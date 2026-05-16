@@ -2,6 +2,7 @@ pub mod nro;
 pub mod env;
 
 pub use nro::Nro;
+pub use env::EnvBlockBuilder;
 
 pub struct Loader;
 

@@ -36,9 +36,9 @@ impl BootContext {
         log::info!("Creating address space");
         let address_space = Arc::new(AddressSpace::new());
 
-        let code_base: u64 = 0x8000_0000_0000;
-        let heap_base: u64 = 0x9000_0000_0000;
-        let stack_base: u64 = 0xA000_0000_0000;
+        let code_base: u64 = 0x80_0000_0000;
+        let heap_base: u64 = 0x90_0000_0000;
+        let stack_base: u64 = 0xA0_0000_0000;
         let env_base: u64 = 0xB0_0000_0000;
         let tls_base: u64 = 0xB0_0000_1000;
         let exit_stub_va: u64 = 0xB0_0000_2000;
@@ -62,13 +62,9 @@ impl BootContext {
             .map_err(|e| format!("Failed to map extras: {:?}", e))?;
 
         log::info!("  Initializing environment block @ {:#x}", env_base);
-        let mut env_block = vec![0u8; 0x10000];
-
-        env_block[0x0..0x4].copy_from_slice(&0x04u32.to_le_bytes());
-        env_block[0x4..0x8].copy_from_slice(&0u32.to_le_bytes());
-
-        address_space.write(env_base, &env_block)
-            .map_err(|e| format!("Failed to write env block: {:?}", e))?;
+        let env_builder = crate::loader::EnvBlockBuilder::new()
+            .with_heap(heap_base, config.heap_size);
+        env_builder.build_into(&address_space, env_base)?;
 
         log::info!("  Writing exit stub SVC instruction @ {:#x}", exit_stub_va);
         let svc_exit_insn: u32 = 0xD400_00E1;

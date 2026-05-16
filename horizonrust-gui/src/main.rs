@@ -22,6 +22,8 @@ fn main() -> Result<(), eframe::Error> {
 
     log::info!("=== HorizonRust - Nintendo Switch Emulator ===");
 
+    let nro_arg = std::env::args().nth(1);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("HorizonRust")
@@ -35,7 +37,7 @@ fn main() -> Result<(), eframe::Error> {
         "HorizonRust",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(HorizonApp::new(cc, log_buf_for_app.clone())))
+            Ok(Box::new(HorizonApp::new(cc, log_buf_for_app.clone(), nro_arg.clone())))
         }),
     )
 }

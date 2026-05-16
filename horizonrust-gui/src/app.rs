@@ -35,11 +35,13 @@ impl HorizonApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         log_buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+        nro_arg: Option<String>,
     ) -> Self {
         Self::apply_theme(&cc.egui_ctx);
         let gilrs = Gilrs::new().ok().or_else(|| { log::warn!("Gilrs init failed"); None });
-        Self {
-            nro_path: String::new(),
+        let nro_path = nro_arg.unwrap_or_default();
+        let mut app = Self {
+            nro_path: nro_path.clone(),
             emulation_handle: None,
             game_texture: None,
             show_settings: false,
@@ -48,7 +50,16 @@ impl HorizonApp {
             debugger: DebuggerState::new(),
             performance: PerformanceMonitor::new(),
             log_buffer,
+        };
+        if !nro_path.is_empty() {
+            if let Ok(handle) = EmulationHandle::new(&nro_path) {
+                app.emulation_handle = Some(handle);
+                log::info!("Auto-loaded NRO: {}", nro_path);
+            } else {
+                log::error!("Failed to load NRO: {}", nro_path);
+            }
         }
+        app
     }
 
     fn apply_theme(ctx: &egui::Context) {
