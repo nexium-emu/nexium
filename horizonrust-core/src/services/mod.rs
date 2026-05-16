@@ -56,6 +56,11 @@ pub struct FrameOut {
     pub pixels: Vec<u8>,
 }
 
+pub struct IpcCtx<'a> {
+    pub tls_buf: &'a [u8],
+    pub pending_frames: &'a mut Vec<FrameOut>,
+}
+
 pub struct Services {
     pub sm: sm::ServiceManager,
     pub hid: hid::HidService,
@@ -165,41 +170,41 @@ impl Services {
         }
     }
 
-    pub fn dispatch_service(&self, port_name: &str, cmd_id: u32) -> u32 {
+    pub fn dispatch_service(&mut self, port_name: &str, cmd_id: u32, ctx: &mut IpcCtx) -> u32 {
         log::trace!("dispatch_service: port={} cmd_id={}", port_name, cmd_id);
         match port_name {
             "sm:" => self.sm.dispatch(cmd_id),
             "hid" => self.hid.dispatch(cmd_id),
             "time:s" | "time:a" | "time:r" => self.time.dispatch(cmd_id),
             "set" | "set:sys" => self.set.dispatch(cmd_id),
-            "am" | "appletOE" => self.am.dispatch(cmd_id),
-            "vi:m" | "vi:s" => self.vi.dispatch(cmd_id),
+            "am" | "appletOE" | "appletAE" => self.am.dispatch(cmd_id),
+            "vi:m" | "vi:s" | "vi:u" => self.vi.dispatch(cmd_id),
             "audio" | "audout:u" => self.audio.dispatch(cmd_id),
             "fsp-srv" => self.fs.dispatch(cmd_id),
             "nifm:u" | "nifm:a" => self.nifm.dispatch(cmd_id),
-            "nvnflinger" => self.nvnflinger.dispatch(cmd_id),
-            "ns" => self.ns.dispatch(cmd_id),
-            "acc:u" | "acc:a" => self.acc.dispatch(cmd_id),
+            "nvnflinger" | "dispdrv" => self.nvnflinger.dispatch(cmd_id, ctx),
+            "ns:am2" | "ns:am" | "ns" => self.ns.dispatch(cmd_id),
+            "acc:u0" | "acc:u1" | "acc:aa" => self.acc.dispatch(cmd_id),
             "pctl:a" | "pctl:r" | "pctl:s" => self.pctl.dispatch(cmd_id),
             "ssl" => self.ssl.dispatch(cmd_id),
             "spl:" => self.spl.dispatch(cmd_id),
             "pl:u" | "pl:s" => self.pl.dispatch(cmd_id),
-            "psc" => self.psc.dispatch(cmd_id),
+            "psc:m" => self.psc.dispatch(cmd_id),
             "smc:" => self.smc.dispatch(cmd_id),
             "fatal:u" | "fatal:p" => self.fatal.dispatch(cmd_id),
-            "apm" => self.apm.dispatch(cmd_id),
+            "apm" | "apm:am" => self.apm.dispatch(cmd_id),
             "bsd:u" | "bsd:s" => self.bsd.dispatch(cmd_id),
-            "caps:a" | "caps:c" | "caps:su" => self.caps.dispatch(cmd_id),
+            "caps:a" | "caps:c" | "caps:su" | "caps:sc" => self.caps.dispatch(cmd_id),
             "lm" => self.misc.dispatch(cmd_id),
-            "pdm" => self.pdm.dispatch(cmd_id),
-            "prepo" => self.prepo.dispatch(cmd_id),
+            "pdm:ntfy" | "pdm:qry" => self.pdm.dispatch(cmd_id),
+            "prepo:a" | "prepo:m" | "prepo:u" => self.prepo.dispatch(cmd_id),
             "psm" => self.psm.dispatch(cmd_id),
             "ldr:ro" => self.ldr.dispatch(cmd_id),
             "lr" => self.lr.dispatch(cmd_id),
-            "ldn:u" | "ldn:s" => self.ldn.dispatch(cmd_id),
-            "friend:u" | "friend:a" | "friend:s" => self.friends.dispatch(cmd_id),
+            "ldn:u" | "ldn:s" | "ldn:m" => self.ldn.dispatch(cmd_id),
+            "friend:u" | "friend:a" | "friend:s" | "friend:v" => self.friends.dispatch(cmd_id),
             "fsp:pr" | "fsp:pc" => self.fsp.dispatch(cmd_id),
-            "btm" => self.btm.dispatch(cmd_id),
+            "btm" | "btm:u" | "btm:dbg" => self.btm.dispatch(cmd_id),
             "mii:u" | "mii:e" => self.mii.dispatch(cmd_id),
             "irs:u" | "irs:o" => self.irs.dispatch(cmd_id),
             "hwopus" => self.hwopus.dispatch(cmd_id),

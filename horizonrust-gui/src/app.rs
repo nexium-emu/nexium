@@ -8,7 +8,7 @@ use crate::performance::PerformanceMonitor;
 pub struct HorizonApp {
     nro_path: String,
     emulation_handle: Option<EmulationHandle>,
-    show_file_picker: bool,
+    game_texture: Option<egui::TextureHandle>,
     show_settings: bool,
     gilrs: Option<Gilrs>,
     last_input: InputSnapshot,
@@ -29,7 +29,7 @@ impl HorizonApp {
         Self {
             nro_path: String::new(),
             emulation_handle: None,
-            show_file_picker: false,
+            game_texture: None,
             show_settings: false,
             gilrs,
             last_input: InputSnapshot::default(),
@@ -44,17 +44,42 @@ impl HorizonApp {
         }
     }
 
+    fn poll_frames(&mut self, ctx: &egui::Context) {
+        let Some(handle) = &self.emulation_handle else { return };
+        while let Ok(frame) = handle.frame_rx.try_recv() {
+            if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() {
+                continue;
+            }
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.pixels,
+            );
+            match &mut self.game_texture {
+                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                None => {
+                    self.game_texture = Some(ctx.load_texture(
+                        "game_frame",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            }
+        }
+    }
+
     fn boot_nro(&mut self) {
         if self.nro_path.is_empty() {
             log::warn!("NRO path is empty");
             return;
         }
 
-        if let Ok(handle) = EmulationHandle::new(&self.nro_path) {
-            self.emulation_handle = Some(handle);
-            log::info!("Booted NRO: {}", self.nro_path);
-        } else {
-            log::error!("Failed to boot NRO: {}", self.nro_path);
+        match EmulationHandle::new(&self.nro_path) {
+            Ok(handle) => {
+                self.emulation_handle = Some(handle);
+                self.game_texture = None;
+                log::info!("Booted NRO: {}", self.nro_path);
+            }
+            Err(e) => log::error!("Failed to boot NRO: {}", e),
         }
     }
 
@@ -69,6 +94,7 @@ impl HorizonApp {
 impl eframe::App for HorizonApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_input();
+        self.poll_frames(ctx);
 
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             ui.menu_button("File", |ui| {
@@ -81,7 +107,6 @@ impl eframe::App for HorizonApp {
                     }
                     ui.close_menu();
                 }
-
                 if ui.button("Exit").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -92,7 +117,6 @@ impl eframe::App for HorizonApp {
                     self.boot_nro();
                     ui.close_menu();
                 }
-
                 if ui.button("Stop").clicked() {
                     self.stop_emulation();
                     ui.close_menu();
@@ -127,58 +151,72 @@ impl eframe::App for HorizonApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("HorizonRust - Nintendo Switch Emulator");
-            ui.label("Phase 4 - GUI Integration");
+            if let Some(tex) = &self.game_texture {
+                let available = ui.available_size();
+                let tex_size = tex.size_vec2();
+                let scale = (available.x / tex_size.x).min(available.y / tex_size.y).min(1.0);
+                let display_size = egui::vec2(tex_size.x * scale, tex_size.y * scale);
+                ui.centered_and_justified(|ui| {
+                    ui.image((tex.id(), display_size));
+                });
+            } else {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(20.0);
+                    ui.heading("HorizonRust");
+                    ui.separator();
+                    ui.label(format!("NRO: {}", if self.nro_path.is_empty() { "(none)" } else { &self.nro_path }));
 
-            ui.separator();
-
-            ui.label(format!("NRO Path: {}", self.nro_path));
-
-            if ui.button("Select NRO...").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Nintendo Homebrew", &["nro"])
-                    .pick_file()
-                {
-                    self.nro_path = path.to_string_lossy().to_string();
-                }
-            }
-
-            if ui.button("Boot").clicked() {
-                self.boot_nro();
-            }
-
-            if let Some(handle) = &self.emulation_handle {
-                if handle.is_running() {
-                    if ui.button("Stop").clicked() {
-                        self.stop_emulation();
+                    if ui.button("Select NRO...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Nintendo Homebrew", &["nro"])
+                            .pick_file()
+                        {
+                            self.nro_path = path.to_string_lossy().to_string();
+                        }
                     }
-                    ui.label("Emulation running...");
-                } else {
-                    ui.label("Emulation complete");
-                    self.emulation_handle = None;
-                }
+
+                    if !self.nro_path.is_empty() {
+                        if ui.button("Boot").clicked() {
+                            self.boot_nro();
+                        }
+                    }
+
+                    if let Some(handle) = &self.emulation_handle {
+                        if handle.is_running() {
+                            ui.separator();
+                            ui.label("Emulation running...");
+                            if ui.button("Stop").clicked() {
+                                self.stop_emulation();
+                            }
+                        } else {
+                            ui.label("Emulation complete");
+                            self.emulation_handle = None;
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label(format!("FPS: {:.1}  Frame: {:.2}ms  SVCs: {}  Cycles: {}",
+                        self.performance.get_fps(),
+                        self.performance.get_frame_time(),
+                        self.performance.get_svc_count(),
+                        self.performance.get_cycle_count(),
+                    ));
+
+                    ui.separator();
+                    ui.label(format!("A:{} B:{} X:{} Y:{}",
+                        self.last_input.a_pressed as u8,
+                        self.last_input.b_pressed as u8,
+                        self.last_input.x_pressed as u8,
+                        self.last_input.y_pressed as u8,
+                    ));
+                });
             }
-
-            ui.separator();
-            ui.label("Input Status:");
-            ui.label(format!("A: {}", self.last_input.a_pressed));
-            ui.label(format!("B: {}", self.last_input.b_pressed));
-            ui.label(format!("X: {}", self.last_input.x_pressed));
-            ui.label(format!("Y: {}", self.last_input.y_pressed));
-
-            ui.separator();
-            ui.label("Performance:");
-            ui.label(format!("FPS: {:.1}", self.performance.get_fps()));
-            ui.label(format!("Frame Time: {:.2} ms", self.performance.get_frame_time()));
-            ui.label(format!("SVCs: {}", self.performance.get_svc_count()));
-            ui.label(format!("Cycles: {}", self.performance.get_cycle_count()));
         });
 
         self.performance.record_frame();
 
         if self.show_settings {
             egui::Window::new("Settings").open(&mut self.show_settings).show(ctx, |ui| {
-                ui.label("Settings Panel");
                 ui.label("Audio Volume: 100%");
                 ui.label("GPU Backend: Vulkan");
                 ui.label("CPU Backend: Dynarmic");
@@ -200,7 +238,6 @@ impl eframe::App for HorizonApp {
             egui::Window::new("CPU Registers")
                 .open(&mut self.debugger.show_registers)
                 .show(ctx, |ui| {
-                    ui.label("Register State:");
                     ui.label("X0: 0x00000000");
                     ui.label("X1: 0x00000000");
                     ui.label("PC: 0x00000000");
@@ -212,7 +249,6 @@ impl eframe::App for HorizonApp {
             egui::Window::new("Disassembler")
                 .open(&mut self.debugger.show_disasm)
                 .show(ctx, |ui| {
-                    ui.label("Disassembly:");
                     ui.label("[Disassembly would be displayed here]");
                 });
         }
@@ -224,7 +260,6 @@ impl eframe::App for HorizonApp {
                     if ui.button("Clear Logs").clicked() {
                         self.debugger.log_history.lock().clear();
                     }
-
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {

@@ -2,6 +2,7 @@ use super::Kernel;
 use crate::common::result::{SUCCESS, KERNEL_NOT_IMPLEMENTED};
 use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
+use crate::services::IpcCtx;
 
 pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
     log::trace!("SVC {:#04x}", imm);
@@ -223,7 +224,14 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
 
     log::debug!("  session handle {:#x} -> port '{}', cmd_id {}", session_handle, port_name, cmd_id);
 
-    let result = kernel.services.dispatch_service(&port_name, cmd_id);
+    let tls_snapshot = tls_buf.clone();
+    let mut pending_frames = std::mem::take(&mut kernel.pending_frames);
+    let mut ipc_ctx = IpcCtx {
+        tls_buf: &tls_snapshot,
+        pending_frames: &mut pending_frames,
+    };
+    let result = kernel.services.dispatch_service(&port_name, cmd_id, &mut ipc_ctx);
+    kernel.pending_frames = pending_frames;
 
     let response_header = [
         0x46, 0x43, 0x4F, 0x53, 0x01, 0x00, 0x00, 0x00,

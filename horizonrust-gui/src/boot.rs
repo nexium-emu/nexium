@@ -1,10 +1,25 @@
 use horizonrust_core::boot::{BootConfig, BootContext};
+use horizonrust_core::services::FrameOut;
 use std::path::Path;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
+
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+impl From<FrameOut> for Frame {
+    fn from(f: FrameOut) -> Self {
+        Self { width: f.width, height: f.height, pixels: f.pixels }
+    }
+}
 
 pub struct EmulationHandle {
     pub stop_flag: Arc<AtomicBool>,
+    pub frame_rx: Receiver<Frame>,
     pub thread_handle: Option<thread::JoinHandle<Result<(), String>>>,
 }
 
@@ -13,6 +28,7 @@ impl EmulationHandle {
         let nro_path = nro_path.to_string();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(2);
 
         let thread_handle = thread::spawn(move || {
             log::info!("Booting NRO: {}", nro_path);
@@ -54,6 +70,10 @@ impl EmulationHandle {
                             if let Some(cpu) = &mut boot_ctx.kernel.cpu {
                                 cpu.set_register(0, result as u64);
                             }
+
+                            for f in boot_ctx.kernel.drain_frames() {
+                                let _ = frame_tx.try_send(f.into());
+                            }
                         }
                         horizonrust_core::cpu::CpuEvent::Stalled => {
                             log::info!("CPU stalled at {:#x}", cpu.get_pc());
@@ -84,6 +104,7 @@ impl EmulationHandle {
 
         Ok(Self {
             stop_flag,
+            frame_rx,
             thread_handle: Some(thread_handle),
         })
     }

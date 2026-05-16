@@ -9,6 +9,7 @@ pub mod cpu_context;
 use crate::memory::AddressSpace;
 use crate::nvdrv::Nvdrv;
 use crate::services::Services;
+use crate::services::FrameOut;
 use crate::cpu::Cpu;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ pub struct Kernel {
     pub event_signals: HashMap<u32, bool>,
     pub tls_buffer: [u8; 0x100],
     pub cpu: Option<Cpu>,
+    pub pending_frames: Vec<FrameOut>,
 
     pub code_base: u64,
     pub code_size: u64,
@@ -55,6 +57,7 @@ impl Kernel {
             event_signals: HashMap::new(),
             tls_buffer: [0u8; 0x100],
             cpu: None,
+            pending_frames: Vec::new(),
             code_base,
             code_size,
             heap_base,
@@ -68,6 +71,10 @@ impl Kernel {
         self.cpu = Some(Cpu::from_env(memory_ptr, memory_size)?);
         log::debug!("Kernel CPU initialized");
         Ok(())
+    }
+
+    pub fn drain_frames(&mut self) -> Vec<FrameOut> {
+        std::mem::take(&mut self.pending_frames)
     }
 
     pub fn dispatch_svc(&mut self, imm: u16) -> u32 {
