@@ -86,13 +86,58 @@ fn svc_unmap_shared_memory(_kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_signal_event(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcSignalEvent");
+    log::debug!("svcSignalEvent (X0=event_handle)");
+
+    if let Some(cpu) = &kernel.cpu {
+        let handle = cpu.get_register(0) as u32;
+        log::debug!("  signaling event handle {:#x}", handle);
+
+        if let Some(_event) = kernel.handles.get_handle(handle) {
+            log::debug!("  event {} signaled", handle);
+            return SUCCESS;
+        } else {
+            log::warn!("  invalid event handle {:#x}", handle);
+            return 1;
+        }
+    }
+
     SUCCESS
 }
 
 fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcWaitSynchronization (X0=handles[], X1=count, X2=timeout_ns)");
-    log::debug!("waiting on {} handles", 1);
+    log::debug!("svcWaitSynchronization (X0=handles_ptr, X1=count, X2=timeout_ns)");
+
+    if let Some(cpu) = &kernel.cpu {
+        let handles_ptr = cpu.get_register(0);
+        let handle_count = cpu.get_register(1);
+        let timeout_ns = cpu.get_register(2);
+
+        log::debug!("  waiting on {} handles, timeout={} ns", handle_count, timeout_ns);
+
+        if handle_count == 0 {
+            log::warn!("  invalid: handle_count is 0");
+            return 1;
+        }
+
+        if handle_count > 64 {
+            log::warn!("  too many handles: {}", handle_count);
+            return 1;
+        }
+
+        if timeout_ns == 0 {
+            log::debug!("  timeout=0 (immediate check)");
+            return 0;
+        }
+
+        if timeout_ns == 0xFFFFFFFFFFFFFFFF {
+            log::debug!("  timeout=infinite (WAIT_INFINITE)");
+        } else {
+            log::debug!("  timeout={} ns (~{} ms)", timeout_ns, timeout_ns / 1_000_000);
+        }
+
+        return SUCCESS;
+    }
+
     SUCCESS
 }
 
@@ -114,6 +159,12 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         return 1;
     }
 
+    let session_handle = if let Some(cpu) = &kernel.cpu {
+        cpu.get_register(0) as u32
+    } else {
+        return 1;
+    };
+
     let cmd_id = u32::from_le_bytes([
         kernel.tls_buffer[8],
         kernel.tls_buffer[9],
@@ -127,7 +178,15 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         kernel.tls_buffer[15],
     ]);
 
-    let port_name = "sm:".to_string();
+    let port_name = if let Some(session) = kernel.sessions.get(&session_handle) {
+        session.port_name.clone()
+    } else {
+        log::warn!("invalid session handle {:#x}", session_handle);
+        return 1;
+    };
+
+    log::debug!("  session handle {:#x} -> port '{}'", session_handle, port_name);
+
     let result = kernel.services.dispatch_service(&port_name, cmd_id);
 
     let response_header = [
@@ -227,12 +286,46 @@ fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
     let session = Session::new(handle, port_name.clone());
     kernel.sessions.insert(handle, session);
 
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, handle as u64);
+    }
+
     log::debug!("created session handle {:#x} to port '{}'", handle, port_name);
     SUCCESS
 }
 
-fn svc_get_info(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcGetInfo");
+fn svc_get_info(kernel: &mut Kernel) -> u32 {
+    log::debug!("svcGetInfo (X0=type, X1=handle, X2=info_id)");
+
+    if let Some(cpu) = &kernel.cpu {
+        let info_type = cpu.get_register(0);
+        let handle = cpu.get_register(1);
+        let info_id = cpu.get_register(2);
+
+        log::debug!("  type={}, handle={:#x}, id={}", info_type, handle, info_id);
+
+        match info_type {
+            2 => {
+                log::debug!("  GetInfo::MemoryUsage");
+                if let Some(cpu_mut) = &mut kernel.cpu {
+                    cpu_mut.set_register(0, kernel.heap_size);
+                }
+                return SUCCESS;
+            }
+            11 => {
+                log::debug!("  GetInfo::ThreadCount");
+                if let Some(cpu_mut) = &mut kernel.cpu {
+                    cpu_mut.set_register(0, 1);
+                }
+                return SUCCESS;
+            }
+            _ => {
+                log::debug!("  unknown info type: {}", info_type);
+                return 1;
+            }
+        }
+    }
+
     SUCCESS
 }
 
@@ -248,7 +341,10 @@ fn svc_unmap_physical_memory(_kernel: &mut Kernel) -> u32 {
 
 fn svc_create_session(kernel: &mut Kernel) -> u32 {
     log::debug!("svcCreateSession");
-    kernel.handles.create_handle(HandleType::Session);
+    let handle = kernel.handles.create_handle(HandleType::Session);
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, handle as u64);
+    }
     SUCCESS
 }
 
@@ -259,13 +355,19 @@ fn svc_reply_and_receive(_kernel: &mut Kernel) -> u32 {
 
 fn svc_create_event(kernel: &mut Kernel) -> u32 {
     log::debug!("svcCreateEvent");
-    kernel.handles.create_handle(HandleType::Event);
+    let handle = kernel.handles.create_handle(HandleType::Event);
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, handle as u64);
+    }
     SUCCESS
 }
 
 fn svc_create_shared_memory(kernel: &mut Kernel) -> u32 {
     log::debug!("svcCreateSharedMemory");
-    kernel.handles.create_handle(HandleType::SharedMemory);
+    let handle = kernel.handles.create_handle(HandleType::SharedMemory);
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, handle as u64);
+    }
     SUCCESS
 }
 
