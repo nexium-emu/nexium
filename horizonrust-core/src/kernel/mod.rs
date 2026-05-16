@@ -22,6 +22,7 @@ pub struct Kernel {
     pub nvdrv: Nvdrv,
     pub hid: Arc<Mutex<hid::HidShared>>,
     pub sessions: HashMap<u32, session::Session>,
+    pub event_signals: HashMap<u32, bool>,
     pub tls_buffer: [u8; 0x100],
     pub cpu: Option<Cpu>,
 
@@ -51,6 +52,7 @@ impl Kernel {
             nvdrv: Nvdrv::new(),
             hid: Arc::new(Mutex::new(hid::HidShared::new())),
             sessions: HashMap::new(),
+            event_signals: HashMap::new(),
             tls_buffer: [0u8; 0x100],
             cpu: None,
             code_base,

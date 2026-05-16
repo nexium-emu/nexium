@@ -93,7 +93,8 @@ fn svc_signal_event(kernel: &mut Kernel) -> u32 {
         log::debug!("  signaling event handle {:#x}", handle);
 
         if let Some(_event) = kernel.handles.get_handle(handle) {
-            log::debug!("  event {} signaled", handle);
+            kernel.event_signals.insert(handle, true);
+            log::debug!("  event {:#x} signaled", handle);
             return SUCCESS;
         } else {
             log::warn!("  invalid event handle {:#x}", handle);
@@ -126,13 +127,42 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
 
         if timeout_ns == 0 {
             log::debug!("  timeout=0 (immediate check)");
-            return 0;
+            for i in 0..handle_count {
+                let mut handle_buf = [0u8; 4];
+                let addr = handles_ptr + (i * 4);
+                if let Ok(()) = kernel.address_space.read(addr, &mut handle_buf) {
+                    let handle = u32::from_le_bytes(handle_buf);
+                    if let Some(true) = kernel.event_signals.get(&handle) {
+                        log::debug!("    handle {:#x} is signaled", handle);
+                        if let Some(cpu_mut) = &mut kernel.cpu {
+                            cpu_mut.set_register(0, i as u64);
+                        }
+                        return SUCCESS;
+                    }
+                }
+            }
+            return 1;
         }
 
         if timeout_ns == 0xFFFFFFFFFFFFFFFF {
             log::debug!("  timeout=infinite (WAIT_INFINITE)");
         } else {
             log::debug!("  timeout={} ns (~{} ms)", timeout_ns, timeout_ns / 1_000_000);
+        }
+
+        for i in 0..handle_count {
+            let mut handle_buf = [0u8; 4];
+            let addr = handles_ptr + (i * 4);
+            if let Ok(()) = kernel.address_space.read(addr, &mut handle_buf) {
+                let handle = u32::from_le_bytes(handle_buf);
+                if let Some(true) = kernel.event_signals.get(&handle) {
+                    log::debug!("    handle {:#x} is signaled", handle);
+                    if let Some(cpu_mut) = &mut kernel.cpu {
+                        cpu_mut.set_register(0, i as u64);
+                    }
+                    return SUCCESS;
+                }
+            }
         }
 
         return SUCCESS;
@@ -365,9 +395,11 @@ fn svc_reply_and_receive(_kernel: &mut Kernel) -> u32 {
 fn svc_create_event(kernel: &mut Kernel) -> u32 {
     log::debug!("svcCreateEvent");
     let handle = kernel.handles.create_handle(HandleType::Event);
+    kernel.event_signals.insert(handle, false);
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(0, handle as u64);
     }
+    log::debug!("  created event handle {:#x}", handle);
     SUCCESS
 }
 
