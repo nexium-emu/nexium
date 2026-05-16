@@ -149,12 +149,7 @@ impl IpcCtx {
             if cursor + 12 > buf.len() {
                 return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 12 });
             }
-            let lo = u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]) as u64;
-            let hi = u32::from_le_bytes([buf[cursor + 4], buf[cursor + 5], buf[cursor + 6], buf[cursor + 7]]) as u64;
-            let size_flags = u32::from_le_bytes([buf[cursor + 8], buf[cursor + 9], buf[cursor + 10], buf[cursor + 11]]);
-            let addr = lo | ((hi & 0xFFFF) as u64) << 32;
-            let size = (size_flags & 0x0000_FFFF) as u64;
-            send_buffers.push(IpcBuffer { addr, size, mode: 0 });
+            send_buffers.push(parse_abc_descriptor(&buf, cursor));
             cursor += 12;
         }
 
@@ -163,12 +158,7 @@ impl IpcCtx {
             if cursor + 12 > buf.len() {
                 return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 12 });
             }
-            let lo = u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]) as u64;
-            let hi = u32::from_le_bytes([buf[cursor + 4], buf[cursor + 5], buf[cursor + 6], buf[cursor + 7]]) as u64;
-            let size_flags = u32::from_le_bytes([buf[cursor + 8], buf[cursor + 9], buf[cursor + 10], buf[cursor + 11]]);
-            let addr = lo | ((hi & 0xFFFF) as u64) << 32;
-            let size = (size_flags & 0x0000_FFFF) as u64;
-            recv_buffers.push(IpcBuffer { addr, size, mode: 0 });
+            recv_buffers.push(parse_abc_descriptor(&buf, cursor));
             cursor += 12;
         }
 
@@ -177,12 +167,7 @@ impl IpcCtx {
             if cursor + 12 > buf.len() {
                 return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 12 });
             }
-            let lo = u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]) as u64;
-            let hi = u32::from_le_bytes([buf[cursor + 4], buf[cursor + 5], buf[cursor + 6], buf[cursor + 7]]) as u64;
-            let size_flags = u32::from_le_bytes([buf[cursor + 8], buf[cursor + 9], buf[cursor + 10], buf[cursor + 11]]);
-            let addr = lo | ((hi & 0xFFFF) as u64) << 32;
-            let size = (size_flags & 0x0000_FFFF) as u64;
-            exch_buffers.push(IpcBuffer { addr, size, mode: 0 });
+            exch_buffers.push(parse_abc_descriptor(&buf, cursor));
             cursor += 12;
         }
 
@@ -407,6 +392,25 @@ impl IpcCtx {
     pub fn input_data(&self) -> &[u8] {
         &self.buf[self.cmif_in_data_off..self.cmif_in_data_off + self.cmif_in_data_len]
     }
+}
+
+fn parse_abc_descriptor(buf: &[u8], off: usize) -> IpcBuffer {
+    let size_low = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+    let addr_low = u32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
+    let packed = u32::from_le_bytes([buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]]);
+    let mode = packed & 0x3;
+    let addr_high = (packed >> 2) & 0x003F_FFFF;
+    let size_high = (packed >> 24) & 0xF;
+    let addr_mid = (packed >> 28) & 0xF;
+    let addr = (addr_low as u64)
+        | ((addr_mid as u64) << 32)
+        | ((addr_high as u64) << 36);
+    let size = (size_low as u64) | ((size_high as u64) << 32);
+    IpcBuffer { addr, size, mode }
+}
+
+impl IpcCtx {
+    fn _placeholder() {}
 
     pub fn build_response(&self, result: u32, out_data: &[u8]) -> Vec<u8> {
         let mut response = vec![0u8; 16 + out_data.len()];

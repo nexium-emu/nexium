@@ -526,6 +526,20 @@ fn dispatch_sm_command_v2(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx) -> Vec<u8>
 fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcCtx, session_handle: u32, pending_frames: &mut Vec<crate::services::FrameOut>) -> Vec<u8> {
     let cmd_id = ctx.cmif_in.cmd_id;
 
+    if let Some(buffer_data) = applet_buffer_response(port_name, cmd_id) {
+        let target_buf = ctx.recv_buffers.iter()
+            .find(|b| b.size > 0 && b.addr != 0)
+            .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0))
+            .copied();
+        if let Some(buf) = target_buf {
+            let write_len = buffer_data.len().min(buf.size as usize);
+            let _ = kernel.address_space.write(buf.addr, &buffer_data[..write_len]);
+            log::info!("  wrote {} bytes to recv buf at {:#x} (avail {})", write_len, buf.addr, buf.size);
+        } else {
+            log::debug!("  no recv buffer/static available for {} cmd={}", port_name, cmd_id);
+        }
+    }
+
     if let Some(sub_service) = subsession_service(port_name, cmd_id) {
         return return_subsession(kernel, ctx, session_handle, sub_service);
     }
@@ -548,6 +562,56 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     };
     let (result, out_data) = kernel.services.dispatch_service(port_name, cmd_id, &mut svc_ctx);
     build_ipc_response(ctx, result, &out_data, &[])
+}
+
+fn applet_buffer_response(port_name: &str, cmd_id: u32) -> Option<Vec<u8>> {
+    match (port_name, cmd_id) {
+        ("IApplicationDisplayService", 2020) | ("IApplicationDisplayService", 2030) | ("IManagerDisplayService", 2012) => {
+            Some(build_native_window_parcel(0x100))
+        }
+        ("IHOSBinderDriver", 0) | ("IHOSBinderDriver", 3) => {
+            Some(build_igbp_success_parcel())
+        }
+        _ => None,
+    }
+}
+
+fn build_igbp_success_parcel() -> Vec<u8> {
+    let mut payload: Vec<u8> = Vec::new();
+    payload.extend_from_slice(&1280u32.to_le_bytes());
+    payload.extend_from_slice(&720u32.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&2u32.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut out = Vec::with_capacity(16 + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&((16 + payload.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
+    out
+}
+
+fn build_native_window_parcel(binder_handle: u32) -> Vec<u8> {
+    let mut payload: Vec<u8> = Vec::new();
+    payload.extend_from_slice(&0x2u32.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&binder_handle.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(b"dispdrv\0");
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut out = Vec::with_capacity(16 + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&((16 + payload.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
+    out
 }
 
 fn return_subsession(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, session_handle: u32, sub_service: &str) -> Vec<u8> {
@@ -646,12 +710,18 @@ fn applet_command_response(kernel: &mut Kernel, port_name: &str, cmd_id: u32) ->
         ("IApplicationDisplayService", 1011) => Some((1u64.to_le_bytes().to_vec(), None)),
         ("IApplicationDisplayService", 1020) => Some((Vec::new(), None)),
         ("IApplicationDisplayService", 2020) => {
-            let mut data = Vec::new();
-            data.extend_from_slice(&0x100u64.to_le_bytes());
-            (data, None).into()
+            let parcel_size = build_native_window_parcel(0x100).len() as u64;
+            Some((parcel_size.to_le_bytes().to_vec(), None))
         }
         ("IApplicationDisplayService", 2021) => Some((Vec::new(), None)),
-        ("IApplicationDisplayService", 2030) => Some((Vec::new(), None)),
+        ("IApplicationDisplayService", 2030) => {
+            let layer_id: u64 = 1;
+            let parcel_size = build_native_window_parcel(0x100).len() as u64;
+            let mut out = Vec::new();
+            out.extend_from_slice(&layer_id.to_le_bytes());
+            out.extend_from_slice(&parcel_size.to_le_bytes());
+            Some((out, None))
+        }
         ("IApplicationDisplayService", 2031) => Some((Vec::new(), None)),
         ("IApplicationDisplayService", 2101) => Some((Vec::new(), None)),
         ("IApplicationDisplayService", 2102) => Some((Vec::new(), None)),
@@ -666,13 +736,19 @@ fn applet_command_response(kernel: &mut Kernel, port_name: &str, cmd_id: u32) ->
 
         ("IManagerDisplayService", 2010) => Some((1u64.to_le_bytes().to_vec(), None)),
         ("IManagerDisplayService", 2011) => Some((Vec::new(), None)),
-        ("IManagerDisplayService", 2012) => Some((Vec::new(), None)),
+        ("IManagerDisplayService", 2012) => {
+            let layer_id: u64 = 1;
+            let parcel_size = build_native_window_parcel(0x100).len() as u64;
+            let mut out = Vec::new();
+            out.extend_from_slice(&layer_id.to_le_bytes());
+            out.extend_from_slice(&parcel_size.to_le_bytes());
+            Some((out, None))
+        }
         ("IManagerDisplayService", 6000) => Some((Vec::new(), None)),
 
-        ("IHOSBinderDriver", 0) => Some((0u32.to_le_bytes().to_vec(), None)),
-        ("IHOSBinderDriver", 1) => Some((0u32.to_le_bytes().to_vec(), None)),
-        ("IHOSBinderDriver", 2) => Some((Vec::new(), None)),
-        ("IHOSBinderDriver", 3) => {
+        ("IHOSBinderDriver", 0) | ("IHOSBinderDriver", 3) => Some((Vec::new(), None)),
+        ("IHOSBinderDriver", 1) => Some((Vec::new(), None)),
+        ("IHOSBinderDriver", 2) => {
             let handle = kernel.handles.create_handle(HandleType::Event);
             Some((Vec::new(), Some(handle)))
         }
