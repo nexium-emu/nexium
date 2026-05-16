@@ -7,6 +7,7 @@ use crate::boot::EmulationHandle;
 use crate::input::InputSnapshot;
 use crate::debugger::DebuggerState;
 use crate::performance::PerformanceMonitor;
+use crate::controller_config::{ControllerConfig, SwitchButton};
 
 const BG:        Color32 = Color32::from_rgb(0x0F, 0x0F, 0x11);
 const BG_RAISED: Color32 = Color32::from_rgb(0x18, 0x18, 0x1C);
@@ -24,11 +25,20 @@ pub struct HorizonApp {
     emulation_handle: Option<EmulationHandle>,
     game_texture: Option<egui::TextureHandle>,
     show_settings: bool,
+    settings_tab: SettingsTab,
     gilrs: Option<Gilrs>,
     last_input: InputSnapshot,
     debugger: DebuggerState,
     performance: PerformanceMonitor,
     log_buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    controller_config: ControllerConfig,
+    rebinding: Option<SwitchButton>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    General,
+    Controller,
 }
 
 impl HorizonApp {
@@ -45,11 +55,14 @@ impl HorizonApp {
             emulation_handle: None,
             game_texture: None,
             show_settings: false,
+            settings_tab: SettingsTab::General,
             gilrs,
             last_input: InputSnapshot::default(),
             debugger: DebuggerState::new(),
             performance: PerformanceMonitor::new(),
             log_buffer,
+            controller_config: ControllerConfig::load(),
+            rebinding: None,
         };
         if !nro_path.is_empty() {
             if let Ok(handle) = EmulationHandle::new(&nro_path) {
@@ -169,6 +182,46 @@ impl eframe::App for HorizonApp {
         if let Some(ref mut g) = self.gilrs {
             self.last_input = InputSnapshot::update_from_gamepad(g);
         }
+
+        if self.rebinding.is_none() {
+            let pressed: Vec<String> = ctx.input(|i| {
+                let mut v = Vec::new();
+                for ev in &i.events {
+                    if let egui::Event::Key { key, pressed: true, .. } = ev {
+                        v.push(format!("{:?}", key));
+                    }
+                }
+                for k in [
+                    egui::Key::A, egui::Key::B, egui::Key::C, egui::Key::D, egui::Key::E, egui::Key::F,
+                    egui::Key::G, egui::Key::H, egui::Key::I, egui::Key::J, egui::Key::K, egui::Key::L,
+                    egui::Key::M, egui::Key::N, egui::Key::O, egui::Key::P, egui::Key::Q, egui::Key::R,
+                    egui::Key::S, egui::Key::T, egui::Key::U, egui::Key::V, egui::Key::W, egui::Key::X,
+                    egui::Key::Y, egui::Key::Z,
+                    egui::Key::Num0, egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
+                    egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
+                    egui::Key::ArrowUp, egui::Key::ArrowDown, egui::Key::ArrowLeft, egui::Key::ArrowRight,
+                    egui::Key::Enter, egui::Key::Tab, egui::Key::Space, egui::Key::Escape,
+                ] {
+                    if i.key_down(k) {
+                        let s = format!("{:?}", k);
+                        if !v.contains(&s) { v.push(s); }
+                    }
+                }
+                v
+            });
+
+            let (buttons, sticks) = self.controller_config.buttons_pressed(&pressed);
+            let state = horizonrust_core::hid_state::get_hid_state();
+            let mut hid = state.lock();
+            hid.update_input(horizonrust_core::hid_state::ControllerInput {
+                buttons,
+                stick_l_x: sticks[0],
+                stick_l_y: sticks[1],
+                stick_r_x: sticks[2],
+                stick_r_y: sticks[3],
+            });
+        }
+
         self.poll_frames(ctx);
 
         if self.emulation_handle.as_ref().map_or(false, |h| !h.is_running()) {
@@ -296,10 +349,44 @@ impl eframe::App for HorizonApp {
         self.performance.record_frame();
 
         if self.show_settings {
+            let mut open = self.show_settings;
+            let mut tab = self.settings_tab;
+            let mut cfg = self.controller_config.clone();
+            let mut rebinding = self.rebinding;
+            let mut save_needed = false;
+
             egui::Window::new("Preferences")
-                .open(&mut self.show_settings)
-                .resizable(false).default_width(280.0)
-                .show(ctx, |ui| { settings_content(ui); });
+                .open(&mut open)
+                .resizable(true).default_size([520.0, 420.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(tab == SettingsTab::General, "General").clicked() {
+                            tab = SettingsTab::General;
+                        }
+                        if ui.selectable_label(tab == SettingsTab::Controller, "Controller").clicked() {
+                            tab = SettingsTab::Controller;
+                        }
+                    });
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    match tab {
+                        SettingsTab::General => settings_content(ui),
+                        SettingsTab::Controller => {
+                            controller_settings_content(ui, &mut cfg, &mut rebinding, &mut save_needed);
+                        }
+                    }
+                });
+
+            self.show_settings = open;
+            self.settings_tab = tab;
+            self.controller_config = cfg;
+            self.rebinding = rebinding;
+            if save_needed {
+                if let Err(e) = self.controller_config.save() {
+                    log::warn!("Failed to save controller config: {}", e);
+                }
+            }
         }
 
         debug_windows(ctx, &mut self.debugger, &self.log_buffer);
@@ -386,6 +473,72 @@ fn settings_content(ui: &mut egui::Ui) {
         row(ui, "GPU Backend", "Vulkan (ash)");
         row(ui, "Audio", "Enabled · 100%");
         row(ui, "Resolution", "1280 × 720");
+    });
+}
+
+fn controller_settings_content(
+    ui: &mut egui::Ui,
+    cfg: &mut ControllerConfig,
+    rebinding: &mut Option<SwitchButton>,
+    save_needed: &mut bool,
+) {
+    ui.label(egui::RichText::new("Switch Pro Controller → Keyboard Mapping")
+        .size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Click a binding then press a key to remap.")
+        .size(11.0).color(MUTED));
+    ui.add_space(8.0);
+
+    if let Some(btn) = *rebinding {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("⟶ Press a key for {}…", btn.display_name()))
+                .size(12.0).color(AMBER));
+            if ui.small_button("Cancel").clicked() {
+                *rebinding = None;
+            }
+        });
+
+        let new_key = ui.input(|i| {
+            for ev in &i.events {
+                if let egui::Event::Key { key, pressed: true, .. } = ev {
+                    return Some(format!("{:?}", key));
+                }
+            }
+            None
+        });
+        if let Some(k) = new_key {
+            cfg.set_binding(btn, k);
+            *rebinding = None;
+            *save_needed = true;
+        }
+        ui.add_space(8.0);
+    }
+
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        egui::Grid::new("bindings")
+            .num_columns(3).spacing([12.0, 4.0]).striped(true)
+            .show(ui, |ui| {
+                for btn in SwitchButton::all() {
+                    ui.label(egui::RichText::new(btn.display_name()).size(12.0).color(TEXT));
+                    let current = cfg.binding_for(*btn).unwrap_or("(unbound)").to_string();
+                    ui.label(egui::RichText::new(&current).size(12.0).monospace().color(MUTED));
+                    if ui.small_button("Rebind").clicked() {
+                        *rebinding = Some(*btn);
+                    }
+                    ui.end_row();
+                }
+            });
+    });
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if pill_button(ui, "Reset to Defaults", false).clicked() {
+            *cfg = ControllerConfig::default();
+            *save_needed = true;
+        }
+        if pill_button(ui, "Save", true).clicked() {
+            *save_needed = true;
+        }
     });
 }
 

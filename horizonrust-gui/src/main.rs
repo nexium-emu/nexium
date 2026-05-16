@@ -4,6 +4,7 @@ mod input;
 mod audio;
 mod debugger;
 mod performance;
+mod controller_config;
 
 use app::HorizonApp;
 use horizonrust_common::FileLogger;
