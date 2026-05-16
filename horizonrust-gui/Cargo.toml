@@ -11,3 +11,20 @@ path = "src/main.rs"
 
 [dependencies]
 horizonrust-common.workspace = true
+horizonrust-core.workspace = true
+horizonrust-gpu.workspace = true
+
+eframe = "0.29"
+egui = "0.29"
+winit = "0.30"
+
+cpal = "0.15"
+gilrs = "0.10"
+parking_lot = "0.12"
+crossbeam = "0.8"
+
+log = "0.4"
+env_logger = "0.11"
+
+serde = { version = "1", features = ["derive"] }
+
