@@ -2,6 +2,9 @@ pub mod rt_cache;
 pub mod pipeline;
 pub mod descriptor;
 pub mod shader;
+pub mod swapchain;
+pub mod presenter;
+pub mod deswizzle;
 
 use ash::vk;
 use std::ffi::CStr;
@@ -9,6 +12,7 @@ use rt_cache::RtCache;
 use pipeline::PipelineCache;
 use descriptor::{DescriptorSetLayout, DescriptorPool};
 use shader::ShaderCompiler;
+use presenter::FramePresenter;
 
 pub struct VulkanContext {
     pub entry: ash::Entry,
@@ -23,6 +27,7 @@ pub struct VulkanContext {
     pub descriptor_layout: DescriptorSetLayout,
     pub descriptor_pool: DescriptorPool,
     pub shader_compiler: ShaderCompiler,
+    pub presenter: FramePresenter,
 }
 
 impl VulkanContext {
@@ -123,6 +128,7 @@ impl VulkanContext {
         let descriptor_layout = DescriptorSetLayout::new(&device)?;
         let descriptor_pool = DescriptorPool::new(&device, 256)?;
         let shader_compiler = ShaderCompiler::new();
+        let presenter = FramePresenter::new();
 
         log::info!("Vulkan context initialized successfully");
 
@@ -138,6 +144,7 @@ impl VulkanContext {
             descriptor_layout,
             descriptor_pool,
             shader_compiler,
+            presenter,
         })
     }
 
