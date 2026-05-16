@@ -127,14 +127,14 @@ impl Maxwell3D {
     }
 
     pub fn write_register(&mut self, method: u32, arg: u32) {
-        if method >= 0x100 && method < 0x140 {
-            let rt_index = ((method - 0x100) / 0x10) as usize;
-            let field = (method - 0x100) % 0x10;
+        if method >= 0x200 && method < 0x300 {
+            let rt_index = ((method - 0x200) / 0x10) as usize;
+            let field = (method - 0x200) % 0x10;
             if rt_index < 8 {
                 let rt = &mut self.regs.rt[rt_index];
                 match field {
-                    0 => rt.address_lo = arg,
-                    1 => rt.address_hi = arg,
+                    0 => rt.address_hi = arg,
+                    1 => rt.address_lo = arg,
                     2 => rt.width = arg,
                     3 => rt.height = arg,
                     4 => rt.format = arg,
@@ -149,63 +149,76 @@ impl Maxwell3D {
         }
 
         match method {
-            0x360..=0x36F => {
+            0x360..=0x363 => {
                 let idx = (method - 0x360) as usize;
-                if idx < 4 {
-                    let f = f32::from_bits(arg);
-                    match idx {
-                        0 => self.regs.clear_color.r = f,
-                        1 => self.regs.clear_color.g = f,
-                        2 => self.regs.clear_color.b = f,
-                        3 => self.regs.clear_color.a = f,
-                        _ => {}
-                    }
+                let f = f32::from_bits(arg);
+                match idx {
+                    0 => self.regs.clear_color.r = f,
+                    1 => self.regs.clear_color.g = f,
+                    2 => self.regs.clear_color.b = f,
+                    3 => self.regs.clear_color.a = f,
+                    _ => {}
                 }
             }
             0x364 => self.regs.clear_depth = f32::from_bits(arg),
             0x368 => self.regs.clear_stencil = arg,
-            0x368..=0x36C => {}
-            0x35D => {
+            0x674 => {
                 self.regs.clear_count += 1;
-                log::debug!("maxwell3d: ClearBuffers (count={}, color={:?})",
-                    self.regs.clear_count, self.regs.clear_color);
+                log::info!("maxwell3d: CLEAR_SURFACE arg={:#x} color={:?}",
+                    arg, self.regs.clear_color);
             }
-            0x44C => {
-                self.regs.viewport.x = f32::from_bits(arg);
+            0x280..=0x2A0 => {
+                let idx = ((method - 0x280) / 4) as usize;
+                if idx < 8 {
+                    let f = f32::from_bits(arg);
+                    let field = (method - 0x280) % 4;
+                    match field {
+                        0 => self.regs.viewport.width = f * 2.0,
+                        1 => self.regs.viewport.height = f * 2.0,
+                        2 => self.regs.viewport.depth_max = f,
+                        3 => {},
+                        _ => {}
+                    }
+                    let _ = idx;
+                }
             }
-            0x44D => {
-                self.regs.viewport.y = f32::from_bits(arg);
-            }
-            0x44E => {
-                self.regs.viewport.width = f32::from_bits(arg);
-            }
-            0x44F => {
-                self.regs.viewport.height = f32::from_bits(arg);
-            }
-            0x585 | 0x586 => {
+            0x35D => {
                 self.regs.draw_count += 1;
-                log::debug!("maxwell3d: Draw (count={} vertex_count={} topology={})",
-                    self.regs.draw_count, self.regs.draw_vertex_count, self.regs.draw_topology);
+                let count = (arg >> 16) & 0xFFFF;
+                let topology = (arg >> 28) & 0xF;
+                log::info!("maxwell3d: DRAW_VERTEX_ARRAY_BEGIN count={} topology={}",
+                    count, topology);
             }
-            0x35E => self.regs.draw_topology = arg & 0xF,
+            0x485 | 0x486 => {
+                self.regs.draw_count += 1;
+                let count = (arg >> 16) & 0xFFF;
+                let topology = (arg >> 28) & 0xF;
+                log::info!("maxwell3d: DRAW_VERTEX_ARRAY_BEGIN_END count={} topology={}",
+                    count, topology);
+            }
+            0x35E => self.regs.draw_vertex_count = arg,
             0x35F => self.regs.draw_first_vertex = arg,
-            0x35C => self.regs.draw_vertex_count = arg,
-            0x600..=0x67F => {
-                let idx = ((method - 0x600) / 4) as usize;
-                let field = (method - 0x600) % 4;
+            0x5F8 => {
+                self.regs.draw_count += 1;
+                self.regs.index_count = arg;
+                log::info!("maxwell3d: DRAW_INDEX_BUFFER count={}", arg);
+            }
+            0x700..=0x77F => {
+                let idx = ((method - 0x700) / 4) as usize;
+                let field = (method - 0x700) % 4;
                 if idx < 32 {
                     let vb = &mut self.regs.vertex_buffers[idx];
                     match field {
-                        0 => vb.stride = arg,
-                        1 => vb.address_lo = arg,
-                        2 => vb.address_hi = arg,
+                        0 => vb.stride = arg & 0xFFF,
+                        1 => vb.address_hi = arg,
+                        2 => vb.address_lo = arg,
                         3 => vb.size = arg,
                         _ => {}
                     }
                 }
             }
-            0x800..=0x81F => {
-                let idx = (method - 0x800) as usize;
+            0x900..=0x91F => {
+                let idx = (method - 0x900) as usize;
                 if idx < 32 {
                     let va = &mut self.regs.vertex_attribs[idx];
                     va.buffer = arg & 0x1F;
@@ -213,11 +226,11 @@ impl Maxwell3D {
                     va.format = (arg >> 21) & 0x3F;
                 }
             }
-            0x4E0..=0x4E5 => {
-                let idx = ((method - 0x4E0) / 0x10) as usize;
+            0x5C0..=0x5F0 => {
+                let idx = ((method - 0x5C0) / 0x10) as usize;
                 if idx < 6 {
                     let sp = &mut self.regs.shader_programs[idx];
-                    let field = (method - 0x4E0) % 0x10;
+                    let field = (method - 0x5C0) % 0x10;
                     match field {
                         0 => sp.enabled = (arg & 1) != 0,
                         1 => sp.address_lo = arg,
@@ -228,7 +241,7 @@ impl Maxwell3D {
                 }
             }
             _ => {
-                log::trace!("maxwell3d: write reg {:#x} = {:#x}", method, arg);
+                log::trace!("maxwell3d: write method {:#x} = {:#x}", method, arg);
             }
         }
     }
