@@ -135,12 +135,14 @@ impl IpcCtx {
             if cursor + 8 > buf.len() {
                 return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 8 });
             }
-            let lo = u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]) as u64;
-            let hi = u32::from_le_bytes([buf[cursor + 4], buf[cursor + 5], buf[cursor + 6], buf[cursor + 7]]) as u64;
-            let packed = lo | (hi << 32);
-            let addr = packed & 0x0000_FFFF_FFFF_FFFF;
-            let size = (packed >> 48) & 0xFFFF;
-            send_statics.push(IpcBuffer { addr, size, mode: 0 });
+            let word0 = u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]);
+            let addr_low = u32::from_le_bytes([buf[cursor + 4], buf[cursor + 5], buf[cursor + 6], buf[cursor + 7]]) as u64;
+            let index = (word0 & 0x3F) as u64;
+            let addr_high = ((word0 >> 6) & 0x3F) as u64;
+            let addr_mid = ((word0 >> 12) & 0xF) as u64;
+            let size = ((word0 >> 16) & 0xFFFF) as u64;
+            let addr = addr_low | (addr_mid << 32) | (addr_high << 36);
+            send_statics.push(IpcBuffer { addr, size, mode: index as u32 });
             cursor += 8;
         }
 

@@ -161,10 +161,10 @@ impl Nvdrv {
                 self.nvmap_handles.insert(id, NvmapHandle {
                     id, size, address: 0, kind: 0,
                 });
-                if out.len() >= 8 {
-                    out[4..8].copy_from_slice(&id.to_le_bytes());
-                }
-                log::debug!("nvmap:Create size={} → id={}", size, id);
+                if out.len() < 8 { out.resize(8, 0); }
+                out[0..4].copy_from_slice(&size.to_le_bytes());
+                out[4..8].copy_from_slice(&id.to_le_bytes());
+                log::debug!("nvmap:Create in_data={:02x?} → size={} id={}", &req.in_data[..req.in_data.len().min(16)], size, id);
             }
             0x0103 => {
                 if req.in_data.len() >= 4 {

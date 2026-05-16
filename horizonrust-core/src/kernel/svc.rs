@@ -985,17 +985,25 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 ])
             } else { 0 };
 
-            let in_src = ctx.send_statics.iter().find(|b| b.size > 0 && b.addr != 0).copied()
-                .or_else(|| ctx.send_buffers.iter().find(|b| b.size > 0 && b.addr != 0).copied());
+            let in_src = ctx.send_buffers.iter().find(|b| b.size > 0 && b.addr != 0).copied()
+                .or_else(|| ctx.send_statics.iter().find(|b| b.size > 0 && b.addr != 0).copied());
             let mut in_data: Vec<u8> = Vec::new();
             if let Some(sb) = in_src {
                 in_data.resize(sb.size as usize, 0);
                 let _ = kernel.address_space.read(sb.addr, &mut in_data);
             }
 
-            let out_dst = ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0).copied()
-                .or_else(|| ctx.recv_buffers.iter().find(|b| b.size > 0 && b.addr != 0).copied());
+            let out_dst = ctx.recv_buffers.iter().find(|b| b.size > 0 && b.addr != 0).copied()
+                .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0).copied());
             let out_size = out_dst.map(|b| b.size as usize).unwrap_or(0);
+
+            if cmd_id == 1 {
+                log::debug!("nvdrv:Ioctl fd={} ioctl_id={:#x} send_buf={:?} send_static={:?} recv_buf={:?}",
+                    fd, ioctl_id,
+                    ctx.send_buffers.iter().map(|b| (b.addr, b.size)).collect::<Vec<_>>(),
+                    ctx.send_statics.iter().map(|b| (b.addr, b.size)).collect::<Vec<_>>(),
+                    ctx.recv_buffers.iter().map(|b| (b.addr, b.size)).collect::<Vec<_>>());
+            }
 
             let req = crate::nvdrv::IoctlRequest {
                 fd, ioctl_id, in_data, out_size,
