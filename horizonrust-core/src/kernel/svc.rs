@@ -119,8 +119,23 @@ fn svc_exit_process(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_map_shared_memory(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcMapSharedMemory");
+fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
+    let (handle, addr, size, perm) = if let Some(cpu) = &kernel.cpu {
+        (cpu.get_register(0) as u32, cpu.get_register(1), cpu.get_register(2), cpu.get_register(3) as u32)
+    } else {
+        return 1;
+    };
+    log::info!("svcMapSharedMemory handle={:#x} addr={:#x} size={:#x} perm={:#x}", handle, addr, size, perm);
+
+    let backing = vec![0u8; size as usize];
+    if kernel.address_space.write(addr, &backing).is_err() {
+        let _ = kernel.address_space.map(addr, size, crate::memory::perm::Perm::RW, "shared");
+        let _ = kernel.address_space.write(addr, &backing);
+    }
+
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, SUCCESS as u64);
+    }
     SUCCESS
 }
 
