@@ -610,6 +610,10 @@ fn dispatch_sm_command_v2(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx) -> Vec<u8>
 fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcCtx, session_handle: u32, pending_frames: &mut Vec<crate::services::FrameOut>) -> Vec<u8> {
     let cmd_id = ctx.cmif_in.cmd_id;
 
+    if port_name == "nvdrv" || port_name == "nvdrv:a" || port_name == "nvdrv:s" || port_name == "nvdrv:t" {
+        return dispatch_nvdrv_command(kernel, ctx, port_name);
+    }
+
     if let Some(buffer_data) = applet_buffer_response(port_name, cmd_id) {
         let target_buf = ctx.recv_buffers.iter()
             .find(|b| b.size > 0 && b.addr != 0)
@@ -646,6 +650,111 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     };
     let (result, out_data) = kernel.services.dispatch_service(port_name, cmd_id, &mut svc_ctx);
     build_ipc_response(ctx, result, &out_data, &[])
+}
+
+fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name: &str) -> Vec<u8> {
+    let cmd_id = ctx.cmif_in.cmd_id;
+    log::info!("nvdrv:{}.cmd_{}", port_name, cmd_id);
+
+    match cmd_id {
+        0 => {
+            let path = if let Some(sb) = ctx.send_buffers.first().or(ctx.send_statics.first()) {
+                let mut buf = vec![0u8; sb.size as usize];
+                let _ = kernel.address_space.read(sb.addr, &mut buf);
+                let trimmed = buf.split(|&b| b == 0).next().unwrap_or(&buf);
+                String::from_utf8_lossy(trimmed).into_owned()
+            } else {
+                String::new()
+            };
+            log::info!("nvdrv:Open path='{}'", path);
+            let fd = kernel.nvdrv.open(&path).unwrap_or(0);
+            let mut out = Vec::new();
+            out.extend_from_slice(&fd.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            build_ipc_response(ctx, 0, &out, &[])
+        }
+        1 | 11 | 12 => {
+            let fd = if ctx.cmif_in_data_len >= 4 {
+                u32::from_le_bytes([
+                    ctx.buf[ctx.cmif_in_data_off],
+                    ctx.buf[ctx.cmif_in_data_off + 1],
+                    ctx.buf[ctx.cmif_in_data_off + 2],
+                    ctx.buf[ctx.cmif_in_data_off + 3],
+                ])
+            } else { 0 };
+            let ioctl_id = if ctx.cmif_in_data_len >= 8 {
+                u32::from_le_bytes([
+                    ctx.buf[ctx.cmif_in_data_off + 4],
+                    ctx.buf[ctx.cmif_in_data_off + 5],
+                    ctx.buf[ctx.cmif_in_data_off + 6],
+                    ctx.buf[ctx.cmif_in_data_off + 7],
+                ])
+            } else { 0 };
+
+            let mut in_data: Vec<u8> = Vec::new();
+            if let Some(sb) = ctx.send_buffers.first() {
+                in_data.resize(sb.size as usize, 0);
+                let _ = kernel.address_space.read(sb.addr, &mut in_data);
+            } else if let Some(sb) = ctx.send_statics.first() {
+                in_data.resize(sb.size as usize, 0);
+                let _ = kernel.address_space.read(sb.addr, &mut in_data);
+            }
+
+            let out_size = ctx.recv_buffers.first().map(|b| b.size as usize)
+                .or_else(|| ctx.recv_statics.first().map(|b| b.size as usize))
+                .unwrap_or(0);
+
+            let req = crate::nvdrv::IoctlRequest {
+                fd, ioctl_id, in_data, out_size,
+            };
+            let outcome = kernel.nvdrv.dispatch_ioctl(req);
+
+            if !outcome.data.is_empty() {
+                let target = ctx.recv_buffers.first()
+                    .or_else(|| ctx.recv_statics.first())
+                    .copied();
+                if let Some(buf) = target {
+                    let n = outcome.data.len().min(buf.size as usize);
+                    let _ = kernel.address_space.write(buf.addr, &outcome.data[..n]);
+                }
+            }
+
+            build_ipc_response(ctx, 0, &outcome.result.to_le_bytes(), &[])
+        }
+        2 => {
+            let fd = if ctx.cmif_in_data_len >= 4 {
+                u32::from_le_bytes([
+                    ctx.buf[ctx.cmif_in_data_off],
+                    ctx.buf[ctx.cmif_in_data_off + 1],
+                    ctx.buf[ctx.cmif_in_data_off + 2],
+                    ctx.buf[ctx.cmif_in_data_off + 3],
+                ])
+            } else { 0 };
+            kernel.nvdrv.close(fd);
+            build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[])
+        }
+        3 => {
+            log::debug!("nvdrv:Initialize");
+            build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[])
+        }
+        4 => {
+            log::debug!("nvdrv:QueryEvent");
+            let h = kernel.handles.create_handle(HandleType::Event);
+            build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[h])
+        }
+        8 => {
+            log::debug!("nvdrv:SetClientPID");
+            build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[])
+        }
+        13 => {
+            log::debug!("nvdrv:GetStatus");
+            build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[])
+        }
+        other => {
+            log::debug!("nvdrv: unknown cmd={}", other);
+            build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[])
+        }
+    }
 }
 
 fn applet_buffer_response(port_name: &str, cmd_id: u32) -> Option<Vec<u8>> {
