@@ -51,6 +51,7 @@ gilrs = "0.10"
 
 serde = { version = "1", features = ["derive"] }
 directories = "5"
+chrono = "0.4"
 
 dynarmic-sys-mythrax = "0.2.4"
 

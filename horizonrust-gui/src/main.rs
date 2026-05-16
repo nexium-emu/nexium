@@ -6,12 +6,19 @@ mod debugger;
 mod performance;
 
 use app::HorizonApp;
-use horizonrust_common::BufferedLogger;
+use horizonrust_common::FileLogger;
 use log::LevelFilter;
 
 fn main() -> Result<(), eframe::Error> {
-    let (logger, log_buffer) = BufferedLogger::new(500);
-    let _ = logger.init(LevelFilter::Info);
+    let (logger, log_buffer) = FileLogger::new(500)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to initialize logger: {}", e);
+            panic!("Logger initialization failed");
+        });
+
+    if let Err(e) = logger.init(LevelFilter::Info) {
+        eprintln!("Failed to set logger: {}", e);
+    }
 
     log::info!("=== HorizonRust - Nintendo Switch Emulator ===");
 

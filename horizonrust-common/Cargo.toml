@@ -9,3 +9,5 @@ license.workspace = true
 thiserror.workspace = true
 log.workspace = true
 env_logger.workspace = true
+chrono.workspace = true
+directories.workspace = true
