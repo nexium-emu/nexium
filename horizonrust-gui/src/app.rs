@@ -3,6 +3,7 @@ use eframe::egui::{
     Color32, FontId, Rounding, Sense, Stroke, Vec2,
 };
 use gilrs::Gilrs;
+use std::sync::Arc;
 use crate::boot::EmulationHandle;
 use crate::input::InputSnapshot;
 use crate::debugger::DebuggerState;
@@ -389,7 +390,20 @@ impl eframe::App for HorizonApp {
             }
         }
 
-        debug_windows(ctx, &mut self.debugger, &self.log_buffer);
+        let snapshot = self.emulation_handle.as_ref().map(|h| h.snapshot());
+        let mem_req_handle = self.emulation_handle.as_ref().map(|h| Arc::clone(&h.mem_request));
+        let mem_req: Option<Box<dyn Fn(u64)>> = mem_req_handle.map(|m| {
+            Box::new(move |addr: u64| {
+                *m.lock() = addr;
+            }) as Box<dyn Fn(u64)>
+        });
+        debug_windows(
+            ctx,
+            &mut self.debugger,
+            snapshot.as_ref(),
+            mem_req.as_deref(),
+            &self.log_buffer,
+        );
 
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
@@ -551,35 +565,145 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
 fn debug_windows(
     ctx: &egui::Context,
     dbg: &mut DebuggerState,
+    snapshot: Option<&crate::boot::CpuSnapshot>,
+    mem_request: Option<&dyn Fn(u64)>,
     log_buffer: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 ) {
     if dbg.show_memory {
         egui::Window::new("Memory").open(&mut dbg.show_memory)
-            .default_size([480.0, 300.0]).show(ctx, |ui| {
-            ui.label(egui::RichText::new(format!("Address  {:#018x}", dbg.memory_address))
-                .size(12.0).monospace().color(MUTED));
-            ui.label(egui::RichText::new("Connect CPU state to read live memory")
-                .size(11.0).color(MUTED));
-        });
+            .default_size([520.0, 340.0]).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Address").size(12.0).color(MUTED));
+                    let resp = ui.add(egui::TextEdit::singleline(&mut dbg.memory_address_input)
+                        .desired_width(160.0)
+                        .font(egui::TextStyle::Monospace));
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let s = dbg.memory_address_input.trim().trim_start_matches("0x");
+                        if let Ok(addr) = u64::from_str_radix(s, 16) {
+                            dbg.memory_address = addr;
+                            if let Some(req) = mem_request { req(addr); }
+                        }
+                    }
+                    if ui.small_button("Go").clicked() {
+                        let s = dbg.memory_address_input.trim().trim_start_matches("0x");
+                        if let Ok(addr) = u64::from_str_radix(s, 16) {
+                            dbg.memory_address = addr;
+                            if let Some(req) = mem_request { req(addr); }
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+
+                if let Some(snap) = snapshot {
+                    if snap.mem_data.is_empty() || snap.mem_address != dbg.memory_address {
+                        if let Some(req) = mem_request { req(dbg.memory_address); }
+                        ui.label(egui::RichText::new("Reading memory…")
+                            .size(11.0).color(MUTED));
+                    } else {
+                        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                            let mut row = 0;
+                            while row * 16 < snap.mem_data.len() {
+                                let off = row * 16;
+                                let addr = snap.mem_address + off as u64;
+                                let slice = &snap.mem_data[off..(off + 16).min(snap.mem_data.len())];
+                                let hex: Vec<String> = slice.iter().map(|b| format!("{:02x}", b)).collect();
+                                let ascii: String = slice.iter()
+                                    .map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' })
+                                    .collect();
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("{:016x}", addr))
+                                        .size(11.5).monospace().color(MUTED));
+                                    ui.label(egui::RichText::new(hex.join(" "))
+                                        .size(11.5).monospace().color(TEXT));
+                                    ui.label(egui::RichText::new(ascii)
+                                        .size(11.5).monospace().color(AMBER));
+                                });
+                                row += 1;
+                            }
+                        });
+                    }
+                } else {
+                    ui.label(egui::RichText::new("No emulation running")
+                        .size(11.0).color(MUTED));
+                }
+            });
     }
+
     if dbg.show_registers {
         egui::Window::new("Registers").open(&mut dbg.show_registers)
-            .default_size([280.0, 340.0]).show(ctx, |ui| {
-            for (n, v) in [("PC","0x0"),("SP","0x0"),("X0","0x0"),("X1","0x0"),("X2","0x0")] {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{:<4}", n)).size(12.0).monospace().color(MUTED));
-                    ui.label(egui::RichText::new(v).size(12.0).monospace().color(TEXT));
-                });
-            }
-        });
+            .default_size([320.0, 480.0]).show(ctx, |ui| {
+                if let Some(snap) = snapshot {
+                    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                        egui::Grid::new("regs").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
+                            for (n, v) in [
+                                ("PC", snap.pc),
+                                ("SP", snap.sp),
+                                ("TPIDRRO", snap.tpidrro_el0),
+                            ] {
+                                ui.label(egui::RichText::new(format!("{:<8}", n))
+                                    .size(12.0).monospace().color(MUTED));
+                                ui.label(egui::RichText::new(format!("{:#018x}", v))
+                                    .size(12.0).monospace().color(TEXT));
+                                ui.end_row();
+                            }
+                            for i in 0..31 {
+                                ui.label(egui::RichText::new(format!("X{:<7}", i))
+                                    .size(12.0).monospace().color(MUTED));
+                                ui.label(egui::RichText::new(format!("{:#018x}", snap.x[i]))
+                                    .size(12.0).monospace().color(TEXT));
+                                ui.end_row();
+                            }
+                        });
+                    });
+                } else {
+                    ui.label(egui::RichText::new("No emulation running")
+                        .size(11.0).color(MUTED));
+                }
+            });
     }
+
     if dbg.show_disasm {
         egui::Window::new("Disassembler").open(&mut dbg.show_disasm)
-            .default_size([440.0, 260.0]).show(ctx, |ui| {
-            ui.label(egui::RichText::new("Connect CPU state to disassemble at PC")
-                .size(11.0).color(MUTED));
-        });
+            .default_size([520.0, 340.0]).show(ctx, |ui| {
+                if let Some(snap) = snapshot {
+                    if snap.instruction_bytes.is_empty() {
+                        ui.label(egui::RichText::new("No instruction data yet")
+                            .size(11.0).color(MUTED));
+                    } else {
+                        ui.label(egui::RichText::new(format!("PC {:#018x}", snap.pc))
+                            .size(12.0).monospace().color(AMBER));
+                        ui.separator();
+                        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                            let mut off = 0;
+                            while off + 4 <= snap.instruction_bytes.len() {
+                                let instr = u32::from_le_bytes([
+                                    snap.instruction_bytes[off],
+                                    snap.instruction_bytes[off + 1],
+                                    snap.instruction_bytes[off + 2],
+                                    snap.instruction_bytes[off + 3],
+                                ]);
+                                let addr = snap.pc + off as u64;
+                                let mnemonic = disasm_arm64(instr);
+                                let color = if off == 0 { ACCENT } else { TEXT };
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("{:016x}", addr))
+                                        .size(11.5).monospace().color(MUTED));
+                                    ui.label(egui::RichText::new(format!("{:08x}", instr))
+                                        .size(11.5).monospace().color(MUTED));
+                                    ui.label(egui::RichText::new(mnemonic)
+                                        .size(11.5).monospace().color(color));
+                                });
+                                off += 4;
+                            }
+                        });
+                    }
+                } else {
+                    ui.label(egui::RichText::new("No emulation running")
+                        .size(11.0).color(MUTED));
+                }
+            });
     }
+
     if dbg.show_logs {
         egui::Window::new("Logs").open(&mut dbg.show_logs)
             .default_size([580.0, 300.0]).show(ctx, |ui| {
@@ -601,4 +725,58 @@ fn debug_windows(
                 });
         });
     }
+}
+
+fn disasm_arm64(instr: u32) -> String {
+    if instr == 0xD503201F { return "nop".into(); }
+    if instr == 0xD65F03C0 { return "ret".into(); }
+    if instr == 0xD4200000 { return "brk #0".into(); }
+
+    let op = instr >> 24;
+
+    if (instr & 0xFFE0_0000) == 0xD400_0000 {
+        let imm = (instr >> 5) & 0xFFFF;
+        return format!("svc #{:#x}", imm);
+    }
+    if (instr & 0xFC00_0000) == 0x9400_0000 {
+        let imm26 = instr & 0x03FF_FFFF;
+        let off = if imm26 & 0x0200_0000 != 0 { ((imm26 | 0xFC00_0000) as i32) * 4 } else { (imm26 as i32) * 4 };
+        return format!("bl pc{:+}", off);
+    }
+    if (instr & 0xFC00_0000) == 0x1400_0000 {
+        let imm26 = instr & 0x03FF_FFFF;
+        let off = if imm26 & 0x0200_0000 != 0 { ((imm26 | 0xFC00_0000) as i32) * 4 } else { (imm26 as i32) * 4 };
+        return format!("b pc{:+}", off);
+    }
+    if (instr & 0xFFC0_0000) == 0x9100_0000 {
+        let imm12 = (instr >> 10) & 0xFFF;
+        let rn = (instr >> 5) & 0x1F;
+        let rd = instr & 0x1F;
+        return format!("add x{}, x{}, #{:#x}", rd, rn, imm12);
+    }
+    if (instr & 0xFFC0_0000) == 0xD100_0000 {
+        let imm12 = (instr >> 10) & 0xFFF;
+        let rn = (instr >> 5) & 0x1F;
+        let rd = instr & 0x1F;
+        return format!("sub x{}, x{}, #{:#x}", rd, rn, imm12);
+    }
+    if (instr & 0xFFC0_0000) == 0xF940_0000 {
+        let imm12 = (instr >> 10) & 0xFFF;
+        let rn = (instr >> 5) & 0x1F;
+        let rt = instr & 0x1F;
+        return format!("ldr x{}, [x{}, #{:#x}]", rt, rn, imm12 * 8);
+    }
+    if (instr & 0xFFC0_0000) == 0xF900_0000 {
+        let imm12 = (instr >> 10) & 0xFFF;
+        let rn = (instr >> 5) & 0x1F;
+        let rt = instr & 0x1F;
+        return format!("str x{}, [x{}, #{:#x}]", rt, rn, imm12 * 8);
+    }
+    if (instr & 0xFFE0_0000) == 0xD280_0000 {
+        let imm16 = (instr >> 5) & 0xFFFF;
+        let rd = instr & 0x1F;
+        return format!("mov x{}, #{:#x}", rd, imm16);
+    }
+
+    format!("? .word {:#010x}  (op={:#x})", instr, op)
 }

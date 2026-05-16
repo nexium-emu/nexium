@@ -1,5 +1,6 @@
 use horizonrust_core::boot::{BootConfig, BootContext};
 use horizonrust_core::services::FrameOut;
+use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::sync::mpsc::{self, Receiver};
@@ -17,10 +18,24 @@ impl From<FrameOut> for Frame {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct CpuSnapshot {
+    pub pc: u64,
+    pub sp: u64,
+    pub tpidrro_el0: u64,
+    pub x: [u64; 31],
+    pub instruction_bytes: Vec<u8>,
+    pub mem_address: u64,
+    pub mem_data: Vec<u8>,
+    pub mem_request_address: u64,
+}
+
 pub struct EmulationHandle {
     pub stop_flag: Arc<AtomicBool>,
     pub frame_rx: Receiver<Frame>,
     pub thread_handle: Option<thread::JoinHandle<Result<(), String>>>,
+    pub cpu_snapshot: Arc<Mutex<CpuSnapshot>>,
+    pub mem_request: Arc<Mutex<u64>>,
 }
 
 impl EmulationHandle {
@@ -29,6 +44,10 @@ impl EmulationHandle {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);
         let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(2);
+        let cpu_snapshot = Arc::new(Mutex::new(CpuSnapshot::default()));
+        let cpu_snapshot_clone = Arc::clone(&cpu_snapshot);
+        let mem_request = Arc::new(Mutex::new(0u64));
+        let mem_request_clone = Arc::clone(&mem_request);
 
         let thread_handle = thread::spawn(move || {
             log::info!("Booting NRO: {}", nro_path);
@@ -61,6 +80,29 @@ impl EmulationHandle {
                     let pc_after = cpu.get_pc();
                     cycle_count += 100_000;
                     boot_ctx.kernel.cycle_count += 100_000;
+
+                    if cycle_count % 1_000_000 == 0 {
+                        let mut snap = cpu_snapshot_clone.lock();
+                        snap.pc = cpu.get_pc();
+                        snap.sp = cpu.get_register(31);
+                        snap.tpidrro_el0 = cpu.get_tpidrro_el0();
+                        for i in 0..31 {
+                            snap.x[i] = cpu.get_register(i as u32);
+                        }
+                        let mut instr_buf = vec![0u8; 64];
+                        if boot_ctx.kernel.address_space.read(snap.pc, &mut instr_buf).is_ok() {
+                            snap.instruction_bytes = instr_buf;
+                        }
+                        let mem_req = *mem_request_clone.lock();
+                        if mem_req != 0 {
+                            snap.mem_request_address = mem_req;
+                            let mut mem_buf = vec![0u8; 256];
+                            if boot_ctx.kernel.address_space.read(mem_req, &mut mem_buf).is_ok() {
+                                snap.mem_address = mem_req;
+                                snap.mem_data = mem_buf;
+                            }
+                        }
+                    }
 
                     if boot_ctx.kernel.cycle_count >= boot_ctx.kernel.next_vsync_cycle {
                         boot_ctx.kernel.next_vsync_cycle += 16_666_667;
@@ -148,7 +190,17 @@ impl EmulationHandle {
             stop_flag,
             frame_rx,
             thread_handle: Some(thread_handle),
+            cpu_snapshot,
+            mem_request,
         })
+    }
+
+    pub fn request_memory_read(&self, address: u64) {
+        *self.mem_request.lock() = address;
+    }
+
+    pub fn snapshot(&self) -> CpuSnapshot {
+        self.cpu_snapshot.lock().clone()
     }
 
     pub fn stop(&mut self) {

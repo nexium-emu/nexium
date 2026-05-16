@@ -33,6 +33,7 @@ impl LogHistory {
 
 pub struct DebuggerState {
     pub memory_address: u64,
+    pub memory_address_input: String,
     pub memory_size: u32,
     pub show_memory: bool,
     pub show_registers: bool,
@@ -44,7 +45,8 @@ pub struct DebuggerState {
 impl DebuggerState {
     pub fn new() -> Self {
         Self {
-            memory_address: 0,
+            memory_address: 0x80000000,
+            memory_address_input: "0x80000000".to_string(),
             memory_size: 256,
             show_memory: false,
             show_registers: false,
