@@ -299,6 +299,17 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
 
     log::info!("IPC port='{}' cmd={} handle={:#x} PC={:#x} data_off={:#x}", port_name, cmd_id, session_handle,
         kernel.cpu.as_ref().map(|c| c.get_pc()).unwrap_or(0), cmif_data_off);
+    if port_name == "sm:" {
+        let hipc_header = u64::from_le_bytes([tls_buf[0], tls_buf[1], tls_buf[2], tls_buf[3], tls_buf[4], tls_buf[5], tls_buf[6], tls_buf[7]]);
+        let cmd_type = (hipc_header & 0xFFFF) as u16;
+        let cmif_offset = cmif_data_off - 16;
+        if tls_buf.len() >= cmif_offset + 16 {
+            let cmif_bytes = &tls_buf[cmif_offset..cmif_offset + 16];
+            let magic = std::str::from_utf8(&cmif_bytes[0..4]).unwrap_or("????");
+            let cmif_cmd_id = u32::from_le_bytes([cmif_bytes[8], cmif_bytes[9], cmif_bytes[10], cmif_bytes[11]]);
+            log::debug!("SM: HIPC cmd_type={}, CMIF magic='{}' cmd_id={}", cmd_type, magic, cmif_cmd_id);
+        }
+    }
 
     let (result, out_data) = if port_name == "sm:" {
         dispatch_sm_command(kernel, cmd_id, &tls_buf, cmif_data_off, cmif_data_len, parsed_ctx)
@@ -332,10 +343,10 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
 
 fn dispatch_sm_command(kernel: &mut Kernel, cmd_id: u32, tls_buf: &[u8], cmif_data_off: usize, cmif_data_len: usize, parsed_ctx: Option<ipc::IpcCtx>) -> (u32, Vec<u8>) {
     match cmd_id {
-        0 => dispatch_sm_get_service_handle(kernel, tls_buf, cmif_data_off, cmif_data_len, parsed_ctx),
-        1 => dispatch_sm_register_service(kernel, tls_buf, cmif_data_off, cmif_data_len),
-        2 => (SUCCESS, Vec::new()),
-        3 => (SUCCESS, Vec::new()),
+        0 => dispatch_sm_register_client(kernel, tls_buf, cmif_data_off, cmif_data_len, parsed_ctx),
+        1 => dispatch_sm_get_service_handle(kernel, tls_buf, cmif_data_off, cmif_data_len, parsed_ctx),
+        2 => dispatch_sm_register_service(kernel, tls_buf, cmif_data_off, cmif_data_len),
+        3 => dispatch_sm_unregister_service(kernel, tls_buf, cmif_data_off, cmif_data_len),
         _ => {
             log::warn!("unknown SM command: {}", cmd_id);
             (1, Vec::new())
@@ -343,94 +354,54 @@ fn dispatch_sm_command(kernel: &mut Kernel, cmd_id: u32, tls_buf: &[u8], cmif_da
     }
 }
 
-fn dispatch_sm_register_service(_kernel: &mut Kernel, _tls_buf: &[u8], _cmif_data_off: usize, _cmif_data_len: usize) -> (u32, Vec<u8>) {
-    log::debug!("SM::RegisterService");
+fn dispatch_sm_register_client(_kernel: &mut Kernel, _tls_buf: &[u8], _cmif_data_off: usize, _cmif_data_len: usize, _parsed_ctx: Option<ipc::IpcCtx>) -> (u32, Vec<u8>) {
+    log::debug!("SM::RegisterClient");
     (SUCCESS, Vec::new())
 }
 
-fn dispatch_sm_get_service_handle(kernel: &mut Kernel, tls_buf: &[u8], cmif_data_off: usize, cmif_data_len: usize, parsed_ctx: Option<ipc::IpcCtx>) -> (u32, Vec<u8>) {
-    log::debug!("SM::GetServiceHandle (cmif_data_off={:#x}, cmif_data_len={:#x})", cmif_data_off, cmif_data_len);
+fn dispatch_sm_register_service(_kernel: &mut Kernel, tls_buf: &[u8], cmif_data_off: usize, _cmif_data_len: usize) -> (u32, Vec<u8>) {
+    let service_name = if tls_buf.len() >= cmif_data_off + 8 {
+        let name_bytes = &tls_buf[cmif_data_off..cmif_data_off + 8];
+        let trimmed = name_bytes.split(|&b| b == 0).next().unwrap_or(name_bytes);
+        String::from_utf8_lossy(trimmed).into_owned()
+    } else {
+        String::new()
+    };
+    log::debug!("SM::RegisterService '{}'", service_name);
+    (SUCCESS, Vec::new())
+}
 
-    let mut service_name = String::new();
+fn dispatch_sm_unregister_service(_kernel: &mut Kernel, tls_buf: &[u8], cmif_data_off: usize, _cmif_data_len: usize) -> (u32, Vec<u8>) {
+    let service_name = if tls_buf.len() >= cmif_data_off + 8 {
+        let name_bytes = &tls_buf[cmif_data_off..cmif_data_off + 8];
+        let trimmed = name_bytes.split(|&b| b == 0).next().unwrap_or(name_bytes);
+        String::from_utf8_lossy(trimmed).into_owned()
+    } else {
+        String::new()
+    };
+    log::debug!("SM::UnregisterService '{}'", service_name);
+    (SUCCESS, Vec::new())
+}
 
-    // Try to extract service name from buffer descriptors first
-    if let Some(ctx) = parsed_ctx {
-        log::debug!("SM: buffers - statics={}, send={}, recv={}",
-            ctx.send_statics.len(), ctx.send_buffers.len(), ctx.recv_buffers.len());
-
-        // Check send_statics (pointer buffers from send static descriptors)
-        if !ctx.send_statics.is_empty() {
-            let buf_desc = &ctx.send_statics[0];
-            log::debug!("SM: trying send_static at {:#x} size={}", buf_desc.addr, buf_desc.size);
-            if buf_desc.size > 0 && buf_desc.size < 256 {
-                let read_size = (buf_desc.size as usize).min(8);
-                let mut name_buf = vec![0u8; read_size];
-                if kernel.address_space.read(buf_desc.addr, &mut name_buf).is_ok() {
-                    if let Ok(s) = std::str::from_utf8(&name_buf) {
-                        let trimmed = s.trim_end_matches('\0');
-                        if !trimmed.is_empty() {
-                            service_name = trimmed.to_string();
-                            log::info!("SM: extracted service name from send_static: '{}'", service_name);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check send_buffers if not found in send_statics
-        if service_name.is_empty() && !ctx.send_buffers.is_empty() {
-            let buf_desc = &ctx.send_buffers[0];
-            log::debug!("SM: trying send_buffer at {:#x} size={}", buf_desc.addr, buf_desc.size);
-            if buf_desc.size > 0 && buf_desc.size < 256 {
-                let read_size = (buf_desc.size as usize).min(8);
-                let mut name_buf = vec![0u8; read_size];
-                if kernel.address_space.read(buf_desc.addr, &mut name_buf).is_ok() {
-                    if let Ok(s) = std::str::from_utf8(&name_buf) {
-                        let trimmed = s.trim_end_matches('\0');
-                        if !trimmed.is_empty() {
-                            service_name = trimmed.to_string();
-                            log::info!("SM: extracted service name from send_buffer: '{}'", service_name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: try inline CMIF payload data
-    if service_name.is_empty() && cmif_data_len >= 8 && tls_buf.len() >= cmif_data_off + 8 {
-        let mut name_buf = [0u8; 8];
-        name_buf.copy_from_slice(&tls_buf[cmif_data_off..cmif_data_off+8]);
-        if let Ok(s) = std::str::from_utf8(&name_buf) {
-            let trimmed = s.trim_end_matches('\0');
-            if !trimmed.is_empty() && trimmed.len() < 8 {
-                service_name = trimmed.to_string();
-                log::info!("SM: extracted service name from inline payload: '{}'", service_name);
-            }
-        }
-    }
-
-    // For now, map SM service handles sequentially to known services
-    // This is a workaround until we properly extract service names from IPC messages
-    static SM_SERVICE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let service_index = SM_SERVICE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-    let mapped_name = match service_index {
-        0 => "hid",
-        1 => "time:s",
-        2 => "set",
-        3 => "am",
-        4 => "vi:m",
-        5 => "audio",
-        _ => "generic",
+fn dispatch_sm_get_service_handle(kernel: &mut Kernel, tls_buf: &[u8], cmif_data_off: usize, _cmif_data_len: usize, _parsed_ctx: Option<ipc::IpcCtx>) -> (u32, Vec<u8>) {
+    let service_name = if tls_buf.len() >= cmif_data_off + 8 {
+        let name_bytes = &tls_buf[cmif_data_off..cmif_data_off + 8];
+        let trimmed = name_bytes.split(|&b| b == 0).next().unwrap_or(name_bytes);
+        String::from_utf8_lossy(trimmed).into_owned()
+    } else {
+        String::new()
     };
 
+    log::debug!("SM::GetServiceHandle data_off={:#x} raw_bytes={:02x?}", cmif_data_off,
+        if tls_buf.len() >= cmif_data_off + 8 { &tls_buf[cmif_data_off..cmif_data_off + 8] } else { &[] });
+    log::info!("SM::GetServiceHandle '{}'", service_name);
+
     let handle = kernel.handles.create_handle(HandleType::Session);
-    let final_name = if !service_name.is_empty() { service_name } else { mapped_name.to_string() };
+    let final_name = if !service_name.is_empty() { service_name } else { "unknown".to_string() };
     let session = Session::new(handle, final_name.clone());
     kernel.sessions.insert(handle, session);
 
-    log::info!("SM: returning handle {:#x} for service '{}' (index {})", handle, final_name, service_index);
+    log::info!("SM: returning handle {:#x} for service '{}'", handle, final_name);
     let mut response = Vec::new();
     response.extend_from_slice(&0u32.to_le_bytes());
     response.extend_from_slice(&handle.to_le_bytes());
