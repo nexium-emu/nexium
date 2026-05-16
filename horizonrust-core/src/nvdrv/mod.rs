@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod bufferqueue;
+pub mod gpu;
 pub use bufferqueue::{BufferQueue, GraphicBuffer, QueuedFrame};
+pub use gpu::GpuContext;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum NvDevice {
@@ -83,6 +85,7 @@ pub struct Nvdrv {
     pub bufferqueues: Arc<Mutex<HashMap<u32, BufferQueue>>>,
     pub frame_queue: Arc<Mutex<Vec<QueuedFrame>>>,
     pub next_event_id: u32,
+    pub gpu: Arc<GpuContext>,
 }
 
 impl Nvdrv {
@@ -95,6 +98,7 @@ impl Nvdrv {
             bufferqueues: Arc::new(Mutex::new(HashMap::new())),
             frame_queue: Arc::new(Mutex::new(Vec::new())),
             next_event_id: 1,
+            gpu: Arc::new(GpuContext::new()),
         }
     }
 
@@ -113,6 +117,14 @@ impl Nvdrv {
     }
 
     pub fn dispatch_ioctl(&mut self, req: IoctlRequest) -> IoctlOutcome {
+        self.dispatch_ioctl_with_mem(req, &|_, _| false)
+    }
+
+    pub fn dispatch_ioctl_with_mem(
+        &mut self,
+        req: IoctlRequest,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> IoctlOutcome {
         let device = match self.files.get(&req.fd) {
             Some(f) => f.device,
             None => {
@@ -128,7 +140,7 @@ impl Nvdrv {
             NvDevice::Nvmap => self.nvmap_ioctl(cmd, &req),
             NvDevice::NvhostCtrlGpu => self.nvhost_ctrl_gpu_ioctl(cmd, &req),
             NvDevice::NvhostAsGpu => self.nvhost_as_gpu_ioctl(cmd, &req),
-            NvDevice::NvhostGpu => self.nvhost_gpu_ioctl(cmd, &req),
+            NvDevice::NvhostGpu => self.nvhost_gpu_ioctl_with_mem(cmd, &req, mem_read),
             NvDevice::NvhostCtrl => Self::nvhost_ctrl_ioctl(cmd, &req),
             _ => IoctlOutcome::ok(vec![0u8; req.out_size]),
         }
@@ -254,32 +266,71 @@ impl Nvdrv {
         match cmd {
             0x4101 => { log::debug!("nvhost-as-gpu:BindChannel"); }
             0x4102 => {
-                log::debug!("nvhost-as-gpu:AllocSpace");
-                if req.in_data.len() >= 24 && out.len() >= 24 {
-                    let offset_in: u64 = u64::from_le_bytes([
+                let pages = if req.in_data.len() >= 4 {
+                    u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]])
+                } else { 0 };
+                let page_size = if req.in_data.len() >= 8 {
+                    u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]])
+                } else { 0x1000 };
+                let total_size = (pages as u64) * (page_size as u64);
+                let offset_in: u64 = if req.in_data.len() >= 24 {
+                    u64::from_le_bytes([
                         req.in_data[16], req.in_data[17], req.in_data[18], req.in_data[19],
                         req.in_data[20], req.in_data[21], req.in_data[22], req.in_data[23],
-                    ]);
-                    let alloc = if offset_in != 0 { offset_in } else { 0x10000_0000u64 };
+                    ])
+                } else { 0 };
+                let alloc = if offset_in != 0 { offset_in } else { self.gpu.alloc_gpu_va(total_size.max(0x1000)) };
+                log::debug!("nvhost-as-gpu:AllocSpace pages={} page_size={:#x} → gpu_va={:#x}",
+                    pages, page_size, alloc);
+                if out.len() >= 24 {
                     out[16..24].copy_from_slice(&alloc.to_le_bytes());
                 }
             }
             0x4106 => { log::debug!("nvhost-as-gpu:FreeSpace"); }
             0x4114 => {
-                log::debug!("nvhost-as-gpu:MapBufferEx");
-                if req.in_data.len() >= 40 && out.len() >= 40 {
+                if req.in_data.len() >= 40 {
+                    let flags = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let _kind = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    let nvmap_id = u32::from_le_bytes([req.in_data[8], req.in_data[9], req.in_data[10], req.in_data[11]]);
+                    let _page_size = u32::from_le_bytes([req.in_data[12], req.in_data[13], req.in_data[14], req.in_data[15]]);
+                    let buffer_offset = u64::from_le_bytes([
+                        req.in_data[16], req.in_data[17], req.in_data[18], req.in_data[19],
+                        req.in_data[20], req.in_data[21], req.in_data[22], req.in_data[23],
+                    ]);
+                    let mapping_size = u64::from_le_bytes([
+                        req.in_data[24], req.in_data[25], req.in_data[26], req.in_data[27],
+                        req.in_data[28], req.in_data[29], req.in_data[30], req.in_data[31],
+                    ]);
                     let offset_in: u64 = u64::from_le_bytes([
                         req.in_data[32], req.in_data[33], req.in_data[34], req.in_data[35],
                         req.in_data[36], req.in_data[37], req.in_data[38], req.in_data[39],
                     ]);
-                    let mapped = if offset_in != 0 { offset_in } else { 0x10000_0000u64 };
-                    out[32..40].copy_from_slice(&mapped.to_le_bytes());
+
+                    let size = if mapping_size > 0 {
+                        mapping_size
+                    } else {
+                        self.nvmap_handles.get(&nvmap_id).map(|h| h.size as u64).unwrap_or(0x1000)
+                    };
+                    let mapped = if offset_in != 0 {
+                        offset_in
+                    } else {
+                        self.gpu.alloc_gpu_va(size)
+                    };
+                    let cpu_addr = self.nvmap_handles.get(&nvmap_id)
+                        .map(|h| h.address.wrapping_add(buffer_offset))
+                        .unwrap_or(0);
+                    log::debug!("nvhost-as-gpu:MapBufferEx flags={:#x} nvmap_id={} cpu_addr={:#x} size={:#x} → gpu_va={:#x}",
+                        flags, nvmap_id, cpu_addr, size, mapped);
+
+                    self.gpu.mappings.lock().add(mapped, size, cpu_addr, nvmap_id);
+
+                    if out.len() >= 40 {
+                        out[32..40].copy_from_slice(&mapped.to_le_bytes());
+                    }
                 }
             }
             0x4105 => { log::debug!("nvhost-as-gpu:UnmapBuffer"); }
-            0x4108 => {
-                log::debug!("nvhost-as-gpu:GetVaRegions");
-            }
+            0x4108 => { log::debug!("nvhost-as-gpu:GetVaRegions"); }
             0x4109 => { log::debug!("nvhost-as-gpu:InitializeEx"); }
             other => {
                 log::debug!("nvhost-as-gpu: unknown ioctl cmd={:#x}", other);
@@ -289,6 +340,10 @@ impl Nvdrv {
     }
 
     fn nvhost_gpu_ioctl(&mut self, cmd: u16, req: &IoctlRequest) -> IoctlOutcome {
+        self.nvhost_gpu_ioctl_with_mem(cmd, req, &|_, _| false)
+    }
+
+    fn nvhost_gpu_ioctl_with_mem(&mut self, cmd: u16, req: &IoctlRequest, mem_read: &dyn Fn(u64, &mut [u8]) -> bool) -> IoctlOutcome {
         let mut out = vec![0u8; req.out_size];
         let n = req.in_data.len().min(out.len());
         out[..n].copy_from_slice(&req.in_data[..n]);
@@ -297,10 +352,54 @@ impl Nvdrv {
             0x4801 => { log::debug!("nvhost-gpu:SetNvmapFd"); }
             0x4803 => { log::debug!("nvhost-gpu:ChannelSetTimeout"); }
             0x4808 | 0x481b => {
-                log::debug!("nvhost-gpu:SubmitGPFIFO");
-                if out.len() >= 24 {
-                    out[16..20].copy_from_slice(&1u32.to_le_bytes());
-                    out[20..24].copy_from_slice(&1u32.to_le_bytes());
+                if req.in_data.len() >= 16 {
+                    let address = u64::from_le_bytes([
+                        req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],
+                        req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7],
+                    ]);
+                    let num_entries = u32::from_le_bytes([
+                        req.in_data[8], req.in_data[9], req.in_data[10], req.in_data[11],
+                    ]);
+                    log::debug!("nvhost-gpu:SubmitGPFIFO addr={:#x} entries={}", address, num_entries);
+
+                    if cmd == 0x4808 && req.in_data.len() >= 16 + (num_entries as usize) * 8 {
+                        let entries: Vec<gpu::CommandListHeader> = (0..num_entries as usize).map(|i| {
+                            let off = 16 + i * 8;
+                            gpu::CommandListHeader {
+                                address_lo: u32::from_le_bytes([
+                                    req.in_data[off], req.in_data[off + 1],
+                                    req.in_data[off + 2], req.in_data[off + 3],
+                                ]),
+                                address_hi_and_count: u32::from_le_bytes([
+                                    req.in_data[off + 4], req.in_data[off + 5],
+                                    req.in_data[off + 6], req.in_data[off + 7],
+                                ]),
+                            }
+                        }).collect();
+                        let (syncpt_id, syncpt_value) = self.gpu.process_inline_gpfifo(&entries, mem_read);
+                        log::debug!("nvhost-gpu:SubmitGPFIFO processed {} entries (draws={}, clears={})",
+                            entries.len(), self.gpu.maxwell3d.lock().draw_count(),
+                            self.gpu.maxwell3d.lock().clear_count());
+                        if out.len() >= 24 {
+                            out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
+                            out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
+                        }
+                    } else if cmd == 0x481b && address != 0 {
+                        let (syncpt_id, syncpt_value) = self.gpu.submit_gpfifo(address, num_entries, mem_read);
+                        log::debug!("nvhost-gpu:SubmitGPFIFO (kickoff) addr={:#x} entries={} draws={}",
+                            address, num_entries, self.gpu.maxwell3d.lock().draw_count());
+                        if out.len() >= 24 {
+                            out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
+                            out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
+                        }
+                    } else {
+                        let syncpt_id: u32 = 0;
+                        let syncpt_value: u32 = 1;
+                        if out.len() >= 24 {
+                            out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
+                            out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
+                        }
+                    }
                 }
             }
             0x4809 => { log::debug!("nvhost-gpu:AllocateObjectContext"); }
@@ -358,6 +457,29 @@ impl Nvdrv {
 
     pub fn submit_frame(&self, frame: QueuedFrame) {
         self.frame_queue.lock().push(frame);
+    }
+
+    pub fn capture_gpu_frame(&self, mem_read: impl Fn(u64, &mut [u8]) -> bool) -> Option<QueuedFrame> {
+        let maxwell = self.gpu.maxwell3d.lock();
+        let (w, h) = maxwell.primary_rt_size()?;
+        let gpu_va = maxwell.primary_rt_gpu_va()?;
+        drop(maxwell);
+
+        let mappings = self.gpu.mappings.lock();
+        let cpu = mappings.cpu_address_for(gpu_va)?;
+        drop(mappings);
+
+        let size = (w as usize) * (h as usize) * 4;
+        let mut pixels = vec![0u8; size];
+        if mem_read(cpu, &mut pixels) {
+            Some(QueuedFrame { width: w, height: h, pixels })
+        } else {
+            None
+        }
+    }
+
+    pub fn gpu_draw_count(&self) -> u64 {
+        self.gpu.maxwell3d.lock().draw_count()
     }
 }
 

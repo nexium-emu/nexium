@@ -109,10 +109,19 @@ impl Kernel {
             });
         }
 
+        if self.pending_frames.is_empty() && self.nvdrv.gpu_draw_count() > 0 {
+            let addr_space = self.address_space.clone();
+            if let Some(qf) = self.nvdrv.capture_gpu_frame(|addr, buf| addr_space.read(addr, buf).is_ok()) {
+                log::info!("captured GPU rt frame {}x{}", qf.width, qf.height);
+                self.pending_frames.push(FrameOut {
+                    width: qf.width, height: qf.height, pixels: qf.pixels,
+                });
+            }
+        }
+
         if self.pending_frames.is_empty() && self.cycle_count >= self.next_vsync_cycle {
             self.next_vsync_cycle = self.cycle_count + 1_000_000;
             let frame = self.synthesize_test_frame();
-            log::debug!("vsync test frame: cycle={} {}x{}", self.cycle_count, frame.width, frame.height);
             self.pending_frames.push(frame);
         }
 

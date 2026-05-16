@@ -1000,7 +1000,10 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             let req = crate::nvdrv::IoctlRequest {
                 fd, ioctl_id, in_data, out_size,
             };
-            let outcome = kernel.nvdrv.dispatch_ioctl(req);
+            let addr_space = kernel.address_space.clone();
+            let outcome = kernel.nvdrv.dispatch_ioctl_with_mem(req, &|addr, buf| {
+                addr_space.read(addr, buf).is_ok()
+            });
 
             if !outcome.data.is_empty() {
                 if let Some(buf) = out_dst {
