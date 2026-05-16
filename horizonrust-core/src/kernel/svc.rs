@@ -42,13 +42,11 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
 }
 
 fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcSetHeapSize (X0=heap_size, X1=heap_addr_ptr)");
-
-    if let Some(cpu) = &kernel.cpu {
-        let heap_size = cpu.get_register(0);
-        log::debug!("  heap_size: {:#x}", heap_size);
+    let size = if let Some(cpu) = &kernel.cpu { cpu.get_register(0) } else { return 1; };
+    log::debug!("svcSetHeapSize size={:#x} -> heap_base={:#x}", size, kernel.heap_base);
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(1, kernel.heap_base);
     }
-
     SUCCESS
 }
 
@@ -178,51 +176,28 @@ fn svc_cancel_synchronization(_kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcSendSyncRequest");
-
     let (tls_addr, session_handle) = if let Some(cpu) = &kernel.cpu {
         (cpu.get_tpidrro_el0(), cpu.get_register(0) as u32)
     } else {
         return 1;
     };
 
-    let mut tls_buf = vec![0u8; 256];
-    if let Err(_) = kernel.address_space.read(tls_addr, &mut tls_buf) {
-        log::warn!("Failed to read TLS buffer from {:#x}", tls_addr);
+    let mut tls_buf = vec![0u8; 0x100];
+    if kernel.address_space.read(tls_addr, &mut tls_buf).is_err() {
+        log::warn!("SendSyncRequest: failed to read TLS at {:#x}", tls_addr);
         return 1;
     }
 
-    if tls_buf.len() < 24 {
-        log::warn!("TLS buffer too small");
-        return 1;
-    }
-
-    if tls_buf[..4] != *b"SFCI" {
-        log::warn!("bad SFCI magic");
-        return 1;
-    }
-
-    let cmd_id = u32::from_le_bytes([
-        tls_buf[8],
-        tls_buf[9],
-        tls_buf[10],
-        tls_buf[11],
-    ]);
-    let token = u32::from_le_bytes([
-        tls_buf[12],
-        tls_buf[13],
-        tls_buf[14],
-        tls_buf[15],
-    ]);
-
-    let port_name = if let Some(session) = kernel.sessions.get(&session_handle) {
-        session.port_name.clone()
-    } else {
-        log::warn!("invalid session handle {:#x}", session_handle);
-        return 1;
+    let port_name = match kernel.sessions.get(&session_handle) {
+        Some(s) => s.port_name.clone(),
+        None => {
+            log::warn!("SendSyncRequest: invalid session handle {:#x}", session_handle);
+            return 1;
+        }
     };
 
-    log::debug!("  session handle {:#x} -> port '{}', cmd_id {}", session_handle, port_name, cmd_id);
+    let (cmd_id, token, data_offset) = parse_ipc_cmd_id(&tls_buf);
+    log::debug!("IPC port='{}' cmd={} handle={:#x}", port_name, cmd_id, session_handle);
 
     let tls_snapshot = tls_buf.clone();
     let mut pending_frames = std::mem::take(&mut kernel.pending_frames);
@@ -233,31 +208,77 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     let result = kernel.services.dispatch_service(&port_name, cmd_id, &mut ipc_ctx);
     kernel.pending_frames = pending_frames;
 
-    let response_header = [
-        0x46, 0x43, 0x4F, 0x53, 0x01, 0x00, 0x00, 0x00,
-        (result & 0xFF) as u8,
-        ((result >> 8) & 0xFF) as u8,
-        ((result >> 16) & 0xFF) as u8,
-        ((result >> 24) & 0xFF) as u8,
-        token as u8,
-        (token >> 8) as u8,
-        (token >> 16) as u8,
-        (token >> 24) as u8,
-    ];
+    write_ipc_response(&mut tls_buf, data_offset, result, token);
 
-    tls_buf[..16].copy_from_slice(&response_header);
-
-    if let Err(_) = kernel.address_space.write(tls_addr, &tls_buf) {
-        log::warn!("Failed to write TLS response to {:#x}", tls_addr);
+    if kernel.address_space.write(tls_addr, &tls_buf).is_err() {
+        log::warn!("SendSyncRequest: failed to write TLS response at {:#x}", tls_addr);
         return 1;
     }
 
-    if result != SUCCESS {
-        log::warn!("service dispatch returned error: {:#x}", result);
-        return result;
+    SUCCESS
+}
+
+fn parse_ipc_cmd_id(buf: &[u8]) -> (u32, u32, usize) {
+    if buf.len() < 8 {
+        return (0, 0, 8);
+    }
+    let hipc_word0 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let hipc_word1 = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+    let num_send_statics = (hipc_word0 >> 16) & 0xF;
+    let num_send_buffers = (hipc_word0 >> 20) & 0xF;
+    let num_recv_buffers = (hipc_word0 >> 24) & 0xF;
+    let num_exch_buffers = (hipc_word0 >> 28) & 0xF;
+    let num_data_words   = (hipc_word1 >> 0)  & 0x3FF;
+    let has_special      = (hipc_word1 >> 31) & 1;
+
+    let mut cursor: usize = 8;
+
+    if has_special != 0 && buf.len() >= cursor + 4 {
+        let special = u32::from_le_bytes([buf[cursor], buf[cursor+1], buf[cursor+2], buf[cursor+3]]);
+        let num_copy_handles = (special >> 0) & 0xF;
+        let num_move_handles = (special >> 4) & 0xF;
+        let send_pid = (special >> 8) & 1;
+        cursor += 4;
+        if send_pid != 0 { cursor += 8; }
+        cursor += (num_copy_handles + num_move_handles) as usize * 4;
     }
 
-    SUCCESS
+    cursor += num_send_statics as usize * 8;
+    cursor += (num_send_buffers + num_recv_buffers + num_exch_buffers) as usize * 12;
+
+    cursor = (cursor + 3) & !3;
+
+    let data_start = cursor;
+
+    if num_data_words == 0 {
+        return (0, 0, data_start);
+    }
+
+    if buf.len() < cursor + 16 {
+        return (0, 0, data_start);
+    }
+
+    if &buf[cursor..cursor+4] == b"SFCI" {
+        let cmd_id = u32::from_le_bytes([buf[cursor+8], buf[cursor+9], buf[cursor+10], buf[cursor+11]]);
+        let token  = u32::from_le_bytes([buf[cursor+12], buf[cursor+13], buf[cursor+14], buf[cursor+15]]);
+        return (cmd_id, token, data_start);
+    }
+
+    (0, 0, data_start)
+}
+
+fn write_ipc_response(buf: &mut [u8], data_offset: usize, result: u32, token: u32) {
+    let hipc_resp: u64 = 0x0000_0004_0000_0000;
+    buf[0..8].copy_from_slice(&hipc_resp.to_le_bytes());
+
+    let off = (data_offset + 3) & !3;
+    if buf.len() >= off + 16 {
+        buf[off..off+4].copy_from_slice(b"SFCO");
+        buf[off+4..off+8].copy_from_slice(&0u32.to_le_bytes());
+        buf[off+8..off+12].copy_from_slice(&result.to_le_bytes());
+        buf[off+12..off+16].copy_from_slice(&token.to_le_bytes());
+    }
 }
 
 fn svc_send_sync_request_with_user_buffer(_kernel: &mut Kernel) -> u32 {
@@ -342,37 +363,47 @@ fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_get_info(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcGetInfo (X0=type, X1=handle, X2=info_id)");
+    let (info_type, _handle, _info_id) = if let Some(cpu) = &kernel.cpu {
+        (cpu.get_register(0), cpu.get_register(1), cpu.get_register(2))
+    } else {
+        return 1;
+    };
 
-    if let Some(cpu) = &kernel.cpu {
-        let info_type = cpu.get_register(0);
-        let handle = cpu.get_register(1);
-        let info_id = cpu.get_register(2);
-
-        log::debug!("  type={}, handle={:#x}, id={}", info_type, handle, info_id);
-
-        match info_type {
-            2 => {
-                log::debug!("  GetInfo::MemoryUsage");
-                if let Some(cpu_mut) = &mut kernel.cpu {
-                    cpu_mut.set_register(0, kernel.heap_size);
-                }
-                return SUCCESS;
-            }
-            11 => {
-                log::debug!("  GetInfo::ThreadCount");
-                if let Some(cpu_mut) = &mut kernel.cpu {
-                    cpu_mut.set_register(0, 1);
-                }
-                return SUCCESS;
-            }
-            _ => {
-                log::debug!("  unknown info type: {}", info_type);
-                return 1;
-            }
+    let val: u64 = match info_type {
+        0  => 0xF,
+        1  => 0x0001_0000_0000,
+        2  => kernel.code_base,
+        3  => 0x4_0000_0000,
+        4  => kernel.heap_base,
+        5  => kernel.heap_size,
+        6  => 0x80_000_000,
+        7  => 0x40_000_000,
+        8  => 0,
+        9  => kernel.stack_base,
+        10 => kernel.stack_size,
+        11 => 0xCAFE_F00D_DEAD_BEEF,
+        12 => kernel.code_base,
+        13 => 0x40_0000_0000,
+        14 => kernel.stack_base,
+        15 => 0x4_000_000,
+        16 => 0,
+        17 => 0,
+        18 => 0,
+        19 => 0,
+        20 => 0,
+        21 => 0,
+        22 => kernel.code_base,
+        _  => {
+            log::warn!("svcGetInfo: unknown type {}", info_type);
+            if let Some(cpu) = &mut kernel.cpu { cpu.set_register(0, 0); }
+            return SUCCESS;
         }
-    }
+    };
 
+    log::debug!("svcGetInfo type={} -> {:#x}", info_type, val);
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(1, val);
+    }
     SUCCESS
 }
 
