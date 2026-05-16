@@ -61,6 +61,15 @@ impl BootContext {
         address_space.map(env_base, 0x10000, Perm::RW, "extras")
             .map_err(|e| format!("Failed to map extras: {:?}", e))?;
 
+        log::info!("  Initializing environment block @ {:#x}", env_base);
+        let mut env_block = vec![0u8; 0x10000];
+
+        env_block[0x0..0x4].copy_from_slice(&0x04u32.to_le_bytes());
+        env_block[0x4..0x8].copy_from_slice(&0u32.to_le_bytes());
+
+        address_space.write(env_base, &env_block)
+            .map_err(|e| format!("Failed to write env block: {:?}", e))?;
+
         log::info!("  Writing exit stub SVC instruction @ {:#x}", exit_stub_va);
         let svc_exit_insn: u32 = 0xD400_00E1;
         address_space.write(exit_stub_va, &svc_exit_insn.to_le_bytes())
