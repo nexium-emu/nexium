@@ -82,6 +82,12 @@ impl Cpu {
             Cpu::Dynarmic(cpu) => cpu.step(),
         }
     }
+
+    pub fn inject_svc(&mut self, imm: u16) {
+        match self {
+            Cpu::Dynarmic(cpu) => cpu.inject_svc(imm),
+        }
+    }
 }
 
 pub use dynarmic::CpuEvent;

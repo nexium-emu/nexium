@@ -71,7 +71,7 @@ fn svc_query_memory(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_exit_process(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcExitProcess");
+    log::info!("svcExitProcess - terminating process");
     SUCCESS
 }
 
@@ -169,8 +169,28 @@ fn svc_break(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_output_debug_string(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcOutputDebugString");
+fn svc_output_debug_string(kernel: &mut Kernel) -> u32 {
+    log::debug!("svcOutputDebugString (X0=str_ptr, X1=str_len)");
+
+    if let Some(cpu) = &kernel.cpu {
+        let str_ptr = cpu.get_register(0);
+        let str_len = cpu.get_register(1);
+
+        if str_ptr > 0 && str_len > 0 && str_len < 4096 {
+            let mut buf = vec![0u8; str_len as usize];
+            match kernel.address_space.read(str_ptr, &mut buf) {
+                Ok(()) => {
+                    let output = std::str::from_utf8(&buf).unwrap_or("[invalid utf8]");
+                    println!("[DEBUG] {}", output);
+                    log::debug!("OutputDebugString: {}", output);
+                }
+                Err(e) => {
+                    log::warn!("Failed to read debug string from {:#x}: {:?}", str_ptr, e);
+                }
+            }
+        }
+    }
+
     SUCCESS
 }
 

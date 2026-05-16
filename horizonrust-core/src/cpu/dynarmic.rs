@@ -7,6 +7,7 @@ pub struct DynarmicCpu {
     sp: u64,
     tpidrro_el0: u64,
     memory: Arc<Mutex<Vec<u8>>>,
+    pending_svc: Option<u16>,
 }
 
 impl DynarmicCpu {
@@ -24,7 +25,12 @@ impl DynarmicCpu {
             sp: 0,
             tpidrro_el0: 0,
             memory,
+            pending_svc: None,
         })
+    }
+
+    pub fn inject_svc(&mut self, imm: u16) {
+        self.pending_svc = Some(imm);
     }
 
     pub fn set_register(&mut self, reg: u32, val: u64) {
@@ -70,6 +76,10 @@ impl DynarmicCpu {
     }
 
     pub fn run(&mut self, cycle_count: u64) -> CpuEvent {
+        if let Some(svc) = self.pending_svc.take() {
+            return CpuEvent::Svc(svc);
+        }
+
         let initial_pc = self.pc;
         log::debug!("CPU running {} cycles from PC {:#x}", cycle_count, initial_pc);
 
@@ -93,6 +103,8 @@ pub enum CpuEvent {
     Running,
     Stalled,
     Interrupted,
+    Svc(u16),
+    Exception(u32),
 }
 
 impl Default for DynarmicCpu {
@@ -103,6 +115,7 @@ impl Default for DynarmicCpu {
             sp: 0,
             tpidrro_el0: 0,
             memory: Arc::new(Mutex::new(vec![0u8; 0x10000])),
+            pending_svc: None,
         }
     }
 }

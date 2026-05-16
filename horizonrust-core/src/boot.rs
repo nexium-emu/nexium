@@ -114,6 +114,7 @@ impl BootContext {
 
         let max_cycles = 1_000_000_000u64;
         let mut cycle_count = 0u64;
+        let mut svc_count = 0u32;
 
         loop {
             if let Some(cpu) = &mut self.kernel.cpu {
@@ -122,17 +123,35 @@ impl BootContext {
                 cycle_count += 100_000;
 
                 match event {
-                    CpuEvent::Running => {
+                    crate::cpu::CpuEvent::Running => {
                         if cycle_count % 10_000_000 == 0 {
                             log::debug!("CPU running... {} cycles executed", cycle_count);
                         }
                     }
-                    CpuEvent::Stalled => {
+                    crate::cpu::CpuEvent::Svc(imm) => {
+                        svc_count += 1;
+                        log::debug!("SVC {:#04x} (count: {})", imm, svc_count);
+
+                        let result = self.kernel.dispatch_svc(imm);
+
+                        if let Some(cpu) = &mut self.kernel.cpu {
+                            cpu.set_register(0, result as u64);
+                        }
+
+                        if result == 0 || result == 1 {
+                            continue;
+                        }
+                    }
+                    crate::cpu::CpuEvent::Stalled => {
                         log::info!("CPU stalled at {:#x}", cpu.get_pc());
                         break;
                     }
-                    CpuEvent::Interrupted => {
+                    crate::cpu::CpuEvent::Interrupted => {
                         log::info!("CPU interrupted");
+                        break;
+                    }
+                    crate::cpu::CpuEvent::Exception(code) => {
+                        log::error!("CPU exception {:#x}", code);
                         break;
                     }
                 }
@@ -146,7 +165,7 @@ impl BootContext {
             }
         }
 
-        log::info!("Execution complete after {} cycles", cycle_count);
+        log::info!("Execution complete: {} cycles, {} SVCs", cycle_count, svc_count);
         Ok(0)
     }
 }
