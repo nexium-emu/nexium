@@ -57,19 +57,11 @@ impl BootContext {
         address_space.map(stack_base, config.stack_size, Perm::RW, "stack")
             .map_err(|e| format!("Failed to map stack: {:?}", e))?;
 
-        log::info!("  Mapping tls @ {:#x} (size 0x1000)", tls_base);
-        address_space.map(tls_base, 0x1000, Perm::RW, "tls")
-            .map_err(|e| format!("Failed to map tls: {:?}", e))?;
+        log::info!("  Mapping extras (env+tls+exit_stub) @ {:#x} (size 0x10000)", env_base);
+        address_space.map(env_base, 0x10000, Perm::RW, "extras")
+            .map_err(|e| format!("Failed to map extras: {:?}", e))?;
 
-        log::info!("  Mapping env @ {:#x} (size 0x10000)", env_base);
-        address_space.map(env_base, 0x10000, Perm::RW, "env")
-            .map_err(|e| format!("Failed to map env: {:?}", e))?;
-
-        log::info!("  Mapping exit_stub @ {:#x} (size 0x1000)", exit_stub_va);
-        address_space.map(exit_stub_va, 0x1000, Perm::RX, "exit_stub")
-            .map_err(|e| format!("Failed to map exit stub: {:?}", e))?;
-
-        log::info!("  Writing exit stub SVC instruction");
+        log::info!("  Writing exit stub SVC instruction @ {:#x}", exit_stub_va);
         let svc_exit_insn: u32 = 0xD400_00E1;
         address_space.write(exit_stub_va, &svc_exit_insn.to_le_bytes())
             .map_err(|e| format!("Failed to write exit stub: {:?}", e))?;
