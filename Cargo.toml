@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "horizonrust-common",
+    "horizonrust-core",
+    "horizonrust-gpu",
+    "horizonrust-gui",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+license = "GPL-2.0-or-later"
+
+[workspace.dependencies]
+horizonrust-common = { path = "horizonrust-common" }
+horizonrust-core = { path = "horizonrust-core" }
+horizonrust-gpu = { path = "horizonrust-gpu" }
+
+bytemuck = { version = "1", features = ["derive"] }
+zerocopy = { version = "0.7", features = ["derive"] }
+modular-bitfield = "0.11"
+bitflags = "2"
+num_enum = "0.7"
+byteorder = "1"
+
+aes = "0.8"
+lz4_flex = { version = "0.11", default-features = false }
+
+parking_lot = "0.12"
+crossbeam = "0.8"
+
+thiserror = "1"
+log = "0.4"
+env_logger = "0.11"
+
+ash = "0.38"
+gpu-allocator = "0.27"
+raw-window-handle = "0.6"
+winit = "0.30"
+
+rspirv = "0.12"
+naga = { version = "0.14", features = ["spv-in"] }
+
+eframe = { version = "0.29", features = ["wgpu"] }
+egui = "0.29"
+rfd = "0.15"
+
+cpal = "0.15"
+gilrs = "0.10"
+
+serde = { version = "1", features = ["derive"] }
+directories = "5"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1

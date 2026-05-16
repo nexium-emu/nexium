@@ -1,0 +1,9 @@
+[package]
+name = "horizonrust-gpu"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+horizonrust-common.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "horizonrust-gui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "horizonrust"
+path = "src/main.rs"
+
+[dependencies]
+horizonrust-common.workspace = true

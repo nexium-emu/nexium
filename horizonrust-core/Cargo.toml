@@ -1,0 +1,28 @@
+[package]
+name = "horizonrust-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+horizonrust-common.workspace = true
+
+bytemuck.workspace = true
+zerocopy.workspace = true
+modular-bitfield.workspace = true
+bitflags.workspace = true
+num_enum.workspace = true
+byteorder.workspace = true
+
+aes.workspace = true
+lz4_flex.workspace = true
+
+parking_lot.workspace = true
+crossbeam.workspace = true
+
+log.workspace = true
+thiserror.workspace = true
+
+rspirv.workspace = true
+naga.workspace = true
