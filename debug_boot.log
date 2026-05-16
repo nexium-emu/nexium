@@ -53,14 +53,26 @@ Initial SP: 0xa0000fffe0
 [1600000] CPU: 0x8000493ed4 → 0x8000493ed4 event=Svc(33)
 [1600000] >> PC 0x8000493ed4
 [1600000] SVC 0x21 @ 0x8000493ed4 (count: 16)
-[1700000] CPU: 0x8000493ed4 → 0x8000493e7c event=Svc(22)
-[1700000] >> PC 0x8000493e7c
-[1700000] SVC 0x16 @ 0x8000493ed4 (count: 17)
-[1800000] CPU: 0x8000493e7c → 0x8000493edc event=Svc(38)
-[1800000] >> PC 0x8000493edc
-[1800000] SVC 0x26 @ 0x8000493e7c (count: 18)
-[1800000] Process exited via svcBreak
+[1700000] CPU: 0x8000493ed4 → 0x8000493ed4 event=Svc(33)
+[1700000] >> PC 0x8000493ed4
+[1700000] SVC 0x21 @ 0x8000493ed4 (count: 17)
+[1800000] CPU: 0x8000493ed4 → 0x8000493ed4 event=Svc(33)
+[1800000] >> PC 0x8000493ed4
+[1800000] SVC 0x21 @ 0x8000493ed4 (count: 18)
+[1900000] CPU: 0x8000493ed4 → 0x8000493ed4 event=Svc(33)
+[1900000] >> PC 0x8000493ed4
+[1900000] SVC 0x21 @ 0x8000493ed4 (count: 19)
+[2000000] CPU: 0x8000493ed4 → 0x8000493ed4 event=Svc(33)
+[2000000] >> PC 0x8000493ed4
+[2000000] SVC 0x21 @ 0x8000493ed4 (count: 20)
+[2100000] >> PC 0x8000493ed4
+[2100000] SVC 0x21 @ 0x8000493ed4 (count: 21)
+[2200000] >> PC 0x8000493e7c
+[2200000] SVC 0x16 @ 0x8000493ed4 (count: 22)
+[2300000] >> PC 0x8000493edc
+[2300000] SVC 0x26 @ 0x8000493e7c (count: 23)
+[2300000] Process exited via svcBreak
 
 === Emulation Complete ===
-Total cycles: 1800000
-Total SVCs: 18
+Total cycles: 2300000
+Total SVCs: 23

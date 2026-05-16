@@ -261,7 +261,7 @@ fn svc_cancel_synchronization(_kernel: &mut Kernel) -> u32 {
 fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     let (tls_addr, session_handle) = if let Some(cpu) = &kernel.cpu {
         let x0 = cpu.get_register(0) as u32;
-        log::info!("SendSyncRequest: X0={:#x}", x0);
+        log::debug!("SendSyncRequest: X0={:#x}", x0);
         (cpu.get_tpidrro_el0(), x0)
     } else {
         return 1;
@@ -281,53 +281,62 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         }
     };
 
-    // Parse IPC message using proper HIPC parsing
-    let ipc_parse_result = ipc::IpcCtx::parse(tls_buf.clone(), false);
-    let (cmd_id, token, cmif_data_off, cmif_data_len, parsed_ctx) = match ipc_parse_result {
-        Ok(ctx) => {
-            let cmd_id = ctx.cmif_in.cmd_id;
-            let token = ctx.cmif_in.token;
-            let data_off = ctx.cmif_in_data_off;
-            let data_len = ctx.cmif_in_data_len;
-            (cmd_id, token, data_off, data_len, Some(ctx))
-        },
+    let hipc_header_raw = u64::from_le_bytes([tls_buf[0], tls_buf[1], tls_buf[2], tls_buf[3], tls_buf[4], tls_buf[5], tls_buf[6], tls_buf[7]]);
+    let cmd_type = (hipc_header_raw & 0xFFFF) as u16;
+
+    match cmd_type {
+        2 => {
+            log::debug!("session Close session={:#x} service={}", session_handle, port_name);
+            kernel.sessions.remove(&session_handle);
+            if let Some(cpu) = &mut kernel.cpu {
+                cpu.set_register(0, SUCCESS as u64);
+            }
+            return SUCCESS;
+        }
+        5 | 7 => {
+            let response = handle_control_request(kernel, session_handle, &port_name, &tls_buf);
+            if !response.is_empty() {
+                let mut response_buf = tls_buf.clone();
+                let copy_len = response.len().min(response_buf.len());
+                response_buf[..copy_len].copy_from_slice(&response[..copy_len]);
+                let _ = kernel.address_space.write(tls_addr, &response_buf);
+            }
+            if let Some(cpu) = &mut kernel.cpu {
+                cpu.set_register(0, SUCCESS as u64);
+            }
+            return SUCCESS;
+        }
+        _ => {}
+    }
+
+    let is_domain = kernel.sessions.get(&session_handle).map(|s| s.is_domain).unwrap_or(false);
+    let ipc_parse_result = ipc::IpcCtx::parse(tls_buf.clone(), is_domain);
+    let mut ctx = match ipc_parse_result {
+        Ok(c) => c,
         Err(e) => {
-            log::warn!("Failed to parse IPC message: {:?}", e);
+            log::warn!("Failed to parse IPC message: {:?} (is_domain={})", e, is_domain);
             return 1;
         }
     };
 
-    log::info!("IPC port='{}' cmd={} handle={:#x} PC={:#x} data_off={:#x}", port_name, cmd_id, session_handle,
-        kernel.cpu.as_ref().map(|c| c.get_pc()).unwrap_or(0), cmif_data_off);
-    if port_name == "sm:" {
-        let hipc_header = u64::from_le_bytes([tls_buf[0], tls_buf[1], tls_buf[2], tls_buf[3], tls_buf[4], tls_buf[5], tls_buf[6], tls_buf[7]]);
-        let cmd_type = (hipc_header & 0xFFFF) as u16;
-        let cmif_offset = cmif_data_off - 16;
-        if tls_buf.len() >= cmif_offset + 16 {
-            let cmif_bytes = &tls_buf[cmif_offset..cmif_offset + 16];
-            let magic = std::str::from_utf8(&cmif_bytes[0..4]).unwrap_or("????");
-            let cmif_cmd_id = u32::from_le_bytes([cmif_bytes[8], cmif_bytes[9], cmif_bytes[10], cmif_bytes[11]]);
-            log::debug!("SM: HIPC cmd_type={}, CMIF magic='{}' cmd_id={}", cmd_type, magic, cmif_cmd_id);
-        }
-    }
+    let cmd_id = ctx.cmif_in.cmd_id;
 
-    let (result, out_data) = if port_name == "sm:" {
-        dispatch_sm_command(kernel, cmd_id, &tls_buf, cmif_data_off, cmif_data_len, parsed_ctx.clone())
+    log::info!("IPC request service=\"{}\" cmd={} in_data={} is_domain={}", port_name, cmd_id, ctx.cmif_in_data_len, is_domain);
+
+    let response = if port_name == "sm:" {
+        dispatch_sm_command_v2(kernel, &mut ctx)
     } else {
-        let tls_snapshot = tls_buf.clone();
         let mut pending_frames = std::mem::take(&mut kernel.pending_frames);
-        let mut ipc_ctx = crate::services::IpcCtx {
-            tls_buf: &tls_snapshot,
-            pending_frames: &mut pending_frames,
-        };
-        let (result, out_data) = kernel.services.dispatch_service(&port_name, cmd_id, &mut ipc_ctx);
+        let response = dispatch_service_v2(kernel, &port_name, &mut ctx, &mut pending_frames);
         kernel.pending_frames = pending_frames;
-        (result, out_data)
+        response
     };
 
-    write_ipc_response_with_data(&mut tls_buf, cmif_data_off, result, token, &out_data);
+    let mut response_buf = vec![0u8; 0x100];
+    let copy_len = response.len().min(response_buf.len());
+    response_buf[..copy_len].copy_from_slice(&response[..copy_len]);
 
-    if kernel.address_space.write(tls_addr, &tls_buf).is_err() {
+    if kernel.address_space.write(tls_addr, &response_buf).is_err() {
         log::warn!("SendSyncRequest: failed to write TLS response at {:#x}", tls_addr);
         if let Some(cpu) = &mut kernel.cpu {
             cpu.set_register(0, 1u64);
@@ -339,6 +348,154 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
+}
+
+fn handle_control_request(kernel: &mut Kernel, session_handle: u32, port_name: &str, tls_buf: &[u8]) -> Vec<u8> {
+    let parse_result = ipc::IpcCtx::parse(tls_buf.to_vec(), false);
+    let mut ctx = match parse_result {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    match ctx.cmif_in.cmd_id {
+        0 => {
+            log::debug!("Control: ConvertCurrentObjectToDomain service={}", port_name);
+            if let Some(session) = kernel.sessions.get_mut(&session_handle) {
+                session.is_domain = true;
+            }
+            build_ipc_response(&ctx, 0, &1u32.to_le_bytes(), &[])
+        }
+        1 => {
+            log::debug!("Control: CopyFromCurrentDomain service={}", port_name);
+            build_ipc_response(&ctx, 0, &[], &[])
+        }
+        2 | 4 => {
+            let dup_handle = kernel.handles.create_handle(HandleType::Session);
+            let session = Session::new(dup_handle, port_name.to_string());
+            kernel.sessions.insert(dup_handle, session);
+            log::debug!("Control: CloneCurrentObject service={} dup={:#x}", port_name, dup_handle);
+            build_ipc_response(&mut ctx, 0, &[], &[dup_handle])
+        }
+        3 => {
+            log::debug!("Control: QueryPointerBufferSize → 0x500 service={}", port_name);
+            build_ipc_response(&mut ctx, 0, &0x500u16.to_le_bytes(), &[])
+        }
+        other => {
+            log::debug!("Control: unknown cmd={} service={}", other, port_name);
+            build_ipc_response(&mut ctx, 0, &[], &[])
+        }
+    }
+}
+
+fn build_ipc_response(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move_handles: &[u32]) -> Vec<u8> {
+    let is_domain = ctx.domain.is_some();
+
+    let mut raw_size = 0usize;
+    if is_domain {
+        raw_size += 16;
+    }
+    raw_size += 16;
+    raw_size += out_data.len();
+    let raw_padded = (raw_size + 3) & !3;
+
+    let mut special_bytes: Vec<u8> = Vec::new();
+    let has_special_header = !move_handles.is_empty();
+    if has_special_header {
+        let mut sh: u32 = 0;
+        sh |= (move_handles.len() as u32 & 0xF) << 5;
+        special_bytes.extend_from_slice(&sh.to_le_bytes());
+        for h in move_handles {
+            special_bytes.extend_from_slice(&h.to_le_bytes());
+        }
+    }
+
+    let mut hipc: u64 = 0;
+    hipc |= ((raw_padded / 4) as u64 & 0x3FF) << 32;
+    if has_special_header {
+        hipc |= 1u64 << 63;
+    }
+
+    let raw_data_off = (8 + special_bytes.len() + 15) & !15;
+    let total = raw_data_off + raw_padded;
+    let mut out = vec![0u8; total];
+
+    out[0..8].copy_from_slice(&hipc.to_le_bytes());
+    if !special_bytes.is_empty() {
+        out[8..8 + special_bytes.len()].copy_from_slice(&special_bytes);
+    }
+
+    let mut p = raw_data_off;
+    if is_domain {
+        p += 16;
+    }
+
+    out[p..p + 4].copy_from_slice(b"SFCO");
+    out[p + 4..p + 8].copy_from_slice(&1u32.to_le_bytes());
+    out[p + 8..p + 12].copy_from_slice(&result.to_le_bytes());
+    out[p + 12..p + 16].copy_from_slice(&ctx.cmif_in.token.to_le_bytes());
+    p += 16;
+
+    if !out_data.is_empty() && p + out_data.len() <= out.len() {
+        out[p..p + out_data.len()].copy_from_slice(out_data);
+    }
+
+    out
+}
+
+fn dispatch_sm_command_v2(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx) -> Vec<u8> {
+    match ctx.cmif_in.cmd_id {
+        0 => {
+            let pid = ctx.send_pid;
+            log::info!("sm:RegisterClient pid={:?}", pid);
+            build_ipc_response(ctx, 0, &[], &[])
+        }
+        1 => {
+            let name_bytes = if ctx.cmif_in_data_off + 8 <= ctx.buf.len() {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&ctx.buf[ctx.cmif_in_data_off..ctx.cmif_in_data_off + 8]);
+                arr
+            } else {
+                [0u8; 8]
+            };
+            let trimmed = name_bytes.split(|&b| b == 0).next().unwrap_or(&name_bytes);
+            let name = String::from_utf8_lossy(trimmed).into_owned();
+            log::info!("sm:GetServiceHandle name={} raw={:02x?}", name, name_bytes);
+
+            let handle = kernel.handles.create_handle(HandleType::Session);
+            let session = Session::new(handle, name.clone());
+            kernel.sessions.insert(handle, session);
+
+            build_ipc_response(ctx, 0, &[], &[handle])
+        }
+        2 => {
+            log::info!("sm:RegisterService");
+            let handle = kernel.handles.create_handle(HandleType::Session);
+            build_ipc_response(ctx, 0, &[], &[handle])
+        }
+        3 => {
+            log::info!("sm:UnregisterService");
+            build_ipc_response(ctx, 0, &[], &[])
+        }
+        4 => {
+            log::info!("sm:DetachClient");
+            build_ipc_response(ctx, 0, &[], &[])
+        }
+        other => {
+            log::warn!("sm: unknown cmd={}", other);
+            build_ipc_response(ctx, 1, &[], &[])
+        }
+    }
+}
+
+fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcCtx, pending_frames: &mut Vec<crate::services::FrameOut>) -> Vec<u8> {
+    let cmd_id = ctx.cmif_in.cmd_id;
+    let tls_snapshot = ctx.buf.clone();
+    let mut svc_ctx = crate::services::IpcCtx {
+        tls_buf: &tls_snapshot,
+        pending_frames,
+    };
+    let (result, out_data) = kernel.services.dispatch_service(port_name, cmd_id, &mut svc_ctx);
+    build_ipc_response(ctx, result, &out_data, &[])
 }
 
 fn dispatch_sm_command(kernel: &mut Kernel, cmd_id: u32, tls_buf: &[u8], cmif_data_off: usize, cmif_data_len: usize, parsed_ctx: Option<ipc::IpcCtx>) -> (u32, Vec<u8>) {
