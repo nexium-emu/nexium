@@ -9,6 +9,10 @@ license.workspace = true
 name = "horizonrust"
 path = "src/main.rs"
 
+[[bin]]
+name = "debug_boot"
+path = "src/debug_boot.rs"
+
 [dependencies]
 horizonrust-common.workspace = true
 horizonrust-core.workspace = true

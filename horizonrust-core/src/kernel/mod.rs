@@ -38,6 +38,7 @@ pub struct Kernel {
     pub cycle_count: u64,
     pub next_vsync_cycle: u64,
     pub display_ready: bool,
+    pub process_exited: bool,
 }
 
 impl Kernel {
@@ -71,6 +72,7 @@ impl Kernel {
             cycle_count: 0,
             next_vsync_cycle: 16_666_667,
             display_ready: false,
+            process_exited: false,
         }
     }
 

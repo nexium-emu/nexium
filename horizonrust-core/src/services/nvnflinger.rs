@@ -24,14 +24,14 @@ impl BufferQueueService {
     }
 
     pub fn dispatch(&mut self, cmd_id: u32, ctx: &mut IpcCtx) -> u32 {
-        log::trace!("nvnflinger/dispdrv cmd: {}", cmd_id);
+        log::info!("nvnflinger/dispdrv cmd: {}", cmd_id);
         match cmd_id {
             0 => self.transact_parcel(ctx),
-            1 => { log::trace!("AdjustRefcount"); SUCCESS }
-            2 => { log::trace!("GetNativeHandle"); SUCCESS }
+            1 => { log::info!("AdjustRefcount"); SUCCESS }
+            2 => { log::info!("GetNativeHandle"); SUCCESS }
             3 => self.transact_parcel(ctx),
             _ => {
-                log::warn!("unknown nvnflinger command: {}", cmd_id);
+                log::info!("nvnflinger stub command: {}", cmd_id);
                 SUCCESS
             }
         }

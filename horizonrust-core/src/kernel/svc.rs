@@ -324,8 +324,10 @@ fn svc_get_thread_id(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_break(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcBreak");
+fn svc_break(kernel: &mut Kernel) -> u32 {
+    let reason = if let Some(cpu) = &kernel.cpu { cpu.get_register(0) } else { 0 };
+    log::info!("svcBreak: reason={:#x}", reason);
+    kernel.process_exited = true;
     SUCCESS
 }
 
@@ -355,12 +357,12 @@ fn svc_output_debug_string(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcConnectToNamedPort (X1=port_name_ptr)");
+    log::info!("svcConnectToNamedPort (X1=port_name_ptr)");
 
     let port_name_ptr = if let Some(cpu) = &kernel.cpu {
         cpu.get_register(1)
     } else {
-        0
+        return 1;
     };
 
     let port_name = if port_name_ptr > 0 {
@@ -371,16 +373,17 @@ fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
                     .unwrap_or("invalid")
                     .trim_end_matches('\0')
                     .to_string();
-                log::debug!("  port_name: '{}'", name_str);
+                log::info!("  port_name: '{}' PC={:#x}", name_str,
+                    kernel.cpu.as_ref().map(|c| c.get_pc()).unwrap_or(0));
                 name_str
             }
             Err(_) => {
                 log::warn!("failed to read port name from {:#x}", port_name_ptr);
-                "sm:".to_string()
+                return 1;
             }
         }
     } else {
-        "sm:".to_string()
+        return 1;
     };
 
     let handle = kernel.handles.create_handle(HandleType::Session);
@@ -391,7 +394,7 @@ fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
         cpu.set_register(0, handle as u64);
     }
 
-    log::debug!("created session handle {:#x} to port '{}'", handle, port_name);
+    log::info!("created session handle {:#x} to port '{}'", handle, port_name);
     SUCCESS
 }
 

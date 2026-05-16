@@ -110,6 +110,11 @@ impl EmulationHandle {
                             for f in boot_ctx.kernel.drain_frames() {
                                 let _ = frame_tx.try_send(f.into());
                             }
+
+                            if boot_ctx.kernel.process_exited {
+                                log::info!("Process exited via svcBreak");
+                                break;
+                            }
                         }
                         horizonrust_core::cpu::CpuEvent::Stalled => {
                             log::info!("CPU stalled at {:#x}", cpu.get_pc());

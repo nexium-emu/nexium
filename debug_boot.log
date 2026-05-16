@@ -1,0 +1,18 @@
+=== HorizonRust Debug Boot ===
+NRO: space-nx-master/spacenx.nro
+Starting boot context...
+Boot context initialized
+Starting emulation loop
+Initial PC: 0x8000000000
+Initial SP: 0xa0000fffe0
+[100000] CPU: 0x8000000000 → 0x8000493d58 event=Svc(2)
+[100000] SVC 0x02 @ 0x8000000000 (count: 1)
+[200000] CPU: 0x8000493d58 → 0x8000493d60 event=Svc(3)
+[200000] SVC 0x03 @ 0x8000493d58 (count: 2)
+[300000] CPU: 0x8000493d60 → 0x8000493e4c event=Svc(38)
+[300000] SVC 0x26 @ 0x8000493d60 (count: 3)
+[300000] Process exited via svcBreak
+
+=== Emulation Complete ===
+Total cycles: 300000
+Total SVCs: 3
