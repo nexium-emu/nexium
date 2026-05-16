@@ -282,19 +282,25 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     };
 
     let (cmd_id, token, data_offset) = parse_ipc_cmd_id(&tls_buf);
-    log::info!("IPC port='{}' cmd={} handle={:#x} PC={:#x}", port_name, cmd_id, session_handle,
-        kernel.cpu.as_ref().map(|c| c.get_pc()).unwrap_or(0));
+    log::info!("IPC port='{}' cmd={} handle={:#x} PC={:#x} data_offset={:#x}", port_name, cmd_id, session_handle,
+        kernel.cpu.as_ref().map(|c| c.get_pc()).unwrap_or(0), data_offset);
+    log::debug!("IPC TLS buffer (first 48 bytes): {:02x?}", &tls_buf[..48.min(tls_buf.len())]);
 
-    let tls_snapshot = tls_buf.clone();
-    let mut pending_frames = std::mem::take(&mut kernel.pending_frames);
-    let mut ipc_ctx = IpcCtx {
-        tls_buf: &tls_snapshot,
-        pending_frames: &mut pending_frames,
+    let (result, out_data) = if port_name == "sm:" {
+        dispatch_sm_command(kernel, cmd_id, &tls_buf, data_offset)
+    } else {
+        let tls_snapshot = tls_buf.clone();
+        let mut pending_frames = std::mem::take(&mut kernel.pending_frames);
+        let mut ipc_ctx = IpcCtx {
+            tls_buf: &tls_snapshot,
+            pending_frames: &mut pending_frames,
+        };
+        let result = kernel.services.dispatch_service(&port_name, cmd_id, &mut ipc_ctx);
+        kernel.pending_frames = pending_frames;
+        (result, Vec::new())
     };
-    let result = kernel.services.dispatch_service(&port_name, cmd_id, &mut ipc_ctx);
-    kernel.pending_frames = pending_frames;
 
-    write_ipc_response(&mut tls_buf, data_offset, result, token);
+    write_ipc_response_with_data(&mut tls_buf, data_offset, result, token, &out_data);
 
     if kernel.address_space.write(tls_addr, &tls_buf).is_err() {
         log::warn!("SendSyncRequest: failed to write TLS response at {:#x}", tls_addr);
@@ -308,6 +314,56 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
+}
+
+fn dispatch_sm_command(kernel: &mut Kernel, cmd_id: u32, tls_buf: &[u8], data_offset: usize) -> (u32, Vec<u8>) {
+    match cmd_id {
+        0 => dispatch_sm_get_service_handle(kernel, tls_buf, data_offset),
+        1 => dispatch_sm_register_service(kernel, tls_buf, data_offset),
+        2 => (SUCCESS, Vec::new()),
+        3 => (SUCCESS, Vec::new()),
+        _ => {
+            log::warn!("unknown SM command: {}", cmd_id);
+            (1, Vec::new())
+        }
+    }
+}
+
+fn dispatch_sm_register_service(_kernel: &mut Kernel, _tls_buf: &[u8], _data_offset: usize) -> (u32, Vec<u8>) {
+    log::debug!("SM::RegisterService");
+    (SUCCESS, Vec::new())
+}
+
+fn dispatch_sm_get_service_handle(kernel: &mut Kernel, tls_buf: &[u8], data_offset: usize) -> (u32, Vec<u8>) {
+    log::debug!("SM::GetServiceHandle (data_offset={:#x})", data_offset);
+
+    let payload_off = data_offset + 16;
+    if tls_buf.len() < payload_off + 8 {
+        log::warn!("SM::GetServiceHandle: TLS buffer too small (need at least {} bytes)", payload_off + 8);
+        return (1, Vec::new());
+    }
+
+    let mut name_buf = [0u8; 8];
+    name_buf.copy_from_slice(&tls_buf[payload_off..payload_off+8]);
+
+    log::debug!("SM: raw bytes at {:#x}: {:02x?}", payload_off, &tls_buf[payload_off..payload_off+8]);
+
+    let service_name = std::str::from_utf8(&name_buf)
+        .unwrap_or("invalid")
+        .trim_end_matches('\0')
+        .to_string();
+
+    log::info!("SM::GetServiceHandle requesting service '{}' (parsed from offset {:#x})", service_name, payload_off);
+
+    let handle = kernel.handles.create_handle(HandleType::Session);
+    let session = Session::new(handle, service_name.clone());
+    kernel.sessions.insert(handle, session);
+
+    log::info!("SM: returning handle {:#x} for service '{}'", handle, service_name);
+    let mut response = Vec::new();
+    response.extend_from_slice(&0u32.to_le_bytes());
+    response.extend_from_slice(&handle.to_le_bytes());
+    (SUCCESS, response)
 }
 
 fn parse_ipc_cmd_id(buf: &[u8]) -> (u32, u32, usize) {
@@ -361,6 +417,10 @@ fn parse_ipc_cmd_id(buf: &[u8]) -> (u32, u32, usize) {
 }
 
 fn write_ipc_response(buf: &mut [u8], data_offset: usize, result: u32, token: u32) {
+    write_ipc_response_with_data(buf, data_offset, result, token, &[]);
+}
+
+fn write_ipc_response_with_data(buf: &mut [u8], data_offset: usize, result: u32, token: u32, out_data: &[u8]) {
     let hipc_resp: u64 = 0x0000_0004_0000_0000;
     buf[0..8].copy_from_slice(&hipc_resp.to_le_bytes());
 
@@ -370,6 +430,10 @@ fn write_ipc_response(buf: &mut [u8], data_offset: usize, result: u32, token: u3
         buf[off+4..off+8].copy_from_slice(&0u32.to_le_bytes());
         buf[off+8..off+12].copy_from_slice(&result.to_le_bytes());
         buf[off+12..off+16].copy_from_slice(&token.to_le_bytes());
+
+        if !out_data.is_empty() && off + 16 + out_data.len() <= buf.len() {
+            buf[off+16..off+16+out_data.len()].copy_from_slice(out_data);
+        }
     }
 }
 
@@ -468,14 +532,23 @@ fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
     };
 
     let port_name = if port_name_ptr > 0 {
-        let mut buf = [0u8; 12];
+        let mut buf = [0u8; 32];
         match kernel.address_space.read(port_name_ptr, &mut buf) {
             Ok(()) => {
-                let name_str = std::str::from_utf8(&buf)
+                let mut len = 0;
+                for (i, &byte) in buf.iter().enumerate() {
+                    if byte == 0 {
+                        len = i;
+                        break;
+                    }
+                    if i == buf.len() - 1 {
+                        len = buf.len();
+                    }
+                }
+                let name_str = std::str::from_utf8(&buf[..len])
                     .unwrap_or("invalid")
-                    .trim_end_matches('\0')
                     .to_string();
-                log::info!("  port_name: '{}' PC={:#x}", name_str,
+                log::info!("  port_name: '{}' (len={}) PC={:#x}", name_str, len,
                     kernel.cpu.as_ref().map(|c| c.get_pc()).unwrap_or(0));
                 name_str
             }
@@ -493,11 +566,10 @@ fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
     kernel.sessions.insert(handle, session);
 
     if let Some(cpu) = &mut kernel.cpu {
-        log::info!("  about to set X0 to {:#x}", handle);
-        cpu.set_register(0, handle as u64);
-        log::info!("  set X0 successfully");
+        cpu.set_register(0, SUCCESS as u64);
+        cpu.set_register(1, handle as u64);
     } else {
-        log::error!("  kernel.cpu is None!");
+        log::error!("kernel.cpu is None!");
     }
 
     log::info!("created session handle {:#x} to port '{}'", handle, port_name);
@@ -544,6 +616,7 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
 
     log::debug!("svcGetInfo type={} -> {:#x}", info_type, val);
     if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, SUCCESS as u64);
         cpu.set_register(1, val);
     }
     SUCCESS
