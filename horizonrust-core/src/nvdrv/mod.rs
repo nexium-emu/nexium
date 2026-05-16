@@ -140,7 +140,7 @@ impl Nvdrv {
         out[..n].copy_from_slice(&req.in_data[..n]);
 
         match cmd {
-            0x0001 => {
+            0x0101 => {
                 let size = if req.in_data.len() >= 4 {
                     u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]])
                 } else { 0 };
@@ -154,7 +154,7 @@ impl Nvdrv {
                 }
                 log::debug!("nvmap:Create size={} → id={}", size, id);
             }
-            0x0003 => {
+            0x0103 => {
                 if req.in_data.len() >= 4 {
                     let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
                     log::debug!("nvmap:FromId id={}", id);
@@ -163,7 +163,7 @@ impl Nvdrv {
                     }
                 }
             }
-            0x0004 => {
+            0x0104 => {
                 if req.in_data.len() >= 32 {
                     let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
                     let address = u64::from_le_bytes([
@@ -176,13 +176,13 @@ impl Nvdrv {
                     log::debug!("nvmap:Alloc id={} addr={:#x}", id, address);
                 }
             }
-            0x0005 => {
+            0x0105 => {
                 log::debug!("nvmap:Free");
             }
-            0x0009 => {
+            0x0109 => {
                 log::debug!("nvmap:Param");
             }
-            0x000E => {
+            0x010E => {
                 log::debug!("nvmap:GetId");
                 if out.len() >= 4 && req.in_data.len() >= 4 {
                     out[0..4].copy_from_slice(&req.in_data[0..4]);

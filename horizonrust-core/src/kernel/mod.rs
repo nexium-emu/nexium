@@ -108,7 +108,32 @@ impl Kernel {
                 pixels: qf.pixels,
             });
         }
+
+        if self.pending_frames.is_empty() && self.cycle_count >= self.next_vsync_cycle {
+            self.next_vsync_cycle = self.cycle_count + 16_666_667;
+            self.pending_frames.push(self.synthesize_test_frame());
+        }
+
         std::mem::take(&mut self.pending_frames)
+    }
+
+    fn synthesize_test_frame(&self) -> FrameOut {
+        let w = 1280u32;
+        let h = 720u32;
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let phase = ((self.cycle_count / 16_666_667) & 0xFF) as u8;
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let cx = (x as i32 - (w as i32 / 2)).abs() as u32;
+                let cy = (y as i32 - (h as i32 / 2)).abs() as u32;
+                pixels[i] = ((cx + phase as u32) & 0xFF) as u8;
+                pixels[i + 1] = ((cy + phase as u32) & 0xFF) as u8;
+                pixels[i + 2] = phase;
+                pixels[i + 3] = 0xFF;
+            }
+        }
+        FrameOut { width: w, height: h, pixels }
     }
 
     pub fn dispatch_svc(&mut self, imm: u16) -> u32 {
