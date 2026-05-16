@@ -1,6 +1,7 @@
 use super::Kernel;
-use crate::common::result::{SUCCESS, KERNEL_INVALID_HANDLE, KERNEL_NOT_IMPLEMENTED};
+use crate::common::result::{SUCCESS, KERNEL_NOT_IMPLEMENTED};
 use crate::kernel::handles::HandleType;
+use crate::kernel::session::Session;
 
 pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
     log::trace!("SVC {:#04x}", imm);
@@ -79,8 +80,17 @@ fn svc_cancel_synchronization(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_send_sync_request(_kernel: &mut Kernel) -> u32 {
+fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     log::debug!("svcSendSyncRequest");
+
+    let port_name = "sm:".to_string();
+    let result = kernel.services.dispatch_service(&port_name, 0);
+
+    if result != SUCCESS {
+        log::warn!("service dispatch returned error: {:#x}", result);
+        return result;
+    }
+
     SUCCESS
 }
 
@@ -106,6 +116,14 @@ fn svc_output_debug_string(_kernel: &mut Kernel) -> u32 {
 
 fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
     log::debug!("svcConnectToNamedPort");
+
+    let handle = kernel.handles.create_handle(HandleType::Session);
+
+    let port_name = "sm:".to_string();
+    let session = Session::new(handle, port_name.clone());
+    kernel.sessions.insert(handle, session);
+
+    log::debug!("created session handle {:#x} to port '{}'", handle, port_name);
     SUCCESS
 }
 

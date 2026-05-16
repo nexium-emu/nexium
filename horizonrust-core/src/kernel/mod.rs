@@ -3,11 +3,13 @@ pub mod svc_defs;
 pub mod threads;
 pub mod handles;
 pub mod hid;
+pub mod session;
 
 use crate::memory::AddressSpace;
 use crate::nvdrv::Nvdrv;
 use crate::services::Services;
 use std::sync::Arc;
+use std::collections::HashMap;
 use parking_lot::Mutex;
 
 pub struct Kernel {
@@ -17,6 +19,7 @@ pub struct Kernel {
     pub services: Services,
     pub nvdrv: Nvdrv,
     pub hid: Arc<Mutex<hid::HidShared>>,
+    pub sessions: HashMap<u32, session::Session>,
 
     pub code_base: u64,
     pub code_size: u64,
@@ -43,6 +46,7 @@ impl Kernel {
             services: Services::new(),
             nvdrv: Nvdrv::new(),
             hid: Arc::new(Mutex::new(hid::HidShared::new())),
+            sessions: HashMap::new(),
             code_base,
             code_size,
             heap_base,

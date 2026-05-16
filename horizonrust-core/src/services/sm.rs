@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use crate::common::result::SUCCESS;
+use crate::ipc::request::{IpcRequest, IpcResponse};
+use crate::ipc::parcel::ParcelReader;
 
 pub struct ServiceManager {
     services: HashMap<String, u32>,
@@ -41,14 +43,35 @@ impl ServiceManager {
 
     pub fn dispatch(&self, cmd_id: u32) -> u32 {
         match cmd_id {
-            0 => SUCCESS,
-            1 => SUCCESS,
-            2 => SUCCESS,
+            0 => self.cmd_register_service(),
+            1 => self.cmd_unregister_service(),
+            2 => self.cmd_get_service_handle(),
+            3 => self.cmd_register_service_for_domain(),
             _ => {
                 log::warn!("unknown sm command: {}", cmd_id);
                 1
             }
         }
+    }
+
+    fn cmd_register_service(&self) -> u32 {
+        log::debug!("SM::RegisterService");
+        SUCCESS
+    }
+
+    fn cmd_unregister_service(&self) -> u32 {
+        log::debug!("SM::UnregisterService");
+        SUCCESS
+    }
+
+    fn cmd_get_service_handle(&self) -> u32 {
+        log::debug!("SM::GetServiceHandle");
+        SUCCESS
+    }
+
+    fn cmd_register_service_for_domain(&self) -> u32 {
+        log::debug!("SM::RegisterServiceForDomain");
+        SUCCESS
     }
 }
 

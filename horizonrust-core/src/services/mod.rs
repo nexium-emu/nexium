@@ -198,7 +198,7 @@ impl Services {
             "lr" => self.lr.dispatch(cmd_id),
             "ldn:u" | "ldn:s" => self.ldn.dispatch(cmd_id),
             "friend:u" | "friend:a" | "friend:s" => self.friends.dispatch(cmd_id),
-            "fsp-srv" | "fsp:pr" | "fsp:pc" => self.fsp.dispatch(cmd_id),
+            "fsp:pr" | "fsp:pc" => self.fsp.dispatch(cmd_id),
             "btm" => self.btm.dispatch(cmd_id),
             "mii:u" | "mii:e" => self.mii.dispatch(cmd_id),
             "irs:u" | "irs:o" => self.irs.dispatch(cmd_id),
