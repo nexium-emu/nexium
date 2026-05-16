@@ -110,8 +110,10 @@ impl Kernel {
         }
 
         if self.pending_frames.is_empty() && self.cycle_count >= self.next_vsync_cycle {
-            self.next_vsync_cycle = self.cycle_count + 16_666_667;
-            self.pending_frames.push(self.synthesize_test_frame());
+            self.next_vsync_cycle = self.cycle_count + 1_000_000;
+            let frame = self.synthesize_test_frame();
+            log::debug!("vsync test frame: cycle={} {}x{}", self.cycle_count, frame.width, frame.height);
+            self.pending_frames.push(frame);
         }
 
         std::mem::take(&mut self.pending_frames)

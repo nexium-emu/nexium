@@ -30,12 +30,19 @@ pub struct CpuSnapshot {
     pub mem_request_address: u64,
 }
 
+#[derive(Clone, Default)]
+pub struct EmuStats {
+    pub svc_count: u64,
+    pub cycle_count: u64,
+}
+
 pub struct EmulationHandle {
     pub stop_flag: Arc<AtomicBool>,
     pub frame_rx: Receiver<Frame>,
     pub thread_handle: Option<thread::JoinHandle<Result<(), String>>>,
     pub cpu_snapshot: Arc<Mutex<CpuSnapshot>>,
     pub mem_request: Arc<Mutex<u64>>,
+    pub stats: Arc<Mutex<EmuStats>>,
 }
 
 impl EmulationHandle {
@@ -48,6 +55,8 @@ impl EmulationHandle {
         let cpu_snapshot_clone = Arc::clone(&cpu_snapshot);
         let mem_request = Arc::new(Mutex::new(0u64));
         let mem_request_clone = Arc::clone(&mem_request);
+        let stats = Arc::new(Mutex::new(EmuStats::default()));
+        let stats_clone = Arc::clone(&stats);
 
         let thread_handle = thread::spawn(move || {
             log::info!("Booting NRO: {}", nro_path);
@@ -82,6 +91,11 @@ impl EmulationHandle {
                     boot_ctx.kernel.cycle_count += 100_000;
 
                     if cycle_count % 1_000_000 == 0 {
+                        let mut st = stats_clone.lock();
+                        st.svc_count = svc_count as u64;
+                        st.cycle_count = cycle_count;
+                        drop(st);
+
                         let mut snap = cpu_snapshot_clone.lock();
                         snap.pc = cpu.get_pc();
                         snap.sp = cpu.get_register(31);
@@ -104,12 +118,9 @@ impl EmulationHandle {
                         }
                     }
 
-                    if boot_ctx.kernel.cycle_count >= boot_ctx.kernel.next_vsync_cycle {
-                        boot_ctx.kernel.next_vsync_cycle += 16_666_667;
-                        if !boot_ctx.kernel.display_ready {
-                            boot_ctx.kernel.display_ready = true;
-                            log::info!("Simulating display ready");
-                        }
+                    if boot_ctx.kernel.cycle_count >= boot_ctx.kernel.next_vsync_cycle && !boot_ctx.kernel.display_ready {
+                        boot_ctx.kernel.display_ready = true;
+                        log::info!("Simulating display ready");
                     }
 
                     if pc_check_count < 5 {
@@ -141,18 +152,7 @@ impl EmulationHandle {
                         horizonrust_core::cpu::CpuEvent::Svc(imm) => {
                             svc_count += 1;
                             last_svc_cycle = cycle_count;
-                            log::info!("SVC {:#04x} (count: {})", imm, svc_count);
-
-                            let _result = boot_ctx.kernel.dispatch_svc(imm);
-
-                            for f in boot_ctx.kernel.drain_frames() {
-                                let _ = frame_tx.try_send(f.into());
-                            }
-
-                            if boot_ctx.kernel.process_exited {
-                                log::info!("Process exited via svcBreak");
-                                break;
-                            }
+                            log::debug!("SVC {:#04x} (count: {})", imm, svc_count);
                         }
                         horizonrust_core::cpu::CpuEvent::Stalled => {
                             log::info!("CPU stalled at {:#x}", cpu.get_pc());
@@ -177,6 +177,22 @@ impl EmulationHandle {
                         log::warn!("Program stuck without SVCs for 500M+ cycles at PC {:#x}. Likely waiting for events/interrupts that aren't implemented. Exiting.", pc_before);
                         break;
                     }
+
+                    let event_copy = event;
+                    drop(cpu);
+
+                    if let horizonrust_core::cpu::CpuEvent::Svc(imm) = event_copy {
+                        let _ = boot_ctx.kernel.dispatch_svc(imm);
+                    }
+
+                    for f in boot_ctx.kernel.drain_frames() {
+                        let _ = frame_tx.try_send(f.into());
+                    }
+
+                    if boot_ctx.kernel.process_exited {
+                        log::info!("Process exited");
+                        break;
+                    }
                 } else {
                     return Err("CPU not initialized".to_string());
                 }
@@ -192,6 +208,7 @@ impl EmulationHandle {
             thread_handle: Some(thread_handle),
             cpu_snapshot,
             mem_request,
+            stats,
         })
     }
 

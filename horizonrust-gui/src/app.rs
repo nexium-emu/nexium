@@ -311,11 +311,14 @@ impl eframe::App for HorizonApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(12.0);
+                        let stats = self.emulation_handle.as_ref()
+                            .map(|h| h.stats.lock().clone())
+                            .unwrap_or_default();
                         ui.label(egui::RichText::new(format!(
                             "Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
                             self.performance.get_frame_time(),
-                            self.performance.get_svc_count(),
-                            self.performance.get_cycle_count(),
+                            stats.svc_count,
+                            stats.cycle_count,
                         )).size(11.0).color(MUTED).monospace());
                     });
                 });

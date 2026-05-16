@@ -52,8 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cycle_count += 100_000;
             boot_ctx.kernel.cycle_count += 100_000;
 
-            if boot_ctx.kernel.cycle_count >= boot_ctx.kernel.next_vsync_cycle {
-                boot_ctx.kernel.next_vsync_cycle += 16_666_667;
+            if boot_ctx.kernel.cycle_count >= boot_ctx.kernel.next_vsync_cycle && !boot_ctx.kernel.display_ready {
                 boot_ctx.kernel.display_ready = true;
             }
 
