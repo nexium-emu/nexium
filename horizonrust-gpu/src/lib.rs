@@ -6,6 +6,7 @@ pub mod swapchain;
 pub mod presenter;
 pub mod deswizzle;
 pub mod draw;
+pub mod commands;
 
 use ash::vk;
 use std::ffi::CStr;
@@ -14,6 +15,7 @@ use pipeline::PipelineCache;
 use descriptor::{DescriptorSetLayout, DescriptorPool};
 use shader::ShaderCompiler;
 use presenter::FramePresenter;
+use commands::CommandRecorder;
 
 pub struct VulkanContext {
     pub entry: ash::Entry,
@@ -29,6 +31,7 @@ pub struct VulkanContext {
     pub descriptor_pool: DescriptorPool,
     pub shader_compiler: ShaderCompiler,
     pub presenter: FramePresenter,
+    pub command_recorder: CommandRecorder,
 }
 
 impl VulkanContext {
@@ -130,6 +133,7 @@ impl VulkanContext {
         let descriptor_pool = DescriptorPool::new(&device, 256)?;
         let shader_compiler = ShaderCompiler::new();
         let presenter = FramePresenter::new();
+        let command_recorder = CommandRecorder::new(&device, graphics_queue_family as u32)?;
 
         log::info!("Vulkan context initialized successfully");
 
@@ -146,6 +150,7 @@ impl VulkanContext {
             descriptor_pool,
             shader_compiler,
             presenter,
+            command_recorder,
         })
     }
 
@@ -169,6 +174,11 @@ impl Drop for VulkanContext {
         unsafe {
             self.device.destroy_descriptor_pool(self.descriptor_pool.pool, None);
             self.device.destroy_descriptor_set_layout(self.descriptor_layout.layout, None);
+        }
+
+        self.command_recorder.clear(&self.device);
+
+        unsafe {
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
