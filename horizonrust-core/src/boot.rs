@@ -44,19 +44,32 @@ impl BootContext {
         let exit_stub_va: u64 = 0xB0_0000_2000;
 
         log::info!("Mapping memory regions");
+
+        log::info!("  Mapping code @ {:#x} (size {:#x})", code_base, config.code_size);
         address_space.map(code_base, config.code_size, Perm::RX, "code")
             .map_err(|e| format!("Failed to map code: {:?}", e))?;
+
+        log::info!("  Mapping heap @ {:#x} (size {:#x})", heap_base, config.heap_size);
         address_space.map(heap_base, config.heap_size, Perm::RW, "heap")
             .map_err(|e| format!("Failed to map heap: {:?}", e))?;
+
+        log::info!("  Mapping stack @ {:#x} (size {:#x})", stack_base, config.stack_size);
         address_space.map(stack_base, config.stack_size, Perm::RW, "stack")
             .map_err(|e| format!("Failed to map stack: {:?}", e))?;
+
+        log::info!("  Mapping tls @ {:#x} (size 0x1000)", tls_base);
         address_space.map(tls_base, 0x1000, Perm::RW, "tls")
             .map_err(|e| format!("Failed to map tls: {:?}", e))?;
+
+        log::info!("  Mapping env @ {:#x} (size 0x10000)", env_base);
         address_space.map(env_base, 0x10000, Perm::RW, "env")
             .map_err(|e| format!("Failed to map env: {:?}", e))?;
+
+        log::info!("  Mapping exit_stub @ {:#x} (size 0x1000)", exit_stub_va);
         address_space.map(exit_stub_va, 0x1000, Perm::RX, "exit_stub")
             .map_err(|e| format!("Failed to map exit stub: {:?}", e))?;
 
+        log::info!("  Writing exit stub SVC instruction");
         let svc_exit_insn: u32 = 0xD400_00E1;
         address_space.write(exit_stub_va, &svc_exit_insn.to_le_bytes())
             .map_err(|e| format!("Failed to write exit stub: {:?}", e))?;
