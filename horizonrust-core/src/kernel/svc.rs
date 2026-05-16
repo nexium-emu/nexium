@@ -306,23 +306,19 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
                 if let Some(true) = kernel.event_signals.get(&handle) {
                     log::debug!("    handle {:#x} is signaled", handle);
                     if let Some(cpu_mut) = &mut kernel.cpu {
-                        cpu_mut.set_register(0, i as u64);
+                        cpu_mut.set_register(1, i as u64);
                     }
                     return SUCCESS;
                 }
             }
         }
 
-        if timeout_ns == 0xFFFFFFFFFFFFFFFF {
-            log::debug!("  timeout=infinite (WAIT_INFINITE), no handles signaled, simulating event");
-            if handle_count > 0 {
-                if let Some(cpu_mut) = &mut kernel.cpu {
-                    cpu_mut.set_register(0, 0);
-                }
-                return SUCCESS;
+        if handle_count > 0 {
+            log::debug!("  no handles signaled, returning index=0 (simulated vsync)");
+            if let Some(cpu_mut) = &mut kernel.cpu {
+                cpu_mut.set_register(1, 0);
             }
-        } else {
-            log::debug!("  timeout={} ns, no handles signaled, returning TIMEOUT", timeout_ns / 1_000_000);
+            return SUCCESS;
         }
 
         const TIMEOUT_ERROR: u32 = 1 | (117 << 9);
