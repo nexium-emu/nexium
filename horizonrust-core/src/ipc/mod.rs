@@ -1,5 +1,6 @@
 pub mod hipc;
 pub mod cmif;
+pub mod parcel;
 
 pub use hipc::{HipcHeader, HipcSpecialHeader, HipcCommandType};
 pub use hipc::{TLS_BUFFER_SIZE, TLS_REQUEST_OFFSET};
