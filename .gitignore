@@ -20,3 +20,6 @@ space-nx-master/
 SDL-main/
 yuzu-master/
 
+debug_boot.log
+*.log
+
