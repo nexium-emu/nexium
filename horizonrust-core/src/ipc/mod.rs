@@ -39,6 +39,7 @@ pub struct TipcInfo {
     pub raw_request_id: u16,
 }
 
+#[derive(Clone)]
 pub struct IpcCtx {
     pub buf: Vec<u8>,
     pub hipc: HipcHeader,

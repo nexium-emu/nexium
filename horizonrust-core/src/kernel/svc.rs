@@ -312,7 +312,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     }
 
     let (result, out_data) = if port_name == "sm:" {
-        dispatch_sm_command(kernel, cmd_id, &tls_buf, cmif_data_off, cmif_data_len, parsed_ctx)
+        dispatch_sm_command(kernel, cmd_id, &tls_buf, cmif_data_off, cmif_data_len, parsed_ctx.clone())
     } else {
         let tls_snapshot = tls_buf.clone();
         let mut pending_frames = std::mem::take(&mut kernel.pending_frames);
@@ -354,8 +354,9 @@ fn dispatch_sm_command(kernel: &mut Kernel, cmd_id: u32, tls_buf: &[u8], cmif_da
     }
 }
 
-fn dispatch_sm_register_client(_kernel: &mut Kernel, _tls_buf: &[u8], _cmif_data_off: usize, _cmif_data_len: usize, _parsed_ctx: Option<ipc::IpcCtx>) -> (u32, Vec<u8>) {
-    log::debug!("SM::RegisterClient");
+fn dispatch_sm_register_client(_kernel: &mut Kernel, _tls_buf: &[u8], _cmif_data_off: usize, _cmif_data_len: usize, parsed_ctx: Option<ipc::IpcCtx>) -> (u32, Vec<u8>) {
+    let pid = parsed_ctx.and_then(|ctx| ctx.send_pid);
+    log::info!("SM::RegisterClient pid={:?}", pid);
     (SUCCESS, Vec::new())
 }
 
