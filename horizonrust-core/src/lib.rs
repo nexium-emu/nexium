@@ -7,5 +7,6 @@ pub mod services;
 pub mod nvdrv;
 pub mod shader;
 pub mod spirv;
+pub mod boot;
 
 pub use horizonrust_common as common;

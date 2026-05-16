@@ -1,4 +1,4 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use byteorder::{LittleEndian, ReadBytesExt};
 
 #[repr(C)]
