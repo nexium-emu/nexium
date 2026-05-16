@@ -93,25 +93,85 @@ fn svc_unmap_memory(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_query_memory(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcQueryMemory (X1=address)");
-
-    let address = if let Some(cpu) = &kernel.cpu {
-        cpu.get_register(1)
+    let (out_ptr, address) = if let Some(cpu) = &kernel.cpu {
+        (cpu.get_register(0), cpu.get_register(2))
     } else {
-        0
+        return 1;
     };
 
-    log::debug!("  query address: {:#x}", address);
+    log::debug!("svcQueryMemory out_ptr={:#x} address={:#x}", out_ptr, address);
 
-    let memory_type: u32 = 0;
-    let memory_attr: u32 = 0;
-    let permission: u32 = 0x3;
+    let info = synthesize_memory_info(kernel, address);
+    let mut buf = [0u8; 0x28];
+    buf[0..8].copy_from_slice(&info.addr.to_le_bytes());
+    buf[8..16].copy_from_slice(&info.size.to_le_bytes());
+    buf[16..20].copy_from_slice(&info.mem_type.to_le_bytes());
+    buf[20..24].copy_from_slice(&info.attr.to_le_bytes());
+    buf[24..28].copy_from_slice(&info.perm.to_le_bytes());
+    buf[28..32].copy_from_slice(&0u32.to_le_bytes());
+    buf[32..36].copy_from_slice(&0u32.to_le_bytes());
+    buf[36..40].copy_from_slice(&0u32.to_le_bytes());
 
-    log::debug!("returning memory_type={:#x}, attr={:#x}, perm={:#x}", memory_type, memory_attr, permission);
+    if out_ptr != 0 {
+        let _ = kernel.address_space.write(out_ptr, &buf);
+    }
+
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(0, SUCCESS as u64);
+        cpu.set_register(1, 0);
     }
     SUCCESS
+}
+
+struct SynthMemInfo {
+    addr: u64,
+    size: u64,
+    mem_type: u32,
+    attr: u32,
+    perm: u32,
+}
+
+fn synthesize_memory_info(kernel: &Kernel, address: u64) -> SynthMemInfo {
+    let regions = kernel.address_space.regions();
+    for r in &regions {
+        if address >= r.base && address < r.base + r.size {
+            let mem_type = if r.name.contains("text") || r.name.contains("rodata") {
+                0x10
+            } else if r.name.contains("data") || r.name.contains("bss") {
+                0x11
+            } else if r.name.starts_with("heap") {
+                0x05
+            } else if r.name.starts_with("stack") {
+                0x07
+            } else if r.name.starts_with("shared") {
+                0x12
+            } else {
+                0x03
+            };
+            return SynthMemInfo {
+                addr: r.base,
+                size: r.size,
+                mem_type,
+                attr: 0,
+                perm: r.perm.bits() as u32,
+            };
+        }
+    }
+
+    let next_base = regions.iter()
+        .map(|r| r.base)
+        .filter(|&b| b > address)
+        .min()
+        .unwrap_or(u64::MAX);
+    let page_addr = address & !0xFFF;
+    let gap_size = next_base.saturating_sub(page_addr);
+    SynthMemInfo {
+        addr: page_addr,
+        size: if gap_size == 0 { 0x10000_0000 } else { gap_size },
+        mem_type: 0,
+        attr: 0,
+        perm: 0,
+    }
 }
 
 fn svc_exit_process(_kernel: &mut Kernel) -> u32 {
@@ -127,7 +187,16 @@ fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
     };
     log::info!("svcMapSharedMemory handle={:#x} addr={:#x} size={:#x} perm={:#x}", handle, addr, size, perm);
 
-    let backing = vec![0u8; size as usize];
+    let backing = if size as usize == crate::hid_state::HID_SHMEM_SIZE {
+        let state = crate::hid_state::get_hid_state();
+        let mut hid = state.lock();
+        hid.shmem_va = Some(addr);
+        log::info!("  → recognized as HID shared memory, populating with Pro Controller state");
+        hid.build_initial_shmem()
+    } else {
+        vec![0u8; size as usize]
+    };
+
     if kernel.address_space.write(addr, &backing).is_err() {
         let _ = kernel.address_space.map(addr, size, crate::memory::perm::Perm::RW, "shared");
         let _ = kernel.address_space.write(addr, &backing);

@@ -9,5 +9,6 @@ pub mod shader;
 pub mod spirv;
 pub mod boot;
 pub mod sdl_emu;
+pub mod hid_state;
 
 pub use horizonrust_common as common;
