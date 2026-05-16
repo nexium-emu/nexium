@@ -34,6 +34,10 @@ pub struct Kernel {
     pub heap_size: u64,
     pub stack_base: u64,
     pub stack_size: u64,
+
+    pub cycle_count: u64,
+    pub next_vsync_cycle: u64,
+    pub display_ready: bool,
 }
 
 impl Kernel {
@@ -64,6 +68,9 @@ impl Kernel {
             heap_size,
             stack_base,
             stack_size,
+            cycle_count: 0,
+            next_vsync_cycle: 16_666_667,
+            display_ready: false,
         }
     }
 

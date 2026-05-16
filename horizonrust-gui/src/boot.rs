@@ -47,6 +47,7 @@ impl EmulationHandle {
             let mut pc_check_count = 0u32;
             let mut stuck_pc: Option<u64> = None;
             let mut stuck_count = 0u32;
+            let mut last_svc_cycle = 0u64;
 
             loop {
                 if stop_flag_clone.load(Ordering::Relaxed) {
@@ -59,6 +60,15 @@ impl EmulationHandle {
                     let event = cpu.run(100_000);
                     let pc_after = cpu.get_pc();
                     cycle_count += 100_000;
+                    boot_ctx.kernel.cycle_count += 100_000;
+
+                    if boot_ctx.kernel.cycle_count >= boot_ctx.kernel.next_vsync_cycle {
+                        boot_ctx.kernel.next_vsync_cycle += 16_666_667;
+                        if !boot_ctx.kernel.display_ready {
+                            boot_ctx.kernel.display_ready = true;
+                            log::info!("Simulating display ready");
+                        }
+                    }
 
                     if pc_check_count < 5 {
                         log::info!("CPU exec: PC {:#x} → {:#x} (event: {:?})", pc_before, pc_after, event);
@@ -88,6 +98,7 @@ impl EmulationHandle {
                         }
                         horizonrust_core::cpu::CpuEvent::Svc(imm) => {
                             svc_count += 1;
+                            last_svc_cycle = cycle_count;
                             log::info!("SVC {:#04x} (count: {})", imm, svc_count);
 
                             let result = boot_ctx.kernel.dispatch_svc(imm);
@@ -116,6 +127,11 @@ impl EmulationHandle {
 
                     if cycle_count > max_cycles {
                         log::warn!("Max cycles exceeded");
+                        break;
+                    }
+
+                    if svc_count > 0 && (cycle_count - last_svc_cycle) > 500_000_000 {
+                        log::warn!("Program stuck without SVCs for 500M+ cycles at PC {:#x}. Likely waiting for events/interrupts that aren't implemented. Exiting.", pc_before);
                         break;
                     }
                 } else {

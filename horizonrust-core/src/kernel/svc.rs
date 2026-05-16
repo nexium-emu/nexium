@@ -124,14 +124,14 @@ fn svc_signal_event(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcWaitSynchronization (X0=handles_ptr, X1=count, X2=timeout_ns)");
+    log::info!("svcWaitSynchronization (X0=handles_ptr, X1=count, X2=timeout_ns)");
 
     if let Some(cpu) = &kernel.cpu {
         let handles_ptr = cpu.get_register(0);
         let handle_count = cpu.get_register(1);
         let timeout_ns = cpu.get_register(2);
 
-        log::debug!("  waiting on {} handles, timeout={} ns", handle_count, timeout_ns);
+        log::info!("  waiting on {} handles, timeout={} ns, PC={:#x}", handle_count, timeout_ns, cpu.get_pc());
 
         if handle_count == 0 {
             log::warn!("  invalid: handle_count is 0");
@@ -183,7 +183,18 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
             }
         }
 
-        log::warn!("svcWaitSynchronization: no handles signaled, returning TIMEOUT_ERROR");
+        if timeout_ns == 0xFFFFFFFFFFFFFFFF {
+            log::debug!("  timeout=infinite (WAIT_INFINITE), no handles signaled, simulating event");
+            if handle_count > 0 {
+                if let Some(cpu_mut) = &mut kernel.cpu {
+                    cpu_mut.set_register(0, 0);
+                }
+                return SUCCESS;
+            }
+        } else {
+            log::debug!("  timeout={} ns, no handles signaled, returning TIMEOUT", timeout_ns / 1_000_000);
+        }
+
         const TIMEOUT_ERROR: u32 = 1 | (117 << 9);
         return TIMEOUT_ERROR;
     }
@@ -218,7 +229,8 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     };
 
     let (cmd_id, token, data_offset) = parse_ipc_cmd_id(&tls_buf);
-    log::debug!("IPC port='{}' cmd={} handle={:#x}", port_name, cmd_id, session_handle);
+    log::info!("IPC port='{}' cmd={} handle={:#x} PC={:#x}", port_name, cmd_id, session_handle,
+        kernel.cpu.as_ref().map(|c| c.get_pc()).unwrap_or(0));
 
     let tls_snapshot = tls_buf.clone();
     let mut pending_frames = std::mem::take(&mut kernel.pending_frames);
