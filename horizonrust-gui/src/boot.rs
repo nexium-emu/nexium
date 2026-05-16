@@ -69,7 +69,7 @@ impl EmulationHandle {
             let mut boot_ctx = BootContext::new(config)?;
 
             log::info!("Starting emulation loop");
-            let max_cycles = 1_000_000_000u64;
+            let max_cycles = u64::MAX;
             let mut cycle_count = 0u64;
             let mut svc_count = 0u32;
             let mut pc_check_count = 0u32;

@@ -123,15 +123,39 @@ impl Kernel {
         let w = 1280u32;
         let h = 720u32;
         let mut pixels = vec![0u8; (w * h * 4) as usize];
-        let phase = ((self.cycle_count / 16_666_667) & 0xFF) as u8;
+        let phase = (self.cycle_count / 100_000) as f32 * 0.05;
+        let cx_f = w as f32 / 2.0;
+        let cy_f = h as f32 / 2.0;
+        let max_r = (cx_f.powi(2) + cy_f.powi(2)).sqrt();
+
         for y in 0..h {
             for x in 0..w {
                 let i = ((y * w + x) * 4) as usize;
-                let cx = (x as i32 - (w as i32 / 2)).abs() as u32;
-                let cy = (y as i32 - (h as i32 / 2)).abs() as u32;
-                pixels[i] = ((cx + phase as u32) & 0xFF) as u8;
-                pixels[i + 1] = ((cy + phase as u32) & 0xFF) as u8;
-                pixels[i + 2] = phase;
+                let dx = x as f32 - cx_f;
+                let dy = y as f32 - cy_f;
+                let r = (dx * dx + dy * dy).sqrt();
+                let angle = dy.atan2(dx);
+                let hue = (angle / std::f32::consts::PI * 180.0 + 180.0 + phase * 30.0) % 360.0;
+                let val = 1.0 - (r / max_r).min(1.0) * 0.4;
+
+                let c = val;
+                let h_sect = hue / 60.0;
+                let frac = h_sect - h_sect.floor();
+                let q = c * (1.0 - frac);
+                let t = c * frac;
+
+                let (r_c, g_c, b_c) = match h_sect as u32 % 6 {
+                    0 => (c, t, 0.0),
+                    1 => (q, c, 0.0),
+                    2 => (0.0, c, t),
+                    3 => (0.0, q, c),
+                    4 => (t, 0.0, c),
+                    _ => (c, 0.0, q),
+                };
+
+                pixels[i] = (r_c * 255.0) as u8;
+                pixels[i + 1] = (g_c * 255.0) as u8;
+                pixels[i + 2] = (b_c * 255.0) as u8;
                 pixels[i + 3] = 0xFF;
             }
         }
