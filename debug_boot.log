@@ -1,5 +1,5 @@
 === HorizonRust Debug Boot ===
-NRO: space-nx-master/spacenx.nro
+NRO: .\space-nx-master\spacenx.nro
 Starting boot context...
 Boot context initialized
 Starting emulation loop
