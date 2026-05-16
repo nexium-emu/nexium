@@ -1,0 +1,154 @@
+use std::io::{Read, Seek, SeekFrom};
+use byteorder::{LittleEndian, ReadBytesExt};
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NroHeader {
+    pub magic: u32,
+    pub version: u32,
+    pub size: u32,
+    pub flags: u32,
+    pub text_offset: u32,
+    pub text_size: u32,
+    pub ro_offset: u32,
+    pub ro_size: u32,
+    pub data_offset: u32,
+    pub data_size: u32,
+    pub bss_size: u32,
+    pub mod0_offset: u32,
+    pub padding: [u8; 12],
+    pub build_id: [u8; 32],
+}
+
+impl NroHeader {
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 128 {
+            return Err("NRO header too small".to_string());
+        }
+
+        let mut cursor = &data[..];
+        let magic = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+
+        if magic != 0x304F524E {
+            return Err(format!("Invalid NRO magic: {:#x}", magic));
+        }
+
+        cursor = &data[..];
+        let magic = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let version = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let size = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let flags = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let text_offset = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let text_size = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let ro_offset = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let ro_size = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let data_offset = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let data_size = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let bss_size = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let mod0_offset = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+
+        let mut padding = [0u8; 12];
+        cursor.read_exact(&mut padding).map_err(|e| e.to_string())?;
+
+        let mut build_id = [0u8; 32];
+        cursor.read_exact(&mut build_id).map_err(|e| e.to_string())?;
+
+        Ok(NroHeader {
+            magic,
+            version,
+            size,
+            flags,
+            text_offset,
+            text_size,
+            ro_offset,
+            ro_size,
+            data_offset,
+            data_size,
+            bss_size,
+            mod0_offset,
+            padding,
+            build_id,
+        })
+    }
+}
+
+pub struct NroSegment {
+    pub offset: u32,
+    pub size: u32,
+    pub data: Vec<u8>,
+}
+
+pub struct Nro {
+    pub header: NroHeader,
+    pub text: NroSegment,
+    pub ro: NroSegment,
+    pub data: NroSegment,
+    pub bss_size: u32,
+}
+
+impl Nro {
+    pub fn parse(data: &[u8]) -> Result<Self, String> {
+        let header = NroHeader::from_bytes(data)?;
+
+        log::debug!("NRO: magic={:#x}, version={}, size={}", header.magic, header.version, header.size);
+        log::debug!("NRO: text=[{:#x}, {:#x}), ro=[{:#x}, {:#x}), data=[{:#x}, {:#x})",
+                   header.text_offset, header.text_offset + header.text_size,
+                   header.ro_offset, header.ro_offset + header.ro_size,
+                   header.data_offset, header.data_offset + header.data_size);
+
+        if header.text_offset + header.text_size > data.len() as u32 {
+            return Err("Text segment out of bounds".to_string());
+        }
+        if header.ro_offset + header.ro_size > data.len() as u32 {
+            return Err("RO segment out of bounds".to_string());
+        }
+        if header.data_offset + header.data_size > data.len() as u32 {
+            return Err("Data segment out of bounds".to_string());
+        }
+
+        let text = NroSegment {
+            offset: header.text_offset,
+            size: header.text_size,
+            data: data[header.text_offset as usize..(header.text_offset + header.text_size) as usize].to_vec(),
+        };
+
+        let ro = NroSegment {
+            offset: header.ro_offset,
+            size: header.ro_size,
+            data: data[header.ro_offset as usize..(header.ro_offset + header.ro_size) as usize].to_vec(),
+        };
+
+        let data_seg = NroSegment {
+            offset: header.data_offset,
+            size: header.data_size,
+            data: data[header.data_offset as usize..(header.data_offset + header.data_size) as usize].to_vec(),
+        };
+
+        Ok(Nro {
+            header,
+            text,
+            ro,
+            data: data_seg,
+            bss_size: header.bss_size,
+        })
+    }
+
+    pub fn load_from_file(path: &str) -> Result<Self, String> {
+        let data = std::fs::read(path)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        Self::parse(&data)
+    }
+
+    pub fn total_memory_size(&self) -> u64 {
+        (self.text.size + self.ro.size + self.data.size + self.bss_size) as u64
+    }
+
+    pub fn get_section(&self, name: &str) -> Option<&NroSegment> {
+        match name {
+            "text" => Some(&self.text),
+            "ro" => Some(&self.ro),
+            "data" => Some(&self.data),
+            _ => None,
+        }
+    }
+}
