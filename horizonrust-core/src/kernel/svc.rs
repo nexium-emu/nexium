@@ -244,14 +244,15 @@ fn svc_signal_event(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
-    log::info!("svcWaitSynchronization (X0=handles_ptr, X1=count, X2=timeout_ns)");
+    log::debug!("svcWaitSynchronization");
 
     if let Some(cpu) = &kernel.cpu {
-        let handles_ptr = cpu.get_register(0);
-        let handle_count = cpu.get_register(1);
-        let timeout_ns = cpu.get_register(2);
+        let handles_ptr = cpu.get_register(1);
+        let handle_count = cpu.get_register(2);
+        let timeout_ns = cpu.get_register(3);
 
-        log::info!("  waiting on {} handles, timeout={} ns, PC={:#x}", handle_count, timeout_ns, cpu.get_pc());
+        log::debug!("  handles_ptr={:#x} count={} timeout={}ns PC={:#x}",
+            handles_ptr, handle_count, timeout_ns, cpu.get_pc());
 
         if handle_count == 0 {
             log::warn!("  invalid: handle_count is 0");
