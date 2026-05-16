@@ -39,6 +39,7 @@ impl BootContext {
         let code_base: u64 = 0x8000_0000_0000;
         let heap_base: u64 = 0x9000_0000_0000;
         let stack_base: u64 = 0xA000_0000_0000;
+        let tls_base: u64 = 0xB000_0000_0000;
 
         log::info!("Mapping memory regions");
         address_space.map(code_base, config.code_size, Perm::RX, "code")
@@ -47,6 +48,8 @@ impl BootContext {
             .map_err(|e| format!("Failed to map heap: {:?}", e))?;
         address_space.map(stack_base, config.stack_size, Perm::RW, "stack")
             .map_err(|e| format!("Failed to map stack: {:?}", e))?;
+        address_space.map(tls_base, 0x1000, Perm::RW, "tls")
+            .map_err(|e| format!("Failed to map tls: {:?}", e))?;
 
         log::info!("Loading NRO segments into memory");
         let text_va = code_base;
@@ -90,12 +93,14 @@ impl BootContext {
 
             cpu.set_pc(entry_point);
             cpu.set_sp(sp);
+            cpu.set_tpidrro_el0(tls_base);
             cpu.set_register(0, 1);
             cpu.set_register(1, 0);
             cpu.set_register(2, heap_end);
 
             log::debug!("  PC: {:#x}", cpu.get_pc());
             log::debug!("  SP: {:#x}", cpu.get_sp());
+            log::debug!("  TPIDRRO_EL0: {:#x}", cpu.get_tpidrro_el0());
             log::debug!("  X0 (main_thread_handle): {}", cpu.get_register(0));
             log::debug!("  X1 (entrypoint_arg): {}", cpu.get_register(1));
             log::debug!("  X2 (heap_base): {:#x}", cpu.get_register(2));

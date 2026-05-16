@@ -149,33 +149,39 @@ fn svc_cancel_synchronization(_kernel: &mut Kernel) -> u32 {
 fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     log::debug!("svcSendSyncRequest");
 
-    if kernel.tls_buffer.len() < 24 {
-        log::warn!("TLS buffer too small");
-        return 1;
-    }
-
-    if kernel.tls_buffer[..4] != *b"SFCI" {
-        log::warn!("bad SFCI magic");
-        return 1;
-    }
-
-    let session_handle = if let Some(cpu) = &kernel.cpu {
-        cpu.get_register(0) as u32
+    let (tls_addr, session_handle) = if let Some(cpu) = &kernel.cpu {
+        (cpu.get_tpidrro_el0(), cpu.get_register(0) as u32)
     } else {
         return 1;
     };
 
+    let mut tls_buf = vec![0u8; 256];
+    if let Err(_) = kernel.address_space.read(tls_addr, &mut tls_buf) {
+        log::warn!("Failed to read TLS buffer from {:#x}", tls_addr);
+        return 1;
+    }
+
+    if tls_buf.len() < 24 {
+        log::warn!("TLS buffer too small");
+        return 1;
+    }
+
+    if tls_buf[..4] != *b"SFCI" {
+        log::warn!("bad SFCI magic");
+        return 1;
+    }
+
     let cmd_id = u32::from_le_bytes([
-        kernel.tls_buffer[8],
-        kernel.tls_buffer[9],
-        kernel.tls_buffer[10],
-        kernel.tls_buffer[11],
+        tls_buf[8],
+        tls_buf[9],
+        tls_buf[10],
+        tls_buf[11],
     ]);
     let token = u32::from_le_bytes([
-        kernel.tls_buffer[12],
-        kernel.tls_buffer[13],
-        kernel.tls_buffer[14],
-        kernel.tls_buffer[15],
+        tls_buf[12],
+        tls_buf[13],
+        tls_buf[14],
+        tls_buf[15],
     ]);
 
     let port_name = if let Some(session) = kernel.sessions.get(&session_handle) {
@@ -185,7 +191,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         return 1;
     };
 
-    log::debug!("  session handle {:#x} -> port '{}'", session_handle, port_name);
+    log::debug!("  session handle {:#x} -> port '{}', cmd_id {}", session_handle, port_name, cmd_id);
 
     let result = kernel.services.dispatch_service(&port_name, cmd_id);
 
@@ -201,8 +207,11 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         (token >> 24) as u8,
     ];
 
-    if kernel.tls_buffer.len() >= 16 {
-        kernel.tls_buffer[..16].copy_from_slice(&response_header);
+    tls_buf[..16].copy_from_slice(&response_header);
+
+    if let Err(_) = kernel.address_space.write(tls_addr, &tls_buf) {
+        log::warn!("Failed to write TLS response to {:#x}", tls_addr);
+        return 1;
     }
 
     if result != SUCCESS {

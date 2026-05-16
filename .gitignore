@@ -11,3 +11,8 @@ Cargo.lock
 *.exe
 *.pdb
 .vs/
+
+Atmosphere-master/
+libnx-master/
+nx-hbloader-master/
+nx-hbmenu-master/
