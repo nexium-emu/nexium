@@ -1,6 +1,9 @@
 mod app;
 mod boot;
 mod input;
+mod audio;
+mod debugger;
+mod performance;
 
 use app::HorizonApp;
 
