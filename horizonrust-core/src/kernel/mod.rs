@@ -39,6 +39,7 @@ pub struct Kernel {
     pub next_vsync_cycle: u64,
     pub display_ready: bool,
     pub process_exited: bool,
+    pub vsync_poll_count: u64,
 
     pub process_handle: u32,
     pub main_thread_handle: u32,
@@ -80,6 +81,7 @@ impl Kernel {
             next_vsync_cycle: 16_666_667,
             display_ready: false,
             process_exited: false,
+            vsync_poll_count: 0,
             process_handle,
             main_thread_handle,
         }

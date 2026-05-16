@@ -271,7 +271,7 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         }
 
         if timeout_ns == 0 {
-            log::debug!("  timeout=0 (immediate check)");
+            log::debug!("  timeout=0 (immediate poll)");
             for i in 0..handle_count {
                 let mut handle_buf = [0u8; 4];
                 let addr = handles_ptr + (i * 4);
@@ -280,16 +280,17 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
                     if let Some(true) = kernel.event_signals.get(&handle) {
                         log::debug!("    handle {:#x} is signaled", handle);
                         if let Some(cpu_mut) = &mut kernel.cpu {
-                            cpu_mut.set_register(0, i as u64);
+                            cpu_mut.set_register(1, i as u64);
                         }
                         return SUCCESS;
                     }
                 }
             }
+            const TIMEOUT_ERROR: u32 = 1 | (117 << 9);
             if let Some(cpu_mut) = &mut kernel.cpu {
-                cpu_mut.set_register(0, 1u64);
+                cpu_mut.set_register(0, TIMEOUT_ERROR as u64);
             }
-            return 1;
+            return TIMEOUT_ERROR;
         }
 
         if timeout_ns == 0xFFFFFFFFFFFFFFFF {
@@ -1166,13 +1167,11 @@ fn applet_command_response(kernel: &mut Kernel, port_name: &str, cmd_id: u32) ->
             let handle = kernel.handles.create_handle(HandleType::Event);
             Some((Vec::new(), Some(handle)))
         }
-        ("ICommonStateGetter", 1) => Some((0u8.to_le_bytes().to_vec(), None)),
-        ("ICommonStateGetter", 5) => Some((1u32.to_le_bytes().to_vec(), None)),
+        ("ICommonStateGetter", 1) => Some((0u32.to_le_bytes().to_vec(), None)),
+        ("ICommonStateGetter", 5) => Some((1u8.to_le_bytes().to_vec(), None)),
         ("ICommonStateGetter", 6) => Some((0u32.to_le_bytes().to_vec(), None)),
-        ("ICommonStateGetter", 9) => {
-            let handle = kernel.handles.create_handle(HandleType::Event);
-            Some((Vec::new(), Some(handle)))
-        }
+        ("ICommonStateGetter", 8) => Some((1u8.to_le_bytes().to_vec(), None)),
+        ("ICommonStateGetter", 9) => Some((1u8.to_le_bytes().to_vec(), None)),
         ("ICommonStateGetter", 60) => Some({
             let mut data = Vec::new();
             data.extend_from_slice(&1280u32.to_le_bytes());
