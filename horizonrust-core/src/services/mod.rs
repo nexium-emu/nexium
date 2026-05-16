@@ -5,6 +5,9 @@ pub mod set;
 pub mod am;
 pub mod vi;
 pub mod audio;
+pub mod fs;
+pub mod nifm;
+pub mod nvnflinger;
 
 pub struct FrameOut {
     pub width: u32,
@@ -20,6 +23,9 @@ pub struct Services {
     pub am: am::AppletService,
     pub vi: vi::DisplayService,
     pub audio: audio::AudioService,
+    pub fs: fs::FileSystemService,
+    pub nifm: nifm::NetworkService,
+    pub nvnflinger: nvnflinger::BufferQueueService,
 }
 
 impl Services {
@@ -32,6 +38,9 @@ impl Services {
             am: am::AppletService::new(),
             vi: vi::DisplayService::new(),
             audio: audio::AudioService::new(),
+            fs: fs::FileSystemService::new(),
+            nifm: nifm::NetworkService::new(),
+            nvnflinger: nvnflinger::BufferQueueService::new(),
         }
     }
 
@@ -40,11 +49,14 @@ impl Services {
         match port_name {
             "sm:" => self.sm.dispatch(cmd_id),
             "hid" => self.hid.dispatch(cmd_id),
-            "time" => self.time.dispatch(cmd_id),
-            "set" => self.set.dispatch(cmd_id),
-            "am" => self.am.dispatch(cmd_id),
+            "time:s" | "time:a" | "time:r" => self.time.dispatch(cmd_id),
+            "set" | "set:sys" => self.set.dispatch(cmd_id),
+            "am" | "appletOE" => self.am.dispatch(cmd_id),
             "vi:m" | "vi:s" => self.vi.dispatch(cmd_id),
             "audio" | "audout:u" => self.audio.dispatch(cmd_id),
+            "fsp-srv" => self.fs.dispatch(cmd_id),
+            "nifm:u" | "nifm:a" => self.nifm.dispatch(cmd_id),
+            "nvnflinger" => self.nvnflinger.dispatch(cmd_id),
             _ => {
                 log::warn!("unknown service: {}", port_name);
                 1
