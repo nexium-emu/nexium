@@ -393,9 +393,7 @@ fn dispatch_sm_get_service_handle(kernel: &mut Kernel, tls_buf: &[u8], cmif_data
         String::new()
     };
 
-    log::debug!("SM::GetServiceHandle data_off={:#x} raw_bytes={:02x?}", cmif_data_off,
-        if tls_buf.len() >= cmif_data_off + 8 { &tls_buf[cmif_data_off..cmif_data_off + 8] } else { &[] });
-    log::info!("SM::GetServiceHandle '{}'", service_name);
+    log::info!("SM::GetServiceHandle '{}' data_off={:#x}", service_name, cmif_data_off);
 
     let handle = kernel.handles.create_handle(HandleType::Session);
     let final_name = if !service_name.is_empty() { service_name } else { "unknown".to_string() };
@@ -403,8 +401,8 @@ fn dispatch_sm_get_service_handle(kernel: &mut Kernel, tls_buf: &[u8], cmif_data
     kernel.sessions.insert(handle, session);
 
     log::info!("SM: returning handle {:#x} for service '{}'", handle, final_name);
+
     let mut response = Vec::new();
-    response.extend_from_slice(&0u32.to_le_bytes());
     response.extend_from_slice(&handle.to_le_bytes());
     (SUCCESS, response)
 }
