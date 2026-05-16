@@ -39,6 +39,15 @@ pub mod pcielm;
 pub mod rtc;
 pub mod jit;
 pub mod omm;
+pub mod nim;
+pub mod olsc;
+pub mod mount;
+pub mod tc;
+pub mod gm;
+pub mod pm;
+pub mod usb;
+pub mod sys;
+pub mod gpio2;
 
 pub struct FrameOut {
     pub width: u32,
@@ -88,6 +97,15 @@ pub struct Services {
     pub rtc: rtc::RtcService,
     pub jit: jit::JitService,
     pub omm: omm::OmmService,
+    pub nim: nim::NimService,
+    pub olsc: olsc::OlscService,
+    pub mount: mount::MountService,
+    pub tc: tc::TcService,
+    pub gm: gm::GmService,
+    pub pm: pm::PmService,
+    pub usb: usb::UsbService,
+    pub sys: sys::SysService,
+    pub gpio2: gpio2::Gpio2Service,
 }
 
 impl Services {
@@ -134,6 +152,15 @@ impl Services {
             rtc: rtc::RtcService::new(),
             jit: jit::JitService::new(),
             omm: omm::OmmService::new(),
+            nim: nim::NimService::new(),
+            olsc: olsc::OlscService::new(),
+            mount: mount::MountService::new(),
+            tc: tc::TcService::new(),
+            gm: gm::GmService::new(),
+            pm: pm::PmService::new(),
+            usb: usb::UsbService::new(),
+            sys: sys::SysService::new(),
+            gpio2: gpio2::Gpio2Service::new(),
         }
     }
 
