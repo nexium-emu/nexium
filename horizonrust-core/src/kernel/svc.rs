@@ -50,12 +50,22 @@ fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_set_memory_permission(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcSetMemoryPermission (no-op)");
+    let (addr, size, perm) = if let Some(cpu) = &kernel.cpu {
+        (cpu.get_register(0), cpu.get_register(1), cpu.get_register(2))
+    } else {
+        (0, 0, 0)
+    };
+    log::info!("svcSetMemoryPermission addr={:#x} size={:#x} perm={:#x} (no-op)", addr, size, perm);
     SUCCESS
 }
 
 fn svc_set_memory_attribute(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcSetMemoryAttribute (no-op)");
+    let (addr, size, mask, value) = if let Some(cpu) = &kernel.cpu {
+        (cpu.get_register(0), cpu.get_register(1), cpu.get_register(2), cpu.get_register(3))
+    } else {
+        (0, 0, 0, 0)
+    };
+    log::info!("svcSetMemoryAttribute addr={:#x} size={:#x} mask={:#x} value={:#x} (no-op)", addr, size, mask, value);
     SUCCESS
 }
 
@@ -326,7 +336,50 @@ fn svc_get_thread_id(_kernel: &mut Kernel) -> u32 {
 
 fn svc_break(kernel: &mut Kernel) -> u32 {
     let reason = if let Some(cpu) = &kernel.cpu { cpu.get_register(0) } else { 0 };
-    log::info!("svcBreak: reason={:#x}", reason);
+    let info_va = if let Some(cpu) = &kernel.cpu { cpu.get_register(1) } else { 0 };
+    let info_size = if let Some(cpu) = &kernel.cpu { cpu.get_register(2) as usize } else { 0 };
+
+    log::warn!("svcBreak: reason={:#x}, info_va={:#x}, info_size={:#x}", reason, info_va, info_size);
+
+    if let Some(cpu) = &kernel.cpu {
+        let pc = cpu.get_pc();
+        let lr = cpu.get_register(30);
+        let sp = cpu.get_register(31);
+        let fp = cpu.get_register(29);
+
+        log::warn!("  PC={:#x}, LR={:#x}, SP={:#x}, FP={:#x}", pc, lr, sp, fp);
+
+        let mut callers = Vec::new();
+        let mut cur_fp = fp;
+        for i in 0..8 {
+            if cur_fp < 0x80_0000_0000 || cur_fp > 0xc0_0000_0000 {
+                break;
+            }
+            let mut frame = [0u8; 16];
+            if kernel.address_space.read(cur_fp, &mut frame).is_err() {
+                break;
+            }
+            let next_fp = u64::from_le_bytes([frame[0], frame[1], frame[2], frame[3], frame[4], frame[5], frame[6], frame[7]]);
+            let saved_lr = u64::from_le_bytes([frame[8], frame[9], frame[10], frame[11], frame[12], frame[13], frame[14], frame[15]]);
+            callers.push((i, saved_lr));
+            if next_fp == 0 || next_fp <= cur_fp {
+                break;
+            }
+            cur_fp = next_fp;
+        }
+
+        for (i, addr) in &callers {
+            log::warn!("  Stack[{}]: {:#x} (offset {:#x})", i, addr, addr.wrapping_sub(kernel.code_base));
+        }
+
+        if info_size > 0 && info_size <= 0x1000 {
+            let mut info_buf = vec![0u8; info_size.min(0x80)];
+            if kernel.address_space.read(info_va, &mut info_buf).is_ok() {
+                log::warn!("  Info buffer: {:02x?}", &info_buf);
+            }
+        }
+    }
+
     kernel.process_exited = true;
     SUCCESS
 }
