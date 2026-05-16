@@ -40,13 +40,18 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
     }
 }
 
-fn svc_set_heap_size(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcSetHeapSize");
+fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
+    log::debug!("svcSetHeapSize (X0=heap_size, X1=heap_addr_ptr)");
     SUCCESS
 }
 
-fn svc_query_memory(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcQueryMemory");
+fn svc_query_memory(kernel: &mut Kernel) -> u32 {
+    log::debug!("svcQueryMemory (X1=address)");
+    let memory_type: u32 = 0;
+    let memory_attr: u32 = 0;
+    let permission: u32 = 0x3;
+
+    log::debug!("returning memory_type={:#x}, attr={:#x}, perm={:#x}", memory_type, memory_attr, permission);
     SUCCESS
 }
 
@@ -70,8 +75,9 @@ fn svc_signal_event(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_wait_synchronization(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcWaitSynchronization");
+fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
+    log::debug!("svcWaitSynchronization (X0=handles[], X1=count, X2=timeout_ns)");
+    log::debug!("waiting on {} handles", 1);
     SUCCESS
 }
 
@@ -139,7 +145,7 @@ fn svc_send_sync_request_with_user_buffer(_kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_get_thread_id(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcGetThreadId");
+    log::debug!("svcGetThreadId (X1=thread_handle)");
     SUCCESS
 }
 
