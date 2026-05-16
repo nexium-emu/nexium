@@ -39,6 +39,9 @@ pub struct Kernel {
     pub next_vsync_cycle: u64,
     pub display_ready: bool,
     pub process_exited: bool,
+
+    pub process_handle: u32,
+    pub main_thread_handle: u32,
 }
 
 impl Kernel {
@@ -51,9 +54,13 @@ impl Kernel {
         stack_base: u64,
         stack_size: u64,
     ) -> Self {
+        let mut handles = handles::HandleTable::new();
+        let process_handle = handles.create_handle(handles::HandleType::Process);
+        let main_thread_handle = handles.create_handle(handles::HandleType::Thread);
+
         Self {
             address_space,
-            handles: handles::HandleTable::new(),
+            handles,
             threads: threads::Threads::new(),
             services: Services::new(),
             nvdrv: Nvdrv::new(),
@@ -73,6 +80,8 @@ impl Kernel {
             next_vsync_cycle: 16_666_667,
             display_ready: false,
             process_exited: false,
+            process_handle,
+            main_thread_handle,
         }
     }
 

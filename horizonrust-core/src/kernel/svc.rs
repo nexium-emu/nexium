@@ -452,8 +452,8 @@ fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_get_info(kernel: &mut Kernel) -> u32 {
-    let (info_type, _handle, _info_id) = if let Some(cpu) = &kernel.cpu {
-        (cpu.get_register(0), cpu.get_register(1), cpu.get_register(2))
+    let (info_type, _handle, _sub) = if let Some(cpu) = &kernel.cpu {
+        (cpu.get_register(1) as u32, cpu.get_register(2), cpu.get_register(3))
     } else {
         return 1;
     };

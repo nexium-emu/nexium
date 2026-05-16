@@ -74,6 +74,12 @@ impl EnvBlockBuilder {
         Self::default()
     }
 
+    pub fn with_handles(mut self, main_thread_handle: u32, process_handle: u32) -> Self {
+        self.main_thread_handle = main_thread_handle;
+        self.process_handle = process_handle;
+        self
+    }
+
     pub fn with_heap(mut self, base: u64, size: u64) -> Self {
         self.heap_base = base;
         self.heap_size = size;

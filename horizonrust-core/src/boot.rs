@@ -61,31 +61,18 @@ impl BootContext {
         address_space.map(env_base, 0x10000, Perm::RW, "extras")
             .map_err(|e| format!("Failed to map extras: {:?}", e))?;
 
-        log::info!("  Initializing environment block @ {:#x}", env_base);
-        let env_builder = crate::loader::EnvBlockBuilder::new()
-            .with_heap(heap_base, config.heap_size);
-        env_builder.build_into(&address_space, env_base)?;
-
         log::info!("  Writing exit stub SVC instruction @ {:#x}", exit_stub_va);
         let svc_exit_insn: u32 = 0xD400_00E1;
         address_space.write(exit_stub_va, &svc_exit_insn.to_le_bytes())
             .map_err(|e| format!("Failed to write exit stub: {:?}", e))?;
 
-        log::info!("Loading NRO segments into memory");
-        let text_va = code_base;
-        let ro_va = text_va + nro.text.size as u64;
-        let data_va = ro_va + nro.ro.size as u64;
+        log::info!("Loading NRO file into memory at code_base");
+        let nro_file = std::fs::read(&config.nro_path)
+            .map_err(|e| format!("Failed to read NRO file: {}", e))?;
 
-        log::info!("  text @ {:#x} ({} bytes)", text_va, nro.text.size);
-        log::info!("  ro   @ {:#x} ({} bytes)", ro_va, nro.ro.size);
-        log::info!("  data @ {:#x} ({} bytes)", data_va, nro.data.size);
-
-        address_space.write(text_va, &nro.text.data)
-            .map_err(|e| format!("Failed to write text segment: {:?}", e))?;
-        address_space.write(ro_va, &nro.ro.data)
-            .map_err(|e| format!("Failed to write ro segment: {:?}", e))?;
-        address_space.write(data_va, &nro.data.data)
-            .map_err(|e| format!("Failed to write data segment: {:?}", e))?;
+        log::info!("  Writing NRO file ({} bytes) at {:#x}", nro_file.len(), code_base);
+        address_space.write(code_base, &nro_file)
+            .map_err(|e| format!("Failed to write NRO file: {:?}", e))?;
 
         let mut kernel = Kernel::new(
             address_space.clone(),
@@ -97,13 +84,19 @@ impl BootContext {
             config.stack_size,
         );
 
+        log::info!("  Initializing environment block @ {:#x}", env_base);
+        let env_builder = crate::loader::EnvBlockBuilder::new()
+            .with_handles(kernel.main_thread_handle, kernel.process_handle)
+            .with_heap(heap_base, config.heap_size);
+        env_builder.build_into(&address_space, env_base)?;
+
         log::info!("Initializing CPU");
         kernel.init_cpu()
             .map_err(|e| format!("Failed to init CPU: {}", e))?;
 
         if let Some(cpu) = &mut kernel.cpu {
             log::info!("Setting up CPU registers");
-            let entry_point = text_va;
+            let entry_point = code_base;
             let sp = stack_base + config.stack_size - 0x20;
 
             cpu.set_pc(entry_point);
