@@ -3,6 +3,7 @@ use gilrs::Gilrs;
 use crate::boot::EmulationHandle;
 use crate::input::InputSnapshot;
 use crate::debugger::DebuggerState;
+use crate::performance::PerformanceMonitor;
 
 pub struct HorizonApp {
     nro_path: String,
@@ -12,6 +13,7 @@ pub struct HorizonApp {
     gilrs: Option<Gilrs>,
     last_input: InputSnapshot,
     debugger: DebuggerState,
+    performance: PerformanceMonitor,
 }
 
 impl HorizonApp {
@@ -32,6 +34,7 @@ impl HorizonApp {
             gilrs,
             last_input: InputSnapshot::default(),
             debugger: DebuggerState::new(),
+            performance: PerformanceMonitor::new(),
         }
     }
 
@@ -162,7 +165,16 @@ impl eframe::App for HorizonApp {
             ui.label(format!("B: {}", self.last_input.b_pressed));
             ui.label(format!("X: {}", self.last_input.x_pressed));
             ui.label(format!("Y: {}", self.last_input.y_pressed));
+
+            ui.separator();
+            ui.label("Performance:");
+            ui.label(format!("FPS: {:.1}", self.performance.get_fps()));
+            ui.label(format!("Frame Time: {:.2} ms", self.performance.get_frame_time()));
+            ui.label(format!("SVCs: {}", self.performance.get_svc_count()));
+            ui.label(format!("Cycles: {}", self.performance.get_cycle_count()));
         });
+
+        self.performance.record_frame();
 
         if self.show_settings {
             egui::Window::new("Settings").open(&mut self.show_settings).show(ctx, |ui| {
