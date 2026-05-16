@@ -87,8 +87,30 @@ pub struct Nro {
 }
 
 impl Nro {
+    fn unwrap_homebrew(data: &[u8]) -> Result<Vec<u8>, String> {
+        if data.len() < 16 {
+            return Ok(data.to_vec());
+        }
+
+        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if magic == 0x304F524E {
+            return Ok(data.to_vec());
+        }
+
+        if data.len() >= 32 {
+            let magic_at_16 = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+            if magic_at_16 == 0x304F524E {
+                log::debug!("Detected homebrew wrapper, skipping 16-byte header");
+                return Ok(data[16..].to_vec());
+            }
+        }
+
+        Ok(data.to_vec())
+    }
+
     pub fn parse(data: &[u8]) -> Result<Self, String> {
-        let header = NroHeader::from_bytes(data)?;
+        let nro_data = Self::unwrap_homebrew(data)?;
+        let header = NroHeader::from_bytes(&nro_data)?;
 
         log::debug!("NRO: magic={:#x}, version={}, size={}", header.magic, header.version, header.size);
         log::debug!("NRO: text=[{:#x}, {:#x}), ro=[{:#x}, {:#x}), data=[{:#x}, {:#x})",
@@ -96,32 +118,32 @@ impl Nro {
                    header.ro_offset, header.ro_offset + header.ro_size,
                    header.data_offset, header.data_offset + header.data_size);
 
-        if header.text_offset + header.text_size > data.len() as u32 {
+        if header.text_offset + header.text_size > nro_data.len() as u32 {
             return Err("Text segment out of bounds".to_string());
         }
-        if header.ro_offset + header.ro_size > data.len() as u32 {
+        if header.ro_offset + header.ro_size > nro_data.len() as u32 {
             return Err("RO segment out of bounds".to_string());
         }
-        if header.data_offset + header.data_size > data.len() as u32 {
+        if header.data_offset + header.data_size > nro_data.len() as u32 {
             return Err("Data segment out of bounds".to_string());
         }
 
         let text = NroSegment {
             offset: header.text_offset,
             size: header.text_size,
-            data: data[header.text_offset as usize..(header.text_offset + header.text_size) as usize].to_vec(),
+            data: nro_data[header.text_offset as usize..(header.text_offset + header.text_size) as usize].to_vec(),
         };
 
         let ro = NroSegment {
             offset: header.ro_offset,
             size: header.ro_size,
-            data: data[header.ro_offset as usize..(header.ro_offset + header.ro_size) as usize].to_vec(),
+            data: nro_data[header.ro_offset as usize..(header.ro_offset + header.ro_size) as usize].to_vec(),
         };
 
         let data_seg = NroSegment {
             offset: header.data_offset,
             size: header.data_size,
-            data: data[header.data_offset as usize..(header.data_offset + header.data_size) as usize].to_vec(),
+            data: nro_data[header.data_offset as usize..(header.data_offset + header.data_size) as usize].to_vec(),
         };
 
         Ok(Nro {
