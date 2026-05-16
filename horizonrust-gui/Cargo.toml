@@ -17,6 +17,7 @@ horizonrust-gpu.workspace = true
 eframe = "0.29"
 egui = "0.29"
 winit = "0.30"
+rfd = "0.15"
 
 cpal = "0.15"
 gilrs = "0.10"
