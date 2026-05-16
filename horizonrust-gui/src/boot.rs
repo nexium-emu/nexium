@@ -2,7 +2,7 @@ use horizonrust_core::boot::{BootConfig, BootContext};
 use horizonrust_core::services::FrameOut;
 use std::path::Path;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 pub struct Frame {

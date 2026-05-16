@@ -8,16 +8,12 @@ mod performance;
 use app::HorizonApp;
 use horizonrust_common::BufferedLogger;
 use log::LevelFilter;
-use std::sync::Mutex;
-use std::collections::VecDeque;
 
 fn main() -> Result<(), eframe::Error> {
     let (logger, log_buffer) = BufferedLogger::new(500);
     let _ = logger.init(LevelFilter::Info);
 
     log::info!("=== HorizonRust - Nintendo Switch Emulator ===");
-
-    let log_buffer = std::sync::Arc::new(Mutex::new(log_buffer));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
