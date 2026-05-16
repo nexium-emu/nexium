@@ -24,10 +24,11 @@ impl DynarmicCpu {
 
         let event_for_svc = last_event.clone();
         emu.set_svc_callback(move |dyn_, swi, _until, pc| {
+            log::info!("dynarmic SVC callback triggered: swi={:#04x}, pc={:#x}", swi, pc);
             *event_for_svc.lock().unwrap() = Some(CpuEvent::Svc(swi as u16));
             let _ = dyn_.emu_stop();
-            let _ = pc;
         });
+        log::info!("dynarmic: SVC callback registered");
 
         let event_for_unmapped = last_event.clone();
         emu.set_unmapped_mem_callback(move |dyn_, addr, size, _value| {
@@ -103,11 +104,18 @@ impl DynarmicCpu {
     pub fn run(&mut self, _max_insn: u64) -> CpuEvent {
         *self.last_event.lock().unwrap() = None;
         let pc = self.get_pc();
+        log::trace!("dynarmic run: PC={:#x}", pc);
         let _ = self.emu.emu.emu_start(pc, u64::MAX - 16);
         let event = self.last_event.lock().unwrap().take();
         match event {
-            Some(CpuEvent::Svc(imm)) => CpuEvent::Svc(imm),
-            Some(other) => other,
+            Some(CpuEvent::Svc(imm)) => {
+                log::debug!("dynarmic SVC {:#04x} hit at PC={:#x}", imm, pc);
+                CpuEvent::Svc(imm)
+            }
+            Some(other) => {
+                log::warn!("dynarmic event: {:?}", other);
+                other
+            }
             None => CpuEvent::Running,
         }
     }

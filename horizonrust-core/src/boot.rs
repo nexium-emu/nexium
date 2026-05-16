@@ -56,9 +56,9 @@ impl BootContext {
         let ro_va = text_va + nro.text.size as u64;
         let data_va = ro_va + nro.ro.size as u64;
 
-        log::debug!("  text @ {:#x} ({} bytes)", text_va, nro.text.size);
-        log::debug!("  ro   @ {:#x} ({} bytes)", ro_va, nro.ro.size);
-        log::debug!("  data @ {:#x} ({} bytes)", data_va, nro.data.size);
+        log::info!("  text @ {:#x} ({} bytes)", text_va, nro.text.size);
+        log::info!("  ro   @ {:#x} ({} bytes)", ro_va, nro.ro.size);
+        log::info!("  data @ {:#x} ({} bytes)", data_va, nro.data.size);
 
         address_space.write(text_va, &nro.text.data)
             .map_err(|e| format!("Failed to write text segment: {:?}", e))?;
@@ -94,12 +94,12 @@ impl BootContext {
             cpu.set_register(1, 0);
             cpu.set_register(2, heap_end);
 
-            log::debug!("  PC: {:#x}", cpu.get_pc());
-            log::debug!("  SP: {:#x}", cpu.get_sp());
-            log::debug!("  TPIDRRO_EL0: {:#x}", cpu.get_tpidrro_el0());
-            log::debug!("  X0 (main_thread_handle): {}", cpu.get_register(0));
-            log::debug!("  X1 (entrypoint_arg): {}", cpu.get_register(1));
-            log::debug!("  X2 (heap_base): {:#x}", cpu.get_register(2));
+            log::info!("  PC: {:#x}", cpu.get_pc());
+            log::info!("  SP: {:#x}", cpu.get_sp());
+            log::info!("  TPIDRRO_EL0: {:#x}", cpu.get_tpidrro_el0());
+            log::info!("  X0 (main_thread_handle): {}", cpu.get_register(0));
+            log::info!("  X1 (entrypoint_arg): {}", cpu.get_register(1));
+            log::info!("  X2 (heap_base): {:#x}", cpu.get_register(2));
         }
 
         log::info!("Boot context ready");
@@ -126,12 +126,12 @@ impl BootContext {
                 match event {
                     crate::cpu::CpuEvent::Running => {
                         if cycle_count % 10_000_000 == 0 {
-                            log::debug!("CPU running... {} cycles executed", cycle_count);
+                            log::info!("CPU running... {} cycles executed (no SVCs yet)", cycle_count);
                         }
                     }
                     crate::cpu::CpuEvent::Svc(imm) => {
                         svc_count += 1;
-                        log::debug!("SVC {:#04x} (count: {})", imm, svc_count);
+                        log::info!("SVC {:#04x} (count: {})", imm, svc_count);
 
                         let result = self.kernel.dispatch_svc(imm);
 

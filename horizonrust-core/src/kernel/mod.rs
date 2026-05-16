@@ -75,8 +75,8 @@ impl Kernel {
                     .map_err(|e| format!("CPU map_host failed for {:#x}: {}", region.base, e))?;
             }
         }
+        log::info!("Kernel CPU initialized with {} mapped regions", self.address_space.host_regions().len());
         self.cpu = Some(cpu);
-        log::debug!("Kernel CPU initialized with {} mapped regions", self.address_space.host_regions().len());
         Ok(())
     }
 
