@@ -1,25 +1,20 @@
 pub mod dynarmic;
 
 use dynarmic::DynarmicCpu;
+use crate::memory::Perm;
 
 pub enum Cpu {
     Dynarmic(DynarmicCpu),
 }
 
 impl Cpu {
-    pub fn new_dynarmic(memory_ptr: *mut u8, memory_size: usize) -> Result<Self, String> {
-        DynarmicCpu::new(memory_ptr, memory_size).map(Cpu::Dynarmic)
+    pub fn new_dynarmic() -> Result<Self, String> {
+        DynarmicCpu::new().map(Cpu::Dynarmic)
     }
 
-    pub fn from_env(memory_ptr: *mut u8, memory_size: usize) -> Result<Self, String> {
-        let backend = std::env::var("HORIZONRUST_CPU").unwrap_or_else(|_| "dynarmic".to_string());
-
-        match backend.as_str() {
-            "dynarmic" => Self::new_dynarmic(memory_ptr, memory_size),
-            _ => {
-                log::warn!("Unknown CPU backend: {}, defaulting to dynarmic", backend);
-                Self::new_dynarmic(memory_ptr, memory_size)
-            }
+    pub unsafe fn map_host(&mut self, va: u64, len: u64, perm: Perm, ptr: *mut u8) -> Result<(), String> {
+        match self {
+            Cpu::Dynarmic(cpu) => cpu.map_host(va, len, perm, ptr),
         }
     }
 
@@ -86,6 +81,18 @@ impl Cpu {
     pub fn inject_svc(&mut self, imm: u16) {
         match self {
             Cpu::Dynarmic(cpu) => cpu.inject_svc(imm),
+        }
+    }
+
+    pub fn write_bytes(&self, va: u64, bytes: &[u8]) -> Result<(), String> {
+        match self {
+            Cpu::Dynarmic(cpu) => cpu.write_bytes(va, bytes),
+        }
+    }
+
+    pub fn read_bytes(&self, va: u64, buf: &mut [u8]) -> Result<(), String> {
+        match self {
+            Cpu::Dynarmic(cpu) => cpu.read_bytes(va, buf),
         }
     }
 }

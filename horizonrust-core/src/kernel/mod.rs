@@ -67,9 +67,16 @@ impl Kernel {
         }
     }
 
-    pub fn init_cpu(&mut self, memory_ptr: *mut u8, memory_size: usize) -> Result<(), String> {
-        self.cpu = Some(Cpu::from_env(memory_ptr, memory_size)?);
-        log::debug!("Kernel CPU initialized");
+    pub fn init_cpu(&mut self) -> Result<(), String> {
+        let mut cpu = Cpu::new_dynarmic()?;
+        for region in self.address_space.host_regions() {
+            unsafe {
+                cpu.map_host(region.base, region.size, region.perm, region.host_ptr)
+                    .map_err(|e| format!("CPU map_host failed for {:#x}: {}", region.base, e))?;
+            }
+        }
+        self.cpu = Some(cpu);
+        log::debug!("Kernel CPU initialized with {} mapped regions", self.address_space.host_regions().len());
         Ok(())
     }
 

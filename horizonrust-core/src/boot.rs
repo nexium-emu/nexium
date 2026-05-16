@@ -77,12 +77,8 @@ impl BootContext {
             config.stack_size,
         );
 
-        log::info!("Initializing CPU with {} bytes of memory", config.code_size + config.heap_size + config.stack_size);
-        let total_memory = (config.code_size + config.heap_size + config.stack_size) as usize;
-        let mut memory = vec![0u8; total_memory];
-        let memory_ptr = memory.as_mut_ptr();
-
-        kernel.init_cpu(memory_ptr, total_memory)
+        log::info!("Initializing CPU");
+        kernel.init_cpu()
             .map_err(|e| format!("Failed to init CPU: {}", e))?;
 
         if let Some(cpu) = &mut kernel.cpu {
