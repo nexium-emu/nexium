@@ -8,5 +8,6 @@ pub mod nvdrv;
 pub mod shader;
 pub mod spirv;
 pub mod boot;
+pub mod sdl_emu;
 
 pub use horizonrust_common as common;
