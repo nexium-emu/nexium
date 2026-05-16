@@ -5,6 +5,7 @@ pub mod shader;
 pub mod swapchain;
 pub mod presenter;
 pub mod deswizzle;
+pub mod draw;
 
 use ash::vk;
 use std::ffi::CStr;
