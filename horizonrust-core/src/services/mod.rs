@@ -170,9 +170,9 @@ impl Services {
         }
     }
 
-    pub fn dispatch_service(&mut self, port_name: &str, cmd_id: u32, ctx: &mut IpcCtx) -> u32 {
+    pub fn dispatch_service(&mut self, port_name: &str, cmd_id: u32, ctx: &mut IpcCtx) -> (u32, Vec<u8>) {
         log::trace!("dispatch_service: port={} cmd_id={}", port_name, cmd_id);
-        match port_name {
+        let result = match port_name {
             "sm:" => self.sm.dispatch(cmd_id),
             "hid" => self.hid.dispatch(cmd_id),
             "time:s" | "time:a" | "time:r" => self.time.dispatch(cmd_id),
@@ -218,7 +218,8 @@ impl Services {
                 log::warn!("unknown service: {}", port_name);
                 1
             }
-        }
+        };
+        (result, Vec::new())
     }
 }
 

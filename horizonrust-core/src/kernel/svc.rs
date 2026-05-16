@@ -320,9 +320,9 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             tls_buf: &tls_snapshot,
             pending_frames: &mut pending_frames,
         };
-        let result = kernel.services.dispatch_service(&port_name, cmd_id, &mut ipc_ctx);
+        let (result, out_data) = kernel.services.dispatch_service(&port_name, cmd_id, &mut ipc_ctx);
         kernel.pending_frames = pending_frames;
-        (result, Vec::new())
+        (result, out_data)
     };
 
     write_ipc_response_with_data(&mut tls_buf, cmif_data_off, result, token, &out_data);
