@@ -1,4 +1,5 @@
 pub mod svc;
+pub mod svc_defs;
 pub mod threads;
 pub mod handles;
 pub mod hid;

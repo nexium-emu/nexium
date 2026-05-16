@@ -1,3 +1,4 @@
+pub mod base;
 pub mod sm;
 pub mod hid;
 pub mod time;
