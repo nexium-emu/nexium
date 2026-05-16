@@ -1,0 +1,18 @@
+=== HorizonRust Debug Continue (ignore Break) ===
+NRO: space-nx-master/spacenx.nro
+Boot context initialized, starting emulation...
+[100000] SVC 0x02 @ 0x8000000000 (count: 1)
+[200000] SVC 0x03 @ 0x8000493d58 (count: 2)
+[300000] SVC 0x26 @ 0x8000493d60 (count: 3)
+[300000] Break #1 encountered, continuing execution...
+[100000000] Running... PC=0x800049322c
+[200000000] Running... PC=0x800049322c
+[300000000] Running... PC=0x800049322c
+[400000000] Running... PC=0x800049322c
+[500000000] Running... PC=0x800049322c
+Max cycles exceeded
+
+=== Execution Complete ===
+Total cycles: 500100000
+Total SVCs: 3
+Break calls: 1

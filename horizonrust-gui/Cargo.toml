@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "debug_boot"
 path = "src/debug_boot.rs"
 
+[[bin]]
+name = "debug_continue"
+path = "src/debug_continue.rs"
+
 [dependencies]
 horizonrust-common.workspace = true
 horizonrust-core.workspace = true
