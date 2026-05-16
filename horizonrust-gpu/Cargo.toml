@@ -7,3 +7,12 @@ license.workspace = true
 
 [dependencies]
 horizonrust-common.workspace = true
+horizonrust-core.workspace = true
+
+ash = "0.38"
+parking_lot = "0.12"
+log = "0.4"
+thiserror = "1"
+
+[dev-dependencies]
+winit = "0.30"
