@@ -44,6 +44,7 @@ impl EmulationHandle {
             let max_cycles = 1_000_000_000u64;
             let mut cycle_count = 0u64;
             let mut svc_count = 0u32;
+            let mut pc_check_count = 0u32;
 
             loop {
                 if stop_flag_clone.load(Ordering::Relaxed) {
@@ -52,18 +53,25 @@ impl EmulationHandle {
                 }
 
                 if let Some(cpu) = &mut boot_ctx.kernel.cpu {
+                    let pc_before = cpu.get_pc();
                     let event = cpu.run(100_000);
+                    let pc_after = cpu.get_pc();
                     cycle_count += 100_000;
+
+                    if pc_check_count < 5 {
+                        log::info!("CPU exec: PC {:#x} → {:#x} (event: {:?})", pc_before, pc_after, event);
+                        pc_check_count += 1;
+                    }
 
                     match event {
                         horizonrust_core::cpu::CpuEvent::Running => {
                             if cycle_count % 10_000_000 == 0 {
-                                log::debug!("CPU running... {} cycles", cycle_count);
+                                log::info!("CPU running... {} cycles executed", cycle_count);
                             }
                         }
                         horizonrust_core::cpu::CpuEvent::Svc(imm) => {
                             svc_count += 1;
-                            log::trace!("SVC {:#04x} (count: {})", imm, svc_count);
+                            log::info!("SVC {:#04x} (count: {})", imm, svc_count);
 
                             let result = boot_ctx.kernel.dispatch_svc(imm);
 
