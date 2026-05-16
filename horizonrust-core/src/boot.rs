@@ -40,6 +40,8 @@ impl BootContext {
         let heap_base: u64 = 0x9000_0000_0000;
         let stack_base: u64 = 0xA000_0000_0000;
         let tls_base: u64 = 0xB000_0000_0000;
+        let env_base: u64 = 0xB0_0000_0000;
+        let exit_stub_va: u64 = 0xB0_0000_2000;
 
         log::info!("Mapping memory regions");
         address_space.map(code_base, config.code_size, Perm::RX, "code")
@@ -50,6 +52,14 @@ impl BootContext {
             .map_err(|e| format!("Failed to map stack: {:?}", e))?;
         address_space.map(tls_base, 0x1000, Perm::RW, "tls")
             .map_err(|e| format!("Failed to map tls: {:?}", e))?;
+        address_space.map(env_base, 0x10000, Perm::RW, "env")
+            .map_err(|e| format!("Failed to map env: {:?}", e))?;
+        address_space.map(exit_stub_va, 0x1000, Perm::RX, "exit_stub")
+            .map_err(|e| format!("Failed to map exit stub: {:?}", e))?;
+
+        let svc_exit_insn: u32 = 0xD400_00E1;
+        address_space.write(exit_stub_va, &svc_exit_insn.to_le_bytes())
+            .map_err(|e| format!("Failed to write exit stub: {:?}", e))?;
 
         log::info!("Loading NRO segments into memory");
         let text_va = code_base;
@@ -84,22 +94,21 @@ impl BootContext {
         if let Some(cpu) = &mut kernel.cpu {
             log::info!("Setting up CPU registers");
             let entry_point = text_va;
-            let sp = stack_base + config.stack_size;
-            let heap_end = heap_base;
+            let sp = stack_base + config.stack_size - 0x20;
 
             cpu.set_pc(entry_point);
             cpu.set_sp(sp);
             cpu.set_tpidrro_el0(tls_base);
-            cpu.set_register(0, 1);
-            cpu.set_register(1, 0);
-            cpu.set_register(2, heap_end);
+            cpu.set_register(0, env_base);
+            cpu.set_register(1, u64::MAX);
+            cpu.set_register(30, exit_stub_va);
 
             log::info!("  PC: {:#x}", cpu.get_pc());
             log::info!("  SP: {:#x}", cpu.get_sp());
+            log::info!("  X0 (env_block): {:#x}", cpu.get_register(0));
+            log::info!("  X1 (env_size): {:#x}", cpu.get_register(1));
+            log::info!("  X30 (exit_stub): {:#x}", cpu.get_register(30));
             log::info!("  TPIDRRO_EL0: {:#x}", cpu.get_tpidrro_el0());
-            log::info!("  X0 (main_thread_handle): {}", cpu.get_register(0));
-            log::info!("  X1 (entrypoint_arg): {}", cpu.get_register(1));
-            log::info!("  X2 (heap_base): {:#x}", cpu.get_register(2));
         }
 
         log::info!("Boot context ready");
