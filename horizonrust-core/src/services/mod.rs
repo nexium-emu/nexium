@@ -8,6 +8,26 @@ pub mod audio;
 pub mod fs;
 pub mod nifm;
 pub mod nvnflinger;
+pub mod ns;
+pub mod acc;
+pub mod pctl;
+pub mod ssl;
+pub mod spl;
+pub mod pl;
+pub mod psc;
+pub mod smc;
+pub mod fatal;
+pub mod apm;
+pub mod bsd;
+pub mod caps;
+pub mod misc;
+pub mod pdm;
+pub mod prepo;
+pub mod psm;
+pub mod ldr;
+pub mod lr;
+pub mod ldn;
+pub mod friends;
 
 pub struct FrameOut {
     pub width: u32,
@@ -26,6 +46,26 @@ pub struct Services {
     pub fs: fs::FileSystemService,
     pub nifm: nifm::NetworkService,
     pub nvnflinger: nvnflinger::BufferQueueService,
+    pub ns: ns::ContentService,
+    pub acc: acc::AccountService,
+    pub pctl: pctl::ParentalControlService,
+    pub ssl: ssl::SslService,
+    pub spl: spl::SplService,
+    pub pl: pl::PlService,
+    pub psc: psc::PscService,
+    pub smc: smc::SmcService,
+    pub fatal: fatal::FatalService,
+    pub apm: apm::ApmService,
+    pub bsd: bsd::BsdService,
+    pub caps: caps::CapsService,
+    pub misc: misc::MiscService,
+    pub pdm: pdm::PdmService,
+    pub prepo: prepo::PrepoService,
+    pub psm: psm::PsmService,
+    pub ldr: ldr::LdrService,
+    pub lr: lr::LrService,
+    pub ldn: ldn::LdnService,
+    pub friends: friends::FriendsService,
 }
 
 impl Services {
@@ -41,6 +81,26 @@ impl Services {
             fs: fs::FileSystemService::new(),
             nifm: nifm::NetworkService::new(),
             nvnflinger: nvnflinger::BufferQueueService::new(),
+            ns: ns::ContentService::new(),
+            acc: acc::AccountService::new(),
+            pctl: pctl::ParentalControlService::new(),
+            ssl: ssl::SslService::new(),
+            spl: spl::SplService::new(),
+            pl: pl::PlService::new(),
+            psc: psc::PscService::new(),
+            smc: smc::SmcService::new(),
+            fatal: fatal::FatalService::new(),
+            apm: apm::ApmService::new(),
+            bsd: bsd::BsdService::new(),
+            caps: caps::CapsService::new(),
+            misc: misc::MiscService::new(),
+            pdm: pdm::PdmService::new(),
+            prepo: prepo::PrepoService::new(),
+            psm: psm::PsmService::new(),
+            ldr: ldr::LdrService::new(),
+            lr: lr::LrService::new(),
+            ldn: ldn::LdnService::new(),
+            friends: friends::FriendsService::new(),
         }
     }
 
@@ -57,6 +117,26 @@ impl Services {
             "fsp-srv" => self.fs.dispatch(cmd_id),
             "nifm:u" | "nifm:a" => self.nifm.dispatch(cmd_id),
             "nvnflinger" => self.nvnflinger.dispatch(cmd_id),
+            "ns" => self.ns.dispatch(cmd_id),
+            "acc:u" | "acc:a" => self.acc.dispatch(cmd_id),
+            "pctl:a" | "pctl:r" | "pctl:s" => self.pctl.dispatch(cmd_id),
+            "ssl" => self.ssl.dispatch(cmd_id),
+            "spl:" => self.spl.dispatch(cmd_id),
+            "pl:u" | "pl:s" => self.pl.dispatch(cmd_id),
+            "psc" => self.psc.dispatch(cmd_id),
+            "smc:" => self.smc.dispatch(cmd_id),
+            "fatal:u" | "fatal:p" => self.fatal.dispatch(cmd_id),
+            "apm" => self.apm.dispatch(cmd_id),
+            "bsd:u" | "bsd:s" => self.bsd.dispatch(cmd_id),
+            "caps:a" | "caps:c" | "caps:su" => self.caps.dispatch(cmd_id),
+            "lm" => self.misc.dispatch(cmd_id),
+            "pdm" => self.pdm.dispatch(cmd_id),
+            "prepo" => self.prepo.dispatch(cmd_id),
+            "psm" => self.psm.dispatch(cmd_id),
+            "ldr:ro" => self.ldr.dispatch(cmd_id),
+            "lr" => self.lr.dispatch(cmd_id),
+            "ldn:u" | "ldn:s" => self.ldn.dispatch(cmd_id),
+            "friend:u" | "friend:a" | "friend:s" => self.friends.dispatch(cmd_id),
             _ => {
                 log::warn!("unknown service: {}", port_name);
                 1
