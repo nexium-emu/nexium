@@ -950,7 +950,9 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
 
     match cmd_id {
         0 => {
-            let path = if let Some(sb) = ctx.send_buffers.first().or(ctx.send_statics.first()) {
+            let buf_src = ctx.send_statics.iter().find(|b| b.size > 0 && b.addr != 0).copied()
+                .or_else(|| ctx.send_buffers.iter().find(|b| b.size > 0 && b.addr != 0).copied());
+            let path = if let Some(sb) = buf_src {
                 let mut buf = vec![0u8; sb.size as usize];
                 let _ = kernel.address_space.read(sb.addr, &mut buf);
                 let trimmed = buf.split(|&b| b == 0).next().unwrap_or(&buf);
@@ -958,7 +960,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             } else {
                 String::new()
             };
-            log::info!("nvdrv:Open path='{}'", path);
+            log::info!("nvdrv:Open path='{}' (sb={:?})", path, buf_src.map(|b| (b.addr, b.size)));
             let fd = kernel.nvdrv.open(&path).unwrap_or(0);
             let mut out = Vec::new();
             out.extend_from_slice(&fd.to_le_bytes());
