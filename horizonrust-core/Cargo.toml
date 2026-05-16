@@ -24,5 +24,7 @@ crossbeam.workspace = true
 log.workspace = true
 thiserror.workspace = true
 
+dynarmic-sys-mythrax.workspace = true
+
 rspirv.workspace = true
 naga.workspace = true

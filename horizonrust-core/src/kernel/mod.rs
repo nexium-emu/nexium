@@ -9,6 +9,7 @@ pub mod cpu_context;
 use crate::memory::AddressSpace;
 use crate::nvdrv::Nvdrv;
 use crate::services::Services;
+use crate::cpu::Cpu;
 use std::sync::Arc;
 use std::collections::HashMap;
 use parking_lot::Mutex;
@@ -22,6 +23,7 @@ pub struct Kernel {
     pub hid: Arc<Mutex<hid::HidShared>>,
     pub sessions: HashMap<u32, session::Session>,
     pub tls_buffer: [u8; 0x100],
+    pub cpu: Option<Cpu>,
 
     pub code_base: u64,
     pub code_size: u64,
@@ -50,6 +52,7 @@ impl Kernel {
             hid: Arc::new(Mutex::new(hid::HidShared::new())),
             sessions: HashMap::new(),
             tls_buffer: [0u8; 0x100],
+            cpu: None,
             code_base,
             code_size,
             heap_base,
@@ -57,6 +60,12 @@ impl Kernel {
             stack_base,
             stack_size,
         }
+    }
+
+    pub fn init_cpu(&mut self, memory_ptr: *mut u8, memory_size: usize) -> Result<(), String> {
+        self.cpu = Some(Cpu::from_env(memory_ptr, memory_size)?);
+        log::debug!("Kernel CPU initialized");
+        Ok(())
     }
 
     pub fn dispatch_svc(&mut self, imm: u16) -> u32 {

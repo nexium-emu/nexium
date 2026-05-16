@@ -52,6 +52,8 @@ gilrs = "0.10"
 serde = { version = "1", features = ["derive"] }
 directories = "5"
 
+dynarmic-sys-mythrax = "0.2.4"
+
 [profile.dev]
 opt-level = 1
 
