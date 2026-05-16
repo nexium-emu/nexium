@@ -614,6 +614,10 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
         return dispatch_nvdrv_command(kernel, ctx, port_name);
     }
 
+    if port_name == "IHOSBinderDriver" && (cmd_id == 0 || cmd_id == 3) {
+        return handle_binder_transact(kernel, ctx, session_handle);
+    }
+
     if let Some(buffer_data) = applet_buffer_response(port_name, cmd_id) {
         let target_buf = ctx.recv_buffers.iter()
             .find(|b| b.size > 0 && b.addr != 0)
@@ -650,6 +654,295 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     };
     let (result, out_data) = kernel.services.dispatch_service(port_name, cmd_id, &mut svc_ctx);
     build_ipc_response(ctx, result, &out_data, &[])
+}
+
+const IGBP_REQUEST_BUFFER: u32 = 1;
+const IGBP_DEQUEUE_BUFFER: u32 = 3;
+const IGBP_QUEUE_BUFFER: u32 = 7;
+const IGBP_CANCEL_BUFFER: u32 = 8;
+const IGBP_QUERY: u32 = 9;
+const IGBP_CONNECT: u32 = 10;
+const IGBP_DISCONNECT: u32 = 11;
+const IGBP_SET_PREALLOCATED_BUFFER: u32 = 14;
+
+fn handle_binder_transact(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, _session_handle: u32) -> Vec<u8> {
+    let cmd_id = ctx.cmif_in.cmd_id;
+    let (binder_id, code) = if ctx.cmif_in_data_len >= 8 {
+        let off = ctx.cmif_in_data_off;
+        let bid = i32::from_le_bytes([ctx.buf[off], ctx.buf[off + 1], ctx.buf[off + 2], ctx.buf[off + 3]]);
+        let c = u32::from_le_bytes([ctx.buf[off + 4], ctx.buf[off + 5], ctx.buf[off + 6], ctx.buf[off + 7]]);
+        (bid as u32, c)
+    } else {
+        (0u32, 0u32)
+    };
+
+    let mut in_parcel: Vec<u8> = Vec::new();
+    let in_src = ctx.send_statics.iter().find(|b| b.size > 0 && b.addr != 0).copied()
+        .or_else(|| ctx.send_buffers.iter().find(|b| b.size > 0 && b.addr != 0).copied());
+    if let Some(sb) = in_src {
+        in_parcel.resize(sb.size as usize, 0);
+        let _ = kernel.address_space.read(sb.addr, &mut in_parcel);
+    }
+
+    let reply = igbp_handle_transact(kernel, binder_id, code, &in_parcel);
+
+    log::info!("IHOSBinderDriver.TransactParcel{} binder={} code={} in_size={} reply_size={}",
+        if cmd_id == 3 { "Auto" } else { "" }, binder_id, code, in_parcel.len(), reply.len());
+
+    let out_dst = ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0).copied()
+        .or_else(|| ctx.recv_buffers.iter().find(|b| b.size > 0 && b.addr != 0).copied());
+    if let Some(rb) = out_dst {
+        let n = reply.len().min(rb.size as usize);
+        let _ = kernel.address_space.write(rb.addr, &reply[..n]);
+    }
+
+    build_ipc_response(ctx, 0, &[], &[])
+}
+
+fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parcel: &[u8]) -> Vec<u8> {
+    let mut reader = ParcelReader::new(in_parcel);
+    let _ = reader.skip_interface_token();
+
+    match code {
+        IGBP_CONNECT => {
+            let _listener = reader.read_i32();
+            let api = reader.read_i32().unwrap_or(0);
+            let _producer_controlled = reader.read_i32();
+            let (w, h) = kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
+                bq.connected_api = api;
+                (bq.width, bq.height)
+            });
+            log::debug!("IGBP::Connect binder={} api={} {}x{}", binder_id, api, w, h);
+            let mut p = ParcelBuilder::new();
+            p.write_bq_buffer_output(w, h);
+            p.write_u32(0);
+            p.finish()
+        }
+        IGBP_DISCONNECT => {
+            log::debug!("IGBP::Disconnect binder={}", binder_id);
+            let mut p = ParcelBuilder::new();
+            p.write_u32(0);
+            p.finish()
+        }
+        IGBP_SET_PREALLOCATED_BUFFER => {
+            let slot = reader.read_i32().unwrap_or(0).max(0) as u32;
+            let has = reader.read_i32().unwrap_or(0);
+            if has == 0 {
+                return ParcelBuilder::new().finish();
+            }
+            let gb = parse_flattened_graphic_buffer(&mut reader);
+            kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
+                if let Some(gb) = gb {
+                    bq.set_preallocated(slot, gb);
+                }
+            });
+            log::debug!("IGBP::SetPreallocatedBuffer binder={} slot={}", binder_id, slot);
+            let mut p = ParcelBuilder::new();
+            p.write_u32(0);
+            p.finish()
+        }
+        IGBP_REQUEST_BUFFER => {
+            let slot = reader.read_i32().unwrap_or(0).max(0) as u32;
+            let gb = kernel.nvdrv.with_bufferqueue(binder_id, |bq| bq.request_buffer(slot).cloned());
+            let mut p = ParcelBuilder::new();
+            if let Some(gb) = gb {
+                p.write_u32(1);
+                p.write_flattened_graphic_buffer(&gb);
+            } else {
+                p.write_u32(0);
+            }
+            p.write_u32(0);
+            log::debug!("IGBP::RequestBuffer binder={} slot={}", binder_id, slot);
+            p.finish()
+        }
+        IGBP_DEQUEUE_BUFFER => {
+            let _async_ = reader.read_i32();
+            let _w = reader.read_u32();
+            let _h = reader.read_u32();
+            let _fmt = reader.read_i32();
+            let _usage = reader.read_u32();
+            let slot = kernel.nvdrv.with_bufferqueue(binder_id, |bq| bq.dequeue());
+            log::debug!("IGBP::DequeueBuffer binder={} → slot={}", binder_id, slot);
+            let mut p = ParcelBuilder::new();
+            p.write_u32(slot);
+            p.write_u32(1);
+            p.write_flattened_zero_fence();
+            p.write_u32(0);
+            p.finish()
+        }
+        IGBP_QUEUE_BUFFER => {
+            let slot = reader.read_i32().unwrap_or(0).max(0) as u32;
+            let gb_opt = kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
+                bq.queue(slot);
+                bq.request_buffer(slot).cloned()
+            });
+            log::debug!("IGBP::QueueBuffer binder={} slot={}", binder_id, slot);
+
+            if let Some(gb) = gb_opt {
+                if let Some(nvmap) = kernel.nvdrv.nvmap_handles.get(&gb.nvmap_id) {
+                    let addr = nvmap.address.wrapping_add(gb.buffer_offset);
+                    let size = (gb.stride as usize) * (gb.height as usize) * 4;
+                    let mut pixels = vec![0u8; size];
+                    if kernel.address_space.read(addr, &mut pixels).is_ok() {
+                        kernel.nvdrv.submit_frame(crate::nvdrv::QueuedFrame {
+                            width: gb.width,
+                            height: gb.height,
+                            pixels,
+                        });
+                    }
+                }
+            }
+
+            let mut p = ParcelBuilder::new();
+            p.write_bq_buffer_output(1280, 720);
+            p.write_u32(0);
+            p.finish()
+        }
+        IGBP_CANCEL_BUFFER => {
+            let slot = reader.read_i32().unwrap_or(0).max(0) as u32;
+            kernel.nvdrv.with_bufferqueue(binder_id, |bq| bq.cancel(slot));
+            let mut p = ParcelBuilder::new();
+            p.write_u32(0);
+            p.finish()
+        }
+        IGBP_QUERY => {
+            let _what = reader.read_i32().unwrap_or(0);
+            let mut p = ParcelBuilder::new();
+            p.write_u32(0);
+            p.write_u32(0);
+            p.finish()
+        }
+        other => {
+            log::debug!("IGBP::Unknown code={} binder={}", other, binder_id);
+            let mut p = ParcelBuilder::new();
+            p.write_u32(0);
+            p.finish()
+        }
+    }
+}
+
+struct ParcelReader<'a> {
+    data: &'a [u8],
+    payload_off: usize,
+    cursor: usize,
+}
+
+impl<'a> ParcelReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        let payload_off = if data.len() >= 16 {
+            u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize
+        } else { 0 };
+        Self { data, payload_off, cursor: payload_off }
+    }
+
+    fn read_u32(&mut self) -> Option<u32> {
+        if self.cursor + 4 > self.data.len() { return None; }
+        let v = u32::from_le_bytes([
+            self.data[self.cursor], self.data[self.cursor + 1],
+            self.data[self.cursor + 2], self.data[self.cursor + 3],
+        ]);
+        self.cursor += 4;
+        Some(v)
+    }
+
+    fn read_i32(&mut self) -> Option<i32> {
+        self.read_u32().map(|v| v as i32)
+    }
+
+    fn read_u64(&mut self) -> Option<u64> {
+        let lo = self.read_u32()? as u64;
+        let hi = self.read_u32()? as u64;
+        Some(lo | (hi << 32))
+    }
+
+    fn skip_interface_token(&mut self) -> Option<()> {
+        let strict_policy = self.read_u32()?;
+        let len = self.read_i32()?;
+        if len <= 0 {
+            return Some(());
+        }
+        let _ = strict_policy;
+        let byte_len = (len as usize) * 2;
+        let padded = (byte_len + 3) & !3;
+        self.cursor += padded;
+        Some(())
+    }
+}
+
+struct ParcelBuilder {
+    payload: Vec<u8>,
+}
+
+impl ParcelBuilder {
+    fn new() -> Self {
+        Self { payload: Vec::new() }
+    }
+
+    fn write_u32(&mut self, v: u32) {
+        self.payload.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn write_bq_buffer_output(&mut self, w: u32, h: u32) {
+        self.write_u32(w);
+        self.write_u32(h);
+        self.write_u32(0);
+        self.write_u32(0);
+    }
+
+    fn write_flattened_zero_fence(&mut self) {
+        for _ in 0..9 {
+            self.write_u32(0);
+        }
+    }
+
+    fn write_flattened_graphic_buffer(&mut self, gb: &crate::nvdrv::GraphicBuffer) {
+        self.write_u32(gb.width);
+        self.write_u32(gb.height);
+        self.write_u32(gb.stride);
+        self.write_u32(gb.format);
+        self.write_u32(gb.usage);
+        self.write_u32(0);
+        self.write_u32(0);
+        self.write_u32(gb.nvmap_id);
+        self.write_u32(0);
+        self.write_u32(gb.size);
+        for _ in 0..32 {
+            self.write_u32(0);
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16 + self.payload.len());
+        out.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&((16 + self.payload.len()) as u32).to_le_bytes());
+        out.extend_from_slice(&self.payload);
+        out
+    }
+}
+
+fn parse_flattened_graphic_buffer(reader: &mut ParcelReader) -> Option<crate::nvdrv::GraphicBuffer> {
+    let width = reader.read_u32()?;
+    let height = reader.read_u32()?;
+    let stride = reader.read_u32()?;
+    let format = reader.read_u32()?;
+    let usage = reader.read_u32()?;
+    let _ = reader.read_u32()?;
+    let _ = reader.read_u32()?;
+    let nvmap_id = reader.read_u32()?;
+    let _ = reader.read_u32()?;
+    let size = reader.read_u32()?;
+    Some(crate::nvdrv::GraphicBuffer {
+        width,
+        height,
+        stride,
+        format,
+        usage,
+        nvmap_id,
+        buffer_offset: 0,
+        size,
+    })
 }
 
 fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name: &str) -> Vec<u8> {

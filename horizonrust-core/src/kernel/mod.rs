@@ -99,6 +99,13 @@ impl Kernel {
     }
 
     pub fn drain_frames(&mut self) -> Vec<FrameOut> {
+        for qf in self.nvdrv.drain_frames() {
+            self.pending_frames.push(FrameOut {
+                width: qf.width,
+                height: qf.height,
+                pixels: qf.pixels,
+            });
+        }
         std::mem::take(&mut self.pending_frames)
     }
 
