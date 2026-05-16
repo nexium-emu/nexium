@@ -214,39 +214,83 @@ impl Nvdrv {
 
         match cmd {
             0x4701 => {
-                log::debug!("nvhost-ctrl-gpu:ZCullGetCtxSize");
-                if out.len() >= 4 { out[0..4].copy_from_slice(&0u32.to_le_bytes()); }
+                if out.len() < 4 { out.resize(4, 0); }
+                out[0..4].copy_from_slice(&1u32.to_le_bytes());
+                log::debug!("nvhost-ctrl-gpu:ZCullGetCtxSize → 1");
             }
             0x4702 => {
+                if out.len() < 40 { out.resize(40, 0); }
+                let words: [u32; 10] = [
+                    0x20, 0x20, 0x400, 0x800, 0x20, 0x20, 0xc0, 0x20, 0x40, 0x10,
+                ];
+                for (i, w) in words.iter().enumerate() {
+                    out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                }
                 log::debug!("nvhost-ctrl-gpu:ZCullGetInfo");
             }
             0x4705 => {
-                log::debug!("nvhost-ctrl-gpu:GetCharacteristics");
-                if out.len() >= 0xA0 {
-                    out[0..8].copy_from_slice(&0xA0u64.to_le_bytes());
-                    out[8..16].copy_from_slice(&0xA0u64.to_le_bytes());
-                    out[16..20].copy_from_slice(&0x00000021u32.to_le_bytes());
-                    out[20..24].copy_from_slice(&0x00000000u32.to_le_bytes());
-                    out[24..28].copy_from_slice(&0x000000b3u32.to_le_bytes());
-                    out[28..32].copy_from_slice(&0x00000001u32.to_le_bytes());
-                    out[32..36].copy_from_slice(&0x00000003u32.to_le_bytes());
-                    out[36..40].copy_from_slice(&0x00010000u32.to_le_bytes());
-                    out[64..68].copy_from_slice(&2u32.to_le_bytes());
-                    out[68..72].copy_from_slice(&8u32.to_le_bytes());
-                    out[72..76].copy_from_slice(&512u32.to_le_bytes());
-                    out[76..80].copy_from_slice(&4u32.to_le_bytes());
-                    out[80..84].copy_from_slice(&1024u32.to_le_bytes());
-                    out[84..88].copy_from_slice(&0u32.to_le_bytes());
-                    out[88..92].copy_from_slice(&192u32.to_le_bytes());
-                    out[92..96].copy_from_slice(&192u32.to_le_bytes());
-                    out[96..100].copy_from_slice(&192u32.to_le_bytes());
-                    out[100..104].copy_from_slice(&65536u32.to_le_bytes());
-                    out[104..108].copy_from_slice(&0u32.to_le_bytes());
-                    out[108..112].copy_from_slice(&0u32.to_le_bytes());
+                if out.len() < 0xB0 { out.resize(0xB0, 0); }
+                out[0..8].copy_from_slice(&0xA0u64.to_le_bytes());
+                out[8..16].copy_from_slice(&0xdeadbeefu64.to_le_bytes());
+                let gc_off = 16usize;
+                let gc: &[(usize, u32)] = &[
+                    (0x00, 0x120),
+                    (0x04, 0x0b),
+                    (0x08, 0xa1),
+                    (0x0c, 0x01),
+                    (0x10, 0x40000),
+                    (0x14, 0x0),
+                    (0x18, 0),
+                    (0x1c, 0),
+                    (0x20, 0x02),
+                    (0x24, 0x20),
+                    (0x28, 0x20000),
+                    (0x2c, 0x20000),
+                    (0x30, 0x1b),
+                    (0x34, 0x30000),
+                    (0x38, 0x01),
+                    (0x3c, 0x503),
+                    (0x40, 0x503),
+                    (0x44, 0x80),
+                    (0x48, 0x28),
+                    (0x4c, 0x0),
+                    (0x50, 0x55),
+                    (0x54, 0x0),
+                    (0x58, 0x902d),
+                    (0x5c, 0xb197),
+                    (0x60, 0xb1c0),
+                    (0x64, 0xb06f),
+                    (0x68, 0xa140),
+                    (0x6c, 0xb0b5),
+                    (0x70, 0x01),
+                    (0x74, 0x0),
+                    (0x78, 0x02),
+                    (0x7c, 0x01),
+                    (0x80, 0x0),
+                    (0x84, 0x01),
+                    (0x88, 0x21d70),
+                    (0x8c, 0x0),
+                ];
+                for (off, val) in gc {
+                    let pos = gc_off + off;
+                    out[pos..pos + 4].copy_from_slice(&val.to_le_bytes());
                 }
+                let chipname: u64 = 0x6230326d67;
+                out[gc_off + 0x90..gc_off + 0x98].copy_from_slice(&chipname.to_le_bytes());
+                log::debug!("nvhost-ctrl-gpu:GetCharacteristics → GM20B");
             }
-            0x4706 => { log::debug!("nvhost-ctrl-gpu:GetTpcMasks"); }
-            0x4714 => { log::debug!("nvhost-ctrl-gpu:GetActiveSlotMask"); }
+            0x4706 => {
+                if out.len() < 24 { out.resize(24, 0); }
+                if req.in_data.len() >= 4 {
+                    let mask_buf_size = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    if mask_buf_size != 0 {
+                        out[16..20].copy_from_slice(&3u32.to_le_bytes());
+                    }
+                    out[0..4].copy_from_slice(&mask_buf_size.to_le_bytes());
+                }
+                log::debug!("nvhost-ctrl-gpu:GetTpcMasks → 3");
+            }
+            0x4714 => { log::debug!("nvhost-ctrl-gpu:GetL2State (legacy gfx)"); }
             0x4718 => {
                 log::debug!("nvhost-ctrl-gpu:GetGpuTime");
                 if out.len() >= 8 { out[0..8].copy_from_slice(&0u64.to_le_bytes()); }
@@ -286,8 +330,25 @@ impl Nvdrv {
                     out[16..24].copy_from_slice(&alloc.to_le_bytes());
                 }
             }
-            0x4106 => { log::debug!("nvhost-as-gpu:FreeSpace"); }
-            0x4114 => {
+            0x4105 => {
+                let small_offset: u64 = 0x4_0000;
+                let small_page: u32 = 0x1000;
+                let small_pages: u64 = ((1u64 << 34) - small_offset) / small_page as u64;
+                let big_offset: u64 = 1u64 << 34;
+                let big_page: u32 = 0x10000;
+                let big_pages: u64 = ((1u64 << 38) - big_offset) / big_page as u64;
+                if out.len() < 64 {
+                    out.resize(64, 0);
+                }
+                out[16..24].copy_from_slice(&small_offset.to_le_bytes());
+                out[24..28].copy_from_slice(&small_page.to_le_bytes());
+                out[32..40].copy_from_slice(&small_pages.to_le_bytes());
+                out[40..48].copy_from_slice(&big_offset.to_le_bytes());
+                out[48..52].copy_from_slice(&big_page.to_le_bytes());
+                out[56..64].copy_from_slice(&big_pages.to_le_bytes());
+                log::debug!("nvhost-as-gpu:GetVaRegions small={} big={}", small_pages, big_pages);
+            }
+            0x4106 => {
                 if req.in_data.len() >= 40 {
                     let flags = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
                     let _kind = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
@@ -297,41 +358,50 @@ impl Nvdrv {
                         req.in_data[16], req.in_data[17], req.in_data[18], req.in_data[19],
                         req.in_data[20], req.in_data[21], req.in_data[22], req.in_data[23],
                     ]);
-                    let mapping_size = u64::from_le_bytes([
+                    let mapping_size_in = u64::from_le_bytes([
                         req.in_data[24], req.in_data[25], req.in_data[26], req.in_data[27],
                         req.in_data[28], req.in_data[29], req.in_data[30], req.in_data[31],
                     ]);
-                    let offset_in: u64 = u64::from_le_bytes([
+                    let requested_offset: u64 = u64::from_le_bytes([
                         req.in_data[32], req.in_data[33], req.in_data[34], req.in_data[35],
                         req.in_data[36], req.in_data[37], req.in_data[38], req.in_data[39],
                     ]);
 
-                    let size = if mapping_size > 0 {
-                        mapping_size
+                    let mapping_size = if mapping_size_in == 0 {
+                        self.nvmap_handles.get(&nvmap_id)
+                            .map(|h| (h.size as u64).saturating_sub(buffer_offset))
+                            .unwrap_or(0x1000)
                     } else {
-                        self.nvmap_handles.get(&nvmap_id).map(|h| h.size as u64).unwrap_or(0x1000)
+                        mapping_size_in
                     };
-                    let mapped = if offset_in != 0 {
-                        offset_in
+                    let gpu_va = if (flags & 0x1) != 0 && requested_offset != 0 {
+                        requested_offset
                     } else {
-                        self.gpu.alloc_gpu_va(size)
+                        self.gpu.alloc_gpu_va(mapping_size.max(0x10000))
                     };
                     let cpu_addr = self.nvmap_handles.get(&nvmap_id)
                         .map(|h| h.address.wrapping_add(buffer_offset))
                         .unwrap_or(0);
                     log::debug!("nvhost-as-gpu:MapBufferEx flags={:#x} nvmap_id={} cpu_addr={:#x} size={:#x} → gpu_va={:#x}",
-                        flags, nvmap_id, cpu_addr, size, mapped);
+                        flags, nvmap_id, cpu_addr, mapping_size, gpu_va);
 
-                    self.gpu.mappings.lock().add(mapped, size, cpu_addr, nvmap_id);
+                    self.gpu.mappings.lock().add(gpu_va, mapping_size, cpu_addr, nvmap_id);
 
                     if out.len() >= 40 {
-                        out[32..40].copy_from_slice(&mapped.to_le_bytes());
+                        out[32..40].copy_from_slice(&gpu_va.to_le_bytes());
                     }
                 }
             }
-            0x4105 => { log::debug!("nvhost-as-gpu:UnmapBuffer"); }
-            0x4108 => { log::debug!("nvhost-as-gpu:GetVaRegions"); }
-            0x4109 => { log::debug!("nvhost-as-gpu:InitializeEx"); }
+            0x4108 => {
+                if req.in_data.len() >= 8 {
+                    let gpu_va = u64::from_le_bytes([
+                        req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],
+                        req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7],
+                    ]);
+                    log::debug!("nvhost-as-gpu:UnmapBuffer gpu_va={:#x}", gpu_va);
+                }
+            }
+            0x4109 => { log::debug!("nvhost-as-gpu:AllocAsEx (InitializeEx)"); }
             other => {
                 log::debug!("nvhost-as-gpu: unknown ioctl cmd={:#x}", other);
             }
