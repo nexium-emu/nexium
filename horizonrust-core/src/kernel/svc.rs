@@ -174,8 +174,9 @@ fn synthesize_memory_info(kernel: &Kernel, address: u64) -> SynthMemInfo {
     }
 }
 
-fn svc_exit_process(_kernel: &mut Kernel) -> u32 {
+fn svc_exit_process(kernel: &mut Kernel) -> u32 {
     log::info!("svcExitProcess - terminating process");
+    kernel.process_exited = true;
     SUCCESS
 }
 
