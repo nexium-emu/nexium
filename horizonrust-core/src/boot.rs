@@ -39,8 +39,8 @@ impl BootContext {
         let code_base: u64 = 0x8000_0000_0000;
         let heap_base: u64 = 0x9000_0000_0000;
         let stack_base: u64 = 0xA000_0000_0000;
-        let tls_base: u64 = 0xB000_0000_0000;
         let env_base: u64 = 0xB0_0000_0000;
+        let tls_base: u64 = 0xB0_0000_1000;
         let exit_stub_va: u64 = 0xB0_0000_2000;
 
         log::info!("Mapping memory regions");
