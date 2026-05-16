@@ -28,6 +28,17 @@ pub mod ldr;
 pub mod lr;
 pub mod ldn;
 pub mod friends;
+pub mod fsp;
+pub mod btm;
+pub mod mii;
+pub mod irs;
+pub mod hwopus;
+pub mod grc;
+pub mod gpio;
+pub mod pcielm;
+pub mod rtc;
+pub mod jit;
+pub mod omm;
 
 pub struct FrameOut {
     pub width: u32,
@@ -66,6 +77,17 @@ pub struct Services {
     pub lr: lr::LrService,
     pub ldn: ldn::LdnService,
     pub friends: friends::FriendsService,
+    pub fsp: fsp::FspService,
+    pub btm: btm::BluetoothService,
+    pub mii: mii::MiiService,
+    pub irs: irs::InfraredService,
+    pub hwopus: hwopus::HwOpusService,
+    pub grc: grc::GameRecordingService,
+    pub gpio: gpio::GpioService,
+    pub pcielm: pcielm::PcieLmService,
+    pub rtc: rtc::RtcService,
+    pub jit: jit::JitService,
+    pub omm: omm::OmmService,
 }
 
 impl Services {
@@ -101,6 +123,17 @@ impl Services {
             lr: lr::LrService::new(),
             ldn: ldn::LdnService::new(),
             friends: friends::FriendsService::new(),
+            fsp: fsp::FspService::new(),
+            btm: btm::BluetoothService::new(),
+            mii: mii::MiiService::new(),
+            irs: irs::InfraredService::new(),
+            hwopus: hwopus::HwOpusService::new(),
+            grc: grc::GameRecordingService::new(),
+            gpio: gpio::GpioService::new(),
+            pcielm: pcielm::PcieLmService::new(),
+            rtc: rtc::RtcService::new(),
+            jit: jit::JitService::new(),
+            omm: omm::OmmService::new(),
         }
     }
 
@@ -137,6 +170,17 @@ impl Services {
             "lr" => self.lr.dispatch(cmd_id),
             "ldn:u" | "ldn:s" => self.ldn.dispatch(cmd_id),
             "friend:u" | "friend:a" | "friend:s" => self.friends.dispatch(cmd_id),
+            "fsp-srv" | "fsp:pr" | "fsp:pc" => self.fsp.dispatch(cmd_id),
+            "btm" => self.btm.dispatch(cmd_id),
+            "mii:u" | "mii:e" => self.mii.dispatch(cmd_id),
+            "irs:u" | "irs:o" => self.irs.dispatch(cmd_id),
+            "hwopus" => self.hwopus.dispatch(cmd_id),
+            "grc:u" | "grc:d" => self.grc.dispatch(cmd_id),
+            "gpio" => self.gpio.dispatch(cmd_id),
+            "pcielm" => self.pcielm.dispatch(cmd_id),
+            "rtc" => self.rtc.dispatch(cmd_id),
+            "jit:u" => self.jit.dispatch(cmd_id),
+            "omm" => self.omm.dispatch(cmd_id),
             _ => {
                 log::warn!("unknown service: {}", port_name);
                 1
