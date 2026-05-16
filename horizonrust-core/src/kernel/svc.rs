@@ -83,8 +83,47 @@ fn svc_cancel_synchronization(_kernel: &mut Kernel) -> u32 {
 fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     log::debug!("svcSendSyncRequest");
 
+    if kernel.tls_buffer.len() < 24 {
+        log::warn!("TLS buffer too small");
+        return 1;
+    }
+
+    if kernel.tls_buffer[..4] != *b"SFCI" {
+        log::warn!("bad SFCI magic");
+        return 1;
+    }
+
+    let cmd_id = u32::from_le_bytes([
+        kernel.tls_buffer[8],
+        kernel.tls_buffer[9],
+        kernel.tls_buffer[10],
+        kernel.tls_buffer[11],
+    ]);
+    let token = u32::from_le_bytes([
+        kernel.tls_buffer[12],
+        kernel.tls_buffer[13],
+        kernel.tls_buffer[14],
+        kernel.tls_buffer[15],
+    ]);
+
     let port_name = "sm:".to_string();
-    let result = kernel.services.dispatch_service(&port_name, 0);
+    let result = kernel.services.dispatch_service(&port_name, cmd_id);
+
+    let response_header = [
+        0x46, 0x43, 0x4F, 0x53, 0x01, 0x00, 0x00, 0x00,
+        (result & 0xFF) as u8,
+        ((result >> 8) & 0xFF) as u8,
+        ((result >> 16) & 0xFF) as u8,
+        ((result >> 24) & 0xFF) as u8,
+        token as u8,
+        (token >> 8) as u8,
+        (token >> 16) as u8,
+        (token >> 24) as u8,
+    ];
+
+    if kernel.tls_buffer.len() >= 16 {
+        kernel.tls_buffer[..16].copy_from_slice(&response_header);
+    }
 
     if result != SUCCESS {
         log::warn!("service dispatch returned error: {:#x}", result);
