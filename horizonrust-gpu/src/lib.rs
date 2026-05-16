@@ -1,5 +1,14 @@
+pub mod rt_cache;
+pub mod pipeline;
+pub mod descriptor;
+pub mod shader;
+
 use ash::vk;
 use std::ffi::CStr;
+use rt_cache::RtCache;
+use pipeline::PipelineCache;
+use descriptor::{DescriptorSetLayout, DescriptorPool};
+use shader::ShaderCompiler;
 
 pub struct VulkanContext {
     pub entry: ash::Entry,
@@ -8,6 +17,12 @@ pub struct VulkanContext {
     pub device: ash::Device,
     pub graphics_queue: vk::Queue,
     pub graphics_queue_family: u32,
+
+    pub rt_cache: RtCache,
+    pub pipeline_cache: PipelineCache,
+    pub descriptor_layout: DescriptorSetLayout,
+    pub descriptor_pool: DescriptorPool,
+    pub shader_compiler: ShaderCompiler,
 }
 
 impl VulkanContext {
@@ -103,6 +118,12 @@ impl VulkanContext {
 
         let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family as u32, 0) };
 
+        let rt_cache = RtCache::new();
+        let pipeline_cache = PipelineCache::new(&device)?;
+        let descriptor_layout = DescriptorSetLayout::new(&device)?;
+        let descriptor_pool = DescriptorPool::new(&device, 256)?;
+        let shader_compiler = ShaderCompiler::new();
+
         log::info!("Vulkan context initialized successfully");
 
         Ok(Self {
@@ -112,16 +133,38 @@ impl VulkanContext {
             device,
             graphics_queue,
             graphics_queue_family: graphics_queue_family as u32,
+            rt_cache,
+            pipeline_cache,
+            descriptor_layout,
+            descriptor_pool,
+            shader_compiler,
         })
+    }
+
+    pub fn wait_idle(&self) -> Result<(), String> {
+        unsafe {
+            self.device.device_wait_idle()
+                .map_err(|_| "device_wait_idle failed".to_string())?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for VulkanContext {
     fn drop(&mut self) {
+        log::debug!("Destroying Vulkan context");
+
+        self.rt_cache.clear(&self.device);
+        self.pipeline_cache.clear(&self.device);
+        self.shader_compiler.clear(&self.device);
+
         unsafe {
+            self.device.destroy_descriptor_pool(self.descriptor_pool.pool, None);
+            self.device.destroy_descriptor_set_layout(self.descriptor_layout.layout, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
+
         log::debug!("Vulkan context destroyed");
     }
 }
