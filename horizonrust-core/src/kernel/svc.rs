@@ -183,7 +183,9 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
             }
         }
 
-        return SUCCESS;
+        log::warn!("svcWaitSynchronization: no handles signaled, returning TIMEOUT_ERROR");
+        const TIMEOUT_ERROR: u32 = 1 | (117 << 9);
+        return TIMEOUT_ERROR;
     }
 
     SUCCESS

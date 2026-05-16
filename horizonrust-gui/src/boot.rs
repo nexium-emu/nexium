@@ -45,6 +45,8 @@ impl EmulationHandle {
             let mut cycle_count = 0u64;
             let mut svc_count = 0u32;
             let mut pc_check_count = 0u32;
+            let mut stuck_pc: Option<u64> = None;
+            let mut stuck_count = 0u32;
 
             loop {
                 if stop_flag_clone.load(Ordering::Relaxed) {
@@ -61,6 +63,21 @@ impl EmulationHandle {
                     if pc_check_count < 5 {
                         log::info!("CPU exec: PC {:#x} → {:#x} (event: {:?})", pc_before, pc_after, event);
                         pc_check_count += 1;
+                    }
+
+                    if pc_before == pc_after && matches!(event, horizonrust_core::cpu::CpuEvent::Running) {
+                        if stuck_pc == Some(pc_before) {
+                            stuck_count += 1;
+                            if stuck_count == 100 {
+                                log::error!("STUCK: CPU looping at PC {:#x} for 10M+ cycles, no SVCs", pc_before);
+                            }
+                        } else {
+                            stuck_pc = Some(pc_before);
+                            stuck_count = 1;
+                        }
+                    } else {
+                        stuck_pc = None;
+                        stuck_count = 0;
                     }
 
                     match event {
