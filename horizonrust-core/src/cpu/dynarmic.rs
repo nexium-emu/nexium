@@ -103,19 +103,13 @@ impl DynarmicCpu {
 
     pub fn run(&mut self, _max_insn: u64) -> CpuEvent {
         *self.last_event.lock().unwrap() = None;
-        let pc_before = self.get_pc();
-        let result = self.emu.emu.emu_start(pc_before, u64::MAX - 16);
-        let pc_after = self.get_pc();
-
-        if pc_after == pc_before && pc_before == 0x8000000004 {
-            // Debug stuck PC
-            log::debug!("dynarmic: PC stuck at {:#x}, emu_start returned {:?}", pc_before, result);
-        }
-
+        let pc = self.get_pc();
+        log::trace!("dynarmic run: PC={:#x}", pc);
+        let _ = self.emu.emu.emu_start(pc, u64::MAX - 16);
         let event = self.last_event.lock().unwrap().take();
         match event {
             Some(CpuEvent::Svc(imm)) => {
-                log::debug!("dynarmic SVC {:#04x} hit at PC={:#x}", imm, pc_before);
+                log::debug!("dynarmic SVC {:#04x} hit at PC={:#x}", imm, pc);
                 CpuEvent::Svc(imm)
             }
             Some(other) => {
