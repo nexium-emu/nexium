@@ -641,6 +641,62 @@ fn applet_command_response(kernel: &mut Kernel, port_name: &str, cmd_id: u32) ->
         ("IApplicationFunctions", 40) => Some((0u32.to_le_bytes().to_vec(), None)),
         ("IApplicationFunctions", 50) => Some((Vec::new(), None)),
         ("IDebugFunctions", _) => Some((Vec::new(), None)),
+
+        ("IApplicationDisplayService", 1010) => Some((1u64.to_le_bytes().to_vec(), None)),
+        ("IApplicationDisplayService", 1011) => Some((1u64.to_le_bytes().to_vec(), None)),
+        ("IApplicationDisplayService", 1020) => Some((Vec::new(), None)),
+        ("IApplicationDisplayService", 2020) => {
+            let mut data = Vec::new();
+            data.extend_from_slice(&0x100u64.to_le_bytes());
+            (data, None).into()
+        }
+        ("IApplicationDisplayService", 2021) => Some((Vec::new(), None)),
+        ("IApplicationDisplayService", 2030) => Some((Vec::new(), None)),
+        ("IApplicationDisplayService", 2031) => Some((Vec::new(), None)),
+        ("IApplicationDisplayService", 2101) => Some((Vec::new(), None)),
+        ("IApplicationDisplayService", 2102) => Some((Vec::new(), None)),
+        ("IApplicationDisplayService", 3000) => Some((60u64.to_le_bytes().to_vec(), None)),
+
+        ("ISystemDisplayService", 2205) => Some((Vec::new(), None)),
+        ("ISystemDisplayService", 2207) => Some((Vec::new(), None)),
+        ("ISystemDisplayService", 2312) => Some((Vec::new(), None)),
+        ("ISystemDisplayService", 2400) => Some((Vec::new(), None)),
+        ("ISystemDisplayService", 2402) => Some((Vec::new(), None)),
+        ("ISystemDisplayService", 3216) => Some((0u32.to_le_bytes().to_vec(), None)),
+
+        ("IManagerDisplayService", 2010) => Some((1u64.to_le_bytes().to_vec(), None)),
+        ("IManagerDisplayService", 2011) => Some((Vec::new(), None)),
+        ("IManagerDisplayService", 2012) => Some((Vec::new(), None)),
+        ("IManagerDisplayService", 6000) => Some((Vec::new(), None)),
+
+        ("IHOSBinderDriver", 0) => Some((0u32.to_le_bytes().to_vec(), None)),
+        ("IHOSBinderDriver", 1) => Some((0u32.to_le_bytes().to_vec(), None)),
+        ("IHOSBinderDriver", 2) => Some((Vec::new(), None)),
+        ("IHOSBinderDriver", 3) => {
+            let handle = kernel.handles.create_handle(HandleType::Event);
+            Some((Vec::new(), Some(handle)))
+        }
+
+        ("ISystemClock", 0) => {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let switch_epoch = secs.saturating_sub(946_684_800);
+            Some((switch_epoch.to_le_bytes().to_vec(), None))
+        }
+        ("ISystemClock", 2) => Some(([0u8; 0x20].to_vec(), None)),
+        ("ISteadyClock", 0) => Some(([0u8; 0x18].to_vec(), None)),
+        ("ITimeZoneService", 0) => Some(([0u8; 0x24].to_vec(), None)),
+        ("ITimeZoneService", 101) => Some(([0u8; 0x4].to_vec(), None)),
+
+        ("IFileSystem", _) => Some((Vec::new(), None)),
+        ("fsp-srv", _) => Some((Vec::new(), None)),
+
+        ("psm", _) => Some((Vec::new(), None)),
+        ("set", _) | ("set:sys", _) => Some((Vec::new(), None)),
+        ("nvdrv:a", _) | ("nvdrv", _) | ("nvdrv:s", _) | ("nvdrv:t", _) => Some((0u32.to_le_bytes().to_vec(), None)),
+
         _ => None,
     }
 }

@@ -175,7 +175,8 @@ impl Services {
         let result = match port_name {
             "sm:" => self.sm.dispatch(cmd_id),
             "hid" => self.hid.dispatch(cmd_id),
-            "time:s" | "time:a" | "time:r" => self.time.dispatch(cmd_id),
+            "time:s" | "time:a" | "time:r" | "time:u" => self.time.dispatch(cmd_id),
+            "ISystemClock" | "ISteadyClock" | "ITimeZoneService" => self.time.dispatch(cmd_id),
             "set" | "set:sys" => self.set.dispatch(cmd_id),
             "am" | "appletOE" | "appletAE" => self.am.dispatch(cmd_id),
             "vi:m" | "vi:s" | "vi:u" => self.vi.dispatch(cmd_id),
@@ -215,8 +216,8 @@ impl Services {
             "jit:u" => self.jit.dispatch(cmd_id),
             "omm" => self.omm.dispatch(cmd_id),
             _ => {
-                log::warn!("unknown service: {}", port_name);
-                1
+                log::debug!("unknown service: {} cmd={} (returning success)", port_name, cmd_id);
+                0
             }
         };
         (result, Vec::new())
