@@ -16,7 +16,7 @@ fn main() -> Result<(), eframe::Error> {
             panic!("Logger initialization failed");
         });
 
-    if let Err(e) = logger.init(LevelFilter::Info) {
+    if let Err(e) = logger.init(LevelFilter::Debug) {
         eprintln!("Failed to set logger: {}", e);
     }
 

@@ -82,6 +82,17 @@ impl BootContext {
 
         address_space.write(text_va, &nro.text.data)
             .map_err(|e| format!("Failed to write text segment: {:?}", e))?;
+
+        // Verify first instruction was written correctly
+        let mut verify_buf = [0u8; 8];
+        address_space.read(text_va, &mut verify_buf)
+            .map_err(|e| format!("Failed to read text for verification: {:?}", e))?;
+        let first_insn = u32::from_le_bytes([verify_buf[0], verify_buf[1], verify_buf[2], verify_buf[3]]);
+        log::debug!("Text segment first 8 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                   verify_buf[0], verify_buf[1], verify_buf[2], verify_buf[3],
+                   verify_buf[4], verify_buf[5], verify_buf[6], verify_buf[7]);
+        log::debug!("First instruction: {:#x} (expected B instruction ~0x14000020)", first_insn);
+
         address_space.write(ro_va, &nro.ro.data)
             .map_err(|e| format!("Failed to write ro segment: {:?}", e))?;
         address_space.write(data_va, &nro.data.data)
