@@ -321,13 +321,31 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
 
     let cmd_id = ctx.cmif_in.cmd_id;
 
-    log::info!("IPC request service=\"{}\" cmd={} in_data={} is_domain={}", port_name, cmd_id, ctx.cmif_in_data_len, is_domain);
+    let dispatch_target = if let Some(d) = ctx.domain {
+        if d.kind == 2 {
+            if let Some(s) = kernel.sessions.get_mut(&session_handle) {
+                s.close_object(d.object_id);
+            }
+            log::debug!("domain Close-object session={:#x} object_id={}", session_handle, d.object_id);
+            if let Some(cpu) = &mut kernel.cpu {
+                cpu.set_register(0, SUCCESS as u64);
+            }
+            return SUCCESS;
+        }
+        kernel.sessions.get(&session_handle)
+            .and_then(|s| s.service_for_object(d.object_id).map(String::from))
+            .unwrap_or_else(|| port_name.clone())
+    } else {
+        port_name.clone()
+    };
 
-    let response = if port_name == "sm:" {
+    log::info!("IPC request service=\"{}\" cmd={} in_data={} is_domain={}", dispatch_target, cmd_id, ctx.cmif_in_data_len, is_domain);
+
+    let response = if dispatch_target == "sm:" {
         dispatch_sm_command_v2(kernel, &mut ctx)
     } else {
         let mut pending_frames = std::mem::take(&mut kernel.pending_frames);
-        let response = dispatch_service_v2(kernel, &port_name, &mut ctx, &mut pending_frames);
+        let response = dispatch_service_v2(kernel, &dispatch_target, &mut ctx, session_handle, &mut pending_frames);
         kernel.pending_frames = pending_frames;
         response
     };
@@ -361,7 +379,7 @@ fn handle_control_request(kernel: &mut Kernel, session_handle: u32, port_name: &
         0 => {
             log::debug!("Control: ConvertCurrentObjectToDomain service={}", port_name);
             if let Some(session) = kernel.sessions.get_mut(&session_handle) {
-                session.is_domain = true;
+                session.convert_to_domain();
             }
             build_ipc_response(&ctx, 0, &1u32.to_le_bytes(), &[])
         }
@@ -388,6 +406,10 @@ fn handle_control_request(kernel: &mut Kernel, session_handle: u32, port_name: &
 }
 
 fn build_ipc_response(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move_handles: &[u32]) -> Vec<u8> {
+    build_ipc_response_full(ctx, result, out_data, move_handles, &[])
+}
+
+fn build_ipc_response_full(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move_handles: &[u32], out_objects: &[u32]) -> Vec<u8> {
     let is_domain = ctx.domain.is_some();
 
     let mut raw_size = 0usize;
@@ -396,6 +418,9 @@ fn build_ipc_response(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move_hand
     }
     raw_size += 16;
     raw_size += out_data.len();
+    if is_domain {
+        raw_size += out_objects.len() * 4;
+    }
     let raw_padded = (raw_size + 3) & !3;
 
     let mut special_bytes: Vec<u8> = Vec::new();
@@ -426,6 +451,7 @@ fn build_ipc_response(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move_hand
 
     let mut p = raw_data_off;
     if is_domain {
+        out[p..p + 4].copy_from_slice(&(out_objects.len() as u32).to_le_bytes());
         p += 16;
     }
 
@@ -437,6 +463,16 @@ fn build_ipc_response(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move_hand
 
     if !out_data.is_empty() && p + out_data.len() <= out.len() {
         out[p..p + out_data.len()].copy_from_slice(out_data);
+        p += out_data.len();
+    }
+
+    if is_domain {
+        for obj in out_objects {
+            if p + 4 <= out.len() {
+                out[p..p + 4].copy_from_slice(&obj.to_le_bytes());
+                p += 4;
+            }
+        }
     }
 
     out
@@ -487,8 +523,25 @@ fn dispatch_sm_command_v2(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx) -> Vec<u8>
     }
 }
 
-fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcCtx, pending_frames: &mut Vec<crate::services::FrameOut>) -> Vec<u8> {
+fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcCtx, session_handle: u32, pending_frames: &mut Vec<crate::services::FrameOut>) -> Vec<u8> {
     let cmd_id = ctx.cmif_in.cmd_id;
+
+    if let Some(proxy_service) = applet_proxy_service(port_name, cmd_id) {
+        log::info!("{} cmd={} → returning {} proxy", port_name, cmd_id, proxy_service);
+        let object_id = if let Some(s) = kernel.sessions.get_mut(&session_handle) {
+            s.alloc_domain_object(proxy_service.to_string())
+        } else {
+            0
+        };
+        return build_ipc_response_full(ctx, 0, &[], &[], &[object_id]);
+    }
+
+    if let Some((data, handle_opt)) = applet_command_response(kernel, port_name, cmd_id) {
+        log::info!("{}.cmd_{} → returning data ({} bytes, handle={:?})", port_name, cmd_id, data.len(), handle_opt);
+        let handles: Vec<u32> = handle_opt.into_iter().collect();
+        return build_ipc_response(ctx, 0, &data, &handles);
+    }
+
     let tls_snapshot = ctx.buf.clone();
     let mut svc_ctx = crate::services::IpcCtx {
         tls_buf: &tls_snapshot,
@@ -496,6 +549,81 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     };
     let (result, out_data) = kernel.services.dispatch_service(port_name, cmd_id, &mut svc_ctx);
     build_ipc_response(ctx, result, &out_data, &[])
+}
+
+fn applet_command_response(kernel: &mut Kernel, port_name: &str, cmd_id: u32) -> Option<(Vec<u8>, Option<u32>)> {
+    match (port_name, cmd_id) {
+        ("IWindowController", 1) => Some((1u64.to_le_bytes().to_vec(), None)),
+        ("IWindowController", 10) => Some((Vec::new(), None)),
+        ("ISelfController", 0) => Some((Vec::new(), None)),
+        ("ISelfController", 1) => Some((Vec::new(), None)),
+        ("ISelfController", 10) => Some((Vec::new(), None)),
+        ("ISelfController", 11) => Some((Vec::new(), None)),
+        ("ISelfController", 12) => Some((Vec::new(), None)),
+        ("ISelfController", 16) => Some((Vec::new(), None)),
+        ("ISelfController", 40) => {
+            let handle = kernel.handles.create_handle(HandleType::Event);
+            Some((Vec::new(), Some(handle)))
+        }
+        ("ISelfController", 50) => Some((1u8.to_le_bytes().to_vec(), None)),
+        ("ISelfController", 91) => {
+            let handle = kernel.handles.create_handle(HandleType::Event);
+            Some((Vec::new(), Some(handle)))
+        }
+        ("ICommonStateGetter", 0) => {
+            let handle = kernel.handles.create_handle(HandleType::Event);
+            Some((Vec::new(), Some(handle)))
+        }
+        ("ICommonStateGetter", 1) => Some((0u8.to_le_bytes().to_vec(), None)),
+        ("ICommonStateGetter", 5) => Some((1u32.to_le_bytes().to_vec(), None)),
+        ("ICommonStateGetter", 6) => Some((0u32.to_le_bytes().to_vec(), None)),
+        ("ICommonStateGetter", 9) => {
+            let handle = kernel.handles.create_handle(HandleType::Event);
+            Some((Vec::new(), Some(handle)))
+        }
+        ("ICommonStateGetter", 60) => Some({
+            let mut data = Vec::new();
+            data.extend_from_slice(&1280u32.to_le_bytes());
+            data.extend_from_slice(&720u32.to_le_bytes());
+            (data, None)
+        }),
+        ("IApplicationFunctions", 1) => Some((0u8.to_le_bytes().to_vec(), None)),
+        ("IApplicationFunctions", 20) => Some((Vec::new(), None)),
+        ("IApplicationFunctions", 21) => Some((Vec::new(), None)),
+        ("IApplicationFunctions", 22) => Some((Vec::new(), None)),
+        ("IApplicationFunctions", 23) => Some((0u8.to_le_bytes().to_vec(), None)),
+        ("IApplicationFunctions", 30) => Some((Vec::new(), None)),
+        ("IApplicationFunctions", 40) => Some((0u32.to_le_bytes().to_vec(), None)),
+        ("IApplicationFunctions", 50) => Some((Vec::new(), None)),
+        ("IDebugFunctions", _) => Some((Vec::new(), None)),
+        _ => None,
+    }
+}
+
+fn applet_proxy_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
+    match (port_name, cmd_id) {
+        ("appletAE" | "appletOE", 100) => Some("ISystemAppletProxy"),
+        ("appletAE" | "appletOE", 200) => Some("ILibraryAppletProxy"),
+        ("appletAE" | "appletOE", 300) => Some("IOverlayAppletProxy"),
+        ("appletAE" | "appletOE", 350) => Some("IApplicationProxy"),
+        ("ISystemAppletProxy" | "ILibraryAppletProxy" | "IOverlayAppletProxy" | "IApplicationProxy", 0) => Some("ICommonStateGetter"),
+        ("ISystemAppletProxy" | "ILibraryAppletProxy" | "IOverlayAppletProxy" | "IApplicationProxy", 1) => Some("ISelfController"),
+        ("ISystemAppletProxy" | "ILibraryAppletProxy" | "IOverlayAppletProxy" | "IApplicationProxy", 2) => Some("IWindowController"),
+        ("ISystemAppletProxy" | "ILibraryAppletProxy" | "IOverlayAppletProxy" | "IApplicationProxy", 3) => Some("IAudioController"),
+        ("ISystemAppletProxy" | "ILibraryAppletProxy" | "IOverlayAppletProxy" | "IApplicationProxy", 4) => Some("IDisplayController"),
+        ("ISystemAppletProxy" | "ILibraryAppletProxy" | "IOverlayAppletProxy" | "IApplicationProxy", 10) => Some("IProcessWindingController"),
+        ("ISystemAppletProxy" | "ILibraryAppletProxy" | "IOverlayAppletProxy" | "IApplicationProxy", 11) => Some("ILibraryAppletCreator"),
+        ("ISystemAppletProxy", 20) => Some("IApplicationFunctions"),
+        ("ISystemAppletProxy", 21) => Some("IHomeMenuFunctions"),
+        ("ISystemAppletProxy", 22) => Some("IGlobalStateController"),
+        ("ISystemAppletProxy", 23) => Some("IApplicationCreator"),
+        ("IApplicationProxy", 20) => Some("IApplicationFunctions"),
+        ("IApplicationProxy", 1000) => Some("IDebugFunctions"),
+        ("ISystemAppletProxy", 1000) => Some("IDebugFunctions"),
+        ("ILibraryAppletProxy", 1000) => Some("IDebugFunctions"),
+        ("IOverlayAppletProxy", 1000) => Some("IDebugFunctions"),
+        _ => None,
+    }
 }
 
 fn dispatch_sm_command(kernel: &mut Kernel, cmd_id: u32, tls_buf: &[u8], cmif_data_off: usize, cmif_data_len: usize, parsed_ctx: Option<ipc::IpcCtx>) -> (u32, Vec<u8>) {
