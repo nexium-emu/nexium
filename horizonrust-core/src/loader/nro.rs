@@ -113,37 +113,45 @@ impl Nro {
         let header = NroHeader::from_bytes(&nro_data)?;
 
         log::debug!("NRO: magic={:#x}, version={}, size={}", header.magic, header.version, header.size);
-        log::debug!("NRO: text=[{:#x}, {:#x}), ro=[{:#x}, {:#x}), data=[{:#x}, {:#x})",
-                   header.text_offset, header.text_offset + header.text_size,
-                   header.ro_offset, header.ro_offset + header.ro_size,
-                   header.data_offset, header.data_offset + header.data_size);
 
-        if header.text_offset + header.text_size > nro_data.len() as u32 {
+        // NRO header is 128 bytes (0x80). Segment offsets may be relative to after the header.
+        // If offsets are < 0x80, assume they're relative and add 0x80.
+        const HEADER_SIZE: u32 = 128;
+        let text_offset = if header.text_offset < HEADER_SIZE { header.text_offset + HEADER_SIZE } else { header.text_offset };
+        let ro_offset = if header.ro_offset < HEADER_SIZE { header.ro_offset + HEADER_SIZE } else { header.ro_offset };
+        let data_offset = if header.data_offset < HEADER_SIZE { header.data_offset + HEADER_SIZE } else { header.data_offset };
+
+        log::debug!("NRO: text=[{:#x}, {:#x}), ro=[{:#x}, {:#x}), data=[{:#x}, {:#x})",
+                   text_offset, text_offset + header.text_size,
+                   ro_offset, ro_offset + header.ro_size,
+                   data_offset, data_offset + header.data_size);
+
+        if text_offset + header.text_size > nro_data.len() as u32 {
             return Err("Text segment out of bounds".to_string());
         }
-        if header.ro_offset + header.ro_size > nro_data.len() as u32 {
+        if ro_offset + header.ro_size > nro_data.len() as u32 {
             return Err("RO segment out of bounds".to_string());
         }
-        if header.data_offset + header.data_size > nro_data.len() as u32 {
+        if data_offset + header.data_size > nro_data.len() as u32 {
             return Err("Data segment out of bounds".to_string());
         }
 
         let text = NroSegment {
-            offset: header.text_offset,
+            offset: text_offset,
             size: header.text_size,
-            data: nro_data[header.text_offset as usize..(header.text_offset + header.text_size) as usize].to_vec(),
+            data: nro_data[text_offset as usize..(text_offset + header.text_size) as usize].to_vec(),
         };
 
         let ro = NroSegment {
-            offset: header.ro_offset,
+            offset: ro_offset,
             size: header.ro_size,
-            data: nro_data[header.ro_offset as usize..(header.ro_offset + header.ro_size) as usize].to_vec(),
+            data: nro_data[ro_offset as usize..(ro_offset + header.ro_size) as usize].to_vec(),
         };
 
         let data_seg = NroSegment {
-            offset: header.data_offset,
+            offset: data_offset,
             size: header.data_size,
-            data: nro_data[header.data_offset as usize..(header.data_offset + header.data_size) as usize].to_vec(),
+            data: nro_data[data_offset as usize..(data_offset + header.data_size) as usize].to_vec(),
         };
 
         Ok(Nro {

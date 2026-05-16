@@ -8,32 +8,31 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
     log::trace!("SVC {:#04x}", imm);
     match imm {
         0x01 => svc_set_heap_size(kernel),
+        0x02 => svc_set_memory_permission(kernel),
+        0x03 => svc_set_memory_attribute(kernel),
+        0x04 => svc_map_memory(kernel),
+        0x05 => svc_unmap_memory(kernel),
         0x06 => svc_query_memory(kernel),
         0x07 => svc_exit_process(kernel),
-        0x0d => svc_map_shared_memory(kernel),
-        0x0e => svc_unmap_shared_memory(kernel),
-        0x10 => svc_signal_event(kernel),
-        0x12 => svc_wait_synchronization(kernel),
-        0x13 => svc_cancel_synchronization(kernel),
-        0x15 => svc_send_sync_request(kernel),
-        0x16 => svc_send_sync_request_with_user_buffer(kernel),
-        0x19 => svc_get_thread_id(kernel),
-        0x1a => svc_break(kernel),
-        0x1b => svc_output_debug_string(kernel),
+        0x08 => svc_create_thread(kernel),
+        0x09 => svc_start_thread(kernel),
+        0x0a => svc_exit_thread(kernel),
+        0x0b => svc_sleep_thread(kernel),
+        0x13 => svc_map_shared_memory(kernel),
+        0x14 => svc_unmap_shared_memory(kernel),
+        0x15 => svc_create_transfer_memory(kernel),
+        0x16 => svc_close_handle(kernel),
+        0x18 => svc_wait_synchronization(kernel),
+        0x19 => svc_cancel_synchronization(kernel),
         0x1f => svc_connect_to_named_port(kernel),
-        0x21 => svc_get_info(kernel),
-        0x25 => svc_map_physical_memory(kernel),
-        0x26 => svc_unmap_physical_memory(kernel),
-        0x29 => svc_create_session(kernel),
-        0x2b => svc_reply_and_receive(kernel),
-        0x2d => svc_create_event(kernel),
-        0x31 => svc_create_shared_memory(kernel),
+        0x21 => svc_send_sync_request(kernel),
+        0x26 => svc_break(kernel),
+        0x27 => svc_output_debug_string(kernel),
+        0x29 => svc_get_info(kernel),
+        0x2c => svc_map_physical_memory(kernel),
+        0x2d => svc_unmap_physical_memory(kernel),
+        0x45 => svc_create_event(kernel),
         0x41 => svc_map_transfer_memory(kernel),
-        0x46 => svc_create_thread(kernel),
-        0x47 => svc_start_thread(kernel),
-        0x48 => svc_exit_thread(kernel),
-        0x4a => svc_sleep_thread(kernel),
-        0x50 => svc_flush_data_cache(kernel),
         _ => {
             log::warn!("unknown SVC: {:#04x}", imm);
             KERNEL_NOT_IMPLEMENTED
@@ -47,6 +46,26 @@ fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(1, kernel.heap_base);
     }
+    SUCCESS
+}
+
+fn svc_set_memory_permission(kernel: &mut Kernel) -> u32 {
+    log::debug!("svcSetMemoryPermission (no-op)");
+    SUCCESS
+}
+
+fn svc_set_memory_attribute(kernel: &mut Kernel) -> u32 {
+    log::debug!("svcSetMemoryAttribute (no-op)");
+    SUCCESS
+}
+
+fn svc_map_memory(kernel: &mut Kernel) -> u32 {
+    log::debug!("svcMapMemory (no-op)");
+    SUCCESS
+}
+
+fn svc_unmap_memory(kernel: &mut Kernel) -> u32 {
+    log::debug!("svcUnmapMemory (no-op)");
     SUCCESS
 }
 
@@ -453,6 +472,16 @@ fn svc_create_shared_memory(kernel: &mut Kernel) -> u32 {
 
 fn svc_map_transfer_memory(_kernel: &mut Kernel) -> u32 {
     log::debug!("svcMapTransferMemory");
+    SUCCESS
+}
+
+fn svc_create_transfer_memory(_kernel: &mut Kernel) -> u32 {
+    log::debug!("svcCreateTransferMemory");
+    SUCCESS
+}
+
+fn svc_close_handle(_kernel: &mut Kernel) -> u32 {
+    log::debug!("svcCloseHandle");
     SUCCESS
 }
 
