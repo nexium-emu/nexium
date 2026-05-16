@@ -42,11 +42,26 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
 
 fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
     log::debug!("svcSetHeapSize (X0=heap_size, X1=heap_addr_ptr)");
+
+    if let Some(cpu) = &kernel.cpu {
+        let heap_size = cpu.get_register(0);
+        log::debug!("  heap_size: {:#x}", heap_size);
+    }
+
     SUCCESS
 }
 
 fn svc_query_memory(kernel: &mut Kernel) -> u32 {
     log::debug!("svcQueryMemory (X1=address)");
+
+    let address = if let Some(cpu) = &kernel.cpu {
+        cpu.get_register(1)
+    } else {
+        0
+    };
+
+    log::debug!("  query address: {:#x}", address);
+
     let memory_type: u32 = 0;
     let memory_attr: u32 = 0;
     let permission: u32 = 0x3;
@@ -160,11 +175,35 @@ fn svc_output_debug_string(_kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcConnectToNamedPort");
+    log::debug!("svcConnectToNamedPort (X1=port_name_ptr)");
+
+    let port_name_ptr = if let Some(cpu) = &kernel.cpu {
+        cpu.get_register(1)
+    } else {
+        0
+    };
+
+    let port_name = if port_name_ptr > 0 {
+        let mut buf = [0u8; 12];
+        match kernel.address_space.read(port_name_ptr, &mut buf) {
+            Ok(()) => {
+                let name_str = std::str::from_utf8(&buf)
+                    .unwrap_or("invalid")
+                    .trim_end_matches('\0')
+                    .to_string();
+                log::debug!("  port_name: '{}'", name_str);
+                name_str
+            }
+            Err(_) => {
+                log::warn!("failed to read port name from {:#x}", port_name_ptr);
+                "sm:".to_string()
+            }
+        }
+    } else {
+        "sm:".to_string()
+    };
 
     let handle = kernel.handles.create_handle(HandleType::Session);
-
-    let port_name = "sm:".to_string();
     let session = Session::new(handle, port_name.clone());
     kernel.sessions.insert(handle, session);
 
@@ -216,7 +255,19 @@ fn svc_map_transfer_memory(_kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_create_thread(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcCreateThread");
+    log::debug!("svcCreateThread (X1=entry, X2=arg, X3=sp, X4=priority, X5=core)");
+
+    if let Some(cpu) = &kernel.cpu {
+        let entry = cpu.get_register(1);
+        let arg = cpu.get_register(2);
+        let sp = cpu.get_register(3);
+        let priority = cpu.get_register(4);
+        let core = cpu.get_register(5);
+
+        log::debug!("  entry: {:#x}, arg: {:#x}, sp: {:#x}, priority: {}, core: {}",
+                   entry, arg, sp, priority, core);
+    }
+
     kernel.threads.create_thread(1);
     SUCCESS
 }
