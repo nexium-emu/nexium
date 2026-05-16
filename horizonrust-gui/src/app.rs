@@ -28,10 +28,14 @@ pub struct HorizonApp {
     last_input: InputSnapshot,
     debugger: DebuggerState,
     performance: PerformanceMonitor,
+    log_buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 impl HorizonApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        log_buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    ) -> Self {
         Self::apply_theme(&cc.egui_ctx);
         let gilrs = Gilrs::new().ok().or_else(|| { log::warn!("Gilrs init failed"); None });
         Self {
@@ -43,6 +47,7 @@ impl HorizonApp {
             last_input: InputSnapshot::default(),
             debugger: DebuggerState::new(),
             performance: PerformanceMonitor::new(),
+            log_buffer,
         }
     }
 
@@ -286,7 +291,7 @@ impl eframe::App for HorizonApp {
                 .show(ctx, |ui| { settings_content(ui); });
         }
 
-        debug_windows(ctx, &mut self.debugger);
+        debug_windows(ctx, &mut self.debugger, &self.log_buffer);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
@@ -379,7 +384,11 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.end_row();
 }
 
-fn debug_windows(ctx: &egui::Context, dbg: &mut DebuggerState) {
+fn debug_windows(
+    ctx: &egui::Context,
+    dbg: &mut DebuggerState,
+    log_buffer: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+) {
     if dbg.show_memory {
         egui::Window::new("Memory").open(&mut dbg.show_memory)
             .default_size([480.0, 300.0]).show(ctx, |ui| {
@@ -412,14 +421,18 @@ fn debug_windows(ctx: &egui::Context, dbg: &mut DebuggerState) {
             .default_size([580.0, 300.0]).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if pill_button(ui, "Clear", false).clicked() {
-                    dbg.log_history.lock().clear();
+                    if let Ok(mut buf) = log_buffer.lock() {
+                        buf.clear();
+                    }
                 }
             });
             ui.add_space(4.0);
             egui::ScrollArea::vertical().auto_shrink([false;2]).stick_to_bottom(true)
                 .show(ui, |ui| {
-                    for e in dbg.log_history.lock().iter() {
-                        ui.label(egui::RichText::new(e).size(11.0).monospace().color(MUTED));
+                    if let Ok(buf) = log_buffer.lock() {
+                        for entry in buf.iter() {
+                            ui.label(egui::RichText::new(entry).size(11.0).monospace().color(MUTED));
+                        }
                     }
                 });
         });
