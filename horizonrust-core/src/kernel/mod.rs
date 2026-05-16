@@ -4,6 +4,7 @@ pub mod threads;
 pub mod handles;
 pub mod hid;
 pub mod session;
+pub mod cpu_context;
 
 use crate::memory::AddressSpace;
 use crate::nvdrv::Nvdrv;
