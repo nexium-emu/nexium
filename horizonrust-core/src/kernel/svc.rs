@@ -45,6 +45,7 @@ fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
     log::debug!("svcSetHeapSize size={:#x} -> heap_base={:#x}", size, kernel.heap_base);
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(1, kernel.heap_base);
+        cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
 }
@@ -56,6 +57,9 @@ fn svc_set_memory_permission(kernel: &mut Kernel) -> u32 {
         (0, 0, 0)
     };
     log::info!("svcSetMemoryPermission addr={:#x} size={:#x} perm={:#x} (no-op)", addr, size, perm);
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, SUCCESS as u64);
+    }
     SUCCESS
 }
 
@@ -66,16 +70,25 @@ fn svc_set_memory_attribute(kernel: &mut Kernel) -> u32 {
         (0, 0, 0, 0)
     };
     log::info!("svcSetMemoryAttribute addr={:#x} size={:#x} mask={:#x} value={:#x} (no-op)", addr, size, mask, value);
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, SUCCESS as u64);
+    }
     SUCCESS
 }
 
 fn svc_map_memory(kernel: &mut Kernel) -> u32 {
     log::debug!("svcMapMemory (no-op)");
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, SUCCESS as u64);
+    }
     SUCCESS
 }
 
 fn svc_unmap_memory(kernel: &mut Kernel) -> u32 {
     log::debug!("svcUnmapMemory (no-op)");
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, SUCCESS as u64);
+    }
     SUCCESS
 }
 
@@ -95,6 +108,9 @@ fn svc_query_memory(kernel: &mut Kernel) -> u32 {
     let permission: u32 = 0x3;
 
     log::debug!("returning memory_type={:#x}, attr={:#x}, perm={:#x}", memory_type, memory_attr, permission);
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, SUCCESS as u64);
+    }
     SUCCESS
 }
 
@@ -116,21 +132,31 @@ fn svc_unmap_shared_memory(_kernel: &mut Kernel) -> u32 {
 fn svc_signal_event(kernel: &mut Kernel) -> u32 {
     log::debug!("svcSignalEvent (X0=event_handle)");
 
-    if let Some(cpu) = &kernel.cpu {
-        let handle = cpu.get_register(0) as u32;
-        log::debug!("  signaling event handle {:#x}", handle);
-
-        if let Some(_event) = kernel.handles.get_handle(handle) {
-            kernel.event_signals.insert(handle, true);
-            log::debug!("  event {:#x} signaled", handle);
-            return SUCCESS;
-        } else {
-            log::warn!("  invalid event handle {:#x}", handle);
-            return 1;
+    let handle = if let Some(cpu) = &kernel.cpu {
+        cpu.get_register(0) as u32
+    } else {
+        if let Some(cpu) = &mut kernel.cpu {
+            cpu.set_register(0, 1u64);
         }
-    }
+        return 1;
+    };
 
-    SUCCESS
+    log::debug!("  signaling event handle {:#x}", handle);
+
+    if let Some(_event) = kernel.handles.get_handle(handle) {
+        kernel.event_signals.insert(handle, true);
+        log::debug!("  event {:#x} signaled", handle);
+        if let Some(cpu) = &mut kernel.cpu {
+            cpu.set_register(0, SUCCESS as u64);
+        }
+        return SUCCESS;
+    } else {
+        log::warn!("  invalid event handle {:#x}", handle);
+        if let Some(cpu) = &mut kernel.cpu {
+            cpu.set_register(0, 1u64);
+        }
+        return 1;
+    }
 }
 
 fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
@@ -145,11 +171,17 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
 
         if handle_count == 0 {
             log::warn!("  invalid: handle_count is 0");
+            if let Some(cpu_mut) = &mut kernel.cpu {
+                cpu_mut.set_register(0, 1u64);
+            }
             return 1;
         }
 
         if handle_count > 64 {
             log::warn!("  too many handles: {}", handle_count);
+            if let Some(cpu_mut) = &mut kernel.cpu {
+                cpu_mut.set_register(0, 1u64);
+            }
             return 1;
         }
 
@@ -168,6 +200,9 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
                         return SUCCESS;
                     }
                 }
+            }
+            if let Some(cpu_mut) = &mut kernel.cpu {
+                cpu_mut.set_register(0, 1u64);
             }
             return 1;
         }
@@ -206,9 +241,15 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         }
 
         const TIMEOUT_ERROR: u32 = 1 | (117 << 9);
+        if let Some(cpu_mut) = &mut kernel.cpu {
+            cpu_mut.set_register(0, TIMEOUT_ERROR as u64);
+        }
         return TIMEOUT_ERROR;
     }
 
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, SUCCESS as u64);
+    }
     SUCCESS
 }
 
@@ -219,7 +260,9 @@ fn svc_cancel_synchronization(_kernel: &mut Kernel) -> u32 {
 
 fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     let (tls_addr, session_handle) = if let Some(cpu) = &kernel.cpu {
-        (cpu.get_tpidrro_el0(), cpu.get_register(0) as u32)
+        let x0 = cpu.get_register(0) as u32;
+        log::info!("SendSyncRequest: X0={:#x}", x0);
+        (cpu.get_tpidrro_el0(), x0)
     } else {
         return 1;
     };
@@ -255,9 +298,15 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
 
     if kernel.address_space.write(tls_addr, &tls_buf).is_err() {
         log::warn!("SendSyncRequest: failed to write TLS response at {:#x}", tls_addr);
+        if let Some(cpu) = &mut kernel.cpu {
+            cpu.set_register(0, 1u64);
+        }
         return 1;
     }
 
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, SUCCESS as u64);
+    }
     SUCCESS
 }
 
@@ -444,7 +493,11 @@ fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
     kernel.sessions.insert(handle, session);
 
     if let Some(cpu) = &mut kernel.cpu {
+        log::info!("  about to set X0 to {:#x}", handle);
         cpu.set_register(0, handle as u64);
+        log::info!("  set X0 successfully");
+    } else {
+        log::error!("  kernel.cpu is None!");
     }
 
     log::info!("created session handle {:#x} to port '{}'", handle, port_name);
@@ -550,8 +603,11 @@ fn svc_create_transfer_memory(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_close_handle(_kernel: &mut Kernel) -> u32 {
+fn svc_close_handle(kernel: &mut Kernel) -> u32 {
     log::debug!("svcCloseHandle");
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(0, SUCCESS as u64);
+    }
     SUCCESS
 }
 

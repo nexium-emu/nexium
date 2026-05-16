@@ -101,11 +101,7 @@ impl EmulationHandle {
                             last_svc_cycle = cycle_count;
                             log::info!("SVC {:#04x} (count: {})", imm, svc_count);
 
-                            let result = boot_ctx.kernel.dispatch_svc(imm);
-
-                            if let Some(cpu) = &mut boot_ctx.kernel.cpu {
-                                cpu.set_register(0, result as u64);
-                            }
+                            let _result = boot_ctx.kernel.dispatch_svc(imm);
 
                             for f in boot_ctx.kernel.drain_frames() {
                                 let _ = frame_tx.try_send(f.into());
