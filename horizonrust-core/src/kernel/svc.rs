@@ -526,14 +526,13 @@ fn dispatch_sm_command_v2(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx) -> Vec<u8>
 fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcCtx, session_handle: u32, pending_frames: &mut Vec<crate::services::FrameOut>) -> Vec<u8> {
     let cmd_id = ctx.cmif_in.cmd_id;
 
+    if let Some(sub_service) = subsession_service(port_name, cmd_id) {
+        return return_subsession(kernel, ctx, session_handle, sub_service);
+    }
+
     if let Some(proxy_service) = applet_proxy_service(port_name, cmd_id) {
         log::info!("{} cmd={} → returning {} proxy", port_name, cmd_id, proxy_service);
-        let object_id = if let Some(s) = kernel.sessions.get_mut(&session_handle) {
-            s.alloc_domain_object(proxy_service.to_string())
-        } else {
-            0
-        };
-        return build_ipc_response_full(ctx, 0, &[], &[], &[object_id]);
+        return return_subsession(kernel, ctx, session_handle, proxy_service);
     }
 
     if let Some((data, handle_opt)) = applet_command_response(kernel, port_name, cmd_id) {
@@ -549,6 +548,52 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     };
     let (result, out_data) = kernel.services.dispatch_service(port_name, cmd_id, &mut svc_ctx);
     build_ipc_response(ctx, result, &out_data, &[])
+}
+
+fn return_subsession(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, session_handle: u32, sub_service: &str) -> Vec<u8> {
+    let is_domain = kernel.sessions.get(&session_handle).map(|s| s.is_domain).unwrap_or(false);
+    if is_domain {
+        let object_id = if let Some(s) = kernel.sessions.get_mut(&session_handle) {
+            s.alloc_domain_object(sub_service.to_string())
+        } else {
+            0
+        };
+        log::info!("→ {} sub-object id={}", sub_service, object_id);
+        build_ipc_response_full(ctx, 0, &[], &[], &[object_id])
+    } else {
+        let h = kernel.handles.create_handle(HandleType::Session);
+        let session = Session::new(h, sub_service.to_string());
+        kernel.sessions.insert(h, session);
+        log::info!("→ {} sub-session handle={:#x}", sub_service, h);
+        build_ipc_response(ctx, 0, &[], &[h])
+    }
+}
+
+fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
+    match (port_name, cmd_id) {
+        ("hid", 0) => Some("IAppletResource"),
+        ("IAppletResource", 0) => Some("HidSharedMemory"),
+        ("IApplicationCreator", 0) => Some("IApplicationAccessor"),
+        ("ILibraryAppletCreator", 0) => Some("ILibraryAppletAccessor"),
+        ("time:s" | "time:u" | "time:a" | "time:r", 0) => Some("ISystemClock"),
+        ("time:s" | "time:u" | "time:a" | "time:r", 1) => Some("ISystemClock"),
+        ("time:s" | "time:u" | "time:a" | "time:r", 2) => Some("ISteadyClock"),
+        ("time:s" | "time:u" | "time:a" | "time:r", 3) => Some("ITimeZoneService"),
+        ("time:s" | "time:u" | "time:a" | "time:r", 4) => Some("ISystemClock"),
+        ("fsp-srv", 18) => Some("IFileSystem"),
+        ("fsp-srv", 51) => Some("IFileSystem"),
+        ("vi:m" | "vi:s" | "vi:u", 0) => Some("IApplicationDisplayService"),
+        ("vi:m" | "vi:s" | "vi:u", 1) => Some("IApplicationDisplayService"),
+        ("vi:m" | "vi:s" | "vi:u", 2) => Some("IApplicationDisplayService"),
+        ("vi:m" | "vi:s" | "vi:u", 3) => Some("IApplicationDisplayService"),
+        ("IApplicationDisplayService", 100) => Some("IHOSBinderDriver"),
+        ("IApplicationDisplayService", 101) => Some("ISystemDisplayService"),
+        ("IApplicationDisplayService", 102) => Some("IManagerDisplayService"),
+        ("IApplicationDisplayService", 103) => Some("IHOSBinderDriver"),
+        ("appletAE" | "appletOE", 0) => Some("IApplicationProxy"),
+        ("appletAE" | "appletOE", 200) => Some("ILibraryAppletProxy"),
+        _ => None,
+    }
 }
 
 fn applet_command_response(kernel: &mut Kernel, port_name: &str, cmd_id: u32) -> Option<(Vec<u8>, Option<u32>)> {
