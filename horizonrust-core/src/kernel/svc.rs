@@ -369,7 +369,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
 
     match cmd_type {
         2 => {
-            log::debug!("session Close session={:#x} service={}", session_handle, port_name);
+            log::info!("session Close session={:#x} service={}", session_handle, port_name);
             kernel.sessions.remove(&session_handle);
             if let Some(cpu) = &mut kernel.cpu {
                 cpu.set_register(0, SUCCESS as u64);
@@ -377,6 +377,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             return SUCCESS;
         }
         5 | 7 => {
+            log::info!("Control cmd_type={} session={:#x} service={}", cmd_type, session_handle, port_name);
             let response = handle_control_request(kernel, session_handle, &port_name, &tls_buf);
             if !response.is_empty() {
                 let mut response_buf = tls_buf.clone();
@@ -750,7 +751,7 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                     bq.set_preallocated(slot, gb);
                 }
             });
-            log::debug!("IGBP::SetPreallocatedBuffer binder={} slot={}", binder_id, slot);
+            log::info!("IGBP::SetPreallocatedBuffer binder={} slot={}", binder_id, slot);
             let mut p = ParcelBuilder::new();
             p.write_u32(0);
             p.finish()
@@ -766,7 +767,7 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                 p.write_u32(0);
             }
             p.write_u32(0);
-            log::debug!("IGBP::RequestBuffer binder={} slot={}", binder_id, slot);
+            log::info!("IGBP::RequestBuffer binder={} slot={}", binder_id, slot);
             p.finish()
         }
         IGBP_DEQUEUE_BUFFER => {
@@ -776,7 +777,7 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
             let _fmt = reader.read_i32();
             let _usage = reader.read_u32();
             let slot = kernel.nvdrv.with_bufferqueue(binder_id, |bq| bq.dequeue());
-            log::debug!("IGBP::DequeueBuffer binder={} → slot={}", binder_id, slot);
+            log::info!("IGBP::DequeueBuffer binder={} → slot={}", binder_id, slot);
             let mut p = ParcelBuilder::new();
             p.write_u32(slot);
             p.write_u32(1);
@@ -1609,7 +1610,10 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         22 => kernel.code_base,
         _  => {
             log::warn!("svcGetInfo: unknown type {}", info_type);
-            if let Some(cpu) = &mut kernel.cpu { cpu.set_register(0, 0); }
+            if let Some(cpu) = &mut kernel.cpu {
+                cpu.set_register(0, 0);
+                cpu.set_register(1, 0);
+            }
             return SUCCESS;
         }
     };
@@ -1671,13 +1675,26 @@ fn svc_map_transfer_memory(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_create_transfer_memory(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcCreateTransferMemory");
+fn svc_create_transfer_memory(kernel: &mut Kernel) -> u32 {
+    let (addr, size, perm) = if let Some(cpu) = &kernel.cpu {
+        (cpu.get_register(1), cpu.get_register(2), cpu.get_register(3))
+    } else {
+        return 1;
+    };
+    let handle = kernel.handles.create_handle(HandleType::TransferMemory);
+    log::info!("svcCreateTransferMemory addr={:#x} size={:#x} perm={:#x} → handle={:#x}",
+        addr, size, perm, handle);
+    if let Some(cpu) = &mut kernel.cpu {
+        cpu.set_register(1, handle as u64);
+    }
     SUCCESS
 }
 
 fn svc_close_handle(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcCloseHandle");
+    let handle = if let Some(cpu) = &kernel.cpu { cpu.get_register(0) as u32 } else { 0 };
+    let kind = kernel.handles.get_handle(handle).map(|h| format!("{:?}", h.handle_type)).unwrap_or_else(|| "unknown".into());
+    log::info!("svcCloseHandle handle={:#x} ({})", handle, kind);
+    kernel.handles.close_handle(handle);
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(0, SUCCESS as u64);
     }

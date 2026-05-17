@@ -3,6 +3,7 @@ pub enum HandleType {
     Session,
     Event,
     SharedMemory,
+    TransferMemory,
     Port,
     Thread,
     Process,
