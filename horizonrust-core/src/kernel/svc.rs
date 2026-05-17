@@ -424,6 +424,21 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
 
     log::info!("IPC request service=\"{}\" cmd={} in_data={} is_domain={}", dispatch_target, cmd_id, ctx.cmif_in_data_len, is_domain);
 
+    if dispatch_target == "fatal:u" && cmd_id == 1 {
+        if ctx.cmif_in_data_len >= 4 {
+            let result = u32::from_le_bytes([
+                ctx.buf[ctx.cmif_in_data_off],
+                ctx.buf[ctx.cmif_in_data_off + 1],
+                ctx.buf[ctx.cmif_in_data_off + 2],
+                ctx.buf[ctx.cmif_in_data_off + 3],
+            ]);
+            let module = result & 0x1FF;
+            let desc = (result >> 9) & 0x1FFF;
+            log::error!("**** fatal:u ThrowFatal result={:#010x} module={} description={} ****",
+                result, module, desc);
+        }
+    }
+
     let response = if dispatch_target == "sm:" {
         dispatch_sm_command_v2(kernel, &mut ctx)
     } else {

@@ -56,12 +56,7 @@ impl HidState {
     pub fn build_initial_shmem(&self) -> Vec<u8> {
         let mut buf = vec![0u8; HID_SHMEM_SIZE];
         write_npad_entry(&mut buf, 0, &self.input, self.sampling_number);
-        for id in 0..10 {
-            let offset = NPAD_OFFSET + id * NPAD_ENTRY_SIZE;
-            buf[offset..offset + 4].copy_from_slice(&STYLE_TAG_NPAD_FULL_KEY.to_le_bytes());
-            buf[offset + 0x6028..offset + 0x602C].copy_from_slice(&NPAD_DEVICE_TYPE_FULL_KEY.to_le_bytes());
-        }
-        write_npad_entry(&mut buf, 0, &self.input, 1);
+        write_npad_entry(&mut buf, 8, &self.input, self.sampling_number);
         buf
     }
 
