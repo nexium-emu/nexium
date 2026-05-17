@@ -45,20 +45,16 @@ impl Pusher {
         maxwell: &mut Maxwell3D,
         mem_read: &impl Fn(u64, &mut [u8]) -> bool,
     ) {
-        let cpu_addr = match mappings.cpu_address_for(address) {
-            Some(a) => a,
-            None => {
-                log::debug!("pusher: no mapping for GPFIFO address {:#x}", address);
-                return;
-            }
-        };
+        let cpu_addr = mappings.cpu_address_for(address).unwrap_or(address);
 
         let bytes_needed = (num_entries as usize) * 8;
         let mut buf = vec![0u8; bytes_needed];
         if !mem_read(cpu_addr, &mut buf) {
-            log::debug!("pusher: failed to read GPFIFO entries at cpu {:#x}", cpu_addr);
+            log::debug!("pusher: failed to read GPFIFO entries at cpu {:#x} (input addr {:#x})",
+                cpu_addr, address);
             return;
         }
+        log::info!("pusher: reading {} GPFIFO entries from cpu_addr={:#x}", num_entries, cpu_addr);
 
         for i in 0..num_entries as usize {
             let off = i * 8;
@@ -167,18 +163,16 @@ impl Pusher {
     fn dispatch_method(&mut self, subchannel: u32, method: u32, arg: u32, maxwell: &mut Maxwell3D) {
         if method == 0 {
             self.bound_classes[subchannel as usize & 7] = arg;
-            log::trace!("pusher: bind subch={} class={:#x}", subchannel, arg);
+            log::info!("pusher: BIND subch={} class={:#x}", subchannel, arg);
             return;
         }
 
-        if subchannel == SUBCH_3D as u32
-            || self.bound_classes[subchannel as usize & 7] == 0xB197
-        {
+        let bound_class = self.bound_classes[subchannel as usize & 7];
+        log::debug!("pusher: subch={} class={:#x} method={:#x} arg={:#x}",
+            subchannel, bound_class, method, arg);
+
+        if subchannel == SUBCH_3D as u32 || bound_class == 0xB197 {
             maxwell.write_register(method, arg);
-        } else if subchannel == SUBCH_INLINE2MEMORY {
-            log::trace!("pusher: I2M method={:#x} arg={:#x}", method, arg);
-        } else if subchannel == SUBCH_DMA {
-            log::trace!("pusher: DMA method={:#x} arg={:#x}", method, arg);
         }
 
         if method == 0x44 || method == 0x45 {
