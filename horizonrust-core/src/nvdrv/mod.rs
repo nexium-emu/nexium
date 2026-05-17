@@ -565,7 +565,6 @@ impl Nvdrv {
     pub fn try_capture_sdl_surface(&self, mem_read: impl Fn(u64, &mut [u8]) -> bool) -> Option<QueuedFrame> {
         const CANDIDATES: &[(u32, u32, u32)] = &[
             (1280, 720, 1280),
-            (1280, 720, 1280),
             (1280, 768, 1280),
             (1920, 1080, 1920),
             (640, 360, 640),
@@ -574,6 +573,7 @@ impl Nvdrv {
             (480, 270, 480),
         ];
 
+        let mut best: Option<(u32, u32, u32, u64, u32, Vec<u8>)> = None;
         for handle in self.nvmap_handles.values() {
             if handle.address == 0 || handle.size == 0 {
                 continue;
@@ -596,26 +596,29 @@ impl Nvdrv {
                 px[3] = 0xFF;
             }
 
-            log::info!("captured SDL surface from nvmap_id={} addr={:#x} {}x{} stride={} (nz={})",
-                handle.id, handle.address, w, h, stride, nz);
+            if best.as_ref().map(|b| nz > b.4 as usize).unwrap_or(true) {
+                best = Some((w, h, stride, handle.address, nz as u32, linear));
+            }
+        }
 
-            let dst_w = 1280u32;
-            let dst_h = 720u32;
-            let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
-            for dy in 0..dst_h {
-                let sy = dy * h / dst_h;
-                for dx in 0..dst_w {
-                    let sx = dx * w / dst_w;
-                    let s = ((sy * stride + sx) * 4) as usize;
-                    let d = ((dy * dst_w + dx) * 4) as usize;
-                    if s + 4 <= linear.len() {
-                        out[d..d + 4].copy_from_slice(&linear[s..s + 4]);
-                    }
+        let (w, h, stride, addr, nz, linear) = best?;
+        log::info!("captured SDL surface addr={:#x} {}x{} stride={} (nz={})", addr, w, h, stride, nz);
+
+        let dst_w = 1280u32;
+        let dst_h = 720u32;
+        let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
+        for dy in 0..dst_h {
+            let sy = dy * h / dst_h;
+            for dx in 0..dst_w {
+                let sx = dx * w / dst_w;
+                let s = ((sy * stride + sx) * 4) as usize;
+                let d = ((dy * dst_w + dx) * 4) as usize;
+                if s + 4 <= linear.len() {
+                    out[d..d + 4].copy_from_slice(&linear[s..s + 4]);
                 }
             }
-            return Some(QueuedFrame { width: dst_w, height: dst_h, pixels: out });
         }
-        None
+        Some(QueuedFrame { width: dst_w, height: dst_h, pixels: out })
     }
 
     pub fn gpu_draw_count(&self) -> u64 {
