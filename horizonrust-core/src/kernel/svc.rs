@@ -726,7 +726,7 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                 bq.connected_api = api;
                 (bq.width, bq.height)
             });
-            log::debug!("IGBP::Connect binder={} api={} {}x{}", binder_id, api, w, h);
+            log::info!("IGBP::Connect binder={} api={} {}x{}", binder_id, api, w, h);
             let mut p = ParcelBuilder::new();
             p.write_bq_buffer_output(w, h);
             p.write_u32(0);
@@ -790,7 +790,7 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                 bq.queue(slot);
                 bq.request_buffer(slot).cloned()
             });
-            log::debug!("IGBP::QueueBuffer binder={} slot={}", binder_id, slot);
+            log::info!("IGBP::QueueBuffer binder={} slot={}", binder_id, slot);
 
             if let Some(gb) = gb_opt {
                 if let Some(nvmap) = kernel.nvdrv.nvmap_handles.get(&gb.nvmap_id) {
