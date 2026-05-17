@@ -870,13 +870,12 @@ impl<'a> ParcelReader<'a> {
     }
 
     fn skip_interface_token(&mut self) -> Option<()> {
-        let strict_policy = self.read_u32()?;
+        let _strict_policy = self.read_u32()?;
         let len = self.read_i32()?;
         if len <= 0 {
             return Some(());
         }
-        let _ = strict_policy;
-        let byte_len = (len as usize) * 2;
+        let byte_len = ((len as usize) + 1) * 2;
         let padded = (byte_len + 3) & !3;
         self.cursor += padded;
         Some(())
@@ -937,16 +936,27 @@ impl ParcelBuilder {
 }
 
 fn parse_flattened_graphic_buffer(reader: &mut ParcelReader) -> Option<crate::nvdrv::GraphicBuffer> {
-    let width = reader.read_u32()?;
-    let height = reader.read_u32()?;
-    let stride = reader.read_u32()?;
-    let format = reader.read_u32()?;
-    let usage = reader.read_u32()?;
-    let _ = reader.read_u32()?;
-    let _ = reader.read_u32()?;
-    let nvmap_id = reader.read_u32()?;
-    let _ = reader.read_u32()?;
-    let size = reader.read_u32()?;
+    let _length = reader.read_u32()?;
+    let _fd_count = reader.read_u32()?;
+    let _magic = reader.read_u32();
+    let width = reader.read_u32().unwrap_or(0);
+    let height = reader.read_u32().unwrap_or(0);
+    let stride = reader.read_u32().unwrap_or(0);
+    let format = reader.read_u32().unwrap_or(0);
+    let usage = reader.read_u32().unwrap_or(0);
+
+    let _pid = reader.read_u32();
+    let _refcount = reader.read_u32();
+    let _num_fds = reader.read_u32();
+    let num_ints = reader.read_u32().unwrap_or(0) as usize;
+
+    let mut ints = Vec::with_capacity(num_ints);
+    for _ in 0..num_ints {
+        ints.push(reader.read_u32().unwrap_or(0));
+    }
+    let nvmap_id = ints.get(1).copied().unwrap_or(0);
+    let buffer_offset = ints.get(20).copied().unwrap_or(0);
+
     Some(crate::nvdrv::GraphicBuffer {
         width,
         height,
@@ -954,8 +964,8 @@ fn parse_flattened_graphic_buffer(reader: &mut ParcelReader) -> Option<crate::nv
         format,
         usage,
         nvmap_id,
-        buffer_offset: 0,
-        size,
+        buffer_offset: buffer_offset as u64,
+        size: stride * height * 4,
     })
 }
 
