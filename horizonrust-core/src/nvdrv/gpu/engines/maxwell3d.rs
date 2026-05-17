@@ -111,22 +111,69 @@ impl Default for Maxwell3DRegisters {
 
 pub struct Maxwell3D {
     pub regs: Maxwell3DRegisters,
-    macros: [u32; 0x200],
-    macro_args: Vec<u32>,
-    pending_macro: Option<u32>,
+    pub reg_file: Vec<u32>,
+    pub macro_engine: super::MacroEngine,
 }
+
+const REG_LOAD_MME_INSTRUCTION_PTR: u32 = 0x45;
+const REG_LOAD_MME_INSTRUCTION: u32 = 0x46;
+const REG_LOAD_MME_START_ADDRESS_PTR: u32 = 0x47;
+const REG_LOAD_MME_START_ADDRESS: u32 = 0x48;
 
 impl Maxwell3D {
     pub fn new() -> Self {
         Self {
             regs: Maxwell3DRegisters::default(),
-            macros: [0; 0x200],
-            macro_args: Vec::new(),
-            pending_macro: None,
+            reg_file: vec![0u32; 0xE00],
+            macro_engine: super::MacroEngine::new(),
         }
     }
 
+    pub fn dispatch_method(&mut self, method: u32, arg: u32, is_last: bool) {
+        if method >= super::MACRO_REGISTERS_START {
+            let reg_file_ptr = &self.reg_file as *const Vec<u32>;
+            let writes = self.macro_engine.on_macro_method(method, arg, is_last, &|idx: u32| {
+                unsafe {
+                    let rf = &*reg_file_ptr;
+                    rf.get(idx as usize).copied().unwrap_or(0)
+                }
+            });
+            if let Some(out) = writes {
+                for (m, a) in out.writes {
+                    self.write_register(m, a);
+                }
+            }
+            return;
+        }
+
+        match method {
+            REG_LOAD_MME_INSTRUCTION_PTR => {
+                self.macro_engine.set_instruction_ptr(arg);
+                return;
+            }
+            REG_LOAD_MME_INSTRUCTION => {
+                self.macro_engine.upload_instruction(arg);
+                return;
+            }
+            REG_LOAD_MME_START_ADDRESS_PTR => {
+                self.macro_engine.set_start_address_ptr(arg);
+                return;
+            }
+            REG_LOAD_MME_START_ADDRESS => {
+                self.macro_engine.bind_macro_entry(arg);
+                return;
+            }
+            _ => {}
+        }
+
+        self.write_register(method, arg);
+    }
+
     pub fn write_register(&mut self, method: u32, arg: u32) {
+        if (method as usize) < self.reg_file.len() {
+            self.reg_file[method as usize] = arg;
+        }
+
         if method >= 0x200 && method < 0x300 {
             let rt_index = ((method - 0x200) / 0x10) as usize;
             let field = (method - 0x200) % 0x10;
