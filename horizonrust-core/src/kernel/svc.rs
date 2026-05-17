@@ -903,24 +903,54 @@ impl ParcelBuilder {
     }
 
     fn write_flattened_zero_fence(&mut self) {
-        for _ in 0..9 {
+        self.write_u32(36);
+        self.write_u32(0);
+        self.write_u32(0);
+        for _ in 0..4 {
+            self.write_u32(0);
             self.write_u32(0);
         }
     }
 
     fn write_flattened_graphic_buffer(&mut self, gb: &crate::nvdrv::GraphicBuffer) {
+        const NUM_INTS: u32 = 81;
+        const HEADER_U32S: u32 = 10;
+        let body_size = (HEADER_U32S + NUM_INTS) * 4;
+        self.write_u32(body_size);
+        self.write_u32(0);
+        self.write_u32(0x47424652);
         self.write_u32(gb.width);
         self.write_u32(gb.height);
         self.write_u32(gb.stride);
         self.write_u32(gb.format);
         self.write_u32(gb.usage);
+        self.write_u32(42);
+        self.write_u32(1);
         self.write_u32(0);
-        self.write_u32(0);
-        self.write_u32(gb.nvmap_id);
-        self.write_u32(0);
-        self.write_u32(gb.size);
-        for _ in 0..32 {
-            self.write_u32(0);
+        self.write_u32(NUM_INTS);
+        let mut ints = [0u32; NUM_INTS as usize];
+        ints[0] = 0xFFFF_FFFF;
+        ints[1] = gb.nvmap_id;
+        ints[2] = 0;
+        ints[3] = 0xDAFF_CAFF;
+        ints[4] = 42;
+        ints[5] = 0;
+        ints[6] = gb.usage;
+        ints[7] = gb.format;
+        ints[8] = gb.format;
+        ints[9] = gb.stride;
+        ints[10] = gb.width.saturating_mul(gb.height).saturating_mul(4);
+        ints[11] = 1;
+        ints[12] = 0;
+        ints[13] = gb.width;
+        ints[14] = gb.height;
+        ints[18] = gb.stride.saturating_mul(4);
+        ints[19] = gb.nvmap_id;
+        ints[20] = gb.buffer_offset as u32;
+        ints[21] = 0;
+        ints[22] = 4;
+        for v in ints {
+            self.write_u32(v);
         }
     }
 
