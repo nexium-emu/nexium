@@ -14,7 +14,15 @@ impl CommandListHeader {
     }
 
     pub fn entry_count(&self) -> u32 {
-        (self.address_hi_and_count >> 10) & 0x3FFFFF
+        (self.address_hi_and_count >> 10) & 0xFFFFF
+    }
+
+    pub fn no_prefetch(&self) -> bool {
+        (self.address_hi_and_count & 0x8000_0000) != 0
+    }
+
+    pub fn not_main(&self) -> bool {
+        (self.address_hi_and_count & 0x4000_0000) != 0
     }
 }
 
@@ -75,21 +83,23 @@ impl Pusher {
     ) {
         let address = entry.address();
         let word_count = entry.entry_count();
-        if word_count == 0 {
+        log::info!("pusher: entry addr={:#x} word_count={}", address, word_count);
+        if word_count == 0 || word_count > 0x100000 {
             return;
         }
 
         let cpu_addr = match mappings.cpu_address_for(address) {
             Some(a) => a,
             None => {
-                log::debug!("pusher: no mapping for cmd buffer {:#x}", address);
-                return;
+                log::debug!("pusher: no mapping for cmd buffer {:#x} - trying CPU direct", address);
+                address
             }
         };
 
         let bytes_needed = (word_count as usize) * 4;
         let mut buf = vec![0u8; bytes_needed];
         if !mem_read(cpu_addr, &mut buf) {
+            log::debug!("pusher: failed to read cmd buffer at cpu {:#x}", cpu_addr);
             return;
         }
 
