@@ -9,6 +9,7 @@ use crate::input::InputSnapshot;
 use crate::debugger::DebuggerState;
 use crate::performance::PerformanceMonitor;
 use crate::controller_config::{ControllerConfig, SwitchButton};
+use crate::app_settings::{AppSettings, LogLevel};
 
 const BG:        Color32 = Color32::from_rgb(0x0F, 0x0F, 0x11);
 const BG_RAISED: Color32 = Color32::from_rgb(0x18, 0x18, 0x1C);
@@ -34,12 +35,14 @@ pub struct HorizonApp {
     log_buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     controller_config: ControllerConfig,
     rebinding: Option<SwitchButton>,
+    app_settings: AppSettings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     General,
     Controller,
+    Logging,
 }
 
 impl HorizonApp {
@@ -64,6 +67,7 @@ impl HorizonApp {
             log_buffer,
             controller_config: ControllerConfig::load(),
             rebinding: None,
+            app_settings: AppSettings::load(),
         };
         if !nro_path.is_empty() {
             if let Ok(handle) = EmulationHandle::new(&nro_path) {
@@ -358,6 +362,8 @@ impl eframe::App for HorizonApp {
             let mut cfg = self.controller_config.clone();
             let mut rebinding = self.rebinding;
             let mut save_needed = false;
+            let mut app_cfg = self.app_settings.clone();
+            let mut app_save_needed = false;
 
             egui::Window::new("Preferences")
                 .open(&mut open)
@@ -370,6 +376,9 @@ impl eframe::App for HorizonApp {
                         if ui.selectable_label(tab == SettingsTab::Controller, "Controller").clicked() {
                             tab = SettingsTab::Controller;
                         }
+                        if ui.selectable_label(tab == SettingsTab::Logging, "Logging").clicked() {
+                            tab = SettingsTab::Logging;
+                        }
                     });
                     ui.separator();
                     ui.add_space(6.0);
@@ -379,6 +388,9 @@ impl eframe::App for HorizonApp {
                         SettingsTab::Controller => {
                             controller_settings_content(ui, &mut cfg, &mut rebinding, &mut save_needed);
                         }
+                        SettingsTab::Logging => {
+                            logging_settings_content(ui, &mut app_cfg, &mut app_save_needed);
+                        }
                     }
                 });
 
@@ -386,9 +398,15 @@ impl eframe::App for HorizonApp {
             self.settings_tab = tab;
             self.controller_config = cfg;
             self.rebinding = rebinding;
+            self.app_settings = app_cfg;
             if save_needed {
                 if let Err(e) = self.controller_config.save() {
                     log::warn!("Failed to save controller config: {}", e);
+                }
+            }
+            if app_save_needed {
+                if let Err(e) = self.app_settings.save() {
+                    log::warn!("Failed to save app settings: {}", e);
                 }
             }
         }
@@ -563,6 +581,26 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.label(egui::RichText::new(label).size(12.0).color(MUTED));
     ui.label(egui::RichText::new(value).size(12.0).color(TEXT));
     ui.end_row();
+}
+
+fn logging_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_needed: &mut bool) {
+    ui.label(egui::RichText::new("Log Level").size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Takes effect on restart.").size(11.0).color(MUTED));
+    ui.add_space(8.0);
+
+    for level in LogLevel::all() {
+        if ui.radio(cfg.log_level == *level, level.label()).clicked() {
+            cfg.log_level = *level;
+            *save_needed = true;
+        }
+    }
+
+    ui.add_space(12.0);
+    let path = AppSettings::config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    ui.label(egui::RichText::new(format!("Config: {}", path)).size(10.5).color(MUTED));
 }
 
 fn debug_windows(

@@ -5,19 +5,22 @@ mod audio;
 mod debugger;
 mod performance;
 mod controller_config;
+mod app_settings;
 
 use app::HorizonApp;
+use app_settings::AppSettings;
 use horizonrust_common::FileLogger;
-use log::LevelFilter;
 
 fn main() -> Result<(), eframe::Error> {
+    let settings = AppSettings::load();
+
     let (logger, log_buffer) = FileLogger::new(500)
         .unwrap_or_else(|e| {
             eprintln!("Failed to initialize logger: {}", e);
             panic!("Logger initialization failed");
         });
 
-    if let Err(e) = logger.init(LevelFilter::Info) {
+    if let Err(e) = logger.init(settings.log_level.to_filter()) {
         eprintln!("Failed to set logger: {}", e);
     }
 
