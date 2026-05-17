@@ -498,15 +498,29 @@ impl Nvdrv {
         out[..n].copy_from_slice(&req.in_data[..n]);
 
         match cmd {
-            0x001b => { log::debug!("nvhost-ctrl:SyncptRead"); }
-            0x001c => { log::debug!("nvhost-ctrl:SyncptIncr"); }
-            0x001d => { log::debug!("nvhost-ctrl:SyncptWait"); }
-            0x001e => { log::debug!("nvhost-ctrl:GetConfig"); }
+            0x0014 => {
+                log::debug!("nvhost-ctrl:SyncptRead");
+                if out.len() >= 8 && req.in_data.len() >= 4 {
+                    out[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+                }
+            }
+            0x0015 => { log::debug!("nvhost-ctrl:SyncptIncr"); }
+            0x0016 | 0x001d => {
+                log::debug!("nvhost-ctrl:SyncptWait (ack)");
+            }
+            0x001a => {
+                log::debug!("nvhost-ctrl:GetConfig");
+            }
+            0x001b => {
+                log::debug!("nvhost-ctrl:EventWait (returning signaled)");
+            }
+            0x001c | 0x001e => {
+                log::debug!("nvhost-ctrl:EventWaitAsync / EventRegister");
+                if out.len() >= 4 { out[0..4].copy_from_slice(&0u32.to_le_bytes()); }
+            }
             0x001f => { log::debug!("nvhost-ctrl:EventSignal"); }
-            0x0020 => { log::debug!("nvhost-ctrl:EventWait"); }
-            0x0021 => { log::debug!("nvhost-ctrl:EventWaitAsync"); }
-            0x0022 => { log::debug!("nvhost-ctrl:EventRegister"); }
-            0x0023 => { log::debug!("nvhost-ctrl:EventUnregister"); }
+            0x0020 => { log::debug!("nvhost-ctrl:EventClear"); }
+            0x0021 => { log::debug!("nvhost-ctrl:EventUnregister"); }
             0x0033 => { log::debug!("nvhost-ctrl:GetGpuCharacteristics"); }
             other => {
                 log::debug!("nvhost-ctrl: unknown ioctl cmd={:#x}", other);
