@@ -3,11 +3,27 @@ use std::sync::Arc;
 
 pub const HID_SHMEM_SIZE: usize = 0x40000;
 
-pub const NPAD_OFFSET: usize = 0x9A00;
-pub const NPAD_ENTRY_SIZE: usize = 0x5000;
+const NPAD_OFFSET: usize = 0x9A00;
+const NPAD_ENTRY_SIZE: usize = 0x5000;
+const NPAD_ENTRY_HANDHELD: usize = 8;
+const NPAD_ENTRY_PLAYER1: usize = 0;
 
-pub const STYLE_TAG_NPAD_FULL_KEY: u32 = 1 << 0;
-pub const STYLE_TAG_NPAD_HANDHELD: u32 = 1 << 1;
+const NPAD_STYLE_TAG_OFFSET: usize = 0x00;
+const NPAD_JOY_ASSIGN_OFFSET: usize = 0x04;
+
+const LAYOUT_BASE_OFFSET: usize = 0x28;
+const LAYOUT_STRIDE: usize = 0x350;
+const LAYOUT_COUNT: usize = 7;
+
+const LIFO_HEADER_SIZE: usize = 0x20;
+const LIFO_STORAGE_ELEM_SIZE: usize = 0x30;
+const LIFO_STORAGE_COUNT: usize = 17;
+
+pub const STYLE_FULLKEY: u32 = 1 << 0;
+pub const STYLE_HANDHELD: u32 = 1 << 1;
+
+pub const ATTR_IS_CONNECTED: u32 = 1 << 0;
+pub const ATTR_IS_WIRED: u32 = 1 << 1;
 
 pub const NPAD_BUTTON_A: u64 = 1 << 0;
 pub const NPAD_BUTTON_B: u64 = 1 << 1;
@@ -26,10 +42,7 @@ pub const NPAD_BUTTON_UP: u64 = 1 << 13;
 pub const NPAD_BUTTON_RIGHT: u64 = 1 << 14;
 pub const NPAD_BUTTON_DOWN: u64 = 1 << 15;
 
-pub const NPAD_DEVICE_TYPE_FULL_KEY: u32 = 1 << 0;
-pub const NPAD_DEVICE_TYPE_HANDHELD: u32 = 1 << 1;
-
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Copy)]
 pub struct ControllerInput {
     pub buttons: u64,
     pub stick_l_x: i32,
@@ -53,10 +66,10 @@ impl HidState {
         }
     }
 
-    pub fn build_initial_shmem(&self) -> Vec<u8> {
+    pub fn build_initial_shmem(&mut self) -> Vec<u8> {
         let mut buf = vec![0u8; HID_SHMEM_SIZE];
-        write_npad_entry(&mut buf, 0, &self.input, self.sampling_number);
-        write_npad_entry(&mut buf, 8, &self.input, self.sampling_number);
+        self.init_metadata(&mut buf);
+        self.write_all_entries(&mut buf);
         buf
     }
 
@@ -64,96 +77,67 @@ impl HidState {
         self.input = input;
         self.sampling_number = self.sampling_number.wrapping_add(1);
     }
-}
 
-fn write_npad_entry(buf: &mut [u8], npad_id: usize, input: &ControllerInput, sampling: u64) {
-    let base = NPAD_OFFSET + npad_id * NPAD_ENTRY_SIZE;
-    if base + NPAD_ENTRY_SIZE > buf.len() {
-        return;
-    }
-
-    buf[base..base + 4].copy_from_slice(&STYLE_TAG_NPAD_FULL_KEY.to_le_bytes());
-    buf[base + 4..base + 8].copy_from_slice(&0u32.to_le_bytes());
-    buf[base + 8..base + 12].copy_from_slice(&1u32.to_le_bytes());
-    buf[base + 12..base + 16].copy_from_slice(&0xFF323232u32.to_le_bytes());
-    buf[base + 16..base + 20].copy_from_slice(&1u32.to_le_bytes());
-    buf[base + 20..base + 24].copy_from_slice(&0xFF323232u32.to_le_bytes());
-    buf[base + 24..base + 28].copy_from_slice(&0xFF323232u32.to_le_bytes());
-
-    let lifo_offset = base + 0x18;
-    write_npad_lifo(&mut buf[lifo_offset..], input, sampling);
-
-    let handheld_lifo_offset = base + 0x350;
-    write_npad_lifo(&mut buf[handheld_lifo_offset..], input, sampling);
-
-    let device_type_offset = base + 0x6028;
-    buf[device_type_offset..device_type_offset + 4]
-        .copy_from_slice(&NPAD_DEVICE_TYPE_FULL_KEY.to_le_bytes());
-
-    let system_properties_offset = base + 0x6030;
-    buf[system_properties_offset..system_properties_offset + 8]
-        .copy_from_slice(&0u64.to_le_bytes());
-
-    let battery_offset = base + 0x6044;
-    buf[battery_offset..battery_offset + 4].copy_from_slice(&4u32.to_le_bytes());
-    buf[battery_offset + 4..battery_offset + 8].copy_from_slice(&4u32.to_le_bytes());
-    buf[battery_offset + 8..battery_offset + 12].copy_from_slice(&4u32.to_le_bytes());
-}
-
-fn write_npad_lifo(buf: &mut [u8], input: &ControllerInput, sampling: u64) {
-    if buf.len() < 0x338 {
-        return;
-    }
-    buf[0..8].copy_from_slice(&sampling.to_le_bytes());
-    buf[8..16].copy_from_slice(&17u64.to_le_bytes());
-    buf[16..24].copy_from_slice(&0u64.to_le_bytes());
-    buf[24..32].copy_from_slice(&17u64.to_le_bytes());
-
-    let entry_base = 32;
-    let entry_size = 48;
-    let entry = build_npad_state_entry(input, sampling);
-    for i in 0..17 {
-        let off = entry_base + i * entry_size;
-        if off + entry.len() > buf.len() {
-            break;
+    fn init_metadata(&self, buf: &mut [u8]) {
+        for &entry_idx in &[NPAD_ENTRY_PLAYER1, NPAD_ENTRY_HANDHELD] {
+            let base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
+            let style = STYLE_FULLKEY | STYLE_HANDHELD;
+            write_u32(buf, base + NPAD_STYLE_TAG_OFFSET, style);
+            write_u32(buf, base + NPAD_JOY_ASSIGN_OFFSET, 0);
         }
-        buf[off..off + entry.len()].copy_from_slice(&entry);
+    }
+
+    fn write_all_entries(&self, buf: &mut [u8]) {
+        for &entry_idx in &[NPAD_ENTRY_PLAYER1, NPAD_ENTRY_HANDHELD] {
+            for layout in 0..LAYOUT_COUNT {
+                let lifo_off = LAYOUT_BASE_OFFSET + layout * LAYOUT_STRIDE;
+                self.write_npad_entry(buf, entry_idx, lifo_off);
+            }
+        }
+    }
+
+    fn write_npad_entry(&self, buf: &mut [u8], entry_idx: usize, lifo_offset_in_entry: usize) {
+        let entry_base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
+        let lifo = entry_base + lifo_offset_in_entry;
+
+        let total = self.sampling_number;
+        let tail: u64 = 0;
+        let count: u64 = 1;
+
+        write_u64(buf, lifo + 0x00, self.sampling_number);
+        write_u64(buf, lifo + 0x08, total);
+        write_u64(buf, lifo + 0x10, tail);
+        write_u64(buf, lifo + 0x18, count);
+
+        let storage0 = lifo + LIFO_HEADER_SIZE;
+        write_u64(buf, storage0, self.sampling_number.wrapping_mul(2));
+        let state = storage0 + 8;
+        write_u64(buf, state + 0x00, self.sampling_number);
+        write_u64(buf, state + 0x08, self.input.buttons);
+        write_i32(buf, state + 0x10, self.input.stick_l_x);
+        write_i32(buf, state + 0x14, self.input.stick_l_y);
+        write_i32(buf, state + 0x18, self.input.stick_r_x);
+        write_i32(buf, state + 0x1C, self.input.stick_r_y);
+        write_u32(buf, state + 0x20, ATTR_IS_CONNECTED | ATTR_IS_WIRED);
+        write_u32(buf, state + 0x24, 0);
+
+        for i in 1..LIFO_STORAGE_COUNT {
+            let storage_i = lifo + LIFO_HEADER_SIZE + i * LIFO_STORAGE_ELEM_SIZE;
+            write_u64(buf, storage_i, 0);
+        }
     }
 }
 
-fn build_npad_state_entry(input: &ControllerInput, sampling: u64) -> Vec<u8> {
-    let mut entry = Vec::with_capacity(48);
-    entry.extend_from_slice(&sampling.to_le_bytes());
-    entry.extend_from_slice(&sampling.to_le_bytes());
-    entry.extend_from_slice(&input.buttons.to_le_bytes());
-    entry.extend_from_slice(&input.stick_l_x.to_le_bytes());
-    entry.extend_from_slice(&input.stick_l_y.to_le_bytes());
-    entry.extend_from_slice(&input.stick_r_x.to_le_bytes());
-    entry.extend_from_slice(&input.stick_r_y.to_le_bytes());
-    entry.extend_from_slice(&0u32.to_le_bytes());
-    entry.extend_from_slice(&0u32.to_le_bytes());
-    entry
+fn write_u64(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-pub fn map_keyboard_to_controller(keys: &[bool; 256]) -> ControllerInput {
-    let mut input = ControllerInput::default();
+fn write_u32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
 
-    if keys[b'Z' as usize] { input.buttons |= NPAD_BUTTON_A; }
-    if keys[b'X' as usize] { input.buttons |= NPAD_BUTTON_B; }
-    if keys[b'A' as usize] { input.buttons |= NPAD_BUTTON_X; }
-    if keys[b'S' as usize] { input.buttons |= NPAD_BUTTON_Y; }
-    if keys[b'Q' as usize] { input.buttons |= NPAD_BUTTON_L; }
-    if keys[b'W' as usize] { input.buttons |= NPAD_BUTTON_R; }
-    if keys[b'1' as usize] { input.buttons |= NPAD_BUTTON_ZL; }
-    if keys[b'2' as usize] { input.buttons |= NPAD_BUTTON_ZR; }
-    if keys[b'\r' as usize] { input.buttons |= NPAD_BUTTON_PLUS; }
-    if keys[b'\t' as usize] { input.buttons |= NPAD_BUTTON_MINUS; }
-    if keys[37] { input.buttons |= NPAD_BUTTON_LEFT; input.stick_l_x = -30000; }
-    if keys[38] { input.buttons |= NPAD_BUTTON_UP; input.stick_l_y = 30000; }
-    if keys[39] { input.buttons |= NPAD_BUTTON_RIGHT; input.stick_l_x = 30000; }
-    if keys[40] { input.buttons |= NPAD_BUTTON_DOWN; input.stick_l_y = -30000; }
-
-    input
+fn write_i32(buf: &mut [u8], off: usize, v: i32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
 pub static HID_STATE: once_cell::sync::OnceCell<Arc<Mutex<HidState>>> = once_cell::sync::OnceCell::new();

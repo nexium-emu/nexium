@@ -342,9 +342,10 @@ fn svc_cancel_synchronization(_kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
+    dump_regs(kernel, "SendSync ENTRY");
     let (tls_addr, session_handle) = if let Some(cpu) = &kernel.cpu {
         let x0 = cpu.get_register(0) as u32;
-        log::debug!("SendSyncRequest: X0={:#x}", x0);
+        log::info!("SendSyncRequest: X0={:#x}", x0);
         (cpu.get_tpidrro_el0(), x0)
     } else {
         return 1;
@@ -355,6 +356,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         log::warn!("SendSyncRequest: failed to read TLS at {:#x}", tls_addr);
         return 1;
     }
+    log::info!("  TLS[0..32]: {:02x?}", &tls_buf[..32]);
 
     let port_name = match kernel.sessions.get(&session_handle) {
         Some(s) => s.port_name.clone(),
@@ -1675,7 +1677,20 @@ fn svc_map_transfer_memory(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+fn dump_regs(kernel: &Kernel, tag: &str) {
+    if let Some(cpu) = &kernel.cpu {
+        log::info!(
+            "  [{}] X0={:#x} X1={:#x} X2={:#x} X3={:#x} X4={:#x} X8={:#x} X19={:#x} X30={:#x}",
+            tag,
+            cpu.get_register(0), cpu.get_register(1), cpu.get_register(2),
+            cpu.get_register(3), cpu.get_register(4), cpu.get_register(8),
+            cpu.get_register(19), cpu.get_register(30),
+        );
+    }
+}
+
 fn svc_create_transfer_memory(kernel: &mut Kernel) -> u32 {
+    dump_regs(kernel, "CreateTmem ENTRY");
     let (addr, size, perm) = if let Some(cpu) = &kernel.cpu {
         (cpu.get_register(1), cpu.get_register(2), cpu.get_register(3))
     } else {
@@ -1687,6 +1702,7 @@ fn svc_create_transfer_memory(kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(1, handle as u64);
     }
+    dump_regs(kernel, "CreateTmem EXIT");
     SUCCESS
 }
 
@@ -1694,6 +1710,7 @@ fn svc_close_handle(kernel: &mut Kernel) -> u32 {
     let handle = if let Some(cpu) = &kernel.cpu { cpu.get_register(0) as u32 } else { 0 };
     let kind = kernel.handles.get_handle(handle).map(|h| format!("{:?}", h.handle_type)).unwrap_or_else(|| "unknown".into());
     log::info!("svcCloseHandle handle={:#x} ({})", handle, kind);
+    dump_regs(kernel, "CloseHandle ENTRY");
     kernel.handles.close_handle(handle);
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(0, SUCCESS as u64);

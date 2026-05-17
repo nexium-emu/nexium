@@ -179,10 +179,28 @@ impl EmulationHandle {
                     }
 
                     let event_copy = event;
-                    drop(cpu);
+                    let _ = cpu;
 
                     if let horizonrust_core::cpu::CpuEvent::Svc(imm) = event_copy {
-                        let _ = boot_ctx.kernel.dispatch_svc(imm);
+                        let result = boot_ctx.kernel.dispatch_svc(imm);
+                        if let Some(cpu) = &mut boot_ctx.kernel.cpu {
+                            cpu.set_register(0, result as u64);
+                        }
+                    }
+
+                    if svc_count % 16 == 0 {
+                        let state = horizonrust_core::hid_state::get_hid_state();
+                        let mut hid = state.lock();
+                        if let Some(va) = hid.shmem_va {
+                            let cur = hid.input.clone();
+                            if cur.buttons != 0 {
+                                log::info!("HID push: buttons={:#x} lstick=({},{}) → va={:#x} sampling={}",
+                                    cur.buttons, cur.stick_l_x, cur.stick_l_y, va, hid.sampling_number);
+                            }
+                            hid.update_input(cur);
+                            let buf = hid.build_initial_shmem();
+                            let _ = boot_ctx.kernel.address_space.write(va, &buf);
+                        }
                     }
 
                     for f in boot_ctx.kernel.drain_frames() {
