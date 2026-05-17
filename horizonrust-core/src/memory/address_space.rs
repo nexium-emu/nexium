@@ -281,6 +281,16 @@ impl AddressSpace {
             .collect()
     }
 
+    pub fn host_region_at(&self, va: u64) -> Option<HostRegion> {
+        let regs = self.regions.lock();
+        regs.iter().find(|r| r.base == va).map(|r| HostRegion {
+            base: r.base,
+            size: r.len as u64,
+            perm: r.perm(),
+            host_ptr: r.buf.as_ptr(),
+        })
+    }
+
     fn locate(&self, va: u64, len: usize) -> Result<(Arc<Region>, usize)> {
         let regs = self.regions.lock();
         let region = regs

@@ -193,13 +193,37 @@ impl EmulationHandle {
                         let mut hid = state.lock();
                         if let Some(va) = hid.shmem_va {
                             let cur = hid.input.clone();
-                            if cur.buttons != 0 {
-                                log::info!("HID push: buttons={:#x} lstick=({},{}) → va={:#x} sampling={}",
-                                    cur.buttons, cur.stick_l_x, cur.stick_l_y, va, hid.sampling_number);
-                            }
+                            let log_input = cur.buttons != 0;
                             hid.update_input(cur);
+                            let sampling = hid.sampling_number;
                             let buf = hid.build_initial_shmem();
                             let _ = boot_ctx.kernel.address_space.write(va, &buf);
+                            if log_input {
+                                let entry0_lifo_va = va + 0x9A00 + 0x28;
+                                let entry8_handheld_lifo_va = va + 0x9A00 + 8 * 0x5000 + 0x378;
+                                let mut header = [0u8; 32];
+                                let _ = boot_ctx.kernel.address_space.read(entry0_lifo_va, &mut header);
+                                let count0 = u64::from_le_bytes(header[24..32].try_into().unwrap_or([0;8]));
+                                let buttons0_va = entry0_lifo_va + 0x20 + 8 + 8;
+                                let mut cpu_read = [0u8; 8];
+                                if let Some(cpu) = &boot_ctx.kernel.cpu {
+                                    let _ = cpu.read_bytes(buttons0_va, &mut cpu_read);
+                                }
+                                let cpu_buttons0 = u64::from_le_bytes(cpu_read);
+                                let buttons8_va = entry8_handheld_lifo_va + 0x20 + 8 + 8;
+                                if let Some(cpu) = &boot_ctx.kernel.cpu {
+                                    let _ = cpu.read_bytes(buttons8_va, &mut cpu_read);
+                                }
+                                let cpu_buttons8 = u64::from_le_bytes(cpu_read);
+                                let style0_va = va + 0x9A00;
+                                let mut style_buf = [0u8; 4];
+                                if let Some(cpu) = &boot_ctx.kernel.cpu {
+                                    let _ = cpu.read_bytes(style0_va, &mut style_buf);
+                                }
+                                let style0 = u32::from_le_bytes(style_buf);
+                                log::info!("HID push: btn={:#x} sampling={} | e0 style={:#x} count={} cpu_buttons={:#x} | e8 cpu_buttons={:#x}",
+                                    cur.buttons, sampling, style0, count0, cpu_buttons0, cpu_buttons8);
+                            }
                         }
                     }
 

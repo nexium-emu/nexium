@@ -198,9 +198,21 @@ fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
         vec![0u8; size as usize]
     };
 
-    if kernel.address_space.write(addr, &backing).is_err() {
+    let needed_map = kernel.address_space.write(addr, &backing).is_err();
+    if needed_map {
         let _ = kernel.address_space.map(addr, size, crate::memory::perm::Perm::RW, "shared");
         let _ = kernel.address_space.write(addr, &backing);
+        if let Some(region) = kernel.address_space.host_region_at(addr) {
+            if let Some(cpu) = &mut kernel.cpu {
+                unsafe {
+                    if let Err(e) = cpu.map_host(region.base, region.size, region.perm, region.host_ptr) {
+                        log::warn!("failed to map shared mem in CPU: {}", e);
+                    } else {
+                        log::info!("  → registered shared mem at {:#x} with CPU", region.base);
+                    }
+                }
+            }
+        }
     }
 
     if let Some(cpu) = &mut kernel.cpu {

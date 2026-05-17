@@ -19,11 +19,23 @@ const LIFO_HEADER_SIZE: usize = 0x20;
 const LIFO_STORAGE_ELEM_SIZE: usize = 0x30;
 const LIFO_STORAGE_COUNT: usize = 17;
 
+const DEVICE_TYPE_OFFSET: usize = 0x41B8;
+const SYSTEM_PROPERTIES_OFFSET: usize = 0x41C0;
+const BATTERY_LEVEL_OFFSET: usize = 0x41CC;
+
+const DEVICE_TYPE_FULLKEY: u32 = 1 << 0;
+const DEVICE_TYPE_HANDHELD_LEFT: u32 = 1 << 2;
+const DEVICE_TYPE_HANDHELD_RIGHT: u32 = 1 << 3;
+
 pub const STYLE_FULLKEY: u32 = 1 << 0;
 pub const STYLE_HANDHELD: u32 = 1 << 1;
 
 pub const ATTR_IS_CONNECTED: u32 = 1 << 0;
 pub const ATTR_IS_WIRED: u32 = 1 << 1;
+pub const ATTR_IS_LEFT_CONNECTED: u32 = 1 << 2;
+pub const ATTR_IS_LEFT_WIRED: u32 = 1 << 3;
+pub const ATTR_IS_RIGHT_CONNECTED: u32 = 1 << 4;
+pub const ATTR_IS_RIGHT_WIRED: u32 = 1 << 5;
 
 pub const NPAD_BUTTON_A: u64 = 1 << 0;
 pub const NPAD_BUTTON_B: u64 = 1 << 1;
@@ -79,11 +91,22 @@ impl HidState {
     }
 
     fn init_metadata(&self, buf: &mut [u8]) {
-        for &entry_idx in &[NPAD_ENTRY_PLAYER1, NPAD_ENTRY_HANDHELD] {
+        let configs = [
+            (NPAD_ENTRY_PLAYER1, STYLE_FULLKEY | STYLE_HANDHELD, DEVICE_TYPE_FULLKEY),
+            (NPAD_ENTRY_HANDHELD, STYLE_HANDHELD, DEVICE_TYPE_HANDHELD_LEFT | DEVICE_TYPE_HANDHELD_RIGHT),
+        ];
+        for (entry_idx, style, device_type) in configs {
             let base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
-            let style = STYLE_FULLKEY | STYLE_HANDHELD;
             write_u32(buf, base + NPAD_STYLE_TAG_OFFSET, style);
             write_u32(buf, base + NPAD_JOY_ASSIGN_OFFSET, 0);
+            write_u32(buf, base + DEVICE_TYPE_OFFSET, device_type);
+
+            let sys_props: u64 = (1u64 << 9) | (1u64 << 10) | (1u64 << 11) | (1u64 << 12);
+            write_u64(buf, base + SYSTEM_PROPERTIES_OFFSET, sys_props);
+
+            write_u32(buf, base + BATTERY_LEVEL_OFFSET, 4);
+            write_u32(buf, base + BATTERY_LEVEL_OFFSET + 4, 4);
+            write_u32(buf, base + BATTERY_LEVEL_OFFSET + 8, 4);
         }
     }
 
@@ -118,7 +141,10 @@ impl HidState {
         write_i32(buf, state + 0x14, self.input.stick_l_y);
         write_i32(buf, state + 0x18, self.input.stick_r_x);
         write_i32(buf, state + 0x1C, self.input.stick_r_y);
-        write_u32(buf, state + 0x20, ATTR_IS_CONNECTED | ATTR_IS_WIRED);
+        let attrs = ATTR_IS_CONNECTED | ATTR_IS_WIRED
+            | ATTR_IS_LEFT_CONNECTED | ATTR_IS_LEFT_WIRED
+            | ATTR_IS_RIGHT_CONNECTED | ATTR_IS_RIGHT_WIRED;
+        write_u32(buf, state + 0x20, attrs);
         write_u32(buf, state + 0x24, 0);
 
         for i in 1..LIFO_STORAGE_COUNT {
