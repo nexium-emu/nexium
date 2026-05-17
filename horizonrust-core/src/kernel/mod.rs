@@ -121,8 +121,15 @@ impl Kernel {
 
         if self.pending_frames.is_empty() && self.cycle_count >= self.next_vsync_cycle {
             self.next_vsync_cycle = self.cycle_count + 1_000_000;
-            let frame = self.synthesize_test_frame();
-            self.pending_frames.push(frame);
+            let addr_space = self.address_space.clone();
+            if let Some(qf) = self.nvdrv.try_capture_sdl_surface(|addr, buf| addr_space.read(addr, buf).is_ok()) {
+                self.pending_frames.push(FrameOut {
+                    width: qf.width, height: qf.height, pixels: qf.pixels,
+                });
+            } else {
+                let frame = self.synthesize_test_frame();
+                self.pending_frames.push(frame);
+            }
         }
 
         std::mem::take(&mut self.pending_frames)

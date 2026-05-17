@@ -562,6 +562,62 @@ impl Nvdrv {
         }
     }
 
+    pub fn try_capture_sdl_surface(&self, mem_read: impl Fn(u64, &mut [u8]) -> bool) -> Option<QueuedFrame> {
+        const CANDIDATES: &[(u32, u32, u32)] = &[
+            (1280, 720, 1280),
+            (1280, 720, 1280),
+            (1280, 768, 1280),
+            (1920, 1080, 1920),
+            (640, 360, 640),
+            (854, 480, 854),
+            (427, 240, 427),
+            (480, 270, 480),
+        ];
+
+        for handle in self.nvmap_handles.values() {
+            if handle.address == 0 || handle.size == 0 {
+                continue;
+            }
+            let Some(&(w, h, stride)) = CANDIDATES.iter().find(|(_w, hh, stride)| (*stride as u32) * (*hh as u32) * 4 == handle.size as u32) else {
+                continue;
+            };
+
+            let mut linear = vec![0u8; handle.size as usize];
+            if !mem_read(handle.address, &mut linear) {
+                continue;
+            }
+
+            let nz = linear.iter().filter(|b| **b != 0).count();
+            if nz < 256 {
+                continue;
+            }
+
+            for px in linear.chunks_exact_mut(4) {
+                px[3] = 0xFF;
+            }
+
+            log::info!("captured SDL surface from nvmap_id={} addr={:#x} {}x{} stride={} (nz={})",
+                handle.id, handle.address, w, h, stride, nz);
+
+            let dst_w = 1280u32;
+            let dst_h = 720u32;
+            let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
+            for dy in 0..dst_h {
+                let sy = dy * h / dst_h;
+                for dx in 0..dst_w {
+                    let sx = dx * w / dst_w;
+                    let s = ((sy * stride + sx) * 4) as usize;
+                    let d = ((dy * dst_w + dx) * 4) as usize;
+                    if s + 4 <= linear.len() {
+                        out[d..d + 4].copy_from_slice(&linear[s..s + 4]);
+                    }
+                }
+            }
+            return Some(QueuedFrame { width: dst_w, height: dst_h, pixels: out });
+        }
+        None
+    }
+
     pub fn gpu_draw_count(&self) -> u64 {
         self.gpu.maxwell3d.lock().draw_count()
     }
