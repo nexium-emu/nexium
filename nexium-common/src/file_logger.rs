@@ -14,11 +14,9 @@ pub struct FileLogger {
 
 impl FileLogger {
     pub fn new(capacity: usize) -> Result<(Self, Arc<Mutex<VecDeque<String>>>), String> {
-        let log_dir = directories::ProjectDirs::from("", "", "NeXium")
-            .ok_or_else(|| "Failed to get project directories".to_string())?
-            .data_dir()
-            .parent()
-            .ok_or_else(|| "Failed to get data parent".to_string())?
+        let log_dir = directories::BaseDirs::new()
+            .ok_or_else(|| "Failed to get base directories".to_string())?
+            .config_dir()
             .join("NeXium")
             .join("logs");
 

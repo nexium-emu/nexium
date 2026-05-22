@@ -123,8 +123,8 @@ impl Default for ControllerConfig {
 
 impl ControllerConfig {
     pub fn config_path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("com", "NeXium", "NeXium")
-            .map(|d| d.config_dir().join("controller.json"))
+        directories::BaseDirs::new()
+            .map(|d| d.config_dir().join("NeXium").join("controller.json"))
     }
 
     pub fn load() -> Self {

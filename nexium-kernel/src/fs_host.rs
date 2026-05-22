@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub fn sdmc_root() -> PathBuf {
-    if let Some(dirs) = directories::ProjectDirs::from("com", "NeXium", "NeXium") {
-        let root = dirs.data_dir().join("sdmc");
+    if let Some(dirs) = directories::BaseDirs::new() {
+        let root = dirs.config_dir().join("NeXium").join("sdmc");
         let _ = std::fs::create_dir_all(&root);
         return root;
     }
