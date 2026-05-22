@@ -148,21 +148,35 @@ fn svc_map_memory(kernel: &mut Kernel) -> u32 {
     }
 
     let map_rc = kernel.address_space.map(dst, size, nexium_memory::Perm::RW, "stack_mirror");
-    match map_rc {
-        Ok(_) => {
-            let mut buf = vec![0u8; size as usize];
-            if kernel.address_space.read(src, &mut buf).is_ok() {
-                let _ = kernel.address_space.write(dst, &buf);
+    let was_new = map_rc.is_ok();
+
+    let mut buf = vec![0u8; size as usize];
+    if kernel.address_space.read(src, &mut buf).is_ok() {
+        let _ = kernel.address_space.write(dst, &buf);
+    }
+
+    if was_new {
+        if let Some(region) = kernel.address_space.host_region_at(dst) {
+            if let Some(cpu) = &mut kernel.cpu {
+                let plumb = unsafe {
+                    cpu.map_host(region.base, region.size, region.perm, region.host_ptr as *mut u8)
+                };
+                match plumb {
+                    Ok(_) => log::info!(
+                        "svcMapMemory dst={:#x} src={:#x} size={:#x} → mapped + copied + plumbed to dynarmic",
+                        dst, src, size
+                    ),
+                    Err(e) => log::warn!(
+                        "svcMapMemory dst={:#x} size={:#x} mapped in AS but dynarmic map_host failed: {}",
+                        dst, size, e
+                    ),
+                }
             }
-            log::info!("svcMapMemory dst={:#x} src={:#x} size={:#x} → mapped + copied", dst, src, size);
+        } else {
+            log::warn!("svcMapMemory dst={:#x}: AS region lookup failed after map()", dst);
         }
-        Err(e) => {
-            log::debug!("svcMapMemory dst={:#x} src={:#x} size={:#x} → already mapped or overlap ({:?}), copying contents only", dst, src, size, e);
-            let mut buf = vec![0u8; size as usize];
-            if kernel.address_space.read(src, &mut buf).is_ok() {
-                let _ = kernel.address_space.write(dst, &buf);
-            }
-        }
+    } else if let Err(e) = map_rc {
+        log::debug!("svcMapMemory dst={:#x} src={:#x} size={:#x} → already mapped ({:?}), refreshed contents only", dst, src, size, e);
     }
 
     if let Some(cpu) = &mut kernel.cpu {

@@ -11,11 +11,16 @@ unsafe impl Sync for SharedDynarmic {}
 #[derive(Clone)]
 pub struct HaltHandle {
     inner: Arc<dyn Fn() + Send + Sync>,
+    peek: Arc<dyn Fn() -> (u64, u64, u64) + Send + Sync>,
 }
 
 impl HaltHandle {
     pub fn halt(&self) {
         (self.inner)();
+    }
+
+    pub fn peek_pc_lr_sp(&self) -> (u64, u64, u64) {
+        (self.peek)()
     }
 }
 
@@ -131,9 +136,16 @@ impl DynarmicCpu {
 
     pub fn halt_handle(&self) -> HaltHandle {
         let emu = Arc::clone(&self.emu);
+        let emu_peek = Arc::clone(&self.emu);
         HaltHandle {
             inner: Arc::new(move || {
                 let _ = emu.emu.emu_stop();
+            }),
+            peek: Arc::new(move || {
+                let pc = emu_peek.emu.reg_read_pc().unwrap_or(0);
+                let lr = emu_peek.emu.reg_read_lr().unwrap_or(0);
+                let sp = emu_peek.emu.reg_read_sp().unwrap_or(0);
+                (pc, lr, sp)
             }),
         }
     }

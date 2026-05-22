@@ -156,6 +156,7 @@ impl EmulationHandle {
                 let _ = thread::Builder::new()
                     .name("nexium-cpu-watchdog".into())
                     .spawn(move || {
+                        let mut peek_counter: u64 = 0;
                         while !watchdog_stop_wd.load(Ordering::Relaxed) {
                             thread::sleep(std::time::Duration::from_millis(5));
                             let last = last_svc_ms_wd.load(Ordering::Relaxed);
@@ -163,6 +164,14 @@ impl EmulationHandle {
                                 continue;
                             }
                             if now_millis().saturating_sub(last) > 20 {
+                                let (pc, lr, sp) = halt.peek_pc_lr_sp();
+                                peek_counter += 1;
+                                if peek_counter % 25 == 1 {
+                                    log::warn!(
+                                        "[watchdog-peek #{}] pc={:#x} lr={:#x} sp={:#x}",
+                                        peek_counter, pc, lr, sp
+                                    );
+                                }
                                 halt.halt();
                                 watchdog_halts_wd.fetch_add(1, Ordering::Relaxed);
                                 last_svc_ms_wd.store(now_millis(), Ordering::Relaxed);
@@ -193,7 +202,21 @@ impl EmulationHandle {
             let mut last_heartbeat_cycles = 0u64;
             let mut last_pipeline_stats = boot_ctx.kernel.nvdrv.stats.snapshot();
 
+            let mut loop_iter: u64 = 0;
+            let mut last_loop_log = std::time::Instant::now();
             loop {
+                loop_iter += 1;
+                if last_loop_log.elapsed() >= std::time::Duration::from_secs(1) {
+                    let cur = boot_ctx.kernel.threads.current_handle();
+                    let pc_now = boot_ctx.kernel.cpu.as_ref().map(|c| c.get_pc()).unwrap_or(0);
+                    let halts = watchdog_halts.load(Ordering::Relaxed);
+                    log::warn!(
+                        "[loop-tick] iter={} svc={} cyc={} cur={:?} pc={:#x} halts={}",
+                        loop_iter, svc_count, cycle_count, cur, pc_now, halts
+                    );
+                    last_loop_log = std::time::Instant::now();
+                }
+
                 if stop_flag_clone.load(Ordering::Relaxed) {
                     log::info!("Stopping emulation");
                     break;
