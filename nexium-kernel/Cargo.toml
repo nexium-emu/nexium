@@ -31,6 +31,7 @@ crossbeam.workspace = true
 log.workspace = true
 thiserror.workspace = true
 once_cell.workspace = true
+memmap2.workspace = true
 
 sdl2.workspace = true
 directories.workspace = true

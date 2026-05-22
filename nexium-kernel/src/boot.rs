@@ -65,12 +65,8 @@ impl BootContext {
         address_space.write(exit_stub_va, &svc_exit_insn.to_le_bytes())
             .map_err(|e| format!("Failed to write exit stub: {:?}", e))?;
 
-        log::info!("Loading NRO file into memory at code_base");
-        let nro_file = std::fs::read(&config.nro_path)
-            .map_err(|e| format!("Failed to read NRO file: {}", e))?;
-
-        log::info!("  Writing NRO file ({} bytes) at {:#x}", nro_file.len(), code_base);
-        address_space.write(code_base, &nro_file)
+        log::info!("  Writing NRO ({} bytes) at {:#x} from mmap", nro.bytes().len(), code_base);
+        address_space.write(code_base, nro.bytes())
             .map_err(|e| format!("Failed to write NRO file: {:?}", e))?;
 
         let tls_pool_base: u64 = env_base + 0x10000;
@@ -85,7 +81,8 @@ impl BootContext {
             tls_base,
             tls_pool_base,
         );
-        kernel.nro_romfs = nro.romfs.clone();
+        kernel.nro_mmap = Some(nro.mmap_arc());
+        kernel.nro_romfs_range = nro.romfs_range();
 
         log::info!("  Initializing environment block @ {:#x}", env_base);
         let env_builder = nexium_loader::EnvBlockBuilder::new()

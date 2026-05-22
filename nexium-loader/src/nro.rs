@@ -1,5 +1,8 @@
 use std::io::Read;
+use std::ops::Range;
+use std::sync::Arc;
 use byteorder::{LittleEndian, ReadBytesExt};
+use memmap2::Mmap;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -72,48 +75,95 @@ impl NroHeader {
     }
 }
 
-pub struct NroSegment {
+#[derive(Debug, Clone)]
+pub struct NroSegmentView {
     pub offset: u32,
     pub size: u32,
-    pub data: Vec<u8>,
+    pub mmap_range: Range<usize>,
 }
 
 pub struct Nro {
     pub header: NroHeader,
-    pub text: NroSegment,
-    pub ro: NroSegment,
-    pub data: NroSegment,
+    pub text: NroSegmentView,
+    pub ro: NroSegmentView,
+    pub data: NroSegmentView,
     pub bss_size: u32,
-    pub romfs: Vec<u8>,
+    mmap: Arc<Mmap>,
+    nro_offset: usize,
+    romfs_range: Option<Range<usize>>,
 }
 
 impl Nro {
-    fn unwrap_homebrew(data: &[u8]) -> Result<Vec<u8>, String> {
-        if data.len() < 16 {
-            return Ok(data.to_vec());
-        }
-
-        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        if magic == 0x304F524E {
-            return Ok(data.to_vec());
-        }
-
-        if data.len() >= 32 {
-            let magic_at_16 = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-            if magic_at_16 == 0x304F524E {
-                log::debug!("Detected homebrew wrapper, skipping 16-byte header");
-                return Ok(data[16..].to_vec());
-            }
-        }
-
-        Ok(data.to_vec())
+    pub fn bytes(&self) -> &[u8] {
+        &self.mmap[..]
     }
 
-    pub fn parse(data: &[u8]) -> Result<Self, String> {
-        let nro_data = Self::unwrap_homebrew(data)?;
-        let header = NroHeader::from_bytes(&nro_data)?;
+    pub fn nro_bytes(&self) -> &[u8] {
+        &self.mmap[self.nro_offset..]
+    }
 
-        log::debug!("NRO: magic={:#x}, version={}, size={}", header.magic, header.version, header.size);
+    pub fn romfs(&self) -> &[u8] {
+        match &self.romfs_range {
+            Some(r) => &self.mmap[r.clone()],
+            None => &[],
+        }
+    }
+
+    pub fn mmap_arc(&self) -> Arc<Mmap> {
+        self.mmap.clone()
+    }
+
+    pub fn romfs_range(&self) -> Option<Range<usize>> {
+        self.romfs_range.clone()
+    }
+
+    pub fn text_data(&self) -> &[u8] {
+        &self.mmap[self.text.mmap_range.clone()]
+    }
+
+    pub fn ro_data(&self) -> &[u8] {
+        &self.mmap[self.ro.mmap_range.clone()]
+    }
+
+    pub fn data_data(&self) -> &[u8] {
+        &self.mmap[self.data.mmap_range.clone()]
+    }
+
+    fn detect_nro_offset(mmap: &Mmap) -> Result<usize, String> {
+        if mmap.len() < 16 {
+            return Err("file too small to contain NRO".to_string());
+        }
+        let magic0 = u32::from_le_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]);
+        if magic0 == 0x304F524E {
+            return Ok(0);
+        }
+        if mmap.len() >= 32 {
+            let magic16 = u32::from_le_bytes([mmap[16], mmap[17], mmap[18], mmap[19]]);
+            if magic16 == 0x304F524E {
+                log::debug!("Detected homebrew wrapper, NRO body starts at offset 16");
+                return Ok(16);
+            }
+        }
+        Err("no NRO magic at offset 0 or 16".to_string())
+    }
+
+    pub fn load_from_file(path: &str) -> Result<Self, String> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("Failed to open NRO: {}", e))?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| format!("Failed to mmap NRO: {}", e))?;
+        Self::parse_mmap(Arc::new(mmap))
+    }
+
+    pub fn parse_mmap(mmap: Arc<Mmap>) -> Result<Self, String> {
+        let nro_offset = Self::detect_nro_offset(&mmap)?;
+        let nro_slice = &mmap[nro_offset..];
+        let header = NroHeader::from_bytes(nro_slice)?;
+
+        log::debug!(
+            "NRO: magic={:#x}, version={}, size={}, file_offset={}",
+            header.magic, header.version, header.size, nro_offset
+        );
 
         const HEADER_SIZE: u32 = 128;
         let text_offset = if header.text_offset < HEADER_SIZE { header.text_offset + HEADER_SIZE } else { header.text_offset };
@@ -125,76 +175,61 @@ impl Nro {
                    ro_offset, ro_offset + header.ro_size,
                    data_offset, data_offset + header.data_size);
 
-        if text_offset + header.text_size > nro_data.len() as u32 {
+        if (text_offset + header.text_size) as usize > nro_slice.len() {
             return Err("Text segment out of bounds".to_string());
         }
-        if ro_offset + header.ro_size > nro_data.len() as u32 {
+        if (ro_offset + header.ro_size) as usize > nro_slice.len() {
             return Err("RO segment out of bounds".to_string());
         }
-        if data_offset + header.data_size > nro_data.len() as u32 {
+        if (data_offset + header.data_size) as usize > nro_slice.len() {
             return Err("Data segment out of bounds".to_string());
         }
 
-        let text = NroSegment {
+        let text = NroSegmentView {
             offset: text_offset,
             size: header.text_size,
-            data: nro_data[text_offset as usize..(text_offset + header.text_size) as usize].to_vec(),
+            mmap_range: (nro_offset + text_offset as usize)..(nro_offset + (text_offset + header.text_size) as usize),
         };
-
-        let ro = NroSegment {
+        let ro = NroSegmentView {
             offset: ro_offset,
             size: header.ro_size,
-            data: nro_data[ro_offset as usize..(ro_offset + header.ro_size) as usize].to_vec(),
+            mmap_range: (nro_offset + ro_offset as usize)..(nro_offset + (ro_offset + header.ro_size) as usize),
         };
-
-        let data_seg = NroSegment {
+        let data = NroSegmentView {
             offset: data_offset,
             size: header.data_size,
-            data: nro_data[data_offset as usize..(data_offset + header.data_size) as usize].to_vec(),
+            mmap_range: (nro_offset + data_offset as usize)..(nro_offset + (data_offset + header.data_size) as usize),
         };
 
-        let romfs = parse_asset_romfs(data, header.size);
+        let romfs_range = parse_asset_romfs(&mmap, header.size);
 
         Ok(Nro {
             header,
             text,
             ro,
-            data: data_seg,
+            data,
             bss_size: header.bss_size,
-            romfs,
+            mmap,
+            nro_offset,
+            romfs_range,
         })
-    }
-
-    pub fn load_from_file(path: &str) -> Result<Self, String> {
-        let data = std::fs::read(path)
-            .map_err(|e| format!("Failed to read file: {}", e))?;
-        Self::parse(&data)
     }
 
     pub fn total_memory_size(&self) -> u64 {
         (self.text.size + self.ro.size + self.data.size + self.bss_size) as u64
     }
-
-    pub fn get_section(&self, name: &str) -> Option<&NroSegment> {
-        match name {
-            "text" => Some(&self.text),
-            "ro" => Some(&self.ro),
-            "data" => Some(&self.data),
-            _ => None,
-        }
-    }
 }
 
-fn parse_asset_romfs(nro_data: &[u8], nro_size: u32) -> Vec<u8> {
+fn parse_asset_romfs(mmap: &Mmap, nro_size: u32) -> Option<Range<usize>> {
     let asset_start = nro_size as usize;
-    if nro_data.len() < asset_start + 56 {
-        return Vec::new();
+    if mmap.len() < asset_start + 56 {
+        return None;
     }
-    let asset = &nro_data[asset_start..];
+    let asset = &mmap[asset_start..];
     let magic = u32::from_le_bytes([asset[0], asset[1], asset[2], asset[3]]);
     if magic != 0x54_45_53_41 {
         log::debug!("NRO: no ASET section (magic={:#x})", magic);
-        return Vec::new();
+        return None;
     }
     let romfs_off = u64::from_le_bytes([
         asset[40], asset[41], asset[42], asset[43],
@@ -206,14 +241,14 @@ fn parse_asset_romfs(nro_data: &[u8], nro_size: u32) -> Vec<u8> {
     ]) as usize;
     if romfs_size == 0 {
         log::debug!("NRO: ASET section present but romfs size is 0");
-        return Vec::new();
+        return None;
     }
     let abs_start = asset_start + romfs_off;
     let abs_end = abs_start + romfs_size;
-    if abs_end > nro_data.len() {
-        log::warn!("NRO: romfs section [{:#x}..{:#x}) exceeds NRO size {:#x}", abs_start, abs_end, nro_data.len());
-        return Vec::new();
+    if abs_end > mmap.len() {
+        log::warn!("NRO: romfs section [{:#x}..{:#x}) exceeds mmap size {:#x}", abs_start, abs_end, mmap.len());
+        return None;
     }
-    log::info!("NRO: extracted romfs ({} bytes) at file offset {:#x}", romfs_size, abs_start);
-    nro_data[abs_start..abs_end].to_vec()
+    log::info!("NRO: romfs ({} bytes) at file offset {:#x} (zero-copy slice)", romfs_size, abs_start);
+    Some(abs_start..abs_end)
 }

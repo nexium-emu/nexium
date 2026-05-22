@@ -990,7 +990,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                     read_in[8], read_in[9], read_in[10], read_in[11],
                     read_in[12], read_in[13], read_in[14], read_in[15],
                 ]);
-                let romfs = &kernel.nro_romfs;
+                let romfs = kernel.nro_romfs();
                 let target = ctx.recv_buffers.iter()
                     .find(|b| b.size > 0 && b.addr != 0)
                     .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0))
@@ -1008,7 +1008,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
             4 => {
-                let size = kernel.nro_romfs.len() as i64;
+                let size = kernel.nro_romfs().len() as i64;
                 log::debug!("IFsStorage.GetSize → {}", size);
                 return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
             }

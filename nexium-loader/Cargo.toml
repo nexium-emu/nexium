@@ -10,3 +10,4 @@ nexium-memory.workspace = true
 
 log.workspace = true
 byteorder.workspace = true
+memmap2.workspace = true

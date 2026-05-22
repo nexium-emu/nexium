@@ -61,7 +61,8 @@ pub struct Kernel {
     pub notification_event: Option<u32>,
     pub acquired_sleep_lock_event: Option<u32>,
 
-    pub nro_romfs: Vec<u8>,
+    pub nro_mmap: Option<Arc<memmap2::Mmap>>,
+    pub nro_romfs_range: Option<std::ops::Range<usize>>,
 }
 
 impl Kernel {
@@ -124,7 +125,15 @@ impl Kernel {
             friend_invitation_event: None,
             notification_event: None,
             acquired_sleep_lock_event: None,
-            nro_romfs: Vec::new(),
+            nro_mmap: None,
+            nro_romfs_range: None,
+        }
+    }
+
+    pub fn nro_romfs(&self) -> &[u8] {
+        match (&self.nro_mmap, &self.nro_romfs_range) {
+            (Some(mmap), Some(range)) => &mmap[range.clone()],
+            _ => &[],
         }
     }
 

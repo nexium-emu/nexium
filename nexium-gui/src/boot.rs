@@ -182,6 +182,7 @@ impl EmulationHandle {
             let max_cycles = u64::MAX;
             let mut cycle_count = 0u64;
             let mut svc_count = 0u32;
+            let mut stuck_log_counter: u64 = 0;
             let mut pc_check_count = 0u32;
             let mut stuck_pc: Option<u64> = None;
             let mut stuck_count = 0u32;
@@ -339,6 +340,32 @@ impl EmulationHandle {
                                 nexium_core::kernel::threads::ThreadState::Ready,
                             );
                             log::info!("[preempt] halted in libnx pc={:#x}, yielded handle={:?}, ready_q={} total={}", pc_after, from, n_ready, n_threads);
+                        } else {
+                            stuck_log_counter += 1;
+                            if stuck_log_counter % 50 == 1 {
+                                let cur = boot_ctx.kernel.threads.current_handle();
+                                let lr = cpu.get_register(30);
+                                let x0 = cpu.get_register(0);
+                                let x1 = cpu.get_register(1);
+                                let x8 = cpu.get_register(8);
+                                let x16 = cpu.get_register(16);
+                                let x19 = cpu.get_register(19);
+                                let x20 = cpu.get_register(20);
+                                let mut instr = [0u8; 16];
+                                let _ = boot_ctx.kernel.address_space.read(pc_after, &mut instr);
+                                let i0 = u32::from_le_bytes([instr[0], instr[1], instr[2], instr[3]]);
+                                let i1 = u32::from_le_bytes([instr[4], instr[5], instr[6], instr[7]]);
+                                let i2 = u32::from_le_bytes([instr[8], instr[9], instr[10], instr[11]]);
+                                let i3 = u32::from_le_bytes([instr[12], instr[13], instr[14], instr[15]]);
+                                let n_threads_total = boot_ctx.kernel.threads.threads.len();
+                                let states: Vec<String> = boot_ctx.kernel.threads.threads.iter()
+                                    .map(|(h, t)| format!("{:#x}={:?}", h, std::mem::discriminant(&t.state)))
+                                    .collect();
+                                log::warn!(
+                                    "[stuck-cpu #{}] handle={:?} pc={:#x} lr={:#x} x0={:#x} x1={:#x} x8={:#x} x16={:#x} x19={:#x} x20={:#x} insn=[{:#010x} {:#010x} {:#010x} {:#010x}] threads={} states=[{}]",
+                                    stuck_log_counter, cur, pc_after, lr, x0, x1, x8, x16, x19, x20, i0, i1, i2, i3, n_threads_total, states.join(",")
+                                );
+                            }
                         }
                     }
                     let _ = no_svc_in_spin;
