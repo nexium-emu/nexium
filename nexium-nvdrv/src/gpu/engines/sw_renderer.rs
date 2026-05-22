@@ -522,12 +522,6 @@ fn read_u16(mem_read: &dyn Fn(u64, &mut [u8]) -> bool, addr: u64) -> u16 {
     u16::from_le_bytes(buf)
 }
 
-fn read_u32(mem_read: &dyn Fn(u64, &mut [u8]) -> bool, addr: u64) -> u32 {
-    let mut buf = [0u8; 4];
-    mem_read(addr, &mut buf);
-    u32::from_le_bytes(buf)
-}
-
 struct Vertex {
     x: f32,
     y: f32,

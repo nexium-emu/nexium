@@ -2,7 +2,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub fn sdmc_root() -> PathBuf {

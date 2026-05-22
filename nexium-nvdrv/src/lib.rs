@@ -498,10 +498,6 @@ impl Nvdrv {
         IoctlOutcome::ok(out)
     }
 
-    fn nvhost_gpu_ioctl(&mut self, cmd: u16, req: &IoctlRequest) -> IoctlOutcome {
-        self.nvhost_gpu_ioctl_with_mem(cmd, req, &|_, _| false, &|_, _| false)
-    }
-
     fn nvhost_gpu_ioctl_with_mem(&mut self, cmd: u16, req: &IoctlRequest, mem_read: &dyn Fn(u64, &mut [u8]) -> bool, mem_write: &dyn Fn(u64, &[u8]) -> bool) -> IoctlOutcome {
         let mut out = vec![0u8; req.out_size];
         let n = req.in_data.len().min(out.len());

@@ -559,47 +559,6 @@ impl Maxwell3D {
         });
     }
 
-    fn push_draw_texture(&mut self, texture_id: u32, sampler_id: u32) {
-        let tic_pool_gpu_va = ((self.regs.tic_pool_va_hi as u64) << 32) | self.regs.tic_pool_va_lo as u64;
-        self.regs.draw_count += 1;
-        self.regs.draw_texture_count += 1;
-        self.pending_draws.push(DrawCall {
-            topology: 0,
-            first_vertex: 0,
-            vertex_count: 0,
-            indexed: false,
-            index_count: 0,
-            rt: self.regs.rt,
-            vertex_buffers: self.regs.vertex_buffers,
-            vertex_attribs: self.regs.vertex_attribs,
-            viewport: self.regs.viewport,
-            clear_color: self.regs.clear_color,
-            is_clear: false,
-            draw_texture: Some(DrawTextureCall {
-                dst_x: self.regs.draw_texture_dst_x,
-                dst_y: self.regs.draw_texture_dst_y,
-                dst_width: self.regs.draw_texture_dst_width,
-                dst_height: self.regs.draw_texture_dst_height,
-                texture_id,
-                sampler_id,
-                tic_pool_gpu_va,
-                tic_pool_limit: self.regs.tic_pool_limit,
-            }),
-            tic_pool_gpu_va,
-            tic_pool_limit: self.regs.tic_pool_limit,
-            last_constbuf_addr: self.regs.last_constbuf_addr,
-            last_constbuf_size: self.regs.last_constbuf_size,
-            fs_bindless_cb_addr: self.regs.cbuf_binds[4][15].0,
-            fs_bindless_cb_size: self.regs.cbuf_binds[4][15].1,
-            fs_shader_gpu_va: {
-                let region = ((self.regs.program_region_va_hi as u64) << 32)
-                    | self.regs.program_region_va_lo as u64;
-                let fs = &self.regs.shader_programs[5];
-                if fs.address_lo != 0 { region.wrapping_add(fs.address_lo as u64) } else { 0 }
-            },
-        });
-    }
-
     pub fn render_target(&self, idx: usize) -> Option<&RenderTarget> {
         self.regs.rt.get(idx).filter(|rt| rt.width > 0 && rt.height > 0)
     }
