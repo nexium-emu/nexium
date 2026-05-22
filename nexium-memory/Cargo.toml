@@ -1,0 +1,13 @@
+[package]
+name = "nexium-memory"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+parking_lot.workspace = true
+bitflags.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true

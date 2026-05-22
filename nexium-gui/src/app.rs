@@ -1,0 +1,832 @@
+use eframe::egui;
+use eframe::egui::{
+    Color32, FontId, Rounding, Sense, Stroke, Vec2,
+};
+use gilrs::Gilrs;
+use std::sync::Arc;
+use crate::boot::EmulationHandle;
+use crate::input::InputSnapshot;
+use crate::debugger::DebuggerState;
+use crate::performance::PerformanceMonitor;
+use crate::controller_config::{ControllerConfig, SwitchButton};
+use crate::app_settings::{AppSettings, LogLevel};
+
+const BG:        Color32 = Color32::from_rgb(0x0F, 0x0F, 0x11);
+const BG_RAISED: Color32 = Color32::from_rgb(0x18, 0x18, 0x1C);
+const BG_INPUT:  Color32 = Color32::from_rgb(0x20, 0x20, 0x26);
+const BORDER:    Color32 = Color32::from_rgb(0x2A, 0x2A, 0x32);
+const ACCENT:    Color32 = Color32::from_rgb(0xE0, 0x2A, 0x2A);
+const ACCENT_HV: Color32 = Color32::from_rgb(0xF0, 0x3C, 0x3C);
+const TEXT:      Color32 = Color32::from_rgb(0xEC, 0xEC, 0xF0);
+const MUTED:     Color32 = Color32::from_rgb(0x70, 0x70, 0x80);
+const GREEN:     Color32 = Color32::from_rgb(0x3C, 0xD4, 0x5C);
+const AMBER:     Color32 = Color32::from_rgb(0xF5, 0xA6, 0x23);
+
+pub struct HorizonApp {
+    nro_path: String,
+    emulation_handle: Option<EmulationHandle>,
+    game_texture: Option<egui::TextureHandle>,
+    show_settings: bool,
+    settings_tab: SettingsTab,
+    gilrs: Option<Gilrs>,
+    last_input: InputSnapshot,
+    debugger: DebuggerState,
+    performance: PerformanceMonitor,
+    log_buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    controller_config: ControllerConfig,
+    rebinding: Option<SwitchButton>,
+    app_settings: AppSettings,
+    last_buttons_logged: u64,
+    last_sticks_logged: [i32; 4],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    General,
+    Controller,
+    Logging,
+}
+
+impl HorizonApp {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        log_buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+        nro_arg: Option<String>,
+    ) -> Self {
+        Self::apply_theme(&cc.egui_ctx);
+        let gilrs = Gilrs::new().ok().or_else(|| { log::warn!("Gilrs init failed"); None });
+        let nro_path = nro_arg.unwrap_or_default();
+        let mut app = Self {
+            nro_path: nro_path.clone(),
+            emulation_handle: None,
+            game_texture: None,
+            show_settings: false,
+            settings_tab: SettingsTab::General,
+            gilrs,
+            last_input: InputSnapshot::default(),
+            debugger: DebuggerState::new(),
+            performance: PerformanceMonitor::new(),
+            log_buffer,
+            controller_config: ControllerConfig::load(),
+            rebinding: None,
+            app_settings: AppSettings::load(),
+            last_buttons_logged: 0,
+            last_sticks_logged: [0; 4],
+        };
+        if !nro_path.is_empty() {
+            if let Ok(handle) = EmulationHandle::new(&nro_path) {
+                app.emulation_handle = Some(handle);
+                log::info!("Auto-loaded NRO: {}", nro_path);
+            } else {
+                log::error!("Failed to load NRO: {}", nro_path);
+            }
+        }
+        app
+    }
+
+    fn apply_theme(ctx: &egui::Context) {
+        let mut s = (*ctx.style()).clone();
+        s.visuals.dark_mode = true;
+        s.visuals.panel_fill = BG;
+        s.visuals.window_fill = BG_RAISED;
+        s.visuals.faint_bg_color = BG_RAISED;
+        s.visuals.extreme_bg_color = BG;
+        s.visuals.override_text_color = Some(TEXT);
+        s.visuals.window_stroke = Stroke::new(1.0, BORDER);
+        s.visuals.window_rounding = Rounding::same(8.0);
+        s.visuals.menu_rounding = Rounding::same(6.0);
+        s.visuals.popup_shadow = egui::epaint::Shadow {
+            offset: Vec2::new(0.0, 6.0), blur: 16.0, spread: 0.0,
+            color: Color32::from_black_alpha(100),
+        };
+        for w in [
+            &mut s.visuals.widgets.noninteractive,
+            &mut s.visuals.widgets.inactive,
+            &mut s.visuals.widgets.hovered,
+            &mut s.visuals.widgets.active,
+            &mut s.visuals.widgets.open,
+        ] {
+            w.rounding = Rounding::same(4.0);
+        }
+        s.visuals.widgets.noninteractive.bg_fill = BG_RAISED;
+        s.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+        s.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, MUTED);
+        s.visuals.widgets.inactive.bg_fill = BG_INPUT;
+        s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+        s.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+        s.visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x28, 0x28, 0x30);
+        s.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x44, 0x44, 0x52));
+        s.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+        s.visuals.widgets.active.bg_fill = ACCENT;
+        s.visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+        s.visuals.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+        s.visuals.widgets.open.bg_fill = BG_INPUT;
+        s.visuals.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT);
+        s.visuals.selection.bg_fill = Color32::from_rgba_premultiplied(0xE0, 0x2A, 0x2A, 0x50);
+        s.spacing.item_spacing = Vec2::new(6.0, 4.0);
+        s.spacing.button_padding = Vec2::new(10.0, 5.0);
+        s.spacing.menu_margin = egui::Margin::same(6.0);
+        s.spacing.window_margin = egui::Margin::same(12.0);
+        ctx.set_style(s);
+    }
+
+    fn poll_frames(&mut self, ctx: &egui::Context) {
+        let Some(handle) = &self.emulation_handle else { return };
+        while let Ok(frame) = handle.frame_rx.try_recv() {
+            if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() { continue; }
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize], &frame.pixels,
+            );
+            match &mut self.game_texture {
+                Some(t) => t.set(img, egui::TextureOptions::NEAREST),
+                None => {
+                    self.game_texture = Some(
+                        ctx.load_texture("game_frame", img, egui::TextureOptions::NEAREST)
+                    );
+                }
+            }
+        }
+    }
+
+    fn boot_nro(&mut self) {
+        if self.nro_path.is_empty() { return; }
+        match EmulationHandle::new(&self.nro_path) {
+            Ok(h) => { self.emulation_handle = Some(h); self.game_texture = None; }
+            Err(e) => log::error!("Boot: {}", e),
+        }
+    }
+
+    fn stop_emulation(&mut self) {
+        if let Some(mut h) = self.emulation_handle.take() { h.stop(); }
+    }
+
+    fn is_running(&self) -> bool {
+        self.emulation_handle.as_ref().map_or(false, |h| h.is_running())
+    }
+}
+
+fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
+    let font = FontId::proportional(12.5);
+    let text_w = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font.clone(), TEXT).size().x);
+    let size = Vec2::new(text_w + 24.0, 26.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+
+    let (bg, text_col, stroke) = if filled {
+        let c = if resp.is_pointer_button_down_on() { Color32::from_rgb(0xBC, 0x20, 0x20) }
+                else if resp.hovered() { ACCENT_HV } else { ACCENT };
+        (c, Color32::WHITE, Stroke::NONE)
+    } else {
+        let c = if resp.hovered() { Color32::from_rgb(0x28, 0x28, 0x30) } else { Color32::TRANSPARENT };
+        let bc = if resp.hovered() { Color32::from_rgb(0x50, 0x50, 0x60) } else { BORDER };
+        (c, TEXT, Stroke::new(1.0, bc))
+    };
+
+    ui.painter().rect(rect, Rounding::same(5.0), bg, stroke);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, font, text_col);
+    resp
+}
+
+impl eframe::App for HorizonApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(ref mut g) = self.gilrs {
+            self.last_input = InputSnapshot::update_from_gamepad(g);
+        }
+
+        if self.rebinding.is_none() {
+            let pressed: Vec<String> = ctx.input(|i| {
+                let mut v = Vec::new();
+                for ev in &i.events {
+                    if let egui::Event::Key { key, pressed: true, .. } = ev {
+                        v.push(format!("{:?}", key));
+                    }
+                }
+                for k in [
+                    egui::Key::A, egui::Key::B, egui::Key::C, egui::Key::D, egui::Key::E, egui::Key::F,
+                    egui::Key::G, egui::Key::H, egui::Key::I, egui::Key::J, egui::Key::K, egui::Key::L,
+                    egui::Key::M, egui::Key::N, egui::Key::O, egui::Key::P, egui::Key::Q, egui::Key::R,
+                    egui::Key::S, egui::Key::T, egui::Key::U, egui::Key::V, egui::Key::W, egui::Key::X,
+                    egui::Key::Y, egui::Key::Z,
+                    egui::Key::Num0, egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
+                    egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
+                    egui::Key::ArrowUp, egui::Key::ArrowDown, egui::Key::ArrowLeft, egui::Key::ArrowRight,
+                    egui::Key::Enter, egui::Key::Tab, egui::Key::Space, egui::Key::Escape,
+                ] {
+                    if i.key_down(k) {
+                        let s = format!("{:?}", k);
+                        if !v.contains(&s) { v.push(s); }
+                    }
+                }
+                v
+            });
+
+            let (buttons, sticks) = self.controller_config.buttons_pressed(&pressed);
+            if buttons != self.last_buttons_logged || sticks != self.last_sticks_logged {
+                self.last_buttons_logged = buttons;
+                self.last_sticks_logged = sticks;
+                log::info!("input change: pressed={:?} buttons={:#x} sticks={:?}", pressed, buttons, sticks);
+            }
+            let state = nexium_core::hid_state::get_hid_state();
+            let mut hid = state.lock();
+            hid.update_input(nexium_core::hid_state::ControllerInput {
+                buttons,
+                stick_l_x: sticks[0],
+                stick_l_y: sticks[1],
+                stick_r_x: sticks[2],
+                stick_r_y: sticks[3],
+            });
+        }
+
+        self.poll_frames(ctx);
+
+        if self.emulation_handle.as_ref().map_or(false, |h| !h.is_running()) {
+            self.emulation_handle = None;
+        }
+
+        let fps = self.performance.get_fps();
+        let running = self.is_running();
+
+        egui::TopBottomPanel::top("topbar")
+            .exact_height(36.0)
+            .frame(egui::Frame::none()
+                .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
+                .stroke(Stroke::new(1.0, BORDER)))
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(12.0);
+
+                    ui.label(egui::RichText::new("NeXium")
+                        .size(13.5).strong().color(TEXT));
+
+                    ui.add_space(8.0);
+                    ui.painter().vline(
+                        ui.cursor().left(), ui.max_rect().y_range(),
+                        Stroke::new(1.0, BORDER),
+                    );
+                    ui.add_space(8.0);
+
+                    ui.menu_button(egui::RichText::new("File").size(13.0).color(TEXT), |ui| {
+                        if ui.button("Open NRO…").clicked() {
+                            if let Some(p) = rfd::FileDialog::new()
+                                .add_filter("Nintendo Homebrew", &["nro"]).pick_file() {
+                                self.nro_path = p.to_string_lossy().to_string();
+                            }
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Exit").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                    ui.menu_button(egui::RichText::new("Emulation").size(13.0).color(TEXT), |ui| {
+                        if ui.button("Boot").clicked() { self.boot_nro(); ui.close_menu(); }
+                        if ui.button("Stop").clicked() { self.stop_emulation(); ui.close_menu(); }
+                    });
+                    ui.menu_button(egui::RichText::new("Debug").size(13.0).color(TEXT), |ui| {
+                        if ui.button("Memory").clicked()    { self.debugger.toggle_memory(); ui.close_menu(); }
+                        if ui.button("Registers").clicked() { self.debugger.toggle_registers(); ui.close_menu(); }
+                        if ui.button("Disassembler").clicked() { self.debugger.toggle_disasm(); ui.close_menu(); }
+                        if ui.button("Logs").clicked()      { self.debugger.toggle_logs(); ui.close_menu(); }
+                    });
+                    ui.menu_button(egui::RichText::new("Settings").size(13.0).color(TEXT), |ui| {
+                        if ui.button("Preferences").clicked() { self.show_settings = !self.show_settings; ui.close_menu(); }
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(12.0);
+                        let (fps_col, fps_str) = if fps >= 55.0 { (GREEN, format!("{:.0} fps", fps)) }
+                            else if fps >= 28.0 { (AMBER, format!("{:.0} fps", fps)) }
+                            else { (Color32::from_rgb(0xE0, 0x40, 0x40), format!("{:.0} fps", fps)) };
+                        ui.label(egui::RichText::new(fps_str).size(12.0).color(fps_col).monospace());
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                        ui.add_space(6.0);
+                        let (dot, status_col) = if running { ("●", GREEN) } else { ("○", MUTED) };
+                        let status = if running { "Running" } else { "Idle" };
+                        ui.label(egui::RichText::new(format!("{} {}", dot, status))
+                            .size(12.0).color(status_col));
+                    });
+                });
+            });
+
+        egui::TopBottomPanel::bottom("statusbar")
+            .exact_height(22.0)
+            .frame(egui::Frame::none()
+                .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
+                .stroke(Stroke::new(1.0, BORDER)))
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(12.0);
+                    let name = std::path::Path::new(&self.nro_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "No file".into());
+                    ui.label(egui::RichText::new(name).size(11.0).color(MUTED));
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(12.0);
+                        let stats = self.emulation_handle.as_ref()
+                            .map(|h| h.stats.lock().clone())
+                            .unwrap_or_default();
+                        ui.label(egui::RichText::new(format!(
+                            "Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
+                            self.performance.get_frame_time(),
+                            stats.svc_count,
+                            stats.cycle_count,
+                        )).size(11.0).color(MUTED).monospace());
+                    });
+                });
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(BG))
+            .show(ctx, |ui| {
+                if let Some(tex) = &self.game_texture {
+                    let avail = ui.available_size();
+                    let tsz = tex.size_vec2();
+                    let scale = (avail.x / tsz.x).min(avail.y / tsz.y);
+                    ui.centered_and_justified(|ui| {
+                        ui.image((tex.id(), tsz * scale));
+                    });
+                } else {
+                    let nro_path = self.nro_path.clone();
+                    let running = self.is_running();
+                    let action = idle_screen(ui, &nro_path, running);
+                    match action {
+                        0 => { if let Some(p) = rfd::FileDialog::new()
+                                   .add_filter("Nintendo Homebrew", &["nro"]).pick_file() {
+                                   self.nro_path = p.to_string_lossy().to_string();
+                               } }
+                        1 => self.boot_nro(),
+                        2 => self.stop_emulation(),
+                        _ => {}
+                    }
+                }
+            });
+
+        self.performance.record_frame();
+
+        if self.show_settings {
+            let mut open = self.show_settings;
+            let mut tab = self.settings_tab;
+            let mut cfg = self.controller_config.clone();
+            let mut rebinding = self.rebinding;
+            let mut save_needed = false;
+            let mut app_cfg = self.app_settings.clone();
+            let mut app_save_needed = false;
+
+            egui::Window::new("Preferences")
+                .open(&mut open)
+                .resizable(true).default_size([520.0, 420.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(tab == SettingsTab::General, "General").clicked() {
+                            tab = SettingsTab::General;
+                        }
+                        if ui.selectable_label(tab == SettingsTab::Controller, "Controller").clicked() {
+                            tab = SettingsTab::Controller;
+                        }
+                        if ui.selectable_label(tab == SettingsTab::Logging, "Logging").clicked() {
+                            tab = SettingsTab::Logging;
+                        }
+                    });
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    match tab {
+                        SettingsTab::General => settings_content(ui),
+                        SettingsTab::Controller => {
+                            controller_settings_content(ui, &mut cfg, &mut rebinding, &mut save_needed);
+                        }
+                        SettingsTab::Logging => {
+                            logging_settings_content(ui, &mut app_cfg, &mut app_save_needed);
+                        }
+                    }
+                });
+
+            self.show_settings = open;
+            self.settings_tab = tab;
+            self.controller_config = cfg;
+            self.rebinding = rebinding;
+            self.app_settings = app_cfg;
+            if save_needed {
+                if let Err(e) = self.controller_config.save() {
+                    log::warn!("Failed to save controller config: {}", e);
+                }
+            }
+            if app_save_needed {
+                if let Err(e) = self.app_settings.save() {
+                    log::warn!("Failed to save app settings: {}", e);
+                }
+            }
+        }
+
+        let snapshot = self.emulation_handle.as_ref().map(|h| h.snapshot());
+        let mem_req_handle = self.emulation_handle.as_ref().map(|h| Arc::clone(&h.mem_request));
+        let mem_req: Option<Box<dyn Fn(u64)>> = mem_req_handle.map(|m| {
+            Box::new(move |addr: u64| {
+                *m.lock() = addr;
+            }) as Box<dyn Fn(u64)>
+        });
+        debug_windows(
+            ctx,
+            &mut self.debugger,
+            snapshot.as_ref(),
+            mem_req.as_deref(),
+            &self.log_buffer,
+        );
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+}
+
+fn idle_screen(ui: &mut egui::Ui, nro_path: &str, running: bool) -> u8 {
+    let mut action = 255u8;
+    let avail = ui.available_size();
+
+    ui.vertical_centered(|ui| {
+        ui.add_space((avail.y * 0.24).max(40.0));
+
+        ui.label(egui::RichText::new("NeXium")
+            .size(36.0).strong().color(TEXT));
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Nintendo Switch Emulator")
+            .size(13.0).color(MUTED));
+
+        ui.add_space(36.0);
+
+        let painter = ui.painter();
+        let card_w = 380.0;
+        let card_rect = egui::Rect::from_center_size(
+            egui::pos2(ui.max_rect().center().x, ui.cursor().top() + 80.0),
+            egui::vec2(card_w, 160.0),
+        );
+        painter.rect(card_rect, Rounding::same(10.0), BG_RAISED, Stroke::new(1.0, BORDER));
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(card_w, 160.0),
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                ui.add_space(20.0);
+
+                if nro_path.is_empty() {
+                    ui.label(egui::RichText::new("No file selected")
+                        .size(13.0).color(MUTED));
+                } else {
+                    let fname = std::path::Path::new(nro_path)
+                        .file_name().map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| nro_path.to_string());
+                    ui.label(egui::RichText::new(&fname).size(14.0).strong().color(TEXT));
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(nro_path).size(10.5).color(MUTED));
+                }
+
+                ui.add_space(16.0);
+
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    if pill_button(ui, "Select NRO…", false).clicked() { action = 0; }
+                    ui.add_space(8.0);
+                    if !nro_path.is_empty() && !running {
+                        if pill_button(ui, "Boot", true).clicked() { action = 1; }
+                    }
+                    if running {
+                        if pill_button(ui, "Stop", false).clicked() { action = 2; }
+                    }
+                });
+
+                if running {
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 3.5, GREEN);
+                        ui.label(egui::RichText::new("Running — awaiting first frame")
+                            .size(11.5).color(MUTED));
+                    });
+                }
+            },
+        );
+    });
+
+    action
+}
+
+fn settings_content(ui: &mut egui::Ui) {
+    egui::Grid::new("prefs").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+        row(ui, "CPU Backend", "Dynarmic (JIT)");
+        row(ui, "GPU Backend", "Vulkan (ash)");
+        row(ui, "Audio", "Enabled · 100%");
+        row(ui, "Resolution", "1280 × 720");
+    });
+}
+
+fn controller_settings_content(
+    ui: &mut egui::Ui,
+    cfg: &mut ControllerConfig,
+    rebinding: &mut Option<SwitchButton>,
+    save_needed: &mut bool,
+) {
+    ui.label(egui::RichText::new("Switch Pro Controller → Keyboard Mapping")
+        .size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Click a binding then press a key to remap.")
+        .size(11.0).color(MUTED));
+    ui.add_space(8.0);
+
+    if let Some(btn) = *rebinding {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("⟶ Press a key for {}…", btn.display_name()))
+                .size(12.0).color(AMBER));
+            if ui.small_button("Cancel").clicked() {
+                *rebinding = None;
+            }
+        });
+
+        let new_key = ui.input(|i| {
+            for ev in &i.events {
+                if let egui::Event::Key { key, pressed: true, .. } = ev {
+                    return Some(format!("{:?}", key));
+                }
+            }
+            None
+        });
+        if let Some(k) = new_key {
+            cfg.set_binding(btn, k);
+            *rebinding = None;
+            *save_needed = true;
+        }
+        ui.add_space(8.0);
+    }
+
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        egui::Grid::new("bindings")
+            .num_columns(3).spacing([12.0, 4.0]).striped(true)
+            .show(ui, |ui| {
+                for btn in SwitchButton::all() {
+                    ui.label(egui::RichText::new(btn.display_name()).size(12.0).color(TEXT));
+                    let current = cfg.binding_for(*btn).unwrap_or("(unbound)").to_string();
+                    ui.label(egui::RichText::new(&current).size(12.0).monospace().color(MUTED));
+                    if ui.small_button("Rebind").clicked() {
+                        *rebinding = Some(*btn);
+                    }
+                    ui.end_row();
+                }
+            });
+    });
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if pill_button(ui, "Reset to Defaults", false).clicked() {
+            *cfg = ControllerConfig::default();
+            *save_needed = true;
+        }
+        if pill_button(ui, "Save", true).clicked() {
+            *save_needed = true;
+        }
+    });
+}
+
+fn row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.label(egui::RichText::new(label).size(12.0).color(MUTED));
+    ui.label(egui::RichText::new(value).size(12.0).color(TEXT));
+    ui.end_row();
+}
+
+fn logging_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_needed: &mut bool) {
+    ui.label(egui::RichText::new("Log Level").size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Takes effect on restart.").size(11.0).color(MUTED));
+    ui.add_space(8.0);
+
+    for level in LogLevel::all() {
+        if ui.radio(cfg.log_level == *level, level.label()).clicked() {
+            cfg.log_level = *level;
+            *save_needed = true;
+        }
+    }
+
+    ui.add_space(12.0);
+    let path = AppSettings::config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    ui.label(egui::RichText::new(format!("Config: {}", path)).size(10.5).color(MUTED));
+}
+
+fn debug_windows(
+    ctx: &egui::Context,
+    dbg: &mut DebuggerState,
+    snapshot: Option<&crate::boot::CpuSnapshot>,
+    mem_request: Option<&dyn Fn(u64)>,
+    log_buffer: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+) {
+    if dbg.show_memory {
+        egui::Window::new("Memory").open(&mut dbg.show_memory)
+            .default_size([520.0, 340.0]).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Address").size(12.0).color(MUTED));
+                    let resp = ui.add(egui::TextEdit::singleline(&mut dbg.memory_address_input)
+                        .desired_width(160.0)
+                        .font(egui::TextStyle::Monospace));
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let s = dbg.memory_address_input.trim().trim_start_matches("0x");
+                        if let Ok(addr) = u64::from_str_radix(s, 16) {
+                            dbg.memory_address = addr;
+                            if let Some(req) = mem_request { req(addr); }
+                        }
+                    }
+                    if ui.small_button("Go").clicked() {
+                        let s = dbg.memory_address_input.trim().trim_start_matches("0x");
+                        if let Ok(addr) = u64::from_str_radix(s, 16) {
+                            dbg.memory_address = addr;
+                            if let Some(req) = mem_request { req(addr); }
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+
+                if let Some(snap) = snapshot {
+                    if snap.mem_data.is_empty() || snap.mem_address != dbg.memory_address {
+                        if let Some(req) = mem_request { req(dbg.memory_address); }
+                        ui.label(egui::RichText::new("Reading memory…")
+                            .size(11.0).color(MUTED));
+                    } else {
+                        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                            let mut row = 0;
+                            while row * 16 < snap.mem_data.len() {
+                                let off = row * 16;
+                                let addr = snap.mem_address + off as u64;
+                                let slice = &snap.mem_data[off..(off + 16).min(snap.mem_data.len())];
+                                let hex: Vec<String> = slice.iter().map(|b| format!("{:02x}", b)).collect();
+                                let ascii: String = slice.iter()
+                                    .map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' })
+                                    .collect();
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("{:016x}", addr))
+                                        .size(11.5).monospace().color(MUTED));
+                                    ui.label(egui::RichText::new(hex.join(" "))
+                                        .size(11.5).monospace().color(TEXT));
+                                    ui.label(egui::RichText::new(ascii)
+                                        .size(11.5).monospace().color(AMBER));
+                                });
+                                row += 1;
+                            }
+                        });
+                    }
+                } else {
+                    ui.label(egui::RichText::new("No emulation running")
+                        .size(11.0).color(MUTED));
+                }
+            });
+    }
+
+    if dbg.show_registers {
+        egui::Window::new("Registers").open(&mut dbg.show_registers)
+            .default_size([320.0, 480.0]).show(ctx, |ui| {
+                if let Some(snap) = snapshot {
+                    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                        egui::Grid::new("regs").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
+                            for (n, v) in [
+                                ("PC", snap.pc),
+                                ("SP", snap.sp),
+                                ("TPIDRRO", snap.tpidrro_el0),
+                            ] {
+                                ui.label(egui::RichText::new(format!("{:<8}", n))
+                                    .size(12.0).monospace().color(MUTED));
+                                ui.label(egui::RichText::new(format!("{:#018x}", v))
+                                    .size(12.0).monospace().color(TEXT));
+                                ui.end_row();
+                            }
+                            for i in 0..31 {
+                                ui.label(egui::RichText::new(format!("X{:<7}", i))
+                                    .size(12.0).monospace().color(MUTED));
+                                ui.label(egui::RichText::new(format!("{:#018x}", snap.x[i]))
+                                    .size(12.0).monospace().color(TEXT));
+                                ui.end_row();
+                            }
+                        });
+                    });
+                } else {
+                    ui.label(egui::RichText::new("No emulation running")
+                        .size(11.0).color(MUTED));
+                }
+            });
+    }
+
+    if dbg.show_disasm {
+        egui::Window::new("Disassembler").open(&mut dbg.show_disasm)
+            .default_size([520.0, 340.0]).show(ctx, |ui| {
+                if let Some(snap) = snapshot {
+                    if snap.instruction_bytes.is_empty() {
+                        ui.label(egui::RichText::new("No instruction data yet")
+                            .size(11.0).color(MUTED));
+                    } else {
+                        ui.label(egui::RichText::new(format!("PC {:#018x}", snap.pc))
+                            .size(12.0).monospace().color(AMBER));
+                        ui.separator();
+                        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                            let mut off = 0;
+                            while off + 4 <= snap.instruction_bytes.len() {
+                                let instr = u32::from_le_bytes([
+                                    snap.instruction_bytes[off],
+                                    snap.instruction_bytes[off + 1],
+                                    snap.instruction_bytes[off + 2],
+                                    snap.instruction_bytes[off + 3],
+                                ]);
+                                let addr = snap.pc + off as u64;
+                                let mnemonic = disasm_arm64(instr);
+                                let color = if off == 0 { ACCENT } else { TEXT };
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("{:016x}", addr))
+                                        .size(11.5).monospace().color(MUTED));
+                                    ui.label(egui::RichText::new(format!("{:08x}", instr))
+                                        .size(11.5).monospace().color(MUTED));
+                                    ui.label(egui::RichText::new(mnemonic)
+                                        .size(11.5).monospace().color(color));
+                                });
+                                off += 4;
+                            }
+                        });
+                    }
+                } else {
+                    ui.label(egui::RichText::new("No emulation running")
+                        .size(11.0).color(MUTED));
+                }
+            });
+    }
+
+    if dbg.show_logs {
+        egui::Window::new("Logs").open(&mut dbg.show_logs)
+            .default_size([580.0, 300.0]).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if pill_button(ui, "Clear", false).clicked() {
+                    if let Ok(mut buf) = log_buffer.lock() {
+                        buf.clear();
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().auto_shrink([false;2]).stick_to_bottom(true)
+                .show(ui, |ui| {
+                    if let Ok(buf) = log_buffer.lock() {
+                        for entry in buf.iter() {
+                            ui.label(egui::RichText::new(entry).size(11.0).monospace().color(MUTED));
+                        }
+                    }
+                });
+        });
+    }
+}
+
+fn disasm_arm64(instr: u32) -> String {
+    if instr == 0xD503201F { return "nop".into(); }
+    if instr == 0xD65F03C0 { return "ret".into(); }
+    if instr == 0xD4200000 { return "brk #0".into(); }
+
+    let op = instr >> 24;
+
+    if (instr & 0xFFE0_0000) == 0xD400_0000 {
+        let imm = (instr >> 5) & 0xFFFF;
+        return format!("svc #{:#x}", imm);
+    }
+    if (instr & 0xFC00_0000) == 0x9400_0000 {
+        let imm26 = instr & 0x03FF_FFFF;
+        let off = if imm26 & 0x0200_0000 != 0 { ((imm26 | 0xFC00_0000) as i32) * 4 } else { (imm26 as i32) * 4 };
+        return format!("bl pc{:+}", off);
+    }
+    if (instr & 0xFC00_0000) == 0x1400_0000 {
+        let imm26 = instr & 0x03FF_FFFF;
+        let off = if imm26 & 0x0200_0000 != 0 { ((imm26 | 0xFC00_0000) as i32) * 4 } else { (imm26 as i32) * 4 };
+        return format!("b pc{:+}", off);
+    }
+    if (instr & 0xFFC0_0000) == 0x9100_0000 {
+        let imm12 = (instr >> 10) & 0xFFF;
+        let rn = (instr >> 5) & 0x1F;
+        let rd = instr & 0x1F;
+        return format!("add x{}, x{}, #{:#x}", rd, rn, imm12);
+    }
+    if (instr & 0xFFC0_0000) == 0xD100_0000 {
+        let imm12 = (instr >> 10) & 0xFFF;
+        let rn = (instr >> 5) & 0x1F;
+        let rd = instr & 0x1F;
+        return format!("sub x{}, x{}, #{:#x}", rd, rn, imm12);
+    }
+    if (instr & 0xFFC0_0000) == 0xF940_0000 {
+        let imm12 = (instr >> 10) & 0xFFF;
+        let rn = (instr >> 5) & 0x1F;
+        let rt = instr & 0x1F;
+        return format!("ldr x{}, [x{}, #{:#x}]", rt, rn, imm12 * 8);
+    }
+    if (instr & 0xFFC0_0000) == 0xF900_0000 {
+        let imm12 = (instr >> 10) & 0xFFF;
+        let rn = (instr >> 5) & 0x1F;
+        let rt = instr & 0x1F;
+        return format!("str x{}, [x{}, #{:#x}]", rt, rn, imm12 * 8);
+    }
+    if (instr & 0xFFE0_0000) == 0xD280_0000 {
+        let imm16 = (instr >> 5) & 0xFFFF;
+        let rd = instr & 0x1F;
+        return format!("mov x{}, #{:#x}", rd, imm16);
+    }
+
+    format!("? .word {:#010x}  (op={:#x})", instr, op)
+}

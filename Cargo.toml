@@ -1,10 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "horizonrust-common",
-    "horizonrust-core",
-    "horizonrust-gpu",
-    "horizonrust-gui",
+    "nexium-common",
+    "nexium-memory",
+    "nexium-cpu",
+    "nexium-loader",
+    "nexium-shader",
+    "nexium-spirv",
+    "nexium-ipc",
+    "nexium-nvdrv",
+    "nexium-kernel",
+    "nexium-core",
+    "nexium-gpu",
+    "nexium-gui",
 ]
 
 [workspace.package]
@@ -13,9 +21,16 @@ rust-version = "1.80"
 license = "GPL-2.0-or-later"
 
 [workspace.dependencies]
-horizonrust-common = { path = "horizonrust-common" }
-horizonrust-core = { path = "horizonrust-core" }
-horizonrust-gpu = { path = "horizonrust-gpu" }
+nexium-common = { path = "nexium-common" }
+nexium-memory = { path = "nexium-memory" }
+nexium-cpu = { path = "nexium-cpu" }
+nexium-loader = { path = "nexium-loader" }
+nexium-shader = { path = "nexium-shader" }
+nexium-ipc = { path = "nexium-ipc" }
+nexium-nvdrv = { path = "nexium-nvdrv" }
+nexium-kernel = { path = "nexium-kernel" }
+nexium-core = { path = "nexium-core" }
+nexium-gpu = { path = "nexium-gpu" }
 
 bytemuck = { version = "1", features = ["derive"] }
 zerocopy = { version = "0.7", features = ["derive"] }

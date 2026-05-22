@@ -1,0 +1,15 @@
+[package]
+name = "nexium-ipc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nexium-common.workspace = true
+
+log.workspace = true
+bytemuck.workspace = true
+modular-bitfield.workspace = true
+num_enum.workspace = true
+byteorder.workspace = true

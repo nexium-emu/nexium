@@ -1,0 +1,13 @@
+[package]
+name = "nexium-cpu"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nexium-memory.workspace = true
+
+log.workspace = true
+parking_lot.workspace = true
+dynarmic-sys-mythrax.workspace = true

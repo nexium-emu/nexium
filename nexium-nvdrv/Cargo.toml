@@ -1,0 +1,21 @@
+[package]
+name = "nexium-nvdrv"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nexium-shader.workspace = true
+
+log.workspace = true
+bytemuck.workspace = true
+zerocopy.workspace = true
+modular-bitfield.workspace = true
+bitflags.workspace = true
+num_enum.workspace = true
+byteorder.workspace = true
+parking_lot.workspace = true
+crossbeam.workspace = true
+thiserror.workspace = true
+once_cell.workspace = true

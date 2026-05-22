@@ -1,0 +1,16 @@
+[package]
+name = "nexium-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nexium-common.workspace = true
+nexium-memory.workspace = true
+nexium-cpu.workspace = true
+nexium-loader.workspace = true
+nexium-shader.workspace = true
+nexium-ipc.workspace = true
+nexium-nvdrv.workspace = true
+nexium-kernel.workspace = true

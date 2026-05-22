@@ -1,0 +1,18 @@
+[package]
+name = "nexium-gpu"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nexium-common.workspace = true
+nexium-core.workspace = true
+
+ash = "0.38"
+parking_lot = "0.12"
+log = "0.4"
+thiserror = "1"
+
+[dev-dependencies]
+winit = "0.30"

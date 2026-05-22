@@ -1,0 +1,456 @@
+use nexium_common::result::SUCCESS;
+use crate::kernel::Kernel;
+use crate::kernel::handles::HandleType;
+
+pub mod msg {
+    pub const EXIT_REQUESTED: u32 = 1;
+    pub const FOCUS_STATE_CHANGED: u32 = 15;
+    pub const REQUEST_TO_PRELOAD_NEXT_APPLET: u32 = 16;
+    pub const OPERATION_MODE_CHANGED: u32 = 30;
+    pub const PERFORMANCE_MODE_CHANGED: u32 = 31;
+    pub const REQUEST_TO_DISPLAY: u32 = 51;
+}
+
+pub const APPLET_MESSAGE_AVAILABLE_RC: u32 = 0;
+pub const APPLET_NO_MESSAGES_RC: u32 = 0x680;
+
+pub struct AppletService;
+
+impl AppletService {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn dispatch(&self, cmd_id: u32) -> u32 {
+        log::debug!("am cmd: {} (legacy path - prefer AM helpers in svc.rs)", cmd_id);
+        SUCCESS
+    }
+}
+
+impl Default for AppletService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn proxy_subsession(port_name: &str, cmd_id: u32) -> Option<&'static str> {
+    match (port_name, cmd_id) {
+        ("appletAE" | "appletOE", 0) => Some("IApplicationProxy"),
+        ("appletAE" | "appletOE", 100) => Some("ISystemAppletProxy"),
+        ("appletAE" | "appletOE", 200) => Some("ILibraryAppletProxy"),
+        ("appletAE" | "appletOE", 201) => Some("ILibraryAppletProxy"),
+        ("appletAE" | "appletOE", 300) => Some("IOverlayAppletProxy"),
+        ("appletAE" | "appletOE", 350) => Some("IApplicationProxy"),
+        ("IApplicationProxy", 0) => Some("ICommonStateGetter"),
+        ("IApplicationProxy", 1) => Some("ISelfController"),
+        ("IApplicationProxy", 2) => Some("IWindowController"),
+        ("IApplicationProxy", 3) => Some("IAudioController"),
+        ("IApplicationProxy", 4) => Some("IDisplayController"),
+        ("IApplicationProxy", 10) => Some("IProcessWindingController"),
+        ("IApplicationProxy", 11) => Some("ILibraryAppletCreator"),
+        ("IApplicationProxy", 20) => Some("IApplicationFunctions"),
+        ("IApplicationProxy", 1000) => Some("IDebugFunctions"),
+        ("ISystemAppletProxy", 0) => Some("ICommonStateGetter"),
+        ("ISystemAppletProxy", 1) => Some("ISelfController"),
+        ("ISystemAppletProxy", 2) => Some("IWindowController"),
+        ("ISystemAppletProxy", 3) => Some("IAudioController"),
+        ("ISystemAppletProxy", 4) => Some("IDisplayController"),
+        ("ISystemAppletProxy", 10) => Some("IProcessWindingController"),
+        ("ISystemAppletProxy", 11) => Some("ILibraryAppletCreator"),
+        ("ISystemAppletProxy", 20) => Some("IApplicationFunctions"),
+        ("ISystemAppletProxy", 21) => Some("IHomeMenuFunctions"),
+        ("ISystemAppletProxy", 22) => Some("IGlobalStateController"),
+        ("ISystemAppletProxy", 23) => Some("IApplicationCreator"),
+        ("ISystemAppletProxy", 1000) => Some("IDebugFunctions"),
+        ("ILibraryAppletProxy", 0) => Some("ICommonStateGetter"),
+        ("ILibraryAppletProxy", 1) => Some("ISelfController"),
+        ("ILibraryAppletProxy", 2) => Some("IWindowController"),
+        ("ILibraryAppletProxy", 3) => Some("IAudioController"),
+        ("ILibraryAppletProxy", 4) => Some("IDisplayController"),
+        ("ILibraryAppletProxy", 10) => Some("IProcessWindingController"),
+        ("ILibraryAppletProxy", 11) => Some("ILibraryAppletCreator"),
+        ("ILibraryAppletProxy", 20) => Some("ILibraryAppletSelfAccessor"),
+        ("ILibraryAppletProxy", 21) => Some("IProcessWindingController"),
+        ("ILibraryAppletProxy", 1000) => Some("IDebugFunctions"),
+        ("IOverlayAppletProxy", 0) => Some("ICommonStateGetter"),
+        ("IOverlayAppletProxy", 1) => Some("ISelfController"),
+        ("IOverlayAppletProxy", 2) => Some("IWindowController"),
+        ("IOverlayAppletProxy", 3) => Some("IAudioController"),
+        ("IOverlayAppletProxy", 4) => Some("IDisplayController"),
+        ("IOverlayAppletProxy", 10) => Some("IProcessWindingController"),
+        ("IOverlayAppletProxy", 11) => Some("ILibraryAppletCreator"),
+        ("IOverlayAppletProxy", 20) => Some("IOverlayFunctions"),
+        ("IOverlayAppletProxy", 1000) => Some("IDebugFunctions"),
+        ("ILibraryAppletCreator", 0) => Some("ILibraryAppletAccessor"),
+        ("ILibraryAppletCreator", 10) => Some("IStorage"),
+        ("ILibraryAppletCreator", 11) => Some("IStorage"),
+        ("IApplicationCreator", 0) => Some("IApplicationAccessor"),
+        ("ILibraryAppletAccessor", 60) => Some("ILibraryAppletAccessor"),
+        ("ILibraryAppletAccessor", 100) => Some("IStorage"),
+        ("ILibraryAppletAccessor", 101) => Some("IStorage"),
+        _ => None,
+    }
+}
+
+pub fn dispatch_command(kernel: &mut Kernel, port_name: &str, cmd_id: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match port_name {
+        "ICommonStateGetter" => common_state_getter(kernel, cmd_id),
+        "ISelfController" => self_controller(kernel, cmd_id),
+        "IWindowController" => window_controller(kernel, cmd_id),
+        "IAudioController" => audio_controller(cmd_id),
+        "IDisplayController" => display_controller(cmd_id),
+        "IProcessWindingController" => process_winding_controller(cmd_id),
+        "ILibraryAppletCreator" => library_applet_creator(cmd_id),
+        "ILibraryAppletAccessor" => library_applet_accessor(kernel, cmd_id),
+        "ILibraryAppletSelfAccessor" => library_applet_self_accessor(kernel, cmd_id),
+        "IApplicationFunctions" => application_functions(kernel, cmd_id),
+        "IApplicationCreator" => application_creator(cmd_id),
+        "IApplicationAccessor" => application_accessor(kernel, cmd_id),
+        "IHomeMenuFunctions" => home_menu_functions(kernel, cmd_id),
+        "IGlobalStateController" => global_state_controller(cmd_id),
+        "IDebugFunctions" => debug_functions(cmd_id),
+        "IStorage" => storage(cmd_id),
+        "IStorageAccessor" => storage_accessor(cmd_id),
+        "IOverlayFunctions" => overlay_functions(cmd_id),
+        "ILockAccessor" => lock_accessor(cmd_id),
+        "IAppletCommonFunctions" => applet_common_functions(cmd_id),
+        _ => None,
+    }
+}
+
+fn alloc_event(kernel: &mut Kernel, slot: &mut Option<u32>, name: &str) -> u32 {
+    if let Some(h) = *slot {
+        h
+    } else {
+        let h = kernel.handles.create_handle(HandleType::Event);
+        kernel.event_signals.insert(h, false);
+        *slot = Some(h);
+        log::debug!("am: allocated event {} = {:#x}", name, h);
+        h
+    }
+}
+
+fn ok(data: Vec<u8>) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    Some((0, data, Vec::new()))
+}
+
+fn ok_with_handle(data: Vec<u8>, handle: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    Some((0, data, vec![handle]))
+}
+
+fn ok_empty() -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    Some((0, Vec::new(), Vec::new()))
+}
+
+fn err(rc: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    Some((rc, Vec::new(), Vec::new()))
+}
+
+fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => {
+            let mut slot = kernel.applet_message_event;
+            let h = alloc_event(kernel, &mut slot, "AppletMessageEvent");
+            kernel.applet_message_event = slot;
+            log::debug!("ICommonStateGetter.GetEventHandle → {:#x}", h);
+            ok_with_handle(Vec::new(), h)
+        }
+        1 => {
+            if let Some(m) = kernel.applet_messages.pop_front() {
+                log::debug!("ICommonStateGetter.ReceiveMessage → {}", m);
+                if kernel.applet_messages.is_empty() {
+                    if let Some(h) = kernel.applet_message_event {
+                        kernel.event_signals.insert(h, false);
+                    }
+                }
+                ok(m.to_le_bytes().to_vec())
+            } else {
+                log::debug!("ICommonStateGetter.ReceiveMessage (none) → 0x680");
+                err(APPLET_NO_MESSAGES_RC)
+            }
+        }
+        2 => {
+            log::debug!("ICommonStateGetter.GetThisAppletKind → 0");
+            ok(0u32.to_le_bytes().to_vec())
+        }
+        3 | 4 => ok_empty(),
+        5 => ok(kernel.applet_operation_mode.to_le_bytes().to_vec()),
+        6 => ok(kernel.applet_performance_mode.to_le_bytes().to_vec()),
+        7 => ok(0u8.to_le_bytes().to_vec()),
+        8 => ok(0u8.to_le_bytes().to_vec()),
+        9 => ok(kernel.applet_focus_state.to_le_bytes().to_vec()),
+        10 | 11 | 12 => ok_empty(),
+        13 => {
+            let mut slot = kernel.acquired_sleep_lock_event;
+            let h = alloc_event(kernel, &mut slot, "AcquiredSleepLockEvent");
+            kernel.acquired_sleep_lock_event = slot;
+            ok_with_handle(Vec::new(), h)
+        }
+        14 => ok(0u64.to_le_bytes().to_vec()),
+        50 => ok(0u8.to_le_bytes().to_vec()),
+        51 | 52 | 53 | 54 => ok_empty(),
+        55 => ok(0u8.to_le_bytes().to_vec()),
+        60 => {
+            let mut buf = [0u8; 8];
+            buf[0..4].copy_from_slice(&1280u32.to_le_bytes());
+            buf[4..8].copy_from_slice(&720u32.to_le_bytes());
+            ok(buf.to_vec())
+        }
+        61 => {
+            let mut slot = kernel.display_resolution_change_event;
+            let h = alloc_event(kernel, &mut slot, "DisplayResolutionChangeEvent");
+            kernel.display_resolution_change_event = slot;
+            ok_with_handle(Vec::new(), h)
+        }
+        66 | 67 => ok_empty(),
+        68 => ok(0u32.to_le_bytes().to_vec()),
+        80 | 90 => ok_empty(),
+        91 => ok(0u32.to_le_bytes().to_vec()),
+        200 => ok(0u32.to_le_bytes().to_vec()),
+        300 => ok(0u8.to_le_bytes().to_vec()),
+        400 | 401 | 500 | 900 => ok_empty(),
+        _ => {
+            log::debug!("ICommonStateGetter.cmd_{} unknown → SUCCESS", cmd);
+            ok_empty()
+        }
+    }
+}
+
+fn self_controller(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 | 1 | 2 | 3 | 4 => ok_empty(),
+        9 => {
+            let mut slot = kernel.library_applet_launchable_event;
+            let h = alloc_event(kernel, &mut slot, "LibraryAppletLaunchableEvent");
+            kernel.library_applet_launchable_event = slot;
+            ok_with_handle(Vec::new(), h)
+        }
+        10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 => ok_empty(),
+        40 => ok(1u64.to_le_bytes().to_vec()),
+        41 => ok_empty(),
+        42 | 43 => {
+            let mut buf = [0u8; 16];
+            buf[0..8].copy_from_slice(&1u64.to_le_bytes());
+            buf[8..16].copy_from_slice(&0u64.to_le_bytes());
+            ok(buf.to_vec())
+        }
+        44 => {
+            let mut buf = [0u8; 16];
+            buf[0..8].copy_from_slice(&1u64.to_le_bytes());
+            buf[8..16].copy_from_slice(&2u64.to_le_bytes());
+            ok(buf.to_vec())
+        }
+        50 | 51 => ok_empty(),
+        60 | 61 | 62 | 63 | 64 | 65 => ok_empty(),
+        66 => ok(0u32.to_le_bytes().to_vec()),
+        67 => ok(0u8.to_le_bytes().to_vec()),
+        68 => ok_empty(),
+        69 => ok(0u8.to_le_bytes().to_vec()),
+        80 => ok_empty(),
+        81 => ok(0u64.to_le_bytes().to_vec()),
+        90 => ok(0u64.to_le_bytes().to_vec()),
+        91 => {
+            let mut slot = kernel.accumulated_suspended_tick_event;
+            let h = alloc_event(kernel, &mut slot, "AccumulatedSuspendedTickChangedEvent");
+            kernel.accumulated_suspended_tick_event = slot;
+            ok_with_handle(Vec::new(), h)
+        }
+        100 | 110 | 120 | 130 => ok_empty(),
+        _ => {
+            log::debug!("ISelfController.cmd_{} unknown → SUCCESS", cmd);
+            ok_empty()
+        }
+    }
+}
+
+fn window_controller(_kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 | 10 | 11 | 12 | 13 => ok_empty(),
+        1 => ok(1u64.to_le_bytes().to_vec()),
+        _ => {
+            log::debug!("IWindowController.cmd_{} unknown → SUCCESS", cmd);
+            ok_empty()
+        }
+    }
+}
+
+fn audio_controller(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 | 1 => ok_empty(),
+        2 => ok(0u32.to_le_bytes().to_vec()),
+        3 => ok_empty(),
+        4 => ok(0u32.to_le_bytes().to_vec()),
+        _ => ok_empty(),
+    }
+}
+
+fn display_controller(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 => ok_empty(),
+        _ => ok_empty(),
+    }
+}
+
+fn process_winding_controller(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 | 11 | 21 | 22 | 23 | 30 | 40 | 41 => ok_empty(),
+        _ => ok_empty(),
+    }
+}
+
+fn library_applet_creator(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        _ => ok_empty(),
+    }
+}
+
+fn library_applet_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => {
+            let h = kernel.handles.create_handle(HandleType::Event);
+            kernel.event_signals.insert(h, false);
+            ok_with_handle(Vec::new(), h)
+        }
+        1 | 10 | 20 | 25 | 26 | 30 | 50 | 51 | 90 | 91 | 100 | 101 | 102 | 103 | 110 | 120 | 150 | 160 => ok_empty(),
+        _ => ok_empty(),
+    }
+}
+
+fn library_applet_self_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 | 1 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 19 => ok_empty(),
+        2 => {
+            let h = kernel.handles.create_handle(HandleType::Event);
+            kernel.event_signals.insert(h, false);
+            ok_with_handle(Vec::new(), h)
+        }
+        20 | 25 | 30 | 40 | 50 | 60 | 100 | 110 | 120 => ok_empty(),
+        _ => ok_empty(),
+    }
+}
+
+fn application_functions(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        1 => ok_empty(),
+        10 | 12 => ok_empty(),
+        20 => ok(0u64.to_le_bytes().to_vec()),
+        21 => {
+            let lang_code = u64::from_le_bytes(*b"en-US\0\0\0");
+            ok(lang_code.to_le_bytes().to_vec())
+        }
+        22 => ok_empty(),
+        23 => ok(vec![0u8; 16]),
+        24 => ok(vec![0u8; 16]),
+        25 => ok(0u64.to_le_bytes().to_vec()),
+        26 => ok(vec![0u8; 16]),
+        27 => ok(vec![0u8; 16]),
+        28 => ok(vec![0u8; 16]),
+        30 | 31 | 32 | 33 => ok_empty(),
+        40 => ok(0u8.to_le_bytes().to_vec()),
+        50 => ok(vec![0u8; 16]),
+        60 => ok_empty(),
+        65 => ok(0u8.to_le_bytes().to_vec()),
+        66 | 67 | 70 | 71 | 72 | 80 | 90 => ok_empty(),
+        100 | 101 | 102 | 103 => ok_empty(),
+        110 => ok(0u8.to_le_bytes().to_vec()),
+        111 => ok(0u64.to_le_bytes().to_vec()),
+        120 => ok(vec![0u8; 16]),
+        121 => ok(0i32.to_le_bytes().to_vec()),
+        123 => {
+            let mut slot = kernel.gpu_error_detected_event;
+            let h = alloc_event(kernel, &mut slot, "GpuErrorDetectedSystemEvent");
+            kernel.gpu_error_detected_event = slot;
+            ok_with_handle(Vec::new(), h)
+        }
+        124 => {
+            let mut slot = kernel.friend_invitation_event;
+            let h = alloc_event(kernel, &mut slot, "FriendInvitationStorageChannelEvent");
+            kernel.friend_invitation_event = slot;
+            ok_with_handle(Vec::new(), h)
+        }
+        130 => {
+            let mut slot = kernel.notification_event;
+            let h = alloc_event(kernel, &mut slot, "NotificationStorageChannelEvent");
+            kernel.notification_event = slot;
+            ok_with_handle(Vec::new(), h)
+        }
+        131 | 140 | 141 | 150 | 160 | 170 | 1000 | 1001 => ok_empty(),
+        _ => {
+            log::debug!("IApplicationFunctions.cmd_{} unknown → SUCCESS", cmd);
+            ok_empty()
+        }
+    }
+}
+
+fn application_creator(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        _ => ok_empty(),
+    }
+}
+
+fn application_accessor(_kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        _ => ok_empty(),
+    }
+}
+
+fn home_menu_functions(_kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        10 | 11 | 12 | 13 | 20 | 21 | 30 => ok_empty(),
+        _ => ok_empty(),
+    }
+}
+
+fn global_state_controller(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        _ => ok_empty(),
+    }
+}
+
+fn debug_functions(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        _ => ok_empty(),
+    }
+}
+
+fn storage(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => ok_empty(),
+        _ => ok_empty(),
+    }
+}
+
+fn storage_accessor(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => ok(0u64.to_le_bytes().to_vec()),
+        10 | 11 => ok_empty(),
+        _ => ok_empty(),
+    }
+}
+
+fn overlay_functions(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        _ => ok_empty(),
+    }
+}
+
+fn lock_accessor(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        _ => ok_empty(),
+    }
+}
+
+fn applet_common_functions(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        _ => ok_empty(),
+    }
+}
+
+pub fn queue_message(kernel: &mut Kernel, msg: u32) {
+    kernel.applet_messages.push_back(msg);
+    if let Some(h) = kernel.applet_message_event {
+        kernel.event_signals.insert(h, true);
+        kernel.threads.signal_handle(h);
+    }
+    log::debug!("am: queued message {} (queue len {})", msg, kernel.applet_messages.len());
+}

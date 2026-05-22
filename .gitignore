@@ -1,26 +1,34 @@
+# Rust build artifacts
 /target/
 Cargo.lock
+.cargo/
+
+# Editor and OS
+.vscode/
+.idea/
+.vs/
+*.iml
 *.swp
 *.swo
 *~
 .DS_Store
-.vscode/
-.idea/
-*.iml
-.cargo/
+
+# Windows binaries
 *.exe
 *.pdb
-.vs/
 
+# Logs
+*.log
+
+# Reference repositories (not part of this project)
 Atmosphere-master/
+deko3d-master/
 libnx-master/
 mesa-26.1.0/
 nx-hbloader-master/
 nx-hbmenu-master/
-space-nx-master/
+RustSwitch/
 SDL-main/
+space-nx-master/
+switchbrew-wiki/
 yuzu-master/
-
-debug_boot.log
-*.log
-
