@@ -1,5 +1,5 @@
 use super::Kernel;
-use nexium_common::result::{SUCCESS, KERNEL_NOT_IMPLEMENTED};
+use nexium_common::result::{SUCCESS, KERNEL_NOT_IMPLEMENTED, KERNEL_INVALID_ADDRESS};
 use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
 use nexium_ipc as ipc;
@@ -133,7 +133,38 @@ fn svc_set_memory_attribute(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_map_memory(kernel: &mut Kernel) -> u32 {
-    log::debug!("svcMapMemory (no-op)");
+    let (dst, src, size) = if let Some(cpu) = &kernel.cpu {
+        (cpu.get_register(0), cpu.get_register(1), cpu.get_register(2))
+    } else {
+        return 1;
+    };
+
+    if size == 0 || (dst & 0xFFF) != 0 || (size & 0xFFF) != 0 {
+        log::warn!("svcMapMemory: bad args dst={:#x} src={:#x} size={:#x}", dst, src, size);
+        if let Some(cpu) = &mut kernel.cpu {
+            cpu.set_register(0, KERNEL_INVALID_ADDRESS as u64);
+        }
+        return KERNEL_INVALID_ADDRESS;
+    }
+
+    let map_rc = kernel.address_space.map(dst, size, nexium_memory::Perm::RW, "stack_mirror");
+    match map_rc {
+        Ok(_) => {
+            let mut buf = vec![0u8; size as usize];
+            if kernel.address_space.read(src, &mut buf).is_ok() {
+                let _ = kernel.address_space.write(dst, &buf);
+            }
+            log::info!("svcMapMemory dst={:#x} src={:#x} size={:#x} → mapped + copied", dst, src, size);
+        }
+        Err(e) => {
+            log::debug!("svcMapMemory dst={:#x} src={:#x} size={:#x} → already mapped or overlap ({:?}), copying contents only", dst, src, size, e);
+            let mut buf = vec![0u8; size as usize];
+            if kernel.address_space.read(src, &mut buf).is_ok() {
+                let _ = kernel.address_space.write(dst, &buf);
+            }
+        }
+    }
+
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(0, SUCCESS as u64);
     }
@@ -946,6 +977,52 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
         }
     }
 
+    if port_name == "IFsStorage" {
+        match cmd_id {
+            0 => {
+                let off_lo = ctx.cmif_in_data_off;
+                let read_in = &ctx.buf[off_lo..off_lo + 16];
+                let offset = i64::from_le_bytes([
+                    read_in[0], read_in[1], read_in[2], read_in[3],
+                    read_in[4], read_in[5], read_in[6], read_in[7],
+                ]);
+                let read_size = u64::from_le_bytes([
+                    read_in[8], read_in[9], read_in[10], read_in[11],
+                    read_in[12], read_in[13], read_in[14], read_in[15],
+                ]);
+                let romfs = &kernel.nro_romfs;
+                let target = ctx.recv_buffers.iter()
+                    .find(|b| b.size > 0 && b.addr != 0)
+                    .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0))
+                    .copied();
+                if let Some(buf) = target {
+                    let start = (offset.max(0) as usize).min(romfs.len());
+                    let want = (read_size as usize).min(buf.size as usize);
+                    let end = start.saturating_add(want).min(romfs.len());
+                    let slice = &romfs[start..end];
+                    let _ = kernel.address_space.write(buf.addr, slice);
+                    log::debug!("IFsStorage.Read off={:#x} size={:#x} → {} bytes (romfs total {})", offset, read_size, slice.len(), romfs.len());
+                } else {
+                    log::warn!("IFsStorage.Read: no recv buffer (off={:#x} size={:#x})", offset, read_size);
+                }
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            4 => {
+                let size = kernel.nro_romfs.len() as i64;
+                log::debug!("IFsStorage.GetSize → {}", size);
+                return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
+            }
+            _ => {}
+        }
+    }
+
+    if port_name == "set" || port_name == "set:sys" {
+        if let Some(outcome) = cmif_dispatch_set(kernel, ctx) {
+            log::debug!("set.cmd_{} → {} bytes (rc={:#x}) via #[service]", cmd_id, outcome.inline_out.len(), outcome.result);
+            return build_ipc_response(ctx, outcome.result, &outcome.inline_out, &[]);
+        }
+    }
+
     if let Some((data, handle_opt)) = applet_command_response(kernel, port_name, cmd_id) {
         log::debug!("{}.cmd_{} → returning data ({} bytes, handle={:?})", port_name, cmd_id, data.len(), handle_opt);
         let handles: Vec<u32> = handle_opt.into_iter().collect();
@@ -1697,6 +1774,8 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("time:s" | "time:u" | "time:a" | "time:r", 4) => Some("ISystemClock"),
         ("fsp-srv", 18) => Some("IFileSystem"),
         ("fsp-srv", 51) => Some("IFileSystem"),
+        ("fsp-srv", 200) => Some("IFsStorage"),
+        ("fsp-srv", 202) => Some("IFsStorage"),
         ("vi:m" | "vi:s" | "vi:u", 0) => Some("IApplicationDisplayService"),
         ("vi:m" | "vi:s" | "vi:u", 1) => Some("IApplicationDisplayService"),
         ("vi:m" | "vi:s" | "vi:u", 2) => Some("IApplicationDisplayService"),
@@ -2826,4 +2905,58 @@ fn unswizzle_block_linear(src: &[u8], stride: u32, height: u32, bpp: usize, bloc
         }
     }
     dst
+}
+
+struct AddressSpaceMemory<'a> {
+    addr_space: &'a nexium_memory::AddressSpace,
+}
+
+impl nexium_cmif::Memory for AddressSpaceMemory<'_> {
+    fn read(&self, addr: u64, dst: &mut [u8]) -> bool {
+        self.addr_space.read(addr, dst).is_ok()
+    }
+
+    fn write(&self, addr: u64, src: &[u8]) -> bool {
+        self.addr_space.write(addr, src).is_ok()
+    }
+}
+
+fn make_cmif_ctx<'a>(
+    ctx: &'a ipc::IpcCtx,
+    mem: &'a AddressSpaceMemory<'a>,
+    recv_buffers: &'a [nexium_cmif::CmifBuffer],
+    recv_statics: &'a [nexium_cmif::CmifBuffer],
+    send_buffers: &'a [nexium_cmif::CmifBuffer],
+    send_statics: &'a [nexium_cmif::CmifBuffer],
+) -> nexium_cmif::DispatchCtx<'a> {
+    let in_off = ctx.cmif_in_data_off;
+    let in_len = ctx.cmif_in_data_len;
+    let end = (in_off + in_len).min(ctx.buf.len());
+    nexium_cmif::DispatchCtx {
+        input_data: &ctx.buf[in_off..end],
+        recv_buffers,
+        recv_statics,
+        send_buffers,
+        send_statics,
+        mem,
+    }
+}
+
+fn convert_buffers(src: &[ipc::IpcBuffer]) -> Vec<nexium_cmif::CmifBuffer> {
+    src.iter()
+        .map(|b| nexium_cmif::CmifBuffer { addr: b.addr, size: b.size })
+        .collect()
+}
+
+fn cmif_dispatch_set(
+    kernel: &mut Kernel,
+    ctx: &ipc::IpcCtx,
+) -> Option<nexium_cmif::DispatchOutcome> {
+    let recv_buffers = convert_buffers(&ctx.recv_buffers);
+    let recv_statics = convert_buffers(&ctx.recv_statics);
+    let send_buffers = convert_buffers(&ctx.send_buffers);
+    let send_statics = convert_buffers(&ctx.send_statics);
+    let mem = AddressSpaceMemory { addr_space: &*kernel.address_space };
+    let mut cmif_ctx = make_cmif_ctx(ctx, &mem, &recv_buffers, &recv_statics, &send_buffers, &send_statics);
+    kernel.services.set.dispatch_cmif(ctx.cmif_in.cmd_id, &mut cmif_ctx)
 }

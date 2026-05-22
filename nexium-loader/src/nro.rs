@@ -84,6 +84,7 @@ pub struct Nro {
     pub ro: NroSegment,
     pub data: NroSegment,
     pub bss_size: u32,
+    pub romfs: Vec<u8>,
 }
 
 impl Nro {
@@ -152,12 +153,15 @@ impl Nro {
             data: nro_data[data_offset as usize..(data_offset + header.data_size) as usize].to_vec(),
         };
 
+        let romfs = parse_asset_romfs(data, header.size);
+
         Ok(Nro {
             header,
             text,
             ro,
             data: data_seg,
             bss_size: header.bss_size,
+            romfs,
         })
     }
 
@@ -179,4 +183,37 @@ impl Nro {
             _ => None,
         }
     }
+}
+
+fn parse_asset_romfs(nro_data: &[u8], nro_size: u32) -> Vec<u8> {
+    let asset_start = nro_size as usize;
+    if nro_data.len() < asset_start + 56 {
+        return Vec::new();
+    }
+    let asset = &nro_data[asset_start..];
+    let magic = u32::from_le_bytes([asset[0], asset[1], asset[2], asset[3]]);
+    if magic != 0x54_45_53_41 {
+        log::debug!("NRO: no ASET section (magic={:#x})", magic);
+        return Vec::new();
+    }
+    let romfs_off = u64::from_le_bytes([
+        asset[40], asset[41], asset[42], asset[43],
+        asset[44], asset[45], asset[46], asset[47],
+    ]) as usize;
+    let romfs_size = u64::from_le_bytes([
+        asset[48], asset[49], asset[50], asset[51],
+        asset[52], asset[53], asset[54], asset[55],
+    ]) as usize;
+    if romfs_size == 0 {
+        log::debug!("NRO: ASET section present but romfs size is 0");
+        return Vec::new();
+    }
+    let abs_start = asset_start + romfs_off;
+    let abs_end = abs_start + romfs_size;
+    if abs_end > nro_data.len() {
+        log::warn!("NRO: romfs section [{:#x}..{:#x}) exceeds NRO size {:#x}", abs_start, abs_end, nro_data.len());
+        return Vec::new();
+    }
+    log::info!("NRO: extracted romfs ({} bytes) at file offset {:#x}", romfs_size, abs_start);
+    nro_data[abs_start..abs_end].to_vec()
 }

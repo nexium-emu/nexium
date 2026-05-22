@@ -85,6 +85,7 @@ impl BootContext {
             tls_base,
             tls_pool_base,
         );
+        kernel.nro_romfs = nro.romfs.clone();
 
         log::info!("  Initializing environment block @ {:#x}", env_base);
         let env_builder = nexium_loader::EnvBlockBuilder::new()
@@ -104,14 +105,14 @@ impl BootContext {
             cpu.set_pc(entry_point);
             cpu.set_sp(sp);
             cpu.set_tpidrro_el0(tls_base);
-            cpu.set_register(0, env_base);
-            cpu.set_register(1, u64::MAX);
+            cpu.set_register(0, 0);
+            cpu.set_register(1, kernel.main_thread_handle as u64);
             cpu.set_register(30, exit_stub_va);
 
             log::info!("  PC: {:#x}", cpu.get_pc());
             log::info!("  SP: {:#x}", cpu.get_sp());
-            log::info!("  X0 (env_block): {:#x}", cpu.get_register(0));
-            log::info!("  X1 (env_size): {:#x}", cpu.get_register(1));
+            log::info!("  X0 (ctx=NULL forces NSO mode): {:#x}", cpu.get_register(0));
+            log::info!("  X1 (main_thread_handle): {:#x}", cpu.get_register(1));
             log::info!("  X30 (exit_stub): {:#x}", cpu.get_register(30));
             log::info!("  TPIDRRO_EL0: {:#x}", cpu.get_tpidrro_el0());
         }

@@ -1,0 +1,10 @@
+[package]
+name = "nexium-cmif"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nexium-cmif-macros = { path = "../nexium-cmif-macros" }
+log.workspace = true

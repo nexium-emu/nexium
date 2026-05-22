@@ -12,6 +12,7 @@ nexium-cpu.workspace = true
 nexium-loader.workspace = true
 nexium-shader.workspace = true
 nexium-ipc.workspace = true
+nexium-cmif.workspace = true
 nexium-nvdrv.workspace = true
 
 bytemuck.workspace = true

@@ -60,6 +60,8 @@ pub struct Kernel {
     pub friend_invitation_event: Option<u32>,
     pub notification_event: Option<u32>,
     pub acquired_sleep_lock_event: Option<u32>,
+
+    pub nro_romfs: Vec<u8>,
 }
 
 impl Kernel {
@@ -122,6 +124,7 @@ impl Kernel {
             friend_invitation_event: None,
             notification_event: None,
             acquired_sleep_lock_event: None,
+            nro_romfs: Vec::new(),
         }
     }
 
