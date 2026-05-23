@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg-b" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0e1430"/>
+      <stop offset="100%" stop-color="#020410"/>
+    </linearGradient>
+    <linearGradient id="hex-b" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3ddbff"/>
+      <stop offset="100%" stop-color="#0d8fbb"/>
+    </linearGradient>
+    <linearGradient id="n-b" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#cfeeff"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="56" fill="url(#bg-b)"/>
+
+  <g transform="translate(128 128)" fill="none" stroke="#3ddbff" stroke-width="2.5" opacity="0.55">
+    <ellipse rx="104" ry="36" transform="rotate(30)"/>
+    <ellipse rx="104" ry="36" transform="rotate(-30)"/>
+  </g>
+
+  <g fill="#ff7043">
+    <circle cx="218" cy="92" r="5"/>
+    <circle cx="38" cy="164" r="5"/>
+  </g>
+
+  <polygon points="128,42 196,82 196,174 128,214 60,174 60,82"
+           fill="url(#hex-b)" stroke="#3ddbff" stroke-width="2"/>
+
+  <path d="M 92 88
+           L 92 168
+           L 108 168
+           L 108 118
+           L 148 168
+           L 164 168
+           L 164 88
+           L 148 88
+           L 148 138
+           L 108 88
+           Z"
+        fill="url(#n-b)"/>
+</svg>
