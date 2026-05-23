@@ -83,7 +83,7 @@ impl BootContext {
         );
         kernel.nro_mmap = Some(nro.mmap_arc());
         kernel.nro_romfs_range = nro.romfs_range();
-        kernel.homebrew_dir = std::path::Path::new(&config.nro_path).parent().map(|p| p.to_path_buf());
+        kernel.homebrew_dir = resolve_homebrew_dir(&config.nro_path);
         log::info!("homebrew_dir = {:?}", kernel.homebrew_dir);
 
         log::info!("  Initializing environment block @ {:#x}", env_base);
@@ -190,4 +190,39 @@ impl BootContext {
         log::info!("Execution complete: {} cycles, {} SVCs", cycle_count, svc_count);
         Ok(0)
     }
+}
+
+fn resolve_homebrew_dir(loaded_nro_path: &str) -> Option<std::path::PathBuf> {
+    let appdata_nro = directories::BaseDirs::new()
+        .map(|d| d.config_dir().join("NeXium").join("NRO"));
+
+    if let Some(dir) = &appdata_nro {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            log::warn!("Failed to create homebrew dir {:?}: {}", dir, e);
+        }
+    }
+
+    if let Some(loaded_dir) = std::path::Path::new(loaded_nro_path).parent() {
+        if let Some(dst) = &appdata_nro {
+            if loaded_dir != dst {
+                if let Ok(rd) = std::fs::read_dir(loaded_dir) {
+                    for entry in rd.flatten() {
+                        let p = entry.path();
+                        let is_nro = p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("nro")).unwrap_or(false);
+                        if !is_nro { continue; }
+                        let Some(name) = p.file_name() else { continue };
+                        let dst_path = dst.join(name);
+                        if !dst_path.exists() {
+                            match std::fs::copy(&p, &dst_path) {
+                                Ok(n) => log::info!("Migrated {:?} → {:?} ({} bytes)", p, dst_path, n),
+                                Err(e) => log::warn!("Failed to migrate {:?}: {}", p, e),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    appdata_nro
 }
