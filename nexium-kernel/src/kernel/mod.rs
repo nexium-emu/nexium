@@ -63,6 +63,9 @@ pub struct Kernel {
 
     pub nro_mmap: Option<Arc<memmap2::Mmap>>,
     pub nro_romfs_range: Option<std::ops::Range<usize>>,
+
+    pub homebrew_dir: Option<std::path::PathBuf>,
+    pub dir_cursor: HashMap<u32, usize>,
 }
 
 impl Kernel {
@@ -127,6 +130,8 @@ impl Kernel {
             acquired_sleep_lock_event: None,
             nro_mmap: None,
             nro_romfs_range: None,
+            homebrew_dir: None,
+            dir_cursor: HashMap::new(),
         }
     }
 

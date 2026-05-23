@@ -83,6 +83,8 @@ impl BootContext {
         );
         kernel.nro_mmap = Some(nro.mmap_arc());
         kernel.nro_romfs_range = nro.romfs_range();
+        kernel.homebrew_dir = std::path::Path::new(&config.nro_path).parent().map(|p| p.to_path_buf());
+        log::info!("homebrew_dir = {:?}", kernel.homebrew_dir);
 
         log::info!("  Initializing environment block @ {:#x}", env_base);
         let nro_filename = std::path::Path::new(&config.nro_path)

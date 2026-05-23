@@ -943,6 +943,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
             }
             9 => {
                 log::debug!("IFileSystem.OpenDirectory → IDirectory sub-session");
+                kernel.dir_cursor.insert(session_handle, 0);
                 return return_subsession(kernel, ctx, session_handle, "IDirectory");
             }
             7 => {
@@ -1018,8 +1019,47 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
 
     if port_name == "IDirectory" {
         match cmd_id {
-            0 | 1 => {
-                return build_ipc_response(ctx, 0, &0u64.to_le_bytes(), &[]);
+            0 => {
+                let target = ctx.recv_buffers.iter()
+                    .find(|b| b.size > 0 && b.addr != 0)
+                    .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0))
+                    .copied();
+                let buf = match target {
+                    Some(b) => b,
+                    None => {
+                        log::warn!("IDirectory.Read: no recv buffer");
+                        return build_ipc_response(ctx, 0, &0i64.to_le_bytes(), &[]);
+                    }
+                };
+                let max_entries = (buf.size as usize) / 0x310;
+                let cursor = *kernel.dir_cursor.get(&session_handle).unwrap_or(&0);
+                let entries = enumerate_homebrew_nros(&kernel.homebrew_dir);
+                let remaining = entries.len().saturating_sub(cursor);
+                let to_emit = remaining.min(max_entries);
+                let mut payload = vec![0u8; to_emit * 0x310];
+                for (i, e) in entries.iter().skip(cursor).take(to_emit).enumerate() {
+                    let base = i * 0x310;
+                    let name_bytes = e.name.as_bytes();
+                    let name_len = name_bytes.len().min(0x300);
+                    payload[base..base + name_len].copy_from_slice(&name_bytes[..name_len]);
+                    payload[base + 0x301 + 3] = 1;
+                    payload[base + 0x308..base + 0x310].copy_from_slice(&e.size.to_le_bytes());
+                }
+                if !payload.is_empty() {
+                    let _ = kernel.address_space.write(buf.addr, &payload);
+                }
+                kernel.dir_cursor.insert(session_handle, cursor + to_emit);
+                log::info!(
+                    "IDirectory.Read cursor={} max_entries={} → {} of {} entries (homebrew_dir={:?})",
+                    cursor, max_entries, to_emit, entries.len(), kernel.homebrew_dir
+                );
+                let total: i64 = to_emit as i64;
+                return build_ipc_response(ctx, 0, &total.to_le_bytes(), &[]);
+            }
+            1 => {
+                let count = enumerate_homebrew_nros(&kernel.homebrew_dir).len() as i64;
+                log::info!("IDirectory.GetEntryCount → {}", count);
+                return build_ipc_response(ctx, 0, &count.to_le_bytes(), &[]);
             }
             _ => {}
         }
@@ -3001,6 +3041,30 @@ fn convert_buffers(src: &[ipc::IpcBuffer]) -> Vec<nexium_cmif::CmifBuffer> {
     src.iter()
         .map(|b| nexium_cmif::CmifBuffer { addr: b.addr, size: b.size })
         .collect()
+}
+
+struct HomebrewEntry {
+    name: String,
+    size: i64,
+}
+
+fn enumerate_homebrew_nros(dir: &Option<std::path::PathBuf>) -> Vec<HomebrewEntry> {
+    let Some(dir) = dir else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<HomebrewEntry> = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let is_nro = path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("nro")).unwrap_or(false);
+        if !is_nro { continue; }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let size = entry.metadata().map(|m| m.len() as i64).unwrap_or(0);
+        out.push(HomebrewEntry { name, size });
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
 }
 
 fn cmif_dispatch_set(
