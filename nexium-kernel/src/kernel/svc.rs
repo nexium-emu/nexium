@@ -1277,12 +1277,17 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
             if let Some(ref mut g) = gb {
                 if g.nvmap_id == 0 && g.kind == 254 {
                     let tiled_size = compute_tiled_size(g.stride, g.height, g.block_height_log2);
+                    let needed = (g.buffer_offset as usize).saturating_add(tiled_size);
                     let pick = kernel.nvdrv.nvmap_handles.iter()
-                        .filter(|(_, h)| h.address != 0 && h.size as usize == tiled_size)
-                        .map(|(id, _)| *id)
-                        .max();
+                        .filter(|(_, h)| h.address != 0 && (h.size as usize) >= needed)
+                        .min_by_key(|(_, h)| h.size as usize)
+                        .map(|(id, _)| *id);
                     if let Some(id) = pick {
                         g.nvmap_id = id;
+                        log::info!(
+                            "SetPreallocatedBuffer fixup: nvmap_id=0 → {} (off={:#x} tiled_size={:#x} needed={:#x})",
+                            id, g.buffer_offset, tiled_size, needed
+                        );
                     }
                 }
             }
