@@ -1071,6 +1071,13 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
         }
     }
 
+    if port_name == "pl:u" || port_name == "pl:s" {
+        if let Some(outcome) = cmif_dispatch_pl(kernel, ctx) {
+            log::debug!("pl.cmd_{} → {} bytes (rc={:#x}) via #[service]", cmd_id, outcome.inline_out.len(), outcome.result);
+            return build_ipc_response(ctx, outcome.result, &outcome.inline_out, &[]);
+        }
+    }
+
     if let Some((data, handle_opt)) = applet_command_response(kernel, port_name, cmd_id) {
         log::debug!("{}.cmd_{} → returning data ({} bytes, handle={:?})", port_name, cmd_id, data.len(), handle_opt);
         let handles: Vec<u32> = handle_opt.into_iter().collect();
@@ -3007,4 +3014,17 @@ fn cmif_dispatch_set(
     let mem = AddressSpaceMemory { addr_space: &*kernel.address_space };
     let mut cmif_ctx = make_cmif_ctx(ctx, &mem, &recv_buffers, &recv_statics, &send_buffers, &send_statics);
     kernel.services.set.dispatch_cmif(ctx.cmif_in.cmd_id, &mut cmif_ctx)
+}
+
+fn cmif_dispatch_pl(
+    kernel: &mut Kernel,
+    ctx: &ipc::IpcCtx,
+) -> Option<nexium_cmif::DispatchOutcome> {
+    let recv_buffers = convert_buffers(&ctx.recv_buffers);
+    let recv_statics = convert_buffers(&ctx.recv_statics);
+    let send_buffers = convert_buffers(&ctx.send_buffers);
+    let send_statics = convert_buffers(&ctx.send_statics);
+    let mem = AddressSpaceMemory { addr_space: &*kernel.address_space };
+    let mut cmif_ctx = make_cmif_ctx(ctx, &mem, &recv_buffers, &recv_statics, &send_buffers, &send_statics);
+    kernel.services.pl.dispatch_cmif(ctx.cmif_in.cmd_id, &mut cmif_ctx)
 }
