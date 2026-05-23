@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 nexium-shader.workspace = true
+nexium-gpu = { path = "../nexium-gpu" }
 
 log.workspace = true
 bytemuck.workspace = true

@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 nexium-common.workspace = true
-nexium-core.workspace = true
 
 ash = "0.38"
 parking_lot = "0.12"

@@ -9,6 +9,9 @@ pub mod presenter;
 pub mod deswizzle;
 pub mod draw;
 pub mod commands;
+pub mod renderer;
+
+pub use renderer::Renderer;
 
 use ash::vk;
 use std::ffi::CStr;

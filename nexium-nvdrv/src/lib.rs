@@ -155,6 +155,7 @@ pub struct Nvdrv {
     pub stats: Arc<PipelineStats>,
     pub channel_client_data: u64,
     pub legacy_gfx: std::sync::atomic::AtomicBool,
+    pub renderer: std::sync::OnceLock<Option<Arc<nexium_gpu::Renderer>>>,
 }
 
 impl Nvdrv {
@@ -174,11 +175,28 @@ impl Nvdrv {
             stats,
             channel_client_data: 0,
             legacy_gfx: std::sync::atomic::AtomicBool::new(false),
+            renderer: std::sync::OnceLock::new(),
         }
     }
 
     pub fn frame_queue_depth(&self) -> usize {
         self.frame_queue.lock().len()
+    }
+
+    pub fn renderer(&self) -> Option<&Arc<nexium_gpu::Renderer>> {
+        let slot = self.renderer.get_or_init(|| {
+            match nexium_gpu::Renderer::new() {
+                Ok(r) => {
+                    log::info!("nexium-nvdrv: Vulkan Renderer initialized");
+                    Some(r)
+                }
+                Err(e) => {
+                    log::warn!("nexium-nvdrv: Vulkan Renderer init failed: {} (falling back to CPU)", e);
+                    None
+                }
+            }
+        });
+        slot.as_ref()
     }
 
     pub fn pace_swap(&self, swap_interval: i32) {
