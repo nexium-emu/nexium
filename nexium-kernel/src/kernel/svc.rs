@@ -1405,6 +1405,13 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                     let mut effective_addr = addr;
                     let mut effective_bh_log2 = gb.block_height_log2;
                     if kernel.address_space.read(addr, &mut raw).is_ok() {
+                        let nonzero = raw.iter().filter(|&&b| b != 0).count();
+                        if nonzero > 0 && slot < 2 {
+                            log::info!(
+                                "QueueBuffer slot={} addr={:#x} nonzero_bytes={}/{} first16={:02x?}",
+                                slot, addr, nonzero, read_size, &raw[..16.min(raw.len())]
+                            );
+                        }
                         if is_tiled && raw.iter().all(|&b| b == 0) {
 
                             let (tiled_rt_cpu, dma_bh_log2, dma_stride, dma_height) = {
