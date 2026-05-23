@@ -46,6 +46,7 @@ pub struct Threads {
     pub next_tid: u64,
     pub next_tls_va: u64,
     pub tls_stride: u64,
+    pub last_switch: Instant,
 }
 
 impl Threads {
@@ -70,7 +71,12 @@ impl Threads {
             next_tid: 2,
             next_tls_va: tls_pool_base,
             tls_stride: 0x1000,
+            last_switch: Instant::now(),
         }
+    }
+
+    pub fn timeslice_expired(&self, threshold: std::time::Duration) -> bool {
+        !self.ready.is_empty() && self.last_switch.elapsed() >= threshold
     }
 
     pub fn alloc_tls(&mut self) -> u64 {
@@ -276,6 +282,7 @@ impl Threads {
             self.ready.push_back(h);
         }
         self.current = None;
+        self.last_switch = Instant::now();
         Some(h)
     }
 
@@ -283,8 +290,10 @@ impl Threads {
         self.load_thread(handle, cpu);
         if let Some(t) = self.threads.get_mut(&handle) {
             t.state = ThreadState::Running;
+            log::info!("[sched] now running handle={:#x} pc={:#x} sp={:#x}", handle, t.ctx.pc, t.ctx.sp);
         }
         self.current = Some(handle);
+        self.last_switch = Instant::now();
     }
 
     pub fn earliest_wake(&self) -> Option<Instant> {

@@ -433,6 +433,9 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         }
 
         const TIMEOUT_ERROR: u32 = 1 | (117 << 9);
+        if !kernel.threads.ready.is_empty() {
+            kernel.yield_after_svc = true;
+        }
         if let Some(cpu) = &mut kernel.cpu {
             cpu.set_register(0, TIMEOUT_ERROR as u64);
             cpu.set_register(1, 0);

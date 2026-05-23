@@ -589,6 +589,21 @@ impl EmulationHandle {
                         if let Some(cpu) = &mut boot_ctx.kernel.cpu {
                             cpu.set_register(0, result as u64);
                         }
+                        let timeslice = boot_ctx.kernel.threads.timeslice_expired(std::time::Duration::from_millis(4));
+                        let should_yield = boot_ctx.kernel.yield_after_svc || timeslice;
+                        if should_yield {
+                            let reason = if boot_ctx.kernel.yield_after_svc { "flag" } else { "timeslice" };
+                            let from = boot_ctx.kernel.threads.current_handle();
+                            let ready_len = boot_ctx.kernel.threads.ready.len();
+                            boot_ctx.kernel.yield_after_svc = false;
+                            if let Some(cpu) = boot_ctx.kernel.cpu.as_ref() {
+                                boot_ctx.kernel.threads.yield_with_state(
+                                    cpu,
+                                    nexium_core::kernel::threads::ThreadState::Ready,
+                                );
+                            }
+                            log::info!("[yield] reason={} from={:?} ready_before={}", reason, from, ready_len);
+                        }
                     }
 
                     if svc_count % 16 == 0 {

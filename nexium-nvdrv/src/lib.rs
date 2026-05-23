@@ -153,6 +153,7 @@ pub struct Nvdrv {
     pub last_swap_return: Arc<Mutex<Option<std::time::Instant>>>,
     pub queue_buffer_active: Arc<std::sync::atomic::AtomicBool>,
     pub stats: Arc<PipelineStats>,
+    pub channel_client_data: u64,
 }
 
 impl Nvdrv {
@@ -170,6 +171,7 @@ impl Nvdrv {
             last_swap_return: Arc::new(Mutex::new(None)),
             queue_buffer_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stats,
+            channel_client_data: 0,
         }
     }
 
@@ -258,12 +260,10 @@ impl Nvdrv {
                 log::debug!("nvmap:Create in_data={:02x?} → size={} id={}", &req.in_data[..req.in_data.len().min(16)], size, id);
             }
             0x0103 => {
-                if req.in_data.len() >= 4 {
+                if req.in_data.len() >= 4 && out.len() >= 8 {
                     let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
-                    log::debug!("nvmap:FromId id={}", id);
-                    if out.len() >= 4 {
-                        out[0..4].copy_from_slice(&id.to_le_bytes());
-                    }
+                    out[4..8].copy_from_slice(&id.to_le_bytes());
+                    log::debug!("nvmap:FromId id={} → handle={}", id, id);
                 }
             }
             0x0104 => {
@@ -281,15 +281,37 @@ impl Nvdrv {
                 }
             }
             0x0105 => {
-                log::debug!("nvmap:Free");
+                if req.in_data.len() >= 4 && out.len() >= 24 {
+                    let handle = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let size = self.nvmap_handles.get(&handle).map(|h| h.size).unwrap_or(0);
+                    self.nvmap_handles.remove(&handle);
+                    out[8..16].copy_from_slice(&0u64.to_le_bytes());
+                    out[16..20].copy_from_slice(&size.to_le_bytes());
+                    out[20..24].copy_from_slice(&0u32.to_le_bytes());
+                    log::debug!("nvmap:Free handle={} size={}", handle, size);
+                }
             }
             0x0109 => {
-                log::debug!("nvmap:Param");
+                if req.in_data.len() >= 8 && out.len() >= 12 {
+                    let handle = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let param = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    let result = match param {
+                        1 => self.nvmap_handles.get(&handle).map(|h| h.size).unwrap_or(0),
+                        2 => 0x10000,
+                        3 => 0,
+                        4 => self.nvmap_handles.get(&handle).map(|h| h.kind as u32).unwrap_or(0),
+                        5 => 0,
+                        _ => 0,
+                    };
+                    out[8..12].copy_from_slice(&result.to_le_bytes());
+                    log::debug!("nvmap:Param handle={} param={} → {}", handle, param, result);
+                }
             }
             0x010E => {
-                log::debug!("nvmap:GetId");
-                if out.len() >= 4 && req.in_data.len() >= 4 {
-                    out[0..4].copy_from_slice(&req.in_data[0..4]);
+                if req.in_data.len() >= 8 && out.len() >= 4 {
+                    let handle = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    out[0..4].copy_from_slice(&handle.to_le_bytes());
+                    log::debug!("nvmap:GetId handle={} → id={}", handle, handle);
                 }
             }
             other => {
@@ -371,6 +393,12 @@ impl Nvdrv {
                 out[gc_off + 0x90..gc_off + 0x98].copy_from_slice(&chipname.to_le_bytes());
                 log::debug!("nvhost-ctrl-gpu:GetCharacteristics → GM20B");
             }
+            0x4703 => {
+                log::debug!("nvhost-ctrl-gpu:ZbcSetTable (ack)");
+            }
+            0x4704 => {
+                log::debug!("nvhost-ctrl-gpu:ZbcQueryTable");
+            }
             0x4706 => {
                 if out.len() < 24 { out.resize(24, 0); }
                 if req.in_data.len() >= 4 {
@@ -382,10 +410,21 @@ impl Nvdrv {
                 }
                 log::debug!("nvhost-ctrl-gpu:GetTpcMasks → 3");
             }
-            0x4714 => { log::debug!("nvhost-ctrl-gpu:GetL2State (legacy gfx)"); }
-            0x4718 => {
-                log::debug!("nvhost-ctrl-gpu:GetGpuTime");
-                if out.len() >= 8 { out[0..8].copy_from_slice(&0u64.to_le_bytes()); }
+            0x4714 => {
+                if out.len() >= 8 {
+                    out[0..4].copy_from_slice(&0x07u32.to_le_bytes());
+                    out[4..8].copy_from_slice(&0x01u32.to_le_bytes());
+                }
+                log::debug!("nvhost-ctrl-gpu:GetActiveSlotMask → slot=7 mask=1");
+            }
+            0x471c => {
+                if out.len() < 16 { out.resize(16, 0); }
+                let ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                out[0..8].copy_from_slice(&ns.to_le_bytes());
+                log::debug!("nvhost-ctrl-gpu:GetGpuTime → {}ns", ns);
             }
             other => {
                 log::debug!("nvhost-ctrl-gpu: unknown ioctl cmd={:#x}", other);
@@ -423,22 +462,13 @@ impl Nvdrv {
                 }
             }
             0x4105 => {
-                let small_offset: u64 = 0x4_0000;
-                let small_page: u32 = 0x1000;
-                let small_pages: u64 = ((1u64 << 34) - small_offset) / small_page as u64;
-                let big_offset: u64 = 1u64 << 34;
-                let big_page: u32 = 0x10000;
-                let big_pages: u64 = ((1u64 << 38) - big_offset) / big_page as u64;
-                if out.len() < 64 {
-                    out.resize(64, 0);
+                if req.in_data.len() >= 8 {
+                    let gpu_va = u64::from_le_bytes([
+                        req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],
+                        req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7],
+                    ]);
+                    log::debug!("nvhost-as-gpu:UnmapBuffer gpu_va={:#x}", gpu_va);
                 }
-                out[16..24].copy_from_slice(&small_offset.to_le_bytes());
-                out[24..28].copy_from_slice(&small_page.to_le_bytes());
-                out[32..40].copy_from_slice(&small_pages.to_le_bytes());
-                out[40..48].copy_from_slice(&big_offset.to_le_bytes());
-                out[48..52].copy_from_slice(&big_page.to_le_bytes());
-                out[56..64].copy_from_slice(&big_pages.to_le_bytes());
-                log::debug!("nvhost-as-gpu:GetVaRegions small={} big={}", small_pages, big_pages);
             }
             0x4106 => {
                 if req.in_data.len() >= 40 {
@@ -485,15 +515,72 @@ impl Nvdrv {
                 }
             }
             0x4108 => {
-                if req.in_data.len() >= 8 {
+                let small_offset: u64 = 0x4_0000;
+                let small_page: u32 = 0x1000;
+                let small_pages: u64 = ((1u64 << 34) - small_offset) / small_page as u64;
+                let big_offset: u64 = 1u64 << 34;
+                let big_page: u32 = 0x10000;
+                let big_pages: u64 = ((1u64 << 38) - big_offset) / big_page as u64;
+                if out.len() < 64 {
+                    out.resize(64, 0);
+                }
+                out[16..24].copy_from_slice(&small_offset.to_le_bytes());
+                out[24..28].copy_from_slice(&small_page.to_le_bytes());
+                out[32..40].copy_from_slice(&small_pages.to_le_bytes());
+                out[40..48].copy_from_slice(&big_offset.to_le_bytes());
+                out[48..52].copy_from_slice(&big_page.to_le_bytes());
+                out[56..64].copy_from_slice(&big_pages.to_le_bytes());
+                log::debug!("nvhost-as-gpu:GetVARegions small_pages={} big_pages={}", small_pages, big_pages);
+            }
+            0x4109 => { log::debug!("nvhost-as-gpu:AllocAsEx (InitializeEx)"); }
+            0x4103 => {
+                if req.in_data.len() >= 16 {
                     let gpu_va = u64::from_le_bytes([
                         req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],
                         req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7],
                     ]);
-                    log::debug!("nvhost-as-gpu:UnmapBuffer gpu_va={:#x}", gpu_va);
+                    log::debug!("nvhost-as-gpu:FreeSpace gpu_va={:#x}", gpu_va);
                 }
             }
-            0x4109 => { log::debug!("nvhost-as-gpu:AllocAsEx (InitializeEx)"); }
+            0x4114 => {
+                let num_entries = req.in_data.len() / 20;
+                for i in 0..num_entries {
+                    let off = i * 20;
+                    if req.in_data.len() < off + 20 { break; }
+                    let _flags = u16::from_le_bytes([req.in_data[off], req.in_data[off + 1]]);
+                    let _kind = u16::from_le_bytes([req.in_data[off + 2], req.in_data[off + 3]]);
+                    let nvmap_handle = u32::from_le_bytes([
+                        req.in_data[off + 4], req.in_data[off + 5],
+                        req.in_data[off + 6], req.in_data[off + 7],
+                    ]);
+                    let handle_offset_big_pages = u32::from_le_bytes([
+                        req.in_data[off + 8], req.in_data[off + 9],
+                        req.in_data[off + 10], req.in_data[off + 11],
+                    ]);
+                    let as_offset_big_pages = u32::from_le_bytes([
+                        req.in_data[off + 12], req.in_data[off + 13],
+                        req.in_data[off + 14], req.in_data[off + 15],
+                    ]);
+                    let big_pages = u32::from_le_bytes([
+                        req.in_data[off + 16], req.in_data[off + 17],
+                        req.in_data[off + 18], req.in_data[off + 19],
+                    ]);
+                    let big_page_size: u64 = 0x10000;
+                    let gpu_va = (as_offset_big_pages as u64) * big_page_size;
+                    let size = (big_pages as u64) * big_page_size;
+                    let handle_off = (handle_offset_big_pages as u64) * big_page_size;
+                    let cpu_addr = self.nvmap_handles.get(&nvmap_handle)
+                        .map(|h| h.address.wrapping_add(handle_off))
+                        .unwrap_or(0);
+                    log::debug!(
+                        "nvhost-as-gpu:Remap[{}/{}] nvmap_id={} cpu={:#x} → gpu_va={:#x} size={:#x}",
+                        i, num_entries, nvmap_handle, cpu_addr, gpu_va, size
+                    );
+                    if cpu_addr != 0 {
+                        self.gpu.mappings.lock().add(gpu_va, size, cpu_addr, nvmap_handle);
+                    }
+                }
+            }
             other => {
                 log::debug!("nvhost-as-gpu: unknown ioctl cmd={:#x}", other);
             }
@@ -564,17 +651,67 @@ impl Nvdrv {
                     }
                 }
             }
-            0x4809 => { log::debug!("nvhost-gpu:AllocateObjectContext"); }
-            0x480b => { log::debug!("nvhost-gpu:ZCullBind"); }
-            0x480c => { log::debug!("nvhost-gpu:SetErrorNotifier"); }
-            0x480d => { log::debug!("nvhost-gpu:SetChannelPriority"); }
-            0x481a => {
-                log::debug!("nvhost-gpu:AllocGPFIFOEx2");
-                if out.len() >= 24 {
-                    let event_id = self.next_event_id;
-                    self.next_event_id = self.next_event_id.wrapping_add(1);
-                    out[20..24].copy_from_slice(&event_id.to_le_bytes());
+            0x4809 => {
+                if req.in_data.len() >= 8 && out.len() >= 16 {
+                    let class_num = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    out[8..16].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
+                    log::debug!("nvhost-gpu:AllocObjCtx class={:#x} → obj_id=0xDEADBEEF", class_num);
                 }
+            }
+            0x480b => {
+                if req.in_data.len() >= 12 {
+                    let gpu_va = u64::from_le_bytes([
+                        req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],
+                        req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7],
+                    ]);
+                    let mode = u32::from_le_bytes([req.in_data[8], req.in_data[9], req.in_data[10], req.in_data[11]]);
+                    log::debug!("nvhost-gpu:ZCullBind gpu_va={:#x} mode={}", gpu_va, mode);
+                }
+            }
+            0x480c => {
+                if req.in_data.len() >= 20 {
+                    let enable = u32::from_le_bytes([req.in_data[16], req.in_data[17], req.in_data[18], req.in_data[19]]);
+                    log::debug!("nvhost-gpu:SetErrorNotifier enable={}", enable);
+                }
+            }
+            0x480d => {
+                if req.in_data.len() >= 4 {
+                    let prio = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    log::debug!("nvhost-gpu:SetPriority prio={:#x}", prio);
+                }
+            }
+            0x4816 => {
+                log::debug!("nvhost-gpu:GetErrorInfo");
+            }
+            0x4817 => {
+                log::debug!("nvhost-gpu:GetErrorNotification");
+            }
+            0x481a => {
+                if req.in_data.len() >= 28 && out.len() >= 28 {
+                    let num_entries = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let flags = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    let syncpt_id = self.next_event_id;
+                    self.next_event_id = self.next_event_id.wrapping_add(1);
+                    out[12..16].copy_from_slice(&syncpt_id.to_le_bytes());
+                    out[16..20].copy_from_slice(&0u32.to_le_bytes());
+                    log::debug!("nvhost-gpu:AllocGpfifoEx2 num_entries={} flags={:#x} → fence_id={}", num_entries, flags, syncpt_id);
+                }
+            }
+            0x4714 => {
+                if req.in_data.len() >= 8 {
+                    let data = u64::from_le_bytes([
+                        req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],
+                        req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7],
+                    ]);
+                    self.channel_client_data = data;
+                    log::debug!("nvhost-gpu:SetClientData data={:#x}", data);
+                }
+            }
+            0x4715 => {
+                if out.len() >= 8 {
+                    out[0..8].copy_from_slice(&self.channel_client_data.to_le_bytes());
+                }
+                log::debug!("nvhost-gpu:GetClientData → {:#x}", self.channel_client_data);
             }
             0x481d => { log::debug!("nvhost-gpu:ChannelSetTimeslice"); }
             other => {
@@ -591,29 +728,59 @@ impl Nvdrv {
 
         match cmd {
             0x0014 => {
-                log::debug!("nvhost-ctrl:SyncptRead");
-                if out.len() >= 8 && req.in_data.len() >= 4 {
+                if req.in_data.len() >= 4 && out.len() >= 8 {
+                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
                     out[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+                    log::debug!("nvhost-ctrl:SyncptRead syncpt_id={} → {:#x}", id, u32::MAX);
                 }
             }
-            0x0015 => { log::debug!("nvhost-ctrl:SyncptIncr"); }
-            0x0016 | 0x001d => {
-                log::debug!("nvhost-ctrl:SyncptWait (ack)");
+            0x0015 => {
+                if req.in_data.len() >= 4 {
+                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    log::debug!("nvhost-ctrl:SyncptIncr syncpt_id={}", id);
+                }
             }
-            0x001a => {
-                log::debug!("nvhost-ctrl:GetConfig");
+            0x0016 => {
+                if req.in_data.len() >= 12 {
+                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let threshold = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    log::debug!("nvhost-ctrl:SyncptWait syncpt_id={} threshold={:#x}", id, threshold);
+                }
             }
-            0x001b => {
-                log::debug!("nvhost-ctrl:EventWait (returning signaled)");
+            0x001c => {
+                if req.in_data.len() >= 4 {
+                    let event_id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    log::debug!("nvhost-ctrl:EventSignal event_id={}", event_id);
+                }
             }
-            0x001c | 0x001e => {
-                log::debug!("nvhost-ctrl:EventWaitAsync / EventRegister");
-                if out.len() >= 4 { out[0..4].copy_from_slice(&0u32.to_le_bytes()); }
+            0x001d => {
+                if req.in_data.len() >= 16 && out.len() >= 16 {
+                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let threshold = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    out[12..16].copy_from_slice(&threshold.to_le_bytes());
+                    log::debug!("nvhost-ctrl:EventWait syncpt={} threshold={:#x} (ack as signaled)", id, threshold);
+                }
             }
-            0x001f => { log::debug!("nvhost-ctrl:EventSignal"); }
-            0x0020 => { log::debug!("nvhost-ctrl:EventClear"); }
-            0x0021 => { log::debug!("nvhost-ctrl:EventUnregister"); }
-            0x0033 => { log::debug!("nvhost-ctrl:GetGpuCharacteristics"); }
+            0x001e => {
+                if req.in_data.len() >= 16 {
+                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let threshold = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    let event_id = u32::from_le_bytes([req.in_data[12], req.in_data[13], req.in_data[14], req.in_data[15]]);
+                    log::debug!("nvhost-ctrl:EventWaitAsync syncpt={} threshold={:#x} event_id={}", id, threshold, event_id);
+                }
+            }
+            0x001f => {
+                if req.in_data.len() >= 4 {
+                    let event_id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    log::debug!("nvhost-ctrl:EventRegister event_id={}", event_id);
+                }
+            }
+            0x0020 => {
+                if req.in_data.len() >= 4 {
+                    let event_id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    log::debug!("nvhost-ctrl:EventUnregister event_id={}", event_id);
+                }
+            }
             other => {
                 log::debug!("nvhost-ctrl: unknown ioctl cmd={:#x}", other);
             }
