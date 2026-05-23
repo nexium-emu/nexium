@@ -344,6 +344,54 @@ impl EmulationHandle {
                     cycle_count += 100_000;
                     boot_ctx.kernel.cycle_count += 100_000;
 
+                    if pc_after < 0x10000 {
+                        let cur = boot_ctx.kernel.threads.current_handle();
+                        let lr = cpu.get_register(30);
+                        let sp = cpu.get_sp();
+                        let mut regs = [0u64; 31];
+                        for i in 0..31 { regs[i] = cpu.get_register(i as u32); }
+                        log::error!("[null-pc] PC entered null page ({:#x}) — likely null function pointer / corrupted vtable", pc_after);
+                        log::error!("[null-pc] handle={:?} lr={:#x} sp={:#x}", cur, lr, sp);
+                        for chunk in 0..4u32 {
+                            let b = (chunk * 8) as usize;
+                            log::error!(
+                                "[null-pc] x{:>2}={:#018x} x{:>2}={:#018x} x{:>2}={:#018x} x{:>2}={:#018x} x{:>2}={:#018x} x{:>2}={:#018x} x{:>2}={:#018x} x{:>2}={:#018x}",
+                                b, regs[b], b+1, regs[b+1], b+2, regs[b+2], b+3, regs[b+3],
+                                b+4, regs[b+4], b+5, regs[b+5], b+6, regs[b+6], b+7, regs[b+7],
+                            );
+                        }
+                        if lr >= 0x20 {
+                            let mut instrs = [0u8; 48];
+                            if boot_ctx.kernel.address_space.read(lr.wrapping_sub(0x20), &mut instrs).is_ok() {
+                                for off in 0..12usize {
+                                    let bytes = &instrs[off*4..off*4+4];
+                                    let insn = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                                    let addr = lr.wrapping_sub(0x20) + (off as u64) * 4;
+                                    let mark = if addr + 4 == lr { " <- BL/BLR site (target was null)" }
+                                              else if addr == lr { " <- LR (return target)" }
+                                              else { "" };
+                                    log::error!("[null-pc] {:#x}: {:08x} ({}){}", addr, insn, decode_a64_brief(insn), mark);
+                                }
+                            }
+                        }
+                        let x20 = regs[20];
+                        if x20 >= 0x10000 {
+                            let mut peek = [0u8; 64];
+                            if boot_ctx.kernel.address_space.read(x20, &mut peek).is_ok() {
+                                log::error!("[null-pc] *x20[0..64] = {:02x?}", &peek);
+                            }
+                        }
+                        let x22 = regs[22];
+                        if x22 >= 0x10000 {
+                            let mut peek = [0u8; 64];
+                            if boot_ctx.kernel.address_space.read(x22, &mut peek).is_ok() {
+                                log::error!("[null-pc] *x22[0..64] = {:02x?}", &peek);
+                            }
+                        }
+                        log::error!("[null-pc] halting emulation for diagnosis");
+                        break;
+                    }
+
                     let in_libnx = pc_after >= 0x8000_0000_00 && pc_after < 0x8000_a0_0000;
                     let no_svc_progress = matches!(event, nexium_core::cpu::CpuEvent::Running) && in_libnx;
                     if no_svc_progress {
