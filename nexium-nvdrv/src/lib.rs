@@ -25,6 +25,7 @@ pub struct PipelineStats {
     pub vsync_signals: AtomicU64,
     pub frames_submitted: AtomicU64,
     pub frames_drained: AtomicU64,
+    pub fence_releases: AtomicU64,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -44,6 +45,7 @@ pub struct PipelineStatsSnapshot {
     pub vsync_signals: u64,
     pub frames_submitted: u64,
     pub frames_drained: u64,
+    pub fence_releases: u64,
 }
 
 impl PipelineStats {
@@ -64,6 +66,7 @@ impl PipelineStats {
             vsync_signals: self.vsync_signals.load(Ordering::Relaxed),
             frames_submitted: self.frames_submitted.load(Ordering::Relaxed),
             frames_drained: self.frames_drained.load(Ordering::Relaxed),
+            fence_releases: self.fence_releases.load(Ordering::Relaxed),
         }
     }
 }

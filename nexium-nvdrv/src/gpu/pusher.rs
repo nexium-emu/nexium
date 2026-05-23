@@ -282,6 +282,21 @@ impl Pusher {
                     }
                 }
             }
+            if !maxwell.regs.pending_semaphore_writes.is_empty() {
+                let writes = std::mem::take(&mut maxwell.regs.pending_semaphore_writes);
+                for (gpu_va, payload) in writes {
+                    if let Some(cpu) = mappings.cpu_address_for(gpu_va) {
+                        let ok = mem_write(cpu, &payload.to_le_bytes());
+                        log::info!(
+                            "pusher: fence release gpu_va={:#x} cpu={:#x} payload={:#x} write_ok={}",
+                            gpu_va, cpu, payload, ok
+                        );
+                        stats.fence_releases.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        log::warn!("pusher: fence release gpu_va={:#x} not mapped — payload={:#x} dropped", gpu_va, payload);
+                    }
+                }
+            }
             if !maxwell.pending_draws.is_empty() {
                 let draws = std::mem::take(&mut maxwell.pending_draws);
                 sw_renderer::execute_draws(&draws, mappings, maxwell_dma, mem_read, mem_write);

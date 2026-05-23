@@ -99,6 +99,7 @@ pub struct Maxwell3DRegisters {
     pub constbuf_load_offset: u32,
 
     pub pending_constbuf_writes: Vec<(u64, u32)>,
+    pub pending_semaphore_writes: Vec<(u64, u32)>,
 
     pub last_constbuf_addr: u64,
     pub last_constbuf_size: u32,
@@ -145,6 +146,7 @@ impl Default for Maxwell3DRegisters {
             constbuf_selector_addr_lo: 0,
             constbuf_load_offset: 0,
             pending_constbuf_writes: Vec::new(),
+            pending_semaphore_writes: Vec::new(),
             last_constbuf_addr: 0,
             last_constbuf_size: 0,
             cbuf_binds: [[(0, 0); 16]; 5],
@@ -325,6 +327,21 @@ impl Maxwell3D {
         }
 
         match method {
+            0x6c3 => {
+                let operation = arg & 0x3;
+                let structure_size = (arg >> 12) & 0x1;
+                if operation == 0 {
+                    let off_hi = self.reg_file.get(0x6c0).copied().unwrap_or(0);
+                    let off_lo = self.reg_file.get(0x6c1).copied().unwrap_or(0);
+                    let payload = self.reg_file.get(0x6c2).copied().unwrap_or(0);
+                    let gpu_va = ((off_hi as u64) << 32) | (off_lo as u64);
+                    self.regs.pending_semaphore_writes.push((gpu_va, payload));
+                    log::debug!(
+                        "maxwell3d: SET_REPORT_SEMAPHORE Release gpu_va={:#x} payload={:#x} struct_size={}",
+                        gpu_va, payload, structure_size
+                    );
+                }
+            }
             0x360..=0x363 => {
                 let idx = (method - 0x360) as usize;
                 let f = f32::from_bits(arg);
