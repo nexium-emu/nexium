@@ -938,7 +938,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     if port_name == "IFileSystem" {
         match cmd_id {
             8 => {
-                log::debug!("IFileSystem.OpenFile → IFile sub-session (empty file)");
+                log::debug!("IFileSystem.OpenFile → IFile sub-session (nro-backed)");
                 return return_subsession(kernel, ctx, session_handle, "IFile");
             }
             9 => {
@@ -946,9 +946,9 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                 return return_subsession(kernel, ctx, session_handle, "IDirectory");
             }
             7 => {
-                let fs_not_found = 1 | (1 << 9) | (2 << 21);
-                log::debug!("IFileSystem.GetEntryType → FS_NOT_FOUND");
-                return build_ipc_response(ctx, fs_not_found, &[], &[]);
+                let entry_type: u32 = 1;
+                log::debug!("IFileSystem.GetEntryType → file");
+                return build_ipc_response(ctx, 0, &entry_type.to_le_bytes(), &[]);
             }
             14 => {
                 log::debug!("IFileSystem.GetFileTimeStampRaw → zeros");
@@ -961,8 +961,41 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     if port_name == "IFile" {
         match cmd_id {
             0 => {
-                log::debug!("IFile.Read → 0 bytes (EOF)");
-                return build_ipc_response(ctx, 0, &0u64.to_le_bytes(), &[]);
+                let in_off = ctx.cmif_in_data_off;
+                let avail = ctx.buf.len().saturating_sub(in_off);
+                if avail < 24 {
+                    log::warn!("IFile.Read: short input ({} bytes)", avail);
+                    return build_ipc_response(ctx, 0, &0u64.to_le_bytes(), &[]);
+                }
+                let offset = i64::from_le_bytes([
+                    ctx.buf[in_off + 8], ctx.buf[in_off + 9], ctx.buf[in_off + 10], ctx.buf[in_off + 11],
+                    ctx.buf[in_off + 12], ctx.buf[in_off + 13], ctx.buf[in_off + 14], ctx.buf[in_off + 15],
+                ]);
+                let read_size = u64::from_le_bytes([
+                    ctx.buf[in_off + 16], ctx.buf[in_off + 17], ctx.buf[in_off + 18], ctx.buf[in_off + 19],
+                    ctx.buf[in_off + 20], ctx.buf[in_off + 21], ctx.buf[in_off + 22], ctx.buf[in_off + 23],
+                ]);
+                let nro_bytes: &[u8] = match &kernel.nro_mmap {
+                    Some(m) => &m[..],
+                    None => &[],
+                };
+                let target = ctx.recv_buffers.iter()
+                    .find(|b| b.size > 0 && b.addr != 0)
+                    .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0))
+                    .copied();
+                let mut bytes_read: u64 = 0;
+                if let Some(buf) = target {
+                    let start = (offset.max(0) as usize).min(nro_bytes.len());
+                    let want = (read_size as usize).min(buf.size as usize);
+                    let end = start.saturating_add(want).min(nro_bytes.len());
+                    let slice = &nro_bytes[start..end];
+                    let _ = kernel.address_space.write(buf.addr, slice);
+                    bytes_read = slice.len() as u64;
+                    log::debug!("IFile.Read off={:#x} size={:#x} → {} bytes (nro total {})", offset, read_size, slice.len(), nro_bytes.len());
+                } else {
+                    log::warn!("IFile.Read: no recv buffer (off={:#x} size={:#x})", offset, read_size);
+                }
+                return build_ipc_response(ctx, 0, &bytes_read.to_le_bytes(), &[]);
             }
             1 => {
                 log::debug!("IFile.Write → SUCCESS (discarded)");
@@ -975,8 +1008,9 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
             4 => {
-                log::debug!("IFile.GetSize → 0");
-                return build_ipc_response(ctx, 0, &0u64.to_le_bytes(), &[]);
+                let size: i64 = kernel.nro_mmap.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+                log::debug!("IFile.GetSize → {}", size);
+                return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
             }
             _ => {}
         }
