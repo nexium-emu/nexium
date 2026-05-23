@@ -1471,16 +1471,30 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                         };
                         if pixels.len() < linear_size { pixels.resize(linear_size, 0); }
                         for px in pixels.chunks_exact_mut(4) { px[3] = 0xFF; }
-                        let nz = pixels.iter().filter(|b| **b != 0).count();
-                        let checksum: u32 = pixels.chunks_exact(4).map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]])).fold(0u32, |a,b| a.wrapping_add(b));
+                        let rgb_nz = pixels.chunks_exact(4).filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0).count();
+                        let (frame_w, frame_h, frame_pixels) = if rgb_nz < 16 {
+                            if let Some((w, h, sdl_pixels)) = try_compose_from_sdl_surface(kernel, gb.width, gb.height) {
+                                log::info!(
+                                    "QueueBuffer SDL_Surface fallback: {}x{} (back buffer had only {} nonzero RGB pixels)",
+                                    w, h, rgb_nz
+                                );
+                                (w, h, sdl_pixels)
+                            } else {
+                                (gb.width, gb.height, pixels)
+                            }
+                        } else {
+                            (gb.width, gb.height, pixels)
+                        };
+                        let nz = frame_pixels.iter().filter(|b| **b != 0).count();
+                        let checksum: u32 = frame_pixels.chunks_exact(4).map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]])).fold(0u32, |a,b| a.wrapping_add(b));
                         log::info!(
                             "QueueBuffer submit slot={} parsed_nvmap_id={} addr={:#x} {}x{} tiled={} nz={} cksum={:#x}",
-                            slot, gb.nvmap_id, effective_addr, gb.width, gb.height, effective_tiled, nz, checksum
+                            slot, gb.nvmap_id, effective_addr, frame_w, frame_h, effective_tiled, nz, checksum
                         );
                         kernel.nvdrv.submit_frame(nexium_nvdrv::QueuedFrame {
-                            width: gb.width,
-                            height: gb.height,
-                            pixels,
+                            width: frame_w,
+                            height: frame_h,
+                            pixels: frame_pixels,
                         });
                     } else {
                         log::warn!("QueueBuffer: failed to read slot {} addr={:#x} read_size={:#x}", slot, addr, read_size);
@@ -1685,6 +1699,56 @@ impl ParcelBuilder {
         out.extend_from_slice(&self.payload);
         out
     }
+}
+
+fn try_compose_from_sdl_surface(kernel: &Kernel, fb_width: u32, fb_height: u32) -> Option<(u32, u32, Vec<u8>)> {
+    const CANDIDATES: &[(u32, u32)] = &[
+        (1280, 720),
+        (640, 360),
+        (854, 480),
+        (1920, 1080),
+        (1280, 768),
+    ];
+    for h in kernel.nvdrv.nvmap_handles.values() {
+        if h.address == 0 {
+            continue;
+        }
+        let Some(&(width, height)) = CANDIDATES.iter().find(|(w, hh)| (*w as u64) * (*hh as u64) * 4 == h.size as u64) else {
+            continue;
+        };
+        let mut linear = vec![0u8; h.size as usize];
+        if kernel.address_space.read(h.address, &mut linear).is_err() {
+            continue;
+        }
+        let nz = linear.iter().filter(|b| **b != 0).count();
+        if nz < 256 {
+            continue;
+        }
+        for px in linear.chunks_exact_mut(4) {
+            px[3] = 0xFF;
+        }
+        log::info!(
+            "compose: SDL_Surface candidate nvmap_id={} cpu={:#x} {}x{} nz={}",
+            h.id, h.address, width, height, nz
+        );
+        if width == fb_width && height == fb_height {
+            return Some((width, height, linear));
+        }
+        let dst_w = fb_width;
+        let dst_h = fb_height;
+        let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+        for dy in 0..dst_h {
+            let sy = (dy as u64 * height as u64 / dst_h as u64) as u32;
+            for dx in 0..dst_w {
+                let sx = (dx as u64 * width as u64 / dst_w as u64) as u32;
+                let s = ((sy * width + sx) * 4) as usize;
+                let d = ((dy * dst_w + dx) * 4) as usize;
+                out[d..d + 4].copy_from_slice(&linear[s..s + 4]);
+            }
+        }
+        return Some((dst_w, dst_h, out));
+    }
+    None
 }
 
 fn parse_flattened_graphic_buffer(reader: &mut ParcelReader) -> Option<nexium_nvdrv::GraphicBuffer> {
