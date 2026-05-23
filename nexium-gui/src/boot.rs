@@ -131,13 +131,24 @@ impl EmulationHandle {
         let stats_clone = Arc::clone(&stats);
 
         let thread_handle = thread::spawn(move || {
-            log::info!("Booting NRO: {}", nro_path);
+            let initial_loader_path = nro_path.clone();
+            let initial_loader_filename = Path::new(&initial_loader_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("hbmenu.nro")
+                .to_string();
+            let initial_loader_argv = format!("sdmc:/{}", initial_loader_filename);
+            let mut cur_nro_path = nro_path;
 
-            if !Path::new(&nro_path).exists() {
-                return Err(format!("NRO file not found: {}", nro_path));
+            'launcher: loop {
+            log::info!("Booting NRO: {}", cur_nro_path);
+
+            if !Path::new(&cur_nro_path).exists() {
+                return Err(format!("NRO file not found: {}", cur_nro_path));
             }
 
-            let config = BootConfig::new(&nro_path);
+            let mut config = BootConfig::new(&cur_nro_path);
+            config.loader_path = Some(initial_loader_argv.clone());
             let mut boot_ctx = BootContext::new(config)?;
 
             if let Some(cpu) = boot_ctx.kernel.cpu.as_ref() {
@@ -559,7 +570,22 @@ impl EmulationHandle {
             }
 
             log::info!("Emulation complete: {} cycles, {} SVCs", cycle_count, svc_count);
-            Ok(())
+
+            if stop_flag_clone.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            if let Some(next_path) = boot_ctx.chained_load_path() {
+                log::info!("Chain-launch: {} -> {}", cur_nro_path, next_path);
+                drop(_wd_guard);
+                drop(boot_ctx);
+                cur_nro_path = next_path;
+                continue 'launcher;
+            }
+
+            let _ = initial_loader_path;
+            return Ok(());
+            }
         });
 
         Ok(Self {

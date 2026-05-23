@@ -8,6 +8,7 @@ pub struct BootConfig {
     pub code_size: u64,
     pub heap_size: u64,
     pub stack_size: u64,
+    pub loader_path: Option<String>,
 }
 
 impl BootConfig {
@@ -17,6 +18,7 @@ impl BootConfig {
             code_size: 256 * 1024 * 1024,
             heap_size: 256 * 1024 * 1024,
             stack_size: 1 * 1024 * 1024,
+            loader_path: None,
         }
     }
 }
@@ -92,11 +94,12 @@ impl BootContext {
             .and_then(|s| s.to_str())
             .unwrap_or("hbmenu.nro");
         let argv_path = format!("sdmc:/{}", nro_filename);
+        let next_load_path = config.loader_path.clone().unwrap_or_else(|| argv_path.clone());
         let env_builder = nexium_loader::EnvBlockBuilder::new()
             .with_handles(kernel.main_thread_handle, kernel.process_handle)
             .with_heap(heap_base, config.heap_size)
             .with_argv(&argv_path)
-            .with_next_load_path(&argv_path);
+            .with_next_load_path(&next_load_path);
         env_builder.build_into(&address_space, env_base)?;
 
         log::info!("Initializing CPU");
@@ -129,6 +132,30 @@ impl BootContext {
             address_space,
             kernel,
         })
+    }
+
+    pub fn chained_load_path(&self) -> Option<String> {
+        const ENV_BASE: u64 = 0xB0_0000_0000;
+        const NEXTLOAD_PATH_VA: u64 = ENV_BASE + 0xA00;
+        let mut buf = vec![0u8; 0x301];
+        self.address_space.read(NEXTLOAD_PATH_VA, &mut buf).ok()?;
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if end == 0 {
+            return None;
+        }
+        let raw = std::str::from_utf8(&buf[..end]).ok()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let trimmed = raw.strip_prefix("sdmc:/").or_else(|| raw.strip_prefix("sdmc:")).unwrap_or(raw);
+        let filename = std::path::Path::new(trimmed).file_name()?.to_str()?.to_string();
+        let homebrew = self.kernel.homebrew_dir.as_ref()?;
+        let host_path = homebrew.join(&filename);
+        if !host_path.exists() {
+            log::warn!("chained_load_path: requested {:?} not found in {:?}", raw, homebrew);
+            return None;
+        }
+        Some(host_path.to_string_lossy().into_owned())
     }
 
     pub fn run(&mut self) -> Result<u32, String> {
