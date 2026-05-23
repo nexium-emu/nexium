@@ -66,6 +66,7 @@ pub struct Kernel {
 
     pub homebrew_dir: Option<std::path::PathBuf>,
     pub dir_cursor: HashMap<u32, usize>,
+    pub open_files: HashMap<(u32, u32), Arc<memmap2::Mmap>>,
 }
 
 impl Kernel {
@@ -132,6 +133,7 @@ impl Kernel {
             nro_romfs_range: None,
             homebrew_dir: None,
             dir_cursor: HashMap::new(),
+            open_files: HashMap::new(),
         }
     }
 

@@ -684,6 +684,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             if let Some(s) = kernel.sessions.get_mut(&session_handle) {
                 s.close_object(d.object_id);
             }
+            kernel.open_files.remove(&(session_handle, d.object_id));
             log::debug!("domain Close-object session={:#x} object_id={}", session_handle, d.object_id);
             if let Some(cpu) = &mut kernel.cpu {
                 cpu.set_register(0, SUCCESS as u64);
@@ -938,7 +939,51 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     if port_name == "IFileSystem" {
         match cmd_id {
             8 => {
-                log::debug!("IFileSystem.OpenFile → IFile sub-session (nro-backed)");
+                let path_buf = ctx.send_statics.iter()
+                    .find(|b| b.size > 0 && b.addr != 0)
+                    .or_else(|| ctx.send_buffers.iter().find(|b| b.size > 0 && b.addr != 0))
+                    .copied();
+                let mut path_str = String::new();
+                if let Some(b) = path_buf {
+                    let max = (b.size as usize).min(0x301);
+                    let mut tmp = vec![0u8; max];
+                    if kernel.address_space.read(b.addr, &mut tmp).is_ok() {
+                        let nul = tmp.iter().position(|&c| c == 0).unwrap_or(tmp.len());
+                        tmp.truncate(nul);
+                        path_str = String::from_utf8_lossy(&tmp).into_owned();
+                    }
+                }
+                let basename = std::path::Path::new(&path_str)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let mmap_arc: Option<std::sync::Arc<memmap2::Mmap>> = if !basename.is_empty() {
+                    kernel.homebrew_dir.as_ref().and_then(|dir| {
+                        let candidate = dir.join(&basename);
+                        std::fs::File::open(&candidate)
+                            .ok()
+                            .and_then(|f| unsafe { memmap2::Mmap::map(&f) }.ok())
+                            .map(std::sync::Arc::new)
+                    })
+                } else {
+                    None
+                };
+
+                let is_domain = kernel.sessions.get(&session_handle).map(|s| s.is_domain).unwrap_or(false);
+                let new_obj_id = if is_domain {
+                    kernel.sessions.get(&session_handle).map(|s| s.next_domain_object_id).unwrap_or(0)
+                } else {
+                    0
+                };
+
+                let mmap_len = mmap_arc.as_ref().map(|m| m.len()).unwrap_or(0);
+                if let Some(m) = mmap_arc {
+                    kernel.open_files.insert((session_handle, new_obj_id), m);
+                }
+
+                log::debug!("IFileSystem.OpenFile path={:?} basename={:?} mmap_len={} → IFile object_id={}", path_str, basename, mmap_len, new_obj_id);
                 return return_subsession(kernel, ctx, session_handle, "IFile");
             }
             9 => {
@@ -960,6 +1005,8 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     }
 
     if port_name == "IFile" {
+        let obj_id = ctx.domain.map(|d| d.object_id).unwrap_or(0);
+        let per_session = kernel.open_files.get(&(session_handle, obj_id)).cloned();
         match cmd_id {
             0 => {
                 let in_off = ctx.cmif_in_data_off;
@@ -976,9 +1023,9 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                     ctx.buf[in_off + 16], ctx.buf[in_off + 17], ctx.buf[in_off + 18], ctx.buf[in_off + 19],
                     ctx.buf[in_off + 20], ctx.buf[in_off + 21], ctx.buf[in_off + 22], ctx.buf[in_off + 23],
                 ]);
-                let nro_bytes: &[u8] = match &kernel.nro_mmap {
+                let file_bytes: &[u8] = match per_session.as_ref() {
                     Some(m) => &m[..],
-                    None => &[],
+                    None => kernel.nro_mmap.as_ref().map(|m| &m[..]).unwrap_or(&[]),
                 };
                 let target = ctx.recv_buffers.iter()
                     .find(|b| b.size > 0 && b.addr != 0)
@@ -986,13 +1033,16 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                     .copied();
                 let mut bytes_read: u64 = 0;
                 if let Some(buf) = target {
-                    let start = (offset.max(0) as usize).min(nro_bytes.len());
+                    let start = (offset.max(0) as usize).min(file_bytes.len());
                     let want = (read_size as usize).min(buf.size as usize);
-                    let end = start.saturating_add(want).min(nro_bytes.len());
-                    let slice = &nro_bytes[start..end];
+                    let end = start.saturating_add(want).min(file_bytes.len());
+                    let slice = &file_bytes[start..end];
                     let _ = kernel.address_space.write(buf.addr, slice);
                     bytes_read = slice.len() as u64;
-                    log::debug!("IFile.Read off={:#x} size={:#x} → {} bytes (nro total {})", offset, read_size, slice.len(), nro_bytes.len());
+                    log::debug!(
+                        "IFile.Read (sess={:#x} obj={}) off={:#x} size={:#x} → {} bytes (file total {}, per_session={})",
+                        session_handle, obj_id, offset, read_size, slice.len(), file_bytes.len(), per_session.is_some()
+                    );
                 } else {
                     log::warn!("IFile.Read: no recv buffer (off={:#x} size={:#x})", offset, read_size);
                 }
@@ -1009,8 +1059,11 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
             4 => {
-                let size: i64 = kernel.nro_mmap.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-                log::debug!("IFile.GetSize → {}", size);
+                let size: i64 = match per_session.as_ref() {
+                    Some(m) => m.len() as i64,
+                    None => kernel.nro_mmap.as_ref().map(|m| m.len() as i64).unwrap_or(0),
+                };
+                log::debug!("IFile.GetSize (sess={:#x} obj={}) → {} (per_session={})", session_handle, obj_id, size, per_session.is_some());
                 return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
             }
             _ => {}
