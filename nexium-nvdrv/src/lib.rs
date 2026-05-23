@@ -154,6 +154,7 @@ pub struct Nvdrv {
     pub queue_buffer_active: Arc<std::sync::atomic::AtomicBool>,
     pub stats: Arc<PipelineStats>,
     pub channel_client_data: u64,
+    pub legacy_gfx: std::sync::atomic::AtomicBool,
 }
 
 impl Nvdrv {
@@ -172,6 +173,7 @@ impl Nvdrv {
             queue_buffer_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stats,
             channel_client_data: 0,
+            legacy_gfx: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -415,7 +417,8 @@ impl Nvdrv {
                     out[0..4].copy_from_slice(&0x07u32.to_le_bytes());
                     out[4..8].copy_from_slice(&0x01u32.to_le_bytes());
                 }
-                log::debug!("nvhost-ctrl-gpu:GetActiveSlotMask → slot=7 mask=1");
+                self.legacy_gfx.store(true, Ordering::Relaxed);
+                log::debug!("nvhost-ctrl-gpu:GetActiveSlotMask → slot=7 mask=1 (legacy_gfx detected)");
             }
             0x471c => {
                 if out.len() < 16 { out.resize(16, 0); }

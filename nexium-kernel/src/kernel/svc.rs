@@ -1472,6 +1472,7 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                         if pixels.len() < linear_size { pixels.resize(linear_size, 0); }
                         for px in pixels.chunks_exact_mut(4) { px[3] = 0xFF; }
                         let rgb_nz = pixels.chunks_exact(4).filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0).count();
+                        let legacy_gfx = kernel.nvdrv.legacy_gfx.load(std::sync::atomic::Ordering::Relaxed);
                         let (frame_w, frame_h, frame_pixels) = if rgb_nz < 16 {
                             if let Some((w, h, sdl_pixels)) = try_compose_from_sdl_surface(kernel, gb.width, gb.height) {
                                 log::info!(
@@ -1479,6 +1480,22 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                                     w, h, rgb_nz
                                 );
                                 (w, h, sdl_pixels)
+                            } else {
+                                (gb.width, gb.height, pixels)
+                            }
+                        } else if legacy_gfx {
+                            if let Some((x0, y0, w, h)) = active_bbox(&pixels, gb.width, gb.height) {
+                                let area_ratio = (w as f32 * h as f32) / (gb.width as f32 * gb.height as f32);
+                                if area_ratio < 0.65 && w >= 64 && h >= 64 {
+                                    let upscaled = crop_and_upscale(&pixels, gb.width, x0, y0, w, h, gb.width, gb.height);
+                                    log::info!(
+                                        "QueueBuffer legacy_gfx sub-window: src=({},{}) {}x{} → upscale to {}x{}",
+                                        x0, y0, w, h, gb.width, gb.height
+                                    );
+                                    (gb.width, gb.height, upscaled)
+                                } else {
+                                    (gb.width, gb.height, pixels)
+                                }
                             } else {
                                 (gb.width, gb.height, pixels)
                             }
@@ -1699,6 +1716,49 @@ impl ParcelBuilder {
         out.extend_from_slice(&self.payload);
         out
     }
+}
+
+fn active_bbox(pixels: &[u8], width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+    let w = width as usize;
+    let h = height as usize;
+    let mut min_x = w;
+    let mut max_x = 0usize;
+    let mut min_y = h;
+    let mut max_y = 0usize;
+    for y in 0..h {
+        let row_off = y * w * 4;
+        for x in 0..w {
+            let p = &pixels[row_off + x * 4..row_off + x * 4 + 3];
+            if p[0] != 0 || p[1] != 0 || p[2] != 0 {
+                if x < min_x { min_x = x; }
+                if x > max_x { max_x = x; }
+                if y < min_y { min_y = y; }
+                if y > max_y { max_y = y; }
+            }
+        }
+    }
+    if max_x < min_x || max_y < min_y {
+        return None;
+    }
+    Some((min_x as u32, min_y as u32, (max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32))
+}
+
+fn crop_and_upscale(
+    src: &[u8], src_stride_px: u32,
+    sx: u32, sy: u32, sw: u32, sh: u32,
+    dst_w: u32, dst_h: u32,
+) -> Vec<u8> {
+    let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    for dy in 0..dst_h {
+        let yy = sy + dy * sh / dst_h;
+        for dx in 0..dst_w {
+            let xx = sx + dx * sw / dst_w;
+            let s = ((yy * src_stride_px + xx) * 4) as usize;
+            let d = ((dy * dst_w + dx) * 4) as usize;
+            out[d..d + 4].copy_from_slice(&src[s..s + 4]);
+        }
+    }
+    out
 }
 
 fn try_compose_from_sdl_surface(kernel: &Kernel, fb_width: u32, fb_height: u32) -> Option<(u32, u32, Vec<u8>)> {
