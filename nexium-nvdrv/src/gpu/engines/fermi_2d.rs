@@ -1,6 +1,13 @@
 use super::super::GpuMappings;
+use crate::QueuedFrame;
+use std::sync::{Arc, Mutex};
 
 pub const FERMI_2D_CLASS: u32 = 0x902D;
+
+const FMT_A8R8G8B8: u32 = 0xCF;
+const FMT_A8B8G8R8: u32 = 0xD5;
+const FMT_X8R8G8B8: u32 = 0xE6;
+const FMT_X8B8G8R8: u32 = 0xCB;
 
 const DST_BASE: u32 = 0x80;
 const SRC_BASE: u32 = 0x9C;
@@ -80,6 +87,7 @@ pub struct Fermi2D {
     src_x0_high: u32,
     src_y0_low: u32,
     pub blit_count: u64,
+    pub captured_frames: Arc<Mutex<Vec<QueuedFrame>>>,
 }
 
 impl Fermi2D {
@@ -186,6 +194,60 @@ impl Fermi2D {
             }
         }
         self.blit_count = self.blit_count.wrapping_add(1);
+
+        let framebuffer_like = self.dst.memory_layout == MEMORY_LAYOUT_PITCH
+            && self.dst.width >= 320
+            && self.dst.height >= 240
+            && self.dst.pitch >= self.dst.width * (bpp as u32)
+            && matches!(self.dst.format, FMT_A8R8G8B8 | FMT_A8B8G8R8 | FMT_X8R8G8B8 | FMT_X8B8G8R8);
+        if framebuffer_like {
+            self.try_publish_frame(dst_cpu, bpp, mem_read);
+        }
+    }
+
+    fn try_publish_frame(
+        &self,
+        dst_cpu: u64,
+        bpp: usize,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) {
+        let w = self.dst.width as usize;
+        let h = self.dst.height as usize;
+        let row_bytes = w * bpp;
+        let total = h * row_bytes;
+        if total == 0 { return; }
+        let mut pixels = vec![0u8; total];
+        let pitch = self.dst.pitch as usize;
+        for y in 0..h {
+            let g_off = dst_cpu + (y * pitch) as u64;
+            let p_off = y * row_bytes;
+            if !mem_read(g_off, &mut pixels[p_off..p_off + row_bytes]) {
+                return;
+            }
+        }
+        let rgba = match self.dst.format {
+            FMT_A8B8G8R8 | FMT_X8B8G8R8 => pixels,
+            FMT_A8R8G8B8 | FMT_X8R8G8B8 => {
+                let mut out = pixels;
+                for px in out.chunks_exact_mut(4) {
+                    px.swap(0, 2);
+                }
+                out
+            }
+            _ => return,
+        };
+        let mut rgba = rgba;
+        for px in rgba.chunks_exact_mut(4) {
+            px[3] = 0xFF;
+        }
+        let rgb_nz = rgba.chunks_exact(4).filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0).count();
+        log::info!(
+            "Fermi2D::publish_frame dst_cpu={:#x} {}x{} pitch={} fmt={:#x} rgb_nz={}",
+            dst_cpu, w, h, pitch, self.dst.format, rgb_nz
+        );
+        let mut q = self.captured_frames.lock().unwrap();
+        if q.len() >= 2 { q.remove(0); }
+        q.push(QueuedFrame { width: w as u32, height: h as u32, pixels: rgba });
     }
 
     fn blit_pitch_to_pitch(

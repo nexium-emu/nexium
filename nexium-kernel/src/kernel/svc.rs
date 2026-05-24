@@ -1473,7 +1473,14 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                         for px in pixels.chunks_exact_mut(4) { px[3] = 0xFF; }
                         let rgb_nz = pixels.chunks_exact(4).filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0).count();
                         let legacy_gfx = kernel.nvdrv.legacy_gfx.load(std::sync::atomic::Ordering::Relaxed);
-                        let vulkan_frame = if legacy_gfx {
+                        let fermi_frame = kernel.nvdrv.drain_fermi2d_frame();
+                        let vulkan_frame = if let Some(qf) = fermi_frame.as_ref() {
+                            log::info!(
+                                "QueueBuffer Fermi2D-captured frame: {}x{} ({} bytes)",
+                                qf.width, qf.height, qf.pixels.len()
+                            );
+                            None
+                        } else if legacy_gfx {
                             if let Some(renderer) = kernel.nvdrv.renderer() {
                                 let r = renderer.clone();
                                 let mut color = kernel.nvdrv.last_clear_color();
@@ -1500,7 +1507,9 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                         } else {
                             None
                         };
-                        let (frame_w, frame_h, frame_pixels) = if let Some(v) = vulkan_frame {
+                        let (frame_w, frame_h, frame_pixels) = if let Some(qf) = fermi_frame {
+                            (qf.width, qf.height, qf.pixels)
+                        } else if let Some(v) = vulkan_frame {
                             (gb.width, gb.height, v)
                         } else if rgb_nz < 16 {
                             if let Some((w, h, sdl_pixels)) = try_compose_from_sdl_surface(kernel, gb.width, gb.height) {

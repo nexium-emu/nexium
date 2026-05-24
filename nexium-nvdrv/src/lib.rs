@@ -918,6 +918,12 @@ impl Nvdrv {
     pub fn last_clear_count(&self) -> u64 {
         self.gpu.maxwell3d.lock().clear_count()
     }
+
+    pub fn drain_fermi2d_frame(&self) -> Option<QueuedFrame> {
+        let f2d = self.gpu.fermi_2d.lock();
+        let mut q = f2d.captured_frames.lock().unwrap();
+        q.pop()
+    }
 }
 
 impl Default for Nvdrv {
