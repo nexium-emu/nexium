@@ -321,7 +321,17 @@ impl Kernel {
         }
 
         if loaded == 0 {
-            log::warn!("pl:u no system fonts loaded; expected BFTTF files in {{config}}/NeXium/system/fonts/");
+            log::warn!("pl:u no system fonts found in {{config}}/NeXium/system/fonts/ — using built-in fallback (NotoMono)");
+            const FALLBACK: &[u8] = include_bytes!("../data/fallback_font.ttf");
+            let mut off = 0u32;
+            for i in 0..6usize {
+                let end = off as usize + FALLBACK.len();
+                if end <= SHMEM_SIZE {
+                    buf[off as usize..end].copy_from_slice(FALLBACK);
+                    offsets[i] = (off, FALLBACK.len() as u32);
+                    off += FALLBACK.len() as u32;
+                }
+            }
         }
 
         self.font_shmem = Some(buf);
