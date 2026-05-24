@@ -771,9 +771,18 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             }
             return SUCCESS;
         }
-        kernel.sessions.get(&session_handle)
+        match kernel.sessions.get(&session_handle)
             .and_then(|s| s.service_for_object(d.object_id).map(String::from))
-            .unwrap_or_else(|| port_name.clone())
+        {
+            Some(name) => name,
+            None => {
+                log::warn!("domain object_id={} not found on session={:#x} (port={}) → InvalidObject 0xCE01", d.object_id, session_handle, port_name);
+                if let Some(cpu) = &mut kernel.cpu {
+                    cpu.set_register(0, SUCCESS as u64);
+                }
+                return 0xCE01;
+            }
+        }
     } else {
         port_name.clone()
     };
@@ -1624,9 +1633,21 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                             raw
                         };
                         if pixels.len() < linear_size { pixels.resize(linear_size, 0); }
+                        let legacy_gfx = kernel.nvdrv.legacy_gfx.load(std::sync::atomic::Ordering::Relaxed);
+                        if legacy_gfx {
+                            let row_bytes = (gb.width * (bpp as u32)) as usize;
+                            let h = gb.height as usize;
+                            for y in 0..h / 2 {
+                                let top = y * row_bytes;
+                                let bot = (h - 1 - y) * row_bytes;
+                                if bot + row_bytes <= pixels.len() {
+                                    let (a, b) = pixels.split_at_mut(bot);
+                                    a[top..top + row_bytes].swap_with_slice(&mut b[..row_bytes]);
+                                }
+                            }
+                        }
                         for px in pixels.chunks_exact_mut(4) { px[3] = 0xFF; }
                         let rgb_nz = pixels.chunks_exact(4).filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0).count();
-                        let legacy_gfx = kernel.nvdrv.legacy_gfx.load(std::sync::atomic::Ordering::Relaxed);
                         let fermi_frame = kernel.nvdrv.drain_fermi2d_frame();
                         if let Some(qf) = fermi_frame.as_ref() {
                             log::info!(
@@ -1886,8 +1907,8 @@ impl ParcelBuilder {
         ints[18] = gb.stride.saturating_mul(4);
         ints[19] = gb.nvmap_id;
         ints[20] = gb.buffer_offset as u32;
-        ints[21] = 0;
-        ints[22] = 4;
+        ints[21] = gb.kind;
+        ints[22] = gb.block_height_log2;
         for v in ints {
             self.write_u32(v);
         }

@@ -752,8 +752,8 @@ impl Nvdrv {
             0x0014 => {
                 if req.in_data.len() >= 4 && out.len() >= 8 {
                     let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
-                    out[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
-                    log::debug!("nvhost-ctrl:SyncptRead syncpt_id={} → {:#x}", id, u32::MAX);
+                    out[4..8].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+                    log::debug!("nvhost-ctrl:SyncptRead syncpt_id={} → 0x7FFFFFFF (HLE always-signaled)", id);
                 }
             }
             0x0015 => {
@@ -780,8 +780,8 @@ impl Nvdrv {
             0x001a => {
                 if req.in_data.len() >= 4 && out.len() >= 8 {
                     let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
-                    out[4..8].copy_from_slice(&0u32.to_le_bytes());
-                    log::debug!("nvhost-ctrl:SyncptReadMax syncpt={} → 0", id);
+                    out[4..8].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+                    log::debug!("nvhost-ctrl:SyncptReadMax syncpt={} → 0x7FFFFFFF (HLE always-signaled)", id);
                 }
             }
             0x001c => {
