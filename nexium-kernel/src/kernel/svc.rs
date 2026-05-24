@@ -765,6 +765,8 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
                 s.close_object(d.object_id);
             }
             kernel.open_files.remove(&(session_handle, d.object_id));
+            kernel.open_host_files.remove(&(session_handle, d.object_id));
+            kernel.open_dir_lists.remove(&(session_handle, d.object_id));
             log::debug!("domain Close-object session={:#x} object_id={}", session_handle, d.object_id);
             if let Some(cpu) = &mut kernel.cpu {
                 cpu.set_register(0, SUCCESS as u64);
@@ -1035,70 +1037,159 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     }
 
     if port_name == "IFileSystem" {
-        match cmd_id {
-            8 => {
-                let path_buf = ctx.send_statics.iter()
-                    .find(|b| b.size > 0 && b.addr != 0)
-                    .or_else(|| ctx.send_buffers.iter().find(|b| b.size > 0 && b.addr != 0))
-                    .copied();
-                let mut path_str = String::new();
-                if let Some(b) = path_buf {
-                    let max = (b.size as usize).min(0x301);
-                    let mut tmp = vec![0u8; max];
-                    if kernel.address_space.read(b.addr, &mut tmp).is_ok() {
-                        let nul = tmp.iter().position(|&c| c == 0).unwrap_or(tmp.len());
-                        tmp.truncate(nul);
-                        path_str = String::from_utf8_lossy(&tmp).into_owned();
-                    }
-                }
-                let basename = std::path::Path::new(&path_str)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
+        let path_str = fs_read_path(ctx, &kernel.address_space);
+        let basename = std::path::Path::new(&path_str)
+            .file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
 
+        match cmd_id {
+            0 => {
+                let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                let Some(host) = host else {
+                    log::warn!("IFileSystem.CreateFile path={:?} → 0x202 PathNotFound", path_str);
+                    return build_ipc_response(ctx, 0x202, &[], &[]);
+                };
+                if let Some(parent) = host.parent() { let _ = std::fs::create_dir_all(parent); }
+                match std::fs::OpenOptions::new().write(true).create_new(true).open(&host) {
+                    Ok(_) => {
+                        log::debug!("IFileSystem.CreateFile path={:?} → SUCCESS", path_str);
+                        return build_ipc_response(ctx, 0, &[], &[]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return build_ipc_response(ctx, 0x402, &[], &[]);
+                    }
+                    Err(_) => return build_ipc_response(ctx, 0x402, &[], &[]),
+                }
+            }
+            1 => {
+                let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                let Some(host) = host else { return build_ipc_response(ctx, 0x202, &[], &[]); };
+                match std::fs::remove_file(&host) {
+                    Ok(()) => return build_ipc_response(ctx, 0, &[], &[]),
+                    Err(_) => return build_ipc_response(ctx, 0x202, &[], &[]),
+                }
+            }
+            2 => {
+                let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                let Some(host) = host else { return build_ipc_response(ctx, 0x202, &[], &[]); };
+                match std::fs::create_dir_all(&host) {
+                    Ok(()) => return build_ipc_response(ctx, 0, &[], &[]),
+                    Err(_) => return build_ipc_response(ctx, 0x402, &[], &[]),
+                }
+            }
+            3 => {
+                let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                let Some(host) = host else { return build_ipc_response(ctx, 0x202, &[], &[]); };
+                match std::fs::remove_dir(&host) {
+                    Ok(()) => return build_ipc_response(ctx, 0, &[], &[]),
+                    Err(_) => return build_ipc_response(ctx, 0x202, &[], &[]),
+                }
+            }
+            4 => {
+                let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                let Some(host) = host else { return build_ipc_response(ctx, 0x202, &[], &[]); };
+                match std::fs::remove_dir_all(&host) {
+                    Ok(()) => return build_ipc_response(ctx, 0, &[], &[]),
+                    Err(_) => return build_ipc_response(ctx, 0x202, &[], &[]),
+                }
+            }
+            7 => {
+                let entry_type: u32 = {
+                    let in_homebrew = !basename.is_empty() && kernel.homebrew_dir.as_ref()
+                        .map(|d| d.join(&basename).is_file()).unwrap_or(false);
+                    if in_homebrew { 1 }
+                    else if let Some(host) = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str)) {
+                        match std::fs::metadata(&host) {
+                            Ok(m) if m.is_dir() => 0,
+                            Ok(_) => 1,
+                            Err(_) => {
+                                log::debug!("IFileSystem.GetEntryType path={:?} → 0x202 NotFound", path_str);
+                                return build_ipc_response(ctx, 0x202, &[], &[]);
+                            }
+                        }
+                    } else { 1 }
+                };
+                log::debug!("IFileSystem.GetEntryType path={:?} → {}", path_str, entry_type);
+                return build_ipc_response(ctx, 0, &entry_type.to_le_bytes(), &[]);
+            }
+            8 => {
                 let mmap_arc: Option<std::sync::Arc<memmap2::Mmap>> = if !basename.is_empty() {
                     kernel.homebrew_dir.as_ref().and_then(|dir| {
                         let candidate = dir.join(&basename);
-                        std::fs::File::open(&candidate)
-                            .ok()
+                        std::fs::File::open(&candidate).ok()
                             .and_then(|f| unsafe { memmap2::Mmap::map(&f) }.ok())
                             .map(std::sync::Arc::new)
                     })
-                } else {
-                    None
-                };
+                } else { None };
 
                 let is_domain = kernel.sessions.get(&session_handle).map(|s| s.is_domain).unwrap_or(false);
                 let new_obj_id = if is_domain {
                     kernel.sessions.get(&session_handle).map(|s| s.next_domain_object_id).unwrap_or(0)
-                } else {
-                    0
-                };
+                } else { 0 };
 
-                let mmap_len = mmap_arc.as_ref().map(|m| m.len()).unwrap_or(0);
                 if let Some(m) = mmap_arc {
+                    let mmap_len = m.len();
                     kernel.open_files.insert((session_handle, new_obj_id), m);
+                    log::debug!("IFileSystem.OpenFile path={:?} → IFile (NRO mmap {} bytes)", path_str, mmap_len);
+                } else {
+                    let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                    if let Some(host) = host {
+                        if host.is_file() {
+                            kernel.open_host_files.insert((session_handle, new_obj_id), host.clone());
+                            log::debug!("IFileSystem.OpenFile path={:?} → IFile (host {})", path_str, host.display());
+                        } else {
+                            log::debug!("IFileSystem.OpenFile path={:?} → 0x202 NotFound (host miss)", path_str);
+                            return build_ipc_response(ctx, 0x202, &[], &[]);
+                        }
+                    } else {
+                        log::debug!("IFileSystem.OpenFile path={:?} → 0x202 NotFound", path_str);
+                        return build_ipc_response(ctx, 0x202, &[], &[]);
+                    }
                 }
-
-                log::debug!("IFileSystem.OpenFile path={:?} basename={:?} mmap_len={} → IFile object_id={}", path_str, basename, mmap_len, new_obj_id);
                 return return_subsession(kernel, ctx, session_handle, "IFile");
             }
             9 => {
-                log::debug!("IFileSystem.OpenDirectory → IDirectory sub-session");
+                let in_off = ctx.cmif_in_data_off;
+                let filter = if ctx.cmif_in_data_len >= 4 {
+                    u32::from_le_bytes([ctx.buf[in_off], ctx.buf[in_off + 1], ctx.buf[in_off + 2], ctx.buf[in_off + 3]])
+                } else { 0 };
+
+                let is_domain = kernel.sessions.get(&session_handle).map(|s| s.is_domain).unwrap_or(false);
+                let new_obj_id = if is_domain {
+                    kernel.sessions.get(&session_handle).map(|s| s.next_domain_object_id).unwrap_or(0)
+                } else { 0 };
+
+                let mut entries: Vec<(String, bool, u64)> = Vec::new();
+                if let Some(host) = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str)) {
+                    let _ = std::fs::create_dir_all(&host);
+                    if let Ok(rd) = std::fs::read_dir(&host) {
+                        for e in rd.filter_map(|e| e.ok()) {
+                            let Ok(md) = e.metadata() else { continue };
+                            let name = e.file_name().to_string_lossy().into_owned();
+                            let is_dir = md.is_dir();
+                            if filter & 1 != 0 && is_dir { continue; }
+                            if filter & 2 != 0 && !is_dir { continue; }
+                            entries.push((name, is_dir, if is_dir { 0 } else { md.len() }));
+                        }
+                    }
+                }
+                log::debug!("IFileSystem.OpenDirectory path={:?} filter={:#x} → {} entries", path_str, filter, entries.len());
+                kernel.open_dir_lists.insert((session_handle, new_obj_id), (entries, 0));
                 kernel.dir_cursor.insert(session_handle, 0);
                 return return_subsession(kernel, ctx, session_handle, "IDirectory");
             }
-            7 => {
-                let entry_type: u32 = 1;
-                log::debug!("IFileSystem.GetEntryType → file");
-                return build_ipc_response(ctx, 0, &entry_type.to_le_bytes(), &[]);
+            10 => return build_ipc_response(ctx, 0, &[], &[]),
+            11 | 12 => {
+                let huge: u64 = 64u64 * 1024 * 1024 * 1024;
+                log::debug!("IFileSystem.Get{}SpaceSize → {}", if cmd_id == 11 { "Free" } else { "Total" }, huge);
+                return build_ipc_response(ctx, 0, &huge.to_le_bytes(), &[]);
             }
             14 => {
                 log::debug!("IFileSystem.GetFileTimeStampRaw → zeros");
                 return build_ipc_response(ctx, 0, &[0u8; 0x20], &[]);
             }
-            _ => {}
+            _ => {
+                log::warn!("IFileSystem.cmd_{} UNHANDLED → empty SUCCESS", cmd_id);
+            }
         }
     }
 
@@ -1121,54 +1212,117 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                     ctx.buf[in_off + 16], ctx.buf[in_off + 17], ctx.buf[in_off + 18], ctx.buf[in_off + 19],
                     ctx.buf[in_off + 20], ctx.buf[in_off + 21], ctx.buf[in_off + 22], ctx.buf[in_off + 23],
                 ]);
-                let file_bytes: &[u8] = match per_session.as_ref() {
-                    Some(m) => &m[..],
-                    None => kernel.nro_mmap.as_ref().map(|m| &m[..]).unwrap_or(&[]),
-                };
+                let host_path = kernel.open_host_files.get(&(session_handle, obj_id)).cloned();
                 let target = ctx.recv_buffers.iter()
                     .find(|b| b.size > 0 && b.addr != 0)
                     .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0))
                     .copied();
                 let mut bytes_read: u64 = 0;
                 if let Some(buf) = target {
-                    let start = (offset.max(0) as usize).min(file_bytes.len());
-                    let want = (read_size as usize).min(buf.size as usize);
-                    let end = start.saturating_add(want).min(file_bytes.len());
-                    let slice = &file_bytes[start..end];
-                    let _ = kernel.address_space.write(buf.addr, slice);
-                    bytes_read = slice.len() as u64;
-                    log::debug!(
-                        "IFile.Read (sess={:#x} obj={}) off={:#x} size={:#x} → {} bytes (file total {}, per_session={})",
-                        session_handle, obj_id, offset, read_size, slice.len(), file_bytes.len(), per_session.is_some()
-                    );
+                    if let Some(host) = host_path {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let want = (read_size as usize).min(buf.size as usize);
+                        let mut data = vec![0u8; want];
+                        if let Ok(mut f) = std::fs::File::open(&host) {
+                            if f.seek(SeekFrom::Start(offset.max(0) as u64)).is_ok() {
+                                bytes_read = f.read(&mut data).unwrap_or(0) as u64;
+                            }
+                        }
+                        let _ = kernel.address_space.write(buf.addr, &data[..bytes_read as usize]);
+                        log::debug!("IFile.Read (host {}) off={:#x} size={:#x} → {} bytes", host.display(), offset, read_size, bytes_read);
+                    } else {
+                        let file_bytes: &[u8] = match per_session.as_ref() {
+                            Some(m) => &m[..],
+                            None => kernel.nro_mmap.as_ref().map(|m| &m[..]).unwrap_or(&[]),
+                        };
+                        let start = (offset.max(0) as usize).min(file_bytes.len());
+                        let want = (read_size as usize).min(buf.size as usize);
+                        let end = start.saturating_add(want).min(file_bytes.len());
+                        let slice = &file_bytes[start..end];
+                        let _ = kernel.address_space.write(buf.addr, slice);
+                        bytes_read = slice.len() as u64;
+                        log::debug!(
+                            "IFile.Read (sess={:#x} obj={}) off={:#x} size={:#x} → {} bytes (file total {}, per_session={})",
+                            session_handle, obj_id, offset, read_size, slice.len(), file_bytes.len(), per_session.is_some()
+                        );
+                    }
                 } else {
                     log::warn!("IFile.Read: no recv buffer (off={:#x} size={:#x})", offset, read_size);
                 }
                 return build_ipc_response(ctx, 0, &bytes_read.to_le_bytes(), &[]);
             }
             1 => {
-                log::debug!("IFile.Write → SUCCESS (discarded)");
+                let host_path = kernel.open_host_files.get(&(session_handle, obj_id)).cloned();
+                if let Some(host) = host_path {
+                    use std::io::{Seek, SeekFrom, Write};
+                    let in_off = ctx.cmif_in_data_off;
+                    if ctx.cmif_in_data_len >= 24 {
+                        let offset = i64::from_le_bytes([
+                            ctx.buf[in_off + 8], ctx.buf[in_off + 9], ctx.buf[in_off + 10], ctx.buf[in_off + 11],
+                            ctx.buf[in_off + 12], ctx.buf[in_off + 13], ctx.buf[in_off + 14], ctx.buf[in_off + 15],
+                        ]);
+                        let size = u64::from_le_bytes([
+                            ctx.buf[in_off + 16], ctx.buf[in_off + 17], ctx.buf[in_off + 18], ctx.buf[in_off + 19],
+                            ctx.buf[in_off + 20], ctx.buf[in_off + 21], ctx.buf[in_off + 22], ctx.buf[in_off + 23],
+                        ]);
+                        if let Some(send_buf) = ctx.send_buffers.iter().find(|b| b.size > 0 && b.addr != 0).copied() {
+                            let n = (send_buf.size.min(size)) as usize;
+                            let mut data = vec![0u8; n];
+                            if kernel.address_space.read(send_buf.addr, &mut data).is_ok() {
+                                let res = std::fs::OpenOptions::new().write(true).create(true).open(&host)
+                                    .and_then(|mut f| { f.seek(SeekFrom::Start(offset.max(0) as u64))?; f.write_all(&data) });
+                                if res.is_ok() {
+                                    log::debug!("IFile.Write (host {}) off={:#x} size={} → SUCCESS", host.display(), offset, n);
+                                    return build_ipc_response(ctx, 0, &[], &[]);
+                                }
+                            }
+                        }
+                    }
+                    return build_ipc_response(ctx, 0x2EE602, &[], &[]);
+                }
+                log::debug!("IFile.Write (read-only mmap) → SUCCESS discarded");
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
-            2 => {
-                return build_ipc_response(ctx, 0, &[], &[]);
-            }
+            2 => return build_ipc_response(ctx, 0, &[], &[]),
             3 => {
+                let host_path = kernel.open_host_files.get(&(session_handle, obj_id)).cloned();
+                if let Some(host) = host_path {
+                    let in_off = ctx.cmif_in_data_off;
+                    if ctx.cmif_in_data_len >= 8 {
+                        let new_size = u64::from_le_bytes([
+                            ctx.buf[in_off], ctx.buf[in_off + 1], ctx.buf[in_off + 2], ctx.buf[in_off + 3],
+                            ctx.buf[in_off + 4], ctx.buf[in_off + 5], ctx.buf[in_off + 6], ctx.buf[in_off + 7],
+                        ]);
+                        let res = std::fs::OpenOptions::new().write(true).open(&host)
+                            .and_then(|f| f.set_len(new_size));
+                        if res.is_ok() {
+                            return build_ipc_response(ctx, 0, &[], &[]);
+                        }
+                    }
+                    return build_ipc_response(ctx, 0x2EE602, &[], &[]);
+                }
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
             4 => {
-                let size: i64 = match per_session.as_ref() {
-                    Some(m) => m.len() as i64,
-                    None => kernel.nro_mmap.as_ref().map(|m| m.len() as i64).unwrap_or(0),
+                let size: i64 = if let Some(host) = kernel.open_host_files.get(&(session_handle, obj_id)) {
+                    std::fs::metadata(host).map(|m| m.len() as i64).unwrap_or(0)
+                } else {
+                    match per_session.as_ref() {
+                        Some(m) => m.len() as i64,
+                        None => kernel.nro_mmap.as_ref().map(|m| m.len() as i64).unwrap_or(0),
+                    }
                 };
-                log::debug!("IFile.GetSize (sess={:#x} obj={}) → {} (per_session={})", session_handle, obj_id, size, per_session.is_some());
+                log::debug!("IFile.GetSize (sess={:#x} obj={}) → {}", session_handle, obj_id, size);
                 return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
             }
-            _ => {}
+            _ => {
+                log::warn!("IFile.cmd_{} UNHANDLED → empty SUCCESS", cmd_id);
+            }
         }
     }
 
     if port_name == "IDirectory" {
+        let obj_id = ctx.domain.map(|d| d.object_id).unwrap_or(0);
         match cmd_id {
             0 => {
                 let target = ctx.recv_buffers.iter()
@@ -1183,6 +1337,25 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                     }
                 };
                 let max_entries = (buf.size as usize) / 0x310;
+
+                if let Some((entries, cursor)) = kernel.open_dir_lists.get_mut(&(session_handle, obj_id)) {
+                    let remaining = entries.len().saturating_sub(*cursor);
+                    let to_emit = remaining.min(max_entries);
+                    let mut payload = vec![0u8; to_emit * 0x310];
+                    for (i, (name, is_dir, size)) in entries.iter().skip(*cursor).take(to_emit).enumerate() {
+                        let base = i * 0x310;
+                        let name_bytes = name.as_bytes();
+                        let name_len = name_bytes.len().min(0x300);
+                        payload[base..base + name_len].copy_from_slice(&name_bytes[..name_len]);
+                        payload[base + 0x304] = if *is_dir { 0 } else { 1 };
+                        payload[base + 0x308..base + 0x310].copy_from_slice(&size.to_le_bytes());
+                    }
+                    *cursor += to_emit;
+                    if !payload.is_empty() { let _ = kernel.address_space.write(buf.addr, &payload); }
+                    log::debug!("IDirectory.Read (host) → {} of {} entries", to_emit, entries.len());
+                    return build_ipc_response(ctx, 0, &(to_emit as i64).to_le_bytes(), &[]);
+                }
+
                 let cursor = *kernel.dir_cursor.get(&session_handle).unwrap_or(&0);
                 let entries = enumerate_homebrew_nros(&kernel.homebrew_dir);
                 let remaining = entries.len().saturating_sub(cursor);
@@ -1196,23 +1369,23 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                     payload[base + 0x301 + 3] = 1;
                     payload[base + 0x308..base + 0x310].copy_from_slice(&e.size.to_le_bytes());
                 }
-                if !payload.is_empty() {
-                    let _ = kernel.address_space.write(buf.addr, &payload);
-                }
+                if !payload.is_empty() { let _ = kernel.address_space.write(buf.addr, &payload); }
                 kernel.dir_cursor.insert(session_handle, cursor + to_emit);
-                log::info!(
-                    "IDirectory.Read cursor={} max_entries={} → {} of {} entries (homebrew_dir={:?})",
-                    cursor, max_entries, to_emit, entries.len(), kernel.homebrew_dir
-                );
-                let total: i64 = to_emit as i64;
-                return build_ipc_response(ctx, 0, &total.to_le_bytes(), &[]);
+                log::info!("IDirectory.Read (homebrew_dir fallback) cursor={} → {} of {}", cursor, to_emit, entries.len());
+                return build_ipc_response(ctx, 0, &(to_emit as i64).to_le_bytes(), &[]);
             }
             1 => {
-                let count = enumerate_homebrew_nros(&kernel.homebrew_dir).len() as i64;
+                let count: i64 = if let Some((entries, _)) = kernel.open_dir_lists.get(&(session_handle, obj_id)) {
+                    entries.len() as i64
+                } else {
+                    enumerate_homebrew_nros(&kernel.homebrew_dir).len() as i64
+                };
                 log::info!("IDirectory.GetEntryCount → {}", count);
                 return build_ipc_response(ctx, 0, &count.to_le_bytes(), &[]);
             }
-            _ => {}
+            _ => {
+                log::warn!("IDirectory.cmd_{} UNHANDLED → empty SUCCESS", cmd_id);
+            }
         }
     }
 
@@ -3357,6 +3530,48 @@ fn svc_call_secure_monitor(kernel: &mut Kernel) -> u32 {
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
+}
+
+fn fs_sd_root(kernel: &mut Kernel) -> Option<std::path::PathBuf> {
+    if kernel.sd_root.is_none() {
+        let base = std::env::var_os("APPDATA").map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from))
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))?;
+        let root = base.join("NeXium").join("sdmc");
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            log::warn!("fs: failed to create SD root {}: {}", root.display(), e);
+            return None;
+        }
+        kernel.sd_root = Some(root);
+    }
+    kernel.sd_root.clone()
+}
+
+fn fs_translate(root: &std::path::Path, hos: &str) -> Option<std::path::PathBuf> {
+    let trimmed = hos.trim_start_matches(|c: char| c.is_ascii_alphabetic() || c == ':');
+    let trimmed = trimmed.trim_start_matches(|c| c == '/' || c == '\\');
+    let rel = std::path::Path::new(trimmed);
+    for c in rel.components() {
+        if matches!(c, std::path::Component::ParentDir | std::path::Component::Prefix(_) | std::path::Component::RootDir) {
+            return None;
+        }
+    }
+    Some(root.join(rel))
+}
+
+fn fs_read_path(ctx: &ipc::IpcCtx, addr_space: &nexium_memory::AddressSpace) -> String {
+    let buf = ctx.send_statics.iter()
+        .find(|b| b.size > 0 && b.addr != 0)
+        .or_else(|| ctx.send_buffers.iter().find(|b| b.size > 0 && b.addr != 0))
+        .copied();
+    let Some(b) = buf else { return String::new() };
+    let n = (b.size as usize).min(0x301);
+    let mut bytes = vec![0u8; n];
+    if addr_space.read(b.addr, &mut bytes).is_err() {
+        return String::new();
+    }
+    let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 fn compute_tiled_size(stride: u32, height: u32, block_height_log2: u32) -> usize {

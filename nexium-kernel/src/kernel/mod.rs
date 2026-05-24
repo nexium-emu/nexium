@@ -68,6 +68,9 @@ pub struct Kernel {
     pub homebrew_dir: Option<std::path::PathBuf>,
     pub dir_cursor: HashMap<u32, usize>,
     pub open_files: HashMap<(u32, u32), Arc<memmap2::Mmap>>,
+    pub sd_root: Option<std::path::PathBuf>,
+    pub open_host_files: HashMap<(u32, u32), std::path::PathBuf>,
+    pub open_dir_lists: HashMap<(u32, u32), (Vec<(String, bool, u64)>, usize)>,
 
     pub yield_after_svc: bool,
 }
@@ -141,6 +144,9 @@ impl Kernel {
             homebrew_dir: None,
             dir_cursor: HashMap::new(),
             open_files: HashMap::new(),
+            sd_root: None,
+            open_host_files: HashMap::new(),
+            open_dir_lists: HashMap::new(),
             yield_after_svc: false,
         }
     }
