@@ -168,24 +168,36 @@ impl EmulationHandle {
                     .name("nexium-cpu-watchdog".into())
                     .spawn(move || {
                         let mut peek_counter: u64 = 0;
+                        let mut prev_pc: u64 = 0;
+                        let mut same_pc_streak: u32 = 0;
                         while !watchdog_stop_wd.load(Ordering::Relaxed) {
-                            thread::sleep(std::time::Duration::from_millis(5));
+                            thread::sleep(std::time::Duration::from_millis(50));
                             let last = last_svc_ms_wd.load(Ordering::Relaxed);
                             if last == 0 {
                                 continue;
                             }
-                            if now_millis().saturating_sub(last) > 20 {
+                            if now_millis().saturating_sub(last) > 250 {
                                 let (pc, lr, sp) = halt.peek_pc_lr_sp();
+                                if pc == prev_pc {
+                                    same_pc_streak = same_pc_streak.saturating_add(1);
+                                } else {
+                                    same_pc_streak = 0;
+                                    prev_pc = pc;
+                                }
+                                if same_pc_streak < 3 {
+                                    continue;
+                                }
                                 peek_counter += 1;
                                 if peek_counter % 25 == 1 {
                                     log::warn!(
-                                        "[watchdog-peek #{}] pc={:#x} lr={:#x} sp={:#x}",
-                                        peek_counter, pc, lr, sp
+                                        "[watchdog-peek #{}] pc={:#x} lr={:#x} sp={:#x} same_pc_streak={}",
+                                        peek_counter, pc, lr, sp, same_pc_streak
                                     );
                                 }
                                 halt.halt();
                                 watchdog_halts_wd.fetch_add(1, Ordering::Relaxed);
                                 last_svc_ms_wd.store(now_millis(), Ordering::Relaxed);
+                                same_pc_streak = 0;
                             }
                         }
                     });
@@ -207,7 +219,7 @@ impl EmulationHandle {
             let mut stuck_pc: Option<u64> = None;
             let mut stuck_count = 0u32;
             let mut last_svc_cycle = 0u64;
-            let no_svc_in_spin = 0u32;
+            let mut no_svc_in_spin = 0u32;
             let mut last_heartbeat = std::time::Instant::now();
             let mut last_heartbeat_svc = 0u32;
             let mut last_heartbeat_cycles = 0u64;
@@ -310,6 +322,8 @@ impl EmulationHandle {
                         }
                         last_pipeline_stats = cur_stats;
 
+                        nexium_core::kernel::profile::dump_heartbeat();
+
                         last_heartbeat = std::time::Instant::now();
                         last_heartbeat_svc = svc_count;
                         last_heartbeat_cycles = cycle_count;
@@ -394,18 +408,14 @@ impl EmulationHandle {
 
                     let in_libnx = pc_after >= 0x8000_0000_00 && pc_after < 0x8000_a0_0000;
                     let no_svc_progress = matches!(event, nexium_core::cpu::CpuEvent::Running) && in_libnx;
+                    if matches!(event, nexium_core::cpu::CpuEvent::Svc(_)) {
+                        no_svc_in_spin = 0;
+                    }
+                    const SPIN_PREEMPT_THRESHOLD: u32 = 20;
                     if no_svc_progress {
-                        let x20 = cpu.get_register(20);
-                        if x20 >= 0x9000_0000_00 && x20 < 0xA000_0000_00 {
-                            let mut state_buf = [0u8; 4];
-                            if boot_ctx.kernel.address_space.read(x20.wrapping_add(16), &mut state_buf).is_ok() {
-                                let state = u32::from_le_bytes(state_buf);
-                                if state == 2 {
-                                    let _ = boot_ctx.kernel.address_space.write(x20.wrapping_add(16), &4u32.to_le_bytes());
-                                    log::debug!("[spin-breaker] state=4 to {:#x}+16 (was {}) pc={:#x}", x20, state, pc_after);
-                                }
-                            }
-                        }
+                        no_svc_in_spin = no_svc_in_spin.saturating_add(1);
+                    }
+                    if no_svc_progress && no_svc_in_spin >= SPIN_PREEMPT_THRESHOLD {
                         let hid = nexium_core::hid_state::get_hid_state();
                         let mut h = hid.lock();
                         if h.shmem_va.is_some() {
@@ -421,6 +431,7 @@ impl EmulationHandle {
                                 cpu,
                                 nexium_core::kernel::threads::ThreadState::Ready,
                             );
+                            no_svc_in_spin = 0;
                             log::info!("[preempt] halted in libnx pc={:#x}, yielded handle={:?}, ready_q={} total={}", pc_after, from, n_ready, n_threads);
                         } else {
                             stuck_log_counter += 1;
@@ -450,7 +461,6 @@ impl EmulationHandle {
                             }
                         }
                     }
-                    let _ = no_svc_in_spin;
 
                     if cycle_count % 1_000_000 == 0 {
                         let mut st = stats_clone.lock();

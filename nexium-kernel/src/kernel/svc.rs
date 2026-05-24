@@ -6,6 +6,15 @@ use nexium_ipc as ipc;
 
 pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
     log::trace!("SVC {:#04x}", imm);
+    let _profile_start = std::time::Instant::now();
+    let _profile_imm = imm;
+    struct ProfileGuard(std::time::Instant, u16);
+    impl Drop for ProfileGuard {
+        fn drop(&mut self) {
+            crate::kernel::profile::record_svc(self.1, self.0);
+        }
+    }
+    let _guard = ProfileGuard(_profile_start, _profile_imm);
     match imm {
         0x01 => svc_set_heap_size(kernel),
         0x02 => svc_set_memory_permission(kernel),
@@ -453,10 +462,7 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         } else {
             std::time::Duration::from_nanos(timeout_ns).min(remaining)
         };
-        if allowed > std::time::Duration::ZERO {
-            std::thread::sleep(allowed);
-        }
-        kernel.last_vsync = std::time::Instant::now();
+        kernel.last_vsync = std::time::Instant::now() + allowed;
         {
             let state = crate::hid_state::get_hid_state();
             let mut hid = state.lock();
@@ -468,6 +474,15 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         if let Some(cpu) = &mut kernel.cpu {
             cpu.set_register(0, SUCCESS as u64);
             cpu.set_register(1, i as u64);
+        }
+        if allowed > std::time::Duration::ZERO {
+            if let Some(cpu) = kernel.cpu.as_ref() {
+                let wake_at = std::time::Instant::now() + allowed;
+                kernel.threads.yield_with_state(
+                    cpu,
+                    crate::kernel::threads::ThreadState::Sleeping { wake_at },
+                );
+            }
         }
         return SUCCESS;
     }
@@ -492,9 +507,6 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
     } else {
         std::time::Duration::from_nanos(timeout_ns).min(cap)
     };
-    if wait > std::time::Duration::ZERO {
-        std::thread::sleep(wait);
-    }
 
     {
         let state = crate::hid_state::get_hid_state();
@@ -506,6 +518,15 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
     }
 
     const TIMEOUT_ERROR: u32 = 1 | (117 << 9);
+    if wait > std::time::Duration::ZERO {
+        if let Some(cpu) = kernel.cpu.as_ref() {
+            let wake_at = std::time::Instant::now() + wait;
+            kernel.threads.yield_with_state(
+                cpu,
+                crate::kernel::threads::ThreadState::WaitingHandle { handles: handles.clone(), wake_at: Some(wake_at) },
+            );
+        }
+    }
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(0, TIMEOUT_ERROR as u64);
     }
@@ -517,6 +538,8 @@ fn svc_cancel_synchronization(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+const MUTEX_HAS_LISTENERS: u32 = 0x4000_0000;
+
 fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
     let (_holder, mutex_addr, self_handle) = if let Some(cpu) = &kernel.cpu {
         (cpu.get_register(0) as u32, cpu.get_register(1), cpu.get_register(2) as u32)
@@ -524,18 +547,52 @@ fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
         return 1;
     };
 
-    let _ = kernel.address_space.write(mutex_addr, &self_handle.to_le_bytes());
+    let mut cur = [0u8; 4];
+    let cur_word = if kernel.address_space.read(mutex_addr, &mut cur).is_ok() {
+        u32::from_le_bytes(cur)
+    } else { 0 };
+    let holder = cur_word & !MUTEX_HAS_LISTENERS;
+    let lr = kernel.cpu.as_ref().map(|c| c.get_register(30)).unwrap_or(0);
+
+    if holder == 0 || holder == self_handle {
+        let new_word = self_handle | (cur_word & MUTEX_HAS_LISTENERS);
+        let _ = kernel.address_space.write(mutex_addr, &new_word.to_le_bytes());
+        log::info!("svcArbitrateLock mutex={:#x} self_handle={:#x} cur={:#x} → uncontended lr={:#x}", mutex_addr, self_handle, cur_word, lr);
+        if let Some(cpu) = &mut kernel.cpu {
+            cpu.set_register(0, SUCCESS as u64);
+        }
+        return SUCCESS;
+    }
+
+    let new_word = cur_word | MUTEX_HAS_LISTENERS;
+    let _ = kernel.address_space.write(mutex_addr, &new_word.to_le_bytes());
+
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(0, SUCCESS as u64);
     }
+    if let Some(cpu) = kernel.cpu.as_ref() {
+        kernel.threads.yield_with_state(
+            cpu,
+            crate::kernel::threads::ThreadState::WaitingMutex { mutex_addr },
+        );
+    }
+    log::debug!("svcArbitrateLock mutex={:#x} contended (holder={:#x} self={:#x}) → parked", mutex_addr, holder, self_handle);
     SUCCESS
 }
 
 fn svc_arbitrate_unlock(kernel: &mut Kernel) -> u32 {
     let mutex_addr = if let Some(cpu) = &kernel.cpu { cpu.get_register(0) } else { return 1; };
-    let _ = kernel.address_space.write(mutex_addr, &0u32.to_le_bytes());
-    if let Some(woken) = kernel.threads.wake_one_on_mutex(mutex_addr) {
-        log::debug!("svcArbitrateUnlock mutex={:#x} woke handle={:#x}", mutex_addr, woken);
+    let woken = kernel.threads.wake_one_on_mutex(mutex_addr);
+    let new_word = match woken {
+        Some(h) => {
+            let more = kernel.threads.has_mutex_waiters(mutex_addr);
+            if more { h | MUTEX_HAS_LISTENERS } else { h }
+        }
+        None => 0,
+    };
+    let _ = kernel.address_space.write(mutex_addr, &new_word.to_le_bytes());
+    if let Some(h) = woken {
+        log::debug!("svcArbitrateUnlock mutex={:#x} handed to handle={:#x} (word={:#x})", mutex_addr, h, new_word);
     }
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(0, SUCCESS as u64);
@@ -544,7 +601,7 @@ fn svc_arbitrate_unlock(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
-    let (mutex_addr, condvar_addr, _self_handle, timeout_ns) = if let Some(cpu) = &kernel.cpu {
+    let (mutex_addr, condvar_addr, self_handle, timeout_ns) = if let Some(cpu) = &kernel.cpu {
         (
             cpu.get_register(0),
             cpu.get_register(1),
@@ -554,10 +611,20 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
     } else {
         return 1;
     };
+    let lr = kernel.cpu.as_ref().map(|c| c.get_register(30)).unwrap_or(0);
+    log::info!("svcWaitProcessWideKeyAtomic mutex={:#x} condvar={:#x} self_handle={:#x} timeout_ns={} lr={:#x}", mutex_addr, condvar_addr, self_handle, timeout_ns, lr);
 
-    let _ = kernel.address_space.write(mutex_addr, &0u32.to_le_bytes());
-    if let Some(woken) = kernel.threads.wake_one_on_mutex(mutex_addr) {
-        log::debug!("cond_wait: handed mutex={:#x} to handle={:#x} on release", mutex_addr, woken);
+    let woken = kernel.threads.wake_one_on_mutex(mutex_addr);
+    let new_word = match woken {
+        Some(h) => {
+            let more = kernel.threads.has_mutex_waiters(mutex_addr);
+            if more { h | MUTEX_HAS_LISTENERS } else { h }
+        }
+        None => 0,
+    };
+    let _ = kernel.address_space.write(mutex_addr, &new_word.to_le_bytes());
+    if let Some(h) = woken {
+        log::debug!("cond_wait release: mutex={:#x} handed to handle={:#x} (word={:#x})", mutex_addr, h, new_word);
     }
 
     if let Some(cpu) = &mut kernel.cpu {
@@ -587,19 +654,29 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
         return 1;
     };
 
-    let woken = if count < 0 {
-        kernel.threads.wake_all_on_condvar(condvar_addr)
-    } else {
-        let mut n = 0;
-        for _ in 0..count {
-            if kernel.threads.wake_one_on_condvar(condvar_addr).is_some() {
-                n += 1;
-            } else {
-                break;
-            }
+    let max = if count < 0 { i32::MAX } else { count };
+    let mut woken = 0;
+    for _ in 0..max {
+        let Some((handle, mutex_addr)) = kernel.threads.peek_one_condvar_waiter(condvar_addr) else { break; };
+
+        let mut cur = [0u8; 4];
+        let cur_word = if kernel.address_space.read(mutex_addr, &mut cur).is_ok() {
+            u32::from_le_bytes(cur)
+        } else { 0 };
+        let holder = cur_word & !MUTEX_HAS_LISTENERS;
+
+        if holder == 0 {
+            let _ = kernel.address_space.write(mutex_addr, &handle.to_le_bytes());
+            kernel.threads.wake_condvar_to_ready(handle);
+            log::debug!("svcSignalProcessWideKey cond={:#x} → handle={:#x} mutex={:#x} (mutex was free, handed off)", condvar_addr, handle, mutex_addr);
+        } else {
+            let new_word = cur_word | MUTEX_HAS_LISTENERS;
+            let _ = kernel.address_space.write(mutex_addr, &new_word.to_le_bytes());
+            kernel.threads.wake_condvar_into_mutex_waiter(handle, mutex_addr);
+            log::debug!("svcSignalProcessWideKey cond={:#x} → handle={:#x} mutex={:#x} (held by {:#x}, requeued as WaitingMutex)", condvar_addr, handle, mutex_addr, holder);
         }
-        n
-    };
+        woken += 1;
+    }
     log::debug!("svcSignalProcessWideKey cond={:#x} count={} woken={}", condvar_addr, count, woken);
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(0, SUCCESS as u64);
@@ -901,6 +978,15 @@ fn dispatch_sm_command_v2(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx) -> Vec<u8>
 }
 
 fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcCtx, session_handle: u32, pending_frames: &mut Vec<crate::services::FrameOut>) -> Vec<u8> {
+    let _ipc_start = std::time::Instant::now();
+    let _port_owned = port_name.to_string();
+    struct IpcProfileGuard(std::time::Instant, String);
+    impl Drop for IpcProfileGuard {
+        fn drop(&mut self) {
+            crate::kernel::profile::record_ipc(&self.1, self.0);
+        }
+    }
+    let _guard = IpcProfileGuard(_ipc_start, _port_owned);
     let cmd_id = ctx.cmif_in.cmd_id;
 
     if port_name == "nvdrv" || port_name == "nvdrv:a" || port_name == "nvdrv:s" || port_name == "nvdrv:t" {
@@ -1160,6 +1246,73 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
         }
     }
 
+    if port_name == "audout:u" && cmd_id == 1 {
+        let name_buf = ctx.recv_statics.iter()
+            .find(|b| b.size > 0 && b.addr != 0)
+            .or_else(|| ctx.recv_buffers.iter().find(|b| b.size > 0 && b.addr != 0))
+            .copied();
+        if let Some(buf) = name_buf {
+            let cap = (buf.size as usize).min(0x100);
+            let mut name = vec![0u8; cap];
+            let bytes = b"DeviceOut";
+            let n = bytes.len().min(cap);
+            name[..n].copy_from_slice(&bytes[..n]);
+            let _ = kernel.address_space.write(buf.addr, &name);
+        }
+
+        let in_off = ctx.cmif_in_data_off;
+        let in_avail = ctx.cmif_in_data_len as usize;
+        let sample_rate = if in_avail >= 4 {
+            u32::from_le_bytes([
+                ctx.buf[in_off], ctx.buf[in_off + 1], ctx.buf[in_off + 2], ctx.buf[in_off + 3],
+            ])
+        } else { 0 };
+        let channel_count = if in_avail >= 6 {
+            u16::from_le_bytes([ctx.buf[in_off + 4], ctx.buf[in_off + 5]])
+        } else { 0 };
+        let effective_rate = if sample_rate == 0 { 48000 } else { sample_rate };
+        let effective_channels: u32 = if channel_count == 0 { 2 } else { channel_count as u32 };
+
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&effective_rate.to_le_bytes());
+        out.extend_from_slice(&effective_channels.to_le_bytes());
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+
+        let is_domain = kernel.sessions.get(&session_handle).map(|s| s.is_domain).unwrap_or(false);
+        log::info!("audout:u OpenAudioOut sample_rate={} channels={} → IAudioOut (domain={})", effective_rate, effective_channels, is_domain);
+        if is_domain {
+            let object_id = if let Some(s) = kernel.sessions.get_mut(&session_handle) {
+                s.alloc_domain_object("IAudioOut".to_string())
+            } else { 0 };
+            return build_ipc_response_full(ctx, 0, &out, &[], &[object_id]);
+        } else {
+            let h = kernel.handles.create_handle(HandleType::Session);
+            let session = Session::new(h, "IAudioOut".to_string());
+            kernel.sessions.insert(h, session);
+            return build_ipc_response(ctx, 0, &out, &[h]);
+        }
+    }
+
+    if port_name == "IAudioOut" {
+        match cmd_id {
+            0 => return build_ipc_response(ctx, 0, &1u32.to_le_bytes(), &[]),
+            1 => return build_ipc_response(ctx, 0, &[], &[]),
+            2 => return build_ipc_response(ctx, 0, &[], &[]),
+            3 | 7 => return build_ipc_response(ctx, 0, &[], &[]),
+            4 => {
+                let event = kernel.handles.create_handle(HandleType::Event);
+                return build_ipc_response(ctx, 0, &[], &[event]);
+            }
+            5 | 8 => return build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[]),
+            6 => return build_ipc_response(ctx, 0, &0u8.to_le_bytes(), &[]),
+            9 => return build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[]),
+            10 => return build_ipc_response(ctx, 0, &0u64.to_le_bytes(), &[]),
+            11 => return build_ipc_response(ctx, 0, &0u8.to_le_bytes(), &[]),
+            _ => {}
+        }
+    }
+
     if port_name == "set" || port_name == "set:sys" {
         if let Some(outcome) = cmif_dispatch_set(kernel, ctx) {
             log::debug!("set.cmd_{} → {} bytes (rc={:#x}) via #[service]", cmd_id, outcome.inline_out.len(), outcome.result);
@@ -1180,6 +1333,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
         return build_ipc_response(ctx, 0, &data, &handles);
     }
 
+    log::warn!("dispatch_service_v2: {} cmd_{} FELL THROUGH to legacy dispatch_service (probably needs a real handler)", port_name, cmd_id);
     let tls_snapshot = ctx.buf.clone();
     let mut svc_ctx = crate::services::IpcCtx {
         tls_buf: &tls_snapshot,
@@ -1474,12 +1628,40 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                         let rgb_nz = pixels.chunks_exact(4).filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0).count();
                         let legacy_gfx = kernel.nvdrv.legacy_gfx.load(std::sync::atomic::Ordering::Relaxed);
                         let fermi_frame = kernel.nvdrv.drain_fermi2d_frame();
-                        let vulkan_frame = if let Some(qf) = fermi_frame.as_ref() {
+                        if let Some(qf) = fermi_frame.as_ref() {
                             log::info!(
                                 "QueueBuffer Fermi2D-captured frame: {}x{} ({} bytes)",
                                 qf.width, qf.height, qf.pixels.len()
                             );
-                            None
+                        }
+                        let (frame_w, frame_h, frame_pixels) = if let Some(qf) = fermi_frame {
+                            (qf.width, qf.height, qf.pixels)
+                        } else if rgb_nz >= 16 {
+                            if legacy_gfx {
+                                if let Some((x0, y0, w, h)) = active_bbox(&pixels, gb.width, gb.height) {
+                                    let area_ratio = (w as f32 * h as f32) / (gb.width as f32 * gb.height as f32);
+                                    if area_ratio < 0.65 && w >= 64 && h >= 64 {
+                                        let upscaled = crop_and_upscale(&pixels, gb.width, x0, y0, w, h, gb.width, gb.height);
+                                        log::info!(
+                                            "QueueBuffer legacy_gfx sub-window: src=({},{}) {}x{} → upscale to {}x{}",
+                                            x0, y0, w, h, gb.width, gb.height
+                                        );
+                                        (gb.width, gb.height, upscaled)
+                                    } else {
+                                        (gb.width, gb.height, pixels)
+                                    }
+                                } else {
+                                    (gb.width, gb.height, pixels)
+                                }
+                            } else {
+                                (gb.width, gb.height, pixels)
+                            }
+                        } else if let Some((w, h, sdl_pixels)) = try_compose_from_sdl_surface(kernel, gb.width, gb.height) {
+                            log::info!(
+                                "QueueBuffer SDL_Surface fallback: {}x{} (back buffer had only {} nonzero RGB pixels)",
+                                w, h, rgb_nz
+                            );
+                            (w, h, sdl_pixels)
                         } else if legacy_gfx {
                             if let Some(renderer) = kernel.nvdrv.renderer() {
                                 let r = renderer.clone();
@@ -1489,48 +1671,13 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                                 if r.clear_target(gb.nvmap_id, gb.width, gb.height, color).is_ok() {
                                     if let Some(bytes) = r.readback_target(gb.nvmap_id, gb.width, gb.height) {
                                         log::info!(
-                                            "QueueBuffer legacy_gfx Vulkan: {}x{} color=[{:.2},{:.2},{:.2},{:.2}] clears={} → {} bytes",
+                                            "QueueBuffer legacy_gfx Vulkan clear-only fallback: {}x{} color=[{:.2},{:.2},{:.2},{:.2}] clears={} → {} bytes",
                                             gb.width, gb.height, color[0], color[1], color[2], color[3], clears, bytes.len()
                                         );
-                                        Some(bytes)
+                                        (gb.width, gb.height, bytes)
                                     } else {
-                                        log::warn!("QueueBuffer Vulkan readback returned None");
-                                        None
+                                        (gb.width, gb.height, pixels)
                                     }
-                                } else {
-                                    log::warn!("QueueBuffer Vulkan clear_target failed");
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        let (frame_w, frame_h, frame_pixels) = if let Some(qf) = fermi_frame {
-                            (qf.width, qf.height, qf.pixels)
-                        } else if let Some(v) = vulkan_frame {
-                            (gb.width, gb.height, v)
-                        } else if rgb_nz < 16 {
-                            if let Some((w, h, sdl_pixels)) = try_compose_from_sdl_surface(kernel, gb.width, gb.height) {
-                                log::info!(
-                                    "QueueBuffer SDL_Surface fallback: {}x{} (back buffer had only {} nonzero RGB pixels)",
-                                    w, h, rgb_nz
-                                );
-                                (w, h, sdl_pixels)
-                            } else {
-                                (gb.width, gb.height, pixels)
-                            }
-                        } else if legacy_gfx {
-                            if let Some((x0, y0, w, h)) = active_bbox(&pixels, gb.width, gb.height) {
-                                let area_ratio = (w as f32 * h as f32) / (gb.width as f32 * gb.height as f32);
-                                if area_ratio < 0.65 && w >= 64 && h >= 64 {
-                                    let upscaled = crop_and_upscale(&pixels, gb.width, x0, y0, w, h, gb.width, gb.height);
-                                    log::info!(
-                                        "QueueBuffer legacy_gfx sub-window: src=({},{}) {}x{} → upscale to {}x{}",
-                                        x0, y0, w, h, gb.width, gb.height
-                                    );
-                                    (gb.width, gb.height, upscaled)
                                 } else {
                                     (gb.width, gb.height, pixels)
                                 }
@@ -1571,8 +1718,9 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
 
             kernel.nvdrv.pace_swap(swap_interval);
 
+            let (qw, qh) = kernel.nvdrv.with_bufferqueue(binder_id, |bq| (bq.width, bq.height));
             let mut p = ParcelBuilder::new();
-            p.write_bq_buffer_output(1280, 720);
+            p.write_bq_buffer_output(qw, qh);
             p.write_u32(0);
             p.finish()
         }
@@ -2111,6 +2259,7 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("IApplicationDisplayService", 103) => Some("IHOSBinderDriver"),
         ("appletAE" | "appletOE", 0) => Some("IApplicationProxy"),
         ("appletAE" | "appletOE", 200) => Some("ILibraryAppletProxy"),
+        ("apm" | "apm:p", 0) => Some("IApmManager"),
         _ => None,
     }
 }
@@ -2802,14 +2951,25 @@ fn svc_exit_thread(kernel: &mut Kernel) -> u32 {
 fn svc_sleep_thread(kernel: &mut Kernel) -> u32 {
     let ns = if let Some(cpu) = &kernel.cpu { cpu.get_register(0) } else { 0 };
     let signed = ns as i64;
-    if signed > 0 {
-        let dur = std::time::Duration::from_nanos(ns).min(std::time::Duration::from_millis(100));
-        std::thread::sleep(dur);
-    } else if signed == -1 {
-        std::thread::yield_now();
-    }
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(0, SUCCESS as u64);
+    }
+    if signed > 0 {
+        let dur = std::time::Duration::from_nanos(ns);
+        let wake_at = std::time::Instant::now() + dur;
+        if let Some(cpu) = kernel.cpu.as_ref() {
+            kernel.threads.yield_with_state(
+                cpu,
+                crate::kernel::threads::ThreadState::Sleeping { wake_at },
+            );
+        }
+    } else if signed == 0 || signed == -1 {
+        if let Some(cpu) = kernel.cpu.as_ref() {
+            kernel.threads.yield_with_state(
+                cpu,
+                crate::kernel::threads::ThreadState::Ready,
+            );
+        }
     }
     SUCCESS
 }

@@ -1,5 +1,6 @@
 pub mod svc;
 pub mod svc_defs;
+pub mod profile;
 pub mod threads;
 pub mod handles;
 pub mod hid;
@@ -117,7 +118,11 @@ impl Kernel {
             vsync_poll_count: 0,
             process_handle,
             main_thread_handle,
-            applet_messages: VecDeque::from(vec![crate::services::am::msg::FOCUS_STATE_CHANGED]),
+            applet_messages: VecDeque::from(vec![
+                crate::services::am::msg::OPERATION_MODE_CHANGED,
+                crate::services::am::msg::PERFORMANCE_MODE_CHANGED,
+                crate::services::am::msg::FOCUS_STATE_CHANGED,
+            ]),
             applet_message_event: None,
             vsync_handles: HashSet::new(),
             last_vsync: std::time::Instant::now(),

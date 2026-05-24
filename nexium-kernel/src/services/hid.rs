@@ -23,7 +23,7 @@ impl HidService {
             101 => self.cmd_get_supported_npad_style_set(),
             102 => self.cmd_set_npad_joy_hold_type(),
             _ => {
-                log::debug!("hid stub command: {}", cmd_id);
+                log::warn!("hid.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd_id);
                 SUCCESS
             }
         }

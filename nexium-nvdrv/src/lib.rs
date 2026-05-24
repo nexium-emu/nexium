@@ -265,9 +265,10 @@ impl Nvdrv {
 
         match cmd {
             0x0101 => {
-                let size = if req.in_data.len() >= 4 {
+                let raw_size = if req.in_data.len() >= 4 {
                     u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]])
                 } else { 0 };
+                let size = (raw_size + 0xFFF) & !0xFFF;
                 let id = self.next_nvmap_id;
                 self.next_nvmap_id = self.next_nvmap_id.wrapping_add(1);
                 self.nvmap_handles.insert(id, NvmapHandle {
@@ -319,8 +320,8 @@ impl Nvdrv {
                         1 => self.nvmap_handles.get(&handle).map(|h| h.size).unwrap_or(0),
                         2 => 0x10000,
                         3 => 0,
-                        4 => self.nvmap_handles.get(&handle).map(|h| h.kind as u32).unwrap_or(0),
-                        5 => 0,
+                        4 => 0x40000000,
+                        5 => self.nvmap_handles.get(&handle).map(|h| h.kind as u32).unwrap_or(0),
                         _ => 0,
                     };
                     out[8..12].copy_from_slice(&result.to_le_bytes());
@@ -766,6 +767,21 @@ impl Nvdrv {
                     let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
                     let threshold = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
                     log::debug!("nvhost-ctrl:SyncptWait syncpt_id={} threshold={:#x}", id, threshold);
+                }
+            }
+            0x0019 => {
+                if req.in_data.len() >= 12 && out.len() >= 16 {
+                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let threshold = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    out[12..16].copy_from_slice(&threshold.to_le_bytes());
+                    log::debug!("nvhost-ctrl:SyncptWaitEx syncpt={} threshold={:#x} (ack)", id, threshold);
+                }
+            }
+            0x001a => {
+                if req.in_data.len() >= 4 && out.len() >= 8 {
+                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    out[4..8].copy_from_slice(&0u32.to_le_bytes());
+                    log::debug!("nvhost-ctrl:SyncptReadMax syncpt={} → 0", id);
                 }
             }
             0x001c => {

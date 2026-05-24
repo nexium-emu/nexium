@@ -196,6 +196,33 @@ impl Threads {
         Some(h)
     }
 
+    pub fn peek_one_condvar_waiter(&self, condvar_addr: u64) -> Option<(u32, u64)> {
+        self.threads.iter().find_map(|(h, t)| match &t.state {
+            ThreadState::WaitingCondvar { condvar_addr: c, mutex_addr, .. } if *c == condvar_addr => {
+                Some((*h, *mutex_addr))
+            }
+            _ => None,
+        })
+    }
+
+    pub fn wake_condvar_into_mutex_waiter(&mut self, handle: u32, mutex_addr: u64) {
+        if let Some(t) = self.threads.get_mut(&handle) {
+            t.ctx.x[0] = nexium_common::result::SUCCESS as u64;
+        }
+        self.transition_state(handle, ThreadState::WaitingMutex { mutex_addr });
+    }
+
+    pub fn wake_condvar_to_ready(&mut self, handle: u32) {
+        if let Some(t) = self.threads.get_mut(&handle) {
+            t.ctx.x[0] = nexium_common::result::SUCCESS as u64;
+        }
+        self.transition_state(handle, ThreadState::Ready);
+    }
+
+    pub fn has_mutex_waiters(&self, mutex_addr: u64) -> bool {
+        self.threads.values().any(|t| matches!(&t.state, ThreadState::WaitingMutex { mutex_addr: m } if *m == mutex_addr))
+    }
+
     pub fn wake_all_on_condvar(&mut self, condvar_addr: u64) -> usize {
         let mut woken: Vec<u32> = Vec::new();
         for (h, t) in self.threads.iter_mut() {

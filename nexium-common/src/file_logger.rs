@@ -63,12 +63,29 @@ static FLUSH_RUNNING: AtomicBool = AtomicBool::new(false);
 
 impl log::Log for FileLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= log::max_level()
+        if metadata.level() > log::max_level() { return false; }
+        if metadata.level() >= log::Level::Debug {
+            let t = metadata.target();
+            if t.starts_with("dynarmic_sys") || t.starts_with("dynarmic_sys_mythrax") {
+                return false;
+            }
+        }
+        true
     }
 
     fn log(&self, record: &Record) {
         if !self.enabled(record.metadata()) {
             return;
+        }
+
+        if record.level() >= log::Level::Debug {
+            let msg = format!("{}", record.args());
+            if msg.starts_with("[Dynarmic]") || msg.starts_with("dynarmic SVC ") {
+                return;
+            }
+            if msg.starts_with("IFile.Read") || msg.starts_with("IFsStorage.Read") {
+                return;
+            }
         }
 
         let line = format!("[{:>5}] {}", record.level(), record.args());
