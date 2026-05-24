@@ -1,6 +1,6 @@
 use super::super::GpuMappings;
 
-pub const KEPLER_MEMORY_CLASS: u32 = 0xB1C0;
+pub const KEPLER_MEMORY_CLASS: u32 = 0xA140;
 
 const M_LINE_LENGTH_IN: u32 = 0x60;
 const M_LINE_COUNT: u32 = 0x61;

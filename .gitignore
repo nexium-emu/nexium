@@ -23,6 +23,7 @@ Cargo.lock
 # Reference repositories (not part of this project)
 Atmosphere-master/
 deko3d-master/
+InvadersNX-master/
 libnx-master/
 mesa-26.1.0/
 nx-hbloader-master/

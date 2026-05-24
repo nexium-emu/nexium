@@ -227,6 +227,26 @@ fn write_tiled_pixel_bytes(
     mem_write(rt_cpu + off as u64, &pixel);
 }
 
+#[derive(Default)]
+struct BlitStats {
+    total: u32,
+    rt_invalid: u32,
+    rt_unmapped: u32,
+    tic_pool_zero: u32,
+    no_best: u32,
+    blit_read_fail: u32,
+    cb_unmapped: u32,
+    no_cb_tracked: u32,
+    fs_tex_ids_empty: u32,
+    fs_tex_ids_found: u32,
+    success_pool_match: u32,
+    success_pool_fallback: u32,
+    success_bindless: u32,
+    last_src_cksum: u32,
+    src_cksum_changed: u32,
+    src_cksum_same: u32,
+}
+
 fn try_blit_bound_texture(
     draw: &DrawCall,
     mappings: &GpuMappings,
@@ -235,10 +255,24 @@ fn try_blit_bound_texture(
 ) -> bool {
     thread_local! {
         static BLIT_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static BLIT_STATS: std::cell::RefCell<BlitStats> = std::cell::RefCell::new(BlitStats::default());
     }
     let log_this = BLIT_LOG_COUNT.with(|c| {
         let n = c.get();
         if n < 6 { c.set(n + 1); true } else { false }
+    });
+    BLIT_STATS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.total = s.total.wrapping_add(1);
+        if s.total % 60 == 0 {
+            log::info!(
+                "try_blit summary @{}: rt_invalid={} rt_unmap={} tic_pool0={} no_best={} blit_fail={} cb_unmap={} no_cb={} fs_ids_empty={} fs_ids_found={} ok_pool={} ok_pool_fb={} ok_bindless={} src_changed={} src_same={}",
+                s.total, s.rt_invalid, s.rt_unmapped, s.tic_pool_zero, s.no_best, s.blit_read_fail,
+                s.cb_unmapped, s.no_cb_tracked, s.fs_tex_ids_empty, s.fs_tex_ids_found,
+                s.success_pool_match, s.success_pool_fallback, s.success_bindless,
+                s.src_cksum_changed, s.src_cksum_same,
+            );
+        }
     });
 
     let rt = &draw.rt[0];
@@ -250,10 +284,12 @@ fn try_blit_bound_texture(
         );
     }
     if rt_gpu == 0 || rt.width == 0 || rt.height == 0 {
+        BLIT_STATS.with(|s| s.borrow_mut().rt_invalid += 1);
         if log_this { log::info!("  bail: rt invalid"); }
         return false;
     }
     let Some(rt_cpu) = mappings.cpu_address_for(rt_gpu) else {
+        BLIT_STATS.with(|s| s.borrow_mut().rt_unmapped += 1);
         if log_this { log::info!("  bail: rt_gpu {:#x} not mapped", rt_gpu); }
         return false;
     };
@@ -262,11 +298,13 @@ fn try_blit_bound_texture(
     let rt_h = rt.height as usize;
 
     if draw.tic_pool_gpu_va == 0 {
+        BLIT_STATS.with(|s| s.borrow_mut().tic_pool_zero += 1);
         if log_this { log::info!("  bail: tic_pool_gpu_va is 0 (TIC pool registers never reached Maxwell3D)"); }
         return false;
     }
 
     let mut best: Option<(u32, u32, u32, u64, u32)> = None;
+    let mut path: u8 = 0;
     let limit = (draw.tic_pool_limit + 1).min(128);
 
     if log_this {
@@ -316,7 +354,7 @@ fn try_blit_bound_texture(
         let matches_rt = tex_w == rt.width && tex_height == rt.height;
         if matches_rt {
             best = Some((idx, tex_w, tex_height, src_cpu, bh_log2));
-
+            path = 1;
             log::trace!(
                 "try_blit_bound_texture: chose TIC[{}] hdr_v={} src_gpu={:#x} src_cpu={:#x} {}x{} bh={}",
                 idx, hdr_version, src_gpu, src_cpu, tex_w, tex_height, bh_log2
@@ -326,6 +364,7 @@ fn try_blit_bound_texture(
 
         if best.is_none() {
             best = Some((idx, tex_w, tex_height, src_cpu, bh_log2));
+            path = 2;
         }
     }
 
@@ -336,6 +375,10 @@ fn try_blit_bound_texture(
             mappings,
             mem_read,
         );
+        BLIT_STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            if fs_tex_ids.is_empty() { s.fs_tex_ids_empty += 1; } else { s.fs_tex_ids_found += 1; }
+        });
         if log_this {
             log::info!(
                 "  TIC pool empty → SASS-decoded FS shader gpu={:#x}: fs_tex_ids = {:?}",
@@ -379,20 +422,25 @@ fn try_blit_bound_texture(
                     }
                     if cand_w == rt.width && cand_h == rt.height {
                         best = Some((candidate_tic, cand_w, cand_h, cand_src_cpu, cand_bh));
+                        path = 3;
                         break;
                     }
                     if best.is_none() {
                         best = Some((candidate_tic, cand_w, cand_h, cand_src_cpu, cand_bh));
+                        path = 3;
                     }
                 }
-            } else if log_this {
-                log::info!("  fs_bindless_cb gpu={:#x} not mapped", draw.fs_bindless_cb_addr);
+            } else {
+                BLIT_STATS.with(|s| s.borrow_mut().cb_unmapped += 1);
+                if log_this { log::info!("  fs_bindless_cb gpu={:#x} not mapped", draw.fs_bindless_cb_addr); }
             }
-        } else if log_this {
-            log::info!("  no FS bindless cbuf tracked");
+        } else {
+            BLIT_STATS.with(|s| s.borrow_mut().no_cb_tracked += 1);
+            if log_this { log::info!("  no FS bindless cbuf tracked"); }
         }
     }
     let Some((idx, tex_w, tex_h, src_cpu, src_bh_log2)) = best else {
+        BLIT_STATS.with(|s| s.borrow_mut().no_best += 1);
         return false;
     };
     if log_this {
@@ -415,8 +463,52 @@ fn try_blit_bound_texture(
             gobs_per_row * block_rows * bh * GOB_SIZE
         };
         let mut buf = vec![0u8; tiled_size];
-        if !mem_read(src_cpu, &mut buf) { return false; }
-        return mem_write(rt_cpu, &buf);
+        if !mem_read(src_cpu, &mut buf) {
+            BLIT_STATS.with(|s| s.borrow_mut().blit_read_fail += 1);
+            return false;
+        }
+        let mut src_cksum: u32 = 0;
+        for chunk in buf.chunks_exact(4).step_by(64) {
+            let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            src_cksum = src_cksum.wrapping_mul(31).wrapping_add(v);
+        }
+        let mut rt_pre = vec![0u8; tiled_size];
+        let rt_pre_cksum: u32 = if mem_read(rt_cpu, &mut rt_pre) {
+            let mut c: u32 = 0;
+            for chunk in rt_pre.chunks_exact(4).step_by(64) {
+                let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                c = c.wrapping_mul(31).wrapping_add(v);
+            }
+            c
+        } else {
+            0
+        };
+        BLIT_STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.last_src_cksum != 0 {
+                if s.last_src_cksum == src_cksum { s.src_cksum_same += 1; } else { s.src_cksum_changed += 1; }
+            }
+            s.last_src_cksum = src_cksum;
+            if s.total <= 6 || s.total % 60 == 0 {
+                log::info!(
+                    "  blit cksum: src({:#x})={:#010x} rt_pre({:#x})={:#010x} differ={}",
+                    src_cpu, src_cksum, rt_cpu, rt_pre_cksum, src_cksum != rt_pre_cksum
+                );
+            }
+        });
+        let ok = mem_write(rt_cpu, &buf);
+        if ok {
+            BLIT_STATS.with(|s| {
+                let mut s = s.borrow_mut();
+                match path {
+                    1 => s.success_pool_match += 1,
+                    2 => s.success_pool_fallback += 1,
+                    3 => s.success_bindless += 1,
+                    _ => {}
+                }
+            });
+        }
+        return ok;
     }
 
     let width_bytes = rt_w * 4;
@@ -429,6 +521,15 @@ fn try_blit_bound_texture(
             mem_write(rt_cpu + dst_off as u64, &pixel);
         }
     }
+    BLIT_STATS.with(|s| {
+        let mut s = s.borrow_mut();
+        match path {
+            1 => s.success_pool_match += 1,
+            2 => s.success_pool_fallback += 1,
+            3 => s.success_bindless += 1,
+            _ => {}
+        }
+    });
     true
 }
 
