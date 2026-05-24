@@ -1476,11 +1476,14 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                         let vulkan_frame = if legacy_gfx {
                             if let Some(renderer) = kernel.nvdrv.renderer() {
                                 let r = renderer.clone();
-                                if r.clear_target(gb.nvmap_id, gb.width, gb.height, [1.0, 0.4, 0.1, 1.0]).is_ok() {
+                                let mut color = kernel.nvdrv.last_clear_color();
+                                if color[3] < 0.5 { color[3] = 1.0; }
+                                let clears = kernel.nvdrv.last_clear_count();
+                                if r.clear_target(gb.nvmap_id, gb.width, gb.height, color).is_ok() {
                                     if let Some(bytes) = r.readback_target(gb.nvmap_id, gb.width, gb.height) {
                                         log::info!(
-                                            "QueueBuffer legacy_gfx Vulkan readback: {}x{} ({} bytes)",
-                                            gb.width, gb.height, bytes.len()
+                                            "QueueBuffer legacy_gfx Vulkan: {}x{} color=[{:.2},{:.2},{:.2},{:.2}] clears={} → {} bytes",
+                                            gb.width, gb.height, color[0], color[1], color[2], color[3], clears, bytes.len()
                                         );
                                         Some(bytes)
                                     } else {

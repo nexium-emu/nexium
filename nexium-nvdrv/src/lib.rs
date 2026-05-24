@@ -908,6 +908,16 @@ impl Nvdrv {
     pub fn gpu_draw_count(&self) -> u64 {
         self.gpu.maxwell3d.lock().draw_count()
     }
+
+    pub fn last_clear_color(&self) -> [f32; 4] {
+        let m = self.gpu.maxwell3d.lock();
+        let c = m.regs.clear_color;
+        [c.r, c.g, c.b, c.a]
+    }
+
+    pub fn last_clear_count(&self) -> u64 {
+        self.gpu.maxwell3d.lock().clear_count()
+    }
 }
 
 impl Default for Nvdrv {
