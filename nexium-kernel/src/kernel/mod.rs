@@ -271,21 +271,59 @@ impl Kernel {
         if let Some(h) = self.font_shmem_handle {
             return h;
         }
-        const FONT_TTF: &[u8] = include_bytes!("../data/NotoMono-Regular.ttf");
         const SHMEM_SIZE: usize = 0x1100000;
-        let font_size = FONT_TTF.len() as u32;
+        const BFTTF_NAMES: [&str; 6] = [
+            "nintendo_udsg-r_std_003.bfttf",
+            "nintendo_udsg-r_org_zh-cn_003.bfttf",
+            "nintendo_udsg-r_ext_zh-cn_003.bfttf",
+            "nintendo_udjxh-db_zh-tw_003.bfttf",
+            "nintendo_udsg-r_ko_003.bfttf",
+            "nintendo_ext_003.bfttf",
+        ];
+        const BFTTF_KEY: [u8; 4] = [0x49, 0x62, 0x18, 0x06];
+
+        let fonts_dir = directories::BaseDirs::new()
+            .map(|b| b.config_dir().join("NeXium").join("system").join("fonts"));
+
         let mut buf = vec![0u8; SHMEM_SIZE];
         let mut offsets = [(0u32, 0u32); 6];
         let mut off = 0u32;
-        for i in 0..6usize {
-            let end = off as usize + FONT_TTF.len();
-            if end <= SHMEM_SIZE {
-                buf[off as usize..end].copy_from_slice(FONT_TTF);
-                offsets[i] = (off, font_size);
-                off += font_size;
+        let mut loaded = 0usize;
+
+        if let Some(dir) = fonts_dir {
+            for (i, name) in BFTTF_NAMES.iter().enumerate() {
+                let path = dir.join(name);
+                let raw = match std::fs::read(&path) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        log::warn!("pl:u font not found: {}", path.display());
+                        continue;
+                    }
+                };
+                if raw.len() < 8 {
+                    log::warn!("pl:u font too small: {}", path.display());
+                    continue;
+                }
+                let decoded_len = raw.len() - 8;
+                let end = off as usize + decoded_len;
+                if end > SHMEM_SIZE {
+                    log::warn!("pl:u font shmem overflow at type {}", i);
+                    break;
+                }
+                for (j, &b) in raw[8..].iter().enumerate() {
+                    buf[off as usize + j] = b ^ BFTTF_KEY[j & 3];
+                }
+                offsets[i] = (off, decoded_len as u32);
+                off = (off + decoded_len as u32 + 3) & !3;
+                loaded += 1;
+                log::info!("pl:u loaded font type {}: {} ({} bytes decoded)", i, name, decoded_len);
             }
         }
-        log::info!("pl:u font shmem: {} bytes, {} types at offsets {:?}", SHMEM_SIZE, 6, offsets.map(|(o, _)| o));
+
+        if loaded == 0 {
+            log::warn!("pl:u no system fonts loaded; expected BFTTF files in {{config}}/NeXium/system/fonts/");
+        }
+
         self.font_shmem = Some(buf);
         self.font_offsets = offsets;
         let h = self.handles.create_handle(handles::HandleType::SharedMemory);
