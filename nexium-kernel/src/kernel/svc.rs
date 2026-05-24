@@ -319,6 +319,30 @@ fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
                 }
             }
         }
+    } else if kernel.font_shmem_handle == Some(handle) {
+        log::info!("  → recognized as font shared memory, mapping {} bytes of font data at {:#x}", size, addr);
+        let font_data: Vec<u8> = kernel.font_shmem.as_deref().map(|d| {
+            let mut v = vec![0u8; size as usize];
+            let copy_len = d.len().min(size as usize);
+            v[..copy_len].copy_from_slice(&d[..copy_len]);
+            v
+        }).unwrap_or_else(|| vec![0u8; size as usize]);
+        let needed_map = kernel.address_space.write(addr, &font_data).is_err();
+        if needed_map {
+            let _ = kernel.address_space.map(addr, size, nexium_memory::perm::Perm::R, "font_shmem");
+            let _ = kernel.address_space.write(addr, &font_data);
+        }
+        if let Some(region) = kernel.address_space.host_region_at(addr) {
+            if let Some(cpu) = &mut kernel.cpu {
+                unsafe {
+                    if let Err(e) = cpu.map_host(region.base, region.size, region.perm, region.host_ptr) {
+                        log::warn!("failed to map font shmem in CPU: {}", e);
+                    } else {
+                        log::info!("  → registered font shmem at {:#x} with CPU", region.base);
+                    }
+                }
+            }
+        }
     } else {
         let backing = vec![0u8; size as usize];
         let needed_map = kernel.address_space.write(addr, &backing).is_err();
@@ -1503,6 +1527,40 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     }
 
     if port_name == "pl:u" || port_name == "pl:s" {
+        match cmd_id {
+            4 => {
+                let handle = kernel.ensure_font_shmem_handle();
+                log::debug!("pl:u cmd=4 GetSharedMemoryNativeHandle → {:#x}", handle);
+                return build_ipc_response(ctx, 0, &[], &[handle]);
+            }
+            2 => {
+                let font_type = if ctx.cmif_in_data_len >= 4 {
+                    u32::from_le_bytes([
+                        ctx.buf[ctx.cmif_in_data_off],
+                        ctx.buf[ctx.cmif_in_data_off + 1],
+                        ctx.buf[ctx.cmif_in_data_off + 2],
+                        ctx.buf[ctx.cmif_in_data_off + 3],
+                    ])
+                } else { 0 };
+                let (_, size) = kernel.font_offsets[font_type.min(5) as usize];
+                log::debug!("pl:u cmd=2 GetSize type={} → {}", font_type, size);
+                return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
+            }
+            3 => {
+                let font_type = if ctx.cmif_in_data_len >= 4 {
+                    u32::from_le_bytes([
+                        ctx.buf[ctx.cmif_in_data_off],
+                        ctx.buf[ctx.cmif_in_data_off + 1],
+                        ctx.buf[ctx.cmif_in_data_off + 2],
+                        ctx.buf[ctx.cmif_in_data_off + 3],
+                    ])
+                } else { 0 };
+                let (offset, _) = kernel.font_offsets[font_type.min(5) as usize];
+                log::debug!("pl:u cmd=3 GetOffset type={} → {}", font_type, offset);
+                return build_ipc_response(ctx, 0, &offset.to_le_bytes(), &[]);
+            }
+            _ => {}
+        }
         if let Some(outcome) = cmif_dispatch_pl(kernel, ctx) {
             log::debug!("pl.cmd_{} → {} bytes (rc={:#x}) via #[service]", cmd_id, outcome.inline_out.len(), outcome.result);
             return build_ipc_response(ctx, outcome.result, &outcome.inline_out, &[]);

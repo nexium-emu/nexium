@@ -73,6 +73,10 @@ pub struct Kernel {
     pub open_dir_lists: HashMap<(u32, u32), (Vec<(String, bool, u64)>, usize)>,
 
     pub yield_after_svc: bool,
+
+    pub font_shmem: Option<Vec<u8>>,
+    pub font_shmem_handle: Option<u32>,
+    pub font_offsets: [(u32, u32); 6],
 }
 
 impl Kernel {
@@ -148,6 +152,9 @@ impl Kernel {
             open_host_files: HashMap::new(),
             open_dir_lists: HashMap::new(),
             yield_after_svc: false,
+            font_shmem: None,
+            font_shmem_handle: None,
+            font_offsets: [(0, 0); 6],
         }
     }
 
@@ -258,6 +265,32 @@ impl Kernel {
         }
 
         FrameOut { width: w, height: h, pixels }
+    }
+
+    pub fn ensure_font_shmem_handle(&mut self) -> u32 {
+        if let Some(h) = self.font_shmem_handle {
+            return h;
+        }
+        const FONT_TTF: &[u8] = include_bytes!("../data/NotoMono-Regular.ttf");
+        const SHMEM_SIZE: usize = 0x1100000;
+        let font_size = FONT_TTF.len() as u32;
+        let mut buf = vec![0u8; SHMEM_SIZE];
+        let mut offsets = [(0u32, 0u32); 6];
+        let mut off = 0u32;
+        for i in 0..6usize {
+            let end = off as usize + FONT_TTF.len();
+            if end <= SHMEM_SIZE {
+                buf[off as usize..end].copy_from_slice(FONT_TTF);
+                offsets[i] = (off, font_size);
+                off += font_size;
+            }
+        }
+        log::info!("pl:u font shmem: {} bytes, {} types at offsets {:?}", SHMEM_SIZE, 6, offsets.map(|(o, _)| o));
+        self.font_shmem = Some(buf);
+        self.font_offsets = offsets;
+        let h = self.handles.create_handle(handles::HandleType::SharedMemory);
+        self.font_shmem_handle = Some(h);
+        h
     }
 
     pub fn dispatch_svc(&mut self, imm: u16) -> u32 {
