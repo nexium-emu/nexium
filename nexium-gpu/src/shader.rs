@@ -61,6 +61,8 @@ impl ShaderCompiler {
 
 impl Drop for ShaderCompiler {
     fn drop(&mut self) {
-        log::warn!("ShaderCompiler dropped without explicit cleanup");
+        if !self.modules.is_empty() {
+            log::warn!("ShaderCompiler dropped without explicit cleanup");
+        }
     }
 }

@@ -28,6 +28,7 @@ nexium-memory = { path = "nexium-memory" }
 nexium-cpu = { path = "nexium-cpu" }
 nexium-loader = { path = "nexium-loader" }
 nexium-shader = { path = "nexium-shader" }
+nexium-spirv = { path = "nexium-spirv" }
 nexium-ipc = { path = "nexium-ipc" }
 nexium-cmif = { path = "nexium-cmif" }
 nexium-nvdrv = { path = "nexium-nvdrv" }

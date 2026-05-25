@@ -6,3 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+nexium-shader.workspace = true
+rspirv.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+naga.workspace = true
+bytemuck.workspace = true

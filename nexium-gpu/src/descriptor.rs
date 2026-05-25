@@ -93,12 +93,16 @@ impl DescriptorPool {
 
 impl Drop for DescriptorSetLayout {
     fn drop(&mut self) {
-        log::warn!("DescriptorSetLayout dropped without explicit cleanup");
+        if self.layout != vk::DescriptorSetLayout::null() {
+            log::warn!("DescriptorSetLayout dropped without explicit cleanup");
+        }
     }
 }
 
 impl Drop for DescriptorPool {
     fn drop(&mut self) {
-        log::warn!("DescriptorPool dropped without explicit cleanup");
+        if self.pool != vk::DescriptorPool::null() {
+            log::warn!("DescriptorPool dropped without explicit cleanup");
+        }
     }
 }

@@ -3,7 +3,10 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::rt_cache::{find_memory_type, GpuImage, RtCache, RtKey};
+use crate::descriptor::{DescriptorPool, DescriptorSetLayout};
+use crate::pipeline::PipelineCache;
+use crate::rt_cache::{find_memory_type, RtCache, RtKey};
+use crate::shader::ShaderCompiler;
 
 pub struct Renderer {
     inner: Mutex<RendererInner>,
@@ -20,6 +23,10 @@ struct RendererInner {
     cmd_pool: vk::CommandPool,
     rt_cache: RtCache,
     staging: HashMap<(u32, u32), StagingBuffer>,
+    descriptor_layout: DescriptorSetLayout,
+    descriptor_pool: DescriptorPool,
+    shader_compiler: ShaderCompiler,
+    pipeline_cache: PipelineCache,
 }
 
 struct StagingBuffer {
@@ -90,6 +97,13 @@ impl Renderer {
             flags: Default::default(),
             _marker: std::marker::PhantomData,
         };
+        let mut features_13 = vk::PhysicalDeviceVulkan13Features {
+            s_type: vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+            dynamic_rendering: vk::TRUE,
+            synchronization2: vk::TRUE,
+            p_next: std::ptr::null_mut(),
+            ..Default::default()
+        };
         let dev_info = vk::DeviceCreateInfo {
             s_type: vk::StructureType::DEVICE_CREATE_INFO,
             queue_create_info_count: 1,
@@ -99,7 +113,7 @@ impl Renderer {
             enabled_layer_count: 0,
             pp_enabled_layer_names: std::ptr::null(),
             p_enabled_features: std::ptr::null(),
-            p_next: std::ptr::null(),
+            p_next: &mut features_13 as *mut _ as *mut std::ffi::c_void,
             flags: Default::default(),
             _marker: std::marker::PhantomData,
         };
@@ -125,6 +139,11 @@ impl Renderer {
         let mut rt_cache = RtCache::new();
         rt_cache.set_mem_properties(mem_props);
 
+        let descriptor_layout = DescriptorSetLayout::new(&device)?;
+        let descriptor_pool = DescriptorPool::new(&device, 256)?;
+        let shader_compiler = ShaderCompiler::new();
+        let pipeline_cache = PipelineCache::new(&device, descriptor_layout.layout)?;
+
         let props = unsafe { instance.get_physical_device_properties(physical_device) };
         let name = unsafe {
             std::ffi::CStr::from_ptr(props.device_name.as_ptr())
@@ -145,6 +164,10 @@ impl Renderer {
                 cmd_pool,
                 rt_cache,
                 staging: HashMap::new(),
+                descriptor_layout,
+                descriptor_pool,
+                shader_compiler,
+                pipeline_cache,
             }),
         }))
     }
@@ -247,6 +270,220 @@ impl Renderer {
         }
         Some(out)
     }
+
+    pub fn compile_pipeline(
+        &self,
+        vs_spirv: &[u32],
+        fs_spirv: &[u32],
+        vs_cbuf_mask: u32,
+        fs_cbuf_mask: u32,
+        layout: &crate::draw::VertexLayout,
+        topology: vk::PrimitiveTopology,
+        color_format: vk::Format,
+    ) -> Result<vk::Pipeline, String> {
+        let mut inner = self.inner.lock();
+        let key = crate::pipeline::PipelineKey {
+            vs_hash: hash_spirv(vs_spirv),
+            fs_hash: hash_spirv(fs_spirv),
+            topology: topology.as_raw() as u32,
+            color_format: color_format.as_raw() as u32,
+            vs_cbuf_mask,
+            fs_cbuf_mask,
+            vertex_layout_hash: layout.hash(),
+        };
+        if let Some(p) = inner.pipeline_cache.get(&key) {
+            return Ok(p);
+        }
+        let RendererInner { device, shader_compiler, pipeline_cache, .. } = &mut *inner;
+
+        let vs_mod = shader_compiler.compile_or_get(vs_spirv, device)?;
+        let fs_mod = shader_compiler.compile_or_get(fs_spirv, device)?;
+
+        let entry = c"main";
+        let stages = [
+            vk::PipelineShaderStageCreateInfo {
+                s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+                stage: vk::ShaderStageFlags::VERTEX,
+                module: vs_mod,
+                p_name: entry.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+                p_next: std::ptr::null(),
+                flags: Default::default(),
+                _marker: std::marker::PhantomData,
+            },
+            vk::PipelineShaderStageCreateInfo {
+                s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+                stage: vk::ShaderStageFlags::FRAGMENT,
+                module: fs_mod,
+                p_name: entry.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+                p_next: std::ptr::null(),
+                flags: Default::default(),
+                _marker: std::marker::PhantomData,
+            },
+        ];
+
+        let vk_bindings: Vec<vk::VertexInputBindingDescription> = layout.bindings.iter().map(|b| {
+            vk::VertexInputBindingDescription {
+                binding: b.binding,
+                stride: b.stride,
+                input_rate: vk::VertexInputRate::VERTEX,
+            }
+        }).collect();
+        let vk_attrs: Vec<vk::VertexInputAttributeDescription> = layout.attrs.iter().map(|a| {
+            vk::VertexInputAttributeDescription {
+                location: a.location,
+                binding: a.binding,
+                format: a.format,
+                offset: a.offset,
+            }
+        }).collect();
+
+        let vi_state = vk::PipelineVertexInputStateCreateInfo {
+            s_type: vk::StructureType::PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            vertex_binding_description_count: vk_bindings.len() as u32,
+            p_vertex_binding_descriptions: vk_bindings.as_ptr(),
+            vertex_attribute_description_count: vk_attrs.len() as u32,
+            p_vertex_attribute_descriptions: vk_attrs.as_ptr(),
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+
+        let ia_state = vk::PipelineInputAssemblyStateCreateInfo {
+            s_type: vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            topology,
+            primitive_restart_enable: vk::FALSE,
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+
+        let vp_state = vk::PipelineViewportStateCreateInfo {
+            s_type: vk::StructureType::PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            viewport_count: 1,
+            p_viewports: std::ptr::null(),
+            scissor_count: 1,
+            p_scissors: std::ptr::null(),
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+
+        let rs_state = vk::PipelineRasterizationStateCreateInfo {
+            s_type: vk::StructureType::PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            polygon_mode: vk::PolygonMode::FILL,
+            cull_mode: vk::CullModeFlags::NONE,
+            front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+            line_width: 1.0,
+            depth_clamp_enable: vk::FALSE,
+            rasterizer_discard_enable: vk::FALSE,
+            depth_bias_enable: vk::FALSE,
+            depth_bias_constant_factor: 0.0,
+            depth_bias_clamp: 0.0,
+            depth_bias_slope_factor: 0.0,
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+
+        let ms_state = vk::PipelineMultisampleStateCreateInfo {
+            s_type: vk::StructureType::PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            rasterization_samples: vk::SampleCountFlags::TYPE_1,
+            sample_shading_enable: vk::FALSE,
+            min_sample_shading: 0.0,
+            p_sample_mask: std::ptr::null(),
+            alpha_to_coverage_enable: vk::FALSE,
+            alpha_to_one_enable: vk::FALSE,
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+
+        let cb_attachment = vk::PipelineColorBlendAttachmentState {
+            blend_enable: vk::FALSE,
+            src_color_blend_factor: vk::BlendFactor::ONE,
+            dst_color_blend_factor: vk::BlendFactor::ZERO,
+            color_blend_op: vk::BlendOp::ADD,
+            src_alpha_blend_factor: vk::BlendFactor::ONE,
+            dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+            alpha_blend_op: vk::BlendOp::ADD,
+            color_write_mask: vk::ColorComponentFlags::RGBA,
+        };
+        let cb_state = vk::PipelineColorBlendStateCreateInfo {
+            s_type: vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            logic_op_enable: vk::FALSE,
+            logic_op: vk::LogicOp::COPY,
+            attachment_count: 1,
+            p_attachments: &cb_attachment,
+            blend_constants: [0.0; 4],
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+
+        let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dyn_state = vk::PipelineDynamicStateCreateInfo {
+            s_type: vk::StructureType::PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            dynamic_state_count: dyn_states.len() as u32,
+            p_dynamic_states: dyn_states.as_ptr(),
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+
+        let color_formats = [color_format];
+        let mut rendering_info = vk::PipelineRenderingCreateInfo {
+            s_type: vk::StructureType::PIPELINE_RENDERING_CREATE_INFO,
+            view_mask: 0,
+            color_attachment_count: 1,
+            p_color_attachment_formats: color_formats.as_ptr(),
+            depth_attachment_format: vk::Format::UNDEFINED,
+            stencil_attachment_format: vk::Format::UNDEFINED,
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+
+        let pipeline_info = vk::GraphicsPipelineCreateInfo {
+            s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
+            stage_count: stages.len() as u32,
+            p_stages: stages.as_ptr(),
+            p_vertex_input_state: &vi_state,
+            p_input_assembly_state: &ia_state,
+            p_tessellation_state: std::ptr::null(),
+            p_viewport_state: &vp_state,
+            p_rasterization_state: &rs_state,
+            p_multisample_state: &ms_state,
+            p_depth_stencil_state: std::ptr::null(),
+            p_color_blend_state: &cb_state,
+            p_dynamic_state: &dyn_state,
+            layout: pipeline_cache.layout,
+            render_pass: vk::RenderPass::null(),
+            subpass: 0,
+            base_pipeline_handle: vk::Pipeline::null(),
+            base_pipeline_index: -1,
+            p_next: &mut rendering_info as *mut _ as *mut std::ffi::c_void,
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+
+        let pipelines = unsafe {
+            device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .map_err(|(_, e)| format!("create_graphics_pipelines: {:?}", e))?
+        };
+        let pipeline = pipelines[0];
+        pipeline_cache.insert(key, pipeline);
+        Ok(pipeline)
+    }
+}
+
+fn hash_spirv(spirv: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for w in spirv {
+        h ^= *w as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 fn cache_contains(rt: &RtCache, key: RtKey) -> bool {
@@ -434,6 +671,14 @@ impl Drop for RendererInner {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+        }
+        self.pipeline_cache.clear(&self.device);
+        self.shader_compiler.clear(&self.device);
+        unsafe {
+            self.device.destroy_descriptor_pool(self.descriptor_pool.pool, None);
+            self.descriptor_pool.pool = vk::DescriptorPool::null();
+            self.device.destroy_descriptor_set_layout(self.descriptor_layout.layout, None);
+            self.descriptor_layout.layout = vk::DescriptorSetLayout::null();
         }
         for (_, s) in self.staging.drain() {
             unsafe {
