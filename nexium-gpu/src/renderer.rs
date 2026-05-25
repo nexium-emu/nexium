@@ -27,12 +27,25 @@ struct RendererInner {
     descriptor_pool: DescriptorPool,
     shader_compiler: ShaderCompiler,
     pipeline_cache: PipelineCache,
+    dummy_white: Option<DummyImage>,
+    default_sampler: Option<vk::Sampler>,
 }
 
 struct StagingBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: u64,
+}
+
+struct HostBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+
+struct DummyImage {
+    image: vk::Image,
+    view: vk::ImageView,
+    memory: vk::DeviceMemory,
 }
 
 impl Renderer {
@@ -168,6 +181,8 @@ impl Renderer {
                 descriptor_pool,
                 shader_compiler,
                 pipeline_cache,
+                dummy_white: None,
+                default_sampler: None,
             }),
         }))
     }
@@ -475,6 +490,480 @@ impl Renderer {
         pipeline_cache.insert(key, pipeline);
         Ok(pipeline)
     }
+
+    pub fn execute_draw<F>(
+        &self,
+        call: &crate::draw::Maxwell3dDrawCall,
+        read_guest: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(u64, usize) -> Option<Vec<u8>>,
+    {
+        let pipeline = self.compile_pipeline(
+            &call.vs_spirv,
+            &call.fs_spirv,
+            call.vs_cbuf_mask,
+            call.fs_cbuf_mask,
+            &call.vertex_layout,
+            call.state.topology,
+            call.rt_format,
+        )?;
+
+        let vertex_stride = call
+            .vertex_layout
+            .bindings
+            .first()
+            .map(|b| b.stride as u64)
+            .unwrap_or(0);
+        let vertex_bytes = vertex_stride.saturating_mul(call.vertex_count as u64) as usize;
+        let vertex_data = if vertex_bytes > 0 {
+            read_guest(call.vertex_addr, vertex_bytes)
+                .ok_or_else(|| format!("vertex read failed va={:#x}", call.vertex_addr))?
+        } else {
+            Vec::new()
+        };
+
+        let cbuf_size = call.cbuf_size as usize;
+        let cbuf_data = if cbuf_size > 0 && call.cbuf_addr != 0 {
+            read_guest(call.cbuf_addr, cbuf_size).unwrap_or_else(|| vec![0u8; cbuf_size])
+        } else {
+            vec![0u8; 256]
+        };
+
+        let mut inner = self.inner.lock();
+        let RendererInner {
+            device,
+            queue,
+            mem_props,
+            cmd_pool,
+            rt_cache,
+            descriptor_layout,
+            descriptor_pool,
+            pipeline_cache,
+            dummy_white,
+            default_sampler,
+            ..
+        } = &mut *inner;
+
+        if dummy_white.is_none() {
+            *dummy_white = Some(create_dummy_white_image(
+                device, *queue, *cmd_pool, mem_props,
+            )?);
+        }
+        if default_sampler.is_none() {
+            *default_sampler = Some(create_default_sampler(device)?);
+        }
+        let dummy = dummy_white.as_ref().unwrap();
+        let samp = default_sampler.unwrap();
+
+        let vertex_buf = if !vertex_data.is_empty() {
+            Some(create_host_buffer(
+                device,
+                mem_props,
+                &vertex_data,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+            )?)
+        } else {
+            None
+        };
+        let ubo_buf = create_host_buffer(
+            device,
+            mem_props,
+            &cbuf_data,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+        )?;
+
+        let set_layouts = [descriptor_layout.layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo {
+            s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
+            descriptor_pool: descriptor_pool.pool,
+            descriptor_set_count: 1,
+            p_set_layouts: set_layouts.as_ptr(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        let dsets = unsafe {
+            device
+                .allocate_descriptor_sets(&alloc_info)
+                .map_err(|e| format!("allocate_descriptor_sets: {:?}", e))?
+        };
+        let dset = dsets[0];
+
+        let ubo_info = vk::DescriptorBufferInfo {
+            buffer: ubo_buf.buffer,
+            offset: 0,
+            range: cbuf_data.len() as u64,
+        };
+        let img_info = vk::DescriptorImageInfo {
+            sampler: vk::Sampler::null(),
+            image_view: dummy.view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        let samp_info = vk::DescriptorImageInfo {
+            sampler: samp,
+            image_view: vk::ImageView::null(),
+            image_layout: vk::ImageLayout::UNDEFINED,
+        };
+        let writes = [
+            vk::WriteDescriptorSet {
+                s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                dst_set: dset,
+                dst_binding: 0,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                p_buffer_info: &ubo_info,
+                p_image_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+                p_next: std::ptr::null(),
+                _marker: std::marker::PhantomData,
+            },
+            vk::WriteDescriptorSet {
+                s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                dst_set: dset,
+                dst_binding: 1,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                p_image_info: &img_info,
+                p_buffer_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+                p_next: std::ptr::null(),
+                _marker: std::marker::PhantomData,
+            },
+            vk::WriteDescriptorSet {
+                s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                dst_set: dset,
+                dst_binding: 2,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::SAMPLER,
+                p_image_info: &samp_info,
+                p_buffer_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+                p_next: std::ptr::null(),
+                _marker: std::marker::PhantomData,
+            },
+        ];
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+
+        let rt = rt_cache.get_or_create(call.rt_key, device)?;
+        let rt_image = rt.image;
+        let rt_view = rt.view;
+        let rt_extent = rt.extent;
+        let rt_prev_layout = rt.layout;
+
+        let cmd = alloc_one_time_cmd(device, *cmd_pool)?;
+        begin_one_time(device, cmd)?;
+        transition_image(
+            device,
+            cmd,
+            rt_image,
+            rt_prev_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+
+        let clear_value = vk::ClearValue {
+            color: vk::ClearColorValue { float32: call.clear_color },
+        };
+        let attachment = vk::RenderingAttachmentInfo {
+            s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
+            image_view: rt_view,
+            image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            resolve_mode: vk::ResolveModeFlags::NONE,
+            resolve_image_view: vk::ImageView::null(),
+            resolve_image_layout: vk::ImageLayout::UNDEFINED,
+            load_op: if call.clear { vk::AttachmentLoadOp::CLEAR } else { vk::AttachmentLoadOp::LOAD },
+            store_op: vk::AttachmentStoreOp::STORE,
+            clear_value,
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        let render_info = vk::RenderingInfo {
+            s_type: vk::StructureType::RENDERING_INFO,
+            render_area: vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: rt_extent,
+            },
+            layer_count: 1,
+            view_mask: 0,
+            color_attachment_count: 1,
+            p_color_attachments: &attachment,
+            p_depth_attachment: std::ptr::null(),
+            p_stencil_attachment: std::ptr::null(),
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+        unsafe { device.cmd_begin_rendering(cmd, &render_info) };
+
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: rt_extent.width as f32,
+            height: rt_extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: rt_extent,
+        };
+        unsafe {
+            device.cmd_set_viewport(cmd, 0, &[viewport]);
+            device.cmd_set_scissor(cmd, 0, &[scissor]);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_cache.layout,
+                0,
+                &[dset],
+                &[],
+            );
+            if let Some(vb) = &vertex_buf {
+                device.cmd_bind_vertex_buffers(cmd, 0, &[vb.buffer], &[0]);
+            }
+            device.cmd_draw(cmd, call.vertex_count, 1, 0, 0);
+            device.cmd_end_rendering(cmd);
+        }
+
+        transition_image(
+            device,
+            cmd,
+            rt_image,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+
+        end_one_time(device, cmd)?;
+        submit_and_wait(device, *queue, cmd)?;
+
+        unsafe {
+            device.free_command_buffers(*cmd_pool, &[cmd]);
+            let _ = device.free_descriptor_sets(descriptor_pool.pool, &[dset]);
+            if let Some(vb) = vertex_buf {
+                device.destroy_buffer(vb.buffer, None);
+                device.free_memory(vb.memory, None);
+            }
+            device.destroy_buffer(ubo_buf.buffer, None);
+            device.free_memory(ubo_buf.memory, None);
+        }
+        rt_cache.get_or_create(call.rt_key, device)?.layout =
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        Ok(())
+    }
+}
+
+fn create_host_buffer(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    data: &[u8],
+    usage: vk::BufferUsageFlags,
+) -> Result<HostBuffer, String> {
+    let size = data.len().max(16) as u64;
+    let info = vk::BufferCreateInfo {
+        s_type: vk::StructureType::BUFFER_CREATE_INFO,
+        size,
+        usage,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        queue_family_index_count: 0,
+        p_queue_family_indices: std::ptr::null(),
+        p_next: std::ptr::null(),
+        flags: Default::default(),
+        _marker: std::marker::PhantomData,
+    };
+    let buffer = unsafe {
+        device
+            .create_buffer(&info, None)
+            .map_err(|e| format!("create_buffer: {:?}", e))?
+    };
+    let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let mt = find_memory_type(
+        mem_props,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )
+    .ok_or_else(|| "no HOST_VISIBLE memory type".to_string())?;
+    let alloc = vk::MemoryAllocateInfo {
+        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+        allocation_size: req.size,
+        memory_type_index: mt,
+        p_next: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let memory = unsafe {
+        device
+            .allocate_memory(&alloc, None)
+            .map_err(|e| format!("allocate_memory(host buffer): {:?}", e))?
+    };
+    unsafe {
+        device
+            .bind_buffer_memory(buffer, memory, 0)
+            .map_err(|e| format!("bind_buffer_memory: {:?}", e))?;
+    }
+    if !data.is_empty() {
+        unsafe {
+            let ptr = device
+                .map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("map_memory: {:?}", e))? as *mut u8;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            device.unmap_memory(memory);
+        }
+    }
+    Ok(HostBuffer { buffer, memory })
+}
+
+fn create_default_sampler(device: &ash::Device) -> Result<vk::Sampler, String> {
+    let info = vk::SamplerCreateInfo {
+        s_type: vk::StructureType::SAMPLER_CREATE_INFO,
+        mag_filter: vk::Filter::LINEAR,
+        min_filter: vk::Filter::LINEAR,
+        mipmap_mode: vk::SamplerMipmapMode::LINEAR,
+        address_mode_u: vk::SamplerAddressMode::REPEAT,
+        address_mode_v: vk::SamplerAddressMode::REPEAT,
+        address_mode_w: vk::SamplerAddressMode::REPEAT,
+        mip_lod_bias: 0.0,
+        anisotropy_enable: vk::FALSE,
+        max_anisotropy: 1.0,
+        compare_enable: vk::FALSE,
+        compare_op: vk::CompareOp::NEVER,
+        min_lod: 0.0,
+        max_lod: 0.0,
+        border_color: vk::BorderColor::FLOAT_OPAQUE_BLACK,
+        unnormalized_coordinates: vk::FALSE,
+        p_next: std::ptr::null(),
+        flags: Default::default(),
+        _marker: std::marker::PhantomData,
+    };
+    unsafe {
+        device
+            .create_sampler(&info, None)
+            .map_err(|e| format!("create_sampler: {:?}", e))
+    }
+}
+
+fn create_dummy_white_image(
+    device: &ash::Device,
+    queue: vk::Queue,
+    cmd_pool: vk::CommandPool,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+) -> Result<DummyImage, String> {
+    let format = vk::Format::R8G8B8A8_UNORM;
+    let img_info = vk::ImageCreateInfo {
+        s_type: vk::StructureType::IMAGE_CREATE_INFO,
+        image_type: vk::ImageType::TYPE_2D,
+        format,
+        extent: vk::Extent3D { width: 1, height: 1, depth: 1 },
+        mip_levels: 1,
+        array_layers: 1,
+        samples: vk::SampleCountFlags::TYPE_1,
+        tiling: vk::ImageTiling::OPTIMAL,
+        usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        initial_layout: vk::ImageLayout::UNDEFINED,
+        p_next: std::ptr::null(),
+        flags: Default::default(),
+        queue_family_index_count: 0,
+        p_queue_family_indices: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let image = unsafe {
+        device
+            .create_image(&img_info, None)
+            .map_err(|e| format!("create_image(dummy): {:?}", e))?
+    };
+    let req = unsafe { device.get_image_memory_requirements(image) };
+    let mt = find_memory_type(
+        mem_props,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )
+    .ok_or_else(|| "no DEVICE_LOCAL for dummy image".to_string())?;
+    let alloc = vk::MemoryAllocateInfo {
+        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+        allocation_size: req.size,
+        memory_type_index: mt,
+        p_next: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let memory = unsafe {
+        device
+            .allocate_memory(&alloc, None)
+            .map_err(|e| format!("allocate_memory(dummy image): {:?}", e))?
+    };
+    unsafe {
+        device
+            .bind_image_memory(image, memory, 0)
+            .map_err(|e| format!("bind_image_memory(dummy): {:?}", e))?;
+    }
+
+    let pixel: [u8; 4] = [255, 255, 255, 255];
+    let stage = create_host_buffer(device, mem_props, &pixel, vk::BufferUsageFlags::TRANSFER_SRC)?;
+
+    let cmd = alloc_one_time_cmd(device, cmd_pool)?;
+    begin_one_time(device, cmd)?;
+    transition_image(device, cmd, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    let copy = vk::BufferImageCopy {
+        buffer_offset: 0,
+        buffer_row_length: 0,
+        buffer_image_height: 0,
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        image_extent: vk::Extent3D { width: 1, height: 1, depth: 1 },
+    };
+    unsafe {
+        device.cmd_copy_buffer_to_image(
+            cmd,
+            stage.buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[copy],
+        );
+    }
+    transition_image(
+        device,
+        cmd,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    );
+    end_one_time(device, cmd)?;
+    submit_and_wait(device, queue, cmd)?;
+    unsafe {
+        device.free_command_buffers(cmd_pool, &[cmd]);
+        device.destroy_buffer(stage.buffer, None);
+        device.free_memory(stage.memory, None);
+    }
+
+    let view_info = vk::ImageViewCreateInfo {
+        s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+        image,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format,
+        subresource_range: vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        components: vk::ComponentMapping::default(),
+        p_next: std::ptr::null(),
+        flags: Default::default(),
+        _marker: std::marker::PhantomData,
+    };
+    let view = unsafe {
+        device
+            .create_image_view(&view_info, None)
+            .map_err(|e| format!("create_image_view(dummy): {:?}", e))?
+    };
+    Ok(DummyImage { image, view, memory })
 }
 
 fn hash_spirv(spirv: &[u32]) -> u64 {
@@ -671,6 +1160,16 @@ impl Drop for RendererInner {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+        }
+        if let Some(d) = self.dummy_white.take() {
+            unsafe {
+                self.device.destroy_image_view(d.view, None);
+                self.device.destroy_image(d.image, None);
+                self.device.free_memory(d.memory, None);
+            }
+        }
+        if let Some(s) = self.default_sampler.take() {
+            unsafe { self.device.destroy_sampler(s, None) };
         }
         self.pipeline_cache.clear(&self.device);
         self.shader_compiler.clear(&self.device);

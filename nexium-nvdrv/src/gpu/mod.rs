@@ -1,5 +1,6 @@
 pub mod pusher;
 pub mod engines;
+pub mod vk_dispatch;
 
 pub use pusher::{CommandListHeader, Pusher};
 pub use engines::{Maxwell3D, Maxwell3DRegisters, MaxwellDma, Fermi2D, KeplerMemory};

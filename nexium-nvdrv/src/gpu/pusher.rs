@@ -2,6 +2,7 @@ use super::engines::{Maxwell3D, MaxwellDma, MAXWELL_DMA_CLASS, Fermi2D, FERMI_2D
 use super::GpuMappings;
 use super::super::PipelineStats;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
@@ -84,6 +85,7 @@ pub struct Pusher {
     state: DmaState,
     puller: PullerState,
     entries_logged: u32,
+    pub renderer: Option<Arc<nexium_gpu::Renderer>>,
 }
 
 impl Pusher {
@@ -94,7 +96,12 @@ impl Pusher {
             state: DmaState::default(),
             puller: PullerState::default(),
             entries_logged: 0,
+            renderer: None,
         }
+    }
+
+    pub fn set_renderer(&mut self, r: Option<Arc<nexium_gpu::Renderer>>) {
+        self.renderer = r;
     }
 
     pub fn process_gpfifo(
@@ -299,7 +306,20 @@ impl Pusher {
             }
             if !maxwell.pending_draws.is_empty() {
                 let draws = std::mem::take(&mut maxwell.pending_draws);
-                sw_renderer::execute_draws(&draws, mappings, maxwell_dma, mem_read, mem_write);
+                let used_vk = if let Some(r) = &self.renderer {
+                    match super::vk_dispatch::try_vulkan_draws(&draws, mappings, maxwell, r, mem_read) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::warn!("vk_dispatch: {} — falling back to sw_renderer", e);
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if !used_vk {
+                    sw_renderer::execute_draws(&draws, mappings, maxwell_dma, mem_read, mem_write);
+                }
             }
         } else if bound_class == MAXWELL_DMA_CLASS {
             let pre = maxwell_dma.blit_count;

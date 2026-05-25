@@ -188,6 +188,7 @@ impl Nvdrv {
             match nexium_gpu::Renderer::new() {
                 Ok(r) => {
                     log::info!("nexium-nvdrv: Vulkan Renderer initialized");
+                    self.gpu.pusher.lock().set_renderer(Some(r.clone()));
                     Some(r)
                 }
                 Err(e) => {
