@@ -21,7 +21,15 @@ impl HidService {
             2 => self.cmd_activate_debug_pad(),
             100 => self.cmd_set_supported_npad_style_set(),
             101 => self.cmd_get_supported_npad_style_set(),
-            102 => self.cmd_set_npad_joy_hold_type(),
+            102 => self.cmd_set_supported_npad_id_type(),
+            103 => self.cmd_activate_npad(),
+            120 => self.cmd_set_npad_joy_hold_type(),
+            121 => self.cmd_get_npad_joy_hold_type(),
+            122 => self.cmd_set_npad_joy_assignment_mode_single_by_default(),
+            123 => self.cmd_set_npad_joy_assignment_mode_single(),
+            124 => self.cmd_set_npad_joy_assignment_mode_dual(),
+            125 => self.cmd_merge_single_joy_as_dual_joy(),
+            128 => self.cmd_set_npad_handheld_activation_mode(),
             _ => {
                 log::warn!("hid.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd_id);
                 SUCCESS
@@ -60,6 +68,46 @@ impl HidService {
 
     fn cmd_set_npad_joy_hold_type(&self) -> u32 {
         log::info!("HID::SetNpadJoyHoldType");
+        SUCCESS
+    }
+
+    fn cmd_get_npad_joy_hold_type(&self) -> u32 {
+        log::info!("HID::GetNpadJoyHoldType");
+        SUCCESS
+    }
+
+    fn cmd_set_supported_npad_id_type(&self) -> u32 {
+        log::info!("HID::SetSupportedNpadIdType");
+        SUCCESS
+    }
+
+    fn cmd_activate_npad(&self) -> u32 {
+        log::info!("HID::ActivateNpad");
+        SUCCESS
+    }
+
+    fn cmd_set_npad_joy_assignment_mode_single_by_default(&self) -> u32 {
+        log::info!("HID::SetNpadJoyAssignmentModeSingleByDefault");
+        SUCCESS
+    }
+
+    fn cmd_set_npad_joy_assignment_mode_single(&self) -> u32 {
+        log::info!("HID::SetNpadJoyAssignmentModeSingle");
+        SUCCESS
+    }
+
+    fn cmd_set_npad_joy_assignment_mode_dual(&self) -> u32 {
+        log::info!("HID::SetNpadJoyAssignmentModeDual");
+        SUCCESS
+    }
+
+    fn cmd_merge_single_joy_as_dual_joy(&self) -> u32 {
+        log::info!("HID::MergeSingleJoyAsDualJoy");
+        SUCCESS
+    }
+
+    fn cmd_set_npad_handheld_activation_mode(&self) -> u32 {
+        log::info!("HID::SetNpadHandheldActivationMode");
         SUCCESS
     }
 }
