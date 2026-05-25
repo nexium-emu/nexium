@@ -79,6 +79,7 @@ pub struct Kernel {
     pub font_offsets: [(u32, u32); 6],
 
     pub audio_out_buffers: HashMap<u32, VecDeque<u64>>,
+    pub audio_buffer_events: HashMap<u32, u32>,
 }
 
 impl Kernel {
@@ -158,6 +159,7 @@ impl Kernel {
             font_shmem_handle: None,
             font_offsets: [(0, 0); 6],
             audio_out_buffers: HashMap::new(),
+            audio_buffer_events: HashMap::new(),
         }
     }
 

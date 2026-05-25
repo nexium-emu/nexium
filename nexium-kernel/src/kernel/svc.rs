@@ -464,6 +464,20 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
                 hid.tick(cur);
             }
         }
+        {
+            const AUDIO_PERIOD: std::time::Duration = std::time::Duration::from_millis(16);
+            use std::sync::OnceLock;
+            use parking_lot::Mutex;
+            static LAST_TICK: OnceLock<Mutex<std::time::Instant>> = OnceLock::new();
+            let cell = LAST_TICK.get_or_init(|| Mutex::new(std::time::Instant::now()));
+            let mut last = cell.lock();
+            if last.elapsed() >= AUDIO_PERIOD {
+                *last = std::time::Instant::now();
+                for &ev in kernel.audio_buffer_events.values() {
+                    kernel.event_signals.insert(ev, true);
+                }
+            }
+        }
 
         const TIMEOUT_ERROR: u32 = 1 | (117 << 9);
         if !kernel.threads.ready.is_empty() {
@@ -494,6 +508,9 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
                 let cur = hid.input.clone();
                 hid.tick(cur);
             }
+        }
+        for &ev in kernel.audio_buffer_events.values() {
+            kernel.event_signals.insert(ev, true);
         }
         if let Some(cpu) = &mut kernel.cpu {
             cpu.set_register(0, SUCCESS as u64);
@@ -1519,7 +1536,8 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
             }
             4 => {
                 let event = kernel.handles.create_handle(HandleType::Event);
-                kernel.event_signals.insert(event, true);
+                kernel.event_signals.insert(event, false);
+                kernel.audio_buffer_events.insert(session_handle, event);
                 return build_ipc_response(ctx, 0, &[], &[event]);
             }
             5 | 8 => {
