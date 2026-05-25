@@ -1266,8 +1266,8 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                         let _ = kernel.address_space.write(buf.addr, slice);
                         bytes_read = slice.len() as u64;
                         log::debug!(
-                            "IFile.Read (sess={:#x} obj={}) off={:#x} size={:#x} → {} bytes (file total {}, per_session={})",
-                            session_handle, obj_id, offset, read_size, slice.len(), file_bytes.len(), per_session.is_some()
+                            "IFile.Read (sess={:#x} obj={}) off={:#x} size={:#x} → {} bytes",
+                            session_handle, obj_id, offset, read_size, slice.len(),
                         );
                     }
                 } else {
@@ -1505,12 +1505,47 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
             0 => return build_ipc_response(ctx, 0, &1u32.to_le_bytes(), &[]),
             1 => return build_ipc_response(ctx, 0, &[], &[]),
             2 => return build_ipc_response(ctx, 0, &[], &[]),
-            3 | 7 => return build_ipc_response(ctx, 0, &[], &[]),
+            3 | 7 => {
+                let in_off = ctx.cmif_in_data_off;
+                if ctx.cmif_in_data_len >= 8 {
+                    let client_ptr = u64::from_le_bytes([
+                        ctx.buf[in_off], ctx.buf[in_off + 1], ctx.buf[in_off + 2], ctx.buf[in_off + 3],
+                        ctx.buf[in_off + 4], ctx.buf[in_off + 5], ctx.buf[in_off + 6], ctx.buf[in_off + 7],
+                    ]);
+                    let q = kernel.audio_out_buffers.entry(session_handle).or_default();
+                    q.push_back(client_ptr);
+                }
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
             4 => {
                 let event = kernel.handles.create_handle(HandleType::Event);
+                kernel.event_signals.insert(event, true);
                 return build_ipc_response(ctx, 0, &[], &[event]);
             }
-            5 | 8 => return build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[]),
+            5 | 8 => {
+                let recv = ctx.recv_buffers.iter()
+                    .find(|b| b.size > 0 && b.addr != 0)
+                    .copied();
+                let max_count = recv.map(|b| (b.size as usize) / 8).unwrap_or(0);
+                let mut ptrs: Vec<u64> = Vec::new();
+                if let Some(q) = kernel.audio_out_buffers.get_mut(&session_handle) {
+                    while ptrs.len() < max_count {
+                        match q.pop_front() {
+                            Some(p) => ptrs.push(p),
+                            None => break,
+                        }
+                    }
+                }
+                if let Some(b) = recv {
+                    let mut bytes = Vec::with_capacity(ptrs.len() * 8);
+                    for p in &ptrs {
+                        bytes.extend_from_slice(&p.to_le_bytes());
+                    }
+                    let _ = kernel.address_space.write(b.addr, &bytes);
+                }
+                let count = ptrs.len() as u32;
+                return build_ipc_response(ctx, 0, &count.to_le_bytes(), &[]);
+            }
             6 => return build_ipc_response(ctx, 0, &0u8.to_le_bytes(), &[]),
             9 => return build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[]),
             10 => return build_ipc_response(ctx, 0, &0u64.to_le_bytes(), &[]),
