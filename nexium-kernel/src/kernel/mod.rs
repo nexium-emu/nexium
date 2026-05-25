@@ -129,9 +129,9 @@ impl Kernel {
             process_handle,
             main_thread_handle,
             applet_messages: VecDeque::from(vec![
+                crate::services::am::msg::FOCUS_STATE_CHANGED,
                 crate::services::am::msg::OPERATION_MODE_CHANGED,
                 crate::services::am::msg::PERFORMANCE_MODE_CHANGED,
-                crate::services::am::msg::FOCUS_STATE_CHANGED,
             ]),
             applet_message_event: None,
             vsync_handles: HashSet::new(),

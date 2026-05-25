@@ -847,6 +847,11 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         }
     }
 
+    let in_data_preview: Vec<u8> = {
+        let start = ctx.cmif_in_data_off;
+        let end = (start + 32).min(ctx.buf.len());
+        if start < ctx.buf.len() { ctx.buf[start..end].to_vec() } else { Vec::new() }
+    };
     let response = if dispatch_target == "sm:" {
         dispatch_sm_command_v2(kernel, &mut ctx)
     } else {
@@ -855,6 +860,28 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         kernel.pending_frames = pending_frames;
         response
     };
+
+    {
+        use std::collections::HashSet;
+        use std::sync::OnceLock;
+        use parking_lot::Mutex;
+        static SEEN: OnceLock<Mutex<HashSet<(String, u32)>>> = OnceLock::new();
+        let seen_cell = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let key = (dispatch_target.clone(), cmd_id);
+        let is_first = seen_cell.lock().insert(key);
+        if is_first {
+            let resp_preview: Vec<String> = response.iter().take(64).map(|b| format!("{:02x}", b)).collect();
+            let in_preview: Vec<String> = in_data_preview.iter().map(|b| format!("{:02x}", b)).collect();
+            let reply_rc = if response.len() >= 12 {
+                u32::from_le_bytes(response[8..12].try_into().unwrap_or([0; 4]))
+            } else { 0 };
+            log::info!(
+                "IPC FIRST-OCCURRENCE response (compare with RustSwitch) service={} cmd={} rc={:#010x} response_len={} response_first64={} in_data_first32={}",
+                dispatch_target, cmd_id, reply_rc, response.len(),
+                resp_preview.join(","), in_preview.join(",")
+            );
+        }
+    }
 
     let mut response_buf = vec![0u8; 0x100];
     let copy_len = response.len().min(response_buf.len());
