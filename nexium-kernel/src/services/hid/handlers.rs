@@ -1,0 +1,209 @@
+use crate::kernel::Kernel;
+use crate::kernel::handles::HandleType;
+use nexium_ipc::IpcCtx;
+
+#[inline]
+fn new_event(kernel: &mut Kernel) -> u32 {
+    let h = kernel.handles.create_handle(HandleType::Event);
+    kernel.event_signals.insert(h, false);
+    h
+}
+
+pub fn activate_debug_pad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn activate_touch_screen(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn activate_mouse(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn add_mouse_wheel_delta(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _delta: i32) {}
+pub fn activate_debug_mouse(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn activate_keyboard(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn send_keyboard_lock_key_event(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _flags: u32, _aruid: u64) {}
+
+pub fn acquire_xpad_id_event_handle(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _basic_xpad_id: u64) -> u32 { new_event(kernel) }
+pub fn release_xpad_id_event_handle(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _basic_xpad_id: u64) {}
+pub fn activate_xpad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _basic_xpad_id: u32, _aruid: u64) {}
+pub fn get_xpad_ids(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> u64 { 0 }
+pub fn activate_joy_xpad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _joy_xpad_id: u32) {}
+pub fn get_joy_xpad_lifo_handle(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _joy_xpad_id: u32) -> u32 { new_event(kernel) }
+pub fn get_joy_xpad_ids(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> u64 { 0 }
+
+pub fn activate_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _joy_xpad_id: u32) {}
+pub fn deactivate_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _joy_xpad_id: u32) {}
+pub fn get_six_axis_sensor_lifo_handle(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _joy_xpad_id: u32) -> u32 { new_event(kernel) }
+pub fn activate_joy_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _joy_xpad_id: u32) {}
+pub fn deactivate_joy_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _joy_xpad_id: u32) {}
+pub fn get_joy_six_axis_sensor_lifo_handle(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _joy_xpad_id: u32) -> u32 { new_event(kernel) }
+pub fn start_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+pub fn stop_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+pub fn is_six_axis_sensor_fusion_enabled(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) -> bool { false }
+pub fn enable_six_axis_sensor_fusion(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _enabled: bool, _handle: u32, _aruid: u64) {}
+pub fn set_six_axis_sensor_fusion_parameters(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _f0: u32, _f1: u32, _aruid: u64) {}
+pub fn get_six_axis_sensor_fusion_parameters(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) -> (u32, u32) { (0, 0) }
+pub fn reset_six_axis_sensor_fusion_parameters(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+pub fn set_accelerometer_parameters(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _f0: u32, _f1: u32, _aruid: u64) {}
+pub fn get_accelerometer_parameters(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) -> (u32, u32) { (0, 0) }
+pub fn reset_accelerometer_parameters(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+pub fn set_accelerometer_play_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _mode: u32, _aruid: u64) {}
+pub fn get_accelerometer_play_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) -> u32 { 0 }
+pub fn reset_accelerometer_play_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+pub fn set_gyroscope_zero_drift_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _mode: u32, _aruid: u64) {}
+pub fn get_gyroscope_zero_drift_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) -> u32 { 0 }
+pub fn reset_gyroscope_zero_drift_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+pub fn is_six_axis_sensor_at_rest(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) -> bool { true }
+pub fn is_firmware_update_available_for_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) -> bool { false }
+pub fn enable_six_axis_sensor_unaltered_passthrough(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _enabled: bool, _aruid: u64) {}
+pub fn is_six_axis_sensor_unaltered_passthrough_enabled(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) -> bool { false }
+pub fn store_six_axis_sensor_calibration_parameter(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+pub fn load_six_axis_sensor_calibration_parameter(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+pub fn get_six_axis_sensor_ic_information(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+pub fn reset_is_six_axis_sensor_device_newly_assigned(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+
+pub fn activate_gesture(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _unk: u32, _aruid: u64) {}
+pub fn set_gesture_output_ranges(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _w: u32, _h: u32, _aruid: u64) {}
+
+pub fn set_supported_npad_style_set(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _style_set: u32, _aruid: u64) {}
+pub fn get_supported_npad_style_set(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) -> u32 { 0 }
+pub fn set_supported_npad_id_type(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64, ids: &[u8]) {
+    let count = ids.len() / 4;
+    log::debug!("HID::SetSupportedNpadIdType npad_count={}", count);
+}
+pub fn activate_npad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn deactivate_npad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn acquire_npad_style_set_update_event_handle(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32, _aruid: u64, _unk: u64) -> u32 { new_event(kernel) }
+pub fn disconnect_npad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32, _aruid: u64) {}
+pub fn get_player_led_pattern(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32) -> u64 { 0 }
+pub fn activate_npad_with_revision(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _revision: i32, _aruid: u64) {}
+
+pub fn set_npad_joy_hold_type(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _aruid: u64, ty: u64) {
+    kernel.services.hid.set_npad_joy_hold_type(ty);
+}
+pub fn get_npad_joy_hold_type(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _aruid: u64) -> u64 {
+    kernel.services.hid.get_npad_joy_hold_type()
+}
+pub fn set_npad_joy_assignment_mode_single_by_default(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, npad_id: u32, aruid: u64) {
+    kernel.services.hid.set_npad_assignment_single_by_default(npad_id, aruid);
+}
+pub fn set_npad_joy_assignment_mode_single(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, npad_id: u32, aruid: u64, device_type: i64) {
+    kernel.services.hid.set_npad_assignment_single(npad_id, aruid, device_type);
+}
+pub fn set_npad_joy_assignment_mode_dual(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, npad_id: u32, aruid: u64) {
+    kernel.services.hid.set_npad_assignment_dual(npad_id, aruid);
+}
+pub fn merge_single_joy_as_dual_joy(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, npad_id_l: u32, npad_id_r: u32, aruid: u64) {
+    kernel.services.hid.merge_single_joy_as_dual_joy(npad_id_l, npad_id_r, aruid);
+}
+
+pub fn start_lr_assignment_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn stop_lr_assignment_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+
+pub fn set_npad_handheld_activation_mode(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _aruid: u64, mode: u64) {
+    kernel.services.hid.set_npad_handheld_activation_mode(mode);
+}
+pub fn get_npad_handheld_activation_mode(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) -> i64 {
+    kernel.services.hid.npad_handheld_activation_mode as i64
+}
+pub fn swap_npad_assignment(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _a: u32, _b: u32, _aruid: u64) {}
+pub fn is_unintended_home_button_input_protection_enabled(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32, _aruid: u64) -> bool { false }
+pub fn enable_unintended_home_button_input_protection(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _enabled: bool, _npad_id: u32, _aruid: u64) {}
+pub fn set_npad_joy_assignment_mode_single_with_destination(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32, _aruid: u64, _device_type: i64) -> (bool, u32) { (false, 0) }
+pub fn set_npad_analog_stick_use_center_clamp(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _clamp: bool, _aruid: u64) {}
+pub fn set_npad_capture_button_assignment(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _style: u32, _aruid: u64, _button_set: u64) {}
+pub fn clear_npad_capture_button_assignment(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn set_npad_gc_analog_stick8bit_raw_value(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _a: u32, _b: u32, _aruid: u64) {}
+
+pub fn get_vibration_device_info(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32) -> (u32, u32) { (0, 0) }
+pub fn send_vibration_value(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _v0: u32, _v1: u32, _v2: u32, _v3: u32, _aruid: u64) {}
+pub fn get_actual_vibration_value(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
+pub fn create_active_vibration_device_list(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn permit_vibration(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _permit: bool) {}
+pub fn is_vibration_permitted(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> bool { true }
+pub fn send_vibration_values(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn send_vibration_gc_erm_command(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64, _cmd: u64) {}
+pub fn get_actual_vibration_gc_erm_command(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) -> u64 { 0 }
+pub fn begin_permit_vibration_session(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn end_permit_vibration_session(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn is_vibration_device_mounted(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) -> bool { true }
+pub fn send_vibration_value_in_bool(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _value: bool, _handle: u32, _aruid: u64) {}
+pub fn send_vibration_value_in_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _v0: u32, _v1: u32, _v2: u32, _v3: u32, _aruid: u64) {}
+pub fn send_vibration_values_in_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64, _mode: u64) {}
+
+pub fn activate_console_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn start_console_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u64, _aruid: u64) {}
+pub fn stop_console_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u64, _aruid: u64) {}
+pub fn activate_seven_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn start_seven_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn stop_seven_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn initialize_seven_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64, _t0: u64, _t1: u64) {}
+pub fn finalize_seven_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn set_seven_six_axis_sensor_fusion_strength(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _f: u32, _aruid: u64) {}
+pub fn get_seven_six_axis_sensor_fusion_strength(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) -> u32 { 0 }
+pub fn reset_seven_six_axis_sensor_timestamp(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn force_activate_console_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn force_deactivate_console_six_axis_sensor(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+
+pub fn enable_npad_imu(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32, _aruid: u64) {}
+pub fn disable_npad_imu(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+
+pub fn is_usb_full_key_controller_enabled(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> bool { false }
+pub fn enable_usb_full_key_controller(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _enabled: bool) {}
+pub fn is_usb_full_key_controller_connected(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32) -> bool { false }
+pub fn has_battery(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32) -> bool { false }
+pub fn has_left_right_battery(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32) -> (bool, bool) { (false, false) }
+pub fn get_npad_interface_type(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32) -> u8 { 1 }
+pub fn get_npad_left_right_interface_type(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32) -> (u8, u8) { (1, 1) }
+pub fn get_npad_of_highest_battery_level(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) -> u32 { 0 }
+
+pub fn get_palma_connection_handle(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32, _aruid: u64) -> u64 { 0 }
+pub fn initialize_palma(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) {}
+pub fn acquire_palma_operation_complete_event(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) -> u32 { new_event(kernel) }
+pub fn get_palma_operation_info(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) -> u64 { 0 }
+pub fn play_palma_activity(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64, _unk: u64) {}
+pub fn set_palma_fr_mode_type(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64, _ty: u64) {}
+pub fn read_palma_step(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) {}
+pub fn enable_palma_step(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _enabled: bool, _palma: u64) {}
+pub fn reset_palma_step(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) {}
+pub fn read_palma_application_section(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64, _off: u64, _size: u64) {}
+pub fn write_palma_application_section(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64, _off: u64, _size: u64) {}
+pub fn read_palma_unique_code(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) {}
+pub fn set_palma_unique_code_invalid(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) {}
+pub fn write_palma_activity_entry(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64, _a: u64, _b: u64, _cc: u64, _d: u64) {}
+pub fn write_palma_rgb_led_pattern_entry(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64, _unk: u64) {}
+pub fn write_palma_wave_entry(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64, _wave_set: u64, _unk: u64, _t: u64, _size: u64) {}
+pub fn set_palma_data_base_identification_version(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _version: i32, _palma: u64) {}
+pub fn get_palma_data_base_identification_version(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) {}
+pub fn suspend_palma_feature(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _features: u32, _palma: u64) {}
+pub fn get_palma_operation_result(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) {}
+pub fn read_palma_play_log(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _unk: u16, _palma: u64) {}
+pub fn reset_palma_play_log(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _unk: u16, _palma: u64) {}
+pub fn set_is_palma_all_connectable(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _connectable: bool, _aruid: u64) {}
+pub fn set_is_palma_paired_connectable(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _connectable: bool, _aruid: u64) {}
+pub fn pair_palma(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) {}
+pub fn set_palma_boost_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _enabled: bool) {}
+pub fn cancel_write_palma_wave_entry(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) {}
+pub fn enable_palma_boost_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _enabled: bool, _aruid: u64) {}
+pub fn get_palma_bluetooth_address(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _palma: u64) {}
+pub fn set_disallowed_palma_connection(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+
+pub fn set_npad_communication_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64, _mode: i64) {}
+pub fn get_npad_communication_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> i64 { 3 }
+pub fn set_touch_screen_configuration(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _c0: u64, _c1: u64, _aruid: u64) {}
+pub fn is_firmware_update_needed_for_notification(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _unk: i32, _aruid: u64) -> bool { false }
+pub fn set_touch_screen_output_ranges(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _w: i32, _h: i32, _aruid: u64) {}
+pub fn enable_nx_touch_screen_emulation_for_touch_enter(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _flag: u32, _aruid: u64) {}
+pub fn activate_digitizer(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+
+pub fn get_debug_pad_generic_pad_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn set_debug_pad_generic_pad_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn reset_debug_pad_generic_pad_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn get_debug_pad_keyboard_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn set_debug_pad_keyboard_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn reset_debug_pad_keyboard_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn get_full_key_generic_pad_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _flag: u32) {}
+pub fn set_full_key_generic_pad_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _flag: u32) {}
+pub fn reset_full_key_generic_pad_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _flag: u32) {}
+pub fn get_full_key_keyboard_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _flag: u32) {}
+pub fn set_full_key_keyboard_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _flag: u32) {}
+pub fn reset_full_key_keyboard_map(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _flag: u32) {}
+pub fn get_debug_pad_generic_pad_map_2(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn set_debug_pad_generic_pad_map_2(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn get_debug_pad_keyboard_map_2(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn set_debug_pad_keyboard_map_2(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn set_mouse_library_version(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _v: u64, _aruid: u64) {}

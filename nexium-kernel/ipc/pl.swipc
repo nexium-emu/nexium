@@ -1,0 +1,16 @@
+# pl:u / pl:s — shared font (Pl) services. The firmware-22 dump names this
+# 'nn::pl::sharedresource::detail::IPlatformSharedResourceManager' but the
+# conventional libnx/switchbrew name is ISharedFontManager. Same vtable.
+# Vtable size 7.
+
+service pl:u, pl:s as pl {
+    [0] RequestLoad(u32 shared_font_type);
+    [1] GetLoadState(u32 shared_font_type) -> u32;
+    [2] GetSize(u32 font_type) -> u64;
+    [3] GetSharedFontInOrderOfPriority_Offset(u32 font_type) -> u64;
+    [4] GetSharedMemoryNativeHandle() -> out_handle;
+    # NOTE [5] writes 3x MapAlias Out u32 buffers (types/offsets/sizes); ignored.
+    [5] GetSharedFontInOrderOfPriority(u64 language_code) -> u64;
+    # NOTE [6] same buffer signature as [5]; ignored.
+    [6] GetSharedFontInOrderOfPriorityForSystem(u64 language_code) -> u64;
+}

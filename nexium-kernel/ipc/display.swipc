@@ -1,0 +1,202 @@
+# Display services — vi:u / vi:m / vi:s root services + IApplicationDisplayService
+# subtree (ISystemDisplayService, IManagerDisplayService, IHOSBinderDriver).
+# Source: firmware IPC dump 525hpm0.txt + switchbrew "Display services".
+# Buffers and pid descriptors are accepted but ignored at the handler level.
+# cmds 0/3 (TransactParcel/TransactParcelAuto) of IHOSBinderDriver are
+# handled by the existing parcel path and intentionally omitted here.
+
+service vi:u, vi:s, vi:m as vi_root_service {
+    [0] GetDisplayServiceUFromRoot() -> session<IApplicationDisplayService>;
+    [1] GetDisplayService() -> session<IApplicationDisplayService>;
+    [2] GetDisplayServiceMFromRoot() -> session<IApplicationDisplayService>;
+    [3] GetDisplayServiceWithProxyNameExchange() -> session<IApplicationDisplayService>;
+    [100] PrepareFatal();
+    [101] ShowFatal();
+    [102] DrawFatalRectangle();
+    # NOTE: cmd 103 DrawFatalText32 takes in_buffer<utf32_text>; buffer ignored.
+    [103] DrawFatalText32() -> u32;
+}
+
+service IApplicationDisplayService as application_display_service {
+    [100] GetRelayService() -> session<IHOSBinderDriver>;
+    [101] GetSystemDisplayService() -> session<ISystemDisplayService>;
+    [102] GetManagerDisplayService() -> session<IManagerDisplayService>;
+    [103] GetIndirectDisplayTransactionService() -> session<IHOSBinderDriver>;
+    # NOTE: cmd 1000 ListDisplays writes display array into out_buffer; buffer ignored.
+    [1000] ListDisplays() -> u64;
+    [1010] OpenDisplay() -> u64;
+    [1011] OpenDefaultDisplay() -> u64;
+    [1020] CloseDisplay();
+    [1101] SetDisplayEnabled();
+    [1102] GetDisplayResolution() -> (u64, u64);
+    # NOTE: cmd 2020 OpenLayer takes pid + out_buffer<native_window>; both ignored.
+    [2020] OpenLayer() -> u64;
+    [2021] CloseLayer();
+    # NOTE: cmd 2030 CreateStrayLayer has out_buffer<native_window>; buffer ignored.
+    [2030] CreateStrayLayer() -> (u64, u64);
+    [2031] DestroyStrayLayer();
+    [2101] SetLayerScalingMode();
+    [2102] ConvertScalingMode();
+    [2103] Cmd2103();
+    # NOTE: cmd 2450 GetIndirectLayerImageMap takes pid + out_buffer; both ignored.
+    [2450] GetIndirectLayerImageMap() -> (u64, u64);
+    # NOTE: cmd 2451 GetIndirectLayerImageCropMap takes pid + out_buffer; both ignored.
+    [2451] GetIndirectLayerImageCropMap() -> (u64, u64);
+    [2460] GetIndirectLayerImageRequiredMemoryInfo() -> (u64, u64);
+    [3000] ListDisplayResolutionRatios() -> u64;
+    [5202] GetDisplayVsyncEvent() -> out_handle;
+    [5203] GetDisplayVsyncEventForDebug();
+}
+
+service ISystemDisplayService as system_display_service {
+    [1200] GetZOrderCountMin() -> u64;
+    [1202] GetZOrderCountMax() -> u64;
+    [1203] GetDisplayLogicalResolution() -> u64;
+    [1204] SetDisplayMagnification();
+    [2201] SetLayerPosition();
+    [2203] SetLayerSize();
+    [2204] GetLayerZ() -> u64;
+    [2205] SetLayerZ();
+    [2207] SetLayerVisibility();
+    [2209] SetLayerAlpha();
+    # NOTE: cmd 2400 OpenIndirectLayer takes pid + out_buffer; both ignored.
+    [2400] OpenIndirectLayer() -> u64;
+    [2401] CloseIndirectLayer();
+    [2402] FlipIndirectLayer();
+    # NOTE: cmd 3000 ListDisplayModes writes modes into out_buffer; buffer ignored.
+    [3001] ListDisplayRgbRanges() -> u64;
+    # NOTE: cmd 3002 ListDisplayContentTypes writes content_types into out_buffer; buffer ignored.
+    [3002] ListDisplayContentTypes() -> u64;
+    [3200] GetDisplayMode();
+    [3201] SetDisplayMode();
+    [3202] GetDisplayUnderscan() -> u64;
+    [3203] SetDisplayUnderscan();
+    [3204] GetDisplayContentType() -> u32;
+    [3205] SetDisplayContentType();
+    [3206] GetDisplayRgbRange() -> u32;
+    [3207] SetDisplayRgbRange();
+    [3208] GetDisplayCmuMode() -> u32;
+    [3209] SetDisplayCmuMode();
+    [3210] GetDisplayContrastRatio() -> u32;
+    [3211] SetDisplayContrastRatio();
+    [3214] GetDisplayGamma() -> u32;
+    [3215] SetDisplayGamma();
+    [3216] GetDisplayCmuLuma() -> u32;
+    [3217] SetDisplayCmuLuma();
+    [3218] SetDisplayCrcMode();
+    # NOTE: cmd 6013 GetLayerPresentationSubmissionTimestamps writes timestamps into out_buffer; buffer ignored.
+    [6013] GetLayerPresentationSubmissionTimestamps() -> (u64, u64);
+    # NOTE: cmd 8225 GetSharedBufferMemoryHandleId takes pid + out_buffer.
+    [8225] GetSharedBufferMemoryHandleId() -> u32;
+    # NOTE: cmd 8250 OpenSharedLayer takes pid.
+    [8250] OpenSharedLayer();
+    [8251] CloseSharedLayer();
+    [8252] ConnectSharedLayer();
+    [8253] DisconnectSharedLayer();
+    [8254] AcquireSharedFrameBuffer() -> zeros(64);
+    [8255] PresentSharedFrameBuffer();
+    [8256] GetSharedFrameBufferAcquirableEvent() -> out_handle;
+    [8257] FillSharedFrameBufferColor();
+    [8258] CancelSharedFrameBuffer();
+    [9000] GetDp2hdmiController() -> session<IDp2hdmiController>;
+}
+
+service IManagerDisplayService as manager_display_service {
+    [200] AllocateProcessHeapBlock() -> u64;
+    [201] FreeProcessHeapBlock();
+    [1102] GetDisplayResolution() -> (u64, u64);
+    [2010] CreateManagedLayer() -> u64;
+    [2011] DestroyManagedLayer();
+    # NOTE: cmd 2012 CreateStrayLayer has out_buffer<native_window>; buffer ignored.
+    [2012] CreateStrayLayer() -> (u64, u64);
+    [2050] CreateIndirectLayer() -> u64;
+    [2051] DestroyIndirectLayer();
+    [2052] CreateIndirectProducerEndPoint() -> u64;
+    [2053] DestroyIndirectProducerEndPoint();
+    [2054] CreateIndirectConsumerEndPoint() -> u64;
+    [2055] DestroyIndirectConsumerEndPoint();
+    [2060] CreateWatermarkCompositor();
+    # NOTE: cmd 2062 SetWatermarkText takes in_buffer<text>; buffer ignored.
+    [2062] SetWatermarkText();
+    [2063] SetWatermarkLayerStacks();
+    [2300] AcquireLayerTexturePresentingEvent() -> out_handle;
+    [2301] ReleaseLayerTexturePresentingEvent();
+    [2302] GetDisplayHotplugEvent() -> out_handle;
+    [2303] GetDisplayModeChangedEvent() -> out_handle;
+    [2402] GetDisplayHotplugState() -> u32;
+    # NOTE: cmd 2501 GetCompositorErrorInfo writes error info into out_buffer; buffer ignored.
+    [2501] GetCompositorErrorInfo() -> u32;
+    [2601] GetDisplayErrorEvent() -> out_handle;
+    [2701] GetDisplayFatalErrorEvent() -> out_handle;
+    [4201] SetDisplayAlpha();
+    [4203] SetDisplayLayerStack();
+    [4205] SetDisplayPowerState();
+    [4206] SetDefaultDisplay();
+    [4207] ResetDisplayPanel();
+    [4208] SetDisplayFatalErrorEnabled();
+    [4209] IsDisplayPanelOn() -> bool;
+    [4300] GetInternalPanelId() -> zeros(3);
+    [6000] AddToLayerStack();
+    [6001] RemoveFromLayerStack();
+    [6002] SetLayerVisibility();
+    [6003] SetLayerConfig();
+    [6004] AttachLayerPresentationTracer();
+    [6005] DetachLayerPresentationTracer();
+    [6006] StartLayerPresentationRecording();
+    [6007] StopLayerPresentationRecording();
+    [6008] StartLayerPresentationFenceWait();
+    [6009] StopLayerPresentationFenceWait();
+    [6010] GetLayerPresentationAllFencesExpiredEvent() -> out_handle;
+    [6011] EnableLayerAutoClearTransitionBuffer();
+    [6012] DisableLayerAutoClearTransitionBuffer();
+    [6013] SetLayerOpacity();
+    [6014] AttachLayerWatermarkCompositor();
+    [6015] DetachLayerWatermarkCompositor();
+    [7000] SetContentVisibility();
+    [8000] SetConductorLayer();
+    [8001] SetTimestampTracking();
+    [8100] SetIndirectProducerFlipOffset();
+    # NOTE: cmd 8200 CreateSharedBufferStaticStorage takes in_buffer<descriptor>; buffer ignored.
+    [8200] CreateSharedBufferStaticStorage() -> u64;
+    # NOTE: cmd 8201 CreateSharedBufferTransferMemory takes in_buffer + in_handle; both ignored.
+    [8201] CreateSharedBufferTransferMemory() -> u64;
+    [8202] DestroySharedBuffer();
+    # NOTE: cmd 8203 BindSharedLowLevelLayerToManagedLayer takes pid.
+    [8203] BindSharedLowLevelLayerToManagedLayer();
+    # NOTE: cmd 8204 BindSharedLowLevelLayerToIndirectLayer takes pid.
+    [8204] BindSharedLowLevelLayerToIndirectLayer();
+    [8207] UnbindSharedLowLevelLayer();
+    [8208] ConnectSharedLowLevelLayerToSharedBuffer();
+    [8209] DisconnectSharedLowLevelLayerFromSharedBuffer();
+    [8210] CreateSharedLayer() -> u64;
+    [8211] DestroySharedLayer();
+    [8216] AttachSharedLayerToLowLevelLayer();
+    [8217] ForceDetachSharedLayerFromLowLevelLayer();
+    [8218] StartDetachSharedLayerFromLowLevelLayer();
+    [8219] FinishDetachSharedLayerFromLowLevelLayer();
+    [8220] GetSharedLayerDetachReadyEvent() -> out_handle;
+    [8221] GetSharedLowLevelLayerSynchronizedEvent() -> out_handle;
+    [8222] CheckSharedLowLevelLayerSynchronized() -> u64;
+    [8223] RegisterSharedBufferImporterAruid();
+    [8224] UnregisterSharedBufferImporterAruid();
+    # NOTE: cmd 8227 CreateSharedBufferProcessHeap takes in_buffer<descriptor>; buffer ignored.
+    [8227] CreateSharedBufferProcessHeap() -> u64;
+    [8228] GetSharedLayerLayerStacks() -> u32;
+    [8229] SetSharedLayerLayerStacks();
+    [8291] PresentDetachedSharedFrameBufferToLowLevelLayer();
+    [8292] FillDetachedSharedFrameBufferColor();
+    # NOTE: cmd 8293 GetDetachedSharedFrameBufferImage has out_buffer<image>; buffer ignored.
+    [8293] GetDetachedSharedFrameBufferImage() -> u64;
+    # NOTE: cmd 8294 SetDetachedSharedFrameBufferImage takes in_buffer<image>; buffer ignored.
+    [8294] SetDetachedSharedFrameBufferImage();
+    [8295] CopyDetachedSharedFrameBufferImage();
+    # NOTE: cmd 8296 SetDetachedSharedFrameBufferSubImage takes in_buffer<image>; buffer ignored.
+    [8296] SetDetachedSharedFrameBufferSubImage();
+    [8297] GetSharedFrameBufferContentParameter() -> zeros(32);
+    [8298] ExpandStartupLogoOnSharedFrameBuffer();
+}
+
+service IHOSBinderDriver as binder_driver {
+    [1] AdjustRefcount();
+    [2] GetNativeHandle() -> out_handle;
+}

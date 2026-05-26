@@ -322,7 +322,7 @@ impl EmulationHandle {
                         }
                         last_pipeline_stats = cur_stats;
 
-                        nexium_core::kernel::profile::dump_heartbeat();
+                        nexium_core::kernel::profile::dump_heartbeat_with_kernel(&boot_ctx.kernel);
 
                         last_heartbeat = std::time::Instant::now();
                         last_heartbeat_svc = svc_count;

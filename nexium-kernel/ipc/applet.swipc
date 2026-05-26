@@ -1,0 +1,361 @@
+# Applet sub-services exposed via am / appletAE / appletOE proxy chains.
+# Source: firmware IPC dump (525hpm0.txt) + switchbrew Applet_Manager_services.
+
+service IWindowController as window_controller {
+    [0] CreateWindow(u32 unk) -> session<IAudioController>;
+    [1] GetAppletResourceUserId() -> u64;
+    [2] GetAppletResourceUserIdOfCallerApplet() -> u64;
+    [10] AcquireForegroundRights();
+    [11] ReleaseForegroundRights();
+    [12] RejectToChangeIntoBackground();
+    [20] SetAppletWindowVisibility(u8 visible);
+    [21] SetAppletGpuTimeSlice(u64 slice);
+}
+
+service ISelfController as self_controller {
+    [0] Exit();
+    [1] LockExit();
+    [2] UnlockExit();
+    [3] EnterFatalSection();
+    [4] LeaveFatalSection();
+    [9] GetLibraryAppletLaunchableEvent() -> out_handle;
+    [10] SetScreenShotPermission(u32 permission);
+    [11] SetOperationModeChangedNotification(u8 flag);
+    [12] SetPerformanceModeChangedNotification(u8 flag);
+    [13] SetFocusHandlingMode(u8 a, u8 b, u8 c);
+    [14] SetRestartMessageEnabled(u8 flag);
+    [15] SetScreenShotAppletIdentityInfo(u64 a, u64 b);
+    [16] SetOutOfFocusSuspendingEnabled(u8 flag);
+    [17] SetControllerFirmwareUpdateSection(u8 flag);
+    [18] SetRequiresCaptureButtonShortPressedMessage(u8 flag);
+    [19] SetAlbumImageOrientation(u32 orientation);
+    [20] SetDesirableKeyboardLayout(u32 layout);
+    [21] GetScreenShotProgramId() -> u64;
+    [22] GetScreenShotAcdIndex() -> u8;
+    [23] GetScreenShotApparentPlatform() -> u8;
+    [24] GetScreenShotApplicationProperty() -> (u64, u64);
+    [40] CreateManagedDisplayLayer() -> u64;
+    [41] IsSystemBufferSharingEnabled() -> bool;
+    [42] GetSystemSharedLayerHandle() -> (u64, u64);
+    [43] GetSystemSharedBufferHandle() -> u64;
+    [44] CreateManagedDisplaySeparableLayer() -> (u64, u64);
+    [45] SetManagedDisplayLayerSeparationMode(u32 mode);
+    [46] SetRecordingLayerCompositionEnabled(u8 flag);
+    [50] SetHandlesRequestToDisplay(u8 flag);
+    [51] ApproveToDisplay();
+    [60] OverrideAutoSleepTimeAndDimmingTime(u64 a, u64 b);
+    [61] SetMediaPlaybackState(u8 flag);
+    [62] SetIdleTimeDetectionExtension(u32 ext);
+    [63] GetIdleTimeDetectionExtension() -> u32;
+    [64] SetInputDetectionSourceSet(u32 set);
+    [65] ReportUserIsActive();
+    [66] GetCurrentIlluminance() -> u32;
+    [67] IsIlluminanceAvailable() -> bool;
+    [68] SetAutoSleepDisabled(u8 flag);
+    [69] IsAutoSleepDisabled() -> bool;
+    # NOTE [70] takes in_buffer
+    [70] ReportMultimediaError(u32 err);
+    [71] GetCurrentIlluminanceEx() -> u64;
+    [72] SetInputDetectionPolicy(u32 policy);
+    [73] Cmd73(u32 a);
+    [80] SetWirelessPriorityMode(u32 mode);
+    [90] GetAccumulatedSuspendedTickValue() -> u64;
+    [91] GetAccumulatedSuspendedTickChangedEvent() -> out_handle;
+    [100] SetAlbumImageTakenNotificationEnabled(u8 flag);
+    # NOTE [110] takes in_buffer
+    [110] SetApplicationAlbumUserData();
+    [120] SaveCurrentScreenshot(u32 album);
+    [130] SetRecordVolumeMuted(u8 flag);
+    [200] Cmd200(u64 a, u64 b, u64 c, u64 d);
+    # NOTE [210] takes in_buffer
+    [210] Cmd210();
+    [211] Cmd211();
+    [220] Cmd220(u8 a);
+    [221] Cmd221(u8 a);
+    [230] Cmd230(u32 a) -> u16;
+    [1000] GetDebugStorageChannel() -> session<IStorageChannel>;
+}
+
+service ICommonStateGetter as common_state_getter {
+    [0] GetEventHandle() -> out_handle;
+    [1] ReceiveMessage() -> u32;
+    [2] GetThisAppletKind() -> u64;
+    [3] AllowToEnterSleep();
+    [4] DisallowToEnterSleep();
+    [5] GetOperationMode() -> bool;
+    [6] GetPerformanceMode() -> u32;
+    [7] GetCradleStatus() -> u8;
+    [8] GetBootMode() -> bool;
+    [9] GetCurrentFocusState() -> bool;
+    [10] RequestToAcquireSleepLock();
+    [11] ReleaseSleepLock();
+    [12] ReleaseSleepLockTransiently();
+    [13] GetAcquiredSleepLockEvent() -> out_handle;
+    [14] GetWakeupCount() -> u64;
+    [15] Cmd15() -> out_handle;
+    # cmd 20 PushToGeneralChannel takes IStorage interface input - skipped
+    [30] GetHomeButtonReaderLockAccessor() -> session<ILockAccessor>;
+    [31] GetReaderLockAccessorEx(u32 a) -> session<ILockAccessor>;
+    [32] GetWriterLockAccessorEx(u32 a) -> session<ILockAccessor>;
+    [40] GetCradleFwVersion() -> (u64, u64);
+    [50] IsVrModeEnabled() -> bool;
+    [51] SetVrModeEnabled(u8 flag);
+    [52] SetLcdBacklighOffEnabled(u8 flag);
+    [53] BeginVrModeEx();
+    [54] EndVrModeEx();
+    [55] IsInControllerFirmwareUpdateSection() -> bool;
+    [59] SetVrPositionForDebug(u64 a, u64 b);
+    [60] GetDefaultDisplayResolution() -> (u32, u32);
+    [61] GetDefaultDisplayResolutionChangeEvent() -> out_handle;
+    [62] GetHdcpAuthenticationState() -> u32;
+    [63] GetHdcpAuthenticationStateChangeEvent() -> out_handle;
+    [64] SetTvPowerStateMatchingMode(u32 mode);
+    # NOTE [65] takes in_buffer
+    [65] GetApplicationIdByContentActionName() -> u64;
+    [66] SetCpuBoostMode(u32 mode);
+    [67] CancelCpuBoostMode();
+    [68] GetBuiltInDisplayType() -> u32;
+    [80] PerformSystemButtonPressingIfInFocus(u32 button);
+    [90] SetPerformanceConfigurationChangedNotification(u8 flag);
+    [91] GetCurrentPerformanceConfiguration() -> u32;
+    [100] SetHandlingHomeButtonShortPressedEnabled(u8 flag);
+    [110] OpenMyGpuErrorHandler() -> session<IGpuErrorHandler>;
+    # NOTE [120] takes out_buffer
+    [120] GetAppletLaunchedHistory() -> u32;
+    [130] Cmd130();
+    [200] GetOperationModeSystemInfo() -> u32;
+    [300] GetSettingsPlatformRegion() -> u8;
+    [400] ActivateMigrationService();
+    [401] DeactivateMigrationService();
+    [500] DisableSleepTillShutdown();
+    [501] SuppressDisablingSleepTemporarily(u64 ns);
+    [502] IsSleepEnabled() -> bool;
+    [503] IsDisablingSleepSuppressed() -> bool;
+    [600] SetHidInputMagnificationForApplication(u32 a, u32 b, u32 c);
+    [610] Cmd610(u64 a);
+    [611] Cmd611(u8 a);
+    [900] SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled();
+    [910] GetLaunchRequiredTick() -> u64;
+    [1000] BeginVrMode3d();
+    [1001] EndVrMode3d();
+    [1002] IsVrModeEnabled3d() -> bool;
+    [1003] GetVrLaboGoggleViewport() -> (u64, u64);
+    [1004] GetPanelPhysicalSizeForSpecificTitle() -> u64;
+    [1005] GetPanelResolutionForSpecificTitle() -> u64;
+}
+
+service IApplicationFunctions as application_functions {
+    [1] PopLaunchParameter(u32 kind) -> bool;
+    [10] CreateApplicationAndPushAndRequestToStart(u64 app_id);
+    [11] CreateApplicationAndPushAndRequestToStartForQuest(u32 a, u32 b, u64 app_id);
+    [12] CreateApplicationAndRequestToStart(u64 app_id);
+    [13] CreateApplicationAndRequestToStartForQuest(u32 a, u32 b, u64 app_id);
+    # NOTE [14] takes in_buffer
+    [14] CreateApplicationWithAttributeAndPushAndRequestToStartForQuest(u64 app_id);
+    # NOTE [15] takes in_buffer
+    [15] CreateApplicationWithAttributeAndRequestToStartForQuest(u64 app_id);
+    [20] EnsureSaveData(u64 user_id_lo, u64 user_id_hi) -> u64;
+    [21] GetDesiredLanguage() -> u64;
+    [22] SetTerminateResult(u32 result);
+    [23] GetDisplayVersion() -> (u64, u64);
+    [24] GetLaunchStorageInfoForDebug() -> (u8, u8);
+    [25] ExtendSaveData(u8 a, u64 user_id_lo, u64 user_id_hi, u64 b, u64 c) -> u64;
+    [26] GetSaveDataSize(u8 a, u64 user_id_lo, u64 user_id_hi) -> (u64, u64);
+    [27] CreateCacheStorage(u16 idx, u64 size, u64 journal) -> (u32, u64);
+    [28] GetSaveDataSizeMax() -> (u64, u64);
+    [29] GetCacheStorageMax() -> (u32, u64);
+    [30] BeginBlockingHomeButtonShortAndLongPressed(u64 ns);
+    [31] EndBlockingHomeButtonShortAndLongPressed();
+    [32] BeginBlockingHomeButton(u64 ns);
+    [33] EndBlockingHomeButton();
+    # NOTE [34] takes in_buffer
+    [34] SelectApplicationLicense() -> u32;
+    [35] GetDeviceSaveDataSizeMax() -> (u64, u64);
+    [36] GetLimitedApplicationLicense() -> u32;
+    [37] GetLimitedApplicationLicenseUpgradableEvent() -> out_handle;
+    [40] NotifyRunning() -> u32;
+    [50] GetPseudoDeviceId() -> (u64, u64);
+    [60] SetMediaPlaybackStateForApplication(u8 flag);
+    [65] IsGamePlayRecordingSupported() -> bool;
+    [66] InitializeGamePlayRecording(u64 size);
+    [67] SetGamePlayRecordingState(u32 state);
+    [68] RequestFlushGamePlayingMovieForDebug();
+    [70] RequestToShutdown();
+    [71] RequestToReboot();
+    [72] RequestToSleep();
+    [80] ExitAndRequestToShowThanksMessage();
+    [90] EnableApplicationCrashReport(u8 flag);
+    [100] InitializeApplicationCopyrightFrameBuffer(u32 width, u32 height, u64 tmem_size);
+    # NOTE [101] takes in_buffer
+    [101] SetApplicationCopyrightImage(u32 x, u32 y, u32 w, u32 h, u32 origin);
+    [102] SetApplicationCopyrightVisibility(u8 flag);
+    # NOTE [110] takes in/out buffers
+    [110] QueryApplicationPlayStatistics() -> u32;
+    # NOTE [111] takes in/out buffers
+    [111] QueryApplicationPlayStatisticsByUid(u64 user_id_lo, u64 user_id_hi) -> u32;
+    [120] ExecuteProgram(u32 kind, u64 value);
+    [121] ClearUserChannel();
+    [122] UnpopToUserChannel();
+    [123] GetPreviousProgramIndex() -> u32;
+    [124] EnableApplicationAllThreadDumpOnCrash(u8 flag);
+    [130] GetGpuErrorDetectedSystemEvent() -> out_handle;
+    [131] SetDelayTimeToAbortOnGpuError(u64 ns);
+    [140] GetFriendInvitationStorageChannelEvent() -> out_handle;
+    [141] TryPopFromFriendInvitationStorageChannel() -> session<IStorage>;
+    [150] GetNotificationStorageChannelEvent() -> out_handle;
+    [151] TryPopFromNotificationStorageChannel() -> session<IStorage>;
+    [160] GetHealthWarningDisappearedSystemEvent() -> out_handle;
+    [170] SetHdcpAuthenticationActivated(u8 flag);
+    [180] GetLaunchRequiredVersion(u64 app_id, u64 a) -> u64;
+    [181] UpgradeLaunchRequiredVersion(u64 app_id, u64 a);
+    [190] SendServerMaintenanceOverlayNotification();
+    [200] GetLastApplicationExitReason() -> u32;
+    [500] StartContinuousRecordingFlushForDebug();
+    [1000] CreateMovieMaker() -> session<IMovieMaker>;
+    [1001] PrepareForJit();
+}
+
+service IDebugFunctions as debug_functions {
+    [0] NotifyMessageToHomeMenuForDebug(u32 msg);
+    [10] PerformSystemButtonPressing(u32 button);
+    [20] InvalidateTransitionLayer();
+    # NOTE [30] takes in_buffers
+    [30] RequestLaunchApplicationWithUserAndArgumentForDebug(u64 a, u64 b);
+    # NOTE [31] takes in_buffers
+    [31] RequestLaunchApplicationByApplicationLaunchInfoForDebug();
+    [40] GetAppletResourceUsageInfo() -> (u64, u64, u64, u64);
+    [50] AddSystemProgramIdAndAppletIdForDebug(u64 a, u64 b);
+    [51] AddOperationConfirmedLibraryAppletIdForDebug(u32 a);
+    [52] GetProgramIdFromAppletIdForDebug(u32 applet_id) -> u64;
+    [53] GetProgramIdFromAppletIdAndLibraryAppletModeForDebug(u32 applet_id, u32 mode) -> u64;
+    [100] SetCpuBoostModeForApplet(u32 mode);
+    [101] CancelCpuBoostModeForApplet();
+    [111] TryPopFromAppletBoundChannelForDebug(u32 a) -> session<IStorage>;
+    [121] AlarmSettingNotificationDisableAppEventReserve();
+    [131] FriendInvitationClearApplicationParameter();
+    [140] RestrictPowerOperationForSecureLaunchModeForDebug();
+    [150] Cmd150();
+    # NOTE [200] takes in_buffer
+    [200] CreateFloatingLibraryAppletAccepterForDebug(pid, u64 a) -> session<IAllSystemAppletProxiesService>;
+    [300] TerminateAllRunningApplicationsForDebug();
+    [410] CreateGeneralStorageForDebug(u64 a, u64 b);
+    # NOTE [411] takes out_buffer
+    [411] ReadGeneralStorageForDebug(u64 a, u64 b) -> u64;
+    # NOTE [412] takes in_buffer
+    [412] WriteGeneralStorageForDebug(u64 a, u64 b);
+    [430] Cmd430();
+    [431] Cmd431(u32 a);
+    [900] GetGrcProcessLaunchedSystemEvent() -> out_handle;
+    # NOTE [910] takes out_buffer
+    [910] Cmd910() -> u32;
+}
+
+service IAudioController as audio_controller {
+    [0] SetExpectedMasterVolume(u32 main, u32 library);
+    [1] GetMainAppletExpectedMasterVolume() -> u32;
+    [2] GetLibraryAppletExpectedMasterVolume() -> u32;
+    [3] ChangeMainAppletMasterVolume(u32 a, u32 b, u64 ns);
+    [4] SetTransparentVolumeRate(u32 rate);
+    [5] Cmd5(u32 a, u32 b, u32 c, u32 d);
+}
+
+service IDisplayController as display_controller {
+    # NOTE [0] takes out_buffer
+    [0] GetLastForegroundCaptureImage();
+    [1] UpdateLastForegroundCaptureImage();
+    # NOTE [2] takes out_buffer
+    [2] GetLastApplicationCaptureImage();
+    # NOTE [3] takes out_buffer
+    [3] GetCallerAppletCaptureImage();
+    [4] UpdateCallerAppletCaptureImage();
+    # NOTE [5] takes out_buffer
+    [5] GetLastForegroundCaptureImageEx() -> u8;
+    # NOTE [6] takes out_buffer
+    [6] GetLastApplicationCaptureImageEx() -> u8;
+    # NOTE [7] takes out_buffer
+    [7] GetCallerAppletCaptureImageEx() -> u8;
+    [8] TakeScreenShotOfOwnLayer(u32 a, u32 b);
+    [9] CopyBetweenCaptureBuffers(u32 dst, u32 src);
+    [10] AcquireLastApplicationCaptureBuffer() -> out_handle;
+    [11] ReleaseLastApplicationCaptureBuffer();
+    [12] AcquireLastForegroundCaptureBuffer() -> out_handle;
+    [13] ReleaseLastForegroundCaptureBuffer();
+    [14] AcquireCallerAppletCaptureBuffer() -> out_handle;
+    [15] ReleaseCallerAppletCaptureBuffer();
+    [16] AcquireLastApplicationCaptureBufferEx() -> (u8, out_handle);
+    [17] AcquireLastForegroundCaptureBufferEx() -> (u8, out_handle);
+    [18] AcquireCallerAppletCaptureBufferEx() -> (u8, out_handle);
+    [20] ClearCaptureBuffer(u32 a, u32 b, u32 c);
+    [21] ClearAppletTransitionBuffer(u32 a);
+    [22] AcquireLastApplicationCaptureSharedBuffer() -> u64;
+    [23] ReleaseLastApplicationCaptureSharedBuffer();
+    [24] AcquireLastForegroundCaptureSharedBuffer() -> u64;
+    [25] ReleaseLastForegroundCaptureSharedBuffer();
+    [26] AcquireCallerAppletCaptureSharedBuffer() -> u64;
+    [27] ReleaseCallerAppletCaptureSharedBuffer();
+    [28] TakeScreenShotOfOwnLayerEx(u32 a, u32 b);
+}
+
+service IProcessWindingController as process_winding_controller {
+    [0] GetLaunchReason() -> u32;
+    [11] OpenCallingLibraryApplet() -> session<ILibraryAppletAccessor>;
+    [22] PopContext() -> session<IStorage>;
+    [23] CancelWindingReservation();
+    [30] WindAndDoReserved();
+}
+
+service IGlobalStateController as global_state_controller {
+    [0] RequestToEnterSleep();
+    [1] EnterSleep();
+    [2] StartSleepSequence(u8 a);
+    [3] StartShutdownSequence();
+    [4] StartRebootSequence();
+    [9] IsAutoPowerDownRequested() -> bool;
+    [10] LoadAndApplyIdlePolicySettings();
+    [11] NotifyCecSettingsChanged();
+    [12] SetDefaultHomeButtonLongPressTime(u64 ns);
+    [13] UpdateDefaultDisplayResolution();
+    [14] ShouldSleepOnBoot() -> bool;
+    [15] GetHdcpAuthenticationFailedEvent() -> out_handle;
+    [30] OpenCradleFirmwareUpdater() -> session<ICradleFirmwareUpdater>;
+}
+
+service IHomeMenuFunctions as home_menu_functions {
+    [10] RequestToGetForeground();
+    [11] LockForeground();
+    [12] UnlockForeground();
+    [20] PopFromGeneralChannel() -> session<IStorage>;
+    [21] GetPopFromGeneralChannelEvent() -> out_handle;
+    [30] GetHomeButtonWriterLockAccessor() -> session<ILockAccessor>;
+    [31] GetWriterLockAccessorEx(u32 a) -> session<ILockAccessor>;
+    [40] IsSleepEnabled() -> bool;
+    [41] IsRebootEnabled() -> bool;
+    [50] LaunchSystemApplet();
+    [51] LaunchStarter();
+    [60] Cmd60();
+    [61] Cmd61();
+    # NOTE [100] takes out_buffer
+    [100] PopRequestLaunchApplicationForDebug() -> (u64, u64);
+    [110] IsForceTerminateApplicationDisabledForDebug() -> bool;
+    [200] LaunchDevMenu();
+    [1000] SetLastApplicationExitReason(u32 reason);
+}
+
+service IApplicationCreator as application_creator {
+    [0] CreateApplication(u64 app_id) -> session<IApplicationAccessor>;
+    [1] PopLaunchRequestedApplication() -> session<IApplicationAccessor>;
+    [10] CreateSystemApplication(u64 app_id) -> session<IApplicationAccessor>;
+    [100] PopFloatingApplicationForDevelopment() -> session<IApplicationAccessor>;
+}
+
+service ILibraryAppletCreator as library_applet_creator {
+    [0] CreateLibraryAppletOld(u64 a) -> session<ILibraryAppletAccessor>;
+    [1] TerminateAllLibraryApplets();
+    [2] AreAnyLibraryAppletsLeft() -> bool;
+    [3] CreateLibraryApplet(u64 a, u64 b) -> session<ILibraryAppletAccessor>;
+    [10] CreateStorage(u64 size) -> session<IStorage>;
+    # NOTE [11] takes in_handle
+    [11] CreateTransferMemoryStorage(u64 a, u64 b) -> session<IStorage>;
+    # NOTE [12] takes in_handle
+    [12] CreateHandleStorage(u64 size) -> session<IStorage>;
+}

@@ -1,0 +1,204 @@
+# IHidServer (port "hid") - full 165-command vtable surface (cmd 0 routed externally).
+# Source: firmware IPC dump (525hpm0.txt:6700-6867) + switchbrew "HID services".
+# Real impls preserved: 120-125, 128 (see hid/mod.rs). Other commands are stubs.
+
+service hid {
+    [1]  ActivateDebugPad(pid, u64 aruid);
+    [11] ActivateTouchScreen(pid, u64 aruid);
+    [21] ActivateMouse(pid, u64 aruid);
+    [22] AddMouseWheelDelta(i32 delta);
+    [26] ActivateDebugMouse(pid, u64 aruid);
+    [31] ActivateKeyboard(pid, u64 aruid);
+    [32] SendKeyboardLockKeyEvent(pid, u32 flags, u64 aruid);
+
+    [40] AcquireXpadIdEventHandle(u64 basic_xpad_id) -> out_handle;
+    [41] ReleaseXpadIdEventHandle(u64 basic_xpad_id);
+    [51] ActivateXpad(pid, u32 basic_xpad_id, u64 aruid);
+    # NOTE: takes out_buffer<u32 BasicXpadId[]>
+    [55] GetXpadIds() -> u64;
+    [56] ActivateJoyXpad(u32 joy_xpad_id);
+    [58] GetJoyXpadLifoHandle(u32 joy_xpad_id) -> out_handle;
+    # NOTE: takes out_buffer<u32 BasicXpadId[]>
+    [59] GetJoyXpadIds() -> u64;
+
+    [60] ActivateSixAxisSensor(u32 joy_xpad_id);
+    [61] DeactivateSixAxisSensor(u32 joy_xpad_id);
+    [62] GetSixAxisSensorLifoHandle(u32 joy_xpad_id) -> out_handle;
+    [63] ActivateJoySixAxisSensor(u32 joy_xpad_id);
+    [64] DeactivateJoySixAxisSensor(u32 joy_xpad_id);
+    [65] GetJoySixAxisSensorLifoHandle(u32 joy_xpad_id) -> out_handle;
+    [66] StartSixAxisSensor(pid, u32 handle, u64 aruid);
+    [67] StopSixAxisSensor(pid, u32 handle, u64 aruid);
+    [68] IsSixAxisSensorFusionEnabled(pid, u32 handle, u64 aruid) -> bool;
+    [69] EnableSixAxisSensorFusion(pid, bool enabled, u32 handle, u64 aruid);
+    [70] SetSixAxisSensorFusionParameters(pid, u32 handle, u32 _f0_bits, u32 _f1_bits, u64 aruid);
+    [71] GetSixAxisSensorFusionParameters(pid, u32 handle, u64 aruid) -> (u32, u32);
+    [72] ResetSixAxisSensorFusionParameters(pid, u32 handle, u64 aruid);
+    [73] SetAccelerometerParameters(pid, u32 handle, u32 _f0_bits, u32 _f1_bits, u64 aruid);
+    [74] GetAccelerometerParameters(pid, u32 handle, u64 aruid) -> (u32, u32);
+    [75] ResetAccelerometerParameters(pid, u32 handle, u64 aruid);
+    [76] SetAccelerometerPlayMode(pid, u32 handle, u32 mode, u64 aruid);
+    [77] GetAccelerometerPlayMode(pid, u32 handle, u64 aruid) -> u32;
+    [78] ResetAccelerometerPlayMode(pid, u32 handle, u64 aruid);
+    [79] SetGyroscopeZeroDriftMode(pid, u32 handle, u32 mode, u64 aruid);
+    [80] GetGyroscopeZeroDriftMode(pid, u32 handle, u64 aruid) -> u32;
+    [81] ResetGyroscopeZeroDriftMode(pid, u32 handle, u64 aruid);
+    [82] IsSixAxisSensorAtRest(pid, u32 handle, u64 aruid) -> bool;
+    [83] IsFirmwareUpdateAvailableForSixAxisSensor(pid, u32 handle, u64 aruid) -> bool;
+    [84] EnableSixAxisSensorUnalteredPassthrough(pid, u32 handle, bool enabled, u64 aruid);
+    [85] IsSixAxisSensorUnalteredPassthroughEnabled(pid, u32 handle, u64 aruid) -> bool;
+    # NOTE: takes in_buffer<SixAxisSensorCalibrationParameter[0x744]>
+    [86] StoreSixAxisSensorCalibrationParameter(pid, u32 handle, u64 aruid);
+    # NOTE: takes out_buffer<SixAxisSensorCalibrationParameter[0x744]>
+    [87] LoadSixAxisSensorCalibrationParameter(pid, u32 handle, u64 aruid);
+    # NOTE: takes out_buffer<SixAxisSensorIcInformation[0xC8]>
+    [88] GetSixAxisSensorIcInformation(pid, u32 handle, u64 aruid);
+    [89] ResetIsSixAxisSensorDeviceNewlyAssigned(pid, u32 handle, u64 aruid);
+
+    [91] ActivateGesture(pid, u32 _unk, u64 aruid);
+    [92] SetGestureOutputRanges(pid, u32 _w, u32 _h, u64 aruid);
+
+    [100] SetSupportedNpadStyleSet(pid, u32 style_set, u64 aruid);
+    [101] GetSupportedNpadStyleSet(pid, u64 aruid) -> u32;
+    [102] SetSupportedNpadIdType(pid, u64 aruid, in_buffer ids);
+    [103] ActivateNpad(pid, u64 aruid);
+    [104] DeactivateNpad(pid, u64 aruid);
+    [106] AcquireNpadStyleSetUpdateEventHandle(pid, u32 npad_id, u64 aruid, u64 _unk) -> out_handle;
+    [107] DisconnectNpad(pid, u32 npad_id, u64 aruid);
+    [108] GetPlayerLedPattern(u32 npad_id) -> u64;
+    [109] ActivateNpadWithRevision(pid, i32 revision, u64 aruid);
+    [120] SetNpadJoyHoldType(pid, u64 aruid, u64 ty);
+    [121] GetNpadJoyHoldType(pid, u64 aruid) -> u64;
+    [122] SetNpadJoyAssignmentModeSingleByDefault(pid, u32 npad_id, u64 aruid);
+    [123] SetNpadJoyAssignmentModeSingle(pid, u32 npad_id, u64 aruid, i64 device_type);
+    [124] SetNpadJoyAssignmentModeDual(pid, u32 npad_id, u64 aruid);
+    [125] MergeSingleJoyAsDualJoy(pid, u32 npad_id_l, u32 npad_id_r, u64 aruid);
+    [126] StartLrAssignmentMode(pid, u64 aruid);
+    [127] StopLrAssignmentMode(pid, u64 aruid);
+    [128] SetNpadHandheldActivationMode(pid, u64 aruid, u64 mode);
+    [129] GetNpadHandheldActivationMode(pid, u64 aruid) -> i64;
+    [130] SwapNpadAssignment(pid, u32 npad_id_a, u32 npad_id_b, u64 aruid);
+    [131] IsUnintendedHomeButtonInputProtectionEnabled(pid, u32 npad_id, u64 aruid) -> bool;
+    [132] EnableUnintendedHomeButtonInputProtection(pid, bool enabled, u32 npad_id, u64 aruid);
+    [133] SetNpadJoyAssignmentModeSingleWithDestination(pid, u32 npad_id, u64 aruid, i64 device_type) -> (bool, u32);
+    [134] SetNpadAnalogStickUseCenterClamp(pid, bool clamp, u64 aruid);
+    [135] SetNpadCaptureButtonAssignment(pid, u32 style_set, u64 aruid, u64 button_set);
+    [136] ClearNpadCaptureButtonAssignment(pid, u64 aruid);
+    [137] SetNpadGcAnalogStick8bitRawValue(pid, u32 _a, u32 _b, u64 aruid);
+
+    [200] GetVibrationDeviceInfo(u32 handle) -> (u32, u32);
+    [201] SendVibrationValue(pid, u32 handle, u32 _v0, u32 _v1, u32 _v2, u32 _v3, u64 aruid);
+    [202] GetActualVibrationValue(pid, u32 handle, u64 aruid) -> zeros(16);
+    [203] CreateActiveVibrationDeviceList() -> session<IActiveVibrationDeviceList>;
+    [204] PermitVibration(bool permit);
+    [205] IsVibrationPermitted() -> bool;
+    # NOTE: takes in_buffer<VibrationDeviceHandle[]> + in_buffer<VibrationValue[]>
+    [206] SendVibrationValues(u64 aruid);
+    [207] SendVibrationGcErmCommand(pid, u32 handle, u64 aruid, u64 cmd);
+    [208] GetActualVibrationGcErmCommand(pid, u32 handle, u64 aruid) -> u64;
+    [209] BeginPermitVibrationSession(u64 aruid);
+    [210] EndPermitVibrationSession();
+    [211] IsVibrationDeviceMounted(pid, u32 handle, u64 aruid) -> bool;
+    [212] SendVibrationValueInBool(pid, bool value, u32 handle, u64 aruid);
+    [213] SendVibrationValueInMode(pid, u32 handle, u32 _v0, u32 _v1, u32 _v2, u32 _v3, u64 aruid);
+    # NOTE: takes in_buffer<VibrationDeviceHandle[]> + in_buffer<VibrationValue[]>
+    [214] SendVibrationValuesInMode(pid, u64 aruid, u64 mode);
+
+    [300] ActivateConsoleSixAxisSensor(pid, u64 aruid);
+    [301] StartConsoleSixAxisSensor(pid, u64 handle, u64 aruid);
+    [302] StopConsoleSixAxisSensor(pid, u64 handle, u64 aruid);
+    [303] ActivateSevenSixAxisSensor(pid, u64 aruid);
+    [304] StartSevenSixAxisSensor(pid, u64 aruid);
+    [305] StopSevenSixAxisSensor(pid, u64 aruid);
+    # NOTE: takes 2 input TransferMemory handles
+    [306] InitializeSevenSixAxisSensor(pid, u64 aruid, u64 tmem0_size, u64 tmem1_size);
+    [307] FinalizeSevenSixAxisSensor(pid, u64 aruid);
+    [308] SetSevenSixAxisSensorFusionStrength(pid, u32 _f_bits, u64 aruid);
+    [309] GetSevenSixAxisSensorFusionStrength(pid, u64 aruid) -> u32;
+    [310] ResetSevenSixAxisSensorTimestamp(pid, u64 aruid);
+    [311] ForceActivateConsoleSixAxisSensor(pid, u64 aruid);
+    [312] ForceDeactivateConsoleSixAxisSensor(pid, u64 aruid);
+
+    # NOTE: takes 1 input event handle
+    [320] EnableNpadImu(pid, u32 npad_id, u64 aruid);
+    [321] DisableNpadImu(pid, u64 aruid);
+
+    [400] IsUsbFullKeyControllerEnabled() -> bool;
+    [401] EnableUsbFullKeyController(bool enabled);
+    [402] IsUsbFullKeyControllerConnected(u32 npad_id) -> bool;
+    [403] HasBattery(u32 npad_id) -> bool;
+    [404] HasLeftRightBattery(u32 npad_id) -> (bool, bool);
+    [405] GetNpadInterfaceType(u32 npad_id) -> u8;
+    [406] GetNpadLeftRightInterfaceType(u32 npad_id) -> (u8, u8);
+    # NOTE: takes in_buffer<u32 NpadIdType[]>
+    [407] GetNpadOfHighestBatteryLevel(pid, u64 aruid) -> u32;
+
+    [500] GetPalmaConnectionHandle(pid, u32 npad_id, u64 aruid) -> u64;
+    [501] InitializePalma(u64 palma);
+    [502] AcquirePalmaOperationCompleteEvent(u64 palma) -> out_handle;
+    # NOTE: takes out_buffer<u8[0x140]>
+    [503] GetPalmaOperationInfo(u64 palma) -> u64;
+    [504] PlayPalmaActivity(u64 palma, u64 _unk);
+    [505] SetPalmaFrModeType(u64 palma, u64 ty);
+    [506] ReadPalmaStep(u64 palma);
+    [507] EnablePalmaStep(bool enabled, u64 palma);
+    [508] ResetPalmaStep(u64 palma);
+    [509] ReadPalmaApplicationSection(u64 palma, u64 offset, u64 size);
+    # NOTE: takes in_buffer<PalmaApplicationSectionAccessBuffer[0x100]>
+    [510] WritePalmaApplicationSection(u64 palma, u64 offset, u64 size);
+    [511] ReadPalmaUniqueCode(u64 palma);
+    [512] SetPalmaUniqueCodeInvalid(u64 palma);
+    [513] WritePalmaActivityEntry(u64 palma, u64 _a, u64 _b, u64 _c, u64 _d);
+    # NOTE: takes in_buffer<u8[]>
+    [514] WritePalmaRgbLedPatternEntry(u64 palma, u64 _unk);
+    # NOTE: takes 1 input TransferMemory handle
+    [515] WritePalmaWaveEntry(u64 palma, u64 wave_set, u64 _unk, u64 tmem_size, u64 size);
+    [516] SetPalmaDataBaseIdentificationVersion(i32 version, u64 palma);
+    [517] GetPalmaDataBaseIdentificationVersion(u64 palma);
+    [518] SuspendPalmaFeature(u32 features, u64 palma);
+    [519] GetPalmaOperationResult(u64 palma);
+    [520] ReadPalmaPlayLog(u16 _unk, u64 palma);
+    [521] ResetPalmaPlayLog(u16 _unk, u64 palma);
+    [522] SetIsPalmaAllConnectable(pid, bool connectable, u64 aruid);
+    [523] SetIsPalmaPairedConnectable(pid, bool connectable, u64 aruid);
+    [524] PairPalma(u64 palma);
+    [525] SetPalmaBoostMode(bool enabled);
+    [526] CancelWritePalmaWaveEntry(u64 palma);
+    [527] EnablePalmaBoostMode(pid, bool enabled, u64 aruid);
+    [528] GetPalmaBluetoothAddress(u64 palma) -> zeros(6);
+    # NOTE: takes in_buffer<BluetoothAddress[]>
+    [529] SetDisallowedPalmaConnection(pid, u64 aruid);
+
+    [1000] SetNpadCommunicationMode(pid, u64 aruid, i64 mode);
+    [1001] GetNpadCommunicationMode() -> i64;
+    [1002] SetTouchScreenConfiguration(pid, u64 _cfg0, u64 _cfg1, u64 aruid);
+    [1003] IsFirmwareUpdateNeededForNotification(pid, i32 _unk, u64 aruid) -> bool;
+    [1004] SetTouchScreenOutputRanges(pid, i32 width, i32 height, u64 aruid);
+    [1005] EnableNxTouchScreenEmulationForTouchEnter(pid, u32 _flag, u64 aruid);
+    [2000] ActivateDigitizer(pid, u64 aruid);
+
+    # NOTE: takes out_buffer<GenericPadMap[0x50]>
+    [3000] GetDebugPadGenericPadMap();
+    # NOTE: takes in_buffer<GenericPadMap[0x50]>
+    [3001] SetDebugPadGenericPadMap();
+    [3002] ResetDebugPadGenericPadMap();
+    [3003] GetDebugPadKeyboardMap() -> zeros(0x38);
+    [3004] SetDebugPadKeyboardMap();
+    [3005] ResetDebugPadKeyboardMap();
+    # NOTE: takes out_buffer<FullKeyGenericPadMap[0x58]>
+    [3006] GetFullKeyGenericPadMap(u32 _flag);
+    # NOTE: takes in_buffer<FullKeyGenericPadMap[0x58]>
+    [3007] SetFullKeyGenericPadMap(u32 _flag);
+    [3008] ResetFullKeyGenericPadMap(u32 _flag);
+    [3009] GetFullKeyKeyboardMap(u32 _flag) -> zeros(0x40);
+    [3010] SetFullKeyKeyboardMap(u32 _flag);
+    [3011] ResetFullKeyKeyboardMap(u32 _flag);
+    # NOTE: takes out_buffer<GenericPadMap[0x80]>
+    [3012] GetDebugPadGenericPadMap_2();
+    # NOTE: takes in_buffer<GenericPadMap[0x80]>
+    [3013] SetDebugPadGenericPadMap_2();
+    [3014] GetDebugPadKeyboardMap_2() -> zeros(0x68);
+    [3015] SetDebugPadKeyboardMap_2();
+
+    [3150] SetMouseLibraryVersion(pid, u64 _v0, u64 aruid);
+}

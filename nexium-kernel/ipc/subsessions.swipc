@@ -1,0 +1,121 @@
+# Sub-session interfaces returned by other services. These were previously
+# unenumerated and fell through to the legacy dispatch path.
+# Source: firmware IPC dump (525hpm0.txt).
+
+# Returned by hid cmd 203 CreateActiveVibrationDeviceList.
+service IActiveVibrationDeviceList as active_vibration_device_list {
+    [0] ActivateVibrationDevice(u32 handle);
+}
+
+# nn::am::service::IStorage — opaque data carrier between applets.
+service IStorage as applet_storage {
+    [0] Open() -> session<IStorageAccessor>;
+    [1] OpenTransferStorage() -> session<ITransferStorageAccessor>;
+}
+
+# nn::am::service::IStorageAccessor — actual read/write into the IStorage.
+service IStorageAccessor as storage_accessor {
+    [0] GetSize() -> u64;
+    [10] Write(u64 offset, in_buffer data);
+    [11] Read(u64 offset, out_buffer data);
+}
+
+# Transfer-memory-backed storage accessor; same surface as IStorageAccessor.
+service ITransferStorageAccessor as transfer_storage_accessor {
+    [0] GetSize() -> u64;
+    [1] GetHandle() -> (u64, out_handle);
+}
+
+# nn::am::service::ILockAccessor — applet-level lock primitive.
+service ILockAccessor as lock_accessor {
+    [1] TryLock(bool unk) -> (bool, out_handle);
+    [2] Unlock();
+    [3] GetEvent() -> out_handle;
+    [4] IsLocked() -> bool;
+}
+
+# nn::am::service::IGpuErrorHandler — opaque GPU error recovery handle.
+service IGpuErrorHandler as gpu_error_handler {
+    [100] GetManualGpuErrorInfoSize() -> u64;
+    [101] GetManualGpuErrorInfo(out_buffer info) -> u64;
+    [102] GetManualGpuErrorDetectionSystemEvent() -> out_handle;
+    [103] FinishManualGpuErrorHandling();
+}
+
+# nn::am::service::ICradleFirmwareUpdater
+service ICradleFirmwareUpdater as cradle_firmware_updater {
+    [0] Start();
+    [1] Finish();
+    [2] GetUpdateDeviceStatus() -> zeros(16);
+    [3] GetUpdateProgress() -> out_handle;
+    [4] GetUpdateDeviceStatusChangeEvent() -> zeros(16);
+    [5] GetUpdateProgress2();
+}
+
+# nn::am::service::IMovieMaker — returns a nested IMovieMaker sub-iface.
+service IMovieMaker as movie_maker {
+    [0] GetGrcMovieMaker() -> session<IMovieMaker>;
+    [1] GetLayerHandle() -> u64;
+}
+
+# nn::am::service::IStorageChannel
+service IStorageChannel as storage_channel {
+    [0] Push();
+    [1] Unpop();
+    [2] Pop() -> session<IStorage>;
+    [3] GetPopEventHandle() -> out_handle;
+    [4] Clear();
+}
+
+# nn::am::service::IApplicationAccessor
+service IApplicationAccessor as application_accessor {
+    [0] GetAppletStateChangedEvent() -> out_handle;
+    [1] IsCompleted() -> bool;
+    [10] Start();
+    [20] RequestExit();
+    [25] Terminate();
+    [30] GetResult();
+    [101] RequestForApplicationToGetForeground();
+    [110] TerminateAllLibraryApplets();
+    [111] AreAnyLibraryAppletsLeft() -> bool;
+    [120] GetApplicationId() -> u64;
+    [124] GetApplicationLaunchRequestInfo() -> zeros(16);
+    # NOTE: cmd 130 SetUsers also takes in_buffer<Uid[]>
+    [130] SetUsers(bool present);
+    [131] CheckRightsEnvironmentAvailable() -> bool;
+    [132] GetNsRightsEnvironmentHandle() -> u64;
+    # NOTE: cmd 140 writes uids into out_buffer
+    [140] GetDesirableUids() -> u32;
+    [170] HasSaveDataAccessPermission(u64 app_id) -> bool;
+    [200] RequestApplicationSoftReset();
+    [201] RestartApplicationTimer();
+    [300] Cmd300() -> bool;
+    [310] Cmd310();
+}
+
+# nn::am::service::ILibraryAppletAccessor
+service ILibraryAppletAccessor as library_applet_accessor {
+    [0] GetAppletStateChangedEvent() -> out_handle;
+    [1] IsCompleted() -> bool;
+    [10] Start();
+    [20] RequestExit();
+    [25] Terminate();
+    [30] GetResult();
+    [50] SetOutOfFocusApplicationSuspendingEnabled(bool enabled);
+    [60] PresetLibraryAppletGpuTimeSliceZero();
+    [80] RequestForLibraryAppletToGetForeground();
+    [90] Cmd90(u64 a, u64 b, u64 c, u64 d);
+    [101] PopOutData() -> session<IStorage>;
+    [104] PopInteractiveOutData() -> session<IStorage>;
+    [105] GetPopOutDataEvent() -> out_handle;
+    [106] GetPopInteractiveOutDataEvent() -> out_handle;
+    [110] NeedsToExitProcess() -> bool;
+    [120] GetLibraryAppletInfo() -> u64;
+    [150] RequestForAppletToGetForeground();
+    [160] GetIndirectLayerConsumerHandle(pid, u64 aruid) -> u64;
+}
+
+# IDp2hdmiController — not present in FW5 dump; declared as empty so the
+# dispatcher can route the port without falling through. Real cmds TBD.
+service IDp2hdmiController as dp2hdmi_controller {
+}

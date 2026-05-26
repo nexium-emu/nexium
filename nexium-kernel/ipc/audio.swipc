@@ -1,0 +1,26 @@
+# IAudioOut — per-session audio output handed back from audout:u OpenAudioOut.
+# Each session owns a FIFO of guest buffer pointers; we drain them at vsync
+# rate and signal the per-session RegisterBufferEvent.
+#
+# Commands taking/returning buffer pointers (3/7 AppendAudioOutBuffer and
+# 5/8 GetReleased) and the event-handle return (4) need ctx access for the
+# guest-buffer read/write — handlers do that explicitly.
+#
+# Source: firmware IPC dump (525hpm0.txt) — 'nn::audio::detail::IAudioOut'.
+
+service IAudioOut as audio_out {
+    [0] GetAudioOutState() -> u32;
+    [1] StartAudioOut();
+    [2] StopAudioOut();
+    [3] AppendAudioOutBuffer(u64 client_ptr);
+    [4] RegisterBufferEvent() -> out_handle;
+    [5] GetReleasedAudioOutBuffer() -> u32;
+    [6] ContainsAudioOutBuffer(u64 client_ptr) -> bool;
+    [7] AppendAudioOutBufferAuto(u64 client_ptr);
+    [8] GetReleasedAudioOutBufferAuto() -> u32;
+    [9] GetAudioOutBufferCount() -> u32;
+    [10] GetAudioOutPlayedSampleCount() -> u64;
+    [11] FlushAudioOutBuffers() -> bool;
+    [12] SetAudioOutVolume(u32 volume);
+    [13] GetAudioOutVolume() -> u32;
+}
