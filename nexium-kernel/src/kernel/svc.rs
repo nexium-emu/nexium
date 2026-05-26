@@ -423,6 +423,10 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         }
     }
 
+    for h in &handles {
+        crate::kernel::profile::record_wait_handle(*h);
+    }
+
     let mut vsync_idx: Option<usize> = None;
     for (i, h) in handles.iter().enumerate() {
         if kernel.vsync_handles.contains(h) {
@@ -465,7 +469,7 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
             }
         }
         {
-            const AUDIO_PERIOD: std::time::Duration = std::time::Duration::from_millis(16);
+            const AUDIO_PERIOD: std::time::Duration = std::time::Duration::from_millis(20);
             use std::sync::OnceLock;
             use parking_lot::Mutex;
             static LAST_TICK: OnceLock<Mutex<std::time::Instant>> = OnceLock::new();
@@ -473,8 +477,13 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
             let mut last = cell.lock();
             if last.elapsed() >= AUDIO_PERIOD {
                 *last = std::time::Instant::now();
-                for &ev in kernel.audio_buffer_events.values() {
-                    kernel.event_signals.insert(ev, true);
+                let sessions_with_pending: Vec<u32> = kernel.audio_out_buffers.iter()
+                    .filter_map(|(s, q)| if !q.is_empty() { Some(*s) } else { None })
+                    .collect();
+                for sess in sessions_with_pending {
+                    if let Some(&ev) = kernel.audio_buffer_events.get(&sess) {
+                        kernel.event_signals.insert(ev, true);
+                    }
                 }
             }
         }
@@ -509,8 +518,13 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
                 hid.tick(cur);
             }
         }
-        for &ev in kernel.audio_buffer_events.values() {
-            kernel.event_signals.insert(ev, true);
+        let sessions_with_pending: Vec<u32> = kernel.audio_out_buffers.iter()
+            .filter_map(|(s, q)| if !q.is_empty() { Some(*s) } else { None })
+            .collect();
+        for sess in sessions_with_pending {
+            if let Some(&ev) = kernel.audio_buffer_events.get(&sess) {
+                kernel.event_signals.insert(ev, true);
+            }
         }
         if let Some(cpu) = &mut kernel.cpu {
             cpu.set_register(0, SUCCESS as u64);
@@ -847,11 +861,12 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         }
     }
 
-    let in_data_preview: Vec<u8> = {
+    let info_enabled = log::max_level() >= log::LevelFilter::Info;
+    let in_data_preview: Vec<u8> = if info_enabled {
         let start = ctx.cmif_in_data_off;
         let end = (start + 32).min(ctx.buf.len());
         if start < ctx.buf.len() { ctx.buf[start..end].to_vec() } else { Vec::new() }
-    };
+    } else { Vec::new() };
     let response = if dispatch_target == "sm:" {
         dispatch_sm_command_v2(kernel, &mut ctx)
     } else {
@@ -861,7 +876,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         response
     };
 
-    {
+    if info_enabled {
         use std::collections::HashSet;
         use std::sync::OnceLock;
         use parking_lot::Mutex;
@@ -938,7 +953,7 @@ fn handle_control_request(kernel: &mut Kernel, session_handle: u32, port_name: &
     }
 }
 
-fn build_ipc_response(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move_handles: &[u32]) -> Vec<u8> {
+pub(crate) fn build_ipc_response(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move_handles: &[u32]) -> Vec<u8> {
     build_ipc_response_full(ctx, result, out_data, move_handles, &[])
 }
 
@@ -1563,61 +1578,6 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
         }
     }
 
-    if port_name == "IAudioOut" {
-        match cmd_id {
-            0 => return build_ipc_response(ctx, 0, &1u32.to_le_bytes(), &[]),
-            1 => return build_ipc_response(ctx, 0, &[], &[]),
-            2 => return build_ipc_response(ctx, 0, &[], &[]),
-            3 | 7 => {
-                let in_off = ctx.cmif_in_data_off;
-                if ctx.cmif_in_data_len >= 8 {
-                    let client_ptr = u64::from_le_bytes([
-                        ctx.buf[in_off], ctx.buf[in_off + 1], ctx.buf[in_off + 2], ctx.buf[in_off + 3],
-                        ctx.buf[in_off + 4], ctx.buf[in_off + 5], ctx.buf[in_off + 6], ctx.buf[in_off + 7],
-                    ]);
-                    let q = kernel.audio_out_buffers.entry(session_handle).or_default();
-                    q.push_back(client_ptr);
-                }
-                return build_ipc_response(ctx, 0, &[], &[]);
-            }
-            4 => {
-                let event = kernel.handles.create_handle(HandleType::Event);
-                kernel.event_signals.insert(event, false);
-                kernel.audio_buffer_events.insert(session_handle, event);
-                return build_ipc_response(ctx, 0, &[], &[event]);
-            }
-            5 | 8 => {
-                let recv = ctx.recv_buffers.iter()
-                    .find(|b| b.size > 0 && b.addr != 0)
-                    .copied();
-                let max_count = recv.map(|b| (b.size as usize) / 8).unwrap_or(0);
-                let mut ptrs: Vec<u64> = Vec::new();
-                if let Some(q) = kernel.audio_out_buffers.get_mut(&session_handle) {
-                    while ptrs.len() < max_count {
-                        match q.pop_front() {
-                            Some(p) => ptrs.push(p),
-                            None => break,
-                        }
-                    }
-                }
-                if let Some(b) = recv {
-                    let mut bytes = Vec::with_capacity(ptrs.len() * 8);
-                    for p in &ptrs {
-                        bytes.extend_from_slice(&p.to_le_bytes());
-                    }
-                    let _ = kernel.address_space.write(b.addr, &bytes);
-                }
-                let count = ptrs.len() as u32;
-                return build_ipc_response(ctx, 0, &count.to_le_bytes(), &[]);
-            }
-            6 => return build_ipc_response(ctx, 0, &0u8.to_le_bytes(), &[]),
-            9 => return build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[]),
-            10 => return build_ipc_response(ctx, 0, &0u64.to_le_bytes(), &[]),
-            11 => return build_ipc_response(ctx, 0, &0u8.to_le_bytes(), &[]),
-            _ => {}
-        }
-    }
-
     if port_name == "set" || port_name == "set:sys" {
         if let Some(outcome) = cmif_dispatch_set(kernel, ctx) {
             log::debug!("set.cmd_{} → {} bytes (rc={:#x}) via #[service]", cmd_id, outcome.inline_out.len(), outcome.result);
@@ -1625,45 +1585,9 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
         }
     }
 
-    if port_name == "pl:u" || port_name == "pl:s" {
-        match cmd_id {
-            4 => {
-                let handle = kernel.ensure_font_shmem_handle();
-                log::debug!("pl:u cmd=4 GetSharedMemoryNativeHandle → {:#x}", handle);
-                return build_ipc_response(ctx, 0, &[], &[handle]);
-            }
-            2 => {
-                let font_type = if ctx.cmif_in_data_len >= 4 {
-                    u32::from_le_bytes([
-                        ctx.buf[ctx.cmif_in_data_off],
-                        ctx.buf[ctx.cmif_in_data_off + 1],
-                        ctx.buf[ctx.cmif_in_data_off + 2],
-                        ctx.buf[ctx.cmif_in_data_off + 3],
-                    ])
-                } else { 0 };
-                let (_, size) = kernel.font_offsets[font_type.min(5) as usize];
-                log::debug!("pl:u cmd=2 GetSize type={} → {}", font_type, size);
-                return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
-            }
-            3 => {
-                let font_type = if ctx.cmif_in_data_len >= 4 {
-                    u32::from_le_bytes([
-                        ctx.buf[ctx.cmif_in_data_off],
-                        ctx.buf[ctx.cmif_in_data_off + 1],
-                        ctx.buf[ctx.cmif_in_data_off + 2],
-                        ctx.buf[ctx.cmif_in_data_off + 3],
-                    ])
-                } else { 0 };
-                let (offset, _) = kernel.font_offsets[font_type.min(5) as usize];
-                log::debug!("pl:u cmd=3 GetOffset type={} → {}", font_type, offset);
-                return build_ipc_response(ctx, 0, &offset.to_le_bytes(), &[]);
-            }
-            _ => {}
-        }
-        if let Some(outcome) = cmif_dispatch_pl(kernel, ctx) {
-            log::debug!("pl.cmd_{} → {} bytes (rc={:#x}) via #[service]", cmd_id, outcome.inline_out.len(), outcome.result);
-            return build_ipc_response(ctx, outcome.result, &outcome.inline_out, &[]);
-        }
+
+    if let Some(resp) = crate::services::generated::dispatch_generated(kernel, port_name, ctx, session_handle) {
+        return resp;
     }
 
     if let Some((data, handle_opt)) = applet_command_response(kernel, port_name, cmd_id) {
@@ -1683,12 +1607,17 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
 }
 
 const IGBP_REQUEST_BUFFER: u32 = 1;
+const IGBP_SET_BUFFER_COUNT: u32 = 2;
 const IGBP_DEQUEUE_BUFFER: u32 = 3;
+const IGBP_DETACH_BUFFER: u32 = 4;
+const IGBP_DETACH_NEXT_BUFFER: u32 = 5;
+const IGBP_ATTACH_BUFFER: u32 = 6;
 const IGBP_QUEUE_BUFFER: u32 = 7;
 const IGBP_CANCEL_BUFFER: u32 = 8;
 const IGBP_QUERY: u32 = 9;
 const IGBP_CONNECT: u32 = 10;
 const IGBP_DISCONNECT: u32 = 11;
+const IGBP_ALLOCATE_BUFFERS: u32 = 13;
 const IGBP_SET_PREALLOCATED_BUFFER: u32 = 14;
 
 fn handle_binder_transact(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, _session_handle: u32) -> Vec<u8> {
@@ -2049,15 +1978,25 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                             use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
                             static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
                             static FIRST_NONBLACK: AtomicBool = AtomicBool::new(false);
+                            static LAST_RGB_NZ: AtomicU64 = AtomicU64::new(0);
                             let seq = FRAME_SEQ.fetch_add(1, Ordering::Relaxed);
-                            let should_dump = (seq > 0 && seq % 300 == 60)
-                                || (rgb_nz > 0 && !FIRST_NONBLACK.swap(true, Ordering::Relaxed));
+                            let is_first_nonblack = rgb_nz > 0 && !FIRST_NONBLACK.swap(true, Ordering::Relaxed);
+                            let should_dump = (seq > 0 && seq % 300 == 60) || is_first_nonblack;
                             if should_dump {
                                 if let Some(home) = std::env::var_os("APPDATA") {
                                     let path = std::path::PathBuf::from(home).join("NeXium").join("logs")
                                         .join(format!("compose-{}.bmp", seq));
                                     let _ = save_rgba_bmp(&path, frame_w, frame_h, &frame_pixels);
-                                    log::info!("frame dump seq={} rgb_nz={} → {}", seq, rgb_nz, path.display());
+                                    log::warn!("FRAME DUMP seq={} rgb_nz={} → {}", seq, rgb_nz, path.display());
+                                }
+                            }
+                            if is_first_nonblack {
+                                log::warn!("FIRST NON-BLACK FRAME seq={} rgb_nz={}", seq, rgb_nz);
+                            }
+                            if seq % 60 == 0 {
+                                let prev = LAST_RGB_NZ.swap(rgb_nz as u64, Ordering::Relaxed);
+                                if (prev == 0) != (rgb_nz == 0) {
+                                    log::warn!("frame heartbeat seq={} rgb_nz={} (was {})", seq, rgb_nz, prev);
                                 }
                             }
                         }
@@ -2112,6 +2051,43 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
             log::debug!("IGBP::Query what={} → {}", what, value);
             let mut p = ParcelBuilder::new();
             p.write_u32(value as u32);
+            p.write_u32(0);
+            p.finish()
+        }
+        IGBP_SET_BUFFER_COUNT => {
+            let count = reader.read_i32().unwrap_or(0);
+            log::debug!("IGBP::SetBufferCount binder={} count={}", binder_id, count);
+            let mut p = ParcelBuilder::new();
+            p.write_u32(0);
+            p.finish()
+        }
+        IGBP_DETACH_BUFFER => {
+            let slot = reader.read_i32().unwrap_or(0).max(0) as u32;
+            kernel.nvdrv.with_bufferqueue(binder_id, |bq| bq.cancel(slot));
+            log::debug!("IGBP::DetachBuffer binder={} slot={}", binder_id, slot);
+            let mut p = ParcelBuilder::new();
+            p.write_u32(0);
+            p.finish()
+        }
+        IGBP_DETACH_NEXT_BUFFER => {
+            log::debug!("IGBP::DetachNextBuffer binder={}", binder_id);
+            let mut p = ParcelBuilder::new();
+            p.write_u32(0);
+            p.write_u32(0);
+            p.write_u32(0);
+            p.finish()
+        }
+        IGBP_ATTACH_BUFFER => {
+            log::debug!("IGBP::AttachBuffer binder={}", binder_id);
+            let mut p = ParcelBuilder::new();
+            p.write_u32(0);
+            p.write_u32(0);
+            p.finish()
+        }
+        IGBP_ALLOCATE_BUFFERS => {
+            let async_ = reader.read_i32().unwrap_or(0);
+            log::debug!("IGBP::AllocateBuffers binder={} async={}", binder_id, async_);
+            let mut p = ParcelBuilder::new();
             p.write_u32(0);
             p.finish()
         }
@@ -2616,7 +2592,7 @@ fn build_native_window_parcel(binder_handle: u32) -> Vec<u8> {
     out
 }
 
-fn return_subsession(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, session_handle: u32, sub_service: &str) -> Vec<u8> {
+pub(crate) fn return_subsession(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, session_handle: u32, sub_service: &str) -> Vec<u8> {
     let is_domain = kernel.sessions.get(&session_handle).map(|s| s.is_domain).unwrap_or(false);
     if is_domain {
         let object_id = if let Some(s) = kernel.sessions.get_mut(&session_handle) {
@@ -2667,118 +2643,9 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
 
 fn applet_command_response(kernel: &mut Kernel, port_name: &str, cmd_id: u32) -> Option<(Vec<u8>, Option<u32>)> {
     match (port_name, cmd_id) {
-        ("IWindowController", 1) => Some((1u64.to_le_bytes().to_vec(), None)),
-        ("IWindowController", 10) => Some((Vec::new(), None)),
-        ("ISelfController", 0) => Some((Vec::new(), None)),
-        ("ISelfController", 1) => Some((Vec::new(), None)),
-        ("ISelfController", 10) => Some((Vec::new(), None)),
-        ("ISelfController", 11) => Some((Vec::new(), None)),
-        ("ISelfController", 12) => Some((Vec::new(), None)),
-        ("ISelfController", 16) => Some((Vec::new(), None)),
-        ("ISelfController", 40) => {
-            let handle = kernel.handles.create_handle(HandleType::Event);
-            Some((Vec::new(), Some(handle)))
-        }
-        ("ISelfController", 50) => Some((1u8.to_le_bytes().to_vec(), None)),
-        ("ISelfController", 91) => {
-            let handle = kernel.handles.create_handle(HandleType::Event);
-            Some((Vec::new(), Some(handle)))
-        }
-        ("ICommonStateGetter", 0) => {
-            let handle = kernel.handles.create_handle(HandleType::Event);
-            Some((Vec::new(), Some(handle)))
-        }
-        ("ICommonStateGetter", 1) => Some((0u32.to_le_bytes().to_vec(), None)),
-        ("ICommonStateGetter", 5) => Some((1u8.to_le_bytes().to_vec(), None)),
-        ("ICommonStateGetter", 6) => Some((0u32.to_le_bytes().to_vec(), None)),
-        ("ICommonStateGetter", 8) => Some((1u8.to_le_bytes().to_vec(), None)),
-        ("ICommonStateGetter", 9) => Some((1u8.to_le_bytes().to_vec(), None)),
-        ("ICommonStateGetter", 60) => Some({
-            let mut data = Vec::new();
-            data.extend_from_slice(&1280u32.to_le_bytes());
-            data.extend_from_slice(&720u32.to_le_bytes());
-            (data, None)
-        }),
-        ("IApplicationFunctions", 1) => Some((0u8.to_le_bytes().to_vec(), None)),
-        ("IApplicationFunctions", 20) => Some((Vec::new(), None)),
-        ("IApplicationFunctions", 21) => Some((Vec::new(), None)),
-        ("IApplicationFunctions", 22) => Some((Vec::new(), None)),
-        ("IApplicationFunctions", 23) => Some((0u8.to_le_bytes().to_vec(), None)),
-        ("IApplicationFunctions", 30) => Some((Vec::new(), None)),
-        ("IApplicationFunctions", 40) => Some((0u32.to_le_bytes().to_vec(), None)),
-        ("IApplicationFunctions", 50) => Some((Vec::new(), None)),
         ("IDebugFunctions", _) => Some((Vec::new(), None)),
 
-        ("IApplicationDisplayService", 1010) => Some((1u64.to_le_bytes().to_vec(), None)),
-        ("IApplicationDisplayService", 1011) => Some((1u64.to_le_bytes().to_vec(), None)),
-        ("IApplicationDisplayService", 1020) => Some((Vec::new(), None)),
-        ("IApplicationDisplayService", 2020) => {
-            let parcel_size = build_native_window_parcel(0x100).len() as u64;
-            Some((parcel_size.to_le_bytes().to_vec(), None))
-        }
-        ("IApplicationDisplayService", 2021) => Some((Vec::new(), None)),
-        ("IApplicationDisplayService", 2030) => {
-            let layer_id: u64 = 1;
-            let parcel_size = build_native_window_parcel(0x100).len() as u64;
-            let mut out = Vec::new();
-            out.extend_from_slice(&layer_id.to_le_bytes());
-            out.extend_from_slice(&parcel_size.to_le_bytes());
-            Some((out, None))
-        }
-        ("IApplicationDisplayService", 2031) => Some((Vec::new(), None)),
-        ("IApplicationDisplayService", 2101) => Some((Vec::new(), None)),
-        ("IApplicationDisplayService", 2102) => Some((Vec::new(), None)),
-        ("IApplicationDisplayService", 3000) => Some((60u64.to_le_bytes().to_vec(), None)),
-        ("IApplicationDisplayService", 5202) => {
-            let h = kernel.handles.create_handle(HandleType::Event);
-            kernel.event_signals.insert(h, false);
-            kernel.vsync_handles.insert(h);
-            log::info!("IApplicationDisplayService.GetDisplayVsyncEvent → vsync_handle={:#x}", h);
-            Some((Vec::new(), Some(h)))
-        }
-        ("IApplicationDisplayService", 5203) => Some((Vec::new(), None)),
-
-        ("ISystemDisplayService", 2205) => Some((Vec::new(), None)),
-        ("ISystemDisplayService", 2207) => Some((Vec::new(), None)),
-        ("ISystemDisplayService", 2312) => Some((Vec::new(), None)),
-        ("ISystemDisplayService", 2400) => Some((Vec::new(), None)),
-        ("ISystemDisplayService", 2402) => Some((Vec::new(), None)),
-        ("ISystemDisplayService", 3216) => Some((0u32.to_le_bytes().to_vec(), None)),
-
-        ("IManagerDisplayService", 2010) => Some((1u64.to_le_bytes().to_vec(), None)),
-        ("IManagerDisplayService", 2011) => Some((Vec::new(), None)),
-        ("IManagerDisplayService", 2012) => {
-            let layer_id: u64 = 1;
-            let parcel_size = build_native_window_parcel(0x100).len() as u64;
-            let mut out = Vec::new();
-            out.extend_from_slice(&layer_id.to_le_bytes());
-            out.extend_from_slice(&parcel_size.to_le_bytes());
-            Some((out, None))
-        }
-        ("IManagerDisplayService", 6000) => Some((Vec::new(), None)),
-
         ("IHOSBinderDriver", 0) | ("IHOSBinderDriver", 3) => Some((Vec::new(), None)),
-        ("IHOSBinderDriver", 1) => Some((Vec::new(), None)),
-        ("IHOSBinderDriver", 2) => {
-            let handle = kernel.handles.create_handle(HandleType::Event);
-            kernel.event_signals.insert(handle, false);
-            kernel.vsync_handles.insert(handle);
-            log::info!("IHOSBinderDriver.GetNativeHandle → BinderEvent {:#x} (registered as vsync)", handle);
-            Some((Vec::new(), Some(handle)))
-        }
-
-        ("ISystemClock", 0) => {
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let switch_epoch = secs.saturating_sub(946_684_800);
-            Some((switch_epoch.to_le_bytes().to_vec(), None))
-        }
-        ("ISystemClock", 2) => Some(([0u8; 0x20].to_vec(), None)),
-        ("ISteadyClock", 0) => Some(([0u8; 0x18].to_vec(), None)),
-        ("ITimeZoneService", 0) => Some(([0u8; 0x24].to_vec(), None)),
-        ("ITimeZoneService", 101) => Some(([0u8; 0x4].to_vec(), None)),
 
         ("IFileSystem", _) => Some((Vec::new(), None)),
         ("fsp-srv", _) => Some((Vec::new(), None)),
@@ -3913,15 +3780,3 @@ fn cmif_dispatch_set(
     kernel.services.set.dispatch_cmif(ctx.cmif_in.cmd_id, &mut cmif_ctx)
 }
 
-fn cmif_dispatch_pl(
-    kernel: &mut Kernel,
-    ctx: &ipc::IpcCtx,
-) -> Option<nexium_cmif::DispatchOutcome> {
-    let recv_buffers = convert_buffers(&ctx.recv_buffers);
-    let recv_statics = convert_buffers(&ctx.recv_statics);
-    let send_buffers = convert_buffers(&ctx.send_buffers);
-    let send_statics = convert_buffers(&ctx.send_statics);
-    let mem = AddressSpaceMemory { addr_space: &*kernel.address_space };
-    let mut cmif_ctx = make_cmif_ctx(ctx, &mem, &recv_buffers, &recv_statics, &send_buffers, &send_statics);
-    kernel.services.pl.dispatch_cmif(ctx.cmif_in.cmd_id, &mut cmif_ctx)
-}
