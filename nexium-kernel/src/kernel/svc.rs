@@ -1234,9 +1234,28 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                             let Ok(md) = e.metadata() else { continue };
                             let name = e.file_name().to_string_lossy().into_owned();
                             let is_dir = md.is_dir();
-                            if filter & 1 != 0 && is_dir { continue; }
-                            if filter & 2 != 0 && !is_dir { continue; }
+                            if is_dir && filter & 1 == 0 { continue; }
+                            if !is_dir && filter & 2 == 0 { continue; }
                             entries.push((name, is_dir, if is_dir { 0 } else { md.len() }));
+                        }
+                    }
+                }
+                let is_switch_path = path_str == "/switch" || path_str == "/switch/";
+                if is_switch_path {
+                    if let Some(dir) = &kernel.homebrew_dir {
+                        let mut seen: std::collections::HashSet<String> =
+                            entries.iter().map(|(n, _, _)| n.clone()).collect();
+                        if let Ok(rd) = std::fs::read_dir(dir) {
+                            for e in rd.filter_map(|e| e.ok()) {
+                                let Ok(md) = e.metadata() else { continue };
+                                let name = e.file_name().to_string_lossy().into_owned();
+                                if seen.contains(&name) { continue; }
+                                let is_dir = md.is_dir();
+                                if is_dir && filter & 1 == 0 { continue; }
+                                if !is_dir && filter & 2 == 0 { continue; }
+                                entries.push((name.clone(), is_dir, if is_dir { 0 } else { md.len() }));
+                                seen.insert(name);
+                            }
                         }
                     }
                 }
