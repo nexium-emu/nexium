@@ -15,10 +15,10 @@ pub fn receive_message(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) ->
 pub fn get_this_applet_kind(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u64 { 0 }
 pub fn allow_to_enter_sleep(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}
 pub fn disallow_to_enter_sleep(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}
-pub fn get_operation_mode(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> bool { true }
+pub fn get_operation_mode(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> bool { false }
 pub fn get_performance_mode(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u32 { 0 }
 pub fn get_cradle_status(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u8 { 0 }
-pub fn get_boot_mode(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> bool { true }
+pub fn get_boot_mode(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> bool { false }
 pub fn get_current_focus_state(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> bool { true }
 pub fn request_to_acquire_sleep_lock(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}
 pub fn release_sleep_lock(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}

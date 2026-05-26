@@ -81,6 +81,7 @@ pub struct Kernel {
     pub audio_out_buffers: HashMap<u32, VecDeque<u64>>,
     pub audio_buffer_events: HashMap<u32, u32>,
     pub audio_out_volumes: HashMap<u32, u32>,
+    pub audio_out_state: HashMap<u32, u8>,
 }
 
 impl Kernel {
@@ -162,6 +163,7 @@ impl Kernel {
             audio_out_buffers: HashMap::new(),
             audio_buffer_events: HashMap::new(),
             audio_out_volumes: HashMap::new(),
+            audio_out_state: HashMap::new(),
         }
     }
 

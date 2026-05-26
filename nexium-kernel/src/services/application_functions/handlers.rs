@@ -10,9 +10,13 @@ pub fn create_application_and_request_to_start_for_quest(_kernel: &mut Kernel, _
 pub fn create_application_with_attribute_and_push_and_request_to_start_for_quest(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _app_id: u64) {}
 pub fn create_application_with_attribute_and_request_to_start_for_quest(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _app_id: u64) {}
 pub fn ensure_save_data(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _user_id_lo: u64, _user_id_hi: u64) -> u64 { 0 }
-pub fn get_desired_language(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u64 { 1 }
+pub fn get_desired_language(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u64 {
+    0x0000_0053_552D_6E65
+}
 pub fn set_terminate_result(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _result: u32) {}
-pub fn get_display_version(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> (u64, u64) { (0, 0) }
+pub fn get_display_version(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> (u64, u64) {
+    (u64::from_le_bytes(*b"1.0.0\0\0\0"), 0)
+}
 pub fn get_launch_storage_info_for_debug(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> (u8, u8) { (0, 0) }
 pub fn extend_save_data(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _a: u8, _user_id_lo: u64, _user_id_hi: u64, _b: u64, _c: u64) -> u64 { 0 }
 pub fn get_save_data_size(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _a: u8, _user_id_lo: u64, _user_id_hi: u64) -> (u64, u64) { (0, 0) }
@@ -33,7 +37,7 @@ pub fn get_limited_application_license_upgradable_event(kernel: &mut Kernel, _ct
     h
 }
 
-pub fn notify_running(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u32 { 0 }
+pub fn notify_running(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u32 { 1 }
 pub fn get_pseudo_device_id(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> (u64, u64) { (0, 0) }
 pub fn set_media_playback_state_for_application(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _flag: u8) {}
 pub fn is_game_play_recording_supported(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> bool { false }

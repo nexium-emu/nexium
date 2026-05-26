@@ -2,9 +2,15 @@ use crate::kernel::Kernel;
 use crate::kernel::handles::HandleType;
 use nexium_ipc::IpcCtx;
 
-pub fn get_audio_out_state(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u32 { 1 }
-pub fn start_audio_out(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}
-pub fn stop_audio_out(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}
+pub fn get_audio_out_state(kernel: &mut Kernel, _ctx: &mut IpcCtx, session: u32) -> u32 {
+    kernel.audio_out_state.get(&session).copied().unwrap_or(1) as u32
+}
+pub fn start_audio_out(kernel: &mut Kernel, _ctx: &mut IpcCtx, session: u32) {
+    kernel.audio_out_state.insert(session, 0);
+}
+pub fn stop_audio_out(kernel: &mut Kernel, _ctx: &mut IpcCtx, session: u32) {
+    kernel.audio_out_state.insert(session, 1);
+}
 
 pub fn append_audio_out_buffer(kernel: &mut Kernel, _ctx: &mut IpcCtx, session: u32, client_ptr: u64) {
     let q = kernel.audio_out_buffers.entry(session).or_default();

@@ -27,6 +27,8 @@ pub struct HidService {
     pub npad_assignment: HashMap<u32, NpadAssignment>,
     pub npad_handheld_activation_mode: u64,
     pub npad_joy_hold_type: u64,
+    pub npad_style_set: u32,
+    pub vibration_permitted: bool,
 }
 
 impl HidService {
@@ -37,6 +39,8 @@ impl HidService {
             npad_assignment: HashMap::new(),
             npad_handheld_activation_mode: 0,
             npad_joy_hold_type: 0,
+            npad_style_set: 0,
+            vibration_permitted: true,
         }
     }
 

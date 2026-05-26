@@ -59,8 +59,12 @@ pub fn reset_is_six_axis_sensor_device_newly_assigned(_k: &mut Kernel, _c: &mut 
 pub fn activate_gesture(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _unk: u32, _aruid: u64) {}
 pub fn set_gesture_output_ranges(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _w: u32, _h: u32, _aruid: u64) {}
 
-pub fn set_supported_npad_style_set(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _style_set: u32, _aruid: u64) {}
-pub fn get_supported_npad_style_set(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) -> u32 { 0 }
+pub fn set_supported_npad_style_set(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, style_set: u32, _aruid: u64) {
+    kernel.services.hid.npad_style_set = style_set;
+}
+pub fn get_supported_npad_style_set(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) -> u32 {
+    kernel.services.hid.npad_style_set
+}
 pub fn set_supported_npad_id_type(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64, ids: &[u8]) {
     let count = ids.len() / 4;
     log::debug!("HID::SetSupportedNpadIdType npad_count={}", count);
@@ -69,7 +73,9 @@ pub fn activate_npad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
 pub fn deactivate_npad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
 pub fn acquire_npad_style_set_update_event_handle(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32, _aruid: u64, _unk: u64) -> u32 { new_event(kernel) }
 pub fn disconnect_npad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32, _aruid: u64) {}
-pub fn get_player_led_pattern(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32) -> u64 { 0 }
+pub fn get_player_led_pattern(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, npad_id: u32) -> u64 {
+    match npad_id { 0 => 0b0001, 1 => 0b0011, 2 => 0b0111, 3 => 0b1111, _ => 0 }
+}
 pub fn activate_npad_with_revision(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _revision: i32, _aruid: u64) {}
 
 pub fn set_npad_joy_hold_type(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _aruid: u64, ty: u64) {
@@ -113,8 +119,12 @@ pub fn get_vibration_device_info(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _han
 pub fn send_vibration_value(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _v0: u32, _v1: u32, _v2: u32, _v3: u32, _aruid: u64) {}
 pub fn get_actual_vibration_value(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) {}
 pub fn create_active_vibration_device_list(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
-pub fn permit_vibration(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _permit: bool) {}
-pub fn is_vibration_permitted(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> bool { true }
+pub fn permit_vibration(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, permit: bool) {
+    kernel.services.hid.vibration_permitted = permit;
+}
+pub fn is_vibration_permitted(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> bool {
+    kernel.services.hid.vibration_permitted
+}
 pub fn send_vibration_values(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
 pub fn send_vibration_gc_erm_command(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64, _cmd: u64) {}
 pub fn get_actual_vibration_gc_erm_command(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _handle: u32, _aruid: u64) -> u64 { 0 }
