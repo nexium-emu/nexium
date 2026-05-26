@@ -2039,11 +2039,28 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                             (gb.width, gb.height, pixels)
                         };
                         let nz = frame_pixels.iter().filter(|b| **b != 0).count();
+                        let rgb_nz = frame_pixels.chunks_exact(4).filter(|p| p[0]!=0||p[1]!=0||p[2]!=0).count();
                         let checksum: u32 = frame_pixels.chunks_exact(4).map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]])).fold(0u32, |a,b| a.wrapping_add(b));
                         log::info!(
-                            "QueueBuffer submit slot={} parsed_nvmap_id={} addr={:#x} {}x{} tiled={} nz={} cksum={:#x}",
-                            slot, gb.nvmap_id, effective_addr, frame_w, frame_h, effective_tiled, nz, checksum
+                            "QueueBuffer submit slot={} parsed_nvmap_id={} addr={:#x} {}x{} tiled={} nz={} rgb_nz={} cksum={:#x}",
+                            slot, gb.nvmap_id, effective_addr, frame_w, frame_h, effective_tiled, nz, rgb_nz, checksum
                         );
+                        {
+                            use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+                            static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
+                            static FIRST_NONBLACK: AtomicBool = AtomicBool::new(false);
+                            let seq = FRAME_SEQ.fetch_add(1, Ordering::Relaxed);
+                            let should_dump = (seq > 0 && seq % 300 == 60)
+                                || (rgb_nz > 0 && !FIRST_NONBLACK.swap(true, Ordering::Relaxed));
+                            if should_dump {
+                                if let Some(home) = std::env::var_os("APPDATA") {
+                                    let path = std::path::PathBuf::from(home).join("NeXium").join("logs")
+                                        .join(format!("compose-{}.bmp", seq));
+                                    let _ = save_rgba_bmp(&path, frame_w, frame_h, &frame_pixels);
+                                    log::info!("frame dump seq={} rgb_nz={} → {}", seq, rgb_nz, path.display());
+                                }
+                            }
+                        }
                         kernel.nvdrv.submit_frame(nexium_nvdrv::QueuedFrame {
                             width: frame_w,
                             height: frame_h,
@@ -2296,6 +2313,39 @@ fn crop_and_upscale(
         }
     }
     out
+}
+
+fn save_rgba_bmp(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let row_bytes = (width as usize) * 3;
+    let row_padded = (row_bytes + 3) & !3;
+    let pixel_bytes = row_padded * height as usize;
+    let file_size = 54 + pixel_bytes;
+    let mut f = std::fs::File::create(path)?;
+    let mut h = Vec::with_capacity(54);
+    h.extend_from_slice(b"BM");
+    h.extend_from_slice(&(file_size as u32).to_le_bytes());
+    h.extend_from_slice(&[0u8; 4]);
+    h.extend_from_slice(&54u32.to_le_bytes());
+    h.extend_from_slice(&40u32.to_le_bytes());
+    h.extend_from_slice(&width.to_le_bytes());
+    h.extend_from_slice(&height.to_le_bytes());
+    h.extend_from_slice(&1u16.to_le_bytes());
+    h.extend_from_slice(&24u16.to_le_bytes());
+    h.extend_from_slice(&[0u8; 24]);
+    f.write_all(&h)?;
+    let mut row = vec![0u8; row_padded];
+    for y in (0..height as usize).rev() {
+        let src_off = y * (width as usize) * 4;
+        for x in 0..width as usize {
+            let s = src_off + x * 4;
+            row[x * 3] = rgba.get(s + 2).copied().unwrap_or(0);
+            row[x * 3 + 1] = rgba.get(s + 1).copied().unwrap_or(0);
+            row[x * 3 + 2] = rgba.get(s).copied().unwrap_or(0);
+        }
+        f.write_all(&row)?;
+    }
+    Ok(())
 }
 
 fn try_compose_from_sdl_surface(kernel: &Kernel, fb_width: u32, fb_height: u32) -> Option<(u32, u32, Vec<u8>)> {
