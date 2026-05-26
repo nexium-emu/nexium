@@ -12,7 +12,7 @@ pub fn unlock(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
 
 pub fn get_event(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> u32 {
     let h = kernel.handles.create_handle(HandleType::Event);
-    kernel.event_signals.insert(h, false);
+    kernel.event_signals.insert(h, true);
     h
 }
 

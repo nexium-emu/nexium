@@ -2,7 +2,11 @@ use crate::kernel::Kernel;
 use crate::kernel::handles::HandleType;
 use nexium_ipc::IpcCtx;
 
-pub fn get_device_location_name(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}
+pub fn get_device_location_name(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> Vec<u8> {
+    let mut out = vec![0u8; 0x24];
+    out[..3].copy_from_slice(b"UTC");
+    out
+}
 pub fn to_calendar_time_with_my_rule(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _posix_time: u64) {}
 
 pub fn set_device_location_name(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}

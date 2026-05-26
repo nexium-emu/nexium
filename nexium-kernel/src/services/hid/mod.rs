@@ -29,6 +29,7 @@ pub struct HidService {
     pub npad_joy_hold_type: u64,
     pub npad_style_set: u32,
     pub vibration_permitted: bool,
+    pub style_change_events: Vec<u32>,
 }
 
 impl HidService {
@@ -41,6 +42,7 @@ impl HidService {
             npad_joy_hold_type: 0,
             npad_style_set: 0,
             vibration_permitted: true,
+            style_change_events: Vec::new(),
         }
     }
 

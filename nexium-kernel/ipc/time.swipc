@@ -28,7 +28,7 @@ service ISteadyClock as steady_clock {
 }
 
 service ITimeZoneService as time_zone {
-    [0] GetDeviceLocationName() -> zeros(0x24);
+    [0] GetDeviceLocationName() -> bytes(0x24);
     # NOTE [1] takes a 0x24 LocationName input; we ignore it in the handler.
     [1] SetDeviceLocationName();
     [2] GetTotalLocationNameCount() -> u32;

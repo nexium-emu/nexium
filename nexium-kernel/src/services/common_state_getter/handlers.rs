@@ -26,7 +26,7 @@ pub fn release_sleep_lock_transiently(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _
 
 pub fn get_acquired_sleep_lock_event(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u32 {
     let h = kernel.handles.create_handle(HandleType::Event);
-    kernel.event_signals.insert(h, false);
+    kernel.event_signals.insert(h, true);
     h
 }
 pub fn get_wakeup_count(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u64 { 0 }

@@ -38,7 +38,9 @@ pub fn get_limited_application_license_upgradable_event(kernel: &mut Kernel, _ct
 }
 
 pub fn notify_running(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u32 { 1 }
-pub fn get_pseudo_device_id(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> (u64, u64) { (0, 0) }
+pub fn get_pseudo_device_id(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> (u64, u64) {
+    (0x4E65_5869_756D_5044, 0x0123_4567_89AB_CDEF)
+}
 pub fn set_media_playback_state_for_application(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _flag: u8) {}
 pub fn is_game_play_recording_supported(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> bool { false }
 pub fn initialize_game_play_recording(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32, _size: u64) {}

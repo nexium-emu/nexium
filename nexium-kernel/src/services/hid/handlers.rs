@@ -9,6 +9,13 @@ fn new_event(kernel: &mut Kernel) -> u32 {
     h
 }
 
+#[inline]
+fn new_signaled_event(kernel: &mut Kernel) -> u32 {
+    let h = kernel.handles.create_handle(HandleType::Event);
+    kernel.event_signals.insert(h, true);
+    h
+}
+
 pub fn activate_debug_pad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
 pub fn activate_touch_screen(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
 pub fn activate_mouse(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
@@ -61,6 +68,8 @@ pub fn set_gesture_output_ranges(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _w: 
 
 pub fn set_supported_npad_style_set(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, style_set: u32, _aruid: u64) {
     kernel.services.hid.npad_style_set = style_set;
+    let events: Vec<u32> = kernel.services.hid.style_change_events.clone();
+    for h in events { kernel.event_signals.insert(h, true); }
 }
 pub fn get_supported_npad_style_set(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) -> u32 {
     kernel.services.hid.npad_style_set
@@ -69,9 +78,16 @@ pub fn set_supported_npad_id_type(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _ar
     let count = ids.len() / 4;
     log::debug!("HID::SetSupportedNpadIdType npad_count={}", count);
 }
-pub fn activate_npad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
+pub fn activate_npad(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {
+    let events: Vec<u32> = kernel.services.hid.style_change_events.clone();
+    for h in events { kernel.event_signals.insert(h, true); }
+}
 pub fn deactivate_npad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}
-pub fn acquire_npad_style_set_update_event_handle(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32, _aruid: u64, _unk: u64) -> u32 { new_event(kernel) }
+pub fn acquire_npad_style_set_update_event_handle(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32, _aruid: u64, _unk: u64) -> u32 {
+    let h = new_signaled_event(kernel);
+    kernel.services.hid.style_change_events.push(h);
+    h
+}
 pub fn disconnect_npad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _npad_id: u32, _aruid: u64) {}
 pub fn get_player_led_pattern(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, npad_id: u32) -> u64 {
     match npad_id { 0 => 0b0001, 1 => 0b0011, 2 => 0b0111, 3 => 0b1111, _ => 0 }

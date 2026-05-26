@@ -88,6 +88,7 @@ enum Output {
     Subsession(String),
     OutHandle,
     ZeroBytes(usize),
+    HandlerBytes(usize),
 }
 
 fn parse(text: &str, source_file: &str) -> Vec<Service> {
@@ -212,6 +213,12 @@ fn parse_one_output(lex: &mut Lexer) -> Output {
             let n = lex.number();
             lex.consume_punct(')');
             Output::ZeroBytes(n as usize)
+        }
+        "bytes" => {
+            lex.consume_punct('(');
+            let n = lex.number();
+            lex.consume_punct(')');
+            Output::HandlerBytes(n as usize)
         }
         other => parse_prim(other).map(Output::Prim).unwrap_or_else(|| lex.fail(&format!("unknown return type `{}`", other))),
     }
@@ -481,6 +488,14 @@ fn emit_command(out: &mut String, module: &str, cmd: &Command) {
                 out.push_str(&post_write_block);
                 out.push_str(&format!("            Some(crate::kernel::svc::build_ipc_response(ctx, 0, &[0u8; {}], &[]))\n", n));
             }
+            Output::HandlerBytes(n) => {
+                out.push_str(&format!("            let __ret: Vec<u8> = {};\n", call));
+                out.push_str(&post_write_block);
+                out.push_str(&format!("            let mut __resp = [0u8; {}];\n", n));
+                out.push_str(&format!("            let __n = __ret.len().min({});\n", n));
+                out.push_str("            __resp[..__n].copy_from_slice(&__ret[..__n]);\n");
+                out.push_str("            Some(crate::kernel::svc::build_ipc_response(ctx, 0, &__resp, &[]))\n");
+            }
         }
         out.push_str("        }\n");
         return;
@@ -503,7 +518,7 @@ fn emit_command(out: &mut String, module: &str, cmd: &Command) {
             Output::OutHandle => {
                 out.push_str(&format!("            __handles.push(__tup.{});\n", i));
             }
-            Output::ZeroBytes(_) | Output::Subsession(_) => {
+            Output::ZeroBytes(_) | Output::HandlerBytes(_) | Output::Subsession(_) => {
                 panic!("tuple returns may only contain primitives and out_handle");
             }
         }

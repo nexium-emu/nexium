@@ -65,7 +65,7 @@ pub fn get_accumulated_suspended_tick_value(_kernel: &mut Kernel, _ctx: &mut Ipc
 
 pub fn get_accumulated_suspended_tick_changed_event(kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u32 {
     let h = kernel.handles.create_handle(HandleType::Event);
-    kernel.event_signals.insert(h, false);
+    kernel.event_signals.insert(h, true);
     h
 }
 
