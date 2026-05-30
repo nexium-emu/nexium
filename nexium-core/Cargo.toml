@@ -8,9 +8,14 @@ license.workspace = true
 [dependencies]
 nexium-common.workspace = true
 nexium-memory.workspace = true
-nexium-cpu.workspace = true
+nexium-cpu = { workspace = true, default-features = false }
 nexium-loader.workspace = true
 nexium-shader.workspace = true
 nexium-ipc.workspace = true
 nexium-nvdrv.workspace = true
-nexium-kernel.workspace = true
+nexium-kernel = { workspace = true, default-features = false }
+
+[features]
+default = ["backend-dynarmic"]
+backend-dynarmic = ["nexium-cpu/backend-dynarmic", "nexium-kernel/backend-dynarmic"]
+backend-rustarmic = ["nexium-cpu/backend-rustarmic", "nexium-kernel/backend-rustarmic"]

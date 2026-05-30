@@ -51,6 +51,20 @@ pub struct Kernel {
     pub applet_message_event: Option<u32>,
     pub vsync_handles: HashSet<u32>,
     pub last_vsync: std::time::Instant,
+    /// Last time we refreshed the HID shmem from `hid_input`. Refreshed on
+    /// both vsync and applet-event polls (the latter being how SDL2-using
+    /// games drive their input loop, since SDL_PollEvent pumps applet
+    /// events without ever waiting on a vsync handle). The timestamp
+    /// throttles those refreshes to ~60 Hz so we don't spam the shmem on
+    /// the kHz-rate timeout=0 polls. (RustSwitch commit 49ca133)
+    pub last_hid_tick: std::time::Instant,
+    /// Per-(svc_imm, calling_lr) streak detector across all SVCs so a guest
+    /// spinning on any particular call site shows up. Fires the first time
+    /// we cross each power-of-two threshold so logs grow O(log N).
+    pub last_generic_svc_imm: u16,
+    pub last_generic_svc_lr: u64,
+    pub generic_svc_streak: u64,
+    pub next_generic_svc_streak_log: u64,
     pub applet_focus_state: u8,
     pub applet_operation_mode: u8,
     pub applet_performance_mode: u32,
@@ -138,6 +152,11 @@ impl Kernel {
             applet_message_event: None,
             vsync_handles: HashSet::new(),
             last_vsync: std::time::Instant::now(),
+            last_hid_tick: std::time::Instant::now(),
+            last_generic_svc_imm: 0xFFFF,
+            last_generic_svc_lr: 0,
+            generic_svc_streak: 0,
+            next_generic_svc_streak_log: 64,
             applet_focus_state: 1,
             applet_operation_mode: 0,
             applet_performance_mode: 0,
@@ -185,8 +204,14 @@ impl Kernel {
         }
     }
 
+
     pub fn init_cpu(&mut self) -> Result<(), String> {
+        #[cfg(feature = "backend-rustarmic")]
+        let mut cpu = Cpu::new_rustarmic()?;
+        #[cfg(all(feature = "backend-dynarmic", not(feature = "backend-rustarmic")))]
         let mut cpu = Cpu::new_dynarmic()?;
+        #[cfg(not(any(feature = "backend-dynarmic", feature = "backend-rustarmic")))]
+        compile_error!("nexium-kernel: enable exactly one of backend-dynarmic / backend-rustarmic");
         for region in self.address_space.host_regions() {
             unsafe {
                 cpu.map_host(region.base, region.size, region.perm, region.host_ptr)

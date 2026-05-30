@@ -23,7 +23,7 @@ path = "src/debug_continue.rs"
 
 [dependencies]
 nexium-common.workspace = true
-nexium-core.workspace = true
+nexium-core = { workspace = true, default-features = false }
 nexium-gpu.workspace = true
 
 eframe = "0.29"
@@ -42,4 +42,9 @@ env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "5"
+
+[features]
+default = ["backend-dynarmic"]
+backend-dynarmic = ["nexium-core/backend-dynarmic"]
+backend-rustarmic = ["nexium-core/backend-rustarmic"]
 

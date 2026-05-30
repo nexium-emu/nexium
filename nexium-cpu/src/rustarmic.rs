@@ -91,6 +91,7 @@ impl RustarmicCpu {
 
     pub unsafe fn map_host(&mut self, va: u64, len: u64, perm: Perm, ptr: *mut u8) -> Result<(), String> {
         let end = va.checked_add(len).ok_or_else(|| format!("map_host overflow va={:#x} len={:#x}", va, len))?;
+        log::debug!("rustarmic map_host va={:#x}..{:#x} perm={} ptr={:p}", va, end, perm, ptr);
         if perm.contains(Perm::X) {
             self.jit.invalidate_range(va, len);
         }
@@ -149,10 +150,15 @@ impl RustarmicCpu {
         *self.state.last_event.lock().unwrap() = None;
         self.state.halt.store(false, Ordering::Relaxed);
 
-        let regions = self.state.regions.read().clone();
+        let regions: Vec<Region> = self.state.regions.read().iter().copied().collect();
+        eprintln!("[rustarmic] run pc={:#x} regions={}", self.state.ctx.pc, regions.len());
+        for r in &regions {
+            eprintln!("  region {:#x}..{:#x} perm={} x={}", r.va, r.end, r.perm, r.perm.contains(Perm::X));
+        }
         let mut mem = RegionMemory { regions };
 
         let exit = self.jit.run(&mut self.state.ctx, &mut mem);
+        eprintln!("[rustarmic] exit = {:?}", exit);
 
         self.state.peek_pc.store(self.state.ctx.pc,    Ordering::Relaxed);
         self.state.peek_lr.store(self.state.ctx.x[30], Ordering::Relaxed);
@@ -193,6 +199,10 @@ impl Memory for RegionMemory {
                     return Some(u32::from_le_bytes(buf));
                 }
             }
+        }
+        log::warn!("rustarmic fetch_inst miss at {:#x} ({} regions)", addr, self.regions.len());
+        for r in &self.regions {
+            log::warn!("  region {:#x}..{:#x} perm={} x={}", r.va, r.end, r.perm, r.perm.contains(Perm::X));
         }
         None
     }
