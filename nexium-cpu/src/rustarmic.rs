@@ -72,18 +72,22 @@ impl RustarmicCpu {
     }
 
     pub fn halt_handle(&self) -> HaltHandle {
-        let halt_addr = &self.state.halt    as *const AtomicBool as usize;
-        let pc_addr   = &self.state.peek_pc as *const AtomicU64  as usize;
-        let lr_addr   = &self.state.peek_lr as *const AtomicU64  as usize;
-        let sp_addr   = &self.state.peek_sp as *const AtomicU64  as usize;
+        let halt_addr = &self.state.halt as *const AtomicBool as usize;
+        let ctx_addr  = &self.state.ctx  as *const CpuContext as usize;
         HaltHandle {
             inner: Arc::new(move || {
                 unsafe { (*(halt_addr as *const AtomicBool)).store(true, Ordering::Relaxed); }
             }),
+            // Block-boundary peek: rustarmic's dispatcher writes ctx.pc after
+            // every block exit, so reading directly here gives the last-block
+            // PC rather than only the last-run() PC (which is what the prior
+            // `peek_pc` cache served). The watchdog in nexium-gui samples this
+            // mid-execution; stale snapshots produced false hang verdicts.
             peek: Arc::new(move || unsafe {
-                let p = (*(pc_addr as *const AtomicU64)).load(Ordering::Relaxed);
-                let l = (*(lr_addr as *const AtomicU64)).load(Ordering::Relaxed);
-                let s = (*(sp_addr as *const AtomicU64)).load(Ordering::Relaxed);
+                let ctx = ctx_addr as *const CpuContext;
+                let p = std::ptr::read_volatile(&(*ctx).pc);
+                let l = std::ptr::read_volatile(&(*ctx).x[30]);
+                let s = std::ptr::read_volatile(&(*ctx).sp);
                 (p, l, s)
             }),
         }
@@ -103,6 +107,9 @@ impl RustarmicCpu {
         let regions = self.state.regions.read();
         for r in regions.iter() {
             if va >= r.va && va.saturating_add(bytes.len() as u64) <= r.end {
+                if !r.perm.contains(Perm::W) {
+                    return Err(format!("write_bytes: read-only region va={:#x} perm={}", va, r.perm));
+                }
                 unsafe {
                     let dst = r.host_ptr.add((va - r.va) as usize);
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
@@ -147,7 +154,12 @@ impl RustarmicCpu {
     pub fn get_tpidrro_el0(&self) -> u64        { self.state.ctx.tpidrro_el0 }
 
     pub fn run(&mut self, _max_insn: u64) -> CpuEvent {
-        *self.state.last_event.lock().unwrap() = None;
+        // Consume any event posted between runs (inject_svc, NULL_SKIP_MAX
+        // overflow). Clearing unconditionally — as the prior code did —
+        // dropped injected SVCs and the null-deref escalation on the floor.
+        if let Some(ev) = self.state.last_event.lock().unwrap().take() {
+            return ev;
+        }
         self.state.halt.store(false, Ordering::Relaxed);
 
         let regions: Vec<Region> = self.state.regions.read().iter().copied().collect();
@@ -250,14 +262,23 @@ unsafe extern "C" fn mem_write_hook(ctx_ptr: *mut CpuContext, addr: u64, size: u
     handle_unmapped(state, ctx_ptr, addr, size, true, value);
 }
 
-fn handle_unmapped(state: &State, _ctx_ptr: *mut CpuContext, addr: u64, size: u8, is_write: bool, value: u64) {
+fn handle_unmapped(state: &State, ctx_ptr: *mut CpuContext, addr: u64, size: u8, is_write: bool, value: u64) {
     let is_null_zone = addr < 0x1000;
+    let mut regs = [0u64; 31];
+    let (live_pc, live_lr, live_sp);
+    unsafe {
+        let ctx = &*ctx_ptr;
+        for i in 0..31 { regs[i] = ctx.x[i]; }
+        live_pc = ctx.pc;
+        live_lr = ctx.x[30];
+        live_sp = ctx.sp;
+    }
     let snap = FaultSnapshot {
-        pc: state.peek_pc.load(Ordering::Relaxed),
-        lr: state.peek_lr.load(Ordering::Relaxed),
-        sp: state.peek_sp.load(Ordering::Relaxed),
+        pc: live_pc,
+        lr: live_lr,
+        sp: live_sp,
         addr, size: size as u32, is_write, value,
-        regs: [0; 31],
+        regs,
     };
     *state.last_fault.lock().unwrap() = Some(snap);
     if is_null_zone {
