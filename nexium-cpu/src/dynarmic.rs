@@ -2,39 +2,13 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use nexium_memory::Perm;
 
+use crate::{CpuEvent, FaultSnapshot, HaltHandle};
+
 pub(crate) struct SharedDynarmic {
     pub(crate) emu: dynarmic_sys::Dynarmic<'static, ()>,
 }
 unsafe impl Send for SharedDynarmic {}
 unsafe impl Sync for SharedDynarmic {}
-
-#[derive(Clone)]
-pub struct HaltHandle {
-    inner: Arc<dyn Fn() + Send + Sync>,
-    peek: Arc<dyn Fn() -> (u64, u64, u64) + Send + Sync>,
-}
-
-impl HaltHandle {
-    pub fn halt(&self) {
-        (self.inner)();
-    }
-
-    pub fn peek_pc_lr_sp(&self) -> (u64, u64, u64) {
-        (self.peek)()
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct FaultSnapshot {
-    pub pc: u64,
-    pub lr: u64,
-    pub sp: u64,
-    pub addr: u64,
-    pub size: u32,
-    pub is_write: bool,
-    pub value: u64,
-    pub regs: [u64; 31],
-}
 
 const NULL_SKIP_MAX: u32 = 64;
 
@@ -241,13 +215,4 @@ fn perm_to_dyn(p: Perm) -> u32 {
     if p.contains(Perm::W) { out |= 2; }
     if p.contains(Perm::X) { out |= 4; }
     out
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum CpuEvent {
-    Running,
-    Stalled,
-    Interrupted,
-    Svc(u16),
-    Exception(u32),
 }

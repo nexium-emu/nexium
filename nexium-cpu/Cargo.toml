@@ -10,4 +10,10 @@ nexium-memory.workspace = true
 
 log.workspace = true
 parking_lot.workspace = true
-dynarmic-sys-mythrax.workspace = true
+dynarmic-sys-mythrax = { workspace = true, optional = true }
+rustarmic = { path = "../../rustarmic", optional = true }
+
+[features]
+default = ["backend-dynarmic"]
+backend-dynarmic = ["dep:dynarmic-sys-mythrax"]
+backend-rustarmic = ["dep:rustarmic"]
