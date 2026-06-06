@@ -159,13 +159,12 @@ impl EmulationHandle {
             let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu, 0);
             use nexium_kernel::kernel::cpu_local::{cpu_mut, cpu_ref};
 
-            // Host core 1 — EXPERIMENTAL, opt-in via NEXIUM_MULTICORE=1. Runs ready
-            // guest threads on its own Cpu in parallel with core 0. The architecture
-            // works (parallel scheduling, no deadlock) but a concurrent context-switch
-            // race on cross-core migration can freeze the guest, so single-core is the
-            // default until the scheduler is made fully race-free.
+            // Host core 1: runs ready guest threads on its own Cpu in parallel with
+            // core 0. Sticky thread affinity (threads pin to their core on first run)
+            // keeps each thread's context + memory mappings coherent on one core, so
+            // there's no cross-core migration race. Set NEXIUM_SINGLECORE=1 to disable.
             let core1_stop = Arc::new(AtomicBool::new(false));
-            let core1_handle = if std::env::var("NEXIUM_MULTICORE").is_ok() {
+            let core1_handle = if std::env::var("NEXIUM_SINGLECORE").is_err() {
                 let kernel_c1 = Arc::clone(&boot_ctx.kernel);
                 let stop_c1 = Arc::clone(&core1_stop);
                 let backend_c1 = cpu_backend;

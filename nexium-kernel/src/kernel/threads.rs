@@ -71,7 +71,7 @@ impl Threads {
                 tls_va: main_tls_va,
                 stack_top: main_stack_top,
                 priority: 0x2C,
-                core: -2,
+                core: 0, // main thread pinned to core 0 (owns the boot/GPU mappings)
             },
         );
         Self {
@@ -303,7 +303,22 @@ impl Threads {
     }
 
     pub fn pick_next(&mut self) -> Option<u32> {
-        self.ready.pop_front()
+        // Sticky affinity: a core only picks ready threads pinned to it, or
+        // unassigned (core < 0) threads which it then claims. Once a thread runs
+        // on a core it never migrates, so its context and dynamic memory
+        // mappings stay coherent on that core's Cpu (no cross-core ctx race).
+        let core = current_core() as i32;
+        let pos = self
+            .ready
+            .iter()
+            .position(|h| self.threads.get(h).map_or(false, |t| t.core == core || t.core < 0))?;
+        let handle = self.ready.remove(pos)?;
+        if let Some(t) = self.threads.get_mut(&handle) {
+            if t.core < 0 {
+                t.core = core;
+            }
+        }
+        Some(handle)
     }
 
     pub fn yield_current(&mut self, cpu: &Cpu) {
