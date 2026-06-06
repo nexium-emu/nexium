@@ -37,6 +37,6 @@ sdl2.workspace = true
 directories.workspace = true
 
 [features]
-default = ["backend-dynarmic"]
+default = ["backend-dynarmic", "backend-rustarmic"]
 backend-dynarmic = ["nexium-cpu/backend-dynarmic"]
 backend-rustarmic = ["nexium-cpu/backend-rustarmic"]

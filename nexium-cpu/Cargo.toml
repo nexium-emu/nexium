@@ -14,6 +14,6 @@ dynarmic-sys-mythrax = { workspace = true, optional = true }
 rustarmic = { path = "../../rustarmic", optional = true }
 
 [features]
-default = ["backend-dynarmic"]
+default = ["backend-dynarmic", "backend-rustarmic"]
 backend-dynarmic = ["dep:dynarmic-sys-mythrax"]
 backend-rustarmic = ["dep:rustarmic"]

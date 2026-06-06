@@ -67,6 +67,7 @@ rfd = "0.15"
 
 cpal = "0.15"
 gilrs = "0.10"
+ringbuf = "0.4"
 
 serde = { version = "1", features = ["derive"] }
 directories = "5"

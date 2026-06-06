@@ -16,6 +16,6 @@ nexium-nvdrv.workspace = true
 nexium-kernel = { workspace = true, default-features = false }
 
 [features]
-default = ["backend-dynarmic"]
+default = ["backend-dynarmic", "backend-rustarmic"]
 backend-dynarmic = ["nexium-cpu/backend-dynarmic", "nexium-kernel/backend-dynarmic"]
 backend-rustarmic = ["nexium-cpu/backend-rustarmic", "nexium-kernel/backend-rustarmic"]
