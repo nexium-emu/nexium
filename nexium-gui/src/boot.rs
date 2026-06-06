@@ -156,7 +156,7 @@ impl EmulationHandle {
             cpu.set_continue_on_null(true);
             log::info!("dynarmic: continue_on_null=ON (will absorb null-zone reads as 0 to keep going)");
             let halt = Some(cpu.halt_handle());
-            let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu);
+            let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu, 0);
             use nexium_kernel::kernel::cpu_local::{cpu_mut, cpu_ref};
             let last_svc_ms = Arc::new(AtomicU64::new(0));
             let watchdog_stop = Arc::new(AtomicBool::new(false));

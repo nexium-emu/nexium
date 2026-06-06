@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = BootConfig::new(&nro_path);
     let mut boot_ctx = BootContext::new(config)?;
     let mut cpu = boot_ctx.cpu.take().expect("BootContext CPU not initialized");
-    let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu);
+    let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu, 0);
     use nexium_kernel::kernel::cpu_local::{cpu_mut, cpu_ref};
 
     writeln!(log, "Boot context initialized")?;

@@ -1,6 +1,11 @@
 use nexium_cpu::Cpu;
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
+use crate::kernel::cpu_local::current_core;
+
+/// Number of guest CPU cores the scheduler tracks. Host threads drive cores
+/// 0..N at runtime (just core 0 on the single-thread path).
+pub const NUM_CORES: usize = 4;
 
 #[derive(Copy, Clone, Debug)]
 pub struct ThreadCtx {
@@ -37,11 +42,15 @@ pub struct Thread {
     pub tls_va: u64,
     pub stack_top: u64,
     pub priority: i32,
+    /// Ideal-core affinity from svcCreateThread (-2 = "any/default"). The shared
+    /// ready queue lets any host core pick it up; honored once affinity matters.
+    pub core: i32,
 }
 
 pub struct Threads {
     pub threads: HashMap<u32, Thread>,
-    pub current: Option<u32>,
+    /// Currently-running guest thread per host core (indexed by current_core()).
+    pub current: [Option<u32>; NUM_CORES],
     pub ready: VecDeque<u32>,
     pub next_tid: u64,
     pub next_tls_va: u64,
@@ -62,11 +71,16 @@ impl Threads {
                 tls_va: main_tls_va,
                 stack_top: main_stack_top,
                 priority: 0x2C,
+                core: -2,
             },
         );
         Self {
             threads,
-            current: Some(main_handle),
+            current: {
+                let mut c = [None; NUM_CORES];
+                c[0] = Some(main_handle);
+                c
+            },
             ready: VecDeque::new(),
             next_tid: 2,
             next_tls_va: tls_pool_base,
@@ -103,12 +117,13 @@ impl Threads {
                 tls_va,
                 stack_top,
                 priority: 0x2C,
+                core: -2,
             },
         );
     }
 
     pub fn current_handle(&self) -> Option<u32> {
-        self.current
+        self.current[current_core()]
     }
 
     pub fn transition_state(&mut self, handle: u32, new_state: ThreadState) {
@@ -123,7 +138,7 @@ impl Threads {
     }
 
     pub fn save_current_ctx(&mut self, cpu: &Cpu) {
-        let Some(h) = self.current else { return };
+        let Some(h) = self.current[current_core()] else { return };
         let Some(t) = self.threads.get_mut(&h) else { return };
         for i in 0..31 {
             t.ctx.x[i] = cpu.get_register(i as u32);
@@ -292,14 +307,14 @@ impl Threads {
     }
 
     pub fn yield_current(&mut self, cpu: &Cpu) {
-        if self.current.is_some() {
+        if self.current[current_core()].is_some() {
             self.save_current_ctx(cpu);
-            self.current = None;
+            self.current[current_core()] = None;
         }
     }
 
     pub fn yield_with_state(&mut self, cpu: &Cpu, new_state: ThreadState) -> Option<u32> {
-        let h = self.current?;
+        let h = self.current[current_core()]?;
         self.save_current_ctx(cpu);
         let became_ready = matches!(new_state, ThreadState::Ready);
         if let Some(t) = self.threads.get_mut(&h) {
@@ -308,7 +323,7 @@ impl Threads {
         if became_ready && !self.ready.contains(&h) {
             self.ready.push_back(h);
         }
-        self.current = None;
+        self.current[current_core()] = None;
         self.last_switch = Instant::now();
         Some(h)
     }
@@ -319,7 +334,7 @@ impl Threads {
             t.state = ThreadState::Running;
             log::info!("[sched] now running handle={:#x} pc={:#x} sp={:#x}", handle, t.ctx.pc, t.ctx.sp);
         }
-        self.current = Some(handle);
+        self.current[current_core()] = Some(handle);
         self.last_switch = Instant::now();
     }
 
@@ -341,13 +356,13 @@ impl Threads {
     }
 
     pub fn ensure_thread_loaded(&mut self, cpu: &mut Cpu) -> Option<u32> {
-        if let Some(h) = self.current {
+        if let Some(h) = self.current[current_core()] {
             if let Some(t) = self.threads.get(&h) {
                 if matches!(t.state, ThreadState::Running) {
                     return Some(h);
                 }
             }
-            self.current = None;
+            self.current[current_core()] = None;
         }
         self.wake_due_sleepers(Instant::now());
         let next = self.pick_next()?;

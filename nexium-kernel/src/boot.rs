@@ -202,7 +202,7 @@ impl BootContext {
         let mut svc_count = 0u32;
 
         let mut cpu = self.cpu.take().ok_or_else(|| "CPU not initialized".to_string())?;
-        let _cpu_guard = crate::kernel::cpu_local::set_current_cpu(&mut cpu);
+        let _cpu_guard = crate::kernel::cpu_local::set_current_cpu(&mut cpu, 0);
         use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
 
         loop {

@@ -3,6 +3,7 @@ use std::cell::Cell;
 
 thread_local! {
     static CURRENT_CPU: Cell<*mut Cpu> = const { Cell::new(std::ptr::null_mut()) };
+    static CURRENT_CORE: Cell<usize> = const { Cell::new(0) };
 }
 
 #[must_use]
@@ -11,12 +12,19 @@ pub struct CpuGuard(());
 impl Drop for CpuGuard {
     fn drop(&mut self) {
         CURRENT_CPU.with(|c| c.set(std::ptr::null_mut()));
+        CURRENT_CORE.with(|c| c.set(0));
     }
 }
 
-pub fn set_current_cpu(cpu: &mut Cpu) -> CpuGuard {
+pub fn set_current_cpu(cpu: &mut Cpu, core: usize) -> CpuGuard {
     CURRENT_CPU.with(|c| c.set(cpu as *mut Cpu));
+    CURRENT_CORE.with(|c| c.set(core));
     CpuGuard(())
+}
+
+/// The guest core id this host thread executes as (0 on the single-thread path).
+pub fn current_core() -> usize {
+    CURRENT_CORE.with(|c| c.get())
 }
 
 #[allow(clippy::mut_from_ref)]
