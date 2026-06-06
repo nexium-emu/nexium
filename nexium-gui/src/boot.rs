@@ -199,6 +199,7 @@ impl EmulationHandle {
                                 let mut k = kernel_c1.lock();
                                 k.threads.save_current_ctx(cpu_ref().unwrap());
                                 let result = k.dispatch_svc(imm);
+                                k.tick_audio_renderers();
                                 drop(k);
                                 cpu_mut().unwrap().set_register(0, result as u64);
                             }
