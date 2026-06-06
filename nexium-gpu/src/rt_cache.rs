@@ -19,6 +19,7 @@ pub struct GpuImage {
 
 pub struct RtCache {
     cache: HashMap<RtKey, GpuImage>,
+    depth_cache: HashMap<RtKey, GpuImage>,
     mem_properties: Option<vk::PhysicalDeviceMemoryProperties>,
 }
 
@@ -26,6 +27,7 @@ impl RtCache {
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            depth_cache: HashMap::new(),
             mem_properties: None,
         }
     }
@@ -46,8 +48,45 @@ impl RtCache {
         Ok(self.cache.get_mut(&key).unwrap())
     }
 
+    pub fn get_or_create_depth(
+        &mut self,
+        key: RtKey,
+        device: &ash::Device,
+    ) -> Result<&mut GpuImage, String> {
+        if !self.depth_cache.contains_key(&key) {
+            let image = self.create_image_inner(
+                device,
+                key,
+                vk::Format::D32_SFLOAT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
+                vk::ImageAspectFlags::DEPTH,
+            )?;
+            self.depth_cache.insert(key, image);
+        }
+        Ok(self.depth_cache.get_mut(&key).unwrap())
+    }
+
     fn create_image(&self, device: &ash::Device, key: RtKey) -> Result<GpuImage, String> {
-        let format = vk::Format::R8G8B8A8_UNORM;
+        self.create_image_inner(
+            device,
+            key,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageAspectFlags::COLOR,
+        )
+    }
+
+    fn create_image_inner(
+        &self,
+        device: &ash::Device,
+        key: RtKey,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        aspect: vk::ImageAspectFlags,
+    ) -> Result<GpuImage, String> {
         let extent = vk::Extent2D { width: key.width, height: key.height };
 
         let image_info = vk::ImageCreateInfo {
@@ -59,10 +98,7 @@ impl RtCache {
             array_layers: 1,
             samples: vk::SampleCountFlags::TYPE_1,
             tiling: vk::ImageTiling::OPTIMAL,
-            usage: vk::ImageUsageFlags::COLOR_ATTACHMENT
-                | vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::TRANSFER_DST
-                | vk::ImageUsageFlags::SAMPLED,
+            usage,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             initial_layout: vk::ImageLayout::UNDEFINED,
             p_next: std::ptr::null(),
@@ -108,7 +144,7 @@ impl RtCache {
             view_type: vk::ImageViewType::TYPE_2D,
             format,
             subresource_range: vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask: aspect,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
@@ -135,7 +171,7 @@ impl RtCache {
     }
 
     pub fn clear(&mut self, device: &ash::Device) {
-        for (_, img) in self.cache.drain() {
+        for (_, img) in self.cache.drain().chain(self.depth_cache.drain()) {
             unsafe {
                 device.destroy_image_view(img.view, None);
                 device.destroy_image(img.image, None);

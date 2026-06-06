@@ -10,6 +10,10 @@ pub struct PipelineKey {
     pub vs_cbuf_mask: u32,
     pub fs_cbuf_mask: u32,
     pub vertex_layout_hash: u64,
+    pub blend_signature: u32,
+    pub raster_state_packed: u32,
+    pub depth_state_packed: u32,
+    pub poly_offset_packed: u64,
 }
 
 pub struct PipelineCache {
