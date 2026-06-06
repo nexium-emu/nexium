@@ -185,7 +185,12 @@ impl DynarmicCpu {
         *self.last_event.lock().unwrap() = None;
         let pc = self.get_pc();
         log::trace!("dynarmic run: PC={:#x}", pc);
-        let _ = self.emu.emu.emu_start(pc, u64::MAX - 16);
+        let until = if _max_insn > 0 {
+            pc.saturating_add(_max_insn.saturating_mul(4))
+        } else {
+            u64::MAX - 16
+        };
+        let _ = self.emu.emu.emu_start(pc, until);
         let event = self.last_event.lock().unwrap().take();
         match event {
             Some(CpuEvent::Svc(imm)) => {
@@ -207,6 +212,8 @@ impl DynarmicCpu {
     pub fn inject_svc(&mut self, imm: u16) {
         *self.last_event.lock().unwrap() = Some(CpuEvent::Svc(imm));
     }
+
+    pub fn invalidate_range(&mut self, _va: u64, _len: u64) {}
 }
 
 fn perm_to_dyn(p: Perm) -> u32 {

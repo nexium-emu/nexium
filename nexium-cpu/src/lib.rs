@@ -42,6 +42,46 @@ pub enum CpuEvent {
     Exception(u32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CpuBackendKind {
+    Dynarmic,
+    Rustarmic,
+}
+
+impl Default for CpuBackendKind {
+    fn default() -> Self {
+        #[cfg(feature = "backend-dynarmic")]
+        { return CpuBackendKind::Dynarmic; }
+        #[cfg(all(not(feature = "backend-dynarmic"), feature = "backend-rustarmic"))]
+        { return CpuBackendKind::Rustarmic; }
+        #[cfg(not(any(feature = "backend-dynarmic", feature = "backend-rustarmic")))]
+        { CpuBackendKind::Dynarmic }
+    }
+}
+
+impl CpuBackendKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CpuBackendKind::Dynarmic  => "Dynarmic (C++)",
+            CpuBackendKind::Rustarmic => "Rustarmic (Rust JIT)",
+        }
+    }
+
+    pub fn available() -> Vec<CpuBackendKind> {
+        let mut v = Vec::new();
+        #[cfg(feature = "backend-dynarmic")]  v.push(CpuBackendKind::Dynarmic);
+        #[cfg(feature = "backend-rustarmic")] v.push(CpuBackendKind::Rustarmic);
+        v
+    }
+
+    pub fn is_compiled_in(&self) -> bool {
+        match self {
+            CpuBackendKind::Dynarmic  => cfg!(feature = "backend-dynarmic"),
+            CpuBackendKind::Rustarmic => cfg!(feature = "backend-rustarmic"),
+        }
+    }
+}
+
 pub enum Cpu {
     #[cfg(feature = "backend-dynarmic")]
     Dynarmic(DynarmicCpu),
@@ -69,6 +109,23 @@ impl Cpu {
     #[cfg(feature = "backend-rustarmic")]
     pub fn new_rustarmic() -> Result<Self, String> {
         RustarmicCpu::new().map(Cpu::Rustarmic)
+    }
+
+    pub fn new(backend: CpuBackendKind) -> Result<Self, String> {
+        match backend {
+            CpuBackendKind::Dynarmic => {
+                #[cfg(feature = "backend-dynarmic")]
+                { return Self::new_dynarmic(); }
+                #[cfg(not(feature = "backend-dynarmic"))]
+                { return Err("Dynarmic backend not compiled in (rebuild with --features backend-dynarmic)".into()); }
+            }
+            CpuBackendKind::Rustarmic => {
+                #[cfg(feature = "backend-rustarmic")]
+                { return Self::new_rustarmic(); }
+                #[cfg(not(feature = "backend-rustarmic"))]
+                { return Err("Rustarmic backend not compiled in (rebuild with --features backend-rustarmic)".into()); }
+            }
+        }
     }
 
     pub fn halt_handle(&self) -> HaltHandle {
@@ -108,4 +165,8 @@ impl Cpu {
     pub fn take_fault(&self) -> Option<FaultSnapshot> { dispatch!(self, cpu => cpu.take_fault()) }
     pub fn set_continue_on_null(&self, enable: bool)  { dispatch!(self, cpu => cpu.set_continue_on_null(enable)) }
     pub fn null_skip_count(&self) -> u32              { dispatch!(self, cpu => cpu.null_skip_count()) }
+
+    pub fn invalidate_range(&mut self, va: u64, len: u64) {
+        dispatch!(self, cpu => cpu.invalidate_range(va, len))
+    }
 }

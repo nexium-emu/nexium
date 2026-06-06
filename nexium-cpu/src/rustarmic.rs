@@ -29,6 +29,7 @@ struct State {
     peek_pc: AtomicU64,
     peek_lr: AtomicU64,
     peek_sp: AtomicU64,
+    pending_invalidations: Mutex<Vec<(u64, u64)>>,
 }
 
 pub struct RustarmicCpu {
@@ -52,6 +53,7 @@ impl RustarmicCpu {
             peek_pc: AtomicU64::new(0),
             peek_lr: AtomicU64::new(0),
             peek_sp: AtomicU64::new(0),
+            pending_invalidations: Mutex::new(Vec::new()),
         });
         state.ctx.mem_read  = mem_read_hook;
         state.ctx.mem_write = mem_write_hook;
@@ -114,10 +116,24 @@ impl RustarmicCpu {
                     let dst = r.host_ptr.add((va - r.va) as usize);
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
                 }
+                if r.perm.contains(Perm::X) {
+                    self.state.pending_invalidations
+                        .lock().unwrap()
+                        .push((va, bytes.len() as u64));
+                }
                 return Ok(());
             }
         }
         Err(format!("write_bytes: unmapped va={:#x}", va))
+    }
+
+    pub fn invalidate_range(&mut self, va: u64, len: u64) {
+        let queued: Vec<(u64, u64)> =
+            std::mem::take(&mut *self.state.pending_invalidations.lock().unwrap());
+        for (qva, qlen) in queued {
+            self.jit.invalidate_range(qva, qlen);
+        }
+        self.jit.invalidate_range(va, len);
     }
 
     pub fn read_bytes(&self, va: u64, buf: &mut [u8]) -> Result<(), String> {
@@ -154,6 +170,15 @@ impl RustarmicCpu {
     pub fn get_tpidrro_el0(&self) -> u64        { self.state.ctx.tpidrro_el0 }
 
     pub fn run(&mut self, _max_insn: u64) -> CpuEvent {
+        let queued: Vec<(u64, u64)> =
+            std::mem::take(&mut *self.state.pending_invalidations.lock().unwrap());
+        if !queued.is_empty() {
+            log::debug!("rustarmic: applying {} queued SMC invalidations", queued.len());
+            for (va, len) in queued {
+                self.jit.invalidate_range(va, len);
+            }
+        }
+
         // Consume any event posted between runs (inject_svc, NULL_SKIP_MAX
         // overflow). Clearing unconditionally — as the prior code did —
         // dropped injected SVCs and the null-deref escalation on the floor.
@@ -183,7 +208,15 @@ impl RustarmicCpu {
             Ok(ExitReason::MemoryFault(_)) => CpuEvent::Exception(0x0E),
             Ok(ExitReason::Stopped)        => CpuEvent::Interrupted,
             Err(e) => {
-                log::warn!("rustarmic Jit::run error: {:?}", e);
+                match &e {
+                    rustarmic::Error::Unsupported { pc, opcode } => {
+                        log::warn!("rustarmic Jit::run unsupported: pc={:#x} opcode={:#010x}", pc, opcode);
+                    }
+                    rustarmic::Error::Decode { pc, opcode } => {
+                        log::warn!("rustarmic Jit::run decode-fail: pc={:#x} opcode={:#010x}", pc, opcode);
+                    }
+                    other => log::warn!("rustarmic Jit::run error: {:?}", other),
+                }
                 CpuEvent::Stalled
             }
         }
@@ -256,6 +289,12 @@ unsafe extern "C" fn mem_write_hook(ctx_ptr: *mut CpuContext, addr: u64, size: u
                 let host = r.host_ptr.add((addr - r.va) as usize);
                 std::ptr::copy_nonoverlapping(buf.as_ptr(), host, size as usize);
             }
+            if r.perm.contains(Perm::X) {
+                state.pending_invalidations
+                    .lock().unwrap()
+                    .push((addr, size as u64));
+                unsafe { (*ctx_ptr).should_halt = 1; }
+            }
             return;
         }
     }
@@ -290,6 +329,41 @@ fn handle_unmapped(state: &State, ctx_ptr: *mut CpuContext, addr: u64, size: u8,
             }
         }
     } else {
-        log::warn!("rustarmic: unmapped {:#x} size={} write={}", addr, size, is_write);
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        const RUNAWAY_THRESHOLD: u64 = 1_000_000;
+
+        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            log::warn!("rustarmic: unmapped {:#x} size={} write={}", addr, size, is_write);
+        } else if n & 0xFFFF == 0 {
+            log::warn!("rustarmic: unmapped {:#x} size={} write={} (total {} so far — likely runaway loop)",
+                addr, size, is_write, n + 1);
+        }
+        if n == RUNAWAY_THRESHOLD {
+            let (pc, sp, regs) = unsafe {
+                let ctx = &*ctx_ptr;
+                let mut r = [0u64; 31];
+                for i in 0..31 { r[i] = ctx.x[i]; }
+                (ctx.pc, ctx.sp, r)
+            };
+            log::error!(
+                "rustarmic: runaway-loop threshold ({} unmapped accesses) reached at addr={:#x}",
+                RUNAWAY_THRESHOLD, addr
+            );
+            log::error!("  PC = {:#018x}  SP = {:#018x}  LR(x30) = {:#018x}", pc, sp, regs[30]);
+            log::error!("  x0..x7   {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x}",
+                regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7]);
+            log::error!("  x8..x15  {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x}",
+                regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15]);
+            log::error!("  x16..x23 {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x}",
+                regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23]);
+            log::error!("  x24..x30 {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x} {:#018x}",
+                regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30]);
+            log::error!("  → halting JIT cooperatively");
+
+            unsafe { (*ctx_ptr).should_halt = 1; }
+            *state.last_event.lock().unwrap() = Some(CpuEvent::Exception(0x0E));
+        }
     }
 }
