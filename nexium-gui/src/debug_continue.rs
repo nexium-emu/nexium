@@ -38,15 +38,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut break_count = 0u32;
 
     loop {
+        let mut guard = boot_ctx.kernel.lock();
         if let Some(cpu) = cpu_mut() {
             let pc_before = cpu.get_pc();
             let event = cpu.run(100_000);
             cycle_count += 100_000;
-            boot_ctx.kernel.cycle_count += 100_000;
+            guard.cycle_count += 100_000;
 
-            if boot_ctx.kernel.cycle_count >= boot_ctx.kernel.next_vsync_cycle {
-                boot_ctx.kernel.next_vsync_cycle += 16_666_667;
-                boot_ctx.kernel.display_ready = true;
+            if guard.cycle_count >= guard.next_vsync_cycle {
+                guard.next_vsync_cycle += 16_666_667;
+                guard.display_ready = true;
             }
 
             match event {
@@ -62,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cycle_count, imm, pc_before, svc_count)?;
                     log.flush()?;
 
-                    let result = boot_ctx.kernel.dispatch_svc(imm);
+                    let result = guard.dispatch_svc(imm);
 
                     if let Some(cpu) = cpu_mut() {
                         cpu.set_register(0, result as u64);
@@ -72,11 +73,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if imm == 0x26 {
                         break_count += 1;
                         writeln!(log, "[{}] Break #{} encountered, continuing execution...", cycle_count, break_count)?;
-                        boot_ctx.kernel.process_exited = false;  // Override the exit flag
+                        guard.process_exited = false;  // Override the exit flag
                         log.flush()?;
                     }
 
-                    for f in boot_ctx.kernel.drain_frames() {
+                    for f in guard.drain_frames() {
                         writeln!(log, "[{}] Frame: {}x{}", cycle_count, f.width, f.height)?;
                     }
                 }

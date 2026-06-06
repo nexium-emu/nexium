@@ -3,6 +3,7 @@ use nexium_loader::{Loader, Nro};
 use crate::kernel::Kernel;
 use nexium_cpu::Cpu;
 use std::sync::Arc;
+use parking_lot::Mutex;
 
 pub struct BootConfig {
     pub nro_path: String,
@@ -29,7 +30,9 @@ impl BootConfig {
 pub struct BootContext {
     pub nro: Nro,
     pub address_space: Arc<AddressSpace>,
-    pub kernel: Kernel,
+    /// Shared across host-thread cores. Each core locks it only for scheduling +
+    /// SVC dispatch and releases it around cpu.run, so cores execute in parallel.
+    pub kernel: Arc<Mutex<Kernel>>,
     /// Core 0's CPU. Owned here (not in `Kernel`) so each host core can own its
     /// own `Cpu`; the run loop publishes it to `cpu_local` around dispatch.
     pub cpu: Option<Cpu>,
@@ -165,7 +168,7 @@ impl BootContext {
         Ok(BootContext {
             nro,
             address_space,
-            kernel,
+            kernel: Arc::new(Mutex::new(kernel)),
             cpu: Some(cpu),
         })
     }
@@ -185,7 +188,8 @@ impl BootContext {
         }
         let trimmed = raw.strip_prefix("sdmc:/").or_else(|| raw.strip_prefix("sdmc:")).unwrap_or(raw);
         let filename = std::path::Path::new(trimmed).file_name()?.to_str()?.to_string();
-        let homebrew = self.kernel.homebrew_dir.as_ref()?;
+        let kguard = self.kernel.lock();
+        let homebrew = kguard.homebrew_dir.as_ref()?;
         let host_path = homebrew.join(&filename);
         if !host_path.exists() {
             log::warn!("chained_load_path: requested {:?} not found in {:?}", raw, homebrew);
@@ -220,7 +224,7 @@ impl BootContext {
                     svc_count += 1;
                     log::info!("SVC {:#04x} (count: {})", imm, svc_count);
 
-                    let result = self.kernel.dispatch_svc(imm);
+                    let result = self.kernel.lock().dispatch_svc(imm);
 
                     cpu_mut().unwrap().set_register(0, result as u64);
 

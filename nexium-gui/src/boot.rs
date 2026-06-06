@@ -158,6 +158,50 @@ impl EmulationHandle {
             let halt = Some(cpu.halt_handle());
             let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu, 0);
             use nexium_kernel::kernel::cpu_local::{cpu_mut, cpu_ref};
+
+            // Host core 1 — EXPERIMENTAL, opt-in via NEXIUM_MULTICORE=1. Runs ready
+            // guest threads on its own Cpu in parallel with core 0. The architecture
+            // works (parallel scheduling, no deadlock) but a concurrent context-switch
+            // race on cross-core migration can freeze the guest, so single-core is the
+            // default until the scheduler is made fully race-free.
+            let core1_stop = Arc::new(AtomicBool::new(false));
+            let core1_handle = if std::env::var("NEXIUM_MULTICORE").is_ok() {
+                let kernel_c1 = Arc::clone(&boot_ctx.kernel);
+                let stop_c1 = Arc::clone(&core1_stop);
+                let backend_c1 = cpu_backend;
+                thread::Builder::new()
+                    .name("nexium-core1".into())
+                    .spawn(move || {
+                        let mut cpu1 = match kernel_c1.lock().init_cpu(backend_c1) {
+                            Ok(c) => c,
+                            Err(e) => { log::error!("[core1] init_cpu failed: {}", e); return; }
+                        };
+                        cpu1.set_continue_on_null(true);
+                        let _g1 = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu1, 1);
+                        log::info!("[core1] started");
+                        while !stop_c1.load(Ordering::Relaxed) {
+                            let has = {
+                                let mut k = kernel_c1.lock();
+                                k.threads.wake_due_sleepers(std::time::Instant::now());
+                                k.ensure_thread_loaded().is_some()
+                            };
+                            if !has {
+                                std::thread::sleep(std::time::Duration::from_micros(200));
+                                continue;
+                            }
+                            let event = cpu_mut().unwrap().run(200_000);
+                            if let nexium_core::cpu::CpuEvent::Svc(imm) = event {
+                                let result = kernel_c1.lock().dispatch_svc(imm);
+                                cpu_mut().unwrap().set_register(0, result as u64);
+                            }
+                        }
+                        log::info!("[core1] stopped");
+                    })
+                    .ok()
+            } else {
+                None
+            };
+
             let last_svc_ms = Arc::new(AtomicU64::new(0));
             let watchdog_stop = Arc::new(AtomicBool::new(false));
             let watchdog_halts = Arc::new(AtomicU64::new(0));
@@ -224,14 +268,18 @@ impl EmulationHandle {
             let mut last_heartbeat = std::time::Instant::now();
             let mut last_heartbeat_svc = 0u32;
             let mut last_heartbeat_cycles = 0u64;
-            let mut last_pipeline_stats = boot_ctx.kernel.nvdrv.stats.snapshot();
+            let mut last_pipeline_stats = boot_ctx.kernel.lock().nvdrv.stats.snapshot();
 
             let mut loop_iter: u64 = 0;
             let mut last_loop_log = std::time::Instant::now();
             loop {
                 loop_iter += 1;
+                // Lock the shared kernel for scheduling + dispatch. Released
+                // explicitly around cpu.run and the idle sleep (below) so the
+                // other host core can run; continue/break auto-drop it.
+                let mut guard = boot_ctx.kernel.lock();
                 if last_loop_log.elapsed() >= std::time::Duration::from_secs(1) {
-                    let cur = boot_ctx.kernel.threads.current_handle();
+                    let cur = guard.threads.current_handle();
                     let pc_now = cpu_ref().map(|c| c.get_pc()).unwrap_or(0);
                     let halts = watchdog_halts.load(Ordering::Relaxed);
                     log::warn!(
@@ -252,9 +300,9 @@ impl EmulationHandle {
                         let secs = elapsed.as_secs_f64();
                         let svc_rate = (svc_count - last_heartbeat_svc) as f64 / secs;
                         let cycle_rate = (cycle_count - last_heartbeat_cycles) as f64 / secs;
-                        let cur = boot_ctx.kernel.threads.current_handle();
-                        let nthreads = boot_ctx.kernel.threads.threads.len();
-                        let nready = boot_ctx.kernel.threads.ready.len();
+                        let cur = guard.threads.current_handle();
+                        let nthreads = guard.threads.threads.len();
+                        let nready = guard.threads.ready.len();
                         let halts = watchdog_halts.load(Ordering::Relaxed);
                         let null_skips = cpu_ref().map(|c| c.null_skip_count()).unwrap_or(0);
                         let (cur_pc, lr, sp, x0, x1, x19, x20, x21, x22) = if let Some(c) = cpu_ref() {
@@ -266,7 +314,7 @@ impl EmulationHandle {
                             log::info!("[heartbeat] null_skips_total={}", null_skips);
                         }
                         let mut x20_bytes = [0u8; 32];
-                        let x20_read = boot_ctx.kernel.address_space.read(x20, &mut x20_bytes).is_ok();
+                        let x20_read = guard.address_space.read(x20, &mut x20_bytes).is_ok();
                         log::info!(
                             "[heartbeat] svc={} cyc={} svc/s={:.0} cyc/s={:.0} halts={} pc={:#x} lr={:#x} sp={:#x} x0={:#x} x1={:#x} x19={:#x} x20={:#x} x21={:#x} x22={:#x}",
                             svc_count, cycle_count, svc_rate, cycle_rate, halts, cur_pc, lr, sp, x0, x1, x19, x20, x21, x22
@@ -282,7 +330,7 @@ impl EmulationHandle {
                         }
                         let _ = (cur, nthreads, nready);
 
-                        let cur_stats = boot_ctx.kernel.nvdrv.stats.snapshot();
+                        let cur_stats = guard.nvdrv.stats.snapshot();
                         let d = |cur: u64, prev: u64| -> u64 { cur.saturating_sub(prev) };
                         log::info!(
                             "[gpu] gpfifo_submits={} (+{}/s) entries={} (+{}/s) methods={} (+{}/s) | mw3d draws={} (+{}) clears={} (+{}) | fermi2d blits={} (+{}) | mwdma blits={} (+{})",
@@ -294,7 +342,7 @@ impl EmulationHandle {
                             cur_stats.fermi_2d_blits, d(cur_stats.fermi_2d_blits, last_pipeline_stats.fermi_2d_blits),
                             cur_stats.maxwell_dma_blits, d(cur_stats.maxwell_dma_blits, last_pipeline_stats.maxwell_dma_blits),
                         );
-                        let frame_q_depth = boot_ctx.kernel.nvdrv.frame_queue_depth();
+                        let frame_q_depth = guard.nvdrv.frame_queue_depth();
                         log::info!(
                             "[fb]  rb={} deq={} q={} submit={} drain={} vsync={} | nvmaps create={} alloc={} | frame_q_depth={}",
                             cur_stats.request_buffer_calls, cur_stats.dequeue_buffer_calls, cur_stats.queue_buffer_calls,
@@ -302,7 +350,7 @@ impl EmulationHandle {
                             cur_stats.nvmap_creates, cur_stats.nvmap_allocs, frame_q_depth,
                         );
 
-                        let bq_info = boot_ctx.kernel.nvdrv.with_bufferqueue(256, |bq| {
+                        let bq_info = guard.nvdrv.with_bufferqueue(256, |bq| {
                             (bq.slots.len(), bq.free.len(), bq.dequeued.len(), bq.queued.len(),
                              bq.last_queued, bq.connected_api)
                         });
@@ -312,7 +360,7 @@ impl EmulationHandle {
                         );
 
                         let top_methods = {
-                            let mut mw = boot_ctx.kernel.nvdrv.gpu.maxwell3d.lock();
+                            let mut mw = guard.nvdrv.gpu.maxwell3d.lock();
                             mw.take_top_methods(10)
                         };
                         if !top_methods.is_empty() {
@@ -323,7 +371,7 @@ impl EmulationHandle {
                         }
                         last_pipeline_stats = cur_stats;
 
-                        nexium_core::kernel::profile::dump_heartbeat_with_kernel(&boot_ctx.kernel);
+                        nexium_core::kernel::profile::dump_heartbeat_with_kernel(&guard);
 
                         last_heartbeat = std::time::Instant::now();
                         last_heartbeat_svc = svc_count;
@@ -335,27 +383,31 @@ impl EmulationHandle {
                     }
                 }
 
-                if boot_ctx.kernel.ensure_thread_loaded().is_none() {
-                    boot_ctx.kernel.tick_audio_renderers();
-                    boot_ctx.kernel.threads.wake_due_sleepers(std::time::Instant::now());
-                    if boot_ctx.kernel.ensure_thread_loaded().is_some() {
+                if guard.ensure_thread_loaded().is_none() {
+                    guard.tick_audio_renderers();
+                    guard.threads.wake_due_sleepers(std::time::Instant::now());
+                    if guard.ensure_thread_loaded().is_some() {
                         continue;
                     }
-                    if let Some(wake) = boot_ctx.kernel.threads.earliest_wake() {
-                        let now = std::time::Instant::now();
-                        if wake > now {
-                            let dur = (wake - now).min(std::time::Duration::from_millis(2));
-                            std::thread::sleep(dur);
+                    let sleep_dur = match guard.threads.earliest_wake() {
+                        Some(wake) => {
+                            let now = std::time::Instant::now();
+                            if wake > now {
+                                (wake - now).min(std::time::Duration::from_millis(2))
+                            } else {
+                                std::time::Duration::ZERO
+                            }
                         }
-                        boot_ctx.kernel.threads.wake_due_sleepers(std::time::Instant::now());
-                        continue;
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                        continue;
+                        None => std::time::Duration::from_millis(2),
+                    };
+                    drop(guard); // release before sleeping so the other core can run
+                    if !sleep_dur.is_zero() {
+                        std::thread::sleep(sleep_dur);
                     }
+                    continue;
                 }
 
-                boot_ctx.kernel.threads.wake_due_sleepers(std::time::Instant::now());
+                guard.threads.wake_due_sleepers(std::time::Instant::now());
 
                 if let Some(cpu) = cpu_mut() {
                     let pc_before = cpu.get_pc();
@@ -363,13 +415,15 @@ impl EmulationHandle {
                         .ok()
                         .and_then(|v| v.parse::<u64>().ok())
                         .unwrap_or(1_000_000);
+                    drop(guard); // release the kernel lock around cpu.run for parallelism
                     let event = cpu.run(cpu_slice);
                     let pc_after = cpu.get_pc();
+                    let mut guard = boot_ctx.kernel.lock(); // re-acquire for post-run + dispatch
                     cycle_count += cpu_slice;
-                    boot_ctx.kernel.cycle_count += cpu_slice;
+                    guard.cycle_count += cpu_slice;
 
                     if pc_after < 0x10000 {
-                        let cur = boot_ctx.kernel.threads.current_handle();
+                        let cur = guard.threads.current_handle();
                         let lr = cpu.get_register(30);
                         let sp = cpu.get_sp();
                         let mut regs = [0u64; 31];
@@ -386,7 +440,7 @@ impl EmulationHandle {
                         }
                         if lr >= 0x20 {
                             let mut instrs = [0u8; 48];
-                            if boot_ctx.kernel.address_space.read(lr.wrapping_sub(0x20), &mut instrs).is_ok() {
+                            if guard.address_space.read(lr.wrapping_sub(0x20), &mut instrs).is_ok() {
                                 for off in 0..12usize {
                                     let bytes = &instrs[off*4..off*4+4];
                                     let insn = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -401,14 +455,14 @@ impl EmulationHandle {
                         let x20 = regs[20];
                         if x20 >= 0x10000 {
                             let mut peek = [0u8; 64];
-                            if boot_ctx.kernel.address_space.read(x20, &mut peek).is_ok() {
+                            if guard.address_space.read(x20, &mut peek).is_ok() {
                                 log::error!("[null-pc] *x20[0..64] = {:02x?}", &peek);
                             }
                         }
                         let x22 = regs[22];
                         if x22 >= 0x10000 {
                             let mut peek = [0u8; 64];
-                            if boot_ctx.kernel.address_space.read(x22, &mut peek).is_ok() {
+                            if guard.address_space.read(x22, &mut peek).is_ok() {
                                 log::error!("[null-pc] *x22[0..64] = {:02x?}", &peek);
                             }
                         }
@@ -433,11 +487,11 @@ impl EmulationHandle {
                             h.tick(cur);
                         }
                         drop(h);
-                        let n_ready = boot_ctx.kernel.threads.ready.len();
-                        let n_threads = boot_ctx.kernel.threads.threads.len();
+                        let n_ready = guard.threads.ready.len();
+                        let n_threads = guard.threads.threads.len();
                         if n_ready > 0 {
-                            let from = boot_ctx.kernel.threads.current_handle();
-                            boot_ctx.kernel.threads.yield_with_state(
+                            let from = guard.threads.current_handle();
+                            guard.threads.yield_with_state(
                                 cpu,
                                 nexium_core::kernel::threads::ThreadState::Ready,
                             );
@@ -446,7 +500,7 @@ impl EmulationHandle {
                         } else {
                             stuck_log_counter += 1;
                             if stuck_log_counter % 50 == 1 {
-                                let cur = boot_ctx.kernel.threads.current_handle();
+                                let cur = guard.threads.current_handle();
                                 let lr = cpu.get_register(30);
                                 let x0 = cpu.get_register(0);
                                 let x1 = cpu.get_register(1);
@@ -455,13 +509,13 @@ impl EmulationHandle {
                                 let x19 = cpu.get_register(19);
                                 let x20 = cpu.get_register(20);
                                 let mut instr = [0u8; 16];
-                                let _ = boot_ctx.kernel.address_space.read(pc_after, &mut instr);
+                                let _ = guard.address_space.read(pc_after, &mut instr);
                                 let i0 = u32::from_le_bytes([instr[0], instr[1], instr[2], instr[3]]);
                                 let i1 = u32::from_le_bytes([instr[4], instr[5], instr[6], instr[7]]);
                                 let i2 = u32::from_le_bytes([instr[8], instr[9], instr[10], instr[11]]);
                                 let i3 = u32::from_le_bytes([instr[12], instr[13], instr[14], instr[15]]);
-                                let n_threads_total = boot_ctx.kernel.threads.threads.len();
-                                let states: Vec<String> = boot_ctx.kernel.threads.threads.iter()
+                                let n_threads_total = guard.threads.threads.len();
+                                let states: Vec<String> = guard.threads.threads.iter()
                                     .map(|(h, t)| format!("{:#x}={:?}", h, std::mem::discriminant(&t.state)))
                                     .collect();
                                 log::warn!(
@@ -486,22 +540,22 @@ impl EmulationHandle {
                             snap.x[i] = cpu.get_register(i as u32);
                         }
                         let mut instr_buf = vec![0u8; 64];
-                        if boot_ctx.kernel.address_space.read(snap.pc, &mut instr_buf).is_ok() {
+                        if guard.address_space.read(snap.pc, &mut instr_buf).is_ok() {
                             snap.instruction_bytes = instr_buf;
                         }
                         let mem_req = *mem_request_clone.lock();
                         if mem_req != 0 {
                             snap.mem_request_address = mem_req;
                             let mut mem_buf = vec![0u8; 256];
-                            if boot_ctx.kernel.address_space.read(mem_req, &mut mem_buf).is_ok() {
+                            if guard.address_space.read(mem_req, &mut mem_buf).is_ok() {
                                 snap.mem_address = mem_req;
                                 snap.mem_data = mem_buf;
                             }
                         }
                     }
 
-                    if boot_ctx.kernel.cycle_count >= boot_ctx.kernel.next_vsync_cycle && !boot_ctx.kernel.display_ready {
-                        boot_ctx.kernel.display_ready = true;
+                    if guard.cycle_count >= guard.next_vsync_cycle && !guard.display_ready {
+                        guard.display_ready = true;
                         log::info!("Simulating display ready");
                     }
 
@@ -550,7 +604,7 @@ impl EmulationHandle {
                             let lr = cpu.get_register(30);
                             let sp = cpu.get_sp();
                             let mut instr = [0u8; 4];
-                            let instr_ok = boot_ctx.kernel.address_space.read(pc, &mut instr).is_ok();
+                            let instr_ok = guard.address_space.read(pc, &mut instr).is_ok();
                             let instr_word = u32::from_le_bytes(instr);
                             log::error!("=== CPU EXCEPTION {:#x} ===", code);
                             log::error!("  PC={:#x}  LR={:#x}  SP={:#x}", pc, lr, sp);
@@ -580,11 +634,11 @@ impl EmulationHandle {
                                 );
                             }
                             let mut stk = [0u8; 64];
-                            if boot_ctx.kernel.address_space.read(sp, &mut stk).is_ok() {
+                            if guard.address_space.read(sp, &mut stk).is_ok() {
                                 log::error!("  stack@SP[0..64] = {:02x?}", &stk[..]);
                             }
                             let mut prev = [0u8; 16];
-                            if pc >= 16 && boot_ctx.kernel.address_space.read(pc - 16, &mut prev).is_ok() {
+                            if pc >= 16 && guard.address_space.read(pc - 16, &mut prev).is_ok() {
                                 log::error!("  code@PC-16..PC = {:02x?}", &prev[..]);
                             }
                             break;
@@ -605,25 +659,25 @@ impl EmulationHandle {
                     let _ = cpu;
 
                     if let nexium_core::cpu::CpuEvent::Svc(imm) = event_copy {
-                        let result = boot_ctx.kernel.dispatch_svc(imm);
+                        let result = guard.dispatch_svc(imm);
                         if let Some(cpu) = cpu_mut() {
                             cpu.set_register(0, result as u64);
                         }
-                        let pace_present = boot_ctx.kernel.present_pace_until.take();
-                        let timeslice = boot_ctx.kernel.threads.timeslice_expired(std::time::Duration::from_millis(4));
+                        let pace_present = guard.present_pace_until.take();
+                        let timeslice = guard.threads.timeslice_expired(std::time::Duration::from_millis(4));
                         let should_yield =
-                            boot_ctx.kernel.yield_after_svc || timeslice || pace_present.is_some();
+                            guard.yield_after_svc || timeslice || pace_present.is_some();
                         if should_yield {
                             let reason = if pace_present.is_some() {
                                 "present-pace"
-                            } else if boot_ctx.kernel.yield_after_svc {
+                            } else if guard.yield_after_svc {
                                 "flag"
                             } else {
                                 "timeslice"
                             };
-                            let from = boot_ctx.kernel.threads.current_handle();
-                            let ready_len = boot_ctx.kernel.threads.ready.len();
-                            boot_ctx.kernel.yield_after_svc = false;
+                            let from = guard.threads.current_handle();
+                            let ready_len = guard.threads.ready.len();
+                            guard.yield_after_svc = false;
                             if let Some(cpu) = cpu_ref() {
                                 let state = match pace_present {
                                     Some(wake_at) if wake_at > std::time::Instant::now() => {
@@ -631,7 +685,7 @@ impl EmulationHandle {
                                     }
                                     _ => nexium_core::kernel::threads::ThreadState::Ready,
                                 };
-                                boot_ctx.kernel.threads.yield_with_state(cpu, state);
+                                guard.threads.yield_with_state(cpu, state);
                             }
                             if reason != "present-pace" {
                                 log::info!("[yield] reason={} from={:?} ready_before={}", reason, from, ready_len);
@@ -648,17 +702,17 @@ impl EmulationHandle {
                         }
                     }
 
-                    for f in boot_ctx.kernel.drain_frames() {
+                    for f in guard.drain_frames() {
                         let _ = frame_tx.try_send(f.into());
                     }
 
-                    boot_ctx.kernel.tick_audio_renderers();
+                    guard.tick_audio_renderers();
 
                     if svc_count % 256 == 0 {
-                        boot_ctx.kernel.threads.drop_exited();
+                        guard.threads.drop_exited();
                     }
 
-                    if boot_ctx.kernel.process_exited {
+                    if guard.process_exited {
                         log::info!("Process exited");
                         break;
                     }
@@ -668,6 +722,12 @@ impl EmulationHandle {
             }
 
             log::info!("Emulation complete: {} cycles, {} SVCs", cycle_count, svc_count);
+
+            // Stop + join host core 1 before tearing down or chain-loading.
+            core1_stop.store(true, Ordering::Relaxed);
+            if let Some(h) = core1_handle {
+                let _ = h.join();
+            }
 
             if stop_flag_clone.load(Ordering::Relaxed) {
                 return Ok(());
