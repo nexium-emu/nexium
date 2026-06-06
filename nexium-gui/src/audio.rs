@@ -9,16 +9,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const RENDER_SR: u32 = 48_000;
 const RB_CAP_SAMPLES: usize = 48_000;
-const PREBUF_TARGET_SAMPLES: usize = 11_520;
+const PREBUF_TARGET_SAMPLES: usize = 9_600;
 
 struct PrebufState {
     priming: bool,
     cur_l: f32,
     cur_r: f32,
+    empty_run: u32,
 }
 impl PrebufState {
     fn new() -> Self {
-        Self { priming: true, cur_l: 0.0, cur_r: 0.0 }
+        Self { priming: true, cur_l: 0.0, cur_r: 0.0, empty_run: 0 }
     }
 }
 
@@ -334,9 +335,15 @@ fn drain_stereo_to(
     if prebuf.priming {
         if occ >= PREBUF_TARGET_SAMPLES {
             prebuf.priming = false;
+            prebuf.empty_run = 0;
         }
     } else if occ == 0 {
-        prebuf.priming = true;
+        prebuf.empty_run = prebuf.empty_run.saturating_add(1);
+        if prebuf.empty_run >= 8 {
+            prebuf.priming = true;
+        }
+    } else {
+        prebuf.empty_run = 0;
     }
     let priming = prebuf.priming;
 
@@ -395,9 +402,15 @@ fn drain_stereo_to_i16(
     if prebuf.priming {
         if occ >= PREBUF_TARGET_SAMPLES {
             prebuf.priming = false;
+            prebuf.empty_run = 0;
         }
     } else if occ == 0 {
-        prebuf.priming = true;
+        prebuf.empty_run = prebuf.empty_run.saturating_add(1);
+        if prebuf.empty_run >= 8 {
+            prebuf.priming = true;
+        }
+    } else {
+        prebuf.empty_run = 0;
     }
     let priming = prebuf.priming;
 
