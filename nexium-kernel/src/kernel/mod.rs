@@ -1,5 +1,6 @@
 pub mod svc;
 pub mod svc_defs;
+pub mod cpu_local;
 pub mod profile;
 pub mod threads;
 pub mod handles;
@@ -87,15 +88,45 @@ pub struct Kernel {
     pub open_dir_lists: HashMap<(u32, u32), (Vec<(String, bool, u64)>, usize)>,
 
     pub yield_after_svc: bool,
+    pub present_pace_until: Option<std::time::Instant>,
 
     pub font_shmem: Option<Vec<u8>>,
     pub font_shmem_handle: Option<u32>,
     pub font_offsets: [(u32, u32); 6],
 
+    pub time_shmem: Option<Vec<u8>>,
+    pub time_shmem_handle: Option<u32>,
+
     pub audio_out_buffers: HashMap<u32, VecDeque<u64>>,
     pub audio_buffer_events: HashMap<u32, u32>,
     pub audio_out_volumes: HashMap<u32, u32>,
     pub audio_out_state: HashMap<u32, u8>,
+
+    pub audio_renderers: HashMap<(u32, u32), AudioRendererState>,
+    pub audio_renderer_events: HashMap<(u32, u32), u32>,
+    pub audio_renderer_frame_counter: u64,
+    pub audio_renderer_last_tick: std::time::Instant,
+    pub audio_renderer_last_consumed: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioRendererState {
+    pub sample_rate: u32,
+    pub sample_count: u32,
+    pub mix_buffer_count: u32,
+    pub voice_count: u32,
+    pub sink_count: u32,
+    pub effect_count: u32,
+    pub revision: u32,
+    pub state: u32,
+    pub rendering_time_limit: u32,
+    pub voice_drop_param: f32,
+    pub voice_played_samples: Vec<u64>,
+    pub voice_wbufs_consumed: Vec<u32>,
+    pub voice_last_wb_index: Vec<u16>,
+    pub voice_is_new_seen: Vec<bool>,
+    pub voice_wb_progress_frames: Vec<u64>,
+    pub voice_fraction: Vec<f32>,
 }
 
 impl Kernel {
@@ -176,13 +207,74 @@ impl Kernel {
             open_host_files: HashMap::new(),
             open_dir_lists: HashMap::new(),
             yield_after_svc: false,
+            present_pace_until: None,
             font_shmem: None,
             font_shmem_handle: None,
             font_offsets: [(0, 0); 6],
+            time_shmem: None,
+            time_shmem_handle: None,
             audio_out_buffers: HashMap::new(),
             audio_buffer_events: HashMap::new(),
             audio_out_volumes: HashMap::new(),
             audio_out_state: HashMap::new(),
+            audio_renderers: HashMap::new(),
+            audio_renderer_events: HashMap::new(),
+            audio_renderer_frame_counter: 0,
+            audio_renderer_last_tick: std::time::Instant::now(),
+            audio_renderer_last_consumed: 0,
+        }
+    }
+
+    pub fn tick_audio_renderers(&mut self) {
+        const FRAMES_PER_AUDIO_FRAME: u64 = 240;
+        const MAX_BACKLOG_BLOCKS: u64 = 400;
+
+        let blocks = if let Some(sink) = crate::audio_sink::host_audio_sink() {
+            let mut n = sink.drain_pending_events();
+            if n == 0 {
+                if self.audio_renderer_last_consumed == 0 {
+                    self.audio_renderer_last_consumed = sink.samples_consumed();
+                }
+                return;
+            }
+            self.audio_renderer_last_consumed = self
+                .audio_renderer_last_consumed
+                .wrapping_add(n * FRAMES_PER_AUDIO_FRAME);
+            if n > MAX_BACKLOG_BLOCKS {
+                n = MAX_BACKLOG_BLOCKS;
+            }
+            n
+        } else {
+            let now = std::time::Instant::now();
+            if now.duration_since(self.audio_renderer_last_tick)
+                < std::time::Duration::from_millis(5)
+            {
+                return;
+            }
+            self.audio_renderer_last_tick = now;
+            1
+        };
+        if blocks == 0 {
+            return;
+        }
+
+        let to_signal: Vec<u32> = self
+            .audio_renderers
+            .iter()
+            .filter(|(_, st)| st.state == 0)
+            .filter_map(|(key, _)| self.audio_renderer_events.get(key).copied())
+            .collect();
+        self.audio_renderer_frame_counter = self
+            .audio_renderer_frame_counter
+            .wrapping_add(1);
+        for ev in &to_signal {
+            self.event_signals.insert(*ev, true);
+            self.threads.signal_handle(*ev);
+        }
+        if blocks > 1 {
+            if let Some(sink) = crate::audio_sink::host_audio_sink() {
+                sink.repost_pending_events(blocks - 1);
+            }
         }
     }
 
@@ -205,13 +297,8 @@ impl Kernel {
     }
 
 
-    pub fn init_cpu(&mut self) -> Result<(), String> {
-        #[cfg(feature = "backend-rustarmic")]
-        let mut cpu = Cpu::new_rustarmic()?;
-        #[cfg(all(feature = "backend-dynarmic", not(feature = "backend-rustarmic")))]
-        let mut cpu = Cpu::new_dynarmic()?;
-        #[cfg(not(any(feature = "backend-dynarmic", feature = "backend-rustarmic")))]
-        compile_error!("nexium-kernel: enable exactly one of backend-dynarmic / backend-rustarmic");
+    pub fn init_cpu(&mut self, backend: nexium_cpu::CpuBackendKind) -> Result<(), String> {
+        let mut cpu = Cpu::new(backend)?;
         for region in self.address_space.host_regions() {
             unsafe {
                 cpu.map_host(region.base, region.size, region.perm, region.host_ptr)
@@ -372,6 +459,18 @@ impl Kernel {
         self.font_offsets = offsets;
         let h = self.handles.create_handle(handles::HandleType::SharedMemory);
         self.font_shmem_handle = Some(h);
+        h
+    }
+
+    pub fn ensure_time_shmem_handle(&mut self) -> u32 {
+        if let Some(h) = self.time_shmem_handle {
+            return h;
+        }
+        const TIME_SHMEM_SIZE: usize = 0x1000;
+        self.time_shmem = Some(vec![0u8; TIME_SHMEM_SIZE]);
+        let h = self.handles.create_handle(handles::HandleType::SharedMemory);
+        self.time_shmem_handle = Some(h);
+        log::info!("time:u allocated KSharedMemory handle={:#x} size={:#x}", h, TIME_SHMEM_SIZE);
         h
     }
 

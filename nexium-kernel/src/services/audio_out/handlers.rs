@@ -15,6 +15,9 @@ pub fn stop_audio_out(kernel: &mut Kernel, _ctx: &mut IpcCtx, session: u32) {
 pub fn append_audio_out_buffer(kernel: &mut Kernel, _ctx: &mut IpcCtx, session: u32, client_ptr: u64) {
     let q = kernel.audio_out_buffers.entry(session).or_default();
     q.push_back(client_ptr);
+    if let Some(&ev) = kernel.audio_buffer_events.get(&session) {
+        kernel.event_signals.insert(ev, true);
+    }
 }
 
 pub fn append_audio_out_buffer_auto(kernel: &mut Kernel, ctx: &mut IpcCtx, session: u32, client_ptr: u64) {

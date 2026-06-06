@@ -9,6 +9,7 @@ pub struct BootConfig {
     pub heap_size: u64,
     pub stack_size: u64,
     pub loader_path: Option<String>,
+    pub cpu_backend: nexium_cpu::CpuBackendKind,
 }
 
 impl BootConfig {
@@ -17,8 +18,9 @@ impl BootConfig {
             nro_path: nro_path.to_string(),
             code_size: 256 * 1024 * 1024,
             heap_size: 256 * 1024 * 1024,
-            stack_size: 1 * 1024 * 1024,
+            stack_size: 16 * 1024 * 1024,
             loader_path: None,
+            cpu_backend: nexium_cpu::CpuBackendKind::default(),
         }
     }
 }
@@ -46,9 +48,24 @@ impl BootContext {
 
         log::info!("Mapping memory regions");
 
-        log::info!("  Mapping code @ {:#x} (size {:#x})", code_base, config.code_size);
-        address_space.map(code_base, config.code_size, Perm::RX, "code")
-            .map_err(|e| format!("Failed to map code: {:?}", e))?;
+        const PAGE_SIZE: u64 = 0x1000;
+        let data_mmap_start = nro.data.mmap_range.start as u64;
+        let split = data_mmap_start & !(PAGE_SIZE - 1);
+        let split = split.min(config.code_size);
+        if split == 0 || split >= config.code_size {
+            log::info!("  Mapping code @ {:#x} (size {:#x}) RX (no split — data section out of range)",
+                code_base, config.code_size);
+            address_space.map(code_base, config.code_size, Perm::RX, "code")
+                .map_err(|e| format!("Failed to map code: {:?}", e))?;
+        } else {
+            log::info!("  Mapping code text+ro @ {:#x} (size {:#x}) RX", code_base, split);
+            address_space.map(code_base, split, Perm::RX, "code_rx")
+                .map_err(|e| format!("Failed to map code_rx: {:?}", e))?;
+            let rw_size = config.code_size - split;
+            log::info!("  Mapping code data+bss @ {:#x} (size {:#x}) RW", code_base + split, rw_size);
+            address_space.map(code_base + split, rw_size, Perm::RW, "code_rw")
+                .map_err(|e| format!("Failed to map code_rw: {:?}", e))?;
+        }
 
         log::info!("  Mapping heap @ {:#x} (size {:#x})", heap_base, config.heap_size);
         address_space.map(heap_base, config.heap_size, Perm::RW, "heap")
@@ -67,9 +84,23 @@ impl BootContext {
         address_space.write(exit_stub_va, &svc_exit_insn.to_le_bytes())
             .map_err(|e| format!("Failed to write exit stub: {:?}", e))?;
 
-        log::info!("  Writing NRO ({} bytes) at {:#x} from mmap", nro.bytes().len(), code_base);
-        address_space.write(code_base, nro.bytes())
-            .map_err(|e| format!("Failed to write NRO file: {:?}", e))?;
+        log::info!("  Writing NRO ({} bytes) at {:#x} from mmap (split at {:#x})",
+            nro.bytes().len(), code_base, split);
+        let bytes = nro.bytes();
+        let split_idx = (split as usize).min(bytes.len());
+        if split == 0 || split >= config.code_size {
+            address_space.write(code_base, bytes)
+                .map_err(|e| format!("Failed to write NRO file: {:?}", e))?;
+        } else {
+            if split_idx > 0 {
+                address_space.write(code_base, &bytes[..split_idx])
+                    .map_err(|e| format!("Failed to write NRO text+ro: {:?}", e))?;
+            }
+            if bytes.len() > split_idx {
+                address_space.write(code_base + split, &bytes[split_idx..])
+                    .map_err(|e| format!("Failed to write NRO data: {:?}", e))?;
+            }
+        }
 
         let tls_pool_base: u64 = env_base + 0x10000;
         let mut kernel = Kernel::new(
@@ -102,8 +133,8 @@ impl BootContext {
             .with_next_load_path(&next_load_path);
         env_builder.build_into(&address_space, env_base)?;
 
-        log::info!("Initializing CPU");
-        kernel.init_cpu()
+        log::info!("Initializing CPU (backend: {})", config.cpu_backend.label());
+        kernel.init_cpu(config.cpu_backend)
             .map_err(|e| format!("Failed to init CPU: {}", e))?;
 
         if let Some(cpu) = &mut kernel.cpu {

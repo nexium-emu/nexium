@@ -79,7 +79,7 @@ impl BufferQueueService {
             }
             QUEUE_BUFFER => {
                 log::debug!("IGBP::QueueBuffer {}x{}", self.width, self.height);
-                let frame = self.compose_blank_frame();
+                let frame = self.compose_frame();
                 if ctx.pending_frames.len() >= 2 {
                     ctx.pending_frames.remove(0);
                 }
@@ -97,7 +97,11 @@ impl BufferQueueService {
         }
     }
 
-    fn compose_blank_frame(&self) -> FrameOut {
+    fn compose_frame(&self) -> FrameOut {
+        if let Some((w, h, px)) = nexium_common::frame_present::peek_last_presented_clone() {
+            log::trace!("nvnflinger present: forwarding GPU frame {}x{} ({} bytes)", w, h, px.len());
+            return FrameOut { width: w, height: h, pixels: px };
+        }
         let pixel_count = (self.width * self.height) as usize;
         FrameOut {
             width: self.width,

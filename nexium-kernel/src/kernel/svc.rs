@@ -2,6 +2,7 @@ use super::Kernel;
 use nexium_common::result::{SUCCESS, KERNEL_NOT_IMPLEMENTED, KERNEL_INVALID_ADDRESS};
 use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
+use crate::kernel::AudioRendererState;
 use nexium_ipc as ipc;
 
 pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
@@ -275,6 +276,7 @@ fn synthesize_memory_info(kernel: &Kernel, address: u64) -> SynthMemInfo {
         .unwrap_or(u64::MAX);
     let page_addr = address & !0xFFF;
     let gap_size = next_base.saturating_sub(page_addr);
+
     SynthMemInfo {
         addr: page_addr,
         size: if gap_size == 0 { 0x10000_0000 } else { gap_size },
@@ -316,6 +318,30 @@ fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
             unsafe {
                 if let Err(e) = cpu.map_host(addr, size, nexium_memory::perm::Perm::RW, ptr) {
                     log::warn!("failed to map HID shmem in CPU: {}", e);
+                }
+            }
+        }
+    } else if kernel.time_shmem_handle == Some(handle) {
+        log::info!("  → recognized as time shared memory, mapping {} bytes at {:#x}", size, addr);
+        let backing: Vec<u8> = kernel.time_shmem.as_deref().map(|d| {
+            let mut v = vec![0u8; size as usize];
+            let copy_len = d.len().min(size as usize);
+            v[..copy_len].copy_from_slice(&d[..copy_len]);
+            v
+        }).unwrap_or_else(|| vec![0u8; size as usize]);
+        let needed_map = kernel.address_space.write(addr, &backing).is_err();
+        if needed_map {
+            let _ = kernel.address_space.map(addr, size, nexium_memory::perm::Perm::R, "time_shmem");
+            let _ = kernel.address_space.write(addr, &backing);
+        }
+        if let Some(region) = kernel.address_space.host_region_at(addr) {
+            if let Some(cpu) = &mut kernel.cpu {
+                unsafe {
+                    if let Err(e) = cpu.map_host(region.base, region.size, region.perm, region.host_ptr) {
+                        log::warn!("failed to map time shmem in CPU: {}", e);
+                    } else {
+                        log::info!("  → registered time shmem at {:#x} with CPU", region.base);
+                    }
                 }
             }
         }
@@ -1530,6 +1556,755 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
         }
     }
 
+    if (port_name == "audren:u" || port_name == "audren:a") && cmd_id == 0 {
+        let in_off = ctx.cmif_in_data_off;
+        let in_avail = ctx.cmif_in_data_len as usize;
+        let read_u32 = |o: usize| -> u32 {
+            if in_avail >= o + 4 {
+                u32::from_le_bytes([
+                    ctx.buf[in_off + o], ctx.buf[in_off + o + 1],
+                    ctx.buf[in_off + o + 2], ctx.buf[in_off + o + 3],
+                ])
+            } else { 0 }
+        };
+        let sample_rate = { let v = read_u32(0); if v == 0 { 48000 } else { v } };
+        let sample_count = { let v = read_u32(4); if v == 0 { 240 } else { v } };
+        let mix_buffer_count = read_u32(8);
+        let voice_count = read_u32(0x10);
+        let sink_count = read_u32(0x14);
+        let effect_count = read_u32(0x18);
+        let revision = read_u32(0x30);
+
+        let state = AudioRendererState {
+            sample_rate, sample_count, mix_buffer_count,
+            voice_count, sink_count, effect_count, revision,
+            state: 1,
+            rendering_time_limit: 100,
+            voice_drop_param: 1.0,
+            voice_played_samples: Vec::new(),
+            voice_wbufs_consumed: Vec::new(),
+            voice_last_wb_index: Vec::new(),
+            voice_is_new_seen: Vec::new(),
+            voice_wb_progress_frames: Vec::new(),
+            voice_fraction: Vec::new(),
+        };
+
+        let is_domain = kernel.sessions.get(&session_handle).map(|s| s.is_domain).unwrap_or(false);
+        log::info!(
+            "audren:u OpenAudioRenderer sr={} samples={} voices={} sinks={} effects={} rev={:#x} → IAudioRenderer (domain={})",
+            sample_rate, sample_count, voice_count, sink_count, effect_count, revision, is_domain
+        );
+
+        if is_domain {
+            let object_id = if let Some(s) = kernel.sessions.get_mut(&session_handle) {
+                s.alloc_domain_object("IAudioRenderer".to_string())
+            } else { 0 };
+            kernel.audio_renderers.insert((session_handle, object_id), state);
+            return build_ipc_response_full(ctx, 0, &[], &[], &[object_id]);
+        } else {
+            let h = kernel.handles.create_handle(HandleType::Session);
+            let session = Session::new(h, "IAudioRenderer".to_string());
+            kernel.sessions.insert(h, session);
+            kernel.audio_renderers.insert((h, 0), state);
+            return build_ipc_response(ctx, 0, &[], &[h]);
+        }
+    }
+    if (port_name == "audren:u" || port_name == "audren:a") && cmd_id == 1 {
+        let work_buffer_size: u64 = 0x100_0000;
+        return build_ipc_response(ctx, 0, &work_buffer_size.to_le_bytes(), &[]);
+    }
+    if (port_name == "audren:u" || port_name == "audren:a") && (cmd_id == 2 || cmd_id == 4) {
+        return return_subsession(kernel, ctx, session_handle, "IAudioDevice");
+    }
+
+    if port_name == "IAudioRenderer" {
+        let obj_id = ctx.domain.as_ref().map(|d| d.object_id).unwrap_or(0);
+        let key = (session_handle, obj_id);
+        let st = kernel.audio_renderers.entry(key).or_insert(AudioRendererState {
+            sample_rate: 48000, sample_count: 240, mix_buffer_count: 0,
+            voice_count: 0, sink_count: 0, effect_count: 0, revision: 0,
+            state: 1, rendering_time_limit: 100, voice_drop_param: 1.0,
+            voice_played_samples: Vec::new(),
+            voice_wbufs_consumed: Vec::new(),
+            voice_last_wb_index: Vec::new(),
+            voice_is_new_seen: Vec::new(),
+            voice_wb_progress_frames: Vec::new(),
+            voice_fraction: Vec::new(),
+        });
+        match cmd_id {
+            0 => {
+                let v = st.sample_rate;
+                return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
+            }
+            1 => {
+                let v = st.sample_count;
+                return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
+            }
+            2 => {
+                let v = st.mix_buffer_count;
+                return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
+            }
+            3 => {
+                let v = st.state;
+                return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
+            }
+            4 | 10 => {
+                let in_buf  = ctx.send_buffers.iter().find(|b| b.size > 0 && b.addr != 0).copied();
+                let out_buf = ctx.recv_buffers.iter().find(|b| b.size > 0 && b.addr != 0).copied();
+                let perf_buf = ctx.recv_buffers.iter().filter(|b| b.size > 0 && b.addr != 0).nth(1).copied();
+                let revision = st.revision;
+                let voice_drop_param = st.voice_drop_param;
+                let frame = kernel.audio_renderer_frame_counter;
+
+                let mut in_behavior_sz: u64 = 0;
+                let mut in_mempools_sz: u64 = 0;
+                let mut in_voices_sz:   u64 = 0;
+                let mut in_channels_sz: u64 = 0;
+                let mut mempool_in_states: Vec<u32> = Vec::new();
+                if let Some(ib) = in_buf {
+                    let mut hdr = [0u8; 0x40];
+                    if (ib.size as usize) >= 0x40
+                        && kernel.address_space.read(ib.addr, &mut hdr).is_ok()
+                    {
+                        let rd = |off: usize| u32::from_le_bytes([
+                            hdr[off], hdr[off+1], hdr[off+2], hdr[off+3],
+                        ]) as u64;
+                        in_behavior_sz = rd(0x04);
+                        in_mempools_sz = rd(0x08);
+                        in_voices_sz   = rd(0x0C);
+                        in_channels_sz = rd(0x10);
+                    }
+                    if in_mempools_sz > 0 {
+                        let mempool_count = (in_mempools_sz / 0x20) as usize;
+                        let mempools_off = 0x40u64 + in_behavior_sz;
+                        mempool_in_states.reserve(mempool_count);
+                        for i in 0..mempool_count {
+                            let off = mempools_off + (i as u64) * 0x20 + 0x10;
+                            let mut sb = [0u8; 4];
+                            if kernel.address_space.read(ib.addr.wrapping_add(off), &mut sb).is_ok() {
+                                mempool_in_states.push(u32::from_le_bytes(sb));
+                            } else {
+                                mempool_in_states.push(0);
+                            }
+                        }
+                    }
+                }
+                let mempool_count = mempool_in_states.len();
+                let voice_count_seen = (in_voices_sz / 0x170) as usize;
+
+                if st.voice_played_samples.len() < voice_count_seen {
+                    st.voice_played_samples.resize(voice_count_seen, 0);
+                    st.voice_wbufs_consumed.resize(voice_count_seen, 0);
+                    st.voice_last_wb_index.resize(voice_count_seen, 0);
+                    st.voice_is_new_seen.resize(voice_count_seen, false);
+                    st.voice_wb_progress_frames.resize(voice_count_seen, 0);
+                    st.voice_fraction.resize(voice_count_seen, 0.0);
+                }
+
+                const TARGET_FRAMES: usize = 240;
+                const TARGET_SR: f32 = 48_000.0;
+
+                let blocks_to_produce: usize = 1;
+                let mut is_new_latched: Vec<bool> = vec![false; voice_count_seen];
+                let mut big_out: Vec<f32> = Vec::with_capacity(TARGET_FRAMES * 2 * blocks_to_produce);
+
+                for _block in 0..blocks_to_produce {
+                let mut out_stereo = vec![0.0f32; TARGET_FRAMES * 2];
+                let mut block_consumed_wb = false;
+                let mut voice_snapshot: Vec<(u16, bool, bool, u32, u32, u32, bool)> =
+                    vec![(0u16, false, false, 0u32, 0u32, 0u32, false); voice_count_seen];
+
+                fn decode_gc_adpcm(
+                    data: &[u8],
+                    coeffs: &[i16; 16],
+                    yn0_seed: i16,
+                    yn1_seed: i16,
+                    count: usize,
+                ) -> Vec<i16> {
+                    let mut out: Vec<i16> = Vec::with_capacity(count);
+                    let mut yn0 = yn0_seed as i64;
+                    let mut yn1 = yn1_seed as i64;
+                    let mut pos = 0usize;
+                    while out.len() < count {
+                        if pos >= data.len() {
+                            break;
+                        }
+                        let header = data[pos];
+                        pos += 1;
+                        let ci = ((header >> 4) & 0xF) as usize;
+                        let scale = (header & 0xF) as u32;
+                        let c0 = coeffs[ci * 2] as i64;
+                        let c1 = coeffs[ci * 2 + 1] as i64;
+                        for _ in 0..7 {
+                            if out.len() >= count || pos >= data.len() {
+                                break;
+                            }
+                            let byte = data[pos];
+                            pos += 1;
+                            for nib in [(byte >> 4) & 0xF, byte & 0xF] {
+                                if out.len() >= count {
+                                    break;
+                                }
+                                let code = if nib >= 8 { nib as i64 - 16 } else { nib as i64 };
+                                let xn = code * (1i64 << scale);
+                                let pred = c0 * yn0 + c1 * yn1;
+                                let s = (((xn << 11) + 0x400 + pred) >> 11).clamp(-0x8000, 0x7FFF);
+                                yn1 = yn0;
+                                yn0 = s;
+                                out.push(s as i16);
+                            }
+                        }
+                    }
+                    while out.len() < count {
+                        out.push(0);
+                    }
+                    out
+                }
+
+                'mix: {
+                    let Some(ib) = in_buf else { break 'mix; };
+                    if (ib.size as usize) < 0x40 || voice_count_seen == 0 {
+                        break 'mix;
+                    }
+                    let voices_off: u64 = 0x40 + in_behavior_sz + in_mempools_sz + in_channels_sz;
+                    let voice_info_stride: u64 = 0x170;
+
+                    for vid in 0..voice_count_seen {
+                        let vinfo_off = voices_off + (vid as u64) * voice_info_stride;
+                        if vinfo_off + voice_info_stride > ib.size as u64 {
+                            break;
+                        }
+                        let v0_addr = ib.addr.wrapping_add(vinfo_off);
+                        let mut v = [0u8; 0x170];
+                        if kernel.address_space.read(v0_addr, &mut v).is_err() {
+                            continue;
+                        }
+
+                        let is_new = v[0x008] != 0;
+                        let is_in_use = v[0x009] != 0;
+                        let play_state = v[0x00A];
+                        let sample_format = v[0x00B];
+                        let sample_rate = u32::from_le_bytes([v[0x00C], v[0x00D], v[0x00E], v[0x00F]]);
+                        let channel_count = u32::from_le_bytes([v[0x018], v[0x019], v[0x01A], v[0x01B]]);
+                        let volume = f32::from_le_bytes([v[0x020], v[0x021], v[0x022], v[0x023]]);
+                        let wb_count = u32::from_le_bytes([v[0x03C], v[0x03D], v[0x03E], v[0x03F]]);
+                        let wb_index = u16::from_le_bytes([v[0x040], v[0x041]]) as usize;
+                        voice_snapshot[vid].0 = wb_index as u16;
+                        voice_snapshot[vid].1 = is_new;
+
+                        if is_in_use {
+                            use std::sync::atomic::{AtomicU64, Ordering as O};
+                            static SEEN_MASK: AtomicU64 = AtomicU64::new(0);
+                            let bit = 1u64 << ((vid as u64) & 63);
+                            let prev = SEEN_MASK.fetch_or(bit, O::Relaxed);
+                            if prev & bit == 0 {
+                                let fmt_name = match sample_format {
+                                    0 => "Invalid", 1 => "PcmInt8", 2 => "PcmInt16",
+                                    3 => "PcmInt24", 4 => "PcmInt32", 5 => "PcmFloat",
+                                    6 => "Adpcm", _ => "?",
+                                };
+                                log::info!(
+                                    "voice[{}] FIRST SEEN: fmt={}({}) ch={} sr={} vol={:.2} state={} wb_count={} wb_index={}",
+                                    vid, fmt_name, sample_format,
+                                    channel_count, sample_rate, volume,
+                                    play_state, wb_count, wb_index
+                                );
+                            }
+                        }
+
+                        if !is_in_use || play_state != 0
+                            || (sample_format != 2 && sample_format != 6)
+                            || !(channel_count == 1 || channel_count == 2)
+                            || sample_rate == 0 || wb_count == 0 || wb_index >= 4
+                        {
+                            continue;
+                        }
+
+                        let wb_base = 0x060 + wb_index * 0x38;
+                        let wb = &v[wb_base..wb_base + 0x38];
+                        let buffer_address = u64::from_le_bytes([
+                            wb[0x00], wb[0x01], wb[0x02], wb[0x03],
+                            wb[0x04], wb[0x05], wb[0x06], wb[0x07],
+                        ]);
+                        let buffer_size = u64::from_le_bytes([
+                            wb[0x08], wb[0x09], wb[0x0A], wb[0x0B],
+                            wb[0x0C], wb[0x0D], wb[0x0E], wb[0x0F],
+                        ]);
+                        let start_offset = i32::from_le_bytes([wb[0x10], wb[0x11], wb[0x12], wb[0x13]]);
+                        let end_offset = i32::from_le_bytes([wb[0x14], wb[0x15], wb[0x16], wb[0x17]]);
+                        let is_looping = wb[0x18] != 0;
+                        if buffer_address == 0 || start_offset < 0
+                            || end_offset <= start_offset
+                        {
+                            continue;
+                        }
+
+                        let ch = channel_count as usize;
+                        let ratio = sample_rate as f32 / TARGET_SR;
+                        let in_frames_needed = ((TARGET_FRAMES as f32) * ratio).ceil() as usize + 2;
+                        let wb_total_frames = (end_offset - start_offset) as usize;
+                        let cursor = (st.voice_wb_progress_frames.get(vid).copied().unwrap_or(0)
+                            as usize)
+                            .min(wb_total_frames.saturating_sub(1));
+                        let remaining = wb_total_frames - cursor;
+                        let in_frames = in_frames_needed.min(remaining);
+                        if in_frames < 2 {
+                            voice_snapshot[vid].2 = true;
+                            voice_snapshot[vid].3 = remaining.max(1) as u32;
+                            voice_snapshot[vid].4 = wb_total_frames as u32;
+                            voice_snapshot[vid].5 = wb_count;
+                            voice_snapshot[vid].6 = is_looping;
+                            continue;
+                        }
+                        let mut pcm_l = vec![0.0f32; in_frames];
+                        let mut pcm_r = vec![0.0f32; in_frames];
+
+                        if sample_format == 6 {
+                            let coeff_addr = u64::from_le_bytes([
+                                v[0x048], v[0x049], v[0x04A], v[0x04B],
+                                v[0x04C], v[0x04D], v[0x04E], v[0x04F],
+                            ]);
+                            let ctx_addr = u64::from_le_bytes([
+                                wb[0x20], wb[0x21], wb[0x22], wb[0x23],
+                                wb[0x24], wb[0x25], wb[0x26], wb[0x27],
+                            ]);
+                            let mut coeff_bytes = [0u8; 32];
+                            if coeff_addr == 0
+                                || kernel.address_space.read(coeff_addr, &mut coeff_bytes).is_err()
+                            {
+                                continue;
+                            }
+                            let mut coeffs = [0i16; 16];
+                            for i in 0..16 {
+                                coeffs[i] = i16::from_le_bytes([coeff_bytes[i * 2], coeff_bytes[i * 2 + 1]]);
+                            }
+                            let (mut yn0_seed, mut yn1_seed) = (0i16, 0i16);
+                            if ctx_addr != 0 {
+                                let mut ctx = [0u8; 6];
+                                if kernel.address_space.read(ctx_addr, &mut ctx).is_ok() {
+                                    yn0_seed = i16::from_le_bytes([ctx[2], ctx[3]]);
+                                    yn1_seed = i16::from_le_bytes([ctx[4], ctx[5]]);
+                                }
+                            }
+                            let decode_through = start_offset as usize + cursor + in_frames;
+                            let frames_needed = (decode_through + 13) / 14;
+                            let bytes_needed = (frames_needed * 8).min(buffer_size as usize);
+                            if buffer_address == 0 || bytes_needed < 8 {
+                                continue;
+                            }
+                            let mut adpcm = vec![0u8; bytes_needed];
+                            if kernel.address_space.read(buffer_address, &mut adpcm).is_err() {
+                                continue;
+                            }
+                            let decoded =
+                                decode_gc_adpcm(&adpcm, &coeffs, yn0_seed, yn1_seed, decode_through);
+                            let base = start_offset as usize + cursor;
+                            for f in 0..in_frames {
+                                let s = decoded.get(base + f).copied().unwrap_or(0);
+                                pcm_l[f] = (s as f32) / 32768.0;
+                                pcm_r[f] = pcm_l[f];
+                            }
+                            {
+                                use std::sync::atomic::{AtomicU64, Ordering as O};
+                                static DUMPED: AtomicU64 = AtomicU64::new(0);
+                                let bit = 1u64 << ((vid as u64) & 63);
+                                if DUMPED.fetch_or(bit, O::Relaxed) & bit == 0 {
+                                    let nz = decoded.iter().filter(|s| **s != 0).count();
+                                    log::info!(
+                                        "voice[{}] ADPCM: decoded={} nonzero={} coeff_addr={:#x} ctx_addr={:#x} start_off={} in_frames={} sr={}",
+                                        vid, decoded.len(), nz, coeff_addr, ctx_addr,
+                                        start_offset, in_frames, sample_rate
+                                    );
+                                }
+                            }
+                        } else {
+                            let in_samples = in_frames * ch;
+                            let src_byte_off =
+                                ((start_offset as u64) + cursor as u64).wrapping_mul(2 * ch as u64);
+                            if src_byte_off.saturating_add((in_samples as u64) * 2) > buffer_size {
+                                continue;
+                            }
+                            let src_va = buffer_address.wrapping_add(src_byte_off);
+                            let mut pcm_bytes = vec![0u8; in_samples * 2];
+                            let read_ok = kernel.address_space.read(src_va, &mut pcm_bytes).is_ok();
+                            {
+                                use std::sync::atomic::{AtomicU64, Ordering as O};
+                                static DUMPED: AtomicU64 = AtomicU64::new(0);
+                                let bit_pos = ((vid & 0xF) * 4 + (wb_index & 0x3)) as u64;
+                                let bit = 1u64 << bit_pos;
+                                let prev = DUMPED.fetch_or(bit, O::Relaxed);
+                                if prev & bit == 0 {
+                                    let nz = pcm_bytes.iter().filter(|b| **b != 0).count();
+                                    let first16: Vec<u8> = pcm_bytes.iter().take(16).copied().collect();
+                                    log::info!(
+                                        "voice[{}] wb[{}] PCM: addr={:#x}+{:#x}=src={:#x} size={:#x} read_ok={} nonzero_bytes={}/{} first16={:02x?} start_off={} end_off={}",
+                                        vid, wb_index, buffer_address, src_byte_off, src_va,
+                                        buffer_size, read_ok, nz, pcm_bytes.len(), first16,
+                                        start_offset, end_offset
+                                    );
+                                }
+                            }
+                            if !read_ok {
+                                continue;
+                            }
+                            let stride = 2 * ch;
+                            for f in 0..in_frames {
+                                let l = i16::from_le_bytes([
+                                    pcm_bytes[f * stride], pcm_bytes[f * stride + 1],
+                                ]);
+                                pcm_l[f] = (l as f32) / 32768.0;
+                                if ch == 2 {
+                                    let r = i16::from_le_bytes([
+                                        pcm_bytes[f * stride + 2], pcm_bytes[f * stride + 3],
+                                    ]);
+                                    pcm_r[f] = (r as f32) / 32768.0;
+                                } else {
+                                    pcm_r[f] = pcm_l[f];
+                                }
+                            }
+                        }
+
+                        let mut read_idx: usize = 0;
+                        let mut fraction: f32 = st
+                            .voice_fraction
+                            .get(vid)
+                            .copied()
+                            .unwrap_or(0.0);
+                        let master = voice_drop_param.clamp(0.0, 4.0);
+                        let gain = volume * master * 0.5;
+                        for i in 0..TARGET_FRAMES {
+                            let idx_a = read_idx.min(in_frames - 1);
+                            let idx_b = (read_idx + 1).min(in_frames - 1);
+                            let frac = fraction;
+                            let inv = 1.0 - frac;
+                            out_stereo[i * 2]     += (pcm_l[idx_a] * inv + pcm_l[idx_b] * frac) * gain;
+                            out_stereo[i * 2 + 1] += (pcm_r[idx_a] * inv + pcm_r[idx_b] * frac) * gain;
+                            fraction += ratio;
+                            let whole = fraction.floor();
+                            read_idx += whole as usize;
+                            fraction -= whole;
+                            if read_idx >= in_frames {
+                                read_idx = in_frames - 1;
+                            }
+                            let _ = i;
+                        }
+                        if let Some(slot) = st.voice_fraction.get_mut(vid) {
+                            *slot = fraction;
+                        }
+
+                        let src_frames_this_pass = (read_idx as u32)
+                            .saturating_add(if fraction >= 0.5 { 1 } else { 0 })
+                            .min(remaining as u32);
+                        voice_snapshot[vid].2 = true;
+                        voice_snapshot[vid].3 = src_frames_this_pass;
+                        voice_snapshot[vid].4 = wb_total_frames as u32;
+                        voice_snapshot[vid].5 = wb_count;
+                        voice_snapshot[vid].6 = is_looping;
+                    }
+                }
+
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering as O};
+                    static LOGGED: AtomicBool = AtomicBool::new(false);
+                    static CONSUMED_LOGGED: AtomicBool = AtomicBool::new(false);
+                    let mut any_mix = false;
+                    let mut any_consumed = false;
+                    for vid in 0..voice_count_seen {
+                        let (wb_now, is_new, did_mix, src_frames, wb_total, wb_count_now, is_looping) =
+                            voice_snapshot[vid];
+                        if did_mix { any_mix = true; }
+                        if is_new && !is_new_latched[vid] {
+                            st.voice_played_samples[vid] = 0;
+                            st.voice_wbufs_consumed[vid] = 0;
+                            st.voice_last_wb_index[vid] = wb_now;
+                            st.voice_is_new_seen[vid] = true;
+                            is_new_latched[vid] = true;
+                            if let Some(p) = st.voice_wb_progress_frames.get_mut(vid) {
+                                *p = 0;
+                            }
+                            if let Some(f) = st.voice_fraction.get_mut(vid) {
+                                *f = 0.0;
+                            }
+                        } else if did_mix && wb_total > 0 {
+                            st.voice_played_samples[vid] = st
+                                .voice_played_samples[vid]
+                                .wrapping_add(src_frames as u64);
+
+                            let prev_progress = st
+                                .voice_wb_progress_frames
+                                .get(vid)
+                                .copied()
+                                .unwrap_or(0);
+                            let mut new_progress = prev_progress
+                                .wrapping_add(src_frames as u64);
+
+                            let cap = wb_count_now.min(4) as u32;
+                            let mut completed: u32 = 0;
+                            if !is_looping {
+                                while new_progress >= wb_total as u64
+                                    && completed < cap
+                                {
+                                    new_progress -= wb_total as u64;
+                                    completed += 1;
+                                }
+                                if new_progress >= wb_total as u64 {
+                                    use std::sync::atomic::{AtomicBool, Ordering as O2};
+                                    static WARN_ONCE: AtomicBool = AtomicBool::new(false);
+                                    if !WARN_ONCE.swap(true, O2::Relaxed) {
+                                        log::warn!(
+                                            "audio voice[{}] consume cap hit: residue={} wb_total={} completed={} cap={} (wb_count={})",
+                                            vid, new_progress, wb_total, completed, cap, wb_count_now
+                                        );
+                                    }
+                                }
+                            } else {
+                                while new_progress >= wb_total as u64 {
+                                    new_progress -= wb_total as u64;
+                                }
+                            }
+
+                            if completed > 0 {
+                                st.voice_wbufs_consumed[vid] = st
+                                    .voice_wbufs_consumed[vid]
+                                    .wrapping_add(completed);
+                                any_consumed = true;
+                                block_consumed_wb = true;
+                                use std::sync::atomic::{AtomicU64, Ordering as O3};
+                                static PER_VOICE_LOGGED: AtomicU64 = AtomicU64::new(0);
+                                let bit = 1u64 << ((vid as u64) & 63);
+                                let prev_mask = PER_VOICE_LOGGED.fetch_or(bit, O3::Relaxed);
+                                if prev_mask & bit == 0 {
+                                    log::info!(
+                                        "voice[{}] FIRST CONSUMED BUMP: wb_index={}, samples_played={} (consumed_now={}, wb_total={}, completed={}, frame {})",
+                                        vid, wb_now, st.voice_played_samples[vid],
+                                        st.voice_wbufs_consumed[vid], wb_total, completed, frame
+                                    );
+                                }
+                            }
+                            if let Some(p) = st.voice_wb_progress_frames.get_mut(vid) {
+                                *p = new_progress;
+                            }
+                            st.voice_last_wb_index[vid] = wb_now;
+                        } else if did_mix {
+                            st.voice_played_samples[vid] = st
+                                .voice_played_samples[vid]
+                                .wrapping_add(TARGET_FRAMES as u64);
+                            st.voice_last_wb_index[vid] = wb_now;
+                        }
+                    }
+                    if any_mix && !LOGGED.swap(true, O::Relaxed) {
+                        let mixed_ids: Vec<usize> = (0..voice_count_seen)
+                            .filter(|&i| voice_snapshot[i].2).collect();
+                        log::info!(
+                            "audio multi-voice MIXED first time: voice_count_seen={} mixed_voices={:?} (frame {})",
+                            voice_count_seen, mixed_ids, frame
+                        );
+                    }
+                    if any_consumed && !CONSUMED_LOGGED.swap(true, O::Relaxed) {
+                        let states: Vec<(usize, u32, u64)> = (0..voice_count_seen)
+                            .filter(|&i| voice_snapshot[i].2)
+                            .map(|i| (
+                                i,
+                                st.voice_wbufs_consumed[i],
+                                st.voice_played_samples[i],
+                            ))
+                            .collect();
+                        log::info!(
+                            "audio wavebuf FIRST CONSUMED: voices={:?} (frame {})",
+                            states, frame
+                        );
+                    }
+                }
+                big_out.extend_from_slice(&out_stereo);
+                if block_consumed_wb { break; }
+                }
+
+                if let Some(ob) = out_buf {
+                    let mempools_sz: u32 = (mempool_count as u32) * 0x10;
+                    let voices_sz:   u32 = (voice_count_seen as u32) * 0x10;
+                    let total_size:  u32 = 0x40 + mempools_sz + voices_sz;
+                    let mut out = vec![0u8; total_size as usize];
+                    out[0x00..0x04].copy_from_slice(&revision.to_le_bytes());
+                    out[0x08..0x0C].copy_from_slice(&mempools_sz.to_le_bytes());
+                    out[0x0C..0x10].copy_from_slice(&voices_sz.to_le_bytes());
+                    out[0x3C..0x40].copy_from_slice(&total_size.to_le_bytes());
+
+                    for (i, &in_state) in mempool_in_states.iter().enumerate() {
+                        let new_state: u32 = match in_state {
+                            4 => 5,
+                            2 => 3,
+                            _ => 0,
+                        };
+                        let off = 0x40 + i * 0x10;
+                        out[off..off+4].copy_from_slice(&new_state.to_le_bytes());
+                    }
+
+                    let voices_off = 0x40 + (mempool_count * 0x10);
+                    for vid in 0..voice_count_seen {
+                        let off = voices_off + vid * 0x10;
+                        let played   = st.voice_played_samples.get(vid).copied().unwrap_or(0);
+                        let consumed = st.voice_wbufs_consumed.get(vid).copied().unwrap_or(0);
+                        out[off..off+8].copy_from_slice(&played.to_le_bytes());
+                        out[off+8..off+12].copy_from_slice(&consumed.to_le_bytes());
+                    }
+
+                    let n = out.len().min(ob.size as usize);
+                    let _ = kernel.address_space.write(ob.addr, &out[..n]);
+                }
+                if let Some(pb) = perf_buf {
+                    let zero = vec![0u8; (pb.size as usize).min(0x100)];
+                    let _ = kernel.address_space.write(pb.addr, &zero);
+                }
+
+                if std::env::var("NEXIUM_AUDIO_TEST_TONE").ok().as_deref() == Some("1") {
+                    let base_phase = (frame as f32) * (TARGET_FRAMES as f32);
+                    let phase_inc = std::f32::consts::TAU * 440.0 / TARGET_SR;
+                    let total_frames = big_out.len() / 2;
+                    for i in 0..total_frames {
+                        let s = (((base_phase + i as f32) * phase_inc).sin()) * 0.25;
+                        big_out[i * 2] = s;
+                        big_out[i * 2 + 1] = s;
+                    }
+                }
+
+                if let Some(sink) = crate::audio_sink::host_audio_sink() {
+                    let pushed = sink.push_stereo_f32(&big_out);
+                    let mix_peak = big_out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+                    use std::sync::atomic::{AtomicBool, Ordering as O};
+                    static FIRST_PUSH: AtomicBool = AtomicBool::new(false);
+                    static FIRST_NONZERO: AtomicBool = AtomicBool::new(false);
+                    if !FIRST_PUSH.swap(true, O::Relaxed) {
+                        log::info!(
+                            "audio: first push to sink — pushed {} frames of {} mix_peak={:.4} (frame {})",
+                            pushed, TARGET_FRAMES, mix_peak, frame
+                        );
+                    }
+                    if mix_peak > 0.001 && !FIRST_NONZERO.swap(true, O::Relaxed) {
+                        log::info!(
+                            "audio: FIRST NON-ZERO MIX — peak={:.4} pushed={}/{} (frame {})",
+                            mix_peak, pushed, TARGET_FRAMES, frame
+                        );
+                    }
+                }
+
+                log::trace!(
+                    "IAudioRenderer.RequestUpdate{} in={:?} out={:?} perf={:?} mempools={} voices={} frame={}",
+                    if cmd_id == 10 { "Auto" } else { "" },
+                    in_buf.map(|b| b.size), out_buf.map(|b| b.size),
+                    perf_buf.map(|b| b.size),
+                    mempool_count, voice_count_seen, frame
+                );
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            5 => {
+                st.state = 0;
+                log::info!("IAudioRenderer.Start");
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            6 => {
+                st.state = 1;
+                log::info!("IAudioRenderer.Stop");
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            7 => {
+                let event_handle = if let Some(&h) = kernel.audio_renderer_events.get(&key) {
+                    h
+                } else {
+                    let h = kernel.handles.create_handle(HandleType::Event);
+                    kernel.event_signals.insert(h, false);
+                    kernel.audio_renderer_events.insert(key, h);
+                    log::info!("IAudioRenderer.QuerySystemEvent → new event handle={:#x}", h);
+                    h
+                };
+                return build_ipc_response(ctx, 0, &[], &[event_handle]);
+            }
+            8 => {
+                let in_off = ctx.cmif_in_data_off;
+                if ctx.cmif_in_data_len >= 4 {
+                    st.rendering_time_limit = u32::from_le_bytes([
+                        ctx.buf[in_off], ctx.buf[in_off + 1],
+                        ctx.buf[in_off + 2], ctx.buf[in_off + 3],
+                    ]);
+                }
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            9 => {
+                let v = st.rendering_time_limit;
+                return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
+            }
+            12 => {
+                let in_off = ctx.cmif_in_data_off;
+                if ctx.cmif_in_data_len >= 4 {
+                    st.voice_drop_param = f32::from_le_bytes([
+                        ctx.buf[in_off], ctx.buf[in_off + 1],
+                        ctx.buf[in_off + 2], ctx.buf[in_off + 3],
+                    ]);
+                }
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            13 => {
+                let v = st.voice_drop_param;
+                return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
+            }
+            other => {
+                log::warn!("IAudioRenderer.cmd_{} UNHANDLED → empty SUCCESS", other);
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+        }
+    }
+
+    if port_name == "IAudioDevice" {
+        match cmd_id {
+            0 => {
+                let buf = ctx.recv_buffers.iter().find(|b| b.size > 0 && b.addr != 0)
+                    .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0))
+                    .copied();
+                if let Some(b) = buf {
+                    let mut name = vec![0u8; (b.size as usize).min(0x100)];
+                    let bytes = b"AudioTvOutput";
+                    let n = bytes.len().min(name.len());
+                    name[..n].copy_from_slice(&bytes[..n]);
+                    let _ = kernel.address_space.write(b.addr, &name);
+                }
+                let count: u32 = 1;
+                return build_ipc_response(ctx, 0, &count.to_le_bytes(), &[]);
+            }
+            1 => {
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            2 => {
+                let vol: f32 = 1.0;
+                return build_ipc_response(ctx, 0, &vol.to_le_bytes(), &[]);
+            }
+            3 => {
+                let buf = ctx.recv_buffers.iter().find(|b| b.size > 0 && b.addr != 0)
+                    .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0))
+                    .copied();
+                if let Some(b) = buf {
+                    let mut name = vec![0u8; (b.size as usize).min(0x100)];
+                    let bytes = b"AudioTvOutput";
+                    let n = bytes.len().min(name.len());
+                    name[..n].copy_from_slice(&bytes[..n]);
+                    let _ = kernel.address_space.write(b.addr, &name);
+                }
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            4 => {
+                let h = kernel.handles.create_handle(HandleType::Event);
+                kernel.event_signals.insert(h, true);
+                return build_ipc_response(ctx, 0, &[], &[h]);
+            }
+            5 => {
+                let ch: u32 = 2;
+                return build_ipc_response(ctx, 0, &ch.to_le_bytes(), &[]);
+            }
+            other => {
+                log::debug!("IAudioDevice.cmd_{} → empty SUCCESS", other);
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+        }
+    }
+
     if port_name == "audout:u" && cmd_id == 1 {
         let name_buf = ctx.recv_statics.iter()
             .find(|b| b.size > 0 && b.addr != 0)
@@ -1594,6 +2369,12 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
         log::debug!("{}.cmd_{} → returning data ({} bytes, handle={:?})", port_name, cmd_id, data.len(), handle_opt);
         let handles: Vec<u32> = handle_opt.into_iter().collect();
         return build_ipc_response(ctx, 0, &data, &handles);
+    }
+
+    if matches!(port_name, "time:u" | "time:s" | "time:a" | "time:r") && cmd_id == 20 {
+        let h = kernel.ensure_time_shmem_handle();
+        log::info!("time:u GetSharedMemoryNativeHandle → handle={:#x}", h);
+        return build_ipc_response(ctx, 0, &[], &[h]);
     }
 
     log::warn!("dispatch_service_v2: {} cmd_{} FELL THROUGH to legacy dispatch_service (probably needs a real handler)", port_name, cmd_id);
@@ -1820,7 +2601,35 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                         None
                     }
                 };
-                if let Some((addr, is_tiled)) = resolved {
+                if let (Some(rt_worker), Some(r_async)) = (
+                    nexium_nvdrv::render_thread::maybe_render_thread(),
+                    kernel.nvdrv.renderer().cloned(),
+                ) {
+                    let fq = kernel.nvdrv.frame_queue.clone();
+                    let qba = kernel.nvdrv.queue_buffer_active.clone();
+                    let (pw, ph, pnv) = (gb.width, gb.height, gb.nvmap_id);
+                    rt_worker.submit(Box::new(move || {
+                        if let Some(mut bytes) = r_async.readback_target(pnv, pw, ph) {
+                            let row = (pw as usize) * 4;
+                            let hh = ph as usize;
+                            if bytes.len() >= row * hh {
+                                for y in 0..hh / 2 {
+                                    let top = y * row;
+                                    let bot = (hh - 1 - y) * row;
+                                    let (a, b) = bytes.split_at_mut(bot);
+                                    a[top..top + row].swap_with_slice(&mut b[..row]);
+                                }
+                            }
+                            nexium_common::frame_present::set_last_presented(pw, ph, bytes.clone());
+                            qba.store(true, std::sync::atomic::Ordering::Relaxed);
+                            fq.lock().push(nexium_nvdrv::QueuedFrame {
+                                width: pw,
+                                height: ph,
+                                pixels: bytes,
+                            });
+                        }
+                    }));
+                } else if let Some((addr, is_tiled)) = resolved {
                     let read_size = if is_tiled { tiled_size } else { linear_size };
                     let mut raw = vec![0u8; read_size];
                     let mut effective_tiled = is_tiled;
@@ -1886,27 +2695,6 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                                 }
                             }
                         }
-                        let mut pixels = if effective_tiled {
-                            unswizzle_block_linear(&raw, gb.stride, gb.height, bpp, effective_bh_log2)
-                        } else {
-                            raw
-                        };
-                        if pixels.len() < linear_size { pixels.resize(linear_size, 0); }
-                        let legacy_gfx = kernel.nvdrv.legacy_gfx.load(std::sync::atomic::Ordering::Relaxed);
-                        if legacy_gfx {
-                            let row_bytes = (gb.width * (bpp as u32)) as usize;
-                            let h = gb.height as usize;
-                            for y in 0..h / 2 {
-                                let top = y * row_bytes;
-                                let bot = (h - 1 - y) * row_bytes;
-                                if bot + row_bytes <= pixels.len() {
-                                    let (a, b) = pixels.split_at_mut(bot);
-                                    a[top..top + row_bytes].swap_with_slice(&mut b[..row_bytes]);
-                                }
-                            }
-                        }
-                        for px in pixels.chunks_exact_mut(4) { px[3] = 0xFF; }
-                        let rgb_nz = pixels.chunks_exact(4).filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0).count();
                         let fermi_frame = kernel.nvdrv.drain_fermi2d_frame();
                         if let Some(qf) = fermi_frame.as_ref() {
                             log::info!(
@@ -1914,8 +2702,57 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                                 qf.width, qf.height, qf.pixels.len()
                             );
                         }
+                        let vk_readback = kernel
+                            .nvdrv
+                            .renderer()
+                            .and_then(|r| r.readback_target(gb.nvmap_id, gb.width, gb.height))
+                            .map(|mut bytes| {
+                                let row = (gb.width as usize) * 4;
+                                let h = gb.height as usize;
+                                if bytes.len() >= row * h {
+                                    for y in 0..h / 2 {
+                                        let top = y * row;
+                                        let bot = (h - 1 - y) * row;
+                                        let (a, b) = bytes.split_at_mut(bot);
+                                        a[top..top + row].swap_with_slice(&mut b[..row]);
+                                    }
+                                }
+                                bytes
+                            });
+                        let have_gpu_frame = fermi_frame.is_some() || vk_readback.is_some();
+                        let legacy_gfx = kernel.nvdrv.legacy_gfx.load(std::sync::atomic::Ordering::Relaxed);
+                        let (mut pixels, rgb_nz) = if have_gpu_frame {
+                            (Vec::new(), 0usize)
+                        } else {
+                            let mut pixels = if effective_tiled {
+                                unswizzle_block_linear(&raw, gb.stride, gb.height, bpp, effective_bh_log2)
+                            } else {
+                                raw
+                            };
+                            if pixels.len() < linear_size { pixels.resize(linear_size, 0); }
+                            if legacy_gfx {
+                                let row_bytes = (gb.width * (bpp as u32)) as usize;
+                                let h = gb.height as usize;
+                                for y in 0..h / 2 {
+                                    let top = y * row_bytes;
+                                    let bot = (h - 1 - y) * row_bytes;
+                                    if bot + row_bytes <= pixels.len() {
+                                        let (a, b) = pixels.split_at_mut(bot);
+                                        a[top..top + row_bytes].swap_with_slice(&mut b[..row_bytes]);
+                                    }
+                                }
+                            }
+                            for px in pixels.chunks_exact_mut(4) { px[3] = 0xFF; }
+                            let rgb_nz = pixels.chunks_exact(4).filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0).count();
+                            (pixels, rgb_nz)
+                        };
                         let (frame_w, frame_h, frame_pixels) = if let Some(qf) = fermi_frame {
                             (qf.width, qf.height, qf.pixels)
+                        } else if let Some(bytes) = vk_readback {
+                            nexium_common::frame_present::set_last_presented(
+                                gb.width, gb.height, bytes.clone(),
+                            );
+                            (gb.width, gb.height, bytes)
                         } else if rgb_nz >= 16 {
                             if legacy_gfx {
                                 if let Some((x0, y0, w, h)) = active_bbox(&pixels, gb.width, gb.height) {
@@ -2023,7 +2860,27 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
             }
             kernel.last_vsync = std::time::Instant::now();
 
-            kernel.nvdrv.pace_swap(swap_interval);
+            {
+                const VSYNC_NS: u64 = 16_666_667;
+                let n = swap_interval.clamp(1, 4) as u64;
+                let target = std::time::Duration::from_nanos(VSYNC_NS.saturating_mul(n));
+                use parking_lot::Mutex;
+                use std::sync::OnceLock;
+                static LAST_SWAP: OnceLock<Mutex<std::time::Instant>> = OnceLock::new();
+                let cell = LAST_SWAP.get_or_init(|| Mutex::new(std::time::Instant::now()));
+                let mut last = cell.lock();
+                let wake = *last + target;
+                let now = std::time::Instant::now();
+                if wake > now {
+                    *last = wake;
+                    drop(last);
+                    kernel.present_pace_until = Some(wake);
+                } else if now.duration_since(wake) > std::time::Duration::from_millis(100) {
+                    *last = now;
+                } else {
+                    *last = wake;
+                }
+            }
 
             let (qw, qh) = kernel.nvdrv.with_bufferqueue(binder_id, |bq| (bq.width, bq.height));
             let mut p = ParcelBuilder::new();
@@ -2841,17 +3698,33 @@ fn svc_wait_for_address(kernel: &mut Kernel) -> u32 {
         let _ = kernel.address_space.write(addr, &current.wrapping_sub(1).to_le_bytes());
     }
 
+    const KERNEL_TIMEOUT: u32 = 1 | (117 << 9);
+    if timeout_ns == 0 {
+        if let Some(cpu) = &mut kernel.cpu {
+            cpu.set_register(0, KERNEL_TIMEOUT as u64);
+        }
+        return KERNEL_TIMEOUT;
+    }
+
     let cap = std::time::Duration::from_millis(100);
-    let wait = if timeout_ns == u64::MAX || timeout_ns == 0 {
+    let wait = if timeout_ns == u64::MAX {
         cap
     } else {
         std::time::Duration::from_nanos(timeout_ns).min(cap)
     };
     if wait > std::time::Duration::ZERO {
-        std::thread::sleep(wait);
+        if let Some(cpu) = kernel.cpu.as_ref() {
+            let wake_at = std::time::Instant::now() + wait;
+            kernel.threads.yield_with_state(
+                cpu,
+                crate::kernel::threads::ThreadState::Sleeping { wake_at },
+            );
+        }
+    }
+    if !kernel.threads.ready.is_empty() {
+        kernel.yield_after_svc = true;
     }
 
-    const KERNEL_TIMEOUT: u32 = 1 | (117 << 9);
     if let Some(cpu) = &mut kernel.cpu {
         cpu.set_register(0, KERNEL_TIMEOUT as u64);
     }
@@ -3030,6 +3903,7 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         return 1;
     };
 
+
     let val: u64 = match info_type {
         0  => 0xF,
         1  => 0x0001_0000_0000,
@@ -3042,7 +3916,16 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         8  => 0,
         9  => kernel.stack_base,
         10 => kernel.stack_size,
-        11 => 0xCAFE_F00D_DEAD_BEEF,
+        11 => {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut z = c.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
         12 => kernel.code_base,
         13 => 0x40_0000_0000,
         14 => kernel.stack_base,

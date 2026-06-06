@@ -8,14 +8,14 @@ impl AudioService {
     }
 
     pub fn dispatch(&self, cmd_id: u32) -> u32 {
-        log::debug!("audio cmd: {}", cmd_id);
+        log::debug!("audio cmd: {} (legacy dispatch)", cmd_id);
         match cmd_id {
             0 => self.cmd_open_audio_out(),
             1 => self.cmd_open_audio_renderer(),
             2 => self.cmd_query_audio_device_list(),
             _ => {
-                log::warn!("unknown audio command: {}", cmd_id);
-                1
+                log::debug!("unknown audio command: {}", cmd_id);
+                0
             }
         }
     }

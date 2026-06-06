@@ -214,6 +214,7 @@ impl Services {
             "am" | "appletOE" | "appletAE" => self.am.dispatch(cmd_id),
             "vi:m" | "vi:s" | "vi:u" => self.vi.dispatch(cmd_id),
             "audio" | "audout:u" => self.audio.dispatch(cmd_id),
+            "audren:u" | "audren:a" => 0,
             "fsp-srv" => self.fs.dispatch(cmd_id),
             "nifm:u" | "nifm:a" => self.nifm.dispatch(cmd_id),
             "nvnflinger" | "dispdrv" => self.nvnflinger.dispatch(cmd_id, ctx),
