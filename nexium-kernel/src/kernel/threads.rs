@@ -3,8 +3,6 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 use crate::kernel::cpu_local::current_core;
 
-/// Number of guest CPU cores the scheduler tracks. Host threads drive cores
-/// 0..N at runtime (just core 0 on the single-thread path).
 pub const NUM_CORES: usize = 4;
 
 #[derive(Copy, Clone, Debug)]
@@ -42,14 +40,11 @@ pub struct Thread {
     pub tls_va: u64,
     pub stack_top: u64,
     pub priority: i32,
-    /// Ideal-core affinity from svcCreateThread (-2 = "any/default"). The shared
-    /// ready queue lets any host core pick it up; honored once affinity matters.
     pub core: i32,
 }
 
 pub struct Threads {
     pub threads: HashMap<u32, Thread>,
-    /// Currently-running guest thread per host core (indexed by current_core()).
     pub current: [Option<u32>; NUM_CORES],
     pub ready: VecDeque<u32>,
     pub next_tid: u64,
@@ -71,7 +66,7 @@ impl Threads {
                 tls_va: main_tls_va,
                 stack_top: main_stack_top,
                 priority: 0x2C,
-                core: 0, // main thread pinned to core 0 (owns the boot/GPU mappings)
+                core: 0,
             },
         );
         Self {
@@ -303,10 +298,6 @@ impl Threads {
     }
 
     pub fn pick_next(&mut self) -> Option<u32> {
-        // Sticky affinity: a core only picks ready threads pinned to it, or
-        // unassigned (core < 0) threads which it then claims. Once a thread runs
-        // on a core it never migrates, so its context and dynamic memory
-        // mappings stay coherent on that core's Cpu (no cross-core ctx race).
         let core = current_core() as i32;
         let pos = self
             .ready

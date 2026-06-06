@@ -30,11 +30,7 @@ impl BootConfig {
 pub struct BootContext {
     pub nro: Nro,
     pub address_space: Arc<AddressSpace>,
-    /// Shared across host-thread cores. Each core locks it only for scheduling +
-    /// SVC dispatch and releases it around cpu.run, so cores execute in parallel.
     pub kernel: Arc<Mutex<Kernel>>,
-    /// Core 0's CPU. Owned here (not in `Kernel`) so each host core can own its
-    /// own `Cpu`; the run loop publishes it to `cpu_local` around dispatch.
     pub cpu: Option<Cpu>,
 }
 

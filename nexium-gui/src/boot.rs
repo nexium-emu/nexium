@@ -160,10 +160,6 @@ impl EmulationHandle {
             use nexium_kernel::kernel::cpu_local::{cpu_mut, cpu_ref};
             let mut last_map_gen0 = boot_ctx.address_space.generation();
 
-            // Host core 1: runs ready guest threads on its own Cpu in parallel with
-            // core 0. Sticky thread affinity (threads pin to their core on first run)
-            // keeps each thread's context + memory mappings coherent on one core, so
-            // there's no cross-core migration race. Set NEXIUM_SINGLECORE=1 to disable.
             let core1_stop = Arc::new(AtomicBool::new(false));
             let core1_handle = if std::env::var("NEXIUM_SINGLECORE").is_err() {
                 let kernel_c1 = Arc::clone(&boot_ctx.kernel);
@@ -191,8 +187,6 @@ impl EmulationHandle {
                                 std::thread::sleep(std::time::Duration::from_micros(200));
                                 continue;
                             }
-                            // Plumb regions mapped since last sync into this core's Cpu
-                            // before running guest code that may touch them.
                             let gen = addr_c1.generation();
                             if gen != last_map_gen1 {
                                 for r in addr_c1.host_regions() {
@@ -288,9 +282,6 @@ impl EmulationHandle {
             let mut last_loop_log = std::time::Instant::now();
             loop {
                 loop_iter += 1;
-                // Lock the shared kernel for scheduling + dispatch. Released
-                // explicitly around cpu.run and the idle sleep (below) so the
-                // other host core can run; continue/break auto-drop it.
                 let mut guard = boot_ctx.kernel.lock();
                 if last_loop_log.elapsed() >= std::time::Duration::from_secs(1) {
                     let cur = guard.threads.current_handle();
@@ -414,7 +405,7 @@ impl EmulationHandle {
                         }
                         None => std::time::Duration::from_millis(2),
                     };
-                    drop(guard); // release before sleeping so the other core can run
+                    drop(guard);
                     if !sleep_dur.is_zero() {
                         std::thread::sleep(sleep_dur);
                     }
@@ -429,8 +420,7 @@ impl EmulationHandle {
                         .ok()
                         .and_then(|v| v.parse::<u64>().ok())
                         .unwrap_or(1_000_000);
-                    drop(guard); // release the kernel lock around cpu.run for parallelism
-                    // Plumb regions mapped since last sync into this core's Cpu.
+                    drop(guard);
                     let gen = boot_ctx.address_space.generation();
                     if gen != last_map_gen0 {
                         for r in boot_ctx.address_space.host_regions() {
@@ -440,11 +430,7 @@ impl EmulationHandle {
                     }
                     let event = cpu.run(cpu_slice);
                     let pc_after = cpu.get_pc();
-                    let mut guard = boot_ctx.kernel.lock(); // re-acquire for post-run + dispatch
-                    // Save the running thread's context now (under the lock, before
-                    // dispatch) so if a wait-handler parks it, a concurrent signal
-                    // from the other core wakes it with the correct post-svc context
-                    // rather than a stale one. Fixes the cross-core condvar race.
+                    let mut guard = boot_ctx.kernel.lock();
                     guard.threads.save_current_ctx(cpu);
                     cycle_count += cpu_slice;
                     guard.cycle_count += cpu_slice;
@@ -750,7 +736,6 @@ impl EmulationHandle {
 
             log::info!("Emulation complete: {} cycles, {} SVCs", cycle_count, svc_count);
 
-            // Stop + join host core 1 before tearing down or chain-loading.
             core1_stop.store(true, Ordering::Relaxed);
             if let Some(h) = core1_handle {
                 let _ = h.join();

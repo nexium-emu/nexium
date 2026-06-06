@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if imm == 0x26 {
                         break_count += 1;
                         writeln!(log, "[{}] Break #{} encountered, continuing execution...", cycle_count, break_count)?;
-                        guard.process_exited = false;  // Override the exit flag
+                        guard.process_exited = false;
                         log.flush()?;
                     }
 

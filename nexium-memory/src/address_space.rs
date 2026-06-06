@@ -105,9 +105,6 @@ unsafe impl Sync for HostRegion {}
 
 pub struct AddressSpace {
     regions: Mutex<Vec<Arc<Region>>>,
-    /// Bumped on every map(). Each host-core Cpu tracks the last generation it
-    /// synced so it can re-plumb regions mapped after its own init (multicore:
-    /// regions mapped on one core must reach the other core's Cpu).
     generation: AtomicU64,
 }
 
@@ -116,8 +113,6 @@ impl AddressSpace {
         Self { regions: Mutex::new(Vec::new()), generation: AtomicU64::new(0) }
     }
 
-    /// Monotonic counter of mapping changes; compare against a per-Cpu snapshot
-    /// to know when host-pointer mappings need re-syncing to that Cpu.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }

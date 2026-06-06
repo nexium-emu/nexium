@@ -22,7 +22,6 @@ pub fn set_current_cpu(cpu: &mut Cpu, core: usize) -> CpuGuard {
     CpuGuard(())
 }
 
-/// The guest core id this host thread executes as (0 on the single-thread path).
 pub fn current_core() -> usize {
     CURRENT_CORE.with(|c| c.get())
 }
