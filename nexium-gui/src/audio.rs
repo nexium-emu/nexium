@@ -322,6 +322,8 @@ fn drain_stereo_to(
     use std::sync::atomic::{AtomicBool, AtomicU32 as AU32};
     static FIRED: AtomicBool = AtomicBool::new(false);
     static CALL_COUNT: AU32 = AU32::new(0);
+    static MIN_OCC: AU32 = AU32::new(u32::MAX);
+    static EMPTY_CT: AU32 = AU32::new(0);
     if !FIRED.swap(true, Ordering::Relaxed) {
         log::info!(
             "cpal callback FIRST FIRE: out_len={} dev_ch={} ratio={:.3}",
@@ -332,6 +334,8 @@ fn drain_stereo_to(
     let vol = f32::from_bits(volume.load(Ordering::Relaxed));
 
     let occ = consumer.occupied_len();
+    MIN_OCC.fetch_min(occ as u32, Ordering::Relaxed);
+    if occ == 0 { EMPTY_CT.fetch_add(1, Ordering::Relaxed); }
     if prebuf.priming {
         if occ >= PREBUF_TARGET_SAMPLES {
             prebuf.priming = false;
@@ -376,10 +380,12 @@ fn drain_stereo_to(
         acc += resample_ratio;
         frames_written += 1;
     }
-    if n == 1 || (n > 0 && n % 100 == 0) {
+    if n == 1 || (n > 0 && n % 50 == 0) {
+        let min_occ = MIN_OCC.swap(u32::MAX, Ordering::Relaxed);
+        let empty_ct = EMPTY_CT.swap(0, Ordering::Relaxed);
         log::info!(
-            "cpal callback #{}: frames_written={} peak_amp={:.4} priming={} occ={}",
-            n, frames_written, peak, priming, occ
+            "cpal callback #{}: peak_amp={:.4} priming={} occ={} min_occ={} empty={}",
+            n, peak, priming, occ, min_occ, empty_ct
         );
     }
     let render_frames = ((frames_written as f32) * resample_ratio).round() as u64;
