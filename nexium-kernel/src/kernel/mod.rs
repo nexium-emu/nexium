@@ -27,7 +27,6 @@ pub struct Kernel {
     pub sessions: HashMap<u32, session::Session>,
     pub event_signals: HashMap<u32, bool>,
     pub tls_buffer: [u8; 0x100],
-    pub cpu: Option<Cpu>,
     pub pending_frames: Vec<FrameOut>,
 
     pub code_base: u64,
@@ -158,7 +157,6 @@ impl Kernel {
             sessions: HashMap::new(),
             event_signals: HashMap::new(),
             tls_buffer: [0u8; 0x100],
-            cpu: None,
             pending_frames: Vec::new(),
             code_base,
             code_size,
@@ -286,18 +284,18 @@ impl Kernel {
     }
 
     pub fn ensure_thread_loaded(&mut self) -> Option<u32> {
-        let cpu = self.cpu.as_mut()?;
+        let cpu = cpu_local::cpu_mut()?;
         self.threads.ensure_thread_loaded(cpu)
     }
 
     pub fn yield_to_scheduler(&mut self) {
-        if let Some(cpu) = self.cpu.as_ref() {
+        if let Some(cpu) = cpu_local::cpu_ref() {
             self.threads.yield_current(cpu);
         }
     }
 
 
-    pub fn init_cpu(&mut self, backend: nexium_cpu::CpuBackendKind) -> Result<(), String> {
+    pub fn init_cpu(&self, backend: nexium_cpu::CpuBackendKind) -> Result<Cpu, String> {
         let mut cpu = Cpu::new(backend)?;
         for region in self.address_space.host_regions() {
             unsafe {
@@ -306,8 +304,7 @@ impl Kernel {
             }
         }
         log::info!("Kernel CPU initialized with {} mapped regions", self.address_space.host_regions().len());
-        self.cpu = Some(cpu);
-        Ok(())
+        Ok(cpu)
     }
 
     pub fn drain_frames(&mut self) -> Vec<FrameOut> {

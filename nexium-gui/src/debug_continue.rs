@@ -25,6 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = BootConfig::new(&nro_path);
     let mut boot_ctx = BootContext::new(config)?;
+    let mut cpu = boot_ctx.cpu.take().expect("BootContext CPU not initialized");
+    let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu);
+    use nexium_kernel::kernel::cpu_local::cpu_mut;
 
     writeln!(log, "Boot context initialized, starting emulation...")?;
     log.flush()?;
@@ -35,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut break_count = 0u32;
 
     loop {
-        if let Some(cpu) = &mut boot_ctx.kernel.cpu {
+        if let Some(cpu) = cpu_mut() {
             let pc_before = cpu.get_pc();
             let event = cpu.run(100_000);
             cycle_count += 100_000;
@@ -61,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let result = boot_ctx.kernel.dispatch_svc(imm);
 
-                    if let Some(cpu) = &mut boot_ctx.kernel.cpu {
+                    if let Some(cpu) = cpu_mut() {
                         cpu.set_register(0, result as u64);
                     }
 

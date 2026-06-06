@@ -152,12 +152,12 @@ impl EmulationHandle {
             config.cpu_backend = cpu_backend;
             let mut boot_ctx = BootContext::new(config)?;
 
-            if let Some(cpu) = boot_ctx.kernel.cpu.as_ref() {
-                cpu.set_continue_on_null(true);
-                log::info!("dynarmic: continue_on_null=ON (will absorb null-zone reads as 0 to keep going)");
-            }
-
-            let halt = boot_ctx.kernel.cpu.as_ref().map(|c| c.halt_handle());
+            let mut cpu = boot_ctx.cpu.take().expect("BootContext CPU not initialized");
+            cpu.set_continue_on_null(true);
+            log::info!("dynarmic: continue_on_null=ON (will absorb null-zone reads as 0 to keep going)");
+            let halt = Some(cpu.halt_handle());
+            let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu);
+            use nexium_kernel::kernel::cpu_local::{cpu_mut, cpu_ref};
             let last_svc_ms = Arc::new(AtomicU64::new(0));
             let watchdog_stop = Arc::new(AtomicBool::new(false));
             let watchdog_halts = Arc::new(AtomicU64::new(0));
@@ -232,7 +232,7 @@ impl EmulationHandle {
                 loop_iter += 1;
                 if last_loop_log.elapsed() >= std::time::Duration::from_secs(1) {
                     let cur = boot_ctx.kernel.threads.current_handle();
-                    let pc_now = boot_ctx.kernel.cpu.as_ref().map(|c| c.get_pc()).unwrap_or(0);
+                    let pc_now = cpu_ref().map(|c| c.get_pc()).unwrap_or(0);
                     let halts = watchdog_halts.load(Ordering::Relaxed);
                     log::warn!(
                         "[loop-tick] iter={} svc={} cyc={} cur={:?} pc={:#x} halts={}",
@@ -256,8 +256,8 @@ impl EmulationHandle {
                         let nthreads = boot_ctx.kernel.threads.threads.len();
                         let nready = boot_ctx.kernel.threads.ready.len();
                         let halts = watchdog_halts.load(Ordering::Relaxed);
-                        let null_skips = boot_ctx.kernel.cpu.as_ref().map(|c| c.null_skip_count()).unwrap_or(0);
-                        let (cur_pc, lr, sp, x0, x1, x19, x20, x21, x22) = if let Some(c) = boot_ctx.kernel.cpu.as_ref() {
+                        let null_skips = cpu_ref().map(|c| c.null_skip_count()).unwrap_or(0);
+                        let (cur_pc, lr, sp, x0, x1, x19, x20, x21, x22) = if let Some(c) = cpu_ref() {
                             (c.get_pc(), c.get_register(30), c.get_sp(), c.get_register(0), c.get_register(1), c.get_register(19), c.get_register(20), c.get_register(21), c.get_register(22))
                         } else {
                             (0, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -357,7 +357,7 @@ impl EmulationHandle {
 
                 boot_ctx.kernel.threads.wake_due_sleepers(std::time::Instant::now());
 
-                if let Some(cpu) = &mut boot_ctx.kernel.cpu {
+                if let Some(cpu) = cpu_mut() {
                     let pc_before = cpu.get_pc();
                     let cpu_slice: u64 = std::env::var("NEXIUM_CPU_SLICE")
                         .ok()
@@ -606,7 +606,7 @@ impl EmulationHandle {
 
                     if let nexium_core::cpu::CpuEvent::Svc(imm) = event_copy {
                         let result = boot_ctx.kernel.dispatch_svc(imm);
-                        if let Some(cpu) = &mut boot_ctx.kernel.cpu {
+                        if let Some(cpu) = cpu_mut() {
                             cpu.set_register(0, result as u64);
                         }
                         let pace_present = boot_ctx.kernel.present_pace_until.take();
@@ -624,7 +624,7 @@ impl EmulationHandle {
                             let from = boot_ctx.kernel.threads.current_handle();
                             let ready_len = boot_ctx.kernel.threads.ready.len();
                             boot_ctx.kernel.yield_after_svc = false;
-                            if let Some(cpu) = boot_ctx.kernel.cpu.as_ref() {
+                            if let Some(cpu) = cpu_ref() {
                                 let state = match pace_present {
                                     Some(wake_at) if wake_at > std::time::Instant::now() => {
                                         nexium_core::kernel::threads::ThreadState::Sleeping { wake_at }

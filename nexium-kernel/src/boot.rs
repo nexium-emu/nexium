@@ -1,6 +1,7 @@
 use nexium_memory::{AddressSpace, Perm};
 use nexium_loader::{Loader, Nro};
 use crate::kernel::Kernel;
+use nexium_cpu::Cpu;
 use std::sync::Arc;
 
 pub struct BootConfig {
@@ -29,6 +30,9 @@ pub struct BootContext {
     pub nro: Nro,
     pub address_space: Arc<AddressSpace>,
     pub kernel: Kernel,
+    /// Core 0's CPU. Owned here (not in `Kernel`) so each host core can own its
+    /// own `Cpu`; the run loop publishes it to `cpu_local` around dispatch.
+    pub cpu: Option<Cpu>,
 }
 
 impl BootContext {
@@ -134,10 +138,10 @@ impl BootContext {
         env_builder.build_into(&address_space, env_base)?;
 
         log::info!("Initializing CPU (backend: {})", config.cpu_backend.label());
-        kernel.init_cpu(config.cpu_backend)
+        let mut cpu = kernel.init_cpu(config.cpu_backend)
             .map_err(|e| format!("Failed to init CPU: {}", e))?;
 
-        if let Some(cpu) = &mut kernel.cpu {
+        {
             log::info!("Setting up CPU registers");
             let entry_point = code_base;
             let sp = stack_base + config.stack_size - 0x20;
@@ -162,6 +166,7 @@ impl BootContext {
             nro,
             address_space,
             kernel,
+            cpu: Some(cpu),
         })
     }
 
@@ -196,52 +201,50 @@ impl BootContext {
         let mut cycle_count = 0u64;
         let mut svc_count = 0u32;
 
+        let mut cpu = self.cpu.take().ok_or_else(|| "CPU not initialized".to_string())?;
+        let _cpu_guard = crate::kernel::cpu_local::set_current_cpu(&mut cpu);
+        use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
+
         loop {
-            if let Some(cpu) = &mut self.kernel.cpu {
-                let event = cpu.run(100_000);
+            let event = cpu_mut().unwrap().run(100_000);
 
-                cycle_count += 100_000;
+            cycle_count += 100_000;
 
-                match event {
-                    nexium_cpu::CpuEvent::Running => {
-                        if cycle_count % 10_000_000 == 0 {
-                            log::info!("CPU running... {} cycles executed (no SVCs yet)", cycle_count);
-                        }
-                    }
-                    nexium_cpu::CpuEvent::Svc(imm) => {
-                        svc_count += 1;
-                        log::info!("SVC {:#04x} (count: {})", imm, svc_count);
-
-                        let result = self.kernel.dispatch_svc(imm);
-
-                        if let Some(cpu) = &mut self.kernel.cpu {
-                            cpu.set_register(0, result as u64);
-                        }
-
-                        if result == 0 || result == 1 {
-                            continue;
-                        }
-                    }
-                    nexium_cpu::CpuEvent::Stalled => {
-                        log::info!("CPU stalled at {:#x}", cpu.get_pc());
-                        break;
-                    }
-                    nexium_cpu::CpuEvent::Interrupted => {
-                        log::info!("CPU interrupted");
-                        break;
-                    }
-                    nexium_cpu::CpuEvent::Exception(code) => {
-                        log::error!("CPU exception {:#x}", code);
-                        break;
+            match event {
+                nexium_cpu::CpuEvent::Running => {
+                    if cycle_count % 10_000_000 == 0 {
+                        log::info!("CPU running... {} cycles executed (no SVCs yet)", cycle_count);
                     }
                 }
+                nexium_cpu::CpuEvent::Svc(imm) => {
+                    svc_count += 1;
+                    log::info!("SVC {:#04x} (count: {})", imm, svc_count);
 
-                if cycle_count > max_cycles {
-                    log::warn!("Max cycles exceeded, stopping execution");
+                    let result = self.kernel.dispatch_svc(imm);
+
+                    cpu_mut().unwrap().set_register(0, result as u64);
+
+                    if result == 0 || result == 1 {
+                        continue;
+                    }
+                }
+                nexium_cpu::CpuEvent::Stalled => {
+                    log::info!("CPU stalled at {:#x}", cpu_ref().unwrap().get_pc());
                     break;
                 }
-            } else {
-                return Err("CPU not initialized".to_string());
+                nexium_cpu::CpuEvent::Interrupted => {
+                    log::info!("CPU interrupted");
+                    break;
+                }
+                nexium_cpu::CpuEvent::Exception(code) => {
+                    log::error!("CPU exception {:#x}", code);
+                    break;
+                }
+            }
+
+            if cycle_count > max_cycles {
+                log::warn!("Max cycles exceeded, stopping execution");
+                break;
             }
         }
 
