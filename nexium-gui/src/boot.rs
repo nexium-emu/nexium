@@ -118,7 +118,7 @@ pub struct EmulationHandle {
 }
 
 impl EmulationHandle {
-    pub fn new(nro_path: &str) -> Result<Self, String> {
+    pub fn new(nro_path: &str, cpu_backend: nexium_cpu::CpuBackendKind) -> Result<Self, String> {
         let nro_path = nro_path.to_string();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);
@@ -149,6 +149,7 @@ impl EmulationHandle {
 
             let mut config = BootConfig::new(&cur_nro_path);
             config.loader_path = Some(initial_loader_argv.clone());
+            config.cpu_backend = cpu_backend;
             let mut boot_ctx = BootContext::new(config)?;
 
             if let Some(cpu) = boot_ctx.kernel.cpu.as_ref() {
@@ -335,10 +336,15 @@ impl EmulationHandle {
                 }
 
                 if boot_ctx.kernel.ensure_thread_loaded().is_none() {
+                    boot_ctx.kernel.tick_audio_renderers();
+                    boot_ctx.kernel.threads.wake_due_sleepers(std::time::Instant::now());
+                    if boot_ctx.kernel.ensure_thread_loaded().is_some() {
+                        continue;
+                    }
                     if let Some(wake) = boot_ctx.kernel.threads.earliest_wake() {
                         let now = std::time::Instant::now();
                         if wake > now {
-                            let dur = (wake - now).min(std::time::Duration::from_millis(8));
+                            let dur = (wake - now).min(std::time::Duration::from_millis(2));
                             std::thread::sleep(dur);
                         }
                         boot_ctx.kernel.threads.wake_due_sleepers(std::time::Instant::now());
@@ -353,10 +359,14 @@ impl EmulationHandle {
 
                 if let Some(cpu) = &mut boot_ctx.kernel.cpu {
                     let pc_before = cpu.get_pc();
-                    let event = cpu.run(100_000);
+                    let cpu_slice: u64 = std::env::var("NEXIUM_CPU_SLICE")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(1_000_000);
+                    let event = cpu.run(cpu_slice);
                     let pc_after = cpu.get_pc();
-                    cycle_count += 100_000;
-                    boot_ctx.kernel.cycle_count += 100_000;
+                    cycle_count += cpu_slice;
+                    boot_ctx.kernel.cycle_count += cpu_slice;
 
                     if pc_after < 0x10000 {
                         let cur = boot_ctx.kernel.threads.current_handle();
@@ -599,20 +609,33 @@ impl EmulationHandle {
                         if let Some(cpu) = &mut boot_ctx.kernel.cpu {
                             cpu.set_register(0, result as u64);
                         }
+                        let pace_present = boot_ctx.kernel.present_pace_until.take();
                         let timeslice = boot_ctx.kernel.threads.timeslice_expired(std::time::Duration::from_millis(4));
-                        let should_yield = boot_ctx.kernel.yield_after_svc || timeslice;
+                        let should_yield =
+                            boot_ctx.kernel.yield_after_svc || timeslice || pace_present.is_some();
                         if should_yield {
-                            let reason = if boot_ctx.kernel.yield_after_svc { "flag" } else { "timeslice" };
+                            let reason = if pace_present.is_some() {
+                                "present-pace"
+                            } else if boot_ctx.kernel.yield_after_svc {
+                                "flag"
+                            } else {
+                                "timeslice"
+                            };
                             let from = boot_ctx.kernel.threads.current_handle();
                             let ready_len = boot_ctx.kernel.threads.ready.len();
                             boot_ctx.kernel.yield_after_svc = false;
                             if let Some(cpu) = boot_ctx.kernel.cpu.as_ref() {
-                                boot_ctx.kernel.threads.yield_with_state(
-                                    cpu,
-                                    nexium_core::kernel::threads::ThreadState::Ready,
-                                );
+                                let state = match pace_present {
+                                    Some(wake_at) if wake_at > std::time::Instant::now() => {
+                                        nexium_core::kernel::threads::ThreadState::Sleeping { wake_at }
+                                    }
+                                    _ => nexium_core::kernel::threads::ThreadState::Ready,
+                                };
+                                boot_ctx.kernel.threads.yield_with_state(cpu, state);
                             }
-                            log::info!("[yield] reason={} from={:?} ready_before={}", reason, from, ready_len);
+                            if reason != "present-pace" {
+                                log::info!("[yield] reason={} from={:?} ready_before={}", reason, from, ready_len);
+                            }
                         }
                     }
 
@@ -628,6 +651,8 @@ impl EmulationHandle {
                     for f in boot_ctx.kernel.drain_frames() {
                         let _ = frame_tx.try_send(f.into());
                     }
+
+                    boot_ctx.kernel.tick_audio_renderers();
 
                     if svc_count % 256 == 0 {
                         boot_ctx.kernel.threads.drop_exited();

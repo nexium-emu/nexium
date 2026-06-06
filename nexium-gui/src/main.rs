@@ -28,6 +28,11 @@ fn main() -> Result<(), eframe::Error> {
 
     log::info!("=== NeXium - Nintendo Switch Emulator ===");
 
+    audio::init_host_audio(
+        settings.audio_output_device.as_deref(),
+        settings.audio_volume,
+    );
+
     let nro_arg = std::env::args().nth(1);
 
     let icon = eframe::icon_data::from_png_bytes(
@@ -40,6 +45,7 @@ fn main() -> Result<(), eframe::Error> {
             .with_icon(icon)
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([640.0, 480.0]),
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 

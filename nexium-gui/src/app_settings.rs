@@ -2,6 +2,37 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CpuBackend {
+    Dynarmic,
+    Rustarmic,
+}
+
+impl Default for CpuBackend {
+    fn default() -> Self { CpuBackend::Dynarmic }
+}
+
+impl CpuBackend {
+    pub fn all() -> &'static [CpuBackend] {
+        &[CpuBackend::Dynarmic, CpuBackend::Rustarmic]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            CpuBackend::Dynarmic  => "Dynarmic (C++)",
+            CpuBackend::Rustarmic => "Rustarmic (Rust JIT)",
+        }
+    }
+    pub fn to_cpu_kind(&self) -> nexium_cpu::CpuBackendKind {
+        match self {
+            CpuBackend::Dynarmic  => nexium_cpu::CpuBackendKind::Dynarmic,
+            CpuBackend::Rustarmic => nexium_cpu::CpuBackendKind::Rustarmic,
+        }
+    }
+    pub fn is_compiled_in(&self) -> bool {
+        self.to_cpu_kind().is_compiled_in()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogLevel {
     Error,
     Warn,
@@ -36,14 +67,78 @@ impl LogLevel {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AspectMode { Letterbox, Stretch, Integer }
+
+impl Default for AspectMode {
+    fn default() -> Self { AspectMode::Letterbox }
+}
+
+impl AspectMode {
+    pub fn all() -> &'static [AspectMode] {
+        &[AspectMode::Letterbox, AspectMode::Stretch, AspectMode::Integer]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            AspectMode::Letterbox => "Letterbox",
+            AspectMode::Stretch   => "Stretch",
+            AspectMode::Integer   => "Integer",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilterMode { Nearest, Linear }
+
+impl Default for FilterMode {
+    fn default() -> Self { FilterMode::Nearest }
+}
+
+impl FilterMode {
+    pub fn all() -> &'static [FilterMode] {
+        &[FilterMode::Nearest, FilterMode::Linear]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            FilterMode::Nearest => "Nearest",
+            FilterMode::Linear  => "Linear",
+        }
+    }
+}
+
+fn default_output_scale() -> u8 { 1 }
+fn default_vsync() -> bool { true }
+fn default_audio_volume() -> f32 { 1.0 }
+fn default_multicore() -> bool { true }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppSettings {
     pub log_level: LogLevel,
+    #[serde(default = "default_output_scale")] pub output_scale: u8,
+    #[serde(default)] pub aspect: AspectMode,
+    #[serde(default)] pub filter: FilterMode,
+    #[serde(default)] pub dpi_aware: bool,
+    #[serde(default = "default_vsync")] pub vsync: bool,
+    #[serde(default)] pub cpu_backend: CpuBackend,
+    #[serde(default)] pub audio_output_device: Option<String>,
+    #[serde(default = "default_audio_volume")] pub audio_volume: f32,
+    #[serde(default = "default_multicore")] pub multicore: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        Self { log_level: LogLevel::Info }
+        Self {
+            log_level: LogLevel::Info,
+            output_scale: default_output_scale(),
+            aspect: AspectMode::default(),
+            filter: FilterMode::default(),
+            dpi_aware: false,
+            vsync: default_vsync(),
+            cpu_backend: CpuBackend::default(),
+            audio_output_device: None,
+            audio_volume: default_audio_volume(),
+            multicore: default_multicore(),
+        }
     }
 }
 

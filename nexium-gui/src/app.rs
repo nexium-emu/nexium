@@ -9,7 +9,8 @@ use crate::input::InputSnapshot;
 use crate::debugger::DebuggerState;
 use crate::performance::PerformanceMonitor;
 use crate::controller_config::{ControllerConfig, SwitchButton};
-use crate::app_settings::{AppSettings, LogLevel};
+use crate::app_settings::{AppSettings, AspectMode, CpuBackend, FilterMode, LogLevel};
+use crate::audio::{current_stream_info, list_output_devices, push_test_tone, set_master_volume, AudioStreamInfo};
 
 const BG:        Color32 = Color32::from_rgb(0x0F, 0x0F, 0x11);
 const BG_RAISED: Color32 = Color32::from_rgb(0x18, 0x18, 0x1C);
@@ -38,12 +39,16 @@ pub struct HorizonApp {
     app_settings: AppSettings,
     last_buttons_logged: u64,
     last_sticks_logged: [i32; 4],
+    audio_device_cache: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     General,
     Controller,
+    Graphics,
+    Audio,
+    Emulation,
     Logging,
 }
 
@@ -72,11 +77,13 @@ impl HorizonApp {
             app_settings: AppSettings::load(),
             last_buttons_logged: 0,
             last_sticks_logged: [0; 4],
+            audio_device_cache: None,
         };
         if !nro_path.is_empty() {
-            if let Ok(handle) = EmulationHandle::new(&nro_path) {
+            let backend = app.app_settings.cpu_backend.to_cpu_kind();
+            if let Ok(handle) = EmulationHandle::new(&nro_path, backend) {
                 app.emulation_handle = Some(handle);
-                log::info!("Auto-loaded NRO: {}", nro_path);
+                log::info!("Auto-loaded NRO: {} (CPU: {})", nro_path, backend.label());
             } else {
                 log::error!("Failed to load NRO: {}", nro_path);
             }
@@ -132,16 +139,21 @@ impl HorizonApp {
 
     fn poll_frames(&mut self, ctx: &egui::Context) {
         let Some(handle) = &self.emulation_handle else { return };
+        let tex_opts = match self.app_settings.filter {
+            crate::app_settings::FilterMode::Linear => egui::TextureOptions::LINEAR,
+            crate::app_settings::FilterMode::Nearest => egui::TextureOptions::NEAREST,
+        };
         while let Ok(frame) = handle.frame_rx.try_recv() {
             if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() { continue; }
+            log::trace!("frame in: {}x{} ({} bytes)", frame.width, frame.height, frame.pixels.len());
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize], &frame.pixels,
             );
             match &mut self.game_texture {
-                Some(t) => t.set(img, egui::TextureOptions::NEAREST),
+                Some(t) => t.set(img, tex_opts),
                 None => {
                     self.game_texture = Some(
-                        ctx.load_texture("game_frame", img, egui::TextureOptions::NEAREST)
+                        ctx.load_texture("game_frame", img, tex_opts)
                     );
                 }
             }
@@ -150,7 +162,9 @@ impl HorizonApp {
 
     fn boot_nro(&mut self) {
         if self.nro_path.is_empty() { return; }
-        match EmulationHandle::new(&self.nro_path) {
+        let backend = self.app_settings.cpu_backend.to_cpu_kind();
+        log::info!("Boot: NRO={} CPU={}", self.nro_path, backend.label());
+        match EmulationHandle::new(&self.nro_path, backend) {
             Ok(h) => { self.emulation_handle = Some(h); self.game_texture = None; }
             Err(e) => log::error!("Boot: {}", e),
         }
@@ -343,9 +357,24 @@ impl eframe::App for HorizonApp {
                 if let Some(tex) = &self.game_texture {
                     let avail = ui.available_size();
                     let tsz = tex.size_vec2();
-                    let scale = (avail.x / tsz.x).min(avail.y / tsz.y);
+                    let user_scale = self.app_settings.output_scale.max(1) as f32;
+                    let draw_size = match self.app_settings.aspect {
+                        AspectMode::Stretch => avail,
+                        AspectMode::Letterbox => {
+                            let s = (avail.x / tsz.x).min(avail.y / tsz.y);
+                            tsz * s
+                        }
+                        AspectMode::Integer => {
+                            let max_s = (avail.x / tsz.x).min(avail.y / tsz.y).floor().max(1.0);
+                            tsz * user_scale.min(max_s)
+                        }
+                    };
+                    log::trace!(
+                        "present: avail={:?} tsz={:?} aspect={:?} scale={} draw={:?}",
+                        avail, tsz, self.app_settings.aspect, user_scale, draw_size
+                    );
                     ui.centered_and_justified(|ui| {
-                        ui.image((tex.id(), tsz * scale));
+                        ui.image((tex.id(), draw_size));
                     });
                 } else {
                     let nro_path = self.nro_path.clone();
@@ -385,6 +414,15 @@ impl eframe::App for HorizonApp {
                         if ui.selectable_label(tab == SettingsTab::Controller, "Controller").clicked() {
                             tab = SettingsTab::Controller;
                         }
+                        if ui.selectable_label(tab == SettingsTab::Graphics, "Graphics").clicked() {
+                            tab = SettingsTab::Graphics;
+                        }
+                        if ui.selectable_label(tab == SettingsTab::Audio, "Audio").clicked() {
+                            tab = SettingsTab::Audio;
+                        }
+                        if ui.selectable_label(tab == SettingsTab::Emulation, "Emulation").clicked() {
+                            tab = SettingsTab::Emulation;
+                        }
                         if ui.selectable_label(tab == SettingsTab::Logging, "Logging").clicked() {
                             tab = SettingsTab::Logging;
                         }
@@ -396,6 +434,20 @@ impl eframe::App for HorizonApp {
                         SettingsTab::General => settings_content(ui),
                         SettingsTab::Controller => {
                             controller_settings_content(ui, &mut cfg, &mut rebinding, &mut save_needed);
+                        }
+                        SettingsTab::Graphics => {
+                            graphics_settings_content(ui, &mut app_cfg, &mut app_save_needed);
+                        }
+                        SettingsTab::Audio => {
+                            audio_settings_content(
+                                ui,
+                                &mut app_cfg,
+                                &mut app_save_needed,
+                                &mut self.audio_device_cache,
+                            );
+                        }
+                        SettingsTab::Emulation => {
+                            emulation_settings_content(ui, &mut app_cfg, &mut app_save_needed);
                         }
                         SettingsTab::Logging => {
                             logging_settings_content(ui, &mut app_cfg, &mut app_save_needed);
@@ -435,7 +487,11 @@ impl eframe::App for HorizonApp {
             &self.log_buffer,
         );
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        if running {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
     }
 }
 
@@ -590,6 +646,200 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.label(egui::RichText::new(label).size(12.0).color(MUTED));
     ui.label(egui::RichText::new(value).size(12.0).color(TEXT));
     ui.end_row();
+}
+
+fn graphics_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_needed: &mut bool) {
+    ui.label(egui::RichText::new("Aspect Mode").size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Letterbox keeps the game's aspect ratio. Integer snaps to pixel-perfect 1x/2x/3x. Stretch fills the window.").size(11.0).color(MUTED));
+    ui.add_space(6.0);
+    for m in AspectMode::all() {
+        if ui.radio(cfg.aspect == *m, m.label()).clicked() {
+            cfg.aspect = *m;
+            *save_needed = true;
+        }
+    }
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Output Scale").size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Used only by Integer mode (1x / 2x / 3x).").size(11.0).color(MUTED));
+    ui.add_space(6.0);
+    let mut s = cfg.output_scale.max(1).min(3);
+    ui.horizontal(|ui| {
+        for v in 1u8..=3u8 {
+            if ui.radio(s == v, format!("{}x", v)).clicked() {
+                s = v;
+            }
+        }
+    });
+    if s != cfg.output_scale {
+        cfg.output_scale = s;
+        *save_needed = true;
+    }
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Texture Filter").size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Nearest preserves pixel-art crispness. Linear smooths upscaled output.").size(11.0).color(MUTED));
+    ui.add_space(6.0);
+    for f in FilterMode::all() {
+        if ui.radio(cfg.filter == *f, f.label()).clicked() {
+            cfg.filter = *f;
+            *save_needed = true;
+        }
+    }
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Windowing").size(13.0).strong().color(TEXT));
+    ui.add_space(6.0);
+    let mut dpi = cfg.dpi_aware;
+    if ui.checkbox(&mut dpi, "High-DPI aware (Windows — requires restart)").changed() {
+        cfg.dpi_aware = dpi;
+        *save_needed = true;
+    }
+    ui.label(egui::RichText::new("Off lets Windows DPI virtualization upscale (blurry). On reports physical pixels — required for crisp output on 4K/2.5K displays.").size(10.5).color(MUTED));
+
+    ui.add_space(8.0);
+    let mut vsync = cfg.vsync;
+    if ui.checkbox(&mut vsync, "V-Sync (requires restart)").changed() {
+        cfg.vsync = vsync;
+        *save_needed = true;
+    }
+}
+
+fn audio_settings_content(
+    ui: &mut egui::Ui,
+    cfg: &mut AppSettings,
+    save_needed: &mut bool,
+    device_cache: &mut Option<Vec<String>>,
+) {
+    ui.label(egui::RichText::new("Output Device").size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(
+        "Pick which audio output to use. Device changes apply on next emulator boot \
+         (the stream is opened once at startup).",
+    ).size(11.0).color(MUTED));
+    ui.add_space(6.0);
+
+    if device_cache.is_none() {
+        *device_cache = Some(list_output_devices());
+    }
+    let devices: Vec<String> = device_cache.clone().unwrap_or_default();
+
+    let current_label: String = match &cfg.audio_output_device {
+        None => "System default".to_string(),
+        Some(n) => n.clone(),
+    };
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_source("audio_output_device")
+            .selected_text(current_label.clone())
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(cfg.audio_output_device.is_none(), "System default")
+                    .clicked()
+                {
+                    if cfg.audio_output_device.is_some() {
+                        cfg.audio_output_device = None;
+                        *save_needed = true;
+                    }
+                }
+                for name in &devices {
+                    let selected = cfg.audio_output_device.as_deref() == Some(name.as_str());
+                    if ui.selectable_label(selected, name).clicked() && !selected {
+                        cfg.audio_output_device = Some(name.clone());
+                        *save_needed = true;
+                    }
+                }
+            });
+        if ui.button("Refresh").clicked() {
+            *device_cache = Some(list_output_devices());
+        }
+    });
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Active Stream").size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    match current_stream_info() {
+        Some(AudioStreamInfo { device_name, sample_rate, channels, sample_format }) => {
+            ui.label(egui::RichText::new(format!(
+                "{}  ·  {} Hz  ·  {} ch  ·  {}",
+                device_name, sample_rate, channels, sample_format,
+            )).size(11.0).color(MUTED));
+        }
+        None => {
+            ui.label(egui::RichText::new("No audio stream open (init failed or audio disabled).")
+                .size(11.0).color(AMBER));
+        }
+    }
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Master Volume").size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(
+        "Applied live in the audio callback. 1.0 = unity, 2.0 = +6 dB (may clip).",
+    ).size(11.0).color(MUTED));
+    ui.add_space(6.0);
+    let mut vol = cfg.audio_volume;
+    if ui.add(egui::Slider::new(&mut vol, 0.0..=2.0).text("vol")).changed() {
+        cfg.audio_volume = vol;
+        set_master_volume(vol);
+        *save_needed = true;
+    }
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Diagnostics").size(13.0).strong().color(TEXT));
+    ui.add_space(6.0);
+    if ui.button("Play 1s 440 Hz test tone").clicked() {
+        let pushed = push_test_tone(440.0, 1.0);
+        log::info!("Audio test tone: pushed {} frames to sink", pushed);
+    }
+}
+
+fn emulation_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_needed: &mut bool) {
+    ui.label(egui::RichText::new("CPU Backend").size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(
+        "Selects which AArch64 JIT runs guest code. Applies on next boot — does not affect a running game.",
+    ).size(11.0).color(MUTED));
+    ui.add_space(8.0);
+
+    for backend in CpuBackend::all() {
+        let compiled = backend.is_compiled_in();
+        let label = if compiled {
+            backend.label().to_string()
+        } else {
+            format!("{} — not in build", backend.label())
+        };
+        ui.add_enabled_ui(compiled, |ui| {
+            if ui.radio(cfg.cpu_backend == *backend, label).clicked() {
+                cfg.cpu_backend = *backend;
+                *save_needed = true;
+            }
+        });
+    }
+
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new(
+        "Dynarmic: MerryMage's mature C++ JIT — the baseline used by yuzu/Ryujinx. \
+        Rustarmic: our own Rust AArch64→x86_64 JIT — newer, useful when debugging guest \
+        behaviour that dynarmic's opaque codegen makes hard to inspect.",
+    ).size(10.5).color(MUTED));
+
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Multi-Core").size(13.0).strong().color(TEXT));
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(
+        "Runs each guest core on its own host thread (3 user cores). Applies on next boot.",
+    ).size(11.0).color(MUTED));
+    ui.add_space(8.0);
+    let resp = ui.checkbox(&mut cfg.multicore, "Enable multi-core CPU emulation");
+    if resp.changed() {
+        *save_needed = true;
+    }
+    resp.on_hover_text("Keep this on — disables only for debugging");
 }
 
 fn logging_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_needed: &mut bool) {
