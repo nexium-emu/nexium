@@ -1705,7 +1705,11 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                 const TARGET_FRAMES: usize = 240;
                 const TARGET_SR: f32 = 48_000.0;
 
-                let blocks_to_produce: usize = 1;
+                const RING_HIGH_WATER_FRAMES: usize = 5_760;
+                let blocks_to_produce: usize = match crate::audio_sink::host_audio_sink() {
+                    Some(sink) if sink.queued_frames() >= RING_HIGH_WATER_FRAMES => 0,
+                    _ => 1,
+                };
                 let mut is_new_latched: Vec<bool> = vec![false; voice_count_seen];
                 let mut big_out: Vec<f32> = Vec::with_capacity(TARGET_FRAMES * 2 * blocks_to_produce);
 
