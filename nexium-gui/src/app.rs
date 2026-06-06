@@ -145,6 +145,7 @@ impl HorizonApp {
         };
         while let Ok(frame) = handle.frame_rx.try_recv() {
             if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() { continue; }
+            self.performance.record_frame();
             log::trace!("frame in: {}x{} ({} bytes)", frame.width, frame.height, frame.pixels.len());
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize], &frame.pixels,
@@ -391,8 +392,6 @@ impl eframe::App for HorizonApp {
                     }
                 }
             });
-
-        self.performance.record_frame();
 
         if self.show_settings {
             let mut open = self.show_settings;
