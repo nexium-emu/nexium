@@ -4,6 +4,7 @@ pub mod constants;
 pub mod log_init;
 pub mod log_sink;
 pub mod file_logger;
+pub mod frame_present;
 
 pub use error::{HorizonError, Result};
 pub use result::SUCCESS;

@@ -17,6 +17,8 @@ pub const TLS_RESPONSE_OFFSET: u64 = 0x100;
 
 pub const NUM_CORES: u32 = 4;
 
+pub const NUM_GUEST_CORES: usize = 3;
+
 pub const DEFAULT_JIT_SIZE_MB: u64 = 128;
 pub const MIN_JIT_SIZE_MB: u64 = 8;
 pub const MAX_JIT_SIZE_MB: u64 = 512;
