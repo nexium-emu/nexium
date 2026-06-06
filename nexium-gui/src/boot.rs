@@ -158,6 +158,7 @@ impl EmulationHandle {
             let halt = Some(cpu.halt_handle());
             let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu, 0);
             use nexium_kernel::kernel::cpu_local::{cpu_mut, cpu_ref};
+            let mut last_map_gen0 = boot_ctx.address_space.generation();
 
             // Host core 1: runs ready guest threads on its own Cpu in parallel with
             // core 0. Sticky thread affinity (threads pin to their core on first run)
@@ -168,6 +169,7 @@ impl EmulationHandle {
                 let kernel_c1 = Arc::clone(&boot_ctx.kernel);
                 let stop_c1 = Arc::clone(&core1_stop);
                 let backend_c1 = cpu_backend;
+                let addr_c1 = Arc::clone(&boot_ctx.address_space);
                 thread::Builder::new()
                     .name("nexium-core1".into())
                     .spawn(move || {
@@ -177,6 +179,7 @@ impl EmulationHandle {
                         };
                         cpu1.set_continue_on_null(true);
                         let _g1 = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu1, 1);
+                        let mut last_map_gen1 = addr_c1.generation();
                         log::info!("[core1] started");
                         while !stop_c1.load(Ordering::Relaxed) {
                             let has = {
@@ -188,9 +191,21 @@ impl EmulationHandle {
                                 std::thread::sleep(std::time::Duration::from_micros(200));
                                 continue;
                             }
+                            // Plumb regions mapped since last sync into this core's Cpu
+                            // before running guest code that may touch them.
+                            let gen = addr_c1.generation();
+                            if gen != last_map_gen1 {
+                                for r in addr_c1.host_regions() {
+                                    unsafe { let _ = cpu_mut().unwrap().map_host(r.base, r.size, r.perm, r.host_ptr); }
+                                }
+                                last_map_gen1 = gen;
+                            }
                             let event = cpu_mut().unwrap().run(200_000);
                             if let nexium_core::cpu::CpuEvent::Svc(imm) = event {
-                                let result = kernel_c1.lock().dispatch_svc(imm);
+                                let mut k = kernel_c1.lock();
+                                k.threads.save_current_ctx(cpu_ref().unwrap());
+                                let result = k.dispatch_svc(imm);
+                                drop(k);
                                 cpu_mut().unwrap().set_register(0, result as u64);
                             }
                         }
@@ -415,9 +430,22 @@ impl EmulationHandle {
                         .and_then(|v| v.parse::<u64>().ok())
                         .unwrap_or(1_000_000);
                     drop(guard); // release the kernel lock around cpu.run for parallelism
+                    // Plumb regions mapped since last sync into this core's Cpu.
+                    let gen = boot_ctx.address_space.generation();
+                    if gen != last_map_gen0 {
+                        for r in boot_ctx.address_space.host_regions() {
+                            unsafe { let _ = cpu.map_host(r.base, r.size, r.perm, r.host_ptr); }
+                        }
+                        last_map_gen0 = gen;
+                    }
                     let event = cpu.run(cpu_slice);
                     let pc_after = cpu.get_pc();
                     let mut guard = boot_ctx.kernel.lock(); // re-acquire for post-run + dispatch
+                    // Save the running thread's context now (under the lock, before
+                    // dispatch) so if a wait-handler parks it, a concurrent signal
+                    // from the other core wakes it with the correct post-svc context
+                    // rather than a stale one. Fixes the cross-core condvar race.
+                    guard.threads.save_current_ctx(cpu);
                     cycle_count += cpu_slice;
                     guard.cycle_count += cpu_slice;
 

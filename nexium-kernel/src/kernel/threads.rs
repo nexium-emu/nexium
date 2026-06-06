@@ -347,7 +347,7 @@ impl Threads {
         self.load_thread(handle, cpu);
         if let Some(t) = self.threads.get_mut(&handle) {
             t.state = ThreadState::Running;
-            log::info!("[sched] now running handle={:#x} pc={:#x} sp={:#x}", handle, t.ctx.pc, t.ctx.sp);
+            log::info!("[sched] core{} now running handle={:#x} pc={:#x} sp={:#x}", current_core(), handle, t.ctx.pc, t.ctx.sp);
         }
         self.current[current_core()] = Some(handle);
         self.last_switch = Instant::now();

@@ -2,6 +2,7 @@ use bytemuck::{NoUninit, Pod};
 use parking_lot::Mutex;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::perm::Perm;
@@ -104,11 +105,21 @@ unsafe impl Sync for HostRegion {}
 
 pub struct AddressSpace {
     regions: Mutex<Vec<Arc<Region>>>,
+    /// Bumped on every map(). Each host-core Cpu tracks the last generation it
+    /// synced so it can re-plumb regions mapped after its own init (multicore:
+    /// regions mapped on one core must reach the other core's Cpu).
+    generation: AtomicU64,
 }
 
 impl AddressSpace {
     pub fn new() -> Self {
-        Self { regions: Mutex::new(Vec::new()) }
+        Self { regions: Mutex::new(Vec::new()), generation: AtomicU64::new(0) }
+    }
+
+    /// Monotonic counter of mapping changes; compare against a per-Cpu snapshot
+    /// to know when host-pointer mappings need re-syncing to that Cpu.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     pub fn map(&self, va: u64, len: u64, perm: Perm, name: impl Into<String>) -> Result<usize> {
@@ -164,6 +175,7 @@ impl AddressSpace {
             region.name
         );
         regs.insert(insert_at, region);
+        self.generation.fetch_add(1, Ordering::Release);
         Ok(insert_at)
     }
 
