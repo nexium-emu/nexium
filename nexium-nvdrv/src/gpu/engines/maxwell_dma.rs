@@ -176,6 +176,12 @@ impl MaxwellDma {
         let line_length_src = line_length_units * src_bytes_per_group;
         let line_length_dst = line_length_units * dst_bytes_per_group;
 
+        let bytes_per_element = if remap_enable {
+            component_size.max(1) * num_src_components.max(1)
+        } else {
+            1
+        };
+
         if self.blit_count < 64 {
             log::info!(
                 "MaxwellDma::launch[{}]: src_gpu={:#x} cpu={:#x} dst_gpu={:#x} cpu={:#x} \
@@ -198,11 +204,13 @@ impl MaxwellDma {
                     src_cpu, dst_cpu, line_length_src, line_length_dst, line_count,
                     remap_enable, component_size, num_src_components, num_dst_components,
                     [dst_x_sel, dst_y_sel, dst_z_sel, dst_w_sel],
+                    bytes_per_element,
                     mem_read, mem_write,
                 );
             }
             (LAYOUT_BLOCK_LINEAR, LAYOUT_PITCH) => {
-                self.blit_block_to_pitch(src_cpu, dst_cpu, line_length_src, line_count, mem_read, mem_write);
+                nexium_gpu::pitch_oracle::record_pitch_dst(dst_gpu);
+                self.blit_block_to_pitch(src_cpu, dst_cpu, line_length_src, line_count, bytes_per_element, mem_read, mem_write);
             }
             (LAYOUT_PITCH, LAYOUT_PITCH) => {
                 self.blit_pitch_to_pitch(src_cpu, dst_cpu, line_length_src, line_count, mem_read, mem_write);
@@ -290,6 +298,7 @@ impl MaxwellDma {
         num_src_components: usize,
         num_dst_components: usize,
         sel: [u32; 4],
+        bytes_per_element: usize,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
@@ -304,7 +313,7 @@ impl MaxwellDma {
         let src_pitch = self.pitch_in.max(line_length_src as u32) as usize;
 
         let dst_width_bytes = if self.dst_width != 0 {
-            self.dst_width as usize
+            (self.dst_width as usize) * bytes_per_element.max(1)
         } else {
             line_length_dst
         };
@@ -358,14 +367,42 @@ impl MaxwellDma {
         dst_cpu: u64,
         line_length: usize,
         line_count: usize,
+        bytes_per_element: usize,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
+        {
+            let block_height_log2_dbg = ((self.src_block_size >> 4) & 0xF) as u32;
+            let src_width_bytes_dbg = if self.src_width != 0 {
+                (self.src_width as usize) * bytes_per_element.max(1)
+            } else {
+                line_length
+            };
+            let src_height_dbg = if self.src_height != 0 {
+                self.src_height as usize
+            } else {
+                line_count
+            };
+            let tiled_size_dbg = tiled_size_bytes(src_width_bytes_dbg, src_height_dbg, block_height_log2_dbg);
+            let remap_comp_size = ((self.remap_components >> 16) & 0x3) as usize + 1;
+            let remap_n_src = ((self.remap_components >> 20) & 0x3) as usize + 1;
+            let remap_n_dst = ((self.remap_components >> 24) & 0x3) as usize + 1;
+            log::debug!(
+                "MaxwellDma::blit_block_to_pitch DIAG: src_width={} src_height={} \
+                 line_length={} line_count={} src_block_size={:#x} \
+                 remap_components={:#x} remap_comp_size={} remap_n_src={} remap_n_dst={} \
+                 src_width_bytes_used={} src_height_used={} bh_log2={} tiled_size_bytes={}",
+                self.src_width, self.src_height,
+                line_length, line_count, self.src_block_size,
+                self.remap_components, remap_comp_size, remap_n_src, remap_n_dst,
+                src_width_bytes_dbg, src_height_dbg, block_height_log2_dbg, tiled_size_dbg,
+            );
+        }
         self.blit_dst_by_src.insert(src_cpu, dst_cpu);
         let dst_pitch = self.pitch_out.max(line_length as u32) as usize;
         let block_height_log2 = ((self.src_block_size >> 4) & 0xF) as u32;
         let src_width_bytes = if self.src_width != 0 {
-            self.src_width as usize
+            (self.src_width as usize) * bytes_per_element.max(1)
         } else {
             line_length
         };

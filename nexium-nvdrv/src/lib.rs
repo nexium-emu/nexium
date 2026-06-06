@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod bufferqueue;
 pub mod gpu;
+pub mod render_thread;
 pub use bufferqueue::{BufferQueue, GraphicBuffer, QueuedFrame};
 pub use gpu::GpuContext;
 
@@ -620,6 +621,7 @@ impl Nvdrv {
             0x4801 => { log::debug!("nvhost-gpu:SetNvmapFd"); }
             0x4803 => { log::debug!("nvhost-gpu:ChannelSetTimeout"); }
             0x4808 | 0x481b => {
+                let _ = self.renderer();
                 if req.in_data.len() >= 16 {
                     let address = u64::from_le_bytes([
                         req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],

@@ -14,6 +14,17 @@ pub struct RenderTarget {
 }
 
 #[derive(Clone, Copy, Default, Debug)]
+pub struct ZetaSurface {
+    pub address_lo: u32,
+    pub address_hi: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub block_size: u32,
+    pub array_pitch: u32,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
 pub struct Viewport {
     pub x: f32,
     pub y: f32,
@@ -21,6 +32,8 @@ pub struct Viewport {
     pub height: f32,
     pub depth_min: f32,
     pub depth_max: f32,
+    pub scale_z: f32,
+    pub translate_z: f32,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -76,12 +89,31 @@ pub struct Maxwell3DRegisters {
     pub index_format: u32,
     pub index_count: u32,
     pub depth_test_enable: bool,
+    pub zeta: ZetaSurface,
+    pub zeta_enable: bool,
+    pub depth_write_enable: bool,
+    pub depth_func: u32,
+    pub cull_test_enable: bool,
+    pub cull_face: u32,
+    pub front_face: u32,
+    pub poly_offset_fill_enable: bool,
+    pub poly_offset_units: f32,
+    pub poly_offset_factor: f32,
     pub blend_enable: [bool; 8],
+    pub blend_eq_rgb: u32,
+    pub blend_src_rgb: u32,
+    pub blend_dst_rgb: u32,
+    pub blend_eq_alpha: u32,
+    pub blend_src_alpha: u32,
+    pub blend_dst_alpha: u32,
     pub draw_count: u64,
     pub clear_count: u64,
 
     pub tic_pool_va_lo: u32,
     pub tic_pool_va_hi: u32,
+    pub tsc_pool_va_lo: u32,
+    pub tsc_pool_va_hi: u32,
+    pub tsc_pool_limit: u32,
 
     pub program_region_va_hi: u32,
     pub program_region_va_lo: u32,
@@ -128,11 +160,30 @@ impl Default for Maxwell3DRegisters {
             index_format: 0,
             index_count: 0,
             depth_test_enable: false,
+            zeta: ZetaSurface::default(),
+            zeta_enable: false,
+            depth_write_enable: true,
+            depth_func: 0x207,
+            cull_test_enable: false,
+            cull_face: 0x405,
+            front_face: 0x901,
+            poly_offset_fill_enable: false,
+            poly_offset_units: 0.0,
+            poly_offset_factor: 0.0,
             blend_enable: [false; 8],
+            blend_eq_rgb: 0x8006,
+            blend_src_rgb: 0x4001,
+            blend_dst_rgb: 0x4000,
+            blend_eq_alpha: 0x8006,
+            blend_src_alpha: 0x4001,
+            blend_dst_alpha: 0x4000,
             draw_count: 0,
             clear_count: 0,
             tic_pool_va_lo: 0,
             tic_pool_va_hi: 0,
+            tsc_pool_va_lo: 0,
+            tsc_pool_va_hi: 0,
+            tsc_pool_limit: 0,
             program_region_va_hi: 0,
             program_region_va_lo: 0,
             tic_pool_limit: 0,
@@ -173,6 +224,8 @@ pub struct DrawCall {
 
     pub tic_pool_gpu_va: u64,
     pub tic_pool_limit: u32,
+    pub tsc_pool_gpu_va: u64,
+    pub tsc_pool_limit: u32,
 
     pub last_constbuf_addr: u64,
     pub last_constbuf_size: u32,
@@ -181,6 +234,21 @@ pub struct DrawCall {
     pub fs_bindless_cb_size: u32,
 
     pub fs_shader_gpu_va: u64,
+
+    pub cull_test_enable: bool,
+    pub cull_face: u32,
+    pub front_face: u32,
+    pub poly_offset_fill_enable: bool,
+    pub poly_offset_units: f32,
+    pub poly_offset_factor: f32,
+
+    pub zeta: ZetaSurface,
+    pub zeta_enable: bool,
+    pub depth_test_enable: bool,
+    pub depth_write_enable: bool,
+    pub depth_func: u32,
+    pub clear_depth: f32,
+    pub clear_mask: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -305,7 +373,7 @@ impl Maxwell3D {
             self.reg_file[method as usize] = arg;
         }
 
-        if method >= 0x200 && method < 0x300 {
+        if method >= 0x200 && method < 0x280 {
             let rt_index = ((method - 0x200) / 0x10) as usize;
             let field = (method - 0x200) % 0x10;
             if rt_index < 8 {
@@ -374,6 +442,8 @@ impl Maxwell3D {
                     draw_texture: None,
                     tic_pool_gpu_va: ((self.regs.tic_pool_va_hi as u64) << 32) | self.regs.tic_pool_va_lo as u64,
                     tic_pool_limit: self.regs.tic_pool_limit,
+                    tsc_pool_gpu_va: ((self.regs.tsc_pool_va_hi as u64) << 32) | self.regs.tsc_pool_va_lo as u64,
+                    tsc_pool_limit: self.regs.tsc_pool_limit,
                     last_constbuf_addr: self.regs.last_constbuf_addr,
                     last_constbuf_size: self.regs.last_constbuf_size,
                     fs_bindless_cb_addr: self.regs.cbuf_binds[4][15].0,
@@ -384,23 +454,25 @@ impl Maxwell3D {
                             | self.regs.program_region_va_lo as u64;
                         if fs.address_lo != 0 { region.wrapping_add(fs.address_lo as u64) } else { 0 }
                     },
+                    cull_test_enable: self.regs.cull_test_enable,
+                    cull_face: self.regs.cull_face,
+                    front_face: self.regs.front_face,
+                    poly_offset_fill_enable: self.regs.poly_offset_fill_enable,
+                    poly_offset_units: self.regs.poly_offset_units,
+                    poly_offset_factor: self.regs.poly_offset_factor,
+                    zeta: self.regs.zeta,
+                    zeta_enable: self.regs.zeta_enable,
+                    depth_test_enable: self.regs.depth_test_enable,
+                    depth_write_enable: self.regs.depth_write_enable,
+                    depth_func: self.regs.depth_func,
+                    clear_depth: self.regs.clear_depth,
+                    clear_mask: arg,
                 });
             }
-            0x280..=0x2A0 => {
-                let idx = ((method - 0x280) / 4) as usize;
-                if idx < 8 {
-                    let f = f32::from_bits(arg);
-                    let field = (method - 0x280) % 4;
-                    match field {
-                        0 => self.regs.viewport.width = f * 2.0,
-                        1 => self.regs.viewport.height = f * 2.0,
-                        2 => self.regs.viewport.depth_max = f,
-                        3 => {},
-                        _ => {}
-                    }
-                    let _ = idx;
-                }
-            }
+            0x280 => self.regs.viewport.width = f32::from_bits(arg).abs() * 2.0,
+            0x281 => self.regs.viewport.height = f32::from_bits(arg).abs() * 2.0,
+            0x282 => self.regs.viewport.scale_z = f32::from_bits(arg),
+            0x285 => self.regs.viewport.translate_z = f32::from_bits(arg),
             0x35D => {
 
                 self.regs.draw_count += 1;
@@ -440,6 +512,20 @@ impl Maxwell3D {
                 self.regs.index_count = arg;
                 log::debug!("maxwell3d: DrawElementsCount count={} topology={}", arg, self.regs.draw_topology);
                 self.push_draw(self.regs.draw_topology, 0, 0, true, arg);
+            }
+
+            0x557 => {
+                log::info!("maxwell3d: SetTexSamplerPool[hi] = {:#x}", arg);
+                self.regs.tsc_pool_va_hi = arg;
+            }
+            0x558 => {
+                log::info!("maxwell3d: SetTexSamplerPool[lo] = {:#x} → full {:#x}",
+                    arg, ((self.regs.tsc_pool_va_hi as u64) << 32) | arg as u64);
+                self.regs.tsc_pool_va_lo = arg;
+            }
+            0x559 => {
+                log::info!("maxwell3d: SetTexSamplerPoolMaximumIndex = {:#x}", arg);
+                self.regs.tsc_pool_limit = arg;
             }
 
             0x55D => {
@@ -483,6 +569,36 @@ impl Maxwell3D {
                     let cb_addr = ((self.regs.constbuf_selector_addr_hi as u64) << 32)
                         | self.regs.constbuf_selector_addr_lo as u64;
                     self.regs.cbuf_binds[stage][slot] = (cb_addr, self.regs.constbuf_selector_size);
+                }
+            }
+            0x645 => self.regs.cull_test_enable = (arg & 1) != 0,
+            0x646 => self.regs.cull_face = arg,
+            0x647 => self.regs.front_face = arg,
+
+            0x372 => self.regs.poly_offset_fill_enable = (arg & 1) != 0,
+            0x55B => self.regs.poly_offset_factor = f32::from_bits(arg),
+            0x56F => self.regs.poly_offset_units = f32::from_bits(arg),
+            0x3F8 => self.regs.zeta.address_hi = arg,
+            0x3F9 => self.regs.zeta.address_lo = arg,
+            0x3FA => self.regs.zeta.format = arg & 0x1F,
+            0x3FB => self.regs.zeta.block_size = arg,
+            0x3FC => self.regs.zeta.array_pitch = arg,
+            0x48A => self.regs.zeta.width = arg & 0x0FFF_FFFF,
+            0x48B => self.regs.zeta.height = arg & 0x0001_FFFF,
+            0x54E => self.regs.zeta_enable = (arg & 1) != 0,
+            0x4B3 => self.regs.depth_test_enable = (arg & 1) != 0,
+            0x4BA => self.regs.depth_write_enable = (arg & 1) != 0,
+            0x4C3 => self.regs.depth_func = arg,
+            0x4D0 => self.regs.blend_eq_rgb = arg,
+            0x4D1 => self.regs.blend_src_rgb = arg,
+            0x4D2 => self.regs.blend_dst_rgb = arg,
+            0x4D3 => self.regs.blend_eq_alpha = arg,
+            0x4D4 => self.regs.blend_src_alpha = arg,
+            0x4D6 => self.regs.blend_dst_alpha = arg,
+            0x4D8..=0x4DF => {
+                let rt = (method - 0x4D8) as usize;
+                if rt < 8 {
+                    self.regs.blend_enable[rt] = (arg & 1) != 0;
                 }
             }
             0x700..=0x77F => {
@@ -545,6 +661,7 @@ impl Maxwell3D {
 
     fn push_draw(&mut self, topology: u32, first: u32, count: u32, indexed: bool, index_count: u32) {
         let tic_pool_gpu_va = ((self.regs.tic_pool_va_hi as u64) << 32) | self.regs.tic_pool_va_lo as u64;
+        let tsc_pool_gpu_va = ((self.regs.tsc_pool_va_hi as u64) << 32) | self.regs.tsc_pool_va_lo as u64;
         let (fs_bindless_cb_addr, fs_bindless_cb_size) = self.regs.cbuf_binds[4][15];
         let fs = &self.regs.shader_programs[5];
 
@@ -568,11 +685,26 @@ impl Maxwell3D {
             draw_texture: None,
             tic_pool_gpu_va,
             tic_pool_limit: self.regs.tic_pool_limit,
+            tsc_pool_gpu_va,
+            tsc_pool_limit: self.regs.tsc_pool_limit,
             last_constbuf_addr: self.regs.last_constbuf_addr,
             last_constbuf_size: self.regs.last_constbuf_size,
             fs_bindless_cb_addr,
             fs_bindless_cb_size,
             fs_shader_gpu_va,
+            cull_test_enable: self.regs.cull_test_enable,
+            cull_face: self.regs.cull_face,
+            front_face: self.regs.front_face,
+            poly_offset_fill_enable: self.regs.poly_offset_fill_enable,
+            poly_offset_units: self.regs.poly_offset_units,
+            poly_offset_factor: self.regs.poly_offset_factor,
+            zeta: self.regs.zeta,
+            zeta_enable: self.regs.zeta_enable,
+            depth_test_enable: self.regs.depth_test_enable,
+            depth_write_enable: self.regs.depth_write_enable,
+            depth_func: self.regs.depth_func,
+            clear_depth: self.regs.clear_depth,
+            clear_mask: 0,
         });
     }
 
