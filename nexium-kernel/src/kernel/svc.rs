@@ -1706,14 +1706,8 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                 const TARGET_SR: f32 = 48_000.0;
 
                 const RING_HIGH_WATER_FRAMES: usize = 14_400;
-                const RING_LOW_WATER_FRAMES: usize = 4_800;
                 let blocks_to_produce: usize = match crate::audio_sink::host_audio_sink() {
-                    Some(sink) => {
-                        let q = sink.queued_frames();
-                        if q >= RING_HIGH_WATER_FRAMES { 0 }
-                        else if q < RING_LOW_WATER_FRAMES { 3 }
-                        else { 1 }
-                    }
+                    Some(sink) if sink.queued_frames() >= RING_HIGH_WATER_FRAMES => 0,
                     _ => 1,
                 };
                 let mut is_new_latched: Vec<bool> = vec![false; voice_count_seen];
@@ -1857,16 +1851,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                         let cursor = (st.voice_wb_progress_frames.get(vid).copied().unwrap_or(0)
                             as usize)
                             .min(wb_total_frames.saturating_sub(1));
-                        let remaining = wb_total_frames - cursor;
-                        let in_frames = in_frames_needed.min(remaining);
-                        if in_frames < 2 {
-                            voice_snapshot[vid].2 = true;
-                            voice_snapshot[vid].3 = remaining.max(1) as u32;
-                            voice_snapshot[vid].4 = wb_total_frames as u32;
-                            voice_snapshot[vid].5 = wb_count;
-                            voice_snapshot[vid].6 = is_looping;
-                            continue;
-                        }
+                        let in_frames = in_frames_needed;
                         let mut pcm_l = vec![0.0f32; in_frames];
                         let mut pcm_r = vec![0.0f32; in_frames];
 
@@ -1929,50 +1914,58 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                                 }
                             }
                         } else {
-                            let in_samples = in_frames * ch;
-                            let src_byte_off =
-                                ((start_offset as u64) + cursor as u64).wrapping_mul(2 * ch as u64);
-                            if src_byte_off.saturating_add((in_samples as u64) * 2) > buffer_size {
-                                continue;
-                            }
-                            let src_va = buffer_address.wrapping_add(src_byte_off);
-                            let mut pcm_bytes = vec![0u8; in_samples * 2];
-                            let read_ok = kernel.address_space.read(src_va, &mut pcm_bytes).is_ok();
-                            {
-                                use std::sync::atomic::{AtomicU64, Ordering as O};
-                                static DUMPED: AtomicU64 = AtomicU64::new(0);
-                                let bit_pos = ((vid & 0xF) * 4 + (wb_index & 0x3)) as u64;
-                                let bit = 1u64 << bit_pos;
-                                let prev = DUMPED.fetch_or(bit, O::Relaxed);
-                                if prev & bit == 0 {
-                                    let nz = pcm_bytes.iter().filter(|b| **b != 0).count();
-                                    let first16: Vec<u8> = pcm_bytes.iter().take(16).copied().collect();
-                                    log::info!(
-                                        "voice[{}] wb[{}] PCM: addr={:#x}+{:#x}=src={:#x} size={:#x} read_ok={} nonzero_bytes={}/{} first16={:02x?} start_off={} end_off={}",
-                                        vid, wb_index, buffer_address, src_byte_off, src_va,
-                                        buffer_size, read_ok, nz, pcm_bytes.len(), first16,
-                                        start_offset, end_offset
-                                    );
-                                }
-                            }
-                            if !read_ok {
-                                continue;
-                            }
                             let stride = 2 * ch;
-                            for f in 0..in_frames {
-                                let l = i16::from_le_bytes([
-                                    pcm_bytes[f * stride], pcm_bytes[f * stride + 1],
+                            let queued = (wb_count as usize).min(4);
+                            let mut got = 0usize;
+                            let mut k = 0usize;
+                            let mut slot_cursor = cursor;
+                            while got < in_frames && k < queued {
+                                let slot = (wb_index + k) % 4;
+                                let sb = 0x060 + slot * 0x38;
+                                let swb = &v[sb..sb + 0x38];
+                                let s_addr = u64::from_le_bytes([
+                                    swb[0x00], swb[0x01], swb[0x02], swb[0x03],
+                                    swb[0x04], swb[0x05], swb[0x06], swb[0x07],
                                 ]);
-                                pcm_l[f] = (l as f32) / 32768.0;
-                                if ch == 2 {
-                                    let r = i16::from_le_bytes([
-                                        pcm_bytes[f * stride + 2], pcm_bytes[f * stride + 3],
-                                    ]);
-                                    pcm_r[f] = (r as f32) / 32768.0;
+                                let s_size = u64::from_le_bytes([
+                                    swb[0x08], swb[0x09], swb[0x0A], swb[0x0B],
+                                    swb[0x0C], swb[0x0D], swb[0x0E], swb[0x0F],
+                                ]);
+                                let s_start = i32::from_le_bytes([swb[0x10], swb[0x11], swb[0x12], swb[0x13]]);
+                                let s_end = i32::from_le_bytes([swb[0x14], swb[0x15], swb[0x16], swb[0x17]]);
+                                let s_loop = swb[0x18] != 0;
+                                if s_addr == 0 || s_start < 0 || s_end <= s_start { break; }
+                                let s_total = (s_end - s_start) as usize;
+                                if slot_cursor >= s_total {
+                                    if s_loop { slot_cursor = 0; }
+                                    else { k += 1; slot_cursor = 0; continue; }
+                                }
+                                let avail = s_total - slot_cursor;
+                                let want = (in_frames - got).min(avail);
+                                let boff = ((s_start as u64) + slot_cursor as u64).wrapping_mul(stride as u64);
+                                if boff.saturating_add((want * stride) as u64) > s_size { break; }
+                                let mut buf = vec![0u8; want * stride];
+                                if kernel.address_space.read(s_addr.wrapping_add(boff), &mut buf).is_err() { break; }
+                                for f in 0..want {
+                                    let l = i16::from_le_bytes([buf[f * stride], buf[f * stride + 1]]);
+                                    pcm_l[got + f] = (l as f32) / 32768.0;
+                                    if ch == 2 {
+                                        let r = i16::from_le_bytes([buf[f * stride + 2], buf[f * stride + 3]]);
+                                        pcm_r[got + f] = (r as f32) / 32768.0;
+                                    } else {
+                                        pcm_r[got + f] = pcm_l[got + f];
+                                    }
+                                }
+                                got += want;
+                                if s_loop {
+                                    slot_cursor += want;
+                                    if slot_cursor >= s_total { slot_cursor = 0; }
                                 } else {
-                                    pcm_r[f] = pcm_l[f];
+                                    k += 1;
+                                    slot_cursor = 0;
                                 }
                             }
+                            if got == 0 { continue; }
                         }
 
                         let mut read_idx: usize = 0;
@@ -2004,8 +1997,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                         }
 
                         let src_frames_this_pass = (read_idx as u32)
-                            .saturating_add(if fraction >= 0.5 { 1 } else { 0 })
-                            .min(remaining as u32);
+                            .saturating_add(if fraction >= 0.5 { 1 } else { 0 });
                         voice_snapshot[vid].2 = true;
                         voice_snapshot[vid].3 = src_frames_this_pass;
                         voice_snapshot[vid].4 = wb_total_frames as u32;
