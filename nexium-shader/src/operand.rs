@@ -1,4 +1,4 @@
-
+use crate::ir::FMods;
 
 #[inline]
 fn bits(insn: u64, lo: u32, hi: u32) -> u64 {
@@ -180,6 +180,57 @@ pub fn fsetp_abs_a(insn: u64) -> bool { bits(insn, 7, 7) != 0 }
 pub fn fsetp_neg_b(insn: u64) -> bool { bits(insn, 6, 6) != 0 }
 #[inline]
 pub fn fsetp_abs_b(insn: u64) -> bool { bits(insn, 44, 44) != 0 }
+
+#[inline]
+pub fn float_imm20(insn: u64) -> f32 {
+    let value = (bits(insn, 20, 38) as u32) << 12;
+    let sign = if bits(insn, 56, 56) != 0 { 1u32 << 31 } else { 0 };
+    f32::from_bits(value | sign)
+}
+
+#[inline]
+pub fn fadd_mods(insn: u64) -> FMods {
+    FMods {
+        neg_a: bits(insn, 48, 48) != 0,
+        abs_a: bits(insn, 46, 46) != 0,
+        neg_b: bits(insn, 45, 45) != 0,
+        abs_b: bits(insn, 49, 49) != 0,
+        neg_c: false,
+        sat: bits(insn, 50, 50) != 0,
+    }
+}
+
+#[inline]
+pub fn fmul_mods(insn: u64) -> FMods {
+    FMods { neg_b: bits(insn, 48, 48) != 0, sat: bits(insn, 50, 50) != 0, ..FMods::default() }
+}
+
+#[inline]
+pub fn ffma_mods(insn: u64) -> FMods {
+    FMods {
+        neg_b: bits(insn, 48, 48) != 0,
+        neg_c: bits(insn, 49, 49) != 0,
+        sat: bits(insn, 50, 50) != 0,
+        ..FMods::default()
+    }
+}
+
+#[inline]
+pub fn fmnmx_mods(insn: u64) -> FMods {
+    FMods {
+        neg_a: bits(insn, 48, 48) != 0,
+        abs_a: bits(insn, 46, 46) != 0,
+        neg_b: bits(insn, 45, 45) != 0,
+        abs_b: bits(insn, 49, 49) != 0,
+        neg_c: false,
+        sat: false,
+    }
+}
+
+#[inline]
+pub fn fmnmx_is_min(insn: u64) -> bool {
+    bits(insn, 42, 42) == 0
+}
 
 pub fn fmt_reg(r: u8) -> String {
     if r == RZ {

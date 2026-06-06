@@ -285,6 +285,35 @@ impl Emitter {
         self.f32_zero
     }
 
+    fn apply_neg_abs(&mut self, v: Word, neg: bool, abs: bool) -> Word {
+        let mut r = v;
+        if abs {
+            r = self.b.ext_inst(self.f32_t, None, self.glsl, 4, [Operand::IdRef(r)]).unwrap();
+        }
+        if neg {
+            let neg_one = self.const_f32((-1.0f32).to_bits());
+            r = self.b.f_mul(self.f32_t, None, r, neg_one).unwrap();
+        }
+        r
+    }
+
+    fn apply_sat(&mut self, v: Word, sat: bool) -> Word {
+        if !sat {
+            return v;
+        }
+        let zero = self.f32_zero;
+        let one = self.f32_one;
+        self.b
+            .ext_inst(
+                self.f32_t,
+                None,
+                self.glsl,
+                43,
+                [Operand::IdRef(v), Operand::IdRef(zero), Operand::IdRef(one)],
+            )
+            .unwrap()
+    }
+
     fn resolve_pred(&mut self, idx: u8, negate: bool) -> Word {
         let raw = if idx == 7 {
             self.bool_true
@@ -333,31 +362,64 @@ impl Emitter {
         let result = inst.result;
         let word = match &inst.op {
             IrOp::Mov(src) => Some(self.lower_value(src)),
-            IrOp::FMul { a, b } => {
+            IrOp::FMul { a, b, mods } => {
                 let av = self.lower_value(a);
                 let bv = self.lower_value(b);
-                Some(self.b.f_mul(self.f32_t, None, av, bv).unwrap())
+                let av = self.apply_neg_abs(av, mods.neg_a, mods.abs_a);
+                let bv = self.apply_neg_abs(bv, mods.neg_b, mods.abs_b);
+                let r = self.b.f_mul(self.f32_t, None, av, bv).unwrap();
+                Some(self.apply_sat(r, mods.sat))
             }
-            IrOp::FAdd { a, b } => {
+            IrOp::FAdd { a, b, mods } => {
                 let av = self.lower_value(a);
                 let bv = self.lower_value(b);
-                Some(self.b.f_add(self.f32_t, None, av, bv).unwrap())
+                let av = self.apply_neg_abs(av, mods.neg_a, mods.abs_a);
+                let bv = self.apply_neg_abs(bv, mods.neg_b, mods.abs_b);
+                let r = self.b.f_add(self.f32_t, None, av, bv).unwrap();
+                Some(self.apply_sat(r, mods.sat))
             }
-            IrOp::FFma { a, b, c } => {
+            IrOp::FFma { a, b, c, mods } => {
                 let av = self.lower_value(a);
                 let bv = self.lower_value(b);
                 let cv = self.lower_value(c);
+                let av = self.apply_neg_abs(av, mods.neg_a, mods.abs_a);
+                let bv = self.apply_neg_abs(bv, mods.neg_b, mods.abs_b);
+                let cv = self.apply_neg_abs(cv, mods.neg_c, false);
                 let glsl = self.glsl;
                 let f32_t = self.f32_t;
+                let r = self
+                    .b
+                    .ext_inst(
+                        f32_t,
+                        None,
+                        glsl,
+                        50,
+                        [Operand::IdRef(av), Operand::IdRef(bv), Operand::IdRef(cv)],
+                    )
+                    .unwrap();
+                Some(self.apply_sat(r, mods.sat))
+            }
+            IrOp::FMin { a, b, mods } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let av = self.apply_neg_abs(av, mods.neg_a, mods.abs_a);
+                let bv = self.apply_neg_abs(bv, mods.neg_b, mods.abs_b);
+                let (glsl, f32_t) = (self.glsl, self.f32_t);
                 Some(
                     self.b
-                        .ext_inst(
-                            f32_t,
-                            None,
-                            glsl,
-                            50,
-                            [Operand::IdRef(av), Operand::IdRef(bv), Operand::IdRef(cv)],
-                        )
+                        .ext_inst(f32_t, None, glsl, 37, [Operand::IdRef(av), Operand::IdRef(bv)])
+                        .unwrap(),
+                )
+            }
+            IrOp::FMax { a, b, mods } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let av = self.apply_neg_abs(av, mods.neg_a, mods.abs_a);
+                let bv = self.apply_neg_abs(bv, mods.neg_b, mods.abs_b);
+                let (glsl, f32_t) = (self.glsl, self.f32_t);
+                Some(
+                    self.b
+                        .ext_inst(f32_t, None, glsl, 40, [Operand::IdRef(av), Operand::IdRef(bv)])
                         .unwrap(),
                 )
             }
@@ -806,6 +868,19 @@ impl Emitter {
                 self.b.store(pos, new_pos, None, []).unwrap();
             }
             Stage::Fragment => {
+                let degenerate = cfg.blocks.is_empty()
+                    || cfg
+                        .blocks
+                        .iter()
+                        .all(|b| b.program.instructions.is_empty());
+                if degenerate {
+                    log::warn!(
+                        "spirv: degenerate Fragment CFG (blocks={}, all-empty) — \
+                         emitting [0,0,0,1] fallback. If this is hot, the SASS \
+                         decoder (nexium-shader::decode) is likely missing opcodes.",
+                        cfg.blocks.len()
+                    );
+                }
                 let exit_state = cfg
                     .blocks
                     .iter()

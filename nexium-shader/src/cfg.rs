@@ -473,7 +473,7 @@ mod tests {
             .iter()
             .find(|i| matches!(i.op, Op::FMul { .. }))
             .expect("expected the FMul in the merge block");
-        if let Op::FMul { a, b } = &fmul.op {
+        if let Op::FMul { a, b, .. } = &fmul.op {
             assert!(matches!(a, Value::Inst(id) if *id == phi_id),
                 "FMul.a should reference the phi result, got {a:?}");
             assert!(matches!(b, Value::Inst(id) if *id == phi_id),
@@ -539,7 +539,7 @@ mod tests {
             .iter()
             .find(|i| matches!(i.op, Op::FAdd { .. }))
             .expect("expected FAdd in B1");
-        if let Op::FAdd { a, b: _ } = &fadd.op {
+        if let Op::FAdd { a, b: _, .. } = &fadd.op {
             assert!(
                 matches!(a, Value::Inst(id) if *id == phi_id),
                 "FAdd.a should be phi result, got {a:?}"

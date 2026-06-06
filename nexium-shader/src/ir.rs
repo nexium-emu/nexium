@@ -150,16 +150,30 @@ impl fmt::Display for Predicate {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FMods {
+    pub neg_a: bool,
+    pub abs_a: bool,
+    pub neg_b: bool,
+    pub abs_b: bool,
+    pub neg_c: bool,
+    pub sat: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum Op {
 
     Mov(Value),
 
-    FMul { a: Value, b: Value },
+    FMul { a: Value, b: Value, mods: FMods },
 
-    FAdd { a: Value, b: Value },
+    FAdd { a: Value, b: Value, mods: FMods },
 
-    FFma { a: Value, b: Value, c: Value },
+    FFma { a: Value, b: Value, c: Value, mods: FMods },
+
+    FMin { a: Value, b: Value, mods: FMods },
+
+    FMax { a: Value, b: Value, mods: FMods },
 
     MultiFunc { src: Value, func: MufuFunc },
 
@@ -301,9 +315,11 @@ impl Inst {
         write!(f, "{pred_tag}{dest_tag}")?;
         match &self.op {
             Op::Mov(s) => write!(f, "Mov   {s}"),
-            Op::FMul { a, b } => write!(f, "FMul  {a}, {b}"),
-            Op::FAdd { a, b } => write!(f, "FAdd  {a}, {b}"),
-            Op::FFma { a, b, c } => write!(f, "FFma  {a}, {b}, {c}"),
+            Op::FMul { a, b, .. } => write!(f, "FMul  {a}, {b}"),
+            Op::FAdd { a, b, .. } => write!(f, "FAdd  {a}, {b}"),
+            Op::FFma { a, b, c, .. } => write!(f, "FFma  {a}, {b}, {c}"),
+            Op::FMin { a, b, .. } => write!(f, "FMin  {a}, {b}"),
+            Op::FMax { a, b, .. } => write!(f, "FMax  {a}, {b}"),
             Op::MultiFunc { src, func } => write!(f, "MFn.{} {src}", func.name()),
             Op::LoadCbuf { binding, byte_offset } => {
                 write!(f, "LdCbuf c[{binding:#x}]:{byte_offset:#x}")

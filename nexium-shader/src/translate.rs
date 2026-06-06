@@ -8,6 +8,7 @@ use super::operand::{
     ldc_ref, ldc_size, ldc_src_reg, mufu_func_bits, reg_a, reg_b, reg_c, reg_dest,
     texs_tex_id, fsetp_dest_p, fsetp_dest_np, fsetp_src_pred, fsetp_src_pred_inv,
     fsetp_bop, fsetp_cmp, fsetp_neg_a, fsetp_abs_a, fsetp_neg_b, fsetp_abs_b, RZ,
+    fadd_mods, fmul_mods, ffma_mods, fmnmx_mods, fmnmx_is_min, float_imm20,
 };
 use super::decode::decode_one; use super::opcodes::Opcode;
 
@@ -120,21 +121,24 @@ impl Translator {
                 let dest = reg_dest(raw);
                 let a = self.read_reg(reg_a(raw));
                 let b = self.read_reg(reg_b(raw));
-                self.write_reg(dest, Op::FMul { a, b }, pred);
+                self.write_reg(dest, Op::FMul { a, b, mods: fmul_mods(raw) }, pred);
             }
             Opcode::FMUL_cbuf => {
                 let dest = reg_dest(raw);
                 let a = self.read_reg(reg_a(raw));
                 let cb_id = self.load_cbuf(raw);
-                self.write_reg(dest, Op::FMul { a, b: Value::Inst(cb_id) }, pred);
+                self.write_reg(
+                    dest,
+                    Op::FMul { a, b: Value::Inst(cb_id), mods: fmul_mods(raw) },
+                    pred,
+                );
             }
             Opcode::FMUL_imm => {
                 let dest = reg_dest(raw);
                 let a = self.read_reg(reg_a(raw));
-                let imm_bits = imm20(raw) as u32;
                 self.write_reg(
                     dest,
-                    Op::FMul { a, b: Value::ImmF32(f32::from_bits(imm_bits)) },
+                    Op::FMul { a, b: Value::ImmF32(float_imm20(raw)), mods: fmul_mods(raw) },
                     pred,
                 );
             }
@@ -143,21 +147,24 @@ impl Translator {
                 let dest = reg_dest(raw);
                 let a = self.read_reg(reg_a(raw));
                 let b = self.read_reg(reg_b(raw));
-                self.write_reg(dest, Op::FAdd { a, b }, pred);
+                self.write_reg(dest, Op::FAdd { a, b, mods: fadd_mods(raw) }, pred);
             }
             Opcode::FADD_cbuf => {
                 let dest = reg_dest(raw);
                 let a = self.read_reg(reg_a(raw));
                 let cb_id = self.load_cbuf(raw);
-                self.write_reg(dest, Op::FAdd { a, b: Value::Inst(cb_id) }, pred);
+                self.write_reg(
+                    dest,
+                    Op::FAdd { a, b: Value::Inst(cb_id), mods: fadd_mods(raw) },
+                    pred,
+                );
             }
             Opcode::FADD_imm => {
                 let dest = reg_dest(raw);
                 let a = self.read_reg(reg_a(raw));
-                let imm_bits = imm20(raw) as u32;
                 self.write_reg(
                     dest,
-                    Op::FAdd { a, b: Value::ImmF32(f32::from_bits(imm_bits)) },
+                    Op::FAdd { a, b: Value::ImmF32(float_imm20(raw)), mods: fadd_mods(raw) },
                     pred,
                 );
             }
@@ -167,32 +174,65 @@ impl Translator {
                 let a = self.read_reg(reg_a(raw));
                 let b = self.read_reg(reg_b(raw));
                 let c = self.read_reg(reg_c(raw));
-                self.write_reg(dest, Op::FFma { a, b, c }, pred);
+                self.write_reg(dest, Op::FFma { a, b, c, mods: ffma_mods(raw) }, pred);
             }
             Opcode::FFMA_cr => {
                 let dest = reg_dest(raw);
                 let a = self.read_reg(reg_a(raw));
                 let cb_id = self.load_cbuf(raw);
                 let c = self.read_reg(reg_c(raw));
-                self.write_reg(dest, Op::FFma { a, b: Value::Inst(cb_id), c }, pred);
+                self.write_reg(
+                    dest,
+                    Op::FFma { a, b: Value::Inst(cb_id), c, mods: ffma_mods(raw) },
+                    pred,
+                );
             }
             Opcode::FFMA_rc => {
                 let dest = reg_dest(raw);
                 let a = self.read_reg(reg_a(raw));
                 let b = self.read_reg(reg_b(raw));
                 let cb_id = self.load_cbuf(raw);
-                self.write_reg(dest, Op::FFma { a, b, c: Value::Inst(cb_id) }, pred);
+                self.write_reg(
+                    dest,
+                    Op::FFma { a, b, c: Value::Inst(cb_id), mods: ffma_mods(raw) },
+                    pred,
+                );
             }
             Opcode::FFMA_imm => {
                 let dest = reg_dest(raw);
                 let a = self.read_reg(reg_a(raw));
-                let imm_bits = imm20(raw) as u32;
                 let c = self.read_reg(reg_c(raw));
                 self.write_reg(
                     dest,
-                    Op::FFma { a, b: Value::ImmF32(f32::from_bits(imm_bits)), c },
+                    Op::FFma { a, b: Value::ImmF32(float_imm20(raw)), c, mods: ffma_mods(raw) },
                     pred,
                 );
+            }
+
+            Opcode::FMNMX_reg => {
+                let dest = reg_dest(raw);
+                let a = self.read_reg(reg_a(raw));
+                let b = self.read_reg(reg_b(raw));
+                let mods = fmnmx_mods(raw);
+                let op = if fmnmx_is_min(raw) { Op::FMin { a, b, mods } } else { Op::FMax { a, b, mods } };
+                self.write_reg(dest, op, pred);
+            }
+            Opcode::FMNMX_cbuf => {
+                let dest = reg_dest(raw);
+                let a = self.read_reg(reg_a(raw));
+                let cb_id = self.load_cbuf(raw);
+                let b = Value::Inst(cb_id);
+                let mods = fmnmx_mods(raw);
+                let op = if fmnmx_is_min(raw) { Op::FMin { a, b, mods } } else { Op::FMax { a, b, mods } };
+                self.write_reg(dest, op, pred);
+            }
+            Opcode::FMNMX_imm => {
+                let dest = reg_dest(raw);
+                let a = self.read_reg(reg_a(raw));
+                let b = Value::ImmF32(float_imm20(raw));
+                let mods = fmnmx_mods(raw);
+                let op = if fmnmx_is_min(raw) { Op::FMin { a, b, mods } } else { Op::FMax { a, b, mods } };
+                self.write_reg(dest, op, pred);
             }
 
             Opcode::ALD => {
@@ -410,7 +450,7 @@ mod tests {
         assert!(t.translate(raw));
         assert_eq!(t.program.instructions.len(), 1);
         match &t.program.instructions[0].op {
-            Op::FMul { a, b } => {
+            Op::FMul { a, b, .. } => {
                 assert!(matches!(a, Value::GprIn(2)));
                 assert!(matches!(b, Value::GprIn(0)));
             }
@@ -428,7 +468,7 @@ mod tests {
         assert_eq!(t.program.instructions.len(), 2);
         assert!(matches!(t.program.instructions[0].op, Op::LoadCbuf { .. }));
         match &t.program.instructions[1].op {
-            Op::FFma { a, b, c } => {
+            Op::FFma { a, b, c, .. } => {
                 assert!(matches!(a, Value::GprIn(1)));
                 assert!(matches!(b, Value::Inst(_)));
                 assert!(matches!(c, Value::GprIn(2)));
