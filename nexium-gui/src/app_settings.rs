@@ -123,6 +123,7 @@ pub struct AppSettings {
     #[serde(default)] pub audio_output_device: Option<String>,
     #[serde(default = "default_audio_volume")] pub audio_volume: f32,
     #[serde(default = "default_multicore")] pub multicore: bool,
+    #[serde(default)] pub async_shaders: bool,
 }
 
 impl Default for AppSettings {
@@ -138,6 +139,7 @@ impl Default for AppSettings {
             audio_output_device: None,
             audio_volume: default_audio_volume(),
             multicore: default_multicore(),
+            async_shaders: false,
         }
     }
 }

@@ -7,6 +7,7 @@ pub mod file_logger;
 pub mod frame_present;
 pub mod title;
 pub mod dumps;
+pub mod async_compile;
 
 pub use error::{HorizonError, Result};
 pub use result::SUCCESS;

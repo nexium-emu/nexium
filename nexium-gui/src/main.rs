@@ -29,6 +29,8 @@ fn main() -> Result<(), eframe::Error> {
 
     log::info!("=== NeXium - Nintendo Switch Emulator ===");
 
+    nexium_common::async_compile::set_enabled(settings.async_shaders);
+
     #[cfg(windows)]
     {
         #[link(name = "winmm")]

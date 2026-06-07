@@ -899,6 +899,17 @@ fn graphics_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_need
         cfg.vsync = vsync;
         *save_needed = true;
     }
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Shaders").size(13.0).strong().color(TEXT));
+    ui.add_space(6.0);
+    let mut async_shaders = cfg.async_shaders;
+    if ui.checkbox(&mut async_shaders, "Asynchronous shader compilation").changed() {
+        cfg.async_shaders = async_shaders;
+        nexium_common::async_compile::set_enabled(async_shaders);
+        *save_needed = true;
+    }
+    ui.label(egui::RichText::new("Builds new pipelines on a background thread so the game never stalls to compile. New effects pop in a frame or two the first time they appear. Off = compile on demand (brief hitch on first sight, no pop-in). Disk cache makes later launches stutter-free either way.").size(10.5).color(MUTED));
 }
 
 fn audio_settings_content(

@@ -723,7 +723,7 @@ impl Renderer {
         poly_offset_factor: f32,
         depth: crate::draw::DepthState,
         depth_format: vk::Format,
-    ) -> Result<vk::Pipeline, String> {
+    ) -> Result<Option<vk::Pipeline>, String> {
         let mut inner = self.inner.lock();
         let blend_signature: u32 = (blend.enabled as u32)
             | ((blend.src_factor.as_raw() as u32 & 0xFF) << 8)
@@ -753,8 +753,9 @@ impl Renderer {
             depth_state_packed,
             poly_offset_packed,
         };
+        inner.pipeline_cache.drain_completed();
         if let Some(p) = inner.pipeline_cache.get(&key) {
-            return Ok(p);
+            return Ok(Some(p));
         }
         let depth_clip_control_enabled = inner.depth_clip_control_enabled;
         let RendererInner { device, shader_compiler, pipeline_cache, .. } = &mut *inner;
@@ -762,38 +763,14 @@ impl Renderer {
         let vs_mod = shader_compiler.compile_or_get(vs_spirv, device)?;
         let fs_mod = shader_compiler.compile_or_get(fs_spirv, device)?;
 
-        let entry = c"main";
-        let stages = [
-            vk::PipelineShaderStageCreateInfo {
-                s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
-                stage: vk::ShaderStageFlags::VERTEX,
-                module: vs_mod,
-                p_name: entry.as_ptr(),
-                p_specialization_info: std::ptr::null(),
-                p_next: std::ptr::null(),
-                flags: Default::default(),
-                _marker: std::marker::PhantomData,
-            },
-            vk::PipelineShaderStageCreateInfo {
-                s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
-                stage: vk::ShaderStageFlags::FRAGMENT,
-                module: fs_mod,
-                p_name: entry.as_ptr(),
-                p_specialization_info: std::ptr::null(),
-                p_next: std::ptr::null(),
-                flags: Default::default(),
-                _marker: std::marker::PhantomData,
-            },
-        ];
-
-        let vk_bindings: Vec<vk::VertexInputBindingDescription> = layout.bindings.iter().map(|b| {
+        let bindings: Vec<vk::VertexInputBindingDescription> = layout.bindings.iter().map(|b| {
             vk::VertexInputBindingDescription {
                 binding: b.binding,
                 stride: b.stride,
                 input_rate: vk::VertexInputRate::VERTEX,
             }
         }).collect();
-        let vk_attrs: Vec<vk::VertexInputAttributeDescription> = layout.attrs.iter().map(|a| {
+        let attrs: Vec<vk::VertexInputAttributeDescription> = layout.attrs.iter().map(|a| {
             vk::VertexInputAttributeDescription {
                 location: a.location,
                 binding: a.binding,
@@ -802,210 +779,35 @@ impl Renderer {
             }
         }).collect();
 
-        let vi_state = vk::PipelineVertexInputStateCreateInfo {
-            s_type: vk::StructureType::PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-            vertex_binding_description_count: vk_bindings.len() as u32,
-            p_vertex_binding_descriptions: vk_bindings.as_ptr(),
-            vertex_attribute_description_count: vk_attrs.len() as u32,
-            p_vertex_attribute_descriptions: vk_attrs.as_ptr(),
-            p_next: std::ptr::null(),
-            flags: Default::default(),
-            _marker: std::marker::PhantomData,
-        };
-
-        let ia_state = vk::PipelineInputAssemblyStateCreateInfo {
-            s_type: vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        let req = crate::pipeline::PipelineBuildRequest {
+            key,
+            vs_mod,
+            fs_mod,
+            bindings,
+            attrs,
             topology,
-            primitive_restart_enable: vk::FALSE,
-            p_next: std::ptr::null(),
-            flags: Default::default(),
-            _marker: std::marker::PhantomData,
+            color_format,
+            depth_format,
+            has_depth,
+            blend,
+            depth,
+            cull_test_enable,
+            cull_face,
+            front_face,
+            poly_offset_enable,
+            poly_offset_units,
+            poly_offset_factor,
+            depth_clip_control_enabled,
         };
 
-        let dcc_vp = vk::PipelineViewportDepthClipControlCreateInfoEXT {
-            s_type: vk::StructureType::PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT,
-            negative_one_to_one: vk::TRUE,
-            p_next: std::ptr::null(),
-            _marker: std::marker::PhantomData,
-        };
-        let vp_pnext: *const std::ffi::c_void = if depth_clip_control_enabled {
-            &dcc_vp as *const _ as *const std::ffi::c_void
-        } else {
-            std::ptr::null()
-        };
-        let vp_state = vk::PipelineViewportStateCreateInfo {
-            s_type: vk::StructureType::PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-            viewport_count: 1,
-            p_viewports: std::ptr::null(),
-            scissor_count: 1,
-            p_scissors: std::ptr::null(),
-            p_next: vp_pnext,
-            flags: Default::default(),
-            _marker: std::marker::PhantomData,
-        };
-
-        let host_front_face = match front_face {
-            0x0900 => vk::FrontFace::CLOCKWISE,
-            0x0901 => vk::FrontFace::COUNTER_CLOCKWISE,
-            _ => vk::FrontFace::COUNTER_CLOCKWISE,
-        };
-        let host_cull = if !cull_test_enable {
-            vk::CullModeFlags::NONE
-        } else {
-            match cull_face {
-                0x0404 | 0x0001 => vk::CullModeFlags::FRONT,
-                0x0405 | 0x0002 => vk::CullModeFlags::BACK,
-                0x0408 | 0x0003 => vk::CullModeFlags::FRONT_AND_BACK,
-                _ => vk::CullModeFlags::NONE,
-            }
-        };
-
-        thread_local! {
-            static RS_DIAG_LOGGED: std::sync::atomic::AtomicBool =
-                const { std::sync::atomic::AtomicBool::new(false) };
+        if nexium_common::async_compile::enabled() {
+            pipeline_cache.request_async(req);
+            return Ok(None);
         }
-        RS_DIAG_LOGGED.with(|flag| {
-            if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                log::info!(
-                    "pipeline_rs_diag (first build): host_cull={:?} host_front_face={:?} \
-                     guest_cull_test_enable={} guest_cull_face={:#x} guest_front_face={:#x} \
-                     pipeline_key{{vs_hash=0x{:016x}, fs_hash=0x{:016x}, topology={}, \
-                     raster_state_packed={:#x}}}",
-                    host_cull,
-                    host_front_face,
-                    cull_test_enable,
-                    cull_face,
-                    front_face,
-                    key.vs_hash,
-                    key.fs_hash,
-                    key.topology,
-                    key.raster_state_packed,
-                );
-            }
-        });
 
-        let rs_state = vk::PipelineRasterizationStateCreateInfo {
-            s_type: vk::StructureType::PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-            polygon_mode: vk::PolygonMode::FILL,
-            cull_mode: host_cull,
-            front_face: host_front_face,
-            line_width: 1.0,
-            depth_clamp_enable: vk::FALSE,
-            rasterizer_discard_enable: vk::FALSE,
-            depth_bias_enable: if poly_offset_enable { vk::TRUE } else { vk::FALSE },
-            depth_bias_constant_factor: poly_offset_units / 2.0,
-            depth_bias_clamp: 0.0,
-            depth_bias_slope_factor: poly_offset_factor,
-            p_next: std::ptr::null(),
-            flags: Default::default(),
-            _marker: std::marker::PhantomData,
-        };
-
-        let ms_state = vk::PipelineMultisampleStateCreateInfo {
-            s_type: vk::StructureType::PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-            rasterization_samples: vk::SampleCountFlags::TYPE_1,
-            sample_shading_enable: vk::FALSE,
-            min_sample_shading: 0.0,
-            p_sample_mask: std::ptr::null(),
-            alpha_to_coverage_enable: vk::FALSE,
-            alpha_to_one_enable: vk::FALSE,
-            p_next: std::ptr::null(),
-            flags: Default::default(),
-            _marker: std::marker::PhantomData,
-        };
-
-        let cb_attachment = vk::PipelineColorBlendAttachmentState {
-            blend_enable: if blend.enabled { vk::TRUE } else { vk::FALSE },
-            src_color_blend_factor: blend.src_factor,
-            dst_color_blend_factor: blend.dst_factor,
-            color_blend_op: blend.op,
-            src_alpha_blend_factor: blend.src_factor,
-            dst_alpha_blend_factor: blend.dst_factor,
-            alpha_blend_op: blend.op,
-            color_write_mask: vk::ColorComponentFlags::RGBA,
-        };
-        let cb_state = vk::PipelineColorBlendStateCreateInfo {
-            s_type: vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-            logic_op_enable: vk::FALSE,
-            logic_op: vk::LogicOp::COPY,
-            attachment_count: 1,
-            p_attachments: &cb_attachment,
-            blend_constants: [0.0; 4],
-            p_next: std::ptr::null(),
-            flags: Default::default(),
-            _marker: std::marker::PhantomData,
-        };
-
-        let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dyn_state = vk::PipelineDynamicStateCreateInfo {
-            s_type: vk::StructureType::PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-            dynamic_state_count: dyn_states.len() as u32,
-            p_dynamic_states: dyn_states.as_ptr(),
-            p_next: std::ptr::null(),
-            flags: Default::default(),
-            _marker: std::marker::PhantomData,
-        };
-
-        let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo {
-            s_type: vk::StructureType::PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-            depth_test_enable: if depth.test_enabled { vk::TRUE } else { vk::FALSE },
-            depth_write_enable: if depth.write_enabled { vk::TRUE } else { vk::FALSE },
-            depth_compare_op: depth.compare_op,
-            depth_bounds_test_enable: vk::FALSE,
-            stencil_test_enable: vk::FALSE,
-            front: vk::StencilOpState::default(),
-            back: vk::StencilOpState::default(),
-            min_depth_bounds: 0.0,
-            max_depth_bounds: 1.0,
-            p_next: std::ptr::null(),
-            flags: Default::default(),
-            _marker: std::marker::PhantomData,
-        };
-        let p_depth_stencil_state: *const vk::PipelineDepthStencilStateCreateInfo =
-            if has_depth { &depth_stencil_state } else { std::ptr::null() };
-
-        let color_formats = [color_format];
-        let mut rendering_info = vk::PipelineRenderingCreateInfo {
-            s_type: vk::StructureType::PIPELINE_RENDERING_CREATE_INFO,
-            view_mask: 0,
-            color_attachment_count: 1,
-            p_color_attachment_formats: color_formats.as_ptr(),
-            depth_attachment_format: depth_format,
-            stencil_attachment_format: vk::Format::UNDEFINED,
-            p_next: std::ptr::null(),
-            _marker: std::marker::PhantomData,
-        };
-
-        let pipeline_info = vk::GraphicsPipelineCreateInfo {
-            s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
-            stage_count: stages.len() as u32,
-            p_stages: stages.as_ptr(),
-            p_vertex_input_state: &vi_state,
-            p_input_assembly_state: &ia_state,
-            p_tessellation_state: std::ptr::null(),
-            p_viewport_state: &vp_state,
-            p_rasterization_state: &rs_state,
-            p_multisample_state: &ms_state,
-            p_depth_stencil_state,
-            p_color_blend_state: &cb_state,
-            p_dynamic_state: &dyn_state,
-            layout: pipeline_cache.layout,
-            render_pass: vk::RenderPass::null(),
-            subpass: 0,
-            base_pipeline_handle: vk::Pipeline::null(),
-            base_pipeline_index: -1,
-            p_next: &mut rendering_info as *mut _ as *mut std::ffi::c_void,
-            flags: Default::default(),
-            _marker: std::marker::PhantomData,
-        };
-
-        let pipelines = unsafe {
-            device.create_graphics_pipelines(pipeline_cache.vk_cache, &[pipeline_info], None)
-                .map_err(|(_, e)| format!("create_graphics_pipelines: {:?}", e))?
-        };
-        let pipeline = pipelines[0];
+        let pipeline = pipeline_cache.build(device, &req)?;
         pipeline_cache.insert(key, pipeline);
-        Ok(pipeline)
+        Ok(Some(pipeline))
     }
 
     pub fn execute_draw<F>(
@@ -1022,7 +824,7 @@ impl Renderer {
         } else {
             vk::Format::UNDEFINED
         };
-        let pipeline = self.compile_pipeline(
+        let pipeline = match self.compile_pipeline(
             &call.vs_spirv,
             &call.fs_spirv,
             call.vs_cbuf_mask,
@@ -1039,7 +841,10 @@ impl Renderer {
             call.poly_offset_factor,
             call.depth,
             depth_format,
-        )?;
+        )? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
 
         let vertex_stride = call
             .vertex_layout
@@ -1539,6 +1344,7 @@ impl Renderer {
         let next_idx = other_idx;
         ubo_ring.slot_head[next_idx] = ubo_ring.head;
         *frame_index = next_idx;
+        pipeline_cache.maybe_save(device);
 
         *tele_in_flight_mask =
             (frame_slots[0].in_flight as u32) | ((frame_slots[1].in_flight as u32) << 1);
@@ -1587,17 +1393,20 @@ impl Renderer {
             use_depth: bool,
             tsc: Option<crate::texture::TscEntry>,
         }
-        let mut preps: Vec<Prep> = Vec::with_capacity(calls.len());
+        let mut preps: Vec<(&crate::draw::Maxwell3dDrawCall, Prep)> = Vec::with_capacity(calls.len());
         for call in calls {
             let use_depth = call.depth_key.is_some();
             let depth_format = if use_depth { vk::Format::D32_SFLOAT } else { vk::Format::UNDEFINED };
-            let pipeline = self.compile_pipeline(
+            let pipeline = match self.compile_pipeline(
                 &call.vs_spirv, &call.fs_spirv, call.vs_cbuf_mask, call.fs_cbuf_mask,
                 &call.vertex_layout, call.state.topology, call.rt_format, call.blend,
                 call.cull_test_enable, call.cull_face, call.front_face,
                 call.poly_offset_enable, call.poly_offset_units, call.poly_offset_factor,
                 call.depth, depth_format,
-            )?;
+            )? {
+                Some(p) => p,
+                None => continue,
+            };
             let vertex_stride = call.vertex_layout.bindings.first().map(|b| b.stride as u64).unwrap_or(0);
             let vertex_bytes = vertex_stride.saturating_mul(call.vertex_count as u64) as usize;
             let vertex_data = if vertex_bytes > 0 {
@@ -1636,7 +1445,11 @@ impl Renderer {
                         read_guest(tsc_addr, 32).and_then(|r| crate::texture::TscEntry::parse(&r))
                     } else { None }
                 } else { None };
-            preps.push(Prep { pipeline, vertex_data, cbuf_data, vertex_stride, tex_pending, use_depth, tsc });
+            preps.push((call, Prep { pipeline, vertex_data, cbuf_data, vertex_stride, tex_pending, use_depth, tsc }));
+        }
+
+        if preps.is_empty() {
+            return Ok(());
         }
 
         let mut inner = self.inner.lock();
@@ -1680,7 +1493,7 @@ impl Renderer {
             let rt = rt_cache.get_or_create(rt_key, device)?;
             (rt.image, rt.view, rt.extent, rt.layout)
         };
-        let any_depth = preps.iter().any(|p| p.use_depth);
+        let any_depth = preps.iter().any(|p| p.1.use_depth);
         let (depth_image, depth_view, depth_prev) = if any_depth {
             let d = rt_cache.get_or_create_depth(rt_key, device)?;
             (Some(d.image), Some(d.view), d.layout)
@@ -1706,7 +1519,8 @@ impl Renderer {
         }
 
         let mut dsets_batch: Vec<vk::DescriptorSet> = Vec::new();
-        for (i, (call, prep)) in calls.iter().zip(preps.iter()).enumerate() {
+        for (i, (call, prep)) in preps.iter().enumerate() {
+            let call = *call;
             if i > 0 {
                 transition_image(device, cmd, rt_image, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
                 if let Some(di) = depth_image {
