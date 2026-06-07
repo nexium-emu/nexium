@@ -294,7 +294,7 @@ impl Pusher {
                 for (gpu_va, payload) in writes {
                     if let Some(cpu) = mappings.cpu_address_for(gpu_va) {
                         let ok = mem_write(cpu, &payload.to_le_bytes());
-                        log::info!(
+                        log::trace!(
                             "pusher: fence release gpu_va={:#x} cpu={:#x} payload={:#x} write_ok={}",
                             gpu_va, cpu, payload, ok
                         );

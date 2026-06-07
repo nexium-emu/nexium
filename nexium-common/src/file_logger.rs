@@ -65,8 +65,13 @@ impl log::Log for FileLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
         if metadata.level() > log::max_level() { return false; }
         if metadata.level() == log::Level::Trace { return false; }
+        let t = metadata.target();
+        if metadata.level() >= log::Level::Info
+            && (t.starts_with("wgpu") || t.starts_with("naga"))
+        {
+            return false;
+        }
         if metadata.level() >= log::Level::Debug {
-            let t = metadata.target();
             if t.starts_with("dynarmic_sys") || t.starts_with("dynarmic_sys_mythrax") {
                 return false;
             }

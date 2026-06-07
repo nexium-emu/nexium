@@ -404,7 +404,7 @@ impl Maxwell3D {
                     let payload = self.reg_file.get(0x6c2).copied().unwrap_or(0);
                     let gpu_va = ((off_hi as u64) << 32) | (off_lo as u64);
                     self.regs.pending_semaphore_writes.push((gpu_va, payload));
-                    log::debug!(
+                    log::trace!(
                         "maxwell3d: SET_REPORT_SEMAPHORE Release gpu_va={:#x} payload={:#x} struct_size={}",
                         gpu_va, payload, structure_size
                     );
@@ -478,14 +478,14 @@ impl Maxwell3D {
                 self.regs.draw_count += 1;
                 let count = (arg >> 16) & 0xFFFF;
                 let topology = (arg >> 28) & 0xF;
-                log::debug!("maxwell3d: DRAW_VERTEX_ARRAY_BEGIN count={} topology={}", count, topology);
+                log::trace!("maxwell3d: DRAW_VERTEX_ARRAY_BEGIN count={} topology={}", count, topology);
                 self.push_draw(topology, self.regs.draw_first_vertex, count, false, 0);
             }
             0x35E => {
 
                 self.regs.draw_vertex_count = arg;
                 self.regs.draw_count += 1;
-                log::debug!("maxwell3d: DrawArraysCount count={} topology={} first={}",
+                log::trace!("maxwell3d: DrawArraysCount count={} topology={} first={}",
                     arg, self.regs.draw_topology, self.regs.draw_first_vertex);
                 if arg > 0 {
                     self.push_draw(self.regs.draw_topology, self.regs.draw_first_vertex, arg, false, 0);
@@ -497,7 +497,7 @@ impl Maxwell3D {
                 self.regs.draw_count += 1;
                 let count = (arg >> 16) & 0xFFF;
                 let topology = (arg >> 28) & 0xF;
-                log::debug!("maxwell3d: DRAW_VERTEX_ARRAY_BEGIN_END count={} topology={}", count, topology);
+                log::trace!("maxwell3d: DRAW_VERTEX_ARRAY_BEGIN_END count={} topology={}", count, topology);
                 self.push_draw(topology, self.regs.draw_first_vertex, count, false, 0);
             }
 

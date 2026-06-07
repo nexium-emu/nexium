@@ -247,7 +247,7 @@ impl Nvdrv {
             }
         };
         let cmd = (req.ioctl_id & 0xFFFF) as u16;
-        log::debug!("nvdrv:Ioctl fd={} device={:?} ioctl={:#010x} cmd={:#06x} in_size={} out_size={}",
+        log::trace!("nvdrv:Ioctl fd={} device={:?} ioctl={:#010x} cmd={:#06x} in_size={} out_size={}",
             req.fd, device, req.ioctl_id, cmd, req.in_data.len(), req.out_size);
 
         match device {
@@ -630,7 +630,7 @@ impl Nvdrv {
                     let num_entries = u32::from_le_bytes([
                         req.in_data[8], req.in_data[9], req.in_data[10], req.in_data[11],
                     ]);
-                    log::debug!("nvhost-gpu:SubmitGPFIFO addr={:#x} entries={}", address, num_entries);
+                    log::trace!("nvhost-gpu:SubmitGPFIFO addr={:#x} entries={}", address, num_entries);
 
                     if cmd == 0x4808 && req.in_data.len() >= 16 + (num_entries as usize) * 8 {
                         let entries: Vec<gpu::CommandListHeader> = (0..num_entries as usize).map(|i| {
@@ -660,7 +660,7 @@ impl Nvdrv {
                         self.stats.gpfifo_submits.fetch_add(1, Ordering::Relaxed);
                         self.stats.gpfifo_entries.fetch_add(num_entries as u64, Ordering::Relaxed);
                         let (syncpt_id, syncpt_value) = self.gpu.submit_gpfifo(address, num_entries, mem_read, mem_write);
-                        log::debug!("nvhost-gpu:SubmitGPFIFO (kickoff) addr={:#x} entries={} draws={}",
+                        log::trace!("nvhost-gpu:SubmitGPFIFO (kickoff) addr={:#x} entries={} draws={}",
                             address, num_entries, self.gpu.maxwell3d.lock().draw_count());
                         if out.len() >= 24 {
                             out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());

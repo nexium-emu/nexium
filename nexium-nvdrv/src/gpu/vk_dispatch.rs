@@ -379,7 +379,7 @@ fn execute_one(
 
     let (cbuf_addr, cbuf_size) = resolve_cbuf(draw, &maxwell.regs.cbuf_binds);
 
-    log::debug!(
+    log::trace!(
         "cbuf_resolve: addr={:#x} size={} cb_binds_nonzero={}",
         cbuf_addr, cbuf_size,
         maxwell.regs.cbuf_binds.iter()
@@ -408,14 +408,14 @@ fn execute_one(
                         let tsc = handle >> 20;
                         let was = *unit_slot;
                         if tic != INVALID_TIC && tic <= draw.tic_pool_limit {
-                            log::debug!(
+                            log::trace!(
                                 "bindless: unit {} -> handle {:#x} -> TIC {} TSC {}",
                                 was, handle, tic, tsc
                             );
                             *unit_slot = tic;
                             fs_sampler_ids[i] = tsc;
                         } else {
-                            log::debug!(
+                            log::trace!(
                                 "bindless: unit {} -> handle {:#x} (invalid/no-tex)",
                                 was, handle
                             );

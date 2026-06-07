@@ -218,7 +218,7 @@ impl BootContext {
                 }
                 nexium_cpu::CpuEvent::Svc(imm) => {
                     svc_count += 1;
-                    log::info!("SVC {:#04x} (count: {})", imm, svc_count);
+                    log::trace!("SVC {:#04x} (count: {})", imm, svc_count);
 
                     let result = self.kernel.lock().dispatch_svc(imm);
 
