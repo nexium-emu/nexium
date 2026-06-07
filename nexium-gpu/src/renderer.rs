@@ -318,7 +318,9 @@ impl Renderer {
         let descriptor_layout = DescriptorSetLayout::new(&device)?;
         let descriptor_pool = DescriptorPool::new(&device, 1024)?;
         let shader_compiler = ShaderCompiler::new();
-        let pipeline_cache = PipelineCache::new(&device, descriptor_layout.layout)?;
+        let cache_uuid = unsafe { instance.get_physical_device_properties(physical_device) }.pipeline_cache_uuid;
+        let device_tag: String = cache_uuid.iter().map(|b| format!("{:02x}", b)).collect();
+        let pipeline_cache = PipelineCache::new(&device, descriptor_layout.layout, &device_tag)?;
 
         let props = unsafe { instance.get_physical_device_properties(physical_device) };
         let name = unsafe {

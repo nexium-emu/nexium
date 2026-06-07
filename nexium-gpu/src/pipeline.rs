@@ -2,13 +2,14 @@ use ash::vk;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-fn pipeline_cache_path() -> Option<PathBuf> {
+fn cache_path(device_tag: &str) -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")?;
     let title = nexium_common::title::title_key().unwrap_or_else(|| "default".to_string());
     Some(
         PathBuf::from(base)
             .join("NeXium")
-            .join("pipeline_cache")
+            .join("shader_cache")
+            .join(device_tag)
             .join(format!("{}.bin", title)),
     )
 }
@@ -42,6 +43,7 @@ impl PipelineCache {
     pub fn new(
         device: &ash::Device,
         descriptor_set_layout: vk::DescriptorSetLayout,
+        device_tag: &str,
     ) -> Result<Self, String> {
         let set_layouts = [descriptor_set_layout];
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
@@ -60,7 +62,9 @@ impl PipelineCache {
                 .map_err(|e| format!("create_pipeline_layout: {:?}", e))?
         };
 
-        let initial = pipeline_cache_path()
+        let path = cache_path(device_tag);
+        let initial = path
+            .as_ref()
             .and_then(|p| std::fs::read(p).ok())
             .unwrap_or_default();
         let cache_info = vk::PipelineCacheCreateInfo {
@@ -81,18 +85,19 @@ impl PipelineCache {
         };
         log::info!("VkPipelineCache initialized ({} bytes from disk)", initial.len());
 
+        let writer_path = path.clone();
         let (save_tx, save_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         std::thread::Builder::new()
             .name("nexium-pipecache".to_string())
             .spawn(move || {
                 while let Ok(data) = save_rx.recv() {
-                    let Some(path) = pipeline_cache_path() else { continue; };
+                    let Some(path) = writer_path.as_ref() else { continue; };
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
                     let tmp = path.with_extension("tmp");
                     if std::fs::write(&tmp, &data).is_ok() {
-                        let _ = std::fs::rename(&tmp, &path);
+                        let _ = std::fs::rename(&tmp, path);
                         log::info!("VkPipelineCache saved ({} bytes)", data.len());
                     }
                 }
