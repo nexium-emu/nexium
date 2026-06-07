@@ -431,6 +431,9 @@ impl Renderer {
     }
 
     fn prewarm(&self) {
+        if !nexium_common::async_compile::enabled() {
+            return;
+        }
         let mut inner = self.inner.lock();
         let specs = inner.pipeline_cache.prewarm_specs();
         if specs.is_empty() {
@@ -752,7 +755,7 @@ impl Renderer {
         poly_offset_factor: f32,
         depth: crate::draw::DepthState,
         depth_format: vk::Format,
-        vertex_count: u32,
+        _vertex_count: u32,
     ) -> Result<Option<vk::Pipeline>, String> {
         let mut inner = self.inner.lock();
         let blend_signature: u32 = (blend.enabled as u32)
@@ -851,16 +854,6 @@ impl Renderer {
             poly_offset_factor,
             depth_clip_control_enabled,
         });
-
-        let safe_to_skip = has_depth || vertex_count > 6;
-        let req = if nexium_common::async_compile::enabled() && safe_to_skip {
-            match pipeline_cache.try_async_skip(req, 2) {
-                None => return Ok(None),
-                Some(r) => r,
-            }
-        } else {
-            req
-        };
 
         let pipeline = pipeline_cache.build(device, &req)?;
         pipeline_cache.insert(key, pipeline);
