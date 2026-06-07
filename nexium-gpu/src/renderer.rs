@@ -998,7 +998,7 @@ impl Renderer {
         };
 
         let pipelines = unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            device.create_graphics_pipelines(pipeline_cache.vk_cache, &[pipeline_info], None)
                 .map_err(|(_, e)| format!("create_graphics_pipelines: {:?}", e))?
         };
         let pipeline = pipelines[0];

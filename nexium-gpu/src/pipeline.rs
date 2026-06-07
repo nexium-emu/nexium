@@ -1,5 +1,11 @@
 use ash::vk;
 use std::collections::HashMap;
+use std::path::PathBuf;
+
+fn pipeline_cache_path() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(PathBuf::from(base).join("NeXium").join("pipeline_cache.bin"))
+}
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub struct PipelineKey {
@@ -19,6 +25,7 @@ pub struct PipelineKey {
 pub struct PipelineCache {
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
     pub layout: vk::PipelineLayout,
+    pub vk_cache: vk::PipelineCache,
 }
 
 impl PipelineCache {
@@ -43,10 +50,54 @@ impl PipelineCache {
                 .map_err(|e| format!("create_pipeline_layout: {:?}", e))?
         };
 
+        let initial = pipeline_cache_path()
+            .and_then(|p| std::fs::read(p).ok())
+            .unwrap_or_default();
+        let cache_info = vk::PipelineCacheCreateInfo {
+            s_type: vk::StructureType::PIPELINE_CACHE_CREATE_INFO,
+            initial_data_size: initial.len(),
+            p_initial_data: if initial.is_empty() {
+                std::ptr::null()
+            } else {
+                initial.as_ptr() as *const std::ffi::c_void
+            },
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+        let vk_cache = unsafe {
+            device.create_pipeline_cache(&cache_info, None)
+                .map_err(|e| format!("create_pipeline_cache: {:?}", e))?
+        };
+        log::info!("VkPipelineCache initialized ({} bytes from disk)", initial.len());
+
         Ok(Self {
             pipelines: HashMap::new(),
             layout,
+            vk_cache,
         })
+    }
+
+    pub fn save(&self, device: &ash::Device) {
+        if self.vk_cache == vk::PipelineCache::null() {
+            return;
+        }
+        let data = match unsafe { device.get_pipeline_cache_data(self.vk_cache) } {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("get_pipeline_cache_data failed: {:?}", e);
+                return;
+            }
+        };
+        if let Some(path) = pipeline_cache_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&path, &data) {
+                Ok(_) => log::info!("VkPipelineCache saved ({} bytes)", data.len()),
+                Err(e) => log::warn!("VkPipelineCache save failed: {}", e),
+            }
+        }
     }
 
     pub fn get(&self, key: &PipelineKey) -> Option<vk::Pipeline> {
@@ -58,10 +109,15 @@ impl PipelineCache {
     }
 
     pub fn clear(&mut self, device: &ash::Device) {
+        self.save(device);
         for (_, pipeline) in self.pipelines.drain() {
             unsafe {
                 device.destroy_pipeline(pipeline, None);
             }
+        }
+        if self.vk_cache != vk::PipelineCache::null() {
+            unsafe { device.destroy_pipeline_cache(self.vk_cache, None); }
+            self.vk_cache = vk::PipelineCache::null();
         }
         if self.layout != vk::PipelineLayout::null() {
             unsafe {
