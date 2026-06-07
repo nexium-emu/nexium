@@ -723,6 +723,7 @@ impl Renderer {
         poly_offset_factor: f32,
         depth: crate::draw::DepthState,
         depth_format: vk::Format,
+        vertex_count: u32,
     ) -> Result<Option<vk::Pipeline>, String> {
         let mut inner = self.inner.lock();
         let blend_signature: u32 = (blend.enabled as u32)
@@ -800,7 +801,8 @@ impl Renderer {
             depth_clip_control_enabled,
         };
 
-        if nexium_common::async_compile::enabled() {
+        let safe_to_skip = has_depth || vertex_count > 6;
+        if nexium_common::async_compile::enabled() && safe_to_skip {
             pipeline_cache.request_async(req);
             return Ok(None);
         }
@@ -841,6 +843,7 @@ impl Renderer {
             call.poly_offset_factor,
             call.depth,
             depth_format,
+            call.vertex_count,
         )? {
             Some(p) => p,
             None => return Ok(()),
@@ -1402,7 +1405,7 @@ impl Renderer {
                 &call.vertex_layout, call.state.topology, call.rt_format, call.blend,
                 call.cull_test_enable, call.cull_face, call.front_face,
                 call.poly_offset_enable, call.poly_offset_units, call.poly_offset_factor,
-                call.depth, depth_format,
+                call.depth, depth_format, call.vertex_count,
             )? {
                 Some(p) => p,
                 None => continue,

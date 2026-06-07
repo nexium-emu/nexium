@@ -54,7 +54,7 @@ pub fn build_graphics_pipeline(
     device: &ash::Device,
     vk_cache: vk::PipelineCache,
     pipeline_layout: vk::PipelineLayout,
-    cache_lock: &std::sync::Mutex<()>,
+    cache_lock: &std::sync::RwLock<()>,
     req: &PipelineBuildRequest,
 ) -> Result<vk::Pipeline, String> {
     let entry = c"main";
@@ -255,7 +255,7 @@ pub fn build_graphics_pipeline(
     };
 
     let pipelines = {
-        let _guard = cache_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = cache_lock.read().unwrap_or_else(|e| e.into_inner());
         unsafe {
             device
                 .create_graphics_pipelines(vk_cache, &[pipeline_info], None)
@@ -269,7 +269,7 @@ struct CompileWorker {
     req_tx: std::sync::mpsc::Sender<PipelineBuildRequest>,
     res_rx: std::sync::mpsc::Receiver<(PipelineKey, vk::Pipeline)>,
     in_flight: std::collections::HashSet<PipelineKey>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 pub struct PipelineCache {
@@ -281,7 +281,7 @@ pub struct PipelineCache {
     last_saved_len: usize,
     save_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     worker: Option<CompileWorker>,
-    cache_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    cache_lock: std::sync::Arc<std::sync::RwLock<()>>,
 }
 
 impl PipelineCache {
@@ -349,19 +349,34 @@ impl PipelineCache {
             })
             .ok();
 
-        let cache_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let cache_lock = std::sync::Arc::new(std::sync::RwLock::new(()));
         let worker = {
-            let dev = device.clone();
-            let wcache = vk_cache;
-            let wlayout = layout;
-            let wlock = cache_lock.clone();
             let (req_tx, req_rx) = std::sync::mpsc::channel::<PipelineBuildRequest>();
             let (res_tx, res_rx) =
                 std::sync::mpsc::channel::<(PipelineKey, vk::Pipeline)>();
-            let handle = std::thread::Builder::new()
-                .name("nexium-pipecompile".to_string())
-                .spawn(move || {
-                    while let Ok(req) = req_rx.recv() {
+            let req_rx = std::sync::Arc::new(std::sync::Mutex::new(req_rx));
+            let num_workers = std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(2))
+                .unwrap_or(2)
+                .clamp(1, 8);
+            let mut handles = Vec::with_capacity(num_workers);
+            for _ in 0..num_workers {
+                let dev = device.clone();
+                let wcache = vk_cache;
+                let wlayout = layout;
+                let wlock = cache_lock.clone();
+                let rx = req_rx.clone();
+                let tx = res_tx.clone();
+                let h = std::thread::Builder::new()
+                    .name("nexium-pipecompile".to_string())
+                    .spawn(move || loop {
+                        let req = {
+                            let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                            match guard.recv() {
+                                Ok(r) => r,
+                                Err(_) => break,
+                            }
+                        };
                         let pipe = match build_graphics_pipeline(&dev, wcache, wlayout, &wlock, &req) {
                             Ok(p) => p,
                             Err(e) => {
@@ -369,17 +384,21 @@ impl PipelineCache {
                                 vk::Pipeline::null()
                             }
                         };
-                        if res_tx.send((req.key, pipe)).is_err() {
+                        if tx.send((req.key, pipe)).is_err() {
                             break;
                         }
-                    }
-                })
-                .ok();
+                    })
+                    .ok();
+                if let Some(h) = h {
+                    handles.push(h);
+                }
+            }
+            log::info!("async pipeline workers: {}", handles.len());
             Some(CompileWorker {
                 req_tx,
                 res_rx,
                 in_flight: std::collections::HashSet::new(),
-                handle,
+                handles,
             })
         };
 
@@ -437,7 +456,7 @@ impl PipelineCache {
             return;
         }
         let data = {
-            let _guard = self.cache_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = self.cache_lock.write().unwrap_or_else(|e| e.into_inner());
             match unsafe { device.get_pipeline_cache_data(self.vk_cache) } {
                 Ok(d) => d,
                 Err(e) => {
@@ -474,9 +493,9 @@ impl PipelineCache {
 
     pub fn clear(&mut self, device: &ash::Device) {
         if let Some(w) = self.worker.take() {
-            let CompileWorker { req_tx, res_rx, handle, in_flight: _ } = w;
+            let CompileWorker { req_tx, res_rx, handles, in_flight: _ } = w;
             drop(req_tx);
-            if let Some(h) = handle {
+            for h in handles {
                 let _ = h.join();
             }
             while let Ok((key, pipe)) = res_rx.try_recv() {
