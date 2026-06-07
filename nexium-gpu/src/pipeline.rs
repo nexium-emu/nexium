@@ -28,6 +28,7 @@ pub struct PipelineCache {
     pub vk_cache: vk::PipelineCache,
     dirty: bool,
     last_save: std::time::Instant,
+    last_saved_len: usize,
     save_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
@@ -98,6 +99,7 @@ impl PipelineCache {
             vk_cache,
             dirty: false,
             last_save: std::time::Instant::now(),
+            last_saved_len: initial.len(),
             save_tx: Some(save_tx),
         })
     }
@@ -110,7 +112,7 @@ impl PipelineCache {
         }
     }
 
-    pub fn save(&self, device: &ash::Device) {
+    pub fn save(&mut self, device: &ash::Device) {
         if self.vk_cache == vk::PipelineCache::null() {
             return;
         }
@@ -121,6 +123,10 @@ impl PipelineCache {
                 return;
             }
         };
+        if data.len() == self.last_saved_len {
+            return;
+        }
+        self.last_saved_len = data.len();
         if let Some(tx) = &self.save_tx {
             let _ = tx.send(data);
         }
