@@ -79,6 +79,7 @@ struct FrameSlot {
     cmd: vk::CommandBuffer,
     in_flight: bool,
     retired_dsets: Vec<vk::DescriptorSet>,
+    retired_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
 }
 
 struct PendingReadback {
@@ -368,12 +369,14 @@ impl Renderer {
                 cmd: frame_cmds[0],
                 in_flight: false,
                 retired_dsets: Vec::new(),
+                retired_buffers: Vec::new(),
             },
             FrameSlot {
                 fence: fence_b,
                 cmd: frame_cmds[1],
                 in_flight: false,
                 retired_dsets: Vec::new(),
+                retired_buffers: Vec::new(),
             },
         ];
         let utility_slot = FrameSlot {
@@ -381,6 +384,7 @@ impl Renderer {
             cmd: frame_cmds[2],
             in_flight: false,
             retired_dsets: Vec::new(),
+            retired_buffers: Vec::new(),
         };
 
         let ubo_ring = create_ubo_ring(&device, &mem_props, 16 * 1024 * 1024)?;
@@ -1146,6 +1150,9 @@ impl Renderer {
                     }
                     slot.retired_dsets.clear();
                 }
+                for (b, m) in slot.retired_buffers.drain(..) {
+                    unsafe { device.destroy_buffer(b, None); device.free_memory(m, None); }
+                }
                 reset_command_buffer(device, slot.cmd)?;
                 slot.in_flight = false;
                 ubo_ring.head = ubo_ring.slot_head[cur_idx];
@@ -1223,7 +1230,7 @@ impl Renderer {
                         tic.gpu_va, tic.width, tic.height, tic.format,
                         tic.is_block_linear, tic.block_height_log2, read_size, rgba8.len()
                     );
-                    match create_texture_image(
+                    match upload_texture_oneshot(
                         device, *queue, *cmd_pool, mem_props, key.width, key.height, &rgba8,
                     ) {
                         Ok(tex) => { tex_cache.insert(key, tex); }
@@ -1649,6 +1656,9 @@ impl Renderer {
                     unsafe { let _ = device.free_descriptor_sets(descriptor_pool.pool, &slot.retired_dsets); }
                     slot.retired_dsets.clear();
                 }
+                for (b, m) in slot.retired_buffers.drain(..) {
+                    unsafe { device.destroy_buffer(b, None); device.free_memory(m, None); }
+                }
                 reset_command_buffer(device, slot.cmd)?;
                 slot.in_flight = false;
                 ubo_ring.head = ubo_ring.slot_head[cur_idx];
@@ -1736,8 +1746,11 @@ impl Renderer {
                                 );
                             }
                         }
-                        match create_texture_image(device, *queue, *cmd_pool, mem_props, key.width, key.height, &rgba8) {
-                            Ok(tex) => { tex_cache.insert(key, tex); }
+                        match create_texture_image(device, cmd, mem_props, key.width, key.height, &rgba8) {
+                            Ok((tex, sbuf, smem)) => {
+                                tex_cache.insert(key, tex);
+                                frame_slots[cur_idx].retired_buffers.push((sbuf, smem));
+                            }
                             Err(e) => log::warn!("texture upload failed: {}", e),
                         }
                     }
@@ -2078,7 +2091,7 @@ fn create_sampler_for_tsc(
     }
 }
 
-fn create_texture_image(
+fn upload_texture_oneshot(
     device: &ash::Device,
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
@@ -2087,6 +2100,27 @@ fn create_texture_image(
     height: u32,
     rgba8: &[u8],
 ) -> Result<CachedTexture, String> {
+    let cmd = alloc_one_time_cmd(device, cmd_pool)?;
+    begin_one_time(device, cmd)?;
+    let (tex, sbuf, smem) = create_texture_image(device, cmd, mem_props, width, height, rgba8)?;
+    end_one_time(device, cmd)?;
+    submit_and_wait(device, queue, cmd)?;
+    unsafe {
+        device.free_command_buffers(cmd_pool, &[cmd]);
+        device.destroy_buffer(sbuf, None);
+        device.free_memory(smem, None);
+    }
+    Ok(tex)
+}
+
+fn create_texture_image(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    width: u32,
+    height: u32,
+    rgba8: &[u8],
+) -> Result<(CachedTexture, vk::Buffer, vk::DeviceMemory), String> {
     let format = vk::Format::R8G8B8A8_UNORM;
     let img_info = vk::ImageCreateInfo {
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
@@ -2134,8 +2168,6 @@ fn create_texture_image(
 
     let stage = create_host_buffer(device, mem_props, rgba8, vk::BufferUsageFlags::TRANSFER_SRC)?;
 
-    let cmd = alloc_one_time_cmd(device, cmd_pool)?;
-    begin_one_time(device, cmd)?;
     transition_image(device, cmd, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
     let copy = vk::BufferImageCopy {
         buffer_offset: 0,
@@ -2160,13 +2192,6 @@ fn create_texture_image(
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     );
-    end_one_time(device, cmd)?;
-    submit_and_wait(device, queue, cmd)?;
-    unsafe {
-        device.free_command_buffers(cmd_pool, &[cmd]);
-        device.destroy_buffer(stage.buffer, None);
-        device.free_memory(stage.memory, None);
-    }
 
     let view_info = vk::ImageViewCreateInfo {
         s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
@@ -2189,7 +2214,7 @@ fn create_texture_image(
         device.create_image_view(&view_info, None)
             .map_err(|e| format!("create_image_view(tex): {:?}", e))?
     };
-    Ok(CachedTexture { image, view, memory })
+    Ok((CachedTexture { image, view, memory }, stage.buffer, stage.memory))
 }
 
 fn create_dummy_white_image(
