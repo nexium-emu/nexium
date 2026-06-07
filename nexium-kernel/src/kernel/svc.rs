@@ -1705,10 +1705,41 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                 const TARGET_FRAMES: usize = 240;
                 const TARGET_SR: f32 = 48_000.0;
 
-                const RING_HIGH_WATER_FRAMES: usize = 14_400;
-                let blocks_to_produce: usize = match crate::audio_sink::host_audio_sink() {
-                    Some(sink) if sink.queued_frames() >= RING_HIGH_WATER_FRAMES => 0,
-                    _ => 1,
+                const RING_HIGH_WATER_FRAMES: usize = 2_880;
+                const RING_LOW_WATER_FRAMES: usize = 1_440;
+                const BLOCK_INTERVAL_MS: u64 = 5;
+                const MAX_CATCHUP_BLOCKS: usize = 3;
+
+                let queued_now = crate::audio_sink::host_audio_sink()
+                    .map(|s| s.queued_frames())
+                    .unwrap_or(0);
+
+                let blocks_to_produce: usize = {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static LAST_PRODUCE_MS: AtomicU64 = AtomicU64::new(0);
+                    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                    let start = *EPOCH.get_or_init(std::time::Instant::now);
+                    let now_ms = start.elapsed().as_millis() as u64;
+
+                    if queued_now >= RING_HIGH_WATER_FRAMES {
+                        LAST_PRODUCE_MS.store(now_ms, Ordering::Relaxed);
+                        0
+                    } else if queued_now < RING_LOW_WATER_FRAMES {
+                        LAST_PRODUCE_MS.store(now_ms, Ordering::Relaxed);
+                        1
+                    } else {
+                        let last = LAST_PRODUCE_MS.load(Ordering::Relaxed);
+                        let elapsed = now_ms.saturating_sub(last);
+                        if elapsed < BLOCK_INTERVAL_MS {
+                            0
+                        } else {
+                            let n = ((elapsed / BLOCK_INTERVAL_MS) as usize)
+                                .min(MAX_CATCHUP_BLOCKS)
+                                .max(1);
+                            LAST_PRODUCE_MS.store(now_ms, Ordering::Relaxed);
+                            n
+                        }
+                    }
                 };
                 let mut is_new_latched: Vec<bool> = vec![false; voice_count_seen];
                 let mut big_out: Vec<f32> = Vec::with_capacity(TARGET_FRAMES * 2 * blocks_to_produce);
@@ -1963,6 +1994,14 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                                 } else {
                                     k += 1;
                                     slot_cursor = 0;
+                                }
+                            }
+                            if vid == 0 {
+                                use std::sync::atomic::{AtomicU64, Ordering as O};
+                                static DC: AtomicU64 = AtomicU64::new(0);
+                                let n = DC.fetch_add(1, O::Relaxed);
+                                if n % 256 == 0 {
+                                    log::info!("voice[0] chain wb_count={} wb_index={} cursor={} got={} in_frames={}", wb_count, wb_index, cursor, got, in_frames);
                                 }
                             }
                             if got == 0 { continue; }

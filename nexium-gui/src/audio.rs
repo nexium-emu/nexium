@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const RENDER_SR: u32 = 48_000;
 const RB_CAP_SAMPLES: usize = 48_000;
-const PREBUF_TARGET_SAMPLES: usize = 9_600;
+const PREBUF_TARGET_SAMPLES: usize = 2_400;
 
 struct PrebufState {
     priming: bool,
@@ -295,19 +295,6 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
             std::cell::RefCell::new(None);
     }
     AUDIO_STREAM.with(|s| *s.borrow_mut() = Some(stream));
-
-    let frames = (RENDER_SR as usize) / 2;
-    let mut beep = Vec::with_capacity(frames * 2);
-    let phase_inc = std::f32::consts::TAU * 440.0 / RENDER_SR as f32;
-    for i in 0..frames {
-        let s = 0.25 * (phase_inc * i as f32).sin();
-        beep.push(s);
-        beep.push(s);
-    }
-    if let Some(h) = SINK_HANDLE.get() {
-        let pushed = h.push_stereo_f32(&beep);
-        log::info!("Audio startup beep: pushed {} frames @ 440 Hz", pushed);
-    }
 }
 
 fn drain_stereo_to(
