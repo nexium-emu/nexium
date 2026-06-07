@@ -15,11 +15,13 @@ struct PrebufState {
     priming: bool,
     cur_l: f32,
     cur_r: f32,
-    empty_run: u32,
+    prev_l: f32,
+    prev_r: f32,
+    pos: f32,
 }
 impl PrebufState {
     fn new() -> Self {
-        Self { priming: true, cur_l: 0.0, cur_r: 0.0, empty_run: 0 }
+        Self { priming: true, cur_l: 0.0, cur_r: 0.0, prev_l: 0.0, prev_r: 0.0, pos: 1.0 }
     }
 }
 
@@ -323,38 +325,31 @@ fn drain_stereo_to(
     let occ = consumer.occupied_len();
     MIN_OCC.fetch_min(occ as u32, Ordering::Relaxed);
     if occ == 0 { EMPTY_CT.fetch_add(1, Ordering::Relaxed); }
-    if prebuf.priming {
-        if occ >= PREBUF_TARGET_SAMPLES {
-            prebuf.priming = false;
-            prebuf.empty_run = 0;
-        }
-    } else if occ == 0 {
-        prebuf.empty_run = prebuf.empty_run.saturating_add(1);
-        if prebuf.empty_run >= 8 {
-            prebuf.priming = true;
-        }
-    } else {
-        prebuf.empty_run = 0;
+    if prebuf.priming && occ >= PREBUF_TARGET_SAMPLES {
+        prebuf.priming = false;
     }
     let priming = prebuf.priming;
 
-    let mut acc: f32 = 1.0;
     let mut frames_written = 0usize;
     let mut peak: f32 = 0.0;
     for chunk in out.chunks_mut(dev_ch) {
         if !priming {
-            while acc >= 1.0 {
+            while prebuf.pos >= 1.0 {
+                prebuf.prev_l = prebuf.cur_l;
+                prebuf.prev_r = prebuf.cur_r;
                 if let (Some(l), Some(r)) = (consumer.try_pop(), consumer.try_pop()) {
                     prebuf.cur_l = l;
                     prebuf.cur_r = r;
                 }
-                acc -= 1.0;
+                prebuf.pos -= 1.0;
             }
         }
         let (l, r) = if priming {
             (0.0, 0.0)
         } else {
-            (prebuf.cur_l * vol, prebuf.cur_r * vol)
+            let f = prebuf.pos;
+            ((prebuf.prev_l + (prebuf.cur_l - prebuf.prev_l) * f) * vol,
+             (prebuf.prev_r + (prebuf.cur_r - prebuf.prev_r) * f) * vol)
         };
         peak = peak.max(l.abs()).max(r.abs());
         if dev_ch == 1 {
@@ -364,7 +359,9 @@ fn drain_stereo_to(
             chunk[1] = r;
             for c in 2..dev_ch { chunk[c] = 0.0; }
         }
-        acc += resample_ratio;
+        if !priming {
+            prebuf.pos += resample_ratio;
+        }
         frames_written += 1;
     }
     if n == 1 || (n > 0 && n % 50 == 0) {
@@ -392,40 +389,33 @@ fn drain_stereo_to_i16(
     let vol = f32::from_bits(volume.load(Ordering::Relaxed));
 
     let occ = consumer.occupied_len();
-    if prebuf.priming {
-        if occ >= PREBUF_TARGET_SAMPLES {
-            prebuf.priming = false;
-            prebuf.empty_run = 0;
-        }
-    } else if occ == 0 {
-        prebuf.empty_run = prebuf.empty_run.saturating_add(1);
-        if prebuf.empty_run >= 8 {
-            prebuf.priming = true;
-        }
-    } else {
-        prebuf.empty_run = 0;
+    if prebuf.priming && occ >= PREBUF_TARGET_SAMPLES {
+        prebuf.priming = false;
     }
     let priming = prebuf.priming;
 
-    let mut acc: f32 = 1.0;
     let mut frames_written = 0usize;
     for chunk in out.chunks_mut(dev_ch) {
         if !priming {
-            while acc >= 1.0 {
+            while prebuf.pos >= 1.0 {
+                prebuf.prev_l = prebuf.cur_l;
+                prebuf.prev_r = prebuf.cur_r;
                 if let (Some(l), Some(r)) = (consumer.try_pop(), consumer.try_pop()) {
                     prebuf.cur_l = l;
                     prebuf.cur_r = r;
                 }
-                acc -= 1.0;
+                prebuf.pos -= 1.0;
             }
         }
         let (l, r) = if priming {
             (0.0, 0.0)
         } else {
-            (prebuf.cur_l * vol, prebuf.cur_r * vol)
+            let f = prebuf.pos;
+            (prebuf.prev_l + (prebuf.cur_l - prebuf.prev_l) * f,
+             prebuf.prev_r + (prebuf.cur_r - prebuf.prev_r) * f)
         };
-        let li = (l.clamp(-1.0, 1.0) * 32767.0) as i16;
-        let ri = (r.clamp(-1.0, 1.0) * 32767.0) as i16;
+        let li = ((l * vol).clamp(-1.0, 1.0) * 32767.0) as i16;
+        let ri = ((r * vol).clamp(-1.0, 1.0) * 32767.0) as i16;
         if dev_ch == 1 {
             chunk[0] = ((li as i32 + ri as i32) / 2) as i16;
         } else {
@@ -433,7 +423,9 @@ fn drain_stereo_to_i16(
             chunk[1] = ri;
             for c in 2..dev_ch { chunk[c] = 0; }
         }
-        acc += resample_ratio;
+        if !priming {
+            prebuf.pos += resample_ratio;
+        }
         frames_written += 1;
     }
     let render_frames = ((frames_written as f32) * resample_ratio).round() as u64;

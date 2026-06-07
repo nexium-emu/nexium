@@ -395,20 +395,25 @@ impl EmulationHandle {
                     if guard.ensure_thread_loaded().is_some() {
                         continue;
                     }
-                    let sleep_dur = match guard.threads.earliest_wake() {
+                    let wake_opt = guard.threads.earliest_wake();
+                    drop(guard);
+                    match wake_opt {
                         Some(wake) => {
                             let now = std::time::Instant::now();
                             if wake > now {
-                                (wake - now).min(std::time::Duration::from_millis(2))
-                            } else {
-                                std::time::Duration::ZERO
+                                let remaining = wake - now;
+                                if remaining > std::time::Duration::from_micros(1500) {
+                                    let coarse = (remaining - std::time::Duration::from_millis(1))
+                                        .min(std::time::Duration::from_millis(2));
+                                    std::thread::sleep(coarse);
+                                } else {
+                                    while std::time::Instant::now() < wake {
+                                        std::hint::spin_loop();
+                                    }
+                                }
                             }
                         }
-                        None => std::time::Duration::from_millis(2),
-                    };
-                    drop(guard);
-                    if !sleep_dur.is_zero() {
-                        std::thread::sleep(sleep_dur);
+                        None => std::thread::sleep(std::time::Duration::from_millis(2)),
                     }
                     continue;
                 }

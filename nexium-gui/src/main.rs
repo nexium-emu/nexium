@@ -28,6 +28,18 @@ fn main() -> Result<(), eframe::Error> {
 
     log::info!("=== NeXium - Nintendo Switch Emulator ===");
 
+    #[cfg(windows)]
+    {
+        #[link(name = "winmm")]
+        extern "system" {
+            fn timeBeginPeriod(uperiod: u32) -> u32;
+        }
+        unsafe {
+            timeBeginPeriod(1);
+        }
+        log::info!("timer resolution pinned to 1ms");
+    }
+
     audio::init_host_audio(
         settings.audio_output_device.as_deref(),
         settings.audio_volume,

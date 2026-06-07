@@ -872,7 +872,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         port_name.clone()
     };
 
-    log::debug!("IPC request service=\"{}\" cmd={} in_data={} is_domain={}", dispatch_target, cmd_id, ctx.cmif_in_data_len, is_domain);
+    log::trace!("IPC request service=\"{}\" cmd={} in_data={} is_domain={}", dispatch_target, cmd_id, ctx.cmif_in_data_len, is_domain);
 
     if dispatch_target == "fatal:u" && cmd_id == 1 {
         if ctx.cmif_in_data_len >= 4 {
@@ -1710,41 +1710,13 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                 const TARGET_SR: f32 = 48_000.0;
 
                 const RING_HIGH_WATER_FRAMES: usize = 2_880;
-                const RING_LOW_WATER_FRAMES: usize = 1_440;
-                const BLOCK_INTERVAL_MS: u64 = 5;
-                const MAX_CATCHUP_BLOCKS: usize = 3;
 
                 let queued_now = crate::audio_sink::host_audio_sink()
                     .map(|s| s.queued_frames())
                     .unwrap_or(0);
 
-                let blocks_to_produce: usize = {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static LAST_PRODUCE_MS: AtomicU64 = AtomicU64::new(0);
-                    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                    let start = *EPOCH.get_or_init(std::time::Instant::now);
-                    let now_ms = start.elapsed().as_millis() as u64;
-
-                    if queued_now >= RING_HIGH_WATER_FRAMES {
-                        LAST_PRODUCE_MS.store(now_ms, Ordering::Relaxed);
-                        0
-                    } else if queued_now < RING_LOW_WATER_FRAMES {
-                        LAST_PRODUCE_MS.store(now_ms, Ordering::Relaxed);
-                        1
-                    } else {
-                        let last = LAST_PRODUCE_MS.load(Ordering::Relaxed);
-                        let elapsed = now_ms.saturating_sub(last);
-                        if elapsed < BLOCK_INTERVAL_MS {
-                            0
-                        } else {
-                            let n = ((elapsed / BLOCK_INTERVAL_MS) as usize)
-                                .min(MAX_CATCHUP_BLOCKS)
-                                .max(1);
-                            LAST_PRODUCE_MS.store(now_ms, Ordering::Relaxed);
-                            n
-                        }
-                    }
-                };
+                let blocks_to_produce: usize =
+                    if queued_now >= RING_HIGH_WATER_FRAMES { 0 } else { 1 };
                 let mut is_new_latched: Vec<bool> = vec![false; voice_count_seen];
                 let mut big_out: Vec<f32> = Vec::with_capacity(TARGET_FRAMES * 2 * blocks_to_produce);
 
@@ -2910,7 +2882,7 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
 
             {
                 const VSYNC_NS: u64 = 16_666_667;
-                let n = swap_interval.clamp(1, 4) as u64;
+                let n = swap_interval.clamp(2, 4) as u64;
                 let target = std::time::Duration::from_nanos(VSYNC_NS.saturating_mul(n));
                 use parking_lot::Mutex;
                 use std::sync::OnceLock;
@@ -3332,7 +3304,7 @@ fn parse_flattened_graphic_buffer(reader: &mut ParcelReader) -> Option<nexium_nv
 
 fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name: &str) -> Vec<u8> {
     let cmd_id = ctx.cmif_in.cmd_id;
-    log::debug!("nvdrv:{}.cmd_{}", port_name, cmd_id);
+    log::trace!("nvdrv:{}.cmd_{}", port_name, cmd_id);
 
     match cmd_id {
         0 => {
@@ -3384,7 +3356,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             let out_size = out_dst.map(|b| b.size as usize).unwrap_or(0);
 
             if cmd_id == 1 {
-                log::debug!("nvdrv:Ioctl fd={} ioctl_id={:#x} send_buf={:?} send_static={:?} recv_buf={:?}",
+                log::trace!("nvdrv:Ioctl fd={} ioctl_id={:#x} send_buf={:?} send_static={:?} recv_buf={:?}",
                     fd, ioctl_id,
                     ctx.send_buffers.iter().map(|b| (b.addr, b.size)).collect::<Vec<_>>(),
                     ctx.send_statics.iter().map(|b| (b.addr, b.size)).collect::<Vec<_>>(),

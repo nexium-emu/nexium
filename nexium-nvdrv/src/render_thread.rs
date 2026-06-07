@@ -37,11 +37,12 @@ impl RenderThread {
 pub fn maybe_render_thread() -> Option<&'static RenderThread> {
     static RT: OnceLock<Option<RenderThread>> = OnceLock::new();
     RT.get_or_init(|| {
-        if std::env::var("NEXIUM_ASYNC_RENDER").ok().as_deref() == Some("1") {
-            log::info!("nexium-nvdrv: async render thread ENABLED (NEXIUM_ASYNC_RENDER=1)");
-            Some(RenderThread::new())
-        } else {
+        if std::env::var("NEXIUM_ASYNC_RENDER").ok().as_deref() == Some("0") {
+            log::info!("nexium-nvdrv: async render thread DISABLED (NEXIUM_ASYNC_RENDER=0)");
             None
+        } else {
+            log::info!("nexium-nvdrv: async render thread ENABLED (default)");
+            Some(RenderThread::new())
         }
     })
     .as_ref()
