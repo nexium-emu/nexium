@@ -3,6 +3,7 @@
 mod app;
 mod boot;
 mod input;
+mod controller_art;
 mod audio;
 mod debugger;
 mod performance;

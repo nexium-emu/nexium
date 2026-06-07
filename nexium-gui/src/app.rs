@@ -2,13 +2,13 @@ use eframe::egui;
 use eframe::egui::{
     Color32, FontId, Rounding, Sense, Stroke, Vec2,
 };
-use gilrs::Gilrs;
 use std::sync::Arc;
 use crate::boot::EmulationHandle;
-use crate::input::InputSnapshot;
+use crate::input::{InputBackend, InputSnapshot};
 use crate::debugger::DebuggerState;
 use crate::performance::PerformanceMonitor;
 use crate::controller_config::{ControllerConfig, SwitchButton};
+use crate::controller_art::{PRO_BODY, PRO_LEFT_HANDLE};
 use crate::app_settings::{AppSettings, AspectMode, CpuBackend, FilterMode, LogLevel};
 use crate::audio::{current_stream_info, list_output_devices, push_test_tone, set_master_volume, AudioStreamInfo};
 
@@ -29,13 +29,15 @@ pub struct HorizonApp {
     game_texture: Option<egui::TextureHandle>,
     show_settings: bool,
     settings_tab: SettingsTab,
-    gilrs: Option<Gilrs>,
+    input: Option<InputBackend>,
     last_input: InputSnapshot,
     debugger: DebuggerState,
     performance: PerformanceMonitor,
     log_buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     controller_config: ControllerConfig,
     rebinding: Option<SwitchButton>,
+    rebinding_pad: Option<SwitchButton>,
+    input_device: InputDevice,
     app_settings: AppSettings,
     last_buttons_logged: u64,
     last_sticks_logged: [i32; 4],
@@ -52,6 +54,12 @@ pub enum SettingsTab {
     Logging,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InputDevice {
+    Keyboard,
+    Gamepad,
+}
+
 impl HorizonApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -59,7 +67,7 @@ impl HorizonApp {
         nro_arg: Option<String>,
     ) -> Self {
         Self::apply_theme(&cc.egui_ctx);
-        let gilrs = Gilrs::new().ok().or_else(|| { log::warn!("Gilrs init failed"); None });
+        let input = InputBackend::new().or_else(|| { log::warn!("SDL3 gamepad init failed"); None });
         let nro_path = nro_arg.unwrap_or_default();
         let mut app = Self {
             nro_path: nro_path.clone(),
@@ -67,13 +75,15 @@ impl HorizonApp {
             game_texture: None,
             show_settings: false,
             settings_tab: SettingsTab::General,
-            gilrs,
+            input,
             last_input: InputSnapshot::default(),
             debugger: DebuggerState::new(),
             performance: PerformanceMonitor::new(),
             log_buffer,
             controller_config: ControllerConfig::load(),
             rebinding: None,
+            rebinding_pad: None,
+            input_device: InputDevice::Keyboard,
             app_settings: AppSettings::load(),
             last_buttons_logged: 0,
             last_sticks_logged: [0; 4],
@@ -203,11 +213,21 @@ fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
 
 impl eframe::App for HorizonApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(ref mut g) = self.gilrs {
-            self.last_input = InputSnapshot::update_from_gamepad(g);
+        if let Some(ref mut ib) = self.input {
+            self.last_input = ib.poll(&self.controller_config);
+            if self.last_input.connected {
+                ctx.request_repaint_after(std::time::Duration::from_millis(8));
+            }
+            if let Some(btn) = self.rebinding_pad {
+                if let Some(gp) = ib.first_pressed() {
+                    self.controller_config.set_pad(btn, gp);
+                    let _ = self.controller_config.save();
+                    self.rebinding_pad = None;
+                }
+            }
         }
 
-        if self.rebinding.is_none() {
+        if self.rebinding.is_none() && self.rebinding_pad.is_none() {
             let pressed: Vec<String> = ctx.input(|i| {
                 let mut v = Vec::new();
                 for ev in &i.events {
@@ -234,7 +254,19 @@ impl eframe::App for HorizonApp {
                 v
             });
 
-            let (buttons, sticks) = self.controller_config.buttons_pressed(&pressed);
+            let (kb_buttons, kb_sticks) = self.controller_config.buttons_pressed(&pressed);
+            let (gp_buttons, gp_sticks) = if self.last_input.connected {
+                self.last_input.to_npad()
+            } else {
+                (0u64, [0i32; 4])
+            };
+            let buttons = kb_buttons | gp_buttons;
+            let mut sticks = kb_sticks;
+            for i in 0..4 {
+                if gp_sticks[i].abs() > sticks[i].abs() {
+                    sticks[i] = gp_sticks[i];
+                }
+            }
             if buttons != self.last_buttons_logged || sticks != self.last_sticks_logged {
                 self.last_buttons_logged = buttons;
                 self.last_sticks_logged = sticks;
@@ -401,10 +433,20 @@ impl eframe::App for HorizonApp {
             let mut save_needed = false;
             let mut app_cfg = self.app_settings.clone();
             let mut app_save_needed = false;
+            let last_input = self.last_input;
+            let gp_name = self.input.as_ref().and_then(|ib| ib.name());
+            let mut rebinding_pad = self.rebinding_pad;
+            let mut input_device = self.input_device;
 
+            let screen = ctx.screen_rect();
+            let max_h = (screen.height() - 80.0).clamp(360.0, 760.0);
+            let max_w = (screen.width() - 80.0).clamp(520.0, 980.0);
             egui::Window::new("Preferences")
                 .open(&mut open)
-                .resizable(true).default_size([520.0, 420.0])
+                .resizable(true)
+                .default_size([max_w.min(900.0), max_h.min(560.0)])
+                .max_height(max_h)
+                .max_width(max_w)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         if ui.selectable_label(tab == SettingsTab::General, "General").clicked() {
@@ -432,7 +474,7 @@ impl eframe::App for HorizonApp {
                     match tab {
                         SettingsTab::General => settings_content(ui),
                         SettingsTab::Controller => {
-                            controller_settings_content(ui, &mut cfg, &mut rebinding, &mut save_needed);
+                            controller_settings_content(ui, &mut cfg, &mut rebinding, &mut rebinding_pad, &mut save_needed, &last_input, gp_name.as_deref(), &mut input_device);
                         }
                         SettingsTab::Graphics => {
                             graphics_settings_content(ui, &mut app_cfg, &mut app_save_needed);
@@ -458,6 +500,8 @@ impl eframe::App for HorizonApp {
             self.settings_tab = tab;
             self.controller_config = cfg;
             self.rebinding = rebinding;
+            self.rebinding_pad = rebinding_pad;
+            self.input_device = input_device;
             self.app_settings = app_cfg;
             if save_needed {
                 if let Err(e) = self.controller_config.save() {
@@ -575,58 +619,121 @@ fn settings_content(ui: &mut egui::Ui) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn controller_settings_content(
     ui: &mut egui::Ui,
     cfg: &mut ControllerConfig,
     rebinding: &mut Option<SwitchButton>,
+    rebinding_pad: &mut Option<SwitchButton>,
     save_needed: &mut bool,
+    input: &InputSnapshot,
+    gp_name: Option<&str>,
+    input_device: &mut InputDevice,
 ) {
-    ui.label(egui::RichText::new("Switch Pro Controller → Keyboard Mapping")
-        .size(13.0).strong().color(TEXT));
-    ui.add_space(4.0);
-    ui.label(egui::RichText::new("Click a binding then press a key to remap.")
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Player 1").size(15.0).strong().color(TEXT));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if input.connected {
+                let name = gp_name.unwrap_or("Gamepad");
+                let pro = gp_name.map(crate::input::is_pro_controller).unwrap_or(false);
+                let tag = if pro { "  ·  auto-mapped 1:1" } else { "  ·  standard mapping" };
+                ui.label(egui::RichText::new(format!("{}{}", name, tag)).size(12.0).color(GREEN));
+                ui.label(egui::RichText::new("●").size(13.0).color(GREEN));
+            } else {
+                ui.label(egui::RichText::new("No gamepad detected").size(12.0).color(MUTED));
+                ui.label(egui::RichText::new("○").size(13.0).color(MUTED));
+            }
+        });
+    });
+    ui.label(egui::RichText::new("Switch Pro Controllers map 1:1 automatically. Other gamepads use a standard layout. Keyboard and gamepad both work at once.")
         .size(11.0).color(MUTED));
-    ui.add_space(8.0);
+    ui.add_space(10.0);
 
-    if let Some(btn) = *rebinding {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(format!("⟶ Press a key for {}…", btn.display_name()))
-                .size(12.0).color(AMBER));
-            if ui.small_button("Cancel").clicked() {
-                *rebinding = None;
-            }
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            ui.set_min_width(470.0);
+            ui.set_max_width(470.0);
+            draw_controller_diagram(ui, input);
         });
-
-        let new_key = ui.input(|i| {
-            for ev in &i.events {
-                if let egui::Event::Key { key, pressed: true, .. } = ev {
-                    return Some(format!("{:?}", key));
-                }
-            }
-            None
-        });
-        if let Some(k) = new_key {
-            cfg.set_binding(btn, k);
-            *rebinding = None;
-            *save_needed = true;
-        }
         ui.add_space(8.0);
-    }
-
-    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-        egui::Grid::new("bindings")
-            .num_columns(3).spacing([12.0, 4.0]).striped(true)
-            .show(ui, |ui| {
-                for btn in SwitchButton::all() {
-                    ui.label(egui::RichText::new(btn.display_name()).size(12.0).color(TEXT));
-                    let current = cfg.binding_for(*btn).unwrap_or("(unbound)").to_string();
-                    ui.label(egui::RichText::new(&current).size(12.0).monospace().color(MUTED));
-                    if ui.small_button("Rebind").clicked() {
-                        *rebinding = Some(*btn);
-                    }
-                    ui.end_row();
-                }
+        ui.separator();
+        ui.add_space(8.0);
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Input device").size(12.0).color(MUTED));
+                let sel = match *input_device {
+                    InputDevice::Keyboard => "Keyboard".to_string(),
+                    InputDevice::Gamepad => gp_name.unwrap_or("Gamepad").to_string(),
+                };
+                egui::ComboBox::from_id_salt("input_device_sel")
+                    .selected_text(sel)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(input_device, InputDevice::Keyboard, "Keyboard");
+                        ui.selectable_value(input_device, InputDevice::Gamepad, gp_name.unwrap_or("Gamepad"));
+                    });
             });
+            ui.add_space(6.0);
+
+            if let Some(btn) = *rebinding {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("Press a key for {}…", btn.display_name())).size(12.0).color(AMBER));
+                    if ui.small_button("Cancel").clicked() { *rebinding = None; }
+                });
+                let new_key = ui.input(|i| {
+                    for ev in &i.events {
+                        if let egui::Event::Key { key, pressed: true, .. } = ev {
+                            return Some(format!("{:?}", key));
+                        }
+                    }
+                    None
+                });
+                if let Some(k) = new_key {
+                    cfg.set_binding(btn, k);
+                    *rebinding = None;
+                    *save_needed = true;
+                }
+            } else if let Some(btn) = *rebinding_pad {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("Press a button for {}…", btn.display_name())).size(12.0).color(AMBER));
+                    if ui.small_button("Cancel").clicked() { *rebinding_pad = None; }
+                });
+            } else {
+                ui.label(egui::RichText::new("Click Rebind, then press the key or button.").size(11.0).color(MUTED));
+            }
+            ui.add_space(4.0);
+
+            let list_h = (ui.available_height() - 46.0).max(160.0);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(list_h).show(ui, |ui| {
+                egui::Grid::new("binds").num_columns(3).spacing([10.0, 6.0]).striped(true).show(ui, |ui| {
+                    match *input_device {
+                        InputDevice::Keyboard => {
+                            for btn in SwitchButton::all() {
+                                ui.label(egui::RichText::new(btn.display_name()).size(12.0).color(TEXT));
+                                let cur = cfg.binding_for(*btn).unwrap_or("—").to_string();
+                                ui.label(egui::RichText::new(cur).size(12.0).monospace().color(MUTED));
+                                if ui.small_button("Rebind").clicked() {
+                                    *rebinding = Some(*btn);
+                                    *rebinding_pad = None;
+                                }
+                                ui.end_row();
+                            }
+                        }
+                        InputDevice::Gamepad => {
+                            for btn in ControllerConfig::pad_list() {
+                                ui.label(egui::RichText::new(btn.display_name()).size(12.0).color(TEXT));
+                                let cur = cfg.pad_for(*btn).map(|g| g.display_name()).unwrap_or("—");
+                                ui.label(egui::RichText::new(cur).size(12.0).color(MUTED));
+                                if ui.small_button("Rebind").clicked() {
+                                    *rebinding_pad = Some(*btn);
+                                    *rebinding = None;
+                                }
+                                ui.end_row();
+                            }
+                        }
+                    }
+                });
+            });
+        });
     });
 
     ui.add_space(8.0);
@@ -639,6 +746,88 @@ fn controller_settings_content(
             *save_needed = true;
         }
     });
+}
+
+fn draw_controller_diagram(ui: &mut egui::Ui, input: &InputSnapshot) {
+    let avail = ui.available_width();
+    let s = (avail / 430.0).min(0.82);
+    let h = 300.0 * s;
+    let (rect, _resp) = ui.allocate_exact_size(Vec2::new(avail, h), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let c = rect.center();
+    let map = |x: f32, y: f32| c + Vec2::new(x * s, (y + 6.0) * s);
+
+    painter.rect(rect, Rounding::same(10.0), BG, Stroke::NONE);
+
+    let outline = Color32::from_rgb(0x4C, 0x4C, 0x58);
+    let body_stroke = Stroke::new((2.0 * s).max(1.2), outline);
+
+    let n = PRO_BODY.len() / 2;
+    let mut body: Vec<egui::Pos2> = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        body.push(map(PRO_BODY[i * 2], PRO_BODY[i * 2 + 1]));
+    }
+    for i in (0..n).rev() {
+        body.push(map(-PRO_BODY[i * 2], PRO_BODY[i * 2 + 1]));
+    }
+    let hn = PRO_LEFT_HANDLE.len() / 2;
+    let lh: Vec<egui::Pos2> = (0..hn).map(|i| map(PRO_LEFT_HANDLE[i * 2], PRO_LEFT_HANDLE[i * 2 + 1])).collect();
+    let rh: Vec<egui::Pos2> = (0..hn).map(|i| map(-PRO_LEFT_HANDLE[i * 2], PRO_LEFT_HANDLE[i * 2 + 1])).collect();
+    painter.add(egui::Shape::closed_line(lh, body_stroke));
+    painter.add(egui::Shape::closed_line(rh, body_stroke));
+    painter.add(egui::Shape::closed_line(body, body_stroke));
+
+    let face = |center: egui::Pos2, r: f32, label: &str, on: bool| {
+        let fill = if on { ACCENT } else { BG_INPUT };
+        painter.circle(center, r, fill, Stroke::new(1.0, BORDER));
+        if !label.is_empty() {
+            let tc = if on { Color32::WHITE } else { MUTED };
+            painter.text(center, egui::Align2::CENTER_CENTER, label, FontId::proportional((r * 0.95).max(7.0)), tc);
+        }
+    };
+    let pad = |center: egui::Pos2, sz: Vec2, label: &str, on: bool| {
+        let r = egui::Rect::from_center_size(center, sz);
+        let fill = if on { ACCENT } else { BG_INPUT };
+        painter.rect(r, Rounding::same(3.0), fill, Stroke::new(1.0, BORDER));
+        if !label.is_empty() {
+            let tc = if on { Color32::WHITE } else { MUTED };
+            painter.text(center, egui::Align2::CENTER_CENTER, label, FontId::proportional(9.0 * s.max(0.8)), tc);
+        }
+    };
+    let stick = |base: egui::Pos2, sx: f32, sy: f32, clicked: bool| {
+        let ring = 22.0 * s;
+        let knob = 13.0 * s;
+        painter.circle(base, ring, BG_INPUT, Stroke::new(1.5, outline));
+        let off = Vec2::new(sx, -sy) * (ring - knob - 1.0);
+        let kc = if clicked { ACCENT } else { Color32::from_rgb(0x62, 0x62, 0x72) };
+        painter.circle(base + off, knob, kc, Stroke::new(1.0, BORDER));
+    };
+
+    pad(map(-120.0, -139.0), Vec2::new(52.0 * s, 13.0 * s), "ZL", input.is(SwitchButton::ZL));
+    pad(map(120.0, -139.0), Vec2::new(52.0 * s, 13.0 * s), "ZR", input.is(SwitchButton::ZR));
+    pad(map(-120.0, -122.0), Vec2::new(62.0 * s, 14.0 * s), "L", input.is(SwitchButton::L));
+    pad(map(120.0, -122.0), Vec2::new(62.0 * s, 14.0 * s), "R", input.is(SwitchButton::R));
+
+    stick(map(-111.0, -55.0), input.lx(), input.ly(), input.is(SwitchButton::StickL));
+
+    let dd = 19.0 * s;
+    let dsz = Vec2::splat(16.0 * s);
+    let dp = map(-61.0, 0.0);
+    pad(dp + Vec2::new(0.0, -dd), dsz, "", input.is(SwitchButton::DUp));
+    pad(dp + Vec2::new(0.0, dd), dsz, "", input.is(SwitchButton::DDown));
+    pad(dp + Vec2::new(-dd, 0.0), dsz, "", input.is(SwitchButton::DLeft));
+    pad(dp + Vec2::new(dd, 0.0), dsz, "", input.is(SwitchButton::DRight));
+
+    let fr = 15.0 * s;
+    face(map(136.0, -56.0), fr, "A", input.is(SwitchButton::A));
+    face(map(105.0, -25.0), fr, "B", input.is(SwitchButton::B));
+    face(map(105.0, -87.0), fr, "X", input.is(SwitchButton::X));
+    face(map(74.0, -56.0), fr, "Y", input.is(SwitchButton::Y));
+
+    stick(map(51.0, 0.0), input.rx(), input.ry(), input.is(SwitchButton::StickR));
+
+    face(map(-50.0, -86.0), 9.0 * s, "-", input.is(SwitchButton::Minus));
+    face(map(50.0, -86.0), 9.0 * s, "+", input.is(SwitchButton::Plus));
 }
 
 fn row(ui: &mut egui::Ui, label: &str, value: &str) {
