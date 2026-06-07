@@ -333,6 +333,11 @@ impl eframe::App for HorizonApp {
                         if ui.button("Registers").clicked() { self.debugger.toggle_registers(); ui.close_menu(); }
                         if ui.button("Disassembler").clicked() { self.debugger.toggle_disasm(); ui.close_menu(); }
                         if ui.button("Logs").clicked()      { self.debugger.toggle_logs(); ui.close_menu(); }
+                        ui.separator();
+                        let mut dumps_on = nexium_common::dumps::enabled();
+                        if ui.checkbox(&mut dumps_on, "Frame dumps (.bmp)").changed() {
+                            nexium_common::dumps::set_enabled(dumps_on);
+                        }
                     });
                     ui.menu_button(egui::RichText::new("Settings").size(13.0).color(TEXT), |ui| {
                         if ui.button("Preferences").clicked() { self.show_settings = !self.show_settings; ui.close_menu(); }

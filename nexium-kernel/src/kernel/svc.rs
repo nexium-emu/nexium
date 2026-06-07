@@ -2838,7 +2838,8 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                             static LAST_RGB_NZ: AtomicU64 = AtomicU64::new(0);
                             let seq = FRAME_SEQ.fetch_add(1, Ordering::Relaxed);
                             let is_first_nonblack = rgb_nz > 0 && !FIRST_NONBLACK.swap(true, Ordering::Relaxed);
-                            let should_dump = (seq > 0 && seq % 300 == 60) || is_first_nonblack;
+                            let should_dump = nexium_common::dumps::enabled()
+                                && ((seq > 0 && seq % 300 == 60) || is_first_nonblack);
                             if should_dump {
                                 if let Some(home) = std::env::var_os("APPDATA") {
                                     let path = std::path::PathBuf::from(home).join("NeXium").join("logs")

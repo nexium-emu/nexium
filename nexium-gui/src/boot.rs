@@ -143,6 +143,10 @@ impl EmulationHandle {
             'launcher: loop {
             log::info!("Booting NRO: {}", cur_nro_path);
 
+            if let Some(stem) = Path::new(&cur_nro_path).file_stem().and_then(|s| s.to_str()) {
+                nexium_common::title::set_title_key(stem);
+            }
+
             if !Path::new(&cur_nro_path).exists() {
                 return Err(format!("NRO file not found: {}", cur_nro_path));
             }

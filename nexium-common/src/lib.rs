@@ -5,6 +5,8 @@ pub mod log_init;
 pub mod log_sink;
 pub mod file_logger;
 pub mod frame_present;
+pub mod title;
+pub mod dumps;
 
 pub use error::{HorizonError, Result};
 pub use result::SUCCESS;

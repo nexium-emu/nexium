@@ -4,7 +4,13 @@ use std::path::PathBuf;
 
 fn pipeline_cache_path() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(base).join("NeXium").join("pipeline_cache.bin"))
+    let title = nexium_common::title::title_key().unwrap_or_else(|| "default".to_string());
+    Some(
+        PathBuf::from(base)
+            .join("NeXium")
+            .join("pipeline_cache")
+            .join(format!("{}.bin", title)),
+    )
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
