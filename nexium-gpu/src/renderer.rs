@@ -288,12 +288,9 @@ impl Renderer {
             } else {
                 enabled_ext_names.as_ptr()
             },
-            enabled_layer_count: 0,
-            pp_enabled_layer_names: std::ptr::null(),
             p_enabled_features: std::ptr::null(),
             p_next: p_next_chain,
-            flags: Default::default(),
-            _marker: std::marker::PhantomData,
+            ..Default::default()
         };
         let device = unsafe {
             instance.create_device(physical_device, &dev_info, None)

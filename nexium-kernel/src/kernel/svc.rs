@@ -118,7 +118,7 @@ fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_set_memory_permission(kernel: &mut Kernel) -> u32 {
+fn svc_set_memory_permission(_kernel: &mut Kernel) -> u32 {
     let (addr, size, perm) = if let Some(cpu) = cpu_ref() {
         (cpu.get_register(0), cpu.get_register(1), cpu.get_register(2))
     } else {
@@ -131,7 +131,7 @@ fn svc_set_memory_permission(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_set_memory_attribute(kernel: &mut Kernel) -> u32 {
+fn svc_set_memory_attribute(_kernel: &mut Kernel) -> u32 {
     let (addr, size, mask, value) = if let Some(cpu) = cpu_ref() {
         (cpu.get_register(0), cpu.get_register(1), cpu.get_register(2), cpu.get_register(3))
     } else {
@@ -197,7 +197,7 @@ fn svc_map_memory(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_unmap_memory(kernel: &mut Kernel) -> u32 {
+fn svc_unmap_memory(_kernel: &mut Kernel) -> u32 {
     log::debug!("svcUnmapMemory (no-op)");
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
@@ -767,7 +767,7 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_get_system_tick(kernel: &mut Kernel) -> u32 {
+fn svc_get_system_tick(_kernel: &mut Kernel) -> u32 {
     use std::sync::OnceLock;
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
     let elapsed = EPOCH.get_or_init(std::time::Instant::now).elapsed();
@@ -2769,7 +2769,7 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                             });
                         let have_gpu_frame = fermi_frame.is_some() || vk_readback.is_some();
                         let legacy_gfx = kernel.nvdrv.legacy_gfx.load(std::sync::atomic::Ordering::Relaxed);
-                        let (mut pixels, rgb_nz) = if have_gpu_frame {
+                        let (pixels, rgb_nz) = if have_gpu_frame {
                             (Vec::new(), 0usize)
                         } else {
                             let mut pixels = if effective_tiled {
@@ -3546,7 +3546,7 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
     }
 }
 
-fn applet_command_response(kernel: &mut Kernel, port_name: &str, cmd_id: u32) -> Option<(Vec<u8>, Option<u32>)> {
+fn applet_command_response(_kernel: &mut Kernel, port_name: &str, cmd_id: u32) -> Option<(Vec<u8>, Option<u32>)> {
     match (port_name, cmd_id) {
         ("IDebugFunctions", _) => Some((Vec::new(), None)),
 
@@ -3691,7 +3691,7 @@ fn svc_get_thread_id(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_get_process_id(kernel: &mut Kernel) -> u32 {
+fn svc_get_process_id(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(1, 0x4F4F4F4F_4F4F4F4F);
         cpu.set_register(0, SUCCESS as u64);
@@ -4045,7 +4045,7 @@ fn svc_map_transfer_memory(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn dump_regs(kernel: &Kernel, tag: &str) {
+fn dump_regs(_kernel: &Kernel, tag: &str) {
     if !log::log_enabled!(log::Level::Trace) {
         return;
     }
@@ -4173,7 +4173,7 @@ fn svc_sleep_thread(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_flush_data_cache(kernel: &mut Kernel) -> u32 {
+fn svc_flush_data_cache(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
@@ -4205,7 +4205,7 @@ fn svc_set_thread_priority(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_get_thread_core_mask(kernel: &mut Kernel) -> u32 {
+fn svc_get_thread_core_mask(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(1, 0);
         cpu.set_register(2, 0xF);
@@ -4214,14 +4214,14 @@ fn svc_get_thread_core_mask(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_set_thread_core_mask(kernel: &mut Kernel) -> u32 {
+fn svc_set_thread_core_mask(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
 }
 
-fn svc_get_current_processor_number(kernel: &mut Kernel) -> u32 {
+fn svc_get_current_processor_number(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, 0);
     }
@@ -4248,7 +4248,7 @@ fn svc_send_async_request_with_user_buffer(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_return_from_exception(kernel: &mut Kernel) -> u32 {
+fn svc_return_from_exception(_kernel: &mut Kernel) -> u32 {
     log::debug!("svcReturnFromException");
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
@@ -4256,24 +4256,14 @@ fn svc_return_from_exception(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_flush_entire_data_cache(kernel: &mut Kernel) -> u32 {
+fn svc_flush_entire_data_cache(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
 }
 
-fn svc_get_debug_future_thread_info(kernel: &mut Kernel) -> u32 {
-    if let Some(cpu) = cpu_mut() {
-        for r in 1..=5 {
-            cpu.set_register(r, 0);
-        }
-        cpu.set_register(0, SUCCESS as u64);
-    }
-    SUCCESS
-}
-
-fn svc_get_last_thread_info(kernel: &mut Kernel) -> u32 {
+fn svc_get_debug_future_thread_info(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         for r in 1..=5 {
             cpu.set_register(r, 0);
@@ -4283,7 +4273,17 @@ fn svc_get_last_thread_info(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_get_resource_limit_limit_value(kernel: &mut Kernel) -> u32 {
+fn svc_get_last_thread_info(_kernel: &mut Kernel) -> u32 {
+    if let Some(cpu) = cpu_mut() {
+        for r in 1..=5 {
+            cpu.set_register(r, 0);
+        }
+        cpu.set_register(0, SUCCESS as u64);
+    }
+    SUCCESS
+}
+
+fn svc_get_resource_limit_limit_value(_kernel: &mut Kernel) -> u32 {
     let limitable = if let Some(cpu) = cpu_ref() { cpu.get_register(2) as u32 } else { 0 };
     let value: u64 = match limitable {
         0 => 0x40_000_000,
@@ -4301,7 +4301,7 @@ fn svc_get_resource_limit_limit_value(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_get_resource_limit_current_value(kernel: &mut Kernel) -> u32 {
+fn svc_get_resource_limit_current_value(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(1, 0);
         cpu.set_register(0, SUCCESS as u64);
@@ -4309,7 +4309,7 @@ fn svc_get_resource_limit_current_value(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_get_resource_limit_peak_value(kernel: &mut Kernel) -> u32 {
+fn svc_get_resource_limit_peak_value(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(1, 0);
         cpu.set_register(0, SUCCESS as u64);
@@ -4317,7 +4317,7 @@ fn svc_get_resource_limit_peak_value(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_set_thread_activity(kernel: &mut Kernel) -> u32 {
+fn svc_set_thread_activity(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
@@ -4348,7 +4348,7 @@ fn svc_get_thread_context3(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_synchronize_preemption_state(kernel: &mut Kernel) -> u32 {
+fn svc_synchronize_preemption_state(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
@@ -4379,7 +4379,7 @@ fn svc_reply_and_receive_light(kernel: &mut Kernel) -> u32 {
     svc_reply_and_receive(kernel)
 }
 
-fn svc_reply_and_receive(kernel: &mut Kernel) -> u32 {
+fn svc_reply_and_receive(_kernel: &mut Kernel) -> u32 {
     log::debug!("svcReplyAndReceive (stub → TIMEOUT)");
     const KERNEL_TIMEOUT: u32 = 1 | (117 << 9);
     if let Some(cpu) = cpu_mut() {
@@ -4401,7 +4401,7 @@ fn svc_create_shared_memory(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_unmap_transfer_memory(kernel: &mut Kernel) -> u32 {
+fn svc_unmap_transfer_memory(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
@@ -4418,7 +4418,7 @@ fn svc_create_interrupt_event(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_query_io_mapping(kernel: &mut Kernel) -> u32 {
+fn svc_query_io_mapping(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(1, 0);
         cpu.set_register(0, SUCCESS as u64);
@@ -4426,7 +4426,7 @@ fn svc_query_io_mapping(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_debug_active_process(kernel: &mut Kernel) -> u32 {
+fn svc_debug_active_process(_kernel: &mut Kernel) -> u32 {
     const KERNEL_INVALID_HANDLE: u32 = 1 | (114 << 9);
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, KERNEL_INVALID_HANDLE as u64);
@@ -4434,21 +4434,21 @@ fn svc_debug_active_process(kernel: &mut Kernel) -> u32 {
     KERNEL_INVALID_HANDLE
 }
 
-fn svc_break_debug_process(kernel: &mut Kernel) -> u32 {
+fn svc_break_debug_process(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
 }
 
-fn svc_terminate_debug_process(kernel: &mut Kernel) -> u32 {
+fn svc_terminate_debug_process(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
 }
 
-fn svc_get_debug_event(kernel: &mut Kernel) -> u32 {
+fn svc_get_debug_event(_kernel: &mut Kernel) -> u32 {
     const KERNEL_NO_DEBUG_EVENT: u32 = 1 | (140 << 9);
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, KERNEL_NO_DEBUG_EVENT as u64);
@@ -4456,14 +4456,14 @@ fn svc_get_debug_event(kernel: &mut Kernel) -> u32 {
     KERNEL_NO_DEBUG_EVENT
 }
 
-fn svc_continue_debug_event(kernel: &mut Kernel) -> u32 {
+fn svc_continue_debug_event(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
 }
 
-fn svc_get_process_list(kernel: &mut Kernel) -> u32 {
+fn svc_get_process_list(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(1, 1);
         cpu.set_register(0, SUCCESS as u64);
@@ -4518,14 +4518,14 @@ fn svc_create_resource_limit(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_set_resource_limit_limit_value(kernel: &mut Kernel) -> u32 {
+fn svc_set_resource_limit_limit_value(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
 }
 
-fn svc_call_secure_monitor(kernel: &mut Kernel) -> u32 {
+fn svc_call_secure_monitor(_kernel: &mut Kernel) -> u32 {
     let smc_id = if let Some(cpu) = cpu_ref() { cpu.get_register(0) as u32 } else { 0 };
     log::debug!("svcCallSecureMonitor smc_id={:#x} (HLE: returning success)", smc_id);
     if let Some(cpu) = cpu_mut() {

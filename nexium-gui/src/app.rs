@@ -731,7 +731,7 @@ fn audio_settings_content(
         Some(n) => n.clone(),
     };
     ui.horizontal(|ui| {
-        egui::ComboBox::from_id_source("audio_output_device")
+        egui::ComboBox::from_id_salt("audio_output_device")
             .selected_text(current_label.clone())
             .show_ui(ui, |ui| {
                 if ui

@@ -25,15 +25,15 @@ license = "GPL-2.0-or-later"
 [workspace.dependencies]
 nexium-common = { path = "nexium-common" }
 nexium-memory = { path = "nexium-memory" }
-nexium-cpu = { path = "nexium-cpu" }
+nexium-cpu = { path = "nexium-cpu", default-features = false }
 nexium-loader = { path = "nexium-loader" }
 nexium-shader = { path = "nexium-shader" }
 nexium-spirv = { path = "nexium-spirv" }
 nexium-ipc = { path = "nexium-ipc" }
 nexium-cmif = { path = "nexium-cmif" }
 nexium-nvdrv = { path = "nexium-nvdrv" }
-nexium-kernel = { path = "nexium-kernel" }
-nexium-core = { path = "nexium-core" }
+nexium-kernel = { path = "nexium-kernel", default-features = false }
+nexium-core = { path = "nexium-core", default-features = false }
 nexium-gpu = { path = "nexium-gpu" }
 
 bytemuck = { version = "1", features = ["derive"] }
