@@ -393,7 +393,7 @@ impl Renderer {
 
         log::info!("nexium-gpu Renderer init OK: {} (Vulkan via Ash)", name);
 
-        Ok(Arc::new(Self {
+        let renderer = Arc::new(Self {
             inner: Mutex::new(RendererInner {
                 entry,
                 instance,
@@ -425,7 +425,36 @@ impl Renderer {
                 tele_in_flight_mask: 0,
                 depth_clip_control_enabled: enable_depth_clip_control,
             }),
-        }))
+        });
+        renderer.prewarm();
+        Ok(renderer)
+    }
+
+    fn prewarm(&self) {
+        let mut inner = self.inner.lock();
+        let specs = inner.pipeline_cache.prewarm_specs();
+        if specs.is_empty() {
+            return;
+        }
+        let RendererInner { device, shader_compiler, pipeline_cache, .. } = &mut *inner;
+        let mut queued = 0usize;
+        for spec in &specs {
+            if pipeline_cache.get(&spec.key).is_some() {
+                continue;
+            }
+            let vs_mod = match shader_compiler.compile_or_get(&spec.vs_spirv, device) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let fs_mod = match shader_compiler.compile_or_get(&spec.fs_spirv, device) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let req = crate::pipeline::spec_to_request(spec, vs_mod, fs_mod);
+            pipeline_cache.queue_build(req);
+            queued += 1;
+        }
+        log::info!("prewarm: queued {} pipelines from {} cached specs", queued, specs.len());
     }
 
     pub fn clear_target(
@@ -801,6 +830,27 @@ impl Renderer {
             poly_offset_factor,
             depth_clip_control_enabled,
         };
+
+        pipeline_cache.register_spec(crate::pipeline::PipelineSpec {
+            key,
+            vs_spirv: vs_spirv.to_vec(),
+            fs_spirv: fs_spirv.to_vec(),
+            bindings: layout.bindings.iter().map(|b| (b.binding, b.stride)).collect(),
+            attrs: layout.attrs.iter().map(|a| (a.location, a.binding, a.format.as_raw(), a.offset)).collect(),
+            topology: topology.as_raw(),
+            color_format: color_format.as_raw(),
+            depth_format: depth_format.as_raw(),
+            has_depth,
+            blend: (blend.enabled, blend.src_factor.as_raw(), blend.dst_factor.as_raw(), blend.op.as_raw()),
+            depth: (depth.test_enabled, depth.write_enabled, depth.compare_op.as_raw()),
+            cull_test_enable,
+            cull_face,
+            front_face,
+            poly_offset_enable,
+            poly_offset_units,
+            poly_offset_factor,
+            depth_clip_control_enabled,
+        });
 
         let safe_to_skip = has_depth || vertex_count > 6;
         let req = if nexium_common::async_compile::enabled() && safe_to_skip {

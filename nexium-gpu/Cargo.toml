@@ -12,6 +12,8 @@ ash = "0.38"
 parking_lot = "0.12"
 log = "0.4"
 thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
 
 [dev-dependencies]
 winit = "0.30"

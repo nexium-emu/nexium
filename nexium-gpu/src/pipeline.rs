@@ -14,7 +14,7 @@ fn cache_path(device_tag: &str) -> Option<PathBuf> {
     )
 }
 
-#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PipelineKey {
     pub vs_hash: u64,
     pub fs_hash: u64,
@@ -27,6 +27,103 @@ pub struct PipelineKey {
     pub raster_state_packed: u32,
     pub depth_state_packed: u32,
     pub poly_offset_packed: u64,
+}
+
+const SPEC_VERSION: u32 = 1;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PipelineSpec {
+    pub key: PipelineKey,
+    pub vs_spirv: Vec<u32>,
+    pub fs_spirv: Vec<u32>,
+    pub bindings: Vec<(u32, u32)>,
+    pub attrs: Vec<(u32, u32, i32, u32)>,
+    pub topology: i32,
+    pub color_format: i32,
+    pub depth_format: i32,
+    pub has_depth: bool,
+    pub blend: (bool, i32, i32, i32),
+    pub depth: (bool, bool, i32),
+    pub cull_test_enable: bool,
+    pub cull_face: u32,
+    pub front_face: u32,
+    pub poly_offset_enable: bool,
+    pub poly_offset_units: f32,
+    pub poly_offset_factor: f32,
+    pub depth_clip_control_enabled: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SpecFile {
+    version: u32,
+    specs: Vec<PipelineSpec>,
+}
+
+fn specs_path(device_tag: &str) -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    let title = nexium_common::title::title_key().unwrap_or_else(|| "default".to_string());
+    Some(
+        PathBuf::from(base)
+            .join("NeXium")
+            .join("shader_cache")
+            .join(device_tag)
+            .join(format!("{}.specs", title)),
+    )
+}
+
+pub fn spec_to_request(
+    spec: &PipelineSpec,
+    vs_mod: vk::ShaderModule,
+    fs_mod: vk::ShaderModule,
+) -> PipelineBuildRequest {
+    let bindings = spec
+        .bindings
+        .iter()
+        .map(|(b, s)| vk::VertexInputBindingDescription {
+            binding: *b,
+            stride: *s,
+            input_rate: vk::VertexInputRate::VERTEX,
+        })
+        .collect();
+    let attrs = spec
+        .attrs
+        .iter()
+        .map(|(l, b, f, o)| vk::VertexInputAttributeDescription {
+            location: *l,
+            binding: *b,
+            format: vk::Format::from_raw(*f),
+            offset: *o,
+        })
+        .collect();
+    PipelineBuildRequest {
+        key: spec.key,
+        vs_mod,
+        fs_mod,
+        bindings,
+        attrs,
+        topology: vk::PrimitiveTopology::from_raw(spec.topology),
+        color_format: vk::Format::from_raw(spec.color_format),
+        depth_format: vk::Format::from_raw(spec.depth_format),
+        has_depth: spec.has_depth,
+        blend: crate::draw::BlendState {
+            enabled: spec.blend.0,
+            src_factor: vk::BlendFactor::from_raw(spec.blend.1),
+            dst_factor: vk::BlendFactor::from_raw(spec.blend.2),
+            op: vk::BlendOp::from_raw(spec.blend.3),
+        },
+        depth: crate::draw::DepthState {
+            test_enabled: spec.depth.0,
+            write_enabled: spec.depth.1,
+            compare_op: vk::CompareOp::from_raw(spec.depth.2),
+        },
+        cull_test_enable: spec.cull_test_enable,
+        cull_face: spec.cull_face,
+        front_face: spec.front_face,
+        poly_offset_enable: spec.poly_offset_enable,
+        poly_offset_units: spec.poly_offset_units,
+        poly_offset_factor: spec.poly_offset_factor,
+        depth_clip_control_enabled: spec.depth_clip_control_enabled,
+    }
 }
 
 pub struct PipelineBuildRequest {
@@ -282,6 +379,10 @@ pub struct PipelineCache {
     save_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     worker: Option<CompileWorker>,
     cache_lock: std::sync::Arc<std::sync::RwLock<()>>,
+    specs: HashMap<PipelineKey, PipelineSpec>,
+    specs_dirty: bool,
+    specs_saved_count: usize,
+    specs_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl PipelineCache {
@@ -344,6 +445,36 @@ impl PipelineCache {
                     if std::fs::write(&tmp, &data).is_ok() {
                         let _ = std::fs::rename(&tmp, path);
                         log::info!("VkPipelineCache saved ({} bytes)", data.len());
+                    }
+                }
+            })
+            .ok();
+
+        let specs_disk_path = specs_path(device_tag);
+        let specs: HashMap<PipelineKey, PipelineSpec> = specs_disk_path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|bytes| bincode::deserialize::<SpecFile>(&bytes).ok())
+            .filter(|f| f.version == SPEC_VERSION)
+            .map(|f| f.specs.into_iter().map(|s| (s.key, s)).collect())
+            .unwrap_or_default();
+        let specs_count = specs.len();
+        log::info!("shader specs loaded: {}", specs_count);
+
+        let (specs_tx, specs_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let specs_writer_path = specs_disk_path.clone();
+        std::thread::Builder::new()
+            .name("nexium-speccache".to_string())
+            .spawn(move || {
+                while let Ok(data) = specs_rx.recv() {
+                    let Some(path) = specs_writer_path.as_ref() else { continue; };
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let tmp = path.with_extension("specs.tmp");
+                    if std::fs::write(&tmp, &data).is_ok() {
+                        let _ = std::fs::rename(&tmp, path);
+                        log::info!("shader specs saved ({} bytes)", data.len());
                     }
                 }
             })
@@ -412,7 +543,53 @@ impl PipelineCache {
             save_tx: Some(save_tx),
             worker,
             cache_lock,
+            specs,
+            specs_dirty: false,
+            specs_saved_count: specs_count,
+            specs_tx: Some(specs_tx),
         })
+    }
+
+    pub fn register_spec(&mut self, spec: PipelineSpec) {
+        if self.specs.insert(spec.key, spec).is_none() {
+            self.specs_dirty = true;
+        }
+    }
+
+    pub fn queue_build(&mut self, req: PipelineBuildRequest) {
+        if self.pipelines.contains_key(&req.key) {
+            return;
+        }
+        if let Some(w) = self.worker.as_mut() {
+            if w.in_flight.contains_key(&req.key) {
+                return;
+            }
+            let key = req.key;
+            if w.req_tx.send(req).is_ok() {
+                w.in_flight.insert(key, 0);
+            }
+        }
+    }
+
+    pub fn prewarm_specs(&self) -> Vec<PipelineSpec> {
+        self.specs.values().cloned().collect()
+    }
+
+    fn save_specs(&mut self) {
+        if !self.specs_dirty || self.specs.len() == self.specs_saved_count {
+            return;
+        }
+        let file = SpecFile {
+            version: SPEC_VERSION,
+            specs: self.specs.values().cloned().collect(),
+        };
+        if let Ok(bytes) = bincode::serialize(&file) {
+            self.specs_saved_count = self.specs.len();
+            if let Some(tx) = &self.specs_tx {
+                let _ = tx.send(bytes);
+            }
+        }
+        self.specs_dirty = false;
     }
 
     pub fn drain_completed(&mut self, device: &ash::Device) {
@@ -467,8 +644,11 @@ impl PipelineCache {
     }
 
     pub fn maybe_save(&mut self, device: &ash::Device) {
-        if self.dirty && self.last_save.elapsed() >= std::time::Duration::from_secs(4) {
+        if (self.dirty || self.specs_dirty)
+            && self.last_save.elapsed() >= std::time::Duration::from_secs(4)
+        {
             self.save(device);
+            self.save_specs();
             self.dirty = false;
             self.last_save = std::time::Instant::now();
         }
