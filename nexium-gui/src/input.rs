@@ -1,82 +1,68 @@
-use gilrs::Gilrs;
+use sdl3::gamepad::{Axis, Button, Gamepad};
+use sdl3::GamepadSubsystem;
+use crate::controller_config::{ControllerConfig, GpButton, SwitchButton};
+
+const ALL_GP: [GpButton; 16] = [
+    GpButton::South, GpButton::East, GpButton::West, GpButton::North,
+    GpButton::L, GpButton::R, GpButton::ZL, GpButton::ZR,
+    GpButton::Plus, GpButton::Minus, GpButton::LStick, GpButton::RStick,
+    GpButton::Up, GpButton::Down, GpButton::Left, GpButton::Right,
+];
+
+const TRIGGER_THRESHOLD: i16 = 8000;
+
+fn gp_pressed(pad: &Gamepad, b: GpButton) -> bool {
+    match b {
+        GpButton::South => pad.button(Button::South),
+        GpButton::East => pad.button(Button::East),
+        GpButton::West => pad.button(Button::West),
+        GpButton::North => pad.button(Button::North),
+        GpButton::L => pad.button(Button::LeftShoulder),
+        GpButton::R => pad.button(Button::RightShoulder),
+        GpButton::ZL => pad.axis(Axis::TriggerLeft) > TRIGGER_THRESHOLD,
+        GpButton::ZR => pad.axis(Axis::TriggerRight) > TRIGGER_THRESHOLD,
+        GpButton::Plus => pad.button(Button::Start),
+        GpButton::Minus => pad.button(Button::Back),
+        GpButton::LStick => pad.button(Button::LeftStick),
+        GpButton::RStick => pad.button(Button::RightStick),
+        GpButton::Up => pad.button(Button::DPadUp),
+        GpButton::Down => pad.button(Button::DPadDown),
+        GpButton::Left => pad.button(Button::DPadLeft),
+        GpButton::Right => pad.button(Button::DPadRight),
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct InputSnapshot {
-    pub a_pressed: bool,
-    pub b_pressed: bool,
-    pub x_pressed: bool,
-    pub y_pressed: bool,
-    pub l_pressed: bool,
-    pub r_pressed: bool,
-    pub zl_pressed: bool,
-    pub zr_pressed: bool,
-    pub plus_pressed: bool,
-    pub minus_pressed: bool,
-    pub dpad_up: bool,
-    pub dpad_down: bool,
-    pub dpad_left: bool,
-    pub dpad_right: bool,
-    pub stick_left_x: f32,
-    pub stick_left_y: f32,
-    pub stick_right_x: f32,
-    pub stick_right_y: f32,
+    pub connected: bool,
+    pub buttons: u64,
+    pub sticks: [i32; 4],
 }
 
 impl InputSnapshot {
     pub fn new() -> Self {
-        Self {
-            a_pressed: false,
-            b_pressed: false,
-            x_pressed: false,
-            y_pressed: false,
-            l_pressed: false,
-            r_pressed: false,
-            zl_pressed: false,
-            zr_pressed: false,
-            plus_pressed: false,
-            minus_pressed: false,
-            dpad_up: false,
-            dpad_down: false,
-            dpad_left: false,
-            dpad_right: false,
-            stick_left_x: 0.0,
-            stick_left_y: 0.0,
-            stick_right_x: 0.0,
-            stick_right_y: 0.0,
-        }
+        Self { connected: false, buttons: 0, sticks: [0; 4] }
     }
 
-    pub fn update_from_gamepad(gilrs: &mut Gilrs) -> Self {
-        let mut snapshot = InputSnapshot::new();
+    pub fn to_npad(&self) -> (u64, [i32; 4]) {
+        (self.buttons, self.sticks)
+    }
 
-        for (_id, gamepad) in gilrs.gamepads() {
-            use gilrs::Button::*;
-            use gilrs::Axis::*;
+    pub fn is(&self, btn: SwitchButton) -> bool {
+        self.buttons & btn.npad_bit() != 0
+    }
 
-            snapshot.a_pressed = gamepad.is_pressed(South);
-            snapshot.b_pressed = gamepad.is_pressed(East);
-            snapshot.x_pressed = gamepad.is_pressed(West);
-            snapshot.y_pressed = gamepad.is_pressed(North);
-            snapshot.l_pressed = gamepad.is_pressed(LeftTrigger);
-            snapshot.r_pressed = gamepad.is_pressed(RightTrigger);
-            snapshot.zl_pressed = gamepad.is_pressed(LeftTrigger2);
-            snapshot.zr_pressed = gamepad.is_pressed(RightTrigger2);
-            snapshot.plus_pressed = gamepad.is_pressed(Start);
-            snapshot.minus_pressed = gamepad.is_pressed(Select);
-            snapshot.dpad_up = gamepad.is_pressed(DPadUp);
-            snapshot.dpad_down = gamepad.is_pressed(DPadDown);
-            snapshot.dpad_left = gamepad.is_pressed(DPadLeft);
-            snapshot.dpad_right = gamepad.is_pressed(DPadRight);
-
-            snapshot.stick_left_x = gamepad.value(LeftStickX);
-            snapshot.stick_left_y = gamepad.value(LeftStickY);
-            snapshot.stick_right_x = gamepad.value(RightStickX);
-            snapshot.stick_right_y = gamepad.value(RightStickY);
-
-            break;
-        }
-
-        snapshot
+    pub fn lx(&self) -> f32 {
+        self.sticks[0] as f32 / 30000.0
+    }
+    pub fn ly(&self) -> f32 {
+        self.sticks[1] as f32 / 30000.0
+    }
+    pub fn rx(&self) -> f32 {
+        self.sticks[2] as f32 / 30000.0
+    }
+    pub fn ry(&self) -> f32 {
+        self.sticks[3] as f32 / 30000.0
     }
 }
 
@@ -84,4 +70,97 @@ impl Default for InputSnapshot {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub struct InputBackend {
+    gamepad: GamepadSubsystem,
+    pad: Option<Gamepad>,
+}
+
+impl InputBackend {
+    pub fn new() -> Option<Self> {
+        let sdl = sdl3::init().ok()?;
+        let gamepad = sdl.gamepad().ok()?;
+        log::info!("SDL3 gamepad subsystem initialized");
+        Some(Self { gamepad, pad: None })
+    }
+
+    fn ensure_pad(&mut self) {
+        let alive = self.pad.as_ref().map(|p| p.connected()).unwrap_or(false);
+        if alive {
+            return;
+        }
+        self.pad = None;
+        if let Ok(ids) = self.gamepad.gamepads() {
+            if let Some(&id) = ids.first() {
+                match self.gamepad.open(id) {
+                    Ok(p) => {
+                        log::info!(
+                            "gamepad connected: {} (type {:?})",
+                            p.name().unwrap_or_else(|| "unknown".to_string()),
+                            p.r#type()
+                        );
+                        self.pad = Some(p);
+                    }
+                    Err(e) => log::warn!("gamepad open failed: {}", e),
+                }
+            }
+        }
+    }
+
+    pub fn poll(&mut self, cfg: &ControllerConfig) -> InputSnapshot {
+        self.gamepad.update();
+        self.ensure_pad();
+
+        let mut snap = InputSnapshot::new();
+        let Some(pad) = self.pad.as_ref() else {
+            return snap;
+        };
+        if !pad.connected() {
+            return snap;
+        }
+        snap.connected = true;
+
+        let mut raw = 0u32;
+        for b in ALL_GP {
+            if gp_pressed(pad, b) {
+                raw |= 1 << b.index();
+            }
+        }
+        snap.buttons = cfg.gamepad_pressed(raw);
+
+        let dz = |v: f32| if v.abs() < 0.12 { 0.0 } else { v };
+        let ax = |a: Axis| pad.axis(a) as f32 / 32768.0;
+        snap.sticks = [
+            (dz(ax(Axis::LeftX)) * 30000.0) as i32,
+            (dz(-ax(Axis::LeftY)) * 30000.0) as i32,
+            (dz(ax(Axis::RightX)) * 30000.0) as i32,
+            (dz(-ax(Axis::RightY)) * 30000.0) as i32,
+        ];
+        snap
+    }
+
+    pub fn first_pressed(&mut self) -> Option<GpButton> {
+        self.gamepad.update();
+        self.ensure_pad();
+        let pad = self.pad.as_ref()?;
+        if !pad.connected() {
+            return None;
+        }
+        for b in ALL_GP {
+            if gp_pressed(pad, b) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    pub fn name(&self) -> Option<String> {
+        self.pad.as_ref().and_then(|p| p.name())
+    }
+}
+
+pub fn is_pro_controller(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("pro controller") || n.contains("nintendo switch") || n.contains("switch pro")
 }

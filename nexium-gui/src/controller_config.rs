@@ -85,39 +85,76 @@ impl SwitchButton {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GpButton {
+    South, East, West, North,
+    L, R, ZL, ZR,
+    Plus, Minus, LStick, RStick,
+    Up, Down, Left, Right,
+}
+
+impl GpButton {
+    pub fn index(&self) -> u32 {
+        *self as u32
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            GpButton::South => "Button ▽",
+            GpButton::East => "Button ▷",
+            GpButton::West => "Button ◁",
+            GpButton::North => "Button △",
+            GpButton::L => "L Bumper",
+            GpButton::R => "R Bumper",
+            GpButton::ZL => "L Trigger",
+            GpButton::ZR => "R Trigger",
+            GpButton::Plus => "Start",
+            GpButton::Minus => "Back",
+            GpButton::LStick => "L Stick Click",
+            GpButton::RStick => "R Stick Click",
+            GpButton::Up => "Pad Up",
+            GpButton::Down => "Pad Down",
+            GpButton::Left => "Pad Left",
+            GpButton::Right => "Pad Right",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControllerConfig {
     pub bindings: HashMap<SwitchButton, String>,
+    #[serde(default = "ControllerConfig::default_pad")]
+    pub pad: HashMap<SwitchButton, GpButton>,
 }
 
 impl Default for ControllerConfig {
     fn default() -> Self {
         let mut bindings = HashMap::new();
-        bindings.insert(SwitchButton::A, "Z".to_string());
+        bindings.insert(SwitchButton::A, "C".to_string());
         bindings.insert(SwitchButton::B, "X".to_string());
-        bindings.insert(SwitchButton::X, "A".to_string());
-        bindings.insert(SwitchButton::Y, "S".to_string());
+        bindings.insert(SwitchButton::X, "V".to_string());
+        bindings.insert(SwitchButton::Y, "Z".to_string());
         bindings.insert(SwitchButton::L, "Q".to_string());
-        bindings.insert(SwitchButton::R, "W".to_string());
-        bindings.insert(SwitchButton::ZL, "1".to_string());
-        bindings.insert(SwitchButton::ZR, "2".to_string());
-        bindings.insert(SwitchButton::Plus, "Enter".to_string());
-        bindings.insert(SwitchButton::Minus, "Tab".to_string());
+        bindings.insert(SwitchButton::R, "E".to_string());
+        bindings.insert(SwitchButton::ZL, "R".to_string());
+        bindings.insert(SwitchButton::ZR, "T".to_string());
+        bindings.insert(SwitchButton::Plus, "M".to_string());
+        bindings.insert(SwitchButton::Minus, "N".to_string());
         bindings.insert(SwitchButton::DUp, "ArrowUp".to_string());
         bindings.insert(SwitchButton::DDown, "ArrowDown".to_string());
         bindings.insert(SwitchButton::DLeft, "ArrowLeft".to_string());
         bindings.insert(SwitchButton::DRight, "ArrowRight".to_string());
-        bindings.insert(SwitchButton::StickLUp, "I".to_string());
-        bindings.insert(SwitchButton::StickLDown, "K".to_string());
-        bindings.insert(SwitchButton::StickLLeft, "J".to_string());
-        bindings.insert(SwitchButton::StickLRight, "L".to_string());
-        bindings.insert(SwitchButton::StickRUp, "Numpad8".to_string());
-        bindings.insert(SwitchButton::StickRDown, "Numpad2".to_string());
-        bindings.insert(SwitchButton::StickRLeft, "Numpad4".to_string());
-        bindings.insert(SwitchButton::StickRRight, "Numpad6".to_string());
+        bindings.insert(SwitchButton::StickLUp, "W".to_string());
+        bindings.insert(SwitchButton::StickLDown, "S".to_string());
+        bindings.insert(SwitchButton::StickLLeft, "A".to_string());
+        bindings.insert(SwitchButton::StickLRight, "D".to_string());
+        bindings.insert(SwitchButton::StickRUp, "I".to_string());
+        bindings.insert(SwitchButton::StickRDown, "K".to_string());
+        bindings.insert(SwitchButton::StickRLeft, "J".to_string());
+        bindings.insert(SwitchButton::StickRRight, "L".to_string());
         bindings.insert(SwitchButton::StickL, "F".to_string());
         bindings.insert(SwitchButton::StickR, "G".to_string());
-        Self { bindings }
+        Self { bindings, pad: Self::default_pad() }
     }
 }
 
@@ -148,6 +185,56 @@ impl ControllerConfig {
         let s = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(&path, s)
+    }
+
+    pub fn default_pad() -> HashMap<SwitchButton, GpButton> {
+        let mut m = HashMap::new();
+        m.insert(SwitchButton::A, GpButton::East);
+        m.insert(SwitchButton::B, GpButton::South);
+        m.insert(SwitchButton::X, GpButton::North);
+        m.insert(SwitchButton::Y, GpButton::West);
+        m.insert(SwitchButton::L, GpButton::L);
+        m.insert(SwitchButton::R, GpButton::R);
+        m.insert(SwitchButton::ZL, GpButton::ZL);
+        m.insert(SwitchButton::ZR, GpButton::ZR);
+        m.insert(SwitchButton::Plus, GpButton::Plus);
+        m.insert(SwitchButton::Minus, GpButton::Minus);
+        m.insert(SwitchButton::StickL, GpButton::LStick);
+        m.insert(SwitchButton::StickR, GpButton::RStick);
+        m.insert(SwitchButton::DUp, GpButton::Up);
+        m.insert(SwitchButton::DDown, GpButton::Down);
+        m.insert(SwitchButton::DLeft, GpButton::Left);
+        m.insert(SwitchButton::DRight, GpButton::Right);
+        m
+    }
+
+    pub fn pad_list() -> &'static [SwitchButton] {
+        &[
+            SwitchButton::A, SwitchButton::B, SwitchButton::X, SwitchButton::Y,
+            SwitchButton::L, SwitchButton::R, SwitchButton::ZL, SwitchButton::ZR,
+            SwitchButton::Plus, SwitchButton::Minus, SwitchButton::StickL, SwitchButton::StickR,
+            SwitchButton::DUp, SwitchButton::DDown, SwitchButton::DLeft, SwitchButton::DRight,
+        ]
+    }
+
+    pub fn pad_for(&self, btn: SwitchButton) -> Option<GpButton> {
+        self.pad.get(&btn).copied()
+    }
+
+    pub fn set_pad(&mut self, btn: SwitchButton, gp: GpButton) {
+        self.pad.insert(btn, gp);
+    }
+
+    pub fn gamepad_pressed(&self, raw: u32) -> u64 {
+        let mut b: u64 = 0;
+        for btn in SwitchButton::all() {
+            if let Some(gp) = self.pad.get(btn) {
+                if raw & (1 << gp.index()) != 0 {
+                    b |= btn.npad_bit();
+                }
+            }
+        }
+        b
     }
 
     pub fn binding_for(&self, btn: SwitchButton) -> Option<&str> {
