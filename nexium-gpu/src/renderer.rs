@@ -1526,6 +1526,8 @@ impl Renderer {
             transition_image_aspect(device, cmd, di, depth_prev, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageAspectFlags::DEPTH);
         }
 
+        let clear_rt = rt_prev_layout == vk::ImageLayout::UNDEFINED;
+
         let mut dsets_batch: Vec<vk::DescriptorSet> = Vec::new();
         for (i, (call, prep)) in preps.iter().enumerate() {
             let call = *call;
@@ -1632,7 +1634,11 @@ impl Renderer {
             unsafe { device.update_descriptor_sets(&writes, &[]); }
             dsets_batch.push(dset);
 
-            let clear_value = vk::ClearValue { color: vk::ClearColorValue { float32: call.clear_color } };
+            let clear_value = if i == 0 && clear_rt {
+                vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] } }
+            } else {
+                vk::ClearValue { color: vk::ClearColorValue { float32: call.clear_color } }
+            };
             let depth_attachment = if prep.use_depth {
                 depth_view.map(|dv| vk::RenderingAttachmentInfo {
                     s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO, image_view: dv,
@@ -1649,7 +1655,8 @@ impl Renderer {
                 s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO, image_view: rt_view,
                 image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, resolve_mode: vk::ResolveModeFlags::NONE,
                 resolve_image_view: vk::ImageView::null(), resolve_image_layout: vk::ImageLayout::UNDEFINED,
-                load_op: vk::AttachmentLoadOp::LOAD, store_op: vk::AttachmentStoreOp::STORE, clear_value,
+                load_op: if i == 0 && clear_rt { vk::AttachmentLoadOp::CLEAR } else { vk::AttachmentLoadOp::LOAD },
+                store_op: vk::AttachmentStoreOp::STORE, clear_value,
                 p_next: std::ptr::null(), _marker: std::marker::PhantomData,
             };
             let render_info = vk::RenderingInfo {
