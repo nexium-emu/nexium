@@ -1865,6 +1865,7 @@ impl Renderer {
         let next_idx = other_idx;
         ubo_ring.slot_head[next_idx] = ubo_ring.head;
         *frame_index = next_idx;
+        pipeline_cache.maybe_save(device);
         Ok(())
     }
 }

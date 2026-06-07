@@ -26,6 +26,9 @@ pub struct PipelineCache {
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
     pub layout: vk::PipelineLayout,
     pub vk_cache: vk::PipelineCache,
+    dirty: bool,
+    last_save: std::time::Instant,
+    save_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 impl PipelineCache {
@@ -71,11 +74,40 @@ impl PipelineCache {
         };
         log::info!("VkPipelineCache initialized ({} bytes from disk)", initial.len());
 
+        let (save_tx, save_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::Builder::new()
+            .name("nexium-pipecache".to_string())
+            .spawn(move || {
+                while let Ok(data) = save_rx.recv() {
+                    let Some(path) = pipeline_cache_path() else { continue; };
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let tmp = path.with_extension("tmp");
+                    if std::fs::write(&tmp, &data).is_ok() {
+                        let _ = std::fs::rename(&tmp, &path);
+                        log::info!("VkPipelineCache saved ({} bytes)", data.len());
+                    }
+                }
+            })
+            .ok();
+
         Ok(Self {
             pipelines: HashMap::new(),
             layout,
             vk_cache,
+            dirty: false,
+            last_save: std::time::Instant::now(),
+            save_tx: Some(save_tx),
         })
+    }
+
+    pub fn maybe_save(&mut self, device: &ash::Device) {
+        if self.dirty && self.last_save.elapsed() >= std::time::Duration::from_secs(4) {
+            self.save(device);
+            self.dirty = false;
+            self.last_save = std::time::Instant::now();
+        }
     }
 
     pub fn save(&self, device: &ash::Device) {
@@ -89,14 +121,8 @@ impl PipelineCache {
                 return;
             }
         };
-        if let Some(path) = pipeline_cache_path() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            match std::fs::write(&path, &data) {
-                Ok(_) => log::info!("VkPipelineCache saved ({} bytes)", data.len()),
-                Err(e) => log::warn!("VkPipelineCache save failed: {}", e),
-            }
+        if let Some(tx) = &self.save_tx {
+            let _ = tx.send(data);
         }
     }
 
@@ -106,6 +132,7 @@ impl PipelineCache {
 
     pub fn insert(&mut self, key: PipelineKey, pipeline: vk::Pipeline) {
         self.pipelines.insert(key, pipeline);
+        self.dirty = true;
     }
 
     pub fn clear(&mut self, device: &ash::Device) {
