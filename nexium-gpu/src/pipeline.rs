@@ -453,9 +453,31 @@ impl PipelineCache {
         let specs_disk_path = specs_path(device_tag);
         let specs: HashMap<PipelineKey, PipelineSpec> = specs_disk_path
             .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|bytes| bincode::deserialize::<SpecFile>(&bytes).ok())
-            .filter(|f| f.version == SPEC_VERSION)
+            .and_then(|p| {
+                let meta = std::fs::metadata(p).ok()?;
+                if meta.len() > 512 * 1024 * 1024 {
+                    log::warn!("shader specs file too large ({} bytes), ignoring", meta.len());
+                    return None;
+                }
+                match std::fs::read(p) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        log::warn!("shader specs read failed: {:?}", e);
+                        None
+                    }
+                }
+            })
+            .and_then(|bytes| match bincode::deserialize::<SpecFile>(&bytes) {
+                Ok(f) if f.version == SPEC_VERSION => Some(f),
+                Ok(f) => {
+                    log::warn!("shader specs version {} != {}, ignoring", f.version, SPEC_VERSION);
+                    None
+                }
+                Err(e) => {
+                    log::warn!("shader specs deserialize failed: {:?}", e);
+                    None
+                }
+            })
             .map(|f| f.specs.into_iter().map(|s| (s.key, s)).collect())
             .unwrap_or_default();
         let specs_count = specs.len();
@@ -708,6 +730,7 @@ impl PipelineCache {
             }
         }
         self.save(device);
+        self.save_specs();
         for (_, pipeline) in self.pipelines.drain() {
             unsafe {
                 device.destroy_pipeline(pipeline, None);
