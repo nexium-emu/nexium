@@ -3,6 +3,7 @@ use nexium_common::result::{SUCCESS, KERNEL_NOT_IMPLEMENTED, KERNEL_INVALID_ADDR
 use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
 use crate::kernel::AudioRendererState;
+use crate::kernel::audio_lut::NX_SRC_LUT_UP;
 use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
 use nexium_ipc as ipc;
 
@@ -1587,7 +1588,8 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
             voice_last_wb_index: Vec::new(),
             voice_is_new_seen: Vec::new(),
             voice_wb_progress_frames: Vec::new(),
-            voice_fraction: Vec::new(),
+            voice_frac_q15: Vec::new(),
+            voice_hist: Vec::new(),
         };
 
         let is_domain = kernel.sessions.get(&session_handle).map(|s| s.is_domain).unwrap_or(false);
@@ -1630,7 +1632,8 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
             voice_last_wb_index: Vec::new(),
             voice_is_new_seen: Vec::new(),
             voice_wb_progress_frames: Vec::new(),
-            voice_fraction: Vec::new(),
+            voice_frac_q15: Vec::new(),
+            voice_hist: Vec::new(),
         });
         match cmd_id {
             0 => {
@@ -1699,7 +1702,8 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                     st.voice_last_wb_index.resize(voice_count_seen, 0);
                     st.voice_is_new_seen.resize(voice_count_seen, false);
                     st.voice_wb_progress_frames.resize(voice_count_seen, 0);
-                    st.voice_fraction.resize(voice_count_seen, 0.0);
+                    st.voice_frac_q15.resize(voice_count_seen, 0);
+                    st.voice_hist.resize(voice_count_seen, [0.0f32; 6]);
                 }
 
                 const TARGET_FRAMES: usize = 240;
@@ -1877,7 +1881,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
 
                         let ch = channel_count as usize;
                         let ratio = sample_rate as f32 / TARGET_SR;
-                        let in_frames_needed = ((TARGET_FRAMES as f32) * ratio).ceil() as usize + 2;
+                        let in_frames_needed = ((TARGET_FRAMES as f32) * ratio).ceil() as usize + 3;
                         let wb_total_frames = (end_offset - start_offset) as usize;
                         let cursor = (st.voice_wb_progress_frames.get(vid).copied().unwrap_or(0)
                             as usize)
@@ -2007,36 +2011,41 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                             if got == 0 { continue; }
                         }
 
-                        let mut read_idx: usize = 0;
-                        let mut fraction: f32 = st
-                            .voice_fraction
-                            .get(vid)
-                            .copied()
-                            .unwrap_or(0.0);
+                        let phist = st.voice_hist.get(vid).copied().unwrap_or([0.0f32; 6]);
+                        let mut frac_q15: i32 = st.voice_frac_q15.get(vid).copied().unwrap_or(0);
+                        let step: i32 = ((sample_rate as f32 / TARGET_SR) * 32768.0) as i32;
                         let master = voice_drop_param.clamp(0.0, 4.0);
                         let gain = volume * master * 0.5;
+                        let smp_l = |i: isize| -> f32 {
+                            if i < 0 { phist[0] } else { pcm_l[(i as usize).min(in_frames - 1)] }
+                        };
+                        let smp_r = |i: isize| -> f32 {
+                            if i < 0 { phist[3] } else { pcm_r[(i as usize).min(in_frames - 1)] }
+                        };
+                        let mut read_idx: usize = 0;
                         for i in 0..TARGET_FRAMES {
-                            let idx_a = read_idx.min(in_frames - 1);
-                            let idx_b = (read_idx + 1).min(in_frames - 1);
-                            let frac = fraction;
-                            let inv = 1.0 - frac;
-                            out_stereo[i * 2]     += (pcm_l[idx_a] * inv + pcm_l[idx_b] * frac) * gain;
-                            out_stereo[i * 2 + 1] += (pcm_r[idx_a] * inv + pcm_r[idx_b] * frac) * gain;
-                            fraction += ratio;
-                            let whole = fraction.floor();
-                            read_idx += whole as usize;
-                            fraction -= whole;
-                            if read_idx >= in_frames {
-                                read_idx = in_frames - 1;
-                            }
-                            let _ = i;
+                            let p = ((frac_q15 >> 8) as usize & 127) * 4;
+                            let c0 = NX_SRC_LUT_UP[p];
+                            let c1 = NX_SRC_LUT_UP[p + 1];
+                            let c2 = NX_SRC_LUT_UP[p + 2];
+                            let c3 = NX_SRC_LUT_UP[p + 3];
+                            let bi = read_idx as isize;
+                            let ol = smp_l(bi - 1) * c0 + smp_l(bi) * c1 + smp_l(bi + 1) * c2 + smp_l(bi + 2) * c3;
+                            let orr = smp_r(bi - 1) * c0 + smp_r(bi) * c1 + smp_r(bi + 1) * c2 + smp_r(bi + 2) * c3;
+                            out_stereo[i * 2] += ol * gain;
+                            out_stereo[i * 2 + 1] += orr * gain;
+                            let no = frac_q15 + step;
+                            read_idx += (no >> 15) as usize;
+                            frac_q15 = no & 0x7fff;
                         }
-                        if let Some(slot) = st.voice_fraction.get_mut(vid) {
-                            *slot = fraction;
-                        }
+                        let consumed = read_idx.min(in_frames).saturating_sub(1).min(in_frames - 1);
+                        let mut nh = [0.0f32; 6];
+                        nh[0] = pcm_l[consumed];
+                        nh[3] = pcm_r[consumed];
+                        if let Some(h) = st.voice_hist.get_mut(vid) { *h = nh; }
+                        if let Some(f) = st.voice_frac_q15.get_mut(vid) { *f = frac_q15; }
 
-                        let src_frames_this_pass = (read_idx as u32)
-                            .saturating_add(if fraction >= 0.5 { 1 } else { 0 });
+                        let src_frames_this_pass = read_idx as u32;
                         voice_snapshot[vid].2 = true;
                         voice_snapshot[vid].3 = src_frames_this_pass;
                         voice_snapshot[vid].4 = wb_total_frames as u32;
@@ -2063,9 +2072,6 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                             is_new_latched[vid] = true;
                             if let Some(p) = st.voice_wb_progress_frames.get_mut(vid) {
                                 *p = 0;
-                            }
-                            if let Some(f) = st.voice_fraction.get_mut(vid) {
-                                *f = 0.0;
                             }
                         } else if did_mix && wb_total > 0 {
                             st.voice_played_samples[vid] = st

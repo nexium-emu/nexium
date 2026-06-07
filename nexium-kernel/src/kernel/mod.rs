@@ -7,6 +7,7 @@ pub mod handles;
 pub mod hid;
 pub mod session;
 pub mod cpu_context;
+pub mod audio_lut;
 
 use nexium_memory::AddressSpace;
 use nexium_nvdrv::Nvdrv;
@@ -125,7 +126,8 @@ pub struct AudioRendererState {
     pub voice_last_wb_index: Vec<u16>,
     pub voice_is_new_seen: Vec<bool>,
     pub voice_wb_progress_frames: Vec<u64>,
-    pub voice_fraction: Vec<f32>,
+    pub voice_frac_q15: Vec<i32>,
+    pub voice_hist: Vec<[f32; 6]>,
 }
 
 impl Kernel {
