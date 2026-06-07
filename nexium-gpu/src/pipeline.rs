@@ -268,7 +268,7 @@ pub fn build_graphics_pipeline(
 struct CompileWorker {
     req_tx: std::sync::mpsc::Sender<PipelineBuildRequest>,
     res_rx: std::sync::mpsc::Receiver<(PipelineKey, vk::Pipeline)>,
-    in_flight: std::collections::HashSet<PipelineKey>,
+    in_flight: std::collections::HashMap<PipelineKey, u32>,
     handles: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -397,7 +397,7 @@ impl PipelineCache {
             Some(CompileWorker {
                 req_tx,
                 res_rx,
-                in_flight: std::collections::HashSet::new(),
+                in_flight: std::collections::HashMap::new(),
                 handles,
             })
         };
@@ -415,7 +415,7 @@ impl PipelineCache {
         })
     }
 
-    pub fn drain_completed(&mut self) {
+    pub fn drain_completed(&mut self, device: &ash::Device) {
         let mut done: Vec<(PipelineKey, vk::Pipeline)> = Vec::new();
         if let Some(w) = self.worker.as_mut() {
             while let Ok(r) = w.res_rx.try_recv() {
@@ -424,21 +424,44 @@ impl PipelineCache {
             }
         }
         for (key, pipe) in done {
-            if pipe != vk::Pipeline::null() {
+            if pipe == vk::Pipeline::null() {
+                continue;
+            }
+            if self.pipelines.contains_key(&key) {
+                unsafe { device.destroy_pipeline(pipe, None); }
+            } else {
                 self.pipelines.insert(key, pipe);
                 self.dirty = true;
             }
         }
     }
 
-    pub fn request_async(&mut self, req: PipelineBuildRequest) {
-        if let Some(w) = self.worker.as_mut() {
-            if w.in_flight.contains(&req.key) {
-                return;
+    pub fn try_async_skip(
+        &mut self,
+        req: PipelineBuildRequest,
+        max_skip: u32,
+    ) -> Option<PipelineBuildRequest> {
+        let Some(w) = self.worker.as_mut() else {
+            return Some(req);
+        };
+        match w.in_flight.get_mut(&req.key) {
+            Some(count) => {
+                if *count >= max_skip {
+                    Some(req)
+                } else {
+                    *count += 1;
+                    None
+                }
             }
-            let key = req.key;
-            if w.req_tx.send(req).is_ok() {
-                w.in_flight.insert(key);
+            None => {
+                let key = req.key;
+                match w.req_tx.send(req) {
+                    Ok(()) => {
+                        w.in_flight.insert(key, 1);
+                        None
+                    }
+                    Err(e) => Some(e.0),
+                }
             }
         }
     }

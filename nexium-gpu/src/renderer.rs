@@ -754,12 +754,13 @@ impl Renderer {
             depth_state_packed,
             poly_offset_packed,
         };
-        inner.pipeline_cache.drain_completed();
-        if let Some(p) = inner.pipeline_cache.get(&key) {
-            return Ok(Some(p));
-        }
         let depth_clip_control_enabled = inner.depth_clip_control_enabled;
         let RendererInner { device, shader_compiler, pipeline_cache, .. } = &mut *inner;
+
+        pipeline_cache.drain_completed(device);
+        if let Some(p) = pipeline_cache.get(&key) {
+            return Ok(Some(p));
+        }
 
         let vs_mod = shader_compiler.compile_or_get(vs_spirv, device)?;
         let fs_mod = shader_compiler.compile_or_get(fs_spirv, device)?;
@@ -802,10 +803,14 @@ impl Renderer {
         };
 
         let safe_to_skip = has_depth || vertex_count > 6;
-        if nexium_common::async_compile::enabled() && safe_to_skip {
-            pipeline_cache.request_async(req);
-            return Ok(None);
-        }
+        let req = if nexium_common::async_compile::enabled() && safe_to_skip {
+            match pipeline_cache.try_async_skip(req, 2) {
+                None => return Ok(None),
+                Some(r) => r,
+            }
+        } else {
+            req
+        };
 
         let pipeline = pipeline_cache.build(device, &req)?;
         pipeline_cache.insert(key, pipeline);
