@@ -1,11 +1,10 @@
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 pub type RenderJob = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct RenderThread {
     tx: SyncSender<RenderJob>,
-    sent_textures: Mutex<std::collections::HashSet<u64>>,
 }
 
 impl RenderThread {
@@ -19,18 +18,11 @@ impl RenderThread {
                 }
             })
             .expect("spawn nexium-render thread");
-        RenderThread {
-            tx,
-            sent_textures: Mutex::new(std::collections::HashSet::new()),
-        }
+        RenderThread { tx }
     }
 
     pub fn submit(&self, job: RenderJob) {
         let _ = self.tx.send(job);
-    }
-
-    pub fn first_sight_texture(&self, gpu_va: u64) -> bool {
-        self.sent_textures.lock().unwrap().insert(gpu_va)
     }
 }
 

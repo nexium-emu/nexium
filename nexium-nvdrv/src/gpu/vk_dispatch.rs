@@ -167,10 +167,8 @@ fn submit_draw_batch_async(
                         } else {
                             pitch
                         };
-                        if rt.first_sight_texture(tic.gpu_va) {
-                            if let Some(d) = read_guest(tic.gpu_va, read_size) {
-                                snapshot.insert(tic.gpu_va, d);
-                            }
+                        if let Some(d) = read_guest(tic.gpu_va, read_size) {
+                            snapshot.insert(tic.gpu_va, d);
                         }
                     }
                     snapshot.insert(tic_addr, tic_raw);

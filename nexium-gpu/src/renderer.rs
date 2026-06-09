@@ -55,6 +55,7 @@ struct CachedTexture {
     image: vk::Image,
     view: vk::ImageView,
     memory: vk::DeviceMemory,
+    hash: u64,
 }
 
 struct StagingBuffer {
@@ -80,6 +81,7 @@ struct FrameSlot {
     in_flight: bool,
     retired_dsets: Vec<vk::DescriptorSet>,
     retired_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    retired_textures: Vec<CachedTexture>,
 }
 
 struct PendingReadback {
@@ -372,6 +374,7 @@ impl Renderer {
                 in_flight: false,
                 retired_dsets: Vec::new(),
                 retired_buffers: Vec::new(),
+                retired_textures: Vec::new(),
             },
             FrameSlot {
                 fence: fence_b,
@@ -379,6 +382,7 @@ impl Renderer {
                 in_flight: false,
                 retired_dsets: Vec::new(),
                 retired_buffers: Vec::new(),
+                retired_textures: Vec::new(),
             },
         ];
         let utility_slot = FrameSlot {
@@ -387,6 +391,7 @@ impl Renderer {
             in_flight: false,
             retired_dsets: Vec::new(),
             retired_buffers: Vec::new(),
+            retired_textures: Vec::new(),
         };
 
         let ubo_ring = create_ubo_ring(&device, &mem_props, 16 * 1024 * 1024)?;
@@ -1011,6 +1016,13 @@ impl Renderer {
                 for (b, m) in slot.retired_buffers.drain(..) {
                     unsafe { device.destroy_buffer(b, None); device.free_memory(m, None); }
                 }
+                for t in slot.retired_textures.drain(..) {
+                    unsafe {
+                        device.destroy_image_view(t.view, None);
+                        device.destroy_image(t.image, None);
+                        device.free_memory(t.memory, None);
+                    }
+                }
                 reset_command_buffer(device, slot.cmd)?;
                 slot.in_flight = false;
                 ubo_ring.head = ubo_ring.slot_head[cur_idx];
@@ -1049,8 +1061,11 @@ impl Renderer {
         let bound_tex_view: vk::ImageView = if let Some((key, tic, pitch_size, read_size)) =
             tex_pending
         {
-            if !tex_cache.contains_key(&key) {
-                if let Some(raw) = read_guest(tic.gpu_va, read_size) {
+            if let Some(raw) = read_guest(tic.gpu_va, read_size) {
+                let tex_hash = hash_src_prefix(&raw);
+                let need_upload =
+                    match tex_cache.get(&key) { Some(t) => t.hash != tex_hash, None => true };
+                if need_upload {
                     {
                         use std::collections::HashSet;
                         use std::sync::{Mutex, OnceLock};
@@ -1089,9 +1104,13 @@ impl Renderer {
                         tic.is_block_linear, tic.block_height_log2, read_size, rgba8.len()
                     );
                     match upload_texture_oneshot(
-                        device, *queue, *cmd_pool, mem_props, key.width, key.height, &rgba8,
+                        device, *queue, *cmd_pool, mem_props, key.width, key.height, &rgba8, tex_hash,
                     ) {
-                        Ok(tex) => { tex_cache.insert(key, tex); }
+                        Ok(tex) => {
+                            if let Some(old) = tex_cache.insert(key, tex) {
+                                frame_slots[cur_idx].retired_textures.push(old);
+                            }
+                        }
                         Err(e) => log::warn!("texture upload failed: {}", e),
                     }
                 }
@@ -1541,6 +1560,13 @@ impl Renderer {
                 for (b, m) in slot.retired_buffers.drain(..) {
                     unsafe { device.destroy_buffer(b, None); device.free_memory(m, None); }
                 }
+                for t in slot.retired_textures.drain(..) {
+                    unsafe {
+                        device.destroy_image_view(t.view, None);
+                        device.destroy_image(t.image, None);
+                        device.free_memory(t.memory, None);
+                    }
+                }
                 reset_command_buffer(device, slot.cmd)?;
                 slot.in_flight = false;
                 ubo_ring.head = ubo_ring.slot_head[cur_idx];
@@ -1600,8 +1626,11 @@ impl Renderer {
             }
 
             let bound_tex_view: vk::ImageView = if let Some((key, tic, pitch_size, read_size)) = prep.tex_pending {
-                if !tex_cache.contains_key(&key) {
-                    if let Some(raw) = read_guest(tic.gpu_va, read_size) {
+                if let Some(raw) = read_guest(tic.gpu_va, read_size) {
+                    let tex_hash = hash_src_prefix(&raw);
+                    let need_upload =
+                        match tex_cache.get(&key) { Some(t) => t.hash != tex_hash, None => true };
+                    if need_upload {
                         let bpp = tic.format.src_bpp();
                         let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH").map(|v| v == "1").unwrap_or(false);
                         let effective_block_linear =
@@ -1631,9 +1660,11 @@ impl Renderer {
                                 );
                             }
                         }
-                        match create_texture_image(device, cmd, mem_props, key.width, key.height, &rgba8) {
+                        match create_texture_image(device, cmd, mem_props, key.width, key.height, &rgba8, tex_hash) {
                             Ok((tex, sbuf, smem)) => {
-                                tex_cache.insert(key, tex);
+                                if let Some(old) = tex_cache.insert(key, tex) {
+                                    frame_slots[cur_idx].retired_textures.push(old);
+                                }
                                 frame_slots[cur_idx].retired_buffers.push((sbuf, smem));
                             }
                             Err(e) => log::warn!("texture upload failed: {}", e),
@@ -2003,10 +2034,11 @@ fn upload_texture_oneshot(
     width: u32,
     height: u32,
     rgba8: &[u8],
+    hash: u64,
 ) -> Result<CachedTexture, String> {
     let cmd = alloc_one_time_cmd(device, cmd_pool)?;
     begin_one_time(device, cmd)?;
-    let (tex, sbuf, smem) = create_texture_image(device, cmd, mem_props, width, height, rgba8)?;
+    let (tex, sbuf, smem) = create_texture_image(device, cmd, mem_props, width, height, rgba8, hash)?;
     end_one_time(device, cmd)?;
     submit_and_wait(device, queue, cmd)?;
     unsafe {
@@ -2024,6 +2056,7 @@ fn create_texture_image(
     width: u32,
     height: u32,
     rgba8: &[u8],
+    hash: u64,
 ) -> Result<(CachedTexture, vk::Buffer, vk::DeviceMemory), String> {
     let format = vk::Format::R8G8B8A8_UNORM;
     let img_info = vk::ImageCreateInfo {
@@ -2118,7 +2151,7 @@ fn create_texture_image(
         device.create_image_view(&view_info, None)
             .map_err(|e| format!("create_image_view(tex): {:?}", e))?
     };
-    Ok((CachedTexture { image, view, memory }, stage.buffer, stage.memory))
+    Ok((CachedTexture { image, view, memory, hash }, stage.buffer, stage.memory))
 }
 
 fn create_dummy_white_image(
@@ -2251,6 +2284,18 @@ fn hash_spirv(spirv: &[u32]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+fn hash_src_prefix(bytes: &[u8]) -> u64 {
+    const CAP: usize = 4096;
+    let n = bytes.len().min(CAP);
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in &bytes[..n] {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h ^= bytes.len() as u64;
+    h.wrapping_mul(0x100000001b3)
 }
 
 fn cache_contains(rt: &RtCache, key: RtKey) -> bool {
@@ -2646,6 +2691,13 @@ impl Drop for RendererInner {
         }
         for slot in self.frame_slots.iter_mut() {
             slot.retired_dsets.clear();
+            for t in slot.retired_textures.drain(..) {
+                unsafe {
+                    self.device.destroy_image_view(t.view, None);
+                    self.device.destroy_image(t.image, None);
+                    self.device.free_memory(t.memory, None);
+                }
+            }
             unsafe {
                 self.device.destroy_fence(slot.fence, None);
             }
