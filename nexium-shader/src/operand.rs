@@ -197,12 +197,18 @@ pub fn fadd_mods(insn: u64) -> FMods {
         abs_b: bits(insn, 49, 49) != 0,
         neg_c: false,
         sat: bits(insn, 50, 50) != 0,
+        scale: 0,
     }
 }
 
 #[inline]
 pub fn fmul_mods(insn: u64) -> FMods {
-    FMods { neg_b: bits(insn, 48, 48) != 0, sat: bits(insn, 50, 50) != 0, ..FMods::default() }
+    FMods {
+        neg_b: bits(insn, 48, 48) != 0,
+        sat: bits(insn, 50, 50) != 0,
+        scale: bits(insn, 39, 41) as u8,
+        ..FMods::default()
+    }
 }
 
 #[inline]
@@ -216,6 +222,110 @@ pub fn ffma_mods(insn: u64) -> FMods {
 }
 
 #[inline]
+pub fn fadd32i_mods(insn: u64) -> FMods {
+    FMods {
+        neg_a: bits(insn, 56, 56) != 0,
+        abs_a: bits(insn, 54, 54) != 0,
+        neg_b: bits(insn, 53, 53) != 0,
+        abs_b: bits(insn, 57, 57) != 0,
+        neg_c: false,
+        sat: false,
+        scale: 0,
+    }
+}
+
+#[inline]
+pub fn fmul32i_mods(insn: u64) -> FMods {
+    FMods {
+        sat: bits(insn, 55, 55) != 0,
+        ..FMods::default()
+    }
+}
+
+#[inline]
+pub fn ffma32i_mods(insn: u64) -> FMods {
+    FMods {
+        neg_a: bits(insn, 56, 56) != 0,
+        neg_c: bits(insn, 57, 57) != 0,
+        sat: bits(insn, 55, 55) != 0,
+        ..FMods::default()
+    }
+}
+
+pub struct F2fMods {
+    pub neg: bool,
+    pub abs: bool,
+    pub sat: bool,
+    pub round: u8,
+}
+
+#[inline]
+pub fn f2f_mods(insn: u64) -> F2fMods {
+    let src_size = bits(insn, 10, 11);
+    let dst_size = bits(insn, 8, 9);
+    let round = if src_size == dst_size {
+        match bits(insn, 39, 42) & 0x0B {
+            8 => 1,
+            9 => 2,
+            10 => 3,
+            11 => 4,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    F2fMods {
+        neg: bits(insn, 45, 45) != 0,
+        abs: bits(insn, 49, 49) != 0,
+        sat: bits(insn, 50, 50) != 0,
+        round,
+    }
+}
+
+#[inline]
+pub fn i2f_signed(insn: u64) -> bool { bits(insn, 13, 13) != 0 }
+#[inline]
+pub fn i2f_neg(insn: u64) -> bool { bits(insn, 45, 45) != 0 }
+#[inline]
+pub fn i2f_abs(insn: u64) -> bool { bits(insn, 49, 49) != 0 }
+#[inline]
+pub fn i2f_int_format(insn: u64) -> u8 { bits(insn, 10, 11) as u8 }
+#[inline]
+pub fn i2f_selector(insn: u64) -> u8 { bits(insn, 41, 42) as u8 }
+
+#[inline]
+pub fn fset_neg_a(insn: u64) -> bool { bits(insn, 43, 43) != 0 }
+#[inline]
+pub fn fset_abs_a(insn: u64) -> bool { bits(insn, 54, 54) != 0 }
+#[inline]
+pub fn fset_neg_b(insn: u64) -> bool { bits(insn, 53, 53) != 0 }
+#[inline]
+pub fn fset_abs_b(insn: u64) -> bool { bits(insn, 44, 44) != 0 }
+#[inline]
+pub fn fset_cmp(insn: u64) -> u64 { bits(insn, 48, 51) }
+#[inline]
+pub fn fset_bop(insn: u64) -> u64 { bits(insn, 45, 46) }
+#[inline]
+pub fn fset_src_pred(insn: u64) -> u8 { bits(insn, 39, 41) as u8 }
+#[inline]
+pub fn fset_src_pred_inv(insn: u64) -> bool { bits(insn, 42, 42) != 0 }
+
+#[inline]
+pub fn isetp_signed(insn: u64) -> bool { bits(insn, 48, 48) != 0 }
+#[inline]
+pub fn isetp_cmp(insn: u64) -> u64 { bits(insn, 49, 51) }
+#[inline]
+pub fn isetp_bop(insn: u64) -> u64 { bits(insn, 45, 46) }
+#[inline]
+pub fn isetp_src_pred(insn: u64) -> u8 { bits(insn, 39, 41) as u8 }
+#[inline]
+pub fn isetp_src_pred_inv(insn: u64) -> bool { bits(insn, 42, 42) != 0 }
+#[inline]
+pub fn isetp_dest_p(insn: u64) -> u8 { bits(insn, 3, 5) as u8 }
+#[inline]
+pub fn isetp_dest_np(insn: u64) -> u8 { bits(insn, 0, 2) as u8 }
+
+#[inline]
 pub fn fmnmx_mods(insn: u64) -> FMods {
     FMods {
         neg_a: bits(insn, 48, 48) != 0,
@@ -224,6 +334,7 @@ pub fn fmnmx_mods(insn: u64) -> FMods {
         abs_b: bits(insn, 49, 49) != 0,
         neg_c: false,
         sat: false,
+        scale: 0,
     }
 }
 

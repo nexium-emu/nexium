@@ -89,6 +89,24 @@ impl BoolOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ICmp { F, Lt, Eq, Le, Gt, Ne, Ge, T }
+
+impl ICmp {
+    pub fn from_bits(v: u64) -> Self {
+        match v & 0x7 {
+            0 => Self::F,
+            1 => Self::Lt,
+            2 => Self::Eq,
+            3 => Self::Le,
+            4 => Self::Gt,
+            5 => Self::Ne,
+            6 => Self::Ge,
+            _ => Self::T,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MufuFunc {
     Cos,
     Sin,
@@ -158,6 +176,7 @@ pub struct FMods {
     pub abs_b: bool,
     pub neg_c: bool,
     pub sat: bool,
+    pub scale: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -196,6 +215,48 @@ pub enum Op {
         abs_a: bool,
         neg_b: bool,
         abs_b: bool,
+        src_pred: u8,
+        src_pred_inv: bool,
+        dest_p: u8,
+        dest_np: u8,
+    },
+
+    F2F {
+        src: Value,
+        neg: bool,
+        abs: bool,
+        sat: bool,
+        round: u8,
+    },
+
+    I2F {
+        src: Value,
+        signed: bool,
+        neg: bool,
+        abs: bool,
+        int_format: u8,
+        selector: u8,
+    },
+
+    FSet {
+        cmp: FComp,
+        bop: BoolOp,
+        src_a: Value,
+        src_b: Value,
+        neg_a: bool,
+        abs_a: bool,
+        neg_b: bool,
+        abs_b: bool,
+        src_pred: u8,
+        src_pred_inv: bool,
+    },
+
+    ISetPred {
+        cmp: ICmp,
+        signed: bool,
+        bop: BoolOp,
+        src_a: Value,
+        src_b: Value,
         src_pred: u8,
         src_pred_inv: bool,
         dest_p: u8,
@@ -345,6 +406,14 @@ impl Inst {
             }
             Op::FSetPred { cmp, bop, src_a, src_b, dest_p, src_pred, .. } => {
                 write!(f, "FSetP.{cmp:?}.{bop:?} P{dest_p}, {src_a}, {src_b}, P{src_pred}")
+            }
+            Op::F2F { src, sat, round, .. } => write!(f, "F2F   {src} sat={sat} round={round}"),
+            Op::I2F { src, signed, .. } => write!(f, "I2F   {src} signed={signed}"),
+            Op::FSet { cmp, bop, src_a, src_b, .. } => {
+                write!(f, "FSet.{cmp:?}.{bop:?} {src_a}, {src_b}")
+            }
+            Op::ISetPred { cmp, bop, src_a, src_b, dest_p, .. } => {
+                write!(f, "ISetP.{cmp:?}.{bop:?} P{dest_p}, {src_a}, {src_b}")
             }
             Op::Kill => write!(f, "Kill"),
             Op::Exit => write!(f, "Exit"),

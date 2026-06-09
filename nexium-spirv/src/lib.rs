@@ -5,7 +5,7 @@ mod opt;
 use std::collections::HashMap;
 
 use nexium_shader::{
-    BasicBlock, BlockId, BoolOp, BranchKind, Cfg, FComp, IrInst, IrOp, IrValue, MufuFunc, ValueId,
+    BasicBlock, BlockId, BoolOp, BranchKind, Cfg, FComp, ICmp, IrInst, IrOp, IrValue, MufuFunc, ValueId,
 };
 use rspirv::binary::Assemble;
 use rspirv::dr::Operand;
@@ -33,6 +33,7 @@ pub struct Emitter {
     vec2_t: Word,
     vec4_t: Word,
     u32_t: Word,
+    i32_t: Word,
     ptr_uniform_f32: Word,
     ptr_input_vec4: Word,
     ptr_input_f32: Word,
@@ -86,6 +87,7 @@ impl Emitter {
         let vec2_t = b.type_vector(f32_t, 2);
         let vec4_t = b.type_vector(f32_t, 4);
         let u32_t = b.type_int(32, 0);
+        let i32_t = b.type_int(32, 1);
         let ptr_uniform_f32 = b.type_pointer(None, StorageClass::Uniform, f32_t);
         let ptr_input_vec4 = b.type_pointer(None, StorageClass::Input, vec4_t);
         let ptr_input_f32 = b.type_pointer(None, StorageClass::Input, f32_t);
@@ -137,6 +139,7 @@ impl Emitter {
             vec2_t,
             vec4_t,
             u32_t,
+            i32_t,
             ptr_uniform_f32,
             ptr_input_vec4,
             ptr_input_f32,
@@ -358,6 +361,72 @@ impl Emitter {
         self.b.store(ac, val, None, []).unwrap();
     }
 
+    fn lower_fcompare(&mut self, cmp: &FComp, va: Word, vb: Word) -> Word {
+        match cmp {
+            FComp::F   => self.bool_false,
+            FComp::T   => self.bool_true,
+            FComp::Lt  => self.b.f_ord_less_than(self.bool_t, None, va, vb).unwrap(),
+            FComp::Eq  => self.b.f_ord_equal(self.bool_t, None, va, vb).unwrap(),
+            FComp::Le  => self.b.f_ord_less_than_equal(self.bool_t, None, va, vb).unwrap(),
+            FComp::Gt  => self.b.f_ord_greater_than(self.bool_t, None, va, vb).unwrap(),
+            FComp::Ne  => self.b.f_ord_not_equal(self.bool_t, None, va, vb).unwrap(),
+            FComp::Ge  => self.b.f_ord_greater_than_equal(self.bool_t, None, va, vb).unwrap(),
+            FComp::Num => self.b.ordered(self.bool_t, None, va, vb).unwrap(),
+            FComp::Nan => self.b.unordered(self.bool_t, None, va, vb).unwrap(),
+            FComp::Ltu => self.b.f_unord_less_than(self.bool_t, None, va, vb).unwrap(),
+            FComp::Equ => self.b.f_unord_equal(self.bool_t, None, va, vb).unwrap(),
+            FComp::Leu => self.b.f_unord_less_than_equal(self.bool_t, None, va, vb).unwrap(),
+            FComp::Gtu => self.b.f_unord_greater_than(self.bool_t, None, va, vb).unwrap(),
+            FComp::Neu => self.b.f_unord_not_equal(self.bool_t, None, va, vb).unwrap(),
+            FComp::Geu => self.b.f_unord_greater_than_equal(self.bool_t, None, va, vb).unwrap(),
+        }
+    }
+
+    fn as_i32(&mut self, w: Word) -> Word {
+        self.b.bitcast(self.i32_t, None, w).unwrap()
+    }
+
+    fn lower_icompare(&mut self, cmp: &ICmp, signed: bool, a_u: Word, b_u: Word) -> Word {
+        match cmp {
+            ICmp::F => self.bool_false,
+            ICmp::T => self.bool_true,
+            ICmp::Eq => self.b.i_equal(self.bool_t, None, a_u, b_u).unwrap(),
+            ICmp::Ne => self.b.i_not_equal(self.bool_t, None, a_u, b_u).unwrap(),
+            ICmp::Lt => {
+                if signed {
+                    let (a, b) = (self.as_i32(a_u), self.as_i32(b_u));
+                    self.b.s_less_than(self.bool_t, None, a, b).unwrap()
+                } else {
+                    self.b.u_less_than(self.bool_t, None, a_u, b_u).unwrap()
+                }
+            }
+            ICmp::Le => {
+                if signed {
+                    let (a, b) = (self.as_i32(a_u), self.as_i32(b_u));
+                    self.b.s_less_than_equal(self.bool_t, None, a, b).unwrap()
+                } else {
+                    self.b.u_less_than_equal(self.bool_t, None, a_u, b_u).unwrap()
+                }
+            }
+            ICmp::Gt => {
+                if signed {
+                    let (a, b) = (self.as_i32(a_u), self.as_i32(b_u));
+                    self.b.s_greater_than(self.bool_t, None, a, b).unwrap()
+                } else {
+                    self.b.u_greater_than(self.bool_t, None, a_u, b_u).unwrap()
+                }
+            }
+            ICmp::Ge => {
+                if signed {
+                    let (a, b) = (self.as_i32(a_u), self.as_i32(b_u));
+                    self.b.s_greater_than_equal(self.bool_t, None, a, b).unwrap()
+                } else {
+                    self.b.u_greater_than_equal(self.bool_t, None, a_u, b_u).unwrap()
+                }
+            }
+        }
+    }
+
     fn lower_op(&mut self, inst: &IrInst) {
         let result = inst.result;
         let word = match &inst.op {
@@ -367,7 +436,17 @@ impl Emitter {
                 let bv = self.lower_value(b);
                 let av = self.apply_neg_abs(av, mods.neg_a, mods.abs_a);
                 let bv = self.apply_neg_abs(bv, mods.neg_b, mods.abs_b);
-                let r = self.b.f_mul(self.f32_t, None, av, bv).unwrap();
+                let mut r = self.b.f_mul(self.f32_t, None, av, bv).unwrap();
+                if mods.scale != 0 {
+                    let exp = if mods.scale < 4 { mods.scale as i32 } else { mods.scale as i32 - 8 };
+                    let factor = 2.0f32.powi(exp);
+                    static FMUL_SCALE_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if FMUL_SCALE_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                        log::warn!("[fmul-scale] applying field={} factor={}", mods.scale, factor);
+                    }
+                    let fc = self.const_f32(factor.to_bits());
+                    r = self.b.f_mul(self.f32_t, None, r, fc).unwrap();
+                }
                 Some(self.apply_sat(r, mods.sat))
             }
             IrOp::FAdd { a, b, mods } => {
@@ -523,11 +602,16 @@ impl Emitter {
                         [Operand::IdRef(lod_zero)],
                     )
                     .unwrap();
-                Some(
-                    self.b
-                        .composite_extract(self.f32_t, None, sampled, [*component as u32])
-                        .unwrap_or(self.f32_zero),
-                )
+                let c = self
+                    .b
+                    .composite_extract(self.f32_t, None, sampled, [*component as u32])
+                    .unwrap_or(self.f32_zero);
+                if std::env::var("NEXIUM_TEX_2X").is_ok() {
+                    let two = self.const_f32(2.0f32.to_bits());
+                    Some(self.b.f_mul(self.f32_t, None, c, two).unwrap())
+                } else {
+                    Some(c)
+                }
             }
             IrOp::FSetPred {
                 cmp, bop, src_a, src_b,
@@ -584,6 +668,107 @@ impl Emitter {
                     let bt = self.bool_t;
                     let inv = self.b.logical_not(bt, None, combined).unwrap();
                     self.pred_regs[*dest_np as usize] = Some(inv);
+                }
+                Some(combined)
+            }
+
+            IrOp::F2F { src, neg, abs, sat, round } => {
+                let v = self.lower_value(src);
+                let v = self.apply_neg_abs(v, *neg, *abs);
+                let v = match *round {
+                    1 => self.b.ext_inst(self.f32_t, None, self.glsl, 2, [Operand::IdRef(v)]).unwrap(),
+                    2 => self.b.ext_inst(self.f32_t, None, self.glsl, 8, [Operand::IdRef(v)]).unwrap(),
+                    3 => self.b.ext_inst(self.f32_t, None, self.glsl, 9, [Operand::IdRef(v)]).unwrap(),
+                    4 => self.b.ext_inst(self.f32_t, None, self.glsl, 3, [Operand::IdRef(v)]).unwrap(),
+                    _ => v,
+                };
+                Some(self.apply_sat(v, *sat))
+            }
+            IrOp::I2F { src, signed, neg, abs, int_format, selector } => {
+                let f = self.lower_value(src);
+                let bits_u = self.b.bitcast(self.u32_t, None, f).unwrap();
+                let extracted = match *int_format {
+                    0 => {
+                        let off = self.const_u32((*selector as u32) * 8);
+                        let cnt = self.const_u32(8);
+                        if *signed {
+                            self.b.bit_field_s_extract(self.u32_t, None, bits_u, off, cnt).unwrap()
+                        } else {
+                            self.b.bit_field_u_extract(self.u32_t, None, bits_u, off, cnt).unwrap()
+                        }
+                    }
+                    1 => {
+                        let off = self.const_u32((*selector as u32) * 8);
+                        let cnt = self.const_u32(16);
+                        if *signed {
+                            self.b.bit_field_s_extract(self.u32_t, None, bits_u, off, cnt).unwrap()
+                        } else {
+                            self.b.bit_field_u_extract(self.u32_t, None, bits_u, off, cnt).unwrap()
+                        }
+                    }
+                    _ => bits_u,
+                };
+                let mut val = if *signed {
+                    let as_i = self.b.bitcast(self.i32_t, None, extracted).unwrap();
+                    self.b.convert_s_to_f(self.f32_t, None, as_i).unwrap()
+                } else {
+                    self.b.convert_u_to_f(self.f32_t, None, extracted).unwrap()
+                };
+                if *abs {
+                    val = self.b.ext_inst(self.f32_t, None, self.glsl, 4, [Operand::IdRef(val)]).unwrap();
+                }
+                if *neg {
+                    let n = self.const_f32((-1.0f32).to_bits());
+                    val = self.b.f_mul(self.f32_t, None, val, n).unwrap();
+                }
+                Some(val)
+            }
+            IrOp::FSet {
+                cmp, bop, src_a, src_b,
+                neg_a, abs_a, neg_b, abs_b,
+                src_pred, src_pred_inv,
+            } => {
+                let va = self.lower_value(src_a);
+                let vb = self.lower_value(src_b);
+                let va = self.apply_neg_abs(va, *neg_a, *abs_a);
+                let vb = self.apply_neg_abs(vb, *neg_b, *abs_b);
+                let cmp_result = self.lower_fcompare(cmp, va, vb);
+                let src_p_word = self.resolve_pred(*src_pred, *src_pred_inv);
+                let combined = match bop {
+                    BoolOp::And => self.b.logical_and(self.bool_t, None, cmp_result, src_p_word).unwrap(),
+                    BoolOp::Or  => self.b.logical_or(self.bool_t, None, cmp_result, src_p_word).unwrap(),
+                    BoolOp::Xor => self.b.logical_not_equal(self.bool_t, None, cmp_result, src_p_word).unwrap(),
+                };
+                let one = self.f32_one;
+                let zero = self.f32_zero;
+                Some(self.b.select(self.f32_t, None, combined, one, zero).unwrap())
+            }
+            IrOp::ISetPred {
+                cmp, signed, bop, src_a, src_b,
+                src_pred, src_pred_inv, dest_p, dest_np,
+            } => {
+                let fa = self.lower_value(src_a);
+                let fb = self.lower_value(src_b);
+                let a_u = self.b.bitcast(self.u32_t, None, fa).unwrap();
+                let b_u = self.b.bitcast(self.u32_t, None, fb).unwrap();
+                let cmp_result = self.lower_icompare(cmp, *signed, a_u, b_u);
+                let src_p_word = self.resolve_pred(*src_pred, *src_pred_inv);
+                let combined = match bop {
+                    BoolOp::And => self.b.logical_and(self.bool_t, None, cmp_result, src_p_word).unwrap(),
+                    BoolOp::Or  => self.b.logical_or(self.bool_t, None, cmp_result, src_p_word).unwrap(),
+                    BoolOp::Xor => self.b.logical_not_equal(self.bool_t, None, cmp_result, src_p_word).unwrap(),
+                };
+                if *dest_p < 7 {
+                    self.pred_regs[*dest_p as usize] = Some(combined);
+                }
+                if *dest_np < 7 {
+                    let not_cmp = self.b.logical_not(self.bool_t, None, cmp_result).unwrap();
+                    let combined_np = match bop {
+                        BoolOp::And => self.b.logical_and(self.bool_t, None, not_cmp, src_p_word).unwrap(),
+                        BoolOp::Or  => self.b.logical_or(self.bool_t, None, not_cmp, src_p_word).unwrap(),
+                        BoolOp::Xor => self.b.logical_not_equal(self.bool_t, None, not_cmp, src_p_word).unwrap(),
+                    };
+                    self.pred_regs[*dest_np as usize] = Some(combined_np);
                 }
                 Some(combined)
             }
@@ -915,10 +1100,18 @@ impl Emitter {
                         None => defaults[r],
                     }
                 });
-                let v = self
+                let mut v = self
                     .b
                     .composite_construct(self.vec4_t, None, chans)
                     .unwrap();
+                if std::env::var("NEXIUM_FRAG_2X").is_ok() {
+                    let two = self.const_f32(2.0f32.to_bits());
+                    let two_vec = self
+                        .b
+                        .composite_construct(self.vec4_t, None, [two, two, two, two])
+                        .unwrap();
+                    v = self.b.f_mul(self.vec4_t, None, v, two_vec).unwrap();
+                }
                 let fc = self.frag_color_var_id();
                 self.b.store(fc, v, None, []).unwrap();
             }

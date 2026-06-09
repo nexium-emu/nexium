@@ -2,13 +2,19 @@
 
 use std::collections::HashMap;
 
-use super::ir::{BoolOp, FComp, MufuFunc, Op, Predicate, Program, Value, ValueId};
+use super::ir::{BoolOp, FComp, ICmp, MufuFunc, Op, Predicate, Program, Value, ValueId};
 use super::operand::{
     ald_num_elements, attr_slot_ald, attr_slot_ipa, cbuf, decoded_pred, imm20, imm32,
     ldc_ref, ldc_size, ldc_src_reg, mufu_func_bits, reg_a, reg_b, reg_c, reg_dest,
     texs_tex_id, fsetp_dest_p, fsetp_dest_np, fsetp_src_pred, fsetp_src_pred_inv,
     fsetp_bop, fsetp_cmp, fsetp_neg_a, fsetp_abs_a, fsetp_neg_b, fsetp_abs_b, RZ,
     fadd_mods, fmul_mods, ffma_mods, fmnmx_mods, fmnmx_is_min, float_imm20,
+    fadd32i_mods, fmul32i_mods, ffma32i_mods,
+    f2f_mods, i2f_signed, i2f_neg, i2f_abs, i2f_int_format, i2f_selector,
+    fset_neg_a, fset_abs_a, fset_neg_b, fset_abs_b, fset_cmp, fset_bop,
+    fset_src_pred, fset_src_pred_inv,
+    isetp_signed, isetp_cmp, isetp_bop, isetp_src_pred, isetp_src_pred_inv,
+    isetp_dest_p, isetp_dest_np,
 };
 use super::decode::decode_one; use super::opcodes::Opcode;
 
@@ -79,6 +85,77 @@ impl Translator {
             Op::LoadCbuf { binding: r.binding, byte_offset: r.byte_offset as u32 },
             None,
         )
+    }
+
+    fn emit_f2f(&mut self, raw: u64, src: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let m = f2f_mods(raw);
+        self.write_reg(
+            dest,
+            Op::F2F { src, neg: m.neg, abs: m.abs, sat: m.sat, round: m.round },
+            pred,
+        );
+    }
+
+    fn emit_i2f(&mut self, raw: u64, src: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        self.write_reg(
+            dest,
+            Op::I2F {
+                src,
+                signed: i2f_signed(raw),
+                neg: i2f_neg(raw),
+                abs: i2f_abs(raw),
+                int_format: i2f_int_format(raw),
+                selector: i2f_selector(raw),
+            },
+            pred,
+        );
+    }
+
+    fn emit_fset(&mut self, raw: u64, src_b: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let src_a = self.read_reg(reg_a(raw));
+        self.write_reg(
+            dest,
+            Op::FSet {
+                cmp: FComp::from_bits(fset_cmp(raw)),
+                bop: BoolOp::from_bits(fset_bop(raw)),
+                src_a,
+                src_b,
+                neg_a: fset_neg_a(raw),
+                abs_a: fset_abs_a(raw),
+                neg_b: fset_neg_b(raw),
+                abs_b: fset_abs_b(raw),
+                src_pred: fset_src_pred(raw),
+                src_pred_inv: fset_src_pred_inv(raw),
+            },
+            pred,
+        );
+    }
+
+    fn emit_isetp(&mut self, raw: u64, src_b: Value, pred: Option<Predicate>) {
+        let src_a = self.read_reg(reg_a(raw));
+        let dest_p = isetp_dest_p(raw);
+        let dest_np = isetp_dest_np(raw);
+        let op = Op::ISetPred {
+            cmp: ICmp::from_bits(isetp_cmp(raw)),
+            signed: isetp_signed(raw),
+            bop: BoolOp::from_bits(isetp_bop(raw)),
+            src_a,
+            src_b,
+            src_pred: isetp_src_pred(raw),
+            src_pred_inv: isetp_src_pred_inv(raw),
+            dest_p,
+            dest_np,
+        };
+        let id = self.program.emit_pred(op, None, pred);
+        if dest_p != PT {
+            self.pred_state.insert(dest_p, id);
+        }
+        if dest_np != PT {
+            self.pred_state.insert(dest_np, id);
+        }
     }
 
     pub fn translate(&mut self, raw: u64) -> bool {
@@ -208,6 +285,62 @@ impl Translator {
                     pred,
                 );
             }
+
+            Opcode::FADD32I => {
+                let dest = reg_dest(raw);
+                let a = self.read_reg(reg_a(raw));
+                self.write_reg(
+                    dest,
+                    Op::FAdd { a, b: Value::ImmF32(f32::from_bits(imm32(raw))), mods: fadd32i_mods(raw) },
+                    pred,
+                );
+            }
+            Opcode::FMUL32I => {
+                let dest = reg_dest(raw);
+                let a = self.read_reg(reg_a(raw));
+                self.write_reg(
+                    dest,
+                    Op::FMul { a, b: Value::ImmF32(f32::from_bits(imm32(raw))), mods: fmul32i_mods(raw) },
+                    pred,
+                );
+            }
+            Opcode::FFMA32I => {
+                let dest = reg_dest(raw);
+                let a = self.read_reg(reg_a(raw));
+                let c = self.read_reg(dest);
+                self.write_reg(
+                    dest,
+                    Op::FFma { a, b: Value::ImmF32(f32::from_bits(imm32(raw))), c, mods: ffma32i_mods(raw) },
+                    pred,
+                );
+            }
+
+            Opcode::F2F_reg => { let s = self.read_reg(reg_b(raw)); self.emit_f2f(raw, s, pred); }
+            Opcode::F2F_cbuf => { let cb = self.load_cbuf(raw); self.emit_f2f(raw, Value::Inst(cb), pred); }
+            Opcode::F2F_imm => { self.emit_f2f(raw, Value::ImmF32(float_imm20(raw)), pred); }
+
+            Opcode::RRO_reg => {
+                let s = self.read_reg(reg_b(raw));
+                self.write_reg(reg_dest(raw), Op::F2F { src: s, neg: i2f_neg(raw), abs: i2f_abs(raw), sat: false, round: 0 }, pred);
+            }
+            Opcode::RRO_cbuf => {
+                let cb = self.load_cbuf(raw);
+                self.write_reg(reg_dest(raw), Op::F2F { src: Value::Inst(cb), neg: i2f_neg(raw), abs: i2f_abs(raw), sat: false, round: 0 }, pred);
+            }
+
+            Opcode::I2F_reg => { let s = self.read_reg(reg_b(raw)); self.emit_i2f(raw, s, pred); }
+            Opcode::I2F_cbuf => { let cb = self.load_cbuf(raw); self.emit_i2f(raw, Value::Inst(cb), pred); }
+            Opcode::I2F_imm => { self.emit_i2f(raw, Value::ImmU32(imm20(raw) as u32), pred); }
+
+            Opcode::FSET_reg => { let b = self.read_reg(reg_b(raw)); self.emit_fset(raw, b, pred); }
+            Opcode::FSET_cbuf => { let cb = self.load_cbuf(raw); self.emit_fset(raw, Value::Inst(cb), pred); }
+            Opcode::FSET_imm => { self.emit_fset(raw, Value::ImmF32(float_imm20(raw)), pred); }
+
+            Opcode::ISETP_reg => { let b = self.read_reg(reg_b(raw)); self.emit_isetp(raw, b, pred); }
+            Opcode::ISETP_cbuf => { let cb = self.load_cbuf(raw); self.emit_isetp(raw, Value::Inst(cb), pred); }
+            Opcode::ISETP_imm => { self.emit_isetp(raw, Value::ImmU32(imm20(raw) as u32), pred); }
+
+            Opcode::SSY | Opcode::SYNC => {}
 
             Opcode::FMNMX_reg => {
                 let dest = reg_dest(raw);

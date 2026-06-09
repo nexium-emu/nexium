@@ -14,7 +14,7 @@ pub use cfg::{build_cfg, BasicBlock, BlockId, BranchKind, Cfg};
 pub use decode::{decode_one, Decoded};
 pub use disasm::{disassemble, DisasmKind, DisasmLine};
 pub use ir::{
-    BoolOp, FComp, Inst as IrInst, MufuFunc, Op as IrOp, Predicate, Program as IrProgram,
+    BoolOp, FComp, ICmp, Inst as IrInst, MufuFunc, Op as IrOp, Predicate, Program as IrProgram,
     Value as IrValue, ValueId,
 };
 pub use opcodes::{Opcode, OPCODE_TABLE};
