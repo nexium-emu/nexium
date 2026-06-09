@@ -364,6 +364,21 @@ fn execute_one(
                 fs_tex_ids,
             });
             guard.insert(shader_key, b.clone());
+            if std::env::var_os("NEXIUM_PROBE_SHADE").is_some() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static DN: AtomicU32 = AtomicU32::new(0);
+                let dk = DN.fetch_add(1, Ordering::Relaxed);
+                if dk < 24 {
+                    let vb: Vec<u8> = b.vs_spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    let fb: Vec<u8> = b.fs_spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    let _ = std::fs::write(format!("C:/Users/Mythrax/Desktop/sh_{}_vs.spv", dk), &vb);
+                    let _ = std::fs::write(format!("C:/Users/Mythrax/Desktop/sh_{}_fs.spv", dk), &fb);
+                    log::warn!(
+                        "[shdump] #{} vs_mask={:#x} fs_mask={:#x} vs_bytes={} fs_bytes={} ntex={}",
+                        dk, b.vs_cbuf_mask, b.fs_cbuf_mask, b.vs_spirv.len(), b.fs_spirv.len(), b.fs_tex_ids.len()
+                    );
+                }
+            }
             b
         }
     };
@@ -378,6 +393,28 @@ fn execute_one(
         .ok_or_else(|| format!("unsupported topology {}", draw.topology))?;
 
     let (cbuf_addr, cbuf_size) = resolve_cbuf(draw, &maxwell.regs.cbuf_binds);
+
+    if std::env::var_os("NEXIUM_PROBE_SHADE").is_some() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed);
+        if k % 2000 == 0 {
+            let stage = |s: usize| -> String {
+                maxwell.regs.cbuf_binds[s]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (a, sz))| *a != 0 && *sz > 0)
+                    .map(|(i, (a, sz))| format!("[{}]={:#x}/{}", i, a, sz))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            log::warn!(
+                "[cbuf] draw{} vs_mask={:#x} fs_mask={:#x} resolved={:#x}/{} last_cb={:#x}/{} | VS:{} | FS:{}",
+                k, vs_cbuf_mask, fs_cbuf_mask, cbuf_addr, cbuf_size,
+                draw.last_constbuf_addr, draw.last_constbuf_size, stage(0), stage(4)
+            );
+        }
+    }
 
     log::trace!(
         "cbuf_resolve: addr={:#x} size={} cb_binds_nonzero={}",
@@ -441,6 +478,58 @@ fn execute_one(
     let vertex_addr = first_vertex_buffer_address(&draw.vertex_buffers, &layout)
         .ok_or_else(|| "no vertex buffer bound".to_string())?;
 
+    if std::env::var_os("NEXIUM_PROBE_SHADE").is_some() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed);
+        if k % 1500 == 0 && layout.attrs.len() >= 5 {
+            let vcpu = mappings.cpu_address_for(vertex_addr).unwrap_or(0);
+            if vcpu != 0 {
+                for a in &layout.attrs {
+                    let stride = layout
+                        .bindings
+                        .iter()
+                        .find(|b| b.binding == a.binding)
+                        .map(|b| b.stride as u64)
+                        .unwrap_or(0);
+                    if stride == 0 {
+                        continue;
+                    }
+                    let mut mx = [0f32; 4];
+                    for vi in 0..96u64 {
+                        let mut buf = [0u8; 16];
+                        if mem_read(vcpu + a.offset as u64 + vi * stride, &mut buf) {
+                            for c in 0..4 {
+                                let f = f32::from_le_bytes([
+                                    buf[c * 4], buf[c * 4 + 1], buf[c * 4 + 2], buf[c * 4 + 3],
+                                ]);
+                                if f.is_finite() && f.abs() <= 4.0 && f > mx[c] {
+                                    mx[c] = f;
+                                }
+                            }
+                        }
+                    }
+                    log::warn!(
+                        "[shade] draw{} nattr={} loc={} fmt={:?} off={} maxRGBA=[{:.3} {:.3} {:.3} {:.3}]",
+                        k, layout.attrs.len(), a.location, a.format, a.offset, mx[0], mx[1], mx[2], mx[3]
+                    );
+                }
+                let vstride = layout.bindings.iter().map(|b| b.stride).max().unwrap_or(0) as usize;
+                let n = vstride.min(80);
+                if n >= 4 {
+                    let mut raw = vec![0u8; n];
+                    if mem_read(vcpu, &mut raw) {
+                        let floats: Vec<String> = raw
+                            .chunks_exact(4)
+                            .map(|c| format!("{:.3}", f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                            .collect();
+                        log::warn!("[vraw] draw{} stride={} v0=[{}]", k, vstride, floats.join(" "));
+                    }
+                }
+            }
+        }
+    }
+
     let depth_test = !no_depth && draw.depth_test_enable && draw.zeta_enable;
     let depth_write = !no_depth && draw.depth_write_enable && draw.zeta_enable;
     let depth_key = if depth_test || depth_write { Some(rt_key) } else { None };
@@ -460,6 +549,15 @@ fn execute_one(
         }
     }
 
+    let (uni_cbuf_addr, uni_cbuf_size) = {
+        let (a, s) = resolve_vs_cbuf(&maxwell.regs.cbuf_binds);
+        if a != 0 && std::env::var_os("NEXIUM_VS_CBUF").is_some() {
+            (a, s)
+        } else {
+            (cbuf_addr, cbuf_size)
+        }
+    };
+
     let call = Maxwell3dDrawCall {
         vs_spirv,
         fs_spirv,
@@ -467,8 +565,8 @@ fn execute_one(
         fs_cbuf_mask,
         fs_tex_ids,
         vertex_layout: layout,
-        cbuf_addr,
-        cbuf_size,
+        cbuf_addr: uni_cbuf_addr,
+        cbuf_size: uni_cbuf_size,
         vertex_addr,
         vertex_count: draw.vertex_count,
         index_addr: None,
@@ -483,7 +581,7 @@ fn execute_one(
             indexed: false,
         },
         blend: BlendState {
-            enabled: maxwell.regs.blend_enable[0],
+            enabled: maxwell.regs.blend_enable[0] && std::env::var("NEXIUM_NO_BLEND").is_err(),
             src_factor: map_blend_factor(maxwell.regs.blend_src_rgb),
             dst_factor: map_blend_factor(maxwell.regs.blend_dst_rgb),
             op: map_blend_op(maxwell.regs.blend_eq_rgb),
@@ -597,8 +695,41 @@ fn build_vertex_layout(draw: &DrawCall) -> Result<VertexLayout, String> {
     let mut attrs: Vec<VertexAttr> = Vec::new();
     let mut seen_bindings: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
+    if std::env::var_os("NEXIUM_PROBE_SHADE").is_some() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed);
+        let nenabled = draw.vertex_attribs.iter().filter(|a| a.format != 0).count();
+        if k % 1500 == 0 && nenabled >= 5 {
+            for (loc, a) in draw.vertex_attribs.iter().enumerate() {
+                if a.format != 0 {
+                    log::warn!(
+                        "[vattr] draw{} loc={} buf={} off={} fmt={:#x} constant={}",
+                        k, loc, a.buffer, a.offset, a.format, a.constant
+                    );
+                }
+            }
+        }
+    }
+
+    let skip_const = std::env::var_os("NEXIUM_SKIP_CONST_ATTR").is_some();
+    const WHITE_BINDING: u32 = 15;
+    let mut need_white = false;
     for (loc, attrib) in draw.vertex_attribs.iter().enumerate() {
         if attrib.format == 0 {
+            continue;
+        }
+        if attrib.constant {
+            if skip_const {
+                continue;
+            }
+            need_white = true;
+            attrs.push(VertexAttr {
+                location: loc as u32,
+                binding: WHITE_BINDING,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 0,
+            });
             continue;
         }
         let format = map_attrib_format(attrib.format)
@@ -626,6 +757,12 @@ fn build_vertex_layout(draw: &DrawCall) -> Result<VertexLayout, String> {
 
     if attrs.is_empty() {
         return Err("no enabled vertex attributes".to_string());
+    }
+    if need_white {
+        bindings.push(VertexBinding {
+            binding: WHITE_BINDING,
+            stride: 0,
+        });
     }
     Ok(VertexLayout { bindings, attrs })
 }
@@ -742,6 +879,15 @@ fn resolve_cbuf(
             if addr != 0 && size > 0 {
                 return (addr, size);
             }
+        }
+    }
+    (0, 0)
+}
+
+fn resolve_vs_cbuf(cbuf_binds: &[[(u64, u32); 16]; 5]) -> (u64, u32) {
+    for &(addr, size) in cbuf_binds[0].iter().rev() {
+        if addr != 0 && size > 0 {
+            return (addr, size);
         }
     }
     (0, 0)

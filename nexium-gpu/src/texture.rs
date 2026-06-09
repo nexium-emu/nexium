@@ -328,5 +328,23 @@ pub fn decode_to_rgba8(
         }
     }
 
+    if std::env::var_os("NEXIUM_PROBE_SHADE").is_some() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed);
+        if k < 400 {
+            let (mut mr, mut mg, mut mb) = (0u8, 0u8, 0u8);
+            for px in out.chunks_exact(4) {
+                mr = mr.max(px[0]);
+                mg = mg.max(px[1]);
+                mb = mb.max(px[2]);
+            }
+            log::warn!(
+                "[texdecode] #{} {:?} {}x{} maxR={} maxG={} maxB={}",
+                k, format, width, height, mr, mg, mb
+            );
+        }
+    }
+
     out
 }

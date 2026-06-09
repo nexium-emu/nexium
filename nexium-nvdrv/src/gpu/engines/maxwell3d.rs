@@ -49,6 +49,7 @@ pub struct VertexAttribute {
     pub buffer: u32,
     pub offset: u32,
     pub format: u32,
+    pub constant: bool,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -621,6 +622,7 @@ impl Maxwell3D {
                 if idx < 32 {
                     let va = &mut self.regs.vertex_attribs[idx];
                     va.buffer = arg & 0x1F;
+                    va.constant = (arg >> 6) & 1 != 0;
                     va.offset = (arg >> 7) & 0x3FFF;
                     let size = (arg >> 21) & 0x3F;
                     let r#type = (arg >> 27) & 0x7;

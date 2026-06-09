@@ -1134,6 +1134,19 @@ impl Renderer {
             None
         };
 
+        let white_bind: Option<(u32, vk::Buffer, u64)> =
+            if let Some(wb) = call.vertex_layout.bindings.iter().find(|b| b.stride == 0) {
+                let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 16, 16)
+                    .map_err(|e| format!("ring_alloc(const_attr): {}", e))?;
+                unsafe {
+                    let const_default = [0.0f32, 0.0, 0.0, 1.0];
+                    std::ptr::copy_nonoverlapping(const_default.as_ptr() as *const u8, wptr, 16);
+                }
+                Some((wb.binding, wbuf, woff))
+            } else {
+                None
+            };
+
         let cbuf_size_aligned = align_up(cbuf_data.len() as u64, ubo_alignment);
         {
             let v_size = if !vertex_data.is_empty() {
@@ -1369,6 +1382,9 @@ impl Renderer {
             );
             if let Some((vbuf, voff)) = vertex_bind {
                 device.cmd_bind_vertex_buffers(cmd, 0, &[vbuf], &[voff]);
+            }
+            if let Some((wbinding, wbuf, woff)) = white_bind {
+                device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]);
             }
             device.cmd_draw(cmd, call.vertex_count, 1, 0, 0);
             device.cmd_end_rendering(cmd);
@@ -1607,10 +1623,10 @@ impl Renderer {
                                 }
                                 let n = (rgba8.len() / 4).max(1) as u64;
                                 log::warn!(
-                                    "TEXDUMP va={:#x} {}x{} fmt={:?} bl={} pitchdst={} tsc={:?} avg=({},{},{},{}) a=[{}..{}]",
+                                    "TEXDUMP va={:#x} {}x{} fmt={:?} bl={} bh_log2={} read_size={} pitch_size={} pitchdst={} avg=({},{},{},{}) a=[{}..{}]",
                                     tic.gpu_va, tic.width, tic.height, tic.format,
-                                    tic.is_block_linear, crate::pitch_oracle::is_pitch_dst(tic.gpu_va),
-                                    prep.tsc.map(|t| (t.wrap_u, t.mag_filter, t.min_filter)),
+                                    tic.is_block_linear, tic.block_height_log2, read_size, pitch_size,
+                                    crate::pitch_oracle::is_pitch_dst(tic.gpu_va),
                                     sr / n, sg / n, sb / n, sa / n, amin, amax,
                                 );
                             }
@@ -1636,6 +1652,18 @@ impl Renderer {
                 unsafe { std::ptr::copy_nonoverlapping(prep.vertex_data.as_ptr(), vptr, prep.vertex_data.len()); }
                 Some((vbuf, voff))
             } else { None };
+
+            let white_bind: Option<(u32, vk::Buffer, u64)> =
+                if let Some(wb) = call.vertex_layout.bindings.iter().find(|b| b.stride == 0) {
+                    if ubo_ring.head + 16 > ubo_ring.size { ubo_ring.head = 0; }
+                    let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 16, 16)
+                        .map_err(|e| format!("ring_alloc(white): {}", e))?;
+                    unsafe {
+                        let white = [1.0f32, 1.0, 1.0, 1.0];
+                        std::ptr::copy_nonoverlapping(white.as_ptr() as *const u8, wptr, 16);
+                    }
+                    Some((wb.binding, wbuf, woff))
+                } else { None };
 
             let cbuf_size_aligned = align_up(prep.cbuf_data.len() as u64, ubo_alignment);
             if ubo_ring.head + cbuf_size_aligned > ubo_ring.size { ubo_ring.head = 0; }
@@ -1718,6 +1746,7 @@ impl Renderer {
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, prep.pipeline);
                 device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_cache.layout, 0, &[dset], &[]);
                 if let Some((vbuf, voff)) = vertex_bind { device.cmd_bind_vertex_buffers(cmd, 0, &[vbuf], &[voff]); }
+                if let Some((wbinding, wbuf, woff)) = white_bind { device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]); }
                 device.cmd_draw(cmd, call.vertex_count, 1, 0, 0);
                 device.cmd_end_rendering(cmd);
             }
