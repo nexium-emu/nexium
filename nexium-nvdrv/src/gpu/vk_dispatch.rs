@@ -426,8 +426,8 @@ fn execute_one(
     );
 
     let mut fs_sampler_ids: Vec<u32> = vec![0u32; fs_tex_ids.len()];
-    if cbuf_addr != 0 && cbuf_size as usize >= 128 && !fs_tex_ids.is_empty() {
-        if let Some(cbuf_cpu) = mappings.cpu_address_for(cbuf_addr) {
+    if draw.fs_bindless_cb_addr != 0 && draw.fs_bindless_cb_size as usize >= 128 && !fs_tex_ids.is_empty() {
+        if let Some(cbuf_cpu) = mappings.cpu_address_for(draw.fs_bindless_cb_addr) {
             let mut cbuf_head = [0u8; 128];
             if mem_read(cbuf_cpu, &mut cbuf_head) {
                 const HANDLE_TIC_MASK: u32 = 0x000F_FFFF;
