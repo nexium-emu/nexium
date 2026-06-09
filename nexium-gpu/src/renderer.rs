@@ -128,11 +128,31 @@ impl Renderer {
         }
         let mut layer_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
         let mut ext_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
+        let want_syncval =
+            std::env::var("NEXIUM_VK_SYNCVAL").ok().as_deref() == Some("1");
         if validation_available {
             layer_ptrs.push(validation_layer.as_ptr());
             ext_ptrs.push(ash::ext::debug_utils::NAME.as_ptr());
+            if want_syncval {
+                ext_ptrs.push(ash::ext::validation_features::NAME.as_ptr());
+            }
             log::info!("Vulkan validation layers ENABLED (guest ash instance)");
         }
+        let syncval_enables = [vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION];
+        let validation_features = vk::ValidationFeaturesEXT {
+            s_type: vk::StructureType::VALIDATION_FEATURES_EXT,
+            enabled_validation_feature_count: syncval_enables.len() as u32,
+            p_enabled_validation_features: syncval_enables.as_ptr(),
+            disabled_validation_feature_count: 0,
+            p_disabled_validation_features: std::ptr::null(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        let inst_pnext: *const std::ffi::c_void = if validation_available && want_syncval {
+            &validation_features as *const _ as *const std::ffi::c_void
+        } else {
+            std::ptr::null()
+        };
 
         let app = vk::ApplicationInfo {
             s_type: vk::StructureType::APPLICATION_INFO,
@@ -151,7 +171,7 @@ impl Renderer {
             pp_enabled_extension_names: ext_ptrs.as_ptr(),
             enabled_layer_count: layer_ptrs.len() as u32,
             pp_enabled_layer_names: layer_ptrs.as_ptr(),
-            p_next: std::ptr::null(),
+            p_next: inst_pnext,
             flags: Default::default(),
             _marker: std::marker::PhantomData,
         };
