@@ -449,7 +449,7 @@ impl EmulationHandle {
                         let cur = guard.threads.current_handle();
                         let lr = cpu.get_register(30);
                         let sp = cpu.get_sp();
-                        let mut regs = [0u64; 31];
+                        let mut regs = [0u64; 32];
                         for i in 0..31 { regs[i] = cpu.get_register(i as u32); }
                         log::error!("[null-pc] PC entered null page ({:#x}) — likely null function pointer / corrupted vtable", pc_after);
                         log::error!("[null-pc] handle={:?} lr={:#x} sp={:#x}", cur, lr, sp);
