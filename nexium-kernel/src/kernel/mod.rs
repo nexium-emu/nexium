@@ -41,6 +41,7 @@ pub struct Kernel {
 
     pub cycle_count: u64,
     pub next_vsync_cycle: u64,
+    pub last_sdl_capture: std::time::Instant,
     pub display_ready: bool,
     pub process_exited: bool,
     pub vsync_poll_count: u64,
@@ -85,6 +86,8 @@ pub struct Kernel {
     pub open_files: HashMap<(u32, u32), Arc<memmap2::Mmap>>,
     pub sd_root: Option<std::path::PathBuf>,
     pub open_host_files: HashMap<(u32, u32), std::path::PathBuf>,
+    pub open_file_handles: HashMap<(u32, u32), std::fs::File>,
+    pub host_file_cache: HashMap<std::path::PathBuf, Arc<memmap2::Mmap>>,
     pub open_dir_lists: HashMap<(u32, u32), (Vec<(String, bool, u64)>, usize)>,
 
     pub yield_after_svc: bool,
@@ -170,16 +173,13 @@ impl Kernel {
             tls_pool_base,
             cycle_count: 0,
             next_vsync_cycle: 16_666_667,
+            last_sdl_capture: std::time::Instant::now(),
             display_ready: false,
             process_exited: false,
             vsync_poll_count: 0,
             process_handle,
             main_thread_handle,
-            applet_messages: VecDeque::from(vec![
-                crate::services::am::msg::FOCUS_STATE_CHANGED,
-                crate::services::am::msg::OPERATION_MODE_CHANGED,
-                crate::services::am::msg::PERFORMANCE_MODE_CHANGED,
-            ]),
+            applet_messages: VecDeque::new(),
             applet_message_event: None,
             vsync_handles: HashSet::new(),
             last_vsync: std::time::Instant::now(),
@@ -205,6 +205,8 @@ impl Kernel {
             open_files: HashMap::new(),
             sd_root: None,
             open_host_files: HashMap::new(),
+            open_file_handles: HashMap::new(),
+            host_file_cache: HashMap::new(),
             open_dir_lists: HashMap::new(),
             yield_after_svc: false,
             present_pace_until: None,
@@ -319,8 +321,10 @@ impl Kernel {
         }
 
         let qb_active = self.nvdrv.queue_buffer_active.load(std::sync::atomic::Ordering::Relaxed);
-        if !qb_active && self.pending_frames.is_empty() && self.cycle_count >= self.next_vsync_cycle {
-            self.next_vsync_cycle = self.cycle_count + 1_000_000;
+        if !qb_active && self.pending_frames.is_empty()
+            && self.last_sdl_capture.elapsed() >= std::time::Duration::from_millis(16)
+        {
+            self.last_sdl_capture = std::time::Instant::now();
             let addr_space = self.address_space.clone();
             if let Some(qf) = self.nvdrv.try_capture_sdl_surface(|addr, buf| addr_space.read(addr, buf).is_ok()) {
                 self.pending_frames.push(FrameOut {

@@ -849,6 +849,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             }
             kernel.open_files.remove(&(session_handle, d.object_id));
             kernel.open_host_files.remove(&(session_handle, d.object_id));
+            kernel.open_file_handles.remove(&(session_handle, d.object_id));
             kernel.open_dir_lists.remove(&(session_handle, d.object_id));
             log::debug!("domain Close-object session={:#x} object_id={}", session_handle, d.object_id);
             if let Some(cpu) = cpu_mut() {
@@ -965,7 +966,12 @@ fn handle_control_request(kernel: &mut Kernel, session_handle: u32, port_name: &
         }
         2 | 4 => {
             let dup_handle = kernel.handles.create_handle(HandleType::Session);
-            let session = Session::new(dup_handle, port_name.to_string());
+            let mut session = Session::new(dup_handle, port_name.to_string());
+            if let Some(orig) = kernel.sessions.get(&session_handle) {
+                session.is_domain = orig.is_domain;
+                session.domain_objects = orig.domain_objects.clone();
+                session.next_domain_object_id = orig.next_domain_object_id;
+            }
             kernel.sessions.insert(dup_handle, session);
             log::debug!("Control: CloneCurrentObject service={} dup={:#x}", port_name, dup_handle);
             build_ipc_response(&mut ctx, 0, &[], &[dup_handle])
@@ -1350,15 +1356,28 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                 let mut bytes_read: u64 = 0;
                 if let Some(buf) = target {
                     if let Some(host) = host_path {
-                        use std::io::{Read, Seek, SeekFrom};
                         let want = (read_size as usize).min(buf.size as usize);
-                        let mut data = vec![0u8; want];
-                        if let Ok(mut f) = std::fs::File::open(&host) {
-                            if f.seek(SeekFrom::Start(offset.max(0) as u64)).is_ok() {
-                                bytes_read = f.read(&mut data).unwrap_or(0) as u64;
+                        let mmap = if let Some(m) = kernel.host_file_cache.get(&host) {
+                            Some(m.clone())
+                        } else {
+                            match std::fs::File::open(&host)
+                                .and_then(|f| unsafe { memmap2::Mmap::map(&f) })
+                            {
+                                Ok(m) => {
+                                    let a = std::sync::Arc::new(m);
+                                    kernel.host_file_cache.insert(host.clone(), a.clone());
+                                    Some(a)
+                                }
+                                Err(_) => None,
                             }
+                        };
+                        if let Some(m) = mmap {
+                            let start = (offset.max(0) as usize).min(m.len());
+                            let end = start.saturating_add(want).min(m.len());
+                            let slice = &m[start..end];
+                            let _ = kernel.address_space.write(buf.addr, slice);
+                            bytes_read = slice.len() as u64;
                         }
-                        let _ = kernel.address_space.write(buf.addr, &data[..bytes_read as usize]);
                         log::debug!("IFile.Read (host {}) off={:#x} size={:#x} → {} bytes", host.display(), offset, read_size, bytes_read);
                     } else {
                         let file_bytes: &[u8] = match per_session.as_ref() {
@@ -1402,6 +1421,8 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                                 let res = std::fs::OpenOptions::new().write(true).create(true).open(&host)
                                     .and_then(|mut f| { f.seek(SeekFrom::Start(offset.max(0) as u64))?; f.write_all(&data) });
                                 if res.is_ok() {
+                                    kernel.open_file_handles.remove(&(session_handle, obj_id));
+                                    kernel.host_file_cache.remove(&host);
                                     log::debug!("IFile.Write (host {}) off={:#x} size={} → SUCCESS", host.display(), offset, n);
                                     return build_ipc_response(ctx, 0, &[], &[]);
                                 }
@@ -1426,6 +1447,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                         let res = std::fs::OpenOptions::new().write(true).open(&host)
                             .and_then(|f| f.set_len(new_size));
                         if res.is_ok() {
+                            kernel.host_file_cache.remove(&host);
                             return build_ipc_response(ctx, 0, &[], &[]);
                         }
                     }
@@ -3845,13 +3867,13 @@ fn svc_output_debug_string(kernel: &mut Kernel) -> u32 {
         let str_ptr = cpu.get_register(0);
         let str_len = cpu.get_register(1);
 
-        if str_ptr > 0 && str_len > 0 && str_len < 4096 {
+        if str_ptr > 0 && str_len > 0 && str_len < 262_144 {
             let mut buf = vec![0u8; str_len as usize];
             match kernel.address_space.read(str_ptr, &mut buf) {
                 Ok(()) => {
                     let output = std::str::from_utf8(&buf).unwrap_or("[invalid utf8]");
                     println!("[DEBUG] {}", output);
-                    log::debug!("OutputDebugString: {}", output);
+                    log::info!("OutputDebugString: {}", output);
                 }
                 Err(e) => {
                     log::warn!("Failed to read debug string from {:#x}: {:?}", str_ptr, e);

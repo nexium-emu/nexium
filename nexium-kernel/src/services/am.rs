@@ -157,7 +157,7 @@ fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, V
         }
         1 => {
             if let Some(m) = kernel.applet_messages.pop_front() {
-                log::debug!("ICommonStateGetter.ReceiveMessage → {}", m);
+                log::warn!("AMDBG ReceiveMessage → {}", m);
                 if kernel.applet_messages.is_empty() {
                     if let Some(h) = kernel.applet_message_event {
                         kernel.event_signals.insert(h, false);

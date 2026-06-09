@@ -63,7 +63,7 @@ impl Default for EnvBlockBuilder {
             process_handle: 0,
             heap_base: 0,
             heap_size: 0,
-            applet_type: 1,
+            applet_type: 0,
             hos_version: 0x000F_0000,
             syscall_hint: (u64::MAX, u64::MAX),
             syscall_hint2: (u64::MAX, 0),

@@ -19,7 +19,7 @@ impl BootConfig {
         Self {
             nro_path: nro_path.to_string(),
             code_size: 256 * 1024 * 1024,
-            heap_size: 256 * 1024 * 1024,
+            heap_size: 1536 * 1024 * 1024,
             stack_size: 16 * 1024 * 1024,
             loader_path: None,
             cpu_backend: nexium_cpu::CpuBackendKind::default(),
@@ -52,19 +52,22 @@ impl BootContext {
         log::info!("Mapping memory regions");
 
         const PAGE_SIZE: u64 = 0x1000;
+        let image_size = nro.total_memory_size();
+        let code_size = ((image_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)).max(config.code_size);
+        log::info!("NRO image size {:#x}, code region size {:#x}", image_size, code_size);
         let data_mmap_start = nro.data.mmap_range.start as u64;
         let split = data_mmap_start & !(PAGE_SIZE - 1);
-        let split = split.min(config.code_size);
-        if split == 0 || split >= config.code_size {
+        let split = split.min(code_size);
+        if split == 0 || split >= code_size {
             log::info!("  Mapping code @ {:#x} (size {:#x}) RX (no split — data section out of range)",
-                code_base, config.code_size);
-            address_space.map(code_base, config.code_size, Perm::RX, "code")
+                code_base, code_size);
+            address_space.map(code_base, code_size, Perm::RX, "code")
                 .map_err(|e| format!("Failed to map code: {:?}", e))?;
         } else {
             log::info!("  Mapping code text+ro @ {:#x} (size {:#x}) RX", code_base, split);
             address_space.map(code_base, split, Perm::RX, "code_rx")
                 .map_err(|e| format!("Failed to map code_rx: {:?}", e))?;
-            let rw_size = config.code_size - split;
+            let rw_size = code_size - split;
             log::info!("  Mapping code data+bss @ {:#x} (size {:#x}) RW", code_base + split, rw_size);
             address_space.map(code_base + split, rw_size, Perm::RW, "code_rw")
                 .map_err(|e| format!("Failed to map code_rw: {:?}", e))?;
@@ -91,7 +94,7 @@ impl BootContext {
             nro.bytes().len(), code_base, split);
         let bytes = nro.bytes();
         let split_idx = (split as usize).min(bytes.len());
-        if split == 0 || split >= config.code_size {
+        if split == 0 || split >= code_size {
             address_space.write(code_base, bytes)
                 .map_err(|e| format!("Failed to write NRO file: {:?}", e))?;
         } else {
@@ -109,7 +112,7 @@ impl BootContext {
         let mut kernel = Kernel::new(
             address_space.clone(),
             code_base,
-            config.code_size,
+            code_size,
             heap_base,
             config.heap_size,
             stack_base,
