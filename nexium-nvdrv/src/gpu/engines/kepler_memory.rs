@@ -104,10 +104,11 @@ impl KeplerMemory {
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
         let dst_gpu = ((self.offset_out_upper as u64) << 32) | self.offset_out_lower as u64;
-        let Some(dst_cpu) = mappings.cpu_address_for(dst_gpu) else {
+        let Some((dst_cpu, dst_limit)) = mappings.cpu_range_for(dst_gpu) else {
             log::trace!("KeplerMemory::flush: dst gpu_va {:#x} not mapped", dst_gpu);
             return;
         };
+        let dst_limit = dst_limit as usize;
 
         let line_length = self.line_length_in as usize;
         let line_count = self.line_count.max(1) as usize;
@@ -128,12 +129,16 @@ impl KeplerMemory {
             LAYOUT_PITCH => {
                 let pitch_out = self.pitch_out.max(line_length as u32) as usize;
                 if line_count == 1 || pitch_out == line_length {
-                    mem_write(dst_cpu, &self.inline_buf[..line_length * line_count]);
+                    let n = (line_length * line_count).min(dst_limit);
+                    mem_write(dst_cpu, &self.inline_buf[..n]);
                 } else {
                     for y in 0..line_count {
+                        let dst_row_off = y * pitch_out;
+                        if dst_row_off >= dst_limit { break; }
+                        let n = line_length.min(dst_limit - dst_row_off);
                         let src_off = y * line_length;
-                        let dst_off = dst_cpu + (y * pitch_out) as u64;
-                        mem_write(dst_off, &self.inline_buf[src_off..src_off + line_length]);
+                        let dst_off = dst_cpu + dst_row_off as u64;
+                        mem_write(dst_off, &self.inline_buf[src_off..src_off + n]);
                     }
                 }
             }
@@ -160,7 +165,14 @@ impl KeplerMemory {
                     self.dst_origin_x as usize,
                     self.dst_origin_y as usize,
                 );
-                mem_write(dst_cpu, &tiled);
+                if tiled.len() > dst_limit {
+                    log::warn!(
+                        "KeplerMemory::flush CLAMP: tiled={} > dst_limit={} (dst_cpu={:#x} dst_w={} dst_h={} line_len={} line_count={}) — truncating to avoid heap overrun",
+                        tiled.len(), dst_limit, dst_cpu, self.dst_width, self.dst_height, line_length, line_count,
+                    );
+                }
+                let n = tiled.len().min(dst_limit);
+                mem_write(dst_cpu, &tiled[..n]);
             }
             _ => unreachable!(),
         }

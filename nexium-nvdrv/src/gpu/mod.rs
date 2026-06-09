@@ -41,8 +41,34 @@ impl GpuMappings {
         None
     }
 
+    pub fn cpu_range_for(&self, gpu_va: u64) -> Option<(u64, u64)> {
+        for m in &self.mappings {
+            if gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size {
+                let offset = gpu_va - m.gpu_va;
+                return Some((m.cpu_addr + offset, m.size - offset));
+            }
+        }
+        None
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &GpuMapping> {
         self.mappings.iter()
+    }
+
+    pub fn describe_around(&self, gpu_va: u64) -> String {
+        let lo = gpu_va.saturating_sub(0x40000);
+        let hi = gpu_va.saturating_add(0x60000);
+        let mut parts: Vec<String> = Vec::new();
+        for m in &self.mappings {
+            if m.gpu_va < hi && m.gpu_va + m.size > lo {
+                let contains = gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size;
+                parts.push(format!(
+                    "[{}gpu={:#x} size={:#x} cpu={:#x} nvmap={}]",
+                    if contains { "*" } else { "" }, m.gpu_va, m.size, m.cpu_addr, m.nvmap_id
+                ));
+            }
+        }
+        format!("{} mappings near {:#x}: {}", parts.len(), gpu_va, parts.join(" "))
     }
 
     pub fn nvmap_id_for(&self, gpu_va: u64) -> Option<u32> {

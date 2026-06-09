@@ -71,6 +71,8 @@ pub struct MaxwellDma {
     pub last_tiled_dst_height: u32,
 
     pub draw_texture_blits: u64,
+
+    clamp_log_count: u64,
 }
 
 impl MaxwellDma {
@@ -145,10 +147,11 @@ impl MaxwellDma {
             log::trace!("MaxwellDma::launch: src gpu_va {:#x} not mapped", src_gpu);
             return;
         };
-        let Some(dst_cpu) = mappings.cpu_address_for(dst_gpu) else {
+        let Some((dst_cpu, dst_limit)) = mappings.cpu_range_for(dst_gpu) else {
             log::trace!("MaxwellDma::launch: dst gpu_va {:#x} not mapped", dst_gpu);
             return;
         };
+        let dst_limit = dst_limit as usize;
 
         let line_length_units = self.line_length_in as usize;
         let line_count = if multi_line { self.line_count.max(1) as usize } else { 1 };
@@ -201,7 +204,8 @@ impl MaxwellDma {
         match (src_layout, dst_layout) {
             (LAYOUT_PITCH, LAYOUT_BLOCK_LINEAR) => {
                 self.blit_pitch_to_block(
-                    src_cpu, dst_cpu, line_length_src, line_length_dst, line_count,
+                    src_cpu, dst_cpu, dst_limit, dst_gpu, mappings,
+                    line_length_src, line_length_dst, line_count,
                     remap_enable, component_size, num_src_components, num_dst_components,
                     [dst_x_sel, dst_y_sel, dst_z_sel, dst_w_sel],
                     bytes_per_element,
@@ -210,10 +214,10 @@ impl MaxwellDma {
             }
             (LAYOUT_BLOCK_LINEAR, LAYOUT_PITCH) => {
                 nexium_gpu::pitch_oracle::record_pitch_dst(dst_gpu);
-                self.blit_block_to_pitch(src_cpu, dst_cpu, line_length_src, line_count, bytes_per_element, mem_read, mem_write);
+                self.blit_block_to_pitch(src_cpu, dst_cpu, dst_limit, line_length_src, line_count, bytes_per_element, mem_read, mem_write);
             }
             (LAYOUT_PITCH, LAYOUT_PITCH) => {
-                self.blit_pitch_to_pitch(src_cpu, dst_cpu, line_length_src, line_count, mem_read, mem_write);
+                self.blit_pitch_to_pitch(src_cpu, dst_cpu, dst_limit, line_length_src, line_count, mem_read, mem_write);
             }
             _ => {
                 log::trace!(
@@ -269,6 +273,7 @@ impl MaxwellDma {
         &self,
         src_cpu: u64,
         dst_cpu: u64,
+        dst_limit: usize,
         line_length: usize,
         line_count: usize,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
@@ -278,18 +283,25 @@ impl MaxwellDma {
         let dst_pitch = self.pitch_out.max(line_length as u32) as usize;
         let mut row = vec![0u8; line_length];
         for y in 0..line_count {
+            let dst_row_off = y * dst_pitch;
+            if dst_row_off >= dst_limit { break; }
+            let n = line_length.min(dst_limit - dst_row_off);
             let src_off = src_cpu + (y * src_pitch) as u64;
-            let dst_off = dst_cpu + (y * dst_pitch) as u64;
+            let dst_off = dst_cpu + dst_row_off as u64;
             if !mem_read(src_off, &mut row) { break; }
-            mem_write(dst_off, &row);
+            mem_write(dst_off, &row[..n]);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn blit_pitch_to_block(
         &mut self,
         src_cpu: u64,
         dst_cpu: u64,
+        dst_limit: usize,
+        dst_gpu: u64,
+        mappings: &GpuMappings,
         line_length_src: usize,
         line_length_dst: usize,
         line_count: usize,
@@ -355,7 +367,24 @@ impl MaxwellDma {
             self.dst_origin_x as usize,
             self.dst_origin_y as usize,
         );
-        mem_write(dst_cpu, &tiled);
+        if tiled.len() > dst_limit {
+            if self.clamp_log_count < 16 {
+                self.clamp_log_count += 1;
+                log::warn!(
+                    "MaxwellDma::blit_pitch_to_block stale‑geometry → linear+pitch_dst: full={} > dst_limit={} \
+                     dst_gpu={:#x} dst_cpu={:#x} stale_w={} stale_h={} stale_bh={} line_count={} line_len_dst={} | {}",
+                    tiled.len(), dst_limit, dst_gpu, dst_cpu,
+                    self.dst_width, self.dst_height, block_height_log2,
+                    line_count, line_length_dst,
+                    mappings.describe_around(dst_gpu),
+                );
+            }
+            let n = post_remap.len().min(dst_limit);
+            mem_write(dst_cpu, &post_remap[..n]);
+            nexium_gpu::pitch_oracle::record_pitch_dst(dst_gpu);
+        } else {
+            mem_write(dst_cpu, &tiled);
+        }
         self.last_tiled_dst_bh_log2 = block_height_log2;
         self.last_tiled_dst_stride = dst_width_bytes as u32;
         self.last_tiled_dst_height = dst_height as u32;
@@ -365,6 +394,7 @@ impl MaxwellDma {
         &mut self,
         src_cpu: u64,
         dst_cpu: u64,
+        dst_limit: usize,
         line_length: usize,
         line_count: usize,
         bytes_per_element: usize,
@@ -427,7 +457,9 @@ impl MaxwellDma {
         );
         for y in 0..line_count {
             let off = y * dst_pitch;
-            mem_write(dst_cpu + off as u64, &linear[off..off + line_length]);
+            if off >= dst_limit { break; }
+            let n = line_length.min(dst_limit - off);
+            mem_write(dst_cpu + off as u64, &linear[off..off + n]);
         }
     }
 }
