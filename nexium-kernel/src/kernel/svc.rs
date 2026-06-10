@@ -2643,10 +2643,8 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                         None
                     }
                 };
-                if let (Some(rt_worker), Some(r_async)) = (
-                    nexium_nvdrv::render_thread::maybe_render_thread(),
-                    kernel.nvdrv.renderer().cloned(),
-                ) {
+                if let Some(r_async) = kernel.nvdrv.renderer().cloned() {
+                    let rt_worker = nexium_nvdrv::render_thread::present_thread();
                     let fq = kernel.nvdrv.frame_queue.clone();
                     let qba = kernel.nvdrv.queue_buffer_active.clone();
                     let (pw, ph, pnv) = (gb.width, gb.height, gb.nvmap_id);

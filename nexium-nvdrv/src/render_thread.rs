@@ -39,3 +39,8 @@ pub fn maybe_render_thread() -> Option<&'static RenderThread> {
     })
     .as_ref()
 }
+
+pub fn present_thread() -> &'static RenderThread {
+    static PT: OnceLock<RenderThread> = OnceLock::new();
+    PT.get_or_init(RenderThread::new)
+}
