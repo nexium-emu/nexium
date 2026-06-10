@@ -333,6 +333,11 @@ impl Pusher {
             }
         } else if bound_class == MAXWELL_DMA_CLASS {
             self.flush_vk(mappings, mem_read);
+            if method == super::engines::maxwell_dma::M_LAUNCH_DMA {
+                if let Some(r) = self.renderer.clone() {
+                    maxwell_dma.stage_rt_source(arg, mappings, &r, mem_write);
+                }
+            }
             let pre = maxwell_dma.blit_count;
             maxwell_dma.dispatch_method(method, arg, mappings, mem_read, mem_write);
             let n = maxwell_dma.blit_count - pre;

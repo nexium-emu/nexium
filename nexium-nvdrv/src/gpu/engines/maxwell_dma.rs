@@ -11,7 +11,7 @@ const M_PITCH_IN: u32 = 0x104;
 const M_PITCH_OUT: u32 = 0x105;
 const M_LINE_LENGTH_IN: u32 = 0x106;
 const M_LINE_COUNT: u32 = 0x107;
-const M_LAUNCH_DMA: u32 = 0xC0;
+pub const M_LAUNCH_DMA: u32 = 0xC0;
 const M_SET_REMAP_CONST_A: u32 = 0x1C0;
 const M_SET_REMAP_CONST_B: u32 = 0x1C1;
 const M_SET_REMAP_COMPONENTS: u32 = 0x1C2;
@@ -123,6 +123,33 @@ impl MaxwellDma {
 
     fn src_addr(&self) -> u64 {
         ((self.offset_in_upper as u64) << 32) | self.offset_in_lower as u64
+    }
+
+    pub fn stage_rt_source(
+        &self,
+        flags: u32,
+        mappings: &GpuMappings,
+        renderer: &nexium_gpu::renderer::Renderer,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
+        let src_layout = (flags >> LAUNCH_SRC_LAYOUT_BIT) & 1;
+        let dst_layout = (flags >> LAUNCH_DST_LAYOUT_BIT) & 1;
+        if src_layout != LAYOUT_BLOCK_LINEAR || dst_layout != LAYOUT_PITCH {
+            return;
+        }
+        let src_gpu = self.src_addr();
+        let Some(nvmap) = mappings.nvmap_id_for(src_gpu) else { return };
+        let Some((src_cpu, limit)) = mappings.cpu_range_for(src_gpu) else { return };
+        let Some((kw, kh)) = renderer.rt_key_for_nvmap(nvmap, self.src_width, self.src_height) else { return };
+        let Some(rgba) = renderer.readback_target(nvmap, kw, kh) else { return };
+        let width_bytes = (kw as usize) * 4;
+        let bh_log2 = ((self.src_block_size >> 4) & 0xF) as u32;
+        let tiled = swizzle_block_linear(
+            &rgba, width_bytes, kh as usize, width_bytes,
+            width_bytes, kh as usize, bh_log2, 0, 0,
+        );
+        let n = tiled.len().min(limit as usize);
+        mem_write(src_cpu, &tiled[..n]);
     }
 
     fn dst_addr(&self) -> u64 {

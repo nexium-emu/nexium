@@ -601,6 +601,13 @@ impl Renderer {
         Ok(())
     }
 
+    pub fn rt_key_for_nvmap(&self, nvmap_id: u32, width: u32, height: u32) -> Option<(u32, u32)> {
+        let inner = self.inner.lock();
+        inner.rt_cache
+            .find_color(RtKey { nvmap_id, width, height })
+            .map(|(k, _, _, _)| (k.width, k.height))
+    }
+
     pub fn readback_target(&self, nvmap_id: u32, width: u32, height: u32) -> Option<Vec<u8>> {
         let mut inner = self.inner.lock();
         let RendererInner {
