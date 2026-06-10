@@ -86,6 +86,7 @@ pub struct Pusher {
     puller: PullerState,
     entries_logged: u32,
     pub renderer: Option<Arc<nexium_gpu::Renderer>>,
+    vk_batch: Vec<nexium_gpu::draw::Maxwell3dDrawCall>,
 }
 
 impl Pusher {
@@ -97,11 +98,23 @@ impl Pusher {
             puller: PullerState::default(),
             entries_logged: 0,
             renderer: None,
+            vk_batch: Vec::new(),
         }
     }
 
     pub fn set_renderer(&mut self, r: Option<Arc<nexium_gpu::Renderer>>) {
         self.renderer = r;
+    }
+
+    fn flush_vk(&mut self, mappings: &GpuMappings, mem_read: &dyn Fn(u64, &mut [u8]) -> bool) {
+        if self.vk_batch.is_empty() {
+            return;
+        }
+        if let Some(r) = self.renderer.clone() {
+            super::vk_dispatch::flush_accum(&mut self.vk_batch, &r, mappings, mem_read);
+        } else {
+            self.vk_batch.clear();
+        }
     }
 
     pub fn process_gpfifo(
@@ -135,6 +148,7 @@ impl Pusher {
             };
             self.process_entry(&entry, mappings, maxwell, maxwell_dma, fermi_2d, kepler_memory, stats, mem_read, mem_write);
         }
+        self.flush_vk(mappings, mem_read);
     }
 
     pub fn process_entry(
@@ -181,6 +195,7 @@ impl Pusher {
         }
 
         self.process_commands(&words, mappings, maxwell, maxwell_dma, fermi_2d, kepler_memory, stats, mem_read, mem_write);
+        self.flush_vk(mappings, mem_read);
     }
 
     fn process_commands(
@@ -265,6 +280,7 @@ impl Pusher {
         let subchannel = self.state.subchannel as usize;
 
         if method < NON_PULLER_METHODS {
+            self.flush_vk(mappings, mem_read);
             self.handle_puller_method(method, arg, subchannel);
             return;
         }
@@ -290,6 +306,7 @@ impl Pusher {
                 }
             }
             if !maxwell.regs.pending_semaphore_writes.is_empty() {
+                self.flush_vk(mappings, mem_read);
                 let writes = std::mem::take(&mut maxwell.regs.pending_semaphore_writes);
                 for (gpu_va, payload) in writes {
                     if let Some(cpu) = mappings.cpu_address_for(gpu_va) {
@@ -306,32 +323,28 @@ impl Pusher {
             }
             if !maxwell.pending_draws.is_empty() {
                 let draws = std::mem::take(&mut maxwell.pending_draws);
-                let used_vk = if let Some(r) = &self.renderer {
-                    match super::vk_dispatch::try_vulkan_draws(&draws, mappings, maxwell, r, mem_read) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            log::warn!("vk_dispatch: {} — falling back to sw_renderer", e);
-                            false
-                        }
-                    }
+                if let Some(r) = self.renderer.clone() {
+                    super::vk_dispatch::enqueue_draws(
+                        &draws, &mut self.vk_batch, mappings, maxwell, &r, maxwell_dma, mem_read, mem_write,
+                    );
                 } else {
-                    false
-                };
-                if !used_vk {
                     sw_renderer::execute_draws(&draws, mappings, maxwell_dma, mem_read, mem_write);
                 }
             }
         } else if bound_class == MAXWELL_DMA_CLASS {
+            self.flush_vk(mappings, mem_read);
             let pre = maxwell_dma.blit_count;
             maxwell_dma.dispatch_method(method, arg, mappings, mem_read, mem_write);
             let n = maxwell_dma.blit_count - pre;
             if n > 0 { stats.maxwell_dma_blits.fetch_add(n, Ordering::Relaxed); }
         } else if bound_class == FERMI_2D_CLASS {
+            self.flush_vk(mappings, mem_read);
             let pre = fermi_2d.blit_count;
             fermi_2d.dispatch_method(method, arg, mappings, mem_read, mem_write);
             let n = fermi_2d.blit_count - pre;
             if n > 0 { stats.fermi_2d_blits.fetch_add(n, Ordering::Relaxed); }
         } else if bound_class == KEPLER_MEMORY_CLASS {
+            self.flush_vk(mappings, mem_read);
             kepler_memory.dispatch_method(method, arg, mappings, mem_write);
         } else {
             log::trace!("pusher: subch={} class={:#x} method={:#x} arg={:#x} (unsupported class)",

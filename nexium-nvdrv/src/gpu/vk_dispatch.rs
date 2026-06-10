@@ -11,72 +11,69 @@ use nexium_gpu::rt_cache::RtKey;
 const SPH_SIZE: usize = 0x50;
 const MAX_SASS_BYTES: usize = 16 * 1024;
 
-pub fn try_vulkan_draws(
+pub fn enqueue_draws(
     draws: &[DrawCall],
+    batch: &mut Vec<Maxwell3dDrawCall>,
     mappings: &GpuMappings,
     maxwell: &Maxwell3D,
     renderer: &Arc<nexium_gpu::Renderer>,
+    maxwell_dma: &mut super::engines::MaxwellDma,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
-) -> Result<(), String> {
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+) {
+    for draw in draws {
+        if draw.draw_texture.is_some() {
+            flush_accum(batch, renderer, mappings, mem_read);
+            super::engines::sw_renderer::execute_draws(
+                std::slice::from_ref(draw), mappings, maxwell_dma, mem_read, mem_write,
+            );
+            continue;
+        }
+        if draw.is_clear {
+            flush_accum(batch, renderer, mappings, mem_read);
+            if let Err(e) = execute_one(draw, mappings, maxwell, renderer, mem_read) {
+                log::debug!("vk_dispatch: clear failed: {}", e);
+            }
+            continue;
+        }
+        match execute_one(draw, mappings, maxwell, renderer, mem_read) {
+            Ok(None) => {}
+            Ok(Some(call)) => {
+                if batch.last().is_some_and(|last| last.rt_key != call.rt_key) {
+                    flush_accum(batch, renderer, mappings, mem_read);
+                }
+                batch.push(call);
+                if batch.len() >= 256 {
+                    flush_accum(batch, renderer, mappings, mem_read);
+                }
+            }
+            Err(e) => {
+                flush_accum(batch, renderer, mappings, mem_read);
+                log::debug!("vk_dispatch: sw fallback: {}", e);
+                super::engines::sw_renderer::execute_draws(
+                    std::slice::from_ref(draw), mappings, maxwell_dma, mem_read, mem_write,
+                );
+            }
+        }
+    }
+}
+
+pub fn flush_accum(
+    batch: &mut Vec<Maxwell3dDrawCall>,
+    renderer: &Arc<nexium_gpu::Renderer>,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) {
+    if batch.is_empty() {
+        return;
+    }
     let rt_thread = crate::render_thread::maybe_render_thread();
-    let batch_mode = batch_draws_enabled() || rt_thread.is_some();
     let read_guest = |gpu_va: u64, len: usize| -> Option<Vec<u8>> {
         let cpu = mappings.cpu_address_for(gpu_va)?;
         let mut buf = vec![0u8; len];
         if mem_read(cpu, &mut buf) { Some(buf) } else { None }
     };
-    let mut batch: Vec<Maxwell3dDrawCall> = Vec::new();
-    let mut attempted = 0usize;
-    let mut succeeded = 0usize;
-    let mut skipped_draw_texture = 0usize;
-    for draw in draws {
-        if draw.draw_texture.is_some() {
-            skipped_draw_texture += 1;
-            continue;
-        }
-        if batch_mode && draw.is_clear && !batch.is_empty() {
-            succeeded += flush_batch(&mut batch, renderer, rt_thread, &read_guest);
-        }
-        if !draw.is_clear {
-            attempted += 1;
-        }
-        match execute_one(draw, mappings, maxwell, renderer, mem_read) {
-            Ok(None) => {}
-            Ok(Some(call)) => {
-                if batch_mode {
-                    batch.push(call);
-                } else if renderer.execute_draw(&call, &read_guest).is_ok() {
-                    succeeded += 1;
-                }
-            }
-            Err(e) => log::debug!("vk_dispatch: skipping draw: {}", e),
-        }
-    }
-    if batch_mode && !batch.is_empty() {
-        succeeded += flush_batch(&mut batch, renderer, rt_thread, &read_guest);
-    }
-    if skipped_draw_texture > 0 {
-        log::debug!(
-            "vk_dispatch: skipped {} DrawTexture draw(s) (unhandled on Vulkan path)",
-            skipped_draw_texture
-        );
-    }
-    if attempted == 0 {
-        if skipped_draw_texture > 0 {
-            return Err("batch is DrawTexture-only; deferring to sw_renderer".to_string());
-        }
-        return Ok(());
-    }
-    if succeeded == 0 {
-        return Err(format!("all {} Vulkan draw(s) failed", attempted));
-    }
-    Ok(())
-}
-
-fn batch_draws_enabled() -> bool {
-    use std::sync::OnceLock;
-    static B: OnceLock<bool> = OnceLock::new();
-    *B.get_or_init(|| std::env::var("NEXIUM_BATCH_DRAWS").ok().as_deref() != Some("0"))
+    flush_batch(batch, renderer, rt_thread, &read_guest);
 }
 
 fn rt_keys_uniform(calls: &[Maxwell3dDrawCall]) -> bool {
@@ -134,7 +131,8 @@ fn submit_draw_batch_async(
         let stride = call
             .vertex_layout
             .bindings
-            .first()
+            .iter()
+            .find(|b| b.stride > 0)
             .map(|b| b.stride as u64)
             .unwrap_or(0);
         let vbytes = stride.saturating_mul(call.vertex_count as u64) as usize;
@@ -198,20 +196,23 @@ fn submit_draw_batch_async(
 }
 
 struct ShaderBundle {
-    vs_spirv: Vec<u32>,
+    vs_spirv: std::sync::Arc<Vec<u32>>,
     vs_cbuf_mask: u32,
-    fs_spirv: Vec<u32>,
+    vs_hash: u64,
+    fs_spirv: std::sync::Arc<Vec<u32>>,
     fs_cbuf_mask: u32,
+    fs_hash: u64,
     fs_tex_ids: Vec<u32>,
+    cbuf_used: u32,
 }
 
 #[allow(clippy::type_complexity)]
 fn shader_bundle_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<(u64, u64, u32, u32), std::sync::Arc<ShaderBundle>>>
+) -> &'static std::sync::Mutex<std::collections::HashMap<(u64, u64, u32, u32, u32), std::sync::Arc<ShaderBundle>>>
 {
     use std::sync::OnceLock;
     static CACHE: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(u64, u64, u32, u32), std::sync::Arc<ShaderBundle>>>,
+        std::sync::Mutex<std::collections::HashMap<(u64, u64, u32, u32, u32), std::sync::Arc<ShaderBundle>>>,
     > = OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -299,7 +300,8 @@ fn execute_one(
         }
     }
 
-    let shader_key = (vs_addr, fs_addr, vptx_scale_z.to_bits(), vptx_translate_z.to_bits());
+    let ps_key = if draw.topology == 0 { draw.point_size.to_bits() } else { 0 };
+    let shader_key = (vs_addr, fs_addr, vptx_scale_z.to_bits(), vptx_translate_z.to_bits(), ps_key);
     let bundle = {
         let cache = shader_bundle_cache();
         let mut guard = cache.lock().unwrap();
@@ -314,7 +316,7 @@ fn execute_one(
             let vs_cfg = nexium_shader::build_cfg(&vs_sass);
             let fs_cfg = nexium_shader::build_cfg(&fs_sass);
 
-            let (fs_spirv, fs_cbuf_mask, mut fs_tex_ids) =
+            let (fs_spirv, fs_cbuf_mask, mut fs_tex_ids, fs_cbuf_used) =
                 nexium_spirv::emit_fragment_full(&fs_cfg);
 
             {
@@ -344,22 +346,28 @@ fn execute_one(
             }
 
             let required_outputs = nexium_spirv::scan_input_locations(&fs_spirv);
-            let (vs_spirv, vs_cbuf_mask) = nexium_spirv::emit_vertex_with_bindings_opts(
+            let (vs_spirv, vs_cbuf_mask, vs_cbuf_used) = nexium_spirv::emit_vertex_with_bindings_opts(
                 &vs_cfg,
                 &required_outputs,
                 nexium_spirv::VertexOptions {
                     vptx_scale_z,
                     vptx_translate_z,
+                    point_size: if draw.topology == 0 { Some(draw.point_size) } else { None },
                     ..Default::default()
                 },
             );
 
+            let vs_hash = nexium_gpu::renderer::hash_spirv(&vs_spirv);
+            let fs_hash = nexium_gpu::renderer::hash_spirv(&fs_spirv);
             let b = std::sync::Arc::new(ShaderBundle {
-                vs_spirv,
+                vs_spirv: std::sync::Arc::new(vs_spirv),
                 vs_cbuf_mask,
-                fs_spirv,
+                vs_hash,
+                fs_spirv: std::sync::Arc::new(fs_spirv),
                 fs_cbuf_mask,
+                fs_hash,
                 fs_tex_ids,
+                cbuf_used: vs_cbuf_used.max(fs_cbuf_used),
             });
             guard.insert(shader_key, b.clone());
             if std::env::var_os("NEXIUM_PROBE_SHADE").is_some() {
@@ -473,6 +481,31 @@ fn execute_one(
         }
     }
 
+    let sampled_rt_key = if !fs_tex_ids.is_empty() && draw.tic_pool_gpu_va != 0 {
+        let tex_id = fs_tex_ids[0];
+        if tex_id != u32::MAX && tex_id <= draw.tic_pool_limit {
+            let tic_addr = draw.tic_pool_gpu_va.wrapping_add((tex_id as u64) * 32);
+            mappings.cpu_address_for(tic_addr).and_then(|cpu| {
+                let mut tic_raw = [0u8; 32];
+                if mem_read(cpu, &mut tic_raw) {
+                    nexium_gpu::texture::TicEntry::parse(&tic_raw).and_then(|tic| {
+                        mappings.nvmap_id_for(tic.gpu_va).map(|nv| RtKey {
+                            nvmap_id: nv,
+                            width: tic.width,
+                            height: tic.height,
+                        })
+                    })
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let vertex_addr = first_vertex_buffer_address(&draw.vertex_buffers, &layout)
         .ok_or_else(|| "no vertex buffer bound".to_string())?;
 
@@ -555,16 +588,28 @@ fn execute_one(
             (cbuf_addr, cbuf_size)
         }
     };
+    let uni_cbuf_size = uni_cbuf_size.min(bundle.cbuf_used);
+    let cbuf_data = if uni_cbuf_addr != 0 && uni_cbuf_size > 0 {
+        mappings.cpu_address_for(uni_cbuf_addr).and_then(|cpu| {
+            let mut buf = vec![0u8; uni_cbuf_size as usize];
+            if mem_read(cpu, &mut buf) { Some(buf) } else { None }
+        })
+    } else {
+        None
+    };
 
     let call = Maxwell3dDrawCall {
         vs_spirv,
         fs_spirv,
+        vs_hash: bundle.vs_hash,
+        fs_hash: bundle.fs_hash,
         vs_cbuf_mask,
         fs_cbuf_mask,
         fs_tex_ids,
         vertex_layout: layout,
         cbuf_addr: uni_cbuf_addr,
         cbuf_size: uni_cbuf_size,
+        cbuf_data,
         vertex_addr,
         vertex_count: draw.vertex_count,
         index_addr: None,
@@ -590,6 +635,7 @@ fn execute_one(
             compare_op: map_compare_op(draw.depth_func),
         },
         depth_key,
+        sampled_rt_key,
         clear: false,
         clear_color: [0.0, 0.0, 0.0, 1.0],
         tic_pool_gpu_va: draw.tic_pool_gpu_va,
@@ -895,7 +941,7 @@ fn first_vertex_buffer_address(
     vertex_buffers: &[VertexBuffer; 32],
     layout: &VertexLayout,
 ) -> Option<u64> {
-    let first_binding = layout.bindings.first()?.binding as usize;
+    let first_binding = layout.bindings.iter().find(|b| b.stride > 0).or_else(|| layout.bindings.first())?.binding as usize;
     let vb = vertex_buffers.get(first_binding)?;
     let va = ((vb.address_hi as u64) << 32) | vb.address_lo as u64;
     if va == 0 { None } else { Some(va) }
