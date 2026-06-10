@@ -1,5 +1,6 @@
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::sync::Arc;
 use nexium_memory::Perm;
 
 use crate::{CpuEvent, FaultSnapshot, HaltHandle};
@@ -14,10 +15,10 @@ const NULL_SKIP_MAX: u32 = 64;
 
 pub struct DynarmicCpu {
     emu: Arc<SharedDynarmic>,
-    last_event: Arc<Mutex<Option<CpuEvent>>>,
-    last_fault: Arc<Mutex<Option<FaultSnapshot>>>,
-    continue_on_null: Arc<AtomicBool>,
-    null_skip_count: Arc<AtomicU32>,
+    last_event: Rc<Cell<Option<CpuEvent>>>,
+    last_fault: Rc<RefCell<Option<FaultSnapshot>>>,
+    continue_on_null: Rc<Cell<bool>>,
+    null_skip_count: Rc<Cell<u32>>,
 }
 
 unsafe impl Send for DynarmicCpu {}
@@ -33,15 +34,15 @@ impl DynarmicCpu {
             None => dynarmic_sys::Dynarmic::new(),
         };
 
-        let last_event = Arc::new(Mutex::new(None::<CpuEvent>));
-        let last_fault: Arc<Mutex<Option<FaultSnapshot>>> = Arc::new(Mutex::new(None));
-        let continue_on_null = Arc::new(AtomicBool::new(false));
-        let null_skip_count = Arc::new(AtomicU32::new(0));
+        let last_event = Rc::new(Cell::new(None::<CpuEvent>));
+        let last_fault: Rc<RefCell<Option<FaultSnapshot>>> = Rc::new(RefCell::new(None));
+        let continue_on_null = Rc::new(Cell::new(false));
+        let null_skip_count = Rc::new(Cell::new(0u32));
 
         let event_for_svc = last_event.clone();
         emu.set_svc_callback(move |dyn_, swi, _until, pc| {
             log::trace!("dynarmic SVC callback triggered: swi={:#04x}, pc={:#x}", swi, pc);
-            *event_for_svc.lock().unwrap() = Some(CpuEvent::Svc(swi as u16));
+            event_for_svc.set(Some(CpuEvent::Svc(swi as u16)));
             let _ = dyn_.emu_stop();
         });
         log::info!("dynarmic: SVC callback registered");
@@ -74,20 +75,21 @@ impl DynarmicCpu {
                 value,
                 regs,
             };
-            *fault_for_unmapped.lock().unwrap() = Some(snap);
+            *fault_for_unmapped.borrow_mut() = Some(snap);
 
-            if is_null_zone && continue_flag.load(Ordering::Relaxed) {
-                let n = skip_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if is_null_zone && continue_flag.get() {
+                let n = skip_counter.get() + 1;
+                skip_counter.set(n);
                 if n > NULL_SKIP_MAX {
                     log::error!("[null-deref] skip cap ({}) exceeded — emitting Exception", NULL_SKIP_MAX);
-                    *event_for_unmapped.lock().unwrap() = Some(CpuEvent::Exception(0x0E));
+                    event_for_unmapped.set(Some(CpuEvent::Exception(0x0E)));
                     let _ = dyn_.emu_stop();
                     return true;
                 }
                 return true;
             }
 
-            *event_for_unmapped.lock().unwrap() = Some(CpuEvent::Exception(0x0E));
+            event_for_unmapped.set(Some(CpuEvent::Exception(0x0E)));
             let _ = dyn_.emu_stop();
             true
         });
@@ -102,15 +104,15 @@ impl DynarmicCpu {
     }
 
     pub fn take_fault(&self) -> Option<FaultSnapshot> {
-        self.last_fault.lock().unwrap().take()
+        self.last_fault.borrow_mut().take()
     }
 
     pub fn set_continue_on_null(&self, enable: bool) {
-        self.continue_on_null.store(enable, Ordering::Relaxed);
+        self.continue_on_null.set(enable);
     }
 
     pub fn null_skip_count(&self) -> u32 {
-        self.null_skip_count.load(Ordering::Relaxed)
+        self.null_skip_count.get()
     }
 
     pub fn halt_handle(&self) -> HaltHandle {
@@ -187,7 +189,7 @@ impl DynarmicCpu {
     }
 
     pub fn run(&mut self, _max_insn: u64) -> CpuEvent {
-        *self.last_event.lock().unwrap() = None;
+        self.last_event.set(None);
         let pc = self.get_pc();
         log::trace!("dynarmic run: PC={:#x}", pc);
         let until = if _max_insn > 0 {
@@ -196,7 +198,7 @@ impl DynarmicCpu {
             u64::MAX - 16
         };
         let _ = self.emu.emu.emu_start(pc, until);
-        let event = self.last_event.lock().unwrap().take();
+        let event = self.last_event.take();
         match event {
             Some(CpuEvent::Svc(imm)) => {
                 log::debug!("dynarmic SVC {:#04x} hit at PC={:#x}", imm, pc);
@@ -215,7 +217,7 @@ impl DynarmicCpu {
     }
 
     pub fn inject_svc(&mut self, imm: u16) {
-        *self.last_event.lock().unwrap() = Some(CpuEvent::Svc(imm));
+        self.last_event.set(Some(CpuEvent::Svc(imm)));
     }
 
     pub fn invalidate_range(&mut self, _va: u64, _len: u64) {}
