@@ -69,14 +69,17 @@ pub struct DepthState {
 
 #[derive(Clone, Debug)]
 pub struct Maxwell3dDrawCall {
-    pub vs_spirv: Vec<u32>,
-    pub fs_spirv: Vec<u32>,
+    pub vs_spirv: std::sync::Arc<Vec<u32>>,
+    pub fs_spirv: std::sync::Arc<Vec<u32>>,
+    pub vs_hash: u64,
+    pub fs_hash: u64,
     pub vs_cbuf_mask: u32,
     pub fs_cbuf_mask: u32,
     pub fs_tex_ids: Vec<u32>,
     pub vertex_layout: VertexLayout,
     pub cbuf_addr: u64,
     pub cbuf_size: u32,
+    pub cbuf_data: Option<Vec<u8>>,
     pub vertex_addr: u64,
     pub vertex_count: u32,
     pub index_addr: Option<u64>,
@@ -88,6 +91,7 @@ pub struct Maxwell3dDrawCall {
     pub blend: BlendState,
     pub depth: DepthState,
     pub depth_key: Option<RtKey>,
+    pub sampled_rt_key: Option<RtKey>,
     pub clear: bool,
     pub clear_color: [f32; 4],
     pub tic_pool_gpu_va: u64,

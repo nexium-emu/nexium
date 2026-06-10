@@ -66,6 +66,37 @@ impl RtCache {
         Ok(self.depth_cache.get_mut(&key).unwrap())
     }
 
+    pub fn find_color(&self, want: RtKey) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
+        if let Some(img) = self.cache.get(&want) {
+            return Some((want, img.image, img.view, img.layout));
+        }
+        let mut best: Option<(RtKey, &GpuImage)> = None;
+        for (k, img) in &self.cache {
+            if k.nvmap_id != want.nvmap_id {
+                continue;
+            }
+            let kd = (k.width as i64 - want.width as i64).abs()
+                + (k.height as i64 - want.height as i64).abs();
+            let replace = match best {
+                Some((bk, _)) => {
+                    kd < (bk.width as i64 - want.width as i64).abs()
+                        + (bk.height as i64 - want.height as i64).abs()
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((*k, img));
+            }
+        }
+        best.map(|(k, img)| (k, img.image, img.view, img.layout))
+    }
+
+    pub fn set_color_layout(&mut self, key: RtKey, layout: vk::ImageLayout) {
+        if let Some(img) = self.cache.get_mut(&key) {
+            img.layout = layout;
+        }
+    }
+
     fn create_image(&self, device: &ash::Device, key: RtKey) -> Result<GpuImage, String> {
         self.create_image_inner(
             device,
