@@ -477,20 +477,18 @@ impl Maxwell3D {
             0x282 => self.regs.viewport.scale_z = f32::from_bits(arg),
             0x285 => self.regs.viewport.translate_z = f32::from_bits(arg),
             0x35D => {
-
-                self.regs.draw_count += 1;
-                let count = (arg >> 16) & 0xFFFF;
-                let topology = (arg >> 28) & 0xF;
-                log::trace!("maxwell3d: DRAW_VERTEX_ARRAY_BEGIN count={} topology={}", count, topology);
-                self.push_draw(topology, self.regs.draw_first_vertex, count, false, 0);
+                let count = (arg >> 16) & 0xFFF;
+                let topology = (arg >> 28) & 0x7;
+                if count > 0 {
+                    self.regs.draw_count += 1;
+                    self.push_draw(topology, self.regs.draw_first_vertex, count, false, 0);
+                }
             }
             0x35E => {
 
                 self.regs.draw_vertex_count = arg;
-                self.regs.draw_count += 1;
-                log::trace!("maxwell3d: DrawArraysCount count={} topology={} first={}",
-                    arg, self.regs.draw_topology, self.regs.draw_first_vertex);
                 if arg > 0 {
+                    self.regs.draw_count += 1;
                     self.push_draw(self.regs.draw_topology, self.regs.draw_first_vertex, arg, false, 0);
                 }
             }
