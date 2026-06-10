@@ -213,6 +213,7 @@ pub struct DrawCall {
     pub vertex_count: u32,
     pub indexed: bool,
     pub index_count: u32,
+    pub point_size: f32,
 
     pub rt: [RenderTarget; 8],
     pub vertex_buffers: [VertexBuffer; 32],
@@ -434,6 +435,7 @@ impl Maxwell3D {
                     vertex_count: 0,
                     indexed: false,
                     index_count: 0,
+                    point_size: 1.0,
                     rt: self.regs.rt,
                     vertex_buffers: self.regs.vertex_buffers,
                     vertex_attribs: self.regs.vertex_attribs,
@@ -672,12 +674,15 @@ impl Maxwell3D {
         let fs_shader_gpu_va = if fs.address_lo != 0 {
             program_region.wrapping_add(fs.address_lo as u64)
         } else { 0 };
+        let ps = f32::from_bits(self.reg_file.get(0x546).copied().unwrap_or(0));
+        let point_size = if ps.is_finite() && ps > 0.0 { ps } else { 1.0 };
         self.pending_draws.push(DrawCall {
             topology,
             first_vertex: first,
             vertex_count: count,
             indexed,
             index_count,
+            point_size,
             rt: self.regs.rt,
             vertex_buffers: self.regs.vertex_buffers,
             vertex_attribs: self.regs.vertex_attribs,
