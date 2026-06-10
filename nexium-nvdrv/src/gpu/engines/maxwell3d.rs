@@ -32,6 +32,10 @@ pub struct Viewport {
     pub height: f32,
     pub depth_min: f32,
     pub depth_max: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub translate_x: f32,
+    pub translate_y: f32,
     pub scale_z: f32,
     pub translate_z: f32,
 }
@@ -83,6 +87,7 @@ pub struct Maxwell3DRegisters {
     pub draw_vertex_count: u32,
     pub draw_first_vertex: u32,
     pub draw_topology: u32,
+    pub viewport_transform_en: bool,
     pub index_buffer_lo: u32,
     pub index_buffer_hi: u32,
     pub index_buffer_end_lo: u32,
@@ -154,6 +159,7 @@ impl Default for Maxwell3DRegisters {
             draw_vertex_count: 0,
             draw_first_vertex: 0,
             draw_topology: 0,
+            viewport_transform_en: true,
             index_buffer_lo: 0,
             index_buffer_hi: 0,
             index_buffer_end_lo: 0,
@@ -219,6 +225,7 @@ pub struct DrawCall {
     pub vertex_buffers: [VertexBuffer; 32],
     pub vertex_attribs: [VertexAttribute; 32],
     pub viewport: Viewport,
+    pub viewport_transform_en: bool,
     pub clear_color: ClearColor,
     pub is_clear: bool,
 
@@ -440,6 +447,7 @@ impl Maxwell3D {
                     vertex_buffers: self.regs.vertex_buffers,
                     vertex_attribs: self.regs.vertex_attribs,
                     viewport: self.regs.viewport,
+                    viewport_transform_en: self.regs.viewport_transform_en,
                     clear_color: self.regs.clear_color,
                     is_clear: true,
                     draw_texture: None,
@@ -472,18 +480,22 @@ impl Maxwell3D {
                     clear_mask: arg,
                 });
             }
-            0x280 => self.regs.viewport.width = f32::from_bits(arg).abs() * 2.0,
-            0x281 => self.regs.viewport.height = f32::from_bits(arg).abs() * 2.0,
-            0x282 => self.regs.viewport.scale_z = f32::from_bits(arg),
-            0x285 => self.regs.viewport.translate_z = f32::from_bits(arg),
-            0x35D => {
-                let count = (arg >> 16) & 0xFFF;
-                let topology = (arg >> 28) & 0x7;
-                if count > 0 {
-                    self.regs.draw_count += 1;
-                    self.push_draw(topology, self.regs.draw_first_vertex, count, false, 0);
-                }
+            0x280 => {
+                let v = f32::from_bits(arg);
+                self.regs.viewport.scale_x = v;
+                self.regs.viewport.width = v.abs() * 2.0;
             }
+            0x281 => {
+                let v = f32::from_bits(arg);
+                self.regs.viewport.scale_y = v;
+                self.regs.viewport.height = v.abs() * 2.0;
+            }
+            0x282 => self.regs.viewport.scale_z = f32::from_bits(arg),
+            0x283 => self.regs.viewport.translate_x = f32::from_bits(arg),
+            0x284 => self.regs.viewport.translate_y = f32::from_bits(arg),
+            0x285 => self.regs.viewport.translate_z = f32::from_bits(arg),
+            0x64B => self.regs.viewport_transform_en = arg & 1 != 0,
+            0x35D => self.regs.draw_first_vertex = arg,
             0x35E => {
 
                 self.regs.draw_vertex_count = arg;
@@ -685,6 +697,7 @@ impl Maxwell3D {
             vertex_buffers: self.regs.vertex_buffers,
             vertex_attribs: self.regs.vertex_attribs,
             viewport: self.regs.viewport,
+            viewport_transform_en: self.regs.viewport_transform_en,
             clear_color: self.regs.clear_color,
             is_clear: false,
             draw_texture: None,

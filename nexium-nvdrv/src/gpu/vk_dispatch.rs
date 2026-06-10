@@ -208,11 +208,11 @@ struct ShaderBundle {
 
 #[allow(clippy::type_complexity)]
 fn shader_bundle_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<(u64, u64, u32, u32, u32), std::sync::Arc<ShaderBundle>>>
+) -> &'static std::sync::Mutex<std::collections::HashMap<(u64, u64, u32, u32, u32, u32), std::sync::Arc<ShaderBundle>>>
 {
     use std::sync::OnceLock;
     static CACHE: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(u64, u64, u32, u32, u32), std::sync::Arc<ShaderBundle>>>,
+        std::sync::Mutex<std::collections::HashMap<(u64, u64, u32, u32, u32, u32), std::sync::Arc<ShaderBundle>>>,
     > = OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -301,7 +301,13 @@ fn execute_one(
     }
 
     let ps_key = if draw.topology == 0 { draw.point_size.to_bits() } else { 0 };
-    let shader_key = (vs_addr, fs_addr, vptx_scale_z.to_bits(), vptx_translate_z.to_bits(), ps_key);
+    let window_ndc = if !draw.viewport_transform_en && rt.width > 0 && rt.height > 0 {
+        Some((2.0 / rt.width as f32, 2.0 / rt.height as f32))
+    } else {
+        None
+    };
+    let win_key = if window_ndc.is_some() { (rt.width << 16) | (rt.height & 0xFFFF) } else { 0 };
+    let shader_key = (vs_addr, fs_addr, vptx_scale_z.to_bits(), vptx_translate_z.to_bits(), ps_key, win_key);
     let bundle = {
         let cache = shader_bundle_cache();
         let mut guard = cache.lock().unwrap();
@@ -353,6 +359,7 @@ fn execute_one(
                     vptx_scale_z,
                     vptx_translate_z,
                     point_size: if draw.topology == 0 { Some(draw.point_size) } else { None },
+                    window_ndc,
                     ..Default::default()
                 },
             );
@@ -617,6 +624,7 @@ fn execute_one(
         index_type: vk::IndexType::UINT16,
         rt_key,
         rt_format: vk::Format::R8G8B8A8_UNORM,
+        vp_rect: guest_viewport_rect(draw, rt.width as f32, rt.height as f32),
         state: DrawState {
             topology,
             vertex_count: draw.vertex_count,
@@ -652,6 +660,28 @@ fn execute_one(
     };
 
     Ok(Some(call))
+}
+
+fn guest_viewport_rect(draw: &DrawCall, rt_w: f32, rt_h: f32) -> Option<[f32; 4]> {
+    if !draw.viewport_transform_en {
+        return None;
+    }
+    let sx = draw.viewport.scale_x.abs();
+    let sy = draw.viewport.scale_y.abs();
+    if sx <= 0.0 || sy <= 0.0 {
+        return None;
+    }
+    let x = draw.viewport.translate_x - sx;
+    let y = draw.viewport.translate_y - sy;
+    let w = sx * 2.0;
+    let h = sy * 2.0;
+    if x <= 0.5 && y <= 0.5 && (x + w) >= rt_w - 0.5 && (y + h) >= rt_h - 0.5 {
+        return None;
+    }
+    if w < 1.0 || h < 1.0 || !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    Some([x, y, w, h])
 }
 
 fn map_blend_factor(v: u32) -> vk::BlendFactor {

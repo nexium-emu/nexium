@@ -1400,13 +1400,18 @@ impl Renderer {
         };
         unsafe { device.cmd_begin_rendering(cmd, &render_info) };
 
-        let viewport = vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: rt_extent.width as f32,
-            height: rt_extent.height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
+        let viewport = match call.vp_rect {
+            Some([x, y, w, h]) => vk::Viewport {
+                x, y, width: w, height: h, min_depth: 0.0, max_depth: 1.0,
+            },
+            None => vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: rt_extent.width as f32,
+                height: rt_extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            },
         };
         let scissor = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -1853,6 +1858,11 @@ impl Renderer {
                 had_pass = true;
             }
             unsafe {
+                let vp = match call.vp_rect {
+                    Some([x, y, w, h]) => vk::Viewport { x, y, width: w, height: h, min_depth: 0.0, max_depth: 1.0 },
+                    None => vk::Viewport { x: 0.0, y: 0.0, width: rt_extent.width as f32, height: rt_extent.height as f32, min_depth: 0.0, max_depth: 1.0 },
+                };
+                device.cmd_set_viewport(cmd, 0, &[vp]);
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, prep.pipeline);
                 device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_cache.layout, 0, &[dset], &[]);
                 if let Some((vbuf, voff)) = vertex_bind {

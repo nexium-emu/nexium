@@ -87,6 +87,7 @@ pub struct Maxwell3dDrawCall {
     pub index_type: vk::IndexType,
     pub rt_key: RtKey,
     pub rt_format: vk::Format,
+    pub vp_rect: Option<[f32; 4]>,
     pub state: DrawState,
     pub blend: BlendState,
     pub depth: DepthState,

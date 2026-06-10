@@ -588,6 +588,19 @@ impl Emitter {
                 let component = (slot & 0xC) >> 2;
                 let aligned_slot = slot & !0xF;
                 if slot_is_gl_position(aligned_slot) {
+                    let val = match (self.vertex_opts.window_ndc, component) {
+                        (Some((sx, _)), 0) if matches!(self.stage, Stage::Vertex) => {
+                            let s = self.const_f32(sx.to_bits());
+                            let m = self.b.f_mul(self.f32_t, None, val, s).unwrap();
+                            self.b.f_sub(self.f32_t, None, m, self.f32_one).unwrap()
+                        }
+                        (Some((_, sy)), 1) if matches!(self.stage, Stage::Vertex) => {
+                            let s = self.const_f32(sy.to_bits());
+                            let m = self.b.f_mul(self.f32_t, None, val, s).unwrap();
+                            self.b.f_sub(self.f32_t, None, m, self.f32_one).unwrap()
+                        }
+                        _ => val,
+                    };
                     let pos = self.position_var();
                     let idx = self.const_u32(component);
                     let ac = self.b.access_chain(self.ptr_output_f32, None, pos, [idx]).unwrap();
@@ -1206,6 +1219,7 @@ pub struct VertexOptions {
     pub vptx_translate_z: f32,
     pub inject_ubo_matrix: bool,
     pub point_size: Option<f32>,
+    pub window_ndc: Option<(f32, f32)>,
 }
 
 impl Default for VertexOptions {
@@ -1216,6 +1230,7 @@ impl Default for VertexOptions {
             vptx_translate_z: 0.0,
             inject_ubo_matrix: false,
             point_size: None,
+            window_ndc: None,
         }
     }
 }
