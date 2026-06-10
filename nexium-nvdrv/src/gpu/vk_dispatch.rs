@@ -488,6 +488,7 @@ fn execute_one(
         }
     }
 
+    let mut sampled_rt_fuzzy = false;
     let sampled_rt_key = if !fs_tex_ids.is_empty() && draw.tic_pool_gpu_va != 0 {
         let tex_id = fs_tex_ids[0];
         if tex_id != u32::MAX && tex_id <= draw.tic_pool_limit {
@@ -496,11 +497,23 @@ fn execute_one(
                 let mut tic_raw = [0u8; 32];
                 if mem_read(cpu, &mut tic_raw) {
                     nexium_gpu::texture::TicEntry::parse(&tic_raw).and_then(|tic| {
-                        mappings.nvmap_id_for(tic.gpu_va).map(|nv| RtKey {
+                        let key = mappings.nvmap_id_for(tic.gpu_va).map(|nv| RtKey {
                             nvmap_id: nv,
                             width: tic.width,
                             height: tic.height,
-                        })
+                        });
+                        if key.is_some() && tic.width >= 512 && tic.height >= 256 {
+                            let mid = tic.gpu_va
+                                + (tic.width as u64 * 4) * (tic.height as u64 / 2)
+                                + (tic.width as u64 * 2);
+                            if let Some(mcpu) = mappings.cpu_address_for(mid) {
+                                let mut probe = [0u8; 64];
+                                if mem_read(mcpu, &mut probe) && probe.iter().all(|b| *b == 0) {
+                                    sampled_rt_fuzzy = true;
+                                }
+                            }
+                        }
+                        key
                     })
                 } else {
                     None
@@ -644,6 +657,7 @@ fn execute_one(
         },
         depth_key,
         sampled_rt_key,
+        sampled_rt_fuzzy,
         clear: false,
         clear_color: [0.0, 0.0, 0.0, 1.0],
         tic_pool_gpu_va: draw.tic_pool_gpu_va,

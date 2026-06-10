@@ -247,10 +247,16 @@ impl MaxwellDma {
                 self.blit_pitch_to_pitch(src_cpu, dst_cpu, dst_limit, line_length_src, line_count, mem_read, mem_write);
             }
             _ => {
-                log::trace!(
-                    "MaxwellDma::launch: unsupported layout combo src={} dst={} flags={:#x}",
-                    src_layout, dst_layout, flags
-                );
+                if self.clamp_log_count < 24 {
+                    self.clamp_log_count += 1;
+                    log::warn!(
+                        "MaxwellDma::launch unsupported combo src_layout={} dst_layout={} \
+                         src_gpu={:#x} dst_gpu={:#x} src_w={} src_h={} dst_w={} dst_h={} line_len={} lines={}",
+                        src_layout, dst_layout, src_gpu, dst_gpu,
+                        self.src_width, self.src_height, self.dst_width, self.dst_height,
+                        self.line_length_in, line_count,
+                    );
+                }
             }
         }
         self.blit_count = self.blit_count.wrapping_add(1);

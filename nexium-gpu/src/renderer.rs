@@ -1073,7 +1073,11 @@ impl Renderer {
 
         let rt_alias: Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> = call
             .sampled_rt_key
-            .and_then(|sk| rt_cache.find_color(sk))
+            .and_then(|sk| {
+                rt_cache.find_color(sk).or_else(|| {
+                    if call.sampled_rt_fuzzy { rt_cache.find_color_screen(sk) } else { None }
+                })
+            })
             .filter(|(k, _, _, _)| *k != call.rt_key);
 
         let bound_tex_view: vk::ImageView = if let Some((_, _, alias_view, _)) = rt_alias {
@@ -1453,6 +1457,7 @@ impl Renderer {
 
         rt_cache.get_or_create(call.rt_key, device)?.layout =
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        rt_cache.mark_drawn(call.rt_key);
         if use_depth {
             if let Ok(d) = rt_cache.get_or_create_depth(call.rt_key, device) {
                 d.layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -1661,7 +1666,11 @@ impl Renderer {
 
             let rt_alias: Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> = call
                 .sampled_rt_key
-                .and_then(|sk| rt_cache.find_color(sk))
+                .and_then(|sk| {
+                    rt_cache.find_color(sk).or_else(|| {
+                        if call.sampled_rt_fuzzy { rt_cache.find_color_screen(sk) } else { None }
+                    })
+                })
                 .filter(|(k, _, _, _)| *k != rt_key);
             if let Some((ak, alias_image, _, alias_prev)) = rt_alias {
                 if !alias_used.contains(&ak) {
@@ -1886,6 +1895,7 @@ impl Renderer {
         frame_slots[cur_idx].in_flight = true;
         frame_slots[cur_idx].retired_dsets.extend(dsets_batch);
         rt_cache.get_or_create(rt_key, device)?.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        rt_cache.mark_drawn(rt_key);
         if any_depth {
             if let Ok(d) = rt_cache.get_or_create_depth(rt_key, device) {
                 d.layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;

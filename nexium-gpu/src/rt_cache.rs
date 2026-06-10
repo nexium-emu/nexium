@@ -21,6 +21,8 @@ pub struct RtCache {
     cache: HashMap<RtKey, GpuImage>,
     depth_cache: HashMap<RtKey, GpuImage>,
     mem_properties: Option<vk::PhysicalDeviceMemoryProperties>,
+    drawn_stamp: HashMap<RtKey, u64>,
+    drawn_counter: u64,
 }
 
 impl RtCache {
@@ -29,7 +31,28 @@ impl RtCache {
             cache: HashMap::new(),
             depth_cache: HashMap::new(),
             mem_properties: None,
+            drawn_stamp: HashMap::new(),
+            drawn_counter: 0,
         }
+    }
+
+    pub fn mark_drawn(&mut self, key: RtKey) {
+        self.drawn_counter += 1;
+        self.drawn_stamp.insert(key, self.drawn_counter);
+    }
+
+    pub fn find_color_screen(&self, want: RtKey) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
+        let mut best: Option<(RtKey, &GpuImage, u64)> = None;
+        for (k, img) in &self.cache {
+            if k.nvmap_id == want.nvmap_id || k.width != want.width || k.height != want.height {
+                continue;
+            }
+            let Some(stamp) = self.drawn_stamp.get(k).copied() else { continue };
+            if best.as_ref().map_or(true, |(_, _, bs)| stamp > *bs) {
+                best = Some((*k, img, stamp));
+            }
+        }
+        best.map(|(k, img, _)| (k, img.image, img.view, img.layout))
     }
 
     pub fn set_mem_properties(&mut self, props: vk::PhysicalDeviceMemoryProperties) {

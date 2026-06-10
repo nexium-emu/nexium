@@ -93,6 +93,7 @@ pub struct Maxwell3dDrawCall {
     pub depth: DepthState,
     pub depth_key: Option<RtKey>,
     pub sampled_rt_key: Option<RtKey>,
+    pub sampled_rt_fuzzy: bool,
     pub clear: bool,
     pub clear_color: [f32; 4],
     pub tic_pool_gpu_va: u64,
