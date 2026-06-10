@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 resolver = "2"
 members = [
     "nexium-common",
@@ -74,4 +74,4 @@ codegen-units = 1
 debug = 1
 
 [patch.crates-io]
-dynarmic-sys-mythrax = { path = "vendored/dynarmic-sys-mythrax" }
+dynarmic-sys-mythrax = { path = "../dynarmic-sys" }
