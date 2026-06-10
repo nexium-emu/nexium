@@ -15,18 +15,18 @@ const M_LAUNCH_DMA: u32 = 0xC0;
 const M_SET_REMAP_CONST_A: u32 = 0x1C0;
 const M_SET_REMAP_CONST_B: u32 = 0x1C1;
 const M_SET_REMAP_COMPONENTS: u32 = 0x1C2;
-const M_SET_SRC_BLOCK_SIZE: u32 = 0x1C3;
-const M_SET_SRC_WIDTH: u32 = 0x1C4;
-const M_SET_SRC_HEIGHT: u32 = 0x1C5;
-const M_SET_SRC_DEPTH: u32 = 0x1C6;
-const M_SET_SRC_LAYER: u32 = 0x1C7;
-const M_SET_SRC_ORIGIN: u32 = 0x1C8;
-const M_SET_DST_BLOCK_SIZE: u32 = 0x1CA;
-const M_SET_DST_WIDTH: u32 = 0x1CB;
-const M_SET_DST_HEIGHT: u32 = 0x1CC;
-const M_SET_DST_DEPTH: u32 = 0x1CD;
-const M_SET_DST_LAYER: u32 = 0x1CE;
-const M_SET_DST_ORIGIN: u32 = 0x1CF;
+const M_SET_DST_BLOCK_SIZE: u32 = 0x1C3;
+const M_SET_DST_WIDTH: u32 = 0x1C4;
+const M_SET_DST_HEIGHT: u32 = 0x1C5;
+const M_SET_DST_DEPTH: u32 = 0x1C6;
+const M_SET_DST_LAYER: u32 = 0x1C7;
+const M_SET_DST_ORIGIN: u32 = 0x1C8;
+const M_SET_SRC_BLOCK_SIZE: u32 = 0x1CA;
+const M_SET_SRC_WIDTH: u32 = 0x1CB;
+const M_SET_SRC_HEIGHT: u32 = 0x1CC;
+const M_SET_SRC_DEPTH: u32 = 0x1CD;
+const M_SET_SRC_LAYER: u32 = 0x1CE;
+const M_SET_SRC_ORIGIN: u32 = 0x1CF;
 
 const LAUNCH_SRC_LAYOUT_BIT: u32 = 7;
 const LAUNCH_DST_LAYOUT_BIT: u32 = 8;
@@ -316,12 +316,7 @@ impl MaxwellDma {
     ) {
         self.last_tiled_dst_cpu = dst_cpu;
 
-        let dst_block_size_eff = if self.dst_block_size != 0 {
-            self.dst_block_size
-        } else {
-            self.src_block_size
-        };
-        let block_height_log2 = ((dst_block_size_eff >> 4) & 0xF) as u32;
+        let block_height_log2 = ((self.dst_block_size >> 4) & 0xF) as u32;
         let src_pitch = self.pitch_in.max(line_length_src as u32) as usize;
 
         let dst_width_bytes = if self.dst_width != 0 {
