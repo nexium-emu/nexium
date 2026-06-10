@@ -29,7 +29,7 @@ pub struct PipelineKey {
     pub poly_offset_packed: u64,
 }
 
-const SPEC_VERSION: u32 = 4;
+const SPEC_VERSION: u32 = 5;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineSpec {

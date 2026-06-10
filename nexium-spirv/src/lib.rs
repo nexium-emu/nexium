@@ -48,6 +48,7 @@ pub struct Emitter {
     input_vars: HashMap<u32, AttrVar>,
     output_vars: HashMap<u32, AttrVar>,
     pos_var: Option<Word>,
+    point_size_var: Option<Word>,
     frag_coord_var: Option<Word>,
     frag_color_var: Option<Word>,
     image_var: Option<Word>,
@@ -67,6 +68,7 @@ pub struct Emitter {
     bool_true: Word,
     bool_false: Word,
     pred_regs: [Option<Word>; 7],
+    ubo_vec4s: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -77,6 +79,10 @@ struct AttrVar {
 
 impl Emitter {
     pub fn new(stage: Stage) -> Self {
+        Self::new_sized(stage, UBO_VEC4S)
+    }
+
+    fn new_sized(stage: Stage, ubo_vec4s: u32) -> Self {
         let mut b = rspirv::dr::Builder::new();
         b.set_version(1, 0);
         b.capability(Capability::Shader);
@@ -94,7 +100,7 @@ impl Emitter {
         let ptr_output_vec4 = b.type_pointer(None, StorageClass::Output, vec4_t);
         let ptr_output_f32 = b.type_pointer(None, StorageClass::Output, f32_t);
 
-        let ubo_vec4s_const = b.constant_bit32(u32_t, UBO_VEC4S);
+        let ubo_vec4s_const = b.constant_bit32(u32_t, ubo_vec4s);
         let vec4_arr = b.type_array(vec4_t, ubo_vec4s_const);
         b.decorate(vec4_arr, Decoration::ArrayStride, [Operand::LiteralBit32(16)]);
         let ubo_struct = b.type_struct([vec4_arr]);
@@ -154,6 +160,7 @@ impl Emitter {
             input_vars: HashMap::new(),
             output_vars: HashMap::new(),
             pos_var: None,
+            point_size_var: None,
             frag_coord_var: None,
             frag_color_var: None,
             image_var: None,
@@ -173,11 +180,18 @@ impl Emitter {
             bool_true,
             bool_false,
             pred_regs: [None; 7],
+            ubo_vec4s,
         }
     }
 
     pub fn new_with_vertex_opts(stage: Stage, vertex_opts: VertexOptions) -> Self {
         let mut e = Self::new(stage);
+        e.vertex_opts = vertex_opts;
+        e
+    }
+
+    fn new_with_vertex_opts_sized(stage: Stage, vertex_opts: VertexOptions, ubo_vec4s: u32) -> Self {
+        let mut e = Self::new_sized(stage, ubo_vec4s);
         e.vertex_opts = vertex_opts;
         e
     }
@@ -190,6 +204,17 @@ impl Emitter {
         self.b.decorate(v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::Position)]);
         self.interface.push(v);
         self.pos_var = Some(v);
+        v
+    }
+
+    fn point_size_var_id(&mut self) -> Word {
+        if let Some(v) = self.point_size_var {
+            return v;
+        }
+        let v = self.b.variable(self.ptr_output_f32, None, StorageClass::Output, None);
+        self.b.decorate(v, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::PointSize)]);
+        self.interface.push(v);
+        self.point_size_var = Some(v);
         v
     }
 
@@ -525,7 +550,7 @@ impl Emitter {
             }
             IrOp::LoadCbuf { binding, byte_offset } => {
                 self.cbuf_bindings_used |= 1u32 << (binding & 0x1F);
-                let vec4_index = (byte_offset / 16) % UBO_VEC4S;
+                let vec4_index = (byte_offset / 16) % self.ubo_vec4s;
                 let component = (byte_offset / 4) & 0x3;
                 let v_idx = self.const_u32(vec4_index);
                 let c_idx = self.const_u32(component);
@@ -567,6 +592,9 @@ impl Emitter {
                     let idx = self.const_u32(component);
                     let ac = self.b.access_chain(self.ptr_output_f32, None, pos, [idx]).unwrap();
                     self.b.store(ac, val, None, []).unwrap();
+                } else if *slot == 0x6C && matches!(self.stage, Stage::Vertex) {
+                    let v = self.point_size_var_id();
+                    self.b.store(v, val, None, []).unwrap();
                 } else if *slot < 0x80 {
                     let _ = (val, component);
                 } else {
@@ -879,6 +907,8 @@ impl Emitter {
                         let aligned = slot & !0xF;
                         if slot_is_gl_position(aligned) {
                             self.position_var();
+                        } else if *slot == 0x6C && matches!(self.stage, Stage::Vertex) {
+                            self.point_size_var_id();
                         } else if *slot >= 0x80 {
                             self.output_var(aligned);
                         }
@@ -941,6 +971,14 @@ impl Emitter {
     ) -> (Vec<u32>, u32, Vec<u32>) {
         self.preallocate_resources(cfg);
 
+        let ps_inject: Option<(Word, u32)> = if matches!(self.stage, Stage::Vertex) {
+            self.vertex_opts
+                .point_size
+                .map(|ps| (self.point_size_var_id(), ps.to_bits()))
+        } else {
+            None
+        };
+
         let mut required_outputs: Vec<(u32, AttrVar)> = Vec::new();
         if matches!(self.stage, Stage::Vertex) {
             for &loc in required_output_locations {
@@ -966,6 +1004,11 @@ impl Emitter {
                     self.write_attr_component(*av, c, o);
                 }
             }
+        }
+
+        if let Some((v, bits)) = ps_inject {
+            let c = self.const_f32(bits);
+            self.b.store(v, c, None, []).unwrap();
         }
 
         self.lower_cfg(cfg);
@@ -1162,6 +1205,7 @@ pub struct VertexOptions {
     pub vptx_scale_z: f32,
     pub vptx_translate_z: f32,
     pub inject_ubo_matrix: bool,
+    pub point_size: Option<f32>,
 }
 
 impl Default for VertexOptions {
@@ -1171,25 +1215,43 @@ impl Default for VertexOptions {
             vptx_scale_z: 1.0,
             vptx_translate_z: 0.0,
             inject_ubo_matrix: false,
+            point_size: None,
         }
     }
+}
+
+fn cbuf_vec4s(cfg: &Cfg, floor_vec4s: u32) -> u32 {
+    let mut max_byte = 0u32;
+    for block in &cfg.blocks {
+        for inst in &block.program.instructions {
+            if let IrOp::LoadCbuf { byte_offset, .. } = &inst.op {
+                max_byte = max_byte.max(byte_offset.saturating_add(4));
+            }
+        }
+    }
+    let vec4s = ((max_byte + 15) / 16).max(floor_vec4s).max(16);
+    ((vec4s + 15) & !15).min(UBO_VEC4S)
 }
 
 pub fn emit_vertex_with_bindings_opts(
     cfg: &Cfg,
     required_outputs: &[u32],
     opts: VertexOptions,
-) -> (Vec<u32>, u32) {
-    Emitter::new_with_vertex_opts(Stage::Vertex, opts)
-        .finish_with_required_outputs_and_bindings(cfg, required_outputs)
+) -> (Vec<u32>, u32, u32) {
+    let vec4s = cbuf_vec4s(cfg, if opts.inject_ubo_matrix { 4 } else { 1 });
+    let (words, mask) = Emitter::new_with_vertex_opts_sized(Stage::Vertex, opts, vec4s)
+        .finish_with_required_outputs_and_bindings(cfg, required_outputs);
+    (words, mask, vec4s * 16)
 }
 
 pub fn emit_fragment_with_bindings(cfg: &Cfg) -> (Vec<u32>, u32) {
     Emitter::new(Stage::Fragment).finish_with_required_outputs_and_bindings(cfg, &[])
 }
 
-pub fn emit_fragment_full(cfg: &Cfg) -> (Vec<u32>, u32, Vec<u32>) {
-    Emitter::new(Stage::Fragment).finish_full(cfg, &[])
+pub fn emit_fragment_full(cfg: &Cfg) -> (Vec<u32>, u32, Vec<u32>, u32) {
+    let vec4s = cbuf_vec4s(cfg, 1);
+    let (words, mask, tex_ids) = Emitter::new_sized(Stage::Fragment, vec4s).finish_full(cfg, &[]);
+    (words, mask, tex_ids, vec4s * 16)
 }
 
 pub fn scan_input_locations(words: &[u32]) -> Vec<u32> {
