@@ -25,8 +25,13 @@ unsafe impl Sync for DynarmicCpu {}
 
 impl DynarmicCpu {
     pub fn new() -> Result<Self, String> {
-        let emu: dynarmic_sys::Dynarmic<'static, ()> =
-            dynarmic_sys::Dynarmic::new();
+        let emu: dynarmic_sys::Dynarmic<'static, ()> = match nexium_memory::fastmem::base() {
+            Some(base) => {
+                log::info!("dynarmic: fastmem enabled, arena base={:p}", base);
+                dynarmic_sys::Dynarmic::new_fastmem(base.cast())
+            }
+            None => dynarmic_sys::Dynarmic::new(),
+        };
 
         let last_event = Arc::new(Mutex::new(None::<CpuEvent>));
         let last_fault: Arc<Mutex<Option<FaultSnapshot>>> = Arc::new(Mutex::new(None));
