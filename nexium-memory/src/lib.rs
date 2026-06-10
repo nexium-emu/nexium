@@ -1,4 +1,5 @@
 pub mod address_space;
+pub mod fastmem;
 pub mod region;
 pub mod perm;
 

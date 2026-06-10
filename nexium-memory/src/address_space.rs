@@ -38,6 +38,7 @@ struct Region {
     len: usize,
     perm: Mutex<Perm>,
     name: String,
+    arena: bool,
 }
 
 unsafe impl Send for Region {}
@@ -45,6 +46,17 @@ unsafe impl Sync for Region {}
 
 impl Region {
     fn new(base: u64, len: usize, perm: Perm, name: String) -> Self {
+        if let Some(ptr) = crate::fastmem::commit(base, len) {
+            let buf = unsafe { NonNull::new_unchecked(ptr) };
+            return Self {
+                base,
+                buf,
+                len,
+                perm: Mutex::new(perm),
+                name,
+                arena: true,
+            };
+        }
         let boxed: Box<[u8]> = vec![0u8; len].into_boxed_slice();
         let raw = Box::into_raw(boxed);
         let buf = unsafe { NonNull::new_unchecked(raw as *mut u8) };
@@ -54,6 +66,7 @@ impl Region {
             len,
             perm: Mutex::new(perm),
             name,
+            arena: false,
         }
     }
 
@@ -75,6 +88,10 @@ impl Region {
 
 impl Drop for Region {
     fn drop(&mut self) {
+        if self.arena {
+            crate::fastmem::decommit(self.buf.as_ptr(), self.len);
+            return;
+        }
         unsafe {
             let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                 self.buf.as_ptr(),
