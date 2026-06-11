@@ -126,11 +126,14 @@ impl BootContext {
         log::info!("homebrew_dir = {:?}", kernel.homebrew_dir);
 
         log::info!("  Initializing environment block @ {:#x}", env_base);
+        nexium_common::paths::init();
         let nro_filename = std::path::Path::new(&config.nro_path)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("hbmenu.nro");
-        let argv_path = format!("sdmc:/{}", nro_filename);
+        let app_name = nexium_common::paths::app_name_from_nro(&config.nro_path);
+        let _ = nexium_common::paths::sdmc_app_dir(&app_name);
+        let argv_path = format!("sdmc:/switch/{}/{}", app_name, nro_filename);
         let next_load_path = config.loader_path.clone().unwrap_or_else(|| argv_path.clone());
         let env_builder = nexium_loader::EnvBlockBuilder::new()
             .with_handles(kernel.main_thread_handle, kernel.process_handle)

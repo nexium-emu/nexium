@@ -137,7 +137,8 @@ impl EmulationHandle {
                 .and_then(|s| s.to_str())
                 .unwrap_or("hbmenu.nro")
                 .to_string();
-            let initial_loader_argv = format!("sdmc:/{}", initial_loader_filename);
+            let initial_loader_app = nexium_common::paths::app_name_from_nro(&initial_loader_path);
+            let initial_loader_argv = format!("sdmc:/switch/{}/{}", initial_loader_app, initial_loader_filename);
             let mut cur_nro_path = nro_path;
 
             'launcher: loop {
