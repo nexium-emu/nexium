@@ -56,6 +56,7 @@ struct CachedTexture {
     view: vk::ImageView,
     memory: vk::DeviceMemory,
     hash: u64,
+    gen: u64,
 }
 
 struct StagingBuffer {
@@ -1040,8 +1041,11 @@ impl Renderer {
         {
             if let Some(raw) = read_guest(tic.gpu_va, read_size) {
                 let tex_hash = hash_src_prefix(&raw);
-                let need_upload =
-                    match tex_cache.get(&key) { Some(t) => t.hash != tex_hash, None => true };
+                let cur_gen = crate::tex_invalidate::region_gen(tic.gpu_va);
+                let need_upload = match tex_cache.get(&key) {
+                    Some(t) => t.gen != cur_gen || t.hash != tex_hash,
+                    None => true,
+                };
                 if need_upload {
                     {
                         use std::collections::HashSet;
@@ -1081,7 +1085,7 @@ impl Renderer {
                         tic.is_block_linear, tic.block_height_log2, read_size, rgba8.len()
                     );
                     match upload_texture_oneshot(
-                        device, *queue, *cmd_pool, mem_props, key.width, key.height, &rgba8, tex_hash,
+                        device, *queue, *cmd_pool, mem_props, key.width, key.height, &rgba8, tex_hash, cur_gen,
                     ) {
                         Ok(tex) => {
                             if let Some(old) = tex_cache.insert(key, tex) {
@@ -1643,8 +1647,11 @@ impl Renderer {
             } else if let Some((key, tic, pitch_size, read_size)) = prep.tex_pending {
                 if let Some(raw) = read_guest(tic.gpu_va, read_size) {
                     let tex_hash = hash_src_prefix(&raw);
-                    let need_upload =
-                        match tex_cache.get(&key) { Some(t) => t.hash != tex_hash, None => true };
+                    let cur_gen = crate::tex_invalidate::region_gen(tic.gpu_va);
+                    let need_upload = match tex_cache.get(&key) {
+                        Some(t) => t.gen != cur_gen || t.hash != tex_hash,
+                        None => true,
+                    };
                     if need_upload {
                         let bpp = tic.format.src_bpp();
                         let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH").map(|v| v == "1").unwrap_or(false);
@@ -1679,7 +1686,7 @@ impl Renderer {
                             unsafe { device.cmd_end_rendering(cmd); }
                             pass_open = false;
                         }
-                        match create_texture_image(device, cmd, mem_props, key.width, key.height, &rgba8, tex_hash) {
+                        match create_texture_image(device, cmd, mem_props, key.width, key.height, &rgba8, tex_hash, cur_gen) {
                             Ok((tex, sbuf, smem)) => {
                                 if let Some(old) = tex_cache.insert(key, tex) {
                                     frame_slots[cur_idx].retired_textures.push(old);
@@ -2130,10 +2137,11 @@ fn upload_texture_oneshot(
     height: u32,
     rgba8: &[u8],
     hash: u64,
+    gen: u64,
 ) -> Result<CachedTexture, String> {
     let cmd = alloc_one_time_cmd(device, cmd_pool)?;
     begin_one_time(device, cmd)?;
-    let (tex, sbuf, smem) = create_texture_image(device, cmd, mem_props, width, height, rgba8, hash)?;
+    let (tex, sbuf, smem) = create_texture_image(device, cmd, mem_props, width, height, rgba8, hash, gen)?;
     end_one_time(device, cmd)?;
     submit_and_wait(device, queue, cmd)?;
     unsafe {
@@ -2152,6 +2160,7 @@ fn create_texture_image(
     height: u32,
     rgba8: &[u8],
     hash: u64,
+    gen: u64,
 ) -> Result<(CachedTexture, vk::Buffer, vk::DeviceMemory), String> {
     let format = vk::Format::R8G8B8A8_UNORM;
     let img_info = vk::ImageCreateInfo {
@@ -2246,7 +2255,7 @@ fn create_texture_image(
         device.create_image_view(&view_info, None)
             .map_err(|e| format!("create_image_view(tex): {:?}", e))?
     };
-    Ok((CachedTexture { image, view, memory, hash }, stage.buffer, stage.memory))
+    Ok((CachedTexture { image, view, memory, hash, gen }, stage.buffer, stage.memory))
 }
 
 fn create_dummy_white_image(

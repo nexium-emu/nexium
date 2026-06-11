@@ -6,6 +6,7 @@ pub mod deswizzle;
 pub mod draw;
 pub mod pipeline;
 pub mod pitch_oracle;
+pub mod tex_invalidate;
 pub mod renderer;
 pub mod rt_cache;
 pub mod shader;
