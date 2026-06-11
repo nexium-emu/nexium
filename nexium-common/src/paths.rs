@@ -66,16 +66,16 @@ pub fn app_name_from_nro(nro_path: &str) -> String {
     let stem = Path::new(nro_path)
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .trim();
     let cleaned: String = stem
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c })
+        .map(|c| if c == '/' || c == '\\' || c == ':' || c == ' ' { '_' } else { c })
         .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
+    if cleaned.is_empty() {
         "app".to_string()
     } else {
-        trimmed.to_string()
+        cleaned
     }
 }
 
