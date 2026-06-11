@@ -227,6 +227,16 @@ impl Kernel {
         }
     }
 
+    pub fn signal_vsync(&mut self) {
+        let vsyncs: Vec<u32> = self.vsync_handles.iter().copied().collect();
+        for h in vsyncs {
+            self.event_signals.insert(h, true);
+            self.threads.signal_handle(h);
+            self.nvdrv.stats.vsync_signals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.last_vsync = std::time::Instant::now();
+    }
+
     pub fn tick_audio_renderers(&mut self) {
         const FRAMES_PER_AUDIO_FRAME: u64 = 240;
         const MAX_BACKLOG_BLOCKS: u64 = 400;

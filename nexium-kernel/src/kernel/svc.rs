@@ -2893,35 +2893,7 @@ fn igbp_handle_transact(kernel: &mut Kernel, binder_id: u32, code: u32, in_parce
                 log::warn!("QueueBuffer: slot {} has no GraphicBuffer", slot);
             }
 
-            let vsyncs: Vec<u32> = kernel.vsync_handles.iter().copied().collect();
-            for h in vsyncs {
-                kernel.event_signals.insert(h, true);
-                kernel.threads.signal_handle(h);
-                kernel.nvdrv.stats.vsync_signals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            kernel.last_vsync = std::time::Instant::now();
-
-            {
-                const VSYNC_NS: u64 = 16_666_667;
-                let n = swap_interval.clamp(2, 4) as u64;
-                let target = std::time::Duration::from_nanos(VSYNC_NS.saturating_mul(n));
-                use parking_lot::Mutex;
-                use std::sync::OnceLock;
-                static LAST_SWAP: OnceLock<Mutex<std::time::Instant>> = OnceLock::new();
-                let cell = LAST_SWAP.get_or_init(|| Mutex::new(std::time::Instant::now()));
-                let mut last = cell.lock();
-                let wake = *last + target;
-                let now = std::time::Instant::now();
-                if wake > now {
-                    *last = wake;
-                    drop(last);
-                    kernel.present_pace_until = Some(wake);
-                } else if now.duration_since(wake) > std::time::Duration::from_millis(100) {
-                    *last = now;
-                } else {
-                    *last = wake;
-                }
-            }
+            let _ = swap_interval;
 
             let (qw, qh) = kernel.nvdrv.with_bufferqueue(binder_id, |bq| (bq.width, bq.height));
             let mut p = ParcelBuilder::new();

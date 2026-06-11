@@ -269,6 +269,45 @@ impl EmulationHandle {
             }
             let _wd_guard = WatchdogGuard(Arc::clone(&watchdog_stop));
 
+            let vsync_stop = Arc::new(AtomicBool::new(false));
+            {
+                let kernel_v = Arc::clone(&boot_ctx.kernel);
+                let stop_v = Arc::clone(&vsync_stop);
+                let _ = thread::Builder::new()
+                    .name("nexium-vsync".into())
+                    .spawn(move || {
+                        const PERIOD: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+                        let mut next = std::time::Instant::now() + PERIOD;
+                        while !stop_v.load(Ordering::Relaxed) {
+                            let now = std::time::Instant::now();
+                            if now < next {
+                                let rem = next - now;
+                                if rem > std::time::Duration::from_millis(2) {
+                                    thread::sleep(rem - std::time::Duration::from_millis(1));
+                                } else {
+                                    while std::time::Instant::now() < next {
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                                continue;
+                            }
+                            kernel_v.lock().signal_vsync();
+                            next += PERIOD;
+                            let after = std::time::Instant::now();
+                            if after > next + PERIOD {
+                                next = after + PERIOD;
+                            }
+                        }
+                    });
+            }
+            struct VsyncGuard(Arc<AtomicBool>);
+            impl Drop for VsyncGuard {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            let _vsync_guard = VsyncGuard(Arc::clone(&vsync_stop));
+
             log::info!("Starting emulation loop [BUILD: heartbeat-v2-gpu-diag]");
             let max_cycles = u64::MAX;
             let mut cycle_count = 0u64;
