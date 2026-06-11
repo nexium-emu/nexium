@@ -17,6 +17,11 @@ pub struct GpuImage {
     pub layout: vk::ImageLayout,
 }
 
+fn dims_close(a: u32, b: u32) -> bool {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    lo != 0 && hi <= lo.saturating_mul(2)
+}
+
 pub struct RtCache {
     cache: HashMap<RtKey, GpuImage>,
     depth_cache: HashMap<RtKey, GpuImage>,
@@ -96,6 +101,9 @@ impl RtCache {
         let mut best: Option<(RtKey, &GpuImage)> = None;
         for (k, img) in &self.cache {
             if k.nvmap_id != want.nvmap_id {
+                continue;
+            }
+            if !dims_close(k.width, want.width) || !dims_close(k.height, want.height) {
                 continue;
             }
             let kd = (k.width as i64 - want.width as i64).abs()
