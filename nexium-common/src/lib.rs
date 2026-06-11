@@ -1,6 +1,7 @@
 pub mod error;
 pub mod result;
 pub mod constants;
+pub mod paths;
 pub mod log_init;
 pub mod log_sink;
 pub mod file_logger;

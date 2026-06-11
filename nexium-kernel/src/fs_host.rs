@@ -6,12 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub fn sdmc_root() -> PathBuf {
-    if let Some(dirs) = directories::BaseDirs::new() {
-        let root = dirs.config_dir().join("NeXium").join("sdmc");
-        let _ = std::fs::create_dir_all(&root);
-        return root;
-    }
-    PathBuf::from("./sdmc")
+    nexium_common::paths::sdmc_dir()
 }
 
 pub fn translate_path(switch_path: &str) -> PathBuf {
