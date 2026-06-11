@@ -195,6 +195,14 @@ impl Fermi2D {
         }
         self.blit_count = self.blit_count.wrapping_add(1);
 
+        let bump_size = if dst_layout == MEMORY_LAYOUT_BLOCK_LINEAR {
+            tiled_size_bytes((self.dst.width as usize) * bpp, self.dst.height as usize, self.dst.block_height_log2()) as u64
+        } else {
+            let dst_pitch = self.dst.pitch.max(self.dst.width.max(1) * bpp as u32) as u64;
+            dst_pitch * (self.dst.height.max(1) as u64)
+        };
+        nexium_gpu::tex_invalidate::bump_region(dst_va, bump_size);
+
         let framebuffer_like = self.dst.memory_layout == MEMORY_LAYOUT_PITCH
             && self.dst.width >= 320
             && self.dst.height >= 240

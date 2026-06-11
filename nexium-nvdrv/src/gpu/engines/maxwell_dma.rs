@@ -246,13 +246,21 @@ impl MaxwellDma {
                     bytes_per_element,
                     mem_read, mem_write,
                 );
+                let dst_w = if self.dst_width != 0 { (self.dst_width as usize) * bytes_per_element.max(1) } else { line_length_dst };
+                let dst_h = if self.dst_height != 0 { self.dst_height as usize } else { line_count };
+                let bh = ((self.dst_block_size >> 4) & 0xF) as u32;
+                nexium_gpu::tex_invalidate::bump_region(dst_gpu, tiled_size_bytes(dst_w, dst_h, bh) as u64);
             }
             (LAYOUT_BLOCK_LINEAR, LAYOUT_PITCH) => {
                 nexium_gpu::pitch_oracle::record_pitch_dst(dst_gpu);
                 self.blit_block_to_pitch(src_cpu, dst_cpu, dst_limit, line_length_src, line_count, bytes_per_element, mem_read, mem_write);
+                let dst_pitch = self.pitch_out.max(line_length_src as u32) as usize;
+                nexium_gpu::tex_invalidate::bump_region(dst_gpu, (dst_pitch * line_count) as u64);
             }
             (LAYOUT_PITCH, LAYOUT_PITCH) => {
                 self.blit_pitch_to_pitch(src_cpu, dst_cpu, dst_limit, line_length_src, line_count, mem_read, mem_write);
+                let dst_pitch = self.pitch_out.max(line_length_src as u32) as usize;
+                nexium_gpu::tex_invalidate::bump_region(dst_gpu, (dst_pitch * line_count) as u64);
             }
             _ => {
                 if self.clamp_log_count < 24 {
@@ -504,7 +512,7 @@ const GOB_W: usize = 64;
 const GOB_H: usize = 8;
 const GOB_SIZE: usize = 512;
 
-fn tiled_size_bytes(width_bytes: usize, height: usize, block_height_log2: u32) -> usize {
+pub(super) fn tiled_size_bytes(width_bytes: usize, height: usize, block_height_log2: u32) -> usize {
     let block_height = 1usize << block_height_log2;
     let rows_per_block = block_height * GOB_H;
     let gobs_per_row = (width_bytes + GOB_W - 1) / GOB_W;

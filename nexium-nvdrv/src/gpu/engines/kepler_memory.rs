@@ -177,6 +177,20 @@ impl KeplerMemory {
             _ => unreachable!(),
         }
 
+        let bump_size = match dst_layout {
+            LAYOUT_BLOCK_LINEAR => {
+                let bh = ((self.dst_block_size >> 4) & 0xF) as u32;
+                let dw = if self.dst_width != 0 { self.dst_width as usize } else { line_length };
+                let dh = if self.dst_height != 0 { self.dst_height as usize } else { line_count };
+                super::maxwell_dma::tiled_size_bytes(dw, dh, bh) as u64
+            }
+            _ => {
+                let pitch_out = self.pitch_out.max(line_length as u32) as u64;
+                pitch_out * line_count as u64
+            }
+        };
+        nexium_gpu::tex_invalidate::bump_region(dst_gpu, bump_size);
+
         self.upload_count = self.upload_count.wrapping_add(1);
     }
 }
