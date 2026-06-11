@@ -141,9 +141,17 @@ impl MaxwellDma {
         let Some(nvmap) = mappings.nvmap_id_for(src_gpu) else { return };
         let Some((src_cpu, limit)) = mappings.cpu_range_for(src_gpu) else { return };
         let Some((kw, kh)) = renderer.rt_key_for_nvmap(nvmap, self.src_width, self.src_height) else { return };
-        let Some(rgba) = renderer.readback_target(nvmap, kw, kh) else { return };
+        let Some(mut rgba) = renderer.readback_target(nvmap, kw, kh) else { return };
         let width_bytes = (kw as usize) * 4;
         let bh_log2 = ((self.src_block_size >> 4) & 0xF) as u32;
+        if kh >= 2 && rgba.len() >= width_bytes * kh as usize {
+            let h = kh as usize;
+            for y in 0..h / 2 {
+                let (top, bot) = rgba.split_at_mut((h - 1 - y) * width_bytes);
+                top[y * width_bytes..(y + 1) * width_bytes]
+                    .swap_with_slice(&mut bot[..width_bytes]);
+            }
+        }
         let tiled = swizzle_block_linear(
             &rgba, width_bytes, kh as usize, width_bytes,
             width_bytes, kh as usize, bh_log2, 0, 0,

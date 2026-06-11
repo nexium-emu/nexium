@@ -617,30 +617,9 @@ impl Renderer {
         if !cache_contains(rt_cache, key) {
             return None;
         }
-
-        let row_bytes = (width as u64) * 4;
-        let total = row_bytes * (height as u64);
-
-        let mut out_bytes: Option<Vec<u8>> = None;
-        if let Some(prev) = pending_readbacks.remove(&key) {
-            if prev.width == width && prev.height == height {
-                unsafe {
-                    let _ = device.wait_for_fences(&[prev.fence], true, u64::MAX);
-                }
-                let mut out = vec![0u8; total as usize];
-                unsafe {
-                    if let Ok(ptr) = device.map_memory(
-                        prev.stage.memory, 0, prev.stage.size, vk::MemoryMapFlags::empty(),
-                    ) {
-                        std::ptr::copy_nonoverlapping(
-                            ptr as *const u8, out.as_mut_ptr(), total as usize,
-                        );
-                        device.unmap_memory(prev.stage.memory);
-                        out_bytes = Some(out);
-                    }
-                }
-            }
+        for (_, prev) in pending_readbacks.drain() {
             unsafe {
+                let _ = device.wait_for_fences(&[prev.fence], true, u64::MAX);
                 device.destroy_fence(prev.fence, None);
                 device.destroy_buffer(prev.stage.buffer, None);
                 device.free_memory(prev.stage.memory, None);
@@ -648,7 +627,16 @@ impl Renderer {
             }
         }
 
+        let total = (width as u64) * 4 * (height as u64);
         let stage = create_staging_owned(device, mem_props, total).ok()?;
+        let cleanup = |device: &ash::Device, cmd_pool: vk::CommandPool,
+                       fence: Option<vk::Fence>, cmd: Option<vk::CommandBuffer>,
+                       stage: &StagingBuffer| unsafe {
+            if let Some(c) = cmd { device.free_command_buffers(cmd_pool, &[c]); }
+            if let Some(f) = fence { device.destroy_fence(f, None); }
+            device.destroy_buffer(stage.buffer, None);
+            device.free_memory(stage.memory, None);
+        };
         let fence_info = vk::FenceCreateInfo {
             s_type: vk::StructureType::FENCE_CREATE_INFO,
             flags: vk::FenceCreateFlags::empty(),
@@ -657,50 +645,25 @@ impl Renderer {
         };
         let fence = match unsafe { device.create_fence(&fence_info, None) } {
             Ok(f) => f,
-            Err(_) => {
-                unsafe {
-                    device.destroy_buffer(stage.buffer, None);
-                    device.free_memory(stage.memory, None);
-                }
-                return out_bytes;
-            }
+            Err(_) => { cleanup(device, *cmd_pool, None, None, &stage); return None; }
         };
         let cmd = match alloc_one_time_cmd(device, *cmd_pool) {
             Ok(c) => c,
-            Err(_) => {
-                unsafe {
-                    device.destroy_fence(fence, None);
-                    device.destroy_buffer(stage.buffer, None);
-                    device.free_memory(stage.memory, None);
-                }
-                return out_bytes;
-            }
+            Err(_) => { cleanup(device, *cmd_pool, Some(fence), None, &stage); return None; }
         };
         if begin_one_time(device, cmd).is_err() {
-            unsafe {
-                device.free_command_buffers(*cmd_pool, &[cmd]);
-                device.destroy_fence(fence, None);
-                device.destroy_buffer(stage.buffer, None);
-                device.free_memory(stage.memory, None);
-            }
-            return out_bytes;
+            cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+            return None;
         }
         let img = match rt_cache.get_or_create(key, device) {
             Ok(i) => i,
             Err(_) => {
-                unsafe {
-                    let _ = device.end_command_buffer(cmd);
-                    device.free_command_buffers(*cmd_pool, &[cmd]);
-                    device.destroy_fence(fence, None);
-                    device.destroy_buffer(stage.buffer, None);
-                    device.free_memory(stage.memory, None);
-                }
-                return out_bytes;
+                unsafe { let _ = device.end_command_buffer(cmd); }
+                cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+                return None;
             }
         };
-        transition_image(
-            device, cmd, img.image, img.layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        );
+        transition_image(device, cmd, img.image, img.layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         let copy = vk::BufferImageCopy {
             buffer_offset: 0,
             buffer_row_length: 0,
@@ -716,36 +679,26 @@ impl Renderer {
         };
         unsafe {
             device.cmd_copy_image_to_buffer(
-                cmd,
-                img.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                stage.buffer,
-                &[copy],
+                cmd, img.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, stage.buffer, &[copy],
             );
         }
         img.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
-        if end_one_time(device, cmd).is_err() {
-            unsafe {
-                device.free_command_buffers(*cmd_pool, &[cmd]);
-                device.destroy_fence(fence, None);
-                device.destroy_buffer(stage.buffer, None);
-                device.free_memory(stage.memory, None);
-            }
-            return out_bytes;
+        if end_one_time(device, cmd).is_err()
+            || submit_with_fence(device, *queue, cmd, fence).is_err()
+        {
+            cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+            return None;
         }
-        if submit_with_fence(device, *queue, cmd, fence).is_err() {
-            unsafe {
-                device.free_command_buffers(*cmd_pool, &[cmd]);
-                device.destroy_fence(fence, None);
-                device.destroy_buffer(stage.buffer, None);
-                device.free_memory(stage.memory, None);
+        let mut out = vec![0u8; total as usize];
+        unsafe {
+            let _ = device.wait_for_fences(&[fence], true, u64::MAX);
+            if let Ok(ptr) = device.map_memory(stage.memory, 0, stage.size, vk::MemoryMapFlags::empty()) {
+                std::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), total as usize);
+                device.unmap_memory(stage.memory);
             }
-            return out_bytes;
         }
-        pending_readbacks.insert(key, PendingReadback {
-            fence, cmd, stage, width, height,
-        });
-        out_bytes
+        cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+        Some(out)
     }
 
     pub fn compile_pipeline(
