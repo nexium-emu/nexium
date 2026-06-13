@@ -302,6 +302,10 @@ impl Renderer {
         } else {
             &mut features_13 as *mut _ as *mut std::ffi::c_void
         };
+        let enabled_core_features = vk::PhysicalDeviceFeatures {
+            robust_buffer_access: vk::TRUE,
+            ..Default::default()
+        };
         let dev_info = vk::DeviceCreateInfo {
             s_type: vk::StructureType::DEVICE_CREATE_INFO,
             queue_create_info_count: 1,
@@ -312,7 +316,7 @@ impl Renderer {
             } else {
                 enabled_ext_names.as_ptr()
             },
-            p_enabled_features: std::ptr::null(),
+            p_enabled_features: &enabled_core_features,
             p_next: p_next_chain,
             ..Default::default()
         };
