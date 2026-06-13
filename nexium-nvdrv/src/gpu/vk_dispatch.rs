@@ -824,11 +824,20 @@ fn build_vertex_layout(draw: &DrawCall) -> Result<VertexLayout, String> {
             .ok_or_else(|| format!("attrib {}: unsupported format {:#x}", loc, attrib.format))?;
         let binding = attrib.buffer;
         if !seen_bindings.contains(&binding) {
-            let stride = draw
+            let mut stride = draw
                 .vertex_buffers
                 .get(binding as usize)
                 .map(|vb| vb.stride)
                 .unwrap_or(0);
+            if stride == 0 {
+                let mut packed = 0u32;
+                for a in draw.vertex_attribs.iter() {
+                    if a.format != 0 && !a.constant && a.buffer == binding {
+                        packed = packed.max(a.offset + attrib_format_bytes(a.format));
+                    }
+                }
+                stride = packed;
+            }
             if stride == 0 {
                 return Err(format!("attrib {}: binding {} has zero stride", loc, binding));
             }
@@ -940,6 +949,26 @@ fn map_attrib_format(format: u32) -> Option<vk::Format> {
         (0x31, 7) => Some(vk::Format::B10G11R11_UFLOAT_PACK32),
 
         _ => None,
+    }
+}
+
+fn attrib_format_bytes(format: u32) -> u32 {
+    match format & 0x3F {
+        0x01 => 16,
+        0x02 => 12,
+        0x03 => 8,
+        0x04 => 8,
+        0x05 => 6,
+        0x0A => 4,
+        0x0F => 4,
+        0x12 => 4,
+        0x13 => 3,
+        0x18 => 2,
+        0x1B => 2,
+        0x1D => 1,
+        0x30 => 4,
+        0x31 => 4,
+        _ => 0,
     }
 }
 
