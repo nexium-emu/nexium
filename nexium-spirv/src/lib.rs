@@ -244,8 +244,13 @@ impl Emitter {
         if let Some(av) = self.input_vars.get(&slot) {
             return *av;
         }
-        let var = self.b.variable(self.ptr_input_vec4, None, StorageClass::Input, None);
         let location = if slot >= 0x80 { (slot - 0x80) / 16 } else { 0 };
+        if location >= 32 {
+            let av = AttrVar { var: 0, ptr_f32: self.ptr_input_f32 };
+            self.input_vars.insert(slot, av);
+            return av;
+        }
+        let var = self.b.variable(self.ptr_input_vec4, None, StorageClass::Input, None);
         self.b.decorate(var, Decoration::Location, [Operand::LiteralBit32(location)]);
         let av = AttrVar { var, ptr_f32: self.ptr_input_f32 };
         self.input_vars.insert(slot, av);
@@ -257,8 +262,13 @@ impl Emitter {
         if let Some(av) = self.output_vars.get(&slot) {
             return *av;
         }
-        let var = self.b.variable(self.ptr_output_vec4, None, StorageClass::Output, None);
         let location = if slot >= 0x80 { (slot - 0x80) / 16 } else { 0 };
+        if location >= 32 {
+            let av = AttrVar { var: 0, ptr_f32: self.ptr_output_f32 };
+            self.output_vars.insert(slot, av);
+            return av;
+        }
+        let var = self.b.variable(self.ptr_output_vec4, None, StorageClass::Output, None);
         self.b.decorate(var, Decoration::Location, [Operand::LiteralBit32(location)]);
         let av = AttrVar { var, ptr_f32: self.ptr_output_f32 };
         self.output_vars.insert(slot, av);
@@ -375,12 +385,18 @@ impl Emitter {
     }
 
     fn read_attr_component(&mut self, av: AttrVar, component: u32) -> Word {
+        if av.var == 0 {
+            return self.f32_zero;
+        }
         let idx = self.const_u32(component);
         let ac = self.b.access_chain(av.ptr_f32, None, av.var, [idx]).unwrap();
         self.b.load(self.f32_t, None, ac, None, []).unwrap()
     }
 
     fn write_attr_component(&mut self, av: AttrVar, component: u32, val: Word) {
+        if av.var == 0 {
+            return;
+        }
         let idx = self.const_u32(component);
         let ac = self.b.access_chain(av.ptr_f32, None, av.var, [idx]).unwrap();
         self.b.store(ac, val, None, []).unwrap();
