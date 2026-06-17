@@ -188,14 +188,9 @@ impl RustarmicCpu {
         self.state.halt.store(false, Ordering::Relaxed);
 
         let regions: Vec<Region> = self.state.regions.read().iter().copied().collect();
-        eprintln!("[rustarmic] run pc={:#x} regions={}", self.state.ctx.pc, regions.len());
-        for r in &regions {
-            eprintln!("  region {:#x}..{:#x} perm={} x={}", r.va, r.end, r.perm, r.perm.contains(Perm::X));
-        }
         let mut mem = RegionMemory { regions };
 
         let exit = self.jit.run(&mut self.state.ctx, &mut mem);
-        eprintln!("[rustarmic] exit = {:?}", exit);
 
         self.state.peek_pc.store(self.state.ctx.pc,    Ordering::Relaxed);
         self.state.peek_lr.store(self.state.ctx.x[30], Ordering::Relaxed);
