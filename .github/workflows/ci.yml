@@ -18,7 +18,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest, macos-13 ]
+        include:
+          - os: ubuntu-latest
+          - os: windows-latest
+          - os: macos-latest
+            cargo_flags: "--no-default-features --features backend-rustarmic"
     steps:
       - name: Checkout NeXium
         uses: actions/checkout@v4
@@ -57,4 +61,4 @@ jobs:
         run: brew install cmake ninja
 
       - name: Build NeXium
-        run: cargo build -p nexium-gui
+        run: cargo build -p nexium-gui ${{ matrix.cargo_flags }}
