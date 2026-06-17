@@ -118,7 +118,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 nexium_core::cpu::CpuEvent::Stalled => {
-                    writeln!(log, "[{}] CPU stalled at {:#x}", cycle_count, pc_before)?;
+                    let mut b = [0u8; 4];
+                    let word = if cpu.read_bytes(pc_after, &mut b).is_ok() { u32::from_le_bytes(b) } else { 0 };
+                    writeln!(log, "[{}] CPU stalled pc={:#x} word={:#010x}", cycle_count, pc_after, word)?;
                     break;
                 }
                 nexium_core::cpu::CpuEvent::Interrupted => {
