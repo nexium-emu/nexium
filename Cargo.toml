@@ -20,7 +20,7 @@ members = [
 [workspace.package]
 edition = "2021"
 rust-version = "1.80"
-license = "GPL-2.0-or-later"
+license = "MIT"
 
 [workspace.dependencies]
 nexium-common = { path = "nexium-common" }
