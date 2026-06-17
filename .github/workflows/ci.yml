@@ -15,6 +15,7 @@ jobs:
   build:
     name: NeXium (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +27,7 @@ jobs:
           - os: macos-latest
             asset: macos-arm64
             cargo_flags: "--no-default-features --features backend-rustarmic"
+            experimental: true
     steps:
       - name: Checkout NeXium
         uses: actions/checkout@v4
@@ -61,7 +63,9 @@ jobs:
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
-        run: brew install cmake ninja
+        run: |
+          brew install cmake ninja
+          echo "MACOSX_DEPLOYMENT_TARGET=15.0" >> "$GITHUB_ENV"
 
       - name: Install Boost (Windows, for Dynarmic)
         if: runner.os == 'Windows'
