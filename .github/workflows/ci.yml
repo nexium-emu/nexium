@@ -20,8 +20,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            asset: linux-x86_64
           - os: windows-latest
+            asset: windows-x86_64
           - os: macos-latest
+            asset: macos-arm64
             cargo_flags: "--no-default-features --features backend-rustarmic"
     steps:
       - name: Checkout NeXium
@@ -54,11 +57,86 @@ jobs:
             build-essential cmake ninja-build pkg-config \
             libgtk-3-dev libasound2-dev libudev-dev \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libwayland-dev libxkbcommon-dev
+            libwayland-dev libxkbcommon-dev libboost-dev
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
         run: brew install cmake ninja
 
+      - name: Install Boost (Windows, for Dynarmic)
+        if: runner.os == 'Windows'
+        id: boost
+        uses: MarkusJx/install-boost@v2
+        with:
+          boost_version: 1.83.0
+          platform_version: 2022
+          toolset: msvc
+
       - name: Build NeXium
-        run: cargo build -p nexium-gui ${{ matrix.cargo_flags }}
+        shell: bash
+        env:
+          BOOST_ROOT: ${{ steps.boost.outputs.BOOST_ROOT }}
+        run: cargo build --release -p nexium-gui --bin nexium ${{ matrix.cargo_flags }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist/NeXium
+          cp target/release/nexium dist/NeXium/
+          cp LICENSE README.md dist/NeXium/
+          tar -C dist -czf "dist/nexium-${{ matrix.asset }}.tar.gz" NeXium
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/NeXium | Out-Null
+          Copy-Item target/release/nexium.exe dist/NeXium/
+          Copy-Item LICENSE, README.md dist/NeXium/
+          Compress-Archive -Path dist/NeXium/* -DestinationPath "dist/nexium-${{ matrix.asset }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexium-${{ matrix.asset }}
+          path: dist/nexium-${{ matrix.asset }}.*
+          if-no-files-found: error
+
+  release:
+    name: Pre-release
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release metadata
+        id: meta
+        run: |
+          echo "date=$(date -u +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "NeXium nightly ${{ steps.meta.outputs.date }} (${{ steps.meta.outputs.sha }})"
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            Automated pre-release built by CI from `main` @ `${{ github.sha }}`.
+
+            **Downloads**
+            - Windows (x86_64): `nexium-windows-x86_64.zip`
+            - Linux (x86_64): `nexium-linux-x86_64.tar.gz`
+            - macOS (Apple Silicon): `nexium-macos-arm64.tar.gz`
+
+            > Pre-release / experimental. NeXium is an x86_64-host emulator; the macOS build is the rustarmic backend compiled for Apple Silicon and is provided as a build artifact only (it will not run on Apple Silicon).
+          files: artifacts/**/*
