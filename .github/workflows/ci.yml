@@ -25,7 +25,16 @@ jobs:
 
       - name: Fetch rustarmic (CPU JIT dependency)
         shell: bash
-        run: git clone --depth 1 --branch "$RUSTARMIC_REF" "$RUSTARMIC_URL" ../rustarmic
+        env:
+          RUSTARMIC_TOKEN: ${{ secrets.RUSTARMIC_TOKEN }}
+        run: |
+          export GIT_TERMINAL_PROMPT=0
+          if [ -n "$RUSTARMIC_TOKEN" ]; then
+            git clone --depth 1 --branch "$RUSTARMIC_REF" \
+              "https://x-access-token:${RUSTARMIC_TOKEN}@github.com/nexium-emu/rustarmic.git" ../rustarmic
+          else
+            git clone --depth 1 --branch "$RUSTARMIC_REF" "$RUSTARMIC_URL" ../rustarmic
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
