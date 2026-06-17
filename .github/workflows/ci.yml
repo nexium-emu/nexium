@@ -121,6 +121,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -152,3 +154,21 @@ jobs:
 
             > Pre-release / experimental. NeXium is an x86_64-host emulator; the macOS build is the rustarmic backend compiled for Apple Silicon and is provided as a build artifact only (it will not run on Apple Silicon).
           files: artifacts/**/*
+
+      - name: Notify Discord (#early-access)
+        if: env.DISCORD_WEBHOOK != ''
+        run: |
+          ver="${{ steps.meta.outputs.date }} (${{ steps.meta.outputs.sha }})"
+          url="https://github.com/nexium-emu/nexium-nightly/releases/tag/nightly"
+          payload="$(jq -n --arg ver "$ver" --arg url "$url" '{
+            username: "NeXium CI",
+            embeds: [ {
+              title: ("NeXium nightly " + $ver),
+              url: $url,
+              description: "A new early-access build is up. Windows and Linux (x86_64) downloads are on the release page.\n\nExperimental — expect bugs.",
+              color: 5814783
+            } ]
+          }')"
+          code="$(printf '%s' "$payload" | curl -s -o /dev/null -w '%{http_code}' \
+            -H 'Content-Type: application/json' -d @- "$DISCORD_WEBHOOK")"
+          echo "Discord webhook HTTP $code"
