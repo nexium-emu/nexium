@@ -137,10 +137,11 @@ jobs:
       - name: Publish pre-release
         uses: softprops/action-gh-release@v2
         with:
+          repository: nexium-emu/nexium-nightly
+          token: ${{ secrets.RELEASE_TOKEN }}
           tag_name: nightly
           name: "NeXium nightly ${{ steps.meta.outputs.date }} (${{ steps.meta.outputs.sha }})"
           prerelease: true
-          generate_release_notes: true
           body: |
             Automated pre-release built by CI from `main` @ `${{ github.sha }}`.
 
