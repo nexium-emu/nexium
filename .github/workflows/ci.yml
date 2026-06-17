@@ -68,7 +68,11 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install cmake ninja
-          echo "MACOSX_DEPLOYMENT_TARGET=15.0" >> "$GITHUB_ENV"
+          RT="$(find "$(dirname "$(xcrun --find clang)")/../lib/clang" -name libclang_rt.osx.a 2>/dev/null | head -1)"
+          if [ -n "$RT" ]; then
+            echo "Linking clang_rt from: $RT"
+            echo "RUSTFLAGS=-L native=$(dirname "$RT") -l static=clang_rt.osx" >> "$GITHUB_ENV"
+          fi
 
       - name: Install Boost (Windows, for Dynarmic)
         if: runner.os == 'Windows'
