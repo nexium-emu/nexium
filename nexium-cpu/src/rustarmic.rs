@@ -205,10 +205,14 @@ impl RustarmicCpu {
             Err(e) => {
                 match &e {
                     rustarmic::Error::Unsupported { pc, opcode } => {
-                        log::warn!("rustarmic Jit::run unsupported: pc={:#x} opcode={:#010x}", pc, opcode);
+                        let mut b = [0u8; 4];
+                        let word = if self.read_bytes(*pc, &mut b).is_ok() { u32::from_le_bytes(b) } else { *opcode };
+                        log::warn!("rustarmic Jit::run unsupported: pc={:#x} opcode={:#010x}", pc, word);
                     }
                     rustarmic::Error::Decode { pc, opcode } => {
-                        log::warn!("rustarmic Jit::run decode-fail: pc={:#x} opcode={:#010x}", pc, opcode);
+                        let mut b = [0u8; 4];
+                        let word = if self.read_bytes(*pc, &mut b).is_ok() { u32::from_le_bytes(b) } else { *opcode };
+                        log::warn!("rustarmic Jit::run decode-fail: pc={:#x} opcode={:#010x}", pc, word);
                     }
                     other => log::warn!("rustarmic Jit::run error: {:?}", other),
                 }
