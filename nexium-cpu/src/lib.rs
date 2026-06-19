@@ -14,11 +14,13 @@ use nexium_memory::Perm;
 pub struct HaltHandle {
     pub(crate) inner: std::sync::Arc<dyn Fn() + Send + Sync>,
     pub(crate) peek:  std::sync::Arc<dyn Fn() -> (u64, u64, u64) + Send + Sync>,
+    pub(crate) peek_dump: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
 }
 
 impl HaltHandle {
     pub fn halt(&self) { (self.inner)(); }
     pub fn peek_pc_lr_sp(&self) -> (u64, u64, u64) { (self.peek)() }
+    pub fn peek_dump(&self) -> String { (self.peek_dump)() }
 }
 
 #[derive(Clone, Debug, Default)]

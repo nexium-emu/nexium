@@ -118,6 +118,7 @@ impl DynarmicCpu {
     pub fn halt_handle(&self) -> HaltHandle {
         let emu = Arc::clone(&self.emu);
         let emu_peek = Arc::clone(&self.emu);
+        let emu_dump = Arc::clone(&self.emu);
         HaltHandle {
             inner: Arc::new(move || {
                 let _ = emu.emu.emu_stop();
@@ -127,6 +128,20 @@ impl DynarmicCpu {
                 let lr = emu_peek.emu.reg_read_lr().unwrap_or(0);
                 let sp = emu_peek.emu.reg_read_sp().unwrap_or(0);
                 (pc, lr, sp)
+            }),
+            peek_dump: Arc::new(move || {
+                let e = &emu_dump.emu;
+                let pc = e.reg_read_pc().unwrap_or(0);
+                let mut code = [0u8; 64];
+                let _ = e.mem_read(pc, &mut code);
+                let mut s = format!("pc={:#x}\n  code={:02x?}\n  regs:", pc, &code[..]);
+                for i in 0..31 {
+                    let r = e.reg_read(i).unwrap_or(0);
+                    let mut b = [0u8; 8];
+                    let v = if e.mem_read(r, &mut b).is_ok() { u64::from_le_bytes(b) } else { 0 };
+                    s.push_str(&format!(" x{}={:#x}([x{}]={:#x})", i, r, i, v));
+                }
+                s
             }),
         }
     }

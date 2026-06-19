@@ -92,6 +92,7 @@ impl RustarmicCpu {
                 let s = std::ptr::read_volatile(&(*ctx).sp);
                 (p, l, s)
             }),
+            peek_dump: Arc::new(|| String::from("(peek_dump unsupported on rustarmic)")),
         }
     }
 
