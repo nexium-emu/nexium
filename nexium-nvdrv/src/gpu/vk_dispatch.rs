@@ -275,7 +275,9 @@ fn execute_one(
 
     let vs_prog = &maxwell.regs.shader_programs[1];
     let fs_prog = &maxwell.regs.shader_programs[5];
-    if !vs_prog.enabled || !fs_prog.enabled {
+    let vs_active = vs_prog.enabled || vs_prog.address_lo != 0;
+    let fs_active = fs_prog.enabled || fs_prog.address_lo != 0;
+    if !vs_active || !fs_active {
         return Err("VS or FS program disabled".to_string());
     }
 
@@ -485,6 +487,30 @@ fn execute_one(
                 "bindless: cbuf gpu_va={:#x} not mapped to CPU address",
                 cbuf_addr
             );
+        }
+    }
+
+    if draw.fs_bindless_cb_addr == 0 && !fs_tex_ids.is_empty() {
+        let tex_cb_index = maxwell.regs.tex_cb_index as usize;
+        let (tcb_addr, tcb_size) = maxwell.regs.cbuf_binds[4][tex_cb_index.min(15)];
+        if tcb_addr != 0 {
+            if let Some(tcb_cpu) = mappings.cpu_address_for(tcb_addr) {
+                let mut head = vec![0u8; (tcb_size as usize).min(0x4000)];
+                if !head.is_empty() && mem_read(tcb_cpu, &mut head) {
+                    for (i, unit_slot) in fs_tex_ids.iter_mut().enumerate() {
+                        let off = (*unit_slot as usize) * 4;
+                        if off + 4 <= head.len() {
+                            let handle = u32::from_le_bytes([head[off], head[off + 1], head[off + 2], head[off + 3]]);
+                            let tic = handle & 0x000F_FFFF;
+                            let tsc = handle >> 20;
+                            if handle != 0 && tic <= draw.tic_pool_limit {
+                                *unit_slot = tic;
+                                fs_sampler_ids[i] = tsc;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

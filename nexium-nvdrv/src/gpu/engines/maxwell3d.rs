@@ -143,6 +143,7 @@ pub struct Maxwell3DRegisters {
     pub last_constbuf_size: u32,
 
     pub cbuf_binds: [[(u64, u32); 16]; 5],
+    pub tex_cb_index: u32,
 }
 
 impl Default for Maxwell3DRegisters {
@@ -208,6 +209,7 @@ impl Default for Maxwell3DRegisters {
             last_constbuf_addr: 0,
             last_constbuf_size: 0,
             cbuf_binds: [[(0, 0); 16]; 5],
+            tex_cb_index: 0,
         }
     }
 }
@@ -592,6 +594,7 @@ impl Maxwell3D {
                     self.regs.cbuf_binds[stage][slot] = (cb_addr, self.regs.constbuf_selector_size);
                 }
             }
+            0x982 => self.regs.tex_cb_index = arg & 0x1F,
             0x645 => self.regs.cull_test_enable = (arg & 1) != 0,
             0x646 => self.regs.cull_face = arg,
             0x647 => self.regs.front_face = arg,
