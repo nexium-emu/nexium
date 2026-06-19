@@ -894,6 +894,11 @@ impl Renderer {
             vec![0u8; 256]
         };
 
+        let (index_data, index_count, index_type) = match (&call.index_data, call.index_count) {
+            (Some(d), Some(c)) if c > 0 && !d.is_empty() => (d.clone(), c, call.index_type),
+            _ => (Vec::new(), 0u32, call.index_type),
+        };
+
         log::debug!(
             "cbuf_data: addr={:#x} size={} all_zero={}",
             call.cbuf_addr, call.cbuf_size,
@@ -1151,6 +1156,20 @@ impl Renderer {
                 None
             };
 
+        let index_bind: Option<(vk::Buffer, u64)> = if index_count > 0 && !index_data.is_empty() {
+            let isz = align_up(index_data.len() as u64, 4);
+            if ubo_ring.head + isz > ubo_ring.size {
+                ubo_ring.head = 0;
+                ubo_ring.slot_head[other_idx] = 0;
+            }
+            let (ibuf, ioff, iptr) = ring_alloc(ubo_ring, isz, 4)
+                .map_err(|e| format!("ring_alloc(index): {}", e))?;
+            unsafe { std::ptr::copy_nonoverlapping(index_data.as_ptr(), iptr, index_data.len()); }
+            Some((ibuf, ioff))
+        } else {
+            None
+        };
+
         let cbuf_size_aligned = align_up(cbuf_data.len() as u64, ubo_alignment);
         {
             let v_size = if !vertex_data.is_empty() {
@@ -1402,7 +1421,12 @@ impl Renderer {
             if let Some((wbinding, wbuf, woff)) = white_bind {
                 device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]);
             }
-            device.cmd_draw(cmd, call.vertex_count, 1, 0, 0);
+            if let Some((ibuf, ioff)) = index_bind {
+                device.cmd_bind_index_buffer(cmd, ibuf, ioff, index_type);
+                device.cmd_draw_indexed(cmd, index_count, 1, 0, 0, 0);
+            } else {
+                device.cmd_draw(cmd, call.vertex_count, 1, 0, 0);
+            }
             device.cmd_end_rendering(cmd);
         }
 
@@ -1479,6 +1503,9 @@ impl Renderer {
             tex_pending: Option<(TexCacheKey, crate::texture::TicEntry, usize, usize)>,
             use_depth: bool,
             tsc: Option<crate::texture::TscEntry>,
+            index_data: Vec<u8>,
+            index_count: u32,
+            index_type: vk::IndexType,
         }
         let mut preps: Vec<(&crate::draw::Maxwell3dDrawCall, Prep)> = Vec::with_capacity(calls.len());
         for call in calls {
@@ -1535,7 +1562,11 @@ impl Renderer {
                         read_guest(tsc_addr, 32).and_then(|r| crate::texture::TscEntry::parse(&r))
                     } else { None }
                 } else { None };
-            preps.push((call, Prep { pipeline, vertex_data, cbuf_data, vertex_stride, tex_pending, use_depth, tsc }));
+            let (index_data, index_count, index_type) = match (&call.index_data, call.index_count) {
+                (Some(d), Some(c)) if c > 0 && !d.is_empty() => (d.clone(), c, call.index_type),
+                _ => (Vec::new(), 0u32, call.index_type),
+            };
+            preps.push((call, Prep { pipeline, vertex_data, cbuf_data, vertex_stride, tex_pending, use_depth, tsc, index_data, index_count, index_type }));
         }
 
         if preps.is_empty() {
@@ -1730,6 +1761,17 @@ impl Renderer {
                     Some((wb.binding, wbuf, woff))
                 } else { None };
 
+            let index_bind: Option<(vk::Buffer, u64)> = if prep.index_count > 0 && !prep.index_data.is_empty() {
+                let isz = align_up(prep.index_data.len() as u64, 4);
+                if ubo_ring.head + isz > ubo_ring.size {
+                    ring_wrap_other(device, frame_slots, other_idx, descriptor_pool.pool, ubo_ring)?;
+                }
+                let (ibuf, ioff, iptr) = ring_alloc(ubo_ring, isz, 4)
+                    .map_err(|e| format!("ring_alloc(index): {}", e))?;
+                unsafe { std::ptr::copy_nonoverlapping(prep.index_data.as_ptr(), iptr, prep.index_data.len()); }
+                Some((ibuf, ioff))
+            } else { None };
+
             let cbuf_size_aligned = align_up(prep.cbuf_data.len() as u64, ubo_alignment);
             if ubo_ring.head + cbuf_size_aligned > ubo_ring.size {
                 ring_wrap_other(device, frame_slots, other_idx, descriptor_pool.pool, ubo_ring)?;
@@ -1844,7 +1886,12 @@ impl Renderer {
                     }
                 }
                 if let Some((wbinding, wbuf, woff)) = white_bind { device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]); }
-                device.cmd_draw(cmd, call.vertex_count, 1, 0, 0);
+                if let Some((ibuf, ioff)) = index_bind {
+                    device.cmd_bind_index_buffer(cmd, ibuf, ioff, prep.index_type);
+                    device.cmd_draw_indexed(cmd, prep.index_count, 1, 0, 0, 0);
+                } else {
+                    device.cmd_draw(cmd, call.vertex_count, 1, 0, 0);
+                }
             }
         }
         if pass_open {
@@ -1985,7 +2032,7 @@ fn create_ubo_ring(
     let info = vk::BufferCreateInfo {
         s_type: vk::StructureType::BUFFER_CREATE_INFO,
         size,
-        usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER,
+        usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         queue_family_index_count: 0,
         p_queue_family_indices: std::ptr::null(),
