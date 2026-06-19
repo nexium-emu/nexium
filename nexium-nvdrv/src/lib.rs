@@ -714,7 +714,12 @@ impl Nvdrv {
                 log::debug!("nvhost-gpu:GetErrorInfo");
             }
             0x4817 => {
-                log::debug!("nvhost-gpu:GetErrorNotification");
+                if out.len() >= 16 {
+                    for b in out[..16].iter_mut() { *b = 0; }
+                    out[14] = 0xFF;
+                    out[15] = 0xFF;
+                }
+                log::trace!("nvhost-gpu:GetErrorNotification → status=0xFFFF (no error)");
             }
             0x481a => {
                 if req.in_data.len() >= 28 && out.len() >= 28 {
