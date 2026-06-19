@@ -109,8 +109,12 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
 }
 
 fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
-    let size = if let Some(cpu) = cpu_ref() { cpu.get_register(0) } else { return 1; };
-    log::debug!("svcSetHeapSize size={:#x} -> heap_base={:#x}", size, kernel.heap_base);
+    let size = if let Some(cpu) = cpu_ref() { cpu.get_register(1) } else { return 1; };
+    if size > kernel.heap_size {
+        log::warn!("svcSetHeapSize requested {:#x} > mapped heap {:#x}; clamping (guest may fault on overflow)", size, kernel.heap_size);
+    }
+    kernel.heap_committed = size.min(kernel.heap_size);
+    log::debug!("svcSetHeapSize size={:#x} -> heap_base={:#x} (heap mapped {:#x})", size, kernel.heap_base, kernel.heap_size);
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(1, kernel.heap_base);
         cpu.set_register(0, SUCCESS as u64);
@@ -248,7 +252,11 @@ fn synthesize_memory_info(kernel: &Kernel, address: u64) -> SynthMemInfo {
     let regions = kernel.address_space.regions();
     for r in &regions {
         if address >= r.base && address < r.base + r.size {
-            let mem_type = if r.name.contains("text") || r.name.contains("rodata") {
+            let mem_type = if r.name.starts_with("codestatic") {
+                0x03
+            } else if r.name.starts_with("codemutable") {
+                0x04
+            } else if r.name.contains("text") || r.name.contains("rodata") {
                 0x10
             } else if r.name.contains("data") || r.name.contains("bss") {
                 0x11
@@ -455,6 +463,16 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         crate::kernel::profile::record_wait_handle(*h);
     }
 
+    for (i, h) in handles.iter().enumerate() {
+        if kernel.nvdrv_sync_events.contains(h) {
+            if let Some(cpu) = cpu_mut() {
+                cpu.set_register(0, SUCCESS as u64);
+                cpu.set_register(1, i as u64);
+            }
+            return SUCCESS;
+        }
+    }
+
     let mut vsync_idx: Option<usize> = None;
     for (i, h) in handles.iter().enumerate() {
         if kernel.vsync_handles.contains(h) {
@@ -571,6 +589,15 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
     }
 
     for (i, h) in handles.iter().enumerate() {
+        if let Some(msg_evt) = kernel.applet_message_event {
+            if *h == msg_evt && !kernel.applet_messages.is_empty() {
+                if let Some(cpu) = cpu_mut() {
+                    cpu.set_register(0, SUCCESS as u64);
+                    cpu.set_register(1, i as u64);
+                }
+                return SUCCESS;
+            }
+        }
         if let Some(slot) = kernel.event_signals.get_mut(h) {
             if *slot {
                 *slot = false;
@@ -988,10 +1015,14 @@ fn handle_control_request(kernel: &mut Kernel, session_handle: u32, port_name: &
 }
 
 pub(crate) fn build_ipc_response(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move_handles: &[u32]) -> Vec<u8> {
-    build_ipc_response_full(ctx, result, out_data, move_handles, &[])
+    build_ipc_response_full(ctx, result, out_data, move_handles, &[], &[])
 }
 
-fn build_ipc_response_full(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move_handles: &[u32], out_objects: &[u32]) -> Vec<u8> {
+pub(crate) fn build_ipc_response_copy(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], copy_handles: &[u32]) -> Vec<u8> {
+    build_ipc_response_full(ctx, result, out_data, &[], copy_handles, &[])
+}
+
+fn build_ipc_response_full(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move_handles: &[u32], copy_handles: &[u32], out_objects: &[u32]) -> Vec<u8> {
     let is_domain = ctx.domain.is_some();
 
     let mut raw_size = 0usize;
@@ -1006,11 +1037,15 @@ fn build_ipc_response_full(ctx: &ipc::IpcCtx, result: u32, out_data: &[u8], move
     let raw_padded = (raw_size + 3) & !3;
 
     let mut special_bytes: Vec<u8> = Vec::new();
-    let has_special_header = !move_handles.is_empty();
+    let has_special_header = !move_handles.is_empty() || !copy_handles.is_empty();
     if has_special_header {
         let mut sh: u32 = 0;
+        sh |= (copy_handles.len() as u32 & 0xF) << 1;
         sh |= (move_handles.len() as u32 & 0xF) << 5;
         special_bytes.extend_from_slice(&sh.to_le_bytes());
+        for h in copy_handles {
+            special_bytes.extend_from_slice(&h.to_le_bytes());
+        }
         for h in move_handles {
             special_bytes.extend_from_slice(&h.to_le_bytes());
         }
@@ -1149,8 +1184,8 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     }
 
     if let Some((rc, data, handles)) = crate::services::am::dispatch_command(kernel, port_name, cmd_id) {
-        log::debug!("am.{}.cmd_{} rc={:#x} → {} bytes, {} handle(s)", port_name, cmd_id, rc, data.len(), handles.len());
-        return build_ipc_response(ctx, rc, &data, &handles);
+        log::debug!("am.{}.cmd_{} rc={:#x} → {} bytes, {} handle(s) [copy]", port_name, cmd_id, rc, data.len(), handles.len());
+        return build_ipc_response_copy(ctx, rc, &data, &handles);
     }
 
     if port_name == "IFileSystem" {
@@ -1625,7 +1660,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                 s.alloc_domain_object("IAudioRenderer".to_string())
             } else { 0 };
             kernel.audio_renderers.insert((session_handle, object_id), state);
-            return build_ipc_response_full(ctx, 0, &[], &[], &[object_id]);
+            return build_ipc_response_full(ctx, 0, &[], &[], &[], &[object_id]);
         } else {
             let h = kernel.handles.create_handle(HandleType::Session);
             let session = Session::new(h, "IAudioRenderer".to_string());
@@ -2386,7 +2421,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
             let object_id = if let Some(s) = kernel.sessions.get_mut(&session_handle) {
                 s.alloc_domain_object("IAudioOut".to_string())
             } else { 0 };
-            return build_ipc_response_full(ctx, 0, &out, &[], &[object_id]);
+            return build_ipc_response_full(ctx, 0, &out, &[], &[], &[object_id]);
         } else {
             let h = kernel.handles.create_handle(HandleType::Session);
             let session = Session::new(h, "IAudioOut".to_string());
@@ -2405,6 +2440,11 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
 
     if let Some(resp) = crate::services::generated::dispatch_generated(kernel, port_name, ctx, session_handle) {
         return resp;
+    }
+
+    if port_name == "fsp-srv" && cmd_id == 203 {
+        log::debug!("fsp-srv.OpenPatchDataStorageByCurrentProcess → ResultTargetNotFound (no patch)");
+        return build_ipc_response(ctx, 0x7D402, &[], &[]);
     }
 
     if let Some((data, handle_opt)) = applet_command_response(kernel, port_name, cmd_id) {
@@ -3374,6 +3414,15 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 }
             }
 
+            let ioctl_cmd = (ioctl_id & 0xFFFF) as u16;
+            if ioctl_cmd == 0x4808 || ioctl_cmd == 0x481b {
+                let fence_handles: Vec<u32> = kernel.gpu_fence_events.drain().collect();
+                for fh in fence_handles {
+                    kernel.event_signals.insert(fh, true);
+                    log::debug!("nvdrv:SubmitGPFIFO → signaling gpu_fence_event handle={:#x}", fh);
+                }
+            }
+
             build_ipc_response(ctx, 0, &outcome.result.to_le_bytes(), &[])
         }
         2 => {
@@ -3393,9 +3442,28 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[])
         }
         4 => {
-            log::debug!("nvdrv:QueryEvent");
+            let fd = if ctx.cmif_in_data_len >= 4 {
+                u32::from_le_bytes([
+                    ctx.buf[ctx.cmif_in_data_off],
+                    ctx.buf[ctx.cmif_in_data_off + 1],
+                    ctx.buf[ctx.cmif_in_data_off + 2],
+                    ctx.buf[ctx.cmif_in_data_off + 3],
+                ])
+            } else { 0 };
+            let is_nvhost_ctrl_fd = kernel.nvdrv.files.get(&fd)
+                .map(|f| f.device == nexium_nvdrv::NvDevice::NvhostCtrl)
+                .unwrap_or(false);
             let h = kernel.handles.create_handle(HandleType::Event);
-            build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[h])
+            if is_nvhost_ctrl_fd {
+                kernel.event_signals.insert(h, false);
+                kernel.gpu_fence_events.insert(h);
+                log::debug!("nvdrv:QueryEvent fd={} (nvhost-ctrl) → fence event handle={:#x} (unsignaled, will signal on GPU submit)", fd, h);
+            } else {
+                kernel.event_signals.insert(h, true);
+                kernel.nvdrv_sync_events.insert(h);
+                log::debug!("nvdrv:QueryEvent fd={} → event handle={:#x} (COPY, always-signaled)", fd, h);
+            }
+            build_ipc_response_copy(ctx, 0, &0u32.to_le_bytes(), &[h])
         }
         8 => {
             log::debug!("nvdrv:SetClientPID");
@@ -3420,8 +3488,29 @@ fn applet_buffer_response(port_name: &str, cmd_id: u32) -> Option<Vec<u8>> {
         ("IHOSBinderDriver", 0) | ("IHOSBinderDriver", 3) => {
             Some(build_igbp_success_parcel())
         }
+        ("ILaunchParamStorageAccessor", 11) => {
+            Some(build_launch_parameter())
+        }
+        ("acc:u0" | "acc:u1" | "acc:aa", 2) | ("acc:u0" | "acc:u1" | "acc:aa", 3) => {
+            Some(build_user_id_list())
+        }
+        ("IProfile", 0) => Some(vec![0u8; 0x80]),
         _ => None,
     }
+}
+
+fn build_launch_parameter() -> Vec<u8> {
+    let mut out = vec![0u8; 0x88];
+    out[0..4].copy_from_slice(&0xC794_97CAu32.to_le_bytes());
+    out[4..8].copy_from_slice(&1u32.to_le_bytes());
+    out[8..24].copy_from_slice(&crate::services::am::ACCOUNT_UID);
+    out
+}
+
+fn build_user_id_list() -> Vec<u8> {
+    let mut out = vec![0u8; 0x80];
+    out[0..16].copy_from_slice(&crate::services::am::ACCOUNT_UID);
+    out
 }
 
 fn build_igbp_success_parcel() -> Vec<u8> {
@@ -3444,7 +3533,7 @@ fn build_igbp_success_parcel() -> Vec<u8> {
 fn build_native_window_parcel(binder_handle: u32) -> Vec<u8> {
     let mut payload: Vec<u8> = Vec::new();
     payload.extend_from_slice(&0x2u32.to_le_bytes());
-    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
     payload.extend_from_slice(&binder_handle.to_le_bytes());
     payload.extend_from_slice(&0u32.to_le_bytes());
     payload.extend_from_slice(&0u32.to_le_bytes());
@@ -3453,12 +3542,13 @@ fn build_native_window_parcel(binder_handle: u32) -> Vec<u8> {
     payload.extend_from_slice(&0u32.to_le_bytes());
     payload.extend_from_slice(&0u32.to_le_bytes());
 
-    let mut out = Vec::with_capacity(16 + payload.len());
+    let mut out = Vec::with_capacity(16 + payload.len() + 4);
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&4u32.to_le_bytes());
     out.extend_from_slice(&((16 + payload.len()) as u32).to_le_bytes());
     out.extend_from_slice(&payload);
+    out.extend_from_slice(&0u32.to_le_bytes());
     out
 }
 
@@ -3471,7 +3561,7 @@ pub(crate) fn return_subsession(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, sess
             0
         };
         log::debug!("→ {} sub-object id={}", sub_service, object_id);
-        build_ipc_response_full(ctx, 0, &[], &[], &[object_id])
+        build_ipc_response_full(ctx, 0, &[], &[], &[], &[object_id])
     } else {
         let h = kernel.handles.create_handle(HandleType::Session);
         let session = Session::new(h, sub_service.to_string());
@@ -3507,6 +3597,8 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("appletAE" | "appletOE", 0) => Some("IApplicationProxy"),
         ("appletAE" | "appletOE", 200) => Some("ILibraryAppletProxy"),
         ("apm" | "apm:p", 0) => Some("IApmManager"),
+        ("pctl:a" | "pctl:r" | "pctl:s" | "pctl", 0) => Some("IParentalControlService"),
+        ("pctl:a" | "pctl:r" | "pctl:s" | "pctl", 1) => Some("IParentalControlService"),
         _ => None,
     }
 }
@@ -3523,6 +3615,16 @@ fn applet_command_response(_kernel: &mut Kernel, port_name: &str, cmd_id: u32) -
         ("psm", _) => Some((Vec::new(), None)),
         ("set", _) | ("set:sys", _) => Some((Vec::new(), None)),
         ("nvdrv:a", _) | ("nvdrv", _) | ("nvdrv:s", _) | ("nvdrv:t", _) => Some((0u32.to_le_bytes().to_vec(), None)),
+
+        ("IParentalControlService", cmd) => {
+            let out: Vec<u8> = match cmd {
+                1031 | 1061 | 1403 | 1453 | 1455 | 1458 => vec![0u8],
+                1018 | 1065 => vec![1u8],
+                1032 | 1039 | 1206 => 0u32.to_le_bytes().to_vec(),
+                _ => Vec::new(),
+            };
+            Some((out, None))
+        }
 
         _ => None,
     }
@@ -3920,12 +4022,16 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
     let val: u64 = match info_type {
         0  => 0xF,
         1  => 0x0001_0000_0000,
-        2  => kernel.code_base,
-        3  => 0x4_0000_0000,
+        2  => kernel.alias_base,
+        3  => kernel.alias_size,
         4  => kernel.heap_base,
         5  => kernel.heap_size,
-        6  => 0x80_000_000,
-        7  => 0x40_000_000,
+        6  => if kernel.is_application { kernel.total_memory } else { 0x80_000_000 },
+        7  => if kernel.is_application {
+            kernel.code_size + kernel.stack_size + kernel.heap_committed + 0x100_0000
+        } else {
+            0x40_000_000
+        },
         8  => 0,
         9  => kernel.stack_base,
         10 => kernel.stack_size,
@@ -3939,8 +4045,8 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^ (z >> 31)
         }
-        12 => kernel.code_base,
-        13 => 0x40_0000_0000,
+        12 => kernel.aslr_base,
+        13 => kernel.aslr_size,
         14 => kernel.stack_base,
         15 => 0x4_000_000,
         16 => 0,

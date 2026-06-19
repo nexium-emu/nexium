@@ -2,7 +2,7 @@ use crate::kernel::Kernel;
 use crate::kernel::handles::HandleType;
 use nexium_ipc::IpcCtx;
 
-const NATIVE_WINDOW_PARCEL_SIZE: u64 = 56;
+const NATIVE_WINDOW_PARCEL_SIZE: u64 = 60;
 
 pub fn get_relay_service(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}
 pub fn get_system_display_service(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}

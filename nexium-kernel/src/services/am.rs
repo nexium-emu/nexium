@@ -88,9 +88,16 @@ pub fn proxy_subsession(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("ILibraryAppletAccessor", 60) => Some("ILibraryAppletAccessor"),
         ("ILibraryAppletAccessor", 100) => Some("IStorage"),
         ("ILibraryAppletAccessor", 101) => Some("IStorage"),
+        ("IApplicationFunctions", 1) => Some("ILaunchParamStorage"),
+        ("ILaunchParamStorage", 0) => Some("ILaunchParamStorageAccessor"),
+        ("acc:u0" | "acc:u1" | "acc:aa", 5) => Some("IProfile"),
+        ("acc:u0" | "acc:u1" | "acc:aa", 101) => Some("IManagerForApplication"),
+        ("IManagerForApplication", 2) => Some("IAsyncContext"),
         _ => None,
     }
 }
+
+pub const ACCOUNT_UID: [u8; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
 pub fn dispatch_command(kernel: &mut Kernel, port_name: &str, cmd_id: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match port_name {
@@ -111,6 +118,12 @@ pub fn dispatch_command(kernel: &mut Kernel, port_name: &str, cmd_id: u32) -> Op
         "IDebugFunctions" => debug_functions(cmd_id),
         "IStorage" => storage(cmd_id),
         "IStorageAccessor" => storage_accessor(cmd_id),
+        "ILaunchParamStorage" => storage(cmd_id),
+        "ILaunchParamStorageAccessor" => launch_param_storage_accessor(cmd_id),
+        "acc:u0" | "acc:u1" | "acc:aa" => account_service(cmd_id),
+        "IProfile" => profile(cmd_id),
+        "IManagerForApplication" => manager_for_application(cmd_id),
+        "IAsyncContext" => async_context(kernel, cmd_id),
         "IOverlayFunctions" => overlay_functions(cmd_id),
         "ILockAccessor" => lock_accessor(cmd_id),
         "IAppletCommonFunctions" => applet_common_functions(cmd_id),
@@ -149,10 +162,14 @@ fn err(rc: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
 fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
         0 => {
+            let first = kernel.applet_message_event.is_none();
             let mut slot = kernel.applet_message_event;
             let h = alloc_event(kernel, &mut slot, "AppletMessageEvent");
             kernel.applet_message_event = slot;
-            log::debug!("ICommonStateGetter.GetEventHandle → {:#x}", h);
+            if first {
+                queue_message(kernel, msg::FOCUS_STATE_CHANGED);
+            }
+            log::debug!("ICommonStateGetter.GetEventHandle → {:#x} (initial focus msg queued={})", h, first);
             ok_with_handle(Vec::new(), h)
         }
         1 => {
@@ -345,7 +362,7 @@ fn library_applet_self_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, V
 
 fn application_functions(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
-        1 => ok_empty(),
+        1 => err(0x480),
         10 | 12 => ok_empty(),
         20 => ok(0u64.to_le_bytes().to_vec()),
         21 => {
@@ -444,6 +461,80 @@ fn storage_accessor(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
             log::warn!("IStorageAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
             ok_empty()
         }
+    }
+}
+
+pub const LAUNCH_PARAMETER_SIZE: u64 = 0x88;
+
+fn launch_param_storage_accessor(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => ok(LAUNCH_PARAMETER_SIZE.to_le_bytes().to_vec()),
+        10 | 11 => ok_empty(),
+        _ => {
+            log::warn!("ILaunchParamStorageAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+            ok_empty()
+        }
+    }
+}
+
+fn account_service(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => ok(1u32.to_le_bytes().to_vec()),
+        1 => ok(vec![1u8]),
+        2 | 3 => ok_empty(),
+        4 => ok(ACCOUNT_UID.to_vec()),
+        100 | 102 | 103 | 110 | 140 | 141 => ok_empty(),
+        _ => {
+            log::warn!("acc.cmd_{} → returning empty SUCCESS (likely wrong)", cmd);
+            ok_empty()
+        }
+    }
+}
+
+fn build_profile_base() -> Vec<u8> {
+    let mut out = vec![0u8; 0x38];
+    out[0..16].copy_from_slice(&ACCOUNT_UID);
+    let name = b"nexium";
+    out[0x18..0x18 + name.len()].copy_from_slice(name);
+    out
+}
+
+fn profile(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 | 1 => ok(build_profile_base()),
+        10 => ok(0u32.to_le_bytes().to_vec()),
+        11 => ok_empty(),
+        _ => {
+            log::warn!("IProfile.cmd_{} → returning empty SUCCESS (likely wrong)", cmd);
+            ok_empty()
+        }
+    }
+}
+
+fn manager_for_application(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => ok(vec![0u8]),
+        1 => ok(0x0102_0304_0506_0708u64.to_le_bytes().to_vec()),
+        3 => ok(0u64.to_le_bytes().to_vec()),
+        160 => ok_empty(),
+        _ => {
+            log::warn!("IManagerForApplication.cmd_{} → returning empty SUCCESS (likely wrong)", cmd);
+            ok_empty()
+        }
+    }
+}
+
+fn async_context(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => {
+            let h = kernel.handles.create_handle(HandleType::Event);
+            kernel.event_signals.insert(h, true);
+            ok_with_handle(Vec::new(), h)
+        }
+        1 => ok_empty(),
+        2 => ok(vec![1u8]),
+        3 => ok_empty(),
+        _ => ok_empty(),
     }
 }
 
