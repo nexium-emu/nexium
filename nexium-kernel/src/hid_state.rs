@@ -3,6 +3,11 @@ use std::sync::Arc;
 
 pub const HID_SHMEM_SIZE: usize = 0x40000;
 
+const TOUCH_OFFSET: usize = 0x400;
+const MOUSE_OFFSET: usize = 0x3400;
+const KEYBOARD_OFFSET: usize = 0x3800;
+const DEBUGPAD_OFFSET: usize = 0x0;
+
 const NPAD_OFFSET: usize = 0x9A00;
 const NPAD_ENTRY_SIZE: usize = 0x5000;
 const NPAD_ENTRY_HANDHELD: usize = 8;
@@ -152,6 +157,20 @@ impl HidState {
             write_u32(&mut *self.buf, base + NPAD_STYLE_TAG_OFFSET, style);
             write_u32(&mut *self.buf, base + NPAD_JOY_ASSIGN_OFFSET, 0);
         }
+        for &off in &[DEBUGPAD_OFFSET, TOUCH_OFFSET, MOUSE_OFFSET, KEYBOARD_OFFSET] {
+            Self::write_empty_lifo(&mut self.buf[..], off);
+        }
+    }
+
+    fn write_empty_lifo(buf: &mut [u8], lifo: usize) {
+        write_u64(buf, lifo + 0x00, 1);
+        write_u64(buf, lifo + 0x08, LIFO_STORAGE_COUNT as u64);
+        write_u64(buf, lifo + 0x10, 0);
+        write_u64(buf, lifo + 0x18, 1);
+        let e0 = lifo + LIFO_HEADER_SIZE;
+        write_u64(buf, e0 + 0x00, 1);
+        write_u64(buf, e0 + 0x08, 1);
+        write_u64(buf, e0 + 0x10, 0);
     }
 
     fn write_npad_entry(buf: &mut [u8], entry_idx: usize, lifo_offset_in_entry: usize, input: &ControllerInput, sampling: u64) {
