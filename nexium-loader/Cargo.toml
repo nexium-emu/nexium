@@ -11,3 +11,7 @@ nexium-memory.workspace = true
 log.workspace = true
 byteorder.workspace = true
 memmap2.workspace = true
+lz4_flex.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true
