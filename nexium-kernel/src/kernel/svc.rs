@@ -1140,6 +1140,45 @@ fn dispatch_sm_command_v2(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx) -> Vec<u8>
     }
 }
 
+fn dump_throw_context(kernel: &Kernel) {
+    let cpu = match cpu_ref() { Some(c) => c, None => return };
+    let base = kernel.code_base;
+    log::warn!("[throw] ===== uncaught-exception context (code_base={:#x}) =====", base);
+    for row in 0..4 {
+        let r = row * 8;
+        log::warn!("[throw] x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x}",
+            r, cpu.get_register(r), r+1, cpu.get_register(r+1), r+2, cpu.get_register(r+2), r+3, cpu.get_register(r+3),
+            r+4, cpu.get_register(r+4), r+5, cpu.get_register(r+5), r+6, cpu.get_register(r+6), r+7, cpu.get_register(r+7));
+    }
+    log::warn!("[throw] x28={:#018x} x29(fp)={:#018x} x30(lr)={:#018x} sp={:#018x}",
+        cpu.get_register(28), cpu.get_register(29), cpu.get_register(30), cpu.get_sp());
+    let read_u64 = |va: u64| -> Option<u64> {
+        let mut b = [0u8; 8];
+        if kernel.address_space.read(va, &mut b).is_ok() { Some(u64::from_le_bytes(b)) } else { None }
+    };
+    let read_u32 = |va: u64| -> Option<u32> {
+        let mut b = [0u8; 4];
+        if kernel.address_space.read(va, &mut b).is_ok() { Some(u32::from_le_bytes(b)) } else { None }
+    };
+    let mut fp = cpu.get_register(29);
+    for depth in 0..28u32 {
+        if fp == 0 || (fp & 7) != 0 { break; }
+        let next_fp = match read_u64(fp) { Some(v) => v, None => break };
+        let ret = match read_u64(fp.wrapping_add(8)) { Some(v) => v, None => break };
+        let off = ret.wrapping_sub(base);
+        let mut words = String::new();
+        for i in 0..6u64 {
+            if let Some(w) = read_u32(ret.wrapping_sub(20).wrapping_add(i * 4)) {
+                words.push_str(&format!("{:08x} ", w));
+            }
+        }
+        log::warn!("[throw] #{:02} ret=+{:#x} (raw={:#x}) fp={:#x} | callsite[ret-20..ret+4]= {}", depth, off, ret, fp, words);
+        if next_fp <= fp { break; }
+        fp = next_fp;
+    }
+    log::warn!("[throw] ===== end context =====");
+}
+
 fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcCtx, session_handle: u32, pending_frames: &mut Vec<crate::services::FrameOut>) -> Vec<u8> {
     let _ipc_start = std::time::Instant::now();
     let _port_owned = port_name.to_string();
@@ -1151,6 +1190,25 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
     }
     let _guard = IpcProfileGuard(_ipc_start, _port_owned);
     let cmd_id = ctx.cmif_in.cmd_id;
+
+    if port_name == "ILogService" && cmd_id == 0 {
+        let sb = ctx.send_buffers.iter().find(|b| b.size > 0 && b.addr != 0).copied()
+            .or_else(|| ctx.send_statics.iter().find(|b| b.size > 0 && b.addr != 0).copied());
+        if let Some(b) = sb {
+            let mut buf = vec![0u8; (b.size as usize).min(0x400)];
+            if kernel.address_space.read(b.addr, &mut buf).is_ok() {
+                let txt: String = buf.iter().map(|&c| if (0x20..0x7f).contains(&c) { c as char } else { '.' }).collect();
+                log::warn!("[lm.Log] {}", txt);
+                if txt.contains("bad_alloc") || txt.contains("uncaught") || txt.contains("abort") {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static DUMPED: AtomicBool = AtomicBool::new(false);
+                    if !DUMPED.swap(true, Ordering::Relaxed) {
+                        dump_throw_context(kernel);
+                    }
+                }
+            }
+        }
+    }
 
     if port_name == "nvdrv" || port_name == "nvdrv:a" || port_name == "nvdrv:s" || port_name == "nvdrv:t" {
         return dispatch_nvdrv_command(kernel, ctx, port_name);
