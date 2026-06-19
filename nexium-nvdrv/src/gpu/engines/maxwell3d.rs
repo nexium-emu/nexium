@@ -94,6 +94,7 @@ pub struct Maxwell3DRegisters {
     pub index_buffer_end_hi: u32,
     pub index_format: u32,
     pub index_count: u32,
+    pub index_first: u32,
     pub depth_test_enable: bool,
     pub zeta: ZetaSurface,
     pub zeta_enable: bool,
@@ -167,6 +168,7 @@ impl Default for Maxwell3DRegisters {
             index_buffer_end_hi: 0,
             index_format: 0,
             index_count: 0,
+            index_first: 0,
             depth_test_enable: false,
             zeta: ZetaSurface::default(),
             zeta_enable: false,
@@ -221,6 +223,9 @@ pub struct DrawCall {
     pub vertex_count: u32,
     pub indexed: bool,
     pub index_count: u32,
+    pub index_gpu_va: u64,
+    pub index_format: u32,
+    pub index_first: u32,
     pub point_size: f32,
 
     pub rt: [RenderTarget; 8],
@@ -452,6 +457,9 @@ impl Maxwell3D {
                     vertex_count: 0,
                     indexed: false,
                     index_count: 0,
+                    index_gpu_va: 0,
+                    index_format: 0,
+                    index_first: 0,
                     point_size: 1.0,
                     rt: self.regs.rt,
                     vertex_buffers: self.regs.vertex_buffers,
@@ -530,6 +538,12 @@ impl Maxwell3D {
             0x585 => {
 
             }
+            0x5F2 => self.regs.index_buffer_hi = arg,
+            0x5F3 => self.regs.index_buffer_lo = arg,
+            0x5F4 => self.regs.index_buffer_end_hi = arg,
+            0x5F5 => self.regs.index_buffer_end_lo = arg,
+            0x5F6 => self.regs.index_format = arg,
+            0x5F7 => self.regs.index_first = arg,
             0x5F8 => {
                 self.regs.draw_count += 1;
                 self.regs.index_count = arg;
@@ -703,6 +717,9 @@ impl Maxwell3D {
             vertex_count: count,
             indexed,
             index_count,
+            index_gpu_va: ((self.regs.index_buffer_hi as u64) << 32) | self.regs.index_buffer_lo as u64,
+            index_format: self.regs.index_format,
+            index_first: self.regs.index_first,
             point_size,
             rt: self.regs.rt,
             vertex_buffers: self.regs.vertex_buffers,
