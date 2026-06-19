@@ -93,6 +93,10 @@ pub fn proxy_subsession(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("acc:u0" | "acc:u1" | "acc:aa", 5) => Some("IProfile"),
         ("acc:u0" | "acc:u1" | "acc:aa", 101) => Some("IManagerForApplication"),
         ("IManagerForApplication", 2) => Some("IAsyncContext"),
+        ("nifm:u" | "nifm:a" | "nifm:s", 4) | ("nifm:u" | "nifm:a" | "nifm:s", 5) => Some("IGeneralService"),
+        ("IGeneralService", 2) => Some("IScanRequest"),
+        ("IGeneralService", 4) => Some("IRequest"),
+        ("lm", 0) => Some("ILogService"),
         _ => None,
     }
 }
@@ -124,6 +128,10 @@ pub fn dispatch_command(kernel: &mut Kernel, port_name: &str, cmd_id: u32) -> Op
         "IProfile" => profile(cmd_id),
         "IManagerForApplication" => manager_for_application(cmd_id),
         "IAsyncContext" => async_context(kernel, cmd_id),
+        "IGeneralService" => general_service(cmd_id),
+        "IRequest" => nifm_request(kernel, cmd_id),
+        "IScanRequest" => ok_empty(),
+        "ILogService" => ok_empty(),
         "IOverlayFunctions" => overlay_functions(cmd_id),
         "ILockAccessor" => lock_accessor(cmd_id),
         "IAppletCommonFunctions" => applet_common_functions(cmd_id),
@@ -534,6 +542,35 @@ fn async_context(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32
         1 => ok_empty(),
         2 => ok(vec![1u8]),
         3 => ok_empty(),
+        _ => ok_empty(),
+    }
+}
+
+fn general_service(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        1 => ok(1u64.to_le_bytes().to_vec()),
+        12 => ok(vec![0u8; 4]),
+        15 => ok(vec![0u8; 0x16]),
+        17 => ok(vec![1u8]),
+        20 | 21 => ok(vec![0u8]),
+        18 => ok(vec![1u8, 3u8, 4u8]),
+        22 => ok(vec![0u8]),
+        _ => ok_empty(),
+    }
+}
+
+fn nifm_request(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => ok(3u32.to_le_bytes().to_vec()),
+        2 => {
+            let h1 = kernel.handles.create_handle(HandleType::Event);
+            let h2 = kernel.handles.create_handle(HandleType::Event);
+            kernel.event_signals.insert(h1, true);
+            kernel.event_signals.insert(h2, true);
+            kernel.nvdrv_sync_events.insert(h1);
+            kernel.nvdrv_sync_events.insert(h2);
+            Some((0, Vec::new(), vec![h1, h2]))
+        }
         _ => ok_empty(),
     }
 }
