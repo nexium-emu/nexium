@@ -312,9 +312,9 @@ impl eframe::App for HorizonApp {
                     ui.add_space(8.0);
 
                     ui.menu_button(egui::RichText::new("File").size(13.0).color(TEXT), |ui| {
-                        if ui.button("Open NRO…").clicked() {
+                        if ui.button("Open game…").clicked() {
                             if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("Nintendo Homebrew", &["nro"]).pick_file() {
+                                .add_filter("Switch games", &["nro", "dxci", "dnsp"]).pick_file() {
                                 self.nro_path = p.to_string_lossy().to_string();
                             }
                             ui.close_menu();
@@ -420,7 +420,7 @@ impl eframe::App for HorizonApp {
                     let action = idle_screen(ui, &nro_path, running);
                     match action {
                         0 => { if let Some(p) = rfd::FileDialog::new()
-                                   .add_filter("Nintendo Homebrew", &["nro"]).pick_file() {
+                                   .add_filter("Switch games", &["nro", "dxci", "dnsp"]).pick_file() {
                                    self.nro_path = p.to_string_lossy().to_string();
                                } }
                         1 => self.boot_nro(),

@@ -253,6 +253,9 @@ impl EmulationHandle {
                                         peek_counter, pc, lr, sp, same_pc_streak
                                     );
                                 }
+                                if peek_counter == 1 {
+                                    log::warn!("[spin-dump] {}", halt.peek_dump());
+                                }
                                 halt.halt();
                                 watchdog_halts_wd.fetch_add(1, Ordering::Relaxed);
                                 last_svc_ms_wd.store(now_millis(), Ordering::Relaxed);

@@ -15,6 +15,9 @@ nexium-ipc.workspace = true
 nexium-nvdrv.workspace = true
 nexium-kernel = { workspace = true, default-features = false }
 
+[dev-dependencies]
+env_logger.workspace = true
+
 [features]
 default = ["backend-dynarmic", "backend-rustarmic"]
 backend-dynarmic = ["nexium-cpu/backend-dynarmic", "nexium-kernel/backend-dynarmic"]
