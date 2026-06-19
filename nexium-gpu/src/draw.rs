@@ -85,6 +85,7 @@ pub struct Maxwell3dDrawCall {
     pub index_addr: Option<u64>,
     pub index_count: Option<u32>,
     pub index_type: vk::IndexType,
+    pub index_data: Option<Vec<u8>>,
     pub rt_key: RtKey,
     pub rt_format: vk::Format,
     pub vp_rect: Option<[f32; 4]>,

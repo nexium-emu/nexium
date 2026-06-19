@@ -644,6 +644,53 @@ fn execute_one(
         None
     };
 
+    let (out_index_data, out_index_count, out_index_type, eff_vertex_count) =
+        if draw.indexed && draw.index_count > 0 && draw.index_gpu_va != 0 {
+            let isz: usize = match draw.index_format { 0 => 1, 2 => 4, _ => 2 };
+            let icount = draw.index_count as usize;
+            let start = draw.index_gpu_va.wrapping_add((draw.index_first as u64) * isz as u64);
+            let raw = mappings.cpu_address_for(start).and_then(|cpu| {
+                let mut b = vec![0u8; icount * isz];
+                if mem_read(cpu, &mut b) { Some(b) } else { None }
+            });
+            match raw {
+                Some(bytes) => {
+                    let (data, max_idx, itype) = match draw.index_format {
+                        2 => {
+                            let mut mx = 0u32;
+                            for c in bytes.chunks_exact(4) {
+                                let v = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                                if v != 0xFFFF_FFFF && v > mx { mx = v; }
+                            }
+                            (bytes, mx, vk::IndexType::UINT32)
+                        }
+                        0 => {
+                            let mut wide = Vec::with_capacity(bytes.len() * 2);
+                            let mut mx = 0u32;
+                            for &b in &bytes {
+                                wide.extend_from_slice(&(b as u16).to_le_bytes());
+                                if b as u32 > mx { mx = b as u32; }
+                            }
+                            (wide, mx, vk::IndexType::UINT16)
+                        }
+                        _ => {
+                            let mut mx = 0u32;
+                            for c in bytes.chunks_exact(2) {
+                                let v = u16::from_le_bytes([c[0], c[1]]) as u32;
+                                if v != 0xFFFF && v > mx { mx = v; }
+                            }
+                            (bytes, mx, vk::IndexType::UINT16)
+                        }
+                    };
+                    (Some(data), Some(icount as u32), itype, max_idx + 1)
+                }
+                None => (None, None, vk::IndexType::UINT16, draw.vertex_count),
+            }
+        } else {
+            (None, None, vk::IndexType::UINT16, draw.vertex_count)
+        };
+    let is_indexed = out_index_count.is_some();
+
     let call = Maxwell3dDrawCall {
         vs_spirv,
         fs_spirv,
@@ -657,18 +704,19 @@ fn execute_one(
         cbuf_size: uni_cbuf_size,
         cbuf_data,
         vertex_addr,
-        vertex_count: draw.vertex_count,
+        vertex_count: eff_vertex_count,
         index_addr: None,
-        index_count: None,
-        index_type: vk::IndexType::UINT16,
+        index_count: out_index_count,
+        index_type: out_index_type,
+        index_data: out_index_data,
         rt_key,
         rt_format: vk::Format::R8G8B8A8_UNORM,
         vp_rect: guest_viewport_rect(draw, rt.width as f32, rt.height as f32),
         state: DrawState {
             topology,
-            vertex_count: draw.vertex_count,
-            index_count: 0,
-            indexed: false,
+            vertex_count: eff_vertex_count,
+            index_count: out_index_count.unwrap_or(0),
+            indexed: is_indexed,
         },
         blend: BlendState {
             enabled: maxwell.regs.blend_enable[0] && std::env::var("NEXIUM_NO_BLEND").is_err(),
