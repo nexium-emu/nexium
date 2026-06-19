@@ -1,5 +1,5 @@
 use nexium_memory::{AddressSpace, Perm};
-use nexium_loader::{Loader, Nro};
+use nexium_loader::{Application, Loader, LoadedProgram, Nro};
 use crate::kernel::Kernel;
 use nexium_cpu::Cpu;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ impl BootConfig {
 }
 
 pub struct BootContext {
-    pub nro: Nro,
+    pub program: LoadedProgram,
     pub address_space: Arc<AddressSpace>,
     pub kernel: Arc<Mutex<Kernel>>,
     pub cpu: Option<Cpu>,
@@ -36,8 +36,14 @@ pub struct BootContext {
 
 impl BootContext {
     pub fn new(config: BootConfig) -> Result<Self, String> {
+        match Loader::load_any(&config.nro_path)? {
+            LoadedProgram::Nro(nro) => Self::new_nro(config, nro),
+            LoadedProgram::Application(app) => Self::new_application(config, app),
+        }
+    }
+
+    fn new_nro(config: BootConfig, nro: Nro) -> Result<Self, String> {
         log::info!("Loading NRO from: {}", config.nro_path);
-        let nro = Loader::load_nro(&config.nro_path)?;
 
         log::info!("Creating address space");
         let address_space = Arc::new(AddressSpace::new());
@@ -168,7 +174,134 @@ impl BootContext {
 
         log::info!("Boot context ready");
         Ok(BootContext {
-            nro,
+            program: LoadedProgram::Nro(nro),
+            address_space,
+            kernel: Arc::new(Mutex::new(kernel)),
+            cpu: Some(cpu),
+        })
+    }
+
+    fn new_application(config: BootConfig, app: Application) -> Result<Self, String> {
+        log::info!("Loading application: {} (title_id={:#018x})", config.nro_path, app.title_id);
+
+        let address_space = Arc::new(AddressSpace::new());
+
+        let bits: u32 = match app.npdm.address_space {
+            nexium_loader::npdm::AddressSpaceType::Is39Bit => 39,
+            nexium_loader::npdm::AddressSpaceType::Is36Bit => 36,
+            other => {
+                log::warn!("address space {:?} unsupported; using 36-bit layout", other);
+                36
+            }
+        };
+        let space: u64 = 1u64 << bits;
+
+        let code_base: u64 = 0x800_0000;
+        let heap_base: u64 = space / 8;
+        let alias_base: u64 = space / 2;
+        let stack_base: u64 = space * 3 / 4;
+        let env_base: u64 = stack_base + 0x4000_0000;
+        let tls_base: u64 = env_base + 0x1000;
+        let exit_stub_va: u64 = env_base + 0x2000;
+        let aslr_base: u64 = code_base;
+        let aslr_size: u64 = space - code_base;
+        let alias_size: u64 = (space / 16).min(0x1_8000_0000);
+        let heap_size: u64 = 0xCC00_0000;
+
+        const PAGE_SIZE: u64 = 0x1000;
+        let code_size = app.total_code_size.max(PAGE_SIZE);
+        log::info!("address space {}-bit: code@{:#x} heap@{:#x} stack@{:#x} alias@{:#x} aslr_size={:#x}",
+            bits, code_base, heap_base, stack_base, alias_base, aslr_size);
+
+        log::info!("Mapping {} NSO module(s), code region {:#x} (size {:#x})", app.modules.len(), code_base, code_size);
+        for m in &app.modules {
+            let base = code_base + m.load_offset;
+            let image = m.nso.image_size as u64;
+            let data_off = (m.nso.data.mem_offset as u64) & !(PAGE_SIZE - 1);
+            let static_size = data_off;
+            let mutable_size = image - data_off;
+
+            if static_size > 0 {
+                address_space.map(base, static_size, Perm::RX, format!("codestatic_{}", m.name))
+                    .map_err(|e| format!("Failed to map {} text/ro: {:?}", m.name, e))?;
+                address_space.write(base, &m.nso.module_image[..static_size as usize])
+                    .map_err(|e| format!("Failed to write {} text/ro: {:?}", m.name, e))?;
+            }
+            if mutable_size > 0 {
+                address_space.map(base + data_off, mutable_size, Perm::RW, format!("codemutable_{}", m.name))
+                    .map_err(|e| format!("Failed to map {} data/bss: {:?}", m.name, e))?;
+                address_space.write(base + data_off, &m.nso.module_image[data_off as usize..])
+                    .map_err(|e| format!("Failed to write {} data/bss: {:?}", m.name, e))?;
+            }
+            log::info!("  module {} @ {:#x} static={:#x} mutable={:#x}", m.name, base, static_size, mutable_size);
+        }
+
+        log::info!("  Mapping heap @ {:#x} (size {:#x})", heap_base, heap_size);
+        address_space.map(heap_base, heap_size, Perm::RW, "heap")
+            .map_err(|e| format!("Failed to map heap: {:?}", e))?;
+
+        log::info!("  Mapping stack @ {:#x} (size {:#x})", stack_base, config.stack_size);
+        address_space.map(stack_base, config.stack_size, Perm::RW, "stack")
+            .map_err(|e| format!("Failed to map stack: {:?}", e))?;
+
+        log::info!("  Mapping extras (env+tls+exit_stub+tls_pool) @ {:#x} (size 0x110000)", env_base);
+        address_space.map(env_base, 0x110000, Perm::RW, "extras")
+            .map_err(|e| format!("Failed to map extras: {:?}", e))?;
+
+        let svc_exit_insn: u32 = 0xD400_00E1;
+        address_space.write(exit_stub_va, &svc_exit_insn.to_le_bytes())
+            .map_err(|e| format!("Failed to write exit stub: {:?}", e))?;
+
+        let tls_pool_base: u64 = env_base + 0x10000;
+        let mut kernel = Kernel::new(
+            address_space.clone(),
+            code_base,
+            code_size,
+            heap_base,
+            heap_size,
+            stack_base,
+            config.stack_size,
+            tls_base,
+            tls_pool_base,
+        );
+
+        let (romfs_mmap, romfs_range) = match &app.romfs {
+            Some(r) => (Some(r.mmap.clone()), Some(r.range.clone())),
+            None => (None, None),
+        };
+        kernel.nro_mmap = romfs_mmap;
+        kernel.nro_romfs_range = romfs_range;
+        kernel.aslr_base = aslr_base;
+        kernel.aslr_size = aslr_size;
+        kernel.alias_base = alias_base;
+        kernel.alias_size = alias_size;
+        kernel.is_application = true;
+        kernel.total_memory = 0xCD50_0000;
+
+        nexium_common::paths::init();
+
+        log::info!("Initializing CPU (backend: {})", config.cpu_backend.label());
+        let mut cpu = kernel.init_cpu(config.cpu_backend)
+            .map_err(|e| format!("Failed to init CPU: {}", e))?;
+
+        let main_thread_handle = kernel.main_thread_handle;
+        {
+            let entry_point = code_base;
+            let sp = stack_base + config.stack_size - 0x20;
+            cpu.set_pc(entry_point);
+            cpu.set_sp(sp);
+            cpu.set_tpidrro_el0(tls_base);
+            cpu.set_register(0, 0);
+            cpu.set_register(1, main_thread_handle as u64);
+            cpu.set_register(30, exit_stub_va);
+            log::info!("  PC: {:#x}  SP: {:#x}  X0: 0  X1 (main_thread): {:#x}  X30 (exit_stub): {:#x}",
+                cpu.get_pc(), cpu.get_sp(), main_thread_handle, exit_stub_va);
+            log::info!("  TPIDRRO_EL0: {:#x}", cpu.get_tpidrro_el0());
+        }
+
+        log::info!("Application boot context ready");
+        Ok(BootContext {
+            program: LoadedProgram::Application(app),
             address_space,
             kernel: Arc::new(Mutex::new(kernel)),
             cpu: Some(cpu),
