@@ -518,6 +518,22 @@ impl EmulationHandle {
                                 }
                             }
                         }
+                        {
+                            let mut fp = regs[29];
+                            let mut frames: Vec<String> = Vec::new();
+                            for _ in 0..16 {
+                                if fp < 0x10000 { break; }
+                                let mut b = [0u8; 16];
+                                if guard.address_space.read(fp, &mut b).is_err() { break; }
+                                let next = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                                let ret = u64::from_le_bytes(b[8..16].try_into().unwrap());
+                                if ret == 0 { break; }
+                                frames.push(format!("+{:#x}", ret.wrapping_sub(0x8000000)));
+                                if next <= fp { break; }
+                                fp = next;
+                            }
+                            log::error!("[null-pc] callstack(+base): {}", frames.join(" <- "));
+                        }
                         let x20 = regs[20];
                         if x20 >= 0x10000 {
                             let mut peek = [0u8; 64];
