@@ -1,8 +1,87 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const NUM_REGS: usize = 8;
 pub const MACRO_REGISTERS_START: u32 = 0xE00;
 const NUM_MACRO_POSITIONS: usize = 0x80;
+
+fn macro_hash(code: &[u32]) -> u64 {
+    const M: u64 = 0xc6a4_a793_5bd1_e995;
+    let mut h: u64 = 0;
+    for &v in code {
+        let mut k = v as u64;
+        k = k.wrapping_mul(M);
+        k ^= k >> 47;
+        k = k.wrapping_mul(M);
+        h ^= k;
+        h = h.wrapping_mul(M);
+        h = h.wrapping_add(0xe654_6b64);
+    }
+    h
+}
+
+const REG_GLOBAL_BASE_VERTEX: u32 = 0x50D;
+const REG_GLOBAL_BASE_INSTANCE: u32 = 0x50E;
+const REG_VERTEX_FIRST: u32 = 0x35D;
+const REG_VERTEX_COUNT: u32 = 0x35E;
+const REG_DRAW_BEGIN: u32 = 0x586;
+const REG_INDEX_FIRST: u32 = 0x5F7;
+const REG_INDEX_COUNT: u32 = 0x5F8;
+const REG_CB_SIZE: u32 = 0x8E0;
+const REG_CB_ADDR_HI: u32 = 0x8E1;
+const REG_CB_ADDR_LO: u32 = 0x8E2;
+const REG_CB_OFFSET: u32 = 0x8E3;
+const REG_UPLOAD_LINE_LENGTH: u32 = 0x60;
+const REG_UPLOAD_LINE_COUNT: u32 = 0x61;
+const REG_UPLOAD_DST_HI: u32 = 0x62;
+const REG_UPLOAD_DST_LO: u32 = 0x63;
+const REG_LAUNCH_DMA: u32 = 0x6C;
+
+fn hle_macro(hash: u64, params: &[u32]) -> Option<Vec<(u32, u32)>> {
+    let p = |i: usize| params.get(i).copied().unwrap_or(0);
+    let mut w: Vec<(u32, u32)> = Vec::new();
+    match hash {
+        0x0D61_FC9F_AAC9_FCAD | 0x8A4D_173E_B99A_8603 => {
+            let topology = p(0) & 0xFFFF;
+            let vertex_count = p(1);
+            let vertex_first = p(3);
+            if hash == 0x8A4D_173E_B99A_8603 {
+                w.push((REG_GLOBAL_BASE_INSTANCE, p(4)));
+            }
+            w.push((REG_DRAW_BEGIN, topology));
+            w.push((REG_VERTEX_FIRST, vertex_first));
+            w.push((REG_VERTEX_COUNT, vertex_count));
+        }
+        0x771B_B18C_6244_4DA0 | 0x0217_9201_0048_8FF7 => {
+            let topology = p(0) & 0xFFFF;
+            let index_count = p(1);
+            let index_first = p(3);
+            let base_vertex = p(4);
+            w.push((REG_GLOBAL_BASE_VERTEX, base_vertex));
+            if hash == 0x0217_9201_0048_8FF7 {
+                w.push((REG_GLOBAL_BASE_INSTANCE, p(5)));
+            }
+            w.push((REG_DRAW_BEGIN, topology));
+            w.push((REG_INDEX_FIRST, index_first));
+            w.push((REG_INDEX_COUNT, index_count));
+        }
+        0x6C97_861D_891E_DF7E | 0xD246_FDDF_3A61_73D7 => {
+            let size = if hash == 0x6C97_861D_891E_DF7E { 0x5F00 } else { 0x7000 };
+            w.push((REG_CB_SIZE, size));
+            w.push((REG_CB_ADDR_HI, p(0)));
+            w.push((REG_CB_ADDR_LO, p(1)));
+            w.push((REG_CB_OFFSET, 0));
+        }
+        0xEE4D_0004_BEC8_ECF4 => {
+            w.push((REG_UPLOAD_LINE_LENGTH, p(2)));
+            w.push((REG_UPLOAD_LINE_COUNT, 1));
+            w.push((REG_UPLOAD_DST_HI, p(0)));
+            w.push((REG_UPLOAD_DST_LO, p(1)));
+            w.push((REG_LAUNCH_DMA, 0x1011));
+        }
+        _ => return None,
+    }
+    Some(w)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Operation {
@@ -89,8 +168,8 @@ impl Opcode {
     fn src_a(self) -> u32 { (self.0 >> 11) & 0x7 }
     fn src_b(self) -> u32 { (self.0 >> 14) & 0x7 }
     fn immediate(self) -> i32 {
-        let raw = (self.0 >> 14) as i32;
-        (raw << 14) >> 14
+        let raw = self.0 >> 14;
+        if raw & 0x2_0000 != 0 { (raw | 0xFFFC_0000) as i32 } else { raw as i32 }
     }
     fn alu_op(self) -> AluOp { AluOp::from_u32((self.0 >> 17) & 0x1F) }
     fn bf_src_bit(self) -> u32 { (self.0 >> 17) & 0x1F }
@@ -116,6 +195,7 @@ pub struct MacroEngine {
     start_address_ptr: u32,
     executing_macro: u32,
     pending_params: Vec<u32>,
+    seen_hashes: HashSet<u64>,
 }
 
 impl MacroEngine {
@@ -128,6 +208,7 @@ impl MacroEngine {
             start_address_ptr: 0,
             executing_macro: 0,
             pending_params: Vec::new(),
+            seen_hashes: HashSet::new(),
         }
     }
 
@@ -177,6 +258,16 @@ impl MacroEngine {
             log::trace!("MME: trigger {:#x} entry={} offset={} - no code", trigger, entry, offset);
             return Some(MacroOutput::default());
         }
+        let hash = macro_hash(&code);
+        let hle = hle_macro(hash, &params);
+        if self.seen_hashes.insert(hash) {
+            log::info!("MME: macro entry={} offset={} hash={:#018x} len={} params={} hle={} code={:08x?}",
+                entry, offset, hash, code.len(), params.len(), hle.is_some(),
+                &code[..code.len().min(28)]);
+        }
+        if let Some(writes) = hle {
+            return Some(MacroOutput { writes });
+        }
         let mut interp = Interpreter::new(&code, &params, reg_reader);
         interp.run();
         Some(MacroOutput { writes: interp.writes })
@@ -221,6 +312,7 @@ struct Interpreter<'a> {
     method_address: u32,
     carry: bool,
     writes: Vec<(u32, u32)>,
+    written: HashMap<u32, u32>,
     reg_reader: &'a dyn Fn(u32) -> u32,
     steps_remaining: u32,
 }
@@ -235,17 +327,23 @@ impl<'a> Interpreter<'a> {
             code, params, next_param: 1,
             registers: regs, pc: 0, delayed_pc: None,
             method_address: 0, carry: false,
-            writes: Vec::new(), reg_reader,
-            steps_remaining: 65_536,
+            writes: Vec::new(), written: HashMap::new(), reg_reader,
+            steps_remaining: 8192,
         }
     }
 
     fn run(&mut self) {
+        let mut exited = false;
         while self.steps_remaining > 0 {
             self.steps_remaining -= 1;
             if !self.step(false) {
+                exited = true;
                 break;
             }
+        }
+        if !exited {
+            log::warn!("MME: macro hit step cap (produced {} writes) — discarding as runaway", self.writes.len());
+            self.writes.clear();
         }
     }
 
@@ -266,6 +364,10 @@ impl<'a> Interpreter<'a> {
         let address = self.method_address & 0xFFF;
         let increment = (self.method_address >> 12) & 0x3F;
         self.writes.push((address, value));
+        self.written.insert(address, value);
+        if address == 0x8C4 {
+            self.written.insert(0xD00, 1);
+        }
         let next = (address.wrapping_add(increment)) & 0xFFF;
         self.method_address = (self.method_address & !0xFFF) | next;
     }
@@ -293,12 +395,12 @@ impl<'a> Interpreter<'a> {
             }
             AluOp::Subtract => {
                 let r = (a as u64).wrapping_sub(b as u64);
-                self.carry = (r as i64) < 0;
+                self.carry = r < 0x1_0000_0000_u64;
                 r as u32
             }
             AluOp::SubtractWithBorrow => {
                 let r = (a as u64).wrapping_sub(b as u64).wrapping_sub(if self.carry { 0 } else { 1 });
-                self.carry = (r as i64) < 0;
+                self.carry = r < 0x1_0000_0000_u64;
                 r as u32
             }
             AluOp::Xor => a ^ b,
@@ -399,7 +501,7 @@ impl<'a> Interpreter<'a> {
             }
             Operation::Read => {
                 let addr = self.read_reg(op.src_a()).wrapping_add(op.immediate() as u32);
-                let v = (self.reg_reader)(addr);
+                let v = self.written.get(&addr).copied().unwrap_or_else(|| (self.reg_reader)(addr));
                 self.process_result(op.result_operation(), op.dst(), v);
             }
             Operation::Branch => {

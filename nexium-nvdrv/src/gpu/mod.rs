@@ -149,7 +149,7 @@ impl GpuContext {
         let mappings = self.mappings.lock();
 
         pusher.process_gpfifo(address, num_entries, &mappings, &mut *maxwell, &mut *maxwell_dma, &mut *fermi_2d, &mut *kepler_memory, &*self.stats, &mem_read, &mem_write);
-        pusher.syncpt_value = pusher.syncpt_value.wrapping_add(1);
+        pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
 
         let syncpt_id = 0u32;
         let syncpt_value = pusher.syncpt_value;
@@ -172,7 +172,7 @@ impl GpuContext {
         for entry in entries {
             pusher.process_entry(entry, &mappings, &mut *maxwell, &mut *maxwell_dma, &mut *fermi_2d, &mut *kepler_memory, &*self.stats, &mem_read, &mem_write);
         }
-        pusher.syncpt_value = pusher.syncpt_value.wrapping_add(1);
+        pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         (0, pusher.syncpt_value)
     }
 

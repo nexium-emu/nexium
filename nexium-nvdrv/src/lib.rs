@@ -255,7 +255,7 @@ impl Nvdrv {
             NvDevice::NvhostCtrlGpu => self.nvhost_ctrl_gpu_ioctl(cmd, &req),
             NvDevice::NvhostAsGpu => self.nvhost_as_gpu_ioctl(cmd, &req),
             NvDevice::NvhostGpu => self.nvhost_gpu_ioctl_with_mem(cmd, &req, mem_read, mem_write),
-            NvDevice::NvhostCtrl => Self::nvhost_ctrl_ioctl(cmd, &req),
+            NvDevice::NvhostCtrl => self.nvhost_ctrl_ioctl(cmd, &req),
             _ => IoctlOutcome::ok(vec![0u8; req.out_size]),
         }
     }
@@ -649,9 +649,14 @@ impl Nvdrv {
                         self.stats.gpfifo_submits.fetch_add(1, Ordering::Relaxed);
                         self.stats.gpfifo_entries.fetch_add(entries.len() as u64, Ordering::Relaxed);
                         let (syncpt_id, syncpt_value) = self.gpu.process_inline_gpfifo(&entries, mem_read, mem_write);
-                        log::debug!("nvhost-gpu:SubmitGPFIFO processed {} entries (draws={}, clears={})",
-                            entries.len(), self.gpu.maxwell3d.lock().draw_count(),
-                            self.gpu.maxwell3d.lock().clear_count());
+                        if log::log_enabled!(log::Level::Debug) {
+                            let (dc, cc) = {
+                                let m = self.gpu.maxwell3d.lock();
+                                (m.draw_count(), m.clear_count())
+                            };
+                            log::debug!("nvhost-gpu:SubmitGPFIFO processed {} entries (draws={}, clears={})",
+                                entries.len(), dc, cc);
+                        }
                         if out.len() >= 24 {
                             out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
                             out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
@@ -746,7 +751,7 @@ impl Nvdrv {
         IoctlOutcome::ok(out)
     }
 
-    fn nvhost_ctrl_ioctl(cmd: u16, req: &IoctlRequest) -> IoctlOutcome {
+    fn nvhost_ctrl_ioctl(&mut self, cmd: u16, req: &IoctlRequest) -> IoctlOutcome {
         let mut out = vec![0u8; req.out_size];
         let n = req.in_data.len().min(out.len());
         out[..n].copy_from_slice(&req.in_data[..n]);
@@ -795,18 +800,43 @@ impl Nvdrv {
             }
             0x001d => {
                 if req.in_data.len() >= 16 && out.len() >= 16 {
-                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let syncpt_id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
                     let threshold = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
-                    out[12..16].copy_from_slice(&threshold.to_le_bytes());
-                    log::debug!("nvhost-ctrl:EventWait syncpt={} threshold={:#x} (ack as signaled)", id, threshold);
+                    let current_val = self.gpu.pusher.lock().syncpt_value;
+                    if current_val >= threshold {
+                        out[12..16].copy_from_slice(&current_val.to_le_bytes());
+                        log::debug!("nvhost-ctrl:EventWait syncpt={} threshold={:#x} current={} → Success (already reached)",
+                            syncpt_id, threshold, current_val);
+                    } else {
+                        let slot: u32 = 0;
+                        let event_val: u32 = slot | ((syncpt_id & 0xFFF) << 16) | (1 << 28);
+                        out[12..16].copy_from_slice(&event_val.to_le_bytes());
+                        log::debug!("nvhost-ctrl:EventWait syncpt={} threshold={:#x} current={} → Timeout (deferred, slot={}, event_val={:#x})",
+                            syncpt_id, threshold, current_val, slot, event_val);
+                        return IoctlOutcome::error(5);
+                    }
                 }
             }
             0x001e => {
                 if req.in_data.len() >= 16 {
-                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let syncpt_id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
                     let threshold = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
                     let event_id = u32::from_le_bytes([req.in_data[12], req.in_data[13], req.in_data[14], req.in_data[15]]);
-                    log::debug!("nvhost-ctrl:EventWaitAsync syncpt={} threshold={:#x} event_id={}", id, threshold, event_id);
+                    let current_val = self.gpu.pusher.lock().syncpt_value;
+                    if current_val >= threshold {
+                        if out.len() >= 16 {
+                            out[12..16].copy_from_slice(&current_val.to_le_bytes());
+                        }
+                        log::debug!("nvhost-ctrl:EventWaitAsync syncpt={} threshold={:#x} current={} event_id={} → Success",
+                            syncpt_id, threshold, current_val, event_id);
+                    } else {
+                        if out.len() >= 16 {
+                            out[12..16].copy_from_slice(&event_id.to_le_bytes());
+                        }
+                        log::debug!("nvhost-ctrl:EventWaitAsync syncpt={} threshold={:#x} current={} event_id={} → Timeout",
+                            syncpt_id, threshold, current_val, event_id);
+                        return IoctlOutcome::error(5);
+                    }
                 }
             }
             0x001f => {
@@ -820,6 +850,19 @@ impl Nvdrv {
                     let event_id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
                     log::debug!("nvhost-ctrl:EventUnregister event_id={}", event_id);
                 }
+            }
+            0x001b => {
+                let cstr = |b: &[u8]| -> String {
+                    String::from_utf8_lossy(b.split(|&c| c == 0).next().unwrap_or(&[])).into_owned()
+                };
+                let domain = cstr(req.in_data.get(0..0x41).unwrap_or(&[]));
+                let param = cstr(req.in_data.get(0x41..0x82).unwrap_or(&[]));
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 12 {
+                    log::info!("nvhost-ctrl:NvOsGetConfigU32 domain='{}' param='{}' → ConfigVarNotFound", domain, param);
+                }
+                return IoctlOutcome::error(0x0003_0006);
             }
             other => {
                 log::debug!("nvhost-ctrl: unknown ioctl cmd={:#x}", other);

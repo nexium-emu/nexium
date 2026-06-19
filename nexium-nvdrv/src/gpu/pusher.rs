@@ -58,9 +58,13 @@ const METHOD_SEMAPHORE_ADDR_HIGH: u32 = 0x04;
 const METHOD_SEMAPHORE_ADDR_LOW: u32 = 0x05;
 const METHOD_SEMAPHORE_PAYLOAD: u32 = 0x06;
 const METHOD_SEMAPHORE_OPERATION: u32 = 0x07;
+const METHOD_SEMAPHORE_ACQUIRE: u32 = 0x1A;
+const METHOD_SEMAPHORE_RELEASE: u32 = 0x1B;
 const METHOD_SYNCPOINT_PAYLOAD: u32 = 0x1C;
 const METHOD_SYNCPOINT_OPERATION: u32 = 0x1D;
 const NON_PULLER_METHODS: u32 = 0x40;
+
+static GPU_SEM_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Default)]
 struct DmaState {
@@ -281,7 +285,7 @@ impl Pusher {
 
         if method < NON_PULLER_METHODS {
             self.flush_vk(mappings, mem_read);
-            self.handle_puller_method(method, arg, subchannel);
+            self.handle_puller_method(method, arg, subchannel, mappings, mem_write);
             return;
         }
 
@@ -357,7 +361,14 @@ impl Pusher {
         }
     }
 
-    fn handle_puller_method(&mut self, method: u32, arg: u32, subchannel: usize) {
+    fn handle_puller_method(
+        &mut self,
+        method: u32,
+        arg: u32,
+        subchannel: usize,
+        mappings: &GpuMappings,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
         match method {
             METHOD_BIND_OBJECT => {
                 self.bound_classes[subchannel & 7] = arg & 0xFFFF;
@@ -367,9 +378,15 @@ impl Pusher {
             METHOD_SEMAPHORE_ADDR_LOW => self.puller.semaphore_addr_low = arg,
             METHOD_SEMAPHORE_PAYLOAD => self.puller.semaphore_payload = arg,
             METHOD_SEMAPHORE_OPERATION => {
-                log::trace!("puller: SemaphoreOp op={:#x} payload={}",
-                    arg, self.puller.semaphore_payload);
+                if arg & 0xF == 0x2 {
+                    let payload = self.puller.semaphore_payload;
+                    self.write_semaphore(mappings, mem_write, payload, true);
+                }
             }
+            METHOD_SEMAPHORE_RELEASE => {
+                self.write_semaphore(mappings, mem_write, arg, false);
+            }
+            METHOD_SEMAPHORE_ACQUIRE => {}
             METHOD_SYNCPOINT_PAYLOAD => self.puller.syncpoint_payload = arg,
             METHOD_SYNCPOINT_OPERATION => {
                 let op = arg & 0xFF;
@@ -381,6 +398,33 @@ impl Pusher {
             _ => {
                 log::trace!("puller: method {:#x} arg={:#x}", method, arg);
             }
+        }
+    }
+
+    fn write_semaphore(
+        &self,
+        mappings: &GpuMappings,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        payload: u32,
+        long: bool,
+    ) {
+        let gpu_va = ((self.puller.semaphore_addr_high as u64) << 32)
+            | (self.puller.semaphore_addr_low as u64);
+        if let Some(cpu) = mappings.cpu_address_for(gpu_va) {
+            if long {
+                let ts = GPU_SEM_TICK.fetch_add(1, Ordering::Relaxed);
+                let mut buf = [0u8; 16];
+                buf[0..8].copy_from_slice(&(payload as u64).to_le_bytes());
+                buf[8..16].copy_from_slice(&ts.to_le_bytes());
+                mem_write(cpu, &buf);
+            } else {
+                mem_write(cpu, &payload.to_le_bytes());
+            }
+            log::trace!("puller: semaphore write gpu_va={:#x} cpu={:#x} payload={:#x} long={}",
+                gpu_va, cpu, payload, long);
+        } else {
+            log::warn!("puller: semaphore write gpu_va={:#x} not mapped — payload={:#x} dropped",
+                gpu_va, payload);
         }
     }
 }

@@ -404,19 +404,27 @@ impl Maxwell3D {
         }
 
         match method {
+            0x8c4 => {
+                if 0xD00 < self.reg_file.len() {
+                    self.reg_file[0xD00] = 1;
+                }
+            }
             0x6c3 => {
                 let operation = arg & 0x3;
-                let structure_size = (arg >> 12) & 0x1;
-                if operation == 0 {
-                    let off_hi = self.reg_file.get(0x6c0).copied().unwrap_or(0);
-                    let off_lo = self.reg_file.get(0x6c1).copied().unwrap_or(0);
-                    let payload = self.reg_file.get(0x6c2).copied().unwrap_or(0);
-                    let gpu_va = ((off_hi as u64) << 32) | (off_lo as u64);
+                let off_hi = self.reg_file.get(0x6c0).copied().unwrap_or(0);
+                let off_lo = self.reg_file.get(0x6c1).copied().unwrap_or(0);
+                let payload = self.reg_file.get(0x6c2).copied().unwrap_or(0);
+                let gpu_va = ((off_hi as u64) << 32) | (off_lo as u64);
+                {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static N: AtomicU32 = AtomicU32::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 12 {
+                        log::info!("maxwell3d: REPORT_SEMAPHORE arg={:#x} op={} gpu_va={:#x} payload={:#x}",
+                            arg, operation, gpu_va, payload);
+                    }
+                }
+                if operation == 0 || operation == 2 {
                     self.regs.pending_semaphore_writes.push((gpu_va, payload));
-                    log::trace!(
-                        "maxwell3d: SET_REPORT_SEMAPHORE Release gpu_va={:#x} payload={:#x} struct_size={}",
-                        gpu_va, payload, structure_size
-                    );
                 }
             }
             0x360..=0x363 => {
