@@ -27,7 +27,7 @@ pub enum ThreadState {
     Sleeping { wake_at: Instant },
     WaitingHandle { handles: Vec<u32>, wake_at: Option<Instant> },
     WaitingMutex { mutex_addr: u64 },
-    WaitingCondvar { mutex_addr: u64, condvar_addr: u64, wake_at: Option<Instant> },
+    WaitingCondvar { mutex_addr: u64, condvar_addr: u64, wake_at: Option<Instant>, spurious_wake: bool },
     WaitingArbiter { addr: u64, value: u32, wake_at: Option<Instant> },
     Exited,
 }
@@ -159,7 +159,6 @@ impl Threads {
             let due = match &t.state {
                 ThreadState::Sleeping { wake_at } => *wake_at <= now,
                 ThreadState::WaitingHandle { wake_at: Some(d), .. } => *d <= now,
-                ThreadState::WaitingCondvar { wake_at: Some(d), .. } => *d <= now,
                 ThreadState::WaitingArbiter { wake_at: Some(d), .. } => *d <= now,
                 _ => false,
             };
@@ -171,7 +170,6 @@ impl Threads {
             if let Some(t) = self.threads.get_mut(&h) {
                 match t.state {
                     ThreadState::WaitingHandle { .. }
-                    | ThreadState::WaitingCondvar { .. }
                     | ThreadState::WaitingArbiter { .. } => {
                         t.ctx.x[0] = nexium_common::result::KERNEL_TIMEOUT as u64;
                     }

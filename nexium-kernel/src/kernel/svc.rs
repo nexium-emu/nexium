@@ -741,16 +741,25 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
         cpu.set_register(0, SUCCESS as u64);
     }
 
-    let wake_at = if (timeout_ns as i64) <= 0 || timeout_ns == u64::MAX {
+    if kernel.pending_condvar_signals.remove(&condvar_addr) {
+        return SUCCESS;
+    }
+
+    let effective_ns = if timeout_ns == u64::MAX { 16_000_000u64 } else { timeout_ns };
+    let wake_at = if (effective_ns as i64) <= 0 {
         None
     } else {
-        Some(std::time::Instant::now() + std::time::Duration::from_nanos(timeout_ns))
+        Some(std::time::Instant::now() + std::time::Duration::from_nanos(effective_ns))
     };
+
+    if timeout_ns < 50_000_000 && timeout_ns != 0 {
+        kernel.audio_render_condvar = Some(condvar_addr);
+    }
 
     if let Some(cpu) = cpu_ref() {
         kernel.threads.yield_with_state(
             cpu,
-            crate::kernel::threads::ThreadState::WaitingCondvar { mutex_addr, condvar_addr, wake_at },
+            crate::kernel::threads::ThreadState::WaitingCondvar { mutex_addr, condvar_addr, wake_at, spurious_wake: timeout_ns == u64::MAX },
         );
     }
 
@@ -786,6 +795,9 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
             log::debug!("svcSignalProcessWideKey cond={:#x} → handle={:#x} mutex={:#x} (held by {:#x}, requeued as WaitingMutex)", condvar_addr, handle, mutex_addr, holder);
         }
         woken += 1;
+    }
+    if woken == 0 {
+        kernel.pending_condvar_signals.insert(condvar_addr);
     }
     log::debug!("svcSignalProcessWideKey cond={:#x} count={} woken={}", condvar_addr, count, woken);
     if let Some(cpu) = cpu_mut() {
@@ -2268,7 +2280,7 @@ fn dispatch_service_v2(kernel: &mut Kernel, port_name: &str, ctx: &mut ipc::IpcC
                         let new_state: u32 = match in_state {
                             4 => 5,
                             2 => 3,
-                            _ => 0,
+                            s => s,
                         };
                         let off = 0x40 + i * 0x10;
                         out[off..off+4].copy_from_slice(&new_state.to_le_bytes());

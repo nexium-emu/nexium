@@ -27,6 +27,8 @@ pub struct Kernel {
     pub hid: Arc<Mutex<hid::HidShared>>,
     pub sessions: HashMap<u32, session::Session>,
     pub event_signals: HashMap<u32, bool>,
+    pub pending_condvar_signals: HashSet<u64>,
+    pub audio_render_condvar: Option<u64>,
     pub tls_buffer: [u8; 0x100],
     pub pending_frames: Vec<FrameOut>,
 
@@ -171,6 +173,8 @@ impl Kernel {
             hid: Arc::new(Mutex::new(hid::HidShared::new())),
             sessions: HashMap::new(),
             event_signals: HashMap::new(),
+            pending_condvar_signals: HashSet::new(),
+            audio_render_condvar: None,
             tls_buffer: [0u8; 0x100],
             pending_frames: Vec::new(),
             code_base,
@@ -316,7 +320,30 @@ impl Kernel {
         }
     }
 
+    pub fn wake_due_sleepers(&mut self, now: std::time::Instant) {
+        let timed_out: Vec<(u32, u64, bool)> = self.threads.threads.iter()
+            .filter_map(|(h, t)| match &t.state {
+                threads::ThreadState::WaitingCondvar { condvar_addr, wake_at: Some(d), spurious_wake, .. }
+                    if *d <= now => Some((*h, *condvar_addr, *spurious_wake)),
+                _ => None,
+            })
+            .collect();
+
+        for (h, condvar_addr, spurious_wake) in timed_out {
+            let had_pending = self.pending_condvar_signals.remove(&condvar_addr);
+            if !had_pending && !spurious_wake {
+                if let Some(t) = self.threads.threads.get_mut(&h) {
+                    t.ctx.x[0] = nexium_common::result::KERNEL_TIMEOUT as u64;
+                }
+            }
+            self.threads.transition_state(h, threads::ThreadState::Ready);
+        }
+
+        self.threads.wake_due_sleepers(now);
+    }
+
     pub fn ensure_thread_loaded(&mut self) -> Option<u32> {
+        self.wake_due_sleepers(std::time::Instant::now());
         let cpu = cpu_local::cpu_mut()?;
         self.threads.ensure_thread_loaded(cpu)
     }
