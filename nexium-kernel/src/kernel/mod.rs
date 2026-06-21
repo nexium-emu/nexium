@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::collections::{HashMap, HashSet, VecDeque};
 use parking_lot::Mutex;
 
+pub(crate) const MUTEX_HAS_LISTENERS: u32 = 0x4000_0000;
+
 pub struct Kernel {
     pub address_space: Arc<AddressSpace>,
     pub handles: handles::HandleTable,
@@ -27,7 +29,7 @@ pub struct Kernel {
     pub hid: Arc<Mutex<hid::HidShared>>,
     pub sessions: HashMap<u32, session::Session>,
     pub event_signals: HashMap<u32, bool>,
-    pub pending_condvar_signals: HashSet<u64>,
+    pub pending_condvar_signals: HashMap<u64, u32>,
     pub audio_render_condvar: Option<u64>,
     pub tls_buffer: [u8; 0x100],
     pub pending_frames: Vec<FrameOut>,
@@ -98,6 +100,7 @@ pub struct Kernel {
     pub open_files: HashMap<(u32, u32), Arc<memmap2::Mmap>>,
     pub sd_root: Option<std::path::PathBuf>,
     pub open_host_files: HashMap<(u32, u32), std::path::PathBuf>,
+    pub open_romfs_files: HashMap<(u32, u32), (usize, usize)>,
     pub open_file_handles: HashMap<(u32, u32), std::fs::File>,
     pub host_file_cache: HashMap<std::path::PathBuf, Arc<memmap2::Mmap>>,
     pub open_dir_lists: HashMap<(u32, u32), (Vec<(String, bool, u64)>, usize)>,
@@ -173,7 +176,7 @@ impl Kernel {
             hid: Arc::new(Mutex::new(hid::HidShared::new())),
             sessions: HashMap::new(),
             event_signals: HashMap::new(),
-            pending_condvar_signals: HashSet::new(),
+            pending_condvar_signals: HashMap::new(),
             audio_render_condvar: None,
             tls_buffer: [0u8; 0x100],
             pending_frames: Vec::new(),
@@ -228,6 +231,7 @@ impl Kernel {
             open_files: HashMap::new(),
             sd_root: None,
             open_host_files: HashMap::new(),
+            open_romfs_files: HashMap::new(),
             open_file_handles: HashMap::new(),
             host_file_cache: HashMap::new(),
             open_dir_lists: HashMap::new(),
@@ -321,25 +325,61 @@ impl Kernel {
     }
 
     pub fn wake_due_sleepers(&mut self, now: std::time::Instant) {
-        let timed_out: Vec<(u32, u64, bool)> = self.threads.threads.iter()
+        let timed_out: Vec<(u32, u64, u64, bool)> = self.threads.threads.iter()
             .filter_map(|(h, t)| match &t.state {
-                threads::ThreadState::WaitingCondvar { condvar_addr, wake_at: Some(d), spurious_wake, .. }
-                    if *d <= now => Some((*h, *condvar_addr, *spurious_wake)),
+                threads::ThreadState::WaitingCondvar { mutex_addr, condvar_addr, wake_at: Some(d), spurious_wake, .. }
+                    if *d <= now => Some((*h, *mutex_addr, *condvar_addr, *spurious_wake)),
                 _ => None,
             })
             .collect();
 
-        for (h, condvar_addr, spurious_wake) in timed_out {
-            let had_pending = self.pending_condvar_signals.remove(&condvar_addr);
+        for (h, mutex_addr, condvar_addr, spurious_wake) in timed_out {
+            let had_pending = if let Some(n) = self.pending_condvar_signals.get_mut(&condvar_addr) {
+                *n = n.saturating_sub(1);
+                let remove = *n == 0;
+                if remove {
+                    self.pending_condvar_signals.remove(&condvar_addr);
+                }
+                true
+            } else {
+                false
+            };
             if !had_pending && !spurious_wake {
                 if let Some(t) = self.threads.threads.get_mut(&h) {
                     t.ctx.x[0] = nexium_common::result::KERNEL_TIMEOUT as u64;
                 }
             }
-            self.threads.transition_state(h, threads::ThreadState::Ready);
+            if self.reacquire_condvar_mutex(h, mutex_addr) {
+                self.threads.transition_state(h, threads::ThreadState::Ready);
+            } else {
+                self.threads.transition_state(h, threads::ThreadState::WaitingMutex { mutex_addr });
+            }
         }
 
         self.threads.wake_due_sleepers(now);
+    }
+
+    pub fn reacquire_condvar_mutex(&mut self, handle: u32, mutex_addr: u64) -> bool {
+        let mut cur = [0u8; 4];
+        let cur_word = if self.address_space.read(mutex_addr, &mut cur).is_ok() {
+            u32::from_le_bytes(cur)
+        } else {
+            0
+        };
+        let holder = cur_word & !MUTEX_HAS_LISTENERS;
+        if holder == 0 || holder == handle {
+            let more = self.threads.has_mutex_waiters(mutex_addr);
+            let new_word = if more {
+                handle | MUTEX_HAS_LISTENERS
+            } else {
+                handle | (cur_word & MUTEX_HAS_LISTENERS)
+            };
+            let _ = self.address_space.write(mutex_addr, &new_word.to_le_bytes());
+            true
+        } else {
+            let _ = self.address_space.write(mutex_addr, &(cur_word | MUTEX_HAS_LISTENERS).to_le_bytes());
+            false
+        }
     }
 
     pub fn ensure_thread_loaded(&mut self) -> Option<u32> {

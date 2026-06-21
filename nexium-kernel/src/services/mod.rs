@@ -237,7 +237,7 @@ impl Services {
             "ldr:ro" => self.ldr.dispatch(cmd_id),
             "lr" => self.lr.dispatch(cmd_id),
             "ldn:u" | "ldn:s" | "ldn:m" => self.ldn.dispatch(cmd_id),
-            "friend:u" | "friend:a" | "friend:s" | "friend:v" => self.friends.dispatch(cmd_id),
+            "friend:u" | "friend:a" | "friend:s" | "friend:v" | "friend:m" => self.friends.dispatch(cmd_id),
             "fsp:pr" | "fsp:pc" => self.fsp.dispatch(cmd_id),
             "btm" | "btm:u" | "btm:dbg" => self.btm.dispatch(cmd_id),
             "mii:u" | "mii:e" => self.mii.dispatch(cmd_id),
