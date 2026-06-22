@@ -200,64 +200,78 @@ impl EmulationHandle {
                 use nexium_kernel::kernel::cpu_local::{cpu_mut, cpu_ref};
                 let mut last_map_gen0 = boot_ctx.address_space.generation();
 
-                let core1_stop = Arc::new(AtomicBool::new(false));
-                let core1_handle = if std::env::var("NEXIUM_SINGLECORE").is_err() {
-                    let kernel_c1 = Arc::clone(&boot_ctx.kernel);
-                    let stop_c1 = Arc::clone(&core1_stop);
-                    let backend_c1 = cpu_backend;
-                    let addr_c1 = Arc::clone(&boot_ctx.address_space);
-                    thread::Builder::new()
-                        .name("nexium-core1".into())
-                        .spawn(move || {
-                            let mut cpu1 = match kernel_c1.lock().init_cpu(backend_c1) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    log::error!("[core1] init_cpu failed: {}", e);
-                                    return;
-                                }
-                            };
-                            cpu1.set_continue_on_null(true);
-                            let _g1 =
-                                nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu1, 1);
-                            let mut last_map_gen1 = addr_c1.generation();
-                            log::info!("[core1] started");
-                            while !stop_c1.load(Ordering::Relaxed) {
-                                let has = {
-                                    let mut k = kernel_c1.lock();
-                                    k.threads.wake_due_sleepers(std::time::Instant::now());
-                                    k.ensure_thread_loaded().is_some()
-                                };
-                                if !has {
-                                    std::thread::sleep(std::time::Duration::from_micros(200));
-                                    continue;
-                                }
-                                let gen = addr_c1.generation();
-                                if gen != last_map_gen1 {
-                                    for r in addr_c1.host_regions() {
-                                        unsafe {
-                                            let _ = cpu_mut()
-                                                .unwrap()
-                                                .map_host(r.base, r.size, r.perm, r.host_ptr);
-                                        }
-                                    }
-                                    last_map_gen1 = gen;
-                                }
-                                let event = cpu_mut().unwrap().run(200_000);
-                                if let nexium_core::cpu::CpuEvent::Svc(imm) = event {
-                                    let mut k = kernel_c1.lock();
-                                    k.threads.save_current_ctx(cpu_ref().unwrap());
-                                    let result = k.dispatch_svc(imm);
-                                    k.tick_audio_renderers();
-                                    drop(k);
-                                    cpu_mut().unwrap().set_register(0, result as u64);
-                                }
-                            }
-                            log::info!("[core1] stopped");
-                        })
-                        .ok()
+                let aux_core_stop = Arc::new(AtomicBool::new(false));
+                let mut aux_core_handles = Vec::new();
+                let active_cores = if std::env::var("NEXIUM_SINGLECORE").is_ok() {
+                    1usize
                 } else {
-                    None
+                    std::env::var("NEXIUM_CPU_CORES")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(nexium_core::kernel::threads::NUM_CORES)
+                        .clamp(1, nexium_core::kernel::threads::NUM_CORES)
                 };
+                if active_cores > 1 {
+                    for core_id in 1..active_cores {
+                        let kernel_aux = Arc::clone(&boot_ctx.kernel);
+                        let stop_aux = Arc::clone(&aux_core_stop);
+                        let backend_aux = cpu_backend;
+                        let addr_aux = Arc::clone(&boot_ctx.address_space);
+                        if let Ok(handle) = thread::Builder::new()
+                            .name(format!("nexium-core{}", core_id))
+                            .spawn(move || {
+                                let mut cpu_aux = match kernel_aux.lock().init_cpu(backend_aux) {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        log::error!("[core{}] init_cpu failed: {}", core_id, e);
+                                        return;
+                                    }
+                                };
+                                cpu_aux.set_continue_on_null(true);
+                                let _g_aux = nexium_kernel::kernel::cpu_local::set_current_cpu(
+                                    &mut cpu_aux,
+                                    core_id,
+                                );
+                                let mut last_map_gen = addr_aux.generation();
+                                log::info!("[core{}] started", core_id);
+                                while !stop_aux.load(Ordering::Relaxed) {
+                                    let has = {
+                                        let mut k = kernel_aux.lock();
+                                        k.threads.wake_due_sleepers(std::time::Instant::now());
+                                        k.ensure_thread_loaded().is_some()
+                                    };
+                                    if !has {
+                                        std::thread::sleep(std::time::Duration::from_micros(200));
+                                        continue;
+                                    }
+                                    let gen = addr_aux.generation();
+                                    if gen != last_map_gen {
+                                        for r in addr_aux.host_regions() {
+                                            unsafe {
+                                                let _ = cpu_mut()
+                                                    .unwrap()
+                                                    .map_host(r.base, r.size, r.perm, r.host_ptr);
+                                            }
+                                        }
+                                        last_map_gen = gen;
+                                    }
+                                    let event = cpu_mut().unwrap().run(200_000);
+                                    if let nexium_core::cpu::CpuEvent::Svc(imm) = event {
+                                        let mut k = kernel_aux.lock();
+                                        k.threads.save_current_ctx(cpu_ref().unwrap());
+                                        let result = k.dispatch_svc(imm);
+                                        k.tick_audio_renderers();
+                                        drop(k);
+                                        cpu_mut().unwrap().set_register(0, result as u64);
+                                    }
+                                }
+                                log::info!("[core{}] stopped", core_id);
+                            })
+                        {
+                            aux_core_handles.push(handle);
+                        }
+                    }
+                }
 
                 let last_svc_ms = Arc::new(AtomicU64::new(0));
                 let watchdog_stop = Arc::new(AtomicBool::new(false));
@@ -958,8 +972,8 @@ impl EmulationHandle {
                     svc_count
                 );
 
-                core1_stop.store(true, Ordering::Relaxed);
-                if let Some(h) = core1_handle {
+                aux_core_stop.store(true, Ordering::Relaxed);
+                for h in aux_core_handles {
                     let _ = h.join();
                 }
 

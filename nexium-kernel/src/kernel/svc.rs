@@ -5976,6 +5976,14 @@ fn svc_create_thread(kernel: &mut Kernel) -> u32 {
     kernel.threads.add_thread(handle, ctx, tls_va, sp);
     if let Some(t) = kernel.threads.threads.get_mut(&handle) {
         t.priority = priority;
+        let active_cores = std::env::var("NEXIUM_CPU_CORES")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(crate::kernel::threads::NUM_CORES as i32)
+            .clamp(1, crate::kernel::threads::NUM_CORES as i32);
+        if (0..active_cores).contains(&core) {
+            t.core = core;
+        }
     }
 
     log::info!(
@@ -6093,9 +6101,15 @@ fn svc_set_thread_priority(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_get_thread_core_mask(_kernel: &mut Kernel) -> u32 {
+fn svc_get_thread_core_mask(kernel: &mut Kernel) -> u32 {
+    let handle = cpu_ref().map(|cpu| cpu.get_register(0) as u32);
+    let core = handle
+        .and_then(|h| kernel.threads.threads.get(&h))
+        .map(|t| t.core)
+        .filter(|core| (0..crate::kernel::threads::NUM_CORES as i32).contains(core))
+        .unwrap_or(0) as u64;
     if let Some(cpu) = cpu_mut() {
-        cpu.set_register(1, 0);
+        cpu.set_register(1, core);
         cpu.set_register(2, 0xF);
         cpu.set_register(0, SUCCESS as u64);
     }
@@ -6111,7 +6125,7 @@ fn svc_set_thread_core_mask(_kernel: &mut Kernel) -> u32 {
 
 fn svc_get_current_processor_number(_kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_mut() {
-        cpu.set_register(0, 0);
+        cpu.set_register(0, crate::kernel::cpu_local::current_core() as u64);
     }
     0
 }
