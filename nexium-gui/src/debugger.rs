@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 pub struct LogHistory {

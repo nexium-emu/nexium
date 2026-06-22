@@ -4,25 +4,59 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SwitchButton {
-    A, B, X, Y,
-    L, R, ZL, ZR,
-    Plus, Minus,
-    DUp, DDown, DLeft, DRight,
-    StickL, StickR,
-    StickLUp, StickLDown, StickLLeft, StickLRight,
-    StickRUp, StickRDown, StickRLeft, StickRRight,
+    A,
+    B,
+    X,
+    Y,
+    L,
+    R,
+    ZL,
+    ZR,
+    Plus,
+    Minus,
+    DUp,
+    DDown,
+    DLeft,
+    DRight,
+    StickL,
+    StickR,
+    StickLUp,
+    StickLDown,
+    StickLLeft,
+    StickLRight,
+    StickRUp,
+    StickRDown,
+    StickRLeft,
+    StickRRight,
 }
 
 impl SwitchButton {
     pub fn all() -> &'static [SwitchButton] {
         &[
-            SwitchButton::A, SwitchButton::B, SwitchButton::X, SwitchButton::Y,
-            SwitchButton::L, SwitchButton::R, SwitchButton::ZL, SwitchButton::ZR,
-            SwitchButton::Plus, SwitchButton::Minus,
-            SwitchButton::DUp, SwitchButton::DDown, SwitchButton::DLeft, SwitchButton::DRight,
-            SwitchButton::StickL, SwitchButton::StickR,
-            SwitchButton::StickLUp, SwitchButton::StickLDown, SwitchButton::StickLLeft, SwitchButton::StickLRight,
-            SwitchButton::StickRUp, SwitchButton::StickRDown, SwitchButton::StickRLeft, SwitchButton::StickRRight,
+            SwitchButton::A,
+            SwitchButton::B,
+            SwitchButton::X,
+            SwitchButton::Y,
+            SwitchButton::L,
+            SwitchButton::R,
+            SwitchButton::ZL,
+            SwitchButton::ZR,
+            SwitchButton::Plus,
+            SwitchButton::Minus,
+            SwitchButton::DUp,
+            SwitchButton::DDown,
+            SwitchButton::DLeft,
+            SwitchButton::DRight,
+            SwitchButton::StickL,
+            SwitchButton::StickR,
+            SwitchButton::StickLUp,
+            SwitchButton::StickLDown,
+            SwitchButton::StickLLeft,
+            SwitchButton::StickLRight,
+            SwitchButton::StickRUp,
+            SwitchButton::StickRDown,
+            SwitchButton::StickRLeft,
+            SwitchButton::StickRRight,
         ]
     }
 
@@ -87,10 +121,22 @@ impl SwitchButton {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GpButton {
-    South, East, West, North,
-    L, R, ZL, ZR,
-    Plus, Minus, LStick, RStick,
-    Up, Down, Left, Right,
+    South,
+    East,
+    West,
+    North,
+    L,
+    R,
+    ZL,
+    ZR,
+    Plus,
+    Minus,
+    LStick,
+    RStick,
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 impl GpButton {
@@ -154,14 +200,16 @@ impl Default for ControllerConfig {
         bindings.insert(SwitchButton::StickRRight, "L".to_string());
         bindings.insert(SwitchButton::StickL, "F".to_string());
         bindings.insert(SwitchButton::StickR, "G".to_string());
-        Self { bindings, pad: Self::default_pad() }
+        Self {
+            bindings,
+            pad: Self::default_pad(),
+        }
     }
 }
 
 impl ControllerConfig {
     pub fn config_path() -> Option<PathBuf> {
-        directories::BaseDirs::new()
-            .map(|d| d.config_dir().join("NeXium").join("controller.json"))
+        directories::BaseDirs::new().map(|d| d.config_dir().join("NeXium").join("controller.json"))
     }
 
     pub fn load() -> Self {
@@ -177,7 +225,10 @@ impl ControllerConfig {
 
     pub fn save(&self) -> std::io::Result<()> {
         let Some(path) = Self::config_path() else {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "no config dir"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "no config dir",
+            ));
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -210,10 +261,22 @@ impl ControllerConfig {
 
     pub fn pad_list() -> &'static [SwitchButton] {
         &[
-            SwitchButton::A, SwitchButton::B, SwitchButton::X, SwitchButton::Y,
-            SwitchButton::L, SwitchButton::R, SwitchButton::ZL, SwitchButton::ZR,
-            SwitchButton::Plus, SwitchButton::Minus, SwitchButton::StickL, SwitchButton::StickR,
-            SwitchButton::DUp, SwitchButton::DDown, SwitchButton::DLeft, SwitchButton::DRight,
+            SwitchButton::A,
+            SwitchButton::B,
+            SwitchButton::X,
+            SwitchButton::Y,
+            SwitchButton::L,
+            SwitchButton::R,
+            SwitchButton::ZL,
+            SwitchButton::ZR,
+            SwitchButton::Plus,
+            SwitchButton::Minus,
+            SwitchButton::StickL,
+            SwitchButton::StickR,
+            SwitchButton::DUp,
+            SwitchButton::DDown,
+            SwitchButton::DLeft,
+            SwitchButton::DRight,
         ]
     }
 

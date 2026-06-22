@@ -1,12 +1,24 @@
+use crate::controller_config::{ControllerConfig, GpButton, SwitchButton};
 use sdl3::gamepad::{Axis, Button, Gamepad};
 use sdl3::GamepadSubsystem;
-use crate::controller_config::{ControllerConfig, GpButton, SwitchButton};
 
 const ALL_GP: [GpButton; 16] = [
-    GpButton::South, GpButton::East, GpButton::West, GpButton::North,
-    GpButton::L, GpButton::R, GpButton::ZL, GpButton::ZR,
-    GpButton::Plus, GpButton::Minus, GpButton::LStick, GpButton::RStick,
-    GpButton::Up, GpButton::Down, GpButton::Left, GpButton::Right,
+    GpButton::South,
+    GpButton::East,
+    GpButton::West,
+    GpButton::North,
+    GpButton::L,
+    GpButton::R,
+    GpButton::ZL,
+    GpButton::ZR,
+    GpButton::Plus,
+    GpButton::Minus,
+    GpButton::LStick,
+    GpButton::RStick,
+    GpButton::Up,
+    GpButton::Down,
+    GpButton::Left,
+    GpButton::Right,
 ];
 
 const TRIGGER_THRESHOLD: i16 = 8000;
@@ -41,7 +53,11 @@ pub struct InputSnapshot {
 
 impl InputSnapshot {
     pub fn new() -> Self {
-        Self { connected: false, buttons: 0, sticks: [0; 4] }
+        Self {
+            connected: false,
+            buttons: 0,
+            sticks: [0; 4],
+        }
     }
 
     pub fn to_npad(&self) -> (u64, [i32; 4]) {

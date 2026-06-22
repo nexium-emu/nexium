@@ -1,4 +1,3 @@
-
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, StreamConfig};
 use nexium_kernel::audio_sink::{set_host_audio_sink, HostPcmSink};
@@ -21,7 +20,14 @@ struct PrebufState {
 }
 impl PrebufState {
     fn new() -> Self {
-        Self { priming: true, cur_l: 0.0, cur_r: 0.0, prev_l: 0.0, prev_r: 0.0, pos: 1.0 }
+        Self {
+            priming: true,
+            cur_l: 0.0,
+            cur_r: 0.0,
+            prev_l: 0.0,
+            prev_r: 0.0,
+            pos: 1.0,
+        }
     }
 }
 
@@ -73,7 +79,9 @@ pub fn set_master_volume(vol: f32) {
 }
 
 pub fn push_test_tone(freq_hz: f32, seconds: f32) -> usize {
-    let Some(sink) = SINK_HANDLE.get() else { return 0; };
+    let Some(sink) = SINK_HANDLE.get() else {
+        return 0;
+    };
     let frames = (RENDER_SR as f32 * seconds).max(0.0) as usize;
     let mut buf = Vec::with_capacity(frames * 2);
     let two_pi_over_sr = std::f32::consts::TAU * freq_hz / RENDER_SR as f32;
@@ -152,9 +160,7 @@ impl HostPcmSink for HostAudioSink {
     }
 }
 
-fn pick_config(
-    device: &cpal::Device,
-) -> Result<(StreamConfig, SampleFormat), String> {
+fn pick_config(device: &cpal::Device) -> Result<(StreamConfig, SampleFormat), String> {
     let supported: Vec<_> = device
         .supported_output_configs()
         .map_err(|e| format!("supported_output_configs: {}", e))?
@@ -226,7 +232,15 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
             device.build_output_stream(
                 &config,
                 move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                    drain_stereo_to(&mut consumer, out, dev_ch, resample_ratio, &consumed_cb, &vol, &mut prebuf);
+                    drain_stereo_to(
+                        &mut consumer,
+                        out,
+                        dev_ch,
+                        resample_ratio,
+                        &consumed_cb,
+                        &vol,
+                        &mut prebuf,
+                    );
                 },
                 err_cb,
                 None,
@@ -239,14 +253,25 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
             device.build_output_stream(
                 &config,
                 move |out: &mut [i16], _info: &cpal::OutputCallbackInfo| {
-                    drain_stereo_to_i16(&mut consumer, out, dev_ch, resample_ratio, &consumed_cb, &vol, &mut prebuf);
+                    drain_stereo_to_i16(
+                        &mut consumer,
+                        out,
+                        dev_ch,
+                        resample_ratio,
+                        &consumed_cb,
+                        &vol,
+                        &mut prebuf,
+                    );
                 },
                 err_cb,
                 None,
             )
         }
         other => {
-            log::warn!("Audio output disabled: unsupported sample format {:?}", other);
+            log::warn!(
+                "Audio output disabled: unsupported sample format {:?}",
+                other
+            );
             return;
         }
     };
@@ -273,7 +298,12 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
     };
     log::info!(
         "HostAudioSink: cpal device '{}' @ {} Hz {}ch {} (ring cap {} samples, vol {:.2})",
-        device_name, device_sr, device_ch, fmt_str, RB_CAP_SAMPLES, initial_volume,
+        device_name,
+        device_sr,
+        device_ch,
+        fmt_str,
+        RB_CAP_SAMPLES,
+        initial_volume,
     );
 
     let _ = STREAM_INFO.set(AudioStreamInfo {
@@ -316,7 +346,9 @@ fn drain_stereo_to(
     if !FIRED.swap(true, Ordering::Relaxed) {
         log::info!(
             "cpal callback FIRST FIRE: out_len={} dev_ch={} ratio={:.3}",
-            out.len(), dev_ch, resample_ratio
+            out.len(),
+            dev_ch,
+            resample_ratio
         );
     }
     let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -324,7 +356,9 @@ fn drain_stereo_to(
 
     let occ = consumer.occupied_len();
     MIN_OCC.fetch_min(occ as u32, Ordering::Relaxed);
-    if occ == 0 { EMPTY_CT.fetch_add(1, Ordering::Relaxed); }
+    if occ == 0 {
+        EMPTY_CT.fetch_add(1, Ordering::Relaxed);
+    }
     if prebuf.priming && occ >= PREBUF_TARGET_SAMPLES {
         prebuf.priming = false;
     }
@@ -348,8 +382,10 @@ fn drain_stereo_to(
             (0.0, 0.0)
         } else {
             let f = prebuf.pos;
-            ((prebuf.prev_l + (prebuf.cur_l - prebuf.prev_l) * f) * vol,
-             (prebuf.prev_r + (prebuf.cur_r - prebuf.prev_r) * f) * vol)
+            (
+                (prebuf.prev_l + (prebuf.cur_l - prebuf.prev_l) * f) * vol,
+                (prebuf.prev_r + (prebuf.cur_r - prebuf.prev_r) * f) * vol,
+            )
         };
         peak = peak.max(l.abs()).max(r.abs());
         if dev_ch == 1 {
@@ -357,7 +393,9 @@ fn drain_stereo_to(
         } else {
             chunk[0] = l;
             chunk[1] = r;
-            for c in 2..dev_ch { chunk[c] = 0.0; }
+            for c in 2..dev_ch {
+                chunk[c] = 0.0;
+            }
         }
         if !priming {
             prebuf.pos += resample_ratio;
@@ -369,7 +407,12 @@ fn drain_stereo_to(
         let empty_ct = EMPTY_CT.swap(0, Ordering::Relaxed);
         log::info!(
             "cpal callback #{}: peak_amp={:.4} priming={} occ={} min_occ={} empty={}",
-            n, peak, priming, occ, min_occ, empty_ct
+            n,
+            peak,
+            priming,
+            occ,
+            min_occ,
+            empty_ct
         );
     }
     let render_frames = ((frames_written as f32) * resample_ratio).round() as u64;
@@ -411,8 +454,10 @@ fn drain_stereo_to_i16(
             (0.0, 0.0)
         } else {
             let f = prebuf.pos;
-            (prebuf.prev_l + (prebuf.cur_l - prebuf.prev_l) * f,
-             prebuf.prev_r + (prebuf.cur_r - prebuf.prev_r) * f)
+            (
+                prebuf.prev_l + (prebuf.cur_l - prebuf.prev_l) * f,
+                prebuf.prev_r + (prebuf.cur_r - prebuf.prev_r) * f,
+            )
         };
         let li = ((l * vol).clamp(-1.0, 1.0) * 32767.0) as i16;
         let ri = ((r * vol).clamp(-1.0, 1.0) * 32767.0) as i16;
@@ -421,7 +466,9 @@ fn drain_stereo_to_i16(
         } else {
             chunk[0] = li;
             chunk[1] = ri;
-            for c in 2..dev_ch { chunk[c] = 0; }
+            for c in 2..dev_ch {
+                chunk[c] = 0;
+            }
         }
         if !priming {
             prebuf.pos += resample_ratio;

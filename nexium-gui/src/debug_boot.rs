@@ -4,8 +4,9 @@ use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("debug,wgpu_core=warn,naga=warn")
-    ).init();
+        env_logger::Env::default().default_filter_or("debug,wgpu_core=warn,naga=warn"),
+    )
+    .init();
     let nro_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "space-nx-master/space-nx.nro".to_string());
@@ -25,7 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = BootConfig::new(&nro_path);
     let mut boot_ctx = BootContext::new(config)?;
-    let mut cpu = boot_ctx.cpu.take().expect("BootContext CPU not initialized");
+    let mut cpu = boot_ctx
+        .cpu
+        .take()
+        .expect("BootContext CPU not initialized");
     let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu, 0);
     use nexium_kernel::kernel::cpu_local::{cpu_mut, cpu_ref};
 
@@ -61,8 +65,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if pc_check_count < 20 {
-                writeln!(log, "[{}] CPU: {:#x} → {:#x} event={:?}",
-                    cycle_count, pc_before, pc_after, event)?;
+                writeln!(
+                    log,
+                    "[{}] CPU: {:#x} → {:#x} event={:?}",
+                    cycle_count, pc_before, pc_after, event
+                )?;
                 pc_check_count += 1;
             }
 
@@ -77,7 +84,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if stuck_pc == Some(pc_before) {
                     stuck_count += 1;
                     if stuck_count == 100 {
-                        writeln!(log, "[{}] STUCK: PC {:#x} looping 10M+ cycles", cycle_count, pc_before)?;
+                        writeln!(
+                            log,
+                            "[{}] STUCK: PC {:#x} looping 10M+ cycles",
+                            cycle_count, pc_before
+                        )?;
                     }
                 } else {
                     stuck_pc = Some(pc_before);
@@ -98,8 +109,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 nexium_core::cpu::CpuEvent::Svc(imm) => {
                     svc_count += 1;
                     last_svc_cycle = cycle_count;
-                    writeln!(log, "[{}] SVC {:#04x} @ {:#x} (count: {})",
-                        cycle_count, imm, pc_before, svc_count)?;
+                    writeln!(
+                        log,
+                        "[{}] SVC {:#04x} @ {:#x} (count: {})",
+                        cycle_count, imm, pc_before, svc_count
+                    )?;
                     log.flush()?;
 
                     let result = guard.dispatch_svc(imm);
@@ -119,8 +133,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 nexium_core::cpu::CpuEvent::Stalled => {
                     let mut b = [0u8; 4];
-                    let word = if cpu.read_bytes(pc_after, &mut b).is_ok() { u32::from_le_bytes(b) } else { 0 };
-                    writeln!(log, "[{}] CPU stalled pc={:#x} word={:#010x}", cycle_count, pc_after, word)?;
+                    let word = if cpu.read_bytes(pc_after, &mut b).is_ok() {
+                        u32::from_le_bytes(b)
+                    } else {
+                        0
+                    };
+                    writeln!(
+                        log,
+                        "[{}] CPU stalled pc={:#x} word={:#010x}",
+                        cycle_count, pc_after, word
+                    )?;
                     break;
                 }
                 nexium_core::cpu::CpuEvent::Interrupted => {
@@ -139,7 +161,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if svc_count > 0 && (cycle_count - last_svc_cycle) > 100_000_000 {
-                writeln!(log, "[{}] STUCK: No SVCs for 100M+ cycles. Last PC {:#x}", cycle_count, pc_before)?;
+                writeln!(
+                    log,
+                    "[{}] STUCK: No SVCs for 100M+ cycles. Last PC {:#x}",
+                    cycle_count, pc_before
+                )?;
                 break;
             }
         } else {

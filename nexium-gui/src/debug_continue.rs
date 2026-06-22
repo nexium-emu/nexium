@@ -4,8 +4,9 @@ use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("debug,wgpu_core=warn,naga=warn")
-    ).init();
+        env_logger::Env::default().default_filter_or("debug,wgpu_core=warn,naga=warn"),
+    )
+    .init();
 
     let nro_path = std::env::args()
         .nth(1)
@@ -25,7 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = BootConfig::new(&nro_path);
     let mut boot_ctx = BootContext::new(config)?;
-    let mut cpu = boot_ctx.cpu.take().expect("BootContext CPU not initialized");
+    let mut cpu = boot_ctx
+        .cpu
+        .take()
+        .expect("BootContext CPU not initialized");
     let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu, 0);
     use nexium_kernel::kernel::cpu_local::cpu_mut;
 
@@ -59,8 +63,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 nexium_core::cpu::CpuEvent::Svc(imm) => {
                     svc_count += 1;
-                    writeln!(log, "[{}] SVC {:#04x} @ {:#x} (count: {})",
-                        cycle_count, imm, pc_before, svc_count)?;
+                    writeln!(
+                        log,
+                        "[{}] SVC {:#04x} @ {:#x} (count: {})",
+                        cycle_count, imm, pc_before, svc_count
+                    )?;
                     log.flush()?;
 
                     let result = guard.dispatch_svc(imm);
@@ -72,7 +79,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // IMPORTANT: Don't exit on Break, just log it and continue
                     if imm == 0x26 {
                         break_count += 1;
-                        writeln!(log, "[{}] Break #{} encountered, continuing execution...", cycle_count, break_count)?;
+                        writeln!(
+                            log,
+                            "[{}] Break #{} encountered, continuing execution...",
+                            cycle_count, break_count
+                        )?;
                         guard.process_exited = false;
                         log.flush()?;
                     }

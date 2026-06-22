@@ -1,14 +1,14 @@
 #![allow(dead_code)]
 
 mod app;
-mod boot;
-mod input;
-mod controller_art;
-mod audio;
-mod debugger;
-mod performance;
-mod controller_config;
 mod app_settings;
+mod audio;
+mod boot;
+mod controller_art;
+mod controller_config;
+mod debugger;
+mod input;
+mod performance;
 
 use app::HorizonApp;
 use app_settings::AppSettings;
@@ -17,11 +17,10 @@ use nexium_common::FileLogger;
 fn main() -> Result<(), eframe::Error> {
     let settings = AppSettings::load();
 
-    let (logger, log_buffer) = FileLogger::new(500)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to initialize logger: {}", e);
-            panic!("Logger initialization failed");
-        });
+    let (logger, log_buffer) = FileLogger::new(500).unwrap_or_else(|e| {
+        eprintln!("Failed to initialize logger: {}", e);
+        panic!("Logger initialization failed");
+    });
 
     if let Err(e) = logger.init(settings.log_level.to_filter()) {
         eprintln!("Failed to set logger: {}", e);
@@ -52,7 +51,8 @@ fn main() -> Result<(), eframe::Error> {
 
     let icon = eframe::icon_data::from_png_bytes(
         include_bytes!("../../branding/png/logo-256.png").as_ref(),
-    ).expect("logo PNG decode");
+    )
+    .expect("logo PNG decode");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -69,7 +69,11 @@ fn main() -> Result<(), eframe::Error> {
         "NeXium",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(HorizonApp::new(cc, log_buf_for_app.clone(), nro_arg.clone())))
+            Ok(Box::new(HorizonApp::new(
+                cc,
+                log_buf_for_app.clone(),
+                nro_arg.clone(),
+            )))
         }),
     )
 }

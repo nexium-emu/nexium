@@ -8,7 +8,9 @@ pub enum CpuBackend {
 }
 
 impl Default for CpuBackend {
-    fn default() -> Self { CpuBackend::Dynarmic }
+    fn default() -> Self {
+        CpuBackend::Dynarmic
+    }
 }
 
 impl CpuBackend {
@@ -17,13 +19,13 @@ impl CpuBackend {
     }
     pub fn label(&self) -> &'static str {
         match self {
-            CpuBackend::Dynarmic  => "Dynarmic (C++)",
+            CpuBackend::Dynarmic => "Dynarmic (C++)",
             CpuBackend::Rustarmic => "Rustarmic (Rust JIT)",
         }
     }
     pub fn to_cpu_kind(&self) -> nexium_cpu::CpuBackendKind {
         match self {
-            CpuBackend::Dynarmic  => nexium_cpu::CpuBackendKind::Dynarmic,
+            CpuBackend::Dynarmic => nexium_cpu::CpuBackendKind::Dynarmic,
             CpuBackend::Rustarmic => nexium_cpu::CpuBackendKind::Rustarmic,
         }
     }
@@ -43,7 +45,13 @@ pub enum LogLevel {
 
 impl LogLevel {
     pub fn all() -> &'static [LogLevel] {
-        &[LogLevel::Error, LogLevel::Warn, LogLevel::Info, LogLevel::Debug, LogLevel::Trace]
+        &[
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ]
     }
 
     pub fn label(&self) -> &'static str {
@@ -68,30 +76,45 @@ impl LogLevel {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AspectMode { Letterbox, Stretch, Integer }
+pub enum AspectMode {
+    Letterbox,
+    Stretch,
+    Integer,
+}
 
 impl Default for AspectMode {
-    fn default() -> Self { AspectMode::Letterbox }
+    fn default() -> Self {
+        AspectMode::Letterbox
+    }
 }
 
 impl AspectMode {
     pub fn all() -> &'static [AspectMode] {
-        &[AspectMode::Letterbox, AspectMode::Stretch, AspectMode::Integer]
+        &[
+            AspectMode::Letterbox,
+            AspectMode::Stretch,
+            AspectMode::Integer,
+        ]
     }
     pub fn label(&self) -> &'static str {
         match self {
             AspectMode::Letterbox => "Letterbox",
-            AspectMode::Stretch   => "Stretch",
-            AspectMode::Integer   => "Integer",
+            AspectMode::Stretch => "Stretch",
+            AspectMode::Integer => "Integer",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FilterMode { Nearest, Linear }
+pub enum FilterMode {
+    Nearest,
+    Linear,
+}
 
 impl Default for FilterMode {
-    fn default() -> Self { FilterMode::Nearest }
+    fn default() -> Self {
+        FilterMode::Nearest
+    }
 }
 
 impl FilterMode {
@@ -101,29 +124,47 @@ impl FilterMode {
     pub fn label(&self) -> &'static str {
         match self {
             FilterMode::Nearest => "Nearest",
-            FilterMode::Linear  => "Linear",
+            FilterMode::Linear => "Linear",
         }
     }
 }
 
-fn default_output_scale() -> u8 { 1 }
-fn default_vsync() -> bool { true }
-fn default_audio_volume() -> f32 { 1.0 }
-fn default_multicore() -> bool { true }
+fn default_output_scale() -> u8 {
+    1
+}
+fn default_vsync() -> bool {
+    true
+}
+fn default_audio_volume() -> f32 {
+    1.0
+}
+fn default_multicore() -> bool {
+    true
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppSettings {
     pub log_level: LogLevel,
-    #[serde(default = "default_output_scale")] pub output_scale: u8,
-    #[serde(default)] pub aspect: AspectMode,
-    #[serde(default)] pub filter: FilterMode,
-    #[serde(default)] pub dpi_aware: bool,
-    #[serde(default = "default_vsync")] pub vsync: bool,
-    #[serde(default)] pub cpu_backend: CpuBackend,
-    #[serde(default)] pub audio_output_device: Option<String>,
-    #[serde(default = "default_audio_volume")] pub audio_volume: f32,
-    #[serde(default = "default_multicore")] pub multicore: bool,
-    #[serde(default)] pub async_shaders: bool,
+    #[serde(default = "default_output_scale")]
+    pub output_scale: u8,
+    #[serde(default)]
+    pub aspect: AspectMode,
+    #[serde(default)]
+    pub filter: FilterMode,
+    #[serde(default)]
+    pub dpi_aware: bool,
+    #[serde(default = "default_vsync")]
+    pub vsync: bool,
+    #[serde(default)]
+    pub cpu_backend: CpuBackend,
+    #[serde(default)]
+    pub audio_output_device: Option<String>,
+    #[serde(default = "default_audio_volume")]
+    pub audio_volume: f32,
+    #[serde(default = "default_multicore")]
+    pub multicore: bool,
+    #[serde(default)]
+    pub async_shaders: bool,
 }
 
 impl Default for AppSettings {
@@ -146,8 +187,7 @@ impl Default for AppSettings {
 
 impl AppSettings {
     pub fn config_path() -> Option<PathBuf> {
-        directories::BaseDirs::new()
-            .map(|d| d.config_dir().join("NeXium").join("app.json"))
+        directories::BaseDirs::new().map(|d| d.config_dir().join("NeXium").join("app.json"))
     }
 
     pub fn load() -> Self {
@@ -163,7 +203,10 @@ impl AppSettings {
 
     pub fn save(&self) -> std::io::Result<()> {
         let Some(path) = Self::config_path() else {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "no config dir"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "no config dir",
+            ));
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
