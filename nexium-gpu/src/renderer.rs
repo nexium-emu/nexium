@@ -1,6 +1,6 @@
 use ash::vk;
 use parking_lot::Mutex;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::descriptor::{DescriptorPool, DescriptorSetLayout};
@@ -36,7 +36,8 @@ struct RendererInner {
     utility_slot: FrameSlot,
     ubo_ring: UboRing,
     min_ubo_offset_alignment: u64,
-    pending_readbacks: HashMap<RtKey, PendingReadback>,
+    pending_readbacks: HashMap<RtKey, VecDeque<PendingReadback>>,
+    readback_slots: Vec<ReadbackSlot>,
     tele_last_emit_ns: u64,
     tele_ring_wraps: u64,
     tele_ring_waits: u64,
@@ -91,11 +92,16 @@ struct FrameSlot {
 }
 
 struct PendingReadback {
-    fence: vk::Fence,
-    cmd: vk::CommandBuffer,
-    stage: StagingBuffer,
+    slot: usize,
     width: u32,
     height: u32,
+}
+
+struct ReadbackSlot {
+    fence: vk::Fence,
+    cmd: vk::CommandBuffer,
+    stage: Option<StagingBuffer>,
+    in_flight: bool,
 }
 
 struct UboRing {
@@ -436,6 +442,22 @@ impl Renderer {
             retired_textures: Vec::new(),
         };
 
+        let mut readback_slots = Vec::with_capacity(4);
+        for i in 0..4 {
+            let fence = unsafe {
+                device
+                    .create_fence(&fence_info, None)
+                    .map_err(|e| format!("create_fence(readback {}): {:?}", i, e))?
+            };
+            let cmd = alloc_one_time_cmd(&device, cmd_pool)?;
+            readback_slots.push(ReadbackSlot {
+                fence,
+                cmd,
+                stage: None,
+                in_flight: false,
+            });
+        }
+
         let ubo_ring = create_ubo_ring(&device, &mem_props, 16 * 1024 * 1024)?;
 
         log::info!("nexium-gpu Renderer init OK: {} (Vulkan via Ash)", name);
@@ -466,6 +488,7 @@ impl Renderer {
                 ubo_ring,
                 min_ubo_offset_alignment,
                 pending_readbacks: HashMap::new(),
+                readback_slots,
                 tele_last_emit_ns: 0,
                 tele_ring_wraps: 0,
                 tele_ring_waits: 0,
@@ -921,6 +944,7 @@ impl Renderer {
             rt_cache,
             mem_props,
             pending_readbacks,
+            readback_slots,
             ..
         } = &mut *inner;
         let requested_key = RtKey {
@@ -961,13 +985,14 @@ impl Renderer {
                 );
             }
         }
-        for (_, prev) in pending_readbacks.drain() {
-            unsafe {
-                let _ = device.wait_for_fences(&[prev.fence], true, u64::MAX);
-                device.destroy_fence(prev.fence, None);
-                device.destroy_buffer(prev.stage.buffer, None);
-                device.free_memory(prev.stage.memory, None);
-                device.free_command_buffers(*cmd_pool, &[prev.cmd]);
+        for (_, mut pending) in pending_readbacks.drain() {
+            while let Some(prev) = pending.pop_front() {
+                if let Some(slot) = readback_slots.get_mut(prev.slot) {
+                    unsafe {
+                        let _ = device.wait_for_fences(&[slot.fence], true, u64::MAX);
+                    }
+                    slot.in_flight = false;
+                }
             }
         }
 
@@ -1080,15 +1105,17 @@ impl Renderer {
         nvmap_id: u32,
         width: u32,
         height: u32,
-    ) -> Option<Vec<u8>> {
+        copy_rect: Option<[u32; 4]>,
+    ) -> Option<(u32, u32, Vec<u8>)> {
         let mut inner = self.inner.lock();
         let RendererInner {
             device,
-            cmd_pool,
+            cmd_pool: _,
             queue,
             rt_cache,
             mem_props,
             pending_readbacks,
+            readback_slots,
             ..
         } = &mut *inner;
         let requested_key = RtKey {
@@ -1099,84 +1126,118 @@ impl Renderer {
         let key = rt_cache.resolve_present_key(requested_key)?;
 
         let mut ready_frame = None;
-        if let Some(prev) = pending_readbacks.remove(&key) {
-            let ready = unsafe { device.get_fence_status(prev.fence).unwrap_or(true) };
+        let mut latest_ready = None;
+        let mut pending_for_key = pending_readbacks.remove(&key).unwrap_or_default();
+        let mut keep_pending = VecDeque::with_capacity(pending_for_key.len());
+        while let Some(prev) = pending_for_key.pop_front() {
+            let ready = readback_slots
+                .get(prev.slot)
+                .map(|slot| unsafe { device.get_fence_status(slot.fence).unwrap_or(true) })
+                .unwrap_or(true);
             if ready {
-                let total = (prev.width as u64) * 4 * (prev.height as u64);
-                let mut out = vec![0u8; total as usize];
-                unsafe {
-                    if let Ok(ptr) =
-                        device.map_memory(prev.stage.memory, 0, prev.stage.size, vk::MemoryMapFlags::empty())
-                    {
-                        std::ptr::copy_nonoverlapping(
-                            ptr as *const u8,
-                            out.as_mut_ptr(),
-                            total as usize,
-                        );
-                        device.unmap_memory(prev.stage.memory);
+                if let Some(old) = latest_ready.replace(prev) {
+                    if let Some(slot) = readback_slots.get_mut(old.slot) {
+                        slot.in_flight = false;
                     }
-                    device.destroy_fence(prev.fence, None);
-                    device.destroy_buffer(prev.stage.buffer, None);
-                    device.free_memory(prev.stage.memory, None);
-                    device.free_command_buffers(*cmd_pool, &[prev.cmd]);
                 }
-                ready_frame = Some(out);
             } else {
-                pending_readbacks.insert(key, prev);
-                return None;
+                keep_pending.push_back(prev);
             }
         }
+        if let Some(prev) = latest_ready {
+            let total = (prev.width as u64) * 4 * (prev.height as u64);
+            let mut out = vec![0u8; total as usize];
+            if let Some(slot) = readback_slots.get_mut(prev.slot) {
+                if let Some(stage) = slot.stage.as_ref() {
+                    unsafe {
+                        if let Ok(ptr) = device.map_memory(
+                            stage.memory,
+                            0,
+                            stage.size,
+                            vk::MemoryMapFlags::empty(),
+                        ) {
+                            std::ptr::copy_nonoverlapping(
+                                ptr as *const u8,
+                                out.as_mut_ptr(),
+                                total as usize,
+                            );
+                            device.unmap_memory(stage.memory);
+                        }
+                    }
+                }
+                slot.in_flight = false;
+            }
+            ready_frame = Some((prev.width, prev.height, out));
+        }
+        let Some(slot_idx) = readback_slots.iter().position(|slot| !slot.in_flight) else {
+            pending_readbacks.insert(key, keep_pending);
+            return ready_frame;
+        };
 
-        let total = (width as u64) * 4 * (height as u64);
-        let stage = match create_staging_owned(device, mem_props, total) {
-            Ok(s) => s,
-            Err(_) => return ready_frame,
-        };
-        let cleanup = |device: &ash::Device,
-                       cmd_pool: vk::CommandPool,
-                       fence: Option<vk::Fence>,
-                       cmd: Option<vk::CommandBuffer>,
-                       stage: &StagingBuffer| unsafe {
-            if let Some(c) = cmd {
-                device.free_command_buffers(cmd_pool, &[c]);
+        let (copy_x, copy_y, copy_w, copy_h) = copy_rect
+            .map(|r| (r[0], r[1], r[2], r[3]))
+            .unwrap_or((0, 0, width, height));
+        let total = (copy_w as u64) * 4 * (copy_h as u64);
+        {
+            let slot = &mut readback_slots[slot_idx];
+            let needs_stage = slot
+                .stage
+                .as_ref()
+                .map(|stage| stage.size < total)
+                .unwrap_or(true);
+            if needs_stage {
+                if let Some(old) = slot.stage.take() {
+                    unsafe {
+                        device.destroy_buffer(old.buffer, None);
+                        device.free_memory(old.memory, None);
+                    }
+                }
+                match create_staging_owned(device, mem_props, total) {
+                    Ok(stage) => {
+                        slot.stage = Some(stage);
+                    }
+                    Err(_) => {
+                        if !keep_pending.is_empty() {
+                            pending_readbacks.insert(key, keep_pending);
+                        }
+                        return ready_frame;
+                    }
+                }
             }
-            if let Some(f) = fence {
-                device.destroy_fence(f, None);
+        }
+        let slot = &mut readback_slots[slot_idx];
+        if reset_command_buffer(device, slot.cmd).is_err() {
+            if !keep_pending.is_empty() {
+                pending_readbacks.insert(key, keep_pending);
             }
-            device.destroy_buffer(stage.buffer, None);
-            device.free_memory(stage.memory, None);
-        };
-        let fence_info = vk::FenceCreateInfo {
-            s_type: vk::StructureType::FENCE_CREATE_INFO,
-            flags: vk::FenceCreateFlags::empty(),
-            p_next: std::ptr::null(),
-            _marker: std::marker::PhantomData,
-        };
-        let fence = match unsafe { device.create_fence(&fence_info, None) } {
-            Ok(f) => f,
-            Err(_) => {
-                cleanup(device, *cmd_pool, None, None, &stage);
-                return ready_frame;
-            }
-        };
-        let cmd = match alloc_one_time_cmd(device, *cmd_pool) {
-            Ok(c) => c,
-            Err(_) => {
-                cleanup(device, *cmd_pool, Some(fence), None, &stage);
-                return ready_frame;
-            }
-        };
-        if begin_one_time(device, cmd).is_err() {
-            cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
             return ready_frame;
         }
+        if begin_one_time(device, slot.cmd).is_err() {
+            if !keep_pending.is_empty() {
+                pending_readbacks.insert(key, keep_pending);
+            }
+            return ready_frame;
+        }
+        let cmd = slot.cmd;
+        let fence = slot.fence;
+        let stage_buffer = match slot.stage.as_ref() {
+            Some(stage) => stage.buffer,
+            None => {
+                if !keep_pending.is_empty() {
+                    pending_readbacks.insert(key, keep_pending);
+                }
+                return ready_frame;
+            }
+        };
         let img = match rt_cache.get_or_create(key, device) {
             Ok(i) => i,
             Err(_) => {
                 unsafe {
                     let _ = device.end_command_buffer(cmd);
                 }
-                cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+                if !keep_pending.is_empty() {
+                    pending_readbacks.insert(key, keep_pending);
+                }
                 return ready_frame;
             }
         };
@@ -1197,10 +1258,14 @@ impl Renderer {
                 base_array_layer: 0,
                 layer_count: 1,
             },
-            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_offset: vk::Offset3D {
+                x: copy_x as i32,
+                y: copy_y as i32,
+                z: 0,
+            },
             image_extent: vk::Extent3D {
-                width,
-                height,
+                width: copy_w,
+                height: copy_h,
                 depth: 1,
             },
         };
@@ -1209,7 +1274,7 @@ impl Renderer {
                 cmd,
                 img.image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                stage.buffer,
+                stage_buffer,
                 &[copy],
             );
         }
@@ -1217,19 +1282,18 @@ impl Renderer {
         if end_one_time(device, cmd).is_err()
             || submit_with_fence(device, *queue, cmd, fence).is_err()
         {
-            cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+            if !keep_pending.is_empty() {
+                pending_readbacks.insert(key, keep_pending);
+            }
             return ready_frame;
         }
-        pending_readbacks.insert(
-            key,
-            PendingReadback {
-                fence,
-                cmd,
-                stage,
-                width,
-                height,
-            },
-        );
+        readback_slots[slot_idx].in_flight = true;
+        keep_pending.push_back(PendingReadback {
+            slot: slot_idx,
+            width: copy_w,
+            height: copy_h,
+        });
+        pending_readbacks.insert(key, keep_pending);
         ready_frame
     }
 
@@ -4016,12 +4080,25 @@ impl Drop for RendererInner {
             self.device.destroy_fence(self.utility_slot.fence, None);
         }
         self.utility_slot.fence = vk::Fence::null();
-        for (_, pr) in self.pending_readbacks.drain() {
+        for (_, mut pending) in self.pending_readbacks.drain() {
+            while let Some(pr) = pending.pop_front() {
+                if let Some(slot) = self.readback_slots.get_mut(pr.slot) {
+                    unsafe {
+                        let _ = self.device.wait_for_fences(&[slot.fence], true, u64::MAX);
+                    }
+                    slot.in_flight = false;
+                }
+            }
+        }
+        for slot in self.readback_slots.drain(..) {
             unsafe {
-                let _ = self.device.wait_for_fences(&[pr.fence], true, u64::MAX);
-                self.device.destroy_fence(pr.fence, None);
-                self.device.destroy_buffer(pr.stage.buffer, None);
-                self.device.free_memory(pr.stage.memory, None);
+                let _ = self.device.wait_for_fences(&[slot.fence], true, u64::MAX);
+                self.device.destroy_fence(slot.fence, None);
+                self.device.free_command_buffers(self.cmd_pool, &[slot.cmd]);
+                if let Some(stage) = slot.stage {
+                    self.device.destroy_buffer(stage.buffer, None);
+                    self.device.free_memory(stage.memory, None);
+                }
             }
         }
         unsafe {

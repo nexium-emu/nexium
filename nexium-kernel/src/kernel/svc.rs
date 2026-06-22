@@ -1681,7 +1681,7 @@ fn dispatch_service_v2(
     if let Some((rc, data, handles)) =
         crate::services::am::dispatch_command(kernel, port_name, cmd_id)
     {
-        log::debug!(
+        log::trace!(
             "am.{}.cmd_{} rc={:#x} → {} bytes, {} handle(s) [copy]",
             port_name,
             cmd_id,
@@ -3883,27 +3883,39 @@ fn igbp_handle_transact(
                     let stats = kernel.nvdrv.stats.clone();
                     let (pw, ph, pnv) = (gb.width, gb.height, gb.nvmap_id);
                     qba.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = rt_worker.try_submit(Box::new(move || {
-                        if let Some(mut bytes) = r_async.readback_target_pipelined(pnv, pw, ph) {
-                            let row = (pw as usize) * 4;
-                            let hh = ph as usize;
-                            if bytes.len() >= row * hh {
-                                for y in 0..hh / 2 {
-                                    let top = y * row;
-                                    let bot = (hh - 1 - y) * row;
-                                    let (a, b) = bytes.split_at_mut(bot);
-                                    a[top..top + row].swap_with_slice(&mut b[..row]);
-                                }
-                            }
-                            let (present_w, present_h, mut bytes) =
-                                maybe_crop_present_subwindow(bytes, pw, ph);
-                            make_present_opaque(&mut bytes);
+                    let present_profile = std::env::var_os("NEXIUM_NVDRV_PROFILE").is_some();
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static PRESENT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+                    static PRESENT_ENQUEUED: AtomicU64 = AtomicU64::new(0);
+                    static PRESENT_DROPPED: AtomicU64 = AtomicU64::new(0);
+                    static PRESENT_EXECUTED: AtomicU64 = AtomicU64::new(0);
+                    static PRESENT_READY: AtomicU64 = AtomicU64::new(0);
+                    static PRESENT_EMPTY: AtomicU64 = AtomicU64::new(0);
+                    static PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+                    let attempt = if present_profile {
+                        PRESENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1
+                    } else {
+                        0
+                    };
+                    let submitted = rt_worker.try_submit(Box::new(move || {
+                        let t0 = std::time::Instant::now();
+                        let crop = cached_present_crop(pw, ph);
+                        let read_rect = crop.map(|(x0, y0, w, h)| {
+                            [x0, ph.saturating_sub(y0).saturating_sub(h), w, h]
+                        });
+                        if let Some((read_w, read_h, bytes)) =
+                            r_async.readback_target_pipelined(pnv, pw, ph, read_rect)
+                        {
+                            let (present_w, present_h, bytes) =
+                                prepare_vulkan_present_frame(bytes, read_w, read_h);
                             dump_present_frame(&bytes, present_w, present_h);
-                            nexium_common::frame_present::set_last_presented(
-                                present_w,
-                                present_h,
-                                bytes.clone(),
-                            );
+                            if std::env::var_os("NEXIUM_FRAME_PRESENT_CACHE").is_some() {
+                                nexium_common::frame_present::set_last_presented(
+                                    present_w,
+                                    present_h,
+                                    bytes.clone(),
+                                );
+                            }
                             fq.lock().push(nexium_nvdrv::QueuedFrame {
                                 width: present_w,
                                 height: present_h,
@@ -3912,8 +3924,43 @@ fn igbp_handle_transact(
                             stats
                                 .frames_submitted
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if present_profile {
+                                PRESENT_READY.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else if present_profile {
+                            PRESENT_EMPTY.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if present_profile {
+                            let elapsed = t0.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                            PRESENT_NS.fetch_add(elapsed, Ordering::Relaxed);
+                            let exec = PRESENT_EXECUTED.fetch_add(1, Ordering::Relaxed) + 1;
+                            if exec % 60 == 0 {
+                                let total_ns = PRESENT_NS.load(Ordering::Relaxed);
+                                log::warn!(
+                                    "[nvprof] present_exec executed={} ready={} empty={} avg_ms={:.3}",
+                                    exec,
+                                    PRESENT_READY.load(Ordering::Relaxed),
+                                    PRESENT_EMPTY.load(Ordering::Relaxed),
+                                    total_ns as f64 / exec as f64 / 1_000_000.0
+                                );
+                            }
                         }
                     }));
+                    if present_profile {
+                        if submitted {
+                            PRESENT_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            PRESENT_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if attempt % 60 == 0 {
+                            log::warn!(
+                                "[nvprof] present_enqueue attempts={} enqueued={} dropped={}",
+                                attempt,
+                                PRESENT_ENQUEUED.load(Ordering::Relaxed),
+                                PRESENT_DROPPED.load(Ordering::Relaxed)
+                            );
+                        }
+                    }
                 } else if let Some((addr, is_tiled)) = resolved {
                     let read_size = if is_tiled { tiled_size } else { linear_size };
                     let mut raw = vec![0u8; read_size];
@@ -4072,11 +4119,7 @@ fn igbp_handle_transact(
                         let (frame_w, frame_h, mut frame_pixels) = if let Some(qf) = fermi_frame {
                             (qf.width, qf.height, qf.pixels)
                         } else if let Some((w, h, bytes)) = vk_readback {
-                            nexium_common::frame_present::set_last_presented(
-                                w,
-                                h,
-                                bytes.clone(),
-                            );
+                            nexium_common::frame_present::set_last_presented(w, h, bytes.clone());
                             (w, h, bytes)
                         } else if rgb_nz >= 16 {
                             if legacy_gfx {
@@ -4605,10 +4648,77 @@ fn outside_crop_has_visible(
 }
 
 fn present_crop_slot() -> &'static std::sync::Mutex<Option<(u32, u32, u32, u32, u32, u32)>> {
-    static SLOT: std::sync::OnceLock<
-        std::sync::Mutex<Option<(u32, u32, u32, u32, u32, u32)>>,
-    > = std::sync::OnceLock::new();
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<(u32, u32, u32, u32, u32, u32)>>> =
+        std::sync::OnceLock::new();
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn cached_present_crop(width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+    present_crop_slot().lock().ok().and_then(|slot| {
+        let (dst_w, dst_h, x0, y0, w, h) = (*slot)?;
+        (dst_w == width && dst_h == height).then_some((x0, y0, w, h))
+    })
+}
+
+fn crop_flipped_opaque(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+) -> Vec<u8> {
+    let src_row = src_w as usize * 4;
+    let dst_row = w as usize * 4;
+    let mut out = vec![0u8; h as usize * dst_row];
+    if src.len() < src_h as usize * src_row {
+        return out;
+    }
+    for dy in 0..h as usize {
+        let Some(src_y) = (src_h as usize).checked_sub(1 + y0 as usize + dy) else {
+            continue;
+        };
+        let src_off = src_y
+            .saturating_mul(src_row)
+            .saturating_add(x0 as usize * 4);
+        let dst_off = dy * dst_row;
+        if src_off + dst_row > src.len() || dst_off + dst_row > out.len() {
+            continue;
+        }
+        out[dst_off..dst_off + dst_row].copy_from_slice(&src[src_off..src_off + dst_row]);
+        for px in out[dst_off..dst_off + dst_row].chunks_exact_mut(4) {
+            px[3] = 0xFF;
+        }
+    }
+    out
+}
+
+fn prepare_vulkan_present_frame(
+    mut bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> (u32, u32, Vec<u8>) {
+    if let Some((x0, y0, w, h)) = cached_present_crop(width, height) {
+        return (
+            w,
+            h,
+            crop_flipped_opaque(&bytes, width, height, x0, y0, w, h),
+        );
+    }
+    let row = width as usize * 4;
+    let hh = height as usize;
+    if bytes.len() >= row * hh {
+        for y in 0..hh / 2 {
+            let top = y * row;
+            let bot = (hh - 1 - y) * row;
+            let (a, b) = bytes.split_at_mut(bot);
+            a[top..top + row].swap_with_slice(&mut b[..row]);
+        }
+    }
+    let (present_w, present_h, mut bytes) = maybe_crop_present_subwindow(bytes, width, height);
+    make_present_opaque(&mut bytes);
+    (present_w, present_h, bytes)
 }
 
 fn maybe_crop_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> (u32, u32, Vec<u8>) {
