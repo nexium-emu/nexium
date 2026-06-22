@@ -3887,6 +3887,7 @@ fn igbp_handle_transact(
                                 }
                             }
                             bytes = maybe_upscale_present_subwindow(bytes, pw, ph);
+                            make_present_opaque(&mut bytes);
                             dump_present_frame(&bytes, pw, ph);
                             nexium_common::frame_present::set_last_presented(pw, ph, bytes.clone());
                             qba.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4002,8 +4003,9 @@ fn igbp_handle_transact(
                                         a[top..top + row].swap_with_slice(&mut b[..row]);
                                     }
                                 }
-                                let bytes =
+                                let mut bytes =
                                     maybe_upscale_present_subwindow(bytes, gb.width, gb.height);
+                                make_present_opaque(&mut bytes);
                                 dump_present_frame(&bytes, gb.width, gb.height);
                                 bytes
                             });
@@ -4051,7 +4053,7 @@ fn igbp_handle_transact(
                                 .count();
                             (pixels, rgb_nz)
                         };
-                        let (frame_w, frame_h, frame_pixels) = if let Some(qf) = fermi_frame {
+                        let (frame_w, frame_h, mut frame_pixels) = if let Some(qf) = fermi_frame {
                             (qf.width, qf.height, qf.pixels)
                         } else if let Some(bytes) = vk_readback {
                             nexium_common::frame_present::set_last_presented(
@@ -4124,6 +4126,7 @@ fn igbp_handle_transact(
                         } else {
                             (gb.width, gb.height, pixels)
                         };
+                        make_present_opaque(&mut frame_pixels);
                         let nz = frame_pixels.iter().filter(|b| **b != 0).count();
                         let rgb_nz = frame_pixels
                             .chunks_exact(4)
@@ -4513,6 +4516,12 @@ fn crop_and_upscale(
         }
     }
     out
+}
+
+fn make_present_opaque(pixels: &mut [u8]) {
+    for px in pixels.chunks_exact_mut(4) {
+        px[3] = 0xFF;
+    }
 }
 
 fn outside_crop_has_visible(
