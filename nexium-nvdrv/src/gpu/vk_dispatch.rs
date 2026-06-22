@@ -429,6 +429,27 @@ fn execute_draw_texture_job(
     renderer.upload_target_rgba(job.nvmap_id, job.width, job.height, &dst)
 }
 
+fn snapshot_read_once(
+    snapshot: &mut std::collections::HashMap<u64, Vec<u8>>,
+    read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
+    gpu_va: u64,
+    len: usize,
+) {
+    if len == 0 {
+        return;
+    }
+    if snapshot
+        .get(&gpu_va)
+        .map(|data| data.len() >= len)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if let Some(data) = read_guest(gpu_va, len) {
+        snapshot.insert(gpu_va, data);
+    }
+}
+
 fn submit_draw_batch_async(
     batch: &[Maxwell3dDrawCall],
     renderer: &Arc<nexium_gpu::Renderer>,
@@ -446,14 +467,15 @@ fn submit_draw_batch_async(
             .unwrap_or(0);
         let vbytes = stride.saturating_mul(call.vertex_count as u64) as usize;
         if vbytes > 0 {
-            if let Some(d) = read_guest(call.vertex_addr, vbytes) {
-                snapshot.insert(call.vertex_addr, d);
-            }
+            snapshot_read_once(&mut snapshot, read_guest, call.vertex_addr, vbytes);
         }
         if call.cbuf_size > 0 && call.cbuf_addr != 0 {
-            if let Some(d) = read_guest(call.cbuf_addr, call.cbuf_size as usize) {
-                snapshot.insert(call.cbuf_addr, d);
-            }
+            snapshot_read_once(
+                &mut snapshot,
+                read_guest,
+                call.cbuf_addr,
+                call.cbuf_size as usize,
+            );
         }
         if !call.fs_tex_ids.is_empty() && call.tic_pool_gpu_va != 0 {
             for &tex_id in &call.fs_tex_ids {
@@ -471,9 +493,7 @@ fn submit_draw_batch_async(
                         } else {
                             pitch
                         };
-                        if let Some(d) = read_guest(tic.gpu_va, read_size) {
-                            snapshot.insert(tic.gpu_va, d);
-                        }
+                        snapshot_read_once(&mut snapshot, read_guest, tic.gpu_va, read_size);
                     }
                     snapshot.insert(tic_addr, tic_raw);
                 }
@@ -485,9 +505,7 @@ fn submit_draw_batch_async(
                     continue;
                 }
                 let tsc_addr = call.tsc_pool_gpu_va.wrapping_add((tsc_id as u64) * 32);
-                if let Some(tsc_raw) = read_guest(tsc_addr, 32) {
-                    snapshot.insert(tsc_addr, tsc_raw);
-                }
+                snapshot_read_once(&mut snapshot, read_guest, tsc_addr, 32);
             }
         }
     }

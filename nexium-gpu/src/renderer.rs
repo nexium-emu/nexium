@@ -1,6 +1,6 @@
 use ash::vk;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::sync::Arc;
 
 use crate::descriptor::{DescriptorPool, DescriptorSetLayout};
@@ -2115,6 +2115,7 @@ impl Renderer {
 
         let mut dsets_batch: Vec<vk::DescriptorSet> = Vec::new();
         let mut alias_used: Vec<RtKey> = Vec::new();
+        let mut tex_raw_cache: HashMap<(u64, usize), Option<(u64, Vec<u8>)>> = HashMap::new();
         let mut pass_open = false;
         let mut pass_depth = false;
         let mut had_pass = false;
@@ -2156,8 +2157,17 @@ impl Renderer {
                 let Some((key, tic, pitch_size, read_size)) = *pending else {
                     continue;
                 };
-                if let Some(raw) = read_guest(tic.gpu_va, read_size) {
-                    let tex_hash = hash_src_prefix(&raw);
+                let raw_entry = match tex_raw_cache.entry((tic.gpu_va, read_size)) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        entry.insert(read_guest(tic.gpu_va, read_size).map(|raw| {
+                            let tex_hash = hash_src_prefix(&raw);
+                            (tex_hash, raw)
+                        }))
+                    }
+                };
+                if let Some((tex_hash, raw)) = raw_entry.as_ref() {
+                    let tex_hash = *tex_hash;
                     let cur_gen = crate::tex_invalidate::region_gen(tic.gpu_va);
                     let need_upload = match tex_cache.get(&key) {
                         Some(t) => t.gen != cur_gen || t.hash != tex_hash,
@@ -2173,7 +2183,7 @@ impl Renderer {
                             let (storage_width, storage_height, bpp) =
                                 tic.format.storage_extent(tic.width, tic.height);
                             crate::texture::unswizzle_block_linear(
-                                &raw,
+                                raw,
                                 storage_width,
                                 storage_height,
                                 bpp,
@@ -2182,7 +2192,7 @@ impl Renderer {
                         } else if raw.len() >= pitch_size {
                             raw[..pitch_size].to_vec()
                         } else {
-                            raw
+                            raw.clone()
                         };
                         let rgba8 = crate::texture::decode_to_rgba8(
                             &linear, tic.width, tic.height, tic.format,
