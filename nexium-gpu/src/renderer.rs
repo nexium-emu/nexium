@@ -1075,6 +1075,164 @@ impl Renderer {
         Some(out)
     }
 
+    pub fn readback_target_pipelined(
+        &self,
+        nvmap_id: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u8>> {
+        let mut inner = self.inner.lock();
+        let RendererInner {
+            device,
+            cmd_pool,
+            queue,
+            rt_cache,
+            mem_props,
+            pending_readbacks,
+            ..
+        } = &mut *inner;
+        let requested_key = RtKey {
+            nvmap_id,
+            width,
+            height,
+        };
+        let key = rt_cache.resolve_present_key(requested_key)?;
+
+        let mut ready_frame = None;
+        if let Some(prev) = pending_readbacks.remove(&key) {
+            let ready = unsafe { device.get_fence_status(prev.fence).unwrap_or(true) };
+            if ready {
+                let total = (prev.width as u64) * 4 * (prev.height as u64);
+                let mut out = vec![0u8; total as usize];
+                unsafe {
+                    if let Ok(ptr) =
+                        device.map_memory(prev.stage.memory, 0, prev.stage.size, vk::MemoryMapFlags::empty())
+                    {
+                        std::ptr::copy_nonoverlapping(
+                            ptr as *const u8,
+                            out.as_mut_ptr(),
+                            total as usize,
+                        );
+                        device.unmap_memory(prev.stage.memory);
+                    }
+                    device.destroy_fence(prev.fence, None);
+                    device.destroy_buffer(prev.stage.buffer, None);
+                    device.free_memory(prev.stage.memory, None);
+                    device.free_command_buffers(*cmd_pool, &[prev.cmd]);
+                }
+                ready_frame = Some(out);
+            } else {
+                pending_readbacks.insert(key, prev);
+                return None;
+            }
+        }
+
+        let total = (width as u64) * 4 * (height as u64);
+        let stage = match create_staging_owned(device, mem_props, total) {
+            Ok(s) => s,
+            Err(_) => return ready_frame,
+        };
+        let cleanup = |device: &ash::Device,
+                       cmd_pool: vk::CommandPool,
+                       fence: Option<vk::Fence>,
+                       cmd: Option<vk::CommandBuffer>,
+                       stage: &StagingBuffer| unsafe {
+            if let Some(c) = cmd {
+                device.free_command_buffers(cmd_pool, &[c]);
+            }
+            if let Some(f) = fence {
+                device.destroy_fence(f, None);
+            }
+            device.destroy_buffer(stage.buffer, None);
+            device.free_memory(stage.memory, None);
+        };
+        let fence_info = vk::FenceCreateInfo {
+            s_type: vk::StructureType::FENCE_CREATE_INFO,
+            flags: vk::FenceCreateFlags::empty(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        let fence = match unsafe { device.create_fence(&fence_info, None) } {
+            Ok(f) => f,
+            Err(_) => {
+                cleanup(device, *cmd_pool, None, None, &stage);
+                return ready_frame;
+            }
+        };
+        let cmd = match alloc_one_time_cmd(device, *cmd_pool) {
+            Ok(c) => c,
+            Err(_) => {
+                cleanup(device, *cmd_pool, Some(fence), None, &stage);
+                return ready_frame;
+            }
+        };
+        if begin_one_time(device, cmd).is_err() {
+            cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+            return ready_frame;
+        }
+        let img = match rt_cache.get_or_create(key, device) {
+            Ok(i) => i,
+            Err(_) => {
+                unsafe {
+                    let _ = device.end_command_buffer(cmd);
+                }
+                cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+                return ready_frame;
+            }
+        };
+        transition_image(
+            device,
+            cmd,
+            img.image,
+            img.layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        let copy = vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+        };
+        unsafe {
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                img.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                stage.buffer,
+                &[copy],
+            );
+        }
+        img.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        if end_one_time(device, cmd).is_err()
+            || submit_with_fence(device, *queue, cmd, fence).is_err()
+        {
+            cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+            return ready_frame;
+        }
+        pending_readbacks.insert(
+            key,
+            PendingReadback {
+                fence,
+                cmd,
+                stage,
+                width,
+                height,
+            },
+        );
+        ready_frame
+    }
+
     pub fn compile_pipeline(
         &self,
         vs_spirv: &[u32],

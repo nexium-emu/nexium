@@ -880,12 +880,12 @@ impl Nvdrv {
                         let (syncpt_id, syncpt_value) = self
                             .gpu
                             .process_inline_gpfifo(&entries, mem_read, mem_write);
-                        if log::log_enabled!(log::Level::Debug) {
+                        if log::log_enabled!(log::Level::Trace) {
                             let (dc, cc) = {
                                 let m = self.gpu.maxwell3d.lock();
                                 (m.draw_count(), m.clear_count())
                             };
-                            log::debug!("nvhost-gpu:SubmitGPFIFO processed {} entries (draws={}, clears={})",
+                            log::trace!("nvhost-gpu:SubmitGPFIFO processed {} entries (draws={}, clears={})",
                                 entries.len(), dc, cc);
                         }
                         if out.len() >= 24 {

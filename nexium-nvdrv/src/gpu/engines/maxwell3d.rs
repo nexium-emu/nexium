@@ -597,7 +597,7 @@ impl Maxwell3D {
             }
             0x674 => {
                 self.regs.clear_count += 1;
-                log::debug!(
+                log::trace!(
                     "maxwell3d: CLEAR_SURFACE arg={:#x} color={:?} clear_control={:#x} scissor={:?}",
                     arg,
                     self.regs.clear_color,
@@ -727,7 +727,7 @@ impl Maxwell3D {
             0x5F8 => {
                 self.regs.draw_count += 1;
                 self.regs.index_count = arg;
-                log::debug!(
+                log::trace!(
                     "maxwell3d: DrawElementsCount count={} topology={}",
                     arg,
                     self.regs.draw_topology
@@ -736,11 +736,11 @@ impl Maxwell3D {
             }
 
             0x557 => {
-                log::info!("maxwell3d: SetTexSamplerPool[hi] = {:#x}", arg);
+                log::trace!("maxwell3d: SetTexSamplerPool[hi] = {:#x}", arg);
                 self.regs.tsc_pool_va_hi = arg;
             }
             0x558 => {
-                log::info!(
+                log::trace!(
                     "maxwell3d: SetTexSamplerPool[lo] = {:#x} → full {:#x}",
                     arg,
                     ((self.regs.tsc_pool_va_hi as u64) << 32) | arg as u64
@@ -748,16 +748,16 @@ impl Maxwell3D {
                 self.regs.tsc_pool_va_lo = arg;
             }
             0x559 => {
-                log::info!("maxwell3d: SetTexSamplerPoolMaximumIndex = {:#x}", arg);
+                log::trace!("maxwell3d: SetTexSamplerPoolMaximumIndex = {:#x}", arg);
                 self.regs.tsc_pool_limit = arg;
             }
 
             0x55D => {
-                log::info!("maxwell3d: SetTexHeaderPool[hi] = {:#x}", arg);
+                log::trace!("maxwell3d: SetTexHeaderPool[hi] = {:#x}", arg);
                 self.regs.tic_pool_va_hi = arg;
             }
             0x55E => {
-                log::info!(
+                log::trace!(
                     "maxwell3d: SetTexHeaderPool[lo] = {:#x} → full {:#x}",
                     arg,
                     ((self.regs.tic_pool_va_hi as u64) << 32) | arg as u64
@@ -765,7 +765,7 @@ impl Maxwell3D {
                 self.regs.tic_pool_va_lo = arg;
             }
             0x55F => {
-                log::info!("maxwell3d: SetTexHeaderPoolMaximumIndex = {:#x}", arg);
+                log::trace!("maxwell3d: SetTexHeaderPoolMaximumIndex = {:#x}", arg);
                 self.regs.tic_pool_limit = arg;
             }
 

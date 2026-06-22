@@ -1,4 +1,4 @@
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::OnceLock;
 
 pub type RenderJob = Box<dyn FnOnce() + Send + 'static>;
@@ -23,6 +23,13 @@ impl RenderThread {
 
     pub fn submit(&self, job: RenderJob) {
         let _ = self.tx.send(job);
+    }
+
+    pub fn try_submit(&self, job: RenderJob) -> bool {
+        match self.tx.try_send(job) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        }
     }
 }
 
