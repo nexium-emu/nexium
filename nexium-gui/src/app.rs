@@ -94,7 +94,8 @@ impl HorizonApp {
         };
         if !nro_path.is_empty() {
             let backend = app.app_settings.cpu_backend.to_cpu_kind();
-            if let Ok(handle) = EmulationHandle::new(&nro_path, backend) {
+            if let Ok(handle) = EmulationHandle::new(&nro_path, backend, Some(cc.egui_ctx.clone()))
+            {
                 app.emulation_handle = Some(handle);
                 log::info!("Auto-loaded NRO: {} (CPU: {})", nro_path, backend.label());
             } else {
@@ -188,13 +189,13 @@ impl HorizonApp {
         }
     }
 
-    fn boot_nro(&mut self) {
+    fn boot_nro(&mut self, ctx: &egui::Context) {
         if self.nro_path.is_empty() {
             return;
         }
         let backend = self.app_settings.cpu_backend.to_cpu_kind();
         log::info!("Boot: NRO={} CPU={}", self.nro_path, backend.label());
-        match EmulationHandle::new(&self.nro_path, backend) {
+        match EmulationHandle::new(&self.nro_path, backend, Some(ctx.clone())) {
             Ok(h) => {
                 self.emulation_handle = Some(h);
                 self.game_texture = None;
@@ -435,7 +436,7 @@ impl eframe::App for HorizonApp {
                         egui::RichText::new("Emulation").size(13.0).color(TEXT),
                         |ui| {
                             if ui.button("Boot").clicked() {
-                                self.boot_nro();
+                                self.boot_nro(ctx);
                                 ui.close_menu();
                             }
                             if ui.button("Stop").clicked() {
@@ -593,7 +594,7 @@ impl eframe::App for HorizonApp {
                                 self.nro_path = p.to_string_lossy().to_string();
                             }
                         }
-                        1 => self.boot_nro(),
+                        1 => self.boot_nro(ctx),
                         2 => self.stop_emulation(),
                         _ => {}
                     }

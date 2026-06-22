@@ -140,7 +140,11 @@ pub struct EmulationHandle {
 }
 
 impl EmulationHandle {
-    pub fn new(nro_path: &str, cpu_backend: nexium_cpu::CpuBackendKind) -> Result<Self, String> {
+    pub fn new(
+        nro_path: &str,
+        cpu_backend: nexium_cpu::CpuBackendKind,
+        repaint_ctx: Option<eframe::egui::Context>,
+    ) -> Result<Self, String> {
         let nro_path = nro_path.to_string();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);
@@ -791,7 +795,7 @@ impl EmulationHandle {
                                 svc_count += 1;
                                 last_svc_cycle = cycle_count;
                                 last_svc_ms.store(now_millis(), Ordering::Relaxed);
-                                log::debug!("SVC {:#04x} (count: {})", imm, svc_count);
+                                log::trace!("SVC {:#04x} (count: {})", imm, svc_count);
                             }
                             nexium_core::cpu::CpuEvent::Stalled => {
                                 log::info!("CPU stalled at {:#x}", cpu.get_pc());
@@ -899,7 +903,7 @@ impl EmulationHandle {
                                     guard.threads.yield_with_state(cpu, state);
                                 }
                                 if reason != "present-pace" {
-                                    log::info!(
+                                    log::trace!(
                                         "[yield] reason={} from={:?} ready_before={}",
                                         reason,
                                         from,
@@ -919,11 +923,18 @@ impl EmulationHandle {
                         }
 
                         if let Some(f) = guard.nvdrv.drain_latest_frame() {
-                            let _ = frame_tx.try_send(Frame {
-                                width: f.width,
-                                height: f.height,
-                                pixels: f.pixels,
-                            });
+                            if frame_tx
+                                .try_send(Frame {
+                                    width: f.width,
+                                    height: f.height,
+                                    pixels: f.pixels,
+                                })
+                                .is_ok()
+                            {
+                                if let Some(ctx) = &repaint_ctx {
+                                    ctx.request_repaint();
+                                }
+                            }
                         }
 
                         guard.tick_audio_renderers();
