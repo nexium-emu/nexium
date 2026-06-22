@@ -1,6 +1,6 @@
-use nexium_common::result::SUCCESS;
-use crate::kernel::Kernel;
 use crate::kernel::handles::HandleType;
+use crate::kernel::Kernel;
+use nexium_common::result::SUCCESS;
 
 pub mod msg {
     pub const EXIT_REQUESTED: u32 = 1;
@@ -22,7 +22,10 @@ impl AppletService {
     }
 
     pub fn dispatch(&self, cmd_id: u32) -> u32 {
-        log::debug!("am cmd: {} (legacy path - prefer AM helpers in svc.rs)", cmd_id);
+        log::debug!(
+            "am cmd: {} (legacy path - prefer AM helpers in svc.rs)",
+            cmd_id
+        );
         SUCCESS
     }
 }
@@ -93,7 +96,9 @@ pub fn proxy_subsession(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("acc:u0" | "acc:u1" | "acc:aa", 5) => Some("IProfile"),
         ("acc:u0" | "acc:u1" | "acc:aa", 101) => Some("IManagerForApplication"),
         ("IManagerForApplication", 2) => Some("IAsyncContext"),
-        ("nifm:u" | "nifm:a" | "nifm:s", 4) | ("nifm:u" | "nifm:a" | "nifm:s", 5) => Some("IGeneralService"),
+        ("nifm:u" | "nifm:a" | "nifm:s", 4) | ("nifm:u" | "nifm:a" | "nifm:s", 5) => {
+            Some("IGeneralService")
+        }
         ("IGeneralService", 2) => Some("IScanRequest"),
         ("IGeneralService", 4) => Some("IRequest"),
         ("lm", 0) => Some("ILogService"),
@@ -103,7 +108,11 @@ pub fn proxy_subsession(port_name: &str, cmd_id: u32) -> Option<&'static str> {
 
 pub const ACCOUNT_UID: [u8; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
-pub fn dispatch_command(kernel: &mut Kernel, port_name: &str, cmd_id: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+pub fn dispatch_command(
+    kernel: &mut Kernel,
+    port_name: &str,
+    cmd_id: u32,
+) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match port_name {
         "ICommonStateGetter" => common_state_getter(kernel, cmd_id),
         "ISelfController" => self_controller(kernel, cmd_id),
@@ -127,6 +136,8 @@ pub fn dispatch_command(kernel: &mut Kernel, port_name: &str, cmd_id: u32) -> Op
         "acc:u0" | "acc:u1" | "acc:aa" => account_service(cmd_id),
         "IProfile" => profile(cmd_id),
         "IManagerForApplication" => manager_for_application(cmd_id),
+        "IApmManager" => apm_manager(cmd_id),
+        "IApmSession" => apm_session(cmd_id),
         "IAsyncContext" => async_context(kernel, cmd_id),
         "IGeneralService" => general_service(cmd_id),
         "IRequest" => nifm_request(kernel, cmd_id),
@@ -177,7 +188,11 @@ fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, V
             if first {
                 queue_message(kernel, msg::FOCUS_STATE_CHANGED);
             }
-            log::debug!("ICommonStateGetter.GetEventHandle → {:#x} (initial focus msg queued={})", h, first);
+            log::debug!(
+                "ICommonStateGetter.GetEventHandle → {:#x} (initial focus msg queued={})",
+                h,
+                first
+            );
             ok_with_handle(Vec::new(), h)
         }
         1 => {
@@ -235,7 +250,10 @@ fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, V
         300 => ok(0u8.to_le_bytes().to_vec()),
         400 | 401 | 500 | 900 => ok_empty(),
         _ => {
-            log::warn!("ICommonStateGetter.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "ICommonStateGetter.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
@@ -282,7 +300,10 @@ fn self_controller(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u
         }
         100 | 110 | 120 | 130 => ok_empty(),
         _ => {
-            log::warn!("ISelfController.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "ISelfController.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
@@ -293,7 +314,10 @@ fn window_controller(_kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Ve
         0 | 10 | 11 | 12 | 13 => ok_empty(),
         1 => ok(1u64.to_le_bytes().to_vec()),
         _ => {
-            log::warn!("IWindowController.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "IWindowController.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
@@ -306,7 +330,10 @@ fn audio_controller(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
         3 => ok_empty(),
         4 => ok(0u32.to_le_bytes().to_vec()),
         _ => {
-            log::warn!("IAudioController.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "IAudioController.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
@@ -314,9 +341,13 @@ fn audio_controller(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
 
 fn display_controller(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
-        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 => ok_empty(),
+        0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19
+        | 20 | 21 | 22 | 23 | 24 => ok_empty(),
         _ => {
-            log::warn!("IDisplayController.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "IDisplayController.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
@@ -333,7 +364,10 @@ fn process_winding_controller(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
 }
 
 fn library_applet_creator(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
-    log::warn!("ILibraryAppletCreator.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+    log::warn!(
+        "ILibraryAppletCreator.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+        cmd
+    );
     ok_empty()
 }
 
@@ -344,9 +378,13 @@ fn library_applet_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8
             kernel.event_signals.insert(h, false);
             ok_with_handle(Vec::new(), h)
         }
-        1 | 10 | 20 | 25 | 26 | 30 | 50 | 51 | 90 | 91 | 100 | 101 | 102 | 103 | 110 | 120 | 150 | 160 => ok_empty(),
+        1 | 10 | 20 | 25 | 26 | 30 | 50 | 51 | 90 | 91 | 100 | 101 | 102 | 103 | 110 | 120
+        | 150 | 160 => ok_empty(),
         _ => {
-            log::warn!("ILibraryAppletAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "ILibraryAppletAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
@@ -415,19 +453,28 @@ fn application_functions(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>,
         }
         131 | 140 | 141 | 150 | 160 | 170 | 1000 | 1001 => ok_empty(),
         _ => {
-            log::warn!("IApplicationFunctions.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "IApplicationFunctions.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
 }
 
 fn application_creator(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
-    log::warn!("IApplicationCreator.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+    log::warn!(
+        "IApplicationCreator.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+        cmd
+    );
     ok_empty()
 }
 
 fn application_accessor(_kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
-    log::warn!("IApplicationAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+    log::warn!(
+        "IApplicationAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+        cmd
+    );
     ok_empty()
 }
 
@@ -435,19 +482,28 @@ fn home_menu_functions(_kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, 
     match cmd {
         10 | 11 | 12 | 13 | 20 | 21 | 30 => ok_empty(),
         _ => {
-            log::warn!("IHomeMenuFunctions.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "IHomeMenuFunctions.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
 }
 
 fn global_state_controller(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
-    log::warn!("IGlobalStateController.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+    log::warn!(
+        "IGlobalStateController.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+        cmd
+    );
     ok_empty()
 }
 
 fn debug_functions(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
-    log::warn!("IDebugFunctions.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+    log::warn!(
+        "IDebugFunctions.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+        cmd
+    );
     ok_empty()
 }
 
@@ -455,7 +511,10 @@ fn storage(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
         0 => ok_empty(),
         _ => {
-            log::warn!("IStorage.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "IStorage.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
@@ -466,7 +525,10 @@ fn storage_accessor(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
         0 => ok(0u64.to_le_bytes().to_vec()),
         10 | 11 => ok_empty(),
         _ => {
-            log::warn!("IStorageAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "IStorageAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
@@ -513,7 +575,10 @@ fn profile(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
         10 => ok(0u32.to_le_bytes().to_vec()),
         11 => ok_empty(),
         _ => {
-            log::warn!("IProfile.cmd_{} → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "IProfile.cmd_{} → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
@@ -526,7 +591,38 @@ fn manager_for_application(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
         3 => ok(0u64.to_le_bytes().to_vec()),
         160 => ok_empty(),
         _ => {
-            log::warn!("IManagerForApplication.cmd_{} → returning empty SUCCESS (likely wrong)", cmd);
+            log::warn!(
+                "IManagerForApplication.cmd_{} → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
+            ok_empty()
+        }
+    }
+}
+
+fn apm_manager(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        1 => ok(0i32.to_le_bytes().to_vec()),
+        6 => ok(vec![0u8]),
+        _ => {
+            log::warn!(
+                "IApmManager.cmd_{} -> returning empty SUCCESS (likely wrong)",
+                cmd
+            );
+            ok_empty()
+        }
+    }
+}
+
+fn apm_session(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 | 2 => ok_empty(),
+        1 => ok(0x0002_0003u32.to_le_bytes().to_vec()),
+        _ => {
+            log::warn!(
+                "IApmSession.cmd_{} -> returning empty SUCCESS (likely wrong)",
+                cmd
+            );
             ok_empty()
         }
     }
@@ -576,17 +672,26 @@ fn nifm_request(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>
 }
 
 fn overlay_functions(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
-    log::warn!("IOverlayFunctions.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+    log::warn!(
+        "IOverlayFunctions.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+        cmd
+    );
     ok_empty()
 }
 
 fn lock_accessor(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
-    log::warn!("ILockAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+    log::warn!(
+        "ILockAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+        cmd
+    );
     ok_empty()
 }
 
 fn applet_common_functions(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
-    log::warn!("IAppletCommonFunctions.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd);
+    log::warn!(
+        "IAppletCommonFunctions.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+        cmd
+    );
     ok_empty()
 }
 
@@ -596,5 +701,9 @@ pub fn queue_message(kernel: &mut Kernel, msg: u32) {
         kernel.event_signals.insert(h, true);
         kernel.threads.signal_handle(h);
     }
-    log::debug!("am: queued message {} (queue len {})", msg, kernel.applet_messages.len());
+    log::debug!(
+        "am: queued message {} (queue len {})",
+        msg,
+        kernel.applet_messages.len()
+    );
 }

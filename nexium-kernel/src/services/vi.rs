@@ -61,7 +61,10 @@ impl DisplayService {
             5000 => self.create_managed_layer(),
             7000 => self.get_display_vsync_event(),
             _ => {
-                log::warn!("VI.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd_id);
+                log::warn!(
+                    "VI.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                    cmd_id
+                );
                 SUCCESS
             }
         }

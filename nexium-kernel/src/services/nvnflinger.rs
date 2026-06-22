@@ -27,8 +27,14 @@ impl BufferQueueService {
         log::info!("nvnflinger/dispdrv cmd: {}", cmd_id);
         match cmd_id {
             0 => self.transact_parcel(ctx),
-            1 => { log::info!("AdjustRefcount"); SUCCESS }
-            2 => { log::info!("GetNativeHandle"); SUCCESS }
+            1 => {
+                log::info!("AdjustRefcount");
+                SUCCESS
+            }
+            2 => {
+                log::info!("GetNativeHandle");
+                SUCCESS
+            }
             3 => self.transact_parcel(ctx),
             _ => {
                 log::info!("nvnflinger stub command: {}", cmd_id);
@@ -43,7 +49,10 @@ impl BufferQueueService {
         }
 
         let transaction_code = u32::from_le_bytes([
-            ctx.tls_buf[20], ctx.tls_buf[21], ctx.tls_buf[22], ctx.tls_buf[23],
+            ctx.tls_buf[20],
+            ctx.tls_buf[21],
+            ctx.tls_buf[22],
+            ctx.tls_buf[23],
         ]);
 
         log::trace!("IGBP transaction code: {}", transaction_code);
@@ -72,8 +81,12 @@ impl BufferQueueService {
                     ctx.tls_buf.get(30).copied().unwrap_or(0),
                     ctx.tls_buf.get(31).copied().unwrap_or(0),
                 ]);
-                if w > 0 { self.width = w; }
-                if h > 0 { self.height = h; }
+                if w > 0 {
+                    self.width = w;
+                }
+                if h > 0 {
+                    self.height = h;
+                }
                 log::debug!("IGBP::SetPreallocatedBuffer {}x{}", self.width, self.height);
                 SUCCESS
             }
@@ -99,8 +112,17 @@ impl BufferQueueService {
 
     fn compose_frame(&self) -> FrameOut {
         if let Some((w, h, px)) = nexium_common::frame_present::peek_last_presented_clone() {
-            log::trace!("nvnflinger present: forwarding GPU frame {}x{} ({} bytes)", w, h, px.len());
-            return FrameOut { width: w, height: h, pixels: px };
+            log::trace!(
+                "nvnflinger present: forwarding GPU frame {}x{} ({} bytes)",
+                w,
+                h,
+                px.len()
+            );
+            return FrameOut {
+                width: w,
+                height: h,
+                pixels: px,
+            };
         }
         let pixel_count = (self.width * self.height) as usize;
         FrameOut {

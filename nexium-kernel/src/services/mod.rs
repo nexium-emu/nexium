@@ -1,87 +1,87 @@
-pub mod base;
-pub mod generated;
-pub mod sm;
-pub mod hid;
-pub mod time;
-pub mod system_clock;
-pub mod steady_clock;
-pub mod time_zone;
-pub mod audio_out;
-pub mod window_controller;
-pub mod self_controller;
-pub mod common_state_getter;
-pub mod application_functions;
-pub mod application_display_service;
-pub mod system_display_service;
-pub mod manager_display_service;
-pub mod binder_driver;
-pub mod vi_root_service;
-pub mod debug_functions;
-pub mod audio_controller;
-pub mod display_controller;
-pub mod process_winding_controller;
-pub mod global_state_controller;
-pub mod home_menu_functions;
-pub mod application_creator;
-pub mod library_applet_creator;
-pub mod active_vibration_device_list;
-pub mod applet_storage;
-pub mod storage_accessor;
-pub mod transfer_storage_accessor;
-pub mod lock_accessor;
-pub mod gpu_error_handler;
-pub mod cradle_firmware_updater;
-pub mod movie_maker;
-pub mod storage_channel;
-pub mod application_accessor;
-pub mod library_applet_accessor;
-pub mod set;
-pub mod am;
-pub mod vi;
-pub mod audio;
-pub mod fs;
-pub mod nifm;
-pub mod nvnflinger;
-pub mod ns;
 pub mod acc;
-pub mod pctl;
-pub mod ssl;
-pub mod spl;
-pub mod pl;
-pub mod psc;
-pub mod smc;
-pub mod fatal;
+pub mod active_vibration_device_list;
+pub mod am;
 pub mod apm;
+pub mod applet_storage;
+pub mod application_accessor;
+pub mod application_creator;
+pub mod application_display_service;
+pub mod application_functions;
+pub mod audio;
+pub mod audio_controller;
+pub mod audio_out;
+pub mod base;
+pub mod binder_driver;
 pub mod bsd;
-pub mod caps;
-pub mod misc;
-pub mod pdm;
-pub mod prepo;
-pub mod psm;
-pub mod ldr;
-pub mod lr;
-pub mod ldn;
-pub mod friends;
-pub mod fsp;
 pub mod btm;
-pub mod mii;
-pub mod irs;
-pub mod hwopus;
-pub mod grc;
-pub mod gpio;
-pub mod pcielm;
-pub mod rtc;
-pub mod jit;
-pub mod omm;
-pub mod nim;
-pub mod olsc;
-pub mod mount;
-pub mod tc;
+pub mod caps;
+pub mod common_state_getter;
+pub mod cradle_firmware_updater;
+pub mod debug_functions;
+pub mod display_controller;
+pub mod fatal;
+pub mod friends;
+pub mod fs;
+pub mod fsp;
+pub mod generated;
+pub mod global_state_controller;
 pub mod gm;
-pub mod pm;
-pub mod usb;
-pub mod sys;
+pub mod gpio;
 pub mod gpio2;
+pub mod gpu_error_handler;
+pub mod grc;
+pub mod hid;
+pub mod home_menu_functions;
+pub mod hwopus;
+pub mod irs;
+pub mod jit;
+pub mod ldn;
+pub mod ldr;
+pub mod library_applet_accessor;
+pub mod library_applet_creator;
+pub mod lock_accessor;
+pub mod lr;
+pub mod manager_display_service;
+pub mod mii;
+pub mod misc;
+pub mod mount;
+pub mod movie_maker;
+pub mod nifm;
+pub mod nim;
+pub mod ns;
+pub mod nvnflinger;
+pub mod olsc;
+pub mod omm;
+pub mod pcielm;
+pub mod pctl;
+pub mod pdm;
+pub mod pl;
+pub mod pm;
+pub mod prepo;
+pub mod process_winding_controller;
+pub mod psc;
+pub mod psm;
+pub mod rtc;
+pub mod self_controller;
+pub mod set;
+pub mod sm;
+pub mod smc;
+pub mod spl;
+pub mod ssl;
+pub mod steady_clock;
+pub mod storage_accessor;
+pub mod storage_channel;
+pub mod sys;
+pub mod system_clock;
+pub mod system_display_service;
+pub mod tc;
+pub mod time;
+pub mod time_zone;
+pub mod transfer_storage_accessor;
+pub mod usb;
+pub mod vi;
+pub mod vi_root_service;
+pub mod window_controller;
 
 pub struct FrameOut {
     pub width: u32,
@@ -203,7 +203,12 @@ impl Services {
         }
     }
 
-    pub fn dispatch_service(&mut self, port_name: &str, cmd_id: u32, ctx: &mut IpcCtx) -> (u32, Vec<u8>) {
+    pub fn dispatch_service(
+        &mut self,
+        port_name: &str,
+        cmd_id: u32,
+        ctx: &mut IpcCtx,
+    ) -> (u32, Vec<u8>) {
         log::trace!("dispatch_service: port={} cmd_id={}", port_name, cmd_id);
         let result = match port_name {
             "sm:" => self.sm.dispatch(cmd_id),
@@ -237,7 +242,9 @@ impl Services {
             "ldr:ro" => self.ldr.dispatch(cmd_id),
             "lr" => self.lr.dispatch(cmd_id),
             "ldn:u" | "ldn:s" | "ldn:m" => self.ldn.dispatch(cmd_id),
-            "friend:u" | "friend:a" | "friend:s" | "friend:v" | "friend:m" => self.friends.dispatch(cmd_id),
+            "friend:u" | "friend:a" | "friend:s" | "friend:v" | "friend:m" => {
+                self.friends.dispatch(cmd_id)
+            }
             "fsp:pr" | "fsp:pc" => self.fsp.dispatch(cmd_id),
             "btm" | "btm:u" | "btm:dbg" => self.btm.dispatch(cmd_id),
             "mii:u" | "mii:e" => self.mii.dispatch(cmd_id),
@@ -250,7 +257,11 @@ impl Services {
             "jit:u" => self.jit.dispatch(cmd_id),
             "omm" => self.omm.dispatch(cmd_id),
             _ => {
-                log::debug!("unknown service: {} cmd={} (returning success)", port_name, cmd_id);
+                log::debug!(
+                    "unknown service: {} cmd={} (returning success)",
+                    port_name,
+                    cmd_id
+                );
                 0
             }
         };

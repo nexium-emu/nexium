@@ -17,7 +17,10 @@ pub struct NpadAssignment {
 
 impl Default for NpadAssignment {
     fn default() -> Self {
-        Self { mode: NpadAssignmentMode::Dual, device_type: 0 }
+        Self {
+            mode: NpadAssignmentMode::Dual,
+            device_type: 0,
+        }
     }
 }
 
@@ -51,7 +54,10 @@ impl HidService {
         match cmd_id {
             0 | 1 | 2 | 100 | 101 | 102 | 103 | 120 | 121 | 122 | 123 | 124 | 125 | 128 => SUCCESS,
             _ => {
-                log::warn!("hid.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)", cmd_id);
+                log::warn!(
+                    "hid.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                    cmd_id
+                );
                 SUCCESS
             }
         }
@@ -65,14 +71,21 @@ impl HidService {
         let entry = self.npad_assignment.entry(npad_id).or_default();
         entry.mode = NpadAssignmentMode::Single;
         entry.device_type = 0;
-        log::info!("HID::SetNpadJoyAssignmentModeSingleByDefault npad_id={:#x}", npad_id);
+        log::info!(
+            "HID::SetNpadJoyAssignmentModeSingleByDefault npad_id={:#x}",
+            npad_id
+        );
     }
 
     pub fn set_npad_assignment_single(&mut self, npad_id: u32, _aruid: u64, device_type: i64) {
         let entry = self.npad_assignment.entry(npad_id).or_default();
         entry.mode = NpadAssignmentMode::Single;
         entry.device_type = device_type;
-        log::info!("HID::SetNpadJoyAssignmentModeSingle npad_id={:#x} device_type={}", npad_id, device_type);
+        log::info!(
+            "HID::SetNpadJoyAssignmentModeSingle npad_id={:#x} device_type={}",
+            npad_id,
+            device_type
+        );
     }
 
     pub fn set_npad_assignment_dual(&mut self, npad_id: u32, _aruid: u64) {
@@ -82,14 +95,23 @@ impl HidService {
         log::info!("HID::SetNpadJoyAssignmentModeDual npad_id={:#x}", npad_id);
     }
 
-    pub fn merge_single_joy_as_dual_joy(&mut self, npad_id_left: u32, npad_id_right: u32, _aruid: u64) {
+    pub fn merge_single_joy_as_dual_joy(
+        &mut self,
+        npad_id_left: u32,
+        npad_id_right: u32,
+        _aruid: u64,
+    ) {
         let l = self.npad_assignment.entry(npad_id_left).or_default();
         l.mode = NpadAssignmentMode::Dual;
         l.device_type = 0;
         let r = self.npad_assignment.entry(npad_id_right).or_default();
         r.mode = NpadAssignmentMode::Dual;
         r.device_type = 0;
-        log::info!("HID::MergeSingleJoyAsDualJoy left={:#x} right={:#x}", npad_id_left, npad_id_right);
+        log::info!(
+            "HID::MergeSingleJoyAsDualJoy left={:#x} right={:#x}",
+            npad_id_left,
+            npad_id_right
+        );
     }
 
     pub fn set_npad_handheld_activation_mode(&mut self, mode: u64) {

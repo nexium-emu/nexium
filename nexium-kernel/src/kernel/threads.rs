@@ -1,7 +1,7 @@
+use crate::kernel::cpu_local::current_core;
 use nexium_cpu::Cpu;
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
-use crate::kernel::cpu_local::current_core;
 
 pub const NUM_CORES: usize = 4;
 
@@ -15,7 +15,12 @@ pub struct ThreadCtx {
 
 impl ThreadCtx {
     pub fn zero() -> Self {
-        Self { x: [0; 31], sp: 0, pc: 0, tpidrro_el0: 0 }
+        Self {
+            x: [0; 31],
+            sp: 0,
+            pc: 0,
+            tpidrro_el0: 0,
+        }
     }
 }
 
@@ -24,11 +29,27 @@ pub enum ThreadState {
     Created,
     Ready,
     Running,
-    Sleeping { wake_at: Instant },
-    WaitingHandle { handles: Vec<u32>, wake_at: Option<Instant> },
-    WaitingMutex { mutex_addr: u64 },
-    WaitingCondvar { mutex_addr: u64, condvar_addr: u64, wake_at: Option<Instant>, spurious_wake: bool },
-    WaitingArbiter { addr: u64, value: u32, wake_at: Option<Instant> },
+    Sleeping {
+        wake_at: Instant,
+    },
+    WaitingHandle {
+        handles: Vec<u32>,
+        wake_at: Option<Instant>,
+    },
+    WaitingMutex {
+        mutex_addr: u64,
+    },
+    WaitingCondvar {
+        mutex_addr: u64,
+        condvar_addr: u64,
+        wake_at: Option<Instant>,
+        spurious_wake: bool,
+    },
+    WaitingArbiter {
+        addr: u64,
+        value: u32,
+        wake_at: Option<Instant>,
+    },
     Exited,
 }
 
@@ -54,7 +75,12 @@ pub struct Threads {
 }
 
 impl Threads {
-    pub fn new(main_handle: u32, main_tls_va: u64, main_stack_top: u64, tls_pool_base: u64) -> Self {
+    pub fn new(
+        main_handle: u32,
+        main_tls_va: u64,
+        main_stack_top: u64,
+        tls_pool_base: u64,
+    ) -> Self {
         let mut threads = HashMap::new();
         threads.insert(
             main_handle,
@@ -133,8 +159,12 @@ impl Threads {
     }
 
     pub fn save_current_ctx(&mut self, cpu: &Cpu) {
-        let Some(h) = self.current[current_core()] else { return };
-        let Some(t) = self.threads.get_mut(&h) else { return };
+        let Some(h) = self.current[current_core()] else {
+            return;
+        };
+        let Some(t) = self.threads.get_mut(&h) else {
+            return;
+        };
         for i in 0..31 {
             t.ctx.x[i] = cpu.get_register(i as u32);
         }
@@ -144,7 +174,9 @@ impl Threads {
     }
 
     pub fn load_thread(&self, handle: u32, cpu: &mut Cpu) {
-        let Some(t) = self.threads.get(&handle) else { return };
+        let Some(t) = self.threads.get(&handle) else {
+            return;
+        };
         for i in 0..31 {
             cpu.set_register(i as u32, t.ctx.x[i]);
         }
@@ -158,8 +190,12 @@ impl Threads {
         for (h, t) in self.threads.iter() {
             let due = match &t.state {
                 ThreadState::Sleeping { wake_at } => *wake_at <= now,
-                ThreadState::WaitingHandle { wake_at: Some(d), .. } => *d <= now,
-                ThreadState::WaitingArbiter { wake_at: Some(d), .. } => *d <= now,
+                ThreadState::WaitingHandle {
+                    wake_at: Some(d), ..
+                } => *d <= now,
+                ThreadState::WaitingArbiter {
+                    wake_at: Some(d), ..
+                } => *d <= now,
                 _ => false,
             };
             if due {
@@ -169,8 +205,7 @@ impl Threads {
         for h in woken {
             if let Some(t) = self.threads.get_mut(&h) {
                 match t.state {
-                    ThreadState::WaitingHandle { .. }
-                    | ThreadState::WaitingArbiter { .. } => {
+                    ThreadState::WaitingHandle { .. } | ThreadState::WaitingArbiter { .. } => {
                         t.ctx.x[0] = nexium_common::result::KERNEL_TIMEOUT as u64;
                     }
                     _ => {}
@@ -194,7 +229,9 @@ impl Threads {
 
     pub fn wake_one_on_condvar(&mut self, condvar_addr: u64) -> Option<u32> {
         let h = self.threads.iter().find_map(|(h, t)| match &t.state {
-            ThreadState::WaitingCondvar { condvar_addr: c, .. } if *c == condvar_addr => Some(*h),
+            ThreadState::WaitingCondvar {
+                condvar_addr: c, ..
+            } if *c == condvar_addr => Some(*h),
             _ => None,
         })?;
         if let Some(t) = self.threads.get_mut(&h) {
@@ -206,9 +243,11 @@ impl Threads {
 
     pub fn peek_one_condvar_waiter(&self, condvar_addr: u64) -> Option<(u32, u64)> {
         self.threads.iter().find_map(|(h, t)| match &t.state {
-            ThreadState::WaitingCondvar { condvar_addr: c, mutex_addr, .. } if *c == condvar_addr => {
-                Some((*h, *mutex_addr))
-            }
+            ThreadState::WaitingCondvar {
+                condvar_addr: c,
+                mutex_addr,
+                ..
+            } if *c == condvar_addr => Some((*h, *mutex_addr)),
             _ => None,
         })
     }
@@ -228,13 +267,22 @@ impl Threads {
     }
 
     pub fn has_mutex_waiters(&self, mutex_addr: u64) -> bool {
-        self.threads.values().any(|t| matches!(&t.state, ThreadState::WaitingMutex { mutex_addr: m } if *m == mutex_addr))
+        self.threads.values().any(
+            |t| matches!(&t.state, ThreadState::WaitingMutex { mutex_addr: m } if *m == mutex_addr),
+        )
+    }
+
+    pub fn has_condvar_waiters(&self, condvar_addr: u64) -> bool {
+        self.threads.values().any(|t| matches!(&t.state, ThreadState::WaitingCondvar { condvar_addr: c, .. } if *c == condvar_addr))
     }
 
     pub fn wake_all_on_condvar(&mut self, condvar_addr: u64) -> usize {
         let mut woken: Vec<u32> = Vec::new();
         for (h, t) in self.threads.iter_mut() {
-            if let ThreadState::WaitingCondvar { condvar_addr: c, .. } = &t.state {
+            if let ThreadState::WaitingCondvar {
+                condvar_addr: c, ..
+            } = &t.state
+            {
                 if *c == condvar_addr {
                     t.ctx.x[0] = nexium_common::result::SUCCESS as u64;
                     woken.push(*h);
@@ -297,10 +345,11 @@ impl Threads {
 
     pub fn pick_next(&mut self) -> Option<u32> {
         let core = current_core() as i32;
-        let pos = self
-            .ready
-            .iter()
-            .position(|h| self.threads.get(h).map_or(false, |t| t.core == core || t.core < 0))?;
+        let pos = self.ready.iter().position(|h| {
+            self.threads
+                .get(h)
+                .map_or(false, |t| t.core == core || t.core < 0)
+        })?;
         let handle = self.ready.remove(pos)?;
         if let Some(t) = self.threads.get_mut(&handle) {
             if t.core < 0 {
@@ -336,7 +385,13 @@ impl Threads {
         self.load_thread(handle, cpu);
         if let Some(t) = self.threads.get_mut(&handle) {
             t.state = ThreadState::Running;
-            log::trace!("[sched] core{} now running handle={:#x} pc={:#x} sp={:#x}", current_core(), handle, t.ctx.pc, t.ctx.sp);
+            log::trace!(
+                "[sched] core{} now running handle={:#x} pc={:#x} sp={:#x}",
+                current_core(),
+                handle,
+                t.ctx.pc,
+                t.ctx.sp
+            );
         }
         self.current[current_core()] = Some(handle);
         self.last_switch = Instant::now();
@@ -347,16 +402,23 @@ impl Threads {
             .values()
             .filter_map(|t| match &t.state {
                 ThreadState::Sleeping { wake_at } => Some(*wake_at),
-                ThreadState::WaitingHandle { wake_at: Some(d), .. } => Some(*d),
-                ThreadState::WaitingCondvar { wake_at: Some(d), .. } => Some(*d),
-                ThreadState::WaitingArbiter { wake_at: Some(d), .. } => Some(*d),
+                ThreadState::WaitingHandle {
+                    wake_at: Some(d), ..
+                } => Some(*d),
+                ThreadState::WaitingCondvar {
+                    wake_at: Some(d), ..
+                } => Some(*d),
+                ThreadState::WaitingArbiter {
+                    wake_at: Some(d), ..
+                } => Some(*d),
                 _ => None,
             })
             .min()
     }
 
     pub fn drop_exited(&mut self) {
-        self.threads.retain(|_, t| !matches!(t.state, ThreadState::Exited));
+        self.threads
+            .retain(|_, t| !matches!(t.state, ThreadState::Exited));
     }
 
     pub fn ensure_thread_loaded(&mut self, cpu: &mut Cpu) -> Option<u32> {

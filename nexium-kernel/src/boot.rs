@@ -1,9 +1,9 @@
-use nexium_memory::{AddressSpace, Perm};
-use nexium_loader::{Application, Loader, LoadedProgram, Nro};
 use crate::kernel::Kernel;
 use nexium_cpu::Cpu;
-use std::sync::Arc;
+use nexium_loader::{Application, LoadedProgram, Loader, Nro};
+use nexium_memory::{AddressSpace, Perm};
 use parking_lot::Mutex;
+use std::sync::Arc;
 
 pub struct BootConfig {
     pub nro_path: String,
@@ -60,56 +60,96 @@ impl BootContext {
         const PAGE_SIZE: u64 = 0x1000;
         let image_size = nro.total_memory_size();
         let code_size = ((image_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)).max(config.code_size);
-        log::info!("NRO image size {:#x}, code region size {:#x}", image_size, code_size);
+        log::info!(
+            "NRO image size {:#x}, code region size {:#x}",
+            image_size,
+            code_size
+        );
         let data_mmap_start = nro.data.mmap_range.start as u64;
         let split = data_mmap_start & !(PAGE_SIZE - 1);
         let split = split.min(code_size);
         if split == 0 || split >= code_size {
-            log::info!("  Mapping code @ {:#x} (size {:#x}) RX (no split — data section out of range)",
-                code_base, code_size);
-            address_space.map(code_base, code_size, Perm::RX, "code")
+            log::info!(
+                "  Mapping code @ {:#x} (size {:#x}) RX (no split — data section out of range)",
+                code_base,
+                code_size
+            );
+            address_space
+                .map(code_base, code_size, Perm::RX, "code")
                 .map_err(|e| format!("Failed to map code: {:?}", e))?;
         } else {
-            log::info!("  Mapping code text+ro @ {:#x} (size {:#x}) RX", code_base, split);
-            address_space.map(code_base, split, Perm::RX, "code_rx")
+            log::info!(
+                "  Mapping code text+ro @ {:#x} (size {:#x}) RX",
+                code_base,
+                split
+            );
+            address_space
+                .map(code_base, split, Perm::RX, "code_rx")
                 .map_err(|e| format!("Failed to map code_rx: {:?}", e))?;
             let rw_size = code_size - split;
-            log::info!("  Mapping code data+bss @ {:#x} (size {:#x}) RW", code_base + split, rw_size);
-            address_space.map(code_base + split, rw_size, Perm::RW, "code_rw")
+            log::info!(
+                "  Mapping code data+bss @ {:#x} (size {:#x}) RW",
+                code_base + split,
+                rw_size
+            );
+            address_space
+                .map(code_base + split, rw_size, Perm::RW, "code_rw")
                 .map_err(|e| format!("Failed to map code_rw: {:?}", e))?;
         }
 
-        log::info!("  Mapping heap @ {:#x} (size {:#x})", heap_base, config.heap_size);
-        address_space.map(heap_base, config.heap_size, Perm::RW, "heap")
+        log::info!(
+            "  Mapping heap @ {:#x} (size {:#x})",
+            heap_base,
+            config.heap_size
+        );
+        address_space
+            .map(heap_base, config.heap_size, Perm::RW, "heap")
             .map_err(|e| format!("Failed to map heap: {:?}", e))?;
 
-        log::info!("  Mapping stack @ {:#x} (size {:#x})", stack_base, config.stack_size);
-        address_space.map(stack_base, config.stack_size, Perm::RW, "stack")
+        log::info!(
+            "  Mapping stack @ {:#x} (size {:#x})",
+            stack_base,
+            config.stack_size
+        );
+        address_space
+            .map(stack_base, config.stack_size, Perm::RW, "stack")
             .map_err(|e| format!("Failed to map stack: {:?}", e))?;
 
-        log::info!("  Mapping extras (env+tls+exit_stub+tls_pool) @ {:#x} (size 0x110000)", env_base);
-        address_space.map(env_base, 0x110000, Perm::RW, "extras")
+        log::info!(
+            "  Mapping extras (env+tls+exit_stub+tls_pool) @ {:#x} (size 0x110000)",
+            env_base
+        );
+        address_space
+            .map(env_base, 0x110000, Perm::RW, "extras")
             .map_err(|e| format!("Failed to map extras: {:?}", e))?;
 
         log::info!("  Writing exit stub SVC instruction @ {:#x}", exit_stub_va);
         let svc_exit_insn: u32 = 0xD400_00E1;
-        address_space.write(exit_stub_va, &svc_exit_insn.to_le_bytes())
+        address_space
+            .write(exit_stub_va, &svc_exit_insn.to_le_bytes())
             .map_err(|e| format!("Failed to write exit stub: {:?}", e))?;
 
-        log::info!("  Writing NRO ({} bytes) at {:#x} from mmap (split at {:#x})",
-            nro.bytes().len(), code_base, split);
+        log::info!(
+            "  Writing NRO ({} bytes) at {:#x} from mmap (split at {:#x})",
+            nro.bytes().len(),
+            code_base,
+            split
+        );
         let bytes = nro.bytes();
         let split_idx = (split as usize).min(bytes.len());
         if split == 0 || split >= code_size {
-            address_space.write(code_base, bytes)
+            address_space
+                .write(code_base, bytes)
                 .map_err(|e| format!("Failed to write NRO file: {:?}", e))?;
         } else {
             if split_idx > 0 {
-                address_space.write(code_base, &bytes[..split_idx])
+                address_space
+                    .write(code_base, &bytes[..split_idx])
                     .map_err(|e| format!("Failed to write NRO text+ro: {:?}", e))?;
             }
             if bytes.len() > split_idx {
-                address_space.write(code_base + split, &bytes[split_idx..])
+                address_space
+                    .write(code_base + split, &bytes[split_idx..])
                     .map_err(|e| format!("Failed to write NRO data: {:?}", e))?;
             }
         }
@@ -140,7 +180,10 @@ impl BootContext {
         let app_name = nexium_common::paths::app_name_from_nro(&config.nro_path);
         let _ = nexium_common::paths::sdmc_app_dir(&app_name);
         let argv_path = format!("sdmc:/switch/{}/{}", app_name, nro_filename);
-        let next_load_path = config.loader_path.clone().unwrap_or_else(|| argv_path.clone());
+        let next_load_path = config
+            .loader_path
+            .clone()
+            .unwrap_or_else(|| argv_path.clone());
         let env_builder = nexium_loader::EnvBlockBuilder::new()
             .with_handles(kernel.main_thread_handle, kernel.process_handle)
             .with_heap(heap_base, config.heap_size)
@@ -149,7 +192,8 @@ impl BootContext {
         env_builder.build_into(&address_space, env_base)?;
 
         log::info!("Initializing CPU (backend: {})", config.cpu_backend.label());
-        let mut cpu = kernel.init_cpu(config.cpu_backend)
+        let mut cpu = kernel
+            .init_cpu(config.cpu_backend)
             .map_err(|e| format!("Failed to init CPU: {}", e))?;
 
         {
@@ -182,7 +226,11 @@ impl BootContext {
     }
 
     fn new_application(config: BootConfig, app: Application) -> Result<Self, String> {
-        log::info!("Loading application: {} (title_id={:#018x})", config.nro_path, app.title_id);
+        log::info!(
+            "Loading application: {} (title_id={:#018x})",
+            config.nro_path,
+            app.title_id
+        );
 
         let address_space = Arc::new(AddressSpace::new());
 
@@ -210,10 +258,22 @@ impl BootContext {
 
         const PAGE_SIZE: u64 = 0x1000;
         let code_size = app.total_code_size.max(PAGE_SIZE);
-        log::info!("address space {}-bit: code@{:#x} heap@{:#x} stack@{:#x} alias@{:#x} aslr_size={:#x}",
-            bits, code_base, heap_base, stack_base, alias_base, aslr_size);
+        log::info!(
+            "address space {}-bit: code@{:#x} heap@{:#x} stack@{:#x} alias@{:#x} aslr_size={:#x}",
+            bits,
+            code_base,
+            heap_base,
+            stack_base,
+            alias_base,
+            aslr_size
+        );
 
-        log::info!("Mapping {} NSO module(s), code region {:#x} (size {:#x})", app.modules.len(), code_base, code_size);
+        log::info!(
+            "Mapping {} NSO module(s), code region {:#x} (size {:#x})",
+            app.modules.len(),
+            code_base,
+            code_size
+        );
         for m in &app.modules {
             let base = code_base + m.load_offset;
             let image = m.nso.image_size as u64;
@@ -222,34 +282,65 @@ impl BootContext {
             let mutable_size = image - data_off;
 
             if static_size > 0 {
-                address_space.map(base, static_size, Perm::RX, format!("codestatic_{}", m.name))
+                address_space
+                    .map(
+                        base,
+                        static_size,
+                        Perm::RX,
+                        format!("codestatic_{}", m.name),
+                    )
                     .map_err(|e| format!("Failed to map {} text/ro: {:?}", m.name, e))?;
-                address_space.write(base, &m.nso.module_image[..static_size as usize])
+                address_space
+                    .write(base, &m.nso.module_image[..static_size as usize])
                     .map_err(|e| format!("Failed to write {} text/ro: {:?}", m.name, e))?;
             }
             if mutable_size > 0 {
-                address_space.map(base + data_off, mutable_size, Perm::RW, format!("codemutable_{}", m.name))
+                address_space
+                    .map(
+                        base + data_off,
+                        mutable_size,
+                        Perm::RW,
+                        format!("codemutable_{}", m.name),
+                    )
                     .map_err(|e| format!("Failed to map {} data/bss: {:?}", m.name, e))?;
-                address_space.write(base + data_off, &m.nso.module_image[data_off as usize..])
+                address_space
+                    .write(base + data_off, &m.nso.module_image[data_off as usize..])
                     .map_err(|e| format!("Failed to write {} data/bss: {:?}", m.name, e))?;
             }
-            log::info!("  module {} @ {:#x} static={:#x} mutable={:#x}", m.name, base, static_size, mutable_size);
+            log::info!(
+                "  module {} @ {:#x} static={:#x} mutable={:#x}",
+                m.name,
+                base,
+                static_size,
+                mutable_size
+            );
         }
 
         log::info!("  Mapping heap @ {:#x} (size {:#x})", heap_base, heap_size);
-        address_space.map(heap_base, heap_size, Perm::RW, "heap")
+        address_space
+            .map(heap_base, heap_size, Perm::RW, "heap")
             .map_err(|e| format!("Failed to map heap: {:?}", e))?;
 
-        log::info!("  Mapping stack @ {:#x} (size {:#x})", stack_base, config.stack_size);
-        address_space.map(stack_base, config.stack_size, Perm::RW, "stack")
+        log::info!(
+            "  Mapping stack @ {:#x} (size {:#x})",
+            stack_base,
+            config.stack_size
+        );
+        address_space
+            .map(stack_base, config.stack_size, Perm::RW, "stack")
             .map_err(|e| format!("Failed to map stack: {:?}", e))?;
 
-        log::info!("  Mapping extras (env+tls+exit_stub+tls_pool) @ {:#x} (size 0x110000)", env_base);
-        address_space.map(env_base, 0x110000, Perm::RW, "extras")
+        log::info!(
+            "  Mapping extras (env+tls+exit_stub+tls_pool) @ {:#x} (size 0x110000)",
+            env_base
+        );
+        address_space
+            .map(env_base, 0x110000, Perm::RW, "extras")
             .map_err(|e| format!("Failed to map extras: {:?}", e))?;
 
         let svc_exit_insn: u32 = 0xD400_00E1;
-        address_space.write(exit_stub_va, &svc_exit_insn.to_le_bytes())
+        address_space
+            .write(exit_stub_va, &svc_exit_insn.to_le_bytes())
             .map_err(|e| format!("Failed to write exit stub: {:?}", e))?;
 
         let tls_pool_base: u64 = env_base + 0x10000;
@@ -281,7 +372,8 @@ impl BootContext {
         nexium_common::paths::init();
 
         log::info!("Initializing CPU (backend: {})", config.cpu_backend.label());
-        let mut cpu = kernel.init_cpu(config.cpu_backend)
+        let mut cpu = kernel
+            .init_cpu(config.cpu_backend)
             .map_err(|e| format!("Failed to init CPU: {}", e))?;
 
         let main_thread_handle = kernel.main_thread_handle;
@@ -294,8 +386,13 @@ impl BootContext {
             cpu.set_register(0, 0);
             cpu.set_register(1, main_thread_handle as u64);
             cpu.set_register(30, exit_stub_va);
-            log::info!("  PC: {:#x}  SP: {:#x}  X0: 0  X1 (main_thread): {:#x}  X30 (exit_stub): {:#x}",
-                cpu.get_pc(), cpu.get_sp(), main_thread_handle, exit_stub_va);
+            log::info!(
+                "  PC: {:#x}  SP: {:#x}  X0: 0  X1 (main_thread): {:#x}  X30 (exit_stub): {:#x}",
+                cpu.get_pc(),
+                cpu.get_sp(),
+                main_thread_handle,
+                exit_stub_va
+            );
             log::info!("  TPIDRRO_EL0: {:#x}", cpu.get_tpidrro_el0());
         }
 
@@ -321,13 +418,23 @@ impl BootContext {
         if raw.is_empty() {
             return None;
         }
-        let trimmed = raw.strip_prefix("sdmc:/").or_else(|| raw.strip_prefix("sdmc:")).unwrap_or(raw);
-        let filename = std::path::Path::new(trimmed).file_name()?.to_str()?.to_string();
+        let trimmed = raw
+            .strip_prefix("sdmc:/")
+            .or_else(|| raw.strip_prefix("sdmc:"))
+            .unwrap_or(raw);
+        let filename = std::path::Path::new(trimmed)
+            .file_name()?
+            .to_str()?
+            .to_string();
         let kguard = self.kernel.lock();
         let homebrew = kguard.homebrew_dir.as_ref()?;
         let host_path = homebrew.join(&filename);
         if !host_path.exists() {
-            log::warn!("chained_load_path: requested {:?} not found in {:?}", raw, homebrew);
+            log::warn!(
+                "chained_load_path: requested {:?} not found in {:?}",
+                raw,
+                homebrew
+            );
             return None;
         }
         Some(host_path.to_string_lossy().into_owned())
@@ -340,7 +447,10 @@ impl BootContext {
         let mut cycle_count = 0u64;
         let mut svc_count = 0u32;
 
-        let mut cpu = self.cpu.take().ok_or_else(|| "CPU not initialized".to_string())?;
+        let mut cpu = self
+            .cpu
+            .take()
+            .ok_or_else(|| "CPU not initialized".to_string())?;
         let _cpu_guard = crate::kernel::cpu_local::set_current_cpu(&mut cpu, 0);
         use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
 
@@ -352,7 +462,10 @@ impl BootContext {
             match event {
                 nexium_cpu::CpuEvent::Running => {
                     if cycle_count % 10_000_000 == 0 {
-                        log::info!("CPU running... {} cycles executed (no SVCs yet)", cycle_count);
+                        log::info!(
+                            "CPU running... {} cycles executed (no SVCs yet)",
+                            cycle_count
+                        );
                     }
                 }
                 nexium_cpu::CpuEvent::Svc(imm) => {
@@ -387,14 +500,18 @@ impl BootContext {
             }
         }
 
-        log::info!("Execution complete: {} cycles, {} SVCs", cycle_count, svc_count);
+        log::info!(
+            "Execution complete: {} cycles, {} SVCs",
+            cycle_count,
+            svc_count
+        );
         Ok(0)
     }
 }
 
 fn resolve_homebrew_dir(loaded_nro_path: &str) -> Option<std::path::PathBuf> {
-    let appdata_nro = directories::BaseDirs::new()
-        .map(|d| d.config_dir().join("NeXium").join("NRO"));
+    let appdata_nro =
+        directories::BaseDirs::new().map(|d| d.config_dir().join("NeXium").join("NRO"));
 
     if let Some(dir) = &appdata_nro {
         if let Err(e) = std::fs::create_dir_all(dir) {
@@ -408,13 +525,21 @@ fn resolve_homebrew_dir(loaded_nro_path: &str) -> Option<std::path::PathBuf> {
                 if let Ok(rd) = std::fs::read_dir(loaded_dir) {
                     for entry in rd.flatten() {
                         let p = entry.path();
-                        let is_nro = p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("nro")).unwrap_or(false);
-                        if !is_nro { continue; }
+                        let is_nro = p
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| e.eq_ignore_ascii_case("nro"))
+                            .unwrap_or(false);
+                        if !is_nro {
+                            continue;
+                        }
                         let Some(name) = p.file_name() else { continue };
                         let dst_path = dst.join(name);
                         if !dst_path.exists() {
                             match std::fs::copy(&p, &dst_path) {
-                                Ok(n) => log::info!("Migrated {:?} → {:?} ({} bytes)", p, dst_path, n),
+                                Ok(n) => {
+                                    log::info!("Migrated {:?} → {:?} ({} bytes)", p, dst_path, n)
+                                }
                                 Err(e) => log::warn!("Failed to migrate {:?}: {}", p, e),
                             }
                         }

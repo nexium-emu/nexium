@@ -4,7 +4,9 @@ use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
 use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
 use crate::kernel::AudioRendererState;
-use nexium_common::result::{KERNEL_INVALID_ADDRESS, KERNEL_NOT_IMPLEMENTED, SUCCESS};
+use nexium_common::result::{
+    KERNEL_INVALID_ADDRESS, KERNEL_NOT_IMPLEMENTED, KERNEL_TIMEOUT, SUCCESS,
+};
 use nexium_ipc as ipc;
 
 pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
@@ -926,6 +928,13 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
         return SUCCESS;
     }
 
+    if timeout_ns == 0 {
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(0, KERNEL_TIMEOUT as u64);
+        }
+        return KERNEL_TIMEOUT;
+    }
+
     let effective_ns = if timeout_ns == u64::MAX {
         16_000_000u64
     } else if timeout_ns != 0 && timeout_ns < 50_000_000 {
@@ -942,6 +951,10 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
     if timeout_ns < 50_000_000 && timeout_ns != 0 {
         kernel.audio_render_condvar = Some(condvar_addr);
     }
+
+    let _ = kernel
+        .address_space
+        .write(condvar_addr, &1u32.to_le_bytes());
 
     if let Some(cpu) = cpu_ref() {
         kernel.threads.yield_with_state(
@@ -1009,6 +1022,11 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
             .entry(condvar_addr)
             .or_insert(0);
         *entry = entry.saturating_add(pending);
+    }
+    if !kernel.threads.has_condvar_waiters(condvar_addr) {
+        let _ = kernel
+            .address_space
+            .write(condvar_addr, &0u32.to_le_bytes());
     }
     log::debug!(
         "svcSignalProcessWideKey cond={:#x} count={} woken={}",
@@ -3868,6 +3886,8 @@ fn igbp_handle_transact(
                                     a[top..top + row].swap_with_slice(&mut b[..row]);
                                 }
                             }
+                            bytes = maybe_upscale_present_subwindow(bytes, pw, ph);
+                            dump_present_frame(&bytes, pw, ph);
                             nexium_common::frame_present::set_last_presented(pw, ph, bytes.clone());
                             qba.store(true, std::sync::atomic::Ordering::Relaxed);
                             fq.lock().push(nexium_nvdrv::QueuedFrame {
@@ -3982,6 +4002,9 @@ fn igbp_handle_transact(
                                         a[top..top + row].swap_with_slice(&mut b[..row]);
                                     }
                                 }
+                                let bytes =
+                                    maybe_upscale_present_subwindow(bytes, gb.width, gb.height);
+                                dump_present_frame(&bytes, gb.width, gb.height);
                                 bytes
                             });
                         let have_gpu_frame = fermi_frame.is_some() || vk_readback.is_some();
@@ -4492,6 +4515,147 @@ fn crop_and_upscale(
     out
 }
 
+fn outside_crop_has_visible(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+) -> bool {
+    let row = width as usize * 4;
+    let x1 = x0.saturating_add(w);
+    let y1 = y0.saturating_add(h);
+    let mut visible = 0u32;
+    let mut min_rgb = [255u8; 3];
+    let mut max_rgb = [0u8; 3];
+    for y in (0..height).step_by(4) {
+        let row_off = y as usize * row;
+        for x in (0..width).step_by(4) {
+            if x >= x0 && x < x1 && y >= y0 && y < y1 {
+                continue;
+            }
+            let p = row_off + x as usize * 4;
+            if p + 2 >= pixels.len() {
+                continue;
+            }
+            let rgb = [pixels[p], pixels[p + 1], pixels[p + 2]];
+            if rgb[0].max(rgb[1]).max(rgb[2]) > 4 {
+                visible += 1;
+                for i in 0..3 {
+                    min_rgb[i] = min_rgb[i].min(rgb[i]);
+                    max_rgb[i] = max_rgb[i].max(rgb[i]);
+                }
+                if visible >= 64 {
+                    let range = (max_rgb[0] - min_rgb[0])
+                        .max(max_rgb[1] - min_rgb[1])
+                        .max(max_rgb[2] - min_rgb[2]);
+                    if range > 24 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    if visible >= 64 {
+        let range = (max_rgb[0] - min_rgb[0])
+            .max(max_rgb[1] - min_rgb[1])
+            .max(max_rgb[2] - min_rgb[2]);
+        if range > 24 {
+            return true;
+        }
+    }
+    false
+}
+
+fn present_crop_slot() -> &'static std::sync::Mutex<Option<(u32, u32, u32, u32, u32, u32)>> {
+    static SLOT: std::sync::OnceLock<
+        std::sync::Mutex<Option<(u32, u32, u32, u32, u32, u32)>>,
+    > = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn maybe_upscale_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
+    if width < 1600 || height < 900 || bytes.len() < (width as usize) * (height as usize) * 4 {
+        return bytes;
+    }
+    if let Ok(mut slot) = present_crop_slot().lock() {
+        if let Some((dst_w, dst_h, x0, y0, w, h)) = *slot {
+            if dst_w == width && dst_h == height {
+                if !outside_crop_has_visible(&bytes, width, height, x0, y0, w, h) {
+                    return crop_and_upscale(&bytes, width, x0, y0, w, h, width, height);
+                }
+                log::info!(
+                    "QueueBuffer Vulkan sub-window invalidated: cached=({},{}) {}x{} target={}x{}",
+                    x0,
+                    y0,
+                    w,
+                    h,
+                    width,
+                    height
+                );
+                *slot = None;
+            }
+        }
+    }
+    let Some((x0, y0, w, h)) = active_bbox(&bytes, width, height) else {
+        return bytes;
+    };
+    let area_ratio = (w as f32 * h as f32) / (width as f32 * height as f32);
+    let src_aspect = w as f32 / h as f32;
+    let dst_aspect = width as f32 / height as f32;
+    let aspect_delta = ((src_aspect / dst_aspect) - 1.0).abs();
+    let inset = x0 > 4 || y0 > 4 || x0 + w + 4 < width || y0 + h + 4 < height;
+    let anchored = x0 <= 4 || y0 <= 4 || x0 + w + 4 >= width || y0 + h + 4 >= height;
+    if inset
+        && anchored
+        && w >= 640
+        && h >= 360
+        && area_ratio >= 0.30
+        && area_ratio <= 0.80
+        && aspect_delta <= 0.05
+    {
+        if let Ok(mut slot) = present_crop_slot().lock() {
+            *slot = Some((width, height, x0, y0, w, h));
+        }
+        log::info!(
+            "QueueBuffer Vulkan sub-window: src=({},{}) {}x{} -> upscale to {}x{}",
+            x0,
+            y0,
+            w,
+            h,
+            width,
+            height
+        );
+        crop_and_upscale(&bytes, width, x0, y0, w, h, width, height)
+    } else {
+        bytes
+    }
+}
+
+fn dump_present_frame(bytes: &[u8], width: u32, height: u32) {
+    if std::env::var("NEXIUM_PRESENT_DUMP")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        if seq % 60 == 0 {
+            if let Some(home) = std::env::var_os("APPDATA") {
+                let path = std::path::PathBuf::from(home)
+                    .join("NeXium")
+                    .join("logs")
+                    .join(format!("present-{}.bmp", seq));
+                if save_rgba_bmp(&path, width, height, bytes).is_ok() {
+                    log::warn!("PRESENT DUMP seq={} -> {}", seq, path.display());
+                }
+            }
+        }
+    }
+}
+
 fn save_rgba_bmp(
     path: &std::path::Path,
     width: u32,
@@ -4977,6 +5141,7 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("appletAE" | "appletOE", 0) => Some("IApplicationProxy"),
         ("appletAE" | "appletOE", 200) => Some("ILibraryAppletProxy"),
         ("apm" | "apm:p", 0) => Some("IApmManager"),
+        ("IApmManager", 0) => Some("IApmSession"),
         ("pctl:a" | "pctl:r" | "pctl:s" | "pctl", 0) => Some("IParentalControlService"),
         ("pctl:a" | "pctl:r" | "pctl:s" | "pctl", 1) => Some("IParentalControlService"),
         _ => None,

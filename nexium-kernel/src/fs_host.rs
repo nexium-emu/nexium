@@ -80,7 +80,14 @@ impl FsHost {
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.files.insert(id, Arc::new(Mutex::new(OpenFile { file, size, writable: write })));
+        self.files.insert(
+            id,
+            Arc::new(Mutex::new(OpenFile {
+                file,
+                size,
+                writable: write,
+            })),
+        );
         log::debug!("fs_host: opened {:?} as id={} size={}", host, id, size);
         Ok(id)
     }
@@ -106,7 +113,9 @@ impl FsHost {
     pub fn read(&self, id: u32, offset: u64, buf: &mut [u8]) -> Result<usize, u32> {
         let entry = self.files.get(&id).ok_or(FS_NOT_FOUND)?;
         let mut g = entry.lock();
-        g.file.seek(SeekFrom::Start(offset)).map_err(|_| FS_IO_ERROR)?;
+        g.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| FS_IO_ERROR)?;
         let n = g.file.read(buf).map_err(|_| FS_IO_ERROR)?;
         Ok(n)
     }
@@ -117,7 +126,9 @@ impl FsHost {
         if !g.writable {
             return Err(FS_ACCESS_DENIED);
         }
-        g.file.seek(SeekFrom::Start(offset)).map_err(|_| FS_IO_ERROR)?;
+        g.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| FS_IO_ERROR)?;
         g.file.write_all(data).map_err(|_| FS_IO_ERROR)?;
         if offset + data.len() as u64 > g.size {
             g.size = offset + data.len() as u64;
@@ -147,7 +158,8 @@ pub const FS_NOT_FOUND: u32 = 1 | (1 << 9) | (2 << 21);
 pub const FS_ACCESS_DENIED: u32 = 6 | (1 << 9) | (2 << 21);
 pub const FS_IO_ERROR: u32 = 4006 | (1 << 9) | (2 << 21);
 
-pub static FS_HOST: once_cell::sync::OnceCell<Arc<Mutex<FsHost>>> = once_cell::sync::OnceCell::new();
+pub static FS_HOST: once_cell::sync::OnceCell<Arc<Mutex<FsHost>>> =
+    once_cell::sync::OnceCell::new();
 
 pub fn get_fs_host() -> Arc<Mutex<FsHost>> {
     FS_HOST
@@ -155,7 +167,12 @@ pub fn get_fs_host() -> Arc<Mutex<FsHost>> {
         .clone()
 }
 
-pub fn read_path_from_buffer(buf: &[u8], addr: u64, size: u64, mem_read: impl FnOnce(u64, &mut [u8]) -> bool) -> Option<String> {
+pub fn read_path_from_buffer(
+    buf: &[u8],
+    addr: u64,
+    size: u64,
+    mem_read: impl FnOnce(u64, &mut [u8]) -> bool,
+) -> Option<String> {
     let _ = buf;
     let mut bytes = vec![0u8; size as usize];
     if !mem_read(addr, &mut bytes) {

@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
-pub mod kernel;
-pub mod services;
-pub mod boot;
-pub mod hid_state;
-pub mod fs_host;
-pub mod sdl_emu;
 pub mod audio_sink;
+pub mod boot;
+pub mod fs_host;
+pub mod hid_state;
+pub mod kernel;
+pub mod sdl_emu;
+pub mod services;
 
 pub use kernel::Kernel;

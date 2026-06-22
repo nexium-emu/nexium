@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use nexium_common::result::SUCCESS;
+use std::collections::HashMap;
 
 pub struct ServiceManager {
     services: HashMap<String, u32>,
@@ -18,21 +18,16 @@ impl ServiceManager {
 
     fn register_builtin_services(&mut self) {
         let services = vec![
-            "hid", "hid:sys", "irs", "time:s", "time:a", "time:r", "time:u",
-            "set", "set:sys", "set:cal", "set:fd", "am", "appletOE", "appletAE",
-            "vi:m", "vi:s", "vi:u",
-            "audio", "audout:u", "audout:a", "audrec:u", "audren:u", "audren:a",
-            "fsp-srv", "nifm:u", "nifm:a", "acc:u0", "acc:u1", "acc:a", "ns",
-            "apm", "apm:p", "bsd:u", "bsd:s", "ssl", "spl:", "spl:mig", "spl:fs",
-            "spl:ssl", "spl:es", "spl:manu",
-            "pl:u", "pl:s", "pctl:a", "pctl:r", "pctl:s", "pctl",
-            "ldn:u", "ldn:m", "lr", "ro:1", "ro:dmnt", "psm", "psc:c", "psc:m",
-            "pm:dmnt", "pm:info", "pm:bm", "pm:shell",
-            "nv:a", "nvdrv", "nvdrv:a", "nvdrv:s", "nvdrv:t",
-            "caps:a", "caps:c", "caps:u", "caps:sc", "caps:ss",
-            "lbl", "btm", "btm:dbg", "btm:sys", "btm:u",
-            "olsc:s", "btdrv", "bt", "bsd:s",
-            "mii:e", "mii:u", "mm:u", "lm",
+            "hid", "hid:sys", "irs", "time:s", "time:a", "time:r", "time:u", "set", "set:sys",
+            "set:cal", "set:fd", "am", "appletOE", "appletAE", "vi:m", "vi:s", "vi:u", "audio",
+            "audout:u", "audout:a", "audrec:u", "audren:u", "audren:a", "fsp-srv", "nifm:u",
+            "nifm:a", "acc:u0", "acc:u1", "acc:a", "ns", "apm", "apm:p", "bsd:u", "bsd:s", "ssl",
+            "spl:", "spl:mig", "spl:fs", "spl:ssl", "spl:es", "spl:manu", "pl:u", "pl:s", "pctl:a",
+            "pctl:r", "pctl:s", "pctl", "ldn:u", "ldn:m", "lr", "ro:1", "ro:dmnt", "psm", "psc:c",
+            "psc:m", "pm:dmnt", "pm:info", "pm:bm", "pm:shell", "nv:a", "nvdrv", "nvdrv:a",
+            "nvdrv:s", "nvdrv:t", "caps:a", "caps:c", "caps:u", "caps:sc", "caps:ss", "lbl", "btm",
+            "btm:dbg", "btm:sys", "btm:u", "olsc:s", "btdrv", "bt", "bsd:s", "mii:e", "mii:u",
+            "mm:u", "lm",
         ];
         for name in services {
             self.register_service(name);

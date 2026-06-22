@@ -1,5 +1,5 @@
-use nexium_ipc::IpcCtx;
 use nexium_common::result::SUCCESS;
+use nexium_ipc::IpcCtx;
 
 pub trait Service {
     fn dispatch(&self, cmd_id: u32, _ctx: Option<&IpcCtx>) -> u32 {

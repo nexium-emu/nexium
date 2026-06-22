@@ -1,5 +1,5 @@
-use crate::kernel::Kernel;
 use crate::kernel::handles::HandleType;
+use crate::kernel::Kernel;
 use nexium_ipc::IpcCtx;
 
 pub fn start(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}

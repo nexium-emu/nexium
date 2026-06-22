@@ -90,7 +90,10 @@ impl HidState {
             || input.stick_l_y != self.input.stick_l_y
             || input.stick_r_x != self.input.stick_r_x
             || input.stick_r_y != self.input.stick_r_y;
-        let elapsed = self.last_tick.map(|t| now.duration_since(t)).unwrap_or(VSYNC);
+        let elapsed = self
+            .last_tick
+            .map(|t| now.duration_since(t))
+            .unwrap_or(VSYNC);
         if force || elapsed >= VSYNC {
             self.last_tick = Some(now);
             self.tick(input);
@@ -111,14 +114,15 @@ impl HidState {
 
     pub fn tick(&mut self, input: ControllerInput) {
         if input.buttons != self.last_logged_buttons {
-            log::info!("hid:tick buttons={:#x} (was {:#x})", input.buttons, self.last_logged_buttons);
+            log::info!(
+                "hid:tick buttons={:#x} (was {:#x})",
+                input.buttons,
+                self.last_logged_buttons
+            );
             self.last_logged_buttons = input.buttons;
         }
         self.sampling_number = self.sampling_number.wrapping_add(1);
-        let configs = [
-            (NPAD_ENTRY_PLAYER1, false),
-            (NPAD_ENTRY_HANDHELD, true),
-        ];
+        let configs = [(NPAD_ENTRY_PLAYER1, false), (NPAD_ENTRY_HANDHELD, true)];
         let sampling = self.sampling_number;
         for (entry_idx, _is_handheld) in configs {
             for layout in 0..LAYOUT_COUNT {
@@ -129,18 +133,41 @@ impl HidState {
 
         if !self.dumped_shmem && input.buttons != 0 {
             self.dumped_shmem = true;
-            log::info!("hid:shmem-dump @va={:?} sampling={}", self.shmem_va, sampling);
-            for (entry_idx, name) in [(NPAD_ENTRY_PLAYER1, "Player1"), (NPAD_ENTRY_HANDHELD, "Handheld")] {
+            log::info!(
+                "hid:shmem-dump @va={:?} sampling={}",
+                self.shmem_va,
+                sampling
+            );
+            for (entry_idx, name) in [
+                (NPAD_ENTRY_PLAYER1, "Player1"),
+                (NPAD_ENTRY_HANDHELD, "Handheld"),
+            ] {
                 let base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
-                let style = u32::from_le_bytes(self.buf[base..base+4].try_into().unwrap_or([0;4]));
-                log::info!("hid:shmem {} (entry={}) style_tag={:#x}", name, entry_idx, style);
-                for (layout_idx, layout_name) in [(0usize, "FullKey"), (1, "Handheld"), (2, "JoyDual")] {
+                let style =
+                    u32::from_le_bytes(self.buf[base..base + 4].try_into().unwrap_or([0; 4]));
+                log::info!(
+                    "hid:shmem {} (entry={}) style_tag={:#x}",
+                    name,
+                    entry_idx,
+                    style
+                );
+                for (layout_idx, layout_name) in
+                    [(0usize, "FullKey"), (1, "Handheld"), (2, "JoyDual")]
+                {
                     let lifo = base + LAYOUT_BASE_OFFSET + layout_idx * LAYOUT_STRIDE;
-                    let hdr0 = u64::from_le_bytes(self.buf[lifo..lifo+8].try_into().unwrap_or([0;8]));
+                    let hdr0 =
+                        u64::from_le_bytes(self.buf[lifo..lifo + 8].try_into().unwrap_or([0; 8]));
                     let state = lifo + LIFO_HEADER_SIZE + 8;
-                    let st_sample = u64::from_le_bytes(self.buf[state..state+8].try_into().unwrap_or([0;8]));
-                    let st_btn = u64::from_le_bytes(self.buf[state+8..state+16].try_into().unwrap_or([0;8]));
-                    let st_attr = u32::from_le_bytes(self.buf[state+0x20..state+0x24].try_into().unwrap_or([0;4]));
+                    let st_sample =
+                        u64::from_le_bytes(self.buf[state..state + 8].try_into().unwrap_or([0; 8]));
+                    let st_btn = u64::from_le_bytes(
+                        self.buf[state + 8..state + 16].try_into().unwrap_or([0; 8]),
+                    );
+                    let st_attr = u32::from_le_bytes(
+                        self.buf[state + 0x20..state + 0x24]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    );
                     log::info!(
                         "  layout[{}={}] lifo_off=+{:#x} latest_sample={} state.sample={} state.buttons={:#x} state.attr={:#x}",
                         layout_idx, layout_name, lifo - base, hdr0, st_sample, st_btn, st_attr
@@ -173,7 +200,13 @@ impl HidState {
         write_u64(buf, e0 + 0x10, 0);
     }
 
-    fn write_npad_entry(buf: &mut [u8], entry_idx: usize, lifo_offset_in_entry: usize, input: &ControllerInput, sampling: u64) {
+    fn write_npad_entry(
+        buf: &mut [u8],
+        entry_idx: usize,
+        lifo_offset_in_entry: usize,
+        input: &ControllerInput,
+        sampling: u64,
+    ) {
         let entry_base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
         let lifo = entry_base + lifo_offset_in_entry;
 
@@ -213,7 +246,8 @@ fn write_i32(buf: &mut [u8], off: usize, v: i32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-pub static HID_STATE: once_cell::sync::OnceCell<Arc<Mutex<HidState>>> = once_cell::sync::OnceCell::new();
+pub static HID_STATE: once_cell::sync::OnceCell<Arc<Mutex<HidState>>> =
+    once_cell::sync::OnceCell::new();
 
 pub fn get_hid_state() -> Arc<Mutex<HidState>> {
     HID_STATE

@@ -8,4 +8,6 @@ pub fn get_display_service_with_proxy_name_exchange(_k: &mut Kernel, _c: &mut Ip
 pub fn prepare_fatal(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
 pub fn show_fatal(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
 pub fn draw_fatal_rectangle(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
-pub fn draw_fatal_text32(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> u32 { 0 }
+pub fn draw_fatal_text32(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> u32 {
+    0
+}

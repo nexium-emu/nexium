@@ -48,16 +48,21 @@ impl SdlContext {
     }
 
     pub fn update_window_surface(&mut self) {
-        if let (Some(ref mut surface), Some(ref mut window)) = (&mut self.surface, &mut self.window) {
-            log::debug!("SDL_UpdateWindowSurface - frame available {}x{}", window.width, window.height);
+        if let (Some(ref mut surface), Some(ref mut window)) = (&mut self.surface, &mut self.window)
+        {
+            log::debug!(
+                "SDL_UpdateWindowSurface - frame available {}x{}",
+                window.width,
+                window.height
+            );
             window.pixels.copy_from_slice(surface);
         }
     }
 
     pub fn get_window_pixels(&self) -> Option<(u32, u32, Vec<u8>)> {
-        self.window.as_ref().map(|w| {
-            (w.width, w.height, w.pixels.clone())
-        })
+        self.window
+            .as_ref()
+            .map(|w| (w.width, w.height, w.pixels.clone()))
     }
 }
 

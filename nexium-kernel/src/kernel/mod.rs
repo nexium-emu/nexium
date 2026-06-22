@@ -1,22 +1,22 @@
-pub mod svc;
-pub mod svc_defs;
+pub mod audio_lut;
+pub mod cpu_context;
 pub mod cpu_local;
-pub mod profile;
-pub mod threads;
 pub mod handles;
 pub mod hid;
+pub mod profile;
 pub mod session;
-pub mod cpu_context;
-pub mod audio_lut;
+pub mod svc;
+pub mod svc_defs;
+pub mod threads;
 
+use crate::services::FrameOut;
+use crate::services::Services;
+use nexium_cpu::Cpu;
 use nexium_memory::AddressSpace;
 use nexium_nvdrv::Nvdrv;
-use crate::services::Services;
-use crate::services::FrameOut;
-use nexium_cpu::Cpu;
-use std::sync::Arc;
-use std::collections::{HashMap, HashSet, VecDeque};
 use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 pub(crate) const MUTEX_HAS_LISTENERS: u32 = 0x4000_0000;
 
@@ -165,7 +165,8 @@ impl Kernel {
         let main_thread_handle = handles.create_handle(handles::HandleType::Thread);
 
         let main_stack_top = stack_base + stack_size - 0x20;
-        let threads = threads::Threads::new(main_thread_handle, tls_base, main_stack_top, tls_pool_base);
+        let threads =
+            threads::Threads::new(main_thread_handle, tls_base, main_stack_top, tls_pool_base);
 
         Self {
             address_space,
@@ -259,7 +260,10 @@ impl Kernel {
         for h in vsyncs {
             self.event_signals.insert(h, true);
             self.threads.signal_handle(h);
-            self.nvdrv.stats.vsync_signals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.nvdrv
+                .stats
+                .vsync_signals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.last_vsync = std::time::Instant::now();
     }
@@ -303,9 +307,7 @@ impl Kernel {
             .filter(|(_, st)| st.state == 0)
             .filter_map(|(key, _)| self.audio_renderer_events.get(key).copied())
             .collect();
-        self.audio_renderer_frame_counter = self
-            .audio_renderer_frame_counter
-            .wrapping_add(1);
+        self.audio_renderer_frame_counter = self.audio_renderer_frame_counter.wrapping_add(1);
         for ev in &to_signal {
             self.event_signals.insert(*ev, true);
             self.threads.signal_handle(*ev);
@@ -325,10 +327,18 @@ impl Kernel {
     }
 
     pub fn wake_due_sleepers(&mut self, now: std::time::Instant) {
-        let timed_out: Vec<(u32, u64, u64, bool)> = self.threads.threads.iter()
+        let timed_out: Vec<(u32, u64, u64, bool)> = self
+            .threads
+            .threads
+            .iter()
             .filter_map(|(h, t)| match &t.state {
-                threads::ThreadState::WaitingCondvar { mutex_addr, condvar_addr, wake_at: Some(d), spurious_wake, .. }
-                    if *d <= now => Some((*h, *mutex_addr, *condvar_addr, *spurious_wake)),
+                threads::ThreadState::WaitingCondvar {
+                    mutex_addr,
+                    condvar_addr,
+                    wake_at: Some(d),
+                    spurious_wake,
+                    ..
+                } if *d <= now => Some((*h, *mutex_addr, *condvar_addr, *spurious_wake)),
                 _ => None,
             })
             .collect();
@@ -350,9 +360,14 @@ impl Kernel {
                 }
             }
             if self.reacquire_condvar_mutex(h, mutex_addr) {
-                self.threads.transition_state(h, threads::ThreadState::Ready);
+                self.threads
+                    .transition_state(h, threads::ThreadState::Ready);
             } else {
-                self.threads.transition_state(h, threads::ThreadState::WaitingMutex { mutex_addr });
+                self.threads
+                    .transition_state(h, threads::ThreadState::WaitingMutex { mutex_addr });
+            }
+            if !self.threads.has_condvar_waiters(condvar_addr) {
+                let _ = self.address_space.write(condvar_addr, &0u32.to_le_bytes());
             }
         }
 
@@ -374,10 +389,14 @@ impl Kernel {
             } else {
                 handle | (cur_word & MUTEX_HAS_LISTENERS)
             };
-            let _ = self.address_space.write(mutex_addr, &new_word.to_le_bytes());
+            let _ = self
+                .address_space
+                .write(mutex_addr, &new_word.to_le_bytes());
             true
         } else {
-            let _ = self.address_space.write(mutex_addr, &(cur_word | MUTEX_HAS_LISTENERS).to_le_bytes());
+            let _ = self
+                .address_space
+                .write(mutex_addr, &(cur_word | MUTEX_HAS_LISTENERS).to_le_bytes());
             false
         }
     }
@@ -394,7 +413,6 @@ impl Kernel {
         }
     }
 
-
     pub fn init_cpu(&self, backend: nexium_cpu::CpuBackendKind) -> Result<Cpu, String> {
         let mut cpu = Cpu::new(backend)?;
         for region in self.address_space.host_regions() {
@@ -403,7 +421,10 @@ impl Kernel {
                     .map_err(|e| format!("CPU map_host failed for {:#x}: {}", region.base, e))?;
             }
         }
-        log::info!("Kernel CPU initialized with {} mapped regions", self.address_space.host_regions().len());
+        log::info!(
+            "Kernel CPU initialized with {} mapped regions",
+            self.address_space.host_regions().len()
+        );
         Ok(cpu)
     }
 
@@ -416,15 +437,24 @@ impl Kernel {
             });
         }
 
-        let qb_active = self.nvdrv.queue_buffer_active.load(std::sync::atomic::Ordering::Relaxed);
-        if !qb_active && self.pending_frames.is_empty()
+        let qb_active = self
+            .nvdrv
+            .queue_buffer_active
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !qb_active
+            && self.pending_frames.is_empty()
             && self.last_sdl_capture.elapsed() >= std::time::Duration::from_millis(16)
         {
             self.last_sdl_capture = std::time::Instant::now();
             let addr_space = self.address_space.clone();
-            if let Some(qf) = self.nvdrv.try_capture_sdl_surface(|addr, buf| addr_space.read(addr, buf).is_ok()) {
+            if let Some(qf) = self
+                .nvdrv
+                .try_capture_sdl_surface(|addr, buf| addr_space.read(addr, buf).is_ok())
+            {
                 self.pending_frames.push(FrameOut {
-                    width: qf.width, height: qf.height, pixels: qf.pixels,
+                    width: qf.width,
+                    height: qf.height,
+                    pixels: qf.pixels,
                 });
             }
         }
@@ -484,7 +514,11 @@ impl Kernel {
             }
         }
 
-        FrameOut { width: w, height: h, pixels }
+        FrameOut {
+            width: w,
+            height: h,
+            pixels,
+        }
     }
 
     pub fn ensure_font_shmem_handle(&mut self) -> u32 {
@@ -536,7 +570,12 @@ impl Kernel {
                 offsets[i] = (off, decoded_len as u32);
                 off = (off + decoded_len as u32 + 3) & !3;
                 loaded += 1;
-                log::info!("pl:u loaded font type {}: {} ({} bytes decoded)", i, name, decoded_len);
+                log::info!(
+                    "pl:u loaded font type {}: {} ({} bytes decoded)",
+                    i,
+                    name,
+                    decoded_len
+                );
             }
         }
 
@@ -556,7 +595,9 @@ impl Kernel {
 
         self.font_shmem = Some(buf);
         self.font_offsets = offsets;
-        let h = self.handles.create_handle(handles::HandleType::SharedMemory);
+        let h = self
+            .handles
+            .create_handle(handles::HandleType::SharedMemory);
         self.font_shmem_handle = Some(h);
         h
     }
@@ -567,9 +608,15 @@ impl Kernel {
         }
         const TIME_SHMEM_SIZE: usize = 0x1000;
         self.time_shmem = Some(vec![0u8; TIME_SHMEM_SIZE]);
-        let h = self.handles.create_handle(handles::HandleType::SharedMemory);
+        let h = self
+            .handles
+            .create_handle(handles::HandleType::SharedMemory);
         self.time_shmem_handle = Some(h);
-        log::info!("time:u allocated KSharedMemory handle={:#x} size={:#x}", h, TIME_SHMEM_SIZE);
+        log::info!(
+            "time:u allocated KSharedMemory handle={:#x} size={:#x}",
+            h,
+            TIME_SHMEM_SIZE
+        );
         h
     }
 

@@ -1,5 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
 use nexium_common::result::SUCCESS;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct TimeService {
     start_time: u64,
