@@ -160,10 +160,14 @@ impl HorizonApp {
             crate::app_settings::FilterMode::Linear => egui::TextureOptions::LINEAR,
             crate::app_settings::FilterMode::Nearest => egui::TextureOptions::NEAREST,
         };
+        let mut latest = None;
         while let Ok(frame) = handle.frame_rx.try_recv() {
             if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() {
                 continue;
             }
+            latest = Some(frame);
+        }
+        if let Some(frame) = latest {
             self.performance.record_frame();
             log::trace!(
                 "frame in: {}x{} ({} bytes)",

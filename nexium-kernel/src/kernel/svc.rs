@@ -3886,14 +3886,19 @@ fn igbp_handle_transact(
                                     a[top..top + row].swap_with_slice(&mut b[..row]);
                                 }
                             }
-                            bytes = maybe_upscale_present_subwindow(bytes, pw, ph);
+                            let (present_w, present_h, mut bytes) =
+                                maybe_crop_present_subwindow(bytes, pw, ph);
                             make_present_opaque(&mut bytes);
-                            dump_present_frame(&bytes, pw, ph);
-                            nexium_common::frame_present::set_last_presented(pw, ph, bytes.clone());
+                            dump_present_frame(&bytes, present_w, present_h);
+                            nexium_common::frame_present::set_last_presented(
+                                present_w,
+                                present_h,
+                                bytes.clone(),
+                            );
                             qba.store(true, std::sync::atomic::Ordering::Relaxed);
                             fq.lock().push(nexium_nvdrv::QueuedFrame {
-                                width: pw,
-                                height: ph,
+                                width: present_w,
+                                height: present_h,
                                 pixels: bytes,
                             });
                         }
@@ -4003,11 +4008,11 @@ fn igbp_handle_transact(
                                         a[top..top + row].swap_with_slice(&mut b[..row]);
                                     }
                                 }
-                                let mut bytes =
-                                    maybe_upscale_present_subwindow(bytes, gb.width, gb.height);
+                                let (present_w, present_h, mut bytes) =
+                                    maybe_crop_present_subwindow(bytes, gb.width, gb.height);
                                 make_present_opaque(&mut bytes);
-                                dump_present_frame(&bytes, gb.width, gb.height);
-                                bytes
+                                dump_present_frame(&bytes, present_w, present_h);
+                                (present_w, present_h, bytes)
                             });
                         let have_gpu_frame = fermi_frame.is_some() || vk_readback.is_some();
                         let legacy_gfx = kernel
@@ -4055,13 +4060,13 @@ fn igbp_handle_transact(
                         };
                         let (frame_w, frame_h, mut frame_pixels) = if let Some(qf) = fermi_frame {
                             (qf.width, qf.height, qf.pixels)
-                        } else if let Some(bytes) = vk_readback {
+                        } else if let Some((w, h, bytes)) = vk_readback {
                             nexium_common::frame_present::set_last_presented(
-                                gb.width,
-                                gb.height,
+                                w,
+                                h,
                                 bytes.clone(),
                             );
-                            (gb.width, gb.height, bytes)
+                            (w, h, bytes)
                         } else if rgb_nz >= 16 {
                             if legacy_gfx {
                                 if let Some((x0, y0, w, h)) =
@@ -4560,7 +4565,12 @@ fn outside_crop_has_visible(
                     let range = (max_rgb[0] - min_rgb[0])
                         .max(max_rgb[1] - min_rgb[1])
                         .max(max_rgb[2] - min_rgb[2]);
+                    let hi = max_rgb[0].max(max_rgb[1]).max(max_rgb[2]);
+                    let lo = min_rgb[0].min(min_rgb[1]).min(min_rgb[2]);
                     if range > 24 {
+                        return true;
+                    }
+                    if hi.saturating_sub(lo) > 48 {
                         return true;
                     }
                 }
@@ -4571,7 +4581,12 @@ fn outside_crop_has_visible(
         let range = (max_rgb[0] - min_rgb[0])
             .max(max_rgb[1] - min_rgb[1])
             .max(max_rgb[2] - min_rgb[2]);
+        let hi = max_rgb[0].max(max_rgb[1]).max(max_rgb[2]);
+        let lo = min_rgb[0].min(min_rgb[1]).min(min_rgb[2]);
         if range > 24 {
+            return true;
+        }
+        if hi.saturating_sub(lo) > 48 {
             return true;
         }
     }
@@ -4585,15 +4600,15 @@ fn present_crop_slot() -> &'static std::sync::Mutex<Option<(u32, u32, u32, u32, 
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-fn maybe_upscale_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
+fn maybe_crop_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> (u32, u32, Vec<u8>) {
     if width < 1600 || height < 900 || bytes.len() < (width as usize) * (height as usize) * 4 {
-        return bytes;
+        return (width, height, bytes);
     }
     if let Ok(mut slot) = present_crop_slot().lock() {
         if let Some((dst_w, dst_h, x0, y0, w, h)) = *slot {
             if dst_w == width && dst_h == height {
                 if !outside_crop_has_visible(&bytes, width, height, x0, y0, w, h) {
-                    return crop_and_upscale(&bytes, width, x0, y0, w, h, width, height);
+                    return (w, h, crop_and_upscale(&bytes, width, x0, y0, w, h, w, h));
                 }
                 log::info!(
                     "QueueBuffer Vulkan sub-window invalidated: cached=({},{}) {}x{} target={}x{}",
@@ -4609,7 +4624,7 @@ fn maybe_upscale_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> V
         }
     }
     let Some((x0, y0, w, h)) = active_bbox(&bytes, width, height) else {
-        return bytes;
+        return (width, height, bytes);
     };
     let area_ratio = (w as f32 * h as f32) / (width as f32 * height as f32);
     let src_aspect = w as f32 / h as f32;
@@ -4629,17 +4644,15 @@ fn maybe_upscale_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> V
             *slot = Some((width, height, x0, y0, w, h));
         }
         log::info!(
-            "QueueBuffer Vulkan sub-window: src=({},{}) {}x{} -> upscale to {}x{}",
+            "QueueBuffer Vulkan sub-window: src=({},{}) {}x{} -> crop",
             x0,
             y0,
             w,
-            h,
-            width,
-            height
+            h
         );
-        crop_and_upscale(&bytes, width, x0, y0, w, h, width, height)
+        (w, h, crop_and_upscale(&bytes, width, x0, y0, w, h, w, h))
     } else {
-        bytes
+        (width, height, bytes)
     }
 }
 

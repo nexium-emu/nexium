@@ -1278,6 +1278,17 @@ impl Nvdrv {
         frames
     }
 
+    pub fn drain_latest_frame(&self) -> Option<QueuedFrame> {
+        let mut queue = self.frame_queue.lock();
+        let len = queue.len();
+        let latest = queue.pop();
+        queue.clear();
+        self.stats
+            .frames_drained
+            .fetch_add(len as u64, Ordering::Relaxed);
+        latest
+    }
+
     pub fn submit_frame(&self, frame: QueuedFrame) {
         self.queue_buffer_active
             .store(true, std::sync::atomic::Ordering::Relaxed);

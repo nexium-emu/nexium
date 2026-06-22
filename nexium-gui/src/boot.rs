@@ -918,8 +918,12 @@ impl EmulationHandle {
                             }
                         }
 
-                        for f in guard.drain_frames() {
-                            let _ = frame_tx.try_send(f.into());
+                        if let Some(f) = guard.nvdrv.drain_latest_frame() {
+                            let _ = frame_tx.try_send(Frame {
+                                width: f.width,
+                                height: f.height,
+                                pixels: f.pixels,
+                            });
                         }
 
                         guard.tick_audio_renderers();
