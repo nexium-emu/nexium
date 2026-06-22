@@ -17,9 +17,11 @@ struct PrebufState {
     prev_l: f32,
     prev_r: f32,
     pos: f32,
+    ratio: f32,
+    last_callback: Option<std::time::Instant>,
 }
 impl PrebufState {
-    fn new() -> Self {
+    fn new(nominal_ratio: f32) -> Self {
         Self {
             priming: true,
             cur_l: 0.0,
@@ -27,7 +29,28 @@ impl PrebufState {
             prev_l: 0.0,
             prev_r: 0.0,
             pos: 1.0,
+            ratio: nominal_ratio.clamp(0.05, 4.0),
+            last_callback: None,
         }
+    }
+
+    fn callback_ratio(&mut self, frames_written: usize, nominal_ratio: f32) -> f32 {
+        let nominal = nominal_ratio.clamp(0.05, 4.0);
+        let now = std::time::Instant::now();
+        let measured = self
+            .last_callback
+            .replace(now)
+            .and_then(|prev| {
+                let elapsed = now.saturating_duration_since(prev).as_secs_f32();
+                if elapsed > 0.001 && frames_written > 0 {
+                    Some((elapsed * RENDER_SR as f32 / frames_written as f32).clamp(0.05, 4.0))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(nominal);
+        self.ratio = self.ratio * 0.75 + measured * 0.25;
+        self.ratio
     }
 }
 
@@ -228,7 +251,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
     let stream_result = match sample_format {
         SampleFormat::F32 => {
             let vol = volume_cb.clone();
-            let mut prebuf = PrebufState::new();
+            let mut prebuf = PrebufState::new(resample_ratio);
             device.build_output_stream(
                 &config,
                 move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
@@ -249,7 +272,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
         SampleFormat::I16 => {
             let consumed_cb = consumed_cb.clone();
             let vol = volume_cb.clone();
-            let mut prebuf = PrebufState::new();
+            let mut prebuf = PrebufState::new(resample_ratio);
             device.build_output_stream(
                 &config,
                 move |out: &mut [i16], _info: &cpal::OutputCallbackInfo| {
@@ -363,6 +386,7 @@ fn drain_stereo_to(
         prebuf.priming = false;
     }
     let priming = prebuf.priming;
+    let ratio = prebuf.callback_ratio(out.len() / dev_ch, resample_ratio);
 
     let mut frames_written = 0usize;
     let mut peak: f32 = 0.0;
@@ -398,24 +422,25 @@ fn drain_stereo_to(
             }
         }
         if !priming {
-            prebuf.pos += resample_ratio;
+            prebuf.pos += ratio;
         }
         frames_written += 1;
     }
     if n == 1 || (n > 0 && n % 50 == 0) {
         let min_occ = MIN_OCC.swap(u32::MAX, Ordering::Relaxed);
         let empty_ct = EMPTY_CT.swap(0, Ordering::Relaxed);
-        log::info!(
-            "cpal callback #{}: peak_amp={:.4} priming={} occ={} min_occ={} empty={}",
+        log::debug!(
+            "cpal callback #{}: peak_amp={:.4} priming={} occ={} min_occ={} empty={} ratio={:.3}",
             n,
             peak,
             priming,
             occ,
             min_occ,
-            empty_ct
+            empty_ct,
+            prebuf.ratio
         );
     }
-    let render_frames = ((frames_written as f32) * resample_ratio).round() as u64;
+    let render_frames = ((frames_written as f32) * ratio).round() as u64;
     let new_consumed = consumed.fetch_add(render_frames, Ordering::Relaxed) + render_frames;
     post_audio_events(new_consumed);
 }
@@ -436,6 +461,7 @@ fn drain_stereo_to_i16(
         prebuf.priming = false;
     }
     let priming = prebuf.priming;
+    let ratio = prebuf.callback_ratio(out.len() / dev_ch, resample_ratio);
 
     let mut frames_written = 0usize;
     for chunk in out.chunks_mut(dev_ch) {
@@ -471,11 +497,11 @@ fn drain_stereo_to_i16(
             }
         }
         if !priming {
-            prebuf.pos += resample_ratio;
+            prebuf.pos += ratio;
         }
         frames_written += 1;
     }
-    let render_frames = ((frames_written as f32) * resample_ratio).round() as u64;
+    let render_frames = ((frames_written as f32) * ratio).round() as u64;
     let new_consumed = consumed.fetch_add(render_frames, Ordering::Relaxed) + render_frames;
     post_audio_events(new_consumed);
 }
