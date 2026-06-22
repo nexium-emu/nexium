@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 pub struct ProfileBucket {
@@ -67,7 +68,15 @@ impl Profiler {
 
 static PROFILER: Mutex<Option<Profiler>> = Mutex::new(None);
 
+pub fn enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_PROFILE").is_some())
+}
+
 pub fn record_svc(imm: u16, start: Instant) {
+    if !enabled() {
+        return;
+    }
     let ns = start.elapsed().as_nanos() as u64;
     let mut g = PROFILER.lock();
     if g.is_none() {
@@ -77,6 +86,9 @@ pub fn record_svc(imm: u16, start: Instant) {
 }
 
 pub fn record_ipc(port: &str, start: Instant) {
+    if !enabled() {
+        return;
+    }
     let ns = start.elapsed().as_nanos() as u64;
     let mut g = PROFILER.lock();
     if g.is_none() {
@@ -86,6 +98,9 @@ pub fn record_ipc(port: &str, start: Instant) {
 }
 
 pub fn record_wait_handle(handle: u32) {
+    if !enabled() {
+        return;
+    }
     let mut g = PROFILER.lock();
     if g.is_none() {
         *g = Some(Profiler::new());
@@ -94,6 +109,9 @@ pub fn record_wait_handle(handle: u32) {
 }
 
 pub fn dump_heartbeat_with_kernel(kernel: &crate::kernel::Kernel) {
+    if !enabled() {
+        return;
+    }
     let (svcs, ipcs, waits) = {
         let mut g = PROFILER.lock();
         if g.is_none() {
@@ -155,6 +173,9 @@ pub fn dump_heartbeat_with_kernel(kernel: &crate::kernel::Kernel) {
 }
 
 pub fn dump_heartbeat() {
+    if !enabled() {
+        return;
+    }
     let (svcs, ipcs, waits) = {
         let mut g = PROFILER.lock();
         if g.is_none() {

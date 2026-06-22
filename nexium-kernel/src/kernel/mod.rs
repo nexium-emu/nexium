@@ -265,15 +265,31 @@ impl Kernel {
                 .vsync_signals
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.last_vsync = std::time::Instant::now();
     }
 
     pub fn tick_audio_renderers(&mut self) {
         const FRAMES_PER_AUDIO_FRAME: u64 = 240;
         const MAX_BACKLOG_BLOCKS: u64 = 400;
+        const TARGET_QUEUE_BLOCKS: u64 = 16;
+
+        let to_signal: Vec<u32> = self
+            .audio_renderers
+            .iter()
+            .filter(|(_, st)| st.state == 0)
+            .filter_map(|(key, _)| self.audio_renderer_events.get(key).copied())
+            .collect();
+        let event_already_pending = to_signal
+            .iter()
+            .any(|ev| self.event_signals.get(ev).copied().unwrap_or(false));
 
         let blocks = if let Some(sink) = crate::audio_sink::host_audio_sink() {
             let mut n = sink.drain_pending_events();
+            if !to_signal.is_empty() && !event_already_pending {
+                let queued_blocks = (sink.queued_frames() as u64) / FRAMES_PER_AUDIO_FRAME;
+                if queued_blocks < TARGET_QUEUE_BLOCKS {
+                    n = n.max(TARGET_QUEUE_BLOCKS - queued_blocks);
+                }
+            }
             if n == 0 {
                 if self.audio_renderer_last_consumed == 0 {
                     self.audio_renderer_last_consumed = sink.samples_consumed();
@@ -301,12 +317,16 @@ impl Kernel {
             return;
         }
 
-        let to_signal: Vec<u32> = self
-            .audio_renderers
-            .iter()
-            .filter(|(_, st)| st.state == 0)
-            .filter_map(|(key, _)| self.audio_renderer_events.get(key).copied())
-            .collect();
+        if to_signal.is_empty() {
+            return;
+        }
+        if event_already_pending {
+            if let Some(sink) = crate::audio_sink::host_audio_sink() {
+                sink.repost_pending_events(blocks);
+            }
+            return;
+        }
+
         self.audio_renderer_frame_counter = self.audio_renderer_frame_counter.wrapping_add(1);
         for ev in &to_signal {
             self.event_signals.insert(*ev, true);
