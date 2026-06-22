@@ -65,7 +65,9 @@ pub fn swizzle_block_linear(
             let dst_offset = gob_index * GOB_SIZE_BYTES + offset_y * GOB_WIDTH_BYTES + offset_x;
 
             let src_offset = y * stride + pixel_x;
-            if src_offset + bytes_per_pixel <= src.len() && dst_offset + bytes_per_pixel <= dst.len() {
+            if src_offset + bytes_per_pixel <= src.len()
+                && dst_offset + bytes_per_pixel <= dst.len()
+            {
                 dst[dst_offset..dst_offset + bytes_per_pixel]
                     .copy_from_slice(&src[src_offset..src_offset + bytes_per_pixel]);
             }

@@ -33,7 +33,8 @@ impl ShaderCompiler {
         };
 
         let module = unsafe {
-            device.create_shader_module(&module_info, None)
+            device
+                .create_shader_module(&module_info, None)
                 .map_err(|_| "Failed to create shader module".to_string())?
         };
 

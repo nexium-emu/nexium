@@ -42,7 +42,10 @@ fn parse(words: &[u32]) -> Option<(Vec<u32>, Vec<Inst>)> {
         if wc == 0 || i + wc > words.len() {
             return None;
         }
-        insts.push(Inst { opcode: op, words: words[i..i + wc].to_vec() });
+        insts.push(Inst {
+            opcode: op,
+            words: words[i..i + wc].to_vec(),
+        });
         i += wc;
     }
     Some((header, insts))
@@ -105,7 +108,9 @@ pub fn dedup_constants(words: Vec<u32>) -> Vec<u32> {
                 continue;
             }
 
-            let Some(key) = make_canon_key(inst, &remap) else { continue };
+            let Some(key) = make_canon_key(inst, &remap) else {
+                continue;
+            };
 
             match canon.get(&key) {
                 Some(&survivor) if survivor != raw_id => {
@@ -183,13 +188,7 @@ mod tests {
     use super::*;
 
     fn spv_header(bound: u32) -> Vec<u32> {
-        vec![
-            0x07230203,
-            0x00010000,
-            0,
-            bound,
-            0,
-        ]
+        vec![0x07230203, 0x00010000, 0, bound, 0]
     }
 
     fn op_type_float(result_id: u32) -> Vec<u32> {
@@ -252,8 +251,12 @@ mod tests {
             let w0 = words[i];
             let wc = (w0 >> 16) as usize;
             let op = (w0 & 0xFFFF) as u16;
-            if wc == 0 { break; }
-            if op == opcode { count += 1; }
+            if wc == 0 {
+                break;
+            }
+            if op == opcode {
+                count += 1;
+            }
             i += wc;
         }
         count

@@ -20,7 +20,8 @@ impl CommandRecorder {
         };
 
         let pool = unsafe {
-            device.create_command_pool(&pool_info, None)
+            device
+                .create_command_pool(&pool_info, None)
                 .map_err(|_| "Failed to create command pool".to_string())?
         };
 
@@ -41,7 +42,8 @@ impl CommandRecorder {
         };
 
         let buffers = unsafe {
-            device.allocate_command_buffers(&alloc_info)
+            device
+                .allocate_command_buffers(&alloc_info)
                 .map_err(|_| "Failed to allocate command buffer".to_string())?
         };
 
@@ -60,7 +62,8 @@ impl CommandRecorder {
         };
 
         unsafe {
-            device.begin_command_buffer(cmd_buf, &begin_info)
+            device
+                .begin_command_buffer(cmd_buf, &begin_info)
                 .map_err(|_| "Failed to begin command buffer".to_string())?
         };
 
@@ -69,7 +72,8 @@ impl CommandRecorder {
 
     pub fn end_recording(cmd_buf: vk::CommandBuffer, device: &ash::Device) -> Result<(), String> {
         unsafe {
-            device.end_command_buffer(cmd_buf)
+            device
+                .end_command_buffer(cmd_buf)
                 .map_err(|_| "Failed to end command buffer".to_string())?
         };
 
@@ -78,7 +82,8 @@ impl CommandRecorder {
 
     pub fn reset(&self, device: &ash::Device) -> Result<(), String> {
         unsafe {
-            device.reset_command_pool(self.pool, vk::CommandPoolResetFlags::RELEASE_RESOURCES)
+            device
+                .reset_command_pool(self.pool, vk::CommandPoolResetFlags::RELEASE_RESOURCES)
                 .map_err(|_| "Failed to reset command pool".to_string())?
         };
 

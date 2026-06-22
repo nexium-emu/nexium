@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use super::super::GpuMappings;
+use std::collections::HashMap;
 
 pub const MAXWELL_DMA_CLASS: u32 = 0xB0B5;
 
@@ -76,7 +76,9 @@ pub struct MaxwellDma {
 }
 
 impl MaxwellDma {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn dispatch_method(
         &mut self,
@@ -138,10 +140,19 @@ impl MaxwellDma {
             return;
         }
         let src_gpu = self.src_addr();
-        let Some(nvmap) = mappings.nvmap_id_for(src_gpu) else { return };
-        let Some((src_cpu, limit)) = mappings.cpu_range_for(src_gpu) else { return };
-        let Some((kw, kh)) = renderer.rt_key_for_nvmap(nvmap, self.src_width, self.src_height) else { return };
-        let Some(mut rgba) = renderer.readback_target(nvmap, kw, kh) else { return };
+        let Some(nvmap) = mappings.nvmap_id_for(src_gpu) else {
+            return;
+        };
+        let Some((src_cpu, limit)) = mappings.cpu_range_for(src_gpu) else {
+            return;
+        };
+        let Some((kw, kh)) = renderer.rt_key_for_nvmap(nvmap, self.src_width, self.src_height)
+        else {
+            return;
+        };
+        let Some(mut rgba) = renderer.readback_target(nvmap, kw, kh) else {
+            return;
+        };
         let width_bytes = (kw as usize) * 4;
         let bh_log2 = ((self.src_block_size >> 4) & 0xF) as u32;
         if kh >= 2 && rgba.len() >= width_bytes * kh as usize {
@@ -153,8 +164,15 @@ impl MaxwellDma {
             }
         }
         let tiled = swizzle_block_linear(
-            &rgba, width_bytes, kh as usize, width_bytes,
-            width_bytes, kh as usize, bh_log2, 0, 0,
+            &rgba,
+            width_bytes,
+            kh as usize,
+            width_bytes,
+            width_bytes,
+            kh as usize,
+            bh_log2,
+            0,
+            0,
         );
         let n = tiled.len().min(limit as usize);
         mem_write(src_cpu, &tiled[..n]);
@@ -189,14 +207,25 @@ impl MaxwellDma {
         let dst_limit = dst_limit as usize;
 
         let line_length_units = self.line_length_in as usize;
-        let line_count = if multi_line { self.line_count.max(1) as usize } else { 1 };
+        let line_count = if multi_line {
+            self.line_count.max(1) as usize
+        } else {
+            1
+        };
 
         if line_length_units == 0 {
             return;
         }
 
-        let (component_size, num_src_components, num_dst_components,
-             dst_x_sel, dst_y_sel, dst_z_sel, dst_w_sel) = if remap_enable {
+        let (
+            component_size,
+            num_src_components,
+            num_dst_components,
+            dst_x_sel,
+            dst_y_sel,
+            dst_z_sel,
+            dst_w_sel,
+        ) = if remap_enable {
             (
                 ((self.remap_components >> 16) & 0x3) as usize + 1,
                 ((self.remap_components >> 20) & 0x3) as usize + 1,
@@ -239,26 +268,64 @@ impl MaxwellDma {
         match (src_layout, dst_layout) {
             (LAYOUT_PITCH, LAYOUT_BLOCK_LINEAR) => {
                 self.blit_pitch_to_block(
-                    src_cpu, dst_cpu, dst_limit, dst_gpu, mappings,
-                    line_length_src, line_length_dst, line_count,
-                    remap_enable, component_size, num_src_components, num_dst_components,
+                    src_cpu,
+                    dst_cpu,
+                    dst_limit,
+                    dst_gpu,
+                    mappings,
+                    line_length_src,
+                    line_length_dst,
+                    line_count,
+                    remap_enable,
+                    component_size,
+                    num_src_components,
+                    num_dst_components,
                     [dst_x_sel, dst_y_sel, dst_z_sel, dst_w_sel],
                     bytes_per_element,
-                    mem_read, mem_write,
+                    mem_read,
+                    mem_write,
                 );
-                let dst_w = if self.dst_width != 0 { (self.dst_width as usize) * bytes_per_element.max(1) } else { line_length_dst };
-                let dst_h = if self.dst_height != 0 { self.dst_height as usize } else { line_count };
+                let dst_w = if self.dst_width != 0 {
+                    (self.dst_width as usize) * bytes_per_element.max(1)
+                } else {
+                    line_length_dst
+                };
+                let dst_h = if self.dst_height != 0 {
+                    self.dst_height as usize
+                } else {
+                    line_count
+                };
                 let bh = ((self.dst_block_size >> 4) & 0xF) as u32;
-                nexium_gpu::tex_invalidate::bump_region(dst_gpu, tiled_size_bytes(dst_w, dst_h, bh) as u64);
+                nexium_gpu::tex_invalidate::bump_region(
+                    dst_gpu,
+                    tiled_size_bytes(dst_w, dst_h, bh) as u64,
+                );
             }
             (LAYOUT_BLOCK_LINEAR, LAYOUT_PITCH) => {
                 nexium_gpu::pitch_oracle::record_pitch_dst(dst_gpu);
-                self.blit_block_to_pitch(src_cpu, dst_cpu, dst_limit, line_length_src, line_count, bytes_per_element, mem_read, mem_write);
+                self.blit_block_to_pitch(
+                    src_cpu,
+                    dst_cpu,
+                    dst_limit,
+                    line_length_src,
+                    line_count,
+                    bytes_per_element,
+                    mem_read,
+                    mem_write,
+                );
                 let dst_pitch = self.pitch_out.max(line_length_src as u32) as usize;
                 nexium_gpu::tex_invalidate::bump_region(dst_gpu, (dst_pitch * line_count) as u64);
             }
             (LAYOUT_PITCH, LAYOUT_PITCH) => {
-                self.blit_pitch_to_pitch(src_cpu, dst_cpu, dst_limit, line_length_src, line_count, mem_read, mem_write);
+                self.blit_pitch_to_pitch(
+                    src_cpu,
+                    dst_cpu,
+                    dst_limit,
+                    line_length_src,
+                    line_count,
+                    mem_read,
+                    mem_write,
+                );
                 let dst_pitch = self.pitch_out.max(line_length_src as u32) as usize;
                 nexium_gpu::tex_invalidate::bump_region(dst_gpu, (dst_pitch * line_count) as u64);
             }
@@ -311,7 +378,8 @@ impl MaxwellDma {
                         5 => &const_b[..component_size.min(4)],
                         _ => continue,
                     };
-                    out[dst_byte_off..dst_byte_off + component_size].copy_from_slice(&src_slice[..component_size]);
+                    out[dst_byte_off..dst_byte_off + component_size]
+                        .copy_from_slice(&src_slice[..component_size]);
                 }
             }
         }
@@ -333,11 +401,15 @@ impl MaxwellDma {
         let mut row = vec![0u8; line_length];
         for y in 0..line_count {
             let dst_row_off = y * dst_pitch;
-            if dst_row_off >= dst_limit { break; }
+            if dst_row_off >= dst_limit {
+                break;
+            }
             let n = line_length.min(dst_limit - dst_row_off);
             let src_off = src_cpu + (y * src_pitch) as u64;
             let dst_off = dst_cpu + dst_row_off as u64;
-            if !mem_read(src_off, &mut row) { break; }
+            if !mem_read(src_off, &mut row) {
+                break;
+            }
             mem_write(dst_off, &row[..n]);
         }
     }
@@ -399,7 +471,11 @@ impl MaxwellDma {
         } else {
             linear_src
         };
-        let post_remap_pitch = if remap_enable { line_length_dst } else { src_pitch };
+        let post_remap_pitch = if remap_enable {
+            line_length_dst
+        } else {
+            src_pitch
+        };
         let tiled = swizzle_block_linear(
             &post_remap,
             line_length_dst,
@@ -457,7 +533,8 @@ impl MaxwellDma {
             } else {
                 line_count
             };
-            let tiled_size_dbg = tiled_size_bytes(src_width_bytes_dbg, src_height_dbg, block_height_log2_dbg);
+            let tiled_size_dbg =
+                tiled_size_bytes(src_width_bytes_dbg, src_height_dbg, block_height_log2_dbg);
             let remap_comp_size = ((self.remap_components >> 16) & 0x3) as usize + 1;
             let remap_n_src = ((self.remap_components >> 20) & 0x3) as usize + 1;
             let remap_n_dst = ((self.remap_components >> 24) & 0x3) as usize + 1;
@@ -466,10 +543,19 @@ impl MaxwellDma {
                  line_length={} line_count={} src_block_size={:#x} \
                  remap_components={:#x} remap_comp_size={} remap_n_src={} remap_n_dst={} \
                  src_width_bytes_used={} src_height_used={} bh_log2={} tiled_size_bytes={}",
-                self.src_width, self.src_height,
-                line_length, line_count, self.src_block_size,
-                self.remap_components, remap_comp_size, remap_n_src, remap_n_dst,
-                src_width_bytes_dbg, src_height_dbg, block_height_log2_dbg, tiled_size_dbg,
+                self.src_width,
+                self.src_height,
+                line_length,
+                line_count,
+                self.src_block_size,
+                self.remap_components,
+                remap_comp_size,
+                remap_n_src,
+                remap_n_dst,
+                src_width_bytes_dbg,
+                src_height_dbg,
+                block_height_log2_dbg,
+                tiled_size_dbg,
             );
         }
         self.blit_dst_by_src.insert(src_cpu, dst_cpu);
@@ -501,7 +587,9 @@ impl MaxwellDma {
         );
         for y in 0..line_count {
             let off = y * dst_pitch;
-            if off >= dst_limit { break; }
+            if off >= dst_limit {
+                break;
+            }
             let n = line_length.min(dst_limit - off);
             mem_write(dst_cpu + off as u64, &linear[off..off + n]);
         }
@@ -521,11 +609,7 @@ pub(super) fn tiled_size_bytes(width_bytes: usize, height: usize, block_height_l
 }
 
 fn in_gob_offset(x: usize, y: usize) -> usize {
-    ((x >> 5) & 1) * 256
-        + ((y >> 1) & 3) * 64
-        + ((x >> 4) & 1) * 32
-        + (y & 1) * 16
-        + (x & 15)
+    ((x >> 5) & 1) * 256 + ((y >> 1) & 3) * 64 + ((x >> 4) & 1) * 32 + (y & 1) * 16 + (x & 15)
 }
 
 pub(super) fn swizzle_block_linear(
@@ -557,9 +641,8 @@ pub(super) fn swizzle_block_linear(
             let dst_byte_x = origin_x + x;
             let gob_col = dst_byte_x / GOB_W;
             let x_in_gob = dst_byte_x - gob_col * GOB_W;
-            let gob_offset = block_row_off
-                + gob_col * block_height * GOB_SIZE
-                + gob_row_in_block * GOB_SIZE;
+            let gob_offset =
+                block_row_off + gob_col * block_height * GOB_SIZE + gob_row_in_block * GOB_SIZE;
             let dst_off = gob_offset + in_gob_offset(x_in_gob, y_in_gob);
             let src_off = src_row_off + x;
             if dst_off < dst.len() && src_off < src_linear.len() {
@@ -598,9 +681,8 @@ fn unswizzle_block_linear_bytes(
             let src_byte_x = origin_x + x;
             let gob_col = src_byte_x / GOB_W;
             let x_in_gob = src_byte_x - gob_col * GOB_W;
-            let gob_offset = block_row_off
-                + gob_col * block_height * GOB_SIZE
-                + gob_row_in_block * GOB_SIZE;
+            let gob_offset =
+                block_row_off + gob_col * block_height * GOB_SIZE + gob_row_in_block * GOB_SIZE;
             let src_off = gob_offset + in_gob_offset(x_in_gob, y_in_gob);
             let dst_off = dst_row_off + x;
             if src_off < src_tiled.len() && dst_off < dst.len() {

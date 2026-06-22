@@ -1,12 +1,11 @@
-
-
-use super::operand::{cbuf, fmt_cbuf, fmt_reg, imm20, imm32, ldc_ref, ldc_src_reg, reg_a, reg_b, reg_c, reg_dest};
 use super::opcodes::Opcode;
+use super::operand::{
+    cbuf, fmt_cbuf, fmt_reg, imm20, imm32, ldc_ref, ldc_src_reg, reg_a, reg_b, reg_c, reg_dest,
+};
 
 pub fn pretty_operands(opcode: Opcode, insn: u64) -> Option<String> {
     use Opcode::*;
     match opcode {
-
         FMUL_reg | FADD_reg | IADD_reg | IMUL_reg | LOP_reg | SHL_reg | SHR_reg => Some(format!(
             "{}, {}, {}",
             fmt_reg(reg_dest(insn)),
@@ -50,7 +49,7 @@ pub fn pretty_operands(opcode: Opcode, insn: u64) -> Option<String> {
             "{}, {}, {}, {}",
             fmt_reg(reg_dest(insn)),
             fmt_reg(reg_a(insn)),
-            fmt_reg(reg_b(insn)),
+            fmt_reg(reg_c(insn)),
             fmt_cbuf(cbuf(insn))
         )),
         FFMA_imm => Some(format!(
@@ -61,8 +60,16 @@ pub fn pretty_operands(opcode: Opcode, insn: u64) -> Option<String> {
             fmt_reg(reg_c(insn))
         )),
 
-        MOV_reg => Some(format!("{}, {}", fmt_reg(reg_dest(insn)), fmt_reg(reg_b(insn)))),
-        MOV_cbuf => Some(format!("{}, {}", fmt_reg(reg_dest(insn)), fmt_cbuf(cbuf(insn)))),
+        MOV_reg => Some(format!(
+            "{}, {}",
+            fmt_reg(reg_dest(insn)),
+            fmt_reg(reg_b(insn))
+        )),
+        MOV_cbuf => Some(format!(
+            "{}, {}",
+            fmt_reg(reg_dest(insn)),
+            fmt_cbuf(cbuf(insn))
+        )),
         MOV_imm => Some(format!("{}, {:#x}", fmt_reg(reg_dest(insn)), imm20(insn))),
         MOV32I => Some(format!(
             "{}, {:#010x}",

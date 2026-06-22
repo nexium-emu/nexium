@@ -69,7 +69,9 @@ impl BufferQueue {
     }
 
     pub fn request_buffer(&self, slot: u32) -> Option<&GraphicBuffer> {
-        self.slots.get(slot as usize).and_then(|s| s.buffer.as_ref())
+        self.slots
+            .get(slot as usize)
+            .and_then(|s| s.buffer.as_ref())
     }
 
     pub fn dequeue(&mut self) -> u32 {

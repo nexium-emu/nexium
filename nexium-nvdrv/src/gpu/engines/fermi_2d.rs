@@ -91,7 +91,9 @@ pub struct Fermi2D {
 }
 
 impl Fermi2D {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn dispatch_method(
         &mut self,
@@ -171,32 +173,48 @@ impl Fermi2D {
         let dst_y0 = self.dst_y0.max(0) as usize;
         let blit_w = self.dst_width_blit.max(0) as usize;
         let blit_h = self.dst_height_blit.max(0) as usize;
-        if blit_w == 0 || blit_h == 0 { return; }
+        if blit_w == 0 || blit_h == 0 {
+            return;
+        }
 
         let src_layout = self.src.memory_layout;
         let dst_layout = self.dst.memory_layout;
 
         match (src_layout, dst_layout) {
             (MEMORY_LAYOUT_PITCH, MEMORY_LAYOUT_BLOCK_LINEAR) => {
-                self.blit_pitch_to_block(src_cpu, dst_cpu, bpp, dst_x0, dst_y0, blit_w, blit_h, mem_read, mem_write);
+                self.blit_pitch_to_block(
+                    src_cpu, dst_cpu, bpp, dst_x0, dst_y0, blit_w, blit_h, mem_read, mem_write,
+                );
             }
             (MEMORY_LAYOUT_BLOCK_LINEAR, MEMORY_LAYOUT_PITCH) => {
-                self.blit_block_to_pitch(src_cpu, dst_cpu, bpp, dst_x0, dst_y0, blit_w, blit_h, mem_read, mem_write);
+                self.blit_block_to_pitch(
+                    src_cpu, dst_cpu, bpp, dst_x0, dst_y0, blit_w, blit_h, mem_read, mem_write,
+                );
             }
             (MEMORY_LAYOUT_PITCH, MEMORY_LAYOUT_PITCH) => {
-                self.blit_pitch_to_pitch(src_cpu, dst_cpu, bpp, dst_x0, dst_y0, blit_w, blit_h, mem_read, mem_write);
+                self.blit_pitch_to_pitch(
+                    src_cpu, dst_cpu, bpp, dst_x0, dst_y0, blit_w, blit_h, mem_read, mem_write,
+                );
             }
             (MEMORY_LAYOUT_BLOCK_LINEAR, MEMORY_LAYOUT_BLOCK_LINEAR) => {
                 log::trace!("Fermi2D: block→block blit not supported (skipping)");
             }
             _ => {
-                log::trace!("Fermi2D: unknown layout combo src={} dst={}", src_layout, dst_layout);
+                log::trace!(
+                    "Fermi2D: unknown layout combo src={} dst={}",
+                    src_layout,
+                    dst_layout
+                );
             }
         }
         self.blit_count = self.blit_count.wrapping_add(1);
 
         let bump_size = if dst_layout == MEMORY_LAYOUT_BLOCK_LINEAR {
-            tiled_size_bytes((self.dst.width as usize) * bpp, self.dst.height as usize, self.dst.block_height_log2()) as u64
+            tiled_size_bytes(
+                (self.dst.width as usize) * bpp,
+                self.dst.height as usize,
+                self.dst.block_height_log2(),
+            ) as u64
         } else {
             let dst_pitch = self.dst.pitch.max(self.dst.width.max(1) * bpp as u32) as u64;
             dst_pitch * (self.dst.height.max(1) as u64)
@@ -207,7 +225,10 @@ impl Fermi2D {
             && self.dst.width >= 320
             && self.dst.height >= 240
             && self.dst.pitch >= self.dst.width * (bpp as u32)
-            && matches!(self.dst.format, FMT_A8R8G8B8 | FMT_A8B8G8R8 | FMT_X8R8G8B8 | FMT_X8B8G8R8);
+            && matches!(
+                self.dst.format,
+                FMT_A8R8G8B8 | FMT_A8B8G8R8 | FMT_X8R8G8B8 | FMT_X8B8G8R8
+            );
         if framebuffer_like {
             self.try_publish_frame(dst_cpu, bpp, mem_read);
         }
@@ -223,7 +244,9 @@ impl Fermi2D {
         let h = self.dst.height as usize;
         let row_bytes = w * bpp;
         let total = h * row_bytes;
-        if total == 0 { return; }
+        if total == 0 {
+            return;
+        }
         let mut pixels = vec![0u8; total];
         let pitch = self.dst.pitch as usize;
         for y in 0..h {
@@ -248,14 +271,28 @@ impl Fermi2D {
         for px in rgba.chunks_exact_mut(4) {
             px[3] = 0xFF;
         }
-        let rgb_nz = rgba.chunks_exact(4).filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0).count();
+        let rgb_nz = rgba
+            .chunks_exact(4)
+            .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
+            .count();
         log::info!(
             "Fermi2D::publish_frame dst_cpu={:#x} {}x{} pitch={} fmt={:#x} rgb_nz={}",
-            dst_cpu, w, h, pitch, self.dst.format, rgb_nz
+            dst_cpu,
+            w,
+            h,
+            pitch,
+            self.dst.format,
+            rgb_nz
         );
         let mut q = self.captured_frames.lock().unwrap();
-        if q.len() >= 2 { q.remove(0); }
-        q.push(QueuedFrame { width: w as u32, height: h as u32, pixels: rgba });
+        if q.len() >= 2 {
+            q.remove(0);
+        }
+        q.push(QueuedFrame {
+            width: w as u32,
+            height: h as u32,
+            pixels: rgba,
+        });
     }
 
     fn blit_pitch_to_pitch(
@@ -272,12 +309,17 @@ impl Fermi2D {
     ) {
         let row_bytes = w * bpp;
         let src_pitch = self.src.pitch.max(row_bytes as u32) as usize;
-        let dst_pitch = self.dst.pitch.max((dst_x0 as u32 + w as u32).saturating_mul(bpp as u32)) as usize;
+        let dst_pitch =
+            self.dst
+                .pitch
+                .max((dst_x0 as u32 + w as u32).saturating_mul(bpp as u32)) as usize;
         let mut row = vec![0u8; row_bytes];
         for y in 0..h {
             let src_off = src_cpu + (y * src_pitch) as u64;
             let dst_off = dst_cpu + ((dst_y0 + y) * dst_pitch + dst_x0 * bpp) as u64;
-            if !mem_read(src_off, &mut row) { break; }
+            if !mem_read(src_off, &mut row) {
+                break;
+            }
             mem_write(dst_off, &row);
         }
     }
@@ -304,11 +346,14 @@ impl Fermi2D {
         let mut row = vec![0u8; w * bpp];
         for y in 0..h {
             let src_off = src_cpu + (y * src_pitch) as u64;
-            if !mem_read(src_off, &mut row) { break; }
+            if !mem_read(src_off, &mut row) {
+                break;
+            }
             let dst_y = dst_y0 + y;
             for x in 0..w {
                 let dst_byte_x = (dst_x0 + x) * bpp;
-                let off = block_linear_offset(dst_byte_x, dst_y, dst_width_bytes, block_height_log2);
+                let off =
+                    block_linear_offset(dst_byte_x, dst_y, dst_width_bytes, block_height_log2);
                 if off + bpp <= tiled.len() {
                     tiled[off..off + bpp].copy_from_slice(&row[x * bpp..x * bpp + bpp]);
                 }
@@ -363,7 +408,12 @@ fn tiled_size_bytes(width_bytes: usize, height: usize, block_height_log2: u32) -
     gobs_per_row * block_rows * block_height * GOB_SIZE
 }
 
-fn block_linear_offset(byte_x: usize, y: usize, width_bytes: usize, block_height_log2: u32) -> usize {
+fn block_linear_offset(
+    byte_x: usize,
+    y: usize,
+    width_bytes: usize,
+    block_height_log2: u32,
+) -> usize {
     let block_height = 1usize << block_height_log2;
     let rows_per_block = block_height * GOB_H;
     let gobs_per_row = (width_bytes + GOB_W - 1) / GOB_W;
@@ -378,5 +428,8 @@ fn block_linear_offset(byte_x: usize, y: usize, width_bytes: usize, block_height
         | ((y_in_gob & 0x01) << 4)
         | ((x_in_gob & 0x30) << 1)
         | ((y_in_gob & 0x06) << 6);
-    block_y * block_row_stride + gob_col * block_height * GOB_SIZE + gob_row_in_block * GOB_SIZE + in_gob
+    block_y * block_row_stride
+        + gob_col * block_height * GOB_SIZE
+        + gob_row_in_block * GOB_SIZE
+        + in_gob
 }

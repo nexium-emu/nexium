@@ -65,7 +65,11 @@ fn hle_macro(hash: u64, params: &[u32]) -> Option<Vec<(u32, u32)>> {
             w.push((REG_INDEX_COUNT, index_count));
         }
         0x6C97_861D_891E_DF7E | 0xD246_FDDF_3A61_73D7 => {
-            let size = if hash == 0x6C97_861D_891E_DF7E { 0x5F00 } else { 0x7000 };
+            let size = if hash == 0x6C97_861D_891E_DF7E {
+                0x5F00
+            } else {
+                0x7000
+            };
             w.push((REG_CB_SIZE, size));
             w.push((REG_CB_ADDR_HI, p(0)));
             w.push((REG_CB_ADDR_LO, p(1)));
@@ -139,17 +143,30 @@ impl ResultOperation {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AluOp {
-    Add, AddWithCarry, Subtract, SubtractWithBorrow,
-    Xor, Or, And, AndNot, Nand, Unknown,
+    Add,
+    AddWithCarry,
+    Subtract,
+    SubtractWithBorrow,
+    Xor,
+    Or,
+    And,
+    AndNot,
+    Nand,
+    Unknown,
 }
 
 impl AluOp {
     fn from_u32(v: u32) -> Self {
         match v & 0x1F {
-            0 => Self::Add, 1 => Self::AddWithCarry,
-            2 => Self::Subtract, 3 => Self::SubtractWithBorrow,
-            8 => Self::Xor, 9 => Self::Or,
-            10 => Self::And, 11 => Self::AndNot, 12 => Self::Nand,
+            0 => Self::Add,
+            1 => Self::AddWithCarry,
+            2 => Self::Subtract,
+            3 => Self::SubtractWithBorrow,
+            8 => Self::Xor,
+            9 => Self::Or,
+            10 => Self::And,
+            11 => Self::AndNot,
+            12 => Self::Nand,
             _ => Self::Unknown,
         }
     }
@@ -159,27 +176,61 @@ impl AluOp {
 struct Opcode(u32);
 
 impl Opcode {
-    fn operation(self) -> Operation { Operation::from_u32(self.0 & 0x7) }
-    fn result_operation(self) -> ResultOperation { ResultOperation::from_u32((self.0 >> 4) & 0x7) }
-    fn branch_zero(self) -> bool { (self.0 >> 4) & 0x1 == 0 }
-    fn branch_annul(self) -> bool { (self.0 >> 5) & 0x1 != 0 }
-    fn is_exit(self) -> bool { (self.0 >> 7) & 0x1 != 0 }
-    fn dst(self) -> u32 { (self.0 >> 8) & 0x7 }
-    fn src_a(self) -> u32 { (self.0 >> 11) & 0x7 }
-    fn src_b(self) -> u32 { (self.0 >> 14) & 0x7 }
+    fn operation(self) -> Operation {
+        Operation::from_u32(self.0 & 0x7)
+    }
+    fn result_operation(self) -> ResultOperation {
+        ResultOperation::from_u32((self.0 >> 4) & 0x7)
+    }
+    fn branch_zero(self) -> bool {
+        (self.0 >> 4) & 0x1 == 0
+    }
+    fn branch_annul(self) -> bool {
+        (self.0 >> 5) & 0x1 != 0
+    }
+    fn is_exit(self) -> bool {
+        (self.0 >> 7) & 0x1 != 0
+    }
+    fn dst(self) -> u32 {
+        (self.0 >> 8) & 0x7
+    }
+    fn src_a(self) -> u32 {
+        (self.0 >> 11) & 0x7
+    }
+    fn src_b(self) -> u32 {
+        (self.0 >> 14) & 0x7
+    }
     fn immediate(self) -> i32 {
         let raw = self.0 >> 14;
-        if raw & 0x2_0000 != 0 { (raw | 0xFFFC_0000) as i32 } else { raw as i32 }
+        if raw & 0x2_0000 != 0 {
+            (raw | 0xFFFC_0000) as i32
+        } else {
+            raw as i32
+        }
     }
-    fn alu_op(self) -> AluOp { AluOp::from_u32((self.0 >> 17) & 0x1F) }
-    fn bf_src_bit(self) -> u32 { (self.0 >> 17) & 0x1F }
-    fn bf_size(self) -> u32 { (self.0 >> 22) & 0x1F }
-    fn bf_dst_bit(self) -> u32 { (self.0 >> 27) & 0x1F }
+    fn alu_op(self) -> AluOp {
+        AluOp::from_u32((self.0 >> 17) & 0x1F)
+    }
+    fn bf_src_bit(self) -> u32 {
+        (self.0 >> 17) & 0x1F
+    }
+    fn bf_size(self) -> u32 {
+        (self.0 >> 22) & 0x1F
+    }
+    fn bf_dst_bit(self) -> u32 {
+        (self.0 >> 27) & 0x1F
+    }
     fn bitfield_mask(self) -> u32 {
         let size = self.bf_size();
-        if size >= 32 { 0xFFFF_FFFF } else { (1u32 << size) - 1 }
+        if size >= 32 {
+            0xFFFF_FFFF
+        } else {
+            (1u32 << size) - 1
+        }
     }
-    fn branch_target(self) -> i32 { self.immediate().wrapping_mul(4) }
+    fn branch_target(self) -> i32 {
+        self.immediate().wrapping_mul(4)
+    }
 }
 
 #[derive(Default)]
@@ -219,7 +270,10 @@ impl MacroEngine {
     }
 
     pub fn upload_instruction(&mut self, word: u32) {
-        self.uploaded_code.entry(self.instruction_ptr).or_default().push(word);
+        self.uploaded_code
+            .entry(self.instruction_ptr)
+            .or_default()
+            .push(word);
     }
 
     pub fn set_start_address_ptr(&mut self, value: u32) {
@@ -255,22 +309,36 @@ impl MacroEngine {
         let params = std::mem::take(&mut self.pending_params);
         let code = self.resolve_code(offset);
         if code.is_empty() {
-            log::trace!("MME: trigger {:#x} entry={} offset={} - no code", trigger, entry, offset);
+            log::trace!(
+                "MME: trigger {:#x} entry={} offset={} - no code",
+                trigger,
+                entry,
+                offset
+            );
             return Some(MacroOutput::default());
         }
         let hash = macro_hash(&code);
         let hle = hle_macro(hash, &params);
         if self.seen_hashes.insert(hash) {
-            log::info!("MME: macro entry={} offset={} hash={:#018x} len={} params={} hle={} code={:08x?}",
-                entry, offset, hash, code.len(), params.len(), hle.is_some(),
-                &code[..code.len().min(28)]);
+            log::info!(
+                "MME: macro entry={} offset={} hash={:#018x} len={} params={} hle={} code={:08x?}",
+                entry,
+                offset,
+                hash,
+                code.len(),
+                params.len(),
+                hle.is_some(),
+                &code[..code.len().min(28)]
+            );
         }
         if let Some(writes) = hle {
             return Some(MacroOutput { writes });
         }
         let mut interp = Interpreter::new(&code, &params, reg_reader);
         interp.run();
-        Some(MacroOutput { writes: interp.writes })
+        Some(MacroOutput {
+            writes: interp.writes,
+        })
     }
 
     fn resolve_code(&mut self, offset: u32) -> Vec<u32> {
@@ -299,7 +367,9 @@ impl MacroEngine {
 }
 
 impl Default for MacroEngine {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 struct Interpreter<'a> {
@@ -324,10 +394,17 @@ impl<'a> Interpreter<'a> {
             regs[1] = params[0];
         }
         Self {
-            code, params, next_param: 1,
-            registers: regs, pc: 0, delayed_pc: None,
-            method_address: 0, carry: false,
-            writes: Vec::new(), written: HashMap::new(), reg_reader,
+            code,
+            params,
+            next_param: 1,
+            registers: regs,
+            pc: 0,
+            delayed_pc: None,
+            method_address: 0,
+            carry: false,
+            writes: Vec::new(),
+            written: HashMap::new(),
+            reg_reader,
             steps_remaining: 8192,
         }
     }
@@ -342,7 +419,10 @@ impl<'a> Interpreter<'a> {
             }
         }
         if !exited {
-            log::warn!("MME: macro hit step cap (produced {} writes) — discarding as runaway", self.writes.len());
+            log::warn!(
+                "MME: macro hit step cap (produced {} writes) — discarding as runaway",
+                self.writes.len()
+            );
             self.writes.clear();
         }
     }
@@ -352,11 +432,17 @@ impl<'a> Interpreter<'a> {
     }
 
     fn read_reg(&self, id: u32) -> u32 {
-        if id == 0 { 0 } else { self.registers[id as usize & 7] }
+        if id == 0 {
+            0
+        } else {
+            self.registers[id as usize & 7]
+        }
     }
 
     fn write_reg(&mut self, id: u32, value: u32) {
-        if id == 0 { return; }
+        if id == 0 {
+            return;
+        }
         self.registers[id as usize & 7] = value;
     }
 
@@ -399,7 +485,9 @@ impl<'a> Interpreter<'a> {
                 r as u32
             }
             AluOp::SubtractWithBorrow => {
-                let r = (a as u64).wrapping_sub(b as u64).wrapping_sub(if self.carry { 0 } else { 1 });
+                let r = (a as u64)
+                    .wrapping_sub(b as u64)
+                    .wrapping_sub(if self.carry { 0 } else { 1 });
                 self.carry = r < 0x1_0000_0000_u64;
                 r as u32
             }
@@ -500,8 +588,14 @@ impl<'a> Interpreter<'a> {
                 self.process_result(op.result_operation(), op.dst(), r);
             }
             Operation::Read => {
-                let addr = self.read_reg(op.src_a()).wrapping_add(op.immediate() as u32);
-                let v = self.written.get(&addr).copied().unwrap_or_else(|| (self.reg_reader)(addr));
+                let addr = self
+                    .read_reg(op.src_a())
+                    .wrapping_add(op.immediate() as u32);
+                let v = self
+                    .written
+                    .get(&addr)
+                    .copied()
+                    .unwrap_or_else(|| (self.reg_reader)(addr));
                 self.process_result(op.result_operation(), op.dst(), v);
             }
             Operation::Branch => {

@@ -46,13 +46,54 @@ impl RtCache {
         self.drawn_stamp.insert(key, self.drawn_counter);
     }
 
-    pub fn find_color_screen(&self, want: RtKey) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
+    pub fn resolve_present_key(&self, want: RtKey) -> Option<RtKey> {
+        let mut best: Option<(RtKey, u64)> = None;
+        for k in self.cache.keys() {
+            if k.width != want.width || k.height != want.height {
+                continue;
+            }
+            let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+                continue;
+            };
+            let replace = match best {
+                Some((best_key, best_stamp)) => {
+                    stamp > best_stamp || (stamp == best_stamp && *k == want && best_key != want)
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((*k, stamp));
+            }
+        }
+        best.map(|(k, _)| k)
+            .or_else(|| self.cache.contains_key(&want).then_some(want))
+    }
+
+    pub fn present_candidates(&self, want: RtKey) -> Vec<(RtKey, u64)> {
+        let mut out = Vec::new();
+        for k in self.cache.keys() {
+            if k.width != want.width || k.height != want.height {
+                continue;
+            }
+            let stamp = self.drawn_stamp.get(k).copied().unwrap_or(0);
+            out.push((*k, stamp));
+        }
+        out.sort_by_key(|(_, stamp)| *stamp);
+        out
+    }
+
+    pub fn find_color_screen(
+        &self,
+        want: RtKey,
+    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
         let mut best: Option<(RtKey, &GpuImage, u64)> = None;
         for (k, img) in &self.cache {
             if k.nvmap_id == want.nvmap_id || k.width != want.width || k.height != want.height {
                 continue;
             }
-            let Some(stamp) = self.drawn_stamp.get(k).copied() else { continue };
+            let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+                continue;
+            };
             if best.as_ref().map_or(true, |(_, _, bs)| stamp > *bs) {
                 best = Some((*k, img, stamp));
             }
@@ -94,7 +135,10 @@ impl RtCache {
         Ok(self.depth_cache.get_mut(&key).unwrap())
     }
 
-    pub fn find_color(&self, want: RtKey) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
+    pub fn find_color(
+        &self,
+        want: RtKey,
+    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
         if let Some(img) = self.cache.get(&want) {
             return Some((want, img.image, img.view, img.layout));
         }
@@ -149,13 +193,20 @@ impl RtCache {
         usage: vk::ImageUsageFlags,
         aspect: vk::ImageAspectFlags,
     ) -> Result<GpuImage, String> {
-        let extent = vk::Extent2D { width: key.width, height: key.height };
+        let extent = vk::Extent2D {
+            width: key.width,
+            height: key.height,
+        };
 
         let image_info = vk::ImageCreateInfo {
             s_type: vk::StructureType::IMAGE_CREATE_INFO,
             image_type: vk::ImageType::TYPE_2D,
             format,
-            extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
+            extent: vk::Extent3D {
+                width: key.width,
+                height: key.height,
+                depth: 1,
+            },
             mip_levels: 1,
             array_layers: 1,
             samples: vk::SampleCountFlags::TYPE_1,
@@ -171,18 +222,21 @@ impl RtCache {
         };
 
         let image = unsafe {
-            device.create_image(&image_info, None)
+            device
+                .create_image(&image_info, None)
                 .map_err(|e| format!("create_image: {:?}", e))?
         };
 
         let req = unsafe { device.get_image_memory_requirements(image) };
-        let mem_props = self.mem_properties
+        let mem_props = self
+            .mem_properties
             .ok_or_else(|| "RtCache: memory properties not set".to_string())?;
         let mem_type = find_memory_type(
             &mem_props,
             req.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        ).ok_or_else(|| "RtCache: no suitable DEVICE_LOCAL memory type".to_string())?;
+        )
+        .ok_or_else(|| "RtCache: no suitable DEVICE_LOCAL memory type".to_string())?;
 
         let alloc_info = vk::MemoryAllocateInfo {
             s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
@@ -192,11 +246,13 @@ impl RtCache {
             _marker: std::marker::PhantomData,
         };
         let memory = unsafe {
-            device.allocate_memory(&alloc_info, None)
+            device
+                .allocate_memory(&alloc_info, None)
                 .map_err(|e| format!("allocate_memory: {:?}", e))?
         };
         unsafe {
-            device.bind_image_memory(image, memory, 0)
+            device
+                .bind_image_memory(image, memory, 0)
                 .map_err(|e| format!("bind_image_memory: {:?}", e))?;
         }
 
@@ -218,7 +274,8 @@ impl RtCache {
             _marker: std::marker::PhantomData,
         };
         let view = unsafe {
-            device.create_image_view(&view_info, None)
+            device
+                .create_image_view(&view_info, None)
                 .map_err(|e| format!("create_image_view: {:?}", e))?
         };
 
@@ -260,7 +317,10 @@ pub fn find_memory_type(
 impl Drop for RtCache {
     fn drop(&mut self) {
         if !self.cache.is_empty() {
-            log::warn!("RtCache dropped with {} images still cached", self.cache.len());
+            log::warn!(
+                "RtCache dropped with {} images still cached",
+                self.cache.len()
+            );
         }
     }
 }

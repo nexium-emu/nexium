@@ -1,5 +1,5 @@
-use ash::vk;
 use crate::rt_cache::RtKey;
+use ash::vk;
 
 #[derive(Clone, Copy, Debug)]
 pub struct VertexAttr {
@@ -58,6 +58,9 @@ pub struct BlendState {
     pub src_factor: vk::BlendFactor,
     pub dst_factor: vk::BlendFactor,
     pub op: vk::BlendOp,
+    pub src_alpha_factor: vk::BlendFactor,
+    pub dst_alpha_factor: vk::BlendFactor,
+    pub alpha_op: vk::BlendOp,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -86,14 +89,19 @@ pub struct Maxwell3dDrawCall {
     pub index_count: Option<u32>,
     pub index_type: vk::IndexType,
     pub index_data: Option<Vec<u8>>,
+    pub quad_expand: bool,
     pub rt_key: RtKey,
     pub rt_format: vk::Format,
     pub vp_rect: Option<[f32; 4]>,
+    pub scissor: Option<[i32; 4]>,
     pub state: DrawState,
     pub blend: BlendState,
     pub depth: DepthState,
+    pub depth_clamp_enabled: bool,
     pub depth_key: Option<RtKey>,
     pub sampled_rt_key: Option<RtKey>,
+    pub sampled_rt_keys: Vec<RtKey>,
+    pub sampled_rt_slots: Vec<Option<RtKey>>,
     pub sampled_rt_fuzzy: bool,
     pub clear: bool,
     pub clear_color: [f32; 4],
@@ -109,4 +117,20 @@ pub struct Maxwell3dDrawCall {
     pub poly_offset_enable: bool,
     pub poly_offset_units: f32,
     pub poly_offset_factor: f32,
+}
+
+pub fn expand_quad_vertices(src: &[u8], stride: usize) -> Vec<u8> {
+    if stride == 0 || src.len() < stride * 4 {
+        return src.to_vec();
+    }
+    let quads = (src.len() / stride) / 4;
+    let mut out = Vec::with_capacity(quads * 6 * stride);
+    for q in 0..quads {
+        let base = q * 4;
+        for &i in &[base, base + 1, base + 2, base, base + 2, base + 3] {
+            let off = i * stride;
+            out.extend_from_slice(&src[off..off + stride]);
+        }
+    }
+    out
 }

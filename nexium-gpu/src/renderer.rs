@@ -41,6 +41,7 @@ struct RendererInner {
     tele_ring_wraps: u64,
     tele_ring_waits: u64,
     tele_in_flight_mask: u32,
+    depth_clamp_supported: bool,
     depth_clip_control_enabled: bool,
 }
 
@@ -49,7 +50,11 @@ struct TexCacheKey {
     gpu_va: u64,
     width: u32,
     height: u32,
+    format: crate::texture::TicFormat,
+    swizzle: [crate::texture::SwizzleSource; 4],
 }
+
+type PendingTexture = (TexCacheKey, crate::texture::TicEntry, usize, usize);
 
 struct CachedTexture {
     image: vk::Image,
@@ -110,8 +115,7 @@ impl Renderer {
         let entry = unsafe { ash::Entry::load() }
             .map_err(|e| format!("Vulkan entry load failed: {:?}", e))?;
 
-        let want_validation =
-            std::env::var("NEXIUM_VK_VALIDATION").ok().as_deref() == Some("1");
+        let want_validation = std::env::var("NEXIUM_VK_VALIDATION").ok().as_deref() == Some("1");
         let validation_layer = c"VK_LAYER_KHRONOS_validation";
         let validation_available = want_validation
             && unsafe { entry.enumerate_instance_layer_properties() }
@@ -129,8 +133,7 @@ impl Renderer {
         }
         let mut layer_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
         let mut ext_ptrs: Vec<*const std::os::raw::c_char> = Vec::new();
-        let want_syncval =
-            std::env::var("NEXIUM_VK_SYNCVAL").ok().as_deref() == Some("1");
+        let want_syncval = std::env::var("NEXIUM_VK_SYNCVAL").ok().as_deref() == Some("1");
         if validation_available {
             layer_ptrs.push(validation_layer.as_ptr());
             ext_ptrs.push(ash::ext::debug_utils::NAME.as_ptr());
@@ -177,7 +180,8 @@ impl Renderer {
             _marker: std::marker::PhantomData,
         };
         let instance = unsafe {
-            entry.create_instance(&inst_info, None)
+            entry
+                .create_instance(&inst_info, None)
                 .map_err(|e| format!("create_instance: {:?}", e))?
         };
 
@@ -218,10 +222,10 @@ impl Renderer {
             .unwrap_or(phys_devices[0]);
 
         let qf = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-        let queue_family = qf
-            .iter()
-            .position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-            .ok_or_else(|| "no graphics queue family".to_string())? as u32;
+        let queue_family =
+            qf.iter()
+                .position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                .ok_or_else(|| "no graphics queue family".to_string())? as u32;
 
         let prio = 1.0f32;
         let queue_info = vk::DeviceQueueCreateInfo {
@@ -302,8 +306,18 @@ impl Renderer {
         } else {
             &mut features_13 as *mut _ as *mut std::ffi::c_void
         };
+        let core_features = unsafe { instance.get_physical_device_features(physical_device) };
+        let depth_clamp_supported = core_features.depth_clamp == vk::TRUE;
+        if !depth_clamp_supported {
+            log::info!("Vulkan depthClamp feature unavailable; Maxwell depth clamp disabled");
+        }
         let enabled_core_features = vk::PhysicalDeviceFeatures {
             robust_buffer_access: vk::TRUE,
+            depth_clamp: if depth_clamp_supported {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
             ..Default::default()
         };
         let dev_info = vk::DeviceCreateInfo {
@@ -321,7 +335,8 @@ impl Renderer {
             ..Default::default()
         };
         let device = unsafe {
-            instance.create_device(physical_device, &dev_info, None)
+            instance
+                .create_device(physical_device, &dev_info, None)
                 .map_err(|e| format!("create_device: {:?}", e))?
         };
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
@@ -335,7 +350,8 @@ impl Renderer {
             _marker: std::marker::PhantomData,
         };
         let cmd_pool = unsafe {
-            device.create_command_pool(&cmd_pool_info, None)
+            device
+                .create_command_pool(&cmd_pool_info, None)
                 .map_err(|e| format!("create_command_pool: {:?}", e))?
         };
 
@@ -345,7 +361,8 @@ impl Renderer {
         let descriptor_layout = DescriptorSetLayout::new(&device)?;
         let descriptor_pool = DescriptorPool::new(&device, 1024)?;
         let shader_compiler = ShaderCompiler::new();
-        let cache_uuid = unsafe { instance.get_physical_device_properties(physical_device) }.pipeline_cache_uuid;
+        let cache_uuid =
+            unsafe { instance.get_physical_device_properties(physical_device) }.pipeline_cache_uuid;
         let device_tag: String = cache_uuid.iter().map(|b| format!("{:02x}", b)).collect();
         let pipeline_cache = PipelineCache::new(&device, descriptor_layout.layout, &device_tag)?;
 
@@ -453,6 +470,7 @@ impl Renderer {
                 tele_ring_wraps: 0,
                 tele_ring_waits: 0,
                 tele_in_flight_mask: 0,
+                depth_clamp_supported,
                 depth_clip_control_enabled: enable_depth_clip_control,
             }),
         });
@@ -469,7 +487,12 @@ impl Renderer {
         if specs.is_empty() {
             return;
         }
-        let RendererInner { device, shader_compiler, pipeline_cache, .. } = &mut *inner;
+        let RendererInner {
+            device,
+            shader_compiler,
+            pipeline_cache,
+            ..
+        } = &mut *inner;
         let mut queued = 0usize;
         for spec in &specs {
             if pipeline_cache.get(&spec.key).is_some() {
@@ -487,7 +510,11 @@ impl Renderer {
             pipeline_cache.queue_build(req);
             queued += 1;
         }
-        log::info!("prewarm: queued {} pipelines from {} cached specs", queued, specs.len());
+        log::info!(
+            "prewarm: queued {} pipelines from {} cached specs",
+            queued,
+            specs.len()
+        );
     }
 
     pub fn clear_target(
@@ -498,8 +525,18 @@ impl Renderer {
         rgba: [f32; 4],
     ) -> Result<(), String> {
         let mut inner = self.inner.lock();
-        let RendererInner { device, queue, rt_cache, utility_slot, .. } = &mut *inner;
-        let key = RtKey { nvmap_id, width, height };
+        let RendererInner {
+            device,
+            queue,
+            rt_cache,
+            utility_slot,
+            ..
+        } = &mut *inner;
+        let key = RtKey {
+            nvmap_id,
+            width,
+            height,
+        };
         let img = rt_cache.get_or_create(key, device)?;
 
         reset_command_buffer(device, utility_slot.cmd)?;
@@ -513,11 +550,16 @@ impl Renderer {
             _marker: std::marker::PhantomData,
         };
         unsafe {
-            device.begin_command_buffer(cmd, &begin)
+            device
+                .begin_command_buffer(cmd, &begin)
                 .map_err(|e| format!("begin_command_buffer(utility): {:?}", e))?;
         }
         transition_image(
-            device, cmd, img.image, img.layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            device,
+            cmd,
+            img.image,
+            img.layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         );
         let clear = vk::ClearColorValue { float32: rgba };
         let range = vk::ImageSubresourceRange {
@@ -538,11 +580,251 @@ impl Renderer {
         }
         img.layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
         unsafe {
-            device.end_command_buffer(cmd)
+            device
+                .end_command_buffer(cmd)
                 .map_err(|e| format!("end_command_buffer(utility): {:?}", e))?;
         }
         submit_with_fence(device, *queue, cmd, utility_slot.fence)?;
         wait_fence(device, utility_slot.fence)?;
+        rt_cache.mark_drawn(key);
+        Ok(())
+    }
+
+    pub fn clear_target_rect(
+        &self,
+        nvmap_id: u32,
+        width: u32,
+        height: u32,
+        rgba: [f32; 4],
+        rect: [i32; 4],
+    ) -> Result<(), String> {
+        let x = rect[0].max(0) as u32;
+        let y = rect[1].max(0) as u32;
+        let w = rect[2].max(0) as u32;
+        let h = rect[3].max(0) as u32;
+        if w == 0 || h == 0 || x >= width || y >= height {
+            return Ok(());
+        }
+        let w = w.min(width - x);
+        let h = h.min(height - y);
+        if x == 0 && y == 0 && w == width && h == height {
+            return self.clear_target(nvmap_id, width, height, rgba);
+        }
+        let mut inner = self.inner.lock();
+        let RendererInner {
+            device,
+            queue,
+            rt_cache,
+            utility_slot,
+            ..
+        } = &mut *inner;
+        let key = RtKey {
+            nvmap_id,
+            width,
+            height,
+        };
+        let img = rt_cache.get_or_create(key, device)?;
+
+        reset_command_buffer(device, utility_slot.cmd)?;
+        let cmd = utility_slot.cmd;
+
+        let begin = vk::CommandBufferBeginInfo {
+            s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+            flags: vk::CommandBufferUsageFlags::empty(),
+            p_inheritance_info: std::ptr::null(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        unsafe {
+            device
+                .begin_command_buffer(cmd, &begin)
+                .map_err(|e| format!("begin_command_buffer(rect clear): {:?}", e))?;
+        }
+        transition_image(
+            device,
+            cmd,
+            img.image,
+            img.layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        let clear_value = vk::ClearValue {
+            color: vk::ClearColorValue { float32: rgba },
+        };
+        let attachment = vk::RenderingAttachmentInfo {
+            s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
+            image_view: img.view,
+            image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            resolve_mode: vk::ResolveModeFlags::NONE,
+            resolve_image_view: vk::ImageView::null(),
+            resolve_image_layout: vk::ImageLayout::UNDEFINED,
+            load_op: vk::AttachmentLoadOp::LOAD,
+            store_op: vk::AttachmentStoreOp::STORE,
+            clear_value,
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        let render_info = vk::RenderingInfo {
+            s_type: vk::StructureType::RENDERING_INFO,
+            render_area: vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width, height },
+            },
+            layer_count: 1,
+            view_mask: 0,
+            color_attachment_count: 1,
+            p_color_attachments: &attachment,
+            p_depth_attachment: std::ptr::null(),
+            p_stencil_attachment: std::ptr::null(),
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+        let clear_attachment = vk::ClearAttachment {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            color_attachment: 0,
+            clear_value,
+        };
+        let clear_rect = vk::ClearRect {
+            rect: vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: x as i32,
+                    y: y as i32,
+                },
+                extent: vk::Extent2D {
+                    width: w,
+                    height: h,
+                },
+            },
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        unsafe {
+            device.cmd_begin_rendering(cmd, &render_info);
+            device.cmd_clear_attachments(cmd, &[clear_attachment], &[clear_rect]);
+            device.cmd_end_rendering(cmd);
+        }
+        img.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        unsafe {
+            device
+                .end_command_buffer(cmd)
+                .map_err(|e| format!("end_command_buffer(rect clear): {:?}", e))?;
+        }
+        submit_with_fence(device, *queue, cmd, utility_slot.fence)?;
+        wait_fence(device, utility_slot.fence)?;
+        rt_cache.mark_drawn(key);
+        Ok(())
+    }
+
+    pub fn upload_target_rgba(
+        &self,
+        nvmap_id: u32,
+        width: u32,
+        height: u32,
+        rgba8: &[u8],
+    ) -> Result<(), String> {
+        let expected = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        if rgba8.len() < expected {
+            return Err(format!(
+                "upload_target_rgba short buffer: got {} need {}",
+                rgba8.len(),
+                expected
+            ));
+        }
+        let mut inner = self.inner.lock();
+        let RendererInner {
+            device,
+            queue,
+            rt_cache,
+            utility_slot,
+            mem_props,
+            ..
+        } = &mut *inner;
+        let key = RtKey {
+            nvmap_id,
+            width,
+            height,
+        };
+        let (image, old_layout) = {
+            let img = rt_cache.get_or_create(key, device)?;
+            (img.image, img.layout)
+        };
+        let stage = create_host_buffer(
+            device,
+            mem_props,
+            &rgba8[..expected],
+            vk::BufferUsageFlags::TRANSFER_SRC,
+        )?;
+
+        reset_command_buffer(device, utility_slot.cmd)?;
+        let cmd = utility_slot.cmd;
+        let begin = vk::CommandBufferBeginInfo {
+            s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+            flags: vk::CommandBufferUsageFlags::empty(),
+            p_inheritance_info: std::ptr::null(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        unsafe {
+            device
+                .begin_command_buffer(cmd, &begin)
+                .map_err(|e| format!("begin_command_buffer(upload target): {:?}", e))?;
+        }
+        transition_image(
+            device,
+            cmd,
+            image,
+            old_layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        let copy = vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+        };
+        unsafe {
+            device.cmd_copy_buffer_to_image(
+                cmd,
+                stage.buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+        }
+        transition_image(
+            device,
+            cmd,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        unsafe {
+            device
+                .end_command_buffer(cmd)
+                .map_err(|e| format!("end_command_buffer(upload target): {:?}", e))?;
+        }
+        let result = submit_with_fence(device, *queue, cmd, utility_slot.fence)
+            .and_then(|_| wait_fence(device, utility_slot.fence));
+        unsafe {
+            device.destroy_buffer(stage.buffer, None);
+            device.free_memory(stage.memory, None);
+        }
+        result?;
+        rt_cache.set_color_layout(key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        rt_cache.mark_drawn(key);
         Ok(())
     }
 
@@ -554,8 +836,18 @@ impl Renderer {
         depth: f32,
     ) -> Result<(), String> {
         let mut inner = self.inner.lock();
-        let RendererInner { device, queue, rt_cache, utility_slot, .. } = &mut *inner;
-        let key = RtKey { nvmap_id, width, height };
+        let RendererInner {
+            device,
+            queue,
+            rt_cache,
+            utility_slot,
+            ..
+        } = &mut *inner;
+        let key = RtKey {
+            nvmap_id,
+            width,
+            height,
+        };
         let img = rt_cache.get_or_create_depth(key, device)?;
 
         reset_command_buffer(device, utility_slot.cmd)?;
@@ -568,7 +860,8 @@ impl Renderer {
             _marker: std::marker::PhantomData,
         };
         unsafe {
-            device.begin_command_buffer(cmd, &begin)
+            device
+                .begin_command_buffer(cmd, &begin)
                 .map_err(|e| format!("begin_command_buffer(depth clear): {:?}", e))?;
         }
         transition_image_aspect(
@@ -598,7 +891,8 @@ impl Renderer {
         }
         img.layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
         unsafe {
-            device.end_command_buffer(cmd)
+            device
+                .end_command_buffer(cmd)
                 .map_err(|e| format!("end_command_buffer(depth clear): {:?}", e))?;
         }
         submit_with_fence(device, *queue, cmd, utility_slot.fence)?;
@@ -608,19 +902,64 @@ impl Renderer {
 
     pub fn rt_key_for_nvmap(&self, nvmap_id: u32, width: u32, height: u32) -> Option<(u32, u32)> {
         let inner = self.inner.lock();
-        inner.rt_cache
-            .find_color(RtKey { nvmap_id, width, height })
+        inner
+            .rt_cache
+            .find_color(RtKey {
+                nvmap_id,
+                width,
+                height,
+            })
             .map(|(k, _, _, _)| (k.width, k.height))
     }
 
     pub fn readback_target(&self, nvmap_id: u32, width: u32, height: u32) -> Option<Vec<u8>> {
         let mut inner = self.inner.lock();
         let RendererInner {
-            device, cmd_pool, queue, rt_cache, mem_props, pending_readbacks, ..
+            device,
+            cmd_pool,
+            queue,
+            rt_cache,
+            mem_props,
+            pending_readbacks,
+            ..
         } = &mut *inner;
-        let key = RtKey { nvmap_id, width, height };
-        if !cache_contains(rt_cache, key) {
-            return None;
+        let requested_key = RtKey {
+            nvmap_id,
+            width,
+            height,
+        };
+        let key = rt_cache.resolve_present_key(requested_key)?;
+        if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            if seq % 60 == 0 {
+                let candidates: Vec<String> = rt_cache
+                    .present_candidates(requested_key)
+                    .into_iter()
+                    .map(|(k, stamp)| {
+                        format!(
+                            "{}:{}x{}#{}{}",
+                            k.nvmap_id,
+                            k.width,
+                            k.height,
+                            stamp,
+                            if k == key { "*" } else { "" }
+                        )
+                    })
+                    .collect();
+                log::warn!(
+                    "present key seq={} requested={}:{}x{} resolved={}:{}x{} candidates=[{}]",
+                    seq,
+                    requested_key.nvmap_id,
+                    requested_key.width,
+                    requested_key.height,
+                    key.nvmap_id,
+                    key.width,
+                    key.height,
+                    candidates.join(", ")
+                );
+            }
         }
         for (_, prev) in pending_readbacks.drain() {
             unsafe {
@@ -634,11 +973,17 @@ impl Renderer {
 
         let total = (width as u64) * 4 * (height as u64);
         let stage = create_staging_owned(device, mem_props, total).ok()?;
-        let cleanup = |device: &ash::Device, cmd_pool: vk::CommandPool,
-                       fence: Option<vk::Fence>, cmd: Option<vk::CommandBuffer>,
+        let cleanup = |device: &ash::Device,
+                       cmd_pool: vk::CommandPool,
+                       fence: Option<vk::Fence>,
+                       cmd: Option<vk::CommandBuffer>,
                        stage: &StagingBuffer| unsafe {
-            if let Some(c) = cmd { device.free_command_buffers(cmd_pool, &[c]); }
-            if let Some(f) = fence { device.destroy_fence(f, None); }
+            if let Some(c) = cmd {
+                device.free_command_buffers(cmd_pool, &[c]);
+            }
+            if let Some(f) = fence {
+                device.destroy_fence(f, None);
+            }
             device.destroy_buffer(stage.buffer, None);
             device.free_memory(stage.memory, None);
         };
@@ -650,11 +995,17 @@ impl Renderer {
         };
         let fence = match unsafe { device.create_fence(&fence_info, None) } {
             Ok(f) => f,
-            Err(_) => { cleanup(device, *cmd_pool, None, None, &stage); return None; }
+            Err(_) => {
+                cleanup(device, *cmd_pool, None, None, &stage);
+                return None;
+            }
         };
         let cmd = match alloc_one_time_cmd(device, *cmd_pool) {
             Ok(c) => c,
-            Err(_) => { cleanup(device, *cmd_pool, Some(fence), None, &stage); return None; }
+            Err(_) => {
+                cleanup(device, *cmd_pool, Some(fence), None, &stage);
+                return None;
+            }
         };
         if begin_one_time(device, cmd).is_err() {
             cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
@@ -663,12 +1014,20 @@ impl Renderer {
         let img = match rt_cache.get_or_create(key, device) {
             Ok(i) => i,
             Err(_) => {
-                unsafe { let _ = device.end_command_buffer(cmd); }
+                unsafe {
+                    let _ = device.end_command_buffer(cmd);
+                }
                 cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
                 return None;
             }
         };
-        transition_image(device, cmd, img.image, img.layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        transition_image(
+            device,
+            cmd,
+            img.image,
+            img.layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
         let copy = vk::BufferImageCopy {
             buffer_offset: 0,
             buffer_row_length: 0,
@@ -680,11 +1039,19 @@ impl Renderer {
                 layer_count: 1,
             },
             image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-            image_extent: vk::Extent3D { width, height, depth: 1 },
+            image_extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
         };
         unsafe {
             device.cmd_copy_image_to_buffer(
-                cmd, img.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, stage.buffer, &[copy],
+                cmd,
+                img.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                stage.buffer,
+                &[copy],
             );
         }
         img.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
@@ -697,7 +1064,9 @@ impl Renderer {
         let mut out = vec![0u8; total as usize];
         unsafe {
             let _ = device.wait_for_fences(&[fence], true, u64::MAX);
-            if let Ok(ptr) = device.map_memory(stage.memory, 0, stage.size, vk::MemoryMapFlags::empty()) {
+            if let Ok(ptr) =
+                device.map_memory(stage.memory, 0, stage.size, vk::MemoryMapFlags::empty())
+            {
                 std::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), total as usize);
                 device.unmap_memory(stage.memory);
             }
@@ -721,6 +1090,7 @@ impl Renderer {
         cull_test_enable: bool,
         cull_face: u32,
         front_face: u32,
+        depth_clamp_enabled: bool,
         poly_offset_enable: bool,
         poly_offset_units: f32,
         poly_offset_factor: f32,
@@ -729,18 +1099,21 @@ impl Renderer {
         _vertex_count: u32,
     ) -> Result<Option<vk::Pipeline>, String> {
         let mut inner = self.inner.lock();
-        let blend_signature: u32 = (blend.enabled as u32)
-            | ((blend.src_factor.as_raw() as u32 & 0xFF) << 8)
-            | ((blend.dst_factor.as_raw() as u32 & 0xFF) << 16)
-            | ((blend.op.as_raw() as u32 & 0xFF) << 24);
-        let raster_state_packed: u32 = (cull_test_enable as u32)
-            | ((cull_face & 0xFF) << 8)
-            | ((front_face & 0xFF) << 16);
+        let blend_signature: u64 = (blend.enabled as u64)
+            | ((blend.src_factor.as_raw() as u64 & 0xFF) << 8)
+            | ((blend.dst_factor.as_raw() as u64 & 0xFF) << 16)
+            | ((blend.op.as_raw() as u64 & 0xFF) << 24)
+            | ((blend.src_alpha_factor.as_raw() as u64 & 0xFF) << 32)
+            | ((blend.dst_alpha_factor.as_raw() as u64 & 0xFF) << 40)
+            | ((blend.alpha_op.as_raw() as u64 & 0xFF) << 48);
+        let raster_state_packed: u32 =
+            (cull_test_enable as u32) | ((cull_face & 0xFF) << 8) | ((front_face & 0xFF) << 16);
         let has_depth = depth_format != vk::Format::UNDEFINED;
         let depth_state_packed: u32 = (depth.test_enabled as u32)
             | ((depth.write_enabled as u32) << 1)
             | ((has_depth as u32) << 2)
             | ((depth.compare_op.as_raw() as u32 & 0xFF) << 8);
+        let depth_clamp_enabled = depth_clamp_enabled && inner.depth_clamp_supported;
         let poly_offset_packed: u64 = (poly_offset_enable as u64)
             | ((poly_offset_units.to_bits() as u64) << 1)
             | ((poly_offset_factor.to_bits() as u64) << 33);
@@ -755,10 +1128,16 @@ impl Renderer {
             blend_signature,
             raster_state_packed,
             depth_state_packed,
+            depth_clamp_enabled,
             poly_offset_packed,
         };
         let depth_clip_control_enabled = inner.depth_clip_control_enabled;
-        let RendererInner { device, shader_compiler, pipeline_cache, .. } = &mut *inner;
+        let RendererInner {
+            device,
+            shader_compiler,
+            pipeline_cache,
+            ..
+        } = &mut *inner;
 
         pipeline_cache.drain_completed(device);
         if let Some(p) = pipeline_cache.get(&key) {
@@ -768,21 +1147,25 @@ impl Renderer {
         let vs_mod = shader_compiler.compile_or_get(vs_spirv, device)?;
         let fs_mod = shader_compiler.compile_or_get(fs_spirv, device)?;
 
-        let bindings: Vec<vk::VertexInputBindingDescription> = layout.bindings.iter().map(|b| {
-            vk::VertexInputBindingDescription {
+        let bindings: Vec<vk::VertexInputBindingDescription> = layout
+            .bindings
+            .iter()
+            .map(|b| vk::VertexInputBindingDescription {
                 binding: b.binding,
                 stride: b.stride,
                 input_rate: vk::VertexInputRate::VERTEX,
-            }
-        }).collect();
-        let attrs: Vec<vk::VertexInputAttributeDescription> = layout.attrs.iter().map(|a| {
-            vk::VertexInputAttributeDescription {
+            })
+            .collect();
+        let attrs: Vec<vk::VertexInputAttributeDescription> = layout
+            .attrs
+            .iter()
+            .map(|a| vk::VertexInputAttributeDescription {
                 location: a.location,
                 binding: a.binding,
                 format: a.format,
                 offset: a.offset,
-            }
-        }).collect();
+            })
+            .collect();
 
         let req = crate::pipeline::PipelineBuildRequest {
             key,
@@ -796,6 +1179,7 @@ impl Renderer {
             has_depth,
             blend,
             depth,
+            depth_clamp_enabled,
             cull_test_enable,
             cull_face,
             front_face,
@@ -809,14 +1193,35 @@ impl Renderer {
             key,
             vs_spirv: vs_spirv.to_vec(),
             fs_spirv: fs_spirv.to_vec(),
-            bindings: layout.bindings.iter().map(|b| (b.binding, b.stride)).collect(),
-            attrs: layout.attrs.iter().map(|a| (a.location, a.binding, a.format.as_raw(), a.offset)).collect(),
+            bindings: layout
+                .bindings
+                .iter()
+                .map(|b| (b.binding, b.stride))
+                .collect(),
+            attrs: layout
+                .attrs
+                .iter()
+                .map(|a| (a.location, a.binding, a.format.as_raw(), a.offset))
+                .collect(),
             topology: topology.as_raw(),
             color_format: color_format.as_raw(),
             depth_format: depth_format.as_raw(),
             has_depth,
-            blend: (blend.enabled, blend.src_factor.as_raw(), blend.dst_factor.as_raw(), blend.op.as_raw()),
-            depth: (depth.test_enabled, depth.write_enabled, depth.compare_op.as_raw()),
+            blend: (
+                blend.enabled,
+                blend.src_factor.as_raw(),
+                blend.dst_factor.as_raw(),
+                blend.op.as_raw(),
+                blend.src_alpha_factor.as_raw(),
+                blend.dst_alpha_factor.as_raw(),
+                blend.alpha_op.as_raw(),
+            ),
+            depth: (
+                depth.test_enabled,
+                depth.write_enabled,
+                depth.compare_op.as_raw(),
+            ),
+            depth_clamp_enabled,
             cull_test_enable,
             cull_face,
             front_face,
@@ -859,6 +1264,7 @@ impl Renderer {
             call.cull_test_enable,
             call.cull_face,
             call.front_face,
+            call.depth_clamp_enabled,
             call.poly_offset_enable,
             call.poly_offset_units,
             call.poly_offset_factor,
@@ -878,11 +1284,18 @@ impl Renderer {
             .map(|b| b.stride as u64)
             .unwrap_or(0);
         let vertex_bytes = vertex_stride.saturating_mul(call.vertex_count as u64) as usize;
-        let vertex_data = if vertex_bytes > 0 {
+        let mut vertex_data = if vertex_bytes > 0 {
             read_guest(call.vertex_addr, vertex_bytes)
                 .ok_or_else(|| format!("vertex read failed va={:#x}", call.vertex_addr))?
         } else {
             Vec::new()
+        };
+        let draw_vertex_count = if call.quad_expand && vertex_stride > 0 && !vertex_data.is_empty()
+        {
+            vertex_data = crate::draw::expand_quad_vertices(&vertex_data, vertex_stride as usize);
+            (vertex_data.len() / vertex_stride as usize) as u32
+        } else {
+            call.vertex_count
         };
 
         let cbuf_size = call.cbuf_size as usize;
@@ -901,52 +1314,12 @@ impl Renderer {
 
         log::debug!(
             "cbuf_data: addr={:#x} size={} all_zero={}",
-            call.cbuf_addr, call.cbuf_size,
+            call.cbuf_addr,
+            call.cbuf_size,
             cbuf_data.iter().all(|&b| b == 0),
         );
 
-        let tex_pending: Option<(TexCacheKey, crate::texture::TicEntry, usize, usize)> =
-            if !call.fs_tex_ids.is_empty() && call.tic_pool_gpu_va != 0 {
-                let tex_id = call.fs_tex_ids[0];
-                if tex_id <= call.tic_pool_limit {
-                    let tic_addr = call.tic_pool_gpu_va.wrapping_add((tex_id as u64) * 32);
-                    read_guest(tic_addr, 32).and_then(|tic_raw| {
-                        {
-                            use std::sync::atomic::{AtomicU64, Ordering};
-                            static DUMPED_MASK: AtomicU64 = AtomicU64::new(0);
-                            let bit = 1u64 << ((tex_id as u64) & 63);
-                            let prev = DUMPED_MASK.fetch_or(bit, Ordering::Relaxed);
-                            if prev & bit == 0 && tic_raw.len() >= 32 {
-                                log::debug!(
-                                    "TIC_RAW id={} bytes={:02x?}",
-                                    tex_id, &tic_raw[..32]
-                                );
-                            }
-                        }
-                        crate::texture::TicEntry::parse(&tic_raw).map(|tic| {
-                            let bpp = tic.format.src_bpp();
-                            let pitch_size = (tic.width as usize) * (tic.height as usize) * bpp;
-                            let read_size = if tic.is_block_linear {
-                                crate::texture::block_linear_byte_size(
-                                    tic.width, tic.height, bpp, tic.block_height_log2,
-                                ).max(pitch_size)
-                            } else {
-                                pitch_size
-                            };
-                            let key = TexCacheKey {
-                                gpu_va: tic.gpu_va,
-                                width: tic.width,
-                                height: tic.height,
-                            };
-                            (key, tic, pitch_size, read_size)
-                        })
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+        let tex_pendings = collect_tex_pendings(call, &read_guest);
 
         let mut inner = self.inner.lock();
         let RendererInner {
@@ -983,14 +1356,16 @@ impl Renderer {
                 *tele_ring_waits += 1;
                 if !slot.retired_dsets.is_empty() {
                     unsafe {
-                        let _ = device.free_descriptor_sets(
-                            descriptor_pool.pool, &slot.retired_dsets,
-                        );
+                        let _ =
+                            device.free_descriptor_sets(descriptor_pool.pool, &slot.retired_dsets);
                     }
                     slot.retired_dsets.clear();
                 }
                 for (b, m) in slot.retired_buffers.drain(..) {
-                    unsafe { device.destroy_buffer(b, None); device.free_memory(m, None); }
+                    unsafe {
+                        device.destroy_buffer(b, None);
+                        device.free_memory(m, None);
+                    }
                 }
                 for t in slot.retired_textures.drain(..) {
                     unsafe {
@@ -1015,39 +1390,19 @@ impl Renderer {
         }
         let dummy = dummy_white.as_ref().unwrap();
         let default_samp = default_sampler.unwrap();
-        let tsc: Option<crate::texture::TscEntry> =
-            if !call.fs_sampler_ids.is_empty() && call.tsc_pool_gpu_va != 0 {
-                let tsc_id = call.fs_sampler_ids[0];
-                if tsc_id <= call.tsc_pool_limit {
-                    let tsc_addr = call.tsc_pool_gpu_va.wrapping_add((tsc_id as u64) * 32);
-                    read_guest(tsc_addr, 32).and_then(|r| crate::texture::TscEntry::parse(&r))
-                } else { None }
-            } else { None };
-        let samp = match tsc {
-            Some(t) => match sampler_cache.get(&t) {
-                Some(s) => *s,
-                None => match create_sampler_for_tsc(device, &t) {
-                    Ok(s) => { sampler_cache.insert(t, s); s }
-                    Err(e) => { log::warn!("tsc sampler create failed: {}", e); default_samp }
-                },
-            },
-            None => default_samp,
-        };
-
-        let rt_alias: Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> = call
-            .sampled_rt_key
-            .and_then(|sk| {
-                rt_cache.find_color(sk).or_else(|| {
-                    if call.sampled_rt_fuzzy { rt_cache.find_color_screen(sk) } else { None }
-                })
-            })
-            .filter(|(k, _, _, _)| *k != call.rt_key);
-
-        let bound_tex_view: vk::ImageView = if let Some((_, _, alias_view, _)) = rt_alias {
-            alias_view
-        } else if let Some((key, tic, pitch_size, read_size)) =
-            tex_pending
-        {
+        let tsc_entries = collect_tsc_entries(call, &read_guest);
+        let rt_aliases: Vec<_> = (0..tex_pendings.len())
+            .map(|slot| rt_alias_for_slot(rt_cache, call, slot, call.rt_key))
+            .collect();
+        let mut bound_tex_views = vec![dummy.view; max_texture_descriptors()];
+        for (slot, pending) in tex_pendings.iter().enumerate() {
+            if let Some((_, _, alias_view, _)) = rt_aliases.get(slot).copied().flatten() {
+                bound_tex_views[slot] = alias_view;
+                continue;
+            }
+            let Some((key, tic, pitch_size, read_size)) = *pending else {
+                continue;
+            };
             if let Some(raw) = read_guest(tic.gpu_va, read_size) {
                 let tex_hash = hash_src_prefix(&raw);
                 let cur_gen = crate::tex_invalidate::region_gen(tic.gpu_va);
@@ -1056,45 +1411,44 @@ impl Renderer {
                     None => true,
                 };
                 if need_upload {
-                    {
-                        use std::collections::HashSet;
-                        use std::sync::{Mutex, OnceLock};
-                        static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-                        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-                        let mut g = seen.lock().unwrap();
-                        if g.insert(tic.gpu_va) && raw.len() >= 32 {
-                            log::debug!(
-                                "TIC_SRC va={:#x} {}x{} bh={} first32={:02x?}",
-                                tic.gpu_va, tic.width, tic.height,
-                                tic.block_height_log2, &raw[..32]
-                            );
-                        }
-                    }
-                    let bpp = tic.format.src_bpp();
                     let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
                         .map(|v| v == "1")
                         .unwrap_or(false);
                     let effective_block_linear =
                         tic.is_block_linear && !crate::pitch_oracle::is_pitch_dst(tic.gpu_va);
                     let linear: Vec<u8> = if effective_block_linear && !force_pitch {
+                        let (storage_width, storage_height, bpp) =
+                            tic.format.storage_extent(tic.width, tic.height);
                         crate::texture::unswizzle_block_linear(
-                            &raw, tic.width, tic.height, bpp, tic.block_height_log2,
+                            &raw,
+                            storage_width,
+                            storage_height,
+                            bpp,
+                            tic.block_height_log2,
                         )
                     } else if raw.len() >= pitch_size {
                         raw[..pitch_size].to_vec()
                     } else {
                         raw
                     };
-                    let rgba8 = crate::texture::decode_to_rgba8(
-                        &linear, tic.width, tic.height, tic.format,
-                    );
+                    let rgba8 =
+                        crate::texture::decode_to_rgba8(&linear, tic.width, tic.height, tic.format);
                     log::debug!(
                         "TIC gpu_va={:#x} {}x{} fmt={:?} bl={} bh={} src_bytes={} rgba8_bytes={} (cache miss -> upload)",
                         tic.gpu_va, tic.width, tic.height, tic.format,
                         tic.is_block_linear, tic.block_height_log2, read_size, rgba8.len()
                     );
                     match upload_texture_oneshot(
-                        device, *queue, *cmd_pool, mem_props, key.width, key.height, &rgba8, tex_hash, cur_gen,
+                        device,
+                        *queue,
+                        *cmd_pool,
+                        mem_props,
+                        key.width,
+                        key.height,
+                        &rgba8,
+                        tic.swizzle,
+                        tex_hash,
+                        cur_gen,
                     ) {
                         Ok(tex) => {
                             if let Some(old) = tex_cache.insert(key, tex) {
@@ -1105,10 +1459,27 @@ impl Renderer {
                     }
                 }
             }
-            tex_cache.get(&key).map(|t| t.view).unwrap_or(dummy.view)
-        } else {
-            dummy.view
-        };
+            bound_tex_views[slot] = tex_cache.get(&key).map(|t| t.view).unwrap_or(dummy.view);
+        }
+        let mut bound_samplers = vec![default_samp; max_texture_descriptors()];
+        for (slot, tsc) in tsc_entries.iter().enumerate() {
+            let Some(t) = *tsc else {
+                continue;
+            };
+            bound_samplers[slot] = match sampler_cache.get(&t) {
+                Some(s) => *s,
+                None => match create_sampler_for_tsc(device, &t) {
+                    Ok(s) => {
+                        sampler_cache.insert(t, s);
+                        s
+                    }
+                    Err(e) => {
+                        log::warn!("tsc sampler create failed: {}", e);
+                        default_samp
+                    }
+                },
+            };
+        }
 
         let vertex_bind: Option<(vk::Buffer, u64)> = if !vertex_data.is_empty() {
             let v_align = vertex_stride.max(16);
@@ -1121,9 +1492,8 @@ impl Renderer {
                     *tele_ring_waits += 1;
                     if !other.retired_dsets.is_empty() {
                         unsafe {
-                            let _ = device.free_descriptor_sets(
-                                descriptor_pool.pool, &other.retired_dsets,
-                            );
+                            let _ = device
+                                .free_descriptor_sets(descriptor_pool.pool, &other.retired_dsets);
                         }
                         other.retired_dsets.clear();
                     }
@@ -1162,9 +1532,11 @@ impl Renderer {
                 ubo_ring.head = 0;
                 ubo_ring.slot_head[other_idx] = 0;
             }
-            let (ibuf, ioff, iptr) = ring_alloc(ubo_ring, isz, 4)
-                .map_err(|e| format!("ring_alloc(index): {}", e))?;
-            unsafe { std::ptr::copy_nonoverlapping(index_data.as_ptr(), iptr, index_data.len()); }
+            let (ibuf, ioff, iptr) =
+                ring_alloc(ubo_ring, isz, 4).map_err(|e| format!("ring_alloc(index): {}", e))?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(index_data.as_ptr(), iptr, index_data.len());
+            }
             Some((ibuf, ioff))
         } else {
             None
@@ -1175,7 +1547,9 @@ impl Renderer {
             let v_size = if !vertex_data.is_empty() {
                 let v_align = vertex_stride.max(16);
                 align_up(vertex_data.len() as u64, v_align)
-            } else { 0 };
+            } else {
+                0
+            };
             debug_assert!(
                 v_size + cbuf_size_aligned <= ubo_ring.size,
                 "execute_draw: per-draw ring payload ({} vertex + {} ubo) exceeds ring capacity ({})",
@@ -1190,9 +1564,8 @@ impl Renderer {
                 *tele_ring_waits += 1;
                 if !other.retired_dsets.is_empty() {
                     unsafe {
-                        let _ = device.free_descriptor_sets(
-                            descriptor_pool.pool, &other.retired_dsets,
-                        );
+                        let _ =
+                            device.free_descriptor_sets(descriptor_pool.pool, &other.retired_dsets);
                     }
                     other.retired_dsets.clear();
                 }
@@ -1230,16 +1603,22 @@ impl Renderer {
             offset: ubo_offset,
             range: cbuf_data.len() as u64,
         };
-        let img_info = vk::DescriptorImageInfo {
-            sampler: vk::Sampler::null(),
-            image_view: bound_tex_view,
-            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        };
-        let samp_info = vk::DescriptorImageInfo {
-            sampler: samp,
-            image_view: vk::ImageView::null(),
-            image_layout: vk::ImageLayout::UNDEFINED,
-        };
+        let image_infos: Vec<vk::DescriptorImageInfo> = bound_tex_views
+            .iter()
+            .map(|view| vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view: *view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            })
+            .collect();
+        let sampler_infos: Vec<vk::DescriptorImageInfo> = bound_samplers
+            .iter()
+            .map(|sampler| vk::DescriptorImageInfo {
+                sampler: *sampler,
+                image_view: vk::ImageView::null(),
+                image_layout: vk::ImageLayout::UNDEFINED,
+            })
+            .collect();
         let writes = [
             vk::WriteDescriptorSet {
                 s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
@@ -1259,9 +1638,9 @@ impl Renderer {
                 dst_set: dset,
                 dst_binding: 1,
                 dst_array_element: 0,
-                descriptor_count: 1,
+                descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
                 descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                p_image_info: &img_info,
+                p_image_info: image_infos.as_ptr(),
                 p_buffer_info: std::ptr::null(),
                 p_texel_buffer_view: std::ptr::null(),
                 p_next: std::ptr::null(),
@@ -1272,9 +1651,9 @@ impl Renderer {
                 dst_set: dset,
                 dst_binding: 2,
                 dst_array_element: 0,
-                descriptor_count: 1,
+                descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
                 descriptor_type: vk::DescriptorType::SAMPLER,
-                p_image_info: &samp_info,
+                p_image_info: sampler_infos.as_ptr(),
                 p_buffer_info: std::ptr::null(),
                 p_texel_buffer_view: std::ptr::null(),
                 p_next: std::ptr::null(),
@@ -1305,7 +1684,8 @@ impl Renderer {
             _marker: std::marker::PhantomData,
         };
         unsafe {
-            device.begin_command_buffer(cmd, &begin)
+            device
+                .begin_command_buffer(cmd, &begin)
                 .map_err(|e| format!("begin_command_buffer(slot): {:?}", e))?;
         }
         transition_image(
@@ -1325,14 +1705,24 @@ impl Renderer {
                 vk::ImageAspectFlags::DEPTH,
             );
         }
-        if let Some((_, alias_image, _, alias_prev)) = rt_alias {
-            if alias_prev != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-                transition_image(device, cmd, alias_image, alias_prev, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        for alias in &rt_aliases {
+            if let Some((_, alias_image, _, alias_prev)) = *alias {
+                if alias_prev != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+                    transition_image(
+                        device,
+                        cmd,
+                        alias_image,
+                        alias_prev,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    );
+                }
             }
         }
 
         let clear_value = vk::ClearValue {
-            color: vk::ClearColorValue { float32: call.clear_color },
+            color: vk::ClearColorValue {
+                float32: call.clear_color,
+            },
         };
         let depth_attachment = depth_bind.map(|(_, d_view, _)| vk::RenderingAttachmentInfo {
             s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
@@ -1344,7 +1734,10 @@ impl Renderer {
             load_op: vk::AttachmentLoadOp::LOAD,
             store_op: vk::AttachmentStoreOp::STORE,
             clear_value: vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
             },
             p_next: std::ptr::null(),
             _marker: std::marker::PhantomData,
@@ -1360,7 +1753,11 @@ impl Renderer {
             resolve_mode: vk::ResolveModeFlags::NONE,
             resolve_image_view: vk::ImageView::null(),
             resolve_image_layout: vk::ImageLayout::UNDEFINED,
-            load_op: if call.clear { vk::AttachmentLoadOp::CLEAR } else { vk::AttachmentLoadOp::LOAD },
+            load_op: if call.clear {
+                vk::AttachmentLoadOp::CLEAR
+            } else {
+                vk::AttachmentLoadOp::LOAD
+            },
             store_op: vk::AttachmentStoreOp::STORE,
             clear_value,
             p_next: std::ptr::null(),
@@ -1386,7 +1783,12 @@ impl Renderer {
 
         let viewport = match call.vp_rect {
             Some([x, y, w, h]) => vk::Viewport {
-                x, y, width: w, height: h, min_depth: 0.0, max_depth: 1.0,
+                x,
+                y,
+                width: w,
+                height: h,
+                min_depth: 0.0,
+                max_depth: 1.0,
             },
             None => vk::Viewport {
                 x: 0.0,
@@ -1397,10 +1799,7 @@ impl Renderer {
                 max_depth: 1.0,
             },
         };
-        let scissor = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: rt_extent,
-        };
+        let scissor = draw_scissor(call.scissor, rt_extent);
         unsafe {
             device.cmd_set_viewport(cmd, 0, &[viewport]);
             device.cmd_set_scissor(cmd, 0, &[scissor]);
@@ -1425,13 +1824,14 @@ impl Renderer {
                 device.cmd_bind_index_buffer(cmd, ibuf, ioff, index_type);
                 device.cmd_draw_indexed(cmd, index_count, 1, 0, 0, 0);
             } else {
-                device.cmd_draw(cmd, call.vertex_count, 1, 0, 0);
+                device.cmd_draw(cmd, draw_vertex_count, 1, 0, 0);
             }
             device.cmd_end_rendering(cmd);
         }
 
         unsafe {
-            device.end_command_buffer(cmd)
+            device
+                .end_command_buffer(cmd)
                 .map_err(|e| format!("end_command_buffer(slot): {:?}", e))?;
         }
 
@@ -1448,8 +1848,10 @@ impl Renderer {
                 d.layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             }
         }
-        if let Some((ak, _, _, _)) = rt_alias {
-            rt_cache.set_color_layout(ak, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        for alias in rt_aliases {
+            if let Some((ak, _, _, _)) = alias {
+                rt_cache.set_color_layout(ak, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            }
         }
 
         let next_idx = other_idx;
@@ -1500,73 +1902,100 @@ impl Renderer {
             vertex_data: Vec<u8>,
             cbuf_data: Vec<u8>,
             vertex_stride: u64,
-            tex_pending: Option<(TexCacheKey, crate::texture::TicEntry, usize, usize)>,
+            tex_pendings: Vec<Option<PendingTexture>>,
             use_depth: bool,
-            tsc: Option<crate::texture::TscEntry>,
+            tsc_entries: Vec<Option<crate::texture::TscEntry>>,
             index_data: Vec<u8>,
             index_count: u32,
             index_type: vk::IndexType,
+            draw_vertex_count: u32,
         }
-        let mut preps: Vec<(&crate::draw::Maxwell3dDrawCall, Prep)> = Vec::with_capacity(calls.len());
+        let mut preps: Vec<(&crate::draw::Maxwell3dDrawCall, Prep)> =
+            Vec::with_capacity(calls.len());
         for call in calls {
             let use_depth = call.depth_key.is_some();
-            let depth_format = if use_depth { vk::Format::D32_SFLOAT } else { vk::Format::UNDEFINED };
+            let depth_format = if use_depth {
+                vk::Format::D32_SFLOAT
+            } else {
+                vk::Format::UNDEFINED
+            };
             let pipeline = match self.compile_pipeline(
-                &call.vs_spirv, &call.fs_spirv, call.vs_hash, call.fs_hash,
-                call.vs_cbuf_mask, call.fs_cbuf_mask,
-                &call.vertex_layout, call.state.topology, call.rt_format, call.blend,
-                call.cull_test_enable, call.cull_face, call.front_face,
-                call.poly_offset_enable, call.poly_offset_units, call.poly_offset_factor,
-                call.depth, depth_format, call.vertex_count,
+                &call.vs_spirv,
+                &call.fs_spirv,
+                call.vs_hash,
+                call.fs_hash,
+                call.vs_cbuf_mask,
+                call.fs_cbuf_mask,
+                &call.vertex_layout,
+                call.state.topology,
+                call.rt_format,
+                call.blend,
+                call.cull_test_enable,
+                call.cull_face,
+                call.front_face,
+                call.depth_clamp_enabled,
+                call.poly_offset_enable,
+                call.poly_offset_units,
+                call.poly_offset_factor,
+                call.depth,
+                depth_format,
+                call.vertex_count,
             )? {
                 Some(p) => p,
                 None => continue,
             };
-            let vertex_stride = call.vertex_layout.bindings.iter().find(|b| b.stride > 0).map(|b| b.stride as u64).unwrap_or(0);
+            let vertex_stride = call
+                .vertex_layout
+                .bindings
+                .iter()
+                .find(|b| b.stride > 0)
+                .map(|b| b.stride as u64)
+                .unwrap_or(0);
             let vertex_bytes = vertex_stride.saturating_mul(call.vertex_count as u64) as usize;
-            let vertex_data = if vertex_bytes > 0 {
+            let mut vertex_data = if vertex_bytes > 0 {
                 read_guest(call.vertex_addr, vertex_bytes)
                     .ok_or_else(|| format!("vertex read failed va={:#x}", call.vertex_addr))?
-            } else { Vec::new() };
+            } else {
+                Vec::new()
+            };
+            let draw_vertex_count =
+                if call.quad_expand && vertex_stride > 0 && !vertex_data.is_empty() {
+                    vertex_data =
+                        crate::draw::expand_quad_vertices(&vertex_data, vertex_stride as usize);
+                    (vertex_data.len() / vertex_stride as usize) as u32
+                } else {
+                    call.vertex_count
+                };
             let cbuf_size = call.cbuf_size as usize;
             let cbuf_data = if let Some(d) = &call.cbuf_data {
                 d.clone()
             } else if cbuf_size > 0 && call.cbuf_addr != 0 {
                 read_guest(call.cbuf_addr, cbuf_size).unwrap_or_else(|| vec![0u8; cbuf_size])
-            } else { vec![0u8; 256] };
-            let tex_pending: Option<(TexCacheKey, crate::texture::TicEntry, usize, usize)> =
-                if !call.fs_tex_ids.is_empty() && call.tic_pool_gpu_va != 0 {
-                    let tex_id = call.fs_tex_ids[0];
-                    if tex_id <= call.tic_pool_limit {
-                        let tic_addr = call.tic_pool_gpu_va.wrapping_add((tex_id as u64) * 32);
-                        read_guest(tic_addr, 32).and_then(|tic_raw| {
-                            crate::texture::TicEntry::parse(&tic_raw).map(|tic| {
-                                let bpp = tic.format.src_bpp();
-                                let pitch_size = (tic.width as usize) * (tic.height as usize) * bpp;
-                                let read_size = if tic.is_block_linear {
-                                    crate::texture::block_linear_byte_size(
-                                        tic.width, tic.height, bpp, tic.block_height_log2,
-                                    ).max(pitch_size)
-                                } else { pitch_size };
-                                let key = TexCacheKey { gpu_va: tic.gpu_va, width: tic.width, height: tic.height };
-                                (key, tic, pitch_size, read_size)
-                            })
-                        })
-                    } else { None }
-                } else { None };
-            let tsc: Option<crate::texture::TscEntry> =
-                if !call.fs_sampler_ids.is_empty() && call.tsc_pool_gpu_va != 0 {
-                    let tsc_id = call.fs_sampler_ids[0];
-                    if tsc_id <= call.tsc_pool_limit {
-                        let tsc_addr = call.tsc_pool_gpu_va.wrapping_add((tsc_id as u64) * 32);
-                        read_guest(tsc_addr, 32).and_then(|r| crate::texture::TscEntry::parse(&r))
-                    } else { None }
-                } else { None };
+            } else {
+                vec![0u8; 256]
+            };
+            let tex_pendings = collect_tex_pendings(call, &read_guest);
+            let tsc_entries = collect_tsc_entries(call, &read_guest);
             let (index_data, index_count, index_type) = match (&call.index_data, call.index_count) {
                 (Some(d), Some(c)) if c > 0 && !d.is_empty() => (d.clone(), c, call.index_type),
                 _ => (Vec::new(), 0u32, call.index_type),
             };
-            preps.push((call, Prep { pipeline, vertex_data, cbuf_data, vertex_stride, tex_pending, use_depth, tsc, index_data, index_count, index_type }));
+            preps.push((
+                call,
+                Prep {
+                    pipeline,
+                    vertex_data,
+                    cbuf_data,
+                    vertex_stride,
+                    tex_pendings,
+                    use_depth,
+                    tsc_entries,
+                    index_data,
+                    index_count,
+                    index_type,
+                    draw_vertex_count,
+                },
+            ));
         }
 
         if preps.is_empty() {
@@ -1575,9 +2004,23 @@ impl Renderer {
 
         let mut inner = self.inner.lock();
         let RendererInner {
-            device, queue, mem_props, cmd_pool, rt_cache, descriptor_layout, descriptor_pool,
-            pipeline_cache, dummy_white, default_sampler, sampler_cache, tex_cache, frame_slots, frame_index,
-            ubo_ring, min_ubo_offset_alignment, ..
+            device,
+            queue,
+            mem_props,
+            cmd_pool,
+            rt_cache,
+            descriptor_layout,
+            descriptor_pool,
+            pipeline_cache,
+            dummy_white,
+            default_sampler,
+            sampler_cache,
+            tex_cache,
+            frame_slots,
+            frame_index,
+            ubo_ring,
+            min_ubo_offset_alignment,
+            ..
         } = &mut *inner;
 
         let cur_idx = *frame_index;
@@ -1589,11 +2032,17 @@ impl Renderer {
             if slot.in_flight {
                 wait_fence(device, slot.fence)?;
                 if !slot.retired_dsets.is_empty() {
-                    unsafe { let _ = device.free_descriptor_sets(descriptor_pool.pool, &slot.retired_dsets); }
+                    unsafe {
+                        let _ =
+                            device.free_descriptor_sets(descriptor_pool.pool, &slot.retired_dsets);
+                    }
                     slot.retired_dsets.clear();
                 }
                 for (b, m) in slot.retired_buffers.drain(..) {
-                    unsafe { device.destroy_buffer(b, None); device.free_memory(m, None); }
+                    unsafe {
+                        device.destroy_buffer(b, None);
+                        device.free_memory(m, None);
+                    }
                 }
                 for t in slot.retired_textures.drain(..) {
                     unsafe {
@@ -1608,7 +2057,9 @@ impl Renderer {
             }
         }
         if dummy_white.is_none() {
-            *dummy_white = Some(create_dummy_white_image(device, *queue, *cmd_pool, mem_props)?);
+            *dummy_white = Some(create_dummy_white_image(
+                device, *queue, *cmd_pool, mem_props,
+            )?);
         }
         if default_sampler.is_none() {
             *default_sampler = Some(create_default_sampler(device)?);
@@ -1638,12 +2089,26 @@ impl Renderer {
             _marker: std::marker::PhantomData,
         };
         unsafe {
-            device.begin_command_buffer(cmd, &begin)
+            device
+                .begin_command_buffer(cmd, &begin)
                 .map_err(|e| format!("begin_command_buffer(batch): {:?}", e))?;
         }
-        transition_image(device, cmd, rt_image, rt_prev_layout, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        transition_image(
+            device,
+            cmd,
+            rt_image,
+            rt_prev_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
         if let Some(di) = depth_image {
-            transition_image_aspect(device, cmd, di, depth_prev, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageAspectFlags::DEPTH);
+            transition_image_aspect(
+                device,
+                cmd,
+                di,
+                depth_prev,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                vk::ImageAspectFlags::DEPTH,
+            );
         }
 
         let clear_rt = rt_prev_layout == vk::ImageLayout::UNDEFINED;
@@ -1656,30 +2121,41 @@ impl Renderer {
         for (_i, (call, prep)) in preps.iter().enumerate() {
             let call = *call;
 
-            let rt_alias: Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> = call
-                .sampled_rt_key
-                .and_then(|sk| {
-                    rt_cache.find_color(sk).or_else(|| {
-                        if call.sampled_rt_fuzzy { rt_cache.find_color_screen(sk) } else { None }
-                    })
-                })
-                .filter(|(k, _, _, _)| *k != rt_key);
-            if let Some((ak, alias_image, _, alias_prev)) = rt_alias {
-                if !alias_used.contains(&ak) {
-                    if alias_prev != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-                        if pass_open {
-                            unsafe { device.cmd_end_rendering(cmd); }
-                            pass_open = false;
+            let rt_aliases: Vec<_> = (0..prep.tex_pendings.len())
+                .map(|slot| rt_alias_for_slot(rt_cache, call, slot, rt_key))
+                .collect();
+            for alias in &rt_aliases {
+                if let Some((ak, alias_image, _, alias_prev)) = *alias {
+                    if !alias_used.contains(&ak) {
+                        if alias_prev != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+                            if pass_open {
+                                unsafe {
+                                    device.cmd_end_rendering(cmd);
+                                }
+                                pass_open = false;
+                            }
+                            transition_image(
+                                device,
+                                cmd,
+                                alias_image,
+                                alias_prev,
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            );
                         }
-                        transition_image(device, cmd, alias_image, alias_prev, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                        alias_used.push(ak);
                     }
-                    alias_used.push(ak);
                 }
             }
 
-            let bound_tex_view: vk::ImageView = if let Some((_, _, alias_view, _)) = rt_alias {
-                alias_view
-            } else if let Some((key, tic, pitch_size, read_size)) = prep.tex_pending {
+            let mut bound_tex_views = vec![dummy_view; max_texture_descriptors()];
+            for (slot, pending) in prep.tex_pendings.iter().enumerate() {
+                if let Some((_, _, alias_view, _)) = rt_aliases.get(slot).copied().flatten() {
+                    bound_tex_views[slot] = alias_view;
+                    continue;
+                }
+                let Some((key, tic, pitch_size, read_size)) = *pending else {
+                    continue;
+                };
                 if let Some(raw) = read_guest(tic.gpu_va, read_size) {
                     let tex_hash = hash_src_prefix(&raw);
                     let cur_gen = crate::tex_invalidate::region_gen(tic.gpu_va);
@@ -1688,24 +2164,48 @@ impl Renderer {
                         None => true,
                     };
                     if need_upload {
-                        let bpp = tic.format.src_bpp();
-                        let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH").map(|v| v == "1").unwrap_or(false);
+                        let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
+                            .map(|v| v == "1")
+                            .unwrap_or(false);
                         let effective_block_linear =
                             tic.is_block_linear && !crate::pitch_oracle::is_pitch_dst(tic.gpu_va);
                         let linear: Vec<u8> = if effective_block_linear && !force_pitch {
-                            crate::texture::unswizzle_block_linear(&raw, tic.width, tic.height, bpp, tic.block_height_log2)
-                        } else if raw.len() >= pitch_size { raw[..pitch_size].to_vec() } else { raw };
-                        let rgba8 = crate::texture::decode_to_rgba8(&linear, tic.width, tic.height, tic.format);
-                        if std::env::var_os("NEXIUM_TEXDUMP").map(|v| v == "1").unwrap_or(false) {
+                            let (storage_width, storage_height, bpp) =
+                                tic.format.storage_extent(tic.width, tic.height);
+                            crate::texture::unswizzle_block_linear(
+                                &raw,
+                                storage_width,
+                                storage_height,
+                                bpp,
+                                tic.block_height_log2,
+                            )
+                        } else if raw.len() >= pitch_size {
+                            raw[..pitch_size].to_vec()
+                        } else {
+                            raw
+                        };
+                        let rgba8 = crate::texture::decode_to_rgba8(
+                            &linear, tic.width, tic.height, tic.format,
+                        );
+                        if std::env::var_os("NEXIUM_TEXDUMP")
+                            .map(|v| v == "1")
+                            .unwrap_or(false)
+                        {
                             use std::sync::{Mutex, OnceLock};
-                            static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
-                            let s = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+                            static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> =
+                                OnceLock::new();
+                            let s =
+                                SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
                             if s.lock().unwrap().insert(tic.gpu_va) {
                                 let (mut sr, mut sg, mut sb, mut sa) = (0u64, 0u64, 0u64, 0u64);
                                 let (mut amin, mut amax) = (255u8, 0u8);
                                 for c in rgba8.chunks_exact(4) {
-                                    sr += c[0] as u64; sg += c[1] as u64; sb += c[2] as u64; sa += c[3] as u64;
-                                    amin = amin.min(c[3]); amax = amax.max(c[3]);
+                                    sr += c[0] as u64;
+                                    sg += c[1] as u64;
+                                    sb += c[2] as u64;
+                                    sa += c[3] as u64;
+                                    amin = amin.min(c[3]);
+                                    amax = amax.max(c[3]);
                                 }
                                 let n = (rgba8.len() / 4).max(1) as u64;
                                 log::warn!(
@@ -1718,10 +2218,22 @@ impl Renderer {
                             }
                         }
                         if pass_open {
-                            unsafe { device.cmd_end_rendering(cmd); }
+                            unsafe {
+                                device.cmd_end_rendering(cmd);
+                            }
                             pass_open = false;
                         }
-                        match create_texture_image(device, cmd, mem_props, key.width, key.height, &rgba8, tex_hash, cur_gen) {
+                        match create_texture_image(
+                            device,
+                            cmd,
+                            mem_props,
+                            key.width,
+                            key.height,
+                            &rgba8,
+                            tic.swizzle,
+                            tex_hash,
+                            cur_gen,
+                        ) {
                             Ok((tex, sbuf, smem)) => {
                                 if let Some(old) = tex_cache.insert(key, tex) {
                                     frame_slots[cur_idx].retired_textures.push(old);
@@ -1732,25 +2244,45 @@ impl Renderer {
                         }
                     }
                 }
-                tex_cache.get(&key).map(|t| t.view).unwrap_or(dummy_view)
-            } else { dummy_view };
+                bound_tex_views[slot] = tex_cache.get(&key).map(|t| t.view).unwrap_or(dummy_view);
+            }
 
             let vertex_bind: Option<(vk::Buffer, u64)> = if !prep.vertex_data.is_empty() {
                 let v_align = prep.vertex_stride.max(16);
                 let v_size = align_up(prep.vertex_data.len() as u64, v_align);
                 if ubo_ring.head + v_size > ubo_ring.size {
-                    ring_wrap_other(device, frame_slots, other_idx, descriptor_pool.pool, ubo_ring)?;
+                    ring_wrap_other(
+                        device,
+                        frame_slots,
+                        other_idx,
+                        descriptor_pool.pool,
+                        ubo_ring,
+                    )?;
                 }
                 let (vbuf, voff, vptr) = ring_alloc(ubo_ring, v_size, v_align)
                     .map_err(|e| format!("ring_alloc(vertex): {}", e))?;
-                unsafe { std::ptr::copy_nonoverlapping(prep.vertex_data.as_ptr(), vptr, prep.vertex_data.len()); }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        prep.vertex_data.as_ptr(),
+                        vptr,
+                        prep.vertex_data.len(),
+                    );
+                }
                 Some((vbuf, voff))
-            } else { None };
+            } else {
+                None
+            };
 
             let white_bind: Option<(u32, vk::Buffer, u64)> =
                 if let Some(wb) = call.vertex_layout.bindings.iter().find(|b| b.stride == 0) {
                     if ubo_ring.head + 16 > ubo_ring.size {
-                        ring_wrap_other(device, frame_slots, other_idx, descriptor_pool.pool, ubo_ring)?;
+                        ring_wrap_other(
+                            device,
+                            frame_slots,
+                            other_idx,
+                            descriptor_pool.pool,
+                            ubo_ring,
+                        )?;
                     }
                     let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 16, 16)
                         .map_err(|e| format!("ring_alloc(white): {}", e))?;
@@ -1759,26 +2291,56 @@ impl Renderer {
                         std::ptr::copy_nonoverlapping(white.as_ptr() as *const u8, wptr, 16);
                     }
                     Some((wb.binding, wbuf, woff))
-                } else { None };
+                } else {
+                    None
+                };
 
-            let index_bind: Option<(vk::Buffer, u64)> = if prep.index_count > 0 && !prep.index_data.is_empty() {
-                let isz = align_up(prep.index_data.len() as u64, 4);
-                if ubo_ring.head + isz > ubo_ring.size {
-                    ring_wrap_other(device, frame_slots, other_idx, descriptor_pool.pool, ubo_ring)?;
-                }
-                let (ibuf, ioff, iptr) = ring_alloc(ubo_ring, isz, 4)
-                    .map_err(|e| format!("ring_alloc(index): {}", e))?;
-                unsafe { std::ptr::copy_nonoverlapping(prep.index_data.as_ptr(), iptr, prep.index_data.len()); }
-                Some((ibuf, ioff))
-            } else { None };
+            let index_bind: Option<(vk::Buffer, u64)> =
+                if prep.index_count > 0 && !prep.index_data.is_empty() {
+                    let isz = align_up(prep.index_data.len() as u64, 4);
+                    if ubo_ring.head + isz > ubo_ring.size {
+                        ring_wrap_other(
+                            device,
+                            frame_slots,
+                            other_idx,
+                            descriptor_pool.pool,
+                            ubo_ring,
+                        )?;
+                    }
+                    let (ibuf, ioff, iptr) = ring_alloc(ubo_ring, isz, 4)
+                        .map_err(|e| format!("ring_alloc(index): {}", e))?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            prep.index_data.as_ptr(),
+                            iptr,
+                            prep.index_data.len(),
+                        );
+                    }
+                    Some((ibuf, ioff))
+                } else {
+                    None
+                };
 
             let cbuf_size_aligned = align_up(prep.cbuf_data.len() as u64, ubo_alignment);
             if ubo_ring.head + cbuf_size_aligned > ubo_ring.size {
-                ring_wrap_other(device, frame_slots, other_idx, descriptor_pool.pool, ubo_ring)?;
+                ring_wrap_other(
+                    device,
+                    frame_slots,
+                    other_idx,
+                    descriptor_pool.pool,
+                    ubo_ring,
+                )?;
             }
-            let (ubo_buffer, ubo_offset, ubo_ptr) = ring_alloc(ubo_ring, cbuf_size_aligned, ubo_alignment)
-                .map_err(|e| format!("ring_alloc(ubo): {}", e))?;
-            unsafe { std::ptr::copy_nonoverlapping(prep.cbuf_data.as_ptr(), ubo_ptr, prep.cbuf_data.len()); }
+            let (ubo_buffer, ubo_offset, ubo_ptr) =
+                ring_alloc(ubo_ring, cbuf_size_aligned, ubo_alignment)
+                    .map_err(|e| format!("ring_alloc(ubo): {}", e))?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    prep.cbuf_data.as_ptr(),
+                    ubo_ptr,
+                    prep.cbuf_data.len(),
+                );
+            }
 
             let set_layouts = [descriptor_layout.layout];
             let alloc_info = vk::DescriptorSetAllocateInfo {
@@ -1790,79 +2352,207 @@ impl Renderer {
                 _marker: std::marker::PhantomData,
             };
             let dset = unsafe {
-                device.allocate_descriptor_sets(&alloc_info)
+                device
+                    .allocate_descriptor_sets(&alloc_info)
                     .map_err(|e| format!("allocate_descriptor_sets: {:?}", e))?[0]
             };
-            let ubo_info = vk::DescriptorBufferInfo { buffer: ubo_buffer, offset: ubo_offset, range: prep.cbuf_data.len() as u64 };
-            let img_info = vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: bound_tex_view, image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL };
-            let samp = match prep.tsc {
-                Some(t) => match sampler_cache.get(&t) {
+            let ubo_info = vk::DescriptorBufferInfo {
+                buffer: ubo_buffer,
+                offset: ubo_offset,
+                range: prep.cbuf_data.len() as u64,
+            };
+            let image_infos: Vec<vk::DescriptorImageInfo> = bound_tex_views
+                .iter()
+                .map(|view| vk::DescriptorImageInfo {
+                    sampler: vk::Sampler::null(),
+                    image_view: *view,
+                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                })
+                .collect();
+            let mut bound_samplers = vec![default_samp; max_texture_descriptors()];
+            for (slot, tsc) in prep.tsc_entries.iter().enumerate() {
+                let Some(t) = *tsc else {
+                    continue;
+                };
+                bound_samplers[slot] = match sampler_cache.get(&t) {
                     Some(s) => *s,
                     None => match create_sampler_for_tsc(device, &t) {
-                        Ok(s) => { sampler_cache.insert(t, s); s }
-                        Err(e) => { log::warn!("tsc sampler create failed: {}", e); default_samp }
+                        Ok(s) => {
+                            sampler_cache.insert(t, s);
+                            s
+                        }
+                        Err(e) => {
+                            log::warn!("tsc sampler create failed: {}", e);
+                            default_samp
+                        }
                     },
-                },
-                None => default_samp,
-            };
-            let samp_info = vk::DescriptorImageInfo { sampler: samp, image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::UNDEFINED };
+                };
+            }
+            let sampler_infos: Vec<vk::DescriptorImageInfo> = bound_samplers
+                .iter()
+                .map(|sampler| vk::DescriptorImageInfo {
+                    sampler: *sampler,
+                    image_view: vk::ImageView::null(),
+                    image_layout: vk::ImageLayout::UNDEFINED,
+                })
+                .collect();
             let writes = [
-                vk::WriteDescriptorSet { s_type: vk::StructureType::WRITE_DESCRIPTOR_SET, dst_set: dset, dst_binding: 0, dst_array_element: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::UNIFORM_BUFFER, p_buffer_info: &ubo_info, p_image_info: std::ptr::null(), p_texel_buffer_view: std::ptr::null(), p_next: std::ptr::null(), _marker: std::marker::PhantomData },
-                vk::WriteDescriptorSet { s_type: vk::StructureType::WRITE_DESCRIPTOR_SET, dst_set: dset, dst_binding: 1, dst_array_element: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::SAMPLED_IMAGE, p_image_info: &img_info, p_buffer_info: std::ptr::null(), p_texel_buffer_view: std::ptr::null(), p_next: std::ptr::null(), _marker: std::marker::PhantomData },
-                vk::WriteDescriptorSet { s_type: vk::StructureType::WRITE_DESCRIPTOR_SET, dst_set: dset, dst_binding: 2, dst_array_element: 0, descriptor_count: 1, descriptor_type: vk::DescriptorType::SAMPLER, p_image_info: &samp_info, p_buffer_info: std::ptr::null(), p_texel_buffer_view: std::ptr::null(), p_next: std::ptr::null(), _marker: std::marker::PhantomData },
+                vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: dset,
+                    dst_binding: 0,
+                    dst_array_element: 0,
+                    descriptor_count: 1,
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                    p_buffer_info: &ubo_info,
+                    p_image_info: std::ptr::null(),
+                    p_texel_buffer_view: std::ptr::null(),
+                    p_next: std::ptr::null(),
+                    _marker: std::marker::PhantomData,
+                },
+                vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: dset,
+                    dst_binding: 1,
+                    dst_array_element: 0,
+                    descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    p_image_info: image_infos.as_ptr(),
+                    p_buffer_info: std::ptr::null(),
+                    p_texel_buffer_view: std::ptr::null(),
+                    p_next: std::ptr::null(),
+                    _marker: std::marker::PhantomData,
+                },
+                vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: dset,
+                    dst_binding: 2,
+                    dst_array_element: 0,
+                    descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
+                    descriptor_type: vk::DescriptorType::SAMPLER,
+                    p_image_info: sampler_infos.as_ptr(),
+                    p_buffer_info: std::ptr::null(),
+                    p_texel_buffer_view: std::ptr::null(),
+                    p_next: std::ptr::null(),
+                    _marker: std::marker::PhantomData,
+                },
             ];
-            unsafe { device.update_descriptor_sets(&writes, &[]); }
+            unsafe {
+                device.update_descriptor_sets(&writes, &[]);
+            }
             dsets_batch.push(dset);
 
             let need_depth = prep.use_depth;
             if !pass_open || pass_depth != need_depth {
                 if pass_open {
-                    unsafe { device.cmd_end_rendering(cmd); }
+                    unsafe {
+                        device.cmd_end_rendering(cmd);
+                    }
                     pass_open = false;
                 }
                 if had_pass {
-                    transition_image(device, cmd, rt_image, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+                    transition_image(
+                        device,
+                        cmd,
+                        rt_image,
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    );
                     if let Some(di) = depth_image {
                         if need_depth {
-                            transition_image_aspect(device, cmd, di, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageAspectFlags::DEPTH);
+                            transition_image_aspect(
+                                device,
+                                cmd,
+                                di,
+                                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                vk::ImageAspectFlags::DEPTH,
+                            );
                         }
                     }
                 }
                 let first = !had_pass;
                 let clear_value = if first && clear_rt {
-                    vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] } }
+                    vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    }
                 } else {
-                    vk::ClearValue { color: vk::ClearColorValue { float32: call.clear_color } }
+                    vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: call.clear_color,
+                        },
+                    }
                 };
                 let depth_attachment = if need_depth {
                     depth_view.map(|dv| vk::RenderingAttachmentInfo {
-                        s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO, image_view: dv,
+                        s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
+                        image_view: dv,
                         image_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                        resolve_mode: vk::ResolveModeFlags::NONE, resolve_image_view: vk::ImageView::null(),
-                        resolve_image_layout: vk::ImageLayout::UNDEFINED, load_op: vk::AttachmentLoadOp::LOAD,
+                        resolve_mode: vk::ResolveModeFlags::NONE,
+                        resolve_image_view: vk::ImageView::null(),
+                        resolve_image_layout: vk::ImageLayout::UNDEFINED,
+                        load_op: vk::AttachmentLoadOp::LOAD,
                         store_op: vk::AttachmentStoreOp::STORE,
-                        clear_value: vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
-                        p_next: std::ptr::null(), _marker: std::marker::PhantomData,
+                        clear_value: vk::ClearValue {
+                            depth_stencil: vk::ClearDepthStencilValue {
+                                depth: 1.0,
+                                stencil: 0,
+                            },
+                        },
+                        p_next: std::ptr::null(),
+                        _marker: std::marker::PhantomData,
                     })
-                } else { None };
-                let p_depth_attachment = match &depth_attachment { Some(a) => a as *const _, None => std::ptr::null() };
+                } else {
+                    None
+                };
+                let p_depth_attachment = match &depth_attachment {
+                    Some(a) => a as *const _,
+                    None => std::ptr::null(),
+                };
                 let attachment = vk::RenderingAttachmentInfo {
-                    s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO, image_view: rt_view,
-                    image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, resolve_mode: vk::ResolveModeFlags::NONE,
-                    resolve_image_view: vk::ImageView::null(), resolve_image_layout: vk::ImageLayout::UNDEFINED,
-                    load_op: if first && clear_rt { vk::AttachmentLoadOp::CLEAR } else { vk::AttachmentLoadOp::LOAD },
-                    store_op: vk::AttachmentStoreOp::STORE, clear_value,
-                    p_next: std::ptr::null(), _marker: std::marker::PhantomData,
+                    s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
+                    image_view: rt_view,
+                    image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    resolve_mode: vk::ResolveModeFlags::NONE,
+                    resolve_image_view: vk::ImageView::null(),
+                    resolve_image_layout: vk::ImageLayout::UNDEFINED,
+                    load_op: if first && clear_rt {
+                        vk::AttachmentLoadOp::CLEAR
+                    } else {
+                        vk::AttachmentLoadOp::LOAD
+                    },
+                    store_op: vk::AttachmentStoreOp::STORE,
+                    clear_value,
+                    p_next: std::ptr::null(),
+                    _marker: std::marker::PhantomData,
                 };
                 let render_info = vk::RenderingInfo {
                     s_type: vk::StructureType::RENDERING_INFO,
-                    render_area: vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: rt_extent },
-                    layer_count: 1, view_mask: 0, color_attachment_count: 1, p_color_attachments: &attachment,
-                    p_depth_attachment, p_stencil_attachment: std::ptr::null(), p_next: std::ptr::null(),
-                    flags: Default::default(), _marker: std::marker::PhantomData,
+                    render_area: vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: rt_extent,
+                    },
+                    layer_count: 1,
+                    view_mask: 0,
+                    color_attachment_count: 1,
+                    p_color_attachments: &attachment,
+                    p_depth_attachment,
+                    p_stencil_attachment: std::ptr::null(),
+                    p_next: std::ptr::null(),
+                    flags: Default::default(),
+                    _marker: std::marker::PhantomData,
                 };
-                let viewport = vk::Viewport { x: 0.0, y: 0.0, width: rt_extent.width as f32, height: rt_extent.height as f32, min_depth: 0.0, max_depth: 1.0 };
-                let scissor = vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: rt_extent };
+                let viewport = vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: rt_extent.width as f32,
+                    height: rt_extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                let scissor = draw_scissor(call.scissor, rt_extent);
                 unsafe {
                     device.cmd_begin_rendering(cmd, &render_info);
                     device.cmd_set_viewport(cmd, 0, &[viewport]);
@@ -1874,32 +2564,61 @@ impl Renderer {
             }
             unsafe {
                 let vp = match call.vp_rect {
-                    Some([x, y, w, h]) => vk::Viewport { x, y, width: w, height: h, min_depth: 0.0, max_depth: 1.0 },
-                    None => vk::Viewport { x: 0.0, y: 0.0, width: rt_extent.width as f32, height: rt_extent.height as f32, min_depth: 0.0, max_depth: 1.0 },
+                    Some([x, y, w, h]) => vk::Viewport {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    },
+                    None => vk::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: rt_extent.width as f32,
+                        height: rt_extent.height as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    },
                 };
                 device.cmd_set_viewport(cmd, 0, &[vp]);
+                let scissor = draw_scissor(call.scissor, rt_extent);
+                device.cmd_set_scissor(cmd, 0, &[scissor]);
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, prep.pipeline);
-                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_cache.layout, 0, &[dset], &[]);
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline_cache.layout,
+                    0,
+                    &[dset],
+                    &[],
+                );
                 if let Some((vbuf, voff)) = vertex_bind {
                     for b in call.vertex_layout.bindings.iter().filter(|b| b.stride > 0) {
                         device.cmd_bind_vertex_buffers(cmd, b.binding, &[vbuf], &[voff]);
                     }
                 }
-                if let Some((wbinding, wbuf, woff)) = white_bind { device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]); }
+                if let Some((wbinding, wbuf, woff)) = white_bind {
+                    device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]);
+                }
                 if let Some((ibuf, ioff)) = index_bind {
                     device.cmd_bind_index_buffer(cmd, ibuf, ioff, prep.index_type);
                     device.cmd_draw_indexed(cmd, prep.index_count, 1, 0, 0, 0);
                 } else {
-                    device.cmd_draw(cmd, call.vertex_count, 1, 0, 0);
+                    device.cmd_draw(cmd, prep.draw_vertex_count, 1, 0, 0);
                 }
             }
         }
         if pass_open {
-            unsafe { device.cmd_end_rendering(cmd); }
+            unsafe {
+                device.cmd_end_rendering(cmd);
+            }
         }
 
         unsafe {
-            device.end_command_buffer(cmd).map_err(|e| format!("end_command_buffer(batch): {:?}", e))?;
+            device
+                .end_command_buffer(cmd)
+                .map_err(|e| format!("end_command_buffer(batch): {:?}", e))?;
         }
         let slot_fence = frame_slots[cur_idx].fence;
         submit_with_fence(device, *queue, cmd, slot_fence)?;
@@ -1923,6 +2642,97 @@ impl Renderer {
     }
 }
 
+fn max_texture_descriptors() -> usize {
+    crate::descriptor::MAX_TEXTURE_DESCRIPTORS as usize
+}
+
+fn collect_tex_pendings<F>(
+    call: &crate::draw::Maxwell3dDrawCall,
+    read_guest: &F,
+) -> Vec<Option<PendingTexture>>
+where
+    F: Fn(u64, usize) -> Option<Vec<u8>>,
+{
+    call.fs_tex_ids
+        .iter()
+        .take(max_texture_descriptors())
+        .map(|tex_id| {
+            if *tex_id == u32::MAX || *tex_id > call.tic_pool_limit || call.tic_pool_gpu_va == 0 {
+                return None;
+            }
+            let tic_addr = call.tic_pool_gpu_va.wrapping_add((*tex_id as u64) * 32);
+            read_guest(tic_addr, 32).and_then(|tic_raw| {
+                crate::texture::TicEntry::parse(&tic_raw).map(|tic| {
+                    let pitch_size = tic.format.linear_size(tic.width, tic.height);
+                    let read_size = if tic.is_block_linear {
+                        tic.format
+                            .block_linear_size(tic.width, tic.height, tic.block_height_log2)
+                            .max(pitch_size)
+                    } else {
+                        pitch_size
+                    };
+                    let key = TexCacheKey {
+                        gpu_va: tic.gpu_va,
+                        width: tic.width,
+                        height: tic.height,
+                        format: tic.format,
+                        swizzle: tic.swizzle,
+                    };
+                    (key, tic, pitch_size, read_size)
+                })
+            })
+        })
+        .collect()
+}
+
+fn collect_tsc_entries<F>(
+    call: &crate::draw::Maxwell3dDrawCall,
+    read_guest: &F,
+) -> Vec<Option<crate::texture::TscEntry>>
+where
+    F: Fn(u64, usize) -> Option<Vec<u8>>,
+{
+    call.fs_sampler_ids
+        .iter()
+        .take(max_texture_descriptors())
+        .map(|tsc_id| {
+            if *tsc_id > call.tsc_pool_limit || call.tsc_pool_gpu_va == 0 {
+                return None;
+            }
+            let tsc_addr = call.tsc_pool_gpu_va.wrapping_add((*tsc_id as u64) * 32);
+            read_guest(tsc_addr, 32).and_then(|r| crate::texture::TscEntry::parse(&r))
+        })
+        .collect()
+}
+
+fn sampled_rt_key_for_slot(call: &crate::draw::Maxwell3dDrawCall, slot: usize) -> Option<RtKey> {
+    call.sampled_rt_slots
+        .get(slot)
+        .copied()
+        .flatten()
+        .or_else(|| call.sampled_rt_keys.get(slot).copied())
+        .or_else(|| if slot == 0 { call.sampled_rt_key } else { None })
+}
+
+fn rt_alias_for_slot(
+    rt_cache: &RtCache,
+    call: &crate::draw::Maxwell3dDrawCall,
+    slot: usize,
+    rt_key: RtKey,
+) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
+    sampled_rt_key_for_slot(call, slot)
+        .and_then(|sk| {
+            rt_cache.find_color(sk).or_else(|| {
+                if call.sampled_rt_fuzzy {
+                    rt_cache.find_color_screen(sk)
+                } else {
+                    None
+                }
+            })
+        })
+        .filter(|(k, _, _, _)| *k != rt_key)
+}
+
 fn ring_wrap_other(
     device: &ash::Device,
     frame_slots: &mut [FrameSlot; 2],
@@ -1940,7 +2750,10 @@ fn ring_wrap_other(
             other.retired_dsets.clear();
         }
         for (b, m) in other.retired_buffers.drain(..) {
-            unsafe { device.destroy_buffer(b, None); device.free_memory(m, None); }
+            unsafe {
+                device.destroy_buffer(b, None);
+                device.free_memory(m, None);
+            }
         }
         for t in other.retired_textures.drain(..) {
             unsafe {
@@ -1958,8 +2771,8 @@ fn ring_wrap_other(
 }
 
 fn monotonic_nanos() -> u64 {
-    use std::time::Instant;
     use std::sync::OnceLock;
+    use std::time::Instant;
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = EPOCH.get_or_init(Instant::now);
     epoch.elapsed().as_nanos() as u64
@@ -2032,7 +2845,9 @@ fn create_ubo_ring(
     let info = vk::BufferCreateInfo {
         s_type: vk::StructureType::BUFFER_CREATE_INFO,
         size,
-        usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
+        usage: vk::BufferUsageFlags::VERTEX_BUFFER
+            | vk::BufferUsageFlags::UNIFORM_BUFFER
+            | vk::BufferUsageFlags::INDEX_BUFFER,
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         queue_family_index_count: 0,
         p_queue_family_indices: std::ptr::null(),
@@ -2187,12 +3002,15 @@ fn upload_texture_oneshot(
     width: u32,
     height: u32,
     rgba8: &[u8],
+    swizzle: [crate::texture::SwizzleSource; 4],
     hash: u64,
     gen: u64,
 ) -> Result<CachedTexture, String> {
     let cmd = alloc_one_time_cmd(device, cmd_pool)?;
     begin_one_time(device, cmd)?;
-    let (tex, sbuf, smem) = create_texture_image(device, cmd, mem_props, width, height, rgba8, hash, gen)?;
+    let (tex, sbuf, smem) = create_texture_image(
+        device, cmd, mem_props, width, height, rgba8, swizzle, hash, gen,
+    )?;
     end_one_time(device, cmd)?;
     submit_and_wait(device, queue, cmd)?;
     unsafe {
@@ -2210,6 +3028,7 @@ fn create_texture_image(
     width: u32,
     height: u32,
     rgba8: &[u8],
+    swizzle: [crate::texture::SwizzleSource; 4],
     hash: u64,
     gen: u64,
 ) -> Result<(CachedTexture, vk::Buffer, vk::DeviceMemory), String> {
@@ -2218,7 +3037,11 @@ fn create_texture_image(
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
         image_type: vk::ImageType::TYPE_2D,
         format,
-        extent: vk::Extent3D { width, height, depth: 1 },
+        extent: vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        },
         mip_levels: 1,
         array_layers: 1,
         samples: vk::SampleCountFlags::TYPE_1,
@@ -2233,7 +3056,8 @@ fn create_texture_image(
         _marker: std::marker::PhantomData,
     };
     let image = unsafe {
-        device.create_image(&img_info, None)
+        device
+            .create_image(&img_info, None)
             .map_err(|e| format!("create_image(tex {}x{}): {:?}", width, height, e))?
     };
     let req = unsafe { device.get_image_memory_requirements(image) };
@@ -2241,7 +3065,8 @@ fn create_texture_image(
         mem_props,
         req.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    ).ok_or_else(|| "no DEVICE_LOCAL for texture image".to_string())?;
+    )
+    .ok_or_else(|| "no DEVICE_LOCAL for texture image".to_string())?;
     let alloc = vk::MemoryAllocateInfo {
         s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
         allocation_size: req.size,
@@ -2250,17 +3075,25 @@ fn create_texture_image(
         _marker: std::marker::PhantomData,
     };
     let memory = unsafe {
-        device.allocate_memory(&alloc, None)
+        device
+            .allocate_memory(&alloc, None)
             .map_err(|e| format!("allocate_memory(tex): {:?}", e))?
     };
     unsafe {
-        device.bind_image_memory(image, memory, 0)
+        device
+            .bind_image_memory(image, memory, 0)
             .map_err(|e| format!("bind_image_memory(tex): {:?}", e))?;
     }
 
     let stage = create_host_buffer(device, mem_props, rgba8, vk::BufferUsageFlags::TRANSFER_SRC)?;
 
-    transition_image(device, cmd, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    transition_image(
+        device,
+        cmd,
+        image,
+        vk::ImageLayout::UNDEFINED,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    );
     let copy = vk::BufferImageCopy {
         buffer_offset: 0,
         buffer_row_length: 0,
@@ -2272,15 +3105,25 @@ fn create_texture_image(
             layer_count: 1,
         },
         image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-        image_extent: vk::Extent3D { width, height, depth: 1 },
+        image_extent: vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        },
     };
     unsafe {
         device.cmd_copy_buffer_to_image(
-            cmd, stage.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy],
+            cmd,
+            stage.buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[copy],
         );
     }
     transition_image(
-        device, cmd, image,
+        device,
+        cmd,
+        image,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     );
@@ -2297,16 +3140,48 @@ fn create_texture_image(
             base_array_layer: 0,
             layer_count: 1,
         },
-        components: vk::ComponentMapping::default(),
+        components: texture_component_mapping(swizzle),
         p_next: std::ptr::null(),
         flags: Default::default(),
         _marker: std::marker::PhantomData,
     };
     let view = unsafe {
-        device.create_image_view(&view_info, None)
+        device
+            .create_image_view(&view_info, None)
             .map_err(|e| format!("create_image_view(tex): {:?}", e))?
     };
-    Ok((CachedTexture { image, view, memory, hash, gen }, stage.buffer, stage.memory))
+    Ok((
+        CachedTexture {
+            image,
+            view,
+            memory,
+            hash,
+            gen,
+        },
+        stage.buffer,
+        stage.memory,
+    ))
+}
+
+fn texture_component_mapping(swizzle: [crate::texture::SwizzleSource; 4]) -> vk::ComponentMapping {
+    fn one(src: crate::texture::SwizzleSource) -> vk::ComponentSwizzle {
+        match src {
+            crate::texture::SwizzleSource::Zero => vk::ComponentSwizzle::ZERO,
+            crate::texture::SwizzleSource::R => vk::ComponentSwizzle::R,
+            crate::texture::SwizzleSource::G => vk::ComponentSwizzle::G,
+            crate::texture::SwizzleSource::B => vk::ComponentSwizzle::B,
+            crate::texture::SwizzleSource::A => vk::ComponentSwizzle::A,
+            crate::texture::SwizzleSource::One => vk::ComponentSwizzle::ONE,
+            crate::texture::SwizzleSource::Unknown(_) => vk::ComponentSwizzle::ZERO,
+        }
+    }
+
+    vk::ComponentMapping {
+        r: one(swizzle[0]),
+        g: one(swizzle[1]),
+        b: one(swizzle[2]),
+        a: one(swizzle[3]),
+    }
 }
 
 fn create_dummy_white_image(
@@ -2320,7 +3195,11 @@ fn create_dummy_white_image(
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
         image_type: vk::ImageType::TYPE_2D,
         format,
-        extent: vk::Extent3D { width: 1, height: 1, depth: 1 },
+        extent: vk::Extent3D {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
         mip_levels: 1,
         array_layers: 1,
         samples: vk::SampleCountFlags::TYPE_1,
@@ -2365,11 +3244,22 @@ fn create_dummy_white_image(
     }
 
     let pixel: [u8; 4] = [255, 255, 255, 255];
-    let stage = create_host_buffer(device, mem_props, &pixel, vk::BufferUsageFlags::TRANSFER_SRC)?;
+    let stage = create_host_buffer(
+        device,
+        mem_props,
+        &pixel,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+    )?;
 
     let cmd = alloc_one_time_cmd(device, cmd_pool)?;
     begin_one_time(device, cmd)?;
-    transition_image(device, cmd, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    transition_image(
+        device,
+        cmd,
+        image,
+        vk::ImageLayout::UNDEFINED,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    );
     let copy = vk::BufferImageCopy {
         buffer_offset: 0,
         buffer_row_length: 0,
@@ -2381,7 +3271,11 @@ fn create_dummy_white_image(
             layer_count: 1,
         },
         image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-        image_extent: vk::Extent3D { width: 1, height: 1, depth: 1 },
+        image_extent: vk::Extent3D {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
     };
     unsafe {
         device.cmd_copy_buffer_to_image(
@@ -2429,7 +3323,11 @@ fn create_dummy_white_image(
             .create_image_view(&view_info, None)
             .map_err(|e| format!("create_image_view(dummy): {:?}", e))?
     };
-    Ok(DummyImage { image, view, memory })
+    Ok(DummyImage {
+        image,
+        view,
+        memory,
+    })
 }
 
 pub fn hash_spirv(spirv: &[u32]) -> u64 {
@@ -2442,24 +3340,34 @@ pub fn hash_spirv(spirv: &[u32]) -> u64 {
 }
 
 fn hash_src_prefix(bytes: &[u8]) -> u64 {
-    const CAP: usize = 4096;
-    let n = bytes.len().min(CAP);
     let mut h: u64 = 0xcbf29ce484222325;
-    for &b in &bytes[..n] {
-        h ^= b as u64;
+
+    h ^= bytes.len() as u64;
+    h = h.wrapping_mul(0x100000001b3);
+
+    if bytes.len() <= 65_536 {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        return h;
+    }
+
+    const SAMPLES: usize = 65_536;
+    let last = bytes.len() - 1;
+    for i in 0..SAMPLES {
+        let idx = i * last / (SAMPLES - 1);
+        h ^= bytes[idx] as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    h ^= bytes.len() as u64;
-    h.wrapping_mul(0x100000001b3)
+
+    h
 }
 
-fn cache_contains(rt: &RtCache, key: RtKey) -> bool {
-    let _ = key;
-    let _ = rt;
-    true
-}
-
-fn alloc_one_time_cmd(device: &ash::Device, pool: vk::CommandPool) -> Result<vk::CommandBuffer, String> {
+fn alloc_one_time_cmd(
+    device: &ash::Device,
+    pool: vk::CommandPool,
+) -> Result<vk::CommandBuffer, String> {
     let info = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
         command_pool: pool,
@@ -2469,10 +3377,43 @@ fn alloc_one_time_cmd(device: &ash::Device, pool: vk::CommandPool) -> Result<vk:
         _marker: std::marker::PhantomData,
     };
     let v = unsafe {
-        device.allocate_command_buffers(&info)
+        device
+            .allocate_command_buffers(&info)
             .map_err(|e| format!("allocate_command_buffers: {:?}", e))?
     };
     Ok(v[0])
+}
+
+fn draw_scissor(rect: Option<[i32; 4]>, extent: vk::Extent2D) -> vk::Rect2D {
+    let Some([x, y, w, h]) = rect else {
+        return vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+    };
+    let x = x.max(0) as u32;
+    let y = y.max(0) as u32;
+    if x >= extent.width || y >= extent.height {
+        return vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: 0,
+                height: 0,
+            },
+        };
+    }
+    let w = (w.max(0) as u32).min(extent.width - x);
+    let h = (h.max(0) as u32).min(extent.height - y);
+    vk::Rect2D {
+        offset: vk::Offset2D {
+            x: x as i32,
+            y: y as i32,
+        },
+        extent: vk::Extent2D {
+            width: w,
+            height: h,
+        },
+    }
 }
 
 fn begin_one_time(device: &ash::Device, cmd: vk::CommandBuffer) -> Result<(), String> {
@@ -2484,19 +3425,25 @@ fn begin_one_time(device: &ash::Device, cmd: vk::CommandBuffer) -> Result<(), St
         _marker: std::marker::PhantomData,
     };
     unsafe {
-        device.begin_command_buffer(cmd, &begin)
+        device
+            .begin_command_buffer(cmd, &begin)
             .map_err(|e| format!("begin_command_buffer: {:?}", e))
     }
 }
 
 fn end_one_time(device: &ash::Device, cmd: vk::CommandBuffer) -> Result<(), String> {
     unsafe {
-        device.end_command_buffer(cmd)
+        device
+            .end_command_buffer(cmd)
             .map_err(|e| format!("end_command_buffer: {:?}", e))
     }
 }
 
-fn submit_and_wait(device: &ash::Device, queue: vk::Queue, cmd: vk::CommandBuffer) -> Result<(), String> {
+fn submit_and_wait(
+    device: &ash::Device,
+    queue: vk::Queue,
+    cmd: vk::CommandBuffer,
+) -> Result<(), String> {
     let submit = vk::SubmitInfo {
         s_type: vk::StructureType::SUBMIT_INFO,
         command_buffer_count: 1,
@@ -2510,14 +3457,15 @@ fn submit_and_wait(device: &ash::Device, queue: vk::Queue, cmd: vk::CommandBuffe
         _marker: std::marker::PhantomData,
     };
     unsafe {
-        device.queue_submit(queue, &[submit], vk::Fence::null())
+        device
+            .queue_submit(queue, &[submit], vk::Fence::null())
             .map_err(|e| format!("queue_submit: {:?}", e))?;
-        device.queue_wait_idle(queue)
+        device
+            .queue_wait_idle(queue)
             .map_err(|e| format!("queue_wait_idle: {:?}", e))?;
     }
     Ok(())
 }
-
 
 fn submit_with_fence(
     device: &ash::Device,
@@ -2538,9 +3486,11 @@ fn submit_with_fence(
         _marker: std::marker::PhantomData,
     };
     unsafe {
-        device.reset_fences(&[fence])
+        device
+            .reset_fences(&[fence])
             .map_err(|e| format!("reset_fences(submit): {:?}", e))?;
-        device.queue_submit(queue, &[submit], fence)
+        device
+            .queue_submit(queue, &[submit], fence)
             .map_err(|e| format!("queue_submit(fence): {:?}", e))?;
     }
     Ok(())
@@ -2548,9 +3498,11 @@ fn submit_with_fence(
 
 fn wait_fence(device: &ash::Device, fence: vk::Fence) -> Result<(), String> {
     unsafe {
-        device.wait_for_fences(&[fence], true, u64::MAX)
+        device
+            .wait_for_fences(&[fence], true, u64::MAX)
             .map_err(|e| format!("wait_for_fences: {:?}", e))?;
-        device.reset_fences(&[fence])
+        device
+            .reset_fences(&[fence])
             .map_err(|e| format!("reset_fences: {:?}", e))?;
     }
     Ok(())
@@ -2564,7 +3516,8 @@ fn align_up(x: u64, align: u64) -> u64 {
 
 fn reset_command_buffer(device: &ash::Device, cmd: vk::CommandBuffer) -> Result<(), String> {
     unsafe {
-        device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+        device
+            .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
             .map_err(|e| format!("reset_command_buffer: {:?}", e))
     }
 }
@@ -2582,7 +3535,9 @@ fn ring_alloc(
     }
     let mask = align - 1;
     let aligned_head = (ring.head + mask) & !mask;
-    let end = aligned_head.checked_add(size).ok_or("ring_alloc: overflow")?;
+    let end = aligned_head
+        .checked_add(size)
+        .ok_or("ring_alloc: overflow")?;
     if end > ring.size {
         return Err("ring_alloc: out of space (wrap required)");
     }
@@ -2651,10 +3606,7 @@ fn transition_image_aspect(
             vk::AccessFlags::TRANSFER_READ,
             vk::AccessFlags::TRANSFER_WRITE,
         ),
-        (
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        ) => (
+        (vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => (
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
@@ -2672,19 +3624,13 @@ fn transition_image_aspect(
             vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
                 | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
         ),
-        (
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        ) => (
+        (vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => (
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             vk::AccessFlags::SHADER_READ,
         ),
-        (
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        ) => (
+        (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => (
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags::SHADER_READ,
@@ -2750,7 +3696,8 @@ fn ensure_staging<'a>(
             _marker: std::marker::PhantomData,
         };
         let buffer = unsafe {
-            device.create_buffer(&buf_info, None)
+            device
+                .create_buffer(&buf_info, None)
                 .map_err(|e| format!("create_buffer: {:?}", e))?
         };
         let req = unsafe { device.get_buffer_memory_requirements(buffer) };
@@ -2758,7 +3705,8 @@ fn ensure_staging<'a>(
             mem_props,
             req.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ).ok_or_else(|| "no HOST_VISIBLE memory type".to_string())?;
+        )
+        .ok_or_else(|| "no HOST_VISIBLE memory type".to_string())?;
         let alloc_info = vk::MemoryAllocateInfo {
             s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
             allocation_size: req.size,
@@ -2767,14 +3715,23 @@ fn ensure_staging<'a>(
             _marker: std::marker::PhantomData,
         };
         let memory = unsafe {
-            device.allocate_memory(&alloc_info, None)
+            device
+                .allocate_memory(&alloc_info, None)
                 .map_err(|e| format!("allocate_memory(staging): {:?}", e))?
         };
         unsafe {
-            device.bind_buffer_memory(buffer, memory, 0)
+            device
+                .bind_buffer_memory(buffer, memory, 0)
                 .map_err(|e| format!("bind_buffer_memory: {:?}", e))?;
         }
-        staging.insert(key, StagingBuffer { buffer, memory, size: req.size });
+        staging.insert(
+            key,
+            StagingBuffer {
+                buffer,
+                memory,
+                size: req.size,
+            },
+        );
     }
     Ok(staging.get(&key).unwrap())
 }
@@ -2796,7 +3753,8 @@ fn create_staging_owned(
         _marker: std::marker::PhantomData,
     };
     let buffer = unsafe {
-        device.create_buffer(&buf_info, None)
+        device
+            .create_buffer(&buf_info, None)
             .map_err(|e| format!("create_buffer(readback): {:?}", e))?
     };
     let req = unsafe { device.get_buffer_memory_requirements(buffer) };
@@ -2804,7 +3762,8 @@ fn create_staging_owned(
         mem_props,
         req.memory_type_bits,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    ).ok_or_else(|| "no HOST_VISIBLE memory type".to_string())?;
+    )
+    .ok_or_else(|| "no HOST_VISIBLE memory type".to_string())?;
     let alloc_info = vk::MemoryAllocateInfo {
         s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
         allocation_size: req.size,
@@ -2813,14 +3772,20 @@ fn create_staging_owned(
         _marker: std::marker::PhantomData,
     };
     let memory = unsafe {
-        device.allocate_memory(&alloc_info, None)
+        device
+            .allocate_memory(&alloc_info, None)
             .map_err(|e| format!("allocate_memory(readback staging): {:?}", e))?
     };
     unsafe {
-        device.bind_buffer_memory(buffer, memory, 0)
+        device
+            .bind_buffer_memory(buffer, memory, 0)
             .map_err(|e| format!("bind_buffer_memory(readback): {:?}", e))?;
     }
-    Ok(StagingBuffer { buffer, memory, size: req.size })
+    Ok(StagingBuffer {
+        buffer,
+        memory,
+        size: req.size,
+    })
 }
 
 impl Drop for RendererInner {
@@ -2851,9 +3816,11 @@ impl Drop for RendererInner {
         self.pipeline_cache.clear(&self.device);
         self.shader_compiler.clear(&self.device);
         unsafe {
-            self.device.destroy_descriptor_pool(self.descriptor_pool.pool, None);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool.pool, None);
             self.descriptor_pool.pool = vk::DescriptorPool::null();
-            self.device.destroy_descriptor_set_layout(self.descriptor_layout.layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_layout.layout, None);
             self.descriptor_layout.layout = vk::DescriptorSetLayout::null();
         }
         for (_, s) in self.staging.drain() {

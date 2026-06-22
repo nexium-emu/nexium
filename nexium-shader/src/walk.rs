@@ -1,5 +1,3 @@
-
-
 use super::decode::{decode_one, Decoded};
 use super::opcodes::Opcode;
 use super::operand::{ldc_ref, texs_tex_id};
@@ -12,7 +10,6 @@ pub struct Instruction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FsTexId {
-
     ImmediateTic(u32),
 
     BindlessCbufOffset(u32),
@@ -30,7 +27,10 @@ pub fn walk_instructions(code: &[u8]) -> Vec<Instruction> {
             let bytes: [u8; 8] = code[inst_off..inst_off + 8].try_into().unwrap();
             let insn = u64::from_le_bytes(bytes);
             if let Some(decoded) = decode_one(insn) {
-                out.push(Instruction { byte_offset: inst_off, decoded });
+                out.push(Instruction {
+                    byte_offset: inst_off,
+                    decoded,
+                });
             }
         }
         off += 32;
@@ -49,7 +49,6 @@ pub fn extract_fs_tex_ids(code: &[u8], bindless_slot: u8) -> Vec<FsTexId> {
     for ins in walk_instructions(code) {
         let raw = ins.decoded.raw;
         match ins.decoded.opcode {
-
             Opcode::TEXS | Opcode::TLDS | Opcode::TLD4S => {
                 let idx = texs_tex_id(raw);
                 push(FsTexId::ImmediateTic(idx), &mut out);

@@ -1,5 +1,7 @@
 use ash::vk;
 
+pub const MAX_TEXTURE_DESCRIPTORS: u32 = 32;
+
 pub struct DescriptorSetLayout {
     pub layout: vk::DescriptorSetLayout,
 }
@@ -22,7 +24,7 @@ impl DescriptorSetLayout {
             vk::DescriptorSetLayoutBinding {
                 binding: 1,
                 descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 1,
+                descriptor_count: MAX_TEXTURE_DESCRIPTORS,
                 stage_flags: vk::ShaderStageFlags::FRAGMENT,
                 p_immutable_samplers: std::ptr::null(),
                 _marker: std::marker::PhantomData,
@@ -30,7 +32,7 @@ impl DescriptorSetLayout {
             vk::DescriptorSetLayoutBinding {
                 binding: 2,
                 descriptor_type: vk::DescriptorType::SAMPLER,
-                descriptor_count: 1,
+                descriptor_count: MAX_TEXTURE_DESCRIPTORS,
                 stage_flags: vk::ShaderStageFlags::FRAGMENT,
                 p_immutable_samplers: std::ptr::null(),
                 _marker: std::marker::PhantomData,
@@ -47,7 +49,8 @@ impl DescriptorSetLayout {
         };
 
         let layout = unsafe {
-            device.create_descriptor_set_layout(&layout_info, None)
+            device
+                .create_descriptor_set_layout(&layout_info, None)
                 .map_err(|_| "Failed to create descriptor set layout".to_string())?
         };
 
@@ -64,11 +67,11 @@ impl DescriptorPool {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: max_sets,
+                descriptor_count: max_sets.saturating_mul(MAX_TEXTURE_DESCRIPTORS),
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: max_sets,
+                descriptor_count: max_sets.saturating_mul(MAX_TEXTURE_DESCRIPTORS),
             },
         ];
 
@@ -83,7 +86,8 @@ impl DescriptorPool {
         };
 
         let pool = unsafe {
-            device.create_descriptor_pool(&pool_info, None)
+            device
+                .create_descriptor_pool(&pool_info, None)
                 .map_err(|_| "Failed to create descriptor pool".to_string())?
         };
 

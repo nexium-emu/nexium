@@ -1,7 +1,7 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub mod bufferqueue;
 pub mod gpu;
@@ -138,7 +138,10 @@ impl IoctlOutcome {
     }
 
     pub fn error(result: u32) -> Self {
-        Self { result, data: Vec::new() }
+        Self {
+            result,
+            data: Vec::new(),
+        }
     }
 }
 
@@ -185,19 +188,22 @@ impl Nvdrv {
     }
 
     pub fn renderer(&self) -> Option<&Arc<nexium_gpu::Renderer>> {
-        let slot = self.renderer.get_or_init(|| {
-            match nexium_gpu::Renderer::new() {
+        let slot = self
+            .renderer
+            .get_or_init(|| match nexium_gpu::Renderer::new() {
                 Ok(r) => {
                     log::info!("nexium-nvdrv: Vulkan Renderer initialized");
                     self.gpu.pusher.lock().set_renderer(Some(r.clone()));
                     Some(r)
                 }
                 Err(e) => {
-                    log::warn!("nexium-nvdrv: Vulkan Renderer init failed: {} (falling back to CPU)", e);
+                    log::warn!(
+                        "nexium-nvdrv: Vulkan Renderer init failed: {} (falling back to CPU)",
+                        e
+                    );
                     None
                 }
-            }
-        });
+            });
         slot.as_ref()
     }
 
@@ -247,8 +253,15 @@ impl Nvdrv {
             }
         };
         let cmd = (req.ioctl_id & 0xFFFF) as u16;
-        log::trace!("nvdrv:Ioctl fd={} device={:?} ioctl={:#010x} cmd={:#06x} in_size={} out_size={}",
-            req.fd, device, req.ioctl_id, cmd, req.in_data.len(), req.out_size);
+        log::trace!(
+            "nvdrv:Ioctl fd={} device={:?} ioctl={:#010x} cmd={:#06x} in_size={} out_size={}",
+            req.fd,
+            device,
+            req.ioctl_id,
+            cmd,
+            req.in_data.len(),
+            req.out_size
+        );
 
         match device {
             NvDevice::Nvmap => self.nvmap_ioctl(cmd, &req),
@@ -268,33 +281,69 @@ impl Nvdrv {
         match cmd {
             0x0101 => {
                 let raw_size = if req.in_data.len() >= 4 {
-                    u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]])
-                } else { 0 };
+                    u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ])
+                } else {
+                    0
+                };
                 let size = (raw_size + 0xFFF) & !0xFFF;
                 let id = self.next_nvmap_id;
                 self.next_nvmap_id = self.next_nvmap_id.wrapping_add(1);
-                self.nvmap_handles.insert(id, NvmapHandle {
-                    id, size, address: 0, kind: 0,
-                });
+                self.nvmap_handles.insert(
+                    id,
+                    NvmapHandle {
+                        id,
+                        size,
+                        address: 0,
+                        kind: 0,
+                    },
+                );
                 self.stats.nvmap_creates.fetch_add(1, Ordering::Relaxed);
-                if out.len() < 8 { out.resize(8, 0); }
+                if out.len() < 8 {
+                    out.resize(8, 0);
+                }
                 out[0..4].copy_from_slice(&size.to_le_bytes());
                 out[4..8].copy_from_slice(&id.to_le_bytes());
-                log::debug!("nvmap:Create in_data={:02x?} → size={} id={}", &req.in_data[..req.in_data.len().min(16)], size, id);
+                log::debug!(
+                    "nvmap:Create in_data={:02x?} → size={} id={}",
+                    &req.in_data[..req.in_data.len().min(16)],
+                    size,
+                    id
+                );
             }
             0x0103 => {
                 if req.in_data.len() >= 4 && out.len() >= 8 {
-                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     out[4..8].copy_from_slice(&id.to_le_bytes());
                     log::debug!("nvmap:FromId id={} → handle={}", id, id);
                 }
             }
             0x0104 => {
                 if req.in_data.len() >= 32 {
-                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     let address = u64::from_le_bytes([
-                        req.in_data[24], req.in_data[25], req.in_data[26], req.in_data[27],
-                        req.in_data[28], req.in_data[29], req.in_data[30], req.in_data[31],
+                        req.in_data[24],
+                        req.in_data[25],
+                        req.in_data[26],
+                        req.in_data[27],
+                        req.in_data[28],
+                        req.in_data[29],
+                        req.in_data[30],
+                        req.in_data[31],
                     ]);
                     if let Some(h) = self.nvmap_handles.get_mut(&id) {
                         h.address = address;
@@ -305,7 +354,12 @@ impl Nvdrv {
             }
             0x0105 => {
                 if req.in_data.len() >= 4 && out.len() >= 24 {
-                    let handle = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let handle = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     let size = self.nvmap_handles.get(&handle).map(|h| h.size).unwrap_or(0);
                     self.nvmap_handles.remove(&handle);
                     out[8..16].copy_from_slice(&0u64.to_le_bytes());
@@ -316,14 +370,28 @@ impl Nvdrv {
             }
             0x0109 => {
                 if req.in_data.len() >= 8 && out.len() >= 12 {
-                    let handle = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
-                    let param = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    let handle = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
+                    let param = u32::from_le_bytes([
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
+                    ]);
                     let result = match param {
                         1 => self.nvmap_handles.get(&handle).map(|h| h.size).unwrap_or(0),
                         2 => 0x10000,
                         3 => 0,
                         4 => 0x40000000,
-                        5 => self.nvmap_handles.get(&handle).map(|h| h.kind as u32).unwrap_or(0),
+                        5 => self
+                            .nvmap_handles
+                            .get(&handle)
+                            .map(|h| h.kind as u32)
+                            .unwrap_or(0),
                         _ => 0,
                     };
                     out[8..12].copy_from_slice(&result.to_le_bytes());
@@ -332,7 +400,12 @@ impl Nvdrv {
             }
             0x010E => {
                 if req.in_data.len() >= 8 && out.len() >= 4 {
-                    let handle = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    let handle = u32::from_le_bytes([
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
+                    ]);
                     out[0..4].copy_from_slice(&handle.to_le_bytes());
                     log::debug!("nvmap:GetId handle={} → id={}", handle, handle);
                 }
@@ -351,22 +424,27 @@ impl Nvdrv {
 
         match cmd {
             0x4701 => {
-                if out.len() < 4 { out.resize(4, 0); }
+                if out.len() < 4 {
+                    out.resize(4, 0);
+                }
                 out[0..4].copy_from_slice(&1u32.to_le_bytes());
                 log::debug!("nvhost-ctrl-gpu:ZCullGetCtxSize → 1");
             }
             0x4702 => {
-                if out.len() < 40 { out.resize(40, 0); }
-                let words: [u32; 10] = [
-                    0x20, 0x20, 0x400, 0x800, 0x20, 0x20, 0xc0, 0x20, 0x40, 0x10,
-                ];
+                if out.len() < 40 {
+                    out.resize(40, 0);
+                }
+                let words: [u32; 10] =
+                    [0x20, 0x20, 0x400, 0x800, 0x20, 0x20, 0xc0, 0x20, 0x40, 0x10];
                 for (i, w) in words.iter().enumerate() {
                     out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
                 }
                 log::debug!("nvhost-ctrl-gpu:ZCullGetInfo");
             }
             0x4705 => {
-                if out.len() < 0xB0 { out.resize(0xB0, 0); }
+                if out.len() < 0xB0 {
+                    out.resize(0xB0, 0);
+                }
                 out[0..8].copy_from_slice(&0xA0u64.to_le_bytes());
                 out[8..16].copy_from_slice(&0xdeadbeefu64.to_le_bytes());
                 let gc_off = 16usize;
@@ -423,9 +501,16 @@ impl Nvdrv {
                 log::debug!("nvhost-ctrl-gpu:ZbcQueryTable");
             }
             0x4706 => {
-                if out.len() < 24 { out.resize(24, 0); }
+                if out.len() < 24 {
+                    out.resize(24, 0);
+                }
                 if req.in_data.len() >= 4 {
-                    let mask_buf_size = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let mask_buf_size = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     if mask_buf_size != 0 {
                         out[16..20].copy_from_slice(&3u32.to_le_bytes());
                     }
@@ -439,10 +524,14 @@ impl Nvdrv {
                     out[4..8].copy_from_slice(&0x01u32.to_le_bytes());
                 }
                 self.legacy_gfx.store(true, Ordering::Relaxed);
-                log::debug!("nvhost-ctrl-gpu:GetActiveSlotMask → slot=7 mask=1 (legacy_gfx detected)");
+                log::debug!(
+                    "nvhost-ctrl-gpu:GetActiveSlotMask → slot=7 mask=1 (legacy_gfx detected)"
+                );
             }
             0x471c => {
-                if out.len() < 16 { out.resize(16, 0); }
+                if out.len() < 16 {
+                    out.resize(16, 0);
+                }
                 let ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
@@ -463,24 +552,56 @@ impl Nvdrv {
         out[..n].copy_from_slice(&req.in_data[..n]);
 
         match cmd {
-            0x4101 => { log::debug!("nvhost-as-gpu:BindChannel"); }
+            0x4101 => {
+                log::debug!("nvhost-as-gpu:BindChannel");
+            }
             0x4102 => {
                 let pages = if req.in_data.len() >= 4 {
-                    u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]])
-                } else { 0 };
+                    u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ])
+                } else {
+                    0
+                };
                 let page_size = if req.in_data.len() >= 8 {
-                    u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]])
-                } else { 0x1000 };
+                    u32::from_le_bytes([
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
+                    ])
+                } else {
+                    0x1000
+                };
                 let total_size = (pages as u64) * (page_size as u64);
                 let offset_in: u64 = if req.in_data.len() >= 24 {
                     u64::from_le_bytes([
-                        req.in_data[16], req.in_data[17], req.in_data[18], req.in_data[19],
-                        req.in_data[20], req.in_data[21], req.in_data[22], req.in_data[23],
+                        req.in_data[16],
+                        req.in_data[17],
+                        req.in_data[18],
+                        req.in_data[19],
+                        req.in_data[20],
+                        req.in_data[21],
+                        req.in_data[22],
+                        req.in_data[23],
                     ])
-                } else { 0 };
-                let alloc = if offset_in != 0 { offset_in } else { self.gpu.alloc_gpu_va(total_size.max(0x1000)) };
-                log::debug!("nvhost-as-gpu:AllocSpace pages={} page_size={:#x} → gpu_va={:#x}",
-                    pages, page_size, alloc);
+                } else {
+                    0
+                };
+                let alloc = if offset_in != 0 {
+                    offset_in
+                } else {
+                    self.gpu.alloc_gpu_va(total_size.max(0x1000))
+                };
+                log::debug!(
+                    "nvhost-as-gpu:AllocSpace pages={} page_size={:#x} → gpu_va={:#x}",
+                    pages,
+                    page_size,
+                    alloc
+                );
                 if out.len() >= 24 {
                     out[16..24].copy_from_slice(&alloc.to_le_bytes());
                 }
@@ -488,33 +609,78 @@ impl Nvdrv {
             0x4105 => {
                 if req.in_data.len() >= 8 {
                     let gpu_va = u64::from_le_bytes([
-                        req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],
-                        req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7],
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
                     ]);
                     log::debug!("nvhost-as-gpu:UnmapBuffer gpu_va={:#x}", gpu_va);
                 }
             }
             0x4106 => {
                 if req.in_data.len() >= 40 {
-                    let flags = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
-                    let _kind = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
-                    let nvmap_id = u32::from_le_bytes([req.in_data[8], req.in_data[9], req.in_data[10], req.in_data[11]]);
-                    let _page_size = u32::from_le_bytes([req.in_data[12], req.in_data[13], req.in_data[14], req.in_data[15]]);
+                    let flags = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
+                    let _kind = u32::from_le_bytes([
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
+                    ]);
+                    let nvmap_id = u32::from_le_bytes([
+                        req.in_data[8],
+                        req.in_data[9],
+                        req.in_data[10],
+                        req.in_data[11],
+                    ]);
+                    let _page_size = u32::from_le_bytes([
+                        req.in_data[12],
+                        req.in_data[13],
+                        req.in_data[14],
+                        req.in_data[15],
+                    ]);
                     let buffer_offset = u64::from_le_bytes([
-                        req.in_data[16], req.in_data[17], req.in_data[18], req.in_data[19],
-                        req.in_data[20], req.in_data[21], req.in_data[22], req.in_data[23],
+                        req.in_data[16],
+                        req.in_data[17],
+                        req.in_data[18],
+                        req.in_data[19],
+                        req.in_data[20],
+                        req.in_data[21],
+                        req.in_data[22],
+                        req.in_data[23],
                     ]);
                     let mapping_size_in = u64::from_le_bytes([
-                        req.in_data[24], req.in_data[25], req.in_data[26], req.in_data[27],
-                        req.in_data[28], req.in_data[29], req.in_data[30], req.in_data[31],
+                        req.in_data[24],
+                        req.in_data[25],
+                        req.in_data[26],
+                        req.in_data[27],
+                        req.in_data[28],
+                        req.in_data[29],
+                        req.in_data[30],
+                        req.in_data[31],
                     ]);
                     let requested_offset: u64 = u64::from_le_bytes([
-                        req.in_data[32], req.in_data[33], req.in_data[34], req.in_data[35],
-                        req.in_data[36], req.in_data[37], req.in_data[38], req.in_data[39],
+                        req.in_data[32],
+                        req.in_data[33],
+                        req.in_data[34],
+                        req.in_data[35],
+                        req.in_data[36],
+                        req.in_data[37],
+                        req.in_data[38],
+                        req.in_data[39],
                     ]);
 
                     let mapping_size = if mapping_size_in == 0 {
-                        self.nvmap_handles.get(&nvmap_id)
+                        self.nvmap_handles
+                            .get(&nvmap_id)
                             .map(|h| (h.size as u64).saturating_sub(buffer_offset))
                             .unwrap_or(0x1000)
                     } else {
@@ -525,13 +691,18 @@ impl Nvdrv {
                     } else {
                         self.gpu.alloc_gpu_va(mapping_size.max(0x10000))
                     };
-                    let cpu_addr = self.nvmap_handles.get(&nvmap_id)
+                    let cpu_addr = self
+                        .nvmap_handles
+                        .get(&nvmap_id)
                         .map(|h| h.address.wrapping_add(buffer_offset))
                         .unwrap_or(0);
                     log::debug!("nvhost-as-gpu:MapBufferEx flags={:#x} nvmap_id={} cpu_addr={:#x} size={:#x} → gpu_va={:#x}",
                         flags, nvmap_id, cpu_addr, mapping_size, gpu_va);
 
-                    self.gpu.mappings.lock().add(gpu_va, mapping_size, cpu_addr, nvmap_id);
+                    self.gpu
+                        .mappings
+                        .lock()
+                        .add(gpu_va, mapping_size, cpu_addr, nvmap_id);
 
                     if out.len() >= 40 {
                         out[32..40].copy_from_slice(&gpu_va.to_le_bytes());
@@ -554,14 +725,26 @@ impl Nvdrv {
                 out[40..48].copy_from_slice(&big_offset.to_le_bytes());
                 out[48..52].copy_from_slice(&big_page.to_le_bytes());
                 out[56..64].copy_from_slice(&big_pages.to_le_bytes());
-                log::debug!("nvhost-as-gpu:GetVARegions small_pages={} big_pages={}", small_pages, big_pages);
+                log::debug!(
+                    "nvhost-as-gpu:GetVARegions small_pages={} big_pages={}",
+                    small_pages,
+                    big_pages
+                );
             }
-            0x4109 => { log::debug!("nvhost-as-gpu:AllocAsEx (InitializeEx)"); }
+            0x4109 => {
+                log::debug!("nvhost-as-gpu:AllocAsEx (InitializeEx)");
+            }
             0x4103 => {
                 if req.in_data.len() >= 16 {
                     let gpu_va = u64::from_le_bytes([
-                        req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],
-                        req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7],
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
                     ]);
                     log::debug!("nvhost-as-gpu:FreeSpace gpu_va={:#x}", gpu_va);
                 }
@@ -570,30 +753,42 @@ impl Nvdrv {
                 let num_entries = req.in_data.len() / 20;
                 for i in 0..num_entries {
                     let off = i * 20;
-                    if req.in_data.len() < off + 20 { break; }
+                    if req.in_data.len() < off + 20 {
+                        break;
+                    }
                     let _flags = u16::from_le_bytes([req.in_data[off], req.in_data[off + 1]]);
                     let _kind = u16::from_le_bytes([req.in_data[off + 2], req.in_data[off + 3]]);
                     let nvmap_handle = u32::from_le_bytes([
-                        req.in_data[off + 4], req.in_data[off + 5],
-                        req.in_data[off + 6], req.in_data[off + 7],
+                        req.in_data[off + 4],
+                        req.in_data[off + 5],
+                        req.in_data[off + 6],
+                        req.in_data[off + 7],
                     ]);
                     let handle_offset_big_pages = u32::from_le_bytes([
-                        req.in_data[off + 8], req.in_data[off + 9],
-                        req.in_data[off + 10], req.in_data[off + 11],
+                        req.in_data[off + 8],
+                        req.in_data[off + 9],
+                        req.in_data[off + 10],
+                        req.in_data[off + 11],
                     ]);
                     let as_offset_big_pages = u32::from_le_bytes([
-                        req.in_data[off + 12], req.in_data[off + 13],
-                        req.in_data[off + 14], req.in_data[off + 15],
+                        req.in_data[off + 12],
+                        req.in_data[off + 13],
+                        req.in_data[off + 14],
+                        req.in_data[off + 15],
                     ]);
                     let big_pages = u32::from_le_bytes([
-                        req.in_data[off + 16], req.in_data[off + 17],
-                        req.in_data[off + 18], req.in_data[off + 19],
+                        req.in_data[off + 16],
+                        req.in_data[off + 17],
+                        req.in_data[off + 18],
+                        req.in_data[off + 19],
                     ]);
                     let big_page_size: u64 = 0x10000;
                     let gpu_va = (as_offset_big_pages as u64) * big_page_size;
                     let size = (big_pages as u64) * big_page_size;
                     let handle_off = (handle_offset_big_pages as u64) * big_page_size;
-                    let cpu_addr = self.nvmap_handles.get(&nvmap_handle)
+                    let cpu_addr = self
+                        .nvmap_handles
+                        .get(&nvmap_handle)
                         .map(|h| h.address.wrapping_add(handle_off))
                         .unwrap_or(0);
                     log::debug!(
@@ -601,7 +796,10 @@ impl Nvdrv {
                         i, num_entries, nvmap_handle, cpu_addr, gpu_va, size
                     );
                     if cpu_addr != 0 {
-                        self.gpu.mappings.lock().add(gpu_va, size, cpu_addr, nvmap_handle);
+                        self.gpu
+                            .mappings
+                            .lock()
+                            .add(gpu_va, size, cpu_addr, nvmap_handle);
                     }
                 }
             }
@@ -612,43 +810,76 @@ impl Nvdrv {
         IoctlOutcome::ok(out)
     }
 
-    fn nvhost_gpu_ioctl_with_mem(&mut self, cmd: u16, req: &IoctlRequest, mem_read: &dyn Fn(u64, &mut [u8]) -> bool, mem_write: &dyn Fn(u64, &[u8]) -> bool) -> IoctlOutcome {
+    fn nvhost_gpu_ioctl_with_mem(
+        &mut self,
+        cmd: u16,
+        req: &IoctlRequest,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) -> IoctlOutcome {
         let mut out = vec![0u8; req.out_size];
         let n = req.in_data.len().min(out.len());
         out[..n].copy_from_slice(&req.in_data[..n]);
 
         match cmd {
-            0x4801 => { log::debug!("nvhost-gpu:SetNvmapFd"); }
-            0x4803 => { log::debug!("nvhost-gpu:ChannelSetTimeout"); }
+            0x4801 => {
+                log::debug!("nvhost-gpu:SetNvmapFd");
+            }
+            0x4803 => {
+                log::debug!("nvhost-gpu:ChannelSetTimeout");
+            }
             0x4808 | 0x481b => {
                 let _ = self.renderer();
                 if req.in_data.len() >= 16 {
                     let address = u64::from_le_bytes([
-                        req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],
-                        req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7],
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
                     ]);
                     let num_entries = u32::from_le_bytes([
-                        req.in_data[8], req.in_data[9], req.in_data[10], req.in_data[11],
+                        req.in_data[8],
+                        req.in_data[9],
+                        req.in_data[10],
+                        req.in_data[11],
                     ]);
-                    log::trace!("nvhost-gpu:SubmitGPFIFO addr={:#x} entries={}", address, num_entries);
+                    log::trace!(
+                        "nvhost-gpu:SubmitGPFIFO addr={:#x} entries={}",
+                        address,
+                        num_entries
+                    );
 
                     if cmd == 0x4808 && req.in_data.len() >= 16 + (num_entries as usize) * 8 {
-                        let entries: Vec<gpu::CommandListHeader> = (0..num_entries as usize).map(|i| {
-                            let off = 16 + i * 8;
-                            gpu::CommandListHeader {
-                                address_lo: u32::from_le_bytes([
-                                    req.in_data[off], req.in_data[off + 1],
-                                    req.in_data[off + 2], req.in_data[off + 3],
-                                ]),
-                                address_hi_and_count: u32::from_le_bytes([
-                                    req.in_data[off + 4], req.in_data[off + 5],
-                                    req.in_data[off + 6], req.in_data[off + 7],
-                                ]),
-                            }
-                        }).collect();
+                        let entries: Vec<gpu::CommandListHeader> = (0..num_entries as usize)
+                            .map(|i| {
+                                let off = 16 + i * 8;
+                                gpu::CommandListHeader {
+                                    address_lo: u32::from_le_bytes([
+                                        req.in_data[off],
+                                        req.in_data[off + 1],
+                                        req.in_data[off + 2],
+                                        req.in_data[off + 3],
+                                    ]),
+                                    address_hi_and_count: u32::from_le_bytes([
+                                        req.in_data[off + 4],
+                                        req.in_data[off + 5],
+                                        req.in_data[off + 6],
+                                        req.in_data[off + 7],
+                                    ]),
+                                }
+                            })
+                            .collect();
                         self.stats.gpfifo_submits.fetch_add(1, Ordering::Relaxed);
-                        self.stats.gpfifo_entries.fetch_add(entries.len() as u64, Ordering::Relaxed);
-                        let (syncpt_id, syncpt_value) = self.gpu.process_inline_gpfifo(&entries, mem_read, mem_write);
+                        self.stats
+                            .gpfifo_entries
+                            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+                        let (syncpt_id, syncpt_value) = self
+                            .gpu
+                            .process_inline_gpfifo(&entries, mem_read, mem_write);
                         if log::log_enabled!(log::Level::Debug) {
                             let (dc, cc) = {
                                 let m = self.gpu.maxwell3d.lock();
@@ -663,10 +894,18 @@ impl Nvdrv {
                         }
                     } else if cmd == 0x481b && address != 0 {
                         self.stats.gpfifo_submits.fetch_add(1, Ordering::Relaxed);
-                        self.stats.gpfifo_entries.fetch_add(num_entries as u64, Ordering::Relaxed);
-                        let (syncpt_id, syncpt_value) = self.gpu.submit_gpfifo(address, num_entries, mem_read, mem_write);
-                        log::trace!("nvhost-gpu:SubmitGPFIFO (kickoff) addr={:#x} entries={} draws={}",
-                            address, num_entries, self.gpu.maxwell3d.lock().draw_count());
+                        self.stats
+                            .gpfifo_entries
+                            .fetch_add(num_entries as u64, Ordering::Relaxed);
+                        let (syncpt_id, syncpt_value) =
+                            self.gpu
+                                .submit_gpfifo(address, num_entries, mem_read, mem_write);
+                        log::trace!(
+                            "nvhost-gpu:SubmitGPFIFO (kickoff) addr={:#x} entries={} draws={}",
+                            address,
+                            num_entries,
+                            self.gpu.maxwell3d.lock().draw_count()
+                        );
                         if out.len() >= 24 {
                             out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
                             out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
@@ -683,30 +922,59 @@ impl Nvdrv {
             }
             0x4809 => {
                 if req.in_data.len() >= 8 && out.len() >= 16 {
-                    let class_num = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let class_num = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     out[8..16].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
-                    log::debug!("nvhost-gpu:AllocObjCtx class={:#x} → obj_id=0xDEADBEEF", class_num);
+                    log::debug!(
+                        "nvhost-gpu:AllocObjCtx class={:#x} → obj_id=0xDEADBEEF",
+                        class_num
+                    );
                 }
             }
             0x480b => {
                 if req.in_data.len() >= 12 {
                     let gpu_va = u64::from_le_bytes([
-                        req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],
-                        req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7],
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
                     ]);
-                    let mode = u32::from_le_bytes([req.in_data[8], req.in_data[9], req.in_data[10], req.in_data[11]]);
+                    let mode = u32::from_le_bytes([
+                        req.in_data[8],
+                        req.in_data[9],
+                        req.in_data[10],
+                        req.in_data[11],
+                    ]);
                     log::debug!("nvhost-gpu:ZCullBind gpu_va={:#x} mode={}", gpu_va, mode);
                 }
             }
             0x480c => {
                 if req.in_data.len() >= 20 {
-                    let enable = u32::from_le_bytes([req.in_data[16], req.in_data[17], req.in_data[18], req.in_data[19]]);
+                    let enable = u32::from_le_bytes([
+                        req.in_data[16],
+                        req.in_data[17],
+                        req.in_data[18],
+                        req.in_data[19],
+                    ]);
                     log::debug!("nvhost-gpu:SetErrorNotifier enable={}", enable);
                 }
             }
             0x480d => {
                 if req.in_data.len() >= 4 {
-                    let prio = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let prio = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     log::debug!("nvhost-gpu:SetPriority prio={:#x}", prio);
                 }
             }
@@ -715,7 +983,9 @@ impl Nvdrv {
             }
             0x4817 => {
                 if out.len() >= 16 {
-                    for b in out[..16].iter_mut() { *b = 0; }
+                    for b in out[..16].iter_mut() {
+                        *b = 0;
+                    }
                     out[14] = 0xFF;
                     out[15] = 0xFF;
                 }
@@ -723,20 +993,41 @@ impl Nvdrv {
             }
             0x481a => {
                 if req.in_data.len() >= 28 && out.len() >= 28 {
-                    let num_entries = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
-                    let flags = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    let num_entries = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
+                    let flags = u32::from_le_bytes([
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
+                    ]);
                     let syncpt_id = self.next_event_id;
                     self.next_event_id = self.next_event_id.wrapping_add(1);
                     out[12..16].copy_from_slice(&syncpt_id.to_le_bytes());
                     out[16..20].copy_from_slice(&0u32.to_le_bytes());
-                    log::debug!("nvhost-gpu:AllocGpfifoEx2 num_entries={} flags={:#x} → fence_id={}", num_entries, flags, syncpt_id);
+                    log::debug!(
+                        "nvhost-gpu:AllocGpfifoEx2 num_entries={} flags={:#x} → fence_id={}",
+                        num_entries,
+                        flags,
+                        syncpt_id
+                    );
                 }
             }
             0x4714 => {
                 if req.in_data.len() >= 8 {
                     let data = u64::from_le_bytes([
-                        req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3],
-                        req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7],
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
                     ]);
                     self.channel_client_data = data;
                     log::debug!("nvhost-gpu:SetClientData data={:#x}", data);
@@ -748,7 +1039,9 @@ impl Nvdrv {
                 }
                 log::debug!("nvhost-gpu:GetClientData → {:#x}", self.channel_client_data);
             }
-            0x481d => { log::debug!("nvhost-gpu:ChannelSetTimeslice"); }
+            0x481d => {
+                log::debug!("nvhost-gpu:ChannelSetTimeslice");
+            }
             other => {
                 log::debug!("nvhost-gpu: unknown ioctl cmd={:#x}", other);
             }
@@ -764,49 +1057,113 @@ impl Nvdrv {
         match cmd {
             0x0014 => {
                 if req.in_data.len() >= 4 && out.len() >= 8 {
-                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     out[4..8].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
-                    log::debug!("nvhost-ctrl:SyncptRead syncpt_id={} → 0x7FFFFFFF (HLE always-signaled)", id);
+                    log::debug!(
+                        "nvhost-ctrl:SyncptRead syncpt_id={} → 0x7FFFFFFF (HLE always-signaled)",
+                        id
+                    );
                 }
             }
             0x0015 => {
                 if req.in_data.len() >= 4 {
-                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     log::debug!("nvhost-ctrl:SyncptIncr syncpt_id={}", id);
                 }
             }
             0x0016 => {
                 if req.in_data.len() >= 12 {
-                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
-                    let threshold = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
-                    log::debug!("nvhost-ctrl:SyncptWait syncpt_id={} threshold={:#x}", id, threshold);
+                    let id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
+                    let threshold = u32::from_le_bytes([
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
+                    ]);
+                    log::debug!(
+                        "nvhost-ctrl:SyncptWait syncpt_id={} threshold={:#x}",
+                        id,
+                        threshold
+                    );
                 }
             }
             0x0019 => {
                 if req.in_data.len() >= 12 && out.len() >= 16 {
-                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
-                    let threshold = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    let id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
+                    let threshold = u32::from_le_bytes([
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
+                    ]);
                     out[12..16].copy_from_slice(&threshold.to_le_bytes());
-                    log::debug!("nvhost-ctrl:SyncptWaitEx syncpt={} threshold={:#x} (ack)", id, threshold);
+                    log::debug!(
+                        "nvhost-ctrl:SyncptWaitEx syncpt={} threshold={:#x} (ack)",
+                        id,
+                        threshold
+                    );
                 }
             }
             0x001a => {
                 if req.in_data.len() >= 4 && out.len() >= 8 {
-                    let id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     out[4..8].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
-                    log::debug!("nvhost-ctrl:SyncptReadMax syncpt={} → 0x7FFFFFFF (HLE always-signaled)", id);
+                    log::debug!(
+                        "nvhost-ctrl:SyncptReadMax syncpt={} → 0x7FFFFFFF (HLE always-signaled)",
+                        id
+                    );
                 }
             }
             0x001c => {
                 if req.in_data.len() >= 4 {
-                    let event_id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let event_id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     log::debug!("nvhost-ctrl:EventSignal event_id={}", event_id);
                 }
             }
             0x001d => {
                 if req.in_data.len() >= 16 && out.len() >= 16 {
-                    let syncpt_id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
-                    let threshold = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
+                    let syncpt_id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
+                    let threshold = u32::from_le_bytes([
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
+                    ]);
                     let current_val = self.gpu.pusher.lock().syncpt_value;
                     if current_val >= threshold {
                         out[12..16].copy_from_slice(&current_val.to_le_bytes());
@@ -824,9 +1181,24 @@ impl Nvdrv {
             }
             0x001e => {
                 if req.in_data.len() >= 16 {
-                    let syncpt_id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
-                    let threshold = u32::from_le_bytes([req.in_data[4], req.in_data[5], req.in_data[6], req.in_data[7]]);
-                    let event_id = u32::from_le_bytes([req.in_data[12], req.in_data[13], req.in_data[14], req.in_data[15]]);
+                    let syncpt_id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
+                    let threshold = u32::from_le_bytes([
+                        req.in_data[4],
+                        req.in_data[5],
+                        req.in_data[6],
+                        req.in_data[7],
+                    ]);
+                    let event_id = u32::from_le_bytes([
+                        req.in_data[12],
+                        req.in_data[13],
+                        req.in_data[14],
+                        req.in_data[15],
+                    ]);
                     let current_val = self.gpu.pusher.lock().syncpt_value;
                     if current_val >= threshold {
                         if out.len() >= 16 {
@@ -846,13 +1218,23 @@ impl Nvdrv {
             }
             0x001f => {
                 if req.in_data.len() >= 4 {
-                    let event_id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let event_id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     log::debug!("nvhost-ctrl:EventRegister event_id={}", event_id);
                 }
             }
             0x0020 => {
                 if req.in_data.len() >= 4 {
-                    let event_id = u32::from_le_bytes([req.in_data[0], req.in_data[1], req.in_data[2], req.in_data[3]]);
+                    let event_id = u32::from_le_bytes([
+                        req.in_data[0],
+                        req.in_data[1],
+                        req.in_data[2],
+                        req.in_data[3],
+                    ]);
                     log::debug!("nvhost-ctrl:EventUnregister event_id={}", event_id);
                 }
             }
@@ -865,7 +1247,11 @@ impl Nvdrv {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static N: AtomicU32 = AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 12 {
-                    log::info!("nvhost-ctrl:NvOsGetConfigU32 domain='{}' param='{}' → ConfigVarNotFound", domain, param);
+                    log::info!(
+                        "nvhost-ctrl:NvOsGetConfigU32 domain='{}' param='{}' → ConfigVarNotFound",
+                        domain,
+                        param
+                    );
                 }
                 return IoctlOutcome::error(0x0003_0006);
             }
@@ -878,23 +1264,31 @@ impl Nvdrv {
 
     pub fn with_bufferqueue<R>(&self, binder_id: u32, f: impl FnOnce(&mut BufferQueue) -> R) -> R {
         let mut bqs = self.bufferqueues.lock();
-        let bq = bqs.entry(binder_id).or_insert_with(|| BufferQueue::new(binder_id));
+        let bq = bqs
+            .entry(binder_id)
+            .or_insert_with(|| BufferQueue::new(binder_id));
         f(bq)
     }
 
     pub fn drain_frames(&self) -> Vec<QueuedFrame> {
         let frames = std::mem::take(&mut *self.frame_queue.lock());
-        self.stats.frames_drained.fetch_add(frames.len() as u64, Ordering::Relaxed);
+        self.stats
+            .frames_drained
+            .fetch_add(frames.len() as u64, Ordering::Relaxed);
         frames
     }
 
     pub fn submit_frame(&self, frame: QueuedFrame) {
-        self.queue_buffer_active.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.queue_buffer_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.frame_queue.lock().push(frame);
         self.stats.frames_submitted.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn capture_gpu_frame(&self, mem_read: impl Fn(u64, &mut [u8]) -> bool) -> Option<QueuedFrame> {
+    pub fn capture_gpu_frame(
+        &self,
+        mem_read: impl Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<QueuedFrame> {
         let maxwell = self.gpu.maxwell3d.lock();
         let (w, h) = maxwell.primary_rt_size()?;
         let gpu_va = maxwell.primary_rt_gpu_va()?;
@@ -907,13 +1301,20 @@ impl Nvdrv {
         let size = (w as usize) * (h as usize) * 4;
         let mut pixels = vec![0u8; size];
         if mem_read(cpu, &mut pixels) {
-            Some(QueuedFrame { width: w, height: h, pixels })
+            Some(QueuedFrame {
+                width: w,
+                height: h,
+                pixels,
+            })
         } else {
             None
         }
     }
 
-    pub fn try_capture_sdl_surface(&self, mem_read: impl Fn(u64, &mut [u8]) -> bool) -> Option<QueuedFrame> {
+    pub fn try_capture_sdl_surface(
+        &self,
+        mem_read: impl Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<QueuedFrame> {
         const CANDIDATES: &[(u32, u32, u32)] = &[
             (1280, 720, 1280),
             (1280, 768, 1280),
@@ -929,7 +1330,10 @@ impl Nvdrv {
             if handle.address == 0 || handle.size == 0 {
                 continue;
             }
-            let Some(&(w, h, stride)) = CANDIDATES.iter().find(|(_w, hh, stride)| (*stride as u32) * (*hh as u32) * 4 == handle.size as u32) else {
+            let Some(&(w, h, stride)) = CANDIDATES
+                .iter()
+                .find(|(_w, hh, stride)| (*stride as u32) * (*hh as u32) * 4 == handle.size as u32)
+            else {
                 continue;
             };
 
@@ -953,7 +1357,14 @@ impl Nvdrv {
         }
 
         let (w, h, stride, addr, nz, linear) = best?;
-        log::debug!("captured SDL surface addr={:#x} {}x{} stride={} (nz={})", addr, w, h, stride, nz);
+        log::debug!(
+            "captured SDL surface addr={:#x} {}x{} stride={} (nz={})",
+            addr,
+            w,
+            h,
+            stride,
+            nz
+        );
 
         let dst_w = 1280u32;
         let dst_h = 720u32;
@@ -969,7 +1380,11 @@ impl Nvdrv {
                 }
             }
         }
-        Some(QueuedFrame { width: dst_w, height: dst_h, pixels: out })
+        Some(QueuedFrame {
+            width: dst_w,
+            height: dst_h,
+            pixels: out,
+        })
     }
 
     pub fn gpu_draw_count(&self) -> u64 {

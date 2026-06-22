@@ -1,17 +1,15 @@
-
-
 use std::collections::{BTreeSet, HashMap};
 
+use super::decode::decode_one;
 use super::ir::{Inst, Op, Predicate, Program, Value, ValueId};
+use super::opcodes::Opcode;
 use super::operand::{decoded_pred, RZ};
 use super::translate::Translator;
-use super::decode::decode_one; use super::opcodes::Opcode;
 
 pub type BlockId = u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BranchKind {
-
     FallThrough,
 
     Unconditional { target: BlockId },
@@ -201,7 +199,10 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
 
     patch_back_edge_phi_sources(&mut blocks);
 
-    Cfg { blocks, unimplemented: total_unimpl }
+    Cfg {
+        blocks,
+        unimplemented: total_unimpl,
+    }
 }
 
 struct BlockInfo {
@@ -251,7 +252,12 @@ fn discover_topology(
             }
             offset += 8;
         }
-        out.push(BlockInfo { start, end, branch, terminator_offset });
+        out.push(BlockInfo {
+            start,
+            end,
+            branch,
+            terminator_offset,
+        });
     }
     out
 }
@@ -351,12 +357,13 @@ fn compute_initial_reg_state(
 }
 
 fn patch_back_edge_phi_sources(blocks: &mut [BasicBlock]) {
-    let reg_exits: Vec<HashMap<u8, Value>> =
-        blocks.iter().map(|b| b.reg_exit.clone()).collect();
+    let reg_exits: Vec<HashMap<u8, Value>> = blocks.iter().map(|b| b.reg_exit.clone()).collect();
     for block in blocks.iter_mut() {
         let bid = block.id;
         for inst in block.program.instructions.iter_mut() {
-            let Op::Phi { sources } = &mut inst.op else { continue };
+            let Op::Phi { sources } = &mut inst.op else {
+                continue;
+            };
             let Some(reg) = inst.dest_reg else { continue };
             if reg == RZ {
                 continue;
@@ -373,16 +380,14 @@ fn patch_back_edge_phi_sources(blocks: &mut [BasicBlock]) {
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
-    matches!(
-        (a, b),
-        (Value::Zero, Value::Zero)
-    ) || match (a, b) {
-        (Value::Inst(a), Value::Inst(b)) => a.0 == b.0,
-        (Value::GprIn(a), Value::GprIn(b)) => a == b,
-        (Value::ImmU32(a), Value::ImmU32(b)) => a == b,
-        (Value::ImmF32(a), Value::ImmF32(b)) => a.to_bits() == b.to_bits(),
-        _ => false,
-    }
+    matches!((a, b), (Value::Zero, Value::Zero))
+        || match (a, b) {
+            (Value::Inst(a), Value::Inst(b)) => a.0 == b.0,
+            (Value::GprIn(a), Value::GprIn(b)) => a == b,
+            (Value::ImmU32(a), Value::ImmU32(b)) => a == b,
+            (Value::ImmF32(a), Value::ImmF32(b)) => a.to_bits() == b.to_bits(),
+            _ => false,
+        }
 }
 
 #[cfg(test)]
@@ -390,12 +395,10 @@ mod tests {
     use super::*;
 
     fn enc_exit() -> u64 {
-
         0xE300_0000_0007_000Fu64
     }
 
     fn enc_fmul_reg(rd: u8, ra: u8, rb: u8) -> u64 {
-
         0x5C68_1000_0000_0000u64
             | ((rb as u64) << 20)
             | ((ra as u64) << 8)
@@ -404,7 +407,6 @@ mod tests {
     }
 
     fn build_program(words: &[u64]) -> Vec<u8> {
-
         let mut bytes = Vec::new();
         let mut idx = 0;
         for chunk in words.chunks(3) {
@@ -420,7 +422,6 @@ mod tests {
     }
 
     fn enc_fadd_reg(rd: u8, ra: u8, rb: u8) -> u64 {
-
         0x5C58_0000_0000_0000u64
             | ((rb as u64) << 20)
             | ((ra as u64) << 8)
@@ -436,7 +437,6 @@ mod tests {
 
     #[test]
     fn conditional_branch_creates_three_blocks_with_phi() {
-
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[0u8; 8]);
         bytes.extend_from_slice(&enc_fmul_reg(2, 0, 1).to_le_bytes());
@@ -449,7 +449,10 @@ mod tests {
 
         let cfg = build_cfg(&bytes);
         assert_eq!(cfg.blocks.len(), 3, "expected 3 blocks");
-        assert!(matches!(cfg.blocks[0].branch, BranchKind::Conditional { .. }));
+        assert!(matches!(
+            cfg.blocks[0].branch,
+            BranchKind::Conditional { .. }
+        ));
         assert!(matches!(cfg.blocks[1].branch, BranchKind::FallThrough));
         assert!(matches!(cfg.blocks[2].branch, BranchKind::Exit));
 
@@ -474,10 +477,14 @@ mod tests {
             .find(|i| matches!(i.op, Op::FMul { .. }))
             .expect("expected the FMul in the merge block");
         if let Op::FMul { a, b, .. } = &fmul.op {
-            assert!(matches!(a, Value::Inst(id) if *id == phi_id),
-                "FMul.a should reference the phi result, got {a:?}");
-            assert!(matches!(b, Value::Inst(id) if *id == phi_id),
-                "FMul.b should reference the phi result, got {b:?}");
+            assert!(
+                matches!(a, Value::Inst(id) if *id == phi_id),
+                "FMul.a should reference the phi result, got {a:?}"
+            );
+            assert!(
+                matches!(b, Value::Inst(id) if *id == phi_id),
+                "FMul.b should reference the phi result, got {b:?}"
+            );
         }
     }
 
@@ -488,7 +495,6 @@ mod tests {
 
     #[test]
     fn back_edge_creates_phi_with_patched_source() {
-
         let mut bytes = Vec::new();
 
         bytes.extend_from_slice(&[0u8; 8]);
@@ -508,8 +514,14 @@ mod tests {
 
         let cfg = build_cfg(&bytes);
         assert_eq!(cfg.blocks.len(), 3);
-        assert!(matches!(cfg.blocks[0].branch, BranchKind::Unconditional { target: 1 }));
-        assert!(matches!(cfg.blocks[1].branch, BranchKind::Conditional { target: 1, .. }));
+        assert!(matches!(
+            cfg.blocks[0].branch,
+            BranchKind::Unconditional { target: 1 }
+        ));
+        assert!(matches!(
+            cfg.blocks[1].branch,
+            BranchKind::Conditional { target: 1, .. }
+        ));
         assert!(matches!(cfg.blocks[2].branch, BranchKind::Exit));
 
         let preds = cfg.predecessors();
@@ -523,7 +535,9 @@ mod tests {
             .find(|i| matches!(i.op, Op::Phi { .. }) && i.dest_reg == Some(2))
             .expect("expected phi for R2 in B1");
         let phi_id = phi.result.unwrap();
-        let Op::Phi { sources } = &phi.op else { unreachable!() };
+        let Op::Phi { sources } = &phi.op else {
+            unreachable!()
+        };
         assert_eq!(sources.len(), 2);
 
         for (pred_id, val) in sources {
@@ -557,11 +571,7 @@ mod tests {
 
     #[test]
     fn straight_line_one_block() {
-        let bytes = build_program(&[
-            enc_fmul_reg(2, 0, 1),
-            enc_fmul_reg(3, 0, 1),
-            enc_exit(),
-        ]);
+        let bytes = build_program(&[enc_fmul_reg(2, 0, 1), enc_fmul_reg(3, 0, 1), enc_exit()]);
         let cfg = build_cfg(&bytes);
         assert_eq!(cfg.blocks.len(), 1);
         assert!(matches!(cfg.blocks[0].branch, BranchKind::Exit));

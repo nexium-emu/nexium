@@ -23,13 +23,14 @@ pub struct PipelineKey {
     pub vs_cbuf_mask: u32,
     pub fs_cbuf_mask: u32,
     pub vertex_layout_hash: u64,
-    pub blend_signature: u32,
+    pub blend_signature: u64,
     pub raster_state_packed: u32,
     pub depth_state_packed: u32,
+    pub depth_clamp_enabled: bool,
     pub poly_offset_packed: u64,
 }
 
-const SPEC_VERSION: u32 = 5;
+const SPEC_VERSION: u32 = 7;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineSpec {
@@ -42,8 +43,9 @@ pub struct PipelineSpec {
     pub color_format: i32,
     pub depth_format: i32,
     pub has_depth: bool,
-    pub blend: (bool, i32, i32, i32),
+    pub blend: (bool, i32, i32, i32, i32, i32, i32),
     pub depth: (bool, bool, i32),
+    pub depth_clamp_enabled: bool,
     pub cull_test_enable: bool,
     pub cull_face: u32,
     pub front_face: u32,
@@ -110,12 +112,16 @@ pub fn spec_to_request(
             src_factor: vk::BlendFactor::from_raw(spec.blend.1),
             dst_factor: vk::BlendFactor::from_raw(spec.blend.2),
             op: vk::BlendOp::from_raw(spec.blend.3),
+            src_alpha_factor: vk::BlendFactor::from_raw(spec.blend.4),
+            dst_alpha_factor: vk::BlendFactor::from_raw(spec.blend.5),
+            alpha_op: vk::BlendOp::from_raw(spec.blend.6),
         },
         depth: crate::draw::DepthState {
             test_enabled: spec.depth.0,
             write_enabled: spec.depth.1,
             compare_op: vk::CompareOp::from_raw(spec.depth.2),
         },
+        depth_clamp_enabled: spec.depth_clamp_enabled,
         cull_test_enable: spec.cull_test_enable,
         cull_face: spec.cull_face,
         front_face: spec.front_face,
@@ -138,6 +144,7 @@ pub struct PipelineBuildRequest {
     pub has_depth: bool,
     pub blend: crate::draw::BlendState,
     pub depth: crate::draw::DepthState,
+    pub depth_clamp_enabled: bool,
     pub cull_test_enable: bool,
     pub cull_face: u32,
     pub front_face: u32,
@@ -242,9 +249,17 @@ pub fn build_graphics_pipeline(
         cull_mode: host_cull,
         front_face: host_front_face,
         line_width: 1.0,
-        depth_clamp_enable: vk::FALSE,
+        depth_clamp_enable: if req.depth_clamp_enabled {
+            vk::TRUE
+        } else {
+            vk::FALSE
+        },
         rasterizer_discard_enable: vk::FALSE,
-        depth_bias_enable: if req.poly_offset_enable { vk::TRUE } else { vk::FALSE },
+        depth_bias_enable: if req.poly_offset_enable {
+            vk::TRUE
+        } else {
+            vk::FALSE
+        },
         depth_bias_constant_factor: req.poly_offset_units / 2.0,
         depth_bias_clamp: 0.0,
         depth_bias_slope_factor: req.poly_offset_factor,
@@ -267,13 +282,17 @@ pub fn build_graphics_pipeline(
     };
 
     let cb_attachment = vk::PipelineColorBlendAttachmentState {
-        blend_enable: if req.blend.enabled { vk::TRUE } else { vk::FALSE },
+        blend_enable: if req.blend.enabled {
+            vk::TRUE
+        } else {
+            vk::FALSE
+        },
         src_color_blend_factor: req.blend.src_factor,
         dst_color_blend_factor: req.blend.dst_factor,
         color_blend_op: req.blend.op,
-        src_alpha_blend_factor: req.blend.src_factor,
-        dst_alpha_blend_factor: req.blend.dst_factor,
-        alpha_blend_op: req.blend.op,
+        src_alpha_blend_factor: req.blend.src_alpha_factor,
+        dst_alpha_blend_factor: req.blend.dst_alpha_factor,
+        alpha_blend_op: req.blend.alpha_op,
         color_write_mask: vk::ColorComponentFlags::RGBA,
     };
     let cb_state = vk::PipelineColorBlendStateCreateInfo {
@@ -300,8 +319,16 @@ pub fn build_graphics_pipeline(
 
     let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-        depth_test_enable: if req.depth.test_enabled { vk::TRUE } else { vk::FALSE },
-        depth_write_enable: if req.depth.write_enabled { vk::TRUE } else { vk::FALSE },
+        depth_test_enable: if req.depth.test_enabled {
+            vk::TRUE
+        } else {
+            vk::FALSE
+        },
+        depth_write_enable: if req.depth.write_enabled {
+            vk::TRUE
+        } else {
+            vk::FALSE
+        },
         depth_compare_op: req.depth.compare_op,
         depth_bounds_test_enable: vk::FALSE,
         stencil_test_enable: vk::FALSE,
@@ -313,8 +340,11 @@ pub fn build_graphics_pipeline(
         flags: Default::default(),
         _marker: std::marker::PhantomData,
     };
-    let p_depth_stencil_state: *const vk::PipelineDepthStencilStateCreateInfo =
-        if req.has_depth { &depth_stencil_state } else { std::ptr::null() };
+    let p_depth_stencil_state: *const vk::PipelineDepthStencilStateCreateInfo = if req.has_depth {
+        &depth_stencil_state
+    } else {
+        std::ptr::null()
+    };
 
     let color_formats = [req.color_format];
     let mut rendering_info = vk::PipelineRenderingCreateInfo {
@@ -404,7 +434,8 @@ impl PipelineCache {
         };
 
         let layout = unsafe {
-            device.create_pipeline_layout(&pipeline_layout_info, None)
+            device
+                .create_pipeline_layout(&pipeline_layout_info, None)
                 .map_err(|e| format!("create_pipeline_layout: {:?}", e))?
         };
 
@@ -426,10 +457,14 @@ impl PipelineCache {
             _marker: std::marker::PhantomData,
         };
         let vk_cache = unsafe {
-            device.create_pipeline_cache(&cache_info, None)
+            device
+                .create_pipeline_cache(&cache_info, None)
                 .map_err(|e| format!("create_pipeline_cache: {:?}", e))?
         };
-        log::info!("VkPipelineCache initialized ({} bytes from disk)", initial.len());
+        log::info!(
+            "VkPipelineCache initialized ({} bytes from disk)",
+            initial.len()
+        );
 
         let writer_path = path.clone();
         let (save_tx, save_rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -437,7 +472,9 @@ impl PipelineCache {
             .name("nexium-pipecache".to_string())
             .spawn(move || {
                 while let Ok(data) = save_rx.recv() {
-                    let Some(path) = writer_path.as_ref() else { continue; };
+                    let Some(path) = writer_path.as_ref() else {
+                        continue;
+                    };
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -456,7 +493,10 @@ impl PipelineCache {
             .and_then(|p| {
                 let meta = std::fs::metadata(p).ok()?;
                 if meta.len() > 512 * 1024 * 1024 {
-                    log::warn!("shader specs file too large ({} bytes), ignoring", meta.len());
+                    log::warn!(
+                        "shader specs file too large ({} bytes), ignoring",
+                        meta.len()
+                    );
                     return None;
                 }
                 match std::fs::read(p) {
@@ -470,7 +510,11 @@ impl PipelineCache {
             .and_then(|bytes| match bincode::deserialize::<SpecFile>(&bytes) {
                 Ok(f) if f.version == SPEC_VERSION => Some(f),
                 Ok(f) => {
-                    log::warn!("shader specs version {} != {}, ignoring", f.version, SPEC_VERSION);
+                    log::warn!(
+                        "shader specs version {} != {}, ignoring",
+                        f.version,
+                        SPEC_VERSION
+                    );
                     None
                 }
                 Err(e) => {
@@ -489,7 +533,9 @@ impl PipelineCache {
             .name("nexium-speccache".to_string())
             .spawn(move || {
                 while let Ok(data) = specs_rx.recv() {
-                    let Some(path) = specs_writer_path.as_ref() else { continue; };
+                    let Some(path) = specs_writer_path.as_ref() else {
+                        continue;
+                    };
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -505,8 +551,7 @@ impl PipelineCache {
         let cache_lock = std::sync::Arc::new(std::sync::RwLock::new(()));
         let worker = {
             let (req_tx, req_rx) = std::sync::mpsc::channel::<PipelineBuildRequest>();
-            let (res_tx, res_rx) =
-                std::sync::mpsc::channel::<(PipelineKey, vk::Pipeline)>();
+            let (res_tx, res_rx) = std::sync::mpsc::channel::<(PipelineKey, vk::Pipeline)>();
             let req_rx = std::sync::Arc::new(std::sync::Mutex::new(req_rx));
             let num_workers = std::thread::available_parallelism()
                 .map(|n| n.get().saturating_sub(2))
@@ -530,13 +575,14 @@ impl PipelineCache {
                                 Err(_) => break,
                             }
                         };
-                        let pipe = match build_graphics_pipeline(&dev, wcache, wlayout, &wlock, &req) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                log::warn!("async pipeline build failed: {}", e);
-                                vk::Pipeline::null()
-                            }
-                        };
+                        let pipe =
+                            match build_graphics_pipeline(&dev, wcache, wlayout, &wlock, &req) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    log::warn!("async pipeline build failed: {}", e);
+                                    vk::Pipeline::null()
+                                }
+                            };
                         if tx.send((req.key, pipe)).is_err() {
                             break;
                         }
@@ -627,7 +673,9 @@ impl PipelineCache {
                 continue;
             }
             if self.pipelines.contains_key(&key) {
-                unsafe { device.destroy_pipeline(pipe, None); }
+                unsafe {
+                    device.destroy_pipeline(pipe, None);
+                }
             } else {
                 self.pipelines.insert(key, pipe);
                 self.dirty = true;
@@ -718,7 +766,12 @@ impl PipelineCache {
 
     pub fn clear(&mut self, device: &ash::Device) {
         if let Some(w) = self.worker.take() {
-            let CompileWorker { req_tx, res_rx, handles, in_flight: _ } = w;
+            let CompileWorker {
+                req_tx,
+                res_rx,
+                handles,
+                in_flight: _,
+            } = w;
             drop(req_tx);
             for h in handles {
                 let _ = h.join();
@@ -737,7 +790,9 @@ impl PipelineCache {
             }
         }
         if self.vk_cache != vk::PipelineCache::null() {
-            unsafe { device.destroy_pipeline_cache(self.vk_cache, None); }
+            unsafe {
+                device.destroy_pipeline_cache(self.vk_cache, None);
+            }
             self.vk_cache = vk::PipelineCache::null();
         }
         if self.layout != vk::PipelineLayout::null() {

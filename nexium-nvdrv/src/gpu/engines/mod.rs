@@ -1,11 +1,11 @@
-pub mod maxwell3d;
-pub mod macro_engine;
-pub mod maxwell_dma;
 pub mod fermi_2d;
 pub mod kepler_memory;
+pub mod macro_engine;
+pub mod maxwell3d;
+pub mod maxwell_dma;
 pub mod sw_renderer;
-pub use maxwell3d::{Maxwell3D, Maxwell3DRegisters, RenderTarget, DrawCall};
-pub use macro_engine::{MacroEngine, MACRO_REGISTERS_START};
-pub use maxwell_dma::{MaxwellDma, MAXWELL_DMA_CLASS};
 pub use fermi_2d::{Fermi2D, FERMI_2D_CLASS};
 pub use kepler_memory::{KeplerMemory, KEPLER_MEMORY_CLASS};
+pub use macro_engine::{MacroEngine, MACRO_REGISTERS_START};
+pub use maxwell3d::{DrawCall, Maxwell3D, Maxwell3DRegisters, RenderTarget};
+pub use maxwell_dma::{MaxwellDma, MAXWELL_DMA_CLASS};

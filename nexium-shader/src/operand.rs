@@ -3,7 +3,11 @@ use crate::ir::FMods;
 #[inline]
 fn bits(insn: u64, lo: u32, hi: u32) -> u64 {
     let len = hi - lo + 1;
-    let mask = if len == 64 { u64::MAX } else { (1u64 << len) - 1 };
+    let mask = if len == 64 {
+        u64::MAX
+    } else {
+        (1u64 << len) - 1
+    };
     (insn >> lo) & mask
 }
 
@@ -122,7 +126,6 @@ pub struct LdcRef {
 
 #[inline]
 pub fn ldc_ref(insn: u64) -> LdcRef {
-
     let raw_off = bits(insn, 20, 35) as u32;
 
     let byte_offset = if raw_off & (1 << 15) != 0 {
@@ -131,7 +134,10 @@ pub fn ldc_ref(insn: u64) -> LdcRef {
         raw_off as i32
     };
     let binding = bits(insn, 36, 40) as u8;
-    LdcRef { binding, byte_offset }
+    LdcRef {
+        binding,
+        byte_offset,
+    }
 }
 
 #[inline]
@@ -173,18 +179,30 @@ pub fn fsetp_cmp(insn: u64) -> u64 {
 }
 
 #[inline]
-pub fn fsetp_neg_a(insn: u64) -> bool { bits(insn, 43, 43) != 0 }
+pub fn fsetp_neg_a(insn: u64) -> bool {
+    bits(insn, 43, 43) != 0
+}
 #[inline]
-pub fn fsetp_abs_a(insn: u64) -> bool { bits(insn, 7, 7) != 0 }
+pub fn fsetp_abs_a(insn: u64) -> bool {
+    bits(insn, 7, 7) != 0
+}
 #[inline]
-pub fn fsetp_neg_b(insn: u64) -> bool { bits(insn, 6, 6) != 0 }
+pub fn fsetp_neg_b(insn: u64) -> bool {
+    bits(insn, 6, 6) != 0
+}
 #[inline]
-pub fn fsetp_abs_b(insn: u64) -> bool { bits(insn, 44, 44) != 0 }
+pub fn fsetp_abs_b(insn: u64) -> bool {
+    bits(insn, 44, 44) != 0
+}
 
 #[inline]
 pub fn float_imm20(insn: u64) -> f32 {
     let value = (bits(insn, 20, 38) as u32) << 12;
-    let sign = if bits(insn, 56, 56) != 0 { 1u32 << 31 } else { 0 };
+    let sign = if bits(insn, 56, 56) != 0 {
+        1u32 << 31
+    } else {
+        0
+    };
     f32::from_bits(value | sign)
 }
 
@@ -283,47 +301,87 @@ pub fn f2f_mods(insn: u64) -> F2fMods {
 }
 
 #[inline]
-pub fn i2f_signed(insn: u64) -> bool { bits(insn, 13, 13) != 0 }
+pub fn i2f_signed(insn: u64) -> bool {
+    bits(insn, 13, 13) != 0
+}
 #[inline]
-pub fn i2f_neg(insn: u64) -> bool { bits(insn, 45, 45) != 0 }
+pub fn i2f_neg(insn: u64) -> bool {
+    bits(insn, 45, 45) != 0
+}
 #[inline]
-pub fn i2f_abs(insn: u64) -> bool { bits(insn, 49, 49) != 0 }
+pub fn i2f_abs(insn: u64) -> bool {
+    bits(insn, 49, 49) != 0
+}
 #[inline]
-pub fn i2f_int_format(insn: u64) -> u8 { bits(insn, 10, 11) as u8 }
+pub fn i2f_int_format(insn: u64) -> u8 {
+    bits(insn, 10, 11) as u8
+}
 #[inline]
-pub fn i2f_selector(insn: u64) -> u8 { bits(insn, 41, 42) as u8 }
+pub fn i2f_selector(insn: u64) -> u8 {
+    bits(insn, 41, 42) as u8
+}
 
 #[inline]
-pub fn fset_neg_a(insn: u64) -> bool { bits(insn, 43, 43) != 0 }
+pub fn fset_neg_a(insn: u64) -> bool {
+    bits(insn, 43, 43) != 0
+}
 #[inline]
-pub fn fset_abs_a(insn: u64) -> bool { bits(insn, 54, 54) != 0 }
+pub fn fset_abs_a(insn: u64) -> bool {
+    bits(insn, 54, 54) != 0
+}
 #[inline]
-pub fn fset_neg_b(insn: u64) -> bool { bits(insn, 53, 53) != 0 }
+pub fn fset_neg_b(insn: u64) -> bool {
+    bits(insn, 53, 53) != 0
+}
 #[inline]
-pub fn fset_abs_b(insn: u64) -> bool { bits(insn, 44, 44) != 0 }
+pub fn fset_abs_b(insn: u64) -> bool {
+    bits(insn, 44, 44) != 0
+}
 #[inline]
-pub fn fset_cmp(insn: u64) -> u64 { bits(insn, 48, 51) }
+pub fn fset_cmp(insn: u64) -> u64 {
+    bits(insn, 48, 51)
+}
 #[inline]
-pub fn fset_bop(insn: u64) -> u64 { bits(insn, 45, 46) }
+pub fn fset_bop(insn: u64) -> u64 {
+    bits(insn, 45, 46)
+}
 #[inline]
-pub fn fset_src_pred(insn: u64) -> u8 { bits(insn, 39, 41) as u8 }
+pub fn fset_src_pred(insn: u64) -> u8 {
+    bits(insn, 39, 41) as u8
+}
 #[inline]
-pub fn fset_src_pred_inv(insn: u64) -> bool { bits(insn, 42, 42) != 0 }
+pub fn fset_src_pred_inv(insn: u64) -> bool {
+    bits(insn, 42, 42) != 0
+}
 
 #[inline]
-pub fn isetp_signed(insn: u64) -> bool { bits(insn, 48, 48) != 0 }
+pub fn isetp_signed(insn: u64) -> bool {
+    bits(insn, 48, 48) != 0
+}
 #[inline]
-pub fn isetp_cmp(insn: u64) -> u64 { bits(insn, 49, 51) }
+pub fn isetp_cmp(insn: u64) -> u64 {
+    bits(insn, 49, 51)
+}
 #[inline]
-pub fn isetp_bop(insn: u64) -> u64 { bits(insn, 45, 46) }
+pub fn isetp_bop(insn: u64) -> u64 {
+    bits(insn, 45, 46)
+}
 #[inline]
-pub fn isetp_src_pred(insn: u64) -> u8 { bits(insn, 39, 41) as u8 }
+pub fn isetp_src_pred(insn: u64) -> u8 {
+    bits(insn, 39, 41) as u8
+}
 #[inline]
-pub fn isetp_src_pred_inv(insn: u64) -> bool { bits(insn, 42, 42) != 0 }
+pub fn isetp_src_pred_inv(insn: u64) -> bool {
+    bits(insn, 42, 42) != 0
+}
 #[inline]
-pub fn isetp_dest_p(insn: u64) -> u8 { bits(insn, 3, 5) as u8 }
+pub fn isetp_dest_p(insn: u64) -> u8 {
+    bits(insn, 3, 5) as u8
+}
 #[inline]
-pub fn isetp_dest_np(insn: u64) -> u8 { bits(insn, 0, 2) as u8 }
+pub fn isetp_dest_np(insn: u64) -> u8 {
+    bits(insn, 0, 2) as u8
+}
 
 #[inline]
 pub fn fmnmx_mods(insn: u64) -> FMods {

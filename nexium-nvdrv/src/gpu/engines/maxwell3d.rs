@@ -41,6 +41,72 @@ pub struct Viewport {
 }
 
 #[derive(Clone, Copy, Default, Debug)]
+pub struct SurfaceClip {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl SurfaceClip {
+    pub fn effective(self, rt_width: u32, rt_height: u32) -> Self {
+        Self {
+            x: self.x,
+            y: self.y,
+            width: if self.width != 0 {
+                self.width
+            } else {
+                rt_width
+            },
+            height: if self.height != 0 {
+                self.height
+            } else {
+                rt_height
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ViewportClipControl {
+    pub raw: u32,
+}
+
+impl ViewportClipControl {
+    pub fn geometry_clip(self) -> u32 {
+        (self.raw >> 11) & 0x7
+    }
+
+    pub fn depth_clamp_enabled(self) -> bool {
+        !matches!(self.geometry_clip(), 1 | 3 | 5)
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct WindowOrigin {
+    pub raw: u32,
+}
+
+impl WindowOrigin {
+    pub fn lower_left(self) -> bool {
+        self.raw & 1 != 0
+    }
+
+    pub fn flip_y(self) -> bool {
+        self.raw & 0x10 != 0
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ScissorTest {
+    pub enabled: bool,
+    pub min_x: u32,
+    pub max_x: u32,
+    pub min_y: u32,
+    pub max_y: u32,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
 pub struct ClearColor {
     pub r: f32,
     pub g: f32,
@@ -88,6 +154,11 @@ pub struct Maxwell3DRegisters {
     pub draw_first_vertex: u32,
     pub draw_topology: u32,
     pub viewport_transform_en: bool,
+    pub viewport_clip_control: ViewportClipControl,
+    pub surface_clip: SurfaceClip,
+    pub window_origin: WindowOrigin,
+    pub scissor: ScissorTest,
+    pub clear_control: u32,
     pub index_buffer_lo: u32,
     pub index_buffer_hi: u32,
     pub index_buffer_end_lo: u32,
@@ -113,6 +184,13 @@ pub struct Maxwell3DRegisters {
     pub blend_eq_alpha: u32,
     pub blend_src_alpha: u32,
     pub blend_dst_alpha: u32,
+    pub blend_per_target_enabled: bool,
+    pub blend_pt_eq_rgb: [u32; 8],
+    pub blend_pt_src_rgb: [u32; 8],
+    pub blend_pt_dst_rgb: [u32; 8],
+    pub blend_pt_eq_alpha: [u32; 8],
+    pub blend_pt_src_alpha: [u32; 8],
+    pub blend_pt_dst_alpha: [u32; 8],
     pub draw_count: u64,
     pub clear_count: u64,
 
@@ -130,6 +208,14 @@ pub struct Maxwell3DRegisters {
     pub draw_texture_dst_y: u32,
     pub draw_texture_dst_width: u32,
     pub draw_texture_dst_height: u32,
+    pub draw_texture_dx_du_lo: u32,
+    pub draw_texture_dx_du_hi: u32,
+    pub draw_texture_dy_dv_lo: u32,
+    pub draw_texture_dy_dv_hi: u32,
+    pub draw_texture_src_sampler: u32,
+    pub draw_texture_src_texture: u32,
+    pub draw_texture_src_x: u32,
+    pub draw_texture_src_y: u32,
     pub draw_texture_count: u64,
 
     pub constbuf_selector_size: u32,
@@ -162,6 +248,11 @@ impl Default for Maxwell3DRegisters {
             draw_first_vertex: 0,
             draw_topology: 0,
             viewport_transform_en: true,
+            viewport_clip_control: ViewportClipControl::default(),
+            surface_clip: SurfaceClip::default(),
+            window_origin: WindowOrigin::default(),
+            scissor: ScissorTest::default(),
+            clear_control: 0,
             index_buffer_lo: 0,
             index_buffer_hi: 0,
             index_buffer_end_lo: 0,
@@ -187,6 +278,13 @@ impl Default for Maxwell3DRegisters {
             blend_eq_alpha: 0x8006,
             blend_src_alpha: 0x4001,
             blend_dst_alpha: 0x4000,
+            blend_per_target_enabled: false,
+            blend_pt_eq_rgb: [0x8006; 8],
+            blend_pt_src_rgb: [0x4001; 8],
+            blend_pt_dst_rgb: [0x4000; 8],
+            blend_pt_eq_alpha: [0x8006; 8],
+            blend_pt_src_alpha: [0x4001; 8],
+            blend_pt_dst_alpha: [0x4000; 8],
             draw_count: 0,
             clear_count: 0,
             tic_pool_va_lo: 0,
@@ -201,6 +299,14 @@ impl Default for Maxwell3DRegisters {
             draw_texture_dst_y: 0,
             draw_texture_dst_width: 0,
             draw_texture_dst_height: 0,
+            draw_texture_dx_du_lo: 0,
+            draw_texture_dx_du_hi: 0,
+            draw_texture_dy_dv_lo: 0,
+            draw_texture_dy_dv_hi: 0,
+            draw_texture_src_sampler: 0,
+            draw_texture_src_texture: 0,
+            draw_texture_src_x: 0,
+            draw_texture_src_y: 0,
             draw_texture_count: 0,
             constbuf_selector_size: 0,
             constbuf_selector_addr_hi: 0,
@@ -233,6 +339,11 @@ pub struct DrawCall {
     pub vertex_attribs: [VertexAttribute; 32],
     pub viewport: Viewport,
     pub viewport_transform_en: bool,
+    pub viewport_clip_control: ViewportClipControl,
+    pub surface_clip: SurfaceClip,
+    pub window_origin: WindowOrigin,
+    pub scissor: ScissorTest,
+    pub clear_control: u32,
     pub clear_color: ClearColor,
     pub is_clear: bool,
 
@@ -269,10 +380,14 @@ pub struct DrawCall {
 
 #[derive(Clone, Copy, Debug)]
 pub struct DrawTextureCall {
-    pub dst_x: u32,
-    pub dst_y: u32,
-    pub dst_width: u32,
-    pub dst_height: u32,
+    pub dst_x: f32,
+    pub dst_y: f32,
+    pub dst_width: f32,
+    pub dst_height: f32,
+    pub src_x: f32,
+    pub src_y: f32,
+    pub src_width: f32,
+    pub src_height: f32,
     pub texture_id: u32,
     pub sampler_id: u32,
     pub tic_pool_gpu_va: u64,
@@ -324,25 +439,30 @@ impl Maxwell3D {
 
     pub fn dispatch_method(&mut self, method: u32, arg: u32, is_last: bool) {
         if method >= super::MACRO_REGISTERS_START {
-
             if self.macro_invocations < 24 {
                 log::info!(
                     "maxwell3d: MME invoke method={:#x} arg={:#x} is_last={} (slot offset {:#x})",
-                    method, arg, is_last, method - super::MACRO_REGISTERS_START
+                    method,
+                    arg,
+                    is_last,
+                    method - super::MACRO_REGISTERS_START
                 );
                 self.macro_invocations += 1;
             }
             let reg_file_ptr = &self.reg_file as *const Vec<u32>;
-            let writes = self.macro_engine.on_macro_method(method, arg, is_last, &|idx: u32| {
-                unsafe {
-                    let rf = &*reg_file_ptr;
-                    rf.get(idx as usize).copied().unwrap_or(0)
-                }
-            });
+            let writes =
+                self.macro_engine
+                    .on_macro_method(method, arg, is_last, &|idx: u32| unsafe {
+                        let rf = &*reg_file_ptr;
+                        rf.get(idx as usize).copied().unwrap_or(0)
+                    });
             if let Some(out) = writes {
                 if self.macro_writes_logged < 24 {
-                    log::info!("maxwell3d: MME produced {} writes: {:?}", out.writes.len(),
-                        out.writes.iter().take(8).copied().collect::<Vec<_>>());
+                    log::info!(
+                        "maxwell3d: MME produced {} writes: {:?}",
+                        out.writes.len(),
+                        out.writes.iter().take(8).copied().collect::<Vec<_>>()
+                    );
                     self.macro_writes_logged += 1;
                 }
                 for (m, a) in out.writes {
@@ -363,7 +483,10 @@ impl Maxwell3D {
             REG_LOAD_MME_INSTRUCTION => {
                 if self.macro_uploads_logged < 4 {
                     self.macro_uploads_logged += 1;
-                    log::info!("maxwell3d: MME upload_instruction (first dword = {:#x})", arg);
+                    log::info!(
+                        "maxwell3d: MME upload_instruction (first dword = {:#x})",
+                        arg
+                    );
                 }
                 self.macro_engine.upload_instruction(arg);
                 return;
@@ -447,10 +570,40 @@ impl Maxwell3D {
             }
             0x364 => self.regs.clear_depth = f32::from_bits(arg),
             0x368 => self.regs.clear_stencil = arg,
+            0x380 => self.regs.scissor.enabled = (arg & 1) != 0,
+            0x381 => {
+                self.regs.scissor.min_x = arg & 0xFFFF;
+                self.regs.scissor.max_x = arg >> 16;
+            }
+            0x382 => {
+                self.regs.scissor.min_y = arg & 0xFFFF;
+                self.regs.scissor.max_y = arg >> 16;
+            }
+            0x43E => self.regs.clear_control = arg,
+            0x420 => self.regs.draw_texture_dst_x = arg,
+            0x421 => self.regs.draw_texture_dst_y = arg,
+            0x422 => self.regs.draw_texture_dst_width = arg,
+            0x423 => self.regs.draw_texture_dst_height = arg,
+            0x424 => self.regs.draw_texture_dx_du_lo = arg,
+            0x425 => self.regs.draw_texture_dx_du_hi = arg,
+            0x426 => self.regs.draw_texture_dy_dv_lo = arg,
+            0x427 => self.regs.draw_texture_dy_dv_hi = arg,
+            0x428 => self.regs.draw_texture_src_sampler = arg,
+            0x429 => self.regs.draw_texture_src_texture = arg,
+            0x42A => self.regs.draw_texture_src_x = arg,
+            0x42B => {
+                self.regs.draw_texture_src_y = arg;
+                self.push_draw_texture();
+            }
             0x674 => {
                 self.regs.clear_count += 1;
-                log::debug!("maxwell3d: CLEAR_SURFACE arg={:#x} color={:?}",
-                    arg, self.regs.clear_color);
+                log::debug!(
+                    "maxwell3d: CLEAR_SURFACE arg={:#x} color={:?} clear_control={:#x} scissor={:?}",
+                    arg,
+                    self.regs.clear_color,
+                    self.regs.clear_control,
+                    self.regs.scissor
+                );
                 self.pending_draws.push(DrawCall {
                     topology: 0,
                     first_vertex: 0,
@@ -466,12 +619,19 @@ impl Maxwell3D {
                     vertex_attribs: self.regs.vertex_attribs,
                     viewport: self.regs.viewport,
                     viewport_transform_en: self.regs.viewport_transform_en,
+                    viewport_clip_control: self.regs.viewport_clip_control,
+                    surface_clip: self.regs.surface_clip,
+                    window_origin: self.regs.window_origin,
+                    scissor: self.regs.scissor,
+                    clear_control: self.regs.clear_control,
                     clear_color: self.regs.clear_color,
                     is_clear: true,
                     draw_texture: None,
-                    tic_pool_gpu_va: ((self.regs.tic_pool_va_hi as u64) << 32) | self.regs.tic_pool_va_lo as u64,
+                    tic_pool_gpu_va: ((self.regs.tic_pool_va_hi as u64) << 32)
+                        | self.regs.tic_pool_va_lo as u64,
                     tic_pool_limit: self.regs.tic_pool_limit,
-                    tsc_pool_gpu_va: ((self.regs.tsc_pool_va_hi as u64) << 32) | self.regs.tsc_pool_va_lo as u64,
+                    tsc_pool_gpu_va: ((self.regs.tsc_pool_va_hi as u64) << 32)
+                        | self.regs.tsc_pool_va_lo as u64,
                     tsc_pool_limit: self.regs.tsc_pool_limit,
                     last_constbuf_addr: self.regs.last_constbuf_addr,
                     last_constbuf_size: self.regs.last_constbuf_size,
@@ -481,7 +641,11 @@ impl Maxwell3D {
                         let fs = &self.regs.shader_programs[5];
                         let region = ((self.regs.program_region_va_hi as u64) << 32)
                             | self.regs.program_region_va_lo as u64;
-                        if fs.address_lo != 0 { region.wrapping_add(fs.address_lo as u64) } else { 0 }
+                        if fs.address_lo != 0 {
+                            region.wrapping_add(fs.address_lo as u64)
+                        } else {
+                            0
+                        }
                     },
                     cull_test_enable: self.regs.cull_test_enable,
                     cull_face: self.regs.cull_face,
@@ -512,32 +676,48 @@ impl Maxwell3D {
             0x283 => self.regs.viewport.translate_x = f32::from_bits(arg),
             0x284 => self.regs.viewport.translate_y = f32::from_bits(arg),
             0x285 => self.regs.viewport.translate_z = f32::from_bits(arg),
+            0x3FD => {
+                self.regs.surface_clip.x = arg & 0xFFFF;
+                self.regs.surface_clip.width = arg >> 16;
+            }
+            0x3FE => {
+                self.regs.surface_clip.y = arg & 0xFFFF;
+                self.regs.surface_clip.height = arg >> 16;
+            }
+            0x4EB => self.regs.window_origin.raw = arg,
             0x64B => self.regs.viewport_transform_en = arg & 1 != 0,
+            0x64F => self.regs.viewport_clip_control.raw = arg,
             0x35D => self.regs.draw_first_vertex = arg,
             0x35E => {
-
                 self.regs.draw_vertex_count = arg;
                 if arg > 0 {
                     self.regs.draw_count += 1;
-                    self.push_draw(self.regs.draw_topology, self.regs.draw_first_vertex, arg, false, 0);
+                    self.push_draw(
+                        self.regs.draw_topology,
+                        self.regs.draw_first_vertex,
+                        arg,
+                        false,
+                        0,
+                    );
                 }
             }
             0x35F => self.regs.draw_first_vertex = arg,
             0x485 | 0x486 => {
-
                 self.regs.draw_count += 1;
                 let count = (arg >> 16) & 0xFFF;
                 let topology = (arg >> 28) & 0xF;
-                log::trace!("maxwell3d: DRAW_VERTEX_ARRAY_BEGIN_END count={} topology={}", count, topology);
+                log::trace!(
+                    "maxwell3d: DRAW_VERTEX_ARRAY_BEGIN_END count={} topology={}",
+                    count,
+                    topology
+                );
                 self.push_draw(topology, self.regs.draw_first_vertex, count, false, 0);
             }
 
             0x586 => {
                 self.regs.draw_topology = arg & 0xFFFF;
             }
-            0x585 => {
-
-            }
+            0x585 => {}
             0x5F2 => self.regs.index_buffer_hi = arg,
             0x5F3 => self.regs.index_buffer_lo = arg,
             0x5F4 => self.regs.index_buffer_end_hi = arg,
@@ -547,7 +727,11 @@ impl Maxwell3D {
             0x5F8 => {
                 self.regs.draw_count += 1;
                 self.regs.index_count = arg;
-                log::debug!("maxwell3d: DrawElementsCount count={} topology={}", arg, self.regs.draw_topology);
+                log::debug!(
+                    "maxwell3d: DrawElementsCount count={} topology={}",
+                    arg,
+                    self.regs.draw_topology
+                );
                 self.push_draw(self.regs.draw_topology, 0, 0, true, arg);
             }
 
@@ -556,8 +740,11 @@ impl Maxwell3D {
                 self.regs.tsc_pool_va_hi = arg;
             }
             0x558 => {
-                log::info!("maxwell3d: SetTexSamplerPool[lo] = {:#x} → full {:#x}",
-                    arg, ((self.regs.tsc_pool_va_hi as u64) << 32) | arg as u64);
+                log::info!(
+                    "maxwell3d: SetTexSamplerPool[lo] = {:#x} → full {:#x}",
+                    arg,
+                    ((self.regs.tsc_pool_va_hi as u64) << 32) | arg as u64
+                );
                 self.regs.tsc_pool_va_lo = arg;
             }
             0x559 => {
@@ -570,8 +757,11 @@ impl Maxwell3D {
                 self.regs.tic_pool_va_hi = arg;
             }
             0x55E => {
-                log::info!("maxwell3d: SetTexHeaderPool[lo] = {:#x} → full {:#x}",
-                    arg, ((self.regs.tic_pool_va_hi as u64) << 32) | arg as u64);
+                log::info!(
+                    "maxwell3d: SetTexHeaderPool[lo] = {:#x} → full {:#x}",
+                    arg,
+                    ((self.regs.tic_pool_va_hi as u64) << 32) | arg as u64
+                );
                 self.regs.tic_pool_va_lo = arg;
             }
             0x55F => {
@@ -633,10 +823,26 @@ impl Maxwell3D {
             0x4D3 => self.regs.blend_eq_alpha = arg,
             0x4D4 => self.regs.blend_src_alpha = arg,
             0x4D6 => self.regs.blend_dst_alpha = arg,
+            0x4B9 => self.regs.blend_per_target_enabled = (arg & 1) != 0,
             0x4D8..=0x4DF => {
                 let rt = (method - 0x4D8) as usize;
                 if rt < 8 {
                     self.regs.blend_enable[rt] = (arg & 1) != 0;
+                }
+            }
+            0x780..=0x7BF => {
+                let rt = ((method - 0x780) / 8) as usize;
+                let field = (method - 0x780) % 8;
+                if rt < 8 {
+                    match field {
+                        1 => self.regs.blend_pt_eq_rgb[rt] = arg,
+                        2 => self.regs.blend_pt_src_rgb[rt] = arg,
+                        3 => self.regs.blend_pt_dst_rgb[rt] = arg,
+                        4 => self.regs.blend_pt_eq_alpha[rt] = arg,
+                        5 => self.regs.blend_pt_src_alpha[rt] = arg,
+                        6 => self.regs.blend_pt_dst_alpha[rt] = arg,
+                        _ => {}
+                    }
                 }
             }
             0x700..=0x77F => {
@@ -654,7 +860,6 @@ impl Maxwell3D {
                 }
             }
             0x458..=0x477 => {
-
                 let idx = (method - 0x458) as usize;
                 if idx < 32 {
                     let va = &mut self.regs.vertex_attribs[idx];
@@ -672,8 +877,11 @@ impl Maxwell3D {
                 self.regs.program_region_va_hi = arg;
             }
             0x583 => {
-                log::trace!("maxwell3d: SetProgramRegion[lo] = {:#x} → full {:#x}",
-                    arg, ((self.regs.program_region_va_hi as u64) << 32) | arg as u64);
+                log::trace!(
+                    "maxwell3d: SetProgramRegion[lo] = {:#x} → full {:#x}",
+                    arg,
+                    ((self.regs.program_region_va_hi as u64) << 32) | arg as u64
+                );
                 self.regs.program_region_va_lo = arg;
             }
 
@@ -682,7 +890,12 @@ impl Maxwell3D {
                 if idx < 6 {
                     let sp = &mut self.regs.shader_programs[idx];
                     let field = (method - 0x800) % 0x10;
-                    log::trace!("maxwell3d: SetProgram[stage={}] field={} = {:#x}", idx, field, arg);
+                    log::trace!(
+                        "maxwell3d: SetProgram[stage={}] field={} = {:#x}",
+                        idx,
+                        field,
+                        arg
+                    );
                     match field {
                         0 => sp.enabled = (arg & 1) != 0,
 
@@ -698,17 +911,28 @@ impl Maxwell3D {
         }
     }
 
-    fn push_draw(&mut self, topology: u32, first: u32, count: u32, indexed: bool, index_count: u32) {
-        let tic_pool_gpu_va = ((self.regs.tic_pool_va_hi as u64) << 32) | self.regs.tic_pool_va_lo as u64;
-        let tsc_pool_gpu_va = ((self.regs.tsc_pool_va_hi as u64) << 32) | self.regs.tsc_pool_va_lo as u64;
+    fn push_draw(
+        &mut self,
+        topology: u32,
+        first: u32,
+        count: u32,
+        indexed: bool,
+        index_count: u32,
+    ) {
+        let tic_pool_gpu_va =
+            ((self.regs.tic_pool_va_hi as u64) << 32) | self.regs.tic_pool_va_lo as u64;
+        let tsc_pool_gpu_va =
+            ((self.regs.tsc_pool_va_hi as u64) << 32) | self.regs.tsc_pool_va_lo as u64;
         let (fs_bindless_cb_addr, fs_bindless_cb_size) = self.regs.cbuf_binds[4][15];
         let fs = &self.regs.shader_programs[5];
 
-        let program_region = ((self.regs.program_region_va_hi as u64) << 32)
-            | self.regs.program_region_va_lo as u64;
+        let program_region =
+            ((self.regs.program_region_va_hi as u64) << 32) | self.regs.program_region_va_lo as u64;
         let fs_shader_gpu_va = if fs.address_lo != 0 {
             program_region.wrapping_add(fs.address_lo as u64)
-        } else { 0 };
+        } else {
+            0
+        };
         let ps = f32::from_bits(self.reg_file.get(0x546).copied().unwrap_or(0));
         let point_size = if ps.is_finite() && ps > 0.0 { ps } else { 1.0 };
         self.pending_draws.push(DrawCall {
@@ -717,7 +941,8 @@ impl Maxwell3D {
             vertex_count: count,
             indexed,
             index_count,
-            index_gpu_va: ((self.regs.index_buffer_hi as u64) << 32) | self.regs.index_buffer_lo as u64,
+            index_gpu_va: ((self.regs.index_buffer_hi as u64) << 32)
+                | self.regs.index_buffer_lo as u64,
             index_format: self.regs.index_format,
             index_first: self.regs.index_first,
             point_size,
@@ -726,6 +951,11 @@ impl Maxwell3D {
             vertex_attribs: self.regs.vertex_attribs,
             viewport: self.regs.viewport,
             viewport_transform_en: self.regs.viewport_transform_en,
+            viewport_clip_control: self.regs.viewport_clip_control,
+            surface_clip: self.regs.surface_clip,
+            window_origin: self.regs.window_origin,
+            scissor: self.regs.scissor,
+            clear_control: self.regs.clear_control,
             clear_color: self.regs.clear_color,
             is_clear: false,
             draw_texture: None,
@@ -754,8 +984,131 @@ impl Maxwell3D {
         });
     }
 
+    fn push_draw_texture(&mut self) {
+        let fixed_20_12 = |v: u32| (v as i32) as f32 / 4096.0;
+        let fixed_32_32 = |lo: u32, hi: u32| {
+            let raw = ((hi as u64) << 32) | lo as u64;
+            (raw as i64) as f64 / 4_294_967_296.0
+        };
+        let dst_x = fixed_20_12(self.regs.draw_texture_dst_x);
+        let mut dst_y = fixed_20_12(self.regs.draw_texture_dst_y);
+        let dst_width = fixed_20_12(self.regs.draw_texture_dst_width);
+        let dst_height = fixed_20_12(self.regs.draw_texture_dst_height);
+        if self.regs.window_origin.lower_left() {
+            let clip = self
+                .regs
+                .surface_clip
+                .effective(self.regs.rt[0].width, self.regs.rt[0].height);
+            dst_y = clip.height as f32 - dst_y;
+        }
+        let src_x = fixed_20_12(self.regs.draw_texture_src_x);
+        let src_y = fixed_20_12(self.regs.draw_texture_src_y);
+        let src_width = (fixed_32_32(
+            self.regs.draw_texture_dx_du_lo,
+            self.regs.draw_texture_dx_du_hi,
+        ) as f32)
+            * dst_width;
+        let src_height = (fixed_32_32(
+            self.regs.draw_texture_dy_dv_lo,
+            self.regs.draw_texture_dy_dv_hi,
+        ) as f32)
+            * dst_height;
+        self.regs.draw_texture_count = self.regs.draw_texture_count.wrapping_add(1);
+        self.regs.draw_count = self.regs.draw_count.wrapping_add(1);
+        if self.regs.draw_texture_count <= 8 {
+            log::info!(
+                "maxwell3d: DrawTexture[{}] dst=({},{} {}x{}) src=({},{} {}x{}) tex={} samp={}",
+                self.regs.draw_texture_count - 1,
+                dst_x,
+                dst_y,
+                dst_width,
+                dst_height,
+                src_x,
+                src_y,
+                src_width,
+                src_height,
+                self.regs.draw_texture_src_texture,
+                self.regs.draw_texture_src_sampler
+            );
+        }
+        self.pending_draws.push(DrawCall {
+            topology: 0,
+            first_vertex: 0,
+            vertex_count: 0,
+            indexed: false,
+            index_count: 0,
+            index_gpu_va: 0,
+            index_format: 0,
+            index_first: 0,
+            point_size: 1.0,
+            rt: self.regs.rt,
+            vertex_buffers: self.regs.vertex_buffers,
+            vertex_attribs: self.regs.vertex_attribs,
+            viewport: self.regs.viewport,
+            viewport_transform_en: self.regs.viewport_transform_en,
+            viewport_clip_control: self.regs.viewport_clip_control,
+            surface_clip: self.regs.surface_clip,
+            window_origin: self.regs.window_origin,
+            scissor: self.regs.scissor,
+            clear_control: self.regs.clear_control,
+            clear_color: self.regs.clear_color,
+            is_clear: false,
+            draw_texture: Some(DrawTextureCall {
+                dst_x,
+                dst_y,
+                dst_width,
+                dst_height,
+                src_x,
+                src_y,
+                src_width,
+                src_height,
+                texture_id: self.regs.draw_texture_src_texture,
+                sampler_id: self.regs.draw_texture_src_sampler,
+                tic_pool_gpu_va: ((self.regs.tic_pool_va_hi as u64) << 32)
+                    | self.regs.tic_pool_va_lo as u64,
+                tic_pool_limit: self.regs.tic_pool_limit,
+            }),
+            tic_pool_gpu_va: ((self.regs.tic_pool_va_hi as u64) << 32)
+                | self.regs.tic_pool_va_lo as u64,
+            tic_pool_limit: self.regs.tic_pool_limit,
+            tsc_pool_gpu_va: ((self.regs.tsc_pool_va_hi as u64) << 32)
+                | self.regs.tsc_pool_va_lo as u64,
+            tsc_pool_limit: self.regs.tsc_pool_limit,
+            last_constbuf_addr: self.regs.last_constbuf_addr,
+            last_constbuf_size: self.regs.last_constbuf_size,
+            fs_bindless_cb_addr: self.regs.cbuf_binds[4][15].0,
+            fs_bindless_cb_size: self.regs.cbuf_binds[4][15].1,
+            fs_shader_gpu_va: {
+                let fs = &self.regs.shader_programs[5];
+                let region = ((self.regs.program_region_va_hi as u64) << 32)
+                    | self.regs.program_region_va_lo as u64;
+                if fs.address_lo != 0 {
+                    region.wrapping_add(fs.address_lo as u64)
+                } else {
+                    0
+                }
+            },
+            cull_test_enable: self.regs.cull_test_enable,
+            cull_face: self.regs.cull_face,
+            front_face: self.regs.front_face,
+            poly_offset_fill_enable: self.regs.poly_offset_fill_enable,
+            poly_offset_units: self.regs.poly_offset_units,
+            poly_offset_factor: self.regs.poly_offset_factor,
+            zeta: self.regs.zeta,
+            zeta_enable: self.regs.zeta_enable,
+            depth_test_enable: self.regs.depth_test_enable,
+            depth_write_enable: self.regs.depth_write_enable,
+            depth_func: self.regs.depth_func,
+            clear_depth: self.regs.clear_depth,
+            clear_mask: 0,
+        });
+    }
+
     pub fn render_target(&self, idx: usize) -> Option<&RenderTarget> {
-        self.regs.rt.get(idx).filter(|rt| rt.width > 0 && rt.height > 0)
+        self.regs
+            .rt
+            .get(idx)
+            .filter(|rt| rt.width > 0 && rt.height > 0)
     }
 
     pub fn primary_rt_gpu_va(&self) -> Option<u64> {

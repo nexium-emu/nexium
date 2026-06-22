@@ -1,4 +1,4 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TicFormat {
     A8B8G8R8,
     R8G8B8A8,
@@ -8,7 +8,35 @@ pub enum TicFormat {
     R8,
     R8G8,
     R16,
+    BC1,
+    BC2,
+    BC3,
     Unknown(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SwizzleSource {
+    Zero,
+    R,
+    G,
+    B,
+    A,
+    One,
+    Unknown(u32),
+}
+
+impl SwizzleSource {
+    pub fn from_raw(raw: u32) -> Self {
+        match raw & 0x7 {
+            0 => SwizzleSource::Zero,
+            2 => SwizzleSource::R,
+            3 => SwizzleSource::G,
+            4 => SwizzleSource::B,
+            5 => SwizzleSource::A,
+            6 | 7 => SwizzleSource::One,
+            other => SwizzleSource::Unknown(other),
+        }
+    }
 }
 
 impl TicFormat {
@@ -22,6 +50,9 @@ impl TicFormat {
             0x1B => TicFormat::R16,
             0x1C => TicFormat::R8G8,
             0x1D => TicFormat::R8,
+            0x24 => TicFormat::BC1,
+            0x25 => TicFormat::BC2,
+            0x26 => TicFormat::BC3,
             0x2D => TicFormat::R8G8B8A8,
             other => TicFormat::Unknown(other),
         }
@@ -33,14 +64,36 @@ impl TicFormat {
             TicFormat::R5G6B5 | TicFormat::A1R5G5B5 | TicFormat::A4R4G4B4 => 2,
             TicFormat::R16 | TicFormat::R8G8 => 2,
             TicFormat::R8 => 1,
+            TicFormat::BC1 => 8,
+            TicFormat::BC2 | TicFormat::BC3 => 16,
             TicFormat::Unknown(_) => 4,
         }
+    }
+
+    pub fn storage_extent(&self, width: u32, height: u32) -> (u32, u32, usize) {
+        match self {
+            TicFormat::BC1 | TicFormat::BC2 | TicFormat::BC3 => {
+                ((width + 3) / 4, (height + 3) / 4, self.src_bpp())
+            }
+            _ => (width, height, self.src_bpp()),
+        }
+    }
+
+    pub fn linear_size(&self, width: u32, height: u32) -> usize {
+        let (storage_width, storage_height, bpp) = self.storage_extent(width, height);
+        storage_width as usize * storage_height as usize * bpp
+    }
+
+    pub fn block_linear_size(&self, width: u32, height: u32, block_height_log2: u32) -> usize {
+        let (storage_width, storage_height, bpp) = self.storage_extent(width, height);
+        block_linear_byte_size(storage_width, storage_height, bpp, block_height_log2)
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct TicEntry {
     pub format: TicFormat,
+    pub swizzle: [SwizzleSource; 4],
     pub gpu_va: u64,
     pub width: u32,
     pub height: u32,
@@ -60,6 +113,12 @@ impl TicEntry {
         let w4 = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
 
         let format = TicFormat::from_raw(w0);
+        let swizzle = [
+            SwizzleSource::from_raw((w0 >> 19) & 0x7),
+            SwizzleSource::from_raw((w0 >> 22) & 0x7),
+            SwizzleSource::from_raw((w0 >> 25) & 0x7),
+            SwizzleSource::from_raw((w0 >> 28) & 0x7),
+        ];
 
         let addr_lo = w1 as u64;
         let addr_hi = (w2 & 0xFFFF) as u64;
@@ -68,11 +127,7 @@ impl TicEntry {
         let header_version = (w2 >> 21) & 0x7;
         let is_block_linear = header_version == 3;
 
-        let block_height_log2 = if is_block_linear {
-            (w3 >> 3) & 0x7
-        } else {
-            0
-        };
+        let block_height_log2 = if is_block_linear { (w3 >> 3) & 0x7 } else { 0 };
 
         let width = (w4 & 0xFFFF) + 1;
         let w5 = u32::from_le_bytes([raw[20], raw[21], raw[22], raw[23]]);
@@ -84,6 +139,7 @@ impl TicEntry {
 
         Some(TicEntry {
             format,
+            swizzle,
             gpu_va,
             width,
             height,
@@ -195,9 +251,8 @@ pub fn unswizzle_block_linear(
             let byte_x = x * bpp;
             let gob_col = byte_x / GOB_W;
             let x_in_gob = byte_x - gob_col * GOB_W;
-            let gob_offset = block_row_offset
-                + gob_col * block_height * GOB_SIZE
-                + gob_row_in_block * GOB_SIZE;
+            let gob_offset =
+                block_row_offset + gob_col * block_height * GOB_SIZE + gob_row_in_block * GOB_SIZE;
             let in_gob = ((x_in_gob >> 5) & 1) * 256
                 + ((y_in_gob >> 1) & 3) * 64
                 + ((x_in_gob >> 4) & 1) * 32
@@ -228,12 +283,163 @@ pub fn block_linear_byte_size(
     block_rows * gobs_per_row * block_height * GOB_SIZE
 }
 
-pub fn decode_to_rgba8(
-    src: &[u8],
-    width: u32,
-    height: u32,
-    format: TicFormat,
-) -> Vec<u8> {
+fn expand_5(v: u16) -> u8 {
+    let v = v as u8;
+    (v << 3) | (v >> 2)
+}
+
+fn expand_6(v: u16) -> u8 {
+    let v = v as u8;
+    (v << 2) | (v >> 4)
+}
+
+fn rgb565(v: u16) -> [u8; 3] {
+    [
+        expand_5((v >> 11) & 0x1F),
+        expand_6((v >> 5) & 0x3F),
+        expand_5(v & 0x1F),
+    ]
+}
+
+fn bc_color_palette(block: &[u8], bc1_alpha: bool) -> [[u8; 4]; 4] {
+    let c0 = u16::from_le_bytes([block[0], block[1]]);
+    let c1 = u16::from_le_bytes([block[2], block[3]]);
+    let p0 = rgb565(c0);
+    let p1 = rgb565(c1);
+    let mut p = [[0u8; 4]; 4];
+    p[0] = [p0[0], p0[1], p0[2], 255];
+    p[1] = [p1[0], p1[1], p1[2], 255];
+    if c0 > c1 || !bc1_alpha {
+        for i in 0..3 {
+            p[2][i] = ((2 * p0[i] as u16 + p1[i] as u16) / 3) as u8;
+            p[3][i] = ((p0[i] as u16 + 2 * p1[i] as u16) / 3) as u8;
+        }
+        p[2][3] = 255;
+        p[3][3] = 255;
+    } else {
+        for i in 0..3 {
+            p[2][i] = ((p0[i] as u16 + p1[i] as u16) / 2) as u8;
+        }
+        p[2][3] = 255;
+    }
+    p
+}
+
+fn put_rgba(out: &mut [u8], width: usize, height: usize, x: usize, y: usize, rgba: [u8; 4]) {
+    if x >= width || y >= height {
+        return;
+    }
+    let off = (y * width + x) * 4;
+    out[off..off + 4].copy_from_slice(&rgba);
+}
+
+fn decode_bc1(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let width = width as usize;
+    let height = height as usize;
+    let blocks_w = (width + 3) / 4;
+    let blocks_h = (height + 3) / 4;
+    for by in 0..blocks_h {
+        for bx in 0..blocks_w {
+            let off = (by * blocks_w + bx) * 8;
+            if off + 8 > src.len() {
+                continue;
+            }
+            let block = &src[off..off + 8];
+            let palette = bc_color_palette(block, true);
+            let bits = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+            for py in 0..4 {
+                for px in 0..4 {
+                    let idx = ((bits >> (2 * (py * 4 + px))) & 3) as usize;
+                    put_rgba(out, width, height, bx * 4 + px, by * 4 + py, palette[idx]);
+                }
+            }
+        }
+    }
+}
+
+fn decode_bc2(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let width = width as usize;
+    let height = height as usize;
+    let blocks_w = (width + 3) / 4;
+    let blocks_h = (height + 3) / 4;
+    for by in 0..blocks_h {
+        for bx in 0..blocks_w {
+            let off = (by * blocks_w + bx) * 16;
+            if off + 16 > src.len() {
+                continue;
+            }
+            let block = &src[off..off + 16];
+            let alpha = u64::from_le_bytes([
+                block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7],
+            ]);
+            let palette = bc_color_palette(&block[8..16], false);
+            let bits = u32::from_le_bytes([block[12], block[13], block[14], block[15]]);
+            for py in 0..4 {
+                for px in 0..4 {
+                    let pos = py * 4 + px;
+                    let idx = ((bits >> (2 * pos)) & 3) as usize;
+                    let mut rgba = palette[idx];
+                    rgba[3] = (((alpha >> (4 * pos)) & 0xF) as u8) * 17;
+                    put_rgba(out, width, height, bx * 4 + px, by * 4 + py, rgba);
+                }
+            }
+        }
+    }
+}
+
+fn decode_bc3(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let width = width as usize;
+    let height = height as usize;
+    let blocks_w = (width + 3) / 4;
+    let blocks_h = (height + 3) / 4;
+    for by in 0..blocks_h {
+        for bx in 0..blocks_w {
+            let off = (by * blocks_w + bx) * 16;
+            if off + 16 > src.len() {
+                continue;
+            }
+            let block = &src[off..off + 16];
+            let a0 = block[0];
+            let a1 = block[1];
+            let mut alpha_palette = [0u8; 8];
+            alpha_palette[0] = a0;
+            alpha_palette[1] = a1;
+            if a0 > a1 {
+                alpha_palette[2] = ((6 * a0 as u16 + a1 as u16) / 7) as u8;
+                alpha_palette[3] = ((5 * a0 as u16 + 2 * a1 as u16) / 7) as u8;
+                alpha_palette[4] = ((4 * a0 as u16 + 3 * a1 as u16) / 7) as u8;
+                alpha_palette[5] = ((3 * a0 as u16 + 4 * a1 as u16) / 7) as u8;
+                alpha_palette[6] = ((2 * a0 as u16 + 5 * a1 as u16) / 7) as u8;
+                alpha_palette[7] = ((a0 as u16 + 6 * a1 as u16) / 7) as u8;
+            } else {
+                alpha_palette[2] = ((4 * a0 as u16 + a1 as u16) / 5) as u8;
+                alpha_palette[3] = ((3 * a0 as u16 + 2 * a1 as u16) / 5) as u8;
+                alpha_palette[4] = ((2 * a0 as u16 + 3 * a1 as u16) / 5) as u8;
+                alpha_palette[5] = ((a0 as u16 + 4 * a1 as u16) / 5) as u8;
+                alpha_palette[6] = 0;
+                alpha_palette[7] = 255;
+            }
+            let mut alpha_bits = 0u64;
+            for i in 0..6 {
+                alpha_bits |= (block[2 + i] as u64) << (8 * i);
+            }
+            let palette = bc_color_palette(&block[8..16], false);
+            let bits = u32::from_le_bytes([block[12], block[13], block[14], block[15]]);
+            for py in 0..4 {
+                for px in 0..4 {
+                    let pos = py * 4 + px;
+                    let idx = ((bits >> (2 * pos)) & 3) as usize;
+                    let alpha_idx = ((alpha_bits >> (3 * pos)) & 7) as usize;
+                    let mut rgba = palette[idx];
+                    rgba[3] = alpha_palette[alpha_idx];
+                    put_rgba(out, width, height, bx * 4 + px, by * 4 + py, rgba);
+                }
+            }
+        }
+    }
+}
+
+pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -> Vec<u8> {
     let pixels = (width as usize) * (height as usize);
     let mut out = vec![0u8; pixels * 4];
 
@@ -242,7 +448,7 @@ pub fn decode_to_rgba8(
             let n = pixels.min(src.len() / 4);
             for i in 0..n {
                 let off = i * 4;
-                out[off]     = src[off];
+                out[off] = src[off];
                 out[off + 1] = src[off + 1];
                 out[off + 2] = src[off + 2];
                 out[off + 3] = src[off + 3];
@@ -256,9 +462,9 @@ pub fn decode_to_rgba8(
             for i in 0..pixels.min(src.len() / 2) {
                 let v = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
                 let r = ((v >> 11) & 0x1F) as u8;
-                let g = ((v >> 5)  & 0x3F) as u8;
-                let b = (v         & 0x1F) as u8;
-                out[i * 4    ] = (r << 3) | (r >> 2);
+                let g = ((v >> 5) & 0x3F) as u8;
+                let b = (v & 0x1F) as u8;
+                out[i * 4] = (r << 3) | (r >> 2);
                 out[i * 4 + 1] = (g << 2) | (g >> 4);
                 out[i * 4 + 2] = (b << 3) | (b >> 2);
                 out[i * 4 + 3] = 0xFF;
@@ -269,9 +475,9 @@ pub fn decode_to_rgba8(
                 let v = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
                 let a = if (v >> 15) & 1 == 1 { 0xFFu8 } else { 0 };
                 let r = ((v >> 10) & 0x1F) as u8;
-                let g = ((v >> 5)  & 0x1F) as u8;
-                let b = (v         & 0x1F) as u8;
-                out[i * 4    ] = (r << 3) | (r >> 2);
+                let g = ((v >> 5) & 0x1F) as u8;
+                let b = (v & 0x1F) as u8;
+                out[i * 4] = (r << 3) | (r >> 2);
                 out[i * 4 + 1] = (g << 3) | (g >> 2);
                 out[i * 4 + 2] = (b << 3) | (b >> 2);
                 out[i * 4 + 3] = a;
@@ -281,10 +487,10 @@ pub fn decode_to_rgba8(
             for i in 0..pixels.min(src.len() / 2) {
                 let v = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
                 let a = ((v >> 12) & 0xF) as u8;
-                let r = ((v >> 8)  & 0xF) as u8;
-                let g = ((v >> 4)  & 0xF) as u8;
-                let b = (v         & 0xF) as u8;
-                out[i * 4    ] = (r << 4) | r;
+                let r = ((v >> 8) & 0xF) as u8;
+                let g = ((v >> 4) & 0xF) as u8;
+                let b = (v & 0xF) as u8;
+                out[i * 4] = (r << 4) | r;
                 out[i * 4 + 1] = (g << 4) | g;
                 out[i * 4 + 2] = (b << 4) | b;
                 out[i * 4 + 3] = (a << 4) | a;
@@ -293,7 +499,7 @@ pub fn decode_to_rgba8(
         TicFormat::R8 => {
             for i in 0..pixels.min(src.len()) {
                 let v = src[i];
-                out[i * 4    ] = v;
+                out[i * 4] = v;
                 out[i * 4 + 1] = v;
                 out[i * 4 + 2] = v;
                 out[i * 4 + 3] = 0xFF;
@@ -303,7 +509,7 @@ pub fn decode_to_rgba8(
             for i in 0..pixels.min(src.len() / 2) {
                 let intensity = src[i * 2];
                 let alpha = src[i * 2 + 1];
-                out[i * 4    ] = intensity;
+                out[i * 4] = intensity;
                 out[i * 4 + 1] = intensity;
                 out[i * 4 + 2] = intensity;
                 out[i * 4 + 3] = alpha;
@@ -312,15 +518,18 @@ pub fn decode_to_rgba8(
         TicFormat::R16 => {
             for i in 0..pixels.min(src.len() / 2) {
                 let v = src[i * 2 + 1];
-                out[i * 4    ] = v;
+                out[i * 4] = v;
                 out[i * 4 + 1] = v;
                 out[i * 4 + 2] = v;
                 out[i * 4 + 3] = 0xFF;
             }
         }
+        TicFormat::BC1 => decode_bc1(src, width, height, &mut out),
+        TicFormat::BC2 => decode_bc2(src, width, height, &mut out),
+        TicFormat::BC3 => decode_bc3(src, width, height, &mut out),
         TicFormat::Unknown(_) => {
             for i in 0..pixels {
-                out[i * 4    ] = 0xFF;
+                out[i * 4] = 0xFF;
                 out[i * 4 + 1] = 0x00;
                 out[i * 4 + 2] = 0xFF;
                 out[i * 4 + 3] = 0xFF;
@@ -341,7 +550,13 @@ pub fn decode_to_rgba8(
             }
             log::warn!(
                 "[texdecode] #{} {:?} {}x{} maxR={} maxG={} maxB={}",
-                k, format, width, height, mr, mg, mb
+                k,
+                format,
+                width,
+                height,
+                mr,
+                mg,
+                mb
             );
         }
     }

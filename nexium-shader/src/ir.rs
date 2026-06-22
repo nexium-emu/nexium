@@ -1,5 +1,3 @@
-
-
 use std::collections::HashMap;
 use std::fmt;
 
@@ -8,7 +6,6 @@ pub struct ValueId(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Value {
-
     Inst(ValueId),
 
     GprIn(u8),
@@ -55,28 +52,32 @@ pub enum FComp {
 impl FComp {
     pub fn from_bits(v: u64) -> Self {
         match v & 0xF {
-            0  => Self::F,
-            1  => Self::Lt,
-            2  => Self::Eq,
-            3  => Self::Le,
-            4  => Self::Gt,
-            5  => Self::Ne,
-            6  => Self::Ge,
-            7  => Self::Num,
-            8  => Self::Nan,
-            9  => Self::Ltu,
+            0 => Self::F,
+            1 => Self::Lt,
+            2 => Self::Eq,
+            3 => Self::Le,
+            4 => Self::Gt,
+            5 => Self::Ne,
+            6 => Self::Ge,
+            7 => Self::Num,
+            8 => Self::Nan,
+            9 => Self::Ltu,
             10 => Self::Equ,
             11 => Self::Leu,
             12 => Self::Gtu,
             13 => Self::Neu,
             14 => Self::Geu,
-            _  => Self::T,
+            _ => Self::T,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BoolOp { And, Or, Xor }
+pub enum BoolOp {
+    And,
+    Or,
+    Xor,
+}
 
 impl BoolOp {
     pub fn from_bits(v: u64) -> Self {
@@ -89,7 +90,16 @@ impl BoolOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ICmp { F, Lt, Eq, Le, Gt, Ne, Ge, T }
+pub enum ICmp {
+    F,
+    Lt,
+    Eq,
+    Le,
+    Gt,
+    Ne,
+    Ge,
+    T,
+}
 
 impl ICmp {
     pub fn from_bits(v: u64) -> Self {
@@ -181,30 +191,69 @@ pub struct FMods {
 
 #[derive(Clone, Debug)]
 pub enum Op {
-
     Mov(Value),
 
-    FMul { a: Value, b: Value, mods: FMods },
+    FMul {
+        a: Value,
+        b: Value,
+        mods: FMods,
+    },
 
-    FAdd { a: Value, b: Value, mods: FMods },
+    FAdd {
+        a: Value,
+        b: Value,
+        mods: FMods,
+    },
 
-    FFma { a: Value, b: Value, c: Value, mods: FMods },
+    FFma {
+        a: Value,
+        b: Value,
+        c: Value,
+        mods: FMods,
+    },
 
-    FMin { a: Value, b: Value, mods: FMods },
+    FMin {
+        a: Value,
+        b: Value,
+        mods: FMods,
+    },
 
-    FMax { a: Value, b: Value, mods: FMods },
+    FMax {
+        a: Value,
+        b: Value,
+        mods: FMods,
+    },
 
-    MultiFunc { src: Value, func: MufuFunc },
+    MultiFunc {
+        src: Value,
+        func: MufuFunc,
+    },
 
-    LoadCbuf { binding: u8, byte_offset: u32 },
+    LoadCbuf {
+        binding: u8,
+        byte_offset: u32,
+    },
 
-    LoadAttr { slot: u32 },
+    LoadAttr {
+        slot: u32,
+    },
 
-    StoreAttr { slot: u32, src: Value },
+    StoreAttr {
+        slot: u32,
+        src: Value,
+    },
 
-    InterpAttr { slot: u32, perspective: Value },
+    InterpAttr {
+        slot: u32,
+        perspective: Value,
+    },
 
-    SampleTex { tex_id: u32, u: Value, v: Value, component: u8 },
+    SampleTex {
+        tex_id: u32,
+        u: Value,
+        v: Value,
+        component: u8,
+    },
 
     FSetPred {
         cmp: FComp,
@@ -265,7 +314,9 @@ pub enum Op {
 
     Kill,
 
-    Phi { sources: Vec<(super::cfg::BlockId, Value)> },
+    Phi {
+        sources: Vec<(super::cfg::BlockId, Value)>,
+    },
 
     Exit,
 
@@ -321,12 +372,7 @@ impl Program {
         self.emit_pred(op, dest_reg, None)
     }
 
-    pub fn emit_pred(
-        &mut self,
-        op: Op,
-        dest_reg: Option<u8>,
-        pred: Option<Predicate>,
-    ) -> ValueId {
+    pub fn emit_pred(&mut self, op: Op, dest_reg: Option<u8>, pred: Option<Predicate>) -> ValueId {
         let id = self.alloc_value();
         self.instructions.push(Inst {
             op,
@@ -362,7 +408,6 @@ impl fmt::Display for Program {
 }
 
 impl Inst {
-
     pub fn fmt_oneline(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let pred_tag = match self.pred {
             Some(p) => format!("{p:<5} "),
@@ -382,7 +427,10 @@ impl Inst {
             Op::FMin { a, b, .. } => write!(f, "FMin  {a}, {b}"),
             Op::FMax { a, b, .. } => write!(f, "FMax  {a}, {b}"),
             Op::MultiFunc { src, func } => write!(f, "MFn.{} {src}", func.name()),
-            Op::LoadCbuf { binding, byte_offset } => {
+            Op::LoadCbuf {
+                binding,
+                byte_offset,
+            } => {
                 write!(f, "LdCbuf c[{binding:#x}]:{byte_offset:#x}")
             }
             Op::LoadAttr { slot } => write!(f, "LdAttr a[{slot:#x}]"),
@@ -390,9 +438,20 @@ impl Inst {
             Op::InterpAttr { slot, perspective } => {
                 write!(f, "Interp a[{slot:#x}], persp={perspective}")
             }
-            Op::SampleTex { tex_id, u, v, component } => {
-                write!(f, "TexSamp t[{tex_id:#x}], ({u}, {v}).{}",
-                    ["r","g","b","a"].get(*component as usize).copied().unwrap_or("?"))
+            Op::SampleTex {
+                tex_id,
+                u,
+                v,
+                component,
+            } => {
+                write!(
+                    f,
+                    "TexSamp t[{tex_id:#x}], ({u}, {v}).{}",
+                    ["r", "g", "b", "a"]
+                        .get(*component as usize)
+                        .copied()
+                        .unwrap_or("?")
+                )
             }
             Op::Phi { sources } => {
                 write!(f, "Phi   ")?;
@@ -404,15 +463,41 @@ impl Inst {
                 }
                 Ok(())
             }
-            Op::FSetPred { cmp, bop, src_a, src_b, dest_p, src_pred, .. } => {
-                write!(f, "FSetP.{cmp:?}.{bop:?} P{dest_p}, {src_a}, {src_b}, P{src_pred}")
+            Op::FSetPred {
+                cmp,
+                bop,
+                src_a,
+                src_b,
+                dest_p,
+                src_pred,
+                ..
+            } => {
+                write!(
+                    f,
+                    "FSetP.{cmp:?}.{bop:?} P{dest_p}, {src_a}, {src_b}, P{src_pred}"
+                )
             }
-            Op::F2F { src, sat, round, .. } => write!(f, "F2F   {src} sat={sat} round={round}"),
+            Op::F2F {
+                src, sat, round, ..
+            } => write!(f, "F2F   {src} sat={sat} round={round}"),
             Op::I2F { src, signed, .. } => write!(f, "I2F   {src} signed={signed}"),
-            Op::FSet { cmp, bop, src_a, src_b, .. } => {
+            Op::FSet {
+                cmp,
+                bop,
+                src_a,
+                src_b,
+                ..
+            } => {
                 write!(f, "FSet.{cmp:?}.{bop:?} {src_a}, {src_b}")
             }
-            Op::ISetPred { cmp, bop, src_a, src_b, dest_p, .. } => {
+            Op::ISetPred {
+                cmp,
+                bop,
+                src_a,
+                src_b,
+                dest_p,
+                ..
+            } => {
                 write!(f, "ISetP.{cmp:?}.{bop:?} P{dest_p}, {src_a}, {src_b}")
             }
             Op::Kill => write!(f, "Kill"),

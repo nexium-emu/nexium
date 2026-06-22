@@ -1,9 +1,9 @@
-pub mod pusher;
 pub mod engines;
+pub mod pusher;
 pub mod vk_dispatch;
 
+pub use engines::{Fermi2D, KeplerMemory, Maxwell3D, Maxwell3DRegisters, MaxwellDma};
 pub use pusher::{CommandListHeader, Pusher};
-pub use engines::{Maxwell3D, Maxwell3DRegisters, MaxwellDma, Fermi2D, KeplerMemory};
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -22,13 +22,25 @@ pub struct GpuMappings {
 
 impl GpuMappings {
     pub fn new() -> Self {
-        Self { mappings: Vec::new() }
+        Self {
+            mappings: Vec::new(),
+        }
     }
 
     pub fn add(&mut self, gpu_va: u64, size: u64, cpu_addr: u64, nvmap_id: u32) {
-        log::debug!("GpuMap: gpu_va={:#x} size={:#x} cpu_addr={:#x} nvmap_id={}",
-            gpu_va, size, cpu_addr, nvmap_id);
-        self.mappings.push(GpuMapping { gpu_va, size, cpu_addr, nvmap_id });
+        log::debug!(
+            "GpuMap: gpu_va={:#x} size={:#x} cpu_addr={:#x} nvmap_id={}",
+            gpu_va,
+            size,
+            cpu_addr,
+            nvmap_id
+        );
+        self.mappings.push(GpuMapping {
+            gpu_va,
+            size,
+            cpu_addr,
+            nvmap_id,
+        });
     }
 
     pub fn cpu_address_for(&self, gpu_va: u64) -> Option<u64> {
@@ -64,11 +76,20 @@ impl GpuMappings {
                 let contains = gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size;
                 parts.push(format!(
                     "[{}gpu={:#x} size={:#x} cpu={:#x} nvmap={}]",
-                    if contains { "*" } else { "" }, m.gpu_va, m.size, m.cpu_addr, m.nvmap_id
+                    if contains { "*" } else { "" },
+                    m.gpu_va,
+                    m.size,
+                    m.cpu_addr,
+                    m.nvmap_id
                 ));
             }
         }
-        format!("{} mappings near {:#x}: {}", parts.len(), gpu_va, parts.join(" "))
+        format!(
+            "{} mappings near {:#x}: {}",
+            parts.len(),
+            gpu_va,
+            parts.join(" ")
+        )
     }
 
     pub fn nvmap_id_for(&self, gpu_va: u64) -> Option<u32> {
@@ -148,7 +169,18 @@ impl GpuContext {
         let mut kepler_memory = self.kepler_memory.lock();
         let mappings = self.mappings.lock();
 
-        pusher.process_gpfifo(address, num_entries, &mappings, &mut *maxwell, &mut *maxwell_dma, &mut *fermi_2d, &mut *kepler_memory, &*self.stats, &mem_read, &mem_write);
+        pusher.process_gpfifo(
+            address,
+            num_entries,
+            &mappings,
+            &mut *maxwell,
+            &mut *maxwell_dma,
+            &mut *fermi_2d,
+            &mut *kepler_memory,
+            &*self.stats,
+            &mem_read,
+            &mem_write,
+        );
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
 
         let syncpt_id = 0u32;
@@ -170,13 +202,26 @@ impl GpuContext {
         let mappings = self.mappings.lock();
 
         for entry in entries {
-            pusher.process_entry(entry, &mappings, &mut *maxwell, &mut *maxwell_dma, &mut *fermi_2d, &mut *kepler_memory, &*self.stats, &mem_read, &mem_write);
+            pusher.process_entry(
+                entry,
+                &mappings,
+                &mut *maxwell,
+                &mut *maxwell_dma,
+                &mut *fermi_2d,
+                &mut *kepler_memory,
+                &*self.stats,
+                &mem_read,
+                &mem_write,
+            );
         }
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         (0, pusher.syncpt_value)
     }
 
-    pub fn read_rt(&self, mem_read: impl Fn(u64, &mut [u8]) -> bool) -> Option<(u32, u32, Vec<u8>)> {
+    pub fn read_rt(
+        &self,
+        mem_read: impl Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<(u32, u32, Vec<u8>)> {
         let mappings = self.mappings.lock();
         let maxwell = self.maxwell3d.lock();
         let rt = &maxwell.regs.rt[0];

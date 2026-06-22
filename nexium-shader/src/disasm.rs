@@ -1,10 +1,7 @@
-
-
 use super::decode::{decode_one, Decoded};
 
 #[derive(Clone, Debug)]
 pub struct DisasmLine {
-
     pub offset: usize,
 
     pub raw: u64,
@@ -13,7 +10,6 @@ pub struct DisasmLine {
 
 #[derive(Clone, Debug)]
 pub enum DisasmKind {
-
     Insn(Decoded),
 
     Schedule,
@@ -55,7 +51,6 @@ pub fn disassemble(bytes: &[u8]) -> Vec<DisasmLine> {
 }
 
 impl DisasmLine {
-
     pub fn to_string_compact(&self) -> String {
         match &self.kind {
             DisasmKind::Insn(d) => {
@@ -66,14 +61,8 @@ impl DisasmLine {
                         "  +{:04x}  {:016x}  {:<8} {}",
                         self.offset, self.raw, mnemonic, s
                     ),
-                    Some(_) => format!(
-                        "  +{:04x}  {:016x}  {}",
-                        self.offset, self.raw, mnemonic
-                    ),
-                    None => format!(
-                        "  +{:04x}  {:016x}  {}",
-                        self.offset, self.raw, d.display
-                    ),
+                    Some(_) => format!("  +{:04x}  {:016x}  {}", self.offset, self.raw, mnemonic),
+                    None => format!("  +{:04x}  {:016x}  {}", self.offset, self.raw, d.display),
                 }
             }
             DisasmKind::Schedule => {

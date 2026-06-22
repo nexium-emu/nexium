@@ -1,5 +1,3 @@
-
-
 use std::sync::OnceLock;
 
 use super::opcodes::{Opcode, OpcodeEntry, OPCODE_TABLE};
@@ -29,7 +27,7 @@ fn mask_value_from_encoding(encoding: &str) -> (u64, u64) {
             '-' => {
                 bit_pos -= 1;
             }
-            _ => {  }
+            _ => {}
         }
         if bit_pos < 0 {
             break;
@@ -87,7 +85,6 @@ mod tests {
 
     #[test]
     fn encoding_parser_basic() {
-
         let (mask, value) = mask_value_from_encoding("0101 1100 1001 1---");
 
         assert_eq!(mask >> 51 & 0x1FFF, 0x1FFF);
@@ -96,7 +93,6 @@ mod tests {
 
     #[test]
     fn decode_known_opcodes() {
-
         let exit_insn = 0xE300_0000_0000_0000u64;
         let d = decode_one(exit_insn).expect("decoded");
         assert_eq!(d.opcode, Opcode::EXIT);

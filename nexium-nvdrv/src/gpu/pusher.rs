@@ -1,6 +1,9 @@
-use super::engines::{Maxwell3D, MaxwellDma, MAXWELL_DMA_CLASS, Fermi2D, FERMI_2D_CLASS, KeplerMemory, KEPLER_MEMORY_CLASS, sw_renderer};
-use super::GpuMappings;
 use super::super::PipelineStats;
+use super::engines::{
+    sw_renderer, Fermi2D, KeplerMemory, Maxwell3D, MaxwellDma, FERMI_2D_CLASS, KEPLER_MEMORY_CLASS,
+    MAXWELL_DMA_CLASS,
+};
+use super::GpuMappings;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -139,18 +142,41 @@ impl Pusher {
         let bytes_needed = (num_entries as usize) * 8;
         let mut buf = vec![0u8; bytes_needed];
         if !mem_read(cpu_addr, &mut buf) {
-            log::debug!("pusher: failed to read GPFIFO entries at cpu {:#x} (input addr {:#x})",
-                cpu_addr, address);
+            log::debug!(
+                "pusher: failed to read GPFIFO entries at cpu {:#x} (input addr {:#x})",
+                cpu_addr,
+                address
+            );
             return;
         }
 
         for i in 0..num_entries as usize {
             let off = i * 8;
             let entry = CommandListHeader {
-                address_lo: u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]),
-                address_hi_and_count: u32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]),
+                address_lo: u32::from_le_bytes([
+                    buf[off],
+                    buf[off + 1],
+                    buf[off + 2],
+                    buf[off + 3],
+                ]),
+                address_hi_and_count: u32::from_le_bytes([
+                    buf[off + 4],
+                    buf[off + 5],
+                    buf[off + 6],
+                    buf[off + 7],
+                ]),
             };
-            self.process_entry(&entry, mappings, maxwell, maxwell_dma, fermi_2d, kepler_memory, stats, mem_read, mem_write);
+            self.process_entry(
+                &entry,
+                mappings,
+                maxwell,
+                maxwell_dma,
+                fermi_2d,
+                kepler_memory,
+                stats,
+                mem_read,
+                mem_write,
+            );
         }
         self.flush_vk(mappings, mem_read);
     }
@@ -195,10 +221,25 @@ impl Pusher {
         let mut words: Vec<u32> = Vec::with_capacity(word_count as usize);
         for i in 0..word_count as usize {
             let off = i * 4;
-            words.push(u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]));
+            words.push(u32::from_le_bytes([
+                buf[off],
+                buf[off + 1],
+                buf[off + 2],
+                buf[off + 3],
+            ]));
         }
 
-        self.process_commands(&words, mappings, maxwell, maxwell_dma, fermi_2d, kepler_memory, stats, mem_read, mem_write);
+        self.process_commands(
+            &words,
+            mappings,
+            maxwell,
+            maxwell_dma,
+            fermi_2d,
+            kepler_memory,
+            stats,
+            mem_read,
+            mem_write,
+        );
         self.flush_vk(mappings, mem_read);
     }
 
@@ -219,7 +260,17 @@ impl Pusher {
             let header = commands[i];
 
             if self.state.method_count > 0 {
-                self.dispatch_method(header, mappings, maxwell, maxwell_dma, fermi_2d, kepler_memory, stats, mem_read, mem_write);
+                self.dispatch_method(
+                    header,
+                    mappings,
+                    maxwell,
+                    maxwell_dma,
+                    fermi_2d,
+                    kepler_memory,
+                    stats,
+                    mem_read,
+                    mem_write,
+                );
                 if !self.state.non_incrementing {
                     self.state.method = self.state.method.wrapping_add(1);
                 }
@@ -236,7 +287,11 @@ impl Pusher {
             let arg_count = (header >> 16) & 0x1FFF;
             let mode_bits = (header >> 29) & 0x7;
             let Some(mode) = Mode::from_bits(mode_bits) else {
-                log::trace!("pusher: unknown mode {} in header {:#010x}", mode_bits, header);
+                log::trace!(
+                    "pusher: unknown mode {} in header {:#010x}",
+                    mode_bits,
+                    header
+                );
                 i += 1;
                 continue;
             };
@@ -260,7 +315,17 @@ impl Pusher {
                 }
                 Mode::Inline => {
                     self.state.method_count = 0;
-                    self.dispatch_method(arg_count, mappings, maxwell, maxwell_dma, fermi_2d, kepler_memory, stats, mem_read, mem_write);
+                    self.dispatch_method(
+                        arg_count,
+                        mappings,
+                        maxwell,
+                        maxwell_dma,
+                        fermi_2d,
+                        kepler_memory,
+                        stats,
+                        mem_read,
+                        mem_write,
+                    );
                 }
             }
             i += 1;
@@ -297,8 +362,12 @@ impl Pusher {
             maxwell.dispatch_method(method, arg, is_last);
             let d = maxwell.regs.draw_count - pre_draws;
             let c = maxwell.regs.clear_count - pre_clears;
-            if d > 0 { stats.maxwell3d_draws.fetch_add(d, Ordering::Relaxed); }
-            if c > 0 { stats.maxwell3d_clears.fetch_add(c, Ordering::Relaxed); }
+            if d > 0 {
+                stats.maxwell3d_draws.fetch_add(d, Ordering::Relaxed);
+            }
+            if c > 0 {
+                stats.maxwell3d_clears.fetch_add(c, Ordering::Relaxed);
+            }
             maxwell.record_method(method);
 
             if !maxwell.regs.pending_constbuf_writes.is_empty() {
@@ -321,7 +390,11 @@ impl Pusher {
                         );
                         stats.fence_releases.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        log::warn!("pusher: fence release gpu_va={:#x} not mapped — payload={:#x} dropped", gpu_va, payload);
+                        log::warn!(
+                            "pusher: fence release gpu_va={:#x} not mapped — payload={:#x} dropped",
+                            gpu_va,
+                            payload
+                        );
                     }
                 }
             }
@@ -329,7 +402,14 @@ impl Pusher {
                 let draws = std::mem::take(&mut maxwell.pending_draws);
                 if let Some(r) = self.renderer.clone() {
                     super::vk_dispatch::enqueue_draws(
-                        &draws, &mut self.vk_batch, mappings, maxwell, &r, maxwell_dma, mem_read, mem_write,
+                        &draws,
+                        &mut self.vk_batch,
+                        mappings,
+                        maxwell,
+                        &r,
+                        maxwell_dma,
+                        mem_read,
+                        mem_write,
                     );
                 } else {
                     sw_renderer::execute_draws(&draws, mappings, maxwell_dma, mem_read, mem_write);
@@ -345,19 +425,28 @@ impl Pusher {
             let pre = maxwell_dma.blit_count;
             maxwell_dma.dispatch_method(method, arg, mappings, mem_read, mem_write);
             let n = maxwell_dma.blit_count - pre;
-            if n > 0 { stats.maxwell_dma_blits.fetch_add(n, Ordering::Relaxed); }
+            if n > 0 {
+                stats.maxwell_dma_blits.fetch_add(n, Ordering::Relaxed);
+            }
         } else if bound_class == FERMI_2D_CLASS {
             self.flush_vk(mappings, mem_read);
             let pre = fermi_2d.blit_count;
             fermi_2d.dispatch_method(method, arg, mappings, mem_read, mem_write);
             let n = fermi_2d.blit_count - pre;
-            if n > 0 { stats.fermi_2d_blits.fetch_add(n, Ordering::Relaxed); }
+            if n > 0 {
+                stats.fermi_2d_blits.fetch_add(n, Ordering::Relaxed);
+            }
         } else if bound_class == KEPLER_MEMORY_CLASS {
             self.flush_vk(mappings, mem_read);
             kepler_memory.dispatch_method(method, arg, mappings, mem_write);
         } else {
-            log::trace!("pusher: subch={} class={:#x} method={:#x} arg={:#x} (unsupported class)",
-                subchannel, bound_class, method, arg);
+            log::trace!(
+                "pusher: subch={} class={:#x} method={:#x} arg={:#x} (unsupported class)",
+                subchannel,
+                bound_class,
+                method,
+                arg
+            );
         }
     }
 
@@ -372,7 +461,11 @@ impl Pusher {
         match method {
             METHOD_BIND_OBJECT => {
                 self.bound_classes[subchannel & 7] = arg & 0xFFFF;
-                log::debug!("puller: BindObject subch={} class={:#x}", subchannel, arg & 0xFFFF);
+                log::debug!(
+                    "puller: BindObject subch={} class={:#x}",
+                    subchannel,
+                    arg & 0xFFFF
+                );
             }
             METHOD_SEMAPHORE_ADDR_HIGH => self.puller.semaphore_addr_high = arg,
             METHOD_SEMAPHORE_ADDR_LOW => self.puller.semaphore_addr_low = arg,
@@ -420,11 +513,19 @@ impl Pusher {
             } else {
                 mem_write(cpu, &payload.to_le_bytes());
             }
-            log::trace!("puller: semaphore write gpu_va={:#x} cpu={:#x} payload={:#x} long={}",
-                gpu_va, cpu, payload, long);
+            log::trace!(
+                "puller: semaphore write gpu_va={:#x} cpu={:#x} payload={:#x} long={}",
+                gpu_va,
+                cpu,
+                payload,
+                long
+            );
         } else {
-            log::warn!("puller: semaphore write gpu_va={:#x} not mapped — payload={:#x} dropped",
-                gpu_va, payload);
+            log::warn!(
+                "puller: semaphore write gpu_va={:#x} not mapped — payload={:#x} dropped",
+                gpu_va,
+                payload
+            );
         }
     }
 }

@@ -1,6 +1,6 @@
+use super::super::GpuMappings;
 use super::maxwell3d::{DrawCall, DrawTextureCall, RenderTarget};
 use super::maxwell_dma::MaxwellDma;
-use super::super::GpuMappings;
 
 pub fn execute_draws(
     draws: &[DrawCall],
@@ -31,9 +31,13 @@ fn execute_draw_texture(
         return;
     }
     let tic_gpu_va = dt.tic_pool_gpu_va + (dt.texture_id as u64) * 0x20;
-    let Some(tic_cpu) = mappings.cpu_address_for(tic_gpu_va) else { return };
+    let Some(tic_cpu) = mappings.cpu_address_for(tic_gpu_va) else {
+        return;
+    };
     let mut tic = [0u8; 32];
-    if !mem_read(tic_cpu, &mut tic) { return; }
+    if !mem_read(tic_cpu, &mut tic) {
+        return;
+    }
     let w1 = u32::from_le_bytes(tic[4..8].try_into().unwrap());
     let w2 = u32::from_le_bytes(tic[8..12].try_into().unwrap());
     let w4 = u32::from_le_bytes(tic[16..20].try_into().unwrap());
@@ -45,39 +49,77 @@ fn execute_draw_texture(
     let tic_h_minus_1 = w5 & 0xFFFF;
     let mut tex_width = (tic_w_minus_1 + 1) as usize;
     let mut tex_height = (tic_h_minus_1 + 1) as usize;
-    if tex_width == 1 || tex_width > 8192 { tex_width = dt.dst_width as usize; }
-    if tex_height == 1 || tex_height > 8192 { tex_height = dt.dst_height as usize; }
+    if tex_width == 1 || tex_width > 8192 {
+        tex_width = dt.dst_width as usize;
+    }
+    if tex_height == 1 || tex_height > 8192 {
+        tex_height = dt.dst_height as usize;
+    }
 
     if maxwell_dma.draw_texture_blits < 4 {
         log::info!(
             "DrawTexture[{}]: tex_id={} tic_pool={:#x} src_gpu={:#x} src={}x{} bh={}",
-            maxwell_dma.draw_texture_blits, dt.texture_id, dt.tic_pool_gpu_va,
-            src_gpu_va, tex_width, tex_height, tile_height_log2
+            maxwell_dma.draw_texture_blits,
+            dt.texture_id,
+            dt.tic_pool_gpu_va,
+            src_gpu_va,
+            tex_width,
+            tex_height,
+            tile_height_log2
         );
     }
 
-    let Some(src_cpu) = mappings.cpu_address_for(src_gpu_va) else { return };
+    let Some(src_cpu) = mappings.cpu_address_for(src_gpu_va) else {
+        return;
+    };
 
-    if maxwell_dma.last_tiled_dst_cpu == 0 { return; }
+    if maxwell_dma.last_tiled_dst_cpu == 0 {
+        return;
+    }
     let dst_cpu = maxwell_dma.last_tiled_dst_cpu;
     let dst_bh_log2 = maxwell_dma.last_tiled_dst_bh_log2;
     let dst_w_bytes = maxwell_dma.last_tiled_dst_stride.max(1) as usize;
     let dst_h = maxwell_dma.last_tiled_dst_height.max(1) as usize;
 
-    let blit_w = (dt.dst_width as usize).min(tex_width).min(dst_w_bytes / 4);
-    let blit_h = (dt.dst_height as usize).min(tex_height).min(dst_h);
+    let blit_w = (dt.dst_width.abs().round() as usize)
+        .min(tex_width)
+        .min(dst_w_bytes / 4);
+    let blit_h = (dt.dst_height.abs().round() as usize)
+        .min(tex_height)
+        .min(dst_h);
 
     let src_pitch = tex_width * 4;
-    let linear = unswizzle_block_linear_local(src_cpu, src_pitch, tex_width, tex_height, tile_height_log2, mem_read);
+    let linear = unswizzle_block_linear_local(
+        src_cpu,
+        src_pitch,
+        tex_width,
+        tex_height,
+        tile_height_log2,
+        mem_read,
+    );
 
     for y in 0..blit_h {
         for x in 0..blit_w {
             let off = y * src_pitch + x * 4;
-            if off + 4 > linear.len() { continue; }
-            let dst_x = dt.dst_x as usize + x;
-            let dst_y = dt.dst_y as usize + y;
-            write_tiled_pixel_bytes(dst_cpu, dst_x, dst_y, dst_w_bytes, dst_bh_log2,
-                [linear[off], linear[off+1], linear[off+2], linear[off+3]], mem_write);
+            if off + 4 > linear.len() {
+                continue;
+            }
+            let dst_x = dt.dst_x.round().max(0.0) as usize + x;
+            let dst_y = dt.dst_y.round().max(0.0) as usize + y;
+            write_tiled_pixel_bytes(
+                dst_cpu,
+                dst_x,
+                dst_y,
+                dst_w_bytes,
+                dst_bh_log2,
+                [
+                    linear[off],
+                    linear[off + 1],
+                    linear[off + 2],
+                    linear[off + 3],
+                ],
+                mem_write,
+            );
         }
     }
     maxwell_dma.draw_texture_blits = maxwell_dma.draw_texture_blits.wrapping_add(1);
@@ -108,7 +150,9 @@ fn unswizzle_block_linear_local(
     for y in 0..height {
         for x in 0..width {
             let off = tiled_offset(x * 4, y, width_bytes, bh_log2);
-            if off + 4 > tiled.len() { continue; }
+            if off + 4 > tiled.len() {
+                continue;
+            }
             let dst_off = y * pitch + x * 4;
             linear[dst_off..dst_off + 4].copy_from_slice(&tiled[off..off + 4]);
         }
@@ -153,20 +197,31 @@ fn read_tic_entry(
     let tic_va = pool_va + idx * 0x20;
     let tic_cpu = mappings.cpu_address_for(tic_va)?;
     let mut tic = [0u8; 32];
-    if !mem_read(tic_cpu, &mut tic) { return None; }
+    if !mem_read(tic_cpu, &mut tic) {
+        return None;
+    }
     let w1 = u32::from_le_bytes(tic[4..8].try_into().unwrap());
     let w2 = u32::from_le_bytes(tic[8..12].try_into().unwrap());
     let w3 = u32::from_le_bytes(tic[12..16].try_into().unwrap());
     let w4 = u32::from_le_bytes(tic[16..20].try_into().unwrap());
     let w5 = u32::from_le_bytes(tic[20..24].try_into().unwrap());
     let src_gpu = (w1 as u64) | (((w2 & 0xFFFF) as u64) << 32);
-    if src_gpu == 0 { return None; }
+    if src_gpu == 0 {
+        return None;
+    }
     let src_cpu = mappings.cpu_address_for(src_gpu)?;
     let bh_log2 = (w3 >> 3) & 0x7;
     let width = ((w4 & 0xFFFF) + 1) as usize;
     let height = ((w5 & 0xFFFF) + 1) as usize;
-    if width == 0 || height == 0 { return None; }
-    Some(TicInfo { src_cpu, bh_log2, width, height })
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(TicInfo {
+        src_cpu,
+        bh_log2,
+        width,
+        height,
+    })
 }
 
 fn try_resolve_bindless(
@@ -183,32 +238,46 @@ fn try_resolve_bindless(
     let fs_cpu = mappings.cpu_address_for(draw.fs_shader_gpu_va)?;
     let cb_cpu = mappings.cpu_address_for(draw.fs_bindless_cb_addr)?;
 
-    let ids = CACHE.with(|c| c.borrow().get(&draw.fs_shader_gpu_va).cloned()).unwrap_or_else(|| {
-        const SPH: u64 = 48;
-        const CODE_SIZE: usize = 4096;
-        let mut code = vec![0u8; CODE_SIZE];
-        if !mem_read(fs_cpu + SPH, &mut code) { return Vec::new(); }
-        let result = nexium_shader::extract_fs_tex_ids(&code, 15);
-        CACHE.with(|c| { c.borrow_mut().insert(draw.fs_shader_gpu_va, result.clone()); });
-        result
-    });
+    let ids = CACHE
+        .with(|c| c.borrow().get(&draw.fs_shader_gpu_va).cloned())
+        .unwrap_or_else(|| {
+            const SPH: u64 = 48;
+            const CODE_SIZE: usize = 4096;
+            let mut code = vec![0u8; CODE_SIZE];
+            if !mem_read(fs_cpu + SPH, &mut code) {
+                return Vec::new();
+            }
+            let result = nexium_shader::extract_fs_tex_ids(&code, 15);
+            CACHE.with(|c| {
+                c.borrow_mut().insert(draw.fs_shader_gpu_va, result.clone());
+            });
+            result
+        });
 
     for id in &ids {
         match *id {
             nexium_shader::FsTexId::ImmediateTic(idx) => {
                 if draw.tic_pool_gpu_va != 0 {
-                    if let Some(t) = read_tic_entry(draw.tic_pool_gpu_va, idx as u64, mappings, mem_read) {
+                    if let Some(t) =
+                        read_tic_entry(draw.tic_pool_gpu_va, idx as u64, mappings, mem_read)
+                    {
                         return Some(t);
                     }
                 }
             }
             nexium_shader::FsTexId::BindlessCbufOffset(off) => {
-                if (off as usize) + 4 > draw.fs_bindless_cb_size as usize { continue; }
+                if (off as usize) + 4 > draw.fs_bindless_cb_size as usize {
+                    continue;
+                }
                 let mut bytes = [0u8; 4];
-                if !mem_read(cb_cpu + off as u64, &mut bytes) { continue; }
+                if !mem_read(cb_cpu + off as u64, &mut bytes) {
+                    continue;
+                }
                 let handle = u32::from_le_bytes(bytes);
                 let tic_idx = (handle & 0xFFFFF) as u64;
-                if tic_idx == 0 || tic_idx > draw.tic_pool_limit as u64 { continue; }
+                if tic_idx == 0 || tic_idx > draw.tic_pool_limit as u64 {
+                    continue;
+                }
                 if let Some(t) = read_tic_entry(draw.tic_pool_gpu_va, tic_idx, mappings, mem_read) {
                     return Some(t);
                 }
@@ -229,7 +298,9 @@ fn resolve_tic(
         }
     }
 
-    if draw.tic_pool_gpu_va == 0 { return None; }
+    if draw.tic_pool_gpu_va == 0 {
+        return None;
+    }
     let limit = (draw.tic_pool_limit + 1).min(64) as u64;
     for idx in 0..limit {
         if let Some(t) = read_tic_entry(draw.tic_pool_gpu_va, idx, mappings, mem_read) {
@@ -279,9 +350,8 @@ fn tiled_offset(x: usize, y: usize, width_bytes: usize, bh_log2: u32) -> usize {
     let gob_col = x / GOB_W;
     let x_in_gob = x % GOB_W;
 
-    let gob_base = block_y * block_row_stride
-        + gob_col * block_height * GOB_SIZE
-        + gob_row * GOB_SIZE;
+    let gob_base =
+        block_y * block_row_stride + gob_col * block_height * GOB_SIZE + gob_row * GOB_SIZE;
 
     let in_gob = ((x_in_gob >> 5) & 1) * 256
         + ((y_in_gob >> 1) & 3) * 64
@@ -298,7 +368,10 @@ fn write_pixel_tiled(
     py: usize,
     width: u32,
     bh_log2: u32,
-    r: u8, g: u8, b: u8, a: u8,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) {
     let width_bytes = (width as usize) * 4;
@@ -307,15 +380,15 @@ fn write_pixel_tiled(
     mem_write(rt_cpu + off as u64, &[r, g, b, a]);
 }
 
-fn execute_clear(
-    draw: &DrawCall,
-    mappings: &GpuMappings,
-    mem_write: &dyn Fn(u64, &[u8]) -> bool,
-) {
+fn execute_clear(draw: &DrawCall, mappings: &GpuMappings, mem_write: &dyn Fn(u64, &[u8]) -> bool) {
     let rt = &draw.rt[0];
     let gpu_va = rt_gpu_va(rt);
-    if gpu_va == 0 { return; }
-    let Some(rt_cpu) = mappings.cpu_address_for(gpu_va) else { return };
+    if gpu_va == 0 {
+        return;
+    }
+    let Some(rt_cpu) = mappings.cpu_address_for(gpu_va) else {
+        return;
+    };
     let bh_log2 = block_height_log2(rt);
     let w = rt.width as usize;
     let h = rt.height as usize;
@@ -375,12 +448,18 @@ fn decode_attrib(
         (0x04, 7) => Some([
             read_f32(mem_read, base),
             read_f32(mem_read, base + 4),
-            0.0, 1.0,
+            0.0,
+            1.0,
         ]),
         (0x0A, 2) => {
             let mut buf = [0u8; 4];
             mem_read(base, &mut buf);
-            Some([buf[0] as f32 / 255.0, buf[1] as f32 / 255.0, buf[2] as f32 / 255.0, buf[3] as f32 / 255.0])
+            Some([
+                buf[0] as f32 / 255.0,
+                buf[1] as f32 / 255.0,
+                buf[2] as f32 / 255.0,
+                buf[3] as f32 / 255.0,
+            ])
         }
         (0x09, 7) => {
             let u = read_u16(mem_read, base) as f32 / 32768.0 - 1.0;
@@ -402,16 +481,31 @@ fn read_vertex(
     let mut uv = [0.0f32; 2];
 
     for attrib in &draw.vertex_attribs {
-        if attrib.format == 0 { continue; }
+        if attrib.format == 0 {
+            continue;
+        }
         let buf_idx = attrib.buffer as usize;
-        if buf_idx >= draw.vertex_buffers.len() { continue; }
+        if buf_idx >= draw.vertex_buffers.len() {
+            continue;
+        }
         let vb = &draw.vertex_buffers[buf_idx];
         let vb_gpu = ((vb.address_hi as u64) << 32) | vb.address_lo as u64;
-        if vb_gpu == 0 { continue; }
-        let Some(vb_cpu) = mappings.cpu_address_for(vb_gpu) else { continue };
+        if vb_gpu == 0 {
+            continue;
+        }
+        let Some(vb_cpu) = mappings.cpu_address_for(vb_gpu) else {
+            continue;
+        };
         let stride = if vb.stride > 0 { vb.stride } else { 16 };
 
-        let vals = match decode_attrib(attrib.format, attrib.offset, vb_cpu, mem_read, stride, vertex_index) {
+        let vals = match decode_attrib(
+            attrib.format,
+            attrib.offset,
+            vb_cpu,
+            mem_read,
+            stride,
+            vertex_index,
+        ) {
             Some(v) => v,
             None => continue,
         };
@@ -425,7 +519,16 @@ fn read_vertex(
         }
     }
 
-    Vertex { x: pos[0], y: pos[1], r: col[0], g: col[1], b: col[2], a: col[3], u: uv[0], v: uv[1] }
+    Vertex {
+        x: pos[0],
+        y: pos[1],
+        r: col[0],
+        g: col[1],
+        b: col[2],
+        a: col[3],
+        u: uv[0],
+        v: uv[1],
+    }
 }
 
 fn viewport_transform(v: &Vertex, draw: &DrawCall, rt_w: u32, rt_h: u32) -> (f32, f32) {
@@ -448,7 +551,9 @@ fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
 }
 
 fn rasterize_triangle(
-    v0: &Vertex, v1: &Vertex, v2: &Vertex,
+    v0: &Vertex,
+    v1: &Vertex,
+    v2: &Vertex,
     draw: &DrawCall,
     rt: &RenderTarget,
     rt_cpu: u64,
@@ -463,13 +568,17 @@ fn rasterize_triangle(
     let (x1, y1) = viewport_transform(v1, draw, w, h);
     let (x2, y2) = viewport_transform(v2, draw, w, h);
 
-    if w == 0 || h == 0 { return; }
+    if w == 0 || h == 0 {
+        return;
+    }
     let min_x = x0.min(x1).min(x2).max(0.0) as usize;
     let min_y = y0.min(y1).min(y2).max(0.0) as usize;
     let max_x = (x0.max(x1).max(x2).ceil() as usize).min(w as usize - 1);
     let max_y = (y0.max(y1).max(y2).ceil() as usize).min(h as usize - 1);
     let area = edge(x0, y0, x1, y1, x2, y2);
-    if area.abs() < 1e-6 { return; }
+    if area.abs() < 1e-6 {
+        return;
+    }
 
     for py in min_y..=max_y {
         for px in min_x..=max_x {
@@ -482,7 +591,9 @@ fn rasterize_triangle(
             } else {
                 w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0
             };
-            if !inside { continue; }
+            if !inside {
+                continue;
+            }
 
             let b0 = w0 / area;
             let b1 = w1 / area;
@@ -497,10 +608,17 @@ fn rasterize_triangle(
                 let g = (b0 * v0.g + b1 * v1.g + b2 * v2.g).clamp(0.0, 1.0);
                 let b = (b0 * v0.b + b1 * v1.b + b2 * v2.b).clamp(0.0, 1.0);
                 let a = (b0 * v0.a + b1 * v1.a + b2 * v2.a).clamp(0.0, 1.0);
-                [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, (a * 255.0) as u8]
+                [
+                    (r * 255.0) as u8,
+                    (g * 255.0) as u8,
+                    (b * 255.0) as u8,
+                    (a * 255.0) as u8,
+                ]
             };
 
-            write_pixel_tiled(rt_cpu, px, py, w, bh_log2, pixel[0], pixel[1], pixel[2], pixel[3], mem_write);
+            write_pixel_tiled(
+                rt_cpu, px, py, w, bh_log2, pixel[0], pixel[1], pixel[2], pixel[3], mem_write,
+            );
         }
     }
 }
@@ -513,19 +631,35 @@ fn execute_draw(
 ) {
     let rt = &draw.rt[0];
     let gpu_va = rt_gpu_va(rt);
-    if gpu_va == 0 || rt.width == 0 || rt.height == 0 { return; }
-    let Some(rt_cpu) = mappings.cpu_address_for(gpu_va) else { return };
+    if gpu_va == 0 || rt.width == 0 || rt.height == 0 {
+        return;
+    }
+    let Some(rt_cpu) = mappings.cpu_address_for(gpu_va) else {
+        return;
+    };
     let bh_log2 = block_height_log2(rt);
 
-    let has_uv_attr = draw.vertex_attribs.iter().any(|a| a.format != 0 && is_float2_format(a.format));
-    let has_color_attr = draw.vertex_attribs.iter().any(|a| {
-        a.format != 0 && a.offset != 0 && (a.format & 0x3F) == 0x2F
-    });
+    let has_uv_attr = draw
+        .vertex_attribs
+        .iter()
+        .any(|a| a.format != 0 && is_float2_format(a.format));
+    let has_color_attr = draw
+        .vertex_attribs
+        .iter()
+        .any(|a| a.format != 0 && a.offset != 0 && (a.format & 0x3F) == 0x2F);
 
-    if !has_uv_attr && !has_color_attr { return; }
+    if !has_uv_attr && !has_color_attr {
+        return;
+    }
 
-    let tic = if has_uv_attr { resolve_tic(draw, mappings, mem_read) } else { None };
-    if has_uv_attr && tic.is_none() && !has_color_attr { return; }
+    let tic = if has_uv_attr {
+        resolve_tic(draw, mappings, mem_read)
+    } else {
+        None
+    };
+    if has_uv_attr && tic.is_none() && !has_color_attr {
+        return;
+    }
 
     thread_local! {
         static LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -545,32 +679,50 @@ fn execute_draw(
         }
     });
 
-    let count = if draw.indexed { draw.index_count } else { draw.vertex_count };
-    if count == 0 { return; }
+    let count = if draw.indexed {
+        draw.index_count
+    } else {
+        draw.vertex_count
+    };
+    if count == 0 {
+        return;
+    }
 
     let indices: Vec<u32> = (draw.first_vertex..draw.first_vertex + count).collect();
     let tic_ref = tic.as_ref();
 
     let rast = |i0: usize, i1: usize, i2: usize| {
-        if i0 >= indices.len() || i1 >= indices.len() || i2 >= indices.len() { return; }
+        if i0 >= indices.len() || i1 >= indices.len() || i2 >= indices.len() {
+            return;
+        }
         let v0 = read_vertex(draw, indices[i0], mappings, mem_read);
         let v1 = read_vertex(draw, indices[i1], mappings, mem_read);
         let v2 = read_vertex(draw, indices[i2], mappings, mem_read);
-        rasterize_triangle(&v0, &v1, &v2, draw, rt, rt_cpu, bh_log2, tic_ref, mem_read, mem_write);
+        rasterize_triangle(
+            &v0, &v1, &v2, draw, rt, rt_cpu, bh_log2, tic_ref, mem_read, mem_write,
+        );
     };
 
     match draw.topology {
         4 => {
             let mut i = 0;
-            while i + 2 < indices.len() { rast(i, i + 1, i + 2); i += 3; }
+            while i + 2 < indices.len() {
+                rast(i, i + 1, i + 2);
+                i += 3;
+            }
         }
         5 => {
             let mut i = 0;
-            while i + 2 < indices.len() { rast(i, i + 1, i + 2); i += 1; }
+            while i + 2 < indices.len() {
+                rast(i, i + 1, i + 2);
+                i += 1;
+            }
         }
         6 => {
             if indices.len() >= 3 {
-                for i in 1..indices.len() - 1 { rast(0, i, i + 1); }
+                for i in 1..indices.len() - 1 {
+                    rast(0, i, i + 1);
+                }
             }
         }
         7 => {
@@ -583,7 +735,10 @@ fn execute_draw(
         }
         _ => {
             let mut i = 0;
-            while i + 2 < indices.len() { rast(i, i + 1, i + 2); i += 3; }
+            while i + 2 < indices.len() {
+                rast(i, i + 1, i + 2);
+                i += 3;
+            }
         }
     }
 }

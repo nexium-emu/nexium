@@ -41,7 +41,9 @@ pub struct KeplerMemory {
 }
 
 impl KeplerMemory {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn dispatch_method(
         &mut self,
@@ -65,7 +67,11 @@ impl KeplerMemory {
             M_LAUNCH_DMA => self.launch(arg),
             M_LOAD_INLINE_DATA => self.load_inline_data(arg, mappings, mem_write),
             _ => {
-                log::trace!("KeplerMemory: unhandled method {:#x} arg={:#x}", method, arg);
+                log::trace!(
+                    "KeplerMemory: unhandled method {:#x} arg={:#x}",
+                    method,
+                    arg
+                );
             }
         }
     }
@@ -98,11 +104,7 @@ impl KeplerMemory {
         }
     }
 
-    fn flush(
-        &mut self,
-        mappings: &GpuMappings,
-        mem_write: &dyn Fn(u64, &[u8]) -> bool,
-    ) {
+    fn flush(&mut self, mappings: &GpuMappings, mem_write: &dyn Fn(u64, &[u8]) -> bool) {
         let dst_gpu = ((self.offset_out_upper as u64) << 32) | self.offset_out_lower as u64;
         let Some((dst_cpu, dst_limit)) = mappings.cpu_range_for(dst_gpu) else {
             log::trace!("KeplerMemory::flush: dst gpu_va {:#x} not mapped", dst_gpu);
@@ -134,7 +136,9 @@ impl KeplerMemory {
                 } else {
                     for y in 0..line_count {
                         let dst_row_off = y * pitch_out;
-                        if dst_row_off >= dst_limit { break; }
+                        if dst_row_off >= dst_limit {
+                            break;
+                        }
                         let n = line_length.min(dst_limit - dst_row_off);
                         let src_off = y * line_length;
                         let dst_off = dst_cpu + dst_row_off as u64;
@@ -180,8 +184,16 @@ impl KeplerMemory {
         let bump_size = match dst_layout {
             LAYOUT_BLOCK_LINEAR => {
                 let bh = ((self.dst_block_size >> 4) & 0xF) as u32;
-                let dw = if self.dst_width != 0 { self.dst_width as usize } else { line_length };
-                let dh = if self.dst_height != 0 { self.dst_height as usize } else { line_count };
+                let dw = if self.dst_width != 0 {
+                    self.dst_width as usize
+                } else {
+                    line_length
+                };
+                let dh = if self.dst_height != 0 {
+                    self.dst_height as usize
+                } else {
+                    line_count
+                };
                 super::maxwell_dma::tiled_size_bytes(dw, dh, bh) as u64
             }
             _ => {
