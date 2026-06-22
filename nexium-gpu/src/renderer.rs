@@ -609,7 +609,7 @@ impl Renderer {
         }
         submit_with_fence(device, *queue, cmd, utility_slot.fence)?;
         wait_fence(device, utility_slot.fence)?;
-        rt_cache.mark_drawn(key);
+        rt_cache.mark_cleared(key, true);
         Ok(())
     }
 
@@ -734,7 +734,7 @@ impl Renderer {
         }
         submit_with_fence(device, *queue, cmd, utility_slot.fence)?;
         wait_fence(device, utility_slot.fence)?;
-        rt_cache.mark_drawn(key);
+        rt_cache.mark_cleared(key, false);
         Ok(())
     }
 
@@ -953,38 +953,7 @@ impl Renderer {
             height,
         };
         let key = rt_cache.resolve_present_key(requested_key)?;
-        if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static SEQ: AtomicU64 = AtomicU64::new(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            if seq % 60 == 0 {
-                let candidates: Vec<String> = rt_cache
-                    .present_candidates(requested_key)
-                    .into_iter()
-                    .map(|(k, stamp)| {
-                        format!(
-                            "{}:{}x{}#{}{}",
-                            k.nvmap_id,
-                            k.width,
-                            k.height,
-                            stamp,
-                            if k == key { "*" } else { "" }
-                        )
-                    })
-                    .collect();
-                log::warn!(
-                    "present key seq={} requested={}:{}x{} resolved={}:{}x{} candidates=[{}]",
-                    seq,
-                    requested_key.nvmap_id,
-                    requested_key.width,
-                    requested_key.height,
-                    key.nvmap_id,
-                    key.width,
-                    key.height,
-                    candidates.join(", ")
-                );
-            }
-        }
+        trace_present_key(rt_cache, requested_key, key);
         for (_, mut pending) in pending_readbacks.drain() {
             while let Some(prev) = pending.pop_front() {
                 if let Some(slot) = readback_slots.get_mut(prev.slot) {
@@ -1124,6 +1093,7 @@ impl Renderer {
             height,
         };
         let key = rt_cache.resolve_present_key(requested_key)?;
+        trace_present_key(rt_cache, requested_key, key);
 
         let mut ready_frame = None;
         let mut latest_ready = None;
@@ -2872,6 +2842,43 @@ impl Renderer {
         pipeline_cache.maybe_save(device);
         Ok(())
     }
+}
+
+fn trace_present_key(rt_cache: &RtCache, requested_key: RtKey, key: RtKey) {
+    if std::env::var_os("NEXIUM_PRESENT_KEYS").is_none() {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    if seq % 60 != 0 {
+        return;
+    }
+    let candidates: Vec<String> = rt_cache
+        .present_candidates(requested_key)
+        .into_iter()
+        .map(|(k, stamp)| {
+            format!(
+                "{}:{}x{}#{}{}",
+                k.nvmap_id,
+                k.width,
+                k.height,
+                stamp,
+                if k == key { "*" } else { "" }
+            )
+        })
+        .collect();
+    log::warn!(
+        "present key seq={} requested={}:{}x{} resolved={}:{}x{} candidates=[{}]",
+        seq,
+        requested_key.nvmap_id,
+        requested_key.width,
+        requested_key.height,
+        key.nvmap_id,
+        key.width,
+        key.height,
+        candidates.join(", ")
+    );
 }
 
 fn max_texture_descriptors() -> usize {

@@ -46,6 +46,14 @@ impl RtCache {
         self.drawn_stamp.insert(key, self.drawn_counter);
     }
 
+    pub fn mark_cleared(&mut self, key: RtKey, full_target: bool) {
+        if full_target {
+            self.drawn_stamp.remove(&key);
+        } else if self.drawn_stamp.contains_key(&key) {
+            self.mark_drawn(key);
+        }
+    }
+
     pub fn resolve_present_key(&self, want: RtKey) -> Option<RtKey> {
         let mut best: Option<(RtKey, u64)> = None;
         for k in self.cache.keys() {
@@ -66,7 +74,6 @@ impl RtCache {
             }
         }
         best.map(|(k, _)| k)
-            .or_else(|| self.cache.contains_key(&want).then_some(want))
     }
 
     pub fn present_candidates(&self, want: RtKey) -> Vec<(RtKey, u64)> {
