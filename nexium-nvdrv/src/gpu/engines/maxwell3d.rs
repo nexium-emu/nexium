@@ -399,6 +399,7 @@ pub struct Maxwell3D {
     pub reg_file: Vec<u32>,
     pub macro_engine: super::MacroEngine,
     pub method_freq: std::collections::HashMap<u32, u64>,
+    method_profile_enabled: bool,
 
     pub pending_draws: Vec<DrawCall>,
 
@@ -419,6 +420,9 @@ impl Maxwell3D {
             reg_file: vec![0u32; 0xE00],
             macro_engine: super::MacroEngine::new(),
             method_freq: std::collections::HashMap::new(),
+            method_profile_enabled: std::env::var("NEXIUM_GPU_METHOD_PROFILE")
+                .map(|v| v != "0")
+                .unwrap_or(false),
             pending_draws: Vec::new(),
             macro_uploads_logged: 0,
             macro_invocations: 0,
@@ -427,10 +431,16 @@ impl Maxwell3D {
     }
 
     pub fn record_method(&mut self, method: u32) {
+        if !self.method_profile_enabled {
+            return;
+        }
         *self.method_freq.entry(method).or_insert(0) += 1;
     }
 
     pub fn take_top_methods(&mut self, n: usize) -> Vec<(u32, u64)> {
+        if !self.method_profile_enabled {
+            return Vec::new();
+        }
         let mut v: Vec<(u32, u64)> = self.method_freq.drain().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
         v.truncate(n);

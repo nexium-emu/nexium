@@ -113,7 +113,11 @@ impl Pusher {
         self.renderer = r;
     }
 
-    fn flush_vk(&mut self, mappings: &GpuMappings, mem_read: &dyn Fn(u64, &mut [u8]) -> bool) {
+    pub(crate) fn flush_vk(
+        &mut self,
+        mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) {
         if self.vk_batch.is_empty() {
             return;
         }
@@ -240,7 +244,6 @@ impl Pusher {
             mem_read,
             mem_write,
         );
-        self.flush_vk(mappings, mem_read);
     }
 
     fn process_commands(
@@ -256,6 +259,7 @@ impl Pusher {
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
         let mut i = 0;
+        let mut methods_dispatched = 0u64;
         while i < commands.len() {
             let header = commands[i];
 
@@ -271,6 +275,7 @@ impl Pusher {
                     mem_read,
                     mem_write,
                 );
+                methods_dispatched += 1;
                 if !self.state.non_incrementing {
                     self.state.method = self.state.method.wrapping_add(1);
                 }
@@ -326,9 +331,15 @@ impl Pusher {
                         mem_read,
                         mem_write,
                     );
+                    methods_dispatched += 1;
                 }
             }
             i += 1;
+        }
+        if methods_dispatched != 0 {
+            stats
+                .methods_dispatched
+                .fetch_add(methods_dispatched, Ordering::Relaxed);
         }
     }
 
@@ -344,7 +355,6 @@ impl Pusher {
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
-        stats.methods_dispatched.fetch_add(1, Ordering::Relaxed);
         let method = self.state.method;
         let subchannel = self.state.subchannel as usize;
 

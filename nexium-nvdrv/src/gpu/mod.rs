@@ -9,6 +9,15 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+fn nvprof_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NEXIUM_NVDRV_PROFILE").is_ok())
+}
+
+fn elapsed_ms(start: std::time::Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
 pub struct GpuMapping {
     pub gpu_va: u64,
     pub size: u64,
@@ -194,13 +203,17 @@ impl GpuContext {
         mem_read: impl Fn(u64, &mut [u8]) -> bool,
         mem_write: impl Fn(u64, &[u8]) -> bool,
     ) -> (u32, u32) {
+        let profile = nvprof_enabled();
+        let t0 = std::time::Instant::now();
         let mut pusher = self.pusher.lock();
         let mut maxwell = self.maxwell3d.lock();
         let mut maxwell_dma = self.maxwell_dma.lock();
         let mut fermi_2d = self.fermi_2d.lock();
         let mut kepler_memory = self.kepler_memory.lock();
         let mappings = self.mappings.lock();
+        let locks_ms = if profile { elapsed_ms(t0) } else { 0.0 };
 
+        let t_entries = std::time::Instant::now();
         for entry in entries {
             pusher.process_entry(
                 entry,
@@ -214,7 +227,21 @@ impl GpuContext {
                 &mem_write,
             );
         }
+        let entries_ms = if profile { elapsed_ms(t_entries) } else { 0.0 };
+        let t_flush = std::time::Instant::now();
+        pusher.flush_vk(&mappings, &mem_read);
+        let flush_ms = if profile { elapsed_ms(t_flush) } else { 0.0 };
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
+        if profile {
+            log::warn!(
+                "[nvprof] inline entries={} locks_ms={:.3} entries_ms={:.3} flush_ms={:.3} total_ms={:.3}",
+                entries.len(),
+                locks_ms,
+                entries_ms,
+                flush_ms,
+                elapsed_ms(t0)
+            );
+        }
         (0, pusher.syncpt_value)
     }
 

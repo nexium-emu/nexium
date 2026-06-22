@@ -15,6 +15,15 @@ const MAX_SASS_BYTES: usize = 16 * 1024;
 const PACKED_CBUF_SLOTS: usize = 32;
 const PACKED_CBUF_SLOT_SIZE: usize = 2048;
 
+fn nvprof_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NEXIUM_NVDRV_PROFILE").is_ok())
+}
+
+fn elapsed_ms(start: std::time::Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
 fn next_gpu_op_seq() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static GPU_OP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -145,6 +154,8 @@ pub fn flush_accum(
     if batch.is_empty() {
         return;
     }
+    let profile = nvprof_enabled();
+    let t0 = std::time::Instant::now();
     let rt_thread = crate::render_thread::maybe_render_thread();
     let read_guest = |gpu_va: u64, len: usize| -> Option<Vec<u8>> {
         let cpu = mappings.cpu_address_for(gpu_va)?;
@@ -155,7 +166,16 @@ pub fn flush_accum(
             None
         }
     };
-    flush_batch(batch, renderer, rt_thread, &read_guest);
+    let before = batch.len();
+    let flushed = flush_batch(batch, renderer, rt_thread, &read_guest);
+    if profile {
+        log::warn!(
+            "[nvprof] flush_accum before={} flushed={} total_ms={:.3}",
+            before,
+            flushed,
+            elapsed_ms(t0)
+        );
+    }
 }
 
 fn rt_keys_uniform(calls: &[Maxwell3dDrawCall]) -> bool {
@@ -434,19 +454,23 @@ fn snapshot_read_once(
     read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
     gpu_va: u64,
     len: usize,
-) {
+) -> usize {
     if len == 0 {
-        return;
+        return 0;
     }
     if snapshot
         .get(&gpu_va)
         .map(|data| data.len() >= len)
         .unwrap_or(false)
     {
-        return;
+        return 0;
     }
     if let Some(data) = read_guest(gpu_va, len) {
+        let n = data.len();
         snapshot.insert(gpu_va, data);
+        n
+    } else {
+        0
     }
 }
 
@@ -456,7 +480,11 @@ fn submit_draw_batch_async(
     rt: &crate::render_thread::RenderThread,
     read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
 ) {
+    let profile = nvprof_enabled();
+    let t_snapshot = std::time::Instant::now();
     let mut snapshot: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+    let mut snapshot_reads = 0usize;
+    let mut snapshot_bytes = 0usize;
     for call in batch {
         let stride = call
             .vertex_layout
@@ -467,15 +495,19 @@ fn submit_draw_batch_async(
             .unwrap_or(0);
         let vbytes = stride.saturating_mul(call.vertex_count as u64) as usize;
         if vbytes > 0 {
-            snapshot_read_once(&mut snapshot, read_guest, call.vertex_addr, vbytes);
+            let n = snapshot_read_once(&mut snapshot, read_guest, call.vertex_addr, vbytes);
+            snapshot_reads += usize::from(n != 0);
+            snapshot_bytes += n;
         }
         if call.cbuf_size > 0 && call.cbuf_addr != 0 {
-            snapshot_read_once(
+            let n = snapshot_read_once(
                 &mut snapshot,
                 read_guest,
                 call.cbuf_addr,
                 call.cbuf_size as usize,
             );
+            snapshot_reads += usize::from(n != 0);
+            snapshot_bytes += n;
         }
         if !call.fs_tex_ids.is_empty() && call.tic_pool_gpu_va != 0 {
             for &tex_id in &call.fs_tex_ids {
@@ -484,6 +516,8 @@ fn submit_draw_batch_async(
                 }
                 let tic_addr = call.tic_pool_gpu_va.wrapping_add((tex_id as u64) * 32);
                 if let Some(tic_raw) = read_guest(tic_addr, 32) {
+                    snapshot_reads += 1;
+                    snapshot_bytes += tic_raw.len();
                     if let Some(tic) = nexium_gpu::texture::TicEntry::parse(&tic_raw) {
                         let pitch = tic.format.linear_size(tic.width, tic.height);
                         let read_size = if tic.is_block_linear {
@@ -493,7 +527,10 @@ fn submit_draw_batch_async(
                         } else {
                             pitch
                         };
-                        snapshot_read_once(&mut snapshot, read_guest, tic.gpu_va, read_size);
+                        let n =
+                            snapshot_read_once(&mut snapshot, read_guest, tic.gpu_va, read_size);
+                        snapshot_reads += usize::from(n != 0);
+                        snapshot_bytes += n;
                     }
                     snapshot.insert(tic_addr, tic_raw);
                 }
@@ -505,10 +542,14 @@ fn submit_draw_batch_async(
                     continue;
                 }
                 let tsc_addr = call.tsc_pool_gpu_va.wrapping_add((tsc_id as u64) * 32);
-                snapshot_read_once(&mut snapshot, read_guest, tsc_addr, 32);
+                let n = snapshot_read_once(&mut snapshot, read_guest, tsc_addr, 32);
+                snapshot_reads += usize::from(n != 0);
+                snapshot_bytes += n;
             }
         }
     }
+    let snapshot_ms = if profile { elapsed_ms(t_snapshot) } else { 0.0 };
+    let snapshot_entries = snapshot.len();
     let calls = batch.to_vec();
     let r = renderer.clone();
     rt.submit(Box::new(move || {
@@ -519,6 +560,16 @@ fn submit_draw_batch_async(
                 .map(|b| b[..len].to_vec())
         });
     }));
+    if profile {
+        log::warn!(
+            "[nvprof] draw_batch calls={} snapshot_entries={} reads={} bytes={} snapshot_ms={:.3}",
+            batch.len(),
+            snapshot_entries,
+            snapshot_reads,
+            snapshot_bytes,
+            snapshot_ms
+        );
+    }
 }
 
 struct ShaderBundle {
@@ -591,7 +642,16 @@ fn execute_one(
             draw.clear_color.a,
         ];
         let do_depth = want_depth_clear && !no_depth;
-        trace_clear(draw, op_seq, nvmap_id, rt, clear_scissor, color, want_color_clear, do_depth);
+        trace_clear(
+            draw,
+            op_seq,
+            nvmap_id,
+            rt,
+            clear_scissor,
+            color,
+            want_color_clear,
+            do_depth,
+        );
         if let Some(rt_thread) = crate::render_thread::maybe_render_thread() {
             let r = renderer.clone();
             let cdepth = draw.clear_depth;
@@ -1871,10 +1931,7 @@ fn vertex_attr_sample(
         for vi in 0..vertex_count.min(4) {
             let addr = base_cpu + attr.offset as u64 + vi as u64 * stride as u64;
             if let Some(v) = read_attr_vec4(attr.format, addr, mem_read) {
-                vals.push(format!(
-                    "({:.3},{:.3},{:.3},{:.3})",
-                    v[0], v[1], v[2], v[3]
-                ));
+                vals.push(format!("({:.3},{:.3},{:.3},{:.3})", v[0], v[1], v[2], v[3]));
             }
         }
         parts.push(format!(
