@@ -1,9 +1,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{quote, format_ident};
-use syn::{
-    parse_macro_input, FnArg, ImplItem, ImplItemFn, ItemImpl, Lit, Meta, Pat, Type,
-};
+use quote::{format_ident, quote};
+use syn::{parse_macro_input, FnArg, ImplItem, ImplItemFn, ItemImpl, Lit, Meta, Pat, Type};
 
 #[proc_macro_attribute]
 pub fn command(_args: TokenStream, item: TokenStream) -> TokenStream {
@@ -18,9 +16,13 @@ pub fn service(_args: TokenStream, item: TokenStream) -> TokenStream {
     let mut arms: Vec<TokenStream2> = Vec::new();
 
     for item in input.items.iter_mut() {
-        let ImplItem::Fn(method) = item else { continue; };
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
 
-        let Some(cmd_id) = extract_command_id(method) else { continue; };
+        let Some(cmd_id) = extract_command_id(method) else {
+            continue;
+        };
 
         let arm = match build_dispatch_arm(cmd_id, method) {
             Ok(tokens) => tokens,
@@ -77,7 +79,11 @@ fn extract_command_id(method: &ImplItemFn) -> Option<u32> {
 }
 
 fn attr_is_command(attr: &syn::Attribute) -> bool {
-    attr.path().segments.last().map(|s| s.ident == "command").unwrap_or(false)
+    attr.path()
+        .segments
+        .last()
+        .map(|s| s.ident == "command")
+        .unwrap_or(false)
 }
 
 fn build_dispatch_arm(cmd_id: u32, method: &ImplItemFn) -> Result<TokenStream2, String> {

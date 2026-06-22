@@ -63,9 +63,16 @@ fn arithmetic_through_jit() {
         code[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
     }
     let mut cpu = Cpu::new_rustarmic().expect("init");
-    unsafe { cpu.map_host(CODE_BASE, 0x1000, Perm::R | Perm::X, code.as_mut_ptr()).unwrap(); }
+    unsafe {
+        cpu.map_host(CODE_BASE, 0x1000, Perm::R | Perm::X, code.as_mut_ptr())
+            .unwrap();
+    }
     cpu.set_pc(CODE_BASE);
     let event = cpu.run(100_000);
-    assert!(matches!(event, CpuEvent::Svc(0)), "expected Svc(0), got {:?}", event);
+    assert!(
+        matches!(event, CpuEvent::Svc(0)),
+        "expected Svc(0), got {:?}",
+        event
+    );
     assert_eq!(cpu.get_register(0), 150);
 }

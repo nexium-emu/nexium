@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use memmap2::Mmap;
+use std::sync::Arc;
 
 use super::partition::{PartitionFs, PFS0_MAGIC};
 

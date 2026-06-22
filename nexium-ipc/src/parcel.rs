@@ -23,8 +23,7 @@ impl Parcel {
             let bytes = &self.data[self.pos..self.pos + 8];
             self.pos += 8;
             Some(u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]))
         } else {
             None
@@ -87,8 +86,7 @@ impl ParcelReader {
             let bytes = &self.data[self.pos..self.pos + 8];
             self.pos += 8;
             Ok(u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]))
         } else {
             Err("not enough data")

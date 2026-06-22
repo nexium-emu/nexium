@@ -13,14 +13,20 @@ use nexium_memory::Perm;
 #[derive(Clone)]
 pub struct HaltHandle {
     pub(crate) inner: std::sync::Arc<dyn Fn() + Send + Sync>,
-    pub(crate) peek:  std::sync::Arc<dyn Fn() -> (u64, u64, u64) + Send + Sync>,
+    pub(crate) peek: std::sync::Arc<dyn Fn() -> (u64, u64, u64) + Send + Sync>,
     pub(crate) peek_dump: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
 }
 
 impl HaltHandle {
-    pub fn halt(&self) { (self.inner)(); }
-    pub fn peek_pc_lr_sp(&self) -> (u64, u64, u64) { (self.peek)() }
-    pub fn peek_dump(&self) -> String { (self.peek_dump)() }
+    pub fn halt(&self) {
+        (self.inner)();
+    }
+    pub fn peek_pc_lr_sp(&self) -> (u64, u64, u64) {
+        (self.peek)()
+    }
+    pub fn peek_dump(&self) -> String {
+        (self.peek_dump)()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -53,32 +59,40 @@ pub enum CpuBackendKind {
 impl Default for CpuBackendKind {
     fn default() -> Self {
         #[cfg(feature = "backend-dynarmic")]
-        { return CpuBackendKind::Dynarmic; }
+        {
+            return CpuBackendKind::Dynarmic;
+        }
         #[cfg(all(not(feature = "backend-dynarmic"), feature = "backend-rustarmic"))]
-        { return CpuBackendKind::Rustarmic; }
+        {
+            return CpuBackendKind::Rustarmic;
+        }
         #[cfg(not(any(feature = "backend-dynarmic", feature = "backend-rustarmic")))]
-        { CpuBackendKind::Dynarmic }
+        {
+            CpuBackendKind::Dynarmic
+        }
     }
 }
 
 impl CpuBackendKind {
     pub fn label(&self) -> &'static str {
         match self {
-            CpuBackendKind::Dynarmic  => "Dynarmic (C++)",
+            CpuBackendKind::Dynarmic => "Dynarmic (C++)",
             CpuBackendKind::Rustarmic => "Rustarmic (Rust JIT)",
         }
     }
 
     pub fn available() -> Vec<CpuBackendKind> {
         let mut v = Vec::new();
-        #[cfg(feature = "backend-dynarmic")]  v.push(CpuBackendKind::Dynarmic);
-        #[cfg(feature = "backend-rustarmic")] v.push(CpuBackendKind::Rustarmic);
+        #[cfg(feature = "backend-dynarmic")]
+        v.push(CpuBackendKind::Dynarmic);
+        #[cfg(feature = "backend-rustarmic")]
+        v.push(CpuBackendKind::Rustarmic);
         v
     }
 
     pub fn is_compiled_in(&self) -> bool {
         match self {
-            CpuBackendKind::Dynarmic  => cfg!(feature = "backend-dynarmic"),
+            CpuBackendKind::Dynarmic => cfg!(feature = "backend-dynarmic"),
             CpuBackendKind::Rustarmic => cfg!(feature = "backend-rustarmic"),
         }
     }
@@ -117,15 +131,23 @@ impl Cpu {
         match backend {
             CpuBackendKind::Dynarmic => {
                 #[cfg(feature = "backend-dynarmic")]
-                { return Self::new_dynarmic(); }
+                {
+                    return Self::new_dynarmic();
+                }
                 #[cfg(not(feature = "backend-dynarmic"))]
-                { return Err("Dynarmic backend not compiled in (rebuild with --features backend-dynarmic)".into()); }
+                {
+                    return Err("Dynarmic backend not compiled in (rebuild with --features backend-dynarmic)".into());
+                }
             }
             CpuBackendKind::Rustarmic => {
                 #[cfg(feature = "backend-rustarmic")]
-                { return Self::new_rustarmic(); }
+                {
+                    return Self::new_rustarmic();
+                }
                 #[cfg(not(feature = "backend-rustarmic"))]
-                { return Err("Rustarmic backend not compiled in (rebuild with --features backend-rustarmic)".into()); }
+                {
+                    return Err("Rustarmic backend not compiled in (rebuild with --features backend-rustarmic)".into());
+                }
             }
         }
     }
@@ -134,7 +156,13 @@ impl Cpu {
         dispatch!(self, cpu => cpu.halt_handle())
     }
 
-    pub unsafe fn map_host(&mut self, va: u64, len: u64, perm: Perm, ptr: *mut u8) -> Result<(), String> {
+    pub unsafe fn map_host(
+        &mut self,
+        va: u64,
+        len: u64,
+        perm: Perm,
+        ptr: *mut u8,
+    ) -> Result<(), String> {
         dispatch!(self, cpu => unsafe { cpu.map_host(va, len, perm, ptr) })
     }
 
@@ -145,17 +173,35 @@ impl Cpu {
         dispatch!(self, cpu => cpu.get_register(reg))
     }
 
-    pub fn set_pc(&mut self, pc: u64) { dispatch!(self, cpu => cpu.set_pc(pc)) }
-    pub fn get_pc(&self) -> u64       { dispatch!(self, cpu => cpu.get_pc()) }
-    pub fn set_sp(&mut self, sp: u64) { dispatch!(self, cpu => cpu.set_sp(sp)) }
-    pub fn get_sp(&self) -> u64       { dispatch!(self, cpu => cpu.get_sp()) }
+    pub fn set_pc(&mut self, pc: u64) {
+        dispatch!(self, cpu => cpu.set_pc(pc))
+    }
+    pub fn get_pc(&self) -> u64 {
+        dispatch!(self, cpu => cpu.get_pc())
+    }
+    pub fn set_sp(&mut self, sp: u64) {
+        dispatch!(self, cpu => cpu.set_sp(sp))
+    }
+    pub fn get_sp(&self) -> u64 {
+        dispatch!(self, cpu => cpu.get_sp())
+    }
 
-    pub fn set_tpidrro_el0(&mut self, val: u64) { dispatch!(self, cpu => cpu.set_tpidrro_el0(val)) }
-    pub fn get_tpidrro_el0(&self) -> u64        { dispatch!(self, cpu => cpu.get_tpidrro_el0()) }
+    pub fn set_tpidrro_el0(&mut self, val: u64) {
+        dispatch!(self, cpu => cpu.set_tpidrro_el0(val))
+    }
+    pub fn get_tpidrro_el0(&self) -> u64 {
+        dispatch!(self, cpu => cpu.get_tpidrro_el0())
+    }
 
-    pub fn run(&mut self, cycle_count: u64) -> CpuEvent { dispatch!(self, cpu => cpu.run(cycle_count)) }
-    pub fn step(&mut self) -> CpuEvent                  { dispatch!(self, cpu => cpu.step()) }
-    pub fn inject_svc(&mut self, imm: u16)              { dispatch!(self, cpu => cpu.inject_svc(imm)) }
+    pub fn run(&mut self, cycle_count: u64) -> CpuEvent {
+        dispatch!(self, cpu => cpu.run(cycle_count))
+    }
+    pub fn step(&mut self) -> CpuEvent {
+        dispatch!(self, cpu => cpu.step())
+    }
+    pub fn inject_svc(&mut self, imm: u16) {
+        dispatch!(self, cpu => cpu.inject_svc(imm))
+    }
 
     pub fn write_bytes(&self, va: u64, bytes: &[u8]) -> Result<(), String> {
         dispatch!(self, cpu => cpu.write_bytes(va, bytes))
@@ -164,9 +210,15 @@ impl Cpu {
         dispatch!(self, cpu => cpu.read_bytes(va, buf))
     }
 
-    pub fn take_fault(&self) -> Option<FaultSnapshot> { dispatch!(self, cpu => cpu.take_fault()) }
-    pub fn set_continue_on_null(&self, enable: bool)  { dispatch!(self, cpu => cpu.set_continue_on_null(enable)) }
-    pub fn null_skip_count(&self) -> u32              { dispatch!(self, cpu => cpu.null_skip_count()) }
+    pub fn take_fault(&self) -> Option<FaultSnapshot> {
+        dispatch!(self, cpu => cpu.take_fault())
+    }
+    pub fn set_continue_on_null(&self, enable: bool) {
+        dispatch!(self, cpu => cpu.set_continue_on_null(enable))
+    }
+    pub fn null_skip_count(&self) -> u32 {
+        dispatch!(self, cpu => cpu.null_skip_count())
+    }
 
     pub fn invalidate_range(&mut self, va: u64, len: u64) {
         dispatch!(self, cpu => cpu.invalidate_range(va, len))

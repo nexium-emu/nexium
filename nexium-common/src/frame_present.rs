@@ -42,18 +42,35 @@ pub fn set_last_presented(width: u32, height: u32, pixels: Vec<u8>) {
         let d = bc.max(1);
         log::info!(
             "[brightness] frame#{} {}x{} max_rgb={} avg_rgb={} bottomRGB=({},{},{})",
-            n, width, height, mx, avg, br / d, bg / d, bb / d
+            n,
+            width,
+            height,
+            mx,
+            avg,
+            br / d,
+            bg / d,
+            bb / d
         );
     }
     if let Ok(mut s) = slot().lock() {
-        *s = Some(FramePresent { width, height, pixels });
+        *s = Some(FramePresent {
+            width,
+            height,
+            pixels,
+        });
     }
 }
 
 pub fn take_last_presented() -> Option<(u32, u32, Vec<u8>)> {
-    slot().lock().ok().and_then(|mut s| s.take().map(|f| (f.width, f.height, f.pixels)))
+    slot()
+        .lock()
+        .ok()
+        .and_then(|mut s| s.take().map(|f| (f.width, f.height, f.pixels)))
 }
 
 pub fn peek_last_presented_clone() -> Option<(u32, u32, Vec<u8>)> {
-    slot().lock().ok().and_then(|s| s.as_ref().map(|f| (f.width, f.height, f.pixels.clone())))
+    slot()
+        .lock()
+        .ok()
+        .and_then(|s| s.as_ref().map(|f| (f.width, f.height, f.pixels.clone())))
 }

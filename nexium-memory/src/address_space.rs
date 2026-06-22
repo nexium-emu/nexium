@@ -1,8 +1,8 @@
 use bytemuck::{NoUninit, Pod};
 use parking_lot::Mutex;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::perm::Perm;
@@ -127,7 +127,10 @@ pub struct AddressSpace {
 
 impl AddressSpace {
     pub fn new() -> Self {
-        Self { regions: Mutex::new(Vec::new()), generation: AtomicU64::new(0) }
+        Self {
+            regions: Mutex::new(Vec::new()),
+            generation: AtomicU64::new(0),
+        }
     }
 
     pub fn generation(&self) -> u64 {
@@ -196,7 +199,10 @@ impl AddressSpace {
         let r = regs
             .iter()
             .find(|r| r.base == va && r.len as u64 == len)
-            .ok_or(AddressSpaceError::Unmapped { va, len: len as usize })?;
+            .ok_or(AddressSpaceError::Unmapped {
+                va,
+                len: len as usize,
+            })?;
         let mut p = r.perm.lock();
         log::debug!(
             "protect va={va:#x} len={len:#x} {} -> {} name={}",
@@ -223,11 +229,7 @@ impl AddressSpace {
     pub fn write(&self, va: u64, buf: &[u8]) -> Result<()> {
         let (region, off) = self.locate(va, buf.len())?;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                region.buf.as_ptr().add(off),
-                buf.len(),
-            );
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), region.buf.as_ptr().add(off), buf.len());
         }
         Ok(())
     }
@@ -272,11 +274,7 @@ impl AddressSpace {
             });
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                region.buf.as_ptr().add(off),
-                buf.len(),
-            );
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), region.buf.as_ptr().add(off), buf.len());
         }
         Ok(())
     }
@@ -407,7 +405,8 @@ mod tests {
     fn read_crossing_region_boundary_fails() {
         let a = fresh();
         a.map(0x1_0000, PAGE_SIZE, Perm::RW, "first").unwrap();
-        a.map(0x1_0000 + PAGE_SIZE, PAGE_SIZE, Perm::RW, "second").unwrap();
+        a.map(0x1_0000 + PAGE_SIZE, PAGE_SIZE, Perm::RW, "second")
+            .unwrap();
         let mut buf = [0u8; 8];
         let err = a.read(0x1_0000 + PAGE_SIZE - 4, &mut buf).unwrap_err();
         assert!(matches!(err, AddressSpaceError::Unmapped { .. }));
@@ -427,9 +426,15 @@ mod tests {
     fn unaligned_map_rejected() {
         let a = fresh();
         let err = a.map(0x1_0001, PAGE_SIZE, Perm::RW, "x").unwrap_err();
-        assert!(matches!(err, AddressSpaceError::Unaligned { what: "va", .. }));
+        assert!(matches!(
+            err,
+            AddressSpaceError::Unaligned { what: "va", .. }
+        ));
         let err = a.map(0x1_0000, 0x800, Perm::RW, "x").unwrap_err();
-        assert!(matches!(err, AddressSpaceError::Unaligned { what: "len", .. }));
+        assert!(matches!(
+            err,
+            AddressSpaceError::Unaligned { what: "len", .. }
+        ));
     }
 
     #[test]
@@ -454,9 +459,12 @@ mod tests {
     #[test]
     fn three_disjoint_regions_coexist() {
         let a = fresh();
-        a.map(crate::region::CODE_BASE, PAGE_SIZE * 16, Perm::RX, "code").unwrap();
-        a.map(crate::region::HEAP_BASE, PAGE_SIZE * 32, Perm::RW, "heap").unwrap();
-        a.map(crate::region::STACK_BASE, PAGE_SIZE * 8, Perm::RW, "stack").unwrap();
+        a.map(crate::region::CODE_BASE, PAGE_SIZE * 16, Perm::RX, "code")
+            .unwrap();
+        a.map(crate::region::HEAP_BASE, PAGE_SIZE * 32, Perm::RW, "heap")
+            .unwrap();
+        a.map(crate::region::STACK_BASE, PAGE_SIZE * 8, Perm::RW, "stack")
+            .unwrap();
         assert_eq!(a.regions().len(), 3);
     }
 

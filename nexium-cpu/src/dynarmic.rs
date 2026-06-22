@@ -1,7 +1,7 @@
+use nexium_memory::Perm;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use nexium_memory::Perm;
 
 use crate::{CpuEvent, FaultSnapshot, HaltHandle};
 
@@ -41,7 +41,11 @@ impl DynarmicCpu {
 
         let event_for_svc = last_event.clone();
         emu.set_svc_callback(move |dyn_, swi, _until, pc| {
-            log::trace!("dynarmic SVC callback triggered: swi={:#04x}, pc={:#x}", swi, pc);
+            log::trace!(
+                "dynarmic SVC callback triggered: swi={:#04x}, pc={:#x}",
+                swi,
+                pc
+            );
             event_for_svc.set(Some(CpuEvent::Svc(swi as u16)));
             let _ = dyn_.emu_stop();
         });
@@ -138,7 +142,11 @@ impl DynarmicCpu {
                 for i in 0..31 {
                     let r = e.reg_read(i).unwrap_or(0);
                     let mut b = [0u8; 8];
-                    let v = if e.mem_read(r, &mut b).is_ok() { u64::from_le_bytes(b) } else { 0 };
+                    let v = if e.mem_read(r, &mut b).is_ok() {
+                        u64::from_le_bytes(b)
+                    } else {
+                        0
+                    };
                     s.push_str(&format!(" x{}={:#x}([x{}]={:#x})", i, r, i, v));
                 }
                 s
@@ -146,18 +154,30 @@ impl DynarmicCpu {
         }
     }
 
-    pub unsafe fn map_host(&mut self, va: u64, len: u64, perm: Perm, ptr: *mut u8) -> Result<(), String> {
-        self.emu.emu.mem_map_ptr(va, len as usize, perm_to_dyn(perm), ptr.cast())
+    pub unsafe fn map_host(
+        &mut self,
+        va: u64,
+        len: u64,
+        perm: Perm,
+        ptr: *mut u8,
+    ) -> Result<(), String> {
+        self.emu
+            .emu
+            .mem_map_ptr(va, len as usize, perm_to_dyn(perm), ptr.cast())
             .map_err(|e| format!("map_host failed: {:?}", e))
     }
 
     pub fn write_bytes(&self, va: u64, bytes: &[u8]) -> Result<(), String> {
-        self.emu.emu.mem_write(va, bytes)
+        self.emu
+            .emu
+            .mem_write(va, bytes)
             .map_err(|e| format!("write_bytes failed: {:?}", e))
     }
 
     pub fn read_bytes(&self, va: u64, buf: &mut [u8]) -> Result<(), String> {
-        self.emu.emu.mem_read(va, buf)
+        self.emu
+            .emu
+            .mem_read(va, buf)
             .map_err(|e| format!("read_bytes failed: {:?}", e))
     }
 
@@ -240,8 +260,14 @@ impl DynarmicCpu {
 
 fn perm_to_dyn(p: Perm) -> u32 {
     let mut out = 0u32;
-    if p.contains(Perm::R) { out |= 1; }
-    if p.contains(Perm::W) { out |= 2; }
-    if p.contains(Perm::X) { out |= 4; }
+    if p.contains(Perm::R) {
+        out |= 1;
+    }
+    if p.contains(Perm::W) {
+        out |= 2;
+    }
+    if p.contains(Perm::X) {
+        out |= 4;
+    }
     out
 }

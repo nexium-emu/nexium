@@ -18,7 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let msg_ptr: u64 = 0x9000_0000_0000;
         let msg_len = test_message.len() as u64;
 
-        boot_ctx.kernel.address_space.write(msg_ptr, test_message.as_bytes())
+        boot_ctx
+            .kernel
+            .address_space
+            .write(msg_ptr, test_message.as_bytes())
             .expect("Failed to write test message");
 
         cpu.set_register(0, msg_ptr);

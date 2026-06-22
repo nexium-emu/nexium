@@ -1,16 +1,16 @@
-pub mod error;
-pub mod result;
+pub mod async_compile;
 pub mod constants;
-pub mod paths;
-pub mod log_init;
-pub mod log_sink;
+pub mod dumps;
+pub mod error;
 pub mod file_logger;
 pub mod frame_present;
+pub mod log_init;
+pub mod log_sink;
+pub mod paths;
+pub mod result;
 pub mod title;
-pub mod dumps;
-pub mod async_compile;
 
 pub use error::{HorizonError, Result};
-pub use result::SUCCESS;
-pub use log_sink::BufferedLogger;
 pub use file_logger::FileLogger;
+pub use log_sink::BufferedLogger;
+pub use result::SUCCESS;

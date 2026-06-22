@@ -1,11 +1,11 @@
+use log::{LevelFilter, Metadata, Record};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use log::{Record, Metadata, LevelFilter};
 
 pub struct FileLogger {
     file: Arc<Mutex<BufWriter<std::fs::File>>>,
@@ -63,11 +63,14 @@ static FLUSH_RUNNING: AtomicBool = AtomicBool::new(false);
 
 impl log::Log for FileLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        if metadata.level() > log::max_level() { return false; }
-        if metadata.level() == log::Level::Trace { return false; }
+        if metadata.level() > log::max_level() {
+            return false;
+        }
+        if metadata.level() == log::Level::Trace {
+            return false;
+        }
         let t = metadata.target();
-        if metadata.level() >= log::Level::Info
-            && (t.starts_with("wgpu") || t.starts_with("naga"))
+        if metadata.level() >= log::Level::Info && (t.starts_with("wgpu") || t.starts_with("naga"))
         {
             return false;
         }

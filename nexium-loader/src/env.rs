@@ -30,7 +30,11 @@ const _: () = assert!(std::mem::size_of::<ConfigEntry>() == 24);
 
 impl ConfigEntry {
     pub fn new(key: EntryType, flags: u32, v0: u64, v1: u64) -> Self {
-        Self { key: key as u32, flags, value: [v0, v1] }
+        Self {
+            key: key as u32,
+            flags,
+            value: [v0, v1],
+        }
     }
 
     pub fn as_bytes(&self) -> [u8; 24] {
@@ -113,31 +117,64 @@ impl EnvBlockBuilder {
         if let Some(s) = &self.argv_string {
             let mut bytes = s.as_bytes().to_vec();
             bytes.push(0);
-            mem.write(argv_va, &bytes).map_err(|e| format!("Failed to write argv string: {:?}", e))?;
+            mem.write(argv_va, &bytes)
+                .map_err(|e| format!("Failed to write argv string: {:?}", e))?;
         }
         if let Some(s) = &self.next_load_path {
             let mut bytes = s.as_bytes().to_vec();
             bytes.push(0);
-            mem.write(nextload_path_va, &bytes).map_err(|e| format!("Failed to write next_load_path: {:?}", e))?;
-            mem.write(nextload_argv_va, &[0u8; 1]).map_err(|e| format!("Failed to write next_load_argv: {:?}", e))?;
+            mem.write(nextload_path_va, &bytes)
+                .map_err(|e| format!("Failed to write next_load_path: {:?}", e))?;
+            mem.write(nextload_argv_va, &[0u8; 1])
+                .map_err(|e| format!("Failed to write next_load_argv: {:?}", e))?;
         }
 
         let mut entries: Vec<ConfigEntry> = vec![
-            ConfigEntry::new(EntryType::MainThreadHandle, 0, self.main_thread_handle as u64, 0),
+            ConfigEntry::new(
+                EntryType::MainThreadHandle,
+                0,
+                self.main_thread_handle as u64,
+                0,
+            ),
             ConfigEntry::new(EntryType::ProcessHandle, 0, self.process_handle as u64, 0),
             ConfigEntry::new(EntryType::AppletType, 0, self.applet_type, 0),
             ConfigEntry::new(EntryType::OverrideHeap, 1, self.heap_base, self.heap_size),
-            ConfigEntry::new(EntryType::SyscallAvailableHint, 0, self.syscall_hint.0, self.syscall_hint.1),
-            ConfigEntry::new(EntryType::SyscallAvailableHint2, 0, self.syscall_hint2.0, self.syscall_hint2.1),
-            ConfigEntry::new(EntryType::RandomSeed, 0, 0xDEAD_BEEF_CAFE_BABE, 0x1234_5678_9ABC_DEF0),
-            ConfigEntry::new(EntryType::HosVersion, 0, self.hos_version, 0x4154_4D4F_5350_4852),
+            ConfigEntry::new(
+                EntryType::SyscallAvailableHint,
+                0,
+                self.syscall_hint.0,
+                self.syscall_hint.1,
+            ),
+            ConfigEntry::new(
+                EntryType::SyscallAvailableHint2,
+                0,
+                self.syscall_hint2.0,
+                self.syscall_hint2.1,
+            ),
+            ConfigEntry::new(
+                EntryType::RandomSeed,
+                0,
+                0xDEAD_BEEF_CAFE_BABE,
+                0x1234_5678_9ABC_DEF0,
+            ),
+            ConfigEntry::new(
+                EntryType::HosVersion,
+                0,
+                self.hos_version,
+                0x4154_4D4F_5350_4852,
+            ),
         ];
 
         if self.argv_string.is_some() {
             entries.push(ConfigEntry::new(EntryType::Argv, 0, 0, argv_va));
         }
         if self.next_load_path.is_some() {
-            entries.push(ConfigEntry::new(EntryType::NextLoadPath, 0, nextload_path_va, nextload_argv_va));
+            entries.push(ConfigEntry::new(
+                EntryType::NextLoadPath,
+                0,
+                nextload_path_va,
+                nextload_argv_va,
+            ));
         }
 
         entries.push(ConfigEntry::new(EntryType::EndOfList, 0, 0, 0));
@@ -151,7 +188,10 @@ impl EnvBlockBuilder {
 
         log::info!(
             "Built env block at {:#x}: {} entries, argv={:?} next_load_path={:?}",
-            va, offset / 24, self.argv_string, self.next_load_path
+            va,
+            offset / 24,
+            self.argv_string,
+            self.next_load_path
         );
         Ok(())
     }

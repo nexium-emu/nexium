@@ -5,9 +5,8 @@ pub fn init_logger() {
 }
 
 pub fn init_logger_with_filter(default_filter: &str) {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(default_filter)
-    )
-    .format_timestamp_millis()
-    .try_init();
+    let _ =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
+            .format_timestamp_millis()
+            .try_init();
 }

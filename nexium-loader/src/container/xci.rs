@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use memmap2::Mmap;
+use std::sync::Arc;
 
-use crate::bin_read::u64at;
 use super::partition::PartitionFs;
+use crate::bin_read::u64at;
 
 pub const DXCI_MAGIC: u32 = 0x49435844;
 pub const HEAD_MAGIC: u32 = 0x44414548;
@@ -17,9 +17,14 @@ impl Xci {
         let magic = crate::bin_read::u32at(buf, 0x100)?;
         if magic != DXCI_MAGIC {
             if magic == HEAD_MAGIC {
-                return Err("XCI is encrypted (magic HEAD); only decrypted DXCI is supported".to_string());
+                return Err(
+                    "XCI is encrypted (magic HEAD); only decrypted DXCI is supported".to_string(),
+                );
             }
-            return Err(format!("gamecard magic {:#010x} at 0x100 is not DXCI", magic));
+            return Err(format!(
+                "gamecard magic {:#010x} at 0x100 is not DXCI",
+                magic
+            ));
         }
 
         let hfs_offset = u64at(buf, 0x130)?;

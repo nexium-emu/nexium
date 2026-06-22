@@ -12,26 +12,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading: {}", nro_path);
 
     match BootConfig::new(&nro_path) {
-        config => {
-            match BootContext::new(config) {
-                Ok(mut boot_ctx) => {
-                    println!("Boot context created successfully");
-                    println!("Starting execution...");
+        config => match BootContext::new(config) {
+            Ok(mut boot_ctx) => {
+                println!("Boot context created successfully");
+                println!("Starting execution...");
 
-                    match boot_ctx.run() {
-                        Ok(_) => println!("Execution completed"),
-                        Err(e) => {
-                            eprintln!("Execution error: {}", e);
-                            return Err(e.into());
-                        }
+                match boot_ctx.run() {
+                    Ok(_) => println!("Execution completed"),
+                    Err(e) => {
+                        eprintln!("Execution error: {}", e);
+                        return Err(e.into());
                     }
                 }
-                Err(e) => {
-                    eprintln!("Failed to create boot context: {}", e);
-                    return Err(e.into());
-                }
             }
-        }
+            Err(e) => {
+                eprintln!("Failed to create boot context: {}", e);
+                return Err(e.into());
+            }
+        },
     }
 
     Ok(())

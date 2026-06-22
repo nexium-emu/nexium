@@ -1,6 +1,6 @@
+use memmap2::Mmap;
 use std::ops::Range;
 use std::sync::Arc;
-use memmap2::Mmap;
 
 use crate::bin_read::{u32at, u64at, u8at};
 use crate::romfs;
@@ -68,9 +68,16 @@ impl Nca {
         let magic = u32at(buf, nca_base + 0x200)?;
         if magic != DNCA_MAGIC {
             if magic == NCA3_MAGIC {
-                return Err(format!("NCA at {:#x} is encrypted (NCA3); only decrypted DNCA supported", nca_base));
+                return Err(format!(
+                    "NCA at {:#x} is encrypted (NCA3); only decrypted DNCA supported",
+                    nca_base
+                ));
             }
-            return Err(format!("NCA magic {:#010x} at {:#x} is not DNCA", magic, nca_base + 0x200));
+            return Err(format!(
+                "NCA magic {:#010x} at {:#x} is not DNCA",
+                magic,
+                nca_base + 0x200
+            ));
         }
 
         let content_type = NcaContentType::from_u8(u8at(buf, nca_base + 0x205)?);
@@ -87,13 +94,27 @@ impl Nca {
             }
 
             let section_start = (nca_base as u64)
-                .checked_add(start_sector.checked_mul(SECTOR).ok_or("section start overflow")?)
+                .checked_add(
+                    start_sector
+                        .checked_mul(SECTOR)
+                        .ok_or("section start overflow")?,
+                )
                 .ok_or("section start overflow")?;
             let section_end = (nca_base as u64)
-                .checked_add(end_sector.checked_mul(SECTOR).ok_or("section end overflow")?)
+                .checked_add(
+                    end_sector
+                        .checked_mul(SECTOR)
+                        .ok_or("section end overflow")?,
+                )
                 .ok_or("section end overflow")?;
             let section_end = if section_end > buf.len() as u64 {
-                log::warn!("NCA section {} end {:#x} clamped to EOF {:#x} (over by {:#x})", i, section_end, buf.len(), section_end - buf.len() as u64);
+                log::warn!(
+                    "NCA section {} end {:#x} clamped to EOF {:#x} (over by {:#x})",
+                    i,
+                    section_end,
+                    buf.len(),
+                    section_end - buf.len() as u64
+                );
                 buf.len() as u64
             } else {
                 section_end
@@ -113,15 +134,26 @@ impl Nca {
             let hash_type = u8at(fs_header, 0x03)?;
             let encryption_type = u8at(fs_header, 0x04)?;
             if encryption_type != 0 && encryption_type != 1 {
-                log::warn!("NCA section {} encryption_type={} (expected None on a decrypted NCA)", i, encryption_type);
+                log::warn!(
+                    "NCA section {} encryption_type={} (expected None on a decrypted NCA)",
+                    i,
+                    encryption_type
+                );
             }
 
             let (data_off, data_size) = romfs::fs_data_extent(fs_header, hash_type, section_len)?;
-            let fs_data_start = section_start.checked_add(data_off).ok_or("fs data start overflow")?;
-            let fs_data_end = fs_data_start.checked_add(data_size).ok_or("fs data end overflow")?;
+            let fs_data_start = section_start
+                .checked_add(data_off)
+                .ok_or("fs data start overflow")?;
+            let fs_data_end = fs_data_start
+                .checked_add(data_size)
+                .ok_or("fs data end overflow")?;
             let fs_data_end = fs_data_end.min(section_end);
             if fs_data_start > section_end {
-                return Err(format!("NCA section {} fs data start {:#x} beyond section end {:#x}", i, fs_data_start, section_end));
+                return Err(format!(
+                    "NCA section {} fs data start {:#x} beyond section end {:#x}",
+                    i, fs_data_start, section_end
+                ));
             }
 
             sections.push(NcaFsSection {
@@ -134,7 +166,14 @@ impl Nca {
             });
         }
 
-        Ok(Self { mmap, nca_base, content_type, program_id, content_size, sections })
+        Ok(Self {
+            mmap,
+            nca_base,
+            content_type,
+            program_id,
+            content_size,
+            sections,
+        })
     }
 
     pub fn section(&self, fs_type: NcaFsType) -> Option<&NcaFsSection> {

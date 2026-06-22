@@ -1,5 +1,5 @@
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::OnceLock;
 
 pub const ARENA_BITS: u32 = 40;
 pub const ARENA_SIZE: u64 = 1u64 << ARENA_BITS;
@@ -54,7 +54,13 @@ mod sys {
     }
 
     pub fn commit(ptr: *mut u8, len: usize) -> bool {
-        unsafe { libc::mprotect(ptr as *mut libc::c_void, len, libc::PROT_READ | libc::PROT_WRITE) == 0 }
+        unsafe {
+            libc::mprotect(
+                ptr as *mut libc::c_void,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+            ) == 0
+        }
     }
 
     pub fn decommit(ptr: *mut u8, len: usize) {
@@ -78,9 +84,16 @@ fn arena() -> *mut u8 {
         .get_or_init(|| {
             let base = sys::reserve(ARENA_SIZE as usize);
             if base.is_null() {
-                log::warn!("fastmem: failed to reserve {}GB arena; falling back to heap regions", ARENA_SIZE >> 30);
+                log::warn!(
+                    "fastmem: failed to reserve {}GB arena; falling back to heap regions",
+                    ARENA_SIZE >> 30
+                );
             } else {
-                log::info!("fastmem: reserved {}GB arena at {:p}", ARENA_SIZE >> 30, base);
+                log::info!(
+                    "fastmem: reserved {}GB arena at {:p}",
+                    ARENA_SIZE >> 30,
+                    base
+                );
             }
             AtomicPtr::new(base)
         })
@@ -89,7 +102,11 @@ fn arena() -> *mut u8 {
 
 pub fn base() -> Option<*mut u8> {
     let p = arena();
-    if p.is_null() { None } else { Some(p) }
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
 }
 
 pub fn commit(va: u64, len: usize) -> Option<*mut u8> {
@@ -99,12 +116,20 @@ pub fn commit(va: u64, len: usize) -> Option<*mut u8> {
     }
     let end = va.checked_add(len as u64)?;
     if end > ARENA_SIZE {
-        log::warn!("fastmem: region va={:#x} len={:#x} outside arena; using heap", va, len);
+        log::warn!(
+            "fastmem: region va={:#x} len={:#x} outside arena; using heap",
+            va,
+            len
+        );
         return None;
     }
     let ptr = unsafe { base.add(va as usize) };
     if !sys::commit(ptr, len) {
-        log::warn!("fastmem: commit failed va={:#x} len={:#x}; using heap", va, len);
+        log::warn!(
+            "fastmem: commit failed va={:#x} len={:#x}; using heap",
+            va,
+            len
+        );
         return None;
     }
     Some(ptr)

@@ -65,7 +65,11 @@ impl Cnmt {
             nca_id.copy_from_slice(id_slice);
             let size = u48at(bytes, r + 0x30)?;
             let content_type = ContentType::from_u8(u8at(bytes, r + 0x36)?);
-            records.push(ContentRecord { nca_id, size, content_type });
+            records.push(ContentRecord {
+                nca_id,
+                size,
+                content_type,
+            });
         }
 
         Ok(Self { title_id, records })

@@ -6,7 +6,7 @@ pub const KERNEL_INVALID_ADDRESS: u32 = 3 | (33 << 9);
 pub const KERNEL_INVALID_SIZE: u32 = 4 | (33 << 9);
 pub const KERNEL_INVALID_STATE: u32 = 5 | (33 << 9);
 pub const KERNEL_INVALID_POINTER: u32 = 7 | (33 << 9);
-pub const KERNEL_TIMEOUT: u32 = 117 | (33 << 9);
+pub const KERNEL_TIMEOUT: u32 = 1 | (117 << 9);
 pub const KERNEL_PORT_NOT_FOUND: u32 = 131 | (33 << 9);
 
 pub const FS_NOT_FOUND: u32 = 1 | (2 << 9) | (2 << 21);

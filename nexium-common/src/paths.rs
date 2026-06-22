@@ -70,7 +70,13 @@ pub fn app_name_from_nro(nro_path: &str) -> String {
         .trim();
     let cleaned: String = stem
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c == ':' || c == ' ' { '_' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c == ':' || c == ' ' {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     if cleaned.is_empty() {
         "app".to_string()

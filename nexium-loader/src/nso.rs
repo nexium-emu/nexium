@@ -1,4 +1,4 @@
-use crate::bin_read::{u32at, slice};
+use crate::bin_read::{slice, u32at};
 
 pub const NSO0_MAGIC: u32 = 0x304F534E;
 const PAGE: u32 = 0x1000;
@@ -50,19 +50,29 @@ impl Nso {
 
         let mut end: u32 = 0;
         for s in [&text, &ro, &data] {
-            let seg_end = s.mem_offset.checked_add(s.decompressed_size).ok_or("NSO segment end overflow")?;
+            let seg_end = s
+                .mem_offset
+                .checked_add(s.decompressed_size)
+                .ok_or("NSO segment end overflow")?;
             end = end.max(seg_end);
         }
         let image_size = page_align(end.checked_add(bss_size).ok_or("NSO image size overflow")?);
 
         let mut module_image = vec![0u8; image_size as usize];
         for s in [&text, &ro, &data] {
-            let src = slice(region, s.file_offset as usize..(s.file_offset as usize + s.compressed_size as usize))?;
+            let src = slice(
+                region,
+                s.file_offset as usize..(s.file_offset as usize + s.compressed_size as usize),
+            )?;
             let bytes = if s.compressed {
                 let out = lz4_flex::block::decompress(src, s.decompressed_size as usize)
                     .map_err(|e| format!("NSO LZ4 decompress failed: {}", e))?;
                 if out.len() != s.decompressed_size as usize {
-                    return Err(format!("NSO segment decompressed to {} bytes, expected {}", out.len(), s.decompressed_size));
+                    return Err(format!(
+                        "NSO segment decompressed to {} bytes, expected {}",
+                        out.len(),
+                        s.decompressed_size
+                    ));
                 }
                 out
             } else {
@@ -75,11 +85,22 @@ impl Nso {
                 .copy_from_slice(&bytes);
         }
 
-        Ok(Self { text, ro, data, bss_size, image_size, module_image })
+        Ok(Self {
+            text,
+            ro,
+            data,
+            bss_size,
+            image_size,
+            module_image,
+        })
     }
 
     pub fn data_region_size(&self) -> u32 {
         let raw = self.data.decompressed_size.saturating_add(self.bss_size);
-        page_align(self.image_size.saturating_sub(self.data.mem_offset).max(raw))
+        page_align(
+            self.image_size
+                .saturating_sub(self.data.mem_offset)
+                .max(raw),
+        )
     }
 }

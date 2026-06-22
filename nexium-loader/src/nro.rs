@@ -1,8 +1,8 @@
+use byteorder::{LittleEndian, ReadBytesExt};
+use memmap2::Mmap;
 use std::io::Read;
 use std::ops::Range;
 use std::sync::Arc;
-use byteorder::{LittleEndian, ReadBytesExt};
-use memmap2::Mmap;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -30,31 +30,59 @@ impl NroHeader {
         }
 
         let mut cursor = &data[..];
-        let magic = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let magic = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
 
         if magic != 0x304F524E {
             return Err(format!("Invalid NRO magic: {:#x}", magic));
         }
 
         cursor = &data[..];
-        let magic = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let version = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let size = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let flags = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let text_offset = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let text_size = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let ro_offset = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let ro_size = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let data_offset = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let data_size = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let bss_size = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let mod0_offset = cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let magic = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
+        let version = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
+        let size = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
+        let flags = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
+        let text_offset = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
+        let text_size = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
+        let ro_offset = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
+        let ro_size = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
+        let data_offset = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
+        let data_size = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
+        let bss_size = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
+        let mod0_offset = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| e.to_string())?;
 
         let mut padding = [0u8; 12];
         cursor.read_exact(&mut padding).map_err(|e| e.to_string())?;
 
         let mut build_id = [0u8; 32];
-        cursor.read_exact(&mut build_id).map_err(|e| e.to_string())?;
+        cursor
+            .read_exact(&mut build_id)
+            .map_err(|e| e.to_string())?;
 
         Ok(NroHeader {
             magic,
@@ -148,10 +176,8 @@ impl Nro {
     }
 
     pub fn load_from_file(path: &str) -> Result<Self, String> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("Failed to open NRO: {}", e))?;
-        let mmap = unsafe { Mmap::map(&file) }
-            .map_err(|e| format!("Failed to mmap NRO: {}", e))?;
+        let file = std::fs::File::open(path).map_err(|e| format!("Failed to open NRO: {}", e))?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("Failed to mmap NRO: {}", e))?;
         Self::parse_mmap(Arc::new(mmap))
     }
 
@@ -162,18 +188,38 @@ impl Nro {
 
         log::debug!(
             "NRO: magic={:#x}, version={}, size={}, file_offset={}",
-            header.magic, header.version, header.size, nro_offset
+            header.magic,
+            header.version,
+            header.size,
+            nro_offset
         );
 
         const HEADER_SIZE: u32 = 128;
-        let text_offset = if header.text_offset < HEADER_SIZE { header.text_offset + HEADER_SIZE } else { header.text_offset };
-        let ro_offset = if header.ro_offset < HEADER_SIZE { header.ro_offset + HEADER_SIZE } else { header.ro_offset };
-        let data_offset = if header.data_offset < HEADER_SIZE { header.data_offset + HEADER_SIZE } else { header.data_offset };
+        let text_offset = if header.text_offset < HEADER_SIZE {
+            header.text_offset + HEADER_SIZE
+        } else {
+            header.text_offset
+        };
+        let ro_offset = if header.ro_offset < HEADER_SIZE {
+            header.ro_offset + HEADER_SIZE
+        } else {
+            header.ro_offset
+        };
+        let data_offset = if header.data_offset < HEADER_SIZE {
+            header.data_offset + HEADER_SIZE
+        } else {
+            header.data_offset
+        };
 
-        log::debug!("NRO: text=[{:#x}, {:#x}), ro=[{:#x}, {:#x}), data=[{:#x}, {:#x})",
-                   text_offset, text_offset + header.text_size,
-                   ro_offset, ro_offset + header.ro_size,
-                   data_offset, data_offset + header.data_size);
+        log::debug!(
+            "NRO: text=[{:#x}, {:#x}), ro=[{:#x}, {:#x}), data=[{:#x}, {:#x})",
+            text_offset,
+            text_offset + header.text_size,
+            ro_offset,
+            ro_offset + header.ro_size,
+            data_offset,
+            data_offset + header.data_size
+        );
 
         if (text_offset + header.text_size) as usize > nro_slice.len() {
             return Err("Text segment out of bounds".to_string());
@@ -188,17 +234,20 @@ impl Nro {
         let text = NroSegmentView {
             offset: text_offset,
             size: header.text_size,
-            mmap_range: (nro_offset + text_offset as usize)..(nro_offset + (text_offset + header.text_size) as usize),
+            mmap_range: (nro_offset + text_offset as usize)
+                ..(nro_offset + (text_offset + header.text_size) as usize),
         };
         let ro = NroSegmentView {
             offset: ro_offset,
             size: header.ro_size,
-            mmap_range: (nro_offset + ro_offset as usize)..(nro_offset + (ro_offset + header.ro_size) as usize),
+            mmap_range: (nro_offset + ro_offset as usize)
+                ..(nro_offset + (ro_offset + header.ro_size) as usize),
         };
         let data = NroSegmentView {
             offset: data_offset,
             size: header.data_size,
-            mmap_range: (nro_offset + data_offset as usize)..(nro_offset + (data_offset + header.data_size) as usize),
+            mmap_range: (nro_offset + data_offset as usize)
+                ..(nro_offset + (data_offset + header.data_size) as usize),
         };
 
         let romfs_range = parse_asset_romfs(&mmap, header.size);
@@ -232,12 +281,10 @@ fn parse_asset_romfs(mmap: &Mmap, nro_size: u32) -> Option<Range<usize>> {
         return None;
     }
     let romfs_off = u64::from_le_bytes([
-        asset[40], asset[41], asset[42], asset[43],
-        asset[44], asset[45], asset[46], asset[47],
+        asset[40], asset[41], asset[42], asset[43], asset[44], asset[45], asset[46], asset[47],
     ]) as usize;
     let romfs_size = u64::from_le_bytes([
-        asset[48], asset[49], asset[50], asset[51],
-        asset[52], asset[53], asset[54], asset[55],
+        asset[48], asset[49], asset[50], asset[51], asset[52], asset[53], asset[54], asset[55],
     ]) as usize;
     if romfs_size == 0 {
         log::debug!("NRO: ASET section present but romfs size is 0");
@@ -246,9 +293,18 @@ fn parse_asset_romfs(mmap: &Mmap, nro_size: u32) -> Option<Range<usize>> {
     let abs_start = asset_start + romfs_off;
     let abs_end = abs_start + romfs_size;
     if abs_end > mmap.len() {
-        log::warn!("NRO: romfs section [{:#x}..{:#x}) exceeds mmap size {:#x}", abs_start, abs_end, mmap.len());
+        log::warn!(
+            "NRO: romfs section [{:#x}..{:#x}) exceeds mmap size {:#x}",
+            abs_start,
+            abs_end,
+            mmap.len()
+        );
         return None;
     }
-    log::info!("NRO: romfs ({} bytes) at file offset {:#x} (zero-copy slice)", romfs_size, abs_start);
+    log::info!(
+        "NRO: romfs ({} bytes) at file offset {:#x} (zero-copy slice)",
+        romfs_size,
+        abs_start
+    );
     Some(abs_start..abs_end)
 }

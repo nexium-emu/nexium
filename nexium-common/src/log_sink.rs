@@ -1,6 +1,6 @@
-use std::sync::{Arc, Mutex};
+use log::{LevelFilter, Metadata, Record};
 use std::collections::VecDeque;
-use log::{Record, Metadata, LevelFilter};
+use std::sync::{Arc, Mutex};
 
 pub struct BufferedLogger {
     buffer: Arc<Mutex<VecDeque<String>>>,
@@ -9,7 +9,12 @@ pub struct BufferedLogger {
 impl BufferedLogger {
     pub fn new(capacity: usize) -> (Self, Arc<Mutex<VecDeque<String>>>) {
         let buffer = Arc::new(Mutex::new(VecDeque::with_capacity(capacity)));
-        (Self { buffer: buffer.clone() }, buffer)
+        (
+            Self {
+                buffer: buffer.clone(),
+            },
+            buffer,
+        )
     }
 
     pub fn init(self, level: LevelFilter) -> Result<(), log::SetLoggerError> {

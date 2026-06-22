@@ -1,17 +1,17 @@
-pub mod nro;
-pub mod env;
-pub mod bin_read;
-pub mod container;
-pub mod nca;
-pub mod cnmt;
-pub mod nso;
-pub mod npdm;
-pub mod romfs;
 pub mod application;
+pub mod bin_read;
+pub mod cnmt;
+pub mod container;
+pub mod env;
+pub mod nca;
+pub mod npdm;
+pub mod nro;
+pub mod nso;
+pub mod romfs;
 
-pub use nro::Nro;
+pub use application::{detect, Application, ContainerKind, LazyRomfs, LoadedModule};
 pub use env::EnvBlockBuilder;
-pub use application::{Application, ContainerKind, LazyRomfs, LoadedModule, detect};
+pub use nro::Nro;
 
 pub enum LoadedProgram {
     Nro(Nro),
@@ -31,9 +31,12 @@ impl Loader {
 
     pub fn load_any(path: &str) -> Result<LoadedProgram, String> {
         let file = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("mmap {}: {}", path, e))?;
+        let mmap =
+            unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("mmap {}: {}", path, e))?;
         match application::detect(path, &mmap) {
-            ContainerKind::Nro => Ok(LoadedProgram::Nro(Nro::parse_mmap(std::sync::Arc::new(mmap))?)),
+            ContainerKind::Nro => Ok(LoadedProgram::Nro(Nro::parse_mmap(std::sync::Arc::new(
+                mmap,
+            ))?)),
             ContainerKind::Unknown => Err(format!("unrecognized file format: {}", path)),
             _ => Ok(LoadedProgram::Application(Application::load(path)?)),
         }

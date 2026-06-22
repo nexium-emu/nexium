@@ -8,7 +8,11 @@ pub const IVFC_MAGIC: u32 = 0x43465649;
 
 const HASH_DATA_OFFSET: usize = 0x08;
 
-pub fn fs_data_extent(fs_header: &[u8], hash_type: u8, section_len: u64) -> Result<(u64, u64), String> {
+pub fn fs_data_extent(
+    fs_header: &[u8],
+    hash_type: u8,
+    section_len: u64,
+) -> Result<(u64, u64), String> {
     match hash_type {
         HASH_TYPE_SHA256 => sha256_target(fs_header),
         HASH_TYPE_INTEGRITY => ivfc_target(fs_header),

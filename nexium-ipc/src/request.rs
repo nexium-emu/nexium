@@ -69,10 +69,7 @@ impl IpcResponse {
         data[8..12].copy_from_slice(&result.to_le_bytes());
         data[12..16].copy_from_slice(&token.to_le_bytes());
 
-        IpcResponse {
-            result,
-            data,
-        }
+        IpcResponse { result, data }
     }
 
     pub fn with_data(token: u32, response_data: &[u8]) -> Self {

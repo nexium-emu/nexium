@@ -1,6 +1,6 @@
+use memmap2::Mmap;
 use std::ops::Range;
 use std::sync::Arc;
-use memmap2::Mmap;
 
 use crate::bin_read::{u32at, u64at};
 
@@ -30,7 +30,12 @@ impl PartitionFs {
         let is_hfs0 = match magic {
             PFS0_MAGIC => false,
             HFS0_MAGIC => true,
-            _ => return Err(format!("partition magic {:#010x} at {:#x} is not PFS0/HFS0", magic, base)),
+            _ => {
+                return Err(format!(
+                    "partition magic {:#010x} at {:#x} is not PFS0/HFS0",
+                    magic, base
+                ))
+            }
         };
         let num_entries = u32at(buf, base + 4)? as usize;
         let strtab_size = u32at(buf, base + 8)? as usize;
@@ -40,11 +45,21 @@ impl PartitionFs {
             .checked_add(0x10)
             .ok_or("partition entry table overflow")?;
         let strtab = entry_table
-            .checked_add(num_entries.checked_mul(entry_size).ok_or("entry count overflow")?)
+            .checked_add(
+                num_entries
+                    .checked_mul(entry_size)
+                    .ok_or("entry count overflow")?,
+            )
             .ok_or("strtab offset overflow")?;
-        let data_start = strtab.checked_add(strtab_size).ok_or("data_start overflow")?;
+        let data_start = strtab
+            .checked_add(strtab_size)
+            .ok_or("data_start overflow")?;
         if data_start > buf.len() {
-            return Err(format!("partition data_start {:#x} exceeds file {:#x}", data_start, buf.len()));
+            return Err(format!(
+                "partition data_start {:#x} exceeds file {:#x}",
+                data_start,
+                buf.len()
+            ));
         }
 
         let mut entries = Vec::with_capacity(num_entries);
@@ -57,10 +72,21 @@ impl PartitionFs {
 
             let name_start = strtab.checked_add(name_off).ok_or("name offset overflow")?;
             let name = read_cstr(buf, name_start, strtab + strtab_size);
-            entries.push(PartitionEntry { name, offset, size, hash_region_size });
+            entries.push(PartitionEntry {
+                name,
+                offset,
+                size,
+                hash_region_size,
+            });
         }
 
-        Ok(Self { mmap, base, data_start, is_hfs0, entries })
+        Ok(Self {
+            mmap,
+            base,
+            data_start,
+            is_hfs0,
+            entries,
+        })
     }
 
     pub fn entries(&self) -> &[PartitionEntry] {
@@ -85,11 +111,20 @@ impl PartitionFs {
             .ok_or("entry start overflow")?;
         let limit = self.mmap.len() as u64;
         if start > limit {
-            return Err(format!("entry '{}' start {:#x} past EOF {:#x}", e.name, start, limit));
+            return Err(format!(
+                "entry '{}' start {:#x} past EOF {:#x}",
+                e.name, start, limit
+            ));
         }
         let nominal_end = start.checked_add(e.size).ok_or("entry size overflow")?;
         let end = if nominal_end > limit {
-            log::warn!("entry '{}' end {:#x} clamped to EOF {:#x} (over by {:#x})", e.name, nominal_end, limit, nominal_end - limit);
+            log::warn!(
+                "entry '{}' end {:#x} clamped to EOF {:#x} (over by {:#x})",
+                e.name,
+                nominal_end,
+                limit,
+                nominal_end - limit
+            );
             limit
         } else {
             nominal_end

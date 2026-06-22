@@ -13,13 +13,26 @@ fn main() {
 
     match Loader::load_any(&path) {
         Ok(LoadedProgram::Nro(nro)) => {
-            println!("NRO: image_size={:#x} romfs={}", nro.total_memory_size(), nro.romfs_range().is_some());
+            println!(
+                "NRO: image_size={:#x} romfs={}",
+                nro.total_memory_size(),
+                nro.romfs_range().is_some()
+            );
         }
         Ok(LoadedProgram::Application(app)) => {
             println!("APPLICATION title_id={:#018x}", app.title_id);
-            println!("  address_space={:?} 64bit={} stack={:#x} sysres={:#x}",
-                app.npdm.address_space, app.npdm.is_64bit, app.npdm.main_stack_size, app.npdm.system_resource_size);
-            println!("  code_size={:#x} modules={}", app.total_code_size, app.modules.len());
+            println!(
+                "  address_space={:?} 64bit={} stack={:#x} sysres={:#x}",
+                app.npdm.address_space,
+                app.npdm.is_64bit,
+                app.npdm.main_stack_size,
+                app.npdm.system_resource_size
+            );
+            println!(
+                "  code_size={:#x} modules={}",
+                app.total_code_size,
+                app.modules.len()
+            );
             let needle = b"__nnDetailInitLibc0";
             for m in &app.modules {
                 let img = &m.nso.module_image;
@@ -35,8 +48,16 @@ fn main() {
             match &app.romfs {
                 Some(r) => {
                     let head = r.as_slice();
-                    let hdr_size = if head.len() >= 4 { u32::from_le_bytes([head[0], head[1], head[2], head[3]]) } else { 0 };
-                    println!("  romfs {} bytes, header_size={:#x} (expect 0x50)", r.len(), hdr_size);
+                    let hdr_size = if head.len() >= 4 {
+                        u32::from_le_bytes([head[0], head[1], head[2], head[3]])
+                    } else {
+                        0
+                    };
+                    println!(
+                        "  romfs {} bytes, header_size={:#x} (expect 0x50)",
+                        r.len(),
+                        hdr_size
+                    );
                 }
                 None => println!("  romfs: none"),
             }

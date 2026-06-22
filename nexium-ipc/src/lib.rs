@@ -1,13 +1,13 @@
-pub mod hipc;
 pub mod cmif;
+pub mod dispatch;
+pub mod hipc;
 pub mod parcel;
 pub mod request;
-pub mod dispatch;
 
-pub use hipc::{HipcHeader, HipcSpecialHeader, HipcCommandType};
+pub use cmif::{CmifDomainInHeader, CmifDomainOutHeader, CmifInHeader, CmifOutHeader};
+pub use cmif::{CMIF_DOMAIN_REQ_CLOSE, CMIF_DOMAIN_REQ_SEND, CMIF_IN_MAGIC, CMIF_OUT_MAGIC};
+pub use hipc::{HipcCommandType, HipcHeader, HipcSpecialHeader};
 pub use hipc::{TLS_BUFFER_SIZE, TLS_REQUEST_OFFSET};
-pub use cmif::{CmifInHeader, CmifOutHeader, CmifDomainInHeader, CmifDomainOutHeader};
-pub use cmif::{CMIF_IN_MAGIC, CMIF_OUT_MAGIC, CMIF_DOMAIN_REQ_SEND, CMIF_DOMAIN_REQ_CLOSE};
 
 #[derive(Debug)]
 pub enum IpcError {
@@ -66,10 +66,12 @@ pub struct IpcCtx {
 }
 
 impl IpcCtx {
-
     pub fn parse(mut buf: Vec<u8>, is_domain: bool) -> IpcResult<Self> {
         if buf.len() < 8 {
-            return Err(IpcError::BufferTooSmall { have: buf.len(), need: 8 });
+            return Err(IpcError::BufferTooSmall {
+                have: buf.len(),
+                need: 8,
+            });
         }
 
         let mut hdr_bytes = [0u8; 8];
@@ -90,7 +92,10 @@ impl IpcCtx {
 
         if hipc.has_special_header() {
             if buf.len() < cursor + 4 {
-                return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 4 });
+                return Err(IpcError::BufferTooSmall {
+                    have: buf.len(),
+                    need: cursor + 4,
+                });
             }
             let mut sh_bytes = [0u8; 4];
             sh_bytes.copy_from_slice(&buf[cursor..cursor + 4]);
@@ -99,11 +104,20 @@ impl IpcCtx {
 
             if sh.send_pid() {
                 if buf.len() < cursor + 8 {
-                    return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 8 });
+                    return Err(IpcError::BufferTooSmall {
+                        have: buf.len(),
+                        need: cursor + 8,
+                    });
                 }
                 let p = u64::from_le_bytes([
-                    buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3],
-                    buf[cursor + 4], buf[cursor + 5], buf[cursor + 6], buf[cursor + 7],
+                    buf[cursor],
+                    buf[cursor + 1],
+                    buf[cursor + 2],
+                    buf[cursor + 3],
+                    buf[cursor + 4],
+                    buf[cursor + 5],
+                    buf[cursor + 6],
+                    buf[cursor + 7],
                 ]);
                 send_pid_value = Some(p);
                 cursor += 8;
@@ -111,18 +125,34 @@ impl IpcCtx {
 
             for _ in 0..sh.num_copy_handles() {
                 if cursor + 4 > buf.len() {
-                    return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 4 });
+                    return Err(IpcError::BufferTooSmall {
+                        have: buf.len(),
+                        need: cursor + 4,
+                    });
                 }
-                let h = u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]);
+                let h = u32::from_le_bytes([
+                    buf[cursor],
+                    buf[cursor + 1],
+                    buf[cursor + 2],
+                    buf[cursor + 3],
+                ]);
                 copy_handles.push(h);
                 cursor += 4;
             }
 
             for _ in 0..sh.num_move_handles() {
                 if cursor + 4 > buf.len() {
-                    return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 4 });
+                    return Err(IpcError::BufferTooSmall {
+                        have: buf.len(),
+                        need: cursor + 4,
+                    });
                 }
-                let h = u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]);
+                let h = u32::from_le_bytes([
+                    buf[cursor],
+                    buf[cursor + 1],
+                    buf[cursor + 2],
+                    buf[cursor + 3],
+                ]);
                 move_handles.push(h);
                 cursor += 4;
             }
@@ -133,23 +163,43 @@ impl IpcCtx {
         let mut send_statics = Vec::new();
         for _ in 0..hipc.num_send_statics() {
             if cursor + 8 > buf.len() {
-                return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 8 });
+                return Err(IpcError::BufferTooSmall {
+                    have: buf.len(),
+                    need: cursor + 8,
+                });
             }
-            let word0 = u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]);
-            let addr_low = u32::from_le_bytes([buf[cursor + 4], buf[cursor + 5], buf[cursor + 6], buf[cursor + 7]]) as u64;
+            let word0 = u32::from_le_bytes([
+                buf[cursor],
+                buf[cursor + 1],
+                buf[cursor + 2],
+                buf[cursor + 3],
+            ]);
+            let addr_low = u32::from_le_bytes([
+                buf[cursor + 4],
+                buf[cursor + 5],
+                buf[cursor + 6],
+                buf[cursor + 7],
+            ]) as u64;
             let index = (word0 & 0x3F) as u64;
             let addr_high = ((word0 >> 6) & 0x3F) as u64;
             let addr_mid = ((word0 >> 12) & 0xF) as u64;
             let size = ((word0 >> 16) & 0xFFFF) as u64;
             let addr = addr_low | (addr_mid << 32) | (addr_high << 36);
-            send_statics.push(IpcBuffer { addr, size, mode: index as u32 });
+            send_statics.push(IpcBuffer {
+                addr,
+                size,
+                mode: index as u32,
+            });
             cursor += 8;
         }
 
         let mut send_buffers = Vec::new();
         for _ in 0..hipc.num_send_buffers() {
             if cursor + 12 > buf.len() {
-                return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 12 });
+                return Err(IpcError::BufferTooSmall {
+                    have: buf.len(),
+                    need: cursor + 12,
+                });
             }
             send_buffers.push(parse_abc_descriptor(&buf, cursor));
             cursor += 12;
@@ -158,7 +208,10 @@ impl IpcCtx {
         let mut recv_buffers = Vec::new();
         for _ in 0..hipc.num_recv_buffers() {
             if cursor + 12 > buf.len() {
-                return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 12 });
+                return Err(IpcError::BufferTooSmall {
+                    have: buf.len(),
+                    need: cursor + 12,
+                });
             }
             recv_buffers.push(parse_abc_descriptor(&buf, cursor));
             cursor += 12;
@@ -167,7 +220,10 @@ impl IpcCtx {
         let mut exch_buffers = Vec::new();
         for _ in 0..hipc.num_exch_buffers() {
             if cursor + 12 > buf.len() {
-                return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 12 });
+                return Err(IpcError::BufferTooSmall {
+                    have: buf.len(),
+                    need: cursor + 12,
+                });
             }
             exch_buffers.push(parse_abc_descriptor(&buf, cursor));
             cursor += 12;
@@ -195,12 +251,19 @@ impl IpcCtx {
                 if off + 8 > buf.len() {
                     break;
                 }
-                let lo = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as u64;
-                let hi = u32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]) as u64;
+                let lo =
+                    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as u64;
+                let hi =
+                    u32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]])
+                        as u64;
                 let packed = lo | (hi << 32);
                 let addr = packed & 0x0000_FFFF_FFFF_FFFF;
                 let size = (packed >> 48) & 0xFFFF;
-                recv_statics.push(IpcBuffer { addr, size, mode: 0 });
+                recv_statics.push(IpcBuffer {
+                    addr,
+                    size,
+                    mode: 0,
+                });
             }
         }
 
@@ -209,18 +272,36 @@ impl IpcCtx {
 
         if is_domain {
             if buf.len() < cursor + 16 {
-                return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 16 });
+                return Err(IpcError::BufferTooSmall {
+                    have: buf.len(),
+                    need: cursor + 16,
+                });
             }
             let kind = buf[cursor];
             let num_in_objects = buf[cursor + 1];
             let data_size = u16::from_le_bytes([buf[cursor + 2], buf[cursor + 3]]);
-            let object_id = u32::from_le_bytes([buf[cursor + 4], buf[cursor + 5], buf[cursor + 6], buf[cursor + 7]]);
+            let object_id = u32::from_le_bytes([
+                buf[cursor + 4],
+                buf[cursor + 5],
+                buf[cursor + 6],
+                buf[cursor + 7],
+            ]);
             cursor += 16;
 
-            domain = Some(DomainIn { kind, object_id, num_in_objects, data_size });
+            domain = Some(DomainIn {
+                kind,
+                object_id,
+                num_in_objects,
+                data_size,
+            });
 
             if kind == CMIF_DOMAIN_REQ_CLOSE {
-                let zero = CmifInHeader { magic: 0, version: 0, cmd_id: 0, token: 0 };
+                let zero = CmifInHeader {
+                    magic: 0,
+                    version: 0,
+                    cmd_id: 0,
+                    token: 0,
+                };
                 return Ok(IpcCtx {
                     buf,
                     hipc,
@@ -244,17 +325,45 @@ impl IpcCtx {
         }
 
         if buf.len() < cursor + 16 {
-            return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 16 });
+            return Err(IpcError::BufferTooSmall {
+                have: buf.len(),
+                need: cursor + 16,
+            });
         }
-        let magic = u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]);
+        let magic = u32::from_le_bytes([
+            buf[cursor],
+            buf[cursor + 1],
+            buf[cursor + 2],
+            buf[cursor + 3],
+        ]);
         if magic != CMIF_IN_MAGIC {
             return Err(IpcError::BadCmifMagic { got: magic });
         }
-        let version = u32::from_le_bytes([buf[cursor + 4], buf[cursor + 5], buf[cursor + 6], buf[cursor + 7]]);
-        let cmd_id = u32::from_le_bytes([buf[cursor + 8], buf[cursor + 9], buf[cursor + 10], buf[cursor + 11]]);
-        let token = u32::from_le_bytes([buf[cursor + 12], buf[cursor + 13], buf[cursor + 14], buf[cursor + 15]]);
+        let version = u32::from_le_bytes([
+            buf[cursor + 4],
+            buf[cursor + 5],
+            buf[cursor + 6],
+            buf[cursor + 7],
+        ]);
+        let cmd_id = u32::from_le_bytes([
+            buf[cursor + 8],
+            buf[cursor + 9],
+            buf[cursor + 10],
+            buf[cursor + 11],
+        ]);
+        let token = u32::from_le_bytes([
+            buf[cursor + 12],
+            buf[cursor + 13],
+            buf[cursor + 14],
+            buf[cursor + 15],
+        ]);
 
-        let cmif_in = CmifInHeader { magic, version, cmd_id, token };
+        let cmif_in = CmifInHeader {
+            magic,
+            version,
+            cmd_id,
+            token,
+        };
         let cmif_in_data_off = cursor + 16;
 
         let raw_size = (hipc.num_data_words() as usize) * 4;
@@ -276,7 +385,8 @@ impl IpcCtx {
                 if off + 4 > buf.len() {
                     break;
                 }
-                let obj_id = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+                let obj_id =
+                    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
                 in_objects.push(obj_id);
             }
         }
@@ -311,44 +421,104 @@ impl IpcCtx {
 
         if hipc.has_special_header() {
             if buf.len() < cursor + 4 {
-                return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 4 });
+                return Err(IpcError::BufferTooSmall {
+                    have: buf.len(),
+                    need: cursor + 4,
+                });
             }
-            let sh = HipcSpecialHeader::from_u32(u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]));
+            let sh = HipcSpecialHeader::from_u32(u32::from_le_bytes([
+                buf[cursor],
+                buf[cursor + 1],
+                buf[cursor + 2],
+                buf[cursor + 3],
+            ]));
             cursor += 4;
             if sh.send_pid() {
                 if buf.len() < cursor + 8 {
-                    return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 8 });
+                    return Err(IpcError::BufferTooSmall {
+                        have: buf.len(),
+                        need: cursor + 8,
+                    });
                 }
-                send_pid_value = Some(u64::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3], buf[cursor + 4], buf[cursor + 5], buf[cursor + 6], buf[cursor + 7]]));
+                send_pid_value = Some(u64::from_le_bytes([
+                    buf[cursor],
+                    buf[cursor + 1],
+                    buf[cursor + 2],
+                    buf[cursor + 3],
+                    buf[cursor + 4],
+                    buf[cursor + 5],
+                    buf[cursor + 6],
+                    buf[cursor + 7],
+                ]));
                 cursor += 8;
             }
             for _ in 0..sh.num_copy_handles() {
-                if cursor + 4 > buf.len() { return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 4 }); }
-                copy_handles.push(u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]));
+                if cursor + 4 > buf.len() {
+                    return Err(IpcError::BufferTooSmall {
+                        have: buf.len(),
+                        need: cursor + 4,
+                    });
+                }
+                copy_handles.push(u32::from_le_bytes([
+                    buf[cursor],
+                    buf[cursor + 1],
+                    buf[cursor + 2],
+                    buf[cursor + 3],
+                ]));
                 cursor += 4;
             }
             for _ in 0..sh.num_move_handles() {
-                if cursor + 4 > buf.len() { return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 4 }); }
-                move_handles.push(u32::from_le_bytes([buf[cursor], buf[cursor + 1], buf[cursor + 2], buf[cursor + 3]]));
+                if cursor + 4 > buf.len() {
+                    return Err(IpcError::BufferTooSmall {
+                        have: buf.len(),
+                        need: cursor + 4,
+                    });
+                }
+                move_handles.push(u32::from_le_bytes([
+                    buf[cursor],
+                    buf[cursor + 1],
+                    buf[cursor + 2],
+                    buf[cursor + 3],
+                ]));
                 cursor += 4;
             }
             special = Some(sh);
         }
 
         for _ in 0..hipc.num_send_statics() {
-            if cursor + 8 > buf.len() { return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 8 }); }
+            if cursor + 8 > buf.len() {
+                return Err(IpcError::BufferTooSmall {
+                    have: buf.len(),
+                    need: cursor + 8,
+                });
+            }
             cursor += 8;
         }
         for _ in 0..hipc.num_send_buffers() {
-            if cursor + 12 > buf.len() { return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 12 }); }
+            if cursor + 12 > buf.len() {
+                return Err(IpcError::BufferTooSmall {
+                    have: buf.len(),
+                    need: cursor + 12,
+                });
+            }
             cursor += 12;
         }
         for _ in 0..hipc.num_recv_buffers() {
-            if cursor + 12 > buf.len() { return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 12 }); }
+            if cursor + 12 > buf.len() {
+                return Err(IpcError::BufferTooSmall {
+                    have: buf.len(),
+                    need: cursor + 12,
+                });
+            }
             cursor += 12;
         }
         for _ in 0..hipc.num_exch_buffers() {
-            if cursor + 12 > buf.len() { return Err(IpcError::BufferTooSmall { have: buf.len(), need: cursor + 12 }); }
+            if cursor + 12 > buf.len() {
+                return Err(IpcError::BufferTooSmall {
+                    have: buf.len(),
+                    need: cursor + 12,
+                });
+            }
             cursor += 12;
         }
 
@@ -387,7 +557,9 @@ impl IpcCtx {
             cmif_in_data_off: raw_data_off,
             cmif_in_data_len: raw_data_len,
             in_objects: Vec::new(),
-            tipc: Some(TipcInfo { raw_request_id: cmd_type }),
+            tipc: Some(TipcInfo {
+                raw_request_id: cmd_type,
+            }),
         })
     }
 
@@ -404,9 +576,7 @@ fn parse_abc_descriptor(buf: &[u8], off: usize) -> IpcBuffer {
     let addr_high = (packed >> 2) & 0x003F_FFFF;
     let size_high = (packed >> 24) & 0xF;
     let addr_mid = (packed >> 28) & 0xF;
-    let addr = (addr_low as u64)
-        | ((addr_mid as u64) << 32)
-        | ((addr_high as u64) << 36);
+    let addr = (addr_low as u64) | ((addr_mid as u64) << 32) | ((addr_high as u64) << 36);
     let size = (size_low as u64) | ((size_high as u64) << 32);
     IpcBuffer { addr, size, mode }
 }

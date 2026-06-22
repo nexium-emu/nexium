@@ -1,12 +1,12 @@
+use memmap2::Mmap;
 use std::ops::Range;
 use std::sync::Arc;
-use memmap2::Mmap;
 
 use crate::cnmt::{Cnmt, ContentType};
 use crate::container::{Nsp, PartitionFs, Xci};
 use crate::nca::{Nca, NcaContentType, NcaFsType};
-use crate::nso::Nso;
 use crate::npdm::Npdm;
+use crate::nso::Nso;
 
 const PAGE: u64 = 0x1000;
 
@@ -99,7 +99,8 @@ const MODULE_ORDER: &[&str] = &[
 impl Application {
     pub fn load(path: &str) -> Result<Self, String> {
         let file = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
-        let mmap = Arc::new(unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap {}: {}", path, e))?);
+        let mmap =
+            Arc::new(unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap {}: {}", path, e))?);
         log::info!("container {} ({} bytes)", path, mmap.len());
 
         match detect(path, &mmap) {
@@ -146,14 +147,20 @@ impl Application {
         parsed: &[(String, Nca)],
     ) -> Result<Nca, String> {
         if let Some((meta_name, meta)) = parsed.iter().find(|(n, nca)| {
-            nca.content_type == NcaContentType::Meta || n.to_ascii_lowercase().ends_with(".cnmt.nca")
+            nca.content_type == NcaContentType::Meta
+                || n.to_ascii_lowercase().ends_with(".cnmt.nca")
         }) {
             if let Some(section) = meta.section(NcaFsType::PartitionFs) {
                 let pfs = PartitionFs::parse(mmap.clone(), section.fs_data_range.start)?;
                 if let Some(cnmt_entry) = pfs.entries().iter().find(|e| e.name.ends_with(".cnmt")) {
                     let bytes = &mmap[pfs.entry_range(cnmt_entry)?];
                     let cnmt = Cnmt::parse(bytes)?;
-                    log::info!("CNMT in {} title_id={:#018x} records={}", meta_name, cnmt.title_id, cnmt.records.len());
+                    log::info!(
+                        "CNMT in {} title_id={:#018x} records={}",
+                        meta_name,
+                        cnmt.title_id,
+                        cnmt.records.len()
+                    );
                     if let Some(rec) = cnmt.find(ContentType::Program) {
                         let want = rec.nca_filename();
                         if let Some(entry) = ncas.find(&want) {
@@ -180,7 +187,11 @@ impl Application {
         let exefs = PartitionFs::parse(mmap.clone(), exefs_section.fs_data_range.start)?;
         log::info!(
             "exefs files: {:?}",
-            exefs.entries().iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+            exefs
+                .entries()
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>()
         );
 
         let npdm = match exefs.find("main.npdm") {
@@ -206,11 +217,22 @@ impl Application {
                 let image_size = nso.image_size as u64;
                 log::info!(
                     "module {} @ +{:#x} image={:#x} text={:#x} ro={:#x} data={:#x} bss={:#x}",
-                    name, load_offset, image_size, nso.text.decompressed_size, nso.ro.decompressed_size,
-                    nso.data.decompressed_size, nso.bss_size
+                    name,
+                    load_offset,
+                    image_size,
+                    nso.text.decompressed_size,
+                    nso.ro.decompressed_size,
+                    nso.data.decompressed_size,
+                    nso.bss_size
                 );
-                modules.push(LoadedModule { name: name.to_string(), nso, load_offset });
-                load_offset = load_offset.checked_add(page_align(image_size)).ok_or("code layout overflow")?;
+                modules.push(LoadedModule {
+                    name: name.to_string(),
+                    nso,
+                    load_offset,
+                });
+                load_offset = load_offset
+                    .checked_add(page_align(image_size))
+                    .ok_or("code layout overflow")?;
             }
         }
         if modules.is_empty() {
@@ -223,15 +245,35 @@ impl Application {
             range: s.fs_data_range.clone(),
         });
         if let Some(r) = &romfs {
-            log::info!("romfs image {:#x}..{:#x} ({} bytes)", r.range.start, r.range.end, r.len());
+            log::info!(
+                "romfs image {:#x}..{:#x} ({} bytes)",
+                r.range.start,
+                r.range.end,
+                r.len()
+            );
         }
 
-        let title_id = if npdm.title_id != 0 { npdm.title_id } else { program.program_id };
+        let title_id = if npdm.title_id != 0 {
+            npdm.title_id
+        } else {
+            program.program_id
+        };
         log::info!(
             "application title_id={:#018x} addr_space={:?} stack={:#x} code_size={:#x} modules={}",
-            title_id, npdm.address_space, npdm.main_stack_size, total_code_size, modules.len()
+            title_id,
+            npdm.address_space,
+            npdm.main_stack_size,
+            total_code_size,
+            modules.len()
         );
 
-        Ok(Self { mmap, modules, total_code_size, npdm, romfs, title_id })
+        Ok(Self {
+            mmap,
+            modules,
+            total_code_size,
+            npdm,
+            romfs,
+            title_id,
+        })
     }
 }
