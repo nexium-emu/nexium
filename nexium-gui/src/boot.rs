@@ -383,6 +383,15 @@ impl EmulationHandle {
                 let mut last_heartbeat_svc = 0u32;
                 let mut last_heartbeat_cycles = 0u64;
                 let mut last_pipeline_stats = boot_ctx.kernel.lock().nvdrv.stats.snapshot();
+                let mut last_render_progress = std::time::Instant::now();
+                let mut seen_render_progress = last_pipeline_stats.gpfifo_submits > 0
+                    || last_pipeline_stats.gpfifo_entries > 0
+                    || last_pipeline_stats.methods_dispatched > 0
+                    || last_pipeline_stats.maxwell3d_draws > 0
+                    || last_pipeline_stats.frames_submitted > 0;
+                let mut last_sync_snapshot = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(std::time::Instant::now);
 
                 let mut loop_iter: u64 = 0;
                 let mut last_loop_log = std::time::Instant::now();
@@ -459,6 +468,24 @@ impl EmulationHandle {
 
                             let cur_stats = guard.nvdrv.stats.snapshot();
                             let d = |cur: u64, prev: u64| -> u64 { cur.saturating_sub(prev) };
+                            let gpu_progress =
+                                d(cur_stats.gpfifo_submits, last_pipeline_stats.gpfifo_submits) > 0
+                                    || d(
+                                        cur_stats.gpfifo_entries,
+                                        last_pipeline_stats.gpfifo_entries,
+                                    ) > 0
+                                    || d(
+                                        cur_stats.methods_dispatched,
+                                        last_pipeline_stats.methods_dispatched,
+                                    ) > 0
+                                    || d(
+                                        cur_stats.maxwell3d_draws,
+                                        last_pipeline_stats.maxwell3d_draws,
+                                    ) > 0
+                                    || d(
+                                        cur_stats.frames_submitted,
+                                        last_pipeline_stats.frames_submitted,
+                                    ) > 0;
                             log::info!(
                             "[gpu] gpfifo_submits={} (+{}/s) entries={} (+{}/s) methods={} (+{}/s) | mw3d draws={} (+{}) clears={} (+{}) | fermi2d blits={} (+{}) | mwdma blits={} (+{})",
                             cur_stats.gpfifo_submits, ((d(cur_stats.gpfifo_submits, last_pipeline_stats.gpfifo_submits) as f64) / secs) as u64,
@@ -502,6 +529,23 @@ impl EmulationHandle {
                                     .map(|(m, n)| format!("{:#x}={}", m, n))
                                     .collect();
                                 log::info!("[mw3d-methods] {}", pretty.join(" "));
+                            }
+                            if gpu_progress {
+                                last_render_progress = std::time::Instant::now();
+                                seen_render_progress = true;
+                            } else if seen_render_progress
+                                && svc_count > last_heartbeat_svc
+                                && last_render_progress.elapsed()
+                                    >= std::time::Duration::from_secs(2)
+                                && last_sync_snapshot.elapsed() >= std::time::Duration::from_secs(2)
+                            {
+                                log::warn!(
+                                    "[render-idle-live] no render progress for {:.2}s while svc_count advanced by {}",
+                                    last_render_progress.elapsed().as_secs_f64(),
+                                    svc_count.saturating_sub(last_heartbeat_svc)
+                                );
+                                guard.log_thread_snapshot("render-idle-live");
+                                last_sync_snapshot = std::time::Instant::now();
                             }
                             last_pipeline_stats = cur_stats;
 

@@ -29,6 +29,7 @@ pub struct Kernel {
     pub hid: Arc<Mutex<hid::HidShared>>,
     pub sessions: HashMap<u32, session::Session>,
     pub event_signals: HashMap<u32, bool>,
+    pub exited_thread_handles: HashSet<u32>,
     pub pending_condvar_signals: HashMap<u64, u32>,
     pub audio_render_condvar: Option<u64>,
     pub tls_buffer: [u8; 0x100],
@@ -177,6 +178,7 @@ impl Kernel {
             hid: Arc::new(Mutex::new(hid::HidShared::new())),
             sessions: HashMap::new(),
             event_signals: HashMap::new(),
+            exited_thread_handles: HashSet::new(),
             pending_condvar_signals: HashMap::new(),
             audio_render_condvar: None,
             tls_buffer: [0u8; 0x100],
@@ -252,6 +254,173 @@ impl Kernel {
             audio_renderer_frame_counter: 0,
             audio_renderer_last_tick: std::time::Instant::now(),
             audio_renderer_last_consumed: 0,
+        }
+    }
+
+    fn debug_read_u32(&self, addr: u64) -> Option<u32> {
+        let mut bytes = [0u8; 4];
+        self.address_space
+            .read(addr, &mut bytes)
+            .ok()
+            .map(|_| u32::from_le_bytes(bytes))
+    }
+
+    fn debug_wait_deadline(wake_at: Option<std::time::Instant>) -> String {
+        match wake_at {
+            Some(deadline) => {
+                let now = std::time::Instant::now();
+                if deadline > now {
+                    format!(
+                        "timeout_in_ms={:.1}",
+                        (deadline - now).as_secs_f64() * 1000.0
+                    )
+                } else {
+                    "timeout_due".to_string()
+                }
+            }
+            None => "timeout=infinite".to_string(),
+        }
+    }
+
+    fn debug_handle_tags(&self, handle: u32) -> String {
+        let mut tags: Vec<&'static str> = Vec::new();
+        if Some(handle) == self.applet_message_event {
+            tags.push("applet_msg");
+        }
+        if self.vsync_handles.contains(&handle) {
+            tags.push("vsync");
+        }
+        if self.nvdrv_sync_events.contains(&handle) {
+            tags.push("nvdrv_sync");
+        }
+        if self.gpu_fence_events.contains(&handle) {
+            tags.push("gpu_fence");
+        }
+        if self.audio_renderer_events.values().any(|&h| h == handle) {
+            tags.push("audren");
+        }
+        if self.audio_buffer_events.values().any(|&h| h == handle) {
+            tags.push("audout");
+        }
+        if self.event_signals.get(&handle).copied().unwrap_or(false) {
+            tags.push("signaled");
+        }
+
+        let ty = self
+            .handles
+            .get_handle(handle)
+            .map(|h| format!("{:?}", h.handle_type))
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        if tags.is_empty() {
+            format!("{:#x}:{}", handle, ty)
+        } else {
+            format!("{:#x}:{}:{}", handle, ty, tags.join("|"))
+        }
+    }
+
+    pub fn log_thread_snapshot(&self, label: &str) {
+        log::warn!(
+            "[thread-snapshot:{}] current={:?} ready={:?} pending_condvars={:?} events={} audio_render_events={}",
+            label,
+            self.threads.current,
+            self.threads.ready,
+            self.pending_condvar_signals,
+            self.event_signals.len(),
+            self.audio_renderer_events.len()
+        );
+
+        let mut handles: Vec<u32> = self.threads.threads.keys().copied().collect();
+        handles.sort_unstable();
+
+        for handle in handles {
+            let Some(t) = self.threads.threads.get(&handle) else {
+                continue;
+            };
+            let state = match &t.state {
+                threads::ThreadState::Created => "Created".to_string(),
+                threads::ThreadState::Ready => "Ready".to_string(),
+                threads::ThreadState::Running => "Running".to_string(),
+                threads::ThreadState::Sleeping { wake_at } => {
+                    format!("Sleeping {}", Self::debug_wait_deadline(Some(*wake_at)))
+                }
+                threads::ThreadState::WaitingHandle { handles, wake_at } => {
+                    let waited = handles
+                        .iter()
+                        .map(|h| self.debug_handle_tags(*h))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(
+                        "WaitingHandle [{}] {}",
+                        waited,
+                        Self::debug_wait_deadline(*wake_at)
+                    )
+                }
+                threads::ThreadState::WaitingMutex { mutex_addr } => {
+                    let word = self.debug_read_u32(*mutex_addr).unwrap_or(0);
+                    let holder = word & !MUTEX_HAS_LISTENERS;
+                    format!(
+                        "WaitingMutex addr={:#x} word={:#x} holder={:#x} listeners={}",
+                        mutex_addr,
+                        word,
+                        holder,
+                        (word & MUTEX_HAS_LISTENERS) != 0
+                    )
+                }
+                threads::ThreadState::WaitingCondvar {
+                    mutex_addr,
+                    condvar_addr,
+                    wake_at,
+                    spurious_wake,
+                } => {
+                    let mutex_word = self.debug_read_u32(*mutex_addr).unwrap_or(0);
+                    let cond_word = self.debug_read_u32(*condvar_addr).unwrap_or(0);
+                    let pending = self
+                        .pending_condvar_signals
+                        .get(condvar_addr)
+                        .copied()
+                        .unwrap_or(0);
+                    format!(
+                        "WaitingCondvar mutex={:#x} mutex_word={:#x} cond={:#x} cond_word={:#x} pending={} spurious={} {}",
+                        mutex_addr,
+                        mutex_word,
+                        condvar_addr,
+                        cond_word,
+                        pending,
+                        spurious_wake,
+                        Self::debug_wait_deadline(*wake_at)
+                    )
+                }
+                threads::ThreadState::WaitingArbiter {
+                    addr,
+                    value,
+                    wake_at,
+                } => {
+                    let word = self.debug_read_u32(*addr).unwrap_or(0);
+                    format!(
+                        "WaitingArbiter addr={:#x} expected={:#x} word={:#x} {}",
+                        addr,
+                        value,
+                        word,
+                        Self::debug_wait_deadline(*wake_at)
+                    )
+                }
+                threads::ThreadState::Exited => "Exited".to_string(),
+            };
+
+            log::warn!(
+                "[thread-snapshot:{}] h={:#x} tid={} core={} prio={} state={} pc={:#x} lr={:#x} sp={:#x} tls={:#x}",
+                label,
+                handle,
+                t.tid,
+                t.core,
+                t.priority,
+                state,
+                t.ctx.pc,
+                t.ctx.x[30],
+                t.ctx.sp,
+                t.tls_va
+            );
         }
     }
 
