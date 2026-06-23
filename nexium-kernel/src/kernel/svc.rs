@@ -1267,6 +1267,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             let domain_handles = close_domain_object(kernel, session_handle, d.object_id);
             for handle in domain_handles {
                 kernel.open_files.remove(&(handle, d.object_id));
+                kernel.file_system_roots.remove(&(handle, d.object_id));
                 kernel.open_host_files.remove(&(handle, d.object_id));
                 kernel.open_romfs_files.remove(&(handle, d.object_id));
                 kernel.open_file_handles.remove(&(handle, d.object_id));
@@ -1787,6 +1788,18 @@ fn dispatch_service_v2(
         return return_subsession(kernel, ctx, session_handle, sub_service);
     }
 
+    if port_name == "fsp-srv" && cmd_id == 51 {
+        if let Some(root) = fs_save_data_root(kernel, ctx) {
+            log::debug!(
+                "fsp-srv.OpenSaveDataFileSystem title_id={:#018x} root={}",
+                kernel.title_id,
+                root.display()
+            );
+            return return_file_system_with_root(kernel, ctx, session_handle, root);
+        }
+        return build_ipc_response(ctx, 0x202, &[], &[]);
+    }
+
     if let Some(sub_service) = subsession_service(port_name, cmd_id) {
         return return_subsession(kernel, ctx, session_handle, sub_service);
     }
@@ -1824,6 +1837,7 @@ fn dispatch_service_v2(
     }
 
     if port_name == "IFileSystem" {
+        let fs_obj_id = ctx.domain.map(|d| d.object_id).unwrap_or(0);
         let path_str = fs_read_path(ctx, &kernel.address_space);
         let basename = std::path::Path::new(&path_str)
             .file_name()
@@ -1833,7 +1847,7 @@ fn dispatch_service_v2(
 
         match cmd_id {
             0 => {
-                let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                let host = fs_host_path(kernel, session_handle, fs_obj_id, &path_str);
                 let Some(host) = host else {
                     log::warn!(
                         "IFileSystem.CreateFile path={:?} → 0x202 PathNotFound",
@@ -1860,7 +1874,7 @@ fn dispatch_service_v2(
                 }
             }
             1 => {
-                let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                let host = fs_host_path(kernel, session_handle, fs_obj_id, &path_str);
                 let Some(host) = host else {
                     return build_ipc_response(ctx, 0x202, &[], &[]);
                 };
@@ -1870,7 +1884,7 @@ fn dispatch_service_v2(
                 }
             }
             2 => {
-                let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                let host = fs_host_path(kernel, session_handle, fs_obj_id, &path_str);
                 let Some(host) = host else {
                     return build_ipc_response(ctx, 0x202, &[], &[]);
                 };
@@ -1880,7 +1894,7 @@ fn dispatch_service_v2(
                 }
             }
             3 => {
-                let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                let host = fs_host_path(kernel, session_handle, fs_obj_id, &path_str);
                 let Some(host) = host else {
                     return build_ipc_response(ctx, 0x202, &[], &[]);
                 };
@@ -1890,7 +1904,7 @@ fn dispatch_service_v2(
                 }
             }
             4 => {
-                let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                let host = fs_host_path(kernel, session_handle, fs_obj_id, &path_str);
                 let Some(host) = host else {
                     return build_ipc_response(ctx, 0x202, &[], &[]);
                 };
@@ -1910,7 +1924,7 @@ fn dispatch_service_v2(
                     if in_homebrew {
                         1
                     } else if let Some(host) =
-                        fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str))
+                        fs_host_path(kernel, session_handle, fs_obj_id, &path_str)
                     {
                         match std::fs::metadata(&host) {
                             Ok(m) if m.is_dir() => 0,
@@ -1973,7 +1987,7 @@ fn dispatch_service_v2(
                         mmap_len
                     );
                 } else {
-                    let host = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str));
+                    let host = fs_host_path(kernel, session_handle, fs_obj_id, &path_str);
                     if let Some(host) = host {
                         if host.is_file() {
                             kernel
@@ -2043,7 +2057,7 @@ fn dispatch_service_v2(
                 };
 
                 let mut entries: Vec<(String, bool, u64)> = Vec::new();
-                if let Some(host) = fs_sd_root(kernel).and_then(|r| fs_translate(&r, &path_str)) {
+                if let Some(host) = fs_host_path(kernel, session_handle, fs_obj_id, &path_str) {
                     let _ = std::fs::create_dir_all(&host);
                     if let Ok(rd) = std::fs::read_dir(&host) {
                         for e in rd.filter_map(|e| e.ok()) {
@@ -5357,6 +5371,36 @@ pub(crate) fn return_subsession(
     }
 }
 
+fn return_file_system_with_root(
+    kernel: &mut Kernel,
+    ctx: &mut ipc::IpcCtx,
+    session_handle: u32,
+    root: std::path::PathBuf,
+) -> Vec<u8> {
+    let is_domain = kernel
+        .sessions
+        .get(&session_handle)
+        .map(|s| s.is_domain)
+        .unwrap_or(false);
+    if is_domain {
+        let object_id = alloc_domain_object(kernel, session_handle, "IFileSystem");
+        for handle in domain_group_handles(kernel, session_handle) {
+            kernel
+                .file_system_roots
+                .insert((handle, object_id), root.clone());
+        }
+        log::debug!("-> IFileSystem sub-object id={}", object_id);
+        build_ipc_response_full(ctx, 0, &[], &[], &[], &[object_id])
+    } else {
+        let h = kernel.handles.create_handle(HandleType::Session);
+        let session = Session::new(h, "IFileSystem".to_string());
+        kernel.sessions.insert(h, session);
+        kernel.file_system_roots.insert((h, 0), root);
+        log::debug!("-> IFileSystem sub-session handle={:#x}", h);
+        build_ipc_response(ctx, 0, &[], &[h])
+    }
+}
+
 fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
     match (port_name, cmd_id) {
         ("hid", 0) => Some("IAppletResource"),
@@ -5371,7 +5415,6 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
             Some("IFriendService")
         }
         ("fsp-srv", 18) => Some("IFileSystem"),
-        ("fsp-srv", 51) => Some("IFileSystem"),
         ("fsp-srv", 200) => Some("IFsStorage"),
         ("fsp-srv", 202) => Some("IFsStorage"),
         ("vi:m" | "vi:s" | "vi:u", 0) => Some("IApplicationDisplayService"),
@@ -6691,15 +6734,19 @@ fn svc_call_secure_monitor(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+fn fs_base_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
+        })
+        .map(|base| base.join("NeXium"))
+}
+
 fn fs_sd_root(kernel: &mut Kernel) -> Option<std::path::PathBuf> {
     if kernel.sd_root.is_none() {
-        let base = std::env::var_os("APPDATA")
-            .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from))
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
-            })?;
-        let root = base.join("NeXium").join("sdmc");
+        let root = fs_base_root()?.join("sdmc");
         if let Err(e) = std::fs::create_dir_all(&root) {
             log::warn!("fs: failed to create SD root {}: {}", root.display(), e);
             return None;
@@ -6707,6 +6754,122 @@ fn fs_sd_root(kernel: &mut Kernel) -> Option<std::path::PathBuf> {
         kernel.sd_root = Some(root);
     }
     kernel.sd_root.clone()
+}
+
+fn fs_save_data_root(kernel: &Kernel, ctx: &ipc::IpcCtx) -> Option<std::path::PathBuf> {
+    let data_start = ctx.cmif_in_data_off.min(ctx.buf.len());
+    let data_end = data_start
+        .saturating_add(ctx.cmif_in_data_len)
+        .min(ctx.buf.len());
+    let data = &ctx.buf[data_start..data_end];
+    let space_id = data.first().copied().unwrap_or(1);
+    let attr_off = 8usize;
+    let program_id = fs_read_le_u64(data, attr_off).unwrap_or(0);
+    let system_save_data_id = fs_read_le_u64(data, attr_off + 24).unwrap_or(0);
+    let save_type = data.get(attr_off + 32).copied().unwrap_or(1);
+    let user_id = fs_user_id_hex(data, attr_off + 8);
+    let title_id = if program_id != 0 {
+        program_id
+    } else {
+        kernel.title_id
+    };
+    let base = fs_base_root()?;
+    let title = format!("{:016x}", title_id);
+    let root = match space_id {
+        0 => base
+            .join("nand")
+            .join("system")
+            .join("save")
+            .join(format!("{:016x}", system_save_data_id))
+            .join(&user_id),
+        1 => match save_type {
+            4 => base
+                .join("nand")
+                .join("temp")
+                .join("0000000000000000")
+                .join(&user_id)
+                .join(&title),
+            5 => base
+                .join("nand")
+                .join("user")
+                .join("save")
+                .join("cache")
+                .join(&title),
+            _ => base
+                .join("nand")
+                .join("user")
+                .join("save")
+                .join("0000000000000000")
+                .join(&user_id)
+                .join(&title),
+        },
+        2 | 4 => base
+            .join("sdmc")
+            .join("save")
+            .join("0000000000000000")
+            .join(&user_id)
+            .join(&title),
+        3 => base
+            .join("nand")
+            .join("temp")
+            .join("0000000000000000")
+            .join(&user_id)
+            .join(&title),
+        _ => base
+            .join("nand")
+            .join("user")
+            .join("save")
+            .join("0000000000000000")
+            .join(&user_id)
+            .join(&title),
+    };
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        log::warn!("fs: failed to create save root {}: {}", root.display(), e);
+        return None;
+    }
+    Some(root)
+}
+
+fn fs_read_le_u64(data: &[u8], off: usize) -> Option<u64> {
+    let bytes = data.get(off..off.checked_add(8)?)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn fs_user_id_hex(data: &[u8], off: usize) -> String {
+    let mut bytes = [0u8; 16];
+    if let Some(src) = data.get(off..off.saturating_add(16)) {
+        if src.len() == 16 {
+            bytes.copy_from_slice(src);
+        }
+    }
+    let mut low_bytes = [0u8; 8];
+    let mut high_bytes = [0u8; 8];
+    low_bytes.copy_from_slice(&bytes[0..8]);
+    high_bytes.copy_from_slice(&bytes[8..16]);
+    let low = u64::from_le_bytes(low_bytes);
+    let high = u64::from_le_bytes(high_bytes);
+    format!("{:016x}{:016x}", high, low)
+}
+
+fn fs_object_root(
+    kernel: &mut Kernel,
+    session_handle: u32,
+    object_id: u32,
+) -> Option<std::path::PathBuf> {
+    let root = domain_object_keys(kernel, session_handle, object_id)
+        .into_iter()
+        .find_map(|key| kernel.file_system_roots.get(&key).cloned());
+    root.or_else(|| fs_sd_root(kernel))
+}
+
+fn fs_host_path(
+    kernel: &mut Kernel,
+    session_handle: u32,
+    object_id: u32,
+    hos: &str,
+) -> Option<std::path::PathBuf> {
+    let root = fs_object_root(kernel, session_handle, object_id)?;
+    fs_translate(&root, hos)
 }
 
 fn fs_translate(root: &std::path::Path, hos: &str) -> Option<std::path::PathBuf> {

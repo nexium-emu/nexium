@@ -367,6 +367,7 @@ impl BootContext {
         kernel.alias_base = alias_base;
         kernel.alias_size = alias_size;
         kernel.is_application = true;
+        kernel.title_id = app.title_id;
         kernel.total_memory = 0xCD50_0000;
 
         nexium_common::paths::init();
