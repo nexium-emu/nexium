@@ -5,6 +5,7 @@ pub struct Session {
     pub handle: u32,
     pub port_name: String,
     pub is_domain: bool,
+    pub domain_group: u32,
     pub domain_objects: HashMap<u32, String>,
     pub next_domain_object_id: u32,
 }
@@ -15,6 +16,7 @@ impl Session {
             handle,
             port_name,
             is_domain: false,
+            domain_group: handle,
             domain_objects: HashMap::new(),
             next_domain_object_id: 1,
         }
@@ -23,6 +25,7 @@ impl Session {
     pub fn convert_to_domain(&mut self) {
         if !self.is_domain {
             self.is_domain = true;
+            self.domain_group = self.handle;
             self.domain_objects.insert(1, self.port_name.clone());
             self.next_domain_object_id = 2;
         }

@@ -546,6 +546,29 @@ fn svc_signal_event(kernel: &mut Kernel) -> u32 {
     }
 }
 
+fn completed_thread_wait_index(kernel: &Kernel, handles: &[u32]) -> Option<usize> {
+    handles.iter().position(|h| {
+        if !matches!(
+            kernel
+                .handles
+                .get_handle(*h)
+                .map(|handle| handle.handle_type),
+            Some(HandleType::Thread)
+        ) {
+            return false;
+        }
+        if kernel.exited_thread_handles.contains(h) {
+            return true;
+        }
+        kernel
+            .threads
+            .threads
+            .get(h)
+            .map(|thread| matches!(thread.state, crate::kernel::threads::ThreadState::Exited))
+            .unwrap_or(false)
+    })
+}
+
 fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
     let (handles_addr, count, timeout_ns) = if let Some(cpu) = cpu_ref() {
         (
@@ -570,6 +593,14 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
 
     for h in &handles {
         crate::kernel::profile::record_wait_handle(*h);
+    }
+
+    if let Some(i) = completed_thread_wait_index(kernel, &handles) {
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(0, SUCCESS as u64);
+            cpu.set_register(1, i as u64);
+        }
+        return SUCCESS;
     }
 
     for (i, h) in handles.iter().enumerate() {
@@ -1053,6 +1084,97 @@ fn svc_get_system_tick(_kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+fn domain_group(kernel: &Kernel, session_handle: u32) -> u32 {
+    kernel
+        .sessions
+        .get(&session_handle)
+        .map(|s| s.domain_group)
+        .unwrap_or(session_handle)
+}
+
+fn domain_group_handles(kernel: &Kernel, session_handle: u32) -> Vec<u32> {
+    let group = domain_group(kernel, session_handle);
+    kernel
+        .sessions
+        .iter()
+        .filter_map(|(&handle, session)| {
+            if session.is_domain && session.domain_group == group {
+                Some(handle)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn next_domain_object_id(kernel: &Kernel, session_handle: u32) -> u32 {
+    let group = domain_group(kernel, session_handle);
+    kernel
+        .sessions
+        .values()
+        .filter(|session| session.is_domain && session.domain_group == group)
+        .map(|session| session.next_domain_object_id)
+        .max()
+        .unwrap_or(0)
+}
+
+fn alloc_domain_object(kernel: &mut Kernel, session_handle: u32, service_name: &str) -> u32 {
+    let object_id = next_domain_object_id(kernel, session_handle);
+    let group = domain_group(kernel, session_handle);
+    for session in kernel.sessions.values_mut() {
+        if session.is_domain && session.domain_group == group {
+            session
+                .domain_objects
+                .insert(object_id, service_name.to_string());
+            session.next_domain_object_id = object_id.saturating_add(1);
+        }
+    }
+    object_id
+}
+
+fn close_domain_object(kernel: &mut Kernel, session_handle: u32, object_id: u32) -> Vec<u32> {
+    let handles = domain_group_handles(kernel, session_handle);
+    for handle in &handles {
+        if let Some(session) = kernel.sessions.get_mut(handle) {
+            session.close_object(object_id);
+        }
+    }
+    handles
+}
+
+fn service_for_domain_object(
+    kernel: &Kernel,
+    session_handle: u32,
+    object_id: u32,
+) -> Option<String> {
+    if let Some(name) = kernel
+        .sessions
+        .get(&session_handle)
+        .and_then(|session| session.service_for_object(object_id))
+    {
+        return Some(name.to_string());
+    }
+
+    let group = domain_group(kernel, session_handle);
+    kernel.sessions.values().find_map(|session| {
+        if session.is_domain && session.domain_group == group {
+            session.service_for_object(object_id).map(str::to_string)
+        } else {
+            None
+        }
+    })
+}
+
+fn domain_object_keys(kernel: &Kernel, session_handle: u32, object_id: u32) -> Vec<(u32, u32)> {
+    let mut keys = vec![(session_handle, object_id)];
+    for handle in domain_group_handles(kernel, session_handle) {
+        if handle != session_handle {
+            keys.push((handle, object_id));
+        }
+    }
+    keys
+}
+
 fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     let (tls_addr, session_handle) = if let Some(cpu) = cpu_ref() {
         let x0 = cpu.get_register(0) as u32;
@@ -1142,20 +1264,14 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
 
     let dispatch_target = if let Some(d) = ctx.domain {
         if d.kind == 2 {
-            if let Some(s) = kernel.sessions.get_mut(&session_handle) {
-                s.close_object(d.object_id);
+            let domain_handles = close_domain_object(kernel, session_handle, d.object_id);
+            for handle in domain_handles {
+                kernel.open_files.remove(&(handle, d.object_id));
+                kernel.open_host_files.remove(&(handle, d.object_id));
+                kernel.open_romfs_files.remove(&(handle, d.object_id));
+                kernel.open_file_handles.remove(&(handle, d.object_id));
+                kernel.open_dir_lists.remove(&(handle, d.object_id));
             }
-            kernel.open_files.remove(&(session_handle, d.object_id));
-            kernel
-                .open_host_files
-                .remove(&(session_handle, d.object_id));
-            kernel
-                .open_romfs_files
-                .remove(&(session_handle, d.object_id));
-            kernel
-                .open_file_handles
-                .remove(&(session_handle, d.object_id));
-            kernel.open_dir_lists.remove(&(session_handle, d.object_id));
             log::debug!(
                 "domain Close-object session={:#x} object_id={}",
                 session_handle,
@@ -1166,11 +1282,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             }
             return SUCCESS;
         }
-        match kernel
-            .sessions
-            .get(&session_handle)
-            .and_then(|s| s.service_for_object(d.object_id).map(String::from))
-        {
+        match service_for_domain_object(kernel, session_handle, d.object_id) {
             Some(name) => name,
             None => {
                 log::warn!("domain object_id={} not found on session={:#x} (port={}) → InvalidObject 0xCE01", d.object_id, session_handle, port_name);
@@ -1322,6 +1434,7 @@ fn handle_control_request(
             let mut session = Session::new(dup_handle, port_name.to_string());
             if let Some(orig) = kernel.sessions.get(&session_handle) {
                 session.is_domain = orig.is_domain;
+                session.domain_group = orig.domain_group;
                 session.domain_objects = orig.domain_objects.clone();
                 session.next_domain_object_id = orig.next_domain_object_id;
             }
@@ -1846,11 +1959,7 @@ fn dispatch_service_v2(
                     .map(|s| s.is_domain)
                     .unwrap_or(false);
                 let new_obj_id = if is_domain {
-                    kernel
-                        .sessions
-                        .get(&session_handle)
-                        .map(|s| s.next_domain_object_id)
-                        .unwrap_or(0)
+                    next_domain_object_id(kernel, session_handle)
                 } else {
                     0
                 };
@@ -1928,11 +2037,7 @@ fn dispatch_service_v2(
                     .map(|s| s.is_domain)
                     .unwrap_or(false);
                 let new_obj_id = if is_domain {
-                    kernel
-                        .sessions
-                        .get(&session_handle)
-                        .map(|s| s.next_domain_object_id)
-                        .unwrap_or(0)
+                    next_domain_object_id(kernel, session_handle)
                 } else {
                     0
                 };
@@ -2018,7 +2123,10 @@ fn dispatch_service_v2(
 
     if port_name == "IFile" {
         let obj_id = ctx.domain.map(|d| d.object_id).unwrap_or(0);
-        let per_session = kernel.open_files.get(&(session_handle, obj_id)).cloned();
+        let object_keys = domain_object_keys(kernel, session_handle, obj_id);
+        let per_session = object_keys
+            .iter()
+            .find_map(|key| kernel.open_files.get(key).cloned());
         match cmd_id {
             0 => {
                 let in_off = ctx.cmif_in_data_off;
@@ -2047,14 +2155,12 @@ fn dispatch_service_v2(
                     ctx.buf[in_off + 22],
                     ctx.buf[in_off + 23],
                 ]);
-                let host_path = kernel
-                    .open_host_files
-                    .get(&(session_handle, obj_id))
-                    .cloned();
-                let romfs_file = kernel
-                    .open_romfs_files
-                    .get(&(session_handle, obj_id))
-                    .copied();
+                let host_path = object_keys
+                    .iter()
+                    .find_map(|key| kernel.open_host_files.get(key).cloned());
+                let romfs_file = object_keys
+                    .iter()
+                    .find_map(|key| kernel.open_romfs_files.get(key).copied());
                 let target = ctx
                     .recv_buffers
                     .iter()
@@ -2140,10 +2246,9 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &bytes_read.to_le_bytes(), &[]);
             }
             1 => {
-                let host_path = kernel
-                    .open_host_files
-                    .get(&(session_handle, obj_id))
-                    .cloned();
+                let host_path = object_keys
+                    .iter()
+                    .find_map(|key| kernel.open_host_files.get(key).cloned());
                 if let Some(host) = host_path {
                     use std::io::{Seek, SeekFrom, Write};
                     let in_off = ctx.cmif_in_data_off;
@@ -2186,7 +2291,9 @@ fn dispatch_service_v2(
                                         f.write_all(&data)
                                     });
                                 if res.is_ok() {
-                                    kernel.open_file_handles.remove(&(session_handle, obj_id));
+                                    for key in &object_keys {
+                                        kernel.open_file_handles.remove(key);
+                                    }
                                     kernel.host_file_cache.remove(&host);
                                     log::debug!(
                                         "IFile.Write (host {}) off={:#x} size={} → SUCCESS",
@@ -2206,10 +2313,9 @@ fn dispatch_service_v2(
             }
             2 => return build_ipc_response(ctx, 0, &[], &[]),
             3 => {
-                let host_path = kernel
-                    .open_host_files
-                    .get(&(session_handle, obj_id))
-                    .cloned();
+                let host_path = object_keys
+                    .iter()
+                    .find_map(|key| kernel.open_host_files.get(key).cloned());
                 if let Some(host) = host_path {
                     let in_off = ctx.cmif_in_data_off;
                     if ctx.cmif_in_data_len >= 8 {
@@ -2237,25 +2343,26 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
             4 => {
-                let size: i64 =
-                    if let Some(host) = kernel.open_host_files.get(&(session_handle, obj_id)) {
-                        std::fs::metadata(host).map(|m| m.len() as i64).unwrap_or(0)
-                    } else if let Some((_, size)) = kernel
-                        .open_romfs_files
-                        .get(&(session_handle, obj_id))
-                        .copied()
-                    {
-                        size as i64
-                    } else {
-                        match per_session.as_ref() {
-                            Some(m) => m.len() as i64,
-                            None => kernel
-                                .nro_mmap
-                                .as_ref()
-                                .map(|m| m.len() as i64)
-                                .unwrap_or(0),
-                        }
-                    };
+                let size: i64 = if let Some(host) = object_keys
+                    .iter()
+                    .find_map(|key| kernel.open_host_files.get(key))
+                {
+                    std::fs::metadata(host).map(|m| m.len() as i64).unwrap_or(0)
+                } else if let Some((_, size)) = object_keys
+                    .iter()
+                    .find_map(|key| kernel.open_romfs_files.get(key).copied())
+                {
+                    size as i64
+                } else {
+                    match per_session.as_ref() {
+                        Some(m) => m.len() as i64,
+                        None => kernel
+                            .nro_mmap
+                            .as_ref()
+                            .map(|m| m.len() as i64)
+                            .unwrap_or(0),
+                    }
+                };
                 log::debug!(
                     "IFile.GetSize (sess={:#x} obj={}) → {}",
                     session_handle,
@@ -2272,6 +2379,7 @@ fn dispatch_service_v2(
 
     if port_name == "IDirectory" {
         let obj_id = ctx.domain.map(|d| d.object_id).unwrap_or(0);
+        let object_keys = domain_object_keys(kernel, session_handle, obj_id);
         match cmd_id {
             0 => {
                 let target = ctx
@@ -2289,8 +2397,12 @@ fn dispatch_service_v2(
                 };
                 let max_entries = (buf.size as usize) / 0x310;
 
+                let dir_key = object_keys
+                    .iter()
+                    .copied()
+                    .find(|key| kernel.open_dir_lists.contains_key(key));
                 if let Some((entries, cursor)) =
-                    kernel.open_dir_lists.get_mut(&(session_handle, obj_id))
+                    dir_key.and_then(|key| kernel.open_dir_lists.get_mut(&key))
                 {
                     let remaining = entries.len().saturating_sub(*cursor);
                     let to_emit = remaining.min(max_entries);
@@ -2343,8 +2455,9 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &(to_emit as i64).to_le_bytes(), &[]);
             }
             1 => {
-                let count: i64 = if let Some((entries, _)) =
-                    kernel.open_dir_lists.get(&(session_handle, obj_id))
+                let count: i64 = if let Some((entries, _)) = object_keys
+                    .iter()
+                    .find_map(|key| kernel.open_dir_lists.get(key))
                 {
                     entries.len() as i64
                 } else {
@@ -2484,11 +2597,7 @@ fn dispatch_service_v2(
         );
 
         if is_domain {
-            let object_id = if let Some(s) = kernel.sessions.get_mut(&session_handle) {
-                s.alloc_domain_object("IAudioRenderer".to_string())
-            } else {
-                0
-            };
+            let object_id = alloc_domain_object(kernel, session_handle, "IAudioRenderer");
             kernel
                 .audio_renderers
                 .insert((session_handle, object_id), state);
@@ -3477,11 +3586,7 @@ fn dispatch_service_v2(
             is_domain
         );
         if is_domain {
-            let object_id = if let Some(s) = kernel.sessions.get_mut(&session_handle) {
-                s.alloc_domain_object("IAudioOut".to_string())
-            } else {
-                0
-            };
+            let object_id = alloc_domain_object(kernel, session_handle, "IAudioOut");
             return build_ipc_response_full(ctx, 0, &out, &[], &[], &[object_id]);
         } else {
             let h = kernel.handles.create_handle(HandleType::Session);
@@ -5240,11 +5345,7 @@ pub(crate) fn return_subsession(
         .map(|s| s.is_domain)
         .unwrap_or(false);
     if is_domain {
-        let object_id = if let Some(s) = kernel.sessions.get_mut(&session_handle) {
-            s.alloc_domain_object(sub_service.to_string())
-        } else {
-            0
-        };
+        let object_id = alloc_domain_object(kernel, session_handle, sub_service);
         log::debug!("→ {} sub-object id={}", sub_service, object_id);
         build_ipc_response_full(ctx, 0, &[], &[], &[], &[object_id])
     } else {
@@ -6052,7 +6153,11 @@ fn svc_close_handle(kernel: &mut Kernel) -> u32 {
         .unwrap_or_else(|| "unknown".into());
     log::debug!("svcCloseHandle handle={:#x} ({})", handle, kind);
     dump_regs(kernel, "CloseHandle ENTRY");
-    kernel.handles.close_handle(handle);
+    if let Some(closed) = kernel.handles.close_handle(handle) {
+        if closed.handle_type == HandleType::Thread {
+            kernel.exited_thread_handles.remove(&handle);
+        }
+    }
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
@@ -6133,6 +6238,10 @@ fn svc_start_thread(kernel: &mut Kernel) -> u32 {
 fn svc_exit_thread(kernel: &mut Kernel) -> u32 {
     let current = kernel.threads.current_handle();
     log::debug!("svcExitThread current={:?}", current);
+    if let Some(handle) = current {
+        kernel.exited_thread_handles.insert(handle);
+        kernel.threads.signal_handle(handle);
+    }
     if let Some(cpu) = cpu_ref() {
         kernel
             .threads
