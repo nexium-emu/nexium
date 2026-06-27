@@ -197,7 +197,7 @@ impl Emitter {
             image_t,
             sampler_t,
             sampled_image_t,
-            interface: vec![ubo_var],
+            interface: Vec::new(),
             value_to_word: HashMap::new(),
             block_labels: HashMap::new(),
             cond_merge: None,
