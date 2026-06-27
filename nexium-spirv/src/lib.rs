@@ -66,6 +66,7 @@ pub struct Emitter {
     value_to_word: HashMap<ValueId, Word>,
     block_labels: HashMap<BlockId, Word>,
     cond_merge: Option<Vec<u32>>,
+    used_merge_blocks: std::collections::HashSet<Word>,
     cbuf_bindings_used: u32,
     texs_ids_used: std::collections::BTreeSet<u32>,
     texture_slots: HashMap<u32, u32>,
@@ -201,6 +202,7 @@ impl Emitter {
             value_to_word: HashMap::new(),
             block_labels: HashMap::new(),
             cond_merge: None,
+            used_merge_blocks: std::collections::HashSet::new(),
             cbuf_bindings_used: 0,
             texs_ids_used: std::collections::BTreeSet::new(),
             texture_slots: HashMap::new(),
@@ -1243,6 +1245,10 @@ impl Emitter {
                     if target == next {
                         self.b.branch(true_lbl).unwrap();
                     } else {
+                        assert!(
+                            self.used_merge_blocks.insert(merge_lbl),
+                            "nexium-spirv: shared selection merge block"
+                        );
                         self.b
                             .selection_merge(merge_lbl, rspirv::spirv::SelectionControl::NONE)
                             .unwrap();
