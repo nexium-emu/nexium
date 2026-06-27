@@ -23,6 +23,7 @@ path = "src/debug_continue.rs"
 
 [dependencies]
 nexium-common.workspace = true
+nexium-memory.workspace = true
 nexium-core = { workspace = true, default-features = false }
 nexium-cpu = { workspace = true, default-features = false }
 nexium-gpu.workspace = true
