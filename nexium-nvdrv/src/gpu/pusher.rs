@@ -450,6 +450,19 @@ impl Pusher {
             self.flush_vk(mappings, mem_read);
             kepler_memory.dispatch_method(method, arg, mappings, mem_write);
         } else {
+            if bound_class != 0 {
+                use std::sync::{Mutex, OnceLock};
+                static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+                let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+                if let Ok(mut s) = seen.lock() {
+                    if s.insert(bound_class) {
+                        log::warn!(
+                            "[gpu-unhandled-class] subch={} class={:#x} method={:#x} arg={:#x} NOT dispatched (0xb1c0=KeplerCompute) — fence may never release",
+                            subchannel, bound_class, method, arg
+                        );
+                    }
+                }
+            }
             log::trace!(
                 "pusher: subch={} class={:#x} method={:#x} arg={:#x} (unsupported class)",
                 subchannel,

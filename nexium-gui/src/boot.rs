@@ -487,7 +487,7 @@ impl EmulationHandle {
                                         last_pipeline_stats.frames_submitted,
                                     ) > 0;
                             log::info!(
-                            "[gpu] gpfifo_submits={} (+{}/s) entries={} (+{}/s) methods={} (+{}/s) | mw3d draws={} (+{}) clears={} (+{}) | fermi2d blits={} (+{}) | mwdma blits={} (+{})",
+                            "[gpu] gpfifo_submits={} (+{}/s) entries={} (+{}/s) methods={} (+{}/s) | mw3d draws={} (+{}) clears={} (+{}) | fermi2d blits={} (+{}) | mwdma blits={} (+{}) | fences={} (+{})",
                             cur_stats.gpfifo_submits, ((d(cur_stats.gpfifo_submits, last_pipeline_stats.gpfifo_submits) as f64) / secs) as u64,
                             cur_stats.gpfifo_entries, ((d(cur_stats.gpfifo_entries, last_pipeline_stats.gpfifo_entries) as f64) / secs) as u64,
                             cur_stats.methods_dispatched, ((d(cur_stats.methods_dispatched, last_pipeline_stats.methods_dispatched) as f64) / secs) as u64,
@@ -495,6 +495,7 @@ impl EmulationHandle {
                             cur_stats.maxwell3d_clears, d(cur_stats.maxwell3d_clears, last_pipeline_stats.maxwell3d_clears),
                             cur_stats.fermi_2d_blits, d(cur_stats.fermi_2d_blits, last_pipeline_stats.fermi_2d_blits),
                             cur_stats.maxwell_dma_blits, d(cur_stats.maxwell_dma_blits, last_pipeline_stats.maxwell_dma_blits),
+                            cur_stats.fence_releases, d(cur_stats.fence_releases, last_pipeline_stats.fence_releases),
                         );
                             let frame_q_depth = guard.nvdrv.frame_queue_depth();
                             log::info!(
