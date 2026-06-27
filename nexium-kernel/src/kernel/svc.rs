@@ -2681,7 +2681,52 @@ fn dispatch_service_v2(
         }
     }
     if (port_name == "audren:u" || port_name == "audren:a") && cmd_id == 1 {
-        let work_buffer_size: u64 = 0x100_0000;
+        let in_off = ctx.cmif_in_data_off;
+        let in_avail = ctx.cmif_in_data_len as usize;
+        let rd = |o: usize| -> u64 {
+            if in_avail >= o + 4 {
+                u32::from_le_bytes([
+                    ctx.buf[in_off + o],
+                    ctx.buf[in_off + o + 1],
+                    ctx.buf[in_off + o + 2],
+                    ctx.buf[in_off + o + 3],
+                ]) as u64
+            } else {
+                0
+            }
+        };
+        let align_up = |v: u64, a: u64| (v + a - 1) & !(a - 1);
+        let sample_count = {
+            let v = rd(4);
+            if v == 0 {
+                240
+            } else {
+                v
+            }
+        };
+        let mixes = rd(8);
+        let sub_mixes = rd(0xC);
+        let voices = rd(0x10);
+        let sinks = rd(0x14);
+        let effects = rd(0x18);
+        const TARGET: u64 = 240;
+        const MAXCH: u64 = 6;
+        let mut size: u64 = 0x4000;
+        size += (sub_mixes + 1) * 0xC00;
+        size += voices * 0x1400;
+        size += effects * 0x400;
+        size += align_up(((sinks + sub_mixes) * TARGET + sample_count) * 4 * (mixes + MAXCH), 0x40);
+        size += (sinks + sub_mixes) * 0xC00;
+        size += 0x40000;
+        let computed = align_up(size, 0x1000);
+        let work_buffer_size = std::env::var("NEXIUM_AUDIO_WORKBUF")
+            .ok()
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .unwrap_or_else(|| computed.clamp(0x20_0000, 0x80_0000));
+        log::info!(
+            "audren GetWorkBufferSize voices={} effects={} mixes={} → {:#x} (computed {:#x})",
+            voices, effects, mixes, work_buffer_size, computed
+        );
         return build_ipc_response(ctx, 0, &work_buffer_size.to_le_bytes(), &[]);
     }
     if (port_name == "audren:u" || port_name == "audren:a") && (cmd_id == 2 || cmd_id == 4) {
