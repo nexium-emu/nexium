@@ -65,6 +65,7 @@ pub struct Emitter {
     interface: Vec<Word>,
     value_to_word: HashMap<ValueId, Word>,
     block_labels: HashMap<BlockId, Word>,
+    cond_merge: Option<Vec<u32>>,
     cbuf_bindings_used: u32,
     texs_ids_used: std::collections::BTreeSet<u32>,
     texture_slots: HashMap<u32, u32>,
@@ -199,6 +200,7 @@ impl Emitter {
             interface: vec![ubo_var],
             value_to_word: HashMap::new(),
             block_labels: HashMap::new(),
+            cond_merge: None,
             cbuf_bindings_used: 0,
             texs_ids_used: std::collections::BTreeSet::new(),
             texture_slots: HashMap::new(),
@@ -1229,12 +1231,25 @@ impl Emitter {
                 let next = block.id + 1;
                 if let Some(&false_lbl) = self.block_labels.get(&next) {
                     let cond = self.resolve_pred(pred.idx, pred.negate);
-                    self.b
-                        .selection_merge(false_lbl, rspirv::spirv::SelectionControl::NONE)
-                        .unwrap();
-                    self.b
-                        .branch_conditional(cond, true_lbl, false_lbl, [])
-                        .unwrap();
+                    let merge_id = match &self.cond_merge {
+                        Some(ipd) => ipd[block.id as usize],
+                        None => next,
+                    };
+                    let merge_lbl = self
+                        .block_labels
+                        .get(&merge_id)
+                        .copied()
+                        .unwrap_or(false_lbl);
+                    if target == next {
+                        self.b.branch(true_lbl).unwrap();
+                    } else {
+                        self.b
+                            .selection_merge(merge_lbl, rspirv::spirv::SelectionControl::NONE)
+                            .unwrap();
+                        self.b
+                            .branch_conditional(cond, true_lbl, false_lbl, [])
+                            .unwrap();
+                    }
                 } else {
                     self.b.branch(true_lbl).unwrap();
                 }
@@ -1387,6 +1402,7 @@ impl Emitter {
             self.b.store(v, c, None, []).unwrap();
         }
 
+        self.cond_merge = structurizer_cond_merges(cfg);
         self.lower_cfg(cfg);
 
         match self.stage {
@@ -1588,6 +1604,67 @@ impl Emitter {
         let words = opt::dedup_constants(self.b.module().assemble());
         (words, bindings, tex_ids)
     }
+}
+
+fn intersect_pdom(mut a: u32, mut b: u32, ipdom: &[u32]) -> u32 {
+    while a != b {
+        while a < b {
+            a = ipdom[a as usize];
+        }
+        while b < a {
+            b = ipdom[b as usize];
+        }
+    }
+    a
+}
+
+// For single-entry, single-exit, ACYCLIC CFGs (exit is the last block), compute
+// each block's immediate post-dominator. Conditional headers use this as their
+// structured-merge block (the real reconvergence point), instead of naively
+// assuming the next block. Returns None for CFGs with loops (back-edges),
+// multiple exits, or an exit that isn't last — those keep the legacy path and
+// (if malformed) get skipped by the shader-emit panic guard in nexium-nvdrv.
+fn structurizer_cond_merges(cfg: &Cfg) -> Option<Vec<u32>> {
+    let n = cfg.blocks.len();
+    if n <= 1 {
+        return None;
+    }
+    let mut exit_count = 0usize;
+    let mut exit_idx = 0usize;
+    for (i, b) in cfg.blocks.iter().enumerate() {
+        if matches!(b.branch, BranchKind::Exit) {
+            exit_count += 1;
+            exit_idx = i;
+        }
+        for s in cfg.successors(b.id) {
+            if (s as usize) <= i {
+                return None; // back-edge => loop, unsupported here
+            }
+        }
+    }
+    if exit_count != 1 || exit_idx != n - 1 {
+        return None;
+    }
+    let mut ipdom = vec![u32::MAX; n];
+    ipdom[n - 1] = (n - 1) as u32;
+    for b in (0..n - 1).rev() {
+        let mut idom = u32::MAX;
+        for s in cfg.successors(b as u32) {
+            if ipdom[s as usize] == u32::MAX {
+                return None;
+            }
+            idom = if idom == u32::MAX {
+                s
+            } else {
+                intersect_pdom(idom, s, &ipdom)
+            };
+        }
+        if idom == u32::MAX {
+            return None;
+        }
+        ipdom[b] = idom;
+    }
+    Some(ipdom)
 }
 
 pub fn emit_vertex(cfg: &Cfg) -> Vec<u32> {
