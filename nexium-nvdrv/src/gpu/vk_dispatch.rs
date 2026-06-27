@@ -597,6 +597,27 @@ fn shader_bundle_cache() -> &'static std::sync::Mutex<
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn shader_failed_set(
+) -> &'static std::sync::Mutex<std::collections::HashSet<(u64, u64, u32, u32, u32, u32)>> {
+    use std::sync::OnceLock;
+    static FAILED: OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(u64, u64, u32, u32, u32, u32)>>,
+    > = OnceLock::new();
+    FAILED.get_or_init(|| {
+        // Silence the default panic hook for shader-emit panics we catch_unwind,
+        // so a few thousand structurizer failures don't flood stderr.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = info.to_string();
+            if msg.contains("nexium-spirv") || msg.contains("NestedBlock") {
+                return;
+            }
+            prev(info);
+        }));
+        std::sync::Mutex::new(std::collections::HashSet::new())
+    })
+}
+
 fn depth_disabled() -> bool {
     use std::sync::OnceLock;
     static D: OnceLock<bool> = OnceLock::new();
@@ -746,6 +767,9 @@ fn execute_one(
         ps_key,
         win_key,
     );
+    if shader_failed_set().lock().unwrap().contains(&shader_key) {
+        return Err("shader previously failed to emit".to_string());
+    }
     let bundle = {
         let cache = shader_bundle_cache();
         let mut guard = cache.lock().unwrap();
@@ -770,6 +794,19 @@ fn execute_one(
                     fs_cfg.unimplemented,
                     unimplemented_samples(&fs_cfg),
                 );
+                if std::env::var_os("NEXIUM_SHADERDBG").is_some() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 20 {
+                        log::warn!(
+                            "[shaderdbg] region={:#x} vs_lo={:#x} fs_lo={:#x} cpu(vs)={:?} cpu(fs)={:?} fs_sass[0..16]={:02x?} | {}",
+                            program_region, vs_prog.address_lo, fs_prog.address_lo,
+                            mappings.cpu_address_for(vs_addr), mappings.cpu_address_for(fs_addr),
+                            &fs_sass[..16.min(fs_sass.len())],
+                            mappings.describe_around(fs_addr),
+                        );
+                    }
+                }
             } else {
                 log::debug!(
                     "shader translated: vs_addr={:#x} fs_addr={:#x} all ops covered",
@@ -779,7 +816,15 @@ fn execute_one(
             }
 
             let (fs_spirv, fs_cbuf_mask, mut fs_tex_ids, fs_cbuf_used) =
-                nexium_spirv::emit_fragment_full(&fs_cfg);
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    nexium_spirv::emit_fragment_full(&fs_cfg)
+                })) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        shader_failed_set().lock().unwrap().insert(shader_key);
+                        return Err("FS SPIR-V emit panicked".to_string());
+                    }
+                };
 
             {
                 let walked = nexium_shader::extract_fs_tex_ids(&fs_sass, 15);
@@ -813,21 +858,29 @@ fn execute_one(
 
             let required_outputs = nexium_spirv::scan_input_locations(&fs_spirv);
             let (vs_spirv, vs_cbuf_mask, vs_cbuf_used) =
-                nexium_spirv::emit_vertex_with_bindings_opts(
-                    &vs_cfg,
-                    &required_outputs,
-                    nexium_spirv::VertexOptions {
-                        vptx_scale_z,
-                        vptx_translate_z,
-                        point_size: if draw.topology == 0 {
-                            Some(draw.point_size)
-                        } else {
-                            None
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    nexium_spirv::emit_vertex_with_bindings_opts(
+                        &vs_cfg,
+                        &required_outputs,
+                        nexium_spirv::VertexOptions {
+                            vptx_scale_z,
+                            vptx_translate_z,
+                            point_size: if draw.topology == 0 {
+                                Some(draw.point_size)
+                            } else {
+                                None
+                            },
+                            window_ndc,
+                            ..Default::default()
                         },
-                        window_ndc,
-                        ..Default::default()
-                    },
-                );
+                    )
+                })) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        shader_failed_set().lock().unwrap().insert(shader_key);
+                        return Err("VS SPIR-V emit panicked".to_string());
+                    }
+                };
 
             let vs_hash = nexium_gpu::renderer::hash_spirv(&vs_spirv);
             let fs_hash = nexium_gpu::renderer::hash_spirv(&fs_spirv);
@@ -976,6 +1029,17 @@ fn execute_one(
     let mut sampled_rt_fuzzy = false;
     let mut sampled_rt_keys: Vec<RtKey> = Vec::new();
     let mut sampled_rt_slots: Vec<Option<RtKey>> = vec![None; fs_tex_ids.len()];
+    if std::env::var_os("NEXIUM_TEXDBG").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static D: AtomicU64 = AtomicU64::new(0);
+        let d = D.fetch_add(1, Ordering::Relaxed);
+        if d < 60 {
+            log::warn!(
+                "[texdbg-draw #{}] tic_pool={:#x} limit={} fs_tex_ids={:?}",
+                d, draw.tic_pool_gpu_va, draw.tic_pool_limit, &fs_tex_ids
+            );
+        }
+    }
     if draw.tic_pool_gpu_va != 0 {
         for (slot, tex_id) in fs_tex_ids.iter().enumerate() {
             if *tex_id == u32::MAX || *tex_id > draw.tic_pool_limit {
@@ -992,6 +1056,19 @@ fn execute_one(
             let Some(tic) = nexium_gpu::texture::TicEntry::parse(&tic_raw) else {
                 continue;
             };
+            if tic.width >= 512 && tic.height >= 256 && std::env::var_os("NEXIUM_TEXDBG").is_some() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static N: AtomicU64 = AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 200 {
+                    log::warn!(
+                        "[texdbg #{}] slot={} fmt={:?} {}x{} gpu_va={:#x} nvmap={:?} can_alias_rt={}",
+                        n, slot, tic.format, tic.width, tic.height, tic.gpu_va,
+                        mappings.nvmap_id_for(tic.gpu_va),
+                        tic_can_alias_render_target(tic.format)
+                    );
+                }
+            }
             if !tic_can_alias_render_target(tic.format) {
                 continue;
             }
