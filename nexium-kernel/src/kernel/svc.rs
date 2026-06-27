@@ -9,6 +9,36 @@ use nexium_common::result::{
 };
 use nexium_ipc as ipc;
 
+fn svc_trace_capture() -> Option<(u64, u64, u64, u64, u64, u64, u64)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_SVC_TRACE")
+            .ok()
+            .map(|v| v.parse::<u64>().unwrap_or(1000))
+            .unwrap_or(0)
+    });
+    if limit == 0 {
+        return None;
+    }
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= limit {
+        return None;
+    }
+    let cpu = cpu_ref()?;
+    Some((
+        n,
+        cpu.get_register(0),
+        cpu.get_register(1),
+        cpu.get_register(2),
+        cpu.get_register(3),
+        cpu.get_pc(),
+        cpu.get_register(30),
+    ))
+}
+
 pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
     log::trace!("SVC {:#04x}", imm);
     struct ProfileGuard(std::time::Instant, u16);
@@ -22,7 +52,8 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
     } else {
         None
     };
-    match imm {
+    let __svc_trace_args = svc_trace_capture();
+    let __svc_res = match imm {
         0x01 => svc_set_heap_size(kernel),
         0x02 => svc_set_memory_permission(kernel),
         0x03 => svc_set_memory_attribute(kernel),
@@ -109,7 +140,14 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
             }
             KERNEL_NOT_IMPLEMENTED
         }
+    };
+    if let Some((n, x0, x1, x2, x3, pc, lr)) = __svc_trace_args {
+        log::info!(
+            "[svc-trace #{}] svc={:#04x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} -> {:#x} pc={:#x} lr={:#x}",
+            n, imm, x0, x1, x2, x3, __svc_res, pc, lr
+        );
     }
+    __svc_res
 }
 
 fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
@@ -1831,6 +1869,24 @@ fn dispatch_service_v2(
             10601 | 10610 | 10700 => return build_ipc_response(ctx, 0, &[], &[]),
             other => {
                 log::debug!("IFriendService.cmd_{} stubbed empty success", other);
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+        }
+    }
+
+    if port_name == "INfpUser" {
+        match cmd_id {
+            0 | 1 => return build_ipc_response(ctx, 0, &[], &[]),
+            2 => return build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[]),
+            17 | 18 | 23 => {
+                let h = kernel.handles.create_handle(HandleType::Event);
+                log::debug!("nfp IUser.cmd_{} → event {:#x}", cmd_id, h);
+                return build_ipc_response_copy(ctx, 0, &[], &[h]);
+            }
+            19 => return build_ipc_response(ctx, 0, &1u32.to_le_bytes(), &[]),
+            20 | 21 => return build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[]),
+            other => {
+                log::debug!("nfp IUser.cmd_{} stubbed empty success", other);
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
         }
@@ -5414,6 +5470,7 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("friend:u" | "friend:a" | "friend:s" | "friend:v" | "friend:m", 0) => {
             Some("IFriendService")
         }
+        ("nfp:user", 0) => Some("INfpUser"),
         ("fsp-srv", 18) => Some("IFileSystem"),
         ("fsp-srv", 200) => Some("IFsStorage"),
         ("fsp-srv", 202) => Some("IFsStorage"),
