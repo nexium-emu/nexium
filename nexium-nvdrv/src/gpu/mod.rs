@@ -53,7 +53,7 @@ impl GpuMappings {
     }
 
     pub fn cpu_address_for(&self, gpu_va: u64) -> Option<u64> {
-        for m in &self.mappings {
+        for m in self.mappings.iter().rev() {
             if gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size {
                 let offset = gpu_va - m.gpu_va;
                 return Some(m.cpu_addr + offset);
@@ -63,7 +63,7 @@ impl GpuMappings {
     }
 
     pub fn cpu_range_for(&self, gpu_va: u64) -> Option<(u64, u64)> {
-        for m in &self.mappings {
+        for m in self.mappings.iter().rev() {
             if gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size {
                 let offset = gpu_va - m.gpu_va;
                 return Some((m.cpu_addr + offset, m.size - offset));
@@ -102,7 +102,7 @@ impl GpuMappings {
     }
 
     pub fn nvmap_id_for(&self, gpu_va: u64) -> Option<u32> {
-        for m in &self.mappings {
+        for m in self.mappings.iter().rev() {
             if gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size {
                 return Some(m.nvmap_id);
             }
