@@ -80,17 +80,6 @@ impl Translator {
         )
     }
 
-    fn load_cbuf_ldc(&mut self, raw: u64) -> ValueId {
-        let r = ldc_ref(raw);
-        self.program.emit(
-            Op::LoadCbuf {
-                binding: r.binding,
-                byte_offset: r.byte_offset as u32,
-            },
-            None,
-        )
-    }
-
     fn emit_f2f(&mut self, raw: u64, src: Value, pred: Option<Predicate>) {
         let dest = reg_dest(raw);
         let m = f2f_mods(raw);
@@ -751,35 +740,56 @@ impl Translator {
                 let dest = reg_dest(raw);
                 let src_reg = ldc_src_reg(raw);
                 let size = ldc_size(raw);
-                if size != 4 {
-                    log::warn!(
-                        "LDC with non-B32 size not yet lifted raw={:#018x} size={}",
-                        raw,
-                        size,
-                    );
-                    self.program.emit_void(Op::Unimplemented {
-                        opcode: Opcode::LDC,
-                        raw,
-                    });
-                    self.unimplemented_count += 1;
-                    return false;
-                }
-
-                let cb_id = if src_reg != RZ {
-                    let r = ldc_ref(raw);
-                    let index = self.read_reg(src_reg);
-                    self.program.emit(
-                        Op::LoadCbufIndexed {
-                            binding: r.binding,
-                            byte_offset: r.byte_offset as u32,
-                            index,
-                        },
-                        None,
-                    )
-                } else {
-                    self.load_cbuf_ldc(raw)
+                let count = match size {
+                    4 => 1u32,
+                    5 => 2,
+                    6 => 4,
+                    _ => {
+                        log::warn!(
+                            "LDC with sub-word size not yet lifted raw={:#018x} size={}",
+                            raw,
+                            size,
+                        );
+                        self.program.emit_void(Op::Unimplemented {
+                            opcode: Opcode::LDC,
+                            raw,
+                        });
+                        self.unimplemented_count += 1;
+                        return false;
+                    }
                 };
-                self.write_reg(dest, Op::Mov(Value::Inst(cb_id)), pred);
+                let r = ldc_ref(raw);
+                let index = if src_reg != RZ {
+                    Some(self.read_reg(src_reg))
+                } else {
+                    None
+                };
+                for w in 0..count {
+                    let bo = (r.byte_offset as u32).wrapping_add(w * 4);
+                    let cb_id = match index {
+                        Some(idx) => self.program.emit(
+                            Op::LoadCbufIndexed {
+                                binding: r.binding,
+                                byte_offset: bo,
+                                index: idx,
+                            },
+                            None,
+                        ),
+                        None => self.program.emit(
+                            Op::LoadCbuf {
+                                binding: r.binding,
+                                byte_offset: bo,
+                            },
+                            None,
+                        ),
+                    };
+                    let dst = if dest == RZ {
+                        RZ
+                    } else {
+                        dest.wrapping_add(w as u8)
+                    };
+                    self.write_reg(dst, Op::Mov(Value::Inst(cb_id)), pred);
+                }
             }
 
             Opcode::FSETP_reg | Opcode::FSETP_cbuf | Opcode::FSETP_imm => {
