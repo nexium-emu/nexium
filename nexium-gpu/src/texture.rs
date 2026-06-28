@@ -11,6 +11,9 @@ pub enum TicFormat {
     BC1,
     BC2,
     BC3,
+    BC4,
+    BC5,
+    BC7,
     Astc(u8, u8),
     Unknown(u32),
 }
@@ -54,6 +57,9 @@ impl TicFormat {
             0x24 => TicFormat::BC1,
             0x25 => TicFormat::BC2,
             0x26 => TicFormat::BC3,
+            0x27 => TicFormat::BC4,
+            0x28 => TicFormat::BC5,
+            0x17 => TicFormat::BC7,
             0x2D => TicFormat::R8G8B8A8,
             0x40 => TicFormat::Astc(4, 4),
             0x50 => TicFormat::Astc(5, 4),
@@ -79,8 +85,8 @@ impl TicFormat {
             TicFormat::R5G6B5 | TicFormat::A1R5G5B5 | TicFormat::A4R4G4B4 => 2,
             TicFormat::R16 | TicFormat::R8G8 => 2,
             TicFormat::R8 => 1,
-            TicFormat::BC1 => 8,
-            TicFormat::BC2 | TicFormat::BC3 => 16,
+            TicFormat::BC1 | TicFormat::BC4 => 8,
+            TicFormat::BC2 | TicFormat::BC3 | TicFormat::BC5 | TicFormat::BC7 => 16,
             TicFormat::Astc(_, _) => 16,
             TicFormat::Unknown(_) => 4,
         }
@@ -88,9 +94,12 @@ impl TicFormat {
 
     pub fn storage_extent(&self, width: u32, height: u32) -> (u32, u32, usize) {
         match self {
-            TicFormat::BC1 | TicFormat::BC2 | TicFormat::BC3 => {
-                ((width + 3) / 4, (height + 3) / 4, self.src_bpp())
-            }
+            TicFormat::BC1
+            | TicFormat::BC2
+            | TicFormat::BC3
+            | TicFormat::BC4
+            | TicFormat::BC5
+            | TicFormat::BC7 => ((width + 3) / 4, (height + 3) / 4, self.src_bpp()),
             TicFormat::Astc(bw, bh) => {
                 let bw = *bw as u32;
                 let bh = *bh as u32;
@@ -482,6 +491,57 @@ fn decode_astc(src: &[u8], width: u32, height: u32, bw: usize, bh: usize, out: &
     }
 }
 
+fn unpack_bcn_u32(buf: &[u32], out: &mut [u8]) {
+    for (i, c) in buf.iter().enumerate() {
+        let o = i * 4;
+        if o + 3 < out.len() {
+            out[o] = ((c >> 16) & 0xFF) as u8;
+            out[o + 1] = ((c >> 8) & 0xFF) as u8;
+            out[o + 2] = (c & 0xFF) as u8;
+            out[o + 3] = ((c >> 24) & 0xFF) as u8;
+        }
+    }
+}
+
+fn fill_magenta(out: &mut [u8]) {
+    for px in out.chunks_exact_mut(4) {
+        px[0] = 0xFF;
+        px[1] = 0x00;
+        px[2] = 0xFF;
+        px[3] = 0xFF;
+    }
+}
+
+fn decode_bc4(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let (w, h) = (width as usize, height as usize);
+    let mut buf = vec![0u32; w * h];
+    if texture2ddecoder::decode_bc4(src, w, h, &mut buf).is_err() {
+        fill_magenta(out);
+        return;
+    }
+    unpack_bcn_u32(&buf, out);
+}
+
+fn decode_bc5(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let (w, h) = (width as usize, height as usize);
+    let mut buf = vec![0u32; w * h];
+    if texture2ddecoder::decode_bc5(src, w, h, &mut buf).is_err() {
+        fill_magenta(out);
+        return;
+    }
+    unpack_bcn_u32(&buf, out);
+}
+
+fn decode_bc7(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let (w, h) = (width as usize, height as usize);
+    let mut buf = vec![0u32; w * h];
+    if texture2ddecoder::decode_bc7(src, w, h, &mut buf).is_err() {
+        fill_magenta(out);
+        return;
+    }
+    unpack_bcn_u32(&buf, out);
+}
+
 pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -> Vec<u8> {
     let pixels = (width as usize) * (height as usize);
     let mut out = vec![0u8; pixels * 4];
@@ -570,6 +630,9 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
         TicFormat::BC1 => decode_bc1(src, width, height, &mut out),
         TicFormat::BC2 => decode_bc2(src, width, height, &mut out),
         TicFormat::BC3 => decode_bc3(src, width, height, &mut out),
+        TicFormat::BC4 => decode_bc4(src, width, height, &mut out),
+        TicFormat::BC5 => decode_bc5(src, width, height, &mut out),
+        TicFormat::BC7 => decode_bc7(src, width, height, &mut out),
         TicFormat::Astc(bw, bh) => decode_astc(src, width, height, bw as usize, bh as usize, &mut out),
         TicFormat::Unknown(_) => {
             for i in 0..pixels {
