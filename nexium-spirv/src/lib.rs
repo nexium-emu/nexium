@@ -1519,23 +1519,6 @@ impl Emitter {
         self.block_labels[&to_block]
     }
 
-    fn effective_phi_pred(&self, p: u32, x: u32) -> u32 {
-        let Some(ipd) = &self.cond_merge else {
-            return p;
-        };
-        let mut b = p;
-        let mut guard = 0usize;
-        while (b as usize) < ipd.len() && b != x && ipd[b as usize] != x && guard <= ipd.len() {
-            let nb = ipd[b as usize];
-            if nb == b {
-                break;
-            }
-            b = nb;
-            guard += 1;
-        }
-        b
-    }
-
     fn emit_synth_merge_blocks(&mut self, m_block: &BasicBlock) {
         let m = m_block.id;
         let Some(synths) = self.synth_merge_blocks.get(&m).cloned() else {
@@ -1556,10 +1539,9 @@ impl Emitter {
             for (rid, sources) in &phis {
                 let mut pairs: Vec<(Word, Word)> = Vec::new();
                 for (pred, val) in sources {
-                    let b = self.effective_phi_pred(*pred, m);
-                    if self.merge_redirect(b, m) == s_i {
+                    if self.merge_redirect(*pred, m) == s_i {
                         let v = self.lower_value(val);
-                        let lbl = self.block_labels[&b];
+                        let lbl = self.block_labels[pred];
                         pairs.push((v, lbl));
                     }
                 }
@@ -1607,10 +1589,9 @@ impl Emitter {
             if shared {
                 let m_lbl = self.block_labels[&m];
                 for (pred_id, val) in sources {
-                    let b = self.effective_phi_pred(*pred_id, m);
-                    if self.merge_redirect(b, m) == m_lbl {
+                    if self.merge_redirect(*pred_id, m) == m_lbl {
                         let v = self.lower_value(val);
-                        let label = self.block_labels.get(&b).copied().unwrap_or(0);
+                        let label = self.block_labels.get(pred_id).copied().unwrap_or(0);
                         pairs.push((v, label));
                     }
                 }
@@ -1626,9 +1607,8 @@ impl Emitter {
                 }
             } else {
                 for (pred_id, val) in sources {
-                    let b = self.effective_phi_pred(*pred_id, m);
                     let v = self.lower_value(val);
-                    let label = self.block_labels.get(&b).copied().unwrap_or(0);
+                    let label = self.block_labels.get(pred_id).copied().unwrap_or(0);
                     pairs.push((v, label));
                 }
             }
