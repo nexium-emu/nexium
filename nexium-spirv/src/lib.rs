@@ -86,6 +86,7 @@ pub struct Emitter {
     ubo_vec4s: u32,
     ssbo_vars: Vec<Option<Word>>,
     ptr_storage_u32: Option<Word>,
+    loop_merge_label: Option<Word>,
 }
 
 #[derive(Clone, Copy)]
@@ -228,6 +229,7 @@ impl Emitter {
             ubo_vec4s,
             ssbo_vars: vec![None; MAX_SSBO as usize],
             ptr_storage_u32: None,
+            loop_merge_label: None,
         }
     }
 
@@ -1559,7 +1561,7 @@ impl Emitter {
         let single_block = cfg.blocks.len() <= 1;
         for (idx, block) in cfg.blocks.iter().enumerate() {
             let is_first = idx == 0;
-            if !is_first {
+            if !is_first || self.loop_merge_label.is_some() {
                 self.emit_synth_merge_blocks(block);
                 let label = self.block_labels[&block.id];
                 self.b.begin_block(Some(label)).unwrap();
@@ -1621,7 +1623,31 @@ impl Emitter {
 
     fn emit_terminator(&mut self, block: &BasicBlock) {
         match block.branch {
-            BranchKind::Exit => {}
+            BranchKind::Exit => {
+                if let Some(lm) = self.loop_merge_label {
+                    if matches!(self.stage, Stage::Fragment) {
+                        let f0 = self.f32_zero;
+                        let f1 = self.f32_one;
+                        let es = block.program.exit_reg_state.as_ref();
+                        let chans: [Word; 4] = std::array::from_fn(|r| {
+                            match es.and_then(|m| m.get(&(r as u8))) {
+                                Some(v) => self.lower_value(v),
+                                None => {
+                                    if r == 3 {
+                                        f1
+                                    } else {
+                                        f0
+                                    }
+                                }
+                            }
+                        });
+                        let v = self.b.composite_construct(self.vec4_t, None, chans).unwrap();
+                        let fc = self.frag_color_var_id();
+                        self.b.store(fc, v, None, []).unwrap();
+                    }
+                    self.b.branch(lm).unwrap();
+                }
+            }
             BranchKind::Unconditional { target } => {
                 let lbl = self.merge_redirect(block.id, target);
                 self.b.branch(lbl).unwrap();
@@ -1666,8 +1692,25 @@ impl Emitter {
                 if self.block_labels.contains_key(&next) {
                     let lbl = self.merge_redirect(block.id, next);
                     self.b.branch(lbl).unwrap();
+                } else if let Some(lm) = self.loop_merge_label {
+                    self.b.branch(lm).unwrap();
                 }
             }
+        }
+    }
+
+    fn emit_entry_inits(&mut self, required_outputs: &[(u32, AttrVar)], ps_inject: Option<(Word, u32)>) {
+        if matches!(self.stage, Stage::Vertex) {
+            for (_loc, av) in required_outputs {
+                let o = self.f32_one;
+                for c in 0..4 {
+                    self.write_attr_component(*av, c, o);
+                }
+            }
+        }
+        if let Some((v, bits)) = ps_inject {
+            let c = self.const_f32(bits);
+            self.b.store(v, c, None, []).unwrap();
         }
     }
 
@@ -1787,32 +1830,52 @@ impl Emitter {
             }
         }
 
+        let needs_wrap = std::env::var_os("NEXIUM_LOOP_WRAP").is_some()
+            && cfg.blocks.iter().enumerate().any(|(i, b)| {
+                matches!(b.branch, BranchKind::Exit) && i + 1 != cfg.blocks.len()
+            });
+
         let void_t = self.b.type_void();
         let main_t = self.b.type_function(void_t, vec![]);
         let main_id = self
             .b
             .begin_function(void_t, None, FunctionControl::NONE, main_t)
             .unwrap();
-        let entry_label = cfg.blocks.first().map(|b| self.block_labels[&b.id]);
-        self.b.begin_block(entry_label).unwrap();
 
-        if matches!(self.stage, Stage::Vertex) {
-            for (_loc, av) in &required_outputs {
-                let o = self.f32_one;
-                for c in 0..4 {
-                    self.write_attr_component(*av, c, o);
-                }
-            }
-        }
-
-        if let Some((v, bits)) = ps_inject {
-            let c = self.const_f32(bits);
-            self.b.store(v, c, None, []).unwrap();
-        }
+        let loop_ids: Option<(Word, Word, Word)> = if needs_wrap {
+            let header = self.b.id();
+            let cont = self.b.id();
+            let merge = self.b.id();
+            self.loop_merge_label = Some(cont);
+            let entry = self.b.id();
+            self.b.begin_block(Some(entry)).unwrap();
+            self.emit_entry_inits(&required_outputs, ps_inject);
+            self.b.branch(header).unwrap();
+            self.b.begin_block(Some(header)).unwrap();
+            self.b
+                .loop_merge(merge, cont, rspirv::spirv::LoopControl::NONE, [])
+                .unwrap();
+            let b0 = self.block_labels[&cfg.blocks[0].id];
+            self.b.branch(b0).unwrap();
+            Some((header, cont, merge))
+        } else {
+            let entry_label = cfg.blocks.first().map(|b| self.block_labels[&b.id]);
+            self.b.begin_block(entry_label).unwrap();
+            self.emit_entry_inits(&required_outputs, ps_inject);
+            None
+        };
 
         self.cond_merge = structurizer_cond_merges(cfg);
         self.compute_shared_merges(cfg);
         self.lower_cfg(cfg);
+
+        if let Some((header, cont, merge)) = loop_ids {
+            self.b.begin_block(Some(cont)).unwrap();
+            self.b
+                .branch_conditional(self.bool_false, header, merge, [])
+                .unwrap();
+            self.b.begin_block(Some(merge)).unwrap();
+        }
 
         match self.stage {
             Stage::Vertex => {
@@ -1919,6 +1982,7 @@ impl Emitter {
                 self.b.store(pos, new_pos, None, []).unwrap();
             }
             Stage::Fragment => {
+                if self.loop_merge_label.is_none() {
                 let degenerate = cfg.blocks.is_empty()
                     || cfg.blocks.iter().all(|b| b.program.instructions.is_empty());
                 if degenerate {
@@ -1991,6 +2055,7 @@ impl Emitter {
                 }
                 let fc = self.frag_color_var_id();
                 self.b.store(fc, v, None, []).unwrap();
+                }
             }
         }
 
@@ -2016,6 +2081,28 @@ impl Emitter {
         }
         if std::env::var_os("NEXIUM_EXIT_GUARD").is_some() && !selection_exits_structured(&words) {
             panic!("nexium-spirv: unstructured selection exit");
+        }
+        if let Some(dir) = std::env::var_os("NEXIUM_DUMP_SPIRV") {
+            use std::io::Write;
+            let stage = match self.stage {
+                Stage::Vertex => "vs",
+                Stage::Fragment => "fs",
+            };
+            let mut h: u64 = 1469598103934665603;
+            for w in &words {
+                h ^= *w as u64;
+                h = h.wrapping_mul(1099511628211);
+            }
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join(format!("{}_{:016x}_wrap{}.spv", stage, h, needs_wrap as u8));
+            if let Ok(mut f) = std::fs::File::create(&path) {
+                let mut bytes = Vec::with_capacity(words.len() * 4);
+                for w in &words {
+                    bytes.extend_from_slice(&w.to_le_bytes());
+                }
+                let _ = f.write_all(&bytes);
+            }
         }
         (words, bindings, tex_ids)
     }
