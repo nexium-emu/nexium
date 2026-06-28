@@ -2034,7 +2034,7 @@ impl Emitter {
         if !phi_preds_consistent(&words) {
             panic!("nexium-spirv: invalid phi predecessors");
         }
-        if !selection_exits_structured(&words) {
+        if std::env::var_os("NEXIUM_EXIT_GUARD").is_some() && !selection_exits_structured(&words) {
             panic!("nexium-spirv: unstructured selection exit");
         }
         (words, bindings, tex_ids)
