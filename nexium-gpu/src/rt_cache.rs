@@ -28,6 +28,7 @@ pub struct RtCache {
     mem_properties: Option<vk::PhysicalDeviceMemoryProperties>,
     drawn_stamp: HashMap<RtKey, u64>,
     drawn_counter: u64,
+    frame_draws: HashMap<RtKey, u32>,
 }
 
 impl RtCache {
@@ -38,12 +39,18 @@ impl RtCache {
             mem_properties: None,
             drawn_stamp: HashMap::new(),
             drawn_counter: 0,
+            frame_draws: HashMap::new(),
         }
     }
 
     pub fn mark_drawn(&mut self, key: RtKey) {
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
+        *self.frame_draws.entry(key).or_insert(0) += 1;
+    }
+
+    pub fn reset_frame_draws(&mut self) {
+        self.frame_draws.clear();
     }
 
     pub fn mark_cleared(&mut self, key: RtKey, full_target: bool) {
@@ -76,21 +83,32 @@ impl RtCache {
         let best_stamp = best.map(|(_, s)| s).unwrap_or(0);
         if best_stamp <= 2 && want.height != 0 {
             let aw = want.width as f32 / want.height as f32;
-            let alt = self
+            let same_aspect = |k: &RtKey| {
+                k.height != 0 && ((k.width as f32 / k.height as f32) - aw).abs() <= aw * 0.12
+            };
+            let by_draws = self
                 .cache
                 .keys()
+                .filter(|k| same_aspect(k))
                 .filter_map(|k| {
-                    let s = self.drawn_stamp.get(k).copied()?;
-                    if k.height == 0 {
-                        return None;
-                    }
-                    let a = k.width as f32 / k.height as f32;
-                    if (a - aw).abs() <= aw * 0.12 {
-                        Some((*k, s))
+                    let fd = self.frame_draws.get(k).copied().unwrap_or(0);
+                    if fd > 0 {
+                        Some((*k, fd))
                     } else {
                         None
                     }
                 })
+                .max_by_key(|(_, fd)| *fd);
+            if let Some((ak, fd)) = by_draws {
+                if fd >= 32 {
+                    return Some(ak);
+                }
+            }
+            let alt = self
+                .cache
+                .keys()
+                .filter(|k| same_aspect(k))
+                .filter_map(|k| self.drawn_stamp.get(k).map(|s| (*k, *s)))
                 .max_by_key(|(_, s)| *s);
             if let Some((ak, astamp)) = alt {
                 if astamp > best_stamp.saturating_mul(16) {

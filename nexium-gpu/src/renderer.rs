@@ -1094,6 +1094,7 @@ impl Renderer {
         };
         let key = rt_cache.resolve_present_key(requested_key)?;
         trace_present_key(rt_cache, requested_key, key);
+        rt_cache.reset_frame_draws();
 
         let mut ready_frame = None;
         let mut latest_ready = None;
