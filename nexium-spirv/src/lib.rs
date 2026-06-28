@@ -87,6 +87,7 @@ pub struct Emitter {
     ssbo_vars: Vec<Option<Word>>,
     ptr_storage_u32: Option<Word>,
     loop_merge_label: Option<Word>,
+    discard_flag_var: Option<Word>,
 }
 
 #[derive(Clone, Copy)]
@@ -230,6 +231,7 @@ impl Emitter {
             ssbo_vars: vec![None; MAX_SSBO as usize],
             ptr_storage_u32: None,
             loop_merge_label: None,
+            discard_flag_var: None,
         }
     }
 
@@ -1448,15 +1450,21 @@ impl Emitter {
                 if std::env::var("NEXIUM_NO_KIL").ok().as_deref() == Some("1") {
                     return;
                 }
-                let kill_block = self.b.id();
-                let merge_block = self.b.id();
-
                 let cond = if let Some(pred_guard) = &inst.pred {
                     self.resolve_pred(pred_guard.idx, pred_guard.negate)
                 } else {
                     self.bool_true
                 };
 
+                if let Some(flag) = self.discard_flag_var {
+                    let cur = self.b.load(self.bool_t, None, flag, None, []).unwrap();
+                    let acc = self.b.logical_or(self.bool_t, None, cond, cur).unwrap();
+                    self.b.store(flag, acc, None, []).unwrap();
+                    return;
+                }
+
+                let kill_block = self.b.id();
+                let merge_block = self.b.id();
                 self.b
                     .selection_merge(merge_block, rspirv::spirv::SelectionControl::NONE)
                     .unwrap();
@@ -1849,6 +1857,13 @@ impl Emitter {
             self.loop_merge_label = Some(cont);
             let entry = self.b.id();
             self.b.begin_block(Some(entry)).unwrap();
+            if matches!(self.stage, Stage::Fragment) {
+                let ptr_fb = self.b.type_pointer(None, StorageClass::Function, self.bool_t);
+                let flag =
+                    self.b
+                        .variable(ptr_fb, None, StorageClass::Function, Some(self.bool_false));
+                self.discard_flag_var = Some(flag);
+            }
             self.emit_entry_inits(&required_outputs, ps_inject);
             self.b.branch(header).unwrap();
             self.b.begin_block(Some(header)).unwrap();
@@ -2059,6 +2074,18 @@ impl Emitter {
             }
         }
 
+        if let Some(flag) = self.discard_flag_var {
+            let f = self.b.load(self.bool_t, None, flag, None, []).unwrap();
+            let kb = self.b.id();
+            let km = self.b.id();
+            self.b
+                .selection_merge(km, rspirv::spirv::SelectionControl::NONE)
+                .unwrap();
+            self.b.branch_conditional(f, kb, km, []).unwrap();
+            self.b.begin_block(Some(kb)).unwrap();
+            self.b.kill().unwrap();
+            self.b.begin_block(Some(km)).unwrap();
+        }
         self.b.ret().unwrap();
         self.b.end_function().unwrap();
 
