@@ -259,6 +259,20 @@ pub enum Op {
         index: Value,
     },
 
+    LoadGlobal {
+        addr_lo: Value,
+        offset: i32,
+    },
+
+    LoadStorage {
+        buffer_index: u32,
+        addr_lo: Value,
+        imm: i32,
+        cbuf_binding: u8,
+        cbuf_offset: u32,
+        align: u32,
+    },
+
     LoadAttr {
         slot: u32,
     },
@@ -517,6 +531,22 @@ impl Inst {
                 index,
             } => {
                 write!(f, "LdCbufIdx c[{binding:#x}]:{byte_offset:#x}+{index}")
+            }
+            Op::LoadGlobal { addr_lo, offset } => {
+                write!(f, "LdGbl [{addr_lo}+{offset:#x}]")
+            }
+            Op::LoadStorage {
+                buffer_index,
+                addr_lo,
+                imm,
+                cbuf_binding,
+                cbuf_offset,
+                align,
+            } => {
+                write!(
+                    f,
+                    "LdStor ssbo{buffer_index}[{addr_lo}+{imm:#x} - (c[{cbuf_binding:#x}]:{cbuf_offset:#x}&~{align:#x})]"
+                )
             }
             Op::LoadAttr { slot } => write!(f, "LdAttr a[{slot:#x}]"),
             Op::StoreAttr { slot, src } => write!(f, "StAttr a[{slot:#x}], {src}"),

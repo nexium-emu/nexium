@@ -151,6 +151,36 @@ pub fn ldc_size(insn: u64) -> u32 {
 }
 
 #[inline]
+pub fn ldg_addr_reg(insn: u64) -> u8 {
+    bits(insn, 8, 15) as u8
+}
+
+#[inline]
+pub fn ldg_offset(insn: u64) -> i32 {
+    let raw = bits(insn, 20, 43) as u32;
+    if raw & (1 << 23) != 0 {
+        (raw | 0xFF00_0000) as i32
+    } else {
+        raw as i32
+    }
+}
+
+#[inline]
+pub fn ldg_e(insn: u64) -> bool {
+    bits(insn, 45, 45) != 0
+}
+
+#[inline]
+pub fn ldg_size(insn: u64) -> u32 {
+    bits(insn, 48, 50) as u32
+}
+
+#[inline]
+pub fn stg_data_reg(insn: u64) -> u8 {
+    bits(insn, 0, 7) as u8
+}
+
+#[inline]
 pub fn fsetp_dest_p(insn: u64) -> u8 {
     bits(insn, 3, 5) as u8
 }

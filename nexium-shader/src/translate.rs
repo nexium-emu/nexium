@@ -12,8 +12,8 @@ use super::operand::{
     i2f_abs, i2f_int_format, i2f_neg, i2f_selector, i2f_signed, iadd_neg_a, iadd_neg_b, imm20,
     imm32, iscadd_shift, iset_bf, iset_cmp, iset_signed, isetp_bop, isetp_cmp, isetp_dest_np,
     isetp_dest_p, isetp_signed, isetp_src_pred, isetp_src_pred_inv, ldc_ref, ldc_size, ldc_src_reg,
-    lop32i_not_a, lop32i_not_b, lop32i_op, lop_not_a, lop_not_b, lop_op, mufu_func_bits, reg_a,
-    reg_b, reg_c, reg_dest, shr_signed, texs_tex_id, RZ,
+    ldg_addr_reg, ldg_offset, ldg_size, lop32i_not_a, lop32i_not_b, lop32i_op, lop_not_a, lop_not_b,
+    lop_op, mufu_func_bits, reg_a, reg_b, reg_c, reg_dest, shr_signed, texs_tex_id, RZ,
 };
 
 const PT: u8 = 7;
@@ -789,6 +789,44 @@ impl Translator {
                         dest.wrapping_add(w as u8)
                     };
                     self.write_reg(dst, Op::Mov(Value::Inst(cb_id)), pred);
+                }
+            }
+
+            Opcode::LDG => {
+                let dest = reg_dest(raw);
+                let addr_reg = ldg_addr_reg(raw);
+                let offset = ldg_offset(raw);
+                let size = ldg_size(raw);
+                let count = match size {
+                    4 => 1u32,
+                    5 => 2,
+                    6 | 7 => 4,
+                    _ => {
+                        log::warn!(
+                            "LDG sub-word size not yet lifted raw={:#018x} size={}",
+                            raw,
+                            size,
+                        );
+                        self.program.emit_void(Op::Unimplemented {
+                            opcode: Opcode::LDG,
+                            raw,
+                        });
+                        self.unimplemented_count += 1;
+                        return false;
+                    }
+                };
+                let addr_lo = self.read_reg(addr_reg);
+                for w in 0..count {
+                    let off = offset.wrapping_add((w * 4) as i32);
+                    let id = self
+                        .program
+                        .emit(Op::LoadGlobal { addr_lo, offset: off }, None);
+                    let dst = if dest == RZ {
+                        RZ
+                    } else {
+                        dest.wrapping_add(w as u8)
+                    };
+                    self.write_reg(dst, Op::Mov(Value::Inst(id)), pred);
                 }
             }
 

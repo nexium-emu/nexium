@@ -38,6 +38,12 @@ pub fn walk_instructions(code: &[u8]) -> Vec<Instruction> {
     out
 }
 
+pub fn shader_uses_ldg(code: &[u8]) -> bool {
+    walk_instructions(code)
+        .iter()
+        .any(|i| matches!(i.decoded.opcode, Opcode::LDG))
+}
+
 pub fn extract_fs_tex_ids(code: &[u8], bindless_slot: u8) -> Vec<FsTexId> {
     let mut out: Vec<FsTexId> = Vec::new();
     let push = |id: FsTexId, out: &mut Vec<FsTexId>| {

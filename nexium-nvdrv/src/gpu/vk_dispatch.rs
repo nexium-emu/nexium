@@ -582,6 +582,7 @@ struct ShaderBundle {
     fs_tex_ids: Vec<u32>,
     fs_cbuf_reads: Vec<(u32, u32)>,
     cbuf_used: u32,
+    ssbo_descs: Vec<nexium_shader::StorageBufferAddr>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -781,9 +782,15 @@ fn execute_one(
             let fs_sass = fetch_sass(fs_addr, mappings, mem_read)
                 .ok_or_else(|| "FS SASS read failed".to_string())?;
 
-            let vs_cfg = nexium_shader::build_cfg(&vs_sass);
+            let mut vs_cfg = nexium_shader::build_cfg(&vs_sass);
             let fs_cfg = nexium_shader::build_cfg(&fs_sass);
             let fs_cbuf_reads = collect_cbuf_reads(&fs_cfg, 16);
+            let ssbo_descs = if nexium_shader::shader_uses_ldg(&vs_sass) {
+                nexium_shader::collect_storage_buffers(&mut vs_cfg)
+            } else {
+                Vec::new()
+            };
+            let num_ssbo = (ssbo_descs.len() as u32).min(8);
             if vs_cfg.unimplemented != 0 || fs_cfg.unimplemented != 0 {
                 log::warn!(
                     "shader unimplemented: vs_addr={:#x} fs_addr={:#x} vs={} {:?} fs={} {:?}",
@@ -871,6 +878,7 @@ fn execute_one(
                                 None
                             },
                             window_ndc,
+                            num_ssbo,
                             ..Default::default()
                         },
                     )
@@ -894,6 +902,7 @@ fn execute_one(
                 fs_tex_ids,
                 fs_cbuf_reads,
                 cbuf_used: vs_cbuf_used.max(fs_cbuf_used),
+                ssbo_descs,
             });
             guard.insert(shader_key, b.clone());
             if std::env::var_os("NEXIUM_PROBE_SHADE").is_some() {
@@ -1397,6 +1406,38 @@ fn execute_one(
         &bundle.fs_cbuf_reads,
     );
 
+    let mut ssbo_data: Vec<(u32, Vec<u8>)> = Vec::new();
+    for (idx, d) in bundle.ssbo_descs.iter().enumerate() {
+        let mut bytes: Vec<u8> = vec![0u8; 16];
+        let (cb_va, _cb_sz) = maxwell.regs.cbuf_binds[0][(d.cbuf_binding as usize).min(15)];
+        if cb_va != 0 {
+            if let Some(desc_cpu) = mappings.cpu_address_for(cb_va.wrapping_add(d.cbuf_offset as u64))
+            {
+                let mut desc = [0u8; 12];
+                if mem_read(desc_cpu, &mut desc) {
+                    let base_lo = u32::from_le_bytes([desc[0], desc[1], desc[2], desc[3]]) as u64;
+                    let base_hi = u32::from_le_bytes([desc[4], desc[5], desc[6], desc[7]]) as u64;
+                    let size = u32::from_le_bytes([desc[8], desc[9], desc[10], desc[11]]);
+                    let base = (base_hi << 32) | base_lo;
+                    let align = (d.align.max(1)) as u64;
+                    let aligned = base & !(align - 1);
+                    let slack = (base - aligned) as usize;
+                    if base != 0 {
+                        if let Some(buf_cpu) = mappings.cpu_address_for(aligned) {
+                            let read_size =
+                                ((size as usize) + slack).clamp(16, 8 * 1024 * 1024);
+                            let mut b = vec![0u8; read_size];
+                            if mem_read(buf_cpu, &mut b) {
+                                bytes = b;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ssbo_data.push((idx as u32, bytes));
+    }
+
     let call = Maxwell3dDrawCall {
         vs_spirv,
         fs_spirv,
@@ -1455,6 +1496,7 @@ fn execute_one(
         poly_offset_enable: draw.poly_offset_fill_enable,
         poly_offset_units: draw.poly_offset_units,
         poly_offset_factor: draw.poly_offset_factor,
+        ssbo_data,
     };
 
     Ok(Some(call))

@@ -76,6 +76,104 @@ impl Cfg {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageBufferAddr {
+    pub cbuf_binding: u8,
+    pub cbuf_offset: u32,
+    pub align: u32,
+}
+
+fn track_cbuf_base(start: Value, defs: &HashMap<u32, Op>) -> Option<(u8, u32, u32)> {
+    if let Some((b, o)) = track_dfs(start, defs, true, 0) {
+        return Some((b, o, 16));
+    }
+    track_dfs(start, defs, false, 0).map(|(b, o)| (b, o, 8))
+}
+
+fn track_dfs(v: Value, defs: &HashMap<u32, Op>, biased: bool, depth: u32) -> Option<(u8, u32)> {
+    if depth > 24 {
+        return None;
+    }
+    let Value::Inst(id) = v else {
+        return None;
+    };
+    match defs.get(&id.0)? {
+        Op::LoadCbuf {
+            binding,
+            byte_offset,
+        } => {
+            let align = if biased { 16 } else { 8 };
+            if *byte_offset % align != 0 {
+                return None;
+            }
+            if biased
+                && !(*binding == 0 && *byte_offset >= 0x110 && *byte_offset < 0x610)
+            {
+                return None;
+            }
+            Some((*binding, *byte_offset))
+        }
+        Op::Mov(s) => track_dfs(*s, defs, biased, depth + 1),
+        Op::IAdd { a, b, .. } => {
+            track_dfs(*a, defs, biased, depth + 1).or_else(|| track_dfs(*b, defs, biased, depth + 1))
+        }
+        Op::IScAdd { a, b, .. } => {
+            track_dfs(*a, defs, biased, depth + 1).or_else(|| track_dfs(*b, defs, biased, depth + 1))
+        }
+        _ => None,
+    }
+}
+
+pub fn collect_storage_buffers(cfg: &mut Cfg) -> Vec<StorageBufferAddr> {
+    let mut defs: HashMap<u32, Op> = HashMap::new();
+    for b in &cfg.blocks {
+        for inst in &b.program.instructions {
+            if let Some(r) = inst.result {
+                defs.insert(r.0, inst.op.clone());
+            }
+        }
+    }
+
+    let mut buffers: Vec<StorageBufferAddr> = Vec::new();
+    let mut rewrites: Vec<(usize, usize, Op)> = Vec::new();
+    for (bi, b) in cfg.blocks.iter().enumerate() {
+        for (ii, inst) in b.program.instructions.iter().enumerate() {
+            if let Op::LoadGlobal { addr_lo, offset } = inst.op {
+                if let Some((binding, coff, align)) = track_cbuf_base(addr_lo, &defs) {
+                    let sba = StorageBufferAddr {
+                        cbuf_binding: binding,
+                        cbuf_offset: coff,
+                        align,
+                    };
+                    let buffer_index = match buffers.iter().position(|x| *x == sba) {
+                        Some(p) => p as u32,
+                        None => {
+                            buffers.push(sba);
+                            (buffers.len() - 1) as u32
+                        }
+                    };
+                    rewrites.push((
+                        bi,
+                        ii,
+                        Op::LoadStorage {
+                            buffer_index,
+                            addr_lo,
+                            imm: offset,
+                            cbuf_binding: binding,
+                            cbuf_offset: coff,
+                            align,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    for (bi, ii, op) in rewrites {
+        cfg.blocks[bi].program.instructions[ii].op = op;
+    }
+    buffers
+}
+
 fn is_schedule(offset: usize) -> bool {
     offset % 0x20 == 0
 }

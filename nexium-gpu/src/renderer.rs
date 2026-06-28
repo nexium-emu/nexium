@@ -1814,7 +1814,31 @@ impl Renderer {
                 image_layout: vk::ImageLayout::UNDEFINED,
             })
             .collect();
-        let writes = [
+        let mut ssbo_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+        let mut ssbo_bindings: Vec<u32> = Vec::new();
+        for (idx, data) in &call.ssbo_data {
+            if *idx >= crate::descriptor::MAX_SSBO || data.is_empty() {
+                continue;
+            }
+            let sz = data.len() as u64;
+            let sz_al = align_up(sz, 16);
+            if ubo_ring.head + sz_al > ubo_ring.size {
+                ubo_ring.head = 0;
+                ubo_ring.slot_head[other_idx] = 0;
+            }
+            let (sbuf, soff, sptr) = ring_alloc(ubo_ring, sz_al, 16)
+                .map_err(|e| format!("ring_alloc(ssbo): {}", e))?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), sptr, data.len());
+            }
+            ssbo_infos.push(vk::DescriptorBufferInfo {
+                buffer: sbuf,
+                offset: soff,
+                range: sz,
+            });
+            ssbo_bindings.push(*idx);
+        }
+        let mut writes = vec![
             vk::WriteDescriptorSet {
                 s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                 dst_set: dset,
@@ -1855,6 +1879,21 @@ impl Renderer {
                 _marker: std::marker::PhantomData,
             },
         ];
+        for (i, binding) in ssbo_bindings.iter().enumerate() {
+            writes.push(vk::WriteDescriptorSet {
+                s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                dst_set: dset,
+                dst_binding: crate::descriptor::SSBO_BINDING_BASE + *binding,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                p_buffer_info: &ssbo_infos[i],
+                p_image_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+                p_next: std::ptr::null(),
+                _marker: std::marker::PhantomData,
+            });
+        }
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
         let rt = rt_cache.get_or_create(call.rt_key, device)?;

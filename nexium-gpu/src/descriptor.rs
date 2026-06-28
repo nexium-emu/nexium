@@ -1,6 +1,8 @@
 use ash::vk;
 
 pub const MAX_TEXTURE_DESCRIPTORS: u32 = 32;
+pub const SSBO_BINDING_BASE: u32 = 3;
+pub const MAX_SSBO: u32 = 8;
 
 pub struct DescriptorSetLayout {
     pub layout: vk::DescriptorSetLayout,
@@ -12,7 +14,7 @@ pub struct DescriptorPool {
 
 impl DescriptorSetLayout {
     pub fn new(device: &ash::Device) -> Result<Self, String> {
-        let bindings = [
+        let mut bindings = vec![
             vk::DescriptorSetLayoutBinding {
                 binding: 0,
                 descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
@@ -38,6 +40,16 @@ impl DescriptorSetLayout {
                 _marker: std::marker::PhantomData,
             },
         ];
+        for i in 0..MAX_SSBO {
+            bindings.push(vk::DescriptorSetLayoutBinding {
+                binding: SSBO_BINDING_BASE + i,
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                p_immutable_samplers: std::ptr::null(),
+                _marker: std::marker::PhantomData,
+            });
+        }
 
         let layout_info = vk::DescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -72,6 +84,10 @@ impl DescriptorPool {
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
                 descriptor_count: max_sets.saturating_mul(MAX_TEXTURE_DESCRIPTORS),
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: max_sets.saturating_mul(MAX_SSBO),
             },
         ];
 

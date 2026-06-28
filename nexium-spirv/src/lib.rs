@@ -29,6 +29,8 @@ const UBO_VEC4S: u32 = 4096;
 const CBUF_LOGICAL_SLOTS: u32 = 32;
 const CBUF_SLOT_VEC4S: u32 = UBO_VEC4S / CBUF_LOGICAL_SLOTS;
 const MAX_TEXTURE_DESCRIPTORS: u32 = 32;
+const SSBO_BINDING_BASE: u32 = 3;
+pub const MAX_SSBO: u32 = 8;
 
 pub struct Emitter {
     b: rspirv::dr::Builder,
@@ -82,6 +84,8 @@ pub struct Emitter {
     bool_false: Word,
     pred_regs: [Option<Word>; 7],
     ubo_vec4s: u32,
+    ssbo_vars: Vec<Option<Word>>,
+    ptr_storage_u32: Option<Word>,
 }
 
 #[derive(Clone, Copy)]
@@ -222,6 +226,39 @@ impl Emitter {
             bool_false,
             pred_regs: [None; 7],
             ubo_vec4s,
+            ssbo_vars: vec![None; MAX_SSBO as usize],
+            ptr_storage_u32: None,
+        }
+    }
+
+    fn setup_ssbos(&mut self, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let u32_t = self.u32_t;
+        let ptr_st = self.b.type_pointer(None, StorageClass::Uniform, u32_t);
+        self.ptr_storage_u32 = Some(ptr_st);
+        let n = count.min(MAX_SSBO);
+        for i in 0..n {
+            let rt = self.b.type_runtime_array(u32_t);
+            self.b
+                .decorate(rt, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
+            let st = self.b.type_struct([rt]);
+            self.b.decorate(st, Decoration::BufferBlock, []);
+            self.b
+                .member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+            let ptr_struct = self.b.type_pointer(None, StorageClass::Uniform, st);
+            let var = self
+                .b
+                .variable(ptr_struct, None, StorageClass::Uniform, None);
+            self.b
+                .decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+            self.b.decorate(
+                var,
+                Decoration::Binding,
+                [Operand::LiteralBit32(SSBO_BINDING_BASE + i)],
+            );
+            self.ssbo_vars[i as usize] = Some(var);
         }
     }
 
@@ -237,6 +274,7 @@ impl Emitter {
         ubo_vec4s: u32,
     ) -> Self {
         let mut e = Self::new_sized(stage, ubo_vec4s);
+        e.setup_ssbos(vertex_opts.num_ssbo);
         e.vertex_opts = vertex_opts;
         e
     }
@@ -800,6 +838,65 @@ impl Emitter {
                         .vector_extract_dynamic(self.f32_t, None, vec, c_idx)
                         .unwrap(),
                 )
+            }
+            IrOp::LoadGlobal { .. } => Some(self.f32_zero),
+            IrOp::LoadStorage {
+                buffer_index,
+                addr_lo,
+                imm,
+                cbuf_binding,
+                cbuf_offset,
+                align,
+            } => {
+                let bi = *buffer_index as usize;
+                let ssbo = if bi < self.ssbo_vars.len() {
+                    self.ssbo_vars[bi]
+                } else {
+                    None
+                };
+                match (ssbo, self.ptr_storage_u32) {
+                    (Some(ssbo), Some(ptr_u)) => {
+                        let u32_t = self.u32_t;
+                        let addr_f = self.lower_value(addr_lo);
+                        let addr_u = self.b.bitcast(u32_t, None, addr_f).unwrap();
+                        let eff = if *imm != 0 {
+                            let immc = self.const_u32(*imm as u32);
+                            self.b.i_add(u32_t, None, addr_u, immc).unwrap()
+                        } else {
+                            addr_u
+                        };
+                        let logical_binding = match self.stage {
+                            Stage::Vertex => (*cbuf_binding as u32) & 0xF,
+                            Stage::Fragment => 16 + ((*cbuf_binding as u32) & 0xF),
+                        };
+                        self.cbuf_bindings_used |= 1u32 << logical_binding;
+                        let local_vec4 = (cbuf_offset / 16).min(CBUF_SLOT_VEC4S.saturating_sub(1));
+                        let vec4_index =
+                            (logical_binding * CBUF_SLOT_VEC4S + local_vec4) % self.ubo_vec4s;
+                        let component = (cbuf_offset / 4) & 0x3;
+                        let v_idx = self.const_u32(vec4_index);
+                        let c_idx = self.const_u32(component);
+                        let zero_u32 = self.const_u32(0);
+                        let ubo_var = self.ubo_var;
+                        let ptr_uniform_f32 = self.ptr_uniform_f32;
+                        let base_ac = self
+                            .b
+                            .access_chain(ptr_uniform_f32, None, ubo_var, [zero_u32, v_idx, c_idx])
+                            .unwrap();
+                        let base_f = self.b.load(self.f32_t, None, base_ac, None, []).unwrap();
+                        let base_u = self.b.bitcast(u32_t, None, base_f).unwrap();
+                        let mask = self.const_u32(!(align.saturating_sub(1)));
+                        let base_a = self.b.bitwise_and(u32_t, None, base_u, mask).unwrap();
+                        let offset = self.b.i_sub(u32_t, None, eff, base_a).unwrap();
+                        let two = self.const_u32(2);
+                        let word = self.b.shift_right_logical(u32_t, None, offset, two).unwrap();
+                        let zero2 = self.const_u32(0);
+                        let dac = self.b.access_chain(ptr_u, None, ssbo, [zero2, word]).unwrap();
+                        let val = self.b.load(u32_t, None, dac, None, []).unwrap();
+                        Some(self.b.bitcast(self.f32_t, None, val).unwrap())
+                    }
+                    _ => Some(self.f32_zero),
+                }
             }
             IrOp::LoadAttr { slot } => {
                 let component = (slot & 0xC) >> 2;
@@ -2166,6 +2263,7 @@ pub struct VertexOptions {
     pub inject_ubo_matrix: bool,
     pub point_size: Option<f32>,
     pub window_ndc: Option<(f32, f32)>,
+    pub num_ssbo: u32,
 }
 
 impl Default for VertexOptions {
@@ -2177,6 +2275,7 @@ impl Default for VertexOptions {
             inject_ubo_matrix: false,
             point_size: None,
             window_ndc: None,
+            num_ssbo: 0,
         }
     }
 }

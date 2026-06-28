@@ -117,6 +117,7 @@ pub struct Maxwell3dDrawCall {
     pub poly_offset_enable: bool,
     pub poly_offset_units: f32,
     pub poly_offset_factor: f32,
+    pub ssbo_data: Vec<(u32, Vec<u8>)>,
 }
 
 pub fn expand_quad_vertices(src: &[u8], stride: usize) -> Vec<u8> {
