@@ -450,6 +450,14 @@ impl Pusher {
             self.flush_vk(mappings, mem_read);
             kepler_memory.dispatch_method(method, arg, mappings, mem_write);
         } else {
+            if bound_class == 0xB1C0 {
+                use std::sync::atomic::{AtomicU64, Ordering as O2};
+                static COMPUTE_METHODS: AtomicU64 = AtomicU64::new(0);
+                let n = COMPUTE_METHODS.fetch_add(1, O2::Relaxed) + 1;
+                if n <= 3 || n % 2000 == 0 {
+                    log::warn!("[compute] 0xb1c0 method={:#x} count={} (dropped)", method, n);
+                }
+            }
             if bound_class != 0 {
                 use std::sync::{Mutex, OnceLock};
                 static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();

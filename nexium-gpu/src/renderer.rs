@@ -1146,7 +1146,9 @@ impl Renderer {
 
         let (copy_x, copy_y, copy_w, copy_h) = copy_rect
             .map(|r| (r[0], r[1], r[2], r[3]))
-            .unwrap_or((0, 0, width, height));
+            .unwrap_or((0, 0, key.width, key.height));
+        let copy_w = copy_w.min(key.width.saturating_sub(copy_x));
+        let copy_h = copy_h.min(key.height.saturating_sub(copy_y));
         let total = (copy_w as u64) * 4 * (copy_h as u64);
         {
             let slot = &mut readback_slots[slot_idx];
@@ -2868,8 +2870,13 @@ fn trace_present_key(rt_cache: &RtCache, requested_key: RtKey, key: RtKey) {
             )
         })
         .collect();
+    let all: Vec<String> = rt_cache
+        .debug_all()
+        .into_iter()
+        .map(|(k, stamp)| format!("{}:{}x{}#{}", k.nvmap_id, k.width, k.height, stamp))
+        .collect();
     log::warn!(
-        "present key seq={} requested={}:{}x{} resolved={}:{}x{} candidates=[{}]",
+        "present key seq={} requested={}:{}x{} resolved={}:{}x{} candidates=[{}] ALL=[{}]",
         seq,
         requested_key.nvmap_id,
         requested_key.width,
@@ -2877,7 +2884,8 @@ fn trace_present_key(rt_cache: &RtCache, requested_key: RtKey, key: RtKey) {
         key.nvmap_id,
         key.width,
         key.height,
-        candidates.join(", ")
+        candidates.join(", "),
+        all.join(", ")
     );
 }
 

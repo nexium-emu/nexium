@@ -73,7 +73,42 @@ impl RtCache {
                 best = Some((*k, stamp));
             }
         }
+        let best_stamp = best.map(|(_, s)| s).unwrap_or(0);
+        if best_stamp <= 2 && want.height != 0 {
+            let aw = want.width as f32 / want.height as f32;
+            let alt = self
+                .cache
+                .keys()
+                .filter_map(|k| {
+                    let s = self.drawn_stamp.get(k).copied()?;
+                    if k.height == 0 {
+                        return None;
+                    }
+                    let a = k.width as f32 / k.height as f32;
+                    if (a - aw).abs() <= aw * 0.12 {
+                        Some((*k, s))
+                    } else {
+                        None
+                    }
+                })
+                .max_by_key(|(_, s)| *s);
+            if let Some((ak, astamp)) = alt {
+                if astamp > best_stamp.saturating_mul(16) {
+                    return Some(ak);
+                }
+            }
+        }
         best.map(|(k, _)| k)
+    }
+
+    pub fn debug_all(&self) -> Vec<(RtKey, u64)> {
+        let mut out: Vec<(RtKey, u64)> = self
+            .cache
+            .keys()
+            .map(|k| (*k, self.drawn_stamp.get(k).copied().unwrap_or(0)))
+            .collect();
+        out.sort_by_key(|(_, s)| *s);
+        out
     }
 
     pub fn present_candidates(&self, want: RtKey) -> Vec<(RtKey, u64)> {
