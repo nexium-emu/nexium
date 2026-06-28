@@ -253,6 +253,12 @@ pub enum Op {
         byte_offset: u32,
     },
 
+    LoadCbufIndexed {
+        binding: u8,
+        byte_offset: u32,
+        index: Value,
+    },
+
     LoadAttr {
         slot: u32,
     },
@@ -504,6 +510,13 @@ impl Inst {
                 byte_offset,
             } => {
                 write!(f, "LdCbuf c[{binding:#x}]:{byte_offset:#x}")
+            }
+            Op::LoadCbufIndexed {
+                binding,
+                byte_offset,
+                index,
+            } => {
+                write!(f, "LdCbufIdx c[{binding:#x}]:{byte_offset:#x}+{index}")
             }
             Op::LoadAttr { slot } => write!(f, "LdAttr a[{slot:#x}]"),
             Op::StoreAttr { slot, src } => write!(f, "StAttr a[{slot:#x}], {src}"),

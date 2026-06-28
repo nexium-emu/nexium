@@ -759,6 +759,48 @@ impl Emitter {
                     .unwrap();
                 Some(self.b.load(self.f32_t, None, ac, None, []).unwrap())
             }
+            IrOp::LoadCbufIndexed {
+                binding,
+                byte_offset,
+                index,
+            } => {
+                let logical_binding = match self.stage {
+                    Stage::Vertex => (*binding as u32) & 0xF,
+                    Stage::Fragment => 16 + ((*binding as u32) & 0xF),
+                };
+                self.cbuf_bindings_used |= 1u32 << logical_binding;
+                let idx_f32 = self.lower_value(index);
+                let u32_t = self.u32_t;
+                let idx_u32 = self.b.bitcast(u32_t, None, idx_f32).unwrap();
+                let imm = self.const_u32(*byte_offset);
+                let eff = self.b.i_add(u32_t, None, imm, idx_u32).unwrap();
+                let sh4 = self.const_u32(4);
+                let slot_vec4s = self.const_u32(CBUF_SLOT_VEC4S);
+                let binding_base = self.const_u32(logical_binding * CBUF_SLOT_VEC4S);
+                let ubo_vec4s_c = self.const_u32(self.ubo_vec4s);
+                let local = self.b.shift_right_logical(u32_t, None, eff, sh4).unwrap();
+                let local_w = self.b.u_mod(u32_t, None, local, slot_vec4s).unwrap();
+                let global = self.b.i_add(u32_t, None, binding_base, local_w).unwrap();
+                let v_idx = self.b.u_mod(u32_t, None, global, ubo_vec4s_c).unwrap();
+                let sh2 = self.const_u32(2);
+                let three = self.const_u32(3);
+                let comp_sh = self.b.shift_right_logical(u32_t, None, eff, sh2).unwrap();
+                let c_idx = self.b.bitwise_and(u32_t, None, comp_sh, three).unwrap();
+                let zero_u32 = self.const_u32(0);
+                let ubo_var = self.ubo_var;
+                let vec4_t = self.vec4_t;
+                let ptr_vec4 = self.b.type_pointer(None, StorageClass::Uniform, vec4_t);
+                let ac = self
+                    .b
+                    .access_chain(ptr_vec4, None, ubo_var, [zero_u32, v_idx])
+                    .unwrap();
+                let vec = self.b.load(vec4_t, None, ac, None, []).unwrap();
+                Some(
+                    self.b
+                        .vector_extract_dynamic(self.f32_t, None, vec, c_idx)
+                        .unwrap(),
+                )
+            }
             IrOp::LoadAttr { slot } => {
                 let component = (slot & 0xC) >> 2;
                 let aligned_slot = slot & !0xF;
@@ -1895,6 +1937,9 @@ impl Emitter {
         if !phi_preds_consistent(&words) {
             panic!("nexium-spirv: invalid phi predecessors");
         }
+        if !selection_exits_structured(&words) {
+            panic!("nexium-spirv: unstructured selection exit");
+        }
         (words, bindings, tex_ids)
     }
 }
@@ -1960,6 +2005,74 @@ fn phi_preds_consistent(words: &[u32]) -> bool {
                             }
                         }
                         i += 2;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn selection_exits_structured(words: &[u32]) -> bool {
+    use rspirv::spirv::Op;
+    let module = match rspirv::dr::load_words(words) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    for func in &module.functions {
+        let has_loop = func
+            .blocks
+            .iter()
+            .any(|b| b.instructions.iter().any(|i| i.class.opcode == Op::LoopMerge));
+        if has_loop {
+            continue;
+        }
+        let mut index: HashMap<Word, usize> = HashMap::new();
+        for (i, b) in func.blocks.iter().enumerate() {
+            if let Some(l) = b.label.as_ref().and_then(|l| l.result_id) {
+                index.insert(l, i);
+            }
+        }
+        let mut constructs: Vec<(usize, usize)> = Vec::new();
+        for (i, b) in func.blocks.iter().enumerate() {
+            for inst in &b.instructions {
+                if inst.class.opcode == Op::SelectionMerge {
+                    if let Some(Operand::IdRef(m)) = inst.operands.first() {
+                        if let Some(&mi) = index.get(m) {
+                            constructs.push((i, mi));
+                        }
+                    }
+                }
+            }
+        }
+        if constructs.is_empty() {
+            continue;
+        }
+        for (i, b) in func.blocks.iter().enumerate() {
+            let mut targets: Vec<usize> = Vec::new();
+            if let Some(term) = b.instructions.last() {
+                let ops = match term.class.opcode {
+                    Op::Branch => term.operands.iter().take(1).collect::<Vec<_>>(),
+                    Op::BranchConditional => {
+                        term.operands.iter().skip(1).take(2).collect::<Vec<_>>()
+                    }
+                    Op::Switch => term.operands.iter().skip(1).collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                for op in ops {
+                    if let Operand::IdRef(t) = op {
+                        if let Some(&ti) = index.get(t) {
+                            targets.push(ti);
+                        }
+                    }
+                }
+            }
+            for &(h, m) in &constructs {
+                if i > h && i < m {
+                    for &t in &targets {
+                        if t <= h || t > m {
+                            return false;
+                        }
                     }
                 }
             }

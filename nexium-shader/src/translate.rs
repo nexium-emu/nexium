@@ -751,18 +751,6 @@ impl Translator {
                 let dest = reg_dest(raw);
                 let src_reg = ldc_src_reg(raw);
                 let size = ldc_size(raw);
-                if src_reg != RZ {
-                    log::warn!(
-                        "LDC with dynamic index register (Ra != RZ) not yet lifted raw={:#018x} src_reg={}",
-                        raw, src_reg,
-                    );
-                    self.program.emit_void(Op::Unimplemented {
-                        opcode: Opcode::LDC,
-                        raw,
-                    });
-                    self.unimplemented_count += 1;
-                    return false;
-                }
                 if size != 4 {
                     log::warn!(
                         "LDC with non-B32 size not yet lifted raw={:#018x} size={}",
@@ -777,7 +765,20 @@ impl Translator {
                     return false;
                 }
 
-                let cb_id = self.load_cbuf_ldc(raw);
+                let cb_id = if src_reg != RZ {
+                    let r = ldc_ref(raw);
+                    let index = self.read_reg(src_reg);
+                    self.program.emit(
+                        Op::LoadCbufIndexed {
+                            binding: r.binding,
+                            byte_offset: r.byte_offset as u32,
+                            index,
+                        },
+                        None,
+                    )
+                } else {
+                    self.load_cbuf_ldc(raw)
+                };
                 self.write_reg(dest, Op::Mov(Value::Inst(cb_id)), pred);
             }
 
