@@ -649,21 +649,25 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
         static N: AtomicU32 = AtomicU32::new(0);
         let k = N.fetch_add(1, Ordering::Relaxed);
         if k < 400 {
-            let (mut mr, mut mg, mut mb) = (0u8, 0u8, 0u8);
+            let (mut mr, mut mg, mut mb, mut ma, mut na) = (0u8, 0u8, 0u8, 0u8, 255u8);
             for px in out.chunks_exact(4) {
                 mr = mr.max(px[0]);
                 mg = mg.max(px[1]);
                 mb = mb.max(px[2]);
+                ma = ma.max(px[3]);
+                na = na.min(px[3]);
             }
             log::warn!(
-                "[texdecode] #{} {:?} {}x{} maxR={} maxG={} maxB={}",
+                "[texdecode] #{} {:?} {}x{} maxR={} maxG={} maxB={} alpha={}..{}",
                 k,
                 format,
                 width,
                 height,
                 mr,
                 mg,
-                mb
+                mb,
+                na,
+                ma
             );
         }
     }

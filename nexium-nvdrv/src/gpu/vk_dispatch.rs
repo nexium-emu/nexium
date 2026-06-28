@@ -611,6 +611,13 @@ fn shader_failed_set(
         std::panic::set_hook(Box::new(move |info| {
             let msg = info.to_string();
             if msg.contains("nexium-spirv") || msg.contains("NestedBlock") {
+                if std::env::var_os("NEXIUM_SHADER_PANIC").is_some() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static PC: AtomicU64 = AtomicU64::new(0);
+                    if PC.fetch_add(1, Ordering::Relaxed) < 16 {
+                        log::warn!("[shader-panic] {}", msg);
+                    }
+                }
                 return;
             }
             prev(info);
@@ -1071,10 +1078,11 @@ fn execute_one(
                 let n = N.fetch_add(1, Ordering::Relaxed);
                 if n < 200 {
                     log::warn!(
-                        "[texdbg #{}] slot={} fmt={:?} {}x{} gpu_va={:#x} nvmap={:?} can_alias_rt={}",
+                        "[texdbg #{}] slot={} fmt={:?} {}x{} gpu_va={:#x} nvmap={:?} can_alias_rt={} swizzle={:?}",
                         n, slot, tic.format, tic.width, tic.height, tic.gpu_va,
                         mappings.nvmap_id_for(tic.gpu_va),
-                        tic_can_alias_render_target(tic.format)
+                        tic_can_alias_render_target(tic.format),
+                        tic.swizzle
                     );
                 }
             }
