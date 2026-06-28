@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 
 use super::decode::decode_one;
-use super::ir::{BoolOp, FComp, ICmp, MufuFunc, Op, Predicate, Program, Value, ValueId};
+use super::ir::{BoolOp, FComp, ICmp, LogicOp, MufuFunc, Op, Predicate, Program, Value, ValueId};
 use super::opcodes::Opcode;
 use super::operand::{
-    ald_num_elements, attr_slot_ald, attr_slot_ipa, cbuf, decoded_pred, f2f_mods, fadd32i_mods,
-    fadd_mods, ffma32i_mods, ffma_mods, float_imm20, fmnmx_is_min, fmnmx_mods, fmul32i_mods,
-    fmul_mods, fset_abs_a, fset_abs_b, fset_bop, fset_cmp, fset_neg_a, fset_neg_b, fset_src_pred,
-    fset_src_pred_inv, fsetp_abs_a, fsetp_abs_b, fsetp_bop, fsetp_cmp, fsetp_dest_np, fsetp_dest_p,
-    fsetp_neg_a, fsetp_neg_b, fsetp_src_pred, fsetp_src_pred_inv, i2f_abs, i2f_int_format, i2f_neg,
-    i2f_selector, i2f_signed, imm20, imm32, isetp_bop, isetp_cmp, isetp_dest_np, isetp_dest_p,
-    isetp_signed, isetp_src_pred, isetp_src_pred_inv, ldc_ref, ldc_size, ldc_src_reg,
-    mufu_func_bits, reg_a, reg_b, reg_c, reg_dest, texs_tex_id, RZ,
+    ald_num_elements, attr_slot_ald, attr_slot_ipa, bfe_signed, cbuf, decoded_pred, f2f_mods,
+    f2i_signed, fadd32i_mods, fadd_mods, ffma32i_mods, ffma_mods, float_imm20, fmnmx_is_min,
+    fmnmx_mods, fmul32i_mods, fmul_mods, fset_abs_a, fset_abs_b, fset_bop, fset_cmp, fset_neg_a,
+    fset_neg_b, fset_src_pred, fset_src_pred_inv, fsetp_abs_a, fsetp_abs_b, fsetp_bop, fsetp_cmp,
+    fsetp_dest_np, fsetp_dest_p, fsetp_neg_a, fsetp_neg_b, fsetp_src_pred, fsetp_src_pred_inv,
+    i2f_abs, i2f_int_format, i2f_neg, i2f_selector, i2f_signed, iadd_neg_a, iadd_neg_b, imm20,
+    imm32, iscadd_shift, iset_bf, iset_cmp, iset_signed, isetp_bop, isetp_cmp, isetp_dest_np,
+    isetp_dest_p, isetp_signed, isetp_src_pred, isetp_src_pred_inv, ldc_ref, ldc_size, ldc_src_reg,
+    lop32i_not_a, lop32i_not_b, lop32i_op, lop_not_a, lop_not_b, lop_op, mufu_func_bits, reg_a,
+    reg_b, reg_c, reg_dest, shr_signed, texs_tex_id, RZ,
 };
 
 const PT: u8 = 7;
@@ -164,6 +166,113 @@ impl Translator {
         if dest_np != PT {
             self.pred_state.insert(dest_np, id);
         }
+    }
+
+    fn emit_iadd(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        self.write_reg(
+            dest,
+            Op::IAdd {
+                a,
+                b,
+                neg_a: iadd_neg_a(raw),
+                neg_b: iadd_neg_b(raw),
+            },
+            pred,
+        );
+    }
+
+    fn emit_iscadd(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        self.write_reg(
+            dest,
+            Op::IScAdd {
+                a,
+                b,
+                shift: iscadd_shift(raw),
+                neg_a: iadd_neg_a(raw),
+                neg_b: iadd_neg_b(raw),
+            },
+            pred,
+        );
+    }
+
+    fn emit_ilop(
+        &mut self,
+        raw: u64,
+        b: Value,
+        op: LogicOp,
+        not_a: bool,
+        not_b: bool,
+        pred: Option<Predicate>,
+    ) {
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        self.write_reg(dest, Op::ILop { a, b, op, not_a, not_b }, pred);
+    }
+
+    fn emit_ishl(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        self.write_reg(dest, Op::IShl { a, b }, pred);
+    }
+
+    fn emit_ishr(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        self.write_reg(
+            dest,
+            Op::IShr {
+                a,
+                b,
+                signed: shr_signed(raw),
+            },
+            pred,
+        );
+    }
+
+    fn emit_bfe(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        self.write_reg(
+            dest,
+            Op::Bfe {
+                a,
+                b,
+                signed: bfe_signed(raw),
+            },
+            pred,
+        );
+    }
+
+    fn emit_f2i(&mut self, raw: u64, src: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        self.write_reg(
+            dest,
+            Op::F2I {
+                src,
+                signed: f2i_signed(raw),
+            },
+            pred,
+        );
+    }
+
+    fn emit_iset(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        self.write_reg(
+            dest,
+            Op::ISet {
+                cmp: ICmp::from_bits(iset_cmp(raw)),
+                signed: iset_signed(raw),
+                a,
+                b,
+                bool_float: iset_bf(raw),
+            },
+            pred,
+        );
     }
 
     pub fn translate(&mut self, raw: u64) -> bool {
@@ -715,6 +824,153 @@ impl Translator {
             Opcode::KIL => {
                 self.program.emit_void_pred(Op::Kill, pred);
             }
+
+            Opcode::IADD_reg => {
+                let b = self.read_reg(reg_b(raw));
+                self.emit_iadd(raw, b, pred);
+            }
+            Opcode::IADD_cbuf => {
+                let id = self.load_cbuf(raw);
+                self.emit_iadd(raw, Value::Inst(id), pred);
+            }
+            Opcode::IADD_imm => {
+                self.emit_iadd(raw, Value::ImmU32(imm20(raw) as u32), pred);
+            }
+            Opcode::IADD32I => {
+                self.emit_iadd(raw, Value::ImmU32(imm32(raw)), pred);
+            }
+
+            Opcode::ISCADD_reg => {
+                let b = self.read_reg(reg_b(raw));
+                self.emit_iscadd(raw, b, pred);
+            }
+            Opcode::ISCADD_cbuf => {
+                let id = self.load_cbuf(raw);
+                self.emit_iscadd(raw, Value::Inst(id), pred);
+            }
+            Opcode::ISCADD_imm => {
+                self.emit_iscadd(raw, Value::ImmU32(imm20(raw) as u32), pred);
+            }
+
+            Opcode::SHL_reg => {
+                let b = self.read_reg(reg_b(raw));
+                self.emit_ishl(raw, b, pred);
+            }
+            Opcode::SHL_cbuf => {
+                let id = self.load_cbuf(raw);
+                self.emit_ishl(raw, Value::Inst(id), pred);
+            }
+            Opcode::SHL_imm => {
+                self.emit_ishl(raw, Value::ImmU32(imm20(raw) as u32), pred);
+            }
+
+            Opcode::SHR_reg => {
+                let b = self.read_reg(reg_b(raw));
+                self.emit_ishr(raw, b, pred);
+            }
+            Opcode::SHR_cbuf => {
+                let id = self.load_cbuf(raw);
+                self.emit_ishr(raw, Value::Inst(id), pred);
+            }
+            Opcode::SHR_imm => {
+                self.emit_ishr(raw, Value::ImmU32(imm20(raw) as u32), pred);
+            }
+
+            Opcode::LOP_reg => {
+                let b = self.read_reg(reg_b(raw));
+                self.emit_ilop(
+                    raw,
+                    b,
+                    LogicOp::from_bits(lop_op(raw)),
+                    lop_not_a(raw),
+                    lop_not_b(raw),
+                    pred,
+                );
+            }
+            Opcode::LOP_cbuf => {
+                let id = self.load_cbuf(raw);
+                self.emit_ilop(
+                    raw,
+                    Value::Inst(id),
+                    LogicOp::from_bits(lop_op(raw)),
+                    lop_not_a(raw),
+                    lop_not_b(raw),
+                    pred,
+                );
+            }
+            Opcode::LOP_imm => {
+                self.emit_ilop(
+                    raw,
+                    Value::ImmU32(imm20(raw) as u32),
+                    LogicOp::from_bits(lop_op(raw)),
+                    false,
+                    false,
+                    pred,
+                );
+            }
+            Opcode::LOP32I => {
+                self.emit_ilop(
+                    raw,
+                    Value::ImmU32(imm32(raw)),
+                    LogicOp::from_bits(lop32i_op(raw)),
+                    lop32i_not_a(raw),
+                    lop32i_not_b(raw),
+                    pred,
+                );
+            }
+
+            Opcode::BFE_reg => {
+                let b = self.read_reg(reg_b(raw));
+                self.emit_bfe(raw, b, pred);
+            }
+            Opcode::BFE_cbuf => {
+                let id = self.load_cbuf(raw);
+                self.emit_bfe(raw, Value::Inst(id), pred);
+            }
+            Opcode::BFE_imm => {
+                self.emit_bfe(raw, Value::ImmU32(imm20(raw) as u32), pred);
+            }
+
+            Opcode::F2I_reg => {
+                let src = self.read_reg(reg_b(raw));
+                self.emit_f2i(raw, src, pred);
+            }
+            Opcode::F2I_cbuf => {
+                let id = self.load_cbuf(raw);
+                self.emit_f2i(raw, Value::Inst(id), pred);
+            }
+            Opcode::F2I_imm => {
+                self.emit_f2i(raw, Value::ImmF32(float_imm20(raw)), pred);
+            }
+
+            Opcode::I2I_reg => {
+                let dest = reg_dest(raw);
+                let src = self.read_reg(reg_b(raw));
+                self.write_reg(dest, Op::Mov(src), pred);
+            }
+            Opcode::I2I_cbuf => {
+                let dest = reg_dest(raw);
+                let id = self.load_cbuf(raw);
+                self.write_reg(dest, Op::Mov(Value::Inst(id)), pred);
+            }
+            Opcode::I2I_imm => {
+                let dest = reg_dest(raw);
+                self.write_reg(dest, Op::Mov(Value::ImmU32(imm20(raw) as u32)), pred);
+            }
+
+            Opcode::ISET_reg => {
+                let b = self.read_reg(reg_b(raw));
+                self.emit_iset(raw, b, pred);
+            }
+            Opcode::ISET_cbuf => {
+                let id = self.load_cbuf(raw);
+                self.emit_iset(raw, Value::Inst(id), pred);
+            }
+            Opcode::ISET_imm => {
+                self.emit_iset(raw, Value::ImmU32(imm20(raw) as u32), pred);
+            }
+
+            Opcode::DEPBAR => {}
 
             other => {
                 log::debug!(

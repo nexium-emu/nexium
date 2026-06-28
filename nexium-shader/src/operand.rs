@@ -401,6 +401,67 @@ pub fn fmnmx_is_min(insn: u64) -> bool {
     bits(insn, 42, 42) == 0
 }
 
+#[inline]
+pub fn iscadd_shift(insn: u64) -> u8 {
+    bits(insn, 39, 43) as u8
+}
+#[inline]
+pub fn iadd_neg_a(insn: u64) -> bool {
+    bits(insn, 49, 49) != 0
+}
+#[inline]
+pub fn iadd_neg_b(insn: u64) -> bool {
+    bits(insn, 48, 48) != 0
+}
+#[inline]
+pub fn lop_op(insn: u64) -> u64 {
+    bits(insn, 41, 42)
+}
+#[inline]
+pub fn lop_not_a(insn: u64) -> bool {
+    bits(insn, 39, 39) != 0
+}
+#[inline]
+pub fn lop_not_b(insn: u64) -> bool {
+    bits(insn, 40, 40) != 0
+}
+#[inline]
+pub fn lop32i_op(insn: u64) -> u64 {
+    bits(insn, 53, 54)
+}
+#[inline]
+pub fn lop32i_not_a(insn: u64) -> bool {
+    bits(insn, 55, 55) != 0
+}
+#[inline]
+pub fn lop32i_not_b(insn: u64) -> bool {
+    bits(insn, 56, 56) != 0
+}
+#[inline]
+pub fn shr_signed(insn: u64) -> bool {
+    bits(insn, 48, 48) != 0
+}
+#[inline]
+pub fn f2i_signed(insn: u64) -> bool {
+    bits(insn, 12, 12) != 0
+}
+#[inline]
+pub fn bfe_signed(insn: u64) -> bool {
+    bits(insn, 48, 48) != 0
+}
+#[inline]
+pub fn iset_cmp(insn: u64) -> u64 {
+    bits(insn, 49, 51)
+}
+#[inline]
+pub fn iset_signed(insn: u64) -> bool {
+    bits(insn, 48, 48) != 0
+}
+#[inline]
+pub fn iset_bf(insn: u64) -> bool {
+    bits(insn, 44, 44) != 0
+}
+
 pub fn fmt_reg(r: u8) -> String {
     if r == RZ {
         "RZ".into()

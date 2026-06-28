@@ -90,6 +90,25 @@ impl BoolOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicOp {
+    And,
+    Or,
+    Xor,
+    PassB,
+}
+
+impl LogicOp {
+    pub fn from_bits(v: u64) -> Self {
+        match v & 3 {
+            0 => Self::And,
+            1 => Self::Or,
+            2 => Self::Xor,
+            _ => Self::PassB,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ICmp {
     F,
     Lt,
@@ -312,6 +331,59 @@ pub enum Op {
         dest_np: u8,
     },
 
+    IAdd {
+        a: Value,
+        b: Value,
+        neg_a: bool,
+        neg_b: bool,
+    },
+
+    IScAdd {
+        a: Value,
+        b: Value,
+        shift: u8,
+        neg_a: bool,
+        neg_b: bool,
+    },
+
+    ILop {
+        a: Value,
+        b: Value,
+        op: LogicOp,
+        not_a: bool,
+        not_b: bool,
+    },
+
+    IShl {
+        a: Value,
+        b: Value,
+    },
+
+    IShr {
+        a: Value,
+        b: Value,
+        signed: bool,
+    },
+
+    F2I {
+        src: Value,
+        signed: bool,
+    },
+
+    Bfe {
+        a: Value,
+        b: Value,
+        signed: bool,
+    },
+
+    ISet {
+        cmp: ICmp,
+        signed: bool,
+        a: Value,
+        b: Value,
+        bool_float: bool,
+    },
+
     Kill,
 
     Phi {
@@ -500,6 +572,14 @@ impl Inst {
             } => {
                 write!(f, "ISetP.{cmp:?}.{bop:?} P{dest_p}, {src_a}, {src_b}")
             }
+            Op::IAdd { a, b, .. } => write!(f, "IAdd  {a}, {b}"),
+            Op::IScAdd { a, b, shift, .. } => write!(f, "IScAdd {a}, {b} << {shift}"),
+            Op::ILop { a, b, op, .. } => write!(f, "ILop.{op:?} {a}, {b}"),
+            Op::IShl { a, b } => write!(f, "IShl  {a}, {b}"),
+            Op::IShr { a, b, signed } => write!(f, "IShr  {a}, {b} signed={signed}"),
+            Op::F2I { src, signed } => write!(f, "F2I   {src} signed={signed}"),
+            Op::Bfe { a, b, signed } => write!(f, "Bfe   {a}, {b} signed={signed}"),
+            Op::ISet { cmp, a, b, .. } => write!(f, "ISet.{cmp:?} {a}, {b}"),
             Op::Kill => write!(f, "Kill"),
             Op::Exit => write!(f, "Exit"),
             Op::Unimplemented { opcode, raw } => {

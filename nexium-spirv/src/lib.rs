@@ -5,8 +5,8 @@ mod opt;
 use std::collections::HashMap;
 
 use nexium_shader::{
-    BasicBlock, BlockId, BoolOp, BranchKind, Cfg, FComp, ICmp, IrInst, IrOp, IrValue, MufuFunc,
-    ValueId,
+    BasicBlock, BlockId, BoolOp, BranchKind, Cfg, FComp, ICmp, IrInst, IrOp, IrValue, LogicOp,
+    MufuFunc, ValueId,
 };
 use rspirv::binary::Assemble;
 use rspirv::dr::Operand;
@@ -564,6 +564,14 @@ impl Emitter {
         self.b.bitcast(self.i32_t, None, w).unwrap()
     }
 
+    fn as_u32(&mut self, w: Word) -> Word {
+        self.b.bitcast(self.u32_t, None, w).unwrap()
+    }
+
+    fn store_bits(&mut self, w: Word) -> Word {
+        self.b.bitcast(self.f32_t, None, w).unwrap()
+    }
+
     fn lower_icompare(&mut self, cmp: &ICmp, signed: bool, a_u: Word, b_u: Word) -> Word {
         match cmp {
             ICmp::F => self.bool_false,
@@ -1002,6 +1010,146 @@ impl Emitter {
                     _ => v,
                 };
                 Some(self.apply_sat(v, *sat))
+            }
+            IrOp::IAdd { a, b, neg_a, neg_b } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let mut au = self.as_u32(av);
+                let mut bu = self.as_u32(bv);
+                if *neg_a {
+                    au = self.b.s_negate(self.u32_t, None, au).unwrap();
+                }
+                if *neg_b {
+                    bu = self.b.s_negate(self.u32_t, None, bu).unwrap();
+                }
+                let r = self.b.i_add(self.u32_t, None, au, bu).unwrap();
+                Some(self.store_bits(r))
+            }
+            IrOp::IScAdd {
+                a,
+                b,
+                shift,
+                neg_a,
+                neg_b,
+            } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let mut au = self.as_u32(av);
+                let mut bu = self.as_u32(bv);
+                if *neg_a {
+                    au = self.b.s_negate(self.u32_t, None, au).unwrap();
+                }
+                if *neg_b {
+                    bu = self.b.s_negate(self.u32_t, None, bu).unwrap();
+                }
+                let sh = self.const_u32(*shift as u32);
+                let shifted = self.b.shift_left_logical(self.u32_t, None, au, sh).unwrap();
+                let r = self.b.i_add(self.u32_t, None, shifted, bu).unwrap();
+                Some(self.store_bits(r))
+            }
+            IrOp::ILop {
+                a,
+                b,
+                op,
+                not_a,
+                not_b,
+            } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let mut au = self.as_u32(av);
+                let mut bu = self.as_u32(bv);
+                if *not_a {
+                    au = self.b.not(self.u32_t, None, au).unwrap();
+                }
+                if *not_b {
+                    bu = self.b.not(self.u32_t, None, bu).unwrap();
+                }
+                let r = match op {
+                    LogicOp::And => self.b.bitwise_and(self.u32_t, None, au, bu).unwrap(),
+                    LogicOp::Or => self.b.bitwise_or(self.u32_t, None, au, bu).unwrap(),
+                    LogicOp::Xor => self.b.bitwise_xor(self.u32_t, None, au, bu).unwrap(),
+                    LogicOp::PassB => bu,
+                };
+                Some(self.store_bits(r))
+            }
+            IrOp::IShl { a, b } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let au = self.as_u32(av);
+                let bu = self.as_u32(bv);
+                let r = self.b.shift_left_logical(self.u32_t, None, au, bu).unwrap();
+                Some(self.store_bits(r))
+            }
+            IrOp::IShr { a, b, signed } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let au = self.as_u32(av);
+                let bu = self.as_u32(bv);
+                let r = if *signed {
+                    let ai = self.as_i32(au);
+                    let ri = self
+                        .b
+                        .shift_right_arithmetic(self.i32_t, None, ai, bu)
+                        .unwrap();
+                    self.b.bitcast(self.u32_t, None, ri).unwrap()
+                } else {
+                    self.b.shift_right_logical(self.u32_t, None, au, bu).unwrap()
+                };
+                Some(self.store_bits(r))
+            }
+            IrOp::F2I { src, signed } => {
+                let f = self.lower_value(src);
+                let r = if *signed {
+                    let i = self.b.convert_f_to_s(self.i32_t, None, f).unwrap();
+                    self.b.bitcast(self.u32_t, None, i).unwrap()
+                } else {
+                    self.b.convert_f_to_u(self.u32_t, None, f).unwrap()
+                };
+                Some(self.store_bits(r))
+            }
+            IrOp::Bfe { a, b, signed } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let au = self.as_u32(av);
+                let bu = self.as_u32(bv);
+                let mask = self.const_u32(0xff);
+                let pos = self.b.bitwise_and(self.u32_t, None, bu, mask).unwrap();
+                let eight = self.const_u32(8);
+                let size_raw = self.b.shift_right_logical(self.u32_t, None, bu, eight).unwrap();
+                let cnt = self.b.bitwise_and(self.u32_t, None, size_raw, mask).unwrap();
+                let r = if *signed {
+                    self.b
+                        .bit_field_s_extract(self.u32_t, None, au, pos, cnt)
+                        .unwrap()
+                } else {
+                    self.b
+                        .bit_field_u_extract(self.u32_t, None, au, pos, cnt)
+                        .unwrap()
+                };
+                Some(self.store_bits(r))
+            }
+            IrOp::ISet {
+                cmp,
+                signed,
+                a,
+                b,
+                bool_float,
+            } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let au = self.as_u32(av);
+                let bu = self.as_u32(bv);
+                let cmp_result = self.lower_icompare(cmp, *signed, au, bu);
+                if *bool_float {
+                    let one = self.f32_one;
+                    let zero = self.f32_zero;
+                    Some(self.b.select(self.f32_t, None, cmp_result, one, zero).unwrap())
+                } else {
+                    let ones = self.const_u32(0xFFFF_FFFF);
+                    let zeros = self.const_u32(0);
+                    let sel = self.b.select(self.u32_t, None, cmp_result, ones, zeros).unwrap();
+                    Some(self.store_bits(sel))
+                }
             }
             IrOp::I2F {
                 src,
