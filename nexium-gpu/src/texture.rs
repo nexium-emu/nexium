@@ -11,6 +11,7 @@ pub enum TicFormat {
     BC1,
     BC2,
     BC3,
+    Astc(u8, u8),
     Unknown(u32),
 }
 
@@ -54,6 +55,20 @@ impl TicFormat {
             0x25 => TicFormat::BC2,
             0x26 => TicFormat::BC3,
             0x2D => TicFormat::R8G8B8A8,
+            0x40 => TicFormat::Astc(4, 4),
+            0x50 => TicFormat::Astc(5, 4),
+            0x41 => TicFormat::Astc(5, 5),
+            0x51 => TicFormat::Astc(6, 5),
+            0x42 => TicFormat::Astc(6, 6),
+            0x55 => TicFormat::Astc(8, 5),
+            0x52 => TicFormat::Astc(8, 6),
+            0x44 => TicFormat::Astc(8, 8),
+            0x56 => TicFormat::Astc(10, 5),
+            0x57 => TicFormat::Astc(10, 6),
+            0x53 => TicFormat::Astc(10, 8),
+            0x45 => TicFormat::Astc(10, 10),
+            0x54 => TicFormat::Astc(12, 10),
+            0x46 => TicFormat::Astc(12, 12),
             other => TicFormat::Unknown(other),
         }
     }
@@ -66,6 +81,7 @@ impl TicFormat {
             TicFormat::R8 => 1,
             TicFormat::BC1 => 8,
             TicFormat::BC2 | TicFormat::BC3 => 16,
+            TicFormat::Astc(_, _) => 16,
             TicFormat::Unknown(_) => 4,
         }
     }
@@ -74,6 +90,11 @@ impl TicFormat {
         match self {
             TicFormat::BC1 | TicFormat::BC2 | TicFormat::BC3 => {
                 ((width + 3) / 4, (height + 3) / 4, self.src_bpp())
+            }
+            TicFormat::Astc(bw, bh) => {
+                let bw = *bw as u32;
+                let bh = *bh as u32;
+                ((width + bw - 1) / bw, (height + bh - 1) / bh, self.src_bpp())
             }
             _ => (width, height, self.src_bpp()),
         }
@@ -439,6 +460,28 @@ fn decode_bc3(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
     }
 }
 
+fn decode_astc(src: &[u8], width: u32, height: u32, bw: usize, bh: usize, out: &mut [u8]) {
+    let w = width as usize;
+    let h = height as usize;
+    let mut buf = vec![0u32; w * h];
+    if texture2ddecoder::decode_astc(src, w, h, bw, bh, &mut buf).is_err() {
+        for px in out.chunks_exact_mut(4) {
+            px[0] = 0xFF;
+            px[1] = 0x00;
+            px[2] = 0xFF;
+            px[3] = 0xFF;
+        }
+        return;
+    }
+    for (i, c) in buf.iter().enumerate() {
+        let o = i * 4;
+        out[o] = ((c >> 16) & 0xFF) as u8;
+        out[o + 1] = ((c >> 8) & 0xFF) as u8;
+        out[o + 2] = (c & 0xFF) as u8;
+        out[o + 3] = ((c >> 24) & 0xFF) as u8;
+    }
+}
+
 pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -> Vec<u8> {
     let pixels = (width as usize) * (height as usize);
     let mut out = vec![0u8; pixels * 4];
@@ -527,6 +570,7 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
         TicFormat::BC1 => decode_bc1(src, width, height, &mut out),
         TicFormat::BC2 => decode_bc2(src, width, height, &mut out),
         TicFormat::BC3 => decode_bc3(src, width, height, &mut out),
+        TicFormat::Astc(bw, bh) => decode_astc(src, width, height, bw as usize, bh as usize, &mut out),
         TicFormat::Unknown(_) => {
             for i in 0..pixels {
                 out[i * 4] = 0xFF;
