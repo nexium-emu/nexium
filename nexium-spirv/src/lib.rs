@@ -67,6 +67,10 @@ pub struct Emitter {
     block_labels: HashMap<BlockId, Word>,
     cond_merge: Option<Vec<u32>>,
     used_merge_blocks: std::collections::HashSet<Word>,
+    shared_merge_headers: HashMap<u32, Vec<u32>>,
+    header_merge_label: HashMap<u32, Word>,
+    synth_merge_blocks: HashMap<u32, Vec<(Word, u32)>>,
+    synth_phi_results: HashMap<(Word, ValueId), Word>,
     cbuf_bindings_used: u32,
     texs_ids_used: std::collections::BTreeSet<u32>,
     texture_slots: HashMap<u32, u32>,
@@ -203,6 +207,10 @@ impl Emitter {
             block_labels: HashMap::new(),
             cond_merge: None,
             used_merge_blocks: std::collections::HashSet::new(),
+            shared_merge_headers: HashMap::new(),
+            header_merge_label: HashMap::new(),
+            synth_merge_blocks: HashMap::new(),
+            synth_phi_results: HashMap::new(),
             cbuf_bindings_used: 0,
             texs_ids_used: std::collections::BTreeSet::new(),
             texture_slots: HashMap::new(),
@@ -1181,11 +1189,109 @@ impl Emitter {
         }
     }
 
+    fn compute_shared_merges(&mut self, cfg: &Cfg) {
+        let Some(ipd) = self.cond_merge.clone() else {
+            return;
+        };
+        let mut by_merge: std::collections::BTreeMap<u32, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for block in &cfg.blocks {
+            if let BranchKind::Conditional { target, .. } = block.branch {
+                let next = block.id + 1;
+                if self.block_labels.contains_key(&next) && target != next {
+                    let m = ipd[block.id as usize];
+                    by_merge.entry(m).or_default().push(block.id);
+                }
+            }
+        }
+        for (m, mut headers) in by_merge {
+            if headers.len() < 2 {
+                continue;
+            }
+            headers.sort_unstable();
+            let m_lbl = self.block_labels[&m];
+            self.header_merge_label.insert(headers[0], m_lbl);
+            let mut synths: Vec<(Word, u32)> = Vec::new();
+            for &h in &headers[1..] {
+                let s = self.b.id();
+                self.header_merge_label.insert(h, s);
+                synths.push((s, h));
+            }
+            synths.reverse();
+            self.synth_merge_blocks.insert(m, synths);
+            self.shared_merge_headers.insert(m, headers);
+        }
+    }
+
+    fn merge_redirect(&self, from_block: u32, to_block: u32) -> Word {
+        if let Some(headers) = self.shared_merge_headers.get(&to_block) {
+            if let Some(&h) = headers.iter().filter(|&&h| h <= from_block).max() {
+                return self.header_merge_label[&h];
+            }
+        }
+        self.block_labels[&to_block]
+    }
+
+    fn effective_phi_pred(&self, p: u32, x: u32) -> u32 {
+        let Some(ipd) = &self.cond_merge else {
+            return p;
+        };
+        let mut b = p;
+        let mut guard = 0usize;
+        while (b as usize) < ipd.len() && b != x && ipd[b as usize] != x && guard <= ipd.len() {
+            let nb = ipd[b as usize];
+            if nb == b {
+                break;
+            }
+            b = nb;
+            guard += 1;
+        }
+        b
+    }
+
+    fn emit_synth_merge_blocks(&mut self, m_block: &BasicBlock) {
+        let m = m_block.id;
+        let Some(synths) = self.synth_merge_blocks.get(&m).cloned() else {
+            return;
+        };
+        let m_lbl = self.block_labels[&m];
+        let phis: Vec<(ValueId, Vec<(BlockId, IrValue)>)> = m_block
+            .program
+            .instructions
+            .iter()
+            .filter_map(|inst| match &inst.op {
+                IrOp::Phi { sources } => inst.result.map(|rid| (rid, sources.clone())),
+                _ => None,
+            })
+            .collect();
+        for (s_i, _h_i) in synths {
+            self.b.begin_block(Some(s_i)).unwrap();
+            for (rid, sources) in &phis {
+                let mut pairs: Vec<(Word, Word)> = Vec::new();
+                for (pred, val) in sources {
+                    let b = self.effective_phi_pred(*pred, m);
+                    if self.merge_redirect(b, m) == s_i {
+                        let v = self.lower_value(val);
+                        let lbl = self.block_labels[&b];
+                        pairs.push((v, lbl));
+                    }
+                }
+                if pairs.is_empty() {
+                    continue;
+                }
+                let pid = self.b.phi(self.f32_t, None, pairs).unwrap();
+                self.synth_phi_results.insert((s_i, *rid), pid);
+            }
+            self.b.branch(m_lbl).unwrap();
+        }
+    }
+
     fn lower_cfg(&mut self, cfg: &Cfg) {
         let single_block = cfg.blocks.len() <= 1;
         for (idx, block) in cfg.blocks.iter().enumerate() {
             let is_first = idx == 0;
             if !is_first {
+                self.emit_synth_merge_blocks(block);
                 let label = self.block_labels[&block.id];
                 self.b.begin_block(Some(label)).unwrap();
             }
@@ -1203,16 +1309,41 @@ impl Emitter {
     }
 
     fn lower_phis(&mut self, block: &BasicBlock) {
+        let m = block.id;
+        let shared = self.shared_merge_headers.contains_key(&m);
         for inst in &block.program.instructions {
             let IrOp::Phi { sources } = &inst.op else {
                 continue;
             };
             let f32_t = self.f32_t;
             let mut pairs: Vec<(Word, Word)> = Vec::with_capacity(sources.len());
-            for (pred_id, val) in sources {
-                let v = self.lower_value(val);
-                let label = self.block_labels.get(pred_id).copied().unwrap_or(0);
-                pairs.push((v, label));
+            if shared {
+                let m_lbl = self.block_labels[&m];
+                for (pred_id, val) in sources {
+                    let b = self.effective_phi_pred(*pred_id, m);
+                    if self.merge_redirect(b, m) == m_lbl {
+                        let v = self.lower_value(val);
+                        let label = self.block_labels.get(&b).copied().unwrap_or(0);
+                        pairs.push((v, label));
+                    }
+                }
+                if let Some(rid) = inst.result {
+                    let synths = self.synth_merge_blocks.get(&m).cloned().unwrap_or_default();
+                    for (s_i, _h) in synths {
+                        let v = match self.synth_phi_results.get(&(s_i, rid)).copied() {
+                            Some(w) => w,
+                            None => self.f32_undef_id(),
+                        };
+                        pairs.push((v, s_i));
+                    }
+                }
+            } else {
+                for (pred_id, val) in sources {
+                    let b = self.effective_phi_pred(*pred_id, m);
+                    let v = self.lower_value(val);
+                    let label = self.block_labels.get(&b).copied().unwrap_or(0);
+                    pairs.push((v, label));
+                }
             }
             let id = self.b.phi(f32_t, None, pairs).unwrap();
             if let Some(rid) = inst.result {
@@ -1225,26 +1356,28 @@ impl Emitter {
         match block.branch {
             BranchKind::Exit => {}
             BranchKind::Unconditional { target } => {
-                let lbl = self.block_labels[&target];
+                let lbl = self.merge_redirect(block.id, target);
                 self.b.branch(lbl).unwrap();
             }
             BranchKind::Conditional { target, pred } => {
-                let true_lbl = self.block_labels[&target];
                 let next = block.id + 1;
-                if let Some(&false_lbl) = self.block_labels.get(&next) {
+                if self.block_labels.contains_key(&next) {
                     let cond = self.resolve_pred(pred.idx, pred.negate);
-                    let merge_id = match &self.cond_merge {
-                        Some(ipd) => ipd[block.id as usize],
-                        None => next,
-                    };
-                    let merge_lbl = self
-                        .block_labels
-                        .get(&merge_id)
-                        .copied()
-                        .unwrap_or(false_lbl);
+                    let true_lbl = self.merge_redirect(block.id, target);
+                    let false_lbl = self.merge_redirect(block.id, next);
                     if target == next {
                         self.b.branch(true_lbl).unwrap();
                     } else {
+                        let merge_lbl = match self.header_merge_label.get(&block.id).copied() {
+                            Some(l) => l,
+                            None => {
+                                let merge_id = match &self.cond_merge {
+                                    Some(ipd) => ipd[block.id as usize],
+                                    None => next,
+                                };
+                                self.block_labels.get(&merge_id).copied().unwrap_or(false_lbl)
+                            }
+                        };
                         assert!(
                             self.used_merge_blocks.insert(merge_lbl),
                             "nexium-spirv: shared selection merge block"
@@ -1257,12 +1390,14 @@ impl Emitter {
                             .unwrap();
                     }
                 } else {
+                    let true_lbl = self.block_labels[&target];
                     self.b.branch(true_lbl).unwrap();
                 }
             }
             BranchKind::FallThrough => {
                 let next = block.id + 1;
-                if let Some(&lbl) = self.block_labels.get(&next) {
+                if self.block_labels.contains_key(&next) {
+                    let lbl = self.merge_redirect(block.id, next);
                     self.b.branch(lbl).unwrap();
                 }
             }
@@ -1409,6 +1544,7 @@ impl Emitter {
         }
 
         self.cond_merge = structurizer_cond_merges(cfg);
+        self.compute_shared_merges(cfg);
         self.lower_cfg(cfg);
 
         match self.stage {
@@ -1608,8 +1744,80 @@ impl Emitter {
         let bindings = self.cbuf_bindings_used;
         let tex_ids: Vec<u32> = self.texs_ids_used.iter().copied().collect();
         let words = opt::dedup_constants(self.b.module().assemble());
+        if !phi_preds_consistent(&words) {
+            panic!("nexium-spirv: invalid phi predecessors");
+        }
         (words, bindings, tex_ids)
     }
+}
+
+fn phi_preds_consistent(words: &[u32]) -> bool {
+    use rspirv::spirv::Op;
+    let module = match rspirv::dr::load_words(words) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    for func in &module.functions {
+        let mut succ: HashMap<Word, Vec<Word>> = HashMap::new();
+        for block in &func.blocks {
+            let Some(label) = block.label.as_ref().and_then(|l| l.result_id) else {
+                continue;
+            };
+            let mut targets: Vec<Word> = Vec::new();
+            if let Some(term) = block.instructions.last() {
+                match term.class.opcode {
+                    Op::Branch => {
+                        if let Some(Operand::IdRef(t)) = term.operands.first() {
+                            targets.push(*t);
+                        }
+                    }
+                    Op::BranchConditional => {
+                        for op in term.operands.iter().skip(1).take(2) {
+                            if let Operand::IdRef(t) = op {
+                                targets.push(*t);
+                            }
+                        }
+                    }
+                    Op::Switch => {
+                        for op in term.operands.iter().skip(1) {
+                            if let Operand::IdRef(t) = op {
+                                targets.push(*t);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            succ.insert(label, targets);
+        }
+        let mut preds: HashMap<Word, std::collections::HashSet<Word>> = HashMap::new();
+        for (b, ts) in &succ {
+            for t in ts {
+                preds.entry(*t).or_default().insert(*b);
+            }
+        }
+        let empty = std::collections::HashSet::new();
+        for block in &func.blocks {
+            let Some(label) = block.label.as_ref().and_then(|l| l.result_id) else {
+                continue;
+            };
+            let bpreds = preds.get(&label).unwrap_or(&empty);
+            for inst in &block.instructions {
+                if inst.class.opcode == Op::Phi {
+                    let mut i = 1;
+                    while i < inst.operands.len() {
+                        if let Operand::IdRef(parent) = inst.operands[i] {
+                            if !bpreds.contains(&parent) {
+                                return false;
+                            }
+                        }
+                        i += 2;
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 fn intersect_pdom(mut a: u32, mut b: u32, ipdom: &[u32]) -> u32 {
