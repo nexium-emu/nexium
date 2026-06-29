@@ -83,7 +83,6 @@ pub fn enqueue_draws(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) {
-    maybe_timed_loop_wrap();
     for draw in draws {
         if draw.draw_texture.is_some() {
             flush_accum(batch, renderer, mappings, mem_read);
@@ -627,35 +626,6 @@ fn shader_failed_set(
     })
 }
 
-fn maybe_timed_loop_wrap() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::OnceLock;
-    static DONE: AtomicBool = AtomicBool::new(false);
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    if DONE.load(Ordering::Relaxed) {
-        return;
-    }
-    let after_s: u64 = std::env::var("NEXIUM_LOOP_WRAP_AFTER_S")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if after_s == 0 {
-        return;
-    }
-    let start = START.get_or_init(std::time::Instant::now);
-    if start.elapsed().as_secs() >= after_s && !DONE.swap(true, Ordering::Relaxed) {
-        nexium_spirv::enable_loop_wrap_runtime();
-        let mut g = shader_failed_set().lock().unwrap();
-        let n = g.len();
-        g.clear();
-        drop(g);
-        log::warn!(
-            "[loop-wrap] runtime-enabled after {}s; cleared {} cached-failed shaders for re-emit",
-            after_s,
-            n
-        );
-    }
-}
 
 fn depth_disabled() -> bool {
     use std::sync::OnceLock;

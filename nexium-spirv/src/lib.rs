@@ -32,17 +32,6 @@ const MAX_TEXTURE_DESCRIPTORS: u32 = 32;
 const SSBO_BINDING_BASE: u32 = 3;
 pub const MAX_SSBO: u32 = 8;
 
-static LOOP_WRAP_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn enable_loop_wrap_runtime() {
-    LOOP_WRAP_RUNTIME.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn loop_wrap_enabled() -> bool {
-    std::env::var_os("NEXIUM_LOOP_WRAP").is_some()
-        || LOOP_WRAP_RUNTIME.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 pub struct Emitter {
     b: rspirv::dr::Builder,
     stage: Stage,
@@ -97,8 +86,7 @@ pub struct Emitter {
     ubo_vec4s: u32,
     ssbo_vars: Vec<Option<Word>>,
     ptr_storage_u32: Option<Word>,
-    loop_merge_label: Option<Word>,
-    discard_flag_var: Option<Word>,
+    return_block: Option<Word>,
 }
 
 #[derive(Clone, Copy)]
@@ -241,8 +229,7 @@ impl Emitter {
             ubo_vec4s,
             ssbo_vars: vec![None; MAX_SSBO as usize],
             ptr_storage_u32: None,
-            loop_merge_label: None,
-            discard_flag_var: None,
+            return_block: None,
         }
     }
 
@@ -1467,13 +1454,6 @@ impl Emitter {
                     self.bool_true
                 };
 
-                if let Some(flag) = self.discard_flag_var {
-                    let cur = self.b.load(self.bool_t, None, flag, None, []).unwrap();
-                    let acc = self.b.logical_or(self.bool_t, None, cond, cur).unwrap();
-                    self.b.store(flag, acc, None, []).unwrap();
-                    return;
-                }
-
                 let kill_block = self.b.id();
                 let merge_block = self.b.id();
                 self.b
@@ -1580,7 +1560,7 @@ impl Emitter {
         let single_block = cfg.blocks.len() <= 1;
         for (idx, block) in cfg.blocks.iter().enumerate() {
             let is_first = idx == 0;
-            if !is_first || self.loop_merge_label.is_some() {
+            if !is_first {
                 self.emit_synth_merge_blocks(block);
                 let label = self.block_labels[&block.id];
                 self.b.begin_block(Some(label)).unwrap();
@@ -1643,7 +1623,7 @@ impl Emitter {
     fn emit_terminator(&mut self, block: &BasicBlock) {
         match block.branch {
             BranchKind::Exit => {
-                if let Some(lm) = self.loop_merge_label {
+                if let Some(rb) = self.return_block {
                     if matches!(self.stage, Stage::Fragment) {
                         let f0 = self.f32_zero;
                         let f1 = self.f32_one;
@@ -1664,7 +1644,7 @@ impl Emitter {
                         let fc = self.frag_color_var_id();
                         self.b.store(fc, v, None, []).unwrap();
                     }
-                    self.b.branch(lm).unwrap();
+                    self.b.branch(rb).unwrap();
                 }
             }
             BranchKind::Unconditional { target } => {
@@ -1687,7 +1667,11 @@ impl Emitter {
                                     Some(ipd) => ipd[block.id as usize],
                                     None => next,
                                 };
-                                self.block_labels.get(&merge_id).copied().unwrap_or(false_lbl)
+                                self.block_labels
+                                    .get(&merge_id)
+                                    .copied()
+                                    .or(self.return_block)
+                                    .unwrap_or(false_lbl)
                             }
                         };
                         assert!(
@@ -1711,8 +1695,8 @@ impl Emitter {
                 if self.block_labels.contains_key(&next) {
                     let lbl = self.merge_redirect(block.id, next);
                     self.b.branch(lbl).unwrap();
-                } else if let Some(lm) = self.loop_merge_label {
-                    self.b.branch(lm).unwrap();
+                } else if let Some(rb) = self.return_block {
+                    self.b.branch(rb).unwrap();
                 }
             }
         }
@@ -1849,10 +1833,9 @@ impl Emitter {
             }
         }
 
-        let needs_wrap = loop_wrap_enabled()
-            && cfg.blocks.iter().enumerate().any(|(i, b)| {
-                matches!(b.branch, BranchKind::Exit) && i + 1 != cfg.blocks.len()
-            });
+        let multi_exit = cfg.blocks.iter().enumerate().any(|(i, b)| {
+            matches!(b.branch, BranchKind::Exit) && i + 1 != cfg.blocks.len()
+        });
 
         let void_t = self.b.type_void();
         let main_t = self.b.type_function(void_t, vec![]);
@@ -1861,46 +1844,20 @@ impl Emitter {
             .begin_function(void_t, None, FunctionControl::NONE, main_t)
             .unwrap();
 
-        let loop_ids: Option<(Word, Word, Word)> = if needs_wrap {
-            let header = self.b.id();
-            let cont = self.b.id();
-            let merge = self.b.id();
-            self.loop_merge_label = Some(cont);
-            let entry = self.b.id();
-            self.b.begin_block(Some(entry)).unwrap();
-            if matches!(self.stage, Stage::Fragment) {
-                let ptr_fb = self.b.type_pointer(None, StorageClass::Function, self.bool_t);
-                let flag =
-                    self.b
-                        .variable(ptr_fb, None, StorageClass::Function, Some(self.bool_false));
-                self.discard_flag_var = Some(flag);
-            }
-            self.emit_entry_inits(&required_outputs, ps_inject);
-            self.b.branch(header).unwrap();
-            self.b.begin_block(Some(header)).unwrap();
-            self.b
-                .loop_merge(merge, cont, rspirv::spirv::LoopControl::NONE, [])
-                .unwrap();
-            let b0 = self.block_labels[&cfg.blocks[0].id];
-            self.b.branch(b0).unwrap();
-            Some((header, cont, merge))
-        } else {
-            let entry_label = cfg.blocks.first().map(|b| self.block_labels[&b.id]);
-            self.b.begin_block(entry_label).unwrap();
-            self.emit_entry_inits(&required_outputs, ps_inject);
-            None
-        };
+        if multi_exit && std::env::var_os("NEXIUM_STRUCT_EXIT").is_some() {
+            self.return_block = Some(self.b.id());
+        }
+
+        let entry_label = cfg.blocks.first().map(|b| self.block_labels[&b.id]);
+        self.b.begin_block(entry_label).unwrap();
+        self.emit_entry_inits(&required_outputs, ps_inject);
 
         self.cond_merge = structurizer_cond_merges(cfg);
         self.compute_shared_merges(cfg);
         self.lower_cfg(cfg);
 
-        if let Some((header, cont, merge)) = loop_ids {
-            self.b.begin_block(Some(cont)).unwrap();
-            self.b
-                .branch_conditional(self.bool_false, header, merge, [])
-                .unwrap();
-            self.b.begin_block(Some(merge)).unwrap();
+        if let Some(rb) = self.return_block {
+            self.b.begin_block(Some(rb)).unwrap();
         }
 
         match self.stage {
@@ -2008,7 +1965,7 @@ impl Emitter {
                 self.b.store(pos, new_pos, None, []).unwrap();
             }
             Stage::Fragment => {
-                if self.loop_merge_label.is_none() {
+                if self.return_block.is_none() {
                 let degenerate = cfg.blocks.is_empty()
                     || cfg.blocks.iter().all(|b| b.program.instructions.is_empty());
                 if degenerate {
@@ -2085,18 +2042,6 @@ impl Emitter {
             }
         }
 
-        if let Some(flag) = self.discard_flag_var {
-            let f = self.b.load(self.bool_t, None, flag, None, []).unwrap();
-            let kb = self.b.id();
-            let km = self.b.id();
-            self.b
-                .selection_merge(km, rspirv::spirv::SelectionControl::NONE)
-                .unwrap();
-            self.b.branch_conditional(f, kb, km, []).unwrap();
-            self.b.begin_block(Some(kb)).unwrap();
-            self.b.kill().unwrap();
-            self.b.begin_block(Some(km)).unwrap();
-        }
         self.b.ret().unwrap();
         self.b.end_function().unwrap();
 
@@ -2133,7 +2078,7 @@ impl Emitter {
             }
             let dir = std::path::PathBuf::from(dir);
             let _ = std::fs::create_dir_all(&dir);
-            let path = dir.join(format!("{}_{:016x}_wrap{}.spv", stage, h, needs_wrap as u8));
+            let path = dir.join(format!("{}_{:016x}_me{}.spv", stage, h, multi_exit as u8));
             if let Ok(mut f) = std::fs::File::create(&path) {
                 let mut bytes = Vec::with_capacity(words.len() * 4);
                 for w in &words {
@@ -2306,27 +2251,32 @@ fn structurizer_cond_merges(cfg: &Cfg) -> Option<Vec<u32>> {
     if n <= 1 {
         return None;
     }
-    let mut exit_count = 0usize;
-    let mut exit_idx = 0usize;
     for (i, b) in cfg.blocks.iter().enumerate() {
-        if matches!(b.branch, BranchKind::Exit) {
-            exit_count += 1;
-            exit_idx = i;
-        }
         for s in cfg.successors(b.id) {
             if (s as usize) <= i {
                 return None; // back-edge => loop, unsupported here
             }
         }
     }
-    if exit_count != 1 || exit_idx != n - 1 {
-        return None;
-    }
-    let mut ipdom = vec![u32::MAX; n];
-    ipdom[n - 1] = (n - 1) as u32;
-    for b in (0..n - 1).rev() {
+    // Virtual exit node at index n: every Exit block post-dominates to it, so a
+    // conditional whose branches all exit reconverges at the virtual exit, which
+    // the emitter maps to the single shared return block. This handles multi-exit
+    // / early-return shaders (matching yuzu's single-OpReturn structurization)
+    // while leaving single-exit shaders byte-identical (they reconverge at the
+    // real exit block before reaching the virtual exit).
+    let virt = n as u32;
+    let succ = |i: usize| -> Vec<u32> {
+        if matches!(cfg.blocks[i].branch, BranchKind::Exit) {
+            vec![virt]
+        } else {
+            cfg.successors(cfg.blocks[i].id)
+        }
+    };
+    let mut ipdom = vec![u32::MAX; n + 1];
+    ipdom[n] = virt;
+    for b in (0..n).rev() {
         let mut idom = u32::MAX;
-        for s in cfg.successors(b as u32) {
+        for s in succ(b) {
             if ipdom[s as usize] == u32::MAX {
                 return None;
             }
