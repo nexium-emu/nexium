@@ -576,6 +576,16 @@ impl Nvdrv {
                 } else {
                     0x1000
                 };
+                let flags = if req.in_data.len() >= 12 {
+                    u32::from_le_bytes([
+                        req.in_data[8],
+                        req.in_data[9],
+                        req.in_data[10],
+                        req.in_data[11],
+                    ])
+                } else {
+                    0
+                };
                 let total_size = (pages as u64) * (page_size as u64);
                 let offset_in: u64 = if req.in_data.len() >= 24 {
                     u64::from_le_bytes([
@@ -591,15 +601,22 @@ impl Nvdrv {
                 } else {
                     0
                 };
-                let alloc = if offset_in != 0 {
+                let alloc = if (flags & 0x1) != 0 && offset_in != 0 {
                     offset_in
                 } else {
-                    self.gpu.alloc_gpu_va(total_size.max(0x1000))
+                    self.gpu
+                        .alloc_gpu_va_aligned(total_size.max(0x1000), (page_size as u64).max(0x1000))
                 };
+                if out.len() >= 24 {
+                    out[0..4].copy_from_slice(&pages.to_le_bytes());
+                    out[4..8].copy_from_slice(&page_size.to_le_bytes());
+                }
                 log::debug!(
-                    "nvhost-as-gpu:AllocSpace pages={} page_size={:#x} → gpu_va={:#x}",
+                    "nvhost-as-gpu:AllocSpace pages={} page_size={:#x} flags={:#x} offset_in={:#x} → gpu_va={:#x}",
                     pages,
                     page_size,
+                    flags,
+                    offset_in,
                     alloc
                 );
                 if out.len() >= 24 {

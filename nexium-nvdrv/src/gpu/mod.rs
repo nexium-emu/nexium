@@ -164,6 +164,15 @@ impl GpuContext {
         va
     }
 
+    pub fn alloc_gpu_va_aligned(&self, size: u64, align: u64) -> u64 {
+        let align = align.max(0x1000);
+        let mut next = self.next_gpu_va.lock();
+        let va = (*next + (align - 1)) & !(align - 1);
+        let aligned_size = (size + (align - 1)) & !(align - 1);
+        *next = va + aligned_size;
+        va
+    }
+
     pub fn submit_gpfifo(
         &self,
         address: u64,
