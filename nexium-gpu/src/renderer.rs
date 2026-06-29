@@ -1141,6 +1141,25 @@ impl Renderer {
             ready_frame = Some((prev.width, prev.height, out));
         }
         let Some(slot_idx) = readback_slots.iter().position(|slot| !slot.in_flight) else {
+            if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static CT: AtomicU64 = AtomicU64::new(0);
+                let n = CT.fetch_add(1, Ordering::Relaxed);
+                if n % 120 == 0 {
+                    let statuses: Vec<String> = readback_slots
+                        .iter()
+                        .map(|s| match unsafe { device.get_fence_status(s.fence) } {
+                            Ok(true) => "sig".to_string(),
+                            Ok(false) => "unsig".to_string(),
+                            Err(e) => format!("err:{:?}", e),
+                        })
+                        .collect();
+                    log::warn!(
+                        "[readback-noslot #{}] all 4 in_flight, fences=[{}] key={}:{}x{}",
+                        n, statuses.join(","), key.nvmap_id, key.width, key.height
+                    );
+                }
+            }
             pending_readbacks.insert(key, keep_pending);
             return ready_frame;
         };
@@ -1252,9 +1271,24 @@ impl Renderer {
             );
         }
         img.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
-        if end_one_time(device, cmd).is_err()
-            || submit_with_fence(device, *queue, cmd, fence).is_err()
-        {
+        let end_res = end_one_time(device, cmd);
+        let sub_res = if end_res.is_ok() {
+            submit_with_fence(device, *queue, cmd, fence)
+        } else {
+            Ok(())
+        };
+        if end_res.is_err() || sub_res.is_err() {
+            if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static CT: AtomicU64 = AtomicU64::new(0);
+                let n = CT.fetch_add(1, Ordering::Relaxed);
+                if n % 120 == 0 {
+                    log::warn!(
+                        "[readback-submitfail #{}] end={:?} submit={:?} key={}:{}x{}",
+                        n, end_res, sub_res, key.nvmap_id, key.width, key.height
+                    );
+                }
+            }
             if !keep_pending.is_empty() {
                 pending_readbacks.insert(key, keep_pending);
             }
@@ -1816,6 +1850,7 @@ impl Renderer {
             .collect();
         let mut ssbo_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
         let mut ssbo_bindings: Vec<u32> = Vec::new();
+        let mut ssbo_provided = [false; crate::descriptor::MAX_SSBO as usize];
         for (idx, data) in &call.ssbo_data {
             if *idx >= crate::descriptor::MAX_SSBO || data.is_empty() {
                 continue;
@@ -1837,6 +1872,28 @@ impl Renderer {
                 range: sz,
             });
             ssbo_bindings.push(*idx);
+            ssbo_provided[*idx as usize] = true;
+        }
+        if ssbo_provided.iter().any(|p| !p) {
+            if ubo_ring.head + 16 > ubo_ring.size {
+                ubo_ring.head = 0;
+                ubo_ring.slot_head[other_idx] = 0;
+            }
+            let (dbuf, doff, dptr) = ring_alloc(ubo_ring, 16, 16)
+                .map_err(|e| format!("ring_alloc(ssbo-dummy): {}", e))?;
+            unsafe {
+                std::ptr::write_bytes(dptr, 0, 16);
+            }
+            for i in 0..crate::descriptor::MAX_SSBO {
+                if !ssbo_provided[i as usize] {
+                    ssbo_infos.push(vk::DescriptorBufferInfo {
+                        buffer: dbuf,
+                        offset: doff,
+                        range: 16,
+                    });
+                    ssbo_bindings.push(i);
+                }
+            }
         }
         let mut writes = vec![
             vk::WriteDescriptorSet {
@@ -2640,7 +2697,54 @@ impl Renderer {
                     image_layout: vk::ImageLayout::UNDEFINED,
                 })
                 .collect();
-            let writes = [
+            let mut ssbo_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+            let mut ssbo_bindings: Vec<u32> = Vec::new();
+            let mut ssbo_provided = [false; crate::descriptor::MAX_SSBO as usize];
+            for (idx, data) in &call.ssbo_data {
+                if *idx >= crate::descriptor::MAX_SSBO || data.is_empty() {
+                    continue;
+                }
+                let sz = data.len() as u64;
+                let sz_al = align_up(sz, 16);
+                if ubo_ring.head + sz_al > ubo_ring.size {
+                    ubo_ring.head = 0;
+                    ubo_ring.slot_head[other_idx] = 0;
+                }
+                let (sbuf, soff, sptr) = ring_alloc(ubo_ring, sz_al, 16)
+                    .map_err(|e| format!("ring_alloc(ssbo): {}", e))?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), sptr, data.len());
+                }
+                ssbo_infos.push(vk::DescriptorBufferInfo {
+                    buffer: sbuf,
+                    offset: soff,
+                    range: sz,
+                });
+                ssbo_bindings.push(*idx);
+                ssbo_provided[*idx as usize] = true;
+            }
+            if ssbo_provided.iter().any(|p| !p) {
+                if ubo_ring.head + 16 > ubo_ring.size {
+                    ubo_ring.head = 0;
+                    ubo_ring.slot_head[other_idx] = 0;
+                }
+                let (dbuf, doff, dptr) = ring_alloc(ubo_ring, 16, 16)
+                    .map_err(|e| format!("ring_alloc(ssbo-dummy): {}", e))?;
+                unsafe {
+                    std::ptr::write_bytes(dptr, 0, 16);
+                }
+                for i in 0..crate::descriptor::MAX_SSBO {
+                    if !ssbo_provided[i as usize] {
+                        ssbo_infos.push(vk::DescriptorBufferInfo {
+                            buffer: dbuf,
+                            offset: doff,
+                            range: 16,
+                        });
+                        ssbo_bindings.push(i);
+                    }
+                }
+            }
+            let mut writes = vec![
                 vk::WriteDescriptorSet {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                     dst_set: dset,
@@ -2681,6 +2785,21 @@ impl Renderer {
                     _marker: std::marker::PhantomData,
                 },
             ];
+            for (i, binding) in ssbo_bindings.iter().enumerate() {
+                writes.push(vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: dset,
+                    dst_binding: crate::descriptor::SSBO_BINDING_BASE + *binding,
+                    dst_array_element: 0,
+                    descriptor_count: 1,
+                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                    p_buffer_info: &ssbo_infos[i],
+                    p_image_info: std::ptr::null(),
+                    p_texel_buffer_view: std::ptr::null(),
+                    p_next: std::ptr::null(),
+                    _marker: std::marker::PhantomData,
+                });
+            }
             unsafe {
                 device.update_descriptor_sets(&writes, &[]);
             }

@@ -116,7 +116,37 @@ impl RtCache {
                 }
             }
         }
-        best.map(|(k, _)| k)
+        let res = best.map(|(k, _)| k);
+        if res.is_none() && std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NONE_CT: AtomicU64 = AtomicU64::new(0);
+            let n = NONE_CT.fetch_add(1, Ordering::Relaxed);
+            if n % 120 == 0 {
+                let mut keys: Vec<String> = self
+                    .cache
+                    .keys()
+                    .map(|k| {
+                        format!(
+                            "{}:{}x{}#{}",
+                            k.nvmap_id,
+                            k.width,
+                            k.height,
+                            self.drawn_stamp.get(k).copied().unwrap_or(0)
+                        )
+                    })
+                    .collect();
+                keys.sort();
+                log::warn!(
+                    "[present-none #{}] want={}:{}x{} cache=[{}]",
+                    n,
+                    want.nvmap_id,
+                    want.width,
+                    want.height,
+                    keys.join(" ")
+                );
+            }
+        }
+        res
     }
 
     pub fn debug_all(&self) -> Vec<(RtKey, u64)> {
