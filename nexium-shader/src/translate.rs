@@ -682,8 +682,15 @@ impl Translator {
             Opcode::TEXS | Opcode::TLDS | Opcode::TLD4S => {
                 let dest_a = reg_dest(raw);
                 let dest_b = ((raw >> 28) & 0xFF) as u8;
-                let u = self.read_reg(reg_a(raw));
-                let v = self.read_reg(reg_b(raw));
+                let ra = reg_a(raw);
+                let rb = reg_b(raw);
+                let array_2d =
+                    matches!(decoded.opcode, Opcode::TEXS) && matches!((raw >> 53) & 0xF, 7 | 8);
+                let (u, v) = if array_2d {
+                    (self.read_reg(ra.wrapping_add(1)), self.read_reg(rb))
+                } else {
+                    (self.read_reg(ra), self.read_reg(rb))
+                };
                 let tex_id = texs_tex_id(raw);
                 let swizzle = ((raw >> 50) & 0x7) as usize;
 
