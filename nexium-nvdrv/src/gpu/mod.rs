@@ -53,6 +53,27 @@ impl GpuMappings {
         });
     }
 
+    pub fn cpu_address_for_any32(&self, gpu_va: u64) -> Option<(u64, u64, u64)> {
+        let lo = gpu_va & 0xFFFF_FFFF;
+        let mut best: Option<&GpuMapping> = None;
+        for m in &self.mappings {
+            let mlo = m.gpu_va & 0xFFFF_FFFF;
+            if lo >= mlo && lo < mlo + m.size {
+                let better = match best {
+                    Some(b) => (m.gpu_va & 0xFFFF_FFFF) > (b.gpu_va & 0xFFFF_FFFF),
+                    None => true,
+                };
+                if better {
+                    best = Some(m);
+                }
+            }
+        }
+        best.map(|m| {
+            let off = lo - (m.gpu_va & 0xFFFF_FFFF);
+            (m.gpu_va, m.cpu_addr + off, m.size - off)
+        })
+    }
+
     pub fn bracket(&self, gpu_va: u64) -> String {
         let mut below: Option<&GpuMapping> = None;
         let mut above: Option<&GpuMapping> = None;

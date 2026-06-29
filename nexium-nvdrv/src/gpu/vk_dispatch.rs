@@ -1500,16 +1500,29 @@ fn execute_one(
                     let slack = (base - aligned) as usize;
                     if ssbo_dbg {
                         log::warn!(
-                            "[ssbo-map] vs={:#x} base={:#x} mapped={} {}",
+                            "[ssbo-map] vs={:#x} base={:#x} mapped={} any32={:x?} {}",
                             vs_addr, base,
                             mappings.cpu_address_for(aligned).is_some(),
+                            mappings.cpu_address_for_any32(aligned),
                             mappings.bracket(aligned)
                         );
                     }
                     if base != 0 {
-                        if let Some(buf_cpu) = mappings.cpu_address_for(aligned) {
+                        let (buf_cpu, remaining) = match mappings.cpu_range_for(aligned) {
+                            Some((cpu, rem)) => (Some(cpu), rem),
+                            None => match mappings.cpu_address_for_any32(aligned) {
+                                Some((_, cpu, rem)) => (Some(cpu), rem),
+                                None => (None, 0),
+                            },
+                        };
+                        if let Some(buf_cpu) = buf_cpu {
+                            let want = if size != 0 {
+                                (size as usize) + slack
+                            } else {
+                                0x40000
+                            };
                             let read_size =
-                                ((size as usize) + slack).clamp(16, 8 * 1024 * 1024);
+                                want.min(remaining as usize).clamp(16, 8 * 1024 * 1024);
                             let mut b = vec![0u8; read_size];
                             if mem_read(buf_cpu, &mut b) {
                                 bytes = b;
