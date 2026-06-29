@@ -520,6 +520,21 @@ fn submit_draw_batch_async(
                     snapshot_reads += 1;
                     snapshot_bytes += tic_raw.len();
                     if let Some(tic) = nexium_gpu::texture::TicEntry::parse(&tic_raw) {
+                        if std::env::var_os("NEXIUM_TEXTYPE_DBG").is_some() {
+                            use std::sync::{Mutex, OnceLock};
+                            static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> =
+                                OnceLock::new();
+                            let s = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+                            if let Ok(mut set) = s.lock() {
+                                if set.insert(tex_id) {
+                                    log::warn!(
+                                        "[textype] tic{} type={} depth={} norm={} {:?} {}x{} bl={}",
+                                        tex_id, tic.texture_type, tic.depth, tic.normalized_coords,
+                                        tic.format, tic.width, tic.height, tic.is_block_linear
+                                    );
+                                }
+                            }
+                        }
                         if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
                             tic_summ.push(format!(
                                 "tic{}={:?} {}x{} bl={} bh={} va={:#x}",

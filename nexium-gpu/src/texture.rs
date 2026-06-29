@@ -129,6 +129,9 @@ pub struct TicEntry {
     pub height: u32,
     pub block_height_log2: u32,
     pub is_block_linear: bool,
+    pub texture_type: u32,
+    pub depth: u32,
+    pub normalized_coords: bool,
 }
 
 impl TicEntry {
@@ -160,8 +163,11 @@ impl TicEntry {
         let block_height_log2 = if is_block_linear { (w3 >> 3) & 0x7 } else { 0 };
 
         let width = (w4 & 0xFFFF) + 1;
+        let texture_type = (w4 >> 23) & 0xF;
         let w5 = u32::from_le_bytes([raw[20], raw[21], raw[22], raw[23]]);
         let height = (w5 & 0xFFFF) + 1;
+        let depth = ((w5 >> 16) & 0x3FFF) + 1;
+        let normalized_coords = (w5 >> 31) & 1 != 0;
 
         if gpu_va == 0 || width == 0 || height == 0 || width > 16384 || height > 16384 {
             return None;
@@ -175,6 +181,9 @@ impl TicEntry {
             height,
             block_height_log2,
             is_block_linear,
+            texture_type,
+            depth,
+            normalized_coords,
         })
     }
 }
