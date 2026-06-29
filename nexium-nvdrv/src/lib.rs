@@ -118,6 +118,7 @@ pub struct NvmapHandle {
     pub size: u32,
     pub address: u64,
     pub kind: u32,
+    pub align: u32,
 }
 
 pub struct IoctlRequest {
@@ -300,6 +301,7 @@ impl Nvdrv {
                         size,
                         address: 0,
                         kind: 0,
+                        align: 0,
                     },
                 );
                 self.stats.nvmap_creates.fetch_add(1, Ordering::Relaxed);
@@ -345,11 +347,18 @@ impl Nvdrv {
                         req.in_data[30],
                         req.in_data[31],
                     ]);
+                    let align = u32::from_le_bytes([
+                        req.in_data[12],
+                        req.in_data[13],
+                        req.in_data[14],
+                        req.in_data[15],
+                    ]);
                     if let Some(h) = self.nvmap_handles.get_mut(&id) {
                         h.address = address;
+                        h.align = align;
                     }
                     self.stats.nvmap_allocs.fetch_add(1, Ordering::Relaxed);
-                    log::debug!("nvmap:Alloc id={} addr={:#x}", id, address);
+                    log::debug!("nvmap:Alloc id={} addr={:#x} align={:#x}", id, address, align);
                 }
             }
             0x0105 => {
@@ -706,7 +715,12 @@ impl Nvdrv {
                     let gpu_va = if (flags & 0x1) != 0 && requested_offset != 0 {
                         requested_offset
                     } else {
-                        self.gpu.alloc_gpu_va(mapping_size.max(0x10000))
+                        let big = self
+                            .nvmap_handles
+                            .get(&nvmap_id)
+                            .map(|h| h.align >= 0x10000)
+                            .unwrap_or(false);
+                        self.gpu.alloc_va(mapping_size.max(0x1000), big)
                     };
                     let cpu_addr = self
                         .nvmap_handles
@@ -727,12 +741,12 @@ impl Nvdrv {
                 }
             }
             0x4108 => {
-                let small_offset: u64 = 0x4_0000;
+                let small_offset: u64 = 0x0400_0000;
                 let small_page: u32 = 0x1000;
                 let small_pages: u64 = ((1u64 << 34) - small_offset) / small_page as u64;
                 let big_offset: u64 = 1u64 << 34;
                 let big_page: u32 = 0x10000;
-                let big_pages: u64 = ((1u64 << 38) - big_offset) / big_page as u64;
+                let big_pages: u64 = ((1u64 << 37) - big_offset) / big_page as u64;
                 if out.len() < 64 {
                     out.resize(64, 0);
                 }
@@ -749,7 +763,36 @@ impl Nvdrv {
                 );
             }
             0x4109 => {
-                log::debug!("nvhost-as-gpu:AllocAsEx (InitializeEx)");
+                let big_page_size = if req.in_data.len() >= 12 {
+                    u32::from_le_bytes([
+                        req.in_data[8],
+                        req.in_data[9],
+                        req.in_data[10],
+                        req.in_data[11],
+                    ])
+                } else {
+                    0
+                };
+                let va_start = if req.in_data.len() >= 24 {
+                    u64::from_le_bytes([
+                        req.in_data[16],
+                        req.in_data[17],
+                        req.in_data[18],
+                        req.in_data[19],
+                        req.in_data[20],
+                        req.in_data[21],
+                        req.in_data[22],
+                        req.in_data[23],
+                    ])
+                } else {
+                    0
+                };
+                log::warn!(
+                    "nvhost-as-gpu:AllocAsEx big_page_size={:#x} va_start={:#x} in_len={}",
+                    big_page_size,
+                    va_start,
+                    req.in_data.len()
+                );
             }
             0x4103 => {
                 if req.in_data.len() >= 16 {

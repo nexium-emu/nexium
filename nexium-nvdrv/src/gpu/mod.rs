@@ -124,7 +124,8 @@ pub struct GpuContext {
     pub fermi_2d: Arc<Mutex<Fermi2D>>,
     pub kepler_memory: Arc<Mutex<KeplerMemory>>,
     pub pusher: Arc<Mutex<Pusher>>,
-    pub next_gpu_va: Arc<Mutex<u64>>,
+    pub small_va_next: Arc<Mutex<u64>>,
+    pub big_va_next: Arc<Mutex<u64>>,
     pub channels: Arc<Mutex<HashMap<u32, ChannelState>>>,
     pub stats: Arc<super::PipelineStats>,
 }
@@ -150,23 +151,28 @@ impl GpuContext {
             fermi_2d: Arc::new(Mutex::new(Fermi2D::new())),
             kepler_memory: Arc::new(Mutex::new(KeplerMemory::new())),
             pusher: Arc::new(Mutex::new(Pusher::new())),
-            next_gpu_va: Arc::new(Mutex::new(0x1_0000_0000u64)),
+            small_va_next: Arc::new(Mutex::new(0x0400_0000u64)),
+            big_va_next: Arc::new(Mutex::new(0x4_0000_0000u64)),
             channels: Arc::new(Mutex::new(HashMap::new())),
             stats,
         }
     }
 
     pub fn alloc_gpu_va(&self, size: u64) -> u64 {
-        let mut next = self.next_gpu_va.lock();
-        let aligned_size = (size + 0xFFF) & !0xFFF;
-        let va = *next;
-        *next += aligned_size;
-        va
+        self.alloc_va(size, false)
     }
 
     pub fn alloc_gpu_va_aligned(&self, size: u64, align: u64) -> u64 {
-        let align = align.max(0x1000);
-        let mut next = self.next_gpu_va.lock();
+        self.alloc_va(size, align >= 0x10000)
+    }
+
+    pub fn alloc_va(&self, size: u64, big: bool) -> u64 {
+        let (cursor, align): (&Mutex<u64>, u64) = if big {
+            (&self.big_va_next, 0x10000)
+        } else {
+            (&self.small_va_next, 0x1000)
+        };
+        let mut next = cursor.lock();
         let va = (*next + (align - 1)) & !(align - 1);
         let aligned_size = (size + (align - 1)) & !(align - 1);
         *next = va + aligned_size;
