@@ -485,6 +485,7 @@ fn submit_draw_batch_async(
     let mut snapshot: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
     let mut snapshot_reads = 0usize;
     let mut snapshot_bytes = 0usize;
+    let mut tic_summ: Vec<String> = Vec::new();
     for call in batch {
         let stride = call
             .vertex_layout
@@ -519,6 +520,13 @@ fn submit_draw_batch_async(
                     snapshot_reads += 1;
                     snapshot_bytes += tic_raw.len();
                     if let Some(tic) = nexium_gpu::texture::TicEntry::parse(&tic_raw) {
+                        if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+                            tic_summ.push(format!(
+                                "tic{}={:?} {}x{} bl={} bh={} va={:#x}",
+                                tex_id, tic.format, tic.width, tic.height,
+                                tic.is_block_linear, tic.block_height_log2, tic.gpu_va
+                            ));
+                        }
                         let pitch = tic.format.linear_size(tic.width, tic.height);
                         let read_size = if tic.is_block_linear {
                             tic.format
@@ -552,13 +560,30 @@ fn submit_draw_batch_async(
     let snapshot_entries = snapshot.len();
     let calls = batch.to_vec();
     let r = renderer.clone();
+    let diag = std::env::var_os("NEXIUM_PRESENT_KEYS").is_some();
     rt.submit(Box::new(move || {
-        let _ = r.execute_draws(&calls, move |addr: u64, len: usize| {
+        let res = r.execute_draws(&calls, move |addr: u64, len: usize| {
             snapshot
                 .get(&addr)
                 .filter(|b| b.len() >= len)
                 .map(|b| b[..len].to_vec())
         });
+        if diag {
+            if let Err(e) = res {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static CT: AtomicU64 = AtomicU64::new(0);
+                let n = CT.fetch_add(1, Ordering::Relaxed);
+                if n < 6 {
+                    let c = &calls[0];
+                    log::warn!(
+                        "[draw-fail #{}] err={} n_calls={} rt={}:{}x{} vtx={} idx={:?} tex_ids={:?} tsc_ids={:?} cbuf_sz={} tics=[{}]",
+                        n, e, calls.len(), c.rt_key.nvmap_id, c.rt_key.width, c.rt_key.height,
+                        c.vertex_count, c.index_count, c.fs_tex_ids, c.fs_sampler_ids, c.cbuf_size,
+                        tic_summ.join(" | ")
+                    );
+                }
+            }
+        }
     }));
     if profile {
         log::warn!(

@@ -395,6 +395,7 @@ impl EmulationHandle {
 
                 let mut loop_iter: u64 = 0;
                 let mut last_loop_log = std::time::Instant::now();
+                let mut last_halts: u64 = 0;
                 loop {
                     loop_iter += 1;
                     let mut guard = boot_ctx.kernel.lock();
@@ -548,6 +549,23 @@ impl EmulationHandle {
                                 guard.log_thread_snapshot("render-idle-live");
                                 last_sync_snapshot = std::time::Instant::now();
                             }
+                            if halts.saturating_sub(last_halts) >= 3 {
+                                log::warn!(
+                                    "[spin-detected] watchdog halts +{} since last heartbeat (no-SVC spinner) pc={:#x} x0={:#x} x1={:#x}",
+                                    halts.saturating_sub(last_halts), cur_pc, x0, x1
+                                );
+                                let mut nm = [0u8; 64];
+                                if x1 != 0 && guard.address_space.read(x1, &mut nm).is_ok() {
+                                    let end = nm.iter().position(|&b| b == 0).unwrap_or(nm.len());
+                                    log::warn!("[spin-detected] *x1 ascii=\"{}\"", String::from_utf8_lossy(&nm[..end]));
+                                }
+                                if x0 != 0 && guard.address_space.read(x0, &mut nm).is_ok() {
+                                    let end = nm.iter().position(|&b| b == 0).unwrap_or(nm.len());
+                                    log::warn!("[spin-detected] *x0 ascii=\"{}\"", String::from_utf8_lossy(&nm[..end]));
+                                }
+                                guard.log_thread_snapshot("spin-detected");
+                            }
+                            last_halts = halts;
                             last_pipeline_stats = cur_stats;
 
                             nexium_core::kernel::profile::dump_heartbeat_with_kernel(&guard);
