@@ -1500,10 +1500,10 @@ fn execute_one(
                     let slack = (base - aligned) as usize;
                     if ssbo_dbg {
                         log::warn!(
-                            "[ssbo-map] vs={:#x} base={:#x} mapped={} near=[{}]",
+                            "[ssbo-map] vs={:#x} base={:#x} mapped={} {}",
                             vs_addr, base,
                             mappings.cpu_address_for(aligned).is_some(),
-                            mappings.describe_around(aligned)
+                            mappings.bracket(aligned)
                         );
                     }
                     if base != 0 {

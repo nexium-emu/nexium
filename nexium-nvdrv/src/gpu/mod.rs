@@ -1,4 +1,5 @@
 pub mod engines;
+pub mod flat_allocator;
 pub mod pusher;
 pub mod vk_dispatch;
 
@@ -50,6 +51,39 @@ impl GpuMappings {
             cpu_addr,
             nvmap_id,
         });
+    }
+
+    pub fn bracket(&self, gpu_va: u64) -> String {
+        let mut below: Option<&GpuMapping> = None;
+        let mut above: Option<&GpuMapping> = None;
+        for m in &self.mappings {
+            if m.gpu_va <= gpu_va {
+                if below.map_or(true, |b| m.gpu_va > b.gpu_va) {
+                    below = Some(m);
+                }
+            } else if above.map_or(true, |a| m.gpu_va < a.gpu_va) {
+                above = Some(m);
+            }
+        }
+        let f = |o: Option<&GpuMapping>| match o {
+            Some(m) => format!(
+                "{:#x}..{:#x}(nv{} cpu{:#x})",
+                m.gpu_va,
+                m.gpu_va + m.size,
+                m.nvmap_id,
+                m.cpu_addr
+            ),
+            None => "none".to_string(),
+        };
+        format!("below={} above={} total={}", f(below), f(above), self.mappings.len())
+    }
+
+    pub fn remove(&mut self, gpu_va: u64) -> Option<u64> {
+        if let Some(pos) = self.mappings.iter().rposition(|m| m.gpu_va == gpu_va) {
+            Some(self.mappings.remove(pos).size)
+        } else {
+            None
+        }
     }
 
     pub fn cpu_address_for(&self, gpu_va: u64) -> Option<u64> {
@@ -124,11 +158,13 @@ pub struct GpuContext {
     pub fermi_2d: Arc<Mutex<Fermi2D>>,
     pub kepler_memory: Arc<Mutex<KeplerMemory>>,
     pub pusher: Arc<Mutex<Pusher>>,
-    pub small_va_next: Arc<Mutex<u64>>,
-    pub big_va_next: Arc<Mutex<u64>>,
+    pub small_alloc: Arc<Mutex<flat_allocator::FlatAllocator>>,
+    pub big_alloc: Arc<Mutex<flat_allocator::FlatAllocator>>,
     pub channels: Arc<Mutex<HashMap<u32, ChannelState>>>,
     pub stats: Arc<super::PipelineStats>,
 }
+
+const BIG_VA_BASE: u64 = 0x4_0000_0000;
 
 #[derive(Default)]
 pub struct ChannelState {
@@ -151,8 +187,14 @@ impl GpuContext {
             fermi_2d: Arc::new(Mutex::new(Fermi2D::new())),
             kepler_memory: Arc::new(Mutex::new(KeplerMemory::new())),
             pusher: Arc::new(Mutex::new(Pusher::new())),
-            small_va_next: Arc::new(Mutex::new(0x0400_0000u64)),
-            big_va_next: Arc::new(Mutex::new(0x4_0000_0000u64)),
+            small_alloc: Arc::new(Mutex::new(flat_allocator::FlatAllocator::new(
+                0x0400_0000,
+                BIG_VA_BASE,
+            ))),
+            big_alloc: Arc::new(Mutex::new(flat_allocator::FlatAllocator::new(
+                BIG_VA_BASE,
+                1u64 << 37,
+            ))),
             channels: Arc::new(Mutex::new(HashMap::new())),
             stats,
         }
@@ -167,16 +209,35 @@ impl GpuContext {
     }
 
     pub fn alloc_va(&self, size: u64, big: bool) -> u64 {
-        let (cursor, align): (&Mutex<u64>, u64) = if big {
-            (&self.big_va_next, 0x10000)
+        let (alloc, page) = if big {
+            (&self.big_alloc, 0x10000u64)
         } else {
-            (&self.small_va_next, 0x1000)
+            (&self.small_alloc, 0x1000u64)
         };
-        let mut next = cursor.lock();
-        let va = (*next + (align - 1)) & !(align - 1);
-        let aligned_size = (size + (align - 1)) & !(align - 1);
-        *next = va + aligned_size;
-        va
+        let padded = (size + (page - 1)) & !(page - 1);
+        alloc.lock().allocate(padded)
+    }
+
+    pub fn alloc_va_fixed(&self, gpu_va: u64, size: u64) {
+        let (alloc, page) = if gpu_va >= BIG_VA_BASE {
+            (&self.big_alloc, 0x10000u64)
+        } else {
+            (&self.small_alloc, 0x1000u64)
+        };
+        let base = gpu_va & !(page - 1);
+        let padded = ((gpu_va - base) + size + (page - 1)) & !(page - 1);
+        alloc.lock().allocate_fixed(base, padded);
+    }
+
+    pub fn free_va(&self, gpu_va: u64, size: u64) {
+        let (alloc, page) = if gpu_va >= BIG_VA_BASE {
+            (&self.big_alloc, 0x10000u64)
+        } else {
+            (&self.small_alloc, 0x1000u64)
+        };
+        let base = gpu_va & !(page - 1);
+        let padded = ((gpu_va - base) + size + (page - 1)) & !(page - 1);
+        alloc.lock().free(base, padded);
     }
 
     pub fn submit_gpfifo(

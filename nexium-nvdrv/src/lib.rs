@@ -611,6 +611,7 @@ impl Nvdrv {
                     0
                 };
                 let alloc = if (flags & 0x1) != 0 && offset_in != 0 {
+                    self.gpu.alloc_va_fixed(offset_in, total_size.max(0x1000));
                     offset_in
                 } else {
                     self.gpu
@@ -644,6 +645,10 @@ impl Nvdrv {
                         req.in_data[6],
                         req.in_data[7],
                     ]);
+                    let removed = self.gpu.mappings.lock().remove(gpu_va);
+                    if let Some(size) = removed {
+                        self.gpu.free_va(gpu_va, size);
+                    }
                     log::debug!("nvhost-as-gpu:UnmapBuffer gpu_va={:#x}", gpu_va);
                 }
             }
@@ -713,6 +718,7 @@ impl Nvdrv {
                         mapping_size_in
                     };
                     let gpu_va = if (flags & 0x1) != 0 && requested_offset != 0 {
+                        self.gpu.alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
                         requested_offset
                     } else {
                         let big = self
@@ -806,7 +812,25 @@ impl Nvdrv {
                         req.in_data[6],
                         req.in_data[7],
                     ]);
-                    log::debug!("nvhost-as-gpu:FreeSpace gpu_va={:#x}", gpu_va);
+                    let pages = u32::from_le_bytes([
+                        req.in_data[8],
+                        req.in_data[9],
+                        req.in_data[10],
+                        req.in_data[11],
+                    ]);
+                    let page_size = u32::from_le_bytes([
+                        req.in_data[12],
+                        req.in_data[13],
+                        req.in_data[14],
+                        req.in_data[15],
+                    ]);
+                    let size = ((pages as u64) * (page_size as u64)).max(0x1000);
+                    self.gpu.free_va(gpu_va, size);
+                    log::debug!(
+                        "nvhost-as-gpu:FreeSpace gpu_va={:#x} size={:#x}",
+                        gpu_va,
+                        size
+                    );
                 }
             }
             0x4114 => {
@@ -856,6 +880,7 @@ impl Nvdrv {
                         i, num_entries, nvmap_handle, cpu_addr, gpu_va, size
                     );
                     if cpu_addr != 0 {
+                        self.gpu.alloc_va_fixed(gpu_va, size);
                         self.gpu
                             .mappings
                             .lock()
