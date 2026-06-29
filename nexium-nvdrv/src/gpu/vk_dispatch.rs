@@ -1455,22 +1455,57 @@ fn execute_one(
         &bundle.fs_cbuf_reads,
     );
 
+    let ssbo_dbg = std::env::var_os("NEXIUM_SSBO_DBG").is_some();
+    if ssbo_dbg && !bundle.ssbo_descs.is_empty() {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+        let s = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        if let Ok(mut set) = s.lock() {
+            if set.insert(vs_addr) {
+                let descs: Vec<String> = bundle
+                    .ssbo_descs
+                    .iter()
+                    .map(|d| format!("bind{}@{:#x}/al{}", d.cbuf_binding, d.cbuf_offset, d.align))
+                    .collect();
+                log::warn!(
+                    "[ssbo] vs={:#x} num_ssbo={} descs=[{}]",
+                    vs_addr, bundle.ssbo_descs.len(), descs.join(" ")
+                );
+            }
+        }
+    }
     let mut ssbo_data: Vec<(u32, Vec<u8>)> = Vec::new();
     for (idx, d) in bundle.ssbo_descs.iter().enumerate() {
         let mut bytes: Vec<u8> = vec![0u8; 16];
         let (cb_va, _cb_sz) = maxwell.regs.cbuf_binds[0][(d.cbuf_binding as usize).min(15)];
+        let mut dbg_base: u64 = 0;
+        let mut dbg_size: u32 = 0;
+        let mut dbg_readok = false;
         if cb_va != 0 {
             if let Some(desc_cpu) = mappings.cpu_address_for(cb_va.wrapping_add(d.cbuf_offset as u64))
             {
-                let mut desc = [0u8; 12];
+                let mut desc = [0u8; 16];
                 if mem_read(desc_cpu, &mut desc) {
+                    if ssbo_dbg {
+                        log::warn!("[ssbo-raw] vs={:#x} desc16={:02x?}", vs_addr, desc);
+                    }
                     let base_lo = u32::from_le_bytes([desc[0], desc[1], desc[2], desc[3]]) as u64;
                     let base_hi = u32::from_le_bytes([desc[4], desc[5], desc[6], desc[7]]) as u64;
                     let size = u32::from_le_bytes([desc[8], desc[9], desc[10], desc[11]]);
                     let base = (base_hi << 32) | base_lo;
+                    dbg_base = base;
+                    dbg_size = size;
                     let align = (d.align.max(1)) as u64;
                     let aligned = base & !(align - 1);
                     let slack = (base - aligned) as usize;
+                    if ssbo_dbg {
+                        log::warn!(
+                            "[ssbo-map] vs={:#x} base={:#x} mapped={} near=[{}]",
+                            vs_addr, base,
+                            mappings.cpu_address_for(aligned).is_some(),
+                            mappings.describe_around(aligned)
+                        );
+                    }
                     if base != 0 {
                         if let Some(buf_cpu) = mappings.cpu_address_for(aligned) {
                             let read_size =
@@ -1478,9 +1513,23 @@ fn execute_one(
                             let mut b = vec![0u8; read_size];
                             if mem_read(buf_cpu, &mut b) {
                                 bytes = b;
+                                dbg_readok = true;
                             }
                         }
                     }
+                }
+            }
+        }
+        if ssbo_dbg {
+            use std::sync::{Mutex, OnceLock};
+            static SEEN: OnceLock<Mutex<std::collections::HashSet<(u64, u32)>>> = OnceLock::new();
+            let s = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+            if let Ok(mut set) = s.lock() {
+                if set.insert((vs_addr, idx as u32)) {
+                    log::warn!(
+                        "[ssbo] vs={:#x} ssbo[{}] cb_va={:#x} base={:#x} size={:#x} read_ok={} bytes={}",
+                        vs_addr, idx, cb_va, dbg_base, dbg_size, dbg_readok, bytes.len()
+                    );
                 }
             }
         }
