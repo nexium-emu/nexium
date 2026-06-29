@@ -452,10 +452,27 @@ impl Pusher {
         } else {
             if bound_class == 0xB1C0 {
                 use std::sync::atomic::{AtomicU64, Ordering as O2};
+                use std::sync::{Mutex, OnceLock};
                 static COMPUTE_METHODS: AtomicU64 = AtomicU64::new(0);
                 let n = COMPUTE_METHODS.fetch_add(1, O2::Relaxed) + 1;
-                if n <= 3 || n % 2000 == 0 {
-                    log::warn!("[compute] 0xb1c0 method={:#x} count={} (dropped)", method, n);
+                if method == 0xAF {
+                    log::warn!("[compute] LAUNCH (0xAF) arg={:#x} count={}", arg, n);
+                }
+                if std::env::var_os("NEXIUM_COMPUTE_DBG").is_some() {
+                    static METHS: OnceLock<Mutex<std::collections::BTreeMap<u32, u64>>> =
+                        OnceLock::new();
+                    let m = METHS.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+                    if let Ok(mut map) = m.lock() {
+                        *map.entry(method).or_insert(0) += 1;
+                        if n % 10000 == 0 {
+                            let s: Vec<String> =
+                                map.iter().map(|(k, v)| format!("{:#x}:{}", k, v)).collect();
+                            log::warn!("[compute-methods] n={} distinct={} [{}]", n, map.len(), s.join(" "));
+                        }
+                    }
+                    if n <= 90 {
+                        log::warn!("[compute-seq] #{} method={:#x} arg={:#x}", n, method, arg);
+                    }
                 }
             }
             if bound_class != 0 {
