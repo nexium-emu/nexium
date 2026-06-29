@@ -1844,7 +1844,7 @@ impl Emitter {
             .begin_function(void_t, None, FunctionControl::NONE, main_t)
             .unwrap();
 
-        if multi_exit && std::env::var_os("NEXIUM_STRUCT_EXIT").is_some() {
+        if multi_exit && std::env::var_os("NEXIUM_NO_STRUCT_EXIT").is_none() {
             self.return_block = Some(self.b.id());
         }
 
