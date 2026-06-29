@@ -32,6 +32,17 @@ const MAX_TEXTURE_DESCRIPTORS: u32 = 32;
 const SSBO_BINDING_BASE: u32 = 3;
 pub const MAX_SSBO: u32 = 8;
 
+static LOOP_WRAP_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn enable_loop_wrap_runtime() {
+    LOOP_WRAP_RUNTIME.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn loop_wrap_enabled() -> bool {
+    std::env::var_os("NEXIUM_LOOP_WRAP").is_some()
+        || LOOP_WRAP_RUNTIME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Emitter {
     b: rspirv::dr::Builder,
     stage: Stage,
@@ -1838,7 +1849,7 @@ impl Emitter {
             }
         }
 
-        let needs_wrap = std::env::var_os("NEXIUM_LOOP_WRAP").is_some()
+        let needs_wrap = loop_wrap_enabled()
             && cfg.blocks.iter().enumerate().any(|(i, b)| {
                 matches!(b.branch, BranchKind::Exit) && i + 1 != cfg.blocks.len()
             });
