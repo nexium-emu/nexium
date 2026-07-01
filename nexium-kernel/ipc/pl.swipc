@@ -9,8 +9,6 @@ service pl:u, pl:s as pl {
     [2] GetSize(u32 font_type) -> u64;
     [3] GetSharedFontInOrderOfPriority_Offset(u32 font_type) -> u64;
     [4] GetSharedMemoryNativeHandle() -> out_handle;
-    # NOTE [5] writes 3x MapAlias Out u32 buffers (types/offsets/sizes); ignored.
-    [5] GetSharedFontInOrderOfPriority(u64 language_code) -> u64;
-    # NOTE [6] same buffer signature as [5]; ignored.
-    [6] GetSharedFontInOrderOfPriorityForSystem(u64 language_code) -> u64;
+    [5] GetSharedFontInOrderOfPriority(u64 language_code, out_buffer font_codes, out_buffer font_offsets, out_buffer font_sizes) -> bytes(8);
+    [6] GetSharedFontInOrderOfPriorityForSystem(u64 language_code, out_buffer font_codes, out_buffer font_offsets, out_buffer font_sizes) -> bytes(8);
 }
