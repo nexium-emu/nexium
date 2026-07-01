@@ -28,9 +28,10 @@ pub struct PipelineKey {
     pub depth_state_packed: u32,
     pub depth_clamp_enabled: bool,
     pub poly_offset_packed: u64,
+    pub color_write_mask: u32,
 }
 
-const SPEC_VERSION: u32 = 7;
+const SPEC_VERSION: u32 = 8;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineSpec {
@@ -44,6 +45,7 @@ pub struct PipelineSpec {
     pub depth_format: i32,
     pub has_depth: bool,
     pub blend: (bool, i32, i32, i32, i32, i32, i32),
+    pub color_write_mask: u32,
     pub depth: (bool, bool, i32),
     pub depth_clamp_enabled: bool,
     pub cull_test_enable: bool,
@@ -115,6 +117,7 @@ pub fn spec_to_request(
             src_alpha_factor: vk::BlendFactor::from_raw(spec.blend.4),
             dst_alpha_factor: vk::BlendFactor::from_raw(spec.blend.5),
             alpha_op: vk::BlendOp::from_raw(spec.blend.6),
+            color_write_mask: vk::ColorComponentFlags::from_raw(spec.color_write_mask),
         },
         depth: crate::draw::DepthState {
             test_enabled: spec.depth.0,
@@ -293,7 +296,7 @@ pub fn build_graphics_pipeline(
         src_alpha_blend_factor: req.blend.src_alpha_factor,
         dst_alpha_blend_factor: req.blend.dst_alpha_factor,
         alpha_blend_op: req.blend.alpha_op,
-        color_write_mask: vk::ColorComponentFlags::RGBA,
+        color_write_mask: req.blend.color_write_mask,
     };
     let cb_state = vk::PipelineColorBlendStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,

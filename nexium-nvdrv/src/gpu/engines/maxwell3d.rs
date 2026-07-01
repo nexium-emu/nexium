@@ -194,6 +194,8 @@ pub struct Maxwell3DRegisters {
     pub blend_pt_eq_alpha: [u32; 8],
     pub blend_pt_src_alpha: [u32; 8],
     pub blend_pt_dst_alpha: [u32; 8],
+    pub color_mask_common: bool,
+    pub color_masks: [u32; 8],
     pub draw_count: u64,
     pub clear_count: u64,
 
@@ -234,6 +236,8 @@ pub struct Maxwell3DRegisters {
 
     pub cbuf_binds: [[(u64, u32); 16]; 5],
     pub tex_cb_index: u32,
+    pub sampler_binding: u32,
+    pub bindless_texture_const_buffer_slot: u32,
 }
 
 impl Default for Maxwell3DRegisters {
@@ -291,6 +295,8 @@ impl Default for Maxwell3DRegisters {
             blend_pt_eq_alpha: [0x8006; 8],
             blend_pt_src_alpha: [0x4001; 8],
             blend_pt_dst_alpha: [0x4000; 8],
+            color_mask_common: false,
+            color_masks: [0x1111; 8],
             draw_count: 0,
             clear_count: 0,
             tic_pool_va_lo: 0,
@@ -324,6 +330,8 @@ impl Default for Maxwell3DRegisters {
             last_constbuf_size: 0,
             cbuf_binds: [[(0, 0); 16]; 5],
             tex_cb_index: 0,
+            sampler_binding: 0,
+            bindless_texture_const_buffer_slot: 0,
         }
     }
 }
@@ -458,6 +466,11 @@ impl Maxwell3D {
     }
 
     pub fn dispatch_method(&mut self, method: u32, arg: u32, is_last: bool) {
+        if matches!(method, 0x1234 | 0x2608) {
+            self.write_register(method, arg);
+            return;
+        }
+
         if method >= super::MACRO_REGISTERS_START {
             if self.macro_invocations < 24 {
                 log::info!(
@@ -845,6 +858,8 @@ impl Maxwell3D {
                 }
             }
             0x982 => self.regs.tex_cb_index = arg & 0x1F,
+            0x1234 => self.regs.sampler_binding = arg,
+            0x2608 => self.regs.bindless_texture_const_buffer_slot = arg & 0x1F,
             0x645 => self.regs.cull_test_enable = (arg & 1) != 0,
             0x646 => self.regs.cull_face = arg,
             0x647 => self.regs.front_face = arg,
@@ -870,6 +885,13 @@ impl Maxwell3D {
             0x4D4 => self.regs.blend_src_alpha = arg,
             0x4D6 => self.regs.blend_dst_alpha = arg,
             0x4B9 => self.regs.blend_per_target_enabled = (arg & 1) != 0,
+            0x3E4 => self.regs.color_mask_common = (arg & 1) != 0,
+            0x680..=0x687 => {
+                let rt = (method - 0x680) as usize;
+                if rt < 8 {
+                    self.regs.color_masks[rt] = arg;
+                }
+            }
             0x4D8..=0x4DF => {
                 let rt = (method - 0x4D8) as usize;
                 if rt < 8 {

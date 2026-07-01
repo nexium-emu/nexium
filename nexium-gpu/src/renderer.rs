@@ -1340,7 +1340,8 @@ impl Renderer {
             | ((blend.op.as_raw() as u64 & 0xFF) << 24)
             | ((blend.src_alpha_factor.as_raw() as u64 & 0xFF) << 32)
             | ((blend.dst_alpha_factor.as_raw() as u64 & 0xFF) << 40)
-            | ((blend.alpha_op.as_raw() as u64 & 0xFF) << 48);
+            | ((blend.alpha_op.as_raw() as u64 & 0xFF) << 48)
+            | ((blend.color_write_mask.as_raw() as u64 & 0xF) << 56);
         let raster_state_packed: u32 =
             (cull_test_enable as u32) | ((cull_face & 0xFF) << 8) | ((front_face & 0xFF) << 16);
         let has_depth = depth_format != vk::Format::UNDEFINED;
@@ -1365,6 +1366,7 @@ impl Renderer {
             depth_state_packed,
             depth_clamp_enabled,
             poly_offset_packed,
+            color_write_mask: blend.color_write_mask.as_raw(),
         };
         let depth_clip_control_enabled = inner.depth_clip_control_enabled;
         let RendererInner {
@@ -1451,6 +1453,7 @@ impl Renderer {
                 blend.dst_alpha_factor.as_raw(),
                 blend.alpha_op.as_raw(),
             ),
+            color_write_mask: blend.color_write_mask.as_raw(),
             depth: (
                 depth.test_enabled,
                 depth.write_enabled,

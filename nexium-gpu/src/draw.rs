@@ -61,6 +61,7 @@ pub struct BlendState {
     pub src_alpha_factor: vk::BlendFactor,
     pub dst_alpha_factor: vk::BlendFactor,
     pub alpha_op: vk::BlendOp,
+    pub color_write_mask: vk::ColorComponentFlags,
 }
 
 #[derive(Clone, Copy, Debug)]

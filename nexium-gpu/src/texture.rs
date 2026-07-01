@@ -8,6 +8,7 @@ pub enum TicFormat {
     R8,
     R8G8,
     R16,
+    R16G16,
     BC1,
     BC2,
     BC3,
@@ -50,6 +51,7 @@ impl TicFormat {
             0x09 => TicFormat::R5G6B5,
             0x0A => TicFormat::A1R5G5B5,
             0x0B => TicFormat::A4R4G4B4,
+            0x0C => TicFormat::R16G16,
             0x12 => TicFormat::R16,
             0x1B => TicFormat::R16,
             0x1C => TicFormat::R8G8,
@@ -84,6 +86,7 @@ impl TicFormat {
             TicFormat::A8B8G8R8 | TicFormat::R8G8B8A8 => 4,
             TicFormat::R5G6B5 | TicFormat::A1R5G5B5 | TicFormat::A4R4G4B4 => 2,
             TicFormat::R16 | TicFormat::R8G8 => 2,
+            TicFormat::R16G16 => 4,
             TicFormat::R8 => 1,
             TicFormat::BC1 | TicFormat::BC4 => 8,
             TicFormat::BC2 | TicFormat::BC3 | TicFormat::BC5 | TicFormat::BC7 => 16,
@@ -639,6 +642,16 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
                 out[i * 4] = v;
                 out[i * 4 + 1] = v;
                 out[i * 4 + 2] = v;
+                out[i * 4 + 3] = 0xFF;
+            }
+        }
+        TicFormat::R16G16 => {
+            for i in 0..pixels.min(src.len() / 4) {
+                let r = src[i * 4 + 1];
+                let g = src[i * 4 + 3];
+                out[i * 4] = r;
+                out[i * 4 + 1] = g;
+                out[i * 4 + 2] = 0;
                 out[i * 4 + 3] = 0xFF;
             }
         }

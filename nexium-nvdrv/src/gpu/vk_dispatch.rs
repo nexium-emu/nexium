@@ -69,7 +69,15 @@ fn collect_cbuf_reads(cfg: &nexium_shader::Cfg, stage_base: u32) -> Vec<(u32, u3
 fn tic_can_alias_render_target(format: nexium_gpu::texture::TicFormat) -> bool {
     matches!(
         format,
-        nexium_gpu::texture::TicFormat::A8B8G8R8 | nexium_gpu::texture::TicFormat::R8G8B8A8
+        nexium_gpu::texture::TicFormat::A8B8G8R8
+            | nexium_gpu::texture::TicFormat::R8G8B8A8
+            | nexium_gpu::texture::TicFormat::R5G6B5
+            | nexium_gpu::texture::TicFormat::A1R5G5B5
+            | nexium_gpu::texture::TicFormat::A4R4G4B4
+            | nexium_gpu::texture::TicFormat::R8
+            | nexium_gpu::texture::TicFormat::R8G8
+            | nexium_gpu::texture::TicFormat::R16
+            | nexium_gpu::texture::TicFormat::R16G16
     )
 }
 
@@ -922,7 +930,13 @@ fn execute_one(
                 };
 
             {
-                let walked = nexium_shader::extract_fs_tex_ids(&fs_sass, 15);
+                let fs_walk_len = shader_cfg_code_len(&fs_cfg).min(fs_sass.len());
+                let fs_walk_sass = if fs_walk_len == 0 {
+                    fs_sass.as_slice()
+                } else {
+                    &fs_sass[..fs_walk_len]
+                };
+                let walked = nexium_shader::extract_fs_tex_ids(fs_walk_sass, 15);
                 let before = fs_tex_ids.len();
                 let mut bindless = 0usize;
                 for id in walked {
@@ -947,7 +961,7 @@ fn execute_one(
                     fs_tex_ids,
                     draw.tic_pool_gpu_va,
                     draw.tic_pool_limit,
-                    fs_sass.len(),
+                    fs_walk_sass.len(),
                 );
             }
 
@@ -1002,19 +1016,32 @@ fn execute_one(
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static DN: AtomicU32 = AtomicU32::new(0);
                 let dk = DN.fetch_add(1, Ordering::Relaxed);
-                if dk < 24 {
+                let target_fs = std::env::var("NEXIUM_PROBE_SHADE_FS")
+                    .ok()
+                    .and_then(|v| parse_env_u64(&v));
+                let target_vs = std::env::var("NEXIUM_PROBE_SHADE_VS")
+                    .ok()
+                    .and_then(|v| parse_env_u64(&v));
+                let target = target_fs.is_some_and(|v| v == fs_addr)
+                    || target_vs.is_some_and(|v| v == vs_addr);
+                if dk < 24 || target {
+                    let tag = if target {
+                        format!("target_{:x}_{:x}", vs_addr, fs_addr)
+                    } else {
+                        dk.to_string()
+                    };
                     let vb: Vec<u8> = b.vs_spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
                     let fb: Vec<u8> = b.fs_spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
                     let _ =
-                        std::fs::write(format!("C:/Users/Mythrax/Desktop/sh_{}_vs.spv", dk), &vb);
+                        std::fs::write(format!("C:/Users/Mythrax/Desktop/sh_{}_vs.spv", tag), &vb);
                     let _ =
-                        std::fs::write(format!("C:/Users/Mythrax/Desktop/sh_{}_fs.spv", dk), &fb);
+                        std::fs::write(format!("C:/Users/Mythrax/Desktop/sh_{}_fs.spv", tag), &fb);
                     let _ = std::fs::write(
-                        format!("C:/Users/Mythrax/Desktop/sh_{}_vs.sass", dk),
+                        format!("C:/Users/Mythrax/Desktop/sh_{}_vs.sass", tag),
                         &vs_sass,
                     );
                     let _ = std::fs::write(
-                        format!("C:/Users/Mythrax/Desktop/sh_{}_fs.sass", dk),
+                        format!("C:/Users/Mythrax/Desktop/sh_{}_fs.sass", tag),
                         &fs_sass,
                     );
                     let vs_dis = nexium_shader::disassemble(&vs_sass)
@@ -1028,16 +1055,22 @@ fn execute_one(
                         .collect::<Vec<_>>()
                         .join("\n");
                     let _ = std::fs::write(
-                        format!("C:/Users/Mythrax/Desktop/sh_{}_vs.txt", dk),
+                        format!("C:/Users/Mythrax/Desktop/sh_{}_vs.txt", tag),
                         vs_dis,
                     );
                     let _ = std::fs::write(
-                        format!("C:/Users/Mythrax/Desktop/sh_{}_fs.txt", dk),
+                        format!("C:/Users/Mythrax/Desktop/sh_{}_fs.txt", tag),
                         fs_dis,
                     );
+                    if target {
+                        let _ = std::fs::write(
+                            format!("C:/Users/Mythrax/Desktop/sh_{}_fs.cfg.txt", tag),
+                            shader_cfg_dump(&fs_cfg),
+                        );
+                    }
                     log::warn!(
                         "[shdump] #{} vs_addr={:#x} fs_addr={:#x} vs_mask={:#x} fs_mask={:#x} vs_bytes={} fs_bytes={} ntex={}",
-                        dk, vs_addr, fs_addr, b.vs_cbuf_mask, b.fs_cbuf_mask, b.vs_spirv.len(), b.fs_spirv.len(), b.fs_tex_ids.len()
+                        tag, vs_addr, fs_addr, b.vs_cbuf_mask, b.fs_cbuf_mask, b.vs_spirv.len(), b.fs_spirv.len(), b.fs_tex_ids.len()
                     );
                 }
             }
@@ -1095,7 +1128,18 @@ fn execute_one(
     let mut fs_tex_remap: Vec<String> = Vec::with_capacity(fs_tex_ids.len());
     let mut fs_sampler_ids: Vec<u32> = vec![0u32; fs_tex_ids.len()];
     if !fs_tex_ids.is_empty() {
-        let tex_cb_index = maxwell.regs.tex_cb_index as usize;
+        let via_header_index = maxwell.regs.sampler_binding == 1;
+        let tex_cb_index = choose_texture_cb_index(
+            &maxwell.regs.cbuf_binds[4],
+            maxwell.regs.bindless_texture_const_buffer_slot,
+            maxwell.regs.tex_cb_index,
+            &fs_tex_ids,
+            draw.tic_pool_gpu_va,
+            draw.tic_pool_limit,
+            via_header_index,
+            mappings,
+            mem_read,
+        );
         let (tcb_addr, tcb_size) = maxwell.regs.cbuf_binds[4][tex_cb_index.min(15)];
         for (i, unit_slot) in fs_tex_ids.iter_mut().enumerate() {
             let shader_id = *unit_slot;
@@ -1122,9 +1166,16 @@ fn execute_one(
             let mut bytes = [0u8; 4];
             if mem_read(cpu, &mut bytes) {
                 let handle = u32::from_le_bytes(bytes);
-                let tic = handle & 0x000F_FFFF;
-                let tsc = handle >> 20;
-                if handle != 0 && tic <= draw.tic_pool_limit {
+                let (tic, tsc) = split_texture_handle(handle, via_header_index);
+                if handle != 0
+                    && texture_tic_readable(
+                        tic,
+                        draw.tic_pool_gpu_va,
+                        draw.tic_pool_limit,
+                        mappings,
+                        mem_read,
+                    )
+                {
                     if std::env::var_os("NEXIUM_TEX_BIND_LOG").is_some() {
                         log::warn!(
                             "tex_handle: cb{} off={:#x} handle={:#x} -> TIC {} TSC {}",
@@ -1493,6 +1544,7 @@ fn execute_one(
         src_alpha_factor: map_blend_factor(blend_raw_src_alpha),
         dst_alpha_factor: map_blend_factor(blend_raw_dst_alpha),
         alpha_op: map_blend_op(blend_raw_eq_alpha),
+        color_write_mask: map_color_write_mask(maxwell.regs.color_masks[0]),
     };
 
     trace_menu_draw(
@@ -1774,8 +1826,8 @@ fn trace_font_ssbo(
     if std::env::var_os("NEXIUM_FONT_SSBO_DBG").is_none() || vs_addr != 0x400660030 {
         return;
     }
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
     static LIMIT: OnceLock<u64> = OnceLock::new();
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let limit = *LIMIT.get_or_init(|| {
@@ -1876,8 +1928,8 @@ fn font_cbuf_summary(cbuf_data: Option<&[u8]>) -> String {
     };
     let base = 3usize * PACKED_CBUF_SLOT_SIZE;
     let offsets = [
-        0x0usize, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34,
-        0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c,
+        0x0usize, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 0x38,
+        0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c,
     ];
     let mut out = Vec::new();
     for off in offsets {
@@ -1886,7 +1938,12 @@ fn font_cbuf_summary(cbuf_data: Option<&[u8]>) -> String {
             continue;
         }
         let raw = u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
-        out.push(format!("{:#x}={:.4}/{:#010x}", off, f32::from_bits(raw), raw));
+        out.push(format!(
+            "{:#x}={:.4}/{:#010x}",
+            off,
+            f32::from_bits(raw),
+            raw
+        ));
     }
     out.join(" ")
 }
@@ -2054,7 +2111,11 @@ fn font_decode_texture_layers(
     for layer in 0..layers as usize {
         let start = layer.saturating_mul(layer_read_size);
         let end = (start + layer_read_size).min(raw.len());
-        let layer_raw = if start < raw.len() { &raw[start..end] } else { &[] };
+        let layer_raw = if start < raw.len() {
+            &raw[start..end]
+        } else {
+            &[]
+        };
         let linear = if effective_block_linear {
             let (storage_width, storage_height, bpp) =
                 tic.format.storage_extent(tic.width, tic.height);
@@ -2104,8 +2165,12 @@ fn font_tex_sample_summary(
     u1: f32,
     v1: f32,
 ) -> String {
-    let direct = font_tex_region_stats(rgba, layer_size, width, height, layer, swizzle, u0, v0, u1, v1, false);
-    let flipped = font_tex_region_stats(rgba, layer_size, width, height, layer, swizzle, u0, v0, u1, v1, true);
+    let direct = font_tex_region_stats(
+        rgba, layer_size, width, height, layer, swizzle, u0, v0, u1, v1, false,
+    );
+    let flipped = font_tex_region_stats(
+        rgba, layer_size, width, height, layer, swizzle, u0, v0, u1, v1, true,
+    );
     format!(
         "v{} uv=({:.4},{:.4})-({:.4},{:.4}) l{} dir[{}] flip[{}]",
         idx, u0, v0, u1, v1, layer, direct, flipped
@@ -2125,12 +2190,22 @@ fn font_tex_region_stats(
     v1: f32,
     flip_v: bool,
 ) -> String {
-    if width == 0 || height == 0 || !u0.is_finite() || !v0.is_finite() || !u1.is_finite() || !v1.is_finite() {
+    if width == 0
+        || height == 0
+        || !u0.is_finite()
+        || !v0.is_finite()
+        || !u1.is_finite()
+        || !v1.is_finite()
+    {
         return "bad".to_string();
     }
     let x0 = font_tex_coord_to_px(u0.min(u1), width);
     let x1 = font_tex_coord_to_px(u0.max(u1), width).max(x0);
-    let (a, b) = if flip_v { (1.0 - v0, 1.0 - v1) } else { (v0, v1) };
+    let (a, b) = if flip_v {
+        (1.0 - v0, 1.0 - v1)
+    } else {
+        (v0, v1)
+    };
     let y0 = font_tex_coord_to_px(a.min(b), height);
     let y1 = font_tex_coord_to_px(a.max(b), height).max(y0);
     let mut raw0 = FontTexStats::default();
@@ -2154,14 +2229,7 @@ fn font_tex_region_stats(
     }
     format!(
         "px={}..{}/{}..{} r0={} r3={} m0={} m3={}",
-        x0,
-        x1,
-        y0,
-        y1,
-        raw0,
-        raw3,
-        map0,
-        map3
+        x0, x1, y0, y1, raw0, raw3, map0, map3
     )
 }
 
@@ -2170,10 +2238,7 @@ fn font_tex_coord_to_px(v: f32, extent: u32) -> u32 {
     (v.clamp(0.0, 1.0) * max).round() as u32
 }
 
-fn font_apply_swizzle(
-    src: [u8; 4],
-    swizzle: [nexium_gpu::texture::SwizzleSource; 4],
-) -> [u8; 4] {
+fn font_apply_swizzle(src: [u8; 4], swizzle: [nexium_gpu::texture::SwizzleSource; 4]) -> [u8; 4] {
     fn one(src: [u8; 4], s: nexium_gpu::texture::SwizzleSource) -> u8 {
         match s {
             nexium_gpu::texture::SwizzleSource::Zero => 0,
@@ -2246,6 +2311,36 @@ fn menu_draw_dbg_limit() -> u64 {
     })
 }
 
+fn menu_draw_dbg_start() -> u64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<u64> = OnceLock::new();
+    *START.get_or_init(|| {
+        std::env::var("NEXIUM_MENU_DRAW_START")
+            .ok()
+            .and_then(|v| parse_env_u64(&v))
+            .unwrap_or(0)
+    })
+}
+
+fn menu_draw_dbg_fs() -> Option<u64> {
+    use std::sync::OnceLock;
+    static FS: OnceLock<Option<u64>> = OnceLock::new();
+    *FS.get_or_init(|| {
+        std::env::var("NEXIUM_MENU_DRAW_FS")
+            .ok()
+            .and_then(|v| parse_env_u64(&v))
+    })
+}
+
+fn parse_env_u64(v: &str) -> Option<u64> {
+    let s = v.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
 fn trace_menu_draw(
     draw: &DrawCall,
     layout: &VertexLayout,
@@ -2280,8 +2375,18 @@ fn trace_menu_draw(
     }
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    if seq >= menu_draw_dbg_limit() {
+    if seq < menu_draw_dbg_start() {
+        return;
+    }
+    if let Some(fs) = menu_draw_dbg_fs() {
+        if fs_addr != fs {
+            return;
+        }
+    }
+    let logged = LOGGED.fetch_add(1, Ordering::Relaxed);
+    if logged >= menu_draw_dbg_limit() {
         return;
     }
     let pos = position_bounds(layout, mappings, mem_read, vertex_addr, vertex_count)
@@ -2349,7 +2454,7 @@ fn trace_menu_draw(
         }
     }
     log::warn!(
-        "[menu-draw] #{} rt={} {}x{} vs={:#x} fs={:#x} topo={} first={} inst={}/{} v={} i={} indexed={} pos={} attrs={} {} vp_en={} vp={:?} clip=({},{} {}x{}) depth={}/{} cull={} ff={:#x} blend={} {:?}/{:?}/{:?}/{:?} masks={:#x}/{:#x} shader_tex_ids={:?} tex_ids={:?} tsc_ids={:?} remap=[{}] tex=[{}] tsc=[{}]",
+        "[menu-draw] #{} rt={} {}x{} vs={:#x} fs={:#x} topo={} first={} inst={}/{} v={} i={} indexed={} pos={} attrs={} {} vp_en={} vp={:?} clip=({},{} {}x{}) depth={}/{} cull={} ff={:#x} blend={} {:?}/{:?}/{:?}/{:?} cw={:#x} masks={:#x}/{:#x} shader_tex_ids={:?} tex_ids={:?} tsc_ids={:?} remap=[{}] tex=[{}] tsc=[{}]",
         seq,
         nvmap_id,
         rt.width,
@@ -2381,6 +2486,7 @@ fn trace_menu_draw(
         blend.dst_factor,
         blend.src_alpha_factor,
         blend.dst_alpha_factor,
+        blend.color_write_mask.as_raw(),
         vs_cbuf_mask,
         fs_cbuf_mask,
         shader_fs_tex_ids,
@@ -2400,21 +2506,17 @@ fn trace_menu_draw(
     }
 }
 
-fn menu_cbuf_sample(
-    cbuf_data: Option<&[u8]>,
-    cbuf_binds: &[[(u64, u32); 16]; 5],
-) -> String {
+fn menu_cbuf_sample(cbuf_data: Option<&[u8]>, cbuf_binds: &[[(u64, u32); 16]; 5]) -> String {
     let Some(data) = cbuf_data else {
         return "none".to_string();
     };
     let offsets = [
-        0x0u32, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34,
-        0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60, 0x64, 0x68, 0x6c,
-        0x70, 0x74, 0x78, 0x7c, 0x80, 0x84, 0x88, 0x8c, 0xe0, 0xe4, 0xe8, 0xec, 0xf0, 0xf4,
-        0xf8, 0xfc, 0x100, 0x104, 0x108, 0x10c, 0x110, 0x114, 0x118, 0x11c, 0x1a0, 0x1a4,
-        0x1a8, 0x1ac, 0x1b0, 0x1b4, 0x1c0, 0x1c4, 0x1d0, 0x1d4, 0x1d8, 0x1dc, 0x1e0,
-        0x1e4, 0x1e8, 0x1ec, 0x1f0, 0x1f4, 0x1f8, 0x1fc, 0x200, 0x204, 0x208, 0x20c,
-        0x210, 0x214, 0x218, 0x21c, 0x22c,
+        0x0u32, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 0x38,
+        0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60, 0x64, 0x68, 0x6c, 0x70, 0x74,
+        0x78, 0x7c, 0x80, 0x84, 0x88, 0x8c, 0xe0, 0xe4, 0xe8, 0xec, 0xf0, 0xf4, 0xf8, 0xfc, 0x100,
+        0x104, 0x108, 0x10c, 0x110, 0x114, 0x118, 0x11c, 0x1a0, 0x1a4, 0x1a8, 0x1ac, 0x1b0, 0x1b4,
+        0x1c0, 0x1c4, 0x1d0, 0x1d4, 0x1d8, 0x1dc, 0x1e0, 0x1e4, 0x1e8, 0x1ec, 0x1f0, 0x1f4, 0x1f8,
+        0x1fc, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c, 0x22c,
     ];
     let logical_slot = 3usize;
     let base = logical_slot * PACKED_CBUF_SLOT_SIZE;
@@ -2515,6 +2617,23 @@ fn flip_front_face(v: u32) -> u32 {
         0x0901 => 0x0900,
         _ => v,
     }
+}
+
+fn map_color_write_mask(raw: u32) -> vk::ColorComponentFlags {
+    let mut mask = vk::ColorComponentFlags::empty();
+    if (raw & 0x1) != 0 {
+        mask |= vk::ColorComponentFlags::R;
+    }
+    if (raw & 0x10) != 0 {
+        mask |= vk::ColorComponentFlags::G;
+    }
+    if (raw & 0x100) != 0 {
+        mask |= vk::ColorComponentFlags::B;
+    }
+    if (raw & 0x1000) != 0 {
+        mask |= vk::ColorComponentFlags::A;
+    }
+    mask
 }
 
 fn map_blend_factor(v: u32) -> vk::BlendFactor {
@@ -2883,6 +3002,151 @@ fn cbuf_bind_for_slot(cbuf_binds: &[[(u64, u32); 16]; 5], logical_slot: u32) -> 
     let stage = if logical_slot < 16 { 0 } else { 4 };
     let binding = (logical_slot & 15) as usize;
     cbuf_binds[stage][binding]
+}
+
+fn choose_texture_cb_index(
+    cbuf_binds: &[(u64, u32); 16],
+    bindless_slot: u32,
+    tex_cb_slot: u32,
+    shader_ids: &[u32],
+    tic_pool_gpu_va: u64,
+    tic_pool_limit: u32,
+    via_header_index: bool,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> usize {
+    let primary = (bindless_slot as usize).min(15);
+    let fallback = (tex_cb_slot as usize).min(15);
+    let mut best = primary;
+    let mut best_score = texture_cb_score(
+        cbuf_binds,
+        best,
+        shader_ids,
+        tic_pool_gpu_va,
+        tic_pool_limit,
+        via_header_index,
+        mappings,
+        mem_read,
+    );
+    for slot in [fallback, 15usize] {
+        if slot == best {
+            continue;
+        }
+        let score = texture_cb_score(
+            cbuf_binds,
+            slot,
+            shader_ids,
+            tic_pool_gpu_va,
+            tic_pool_limit,
+            via_header_index,
+            mappings,
+            mem_read,
+        );
+        if score > best_score {
+            best = slot;
+            best_score = score;
+        }
+    }
+    best
+}
+
+fn texture_cb_score(
+    cbuf_binds: &[(u64, u32); 16],
+    slot: usize,
+    shader_ids: &[u32],
+    tic_pool_gpu_va: u64,
+    tic_pool_limit: u32,
+    via_header_index: bool,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> u32 {
+    let mut score = 0u32;
+    for shader_id in shader_ids {
+        let Some(handle) = read_texture_handle(cbuf_binds, slot, *shader_id, mappings, mem_read)
+        else {
+            continue;
+        };
+        if handle == 0 {
+            continue;
+        }
+        let (tic, _) = split_texture_handle(handle, via_header_index);
+        if texture_tic_readable(tic, tic_pool_gpu_va, tic_pool_limit, mappings, mem_read) {
+            score = score.saturating_add(1);
+        }
+    }
+    score
+}
+
+fn read_texture_handle(
+    cbuf_binds: &[(u64, u32); 16],
+    slot: usize,
+    shader_id: u32,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> Option<u32> {
+    let (addr, size) = cbuf_binds[slot.min(15)];
+    let off = (shader_id as u64).saturating_mul(4);
+    if addr == 0 || off + 4 > size as u64 {
+        return None;
+    }
+    let cpu = mappings.cpu_address_for(addr.wrapping_add(off))?;
+    let mut bytes = [0u8; 4];
+    if mem_read(cpu, &mut bytes) {
+        Some(u32::from_le_bytes(bytes))
+    } else {
+        None
+    }
+}
+
+fn split_texture_handle(raw: u32, via_header_index: bool) -> (u32, u32) {
+    if via_header_index {
+        (raw, raw)
+    } else {
+        (raw & 0x000F_FFFF, raw >> 20)
+    }
+}
+
+fn texture_tic_readable(
+    tic: u32,
+    tic_pool_gpu_va: u64,
+    tic_pool_limit: u32,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> bool {
+    if tic_pool_gpu_va == 0 || tic > tic_pool_limit {
+        return false;
+    }
+    let tic_addr = tic_pool_gpu_va.wrapping_add((tic as u64).saturating_mul(32));
+    let Some(cpu) = mappings.cpu_address_for(tic_addr) else {
+        return false;
+    };
+    let mut raw = [0u8; 32];
+    mem_read(cpu, &mut raw) && nexium_gpu::texture::TicEntry::parse(&raw).is_some()
+}
+
+fn shader_cfg_dump(cfg: &nexium_shader::Cfg) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "blocks={} unimplemented={}\n",
+        cfg.blocks.len(),
+        cfg.unimplemented
+    ));
+    for block in &cfg.blocks {
+        out.push_str(&format!(
+            "\nblock {} {:#x}..{:#x} {:?}\n",
+            block.id, block.start_offset, block.end_offset, block.branch
+        ));
+        out.push_str(&block.program.to_string());
+    }
+    out
+}
+
+fn shader_cfg_code_len(cfg: &nexium_shader::Cfg) -> usize {
+    cfg.blocks
+        .iter()
+        .map(|b| b.end_offset)
+        .max()
+        .unwrap_or(0)
 }
 
 fn position_bounds(
