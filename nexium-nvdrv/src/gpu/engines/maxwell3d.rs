@@ -143,6 +143,7 @@ pub struct ShaderProgram {
 #[derive(Clone)]
 pub struct Maxwell3DRegisters {
     pub rt: [RenderTarget; 8],
+    pub rt_control: u32,
     pub viewport: Viewport,
     pub clear_color: ClearColor,
     pub clear_depth: f32,
@@ -244,6 +245,7 @@ impl Default for Maxwell3DRegisters {
     fn default() -> Self {
         Self {
             rt: [RenderTarget::default(); 8],
+            rt_control: 1,
             viewport: Viewport::default(),
             clear_color: ClearColor::default(),
             clear_depth: 1.0,
@@ -351,6 +353,7 @@ pub struct DrawCall {
     pub point_size: f32,
 
     pub rt: [RenderTarget; 8],
+    pub rt_control: u32,
     pub vertex_buffers: [VertexBuffer; 32],
     pub vertex_attribs: [VertexAttribute; 32],
     pub viewport: Viewport,
@@ -585,8 +588,13 @@ impl Maxwell3D {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static N: AtomicU32 = AtomicU32::new(0);
                     if N.fetch_add(1, Ordering::Relaxed) < 12 {
-                        log::info!("maxwell3d: REPORT_SEMAPHORE arg={:#x} op={} gpu_va={:#x} payload={:#x}",
-                            arg, operation, gpu_va, payload);
+                        log::info!(
+                            "maxwell3d: REPORT_SEMAPHORE arg={:#x} op={} gpu_va={:#x} payload={:#x}",
+                            arg,
+                            operation,
+                            gpu_va,
+                            payload
+                        );
                     }
                 }
                 if operation == 0 || operation == 2 {
@@ -653,6 +661,7 @@ impl Maxwell3D {
                     index_first: 0,
                     point_size: 1.0,
                     rt: self.regs.rt,
+                    rt_control: self.regs.rt_control,
                     vertex_buffers: self.regs.vertex_buffers,
                     vertex_attribs: self.regs.vertex_attribs,
                     viewport: self.regs.viewport,
@@ -884,6 +893,7 @@ impl Maxwell3D {
             0x4D3 => self.regs.blend_eq_alpha = arg,
             0x4D4 => self.regs.blend_src_alpha = arg,
             0x4D6 => self.regs.blend_dst_alpha = arg,
+            0x487 => self.regs.rt_control = arg,
             0x4B9 => self.regs.blend_per_target_enabled = (arg & 1) != 0,
             0x3E4 => self.regs.color_mask_common = (arg & 1) != 0,
             0x680..=0x687 => {
@@ -1024,6 +1034,7 @@ impl Maxwell3D {
             index_first: self.regs.index_first,
             point_size,
             rt: self.regs.rt,
+            rt_control: self.regs.rt_control,
             vertex_buffers: self.regs.vertex_buffers,
             vertex_attribs: self.regs.vertex_attribs,
             viewport: self.regs.viewport,
@@ -1121,6 +1132,7 @@ impl Maxwell3D {
             index_first: 0,
             point_size: 1.0,
             rt: self.regs.rt,
+            rt_control: self.regs.rt_control,
             vertex_buffers: self.regs.vertex_buffers,
             vertex_attribs: self.regs.vertex_attribs,
             viewport: self.regs.viewport,

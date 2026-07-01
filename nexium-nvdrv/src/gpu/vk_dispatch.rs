@@ -262,9 +262,10 @@ fn prepare_draw_texture_job(
             dt.texture_id, dt.tic_pool_limit
         ));
     }
-    let rt = &draw.rt[0];
+    let rt_slot = draw_color_rt_slot(draw);
+    let rt = &draw.rt[rt_slot];
     if rt.width == 0 || rt.height == 0 {
-        return Err("RT[0] has zero extent".to_string());
+        return Err(format!("RT[{}] has zero extent", rt_slot));
     }
     let rt_gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
     let nvmap_id = mappings
@@ -720,9 +721,14 @@ fn execute_one(
     renderer: &Arc<nexium_gpu::Renderer>,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Result<Option<Maxwell3dDrawCall>, String> {
-    let rt = &draw.rt[0];
+    let rt_slot = if draw.is_clear {
+        0
+    } else {
+        draw_color_rt_slot(draw)
+    };
+    let rt = &draw.rt[rt_slot];
     if rt.width == 0 || rt.height == 0 {
-        return Err("RT[0] has zero extent".to_string());
+        return Err(format!("RT[{}] has zero extent", rt_slot));
     }
     let rt_gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
     let nvmap_id = mappings
@@ -898,8 +904,11 @@ fn execute_one(
                     if N.fetch_add(1, Ordering::Relaxed) < 20 {
                         log::warn!(
                             "[shaderdbg] region={:#x} vs_lo={:#x} fs_lo={:#x} cpu(vs)={:?} cpu(fs)={:?} fs_sass[0..16]={:02x?} | {}",
-                            program_region, vs_prog.address_lo, fs_prog.address_lo,
-                            mappings.cpu_address_for(vs_addr), mappings.cpu_address_for(fs_addr),
+                            program_region,
+                            vs_prog.address_lo,
+                            fs_prog.address_lo,
+                            mappings.cpu_address_for(vs_addr),
+                            mappings.cpu_address_for(fs_addr),
                             &fs_sass[..16.min(fs_sass.len())],
                             mappings.describe_around(fs_addr),
                         );
@@ -1070,7 +1079,14 @@ fn execute_one(
                     }
                     log::warn!(
                         "[shdump] #{} vs_addr={:#x} fs_addr={:#x} vs_mask={:#x} fs_mask={:#x} vs_bytes={} fs_bytes={} ntex={}",
-                        tag, vs_addr, fs_addr, b.vs_cbuf_mask, b.fs_cbuf_mask, b.vs_spirv.len(), b.fs_spirv.len(), b.fs_tex_ids.len()
+                        tag,
+                        vs_addr,
+                        fs_addr,
+                        b.vs_cbuf_mask,
+                        b.fs_cbuf_mask,
+                        b.vs_spirv.len(),
+                        b.fs_spirv.len(),
+                        b.fs_tex_ids.len()
                     );
                 }
             }
@@ -1105,8 +1121,15 @@ fn execute_one(
             };
             log::warn!(
                 "[cbuf] draw{} vs_mask={:#x} fs_mask={:#x} resolved={:#x}/{} last_cb={:#x}/{} | VS:{} | FS:{}",
-                k, vs_cbuf_mask, fs_cbuf_mask, cbuf_addr, cbuf_size,
-                draw.last_constbuf_addr, draw.last_constbuf_size, stage(0), stage(4)
+                k,
+                vs_cbuf_mask,
+                fs_cbuf_mask,
+                cbuf_addr,
+                cbuf_size,
+                draw.last_constbuf_addr,
+                draw.last_constbuf_size,
+                stage(0),
+                stage(4)
             );
         }
     }
@@ -1243,8 +1266,16 @@ fn execute_one(
                 if n < 200 {
                     log::warn!(
                         "[texdbg #{}] slot={} fmt={:?} {}x{}x{} base={} type={} norm={} gpu_va={:#x} nvmap={:?} can_alias_rt={} swizzle={:?}",
-                        n, slot, tic.format, tic.width, tic.height, tic.depth, tic.base_layer,
-                        tic.texture_type, tic.normalized_coords, tic.gpu_va,
+                        n,
+                        slot,
+                        tic.format,
+                        tic.width,
+                        tic.height,
+                        tic.depth,
+                        tic.base_layer,
+                        tic.texture_type,
+                        tic.normalized_coords,
+                        tic.gpu_va,
                         mappings.nvmap_id_for(tic.gpu_va),
                         tic_can_alias_render_target(tic.format),
                         tic.swizzle
@@ -1325,7 +1356,15 @@ fn execute_one(
                     }
                     log::warn!(
                         "[shade] draw{} nattr={} loc={} fmt={:?} off={} maxRGBA=[{:.3} {:.3} {:.3} {:.3}]",
-                        k, layout.attrs.len(), a.location, a.format, a.offset, mx[0], mx[1], mx[2], mx[3]
+                        k,
+                        layout.attrs.len(),
+                        a.location,
+                        a.format,
+                        a.offset,
+                        mx[0],
+                        mx[1],
+                        mx[2],
+                        mx[3]
                     );
                 }
                 let vstride = layout.bindings.iter().map(|b| b.stride).max().unwrap_or(0) as usize;
@@ -1553,6 +1592,7 @@ fn execute_one(
         mappings,
         mem_read,
         nvmap_id,
+        rt_slot,
         rt,
         vs_addr,
         fs_addr,
@@ -1699,7 +1739,13 @@ fn execute_one(
                 if set.insert((vs_addr, idx as u32)) {
                     log::warn!(
                         "[ssbo] vs={:#x} ssbo[{}] cb_va={:#x} base={:#x} size={:#x} read_ok={} bytes={}",
-                        vs_addr, idx, cb_va, dbg_base, dbg_size, dbg_readok, bytes.len()
+                        vs_addr,
+                        idx,
+                        cb_va,
+                        dbg_base,
+                        dbg_size,
+                        dbg_readok,
+                        bytes.len()
                     );
                 }
             }
@@ -1791,19 +1837,54 @@ fn execute_one(
     Ok(Some(call))
 }
 
-fn menu_draw_dbg_target() -> Option<u32> {
+fn menu_draw_dbg_targets() -> Option<Vec<u32>> {
     use std::sync::OnceLock;
-    static TARGET: OnceLock<Option<u32>> = OnceLock::new();
-    *TARGET.get_or_init(|| {
+    static TARGETS: OnceLock<Option<Vec<u32>>> = OnceLock::new();
+    TARGETS
+        .get_or_init(|| {
+            if std::env::var_os("NEXIUM_MENU_DRAW_DBG").is_none() {
+                return None;
+            }
+            let raw = std::env::var("NEXIUM_MENU_DRAW_NVMAP").unwrap_or_else(|_| "16".to_string());
+            let trimmed = raw.trim();
+            if trimmed.eq_ignore_ascii_case("all") || trimmed == "*" {
+                return Some(Vec::new());
+            }
+            let targets = trimmed
+                .split(',')
+                .filter_map(|v| v.trim().parse::<u32>().ok())
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                Some(vec![16])
+            } else {
+                Some(targets)
+            }
+        })
+        .clone()
+}
+
+fn rt_control_target(raw: u32, index: usize) -> usize {
+    (((raw >> (4 + index * 3)) & 0x7) as usize).min(7)
+}
+
+fn draw_color_rt_slot(draw: &DrawCall) -> usize {
+    let slot = rt_control_target(draw.rt_control, 0);
+    let count = (draw.rt_control & 0xf).min(8);
+    if count != 0 && slot < draw.rt.len() && draw.rt[slot].width != 0 && draw.rt[slot].height != 0 {
+        slot
+    } else {
+        0
+    }
+}
+
+fn menu_draw_dbg_color_only() -> bool {
+    use std::sync::OnceLock;
+    static COLOR_ONLY: OnceLock<bool> = OnceLock::new();
+    *COLOR_ONLY.get_or_init(|| {
         if std::env::var_os("NEXIUM_MENU_DRAW_DBG").is_none() {
-            return None;
+            return false;
         }
-        Some(
-            std::env::var("NEXIUM_MENU_DRAW_NVMAP")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(16),
-        )
+        std::env::var_os("NEXIUM_MENU_DRAW_COLOR_ONLY").is_some()
     })
 }
 
@@ -2347,6 +2428,7 @@ fn trace_menu_draw(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     nvmap_id: u32,
+    rt_slot: usize,
     rt: &RenderTarget,
     vs_addr: u64,
     fs_addr: u64,
@@ -2367,10 +2449,13 @@ fn trace_menu_draw(
     cbuf_data: Option<&[u8]>,
     cbuf_binds: &[[(u64, u32); 16]; 5],
 ) {
-    let Some(target) = menu_draw_dbg_target() else {
+    let Some(targets) = menu_draw_dbg_targets() else {
         return;
     };
-    if nvmap_id != target {
+    if !targets.is_empty() && !targets.contains(&nvmap_id) {
+        return;
+    }
+    if menu_draw_dbg_color_only() && blend.color_write_mask.is_empty() {
         return;
     }
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2454,9 +2539,11 @@ fn trace_menu_draw(
         }
     }
     log::warn!(
-        "[menu-draw] #{} rt={} {}x{} vs={:#x} fs={:#x} topo={} first={} inst={}/{} v={} i={} indexed={} pos={} attrs={} {} vp_en={} vp={:?} clip=({},{} {}x{}) depth={}/{} cull={} ff={:#x} blend={} {:?}/{:?}/{:?}/{:?} cw={:#x} masks={:#x}/{:#x} shader_tex_ids={:?} tex_ids={:?} tsc_ids={:?} remap=[{}] tex=[{}] tsc=[{}]",
+        "[menu-draw] #{} rt={} slot={} rtctl={:#x} {}x{} vs={:#x} fs={:#x} topo={} first={} inst={}/{} v={} i={} indexed={} pos={} attrs={} {} vp_en={} vp={:?} clip=({},{} {}x{}) depth={}/{} cull={} ff={:#x} blend={} {:?}/{:?}/{:?}/{:?} cw={:#x} masks={:#x}/{:#x} shader_tex_ids={:?} tex_ids={:?} tsc_ids={:?} remap=[{}] tex=[{}] tsc=[{}]",
         seq,
         nvmap_id,
+        rt_slot,
+        draw.rt_control,
         rt.width,
         rt.height,
         vs_addr,
@@ -3142,11 +3229,7 @@ fn shader_cfg_dump(cfg: &nexium_shader::Cfg) -> String {
 }
 
 fn shader_cfg_code_len(cfg: &nexium_shader::Cfg) -> usize {
-    cfg.blocks
-        .iter()
-        .map(|b| b.end_offset)
-        .max()
-        .unwrap_or(0)
+    cfg.blocks.iter().map(|b| b.end_offset).max().unwrap_or(0)
 }
 
 fn position_bounds(
