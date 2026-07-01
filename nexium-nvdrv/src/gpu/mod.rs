@@ -3,7 +3,9 @@ pub mod flat_allocator;
 pub mod pusher;
 pub mod vk_dispatch;
 
-pub use engines::{Fermi2D, KeplerMemory, Maxwell3D, Maxwell3DRegisters, MaxwellDma};
+pub use engines::{
+    Fermi2D, KeplerCompute, KeplerMemory, Maxwell3D, Maxwell3DRegisters, MaxwellDma,
+};
 pub use pusher::{CommandListHeader, Pusher};
 
 use parking_lot::Mutex;
@@ -96,7 +98,12 @@ impl GpuMappings {
             ),
             None => "none".to_string(),
         };
-        format!("below={} above={} total={}", f(below), f(above), self.mappings.len())
+        format!(
+            "below={} above={} total={}",
+            f(below),
+            f(above),
+            self.mappings.len()
+        )
     }
 
     pub fn remove(&mut self, gpu_va: u64) -> Option<u64> {
@@ -177,6 +184,7 @@ pub struct GpuContext {
     pub maxwell3d: Arc<Mutex<Maxwell3D>>,
     pub maxwell_dma: Arc<Mutex<MaxwellDma>>,
     pub fermi_2d: Arc<Mutex<Fermi2D>>,
+    pub kepler_compute: Arc<Mutex<KeplerCompute>>,
     pub kepler_memory: Arc<Mutex<KeplerMemory>>,
     pub pusher: Arc<Mutex<Pusher>>,
     pub small_alloc: Arc<Mutex<flat_allocator::FlatAllocator>>,
@@ -206,6 +214,7 @@ impl GpuContext {
             maxwell3d: Arc::new(Mutex::new(Maxwell3D::new())),
             maxwell_dma: Arc::new(Mutex::new(MaxwellDma::new())),
             fermi_2d: Arc::new(Mutex::new(Fermi2D::new())),
+            kepler_compute: Arc::new(Mutex::new(KeplerCompute::new())),
             kepler_memory: Arc::new(Mutex::new(KeplerMemory::new())),
             pusher: Arc::new(Mutex::new(Pusher::new())),
             small_alloc: Arc::new(Mutex::new(flat_allocator::FlatAllocator::new(
@@ -272,6 +281,7 @@ impl GpuContext {
         let mut maxwell = self.maxwell3d.lock();
         let mut maxwell_dma = self.maxwell_dma.lock();
         let mut fermi_2d = self.fermi_2d.lock();
+        let mut kepler_compute = self.kepler_compute.lock();
         let mut kepler_memory = self.kepler_memory.lock();
         let mappings = self.mappings.lock();
 
@@ -282,6 +292,7 @@ impl GpuContext {
             &mut *maxwell,
             &mut *maxwell_dma,
             &mut *fermi_2d,
+            &mut *kepler_compute,
             &mut *kepler_memory,
             &*self.stats,
             &mem_read,
@@ -306,6 +317,7 @@ impl GpuContext {
         let mut maxwell = self.maxwell3d.lock();
         let mut maxwell_dma = self.maxwell_dma.lock();
         let mut fermi_2d = self.fermi_2d.lock();
+        let mut kepler_compute = self.kepler_compute.lock();
         let mut kepler_memory = self.kepler_memory.lock();
         let mappings = self.mappings.lock();
         let locks_ms = if profile { elapsed_ms(t0) } else { 0.0 };
@@ -318,6 +330,7 @@ impl GpuContext {
                 &mut *maxwell,
                 &mut *maxwell_dma,
                 &mut *fermi_2d,
+                &mut *kepler_compute,
                 &mut *kepler_memory,
                 &*self.stats,
                 &mem_read,

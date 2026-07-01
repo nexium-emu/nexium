@@ -1,7 +1,7 @@
 use super::super::PipelineStats;
 use super::engines::{
-    sw_renderer, Fermi2D, KeplerMemory, Maxwell3D, MaxwellDma, FERMI_2D_CLASS, KEPLER_MEMORY_CLASS,
-    MAXWELL_DMA_CLASS,
+    sw_renderer, Fermi2D, KeplerCompute, KeplerMemory, Maxwell3D, MaxwellDma, FERMI_2D_CLASS,
+    KEPLER_COMPUTE_CLASS, KEPLER_MEMORY_CLASS, MAXWELL_DMA_CLASS,
 };
 use super::GpuMappings;
 use std::sync::atomic::Ordering;
@@ -136,6 +136,7 @@ impl Pusher {
         maxwell: &mut Maxwell3D,
         maxwell_dma: &mut MaxwellDma,
         fermi_2d: &mut Fermi2D,
+        kepler_compute: &mut KeplerCompute,
         kepler_memory: &mut KeplerMemory,
         stats: &PipelineStats,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
@@ -176,6 +177,7 @@ impl Pusher {
                 maxwell,
                 maxwell_dma,
                 fermi_2d,
+                kepler_compute,
                 kepler_memory,
                 stats,
                 mem_read,
@@ -192,6 +194,7 @@ impl Pusher {
         maxwell: &mut Maxwell3D,
         maxwell_dma: &mut MaxwellDma,
         fermi_2d: &mut Fermi2D,
+        kepler_compute: &mut KeplerCompute,
         kepler_memory: &mut KeplerMemory,
         stats: &PipelineStats,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
@@ -239,6 +242,7 @@ impl Pusher {
             maxwell,
             maxwell_dma,
             fermi_2d,
+            kepler_compute,
             kepler_memory,
             stats,
             mem_read,
@@ -253,6 +257,7 @@ impl Pusher {
         maxwell: &mut Maxwell3D,
         maxwell_dma: &mut MaxwellDma,
         fermi_2d: &mut Fermi2D,
+        kepler_compute: &mut KeplerCompute,
         kepler_memory: &mut KeplerMemory,
         stats: &PipelineStats,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
@@ -270,6 +275,7 @@ impl Pusher {
                     maxwell,
                     maxwell_dma,
                     fermi_2d,
+                    kepler_compute,
                     kepler_memory,
                     stats,
                     mem_read,
@@ -326,6 +332,7 @@ impl Pusher {
                         maxwell,
                         maxwell_dma,
                         fermi_2d,
+                        kepler_compute,
                         kepler_memory,
                         stats,
                         mem_read,
@@ -350,6 +357,7 @@ impl Pusher {
         maxwell: &mut Maxwell3D,
         maxwell_dma: &mut MaxwellDma,
         fermi_2d: &mut Fermi2D,
+        kepler_compute: &mut KeplerCompute,
         kepler_memory: &mut KeplerMemory,
         stats: &PipelineStats,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
@@ -449,6 +457,10 @@ impl Pusher {
         } else if bound_class == KEPLER_MEMORY_CLASS {
             self.flush_vk(mappings, mem_read);
             kepler_memory.dispatch_method(method, arg, mappings, mem_write);
+        } else if bound_class == KEPLER_COMPUTE_CLASS {
+            self.flush_vk(mappings, mem_read);
+            let is_last = self.state.method_count <= 1;
+            kepler_compute.dispatch_method(method, arg, is_last, mappings, mem_read, mem_write);
         } else {
             if bound_class == 0xB1C0 {
                 use std::sync::atomic::{AtomicU64, Ordering as O2};
@@ -467,7 +479,12 @@ impl Pusher {
                         if n % 10000 == 0 {
                             let s: Vec<String> =
                                 map.iter().map(|(k, v)| format!("{:#x}:{}", k, v)).collect();
-                            log::warn!("[compute-methods] n={} distinct={} [{}]", n, map.len(), s.join(" "));
+                            log::warn!(
+                                "[compute-methods] n={} distinct={} [{}]",
+                                n,
+                                map.len(),
+                                s.join(" ")
+                            );
                         }
                     }
                     if n <= 90 {
