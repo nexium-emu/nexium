@@ -350,7 +350,22 @@ impl eframe::App for HorizonApp {
             } else {
                 (0u64, [0i32; 4])
             };
-            let buttons = kb_buttons | gp_buttons;
+            let mut buttons = kb_buttons | gp_buttons;
+            if let Some(delay_ms) = std::env::var("NEXIUM_AUTO_PRESS_A_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                static START: std::sync::OnceLock<std::time::Instant> =
+                    std::sync::OnceLock::new();
+                let len_ms = std::env::var("NEXIUM_AUTO_PRESS_A_LEN_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(2000);
+                let elapsed_ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+                if elapsed_ms >= delay_ms && elapsed_ms < delay_ms.saturating_add(len_ms) {
+                    buttons |= nexium_core::hid_state::NPAD_BUTTON_A;
+                }
+            }
             let mut sticks = kb_sticks;
             for i in 0..4 {
                 if gp_sticks[i].abs() > sticks[i].abs() {
