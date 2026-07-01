@@ -689,6 +689,16 @@ fn shader_failed_set(
     })
 }
 
+fn shader_panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic".to_string()
+    }
+}
+
 fn depth_disabled() -> bool {
     use std::sync::OnceLock;
     static D: OnceLock<bool> = OnceLock::new();
@@ -900,9 +910,14 @@ fn execute_one(
                     nexium_spirv::emit_fragment_full_with_input_map(&fs_cfg, fs_input_map)
                 })) {
                     Ok(v) => v,
-                    Err(_) => {
+                    Err(panic) => {
                         shader_failed_set().lock().unwrap().insert(shader_key);
-                        return Err("FS SPIR-V emit panicked".to_string());
+                        return Err(format!(
+                            "FS SPIR-V emit panicked vs_addr={:#x} fs_addr={:#x}: {}",
+                            vs_addr,
+                            fs_addr,
+                            shader_panic_message(panic)
+                        ));
                     }
                 };
 
@@ -957,9 +972,14 @@ fn execute_one(
                     )
                 })) {
                     Ok(v) => v,
-                    Err(_) => {
+                    Err(panic) => {
                         shader_failed_set().lock().unwrap().insert(shader_key);
-                        return Err("VS SPIR-V emit panicked".to_string());
+                        return Err(format!(
+                            "VS SPIR-V emit panicked vs_addr={:#x} fs_addr={:#x}: {}",
+                            vs_addr,
+                            fs_addr,
+                            shader_panic_message(panic)
+                        ));
                     }
                 };
 
