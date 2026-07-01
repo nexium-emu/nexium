@@ -1085,7 +1085,7 @@ impl Renderer {
         let mut inner = self.inner.lock();
         let RendererInner {
             device,
-            cmd_pool: _,
+            cmd_pool,
             queue,
             rt_cache,
             mem_props,
@@ -1100,6 +1100,15 @@ impl Renderer {
         };
         let key = rt_cache.resolve_present_key(requested_key)?;
         trace_present_key(rt_cache, requested_key, key);
+        trace_rt_stats(
+            device,
+            *cmd_pool,
+            *queue,
+            rt_cache,
+            mem_props,
+            requested_key,
+            key,
+        );
         rt_cache.reset_frame_draws();
 
         let mut ready_frame = None;
@@ -1162,7 +1171,11 @@ impl Renderer {
                         .collect();
                     log::warn!(
                         "[readback-noslot #{}] all 4 in_flight, fences=[{}] key={}:{}x{}",
-                        n, statuses.join(","), key.nvmap_id, key.width, key.height
+                        n,
+                        statuses.join(","),
+                        key.nvmap_id,
+                        key.width,
+                        key.height
                     );
                 }
             }
@@ -1291,7 +1304,12 @@ impl Renderer {
                 if n % 120 == 0 {
                     log::warn!(
                         "[readback-submitfail #{}] end={:?} submit={:?} key={}:{}x{}",
-                        n, end_res, sub_res, key.nvmap_id, key.width, key.height
+                        n,
+                        end_res,
+                        sub_res,
+                        key.nvmap_id,
+                        key.width,
+                        key.height
                     );
                 }
             }
@@ -1661,10 +1679,11 @@ impl Renderer {
                 let tex_hash = hash_src_prefix(&raw);
                 let cur_gen = crate::tex_invalidate::region_gen_range(tic.gpu_va, read_size as u64);
                 let force_refresh = force_refresh_texture(tic.gpu_va);
-                let need_upload = force_refresh || match tex_cache.get(&key) {
-                    Some(t) => t.gen != cur_gen || t.hash != tex_hash,
-                    None => true,
-                };
+                let need_upload = force_refresh
+                    || match tex_cache.get(&key) {
+                        Some(t) => t.gen != cur_gen || t.hash != tex_hash,
+                        None => true,
+                    };
                 if need_upload {
                     let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
                         .map(|v| v == "1")
@@ -1873,8 +1892,8 @@ impl Renderer {
                 ubo_ring.head = 0;
                 ubo_ring.slot_head[other_idx] = 0;
             }
-            let (sbuf, soff, sptr) = ring_alloc(ubo_ring, sz_al, 16)
-                .map_err(|e| format!("ring_alloc(ssbo): {}", e))?;
+            let (sbuf, soff, sptr) =
+                ring_alloc(ubo_ring, sz_al, 16).map_err(|e| format!("ring_alloc(ssbo): {}", e))?;
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), sptr, data.len());
             }
@@ -2506,12 +2525,14 @@ impl Renderer {
                 };
                 if let Some((tex_hash, raw)) = raw_entry.as_ref() {
                     let tex_hash = *tex_hash;
-                    let cur_gen = crate::tex_invalidate::region_gen_range(tic.gpu_va, read_size as u64);
+                    let cur_gen =
+                        crate::tex_invalidate::region_gen_range(tic.gpu_va, read_size as u64);
                     let force_refresh = force_refresh_texture(tic.gpu_va);
-                    let need_upload = force_refresh || match tex_cache.get(&key) {
-                        Some(t) => t.gen != cur_gen || t.hash != tex_hash,
-                        None => true,
-                    };
+                    let need_upload = force_refresh
+                        || match tex_cache.get(&key) {
+                            Some(t) => t.gen != cur_gen || t.hash != tex_hash,
+                            None => true,
+                        };
                     if need_upload {
                         let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
                             .map(|v| v == "1")
@@ -2591,7 +2612,8 @@ impl Renderer {
                         }
                     }
                 }
-                bound_tex_views[slot] = tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
+                bound_tex_views[slot] =
+                    tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
             }
 
             let vertex_bind: Option<(vk::Buffer, u64)> = if !prep.vertex_data.is_empty() {
@@ -3112,6 +3134,310 @@ fn trace_present_key(rt_cache: &RtCache, requested_key: RtKey, key: RtKey) {
     );
 }
 
+#[derive(Default)]
+struct RtImageStats {
+    pixels: u64,
+    rgb_nonzero: u64,
+    alpha_nonzero: u64,
+    rgb_sum: u64,
+    alpha_sum: u64,
+    rgb_max: u8,
+    bbox: Option<(u32, u32, u32, u32)>,
+    first: Option<(u32, u32, [u8; 4])>,
+}
+
+fn trace_rt_stats(
+    device: &ash::Device,
+    cmd_pool: vk::CommandPool,
+    queue: vk::Queue,
+    rt_cache: &mut RtCache,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    requested_key: RtKey,
+    resolved_key: RtKey,
+) {
+    let Some(seq) = rt_stats_seq() else {
+        return;
+    };
+    let mut stamps: HashMap<RtKey, u64> = HashMap::new();
+    for (k, stamp) in rt_cache.debug_all() {
+        stamps.insert(k, stamp);
+    }
+    for key in rt_stats_keys(rt_cache, requested_key, resolved_key) {
+        let stamp = stamps.get(&key).copied().unwrap_or(0);
+        match read_rt_image_stats(device, cmd_pool, queue, rt_cache, mem_props, key) {
+            Some(stats) => {
+                let pct = if stats.pixels == 0 {
+                    0.0
+                } else {
+                    stats.rgb_nonzero as f64 * 100.0 / stats.pixels as f64
+                };
+                let avg_rgb = if stats.pixels == 0 {
+                    0.0
+                } else {
+                    stats.rgb_sum as f64 / (stats.pixels as f64 * 3.0)
+                };
+                let avg_alpha = if stats.pixels == 0 {
+                    0.0
+                } else {
+                    stats.alpha_sum as f64 / stats.pixels as f64
+                };
+                let bbox = stats
+                    .bbox
+                    .map(|(x0, y0, x1, y1)| format!("{},{}-{},{}", x0, y0, x1, y1))
+                    .unwrap_or_else(|| "-".to_string());
+                let first = stats
+                    .first
+                    .map(|(x, y, rgba)| {
+                        format!(
+                            "{},{}:{:02x}{:02x}{:02x}{:02x}",
+                            x, y, rgba[0], rgba[1], rgba[2], rgba[3]
+                        )
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                log::warn!(
+                    "[rt-stats] seq={} key={}:{}x{} stamp={} rgbnz={}/{} ({:.2}%) anz={} avg_rgb={:.2} avg_a={:.2} max={} bbox={} first={}",
+                    seq,
+                    key.nvmap_id,
+                    key.width,
+                    key.height,
+                    stamp,
+                    stats.rgb_nonzero,
+                    stats.pixels,
+                    pct,
+                    stats.alpha_nonzero,
+                    avg_rgb,
+                    avg_alpha,
+                    stats.rgb_max,
+                    bbox,
+                    first
+                );
+            }
+            None => {
+                log::warn!(
+                    "[rt-stats] seq={} key={}:{}x{} stamp={} readback=failed",
+                    seq,
+                    key.nvmap_id,
+                    key.width,
+                    key.height,
+                    stamp
+                );
+            }
+        }
+    }
+}
+
+fn rt_stats_seq() -> Option<u64> {
+    let enabled = std::env::var_os("NEXIUM_RT_STATS")?;
+    if enabled.to_string_lossy().trim() == "0" {
+        return None;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let period = std::env::var("NEXIUM_RT_STATS_PERIOD")
+        .ok()
+        .and_then(|s| parse_u64_value(&s))
+        .unwrap_or(60)
+        .max(1);
+    if seq % period == 0 {
+        Some(seq)
+    } else {
+        None
+    }
+}
+
+fn rt_stats_keys(rt_cache: &RtCache, requested_key: RtKey, resolved_key: RtKey) -> Vec<RtKey> {
+    let mut keys = Vec::new();
+    push_unique_rt_key(&mut keys, resolved_key);
+    for (k, _) in rt_cache.present_candidates(requested_key) {
+        push_unique_rt_key(&mut keys, k);
+    }
+    if let Ok(list) = std::env::var("NEXIUM_RT_STATS_KEYS") {
+        for item in list.split(',') {
+            if let Some(k) = parse_rt_key(item.trim()) {
+                push_unique_rt_key(&mut keys, k);
+            }
+        }
+    }
+    let max_recent = std::env::var("NEXIUM_RT_STATS_MAX")
+        .ok()
+        .and_then(|s| parse_u64_value(&s))
+        .unwrap_or(12) as usize;
+    let mut recent = rt_cache.debug_all();
+    recent.retain(|(_, stamp)| *stamp != 0);
+    recent.sort_by_key(|(_, stamp)| std::cmp::Reverse(*stamp));
+    for (k, _) in recent.into_iter().take(max_recent) {
+        push_unique_rt_key(&mut keys, k);
+    }
+    keys
+}
+
+fn push_unique_rt_key(keys: &mut Vec<RtKey>, key: RtKey) {
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+fn parse_rt_key(s: &str) -> Option<RtKey> {
+    let (nvmap, dims) = s.split_once(':')?;
+    let (width, height) = dims.split_once('x')?;
+    Some(RtKey {
+        nvmap_id: parse_u64_value(nvmap)? as u32,
+        width: parse_u64_value(width)? as u32,
+        height: parse_u64_value(height)? as u32,
+    })
+}
+
+fn parse_u64_value(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        t.parse().ok()
+    }
+}
+
+fn read_rt_image_stats(
+    device: &ash::Device,
+    cmd_pool: vk::CommandPool,
+    queue: vk::Queue,
+    rt_cache: &mut RtCache,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    key: RtKey,
+) -> Option<RtImageStats> {
+    let total = (key.width as u64)
+        .checked_mul(key.height as u64)?
+        .checked_mul(4)?;
+    let stage = create_staging_owned(device, mem_props, total).ok()?;
+    let cleanup = |device: &ash::Device,
+                   cmd_pool: vk::CommandPool,
+                   fence: Option<vk::Fence>,
+                   cmd: Option<vk::CommandBuffer>,
+                   stage: &StagingBuffer| unsafe {
+        if let Some(c) = cmd {
+            device.free_command_buffers(cmd_pool, &[c]);
+        }
+        if let Some(f) = fence {
+            device.destroy_fence(f, None);
+        }
+        device.destroy_buffer(stage.buffer, None);
+        device.free_memory(stage.memory, None);
+    };
+    let fence_info = vk::FenceCreateInfo {
+        s_type: vk::StructureType::FENCE_CREATE_INFO,
+        flags: vk::FenceCreateFlags::empty(),
+        p_next: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let fence = match unsafe { device.create_fence(&fence_info, None) } {
+        Ok(f) => f,
+        Err(_) => {
+            cleanup(device, cmd_pool, None, None, &stage);
+            return None;
+        }
+    };
+    let cmd = match alloc_one_time_cmd(device, cmd_pool) {
+        Ok(c) => c,
+        Err(_) => {
+            cleanup(device, cmd_pool, Some(fence), None, &stage);
+            return None;
+        }
+    };
+    if begin_one_time(device, cmd).is_err() {
+        cleanup(device, cmd_pool, Some(fence), Some(cmd), &stage);
+        return None;
+    }
+    let img = match rt_cache.get_or_create(key, device) {
+        Ok(i) => i,
+        Err(_) => {
+            unsafe {
+                let _ = device.end_command_buffer(cmd);
+            }
+            cleanup(device, cmd_pool, Some(fence), Some(cmd), &stage);
+            return None;
+        }
+    };
+    transition_image(
+        device,
+        cmd,
+        img.image,
+        img.layout,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+    );
+    let copy = vk::BufferImageCopy {
+        buffer_offset: 0,
+        buffer_row_length: 0,
+        buffer_image_height: 0,
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        image_extent: vk::Extent3D {
+            width: key.width,
+            height: key.height,
+            depth: 1,
+        },
+    };
+    unsafe {
+        device.cmd_copy_image_to_buffer(
+            cmd,
+            img.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            stage.buffer,
+            &[copy],
+        );
+    }
+    img.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+    if end_one_time(device, cmd).is_err() || submit_with_fence(device, queue, cmd, fence).is_err() {
+        cleanup(device, cmd_pool, Some(fence), Some(cmd), &stage);
+        return None;
+    }
+    let mut stats = RtImageStats {
+        pixels: (key.width as u64) * (key.height as u64),
+        ..RtImageStats::default()
+    };
+    unsafe {
+        let _ = device.wait_for_fences(&[fence], true, u64::MAX);
+        let ptr = match device.map_memory(stage.memory, 0, stage.size, vk::MemoryMapFlags::empty())
+        {
+            Ok(ptr) => ptr as *const u8,
+            Err(_) => {
+                cleanup(device, cmd_pool, Some(fence), Some(cmd), &stage);
+                return None;
+            }
+        };
+        let data = std::slice::from_raw_parts(ptr, total as usize);
+        for (i, px) in data.chunks_exact(4).enumerate() {
+            let r = px[0];
+            let g = px[1];
+            let b = px[2];
+            let a = px[3];
+            stats.rgb_sum += r as u64 + g as u64 + b as u64;
+            stats.alpha_sum += a as u64;
+            stats.rgb_max = stats.rgb_max.max(r).max(g).max(b);
+            if a != 0 {
+                stats.alpha_nonzero += 1;
+            }
+            if r != 0 || g != 0 || b != 0 {
+                let x = (i as u32) % key.width;
+                let y = (i as u32) / key.width;
+                stats.rgb_nonzero += 1;
+                stats.first.get_or_insert((x, y, [r, g, b, a]));
+                stats.bbox = Some(match stats.bbox {
+                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                    None => (x, y, x, y),
+                });
+            }
+        }
+        device.unmap_memory(stage.memory);
+    }
+    cleanup(device, cmd_pool, Some(fence), Some(cmd), &stage);
+    Some(stats)
+}
+
 fn max_texture_descriptors() -> usize {
     crate::descriptor::MAX_TEXTURE_DESCRIPTORS as usize
 }
@@ -3179,7 +3505,8 @@ fn decode_texture_rgba8_layers(
 ) -> Vec<u8> {
     let layers = tic_layer_count(tic) as usize;
     let layer_read_size = tic_layer_read_size(tic, pitch_size);
-    let effective_block_linear = tic.is_block_linear && !crate::pitch_oracle::is_pitch_dst(tic.gpu_va);
+    let effective_block_linear =
+        tic.is_block_linear && !crate::pitch_oracle::is_pitch_dst(tic.gpu_va);
     let mut out = Vec::new();
     let layer_rgba_size = tic.width as usize * tic.height as usize * 4;
     for layer in 0..layers {
@@ -3205,12 +3532,8 @@ fn decode_texture_rgba8_layers(
         } else {
             layer_raw.to_vec()
         };
-        let mut decoded = crate::texture::decode_to_rgba8(
-            &linear,
-            tic.width,
-            tic.height,
-            tic.format,
-        );
+        let mut decoded =
+            crate::texture::decode_to_rgba8(&linear, tic.width, tic.height, tic.format);
         decoded.resize(layer_rgba_size, 0);
         out.extend(decoded);
     }
@@ -3585,8 +3908,19 @@ fn upload_texture_oneshot(
     let cmd = alloc_one_time_cmd(device, cmd_pool)?;
     begin_one_time(device, cmd)?;
     let (tex, sbuf, smem) = create_texture_image(
-        device, cmd, mem_props, width, height, layers, base_layer, view_layers, arrayed, rgba8,
-        swizzle, hash, gen,
+        device,
+        cmd,
+        mem_props,
+        width,
+        height,
+        layers,
+        base_layer,
+        view_layers,
+        arrayed,
+        rgba8,
+        swizzle,
+        hash,
+        gen,
     )?;
     end_one_time(device, cmd)?;
     submit_and_wait(device, queue, cmd)?;
@@ -3629,9 +3963,7 @@ fn dump_texture_bmp_once(
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let path = dir.join(format!(
-        "tex-{gpu_va:010x}-{width}x{height}x{layers}.bmp"
-    ));
+    let path = dir.join(format!("tex-{gpu_va:010x}-{width}x{height}x{layers}.bmp"));
     let mut file = match std::fs::File::create(path) {
         Ok(file) => file,
         Err(_) => return,
@@ -3691,10 +4023,7 @@ fn dump_texture_bmp_once(
     }
 }
 
-fn swizzle_rgba_for_dump(
-    src: [u8; 4],
-    swizzle: [crate::texture::SwizzleSource; 4],
-) -> [u8; 4] {
+fn swizzle_rgba_for_dump(src: [u8; 4], swizzle: [crate::texture::SwizzleSource; 4]) -> [u8; 4] {
     fn one(src: [u8; 4], s: crate::texture::SwizzleSource) -> u8 {
         match s {
             crate::texture::SwizzleSource::Zero => 0,
@@ -3731,7 +4060,11 @@ fn create_texture_image(
 ) -> Result<(CachedTexture, vk::Buffer, vk::DeviceMemory), String> {
     let format = vk::Format::R8G8B8A8_UNORM;
     let layers = layers.max(1);
-    let view_base_layer = if arrayed { base_layer.min(layers - 1) } else { 0 };
+    let view_base_layer = if arrayed {
+        base_layer.min(layers - 1)
+    } else {
+        0
+    };
     let view_layer_count = if arrayed {
         view_layers.max(1).min(layers - view_base_layer)
     } else {
