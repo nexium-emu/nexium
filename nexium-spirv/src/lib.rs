@@ -83,6 +83,8 @@ pub struct Emitter {
     synth_phi_results: HashMap<(Word, ValueId), Word>,
     synth_pred_phi_results: HashMap<(Word, ValueId), Word>,
     merge_redirects: HashMap<(u32, u32), Word>,
+    block_end_labels: HashMap<BlockId, Word>,
+    current_block: Option<BlockId>,
     cbuf_bindings_used: u32,
     texs_ids_used: std::collections::BTreeSet<u32>,
     texture_slots: HashMap<u32, u32>,
@@ -185,7 +187,8 @@ impl Emitter {
         let sampled_image_t = b.type_sampled_image(image_t);
         let sampled_image_arrayed_t = b.type_sampled_image(image_arrayed_t);
         let ptr_image = b.type_pointer(None, StorageClass::UniformConstant, image_t);
-        let ptr_image_arrayed = b.type_pointer(None, StorageClass::UniformConstant, image_arrayed_t);
+        let ptr_image_arrayed =
+            b.type_pointer(None, StorageClass::UniformConstant, image_arrayed_t);
         let ptr_sampler = b.type_pointer(None, StorageClass::UniformConstant, sampler_t);
         let texture_slots_const = b.constant_bit32(u32_t, MAX_TEXTURE_DESCRIPTORS);
         let image_array_t = b.type_array(image_t, texture_slots_const);
@@ -260,6 +263,8 @@ impl Emitter {
             synth_phi_results: HashMap::new(),
             synth_pred_phi_results: HashMap::new(),
             merge_redirects: HashMap::new(),
+            block_end_labels: HashMap::new(),
+            current_block: None,
             cbuf_bindings_used: 0,
             texs_ids_used: std::collections::BTreeSet::new(),
             texture_slots: HashMap::new(),
@@ -556,12 +561,9 @@ impl Emitter {
         } else {
             self.ptr_image_array
         };
-        let img = self.b.variable(
-            ptr_image_array,
-            None,
-            StorageClass::UniformConstant,
-            None,
-        );
+        let img = self
+            .b
+            .variable(ptr_image_array, None, StorageClass::UniformConstant, None);
         self.b
             .decorate(img, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
         self.b
@@ -684,9 +686,7 @@ impl Emitter {
         }
         let value = if let Some(cond) = guard {
             let old = self.pred_regs[idx as usize].unwrap_or(self.bool_false);
-            self.b
-                .select(self.bool_t, None, cond, value, old)
-                .unwrap()
+            self.b.select(self.bool_t, None, cond, value, old).unwrap()
         } else {
             value
         };
@@ -884,6 +884,22 @@ impl Emitter {
                         .unwrap()
                 }
             }
+        }
+    }
+
+    fn lower_boolop(&mut self, op: &BoolOp, a: Word, b: Word) -> Word {
+        match op {
+            BoolOp::And => self.b.logical_and(self.bool_t, None, a, b).unwrap(),
+            BoolOp::Or => self.b.logical_or(self.bool_t, None, a, b).unwrap(),
+            BoolOp::Xor => self.b.logical_not_equal(self.bool_t, None, a, b).unwrap(),
+        }
+    }
+
+    fn lower_flow_test(&mut self, flow_test: u8) -> Word {
+        match flow_test {
+            0 | 1 | 2 | 3 | 8 | 9 | 10 | 11 | 20 | 21 | 22 | 23 | 30 => self.bool_false,
+            4 | 5 | 6 | 7 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 31 => self.bool_true,
+            _ => self.bool_false,
         }
     }
 
@@ -1254,14 +1270,12 @@ impl Emitter {
                     .copied()
                     .unwrap_or(0)
                     .min(MAX_TEXTURE_DESCRIPTORS - 1);
-                let uv_override = std::env::var("NEXIUM_TEX_UV_OVERRIDE")
-                    .ok()
-                    .and_then(|s| {
-                        let mut parts = s.split(',');
-                        let u = parts.next()?.trim().parse::<f32>().ok()?;
-                        let v = parts.next()?.trim().parse::<f32>().ok()?;
-                        Some((u, v))
-                    });
+                let uv_override = std::env::var("NEXIUM_TEX_UV_OVERRIDE").ok().and_then(|s| {
+                    let mut parts = s.split(',');
+                    let u = parts.next()?.trim().parse::<f32>().ok()?;
+                    let v = parts.next()?.trim().parse::<f32>().ok()?;
+                    Some((u, v))
+                });
                 let (uv0, uv1) = if let Some((u, v)) = uv_override {
                     (self.const_f32(u.to_bits()), self.const_f32(v.to_bits()))
                 } else {
@@ -1525,6 +1539,14 @@ impl Emitter {
                     bu = self.b.s_negate(self.u32_t, None, bu).unwrap();
                 }
                 let r = self.b.i_add(self.u32_t, None, au, bu).unwrap();
+                Some(self.store_bits(r))
+            }
+            IrOp::IMul { a, b } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let au = self.as_u32(av);
+                let bu = self.as_u32(bv);
+                let r = self.b.i_mul(self.u32_t, None, au, bu).unwrap();
                 Some(self.store_bits(r))
             }
             IrOp::IScAdd {
@@ -1820,10 +1842,86 @@ impl Emitter {
                 }
                 Some(combined)
             }
+            IrOp::PSetPred {
+                dest_p,
+                dest_np,
+                pred_a,
+                neg_pred_a,
+                pred_b,
+                neg_pred_b,
+                pred_c,
+                neg_pred_c,
+                bop_1,
+                bop_2,
+            } => {
+                let pa = self.resolve_pred(*pred_a, *neg_pred_a);
+                let pb = self.resolve_pred(*pred_b, *neg_pred_b);
+                let pc = self.resolve_pred(*pred_c, *neg_pred_c);
+                let lhs_a = self.lower_boolop(bop_1, pa, pb);
+                let not_pa = self.b.logical_not(self.bool_t, None, pa).unwrap();
+                let lhs_b = self.lower_boolop(bop_1, not_pa, pb);
+                let result_a = self.lower_boolop(bop_2, lhs_a, pc);
+                let result_b = self.lower_boolop(bop_2, lhs_b, pc);
+                let guard = inst
+                    .pred
+                    .map(|pred| self.resolve_pred(pred.idx, pred.negate));
+                self.write_pred_reg(*dest_p, result_a, guard);
+                self.write_pred_reg(*dest_np, result_b, guard);
+                Some(result_a)
+            }
+
+            IrOp::CSetPred {
+                dest_p,
+                dest_np,
+                flow_test,
+                bop_pred,
+                neg_bop_pred,
+                bop,
+            } => {
+                let cc_result = self.lower_flow_test(*flow_test);
+                let bop_pred = self.resolve_pred(*bop_pred, *neg_bop_pred);
+                let result_a = self.lower_boolop(bop, cc_result, bop_pred);
+                let not_cc = self.b.logical_not(self.bool_t, None, cc_result).unwrap();
+                let result_b = self.lower_boolop(bop, not_cc, bop_pred);
+                let guard = inst
+                    .pred
+                    .map(|pred| self.resolve_pred(pred.idx, pred.negate));
+                self.write_pred_reg(*dest_p, result_a, guard);
+                self.write_pred_reg(*dest_np, result_b, guard);
+                Some(result_a)
+            }
+
+            IrOp::PSet {
+                pred_a,
+                neg_pred_a,
+                pred_b,
+                neg_pred_b,
+                pred_c,
+                neg_pred_c,
+                bop_1,
+                bop_2,
+                bool_float,
+            } => {
+                let pa = self.resolve_pred(*pred_a, *neg_pred_a);
+                let pb = self.resolve_pred(*pred_b, *neg_pred_b);
+                let pc = self.resolve_pred(*pred_c, *neg_pred_c);
+                let lhs = self.lower_boolop(bop_1, pa, pb);
+                let result = self.lower_boolop(bop_2, lhs, pc);
+                let true_value = if *bool_float {
+                    self.const_u32(0x3f80_0000)
+                } else {
+                    self.const_u32(0xffff_ffff)
+                };
+                let zero = self.const_u32(0);
+                let value = self
+                    .b
+                    .select(self.u32_t, None, result, true_value, zero)
+                    .unwrap();
+                Some(self.store_bits(value))
+            }
 
             IrOp::Kill => {
-                if std::env::var("NEXIUM_NO_KIL").ok().as_deref() == Some("1")
-                    || self.no_kil_shader
+                if std::env::var("NEXIUM_NO_KIL").ok().as_deref() == Some("1") || self.no_kil_shader
                 {
                     return;
                 }
@@ -1844,6 +1942,9 @@ impl Emitter {
                 self.b.begin_block(Some(kill_block)).unwrap();
                 self.b.kill().unwrap();
                 self.b.begin_block(Some(merge_block)).unwrap();
+                if let Some(block) = self.current_block {
+                    self.block_end_labels.insert(block, merge_block);
+                }
                 None
             }
 
@@ -1917,6 +2018,13 @@ impl Emitter {
         self.block_labels[&to_block]
     }
 
+    fn phi_pred_label(&self, block: BlockId) -> Word {
+        self.block_end_labels
+            .get(&block)
+            .copied()
+            .unwrap_or_else(|| self.block_labels[&block])
+    }
+
     fn emit_synth_merge_blocks(&mut self, m_block: &BasicBlock) {
         let m = m_block.id;
         let Some(synths) = self.synth_merge_blocks.get(&m).cloned() else {
@@ -1938,7 +2046,7 @@ impl Emitter {
                 for (pred, val) in sources {
                     if self.merge_redirect(*pred, m) == s_i {
                         let v = self.lower_value(val);
-                        let lbl = self.block_labels[pred];
+                        let lbl = self.phi_pred_label(*pred);
                         pairs.push((v, lbl));
                     }
                 }
@@ -1969,7 +2077,7 @@ impl Emitter {
                         let v = val
                             .and_then(|id| self.value_to_word.get(&id).copied())
                             .unwrap_or(self.bool_false);
-                        let lbl = self.block_labels[pred];
+                        let lbl = self.phi_pred_label(*pred);
                         pairs.push((v, lbl));
                     }
                 }
@@ -2006,6 +2114,7 @@ impl Emitter {
                 let label = self.block_labels[&block.id];
                 self.b.begin_block(Some(label)).unwrap();
             }
+            self.current_block = Some(block.id);
             self.lower_pred_phis(block);
             self.lower_phis(block);
             for inst in &block.program.instructions {
@@ -2017,6 +2126,7 @@ impl Emitter {
             if !single_block {
                 self.emit_terminator(block);
             }
+            self.current_block = None;
         }
     }
 
@@ -2032,7 +2142,7 @@ impl Emitter {
                         let v = val
                             .and_then(|id| self.value_to_word.get(&id).copied())
                             .unwrap_or(self.bool_false);
-                        let label = self.block_labels.get(pred).copied().unwrap_or(0);
+                        let label = self.phi_pred_label(*pred);
                         pairs.push((v, label));
                     }
                 }
@@ -2053,7 +2163,7 @@ impl Emitter {
                     let v = val
                         .and_then(|id| self.value_to_word.get(&id).copied())
                         .unwrap_or(self.bool_false);
-                    let label = self.block_labels.get(pred).copied().unwrap_or(0);
+                    let label = self.phi_pred_label(*pred);
                     pairs.push((v, label));
                 }
             }
@@ -2079,7 +2189,7 @@ impl Emitter {
                 for (pred_id, val) in sources {
                     if self.merge_redirect(*pred_id, m) == m_lbl {
                         let v = self.lower_value(val);
-                        let label = self.block_labels.get(pred_id).copied().unwrap_or(0);
+                        let label = self.phi_pred_label(*pred_id);
                         pairs.push((v, label));
                     }
                 }
@@ -2099,7 +2209,7 @@ impl Emitter {
             } else {
                 for (pred_id, val) in sources {
                     let v = self.lower_value(val);
-                    let label = self.block_labels.get(pred_id).copied().unwrap_or(0);
+                    let label = self.phi_pred_label(*pred_id);
                     pairs.push((v, label));
                 }
             }
@@ -2163,8 +2273,7 @@ impl Emitter {
                                 .unwrap();
                             v = self.b.f_mul(self.vec4_t, None, v, sv).unwrap();
                         }
-                        if std::env::var("NEXIUM_FS_COLOR_ALPHA_ONE").ok().as_deref() == Some("1")
-                        {
+                        if std::env::var("NEXIUM_FS_COLOR_ALPHA_ONE").ok().as_deref() == Some("1") {
                             let r = self.b.composite_extract(self.f32_t, None, v, [0]).unwrap();
                             let g = self.b.composite_extract(self.f32_t, None, v, [1]).unwrap();
                             let b = self.b.composite_extract(self.f32_t, None, v, [2]).unwrap();
@@ -2330,6 +2439,7 @@ impl Emitter {
         for block in &cfg.blocks {
             let id = self.b.id();
             self.block_labels.insert(block.id, id);
+            self.block_end_labels.insert(block.id, id);
         }
     }
 

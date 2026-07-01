@@ -4,17 +4,23 @@ use super::decode::decode_one;
 use super::ir::{BoolOp, FComp, ICmp, LogicOp, MufuFunc, Op, Predicate, Program, Value, ValueId};
 use super::opcodes::Opcode;
 use super::operand::{
-    ald_num_elements, attr_slot_ald, attr_slot_ipa, bfe_signed, cbuf, decoded_pred, f2f_mods,
-    f2i_signed, fadd32i_mods, fadd_mods, ffma32i_mods, ffma_mods, float_imm20, fmnmx_mods,
-    fmnmx_neg_pred, fmnmx_pred, fmul32i_mods, fmul_mods, fset_abs_a, fset_abs_b, fset_bop,
-    fset_cmp, fset_neg_a, fset_neg_b, fset_src_pred, fset_src_pred_inv, fsetp_abs_a, fsetp_abs_b,
-    fsetp_bop, fsetp_cmp, fsetp_dest_np, fsetp_dest_p, fsetp_neg_a, fsetp_neg_b, fsetp_src_pred,
-    fsetp_src_pred_inv, i2f_abs, i2f_int_format, i2f_neg, i2f_selector, i2f_signed, iadd_neg_a,
-    iadd_neg_b, imm20, imm32, iscadd_shift, iset_bf, iset_cmp, iset_signed, isetp_bop, isetp_cmp,
-    ipa_interpolation_mode, ipa_saturate, isetp_dest_np, isetp_dest_p, isetp_signed,
-    isetp_src_pred, isetp_src_pred_inv, ldc_ref, ldc_size, ldc_src_reg, ldg_addr_reg, ldg_offset,
-    ldg_size, lop32i_not_a, lop32i_not_b, lop32i_op, lop_not_a, lop_not_b, lop_op,
-    mufu_func_bits, reg_a, reg_b, reg_c, reg_dest, shr_signed, texs_tex_id, RZ,
+    ald_num_elements, attr_slot_ald, attr_slot_ipa, bfe_signed, cbuf, csetp_bop, csetp_bop_pred,
+    csetp_flow_test, csetp_neg_bop_pred, decoded_pred, f2f_mods, f2i_signed, fadd32i_mods,
+    fadd_mods, ffma32i_mods, ffma_mods, float_imm20, fmnmx_mods, fmnmx_neg_pred, fmnmx_pred,
+    fmul32i_mods, fmul_mods, fset_abs_a, fset_abs_b, fset_bop, fset_cmp, fset_neg_a, fset_neg_b,
+    fset_src_pred, fset_src_pred_inv, fsetp_abs_a, fsetp_abs_b, fsetp_bop, fsetp_cmp,
+    fsetp_dest_np, fsetp_dest_p, fsetp_neg_a, fsetp_neg_b, fsetp_src_pred, fsetp_src_pred_inv,
+    i2f_abs, i2f_int_format, i2f_neg, i2f_selector, i2f_signed, iadd3_half_a, iadd3_half_b,
+    iadd3_half_c, iadd3_neg_a, iadd3_neg_b, iadd3_neg_c, iadd3_shift, iadd_neg_a, iadd_neg_b,
+    imm20, imm32, ipa_interpolation_mode, ipa_saturate, iscadd_shift, iset_bf, iset_cmp,
+    iset_signed, isetp_bop, isetp_cmp, isetp_dest_np, isetp_dest_p, isetp_signed, isetp_src_pred,
+    isetp_src_pred_inv, ldc_ref, ldc_size, ldc_src_reg, ldg_addr_reg, ldg_offset, ldg_size,
+    lop32i_not_a, lop32i_not_b, lop32i_op, lop_not_a, lop_not_b, lop_op, mufu_func_bits,
+    pset_bool_float, psetp_bop_1, psetp_bop_2, psetp_dest_np, psetp_dest_p, psetp_neg_pred_a,
+    psetp_neg_pred_b, psetp_neg_pred_c, psetp_pred_a, psetp_pred_b, psetp_pred_c, reg_a, reg_b,
+    reg_c, reg_dest, sel_neg_pred, sel_pred, shr_signed, texs_tex_id, xmad_cr_mrg, xmad_cr_psl,
+    xmad_half_a, xmad_imm_src_b, xmad_rc_half_b, xmad_rc_select, xmad_reg_half_b, xmad_reg_mrg,
+    xmad_reg_psl, xmad_reg_select, xmad_signed_a, xmad_signed_b, RZ,
 };
 
 const PT: u8 = 7;
@@ -188,6 +194,301 @@ impl Translator {
                 neg_a: iadd_neg_a(raw),
                 neg_b: iadd_neg_b(raw),
             },
+            pred,
+        );
+    }
+
+    fn emit_sel(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        self.write_reg(
+            dest,
+            Op::SelectPred {
+                pred: Predicate {
+                    idx: sel_pred(raw),
+                    negate: sel_neg_pred(raw),
+                },
+                if_true: a,
+                if_false: b,
+            },
+            pred,
+        );
+    }
+
+    fn emit_psetp(&mut self, raw: u64, pred: Option<Predicate>) {
+        let dest_p = psetp_dest_p(raw);
+        let dest_np = psetp_dest_np(raw);
+        let op = Op::PSetPred {
+            dest_p,
+            dest_np,
+            pred_a: psetp_pred_a(raw),
+            neg_pred_a: psetp_neg_pred_a(raw),
+            pred_b: psetp_pred_b(raw),
+            neg_pred_b: psetp_neg_pred_b(raw),
+            pred_c: psetp_pred_c(raw),
+            neg_pred_c: psetp_neg_pred_c(raw),
+            bop_1: BoolOp::from_bits(psetp_bop_1(raw)),
+            bop_2: BoolOp::from_bits(psetp_bop_2(raw)),
+        };
+        let id = self.program.emit_pred(op, None, pred);
+        if dest_p != PT {
+            self.pred_state.insert(dest_p, id);
+        }
+        if dest_np != PT {
+            self.pred_state.insert(dest_np, id);
+        }
+    }
+
+    fn emit_csetp(&mut self, raw: u64, pred: Option<Predicate>) {
+        let dest_p = psetp_dest_p(raw);
+        let dest_np = psetp_dest_np(raw);
+        let op = Op::CSetPred {
+            dest_p,
+            dest_np,
+            flow_test: csetp_flow_test(raw),
+            bop_pred: csetp_bop_pred(raw),
+            neg_bop_pred: csetp_neg_bop_pred(raw),
+            bop: BoolOp::from_bits(csetp_bop(raw)),
+        };
+        let id = self.program.emit_pred(op, None, pred);
+        if dest_p != PT {
+            self.pred_state.insert(dest_p, id);
+        }
+        if dest_np != PT {
+            self.pred_state.insert(dest_np, id);
+        }
+    }
+
+    fn emit_pset(&mut self, raw: u64, pred: Option<Predicate>) {
+        self.write_reg(
+            reg_dest(raw),
+            Op::PSet {
+                pred_a: psetp_pred_a(raw),
+                neg_pred_a: psetp_neg_pred_a(raw),
+                pred_b: psetp_pred_b(raw),
+                neg_pred_b: psetp_neg_pred_b(raw),
+                pred_c: psetp_pred_c(raw),
+                neg_pred_c: psetp_neg_pred_c(raw),
+                bop_1: BoolOp::from_bits(psetp_bop_1(raw)),
+                bop_2: BoolOp::from_bits(psetp_bop_2(raw)),
+                bool_float: pset_bool_float(raw),
+            },
+            pred,
+        );
+    }
+
+    fn emit_value(&mut self, op: Op) -> Value {
+        Value::Inst(self.program.emit(op, None))
+    }
+
+    fn emit_bfe_value(&mut self, a: Value, pos: u32, count: u32, signed: bool) -> Value {
+        self.emit_value(Op::Bfe {
+            a,
+            b: Value::ImmU32(pos | (count << 8)),
+            signed,
+        })
+    }
+
+    fn emit_iadd_value(&mut self, a: Value, b: Value, neg_a: bool, neg_b: bool) -> Value {
+        self.emit_value(Op::IAdd { a, b, neg_a, neg_b })
+    }
+
+    fn emit_ineg_value(&mut self, value: Value) -> Value {
+        self.emit_iadd_value(Value::Zero, value, false, true)
+    }
+
+    fn emit_imul_value(&mut self, a: Value, b: Value) -> Value {
+        self.emit_value(Op::IMul { a, b })
+    }
+
+    fn emit_ishl_imm_value(&mut self, a: Value, shift: u32) -> Value {
+        self.emit_value(Op::IShl {
+            a,
+            b: Value::ImmU32(shift),
+        })
+    }
+
+    fn emit_ishr_imm_value(&mut self, a: Value, shift: u32) -> Value {
+        self.emit_value(Op::IShr {
+            a,
+            b: Value::ImmU32(shift),
+            signed: false,
+        })
+    }
+
+    fn emit_ilop_imm_value(
+        &mut self,
+        a: Value,
+        b: u32,
+        op: LogicOp,
+        not_a: bool,
+        not_b: bool,
+    ) -> Value {
+        self.emit_value(Op::ILop {
+            a,
+            b: Value::ImmU32(b),
+            op,
+            not_a,
+            not_b,
+        })
+    }
+
+    fn iadd3_half(&mut self, value: Value, half: u8) -> Value {
+        match half {
+            1 => self.emit_bfe_value(value, 0, 16, false),
+            2 => self.emit_bfe_value(value, 16, 16, false),
+            _ => value,
+        }
+    }
+
+    fn xmad_half(&mut self, value: Value, half: u8, signed: bool) -> Value {
+        let pos = if half != 0 { 16 } else { 0 };
+        self.emit_bfe_value(value, pos, 16, signed)
+    }
+
+    fn emit_iadd3_common(
+        &mut self,
+        raw: u64,
+        mut op_a: Value,
+        mut op_b: Value,
+        mut op_c: Value,
+        shift: u8,
+        pred: Option<Predicate>,
+    ) {
+        if iadd3_neg_a(raw) {
+            op_a = self.emit_ineg_value(op_a);
+        }
+        if iadd3_neg_b(raw) {
+            op_b = self.emit_ineg_value(op_b);
+        }
+        if iadd3_neg_c(raw) {
+            op_c = self.emit_ineg_value(op_c);
+        }
+        let lhs = self.emit_iadd_value(op_a, op_b, false, false);
+        let lhs = match shift {
+            1 => self.emit_ishr_imm_value(lhs, 16),
+            2 => self.emit_ishl_imm_value(lhs, 16),
+            _ => lhs,
+        };
+        let result = self.emit_iadd_value(lhs, op_c, false, false);
+        self.write_reg(reg_dest(raw), Op::Mov(result), pred);
+    }
+
+    fn emit_iadd3_reg(&mut self, raw: u64, pred: Option<Predicate>) {
+        let a = self.iadd3_half(self.read_reg(reg_a(raw)), iadd3_half_a(raw));
+        let b = self.iadd3_half(self.read_reg(reg_b(raw)), iadd3_half_b(raw));
+        let c = self.iadd3_half(self.read_reg(reg_c(raw)), iadd3_half_c(raw));
+        self.emit_iadd3_common(raw, a, b, c, iadd3_shift(raw), pred);
+    }
+
+    fn emit_iadd3(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
+        self.emit_iadd3_common(
+            raw,
+            self.read_reg(reg_a(raw)),
+            b,
+            self.read_reg(reg_c(raw)),
+            0,
+            pred,
+        );
+    }
+
+    fn emit_xmad_common(
+        &mut self,
+        raw: u64,
+        src_b: Value,
+        src_c: Value,
+        select: u8,
+        half_b: u8,
+        psl: bool,
+        mrg: bool,
+        pred: Option<Predicate>,
+    ) {
+        let a = self.xmad_half(
+            self.read_reg(reg_a(raw)),
+            xmad_half_a(raw),
+            xmad_signed_a(raw),
+        );
+        let b = self.xmad_half(src_b, half_b, xmad_signed_b(raw));
+        let mut product = self.emit_imul_value(a, b);
+        if psl {
+            product = self.emit_ishl_imm_value(product, 16);
+        }
+        let c = match select {
+            1 => self.emit_bfe_value(src_c, 0, 16, false),
+            2 => self.emit_bfe_value(src_c, 16, 16, false),
+            4 => {
+                let shifted_b = self.emit_ishl_imm_value(src_b, 16);
+                self.emit_iadd_value(shifted_b, src_c, false, false)
+            }
+            _ => src_c,
+        };
+        let mut result = self.emit_iadd_value(product, c, false, false);
+        if mrg {
+            let low_result =
+                self.emit_ilop_imm_value(result, 0x0000_ffff, LogicOp::And, false, false);
+            let low_b = self.emit_bfe_value(src_b, 0, 16, false);
+            let high_b = self.emit_ishl_imm_value(low_b, 16);
+            result = self.emit_value(Op::ILop {
+                a: low_result,
+                b: high_b,
+                op: LogicOp::Or,
+                not_a: false,
+                not_b: false,
+            });
+        }
+        self.write_reg(reg_dest(raw), Op::Mov(result), pred);
+    }
+
+    fn emit_xmad_reg(&mut self, raw: u64, pred: Option<Predicate>) {
+        self.emit_xmad_common(
+            raw,
+            self.read_reg(reg_b(raw)),
+            self.read_reg(reg_c(raw)),
+            xmad_reg_select(raw),
+            xmad_reg_half_b(raw),
+            xmad_reg_psl(raw),
+            xmad_reg_mrg(raw),
+            pred,
+        );
+    }
+
+    fn emit_xmad_rc(&mut self, raw: u64, pred: Option<Predicate>) {
+        let cbuf = Value::Inst(self.load_cbuf(raw));
+        self.emit_xmad_common(
+            raw,
+            self.read_reg(reg_c(raw)),
+            cbuf,
+            xmad_rc_select(raw),
+            xmad_rc_half_b(raw),
+            false,
+            false,
+            pred,
+        );
+    }
+
+    fn emit_xmad_cr(&mut self, raw: u64, pred: Option<Predicate>) {
+        let cbuf = Value::Inst(self.load_cbuf(raw));
+        self.emit_xmad_common(
+            raw,
+            cbuf,
+            self.read_reg(reg_c(raw)),
+            xmad_rc_select(raw),
+            xmad_rc_half_b(raw),
+            xmad_cr_psl(raw),
+            xmad_cr_mrg(raw),
+            pred,
+        );
+    }
+
+    fn emit_xmad_imm(&mut self, raw: u64, pred: Option<Predicate>) {
+        self.emit_xmad_common(
+            raw,
+            Value::ImmU32(xmad_imm_src_b(raw)),
+            self.read_reg(reg_c(raw)),
+            xmad_reg_select(raw),
+            0,
+            xmad_reg_psl(raw),
+            xmad_reg_mrg(raw),
             pred,
         );
     }
@@ -684,37 +985,28 @@ impl Translator {
             }
 
             Opcode::TEX => {
-                let tex_type = ((raw >> 28) & 0x7) as u32;
-                if tex_type == 2 {
-                    let tex_id = texs_tex_id(raw);
-                    let coord = reg_a(raw);
-                    let u = self.read_reg(coord);
-                    let v = self.read_reg(coord.wrapping_add(1));
-                    let mask = ((raw >> 31) & 0xF) as u8;
-                    let mut dst = reg_dest(raw);
-                    for component in 0..4u8 {
-                        if (mask >> component) & 1 == 0 {
-                            continue;
-                        }
-                        self.write_reg(
-                            dst,
-                            Op::SampleTex {
-                                tex_id,
-                                u,
-                                v,
-                                array: None,
-                                component,
-                            },
-                            pred,
-                        );
-                        dst = dst.wrapping_add(1);
+                let tex_id = texs_tex_id(raw);
+                let coord = reg_a(raw);
+                let u = self.read_reg(coord);
+                let v = self.read_reg(coord.wrapping_add(1));
+                let mask = ((raw >> 31) & 0xF) as u8;
+                let mut dst = reg_dest(raw);
+                for component in 0..4u8 {
+                    if (mask >> component) & 1 == 0 {
+                        continue;
                     }
-                } else {
-                    self.program.emit_void(Op::Unimplemented {
-                        opcode: Opcode::TEX,
-                        raw,
-                    });
-                    self.unimplemented_count += 1;
+                    self.write_reg(
+                        dst,
+                        Op::SampleTex {
+                            tex_id,
+                            u,
+                            v,
+                            array: None,
+                            component,
+                        },
+                        pred,
+                    );
+                    dst = dst.wrapping_add(1);
                 }
             }
 
@@ -772,6 +1064,30 @@ impl Translator {
                         pred,
                     );
                     store_index += 1;
+                }
+            }
+
+            Opcode::TMML | Opcode::TMML_b => {
+                let mask = ((raw >> 31) & 0xF) as u8;
+                let mut dst = reg_dest(raw);
+                for component in 0..4u8 {
+                    if (mask >> component) & 1 == 0 {
+                        continue;
+                    }
+                    self.write_reg(dst, Op::Mov(Value::Zero), pred);
+                    dst = dst.wrapping_add(1);
+                }
+            }
+
+            Opcode::TXQ | Opcode::TXQ_b | Opcode::TLD4 | Opcode::TLD4_b => {
+                let mask = ((raw >> 31) & 0xF) as u8;
+                let mut dst = reg_dest(raw);
+                for component in 0..4u8 {
+                    if (mask >> component) & 1 == 0 {
+                        continue;
+                    }
+                    self.write_reg(dst, Op::Mov(Value::Zero), pred);
+                    dst = dst.wrapping_add(1);
                 }
             }
 
@@ -926,6 +1242,16 @@ impl Translator {
                 }
             }
 
+            Opcode::PSETP => {
+                self.emit_psetp(raw, pred);
+            }
+            Opcode::CSETP => {
+                self.emit_csetp(raw, pred);
+            }
+            Opcode::PSET => {
+                self.emit_pset(raw, pred);
+            }
+
             Opcode::KIL => {
                 self.program.emit_void_pred(Op::Kill, pred);
             }
@@ -943,6 +1269,29 @@ impl Translator {
             }
             Opcode::IADD32I => {
                 self.emit_iadd(raw, Value::ImmU32(imm32(raw)), pred);
+            }
+
+            Opcode::IADD3_reg => {
+                self.emit_iadd3_reg(raw, pred);
+            }
+            Opcode::IADD3_cbuf => {
+                let id = self.load_cbuf(raw);
+                self.emit_iadd3(raw, Value::Inst(id), pred);
+            }
+            Opcode::IADD3_imm => {
+                self.emit_iadd3(raw, Value::ImmU32(imm20(raw) as u32), pred);
+            }
+
+            Opcode::SEL_reg => {
+                let b = self.read_reg(reg_b(raw));
+                self.emit_sel(raw, b, pred);
+            }
+            Opcode::SEL_cbuf => {
+                let id = self.load_cbuf(raw);
+                self.emit_sel(raw, Value::Inst(id), pred);
+            }
+            Opcode::SEL_imm => {
+                self.emit_sel(raw, Value::ImmU32(imm20(raw) as u32), pred);
             }
 
             Opcode::ISCADD_reg => {
@@ -1022,6 +1371,19 @@ impl Translator {
                     lop32i_not_b(raw),
                     pred,
                 );
+            }
+
+            Opcode::XMAD_reg => {
+                self.emit_xmad_reg(raw, pred);
+            }
+            Opcode::XMAD_rc => {
+                self.emit_xmad_rc(raw, pred);
+            }
+            Opcode::XMAD_cr => {
+                self.emit_xmad_cr(raw, pred);
+            }
+            Opcode::XMAD_imm => {
+                self.emit_xmad_imm(raw, pred);
             }
 
             Opcode::BFE_reg => {

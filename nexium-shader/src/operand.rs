@@ -446,6 +446,186 @@ pub fn fmnmx_neg_pred(insn: u64) -> bool {
 }
 
 #[inline]
+pub fn sel_pred(insn: u64) -> u8 {
+    bits(insn, 39, 41) as u8
+}
+
+#[inline]
+pub fn sel_neg_pred(insn: u64) -> bool {
+    bits(insn, 42, 42) != 0
+}
+
+#[inline]
+pub fn psetp_dest_np(insn: u64) -> u8 {
+    bits(insn, 0, 2) as u8
+}
+
+#[inline]
+pub fn psetp_dest_p(insn: u64) -> u8 {
+    bits(insn, 3, 5) as u8
+}
+
+#[inline]
+pub fn psetp_pred_a(insn: u64) -> u8 {
+    bits(insn, 12, 14) as u8
+}
+
+#[inline]
+pub fn psetp_neg_pred_a(insn: u64) -> bool {
+    bits(insn, 15, 15) != 0
+}
+
+#[inline]
+pub fn psetp_bop_1(insn: u64) -> u64 {
+    bits(insn, 24, 25)
+}
+
+#[inline]
+pub fn psetp_pred_b(insn: u64) -> u8 {
+    bits(insn, 29, 31) as u8
+}
+
+#[inline]
+pub fn psetp_neg_pred_b(insn: u64) -> bool {
+    bits(insn, 32, 32) != 0
+}
+
+#[inline]
+pub fn psetp_pred_c(insn: u64) -> u8 {
+    bits(insn, 39, 41) as u8
+}
+
+#[inline]
+pub fn psetp_neg_pred_c(insn: u64) -> bool {
+    bits(insn, 42, 42) != 0
+}
+
+#[inline]
+pub fn psetp_bop_2(insn: u64) -> u64 {
+    bits(insn, 45, 46)
+}
+
+#[inline]
+pub fn pset_bool_float(insn: u64) -> bool {
+    bits(insn, 44, 44) != 0
+}
+
+#[inline]
+pub fn csetp_flow_test(insn: u64) -> u8 {
+    bits(insn, 8, 12) as u8
+}
+
+#[inline]
+pub fn csetp_bop_pred(insn: u64) -> u8 {
+    bits(insn, 39, 41) as u8
+}
+
+#[inline]
+pub fn csetp_neg_bop_pred(insn: u64) -> bool {
+    bits(insn, 42, 42) != 0
+}
+
+#[inline]
+pub fn csetp_bop(insn: u64) -> u64 {
+    bits(insn, 45, 46)
+}
+
+#[inline]
+pub fn iadd3_shift(insn: u64) -> u8 {
+    bits(insn, 37, 38) as u8
+}
+
+#[inline]
+pub fn iadd3_half_a(insn: u64) -> u8 {
+    bits(insn, 35, 36) as u8
+}
+
+#[inline]
+pub fn iadd3_half_b(insn: u64) -> u8 {
+    bits(insn, 33, 34) as u8
+}
+
+#[inline]
+pub fn iadd3_half_c(insn: u64) -> u8 {
+    bits(insn, 31, 32) as u8
+}
+
+#[inline]
+pub fn iadd3_neg_a(insn: u64) -> bool {
+    bits(insn, 51, 51) != 0
+}
+
+#[inline]
+pub fn iadd3_neg_b(insn: u64) -> bool {
+    bits(insn, 50, 50) != 0
+}
+
+#[inline]
+pub fn iadd3_neg_c(insn: u64) -> bool {
+    bits(insn, 49, 49) != 0
+}
+
+#[inline]
+pub fn xmad_half_a(insn: u64) -> u8 {
+    bits(insn, 53, 53) as u8
+}
+
+#[inline]
+pub fn xmad_signed_a(insn: u64) -> bool {
+    bits(insn, 48, 48) != 0
+}
+
+#[inline]
+pub fn xmad_signed_b(insn: u64) -> bool {
+    bits(insn, 49, 49) != 0
+}
+
+#[inline]
+pub fn xmad_reg_half_b(insn: u64) -> u8 {
+    bits(insn, 35, 35) as u8
+}
+
+#[inline]
+pub fn xmad_reg_psl(insn: u64) -> bool {
+    bits(insn, 36, 36) != 0
+}
+
+#[inline]
+pub fn xmad_reg_mrg(insn: u64) -> bool {
+    bits(insn, 37, 37) != 0
+}
+
+#[inline]
+pub fn xmad_reg_select(insn: u64) -> u8 {
+    bits(insn, 50, 52) as u8
+}
+
+#[inline]
+pub fn xmad_rc_half_b(insn: u64) -> u8 {
+    bits(insn, 52, 52) as u8
+}
+
+#[inline]
+pub fn xmad_rc_select(insn: u64) -> u8 {
+    bits(insn, 50, 51) as u8
+}
+
+#[inline]
+pub fn xmad_cr_psl(insn: u64) -> bool {
+    bits(insn, 55, 55) != 0
+}
+
+#[inline]
+pub fn xmad_cr_mrg(insn: u64) -> bool {
+    bits(insn, 56, 56) != 0
+}
+
+#[inline]
+pub fn xmad_imm_src_b(insn: u64) -> u32 {
+    bits(insn, 20, 35) as u32
+}
+
+#[inline]
 pub fn iscadd_shift(insn: u64) -> u8 {
     bits(insn, 39, 43) as u8
 }

@@ -362,11 +362,50 @@ pub enum Op {
         dest_np: u8,
     },
 
+    PSetPred {
+        dest_p: u8,
+        dest_np: u8,
+        pred_a: u8,
+        neg_pred_a: bool,
+        pred_b: u8,
+        neg_pred_b: bool,
+        pred_c: u8,
+        neg_pred_c: bool,
+        bop_1: BoolOp,
+        bop_2: BoolOp,
+    },
+
+    CSetPred {
+        dest_p: u8,
+        dest_np: u8,
+        flow_test: u8,
+        bop_pred: u8,
+        neg_bop_pred: bool,
+        bop: BoolOp,
+    },
+
+    PSet {
+        pred_a: u8,
+        neg_pred_a: bool,
+        pred_b: u8,
+        neg_pred_b: bool,
+        pred_c: u8,
+        neg_pred_c: bool,
+        bop_1: BoolOp,
+        bop_2: BoolOp,
+        bool_float: bool,
+    },
+
     IAdd {
         a: Value,
         b: Value,
         neg_a: bool,
         neg_b: bool,
+    },
+
+    IMul {
+        a: Value,
+        b: Value,
     },
 
     IScAdd {
@@ -580,7 +619,10 @@ impl Inst {
                 mode,
                 sat,
             } => {
-                write!(f, "Interp a[{slot:#x}], persp={perspective}, mode={mode}, sat={sat}")
+                write!(
+                    f,
+                    "Interp a[{slot:#x}], persp={perspective}, mode={mode}, sat={sat}"
+                )
             }
             Op::SampleTex {
                 tex_id,
@@ -655,7 +697,24 @@ impl Inst {
             } => {
                 write!(f, "ISetP.{cmp:?}.{bop:?} P{dest_p}, {src_a}, {src_b}")
             }
+            Op::PSetPred {
+                dest_p,
+                pred_a,
+                pred_b,
+                pred_c,
+                ..
+            } => write!(f, "PSetP P{dest_p}, P{pred_a}, P{pred_b}, P{pred_c}"),
+            Op::CSetPred {
+                dest_p, flow_test, ..
+            } => write!(f, "CSetP P{dest_p}, flow={flow_test}"),
+            Op::PSet {
+                pred_a,
+                pred_b,
+                pred_c,
+                ..
+            } => write!(f, "PSet P{pred_a}, P{pred_b}, P{pred_c}"),
             Op::IAdd { a, b, .. } => write!(f, "IAdd  {a}, {b}"),
+            Op::IMul { a, b } => write!(f, "IMul  {a}, {b}"),
             Op::IScAdd { a, b, shift, .. } => write!(f, "IScAdd {a}, {b} << {shift}"),
             Op::ILop { a, b, op, .. } => write!(f, "ILop.{op:?} {a}, {b}"),
             Op::IShl { a, b } => write!(f, "IShl  {a}, {b}"),
