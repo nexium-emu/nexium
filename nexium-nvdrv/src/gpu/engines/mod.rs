@@ -5,6 +5,7 @@ pub mod macro_engine;
 pub mod maxwell3d;
 pub mod maxwell_dma;
 pub mod sw_renderer;
+mod compute_cpu;
 pub use fermi_2d::{Fermi2D, FERMI_2D_CLASS};
 pub use kepler_compute::{KeplerCompute, KEPLER_COMPUTE_CLASS};
 pub use kepler_memory::{KeplerMemory, KEPLER_MEMORY_CLASS};

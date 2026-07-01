@@ -17,8 +17,15 @@ const M_EXEC_UPLOAD: u32 = 0x6C;
 const M_LOAD_INLINE_DATA: u32 = 0x6D;
 const M_LAUNCH_DESC_LOC: u32 = 0xAD;
 const M_LAUNCH: u32 = 0xAF;
+const M_TSC_ADDRESS_HIGH: u32 = 0x557;
+const M_TSC_ADDRESS_LOW: u32 = 0x558;
+const M_TSC_LIMIT: u32 = 0x559;
+const M_TIC_ADDRESS_HIGH: u32 = 0x55D;
+const M_TIC_ADDRESS_LOW: u32 = 0x55E;
+const M_TIC_LIMIT: u32 = 0x55F;
 const M_CODE_LOC_UPPER: u32 = 0x582;
 const M_CODE_LOC_LOWER: u32 = 0x583;
+const M_TEX_CB_INDEX: u32 = 0x982;
 const LAUNCH_WORDS: usize = 0x40;
 
 pub struct KeplerCompute {
@@ -61,12 +68,17 @@ impl KeplerCompute {
                 self.upload
                     .data(arg, is_last_call, mappings, mem_read, mem_write, &self.regs)
             }
-            M_LAUNCH => self.launch(mappings, mem_read),
+            M_LAUNCH => self.launch(mappings, mem_read, mem_write),
             _ => {}
         }
     }
 
-    fn launch(&mut self, mappings: &GpuMappings, mem_read: &dyn Fn(u64, &mut [u8]) -> bool) {
+    fn launch(
+        &mut self,
+        mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
         let launch_gpu = (self.reg(M_LAUNCH_DESC_LOC) as u64) << 8;
         let launch_cpu = mappings.cpu_address_for(launch_gpu).unwrap_or(launch_gpu);
         let mut bytes = [0u8; LAUNCH_WORDS * 4];
@@ -89,11 +101,31 @@ impl KeplerCompute {
             );
         }
 
+        let code_base =
+            ((self.reg(M_CODE_LOC_UPPER) as u64) << 32) | self.reg(M_CODE_LOC_LOWER) as u64;
+        let texture = super::compute_cpu::ComputeTextureState {
+            tic_pool_gpu_va: ((self.reg(M_TIC_ADDRESS_HIGH) as u64) << 32)
+                | self.reg(M_TIC_ADDRESS_LOW) as u64,
+            tic_limit: self.reg(M_TIC_LIMIT),
+            tsc_pool_gpu_va: ((self.reg(M_TSC_ADDRESS_HIGH) as u64) << 32)
+                | self.reg(M_TSC_ADDRESS_LOW) as u64,
+            tsc_limit: self.reg(M_TSC_LIMIT),
+            tex_cb_index: self.reg(M_TEX_CB_INDEX),
+        };
+        let executed = super::compute_cpu::try_execute(
+            &self.launch_description,
+            code_base,
+            texture,
+            mappings,
+            mem_read,
+            mem_write,
+            self.launch_count,
+        );
+
         if self.launch_count < 8 {
-            let code_base = ((self.reg(M_CODE_LOC_UPPER) as u64) << 32)
-                | self.reg(M_CODE_LOC_LOWER) as u64;
             log::warn!(
-                "KeplerCompute::launch ignored gpu={:#x} code={:#x} program_start={:#x} grid=({}, {}, {}) block=({}, {}, {})",
+                "KeplerCompute::launch {} gpu={:#x} code={:#x} program_start={:#x} grid=({}, {}, {}) block=({}, {}, {}) tic={:#x}/{} tsc={:#x}/{} tex_cb={}",
+                if executed { "cpu" } else { "ignored" },
                 launch_gpu,
                 code_base,
                 self.launch_description[0x8],
@@ -102,7 +134,12 @@ impl KeplerCompute {
                 self.launch_description[0xD] >> 16,
                 self.launch_description[0x12] >> 16,
                 self.launch_description[0x13] & 0xFFFF,
-                self.launch_description[0x13] >> 16
+                self.launch_description[0x13] >> 16,
+                texture.tic_pool_gpu_va,
+                texture.tic_limit,
+                texture.tsc_pool_gpu_va,
+                texture.tsc_limit,
+                texture.tex_cb_index
             );
             self.dump_launch(launch_gpu, code_base, mappings, mem_read);
         }
@@ -130,10 +167,14 @@ impl KeplerCompute {
         let _ = std::fs::write(dir.join(format!("compute_{idx:04}_desc.bin")), desc);
 
         let code_gpu = code_base + self.launch_description[0x8] as u64;
+        let code_dump_len = std::env::var("NEXIUM_COMPUTE_CODE_DUMP_SIZE")
+            .ok()
+            .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x10000);
         if let Some(code) = self.dump_range(
             &dir.join(format!("compute_{idx:04}_code.bin")),
             code_gpu,
-            0x1000,
+            code_dump_len,
             mappings,
             mem_read,
         ) {
