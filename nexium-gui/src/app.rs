@@ -217,6 +217,15 @@ impl HorizonApp {
     }
 }
 
+fn parse_u64_value(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        t.parse::<u64>().ok()
+    }
+}
+
 fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
     let font = FontId::proportional(12.5);
     let text_w = ui.fonts(|f| {
@@ -351,19 +360,57 @@ impl eframe::App for HorizonApp {
                 (0u64, [0i32; 4])
             };
             let mut buttons = kb_buttons | gp_buttons;
-            if let Some(delay_ms) = std::env::var("NEXIUM_AUTO_PRESS_A_MS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
+            if std::env::var_os("NEXIUM_AUTO_PRESS_A_MS").is_some()
+                || std::env::var_os("NEXIUM_AUTO_PRESS_SEQUENCE").is_some()
             {
-                static START: std::sync::OnceLock<std::time::Instant> =
-                    std::sync::OnceLock::new();
-                let len_ms = std::env::var("NEXIUM_AUTO_PRESS_A_LEN_MS")
+                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                let elapsed_ms = START
+                    .get_or_init(std::time::Instant::now)
+                    .elapsed()
+                    .as_millis() as u64;
+                let mut auto_buttons = 0u64;
+                if let Ok(sequence) = std::env::var("NEXIUM_AUTO_PRESS_SEQUENCE") {
+                    for step in sequence.split(',') {
+                        let mut parts = step.split(':');
+                        let Some(delay_ms) = parts.next().and_then(parse_u64_value) else {
+                            continue;
+                        };
+                        let len_ms = parts.next().and_then(parse_u64_value).unwrap_or(2000);
+                        let mask = parts
+                            .next()
+                            .and_then(parse_u64_value)
+                            .unwrap_or(nexium_core::hid_state::NPAD_BUTTON_A);
+                        if elapsed_ms >= delay_ms && elapsed_ms < delay_ms.saturating_add(len_ms) {
+                            auto_buttons |= mask;
+                        }
+                    }
+                } else if let Some(delay_ms) = std::env::var("NEXIUM_AUTO_PRESS_A_MS")
                     .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(2000);
-                let elapsed_ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
-                if elapsed_ms >= delay_ms && elapsed_ms < delay_ms.saturating_add(len_ms) {
-                    buttons |= nexium_core::hid_state::NPAD_BUTTON_A;
+                    .and_then(|s| parse_u64_value(&s))
+                {
+                    let len_ms = std::env::var("NEXIUM_AUTO_PRESS_A_LEN_MS")
+                        .ok()
+                        .and_then(|s| parse_u64_value(&s))
+                        .unwrap_or(2000);
+                    let mask = std::env::var("NEXIUM_AUTO_PRESS_MASK")
+                        .ok()
+                        .and_then(|s| parse_u64_value(&s))
+                        .unwrap_or(nexium_core::hid_state::NPAD_BUTTON_A);
+                    if elapsed_ms >= delay_ms && elapsed_ms < delay_ms.saturating_add(len_ms) {
+                        auto_buttons |= mask;
+                    }
+                }
+                buttons |= auto_buttons;
+                static LAST_AUTO_BUTTONS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(u64::MAX);
+                let last =
+                    LAST_AUTO_BUTTONS.swap(auto_buttons, std::sync::atomic::Ordering::Relaxed);
+                if last != auto_buttons {
+                    log::info!(
+                        "auto input elapsed_ms={} buttons={:#x}",
+                        elapsed_ms,
+                        auto_buttons
+                    );
                 }
             }
             let mut sticks = kb_sticks;
