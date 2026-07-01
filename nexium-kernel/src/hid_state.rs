@@ -11,6 +11,7 @@ const DEBUGPAD_OFFSET: usize = 0x0;
 const NPAD_OFFSET: usize = 0x9A00;
 const NPAD_ENTRY_SIZE: usize = 0x5000;
 const NPAD_ENTRY_HANDHELD: usize = 8;
+const NPAD_ENTRY_OTHER: usize = 9;
 const NPAD_ENTRY_PLAYER1: usize = 0;
 
 const NPAD_STYLE_TAG_OFFSET: usize = 0x00;
@@ -26,9 +27,14 @@ const LIFO_STORAGE_COUNT: usize = 17;
 
 pub const STYLE_FULLKEY: u32 = 1 << 0;
 pub const STYLE_HANDHELD: u32 = 1 << 1;
+pub const STYLE_SYSTEM_EXT: u32 = 1 << 29;
 
 pub const ATTR_IS_CONNECTED: u32 = 1 << 0;
 pub const ATTR_IS_WIRED: u32 = 1 << 1;
+pub const ATTR_LEFT_CONNECTED: u32 = 1 << 2;
+pub const ATTR_LEFT_WIRED: u32 = 1 << 3;
+pub const ATTR_RIGHT_CONNECTED: u32 = 1 << 4;
+pub const ATTR_RIGHT_WIRED: u32 = 1 << 5;
 
 pub const NPAD_BUTTON_A: u64 = 1 << 0;
 pub const NPAD_BUTTON_B: u64 = 1 << 1;
@@ -122,12 +128,50 @@ impl HidState {
             self.last_logged_buttons = input.buttons;
         }
         self.sampling_number = self.sampling_number.wrapping_add(1);
-        let configs = [(NPAD_ENTRY_PLAYER1, false), (NPAD_ENTRY_HANDHELD, true)];
         let sampling = self.sampling_number;
-        for (entry_idx, _is_handheld) in configs {
-            for layout in 0..LAYOUT_COUNT {
-                let lifo_off = LAYOUT_BASE_OFFSET + layout * LAYOUT_STRIDE;
-                Self::write_npad_entry(&mut self.buf[..], entry_idx, lifo_off, &input, sampling);
+        for entry_idx in 0..=NPAD_ENTRY_OTHER {
+            match entry_idx {
+                NPAD_ENTRY_PLAYER1 => {
+                    Self::write_entry_style(
+                        &mut self.buf[..],
+                        entry_idx,
+                        STYLE_FULLKEY | STYLE_SYSTEM_EXT,
+                    );
+                    Self::write_npad_lifo(
+                        &mut self.buf[..],
+                        entry_idx,
+                        0,
+                        &input,
+                        sampling,
+                        ATTR_IS_CONNECTED | ATTR_IS_WIRED,
+                    );
+                    Self::write_npad_lifo(
+                        &mut self.buf[..],
+                        entry_idx,
+                        6,
+                        &input,
+                        sampling,
+                        ATTR_IS_CONNECTED | ATTR_IS_WIRED,
+                    );
+                }
+                NPAD_ENTRY_HANDHELD => {
+                    let attr = ATTR_IS_CONNECTED
+                        | ATTR_IS_WIRED
+                        | ATTR_LEFT_CONNECTED
+                        | ATTR_LEFT_WIRED
+                        | ATTR_RIGHT_CONNECTED
+                        | ATTR_RIGHT_WIRED;
+                    Self::write_entry_style(
+                        &mut self.buf[..],
+                        entry_idx,
+                        STYLE_HANDHELD | STYLE_SYSTEM_EXT,
+                    );
+                    Self::write_npad_lifo(&mut self.buf[..], entry_idx, 1, &input, sampling, attr);
+                    Self::write_npad_lifo(&mut self.buf[..], entry_idx, 6, &input, sampling, attr);
+                }
+                _ => {
+                    Self::write_entry_style(&mut self.buf[..], entry_idx, 0);
+                }
             }
         }
 
@@ -140,7 +184,9 @@ impl HidState {
             );
             for (entry_idx, name) in [
                 (NPAD_ENTRY_PLAYER1, "Player1"),
+                (1usize, "Player2"),
                 (NPAD_ENTRY_HANDHELD, "Handheld"),
+                (NPAD_ENTRY_OTHER, "Other"),
             ] {
                 let base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
                 let style =
@@ -157,7 +203,21 @@ impl HidState {
                     let lifo = base + LAYOUT_BASE_OFFSET + layout_idx * LAYOUT_STRIDE;
                     let hdr0 =
                         u64::from_le_bytes(self.buf[lifo..lifo + 8].try_into().unwrap_or([0; 8]));
-                    let state = lifo + LIFO_HEADER_SIZE + 8;
+                    let hdr1 = u64::from_le_bytes(
+                        self.buf[lifo + 8..lifo + 16].try_into().unwrap_or([0; 8]),
+                    );
+                    let hdr2 = u64::from_le_bytes(
+                        self.buf[lifo + 0x10..lifo + 0x18]
+                            .try_into()
+                            .unwrap_or([0; 8]),
+                    );
+                    let hdr3 = u64::from_le_bytes(
+                        self.buf[lifo + 0x18..lifo + 0x20]
+                            .try_into()
+                            .unwrap_or([0; 8]),
+                    );
+                    let current = (hdr2 as usize).min(LIFO_STORAGE_COUNT - 1);
+                    let state = lifo + LIFO_HEADER_SIZE + current * LIFO_STORAGE_ELEM_SIZE + 8;
                     let st_sample =
                         u64::from_le_bytes(self.buf[state..state + 8].try_into().unwrap_or([0; 8]));
                     let st_btn = u64::from_le_bytes(
@@ -169,8 +229,17 @@ impl HidState {
                             .unwrap_or([0; 4]),
                     );
                     log::info!(
-                        "  layout[{}={}] lifo_off=+{:#x} latest_sample={} state.sample={} state.buttons={:#x} state.attr={:#x}",
-                        layout_idx, layout_name, lifo - base, hdr0, st_sample, st_btn, st_attr
+                        "  layout[{}={}] lifo_off=+{:#x} hdr=({},{},{},{}) state.sample={} state.buttons={:#x} state.attr={:#x}",
+                        layout_idx,
+                        layout_name,
+                        lifo - base,
+                        hdr0,
+                        hdr1,
+                        hdr2,
+                        hdr3,
+                        st_sample,
+                        st_btn,
+                        st_attr
                     );
                 }
             }
@@ -178,11 +247,19 @@ impl HidState {
     }
 
     fn init_metadata(&mut self) {
-        let style = STYLE_FULLKEY | STYLE_HANDHELD;
-        for &idx in &[NPAD_ENTRY_PLAYER1, NPAD_ENTRY_HANDHELD] {
+        for idx in 0..=NPAD_ENTRY_OTHER {
             let base = NPAD_OFFSET + idx * NPAD_ENTRY_SIZE;
+            let style = match idx {
+                NPAD_ENTRY_PLAYER1 => STYLE_FULLKEY | STYLE_SYSTEM_EXT,
+                NPAD_ENTRY_HANDHELD => STYLE_HANDHELD | STYLE_SYSTEM_EXT,
+                _ => 0,
+            };
             write_u32(&mut *self.buf, base + NPAD_STYLE_TAG_OFFSET, style);
             write_u32(&mut *self.buf, base + NPAD_JOY_ASSIGN_OFFSET, 0);
+            for layout in 0..LAYOUT_COUNT {
+                let lifo = base + LAYOUT_BASE_OFFSET + layout * LAYOUT_STRIDE;
+                Self::write_empty_lifo(&mut self.buf[..], lifo);
+            }
         }
         for &off in &[DEBUGPAD_OFFSET, TOUCH_OFFSET, MOUSE_OFFSET, KEYBOARD_OFFSET] {
             Self::write_empty_lifo(&mut self.buf[..], off);
@@ -200,37 +277,40 @@ impl HidState {
         write_u64(buf, e0 + 0x10, 0);
     }
 
-    fn write_npad_entry(
+    fn write_entry_style(buf: &mut [u8], entry_idx: usize, style: u32) {
+        let entry_base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
+        write_u32(buf, entry_base + NPAD_STYLE_TAG_OFFSET, style);
+    }
+
+    fn write_npad_lifo(
         buf: &mut [u8],
         entry_idx: usize,
-        lifo_offset_in_entry: usize,
+        layout: usize,
         input: &ControllerInput,
         sampling: u64,
+        attr: u32,
     ) {
         let entry_base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
-        let lifo = entry_base + lifo_offset_in_entry;
+        let lifo = entry_base + LAYOUT_BASE_OFFSET + layout * LAYOUT_STRIDE;
+        let tail = (sampling % LIFO_STORAGE_COUNT as u64) as usize;
+        let count = sampling.min((LIFO_STORAGE_COUNT - 1) as u64);
 
         write_u64(buf, lifo + 0x00, sampling);
-        write_u64(buf, lifo + 0x08, sampling);
-        write_u64(buf, lifo + 0x10, 0);
-        write_u64(buf, lifo + 0x18, 1);
+        write_u64(buf, lifo + 0x08, LIFO_STORAGE_COUNT as u64);
+        write_u64(buf, lifo + 0x10, tail as u64);
+        write_u64(buf, lifo + 0x18, count);
 
-        let storage0 = lifo + LIFO_HEADER_SIZE;
-        write_u64(buf, storage0, sampling.wrapping_mul(2));
-        let state = storage0 + 8;
+        let storage = lifo + LIFO_HEADER_SIZE + tail * LIFO_STORAGE_ELEM_SIZE;
+        write_u64(buf, storage, sampling);
+        let state = storage + 8;
         write_u64(buf, state + 0x00, sampling);
         write_u64(buf, state + 0x08, input.buttons);
         write_i32(buf, state + 0x10, input.stick_l_x);
         write_i32(buf, state + 0x14, input.stick_l_y);
         write_i32(buf, state + 0x18, input.stick_r_x);
         write_i32(buf, state + 0x1C, input.stick_r_y);
-        write_u32(buf, state + 0x20, ATTR_IS_CONNECTED | ATTR_IS_WIRED);
+        write_u32(buf, state + 0x20, attr);
         write_u32(buf, state + 0x24, 0);
-
-        for i in 1..LIFO_STORAGE_COUNT {
-            let storage_i = lifo + LIFO_HEADER_SIZE + i * LIFO_STORAGE_ELEM_SIZE;
-            write_u64(buf, storage_i, 0);
-        }
     }
 }
 
