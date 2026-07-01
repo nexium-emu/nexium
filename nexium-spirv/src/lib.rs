@@ -37,17 +37,21 @@ pub struct Emitter {
     stage: Stage,
     f32_t: Word,
     vec2_t: Word,
+    vec3_t: Word,
     vec4_t: Word,
     u32_t: Word,
     i32_t: Word,
     ptr_uniform_f32: Word,
     ptr_input_vec4: Word,
     ptr_input_f32: Word,
+    ptr_input_u32: Word,
     ptr_output_vec4: Word,
     ptr_output_f32: Word,
     ptr_image: Word,
+    ptr_image_arrayed: Word,
     ptr_sampler: Word,
     ptr_image_array: Word,
+    ptr_image_arrayed_array: Word,
     ptr_sampler_array: Word,
     ubo_var: Word,
     f32_zero: Word,
@@ -59,11 +63,15 @@ pub struct Emitter {
     point_size_var: Option<Word>,
     frag_coord_var: Option<Word>,
     frag_color_var: Option<Word>,
+    vertex_index_var: Option<Word>,
+    instance_index_var: Option<Word>,
     image_var: Option<Word>,
     sampler_var: Option<Word>,
     image_t: Word,
+    image_arrayed_t: Word,
     sampler_t: Word,
     sampled_image_t: Word,
+    sampled_image_arrayed_t: Word,
     interface: Vec<Word>,
     value_to_word: HashMap<ValueId, Word>,
     block_labels: HashMap<BlockId, Word>,
@@ -71,8 +79,10 @@ pub struct Emitter {
     used_merge_blocks: std::collections::HashSet<Word>,
     shared_merge_headers: HashMap<u32, Vec<u32>>,
     header_merge_label: HashMap<u32, Word>,
-    synth_merge_blocks: HashMap<u32, Vec<(Word, u32)>>,
+    synth_merge_blocks: HashMap<u32, Vec<(Word, u32, Word)>>,
     synth_phi_results: HashMap<(Word, ValueId), Word>,
+    synth_pred_phi_results: HashMap<(Word, ValueId), Word>,
+    merge_redirects: HashMap<(u32, u32), Word>,
     cbuf_bindings_used: u32,
     texs_ids_used: std::collections::BTreeSet<u32>,
     texture_slots: HashMap<u32, u32>,
@@ -87,6 +97,13 @@ pub struct Emitter {
     ssbo_vars: Vec<Option<Word>>,
     ptr_storage_u32: Option<Word>,
     return_block: Option<Word>,
+    sample_debug_slot: Option<u32>,
+    sample_debug_component: Option<u32>,
+    sample_debug_value: Option<Word>,
+    texcoord_debug_slot: Option<u32>,
+    sampler_arrayed: bool,
+    no_kil_shader: bool,
+    ps_input_map: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
@@ -109,12 +126,14 @@ impl Emitter {
 
         let f32_t = b.type_float(32);
         let vec2_t = b.type_vector(f32_t, 2);
+        let vec3_t = b.type_vector(f32_t, 3);
         let vec4_t = b.type_vector(f32_t, 4);
         let u32_t = b.type_int(32, 0);
         let i32_t = b.type_int(32, 1);
         let ptr_uniform_f32 = b.type_pointer(None, StorageClass::Uniform, f32_t);
         let ptr_input_vec4 = b.type_pointer(None, StorageClass::Input, vec4_t);
         let ptr_input_f32 = b.type_pointer(None, StorageClass::Input, f32_t);
+        let ptr_input_u32 = b.type_pointer(None, StorageClass::Input, u32_t);
         let ptr_output_vec4 = b.type_pointer(None, StorageClass::Output, vec4_t);
         let ptr_output_f32 = b.type_pointer(None, StorageClass::Output, f32_t);
 
@@ -152,14 +171,29 @@ impl Emitter {
             ImageFormat::Unknown,
             None,
         );
+        let image_arrayed_t = b.type_image(
+            f32_t,
+            rspirv::spirv::Dim::Dim2D,
+            0,
+            1,
+            0,
+            1,
+            ImageFormat::Unknown,
+            None,
+        );
         let sampler_t = b.type_sampler();
         let sampled_image_t = b.type_sampled_image(image_t);
+        let sampled_image_arrayed_t = b.type_sampled_image(image_arrayed_t);
         let ptr_image = b.type_pointer(None, StorageClass::UniformConstant, image_t);
+        let ptr_image_arrayed = b.type_pointer(None, StorageClass::UniformConstant, image_arrayed_t);
         let ptr_sampler = b.type_pointer(None, StorageClass::UniformConstant, sampler_t);
         let texture_slots_const = b.constant_bit32(u32_t, MAX_TEXTURE_DESCRIPTORS);
         let image_array_t = b.type_array(image_t, texture_slots_const);
+        let image_arrayed_array_t = b.type_array(image_arrayed_t, texture_slots_const);
         let sampler_array_t = b.type_array(sampler_t, texture_slots_const);
         let ptr_image_array = b.type_pointer(None, StorageClass::UniformConstant, image_array_t);
+        let ptr_image_arrayed_array =
+            b.type_pointer(None, StorageClass::UniformConstant, image_arrayed_array_t);
         let ptr_sampler_array =
             b.type_pointer(None, StorageClass::UniformConstant, sampler_array_t);
 
@@ -180,17 +214,21 @@ impl Emitter {
             stage,
             f32_t,
             vec2_t,
+            vec3_t,
             vec4_t,
             u32_t,
             i32_t,
             ptr_uniform_f32,
             ptr_input_vec4,
             ptr_input_f32,
+            ptr_input_u32,
             ptr_output_vec4,
             ptr_output_f32,
             ptr_image,
+            ptr_image_arrayed,
             ptr_sampler,
             ptr_image_array,
+            ptr_image_arrayed_array,
             ptr_sampler_array,
             ubo_var,
             f32_zero,
@@ -202,11 +240,15 @@ impl Emitter {
             point_size_var: None,
             frag_coord_var: None,
             frag_color_var: None,
+            vertex_index_var: None,
+            instance_index_var: None,
             image_var: None,
             sampler_var: None,
             image_t,
+            image_arrayed_t,
             sampler_t,
             sampled_image_t,
+            sampled_image_arrayed_t,
             interface: Vec::new(),
             value_to_word: HashMap::new(),
             block_labels: HashMap::new(),
@@ -216,6 +258,8 @@ impl Emitter {
             header_merge_label: HashMap::new(),
             synth_merge_blocks: HashMap::new(),
             synth_phi_results: HashMap::new(),
+            synth_pred_phi_results: HashMap::new(),
+            merge_redirects: HashMap::new(),
             cbuf_bindings_used: 0,
             texs_ids_used: std::collections::BTreeSet::new(),
             texture_slots: HashMap::new(),
@@ -230,6 +274,20 @@ impl Emitter {
             ssbo_vars: vec![None; MAX_SSBO as usize],
             ptr_storage_u32: None,
             return_block: None,
+            sample_debug_slot: std::env::var("NEXIUM_FS_SAMPLE_SLOT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok()),
+            sample_debug_component: std::env::var("NEXIUM_FS_SAMPLE_COMPONENT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|v| v.min(3)),
+            sample_debug_value: None,
+            texcoord_debug_slot: std::env::var("NEXIUM_FS_TEXCOORD_SLOT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok()),
+            sampler_arrayed: false,
+            no_kil_shader: false,
+            ps_input_map: [0; 32],
         }
     }
 
@@ -346,6 +404,57 @@ impl Emitter {
         v
     }
 
+    fn vertex_index_var_id(&mut self) -> Word {
+        if let Some(v) = self.vertex_index_var {
+            return v;
+        }
+        let v = self
+            .b
+            .variable(self.ptr_input_u32, None, StorageClass::Input, None);
+        self.b.decorate(
+            v,
+            Decoration::BuiltIn,
+            [Operand::BuiltIn(BuiltIn::VertexIndex)],
+        );
+        self.interface.push(v);
+        self.vertex_index_var = Some(v);
+        v
+    }
+
+    fn instance_index_var_id(&mut self) -> Word {
+        if let Some(v) = self.instance_index_var {
+            return v;
+        }
+        let v = self
+            .b
+            .variable(self.ptr_input_u32, None, StorageClass::Input, None);
+        self.b.decorate(
+            v,
+            Decoration::BuiltIn,
+            [Operand::BuiltIn(BuiltIn::InstanceIndex)],
+        );
+        self.interface.push(v);
+        self.instance_index_var = Some(v);
+        v
+    }
+
+    fn system_attr_var_id(&mut self, slot: u32) -> Option<Word> {
+        if !matches!(self.stage, Stage::Vertex) {
+            return None;
+        }
+        match slot {
+            0x2f8 => Some(self.instance_index_var_id()),
+            0x2fc => Some(self.vertex_index_var_id()),
+            _ => None,
+        }
+    }
+
+    fn load_system_attr_bits(&mut self, slot: u32) -> Option<Word> {
+        let var = self.system_attr_var_id(slot)?;
+        let raw = self.b.load(self.u32_t, None, var, None, []).unwrap();
+        Some(self.b.bitcast(self.f32_t, None, raw).unwrap())
+    }
+
     fn input_var(&mut self, slot: u32) -> AttrVar {
         if let Some(av) = self.input_vars.get(&slot) {
             return *av;
@@ -364,6 +473,7 @@ impl Emitter {
             .variable(self.ptr_input_vec4, None, StorageClass::Input, None);
         self.b
             .decorate(var, Decoration::Location, [Operand::LiteralBit32(location)]);
+        self.decorate_fs_input_interpolation(var, location);
         let av = AttrVar {
             var,
             ptr_f32: self.ptr_input_f32,
@@ -371,6 +481,43 @@ impl Emitter {
         self.input_vars.insert(slot, av);
         self.interface.push(var);
         av
+    }
+
+    fn decorate_fs_input_interpolation(&mut self, var: Word, location: u32) {
+        if !matches!(self.stage, Stage::Fragment) || location >= 32 {
+            return;
+        }
+        let raw = self.ps_input_map[location as usize];
+        let mut seen = None;
+        for component in 0..4 {
+            let mode = (raw >> (component * 2)) & 0x3;
+            if mode == 0 {
+                continue;
+            }
+            if let Some(prev) = seen {
+                if prev != mode {
+                    return;
+                }
+            } else {
+                seen = Some(mode);
+            }
+        }
+        match seen {
+            Some(1) => {
+                self.b.decorate(var, Decoration::Flat, []);
+            }
+            Some(3) => {
+                self.b.decorate(var, Decoration::NoPerspective, []);
+            }
+            _ => {}
+        }
+    }
+
+    fn ps_input_component_mode(&self, location: u32, component: u32) -> u8 {
+        if !matches!(self.stage, Stage::Fragment) || location >= 32 || component >= 4 {
+            return 0;
+        }
+        (self.ps_input_map[location as usize] >> (component * 2)) & 0x3
     }
 
     fn output_var(&mut self, slot: u32) -> AttrVar {
@@ -404,8 +551,13 @@ impl Emitter {
         if let (Some(img), Some(samp)) = (self.image_var, self.sampler_var) {
             return (img, samp);
         }
+        let ptr_image_array = if self.sampler_arrayed {
+            self.ptr_image_arrayed_array
+        } else {
+            self.ptr_image_array
+        };
         let img = self.b.variable(
-            self.ptr_image_array,
+            ptr_image_array,
             None,
             StorageClass::UniformConstant,
             None,
@@ -438,9 +590,14 @@ impl Emitter {
             .unwrap_or(0)
             .min(MAX_TEXTURE_DESCRIPTORS - 1);
         let idx = self.const_u32(idx);
+        let ptr_image = if self.sampler_arrayed {
+            self.ptr_image_arrayed
+        } else {
+            self.ptr_image
+        };
         let img = self
             .b
-            .access_chain(self.ptr_image, None, img_array, [idx])
+            .access_chain(ptr_image, None, img_array, [idx])
             .unwrap();
         let samp = self
             .b
@@ -521,6 +678,21 @@ impl Emitter {
         }
     }
 
+    fn write_pred_reg(&mut self, idx: u8, value: Word, guard: Option<Word>) {
+        if idx >= 7 {
+            return;
+        }
+        let value = if let Some(cond) = guard {
+            let old = self.pred_regs[idx as usize].unwrap_or(self.bool_false);
+            self.b
+                .select(self.bool_t, None, cond, value, old)
+                .unwrap()
+        } else {
+            value
+        };
+        self.pred_regs[idx as usize] = Some(value);
+    }
+
     fn lower_value(&mut self, v: &IrValue) -> Word {
         match v {
             IrValue::Inst(id) => match self.value_to_word.get(id).copied() {
@@ -559,6 +731,62 @@ impl Emitter {
             .access_chain(av.ptr_f32, None, av.var, [idx])
             .unwrap();
         self.b.store(ac, val, None, []).unwrap();
+    }
+
+    fn select_guarded(&mut self, val: Word, guard: Option<Word>, old: Word) -> Word {
+        if let Some(cond) = guard {
+            self.b.select(self.f32_t, None, cond, val, old).unwrap()
+        } else {
+            val
+        }
+    }
+
+    fn lower_store_attr(&mut self, slot: u32, src: &IrValue, guard: Option<Word>) {
+        let mut val = self.lower_value(src);
+        let component = (slot & 0xC) >> 2;
+        let aligned_slot = slot & !0xF;
+        if slot_is_gl_position(aligned_slot) {
+            val = match (self.vertex_opts.window_ndc, component) {
+                (Some((sx, _)), 0) if matches!(self.stage, Stage::Vertex) => {
+                    let s = self.const_f32(sx.to_bits());
+                    let m = self.b.f_mul(self.f32_t, None, val, s).unwrap();
+                    self.b.f_sub(self.f32_t, None, m, self.f32_one).unwrap()
+                }
+                (Some((_, sy)), 1) if matches!(self.stage, Stage::Vertex) => {
+                    let s = self.const_f32(sy.to_bits());
+                    let m = self.b.f_mul(self.f32_t, None, val, s).unwrap();
+                    self.b.f_sub(self.f32_t, None, m, self.f32_one).unwrap()
+                }
+                _ => val,
+            };
+            let pos = self.position_var();
+            let idx = self.const_u32(component);
+            let ac = self
+                .b
+                .access_chain(self.ptr_output_f32, None, pos, [idx])
+                .unwrap();
+            if guard.is_some() {
+                let old = self.b.load(self.f32_t, None, ac, None, []).unwrap();
+                val = self.select_guarded(val, guard, old);
+            }
+            self.b.store(ac, val, None, []).unwrap();
+        } else if slot == 0x6C && matches!(self.stage, Stage::Vertex) {
+            let v = self.point_size_var_id();
+            if guard.is_some() {
+                let old = self.b.load(self.f32_t, None, v, None, []).unwrap();
+                val = self.select_guarded(val, guard, old);
+            }
+            self.b.store(v, val, None, []).unwrap();
+        } else if slot < 0x80 {
+            let _ = (val, component);
+        } else {
+            let av = self.output_var(aligned_slot);
+            if guard.is_some() {
+                let old = self.read_attr_component(av, component);
+                val = self.select_guarded(val, guard, old);
+            }
+            self.write_attr_component(av, component, val);
+        }
     }
 
     fn lower_fcompare(&mut self, cmp: &FComp, va: Word, vb: Word) -> Word {
@@ -670,12 +898,15 @@ impl Emitter {
                 let bv = self.apply_neg_abs(bv, mods.neg_b, mods.abs_b);
                 let mut r = self.b.f_mul(self.f32_t, None, av, bv).unwrap();
                 if mods.scale != 0 {
-                    let exp = if mods.scale < 4 {
-                        mods.scale as i32
-                    } else {
-                        mods.scale as i32 - 8
+                    let factor: f32 = match mods.scale {
+                        1 => 0.5,
+                        2 => 0.25,
+                        3 => 0.125,
+                        4 => 8.0,
+                        5 => 4.0,
+                        6 => 2.0,
+                        _ => 1.0,
                     };
-                    let factor = 2.0f32.powi(exp);
                     static FMUL_SCALE_LOG: std::sync::atomic::AtomicU32 =
                         std::sync::atomic::AtomicU32::new(0);
                     if FMUL_SCALE_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
@@ -754,6 +985,51 @@ impl Emitter {
                         )
                         .unwrap(),
                 )
+            }
+            IrOp::FMinMaxPred {
+                a,
+                b,
+                mods,
+                pred,
+                neg_pred,
+            } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let av = self.apply_neg_abs(av, mods.neg_a, mods.abs_a);
+                let bv = self.apply_neg_abs(bv, mods.neg_b, mods.abs_b);
+                let f32_t = self.f32_t;
+                let min = self
+                    .b
+                    .ext_inst(
+                        f32_t,
+                        None,
+                        self.glsl,
+                        37,
+                        [Operand::IdRef(av), Operand::IdRef(bv)],
+                    )
+                    .unwrap();
+                let max = self
+                    .b
+                    .ext_inst(
+                        f32_t,
+                        None,
+                        self.glsl,
+                        40,
+                        [Operand::IdRef(av), Operand::IdRef(bv)],
+                    )
+                    .unwrap();
+                let cond = self.resolve_pred(*pred, *neg_pred);
+                Some(self.b.select(f32_t, None, cond, min, max).unwrap())
+            }
+            IrOp::SelectPred {
+                pred,
+                if_true,
+                if_false,
+            } => {
+                let cond = self.resolve_pred(pred.idx, pred.negate);
+                let t = self.lower_value(if_true);
+                let f = self.lower_value(if_false);
+                Some(self.b.select(self.f32_t, None, cond, t, f).unwrap())
             }
             IrOp::MultiFunc { src, func } => {
                 let s = self.lower_value(src);
@@ -891,9 +1167,15 @@ impl Emitter {
                         let base_a = self.b.bitwise_and(u32_t, None, base_u, mask).unwrap();
                         let offset = self.b.i_sub(u32_t, None, eff, base_a).unwrap();
                         let two = self.const_u32(2);
-                        let word = self.b.shift_right_logical(u32_t, None, offset, two).unwrap();
+                        let word = self
+                            .b
+                            .shift_right_logical(u32_t, None, offset, two)
+                            .unwrap();
                         let zero2 = self.const_u32(0);
-                        let dac = self.b.access_chain(ptr_u, None, ssbo, [zero2, word]).unwrap();
+                        let dac = self
+                            .b
+                            .access_chain(ptr_u, None, ssbo, [zero2, word])
+                            .unwrap();
                         let val = self.b.load(u32_t, None, dac, None, []).unwrap();
                         Some(self.b.bitcast(self.f32_t, None, val).unwrap())
                     }
@@ -901,89 +1183,150 @@ impl Emitter {
                 }
             }
             IrOp::LoadAttr { slot } => {
-                let component = (slot & 0xC) >> 2;
-                let aligned_slot = slot & !0xF;
-                let av = self.input_var(aligned_slot);
-                Some(self.read_attr_component(av, component))
+                if let Some(val) = self.load_system_attr_bits(*slot) {
+                    Some(val)
+                } else {
+                    let component = (slot & 0xC) >> 2;
+                    let aligned_slot = slot & !0xF;
+                    let av = self.input_var(aligned_slot);
+                    Some(self.read_attr_component(av, component))
+                }
             }
             IrOp::InterpAttr {
                 slot,
-                perspective: _,
+                perspective,
+                mode,
+                sat,
             } => {
                 let component = (slot & 0xC) >> 2;
                 let aligned_slot = slot & !0xF;
-                if aligned_slot == 0x70 {
+                let mut val = if aligned_slot == 0x70 {
                     let fc = self.frag_coord_var();
                     let idx = self.const_u32(component);
                     let ac = self
                         .b
                         .access_chain(self.ptr_input_f32, None, fc, [idx])
                         .unwrap();
-                    let val = self.b.load(self.f32_t, None, ac, None, []).unwrap();
-                    Some(val)
+                    self.b.load(self.f32_t, None, ac, None, []).unwrap()
                 } else {
                     let av = self.input_var(aligned_slot);
-                    Some(self.read_attr_component(av, component))
+                    let mut val = self.read_attr_component(av, component);
+                    if aligned_slot >= 0x80 {
+                        let loc = (aligned_slot - 0x80) / 16;
+                        if self.ps_input_component_mode(loc, component) == 2 {
+                            let fc = self.frag_coord_var();
+                            let idx = self.const_u32(3);
+                            let ac = self
+                                .b
+                                .access_chain(self.ptr_input_f32, None, fc, [idx])
+                                .unwrap();
+                            let w = self.b.load(self.f32_t, None, ac, None, []).unwrap();
+                            val = self.b.f_mul(self.f32_t, None, val, w).unwrap();
+                        }
+                    }
+                    val
+                };
+                if *mode == 1 {
+                    let p = self.lower_value(perspective);
+                    val = self.b.f_mul(self.f32_t, None, val, p).unwrap();
                 }
+                val = self.apply_sat(val, *sat);
+                Some(val)
             }
             IrOp::StoreAttr { slot, src } => {
-                let val = self.lower_value(src);
-                let component = (slot & 0xC) >> 2;
-                let aligned_slot = slot & !0xF;
-                if slot_is_gl_position(aligned_slot) {
-                    let val = match (self.vertex_opts.window_ndc, component) {
-                        (Some((sx, _)), 0) if matches!(self.stage, Stage::Vertex) => {
-                            let s = self.const_f32(sx.to_bits());
-                            let m = self.b.f_mul(self.f32_t, None, val, s).unwrap();
-                            self.b.f_sub(self.f32_t, None, m, self.f32_one).unwrap()
-                        }
-                        (Some((_, sy)), 1) if matches!(self.stage, Stage::Vertex) => {
-                            let s = self.const_f32(sy.to_bits());
-                            let m = self.b.f_mul(self.f32_t, None, val, s).unwrap();
-                            self.b.f_sub(self.f32_t, None, m, self.f32_one).unwrap()
-                        }
-                        _ => val,
-                    };
-                    let pos = self.position_var();
-                    let idx = self.const_u32(component);
-                    let ac = self
-                        .b
-                        .access_chain(self.ptr_output_f32, None, pos, [idx])
-                        .unwrap();
-                    self.b.store(ac, val, None, []).unwrap();
-                } else if *slot == 0x6C && matches!(self.stage, Stage::Vertex) {
-                    let v = self.point_size_var_id();
-                    self.b.store(v, val, None, []).unwrap();
-                } else if *slot < 0x80 {
-                    let _ = (val, component);
-                } else {
-                    let av = self.output_var(aligned_slot);
-                    self.write_attr_component(av, component, val);
-                }
+                let guard = inst
+                    .pred
+                    .map(|pred| self.resolve_pred(pred.idx, pred.negate));
+                self.lower_store_attr(*slot, src, guard);
                 None
             }
             IrOp::SampleTex {
                 tex_id,
                 u,
                 v,
+                array,
                 component,
             } => {
                 self.texs_ids_used.insert(*tex_id);
-                let uv0 = self.lower_value(u);
-                let uv1 = self.lower_value(v);
-                let coords = self
-                    .b
-                    .composite_construct(self.vec2_t, None, [uv0, uv1])
-                    .unwrap();
+                let tex_slot = self
+                    .texture_slots
+                    .get(tex_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(MAX_TEXTURE_DESCRIPTORS - 1);
+                let uv_override = std::env::var("NEXIUM_TEX_UV_OVERRIDE")
+                    .ok()
+                    .and_then(|s| {
+                        let mut parts = s.split(',');
+                        let u = parts.next()?.trim().parse::<f32>().ok()?;
+                        let v = parts.next()?.trim().parse::<f32>().ok()?;
+                        Some((u, v))
+                    });
+                let (uv0, uv1) = if let Some((u, v)) = uv_override {
+                    (self.const_f32(u.to_bits()), self.const_f32(v.to_bits()))
+                } else {
+                    (self.lower_value(u), self.lower_value(v))
+                };
+                let coords = if self.sampler_arrayed {
+                    let layer = if let Some(override_layer) =
+                        std::env::var("NEXIUM_TEX_LAYER_OVERRIDE")
+                            .ok()
+                            .and_then(|v| v.parse::<f32>().ok())
+                    {
+                        self.const_f32(override_layer.to_bits())
+                    } else if let Some(array) = array {
+                        let layer_value = self.lower_value(array);
+                        let raw = self.as_u32(layer_value);
+                        let mask = self.const_u32(0xFFFF);
+                        let layer_u = self.b.bitwise_and(self.u32_t, None, raw, mask).unwrap();
+                        self.b.convert_u_to_f(self.f32_t, None, layer_u).unwrap()
+                    } else {
+                        self.f32_zero
+                    };
+                    self.b
+                        .composite_construct(self.vec3_t, None, [uv0, uv1, layer])
+                        .unwrap()
+                } else {
+                    self.b
+                        .composite_construct(self.vec2_t, None, [uv0, uv1])
+                        .unwrap()
+                };
+                if matches!(self.stage, Stage::Fragment)
+                    && self.texcoord_debug_slot == Some(tex_slot)
+                    && self.sample_debug_value.is_none()
+                {
+                    let layer = if self.sampler_arrayed {
+                        self.b
+                            .composite_extract(self.f32_t, None, coords, [2])
+                            .unwrap_or(self.f32_zero)
+                    } else {
+                        self.f32_zero
+                    };
+                    self.sample_debug_value = Some(
+                        self.b
+                            .composite_construct(self.vec4_t, None, [uv0, uv1, layer, self.f32_one])
+                            .unwrap(),
+                    );
+                }
                 let (img_var, samp_var) = self.sampler_at(*tex_id);
-                let img = self.b.load(self.image_t, None, img_var, None, []).unwrap();
+                let image_t = if self.sampler_arrayed {
+                    self.image_arrayed_t
+                } else {
+                    self.image_t
+                };
+                let sampled_image_t = if self.sampler_arrayed {
+                    self.sampled_image_arrayed_t
+                } else {
+                    self.sampled_image_t
+                };
+                let img = self.b.load(image_t, None, img_var, None, []).unwrap();
                 let samp = self
                     .b
                     .load(self.sampler_t, None, samp_var, None, [])
                     .unwrap();
                 let sampled_img = self
                     .b
-                    .sampled_image(self.sampled_image_t, None, img, samp)
+                    .sampled_image(sampled_image_t, None, img, samp)
                     .unwrap();
                 let lod_zero = self.f32_zero;
                 let sampled = self
@@ -997,6 +1340,23 @@ impl Emitter {
                         [Operand::IdRef(lod_zero)],
                     )
                     .unwrap();
+                if matches!(self.stage, Stage::Fragment)
+                    && self.sample_debug_slot == Some(tex_slot)
+                    && self.sample_debug_value.is_none()
+                {
+                    let debug_value = if let Some(component) = self.sample_debug_component {
+                        let c = self
+                            .b
+                            .composite_extract(self.f32_t, None, sampled, [component])
+                            .unwrap_or(self.f32_zero);
+                        self.b
+                            .composite_construct(self.vec4_t, None, [c, c, c, self.f32_one])
+                            .unwrap()
+                    } else {
+                        sampled
+                    };
+                    self.sample_debug_value = Some(debug_value);
+                }
                 let c = self
                     .b
                     .composite_extract(self.f32_t, None, sampled, [*component as u32])
@@ -1098,9 +1458,10 @@ impl Emitter {
                         .unwrap(),
                 };
 
-                if *dest_p < 7 {
-                    self.pred_regs[*dest_p as usize] = Some(combined);
-                }
+                let guard = inst
+                    .pred
+                    .map(|pred| self.resolve_pred(pred.idx, pred.negate));
+                self.write_pred_reg(*dest_p, combined, guard);
                 if *dest_np < 7 {
                     let not_cmp = self.b.logical_not(self.bool_t, None, cmp_result).unwrap();
                     let combined_np = match bop {
@@ -1117,7 +1478,7 @@ impl Emitter {
                             .logical_not_equal(self.bool_t, None, not_cmp, src_p_word)
                             .unwrap(),
                     };
-                    self.pred_regs[*dest_np as usize] = Some(combined_np);
+                    self.write_pred_reg(*dest_np, combined_np, guard);
                 }
                 Some(combined)
             }
@@ -1234,7 +1595,9 @@ impl Emitter {
                         .unwrap();
                     self.b.bitcast(self.u32_t, None, ri).unwrap()
                 } else {
-                    self.b.shift_right_logical(self.u32_t, None, au, bu).unwrap()
+                    self.b
+                        .shift_right_logical(self.u32_t, None, au, bu)
+                        .unwrap()
                 };
                 Some(self.store_bits(r))
             }
@@ -1256,8 +1619,14 @@ impl Emitter {
                 let mask = self.const_u32(0xff);
                 let pos = self.b.bitwise_and(self.u32_t, None, bu, mask).unwrap();
                 let eight = self.const_u32(8);
-                let size_raw = self.b.shift_right_logical(self.u32_t, None, bu, eight).unwrap();
-                let cnt = self.b.bitwise_and(self.u32_t, None, size_raw, mask).unwrap();
+                let size_raw = self
+                    .b
+                    .shift_right_logical(self.u32_t, None, bu, eight)
+                    .unwrap();
+                let cnt = self
+                    .b
+                    .bitwise_and(self.u32_t, None, size_raw, mask)
+                    .unwrap();
                 let r = if *signed {
                     self.b
                         .bit_field_s_extract(self.u32_t, None, au, pos, cnt)
@@ -1284,11 +1653,18 @@ impl Emitter {
                 if *bool_float {
                     let one = self.f32_one;
                     let zero = self.f32_zero;
-                    Some(self.b.select(self.f32_t, None, cmp_result, one, zero).unwrap())
+                    Some(
+                        self.b
+                            .select(self.f32_t, None, cmp_result, one, zero)
+                            .unwrap(),
+                    )
                 } else {
                     let ones = self.const_u32(0xFFFF_FFFF);
                     let zeros = self.const_u32(0);
-                    let sel = self.b.select(self.u32_t, None, cmp_result, ones, zeros).unwrap();
+                    let sel = self
+                        .b
+                        .select(self.u32_t, None, cmp_result, ones, zeros)
+                        .unwrap();
                     Some(self.store_bits(sel))
                 }
             }
@@ -1420,9 +1796,10 @@ impl Emitter {
                         .logical_not_equal(self.bool_t, None, cmp_result, src_p_word)
                         .unwrap(),
                 };
-                if *dest_p < 7 {
-                    self.pred_regs[*dest_p as usize] = Some(combined);
-                }
+                let guard = inst
+                    .pred
+                    .map(|pred| self.resolve_pred(pred.idx, pred.negate));
+                self.write_pred_reg(*dest_p, combined, guard);
                 if *dest_np < 7 {
                     let not_cmp = self.b.logical_not(self.bool_t, None, cmp_result).unwrap();
                     let combined_np = match bop {
@@ -1439,13 +1816,15 @@ impl Emitter {
                             .logical_not_equal(self.bool_t, None, not_cmp, src_p_word)
                             .unwrap(),
                     };
-                    self.pred_regs[*dest_np as usize] = Some(combined_np);
+                    self.write_pred_reg(*dest_np, combined_np, guard);
                 }
                 Some(combined)
             }
 
             IrOp::Kill => {
-                if std::env::var("NEXIUM_NO_KIL").ok().as_deref() == Some("1") {
+                if std::env::var("NEXIUM_NO_KIL").ok().as_deref() == Some("1")
+                    || self.no_kil_shader
+                {
                     return;
                 }
                 let cond = if let Some(pred_guard) = &inst.pred {
@@ -1481,6 +1860,7 @@ impl Emitter {
         let Some(ipd) = self.cond_merge.clone() else {
             return;
         };
+        let dom = dominators(cfg);
         let mut by_merge: std::collections::BTreeMap<u32, Vec<u32>> =
             std::collections::BTreeMap::new();
         for block in &cfg.blocks {
@@ -1499,11 +1879,28 @@ impl Emitter {
             headers.sort_unstable();
             let m_lbl = self.block_labels[&m];
             self.header_merge_label.insert(headers[0], m_lbl);
-            let mut synths: Vec<(Word, u32)> = Vec::new();
-            for &h in &headers[1..] {
+            let mut synths: Vec<(Word, u32, Word)> = Vec::new();
+            for (idx, &h) in headers.iter().enumerate().skip(1) {
                 let s = self.b.id();
                 self.header_merge_label.insert(h, s);
-                synths.push((s, h));
+                let parent = headers[..idx]
+                    .iter()
+                    .rev()
+                    .find(|&&p| dom[h as usize][p as usize])
+                    .copied();
+                let target = parent
+                    .and_then(|p| self.header_merge_label.get(&p).copied())
+                    .unwrap_or(m_lbl);
+                synths.push((s, h, target));
+            }
+            for b in 0..m {
+                let target = headers
+                    .iter()
+                    .rev()
+                    .find(|&&h| dom[b as usize][h as usize])
+                    .and_then(|h| self.header_merge_label.get(h).copied())
+                    .unwrap_or(m_lbl);
+                self.merge_redirects.insert((m, b), target);
             }
             synths.reverse();
             self.synth_merge_blocks.insert(m, synths);
@@ -1512,9 +1909,9 @@ impl Emitter {
     }
 
     fn merge_redirect(&self, from_block: u32, to_block: u32) -> Word {
-        if let Some(headers) = self.shared_merge_headers.get(&to_block) {
-            if let Some(&h) = headers.iter().filter(|&&h| h <= from_block).max() {
-                return self.header_merge_label[&h];
+        if self.shared_merge_headers.contains_key(&to_block) {
+            if let Some(&label) = self.merge_redirects.get(&(to_block, from_block)) {
+                return label;
             }
         }
         self.block_labels[&to_block]
@@ -1525,7 +1922,6 @@ impl Emitter {
         let Some(synths) = self.synth_merge_blocks.get(&m).cloned() else {
             return;
         };
-        let m_lbl = self.block_labels[&m];
         let phis: Vec<(ValueId, Vec<(BlockId, IrValue)>)> = m_block
             .program
             .instructions
@@ -1535,7 +1931,7 @@ impl Emitter {
                 _ => None,
             })
             .collect();
-        for (s_i, _h_i) in synths {
+        for (s_i, _h_i, target) in synths {
             self.b.begin_block(Some(s_i)).unwrap();
             for (rid, sources) in &phis {
                 let mut pairs: Vec<(Word, Word)> = Vec::new();
@@ -1546,13 +1942,58 @@ impl Emitter {
                         pairs.push((v, lbl));
                     }
                 }
+                let child_pairs: Vec<(Word, Word)> = self
+                    .synth_merge_blocks
+                    .get(&m)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(child, _, child_target)| *child_target == s_i && *child != s_i)
+                    .filter_map(|(child, _, _)| {
+                        self.synth_phi_results
+                            .get(&(*child, *rid))
+                            .copied()
+                            .map(|v| (v, *child))
+                    })
+                    .collect();
+                pairs.extend(child_pairs);
                 if pairs.is_empty() {
                     continue;
                 }
                 let pid = self.b.phi(self.f32_t, None, pairs).unwrap();
                 self.synth_phi_results.insert((s_i, *rid), pid);
             }
-            self.b.branch(m_lbl).unwrap();
+            for phi in &m_block.pred_phis {
+                let mut pairs: Vec<(Word, Word)> = Vec::new();
+                for (pred, val) in &phi.sources {
+                    if self.merge_redirect(*pred, m) == s_i {
+                        let v = val
+                            .and_then(|id| self.value_to_word.get(&id).copied())
+                            .unwrap_or(self.bool_false);
+                        let lbl = self.block_labels[pred];
+                        pairs.push((v, lbl));
+                    }
+                }
+                let child_pairs: Vec<(Word, Word)> = self
+                    .synth_merge_blocks
+                    .get(&m)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(child, _, child_target)| *child_target == s_i && *child != s_i)
+                    .filter_map(|(child, _, _)| {
+                        self.synth_pred_phi_results
+                            .get(&(*child, phi.result))
+                            .copied()
+                            .map(|v| (v, *child))
+                    })
+                    .collect();
+                pairs.extend(child_pairs);
+                if pairs.is_empty() {
+                    continue;
+                }
+                let pid = self.b.phi(self.bool_t, None, pairs).unwrap();
+                self.synth_pred_phi_results.insert((s_i, phi.result), pid);
+            }
+            self.b.branch(target).unwrap();
         }
     }
 
@@ -1565,6 +2006,7 @@ impl Emitter {
                 let label = self.block_labels[&block.id];
                 self.b.begin_block(Some(label)).unwrap();
             }
+            self.lower_pred_phis(block);
             self.lower_phis(block);
             for inst in &block.program.instructions {
                 if matches!(inst.op, IrOp::Phi { .. }) {
@@ -1574,6 +2016,51 @@ impl Emitter {
             }
             if !single_block {
                 self.emit_terminator(block);
+            }
+        }
+    }
+
+    fn lower_pred_phis(&mut self, block: &BasicBlock) {
+        let m = block.id;
+        let shared = self.shared_merge_headers.contains_key(&m);
+        for phi in &block.pred_phis {
+            let mut pairs: Vec<(Word, Word)> = Vec::new();
+            if shared {
+                let m_lbl = self.block_labels[&m];
+                for (pred, val) in &phi.sources {
+                    if self.merge_redirect(*pred, m) == m_lbl {
+                        let v = val
+                            .and_then(|id| self.value_to_word.get(&id).copied())
+                            .unwrap_or(self.bool_false);
+                        let label = self.block_labels.get(pred).copied().unwrap_or(0);
+                        pairs.push((v, label));
+                    }
+                }
+                let synths = self.synth_merge_blocks.get(&m).cloned().unwrap_or_default();
+                for (s_i, _h, target) in synths {
+                    if target != m_lbl {
+                        continue;
+                    }
+                    let v = self
+                        .synth_pred_phi_results
+                        .get(&(s_i, phi.result))
+                        .copied()
+                        .unwrap_or(self.bool_false);
+                    pairs.push((v, s_i));
+                }
+            } else {
+                for (pred, val) in &phi.sources {
+                    let v = val
+                        .and_then(|id| self.value_to_word.get(&id).copied())
+                        .unwrap_or(self.bool_false);
+                    let label = self.block_labels.get(pred).copied().unwrap_or(0);
+                    pairs.push((v, label));
+                }
+            }
+            let id = self.b.phi(self.bool_t, None, pairs).unwrap();
+            self.value_to_word.insert(phi.result, id);
+            if phi.pred < 7 {
+                self.pred_regs[phi.pred as usize] = Some(id);
             }
         }
     }
@@ -1598,7 +2085,10 @@ impl Emitter {
                 }
                 if let Some(rid) = inst.result {
                     let synths = self.synth_merge_blocks.get(&m).cloned().unwrap_or_default();
-                    for (s_i, _h) in synths {
+                    for (s_i, _h, target) in synths {
+                        if target != m_lbl {
+                            continue;
+                        }
                         let v = match self.synth_phi_results.get(&(s_i, rid)).copied() {
                             Some(w) => w,
                             None => self.f32_undef_id(),
@@ -1628,8 +2118,8 @@ impl Emitter {
                         let f0 = self.f32_zero;
                         let f1 = self.f32_one;
                         let es = block.program.exit_reg_state.as_ref();
-                        let chans: [Word; 4] = std::array::from_fn(|r| {
-                            match es.and_then(|m| m.get(&(r as u8))) {
+                        let chans: [Word; 4] =
+                            std::array::from_fn(|r| match es.and_then(|m| m.get(&(r as u8))) {
                                 Some(v) => self.lower_value(v),
                                 None => {
                                     if r == 3 {
@@ -1638,9 +2128,52 @@ impl Emitter {
                                         f0
                                     }
                                 }
-                            }
-                        });
-                        let v = self.b.composite_construct(self.vec4_t, None, chans).unwrap();
+                            });
+                        let v = self
+                            .b
+                            .composite_construct(self.vec4_t, None, chans)
+                            .unwrap();
+                        let mut v = v;
+                        if let Ok(loc) = std::env::var("NEXIUM_FS_COLOR_LOC")
+                            .ok()
+                            .and_then(|v| v.parse::<u32>().ok())
+                            .ok_or(())
+                        {
+                            let color = self.input_var(0x80 + loc.saturating_mul(16));
+                            let forced = [
+                                self.read_attr_component(color, 0),
+                                self.read_attr_component(color, 1),
+                                self.read_attr_component(color, 2),
+                                self.read_attr_component(color, 3),
+                            ];
+                            v = self
+                                .b
+                                .composite_construct(self.vec4_t, None, forced)
+                                .unwrap();
+                        }
+                        if let Ok(scale) = std::env::var("NEXIUM_FS_COLOR_SCALE")
+                            .ok()
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .ok_or(())
+                        {
+                            let s = self.const_f32(scale.to_bits());
+                            let sv = self
+                                .b
+                                .composite_construct(self.vec4_t, None, [s, s, s, s])
+                                .unwrap();
+                            v = self.b.f_mul(self.vec4_t, None, v, sv).unwrap();
+                        }
+                        if std::env::var("NEXIUM_FS_COLOR_ALPHA_ONE").ok().as_deref() == Some("1")
+                        {
+                            let r = self.b.composite_extract(self.f32_t, None, v, [0]).unwrap();
+                            let g = self.b.composite_extract(self.f32_t, None, v, [1]).unwrap();
+                            let b = self.b.composite_extract(self.f32_t, None, v, [2]).unwrap();
+                            v = self
+                                .b
+                                .composite_construct(self.vec4_t, None, [r, g, b, self.f32_one])
+                                .unwrap();
+                        }
+                        let v = self.sample_debug_value.unwrap_or(v);
                         let fc = self.frag_color_var_id();
                         self.b.store(fc, v, None, []).unwrap();
                     }
@@ -1702,7 +2235,11 @@ impl Emitter {
         }
     }
 
-    fn emit_entry_inits(&mut self, required_outputs: &[(u32, AttrVar)], ps_inject: Option<(Word, u32)>) {
+    fn emit_entry_inits(
+        &mut self,
+        required_outputs: &[(u32, AttrVar)],
+        ps_inject: Option<(Word, u32)>,
+    ) {
         if matches!(self.stage, Stage::Vertex) {
             for (_loc, av) in required_outputs {
                 let o = self.f32_one;
@@ -1719,11 +2256,19 @@ impl Emitter {
 
     fn preallocate_resources(&mut self, cfg: &Cfg) {
         let mut needs_sampler = false;
+        let mut needs_arrayed_sampler = false;
         let mut tex_ids = std::collections::BTreeSet::new();
         for block in &cfg.blocks {
             for inst in &block.program.instructions {
                 match &inst.op {
-                    IrOp::LoadAttr { slot } | IrOp::InterpAttr { slot, .. } => {
+                    IrOp::LoadAttr { slot } => {
+                        if self.system_attr_var_id(*slot).is_some() {
+                            continue;
+                        }
+                        let aligned = slot & !0xF;
+                        self.input_var(aligned);
+                    }
+                    IrOp::InterpAttr { slot, .. } => {
                         let aligned = slot & !0xF;
                         if aligned == 0x70 {
                             if matches!(self.stage, Stage::Fragment) {
@@ -1745,8 +2290,9 @@ impl Emitter {
                             self.output_var(aligned);
                         }
                     }
-                    IrOp::SampleTex { tex_id, .. } => {
+                    IrOp::SampleTex { tex_id, array, .. } => {
                         needs_sampler = true;
+                        needs_arrayed_sampler |= array.is_some();
                         tex_ids.insert(*tex_id);
                     }
                     _ => {}
@@ -1762,7 +2308,14 @@ impl Emitter {
             }
         }
         if needs_sampler {
+            self.sampler_arrayed = needs_arrayed_sampler;
             self.texs_ids_used.extend(tex_ids.iter().copied());
+            if let Some(id) = std::env::var("NEXIUM_NO_KIL_TEX_ID")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                self.no_kil_shader = tex_ids.contains(&id);
+            }
             self.texture_slots.clear();
             for (slot, tex_id) in tex_ids
                 .iter()
@@ -1833,9 +2386,11 @@ impl Emitter {
             }
         }
 
-        let multi_exit = cfg.blocks.iter().enumerate().any(|(i, b)| {
-            matches!(b.branch, BranchKind::Exit) && i + 1 != cfg.blocks.len()
-        });
+        let multi_exit = cfg
+            .blocks
+            .iter()
+            .enumerate()
+            .any(|(i, b)| matches!(b.branch, BranchKind::Exit) && i + 1 != cfg.blocks.len());
 
         let void_t = self.b.type_void();
         let main_t = self.b.type_function(void_t, vec![]);
@@ -1966,78 +2521,119 @@ impl Emitter {
             }
             Stage::Fragment => {
                 if self.return_block.is_none() {
-                let degenerate = cfg.blocks.is_empty()
-                    || cfg.blocks.iter().all(|b| b.program.instructions.is_empty());
-                if degenerate {
-                    log::warn!(
-                        "spirv: degenerate Fragment CFG (blocks={}, all-empty) — \
+                    let degenerate = cfg.blocks.is_empty()
+                        || cfg.blocks.iter().all(|b| b.program.instructions.is_empty());
+                    if degenerate {
+                        log::warn!(
+                            "spirv: degenerate Fragment CFG (blocks={}, all-empty) — \
                          emitting [0,0,0,1] fallback. If this is hot, the SASS \
                          decoder (nexium-shader::decode) is likely missing opcodes.",
-                        cfg.blocks.len()
-                    );
-                }
-                let exit_state = cfg
-                    .blocks
-                    .iter()
-                    .find_map(|b| b.program.exit_reg_state.as_ref());
-                let alpha_recovery: Option<Word> =
-                    exit_state.filter(|m| !m.contains_key(&3u8)).and_then(|m| {
-                        for v in m.values() {
-                            if let nexium_shader::ir::Value::Inst(vid) = v {
-                                let is_alpha = cfg.blocks.iter().any(|b| {
-                                    b.program.instructions.iter().any(|inst| {
-                                        inst.result == Some(*vid)
-                                            && matches!(
-                                                inst.op,
-                                                nexium_shader::ir::Op::SampleTex {
-                                                    component: 3,
-                                                    ..
-                                                }
-                                            )
-                                    })
-                                });
-                                if is_alpha {
-                                    return Some(self.lower_value(v));
+                            cfg.blocks.len()
+                        );
+                    }
+                    let exit_state = cfg
+                        .blocks
+                        .iter()
+                        .find_map(|b| b.program.exit_reg_state.as_ref());
+                    let alpha_recovery: Option<Word> =
+                        exit_state.filter(|m| !m.contains_key(&3u8)).and_then(|m| {
+                            for v in m.values() {
+                                if let nexium_shader::ir::Value::Inst(vid) = v {
+                                    let is_alpha = cfg.blocks.iter().any(|b| {
+                                        b.program.instructions.iter().any(|inst| {
+                                            inst.result == Some(*vid)
+                                                && matches!(
+                                                    inst.op,
+                                                    nexium_shader::ir::Op::SampleTex {
+                                                        component: 3,
+                                                        ..
+                                                    }
+                                                )
+                                        })
+                                    });
+                                    if is_alpha {
+                                        return Some(self.lower_value(v));
+                                    }
                                 }
                             }
-                        }
-                        None
-                    });
-                let f0 = self.f32_zero;
-                let f1 = self.f32_one;
-                let defaults: [Word; 4] = [f0, f0, f0, alpha_recovery.unwrap_or(f1)];
-                let chans: [Word; 4] =
-                    std::array::from_fn(|r| match exit_state.and_then(|m| m.get(&(r as u8))) {
-                        Some(v) => self.lower_value(v),
-                        None => defaults[r],
-                    });
-                let mut v = self
-                    .b
-                    .composite_construct(self.vec4_t, None, chans)
-                    .unwrap();
-                if std::env::var("NEXIUM_FS_COLOR_ATTR").ok().as_deref() == Some("1") {
-                    let color = self.input_var(0x80);
-                    let forced = [
-                        self.read_attr_component(color, 0),
-                        self.read_attr_component(color, 1),
-                        self.read_attr_component(color, 2),
-                        self.read_attr_component(color, 3),
-                    ];
-                    v = self
+                            None
+                        });
+                    let f0 = self.f32_zero;
+                    let f1 = self.f32_one;
+                    let defaults: [Word; 4] = [f0, f0, f0, alpha_recovery.unwrap_or(f1)];
+                    let chans: [Word; 4] =
+                        std::array::from_fn(|r| match exit_state.and_then(|m| m.get(&(r as u8))) {
+                            Some(v) => self.lower_value(v),
+                            None => defaults[r],
+                        });
+                    let mut v = self
                         .b
-                        .composite_construct(self.vec4_t, None, forced)
+                        .composite_construct(self.vec4_t, None, chans)
                         .unwrap();
-                }
-                if std::env::var("NEXIUM_FRAG_2X").is_ok() {
-                    let two = self.const_f32(2.0f32.to_bits());
-                    let two_vec = self
-                        .b
-                        .composite_construct(self.vec4_t, None, [two, two, two, two])
-                        .unwrap();
-                    v = self.b.f_mul(self.vec4_t, None, v, two_vec).unwrap();
-                }
-                let fc = self.frag_color_var_id();
-                self.b.store(fc, v, None, []).unwrap();
+                    if std::env::var("NEXIUM_FS_COLOR_ATTR").ok().as_deref() == Some("1") {
+                        let color = self.input_var(0x80);
+                        let forced = [
+                            self.read_attr_component(color, 0),
+                            self.read_attr_component(color, 1),
+                            self.read_attr_component(color, 2),
+                            self.read_attr_component(color, 3),
+                        ];
+                        v = self
+                            .b
+                            .composite_construct(self.vec4_t, None, forced)
+                            .unwrap();
+                    }
+                    if let Ok(loc) = std::env::var("NEXIUM_FS_COLOR_LOC")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .ok_or(())
+                    {
+                        let color = self.input_var(0x80 + loc.saturating_mul(16));
+                        let forced = [
+                            self.read_attr_component(color, 0),
+                            self.read_attr_component(color, 1),
+                            self.read_attr_component(color, 2),
+                            self.read_attr_component(color, 3),
+                        ];
+                        v = self
+                            .b
+                            .composite_construct(self.vec4_t, None, forced)
+                            .unwrap();
+                    }
+                    if let Ok(scale) = std::env::var("NEXIUM_FS_COLOR_SCALE")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .ok_or(())
+                    {
+                        let s = self.const_f32(scale.to_bits());
+                        let sv = self
+                            .b
+                            .composite_construct(self.vec4_t, None, [s, s, s, s])
+                            .unwrap();
+                        v = self.b.f_mul(self.vec4_t, None, v, sv).unwrap();
+                    }
+                    if std::env::var("NEXIUM_FS_COLOR_ALPHA_ONE").ok().as_deref() == Some("1") {
+                        let r = self.b.composite_extract(self.f32_t, None, v, [0]).unwrap();
+                        let g = self.b.composite_extract(self.f32_t, None, v, [1]).unwrap();
+                        let b = self.b.composite_extract(self.f32_t, None, v, [2]).unwrap();
+                        v = self
+                            .b
+                            .composite_construct(self.vec4_t, None, [r, g, b, self.f32_one])
+                            .unwrap();
+                    }
+                    if let Some(sample) = self.sample_debug_value {
+                        v = sample;
+                    }
+                    if std::env::var("NEXIUM_FRAG_2X").is_ok() {
+                        let two = self.const_f32(2.0f32.to_bits());
+                        let two_vec = self
+                            .b
+                            .composite_construct(self.vec4_t, None, [two, two, two, two])
+                            .unwrap();
+                        v = self.b.f_mul(self.vec4_t, None, v, two_vec).unwrap();
+                    }
+                    let fc = self.frag_color_var_id();
+                    self.b.store(fc, v, None, []).unwrap();
                 }
             }
         }
@@ -2167,10 +2763,11 @@ fn selection_exits_structured(words: &[u32]) -> bool {
         Err(_) => return false,
     };
     for func in &module.functions {
-        let has_loop = func
-            .blocks
-            .iter()
-            .any(|b| b.instructions.iter().any(|i| i.class.opcode == Op::LoopMerge));
+        let has_loop = func.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| i.class.opcode == Op::LoopMerge)
+        });
         if has_loop {
             continue;
         }
@@ -2238,6 +2835,39 @@ fn intersect_pdom(mut a: u32, mut b: u32, ipdom: &[u32]) -> u32 {
         }
     }
     a
+}
+
+fn dominators(cfg: &Cfg) -> Vec<Vec<bool>> {
+    let n = cfg.blocks.len();
+    let preds = cfg.predecessors();
+    let mut dom = vec![vec![true; n]; n];
+    if n == 0 {
+        return dom;
+    }
+    dom[0].fill(false);
+    dom[0][0] = true;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in 1..n {
+            let mut next = vec![true; n];
+            if preds[b].is_empty() {
+                next.fill(false);
+            } else {
+                for &p in &preds[b] {
+                    for d in 0..n {
+                        next[d] &= dom[p as usize][d];
+                    }
+                }
+            }
+            next[b] = true;
+            if next != dom[b] {
+                dom[b] = next;
+                changed = true;
+            }
+        }
+    }
+    dom
 }
 
 // For single-entry, single-exit, ACYCLIC CFGs (exit is the last block), compute
@@ -2364,8 +2994,17 @@ pub fn emit_fragment_with_bindings(cfg: &Cfg) -> (Vec<u32>, u32) {
 }
 
 pub fn emit_fragment_full(cfg: &Cfg) -> (Vec<u32>, u32, Vec<u32>, u32) {
+    emit_fragment_full_with_input_map(cfg, [0; 32])
+}
+
+pub fn emit_fragment_full_with_input_map(
+    cfg: &Cfg,
+    ps_input_map: [u8; 32],
+) -> (Vec<u32>, u32, Vec<u32>, u32) {
     let vec4s = cbuf_vec4s(cfg, 1).max(UBO_VEC4S);
-    let (words, mask, tex_ids) = Emitter::new_sized(Stage::Fragment, vec4s).finish_full(cfg, &[]);
+    let mut emitter = Emitter::new_sized(Stage::Fragment, vec4s);
+    emitter.ps_input_map = ps_input_map;
+    let (words, mask, tex_ids) = emitter.finish_full(cfg, &[]);
     (words, mask, tex_ids, vec4s * 16)
 }
 

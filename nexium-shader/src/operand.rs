@@ -59,12 +59,11 @@ pub fn cbuf(insn: u64) -> CbufRef {
 
 #[inline]
 pub fn imm20(insn: u64) -> i32 {
-    let raw = bits(insn, 20, 39) as u32;
-
-    if raw & (1 << 19) != 0 {
-        (raw | 0xFFF0_0000) as i32
+    let raw = bits(insn, 20, 38) as i32;
+    if bits(insn, 56, 56) != 0 {
+        raw - (1 << 19)
     } else {
-        raw as i32
+        raw
     }
 }
 
@@ -96,6 +95,16 @@ pub fn attr_slot_ald(insn: u64) -> u32 {
 #[inline]
 pub fn attr_slot_ipa(insn: u64) -> u32 {
     (bits(insn, 30, 37) as u32) * 4
+}
+
+#[inline]
+pub fn ipa_saturate(insn: u64) -> bool {
+    bits(insn, 51, 51) != 0
+}
+
+#[inline]
+pub fn ipa_interpolation_mode(insn: u64) -> u8 {
+    bits(insn, 54, 55) as u8
 }
 
 #[inline]
@@ -254,7 +263,7 @@ pub fn fmul_mods(insn: u64) -> FMods {
     FMods {
         neg_b: bits(insn, 48, 48) != 0,
         sat: bits(insn, 50, 50) != 0,
-        scale: bits(insn, 39, 41) as u8,
+        scale: bits(insn, 41, 43) as u8,
         ..FMods::default()
     }
 }
@@ -427,8 +436,13 @@ pub fn fmnmx_mods(insn: u64) -> FMods {
 }
 
 #[inline]
-pub fn fmnmx_is_min(insn: u64) -> bool {
-    bits(insn, 42, 42) == 0
+pub fn fmnmx_pred(insn: u64) -> u8 {
+    bits(insn, 39, 41) as u8
+}
+
+#[inline]
+pub fn fmnmx_neg_pred(insn: u64) -> bool {
+    bits(insn, 42, 42) != 0
 }
 
 #[inline]

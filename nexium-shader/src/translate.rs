@@ -5,15 +5,16 @@ use super::ir::{BoolOp, FComp, ICmp, LogicOp, MufuFunc, Op, Predicate, Program, 
 use super::opcodes::Opcode;
 use super::operand::{
     ald_num_elements, attr_slot_ald, attr_slot_ipa, bfe_signed, cbuf, decoded_pred, f2f_mods,
-    f2i_signed, fadd32i_mods, fadd_mods, ffma32i_mods, ffma_mods, float_imm20, fmnmx_is_min,
-    fmnmx_mods, fmul32i_mods, fmul_mods, fset_abs_a, fset_abs_b, fset_bop, fset_cmp, fset_neg_a,
-    fset_neg_b, fset_src_pred, fset_src_pred_inv, fsetp_abs_a, fsetp_abs_b, fsetp_bop, fsetp_cmp,
-    fsetp_dest_np, fsetp_dest_p, fsetp_neg_a, fsetp_neg_b, fsetp_src_pred, fsetp_src_pred_inv,
-    i2f_abs, i2f_int_format, i2f_neg, i2f_selector, i2f_signed, iadd_neg_a, iadd_neg_b, imm20,
-    imm32, iscadd_shift, iset_bf, iset_cmp, iset_signed, isetp_bop, isetp_cmp, isetp_dest_np,
-    isetp_dest_p, isetp_signed, isetp_src_pred, isetp_src_pred_inv, ldc_ref, ldc_size, ldc_src_reg,
-    ldg_addr_reg, ldg_offset, ldg_size, lop32i_not_a, lop32i_not_b, lop32i_op, lop_not_a, lop_not_b,
-    lop_op, mufu_func_bits, reg_a, reg_b, reg_c, reg_dest, shr_signed, texs_tex_id, RZ,
+    f2i_signed, fadd32i_mods, fadd_mods, ffma32i_mods, ffma_mods, float_imm20, fmnmx_mods,
+    fmnmx_neg_pred, fmnmx_pred, fmul32i_mods, fmul_mods, fset_abs_a, fset_abs_b, fset_bop,
+    fset_cmp, fset_neg_a, fset_neg_b, fset_src_pred, fset_src_pred_inv, fsetp_abs_a, fsetp_abs_b,
+    fsetp_bop, fsetp_cmp, fsetp_dest_np, fsetp_dest_p, fsetp_neg_a, fsetp_neg_b, fsetp_src_pred,
+    fsetp_src_pred_inv, i2f_abs, i2f_int_format, i2f_neg, i2f_selector, i2f_signed, iadd_neg_a,
+    iadd_neg_b, imm20, imm32, iscadd_shift, iset_bf, iset_cmp, iset_signed, isetp_bop, isetp_cmp,
+    ipa_interpolation_mode, ipa_saturate, isetp_dest_np, isetp_dest_p, isetp_signed,
+    isetp_src_pred, isetp_src_pred_inv, ldc_ref, ldc_size, ldc_src_reg, ldg_addr_reg, ldg_offset,
+    ldg_size, lop32i_not_a, lop32i_not_b, lop32i_op, lop_not_a, lop_not_b, lop_op,
+    mufu_func_bits, reg_a, reg_b, reg_c, reg_dest, shr_signed, texs_tex_id, RZ,
 };
 
 const PT: u8 = 7;
@@ -33,14 +34,18 @@ impl Translator {
     }
 
     pub fn with_offset(start: u32) -> Self {
-        Self::with_initial(HashMap::new(), start)
+        Self::with_initial(HashMap::new(), HashMap::new(), start)
     }
 
-    pub fn with_initial(initial: HashMap<u8, Value>, start: u32) -> Self {
+    pub fn with_initial(
+        initial: HashMap<u8, Value>,
+        initial_pred: HashMap<u8, ValueId>,
+        start: u32,
+    ) -> Self {
         Self {
             program: Program::with_offset(start),
             reg_state: initial,
-            pred_state: HashMap::new(),
+            pred_state: initial_pred,
             finished: false,
             unimplemented_count: 0,
         }
@@ -62,11 +67,26 @@ impl Translator {
     }
 
     fn write_reg(&mut self, r: u8, op: Op, pred: Option<Predicate>) -> ValueId {
-        let id = self.program.emit_pred(op, Some(r), pred);
-        if r != RZ {
+        if let Some(pred) = pred.filter(|_| r != RZ) {
+            let old = self.read_reg(r);
+            let new_id = self.program.emit(op, None);
+            let id = self.program.emit(
+                Op::SelectPred {
+                    pred,
+                    if_true: Value::Inst(new_id),
+                    if_false: old,
+                },
+                Some(r),
+            );
             self.reg_state.insert(r, Value::Inst(id));
+            id
+        } else {
+            let id = self.program.emit_pred(op, Some(r), pred);
+            if r != RZ {
+                self.reg_state.insert(r, Value::Inst(id));
+            }
+            id
         }
-        id
     }
 
     fn load_cbuf(&mut self, raw: u64) -> ValueId {
@@ -199,7 +219,17 @@ impl Translator {
     ) {
         let dest = reg_dest(raw);
         let a = self.read_reg(reg_a(raw));
-        self.write_reg(dest, Op::ILop { a, b, op, not_a, not_b }, pred);
+        self.write_reg(
+            dest,
+            Op::ILop {
+                a,
+                b,
+                op,
+                not_a,
+                not_b,
+            },
+            pred,
+        );
     }
 
     fn emit_ishl(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
@@ -577,10 +607,12 @@ impl Translator {
                 let a = self.read_reg(reg_a(raw));
                 let b = self.read_reg(reg_b(raw));
                 let mods = fmnmx_mods(raw);
-                let op = if fmnmx_is_min(raw) {
-                    Op::FMin { a, b, mods }
-                } else {
-                    Op::FMax { a, b, mods }
+                let op = Op::FMinMaxPred {
+                    a,
+                    b,
+                    mods,
+                    pred: fmnmx_pred(raw),
+                    neg_pred: fmnmx_neg_pred(raw),
                 };
                 self.write_reg(dest, op, pred);
             }
@@ -590,10 +622,12 @@ impl Translator {
                 let cb_id = self.load_cbuf(raw);
                 let b = Value::Inst(cb_id);
                 let mods = fmnmx_mods(raw);
-                let op = if fmnmx_is_min(raw) {
-                    Op::FMin { a, b, mods }
-                } else {
-                    Op::FMax { a, b, mods }
+                let op = Op::FMinMaxPred {
+                    a,
+                    b,
+                    mods,
+                    pred: fmnmx_pred(raw),
+                    neg_pred: fmnmx_neg_pred(raw),
                 };
                 self.write_reg(dest, op, pred);
             }
@@ -602,10 +636,12 @@ impl Translator {
                 let a = self.read_reg(reg_a(raw));
                 let b = Value::ImmF32(float_imm20(raw));
                 let mods = fmnmx_mods(raw);
-                let op = if fmnmx_is_min(raw) {
-                    Op::FMin { a, b, mods }
-                } else {
-                    Op::FMax { a, b, mods }
+                let op = Op::FMinMaxPred {
+                    a,
+                    b,
+                    mods,
+                    pred: fmnmx_pred(raw),
+                    neg_pred: fmnmx_neg_pred(raw),
                 };
                 self.write_reg(dest, op, pred);
             }
@@ -640,6 +676,8 @@ impl Translator {
                     Op::InterpAttr {
                         slot: attr_slot_ipa(raw),
                         perspective,
+                        mode: ipa_interpolation_mode(raw),
+                        sat: ipa_saturate(raw),
                     },
                     pred,
                 );
@@ -664,6 +702,7 @@ impl Translator {
                                 tex_id,
                                 u,
                                 v,
+                                array: None,
                                 component,
                             },
                             pred,
@@ -690,6 +729,11 @@ impl Translator {
                     (self.read_reg(ra.wrapping_add(1)), self.read_reg(rb))
                 } else {
                     (self.read_reg(ra), self.read_reg(rb))
+                };
+                let array = if array_2d {
+                    Some(self.read_reg(ra))
+                } else {
+                    None
                 };
                 let tex_id = texs_tex_id(raw);
                 let swizzle = ((raw >> 50) & 0x7) as usize;
@@ -722,6 +766,7 @@ impl Translator {
                             tex_id,
                             u,
                             v,
+                            array,
                             component,
                         },
                         pred,
@@ -825,9 +870,13 @@ impl Translator {
                 let addr_lo = self.read_reg(addr_reg);
                 for w in 0..count {
                     let off = offset.wrapping_add((w * 4) as i32);
-                    let id = self
-                        .program
-                        .emit(Op::LoadGlobal { addr_lo, offset: off }, None);
+                    let id = self.program.emit(
+                        Op::LoadGlobal {
+                            addr_lo,
+                            offset: off,
+                        },
+                        None,
+                    );
                     let dst = if dest == RZ {
                         RZ
                     } else {

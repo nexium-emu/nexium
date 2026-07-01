@@ -243,6 +243,14 @@ pub enum Op {
         mods: FMods,
     },
 
+    FMinMaxPred {
+        a: Value,
+        b: Value,
+        mods: FMods,
+        pred: u8,
+        neg_pred: bool,
+    },
+
     MultiFunc {
         src: Value,
         func: MufuFunc,
@@ -285,12 +293,15 @@ pub enum Op {
     InterpAttr {
         slot: u32,
         perspective: Value,
+        mode: u8,
+        sat: bool,
     },
 
     SampleTex {
         tex_id: u32,
         u: Value,
         v: Value,
+        array: Option<Value>,
         component: u8,
     },
 
@@ -410,6 +421,12 @@ pub enum Op {
         sources: Vec<(super::cfg::BlockId, Value)>,
     },
 
+    SelectPred {
+        pred: Predicate,
+        if_true: Value,
+        if_false: Value,
+    },
+
     Exit,
 
     Unimplemented {
@@ -518,6 +535,13 @@ impl Inst {
             Op::FFma { a, b, c, .. } => write!(f, "FFma  {a}, {b}, {c}"),
             Op::FMin { a, b, .. } => write!(f, "FMin  {a}, {b}"),
             Op::FMax { a, b, .. } => write!(f, "FMax  {a}, {b}"),
+            Op::FMinMaxPred {
+                a,
+                b,
+                pred,
+                neg_pred,
+                ..
+            } => write!(f, "FMnMx {a}, {b}, P{pred}, neg={neg_pred}"),
             Op::MultiFunc { src, func } => write!(f, "MFn.{} {src}", func.name()),
             Op::LoadCbuf {
                 binding,
@@ -550,18 +574,29 @@ impl Inst {
             }
             Op::LoadAttr { slot } => write!(f, "LdAttr a[{slot:#x}]"),
             Op::StoreAttr { slot, src } => write!(f, "StAttr a[{slot:#x}], {src}"),
-            Op::InterpAttr { slot, perspective } => {
-                write!(f, "Interp a[{slot:#x}], persp={perspective}")
+            Op::InterpAttr {
+                slot,
+                perspective,
+                mode,
+                sat,
+            } => {
+                write!(f, "Interp a[{slot:#x}], persp={perspective}, mode={mode}, sat={sat}")
             }
             Op::SampleTex {
                 tex_id,
                 u,
                 v,
+                array,
                 component,
             } => {
+                let coords = if let Some(array) = array {
+                    format!("({u}, {v}, {array})")
+                } else {
+                    format!("({u}, {v})")
+                };
                 write!(
                     f,
-                    "TexSamp t[{tex_id:#x}], ({u}, {v}).{}",
+                    "TexSamp t[{tex_id:#x}], {coords}.{}",
                     ["r", "g", "b", "a"]
                         .get(*component as usize)
                         .copied()
@@ -578,6 +613,11 @@ impl Inst {
                 }
                 Ok(())
             }
+            Op::SelectPred {
+                pred,
+                if_true,
+                if_false,
+            } => write!(f, "SelPred {pred}, {if_true}, {if_false}"),
             Op::FSetPred {
                 cmp,
                 bop,

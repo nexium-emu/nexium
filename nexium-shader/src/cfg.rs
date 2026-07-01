@@ -30,6 +30,15 @@ pub struct BasicBlock {
     pub program: Program,
 
     pub reg_exit: HashMap<u8, Value>,
+    pub pred_phis: Vec<PredPhi>,
+    pub pred_exit: HashMap<u8, ValueId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PredPhi {
+    pub pred: u8,
+    pub result: ValueId,
+    pub sources: Vec<(BlockId, Option<ValueId>)>,
 }
 
 pub struct Cfg {
@@ -188,7 +197,36 @@ fn bra_target(pc: usize, raw: u64) -> usize {
     (pc as i64 + signed as i64 + 8) as usize
 }
 
-fn discover_leaders(bytes: &[u8]) -> BTreeSet<usize> {
+fn discover_sync_targets(bytes: &[u8]) -> HashMap<usize, usize> {
+    let mut targets = HashMap::new();
+    let mut stack = Vec::new();
+    let mut offset = 0usize;
+    while offset + 8 <= bytes.len() {
+        if is_schedule(offset) {
+            offset += 8;
+            continue;
+        }
+        let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        if let Some(d) = decode_one(raw) {
+            match d.opcode {
+                Opcode::SSY => stack.push(bra_target(offset, raw)),
+                Opcode::SYNC => {
+                    if let Some(&target) = stack.last() {
+                        targets.insert(offset, target);
+                        if decoded_pred(raw).is_none() {
+                            stack.pop();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        offset += 8;
+    }
+    targets
+}
+
+fn discover_leaders(bytes: &[u8], sync_targets: &HashMap<usize, usize>) -> BTreeSet<usize> {
     let mut leaders: BTreeSet<usize> = BTreeSet::new();
     let mut worklist: Vec<usize> = vec![0];
     leaders.insert(0);
@@ -223,6 +261,21 @@ fn discover_leaders(bytes: &[u8]) -> BTreeSet<usize> {
                     }
                     break;
                 }
+                Opcode::SYNC => {
+                    if let Some(&target) = sync_targets.get(&offset) {
+                        if target < bytes.len() && leaders.insert(target) {
+                            worklist.push(target);
+                        }
+                        if pred.is_some() {
+                            if next < bytes.len() && leaders.insert(next) {
+                                worklist.push(next);
+                            }
+                            offset = next;
+                            continue;
+                        }
+                        break;
+                    }
+                }
                 _ => {}
             }
             offset = next;
@@ -240,11 +293,12 @@ fn make_offset_to_block(leaders: &BTreeSet<usize>) -> HashMap<usize, BlockId> {
 }
 
 pub fn build_cfg(bytes: &[u8]) -> Cfg {
-    let leaders = discover_leaders(bytes);
+    let sync_targets = discover_sync_targets(bytes);
+    let leaders = discover_leaders(bytes, &sync_targets);
     let offset_to_block = make_offset_to_block(&leaders);
     let leader_vec: Vec<usize> = leaders.iter().copied().collect();
 
-    let topology = discover_topology(bytes, &leader_vec, &offset_to_block);
+    let topology = discover_topology(bytes, &leader_vec, &offset_to_block, &sync_targets);
     let preds = compute_predecessors(&topology);
 
     let mut blocks: Vec<BasicBlock> = Vec::with_capacity(topology.len());
@@ -256,7 +310,11 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
             compute_initial_reg_state(&blocks, &preds, bid as BlockId, next_value);
         next_value = after_phis;
 
-        let mut t = Translator::with_initial(initial_state, next_value);
+        let (initial_pred_state, pred_phis, after_pred_phis) =
+            compute_initial_pred_state(&blocks, &preds, bid as BlockId, next_value);
+        next_value = after_pred_phis;
+
+        let mut t = Translator::with_initial(initial_state, initial_pred_state, next_value);
         for phi in phis {
             t.program.instructions.push(phi);
         }
@@ -285,6 +343,7 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
         total_unimpl += t.unimplemented_count;
         next_value = t.program.next_value_id();
         let reg_exit = t.snapshot_reg_state();
+        let pred_exit = t.snapshot_pred_state();
         blocks.push(BasicBlock {
             id: bid as BlockId,
             start_offset: info.start,
@@ -292,10 +351,13 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
             branch: info.branch,
             program: std::mem::take(&mut t.program),
             reg_exit,
+            pred_phis,
+            pred_exit,
         });
     }
 
     patch_back_edge_phi_sources(&mut blocks);
+    patch_back_edge_pred_phi_sources(&mut blocks);
 
     Cfg {
         blocks,
@@ -315,6 +377,7 @@ fn discover_topology(
     bytes: &[u8],
     leader_vec: &[usize],
     offset_to_block: &HashMap<usize, BlockId>,
+    sync_targets: &HashMap<usize, usize>,
 ) -> Vec<BlockInfo> {
     let mut out = Vec::with_capacity(leader_vec.len());
     for (i, &start) in leader_vec.iter().enumerate() {
@@ -344,6 +407,18 @@ fn discover_topology(
                         }
                         terminator_offset = Some(offset);
                         break;
+                    }
+                    Opcode::SYNC => {
+                        if let Some(&target_off) = sync_targets.get(&offset) {
+                            let target =
+                                *offset_to_block.get(&target_off).unwrap_or(&(i as u32));
+                            match decoded_pred(raw) {
+                                None => branch = BranchKind::Unconditional { target },
+                                Some(pred) => branch = BranchKind::Conditional { target, pred },
+                            }
+                            terminator_offset = Some(offset);
+                            break;
+                        }
                     }
                     _ => {}
                 }
@@ -454,6 +529,75 @@ fn compute_initial_reg_state(
     (initial, phis, next_value)
 }
 
+fn compute_initial_pred_state(
+    built_blocks: &[BasicBlock],
+    preds: &[Vec<BlockId>],
+    bid: BlockId,
+    mut next_value: u32,
+) -> (HashMap<u8, ValueId>, Vec<PredPhi>, u32) {
+    let pred_ids = &preds[bid as usize];
+    if pred_ids.is_empty() {
+        return (HashMap::new(), Vec::new(), next_value);
+    }
+
+    let has_back_edge = pred_ids.iter().any(|&p| p >= bid);
+
+    if pred_ids.len() == 1 && !has_back_edge {
+        let p = pred_ids[0] as usize;
+        if p < built_blocks.len() {
+            return (built_blocks[p].pred_exit.clone(), Vec::new(), next_value);
+        }
+        return (HashMap::new(), Vec::new(), next_value);
+    }
+
+    let mut all_preds: BTreeSet<u8> = BTreeSet::new();
+    for &p in pred_ids {
+        if let Some(b) = built_blocks.get(p as usize) {
+            for &r in b.pred_exit.keys() {
+                all_preds.insert(r);
+            }
+        }
+    }
+
+    let mut initial = HashMap::new();
+    let mut phis = Vec::new();
+    for pidx in all_preds {
+        if pidx >= 7 {
+            continue;
+        }
+        let sources: Vec<(BlockId, Option<ValueId>)> = pred_ids
+            .iter()
+            .map(|&p| {
+                let v = built_blocks
+                    .get(p as usize)
+                    .and_then(|b| b.pred_exit.get(&pidx).copied());
+                (p, v)
+            })
+            .collect();
+
+        if !has_back_edge {
+            let all_same = sources.windows(2).all(|w| w[0].1 == w[1].1);
+            if all_same {
+                if let Some(id) = sources[0].1 {
+                    initial.insert(pidx, id);
+                }
+                continue;
+            }
+        }
+
+        let id = ValueId(next_value);
+        next_value = next_value.wrapping_add(1);
+        phis.push(PredPhi {
+            pred: pidx,
+            result: id,
+            sources,
+        });
+        initial.insert(pidx, id);
+    }
+
+    (initial, phis, next_value)
+}
+
 fn patch_back_edge_phi_sources(blocks: &mut [BasicBlock]) {
     let reg_exits: Vec<HashMap<u8, Value>> = blocks.iter().map(|b| b.reg_exit.clone()).collect();
     for block in blocks.iter_mut() {
@@ -470,6 +614,23 @@ fn patch_back_edge_phi_sources(blocks: &mut [BasicBlock]) {
                 if *pred_id >= bid {
                     if let Some(exit) = reg_exits.get(*pred_id as usize) {
                         *value = exit.get(&reg).copied().unwrap_or(Value::GprIn(reg));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn patch_back_edge_pred_phi_sources(blocks: &mut [BasicBlock]) {
+    let pred_exits: Vec<HashMap<u8, ValueId>> =
+        blocks.iter().map(|b| b.pred_exit.clone()).collect();
+    for block in blocks.iter_mut() {
+        let bid = block.id;
+        for phi in block.pred_phis.iter_mut() {
+            for (pred_id, value) in phi.sources.iter_mut() {
+                if *pred_id >= bid {
+                    if let Some(exit) = pred_exits.get(*pred_id as usize) {
+                        *value = exit.get(&phi.pred).copied();
                     }
                 }
             }
