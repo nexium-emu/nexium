@@ -144,7 +144,15 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
     if let Some((n, x0, x1, x2, x3, pc, lr)) = __svc_trace_args {
         log::info!(
             "[svc-trace #{}] svc={:#04x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} -> {:#x} pc={:#x} lr={:#x}",
-            n, imm, x0, x1, x2, x3, __svc_res, pc, lr
+            n,
+            imm,
+            x0,
+            x1,
+            x2,
+            x3,
+            __svc_res,
+            pc,
+            lr
         );
     }
     __svc_res
@@ -157,7 +165,11 @@ fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
         return 1;
     };
     if size > kernel.heap_size {
-        log::warn!("svcSetHeapSize requested {:#x} > mapped heap {:#x}; clamping (guest may fault on overflow)", size, kernel.heap_size);
+        log::warn!(
+            "svcSetHeapSize requested {:#x} > mapped heap {:#x}; clamping (guest may fault on overflow)",
+            size,
+            kernel.heap_size
+        );
     }
     kernel.heap_committed = size.min(kernel.heap_size);
     log::debug!(
@@ -267,11 +279,15 @@ fn svc_map_memory(kernel: &mut Kernel) -> u32 {
                 match plumb {
                     Ok(_) => log::info!(
                         "svcMapMemory dst={:#x} src={:#x} size={:#x} → mapped + copied + plumbed to dynarmic",
-                        dst, src, size
+                        dst,
+                        src,
+                        size
                     ),
                     Err(e) => log::warn!(
                         "svcMapMemory dst={:#x} size={:#x} mapped in AS but dynarmic map_host failed: {}",
-                        dst, size, e
+                        dst,
+                        size,
+                        e
                     ),
                 }
             }
@@ -282,7 +298,13 @@ fn svc_map_memory(kernel: &mut Kernel) -> u32 {
             );
         }
     } else if let Err(e) = map_rc {
-        log::debug!("svcMapMemory dst={:#x} src={:#x} size={:#x} → already mapped ({:?}), refreshed contents only", dst, src, size, e);
+        log::debug!(
+            "svcMapMemory dst={:#x} src={:#x} size={:#x} → already mapped ({:?}), refreshed contents only",
+            dst,
+            src,
+            size,
+            e
+        );
     }
 
     if let Some(cpu) = cpu_mut() {
@@ -424,7 +446,8 @@ fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
             "svcMapSharedMemory called with handle=0 (addr={:#x} size={:#x}). \
              Upstream service returned no shared-memory handle. \
              Allocating zero-filled placeholder; expect downstream code to read zeros from this region.",
-            addr, size
+            addr,
+            size
         );
     }
 
@@ -660,8 +683,13 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
     }
 
     if timeout_ns == 0 {
-        log::trace!("svcWaitSync(timeout=0) handles={:?} applet_msg_event={:?} applet_msgs_pending={} vsync_idx={:?}",
-            handles, kernel.applet_message_event, kernel.applet_messages.len(), vsync_idx);
+        log::trace!(
+            "svcWaitSync(timeout=0) handles={:?} applet_msg_event={:?} applet_msgs_pending={} vsync_idx={:?}",
+            handles,
+            kernel.applet_message_event,
+            kernel.applet_messages.len(),
+            vsync_idx
+        );
         for (i, h) in handles.iter().enumerate() {
             if let Some(msg_evt) = kernel.applet_message_event {
                 if *h == msg_evt && !kernel.applet_messages.is_empty() {
@@ -945,7 +973,14 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
         return 1;
     };
     let lr = cpu_ref().map(|c| c.get_register(30)).unwrap_or(0);
-    log::trace!("svcWaitProcessWideKeyAtomic mutex={:#x} condvar={:#x} self_handle={:#x} timeout_ns={} lr={:#x}", mutex_addr, condvar_addr, self_handle, timeout_ns, lr);
+    log::trace!(
+        "svcWaitProcessWideKeyAtomic mutex={:#x} condvar={:#x} self_handle={:#x} timeout_ns={} lr={:#x}",
+        mutex_addr,
+        condvar_addr,
+        self_handle,
+        timeout_ns,
+        lr
+    );
 
     let woken = kernel.threads.wake_one_on_mutex(mutex_addr);
     let new_word = match woken {
@@ -1006,22 +1041,11 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
         return KERNEL_TIMEOUT;
     }
 
-    let effective_ns = if timeout_ns == u64::MAX {
-        16_000_000u64
-    } else if timeout_ns != 0 && timeout_ns < 50_000_000 {
-        50_000_000u64
-    } else {
-        timeout_ns
-    };
-    let wake_at = if (effective_ns as i64) <= 0 {
+    let wake_at = if timeout_ns == u64::MAX {
         None
     } else {
-        Some(std::time::Instant::now() + std::time::Duration::from_nanos(effective_ns))
+        Some(std::time::Instant::now() + std::time::Duration::from_nanos(timeout_ns))
     };
-
-    if timeout_ns < 50_000_000 && timeout_ns != 0 {
-        kernel.audio_render_condvar = Some(condvar_addr);
-    }
 
     let _ = kernel
         .address_space
@@ -1034,10 +1058,7 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
                 mutex_addr,
                 condvar_addr,
                 wake_at,
-                spurious_wake: timeout_ns == u64::MAX
-                    || (timeout_ns != 0
-                        && timeout_ns < 50_000_000
-                        && kernel.audio_render_condvar == Some(condvar_addr)),
+                spurious_wake: false,
             },
         );
     }
@@ -1073,7 +1094,12 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
                 .address_space
                 .write(mutex_addr, &handle.to_le_bytes());
             kernel.threads.wake_condvar_to_ready(handle);
-            log::trace!("svcSignalProcessWideKey cond={:#x} → handle={:#x} mutex={:#x} (mutex was free, handed off)", condvar_addr, handle, mutex_addr);
+            log::trace!(
+                "svcSignalProcessWideKey cond={:#x} → handle={:#x} mutex={:#x} (mutex was free, handed off)",
+                condvar_addr,
+                handle,
+                mutex_addr
+            );
         } else {
             let new_word = cur_word | MUTEX_HAS_LISTENERS;
             let _ = kernel
@@ -1082,7 +1108,13 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
             kernel
                 .threads
                 .wake_condvar_into_mutex_waiter(handle, mutex_addr);
-            log::trace!("svcSignalProcessWideKey cond={:#x} → handle={:#x} mutex={:#x} (held by {:#x}, requeued as WaitingMutex)", condvar_addr, handle, mutex_addr, holder);
+            log::trace!(
+                "svcSignalProcessWideKey cond={:#x} → handle={:#x} mutex={:#x} (held by {:#x}, requeued as WaitingMutex)",
+                condvar_addr,
+                handle,
+                mutex_addr,
+                holder
+            );
         }
         woken += 1;
     }
@@ -1324,7 +1356,12 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         match service_for_domain_object(kernel, session_handle, d.object_id) {
             Some(name) => name,
             None => {
-                log::warn!("domain object_id={} not found on session={:#x} (port={}) → InvalidObject 0xCE01", d.object_id, session_handle, port_name);
+                log::warn!(
+                    "domain object_id={} not found on session={:#x} (port={}) → InvalidObject 0xCE01",
+                    d.object_id,
+                    session_handle,
+                    port_name
+                );
                 if let Some(cpu) = cpu_mut() {
                     cpu.set_register(0, SUCCESS as u64);
                 }
@@ -1414,8 +1451,12 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             };
             log::info!(
                 "IPC FIRST-OCCURRENCE response (compare with RustSwitch) service={} cmd={} rc={:#010x} response_len={} response_first64={} in_data_first32={}",
-                dispatch_target, cmd_id, reply_rc, response.len(),
-                resp_preview.join(","), in_preview.join(",")
+                dispatch_target,
+                cmd_id,
+                reply_rc,
+                response.len(),
+                resp_preview.join(","),
+                in_preview.join(",")
             );
         }
     }
@@ -1654,9 +1695,25 @@ fn dump_throw_context(kernel: &Kernel) {
     );
     for row in 0..4 {
         let r = row * 8;
-        log::warn!("[throw] x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x}",
-            r, cpu.get_register(r), r+1, cpu.get_register(r+1), r+2, cpu.get_register(r+2), r+3, cpu.get_register(r+3),
-            r+4, cpu.get_register(r+4), r+5, cpu.get_register(r+5), r+6, cpu.get_register(r+6), r+7, cpu.get_register(r+7));
+        log::warn!(
+            "[throw] x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x}",
+            r,
+            cpu.get_register(r),
+            r + 1,
+            cpu.get_register(r + 1),
+            r + 2,
+            cpu.get_register(r + 2),
+            r + 3,
+            cpu.get_register(r + 3),
+            r + 4,
+            cpu.get_register(r + 4),
+            r + 5,
+            cpu.get_register(r + 5),
+            r + 6,
+            cpu.get_register(r + 6),
+            r + 7,
+            cpu.get_register(r + 7)
+        );
     }
     log::warn!(
         "[throw] x28={:#018x} x29(fp)={:#018x} x30(lr)={:#018x} sp={:#018x}",
@@ -2663,7 +2720,13 @@ fn dispatch_service_v2(
             .unwrap_or(false);
         log::info!(
             "audren:u OpenAudioRenderer sr={} samples={} voices={} sinks={} effects={} rev={:#x} → IAudioRenderer (domain={})",
-            sample_rate, sample_count, voice_count, sink_count, effect_count, revision, is_domain
+            sample_rate,
+            sample_count,
+            voice_count,
+            sink_count,
+            effect_count,
+            revision,
+            is_domain
         );
 
         if is_domain {
@@ -2715,7 +2778,10 @@ fn dispatch_service_v2(
         size += (sub_mixes + 1) * 0xC00;
         size += voices * 0x1400;
         size += effects * 0x400;
-        size += align_up(((sinks + sub_mixes) * TARGET + sample_count) * 4 * (mixes + MAXCH), 0x40);
+        size += align_up(
+            ((sinks + sub_mixes) * TARGET + sample_count) * 4 * (mixes + MAXCH),
+            0x40,
+        );
         size += (sinks + sub_mixes) * 0xC00;
         size += 0x40000;
         let computed = align_up(size, 0x1000);
@@ -2725,7 +2791,11 @@ fn dispatch_service_v2(
             .unwrap_or_else(|| computed.clamp(0x20_0000, 0x80_0000));
         log::info!(
             "audren GetWorkBufferSize voices={} effects={} mixes={} → {:#x} (computed {:#x})",
-            voices, effects, mixes, work_buffer_size, computed
+            voices,
+            effects,
+            mixes,
+            work_buffer_size,
+            computed
         );
         return build_ipc_response(ctx, 0, &work_buffer_size.to_le_bytes(), &[]);
     }
@@ -3008,11 +3078,17 @@ fn dispatch_service_v2(
                                         _ => "?",
                                     };
                                     log::trace!(
-                                    "voice[{}] FIRST SEEN: fmt={}({}) ch={} sr={} vol={:.2} state={} wb_count={} wb_index={}",
-                                    vid, fmt_name, sample_format,
-                                    channel_count, sample_rate, volume,
-                                    play_state, wb_count, wb_index
-                                );
+                                        "voice[{}] FIRST SEEN: fmt={}({}) ch={} sr={} vol={:.2} state={} wb_count={} wb_index={}",
+                                        vid,
+                                        fmt_name,
+                                        sample_format,
+                                        channel_count,
+                                        sample_rate,
+                                        volume,
+                                        play_state,
+                                        wb_count,
+                                        wb_index
+                                    );
                                 }
                             }
 
@@ -3127,10 +3203,16 @@ fn dispatch_service_v2(
                                     if DUMPED.fetch_or(bit, O::Relaxed) & bit == 0 {
                                         let nz = decoded.iter().filter(|s| **s != 0).count();
                                         log::trace!(
-                                        "voice[{}] ADPCM: decoded={} nonzero={} coeff_addr={:#x} ctx_addr={:#x} start_off={} in_frames={} sr={}",
-                                        vid, decoded.len(), nz, coeff_addr, ctx_addr,
-                                        start_offset, in_frames, sample_rate
-                                    );
+                                            "voice[{}] ADPCM: decoded={} nonzero={} coeff_addr={:#x} ctx_addr={:#x} start_off={} in_frames={} sr={}",
+                                            vid,
+                                            decoded.len(),
+                                            nz,
+                                            coeff_addr,
+                                            ctx_addr,
+                                            start_offset,
+                                            in_frames,
+                                            sample_rate
+                                        );
                                     }
                                 }
                             } else {
@@ -3218,7 +3300,14 @@ fn dispatch_service_v2(
                                     static DC: AtomicU64 = AtomicU64::new(0);
                                     let n = DC.fetch_add(1, O::Relaxed);
                                     if n % 256 == 0 {
-                                        log::trace!("voice[0] chain wb_count={} wb_index={} cursor={} got={} in_frames={}", wb_count, wb_index, cursor, got, in_frames);
+                                        log::trace!(
+                                            "voice[0] chain wb_count={} wb_index={} cursor={} got={} in_frames={}",
+                                            wb_count,
+                                            wb_index,
+                                            cursor,
+                                            got,
+                                            in_frames
+                                        );
                                     }
                                 }
                                 if got == 0 {
@@ -3338,9 +3427,14 @@ fn dispatch_service_v2(
                                         static WARN_ONCE: AtomicBool = AtomicBool::new(false);
                                         if !WARN_ONCE.swap(true, O2::Relaxed) {
                                             log::warn!(
-                                            "audio voice[{}] consume cap hit: residue={} wb_total={} completed={} cap={} (wb_count={})",
-                                            vid, new_progress, wb_total, completed, cap, wb_count_now
-                                        );
+                                                "audio voice[{}] consume cap hit: residue={} wb_total={} completed={} cap={} (wb_count={})",
+                                                vid,
+                                                new_progress,
+                                                wb_total,
+                                                completed,
+                                                cap,
+                                                wb_count_now
+                                            );
                                         }
                                     }
                                 } else {
@@ -3360,10 +3454,15 @@ fn dispatch_service_v2(
                                     let prev_mask = PER_VOICE_LOGGED.fetch_or(bit, O3::Relaxed);
                                     if prev_mask & bit == 0 {
                                         log::trace!(
-                                        "voice[{}] FIRST CONSUMED BUMP: wb_index={}, samples_played={} (consumed_now={}, wb_total={}, completed={}, frame {})",
-                                        vid, wb_now, st.voice_played_samples[vid],
-                                        st.voice_wbufs_consumed[vid], wb_total, completed, frame
-                                    );
+                                            "voice[{}] FIRST CONSUMED BUMP: wb_index={}, samples_played={} (consumed_now={}, wb_total={}, completed={}, frame {})",
+                                            vid,
+                                            wb_now,
+                                            st.voice_played_samples[vid],
+                                            st.voice_wbufs_consumed[vid],
+                                            wb_total,
+                                            completed,
+                                            frame
+                                        );
                                     }
                                 }
                                 if let Some(p) = st.voice_wb_progress_frames.get_mut(vid) {
@@ -3381,9 +3480,11 @@ fn dispatch_service_v2(
                                 .filter(|&i| voice_snapshot[i].2)
                                 .collect();
                             log::trace!(
-                            "audio multi-voice MIXED first time: voice_count_seen={} mixed_voices={:?} (frame {})",
-                            voice_count_seen, mixed_ids, frame
-                        );
+                                "audio multi-voice MIXED first time: voice_count_seen={} mixed_voices={:?} (frame {})",
+                                voice_count_seen,
+                                mixed_ids,
+                                frame
+                            );
                         }
                         if any_consumed && !CONSUMED_LOGGED.swap(true, O::Relaxed) {
                             let states: Vec<(usize, u32, u64)> = (0..voice_count_seen)
@@ -3498,7 +3599,10 @@ fn dispatch_service_v2(
                     if !FIRST_PUSH.swap(true, O::Relaxed) {
                         log::info!(
                             "audio: first push to sink — pushed {} frames of {} mix_peak={:.4} (frame {})",
-                            pushed, TARGET_FRAMES, mix_peak, frame
+                            pushed,
+                            TARGET_FRAMES,
+                            mix_peak,
+                            frame
                         );
                     }
                     if mix_peak > 0.001 && !FIRST_NONZERO.swap(true, O::Relaxed) {
@@ -3515,9 +3619,12 @@ fn dispatch_service_v2(
                 log::trace!(
                     "IAudioRenderer.RequestUpdate{} in={:?} out={:?} perf={:?} mempools={} voices={} frame={}",
                     if cmd_id == 10 { "Auto" } else { "" },
-                    in_buf.map(|b| b.size), out_buf.map(|b| b.size),
+                    in_buf.map(|b| b.size),
+                    out_buf.map(|b| b.size),
                     perf_buf.map(|b| b.size),
-                    mempool_count, voice_count_seen, frame
+                    mempool_count,
+                    voice_count_seen,
+                    frame
                 );
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
@@ -3587,7 +3694,7 @@ fn dispatch_service_v2(
 
     if port_name == "IAudioDevice" {
         match cmd_id {
-            0 => {
+            0 | 6 | 14 => {
                 let buf = ctx
                     .recv_buffers
                     .iter()
@@ -3604,14 +3711,14 @@ fn dispatch_service_v2(
                 let count: u32 = 1;
                 return build_ipc_response(ctx, 0, &count.to_le_bytes(), &[]);
             }
-            1 => {
+            1 | 7 => {
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
-            2 => {
+            2 | 8 => {
                 let vol: f32 = 1.0;
                 return build_ipc_response(ctx, 0, &vol.to_le_bytes(), &[]);
             }
-            3 => {
+            3 | 10 | 13 => {
                 let buf = ctx
                     .recv_buffers
                     .iter()
@@ -3627,7 +3734,7 @@ fn dispatch_service_v2(
                 }
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
-            4 => {
+            4 | 11 | 12 => {
                 let h = kernel.handles.create_handle(HandleType::Event);
                 kernel.event_signals.insert(h, true);
                 return build_ipc_response(ctx, 0, &[], &[h]);
@@ -3768,7 +3875,11 @@ fn dispatch_service_v2(
         return build_ipc_response_copy(ctx, 0, &[], &[h]);
     }
 
-    log::warn!("dispatch_service_v2: {} cmd_{} FELL THROUGH to legacy dispatch_service (probably needs a real handler)", port_name, cmd_id);
+    log::warn!(
+        "dispatch_service_v2: {} cmd_{} FELL THROUGH to legacy dispatch_service (probably needs a real handler)",
+        port_name,
+        cmd_id
+    );
     let tls_snapshot = ctx.buf.clone();
     let mut svc_ctx = crate::services::IpcCtx {
         tls_buf: &tls_snapshot,
@@ -3953,7 +4064,10 @@ fn igbp_handle_transact(
                         g.nvmap_id = id;
                         log::info!(
                             "SetPreallocatedBuffer fixup: nvmap_id=0 → {} (off={:#x} tiled_size={:#x} needed={:#x})",
-                            id, g.buffer_offset, tiled_size, needed
+                            id,
+                            g.buffer_offset,
+                            tiled_size,
+                            needed
                         );
                     }
                 }
@@ -3968,7 +4082,16 @@ fn igbp_handle_transact(
                     bq.set_preallocated(slot, gb);
                 }
             });
-            log::info!("IGBP::SetPreallocatedBuffer binder={} slot={} parsed={} nvmap_id={} {}x{} off={:#x}", binder_id, slot, parsed, nvmap_id, w, h, off);
+            log::info!(
+                "IGBP::SetPreallocatedBuffer binder={} slot={} parsed={} nvmap_id={} {}x{} off={:#x}",
+                binder_id,
+                slot,
+                parsed,
+                nvmap_id,
+                w,
+                h,
+                off
+            );
             let mut p = ParcelBuilder::new();
             p.write_u32(0);
             p.finish()
@@ -4039,7 +4162,7 @@ fn igbp_handle_transact(
             let _crop_r = reader.read_i32();
             let _crop_b = reader.read_i32();
             let _scaling = reader.read_i32();
-            let _transform = reader.read_i32();
+            let transform = reader.read_i32().unwrap_or(0) as u32;
             let _sticky = reader.read_u32();
             let _async = reader.read_i32();
             let swap_interval = reader.read_i32().unwrap_or(1).max(1);
@@ -4056,7 +4179,24 @@ fn igbp_handle_transact(
                 (r, slot_count, has_buf)
             });
             let (gb_opt, slot_count, has_buf) = gb_opt;
-            log::trace!("IGBP::QueueBuffer binder={} slot={} swap_interval={} slot_count={} has_buf={} gb_some={}", binder_id, slot, swap_interval, slot_count, has_buf, gb_opt.is_some());
+            log::trace!(
+                "IGBP::QueueBuffer binder={} slot={} swap_interval={} transform={:#x} slot_count={} has_buf={} gb_some={}",
+                binder_id,
+                slot,
+                swap_interval,
+                transform,
+                slot_count,
+                has_buf,
+                gb_opt.is_some()
+            );
+            if transform != 0 && std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+                log::warn!(
+                    "IGBP::QueueBuffer transform binder={} slot={} transform={:#x}",
+                    binder_id,
+                    slot,
+                    transform
+                );
+            }
 
             if let Some(gb) = gb_opt {
                 let bpp: usize = 4;
@@ -4070,7 +4210,14 @@ fn igbp_handle_transact(
                         actual_size >= tiled_size && gb.kind == 254 && gb.block_height_log2 != 0;
                     log::trace!(
                         "QueueBuffer fast-path: nvmap_id={} addr={:#x} off={:#x} size={:#x} kind={} bh_log2={} tiled={} (slot={})",
-                        gb.nvmap_id, nvmap.address, gb.buffer_offset, actual_size, gb.kind, gb.block_height_log2, is_tiled, slot
+                        gb.nvmap_id,
+                        nvmap.address,
+                        gb.buffer_offset,
+                        actual_size,
+                        gb.kind,
+                        gb.block_height_log2,
+                        is_tiled,
+                        slot
                     );
                     Some((nvmap.address.wrapping_add(gb.buffer_offset), is_tiled))
                 } else {
@@ -4085,13 +4232,19 @@ fn igbp_handle_transact(
                     if let Some(&(id, addr, size)) = candidates.last() {
                         log::info!(
                             "QueueBuffer fallback pick newest: nvmap_id={} addr={:#x} size={:#x} (slot={} candidates={})",
-                            id, addr, size, slot, candidates.len()
+                            id,
+                            addr,
+                            size,
+                            slot,
+                            candidates.len()
                         );
                         Some((addr, false))
                     } else {
                         log::warn!(
                             "QueueBuffer fallback: no exact-size candidate (linear_size={:#x} slot={} total_handles={})",
-                            linear_size, slot, kernel.nvdrv.nvmap_handles.len()
+                            linear_size,
+                            slot,
+                            kernel.nvdrv.nvmap_handles.len()
                         );
                         None
                     }
@@ -4127,7 +4280,7 @@ fn igbp_handle_transact(
                             r_async.readback_target_pipelined(pnv, pw, ph, read_rect)
                         {
                             let (present_w, present_h, bytes) =
-                                prepare_vulkan_present_frame(bytes, read_w, read_h);
+                                prepare_vulkan_present_frame(bytes, read_w, read_h, transform);
                             dump_present_frame(&bytes, present_w, present_h);
                             if std::env::var_os("NEXIUM_FRAME_PRESENT_CACHE").is_some() {
                                 nexium_common::frame_present::set_last_presented(
@@ -4192,7 +4345,11 @@ fn igbp_handle_transact(
                         if nonzero > 0 && slot < 2 {
                             log::info!(
                                 "QueueBuffer slot={} addr={:#x} nonzero_bytes={}/{} first16={:02x?}",
-                                slot, addr, nonzero, read_size, &raw[..16.min(raw.len())]
+                                slot,
+                                addr,
+                                nonzero,
+                                read_size,
+                                &raw[..16.min(raw.len())]
                             );
                         }
                         if is_tiled && raw.iter().all(|&b| b == 0) {
@@ -4221,7 +4378,13 @@ fn igbp_handle_transact(
                                 {
                                     log::info!(
                                         "QueueBuffer tiled-rt-redirect: slot={} slot_tiled={:#x} → rt_cpu={:#x} (gralloc_bh={} dma_bh={} dma_stride={} dma_h={})",
-                                        slot, addr, tiled_rt_cpu, gb.block_height_log2, dma_bh_log2, dma_stride, dma_height
+                                        slot,
+                                        addr,
+                                        tiled_rt_cpu,
+                                        gb.block_height_log2,
+                                        dma_bh_log2,
+                                        dma_stride,
+                                        dma_height
                                     );
                                     raw = tiled_raw;
                                     effective_tiled = true;
@@ -4253,7 +4416,9 @@ fn igbp_handle_transact(
                                     {
                                         log::info!(
                                             "QueueBuffer tiled-empty fallback nvmap_id={} addr={:#x} (slot={})",
-                                            id, lin_addr, slot
+                                            id,
+                                            lin_addr,
+                                            slot
                                         );
                                         raw = lin_raw;
                                         effective_tiled = false;
@@ -4354,7 +4519,12 @@ fn igbp_handle_transact(
                                         );
                                         log::info!(
                                             "QueueBuffer legacy_gfx sub-window: src=({},{}) {}x{} → upscale to {}x{}",
-                                            x0, y0, w, h, gb.width, gb.height
+                                            x0,
+                                            y0,
+                                            w,
+                                            h,
+                                            gb.width,
+                                            gb.height
                                         );
                                         (gb.width, gb.height, upscaled)
                                     } else {
@@ -4371,7 +4541,9 @@ fn igbp_handle_transact(
                         {
                             log::info!(
                                 "QueueBuffer SDL_Surface fallback: {}x{} (back buffer had only {} nonzero RGB pixels)",
-                                w, h, rgb_nz
+                                w,
+                                h,
+                                rgb_nz
                             );
                             (w, h, sdl_pixels)
                         } else if legacy_gfx {
@@ -4390,7 +4562,14 @@ fn igbp_handle_transact(
                                     {
                                         log::info!(
                                             "QueueBuffer legacy_gfx Vulkan clear-only fallback: {}x{} color=[{:.2},{:.2},{:.2},{:.2}] clears={} → {} bytes",
-                                            gb.width, gb.height, color[0], color[1], color[2], color[3], clears, bytes.len()
+                                            gb.width,
+                                            gb.height,
+                                            color[0],
+                                            color[1],
+                                            color[2],
+                                            color[3],
+                                            clears,
+                                            bytes.len()
                                         );
                                         (gb.width, gb.height, bytes)
                                     } else {
@@ -4417,7 +4596,15 @@ fn igbp_handle_transact(
                             .fold(0u32, |a, b| a.wrapping_add(b));
                         log::trace!(
                             "QueueBuffer submit slot={} parsed_nvmap_id={} addr={:#x} {}x{} tiled={} nz={} rgb_nz={} cksum={:#x}",
-                            slot, gb.nvmap_id, effective_addr, frame_w, frame_h, effective_tiled, nz, rgb_nz, checksum
+                            slot,
+                            gb.nvmap_id,
+                            effective_addr,
+                            frame_w,
+                            frame_h,
+                            effective_tiled,
+                            nz,
+                            rgb_nz,
+                            checksum
                         );
                         {
                             use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -4918,27 +5105,66 @@ fn prepare_vulkan_present_frame(
     mut bytes: Vec<u8>,
     width: u32,
     height: u32,
+    transform: u32,
 ) -> (u32, u32, Vec<u8>) {
     if let Some((x0, y0, w, h)) = cached_present_crop(width, height) {
-        return (
-            w,
-            h,
-            crop_flipped_opaque(&bytes, width, height, x0, y0, w, h),
-        );
+        let mut cropped = crop_flipped_opaque(&bytes, width, height, x0, y0, w, h);
+        apply_present_transform(&mut cropped, w, h, transform);
+        return (w, h, cropped);
     }
-    let row = width as usize * 4;
-    let hh = height as usize;
-    if bytes.len() >= row * hh {
-        for y in 0..hh / 2 {
-            let top = y * row;
-            let bot = (hh - 1 - y) * row;
-            let (a, b) = bytes.split_at_mut(bot);
-            a[top..top + row].swap_with_slice(&mut b[..row]);
-        }
+    if should_flip_vulkan_present(width, height) {
+        flip_present_v(&mut bytes, width, height);
     }
     let (present_w, present_h, mut bytes) = maybe_crop_present_subwindow(bytes, width, height);
+    apply_present_transform(&mut bytes, present_w, present_h, transform);
     make_present_opaque(&mut bytes);
     (present_w, present_h, bytes)
+}
+
+fn should_flip_vulkan_present(width: u32, height: u32) -> bool {
+    !(width == 1600 && height == 900)
+}
+
+fn apply_present_transform(bytes: &mut [u8], width: u32, height: u32, transform: u32) {
+    if transform & 0x1 != 0 {
+        flip_present_h(bytes, width, height);
+    }
+    if transform & 0x2 != 0 {
+        flip_present_v(bytes, width, height);
+    }
+}
+
+fn flip_present_h(bytes: &mut [u8], width: u32, height: u32) {
+    let w = width as usize;
+    let h = height as usize;
+    let row = w * 4;
+    if w == 0 || h == 0 || bytes.len() < row * h {
+        return;
+    }
+    for y in 0..h {
+        let base = y * row;
+        for x in 0..w / 2 {
+            let a = base + x * 4;
+            let b = base + (w - 1 - x) * 4;
+            for c in 0..4 {
+                bytes.swap(a + c, b + c);
+            }
+        }
+    }
+}
+
+fn flip_present_v(bytes: &mut [u8], width: u32, height: u32) {
+    let row = width as usize * 4;
+    let h = height as usize;
+    if row == 0 || h == 0 || bytes.len() < row * h {
+        return;
+    }
+    for y in 0..h / 2 {
+        let top = y * row;
+        let bot = (h - 1 - y) * row;
+        let (a, b) = bytes.split_at_mut(bot);
+        a[top..top + row].swap_with_slice(&mut b[..row]);
+    }
 }
 
 fn maybe_crop_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> (u32, u32, Vec<u8>) {
@@ -5154,7 +5380,12 @@ fn parse_flattened_graphic_buffer(
 
     log::debug!(
         "parse_flattened_graphic_buffer: nvmap_id={} (binder_handle={} inline={}) off={:#x} kind={} bh_log2={}",
-        nvmap_id, binder_handle, inline_nvmap_id, buffer_offset, kind, block_height_log2
+        nvmap_id,
+        binder_handle,
+        inline_nvmap_id,
+        buffer_offset,
+        kind,
+        block_height_log2
     );
 
     Some(nexium_nvdrv::GraphicBuffer {
@@ -5353,7 +5584,11 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             if is_nvhost_ctrl_fd {
                 kernel.event_signals.insert(h, false);
                 kernel.gpu_fence_events.insert(h);
-                log::debug!("nvdrv:QueryEvent fd={} (nvhost-ctrl) → fence event handle={:#x} (unsignaled, will signal on GPU submit)", fd, h);
+                log::debug!(
+                    "nvdrv:QueryEvent fd={} (nvhost-ctrl) → fence event handle={:#x} (unsignaled, will signal on GPU submit)",
+                    fd,
+                    h
+                );
             } else {
                 kernel.event_signals.insert(h, true);
                 kernel.nvdrv_sync_events.insert(h);

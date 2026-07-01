@@ -81,6 +81,9 @@ impl RtCache {
             }
         }
         let best_stamp = best.map(|(_, s)| s).unwrap_or(0);
+        if best_stamp > 2 {
+            return best.map(|(k, _)| k);
+        }
         if want.height != 0 {
             let aw = want.width as f32 / want.height as f32;
             let same_aspect = |k: &RtKey| {
