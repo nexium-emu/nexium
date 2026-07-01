@@ -26,6 +26,7 @@ const REG_VERTEX_COUNT: u32 = 0x35E;
 const REG_DRAW_BEGIN: u32 = 0x586;
 const REG_INDEX_FIRST: u32 = 0x5F7;
 const REG_INDEX_COUNT: u32 = 0x5F8;
+const REG_DRAW_INSTANCE_COUNT: u32 = 0xD1B;
 const REG_CB_SIZE: u32 = 0x8E0;
 const REG_CB_ADDR_HI: u32 = 0x8E1;
 const REG_CB_ADDR_LO: u32 = 0x8E2;
@@ -36,33 +37,47 @@ const REG_UPLOAD_DST_HI: u32 = 0x62;
 const REG_UPLOAD_DST_LO: u32 = 0x63;
 const REG_LAUNCH_DMA: u32 = 0x6C;
 
-fn hle_macro(hash: u64, params: &[u32]) -> Option<Vec<(u32, u32)>> {
+fn hle_macro(
+    hash: u64,
+    params: &[u32],
+    reg_reader: &dyn Fn(u32) -> u32,
+) -> Option<MacroOutput> {
     let p = |i: usize| params.get(i).copied().unwrap_or(0);
-    let mut w: Vec<(u32, u32)> = Vec::new();
+    let macro_instance_count = || (reg_reader(REG_DRAW_INSTANCE_COUNT) & p(2)).max(1);
+    let mut out = MacroOutput::default();
     match hash {
         0x0D61_FC9F_AAC9_FCAD | 0x8A4D_173E_B99A_8603 => {
             let topology = p(0) & 0xFFFF;
             let vertex_count = p(1);
             let vertex_first = p(3);
+            out.draw_instance_count = Some(macro_instance_count());
             if hash == 0x8A4D_173E_B99A_8603 {
-                w.push((REG_GLOBAL_BASE_INSTANCE, p(4)));
+                out.writes.push((REG_GLOBAL_BASE_INSTANCE, p(4)));
             }
-            w.push((REG_DRAW_BEGIN, topology));
-            w.push((REG_VERTEX_FIRST, vertex_first));
-            w.push((REG_VERTEX_COUNT, vertex_count));
+            out.writes.push((REG_DRAW_BEGIN, topology));
+            out.writes.push((REG_VERTEX_FIRST, vertex_first));
+            out.writes.push((REG_VERTEX_COUNT, vertex_count));
+            if hash == 0x8A4D_173E_B99A_8603 {
+                out.writes.push((REG_GLOBAL_BASE_INSTANCE, 0));
+            }
         }
         0x771B_B18C_6244_4DA0 | 0x0217_9201_0048_8FF7 => {
             let topology = p(0) & 0xFFFF;
             let index_count = p(1);
             let index_first = p(3);
             let base_vertex = p(4);
-            w.push((REG_GLOBAL_BASE_VERTEX, base_vertex));
+            out.draw_instance_count = Some(macro_instance_count());
+            out.writes.push((REG_GLOBAL_BASE_VERTEX, base_vertex));
             if hash == 0x0217_9201_0048_8FF7 {
-                w.push((REG_GLOBAL_BASE_INSTANCE, p(5)));
+                out.writes.push((REG_GLOBAL_BASE_INSTANCE, p(5)));
             }
-            w.push((REG_DRAW_BEGIN, topology));
-            w.push((REG_INDEX_FIRST, index_first));
-            w.push((REG_INDEX_COUNT, index_count));
+            out.writes.push((REG_DRAW_BEGIN, topology));
+            out.writes.push((REG_INDEX_FIRST, index_first));
+            out.writes.push((REG_INDEX_COUNT, index_count));
+            out.writes.push((REG_GLOBAL_BASE_VERTEX, 0));
+            if hash == 0x0217_9201_0048_8FF7 {
+                out.writes.push((REG_GLOBAL_BASE_INSTANCE, 0));
+            }
         }
         0x6C97_861D_891E_DF7E | 0xD246_FDDF_3A61_73D7 => {
             let size = if hash == 0x6C97_861D_891E_DF7E {
@@ -70,21 +85,21 @@ fn hle_macro(hash: u64, params: &[u32]) -> Option<Vec<(u32, u32)>> {
             } else {
                 0x7000
             };
-            w.push((REG_CB_SIZE, size));
-            w.push((REG_CB_ADDR_HI, p(0)));
-            w.push((REG_CB_ADDR_LO, p(1)));
-            w.push((REG_CB_OFFSET, 0));
+            out.writes.push((REG_CB_SIZE, size));
+            out.writes.push((REG_CB_ADDR_HI, p(0)));
+            out.writes.push((REG_CB_ADDR_LO, p(1)));
+            out.writes.push((REG_CB_OFFSET, 0));
         }
         0xEE4D_0004_BEC8_ECF4 => {
-            w.push((REG_UPLOAD_LINE_LENGTH, p(2)));
-            w.push((REG_UPLOAD_LINE_COUNT, 1));
-            w.push((REG_UPLOAD_DST_HI, p(0)));
-            w.push((REG_UPLOAD_DST_LO, p(1)));
-            w.push((REG_LAUNCH_DMA, 0x1011));
+            out.writes.push((REG_UPLOAD_LINE_LENGTH, p(2)));
+            out.writes.push((REG_UPLOAD_LINE_COUNT, 1));
+            out.writes.push((REG_UPLOAD_DST_HI, p(0)));
+            out.writes.push((REG_UPLOAD_DST_LO, p(1)));
+            out.writes.push((REG_LAUNCH_DMA, 0x1011));
         }
         _ => return None,
     }
-    Some(w)
+    Some(out)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -236,6 +251,7 @@ impl Opcode {
 #[derive(Default)]
 pub struct MacroOutput {
     pub writes: Vec<(u32, u32)>,
+    pub draw_instance_count: Option<u32>,
 }
 
 pub struct MacroEngine {
@@ -318,7 +334,7 @@ impl MacroEngine {
             return Some(MacroOutput::default());
         }
         let hash = macro_hash(&code);
-        let hle = hle_macro(hash, &params);
+        let hle = hle_macro(hash, &params, reg_reader);
         if self.seen_hashes.insert(hash) {
             log::info!(
                 "MME: macro entry={} offset={} hash={:#018x} len={} params={} hle={} code={:08x?}",
@@ -331,13 +347,14 @@ impl MacroEngine {
                 &code[..code.len().min(28)]
             );
         }
-        if let Some(writes) = hle {
-            return Some(MacroOutput { writes });
+        if let Some(out) = hle {
+            return Some(out);
         }
         let mut interp = Interpreter::new(&code, &params, reg_reader);
         interp.run();
         Some(MacroOutput {
             writes: interp.writes,
+            draw_instance_count: None,
         })
     }
 

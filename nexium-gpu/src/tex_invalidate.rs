@@ -28,3 +28,20 @@ pub fn region_gen(gpu_va: u64) -> u64 {
     let g = gens().lock().unwrap();
     g.get(&(gpu_va & PAGE_MASK)).copied().unwrap_or(0)
 }
+
+pub fn region_gen_range(gpu_va: u64, size: u64) -> u64 {
+    if size == 0 {
+        return region_gen(gpu_va);
+    }
+    let start = gpu_va & PAGE_MASK;
+    let end = gpu_va.saturating_add(size).saturating_add(0xFFFF) & PAGE_MASK;
+    let g = gens().lock().unwrap();
+    let mut p = start;
+    let mut h = 0xcbf29ce484222325u64;
+    while p < end {
+        h ^= g.get(&p).copied().unwrap_or(0);
+        h = h.wrapping_mul(0x100000001b3);
+        p = p.wrapping_add(1 << PAGE_SHIFT);
+    }
+    h
+}

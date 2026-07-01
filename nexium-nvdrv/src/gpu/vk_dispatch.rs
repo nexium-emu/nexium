@@ -524,32 +524,55 @@ fn submit_draw_batch_async(
                             use std::sync::{Mutex, OnceLock};
                             static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> =
                                 OnceLock::new();
-                            let s = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+                            let s =
+                                SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
                             if let Ok(mut set) = s.lock() {
                                 if set.insert(tex_id) {
                                     log::warn!(
-                                        "[textype] tic{} type={} depth={} norm={} {:?} {}x{} bl={}",
-                                        tex_id, tic.texture_type, tic.depth, tic.normalized_coords,
-                                        tic.format, tic.width, tic.height, tic.is_block_linear
+                                        "[textype] tic{} type={} base={} depth={} norm={} {:?} {}x{} bl={}",
+                                        tex_id,
+                                        tic.texture_type,
+                                        tic.base_layer,
+                                        tic.depth,
+                                        tic.normalized_coords,
+                                        tic.format,
+                                        tic.width,
+                                        tic.height,
+                                        tic.is_block_linear
                                     );
                                 }
                             }
                         }
                         if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
                             tic_summ.push(format!(
-                                "tic{}={:?} {}x{} bl={} bh={} va={:#x}",
-                                tex_id, tic.format, tic.width, tic.height,
-                                tic.is_block_linear, tic.block_height_log2, tic.gpu_va
+                                "tic{}={:?} {}x{}x{} base={} type={} norm={} bl={} bh={} va={:#x}",
+                                tex_id,
+                                tic.format,
+                                tic.width,
+                                tic.height,
+                                tic.depth,
+                                tic.base_layer,
+                                tic.texture_type,
+                                tic.normalized_coords,
+                                tic.is_block_linear,
+                                tic.block_height_log2,
+                                tic.gpu_va
                             ));
                         }
                         let pitch = tic.format.linear_size(tic.width, tic.height);
-                        let read_size = if tic.is_block_linear {
+                        let layer_size = if tic.is_block_linear {
                             tic.format
                                 .block_linear_size(tic.width, tic.height, tic.block_height_log2)
                                 .max(pitch)
                         } else {
                             pitch
                         };
+                        let layer_count = if tic.texture_type == 5 {
+                            tic.base_layer.saturating_add(tic.depth).max(1)
+                        } else {
+                            1
+                        };
+                        let read_size = layer_size.saturating_mul(layer_count as usize);
                         let n =
                             snapshot_read_once(&mut snapshot, read_guest, tic.gpu_va, read_size);
                         snapshot_reads += usize::from(n != 0);
@@ -665,7 +688,6 @@ fn shader_failed_set(
         std::sync::Mutex::new(std::collections::HashSet::new())
     })
 }
-
 
 fn depth_disabled() -> bool {
     use std::sync::OnceLock;
@@ -825,6 +847,9 @@ fn execute_one(
         if let Some(b) = guard.get(&shader_key) {
             b.clone()
         } else {
+            let fs_input_map = fetch_sph(fs_addr, mappings, mem_read)
+                .map(ps_generic_input_map)
+                .unwrap_or([0; 32]);
             let vs_sass = fetch_sass(vs_addr, mappings, mem_read)
                 .ok_or_else(|| "VS SASS read failed".to_string())?;
             let fs_sass = fetch_sass(fs_addr, mappings, mem_read)
@@ -872,7 +897,7 @@ fn execute_one(
 
             let (fs_spirv, fs_cbuf_mask, mut fs_tex_ids, fs_cbuf_used) =
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    nexium_spirv::emit_fragment_full(&fs_cfg)
+                    nexium_spirv::emit_fragment_full_with_input_map(&fs_cfg, fs_input_map)
                 })) {
                     Ok(v) => v,
                     Err(_) => {
@@ -1046,40 +1071,63 @@ fn execute_one(
             .count(),
     );
 
+    let shader_fs_tex_ids = fs_tex_ids.clone();
+    let mut fs_tex_remap: Vec<String> = Vec::with_capacity(fs_tex_ids.len());
     let mut fs_sampler_ids: Vec<u32> = vec![0u32; fs_tex_ids.len()];
     if !fs_tex_ids.is_empty() {
         let tex_cb_index = maxwell.regs.tex_cb_index as usize;
         let (tcb_addr, tcb_size) = maxwell.regs.cbuf_binds[4][tex_cb_index.min(15)];
-        if tcb_addr != 0 {
-            for (i, unit_slot) in fs_tex_ids.iter_mut().enumerate() {
-                let off = (*unit_slot as u64).saturating_mul(4);
-                if off + 4 > tcb_size as u64 {
-                    continue;
-                }
-                let Some(cpu) = mappings.cpu_address_for(tcb_addr.wrapping_add(off)) else {
-                    continue;
-                };
-                let mut bytes = [0u8; 4];
-                if mem_read(cpu, &mut bytes) {
-                    let handle = u32::from_le_bytes(bytes);
-                    let tic = handle & 0x000F_FFFF;
-                    let tsc = handle >> 20;
-                    if handle != 0 && tic <= draw.tic_pool_limit {
-                        if std::env::var_os("NEXIUM_TEX_BIND_LOG").is_some() {
-                            log::warn!(
-                                "tex_handle: cb{} off={:#x} handle={:#x} -> TIC {} TSC {}",
-                                tex_cb_index,
-                                off,
-                                handle,
-                                tic,
-                                tsc
-                            );
-                        }
-                        *unit_slot = tic;
-                        fs_sampler_ids[i] = tsc;
-                    }
-                }
+        for (i, unit_slot) in fs_tex_ids.iter_mut().enumerate() {
+            let shader_id = *unit_slot;
+            let off = (shader_id as u64).saturating_mul(4);
+            let mut remap = format!(
+                "s{}:{} cb{} base={:#x}/{} off={:#x}",
+                i, shader_id, tex_cb_index, tcb_addr, tcb_size, off
+            );
+            if tcb_addr == 0 {
+                remap.push_str(" no-tcb");
+                fs_tex_remap.push(remap);
+                continue;
             }
+            if off + 4 > tcb_size as u64 {
+                remap.push_str(" out-of-range");
+                fs_tex_remap.push(remap);
+                continue;
+            }
+            let Some(cpu) = mappings.cpu_address_for(tcb_addr.wrapping_add(off)) else {
+                remap.push_str(" unmapped");
+                fs_tex_remap.push(remap);
+                continue;
+            };
+            let mut bytes = [0u8; 4];
+            if mem_read(cpu, &mut bytes) {
+                let handle = u32::from_le_bytes(bytes);
+                let tic = handle & 0x000F_FFFF;
+                let tsc = handle >> 20;
+                if handle != 0 && tic <= draw.tic_pool_limit {
+                    if std::env::var_os("NEXIUM_TEX_BIND_LOG").is_some() {
+                        log::warn!(
+                            "tex_handle: cb{} off={:#x} handle={:#x} -> TIC {} TSC {}",
+                            tex_cb_index,
+                            off,
+                            handle,
+                            tic,
+                            tsc
+                        );
+                    }
+                    *unit_slot = tic;
+                    fs_sampler_ids[i] = tsc;
+                    remap.push_str(&format!(" handle={:#x}->tic{} tsc{}", handle, tic, tsc));
+                } else {
+                    remap.push_str(&format!(
+                        " handle={:#x} invalid tic{} tsc{}",
+                        handle, tic, tsc
+                    ));
+                }
+            } else {
+                remap.push_str(" read-fail");
+            }
+            fs_tex_remap.push(remap);
         }
     }
 
@@ -1093,7 +1141,10 @@ fn execute_one(
         if d < 60 {
             log::warn!(
                 "[texdbg-draw #{}] tic_pool={:#x} limit={} fs_tex_ids={:?}",
-                d, draw.tic_pool_gpu_va, draw.tic_pool_limit, &fs_tex_ids
+                d,
+                draw.tic_pool_gpu_va,
+                draw.tic_pool_limit,
+                &fs_tex_ids
             );
         }
     }
@@ -1113,14 +1164,16 @@ fn execute_one(
             let Some(tic) = nexium_gpu::texture::TicEntry::parse(&tic_raw) else {
                 continue;
             };
-            if tic.width >= 512 && tic.height >= 256 && std::env::var_os("NEXIUM_TEXDBG").is_some() {
+            if tic.width >= 512 && tic.height >= 256 && std::env::var_os("NEXIUM_TEXDBG").is_some()
+            {
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static N: AtomicU64 = AtomicU64::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
                 if n < 200 {
                     log::warn!(
-                        "[texdbg #{}] slot={} fmt={:?} {}x{} gpu_va={:#x} nvmap={:?} can_alias_rt={} swizzle={:?}",
-                        n, slot, tic.format, tic.width, tic.height, tic.gpu_va,
+                        "[texdbg #{}] slot={} fmt={:?} {}x{}x{} base={} type={} norm={} gpu_va={:#x} nvmap={:?} can_alias_rt={} swizzle={:?}",
+                        n, slot, tic.format, tic.width, tic.height, tic.depth, tic.base_layer,
+                        tic.texture_type, tic.normalized_coords, tic.gpu_va,
                         mappings.nvmap_id_for(tic.gpu_va),
                         tic_can_alias_render_target(tic.format),
                         tic.swizzle
@@ -1422,6 +1475,33 @@ fn execute_one(
         alpha_op: map_blend_op(blend_raw_eq_alpha),
     };
 
+    trace_menu_draw(
+        draw,
+        &layout,
+        mappings,
+        mem_read,
+        nvmap_id,
+        rt,
+        vs_addr,
+        fs_addr,
+        vertex_addr,
+        eff_vertex_count,
+        out_index_count.unwrap_or(0),
+        is_indexed,
+        &shader_fs_tex_ids,
+        &fs_tex_ids,
+        &fs_sampler_ids,
+        &fs_tex_remap,
+        &sampled_rt_slots,
+        depth_test,
+        depth_write,
+        &blend_state,
+        vs_cbuf_mask,
+        fs_cbuf_mask,
+        cbuf_data.as_deref(),
+        &maxwell.regs.cbuf_binds,
+    );
+
     trace_draw(
         draw,
         &layout,
@@ -1469,20 +1549,25 @@ fn execute_one(
                     .collect();
                 log::warn!(
                     "[ssbo] vs={:#x} num_ssbo={} descs=[{}]",
-                    vs_addr, bundle.ssbo_descs.len(), descs.join(" ")
+                    vs_addr,
+                    bundle.ssbo_descs.len(),
+                    descs.join(" ")
                 );
             }
         }
     }
     let mut ssbo_data: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut ssbo_meta: Vec<(u64, usize, bool)> = Vec::new();
     for (idx, d) in bundle.ssbo_descs.iter().enumerate() {
         let mut bytes: Vec<u8> = vec![0u8; 16];
         let (cb_va, _cb_sz) = maxwell.regs.cbuf_binds[0][(d.cbuf_binding as usize).min(15)];
         let mut dbg_base: u64 = 0;
+        let mut dbg_slack: usize = 0;
         let mut dbg_size: u32 = 0;
         let mut dbg_readok = false;
         if cb_va != 0 {
-            if let Some(desc_cpu) = mappings.cpu_address_for(cb_va.wrapping_add(d.cbuf_offset as u64))
+            if let Some(desc_cpu) =
+                mappings.cpu_address_for(cb_va.wrapping_add(d.cbuf_offset as u64))
             {
                 let mut desc = [0u8; 16];
                 if mem_read(desc_cpu, &mut desc) {
@@ -1498,10 +1583,12 @@ fn execute_one(
                     let align = (d.align.max(1)) as u64;
                     let aligned = base & !(align - 1);
                     let slack = (base - aligned) as usize;
+                    dbg_slack = slack;
                     if ssbo_dbg {
                         log::warn!(
                             "[ssbo-map] vs={:#x} base={:#x} mapped={} any32={:x?} {}",
-                            vs_addr, base,
+                            vs_addr,
+                            base,
                             mappings.cpu_address_for(aligned).is_some(),
                             mappings.cpu_address_for_any32(aligned),
                             mappings.bracket(aligned)
@@ -1521,8 +1608,7 @@ fn execute_one(
                             } else {
                                 0x40000
                             };
-                            let read_size =
-                                want.min(remaining as usize).clamp(16, 8 * 1024 * 1024);
+                            let read_size = want.min(remaining as usize).clamp(16, 8 * 1024 * 1024);
                             let mut b = vec![0u8; read_size];
                             if mem_read(buf_cpu, &mut b) {
                                 bytes = b;
@@ -1547,7 +1633,24 @@ fn execute_one(
             }
         }
         ssbo_data.push((idx as u32, bytes));
+        ssbo_meta.push((dbg_base, dbg_slack, dbg_readok));
     }
+    trace_font_ssbo(
+        vs_addr,
+        fs_addr,
+        &ssbo_data,
+        &ssbo_meta,
+        cbuf_data.as_deref(),
+        &fs_tex_ids,
+        draw.tic_pool_gpu_va,
+        draw.tic_pool_limit,
+        mappings,
+        mem_read,
+        eff_vertex_count,
+        out_index_count.unwrap_or(0),
+        out_index_type,
+        out_index_data.as_deref(),
+    );
 
     let call = Maxwell3dDrawCall {
         vs_spirv,
@@ -1563,6 +1666,9 @@ fn execute_one(
         cbuf_data,
         vertex_addr,
         vertex_count: eff_vertex_count,
+        first_vertex: draw.first_vertex,
+        instance_count: draw.instance_count.max(1),
+        first_instance: draw.first_instance,
         index_addr: None,
         index_count: out_index_count,
         index_type: out_index_type,
@@ -1611,6 +1717,704 @@ fn execute_one(
     };
 
     Ok(Some(call))
+}
+
+fn menu_draw_dbg_target() -> Option<u32> {
+    use std::sync::OnceLock;
+    static TARGET: OnceLock<Option<u32>> = OnceLock::new();
+    *TARGET.get_or_init(|| {
+        if std::env::var_os("NEXIUM_MENU_DRAW_DBG").is_none() {
+            return None;
+        }
+        Some(
+            std::env::var("NEXIUM_MENU_DRAW_NVMAP")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(16),
+        )
+    })
+}
+
+fn trace_font_ssbo(
+    vs_addr: u64,
+    fs_addr: u64,
+    ssbo_data: &[(u32, Vec<u8>)],
+    ssbo_meta: &[(u64, usize, bool)],
+    cbuf_data: Option<&[u8]>,
+    fs_tex_ids: &[u32],
+    tic_pool_gpu_va: u64,
+    tic_pool_limit: u32,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    vertex_count: u32,
+    index_count: u32,
+    index_type: vk::IndexType,
+    index_data: Option<&[u8]>,
+) {
+    if std::env::var_os("NEXIUM_FONT_SSBO_DBG").is_none() || vs_addr != 0x400660030 {
+        return;
+    }
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_FONT_SSBO_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(64)
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    if seq >= limit {
+        return;
+    }
+    let c3 = font_cbuf_summary(cbuf_data);
+    let indices = font_indices(vertex_count, index_count, index_type, index_data);
+    for (idx, (_, bytes)) in ssbo_data.iter().enumerate() {
+        let (base, slack, read_ok) = ssbo_meta.get(idx).copied().unwrap_or((0, 0, false));
+        let mut verts = Vec::new();
+        for v in indices.iter().take(12) {
+            let off = slack.saturating_add((*v as usize).saturating_mul(64));
+            verts.push(font_vertex_words(bytes, off));
+        }
+        log::warn!(
+            "[font-ssbo] #{} vs={:#x} fs={:#x} tex={:?} v={} i={} idx={:?} ssbo={} base={:#x} slack={} read_ok={} bytes={} c3=[{}] {}",
+            seq,
+            vs_addr,
+            fs_addr,
+            fs_tex_ids,
+            vertex_count,
+            index_count,
+            indices,
+            idx,
+            base,
+            slack,
+            read_ok,
+            bytes.len(),
+            c3,
+            verts.join(" ")
+        );
+        font_tex_probe(
+            seq,
+            fs_tex_ids,
+            tic_pool_gpu_va,
+            tic_pool_limit,
+            mappings,
+            mem_read,
+            bytes,
+            slack,
+            &indices,
+        );
+    }
+}
+
+fn font_indices(
+    vertex_count: u32,
+    index_count: u32,
+    index_type: vk::IndexType,
+    index_data: Option<&[u8]>,
+) -> Vec<u32> {
+    if index_count == 0 {
+        return (0..vertex_count.min(12)).collect();
+    }
+    let Some(data) = index_data else {
+        return (0..vertex_count.min(12)).collect();
+    };
+    let mut out = Vec::new();
+    match index_type {
+        vk::IndexType::UINT32 => {
+            for c in data.chunks_exact(4).take(index_count as usize).take(12) {
+                out.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+        }
+        _ => {
+            for c in data.chunks_exact(2).take(index_count as usize).take(12) {
+                out.push(u16::from_le_bytes([c[0], c[1]]) as u32);
+            }
+        }
+    }
+    out
+}
+
+fn font_vertex_words(bytes: &[u8], off: usize) -> String {
+    let mut vals = Vec::new();
+    for i in 0..16usize {
+        let p = off.saturating_add(i * 4);
+        if p + 4 > bytes.len() {
+            vals.push("out".to_string());
+            continue;
+        }
+        let raw = u32::from_le_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]]);
+        vals.push(format!("{:#010x}/{:.4}", raw, f32::from_bits(raw)));
+    }
+    format!("v{}=[{}]", off / 64, vals.join(","))
+}
+
+fn font_cbuf_summary(cbuf_data: Option<&[u8]>) -> String {
+    let Some(data) = cbuf_data else {
+        return "none".to_string();
+    };
+    let base = 3usize * PACKED_CBUF_SLOT_SIZE;
+    let offsets = [
+        0x0usize, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34,
+        0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c,
+    ];
+    let mut out = Vec::new();
+    for off in offsets {
+        let p = base + off;
+        if p + 4 > data.len() {
+            continue;
+        }
+        let raw = u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
+        out.push(format!("{:#x}={:.4}/{:#010x}", off, f32::from_bits(raw), raw));
+    }
+    out.join(" ")
+}
+
+fn font_tex_probe(
+    seq: u64,
+    fs_tex_ids: &[u32],
+    tic_pool_gpu_va: u64,
+    tic_pool_limit: u32,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ssbo: &[u8],
+    slack: usize,
+    indices: &[u32],
+) {
+    if std::env::var_os("NEXIUM_FONT_TEX_PROBE").is_none() || tic_pool_gpu_va == 0 {
+        return;
+    }
+    let start = std::env::var("NEXIUM_FONT_TEX_PROBE_START")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let end = std::env::var("NEXIUM_FONT_TEX_PROBE_END")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    if seq < start || seq > end {
+        return;
+    }
+    let target_tic = std::env::var("NEXIUM_FONT_TEX_PROBE_TIC")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    for (slot, tex_id) in fs_tex_ids.iter().enumerate() {
+        if *tex_id == u32::MAX || *tex_id > tic_pool_limit {
+            continue;
+        }
+        if target_tic.is_some_and(|target| target != *tex_id) {
+            continue;
+        }
+        let Some((tic, rgba, layers, layer_size)) =
+            font_read_texture(tic_pool_gpu_va, *tex_id, mappings, mem_read)
+        else {
+            log::warn!("[font-tex] #{} slot={} tic{} unreadable", seq, slot, tex_id);
+            continue;
+        };
+        let mut seen = Vec::new();
+        let mut samples = Vec::new();
+        for idx in indices {
+            if seen.contains(idx) {
+                continue;
+            }
+            seen.push(*idx);
+            if samples.len() >= 6 {
+                break;
+            }
+            let off = slack.saturating_add((*idx as usize).saturating_mul(64));
+            let Some(words) = font_vertex_raw_words(ssbo, off) else {
+                continue;
+            };
+            let u0 = f32::from_bits(words[4]);
+            let v0 = f32::from_bits(words[5]);
+            let u1 = f32::from_bits(words[6]);
+            let v1 = f32::from_bits(words[7]);
+            let layer = (words[10] & 0xffff).min(layers.saturating_sub(1));
+            samples.push(font_tex_sample_summary(
+                *idx,
+                &rgba,
+                layer_size,
+                tic.width,
+                tic.height,
+                layer,
+                tic.swizzle,
+                u0,
+                v0,
+                u1,
+                v1,
+            ));
+        }
+        log::warn!(
+            "[font-tex] #{} slot={} tic{} fmt={:?} {}x{}x{} type={} base={} norm={} bl={} bh={} va={:#x} nvmap={:?} swz={:?} samples={}",
+            seq,
+            slot,
+            tex_id,
+            tic.format,
+            tic.width,
+            tic.height,
+            tic.depth,
+            tic.texture_type,
+            tic.base_layer,
+            tic.normalized_coords,
+            tic.is_block_linear,
+            tic.block_height_log2,
+            tic.gpu_va,
+            mappings.nvmap_id_for(tic.gpu_va),
+            tic.swizzle,
+            samples.join(" ")
+        );
+        if target_tic.is_some() {
+            break;
+        }
+    }
+}
+
+fn font_read_texture(
+    tic_pool_gpu_va: u64,
+    tex_id: u32,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> Option<(nexium_gpu::texture::TicEntry, Vec<u8>, u32, usize)> {
+    let tic_addr = tic_pool_gpu_va.wrapping_add((tex_id as u64).saturating_mul(32));
+    let tic_cpu = mappings.cpu_address_for(tic_addr)?;
+    let mut tic_raw = [0u8; 32];
+    if !mem_read(tic_cpu, &mut tic_raw) {
+        return None;
+    }
+    let tic = nexium_gpu::texture::TicEntry::parse(&tic_raw)?;
+    let pitch_size = tic.format.linear_size(tic.width, tic.height);
+    let layers = font_tic_layer_count(&tic);
+    let layer_read_size = font_tic_layer_read_size(&tic, pitch_size);
+    let read_size = layer_read_size.saturating_mul(layers as usize);
+    let (tex_cpu, remaining) = mappings.cpu_range_for(tic.gpu_va)?;
+    let read_size = read_size.min(remaining as usize);
+    let mut raw = vec![0u8; read_size];
+    if !mem_read(tex_cpu, &mut raw) {
+        return None;
+    }
+    let rgba = font_decode_texture_layers(&raw, &tic, pitch_size, layer_read_size, layers);
+    let layer_size = tic.width as usize * tic.height as usize * 4;
+    Some((tic, rgba, layers, layer_size))
+}
+
+fn font_tic_is_arrayed(tic: &nexium_gpu::texture::TicEntry) -> bool {
+    tic.texture_type == 5
+}
+
+fn font_tic_layer_count(tic: &nexium_gpu::texture::TicEntry) -> u32 {
+    if font_tic_is_arrayed(tic) {
+        tic.base_layer.saturating_add(tic.depth).max(1)
+    } else {
+        1
+    }
+}
+
+fn font_tic_layer_read_size(tic: &nexium_gpu::texture::TicEntry, pitch_size: usize) -> usize {
+    if tic.is_block_linear {
+        tic.format
+            .block_linear_size(tic.width, tic.height, tic.block_height_log2)
+            .max(pitch_size)
+    } else {
+        pitch_size
+    }
+}
+
+fn font_decode_texture_layers(
+    raw: &[u8],
+    tic: &nexium_gpu::texture::TicEntry,
+    pitch_size: usize,
+    layer_read_size: usize,
+    layers: u32,
+) -> Vec<u8> {
+    let layer_rgba_size = tic.width as usize * tic.height as usize * 4;
+    let mut out = Vec::with_capacity(layer_rgba_size.saturating_mul(layers as usize));
+    let effective_block_linear =
+        tic.is_block_linear && !nexium_gpu::pitch_oracle::is_pitch_dst(tic.gpu_va);
+    for layer in 0..layers as usize {
+        let start = layer.saturating_mul(layer_read_size);
+        let end = (start + layer_read_size).min(raw.len());
+        let layer_raw = if start < raw.len() { &raw[start..end] } else { &[] };
+        let linear = if effective_block_linear {
+            let (storage_width, storage_height, bpp) =
+                tic.format.storage_extent(tic.width, tic.height);
+            nexium_gpu::texture::unswizzle_block_linear(
+                layer_raw,
+                storage_width,
+                storage_height,
+                bpp,
+                tic.block_height_log2,
+            )
+        } else if layer_raw.len() >= pitch_size {
+            layer_raw[..pitch_size].to_vec()
+        } else {
+            layer_raw.to_vec()
+        };
+        let mut decoded =
+            nexium_gpu::texture::decode_to_rgba8(&linear, tic.width, tic.height, tic.format);
+        decoded.resize(layer_rgba_size, 0);
+        out.extend(decoded);
+    }
+    out.resize(layer_rgba_size.saturating_mul(layers as usize), 0);
+    out
+}
+
+fn font_vertex_raw_words(bytes: &[u8], off: usize) -> Option<[u32; 16]> {
+    if off + 64 > bytes.len() {
+        return None;
+    }
+    let mut words = [0u32; 16];
+    for (i, word) in words.iter_mut().enumerate() {
+        let p = off + i * 4;
+        *word = u32::from_le_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]]);
+    }
+    Some(words)
+}
+
+fn font_tex_sample_summary(
+    idx: u32,
+    rgba: &[u8],
+    layer_size: usize,
+    width: u32,
+    height: u32,
+    layer: u32,
+    swizzle: [nexium_gpu::texture::SwizzleSource; 4],
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+) -> String {
+    let direct = font_tex_region_stats(rgba, layer_size, width, height, layer, swizzle, u0, v0, u1, v1, false);
+    let flipped = font_tex_region_stats(rgba, layer_size, width, height, layer, swizzle, u0, v0, u1, v1, true);
+    format!(
+        "v{} uv=({:.4},{:.4})-({:.4},{:.4}) l{} dir[{}] flip[{}]",
+        idx, u0, v0, u1, v1, layer, direct, flipped
+    )
+}
+
+fn font_tex_region_stats(
+    rgba: &[u8],
+    layer_size: usize,
+    width: u32,
+    height: u32,
+    layer: u32,
+    swizzle: [nexium_gpu::texture::SwizzleSource; 4],
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+    flip_v: bool,
+) -> String {
+    if width == 0 || height == 0 || !u0.is_finite() || !v0.is_finite() || !u1.is_finite() || !v1.is_finite() {
+        return "bad".to_string();
+    }
+    let x0 = font_tex_coord_to_px(u0.min(u1), width);
+    let x1 = font_tex_coord_to_px(u0.max(u1), width).max(x0);
+    let (a, b) = if flip_v { (1.0 - v0, 1.0 - v1) } else { (v0, v1) };
+    let y0 = font_tex_coord_to_px(a.min(b), height);
+    let y1 = font_tex_coord_to_px(a.max(b), height).max(y0);
+    let mut raw0 = FontTexStats::default();
+    let mut raw3 = FontTexStats::default();
+    let mut map0 = FontTexStats::default();
+    let mut map3 = FontTexStats::default();
+    let base = layer as usize * layer_size;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let p = base + ((y as usize * width as usize + x as usize) * 4);
+            if p + 4 > rgba.len() {
+                continue;
+            }
+            let src = [rgba[p], rgba[p + 1], rgba[p + 2], rgba[p + 3]];
+            let mapped = font_apply_swizzle(src, swizzle);
+            raw0.add(src[0]);
+            raw3.add(src[3]);
+            map0.add(mapped[0]);
+            map3.add(mapped[3]);
+        }
+    }
+    format!(
+        "px={}..{}/{}..{} r0={} r3={} m0={} m3={}",
+        x0,
+        x1,
+        y0,
+        y1,
+        raw0,
+        raw3,
+        map0,
+        map3
+    )
+}
+
+fn font_tex_coord_to_px(v: f32, extent: u32) -> u32 {
+    let max = extent.saturating_sub(1) as f32;
+    (v.clamp(0.0, 1.0) * max).round() as u32
+}
+
+fn font_apply_swizzle(
+    src: [u8; 4],
+    swizzle: [nexium_gpu::texture::SwizzleSource; 4],
+) -> [u8; 4] {
+    fn one(src: [u8; 4], s: nexium_gpu::texture::SwizzleSource) -> u8 {
+        match s {
+            nexium_gpu::texture::SwizzleSource::Zero => 0,
+            nexium_gpu::texture::SwizzleSource::R => src[0],
+            nexium_gpu::texture::SwizzleSource::G => src[1],
+            nexium_gpu::texture::SwizzleSource::B => src[2],
+            nexium_gpu::texture::SwizzleSource::A => src[3],
+            nexium_gpu::texture::SwizzleSource::One => 255,
+            nexium_gpu::texture::SwizzleSource::Unknown(_) => 0,
+        }
+    }
+    [
+        one(src, swizzle[0]),
+        one(src, swizzle[1]),
+        one(src, swizzle[2]),
+        one(src, swizzle[3]),
+    ]
+}
+
+#[derive(Default)]
+struct FontTexStats {
+    count: u64,
+    nonzero: u64,
+    sum: u64,
+    min: u8,
+    max: u8,
+}
+
+impl FontTexStats {
+    fn add(&mut self, v: u8) {
+        if self.count == 0 {
+            self.min = v;
+            self.max = v;
+        } else {
+            self.min = self.min.min(v);
+            self.max = self.max.max(v);
+        }
+        self.count += 1;
+        self.sum += v as u64;
+        if v != 0 {
+            self.nonzero += 1;
+        }
+    }
+}
+
+impl std::fmt::Display for FontTexStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.count == 0 {
+            return write!(f, "empty");
+        }
+        write!(
+            f,
+            "{:.1}/{:.3}/{}..{}",
+            self.sum as f64 / self.count as f64,
+            self.nonzero as f64 / self.count as f64,
+            self.min,
+            self.max
+        )
+    }
+}
+
+fn menu_draw_dbg_limit() -> u64 {
+    use std::sync::OnceLock;
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_MENU_DRAW_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(4000)
+    })
+}
+
+fn trace_menu_draw(
+    draw: &DrawCall,
+    layout: &VertexLayout,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    nvmap_id: u32,
+    rt: &RenderTarget,
+    vs_addr: u64,
+    fs_addr: u64,
+    vertex_addr: u64,
+    vertex_count: u32,
+    index_count: u32,
+    indexed: bool,
+    shader_fs_tex_ids: &[u32],
+    fs_tex_ids: &[u32],
+    fs_sampler_ids: &[u32],
+    fs_tex_remap: &[String],
+    sampled_rt_slots: &[Option<RtKey>],
+    depth_test: bool,
+    depth_write: bool,
+    blend: &BlendState,
+    vs_cbuf_mask: u32,
+    fs_cbuf_mask: u32,
+    cbuf_data: Option<&[u8]>,
+    cbuf_binds: &[[(u64, u32); 16]; 5],
+) {
+    let Some(target) = menu_draw_dbg_target() else {
+        return;
+    };
+    if nvmap_id != target {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    if seq >= menu_draw_dbg_limit() {
+        return;
+    }
+    let pos = position_bounds(layout, mappings, mem_read, vertex_addr, vertex_count)
+        .unwrap_or_else(|| "n/a".to_string());
+    let attr = vertex_attr_sample(layout, mappings, mem_read, vertex_addr, vertex_count);
+    let vp = guest_viewport_rect(draw, rt.width as f32, rt.height as f32);
+    let clip = draw.surface_clip.effective(rt.width, rt.height);
+    let mut tex = Vec::new();
+    for (slot, tex_id) in fs_tex_ids.iter().enumerate() {
+        if *tex_id == u32::MAX || draw.tic_pool_gpu_va == 0 || *tex_id > draw.tic_pool_limit {
+            tex.push(format!("s{}:tic{}=invalid", slot, tex_id));
+            continue;
+        }
+        let tic_addr = draw.tic_pool_gpu_va.wrapping_add((*tex_id as u64) * 32);
+        let mut raw = [0u8; 32];
+        let entry = mappings
+            .cpu_address_for(tic_addr)
+            .filter(|cpu| mem_read(*cpu, &mut raw))
+            .and_then(|_| nexium_gpu::texture::TicEntry::parse(&raw));
+        match entry {
+            Some(tic) => tex.push(format!(
+                "s{}:tic{} {:?} {}x{}x{} base={} type={} norm={} bl={} bh={} va={:#x} nvmap={:?} swz={:?} sampled={:?}",
+                slot,
+                tex_id,
+                tic.format,
+                tic.width,
+                tic.height,
+                tic.depth,
+                tic.base_layer,
+                tic.texture_type,
+                tic.normalized_coords,
+                tic.is_block_linear,
+                tic.block_height_log2,
+                tic.gpu_va,
+                mappings.nvmap_id_for(tic.gpu_va),
+                tic.swizzle,
+                sampled_rt_slots.get(slot).copied().flatten()
+            )),
+            None => tex.push(format!("s{}:tic{}=unreadable", slot, tex_id)),
+        }
+    }
+    let mut tsc = Vec::new();
+    for (slot, tsc_id) in fs_sampler_ids.iter().enumerate() {
+        if draw.tsc_pool_gpu_va == 0 || *tsc_id > draw.tsc_pool_limit {
+            continue;
+        }
+        let tsc_addr = draw.tsc_pool_gpu_va.wrapping_add((*tsc_id as u64) * 32);
+        let mut raw = [0u8; 32];
+        let entry = mappings
+            .cpu_address_for(tsc_addr)
+            .filter(|cpu| mem_read(*cpu, &mut raw))
+            .and_then(|_| nexium_gpu::texture::TscEntry::parse(&raw));
+        if let Some(ts) = entry {
+            tsc.push(format!(
+                "s{}:tsc{} wrap=({:?},{:?},{:?}) filt=({:?},{:?},{:?})",
+                slot,
+                tsc_id,
+                ts.wrap_u,
+                ts.wrap_v,
+                ts.wrap_p,
+                ts.mag_filter,
+                ts.min_filter,
+                ts.mip_filter
+            ));
+        }
+    }
+    log::warn!(
+        "[menu-draw] #{} rt={} {}x{} vs={:#x} fs={:#x} topo={} first={} inst={}/{} v={} i={} indexed={} pos={} attrs={} {} vp_en={} vp={:?} clip=({},{} {}x{}) depth={}/{} cull={} ff={:#x} blend={} {:?}/{:?}/{:?}/{:?} masks={:#x}/{:#x} shader_tex_ids={:?} tex_ids={:?} tsc_ids={:?} remap=[{}] tex=[{}] tsc=[{}]",
+        seq,
+        nvmap_id,
+        rt.width,
+        rt.height,
+        vs_addr,
+        fs_addr,
+        draw.topology,
+        draw.first_vertex,
+        draw.instance_count,
+        draw.first_instance,
+        vertex_count,
+        index_count,
+        indexed,
+        pos,
+        layout.attrs.len(),
+        attr,
+        draw.viewport_transform_en,
+        vp,
+        clip.x,
+        clip.y,
+        clip.width,
+        clip.height,
+        depth_test,
+        depth_write,
+        draw.cull_test_enable,
+        draw.front_face,
+        blend.enabled,
+        blend.src_factor,
+        blend.dst_factor,
+        blend.src_alpha_factor,
+        blend.dst_alpha_factor,
+        vs_cbuf_mask,
+        fs_cbuf_mask,
+        shader_fs_tex_ids,
+        fs_tex_ids,
+        fs_sampler_ids,
+        fs_tex_remap.join(" | "),
+        tex.join(" | "),
+        tsc.join(" | "),
+    );
+    if std::env::var_os("NEXIUM_MENU_CBUF_DBG").is_some() {
+        log::warn!(
+            "[menu-cbuf] #{} vs={:#x} {}",
+            seq,
+            vs_addr,
+            menu_cbuf_sample(cbuf_data, cbuf_binds)
+        );
+    }
+}
+
+fn menu_cbuf_sample(
+    cbuf_data: Option<&[u8]>,
+    cbuf_binds: &[[(u64, u32); 16]; 5],
+) -> String {
+    let Some(data) = cbuf_data else {
+        return "none".to_string();
+    };
+    let offsets = [
+        0x0u32, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34,
+        0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60, 0x64, 0x68, 0x6c,
+        0x70, 0x74, 0x78, 0x7c, 0x80, 0x84, 0x88, 0x8c, 0xe0, 0xe4, 0xe8, 0xec, 0xf0, 0xf4,
+        0xf8, 0xfc, 0x100, 0x104, 0x108, 0x10c, 0x110, 0x114, 0x118, 0x11c, 0x1a0, 0x1a4,
+        0x1a8, 0x1ac, 0x1b0, 0x1b4, 0x1c0, 0x1c4, 0x1d0, 0x1d4, 0x1d8, 0x1dc, 0x1e0,
+        0x1e4, 0x1e8, 0x1ec, 0x1f0, 0x1f4, 0x1f8, 0x1fc, 0x200, 0x204, 0x208, 0x20c,
+        0x210, 0x214, 0x218, 0x21c, 0x22c,
+    ];
+    let logical_slot = 3usize;
+    let base = logical_slot * PACKED_CBUF_SLOT_SIZE;
+    let (addr, size) = cbuf_bind_for_slot(cbuf_binds, logical_slot as u32);
+    let mut vals = Vec::new();
+    for off in offsets {
+        let idx = base + off as usize;
+        if idx + 4 > data.len() {
+            vals.push(format!("{:#x}=out", off));
+            continue;
+        }
+        let b = [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
+        vals.push(format!(
+            "{:#x}={:.6}/{:#010x}",
+            off,
+            f32::from_le_bytes(b),
+            u32::from_le_bytes(b)
+        ));
+    }
+    format!("s3({:#x}/{}) [{}]", addr, size, vals.join(" "))
 }
 
 fn guest_viewport_rect(draw: &DrawCall, rt_w: f32, rt_h: f32) -> Option<[f32; 4]> {
@@ -2299,6 +3103,25 @@ fn fetch_sass(
         return None;
     }
     Some(buf)
+}
+
+fn fetch_sph(
+    gpu_va: u64,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> Option<[u8; SPH_SIZE]> {
+    let cpu = mappings.cpu_address_for(gpu_va)?;
+    let mut buf = [0u8; SPH_SIZE];
+    if !mem_read(cpu, &mut buf) {
+        return None;
+    }
+    Some(buf)
+}
+
+fn ps_generic_input_map(sph: [u8; SPH_SIZE]) -> [u8; 32] {
+    let mut map = [0u8; 32];
+    map.copy_from_slice(&sph[0x18..0x38]);
+    map
 }
 
 fn build_vertex_layout(draw: &DrawCall) -> Result<VertexLayout, String> {

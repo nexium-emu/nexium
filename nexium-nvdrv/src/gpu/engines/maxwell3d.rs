@@ -153,6 +153,9 @@ pub struct Maxwell3DRegisters {
     pub draw_vertex_count: u32,
     pub draw_first_vertex: u32,
     pub draw_topology: u32,
+    pub vertex_array_instance_count: u32,
+    pub global_base_vertex_index: u32,
+    pub global_base_instance_index: u32,
     pub viewport_transform_en: bool,
     pub viewport_clip_control: ViewportClipControl,
     pub surface_clip: SurfaceClip,
@@ -247,6 +250,9 @@ impl Default for Maxwell3DRegisters {
             draw_vertex_count: 0,
             draw_first_vertex: 0,
             draw_topology: 0,
+            vertex_array_instance_count: 0,
+            global_base_vertex_index: 0,
+            global_base_instance_index: 0,
             viewport_transform_en: true,
             viewport_clip_control: ViewportClipControl::default(),
             surface_clip: SurfaceClip::default(),
@@ -327,6 +333,8 @@ pub struct DrawCall {
     pub topology: u32,
     pub first_vertex: u32,
     pub vertex_count: u32,
+    pub instance_count: u32,
+    pub first_instance: u32,
     pub indexed: bool,
     pub index_count: u32,
     pub index_gpu_va: u64,
@@ -406,6 +414,7 @@ pub struct Maxwell3D {
     pub macro_uploads_logged: u32,
     pub macro_invocations: u32,
     pub macro_writes_logged: u32,
+    macro_draw_instance_count: Option<u32>,
 }
 
 const REG_LOAD_MME_INSTRUCTION_PTR: u32 = 0x45;
@@ -427,6 +436,7 @@ impl Maxwell3D {
             macro_uploads_logged: 0,
             macro_invocations: 0,
             macro_writes_logged: 0,
+            macro_draw_instance_count: None,
         }
     }
 
@@ -469,15 +479,18 @@ impl Maxwell3D {
             if let Some(out) = writes {
                 if self.macro_writes_logged < 24 {
                     log::info!(
-                        "maxwell3d: MME produced {} writes: {:?}",
+                        "maxwell3d: MME produced {} writes inst={:?}: {:?}",
                         out.writes.len(),
+                        out.draw_instance_count,
                         out.writes.iter().take(8).copied().collect::<Vec<_>>()
                     );
                     self.macro_writes_logged += 1;
                 }
+                self.macro_draw_instance_count = out.draw_instance_count;
                 for (m, a) in out.writes {
                     self.write_register(m, a);
                 }
+                self.macro_draw_instance_count = None;
             }
             return;
         }
@@ -618,6 +631,8 @@ impl Maxwell3D {
                     topology: 0,
                     first_vertex: 0,
                     vertex_count: 0,
+                    instance_count: 1,
+                    first_instance: 0,
                     indexed: false,
                     index_count: 0,
                     index_gpu_va: 0,
@@ -697,6 +712,8 @@ impl Maxwell3D {
             0x4EB => self.regs.window_origin.raw = arg,
             0x64B => self.regs.viewport_transform_en = arg & 1 != 0,
             0x64F => self.regs.viewport_clip_control.raw = arg,
+            0x50D => self.regs.global_base_vertex_index = arg,
+            0x50E => self.regs.global_base_instance_index = arg,
             0x35D => self.regs.draw_first_vertex = arg,
             0x35E => {
                 self.regs.draw_vertex_count = arg;
@@ -708,20 +725,31 @@ impl Maxwell3D {
                         arg,
                         false,
                         0,
+                        1,
+                        self.regs.global_base_instance_index,
                     );
                 }
             }
             0x35F => self.regs.draw_first_vertex = arg,
             0x485 | 0x486 => {
                 self.regs.draw_count += 1;
+                let first = arg & 0xFFFF;
                 let count = (arg >> 16) & 0xFFF;
                 let topology = (arg >> 28) & 0xF;
+                if method == 0x485 || self.regs.vertex_array_instance_count == 0 {
+                    self.regs.vertex_array_instance_count = 1;
+                }
+                let first_instance = self.regs.vertex_array_instance_count - 1;
+                self.regs.vertex_array_instance_count =
+                    self.regs.vertex_array_instance_count.wrapping_add(1);
                 log::trace!(
-                    "maxwell3d: DRAW_VERTEX_ARRAY_BEGIN_END count={} topology={}",
+                    "maxwell3d: DRAW_VERTEX_ARRAY_BEGIN_END first={} count={} topology={} first_instance={}",
+                    first,
                     count,
-                    topology
+                    topology,
+                    first_instance
                 );
-                self.push_draw(topology, self.regs.draw_first_vertex, count, false, 0);
+                self.push_draw(topology, first, count, false, 0, 1, first_instance);
             }
 
             0x586 => {
@@ -742,7 +770,15 @@ impl Maxwell3D {
                     arg,
                     self.regs.draw_topology
                 );
-                self.push_draw(self.regs.draw_topology, 0, 0, true, arg);
+                self.push_draw(
+                    self.regs.draw_topology,
+                    0,
+                    0,
+                    true,
+                    arg,
+                    1,
+                    self.regs.global_base_instance_index,
+                );
             }
 
             0x557 => {
@@ -928,7 +964,14 @@ impl Maxwell3D {
         count: u32,
         indexed: bool,
         index_count: u32,
+        instance_count: u32,
+        first_instance: u32,
     ) {
+        let instance_count = self
+            .macro_draw_instance_count
+            .take()
+            .unwrap_or(instance_count)
+            .max(1);
         let tic_pool_gpu_va =
             ((self.regs.tic_pool_va_hi as u64) << 32) | self.regs.tic_pool_va_lo as u64;
         let tsc_pool_gpu_va =
@@ -949,6 +992,8 @@ impl Maxwell3D {
             topology,
             first_vertex: first,
             vertex_count: count,
+            instance_count,
+            first_instance,
             indexed,
             index_count,
             index_gpu_va: ((self.regs.index_buffer_hi as u64) << 32)
@@ -1045,6 +1090,8 @@ impl Maxwell3D {
             topology: 0,
             first_vertex: 0,
             vertex_count: 0,
+            instance_count: 1,
+            first_instance: 0,
             indexed: false,
             index_count: 0,
             index_gpu_va: 0,

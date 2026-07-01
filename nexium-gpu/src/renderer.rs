@@ -28,6 +28,7 @@ struct RendererInner {
     shader_compiler: ShaderCompiler,
     pipeline_cache: PipelineCache,
     dummy_white: Option<DummyImage>,
+    dummy_white_array: Option<DummyImage>,
     default_sampler: Option<vk::Sampler>,
     sampler_cache: HashMap<crate::texture::TscEntry, vk::Sampler>,
     tex_cache: HashMap<TexCacheKey, CachedTexture>,
@@ -51,6 +52,10 @@ struct TexCacheKey {
     gpu_va: u64,
     width: u32,
     height: u32,
+    layers: u32,
+    base_layer: u32,
+    view_layers: u32,
+    arrayed: bool,
     format: crate::texture::TicFormat,
     swizzle: [crate::texture::SwizzleSource; 4],
 }
@@ -479,6 +484,7 @@ impl Renderer {
                 shader_compiler,
                 pipeline_cache,
                 dummy_white: None,
+                dummy_white_array: None,
                 default_sampler: None,
                 sampler_cache: HashMap::new(),
                 tex_cache: HashMap::new(),
@@ -1561,6 +1567,7 @@ impl Renderer {
             descriptor_pool,
             pipeline_cache,
             dummy_white,
+            dummy_white_array,
             default_sampler,
             sampler_cache,
             tex_cache,
@@ -1611,19 +1618,34 @@ impl Renderer {
 
         if dummy_white.is_none() {
             *dummy_white = Some(create_dummy_white_image(
-                device, *queue, *cmd_pool, mem_props,
+                device, *queue, *cmd_pool, mem_props, false,
+            )?);
+        }
+        if dummy_white_array.is_none() {
+            *dummy_white_array = Some(create_dummy_white_image(
+                device, *queue, *cmd_pool, mem_props, true,
             )?);
         }
         if default_sampler.is_none() {
             *default_sampler = Some(create_default_sampler(device)?);
         }
-        let dummy = dummy_white.as_ref().unwrap();
+        let dummy_view = dummy_white.as_ref().unwrap().view;
+        let dummy_array_view = dummy_white_array.as_ref().unwrap().view;
+        let arrayed_descriptors = tex_pendings
+            .iter()
+            .flatten()
+            .any(|(key, _, _, _)| key.arrayed);
+        let fallback_view = if arrayed_descriptors {
+            dummy_array_view
+        } else {
+            dummy_view
+        };
         let default_samp = default_sampler.unwrap();
         let tsc_entries = collect_tsc_entries(call, &read_guest);
         let rt_aliases: Vec<_> = (0..tex_pendings.len())
             .map(|slot| rt_alias_for_slot(rt_cache, call, slot, call.rt_key))
             .collect();
-        let mut bound_tex_views = vec![dummy.view; max_texture_descriptors()];
+        let mut bound_tex_views = vec![fallback_view; max_texture_descriptors()];
         for (slot, pending) in tex_pendings.iter().enumerate() {
             if let Some((_, _, alias_view, _)) = rt_aliases.get(slot).copied().flatten() {
                 bound_tex_views[slot] = alias_view;
@@ -1634,8 +1656,9 @@ impl Renderer {
             };
             if let Some(raw) = read_guest(tic.gpu_va, read_size) {
                 let tex_hash = hash_src_prefix(&raw);
-                let cur_gen = crate::tex_invalidate::region_gen(tic.gpu_va);
-                let need_upload = match tex_cache.get(&key) {
+                let cur_gen = crate::tex_invalidate::region_gen_range(tic.gpu_va, read_size as u64);
+                let force_refresh = force_refresh_texture(tic.gpu_va);
+                let need_upload = force_refresh || match tex_cache.get(&key) {
                     Some(t) => t.gen != cur_gen || t.hash != tex_hash,
                     None => true,
                 };
@@ -1643,28 +1666,10 @@ impl Renderer {
                     let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
                         .map(|v| v == "1")
                         .unwrap_or(false);
-                    let effective_block_linear =
-                        tic.is_block_linear && !crate::pitch_oracle::is_pitch_dst(tic.gpu_va);
-                    let linear: Vec<u8> = if effective_block_linear && !force_pitch {
-                        let (storage_width, storage_height, bpp) =
-                            tic.format.storage_extent(tic.width, tic.height);
-                        crate::texture::unswizzle_block_linear(
-                            &raw,
-                            storage_width,
-                            storage_height,
-                            bpp,
-                            tic.block_height_log2,
-                        )
-                    } else if raw.len() >= pitch_size {
-                        raw[..pitch_size].to_vec()
-                    } else {
-                        raw
-                    };
-                    let rgba8 =
-                        crate::texture::decode_to_rgba8(&linear, tic.width, tic.height, tic.format);
+                    let rgba8 = decode_texture_rgba8_layers(&raw, &tic, pitch_size, force_pitch);
                     log::debug!(
-                        "TIC gpu_va={:#x} {}x{} fmt={:?} bl={} bh={} src_bytes={} rgba8_bytes={} (cache miss -> upload)",
-                        tic.gpu_va, tic.width, tic.height, tic.format,
+                        "TIC gpu_va={:#x} {}x{}x{} fmt={:?} bl={} bh={} src_bytes={} rgba8_bytes={} (cache miss -> upload)",
+                        tic.gpu_va, tic.width, tic.height, key.layers, tic.format,
                         tic.is_block_linear, tic.block_height_log2, read_size, rgba8.len()
                     );
                     match upload_texture_oneshot(
@@ -1674,6 +1679,10 @@ impl Renderer {
                         mem_props,
                         key.width,
                         key.height,
+                        key.layers,
+                        key.base_layer,
+                        key.view_layers,
+                        key.arrayed,
                         &rgba8,
                         tic.swizzle,
                         tex_hash,
@@ -1688,7 +1697,7 @@ impl Renderer {
                     }
                 }
             }
-            bound_tex_views[slot] = tex_cache.get(&key).map(|t| t.view).unwrap_or(dummy.view);
+            bound_tex_views[slot] = tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
         }
         let mut bound_samplers = vec![default_samp; max_texture_descriptors()];
         for (slot, tsc) in tsc_entries.iter().enumerate() {
@@ -2111,11 +2120,29 @@ impl Renderer {
             if let Some((wbinding, wbuf, woff)) = white_bind {
                 device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]);
             }
+            let cmd_first_vertex = if vertex_bind.is_some() {
+                0
+            } else {
+                call.first_vertex
+            };
             if let Some((ibuf, ioff)) = index_bind {
                 device.cmd_bind_index_buffer(cmd, ibuf, ioff, index_type);
-                device.cmd_draw_indexed(cmd, index_count, 1, 0, 0, 0);
+                device.cmd_draw_indexed(
+                    cmd,
+                    index_count,
+                    call.instance_count.max(1),
+                    0,
+                    0,
+                    call.first_instance,
+                );
             } else {
-                device.cmd_draw(cmd, draw_vertex_count, 1, 0, 0);
+                device.cmd_draw(
+                    cmd,
+                    draw_vertex_count,
+                    call.instance_count.max(1),
+                    cmd_first_vertex,
+                    call.first_instance,
+                );
             }
             device.cmd_end_rendering(cmd);
         }
@@ -2304,6 +2331,7 @@ impl Renderer {
             descriptor_pool,
             pipeline_cache,
             dummy_white,
+            dummy_white_array,
             default_sampler,
             sampler_cache,
             tex_cache,
@@ -2349,13 +2377,19 @@ impl Renderer {
         }
         if dummy_white.is_none() {
             *dummy_white = Some(create_dummy_white_image(
-                device, *queue, *cmd_pool, mem_props,
+                device, *queue, *cmd_pool, mem_props, false,
+            )?);
+        }
+        if dummy_white_array.is_none() {
+            *dummy_white_array = Some(create_dummy_white_image(
+                device, *queue, *cmd_pool, mem_props, true,
             )?);
         }
         if default_sampler.is_none() {
             *default_sampler = Some(create_default_sampler(device)?);
         }
         let dummy_view = dummy_white.as_ref().unwrap().view;
+        let dummy_array_view = dummy_white_array.as_ref().unwrap().view;
         let default_samp = default_sampler.unwrap();
 
         let rt_key = calls[0].rt_key;
@@ -2439,7 +2473,17 @@ impl Renderer {
                 }
             }
 
-            let mut bound_tex_views = vec![dummy_view; max_texture_descriptors()];
+            let arrayed_descriptors = prep
+                .tex_pendings
+                .iter()
+                .flatten()
+                .any(|(key, _, _, _)| key.arrayed);
+            let fallback_view = if arrayed_descriptors {
+                dummy_array_view
+            } else {
+                dummy_view
+            };
+            let mut bound_tex_views = vec![fallback_view; max_texture_descriptors()];
             for (slot, pending) in prep.tex_pendings.iter().enumerate() {
                 if let Some((_, _, alias_view, _)) = rt_aliases.get(slot).copied().flatten() {
                     bound_tex_views[slot] = alias_view;
@@ -2459,8 +2503,9 @@ impl Renderer {
                 };
                 if let Some((tex_hash, raw)) = raw_entry.as_ref() {
                     let tex_hash = *tex_hash;
-                    let cur_gen = crate::tex_invalidate::region_gen(tic.gpu_va);
-                    let need_upload = match tex_cache.get(&key) {
+                    let cur_gen = crate::tex_invalidate::region_gen_range(tic.gpu_va, read_size as u64);
+                    let force_refresh = force_refresh_texture(tic.gpu_va);
+                    let need_upload = force_refresh || match tex_cache.get(&key) {
                         Some(t) => t.gen != cur_gen || t.hash != tex_hash,
                         None => true,
                     };
@@ -2468,26 +2513,7 @@ impl Renderer {
                         let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
                             .map(|v| v == "1")
                             .unwrap_or(false);
-                        let effective_block_linear =
-                            tic.is_block_linear && !crate::pitch_oracle::is_pitch_dst(tic.gpu_va);
-                        let linear: Vec<u8> = if effective_block_linear && !force_pitch {
-                            let (storage_width, storage_height, bpp) =
-                                tic.format.storage_extent(tic.width, tic.height);
-                            crate::texture::unswizzle_block_linear(
-                                raw,
-                                storage_width,
-                                storage_height,
-                                bpp,
-                                tic.block_height_log2,
-                            )
-                        } else if raw.len() >= pitch_size {
-                            raw[..pitch_size].to_vec()
-                        } else {
-                            raw.clone()
-                        };
-                        let rgba8 = crate::texture::decode_to_rgba8(
-                            &linear, tic.width, tic.height, tic.format,
-                        );
+                        let rgba8 = decode_texture_rgba8_layers(raw, &tic, pitch_size, force_pitch);
                         if std::env::var_os("NEXIUM_TEXDUMP")
                             .map(|v| v == "1")
                             .unwrap_or(false)
@@ -2518,6 +2544,19 @@ impl Renderer {
                                 );
                             }
                         }
+                        if std::env::var_os("NEXIUM_TEXDUMP_IMG")
+                            .map(|v| v == "1")
+                            .unwrap_or(false)
+                        {
+                            dump_texture_bmp_once(
+                                tic.gpu_va,
+                                tic.width,
+                                tic.height,
+                                key.layers,
+                                &rgba8,
+                                tic.swizzle,
+                            );
+                        }
                         if pass_open {
                             unsafe {
                                 device.cmd_end_rendering(cmd);
@@ -2530,6 +2569,10 @@ impl Renderer {
                             mem_props,
                             key.width,
                             key.height,
+                            key.layers,
+                            key.base_layer,
+                            key.view_layers,
+                            key.arrayed,
                             &rgba8,
                             tic.swizzle,
                             tex_hash,
@@ -2545,7 +2588,7 @@ impl Renderer {
                         }
                     }
                 }
-                bound_tex_views[slot] = tex_cache.get(&key).map(|t| t.view).unwrap_or(dummy_view);
+                bound_tex_views[slot] = tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
             }
 
             let vertex_bind: Option<(vk::Buffer, u64)> = if !prep.vertex_data.is_empty() {
@@ -2964,11 +3007,29 @@ impl Renderer {
                 if let Some((wbinding, wbuf, woff)) = white_bind {
                     device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]);
                 }
+                let cmd_first_vertex = if vertex_bind.is_some() {
+                    0
+                } else {
+                    call.first_vertex
+                };
                 if let Some((ibuf, ioff)) = index_bind {
                     device.cmd_bind_index_buffer(cmd, ibuf, ioff, prep.index_type);
-                    device.cmd_draw_indexed(cmd, prep.index_count, 1, 0, 0, 0);
+                    device.cmd_draw_indexed(
+                        cmd,
+                        prep.index_count,
+                        call.instance_count.max(1),
+                        0,
+                        0,
+                        call.first_instance,
+                    );
                 } else {
-                    device.cmd_draw(cmd, prep.draw_vertex_count, 1, 0, 0);
+                    device.cmd_draw(
+                        cmd,
+                        prep.draw_vertex_count,
+                        call.instance_count.max(1),
+                        cmd_first_vertex,
+                        call.first_instance,
+                    );
                 }
             }
         }
@@ -3052,6 +3113,108 @@ fn max_texture_descriptors() -> usize {
     crate::descriptor::MAX_TEXTURE_DESCRIPTORS as usize
 }
 
+fn force_refresh_texture(gpu_va: u64) -> bool {
+    if std::env::var_os("NEXIUM_TEX_FORCE_REFRESH")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let Some(target) = std::env::var_os("NEXIUM_TEX_FORCE_REFRESH_VA") else {
+        return false;
+    };
+    let s = target.to_string_lossy();
+    let s = s.trim().trim_start_matches("0x");
+    u64::from_str_radix(s, 16)
+        .map(|target| target == gpu_va)
+        .unwrap_or(false)
+}
+
+fn tic_is_arrayed(tic: &crate::texture::TicEntry) -> bool {
+    tic.texture_type == 5
+}
+
+fn tic_layer_count(tic: &crate::texture::TicEntry) -> u32 {
+    if tic_is_arrayed(tic) {
+        tic.base_layer.saturating_add(tic.depth).max(1)
+    } else {
+        1
+    }
+}
+
+fn tic_view_base_layer(tic: &crate::texture::TicEntry) -> u32 {
+    if tic_is_arrayed(tic) {
+        tic.base_layer
+    } else {
+        0
+    }
+}
+
+fn tic_view_layer_count(tic: &crate::texture::TicEntry) -> u32 {
+    if tic_is_arrayed(tic) {
+        tic.depth.max(1)
+    } else {
+        1
+    }
+}
+
+fn tic_layer_read_size(tic: &crate::texture::TicEntry, pitch_size: usize) -> usize {
+    if tic.is_block_linear {
+        tic.format
+            .block_linear_size(tic.width, tic.height, tic.block_height_log2)
+            .max(pitch_size)
+    } else {
+        pitch_size
+    }
+}
+
+fn decode_texture_rgba8_layers(
+    raw: &[u8],
+    tic: &crate::texture::TicEntry,
+    pitch_size: usize,
+    force_pitch: bool,
+) -> Vec<u8> {
+    let layers = tic_layer_count(tic) as usize;
+    let layer_read_size = tic_layer_read_size(tic, pitch_size);
+    let effective_block_linear = tic.is_block_linear && !crate::pitch_oracle::is_pitch_dst(tic.gpu_va);
+    let mut out = Vec::new();
+    let layer_rgba_size = tic.width as usize * tic.height as usize * 4;
+    for layer in 0..layers {
+        let start = layer.saturating_mul(layer_read_size);
+        if start >= raw.len() {
+            out.resize(out.len() + layer_rgba_size, 0);
+            break;
+        }
+        let end = (start + layer_read_size).min(raw.len());
+        let layer_raw = &raw[start..end];
+        let linear: Vec<u8> = if effective_block_linear && !force_pitch {
+            let (storage_width, storage_height, bpp) =
+                tic.format.storage_extent(tic.width, tic.height);
+            crate::texture::unswizzle_block_linear(
+                layer_raw,
+                storage_width,
+                storage_height,
+                bpp,
+                tic.block_height_log2,
+            )
+        } else if layer_raw.len() >= pitch_size {
+            layer_raw[..pitch_size].to_vec()
+        } else {
+            layer_raw.to_vec()
+        };
+        let mut decoded = crate::texture::decode_to_rgba8(
+            &linear,
+            tic.width,
+            tic.height,
+            tic.format,
+        );
+        decoded.resize(layer_rgba_size, 0);
+        out.extend(decoded);
+    }
+    out.resize(layer_rgba_size.saturating_mul(layers), 0);
+    out
+}
+
 fn collect_tex_pendings<F>(
     call: &crate::draw::Maxwell3dDrawCall,
     read_guest: &F,
@@ -3070,17 +3233,17 @@ where
             read_guest(tic_addr, 32).and_then(|tic_raw| {
                 crate::texture::TicEntry::parse(&tic_raw).map(|tic| {
                     let pitch_size = tic.format.linear_size(tic.width, tic.height);
-                    let read_size = if tic.is_block_linear {
-                        tic.format
-                            .block_linear_size(tic.width, tic.height, tic.block_height_log2)
-                            .max(pitch_size)
-                    } else {
-                        pitch_size
-                    };
+                    let layers = tic_layer_count(&tic);
+                    let read_size =
+                        tic_layer_read_size(&tic, pitch_size).saturating_mul(layers as usize);
                     let key = TexCacheKey {
                         gpu_va: tic.gpu_va,
                         width: tic.width,
                         height: tic.height,
+                        layers,
+                        base_layer: tic_view_base_layer(&tic),
+                        view_layers: tic_view_layer_count(&tic),
+                        arrayed: tic_is_arrayed(&tic),
                         format: tic.format,
                         swizzle: tic.swizzle,
                     };
@@ -3407,6 +3570,10 @@ fn upload_texture_oneshot(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     width: u32,
     height: u32,
+    layers: u32,
+    base_layer: u32,
+    view_layers: u32,
+    arrayed: bool,
     rgba8: &[u8],
     swizzle: [crate::texture::SwizzleSource; 4],
     hash: u64,
@@ -3415,7 +3582,8 @@ fn upload_texture_oneshot(
     let cmd = alloc_one_time_cmd(device, cmd_pool)?;
     begin_one_time(device, cmd)?;
     let (tex, sbuf, smem) = create_texture_image(
-        device, cmd, mem_props, width, height, rgba8, swizzle, hash, gen,
+        device, cmd, mem_props, width, height, layers, base_layer, view_layers, arrayed, rgba8,
+        swizzle, hash, gen,
     )?;
     end_one_time(device, cmd)?;
     submit_and_wait(device, queue, cmd)?;
@@ -3427,18 +3595,145 @@ fn upload_texture_oneshot(
     Ok(tex)
 }
 
+fn dump_texture_bmp_once(
+    gpu_va: u64,
+    width: u32,
+    height: u32,
+    layers: u32,
+    rgba8: &[u8],
+    swizzle: [crate::texture::SwizzleSource; 4],
+) {
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if !seen.lock().map(|mut s| s.insert(gpu_va)).unwrap_or(false) {
+        return;
+    }
+    let Some(base) = std::env::var_os("APPDATA") else {
+        return;
+    };
+    let layers = layers.max(1);
+    let out_h = height.saturating_mul(layers);
+    if width == 0 || out_h == 0 {
+        return;
+    }
+    let row_stride = ((width as usize * 3 + 3) / 4) * 4;
+    let image_size = row_stride.saturating_mul(out_h as usize);
+    let file_size = 14usize.saturating_add(40).saturating_add(image_size);
+    let dir = std::path::PathBuf::from(base).join("NeXium").join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join(format!(
+        "tex-{gpu_va:010x}-{width}x{height}x{layers}.bmp"
+    ));
+    let mut file = match std::fs::File::create(path) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let mut header = Vec::with_capacity(54);
+    header.extend_from_slice(b"BM");
+    header.extend_from_slice(&(file_size as u32).to_le_bytes());
+    header.extend_from_slice(&[0u8; 4]);
+    header.extend_from_slice(&(54u32).to_le_bytes());
+    header.extend_from_slice(&(40u32).to_le_bytes());
+    header.extend_from_slice(&(width as i32).to_le_bytes());
+    header.extend_from_slice(&(out_h as i32).to_le_bytes());
+    header.extend_from_slice(&(1u16).to_le_bytes());
+    header.extend_from_slice(&(24u16).to_le_bytes());
+    header.extend_from_slice(&(0u32).to_le_bytes());
+    header.extend_from_slice(&(image_size as u32).to_le_bytes());
+    header.extend_from_slice(&(2835u32).to_le_bytes());
+    header.extend_from_slice(&(2835u32).to_le_bytes());
+    header.extend_from_slice(&(0u32).to_le_bytes());
+    header.extend_from_slice(&(0u32).to_le_bytes());
+    if file.write_all(&header).is_err() {
+        return;
+    }
+    let layer_size = width as usize * height as usize * 4;
+    let mut row = vec![0u8; row_stride];
+    for y_out_rev in 0..out_h {
+        let y_out = out_h - 1 - y_out_rev;
+        let layer = (y_out / height) as usize;
+        let y = (y_out % height) as usize;
+        row.fill(0);
+        for x in 0..width as usize {
+            let idx = layer
+                .saturating_mul(layer_size)
+                .saturating_add((y * width as usize + x) * 4);
+            if idx + 4 > rgba8.len() {
+                continue;
+            }
+            let src = [rgba8[idx], rgba8[idx + 1], rgba8[idx + 2], rgba8[idx + 3]];
+            let mapped = swizzle_rgba_for_dump(src, swizzle);
+            let checker = if ((x / 8) + (y / 8) + layer) & 1 == 0 {
+                [224u8, 224u8, 224u8]
+            } else {
+                [96u8, 96u8, 96u8]
+            };
+            let a = mapped[3] as u32;
+            let r = (mapped[0] as u32 * a + checker[0] as u32 * (255 - a)) / 255;
+            let g = (mapped[1] as u32 * a + checker[1] as u32 * (255 - a)) / 255;
+            let b = (mapped[2] as u32 * a + checker[2] as u32 * (255 - a)) / 255;
+            let dst = x * 3;
+            row[dst] = b as u8;
+            row[dst + 1] = g as u8;
+            row[dst + 2] = r as u8;
+        }
+        if file.write_all(&row).is_err() {
+            return;
+        }
+    }
+}
+
+fn swizzle_rgba_for_dump(
+    src: [u8; 4],
+    swizzle: [crate::texture::SwizzleSource; 4],
+) -> [u8; 4] {
+    fn one(src: [u8; 4], s: crate::texture::SwizzleSource) -> u8 {
+        match s {
+            crate::texture::SwizzleSource::Zero => 0,
+            crate::texture::SwizzleSource::R => src[0],
+            crate::texture::SwizzleSource::G => src[1],
+            crate::texture::SwizzleSource::B => src[2],
+            crate::texture::SwizzleSource::A => src[3],
+            crate::texture::SwizzleSource::One => 255,
+            crate::texture::SwizzleSource::Unknown(_) => 0,
+        }
+    }
+    [
+        one(src, swizzle[0]),
+        one(src, swizzle[1]),
+        one(src, swizzle[2]),
+        one(src, swizzle[3]),
+    ]
+}
+
 fn create_texture_image(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     width: u32,
     height: u32,
+    layers: u32,
+    base_layer: u32,
+    view_layers: u32,
+    arrayed: bool,
     rgba8: &[u8],
     swizzle: [crate::texture::SwizzleSource; 4],
     hash: u64,
     gen: u64,
 ) -> Result<(CachedTexture, vk::Buffer, vk::DeviceMemory), String> {
     let format = vk::Format::R8G8B8A8_UNORM;
+    let layers = layers.max(1);
+    let view_base_layer = if arrayed { base_layer.min(layers - 1) } else { 0 };
+    let view_layer_count = if arrayed {
+        view_layers.max(1).min(layers - view_base_layer)
+    } else {
+        1
+    };
     let img_info = vk::ImageCreateInfo {
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
         image_type: vk::ImageType::TYPE_2D,
@@ -3449,7 +3744,7 @@ fn create_texture_image(
             depth: 1,
         },
         mip_levels: 1,
-        array_layers: 1,
+        array_layers: layers,
         samples: vk::SampleCountFlags::TYPE_1,
         tiling: vk::ImageTiling::OPTIMAL,
         usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
@@ -3508,7 +3803,7 @@ fn create_texture_image(
             aspect_mask: vk::ImageAspectFlags::COLOR,
             mip_level: 0,
             base_array_layer: 0,
-            layer_count: 1,
+            layer_count: layers,
         },
         image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
         image_extent: vk::Extent3D {
@@ -3537,14 +3832,18 @@ fn create_texture_image(
     let view_info = vk::ImageViewCreateInfo {
         s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
         image,
-        view_type: vk::ImageViewType::TYPE_2D,
+        view_type: if arrayed {
+            vk::ImageViewType::TYPE_2D_ARRAY
+        } else {
+            vk::ImageViewType::TYPE_2D
+        },
         format,
         subresource_range: vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
             level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
+            base_array_layer: view_base_layer,
+            layer_count: view_layer_count,
         },
         components: texture_component_mapping(swizzle),
         p_next: std::ptr::null(),
@@ -3595,6 +3894,7 @@ fn create_dummy_white_image(
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
+    arrayed: bool,
 ) -> Result<DummyImage, String> {
     let format = vk::Format::R8G8B8A8_UNORM;
     let img_info = vk::ImageCreateInfo {
@@ -3710,7 +4010,11 @@ fn create_dummy_white_image(
     let view_info = vk::ImageViewCreateInfo {
         s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
         image,
-        view_type: vk::ImageViewType::TYPE_2D,
+        view_type: if arrayed {
+            vk::ImageViewType::TYPE_2D_ARRAY
+        } else {
+            vk::ImageViewType::TYPE_2D
+        },
         format,
         subresource_range: vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -4062,7 +4366,7 @@ fn transition_image_aspect(
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
-            layer_count: 1,
+            layer_count: vk::REMAINING_ARRAY_LAYERS,
         },
         src_access_mask: src_access,
         dst_access_mask: dst_access,
@@ -4200,6 +4504,13 @@ impl Drop for RendererInner {
             let _ = self.device.device_wait_idle();
         }
         if let Some(d) = self.dummy_white.take() {
+            unsafe {
+                self.device.destroy_image_view(d.view, None);
+                self.device.destroy_image(d.image, None);
+                self.device.free_memory(d.memory, None);
+            }
+        }
+        if let Some(d) = self.dummy_white_array.take() {
             unsafe {
                 self.device.destroy_image_view(d.view, None);
                 self.device.destroy_image(d.image, None);
