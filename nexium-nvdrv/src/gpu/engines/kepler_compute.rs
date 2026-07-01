@@ -376,7 +376,11 @@ fn format_compute_sass(bytes: &[u8]) -> String {
         };
         match nexium_shader::decode_one(raw) {
             Some(d) => {
-                let mnemonic = d.display.split_once(' ').map(|(m, _)| m).unwrap_or(d.display);
+                let mnemonic = d
+                    .display
+                    .split_once(' ')
+                    .map(|(m, _)| m)
+                    .unwrap_or(d.display);
                 let operands = nexium_shader::pretty_operands(d.opcode, d.raw).unwrap_or_default();
                 if operands.is_empty() {
                     lines.push(format!("  +{offset:04x}  {raw:016x}  {pred}{mnemonic}"));

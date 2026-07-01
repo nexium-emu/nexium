@@ -259,11 +259,32 @@ impl ComputeExec<'_> {
                 SHR_imm => self.ishr(&mut regs, raw, imm20(raw) as u32),
                 LOP_reg => {
                     let b = get_reg(&regs, reg_b(raw));
-                    self.lop(&mut regs, raw, b, lop_op(raw), lop_not_a(raw), lop_not_b(raw));
+                    self.lop(
+                        &mut regs,
+                        raw,
+                        b,
+                        lop_op(raw),
+                        lop_not_a(raw),
+                        lop_not_b(raw),
+                    );
                 }
-                LOP_cbuf => self.lop(&mut regs, raw, self.cbuf_u32(raw), lop_op(raw), lop_not_a(raw), lop_not_b(raw)),
+                LOP_cbuf => self.lop(
+                    &mut regs,
+                    raw,
+                    self.cbuf_u32(raw),
+                    lop_op(raw),
+                    lop_not_a(raw),
+                    lop_not_b(raw),
+                ),
                 LOP_imm => self.lop(&mut regs, raw, imm20(raw) as u32, lop_op(raw), false, false),
-                LOP32I => self.lop(&mut regs, raw, imm32(raw), lop32i_op(raw), lop32i_not_a(raw), lop32i_not_b(raw)),
+                LOP32I => self.lop(
+                    &mut regs,
+                    raw,
+                    imm32(raw),
+                    lop32i_op(raw),
+                    lop32i_not_a(raw),
+                    lop32i_not_b(raw),
+                ),
                 F2I_reg => {
                     let src = get_reg(&regs, reg_b(raw));
                     self.f2i(&mut regs, raw, src);
@@ -384,7 +405,9 @@ impl ComputeExec<'_> {
         };
         let dest = reg_dest(raw);
         for i in 0..count {
-            let gpu = base.wrapping_add(offset as u64).wrapping_add((i * 4) as u64);
+            let gpu = base
+                .wrapping_add(offset as u64)
+                .wrapping_add((i * 4) as u64);
             set_reg(regs, dest.wrapping_add(i as u8), self.read_gpu_u32(gpu));
         }
     }
@@ -432,7 +455,11 @@ impl ComputeExec<'_> {
         if bit(raw, 49) {
             c = -c;
         }
-        set_reg(regs, reg_dest(raw), fsat(a.mul_add(b, c), bit(raw, 50)).to_bits());
+        set_reg(
+            regs,
+            reg_dest(raw),
+            fsat(a.mul_add(b, c), bit(raw, 50)).to_bits(),
+        );
     }
 
     fn iadd(&self, regs: &mut [u32; 256], raw: u64, b: u32) {
@@ -483,7 +510,11 @@ impl ComputeExec<'_> {
         if bit(raw, 48) {
             b = (!b).wrapping_add(1);
         }
-        set_reg(regs, reg_dest(raw), (a << bits(raw, 39, 43)).wrapping_add(b));
+        set_reg(
+            regs,
+            reg_dest(raw),
+            (a << bits(raw, 39, 43)).wrapping_add(b),
+        );
     }
 
     fn ishl(&self, regs: &mut [u32; 256], raw: u64, b: u32) {
@@ -520,7 +551,11 @@ impl ComputeExec<'_> {
 
     fn f2i(&self, regs: &mut [u32; 256], raw: u64, src: u32) {
         let f = f32::from_bits(src);
-        let v = if bit(raw, 12) { f as i32 as u32 } else { f as u32 };
+        let v = if bit(raw, 12) {
+            f as i32 as u32
+        } else {
+            f as u32
+        };
         set_reg(regs, reg_dest(raw), v);
     }
 
@@ -533,7 +568,14 @@ impl ComputeExec<'_> {
             _ => src,
         };
         let mut f = if bit(raw, 13) {
-            sign_extend(extracted, match int_format { 0 => 8, 1 => 16, _ => 32 }) as f32
+            sign_extend(
+                extracted,
+                match int_format {
+                    0 => 8,
+                    1 => 16,
+                    _ => 32,
+                },
+            ) as f32
         } else {
             extracted as f32
         };
@@ -550,7 +592,11 @@ impl ComputeExec<'_> {
         let a = get_reg(regs, reg_a(raw));
         let pass = icmp(bits(raw, 49, 51), bit(raw, 48), a, b);
         let v = if bit(raw, 44) {
-            if pass { 1.0f32.to_bits() } else { 0 }
+            if pass {
+                1.0f32.to_bits()
+            } else {
+                0
+            }
         } else if pass {
             u32::MAX
         } else {
@@ -655,7 +701,11 @@ impl ComputeExec<'_> {
         let handle_offset = (bits(raw, 36, 48) as u32).wrapping_mul(4);
         let handle = self.cbuf_slot_u32(self.texture.tex_cb_index as u8, handle_offset);
         let linked_tsc = (self.qmd[0x0b] & (1 << 30)) != 0;
-        let tic_index = if linked_tsc { handle } else { handle & 0x000f_ffff };
+        let tic_index = if linked_tsc {
+            handle
+        } else {
+            handle & 0x000f_ffff
+        };
         if tic_index > self.texture.tic_limit || self.texture.tic_pool_gpu_va == 0 {
             return None;
         }
@@ -824,10 +874,7 @@ fn coord_to_index(v: f32, size: u32, normalized: bool) -> usize {
     f.floor().clamp(0.0, max) as usize
 }
 
-fn apply_swizzle(
-    src: [u8; 4],
-    swizzle: [nexium_gpu::texture::SwizzleSource; 4],
-) -> [u8; 4] {
+fn apply_swizzle(src: [u8; 4], swizzle: [nexium_gpu::texture::SwizzleSource; 4]) -> [u8; 4] {
     fn one(src: [u8; 4], s: nexium_gpu::texture::SwizzleSource) -> u8 {
         match s {
             nexium_gpu::texture::SwizzleSource::Zero => 0,
@@ -971,8 +1018,16 @@ fn pred_active(raw: u64, preds: &[bool; 8]) -> bool {
 }
 
 fn pred_value(preds: &[bool; 8], pred: u8, neg: bool) -> bool {
-    let v = if pred == PT { true } else { preds[pred as usize] };
-    if neg { !v } else { v }
+    let v = if pred == PT {
+        true
+    } else {
+        preds[pred as usize]
+    };
+    if neg {
+        !v
+    } else {
+        v
+    }
 }
 
 fn set_pred(preds: &mut [bool; 8], pred: u8, v: bool) {

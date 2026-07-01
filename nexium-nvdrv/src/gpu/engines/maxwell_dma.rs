@@ -255,13 +255,32 @@ impl MaxwellDma {
                  src_layout={} dst_layout={} flags={:#x} line_units={} line_count={} \
                  remap={} comp_size={} n_src={} n_dst={} sel={}{}{}{} \
                  src_w={} src_h={} src_blk={:#x} dst_w={} dst_h={} dst_blk={:#x} pitch_in={} pitch_out={}",
-                self.blit_count, src_gpu, src_cpu, dst_gpu, dst_cpu,
-                src_layout, dst_layout, flags, line_length_units, line_count,
-                remap_enable, component_size, num_src_components, num_dst_components,
-                dst_x_sel, dst_y_sel, dst_z_sel, dst_w_sel,
-                self.src_width, self.src_height, self.src_block_size,
-                self.dst_width, self.dst_height, self.dst_block_size,
-                self.pitch_in, self.pitch_out,
+                self.blit_count,
+                src_gpu,
+                src_cpu,
+                dst_gpu,
+                dst_cpu,
+                src_layout,
+                dst_layout,
+                flags,
+                line_length_units,
+                line_count,
+                remap_enable,
+                component_size,
+                num_src_components,
+                num_dst_components,
+                dst_x_sel,
+                dst_y_sel,
+                dst_z_sel,
+                dst_w_sel,
+                self.src_width,
+                self.src_height,
+                self.src_block_size,
+                self.dst_width,
+                self.dst_height,
+                self.dst_block_size,
+                self.pitch_in,
+                self.pitch_out,
             );
         }
 
@@ -335,9 +354,16 @@ impl MaxwellDma {
                     log::warn!(
                         "MaxwellDma::launch unsupported combo src_layout={} dst_layout={} \
                          src_gpu={:#x} dst_gpu={:#x} src_w={} src_h={} dst_w={} dst_h={} line_len={} lines={}",
-                        src_layout, dst_layout, src_gpu, dst_gpu,
-                        self.src_width, self.src_height, self.dst_width, self.dst_height,
-                        self.line_length_in, line_count,
+                        src_layout,
+                        dst_layout,
+                        src_gpu,
+                        dst_gpu,
+                        self.src_width,
+                        self.src_height,
+                        self.dst_width,
+                        self.dst_height,
+                        self.line_length_in,
+                        line_count,
                     );
                 }
             }
@@ -493,9 +519,15 @@ impl MaxwellDma {
                 log::warn!(
                     "MaxwellDma::blit_pitch_to_block stale‑geometry → linear+pitch_dst: full={} > dst_limit={} \
                      dst_gpu={:#x} dst_cpu={:#x} stale_w={} stale_h={} stale_bh={} line_count={} line_len_dst={} | {}",
-                    tiled.len(), dst_limit, dst_gpu, dst_cpu,
-                    self.dst_width, self.dst_height, block_height_log2,
-                    line_count, line_length_dst,
+                    tiled.len(),
+                    dst_limit,
+                    dst_gpu,
+                    dst_cpu,
+                    self.dst_width,
+                    self.dst_height,
+                    block_height_log2,
+                    line_count,
+                    line_length_dst,
                     mappings.describe_around(dst_gpu),
                 );
             }

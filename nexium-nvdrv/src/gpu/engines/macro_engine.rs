@@ -37,11 +37,7 @@ const REG_UPLOAD_DST_HI: u32 = 0x62;
 const REG_UPLOAD_DST_LO: u32 = 0x63;
 const REG_LAUNCH_DMA: u32 = 0x6C;
 
-fn hle_macro(
-    hash: u64,
-    params: &[u32],
-    reg_reader: &dyn Fn(u32) -> u32,
-) -> Option<MacroOutput> {
+fn hle_macro(hash: u64, params: &[u32], reg_reader: &dyn Fn(u32) -> u32) -> Option<MacroOutput> {
     let p = |i: usize| params.get(i).copied().unwrap_or(0);
     let macro_instance_count = || (reg_reader(REG_DRAW_INSTANCE_COUNT) & p(2)).max(1);
     let mut out = MacroOutput::default();

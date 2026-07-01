@@ -123,7 +123,13 @@ impl KeplerMemory {
         if self.upload_count < 32 {
             log::info!(
                 "KeplerMemory::flush[{}]: dst_gpu={:#x} cpu={:#x} layout={} line_len={} line_count={} flags={:#x}",
-                self.upload_count, dst_gpu, dst_cpu, dst_layout, line_length, line_count, self.launch_flags
+                self.upload_count,
+                dst_gpu,
+                dst_cpu,
+                dst_layout,
+                line_length,
+                line_count,
+                self.launch_flags
             );
         }
 
@@ -172,7 +178,13 @@ impl KeplerMemory {
                 if tiled.len() > dst_limit {
                     log::warn!(
                         "KeplerMemory::flush CLAMP: tiled={} > dst_limit={} (dst_cpu={:#x} dst_w={} dst_h={} line_len={} line_count={}) — truncating to avoid heap overrun",
-                        tiled.len(), dst_limit, dst_cpu, self.dst_width, self.dst_height, line_length, line_count,
+                        tiled.len(),
+                        dst_limit,
+                        dst_cpu,
+                        self.dst_width,
+                        self.dst_height,
+                        line_length,
+                        line_count,
                     );
                 }
                 let n = tiled.len().min(dst_limit);

@@ -115,20 +115,16 @@ fn track_dfs(v: Value, defs: &HashMap<u32, Op>, biased: bool, depth: u32) -> Opt
             if *byte_offset % align != 0 {
                 return None;
             }
-            if biased
-                && !(*binding == 0 && *byte_offset >= 0x110 && *byte_offset < 0x610)
-            {
+            if biased && !(*binding == 0 && *byte_offset >= 0x110 && *byte_offset < 0x610) {
                 return None;
             }
             Some((*binding, *byte_offset))
         }
         Op::Mov(s) => track_dfs(*s, defs, biased, depth + 1),
-        Op::IAdd { a, b, .. } => {
-            track_dfs(*a, defs, biased, depth + 1).or_else(|| track_dfs(*b, defs, biased, depth + 1))
-        }
-        Op::IScAdd { a, b, .. } => {
-            track_dfs(*a, defs, biased, depth + 1).or_else(|| track_dfs(*b, defs, biased, depth + 1))
-        }
+        Op::IAdd { a, b, .. } => track_dfs(*a, defs, biased, depth + 1)
+            .or_else(|| track_dfs(*b, defs, biased, depth + 1)),
+        Op::IScAdd { a, b, .. } => track_dfs(*a, defs, biased, depth + 1)
+            .or_else(|| track_dfs(*b, defs, biased, depth + 1)),
         _ => None,
     }
 }
@@ -410,8 +406,7 @@ fn discover_topology(
                     }
                     Opcode::SYNC => {
                         if let Some(&target_off) = sync_targets.get(&offset) {
-                            let target =
-                                *offset_to_block.get(&target_off).unwrap_or(&(i as u32));
+                            let target = *offset_to_block.get(&target_off).unwrap_or(&(i as u32));
                             match decoded_pred(raw) {
                                 None => branch = BranchKind::Unconditional { target },
                                 Some(pred) => branch = BranchKind::Conditional { target, pred },

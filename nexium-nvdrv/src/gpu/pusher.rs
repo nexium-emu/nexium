@@ -206,8 +206,13 @@ impl Pusher {
         if self.entries_logged < 16 {
             log::info!(
                 "gpfifo[{}]: gpu_va={:#x} word_count={} no_prefetch={} not_main={} raw_lo={:#010x} raw_hi={:#010x}",
-                self.entries_logged, address, word_count, entry.no_prefetch(), entry.not_main(),
-                entry.address_lo, entry.address_hi_and_count
+                self.entries_logged,
+                address,
+                word_count,
+                entry.no_prefetch(),
+                entry.not_main(),
+                entry.address_lo,
+                entry.address_hi_and_count
             );
             self.entries_logged += 1;
         }
@@ -404,7 +409,10 @@ impl Pusher {
                         let ok = mem_write(cpu, &payload.to_le_bytes());
                         log::trace!(
                             "pusher: fence release gpu_va={:#x} cpu={:#x} payload={:#x} write_ok={}",
-                            gpu_va, cpu, payload, ok
+                            gpu_va,
+                            cpu,
+                            payload,
+                            ok
                         );
                         stats.fence_releases.fetch_add(1, Ordering::Relaxed);
                     } else {
@@ -500,7 +508,10 @@ impl Pusher {
                     if s.insert(bound_class) {
                         log::warn!(
                             "[gpu-unhandled-class] subch={} class={:#x} method={:#x} arg={:#x} NOT dispatched (0xb1c0=KeplerCompute) — fence may never release",
-                            subchannel, bound_class, method, arg
+                            subchannel,
+                            bound_class,
+                            method,
+                            arg
                         );
                     }
                 }

@@ -25,7 +25,10 @@ impl FlatAllocator {
                 start = e;
             }
         }
-        if start.checked_add(size).map_or(false, |end| end <= self.va_limit) {
+        if start
+            .checked_add(size)
+            .map_or(false, |end| end <= self.va_limit)
+        {
             self.reserve(start, start + size);
             self.linear = start + size;
             return start;
@@ -41,7 +44,10 @@ impl FlatAllocator {
             }
             cand = cand.max(e);
         }
-        if cand.checked_add(size).map_or(false, |end| end <= self.va_limit) {
+        if cand
+            .checked_add(size)
+            .map_or(false, |end| end <= self.va_limit)
+        {
             self.reserve(cand, cand + size);
             return cand;
         }

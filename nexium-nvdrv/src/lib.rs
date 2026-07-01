@@ -358,7 +358,12 @@ impl Nvdrv {
                         h.align = align;
                     }
                     self.stats.nvmap_allocs.fetch_add(1, Ordering::Relaxed);
-                    log::debug!("nvmap:Alloc id={} addr={:#x} align={:#x}", id, address, align);
+                    log::debug!(
+                        "nvmap:Alloc id={} addr={:#x} align={:#x}",
+                        id,
+                        address,
+                        align
+                    );
                 }
             }
             0x0105 => {
@@ -614,8 +619,10 @@ impl Nvdrv {
                     self.gpu.alloc_va_fixed(offset_in, total_size.max(0x1000));
                     offset_in
                 } else {
-                    self.gpu
-                        .alloc_gpu_va_aligned(total_size.max(0x1000), (page_size as u64).max(0x1000))
+                    self.gpu.alloc_gpu_va_aligned(
+                        total_size.max(0x1000),
+                        (page_size as u64).max(0x1000),
+                    )
                 };
                 if out.len() >= 24 {
                     out[0..4].copy_from_slice(&pages.to_le_bytes());
@@ -718,7 +725,8 @@ impl Nvdrv {
                         mapping_size_in
                     };
                     let gpu_va = if (flags & 0x1) != 0 && requested_offset != 0 {
-                        self.gpu.alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
+                        self.gpu
+                            .alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
                         requested_offset
                     } else {
                         let big = self
@@ -733,8 +741,14 @@ impl Nvdrv {
                         .get(&nvmap_id)
                         .map(|h| h.address.wrapping_add(buffer_offset))
                         .unwrap_or(0);
-                    log::debug!("nvhost-as-gpu:MapBufferEx flags={:#x} nvmap_id={} cpu_addr={:#x} size={:#x} → gpu_va={:#x}",
-                        flags, nvmap_id, cpu_addr, mapping_size, gpu_va);
+                    log::debug!(
+                        "nvhost-as-gpu:MapBufferEx flags={:#x} nvmap_id={} cpu_addr={:#x} size={:#x} → gpu_va={:#x}",
+                        flags,
+                        nvmap_id,
+                        cpu_addr,
+                        mapping_size,
+                        gpu_va
+                    );
 
                     self.gpu
                         .mappings
@@ -877,7 +891,12 @@ impl Nvdrv {
                         .unwrap_or(0);
                     log::debug!(
                         "nvhost-as-gpu:Remap[{}/{}] nvmap_id={} cpu={:#x} → gpu_va={:#x} size={:#x}",
-                        i, num_entries, nvmap_handle, cpu_addr, gpu_va, size
+                        i,
+                        num_entries,
+                        nvmap_handle,
+                        cpu_addr,
+                        gpu_va,
+                        size
                     );
                     if cpu_addr != 0 {
                         self.gpu.alloc_va_fixed(gpu_va, size);
@@ -970,8 +989,12 @@ impl Nvdrv {
                                 let m = self.gpu.maxwell3d.lock();
                                 (m.draw_count(), m.clear_count())
                             };
-                            log::trace!("nvhost-gpu:SubmitGPFIFO processed {} entries (draws={}, clears={})",
-                                entries.len(), dc, cc);
+                            log::trace!(
+                                "nvhost-gpu:SubmitGPFIFO processed {} entries (draws={}, clears={})",
+                                entries.len(),
+                                dc,
+                                cc
+                            );
                         }
                         if out.len() >= 24 {
                             out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
@@ -1252,14 +1275,24 @@ impl Nvdrv {
                     let current_val = self.gpu.pusher.lock().syncpt_value;
                     if current_val >= threshold {
                         out[12..16].copy_from_slice(&current_val.to_le_bytes());
-                        log::debug!("nvhost-ctrl:EventWait syncpt={} threshold={:#x} current={} → Success (already reached)",
-                            syncpt_id, threshold, current_val);
+                        log::debug!(
+                            "nvhost-ctrl:EventWait syncpt={} threshold={:#x} current={} → Success (already reached)",
+                            syncpt_id,
+                            threshold,
+                            current_val
+                        );
                     } else {
                         let slot: u32 = 0;
                         let event_val: u32 = slot | ((syncpt_id & 0xFFF) << 16) | (1 << 28);
                         out[12..16].copy_from_slice(&event_val.to_le_bytes());
-                        log::debug!("nvhost-ctrl:EventWait syncpt={} threshold={:#x} current={} → Timeout (deferred, slot={}, event_val={:#x})",
-                            syncpt_id, threshold, current_val, slot, event_val);
+                        log::debug!(
+                            "nvhost-ctrl:EventWait syncpt={} threshold={:#x} current={} → Timeout (deferred, slot={}, event_val={:#x})",
+                            syncpt_id,
+                            threshold,
+                            current_val,
+                            slot,
+                            event_val
+                        );
                         return IoctlOutcome::error(5);
                     }
                 }
@@ -1289,14 +1322,24 @@ impl Nvdrv {
                         if out.len() >= 16 {
                             out[12..16].copy_from_slice(&current_val.to_le_bytes());
                         }
-                        log::debug!("nvhost-ctrl:EventWaitAsync syncpt={} threshold={:#x} current={} event_id={} → Success",
-                            syncpt_id, threshold, current_val, event_id);
+                        log::debug!(
+                            "nvhost-ctrl:EventWaitAsync syncpt={} threshold={:#x} current={} event_id={} → Success",
+                            syncpt_id,
+                            threshold,
+                            current_val,
+                            event_id
+                        );
                     } else {
                         if out.len() >= 16 {
                             out[12..16].copy_from_slice(&event_id.to_le_bytes());
                         }
-                        log::debug!("nvhost-ctrl:EventWaitAsync syncpt={} threshold={:#x} current={} event_id={} → Timeout",
-                            syncpt_id, threshold, current_val, event_id);
+                        log::debug!(
+                            "nvhost-ctrl:EventWaitAsync syncpt={} threshold={:#x} current={} event_id={} → Timeout",
+                            syncpt_id,
+                            threshold,
+                            current_val,
+                            event_id
+                        );
                         return IoctlOutcome::error(5);
                     }
                 }
