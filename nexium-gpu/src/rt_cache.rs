@@ -81,29 +81,11 @@ impl RtCache {
             }
         }
         let best_stamp = best.map(|(_, s)| s).unwrap_or(0);
-        if best_stamp <= 2 && want.height != 0 {
+        if want.height != 0 {
             let aw = want.width as f32 / want.height as f32;
             let same_aspect = |k: &RtKey| {
                 k.height != 0 && ((k.width as f32 / k.height as f32) - aw).abs() <= aw * 0.12
             };
-            let by_draws = self
-                .cache
-                .keys()
-                .filter(|k| same_aspect(k))
-                .filter_map(|k| {
-                    let fd = self.frame_draws.get(k).copied().unwrap_or(0);
-                    if fd > 0 {
-                        Some((*k, fd))
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|(_, fd)| *fd);
-            if let Some((ak, fd)) = by_draws {
-                if fd >= 32 {
-                    return Some(ak);
-                }
-            }
             let alt = self
                 .cache
                 .keys()
@@ -111,8 +93,36 @@ impl RtCache {
                 .filter_map(|k| self.drawn_stamp.get(k).map(|s| (*k, *s)))
                 .max_by_key(|(_, s)| *s);
             if let Some((ak, astamp)) = alt {
-                if astamp > best_stamp.saturating_mul(16) {
+                let best_frame_draws = best
+                    .map(|(bk, _)| self.frame_draws.get(&bk).copied().unwrap_or(0))
+                    .unwrap_or(0);
+                let alt_frame_draws = self.frame_draws.get(&ak).copied().unwrap_or(0);
+                if alt_frame_draws > 0 && best_frame_draws == 0 {
                     return Some(ak);
+                }
+                let stale_gap = best_stamp.max(256) / 4;
+                if astamp > best_stamp.saturating_add(stale_gap) {
+                    return Some(ak);
+                }
+            }
+            if best_stamp <= 2 {
+                let by_draws = self
+                    .cache
+                    .keys()
+                    .filter(|k| same_aspect(k))
+                    .filter_map(|k| {
+                        let fd = self.frame_draws.get(k).copied().unwrap_or(0);
+                        if fd > 0 {
+                            Some((*k, fd))
+                        } else {
+                            None
+                        }
+                    })
+                    .max_by_key(|(_, fd)| *fd);
+                if let Some((ak, fd)) = by_draws {
+                    if fd >= 32 {
+                        return Some(ak);
+                    }
                 }
             }
         }
