@@ -9,6 +9,7 @@ pub enum TicFormat {
     R8G8,
     R16,
     R16G16,
+    B10G11R11,
     BC1,
     BC2,
     BC3,
@@ -56,6 +57,7 @@ impl TicFormat {
             0x1B => TicFormat::R16,
             0x1C => TicFormat::R8G8,
             0x1D => TicFormat::R8,
+            0x21 => TicFormat::B10G11R11,
             0x24 => TicFormat::BC1,
             0x25 => TicFormat::BC2,
             0x26 => TicFormat::BC3,
@@ -83,7 +85,7 @@ impl TicFormat {
 
     pub fn src_bpp(&self) -> usize {
         match self {
-            TicFormat::A8B8G8R8 | TicFormat::R8G8B8A8 => 4,
+            TicFormat::A8B8G8R8 | TicFormat::R8G8B8A8 | TicFormat::B10G11R11 => 4,
             TicFormat::R5G6B5 | TicFormat::A1R5G5B5 | TicFormat::A4R4G4B4 => 2,
             TicFormat::R16 | TicFormat::R8G8 => 2,
             TicFormat::R16G16 => 4,
@@ -530,6 +532,52 @@ fn fill_magenta(out: &mut [u8]) {
     }
 }
 
+fn decode_ufloat(v: u32, mantissa_bits: u32) -> f32 {
+    let exponent_bits = 5;
+    let mantissa_mask = (1u32 << mantissa_bits) - 1;
+    let exponent_mask = (1u32 << exponent_bits) - 1;
+    let mantissa = v & mantissa_mask;
+    let exponent = (v >> mantissa_bits) & exponent_mask;
+    if exponent == 0 {
+        (mantissa as f32) * 2f32.powi(-14 - mantissa_bits as i32)
+    } else if exponent == exponent_mask {
+        if mantissa == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
+    } else {
+        (1.0 + (mantissa as f32) / ((1u32 << mantissa_bits) as f32))
+            * 2f32.powi(exponent as i32 - 15)
+    }
+}
+
+fn float_to_u8(v: f32) -> u8 {
+    if !v.is_finite() {
+        return if v.is_sign_positive() { 255 } else { 0 };
+    }
+    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+fn decode_b10g11r11(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let pixels = width as usize * height as usize;
+    for i in 0..pixels.min(src.len() / 4) {
+        let p = u32::from_le_bytes([
+            src[i * 4],
+            src[i * 4 + 1],
+            src[i * 4 + 2],
+            src[i * 4 + 3],
+        ]);
+        let b = decode_ufloat(p & 0x3ff, 5);
+        let g = decode_ufloat((p >> 10) & 0x7ff, 6);
+        let r = decode_ufloat((p >> 21) & 0x7ff, 6);
+        out[i * 4] = float_to_u8(r);
+        out[i * 4 + 1] = float_to_u8(g);
+        out[i * 4 + 2] = float_to_u8(b);
+        out[i * 4 + 3] = 0xff;
+    }
+}
+
 fn decode_bc4(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
     let (w, h) = (width as usize, height as usize);
     let mut buf = vec![0u32; w * h];
@@ -655,6 +703,7 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
                 out[i * 4 + 3] = 0xFF;
             }
         }
+        TicFormat::B10G11R11 => decode_b10g11r11(src, width, height, &mut out),
         TicFormat::BC1 => decode_bc1(src, width, height, &mut out),
         TicFormat::BC2 => decode_bc2(src, width, height, &mut out),
         TicFormat::BC3 => decode_bc3(src, width, height, &mut out),
