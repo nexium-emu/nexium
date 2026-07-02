@@ -53,6 +53,11 @@ pub struct Emitter {
     ptr_image_array: Word,
     ptr_image_arrayed_array: Word,
     ptr_sampler_array: Word,
+    image_3d_t: Word,
+    sampled_image_3d_t: Word,
+    ptr_image_3d: Word,
+    ptr_image_3d_array: Word,
+    image_3d_var: Option<Word>,
     ubo_var: Word,
     f32_zero: Word,
     f32_one: Word,
@@ -202,6 +207,21 @@ impl Emitter {
             b.type_pointer(None, StorageClass::UniformConstant, image_arrayed_array_t);
         let ptr_sampler_array =
             b.type_pointer(None, StorageClass::UniformConstant, sampler_array_t);
+        let image_3d_t = b.type_image(
+            f32_t,
+            rspirv::spirv::Dim::Dim3D,
+            0,
+            0,
+            0,
+            1,
+            ImageFormat::Unknown,
+            None,
+        );
+        let sampled_image_3d_t = b.type_sampled_image(image_3d_t);
+        let ptr_image_3d = b.type_pointer(None, StorageClass::UniformConstant, image_3d_t);
+        let image_3d_array_t = b.type_array(image_3d_t, texture_slots_const);
+        let ptr_image_3d_array =
+            b.type_pointer(None, StorageClass::UniformConstant, image_3d_array_t);
 
         let f32_zero = b.constant_bit32(f32_t, 0.0f32.to_bits());
         let f32_one = b.constant_bit32(f32_t, 1.0f32.to_bits());
@@ -236,6 +256,11 @@ impl Emitter {
             ptr_image_array,
             ptr_image_arrayed_array,
             ptr_sampler_array,
+            image_3d_t,
+            sampled_image_3d_t,
+            ptr_image_3d,
+            ptr_image_3d_array,
+            image_3d_var: None,
             ubo_var,
             f32_zero,
             f32_one,
@@ -607,6 +632,45 @@ impl Emitter {
             .decorate(samp, Decoration::Binding, [Operand::LiteralBit32(2)]);
         self.image_var = Some(img);
         self.sampler_var = Some(samp);
+        (img, samp)
+    }
+
+    fn ensure_image_3d_array(&mut self) -> Word {
+        if let Some(v) = self.image_3d_var {
+            return v;
+        }
+        let var = self.b.variable(
+            self.ptr_image_3d_array,
+            None,
+            StorageClass::UniformConstant,
+            None,
+        );
+        self.b
+            .decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+        self.b
+            .decorate(var, Decoration::Binding, [Operand::LiteralBit32(11)]);
+        self.image_3d_var = Some(var);
+        var
+    }
+
+    fn sampler_3d_at(&mut self, tex_id: u32) -> (Word, Word) {
+        let (_, samp_array) = self.ensure_sampler_array();
+        let img_array = self.ensure_image_3d_array();
+        let idx = self
+            .texture_slots
+            .get(&tex_id)
+            .copied()
+            .unwrap_or(0)
+            .min(MAX_TEXTURE_DESCRIPTORS - 1);
+        let idx = self.const_u32(idx);
+        let img = self
+            .b
+            .access_chain(self.ptr_image_3d, None, img_array, [idx])
+            .unwrap();
+        let samp = self
+            .b
+            .access_chain(self.ptr_sampler, None, samp_array, [idx])
+            .unwrap();
         (img, samp)
     }
 
@@ -1293,9 +1357,49 @@ impl Emitter {
                 u,
                 v,
                 array,
+                volume,
                 component,
-            } => {
+            } => 'sample_tex: {
                 self.texs_ids_used.insert(*tex_id);
+                if let Some(w) = volume {
+                    let uv0 = self.lower_value(u);
+                    let uv1 = self.lower_value(v);
+                    let uv2 = self.lower_value(w);
+                    let coords = self
+                        .b
+                        .composite_construct(self.vec3_t, None, [uv0, uv1, uv2])
+                        .unwrap();
+                    let (img_var, samp_var) = self.sampler_3d_at(*tex_id);
+                    let img = self
+                        .b
+                        .load(self.image_3d_t, None, img_var, None, [])
+                        .unwrap();
+                    let samp = self
+                        .b
+                        .load(self.sampler_t, None, samp_var, None, [])
+                        .unwrap();
+                    let sampled_img = self
+                        .b
+                        .sampled_image(self.sampled_image_3d_t, None, img, samp)
+                        .unwrap();
+                    let lod_zero = self.f32_zero;
+                    let sampled = self
+                        .b
+                        .image_sample_explicit_lod(
+                            self.vec4_t,
+                            None,
+                            sampled_img,
+                            coords,
+                            rspirv::spirv::ImageOperands::LOD,
+                            [Operand::IdRef(lod_zero)],
+                        )
+                        .unwrap();
+                    let c = self
+                        .b
+                        .composite_extract(self.f32_t, None, sampled, [*component as u32])
+                        .unwrap_or(self.f32_zero);
+                    break 'sample_tex Some(c);
+                }
                 let tex_slot = self
                     .texture_slots
                     .get(tex_id)
@@ -2509,6 +2613,7 @@ impl Emitter {
     fn preallocate_resources(&mut self, cfg: &Cfg) {
         let mut needs_sampler = false;
         let mut needs_arrayed_sampler = false;
+        let mut needs_3d_sampler = false;
         let mut tex_ids = std::collections::BTreeSet::new();
         for block in &cfg.blocks {
             for inst in &block.program.instructions {
@@ -2542,9 +2647,15 @@ impl Emitter {
                             self.output_var(aligned);
                         }
                     }
-                    IrOp::SampleTex { tex_id, array, .. } => {
+                    IrOp::SampleTex {
+                        tex_id,
+                        array,
+                        volume,
+                        ..
+                    } => {
                         needs_sampler = true;
                         needs_arrayed_sampler |= array.is_some();
+                        needs_3d_sampler |= volume.is_some();
                         tex_ids.insert(*tex_id);
                     }
                     _ => {}
@@ -2578,6 +2689,9 @@ impl Emitter {
                 self.texture_slots.insert(tex_id, slot as u32);
             }
             self.ensure_sampler_array();
+            if needs_3d_sampler {
+                self.ensure_image_3d_array();
+            }
         }
         for block in &cfg.blocks {
             let id = self.b.id();
