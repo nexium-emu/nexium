@@ -6,6 +6,33 @@ pub struct RtKey {
     pub nvmap_id: u32,
     pub width: u32,
     pub height: u32,
+    pub gpu_va: u64,
+}
+
+impl RtKey {
+    pub fn new(nvmap_id: u32, width: u32, height: u32, gpu_va: u64) -> Self {
+        Self {
+            nvmap_id,
+            width,
+            height,
+            gpu_va,
+        }
+    }
+
+    pub fn request(nvmap_id: u32, width: u32, height: u32) -> Self {
+        Self::new(nvmap_id, width, height, 0)
+    }
+
+    pub fn label(self) -> String {
+        if self.gpu_va != 0 {
+            format!(
+                "{}:{}x{}@{:x}",
+                self.nvmap_id, self.width, self.height, self.gpu_va
+            )
+        } else {
+            format!("{}:{}x{}", self.nvmap_id, self.width, self.height)
+        }
+    }
 }
 
 pub struct GpuImage {
@@ -43,10 +70,11 @@ impl RtCache {
         }
     }
 
-    pub fn mark_drawn(&mut self, key: RtKey) {
+    pub fn mark_drawn(&mut self, key: RtKey) -> u64 {
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
         *self.frame_draws.entry(key).or_insert(0) += 1;
+        self.drawn_counter
     }
 
     pub fn reset_frame_draws(&mut self) {
@@ -67,6 +95,9 @@ impl RtCache {
             if k.width != want.width || k.height != want.height {
                 continue;
             }
+            if want.gpu_va != 0 && k.gpu_va != want.gpu_va {
+                continue;
+            }
             let Some(stamp) = self.drawn_stamp.get(k).copied() else {
                 continue;
             };
@@ -81,10 +112,7 @@ impl RtCache {
             }
         }
         let best_stamp = best.map(|(_, s)| s).unwrap_or(0);
-        if best_stamp > 2 {
-            return best.map(|(k, _)| k);
-        }
-        if want.height != 0 {
+        if want.height != 0 && want.gpu_va == 0 {
             let aw = want.width as f32 / want.height as f32;
             let same_aspect = |k: &RtKey| {
                 k.height != 0 && ((k.width as f32 / k.height as f32) - aw).abs() <= aw * 0.12
@@ -129,6 +157,9 @@ impl RtCache {
                 }
             }
         }
+        if best_stamp > 2 {
+            return best.map(|(k, _)| k);
+        }
         let res = best.map(|(k, _)| k);
         if res.is_none() && std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,21 +171,17 @@ impl RtCache {
                     .keys()
                     .map(|k| {
                         format!(
-                            "{}:{}x{}#{}",
-                            k.nvmap_id,
-                            k.width,
-                            k.height,
+                            "{}#{}",
+                            k.label(),
                             self.drawn_stamp.get(k).copied().unwrap_or(0)
                         )
                     })
                     .collect();
                 keys.sort();
                 log::warn!(
-                    "[present-none #{}] want={}:{}x{} cache=[{}]",
+                    "[present-none #{}] want={} cache=[{}]",
                     n,
-                    want.nvmap_id,
-                    want.width,
-                    want.height,
+                    want.label(),
                     keys.join(" ")
                 );
             }
@@ -176,6 +203,9 @@ impl RtCache {
         let mut out = Vec::new();
         for k in self.cache.keys() {
             if k.width != want.width || k.height != want.height {
+                continue;
+            }
+            if want.gpu_va != 0 && k.gpu_va != want.gpu_va {
                 continue;
             }
             let stamp = self.drawn_stamp.get(k).copied().unwrap_or(0);
@@ -248,6 +278,9 @@ impl RtCache {
         let mut best: Option<(RtKey, &GpuImage)> = None;
         for (k, img) in &self.cache {
             if k.nvmap_id != want.nvmap_id {
+                continue;
+            }
+            if want.gpu_va != 0 && k.gpu_va != want.gpu_va {
                 continue;
             }
             if !dims_close(k.width, want.width) || !dims_close(k.height, want.height) {

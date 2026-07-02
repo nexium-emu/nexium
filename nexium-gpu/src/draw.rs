@@ -75,6 +75,8 @@ pub struct DepthState {
 pub struct Maxwell3dDrawCall {
     pub vs_spirv: std::sync::Arc<Vec<u32>>,
     pub fs_spirv: std::sync::Arc<Vec<u32>>,
+    pub vs_gpu_va: u64,
+    pub fs_gpu_va: u64,
     pub vs_hash: u64,
     pub fs_hash: u64,
     pub vs_cbuf_mask: u32,
@@ -114,6 +116,7 @@ pub struct Maxwell3dDrawCall {
     pub tsc_pool_gpu_va: u64,
     pub tsc_pool_limit: u32,
     pub fs_sampler_ids: Vec<u32>,
+    pub fs_sampler_arrayed: bool,
 
     pub cull_test_enable: bool,
     pub cull_face: u32,

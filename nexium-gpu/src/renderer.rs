@@ -551,6 +551,7 @@ impl Renderer {
         nvmap_id: u32,
         width: u32,
         height: u32,
+        gpu_va: u64,
         rgba: [f32; 4],
     ) -> Result<(), String> {
         let mut inner = self.inner.lock();
@@ -561,11 +562,7 @@ impl Renderer {
             utility_slot,
             ..
         } = &mut *inner;
-        let key = RtKey {
-            nvmap_id,
-            width,
-            height,
-        };
+        let key = RtKey::new(nvmap_id, width, height, gpu_va);
         let img = rt_cache.get_or_create(key, device)?;
 
         reset_command_buffer(device, utility_slot.cmd)?;
@@ -624,6 +621,7 @@ impl Renderer {
         nvmap_id: u32,
         width: u32,
         height: u32,
+        gpu_va: u64,
         rgba: [f32; 4],
         rect: [i32; 4],
     ) -> Result<(), String> {
@@ -637,7 +635,7 @@ impl Renderer {
         let w = w.min(width - x);
         let h = h.min(height - y);
         if x == 0 && y == 0 && w == width && h == height {
-            return self.clear_target(nvmap_id, width, height, rgba);
+            return self.clear_target(nvmap_id, width, height, gpu_va, rgba);
         }
         let mut inner = self.inner.lock();
         let RendererInner {
@@ -647,11 +645,7 @@ impl Renderer {
             utility_slot,
             ..
         } = &mut *inner;
-        let key = RtKey {
-            nvmap_id,
-            width,
-            height,
-        };
+        let key = RtKey::new(nvmap_id, width, height, gpu_va);
         let img = rt_cache.get_or_create(key, device)?;
 
         reset_command_buffer(device, utility_slot.cmd)?;
@@ -749,6 +743,7 @@ impl Renderer {
         nvmap_id: u32,
         width: u32,
         height: u32,
+        gpu_va: u64,
         rgba8: &[u8],
     ) -> Result<(), String> {
         let expected = (width as usize)
@@ -770,11 +765,7 @@ impl Renderer {
             mem_props,
             ..
         } = &mut *inner;
-        let key = RtKey {
-            nvmap_id,
-            width,
-            height,
-        };
+        let key = RtKey::new(nvmap_id, width, height, gpu_va);
         let (image, old_layout) = {
             let img = rt_cache.get_or_create(key, device)?;
             (img.image, img.layout)
@@ -862,6 +853,7 @@ impl Renderer {
         nvmap_id: u32,
         width: u32,
         height: u32,
+        gpu_va: u64,
         depth: f32,
     ) -> Result<(), String> {
         let mut inner = self.inner.lock();
@@ -872,11 +864,7 @@ impl Renderer {
             utility_slot,
             ..
         } = &mut *inner;
-        let key = RtKey {
-            nvmap_id,
-            width,
-            height,
-        };
+        let key = RtKey::new(nvmap_id, width, height, gpu_va);
         let img = rt_cache.get_or_create_depth(key, device)?;
 
         reset_command_buffer(device, utility_slot.cmd)?;
@@ -933,15 +921,21 @@ impl Renderer {
         let inner = self.inner.lock();
         inner
             .rt_cache
-            .find_color(RtKey {
-                nvmap_id,
-                width,
-                height,
-            })
+            .find_color(RtKey::request(nvmap_id, width, height))
             .map(|(k, _, _, _)| (k.width, k.height))
     }
 
     pub fn readback_target(&self, nvmap_id: u32, width: u32, height: u32) -> Option<Vec<u8>> {
+        self.readback_target_at(nvmap_id, width, height, 0)
+    }
+
+    pub fn readback_target_at(
+        &self,
+        nvmap_id: u32,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+    ) -> Option<Vec<u8>> {
         let mut inner = self.inner.lock();
         let RendererInner {
             device,
@@ -953,11 +947,7 @@ impl Renderer {
             readback_slots,
             ..
         } = &mut *inner;
-        let requested_key = RtKey {
-            nvmap_id,
-            width,
-            height,
-        };
+        let requested_key = RtKey::new(nvmap_id, width, height, gpu_va);
         let key = rt_cache.resolve_present_key(requested_key)?;
         trace_present_key(rt_cache, requested_key, key);
         for (_, mut pending) in pending_readbacks.drain() {
@@ -1093,11 +1083,7 @@ impl Renderer {
             readback_slots,
             ..
         } = &mut *inner;
-        let requested_key = RtKey {
-            nvmap_id,
-            width,
-            height,
-        };
+        let requested_key = RtKey::request(nvmap_id, width, height);
         let key = rt_cache.resolve_present_key(requested_key)?;
         trace_present_key(rt_cache, requested_key, key);
         trace_rt_stats(
@@ -1170,12 +1156,10 @@ impl Renderer {
                         })
                         .collect();
                     log::warn!(
-                        "[readback-noslot #{}] all 4 in_flight, fences=[{}] key={}:{}x{}",
+                        "[readback-noslot #{}] all 4 in_flight, fences=[{}] key={}",
                         n,
                         statuses.join(","),
-                        key.nvmap_id,
-                        key.width,
-                        key.height
+                        key.label()
                     );
                 }
             }
@@ -1303,13 +1287,11 @@ impl Renderer {
                 let n = CT.fetch_add(1, Ordering::Relaxed);
                 if n % 120 == 0 {
                     log::warn!(
-                        "[readback-submitfail #{}] end={:?} submit={:?} key={}:{}x{}",
+                        "[readback-submitfail #{}] end={:?} submit={:?} key={}",
                         n,
                         end_res,
                         sub_res,
-                        key.nvmap_id,
-                        key.width,
-                        key.height
+                        key.label()
                     );
                 }
             }
@@ -1652,11 +1634,8 @@ impl Renderer {
         }
         let dummy_view = dummy_white.as_ref().unwrap().view;
         let dummy_array_view = dummy_white_array.as_ref().unwrap().view;
-        let arrayed_descriptors = tex_pendings
-            .iter()
-            .flatten()
-            .any(|(key, _, _, _)| key.arrayed);
-        let fallback_view = if arrayed_descriptors {
+        let shader_arrayed = call.fs_sampler_arrayed;
+        let fallback_view = if shader_arrayed {
             dummy_array_view
         } else {
             dummy_view
@@ -1664,7 +1643,7 @@ impl Renderer {
         let default_samp = default_sampler.unwrap();
         let tsc_entries = collect_tsc_entries(call, &read_guest);
         let rt_aliases: Vec<_> = (0..tex_pendings.len())
-            .map(|slot| rt_alias_for_slot(rt_cache, call, slot, call.rt_key))
+            .map(|slot| rt_alias_for_slot(rt_cache, call, slot, call.rt_key, false))
             .collect();
         let mut bound_tex_views = vec![fallback_view; max_texture_descriptors()];
         for (slot, pending) in tex_pendings.iter().enumerate() {
@@ -2182,7 +2161,10 @@ impl Renderer {
 
         rt_cache.get_or_create(call.rt_key, device)?.layout =
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-        rt_cache.mark_drawn(call.rt_key);
+        if !call.blend.color_write_mask.is_empty() {
+            let stamp = rt_cache.mark_drawn(call.rt_key);
+            trace_rt_stamp(stamp, call.rt_key, &[call]);
+        }
         if use_depth {
             if let Ok(d) = rt_cache.get_or_create_depth(call.rt_key, device) {
                 d.layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -2320,6 +2302,32 @@ impl Renderer {
                 (Some(d), Some(c)) if c > 0 && !d.is_empty() => (d.clone(), c, call.index_type),
                 _ => (Vec::new(), 0u32, call.index_type),
             };
+            if let Ok(want) = std::env::var("NEXIUM_VTX_DBG") {
+                if parse_u64_value(&want) == Some(call.vs_gpu_va) {
+                    let floats: Vec<f32> = vertex_data
+                        .chunks_exact(4)
+                        .take(24)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let idx: Vec<u16> = index_data
+                        .chunks_exact(2)
+                        .take(8)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    log::warn!(
+                        "[vtx-dbg] vs={:#x} addr={:#x} stride={} vlen={} vcount={} icount={} itype={:?} floats={:?} idx={:?}",
+                        call.vs_gpu_va,
+                        call.vertex_addr,
+                        vertex_stride,
+                        vertex_data.len(),
+                        call.vertex_count,
+                        index_count,
+                        index_type,
+                        floats,
+                        idx
+                    );
+                }
+            }
             preps.push((
                 call,
                 Prep {
@@ -2440,13 +2448,7 @@ impl Renderer {
                 .begin_command_buffer(cmd, &begin)
                 .map_err(|e| format!("begin_command_buffer(batch): {:?}", e))?;
         }
-        transition_image(
-            device,
-            cmd,
-            rt_image,
-            rt_prev_layout,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        );
+        let mut rt_layout = rt_prev_layout;
         if let Some(di) = depth_image {
             transition_image_aspect(
                 device,
@@ -2465,15 +2467,25 @@ impl Renderer {
         let mut tex_raw_cache: HashMap<(u64, usize), Option<(u64, Vec<u8>)>> = HashMap::new();
         let mut pass_open = false;
         let mut pass_depth = false;
+        let mut pass_rt_layout = vk::ImageLayout::UNDEFINED;
         let mut had_pass = false;
         for (_i, (call, prep)) in preps.iter().enumerate() {
             let call = *call;
+            let feedback_loop = call_samples_rt(call, rt_key);
+            let required_rt_layout = if feedback_loop {
+                vk::ImageLayout::GENERAL
+            } else {
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            };
 
             let rt_aliases: Vec<_> = (0..prep.tex_pendings.len())
-                .map(|slot| rt_alias_for_slot(rt_cache, call, slot, rt_key))
+                .map(|slot| rt_alias_for_slot(rt_cache, call, slot, rt_key, true))
                 .collect();
             for alias in &rt_aliases {
                 if let Some((ak, alias_image, _, alias_prev)) = *alias {
+                    if ak == rt_key {
+                        continue;
+                    }
                     if !alias_used.contains(&ak) {
                         if alias_prev != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
                             if pass_open {
@@ -2481,6 +2493,7 @@ impl Renderer {
                                     device.cmd_end_rendering(cmd);
                                 }
                                 pass_open = false;
+                                rt_layout = pass_rt_layout;
                             }
                             transition_image(
                                 device,
@@ -2495,20 +2508,21 @@ impl Renderer {
                 }
             }
 
-            let arrayed_descriptors = prep
-                .tex_pendings
-                .iter()
-                .flatten()
-                .any(|(key, _, _, _)| key.arrayed);
-            let fallback_view = if arrayed_descriptors {
+            let shader_arrayed = call.fs_sampler_arrayed;
+            let fallback_view = if shader_arrayed {
                 dummy_array_view
             } else {
                 dummy_view
             };
             let mut bound_tex_views = vec![fallback_view; max_texture_descriptors()];
+            let mut bound_tex_layouts =
+                vec![vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL; max_texture_descriptors()];
             for (slot, pending) in prep.tex_pendings.iter().enumerate() {
                 if let Some((_, _, alias_view, _)) = rt_aliases.get(slot).copied().flatten() {
                     bound_tex_views[slot] = alias_view;
+                    if sampled_rt_key_for_slot(call, slot) == Some(rt_key) {
+                        bound_tex_layouts[slot] = required_rt_layout;
+                    }
                     continue;
                 }
                 let Some((key, tic, pitch_size, read_size)) = *pending else {
@@ -2732,10 +2746,11 @@ impl Renderer {
             };
             let image_infos: Vec<vk::DescriptorImageInfo> = bound_tex_views
                 .iter()
-                .map(|view| vk::DescriptorImageInfo {
+                .zip(bound_tex_layouts.iter())
+                .map(|(view, layout)| vk::DescriptorImageInfo {
                     sampler: vk::Sampler::null(),
                     image_view: *view,
-                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    image_layout: *layout,
                 })
                 .collect();
             let mut bound_samplers = vec![default_samp; max_texture_descriptors()];
@@ -2874,21 +2889,20 @@ impl Renderer {
             dsets_batch.push(dset);
 
             let need_depth = prep.use_depth;
-            if !pass_open || pass_depth != need_depth {
+            if !pass_open || pass_depth != need_depth || pass_rt_layout != required_rt_layout {
                 if pass_open {
                     unsafe {
                         device.cmd_end_rendering(cmd);
                     }
-                    pass_open = false;
+                    rt_layout = pass_rt_layout;
+                }
+                if rt_layout != required_rt_layout || rt_layout == vk::ImageLayout::UNDEFINED {
+                    transition_image(device, cmd, rt_image, rt_layout, required_rt_layout);
+                    rt_layout = required_rt_layout;
+                } else if had_pass {
+                    transition_image(device, cmd, rt_image, rt_layout, required_rt_layout);
                 }
                 if had_pass {
-                    transition_image(
-                        device,
-                        cmd,
-                        rt_image,
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    );
                     if let Some(di) = depth_image {
                         if need_depth {
                             transition_image_aspect(
@@ -2945,7 +2959,7 @@ impl Renderer {
                 let attachment = vk::RenderingAttachmentInfo {
                     s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
                     image_view: rt_view,
-                    image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    image_layout: required_rt_layout,
                     resolve_mode: vk::ResolveModeFlags::NONE,
                     resolve_image_view: vk::ImageView::null(),
                     resolve_image_layout: vk::ImageLayout::UNDEFINED,
@@ -2991,6 +3005,7 @@ impl Renderer {
                 }
                 pass_open = true;
                 pass_depth = need_depth;
+                pass_rt_layout = required_rt_layout;
                 had_pass = true;
             }
             unsafe {
@@ -3073,8 +3088,15 @@ impl Renderer {
         submit_with_fence(device, *queue, cmd, slot_fence)?;
         frame_slots[cur_idx].in_flight = true;
         frame_slots[cur_idx].retired_dsets.extend(dsets_batch);
-        rt_cache.get_or_create(rt_key, device)?.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-        rt_cache.mark_drawn(rt_key);
+        rt_cache.get_or_create(rt_key, device)?.layout = rt_layout;
+        if calls
+            .iter()
+            .any(|call| !call.blend.color_write_mask.is_empty())
+        {
+            let stamp = rt_cache.mark_drawn(rt_key);
+            let trace_calls: Vec<_> = calls.iter().collect();
+            trace_rt_stamp(stamp, rt_key, &trace_calls);
+        }
         if any_depth {
             if let Ok(d) = rt_cache.get_or_create_depth(rt_key, device) {
                 d.layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -3106,10 +3128,8 @@ fn trace_present_key(rt_cache: &RtCache, requested_key: RtKey, key: RtKey) {
         .into_iter()
         .map(|(k, stamp)| {
             format!(
-                "{}:{}x{}#{}{}",
-                k.nvmap_id,
-                k.width,
-                k.height,
+                "{}#{}{}",
+                k.label(),
                 stamp,
                 if k == key { "*" } else { "" }
             )
@@ -3118,17 +3138,13 @@ fn trace_present_key(rt_cache: &RtCache, requested_key: RtKey, key: RtKey) {
     let all: Vec<String> = rt_cache
         .debug_all()
         .into_iter()
-        .map(|(k, stamp)| format!("{}:{}x{}#{}", k.nvmap_id, k.width, k.height, stamp))
+        .map(|(k, stamp)| format!("{}#{}", k.label(), stamp))
         .collect();
     log::warn!(
-        "present key seq={} requested={}:{}x{} resolved={}:{}x{} candidates=[{}] ALL=[{}]",
+        "present key seq={} requested={} resolved={} candidates=[{}] ALL=[{}]",
         seq,
-        requested_key.nvmap_id,
-        requested_key.width,
-        requested_key.height,
-        key.nvmap_id,
-        key.width,
-        key.height,
+        requested_key.label(),
+        key.label(),
         candidates.join(", "),
         all.join(", ")
     );
@@ -3195,11 +3211,9 @@ fn trace_rt_stats(
                     })
                     .unwrap_or_else(|| "-".to_string());
                 log::warn!(
-                    "[rt-stats] seq={} key={}:{}x{} stamp={} rgbnz={}/{} ({:.2}%) anz={} avg_rgb={:.2} avg_a={:.2} max={} bbox={} first={}",
+                    "[rt-stats] seq={} key={} stamp={} rgbnz={}/{} ({:.2}%) anz={} avg_rgb={:.2} avg_a={:.2} max={} bbox={} first={}",
                     seq,
-                    key.nvmap_id,
-                    key.width,
-                    key.height,
+                    key.label(),
                     stamp,
                     stats.rgb_nonzero,
                     stats.pixels,
@@ -3214,11 +3228,9 @@ fn trace_rt_stats(
             }
             None => {
                 log::warn!(
-                    "[rt-stats] seq={} key={}:{}x{} stamp={} readback=failed",
+                    "[rt-stats] seq={} key={} stamp={} readback=failed",
                     seq,
-                    key.nvmap_id,
-                    key.width,
-                    key.height,
+                    key.label(),
                     stamp
                 );
             }
@@ -3281,11 +3293,17 @@ fn push_unique_rt_key(keys: &mut Vec<RtKey>, key: RtKey) {
 fn parse_rt_key(s: &str) -> Option<RtKey> {
     let (nvmap, dims) = s.split_once(':')?;
     let (width, height) = dims.split_once('x')?;
-    Some(RtKey {
-        nvmap_id: parse_u64_value(nvmap)? as u32,
-        width: parse_u64_value(width)? as u32,
-        height: parse_u64_value(height)? as u32,
-    })
+    let (height, gpu_va) = if let Some((height, addr)) = height.split_once('@') {
+        (height, parse_u64_value(addr)?)
+    } else {
+        (height, 0)
+    };
+    Some(RtKey::new(
+        parse_u64_value(nvmap)? as u32,
+        parse_u64_value(width)? as u32,
+        parse_u64_value(height)? as u32,
+        gpu_va,
+    ))
 }
 
 fn parse_u64_value(s: &str) -> Option<u64> {
@@ -3295,6 +3313,65 @@ fn parse_u64_value(s: &str) -> Option<u64> {
     } else {
         t.parse().ok()
     }
+}
+
+fn trace_rt_stamp(stamp: u64, rt_key: RtKey, calls: &[&crate::draw::Maxwell3dDrawCall]) {
+    if std::env::var_os("NEXIUM_RT_STAMP_DBG").is_none() {
+        return;
+    }
+    let start = std::env::var("NEXIUM_RT_STAMP_START")
+        .ok()
+        .and_then(|s| parse_u64_value(&s))
+        .unwrap_or(0);
+    let end = std::env::var("NEXIUM_RT_STAMP_END")
+        .ok()
+        .and_then(|s| parse_u64_value(&s))
+        .unwrap_or(u64::MAX);
+    if stamp < start || stamp > end {
+        return;
+    }
+    let mut parts = Vec::new();
+    for (i, call) in calls.iter().take(24).enumerate() {
+        let sampled = call
+            .sampled_rt_slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, key)| key.map(|k| format!("s{}={}", slot, k.label())))
+            .collect::<Vec<_>>()
+            .join(",");
+        let vp = match call.vp_rect {
+            Some([x, y, w, h]) => format!("{},{},{}x{}", x, y, w, h),
+            None => "full".to_string(),
+        };
+        let sc = match call.scissor {
+            Some([x, y, w, h]) => format!("{},{},{}x{}", x, y, w, h),
+            None => "full".to_string(),
+        };
+        parts.push(format!(
+            "{}:vs={:#x} fs={:#x} topo={} v={} i={} tex={:?} sampled=[{}] blend={} cw={:#x} depth={}/{} vp={} sc={}",
+            i,
+            call.vs_gpu_va,
+            call.fs_gpu_va,
+            call.state.topology.as_raw(),
+            call.state.vertex_count,
+            call.state.index_count,
+            call.fs_tex_ids,
+            sampled,
+            call.blend.enabled,
+            call.blend.color_write_mask.as_raw(),
+            call.depth.test_enabled,
+            call.depth.write_enabled,
+            vp,
+            sc
+        ));
+    }
+    log::warn!(
+        "[rt-stamp] stamp={} rt={} calls={} {}",
+        stamp,
+        rt_key.label(),
+        calls.len(),
+        parts.join(" | ")
+    );
 }
 
 fn read_rt_image_stats(
@@ -3548,6 +3625,7 @@ fn collect_tex_pendings<F>(
 where
     F: Fn(u64, usize) -> Option<Vec<u8>>,
 {
+    let shader_arrayed = call.fs_sampler_arrayed;
     call.fs_tex_ids
         .iter()
         .take(max_texture_descriptors())
@@ -3559,7 +3637,8 @@ where
             read_guest(tic_addr, 32).and_then(|tic_raw| {
                 crate::texture::TicEntry::parse(&tic_raw).map(|tic| {
                     let pitch_size = tic.format.linear_size(tic.width, tic.height);
-                    let layers = tic_layer_count(&tic);
+                    let arrayed = shader_arrayed;
+                    let layers = if arrayed { tic_layer_count(&tic) } else { 1 };
                     let read_size =
                         tic_layer_read_size(&tic, pitch_size).saturating_mul(layers as usize);
                     let key = TexCacheKey {
@@ -3567,9 +3646,9 @@ where
                         width: tic.width,
                         height: tic.height,
                         layers,
-                        base_layer: tic_view_base_layer(&tic),
-                        view_layers: tic_view_layer_count(&tic),
-                        arrayed: tic_is_arrayed(&tic),
+                        base_layer: if arrayed { tic_view_base_layer(&tic) } else { 0 },
+                        view_layers: if arrayed { tic_view_layer_count(&tic) } else { 1 },
+                        arrayed,
                         format: tic.format,
                         swizzle: tic.swizzle,
                     };
@@ -3609,23 +3688,73 @@ fn sampled_rt_key_for_slot(call: &crate::draw::Maxwell3dDrawCall, slot: usize) -
         .or_else(|| if slot == 0 { call.sampled_rt_key } else { None })
 }
 
+fn call_samples_rt(call: &crate::draw::Maxwell3dDrawCall, rt_key: RtKey) -> bool {
+    call.sampled_rt_key == Some(rt_key)
+        || call.sampled_rt_keys.contains(&rt_key)
+        || call
+            .sampled_rt_slots
+            .iter()
+            .any(|slot| *slot == Some(rt_key))
+}
+
 fn rt_alias_for_slot(
     rt_cache: &RtCache,
     call: &crate::draw::Maxwell3dDrawCall,
     slot: usize,
     rt_key: RtKey,
+    allow_self: bool,
 ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
-    sampled_rt_key_for_slot(call, slot)
-        .and_then(|sk| {
-            rt_cache.find_color(sk).or_else(|| {
-                if call.sampled_rt_fuzzy {
-                    rt_cache.find_color_screen(sk)
-                } else {
-                    None
-                }
-            })
-        })
-        .filter(|(k, _, _, _)| *k != rt_key)
+    let sk = sampled_rt_key_for_slot(call, slot)?;
+    let found = rt_cache.find_color(sk).or_else(|| {
+        if call.sampled_rt_fuzzy {
+            rt_cache.find_color_screen(sk)
+        } else {
+            None
+        }
+    });
+    let found_key = found.as_ref().map(|(k, _, _, _)| *k);
+    let filtered = found.filter(|(k, _, _, _)| allow_self || *k != rt_key);
+    trace_rt_alias(slot, rt_key, sk, found_key, filtered.is_some(), call.sampled_rt_fuzzy);
+    filtered
+}
+
+fn trace_rt_alias(
+    slot: usize,
+    dst: RtKey,
+    src: RtKey,
+    found: Option<RtKey>,
+    used: bool,
+    fuzzy: bool,
+) {
+    if std::env::var_os("NEXIUM_RT_ALIAS_DBG").is_none() {
+        return;
+    }
+    if src.width < 512 || src.height < 256 {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let limit = std::env::var("NEXIUM_RT_ALIAS_LIMIT")
+        .ok()
+        .and_then(|v| parse_u64_value(&v))
+        .unwrap_or(300);
+    if n >= limit {
+        return;
+    }
+    let found = found
+        .map(|k| k.label())
+        .unwrap_or_else(|| "-".to_string());
+    log::warn!(
+        "[rt-alias] #{} slot={} dst={} src={} found={} used={} fuzzy={}",
+        n,
+        slot,
+        dst.label(),
+        src.label(),
+        found,
+        used,
+        fuzzy
+    );
 }
 
 fn ring_wrap_other(
@@ -3742,7 +3871,8 @@ fn create_ubo_ring(
         size,
         usage: vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::UNIFORM_BUFFER
-            | vk::BufferUsageFlags::INDEX_BUFFER,
+            | vk::BufferUsageFlags::INDEX_BUFFER
+            | vk::BufferUsageFlags::STORAGE_BUFFER,
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         queue_family_index_count: 0,
         p_queue_family_indices: std::ptr::null(),
