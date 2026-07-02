@@ -583,6 +583,8 @@ fn submit_draw_batch_async(
                         };
                         let layer_count = if tic.texture_type == 5 {
                             tic.base_layer.saturating_add(tic.depth).max(1)
+                        } else if tic.texture_type == 2 {
+                            tic.depth.max(1)
                         } else {
                             1
                         };
@@ -994,6 +996,20 @@ fn execute_one(
                 );
             }
 
+            if let Ok(want) = std::env::var("NEXIUM_DUMP_FS") {
+                let want_addr = u64::from_str_radix(want.trim_start_matches("0x"), 16).ok();
+                if want_addr == Some(fs_addr) {
+                    let fs_dis = nexium_shader::disassemble(&fs_sass)
+                        .into_iter()
+                        .map(|line| line.to_string_compact())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let _ = std::fs::write(
+                        format!("C:/Users/Mythrax/Desktop/target_fs_{:x}.txt", fs_addr),
+                        &fs_dis,
+                    );
+                }
+            }
             if let Ok(want) = std::env::var("NEXIUM_DUMP_VS") {
                 let want_addr = u64::from_str_radix(want.trim_start_matches("0x"), 16).ok();
                 if want_addr == Some(vs_addr) {

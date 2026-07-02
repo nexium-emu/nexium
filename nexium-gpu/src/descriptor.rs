@@ -3,6 +3,7 @@ use ash::vk;
 pub const MAX_TEXTURE_DESCRIPTORS: u32 = 32;
 pub const SSBO_BINDING_BASE: u32 = 3;
 pub const MAX_SSBO: u32 = 8;
+pub const IMAGE3D_BINDING: u32 = 11;
 
 pub struct DescriptorSetLayout {
     pub layout: vk::DescriptorSetLayout,
@@ -50,6 +51,14 @@ impl DescriptorSetLayout {
                 _marker: std::marker::PhantomData,
             });
         }
+        bindings.push(vk::DescriptorSetLayoutBinding {
+            binding: IMAGE3D_BINDING,
+            descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+            descriptor_count: MAX_TEXTURE_DESCRIPTORS,
+            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            p_immutable_samplers: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        });
 
         let layout_info = vk::DescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -79,7 +88,7 @@ impl DescriptorPool {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: max_sets.saturating_mul(MAX_TEXTURE_DESCRIPTORS),
+                descriptor_count: max_sets.saturating_mul(MAX_TEXTURE_DESCRIPTORS * 2),
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,

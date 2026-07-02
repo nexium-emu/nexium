@@ -29,6 +29,7 @@ struct RendererInner {
     pipeline_cache: PipelineCache,
     dummy_white: Option<DummyImage>,
     dummy_white_array: Option<DummyImage>,
+    dummy_white_3d: Option<DummyImage>,
     default_sampler: Option<vk::Sampler>,
     sampler_cache: HashMap<crate::texture::TscEntry, vk::Sampler>,
     tex_cache: HashMap<TexCacheKey, CachedTexture>,
@@ -56,6 +57,7 @@ struct TexCacheKey {
     base_layer: u32,
     view_layers: u32,
     arrayed: bool,
+    volume: bool,
     format: crate::texture::TicFormat,
     swizzle: [crate::texture::SwizzleSource; 4],
 }
@@ -485,6 +487,7 @@ impl Renderer {
                 pipeline_cache,
                 dummy_white: None,
                 dummy_white_array: None,
+                dummy_white_3d: None,
                 default_sampler: None,
                 sampler_cache: HashMap::new(),
                 tex_cache: HashMap::new(),
@@ -1571,6 +1574,7 @@ impl Renderer {
             pipeline_cache,
             dummy_white,
             dummy_white_array,
+            dummy_white_3d,
             default_sampler,
             sampler_cache,
             tex_cache,
@@ -1621,12 +1625,17 @@ impl Renderer {
 
         if dummy_white.is_none() {
             *dummy_white = Some(create_dummy_white_image(
-                device, *queue, *cmd_pool, mem_props, false,
+                device, *queue, *cmd_pool, mem_props, false, false,
             )?);
         }
         if dummy_white_array.is_none() {
             *dummy_white_array = Some(create_dummy_white_image(
-                device, *queue, *cmd_pool, mem_props, true,
+                device, *queue, *cmd_pool, mem_props, true, false,
+            )?);
+        }
+        if dummy_white_3d.is_none() {
+            *dummy_white_3d = Some(create_dummy_white_image(
+                device, *queue, *cmd_pool, mem_props, false, true,
             )?);
         }
         if default_sampler.is_none() {
@@ -1634,6 +1643,7 @@ impl Renderer {
         }
         let dummy_view = dummy_white.as_ref().unwrap().view;
         let dummy_array_view = dummy_white_array.as_ref().unwrap().view;
+        let dummy_3d_view = dummy_white_3d.as_ref().unwrap().view;
         let shader_arrayed = call.fs_sampler_arrayed;
         let fallback_view = if shader_arrayed {
             dummy_array_view
@@ -1646,10 +1656,14 @@ impl Renderer {
             .map(|slot| rt_alias_for_slot(rt_cache, call, slot, call.rt_key, false))
             .collect();
         let mut bound_tex_views = vec![fallback_view; max_texture_descriptors()];
+        let mut bound_tex_views_3d = vec![dummy_3d_view; max_texture_descriptors()];
         for (slot, pending) in tex_pendings.iter().enumerate() {
-            if let Some((_, _, alias_view, _)) = rt_aliases.get(slot).copied().flatten() {
-                bound_tex_views[slot] = alias_view;
-                continue;
+            let pending_volume = pending.map_or(false, |(k, _, _, _)| k.volume);
+            if !pending_volume {
+                if let Some((_, _, alias_view, _)) = rt_aliases.get(slot).copied().flatten() {
+                    bound_tex_views[slot] = alias_view;
+                    continue;
+                }
             }
             let Some((key, tic, pitch_size, read_size)) = *pending else {
                 continue;
@@ -1684,6 +1698,7 @@ impl Renderer {
                         key.base_layer,
                         key.view_layers,
                         key.arrayed,
+                        key.volume,
                         &rgba8,
                         tic.swizzle,
                         tex_hash,
@@ -1698,7 +1713,13 @@ impl Renderer {
                     }
                 }
             }
-            bound_tex_views[slot] = tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
+            if key.volume {
+                bound_tex_views_3d[slot] =
+                    tex_cache.get(&key).map(|t| t.view).unwrap_or(dummy_3d_view);
+            } else {
+                bound_tex_views[slot] =
+                    tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
+            }
         }
         let mut bound_samplers = vec![default_samp; max_texture_descriptors()];
         for (slot, tsc) in tsc_entries.iter().enumerate() {
@@ -1850,6 +1871,14 @@ impl Renderer {
                 image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             })
             .collect();
+        let image_infos_3d: Vec<vk::DescriptorImageInfo> = bound_tex_views_3d
+            .iter()
+            .map(|view| vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view: *view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            })
+            .collect();
         let sampler_infos: Vec<vk::DescriptorImageInfo> = bound_samplers
             .iter()
             .map(|sampler| vk::DescriptorImageInfo {
@@ -1961,6 +1990,19 @@ impl Renderer {
                 _marker: std::marker::PhantomData,
             });
         }
+        writes.push(vk::WriteDescriptorSet {
+            s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+            dst_set: dset,
+            dst_binding: crate::descriptor::IMAGE3D_BINDING,
+            dst_array_element: 0,
+            descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
+            descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+            p_image_info: image_infos_3d.as_ptr(),
+            p_buffer_info: std::ptr::null(),
+            p_texel_buffer_view: std::ptr::null(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        });
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
         let rt = rt_cache.get_or_create(call.rt_key, device)?;
@@ -2362,6 +2404,7 @@ impl Renderer {
             pipeline_cache,
             dummy_white,
             dummy_white_array,
+            dummy_white_3d,
             default_sampler,
             sampler_cache,
             tex_cache,
@@ -2407,12 +2450,17 @@ impl Renderer {
         }
         if dummy_white.is_none() {
             *dummy_white = Some(create_dummy_white_image(
-                device, *queue, *cmd_pool, mem_props, false,
+                device, *queue, *cmd_pool, mem_props, false, false,
             )?);
         }
         if dummy_white_array.is_none() {
             *dummy_white_array = Some(create_dummy_white_image(
-                device, *queue, *cmd_pool, mem_props, true,
+                device, *queue, *cmd_pool, mem_props, true, false,
+            )?);
+        }
+        if dummy_white_3d.is_none() {
+            *dummy_white_3d = Some(create_dummy_white_image(
+                device, *queue, *cmd_pool, mem_props, false, true,
             )?);
         }
         if default_sampler.is_none() {
@@ -2420,6 +2468,7 @@ impl Renderer {
         }
         let dummy_view = dummy_white.as_ref().unwrap().view;
         let dummy_array_view = dummy_white_array.as_ref().unwrap().view;
+        let dummy_3d_view = dummy_white_3d.as_ref().unwrap().view;
         let default_samp = default_sampler.unwrap();
 
         let rt_key = calls[0].rt_key;
@@ -2515,15 +2564,19 @@ impl Renderer {
                 dummy_view
             };
             let mut bound_tex_views = vec![fallback_view; max_texture_descriptors()];
+            let mut bound_tex_views_3d = vec![dummy_3d_view; max_texture_descriptors()];
             let mut bound_tex_layouts =
                 vec![vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL; max_texture_descriptors()];
             for (slot, pending) in prep.tex_pendings.iter().enumerate() {
-                if let Some((_, _, alias_view, _)) = rt_aliases.get(slot).copied().flatten() {
-                    bound_tex_views[slot] = alias_view;
-                    if sampled_rt_key_for_slot(call, slot) == Some(rt_key) {
-                        bound_tex_layouts[slot] = required_rt_layout;
+                let pending_volume = pending.map_or(false, |(k, _, _, _)| k.volume);
+                if !pending_volume {
+                    if let Some((_, _, alias_view, _)) = rt_aliases.get(slot).copied().flatten() {
+                        bound_tex_views[slot] = alias_view;
+                        if sampled_rt_key_for_slot(call, slot) == Some(rt_key) {
+                            bound_tex_layouts[slot] = required_rt_layout;
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 let Some((key, tic, pitch_size, read_size)) = *pending else {
                     continue;
@@ -2574,11 +2627,12 @@ impl Renderer {
                                 }
                                 let n = (rgba8.len() / 4).max(1) as u64;
                                 log::warn!(
-                                    "TEXDUMP va={:#x} {}x{} fmt={:?} bl={} bh_log2={} read_size={} pitch_size={} pitchdst={} avg=({},{},{},{}) a=[{}..{}]",
+                                    "TEXDUMP va={:#x} {}x{} fmt={:?} bl={} bh_log2={} read_size={} pitch_size={} pitchdst={} avg=({},{},{},{}) a=[{}..{}] raw16={:02x?}",
                                     tic.gpu_va, tic.width, tic.height, tic.format,
                                     tic.is_block_linear, tic.block_height_log2, read_size, pitch_size,
                                     crate::pitch_oracle::is_pitch_dst(tic.gpu_va),
                                     sr / n, sg / n, sb / n, sa / n, amin, amax,
+                                    &raw[..16.min(raw.len())],
                                 );
                             }
                         }
@@ -2611,6 +2665,7 @@ impl Renderer {
                             key.base_layer,
                             key.view_layers,
                             key.arrayed,
+                            key.volume,
                             &rgba8,
                             tic.swizzle,
                             tex_hash,
@@ -2626,8 +2681,13 @@ impl Renderer {
                         }
                     }
                 }
-                bound_tex_views[slot] =
-                    tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
+                if key.volume {
+                    bound_tex_views_3d[slot] =
+                        tex_cache.get(&key).map(|t| t.view).unwrap_or(dummy_3d_view);
+                } else {
+                    bound_tex_views[slot] =
+                        tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
+                }
             }
 
             let vertex_bind: Option<(vk::Buffer, u64)> = if !prep.vertex_data.is_empty() {
@@ -2751,6 +2811,14 @@ impl Renderer {
                     sampler: vk::Sampler::null(),
                     image_view: *view,
                     image_layout: *layout,
+                })
+                .collect();
+            let image_infos_3d: Vec<vk::DescriptorImageInfo> = bound_tex_views_3d
+                .iter()
+                .map(|view| vk::DescriptorImageInfo {
+                    sampler: vk::Sampler::null(),
+                    image_view: *view,
+                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 })
                 .collect();
             let mut bound_samplers = vec![default_samp; max_texture_descriptors()];
@@ -2883,6 +2951,19 @@ impl Renderer {
                     _marker: std::marker::PhantomData,
                 });
             }
+            writes.push(vk::WriteDescriptorSet {
+                s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                dst_set: dset,
+                dst_binding: crate::descriptor::IMAGE3D_BINDING,
+                dst_array_element: 0,
+                descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                p_image_info: image_infos_3d.as_ptr(),
+                p_buffer_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+                p_next: std::ptr::null(),
+                _marker: std::marker::PhantomData,
+            });
             unsafe {
                 device.update_descriptor_sets(&writes, &[]);
             }
@@ -3540,9 +3621,15 @@ fn tic_is_arrayed(tic: &crate::texture::TicEntry) -> bool {
     tic.texture_type == 5
 }
 
+fn tic_is_volume(tic: &crate::texture::TicEntry) -> bool {
+    tic.texture_type == 2
+}
+
 fn tic_layer_count(tic: &crate::texture::TicEntry) -> u32 {
     if tic_is_arrayed(tic) {
         tic.base_layer.saturating_add(tic.depth).max(1)
+    } else if tic_is_volume(tic) {
+        tic.depth.max(1)
     } else {
         1
     }
@@ -3637,8 +3724,13 @@ where
             read_guest(tic_addr, 32).and_then(|tic_raw| {
                 crate::texture::TicEntry::parse(&tic_raw).map(|tic| {
                     let pitch_size = tic.format.linear_size(tic.width, tic.height);
-                    let arrayed = shader_arrayed;
-                    let layers = if arrayed { tic_layer_count(&tic) } else { 1 };
+                    let volume = tic_is_volume(&tic);
+                    let arrayed = shader_arrayed && !volume;
+                    let layers = if arrayed || volume {
+                        tic_layer_count(&tic)
+                    } else {
+                        1
+                    };
                     let read_size =
                         tic_layer_read_size(&tic, pitch_size).saturating_mul(layers as usize);
                     let key = TexCacheKey {
@@ -3649,6 +3741,7 @@ where
                         base_layer: if arrayed { tic_view_base_layer(&tic) } else { 0 },
                         view_layers: if arrayed { tic_view_layer_count(&tic) } else { 1 },
                         arrayed,
+                        volume,
                         format: tic.format,
                         swizzle: tic.swizzle,
                     };
@@ -4030,6 +4123,7 @@ fn upload_texture_oneshot(
     base_layer: u32,
     view_layers: u32,
     arrayed: bool,
+    volume: bool,
     rgba8: &[u8],
     swizzle: [crate::texture::SwizzleSource; 4],
     hash: u64,
@@ -4047,6 +4141,7 @@ fn upload_texture_oneshot(
         base_layer,
         view_layers,
         arrayed,
+        volume,
         rgba8,
         swizzle,
         hash,
@@ -4183,6 +4278,7 @@ fn create_texture_image(
     base_layer: u32,
     view_layers: u32,
     arrayed: bool,
+    volume: bool,
     rgba8: &[u8],
     swizzle: [crate::texture::SwizzleSource; 4],
     hash: u64,
@@ -4202,15 +4298,19 @@ fn create_texture_image(
     };
     let img_info = vk::ImageCreateInfo {
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
-        image_type: vk::ImageType::TYPE_2D,
+        image_type: if volume {
+            vk::ImageType::TYPE_3D
+        } else {
+            vk::ImageType::TYPE_2D
+        },
         format,
         extent: vk::Extent3D {
             width,
             height,
-            depth: 1,
+            depth: if volume { layers } else { 1 },
         },
         mip_levels: 1,
-        array_layers: layers,
+        array_layers: if volume { 1 } else { layers },
         samples: vk::SampleCountFlags::TYPE_1,
         tiling: vk::ImageTiling::OPTIMAL,
         usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
@@ -4269,13 +4369,13 @@ fn create_texture_image(
             aspect_mask: vk::ImageAspectFlags::COLOR,
             mip_level: 0,
             base_array_layer: 0,
-            layer_count: layers,
+            layer_count: if volume { 1 } else { layers },
         },
         image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
         image_extent: vk::Extent3D {
             width,
             height,
-            depth: 1,
+            depth: if volume { layers } else { 1 },
         },
     };
     unsafe {
@@ -4298,7 +4398,9 @@ fn create_texture_image(
     let view_info = vk::ImageViewCreateInfo {
         s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
         image,
-        view_type: if arrayed {
+        view_type: if volume {
+            vk::ImageViewType::TYPE_3D
+        } else if arrayed {
             vk::ImageViewType::TYPE_2D_ARRAY
         } else {
             vk::ImageViewType::TYPE_2D
@@ -4308,8 +4410,8 @@ fn create_texture_image(
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
             level_count: 1,
-            base_array_layer: view_base_layer,
-            layer_count: view_layer_count,
+            base_array_layer: if volume { 0 } else { view_base_layer },
+            layer_count: if volume { 1 } else { view_layer_count },
         },
         components: texture_component_mapping(swizzle),
         p_next: std::ptr::null(),
@@ -4361,11 +4463,16 @@ fn create_dummy_white_image(
     cmd_pool: vk::CommandPool,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     arrayed: bool,
+    volume: bool,
 ) -> Result<DummyImage, String> {
     let format = vk::Format::R8G8B8A8_UNORM;
     let img_info = vk::ImageCreateInfo {
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
-        image_type: vk::ImageType::TYPE_2D,
+        image_type: if volume {
+            vk::ImageType::TYPE_3D
+        } else {
+            vk::ImageType::TYPE_2D
+        },
         format,
         extent: vk::Extent3D {
             width: 1,
@@ -4476,7 +4583,9 @@ fn create_dummy_white_image(
     let view_info = vk::ImageViewCreateInfo {
         s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
         image,
-        view_type: if arrayed {
+        view_type: if volume {
+            vk::ImageViewType::TYPE_3D
+        } else if arrayed {
             vk::ImageViewType::TYPE_2D_ARRAY
         } else {
             vk::ImageViewType::TYPE_2D
@@ -4977,6 +5086,13 @@ impl Drop for RendererInner {
             }
         }
         if let Some(d) = self.dummy_white_array.take() {
+            unsafe {
+                self.device.destroy_image_view(d.view, None);
+                self.device.destroy_image(d.image, None);
+                self.device.free_memory(d.memory, None);
+            }
+        }
+        if let Some(d) = self.dummy_white_3d.take() {
             unsafe {
                 self.device.destroy_image_view(d.view, None);
                 self.device.destroy_image(d.image, None);
