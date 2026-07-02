@@ -78,6 +78,9 @@ fn tic_can_alias_render_target(format: nexium_gpu::texture::TicFormat) -> bool {
             | nexium_gpu::texture::TicFormat::R8G8
             | nexium_gpu::texture::TicFormat::R16
             | nexium_gpu::texture::TicFormat::R16G16
+            | nexium_gpu::texture::TicFormat::B10G11R11
+            | nexium_gpu::texture::TicFormat::Unknown(3)
+            | nexium_gpu::texture::TicFormat::Unknown(47)
     )
 }
 
@@ -235,6 +238,7 @@ struct DrawTextureJob {
     nvmap_id: u32,
     width: u32,
     height: u32,
+    gpu_va: u64,
     dst_x: f32,
     dst_y: f32,
     dst_width: f32,
@@ -338,6 +342,7 @@ fn prepare_draw_texture_job(
         nvmap_id,
         width: rt.width,
         height: rt.height,
+        gpu_va: rt_gpu_va,
         dst_x: dt.dst_x,
         dst_y: dt.dst_y,
         dst_width: dt.dst_width,
@@ -386,7 +391,7 @@ fn execute_draw_texture_job(
     job: &DrawTextureJob,
 ) -> Result<(), String> {
     let mut dst = renderer
-        .readback_target(job.nvmap_id, job.width, job.height)
+        .readback_target_at(job.nvmap_id, job.width, job.height, job.gpu_va)
         .unwrap_or_else(|| {
             vec![
                 0;
@@ -455,7 +460,7 @@ fn execute_draw_texture_job(
             dst[dst_off + 3] = (sa + (da * inv + 127) / 255).min(255) as u8;
         }
     }
-    renderer.upload_target_rgba(job.nvmap_id, job.width, job.height, &dst)
+    renderer.upload_target_rgba(job.nvmap_id, job.width, job.height, job.gpu_va, &dst)
 }
 
 fn snapshot_read_once(
@@ -652,6 +657,7 @@ struct ShaderBundle {
     fs_cbuf_mask: u32,
     fs_hash: u64,
     fs_tex_ids: Vec<u32>,
+    fs_sampler_arrayed: bool,
     fs_cbuf_reads: Vec<(u32, u32)>,
     cbuf_used: u32,
     ssbo_descs: Vec<nexium_shader::StorageBufferAddr>,
@@ -659,22 +665,25 @@ struct ShaderBundle {
 
 #[allow(clippy::type_complexity)]
 fn shader_bundle_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<(u64, u64, u32, u32, u32, u32), std::sync::Arc<ShaderBundle>>,
+    std::collections::HashMap<(u64, u64, u32, u32, u32, u32, u32), std::sync::Arc<ShaderBundle>>,
 > {
     use std::sync::OnceLock;
     static CACHE: OnceLock<
         std::sync::Mutex<
-            std::collections::HashMap<(u64, u64, u32, u32, u32, u32), std::sync::Arc<ShaderBundle>>,
+            std::collections::HashMap<
+                (u64, u64, u32, u32, u32, u32, u32),
+                std::sync::Arc<ShaderBundle>,
+            >,
         >,
     > = OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 fn shader_failed_set(
-) -> &'static std::sync::Mutex<std::collections::HashSet<(u64, u64, u32, u32, u32, u32)>> {
+) -> &'static std::sync::Mutex<std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32)>> {
     use std::sync::OnceLock;
     static FAILED: OnceLock<
-        std::sync::Mutex<std::collections::HashSet<(u64, u64, u32, u32, u32, u32)>>,
+        std::sync::Mutex<std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32)>>,
     > = OnceLock::new();
     FAILED.get_or_init(|| {
         // Silence the default panic hook for shader-emit panics we catch_unwind,
@@ -734,11 +743,7 @@ fn execute_one(
     let nvmap_id = mappings
         .nvmap_id_for(rt_gpu_va)
         .ok_or_else(|| format!("RT gpu_va={:#x} not mapped", rt_gpu_va))?;
-    let rt_key = RtKey {
-        nvmap_id,
-        width: rt.width,
-        height: rt.height,
-    };
+    let rt_key = RtKey::new(nvmap_id, rt.width, rt.height, rt_gpu_va);
     let no_depth = depth_disabled();
 
     if draw.is_clear {
@@ -775,25 +780,25 @@ fn execute_one(
             rt_thread.submit(Box::new(move || {
                 if want_color_clear {
                     if let Some(rect) = clear_scissor {
-                        let _ = r.clear_target_rect(nvmap_id, w, h, color, rect);
+                        let _ = r.clear_target_rect(nvmap_id, w, h, rt_gpu_va, color, rect);
                     } else {
-                        let _ = r.clear_target(nvmap_id, w, h, color);
+                        let _ = r.clear_target(nvmap_id, w, h, rt_gpu_va, color);
                     }
                 }
                 if do_depth {
-                    let _ = r.clear_depth(nvmap_id, w, h, cdepth);
+                    let _ = r.clear_depth(nvmap_id, w, h, rt_gpu_va, cdepth);
                 }
             }));
         } else {
             if want_color_clear {
                 if let Some(rect) = clear_scissor {
-                    renderer.clear_target_rect(nvmap_id, rt.width, rt.height, color, rect)?;
+                    renderer.clear_target_rect(nvmap_id, rt.width, rt.height, rt_gpu_va, color, rect)?;
                 } else {
-                    renderer.clear_target(nvmap_id, rt.width, rt.height, color)?;
+                    renderer.clear_target(nvmap_id, rt.width, rt.height, rt_gpu_va, color)?;
                 }
             }
             if do_depth {
-                renderer.clear_depth(nvmap_id, rt.width, rt.height, draw.clear_depth)?;
+                renderer.clear_depth(nvmap_id, rt.width, rt.height, rt_gpu_va, draw.clear_depth)?;
             }
         }
         return Ok(None);
@@ -813,11 +818,12 @@ fn execute_one(
     let vs_addr = program_region.wrapping_add(vs_prog.address_lo as u64);
     let fs_addr = program_region.wrapping_add(fs_prog.address_lo as u64);
 
-    let (vptx_scale_z, vptx_translate_z) = if !no_depth && draw.viewport.scale_z != 0.0 {
-        (draw.viewport.scale_z, draw.viewport.translate_z)
-    } else {
-        (1.0, 0.0)
-    };
+    let (vptx_scale_z, vptx_translate_z) =
+        if draw.viewport.scale_z != 0.0 || draw.viewport.translate_z != 0.0 {
+            (draw.viewport.scale_z, draw.viewport.translate_z)
+        } else {
+            (1.0, 0.0)
+        };
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static LOGGED: AtomicBool = AtomicBool::new(false);
@@ -854,6 +860,19 @@ fn execute_one(
     } else {
         0
     };
+    let mut int_attr_mask: u32 = 0;
+    for (loc, attrib) in draw.vertex_attribs.iter().enumerate() {
+        if attrib.format == 0 || attrib.constant || loc >= 32 {
+            continue;
+        }
+        let size = attrib.format & 0x3F;
+        let type_ = attrib.format >> 6;
+        let is_int = type_ == 3 || type_ == 4;
+        let is_32bit = matches!(size, 0x01 | 0x02 | 0x04 | 0x12);
+        if is_int && !is_32bit {
+            int_attr_mask |= 1 << loc;
+        }
+    }
     let shader_key = (
         vs_addr,
         fs_addr,
@@ -861,6 +880,7 @@ fn execute_one(
         vptx_translate_z.to_bits(),
         ps_key,
         win_key,
+        int_attr_mask,
     );
     if shader_failed_set().lock().unwrap().contains(&shader_key) {
         return Err("shader previously failed to emit".to_string());
@@ -922,9 +942,9 @@ fn execute_one(
                 );
             }
 
-            let (fs_spirv, fs_cbuf_mask, mut fs_tex_ids, fs_cbuf_used) =
+            let (fs_spirv, fs_cbuf_mask, mut fs_tex_ids, fs_cbuf_used, fs_sampler_arrayed) =
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    nexium_spirv::emit_fragment_full_with_input_map(&fs_cfg, fs_input_map)
+                    nexium_spirv::emit_fragment_full_with_input_map_meta(&fs_cfg, fs_input_map)
                 })) {
                     Ok(v) => v,
                     Err(panic) => {
@@ -974,6 +994,29 @@ fn execute_one(
                 );
             }
 
+            if let Ok(want) = std::env::var("NEXIUM_DUMP_VS") {
+                let want_addr = u64::from_str_radix(want.trim_start_matches("0x"), 16).ok();
+                if want_addr == Some(vs_addr) {
+                    let vs_dis = nexium_shader::disassemble(&vs_sass)
+                        .into_iter()
+                        .map(|line| line.to_string_compact())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let _ = std::fs::write(
+                        format!("C:/Users/Mythrax/Desktop/target_vs_{:x}.txt", vs_addr),
+                        &vs_dis,
+                    );
+                    log::warn!(
+                        "[dump-vs] vs={:#x} vp_scale_z={} vp_translate_z={} applied={}/{} vp_en={}",
+                        vs_addr,
+                        draw.viewport.scale_z,
+                        draw.viewport.translate_z,
+                        vptx_scale_z,
+                        vptx_translate_z,
+                        draw.viewport_transform_en
+                    );
+                }
+            }
             let required_outputs = nexium_spirv::scan_input_locations(&fs_spirv);
             let (vs_spirv, vs_cbuf_mask, vs_cbuf_used) =
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -990,6 +1033,7 @@ fn execute_one(
                             },
                             window_ndc,
                             num_ssbo,
+                            int_attr_mask,
                             ..Default::default()
                         },
                     )
@@ -1016,6 +1060,7 @@ fn execute_one(
                 fs_cbuf_mask,
                 fs_hash,
                 fs_tex_ids,
+                fs_sampler_arrayed,
                 fs_cbuf_reads,
                 cbuf_used: vs_cbuf_used.max(fs_cbuf_used),
                 ssbo_descs,
@@ -1098,6 +1143,7 @@ fn execute_one(
     let vs_cbuf_mask = bundle.vs_cbuf_mask;
     let fs_cbuf_mask = bundle.fs_cbuf_mask;
     let mut fs_tex_ids = bundle.fs_tex_ids.clone();
+    let fs_sampler_arrayed = bundle.fs_sampler_arrayed;
 
     let layout = build_vertex_layout(draw)?;
     let topology = map_topology(draw.topology)
@@ -1288,11 +1334,7 @@ fn execute_one(
             let Some(nv) = mappings.nvmap_id_for(tic.gpu_va) else {
                 continue;
             };
-            let key = RtKey {
-                nvmap_id: nv,
-                width: tic.width,
-                height: tic.height,
-            };
+            let key = RtKey::new(nv, tic.width, tic.height, tic.gpu_va);
             sampled_rt_slots[slot] = Some(key);
             if !sampled_rt_keys.contains(&key) {
                 sampled_rt_keys.push(key);
@@ -1773,6 +1815,8 @@ fn execute_one(
     let call = Maxwell3dDrawCall {
         vs_spirv,
         fs_spirv,
+        vs_gpu_va: vs_addr,
+        fs_gpu_va: fs_addr,
         vs_hash: bundle.vs_hash,
         fs_hash: bundle.fs_hash,
         vs_cbuf_mask,
@@ -1821,6 +1865,7 @@ fn execute_one(
         tsc_pool_gpu_va: draw.tsc_pool_gpu_va,
         tsc_pool_limit: draw.tsc_pool_limit,
         fs_sampler_ids,
+        fs_sampler_arrayed,
         cull_test_enable: draw.cull_test_enable,
         cull_face: draw.cull_face,
         front_face: if draw.window_origin.flip_y() {
@@ -2474,6 +2519,7 @@ fn trace_menu_draw(
     if logged >= menu_draw_dbg_limit() {
         return;
     }
+    let rt_gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
     let pos = position_bounds(layout, mappings, mem_read, vertex_addr, vertex_count)
         .unwrap_or_else(|| "n/a".to_string());
     let attr = vertex_attr_sample(layout, mappings, mem_read, vertex_addr, vertex_count);
@@ -2539,10 +2585,11 @@ fn trace_menu_draw(
         }
     }
     log::warn!(
-        "[menu-draw] #{} rt={} slot={} rtctl={:#x} {}x{} vs={:#x} fs={:#x} topo={} first={} inst={}/{} v={} i={} indexed={} pos={} attrs={} {} vp_en={} vp={:?} clip=({},{} {}x{}) depth={}/{} cull={} ff={:#x} blend={} {:?}/{:?}/{:?}/{:?} cw={:#x} masks={:#x}/{:#x} shader_tex_ids={:?} tex_ids={:?} tsc_ids={:?} remap=[{}] tex=[{}] tsc=[{}]",
+        "[menu-draw] #{} rt={} slot={} rt_va={:#x} rtctl={:#x} {}x{} vs={:#x} fs={:#x} topo={} first={} inst={}/{} v={} i={} indexed={} pos={} attrs={} {} vp_en={} vp={:?} clip=({},{} {}x{}) depth={}/{} cull={} ff={:#x} blend={} {:?}/{:?}/{:?}/{:?} cw={:#x} masks={:#x}/{:#x} shader_tex_ids={:?} tex_ids={:?} tsc_ids={:?} remap=[{}] tex=[{}] tsc=[{}]",
         seq,
         nvmap_id,
         rt_slot,
+        rt_gpu_va,
         draw.rt_control,
         rt.width,
         rt.height,
@@ -3590,12 +3637,12 @@ fn map_attrib_format(format: u32) -> Option<vk::Format> {
     let type_ = format >> 6;
     match (size, type_) {
         (0x01, 7) => Some(vk::Format::R32G32B32A32_SFLOAT),
-        (0x01, 3) => Some(vk::Format::R32G32B32A32_SINT),
-        (0x01, 4) => Some(vk::Format::R32G32B32A32_UINT),
+        (0x01, 3) => Some(vk::Format::R32G32B32A32_SFLOAT),
+        (0x01, 4) => Some(vk::Format::R32G32B32A32_SFLOAT),
 
         (0x02, 7) => Some(vk::Format::R32G32B32_SFLOAT),
-        (0x02, 3) => Some(vk::Format::R32G32B32_SINT),
-        (0x02, 4) => Some(vk::Format::R32G32B32_UINT),
+        (0x02, 3) => Some(vk::Format::R32G32B32_SFLOAT),
+        (0x02, 4) => Some(vk::Format::R32G32B32_SFLOAT),
 
         (0x03, 7) => Some(vk::Format::R16G16B16A16_SFLOAT),
         (0x03, 2) => Some(vk::Format::R16G16B16A16_UNORM),
@@ -3606,8 +3653,8 @@ fn map_attrib_format(format: u32) -> Option<vk::Format> {
         (0x03, 5) => Some(vk::Format::R16G16B16A16_USCALED),
 
         (0x04, 7) => Some(vk::Format::R32G32_SFLOAT),
-        (0x04, 3) => Some(vk::Format::R32G32_SINT),
-        (0x04, 4) => Some(vk::Format::R32G32_UINT),
+        (0x04, 3) => Some(vk::Format::R32G32_SFLOAT),
+        (0x04, 4) => Some(vk::Format::R32G32_SFLOAT),
 
         (0x05, 3) => Some(vk::Format::R16G16B16_SINT),
         (0x05, 4) => Some(vk::Format::R16G16B16_UINT),
@@ -3628,8 +3675,8 @@ fn map_attrib_format(format: u32) -> Option<vk::Format> {
         (0x0F, 5) => Some(vk::Format::R16G16_USCALED),
 
         (0x12, 7) => Some(vk::Format::R32_SFLOAT),
-        (0x12, 3) => Some(vk::Format::R32_SINT),
-        (0x12, 4) => Some(vk::Format::R32_UINT),
+        (0x12, 3) => Some(vk::Format::R32_SFLOAT),
+        (0x12, 4) => Some(vk::Format::R32_SFLOAT),
 
         (0x13, 2) => Some(vk::Format::R8G8B8_UNORM),
         (0x13, 1) => Some(vk::Format::R8G8B8_SNORM),
