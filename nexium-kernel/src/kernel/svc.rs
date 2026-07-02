@@ -3875,6 +3875,18 @@ fn dispatch_service_v2(
         return build_ipc_response_copy(ctx, 0, &[], &[h]);
     }
 
+    if port_name == "mm:u" {
+        let data_start = ctx.cmif_in_data_off.min(ctx.buf.len());
+        let data_end = data_start
+            .saturating_add(ctx.cmif_in_data_len)
+            .min(ctx.buf.len());
+        let (result, out_data) = kernel
+            .services
+            .mm
+            .dispatch(cmd_id, &ctx.buf[data_start..data_end]);
+        return build_ipc_response(ctx, result, &out_data, &[]);
+    }
+
     log::warn!(
         "dispatch_service_v2: {} cmd_{} FELL THROUGH to legacy dispatch_service (probably needs a real handler)",
         port_name,
@@ -4554,7 +4566,7 @@ fn igbp_handle_transact(
                                     color[3] = 1.0;
                                 }
                                 let clears = kernel.nvdrv.last_clear_count();
-                                if r.clear_target(gb.nvmap_id, gb.width, gb.height, color)
+                                if r.clear_target(gb.nvmap_id, gb.width, gb.height, 0, color)
                                     .is_ok()
                                 {
                                     if let Some(bytes) =

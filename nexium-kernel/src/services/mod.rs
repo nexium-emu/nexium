@@ -44,6 +44,7 @@ pub mod lr;
 pub mod manager_display_service;
 pub mod mii;
 pub mod misc;
+pub mod mm;
 pub mod mount;
 pub mod movie_maker;
 pub mod nifm;
@@ -128,6 +129,7 @@ pub struct Services {
     pub fsp: fsp::FspService,
     pub btm: btm::BluetoothService,
     pub mii: mii::MiiService,
+    pub mm: mm::MmService,
     pub irs: irs::InfraredService,
     pub hwopus: hwopus::HwOpusService,
     pub grc: grc::GameRecordingService,
@@ -183,6 +185,7 @@ impl Services {
             fsp: fsp::FspService::new(),
             btm: btm::BluetoothService::new(),
             mii: mii::MiiService::new(),
+            mm: mm::MmService::new(),
             irs: irs::InfraredService::new(),
             hwopus: hwopus::HwOpusService::new(),
             grc: grc::GameRecordingService::new(),
@@ -248,6 +251,7 @@ impl Services {
             "fsp:pr" | "fsp:pc" => self.fsp.dispatch(cmd_id),
             "btm" | "btm:u" | "btm:dbg" => self.btm.dispatch(cmd_id),
             "mii:u" | "mii:e" => self.mii.dispatch(cmd_id),
+            "mm:u" => self.mm.dispatch(cmd_id, ctx.tls_buf).0,
             "irs:u" | "irs:o" => self.irs.dispatch(cmd_id),
             "hwopus" => self.hwopus.dispatch(cmd_id),
             "grc:u" | "grc:d" => self.grc.dispatch(cmd_id),
