@@ -987,8 +987,14 @@ impl Translator {
             Opcode::TEX => {
                 let tex_id = texs_tex_id(raw);
                 let coord = reg_a(raw);
+                let tex_type = ((raw >> 28) & 0x7) as u32;
                 let u = self.read_reg(coord);
                 let v = self.read_reg(coord.wrapping_add(1));
+                let volume = if tex_type == 4 {
+                    Some(self.read_reg(coord.wrapping_add(2)))
+                } else {
+                    None
+                };
                 let mask = ((raw >> 31) & 0xF) as u8;
                 let mut dst = reg_dest(raw);
                 for component in 0..4u8 {
@@ -1002,6 +1008,7 @@ impl Translator {
                             u,
                             v,
                             array: None,
+                            volume,
                             component,
                         },
                         pred,
@@ -1015,15 +1022,24 @@ impl Translator {
                 let dest_b = ((raw >> 28) & 0xFF) as u8;
                 let ra = reg_a(raw);
                 let rb = reg_b(raw);
-                let array_2d =
-                    matches!(decoded.opcode, Opcode::TEXS) && matches!((raw >> 53) & 0xF, 7 | 8);
+                let enc = (raw >> 53) & 0xF;
+                let is_texs = matches!(decoded.opcode, Opcode::TEXS);
+                let array_2d = is_texs && matches!(enc, 7 | 8);
+                let tex_3d = is_texs && matches!(enc, 10 | 11);
                 let (u, v) = if array_2d {
                     (self.read_reg(ra.wrapping_add(1)), self.read_reg(rb))
+                } else if tex_3d {
+                    (self.read_reg(ra), self.read_reg(ra.wrapping_add(1)))
                 } else {
                     (self.read_reg(ra), self.read_reg(rb))
                 };
                 let array = if array_2d {
                     Some(self.read_reg(ra))
+                } else {
+                    None
+                };
+                let volume = if tex_3d {
+                    Some(self.read_reg(rb))
                 } else {
                     None
                 };
@@ -1059,6 +1075,7 @@ impl Translator {
                             u,
                             v,
                             array,
+                            volume,
                             component,
                         },
                         pred,

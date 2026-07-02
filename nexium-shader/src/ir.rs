@@ -302,6 +302,7 @@ pub enum Op {
         u: Value,
         v: Value,
         array: Option<Value>,
+        volume: Option<Value>,
         component: u8,
     },
 
@@ -629,9 +630,12 @@ impl Inst {
                 u,
                 v,
                 array,
+                volume,
                 component,
             } => {
-                let coords = if let Some(array) = array {
+                let coords = if let Some(w) = volume {
+                    format!("({u}, {v}, {w})3d")
+                } else if let Some(array) = array {
                     format!("({u}, {v}, {array})")
                 } else {
                     format!("({u}, {v})")
