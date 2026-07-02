@@ -1,6 +1,8 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TicFormat {
+    R32G32B32A32,
     A8B8G8R8,
+    A2B10G10R10,
     R8G8B8A8,
     R5G6B5,
     A1R5G5B5,
@@ -9,6 +11,8 @@ pub enum TicFormat {
     R8G8,
     R16,
     R16G16,
+    R32,
+    Z32,
     B10G11R11,
     BC1,
     BC2,
@@ -48,11 +52,14 @@ impl SwizzleSource {
 impl TicFormat {
     pub fn from_raw(format_word: u32) -> Self {
         match format_word & 0x7F {
+            0x01 => TicFormat::R32G32B32A32,
             0x08 => TicFormat::A8B8G8R8,
-            0x09 => TicFormat::R5G6B5,
+            0x09 => TicFormat::A2B10G10R10,
             0x0A => TicFormat::A1R5G5B5,
             0x0B => TicFormat::A4R4G4B4,
             0x0C => TicFormat::R16G16,
+            0x0F => TicFormat::R32,
+            0x15 => TicFormat::R5G6B5,
             0x12 => TicFormat::R16,
             0x1B => TicFormat::R16,
             0x1C => TicFormat::R8G8,
@@ -64,6 +71,7 @@ impl TicFormat {
             0x27 => TicFormat::BC4,
             0x28 => TicFormat::BC5,
             0x17 => TicFormat::BC7,
+            0x2F => TicFormat::Z32,
             0x2D => TicFormat::R8G8B8A8,
             0x40 => TicFormat::Astc(4, 4),
             0x50 => TicFormat::Astc(5, 4),
@@ -85,7 +93,13 @@ impl TicFormat {
 
     pub fn src_bpp(&self) -> usize {
         match self {
-            TicFormat::A8B8G8R8 | TicFormat::R8G8B8A8 | TicFormat::B10G11R11 => 4,
+            TicFormat::R32G32B32A32 => 16,
+            TicFormat::A8B8G8R8
+            | TicFormat::A2B10G10R10
+            | TicFormat::R8G8B8A8
+            | TicFormat::R32
+            | TicFormat::Z32
+            | TicFormat::B10G11R11 => 4,
             TicFormat::R5G6B5 | TicFormat::A1R5G5B5 | TicFormat::A4R4G4B4 => 2,
             TicFormat::R16 | TicFormat::R8G8 => 2,
             TicFormat::R16G16 => 4,
@@ -108,7 +122,11 @@ impl TicFormat {
             TicFormat::Astc(bw, bh) => {
                 let bw = *bw as u32;
                 let bh = *bh as u32;
-                ((width + bw - 1) / bw, (height + bh - 1) / bh, self.src_bpp())
+                (
+                    (width + bw - 1) / bw,
+                    (height + bh - 1) / bh,
+                    self.src_bpp(),
+                )
             }
             _ => (width, height, self.src_bpp()),
         }
@@ -562,12 +580,7 @@ fn float_to_u8(v: f32) -> u8 {
 fn decode_b10g11r11(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
     let pixels = width as usize * height as usize;
     for i in 0..pixels.min(src.len() / 4) {
-        let p = u32::from_le_bytes([
-            src[i * 4],
-            src[i * 4 + 1],
-            src[i * 4 + 2],
-            src[i * 4 + 3],
-        ]);
+        let p = u32::from_le_bytes([src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3]]);
         let b = decode_ufloat(p & 0x3ff, 5);
         let g = decode_ufloat((p >> 10) & 0x7ff, 6);
         let r = decode_ufloat((p >> 21) & 0x7ff, 6);
@@ -626,6 +639,24 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
         TicFormat::R8G8B8A8 => {
             let n = (pixels * 4).min(src.len());
             out[..n].copy_from_slice(&src[..n]);
+        }
+        TicFormat::A2B10G10R10 => {
+            for i in 0..pixels.min(src.len() / 4) {
+                let v = u32::from_le_bytes([
+                    src[i * 4],
+                    src[i * 4 + 1],
+                    src[i * 4 + 2],
+                    src[i * 4 + 3],
+                ]);
+                let a = v & 0x3;
+                let b = (v >> 2) & 0x3ff;
+                let g = (v >> 12) & 0x3ff;
+                let r = (v >> 22) & 0x3ff;
+                out[i * 4] = ((r * 255 + 511) / 1023) as u8;
+                out[i * 4 + 1] = ((g * 255 + 511) / 1023) as u8;
+                out[i * 4 + 2] = ((b * 255 + 511) / 1023) as u8;
+                out[i * 4 + 3] = ((a * 255 + 1) / 3) as u8;
+            }
         }
         TicFormat::R5G6B5 => {
             for i in 0..pixels.min(src.len() / 2) {
@@ -703,6 +734,50 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
                 out[i * 4 + 3] = 0xFF;
             }
         }
+        TicFormat::R32G32B32A32 => {
+            for i in 0..pixels.min(src.len() / 16) {
+                let off = i * 16;
+                out[i * 4] = float_to_u8(f32::from_bits(u32::from_le_bytes([
+                    src[off],
+                    src[off + 1],
+                    src[off + 2],
+                    src[off + 3],
+                ])));
+                out[i * 4 + 1] = float_to_u8(f32::from_bits(u32::from_le_bytes([
+                    src[off + 4],
+                    src[off + 5],
+                    src[off + 6],
+                    src[off + 7],
+                ])));
+                out[i * 4 + 2] = float_to_u8(f32::from_bits(u32::from_le_bytes([
+                    src[off + 8],
+                    src[off + 9],
+                    src[off + 10],
+                    src[off + 11],
+                ])));
+                out[i * 4 + 3] = float_to_u8(f32::from_bits(u32::from_le_bytes([
+                    src[off + 12],
+                    src[off + 13],
+                    src[off + 14],
+                    src[off + 15],
+                ])));
+            }
+        }
+        TicFormat::R32 | TicFormat::Z32 => {
+            for i in 0..pixels.min(src.len() / 4) {
+                let raw = u32::from_le_bytes([
+                    src[i * 4],
+                    src[i * 4 + 1],
+                    src[i * 4 + 2],
+                    src[i * 4 + 3],
+                ]);
+                let v = float_to_u8(f32::from_bits(raw));
+                out[i * 4] = v;
+                out[i * 4 + 1] = v;
+                out[i * 4 + 2] = v;
+                out[i * 4 + 3] = 0xFF;
+            }
+        }
         TicFormat::B10G11R11 => decode_b10g11r11(src, width, height, &mut out),
         TicFormat::BC1 => decode_bc1(src, width, height, &mut out),
         TicFormat::BC2 => decode_bc2(src, width, height, &mut out),
@@ -710,7 +785,9 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
         TicFormat::BC4 => decode_bc4(src, width, height, &mut out),
         TicFormat::BC5 => decode_bc5(src, width, height, &mut out),
         TicFormat::BC7 => decode_bc7(src, width, height, &mut out),
-        TicFormat::Astc(bw, bh) => decode_astc(src, width, height, bw as usize, bh as usize, &mut out),
+        TicFormat::Astc(bw, bh) => {
+            decode_astc(src, width, height, bw as usize, bh as usize, &mut out)
+        }
         TicFormat::Unknown(_) => {
             for i in 0..pixels {
                 out[i * 4] = 0xFF;

@@ -97,6 +97,8 @@ pub struct Maxwell3dDrawCall {
     pub index_data: Option<Vec<u8>>,
     pub quad_expand: bool,
     pub rt_key: RtKey,
+    pub color_rt_keys: Vec<RtKey>,
+    pub color_rt_formats: Vec<vk::Format>,
     pub rt_format: vk::Format,
     pub vp_rect: Option<[f32; 4]>,
     pub scissor: Option<[i32; 4]>,

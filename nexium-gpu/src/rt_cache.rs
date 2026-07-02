@@ -243,8 +243,36 @@ impl RtCache {
         key: RtKey,
         device: &ash::Device,
     ) -> Result<&mut GpuImage, String> {
+        self.get_or_create_with_format(key, device, vk::Format::R8G8B8A8_UNORM)
+    }
+
+    pub fn get_existing(&mut self, key: RtKey) -> Option<&mut GpuImage> {
+        self.cache.get_mut(&key)
+    }
+
+    pub fn get_or_create_with_format(
+        &mut self,
+        key: RtKey,
+        device: &ash::Device,
+        format: vk::Format,
+    ) -> Result<&mut GpuImage, String> {
+        if self
+            .cache
+            .get(&key)
+            .is_some_and(|image| image.format != format)
+        {
+            if let Some(image) = self.cache.remove(&key) {
+                unsafe {
+                    device.destroy_image_view(image.view, None);
+                    device.destroy_image(image.image, None);
+                    device.free_memory(image.memory, None);
+                }
+            }
+            self.drawn_stamp.remove(&key);
+            self.frame_draws.remove(&key);
+        }
         if !self.cache.contains_key(&key) {
-            let image = self.create_image(device, key)?;
+            let image = self.create_image(device, key, format)?;
             self.cache.insert(key, image);
         }
         Ok(self.cache.get_mut(&key).unwrap())
@@ -260,12 +288,49 @@ impl RtCache {
                 device,
                 key,
                 vk::Format::D32_SFLOAT,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::SAMPLED,
                 vk::ImageAspectFlags::DEPTH,
             )?;
             self.depth_cache.insert(key, image);
         }
         Ok(self.depth_cache.get_mut(&key).unwrap())
+    }
+
+    pub fn find_depth(
+        &self,
+        want: RtKey,
+    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
+        if let Some(img) = self.depth_cache.get(&want) {
+            return Some((want, img.image, img.view, img.layout));
+        }
+        let mut best: Option<(RtKey, &GpuImage)> = None;
+        for (k, img) in &self.depth_cache {
+            if k.nvmap_id != want.nvmap_id {
+                continue;
+            }
+            if want.gpu_va != 0 && k.gpu_va != want.gpu_va {
+                continue;
+            }
+            if !dims_close(k.width, want.width) || !dims_close(k.height, want.height) {
+                continue;
+            }
+            let kd = (k.width as i64 - want.width as i64).abs()
+                + (k.height as i64 - want.height as i64).abs();
+            let replace = match best {
+                Some((bk, _)) => {
+                    kd < (bk.width as i64 - want.width as i64).abs()
+                        + (bk.height as i64 - want.height as i64).abs()
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((*k, img));
+            }
+        }
+        best.map(|(k, img)| (k, img.image, img.view, img.layout))
     }
 
     pub fn find_color(
@@ -302,17 +367,65 @@ impl RtCache {
         best.map(|(k, img)| (k, img.image, img.view, img.layout))
     }
 
+    pub fn find_drawn_color_at(
+        &self,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+    ) -> Option<(RtKey, vk::Image, vk::ImageLayout, vk::Format, u64)> {
+        let mut best: Option<(RtKey, &GpuImage, u64)> = None;
+        for (k, img) in &self.cache {
+            if k.gpu_va != gpu_va || k.width < width || k.height < height {
+                continue;
+            }
+            let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+                continue;
+            };
+            let area = k.width as u64 * k.height as u64;
+            let replace = match best {
+                Some((best_key, _, best_stamp)) => {
+                    let best_area = best_key.width as u64 * best_key.height as u64;
+                    area < best_area || (area == best_area && stamp > best_stamp)
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((*k, img, stamp));
+            }
+        }
+        best.map(|(k, img, stamp)| (k, img.image, img.layout, img.format, stamp))
+    }
+
     pub fn set_color_layout(&mut self, key: RtKey, layout: vk::ImageLayout) {
         if let Some(img) = self.cache.get_mut(&key) {
             img.layout = layout;
         }
     }
 
-    fn create_image(&self, device: &ash::Device, key: RtKey) -> Result<GpuImage, String> {
+    pub fn color_layout(&self, key: RtKey) -> Option<vk::ImageLayout> {
+        self.cache.get(&key).map(|img| img.layout)
+    }
+
+    pub fn set_depth_layout(&mut self, key: RtKey, layout: vk::ImageLayout) {
+        if let Some(img) = self.depth_cache.get_mut(&key) {
+            img.layout = layout;
+        }
+    }
+
+    pub fn depth_layout(&self, key: RtKey) -> Option<vk::ImageLayout> {
+        self.depth_cache.get(&key).map(|img| img.layout)
+    }
+
+    fn create_image(
+        &self,
+        device: &ash::Device,
+        key: RtKey,
+        format: vk::Format,
+    ) -> Result<GpuImage, String> {
         self.create_image_inner(
             device,
             key,
-            vk::Format::R8G8B8A8_UNORM,
+            format,
             vk::ImageUsageFlags::COLOR_ATTACHMENT
                 | vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST

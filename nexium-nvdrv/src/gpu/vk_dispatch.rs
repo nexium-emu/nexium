@@ -69,7 +69,9 @@ fn collect_cbuf_reads(cfg: &nexium_shader::Cfg, stage_base: u32) -> Vec<(u32, u3
 fn tic_can_alias_render_target(format: nexium_gpu::texture::TicFormat) -> bool {
     matches!(
         format,
-        nexium_gpu::texture::TicFormat::A8B8G8R8
+        nexium_gpu::texture::TicFormat::R32G32B32A32
+            | nexium_gpu::texture::TicFormat::A8B8G8R8
+            | nexium_gpu::texture::TicFormat::A2B10G10R10
             | nexium_gpu::texture::TicFormat::R8G8B8A8
             | nexium_gpu::texture::TicFormat::R5G6B5
             | nexium_gpu::texture::TicFormat::A1R5G5B5
@@ -78,6 +80,8 @@ fn tic_can_alias_render_target(format: nexium_gpu::texture::TicFormat) -> bool {
             | nexium_gpu::texture::TicFormat::R8G8
             | nexium_gpu::texture::TicFormat::R16
             | nexium_gpu::texture::TicFormat::R16G16
+            | nexium_gpu::texture::TicFormat::R32
+            | nexium_gpu::texture::TicFormat::Z32
             | nexium_gpu::texture::TicFormat::B10G11R11
             | nexium_gpu::texture::TicFormat::Unknown(3)
             | nexium_gpu::texture::TicFormat::Unknown(47)
@@ -133,7 +137,12 @@ pub fn enqueue_draws(
         match execute_one(draw, mappings, maxwell, renderer, mem_read) {
             Ok(None) => {}
             Ok(Some(call)) => {
-                if batch.last().is_some_and(|last| last.rt_key != call.rt_key) {
+                if batch.last().is_some_and(|last| {
+                    last.rt_key != call.rt_key
+                        || last.color_rt_keys != call.color_rt_keys
+                        || last.color_rt_formats != call.color_rt_formats
+                        || last.depth_key != call.depth_key
+                }) {
                     flush_accum(batch, renderer, mappings, mem_read);
                 }
                 batch.push(call);
@@ -191,7 +200,12 @@ pub fn flush_accum(
 
 fn rt_keys_uniform(calls: &[Maxwell3dDrawCall]) -> bool {
     match calls.first() {
-        Some(f) => calls.iter().all(|c| c.rt_key == f.rt_key),
+        Some(f) => calls.iter().all(|c| {
+            c.rt_key == f.rt_key
+                && c.color_rt_keys == f.color_rt_keys
+                && c.color_rt_formats == f.color_rt_formats
+                && c.depth_key == f.depth_key
+        }),
         None => true,
     }
 }
@@ -667,13 +681,16 @@ struct ShaderBundle {
 
 #[allow(clippy::type_complexity)]
 fn shader_bundle_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<(u64, u64, u32, u32, u32, u32, u32), std::sync::Arc<ShaderBundle>>,
+    std::collections::HashMap<
+        (u64, u64, u32, u32, u32, u32, u32, u32, u32),
+        std::sync::Arc<ShaderBundle>,
+    >,
 > {
     use std::sync::OnceLock;
     static CACHE: OnceLock<
         std::sync::Mutex<
             std::collections::HashMap<
-                (u64, u64, u32, u32, u32, u32, u32),
+                (u64, u64, u32, u32, u32, u32, u32, u32, u32),
                 std::sync::Arc<ShaderBundle>,
             >,
         >,
@@ -682,10 +699,15 @@ fn shader_bundle_cache() -> &'static std::sync::Mutex<
 }
 
 fn shader_failed_set(
-) -> &'static std::sync::Mutex<std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32)>> {
+) -> &'static std::sync::Mutex<
+    std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32)>,
+>
+{
     use std::sync::OnceLock;
     static FAILED: OnceLock<
-        std::sync::Mutex<std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32)>>,
+        std::sync::Mutex<
+            std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32)>,
+        >,
     > = OnceLock::new();
     FAILED.get_or_init(|| {
         // Silence the default panic hook for shader-emit panics we catch_unwind,
@@ -746,7 +768,15 @@ fn execute_one(
         .nvmap_id_for(rt_gpu_va)
         .ok_or_else(|| format!("RT gpu_va={:#x} not mapped", rt_gpu_va))?;
     let rt_key = RtKey::new(nvmap_id, rt.width, rt.height, rt_gpu_va);
+    let rt_format = map_rt_format_for_key(rt.format, rt_key);
+    let color_rts = active_color_rts(draw, mappings, rt_key, rt_format);
+    let color_rt_keys = color_rts.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    let color_rt_formats = color_rts
+        .iter()
+        .map(|(_, format)| *format)
+        .collect::<Vec<_>>();
     let no_depth = depth_disabled();
+    let zeta_key = zeta_rt_key(draw, mappings, rt_key);
 
     if draw.is_clear {
         let op_seq = next_gpu_op_seq();
@@ -765,6 +795,7 @@ fn execute_one(
             draw.clear_color.a,
         ];
         let do_depth = want_depth_clear && !no_depth;
+        let depth_clear_key = zeta_key.unwrap_or(rt_key);
         trace_clear(
             draw,
             op_seq,
@@ -779,6 +810,12 @@ fn execute_one(
             let r = renderer.clone();
             let cdepth = draw.clear_depth;
             let (w, h) = (rt.width, rt.height);
+            let (dw, dh, dva, dnv) = (
+                depth_clear_key.width,
+                depth_clear_key.height,
+                depth_clear_key.gpu_va,
+                depth_clear_key.nvmap_id,
+            );
             rt_thread.submit(Box::new(move || {
                 if want_color_clear {
                     if let Some(rect) = clear_scissor {
@@ -788,19 +825,26 @@ fn execute_one(
                     }
                 }
                 if do_depth {
-                    let _ = r.clear_depth(nvmap_id, w, h, rt_gpu_va, cdepth);
+                    let _ = r.clear_depth(dnv, dw, dh, dva, cdepth);
                 }
             }));
         } else {
             if want_color_clear {
                 if let Some(rect) = clear_scissor {
-                    renderer.clear_target_rect(nvmap_id, rt.width, rt.height, rt_gpu_va, color, rect)?;
+                    renderer
+                        .clear_target_rect(nvmap_id, rt.width, rt.height, rt_gpu_va, color, rect)?;
                 } else {
                     renderer.clear_target(nvmap_id, rt.width, rt.height, rt_gpu_va, color)?;
                 }
             }
             if do_depth {
-                renderer.clear_depth(nvmap_id, rt.width, rt.height, rt_gpu_va, draw.clear_depth)?;
+                renderer.clear_depth(
+                    depth_clear_key.nvmap_id,
+                    depth_clear_key.width,
+                    depth_clear_key.height,
+                    depth_clear_key.gpu_va,
+                    draw.clear_depth,
+                )?;
             }
         }
         return Ok(None);
@@ -875,6 +919,50 @@ fn execute_one(
             int_attr_mask |= 1 << loc;
         }
     }
+    let fs_sph = fetch_sph(fs_addr, mappings, mem_read);
+    let fs_input_map = fs_sph.map(ps_generic_input_map).unwrap_or([0; 32]);
+    let fs_output_map = fs_sph.map(ps_output_map).unwrap_or(0);
+    let color_output_count = (color_rt_formats.len() as u32).clamp(1, 8);
+    if std::env::var_os("NEXIUM_SHADER_MAP_DBG").is_some() {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<(u64, u64, u32, u32, u32)>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        if seen.lock().unwrap().insert((
+            vs_addr,
+            fs_addr,
+            color_output_count,
+            fs_output_map,
+            draw.rt_control,
+        )) {
+            let keys = color_rt_keys
+                .iter()
+                .map(|key| key.label())
+                .collect::<Vec<_>>()
+                .join(",");
+            let formats = color_rt_formats
+                .iter()
+                .map(|format| format!("{:?}", format))
+                .collect::<Vec<_>>()
+                .join(",");
+            let imap = fs_input_map
+                .iter()
+                .map(|v| format!("{:02x}", v))
+                .collect::<Vec<_>>()
+                .join("");
+            log::warn!(
+                "[shader-map] vs={:#x} fs={:#x} outputs={} omap={:#010x} imap={} rtctl={:#x} keys=[{}] fmts=[{}]",
+                vs_addr,
+                fs_addr,
+                color_output_count,
+                fs_output_map,
+                imap,
+                draw.rt_control,
+                keys,
+                formats
+            );
+        }
+    }
     let shader_key = (
         vs_addr,
         fs_addr,
@@ -883,6 +971,8 @@ fn execute_one(
         ps_key,
         win_key,
         int_attr_mask,
+        color_output_count,
+        fs_output_map,
     );
     if shader_failed_set().lock().unwrap().contains(&shader_key) {
         return Err("shader previously failed to emit".to_string());
@@ -893,9 +983,6 @@ fn execute_one(
         if let Some(b) = guard.get(&shader_key) {
             b.clone()
         } else {
-            let fs_input_map = fetch_sph(fs_addr, mappings, mem_read)
-                .map(ps_generic_input_map)
-                .unwrap_or([0; 32]);
             let vs_sass = fetch_sass(vs_addr, mappings, mem_read)
                 .ok_or_else(|| "VS SASS read failed".to_string())?;
             let fs_sass = fetch_sass(fs_addr, mappings, mem_read)
@@ -946,7 +1033,12 @@ fn execute_one(
 
             let (fs_spirv, fs_cbuf_mask, mut fs_tex_ids, fs_cbuf_used, fs_sampler_arrayed) =
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    nexium_spirv::emit_fragment_full_with_input_map_meta(&fs_cfg, fs_input_map)
+                    nexium_spirv::emit_fragment_full_with_input_map_meta_outputs(
+                        &fs_cfg,
+                        fs_input_map,
+                        color_output_count,
+                        fs_output_map,
+                    )
                 })) {
                     Ok(v) => v,
                     Err(panic) => {
@@ -1449,7 +1541,7 @@ fn execute_one(
     let depth_test = !no_depth && draw.depth_test_enable && draw.zeta_enable;
     let depth_write = !no_depth && draw.depth_write_enable && draw.zeta_enable;
     let depth_key = if depth_test || depth_write {
-        Some(rt_key)
+        zeta_key.or(Some(rt_key))
     } else {
         None
     };
@@ -1853,7 +1945,9 @@ fn execute_one(
         index_data: out_index_data,
         quad_expand: draw.topology == 7 && out_index_count.is_none(),
         rt_key,
-        rt_format: vk::Format::R8G8B8A8_UNORM,
+        color_rt_keys,
+        color_rt_formats,
+        rt_format,
         vp_rect: guest_viewport_rect(draw, rt.width as f32, rt.height as f32),
         scissor: None,
         state: DrawState {
@@ -1928,6 +2022,59 @@ fn rt_control_target(raw: u32, index: usize) -> usize {
     (((raw >> (4 + index * 3)) & 0x7) as usize).min(7)
 }
 
+fn rt_key_for_target(rt: &RenderTarget, mappings: &GpuMappings) -> Option<RtKey> {
+    if rt.width == 0 || rt.height == 0 {
+        return None;
+    }
+    let gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
+    let nvmap_id = mappings.nvmap_id_for(gpu_va)?;
+    Some(RtKey::new(nvmap_id, rt.width, rt.height, gpu_va))
+}
+
+fn zeta_rt_key(draw: &DrawCall, mappings: &GpuMappings, fallback: RtKey) -> Option<RtKey> {
+    if !draw.zeta_enable {
+        return None;
+    }
+    let gpu_va = ((draw.zeta.address_hi as u64) << 32) | draw.zeta.address_lo as u64;
+    if gpu_va == 0 {
+        return None;
+    }
+    let nvmap_id = mappings.nvmap_id_for(gpu_va)?;
+    let width = fallback.width;
+    let height = fallback.height;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(RtKey::new(nvmap_id, width, height, gpu_va))
+}
+
+fn active_color_rts(
+    draw: &DrawCall,
+    mappings: &GpuMappings,
+    fallback_key: RtKey,
+    fallback_format: vk::Format,
+) -> Vec<(RtKey, vk::Format)> {
+    let count = (draw.rt_control & 0xf).min(8) as usize;
+    let mut keys = Vec::new();
+    if count != 0 {
+        for index in 0..count {
+            let slot = rt_control_target(draw.rt_control, index);
+            if let Some((key, format)) = draw.rt.get(slot).and_then(|rt| {
+                rt_key_for_target(rt, mappings)
+                    .map(|key| (key, map_rt_format_for_key(rt.format, key)))
+            }) {
+                if !keys.iter().any(|(existing, _)| *existing == key) {
+                    keys.push((key, format));
+                }
+            }
+        }
+    }
+    if keys.is_empty() {
+        keys.push((fallback_key, fallback_format));
+    }
+    keys
+}
+
 fn draw_color_rt_slot(draw: &DrawCall) -> usize {
     let slot = rt_control_target(draw.rt_control, 0);
     let count = (draw.rt_control & 0xf).min(8);
@@ -1935,6 +2082,63 @@ fn draw_color_rt_slot(draw: &DrawCall) -> usize {
         slot
     } else {
         0
+    }
+}
+
+fn map_rt_format(format: u32) -> vk::Format {
+    match format {
+        0xC0 | 0xC3 => vk::Format::R32G32B32A32_SFLOAT,
+        0xC1 | 0xC4 => vk::Format::R32G32B32A32_SINT,
+        0xC2 | 0xC5 => vk::Format::R32G32B32A32_UINT,
+        0xC6 => vk::Format::R16G16B16A16_UNORM,
+        0xC7 => vk::Format::R16G16B16A16_SNORM,
+        0xC8 => vk::Format::R16G16B16A16_SINT,
+        0xC9 => vk::Format::R16G16B16A16_UINT,
+        0xCA | 0xCE => vk::Format::R16G16B16A16_SFLOAT,
+        0xCB => vk::Format::R32G32_SFLOAT,
+        0xCC => vk::Format::R32G32_SINT,
+        0xCD => vk::Format::R32G32_UINT,
+        0xCF | 0xE6 => vk::Format::B8G8R8A8_UNORM,
+        0xD1 => vk::Format::A2B10G10R10_UNORM_PACK32,
+        0xD2 => vk::Format::A2B10G10R10_UINT_PACK32,
+        0xD5 | 0xF9 => vk::Format::A8B8G8R8_UNORM_PACK32,
+        0xD6 | 0xFA => vk::Format::A8B8G8R8_SRGB_PACK32,
+        0xD7 => vk::Format::A8B8G8R8_SNORM_PACK32,
+        0xD8 => vk::Format::A8B8G8R8_SINT_PACK32,
+        0xD9 => vk::Format::A8B8G8R8_UINT_PACK32,
+        0xDA => vk::Format::R16G16_UNORM,
+        0xDB => vk::Format::R16G16_SNORM,
+        0xDC => vk::Format::R16G16_SINT,
+        0xDD => vk::Format::R16G16_UINT,
+        0xDE => vk::Format::R16G16_SFLOAT,
+        0xDF => vk::Format::A2R10G10B10_UNORM_PACK32,
+        0xE0 => vk::Format::B10G11R11_UFLOAT_PACK32,
+        0xE3 => vk::Format::R32_SINT,
+        0xE4 => vk::Format::R32_UINT,
+        0xE5 => vk::Format::R32_SFLOAT,
+        0xE8 => vk::Format::R5G6B5_UNORM_PACK16,
+        0xEA => vk::Format::R8G8_UNORM,
+        0xEB => vk::Format::R8G8_SNORM,
+        0xEC => vk::Format::R8G8_SINT,
+        0xED => vk::Format::R8G8_UINT,
+        0xEE => vk::Format::R16_UNORM,
+        0xEF => vk::Format::R16_SNORM,
+        0xF0 => vk::Format::R16_SINT,
+        0xF1 => vk::Format::R16_UINT,
+        0xF2 => vk::Format::R16_SFLOAT,
+        0xF3 => vk::Format::R8_UNORM,
+        0xF4 => vk::Format::R8_SNORM,
+        0xF5 => vk::Format::R8_SINT,
+        0xF6 => vk::Format::R8_UINT,
+        _ => vk::Format::R8G8B8A8_UNORM,
+    }
+}
+
+fn map_rt_format_for_key(format: u32, key: RtKey) -> vk::Format {
+    if format == 0xD1 && matches!(key.nvmap_id, 7 | 16) {
+        vk::Format::R8G8B8A8_UNORM
+    } else {
+        map_rt_format(format)
     }
 }
 
@@ -2601,7 +2805,7 @@ fn trace_menu_draw(
         }
     }
     log::warn!(
-        "[menu-draw] #{} rt={} slot={} rt_va={:#x} rtctl={:#x} {}x{} vs={:#x} fs={:#x} topo={} first={} inst={}/{} v={} i={} indexed={} pos={} attrs={} {} vp_en={} vp={:?} clip=({},{} {}x{}) depth={}/{} cull={} ff={:#x} blend={} {:?}/{:?}/{:?}/{:?} cw={:#x} masks={:#x}/{:#x} shader_tex_ids={:?} tex_ids={:?} tsc_ids={:?} remap=[{}] tex=[{}] tsc=[{}]",
+        "[menu-draw] #{} rt={} slot={} rt_va={:#x} rtctl={:#x} {}x{} fmt={:#x} tile={:#x} depth={} stride={} base={} vs={:#x} fs={:#x} topo={} first={} inst={}/{} v={} i={} indexed={} pos={} attrs={} {} vp_en={} vp={:?} clip=({},{} {}x{}) depth={}/{} cull={} ff={:#x} blend={} {:?}/{:?}/{:?}/{:?} cw={:#x} masks={:#x}/{:#x} shader_tex_ids={:?} tex_ids={:?} tsc_ids={:?} remap=[{}] tex=[{}] tsc=[{}]",
         seq,
         nvmap_id,
         rt_slot,
@@ -2609,6 +2813,11 @@ fn trace_menu_draw(
         draw.rt_control,
         rt.width,
         rt.height,
+        rt.format,
+        rt.tile_mode,
+        rt.depth,
+        rt.layer_stride,
+        rt.base_layer,
         vs_addr,
         fs_addr,
         draw.topology,
@@ -3552,6 +3761,10 @@ fn ps_generic_input_map(sph: [u8; SPH_SIZE]) -> [u8; 32] {
     let mut map = [0u8; 32];
     map.copy_from_slice(&sph[0x18..0x38]);
     map
+}
+
+fn ps_output_map(sph: [u8; SPH_SIZE]) -> u32 {
+    u32::from_le_bytes([sph[0x48], sph[0x49], sph[0x4A], sph[0x4B]])
 }
 
 fn build_vertex_layout(draw: &DrawCall) -> Result<VertexLayout, String> {

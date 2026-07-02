@@ -20,6 +20,8 @@ pub struct PipelineKey {
     pub fs_hash: u64,
     pub topology: u32,
     pub color_format: u32,
+    pub color_formats: [u32; 8],
+    pub color_attachment_count: u32,
     pub vs_cbuf_mask: u32,
     pub fs_cbuf_mask: u32,
     pub vertex_layout_hash: u64,
@@ -31,7 +33,7 @@ pub struct PipelineKey {
     pub color_write_mask: u32,
 }
 
-const SPEC_VERSION: u32 = 8;
+const SPEC_VERSION: u32 = 10;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineSpec {
@@ -42,6 +44,8 @@ pub struct PipelineSpec {
     pub attrs: Vec<(u32, u32, i32, u32)>,
     pub topology: i32,
     pub color_format: i32,
+    pub color_formats: Vec<i32>,
+    pub color_attachment_count: u32,
     pub depth_format: i32,
     pub has_depth: bool,
     pub blend: (bool, i32, i32, i32, i32, i32, i32),
@@ -106,7 +110,7 @@ pub fn spec_to_request(
         bindings,
         attrs,
         topology: vk::PrimitiveTopology::from_raw(spec.topology),
-        color_format: vk::Format::from_raw(spec.color_format),
+        color_formats: spec_color_formats(spec),
         depth_format: vk::Format::from_raw(spec.depth_format),
         has_depth: spec.has_depth,
         blend: crate::draw::BlendState {
@@ -142,7 +146,7 @@ pub struct PipelineBuildRequest {
     pub bindings: Vec<vk::VertexInputBindingDescription>,
     pub attrs: Vec<vk::VertexInputAttributeDescription>,
     pub topology: vk::PrimitiveTopology,
-    pub color_format: vk::Format,
+    pub color_formats: Vec<vk::Format>,
     pub depth_format: vk::Format,
     pub has_depth: bool,
     pub blend: crate::draw::BlendState,
@@ -155,6 +159,41 @@ pub struct PipelineBuildRequest {
     pub poly_offset_units: f32,
     pub poly_offset_factor: f32,
     pub depth_clip_control_enabled: bool,
+}
+
+pub fn normalized_color_formats(formats: &[vk::Format]) -> Vec<vk::Format> {
+    let mut out = if formats.is_empty() {
+        vec![vk::Format::R8G8B8A8_UNORM]
+    } else {
+        formats.iter().copied().take(8).collect()
+    };
+    if out.is_empty() {
+        out.push(vk::Format::R8G8B8A8_UNORM);
+    }
+    out
+}
+
+pub fn color_format_key(formats: &[vk::Format]) -> (u32, [u32; 8], u32) {
+    let formats = normalized_color_formats(formats);
+    let mut key = [0u32; 8];
+    for (idx, format) in formats.iter().enumerate() {
+        key[idx] = format.as_raw() as u32;
+    }
+    (key[0], key, formats.len() as u32)
+}
+
+fn spec_color_formats(spec: &PipelineSpec) -> Vec<vk::Format> {
+    if spec.color_formats.is_empty() {
+        normalized_color_formats(&[vk::Format::from_raw(spec.color_format)])
+    } else {
+        normalized_color_formats(
+            &spec
+                .color_formats
+                .iter()
+                .map(|f| vk::Format::from_raw(*f))
+                .collect::<Vec<_>>(),
+        )
+    }
 }
 
 pub fn build_graphics_pipeline(
@@ -298,12 +337,15 @@ pub fn build_graphics_pipeline(
         alpha_blend_op: req.blend.alpha_op,
         color_write_mask: req.blend.color_write_mask,
     };
+    let color_formats = normalized_color_formats(&req.color_formats);
+    let color_attachment_count = color_formats.len() as u32;
+    let cb_attachments = vec![cb_attachment; color_attachment_count as usize];
     let cb_state = vk::PipelineColorBlendStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         logic_op_enable: vk::FALSE,
         logic_op: vk::LogicOp::COPY,
-        attachment_count: 1,
-        p_attachments: &cb_attachment,
+        attachment_count: color_attachment_count,
+        p_attachments: cb_attachments.as_ptr(),
         blend_constants: [0.0; 4],
         p_next: std::ptr::null(),
         flags: Default::default(),
@@ -349,11 +391,10 @@ pub fn build_graphics_pipeline(
         std::ptr::null()
     };
 
-    let color_formats = [req.color_format];
     let mut rendering_info = vk::PipelineRenderingCreateInfo {
         s_type: vk::StructureType::PIPELINE_RENDERING_CREATE_INFO,
         view_mask: 0,
-        color_attachment_count: 1,
+        color_attachment_count,
         p_color_attachment_formats: color_formats.as_ptr(),
         depth_attachment_format: req.depth_format,
         stencil_attachment_format: vk::Format::UNDEFINED,
