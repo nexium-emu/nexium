@@ -1,21 +1,48 @@
 use ash::vk;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
-#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct RtKey {
     pub nvmap_id: u32,
     pub width: u32,
     pub height: u32,
     pub gpu_va: u64,
+    pub cpu_addr: u64,
+}
+
+impl PartialEq for RtKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.nvmap_id == other.nvmap_id
+            && self.width == other.width
+            && self.height == other.height
+            && self.gpu_va == other.gpu_va
+    }
+}
+
+impl Eq for RtKey {}
+
+impl Hash for RtKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.nvmap_id.hash(state);
+        self.width.hash(state);
+        self.height.hash(state);
+        self.gpu_va.hash(state);
+    }
 }
 
 impl RtKey {
     pub fn new(nvmap_id: u32, width: u32, height: u32, gpu_va: u64) -> Self {
+        Self::with_cpu(nvmap_id, width, height, gpu_va, 0)
+    }
+
+    pub fn with_cpu(nvmap_id: u32, width: u32, height: u32, gpu_va: u64, cpu_addr: u64) -> Self {
         Self {
             nvmap_id,
             width,
             height,
             gpu_va,
+            cpu_addr,
         }
     }
 
@@ -376,6 +403,43 @@ impl RtCache {
         let mut best: Option<(RtKey, &GpuImage, u64)> = None;
         for (k, img) in &self.cache {
             if k.gpu_va != gpu_va || k.width < width || k.height < height {
+                continue;
+            }
+            let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+                continue;
+            };
+            let area = k.width as u64 * k.height as u64;
+            let replace = match best {
+                Some((best_key, _, best_stamp)) => {
+                    let best_area = best_key.width as u64 * best_key.height as u64;
+                    area < best_area || (area == best_area && stamp > best_stamp)
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((*k, img, stamp));
+            }
+        }
+        best.map(|(k, img, stamp)| (k, img.image, img.layout, img.format, stamp))
+    }
+
+    pub fn find_drawn_color_at_cpu(
+        &self,
+        width: u32,
+        height: u32,
+        nvmap_id: u32,
+        cpu_addr: u64,
+    ) -> Option<(RtKey, vk::Image, vk::ImageLayout, vk::Format, u64)> {
+        if cpu_addr == 0 {
+            return None;
+        }
+        let mut best: Option<(RtKey, &GpuImage, u64)> = None;
+        for (k, img) in &self.cache {
+            if k.nvmap_id != nvmap_id
+                || k.cpu_addr != cpu_addr
+                || k.width < width
+                || k.height < height
+            {
                 continue;
             }
             let Some(stamp) = self.drawn_stamp.get(k).copied() else {

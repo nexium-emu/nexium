@@ -767,7 +767,13 @@ fn execute_one(
     let nvmap_id = mappings
         .nvmap_id_for(rt_gpu_va)
         .ok_or_else(|| format!("RT gpu_va={:#x} not mapped", rt_gpu_va))?;
-    let rt_key = RtKey::new(nvmap_id, rt.width, rt.height, rt_gpu_va);
+    let rt_key = RtKey::with_cpu(
+        nvmap_id,
+        rt.width,
+        rt.height,
+        rt_gpu_va,
+        mappings.cpu_address_for(rt_gpu_va).unwrap_or(0),
+    );
     let rt_format = map_rt_format_for_key(rt.format, rt_key);
     let color_rts = active_color_rts(draw, mappings, rt_key, rt_format);
     let color_rt_keys = color_rts.iter().map(|(key, _)| *key).collect::<Vec<_>>();
@@ -1442,7 +1448,13 @@ fn execute_one(
             let Some(nv) = mappings.nvmap_id_for(tic.gpu_va) else {
                 continue;
             };
-            let key = RtKey::new(nv, tic.width, tic.height, tic.gpu_va);
+            let key = RtKey::with_cpu(
+                nv,
+                tic.width,
+                tic.height,
+                tic.gpu_va,
+                mappings.cpu_address_for(tic.gpu_va).unwrap_or(0),
+            );
             sampled_rt_slots[slot] = Some(key);
             if !sampled_rt_keys.contains(&key) {
                 sampled_rt_keys.push(key);
@@ -2028,7 +2040,13 @@ fn rt_key_for_target(rt: &RenderTarget, mappings: &GpuMappings) -> Option<RtKey>
     }
     let gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
     let nvmap_id = mappings.nvmap_id_for(gpu_va)?;
-    Some(RtKey::new(nvmap_id, rt.width, rt.height, gpu_va))
+    Some(RtKey::with_cpu(
+        nvmap_id,
+        rt.width,
+        rt.height,
+        gpu_va,
+        mappings.cpu_address_for(gpu_va).unwrap_or(0),
+    ))
 }
 
 fn zeta_rt_key(draw: &DrawCall, mappings: &GpuMappings, fallback: RtKey) -> Option<RtKey> {
@@ -2045,7 +2063,13 @@ fn zeta_rt_key(draw: &DrawCall, mappings: &GpuMappings, fallback: RtKey) -> Opti
     if width == 0 || height == 0 {
         return None;
     }
-    Some(RtKey::new(nvmap_id, width, height, gpu_va))
+    Some(RtKey::with_cpu(
+        nvmap_id,
+        width,
+        height,
+        gpu_va,
+        mappings.cpu_address_for(gpu_va).unwrap_or(0),
+    ))
 }
 
 fn active_color_rts(

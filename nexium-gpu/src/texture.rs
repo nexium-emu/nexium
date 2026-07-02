@@ -150,7 +150,10 @@ pub struct TicEntry {
     pub gpu_va: u64,
     pub width: u32,
     pub height: u32,
+    pub block_width_log2: u32,
     pub block_height_log2: u32,
+    pub block_depth_log2: u32,
+    pub tile_width_spacing: u32,
     pub is_block_linear: bool,
     pub texture_type: u32,
     pub depth: u32,
@@ -184,7 +187,10 @@ impl TicEntry {
         let header_version = (w2 >> 21) & 0x7;
         let is_block_linear = header_version == 3;
 
+        let block_width_log2 = if is_block_linear { w3 & 0x7 } else { 0 };
         let block_height_log2 = if is_block_linear { (w3 >> 3) & 0x7 } else { 0 };
+        let block_depth_log2 = if is_block_linear { (w3 >> 6) & 0x7 } else { 0 };
+        let tile_width_spacing = if is_block_linear { (w3 >> 10) & 0x7 } else { 0 };
 
         let width = (w4 & 0xFFFF) + 1;
         let layer_base_0_2 = (w4 >> 16) & 0x7;
@@ -207,7 +213,10 @@ impl TicEntry {
             gpu_va,
             width,
             height,
+            block_width_log2,
             block_height_log2,
+            block_depth_log2,
+            tile_width_spacing,
             is_block_linear,
             texture_type,
             depth,

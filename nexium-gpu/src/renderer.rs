@@ -2736,7 +2736,8 @@ impl Renderer {
                     let identity_volume =
                         key.volume && std::env::var_os("NEXIUM_VOLUME_IDENTITY").is_some();
                     let volume_slices = if key.volume && !identity_volume {
-                        find_volume_rt_slices(rt_cache, &tic, pitch_size, key.layers)
+                        let sampled_key = call.sampled_rt_slots.get(slot).copied().flatten();
+                        find_volume_rt_slices(rt_cache, &tic, pitch_size, key.layers, sampled_key)
                     } else {
                         None
                     };
@@ -4041,57 +4042,30 @@ fn find_volume_rt_slices(
     tic: &crate::texture::TicEntry,
     pitch_size: usize,
     layers: u32,
+    base_key: Option<RtKey>,
 ) -> Option<Vec<VolumeRtSlice>> {
     if layers == 0 {
         return None;
     }
-    let nominal_slice_size = tic_layer_read_size(tic, pitch_size) as u64;
-    if nominal_slice_size == 0 {
+    let offsets = volume_slice_offsets(tic, pitch_size, layers)?;
+    if offsets.is_empty() {
         return None;
     }
     let allow_partial = std::env::var_os("NEXIUM_VOLUME_PARTIAL").is_some();
-    let Some((first_key, first_image, first_layout, first_format, first_stamp)) =
-        rt_cache.find_drawn_color_at(tic.width, tic.height, tic.gpu_va)
-    else {
-        if std::env::var_os("NEXIUM_VOLUME_DBG").is_some() {
-            use std::collections::HashSet;
-            use std::sync::{Mutex, OnceLock};
-            static MISSING: OnceLock<Mutex<HashSet<(u64, u32)>>> = OnceLock::new();
-            let missing = MISSING.get_or_init(|| Mutex::new(HashSet::new()));
-            if missing.lock().unwrap().insert((tic.gpu_va, 0)) {
-                log::warn!(
-                    "[volume-rt-miss] va={:#x} layer=0 slice_va={:#x} {}x{}x{} slice_size={}",
-                    tic.gpu_va,
-                    tic.gpu_va,
-                    tic.width,
-                    tic.height,
-                    layers,
-                    nominal_slice_size
-                );
-            }
-        }
-        return None;
-    };
-    let slice_size = nominal_slice_size.max(
-        (first_key.width as u64)
-            .saturating_mul(first_key.height as u64)
-            .saturating_mul(tic.format.src_bpp() as u64),
-    );
     let mut out = Vec::with_capacity(layers as usize);
-    out.push(VolumeRtSlice {
-        layer: 0,
-        key: first_key,
-        image: first_image,
-        layout: first_layout,
-        format: first_format,
-        stamp: first_stamp,
-    });
-    for layer in 1..layers {
-        let va = tic
-            .gpu_va
-            .checked_add(slice_size.saturating_mul(layer as u64))?;
-        let Some((key, image, layout, format, stamp)) =
-            rt_cache.find_drawn_color_at(tic.width, tic.height, va)
+    for layer in 0..layers {
+        let offset = offsets.get(layer as usize).copied()?;
+        let va = tic.gpu_va.checked_add(offset)?;
+        let cpu_addr = base_key
+            .and_then(|key| key.cpu_addr.checked_add(offset))
+            .unwrap_or(0);
+        let Some((key, image, layout, format, stamp)) = rt_cache
+            .find_drawn_color_at(tic.width, tic.height, va)
+            .or_else(|| {
+                base_key.and_then(|key| {
+                    rt_cache.find_drawn_color_at_cpu(tic.width, tic.height, key.nvmap_id, cpu_addr)
+                })
+            })
         else {
             if std::env::var_os("NEXIUM_VOLUME_DBG").is_some() {
                 use std::collections::HashSet;
@@ -4100,14 +4074,20 @@ fn find_volume_rt_slices(
                 let missing = MISSING.get_or_init(|| Mutex::new(HashSet::new()));
                 if missing.lock().unwrap().insert((tic.gpu_va, layer)) {
                     log::warn!(
-                        "[volume-rt-miss] va={:#x} layer={} slice_va={:#x} {}x{}x{} slice_size={}",
+                        "[volume-rt-miss] va={:#x} layer={} slice_va={:#x} cpu={:#x} off={:#x} {}x{}x{} bl={} bw={} bh={} bd={} tw={}",
                         tic.gpu_va,
                         layer,
                         va,
+                        cpu_addr,
+                        offset,
                         tic.width,
                         tic.height,
                         layers,
-                        slice_size
+                        tic.is_block_linear,
+                        tic.block_width_log2,
+                        tic.block_height_log2,
+                        tic.block_depth_log2,
+                        tic.tile_width_spacing
                     );
                 }
             }
@@ -4125,6 +4105,9 @@ fn find_volume_rt_slices(
             stamp,
         });
     }
+    if out.is_empty() {
+        return None;
+    }
     if std::env::var_os("NEXIUM_VOLUME_DBG").is_some() {
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
@@ -4140,14 +4123,19 @@ fn find_volume_rt_slices(
             formats.sort();
             formats.dedup();
             log::warn!(
-                "[volume-rt] va={:#x} {}x{}x{} found={}/{} slice_size={} first={} last={} formats={}",
+                "[volume-rt] va={:#x} {}x{}x{} found={}/{} last_off={:#x} bl={} bw={} bh={} bd={} tw={} first={} last={} formats={}",
                 tic.gpu_va,
                 tic.width,
                 tic.height,
                 layers,
                 out.len(),
                 layers,
-                slice_size,
+                offsets.last().copied().unwrap_or(0),
+                tic.is_block_linear,
+                tic.block_width_log2,
+                tic.block_height_log2,
+                tic.block_depth_log2,
+                tic.tile_width_spacing,
                 first,
                 last,
                 formats.join("|")
@@ -4155,6 +4143,84 @@ fn find_volume_rt_slices(
         }
     }
     Some(out)
+}
+
+fn volume_slice_offsets(
+    tic: &crate::texture::TicEntry,
+    pitch_size: usize,
+    layers: u32,
+) -> Option<Vec<u64>> {
+    if layers == 0 {
+        return None;
+    }
+    if tic.is_block_linear && tic_is_volume(tic) {
+        return Some(block_linear_volume_slice_offsets(tic, layers));
+    }
+    let slice_size = tic_layer_read_size(tic, pitch_size) as u64;
+    if slice_size == 0 {
+        return None;
+    }
+    Some(
+        (0..layers)
+            .map(|layer| slice_size.saturating_mul(layer as u64))
+            .collect(),
+    )
+}
+
+fn block_linear_volume_slice_offsets(tic: &crate::texture::TicEntry, layers: u32) -> Vec<u64> {
+    let (storage_width, storage_height, bpp) = tic.format.storage_extent(tic.width, tic.height);
+    let bpp_log2 = bytes_per_block_log2(bpp);
+    let width_bytes = (storage_width as u64) << bpp_log2;
+    let height_blocks = storage_height as u64;
+    let depth = layers.max(1) as u64;
+    let gobs_width = ceil_div_pow2(width_bytes, 6);
+    let gobs_height = ceil_div_pow2(height_blocks, 3);
+    let block_width = tic.block_width_log2;
+    let block_height = tic.block_height_log2;
+    let block_depth = tic.block_depth_log2;
+    let gob_width = 6u32
+        .saturating_sub(bpp_log2)
+        .saturating_add(tic.tile_width_spacing);
+    let gob_height = 3u32.saturating_add(block_height);
+    let small = width_bytes <= (1u64 << gob_width)
+        || height_blocks <= (1u64 << gob_height)
+        || depth < (1u64 << block_depth);
+    let aligned_gobs_width = if small {
+        gobs_width
+    } else {
+        align_up_pow2(gobs_width, tic.tile_width_spacing)
+    };
+    let tiles_width = ceil_div_pow2(aligned_gobs_width, block_width);
+    let tiles_height = ceil_div_pow2(gobs_height, block_height);
+    let gob_size_shift = 9u32.saturating_add(block_height);
+    let slice_size = (tiles_width.saturating_mul(tiles_height)) << gob_size_shift;
+    let z_mask = (1u64 << block_depth).saturating_sub(1);
+    (0..layers as u64)
+        .map(|z| {
+            ((z >> block_depth) * slice_size).saturating_add((z & z_mask) << gob_size_shift)
+        })
+        .collect()
+}
+
+fn bytes_per_block_log2(bpp: usize) -> u32 {
+    bpp.next_power_of_two().trailing_zeros()
+}
+
+fn ceil_div_pow2(value: u64, shift: u32) -> u64 {
+    if shift == 0 {
+        value
+    } else {
+        (value + (1u64 << shift) - 1) >> shift
+    }
+}
+
+fn align_up_pow2(value: u64, shift: u32) -> u64 {
+    if shift == 0 {
+        value
+    } else {
+        let mask = (1u64 << shift) - 1;
+        (value + mask) & !mask
+    }
 }
 
 fn volume_rt_slice_hash(mut hash: u64, slices: &[VolumeRtSlice]) -> u64 {
