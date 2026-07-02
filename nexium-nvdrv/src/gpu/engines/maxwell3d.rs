@@ -416,6 +416,8 @@ pub struct DrawTextureCall {
 pub struct Maxwell3D {
     pub regs: Maxwell3DRegisters,
     pub reg_file: Vec<u32>,
+    pub shadow_ram_control: u32,
+    pub shadow_regs: Vec<u32>,
     pub macro_engine: super::MacroEngine,
     pub method_freq: std::collections::HashMap<u32, u64>,
     method_profile_enabled: bool,
@@ -438,6 +440,8 @@ impl Maxwell3D {
         Self {
             regs: Maxwell3DRegisters::default(),
             reg_file: vec![0u32; 0xE00],
+            shadow_ram_control: 0,
+            shadow_regs: vec![0u32; 0xE00],
             macro_engine: super::MacroEngine::new(),
             method_freq: std::collections::HashMap::new(),
             method_profile_enabled: std::env::var("NEXIUM_GPU_METHOD_PROFILE")
@@ -547,6 +551,28 @@ impl Maxwell3D {
     }
 
     pub fn write_register(&mut self, method: u32, arg: u32) {
+        let arg = if method == 0x49 {
+            self.shadow_ram_control = arg;
+            arg
+        } else {
+            let m = method as usize;
+            match self.shadow_ram_control {
+                0 | 1 => {
+                    if m < self.shadow_regs.len() {
+                        self.shadow_regs[m] = arg;
+                    }
+                    arg
+                }
+                3 => {
+                    if m < self.shadow_regs.len() {
+                        self.shadow_regs[m]
+                    } else {
+                        arg
+                    }
+                }
+                _ => arg,
+            }
+        };
         if (method as usize) < self.reg_file.len() {
             self.reg_file[method as usize] = arg;
         }
@@ -732,7 +758,17 @@ impl Maxwell3D {
                 self.regs.surface_clip.height = arg >> 16;
             }
             0x4EB => self.regs.window_origin.raw = arg,
-            0x64B => self.regs.viewport_transform_en = arg & 1 != 0,
+            0x64B => {
+                self.regs.viewport_transform_en = arg & 1 != 0;
+                if std::env::var_os("NEXIUM_VPEN_DBG").is_some() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    if n < 200 {
+                        log::warn!("[vp-en] #{} arg={} draws={}", n, arg & 1, self.regs.draw_count);
+                    }
+                }
+            }
             0x64F => self.regs.viewport_clip_control.raw = arg,
             0x50D => self.regs.global_base_vertex_index = arg,
             0x50E => self.regs.global_base_instance_index = arg,
