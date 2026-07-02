@@ -765,7 +765,12 @@ impl Maxwell3D {
                     static N: AtomicU64 = AtomicU64::new(0);
                     let n = N.fetch_add(1, Ordering::Relaxed);
                     if n < 200 {
-                        log::warn!("[vp-en] #{} arg={} draws={}", n, arg & 1, self.regs.draw_count);
+                        log::warn!(
+                            "[vp-en] #{} arg={} draws={}",
+                            n,
+                            arg & 1,
+                            self.regs.draw_count
+                        );
                     }
                 }
             }
@@ -830,7 +835,7 @@ impl Maxwell3D {
                 );
                 self.push_draw(
                     self.regs.draw_topology,
-                    0,
+                    self.regs.global_base_vertex_index,
                     0,
                     true,
                     arg,
