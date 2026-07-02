@@ -84,6 +84,8 @@ pub struct Emitter {
     synth_pred_phi_results: HashMap<(Word, ValueId), Word>,
     merge_redirects: HashMap<(u32, u32), Word>,
     block_end_labels: HashMap<BlockId, Word>,
+    self_loops: HashMap<BlockId, (Word, Word, Word, BlockId)>,
+    loop_carried: HashMap<BlockId, Vec<(ValueId, Word, Word)>>,
     current_block: Option<BlockId>,
     cbuf_bindings_used: u32,
     texs_ids_used: std::collections::BTreeSet<u32>,
@@ -112,6 +114,7 @@ pub struct Emitter {
 struct AttrVar {
     var: Word,
     ptr_f32: Word,
+    is_uint: bool,
 }
 
 impl Emitter {
@@ -264,6 +267,8 @@ impl Emitter {
             synth_pred_phi_results: HashMap::new(),
             merge_redirects: HashMap::new(),
             block_end_labels: HashMap::new(),
+            self_loops: HashMap::new(),
+            loop_carried: HashMap::new(),
             current_block: None,
             cbuf_bindings_used: 0,
             texs_ids_used: std::collections::BTreeSet::new(),
@@ -312,6 +317,8 @@ impl Emitter {
             self.b.decorate(st, Decoration::BufferBlock, []);
             self.b
                 .member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+            self.b
+                .member_decorate(st, 0, Decoration::NonWritable, []);
             let ptr_struct = self.b.type_pointer(None, StorageClass::Uniform, st);
             let var = self
                 .b
@@ -469,22 +476,40 @@ impl Emitter {
             let av = AttrVar {
                 var: 0,
                 ptr_f32: self.ptr_input_f32,
+                is_uint: false,
             };
             self.input_vars.insert(slot, av);
             return av;
         }
-        let var = self
-            .b
-            .variable(self.ptr_input_vec4, None, StorageClass::Input, None);
-        self.b
-            .decorate(var, Decoration::Location, [Operand::LiteralBit32(location)]);
-        self.decorate_fs_input_interpolation(var, location);
-        let av = AttrVar {
-            var,
-            ptr_f32: self.ptr_input_f32,
+        let is_uint = matches!(self.stage, Stage::Vertex)
+            && (self.vertex_opts.int_attr_mask >> location) & 1 == 1;
+        let av = if is_uint {
+            let uvec4_t = self.b.type_vector(self.u32_t, 4);
+            let ptr_uvec4 = self.b.type_pointer(None, StorageClass::Input, uvec4_t);
+            let ptr_u32 = self.b.type_pointer(None, StorageClass::Input, self.u32_t);
+            let var = self.b.variable(ptr_uvec4, None, StorageClass::Input, None);
+            self.b
+                .decorate(var, Decoration::Location, [Operand::LiteralBit32(location)]);
+            AttrVar {
+                var,
+                ptr_f32: ptr_u32,
+                is_uint: true,
+            }
+        } else {
+            let var = self
+                .b
+                .variable(self.ptr_input_vec4, None, StorageClass::Input, None);
+            self.b
+                .decorate(var, Decoration::Location, [Operand::LiteralBit32(location)]);
+            self.decorate_fs_input_interpolation(var, location);
+            AttrVar {
+                var,
+                ptr_f32: self.ptr_input_f32,
+                is_uint: false,
+            }
         };
         self.input_vars.insert(slot, av);
-        self.interface.push(var);
+        self.interface.push(av.var);
         av
     }
 
@@ -534,6 +559,7 @@ impl Emitter {
             let av = AttrVar {
                 var: 0,
                 ptr_f32: self.ptr_output_f32,
+                is_uint: false,
             };
             self.output_vars.insert(slot, av);
             return av;
@@ -546,6 +572,7 @@ impl Emitter {
         let av = AttrVar {
             var,
             ptr_f32: self.ptr_output_f32,
+            is_uint: false,
         };
         self.output_vars.insert(slot, av);
         self.interface.push(var);
@@ -718,7 +745,12 @@ impl Emitter {
             .b
             .access_chain(av.ptr_f32, None, av.var, [idx])
             .unwrap();
-        self.b.load(self.f32_t, None, ac, None, []).unwrap()
+        if av.is_uint {
+            let raw = self.b.load(self.u32_t, None, ac, None, []).unwrap();
+            self.b.bitcast(self.f32_t, None, raw).unwrap()
+        } else {
+            self.b.load(self.f32_t, None, ac, None, []).unwrap()
+        }
     }
 
     fn write_attr_component(&mut self, av: AttrVar, component: u32, val: Word) {
@@ -2108,6 +2140,25 @@ impl Emitter {
     fn lower_cfg(&mut self, cfg: &Cfg) {
         let single_block = cfg.blocks.len() <= 1;
         for (idx, block) in cfg.blocks.iter().enumerate() {
+            if idx == 0 {
+                continue;
+            }
+            let back_target = match block.branch {
+                BranchKind::Conditional { target, .. } if target <= block.id => Some(target),
+                BranchKind::Unconditional { target } if target <= block.id => Some(target),
+                _ => None,
+            };
+            if let Some(header) = back_target {
+                if header == 0 {
+                    continue;
+                }
+                let body = self.b.id();
+                let cont = self.b.id();
+                let merge = self.b.id();
+                self.self_loops.insert(header, (body, cont, merge, block.id));
+            }
+        }
+        for (idx, block) in cfg.blocks.iter().enumerate() {
             let is_first = idx == 0;
             if !is_first {
                 self.emit_synth_merge_blocks(block);
@@ -2117,6 +2168,13 @@ impl Emitter {
             self.current_block = Some(block.id);
             self.lower_pred_phis(block);
             self.lower_phis(block);
+            if let Some(&(body, cont, merge, _)) = self.self_loops.get(&block.id) {
+                self.b
+                    .loop_merge(merge, cont, rspirv::spirv::LoopControl::NONE, [])
+                    .unwrap();
+                self.b.branch(body).unwrap();
+                self.b.begin_block(Some(body)).unwrap();
+            }
             for inst in &block.program.instructions {
                 if matches!(inst.op, IrOp::Phi { .. }) {
                     continue;
@@ -2160,6 +2218,22 @@ impl Emitter {
                 }
             } else {
                 for (pred, val) in &phi.sources {
+                    if let Some(&(_, cont, _, latch)) = self.self_loops.get(&m) {
+                        if *pred == latch {
+                            let v = match val {
+                                Some(id) if !self.value_to_word.contains_key(id) => {
+                                    let w = self.b.id();
+                                    let bt = self.bool_t;
+                                    self.loop_carried.entry(m).or_default().push((*id, w, bt));
+                                    w
+                                }
+                                Some(id) => self.value_to_word[id],
+                                None => self.bool_false,
+                            };
+                            pairs.push((v, cont));
+                            continue;
+                        }
+                    }
                     let v = val
                         .and_then(|id| self.value_to_word.get(&id).copied())
                         .unwrap_or(self.bool_false);
@@ -2208,6 +2282,24 @@ impl Emitter {
                 }
             } else {
                 for (pred_id, val) in sources {
+                    if let Some(&(_, cont, _, latch)) = self.self_loops.get(&m) {
+                        if *pred_id == latch {
+                            let v = match val {
+                                IrValue::Inst(id) if !self.value_to_word.contains_key(id) => {
+                                    let w = self.b.id();
+                                    self.loop_carried.entry(m).or_default().push((
+                                        *id,
+                                        w,
+                                        f32_t,
+                                    ));
+                                    w
+                                }
+                                _ => self.lower_value(val),
+                            };
+                            pairs.push((v, cont));
+                            continue;
+                        }
+                    }
                     let v = self.lower_value(val);
                     let label = self.phi_pred_label(*pred_id);
                     pairs.push((v, label));
@@ -2218,6 +2310,40 @@ impl Emitter {
                 self.value_to_word.insert(rid, id);
             }
         }
+    }
+
+    fn emit_self_loop_close(&mut self, header_id: BlockId, latch_id: BlockId, cond: Option<Word>) {
+        let (_, cont, merge, _) = self.self_loops[&header_id];
+        match cond {
+            Some(c) => self.b.branch_conditional(c, cont, merge, []).unwrap(),
+            None => self.b.branch(cont).unwrap(),
+        }
+        self.b.begin_block(Some(cont)).unwrap();
+        if let Some(carried) = self.loop_carried.get(&header_id).cloned() {
+            for (vid, reserved, ty) in carried {
+                let actual = match self.value_to_word.get(&vid).copied() {
+                    Some(a) => a,
+                    None => {
+                        if ty == self.bool_t {
+                            self.bool_false
+                        } else {
+                            self.f32_undef_id()
+                        }
+                    }
+                };
+                self.b.copy_object(ty, Some(reserved), actual).unwrap();
+            }
+        }
+        let header = self.block_labels[&header_id];
+        self.b.branch(header).unwrap();
+        self.b.begin_block(Some(merge)).unwrap();
+        let next = latch_id + 1;
+        if let Some(&nl) = self.block_labels.get(&next) {
+            self.b.branch(nl).unwrap();
+        } else if let Some(rb) = self.return_block {
+            self.b.branch(rb).unwrap();
+        }
+        self.block_end_labels.insert(latch_id, merge);
     }
 
     fn emit_terminator(&mut self, block: &BasicBlock) {
@@ -2290,10 +2416,27 @@ impl Emitter {
                 }
             }
             BranchKind::Unconditional { target } => {
+                if self
+                    .self_loops
+                    .get(&target)
+                    .map_or(false, |&(_, _, _, latch)| latch == block.id)
+                {
+                    self.emit_self_loop_close(target, block.id, None);
+                    return;
+                }
                 let lbl = self.merge_redirect(block.id, target);
                 self.b.branch(lbl).unwrap();
             }
             BranchKind::Conditional { target, pred } => {
+                if self
+                    .self_loops
+                    .get(&target)
+                    .map_or(false, |&(_, _, _, latch)| latch == block.id)
+                {
+                    let cond = self.resolve_pred(pred.idx, pred.negate);
+                    self.emit_self_loop_close(target, block.id, Some(cond));
+                    return;
+                }
                 let next = block.id + 1;
                 if self.block_labels.contains_key(&next) {
                     let cond = self.resolve_pred(pred.idx, pred.negate);
@@ -2452,7 +2595,7 @@ impl Emitter {
         cfg: &Cfg,
         required_output_locations: &[u32],
     ) -> (Vec<u32>, u32) {
-        let (words, mask, _ids) = self.finish_inner(cfg, required_output_locations);
+        let (words, mask, _ids, _) = self.finish_inner(cfg, required_output_locations);
         (words, mask)
     }
 
@@ -2461,6 +2604,15 @@ impl Emitter {
         cfg: &Cfg,
         required_output_locations: &[u32],
     ) -> (Vec<u32>, u32, Vec<u32>) {
+        let (words, mask, tex_ids, _) = self.finish_inner(cfg, required_output_locations);
+        (words, mask, tex_ids)
+    }
+
+    pub fn finish_full_meta(
+        self,
+        cfg: &Cfg,
+        required_output_locations: &[u32],
+    ) -> (Vec<u32>, u32, Vec<u32>, bool) {
         self.finish_inner(cfg, required_output_locations)
     }
 
@@ -2476,8 +2628,9 @@ impl Emitter {
         mut self,
         cfg: &Cfg,
         required_output_locations: &[u32],
-    ) -> (Vec<u32>, u32, Vec<u32>) {
+    ) -> (Vec<u32>, u32, Vec<u32>, bool) {
         self.preallocate_resources(cfg);
+        let sampler_arrayed = self.sampler_arrayed;
 
         let ps_inject: Option<(Word, u32)> = if matches!(self.stage, Stage::Vertex) {
             self.vertex_opts
@@ -2793,7 +2946,7 @@ impl Emitter {
                 let _ = f.write_all(&bytes);
             }
         }
-        (words, bindings, tex_ids)
+        (words, bindings, tex_ids, sampler_arrayed)
     }
 }
 
@@ -3059,6 +3212,7 @@ pub struct VertexOptions {
     pub point_size: Option<f32>,
     pub window_ndc: Option<(f32, f32)>,
     pub num_ssbo: u32,
+    pub int_attr_mask: u32,
 }
 
 impl Default for VertexOptions {
@@ -3071,6 +3225,7 @@ impl Default for VertexOptions {
             point_size: None,
             window_ndc: None,
             num_ssbo: 0,
+            int_attr_mask: 0,
         }
     }
 }
@@ -3111,11 +3266,19 @@ pub fn emit_fragment_full_with_input_map(
     cfg: &Cfg,
     ps_input_map: [u8; 32],
 ) -> (Vec<u32>, u32, Vec<u32>, u32) {
+    let (words, mask, tex_ids, cbuf_size, _) = emit_fragment_full_with_input_map_meta(cfg, ps_input_map);
+    (words, mask, tex_ids, cbuf_size)
+}
+
+pub fn emit_fragment_full_with_input_map_meta(
+    cfg: &Cfg,
+    ps_input_map: [u8; 32],
+) -> (Vec<u32>, u32, Vec<u32>, u32, bool) {
     let vec4s = cbuf_vec4s(cfg, 1).max(UBO_VEC4S);
     let mut emitter = Emitter::new_sized(Stage::Fragment, vec4s);
     emitter.ps_input_map = ps_input_map;
-    let (words, mask, tex_ids) = emitter.finish_full(cfg, &[]);
-    (words, mask, tex_ids, vec4s * 16)
+    let (words, mask, tex_ids, sampler_arrayed) = emitter.finish_full_meta(cfg, &[]);
+    (words, mask, tex_ids, vec4s * 16, sampler_arrayed)
 }
 
 pub fn scan_input_locations(words: &[u32]) -> Vec<u32> {
