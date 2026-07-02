@@ -27,6 +27,7 @@ const LIFO_STORAGE_COUNT: usize = 17;
 
 pub const STYLE_FULLKEY: u32 = 1 << 0;
 pub const STYLE_HANDHELD: u32 = 1 << 1;
+pub const STYLE_JOY_DUAL: u32 = 1 << 2;
 pub const STYLE_SYSTEM_EXT: u32 = 1 << 29;
 
 pub const ATTR_IS_CONNECTED: u32 = 1 << 0;
@@ -132,10 +133,16 @@ impl HidState {
         for entry_idx in 0..=NPAD_ENTRY_OTHER {
             match entry_idx {
                 NPAD_ENTRY_PLAYER1 => {
+                    let joy_attr = ATTR_IS_CONNECTED
+                        | ATTR_IS_WIRED
+                        | ATTR_LEFT_CONNECTED
+                        | ATTR_LEFT_WIRED
+                        | ATTR_RIGHT_CONNECTED
+                        | ATTR_RIGHT_WIRED;
                     Self::write_entry_style(
                         &mut self.buf[..],
                         entry_idx,
-                        STYLE_FULLKEY | STYLE_SYSTEM_EXT,
+                        STYLE_FULLKEY | STYLE_JOY_DUAL | STYLE_SYSTEM_EXT,
                     );
                     Self::write_npad_lifo(
                         &mut self.buf[..],
@@ -144,6 +151,14 @@ impl HidState {
                         &input,
                         sampling,
                         ATTR_IS_CONNECTED | ATTR_IS_WIRED,
+                    );
+                    Self::write_npad_lifo(
+                        &mut self.buf[..],
+                        entry_idx,
+                        2,
+                        &input,
+                        sampling,
+                        joy_attr,
                     );
                     Self::write_npad_lifo(
                         &mut self.buf[..],
@@ -250,7 +265,7 @@ impl HidState {
         for idx in 0..=NPAD_ENTRY_OTHER {
             let base = NPAD_OFFSET + idx * NPAD_ENTRY_SIZE;
             let style = match idx {
-                NPAD_ENTRY_PLAYER1 => STYLE_FULLKEY | STYLE_SYSTEM_EXT,
+                NPAD_ENTRY_PLAYER1 => STYLE_FULLKEY | STYLE_JOY_DUAL | STYLE_SYSTEM_EXT,
                 NPAD_ENTRY_HANDHELD => STYLE_HANDHELD | STYLE_SYSTEM_EXT,
                 _ => 0,
             };
