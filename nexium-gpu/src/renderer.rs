@@ -1095,6 +1095,140 @@ impl Renderer {
         Some(out)
     }
 
+    pub fn readback_target_raw(
+        &self,
+        nvmap_id: u32,
+        gpu_va: u64,
+    ) -> Option<(u32, u32, usize, Vec<u8>)> {
+        let mut inner = self.inner.lock();
+        let RendererInner {
+            device,
+            cmd_pool,
+            queue,
+            rt_cache,
+            mem_props,
+            ..
+        } = &mut *inner;
+        let key = rt_cache.find_color_key_at_va(nvmap_id, gpu_va)?;
+        let format = rt_cache.get_existing(key)?.format;
+        let bpp = readback_format_bpp(format);
+        let total = (key.width as u64) * (key.height as u64) * bpp as u64;
+        let stage = create_staging_owned(device, mem_props, total).ok()?;
+        let fence_info = vk::FenceCreateInfo {
+            s_type: vk::StructureType::FENCE_CREATE_INFO,
+            flags: vk::FenceCreateFlags::empty(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        let cleanup = |device: &ash::Device,
+                       cmd_pool: vk::CommandPool,
+                       fence: Option<vk::Fence>,
+                       cmd: Option<vk::CommandBuffer>,
+                       stage: &StagingBuffer| unsafe {
+            if let Some(c) = cmd {
+                device.free_command_buffers(cmd_pool, &[c]);
+            }
+            if let Some(f) = fence {
+                device.destroy_fence(f, None);
+            }
+            device.destroy_buffer(stage.buffer, None);
+            device.free_memory(stage.memory, None);
+        };
+        let fence = match unsafe { device.create_fence(&fence_info, None) } {
+            Ok(f) => f,
+            Err(_) => {
+                cleanup(device, *cmd_pool, None, None, &stage);
+                return None;
+            }
+        };
+        let cmd = match alloc_one_time_cmd(device, *cmd_pool) {
+            Ok(c) => c,
+            Err(_) => {
+                cleanup(device, *cmd_pool, Some(fence), None, &stage);
+                return None;
+            }
+        };
+        if begin_one_time(device, cmd).is_err() {
+            cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+            return None;
+        }
+        let img = match rt_cache.get_existing(key) {
+            Some(i) => i,
+            None => {
+                unsafe {
+                    let _ = device.end_command_buffer(cmd);
+                }
+                cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+                return None;
+            }
+        };
+        let prev_layout = img.layout;
+        transition_image(
+            device,
+            cmd,
+            img.image,
+            prev_layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        let copy = vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width: key.width,
+                height: key.height,
+                depth: 1,
+            },
+        };
+        unsafe {
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                img.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                stage.buffer,
+                &[copy],
+            );
+        }
+        if prev_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+            && prev_layout != vk::ImageLayout::UNDEFINED
+        {
+            transition_image(
+                device,
+                cmd,
+                img.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                prev_layout,
+            );
+        } else {
+            img.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        }
+        if end_one_time(device, cmd).is_err()
+            || submit_with_fence(device, *queue, cmd, fence).is_err()
+        {
+            cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+            return None;
+        }
+        let mut raw = vec![0u8; total as usize];
+        unsafe {
+            let _ = device.wait_for_fences(&[fence], true, u64::MAX);
+            if let Ok(ptr) =
+                device.map_memory(stage.memory, 0, stage.size, vk::MemoryMapFlags::empty())
+            {
+                std::ptr::copy_nonoverlapping(ptr as *const u8, raw.as_mut_ptr(), total as usize);
+                device.unmap_memory(stage.memory);
+            }
+        }
+        cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+        Some((key.width, key.height, bpp, raw))
+    }
+
     pub fn readback_target_pipelined(
         &self,
         nvmap_id: u32,
@@ -2622,13 +2756,49 @@ impl Renderer {
                                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                                 );
                             } else {
-                                transition_image(
-                                    device,
-                                    cmd,
-                                    alias.image,
-                                    alias_prev,
-                                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                                );
+                                if alias_prev == vk::ImageLayout::UNDEFINED {
+                                    transition_image(
+                                        device,
+                                        cmd,
+                                        alias.image,
+                                        vk::ImageLayout::UNDEFINED,
+                                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                    );
+                                    let clear = vk::ClearColorValue {
+                                        float32: [0.0, 0.0, 0.0, 0.0],
+                                    };
+                                    let range = vk::ImageSubresourceRange {
+                                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                                        base_mip_level: 0,
+                                        level_count: 1,
+                                        base_array_layer: 0,
+                                        layer_count: 1,
+                                    };
+                                    unsafe {
+                                        device.cmd_clear_color_image(
+                                            cmd,
+                                            alias.image,
+                                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                            &clear,
+                                            &[range],
+                                        );
+                                    }
+                                    transition_image(
+                                        device,
+                                        cmd,
+                                        alias.image,
+                                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                    );
+                                } else {
+                                    transition_image(
+                                        device,
+                                        cmd,
+                                        alias.image,
+                                        alias_prev,
+                                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                    );
+                                }
                                 rt_cache.set_color_layout(
                                     alias.key,
                                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,

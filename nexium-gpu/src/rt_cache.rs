@@ -277,6 +277,14 @@ impl RtCache {
         self.cache.get_mut(&key)
     }
 
+    pub fn find_color_key_at_va(&self, nvmap_id: u32, gpu_va: u64) -> Option<RtKey> {
+        self.cache
+            .keys()
+            .filter(|k| k.nvmap_id == nvmap_id && k.gpu_va == gpu_va)
+            .max_by_key(|k| self.drawn_stamp.get(*k).copied().unwrap_or(0))
+            .copied()
+    }
+
     pub fn get_or_create_with_format(
         &mut self,
         key: RtKey,
