@@ -590,9 +590,9 @@ fn decode_b10g11r11(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
     let pixels = width as usize * height as usize;
     for i in 0..pixels.min(src.len() / 4) {
         let p = u32::from_le_bytes([src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3]]);
-        let b = decode_ufloat(p & 0x3ff, 5);
-        let g = decode_ufloat((p >> 10) & 0x7ff, 6);
-        let r = decode_ufloat((p >> 21) & 0x7ff, 6);
+        let r = decode_ufloat(p & 0x7ff, 6);
+        let g = decode_ufloat((p >> 11) & 0x7ff, 6);
+        let b = decode_ufloat((p >> 22) & 0x3ff, 5);
         out[i * 4] = float_to_u8(r);
         out[i * 4 + 1] = float_to_u8(g);
         out[i * 4 + 2] = float_to_u8(b);
@@ -657,10 +657,10 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
                     src[i * 4 + 2],
                     src[i * 4 + 3],
                 ]);
-                let a = v & 0x3;
-                let b = (v >> 2) & 0x3ff;
-                let g = (v >> 12) & 0x3ff;
-                let r = (v >> 22) & 0x3ff;
+                let r = v & 0x3ff;
+                let g = (v >> 10) & 0x3ff;
+                let b = (v >> 20) & 0x3ff;
+                let a = (v >> 30) & 0x3;
                 out[i * 4] = ((r * 255 + 511) / 1023) as u8;
                 out[i * 4 + 1] = ((g * 255 + 511) / 1023) as u8;
                 out[i * 4 + 2] = ((b * 255 + 511) / 1023) as u8;
