@@ -763,6 +763,76 @@ fn depth_disabled() -> bool {
     *D.get_or_init(|| std::env::var("NEXIUM_NO_DEPTH").ok().as_deref() == Some("1"))
 }
 
+fn small_rt_registry() -> &'static std::sync::Mutex<std::collections::HashMap<RtKey, u32>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<RtKey, u32>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn writeback_small_rts(
+    renderer: &Arc<nexium_gpu::Renderer>,
+    mappings: &GpuMappings,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+) {
+    let pending: Vec<(RtKey, u32)> = {
+        let mut reg = small_rt_registry().lock().unwrap();
+        if reg.is_empty() {
+            return;
+        }
+        reg.drain().collect()
+    };
+    if let Some(rt) = crate::render_thread::maybe_render_thread() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt.submit(Box::new(move || {
+            let _ = tx.send(());
+        }));
+        let _ = rx.recv_timeout(std::time::Duration::from_millis(250));
+    }
+    for (key, tile_mode) in pending {
+        let Some((kw, kh, bpp, mut raw)) = renderer.readback_target_raw(key.nvmap_id, key.gpu_va)
+        else {
+            continue;
+        };
+        let Some((cpu, limit)) = mappings.cpu_range_for(key.gpu_va) else {
+            continue;
+        };
+        let width_bytes = kw as usize * bpp;
+        if kh >= 2 && raw.len() >= width_bytes * kh as usize {
+            let h = kh as usize;
+            for y in 0..h / 2 {
+                let (top, bot) = raw.split_at_mut((h - 1 - y) * width_bytes);
+                top[y * width_bytes..(y + 1) * width_bytes]
+                    .swap_with_slice(&mut bot[..width_bytes]);
+            }
+        }
+        if (tile_mode >> 12) & 1 == 1 {
+            let n = raw.len().min(limit as usize);
+            mem_write(cpu, &raw[..n]);
+        } else {
+            let bh_log2 = (tile_mode >> 4) & 0x7;
+            let tiled = super::engines::maxwell_dma::swizzle_block_linear(
+                &raw,
+                width_bytes,
+                kh as usize,
+                width_bytes,
+                width_bytes,
+                kh as usize,
+                bh_log2,
+                0,
+                0,
+            );
+            let n = tiled.len().min(limit as usize);
+            mem_write(cpu, &tiled[..n]);
+        }
+        log::info!(
+            "[rt-writeback] {} bpp={} tile={:#x}",
+            key.label(),
+            bpp,
+            tile_mode
+        );
+    }
+}
+
 fn execute_one(
     draw: &DrawCall,
     mappings: &GpuMappings,
@@ -797,6 +867,12 @@ fn execute_one(
         .iter()
         .map(|(_, format)| *format)
         .collect::<Vec<_>>();
+    if !draw.is_clear && (rt.width as u64) * (rt.height as u64) <= 16384 {
+        small_rt_registry()
+            .lock()
+            .unwrap()
+            .insert(rt_key, rt.tile_mode);
+    }
     let no_depth = depth_disabled();
     let zeta_key = zeta_rt_key(draw, mappings, rt_key);
 

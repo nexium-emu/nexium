@@ -146,6 +146,41 @@ impl MaxwellDma {
         let Some((src_cpu, limit)) = mappings.cpu_range_for(src_gpu) else {
             return;
         };
+        let bh_log2 = ((self.src_block_size >> 4) & 0xF) as u32;
+        if let Some((kw, kh, bpp, mut raw)) = renderer.readback_target_raw(nvmap, src_gpu) {
+            let width_bytes = (kw as usize) * bpp;
+            if kh >= 2 && raw.len() >= width_bytes * kh as usize {
+                let h = kh as usize;
+                for y in 0..h / 2 {
+                    let (top, bot) = raw.split_at_mut((h - 1 - y) * width_bytes);
+                    top[y * width_bytes..(y + 1) * width_bytes]
+                        .swap_with_slice(&mut bot[..width_bytes]);
+                }
+            }
+            let tiled = swizzle_block_linear(
+                &raw,
+                width_bytes,
+                kh as usize,
+                width_bytes,
+                width_bytes,
+                kh as usize,
+                bh_log2,
+                0,
+                0,
+            );
+            let n = tiled.len().min(limit as usize);
+            mem_write(src_cpu, &tiled[..n]);
+            log::debug!(
+                "MaxwellDma::stage_rt_source raw va={:#x} nvmap={} {}x{} bpp={} bytes={}",
+                src_gpu,
+                nvmap,
+                kw,
+                kh,
+                bpp,
+                n
+            );
+            return;
+        }
         let Some((kw, kh)) = renderer.rt_key_for_nvmap(nvmap, self.src_width, self.src_height)
         else {
             return;
@@ -154,7 +189,6 @@ impl MaxwellDma {
             return;
         };
         let width_bytes = (kw as usize) * 4;
-        let bh_log2 = ((self.src_block_size >> 4) & 0xF) as u32;
         if kh >= 2 && rgba.len() >= width_bytes * kh as usize {
             let h = kh as usize;
             for y in 0..h / 2 {
@@ -644,7 +678,7 @@ fn in_gob_offset(x: usize, y: usize) -> usize {
     ((x >> 5) & 1) * 256 + ((y >> 1) & 3) * 64 + ((x >> 4) & 1) * 32 + (y & 1) * 16 + (x & 15)
 }
 
-pub(super) fn swizzle_block_linear(
+pub(crate) fn swizzle_block_linear(
     src_linear: &[u8],
     copy_width_bytes: usize,
     copy_height: usize,

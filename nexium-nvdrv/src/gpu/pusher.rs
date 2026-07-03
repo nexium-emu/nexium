@@ -185,6 +185,9 @@ impl Pusher {
             );
         }
         self.flush_vk(mappings, mem_read);
+        if let Some(r) = self.renderer.clone() {
+            super::vk_dispatch::writeback_small_rts(&r, mappings, mem_write);
+        }
     }
 
     pub fn process_entry(

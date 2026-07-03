@@ -340,6 +340,9 @@ impl GpuContext {
         let entries_ms = if profile { elapsed_ms(t_entries) } else { 0.0 };
         let t_flush = std::time::Instant::now();
         pusher.flush_vk(&mappings, &mem_read);
+        if let Some(r) = pusher.renderer.clone() {
+            vk_dispatch::writeback_small_rts(&r, &mappings, &mem_write);
+        }
         let flush_ms = if profile { elapsed_ms(t_flush) } else { 0.0 };
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         if profile {
