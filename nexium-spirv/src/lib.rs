@@ -1770,6 +1770,42 @@ impl Emitter {
                 let r = self.b.i_mul(self.u32_t, None, au, bu).unwrap();
                 Some(self.store_bits(r))
             }
+            IrOp::IMinMaxPred {
+                a,
+                b,
+                signed,
+                pred,
+                neg_pred,
+            } => {
+                let av = self.lower_value(a);
+                let bv = self.lower_value(b);
+                let au = self.as_u32(av);
+                let bu = self.as_u32(bv);
+                let (min_op, max_op) = if *signed { (39, 42) } else { (38, 41) };
+                let min = self
+                    .b
+                    .ext_inst(
+                        self.u32_t,
+                        None,
+                        self.glsl,
+                        min_op,
+                        [Operand::IdRef(au), Operand::IdRef(bu)],
+                    )
+                    .unwrap();
+                let max = self
+                    .b
+                    .ext_inst(
+                        self.u32_t,
+                        None,
+                        self.glsl,
+                        max_op,
+                        [Operand::IdRef(au), Operand::IdRef(bu)],
+                    )
+                    .unwrap();
+                let cond = self.resolve_pred(*pred, *neg_pred);
+                let r = self.b.select(self.u32_t, None, cond, min, max).unwrap();
+                Some(self.store_bits(r))
+            }
             IrOp::IScAdd {
                 a,
                 b,

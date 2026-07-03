@@ -196,6 +196,7 @@ fn bra_target(pc: usize, raw: u64) -> usize {
 fn discover_sync_targets(bytes: &[u8]) -> HashMap<usize, usize> {
     let mut targets = HashMap::new();
     let mut stack = Vec::new();
+    let mut pbk_stack = Vec::new();
     let mut offset = 0usize;
     while offset + 8 <= bytes.len() {
         if is_schedule(offset) {
@@ -211,6 +212,15 @@ fn discover_sync_targets(bytes: &[u8]) -> HashMap<usize, usize> {
                         targets.insert(offset, target);
                         if decoded_pred(raw).is_none() {
                             stack.pop();
+                        }
+                    }
+                }
+                Opcode::PBK => pbk_stack.push(bra_target(offset, raw)),
+                Opcode::BRK => {
+                    if let Some(&target) = pbk_stack.last() {
+                        targets.insert(offset, target);
+                        if decoded_pred(raw).is_none() {
+                            pbk_stack.pop();
                         }
                     }
                 }
@@ -257,7 +267,7 @@ fn discover_leaders(bytes: &[u8], sync_targets: &HashMap<usize, usize>) -> BTree
                     }
                     break;
                 }
-                Opcode::SYNC => {
+                Opcode::SYNC | Opcode::BRK => {
                     if let Some(&target) = sync_targets.get(&offset) {
                         if target < bytes.len() && leaders.insert(target) {
                             worklist.push(target);
@@ -404,7 +414,7 @@ fn discover_topology(
                         terminator_offset = Some(offset);
                         break;
                     }
-                    Opcode::SYNC => {
+                    Opcode::SYNC | Opcode::BRK => {
                         if let Some(&target_off) = sync_targets.get(&offset) {
                             let target = *offset_to_block.get(&target_off).unwrap_or(&(i as u32));
                             match decoded_pred(raw) {

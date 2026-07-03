@@ -198,6 +198,38 @@ impl Translator {
         );
     }
 
+    fn emit_imad(&mut self, raw: u64, b: Value, c: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        let prod = self.emit_imul_value(a, b);
+        self.write_reg(
+            dest,
+            Op::IAdd {
+                a: prod,
+                b: c,
+                neg_a: false,
+                neg_b: false,
+            },
+            pred,
+        );
+    }
+
+    fn emit_imnmx(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        self.write_reg(
+            dest,
+            Op::IMinMaxPred {
+                a,
+                b,
+                signed: (raw >> 48) & 1 == 1,
+                pred: fmnmx_pred(raw),
+                neg_pred: fmnmx_neg_pred(raw),
+            },
+            pred,
+        );
+    }
+
     fn emit_sel(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
         let dest = reg_dest(raw);
         let a = self.read_reg(reg_a(raw));
@@ -901,7 +933,39 @@ impl Translator {
                 self.emit_isetp(raw, Value::ImmU32(imm20(raw) as u32), pred);
             }
 
-            Opcode::SSY | Opcode::SYNC => {}
+            Opcode::SSY | Opcode::SYNC | Opcode::PBK | Opcode::BRK => {}
+
+            Opcode::IMAD_reg => {
+                let b = self.read_reg(reg_b(raw));
+                let c = self.read_reg(reg_c(raw));
+                self.emit_imad(raw, b, c, pred);
+            }
+            Opcode::IMAD_cr => {
+                let cb = self.load_cbuf(raw);
+                let c = self.read_reg(reg_c(raw));
+                self.emit_imad(raw, Value::Inst(cb), c, pred);
+            }
+            Opcode::IMAD_rc => {
+                let b = self.read_reg(reg_c(raw));
+                let cb = self.load_cbuf(raw);
+                self.emit_imad(raw, b, Value::Inst(cb), pred);
+            }
+            Opcode::IMAD_imm => {
+                let c = self.read_reg(reg_c(raw));
+                self.emit_imad(raw, Value::ImmU32(imm20(raw) as u32), c, pred);
+            }
+
+            Opcode::IMNMX_reg => {
+                let b = self.read_reg(reg_b(raw));
+                self.emit_imnmx(raw, b, pred);
+            }
+            Opcode::IMNMX_cbuf => {
+                let id = self.load_cbuf(raw);
+                self.emit_imnmx(raw, Value::Inst(id), pred);
+            }
+            Opcode::IMNMX_imm => {
+                self.emit_imnmx(raw, Value::ImmU32(imm20(raw) as u32), pred);
+            }
 
             Opcode::FMNMX_reg => {
                 let dest = reg_dest(raw);

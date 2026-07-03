@@ -409,6 +409,14 @@ pub enum Op {
         b: Value,
     },
 
+    IMinMaxPred {
+        a: Value,
+        b: Value,
+        signed: bool,
+        pred: u8,
+        neg_pred: bool,
+    },
+
     IScAdd {
         a: Value,
         b: Value,
@@ -719,6 +727,9 @@ impl Inst {
             } => write!(f, "PSet P{pred_a}, P{pred_b}, P{pred_c}"),
             Op::IAdd { a, b, .. } => write!(f, "IAdd  {a}, {b}"),
             Op::IMul { a, b } => write!(f, "IMul  {a}, {b}"),
+            Op::IMinMaxPred {
+                a, b, signed, pred, ..
+            } => write!(f, "IMnMx {a}, {b} signed={signed} P{pred}"),
             Op::IScAdd { a, b, shift, .. } => write!(f, "IScAdd {a}, {b} << {shift}"),
             Op::ILop { a, b, op, .. } => write!(f, "ILop.{op:?} {a}, {b}"),
             Op::IShl { a, b } => write!(f, "IShl  {a}, {b}"),
