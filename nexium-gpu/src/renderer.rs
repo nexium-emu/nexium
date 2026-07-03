@@ -2743,6 +2743,9 @@ impl Renderer {
                     };
                     if let Some(slices) = volume_slices.as_ref() {
                         tex_hash = volume_rt_slice_hash(tex_hash, slices);
+                        trace_volume_rt_pixels(
+                            device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
+                        );
                     }
                     let force_refresh = force_refresh_texture(tic.gpu_va);
                     let need_upload = force_refresh
@@ -3617,6 +3620,12 @@ fn rt_pixels_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn volume_pixels_enabled() -> bool {
+    std::env::var_os("NEXIUM_VOLUME_PIXELS")
+        .map(|v| v.to_string_lossy().trim() != "0")
+        .unwrap_or(false)
+}
+
 fn rt_pixel_limit(name: &str, default: u32, max: u32) -> u32 {
     std::env::var(name)
         .ok()
@@ -3692,6 +3701,102 @@ fn trace_rt_stamp(stamp: u64, rt_key: RtKey, calls: &[&crate::draw::Maxwell3dDra
     );
 }
 
+fn trace_volume_rt_pixels(
+    device: &ash::Device,
+    cmd_pool: vk::CommandPool,
+    queue: vk::Queue,
+    rt_cache: &mut RtCache,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    tic: &crate::texture::TicEntry,
+    slices: &[VolumeRtSlice],
+) {
+    if !volume_pixels_enabled() {
+        return;
+    }
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if !seen.lock().unwrap().insert(tic.gpu_va) {
+        return;
+    }
+    let max_layers = std::env::var("NEXIUM_VOLUME_PIXELS_LAYERS")
+        .ok()
+        .and_then(|s| parse_u64_value(&s))
+        .unwrap_or(8)
+        .clamp(1, 64) as usize;
+    for slice in slices.iter().take(max_layers) {
+        let stamp = slice.stamp;
+        match read_rt_image_stats(device, cmd_pool, queue, rt_cache, mem_props, slice.key) {
+            Some(stats) => {
+                let pct = if stats.pixels == 0 {
+                    0.0
+                } else {
+                    stats.rgb_nonzero as f64 * 100.0 / stats.pixels as f64
+                };
+                let avg_rgb = if stats.pixels == 0 {
+                    0.0
+                } else {
+                    stats.rgb_sum as f64 / (stats.pixels as f64 * 3.0)
+                };
+                let avg_alpha = if stats.pixels == 0 {
+                    0.0
+                } else {
+                    stats.alpha_sum as f64 / stats.pixels as f64
+                };
+                let bbox = stats
+                    .bbox
+                    .map(|(x0, y0, x1, y1)| format!("{},{}-{},{}", x0, y0, x1, y1))
+                    .unwrap_or_else(|| "-".to_string());
+                let first = stats
+                    .first
+                    .map(|(x, y, rgba)| {
+                        format!(
+                            "{},{}:{:02x}{:02x}{:02x}{:02x}",
+                            x, y, rgba[0], rgba[1], rgba[2], rgba[3]
+                        )
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                log::warn!(
+                    "[volume-pixels] va={:#x} slice={} key={} stamp={} rgbnz={}/{} ({:.2}%) anz={} avg_rgb={:.2} avg_a={:.2} max={} bbox={} first={} fmt={:?}",
+                    tic.gpu_va,
+                    slice.layer,
+                    slice.key.label(),
+                    stamp,
+                    stats.rgb_nonzero,
+                    stats.pixels,
+                    pct,
+                    stats.alpha_nonzero,
+                    avg_rgb,
+                    avg_alpha,
+                    stats.rgb_max,
+                    bbox,
+                    first,
+                    slice.format
+                );
+                for row in &stats.pixel_rows {
+                    log::warn!(
+                        "[volume-pixel-row] va={:#x} slice={} key={} {}",
+                        tic.gpu_va,
+                        slice.layer,
+                        slice.key.label(),
+                        row
+                    );
+                }
+            }
+            None => {
+                log::warn!(
+                    "[volume-pixels] va={:#x} slice={} key={} readback=miss fmt={:?}",
+                    tic.gpu_va,
+                    slice.layer,
+                    slice.key.label(),
+                    slice.format
+                );
+            }
+        }
+    }
+}
+
 fn read_rt_image_stats(
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
@@ -3754,11 +3859,12 @@ fn read_rt_image_stats(
             return None;
         }
     };
+    let prev_layout = img.layout;
     transition_image(
         device,
         cmd,
         img.image,
-        img.layout,
+        prev_layout,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
     );
     let copy = vk::BufferImageCopy {
@@ -3787,7 +3893,16 @@ fn read_rt_image_stats(
             &[copy],
         );
     }
-    img.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+    if prev_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+        transition_image(
+            device,
+            cmd,
+            img.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            prev_layout,
+        );
+    }
+    img.layout = prev_layout;
     if end_one_time(device, cmd).is_err() || submit_with_fence(device, queue, cmd, fence).is_err() {
         cleanup(device, cmd_pool, Some(fence), Some(cmd), &stage);
         return None;
@@ -3830,7 +3945,7 @@ fn read_rt_image_stats(
                 });
             }
         }
-        if rt_pixels_enabled() {
+        if rt_pixels_enabled() || volume_pixels_enabled() {
             let w = key.width.min(rt_pixel_limit("NEXIUM_RT_PIXELS_W", 8, 64));
             let h = key.height.min(rt_pixel_limit("NEXIUM_RT_PIXELS_H", 8, 64));
             for y in 0..h {
@@ -3877,10 +3992,9 @@ fn readback_format_bpp(format: vk::Format) -> usize {
         | vk::Format::R8G8_SINT
         | vk::Format::R8G8_UINT
         | vk::Format::R5G6B5_UNORM_PACK16 => 2,
-        vk::Format::R8_UNORM
-        | vk::Format::R8_SNORM
-        | vk::Format::R8_SINT
-        | vk::Format::R8_UINT => 1,
+        vk::Format::R8_UNORM | vk::Format::R8_SNORM | vk::Format::R8_SINT | vk::Format::R8_UINT => {
+            1
+        }
         _ => 4,
     }
 }
@@ -4196,9 +4310,7 @@ fn block_linear_volume_slice_offsets(tic: &crate::texture::TicEntry, layers: u32
     let slice_size = (tiles_width.saturating_mul(tiles_height)) << gob_size_shift;
     let z_mask = (1u64 << block_depth).saturating_sub(1);
     (0..layers as u64)
-        .map(|z| {
-            ((z >> block_depth) * slice_size).saturating_add((z & z_mask) << gob_size_shift)
-        })
+        .map(|z| ((z >> block_depth) * slice_size).saturating_add((z & z_mask) << gob_size_shift))
         .collect()
 }
 
