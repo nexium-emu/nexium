@@ -525,7 +525,6 @@ impl Emitter {
         }
     }
 
-
     fn vertex_index_var_id(&mut self) -> Word {
         if let Some(v) = self.vertex_index_var {
             return v;
@@ -2693,9 +2692,12 @@ impl Emitter {
                         }
                         if std::env::var("NEXIUM_FS_COLOR_ALPHA_ONE").ok().as_deref() == Some("1") {
                             for (_, v) in &mut outputs {
-                                let r = self.b.composite_extract(self.f32_t, None, *v, [0]).unwrap();
-                                let g = self.b.composite_extract(self.f32_t, None, *v, [1]).unwrap();
-                                let b = self.b.composite_extract(self.f32_t, None, *v, [2]).unwrap();
+                                let r =
+                                    self.b.composite_extract(self.f32_t, None, *v, [0]).unwrap();
+                                let g =
+                                    self.b.composite_extract(self.f32_t, None, *v, [1]).unwrap();
+                                let b =
+                                    self.b.composite_extract(self.f32_t, None, *v, [2]).unwrap();
                                 *v = self
                                     .b
                                     .composite_construct(self.vec4_t, None, [r, g, b, self.f32_one])
@@ -3426,18 +3428,6 @@ fn selection_exits_structured(words: &[u32]) -> bool {
     true
 }
 
-fn intersect_pdom(mut a: u32, mut b: u32, ipdom: &[u32]) -> u32 {
-    while a != b {
-        while a < b {
-            a = ipdom[a as usize];
-        }
-        while b < a {
-            b = ipdom[b as usize];
-        }
-    }
-    a
-}
-
 fn dominators(cfg: &Cfg) -> Vec<Vec<bool>> {
     let n = cfg.blocks.len();
     let preds = cfg.predecessors();
@@ -3471,56 +3461,62 @@ fn dominators(cfg: &Cfg) -> Vec<Vec<bool>> {
     dom
 }
 
-// For single-entry, single-exit, ACYCLIC CFGs (exit is the last block), compute
-// each block's immediate post-dominator. Conditional headers use this as their
-// structured-merge block (the real reconvergence point), instead of naively
-// assuming the next block. Returns None for CFGs with loops (back-edges),
-// multiple exits, or an exit that isn't last — those keep the legacy path and
-// (if malformed) get skipped by the shader-emit panic guard in nexium-nvdrv.
 fn structurizer_cond_merges(cfg: &Cfg) -> Option<Vec<u32>> {
     let n = cfg.blocks.len();
     if n <= 1 {
         return None;
     }
-    for (i, b) in cfg.blocks.iter().enumerate() {
-        for s in cfg.successors(b.id) {
-            if (s as usize) <= i {
-                return None; // back-edge => loop, unsupported here
+    let virt = n as u32;
+    let total = n + 1;
+    let mut succs = vec![Vec::<u32>::new(); total];
+    for (i, block) in cfg.blocks.iter().enumerate() {
+        succs[i] = if matches!(block.branch, BranchKind::Exit) {
+            vec![virt]
+        } else {
+            cfg.successors(block.id)
+        };
+        if succs[i].is_empty() {
+            succs[i].push(virt);
+        }
+    }
+    succs[n].push(virt);
+
+    let mut pdom = vec![vec![true; total]; total];
+    pdom[n].fill(false);
+    pdom[n][n] = true;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            let mut next = vec![true; total];
+            for &s in &succs[b] {
+                for d in 0..total {
+                    next[d] &= pdom[s as usize][d];
+                }
+            }
+            next[b] = true;
+            if next != pdom[b] {
+                pdom[b] = next;
+                changed = true;
             }
         }
     }
-    // Virtual exit node at index n: every Exit block post-dominates to it, so a
-    // conditional whose branches all exit reconverges at the virtual exit, which
-    // the emitter maps to the single shared return block. This handles multi-exit
-    // / early-return shaders (matching yuzu's single-OpReturn structurization)
-    // while leaving single-exit shaders byte-identical (they reconverge at the
-    // real exit block before reaching the virtual exit).
-    let virt = n as u32;
-    let succ = |i: usize| -> Vec<u32> {
-        if matches!(cfg.blocks[i].branch, BranchKind::Exit) {
-            vec![virt]
-        } else {
-            cfg.successors(cfg.blocks[i].id)
-        }
-    };
-    let mut ipdom = vec![u32::MAX; n + 1];
+
+    let mut ipdom = vec![virt; total];
     ipdom[n] = virt;
-    for b in (0..n).rev() {
-        let mut idom = u32::MAX;
-        for s in succ(b) {
-            if ipdom[s as usize] == u32::MAX {
-                return None;
-            }
-            idom = if idom == u32::MAX {
-                s
-            } else {
-                intersect_pdom(idom, s, &ipdom)
-            };
-        }
-        if idom == u32::MAX {
+    for b in 0..n {
+        let strict = (0..total)
+            .filter(|&c| c != b && pdom[b][c])
+            .collect::<Vec<_>>();
+        if strict.is_empty() {
             return None;
         }
-        ipdom[b] = idom;
+        ipdom[b] = strict
+            .iter()
+            .copied()
+            .find(|&c| strict.iter().all(|&d| d == c || pdom[c][d]))
+            .map(|c| c as u32)
+            .unwrap_or(virt);
     }
     Some(ipdom)
 }

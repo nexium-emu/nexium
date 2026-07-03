@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::decode::decode_one;
 use super::ir::{Inst, Op, Predicate, Program, Value, ValueId};
@@ -193,41 +193,82 @@ fn bra_target(pc: usize, raw: u64) -> usize {
     (pc as i64 + signed as i64 + 8) as usize
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum FlowToken {
+    Ssy,
+    Pbk,
+}
+
+type FlowStack = Vec<(FlowToken, usize)>;
+
+fn pop_flow_token(stack: &FlowStack, token: FlowToken) -> Option<(usize, FlowStack)> {
+    let idx = stack.iter().rposition(|(t, _)| *t == token)?;
+    let target = stack[idx].1;
+    let mut next = stack.clone();
+    next.truncate(idx);
+    Some((target, next))
+}
+
+fn push_flow_state(
+    worklist: &mut Vec<(usize, FlowStack)>,
+    offset: usize,
+    stack: &FlowStack,
+    len: usize,
+) {
+    if offset < len {
+        worklist.push((offset, stack.clone()));
+    }
+}
+
 fn discover_sync_targets(bytes: &[u8]) -> HashMap<usize, usize> {
     let mut targets = HashMap::new();
-    let mut stack = Vec::new();
-    let mut pbk_stack = Vec::new();
-    let mut offset = 0usize;
-    while offset + 8 <= bytes.len() {
-        if is_schedule(offset) {
-            offset += 8;
+    let mut worklist = vec![(0usize, FlowStack::new())];
+    let mut visited: HashSet<(usize, FlowStack)> = HashSet::new();
+    while let Some((start, mut stack)) = worklist.pop() {
+        if start >= bytes.len() || !visited.insert((start, stack.clone())) {
             continue;
         }
-        let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        if let Some(d) = decode_one(raw) {
-            match d.opcode {
-                Opcode::SSY => stack.push(bra_target(offset, raw)),
-                Opcode::SYNC => {
-                    if let Some(&target) = stack.last() {
-                        targets.insert(offset, target);
-                        if decoded_pred(raw).is_none() {
-                            stack.pop();
-                        }
-                    }
-                }
-                Opcode::PBK => pbk_stack.push(bra_target(offset, raw)),
-                Opcode::BRK => {
-                    if let Some(&target) = pbk_stack.last() {
-                        targets.insert(offset, target);
-                        if decoded_pred(raw).is_none() {
-                            pbk_stack.pop();
-                        }
-                    }
-                }
-                _ => {}
+        let mut offset = start;
+        while offset + 8 <= bytes.len() {
+            if is_schedule(offset) {
+                offset += 8;
+                continue;
             }
+            let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            let next = offset + 8;
+            if let Some(d) = decode_one(raw) {
+                match d.opcode {
+                    Opcode::SSY => stack.push((FlowToken::Ssy, bra_target(offset, raw))),
+                    Opcode::PBK => stack.push((FlowToken::Pbk, bra_target(offset, raw))),
+                    Opcode::SYNC | Opcode::BRK => {
+                        let token = if matches!(d.opcode, Opcode::SYNC) {
+                            FlowToken::Ssy
+                        } else {
+                            FlowToken::Pbk
+                        };
+                        if let Some((target, popped)) = pop_flow_token(&stack, token) {
+                            targets.entry(offset).or_insert(target);
+                            push_flow_state(&mut worklist, target, &popped, bytes.len());
+                            if decoded_pred(raw).is_some() {
+                                push_flow_state(&mut worklist, next, &stack, bytes.len());
+                            }
+                            break;
+                        }
+                    }
+                    Opcode::BRA | Opcode::JMP => {
+                        let target = bra_target(offset, raw);
+                        push_flow_state(&mut worklist, target, &stack, bytes.len());
+                        if decoded_pred(raw).is_some() {
+                            push_flow_state(&mut worklist, next, &stack, bytes.len());
+                        }
+                        break;
+                    }
+                    Opcode::EXIT if decoded_pred(raw).is_none() => break,
+                    _ => {}
+                }
+            }
+            offset = next;
         }
-        offset += 8;
     }
     targets
 }
