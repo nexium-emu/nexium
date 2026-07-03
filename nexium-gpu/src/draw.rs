@@ -61,6 +61,18 @@ pub struct DrawState {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct BlendAttachmentState {
+    pub enabled: bool,
+    pub src_factor: vk::BlendFactor,
+    pub dst_factor: vk::BlendFactor,
+    pub op: vk::BlendOp,
+    pub src_alpha_factor: vk::BlendFactor,
+    pub dst_alpha_factor: vk::BlendFactor,
+    pub alpha_op: vk::BlendOp,
+    pub color_write_mask: vk::ColorComponentFlags,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct BlendState {
     pub enabled: bool,
     pub src_factor: vk::BlendFactor,
@@ -70,6 +82,7 @@ pub struct BlendState {
     pub dst_alpha_factor: vk::BlendFactor,
     pub alpha_op: vk::BlendOp,
     pub color_write_mask: vk::ColorComponentFlags,
+    pub attachments: [BlendAttachmentState; 8],
 }
 
 #[derive(Clone, Copy, Debug)]

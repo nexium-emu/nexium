@@ -347,12 +347,21 @@ impl Renderer {
         };
         let core_features = unsafe { instance.get_physical_device_features(physical_device) };
         let depth_clamp_supported = core_features.depth_clamp == vk::TRUE;
+        let independent_blend_supported = core_features.independent_blend == vk::TRUE;
         if !depth_clamp_supported {
             log::info!("Vulkan depthClamp feature unavailable; Maxwell depth clamp disabled");
+        }
+        if !independent_blend_supported {
+            log::info!("Vulkan independentBlend feature unavailable; per-target masks collapsed");
         }
         let enabled_core_features = vk::PhysicalDeviceFeatures {
             robust_buffer_access: vk::TRUE,
             depth_clamp: if depth_clamp_supported {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
+            independent_blend: if independent_blend_supported {
                 vk::TRUE
             } else {
                 vk::FALSE
@@ -1514,14 +1523,19 @@ impl Renderer {
         _vertex_count: u32,
     ) -> Result<Option<vk::Pipeline>, String> {
         let mut inner = self.inner.lock();
-        let blend_signature: u64 = (blend.enabled as u64)
-            | ((blend.src_factor.as_raw() as u64 & 0xFF) << 8)
-            | ((blend.dst_factor.as_raw() as u64 & 0xFF) << 16)
-            | ((blend.op.as_raw() as u64 & 0xFF) << 24)
-            | ((blend.src_alpha_factor.as_raw() as u64 & 0xFF) << 32)
-            | ((blend.dst_alpha_factor.as_raw() as u64 & 0xFF) << 40)
-            | ((blend.alpha_op.as_raw() as u64 & 0xFF) << 48)
-            | ((blend.color_write_mask.as_raw() as u64 & 0xF) << 56);
+        let mut blend_signature: u64 = 0xcbf29ce484222325;
+        for att in &blend.attachments {
+            let packed = (att.enabled as u64)
+                | ((att.src_factor.as_raw() as u64 & 0xFF) << 8)
+                | ((att.dst_factor.as_raw() as u64 & 0xFF) << 16)
+                | ((att.op.as_raw() as u64 & 0xFF) << 24)
+                | ((att.src_alpha_factor.as_raw() as u64 & 0xFF) << 32)
+                | ((att.dst_alpha_factor.as_raw() as u64 & 0xFF) << 40)
+                | ((att.alpha_op.as_raw() as u64 & 0xFF) << 48)
+                | ((att.color_write_mask.as_raw() as u64 & 0xF) << 56);
+            blend_signature ^= packed;
+            blend_signature = blend_signature.wrapping_mul(0x100000001b3);
+        }
         let raster_state_packed: u32 =
             (cull_test_enable as u32) | ((cull_face & 0xFF) << 8) | ((front_face & 0xFF) << 16);
         let has_depth = depth_format != vk::Format::UNDEFINED;
@@ -1640,6 +1654,22 @@ impl Renderer {
                 blend.dst_alpha_factor.as_raw(),
                 blend.alpha_op.as_raw(),
             ),
+            blend_attachments: blend
+                .attachments
+                .iter()
+                .map(|att| {
+                    (
+                        att.enabled,
+                        att.src_factor.as_raw(),
+                        att.dst_factor.as_raw(),
+                        att.op.as_raw(),
+                        att.src_alpha_factor.as_raw(),
+                        att.dst_alpha_factor.as_raw(),
+                        att.alpha_op.as_raw(),
+                        att.color_write_mask.as_raw(),
+                    )
+                })
+                .collect(),
             color_write_mask: blend.color_write_mask.as_raw(),
             depth: (
                 depth.test_enabled,
@@ -2359,6 +2389,14 @@ impl Renderer {
             }
             device.cmd_end_rendering(cmd);
         }
+        for (_, image, _, _, _) in &color_bind {
+            barrier_color_attachment_after_pass(
+                device,
+                cmd,
+                *image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
+        }
 
         unsafe {
             device
@@ -2374,8 +2412,13 @@ impl Renderer {
         for (key, _, _, _, _) in &color_bind {
             rt_cache.set_color_layout(*key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         }
-        if !call.blend.color_write_mask.is_empty() {
-            for (key, _, _, _, _) in &color_bind {
+        for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
+            if call
+                .blend
+                .attachments
+                .get(idx)
+                .is_some_and(|att| !att.color_write_mask.is_empty())
+            {
                 let stamp = rt_cache.mark_drawn(*key);
                 trace_rt_stamp(stamp, *key, &[call]);
             }
@@ -2720,19 +2763,23 @@ impl Renderer {
         let mut had_pass = false;
         for (_i, (call, prep)) in preps.iter().enumerate() {
             let call = *call;
+            let rt_aliases: Vec<_> = (0..prep.tex_pendings.len())
+                .map(|slot| rt_alias_for_slot(rt_cache, call, slot, rt_key, true))
+                .collect();
             let feedback_loop = color_keys
                 .iter()
                 .copied()
-                .any(|key| call_samples_rt(call, key));
+                .any(|key| call_samples_rt(call, key))
+                || rt_aliases
+                    .iter()
+                    .flatten()
+                    .any(|alias| !alias.depth && color_keys.contains(&alias.key));
             let required_rt_layout = if feedback_loop {
                 vk::ImageLayout::GENERAL
             } else {
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
             };
 
-            let rt_aliases: Vec<_> = (0..prep.tex_pendings.len())
-                .map(|slot| rt_alias_for_slot(rt_cache, call, slot, rt_key, true))
-                .collect();
             for alias in &rt_aliases {
                 if let Some(alias) = *alias {
                     if !alias.depth && color_keys.contains(&alias.key) {
@@ -2749,6 +2796,14 @@ impl Renderer {
                             if pass_open {
                                 unsafe {
                                     device.cmd_end_rendering(cmd);
+                                }
+                                for (_, image, _, _, _) in &color_bind {
+                                    barrier_color_attachment_after_pass(
+                                        device,
+                                        cmd,
+                                        *image,
+                                        pass_rt_layout,
+                                    );
                                 }
                                 pass_open = false;
                                 for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
@@ -2839,10 +2894,7 @@ impl Renderer {
                 if !pending_volume {
                     if let Some(alias) = rt_aliases.get(slot).copied().flatten() {
                         bound_tex_views[slot] = alias.view;
-                        if !alias.depth
-                            && sampled_rt_key_for_slot(call, slot)
-                                .map_or(false, |key| color_keys.contains(&key))
-                        {
+                        if !alias.depth && color_keys.contains(&alias.key) {
                             bound_tex_layouts[slot] = required_rt_layout;
                         }
                         continue;
@@ -2947,6 +2999,14 @@ impl Renderer {
                         if pass_open {
                             unsafe {
                                 device.cmd_end_rendering(cmd);
+                            }
+                            for (_, image, _, _, _) in &color_bind {
+                                barrier_color_attachment_after_pass(
+                                    device,
+                                    cmd,
+                                    *image,
+                                    pass_rt_layout,
+                                );
                             }
                             pass_open = false;
                             for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
@@ -3277,6 +3337,9 @@ impl Renderer {
                     unsafe {
                         device.cmd_end_rendering(cmd);
                     }
+                    for (_, image, _, _, _) in &color_bind {
+                        barrier_color_attachment_after_pass(device, cmd, *image, pass_rt_layout);
+                    }
                     for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
                         color_layouts[idx] = pass_rt_layout;
                         rt_cache.set_color_layout(*key, pass_rt_layout);
@@ -3479,6 +3542,9 @@ impl Renderer {
             unsafe {
                 device.cmd_end_rendering(cmd);
             }
+            for (_, image, _, _, _) in &color_bind {
+                barrier_color_attachment_after_pass(device, cmd, *image, pass_rt_layout);
+            }
             for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
                 color_layouts[idx] = pass_rt_layout;
                 rt_cache.set_color_layout(*key, pass_rt_layout);
@@ -3497,12 +3563,14 @@ impl Renderer {
         for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
             rt_cache.set_color_layout(*key, color_layouts[idx]);
         }
-        if calls
-            .iter()
-            .any(|call| !call.blend.color_write_mask.is_empty())
-        {
-            let trace_calls: Vec<_> = calls.iter().collect();
-            for (key, _, _, _, _) in &color_bind {
+        let trace_calls: Vec<_> = calls.iter().collect();
+        for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
+            if calls.iter().any(|call| {
+                call.blend
+                    .attachments
+                    .get(idx)
+                    .is_some_and(|att| !att.color_write_mask.is_empty())
+            }) {
                 let stamp = rt_cache.mark_drawn(*key);
                 trace_rt_stamp(stamp, *key, &trace_calls);
             }
@@ -4663,7 +4731,7 @@ fn rt_alias_for_slot(
 ) -> Option<RtAlias> {
     let sk = sampled_rt_key_for_slot(call, slot)?;
     let found = rt_cache.find_color(sk).or_else(|| {
-        if call.sampled_rt_fuzzy {
+        if call.sampled_rt_fuzzy && sk.gpu_va == 0 {
             rt_cache.find_color_screen(sk)
         } else {
             None
@@ -5972,6 +6040,58 @@ fn transition_image(
     new: vk::ImageLayout,
 ) {
     transition_image_aspect(device, cmd, image, old, new, vk::ImageAspectFlags::COLOR);
+}
+
+fn barrier_color_attachment_after_pass(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    layout: vk::ImageLayout,
+) {
+    let (dst_stage, dst_access) = if layout == vk::ImageLayout::GENERAL {
+        (
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::COLOR_ATTACHMENT_READ
+                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        )
+    } else {
+        (
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        )
+    };
+    let barrier = vk::ImageMemoryBarrier {
+        s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+        old_layout: layout,
+        new_layout: layout,
+        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        image,
+        subresource_range: vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: vk::REMAINING_ARRAY_LAYERS,
+        },
+        src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        dst_access_mask: dst_access,
+        p_next: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            dst_stage,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
+    }
 }
 
 fn transition_image_aspect(

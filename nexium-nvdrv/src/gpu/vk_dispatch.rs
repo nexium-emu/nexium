@@ -1,13 +1,13 @@
 use ash::vk;
 use std::sync::Arc;
 
-use super::engines::maxwell3d::{DrawCall, RenderTarget, VertexBuffer};
-use super::engines::Maxwell3D;
 use super::GpuMappings;
+use super::engines::Maxwell3D;
+use super::engines::maxwell3d::{DrawCall, RenderTarget, VertexBuffer};
 
 use nexium_gpu::draw::{
-    BlendState, DepthState, DrawState, Maxwell3dDrawCall, VertexAttr, VertexBinding,
-    VertexBufferBinding, VertexLayout,
+    BlendAttachmentState, BlendState, DepthState, DrawState, Maxwell3dDrawCall, VertexAttr,
+    VertexBinding, VertexBufferBinding, VertexLayout,
 };
 use nexium_gpu::rt_cache::RtKey;
 
@@ -1787,11 +1787,7 @@ fn execute_one(
                 .wrapping_add((draw.index_first as u64) * isz as u64);
             let raw = mappings.cpu_address_for(start).and_then(|cpu| {
                 let mut b = vec![0u8; icount * isz];
-                if mem_read(cpu, &mut b) {
-                    Some(b)
-                } else {
-                    None
-                }
+                if mem_read(cpu, &mut b) { Some(b) } else { None }
             });
             match raw {
                 Some(bytes) => {
@@ -1870,41 +1866,60 @@ fn execute_one(
         };
     let is_indexed = out_index_count.is_some();
 
-    let (
-        blend_raw_src,
-        blend_raw_dst,
-        blend_raw_eq,
-        blend_raw_src_alpha,
-        blend_raw_dst_alpha,
-        blend_raw_eq_alpha,
-    ) = if maxwell.regs.blend_per_target_enabled {
-        (
-            maxwell.regs.blend_pt_src_rgb[0],
-            maxwell.regs.blend_pt_dst_rgb[0],
-            maxwell.regs.blend_pt_eq_rgb[0],
-            maxwell.regs.blend_pt_src_alpha[0],
-            maxwell.regs.blend_pt_dst_alpha[0],
-            maxwell.regs.blend_pt_eq_alpha[0],
-        )
-    } else {
-        (
-            maxwell.regs.blend_src_rgb,
-            maxwell.regs.blend_dst_rgb,
-            maxwell.regs.blend_eq_rgb,
-            maxwell.regs.blend_src_alpha,
-            maxwell.regs.blend_dst_alpha,
-            maxwell.regs.blend_eq_alpha,
-        )
-    };
+    let attachments = std::array::from_fn(|rt| {
+        let (
+            blend_raw_src,
+            blend_raw_dst,
+            blend_raw_eq,
+            blend_raw_src_alpha,
+            blend_raw_dst_alpha,
+            blend_raw_eq_alpha,
+        ) = if maxwell.regs.blend_per_target_enabled {
+            (
+                maxwell.regs.blend_pt_src_rgb[rt],
+                maxwell.regs.blend_pt_dst_rgb[rt],
+                maxwell.regs.blend_pt_eq_rgb[rt],
+                maxwell.regs.blend_pt_src_alpha[rt],
+                maxwell.regs.blend_pt_dst_alpha[rt],
+                maxwell.regs.blend_pt_eq_alpha[rt],
+            )
+        } else {
+            (
+                maxwell.regs.blend_src_rgb,
+                maxwell.regs.blend_dst_rgb,
+                maxwell.regs.blend_eq_rgb,
+                maxwell.regs.blend_src_alpha,
+                maxwell.regs.blend_dst_alpha,
+                maxwell.regs.blend_eq_alpha,
+            )
+        };
+        let mask_rt = if maxwell.regs.color_mask_common {
+            0
+        } else {
+            rt
+        };
+        let shader_mask = map_output_component_mask(fragment_output_mask(fs_output_map, rt as u32));
+        BlendAttachmentState {
+            enabled: maxwell.regs.blend_enable[rt] && std::env::var("NEXIUM_NO_BLEND").is_err(),
+            src_factor: map_blend_factor(blend_raw_src),
+            dst_factor: map_blend_factor(blend_raw_dst),
+            op: map_blend_op(blend_raw_eq),
+            src_alpha_factor: map_blend_factor(blend_raw_src_alpha),
+            dst_alpha_factor: map_blend_factor(blend_raw_dst_alpha),
+            alpha_op: map_blend_op(blend_raw_eq_alpha),
+            color_write_mask: map_color_write_mask(maxwell.regs.color_masks[mask_rt]) & shader_mask,
+        }
+    });
     let blend_state = BlendState {
-        enabled: maxwell.regs.blend_enable[0] && std::env::var("NEXIUM_NO_BLEND").is_err(),
-        src_factor: map_blend_factor(blend_raw_src),
-        dst_factor: map_blend_factor(blend_raw_dst),
-        op: map_blend_op(blend_raw_eq),
-        src_alpha_factor: map_blend_factor(blend_raw_src_alpha),
-        dst_alpha_factor: map_blend_factor(blend_raw_dst_alpha),
-        alpha_op: map_blend_op(blend_raw_eq_alpha),
-        color_write_mask: map_color_write_mask(maxwell.regs.color_masks[0]),
+        enabled: attachments[0].enabled,
+        src_factor: attachments[0].src_factor,
+        dst_factor: attachments[0].dst_factor,
+        op: attachments[0].op,
+        src_alpha_factor: attachments[0].src_alpha_factor,
+        dst_alpha_factor: attachments[0].dst_alpha_factor,
+        alpha_op: attachments[0].alpha_op,
+        color_write_mask: attachments[0].color_write_mask,
+        attachments,
     };
 
     trace_menu_draw(
@@ -1953,12 +1968,12 @@ fn execute_one(
         (
             blend_state.enabled,
             maxwell.regs.blend_per_target_enabled,
-            blend_raw_src,
-            blend_raw_dst,
-            blend_raw_eq,
-            blend_raw_src_alpha,
-            blend_raw_dst_alpha,
-            blend_raw_eq_alpha,
+            attachments[0].src_factor.as_raw() as u32,
+            attachments[0].dst_factor.as_raw() as u32,
+            attachments[0].op.as_raw() as u32,
+            attachments[0].src_alpha_factor.as_raw() as u32,
+            attachments[0].dst_alpha_factor.as_raw() as u32,
+            attachments[0].alpha_op.as_raw() as u32,
         ),
         &blend_state,
         vs_cbuf_mask,
@@ -2356,8 +2371,8 @@ fn trace_font_ssbo(
     if std::env::var_os("NEXIUM_FONT_SSBO_DBG").is_none() || vs_addr != 0x400660030 {
         return;
     }
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
     static LIMIT: OnceLock<u64> = OnceLock::new();
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let limit = *LIMIT.get_or_init(|| {
@@ -3111,9 +3126,14 @@ fn guest_viewport_rect(draw: &DrawCall, rt_w: f32, rt_h: f32) -> Option<[f32; 4]
         y += clip.height as f32;
         h = -h;
     }
+    if draw.viewport.y_negate() {
+        y += h;
+        h = -h;
+    }
     let min_y = y.min(y + h);
     let max_y = y.max(y + h);
     if !draw.window_origin.lower_left()
+        && !draw.viewport.y_negate()
         && x <= 0.5
         && min_y <= 0.5
         && (x + w) >= rt_w - 0.5
@@ -3177,6 +3197,41 @@ fn map_color_write_mask(raw: u32) -> vk::ColorComponentFlags {
         mask |= vk::ColorComponentFlags::A;
     }
     mask
+}
+
+fn map_output_component_mask(raw: u32) -> vk::ColorComponentFlags {
+    let mut mask = vk::ColorComponentFlags::empty();
+    if (raw & 0x1) != 0 {
+        mask |= vk::ColorComponentFlags::R;
+    }
+    if (raw & 0x2) != 0 {
+        mask |= vk::ColorComponentFlags::G;
+    }
+    if (raw & 0x4) != 0 {
+        mask |= vk::ColorComponentFlags::B;
+    }
+    if (raw & 0x8) != 0 {
+        mask |= vk::ColorComponentFlags::A;
+    }
+    mask
+}
+
+fn fragment_output_mask(output_map: u32, location: u32) -> u32 {
+    if output_map == 0 {
+        return 0xF;
+    }
+    let mut output = 0u32;
+    for group in 0..8u32 {
+        let mask = (output_map >> (group * 4)) & 0xF;
+        if mask == 0 {
+            continue;
+        }
+        if output == location {
+            return mask;
+        }
+        output += 1;
+    }
+    0
 }
 
 fn map_blend_factor(v: u32) -> vk::BlendFactor {
@@ -3336,25 +3391,29 @@ fn trace_draw(
     let attr = vertex_attr_sample(layout, mappings, mem_read, vertex_addr, vertex_count);
     let vp = guest_viewport_rect(draw, rt.width as f32, rt.height as f32);
     let clip = draw.surface_clip.effective(rt.width, rt.height);
-    let cbuf = if matches!(draw.fs_shader_gpu_va, 0x20330 | 0x40430) || fs_tex_ids.is_empty() {
-        if std::env::var_os("NEXIUM_DRAW_TRACE_CBUF_FULL").is_some() {
-            cbuf_sample(cbuf_data, vs_cbuf_mask | fs_cbuf_mask, &[], cbuf_binds)
+    let cbuf_full = std::env::var_os("NEXIUM_DRAW_TRACE_CBUF_FULL").is_some();
+    let cbuf =
+        if cbuf_full || matches!(draw.fs_shader_gpu_va, 0x20330 | 0x40430) || fs_tex_ids.is_empty()
+        {
+            if cbuf_full {
+                cbuf_sample(cbuf_data, vs_cbuf_mask | fs_cbuf_mask, &[], cbuf_binds)
+            } else {
+                cbuf_sample(
+                    cbuf_data,
+                    vs_cbuf_mask | fs_cbuf_mask,
+                    fs_cbuf_reads,
+                    cbuf_binds,
+                )
+            }
         } else {
-            cbuf_sample(
-                cbuf_data,
-                vs_cbuf_mask | fs_cbuf_mask,
-                fs_cbuf_reads,
-                cbuf_binds,
-            )
-        }
-    } else {
-        String::new()
-    };
+            String::new()
+        };
+    let tics = tic_trace_summary(draw, fs_tex_ids, mappings, mem_read);
     log::warn!(
         "[drawtrace] op={} #{} rt={} {}x{} topo={} first={} v={} i={} indexed={} pos={} \
-         vp_en={} vp={:?} clip=({},{} {}x{}) origin={:#x} ll={} fy={} \
+         vp_en={} vp={:?} clip=({},{} {}x{}) origin={:#x} ll={} fy={} sw={:#x}/{} \
          depth={}/{} clamp={} vclip={:#x}/{} func={:#x} zeta={} cull={} ff={:#x} \
-         tex={:?} sampled={:?} \
+         tex={:?} tics=[{}] sampled={:?} \
          blend={} per={} rgb=({:#x},{:#x},{:#x})->({:?},{:?},{:?}) \
          a=({:#x},{:#x},{:#x})->({:?},{:?},{:?}) \
          vb={:#x} attrs={} {} cbuf={:#x}/{} masks={:#x}/{:#x} {} fs={:#x}",
@@ -3378,6 +3437,8 @@ fn trace_draw(
         draw.window_origin.raw,
         draw.window_origin.lower_left(),
         draw.window_origin.flip_y(),
+        draw.viewport.swizzle,
+        draw.viewport.y_swizzle(),
         depth_test,
         depth_write,
         draw.viewport_clip_control.depth_clamp_enabled(),
@@ -3388,6 +3449,7 @@ fn trace_draw(
         draw.cull_test_enable,
         draw.front_face,
         fs_tex_ids,
+        tics,
         sampled_rt_slots,
         blend_raw.0,
         blend_raw.1,
@@ -3413,6 +3475,55 @@ fn trace_draw(
         cbuf,
         draw.fs_shader_gpu_va,
     );
+}
+
+fn tic_trace_summary(
+    draw: &DrawCall,
+    fs_tex_ids: &[u32],
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> String {
+    if draw.tic_pool_gpu_va == 0 || fs_tex_ids.is_empty() {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    for (slot, tex_id) in fs_tex_ids.iter().enumerate().take(8) {
+        if *tex_id == u32::MAX || *tex_id > draw.tic_pool_limit {
+            out.push(format!("s{}:tic{}=invalid", slot, tex_id));
+            continue;
+        }
+        let tic_addr = draw.tic_pool_gpu_va.wrapping_add((*tex_id as u64) * 32);
+        let Some(cpu) = mappings.cpu_address_for(tic_addr) else {
+            out.push(format!("s{}:tic{}=unmapped", slot, tex_id));
+            continue;
+        };
+        let mut raw = [0u8; 32];
+        if !mem_read(cpu, &mut raw) {
+            out.push(format!("s{}:tic{}=unread", slot, tex_id));
+            continue;
+        }
+        let Some(tic) = nexium_gpu::texture::TicEntry::parse(&raw) else {
+            out.push(format!("s{}:tic{}=parse", slot, tex_id));
+            continue;
+        };
+        out.push(format!(
+            "s{}:tic{} {:?} {}x{}x{} ty{} base{} norm{} bl{} va{:#x} nv{:?} swz{:?}",
+            slot,
+            tex_id,
+            tic.format,
+            tic.width,
+            tic.height,
+            tic.depth,
+            tic.texture_type,
+            tic.base_layer,
+            tic.normalized_coords,
+            tic.is_block_linear,
+            tic.gpu_va,
+            mappings.nvmap_id_for(tic.gpu_va),
+            tic.swizzle
+        ));
+    }
+    out.join(" | ")
 }
 
 fn clear_trace_enabled() -> bool {
@@ -4224,11 +4335,7 @@ fn pack_cbuf_data(
             any = true;
         }
     }
-    if any {
-        Some(out)
-    } else {
-        None
-    }
+    if any { Some(out) } else { None }
 }
 
 fn resolve_cbuf(draw: &DrawCall, cbuf_binds: &[[(u64, u32); 16]; 5]) -> (u64, u32) {

@@ -33,7 +33,7 @@ pub struct PipelineKey {
     pub color_write_mask: u32,
 }
 
-const SPEC_VERSION: u32 = 10;
+const SPEC_VERSION: u32 = 11;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineSpec {
@@ -49,6 +49,7 @@ pub struct PipelineSpec {
     pub depth_format: i32,
     pub has_depth: bool,
     pub blend: (bool, i32, i32, i32, i32, i32, i32),
+    pub blend_attachments: Vec<(bool, i32, i32, i32, i32, i32, i32, u32)>,
     pub color_write_mask: u32,
     pub depth: (bool, bool, i32),
     pub depth_clamp_enabled: bool,
@@ -103,6 +104,29 @@ pub fn spec_to_request(
             offset: *o,
         })
         .collect();
+    let first_attachment = crate::draw::BlendAttachmentState {
+        enabled: spec.blend.0,
+        src_factor: vk::BlendFactor::from_raw(spec.blend.1),
+        dst_factor: vk::BlendFactor::from_raw(spec.blend.2),
+        op: vk::BlendOp::from_raw(spec.blend.3),
+        src_alpha_factor: vk::BlendFactor::from_raw(spec.blend.4),
+        dst_alpha_factor: vk::BlendFactor::from_raw(spec.blend.5),
+        alpha_op: vk::BlendOp::from_raw(spec.blend.6),
+        color_write_mask: vk::ColorComponentFlags::from_raw(spec.color_write_mask),
+    };
+    let mut attachments = [first_attachment; 8];
+    for (idx, att) in spec.blend_attachments.iter().take(8).enumerate() {
+        attachments[idx] = crate::draw::BlendAttachmentState {
+            enabled: att.0,
+            src_factor: vk::BlendFactor::from_raw(att.1),
+            dst_factor: vk::BlendFactor::from_raw(att.2),
+            op: vk::BlendOp::from_raw(att.3),
+            src_alpha_factor: vk::BlendFactor::from_raw(att.4),
+            dst_alpha_factor: vk::BlendFactor::from_raw(att.5),
+            alpha_op: vk::BlendOp::from_raw(att.6),
+            color_write_mask: vk::ColorComponentFlags::from_raw(att.7),
+        };
+    }
     PipelineBuildRequest {
         key: spec.key,
         vs_mod,
@@ -114,14 +138,15 @@ pub fn spec_to_request(
         depth_format: vk::Format::from_raw(spec.depth_format),
         has_depth: spec.has_depth,
         blend: crate::draw::BlendState {
-            enabled: spec.blend.0,
-            src_factor: vk::BlendFactor::from_raw(spec.blend.1),
-            dst_factor: vk::BlendFactor::from_raw(spec.blend.2),
-            op: vk::BlendOp::from_raw(spec.blend.3),
-            src_alpha_factor: vk::BlendFactor::from_raw(spec.blend.4),
-            dst_alpha_factor: vk::BlendFactor::from_raw(spec.blend.5),
-            alpha_op: vk::BlendOp::from_raw(spec.blend.6),
-            color_write_mask: vk::ColorComponentFlags::from_raw(spec.color_write_mask),
+            enabled: attachments[0].enabled,
+            src_factor: attachments[0].src_factor,
+            dst_factor: attachments[0].dst_factor,
+            op: attachments[0].op,
+            src_alpha_factor: attachments[0].src_alpha_factor,
+            dst_alpha_factor: attachments[0].dst_alpha_factor,
+            alpha_op: attachments[0].alpha_op,
+            color_write_mask: attachments[0].color_write_mask,
+            attachments,
         },
         depth: crate::draw::DepthState {
             test_enabled: spec.depth.0,
@@ -323,23 +348,24 @@ pub fn build_graphics_pipeline(
         _marker: std::marker::PhantomData,
     };
 
-    let cb_attachment = vk::PipelineColorBlendAttachmentState {
-        blend_enable: if req.blend.enabled {
-            vk::TRUE
-        } else {
-            vk::FALSE
-        },
-        src_color_blend_factor: req.blend.src_factor,
-        dst_color_blend_factor: req.blend.dst_factor,
-        color_blend_op: req.blend.op,
-        src_alpha_blend_factor: req.blend.src_alpha_factor,
-        dst_alpha_blend_factor: req.blend.dst_alpha_factor,
-        alpha_blend_op: req.blend.alpha_op,
-        color_write_mask: req.blend.color_write_mask,
-    };
     let color_formats = normalized_color_formats(&req.color_formats);
     let color_attachment_count = color_formats.len() as u32;
-    let cb_attachments = vec![cb_attachment; color_attachment_count as usize];
+    let cb_attachments = req
+        .blend
+        .attachments
+        .iter()
+        .take(color_attachment_count as usize)
+        .map(|att| vk::PipelineColorBlendAttachmentState {
+            blend_enable: if att.enabled { vk::TRUE } else { vk::FALSE },
+            src_color_blend_factor: att.src_factor,
+            dst_color_blend_factor: att.dst_factor,
+            color_blend_op: att.op,
+            src_alpha_blend_factor: att.src_alpha_factor,
+            dst_alpha_blend_factor: att.dst_alpha_factor,
+            alpha_blend_op: att.alpha_op,
+            color_write_mask: att.color_write_mask,
+        })
+        .collect::<Vec<_>>();
     let cb_state = vk::PipelineColorBlendStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         logic_op_enable: vk::FALSE,
@@ -611,24 +637,27 @@ impl PipelineCache {
                 let tx = res_tx.clone();
                 let h = std::thread::Builder::new()
                     .name("nexium-pipecompile".to_string())
-                    .spawn(move || loop {
-                        let req = {
-                            let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
-                            match guard.recv() {
-                                Ok(r) => r,
-                                Err(_) => break,
-                            }
-                        };
-                        let pipe =
-                            match build_graphics_pipeline(&dev, wcache, wlayout, &wlock, &req) {
+                    .spawn(move || {
+                        loop {
+                            let req = {
+                                let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                                match guard.recv() {
+                                    Ok(r) => r,
+                                    Err(_) => break,
+                                }
+                            };
+                            let pipe = match build_graphics_pipeline(
+                                &dev, wcache, wlayout, &wlock, &req,
+                            ) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     log::warn!("async pipeline build failed: {}", e);
                                     vk::Pipeline::null()
                                 }
                             };
-                        if tx.send((req.key, pipe)).is_err() {
-                            break;
+                            if tx.send((req.key, pipe)).is_err() {
+                                break;
+                            }
                         }
                     })
                     .ok();

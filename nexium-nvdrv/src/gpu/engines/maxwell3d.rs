@@ -24,7 +24,7 @@ pub struct ZetaSurface {
     pub array_pitch: u32,
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Viewport {
     pub x: f32,
     pub y: f32,
@@ -38,6 +38,37 @@ pub struct Viewport {
     pub translate_y: f32,
     pub scale_z: f32,
     pub translate_z: f32,
+    pub swizzle: u32,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+            depth_min: 0.0,
+            depth_max: 0.0,
+            scale_x: 0.0,
+            scale_y: 0.0,
+            translate_x: 0.0,
+            translate_y: 0.0,
+            scale_z: 0.0,
+            translate_z: 0.0,
+            swizzle: 0x6420,
+        }
+    }
+}
+
+impl Viewport {
+    pub fn y_swizzle(self) -> u32 {
+        (self.swizzle >> 4) & 0x7
+    }
+
+    pub fn y_negate(self) -> bool {
+        self.y_swizzle() == 3
+    }
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -749,6 +780,7 @@ impl Maxwell3D {
             0x283 => self.regs.viewport.translate_x = f32::from_bits(arg),
             0x284 => self.regs.viewport.translate_y = f32::from_bits(arg),
             0x285 => self.regs.viewport.translate_z = f32::from_bits(arg),
+            0x286 => self.regs.viewport.swizzle = arg,
             0x3FD => {
                 self.regs.surface_clip.x = arg & 0xFFFF;
                 self.regs.surface_clip.width = arg >> 16;
