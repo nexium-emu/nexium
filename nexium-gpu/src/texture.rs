@@ -35,6 +35,33 @@ pub enum SwizzleSource {
     Unknown(u32),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ComponentType {
+    Snorm,
+    Unorm,
+    Sint,
+    Uint,
+    SnormForceFp16,
+    UnormForceFp16,
+    Float,
+    Unknown(u32),
+}
+
+impl ComponentType {
+    pub fn from_raw(raw: u32) -> Self {
+        match raw & 0x7 {
+            1 => ComponentType::Snorm,
+            2 => ComponentType::Unorm,
+            3 => ComponentType::Sint,
+            4 => ComponentType::Uint,
+            5 => ComponentType::SnormForceFp16,
+            6 => ComponentType::UnormForceFp16,
+            7 => ComponentType::Float,
+            other => ComponentType::Unknown(other),
+        }
+    }
+}
+
 impl SwizzleSource {
     pub fn from_raw(raw: u32) -> Self {
         match raw & 0x7 {
@@ -146,6 +173,7 @@ impl TicFormat {
 #[derive(Clone, Copy, Debug)]
 pub struct TicEntry {
     pub format: TicFormat,
+    pub component_types: [ComponentType; 4],
     pub swizzle: [SwizzleSource; 4],
     pub gpu_va: u64,
     pub width: u32,
@@ -173,6 +201,12 @@ impl TicEntry {
         let w4 = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
 
         let format = TicFormat::from_raw(w0);
+        let component_types = [
+            ComponentType::from_raw((w0 >> 7) & 0x7),
+            ComponentType::from_raw((w0 >> 10) & 0x7),
+            ComponentType::from_raw((w0 >> 13) & 0x7),
+            ComponentType::from_raw((w0 >> 16) & 0x7),
+        ];
         let swizzle = [
             SwizzleSource::from_raw((w0 >> 19) & 0x7),
             SwizzleSource::from_raw((w0 >> 22) & 0x7),
@@ -209,6 +243,7 @@ impl TicEntry {
 
         Some(TicEntry {
             format,
+            component_types,
             swizzle,
             gpu_va,
             width,

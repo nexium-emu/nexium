@@ -64,6 +64,13 @@ struct TexCacheKey {
 
 type PendingTexture = (TexCacheKey, crate::texture::TicEntry, usize, usize);
 
+const TEXTURE_IDENTITY_SWIZZLE: [crate::texture::SwizzleSource; 4] = [
+    crate::texture::SwizzleSource::R,
+    crate::texture::SwizzleSource::G,
+    crate::texture::SwizzleSource::B,
+    crate::texture::SwizzleSource::A,
+];
+
 struct PreparedVertexBinding {
     binding: u32,
     stride: u64,
@@ -94,6 +101,7 @@ struct RtAlias {
     image: vk::Image,
     view: vk::ImageView,
     layout: vk::ImageLayout,
+    format: vk::Format,
     depth: bool,
 }
 
@@ -121,6 +129,7 @@ struct FrameSlot {
     retired_dsets: Vec<vk::DescriptorSet>,
     retired_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
     retired_textures: Vec<CachedTexture>,
+    retired_views: Vec<vk::ImageView>,
 }
 
 struct PendingReadback {
@@ -465,6 +474,7 @@ impl Renderer {
                 retired_dsets: Vec::new(),
                 retired_buffers: Vec::new(),
                 retired_textures: Vec::new(),
+                retired_views: Vec::new(),
             },
             FrameSlot {
                 fence: fence_b,
@@ -473,6 +483,7 @@ impl Renderer {
                 retired_dsets: Vec::new(),
                 retired_buffers: Vec::new(),
                 retired_textures: Vec::new(),
+                retired_views: Vec::new(),
             },
         ];
         let utility_slot = FrameSlot {
@@ -482,6 +493,7 @@ impl Renderer {
             retired_dsets: Vec::new(),
             retired_buffers: Vec::new(),
             retired_textures: Vec::new(),
+            retired_views: Vec::new(),
         };
 
         let mut readback_slots = Vec::with_capacity(4);
@@ -565,14 +577,18 @@ impl Renderer {
             if pipeline_cache.get(&spec.key).is_some() {
                 continue;
             }
-            let vs_mod = match shader_compiler.compile_or_get(&spec.vs_spirv, device) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let fs_mod = match shader_compiler.compile_or_get(&spec.fs_spirv, device) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            let vs_label = format!("prewarm-vs key={:?}", spec.key);
+            let vs_mod =
+                match shader_compiler.compile_or_get_labeled(&spec.vs_spirv, device, &vs_label) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+            let fs_label = format!("prewarm-fs key={:?}", spec.key);
+            let fs_mod =
+                match shader_compiler.compile_or_get_labeled(&spec.fs_spirv, device, &fs_label) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
             let req = crate::pipeline::spec_to_request(spec, vs_mod, fs_mod);
             pipeline_cache.queue_build(req);
             queued += 1;
@@ -1580,8 +1596,10 @@ impl Renderer {
             return Ok(Some(p));
         }
 
-        let vs_mod = shader_compiler.compile_or_get(vs_spirv, device)?;
-        let fs_mod = shader_compiler.compile_or_get(fs_spirv, device)?;
+        let vs_label = format!("runtime-vs hash={:016x}", vs_hash);
+        let fs_label = format!("runtime-fs hash={:016x}", fs_hash);
+        let vs_mod = shader_compiler.compile_or_get_labeled(vs_spirv, device, &vs_label)?;
+        let fs_mod = shader_compiler.compile_or_get_labeled(fs_spirv, device, &fs_label)?;
 
         let bindings: Vec<vk::VertexInputBindingDescription> = layout
             .bindings
@@ -1805,6 +1823,11 @@ impl Renderer {
                         device.free_memory(m, None);
                     }
                 }
+                for view in slot.retired_views.drain(..) {
+                    unsafe {
+                        device.destroy_image_view(view, None);
+                    }
+                }
                 for t in slot.retired_textures.drain(..) {
                     unsafe {
                         device.destroy_image_view(t.view, None);
@@ -1862,7 +1885,19 @@ impl Renderer {
             let pending_volume = pending.map_or(false, |(k, _, _, _)| k.volume);
             if !pending_volume {
                 if let Some(alias) = rt_aliases.get(slot).copied().flatten() {
-                    bound_tex_views[slot] = alias.view;
+                    let swizzle = pending
+                        .map(|(_, tic, _, _)| tic.swizzle)
+                        .unwrap_or(TEXTURE_IDENTITY_SWIZZLE);
+                    let view_format = pending
+                        .map(|(_, tic, _, _)| rt_alias_view_format(alias.key, tic, alias.format))
+                        .unwrap_or(alias.format);
+                    bound_tex_views[slot] = rt_alias_sample_view(
+                        device,
+                        &mut frame_slots[cur_idx],
+                        alias,
+                        swizzle,
+                        view_format,
+                    );
                     continue;
                 }
             }
@@ -2002,6 +2037,11 @@ impl Renderer {
                             device.free_descriptor_sets(descriptor_pool.pool, &other.retired_dsets);
                     }
                     other.retired_dsets.clear();
+                }
+                for view in other.retired_views.drain(..) {
+                    unsafe {
+                        device.destroy_image_view(view, None);
+                    }
                 }
                 reset_command_buffer(device, other.cmd)?;
                 other.in_flight = false;
@@ -2663,6 +2703,11 @@ impl Renderer {
                         device.free_memory(m, None);
                     }
                 }
+                for view in slot.retired_views.drain(..) {
+                    unsafe {
+                        device.destroy_image_view(view, None);
+                    }
+                }
                 for t in slot.retired_textures.drain(..) {
                     unsafe {
                         device.destroy_image_view(t.view, None);
@@ -2760,6 +2805,8 @@ impl Renderer {
         let mut pass_open = false;
         let mut pass_depth = false;
         let mut pass_rt_layout = vk::ImageLayout::UNDEFINED;
+        let mut pass_dirty = vec![false; color_bind.len()];
+        let mut pass_trace_calls: Vec<&crate::draw::Maxwell3dDrawCall> = Vec::new();
         let mut had_pass = false;
         for (_i, (call, prep)) in preps.iter().enumerate() {
             let call = *call;
@@ -2797,19 +2844,18 @@ impl Renderer {
                                 unsafe {
                                     device.cmd_end_rendering(cmd);
                                 }
-                                for (_, image, _, _, _) in &color_bind {
-                                    barrier_color_attachment_after_pass(
-                                        device,
-                                        cmd,
-                                        *image,
-                                        pass_rt_layout,
-                                    );
-                                }
+                                finish_color_pass(
+                                    device,
+                                    cmd,
+                                    rt_cache,
+                                    &color_bind,
+                                    &mut color_layouts,
+                                    pass_rt_layout,
+                                    &mut pass_dirty,
+                                    &pass_trace_calls,
+                                );
                                 pass_open = false;
-                                for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
-                                    color_layouts[idx] = pass_rt_layout;
-                                    rt_cache.set_color_layout(*key, pass_rt_layout);
-                                }
+                                pass_trace_calls.clear();
                             }
                             if alias.depth {
                                 transition_image_aspect(
@@ -2893,7 +2939,21 @@ impl Renderer {
                 let pending_volume = pending.map_or(false, |(k, _, _, _)| k.volume);
                 if !pending_volume {
                     if let Some(alias) = rt_aliases.get(slot).copied().flatten() {
-                        bound_tex_views[slot] = alias.view;
+                        let swizzle = pending
+                            .map(|(_, tic, _, _)| tic.swizzle)
+                            .unwrap_or(TEXTURE_IDENTITY_SWIZZLE);
+                        let view_format = pending
+                            .map(|(_, tic, _, _)| {
+                                rt_alias_view_format(alias.key, tic, alias.format)
+                            })
+                            .unwrap_or(alias.format);
+                        bound_tex_views[slot] = rt_alias_sample_view(
+                            device,
+                            &mut frame_slots[cur_idx],
+                            alias,
+                            swizzle,
+                            view_format,
+                        );
                         if !alias.depth && color_keys.contains(&alias.key) {
                             bound_tex_layouts[slot] = required_rt_layout;
                         }
@@ -3000,19 +3060,18 @@ impl Renderer {
                             unsafe {
                                 device.cmd_end_rendering(cmd);
                             }
-                            for (_, image, _, _, _) in &color_bind {
-                                barrier_color_attachment_after_pass(
-                                    device,
-                                    cmd,
-                                    *image,
-                                    pass_rt_layout,
-                                );
-                            }
+                            finish_color_pass(
+                                device,
+                                cmd,
+                                rt_cache,
+                                &color_bind,
+                                &mut color_layouts,
+                                pass_rt_layout,
+                                &mut pass_dirty,
+                                &pass_trace_calls,
+                            );
                             pass_open = false;
-                            for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
-                                color_layouts[idx] = pass_rt_layout;
-                                rt_cache.set_color_layout(*key, pass_rt_layout);
-                            }
+                            pass_trace_calls.clear();
                         }
                         let image_format = if identity_volume {
                             vk::Format::R8G8B8A8_UNORM
@@ -3337,13 +3396,17 @@ impl Renderer {
                     unsafe {
                         device.cmd_end_rendering(cmd);
                     }
-                    for (_, image, _, _, _) in &color_bind {
-                        barrier_color_attachment_after_pass(device, cmd, *image, pass_rt_layout);
-                    }
-                    for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
-                        color_layouts[idx] = pass_rt_layout;
-                        rt_cache.set_color_layout(*key, pass_rt_layout);
-                    }
+                    finish_color_pass(
+                        device,
+                        cmd,
+                        rt_cache,
+                        &color_bind,
+                        &mut color_layouts,
+                        pass_rt_layout,
+                        &mut pass_dirty,
+                        &pass_trace_calls,
+                    );
+                    pass_trace_calls.clear();
                 }
                 let needs_color_transition = color_layouts
                     .iter()
@@ -3468,6 +3531,8 @@ impl Renderer {
                 pass_open = true;
                 pass_depth = need_depth;
                 pass_rt_layout = required_rt_layout;
+                pass_dirty.fill(false);
+                pass_trace_calls.clear();
                 had_pass = true;
             }
             unsafe {
@@ -3537,18 +3602,27 @@ impl Renderer {
                     );
                 }
             }
+            for (idx, dirty) in pass_dirty.iter_mut().enumerate() {
+                if call_writes_color(call, idx) {
+                    *dirty = true;
+                }
+            }
+            pass_trace_calls.push(call);
         }
         if pass_open {
             unsafe {
                 device.cmd_end_rendering(cmd);
             }
-            for (_, image, _, _, _) in &color_bind {
-                barrier_color_attachment_after_pass(device, cmd, *image, pass_rt_layout);
-            }
-            for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
-                color_layouts[idx] = pass_rt_layout;
-                rt_cache.set_color_layout(*key, pass_rt_layout);
-            }
+            finish_color_pass(
+                device,
+                cmd,
+                rt_cache,
+                &color_bind,
+                &mut color_layouts,
+                pass_rt_layout,
+                &mut pass_dirty,
+                &pass_trace_calls,
+            );
         }
 
         unsafe {
@@ -3562,18 +3636,6 @@ impl Renderer {
         frame_slots[cur_idx].retired_dsets.extend(dsets_batch);
         for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
             rt_cache.set_color_layout(*key, color_layouts[idx]);
-        }
-        let trace_calls: Vec<_> = calls.iter().collect();
-        for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
-            if calls.iter().any(|call| {
-                call.blend
-                    .attachments
-                    .get(idx)
-                    .is_some_and(|att| !att.color_write_mask.is_empty())
-            }) {
-                let stamp = rt_cache.mark_drawn(*key);
-                trace_rt_stamp(stamp, *key, &trace_calls);
-            }
         }
         if any_depth {
             if let Ok(d) = rt_cache.get_or_create_depth(depth_key.unwrap(), device) {
@@ -3941,6 +4003,41 @@ fn trace_rt_stamp(stamp: u64, rt_key: RtKey, calls: &[&crate::draw::Maxwell3dDra
         calls.len(),
         parts.join(" | ")
     );
+}
+
+fn call_writes_color(call: &crate::draw::Maxwell3dDrawCall, idx: usize) -> bool {
+    call.blend
+        .attachments
+        .get(idx)
+        .is_some_and(|att| !att.color_write_mask.is_empty())
+}
+
+fn finish_color_pass(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    rt_cache: &mut RtCache,
+    color_bind: &[(
+        RtKey,
+        vk::Image,
+        vk::ImageView,
+        vk::Extent2D,
+        vk::ImageLayout,
+    )],
+    color_layouts: &mut [vk::ImageLayout],
+    pass_rt_layout: vk::ImageLayout,
+    pass_dirty: &mut [bool],
+    trace_calls: &[&crate::draw::Maxwell3dDrawCall],
+) {
+    for (idx, (key, image, _, _, _)) in color_bind.iter().enumerate() {
+        barrier_color_attachment_after_pass(device, cmd, *image, pass_rt_layout);
+        color_layouts[idx] = pass_rt_layout;
+        rt_cache.set_color_layout(*key, pass_rt_layout);
+        if pass_dirty.get(idx).copied().unwrap_or(false) {
+            let stamp = rt_cache.mark_drawn(*key);
+            trace_rt_stamp(stamp, *key, trace_calls);
+        }
+    }
+    pass_dirty.fill(false);
 }
 
 fn trace_volume_rt_pixels(
@@ -4730,21 +4827,30 @@ fn rt_alias_for_slot(
     allow_self: bool,
 ) -> Option<RtAlias> {
     let sk = sampled_rt_key_for_slot(call, slot)?;
-    let found = rt_cache.find_color(sk).or_else(|| {
+    let found = rt_cache.find_color_with_format(sk).or_else(|| {
         if call.sampled_rt_fuzzy && sk.gpu_va == 0 {
-            rt_cache.find_color_screen(sk)
+            rt_cache
+                .find_color_screen(sk)
+                .map(|(key, image, view, layout)| {
+                    let format = rt_cache
+                        .find_color_with_format(key)
+                        .map(|(_, _, _, _, format)| format)
+                        .unwrap_or(vk::Format::R8G8B8A8_UNORM);
+                    (key, image, view, layout, format)
+                })
         } else {
             None
         }
     });
-    let found_key = found.as_ref().map(|(k, _, _, _)| *k);
+    let found_key = found.as_ref().map(|(k, _, _, _, _)| *k);
     let filtered = found
-        .filter(|(k, _, _, _)| allow_self || *k != rt_key)
-        .map(|(key, image, view, layout)| RtAlias {
+        .filter(|(k, _, _, _, _)| allow_self || *k != rt_key)
+        .map(|(key, image, view, layout, format)| RtAlias {
             key,
             image,
             view,
             layout,
+            format,
             depth: false,
         })
         .or_else(|| {
@@ -4757,6 +4863,7 @@ fn rt_alias_for_slot(
                             image,
                             view,
                             layout,
+                            format: vk::Format::D32_SFLOAT,
                             depth: true,
                         })
                     } else {
@@ -4766,6 +4873,7 @@ fn rt_alias_for_slot(
         });
     trace_rt_alias(
         slot,
+        call,
         rt_key,
         sk,
         found_key,
@@ -4777,6 +4885,7 @@ fn rt_alias_for_slot(
 
 fn trace_rt_alias(
     slot: usize,
+    call: &crate::draw::Maxwell3dDrawCall,
     dst: RtKey,
     src: RtKey,
     found: Option<RtKey>,
@@ -4801,9 +4910,12 @@ fn trace_rt_alias(
     }
     let found = found.map(|k| k.label()).unwrap_or_else(|| "-".to_string());
     log::warn!(
-        "[rt-alias] #{} slot={} dst={} src={} found={} used={} fuzzy={}",
+        "[rt-alias] #{} slot={} vs={:#x} fs={:#x} tex={:?} dst={} src={} found={} used={} fuzzy={}",
         n,
         slot,
+        call.vs_gpu_va,
+        call.fs_gpu_va,
+        call.fs_tex_ids,
         dst.label(),
         src.label(),
         found,
@@ -4923,6 +5035,11 @@ fn ring_wrap_other(
             unsafe {
                 device.destroy_buffer(b, None);
                 device.free_memory(m, None);
+            }
+        }
+        for view in other.retired_views.drain(..) {
+            unsafe {
+                device.destroy_image_view(view, None);
             }
         }
         for t in other.retired_textures.drain(..) {
@@ -5613,6 +5730,111 @@ fn color_formats_for_call(
     }
     formats.truncate(count);
     formats
+}
+
+fn rt_alias_view_format(
+    key: RtKey,
+    tic: crate::texture::TicEntry,
+    fallback: vk::Format,
+) -> vk::Format {
+    if key.nvmap_id == 16 && fallback == vk::Format::R8G8B8A8_UNORM {
+        return fallback;
+    }
+    use crate::texture::{ComponentType, TicFormat};
+    let ty = tic.component_types[0];
+    match tic.format {
+        TicFormat::A2B10G10R10 => match ty {
+            ComponentType::Unorm | ComponentType::UnormForceFp16 => {
+                vk::Format::A2B10G10R10_UNORM_PACK32
+            }
+            ComponentType::Uint => vk::Format::A2B10G10R10_UINT_PACK32,
+            ComponentType::Sint => vk::Format::A2B10G10R10_SINT_PACK32,
+            _ => fallback,
+        },
+        TicFormat::A8B8G8R8 => match ty {
+            ComponentType::Unorm | ComponentType::UnormForceFp16 => {
+                vk::Format::A8B8G8R8_UNORM_PACK32
+            }
+            ComponentType::Snorm | ComponentType::SnormForceFp16 => {
+                vk::Format::A8B8G8R8_SNORM_PACK32
+            }
+            ComponentType::Uint => vk::Format::A8B8G8R8_UINT_PACK32,
+            ComponentType::Sint => vk::Format::A8B8G8R8_SINT_PACK32,
+            _ => fallback,
+        },
+        TicFormat::R16G16 => match ty {
+            ComponentType::Unorm | ComponentType::UnormForceFp16 => vk::Format::R16G16_UNORM,
+            ComponentType::Snorm | ComponentType::SnormForceFp16 => vk::Format::R16G16_SNORM,
+            ComponentType::Uint => vk::Format::R16G16_UINT,
+            ComponentType::Sint => vk::Format::R16G16_SINT,
+            ComponentType::Float => vk::Format::R16G16_SFLOAT,
+            _ => fallback,
+        },
+        TicFormat::R8G8 => match ty {
+            ComponentType::Unorm | ComponentType::UnormForceFp16 => vk::Format::R8G8_UNORM,
+            ComponentType::Snorm | ComponentType::SnormForceFp16 => vk::Format::R8G8_SNORM,
+            ComponentType::Uint => vk::Format::R8G8_UINT,
+            ComponentType::Sint => vk::Format::R8G8_SINT,
+            _ => fallback,
+        },
+        TicFormat::R8 => match ty {
+            ComponentType::Unorm | ComponentType::UnormForceFp16 => vk::Format::R8_UNORM,
+            ComponentType::Snorm | ComponentType::SnormForceFp16 => vk::Format::R8_SNORM,
+            ComponentType::Uint => vk::Format::R8_UINT,
+            ComponentType::Sint => vk::Format::R8_SINT,
+            _ => fallback,
+        },
+        TicFormat::B10G11R11 => vk::Format::B10G11R11_UFLOAT_PACK32,
+        _ => fallback,
+    }
+}
+
+fn rt_alias_sample_view(
+    device: &ash::Device,
+    slot: &mut FrameSlot,
+    alias: RtAlias,
+    swizzle: [crate::texture::SwizzleSource; 4],
+    view_format: vk::Format,
+) -> vk::ImageView {
+    if alias.depth || (swizzle == TEXTURE_IDENTITY_SWIZZLE && view_format == alias.format) {
+        return alias.view;
+    }
+
+    let view_info = vk::ImageViewCreateInfo {
+        s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+        image: alias.image,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: view_format,
+        subresource_range: vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        components: texture_component_mapping(swizzle),
+        p_next: std::ptr::null(),
+        flags: Default::default(),
+        _marker: std::marker::PhantomData,
+    };
+
+    match unsafe { device.create_image_view(&view_info, None) } {
+        Ok(view) => {
+            slot.retired_views.push(view);
+            view
+        }
+        Err(e) => {
+            log::warn!(
+                "rt alias sample view failed key={} fmt={:?}->{:?} swz={:?}: {:?}",
+                alias.key.label(),
+                alias.format,
+                view_format,
+                swizzle,
+                e
+            );
+            alias.view
+        }
+    }
 }
 
 fn texture_component_mapping(swizzle: [crate::texture::SwizzleSource; 4]) -> vk::ComponentMapping {
@@ -6361,6 +6583,11 @@ impl Drop for RendererInner {
         }
         for slot in self.frame_slots.iter_mut() {
             slot.retired_dsets.clear();
+            for view in slot.retired_views.drain(..) {
+                unsafe {
+                    self.device.destroy_image_view(view, None);
+                }
+            }
             for t in slot.retired_textures.drain(..) {
                 unsafe {
                     self.device.destroy_image_view(t.view, None);
@@ -6374,6 +6601,11 @@ impl Drop for RendererInner {
             slot.fence = vk::Fence::null();
         }
         self.utility_slot.retired_dsets.clear();
+        for view in self.utility_slot.retired_views.drain(..) {
+            unsafe {
+                self.device.destroy_image_view(view, None);
+            }
+        }
         unsafe {
             self.device.destroy_fence(self.utility_slot.fence, None);
         }

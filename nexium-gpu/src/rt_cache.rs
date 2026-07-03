@@ -372,8 +372,16 @@ impl RtCache {
         &self,
         want: RtKey,
     ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
+        self.find_color_with_format(want)
+            .map(|(k, image, view, layout, _)| (k, image, view, layout))
+    }
+
+    pub fn find_color_with_format(
+        &self,
+        want: RtKey,
+    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
         if let Some(img) = self.cache.get(&want) {
-            return Some((want, img.image, img.view, img.layout));
+            return Some((want, img.image, img.view, img.layout, img.format));
         }
         let mut best: Option<(RtKey, &GpuImage)> = None;
         for (k, img) in &self.cache {
@@ -399,7 +407,7 @@ impl RtCache {
                 best = Some((*k, img));
             }
         }
-        best.map(|(k, img)| (k, img.image, img.view, img.layout))
+        best.map(|(k, img)| (k, img.image, img.view, img.layout, img.format))
     }
 
     pub fn find_drawn_color_at(
@@ -536,7 +544,11 @@ impl RtCache {
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             initial_layout: vk::ImageLayout::UNDEFINED,
             p_next: std::ptr::null(),
-            flags: Default::default(),
+            flags: if aspect.contains(vk::ImageAspectFlags::COLOR) {
+                vk::ImageCreateFlags::MUTABLE_FORMAT
+            } else {
+                vk::ImageCreateFlags::empty()
+            },
             queue_family_index_count: 0,
             p_queue_family_indices: std::ptr::null(),
             _marker: std::marker::PhantomData,

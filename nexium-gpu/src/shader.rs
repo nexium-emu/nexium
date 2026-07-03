@@ -17,10 +17,28 @@ impl ShaderCompiler {
         spirv: &[u32],
         device: &ash::Device,
     ) -> Result<vk::ShaderModule, String> {
+        self.compile_or_get_labeled(spirv, device, "")
+    }
+
+    pub fn compile_or_get_labeled(
+        &mut self,
+        spirv: &[u32],
+        device: &ash::Device,
+        label: &str,
+    ) -> Result<vk::ShaderModule, String> {
         let hash = Self::hash_spirv(spirv);
 
         if let Some(&module) = self.modules.get(&hash) {
             return Ok(module);
+        }
+
+        if std::env::var_os("NEXIUM_SHADER_MODULE_DBG").is_some() {
+            log::warn!(
+                "[shader-module] create {} hash={:016x} words={}",
+                label,
+                hash,
+                spirv.len()
+            );
         }
 
         let module_info = vk::ShaderModuleCreateInfo {
@@ -35,7 +53,12 @@ impl ShaderCompiler {
         let module = unsafe {
             device
                 .create_shader_module(&module_info, None)
-                .map_err(|_| "Failed to create shader module".to_string())?
+                .map_err(|e| {
+                    format!(
+                        "Failed to create shader module {} hash={:016x}: {:?}",
+                        label, hash, e
+                    )
+                })?
         };
 
         self.modules.insert(hash, module);

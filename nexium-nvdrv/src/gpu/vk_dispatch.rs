@@ -1,9 +1,9 @@
 use ash::vk;
 use std::sync::Arc;
 
-use super::GpuMappings;
-use super::engines::Maxwell3D;
 use super::engines::maxwell3d::{DrawCall, RenderTarget, VertexBuffer};
+use super::engines::Maxwell3D;
+use super::GpuMappings;
 
 use nexium_gpu::draw::{
     BlendAttachmentState, BlendState, DepthState, DrawState, Maxwell3dDrawCall, VertexAttr,
@@ -1305,6 +1305,15 @@ fn execute_one(
 
             let vs_hash = nexium_gpu::renderer::hash_spirv(&vs_spirv);
             let fs_hash = nexium_gpu::renderer::hash_spirv(&fs_spirv);
+            if std::env::var_os("NEXIUM_SHADER_MODULE_DBG").is_some() {
+                log::warn!(
+                    "[shader-module-map] vs_addr={:#x} vs_hash={:016x} fs_addr={:#x} fs_hash={:016x}",
+                    vs_addr,
+                    vs_hash,
+                    fs_addr,
+                    fs_hash
+                );
+            }
             if std::env::var_os("NEXIUM_DUMP_SPIRV").is_some() {
                 let fnv = |words: &[u32]| {
                     let mut h: u64 = 1469598103934665603;
@@ -1787,7 +1796,11 @@ fn execute_one(
                 .wrapping_add((draw.index_first as u64) * isz as u64);
             let raw = mappings.cpu_address_for(start).and_then(|cpu| {
                 let mut b = vec![0u8; icount * isz];
-                if mem_read(cpu, &mut b) { Some(b) } else { None }
+                if mem_read(cpu, &mut b) {
+                    Some(b)
+                } else {
+                    None
+                }
             });
             match raw {
                 Some(bytes) => {
@@ -1957,6 +1970,7 @@ fn execute_one(
         mem_read,
         nvmap_id,
         rt,
+        &color_rt_keys,
         vertex_addr,
         eff_vertex_count,
         out_index_count.unwrap_or(0),
@@ -2371,8 +2385,8 @@ fn trace_font_ssbo(
     if std::env::var_os("NEXIUM_FONT_SSBO_DBG").is_none() || vs_addr != 0x400660030 {
         return;
     }
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
     static LIMIT: OnceLock<u64> = OnceLock::new();
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let limit = *LIMIT.get_or_init(|| {
@@ -3327,6 +3341,9 @@ struct DrawTraceConfig {
     start: u64,
     end: u64,
     fs: Option<u64>,
+    rt: Option<u32>,
+    rt_va: Option<u64>,
+    sampled_rt_only: bool,
 }
 
 fn draw_trace_config() -> DrawTraceConfig {
@@ -3345,6 +3362,14 @@ fn draw_trace_config() -> DrawTraceConfig {
         fs: std::env::var("NEXIUM_DRAW_TRACE_FS")
             .ok()
             .and_then(|v| parse_env_u64(&v)),
+        rt: std::env::var("NEXIUM_DRAW_TRACE_RT")
+            .ok()
+            .and_then(|v| parse_env_u64(&v))
+            .map(|v| v as u32),
+        rt_va: std::env::var("NEXIUM_DRAW_TRACE_RT_VA")
+            .ok()
+            .and_then(|v| parse_env_u64(&v)),
+        sampled_rt_only: std::env::var_os("NEXIUM_DRAW_TRACE_SAMPLED_RT").is_some(),
     })
 }
 
@@ -3355,6 +3380,7 @@ fn trace_draw(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     nvmap_id: u32,
     rt: &RenderTarget,
+    color_rt_keys: &[RtKey],
     vertex_addr: u64,
     vertex_count: u32,
     index_count: u32,
@@ -3380,6 +3406,20 @@ fn trace_draw(
         if draw.fs_shader_gpu_va != fs {
             return;
         }
+    }
+    if let Some(rt_filter) = cfg.rt {
+        if nvmap_id != rt_filter && !color_rt_keys.iter().any(|key| key.nvmap_id == rt_filter) {
+            return;
+        }
+    }
+    let rt_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
+    if let Some(rt_va_filter) = cfg.rt_va {
+        if rt_va != rt_va_filter && !color_rt_keys.iter().any(|key| key.gpu_va == rt_va_filter) {
+            return;
+        }
+    }
+    if cfg.sampled_rt_only && sampled_rt_slots.iter().all(|slot| slot.is_none()) {
+        return;
     }
     use std::sync::atomic::{AtomicU64, Ordering};
     static DRAW_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -3409,8 +3449,13 @@ fn trace_draw(
             String::new()
         };
     let tics = tic_trace_summary(draw, fs_tex_ids, mappings, mem_read);
+    let color_keys = color_rt_keys
+        .iter()
+        .map(|key| key.label())
+        .collect::<Vec<_>>()
+        .join(",");
     log::warn!(
-        "[drawtrace] op={} #{} rt={} {}x{} topo={} first={} v={} i={} indexed={} pos={} \
+        "[drawtrace] op={} #{} rt={} va={:#x} keys=[{}] {}x{} topo={} first={} v={} i={} indexed={} pos={} \
          vp_en={} vp={:?} clip=({},{} {}x{}) origin={:#x} ll={} fy={} sw={:#x}/{} \
          depth={}/{} clamp={} vclip={:#x}/{} func={:#x} zeta={} cull={} ff={:#x} \
          tex={:?} tics=[{}] sampled={:?} \
@@ -3420,6 +3465,8 @@ fn trace_draw(
         op_seq,
         seq,
         nvmap_id,
+        rt_va,
+        color_keys,
         rt.width,
         rt.height,
         draw.topology,
@@ -3507,10 +3554,11 @@ fn tic_trace_summary(
             continue;
         };
         out.push(format!(
-            "s{}:tic{} {:?} {}x{}x{} ty{} base{} norm{} bl{} va{:#x} nv{:?} swz{:?}",
+            "s{}:tic{} {:?}/{:?} {}x{}x{} ty{} base{} norm{} bl{} va{:#x} nv{:?} swz{:?}",
             slot,
             tex_id,
             tic.format,
+            tic.component_types,
             tic.width,
             tic.height,
             tic.depth,
@@ -4335,7 +4383,11 @@ fn pack_cbuf_data(
             any = true;
         }
     }
-    if any { Some(out) } else { None }
+    if any {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 fn resolve_cbuf(draw: &DrawCall, cbuf_binds: &[[(u64, u32); 16]; 5]) -> (u64, u32) {
