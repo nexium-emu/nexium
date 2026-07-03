@@ -64,6 +64,12 @@ struct TexCacheKey {
 
 type PendingTexture = (TexCacheKey, crate::texture::TicEntry, usize, usize);
 
+struct PreparedVertexBinding {
+    binding: u32,
+    stride: u64,
+    data: Vec<u8>,
+}
+
 struct CachedTexture {
     image: vk::Image,
     view: vk::ImageView,
@@ -1548,30 +1554,7 @@ impl Renderer {
             None => return Ok(()),
         };
 
-        let vertex_stride = call
-            .vertex_layout
-            .bindings
-            .iter()
-            .find(|b| b.stride > 0)
-            .map(|b| b.stride as u64)
-            .unwrap_or(0);
-        let vertex_base_addr = call
-            .vertex_addr
-            .wrapping_add(vertex_stride.saturating_mul(call.first_vertex as u64));
-        let vertex_bytes = vertex_stride.saturating_mul(call.vertex_count as u64) as usize;
-        let mut vertex_data = if vertex_bytes > 0 {
-            read_guest(vertex_base_addr, vertex_bytes)
-                .ok_or_else(|| format!("vertex read failed va={:#x}", vertex_base_addr))?
-        } else {
-            Vec::new()
-        };
-        let draw_vertex_count = if call.quad_expand && vertex_stride > 0 && !vertex_data.is_empty()
-        {
-            vertex_data = crate::draw::expand_quad_vertices(&vertex_data, vertex_stride as usize);
-            (vertex_data.len() / vertex_stride as usize) as u32
-        } else {
-            call.vertex_count
-        };
+        let (vertex_bindings, draw_vertex_count) = prepare_vertex_bindings(call, &read_guest)?;
 
         let cbuf_size = call.cbuf_size as usize;
         let cbuf_data = if let Some(d) = &call.cbuf_data {
@@ -1782,37 +1765,14 @@ impl Renderer {
             };
         }
 
-        let vertex_bind: Option<(vk::Buffer, u64)> = if !vertex_data.is_empty() {
-            let v_align = vertex_stride.max(16);
-            let v_size = align_up(vertex_data.len() as u64, v_align);
-            if ubo_ring.head + v_size > ubo_ring.size {
-                *tele_ring_wraps += 1;
-                let other = &mut frame_slots[other_idx];
-                if other.in_flight {
-                    wait_fence(device, other.fence)?;
-                    *tele_ring_waits += 1;
-                    if !other.retired_dsets.is_empty() {
-                        unsafe {
-                            let _ = device
-                                .free_descriptor_sets(descriptor_pool.pool, &other.retired_dsets);
-                        }
-                        other.retired_dsets.clear();
-                    }
-                    reset_command_buffer(device, other.cmd)?;
-                    other.in_flight = false;
-                }
-                ubo_ring.head = 0;
-                ubo_ring.slot_head[other_idx] = 0;
-            }
-            let (vbuf, voff, vptr) = ring_alloc(ubo_ring, v_size, v_align)
-                .map_err(|e| format!("ring_alloc(vertex): {}", e))?;
-            unsafe {
-                std::ptr::copy_nonoverlapping(vertex_data.as_ptr(), vptr, vertex_data.len());
-            }
-            Some((vbuf, voff))
-        } else {
-            None
-        };
+        let vertex_binds = upload_vertex_bindings(
+            device,
+            frame_slots,
+            other_idx,
+            descriptor_pool.pool,
+            ubo_ring,
+            &vertex_bindings,
+        )?;
 
         let white_bind: Option<(u32, vk::Buffer, u64)> =
             if let Some(wb) = call.vertex_layout.bindings.iter().find(|b| b.stride == 0) {
@@ -1845,12 +1805,7 @@ impl Renderer {
 
         let cbuf_size_aligned = align_up(cbuf_data.len() as u64, ubo_alignment);
         {
-            let v_size = if !vertex_data.is_empty() {
-                let v_align = vertex_stride.max(16);
-                align_up(vertex_data.len() as u64, v_align)
-            } else {
-                0
-            };
+            let v_size = vertex_bindings_size(&vertex_bindings);
             debug_assert!(
                 v_size + cbuf_size_aligned <= ubo_ring.size,
                 "execute_draw: per-draw ring payload ({} vertex + {} ubo) exceeds ring capacity ({})",
@@ -2219,27 +2174,30 @@ impl Renderer {
                 &[dset],
                 &[],
             );
-            if let Some((vbuf, voff)) = vertex_bind {
-                for b in call.vertex_layout.bindings.iter().filter(|b| b.stride > 0) {
-                    device.cmd_bind_vertex_buffers(cmd, b.binding, &[vbuf], &[voff]);
-                }
+            for (binding, vbuf, voff) in &vertex_binds {
+                device.cmd_bind_vertex_buffers(cmd, *binding, &[*vbuf], &[*voff]);
             }
             if let Some((wbinding, wbuf, woff)) = white_bind {
                 device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]);
             }
-            let cmd_first_vertex = if vertex_bind.is_some() {
+            let cmd_first_vertex = if !vertex_binds.is_empty() {
                 0
             } else {
                 call.first_vertex
             };
             if let Some((ibuf, ioff)) = index_bind {
                 device.cmd_bind_index_buffer(cmd, ibuf, ioff, index_type);
+                let vertex_offset = if !vertex_binds.is_empty() {
+                    call.first_vertex as i32
+                } else {
+                    0
+                };
                 device.cmd_draw_indexed(
                     cmd,
                     index_count,
                     call.instance_count.max(1),
                     0,
-                    0,
+                    vertex_offset,
                     call.first_instance,
                 );
             } else {
@@ -2334,9 +2292,8 @@ impl Renderer {
 
         struct Prep {
             pipeline: vk::Pipeline,
-            vertex_data: Vec<u8>,
+            vertex_bindings: Vec<PreparedVertexBinding>,
             cbuf_data: Vec<u8>,
-            vertex_stride: u64,
             tex_pendings: Vec<Option<PendingTexture>>,
             use_depth: bool,
             tsc_entries: Vec<Option<crate::texture::TscEntry>>,
@@ -2380,31 +2337,7 @@ impl Renderer {
                 Some(p) => p,
                 None => continue,
             };
-            let vertex_stride = call
-                .vertex_layout
-                .bindings
-                .iter()
-                .find(|b| b.stride > 0)
-                .map(|b| b.stride as u64)
-                .unwrap_or(0);
-            let vertex_base_addr = call
-                .vertex_addr
-                .wrapping_add(vertex_stride.saturating_mul(call.first_vertex as u64));
-            let vertex_bytes = vertex_stride.saturating_mul(call.vertex_count as u64) as usize;
-            let mut vertex_data = if vertex_bytes > 0 {
-                read_guest(vertex_base_addr, vertex_bytes)
-                    .ok_or_else(|| format!("vertex read failed va={:#x}", vertex_base_addr))?
-            } else {
-                Vec::new()
-            };
-            let draw_vertex_count =
-                if call.quad_expand && vertex_stride > 0 && !vertex_data.is_empty() {
-                    vertex_data =
-                        crate::draw::expand_quad_vertices(&vertex_data, vertex_stride as usize);
-                    (vertex_data.len() / vertex_stride as usize) as u32
-                } else {
-                    call.vertex_count
-                };
+            let (vertex_bindings, draw_vertex_count) = prepare_vertex_bindings(call, &read_guest)?;
             let cbuf_size = call.cbuf_size as usize;
             let cbuf_data = if let Some(d) = &call.cbuf_data {
                 d.clone()
@@ -2421,11 +2354,16 @@ impl Renderer {
             };
             if let Ok(want) = std::env::var("NEXIUM_VTX_DBG") {
                 if parse_u64_value(&want) == Some(call.vs_gpu_va) {
-                    let floats: Vec<f32> = vertex_data
-                        .chunks_exact(4)
-                        .take(24)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect();
+                    let first_binding = vertex_bindings.first();
+                    let floats: Vec<f32> = first_binding
+                        .map(|b| {
+                            b.data
+                                .chunks_exact(4)
+                                .take(24)
+                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     let idx: Vec<u16> = index_data
                         .chunks_exact(2)
                         .take(8)
@@ -2443,12 +2381,23 @@ impl Renderer {
                         })
                         .collect::<Vec<_>>()
                         .join(",");
+                    let vertex_base_addr = call
+                        .vertex_bindings
+                        .first()
+                        .map(|b| {
+                            b.addr.wrapping_add(
+                                (b.stride as u64).saturating_mul(call.first_vertex as u64),
+                            )
+                        })
+                        .unwrap_or(call.vertex_addr);
+                    let vertex_stride = first_binding.map(|b| b.stride).unwrap_or(0);
+                    let vertex_len: usize = vertex_bindings.iter().map(|b| b.data.len()).sum();
                     log::warn!(
                         "[vtx-dbg] vs={:#x} addr={:#x} stride={} vlen={} vcount={} icount={} itype={:?} attrs=[{}] floats={:?} idx={:?}",
                         call.vs_gpu_va,
                         vertex_base_addr,
                         vertex_stride,
-                        vertex_data.len(),
+                        vertex_len,
                         call.vertex_count,
                         index_count,
                         index_type,
@@ -2462,9 +2411,8 @@ impl Renderer {
                 call,
                 Prep {
                     pipeline,
-                    vertex_data,
+                    vertex_bindings,
                     cbuf_data,
-                    vertex_stride,
                     tex_pendings,
                     use_depth,
                     tsc_entries,
@@ -2870,31 +2818,14 @@ impl Renderer {
                 }
             }
 
-            let vertex_bind: Option<(vk::Buffer, u64)> = if !prep.vertex_data.is_empty() {
-                let v_align = prep.vertex_stride.max(16);
-                let v_size = align_up(prep.vertex_data.len() as u64, v_align);
-                if ubo_ring.head + v_size > ubo_ring.size {
-                    ring_wrap_other(
-                        device,
-                        frame_slots,
-                        other_idx,
-                        descriptor_pool.pool,
-                        ubo_ring,
-                    )?;
-                }
-                let (vbuf, voff, vptr) = ring_alloc(ubo_ring, v_size, v_align)
-                    .map_err(|e| format!("ring_alloc(vertex): {}", e))?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        prep.vertex_data.as_ptr(),
-                        vptr,
-                        prep.vertex_data.len(),
-                    );
-                }
-                Some((vbuf, voff))
-            } else {
-                None
-            };
+            let vertex_binds = upload_vertex_bindings(
+                device,
+                frame_slots,
+                other_idx,
+                descriptor_pool.pool,
+                ubo_ring,
+                &prep.vertex_bindings,
+            )?;
 
             let white_bind: Option<(u32, vk::Buffer, u64)> =
                 if let Some(wb) = call.vertex_layout.bindings.iter().find(|b| b.stride == 0) {
@@ -3323,27 +3254,30 @@ impl Renderer {
                     &[dset],
                     &[],
                 );
-                if let Some((vbuf, voff)) = vertex_bind {
-                    for b in call.vertex_layout.bindings.iter().filter(|b| b.stride > 0) {
-                        device.cmd_bind_vertex_buffers(cmd, b.binding, &[vbuf], &[voff]);
-                    }
+                for (binding, vbuf, voff) in &vertex_binds {
+                    device.cmd_bind_vertex_buffers(cmd, *binding, &[*vbuf], &[*voff]);
                 }
                 if let Some((wbinding, wbuf, woff)) = white_bind {
                     device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]);
                 }
-                let cmd_first_vertex = if vertex_bind.is_some() {
+                let cmd_first_vertex = if !vertex_binds.is_empty() {
                     0
                 } else {
                     call.first_vertex
                 };
                 if let Some((ibuf, ioff)) = index_bind {
                     device.cmd_bind_index_buffer(cmd, ibuf, ioff, prep.index_type);
+                    let vertex_offset = if !vertex_binds.is_empty() {
+                        call.first_vertex as i32
+                    } else {
+                        0
+                    };
                     device.cmd_draw_indexed(
                         cmd,
                         prep.index_count,
                         call.instance_count.max(1),
                         0,
-                        0,
+                        vertex_offset,
                         call.first_instance,
                     );
                 } else {
@@ -4561,6 +4495,97 @@ fn trace_rt_alias(
         used,
         fuzzy
     );
+}
+
+fn prepare_vertex_bindings<F>(
+    call: &crate::draw::Maxwell3dDrawCall,
+    read_guest: &F,
+) -> Result<(Vec<PreparedVertexBinding>, u32), String>
+where
+    F: Fn(u64, usize) -> Option<Vec<u8>>,
+{
+    let mut out = Vec::new();
+    let mut draw_vertex_count = call.vertex_count;
+    for binding in &call.vertex_bindings {
+        if binding.stride == 0 {
+            continue;
+        }
+        let stride = binding.stride as u64;
+        let start_vertex = if call.state.indexed {
+            0
+        } else {
+            call.first_vertex
+        };
+        let vertex_span = if call.state.indexed {
+            call.first_vertex.saturating_add(call.vertex_count)
+        } else {
+            call.vertex_count
+        };
+        let start_byte = stride.saturating_mul(start_vertex as u64);
+        let base = binding.addr.wrapping_add(start_byte);
+        let mut bytes = stride.saturating_mul(vertex_span as u64);
+        if binding.size > 0 {
+            if start_byte >= binding.size {
+                continue;
+            }
+            bytes = bytes.min(binding.size - start_byte);
+        }
+        let bytes = bytes as usize;
+        let mut data = if bytes > 0 {
+            read_guest(base, bytes).ok_or_else(|| format!("vertex read failed va={:#x}", base))?
+        } else {
+            Vec::new()
+        };
+        if call.quad_expand && !data.is_empty() {
+            data = crate::draw::expand_quad_vertices(&data, stride as usize);
+            if out.is_empty() {
+                draw_vertex_count = (data.len() / stride as usize) as u32;
+            }
+        }
+        if !data.is_empty() {
+            out.push(PreparedVertexBinding {
+                binding: binding.binding,
+                stride,
+                data,
+            });
+        }
+    }
+    Ok((out, draw_vertex_count))
+}
+
+fn upload_vertex_bindings(
+    device: &ash::Device,
+    frame_slots: &mut [FrameSlot; 2],
+    other_idx: usize,
+    pool: vk::DescriptorPool,
+    ubo_ring: &mut UboRing,
+    vertex_bindings: &[PreparedVertexBinding],
+) -> Result<Vec<(u32, vk::Buffer, u64)>, String> {
+    let mut out = Vec::with_capacity(vertex_bindings.len());
+    for binding in vertex_bindings {
+        if binding.data.is_empty() {
+            continue;
+        }
+        let align = binding.stride.max(16);
+        let size = align_up(binding.data.len() as u64, align);
+        if ubo_ring.head + size > ubo_ring.size {
+            ring_wrap_other(device, frame_slots, other_idx, pool, ubo_ring)?;
+        }
+        let (buf, off, ptr) =
+            ring_alloc(ubo_ring, size, align).map_err(|e| format!("ring_alloc(vertex): {}", e))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(binding.data.as_ptr(), ptr, binding.data.len());
+        }
+        out.push((binding.binding, buf, off));
+    }
+    Ok(out)
+}
+
+fn vertex_bindings_size(vertex_bindings: &[PreparedVertexBinding]) -> u64 {
+    vertex_bindings
+        .iter()
+        .map(|b| align_up(b.data.len() as u64, b.stride.max(16)))
+        .sum()
 }
 
 fn ring_wrap_other(

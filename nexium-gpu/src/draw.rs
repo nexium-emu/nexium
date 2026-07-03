@@ -15,6 +15,14 @@ pub struct VertexBinding {
     pub stride: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct VertexBufferBinding {
+    pub binding: u32,
+    pub addr: u64,
+    pub stride: u32,
+    pub size: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct VertexLayout {
     pub bindings: Vec<VertexBinding>,
@@ -87,6 +95,7 @@ pub struct Maxwell3dDrawCall {
     pub cbuf_size: u32,
     pub cbuf_data: Option<Vec<u8>>,
     pub vertex_addr: u64,
+    pub vertex_bindings: Vec<VertexBufferBinding>,
     pub vertex_count: u32,
     pub first_vertex: u32,
     pub instance_count: u32,

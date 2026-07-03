@@ -978,6 +978,18 @@ impl Maxwell3D {
                     }
                 }
             }
+            0x7C0..=0x7FF => {
+                let idx = ((method - 0x7C0) / 2) as usize;
+                let field = (method - 0x7C0) % 2;
+                if idx < 32 {
+                    let vb = &mut self.regs.vertex_buffers[idx];
+                    match field {
+                        0 => vb.end_hi = arg,
+                        1 => vb.end_lo = arg,
+                        _ => {}
+                    }
+                }
+            }
             0x458..=0x477 => {
                 let idx = (method - 0x458) as usize;
                 if idx < 32 {

@@ -6,7 +6,8 @@ use super::engines::Maxwell3D;
 use super::GpuMappings;
 
 use nexium_gpu::draw::{
-    BlendState, DepthState, DrawState, Maxwell3dDrawCall, VertexAttr, VertexBinding, VertexLayout,
+    BlendState, DepthState, DrawState, Maxwell3dDrawCall, VertexAttr, VertexBinding,
+    VertexBufferBinding, VertexLayout,
 };
 use nexium_gpu::rt_cache::RtKey;
 
@@ -515,16 +516,35 @@ fn submit_draw_batch_async(
     let mut snapshot_bytes = 0usize;
     let mut tic_summ: Vec<String> = Vec::new();
     for call in batch {
-        let stride = call
-            .vertex_layout
-            .bindings
-            .iter()
-            .find(|b| b.stride > 0)
-            .map(|b| b.stride as u64)
-            .unwrap_or(0);
-        let vbytes = stride.saturating_mul(call.vertex_count as u64) as usize;
-        if vbytes > 0 {
-            let n = snapshot_read_once(&mut snapshot, read_guest, call.vertex_addr, vbytes);
+        for binding in &call.vertex_bindings {
+            if binding.stride == 0 {
+                continue;
+            }
+            let stride = binding.stride as u64;
+            let start_vertex = if call.state.indexed {
+                0
+            } else {
+                call.first_vertex
+            };
+            let vertex_span = if call.state.indexed {
+                call.first_vertex.saturating_add(call.vertex_count)
+            } else {
+                call.vertex_count
+            };
+            let start_byte = stride.saturating_mul(start_vertex as u64);
+            let mut vbytes = stride.saturating_mul(vertex_span as u64);
+            if binding.size > 0 {
+                if start_byte >= binding.size {
+                    continue;
+                }
+                vbytes = vbytes.min(binding.size - start_byte);
+            }
+            let vbytes = vbytes as usize;
+            if vbytes == 0 {
+                continue;
+            }
+            let addr = binding.addr.wrapping_add(start_byte);
+            let n = snapshot_read_once(&mut snapshot, read_guest, addr, vbytes);
             snapshot_reads += usize::from(n != 0);
             snapshot_bytes += n;
         }
@@ -1470,7 +1490,10 @@ fn execute_one(
     }
     let sampled_rt_key = sampled_rt_keys.first().copied();
 
-    let vertex_addr = first_vertex_buffer_address(&draw.vertex_buffers, &layout)
+    let vertex_bindings = vertex_buffer_bindings(&draw.vertex_buffers, &layout);
+    let vertex_addr = vertex_bindings
+        .first()
+        .map(|b| b.addr)
         .ok_or_else(|| "no vertex buffer bound".to_string())?;
 
     if std::env::var_os("NEXIUM_PROBE_SHADE").is_some() {
@@ -1943,6 +1966,7 @@ fn execute_one(
         cbuf_size: call_cbuf_size,
         cbuf_data,
         vertex_addr,
+        vertex_bindings,
         vertex_count: eff_vertex_count,
         first_vertex: draw.first_vertex,
         instance_count: draw.instance_count.max(1),
@@ -4090,21 +4114,25 @@ fn resolve_vs_cbuf(cbuf_binds: &[[(u64, u32); 16]; 5]) -> (u64, u32) {
     (0, 0)
 }
 
-fn first_vertex_buffer_address(
+fn vertex_buffer_bindings(
     vertex_buffers: &[VertexBuffer; 32],
     layout: &VertexLayout,
-) -> Option<u64> {
-    let first_binding = layout
+) -> Vec<VertexBufferBinding> {
+    layout
         .bindings
         .iter()
-        .find(|b| b.stride > 0)
-        .or_else(|| layout.bindings.first())?
-        .binding as usize;
-    let vb = vertex_buffers.get(first_binding)?;
-    let va = ((vb.address_hi as u64) << 32) | vb.address_lo as u64;
-    if va == 0 {
-        None
-    } else {
-        Some(va)
-    }
+        .filter(|b| b.stride > 0)
+        .filter_map(|b| {
+            let vb = vertex_buffers.get(b.binding as usize)?;
+            let va = ((vb.address_hi as u64) << 32) | vb.address_lo as u64;
+            let end = ((vb.end_hi as u64) << 32) | vb.end_lo as u64;
+            let size = end.saturating_sub(va);
+            (va != 0).then_some(VertexBufferBinding {
+                binding: b.binding,
+                addr: va,
+                stride: b.stride,
+                size,
+            })
+        })
+        .collect()
 }
