@@ -360,12 +360,18 @@ impl Kernel {
                         Self::debug_wait_deadline(*wake_at)
                     )
                 }
-                threads::ThreadState::WaitingMutex { mutex_addr } => {
+                threads::ThreadState::WaitingMutex {
+                    mutex_addr,
+                    owner_handle,
+                    tag,
+                } => {
                     let word = self.debug_read_u32(*mutex_addr).unwrap_or(0);
                     let holder = word & !MUTEX_HAS_LISTENERS;
                     format!(
-                        "WaitingMutex addr={:#x} word={:#x} holder={:#x} listeners={}",
+                        "WaitingMutex addr={:#x} owner={:#x} tag={:#x} word={:#x} holder={:#x} listeners={}",
                         mutex_addr,
+                        owner_handle,
+                        tag,
                         word,
                         holder,
                         (word & MUTEX_HAS_LISTENERS) != 0
@@ -552,12 +558,24 @@ impl Kernel {
                     t.ctx.x[0] = nexium_common::result::KERNEL_TIMEOUT as u64;
                 }
             }
-            if self.reacquire_condvar_mutex(h, mutex_addr) {
+            if self.reacquire_condvar_mutex(h, mutex_addr, h) {
                 self.threads
                     .transition_state(h, threads::ThreadState::Ready);
             } else {
-                self.threads
-                    .transition_state(h, threads::ThreadState::WaitingMutex { mutex_addr });
+                let mut cur = [0u8; 4];
+                let cur_word = if self.address_space.read(mutex_addr, &mut cur).is_ok() {
+                    u32::from_le_bytes(cur)
+                } else {
+                    0
+                };
+                self.threads.transition_state(
+                    h,
+                    threads::ThreadState::WaitingMutex {
+                        mutex_addr,
+                        owner_handle: cur_word & !MUTEX_HAS_LISTENERS,
+                        tag: h,
+                    },
+                );
             }
             if !self.threads.has_condvar_waiters(condvar_addr) {
                 let _ = self.address_space.write(condvar_addr, &0u32.to_le_bytes());
@@ -567,7 +585,7 @@ impl Kernel {
         self.threads.wake_due_sleepers(now);
     }
 
-    pub fn reacquire_condvar_mutex(&mut self, handle: u32, mutex_addr: u64) -> bool {
+    pub fn reacquire_condvar_mutex(&mut self, handle: u32, mutex_addr: u64, tag: u32) -> bool {
         let mut cur = [0u8; 4];
         let cur_word = if self.address_space.read(mutex_addr, &mut cur).is_ok() {
             u32::from_le_bytes(cur)
@@ -576,11 +594,11 @@ impl Kernel {
         };
         let holder = cur_word & !MUTEX_HAS_LISTENERS;
         if holder == 0 || holder == handle {
-            let more = self.threads.has_mutex_waiters(mutex_addr);
+            let more = self.threads.has_mutex_waiters_for_owner(mutex_addr, handle);
             let new_word = if more {
-                handle | MUTEX_HAS_LISTENERS
+                tag | MUTEX_HAS_LISTENERS
             } else {
-                handle | (cur_word & MUTEX_HAS_LISTENERS)
+                tag | (cur_word & MUTEX_HAS_LISTENERS)
             };
             let _ = self
                 .address_space

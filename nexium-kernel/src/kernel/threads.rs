@@ -38,6 +38,8 @@ pub enum ThreadState {
     },
     WaitingMutex {
         mutex_addr: u64,
+        owner_handle: u32,
+        tag: u32,
     },
     WaitingCondvar {
         mutex_addr: u64,
@@ -215,16 +217,50 @@ impl Threads {
         }
     }
 
-    pub fn wake_one_on_mutex(&mut self, mutex_addr: u64) -> Option<u32> {
-        let h = self.threads.iter().find_map(|(h, t)| match &t.state {
-            ThreadState::WaitingMutex { mutex_addr: m } if *m == mutex_addr => Some(*h),
-            _ => None,
-        })?;
+    pub fn wake_one_on_mutex_owned(
+        &mut self,
+        mutex_addr: u64,
+        owner_handle: u32,
+    ) -> Option<(u32, u32, bool)> {
+        let h = self
+            .threads
+            .iter()
+            .filter_map(|(h, t)| match &t.state {
+                ThreadState::WaitingMutex {
+                    mutex_addr: m,
+                    owner_handle: o,
+                    ..
+                } if *m == mutex_addr && *o == owner_handle => Some((*h, t.priority)),
+                _ => None,
+            })
+            .min_by_key(|(h, priority)| (*priority, *h))
+            .map(|(h, _)| h)?;
+        let tag = match self.threads.get(&h).map(|t| &t.state) {
+            Some(ThreadState::WaitingMutex { tag, .. }) => *tag,
+            _ => h,
+        };
+        let mut has_more = false;
+        for (other_h, t) in self.threads.iter_mut() {
+            if *other_h == h {
+                continue;
+            }
+            if let ThreadState::WaitingMutex {
+                mutex_addr: m,
+                owner_handle: o,
+                ..
+            } = &mut t.state
+            {
+                if *m == mutex_addr && *o == owner_handle {
+                    *o = h;
+                    has_more = true;
+                }
+            }
+        }
         if let Some(t) = self.threads.get_mut(&h) {
             t.ctx.x[0] = nexium_common::result::SUCCESS as u64;
         }
         self.transition_state(h, ThreadState::Ready);
-        Some(h)
+        Some((h, tag, has_more))
     }
 
     pub fn wake_one_on_condvar(&mut self, condvar_addr: u64) -> Option<u32> {
@@ -252,11 +288,24 @@ impl Threads {
         })
     }
 
-    pub fn wake_condvar_into_mutex_waiter(&mut self, handle: u32, mutex_addr: u64) {
+    pub fn wake_condvar_into_mutex_waiter(
+        &mut self,
+        handle: u32,
+        mutex_addr: u64,
+        owner_handle: u32,
+        tag: u32,
+    ) {
         if let Some(t) = self.threads.get_mut(&handle) {
             t.ctx.x[0] = nexium_common::result::SUCCESS as u64;
         }
-        self.transition_state(handle, ThreadState::WaitingMutex { mutex_addr });
+        self.transition_state(
+            handle,
+            ThreadState::WaitingMutex {
+                mutex_addr,
+                owner_handle,
+                tag,
+            },
+        );
     }
 
     pub fn wake_condvar_to_ready(&mut self, handle: u32) {
@@ -266,10 +315,17 @@ impl Threads {
         self.transition_state(handle, ThreadState::Ready);
     }
 
-    pub fn has_mutex_waiters(&self, mutex_addr: u64) -> bool {
-        self.threads.values().any(
-            |t| matches!(&t.state, ThreadState::WaitingMutex { mutex_addr: m } if *m == mutex_addr),
-        )
+    pub fn has_mutex_waiters_for_owner(&self, mutex_addr: u64, owner_handle: u32) -> bool {
+        self.threads.values().any(|t| {
+            matches!(
+                &t.state,
+                ThreadState::WaitingMutex {
+                    mutex_addr: m,
+                    owner_handle: o,
+                    ..
+                } if *m == mutex_addr && *o == owner_handle
+            )
+        })
     }
 
     pub fn has_condvar_waiters(&self, condvar_addr: u64) -> bool {

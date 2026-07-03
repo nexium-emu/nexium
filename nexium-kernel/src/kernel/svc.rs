@@ -5,7 +5,7 @@ use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
 use crate::kernel::AudioRendererState;
 use nexium_common::result::{
-    KERNEL_INVALID_ADDRESS, KERNEL_NOT_IMPLEMENTED, KERNEL_TIMEOUT, SUCCESS,
+    KERNEL_INVALID_ADDRESS, KERNEL_INVALID_HANDLE, KERNEL_NOT_IMPLEMENTED, KERNEL_TIMEOUT, SUCCESS,
 };
 use nexium_ipc as ipc;
 
@@ -866,7 +866,7 @@ fn svc_cancel_synchronization(_kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
-    let (_holder, mutex_addr, self_handle) = if let Some(cpu) = cpu_ref() {
+    let (owner_handle, mutex_addr, self_handle) = if let Some(cpu) = cpu_ref() {
         (
             cpu.get_register(0) as u32,
             cpu.get_register(1),
@@ -885,16 +885,14 @@ fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
     let holder = cur_word & !MUTEX_HAS_LISTENERS;
     let lr = cpu_ref().map(|c| c.get_register(30)).unwrap_or(0);
 
-    if holder == 0 || holder == self_handle {
-        let new_word = self_handle | (cur_word & MUTEX_HAS_LISTENERS);
-        let _ = kernel
-            .address_space
-            .write(mutex_addr, &new_word.to_le_bytes());
-        log::info!(
-            "svcArbitrateLock mutex={:#x} self_handle={:#x} cur={:#x} → uncontended lr={:#x}",
+    if cur_word != (owner_handle | MUTEX_HAS_LISTENERS) {
+        log::debug!(
+            "svcArbitrateLock mutex={:#x} owner={:#x} self={:#x} cur={:#x} holder={:#x} -> retry lr={:#x}",
             mutex_addr,
+            owner_handle,
             self_handle,
             cur_word,
+            holder,
             lr
         );
         if let Some(cpu) = cpu_mut() {
@@ -903,10 +901,12 @@ fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
         return SUCCESS;
     }
 
-    let new_word = cur_word | MUTEX_HAS_LISTENERS;
-    let _ = kernel
-        .address_space
-        .write(mutex_addr, &new_word.to_le_bytes());
+    if !kernel.threads.threads.contains_key(&owner_handle) {
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(0, KERNEL_INVALID_HANDLE as u64);
+        }
+        return KERNEL_INVALID_HANDLE;
+    }
 
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
@@ -914,13 +914,17 @@ fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
     if let Some(cpu) = cpu_ref() {
         kernel.threads.yield_with_state(
             cpu,
-            crate::kernel::threads::ThreadState::WaitingMutex { mutex_addr },
+            crate::kernel::threads::ThreadState::WaitingMutex {
+                mutex_addr,
+                owner_handle,
+                tag: self_handle,
+            },
         );
     }
     log::debug!(
-        "svcArbitrateLock mutex={:#x} contended (holder={:#x} self={:#x}) → parked",
+        "svcArbitrateLock mutex={:#x} contended (owner={:#x} self={:#x}) -> parked",
         mutex_addr,
-        holder,
+        owner_handle,
         self_handle
     );
     SUCCESS
@@ -932,14 +936,16 @@ fn svc_arbitrate_unlock(kernel: &mut Kernel) -> u32 {
     } else {
         return 1;
     };
-    let woken = kernel.threads.wake_one_on_mutex(mutex_addr);
+    let owner_handle = kernel.threads.current_handle().unwrap_or(0);
+    let woken = kernel
+        .threads
+        .wake_one_on_mutex_owned(mutex_addr, owner_handle);
     let new_word = match woken {
-        Some(h) => {
-            let more = kernel.threads.has_mutex_waiters(mutex_addr);
+        Some((_h, tag, more)) => {
             if more {
-                h | MUTEX_HAS_LISTENERS
+                tag | MUTEX_HAS_LISTENERS
             } else {
-                h
+                tag
             }
         }
         None => 0,
@@ -947,10 +953,11 @@ fn svc_arbitrate_unlock(kernel: &mut Kernel) -> u32 {
     let _ = kernel
         .address_space
         .write(mutex_addr, &new_word.to_le_bytes());
-    if let Some(h) = woken {
+    if let Some((h, _, _)) = woken {
         log::debug!(
-            "svcArbitrateUnlock mutex={:#x} handed to handle={:#x} (word={:#x})",
+            "svcArbitrateUnlock mutex={:#x} owner={:#x} handed to handle={:#x} (word={:#x})",
             mutex_addr,
+            owner_handle,
             h,
             new_word
         );
@@ -982,14 +989,16 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
         lr
     );
 
-    let woken = kernel.threads.wake_one_on_mutex(mutex_addr);
+    let owner_handle = kernel.threads.current_handle().unwrap_or(0);
+    let woken = kernel
+        .threads
+        .wake_one_on_mutex_owned(mutex_addr, owner_handle);
     let new_word = match woken {
-        Some(h) => {
-            let more = kernel.threads.has_mutex_waiters(mutex_addr);
+        Some((_h, tag, more)) => {
             if more {
-                h | MUTEX_HAS_LISTENERS
+                tag | MUTEX_HAS_LISTENERS
             } else {
-                h
+                tag
             }
         }
         None => 0,
@@ -997,10 +1006,11 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
     let _ = kernel
         .address_space
         .write(mutex_addr, &new_word.to_le_bytes());
-    if let Some(h) = woken {
+    if let Some((h, _, _)) = woken {
         log::debug!(
-            "cond_wait release: mutex={:#x} handed to handle={:#x} (word={:#x})",
+            "cond_wait release: mutex={:#x} owner={:#x} handed to handle={:#x} (word={:#x})",
             mutex_addr,
+            owner_handle,
             h,
             new_word
         );
@@ -1021,14 +1031,26 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
         false
     };
     if had_pending {
-        if kernel.reacquire_condvar_mutex(self_handle, mutex_addr) {
+        if kernel.reacquire_condvar_mutex(self_handle, mutex_addr, self_handle) {
             if let Some(cpu) = cpu_mut() {
                 cpu.set_register(0, SUCCESS as u64);
             }
         } else if let Some(cpu) = cpu_ref() {
+            let owner_handle = {
+                let mut cur = [0u8; 4];
+                if kernel.address_space.read(mutex_addr, &mut cur).is_ok() {
+                    u32::from_le_bytes(cur) & !MUTEX_HAS_LISTENERS
+                } else {
+                    0
+                }
+            };
             kernel.threads.yield_with_state(
                 cpu,
-                crate::kernel::threads::ThreadState::WaitingMutex { mutex_addr },
+                crate::kernel::threads::ThreadState::WaitingMutex {
+                    mutex_addr,
+                    owner_handle,
+                    tag: self_handle,
+                },
             );
         }
         return SUCCESS;
@@ -1107,7 +1129,7 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
                 .write(mutex_addr, &new_word.to_le_bytes());
             kernel
                 .threads
-                .wake_condvar_into_mutex_waiter(handle, mutex_addr);
+                .wake_condvar_into_mutex_waiter(handle, mutex_addr, holder, handle);
             log::trace!(
                 "svcSignalProcessWideKey cond={:#x} → handle={:#x} mutex={:#x} (held by {:#x}, requeued as WaitingMutex)",
                 condvar_addr,
