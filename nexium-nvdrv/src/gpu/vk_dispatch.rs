@@ -4126,7 +4126,11 @@ fn vertex_buffer_bindings(
             let vb = vertex_buffers.get(b.binding as usize)?;
             let va = ((vb.address_hi as u64) << 32) | vb.address_lo as u64;
             let end = ((vb.end_hi as u64) << 32) | vb.end_lo as u64;
-            let size = end.saturating_sub(va);
+            let size = if end == 0 {
+                0
+            } else {
+                end.saturating_add(1).saturating_sub(va)
+            };
             (va != 0).then_some(VertexBufferBinding {
                 binding: b.binding,
                 addr: va,
