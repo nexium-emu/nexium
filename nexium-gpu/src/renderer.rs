@@ -4001,10 +4001,10 @@ fn readback_to_rgba8(src: &[u8], format: vk::Format, width: u32, height: u32) ->
             for i in 0..pixels.min(src.len() / 4) {
                 let off = i * 4;
                 let v = u32::from_le_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
-                let a = v & 0x3;
-                let b = (v >> 2) & 0x3ff;
-                let g = (v >> 12) & 0x3ff;
-                let r = (v >> 22) & 0x3ff;
+                let r = v & 0x3ff;
+                let g = (v >> 10) & 0x3ff;
+                let b = (v >> 20) & 0x3ff;
+                let a = (v >> 30) & 0x3;
                 out[off] = ((r * 255 + 511) / 1023) as u8;
                 out[off + 1] = ((g * 255 + 511) / 1023) as u8;
                 out[off + 2] = ((b * 255 + 511) / 1023) as u8;
@@ -5211,31 +5211,37 @@ fn create_texture_image(
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 );
             }
-            let copy = vk::ImageCopy {
-                src_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                src_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                dst_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                dst_offset: vk::Offset3D {
-                    x: 0,
-                    y: 0,
-                    z: slice.layer as i32,
-                },
-                extent: vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                },
-            };
+            let regions: Vec<vk::ImageCopy> = (0..height)
+                .map(|y| vk::ImageCopy {
+                    src_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    src_offset: vk::Offset3D {
+                        x: 0,
+                        y: y as i32,
+                        z: 0,
+                    },
+                    dst_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    dst_offset: vk::Offset3D {
+                        x: 0,
+                        y: (height - 1 - y) as i32,
+                        z: slice.layer as i32,
+                    },
+                    extent: vk::Extent3D {
+                        width,
+                        height: 1,
+                        depth: 1,
+                    },
+                })
+                .collect();
             unsafe {
                 device.cmd_copy_image(
                     cmd,
@@ -5243,7 +5249,7 @@ fn create_texture_image(
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[copy],
+                    &regions,
                 );
             }
             if restore_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
