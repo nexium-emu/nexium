@@ -698,16 +698,12 @@ fn shader_bundle_cache() -> &'static std::sync::Mutex<
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn shader_failed_set(
-) -> &'static std::sync::Mutex<
+fn shader_failed_set() -> &'static std::sync::Mutex<
     std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32)>,
->
-{
+> {
     use std::sync::OnceLock;
     static FAILED: OnceLock<
-        std::sync::Mutex<
-            std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32)>,
-        >,
+        std::sync::Mutex<std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32)>>,
     > = OnceLock::new();
     FAILED.get_or_init(|| {
         // Silence the default panic hook for shader-emit panics we catch_unwind,
@@ -3111,6 +3107,7 @@ struct DrawTraceConfig {
     enabled: bool,
     start: u64,
     end: u64,
+    fs: Option<u64>,
 }
 
 fn draw_trace_config() -> DrawTraceConfig {
@@ -3126,6 +3123,9 @@ fn draw_trace_config() -> DrawTraceConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(u64::MAX),
+        fs: std::env::var("NEXIUM_DRAW_TRACE_FS")
+            .ok()
+            .and_then(|v| parse_env_u64(&v)),
     })
 }
 
@@ -3156,6 +3156,11 @@ fn trace_draw(
     let cfg = draw_trace_config();
     if !cfg.enabled {
         return;
+    }
+    if let Some(fs) = cfg.fs {
+        if draw.fs_shader_gpu_va != fs {
+            return;
+        }
     }
     use std::sync::atomic::{AtomicU64, Ordering};
     static DRAW_SEQ: AtomicU64 = AtomicU64::new(0);
