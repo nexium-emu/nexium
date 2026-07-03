@@ -3384,6 +3384,61 @@ struct RtImageStats {
     bbox: Option<(u32, u32, u32, u32)>,
     first: Option<(u32, u32, [u8; 4])>,
     pixel_rows: Vec<String>,
+    format: vk::Format,
+}
+
+fn dump_rt_bmp(key: RtKey, rgba: &[u8]) {
+    use std::io::Write;
+    let Some(base) = std::env::var_os("APPDATA") else {
+        return;
+    };
+    if key.width == 0 || key.height == 0 {
+        return;
+    }
+    let dir = std::path::PathBuf::from(base).join("NeXium").join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join(format!(
+        "rt-{}-{}x{}-{:x}.bmp",
+        key.nvmap_id, key.width, key.height, key.gpu_va
+    ));
+    let row_stride = ((key.width as usize * 3 + 3) / 4) * 4;
+    let image_size = row_stride * key.height as usize;
+    let file_size = 54 + image_size;
+    let Ok(mut file) = std::fs::File::create(path) else {
+        return;
+    };
+    let mut header = Vec::with_capacity(54);
+    header.extend_from_slice(b"BM");
+    header.extend_from_slice(&(file_size as u32).to_le_bytes());
+    header.extend_from_slice(&[0u8; 4]);
+    header.extend_from_slice(&54u32.to_le_bytes());
+    header.extend_from_slice(&40u32.to_le_bytes());
+    header.extend_from_slice(&(key.width as i32).to_le_bytes());
+    header.extend_from_slice(&(key.height as i32).to_le_bytes());
+    header.extend_from_slice(&1u16.to_le_bytes());
+    header.extend_from_slice(&24u16.to_le_bytes());
+    header.extend_from_slice(&[0u8; 24]);
+    if file.write_all(&header).is_err() {
+        return;
+    }
+    let mut row = vec![0u8; row_stride];
+    for y in (0..key.height as usize).rev() {
+        row.fill(0);
+        for x in 0..key.width as usize {
+            let idx = (y * key.width as usize + x) * 4;
+            if idx + 4 > rgba.len() {
+                continue;
+            }
+            row[x * 3] = rgba[idx + 2];
+            row[x * 3 + 1] = rgba[idx + 1];
+            row[x * 3 + 2] = rgba[idx];
+        }
+        if file.write_all(&row).is_err() {
+            return;
+        }
+    }
 }
 
 fn trace_rt_stats(
@@ -3435,9 +3490,10 @@ fn trace_rt_stats(
                     })
                     .unwrap_or_else(|| "-".to_string());
                 log::warn!(
-                    "[rt-stats] seq={} key={} stamp={} rgbnz={}/{} ({:.2}%) anz={} avg_rgb={:.2} avg_a={:.2} max={} bbox={} first={}",
+                    "[rt-stats] seq={} key={} fmt={:?} stamp={} rgbnz={}/{} ({:.2}%) anz={} avg_rgb={:.2} avg_a={:.2} max={} bbox={} first={}",
                     seq,
                     key.label(),
+                    stats.format,
                     stamp,
                     stats.rgb_nonzero,
                     stats.pixels,
@@ -3843,6 +3899,7 @@ fn read_rt_image_stats(
     }
     let mut stats = RtImageStats {
         pixels: (key.width as u64) * (key.height as u64),
+        format,
         ..RtImageStats::default()
     };
     unsafe {
@@ -3857,6 +3914,9 @@ fn read_rt_image_stats(
         };
         let data = std::slice::from_raw_parts(ptr, total as usize);
         let rgba = readback_to_rgba8(data, format, key.width, key.height);
+        if std::env::var_os("NEXIUM_RT_DUMP").is_some() {
+            dump_rt_bmp(key, &rgba);
+        }
         for (i, px) in rgba.chunks_exact(4).enumerate() {
             let r = px[0];
             let g = px[1];
@@ -4244,7 +4304,10 @@ fn block_linear_volume_slice_offsets(tic: &crate::texture::TicEntry, layers: u32
     let slice_size = (tiles_width.saturating_mul(tiles_height)) << gob_size_shift;
     let z_mask = (1u64 << block_depth).saturating_sub(1);
     (0..layers as u64)
-        .map(|z| ((z >> block_depth) * slice_size).saturating_add((z & z_mask) << gob_size_shift))
+        .map(|z| {
+            ((z & !z_mask).saturating_mul(slice_size))
+                .saturating_add((z & z_mask) << gob_size_shift)
+        })
         .collect()
 }
 
