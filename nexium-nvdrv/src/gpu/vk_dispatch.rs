@@ -650,25 +650,47 @@ fn submit_draw_batch_async(
     let r = renderer.clone();
     let diag = std::env::var_os("NEXIUM_PRESENT_KEYS").is_some();
     rt.submit(Box::new(move || {
+        {
+            let mut ring = submit_ring().lock().unwrap();
+            let mut fss: Vec<String> = calls
+                .iter()
+                .map(|c| format!("{:#x}", c.fs_gpu_va))
+                .collect();
+            fss.dedup();
+            ring.push_back(format!(
+                "vs={:#x} fs=[{}] calls={} rt={}",
+                calls[0].vs_gpu_va,
+                fss.join(","),
+                calls.len(),
+                calls[0].rt_key.label()
+            ));
+            while ring.len() > 24 {
+                ring.pop_front();
+            }
+        }
         let res = r.execute_draws(&calls, move |addr: u64, len: usize| {
             snapshot
                 .get(&addr)
                 .filter(|b| b.len() >= len)
                 .map(|b| b[..len].to_vec())
         });
-        if diag {
-            if let Err(e) = res {
-                use std::sync::atomic::{AtomicU64, Ordering};
-                static CT: AtomicU64 = AtomicU64::new(0);
-                let n = CT.fetch_add(1, Ordering::Relaxed);
-                if n < 6 {
-                    let c = &calls[0];
-                    log::warn!(
-                        "[draw-fail #{}] err={} n_calls={} rt={}:{}x{} vtx={} idx={:?} tex_ids={:?} tsc_ids={:?} cbuf_sz={} tics=[{}]",
-                        n, e, calls.len(), c.rt_key.nvmap_id, c.rt_key.width, c.rt_key.height,
-                        c.vertex_count, c.index_count, c.fs_tex_ids, c.fs_sampler_ids, c.cbuf_size,
-                        tic_summ.join(" | ")
-                    );
+        if let Err(e) = res {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CT: AtomicU64 = AtomicU64::new(0);
+            let n = CT.fetch_add(1, Ordering::Relaxed);
+            if n < 6 {
+                let c = &calls[0];
+                log::warn!(
+                    "[draw-fail #{}] err={} n_calls={} rt={}:{}x{} vtx={} idx={:?} tex_ids={:?} tsc_ids={:?} cbuf_sz={} tics=[{}]",
+                    n, e, calls.len(), c.rt_key.nvmap_id, c.rt_key.width, c.rt_key.height,
+                    c.vertex_count, c.index_count, c.fs_tex_ids, c.fs_sampler_ids, c.cbuf_size,
+                    if diag { tic_summ.join(" | ") } else { String::new() }
+                );
+                if n == 0 {
+                    let ring = submit_ring().lock().unwrap();
+                    for (i, entry) in ring.iter().enumerate() {
+                        log::warn!("[draw-fail-ring] {}: {}", i, entry);
+                    }
                 }
             }
         }
@@ -769,6 +791,12 @@ fn small_rt_registry() -> &'static std::sync::Mutex<std::collections::HashMap<Rt
     R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn submit_ring() -> &'static std::sync::Mutex<std::collections::VecDeque<String>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<String>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
 pub fn writeback_small_rts(
     renderer: &Arc<nexium_gpu::Renderer>,
     mappings: &GpuMappings,
@@ -783,10 +811,29 @@ pub fn writeback_small_rts(
     };
     if let Some(rt) = crate::render_thread::maybe_render_thread() {
         let (tx, rx) = std::sync::mpsc::channel();
-        rt.submit(Box::new(move || {
+        if !rt.try_submit(Box::new(move || {
             let _ = tx.send(());
-        }));
-        let _ = rx.recv_timeout(std::time::Duration::from_millis(250));
+        })) {
+            let mut reg = small_rt_registry().lock().unwrap();
+            for (key, tile_mode) in pending {
+                if reg.len() < 64 {
+                    reg.insert(key, tile_mode);
+                }
+            }
+            return;
+        }
+        if rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_err()
+        {
+            let mut reg = small_rt_registry().lock().unwrap();
+            for (key, tile_mode) in pending {
+                if reg.len() < 64 {
+                    reg.insert(key, tile_mode);
+                }
+            }
+            return;
+        }
     }
     for (key, tile_mode) in pending {
         let Some((kw, kh, bpp, mut raw)) = renderer.readback_target_raw(key.nvmap_id, key.gpu_va)
@@ -824,7 +871,7 @@ pub fn writeback_small_rts(
             let n = tiled.len().min(limit as usize);
             mem_write(cpu, &tiled[..n]);
         }
-        log::info!(
+        log::debug!(
             "[rt-writeback] {} bpp={} tile={:#x}",
             key.label(),
             bpp,
@@ -1258,6 +1305,23 @@ fn execute_one(
 
             let vs_hash = nexium_gpu::renderer::hash_spirv(&vs_spirv);
             let fs_hash = nexium_gpu::renderer::hash_spirv(&fs_spirv);
+            if std::env::var_os("NEXIUM_DUMP_SPIRV").is_some() {
+                let fnv = |words: &[u32]| {
+                    let mut h: u64 = 1469598103934665603;
+                    for w in words {
+                        h ^= *w as u64;
+                        h = h.wrapping_mul(1099511628211);
+                    }
+                    h
+                };
+                log::info!(
+                    "[spv-map] vs_addr={:#x} vs_spv={:016x} fs_addr={:#x} fs_spv={:016x}",
+                    vs_addr,
+                    fnv(&vs_spirv),
+                    fs_addr,
+                    fnv(&fs_spirv)
+                );
+            }
             let b = std::sync::Arc::new(ShaderBundle {
                 vs_spirv: std::sync::Arc::new(vs_spirv),
                 vs_cbuf_mask,

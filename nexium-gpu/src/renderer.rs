@@ -1216,13 +1216,27 @@ impl Renderer {
             return None;
         }
         let mut raw = vec![0u8; total as usize];
-        unsafe {
-            let _ = device.wait_for_fences(&[fence], true, u64::MAX);
-            if let Ok(ptr) =
-                device.map_memory(stage.memory, 0, stage.size, vk::MemoryMapFlags::empty())
-            {
-                std::ptr::copy_nonoverlapping(ptr as *const u8, raw.as_mut_ptr(), total as usize);
-                device.unmap_memory(stage.memory);
+        let waited = unsafe { device.wait_for_fences(&[fence], true, 1_000_000_000) };
+        match waited {
+            Ok(()) => unsafe {
+                if let Ok(ptr) =
+                    device.map_memory(stage.memory, 0, stage.size, vk::MemoryMapFlags::empty())
+                {
+                    std::ptr::copy_nonoverlapping(
+                        ptr as *const u8,
+                        raw.as_mut_ptr(),
+                        total as usize,
+                    );
+                    device.unmap_memory(stage.memory);
+                }
+            },
+            Err(e) => {
+                log::warn!("readback_target_raw fence wait failed: {:?}", e);
+                unsafe {
+                    let _ = device.wait_for_fences(&[fence], true, 5_000_000_000);
+                }
+                cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+                return None;
             }
         }
         cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
