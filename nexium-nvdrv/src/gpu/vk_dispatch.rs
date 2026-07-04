@@ -1195,11 +1195,15 @@ fn execute_one(
 
             let (fs_spirv, fs_cbuf_mask, mut fs_tex_ids, fs_cbuf_used, fs_sampler_arrayed) =
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    nexium_spirv::emit_fragment_full_with_input_map_meta_outputs(
+                    let fs_debug_targets = parse_env_u64_list("NEXIUM_FS_DEBUG_TARGET");
+                    let fs_debug_active =
+                        fs_debug_targets.is_empty() || fs_debug_targets.contains(&fs_addr);
+                    nexium_spirv::emit_fragment_full_with_input_map_meta_outputs_debug(
                         &fs_cfg,
                         fs_input_map,
                         color_output_count,
                         fs_output_map,
+                        fs_debug_active,
                     )
                 })) {
                     Ok(v) => v,
@@ -1994,6 +1998,7 @@ fn execute_one(
         is_indexed,
         &fs_tex_ids,
         &sampled_rt_slots,
+        &color_rt_formats,
         depth_test,
         depth_write,
         (
@@ -2007,6 +2012,9 @@ fn execute_one(
             attachments[0].alpha_op.as_raw() as u32,
         ),
         &blend_state,
+        fs_output_map,
+        &maxwell.regs.color_masks,
+        maxwell.regs.color_mask_common,
         vs_cbuf_mask,
         fs_cbuf_mask,
         &maxwell.regs.cbuf_binds,
@@ -3408,10 +3416,14 @@ fn trace_draw(
     indexed: bool,
     fs_tex_ids: &[u32],
     sampled_rt_slots: &[Option<RtKey>],
+    color_rt_formats: &[vk::Format],
     depth_test: bool,
     depth_write: bool,
     blend_raw: (bool, bool, u32, u32, u32, u32, u32, u32),
     blend: &BlendState,
+    fs_output_map: u32,
+    color_masks: &[u32; 8],
+    color_mask_common: bool,
     vs_cbuf_mask: u32,
     fs_cbuf_mask: u32,
     cbuf_binds: &[[(u64, u32); 16]; 5],
@@ -3554,6 +3566,42 @@ fn trace_draw(
         fs_cbuf_mask,
         cbuf,
         draw.fs_shader_gpu_va,
+    );
+    let attachments = color_rt_keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let slot = rt_control_target(draw.rt_control, index);
+            let mask_index = if color_mask_common { 0 } else { index.min(7) };
+            let shader_mask = fragment_output_mask(fs_output_map, index as u32);
+            let maxwell_mask = color_masks[mask_index];
+            let final_mask = blend.attachments[index.min(7)].color_write_mask.as_raw();
+            let format = color_rt_formats
+                .get(index)
+                .map(|format| format!("{:?}", format))
+                .unwrap_or_else(|| "?".to_string());
+            format!(
+                "{}:slot{} {} fmt={} omap={:x} cmask={:#x} final={:#x} blend={}",
+                index,
+                slot,
+                key.label(),
+                format,
+                shader_mask,
+                maxwell_mask,
+                final_mask,
+                blend.attachments[index.min(7)].enabled
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    log::warn!(
+        "[drawtrace-att] op={} #{} fs={:#x} rtctl={:#x} common={} [{}]",
+        op_seq,
+        seq,
+        draw.fs_shader_gpu_va,
+        draw.rt_control,
+        color_mask_common,
+        attachments
     );
 }
 
