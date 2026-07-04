@@ -4307,7 +4307,13 @@ fn igbp_handle_transact(
                     let submitted = rt_worker.try_submit(Box::new(move || {
                         let t0 = std::time::Instant::now();
                         let crop = cached_present_crop(pw, ph);
-                        let read_rect = crop.map(|(x0, y0, w, h)| [x0, y0, w, h]);
+                        let read_rect = crop.map(|(x0, y0, w, h)| {
+                            if should_flip_vulkan_present(pw, ph) {
+                                [x0, ph.saturating_sub(y0).saturating_sub(h), w, h]
+                            } else {
+                                [x0, y0, w, h]
+                            }
+                        });
                         if let Some((read_w, read_h, bytes)) =
                             r_async.readback_target_pipelined(pnv, pw, ph, read_rect)
                         {
