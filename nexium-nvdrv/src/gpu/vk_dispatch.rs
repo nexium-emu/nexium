@@ -3757,7 +3757,7 @@ fn cbuf_sample(
         }
         let (addr, size) = cbuf_bind_for_slot(cbuf_binds, logical_slot as u32);
         let dump_bytes = if std::env::var_os("NEXIUM_DRAW_TRACE_CBUF_FULL").is_some() {
-            PACKED_CBUF_SLOT_SIZE.min(64)
+            PACKED_CBUF_SLOT_SIZE.min(256)
         } else {
             16
         };
