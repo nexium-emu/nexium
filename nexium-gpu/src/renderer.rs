@@ -4989,6 +4989,22 @@ fn texture_upload_data(
     }
 }
 
+fn volume_from_guest(gpu_va: u64) -> bool {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("NEXIUM_VOLUME_FROM_GUEST")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|s| {
+                        u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    list.contains(&gpu_va)
+}
+
 fn find_volume_rt_slices(
     rt_cache: &RtCache,
     tic: &crate::texture::TicEntry,
@@ -4997,6 +5013,9 @@ fn find_volume_rt_slices(
     base_key: Option<RtKey>,
 ) -> Option<Vec<VolumeRtSlice>> {
     if layers == 0 {
+        return None;
+    }
+    if volume_from_guest(tic.gpu_va) {
         return None;
     }
     let offsets = volume_slice_offsets(tic, pitch_size, layers)?;

@@ -921,7 +921,15 @@ fn execute_one(
         .iter()
         .map(|(_, format)| *format)
         .collect::<Vec<_>>();
-    if !draw.is_clear && (rt.width as u64) * (rt.height as u64) <= 16384 {
+    if !draw.is_clear && (rt.width as u64) * (rt.height as u64) <= 16384 && {
+        static SKIP: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+        let skip = SKIP.get_or_init(|| {
+            std::env::var("NEXIUM_NO_SMALL_RT_WB_NVMAPS")
+                .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+                .unwrap_or_default()
+        });
+        !skip.contains(&rt_key.nvmap_id)
+    } {
         small_rt_registry()
             .lock()
             .unwrap()
@@ -3728,8 +3736,13 @@ fn cbuf_sample(
         return "cbuf_sample=none".to_string();
     };
     if !cbuf_reads.is_empty() {
+        let max_reads = std::env::var("NEXIUM_DRAW_TRACE_CBUF_READS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(12)
+            .clamp(1, 64);
         let mut vals = Vec::new();
-        for &(logical_slot, byte_offset) in cbuf_reads.iter().take(12) {
+        for &(logical_slot, byte_offset) in cbuf_reads.iter().take(max_reads) {
             let off = logical_slot as usize * PACKED_CBUF_SLOT_SIZE + byte_offset as usize;
             let (addr, size) = cbuf_bind_for_slot(cbuf_binds, logical_slot);
             if off + 4 > data.len() {
@@ -3763,7 +3776,16 @@ fn cbuf_sample(
         }
         let (addr, size) = cbuf_bind_for_slot(cbuf_binds, logical_slot as u32);
         let dump_bytes = if std::env::var_os("NEXIUM_DRAW_TRACE_CBUF_FULL").is_some() {
-            PACKED_CBUF_SLOT_SIZE.min(256)
+            let max = std::env::var("NEXIUM_DRAW_TRACE_CBUF_MAX")
+                .ok()
+                .and_then(|v| {
+                    let v = v.trim();
+                    usize::from_str_radix(v.trim_start_matches("0x"), 16)
+                        .ok()
+                        .or_else(|| v.parse().ok())
+                })
+                .unwrap_or(256);
+            PACKED_CBUF_SLOT_SIZE.min(max)
         } else {
             16
         };
