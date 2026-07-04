@@ -3780,6 +3780,9 @@ fn trace_present_key(rt_cache: &RtCache, requested_key: RtKey, key: RtKey) {
 #[derive(Default)]
 struct RtImageStats {
     pixels: u64,
+    raw_nonzero_bytes: u64,
+    raw_nonzero_words: u64,
+    raw_first_word: Option<(u32, u32, u32)>,
     rgb_nonzero: u64,
     alpha_nonzero: u64,
     rgb_sum: u64,
@@ -3893,12 +3896,19 @@ fn trace_rt_stats(
                         )
                     })
                     .unwrap_or_else(|| "-".to_string());
+                let raw_first = stats
+                    .raw_first_word
+                    .map(|(x, y, word)| format!("{},{}:{:08x}", x, y, word))
+                    .unwrap_or_else(|| "-".to_string());
                 log::warn!(
-                    "[rt-stats] seq={} key={} fmt={:?} stamp={} rgbnz={}/{} ({:.2}%) anz={} avg_rgb={:.2} avg_a={:.2} max={} bbox={} first={}",
+                    "[rt-stats] seq={} key={} fmt={:?} stamp={} rawbnz={} rawwnz={} rawfirst={} rgbnz={}/{} ({:.2}%) anz={} avg_rgb={:.2} avg_a={:.2} max={} bbox={} first={}",
                     seq,
                     key.label(),
                     stats.format,
                     stamp,
+                    stats.raw_nonzero_bytes,
+                    stats.raw_nonzero_words,
+                    raw_first,
                     stats.rgb_nonzero,
                     stats.pixels,
                     pct,
@@ -4369,6 +4379,29 @@ fn read_rt_image_stats(
             }
         };
         let data = std::slice::from_raw_parts(ptr, total as usize);
+        for (idx, byte) in data.iter().enumerate() {
+            if *byte != 0 {
+                stats.raw_nonzero_bytes += 1;
+                if stats.raw_first_word.is_none() {
+                    let pixel_size = readback_format_bpp(format).max(1);
+                    let pixel = idx / pixel_size;
+                    let word_start = (idx / 4) * 4;
+                    let mut raw = [0u8; 4];
+                    let available = data.len().saturating_sub(word_start).min(4);
+                    raw[..available].copy_from_slice(&data[word_start..word_start + available]);
+                    stats.raw_first_word = Some((
+                        (pixel as u32) % key.width,
+                        (pixel as u32) / key.width,
+                        u32::from_le_bytes(raw),
+                    ));
+                }
+            }
+        }
+        for word in data.chunks(4) {
+            if word.iter().any(|byte| *byte != 0) {
+                stats.raw_nonzero_words += 1;
+            }
+        }
         let rgba = readback_to_rgba8(data, format, key.width, key.height);
         if std::env::var_os("NEXIUM_RT_DUMP").is_some() {
             dump_rt_bmp(key, &rgba);
@@ -5293,6 +5326,15 @@ fn trace_rt_alias(
     if std::env::var_os("NEXIUM_RT_ALIAS_DBG").is_none() {
         return;
     }
+    if let Ok(list) = std::env::var("NEXIUM_RT_ALIAS_FS") {
+        let matched = list
+            .split(',')
+            .filter_map(|part| parse_u64_value(part.trim()))
+            .any(|addr| addr == call.fs_gpu_va);
+        if !matched {
+            return;
+        }
+    }
     if src.width < 512 || src.height < 256 {
         return;
     }
@@ -5968,6 +6010,7 @@ fn create_texture_image(
             if slice.layer >= layers || slice.format != format {
                 continue;
             }
+            let no_yflip = std::env::var_os("NEXIUM_VOLUME_NO_YFLIP").is_some();
             let restore_layout = slice.layout;
             if restore_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
                 transition_image(
@@ -5999,7 +6042,7 @@ fn create_texture_image(
                     },
                     dst_offset: vk::Offset3D {
                         x: 0,
-                        y: (height - 1 - y) as i32,
+                        y: if no_yflip { y } else { height - 1 - y } as i32,
                         z: slice.layer as i32,
                     },
                     extent: vk::Extent3D {
