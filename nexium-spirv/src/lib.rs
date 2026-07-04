@@ -110,6 +110,7 @@ pub struct Emitter {
     sample_debug_component: Option<u32>,
     sample_debug_value: Option<Word>,
     texcoord_debug_slot: Option<u32>,
+    tex_v_flip_slots: Vec<u32>,
     sampler_arrayed: bool,
     no_kil_shader: bool,
     fragment_color_outputs: u32,
@@ -322,6 +323,14 @@ impl Emitter {
             texcoord_debug_slot: std::env::var("NEXIUM_FS_TEXCOORD_SLOT")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok()),
+            tex_v_flip_slots: std::env::var("NEXIUM_TEX_V_FLIP_SLOTS")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|part| part.trim().parse::<u32>().ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
             sampler_arrayed: false,
             no_kil_shader: false,
             fragment_color_outputs: 1,
@@ -452,7 +461,16 @@ impl Emitter {
             return None;
         }
         let mask = (self.fragment_output_map >> (location * 4)) & 0xF;
-        (mask != 0).then_some(((location * 4) as u8, mask))
+        if mask == 0 {
+            return None;
+        }
+        let mut base = 0u32;
+        for rt in 0..location {
+            if ((self.fragment_output_map >> (rt * 4)) & 0xF) != 0 {
+                base += 4;
+            }
+        }
+        Some((base as u8, mask))
     }
 
     fn fragment_output_mask(&self, location: u32) -> u32 {
@@ -1443,6 +1461,12 @@ impl Emitter {
             } => 'sample_tex: {
                 self.texs_ids_used.insert(*tex_id);
                 if let Some(w) = volume {
+                    let tex_slot = self
+                        .texture_slots
+                        .get(tex_id)
+                        .copied()
+                        .unwrap_or(0)
+                        .min(MAX_TEXTURE_DESCRIPTORS - 1);
                     let uv0 = self.lower_value(u);
                     let uv1 = self.lower_value(v);
                     let uv2 = self.lower_value(w);
@@ -1450,6 +1474,20 @@ impl Emitter {
                         .b
                         .composite_construct(self.vec3_t, None, [uv0, uv1, uv2])
                         .unwrap();
+                    if matches!(self.stage, Stage::Fragment)
+                        && self.texcoord_debug_slot == Some(tex_slot)
+                        && self.sample_debug_value.is_none()
+                    {
+                        self.sample_debug_value = Some(
+                            self.b
+                                .composite_construct(
+                                    self.vec4_t,
+                                    None,
+                                    [uv0, uv1, uv2, self.f32_one],
+                                )
+                                .unwrap(),
+                        );
+                    }
                     let (img_var, samp_var) = self.sampler_3d_at(*tex_id);
                     let img = self
                         .b
@@ -1475,6 +1513,23 @@ impl Emitter {
                             [Operand::IdRef(lod_zero)],
                         )
                         .unwrap();
+                    if matches!(self.stage, Stage::Fragment)
+                        && self.sample_debug_slot == Some(tex_slot)
+                        && self.sample_debug_value.is_none()
+                    {
+                        let debug_value = if let Some(component) = self.sample_debug_component {
+                            let c = self
+                                .b
+                                .composite_extract(self.f32_t, None, sampled, [component])
+                                .unwrap_or(self.f32_zero);
+                            self.b
+                                .composite_construct(self.vec4_t, None, [c, c, c, self.f32_one])
+                                .unwrap()
+                        } else {
+                            sampled
+                        };
+                        self.sample_debug_value = Some(debug_value);
+                    }
                     let c = self
                         .b
                         .composite_extract(self.f32_t, None, sampled, [*component as u32])
@@ -1493,11 +1548,16 @@ impl Emitter {
                     let v = parts.next()?.trim().parse::<f32>().ok()?;
                     Some((u, v))
                 });
-                let (uv0, uv1) = if let Some((u, v)) = uv_override {
+                let (uv0, mut uv1) = if let Some((u, v)) = uv_override {
                     (self.const_f32(u.to_bits()), self.const_f32(v.to_bits()))
                 } else {
                     (self.lower_value(u), self.lower_value(v))
                 };
+                if matches!(self.stage, Stage::Fragment)
+                    && self.tex_v_flip_slots.contains(&tex_slot)
+                {
+                    uv1 = self.b.f_sub(self.f32_t, None, self.f32_one, uv1).unwrap();
+                }
                 let coords = if self.sampler_arrayed {
                     let layer = if let Some(override_layer) =
                         std::env::var("NEXIUM_TEX_LAYER_OVERRIDE")
@@ -3630,8 +3690,29 @@ pub fn emit_fragment_full_with_input_map_meta_outputs(
     color_outputs: u32,
     output_map: u32,
 ) -> (Vec<u32>, u32, Vec<u32>, u32, bool) {
+    emit_fragment_full_with_input_map_meta_outputs_debug(
+        cfg,
+        ps_input_map,
+        color_outputs,
+        output_map,
+        true,
+    )
+}
+
+pub fn emit_fragment_full_with_input_map_meta_outputs_debug(
+    cfg: &Cfg,
+    ps_input_map: [u8; 32],
+    color_outputs: u32,
+    output_map: u32,
+    debug_active: bool,
+) -> (Vec<u32>, u32, Vec<u32>, u32, bool) {
     let vec4s = cbuf_vec4s(cfg, 1).max(UBO_VEC4S);
     let mut emitter = Emitter::new_sized(Stage::Fragment, vec4s);
+    if !debug_active {
+        emitter.sample_debug_slot = None;
+        emitter.texcoord_debug_slot = None;
+        emitter.tex_v_flip_slots.clear();
+    }
     emitter.ps_input_map = ps_input_map;
     emitter.fragment_color_outputs = color_outputs.max(1).min(8);
     emitter.fragment_output_map = output_map;
