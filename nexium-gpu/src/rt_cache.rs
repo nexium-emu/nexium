@@ -65,8 +65,10 @@ impl RtKey {
 pub struct GpuImage {
     pub image: vk::Image,
     pub view: vk::ImageView,
+    pub views: HashMap<vk::Format, vk::ImageView>,
     pub memory: vk::DeviceMemory,
     pub format: vk::Format,
+    pub base_format: vk::Format,
     pub extent: vk::Extent2D,
     pub layout: vk::ImageLayout,
 }
@@ -270,6 +272,9 @@ impl RtCache {
         key: RtKey,
         device: &ash::Device,
     ) -> Result<&mut GpuImage, String> {
+        if self.cache.contains_key(&key) {
+            return Ok(self.cache.get_mut(&key).unwrap());
+        }
         self.get_or_create_with_format(key, device, vk::Format::R8G8B8A8_UNORM)
     }
 
@@ -285,23 +290,95 @@ impl RtCache {
             .copied()
     }
 
+    pub fn color_exact_with_format(
+        &self,
+        key: RtKey,
+    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format, u64)> {
+        let img = self.cache.get(&key)?;
+        Some((
+            key,
+            img.image,
+            img.view,
+            img.layout,
+            img.format,
+            self.drawn_stamp.get(&key).copied().unwrap_or(0),
+        ))
+    }
+
+    pub fn drawn_color_aliases(
+        &self,
+        key: RtKey,
+    ) -> Vec<(RtKey, vk::Image, vk::ImageLayout, vk::Format, u64)> {
+        let mut out = Vec::new();
+        if key.gpu_va == 0 {
+            return out;
+        }
+        for (k, img) in &self.cache {
+            if *k == key || k.nvmap_id != key.nvmap_id || k.gpu_va != key.gpu_va {
+                continue;
+            }
+            let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+                continue;
+            };
+            out.push((*k, img.image, img.layout, img.format, stamp));
+        }
+        out.sort_by_key(|(_, _, _, _, stamp)| *stamp);
+        out
+    }
+
     pub fn get_or_create_with_format(
         &mut self,
         key: RtKey,
         device: &ash::Device,
         format: vk::Format,
     ) -> Result<&mut GpuImage, String> {
-        if self
+        let existing = self
             .cache
             .get(&key)
-            .is_some_and(|image| image.format != format)
-        {
-            if let Some(image) = self.cache.remove(&key) {
-                unsafe {
-                    device.destroy_image_view(image.view, None);
-                    device.destroy_image(image.image, None);
-                    device.free_memory(image.memory, None);
+            .map(|image| (image.format, image.base_format));
+        match existing {
+            Some((current, _)) if current == format => {
+                return Ok(self.cache.get_mut(&key).unwrap());
+            }
+            Some((current, base)) if rt_formats_compatible(base, format) => {
+                if rt_format_dbg_enabled(key.nvmap_id) {
+                    log::warn!(
+                        "[rt-format-view] key={} {:?}->{:?} stamp={}",
+                        key.label(),
+                        current,
+                        format,
+                        self.drawn_stamp.get(&key).copied().unwrap_or(0)
+                    );
                 }
+                let image = self.cache.get_mut(&key).unwrap();
+                if !image.views.contains_key(&format) {
+                    let view = create_image_view(
+                        device,
+                        image.image,
+                        format,
+                        vk::ImageAspectFlags::COLOR,
+                    )?;
+                    image.views.insert(format, view);
+                }
+                image.view = image.views[&format];
+                image.format = format;
+                return Ok(image);
+            }
+            Some(_) => {}
+            None => {}
+        }
+        if existing.is_some() {
+            if let Some(image) = self.cache.remove(&key) {
+                if rt_format_dbg_enabled(key.nvmap_id) {
+                    log::warn!(
+                        "[rt-format-churn] key={} {:?}->{:?} stamp={}",
+                        key.label(),
+                        image.format,
+                        format,
+                        self.drawn_stamp.get(&key).copied().unwrap_or(0)
+                    );
+                }
+                destroy_gpu_image(device, image);
             }
             self.drawn_stamp.remove(&key);
             self.frame_draws.remove(&key);
@@ -589,34 +666,17 @@ impl RtCache {
                 .map_err(|e| format!("bind_image_memory: {:?}", e))?;
         }
 
-        let view_info = vk::ImageViewCreateInfo {
-            s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
-            image,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format,
-            subresource_range: vk::ImageSubresourceRange {
-                aspect_mask: aspect,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            components: vk::ComponentMapping::default(),
-            p_next: std::ptr::null(),
-            flags: Default::default(),
-            _marker: std::marker::PhantomData,
-        };
-        let view = unsafe {
-            device
-                .create_image_view(&view_info, None)
-                .map_err(|e| format!("create_image_view: {:?}", e))?
-        };
+        let view = create_image_view(device, image, format, aspect)?;
+        let mut views = HashMap::new();
+        views.insert(format, view);
 
         Ok(GpuImage {
             image,
             view,
+            views,
             memory,
             format,
+            base_format: format,
             extent,
             layout: vk::ImageLayout::UNDEFINED,
         })
@@ -624,12 +684,120 @@ impl RtCache {
 
     pub fn clear(&mut self, device: &ash::Device) {
         for (_, img) in self.cache.drain().chain(self.depth_cache.drain()) {
-            unsafe {
-                device.destroy_image_view(img.view, None);
-                device.destroy_image(img.image, None);
-                device.free_memory(img.memory, None);
-            }
+            destroy_gpu_image(device, img);
         }
+    }
+}
+
+fn create_image_view(
+    device: &ash::Device,
+    image: vk::Image,
+    format: vk::Format,
+    aspect: vk::ImageAspectFlags,
+) -> Result<vk::ImageView, String> {
+    let view_info = vk::ImageViewCreateInfo {
+        s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+        image,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format,
+        subresource_range: vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        components: vk::ComponentMapping::default(),
+        p_next: std::ptr::null(),
+        flags: Default::default(),
+        _marker: std::marker::PhantomData,
+    };
+    unsafe {
+        device
+            .create_image_view(&view_info, None)
+            .map_err(|e| format!("create_image_view: {:?}", e))
+    }
+}
+
+fn destroy_gpu_image(device: &ash::Device, image: GpuImage) {
+    unsafe {
+        for view in image.views.into_values() {
+            device.destroy_image_view(view, None);
+        }
+        device.destroy_image(image.image, None);
+        device.free_memory(image.memory, None);
+    }
+}
+
+fn rt_formats_compatible(base: vk::Format, view: vk::Format) -> bool {
+    base == view
+        || rt_format_class_bits(base)
+            .zip(rt_format_class_bits(view))
+            .is_some_and(|(a, b)| a == b)
+}
+
+fn rt_format_class_bits(format: vk::Format) -> Option<u32> {
+    match format {
+        vk::Format::R32G32B32A32_SFLOAT
+        | vk::Format::R32G32B32A32_SINT
+        | vk::Format::R32G32B32A32_UINT => Some(128),
+        vk::Format::R16G16B16A16_UNORM
+        | vk::Format::R16G16B16A16_SNORM
+        | vk::Format::R16G16B16A16_SINT
+        | vk::Format::R16G16B16A16_UINT
+        | vk::Format::R16G16B16A16_SFLOAT
+        | vk::Format::R32G32_SFLOAT
+        | vk::Format::R32G32_SINT
+        | vk::Format::R32G32_UINT => Some(64),
+        vk::Format::R16G16_UNORM
+        | vk::Format::R16G16_SNORM
+        | vk::Format::R16G16_SINT
+        | vk::Format::R16G16_UINT
+        | vk::Format::R16G16_SFLOAT
+        | vk::Format::R32_SFLOAT
+        | vk::Format::R32_SINT
+        | vk::Format::R32_UINT
+        | vk::Format::A2B10G10R10_UNORM_PACK32
+        | vk::Format::A2B10G10R10_UINT_PACK32
+        | vk::Format::A2B10G10R10_SINT_PACK32
+        | vk::Format::A8B8G8R8_UNORM_PACK32
+        | vk::Format::A8B8G8R8_SNORM_PACK32
+        | vk::Format::A8B8G8R8_SINT_PACK32
+        | vk::Format::A8B8G8R8_UINT_PACK32
+        | vk::Format::A8B8G8R8_SRGB_PACK32
+        | vk::Format::B8G8R8A8_UNORM
+        | vk::Format::B8G8R8A8_SRGB
+        | vk::Format::R8G8B8A8_UNORM
+        | vk::Format::R8G8B8A8_SRGB
+        | vk::Format::B10G11R11_UFLOAT_PACK32 => Some(32),
+        vk::Format::R16_UNORM
+        | vk::Format::R16_SNORM
+        | vk::Format::R16_SINT
+        | vk::Format::R16_UINT
+        | vk::Format::R16_SFLOAT
+        | vk::Format::R8G8_UNORM
+        | vk::Format::R8G8_SNORM
+        | vk::Format::R8G8_SINT
+        | vk::Format::R8G8_UINT
+        | vk::Format::R5G6B5_UNORM_PACK16 => Some(16),
+        vk::Format::R8_UNORM | vk::Format::R8_SNORM | vk::Format::R8_SINT | vk::Format::R8_UINT => {
+            Some(8)
+        }
+        _ => None,
+    }
+}
+
+fn rt_format_dbg_enabled(nvmap_id: u32) -> bool {
+    if std::env::var_os("NEXIUM_RT_FORMAT_DBG").is_none() {
+        return false;
+    }
+    match std::env::var("NEXIUM_RT_FORMAT_NVMAPS") {
+        Ok(list) => list.split(',').any(|item| {
+            item.trim()
+                .parse::<u32>()
+                .is_ok_and(|want| want == nvmap_id)
+        }),
+        Err(_) => true,
     }
 }
 
