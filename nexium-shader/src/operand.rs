@@ -670,6 +670,10 @@ pub fn f2i_signed(insn: u64) -> bool {
     bits(insn, 12, 12) != 0
 }
 #[inline]
+pub fn f2i_rounding(insn: u64) -> u8 {
+    bits(insn, 39, 40) as u8
+}
+#[inline]
 pub fn bfe_signed(insn: u64) -> bool {
     bits(insn, 48, 48) != 0
 }

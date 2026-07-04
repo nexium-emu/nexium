@@ -448,18 +448,11 @@ impl Emitter {
         if self.fragment_output_map == 0 {
             return Some(((location * 4) as u8, 0xF));
         }
-        let mut output = 0u32;
-        for group in 0..8u32 {
-            let mask = (self.fragment_output_map >> (group * 4)) & 0xF;
-            if mask == 0 {
-                continue;
-            }
-            if output == location {
-                return Some(((group * 4) as u8, mask));
-            }
-            output += 1;
+        if location >= 8 {
+            return None;
         }
-        None
+        let mask = (self.fragment_output_map >> (location * 4)) & 0xF;
+        (mask != 0).then_some(((location * 4) as u8, mask))
     }
 
     fn fragment_output_mask(&self, location: u32) -> u32 {
@@ -502,12 +495,16 @@ impl Emitter {
     }
 
     fn store_fragment_output_vec(&mut self, location: u32, value: Word) {
-        let fc = self.frag_color_var_at(location);
         if self.fragment_output_map == 0 {
+            let fc = self.frag_color_var_at(location);
             self.b.store(fc, value, None, []).unwrap();
             return;
         }
         let mask = self.fragment_output_mask(location);
+        if mask == 0 {
+            return;
+        }
+        let fc = self.frag_color_var_at(location);
         for component in 0..4 {
             if (mask & (1 << component)) == 0 {
                 continue;
@@ -1879,8 +1876,23 @@ impl Emitter {
                 };
                 Some(self.store_bits(r))
             }
-            IrOp::F2I { src, signed } => {
+            IrOp::F2I { src, signed, round } => {
                 let f = self.lower_value(src);
+                let f = match *round {
+                    0 => self
+                        .b
+                        .ext_inst(self.f32_t, None, self.glsl, 2, [Operand::IdRef(f)])
+                        .unwrap(),
+                    1 => self
+                        .b
+                        .ext_inst(self.f32_t, None, self.glsl, 8, [Operand::IdRef(f)])
+                        .unwrap(),
+                    2 => self
+                        .b
+                        .ext_inst(self.f32_t, None, self.glsl, 9, [Operand::IdRef(f)])
+                        .unwrap(),
+                    _ => f,
+                };
                 let r = if *signed {
                     let i = self.b.convert_f_to_s(self.i32_t, None, f).unwrap();
                     self.b.bitcast(self.u32_t, None, i).unwrap()

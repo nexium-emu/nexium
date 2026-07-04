@@ -447,6 +447,7 @@ pub enum Op {
     F2I {
         src: Value,
         signed: bool,
+        round: u8,
     },
 
     Bfe {
@@ -734,7 +735,9 @@ impl Inst {
             Op::ILop { a, b, op, .. } => write!(f, "ILop.{op:?} {a}, {b}"),
             Op::IShl { a, b } => write!(f, "IShl  {a}, {b}"),
             Op::IShr { a, b, signed } => write!(f, "IShr  {a}, {b} signed={signed}"),
-            Op::F2I { src, signed } => write!(f, "F2I   {src} signed={signed}"),
+            Op::F2I { src, signed, round } => {
+                write!(f, "F2I   {src} signed={signed} round={round}")
+            }
             Op::Bfe { a, b, signed } => write!(f, "Bfe   {a}, {b} signed={signed}"),
             Op::ISet { cmp, a, b, .. } => write!(f, "ISet.{cmp:?} {a}, {b}"),
             Op::Kill => write!(f, "Kill"),

@@ -5,7 +5,8 @@ use super::ir::{BoolOp, FComp, ICmp, LogicOp, MufuFunc, Op, Predicate, Program, 
 use super::opcodes::Opcode;
 use super::operand::{
     ald_num_elements, attr_slot_ald, attr_slot_ipa, bfe_signed, cbuf, csetp_bop, csetp_bop_pred,
-    csetp_flow_test, csetp_neg_bop_pred, decoded_pred, f2f_mods, f2i_signed, fadd32i_mods,
+    csetp_flow_test, csetp_neg_bop_pred, decoded_pred, f2f_mods, f2i_rounding, f2i_signed,
+    fadd32i_mods,
     fadd_mods, ffma32i_mods, ffma_mods, float_imm20, fmnmx_mods, fmnmx_neg_pred, fmnmx_pred,
     fmul32i_mods, fmul_mods, fset_abs_a, fset_abs_b, fset_bop, fset_cmp, fset_neg_a, fset_neg_b,
     fset_src_pred, fset_src_pred_inv, fsetp_abs_a, fsetp_abs_b, fsetp_bop, fsetp_cmp,
@@ -606,6 +607,7 @@ impl Translator {
             Op::F2I {
                 src,
                 signed: f2i_signed(raw),
+                round: f2i_rounding(raw),
             },
             pred,
         );
