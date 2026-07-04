@@ -200,6 +200,8 @@ impl ComputeExec<'_> {
                 }
                 FMUL_cbuf => self.fmul(&mut regs, raw, self.cbuf_u32(raw)),
                 FMUL_imm => self.fmul(&mut regs, raw, float_imm20(raw).to_bits()),
+                FMUL32I => self.fmul(&mut regs, raw, imm32(raw)),
+                FADD32I => self.fadd(&mut regs, raw, imm32(raw)),
                 FFMA_reg => {
                     let b = get_reg(&regs, reg_b(raw));
                     let c = get_reg(&regs, reg_c(raw));
@@ -245,6 +247,70 @@ impl ComputeExec<'_> {
                 }
                 ISCADD_cbuf => self.iscadd(&mut regs, raw, self.cbuf_u32(raw)),
                 ISCADD_imm => self.iscadd(&mut regs, raw, imm20(raw) as u32),
+                XMAD_reg => {
+                    let a = get_reg(&regs, reg_a(raw));
+                    let b = get_reg(&regs, reg_b(raw));
+                    let c = get_reg(&regs, reg_c(raw));
+                    let v = xmad_eval(
+                        raw,
+                        a,
+                        b,
+                        c,
+                        bits(raw, 50, 52) as u8,
+                        bit(raw, 35) as u8,
+                        bit(raw, 36),
+                        bit(raw, 37),
+                    );
+                    set_reg(&mut regs, reg_dest(raw), v);
+                }
+                XMAD_rc => {
+                    let a = get_reg(&regs, reg_a(raw));
+                    let b = get_reg(&regs, reg_c(raw));
+                    let c = self.cbuf_u32(raw);
+                    let v = xmad_eval(
+                        raw,
+                        a,
+                        b,
+                        c,
+                        bits(raw, 50, 51) as u8,
+                        bit(raw, 52) as u8,
+                        false,
+                        false,
+                    );
+                    set_reg(&mut regs, reg_dest(raw), v);
+                }
+                XMAD_cr => {
+                    let a = get_reg(&regs, reg_a(raw));
+                    let b = self.cbuf_u32(raw);
+                    let c = get_reg(&regs, reg_c(raw));
+                    let v = xmad_eval(
+                        raw,
+                        a,
+                        b,
+                        c,
+                        bits(raw, 50, 51) as u8,
+                        bit(raw, 52) as u8,
+                        bit(raw, 55),
+                        bit(raw, 56),
+                    );
+                    set_reg(&mut regs, reg_dest(raw), v);
+                }
+                XMAD_imm => {
+                    let a = get_reg(&regs, reg_a(raw));
+                    let b = bits(raw, 20, 35) as u32;
+                    let c = get_reg(&regs, reg_c(raw));
+                    let v = xmad_eval(
+                        raw,
+                        a,
+                        b,
+                        c,
+                        bits(raw, 50, 52) as u8,
+                        0,
+                        bit(raw, 36),
+                        bit(raw, 37),
+                    );
+                    set_reg(&mut regs, reg_dest(raw), v);
+                }
                 SHL_reg => {
                     let b = get_reg(&regs, reg_b(raw));
                     self.ishl(&mut regs, raw, b);
@@ -939,6 +1005,44 @@ fn bits(insn: u64, lo: u32, hi: u32) -> u64 {
 
 fn bit(insn: u64, n: u32) -> bool {
     ((insn >> n) & 1) != 0
+}
+
+fn xmad_half(v: u32, half: u8, signed: bool) -> u32 {
+    let x = (v >> (16 * half as u32)) & 0xffff;
+    if signed {
+        (((x as i32) << 16) >> 16) as u32
+    } else {
+        x
+    }
+}
+
+fn xmad_eval(
+    raw: u64,
+    a_full: u32,
+    src_b: u32,
+    src_c: u32,
+    select: u8,
+    half_b: u8,
+    psl: bool,
+    mrg: bool,
+) -> u32 {
+    let a = xmad_half(a_full, bit(raw, 53) as u8, bit(raw, 48));
+    let b = xmad_half(src_b, half_b, bit(raw, 49));
+    let mut product = a.wrapping_mul(b);
+    if psl {
+        product <<= 16;
+    }
+    let c = match select {
+        1 => src_c & 0xffff,
+        2 => src_c >> 16,
+        4 => (src_b << 16).wrapping_add(src_c),
+        _ => src_c,
+    };
+    let mut result = product.wrapping_add(c);
+    if mrg {
+        result = (result & 0xffff) | (src_b << 16);
+    }
+    result
 }
 
 fn reg_dest(insn: u64) -> u8 {
