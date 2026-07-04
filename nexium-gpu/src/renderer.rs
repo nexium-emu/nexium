@@ -2916,7 +2916,7 @@ impl Renderer {
         let mut had_pass = false;
         for (_i, (call, prep)) in preps.iter().enumerate() {
             let call = *call;
-            let rt_aliases: Vec<_> = (0..prep.tex_pendings.len())
+            let mut rt_aliases: Vec<_> = (0..prep.tex_pendings.len())
                 .map(|slot| rt_alias_for_slot(rt_cache, call, slot, rt_key, true))
                 .collect();
             let feedback_loop = color_keys
@@ -2948,6 +2948,29 @@ impl Renderer {
                 );
                 pass_open = false;
                 pass_trace_calls.clear();
+            }
+            let mut alias_snapshotted = vec![false; rt_aliases.len()];
+            if feedback_loop {
+                for (slot, alias_opt) in rt_aliases.iter_mut().enumerate() {
+                    let Some(alias) = alias_opt else {
+                        continue;
+                    };
+                    if alias.depth || !color_keys.contains(&alias.key) {
+                        continue;
+                    }
+                    match snapshot_feedback_alias(device, cmd, rt_cache, alias.key) {
+                        Ok((snap_image, snap_view, snap_format)) => {
+                            alias.image = snap_image;
+                            alias.view = snap_view;
+                            alias.format = snap_format;
+                            alias.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                            alias_snapshotted[slot] = true;
+                        }
+                        Err(e) => {
+                            log::debug!("feedback snapshot failed: {}", e);
+                        }
+                    }
+                }
             }
 
             for alias in &rt_aliases {
@@ -3108,12 +3131,16 @@ impl Renderer {
                         );
                         if bind_trace_fs(call.fs_gpu_va) {
                             log::warn!(
-                                "[bind-trace] EXDS fs={:#x} slot={} ALIAS key={} alias_fmt={:?} view_fmt={:?} swz={:?} alias_view={:?} bound={:?}",
+                                "[bind-trace] EXDS fs={:#x} slot={} ALIAS key={} alias_fmt={:?} view_fmt={:?} swz={:?} alias_view={:?} bound={:?} snap={}",
                                 call.fs_gpu_va, slot, alias.key.label(), alias.format,
-                                view_format, swizzle, alias.view, bound_tex_views[slot]
+                                view_format, swizzle, alias.view, bound_tex_views[slot],
+                                alias_snapshotted.get(slot).copied().unwrap_or(false)
                             );
                         }
-                        if !alias.depth && color_keys.contains(&alias.key) {
+                        if !alias.depth
+                            && color_keys.contains(&alias.key)
+                            && !alias_snapshotted.get(slot).copied().unwrap_or(false)
+                        {
                             bound_tex_layouts[slot] = required_rt_layout;
                         }
                         continue;
@@ -5382,6 +5409,80 @@ fn drawn_color_alias_for_key(
         None
     }?;
     rt_cache.find_color_with_format(found.0)
+}
+
+fn snapshot_feedback_alias(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    rt_cache: &mut RtCache,
+    key: RtKey,
+) -> Result<(vk::Image, vk::ImageView, vk::Format), String> {
+    let (_, live_image, _, live_layout, _, _) = rt_cache
+        .color_exact_with_format(key)
+        .ok_or_else(|| format!("feedback snapshot: no live entry {}", key.label()))?;
+    let live_prev = rt_cache.color_layout(key).unwrap_or(live_layout);
+    let (snap_image, snap_view, snap_format) =
+        rt_cache.get_or_create_feedback_snapshot(device, key)?;
+    transition_image(
+        device,
+        cmd,
+        live_image,
+        live_prev,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+    );
+    transition_image(
+        device,
+        cmd,
+        snap_image,
+        vk::ImageLayout::UNDEFINED,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    );
+    let region = vk::ImageCopy {
+        src_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        src_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        dst_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        dst_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        extent: vk::Extent3D {
+            width: key.width,
+            height: key.height,
+            depth: 1,
+        },
+    };
+    unsafe {
+        device.cmd_copy_image(
+            cmd,
+            live_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            snap_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+    }
+    transition_image(
+        device,
+        cmd,
+        live_image,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        live_prev,
+    );
+    transition_image(
+        device,
+        cmd,
+        snap_image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    );
+    Ok((snap_image, snap_view, snap_format))
 }
 
 fn sampled_color_alias_needs_sync(rt_cache: &RtCache, key: RtKey) -> bool {

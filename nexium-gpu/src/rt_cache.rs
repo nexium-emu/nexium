@@ -81,6 +81,7 @@ fn dims_close(a: u32, b: u32) -> bool {
 pub struct RtCache {
     cache: HashMap<RtKey, GpuImage>,
     depth_cache: HashMap<RtKey, GpuImage>,
+    snapshots: HashMap<RtKey, GpuImage>,
     mem_properties: Option<vk::PhysicalDeviceMemoryProperties>,
     drawn_stamp: HashMap<RtKey, u64>,
     drawn_counter: u64,
@@ -92,11 +93,42 @@ impl RtCache {
         Self {
             cache: HashMap::new(),
             depth_cache: HashMap::new(),
+            snapshots: HashMap::new(),
             mem_properties: None,
             drawn_stamp: HashMap::new(),
             drawn_counter: 0,
             frame_draws: HashMap::new(),
         }
+    }
+
+    pub fn get_or_create_feedback_snapshot(
+        &mut self,
+        device: &ash::Device,
+        key: RtKey,
+    ) -> Result<(vk::Image, vk::ImageView, vk::Format), String> {
+        let (native_format, extent) = {
+            let live = self
+                .cache
+                .get(&key)
+                .ok_or_else(|| format!("feedback snapshot: no live image for {}", key.label()))?;
+            (live.base_format, live.extent)
+        };
+        let recreate = match self.snapshots.get(&key) {
+            Some(s) => {
+                s.base_format != native_format
+                    || s.extent.width != extent.width
+                    || s.extent.height != extent.height
+            }
+            None => true,
+        };
+        if recreate {
+            let img = self.create_image(device, key, native_format)?;
+            if let Some(old) = self.snapshots.insert(key, img) {
+                destroy_gpu_image(device, old);
+            }
+        }
+        let snap = self.snapshots.get(&key).unwrap();
+        Ok((snap.image, snap.view, snap.base_format))
     }
 
     pub fn mark_drawn(&mut self, key: RtKey) -> u64 {
@@ -683,7 +715,12 @@ impl RtCache {
     }
 
     pub fn clear(&mut self, device: &ash::Device) {
-        for (_, img) in self.cache.drain().chain(self.depth_cache.drain()) {
+        for (_, img) in self
+            .cache
+            .drain()
+            .chain(self.depth_cache.drain())
+            .chain(self.snapshots.drain())
+        {
             destroy_gpu_image(device, img);
         }
     }
