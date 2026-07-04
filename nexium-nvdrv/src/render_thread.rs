@@ -31,6 +31,24 @@ impl RenderThread {
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
         }
     }
+
+    pub fn submit_timeout(&self, job: RenderJob, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut job = job;
+        loop {
+            match self.tx.try_send(job) {
+                Ok(()) => return true,
+                Err(TrySendError::Full(j)) => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    job = j;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+    }
 }
 
 fn async_render_enabled() -> bool {

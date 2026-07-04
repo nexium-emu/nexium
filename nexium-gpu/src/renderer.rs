@@ -105,6 +105,23 @@ struct RtAlias {
     depth: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ColorAliasSync {
+    src_key: RtKey,
+    src_image: vk::Image,
+    src_layout: vk::ImageLayout,
+    src_format: vk::Format,
+    src_stamp: u64,
+    dst_key: RtKey,
+    dst_image: vk::Image,
+    dst_layout: vk::ImageLayout,
+    dst_format: vk::Format,
+    dst_stamp: u64,
+    src_width: u32,
+    height: u32,
+    bytes: u64,
+}
+
 struct StagingBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -1008,7 +1025,7 @@ impl Renderer {
             while let Some(prev) = pending.pop_front() {
                 if let Some(slot) = readback_slots.get_mut(prev.slot) {
                     unsafe {
-                        let _ = device.wait_for_fences(&[slot.fence], true, u64::MAX);
+                        let _ = device.wait_for_fences(&[slot.fence], true, 2_000_000_000);
                     }
                     slot.in_flight = false;
                 }
@@ -1106,8 +1123,15 @@ impl Renderer {
             return None;
         }
         let mut raw = vec![0u8; total as usize];
+        if unsafe { device.wait_for_fences(&[fence], true, 2_000_000_000) }.is_err() {
+            log::warn!("readback_target_at fence wait failed/timed out");
+            unsafe {
+                let _ = device.wait_for_fences(&[fence], true, 8_000_000_000);
+            }
+            cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
+            return None;
+        }
         unsafe {
-            let _ = device.wait_for_fences(&[fence], true, u64::MAX);
             if let Ok(ptr) =
                 device.map_memory(stage.memory, 0, stage.size, vk::MemoryMapFlags::empty())
             {
@@ -1917,11 +1941,13 @@ impl Renderer {
                     let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
                         .map(|v| v == "1")
                         .unwrap_or(false);
-                    let rgba8 = decode_texture_rgba8_layers(&raw, &tic, pitch_size, force_pitch);
+                    let image_format = texture_image_format(tic.format, false);
+                    let texels =
+                        texture_upload_data(&raw, &tic, pitch_size, force_pitch, image_format);
                     log::debug!(
-                        "TIC gpu_va={:#x} {}x{}x{} fmt={:?} bl={} bh={} src_bytes={} rgba8_bytes={} (cache miss -> upload)",
+                        "TIC gpu_va={:#x} {}x{}x{} fmt={:?} bl={} bh={} bd={} src_bytes={} upload_bytes={} vkfmt={:?} (cache miss -> upload)",
                         tic.gpu_va, tic.width, tic.height, key.layers, tic.format,
-                        tic.is_block_linear, tic.block_height_log2, read_size, rgba8.len()
+                        tic.is_block_linear, tic.block_height_log2, tic.block_depth_log2, read_size, texels.len(), image_format
                     );
                     match upload_texture_oneshot(
                         device,
@@ -1935,9 +1961,9 @@ impl Renderer {
                         key.view_layers,
                         key.arrayed,
                         key.volume,
-                        &rgba8,
+                        &texels,
                         tic.swizzle,
-                        vk::Format::R8G8B8A8_UNORM,
+                        image_format,
                         tex_hash,
                         cur_gen,
                     ) {
@@ -2826,6 +2852,23 @@ impl Renderer {
             } else {
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
             };
+            if feedback_loop && pass_open {
+                unsafe {
+                    device.cmd_end_rendering(cmd);
+                }
+                finish_color_pass(
+                    device,
+                    cmd,
+                    rt_cache,
+                    &color_bind,
+                    &mut color_layouts,
+                    pass_rt_layout,
+                    &mut pass_dirty,
+                    &pass_trace_calls,
+                );
+                pass_open = false;
+                pass_trace_calls.clear();
+            }
 
             for alias in &rt_aliases {
                 if let Some(alias) = *alias {
@@ -2938,6 +2981,35 @@ impl Renderer {
             for (slot, pending) in prep.tex_pendings.iter().enumerate() {
                 let pending_volume = pending.map_or(false, |(k, _, _, _)| k.volume);
                 if !pending_volume {
+                    if let Some(sk) = sampled_rt_key_for_slot(call, slot) {
+                        if pass_open && sampled_color_alias_needs_sync(rt_cache, sk) {
+                            unsafe {
+                                device.cmd_end_rendering(cmd);
+                            }
+                            finish_color_pass(
+                                device,
+                                cmd,
+                                rt_cache,
+                                &color_bind,
+                                &mut color_layouts,
+                                pass_rt_layout,
+                                &mut pass_dirty,
+                                &pass_trace_calls,
+                            );
+                            pass_open = false;
+                            pass_trace_calls.clear();
+                        }
+                        sync_sampled_color_alias(
+                            device,
+                            cmd,
+                            rt_cache,
+                            mem_props,
+                            &mut frame_slots[cur_idx],
+                            sk,
+                        )?;
+                    }
+                }
+                if !pending_volume {
                     if let Some(alias) = rt_aliases.get(slot).copied().flatten() {
                         let swizzle = pending
                             .map(|(_, tic, _, _)| tic.swizzle)
@@ -3007,21 +3079,51 @@ impl Renderer {
                         let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
                             .map(|v| v == "1")
                             .unwrap_or(false);
-                        let rgba8 = if identity_volume {
+                        let image_format = if identity_volume {
+                            vk::Format::R8G8B8A8_UNORM
+                        } else if let Some(slice) =
+                            volume_slices.as_ref().and_then(|slices| slices.first())
+                        {
+                            slice.format
+                        } else {
+                            texture_image_format(tic.format, false)
+                        };
+                        let texels = if volume_slices.is_some() {
+                            Vec::new()
+                        } else if identity_volume {
                             identity_volume_rgba8(key.width, key.height, key.layers)
                         } else {
-                            decode_texture_rgba8_layers(raw, &tic, pitch_size, force_pitch)
+                            texture_upload_data(raw, &tic, pitch_size, force_pitch, image_format)
                         };
-                        if std::env::var_os("NEXIUM_TEXDUMP")
+                        let dump_stats = std::env::var_os("NEXIUM_TEXDUMP")
                             .map(|v| v == "1")
-                            .unwrap_or(false)
-                        {
+                            .unwrap_or(false);
+                        let dump_img = std::env::var_os("NEXIUM_TEXDUMP_IMG")
+                            .map(|v| v == "1")
+                            .unwrap_or(false);
+                        let dump_rgba8 = if dump_stats || dump_img {
+                            Some(
+                                if image_format == vk::Format::R8G8B8A8_UNORM
+                                    && volume_slices.is_none()
+                                {
+                                    texels.clone()
+                                } else if identity_volume {
+                                    identity_volume_rgba8(key.width, key.height, key.layers)
+                                } else {
+                                    decode_texture_rgba8_layers(raw, &tic, pitch_size, force_pitch)
+                                },
+                            )
+                        } else {
+                            None
+                        };
+                        if dump_stats {
                             use std::sync::{Mutex, OnceLock};
                             static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> =
                                 OnceLock::new();
                             let s =
                                 SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
                             if s.lock().unwrap().insert(tic.gpu_va) {
+                                let rgba8 = dump_rgba8.as_deref().unwrap_or(&[]);
                                 let (mut sr, mut sg, mut sb, mut sa) = (0u64, 0u64, 0u64, 0u64);
                                 let (mut amin, mut amax) = (255u8, 0u8);
                                 for c in rgba8.chunks_exact(4) {
@@ -3043,16 +3145,13 @@ impl Renderer {
                                 );
                             }
                         }
-                        if std::env::var_os("NEXIUM_TEXDUMP_IMG")
-                            .map(|v| v == "1")
-                            .unwrap_or(false)
-                        {
+                        if dump_img {
                             dump_texture_bmp_once(
                                 tic.gpu_va,
                                 tic.width,
                                 tic.height,
                                 key.layers,
-                                &rgba8,
+                                dump_rgba8.as_deref().unwrap_or(&[]),
                                 tic.swizzle,
                             );
                         }
@@ -3073,15 +3172,6 @@ impl Renderer {
                             pass_open = false;
                             pass_trace_calls.clear();
                         }
-                        let image_format = if identity_volume {
-                            vk::Format::R8G8B8A8_UNORM
-                        } else if let Some(slice) =
-                            volume_slices.as_ref().and_then(|slices| slices.first())
-                        {
-                            slice.format
-                        } else {
-                            texture_image_format(tic.format, false)
-                        };
                         match create_texture_image(
                             device,
                             cmd,
@@ -3093,7 +3183,7 @@ impl Renderer {
                             key.view_layers,
                             key.arrayed,
                             key.volume,
-                            &rgba8,
+                            &texels,
                             volume_slices.as_deref(),
                             tic.swizzle,
                             image_format,
@@ -3874,6 +3964,20 @@ fn rt_stats_keys(rt_cache: &RtCache, requested_key: RtKey, resolved_key: RtKey) 
             }
         }
     }
+    if let Ok(list) = std::env::var("NEXIUM_RT_STATS_NVMAPS") {
+        let ids: Vec<u32> = list
+            .split(',')
+            .filter_map(|item| parse_u64_value(item.trim()).map(|v| v as u32))
+            .collect();
+        if !ids.is_empty() {
+            let mut all = rt_cache.debug_all();
+            all.retain(|(key, stamp)| *stamp != 0 && ids.contains(&key.nvmap_id));
+            all.sort_by_key(|(_, stamp)| std::cmp::Reverse(*stamp));
+            for (key, _) in all {
+                push_unique_rt_key(&mut keys, key);
+            }
+        }
+    }
     let max_recent = std::env::var("NEXIUM_RT_STATS_MAX")
         .ok()
         .and_then(|s| parse_u64_value(&s))
@@ -4252,7 +4356,10 @@ fn read_rt_image_stats(
         ..RtImageStats::default()
     };
     unsafe {
-        let _ = device.wait_for_fences(&[fence], true, u64::MAX);
+        if wait_fence(device, fence).is_err() {
+            cleanup(device, cmd_pool, Some(fence), Some(cmd), &stage);
+            return None;
+        }
         let ptr = match device.map_memory(stage.memory, 0, stage.size, vk::MemoryMapFlags::empty())
         {
             Ok(ptr) => ptr as *const u8,
@@ -4450,27 +4557,56 @@ fn tic_layer_read_size(tic: &crate::texture::TicEntry, pitch_size: usize) -> usi
     }
 }
 
-fn decode_texture_rgba8_layers(
+fn tic_read_size(tic: &crate::texture::TicEntry, pitch_size: usize, layers: u32) -> usize {
+    if tic.is_block_linear && tic_is_volume(tic) {
+        block_linear_volume_byte_size(tic, layers).max(
+            tic.format
+                .linear_size(tic.width, tic.height)
+                .saturating_mul(layers as usize),
+        )
+    } else {
+        tic_layer_read_size(tic, pitch_size).saturating_mul(layers as usize)
+    }
+}
+
+fn linear_texture_layers(
     raw: &[u8],
     tic: &crate::texture::TicEntry,
     pitch_size: usize,
     force_pitch: bool,
 ) -> Vec<u8> {
     let layers = tic_layer_count(tic) as usize;
-    let layer_read_size = tic_layer_read_size(tic, pitch_size);
+    let layer_linear_size = tic.format.linear_size(tic.width, tic.height);
     let effective_block_linear =
         tic.is_block_linear && !crate::pitch_oracle::is_pitch_dst(tic.gpu_va);
-    let mut out = Vec::new();
-    let layer_rgba_size = tic.width as usize * tic.height as usize * 4;
+    if effective_block_linear && !force_pitch && tic_is_volume(tic) {
+        let (storage_width, storage_height, bpp) = tic.format.storage_extent(tic.width, tic.height);
+        let read_size = block_linear_volume_byte_size(tic, layers as u32).min(raw.len());
+        let mut out = crate::texture::unswizzle_block_linear_3d(
+            &raw[..read_size],
+            storage_width,
+            storage_height,
+            layers as u32,
+            bpp,
+            tic.block_height_log2,
+            tic.block_depth_log2,
+            tic.tile_width_spacing,
+        );
+        out.resize(layer_linear_size.saturating_mul(layers), 0);
+        return out;
+    }
+
+    let layer_read_size = tic_layer_read_size(tic, pitch_size);
+    let mut out = Vec::with_capacity(layer_linear_size.saturating_mul(layers));
     for layer in 0..layers {
         let start = layer.saturating_mul(layer_read_size);
         if start >= raw.len() {
-            out.resize(out.len() + layer_rgba_size, 0);
+            out.resize(out.len() + layer_linear_size, 0);
             break;
         }
         let end = (start + layer_read_size).min(raw.len());
         let layer_raw = &raw[start..end];
-        let linear: Vec<u8> = if effective_block_linear && !force_pitch {
+        let mut linear: Vec<u8> = if effective_block_linear && !force_pitch {
             let (storage_width, storage_height, bpp) =
                 tic.format.storage_extent(tic.width, tic.height);
             crate::texture::unswizzle_block_linear(
@@ -4485,13 +4621,52 @@ fn decode_texture_rgba8_layers(
         } else {
             layer_raw.to_vec()
         };
+        linear.resize(layer_linear_size, 0);
+        out.extend(linear);
+    }
+    out.resize(layer_linear_size.saturating_mul(layers), 0);
+    out
+}
+
+fn decode_texture_rgba8_layers(
+    raw: &[u8],
+    tic: &crate::texture::TicEntry,
+    pitch_size: usize,
+    force_pitch: bool,
+) -> Vec<u8> {
+    let layers = tic_layer_count(tic) as usize;
+    let linear = linear_texture_layers(raw, tic, pitch_size, force_pitch);
+    let mut out = Vec::new();
+    let layer_rgba_size = tic.width as usize * tic.height as usize * 4;
+    let layer_linear_size = tic.format.linear_size(tic.width, tic.height);
+    for layer in 0..layers {
+        let start = layer.saturating_mul(layer_linear_size);
+        if start >= linear.len() {
+            out.resize(out.len() + layer_rgba_size, 0);
+            break;
+        }
+        let end = (start + layer_linear_size).min(linear.len());
         let mut decoded =
-            crate::texture::decode_to_rgba8(&linear, tic.width, tic.height, tic.format);
+            crate::texture::decode_to_rgba8(&linear[start..end], tic.width, tic.height, tic.format);
         decoded.resize(layer_rgba_size, 0);
         out.extend(decoded);
     }
     out.resize(layer_rgba_size.saturating_mul(layers), 0);
     out
+}
+
+fn texture_upload_data(
+    raw: &[u8],
+    tic: &crate::texture::TicEntry,
+    pitch_size: usize,
+    force_pitch: bool,
+    format: vk::Format,
+) -> Vec<u8> {
+    if format == vk::Format::B10G11R11_UFLOAT_PACK32 {
+        linear_texture_layers(raw, tic, pitch_size, force_pitch)
+    } else {
+        decode_texture_rgba8_layers(raw, tic, pitch_size, force_pitch)
+    }
 }
 
 fn find_volume_rt_slices(
@@ -4660,6 +4835,24 @@ fn block_linear_volume_slice_offsets(tic: &crate::texture::TicEntry, layers: u32
         .collect()
 }
 
+fn block_linear_volume_byte_size(tic: &crate::texture::TicEntry, layers: u32) -> usize {
+    let (storage_width, storage_height, bpp) = tic.format.storage_extent(tic.width, tic.height);
+    let bpp_log2 = bytes_per_block_log2(bpp);
+    let width_blocks = align_up_pow2(storage_width as u64, tic.tile_width_spacing);
+    let stride_bytes = width_blocks << bpp_log2;
+    let gobs_width = ceil_div_pow2(stride_bytes, 6);
+    let block_height = tic.block_height_log2;
+    let block_depth = tic.block_depth_log2;
+    let block_size = gobs_width
+        << (9u32
+            .saturating_add(block_height)
+            .saturating_add(block_depth));
+    let slice_size = ceil_div_pow2(storage_height as u64, 3u32.saturating_add(block_height))
+        .saturating_mul(block_size);
+    let depth_blocks = ceil_div_pow2(layers.max(1) as u64, block_depth);
+    depth_blocks.saturating_mul(slice_size) as usize
+}
+
 fn bytes_per_block_log2(bpp: usize) -> u32 {
     bpp.next_power_of_two().trailing_zeros()
 }
@@ -4752,8 +4945,7 @@ where
                     } else {
                         1
                     };
-                    let read_size =
-                        tic_layer_read_size(&tic, pitch_size).saturating_mul(layers as usize);
+                    let read_size = tic_read_size(&tic, pitch_size, layers);
                     let key = TexCacheKey {
                         gpu_va: tic.gpu_va,
                         width: tic.width,
@@ -4827,21 +5019,23 @@ fn rt_alias_for_slot(
     allow_self: bool,
 ) -> Option<RtAlias> {
     let sk = sampled_rt_key_for_slot(call, slot)?;
-    let found = rt_cache.find_color_with_format(sk).or_else(|| {
-        if call.sampled_rt_fuzzy && sk.gpu_va == 0 {
-            rt_cache
-                .find_color_screen(sk)
-                .map(|(key, image, view, layout)| {
-                    let format = rt_cache
-                        .find_color_with_format(key)
-                        .map(|(_, _, _, _, format)| format)
-                        .unwrap_or(vk::Format::R8G8B8A8_UNORM);
-                    (key, image, view, layout, format)
-                })
-        } else {
-            None
-        }
-    });
+    let found = drawn_color_alias_for_key(rt_cache, sk)
+        .or_else(|| rt_cache.find_color_with_format(sk))
+        .or_else(|| {
+            if call.sampled_rt_fuzzy && sk.gpu_va == 0 {
+                rt_cache
+                    .find_color_screen(sk)
+                    .map(|(key, image, view, layout)| {
+                        let format = rt_cache
+                            .find_color_with_format(key)
+                            .map(|(_, _, _, _, format)| format)
+                            .unwrap_or(vk::Format::R8G8B8A8_UNORM);
+                        (key, image, view, layout, format)
+                    })
+            } else {
+                None
+            }
+        });
     let found_key = found.as_ref().map(|(k, _, _, _, _)| *k);
     let filtered = found
         .filter(|(k, _, _, _, _)| allow_self || *k != rt_key)
@@ -4881,6 +5075,210 @@ fn rt_alias_for_slot(
         call.sampled_rt_fuzzy,
     );
     filtered
+}
+
+fn drawn_color_alias_for_key(
+    rt_cache: &RtCache,
+    key: RtKey,
+) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
+    let found = if key.gpu_va != 0 {
+        rt_cache.find_drawn_color_at(key.width, key.height, key.gpu_va)
+    } else if key.cpu_addr != 0 {
+        rt_cache.find_drawn_color_at_cpu(key.width, key.height, key.nvmap_id, key.cpu_addr)
+    } else {
+        None
+    }?;
+    rt_cache.find_color_with_format(found.0)
+}
+
+fn sampled_color_alias_needs_sync(rt_cache: &RtCache, key: RtKey) -> bool {
+    color_alias_sync_pair(rt_cache, key).is_some()
+}
+
+fn color_alias_sync_pair(rt_cache: &RtCache, key: RtKey) -> Option<ColorAliasSync> {
+    let (dst_key, dst_image, _, dst_layout, dst_format, dst_stamp) =
+        rt_cache.color_exact_with_format(key)?;
+    let mut best = None;
+    for (src_key, src_image, src_layout, src_format, src_stamp) in
+        rt_cache.drawn_color_aliases(dst_key)
+    {
+        if src_stamp <= dst_stamp || src_layout == vk::ImageLayout::UNDEFINED {
+            continue;
+        }
+        let Some((src_width, height, bytes)) =
+            rt_alias_copy_geometry(src_key, src_format, dst_key, dst_format)
+        else {
+            continue;
+        };
+        let sync = ColorAliasSync {
+            src_key,
+            src_image,
+            src_layout,
+            src_format,
+            src_stamp,
+            dst_key,
+            dst_image,
+            dst_layout,
+            dst_format,
+            dst_stamp,
+            src_width,
+            height,
+            bytes,
+        };
+        if best
+            .as_ref()
+            .map_or(true, |old: &ColorAliasSync| src_stamp > old.src_stamp)
+        {
+            best = Some(sync);
+        }
+    }
+    best
+}
+
+fn rt_alias_copy_geometry(
+    src_key: RtKey,
+    src_format: vk::Format,
+    dst_key: RtKey,
+    dst_format: vk::Format,
+) -> Option<(u32, u32, u64)> {
+    let src_bpp = readback_format_bpp(src_format) as u64;
+    let dst_bpp = readback_format_bpp(dst_format) as u64;
+    if src_bpp == 0 || dst_bpp == 0 || dst_key.width == 0 || dst_key.height == 0 {
+        return None;
+    }
+    let dst_row = (dst_key.width as u64).checked_mul(dst_bpp)?;
+    if dst_row % src_bpp != 0 {
+        return None;
+    }
+    let src_width = dst_row / src_bpp;
+    if src_width == 0 || src_width > src_key.width as u64 || dst_key.height > src_key.height {
+        return None;
+    }
+    let bytes = dst_row.checked_mul(dst_key.height as u64)?;
+    Some((src_width as u32, dst_key.height, bytes))
+}
+
+fn sync_sampled_color_alias(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    rt_cache: &mut RtCache,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    frame_slot: &mut FrameSlot,
+    key: RtKey,
+) -> Result<bool, String> {
+    let Some(sync) = color_alias_sync_pair(rt_cache, key) else {
+        return Ok(false);
+    };
+    let transfer = create_transfer_buffer_owned(device, mem_props, sync.bytes)?;
+    let src_prev = rt_cache
+        .color_layout(sync.src_key)
+        .unwrap_or(sync.src_layout);
+    let dst_prev = rt_cache
+        .color_layout(sync.dst_key)
+        .unwrap_or(sync.dst_layout);
+    transition_image(
+        device,
+        cmd,
+        sync.src_image,
+        src_prev,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+    );
+    transition_image(
+        device,
+        cmd,
+        sync.dst_image,
+        dst_prev,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    );
+    let src_copy = vk::BufferImageCopy {
+        buffer_offset: 0,
+        buffer_row_length: 0,
+        buffer_image_height: 0,
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        image_extent: vk::Extent3D {
+            width: sync.src_width,
+            height: sync.height,
+            depth: 1,
+        },
+    };
+    let dst_copy = vk::BufferImageCopy {
+        buffer_offset: 0,
+        buffer_row_length: 0,
+        buffer_image_height: 0,
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        image_extent: vk::Extent3D {
+            width: sync.dst_key.width,
+            height: sync.dst_key.height,
+            depth: 1,
+        },
+    };
+    unsafe {
+        device.cmd_copy_image_to_buffer(
+            cmd,
+            sync.src_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            transfer.buffer,
+            &[src_copy],
+        );
+        device.cmd_copy_buffer_to_image(
+            cmd,
+            transfer.buffer,
+            sync.dst_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[dst_copy],
+        );
+    }
+    transition_image(
+        device,
+        cmd,
+        sync.dst_image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    );
+    if src_prev != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+        transition_image(
+            device,
+            cmd,
+            sync.src_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            src_prev,
+        );
+    }
+    rt_cache.set_color_layout(sync.src_key, src_prev);
+    rt_cache.set_color_layout(sync.dst_key, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    let stamp = rt_cache.mark_drawn(sync.dst_key);
+    if std::env::var_os("NEXIUM_RT_ALIAS_SYNC_DBG").is_some() {
+        log::warn!(
+            "[rt-alias-sync] src={}#{}/{} {:?} dst={}#{}/{} {:?} src_width={} h={} bytes={}",
+            sync.src_key.label(),
+            sync.src_stamp,
+            rt_cache.color_layout(sync.src_key).is_some() as u8,
+            sync.src_format,
+            sync.dst_key.label(),
+            sync.dst_stamp,
+            stamp,
+            sync.dst_format,
+            sync.src_width,
+            sync.height,
+            sync.bytes
+        );
+    }
+    frame_slot
+        .retired_buffers
+        .push((transfer.buffer, transfer.memory));
+    Ok(true)
 }
 
 fn trace_rt_alias(
@@ -6184,9 +6582,16 @@ fn submit_with_fence(
 
 fn wait_fence(device: &ash::Device, fence: vk::Fence) -> Result<(), String> {
     unsafe {
-        device
-            .wait_for_fences(&[fence], true, u64::MAX)
-            .map_err(|e| format!("wait_for_fences: {:?}", e))?;
+        match device.wait_for_fences(&[fence], true, 2_000_000_000) {
+            Ok(()) => {}
+            Err(vk::Result::TIMEOUT) => {
+                log::warn!("wait_fence: 2s timeout, extended wait");
+                device
+                    .wait_for_fences(&[fence], true, 8_000_000_000)
+                    .map_err(|e| format!("wait_for_fences(hung 10s): {:?}", e))?;
+            }
+            Err(e) => return Err(format!("wait_for_fences: {:?}", e)),
+        }
         device
             .reset_fences(&[fence])
             .map_err(|e| format!("reset_fences: {:?}", e))?;
@@ -6526,6 +6931,65 @@ fn create_staging_owned(
     })
 }
 
+fn create_transfer_buffer_owned(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+) -> Result<StagingBuffer, String> {
+    let buf_info = vk::BufferCreateInfo {
+        s_type: vk::StructureType::BUFFER_CREATE_INFO,
+        size: size.max(16),
+        usage: vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        queue_family_index_count: 0,
+        p_queue_family_indices: std::ptr::null(),
+        p_next: std::ptr::null(),
+        flags: Default::default(),
+        _marker: std::marker::PhantomData,
+    };
+    let buffer = unsafe {
+        device
+            .create_buffer(&buf_info, None)
+            .map_err(|e| format!("create_buffer(alias transfer): {:?}", e))?
+    };
+    let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let mt = find_memory_type(
+        mem_props,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )
+    .or_else(|| {
+        find_memory_type(
+            mem_props,
+            req.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    })
+    .ok_or_else(|| "no memory type for alias transfer buffer".to_string())?;
+    let alloc_info = vk::MemoryAllocateInfo {
+        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+        allocation_size: req.size,
+        memory_type_index: mt,
+        p_next: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let memory = unsafe {
+        device
+            .allocate_memory(&alloc_info, None)
+            .map_err(|e| format!("allocate_memory(alias transfer): {:?}", e))?
+    };
+    unsafe {
+        device
+            .bind_buffer_memory(buffer, memory, 0)
+            .map_err(|e| format!("bind_buffer_memory(alias transfer): {:?}", e))?;
+    }
+    Ok(StagingBuffer {
+        buffer,
+        memory,
+        size: req.size,
+    })
+}
+
 impl Drop for RendererInner {
     fn drop(&mut self) {
         unsafe {
@@ -6614,7 +7078,7 @@ impl Drop for RendererInner {
             while let Some(pr) = pending.pop_front() {
                 if let Some(slot) = self.readback_slots.get_mut(pr.slot) {
                     unsafe {
-                        let _ = self.device.wait_for_fences(&[slot.fence], true, u64::MAX);
+                        let _ = self.device.wait_for_fences(&[slot.fence], true, 2_000_000_000);
                     }
                     slot.in_flight = false;
                 }
@@ -6622,7 +7086,7 @@ impl Drop for RendererInner {
         }
         for slot in self.readback_slots.drain(..) {
             unsafe {
-                let _ = self.device.wait_for_fences(&[slot.fence], true, u64::MAX);
+                let _ = self.device.wait_for_fences(&[slot.fence], true, 2_000_000_000);
                 self.device.destroy_fence(slot.fence, None);
                 self.device.free_command_buffers(self.cmd_pool, &[slot.cmd]);
                 if let Some(stage) = slot.stage {

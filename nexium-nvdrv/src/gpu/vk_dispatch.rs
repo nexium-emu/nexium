@@ -646,10 +646,11 @@ fn submit_draw_batch_async(
     }
     let snapshot_ms = if profile { elapsed_ms(t_snapshot) } else { 0.0 };
     let snapshot_entries = snapshot.len();
+    let n_calls = batch.len();
     let calls = batch.to_vec();
     let r = renderer.clone();
     let diag = std::env::var_os("NEXIUM_PRESENT_KEYS").is_some();
-    rt.submit(Box::new(move || {
+    let job = Box::new(move || {
         {
             let mut ring = submit_ring().lock().unwrap();
             let mut fss: Vec<String> = calls
@@ -694,7 +695,13 @@ fn submit_draw_batch_async(
                 }
             }
         }
-    }));
+    }) as crate::render_thread::RenderJob;
+    if !rt.submit_timeout(job, std::time::Duration::from_secs(3)) {
+        log::warn!(
+            "[render-saturated] dropped draw batch (calls={}) after 3s; render thread blocked",
+            n_calls
+        );
+    }
     if profile {
         log::warn!(
             "[nvprof] draw_batch calls={} snapshot_entries={} reads={} bytes={} snapshot_ms={:.3}",
@@ -907,10 +914,10 @@ fn execute_one(
         rt_gpu_va,
         mappings.cpu_address_for(rt_gpu_va).unwrap_or(0),
     );
-    let rt_format = map_rt_format_for_key(rt.format, rt_key);
+    let mut rt_format = map_rt_format_for_key(rt.format, rt_key);
     let color_rts = active_color_rts(draw, mappings, rt_key, rt_format);
     let color_rt_keys = color_rts.iter().map(|(key, _)| *key).collect::<Vec<_>>();
-    let color_rt_formats = color_rts
+    let mut color_rt_formats = color_rts
         .iter()
         .map(|(_, format)| *format)
         .collect::<Vec<_>>();
@@ -1008,6 +1015,16 @@ fn execute_one(
 
     let vs_addr = program_region.wrapping_add(vs_prog.address_lo as u64);
     let fs_addr = program_region.wrapping_add(fs_prog.address_lo as u64);
+    if rt16_raw_a2_producer_fs(fs_addr) {
+        if rt_key.nvmap_id == 16 && rt.format == 0xD1 {
+            rt_format = map_rt_format(rt.format);
+        }
+        for (key, format) in color_rt_keys.iter().zip(color_rt_formats.iter_mut()) {
+            if key.nvmap_id == 16 && *format == vk::Format::R8G8B8A8_UNORM {
+                *format = vk::Format::A2B10G10R10_UNORM_PACK32;
+            }
+        }
+    }
 
     let (vptx_scale_z, vptx_translate_z) =
         if draw.viewport.scale_z != 0.0 || draw.viewport.translate_z != 0.0 {
@@ -2355,6 +2372,10 @@ fn map_rt_format_for_key(format: u32, key: RtKey) -> vk::Format {
     }
 }
 
+fn rt16_raw_a2_producer_fs(fs_addr: u64) -> bool {
+    matches!(fs_addr, 0x405df5a30 | 0x405df1c30)
+}
+
 fn menu_draw_dbg_color_only() -> bool {
     use std::sync::OnceLock;
     static COLOR_ONLY: OnceLock<bool> = OnceLock::new();
@@ -3234,18 +3255,10 @@ fn fragment_output_mask(output_map: u32, location: u32) -> u32 {
     if output_map == 0 {
         return 0xF;
     }
-    let mut output = 0u32;
-    for group in 0..8u32 {
-        let mask = (output_map >> (group * 4)) & 0xF;
-        if mask == 0 {
-            continue;
-        }
-        if output == location {
-            return mask;
-        }
-        output += 1;
+    if location >= 8 {
+        return 0;
     }
-    0
+    (output_map >> (location * 4)) & 0xF
 }
 
 fn map_blend_factor(v: u32) -> vk::BlendFactor {
@@ -3335,21 +3348,21 @@ fn map_compare_op(v: u32) -> vk::CompareOp {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DrawTraceConfig {
     enabled: bool,
     start: u64,
     end: u64,
-    fs: Option<u64>,
-    rt: Option<u32>,
-    rt_va: Option<u64>,
+    fs: Vec<u64>,
+    rt: Vec<u32>,
+    rt_va: Vec<u64>,
     sampled_rt_only: bool,
 }
 
 fn draw_trace_config() -> DrawTraceConfig {
     use std::sync::OnceLock;
     static CONFIG: OnceLock<DrawTraceConfig> = OnceLock::new();
-    *CONFIG.get_or_init(|| DrawTraceConfig {
+    CONFIG.get_or_init(|| DrawTraceConfig {
         enabled: std::env::var_os("NEXIUM_DRAW_TRACE").is_some(),
         start: std::env::var("NEXIUM_DRAW_TRACE_START")
             .ok()
@@ -3359,18 +3372,26 @@ fn draw_trace_config() -> DrawTraceConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(u64::MAX),
-        fs: std::env::var("NEXIUM_DRAW_TRACE_FS")
-            .ok()
-            .and_then(|v| parse_env_u64(&v)),
-        rt: std::env::var("NEXIUM_DRAW_TRACE_RT")
-            .ok()
-            .and_then(|v| parse_env_u64(&v))
-            .map(|v| v as u32),
-        rt_va: std::env::var("NEXIUM_DRAW_TRACE_RT_VA")
-            .ok()
-            .and_then(|v| parse_env_u64(&v)),
+        fs: parse_env_u64_list("NEXIUM_DRAW_TRACE_FS"),
+        rt: parse_env_u64_list("NEXIUM_DRAW_TRACE_RT")
+            .into_iter()
+            .map(|v| v as u32)
+            .collect(),
+        rt_va: parse_env_u64_list("NEXIUM_DRAW_TRACE_RT_VA"),
         sampled_rt_only: std::env::var_os("NEXIUM_DRAW_TRACE_SAMPLED_RT").is_some(),
     })
+    .clone()
+}
+
+fn parse_env_u64_list(name: &str) -> Vec<u64> {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .filter_map(|part| parse_env_u64(part.trim()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn trace_draw(
@@ -3402,19 +3423,25 @@ fn trace_draw(
     if !cfg.enabled {
         return;
     }
-    if let Some(fs) = cfg.fs {
-        if draw.fs_shader_gpu_va != fs {
-            return;
-        }
+    if !cfg.fs.is_empty() && !cfg.fs.contains(&draw.fs_shader_gpu_va) {
+        return;
     }
-    if let Some(rt_filter) = cfg.rt {
-        if nvmap_id != rt_filter && !color_rt_keys.iter().any(|key| key.nvmap_id == rt_filter) {
+    if !cfg.rt.is_empty() {
+        if !cfg.rt.contains(&nvmap_id)
+            && !color_rt_keys
+                .iter()
+                .any(|key| cfg.rt.contains(&key.nvmap_id))
+        {
             return;
         }
     }
     let rt_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
-    if let Some(rt_va_filter) = cfg.rt_va {
-        if rt_va != rt_va_filter && !color_rt_keys.iter().any(|key| key.gpu_va == rt_va_filter) {
+    if !cfg.rt_va.is_empty() {
+        if !cfg.rt_va.contains(&rt_va)
+            && !color_rt_keys
+                .iter()
+                .any(|key| cfg.rt_va.contains(&key.gpu_va))
+        {
             return;
         }
     }
@@ -3456,7 +3483,7 @@ fn trace_draw(
         .join(",");
     log::warn!(
         "[drawtrace] op={} #{} rt={} va={:#x} keys=[{}] {}x{} topo={} first={} v={} i={} indexed={} pos={} \
-         vp_en={} vp={:?} clip=({},{} {}x{}) origin={:#x} ll={} fy={} sw={:#x}/{} \
+         vp_en={} vp={:?} scale=({:.3},{:.3},{:.3}) trans=({:.3},{:.3},{:.3}) clip=({},{} {}x{}) origin={:#x} ll={} fy={} sw={:#x}/{} \
          depth={}/{} clamp={} vclip={:#x}/{} func={:#x} zeta={} cull={} ff={:#x} \
          tex={:?} tics=[{}] sampled={:?} \
          blend={} per={} rgb=({:#x},{:#x},{:#x})->({:?},{:?},{:?}) \
@@ -3477,6 +3504,12 @@ fn trace_draw(
         pos.unwrap_or_else(|| "n/a".to_string()),
         draw.viewport_transform_en,
         vp,
+        draw.viewport.scale_x,
+        draw.viewport.scale_y,
+        draw.viewport.scale_z,
+        draw.viewport.translate_x,
+        draw.viewport.translate_y,
+        draw.viewport.translate_z,
         clip.x,
         clip.y,
         clip.width,
