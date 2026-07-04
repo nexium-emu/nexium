@@ -625,6 +625,25 @@ impl Renderer {
         gpu_va: u64,
         rgba: [f32; 4],
     ) -> Result<(), String> {
+        self.clear_target_with_format(
+            nvmap_id,
+            width,
+            height,
+            gpu_va,
+            rgba,
+            vk::Format::R8G8B8A8_UNORM,
+        )
+    }
+
+    pub fn clear_target_with_format(
+        &self,
+        nvmap_id: u32,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+        rgba: [f32; 4],
+        format: vk::Format,
+    ) -> Result<(), String> {
         let mut inner = self.inner.lock();
         let RendererInner {
             device,
@@ -634,7 +653,7 @@ impl Renderer {
             ..
         } = &mut *inner;
         let key = RtKey::new(nvmap_id, width, height, gpu_va);
-        let img = rt_cache.get_or_create(key, device)?;
+        let img = rt_cache.get_or_create_with_format(key, device, format)?;
 
         reset_command_buffer(device, utility_slot.cmd)?;
         let cmd = utility_slot.cmd;
@@ -656,26 +675,45 @@ impl Renderer {
             cmd,
             img.image,
             img.layout,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         );
-        let clear = vk::ClearColorValue { float32: rgba };
-        let range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
+        let clear_value = vk::ClearValue {
+            color: vk::ClearColorValue { float32: rgba },
+        };
+        let attachment = vk::RenderingAttachmentInfo {
+            s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
+            image_view: img.view,
+            image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            resolve_mode: vk::ResolveModeFlags::NONE,
+            resolve_image_view: vk::ImageView::null(),
+            resolve_image_layout: vk::ImageLayout::UNDEFINED,
+            load_op: vk::AttachmentLoadOp::CLEAR,
+            store_op: vk::AttachmentStoreOp::STORE,
+            clear_value,
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        let render_info = vk::RenderingInfo {
+            s_type: vk::StructureType::RENDERING_INFO,
+            render_area: vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width, height },
+            },
             layer_count: 1,
+            view_mask: 0,
+            color_attachment_count: 1,
+            p_color_attachments: &attachment,
+            p_depth_attachment: std::ptr::null(),
+            p_stencil_attachment: std::ptr::null(),
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
         };
         unsafe {
-            device.cmd_clear_color_image(
-                cmd,
-                img.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &clear,
-                &[range],
-            );
+            device.cmd_begin_rendering(cmd, &render_info);
+            device.cmd_end_rendering(cmd);
         }
-        img.layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+        img.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
         unsafe {
             device
                 .end_command_buffer(cmd)
@@ -696,6 +734,27 @@ impl Renderer {
         rgba: [f32; 4],
         rect: [i32; 4],
     ) -> Result<(), String> {
+        self.clear_target_rect_with_format(
+            nvmap_id,
+            width,
+            height,
+            gpu_va,
+            rgba,
+            rect,
+            vk::Format::R8G8B8A8_UNORM,
+        )
+    }
+
+    pub fn clear_target_rect_with_format(
+        &self,
+        nvmap_id: u32,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+        rgba: [f32; 4],
+        rect: [i32; 4],
+        format: vk::Format,
+    ) -> Result<(), String> {
         let x = rect[0].max(0) as u32;
         let y = rect[1].max(0) as u32;
         let w = rect[2].max(0) as u32;
@@ -706,7 +765,7 @@ impl Renderer {
         let w = w.min(width - x);
         let h = h.min(height - y);
         if x == 0 && y == 0 && w == width && h == height {
-            return self.clear_target(nvmap_id, width, height, gpu_va, rgba);
+            return self.clear_target_with_format(nvmap_id, width, height, gpu_va, rgba, format);
         }
         let mut inner = self.inner.lock();
         let RendererInner {
@@ -717,7 +776,7 @@ impl Renderer {
             ..
         } = &mut *inner;
         let key = RtKey::new(nvmap_id, width, height, gpu_va);
-        let img = rt_cache.get_or_create(key, device)?;
+        let img = rt_cache.get_or_create_with_format(key, device, format)?;
 
         reset_command_buffer(device, utility_slot.cmd)?;
         let cmd = utility_slot.cmd;
@@ -1922,10 +1981,23 @@ impl Renderer {
                         swizzle,
                         view_format,
                     );
+                    if bind_trace_fs(call.fs_gpu_va) {
+                        log::warn!(
+                            "[bind-trace] EXD fs={:#x} slot={} ALIAS key={} alias_fmt={:?} view_fmt={:?} swz={:?} bound={:?}",
+                            call.fs_gpu_va, slot, alias.key.label(), alias.format,
+                            view_format, swizzle, bound_tex_views[slot]
+                        );
+                    }
                     continue;
                 }
             }
             let Some((key, tic, pitch_size, read_size)) = *pending else {
+                if bind_trace_fs(call.fs_gpu_va) {
+                    log::warn!(
+                        "[bind-trace] EXD fs={:#x} slot={} DUMMY no_pending",
+                        call.fs_gpu_va, slot
+                    );
+                }
                 continue;
             };
             if let Some(raw) = read_guest(tic.gpu_va, read_size) {
@@ -1982,6 +2054,14 @@ impl Renderer {
             } else {
                 bound_tex_views[slot] =
                     tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
+            }
+            if bind_trace_fs(call.fs_gpu_va) {
+                log::warn!(
+                    "[bind-trace] EXD fs={:#x} slot={} TEX va={:#x} {}x{}x{} vol={} cache_hit={} bound={:?}",
+                    call.fs_gpu_va, slot, tic.gpu_va, tic.width, tic.height, key.layers,
+                    key.volume, tex_cache.get(&key).is_some(),
+                    if key.volume { bound_tex_views_3d[slot] } else { bound_tex_views[slot] }
+                );
             }
         }
         let mut bound_samplers = vec![default_samp; max_texture_descriptors()];
@@ -3026,6 +3106,13 @@ impl Renderer {
                             swizzle,
                             view_format,
                         );
+                        if bind_trace_fs(call.fs_gpu_va) {
+                            log::warn!(
+                                "[bind-trace] EXDS fs={:#x} slot={} ALIAS key={} alias_fmt={:?} view_fmt={:?} swz={:?} alias_view={:?} bound={:?}",
+                                call.fs_gpu_va, slot, alias.key.label(), alias.format,
+                                view_format, swizzle, alias.view, bound_tex_views[slot]
+                            );
+                        }
                         if !alias.depth && color_keys.contains(&alias.key) {
                             bound_tex_layouts[slot] = required_rt_layout;
                         }
@@ -3033,6 +3120,12 @@ impl Renderer {
                     }
                 }
                 let Some((key, tic, pitch_size, read_size)) = *pending else {
+                    if bind_trace_fs(call.fs_gpu_va) {
+                        log::warn!(
+                            "[bind-trace] EXDS fs={:#x} slot={} DUMMY no_pending",
+                            call.fs_gpu_va, slot
+                        );
+                    }
                     continue;
                 };
                 let raw_entry = match tex_raw_cache.entry((tic.gpu_va, read_size)) {
@@ -3208,6 +3301,29 @@ impl Renderer {
                 } else {
                     bound_tex_views[slot] =
                         tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
+                }
+                if bind_trace_fs(call.fs_gpu_va) {
+                    log::warn!(
+                        "[bind-trace] EXDS fs={:#x} slot={} TEX va={:#x} {}x{}x{} vol={} cache_hit={} bound={:?}",
+                        call.fs_gpu_va, slot, tic.gpu_va, tic.width, tic.height, key.layers,
+                        key.volume, tex_cache.get(&key).is_some(),
+                        if key.volume { bound_tex_views_3d[slot] } else { bound_tex_views[slot] }
+                    );
+                    if key.volume {
+                        if let Some(t) = tex_cache.get(&key) {
+                            verify_volume_image(
+                                device,
+                                *cmd_pool,
+                                *queue,
+                                mem_props,
+                                t.image,
+                                key.width,
+                                key.height,
+                                key.layers,
+                                tic.gpu_va,
+                            );
+                        }
+                    }
                 }
             }
 
@@ -4543,6 +4659,134 @@ fn readback_to_rgba8(src: &[u8], format: vk::Format, width: u32, height: u32) ->
 
 fn max_texture_descriptors() -> usize {
     crate::descriptor::MAX_TEXTURE_DESCRIPTORS as usize
+}
+
+fn bind_trace_fs(fs_gpu_va: u64) -> bool {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("NEXIUM_BIND_TRACE_FS")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|s| {
+                        u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    list.contains(&fs_gpu_va)
+}
+
+fn verify_volume_image(
+    device: &ash::Device,
+    cmd_pool: vk::CommandPool,
+    queue: vk::Queue,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    layers: u32,
+    va: u64,
+) {
+    use ash::vk::Handle;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
+    {
+        let mut seen = SEEN
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        let count = seen.entry(image.as_raw()).or_insert(0);
+        *count += 1;
+        if *count != 3 {
+            return;
+        }
+    }
+    let size = (width as usize) * (height as usize) * (layers as usize) * 4;
+    let zeros = vec![0u8; size];
+    let Ok(buf) = create_host_buffer(device, mem_props, &zeros, vk::BufferUsageFlags::TRANSFER_DST)
+    else {
+        return;
+    };
+    let result = (|| -> Result<Vec<u8>, String> {
+        let cmd = alloc_one_time_cmd(device, cmd_pool)?;
+        begin_one_time(device, cmd)?;
+        transition_image(
+            device,
+            cmd,
+            image,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        let copy = vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width,
+                height,
+                depth: layers,
+            },
+        };
+        unsafe {
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buf.buffer,
+                &[copy],
+            );
+        }
+        transition_image(
+            device,
+            cmd,
+            image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        );
+        end_one_time(device, cmd)?;
+        submit_and_wait(device, queue, cmd)?;
+        let mut out = vec![0u8; size];
+        unsafe {
+            let ptr = device
+                .map_memory(buf.memory, 0, size as u64, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("map_memory: {:?}", e))?;
+            std::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), size);
+            device.unmap_memory(buf.memory);
+            device.free_command_buffers(cmd_pool, &[cmd]);
+        }
+        Ok(out)
+    })();
+    unsafe {
+        device.destroy_buffer(buf.buffer, None);
+        device.free_memory(buf.memory, None);
+    }
+    match result {
+        Ok(data) => {
+            let slice_bytes = (width as usize) * (height as usize) * 4;
+            for z in 0..layers as usize {
+                let base = z * slice_bytes;
+                let w00 = u32::from_le_bytes(data[base..base + 4].try_into().unwrap_or_default());
+                let mid = base
+                    + ((height as usize / 2) * width as usize + width as usize / 2) * 4;
+                let wmid =
+                    u32::from_le_bytes(data[mid..mid + 4].try_into().unwrap_or_default());
+                log::warn!(
+                    "[volume-verify] va={:#x} z={} w00={:08x} wmid={:08x}",
+                    va, z, w00, wmid
+                );
+            }
+        }
+        Err(e) => log::warn!("[volume-verify] va={:#x} failed: {}", va, e),
+    }
 }
 
 fn force_refresh_texture(gpu_va: u64) -> bool {

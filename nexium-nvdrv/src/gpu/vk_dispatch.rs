@@ -971,9 +971,12 @@ fn execute_one(
             rt_thread.submit(Box::new(move || {
                 if want_color_clear {
                     if let Some(rect) = clear_scissor {
-                        let _ = r.clear_target_rect(nvmap_id, w, h, rt_gpu_va, color, rect);
+                        let _ = r.clear_target_rect_with_format(
+                            nvmap_id, w, h, rt_gpu_va, color, rect, rt_format,
+                        );
                     } else {
-                        let _ = r.clear_target(nvmap_id, w, h, rt_gpu_va, color);
+                        let _ =
+                            r.clear_target_with_format(nvmap_id, w, h, rt_gpu_va, color, rt_format);
                     }
                 }
                 if do_depth {
@@ -983,10 +986,13 @@ fn execute_one(
         } else {
             if want_color_clear {
                 if let Some(rect) = clear_scissor {
-                    renderer
-                        .clear_target_rect(nvmap_id, rt.width, rt.height, rt_gpu_va, color, rect)?;
+                    renderer.clear_target_rect_with_format(
+                        nvmap_id, rt.width, rt.height, rt_gpu_va, color, rect, rt_format,
+                    )?;
                 } else {
-                    renderer.clear_target(nvmap_id, rt.width, rt.height, rt_gpu_va, color)?;
+                    renderer.clear_target_with_format(
+                        nvmap_id, rt.width, rt.height, rt_gpu_va, color, rt_format,
+                    )?;
                 }
             }
             if do_depth {
