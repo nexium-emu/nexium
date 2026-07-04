@@ -6178,9 +6178,7 @@ fn rt_alias_view_format(
     tic: crate::texture::TicEntry,
     fallback: vk::Format,
 ) -> vk::Format {
-    if key.nvmap_id == 16 && fallback == vk::Format::R8G8B8A8_UNORM {
-        return fallback;
-    }
+    let _ = key;
     use crate::texture::{ComponentType, TicFormat};
     let ty = tic.component_types[0];
     match tic.format {
