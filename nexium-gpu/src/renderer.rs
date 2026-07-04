@@ -2095,11 +2095,11 @@ impl Renderer {
 
         let white_bind: Option<(u32, vk::Buffer, u64)> =
             if let Some(wb) = call.vertex_layout.bindings.iter().find(|b| b.stride == 0) {
-                let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 16, 16)
+                let data = const_attr_data(call, wb.binding, [0.0, 0.0, 0.0, 1.0], &read_guest);
+                let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 64, 16)
                     .map_err(|e| format!("ring_alloc(const_attr): {}", e))?;
                 unsafe {
-                    let const_default = [0.0f32, 0.0, 0.0, 1.0];
-                    std::ptr::copy_nonoverlapping(const_default.as_ptr() as *const u8, wptr, 16);
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), wptr, 64);
                 }
                 Some((wb.binding, wbuf, woff))
             } else {
@@ -3365,7 +3365,9 @@ impl Renderer {
 
             let white_bind: Option<(u32, vk::Buffer, u64)> =
                 if let Some(wb) = call.vertex_layout.bindings.iter().find(|b| b.stride == 0) {
-                    if ubo_ring.head + 16 > ubo_ring.size {
+                    let data =
+                        const_attr_data(call, wb.binding, [1.0, 1.0, 1.0, 1.0], &read_guest);
+                    if ubo_ring.head + 64 > ubo_ring.size {
                         ring_wrap_other(
                             device,
                             frame_slots,
@@ -3374,11 +3376,10 @@ impl Renderer {
                             ubo_ring,
                         )?;
                     }
-                    let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 16, 16)
+                    let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 64, 16)
                         .map_err(|e| format!("ring_alloc(white): {}", e))?;
                     unsafe {
-                        let white = [1.0f32, 1.0, 1.0, 1.0];
-                        std::ptr::copy_nonoverlapping(white.as_ptr() as *const u8, wptr, 16);
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), wptr, 64);
                     }
                     Some((wb.binding, wbuf, woff))
                 } else {
@@ -5723,6 +5724,39 @@ fn trace_rt_alias(
         used,
         fuzzy
     );
+}
+
+fn const_attr_data<F>(
+    call: &crate::draw::Maxwell3dDrawCall,
+    binding: u32,
+    fallback: [f32; 4],
+    read_guest: &F,
+) -> [u8; 64]
+where
+    F: Fn(u64, usize) -> Option<Vec<u8>>,
+{
+    let mut out = [0u8; 64];
+    for chunk in out.chunks_exact_mut(16) {
+        for (i, v) in fallback.iter().enumerate() {
+            chunk[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    if let Some(vb) = call
+        .vertex_bindings
+        .iter()
+        .find(|vb| vb.binding == binding && vb.addr != 0)
+    {
+        let want = if vb.size > 0 {
+            (vb.size as usize).min(64)
+        } else {
+            64
+        };
+        if let Some(data) = read_guest(vb.addr, want) {
+            let n = data.len().min(64);
+            out[..n].copy_from_slice(&data[..n]);
+        }
+    }
+    out
 }
 
 fn prepare_vertex_bindings<F>(

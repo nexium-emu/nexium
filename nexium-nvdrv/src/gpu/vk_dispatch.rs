@@ -518,6 +518,11 @@ fn submit_draw_batch_async(
     for call in batch {
         for binding in &call.vertex_bindings {
             if binding.stride == 0 {
+                if binding.addr != 0 {
+                    let n = snapshot_read_once(&mut snapshot, read_guest, binding.addr, 64);
+                    snapshot_reads += usize::from(n != 0);
+                    snapshot_bytes += n;
+                }
                 continue;
             }
             let stride = binding.stride as u64;
@@ -792,6 +797,12 @@ fn depth_disabled() -> bool {
     *D.get_or_init(|| std::env::var("NEXIUM_NO_DEPTH").ok().as_deref() == Some("1"))
 }
 
+fn small_rt_wb_disabled() -> bool {
+    use std::sync::OnceLock;
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| std::env::var("NEXIUM_NO_SMALL_RT_WB").ok().as_deref() == Some("1"))
+}
+
 fn small_rt_registry() -> &'static std::sync::Mutex<std::collections::HashMap<RtKey, u32>> {
     static R: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<RtKey, u32>>> =
         std::sync::OnceLock::new();
@@ -921,7 +932,7 @@ fn execute_one(
         .iter()
         .map(|(_, format)| *format)
         .collect::<Vec<_>>();
-    if !draw.is_clear && (rt.width as u64) * (rt.height as u64) <= 16384 {
+    if !draw.is_clear && (rt.width as u64) * (rt.height as u64) <= 16384 && !small_rt_wb_disabled() {
         small_rt_registry()
             .lock()
             .unwrap()
@@ -2990,7 +3001,7 @@ fn trace_menu_draw(
     let rt_gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
     let pos = position_bounds(layout, mappings, mem_read, vertex_addr, vertex_count)
         .unwrap_or_else(|| "n/a".to_string());
-    let attr = vertex_attr_sample(layout, mappings, mem_read, vertex_addr, vertex_count);
+    let attr = vertex_attr_sample(layout, mappings, mem_read, vertex_addr, vertex_count, &draw.vertex_buffers);
     let vp = guest_viewport_rect(draw, rt.width as f32, rt.height as f32);
     let clip = draw.surface_clip.effective(rt.width, rt.height);
     let mut tex = Vec::new();
@@ -3473,7 +3484,7 @@ fn trace_draw(
         return;
     }
     let pos = position_bounds(layout, mappings, mem_read, vertex_addr, vertex_count);
-    let attr = vertex_attr_sample(layout, mappings, mem_read, vertex_addr, vertex_count);
+    let attr = vertex_attr_sample(layout, mappings, mem_read, vertex_addr, vertex_count, &draw.vertex_buffers);
     let vp = guest_viewport_rect(draw, rt.width as f32, rt.height as f32);
     let clip = draw.surface_clip.effective(rt.width, rt.height);
     let cbuf_full = std::env::var_os("NEXIUM_DRAW_TRACE_CBUF_FULL").is_some();
@@ -4017,6 +4028,7 @@ fn vertex_attr_sample(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     vertex_addr: u64,
     vertex_count: u32,
+    vbufs: &[VertexBuffer; 32],
 ) -> String {
     let Some(base_cpu) = mappings.cpu_address_for(vertex_addr) else {
         return "attr_sample=unmapped".to_string();
@@ -4036,7 +4048,20 @@ fn vertex_attr_sample(
             continue;
         };
         if stride == 0 {
-            parts.push(format!("l{} const {:?}", attr.location, attr.format));
+            let base_va = vbufs
+                .get(attr.binding as usize)
+                .map(|vb| ((vb.address_hi as u64) << 32) | vb.address_lo as u64)
+                .unwrap_or(0);
+            let cval = mappings
+                .cpu_address_for(base_va)
+                .and_then(|cpu| read_attr_vec4(attr.format, cpu + attr.offset as u64, mem_read));
+            match cval {
+                Some(v) => parts.push(format!(
+                    "l{} const {:?} b{}+{}=({:.4},{:.4},{:.4},{:.4})",
+                    attr.location, attr.format, attr.binding, attr.offset, v[0], v[1], v[2], v[3]
+                )),
+                None => parts.push(format!("l{} const {:?}", attr.location, attr.format)),
+            }
             continue;
         }
         let mut vals = Vec::new();
