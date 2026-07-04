@@ -3783,6 +3783,7 @@ struct RtImageStats {
     raw_nonzero_bytes: u64,
     raw_nonzero_words: u64,
     raw_first_word: Option<(u32, u32, u32)>,
+    raw_mid_word: Option<(u32, u32, u32)>,
     rgb_nonzero: u64,
     alpha_nonzero: u64,
     rgb_sum: u64,
@@ -3900,8 +3901,12 @@ fn trace_rt_stats(
                     .raw_first_word
                     .map(|(x, y, word)| format!("{},{}:{:08x}", x, y, word))
                     .unwrap_or_else(|| "-".to_string());
+                let raw_mid = stats
+                    .raw_mid_word
+                    .map(|(x, y, word)| format!("{},{}:{:08x}", x, y, word))
+                    .unwrap_or_else(|| "-".to_string());
                 log::warn!(
-                    "[rt-stats] seq={} key={} fmt={:?} stamp={} rawbnz={} rawwnz={} rawfirst={} rgbnz={}/{} ({:.2}%) anz={} avg_rgb={:.2} avg_a={:.2} max={} bbox={} first={}",
+                    "[rt-stats] seq={} key={} fmt={:?} stamp={} rawbnz={} rawwnz={} rawfirst={} rawmid={} rgbnz={}/{} ({:.2}%) anz={} avg_rgb={:.2} avg_a={:.2} max={} bbox={} first={}",
                     seq,
                     key.label(),
                     stats.format,
@@ -3909,6 +3914,7 @@ fn trace_rt_stats(
                     stats.raw_nonzero_bytes,
                     stats.raw_nonzero_words,
                     raw_first,
+                    raw_mid,
                     stats.rgb_nonzero,
                     stats.pixels,
                     pct,
@@ -4400,6 +4406,16 @@ fn read_rt_image_stats(
         for word in data.chunks(4) {
             if word.iter().any(|byte| *byte != 0) {
                 stats.raw_nonzero_words += 1;
+            }
+        }
+        {
+            let pixel_size = readback_format_bpp(format).max(1);
+            let cx = key.width / 2;
+            let cy = key.height * 5 / 8;
+            let idx = (cy as usize * key.width as usize + cx as usize) * pixel_size;
+            if idx + 4 <= data.len() {
+                let raw = [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
+                stats.raw_mid_word = Some((cx, cy, u32::from_le_bytes(raw)));
             }
         }
         let rgba = readback_to_rgba8(data, format, key.width, key.height);
