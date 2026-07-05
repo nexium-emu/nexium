@@ -808,6 +808,33 @@ pub fn guest_probe(mappings: &GpuMappings, mem_read: &dyn Fn(u64, &mut [u8]) -> 
     use std::sync::{Mutex, OnceLock};
     static CFG: OnceLock<Vec<(u64, usize)>> = OnceLock::new();
     static LAST: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+    static ARMED: OnceLock<()> = OnceLock::new();
+    if let Ok(spec) = std::env::var("NEXIUM_WATCH_WRITE_GPU") {
+        if ARMED.get().is_none() {
+            if let Some((va, len)) = spec.trim().split_once(':') {
+                let va = u64::from_str_radix(va.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+                let len =
+                    u64::from_str_radix(len.trim().trim_start_matches("0x"), 16).unwrap_or(0x60);
+                if va != 0 {
+                    if let Some(cpu) = mappings.cpu_address_for(va) {
+                        if nexium_memory::fastmem::watch_arm(cpu, len) {
+                            let _ = ARMED.set(());
+                            log::warn!(
+                                "[watch-write] ARMED gpu_va={:#x} cpu_va={:#x} len={:#x}",
+                                va, cpu, len
+                            );
+                        } else {
+                            log::warn!(
+                                "[watch-write] arm FAILED gpu_va={:#x} cpu_va={:#x}",
+                                va, cpu
+                            );
+                            let _ = ARMED.set(());
+                        }
+                    }
+                }
+            }
+        }
+    }
     let cfg = CFG.get_or_init(|| {
         std::env::var("NEXIUM_GUEST_PROBE")
             .map(|v| {

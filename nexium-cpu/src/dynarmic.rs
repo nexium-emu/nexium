@@ -56,6 +56,45 @@ impl DynarmicCpu {
         let continue_flag = continue_on_null.clone();
         let skip_counter = null_skip_count.clone();
         emu.set_unmapped_mem_callback(move |dyn_, addr, size, value| {
+            if let Some((lo, hi)) = nexium_memory::fastmem::watch_range() {
+                if addr >= lo && addr < hi {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static HITS: AtomicU64 = AtomicU64::new(0);
+                    let n = HITS.fetch_add(1, Ordering::SeqCst);
+                    let pc = dyn_.reg_read_pc().unwrap_or(0);
+                    let lr = dyn_.reg_read_lr().unwrap_or(0);
+                    if n < 64 {
+                        log::warn!(
+                            "[watch-write] #{} addr={:#x} size={} val={:#x} pc={:#x} lr={:#x}",
+                            n, addr, size, value, pc, lr
+                        );
+                    }
+                    if n >= 64 || value != 0 {
+                        if value != 0 {
+                            log::warn!(
+                                "[watch-write] NONZERO writer pc={:#x} lr={:#x} — disarming",
+                                pc, lr
+                            );
+                        } else {
+                            log::warn!("[watch-write] cap reached, disarming");
+                        }
+                        nexium_memory::fastmem::watch_disarm();
+                        unsafe {
+                            let base = nexium_memory::fastmem::base().unwrap();
+                            let bytes = value.to_le_bytes();
+                            std::ptr::copy_nonoverlapping(
+                                bytes.as_ptr(),
+                                base.add(addr as usize),
+                                (size as usize).min(8),
+                            );
+                        }
+                        return true;
+                    }
+                    if nexium_memory::fastmem::watch_write_through(addr, size as usize, value) {
+                        return true;
+                    }
+                }
+            }
             let pc = dyn_.reg_read_pc().unwrap_or(0);
             let lr = dyn_.reg_read_lr().unwrap_or(0);
             let sp = dyn_.reg_read_sp().unwrap_or(0);

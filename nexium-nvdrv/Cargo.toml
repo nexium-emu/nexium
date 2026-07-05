@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "nexium-nvdrv"
 version = "0.1.0"
 edition.workspace = true
@@ -9,6 +9,7 @@ license.workspace = true
 nexium-shader.workspace = true
 nexium-spirv.workspace = true
 nexium-gpu = { path = "../nexium-gpu" }
+nexium-memory.workspace = true
 ash = "0.38"
 
 log.workspace = true
