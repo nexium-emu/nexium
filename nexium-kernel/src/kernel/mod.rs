@@ -221,8 +221,16 @@ impl Kernel {
             generic_svc_streak: 0,
             next_generic_svc_streak_log: 64,
             applet_focus_state: 1,
-            applet_operation_mode: 0,
-            applet_performance_mode: 0,
+            applet_operation_mode: if std::env::var_os("NEXIUM_DOCKED").is_some() {
+                1
+            } else {
+                0
+            },
+            applet_performance_mode: if std::env::var_os("NEXIUM_DOCKED").is_some() {
+                1
+            } else {
+                0
+            },
             display_resolution_change_event: None,
             library_applet_launchable_event: None,
             accumulated_suspended_tick_event: None,

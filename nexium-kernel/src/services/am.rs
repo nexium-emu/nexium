@@ -602,7 +602,14 @@ fn manager_for_application(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
 
 fn apm_manager(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
-        1 => ok(0i32.to_le_bytes().to_vec()),
+        1 => {
+            let mode: i32 = if std::env::var_os("NEXIUM_DOCKED").is_some() {
+                1
+            } else {
+                0
+            };
+            ok(mode.to_le_bytes().to_vec())
+        }
         6 => ok(vec![0u8]),
         _ => {
             log::warn!(

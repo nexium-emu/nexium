@@ -343,6 +343,7 @@ impl GpuContext {
         if let Some(r) = pusher.renderer.clone() {
             vk_dispatch::writeback_small_rts(&r, &mappings, &mem_write);
         }
+        vk_dispatch::guest_probe(&mappings, &mem_read);
         let flush_ms = if profile { elapsed_ms(t_flush) } else { 0.0 };
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         if profile {

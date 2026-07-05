@@ -804,6 +804,62 @@ fn submit_ring() -> &'static std::sync::Mutex<std::collections::VecDeque<String>
     R.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
 }
 
+pub fn guest_probe(mappings: &GpuMappings, mem_read: &dyn Fn(u64, &mut [u8]) -> bool) {
+    use std::sync::{Mutex, OnceLock};
+    static CFG: OnceLock<Vec<(u64, usize)>> = OnceLock::new();
+    static LAST: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+    let cfg = CFG.get_or_init(|| {
+        std::env::var("NEXIUM_GUEST_PROBE")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|part| {
+                        let (va, len) = part.trim().split_once(':')?;
+                        let va =
+                            u64::from_str_radix(va.trim().trim_start_matches("0x"), 16).ok()?;
+                        let len = usize::from_str_radix(
+                            len.trim().trim_start_matches("0x"),
+                            16,
+                        )
+                        .ok()?
+                        .min(256);
+                        Some((va, len))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if cfg.is_empty() {
+        return;
+    }
+    let last = LAST.get_or_init(|| Mutex::new(vec![Vec::new(); cfg.len()]));
+    let mut last = last.lock().unwrap();
+    for (i, (va, len)) in cfg.iter().enumerate() {
+        let Some(cpu) = mappings.cpu_address_for(*va) else {
+            continue;
+        };
+        let mut buf = vec![0u8; *len];
+        if !mem_read(cpu, &mut buf) {
+            continue;
+        }
+        if last[i] != buf {
+            let floats: Vec<String> = buf
+                .chunks_exact(4)
+                .map(|c| {
+                    let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    format!("{:.3}", v)
+                })
+                .collect();
+            log::warn!(
+                "[guest-probe] va={:#x} len={:#x} changed: [{}]",
+                va,
+                len,
+                floats.join(",")
+            );
+            last[i] = buf;
+        }
+    }
+}
+
 pub fn writeback_small_rts(
     renderer: &Arc<nexium_gpu::Renderer>,
     mappings: &GpuMappings,
