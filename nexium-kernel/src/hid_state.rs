@@ -16,6 +16,21 @@ const NPAD_ENTRY_PLAYER1: usize = 0;
 
 const NPAD_STYLE_TAG_OFFSET: usize = 0x00;
 const NPAD_JOY_ASSIGN_OFFSET: usize = 0x04;
+const NPAD_DEVICE_TYPE_OFFSET: usize = 0x4188;
+const NPAD_SYSTEM_PROPERTIES_OFFSET: usize = 0x4190;
+const NPAD_APPLET_FOOTER_OFFSET: usize = 0x41AC;
+
+const DEVICE_TYPE_FULLKEY: u32 = 1 << 0;
+const DEVICE_TYPE_HANDHELD_LEFT: u32 = 1 << 2;
+const DEVICE_TYPE_HANDHELD_RIGHT: u32 = 1 << 3;
+
+const SYSPROP_IS_VERTICAL: u64 = 1 << 11;
+const SYSPROP_USE_PLUS: u64 = 1 << 13;
+const SYSPROP_USE_MINUS: u64 = 1 << 14;
+const SYSPROP_USE_DIRECTIONAL: u64 = 1 << 15;
+
+const FOOTER_SWITCH_PRO: u8 = 12;
+const FOOTER_HANDHELD: u8 = 4;
 
 const LAYOUT_BASE_OFFSET: usize = 0x28;
 const LAYOUT_STRIDE: usize = 0x350;
@@ -28,6 +43,8 @@ const LIFO_STORAGE_COUNT: usize = 17;
 pub const STYLE_FULLKEY: u32 = 1 << 0;
 pub const STYLE_HANDHELD: u32 = 1 << 1;
 pub const STYLE_JOY_DUAL: u32 = 1 << 2;
+pub const STYLE_JOY_LEFT: u32 = 1 << 3;
+pub const STYLE_JOY_RIGHT: u32 = 1 << 4;
 pub const STYLE_SYSTEM_EXT: u32 = 1 << 29;
 
 pub const ATTR_IS_CONNECTED: u32 = 1 << 0;
@@ -53,6 +70,18 @@ pub const NPAD_BUTTON_LEFT: u64 = 1 << 12;
 pub const NPAD_BUTTON_UP: u64 = 1 << 13;
 pub const NPAD_BUTTON_RIGHT: u64 = 1 << 14;
 pub const NPAD_BUTTON_DOWN: u64 = 1 << 15;
+pub const NPAD_BUTTON_STICK_L_LEFT: u64 = 1 << 16;
+pub const NPAD_BUTTON_STICK_L_UP: u64 = 1 << 17;
+pub const NPAD_BUTTON_STICK_L_RIGHT: u64 = 1 << 18;
+pub const NPAD_BUTTON_STICK_L_DOWN: u64 = 1 << 19;
+pub const NPAD_BUTTON_STICK_R_LEFT: u64 = 1 << 20;
+pub const NPAD_BUTTON_STICK_R_UP: u64 = 1 << 21;
+pub const NPAD_BUTTON_STICK_R_RIGHT: u64 = 1 << 22;
+pub const NPAD_BUTTON_STICK_R_DOWN: u64 = 1 << 23;
+pub const NPAD_BUTTON_LEFT_SL: u64 = 1 << 24;
+pub const NPAD_BUTTON_LEFT_SR: u64 = 1 << 25;
+pub const NPAD_BUTTON_RIGHT_SL: u64 = 1 << 26;
+pub const NPAD_BUTTON_RIGHT_SR: u64 = 1 << 27;
 
 #[derive(Default, Clone, Copy)]
 pub struct ControllerInput {
@@ -130,64 +159,43 @@ impl HidState {
         }
         self.sampling_number = self.sampling_number.wrapping_add(1);
         let sampling = self.sampling_number;
+        let docked = CONSOLE_DOCKED.load(std::sync::atomic::Ordering::Relaxed);
+        let active_entry = if docked {
+            NPAD_ENTRY_PLAYER1
+        } else {
+            NPAD_ENTRY_HANDHELD
+        };
         for entry_idx in 0..=NPAD_ENTRY_OTHER {
-            match entry_idx {
-                NPAD_ENTRY_PLAYER1 => {
-                    let joy_attr = ATTR_IS_CONNECTED
-                        | ATTR_IS_WIRED
-                        | ATTR_LEFT_CONNECTED
-                        | ATTR_LEFT_WIRED
-                        | ATTR_RIGHT_CONNECTED
-                        | ATTR_RIGHT_WIRED;
-                    Self::write_entry_style(
-                        &mut self.buf[..],
-                        entry_idx,
-                        STYLE_FULLKEY | STYLE_JOY_DUAL | STYLE_SYSTEM_EXT,
-                    );
-                    Self::write_npad_lifo(
-                        &mut self.buf[..],
-                        entry_idx,
-                        0,
-                        &input,
-                        sampling,
-                        ATTR_IS_CONNECTED | ATTR_IS_WIRED,
-                    );
-                    Self::write_npad_lifo(
-                        &mut self.buf[..],
-                        entry_idx,
-                        2,
-                        &input,
-                        sampling,
-                        joy_attr,
-                    );
-                    Self::write_npad_lifo(
-                        &mut self.buf[..],
-                        entry_idx,
-                        6,
-                        &input,
-                        sampling,
-                        ATTR_IS_CONNECTED | ATTR_IS_WIRED,
-                    );
-                }
-                NPAD_ENTRY_HANDHELD => {
-                    let attr = ATTR_IS_CONNECTED
-                        | ATTR_IS_WIRED
-                        | ATTR_LEFT_CONNECTED
-                        | ATTR_LEFT_WIRED
-                        | ATTR_RIGHT_CONNECTED
-                        | ATTR_RIGHT_WIRED;
-                    Self::write_entry_style(
-                        &mut self.buf[..],
-                        entry_idx,
-                        STYLE_HANDHELD | STYLE_SYSTEM_EXT,
-                    );
-                    Self::write_npad_lifo(&mut self.buf[..], entry_idx, 1, &input, sampling, attr);
-                    Self::write_npad_lifo(&mut self.buf[..], entry_idx, 6, &input, sampling, attr);
-                }
-                _ => {
-                    Self::write_entry_style(&mut self.buf[..], entry_idx, 0);
-                }
+            if entry_idx != active_entry {
+                Self::write_entry_style(&mut self.buf[..], entry_idx, 0);
             }
+        }
+        if docked {
+            Self::setup_fullkey(&mut self.buf[..], NPAD_ENTRY_PLAYER1);
+            Self::write_npad_lifo(
+                &mut self.buf[..],
+                NPAD_ENTRY_PLAYER1,
+                0,
+                &input,
+                sampling,
+                ATTR_IS_CONNECTED | ATTR_IS_WIRED,
+            );
+        } else {
+            let attr = ATTR_IS_CONNECTED
+                | ATTR_IS_WIRED
+                | ATTR_LEFT_CONNECTED
+                | ATTR_LEFT_WIRED
+                | ATTR_RIGHT_CONNECTED
+                | ATTR_RIGHT_WIRED;
+            Self::setup_handheld(&mut self.buf[..], NPAD_ENTRY_HANDHELD);
+            Self::write_npad_lifo(
+                &mut self.buf[..],
+                NPAD_ENTRY_HANDHELD,
+                1,
+                &input,
+                sampling,
+                attr,
+            );
         }
 
         if !self.dumped_shmem && input.buttons != 0 {
@@ -265,8 +273,8 @@ impl HidState {
         for idx in 0..=NPAD_ENTRY_OTHER {
             let base = NPAD_OFFSET + idx * NPAD_ENTRY_SIZE;
             let style = match idx {
-                NPAD_ENTRY_PLAYER1 => STYLE_FULLKEY | STYLE_JOY_DUAL | STYLE_SYSTEM_EXT,
-                NPAD_ENTRY_HANDHELD => STYLE_HANDHELD | STYLE_SYSTEM_EXT,
+                NPAD_ENTRY_PLAYER1 => STYLE_FULLKEY,
+                NPAD_ENTRY_HANDHELD => STYLE_HANDHELD,
                 _ => 0,
             };
             write_u32(&mut *self.buf, base + NPAD_STYLE_TAG_OFFSET, style);
@@ -295,6 +303,36 @@ impl HidState {
     fn write_entry_style(buf: &mut [u8], entry_idx: usize, style: u32) {
         let entry_base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
         write_u32(buf, entry_base + NPAD_STYLE_TAG_OFFSET, style);
+    }
+
+    fn setup_fullkey(buf: &mut [u8], entry_idx: usize) {
+        let base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
+        write_u32(buf, base + NPAD_STYLE_TAG_OFFSET, STYLE_FULLKEY);
+        write_u32(buf, base + NPAD_JOY_ASSIGN_OFFSET, 0);
+        write_u32(buf, base + NPAD_DEVICE_TYPE_OFFSET, DEVICE_TYPE_FULLKEY);
+        write_u64(
+            buf,
+            base + NPAD_SYSTEM_PROPERTIES_OFFSET,
+            SYSPROP_IS_VERTICAL | SYSPROP_USE_PLUS | SYSPROP_USE_MINUS,
+        );
+        buf[base + NPAD_APPLET_FOOTER_OFFSET] = FOOTER_SWITCH_PRO;
+    }
+
+    fn setup_handheld(buf: &mut [u8], entry_idx: usize) {
+        let base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
+        write_u32(buf, base + NPAD_STYLE_TAG_OFFSET, STYLE_HANDHELD);
+        write_u32(buf, base + NPAD_JOY_ASSIGN_OFFSET, 0);
+        write_u32(
+            buf,
+            base + NPAD_DEVICE_TYPE_OFFSET,
+            DEVICE_TYPE_HANDHELD_LEFT | DEVICE_TYPE_HANDHELD_RIGHT,
+        );
+        write_u64(
+            buf,
+            base + NPAD_SYSTEM_PROPERTIES_OFFSET,
+            SYSPROP_IS_VERTICAL | SYSPROP_USE_PLUS | SYSPROP_USE_MINUS | SYSPROP_USE_DIRECTIONAL,
+        );
+        buf[base + NPAD_APPLET_FOOTER_OFFSET] = FOOTER_HANDHELD;
     }
 
     fn write_npad_lifo(
@@ -348,4 +386,24 @@ pub fn get_hid_state() -> Arc<Mutex<HidState>> {
     HID_STATE
         .get_or_init(|| Arc::new(Mutex::new(HidState::new())))
         .clone()
+}
+
+pub static CONSOLE_DOCKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CONSOLE_MODE_DIRTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn is_docked() -> bool {
+    CONSOLE_DOCKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_docked(value: bool) {
+    let prev = CONSOLE_DOCKED.swap(value, std::sync::atomic::Ordering::Relaxed);
+    if prev != value {
+        CONSOLE_MODE_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub fn take_console_mode_dirty() -> bool {
+    CONSOLE_MODE_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
