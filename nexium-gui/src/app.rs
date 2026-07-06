@@ -572,6 +572,33 @@ impl eframe::App for HorizonApp {
                                 .size(12.0)
                                 .color(status_col),
                         );
+
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                        ui.add_space(6.0);
+                        let docked = nexium_core::hid_state::is_docked();
+                        let (mode_icon, mode_txt, mode_col) = if docked {
+                            ("⏻", "Docked", GREEN)
+                        } else {
+                            ("▢", "Handheld", AMBER)
+                        };
+                        let mode_resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("{} {}", mode_icon, mode_txt))
+                                    .size(12.0)
+                                    .color(mode_col),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        if mode_resp.hovered() {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if mode_resp
+                            .on_hover_text("Toggle Docked / Handheld (Pro Controller vs Handheld)")
+                            .clicked()
+                        {
+                            nexium_core::hid_state::set_docked(!docked);
+                        }
                     });
                 });
             });

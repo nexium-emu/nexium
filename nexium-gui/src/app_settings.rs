@@ -191,14 +191,29 @@ impl AppSettings {
     }
 
     pub fn load() -> Self {
-        if let Some(path) = Self::config_path() {
+        let mut cfg = if let Some(path) = Self::config_path() {
             if let Ok(s) = std::fs::read_to_string(&path) {
                 if let Ok(cfg) = serde_json::from_str::<AppSettings>(&s) {
-                    return cfg;
+                    cfg
+                } else {
+                    Self::default()
                 }
+            } else {
+                Self::default()
+            }
+        } else {
+            Self::default()
+        };
+        if let Ok(backend) = std::env::var("NEXIUM_CPU_BACKEND") {
+            if backend.eq_ignore_ascii_case("rustarmic") || backend.eq_ignore_ascii_case("rust") {
+                cfg.cpu_backend = CpuBackend::Rustarmic;
+            } else if backend.eq_ignore_ascii_case("dynarmic")
+                || backend.eq_ignore_ascii_case("dyn")
+            {
+                cfg.cpu_backend = CpuBackend::Dynarmic;
             }
         }
-        Self::default()
+        cfg
     }
 
     pub fn save(&self) -> std::io::Result<()> {
