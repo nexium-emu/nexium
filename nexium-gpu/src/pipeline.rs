@@ -33,7 +33,7 @@ pub struct PipelineKey {
     pub color_write_mask: u32,
 }
 
-const SPEC_VERSION: u32 = 11;
+const SPEC_VERSION: u32 = 13;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineSpec {
@@ -187,15 +187,7 @@ pub struct PipelineBuildRequest {
 }
 
 pub fn normalized_color_formats(formats: &[vk::Format]) -> Vec<vk::Format> {
-    let mut out = if formats.is_empty() {
-        vec![vk::Format::R8G8B8A8_UNORM]
-    } else {
-        formats.iter().copied().take(8).collect()
-    };
-    if out.is_empty() {
-        out.push(vk::Format::R8G8B8A8_UNORM);
-    }
-    out
+    formats.iter().copied().take(8).collect()
 }
 
 pub fn color_format_key(formats: &[vk::Format]) -> (u32, [u32; 8], u32) {
@@ -208,7 +200,9 @@ pub fn color_format_key(formats: &[vk::Format]) -> (u32, [u32; 8], u32) {
 }
 
 fn spec_color_formats(spec: &PipelineSpec) -> Vec<vk::Format> {
-    if spec.color_formats.is_empty() {
+    if spec.color_attachment_count == 0 {
+        Vec::new()
+    } else if spec.color_formats.is_empty() {
         normalized_color_formats(&[vk::Format::from_raw(spec.color_format)])
     } else {
         normalized_color_formats(
@@ -421,7 +415,11 @@ pub fn build_graphics_pipeline(
         s_type: vk::StructureType::PIPELINE_RENDERING_CREATE_INFO,
         view_mask: 0,
         color_attachment_count,
-        p_color_attachment_formats: color_formats.as_ptr(),
+        p_color_attachment_formats: if color_formats.is_empty() {
+            std::ptr::null()
+        } else {
+            color_formats.as_ptr()
+        },
         depth_attachment_format: req.depth_format,
         stencil_attachment_format: vk::Format::UNDEFINED,
         p_next: std::ptr::null(),
@@ -637,27 +635,24 @@ impl PipelineCache {
                 let tx = res_tx.clone();
                 let h = std::thread::Builder::new()
                     .name("nexium-pipecompile".to_string())
-                    .spawn(move || {
-                        loop {
-                            let req = {
-                                let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
-                                match guard.recv() {
-                                    Ok(r) => r,
-                                    Err(_) => break,
-                                }
-                            };
-                            let pipe = match build_graphics_pipeline(
-                                &dev, wcache, wlayout, &wlock, &req,
-                            ) {
+                    .spawn(move || loop {
+                        let req = {
+                            let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                            match guard.recv() {
+                                Ok(r) => r,
+                                Err(_) => break,
+                            }
+                        };
+                        let pipe =
+                            match build_graphics_pipeline(&dev, wcache, wlayout, &wlock, &req) {
                                 Ok(p) => p,
                                 Err(e) => {
                                     log::warn!("async pipeline build failed: {}", e);
                                     vk::Pipeline::null()
                                 }
                             };
-                            if tx.send((req.key, pipe)).is_err() {
-                                break;
-                            }
+                        if tx.send((req.key, pipe)).is_err() {
+                            break;
                         }
                     })
                     .ok();

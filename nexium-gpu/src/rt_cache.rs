@@ -1,5 +1,5 @@
 use ash::vk;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Copy, Debug)]
@@ -73,6 +73,17 @@ pub struct GpuImage {
     pub layout: vk::ImageLayout,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RtColorRegion {
+    pub key: RtKey,
+    pub image: vk::Image,
+    pub layout: vk::ImageLayout,
+    pub format: vk::Format,
+    pub stamp: u64,
+    pub src_x: u32,
+    pub src_y: u32,
+}
+
 fn dims_close(a: u32, b: u32) -> bool {
     let (lo, hi) = if a < b { (a, b) } else { (b, a) };
     lo != 0 && hi <= lo.saturating_mul(2)
@@ -84,6 +95,8 @@ pub struct RtCache {
     snapshots: HashMap<RtKey, GpuImage>,
     mem_properties: Option<vk::PhysicalDeviceMemoryProperties>,
     drawn_stamp: HashMap<RtKey, u64>,
+    present_excluded: HashSet<RtKey>,
+    present_flip_y: HashMap<RtKey, bool>,
     drawn_counter: u64,
     frame_draws: HashMap<RtKey, u32>,
 }
@@ -96,6 +109,8 @@ impl RtCache {
             snapshots: HashMap::new(),
             mem_properties: None,
             drawn_stamp: HashMap::new(),
+            present_excluded: HashSet::new(),
+            present_flip_y: HashMap::new(),
             drawn_counter: 0,
             frame_draws: HashMap::new(),
         }
@@ -134,7 +149,23 @@ impl RtCache {
     pub fn mark_drawn(&mut self, key: RtKey) -> u64 {
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
+        self.present_excluded.remove(&key);
         *self.frame_draws.entry(key).or_insert(0) += 1;
+        self.drawn_counter
+    }
+
+    pub fn record_present_flip(&mut self, key: RtKey, flip_y: bool) {
+        self.present_flip_y.insert(key, flip_y);
+    }
+
+    pub fn present_flip_y(&self, key: RtKey) -> Option<bool> {
+        self.present_flip_y.get(&key).copied()
+    }
+
+    pub fn mark_synced_sample(&mut self, key: RtKey) -> u64 {
+        self.drawn_counter += 1;
+        self.drawn_stamp.insert(key, self.drawn_counter);
+        self.present_excluded.insert(key);
         self.drawn_counter
     }
 
@@ -151,29 +182,84 @@ impl RtCache {
     }
 
     pub fn resolve_present_key(&self, want: RtKey) -> Option<RtKey> {
-        let mut best: Option<(RtKey, u64)> = None;
-        for k in self.cache.keys() {
-            if k.width != want.width || k.height != want.height {
-                continue;
+        let choose_cpu = || -> Option<(RtKey, u64)> {
+            if want.cpu_addr == 0 {
+                return None;
             }
-            if want.gpu_va != 0 && k.gpu_va != want.gpu_va {
-                continue;
-            }
-            let Some(stamp) = self.drawn_stamp.get(k).copied() else {
-                continue;
-            };
-            let replace = match best {
-                Some((best_key, best_stamp)) => {
-                    stamp > best_stamp || (stamp == best_stamp && *k == want && best_key != want)
+            let mut best: Option<(RtKey, u64)> = None;
+            for k in self.cache.keys() {
+                if k.width != want.width
+                    || k.height != want.height
+                    || k.cpu_addr != want.cpu_addr
+                    || self.present_excluded.contains(k)
+                {
+                    continue;
                 }
-                None => true,
-            };
-            if replace {
-                best = Some((*k, stamp));
+                if want.nvmap_id != 0 && k.nvmap_id != want.nvmap_id {
+                    continue;
+                }
+                let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+                    continue;
+                };
+                let replace = match best {
+                    Some((best_key, best_stamp)) => {
+                        stamp > best_stamp
+                            || (stamp == best_stamp && *k == want && best_key != want)
+                    }
+                    None => true,
+                };
+                if replace {
+                    best = Some((*k, stamp));
+                }
             }
+            best
+        };
+        let choose = |gpu_va: Option<u64>, same_nvmap: bool| -> Option<(RtKey, u64)> {
+            let mut best: Option<(RtKey, u64)> = None;
+            for k in self.cache.keys() {
+                if k.width != want.width || k.height != want.height {
+                    continue;
+                }
+                if let Some(gpu_va) = gpu_va {
+                    if k.gpu_va != gpu_va {
+                        continue;
+                    }
+                }
+                if self.present_excluded.contains(k) {
+                    continue;
+                }
+                if same_nvmap && want.nvmap_id != 0 && k.nvmap_id != want.nvmap_id {
+                    continue;
+                }
+                let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+                    continue;
+                };
+                let replace = match best {
+                    Some((best_key, best_stamp)) => {
+                        stamp > best_stamp
+                            || (stamp == best_stamp && *k == want && best_key != want)
+                    }
+                    None => true,
+                };
+                if replace {
+                    best = Some((*k, stamp));
+                }
+            }
+            best
+        };
+        let mut best = choose_cpu();
+        if best.is_none() && want.gpu_va != 0 {
+            best = choose(Some(want.gpu_va), false);
+        }
+        if best.is_none() {
+            best = choose(None, true);
+        }
+        if best.is_none() {
+            best = choose(None, false);
         }
         let best_stamp = best.map(|(_, s)| s).unwrap_or(0);
-        if want.height != 0 && want.gpu_va == 0 {
+        let strict_cpu = std::env::var_os("NEXIUM_PRESENT_STRICT_CPU").is_some();
+        if want.height != 0 && want.gpu_va == 0 && (want.cpu_addr == 0 || !strict_cpu) {
             let aw = want.width as f32 / want.height as f32;
             let same_aspect = |k: &RtKey| {
                 k.height != 0 && ((k.width as f32 / k.height as f32) - aw).abs() <= aw * 0.12
@@ -182,6 +268,8 @@ impl RtCache {
                 .cache
                 .keys()
                 .filter(|k| same_aspect(k))
+                .filter(|k| dims_close(k.width, want.width) && dims_close(k.height, want.height))
+                .filter(|k| !self.present_excluded.contains(k))
                 .filter_map(|k| self.drawn_stamp.get(k).map(|s| (*k, *s)))
                 .max_by_key(|(_, s)| *s);
             if let Some((ak, astamp)) = alt {
@@ -202,6 +290,8 @@ impl RtCache {
                     .cache
                     .keys()
                     .filter(|k| same_aspect(k))
+                    .filter(|k| dims_close(k.width, want.width) && dims_close(k.height, want.height))
+                    .filter(|k| !self.present_excluded.contains(k))
                     .filter_map(|k| {
                         let fd = self.frame_draws.get(k).copied().unwrap_or(0);
                         if fd > 0 {
@@ -263,10 +353,16 @@ impl RtCache {
     pub fn present_candidates(&self, want: RtKey) -> Vec<(RtKey, u64)> {
         let mut out = Vec::new();
         for k in self.cache.keys() {
+            if self.present_excluded.contains(k) {
+                continue;
+            }
             if k.width != want.width || k.height != want.height {
                 continue;
             }
             if want.gpu_va != 0 && k.gpu_va != want.gpu_va {
+                continue;
+            }
+            if want.cpu_addr != 0 && k.cpu_addr != want.cpu_addr {
                 continue;
             }
             let stamp = self.drawn_stamp.get(k).copied().unwrap_or(0);
@@ -325,7 +421,14 @@ impl RtCache {
     pub fn color_exact_with_format(
         &self,
         key: RtKey,
-    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format, u64)> {
+    ) -> Option<(
+        RtKey,
+        vk::Image,
+        vk::ImageView,
+        vk::ImageLayout,
+        vk::Format,
+        u64,
+    )> {
         let img = self.cache.get(&key)?;
         Some((
             key,
@@ -413,6 +516,8 @@ impl RtCache {
                 destroy_gpu_image(device, image);
             }
             self.drawn_stamp.remove(&key);
+            self.present_excluded.remove(&key);
+            self.present_flip_y.remove(&key);
             self.frame_draws.remove(&key);
         }
         if !self.cache.contains_key(&key) {
@@ -583,6 +688,98 @@ impl RtCache {
             }
         }
         best.map(|(k, img, stamp)| (k, img.image, img.layout, img.format, stamp))
+    }
+
+    pub fn find_drawn_color_region_at(
+        &self,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+    ) -> Option<RtColorRegion> {
+        if gpu_va == 0 {
+            return None;
+        }
+        let mut best: Option<(RtKey, &GpuImage, u64, u32, u32, bool)> = None;
+        for (k, img) in &self.cache {
+            let Some((src_x, src_y, exact)) =
+                rt_region_offset(*k, img.format, width, height, gpu_va)
+            else {
+                continue;
+            };
+            let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+                continue;
+            };
+            let area = k.width as u64 * k.height as u64;
+            let replace = match best {
+                Some((best_key, _, best_stamp, _, _, best_exact)) => {
+                    let best_area = best_key.width as u64 * best_key.height as u64;
+                    (exact && !best_exact)
+                        || (exact == best_exact
+                            && (area < best_area || (area == best_area && stamp > best_stamp)))
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((*k, img, stamp, src_x, src_y, exact));
+            }
+        }
+        best.map(|(key, img, stamp, src_x, src_y, _)| RtColorRegion {
+            key,
+            image: img.image,
+            layout: img.layout,
+            format: img.format,
+            stamp,
+            src_x,
+            src_y,
+        })
+    }
+
+    pub fn find_drawn_color_region_at_cpu(
+        &self,
+        width: u32,
+        height: u32,
+        nvmap_id: u32,
+        cpu_addr: u64,
+    ) -> Option<RtColorRegion> {
+        if cpu_addr == 0 {
+            return None;
+        }
+        let mut best: Option<(RtKey, &GpuImage, u64, u32, u32, bool)> = None;
+        for (k, img) in &self.cache {
+            if k.nvmap_id != nvmap_id {
+                continue;
+            }
+            let Some((src_x, src_y, exact)) =
+                rt_region_cpu_offset(*k, img.format, width, height, cpu_addr)
+            else {
+                continue;
+            };
+            let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+                continue;
+            };
+            let area = k.width as u64 * k.height as u64;
+            let replace = match best {
+                Some((best_key, _, best_stamp, _, _, best_exact)) => {
+                    let best_area = best_key.width as u64 * best_key.height as u64;
+                    (exact && !best_exact)
+                        || (exact == best_exact
+                            && (area < best_area || (area == best_area && stamp > best_stamp)))
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((*k, img, stamp, src_x, src_y, exact));
+            }
+        }
+        best.map(|(key, img, stamp, src_x, src_y, _)| RtColorRegion {
+            key,
+            image: img.image,
+            layout: img.layout,
+            format: img.format,
+            stamp,
+            src_x,
+            src_y,
+        })
     }
 
     pub fn set_color_layout(&mut self, key: RtKey, layout: vk::ImageLayout) {
@@ -771,6 +968,76 @@ fn rt_formats_compatible(base: vk::Format, view: vk::Format) -> bool {
         || rt_format_class_bits(base)
             .zip(rt_format_class_bits(view))
             .is_some_and(|(a, b)| a == b)
+}
+
+fn rt_region_offset(
+    key: RtKey,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+    gpu_va: u64,
+) -> Option<(u32, u32, bool)> {
+    if key.gpu_va == 0 || width == 0 || height == 0 || key.width == 0 || key.height == 0 {
+        return None;
+    }
+    if gpu_va < key.gpu_va || width > key.width || height > key.height {
+        return None;
+    }
+    let offset = gpu_va.checked_sub(key.gpu_va)?;
+    rt_region_from_offset(key, format, width, height, offset)
+}
+
+fn rt_region_cpu_offset(
+    key: RtKey,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+    cpu_addr: u64,
+) -> Option<(u32, u32, bool)> {
+    if key.cpu_addr == 0 || width == 0 || height == 0 || key.width == 0 || key.height == 0 {
+        return None;
+    }
+    if cpu_addr < key.cpu_addr || width > key.width || height > key.height {
+        return None;
+    }
+    let offset = cpu_addr.checked_sub(key.cpu_addr)?;
+    rt_region_from_offset(key, format, width, height, offset)
+}
+
+fn rt_region_from_offset(
+    key: RtKey,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+    offset: u64,
+) -> Option<(u32, u32, bool)> {
+    let bpp = rt_format_bytes(format);
+    if bpp == 0 || offset % bpp != 0 {
+        return None;
+    }
+    let row = (key.width as u64).checked_mul(bpp)?;
+    if row == 0 {
+        return None;
+    }
+    let src_y = offset / row;
+    let src_x_bytes = offset % row;
+    if src_x_bytes % bpp != 0 {
+        return None;
+    }
+    let src_x = src_x_bytes / bpp;
+    if src_x.checked_add(width as u64)? > key.width as u64
+        || src_y.checked_add(height as u64)? > key.height as u64
+    {
+        return None;
+    }
+    let exact = offset == 0 && width == key.width && height == key.height;
+    Some((src_x as u32, src_y as u32, exact))
+}
+
+fn rt_format_bytes(format: vk::Format) -> u64 {
+    rt_format_class_bits(format)
+        .map(|bits| (bits / 8) as u64)
+        .unwrap_or(4)
 }
 
 fn rt_format_class_bits(format: vk::Format) -> Option<u32> {
