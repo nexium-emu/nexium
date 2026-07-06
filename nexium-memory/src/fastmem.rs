@@ -36,8 +36,7 @@ mod sys {
 
     pub fn protect(ptr: *mut u8, len: usize, trap: bool) -> bool {
         let mut old = 0u32;
-        let p = if trap { PAGE_NOACCESS } else { PAGE_READWRITE };
-        let _ = PAGE_READONLY;
+        let p = if trap { PAGE_READONLY } else { PAGE_READWRITE };
         unsafe { VirtualProtect(ptr, len, p, &mut old) != 0 }
     }
 }
@@ -46,7 +45,7 @@ mod sys {
 mod sys {
     pub fn protect(ptr: *mut u8, len: usize, trap: bool) -> bool {
         let p = if trap {
-            libc::PROT_NONE
+            libc::PROT_READ
         } else {
             libc::PROT_READ | libc::PROT_WRITE
         };
@@ -161,6 +160,20 @@ use std::sync::atomic::AtomicU64;
 
 static WATCH_LO: AtomicU64 = AtomicU64::new(0);
 static WATCH_HI: AtomicU64 = AtomicU64::new(0);
+static WATCH_EXACT_LO: AtomicU64 = AtomicU64::new(0);
+static WATCH_EXACT_HI: AtomicU64 = AtomicU64::new(0);
+static GUEST_PROBE_EVENT: AtomicU64 = AtomicU64::new(0);
+
+pub fn mark_guest_probe_event(va: u64) {
+    if va != 0 {
+        GUEST_PROBE_EVENT.store(va, Ordering::SeqCst);
+    }
+}
+
+pub fn take_guest_probe_event() -> Option<u64> {
+    let va = GUEST_PROBE_EVENT.swap(0, Ordering::SeqCst);
+    (va != 0).then_some(va)
+}
 
 pub fn watch_arm(va: u64, len: u64) -> bool {
     let base = arena();
@@ -178,6 +191,21 @@ pub fn watch_arm(va: u64, len: u64) -> bool {
     }
     WATCH_LO.store(lo, Ordering::SeqCst);
     WATCH_HI.store(hi, Ordering::SeqCst);
+    WATCH_EXACT_LO.store(va, Ordering::SeqCst);
+    WATCH_EXACT_HI.store(va.saturating_add(len), Ordering::SeqCst);
+    true
+}
+
+pub fn watch_mark(va: u64, len: u64) -> bool {
+    let lo = va & !0xFFF;
+    let hi = (va + len + 0xFFF) & !0xFFF;
+    if hi <= lo || hi > ARENA_SIZE {
+        return false;
+    }
+    WATCH_LO.store(lo, Ordering::SeqCst);
+    WATCH_HI.store(hi, Ordering::SeqCst);
+    WATCH_EXACT_LO.store(va, Ordering::SeqCst);
+    WATCH_EXACT_HI.store(va.saturating_add(len), Ordering::SeqCst);
     true
 }
 
@@ -188,6 +216,16 @@ pub fn watch_range() -> Option<(u64, u64)> {
         Some((lo, hi))
     } else {
         None
+    }
+}
+
+pub fn watch_exact_range() -> Option<(u64, u64)> {
+    let lo = WATCH_EXACT_LO.load(Ordering::SeqCst);
+    let hi = WATCH_EXACT_HI.load(Ordering::SeqCst);
+    if hi > lo {
+        Some((lo, hi))
+    } else {
+        watch_range()
     }
 }
 
@@ -213,6 +251,8 @@ pub fn watch_disarm() {
     }
     WATCH_LO.store(0, Ordering::SeqCst);
     WATCH_HI.store(0, Ordering::SeqCst);
+    WATCH_EXACT_LO.store(0, Ordering::SeqCst);
+    WATCH_EXACT_HI.store(0, Ordering::SeqCst);
 }
 
 pub fn watch_write_through(addr: u64, size: usize, value: u64) -> bool {

@@ -228,6 +228,7 @@ impl AddressSpace {
 
     pub fn write(&self, va: u64, buf: &[u8]) -> Result<()> {
         let (region, off) = self.locate(va, buf.len())?;
+        trace_host_write(&region, va, off, buf);
         unsafe {
             std::ptr::copy_nonoverlapping(buf.as_ptr(), region.buf.as_ptr().add(off), buf.len());
         }
@@ -273,6 +274,7 @@ impl AddressSpace {
                 need: Perm::W,
             });
         }
+        trace_host_write(&region, va, off, buf);
         unsafe {
             std::ptr::copy_nonoverlapping(buf.as_ptr(), region.buf.as_ptr().add(off), buf.len());
         }
@@ -343,6 +345,102 @@ fn check_aligned(what: &'static str, value: u64) -> Result<()> {
         return Err(AddressSpaceError::Unaligned { what, value });
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct HostWriteWatch {
+    va: u64,
+    len: u64,
+}
+
+fn trace_host_write(region: &Region, va: u64, off: usize, buf: &[u8]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    static WATCH: OnceLock<Option<HostWriteWatch>> = OnceLock::new();
+    static HITS: AtomicU64 = AtomicU64::new(0);
+
+    let Some(watch) = *WATCH.get_or_init(parse_host_write_watch) else {
+        return;
+    };
+    let write_end = va.saturating_add(buf.len() as u64);
+    let watch_end = watch.va.saturating_add(watch.len);
+    if va >= watch_end || write_end <= watch.va {
+        return;
+    }
+    let hit = HITS.fetch_add(1, Ordering::Relaxed);
+    let cap = std::env::var("NEXIUM_HOST_WRITE_WATCH_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(64);
+    if hit >= cap {
+        return;
+    }
+    let overlap_start = va.max(watch.va);
+    let overlap_end = write_end.min(watch_end);
+    let src_off = (overlap_start - va) as usize;
+    let n = (overlap_end - overlap_start).min(128) as usize;
+    let incoming = &buf[src_off..src_off + n];
+    let old_off = off + src_off;
+    let old = unsafe { std::slice::from_raw_parts(region.buf.as_ptr().add(old_off), n) };
+    log::warn!(
+        "[host-write-watch] #{} va={:#x} len={:#x} overlap={:#x}..{:#x} region={} old={} new={} floats={}",
+        hit + 1,
+        va,
+        buf.len(),
+        overlap_start,
+        overlap_end,
+        region.name,
+        hex_preview(old),
+        hex_preview(incoming),
+        float_preview(incoming)
+    );
+    if std::env::var("NEXIUM_HOST_WRITE_BACKTRACE").is_ok() {
+        log::warn!(
+            "[host-write-watch] backtrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+}
+
+fn parse_host_write_watch() -> Option<HostWriteWatch> {
+    let spec = std::env::var("NEXIUM_HOST_WRITE_WATCH")
+        .ok()
+        .or_else(|| std::env::var("NEXIUM_WATCH_WRITE_CPU").ok())?;
+    let (va, len) = spec.trim().split_once(':')?;
+    let va = parse_u64ish(va.trim())?;
+    let len = parse_u64ish(len.trim()).unwrap_or(0x80);
+    (va != 0 && len != 0).then_some(HostWriteWatch { va, len })
+}
+
+fn parse_u64ish(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>()
+            .ok()
+            .or_else(|| u64::from_str_radix(s, 16).ok())
+    }
+}
+
+fn hex_preview(buf: &[u8]) -> String {
+    buf.iter()
+        .take(64)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn float_preview(buf: &[u8]) -> String {
+    buf.chunks_exact(4)
+        .take(16)
+        .map(|c| {
+            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            format!("{:.3}", v)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn align_request(base: u64, size: u64) -> (u64, u64) {
