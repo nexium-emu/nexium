@@ -385,6 +385,10 @@ pub fn fset_bop(insn: u64) -> u64 {
     bits(insn, 45, 46)
 }
 #[inline]
+pub fn fset_bf(insn: u64) -> bool {
+    bits(insn, 52, 52) != 0
+}
+#[inline]
 pub fn fset_src_pred(insn: u64) -> u8 {
     bits(insn, 39, 41) as u8
 }

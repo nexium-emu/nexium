@@ -8,8 +8,8 @@ use super::operand::{
     csetp_flow_test, csetp_neg_bop_pred, decoded_pred, f2f_mods, f2i_rounding, f2i_signed,
     fadd32i_mods,
     fadd_mods, ffma32i_mods, ffma_mods, float_imm20, fmnmx_mods, fmnmx_neg_pred, fmnmx_pred,
-    fmul32i_mods, fmul_mods, fset_abs_a, fset_abs_b, fset_bop, fset_cmp, fset_neg_a, fset_neg_b,
-    fset_src_pred, fset_src_pred_inv, fsetp_abs_a, fsetp_abs_b, fsetp_bop, fsetp_cmp,
+    fmul32i_mods, fmul_mods, fset_abs_a, fset_abs_b, fset_bf, fset_bop, fset_cmp, fset_neg_a,
+    fset_neg_b, fset_src_pred, fset_src_pred_inv, fsetp_abs_a, fsetp_abs_b, fsetp_bop, fsetp_cmp,
     fsetp_dest_np, fsetp_dest_p, fsetp_neg_a, fsetp_neg_b, fsetp_src_pred, fsetp_src_pred_inv,
     i2f_abs, i2f_int_format, i2f_neg, i2f_selector, i2f_signed, iadd3_half_a, iadd3_half_b,
     iadd3_half_c, iadd3_neg_a, iadd3_neg_b, iadd3_neg_c, iadd3_shift, iadd_neg_a, iadd_neg_b,
@@ -153,6 +153,7 @@ impl Translator {
                 abs_a: fset_abs_a(raw),
                 neg_b: fset_neg_b(raw),
                 abs_b: fset_abs_b(raw),
+                bf: fset_bf(raw),
                 src_pred: fset_src_pred(raw),
                 src_pred_inv: fset_src_pred_inv(raw),
             },
@@ -1083,7 +1084,42 @@ impl Translator {
                 }
             }
 
-            Opcode::TEXS | Opcode::TLDS | Opcode::TLD4S => {
+            Opcode::TLD4S => {
+                let dest_a = reg_dest(raw);
+                let dest_b = ((raw >> 28) & 0xFF) as u8;
+                let ra = reg_a(raw);
+                let rb = reg_b(raw);
+                let tex_id = texs_tex_id(raw);
+                let gather_component = ((raw >> 52) & 0x3) as u8;
+                let aoffi = ((raw >> 51) & 0x1) != 0;
+                let dc = ((raw >> 50) & 0x1) != 0;
+                let (u, v) = if aoffi || dc {
+                    (self.read_reg(ra), self.read_reg(ra.wrapping_add(1)))
+                } else {
+                    (self.read_reg(ra), self.read_reg(rb))
+                };
+                for lane in 0..4u8 {
+                    let dst_reg = match lane {
+                        0 => dest_a,
+                        1 => dest_a.wrapping_add(1),
+                        2 => dest_b,
+                        _ => dest_b.wrapping_add(1),
+                    };
+                    self.write_reg(
+                        dst_reg,
+                        Op::GatherTex {
+                            tex_id,
+                            u,
+                            v,
+                            gather_component,
+                            lane,
+                        },
+                        pred,
+                    );
+                }
+            }
+
+            Opcode::TEXS | Opcode::TLDS => {
                 let dest_a = reg_dest(raw);
                 let dest_b = ((raw >> 28) & 0xFF) as u8;
                 let ra = reg_a(raw);

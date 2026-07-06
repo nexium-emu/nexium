@@ -306,6 +306,14 @@ pub enum Op {
         component: u8,
     },
 
+    GatherTex {
+        tex_id: u32,
+        u: Value,
+        v: Value,
+        gather_component: u8,
+        lane: u8,
+    },
+
     FSetPred {
         cmp: FComp,
         bop: BoolOp,
@@ -347,6 +355,7 @@ pub enum Op {
         abs_a: bool,
         neg_b: bool,
         abs_b: bool,
+        bf: bool,
         src_pred: u8,
         src_pred_inv: bool,
     },
@@ -658,6 +667,20 @@ impl Inst {
                         .unwrap_or("?")
                 )
             }
+            Op::GatherTex {
+                tex_id,
+                u,
+                v,
+                gather_component,
+                lane,
+            } => write!(
+                f,
+                "TexGather t[{tex_id:#x}], ({u}, {v}).{}[{lane}]",
+                ["r", "g", "b", "a"]
+                    .get(*gather_component as usize)
+                    .copied()
+                    .unwrap_or("?")
+            ),
             Op::Phi { sources } => {
                 write!(f, "Phi   ")?;
                 for (i, (bid, v)) in sources.iter().enumerate() {

@@ -123,6 +123,7 @@ struct AttrVar {
     var: Word,
     ptr_f32: Word,
     is_uint: bool,
+    is_sint: bool,
 }
 
 impl Emitter {
@@ -443,11 +444,15 @@ impl Emitter {
         if let Some(&v) = self.frag_color_vars.get(&location) {
             return v;
         }
+        let attachment_location = self.fragment_output_attachment_location(location);
         let v = self
             .b
             .variable(self.ptr_output_vec4, None, StorageClass::Output, None);
-        self.b
-            .decorate(v, Decoration::Location, [Operand::LiteralBit32(location)]);
+        self.b.decorate(
+            v,
+            Decoration::Location,
+            [Operand::LiteralBit32(attachment_location)],
+        );
         self.interface.push(v);
         self.frag_color_vars.insert(location, v);
         v
@@ -481,7 +486,22 @@ impl Emitter {
 
     fn fragment_output_locations(&self) -> Vec<u32> {
         let count = self.fragment_color_outputs.max(1).min(8);
-        (0..count).collect()
+        if self.fragment_output_map == 0 {
+            return (0..count).collect();
+        }
+        (0..8)
+            .filter(|location| self.fragment_output_mask(*location) != 0)
+            .take(count as usize)
+            .collect()
+    }
+
+    fn fragment_output_attachment_location(&self, location: u32) -> u32 {
+        if self.fragment_output_map == 0 {
+            return location;
+        }
+        (0..location)
+            .filter(|rt| self.fragment_output_mask(*rt) != 0)
+            .count() as u32
     }
 
     fn fragment_output_reg_base(&self, location: u32) -> u8 {
@@ -537,6 +557,29 @@ impl Emitter {
                 .composite_extract(self.f32_t, None, value, [component])
                 .unwrap();
             self.b.store(ptr, c, None, []).unwrap();
+        }
+    }
+
+    fn apply_fragment_output_debug_overrides(&mut self, outputs: &mut [(u32, Word)]) {
+        let Some(loc) = std::env::var("NEXIUM_FS_FORCE_OUTPUT_LOC")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        else {
+            return;
+        };
+        let value = std::env::var("NEXIUM_FS_FORCE_OUTPUT_VALUE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        let v = self.const_f32(value.to_bits());
+        let forced = self
+            .b
+            .composite_construct(self.vec4_t, None, [v, v, v, v])
+            .unwrap();
+        for (out_loc, out) in outputs {
+            if *out_loc == loc {
+                *out = forced;
+            }
         }
     }
 
@@ -601,12 +644,15 @@ impl Emitter {
                 var: 0,
                 ptr_f32: self.ptr_input_f32,
                 is_uint: false,
+                is_sint: false,
             };
             self.input_vars.insert(slot, av);
             return av;
         }
         let is_uint = matches!(self.stage, Stage::Vertex)
-            && (self.vertex_opts.int_attr_mask >> location) & 1 == 1;
+            && (self.vertex_opts.uint_attr_mask >> location) & 1 == 1;
+        let is_sint = matches!(self.stage, Stage::Vertex)
+            && (self.vertex_opts.sint_attr_mask >> location) & 1 == 1;
         let av = if is_uint {
             let uvec4_t = self.b.type_vector(self.u32_t, 4);
             let ptr_uvec4 = self.b.type_pointer(None, StorageClass::Input, uvec4_t);
@@ -618,6 +664,20 @@ impl Emitter {
                 var,
                 ptr_f32: ptr_u32,
                 is_uint: true,
+                is_sint: false,
+            }
+        } else if is_sint {
+            let ivec4_t = self.b.type_vector(self.i32_t, 4);
+            let ptr_ivec4 = self.b.type_pointer(None, StorageClass::Input, ivec4_t);
+            let ptr_i32 = self.b.type_pointer(None, StorageClass::Input, self.i32_t);
+            let var = self.b.variable(ptr_ivec4, None, StorageClass::Input, None);
+            self.b
+                .decorate(var, Decoration::Location, [Operand::LiteralBit32(location)]);
+            AttrVar {
+                var,
+                ptr_f32: ptr_i32,
+                is_uint: false,
+                is_sint: true,
             }
         } else {
             let var = self
@@ -630,6 +690,7 @@ impl Emitter {
                 var,
                 ptr_f32: self.ptr_input_f32,
                 is_uint: false,
+                is_sint: false,
             }
         };
         self.input_vars.insert(slot, av);
@@ -684,6 +745,7 @@ impl Emitter {
                 var: 0,
                 ptr_f32: self.ptr_output_f32,
                 is_uint: false,
+                is_sint: false,
             };
             self.output_vars.insert(slot, av);
             return av;
@@ -697,6 +759,7 @@ impl Emitter {
             var,
             ptr_f32: self.ptr_output_f32,
             is_uint: false,
+            is_sint: false,
         };
         self.output_vars.insert(slot, av);
         self.interface.push(var);
@@ -911,6 +974,9 @@ impl Emitter {
         if av.is_uint {
             let raw = self.b.load(self.u32_t, None, ac, None, []).unwrap();
             self.b.bitcast(self.f32_t, None, raw).unwrap()
+        } else if av.is_sint {
+            let raw = self.b.load(self.i32_t, None, ac, None, []).unwrap();
+            self.b.bitcast(self.f32_t, None, raw).unwrap()
         } else {
             self.b.load(self.f32_t, None, ac, None, []).unwrap()
         }
@@ -1105,9 +1171,8 @@ impl Emitter {
             IrOp::FMul { a, b, mods } => {
                 let av = self.lower_value(a);
                 let bv = self.lower_value(b);
-                let av = self.apply_neg_abs(av, mods.neg_a, mods.abs_a);
+                let mut av = self.apply_neg_abs(av, mods.neg_a, mods.abs_a);
                 let bv = self.apply_neg_abs(bv, mods.neg_b, mods.abs_b);
-                let mut r = self.b.f_mul(self.f32_t, None, av, bv).unwrap();
                 if mods.scale != 0 {
                     let factor: f32 = match mods.scale {
                         1 => 0.5,
@@ -1118,18 +1183,10 @@ impl Emitter {
                         6 => 2.0,
                         _ => 1.0,
                     };
-                    static FMUL_SCALE_LOG: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    if FMUL_SCALE_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
-                        log::warn!(
-                            "[fmul-scale] applying field={} factor={}",
-                            mods.scale,
-                            factor
-                        );
-                    }
                     let fc = self.const_f32(factor.to_bits());
-                    r = self.b.f_mul(self.f32_t, None, r, fc).unwrap();
+                    av = self.b.f_mul(self.f32_t, None, av, fc).unwrap();
                 }
+                let r = self.b.f_mul(self.f32_t, None, av, bv).unwrap();
                 Some(self.apply_sat(r, mods.sat))
             }
             IrOp::FAdd { a, b, mods } => {
@@ -1659,6 +1716,87 @@ impl Emitter {
                     Some(c)
                 }
             }
+            IrOp::GatherTex {
+                tex_id,
+                u,
+                v,
+                gather_component,
+                lane,
+            } => {
+                self.texs_ids_used.insert(*tex_id);
+                let tex_slot = self
+                    .texture_slots
+                    .get(tex_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(MAX_TEXTURE_DESCRIPTORS - 1);
+                let uv0 = self.lower_value(u);
+                let mut uv1 = self.lower_value(v);
+                if matches!(self.stage, Stage::Fragment)
+                    && self.tex_v_flip_slots.contains(&tex_slot)
+                {
+                    uv1 = self.b.f_sub(self.f32_t, None, self.f32_one, uv1).unwrap();
+                }
+                let coords = if self.sampler_arrayed {
+                    self.b
+                        .composite_construct(self.vec3_t, None, [uv0, uv1, self.f32_zero])
+                        .unwrap()
+                } else {
+                    self.b
+                        .composite_construct(self.vec2_t, None, [uv0, uv1])
+                        .unwrap()
+                };
+                if matches!(self.stage, Stage::Fragment)
+                    && self.texcoord_debug_slot == Some(tex_slot)
+                    && self.sample_debug_value.is_none()
+                {
+                    self.sample_debug_value = Some(
+                        self.b
+                            .composite_construct(
+                                self.vec4_t,
+                                None,
+                                [uv0, uv1, self.f32_zero, self.f32_one],
+                            )
+                            .unwrap(),
+                    );
+                }
+                let (img_var, samp_var) = self.sampler_at(*tex_id);
+                let image_t = if self.sampler_arrayed {
+                    self.image_arrayed_t
+                } else {
+                    self.image_t
+                };
+                let sampled_image_t = if self.sampler_arrayed {
+                    self.sampled_image_arrayed_t
+                } else {
+                    self.sampled_image_t
+                };
+                let img = self.b.load(image_t, None, img_var, None, []).unwrap();
+                let samp = self
+                    .b
+                    .load(self.sampler_t, None, samp_var, None, [])
+                    .unwrap();
+                let sampled_img = self
+                    .b
+                    .sampled_image(sampled_image_t, None, img, samp)
+                    .unwrap();
+                let component = self.const_u32((*gather_component).min(3) as u32);
+                let gathered = self
+                    .b
+                    .image_gather(self.vec4_t, None, sampled_img, coords, component, None, [])
+                    .unwrap();
+                if matches!(self.stage, Stage::Fragment)
+                    && self.sample_debug_slot == Some(tex_slot)
+                    && self.sample_debug_value.is_none()
+                {
+                    self.sample_debug_value = Some(gathered);
+                }
+                Some(
+                    self.b
+                        .composite_extract(self.f32_t, None, gathered, [(*lane).min(3) as u32])
+                        .unwrap_or(self.f32_zero),
+                )
+            }
             IrOp::FSetPred {
                 cmp,
                 bop,
@@ -2084,6 +2222,7 @@ impl Emitter {
                 abs_a,
                 neg_b,
                 abs_b,
+                bf,
                 src_pred,
                 src_pred_inv,
             } => {
@@ -2107,13 +2246,23 @@ impl Emitter {
                         .logical_not_equal(self.bool_t, None, cmp_result, src_p_word)
                         .unwrap(),
                 };
-                let one = self.f32_one;
-                let zero = self.f32_zero;
-                Some(
-                    self.b
-                        .select(self.f32_t, None, combined, one, zero)
-                        .unwrap(),
-                )
+                if *bf {
+                    let one = self.f32_one;
+                    let zero = self.f32_zero;
+                    Some(
+                        self.b
+                            .select(self.f32_t, None, combined, one, zero)
+                            .unwrap(),
+                    )
+                } else {
+                    let one_mask = self.const_u32(u32::MAX);
+                    let zero_mask = self.const_u32(0);
+                    let bits = self
+                        .b
+                        .select(self.u32_t, None, combined, one_mask, zero_mask)
+                        .unwrap();
+                    Some(self.b.bitcast(self.f32_t, None, bits).unwrap())
+                }
             }
             IrOp::ISetPred {
                 cmp,
@@ -2781,6 +2930,7 @@ impl Emitter {
                                 *out = sample;
                             }
                         }
+                        self.apply_fragment_output_debug_overrides(&mut outputs);
                         for (loc, v) in outputs {
                             self.store_fragment_output_vec(loc, v);
                         }
@@ -2867,9 +3017,9 @@ impl Emitter {
     ) {
         if matches!(self.stage, Stage::Vertex) {
             for (_loc, av) in required_outputs {
-                let o = self.f32_one;
-                for c in 0..4 {
-                    self.write_attr_component(*av, c, o);
+                let defaults = [self.f32_zero, self.f32_zero, self.f32_zero, self.f32_one];
+                for (c, value) in defaults.into_iter().enumerate() {
+                    self.write_attr_component(*av, c as u32, value);
                 }
             }
         }
@@ -2927,6 +3077,10 @@ impl Emitter {
                         needs_3d_sampler |= volume.is_some();
                         tex_ids.insert(*tex_id);
                     }
+                    IrOp::GatherTex { tex_id, .. } => {
+                        needs_sampler = true;
+                        tex_ids.insert(*tex_id);
+                    }
                     _ => {}
                 }
             }
@@ -2951,13 +3105,12 @@ impl Emitter {
                 self.no_kil_shader = tex_ids.contains(&id);
             }
             self.texture_slots.clear();
-            for (slot, tex_id) in tex_ids
-                .iter()
-                .copied()
-                .take(MAX_TEXTURE_DESCRIPTORS as usize)
-                .enumerate()
-            {
-                self.texture_slots.insert(tex_id, slot as u32);
+            let tex_slot_base = self.vertex_opts.tex_slot_base;
+            let tex_budget =
+                (MAX_TEXTURE_DESCRIPTORS as usize).saturating_sub(tex_slot_base as usize);
+            for (slot, tex_id) in tex_ids.iter().copied().take(tex_budget).enumerate() {
+                self.texture_slots
+                    .insert(tex_id, slot as u32 + tex_slot_base);
             }
             self.ensure_sampler_array();
             if needs_3d_sampler {
@@ -3288,6 +3441,7 @@ impl Emitter {
                             *v = self.b.f_mul(self.vec4_t, None, *v, two_vec).unwrap();
                         }
                     }
+                    self.apply_fragment_output_debug_overrides(&mut outputs);
                     for (loc, v) in outputs {
                         self.store_fragment_output_vec(loc, v);
                     }
@@ -3618,7 +3772,9 @@ pub struct VertexOptions {
     pub point_size: Option<f32>,
     pub window_ndc: Option<(f32, f32)>,
     pub num_ssbo: u32,
-    pub int_attr_mask: u32,
+    pub uint_attr_mask: u32,
+    pub sint_attr_mask: u32,
+    pub tex_slot_base: u32,
 }
 
 impl Default for VertexOptions {
@@ -3631,7 +3787,9 @@ impl Default for VertexOptions {
             point_size: None,
             window_ndc: None,
             num_ssbo: 0,
-            int_attr_mask: 0,
+            uint_attr_mask: 0,
+            sint_attr_mask: 0,
+            tex_slot_base: 0,
         }
     }
 }
