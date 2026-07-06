@@ -236,6 +236,10 @@ impl Nvdrv {
         log::debug!("nvdrv:Close fd={}", fd);
     }
 
+    pub fn device_for_fd(&self, fd: u32) -> Option<NvDevice> {
+        self.files.get(&fd).map(|f| f.device)
+    }
+
     pub fn dispatch_ioctl(&mut self, req: IoctlRequest) -> IoctlOutcome {
         self.dispatch_ioctl_with_mem(req, &|_, _| false, &|_, _| false)
     }

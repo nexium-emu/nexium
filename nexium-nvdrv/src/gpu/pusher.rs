@@ -5,7 +5,8 @@ use super::engines::{
 };
 use super::GpuMappings;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, OnceLock};
+use std::time::Duration;
 
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
@@ -69,6 +70,15 @@ const NON_PULLER_METHODS: u32 = 0x40;
 
 static GPU_SEM_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+fn ordered_gpu_sync_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_RELAXED_GPU_SYNC")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
+
 #[derive(Default)]
 struct DmaState {
     method: u32,
@@ -92,6 +102,10 @@ pub struct Pusher {
     state: DmaState,
     puller: PullerState,
     entries_logged: u32,
+    active_entry_gpu_va: u64,
+    active_entry_cpu_va: u64,
+    active_word_index: usize,
+    active_header: u32,
     pub renderer: Option<Arc<nexium_gpu::Renderer>>,
     vk_batch: Vec<nexium_gpu::draw::Maxwell3dDrawCall>,
 }
@@ -104,6 +118,10 @@ impl Pusher {
             state: DmaState::default(),
             puller: PullerState::default(),
             entries_logged: 0,
+            active_entry_gpu_va: 0,
+            active_entry_cpu_va: 0,
+            active_word_index: 0,
+            active_header: 0,
             renderer: None,
             vk_batch: Vec::new(),
         }
@@ -125,6 +143,32 @@ impl Pusher {
             super::vk_dispatch::flush_accum(&mut self.vk_batch, &r, mappings, mem_read);
         } else {
             self.vk_batch.clear();
+        }
+    }
+
+    fn sync_renderer_idle(&self, reason: &str) {
+        if !ordered_gpu_sync_enabled() {
+            return;
+        }
+        let Some(renderer) = self.renderer.clone() else {
+            return;
+        };
+        if let Some(rt) = crate::render_thread::maybe_render_thread() {
+            let (tx, rx) = mpsc::sync_channel(1);
+            let r = renderer.clone();
+            let job = Box::new(move || {
+                r.wait_idle();
+                let _ = tx.send(());
+            }) as crate::render_thread::RenderJob;
+            if !rt.submit_timeout(job, Duration::from_secs(3)) {
+                log::warn!("[gpu-sync] {} render thread submit timeout", reason);
+                return;
+            }
+            if rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                log::warn!("[gpu-sync] {} render thread idle timeout", reason);
+            }
+        } else {
+            renderer.wait_idle();
         }
     }
 
@@ -244,6 +288,8 @@ impl Pusher {
             ]));
         }
 
+        self.active_entry_gpu_va = address;
+        self.active_entry_cpu_va = cpu_addr;
         self.process_commands(
             &words,
             mappings,
@@ -256,6 +302,10 @@ impl Pusher {
             mem_read,
             mem_write,
         );
+        self.active_entry_gpu_va = 0;
+        self.active_entry_cpu_va = 0;
+        self.active_word_index = 0;
+        self.active_header = 0;
     }
 
     fn process_commands(
@@ -277,6 +327,7 @@ impl Pusher {
             let header = commands[i];
 
             if self.state.method_count > 0 {
+                self.active_word_index = i;
                 self.dispatch_method(
                     header,
                     mappings,
@@ -305,6 +356,8 @@ impl Pusher {
             let subchannel = (header >> 13) & 0x7;
             let arg_count = (header >> 16) & 0x1FFF;
             let mode_bits = (header >> 29) & 0x7;
+            self.active_word_index = i;
+            self.active_header = header;
             let Some(mode) = Mode::from_bits(mode_bits) else {
                 log::trace!(
                     "pusher: unknown mode {} in header {:#010x}",
@@ -334,6 +387,7 @@ impl Pusher {
                 }
                 Mode::Inline => {
                     self.state.method_count = 0;
+                    self.active_word_index = i;
                     self.dispatch_method(
                         arg_count,
                         mappings,
@@ -400,21 +454,32 @@ impl Pusher {
                 let writes = std::mem::take(&mut maxwell.regs.pending_constbuf_writes);
                 for (gpu_va, dword) in writes {
                     if let Some(cpu) = mappings.cpu_address_for(gpu_va) {
+                        self.trace_constbuf_upload(maxwell, gpu_va, cpu, dword);
                         mem_write(cpu, &dword.to_le_bytes());
                     }
                 }
             }
             if !maxwell.regs.pending_semaphore_writes.is_empty() {
                 self.flush_vk(mappings, mem_read);
+                self.sync_renderer_idle("report-semaphore");
                 let writes = std::mem::take(&mut maxwell.regs.pending_semaphore_writes);
-                for (gpu_va, payload) in writes {
+                for (gpu_va, payload, long) in writes {
                     if let Some(cpu) = mappings.cpu_address_for(gpu_va) {
-                        let ok = mem_write(cpu, &payload.to_le_bytes());
+                        let ok = if long {
+                            let ts = GPU_SEM_TICK.fetch_add(1, Ordering::Relaxed);
+                            let mut buf = [0u8; 16];
+                            buf[0..8].copy_from_slice(&(payload as u64).to_le_bytes());
+                            buf[8..16].copy_from_slice(&ts.to_le_bytes());
+                            mem_write(cpu, &buf)
+                        } else {
+                            mem_write(cpu, &payload.to_le_bytes())
+                        };
                         log::trace!(
-                            "pusher: fence release gpu_va={:#x} cpu={:#x} payload={:#x} write_ok={}",
+                            "pusher: fence release gpu_va={:#x} cpu={:#x} payload={:#x} long={} write_ok={}",
                             gpu_va,
                             cpu,
                             payload,
+                            long,
                             ok
                         );
                         stats.fence_releases.fetch_add(1, Ordering::Relaxed);
@@ -442,6 +507,25 @@ impl Pusher {
                     );
                 } else {
                     sw_renderer::execute_draws(&draws, mappings, maxwell_dma, mem_read, mem_write);
+                }
+            }
+            let barrier_flushes = std::mem::take(&mut maxwell.regs.pending_barrier_flushes);
+            let texture_invalidates =
+                std::mem::take(&mut maxwell.regs.pending_texture_cache_invalidates);
+            if barrier_flushes != 0 || texture_invalidates != 0 {
+                self.flush_vk(mappings, mem_read);
+                self.sync_renderer_idle("maxwell-barrier");
+                if texture_invalidates != 0 {
+                    if let Some(r) = self.renderer.clone() {
+                        r.clear_texture_cache();
+                    }
+                }
+                if std::env::var_os("NEXIUM_MW3D_SYNC_DBG").is_some() {
+                    log::warn!(
+                        "[gpu-sync] maxwell barriers={} texture_invalidates={}",
+                        barrier_flushes,
+                        texture_invalidates
+                    );
                 }
             }
         } else if bound_class == MAXWELL_DMA_CLASS {
@@ -606,6 +690,56 @@ impl Pusher {
                 payload
             );
         }
+    }
+
+    fn trace_constbuf_upload(&self, maxwell: &Maxwell3D, gpu_va: u64, cpu: u64, dword: u32) {
+        let Some((watch_va, watch_len)) = constbuf_upload_watch() else {
+            return;
+        };
+        if gpu_va >= watch_va.saturating_add(watch_len) || gpu_va.saturating_add(4) <= watch_va {
+            return;
+        }
+        let cb_addr = ((maxwell.regs.constbuf_selector_addr_hi as u64) << 32)
+            | maxwell.regs.constbuf_selector_addr_lo as u64;
+        log::warn!(
+            "[cbuf-upload] entry_gpu={:#x} entry_cpu={:#x} word={} header={:#010x} subch={} method={:#x} target={:#x} cpu={:#x} cb={:#x} size={:#x} off={:#x} dword={:#010x} float={:.6}",
+            self.active_entry_gpu_va,
+            self.active_entry_cpu_va,
+            self.active_word_index,
+            self.active_header,
+            self.state.subchannel,
+            self.state.method,
+            gpu_va,
+            cpu,
+            cb_addr,
+            maxwell.regs.constbuf_selector_size,
+            gpu_va.saturating_sub(cb_addr),
+            dword,
+            f32::from_bits(dword)
+        );
+    }
+}
+
+fn constbuf_upload_watch() -> Option<(u64, u64)> {
+    use std::sync::OnceLock;
+    static WATCH: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *WATCH.get_or_init(|| {
+        let spec = std::env::var("NEXIUM_CBUF_UPLOAD_WATCH").ok()?;
+        let (va, len) = spec.trim().split_once(':')?;
+        let va = parse_u64ish(va.trim())?;
+        let len = parse_u64ish(len.trim()).unwrap_or(4);
+        (va != 0 && len != 0).then_some((va, len))
+    })
+}
+
+fn parse_u64ish(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>()
+            .ok()
+            .or_else(|| u64::from_str_radix(s, 16).ok())
     }
 }
 

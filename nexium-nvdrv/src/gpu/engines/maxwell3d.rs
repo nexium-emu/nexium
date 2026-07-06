@@ -261,7 +261,17 @@ pub struct Maxwell3DRegisters {
     pub constbuf_load_offset: u32,
 
     pub pending_constbuf_writes: Vec<(u64, u32)>,
-    pub pending_semaphore_writes: Vec<(u64, u32)>,
+    pub pending_semaphore_writes: Vec<(u64, u32, bool)>,
+    pub pending_barrier_flushes: u32,
+    pub pending_texture_cache_invalidates: u32,
+    pub sync_info: u32,
+    pub clear_report_value: u32,
+    pub zpass_pixel_count_enable: bool,
+
+    pub render_enable_addr_hi: u32,
+    pub render_enable_addr_lo: u32,
+    pub render_enable_mode: u32,
+    pub render_enable_override: u32,
 
     pub last_constbuf_addr: u64,
     pub last_constbuf_size: u32,
@@ -359,6 +369,15 @@ impl Default for Maxwell3DRegisters {
             constbuf_load_offset: 0,
             pending_constbuf_writes: Vec::new(),
             pending_semaphore_writes: Vec::new(),
+            pending_barrier_flushes: 0,
+            pending_texture_cache_invalidates: 0,
+            sync_info: 0,
+            clear_report_value: 0,
+            zpass_pixel_count_enable: false,
+            render_enable_addr_hi: 0,
+            render_enable_addr_lo: 0,
+            render_enable_mode: 1,
+            render_enable_override: 0,
             last_constbuf_addr: 0,
             last_constbuf_size: 0,
             cbuf_binds: [[(0, 0); 16]; 5],
@@ -411,6 +430,10 @@ pub struct DrawCall {
     pub fs_bindless_cb_size: u32,
 
     pub fs_shader_gpu_va: u64,
+
+    pub render_enable_addr: u64,
+    pub render_enable_mode: u32,
+    pub render_enable_override: u32,
 
     pub cull_test_enable: bool,
     pub cull_face: u32,
@@ -465,6 +488,27 @@ const REG_LOAD_MME_INSTRUCTION_PTR: u32 = 0x45;
 const REG_LOAD_MME_INSTRUCTION: u32 = 0x46;
 const REG_LOAD_MME_START_ADDRESS_PTR: u32 = 0x47;
 const REG_LOAD_MME_START_ADDRESS: u32 = 0x48;
+
+fn trace_sync_method(method: u32, arg: u32, pending: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("NEXIUM_MW3D_SYNC_DBG").is_some()) {
+        return;
+    }
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 256 {
+        log::warn!(
+            "[mw3d-sync] #{} method={:#x} arg={:#x} pending={}",
+            n + 1,
+            method,
+            arg,
+            pending
+        );
+    }
+}
 
 impl Maxwell3D {
     pub fn new() -> Self {
@@ -630,6 +674,28 @@ impl Maxwell3D {
         }
 
         match method {
+            0x44 | 0x378 | 0x3df | 0x47d => {
+                self.regs.pending_barrier_flushes =
+                    self.regs.pending_barrier_flushes.saturating_add(1);
+                trace_sync_method(method, arg, self.regs.pending_barrier_flushes);
+            }
+            0xb2 => {
+                self.regs.sync_info = arg;
+                self.regs.pending_barrier_flushes =
+                    self.regs.pending_barrier_flushes.saturating_add(1);
+                trace_sync_method(method, arg, self.regs.pending_barrier_flushes);
+            }
+            0x3dd => {
+                self.regs.pending_barrier_flushes =
+                    self.regs.pending_barrier_flushes.saturating_add(1);
+                self.regs.pending_texture_cache_invalidates = self
+                    .regs
+                    .pending_texture_cache_invalidates
+                    .saturating_add(1);
+                trace_sync_method(method, arg, self.regs.pending_barrier_flushes);
+            }
+            0x545 => self.regs.zpass_pixel_count_enable = (arg & 1) != 0,
+            0x54c => self.regs.clear_report_value = arg,
             0x8c4 => {
                 if 0xD00 < self.reg_file.len() {
                     self.reg_file[0xD00] = 1;
@@ -655,7 +721,10 @@ impl Maxwell3D {
                     }
                 }
                 if operation == 0 || operation == 2 {
-                    self.regs.pending_semaphore_writes.push((gpu_va, payload));
+                    let long = ((arg >> 28) & 1) == 0;
+                    self.regs
+                        .pending_semaphore_writes
+                        .push((gpu_va, payload, long));
                 }
             }
             0x360..=0x363 => {
@@ -681,6 +750,10 @@ impl Maxwell3D {
                 self.regs.scissor.max_y = arg >> 16;
             }
             0x43E => self.regs.clear_control = arg,
+            0x554 => self.regs.render_enable_addr_hi = arg,
+            0x555 => self.regs.render_enable_addr_lo = arg,
+            0x556 => self.regs.render_enable_mode = arg,
+            0x651 => self.regs.render_enable_override = arg,
             0x420 => self.regs.draw_texture_dst_x = arg,
             0x421 => self.regs.draw_texture_dst_y = arg,
             0x422 => self.regs.draw_texture_dst_width = arg,
@@ -751,6 +824,10 @@ impl Maxwell3D {
                             0
                         }
                     },
+                    render_enable_addr: ((self.regs.render_enable_addr_hi as u64) << 32)
+                        | self.regs.render_enable_addr_lo as u64,
+                    render_enable_mode: self.regs.render_enable_mode,
+                    render_enable_override: self.regs.render_enable_override,
                     cull_test_enable: self.regs.cull_test_enable,
                     cull_face: self.regs.cull_face,
                     front_face: self.regs.front_face,
@@ -919,7 +996,7 @@ impl Maxwell3D {
                 self.regs.last_constbuf_size = self.regs.constbuf_selector_size;
             }
             0x8E3 => self.regs.constbuf_load_offset = arg,
-            0x8E4 => {
+            0x8E4..=0x8F3 => {
                 let cb_addr = ((self.regs.constbuf_selector_addr_hi as u64) << 32)
                     | self.regs.constbuf_selector_addr_lo as u64;
                 if cb_addr != 0 {
@@ -1141,6 +1218,10 @@ impl Maxwell3D {
             fs_bindless_cb_addr,
             fs_bindless_cb_size,
             fs_shader_gpu_va,
+            render_enable_addr: ((self.regs.render_enable_addr_hi as u64) << 32)
+                | self.regs.render_enable_addr_lo as u64,
+            render_enable_mode: self.regs.render_enable_mode,
+            render_enable_override: self.regs.render_enable_override,
             cull_test_enable: self.regs.cull_test_enable,
             cull_face: self.regs.cull_face,
             front_face: self.regs.front_face,
@@ -1264,6 +1345,10 @@ impl Maxwell3D {
                     0
                 }
             },
+            render_enable_addr: ((self.regs.render_enable_addr_hi as u64) << 32)
+                | self.regs.render_enable_addr_lo as u64,
+            render_enable_mode: self.regs.render_enable_mode,
+            render_enable_override: self.regs.render_enable_override,
             cull_test_enable: self.regs.cull_test_enable,
             cull_face: self.regs.cull_face,
             front_face: self.regs.front_face,
