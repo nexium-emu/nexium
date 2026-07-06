@@ -100,6 +100,14 @@ pub fn enqueue_draws(
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
 ) {
     for draw in draws {
+        if !draw.is_clear {
+            if render_enable_needs_ordered_read(draw) {
+                flush_accum(batch, renderer, mappings, mem_read);
+            }
+            if !render_enabled(draw, mappings, mem_read) {
+                continue;
+            }
+        }
         if draw.draw_texture.is_some() {
             flush_accum(batch, renderer, mappings, mem_read);
             match prepare_draw_texture_job(draw, mappings, mem_read) {
@@ -163,6 +171,81 @@ pub fn enqueue_draws(
                 );
             }
         }
+    }
+}
+
+fn render_enable_needs_ordered_read(draw: &DrawCall) -> bool {
+    draw.render_enable_override == 0 && matches!(draw.render_enable_mode, 2 | 3 | 4)
+}
+
+fn render_enabled(
+    draw: &DrawCall,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> bool {
+    let enabled = match draw.render_enable_override {
+        1 => true,
+        2 => false,
+        _ => match draw.render_enable_mode {
+            0 => false,
+            1 => true,
+            2 | 3 | 4 => {
+                let Some(cpu) = mappings.cpu_address_for(draw.render_enable_addr) else {
+                    log_render_enable_miss(draw, "unmapped");
+                    return true;
+                };
+                let mut b = [0u8; 24];
+                if !mem_read(cpu, &mut b) {
+                    log_render_enable_miss(draw, "read-failed");
+                    return true;
+                }
+                let initial_sequence = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                let initial_mode = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                let current_sequence = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
+                let current_mode = u32::from_le_bytes([b[20], b[21], b[22], b[23]]);
+                match draw.render_enable_mode {
+                    2 => initial_sequence != 0 && initial_mode != 0,
+                    3 => initial_sequence == current_sequence && initial_mode == current_mode,
+                    4 => initial_sequence != current_sequence || initial_mode != current_mode,
+                    _ => true,
+                }
+            }
+            _ => {
+                log_render_enable_miss(draw, "unknown-mode");
+                true
+            }
+        },
+    };
+    if !enabled {
+        log_render_enable_skip(draw);
+    }
+    enabled
+}
+
+fn log_render_enable_miss(draw: &DrawCall, reason: &str) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+        log::debug!(
+            "[render-enable] {} addr={:#x} mode={} override={} fs={:#x}",
+            reason,
+            draw.render_enable_addr,
+            draw.render_enable_mode,
+            draw.render_enable_override,
+            draw.fs_shader_gpu_va
+        );
+    }
+}
+
+fn log_render_enable_skip(draw: &DrawCall) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+        log::debug!(
+            "[render-enable] skip addr={:#x} mode={} override={} fs={:#x}",
+            draw.render_enable_addr,
+            draw.render_enable_mode,
+            draw.render_enable_override,
+            draw.fs_shader_gpu_va
+        );
     }
 }
 
@@ -731,7 +814,7 @@ struct ShaderBundle {
 #[allow(clippy::type_complexity)]
 fn shader_bundle_cache() -> &'static std::sync::Mutex<
     std::collections::HashMap<
-        (u64, u64, u32, u32, u32, u32, u32, u32, u32),
+        (u64, u64, u32, u32, u32, u32, u32, u32, u32, u32),
         std::sync::Arc<ShaderBundle>,
     >,
 > {
@@ -739,7 +822,7 @@ fn shader_bundle_cache() -> &'static std::sync::Mutex<
     static CACHE: OnceLock<
         std::sync::Mutex<
             std::collections::HashMap<
-                (u64, u64, u32, u32, u32, u32, u32, u32, u32),
+                (u64, u64, u32, u32, u32, u32, u32, u32, u32, u32),
                 std::sync::Arc<ShaderBundle>,
             >,
         >,
@@ -748,11 +831,13 @@ fn shader_bundle_cache() -> &'static std::sync::Mutex<
 }
 
 fn shader_failed_set() -> &'static std::sync::Mutex<
-    std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32)>,
+    std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32, u32)>,
 > {
     use std::sync::OnceLock;
     static FAILED: OnceLock<
-        std::sync::Mutex<std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32)>>,
+        std::sync::Mutex<
+            std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32, u32)>,
+        >,
     > = OnceLock::new();
     FAILED.get_or_init(|| {
         // Silence the default panic hook for shader-emit panics we catch_unwind,
@@ -809,6 +894,7 @@ pub fn guest_probe(mappings: &GpuMappings, mem_read: &dyn Fn(u64, &mut [u8]) -> 
     static CFG: OnceLock<Vec<(u64, usize)>> = OnceLock::new();
     static LAST: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
     static ARMED: OnceLock<()> = OnceLock::new();
+    static SNAPSHOT_TARGET: OnceLock<Option<Option<u64>>> = OnceLock::new();
     if let Ok(spec) = std::env::var("NEXIUM_WATCH_WRITE_GPU") {
         if ARMED.get().is_none() {
             if let Some((va, len)) = spec.trim().split_once(':') {
@@ -817,16 +903,28 @@ pub fn guest_probe(mappings: &GpuMappings, mem_read: &dyn Fn(u64, &mut [u8]) -> 
                     u64::from_str_radix(len.trim().trim_start_matches("0x"), 16).unwrap_or(0x60);
                 if va != 0 {
                     if let Some(cpu) = mappings.cpu_address_for(va) {
-                        if nexium_memory::fastmem::watch_arm(cpu, len) {
+                        let armed = if std::env::var("NEXIUM_WATCH_PAGE_PROTECT")
+                            .ok()
+                            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                            .unwrap_or(false)
+                        {
+                            nexium_memory::fastmem::watch_arm(cpu, len)
+                        } else {
+                            nexium_memory::fastmem::watch_mark(cpu, len)
+                        };
+                        if armed {
                             let _ = ARMED.set(());
                             log::warn!(
                                 "[watch-write] ARMED gpu_va={:#x} cpu_va={:#x} len={:#x}",
-                                va, cpu, len
+                                va,
+                                cpu,
+                                len
                             );
                         } else {
                             log::warn!(
                                 "[watch-write] arm FAILED gpu_va={:#x} cpu_va={:#x}",
-                                va, cpu
+                                va,
+                                cpu
                             );
                             let _ = ARMED.set(());
                         }
@@ -843,12 +941,9 @@ pub fn guest_probe(mappings: &GpuMappings, mem_read: &dyn Fn(u64, &mut [u8]) -> 
                         let (va, len) = part.trim().split_once(':')?;
                         let va =
                             u64::from_str_radix(va.trim().trim_start_matches("0x"), 16).ok()?;
-                        let len = usize::from_str_radix(
-                            len.trim().trim_start_matches("0x"),
-                            16,
-                        )
-                        .ok()?
-                        .min(256);
+                        let len = usize::from_str_radix(len.trim().trim_start_matches("0x"), 16)
+                            .ok()?
+                            .min(256);
                         Some((va, len))
                     })
                     .collect()
@@ -858,6 +953,19 @@ pub fn guest_probe(mappings: &GpuMappings, mem_read: &dyn Fn(u64, &mut [u8]) -> 
     if cfg.is_empty() {
         return;
     }
+    let snapshot_target = SNAPSHOT_TARGET.get_or_init(|| {
+        let spec = std::env::var("NEXIUM_GUEST_PROBE_THREAD_SNAPSHOT").ok()?;
+        let spec = spec.trim();
+        if spec.is_empty()
+            || spec == "1"
+            || spec.eq_ignore_ascii_case("true")
+            || spec.eq_ignore_ascii_case("all")
+        {
+            return Some(None);
+        }
+        let va = u64::from_str_radix(spec.trim_start_matches("0x"), 16).ok()?;
+        Some(Some(va))
+    });
     let last = LAST.get_or_init(|| Mutex::new(vec![Vec::new(); cfg.len()]));
     let mut last = last.lock().unwrap();
     for (i, (va, len)) in cfg.iter().enumerate() {
@@ -882,6 +990,14 @@ pub fn guest_probe(mappings: &GpuMappings, mem_read: &dyn Fn(u64, &mut [u8]) -> 
                 len,
                 floats.join(",")
             );
+            let snapshot_match = match *snapshot_target {
+                Some(Some(target_va)) => target_va == *va,
+                Some(None) => true,
+                None => false,
+            };
+            if buf.iter().any(|b| *b != 0) && snapshot_match {
+                nexium_memory::fastmem::mark_guest_probe_event(*va);
+            }
             last[i] = buf;
         }
     }
@@ -978,7 +1094,7 @@ fn execute_one(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Result<Option<Maxwell3dDrawCall>, String> {
     let rt_slot = if draw.is_clear {
-        0
+        ((draw.clear_mask >> 6) & 0xF).min(7) as usize
     } else {
         draw_color_rt_slot(draw)
     };
@@ -997,13 +1113,7 @@ fn execute_one(
         rt_gpu_va,
         mappings.cpu_address_for(rt_gpu_va).unwrap_or(0),
     );
-    let mut rt_format = map_rt_format_for_key(rt.format, rt_key);
-    let color_rts = active_color_rts(draw, mappings, rt_key, rt_format);
-    let color_rt_keys = color_rts.iter().map(|(key, _)| *key).collect::<Vec<_>>();
-    let mut color_rt_formats = color_rts
-        .iter()
-        .map(|(_, format)| *format)
-        .collect::<Vec<_>>();
+    let rt_format = map_rt_format_for_key(rt.format, rt_key);
     if !draw.is_clear && (rt.width as u64) * (rt.height as u64) <= 16384 && {
         static SKIP: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
         let skip = SKIP.get_or_init(|| {
@@ -1044,6 +1154,7 @@ fn execute_one(
             op_seq,
             nvmap_id,
             rt,
+            rt_gpu_va,
             clear_scissor,
             color,
             want_color_clear,
@@ -1112,17 +1223,6 @@ fn execute_one(
 
     let vs_addr = program_region.wrapping_add(vs_prog.address_lo as u64);
     let fs_addr = program_region.wrapping_add(fs_prog.address_lo as u64);
-    if rt16_raw_a2_producer_fs(fs_addr) {
-        if rt_key.nvmap_id == 16 && rt.format == 0xD1 {
-            rt_format = map_rt_format(rt.format);
-        }
-        for (key, format) in color_rt_keys.iter().zip(color_rt_formats.iter_mut()) {
-            if key.nvmap_id == 16 && *format == vk::Format::R8G8B8A8_UNORM {
-                *format = vk::Format::A2B10G10R10_UNORM_PACK32;
-            }
-        }
-    }
-
     let (vptx_scale_z, vptx_translate_z) =
         if draw.viewport.scale_z != 0.0 || draw.viewport.translate_z != 0.0 {
             (draw.viewport.scale_z, draw.viewport.translate_z)
@@ -1165,22 +1265,35 @@ fn execute_one(
     } else {
         0
     };
-    let mut int_attr_mask: u32 = 0;
+    let mut uint_attr_mask: u32 = 0;
+    let mut sint_attr_mask: u32 = 0;
     for (loc, attrib) in draw.vertex_attribs.iter().enumerate() {
         if attrib.format == 0 || attrib.constant || loc >= 32 {
             continue;
         }
-        let size = attrib.format & 0x3F;
         let type_ = attrib.format >> 6;
-        let is_int = type_ == 3 || type_ == 4;
-        let is_32bit = matches!(size, 0x01 | 0x02 | 0x04 | 0x12);
-        if is_int && !is_32bit {
-            int_attr_mask |= 1 << loc;
+        if type_ == 3 {
+            sint_attr_mask |= 1 << loc;
+        } else if type_ == 4 {
+            uint_attr_mask |= 1 << loc;
         }
     }
     let fs_sph = fetch_sph(fs_addr, mappings, mem_read);
     let fs_input_map = fs_sph.map(ps_generic_input_map).unwrap_or([0; 32]);
     let fs_output_map = fs_sph.map(ps_output_map).unwrap_or(0);
+    let color_rts = active_color_rts(draw, mappings, rt_key, rt_format, fs_output_map);
+    let color_rt_locations = color_rts
+        .iter()
+        .map(|(location, _, _)| *location)
+        .collect::<Vec<_>>();
+    let color_rt_keys = color_rts
+        .iter()
+        .map(|(_, key, _)| *key)
+        .collect::<Vec<_>>();
+    let color_rt_formats = color_rts
+        .iter()
+        .map(|(_, _, format)| *format)
+        .collect::<Vec<_>>();
     let color_output_count = (color_rt_formats.len() as u32).clamp(1, 8);
     if std::env::var_os("NEXIUM_SHADER_MAP_DBG").is_some() {
         use std::collections::HashSet;
@@ -1229,7 +1342,8 @@ fn execute_one(
         vptx_translate_z.to_bits(),
         ps_key,
         win_key,
-        int_attr_mask,
+        uint_attr_mask,
+        sint_attr_mask,
         color_output_count,
         fs_output_map,
     );
@@ -1351,9 +1465,41 @@ fn execute_one(
                 );
             }
 
-            if let Ok(want) = std::env::var("NEXIUM_DUMP_FS") {
-                let want_addr = u64::from_str_radix(want.trim_start_matches("0x"), 16).ok();
-                if want_addr == Some(fs_addr) {
+            let vs_tex_base: u32 = {
+                let vs_walked = nexium_shader::extract_fs_tex_ids(vs_sass.as_slice(), 15);
+                let mut vs_tex_ids: Vec<u32> = Vec::new();
+                let mut vs_bindless = 0usize;
+                for id in vs_walked {
+                    match id {
+                        nexium_shader::FsTexId::ImmediateTic(idx) => {
+                            if !vs_tex_ids.contains(&idx) {
+                                vs_tex_ids.push(idx);
+                            }
+                        }
+                        nexium_shader::FsTexId::BindlessCbufOffset(_) => vs_bindless += 1,
+                    }
+                }
+                if !vs_tex_ids.is_empty() || vs_bindless != 0 {
+                    log::warn!(
+                        "[vs-tex] vs={:#x} fs={:#x} vs_imm={:?} vs_bindless={} fs_tex_ids={:?}",
+                        vs_addr, fs_addr, vs_tex_ids, vs_bindless, fs_tex_ids
+                    );
+                }
+                if std::env::var_os("NEXIUM_VS_TEX").is_some() && !vs_tex_ids.is_empty() {
+                    let base = fs_tex_ids.len() as u32;
+                    vs_tex_ids.sort_unstable();
+                    for id in &vs_tex_ids {
+                        fs_tex_ids.push(*id);
+                    }
+                    base
+                } else {
+                    0
+                }
+            };
+
+            {
+                let want_addrs = parse_env_u64_list("NEXIUM_DUMP_FS");
+                if want_addrs.contains(&fs_addr) {
                     let fs_dis = nexium_shader::disassemble(&fs_sass)
                         .into_iter()
                         .map(|line| line.to_string_compact())
@@ -1365,9 +1511,9 @@ fn execute_one(
                     );
                 }
             }
-            if let Ok(want) = std::env::var("NEXIUM_DUMP_VS") {
-                let want_addr = u64::from_str_radix(want.trim_start_matches("0x"), 16).ok();
-                if want_addr == Some(vs_addr) {
+            {
+                let want_addrs = parse_env_u64_list("NEXIUM_DUMP_VS");
+                if want_addrs.contains(&vs_addr) {
                     let vs_dis = nexium_shader::disassemble(&vs_sass)
                         .into_iter()
                         .map(|line| line.to_string_compact())
@@ -1404,7 +1550,9 @@ fn execute_one(
                             },
                             window_ndc,
                             num_ssbo,
-                            int_attr_mask,
+                            uint_attr_mask,
+                            sint_attr_mask,
+                            tex_slot_base: vs_tex_base,
                             ..Default::default()
                         },
                     )
@@ -1901,6 +2049,25 @@ fn execute_one(
         (fallback_cbuf_addr, fallback_cbuf_size)
     };
 
+    trace_grade_discover(
+        draw,
+        rt_key,
+        &color_rt_keys,
+        &color_rt_formats,
+        vs_addr,
+        fs_addr,
+        fs_output_map,
+        &fs_input_map,
+        vs_cbuf_mask,
+        fs_cbuf_mask,
+        &maxwell.regs.cbuf_binds,
+        mappings,
+        mem_read,
+        &fs_tex_ids,
+        &sampled_rt_slots,
+        &bundle.fs_cbuf_reads,
+    );
+
     let (out_index_data, out_index_count, out_index_type, eff_vertex_count) =
         if draw.indexed && draw.index_count > 0 && draw.index_gpu_va != 0 {
             let isz: usize = match draw.index_format {
@@ -1997,7 +2164,7 @@ fn execute_one(
         };
     let is_indexed = out_index_count.is_some();
 
-    let attachments = std::array::from_fn(|rt| {
+    let attachments: [BlendAttachmentState; 8] = std::array::from_fn(|rt| {
         let (
             blend_raw_src,
             blend_raw_dst,
@@ -2041,16 +2208,20 @@ fn execute_one(
             color_write_mask: map_color_write_mask(maxwell.regs.color_masks[mask_rt]) & shader_mask,
         }
     });
+    let compact_attachments: [BlendAttachmentState; 8] = std::array::from_fn(|index| {
+        let location = color_rt_locations.get(index).copied().unwrap_or(index).min(7);
+        attachments[location]
+    });
     let blend_state = BlendState {
-        enabled: attachments[0].enabled,
-        src_factor: attachments[0].src_factor,
-        dst_factor: attachments[0].dst_factor,
-        op: attachments[0].op,
-        src_alpha_factor: attachments[0].src_alpha_factor,
-        dst_alpha_factor: attachments[0].dst_alpha_factor,
-        alpha_op: attachments[0].alpha_op,
-        color_write_mask: attachments[0].color_write_mask,
-        attachments,
+        enabled: compact_attachments[0].enabled,
+        src_factor: compact_attachments[0].src_factor,
+        dst_factor: compact_attachments[0].dst_factor,
+        op: compact_attachments[0].op,
+        src_alpha_factor: compact_attachments[0].src_alpha_factor,
+        dst_alpha_factor: compact_attachments[0].dst_alpha_factor,
+        alpha_op: compact_attachments[0].alpha_op,
+        color_write_mask: compact_attachments[0].color_write_mask,
+        attachments: compact_attachments,
     };
 
     trace_menu_draw(
@@ -2089,6 +2260,7 @@ fn execute_one(
         nvmap_id,
         rt,
         &color_rt_keys,
+        &color_rt_locations,
         vertex_addr,
         eff_vertex_count,
         out_index_count.unwrap_or(0),
@@ -2116,6 +2288,20 @@ fn execute_one(
         fs_cbuf_mask,
         &maxwell.regs.cbuf_binds,
         cbuf_data.as_deref(),
+        &bundle.fs_cbuf_reads,
+    );
+    trace_cbuf_watch(
+        draw,
+        nvmap_id,
+        rt_key,
+        vs_addr,
+        fs_addr,
+        vs_cbuf_mask,
+        fs_cbuf_mask,
+        &maxwell.regs.cbuf_binds,
+        cbuf_data.as_deref(),
+        &fs_tex_ids,
+        &sampled_rt_slots,
         &bundle.fs_cbuf_reads,
     );
 
@@ -2271,8 +2457,13 @@ fn execute_one(
         color_rt_keys,
         color_rt_formats,
         rt_format,
-        vp_rect: guest_viewport_rect(draw, rt.width as f32, rt.height as f32),
-        scissor: None,
+        vp_rect: guest_viewport_rect(
+            draw,
+            rt.width as f32,
+            rt.height as f32,
+            signed_viewport_nvmap(rt_key.nvmap_id),
+        ),
+        scissor: scissor_rect(draw, rt.width, rt.height),
         state: DrawState {
             topology,
             vertex_count: eff_vertex_count,
@@ -2310,6 +2501,7 @@ fn execute_one(
         poly_offset_units: draw.poly_offset_units,
         poly_offset_factor: draw.poly_offset_factor,
         ssbo_data,
+        flip_y: draw.window_origin.flip_y(),
     };
 
     Ok(Some(call))
@@ -2388,26 +2580,34 @@ fn active_color_rts(
     mappings: &GpuMappings,
     fallback_key: RtKey,
     fallback_format: vk::Format,
-) -> Vec<(RtKey, vk::Format)> {
+    output_map: u32,
+) -> Vec<(usize, RtKey, vk::Format)> {
     let count = (draw.rt_control & 0xf).min(8) as usize;
     let mut keys = Vec::new();
     if count != 0 {
-        for index in 0..count {
+        for index in active_fragment_output_locations(count, output_map) {
             let slot = rt_control_target(draw.rt_control, index);
             if let Some((key, format)) = draw.rt.get(slot).and_then(|rt| {
                 rt_key_for_target(rt, mappings)
                     .map(|key| (key, map_rt_format_for_key(rt.format, key)))
             }) {
-                if !keys.iter().any(|(existing, _)| *existing == key) {
-                    keys.push((key, format));
-                }
+                keys.push((index, key, format));
             }
         }
     }
     if keys.is_empty() {
-        keys.push((fallback_key, fallback_format));
+        keys.push((0, fallback_key, fallback_format));
     }
     keys
+}
+
+fn active_fragment_output_locations(count: usize, output_map: u32) -> Vec<usize> {
+    if output_map == 0 {
+        return (0..count).collect();
+    }
+    (0..count)
+        .filter(|index| fragment_output_mask(output_map, *index as u32) != 0)
+        .collect()
 }
 
 fn draw_color_rt_slot(draw: &DrawCall) -> usize {
@@ -2469,16 +2669,8 @@ fn map_rt_format(format: u32) -> vk::Format {
     }
 }
 
-fn map_rt_format_for_key(format: u32, key: RtKey) -> vk::Format {
-    if format == 0xD1 && matches!(key.nvmap_id, 7 | 16) {
-        vk::Format::R8G8B8A8_UNORM
-    } else {
-        map_rt_format(format)
-    }
-}
-
-fn rt16_raw_a2_producer_fs(fs_addr: u64) -> bool {
-    matches!(fs_addr, 0x405df5a30 | 0x405df1c30)
+fn map_rt_format_for_key(format: u32, _key: RtKey) -> vk::Format {
+    map_rt_format(format)
 }
 
 fn menu_draw_dbg_color_only() -> bool {
@@ -3082,7 +3274,12 @@ fn trace_menu_draw(
     let pos = position_bounds(layout, mappings, mem_read, vertex_addr, vertex_count)
         .unwrap_or_else(|| "n/a".to_string());
     let attr = vertex_attr_sample(layout, mappings, mem_read, vertex_addr, vertex_count);
-    let vp = guest_viewport_rect(draw, rt.width as f32, rt.height as f32);
+    let vp = guest_viewport_rect(
+        draw,
+        rt.width as f32,
+        rt.height as f32,
+        signed_viewport_nvmap(nvmap_id),
+    );
     let clip = draw.surface_clip.effective(rt.width, rt.height);
     let mut tex = Vec::new();
     for (slot, tex_id) in fs_tex_ids.iter().enumerate() {
@@ -3237,7 +3434,12 @@ fn menu_cbuf_sample(cbuf_data: Option<&[u8]>, cbuf_binds: &[[(u64, u32); 16]; 5]
     format!("s3({:#x}/{}) [{}]", addr, size, vals.join(" "))
 }
 
-fn guest_viewport_rect(draw: &DrawCall, rt_w: f32, rt_h: f32) -> Option<[f32; 4]> {
+fn guest_viewport_rect(
+    draw: &DrawCall,
+    rt_w: f32,
+    rt_h: f32,
+    force_signed: bool,
+) -> Option<[f32; 4]> {
     if !draw.viewport_transform_en {
         let clip = draw.surface_clip.effective(rt_w as u32, rt_h as u32);
         let x = clip.x as f32;
@@ -3252,9 +3454,18 @@ fn guest_viewport_rect(draw: &DrawCall, rt_w: f32, rt_h: f32) -> Option<[f32; 4]
         }
         return Some([x, y, w, h]);
     }
-    let sx = draw.viewport.scale_x.abs();
-    let sy = draw.viewport.scale_y.abs();
-    if sx <= 0.0 || sy <= 0.0 {
+    let signed = force_signed || signed_viewport_rect();
+    let sx = if signed {
+        draw.viewport.scale_x
+    } else {
+        draw.viewport.scale_x.abs()
+    };
+    let sy = if signed {
+        draw.viewport.scale_y
+    } else {
+        draw.viewport.scale_y.abs()
+    };
+    if sx == 0.0 || sy == 0.0 {
         return None;
     }
     let x = draw.viewport.translate_x - sx;
@@ -3272,7 +3483,8 @@ fn guest_viewport_rect(draw: &DrawCall, rt_w: f32, rt_h: f32) -> Option<[f32; 4]
     }
     let min_y = y.min(y + h);
     let max_y = y.max(y + h);
-    if !draw.window_origin.lower_left()
+    if (!signed || (w > 0.0 && h > 0.0))
+        && !draw.window_origin.lower_left()
         && !draw.viewport.y_negate()
         && x <= 0.5
         && min_y <= 0.5
@@ -3281,10 +3493,23 @@ fn guest_viewport_rect(draw: &DrawCall, rt_w: f32, rt_h: f32) -> Option<[f32; 4]
     {
         return None;
     }
-    if w < 1.0 || h.abs() < 1.0 || !x.is_finite() || !y.is_finite() {
+    if w.abs() < 1.0 || h.abs() < 1.0 || !x.is_finite() || !y.is_finite() {
         return None;
     }
     Some([x, y, w, h])
+}
+
+fn signed_viewport_rect() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_UNSIGNED_VIEWPORT").is_none())
+}
+
+fn signed_viewport_nvmap(nvmap_id: u32) -> bool {
+    use std::sync::OnceLock;
+    static IDS: OnceLock<Vec<u64>> = OnceLock::new();
+    IDS.get_or_init(|| parse_env_u64_list("NEXIUM_SIGNED_VIEWPORT_NVMAPS"))
+        .contains(&(nvmap_id as u64))
 }
 
 fn scissor_rect(draw: &DrawCall, rt_w: u32, rt_h: u32) -> Option<[i32; 4]> {
@@ -3467,25 +3692,26 @@ struct DrawTraceConfig {
 fn draw_trace_config() -> DrawTraceConfig {
     use std::sync::OnceLock;
     static CONFIG: OnceLock<DrawTraceConfig> = OnceLock::new();
-    CONFIG.get_or_init(|| DrawTraceConfig {
-        enabled: std::env::var_os("NEXIUM_DRAW_TRACE").is_some(),
-        start: std::env::var("NEXIUM_DRAW_TRACE_START")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
-        end: std::env::var("NEXIUM_DRAW_TRACE_END")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(u64::MAX),
-        fs: parse_env_u64_list("NEXIUM_DRAW_TRACE_FS"),
-        rt: parse_env_u64_list("NEXIUM_DRAW_TRACE_RT")
-            .into_iter()
-            .map(|v| v as u32)
-            .collect(),
-        rt_va: parse_env_u64_list("NEXIUM_DRAW_TRACE_RT_VA"),
-        sampled_rt_only: std::env::var_os("NEXIUM_DRAW_TRACE_SAMPLED_RT").is_some(),
-    })
-    .clone()
+    CONFIG
+        .get_or_init(|| DrawTraceConfig {
+            enabled: std::env::var_os("NEXIUM_DRAW_TRACE").is_some(),
+            start: std::env::var("NEXIUM_DRAW_TRACE_START")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            end: std::env::var("NEXIUM_DRAW_TRACE_END")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u64::MAX),
+            fs: parse_env_u64_list("NEXIUM_DRAW_TRACE_FS"),
+            rt: parse_env_u64_list("NEXIUM_DRAW_TRACE_RT")
+                .into_iter()
+                .map(|v| v as u32)
+                .collect(),
+            rt_va: parse_env_u64_list("NEXIUM_DRAW_TRACE_RT_VA"),
+            sampled_rt_only: std::env::var_os("NEXIUM_DRAW_TRACE_SAMPLED_RT").is_some(),
+        })
+        .clone()
 }
 
 fn parse_env_u64_list(name: &str) -> Vec<u64> {
@@ -3499,6 +3725,163 @@ fn parse_env_u64_list(name: &str) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+fn trace_grade_discover(
+    draw: &DrawCall,
+    fallback_key: RtKey,
+    color_rt_keys: &[RtKey],
+    color_rt_formats: &[vk::Format],
+    vs_addr: u64,
+    fs_addr: u64,
+    fs_output_map: u32,
+    fs_input_map: &[u8; 32],
+    vs_cbuf_mask: u32,
+    fs_cbuf_mask: u32,
+    cbuf_binds: &[[(u64, u32); 16]; 5],
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    fs_tex_ids: &[u32],
+    sampled_rt_slots: &[Option<RtKey>],
+    fs_cbuf_reads: &[(u32, u32)],
+) {
+    if std::env::var_os("NEXIUM_GRADE_DISCOVER").is_none() {
+        return;
+    }
+    let keys = if color_rt_keys.is_empty() {
+        std::slice::from_ref(&fallback_key)
+    } else {
+        color_rt_keys
+    };
+    let tiny = keys
+        .iter()
+        .any(|key| key.height <= 64 || key.width <= 128 || key.width.saturating_mul(key.height) <= 0x4000);
+    if !tiny {
+        return;
+    }
+    let slot19_offset = 0x120usize;
+    let slot19_len = 0x60usize;
+    let (slot19_addr, slot19_size) = cbuf_bind_for_slot(cbuf_binds, 19);
+    let slot19_bytes = if slot19_addr != 0 && slot19_size as usize > slot19_offset {
+        let len = slot19_len.min(slot19_size as usize - slot19_offset);
+        mappings
+            .cpu_address_for(slot19_addr.wrapping_add(slot19_offset as u64))
+            .and_then(|cpu| {
+                let mut bytes = vec![0u8; len];
+                mem_read(cpu, &mut bytes).then_some(bytes)
+            })
+    } else {
+        None
+    };
+    let hash_bytes = |bytes: &[u8]| -> u64 {
+        bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
+            (h ^ (*b as u64)).wrapping_mul(0x100000001b3)
+        })
+    };
+    let key_hash = keys.iter().fold(0xcbf29ce484222325u64, |h, key| {
+        let h = (h ^ key.nvmap_id as u64).wrapping_mul(0x100000001b3);
+        let h = (h ^ key.width as u64).wrapping_mul(0x100000001b3);
+        let h = (h ^ key.height as u64).wrapping_mul(0x100000001b3);
+        (h ^ key.gpu_va).wrapping_mul(0x100000001b3)
+    });
+    let slot19_hash = slot19_bytes.as_deref().map(hash_bytes).unwrap_or(0);
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<(u64, u64, u32, u32, u64, u64)>>> = OnceLock::new();
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    let seen_key = (
+        vs_addr,
+        fs_addr,
+        draw.rt_control,
+        fs_output_map,
+        key_hash,
+        slot19_hash,
+    );
+    let first = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut seen| seen.insert(seen_key))
+        .unwrap_or(true);
+    if !first {
+        return;
+    }
+    let hit = HITS.fetch_add(1, Ordering::Relaxed);
+    let cap = std::env::var("NEXIUM_GRADE_DISCOVER_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(256);
+    if hit >= cap {
+        return;
+    }
+    let rts = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let format = color_rt_formats
+                .get(index)
+                .map(|format| format!("{:?}", format))
+                .unwrap_or_else(|| "?".to_string());
+            format!("{}:{} fmt={}", index, key.label(), format)
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let imap = fs_input_map
+        .iter()
+        .map(|v| format!("{:02x}", v))
+        .collect::<Vec<_>>()
+        .join("");
+    let slot19 = match slot19_bytes.as_deref() {
+        Some(bytes) => format!(
+            "floats=[{}] raw={}",
+            cbuf_watch_float_preview(bytes),
+            cbuf_watch_hex_preview(bytes)
+        ),
+        None if slot19_addr == 0 || slot19_size == 0 => "unbound".to_string(),
+        None => "unreadable".to_string(),
+    };
+    let reads = fs_cbuf_reads
+        .iter()
+        .filter_map(|(slot, offset)| (*slot == 19).then(|| format!("{:#x}", offset)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let fs_binds = (16..32u32)
+        .filter_map(|slot| {
+            let (addr, size) = cbuf_bind_for_slot(cbuf_binds, slot);
+            (addr != 0 && size != 0).then(|| format!("{}={:#x}/{}", slot, addr, size))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sampled = sampled_rt_slots
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, key)| key.map(|key| format!("s{}={}", slot, key.label())))
+        .collect::<Vec<_>>()
+        .join(",");
+    let tics = tic_trace_summary(draw, fs_tex_ids, mappings, mem_read);
+    log::warn!(
+        "[grade-discover] #{} vs={:#x} fs={:#x} rtctl={:#x} omap={:#010x} imap={} masks={:#x}/{:#x} active19={} slot19={:#x}/{} {} rts=[{}] tex={:?} sampled=[{}] reads19=[{}] fs_binds=[{}] tics=[{}] topo={} v={}",
+        hit,
+        vs_addr,
+        fs_addr,
+        draw.rt_control,
+        fs_output_map,
+        imap,
+        vs_cbuf_mask,
+        fs_cbuf_mask,
+        ((vs_cbuf_mask | fs_cbuf_mask) & (1u32 << 19)) != 0,
+        slot19_addr,
+        slot19_size,
+        slot19,
+        rts,
+        fs_tex_ids,
+        sampled,
+        reads,
+        fs_binds,
+        tics,
+        draw.topology,
+        draw.vertex_count,
+    );
+}
+
 fn trace_draw(
     draw: &DrawCall,
     layout: &VertexLayout,
@@ -3507,6 +3890,7 @@ fn trace_draw(
     nvmap_id: u32,
     rt: &RenderTarget,
     color_rt_keys: &[RtKey],
+    color_rt_locations: &[usize],
     vertex_addr: u64,
     vertex_count: u32,
     index_count: u32,
@@ -3565,7 +3949,12 @@ fn trace_draw(
     }
     let pos = position_bounds(layout, mappings, mem_read, vertex_addr, vertex_count);
     let attr = vertex_attr_sample(layout, mappings, mem_read, vertex_addr, vertex_count);
-    let vp = guest_viewport_rect(draw, rt.width as f32, rt.height as f32);
+    let vp = guest_viewport_rect(
+        draw,
+        rt.width as f32,
+        rt.height as f32,
+        signed_viewport_nvmap(nvmap_id),
+    );
     let clip = draw.surface_clip.effective(rt.width, rt.height);
     let cbuf_full = std::env::var_os("NEXIUM_DRAW_TRACE_CBUF_FULL").is_some();
     let cbuf =
@@ -3668,9 +4057,10 @@ fn trace_draw(
         .iter()
         .enumerate()
         .map(|(index, key)| {
-            let slot = rt_control_target(draw.rt_control, index);
-            let mask_index = if color_mask_common { 0 } else { index.min(7) };
-            let shader_mask = fragment_output_mask(fs_output_map, index as u32);
+            let location = color_rt_locations.get(index).copied().unwrap_or(index);
+            let slot = rt_control_target(draw.rt_control, location);
+            let mask_index = if color_mask_common { 0 } else { location.min(7) };
+            let shader_mask = fragment_output_mask(fs_output_map, location as u32);
             let maxwell_mask = color_masks[mask_index];
             let final_mask = blend.attachments[index.min(7)].color_write_mask.as_raw();
             let format = color_rt_formats
@@ -3678,8 +4068,9 @@ fn trace_draw(
                 .map(|format| format!("{:?}", format))
                 .unwrap_or_else(|| "?".to_string());
             format!(
-                "{}:slot{} {} fmt={} omap={:x} cmask={:#x} final={:#x} blend={}",
+                "{}:loc{} slot{} {} fmt={} omap={:x} cmask={:#x} final={:#x} blend={}",
                 index,
+                location,
                 slot,
                 key.label(),
                 format,
@@ -3763,6 +4154,7 @@ fn trace_clear(
     op_seq: u64,
     nvmap_id: u32,
     rt: &RenderTarget,
+    rt_gpu_va: u64,
     clear_scissor: Option<[i32; 4]>,
     color: [f32; 4],
     want_color_clear: bool,
@@ -3773,10 +4165,11 @@ fn trace_clear(
     }
     let clip = draw.surface_clip.effective(rt.width, rt.height);
     log::warn!(
-        "[cleartrace] op={} rt={} {}x{} mask={:#x} color={} depth={} clear_depth={:.6} \
+        "[cleartrace] op={} rt={} va={:#x} {}x{} mask={:#x} color={} depth={} clear_depth={:.6} \
          ctrl={:#x} scissor_en={} rect={:?} clip=({},{} {}x{}) origin={:#x} ll={} fy={} zeta={}",
         op_seq,
         nvmap_id,
+        rt_gpu_va,
         rt.width,
         rt.height,
         draw.clear_mask,
@@ -3899,6 +4292,205 @@ fn cbuf_sample(
     } else {
         format!("cbuf_sample={}", slots.join(" "))
     }
+}
+
+#[derive(Clone, Copy)]
+struct CbufWatchRegion {
+    slot: usize,
+    offset: usize,
+    len: usize,
+}
+
+fn cbuf_watch_regions() -> Option<&'static [CbufWatchRegion]> {
+    use std::sync::OnceLock;
+    static REGIONS: OnceLock<Option<Vec<CbufWatchRegion>>> = OnceLock::new();
+    REGIONS
+        .get_or_init(|| {
+            let spec = std::env::var("NEXIUM_CBUF_WATCH").ok()?;
+            let spec = spec.trim();
+            if spec.is_empty() || spec == "0" || spec.eq_ignore_ascii_case("false") {
+                return None;
+            }
+            if spec == "1"
+                || spec.eq_ignore_ascii_case("true")
+                || spec.eq_ignore_ascii_case("grade")
+            {
+                return Some(vec![CbufWatchRegion {
+                    slot: 19,
+                    offset: 0x120,
+                    len: 0x60,
+                }]);
+            }
+            let regions = spec
+                .split(',')
+                .filter_map(|part| {
+                    let mut fields = part.trim().split(':');
+                    let slot = parse_env_u64(fields.next()?)? as usize;
+                    let offset = parse_env_u64(fields.next().unwrap_or("0"))? as usize;
+                    let len = fields
+                        .next()
+                        .and_then(parse_env_u64)
+                        .unwrap_or(0x40)
+                        .min(0x800) as usize;
+                    (slot < PACKED_CBUF_SLOTS && len != 0).then_some(CbufWatchRegion {
+                        slot,
+                        offset,
+                        len,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!regions.is_empty()).then_some(regions)
+        })
+        .as_deref()
+}
+
+fn trace_cbuf_watch(
+    draw: &DrawCall,
+    nvmap_id: u32,
+    rt_key: RtKey,
+    vs_addr: u64,
+    fs_addr: u64,
+    vs_cbuf_mask: u32,
+    fs_cbuf_mask: u32,
+    cbuf_binds: &[[(u64, u32); 16]; 5],
+    cbuf_data: Option<&[u8]>,
+    fs_tex_ids: &[u32],
+    sampled_rt_slots: &[Option<RtKey>],
+    fs_cbuf_reads: &[(u32, u32)],
+) {
+    let Some(regions) = cbuf_watch_regions() else {
+        return;
+    };
+    let Some(data) = cbuf_data else {
+        return;
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<(u64, usize, usize, usize, u64)>>> = OnceLock::new();
+    static LAST: OnceLock<Mutex<HashMap<(usize, usize, usize, u64), Vec<u8>>>> = OnceLock::new();
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    let cap = std::env::var("NEXIUM_CBUF_WATCH_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(512);
+    let fs_filter = parse_env_u64_list("NEXIUM_CBUF_WATCH_FS");
+    if !fs_filter.is_empty() && !fs_filter.contains(&fs_addr) {
+        return;
+    }
+    let bind_filter = parse_env_u64_list("NEXIUM_CBUF_WATCH_BIND");
+    let include_inactive = std::env::var_os("NEXIUM_CBUF_WATCH_INACTIVE").is_some();
+    let used_mask = vs_cbuf_mask | fs_cbuf_mask;
+    for region in regions {
+        let active = (used_mask & (1u32 << region.slot)) != 0;
+        if !active && !include_inactive {
+            continue;
+        }
+        let off = region.slot * PACKED_CBUF_SLOT_SIZE + region.offset;
+        if off >= data.len() {
+            continue;
+        }
+        let (addr, size) = cbuf_bind_for_slot(cbuf_binds, region.slot as u32);
+        let bind_len = size as usize;
+        if bind_len <= region.offset {
+            continue;
+        }
+        let len = region
+            .len
+            .min(data.len() - off)
+            .min(bind_len - region.offset);
+        if len == 0 {
+            continue;
+        }
+        let bytes = data[off..off + len].to_vec();
+        if !bind_filter.is_empty() && !bind_filter.contains(&addr) {
+            continue;
+        }
+        let seen_key = (fs_addr, region.slot, region.offset, len, addr);
+        let value_key = (region.slot, region.offset, len, addr);
+        let first = {
+            let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+            seen.lock().map(|mut seen| seen.insert(seen_key)).unwrap_or(false)
+        };
+        let changed = {
+            let last = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+            match last.lock() {
+                Ok(mut last) => {
+                    let changed = last.get(&value_key).map(|old| old != &bytes).unwrap_or(true);
+                    if changed {
+                        last.insert(value_key, bytes.clone());
+                    }
+                    changed
+                }
+                Err(_) => true,
+            }
+        };
+        if !first && !changed {
+            continue;
+        }
+        let hit = HITS.fetch_add(1, Ordering::Relaxed);
+        if hit >= cap {
+            return;
+        }
+        let read_hits = fs_cbuf_reads
+            .iter()
+            .filter_map(|(slot, byte_offset)| {
+                let byte_offset = *byte_offset as usize;
+                (*slot as usize == region.slot
+                    && byte_offset >= region.offset
+                    && byte_offset < region.offset + len)
+                    .then(|| format!("{:#x}", byte_offset))
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let sampled = sampled_rt_slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, key)| key.map(|key| format!("s{}={}", slot, key.label())))
+            .collect::<Vec<_>>()
+            .join(",");
+        log::warn!(
+            "[cbuf-watch] #{} rt={} key={} vs={:#x} fs={:#x} slot={} bind={:#x}/{} off={:#x} len={:#x} active={} first={} changed={} reads=[{}] tex={:?} sampled=[{}] topo={} v={} floats=[{}] raw={}",
+            hit,
+            nvmap_id,
+            rt_key.label(),
+            vs_addr,
+            fs_addr,
+            region.slot,
+            addr,
+            size,
+            region.offset,
+            len,
+            active,
+            first,
+            changed,
+            read_hits,
+            fs_tex_ids,
+            sampled,
+            draw.topology,
+            draw.vertex_count,
+            cbuf_watch_float_preview(&bytes),
+            cbuf_watch_hex_preview(&bytes),
+        );
+    }
+}
+
+fn cbuf_watch_float_preview(bytes: &[u8]) -> String {
+    bytes
+        .chunks_exact(4)
+        .take(32)
+        .map(|c| format!("{:.3}", f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn cbuf_watch_hex_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(64)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn cbuf_bind_for_slot(cbuf_binds: &[[(u64, u32); 16]; 5], logical_slot: u32) -> (u64, u32) {
@@ -4410,12 +5002,12 @@ fn map_attrib_format(format: u32) -> Option<vk::Format> {
     let type_ = format >> 6;
     match (size, type_) {
         (0x01, 7) => Some(vk::Format::R32G32B32A32_SFLOAT),
-        (0x01, 3) => Some(vk::Format::R32G32B32A32_SFLOAT),
-        (0x01, 4) => Some(vk::Format::R32G32B32A32_SFLOAT),
+        (0x01, 3) => Some(vk::Format::R32G32B32A32_SINT),
+        (0x01, 4) => Some(vk::Format::R32G32B32A32_UINT),
 
         (0x02, 7) => Some(vk::Format::R32G32B32_SFLOAT),
-        (0x02, 3) => Some(vk::Format::R32G32B32_SFLOAT),
-        (0x02, 4) => Some(vk::Format::R32G32B32_SFLOAT),
+        (0x02, 3) => Some(vk::Format::R32G32B32_SINT),
+        (0x02, 4) => Some(vk::Format::R32G32B32_UINT),
 
         (0x03, 7) => Some(vk::Format::R16G16B16A16_SFLOAT),
         (0x03, 2) => Some(vk::Format::R16G16B16A16_UNORM),
@@ -4426,8 +5018,8 @@ fn map_attrib_format(format: u32) -> Option<vk::Format> {
         (0x03, 5) => Some(vk::Format::R16G16B16A16_USCALED),
 
         (0x04, 7) => Some(vk::Format::R32G32_SFLOAT),
-        (0x04, 3) => Some(vk::Format::R32G32_SFLOAT),
-        (0x04, 4) => Some(vk::Format::R32G32_SFLOAT),
+        (0x04, 3) => Some(vk::Format::R32G32_SINT),
+        (0x04, 4) => Some(vk::Format::R32G32_UINT),
 
         (0x05, 3) => Some(vk::Format::R16G16B16_SINT),
         (0x05, 4) => Some(vk::Format::R16G16B16_UINT),
@@ -4448,8 +5040,8 @@ fn map_attrib_format(format: u32) -> Option<vk::Format> {
         (0x0F, 5) => Some(vk::Format::R16G16_USCALED),
 
         (0x12, 7) => Some(vk::Format::R32_SFLOAT),
-        (0x12, 3) => Some(vk::Format::R32_SFLOAT),
-        (0x12, 4) => Some(vk::Format::R32_SFLOAT),
+        (0x12, 3) => Some(vk::Format::R32_SINT),
+        (0x12, 4) => Some(vk::Format::R32_UINT),
 
         (0x13, 2) => Some(vk::Format::R8G8B8_UNORM),
         (0x13, 1) => Some(vk::Format::R8G8B8_SNORM),
