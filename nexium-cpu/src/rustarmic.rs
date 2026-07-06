@@ -367,6 +367,24 @@ unsafe extern "C" fn mem_write_hook(ctx_ptr: *mut CpuContext, addr: u64, size: u
     buf[..8].copy_from_slice(&io[0].to_le_bytes());
     buf[8..].copy_from_slice(&io[1].to_le_bytes());
     let value = io[0];
+    if rustarmic_watch_overlaps(addr, size as u64) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let n = HITS.fetch_add(1, Ordering::SeqCst);
+        if n < 128 {
+            let ctx = unsafe { &*ctx_ptr };
+            log::warn!(
+                "[watch-write] #{} addr={:#x} size={} val={:#x}/{:#x} pc={:#x} lr={:#x}",
+                n,
+                addr,
+                size,
+                io[0],
+                io[1],
+                ctx.pc,
+                ctx.x[30]
+            );
+        }
+    }
     let regions = state.regions.read();
     if let Some(r) = find_region(&regions, addr, size as u64) {
         if r.perm.contains(Perm::W) {
@@ -388,6 +406,36 @@ unsafe extern "C" fn mem_write_hook(ctx_ptr: *mut CpuContext, addr: u64, size: u
         }
     }
     handle_unmapped(state, ctx_ptr, addr, size, true, value);
+}
+
+fn rustarmic_watch_overlaps(addr: u64, size: u64) -> bool {
+    let Some((lo, hi)) = rustarmic_watch_range() else {
+        return false;
+    };
+    addr < hi && addr.saturating_add(size) > lo
+}
+
+fn rustarmic_watch_range() -> Option<(u64, u64)> {
+    use std::sync::OnceLock;
+    static RANGE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let spec = std::env::var("NEXIUM_WATCH_WRITE_CPU").ok()?;
+        let (va, len) = spec.trim().split_once(':')?;
+        let va = parse_watch_u64(va.trim())?;
+        let len = parse_watch_u64(len.trim()).unwrap_or(0x80);
+        (va != 0 && len != 0).then_some((va, va.saturating_add(len)))
+    })
+}
+
+fn parse_watch_u64(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>()
+            .ok()
+            .or_else(|| u64::from_str_radix(s, 16).ok())
+    }
 }
 
 fn handle_unmapped(
