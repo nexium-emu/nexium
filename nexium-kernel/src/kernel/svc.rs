@@ -1362,6 +1362,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
                 kernel.file_system_roots.remove(&(handle, d.object_id));
                 kernel.open_host_files.remove(&(handle, d.object_id));
                 kernel.open_romfs_files.remove(&(handle, d.object_id));
+                kernel.open_romfs_file_paths.remove(&(handle, d.object_id));
                 kernel.open_file_handles.remove(&(handle, d.object_id));
                 kernel.open_dir_lists.remove(&(handle, d.object_id));
             }
@@ -1401,6 +1402,16 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         ctx.cmif_in_data_len,
         is_domain
     );
+    ipc_trace_request(
+        kernel,
+        session_handle,
+        &port_name,
+        &dispatch_target,
+        cmd_id,
+        is_domain,
+        &ctx,
+    );
+    maybe_thread_snapshot(kernel, &dispatch_target, cmd_id);
 
     if dispatch_target == "fatal:u" && cmd_id == 1 {
         if ctx.cmif_in_data_len >= 4 {
@@ -1809,15 +1820,17 @@ fn dispatch_service_v2(
             crate::kernel::profile::record_ipc(&self.1, self.0);
         }
     }
+    let cmd_id = ctx.cmif_in.cmd_id;
     let _guard = if crate::kernel::profile::enabled() {
-        Some(IpcProfileGuard(
-            std::time::Instant::now(),
-            port_name.to_string(),
-        ))
+        let key = if std::env::var_os("NEXIUM_PROFILE_IPC_CMD").is_some() {
+            format!("{port_name}.cmd{cmd_id}")
+        } else {
+            port_name.to_string()
+        };
+        Some(IpcProfileGuard(std::time::Instant::now(), key))
     } else {
         None
     };
-    let cmd_id = ctx.cmif_in.cmd_id;
 
     if port_name == "ILogService" && cmd_id == 0 {
         let sb = ctx
@@ -2068,6 +2081,7 @@ fn dispatch_service_v2(
                                 if let Some(ty) = romfs_entry_type(kernel.nro_romfs(), &path_str) {
                                     ty
                                 } else {
+                                    fs_trace_path("GetEntryType", &path_str, "not_found");
                                     log::debug!(
                                         "IFileSystem.GetEntryType path={:?} → 0x202 NotFound",
                                         path_str
@@ -2079,9 +2093,15 @@ fn dispatch_service_v2(
                     } else if let Some(ty) = romfs_entry_type(kernel.nro_romfs(), &path_str) {
                         ty
                     } else {
-                        1
+                        fs_trace_path("GetEntryType", &path_str, "not_found");
+                        log::debug!(
+                            "IFileSystem.GetEntryType path={:?} → 0x202 NotFound",
+                            path_str
+                        );
+                        return build_ipc_response(ctx, 0x202, &[], &[]);
                     }
                 };
+                fs_trace_path("GetEntryType", &path_str, &format!("type={}", entry_type));
                 log::debug!(
                     "IFileSystem.GetEntryType path={:?} → {}",
                     path_str,
@@ -2128,6 +2148,11 @@ fn dispatch_service_v2(
                             kernel
                                 .open_host_files
                                 .insert((session_handle, new_obj_id), host.clone());
+                            fs_trace_path(
+                                "OpenFile",
+                                &path_str,
+                                &format!("host {}", host.display()),
+                            );
                             log::debug!(
                                 "IFileSystem.OpenFile path={:?} → IFile (host {})",
                                 path_str,
@@ -2137,6 +2162,14 @@ fn dispatch_service_v2(
                             kernel
                                 .open_romfs_files
                                 .insert((session_handle, new_obj_id), rf);
+                            kernel
+                                .open_romfs_file_paths
+                                .insert((session_handle, new_obj_id), path_str.clone());
+                            fs_trace_path(
+                                "OpenFile",
+                                &path_str,
+                                &format!("romfs off={:#x} size={}", rf.0, rf.1),
+                            );
                             log::debug!(
                                 "IFileSystem.OpenFile path={:?} → IFile (romfs off={:#x} size={})",
                                 path_str,
@@ -2148,12 +2181,21 @@ fn dispatch_service_v2(
                                 "IFileSystem.OpenFile path={:?} → 0x202 NotFound (host miss)",
                                 path_str
                             );
+                            fs_trace_path("OpenFile", &path_str, "not_found_host_miss");
                             return build_ipc_response(ctx, 0x202, &[], &[]);
                         }
                     } else if let Some(rf) = romfs_open_file(kernel.nro_romfs(), &path_str) {
                         kernel
                             .open_romfs_files
                             .insert((session_handle, new_obj_id), rf);
+                        kernel
+                            .open_romfs_file_paths
+                            .insert((session_handle, new_obj_id), path_str.clone());
+                        fs_trace_path(
+                            "OpenFile",
+                            &path_str,
+                            &format!("romfs off={:#x} size={}", rf.0, rf.1),
+                        );
                         log::debug!(
                             "IFileSystem.OpenFile path={:?} → IFile (romfs off={:#x} size={})",
                             path_str,
@@ -2161,6 +2203,7 @@ fn dispatch_service_v2(
                             rf.1
                         );
                     } else {
+                        fs_trace_path("OpenFile", &path_str, "not_found");
                         log::debug!("IFileSystem.OpenFile path={:?} → 0x202 NotFound", path_str);
                         return build_ipc_response(ctx, 0x202, &[], &[]);
                     }
@@ -2244,6 +2287,11 @@ fn dispatch_service_v2(
                     filter,
                     entries.len()
                 );
+                fs_trace_path(
+                    "OpenDirectory",
+                    &path_str,
+                    &format!("filter={:#x} entries={}", filter, entries.len()),
+                );
                 kernel
                     .open_dir_lists
                     .insert((session_handle, new_obj_id), (entries, 0));
@@ -2310,6 +2358,9 @@ fn dispatch_service_v2(
                 let romfs_file = object_keys
                     .iter()
                     .find_map(|key| kernel.open_romfs_files.get(key).copied());
+                let romfs_path = object_keys
+                    .iter()
+                    .find_map(|key| kernel.open_romfs_file_paths.get(key).cloned());
                 let target = ctx
                     .recv_buffers
                     .iter()
@@ -2364,6 +2415,14 @@ fn dispatch_service_v2(
                             offset,
                             read_size,
                             bytes_read
+                        );
+                        fs_trace_read(
+                            "IFile.Read",
+                            romfs_path.as_deref().unwrap_or("<romfs-file>"),
+                            base.saturating_add(off),
+                            offset,
+                            read_size,
+                            bytes_read,
                         );
                     } else {
                         let file_bytes: &[u8] = match per_session.as_ref() {
@@ -2659,6 +2718,20 @@ fn dispatch_service_v2(
                         read_size,
                         slice.len(),
                         romfs.len()
+                    );
+                    let path = romfs_path_for_data_offset(romfs, start)
+                        .map(|(path, file_off, _)| {
+                            let rel = start.saturating_sub(file_off);
+                            format!("{}+{:#x}", path, rel)
+                        })
+                        .unwrap_or_else(|| "<romfs-meta>".to_string());
+                    fs_trace_read(
+                        "IFsStorage.Read",
+                        &path,
+                        start,
+                        offset,
+                        read_size,
+                        slice.len() as u64,
                     );
                 } else {
                     log::warn!(
@@ -3757,9 +3830,16 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
             4 | 11 | 12 => {
-                let h = kernel.handles.create_handle(HandleType::Event);
+                let h = if let Some(&h) = kernel.audio_buffer_events.get(&session_handle) {
+                    h
+                } else {
+                    let h = kernel.handles.create_handle(HandleType::Event);
+                    kernel.event_signals.insert(h, true);
+                    kernel.audio_buffer_events.insert(session_handle, h);
+                    h
+                };
                 kernel.event_signals.insert(h, true);
-                return build_ipc_response(ctx, 0, &[], &[h]);
+                return build_ipc_response_copy(ctx, 0, &[], &[h]);
             }
             5 => {
                 let ch: u32 = 2;
@@ -4289,6 +4369,7 @@ fn igbp_handle_transact(
                     let qba = kernel.nvdrv.queue_buffer_active.clone();
                     let stats = kernel.nvdrv.stats.clone();
                     let (pw, ph, pnv) = (gb.width, gb.height, gb.nvmap_id);
+                    let present_cpu_addr = resolved.map(|(addr, _)| addr).unwrap_or(0);
                     qba.store(true, std::sync::atomic::Ordering::Relaxed);
                     let present_profile = std::env::var_os("NEXIUM_NVDRV_PROFILE").is_some();
                     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4314,11 +4395,21 @@ fn igbp_handle_transact(
                                 [x0, y0, w, h]
                             }
                         });
-                        if let Some((read_w, read_h, bytes)) =
-                            r_async.readback_target_pipelined(pnv, pw, ph, read_rect)
+                        if let Some((read_w, read_h, bytes, flip_y)) =
+                            r_async.readback_target_pipelined(
+                                pnv,
+                                pw,
+                                ph,
+                                0,
+                                present_cpu_addr,
+                                read_rect,
+                            )
                         {
-                            let (present_w, present_h, bytes) =
-                                prepare_vulkan_present_frame(bytes, read_w, read_h, transform);
+                            let (present_w, present_h, mut bytes) =
+                                prepare_vulkan_present_frame(
+                                    bytes, read_w, read_h, transform, flip_y,
+                                );
+                            make_present_opaque(&mut bytes);
                             dump_present_frame(&bytes, present_w, present_h);
                             if std::env::var_os("NEXIUM_FRAME_PRESENT_CACHE").is_some() {
                                 nexium_common::frame_present::set_last_presented(
@@ -5144,13 +5235,18 @@ fn prepare_vulkan_present_frame(
     width: u32,
     height: u32,
     transform: u32,
+    flip_y: Option<bool>,
 ) -> (u32, u32, Vec<u8>) {
     if let Some((x0, y0, w, h)) = cached_present_crop(width, height) {
         let mut cropped = crop_flipped_opaque(&bytes, width, height, x0, y0, w, h);
         apply_present_transform(&mut cropped, w, h, transform);
         return (w, h, cropped);
     }
-    if should_flip_vulkan_present(width, height) {
+    let do_flip = match flip_y {
+        Some(f) => f,
+        None => should_flip_vulkan_present(width, height),
+    };
+    if do_flip {
         flip_present_v(&mut bytes, width, height);
     }
     let (present_w, present_h, mut bytes) = maybe_crop_present_subwindow(bytes, width, height);
@@ -5556,11 +5652,29 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             };
             let addr_space = kernel.address_space.clone();
             let addr_space_w = kernel.address_space.clone();
+            let ioctl_profile = if crate::kernel::profile::enabled()
+                && std::env::var_os("NEXIUM_PROFILE_IOCTL").is_some()
+            {
+                let device = kernel
+                    .nvdrv
+                    .device_for_fd(fd)
+                    .map(|d| format!("{:?}", d))
+                    .unwrap_or_else(|| "invalid".to_string());
+                Some((
+                    std::time::Instant::now(),
+                    format!("nvdrv.{}.{:#06x}", device, (ioctl_id & 0xFFFF) as u16),
+                ))
+            } else {
+                None
+            };
             let outcome = kernel.nvdrv.dispatch_ioctl_with_mem(
                 req,
                 &|addr, buf| addr_space.read(addr, buf).is_ok(),
                 &|addr, buf| addr_space_w.write(addr, buf).is_ok(),
             );
+            if let Some((start, key)) = ioctl_profile {
+                crate::kernel::profile::record_ipc(&key, start);
+            }
 
             if !outcome.data.is_empty() {
                 if let Some(buf) = out_dst {
@@ -6606,7 +6720,7 @@ fn svc_create_thread(kernel: &mut Kernel) -> u32 {
     ctx.pc = entry;
     ctx.tpidrro_el0 = tls_va;
 
-    kernel.threads.add_thread(handle, ctx, tls_va, sp);
+    kernel.threads.add_thread(handle, ctx, tls_va, sp, arg);
     if let Some(t) = kernel.threads.threads.get_mut(&handle) {
         t.priority = priority;
         let active_cores = std::env::var("NEXIUM_CPU_CORES")
@@ -7442,6 +7556,293 @@ fn romfs_entry_type(romfs: &[u8], path: &str) -> Option<u32> {
         RomfsEntry::Dir => Some(0),
         RomfsEntry::File { .. } => Some(1),
     }
+}
+
+fn fs_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_FS_TRACE")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    })
+}
+
+fn fs_trace_matches(path: &str) -> bool {
+    use std::sync::OnceLock;
+    static FILTERS: OnceLock<Vec<String>> = OnceLock::new();
+    let filters = FILTERS.get_or_init(|| {
+        std::env::var("NEXIUM_FS_TRACE_FILTER")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if filters.is_empty() {
+        return true;
+    }
+    let hay = path.to_ascii_lowercase();
+    filters.iter().any(|needle| hay.contains(needle))
+}
+
+fn fs_trace_path(kind: &str, path: &str, detail: &str) {
+    if !fs_trace_enabled() || !fs_trace_matches(path) {
+        return;
+    }
+    log::warn!("[fs-trace] {} path={} {}", kind, path, detail);
+}
+
+fn fs_trace_read(
+    kind: &str,
+    path: &str,
+    abs_offset: usize,
+    read_offset: i64,
+    read_size: u64,
+    bytes_read: u64,
+) {
+    if !fs_trace_enabled() || !fs_trace_matches(path) {
+        return;
+    }
+
+    log::warn!(
+        "[fs-trace] {} path={} abs={:#x} read_off={:#x} size={:#x} bytes={}",
+        kind,
+        path,
+        abs_offset,
+        read_offset,
+        read_size,
+        bytes_read
+    );
+}
+
+fn ipc_trace_request(
+    kernel: &Kernel,
+    session_handle: u32,
+    port_name: &str,
+    dispatch_target: &str,
+    cmd_id: u32,
+    is_domain: bool,
+    ctx: &ipc::IpcCtx,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_IPC_TRACE")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    });
+    if !enabled {
+        return;
+    }
+
+    static FILTERS: OnceLock<Vec<String>> = OnceLock::new();
+    let filters = FILTERS.get_or_init(|| {
+        std::env::var("NEXIUM_IPC_TRACE_FILTER")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if !filters.is_empty() {
+        let hay = format!(
+            "{} {} cmd={} session={:#x}",
+            port_name, dispatch_target, cmd_id, session_handle
+        )
+        .to_ascii_lowercase();
+        if !filters.iter().any(|needle| hay.contains(needle)) {
+            return;
+        }
+    }
+
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_IPC_TRACE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(20_000)
+    });
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if limit != 0 && n >= limit {
+        return;
+    }
+
+    let (pc, lr, x20, x21) = cpu_ref()
+        .map(|cpu| {
+            (
+                cpu.get_pc(),
+                cpu.get_register(30),
+                cpu.get_register(20),
+                cpu.get_register(21),
+            )
+        })
+        .unwrap_or((0, 0, 0, 0));
+    let domain = ctx
+        .domain
+        .map(|d| {
+            format!(
+                "kind={} obj={} in_objs={} data={}",
+                d.kind, d.object_id, d.num_in_objects, d.data_size
+            )
+        })
+        .unwrap_or_else(|| "-".to_string());
+    let in_preview: Vec<String> = if ctx.cmif_in_data_off < ctx.buf.len() {
+        let end = (ctx.cmif_in_data_off + ctx.cmif_in_data_len.min(24)).min(ctx.buf.len());
+        ctx.buf[ctx.cmif_in_data_off..end]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    log::warn!(
+        "[ipc-trace] n={} thread={:?} sess={:#x} port={} target={} cmd={} domain={} is_domain={} in_len={} pc={:#x} lr={:#x} x20={:#x} x21={:#x} send={} recv={} sstat={} rstat={} in={}",
+        n,
+        kernel.threads.current,
+        session_handle,
+        port_name,
+        dispatch_target,
+        cmd_id,
+        domain,
+        is_domain,
+        ctx.cmif_in_data_len,
+        pc,
+        lr,
+        x20,
+        x21,
+        ipc_trace_buffers(&ctx.send_buffers),
+        ipc_trace_buffers(&ctx.recv_buffers),
+        ipc_trace_buffers(&ctx.send_statics),
+        ipc_trace_buffers(&ctx.recv_statics),
+        in_preview.join(",")
+    );
+}
+
+fn ipc_trace_buffers(buffers: &[ipc::IpcBuffer]) -> String {
+    if buffers.is_empty() {
+        return "-".to_string();
+    }
+    let mut parts: Vec<String> = buffers
+        .iter()
+        .take(3)
+        .map(|b| format!("{:#x}:{:#x}:{}", b.addr, b.size, b.mode))
+        .collect();
+    if buffers.len() > parts.len() {
+        parts.push(format!("+{}", buffers.len() - parts.len()));
+    }
+    parts.join("|")
+}
+
+fn maybe_thread_snapshot(kernel: &Kernel, dispatch_target: &str, cmd_id: u32) {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static PERIOD_MS: OnceLock<Option<u64>> = OnceLock::new();
+    let Some(period_ms) = *PERIOD_MS.get_or_init(|| {
+        std::env::var("NEXIUM_THREAD_SNAPSHOT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+    }) else {
+        return;
+    };
+
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let now = Instant::now();
+    let last_cell = LAST.get_or_init(|| Mutex::new(None));
+    let Ok(mut last) = last_cell.lock() else {
+        return;
+    };
+    if last
+        .as_ref()
+        .map(|prev| prev.elapsed().as_millis() < period_ms as u128)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    *last = Some(now);
+    kernel.log_thread_snapshot(&format!("ipc-{}-cmd{}", dispatch_target, cmd_id));
+}
+
+fn romfs_path_for_data_offset(romfs: &[u8], data_off: usize) -> Option<(String, usize, usize)> {
+    let hdr = romfs_header(romfs)?;
+    romfs_path_for_data_offset_in_dir(romfs, hdr, 0, "", data_off, 0)
+}
+
+fn romfs_path_for_data_offset_in_dir(
+    romfs: &[u8],
+    hdr: RomfsHeader,
+    dir_off: u32,
+    prefix: &str,
+    data_off: usize,
+    depth: usize,
+) -> Option<(String, usize, usize)> {
+    if depth > 64 {
+        return None;
+    }
+    let dir_rel = usize::try_from(dir_off).ok()?;
+    if dir_rel >= hdr.dir_meta_size {
+        return None;
+    }
+    let dir_abs = hdr.dir_meta_off.checked_add(dir_rel)?;
+
+    let mut file = romfs_u32(romfs, dir_abs.checked_add(0x0c)?)?;
+    while file != u32::MAX {
+        let rel = usize::try_from(file).ok()?;
+        if rel >= hdr.file_meta_size {
+            return None;
+        }
+        let abs = hdr.file_meta_off.checked_add(rel)?;
+        let name = romfs_name(romfs, abs, 0x20, 0x1c)?;
+        let rel_off = usize::try_from(romfs_u64(romfs, abs.checked_add(0x08)?)?).ok()?;
+        let size = usize::try_from(romfs_u64(romfs, abs.checked_add(0x10)?)?).ok()?;
+        let file_off = hdr.file_data_off.checked_add(rel_off)?;
+        if data_off >= file_off && data_off.saturating_sub(file_off) < size {
+            let path = if prefix.is_empty() {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", prefix, name)
+            };
+            return Some((path, file_off, size));
+        }
+        file = romfs_u32(romfs, abs.checked_add(0x04)?)?;
+    }
+
+    let mut child = romfs_u32(romfs, dir_abs.checked_add(0x08)?)?;
+    while child != u32::MAX {
+        let rel = usize::try_from(child).ok()?;
+        if rel >= hdr.dir_meta_size {
+            return None;
+        }
+        let abs = hdr.dir_meta_off.checked_add(rel)?;
+        let name = romfs_name(romfs, abs, 0x18, 0x14)?;
+        let child_prefix = if prefix.is_empty() {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", prefix, name)
+        };
+        if let Some(hit) =
+            romfs_path_for_data_offset_in_dir(romfs, hdr, child, &child_prefix, data_off, depth + 1)
+        {
+            return Some(hit);
+        }
+        child = romfs_u32(romfs, abs.checked_add(0x04)?)?;
+    }
+
+    None
 }
 
 fn compute_tiled_size(stride: u32, height: u32, block_height_log2: u32) -> usize {

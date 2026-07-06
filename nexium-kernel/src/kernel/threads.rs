@@ -62,6 +62,7 @@ pub struct Thread {
     pub state: ThreadState,
     pub tls_va: u64,
     pub stack_top: u64,
+    pub entry_arg: u64,
     pub priority: i32,
     pub core: i32,
 }
@@ -93,6 +94,7 @@ impl Threads {
                 state: ThreadState::Running,
                 tls_va: main_tls_va,
                 stack_top: main_stack_top,
+                entry_arg: 0,
                 priority: 0x2C,
                 core: 0,
             },
@@ -128,7 +130,14 @@ impl Threads {
         tid
     }
 
-    pub fn add_thread(&mut self, handle: u32, ctx: ThreadCtx, tls_va: u64, stack_top: u64) {
+    pub fn add_thread(
+        &mut self,
+        handle: u32,
+        ctx: ThreadCtx,
+        tls_va: u64,
+        stack_top: u64,
+        entry_arg: u64,
+    ) {
         let tid = self.alloc_tid();
         self.threads.insert(
             handle,
@@ -139,6 +148,7 @@ impl Threads {
                 state: ThreadState::Created,
                 tls_va,
                 stack_top,
+                entry_arg,
                 priority: 0x2C,
                 core: -2,
             },
