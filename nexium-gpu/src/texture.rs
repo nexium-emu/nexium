@@ -187,6 +187,7 @@ pub struct TicEntry {
     pub depth: u32,
     pub base_layer: u32,
     pub normalized_coords: bool,
+    pub is_srgb: bool,
 }
 
 impl TicEntry {
@@ -232,6 +233,7 @@ impl TicEntry {
         let layer_base_8_10 = (w2 >> 29) & 0x7;
         let base_layer = layer_base_0_2 | (layer_base_3_7 << 3) | (layer_base_8_10 << 8);
         let texture_type = (w4 >> 23) & 0xF;
+        let is_srgb = (w4 >> 22) & 1 != 0;
         let w5 = u32::from_le_bytes([raw[20], raw[21], raw[22], raw[23]]);
         let height = (w5 & 0xFFFF) + 1;
         let depth = ((w5 >> 16) & 0x3FFF) + 1;
@@ -257,6 +259,7 @@ impl TicEntry {
             depth,
             base_layer,
             normalized_coords,
+            is_srgb,
         })
     }
 }
@@ -291,15 +294,67 @@ impl WrapMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TexFilter {
+    None,
     Nearest,
     Linear,
 }
 impl TexFilter {
+    pub fn from_filter_raw(v: u32) -> Self {
+        match v & 0x3 {
+            2 => TexFilter::Linear,
+            _ => TexFilter::Nearest,
+        }
+    }
+
+    pub fn from_mipmap_raw(v: u32) -> Self {
+        match v & 0x3 {
+            2 => TexFilter::Nearest,
+            3 => TexFilter::Linear,
+            _ => TexFilter::None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SamplerReduction {
+    WeightedAverage,
+    Min,
+    Max,
+}
+
+impl SamplerReduction {
     pub fn from_raw(v: u32) -> Self {
-        if (v & 0x3) == 2 {
-            TexFilter::Linear
-        } else {
-            TexFilter::Nearest
+        match v & 0x3 {
+            1 => SamplerReduction::Min,
+            2 => SamplerReduction::Max,
+            _ => SamplerReduction::WeightedAverage,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DepthCompareFunc {
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
+}
+
+impl DepthCompareFunc {
+    pub fn from_raw(v: u32) -> Self {
+        match v & 0x7 {
+            1 => DepthCompareFunc::Less,
+            2 => DepthCompareFunc::Equal,
+            3 => DepthCompareFunc::LessEqual,
+            4 => DepthCompareFunc::Greater,
+            5 => DepthCompareFunc::NotEqual,
+            6 => DepthCompareFunc::GreaterEqual,
+            7 => DepthCompareFunc::Always,
+            _ => DepthCompareFunc::Never,
         }
     }
 }
@@ -309,9 +364,17 @@ pub struct TscEntry {
     pub wrap_u: WrapMode,
     pub wrap_v: WrapMode,
     pub wrap_p: WrapMode,
+    pub depth_compare_enabled: bool,
+    pub depth_compare_func: DepthCompareFunc,
+    pub max_anisotropy: u32,
     pub mag_filter: TexFilter,
     pub min_filter: TexFilter,
     pub mip_filter: TexFilter,
+    pub reduction: SamplerReduction,
+    pub mip_lod_bias: i32,
+    pub min_lod_clamp: u32,
+    pub max_lod_clamp: u32,
+    pub border_color_bits: [u32; 4],
 }
 impl TscEntry {
     pub fn parse(raw: &[u8]) -> Option<TscEntry> {
@@ -320,14 +383,51 @@ impl TscEntry {
         }
         let w0 = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
         let w1 = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+        let w2 = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+        let border_color_bits = [
+            u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]),
+            u32::from_le_bytes([raw[20], raw[21], raw[22], raw[23]]),
+            u32::from_le_bytes([raw[24], raw[25], raw[26], raw[27]]),
+            u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
+        ];
+        let raw_bias = ((w1 >> 12) & 0x1FFF) as i32;
+        let mip_lod_bias = if (raw_bias & 0x1000) != 0 {
+            raw_bias - 0x2000
+        } else {
+            raw_bias
+        };
         Some(TscEntry {
             wrap_u: WrapMode::from_raw(w0),
             wrap_v: WrapMode::from_raw(w0 >> 3),
             wrap_p: WrapMode::from_raw(w0 >> 6),
-            mag_filter: TexFilter::from_raw(w1),
-            min_filter: TexFilter::from_raw(w1 >> 4),
-            mip_filter: TexFilter::from_raw(w1 >> 6),
+            depth_compare_enabled: ((w0 >> 9) & 1) != 0,
+            depth_compare_func: DepthCompareFunc::from_raw(w0 >> 10),
+            max_anisotropy: (w0 >> 20) & 0x7,
+            mag_filter: TexFilter::from_filter_raw(w1),
+            min_filter: TexFilter::from_filter_raw(w1 >> 4),
+            mip_filter: TexFilter::from_mipmap_raw(w1 >> 6),
+            reduction: SamplerReduction::from_raw(w1 >> 10),
+            mip_lod_bias,
+            min_lod_clamp: w2 & 0xFFF,
+            max_lod_clamp: (w2 >> 12) & 0xFFF,
+            border_color_bits,
         })
+    }
+
+    pub fn lod_bias(&self) -> f32 {
+        self.mip_lod_bias as f32 / 256.0
+    }
+
+    pub fn min_lod(&self) -> f32 {
+        self.min_lod_clamp as f32 / 256.0
+    }
+
+    pub fn max_lod(&self) -> f32 {
+        self.max_lod_clamp as f32 / 256.0
+    }
+
+    pub fn max_anisotropy(&self) -> f32 {
+        (1u32 << self.max_anisotropy.min(4)) as f32
     }
 }
 
@@ -379,6 +479,70 @@ pub fn unswizzle_block_linear(
     }
 
     dst
+}
+
+pub fn unswizzle_block_linear_3d(
+    src: &[u8],
+    width_px: u32,
+    height_px: u32,
+    depth_px: u32,
+    bpp: usize,
+    block_height_log2: u32,
+    block_depth_log2: u32,
+    tile_width_spacing: u32,
+) -> Vec<u8> {
+    let width = width_px as usize;
+    let height = height_px as usize;
+    let depth = depth_px as usize;
+    let dst_stride = width.saturating_mul(bpp);
+    let mut dst = vec![0u8; dst_stride.saturating_mul(height).saturating_mul(depth)];
+    let width_aligned = align_up_pow2_usize(width, tile_width_spacing);
+    let stride_bytes = width_aligned.saturating_mul(bpp);
+    let gobs_in_x = (stride_bytes + GOB_W - 1) / GOB_W;
+    let block_height = 1usize << block_height_log2 as usize;
+    let block_depth = 1usize << block_depth_log2 as usize;
+    let block_size = gobs_in_x << (9 + block_height_log2 as usize + block_depth_log2 as usize);
+    let slice_size = ((height + block_height * GOB_H - 1) / (block_height * GOB_H)) * block_size;
+    let block_height_mask = block_height - 1;
+    let block_depth_mask = block_depth - 1;
+    let x_shift = 9usize + block_height_log2 as usize + block_depth_log2 as usize;
+
+    for z in 0..depth {
+        let offset_z = (z / block_depth) * slice_size
+            + (z & block_depth_mask) * (GOB_SIZE << block_height_log2 as usize);
+        for y in 0..height {
+            let block_y = y / GOB_H;
+            let offset_y =
+                (block_y / block_height) * block_size + (block_y & block_height_mask) * GOB_SIZE;
+            let y_in_gob = y & (GOB_H - 1);
+            for x in 0..width {
+                let byte_x = x.saturating_mul(bpp);
+                let offset_x = (byte_x / GOB_W) << x_shift;
+                let x_in_gob = byte_x & (GOB_W - 1);
+                let in_gob = ((x_in_gob >> 5) & 1) * 256
+                    + ((y_in_gob >> 1) & 3) * 64
+                    + ((x_in_gob >> 4) & 1) * 32
+                    + (y_in_gob & 1) * 16
+                    + (x_in_gob & 15);
+                let src_off = offset_z + offset_y + offset_x + in_gob;
+                let dst_off = (z * height * dst_stride) + y * dst_stride + byte_x;
+                if src_off + bpp <= src.len() && dst_off + bpp <= dst.len() {
+                    dst[dst_off..dst_off + bpp].copy_from_slice(&src[src_off..src_off + bpp]);
+                }
+            }
+        }
+    }
+
+    dst
+}
+
+fn align_up_pow2_usize(value: usize, shift: u32) -> usize {
+    if shift == 0 {
+        value
+    } else {
+        let mask = (1usize << shift) - 1;
+        (value + mask) & !mask
+    }
 }
 
 pub fn block_linear_byte_size(
