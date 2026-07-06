@@ -20,13 +20,21 @@ pub fn get_this_applet_kind(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u
 pub fn allow_to_enter_sleep(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}
 pub fn disallow_to_enter_sleep(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}
 pub fn get_operation_mode(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> bool {
-    false
+    crate::hid_state::is_docked()
 }
 pub fn get_performance_mode(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u32 {
-    0
+    if crate::hid_state::is_docked() {
+        1
+    } else {
+        0
+    }
 }
 pub fn get_cradle_status(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u8 {
-    0
+    if crate::hid_state::is_docked() {
+        1
+    } else {
+        0
+    }
 }
 pub fn get_boot_mode(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> bool {
     false

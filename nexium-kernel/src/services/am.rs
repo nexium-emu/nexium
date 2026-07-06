@@ -187,6 +187,8 @@ fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, V
             kernel.applet_message_event = slot;
             if first {
                 queue_message(kernel, msg::FOCUS_STATE_CHANGED);
+                queue_message(kernel, msg::OPERATION_MODE_CHANGED);
+                queue_message(kernel, msg::PERFORMANCE_MODE_CHANGED);
             }
             log::debug!(
                 "ICommonStateGetter.GetEventHandle → {:#x} (initial focus msg queued={})",
@@ -214,8 +216,14 @@ fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, V
             ok(0u32.to_le_bytes().to_vec())
         }
         3 | 4 => ok_empty(),
-        5 => ok(kernel.applet_operation_mode.to_le_bytes().to_vec()),
-        6 => ok(kernel.applet_performance_mode.to_le_bytes().to_vec()),
+        5 => {
+            let mode: u8 = if crate::hid_state::is_docked() { 1 } else { 0 };
+            ok(mode.to_le_bytes().to_vec())
+        }
+        6 => {
+            let mode: u8 = if crate::hid_state::is_docked() { 1 } else { 0 };
+            ok(mode.to_le_bytes().to_vec())
+        }
         7 => ok(0u8.to_le_bytes().to_vec()),
         8 => ok(0u8.to_le_bytes().to_vec()),
         9 => ok(kernel.applet_focus_state.to_le_bytes().to_vec()),
@@ -603,11 +611,7 @@ fn manager_for_application(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
 fn apm_manager(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
         1 => {
-            let mode: i32 = if std::env::var_os("NEXIUM_DOCKED").is_some() {
-                1
-            } else {
-                0
-            };
+            let mode: i32 = if crate::hid_state::is_docked() { 1 } else { 0 };
             ok(mode.to_le_bytes().to_vec())
         }
         6 => ok(vec![0u8]),

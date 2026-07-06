@@ -104,6 +104,7 @@ pub struct Kernel {
     pub file_system_roots: HashMap<(u32, u32), std::path::PathBuf>,
     pub open_host_files: HashMap<(u32, u32), std::path::PathBuf>,
     pub open_romfs_files: HashMap<(u32, u32), (usize, usize)>,
+    pub open_romfs_file_paths: HashMap<(u32, u32), String>,
     pub open_file_handles: HashMap<(u32, u32), std::fs::File>,
     pub host_file_cache: HashMap<std::path::PathBuf, Arc<memmap2::Mmap>>,
     pub open_dir_lists: HashMap<(u32, u32), (Vec<(String, bool, u64)>, usize)>,
@@ -221,16 +222,8 @@ impl Kernel {
             generic_svc_streak: 0,
             next_generic_svc_streak_log: 64,
             applet_focus_state: 1,
-            applet_operation_mode: if std::env::var_os("NEXIUM_DOCKED").is_some() {
-                1
-            } else {
-                0
-            },
-            applet_performance_mode: if std::env::var_os("NEXIUM_DOCKED").is_some() {
-                1
-            } else {
-                0
-            },
+            applet_operation_mode: if crate::hid_state::is_docked() { 1 } else { 0 },
+            applet_performance_mode: if crate::hid_state::is_docked() { 1 } else { 0 },
             display_resolution_change_event: None,
             library_applet_launchable_event: None,
             accumulated_suspended_tick_event: None,
@@ -247,6 +240,7 @@ impl Kernel {
             file_system_roots: HashMap::new(),
             open_host_files: HashMap::new(),
             open_romfs_files: HashMap::new(),
+            open_romfs_file_paths: HashMap::new(),
             open_file_handles: HashMap::new(),
             host_file_cache: HashMap::new(),
             open_dir_lists: HashMap::new(),
@@ -275,6 +269,109 @@ impl Kernel {
             .read(addr, &mut bytes)
             .ok()
             .map(|_| u32::from_le_bytes(bytes))
+    }
+
+    fn debug_read_u64(&self, addr: u64) -> Option<u64> {
+        let mut bytes = [0u8; 8];
+        self.address_space
+            .read(addr, &mut bytes)
+            .ok()
+            .map(|_| u64::from_le_bytes(bytes))
+    }
+
+    fn debug_is_code_ptr(addr: u64) -> bool {
+        (0x0800_0000..0x0b80_0000).contains(&addr)
+    }
+
+    fn debug_stack_code_hits(&self, sp: u64, len: usize) -> Vec<String> {
+        let mut hits = Vec::new();
+        let mut seen = HashSet::new();
+        for off in (0..len).step_by(8) {
+            let Some(value) = self.debug_read_u64(sp.wrapping_add(off as u64)) else {
+                continue;
+            };
+            if Self::debug_is_code_ptr(value) && seen.insert(value) {
+                hits.push(format!("+{:#x}:{:#x}", off, value));
+                if hits.len() >= 32 {
+                    break;
+                }
+            }
+        }
+        hits
+    }
+
+    fn debug_ascii_at(&self, addr: u64) -> Option<String> {
+        if addr < 0x1000 {
+            return None;
+        }
+        let mut bytes = [0u8; 96];
+        self.address_space.read(addr, &mut bytes).ok()?;
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        if end < 4 {
+            return None;
+        }
+        let s = &bytes[..end];
+        if !s
+            .iter()
+            .all(|&b| b == b' ' || (0x21..=0x7e).contains(&b))
+        {
+            return None;
+        }
+        if !s.iter().any(|&b| b.is_ascii_alphabetic()) {
+            return None;
+        }
+        Some(String::from_utf8_lossy(s).into_owned())
+    }
+
+    fn debug_inline_ascii_runs(bytes: &[u8]) -> Vec<String> {
+        let mut runs = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            while i < bytes.len() && !(bytes[i] == b' ' || (0x21..=0x7e).contains(&bytes[i])) {
+                i += 1;
+            }
+            let start = i;
+            while i < bytes.len() && (bytes[i] == b' ' || (0x21..=0x7e).contains(&bytes[i])) {
+                i += 1;
+            }
+            if i - start >= 4 && bytes[start..i].iter().any(|&b| b.is_ascii_alphabetic()) {
+                let s = String::from_utf8_lossy(&bytes[start..i.min(start + 64)]).into_owned();
+                runs.push(format!("+{:#x}:\"{}\"", start, s));
+                if runs.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        runs
+    }
+
+    fn debug_thread_arg_hits(&self, arg: u64) -> String {
+        let mut bytes = [0u8; 0x180];
+        if self.address_space.read(arg, &mut bytes).is_err() {
+            return "unreadable".to_string();
+        }
+
+        let mut parts = Self::debug_inline_ascii_runs(&bytes);
+        let mut seen = HashSet::new();
+        for off in (0..bytes.len()).step_by(8) {
+            let value = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+            if Self::debug_is_code_ptr(value) && seen.insert(value) {
+                parts.push(format!("+{:#x}:code={:#x}", off, value));
+            } else if seen.insert(value) {
+                if let Some(s) = self.debug_ascii_at(value) {
+                    parts.push(format!("+{:#x}->{:#x}:\"{}\"", off, value, s));
+                }
+            }
+            if parts.len() >= 24 {
+                break;
+            }
+        }
+
+        if parts.is_empty() {
+            "hits=[]".to_string()
+        } else {
+            format!("hits=[{}]", parts.join(","))
+        }
     }
 
     fn debug_wait_deadline(wake_at: Option<std::time::Instant>) -> String {
@@ -332,6 +429,9 @@ impl Kernel {
     }
 
     pub fn log_thread_snapshot(&self, label: &str) {
+        let scan_stacks = std::env::var_os("NEXIUM_THREAD_STACK_SCAN").is_some();
+        let scan_args = std::env::var_os("NEXIUM_THREAD_ARG_SCAN").is_some();
+
         log::warn!(
             "[thread-snapshot:{}] current={:?} ready={:?} pending_condvars={:?} events={} audio_render_events={}",
             label,
@@ -427,7 +527,7 @@ impl Kernel {
             };
 
             log::warn!(
-                "[thread-snapshot:{}] h={:#x} tid={} core={} prio={} state={} pc={:#x} lr={:#x} sp={:#x} tls={:#x}",
+                "[thread-snapshot:{}] h={:#x} tid={} core={} prio={} state={} pc={:#x} lr={:#x} sp={:#x} tls={:#x} arg={:#x}",
                 label,
                 handle,
                 t.tid,
@@ -437,12 +537,50 @@ impl Kernel {
                 t.ctx.pc,
                 t.ctx.x[30],
                 t.ctx.sp,
-                t.tls_va
+                t.tls_va,
+                t.entry_arg
             );
+
+            if scan_stacks {
+                let hits = self.debug_stack_code_hits(t.ctx.sp, 0x800);
+                log::warn!(
+                    "[thread-stack-scan:{}] h={:#x} sp={:#x} hits=[{}]",
+                    label,
+                    handle,
+                    t.ctx.sp,
+                    hits.join(",")
+                );
+            }
+            if scan_args && t.entry_arg != 0 {
+                log::warn!(
+                    "[thread-arg-scan:{}] h={:#x} arg={:#x} {}",
+                    label,
+                    handle,
+                    t.entry_arg,
+                    self.debug_thread_arg_hits(t.entry_arg)
+                );
+            }
         }
     }
 
     pub fn signal_vsync(&mut self) {
+        if std::env::var_os("NEXIUM_NO_BOOT_MODE_KICK").is_none() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static VN: AtomicU64 = AtomicU64::new(0);
+            let n = VN.fetch_add(1, Ordering::Relaxed);
+            if matches!(n, 180 | 420 | 720 | 1020 | 1380) {
+                crate::services::am::queue_message(self, 30);
+                crate::services::am::queue_message(self, 31);
+            }
+        }
+        if crate::hid_state::take_console_mode_dirty() {
+            let docked = crate::hid_state::is_docked();
+            self.applet_operation_mode = if docked { 1 } else { 0 };
+            self.applet_performance_mode = if docked { 1 } else { 0 };
+            crate::services::am::queue_message(self, 30);
+            crate::services::am::queue_message(self, 31);
+            log::info!("console mode -> {}", if docked { "Docked" } else { "Handheld" });
+        }
         let vsyncs: Vec<u32> = self.vsync_handles.iter().copied().collect();
         for h in vsyncs {
             self.event_signals.insert(h, true);
