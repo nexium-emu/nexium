@@ -125,6 +125,7 @@ pub struct IoctlRequest {
     pub fd: u32,
     pub ioctl_id: u32,
     pub in_data: Vec<u8>,
+    pub inline_in_data: Vec<u8>,
     pub out_size: usize,
 }
 
@@ -259,12 +260,13 @@ impl Nvdrv {
         };
         let cmd = (req.ioctl_id & 0xFFFF) as u16;
         log::trace!(
-            "nvdrv:Ioctl fd={} device={:?} ioctl={:#010x} cmd={:#06x} in_size={} out_size={}",
+            "nvdrv:Ioctl fd={} device={:?} ioctl={:#010x} cmd={:#06x} in_size={} inline_in_size={} out_size={}",
             req.fd,
             device,
             req.ioctl_id,
             cmd,
             req.in_data.len(),
+            req.inline_in_data.len(),
             req.out_size
         );
 
@@ -961,10 +963,47 @@ impl Nvdrv {
                         num_entries
                     );
 
-                    if cmd == 0x4808 && req.in_data.len() >= 16 + (num_entries as usize) * 8 {
+                    if cmd == 0x481b && req.inline_in_data.len() >= (num_entries as usize) * 8 {
                         let entries: Vec<gpu::CommandListHeader> = (0..num_entries as usize)
                             .map(|i| {
-                                let off = 16 + i * 8;
+                                let off = i * 8;
+                                gpu::CommandListHeader {
+                                    address_lo: u32::from_le_bytes([
+                                        req.inline_in_data[off],
+                                        req.inline_in_data[off + 1],
+                                        req.inline_in_data[off + 2],
+                                        req.inline_in_data[off + 3],
+                                    ]),
+                                    address_hi_and_count: u32::from_le_bytes([
+                                        req.inline_in_data[off + 4],
+                                        req.inline_in_data[off + 5],
+                                        req.inline_in_data[off + 6],
+                                        req.inline_in_data[off + 7],
+                                    ]),
+                                }
+                            })
+                            .collect();
+                        self.stats.gpfifo_submits.fetch_add(1, Ordering::Relaxed);
+                        self.stats
+                            .gpfifo_entries
+                            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+                        let (syncpt_id, syncpt_value) = self
+                            .gpu
+                            .process_inline_gpfifo(&entries, mem_read, mem_write);
+                        log::trace!(
+                            "nvhost-gpu:SubmitGPFIFO (inline) entries={} draws={}",
+                            entries.len(),
+                            self.gpu.maxwell3d.lock().draw_count()
+                        );
+                        if out.len() >= 24 {
+                            out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
+                            out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
+                        }
+                    } else if cmd == 0x4808 && req.in_data.len() >= 24 + (num_entries as usize) * 8
+                    {
+                        let entries: Vec<gpu::CommandListHeader> = (0..num_entries as usize)
+                            .map(|i| {
+                                let off = 24 + i * 8;
                                 gpu::CommandListHeader {
                                     address_lo: u32::from_le_bytes([
                                         req.in_data[off],

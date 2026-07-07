@@ -103,6 +103,8 @@ pub struct Maxwell3dDrawCall {
     pub vs_cbuf_mask: u32,
     pub fs_cbuf_mask: u32,
     pub fs_tex_ids: Vec<u32>,
+    pub vs_tex_base: u32,
+    pub vs_tex_count: u32,
     pub vertex_layout: VertexLayout,
     pub cbuf_addr: u64,
     pub cbuf_size: u32,

@@ -805,6 +805,8 @@ struct ShaderBundle {
     fs_cbuf_mask: u32,
     fs_hash: u64,
     fs_tex_ids: Vec<u32>,
+    vs_tex_base: u32,
+    vs_tex_count: u32,
     fs_sampler_arrayed: bool,
     fs_cbuf_reads: Vec<(u32, u32)>,
     cbuf_used: u32,
@@ -1286,10 +1288,7 @@ fn execute_one(
         .iter()
         .map(|(location, _, _)| *location)
         .collect::<Vec<_>>();
-    let color_rt_keys = color_rts
-        .iter()
-        .map(|(_, key, _)| *key)
-        .collect::<Vec<_>>();
+    let color_rt_keys = color_rts.iter().map(|(_, key, _)| *key).collect::<Vec<_>>();
     let color_rt_formats = color_rts
         .iter()
         .map(|(_, _, format)| *format)
@@ -1465,7 +1464,7 @@ fn execute_one(
                 );
             }
 
-            let vs_tex_base: u32 = {
+            let (vs_tex_base, vs_tex_count): (u32, u32) = {
                 let vs_walked = nexium_shader::extract_fs_tex_ids(vs_sass.as_slice(), 15);
                 let mut vs_tex_ids: Vec<u32> = Vec::new();
                 let mut vs_bindless = 0usize;
@@ -1482,7 +1481,11 @@ fn execute_one(
                 if !vs_tex_ids.is_empty() || vs_bindless != 0 {
                     log::warn!(
                         "[vs-tex] vs={:#x} fs={:#x} vs_imm={:?} vs_bindless={} fs_tex_ids={:?}",
-                        vs_addr, fs_addr, vs_tex_ids, vs_bindless, fs_tex_ids
+                        vs_addr,
+                        fs_addr,
+                        vs_tex_ids,
+                        vs_bindless,
+                        fs_tex_ids
                     );
                 }
                 if std::env::var_os("NEXIUM_VS_TEX").is_some() && !vs_tex_ids.is_empty() {
@@ -1491,9 +1494,9 @@ fn execute_one(
                     for id in &vs_tex_ids {
                         fs_tex_ids.push(*id);
                     }
-                    base
+                    (base, vs_tex_ids.len() as u32)
                 } else {
-                    0
+                    (0, 0)
                 }
             };
 
@@ -1605,6 +1608,8 @@ fn execute_one(
                 fs_cbuf_mask,
                 fs_hash,
                 fs_tex_ids,
+                vs_tex_base,
+                vs_tex_count,
                 fs_sampler_arrayed,
                 fs_cbuf_reads,
                 cbuf_used: vs_cbuf_used.max(fs_cbuf_used),
@@ -1688,6 +1693,8 @@ fn execute_one(
     let vs_cbuf_mask = bundle.vs_cbuf_mask;
     let fs_cbuf_mask = bundle.fs_cbuf_mask;
     let mut fs_tex_ids = bundle.fs_tex_ids.clone();
+    let vs_tex_base = bundle.vs_tex_base;
+    let vs_tex_count = bundle.vs_tex_count;
     let fs_sampler_arrayed = bundle.fs_sampler_arrayed;
 
     let layout = build_vertex_layout(draw)?;
@@ -1741,80 +1748,73 @@ fn execute_one(
     let shader_fs_tex_ids = fs_tex_ids.clone();
     let mut fs_tex_remap: Vec<String> = Vec::with_capacity(fs_tex_ids.len());
     let mut fs_sampler_ids: Vec<u32> = vec![0u32; fs_tex_ids.len()];
+    let via_header_index = maxwell.regs.sampler_binding == 1;
+    let split_vs_stage = std::env::var("NEXIUM_VS_TEX_STAGE_REMAP")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     if !fs_tex_ids.is_empty() {
-        let via_header_index = maxwell.regs.sampler_binding == 1;
-        let tex_cb_index = choose_texture_cb_index(
-            &maxwell.regs.cbuf_binds[4],
-            maxwell.regs.bindless_texture_const_buffer_slot,
-            maxwell.regs.tex_cb_index,
-            &fs_tex_ids,
-            draw.tic_pool_gpu_va,
-            draw.tic_pool_limit,
-            via_header_index,
-            mappings,
-            mem_read,
-        );
-        let (tcb_addr, tcb_size) = maxwell.regs.cbuf_binds[4][tex_cb_index.min(15)];
-        for (i, unit_slot) in fs_tex_ids.iter_mut().enumerate() {
-            let shader_id = *unit_slot;
-            let off = (shader_id as u64).saturating_mul(4);
-            let mut remap = format!(
-                "s{}:{} cb{} base={:#x}/{} off={:#x}",
-                i, shader_id, tex_cb_index, tcb_addr, tcb_size, off
+        let fs_end = if split_vs_stage && vs_tex_count != 0 {
+            (vs_tex_base as usize).min(fs_tex_ids.len())
+        } else {
+            fs_tex_ids.len()
+        };
+        if fs_end != 0 {
+            remap_texture_ids_for_stage(
+                "fs",
+                &maxwell.regs.cbuf_binds[4],
+                maxwell.regs.bindless_texture_const_buffer_slot,
+                maxwell.regs.tex_cb_index,
+                &mut fs_tex_ids[..fs_end],
+                &mut fs_sampler_ids[..fs_end],
+                0,
+                &mut fs_tex_remap,
+                draw.tic_pool_gpu_va,
+                draw.tic_pool_limit,
+                via_header_index,
+                mappings,
+                mem_read,
             );
-            if tcb_addr == 0 {
-                remap.push_str(" no-tcb");
-                fs_tex_remap.push(remap);
-                continue;
+        }
+        if split_vs_stage && vs_tex_count != 0 {
+            let vs_start = (vs_tex_base as usize).min(fs_tex_ids.len());
+            let vs_end = vs_start
+                .saturating_add(vs_tex_count as usize)
+                .min(fs_tex_ids.len());
+            if vs_start < vs_end {
+                remap_texture_ids_for_stage(
+                    "vs",
+                    &maxwell.regs.cbuf_binds[0],
+                    maxwell.regs.bindless_texture_const_buffer_slot,
+                    maxwell.regs.tex_cb_index,
+                    &mut fs_tex_ids[vs_start..vs_end],
+                    &mut fs_sampler_ids[vs_start..vs_end],
+                    vs_start,
+                    &mut fs_tex_remap,
+                    draw.tic_pool_gpu_va,
+                    draw.tic_pool_limit,
+                    via_header_index,
+                    mappings,
+                    mem_read,
+                );
             }
-            if off + 4 > tcb_size as u64 {
-                remap.push_str(" out-of-range");
-                fs_tex_remap.push(remap);
-                continue;
-            }
-            let Some(cpu) = mappings.cpu_address_for(tcb_addr.wrapping_add(off)) else {
-                remap.push_str(" unmapped");
-                fs_tex_remap.push(remap);
-                continue;
-            };
-            let mut bytes = [0u8; 4];
-            if mem_read(cpu, &mut bytes) {
-                let handle = u32::from_le_bytes(bytes);
-                let (tic, tsc) = split_texture_handle(handle, via_header_index);
-                if handle != 0
-                    && texture_tic_readable(
-                        tic,
-                        draw.tic_pool_gpu_va,
-                        draw.tic_pool_limit,
-                        mappings,
-                        mem_read,
-                    )
-                {
-                    if std::env::var_os("NEXIUM_TEX_BIND_LOG").is_some() {
-                        log::warn!(
-                            "tex_handle: cb{} off={:#x} handle={:#x} -> TIC {} TSC {}",
-                            tex_cb_index,
-                            off,
-                            handle,
-                            tic,
-                            tsc
-                        );
-                    }
-                    *unit_slot = tic;
-                    fs_sampler_ids[i] = tsc;
-                    remap.push_str(&format!(" handle={:#x}->tic{} tsc{}", handle, tic, tsc));
-                } else {
-                    remap.push_str(&format!(
-                        " handle={:#x} invalid tic{} tsc{}",
-                        handle, tic, tsc
-                    ));
-                }
-            } else {
-                remap.push_str(" read-fail");
-            }
-            fs_tex_remap.push(remap);
         }
     }
+    trace_vs_tex_remap(
+        vs_addr,
+        fs_addr,
+        vs_tex_base,
+        vs_tex_count,
+        &shader_fs_tex_ids,
+        &fs_tex_ids,
+        &fs_sampler_ids,
+        &fs_tex_remap,
+        maxwell.regs.bindless_texture_const_buffer_slot,
+        maxwell.regs.tex_cb_index,
+        via_header_index,
+        split_vs_stage,
+        draw.tic_pool_gpu_va,
+        draw.tic_pool_limit,
+    );
 
     let mut sampled_rt_fuzzy = false;
     let mut sampled_rt_keys: Vec<RtKey> = Vec::new();
@@ -2209,7 +2209,11 @@ fn execute_one(
         }
     });
     let compact_attachments: [BlendAttachmentState; 8] = std::array::from_fn(|index| {
-        let location = color_rt_locations.get(index).copied().unwrap_or(index).min(7);
+        let location = color_rt_locations
+            .get(index)
+            .copied()
+            .unwrap_or(index)
+            .min(7);
         attachments[location]
     });
     let blend_state = BlendState {
@@ -2438,6 +2442,8 @@ fn execute_one(
         vs_cbuf_mask,
         fs_cbuf_mask,
         fs_tex_ids,
+        vs_tex_base,
+        vs_tex_count,
         vertex_layout: layout,
         cbuf_addr: call_cbuf_addr,
         cbuf_size: call_cbuf_size,
@@ -3751,9 +3757,9 @@ fn trace_grade_discover(
     } else {
         color_rt_keys
     };
-    let tiny = keys
-        .iter()
-        .any(|key| key.height <= 64 || key.width <= 128 || key.width.saturating_mul(key.height) <= 0x4000);
+    let tiny = keys.iter().any(|key| {
+        key.height <= 64 || key.width <= 128 || key.width.saturating_mul(key.height) <= 0x4000
+    });
     if !tiny {
         return;
     }
@@ -4059,7 +4065,11 @@ fn trace_draw(
         .map(|(index, key)| {
             let location = color_rt_locations.get(index).copied().unwrap_or(index);
             let slot = rt_control_target(draw.rt_control, location);
-            let mask_index = if color_mask_common { 0 } else { location.min(7) };
+            let mask_index = if color_mask_common {
+                0
+            } else {
+                location.min(7)
+            };
             let shader_mask = fragment_output_mask(fs_output_map, location as u32);
             let maxwell_mask = color_masks[mask_index];
             let final_mask = blend.attachments[index.min(7)].color_write_mask.as_raw();
@@ -4410,13 +4420,18 @@ fn trace_cbuf_watch(
         let value_key = (region.slot, region.offset, len, addr);
         let first = {
             let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-            seen.lock().map(|mut seen| seen.insert(seen_key)).unwrap_or(false)
+            seen.lock()
+                .map(|mut seen| seen.insert(seen_key))
+                .unwrap_or(false)
         };
         let changed = {
             let last = LAST.get_or_init(|| Mutex::new(HashMap::new()));
             match last.lock() {
                 Ok(mut last) => {
-                    let changed = last.get(&value_key).map(|old| old != &bytes).unwrap_or(true);
+                    let changed = last
+                        .get(&value_key)
+                        .map(|old| old != &bytes)
+                        .unwrap_or(true);
                     if changed {
                         last.insert(value_key, bytes.clone());
                     }
@@ -4497,6 +4512,144 @@ fn cbuf_bind_for_slot(cbuf_binds: &[[(u64, u32); 16]; 5], logical_slot: u32) -> 
     let stage = if logical_slot < 16 { 0 } else { 4 };
     let binding = (logical_slot & 15) as usize;
     cbuf_binds[stage][binding]
+}
+
+fn remap_texture_ids_for_stage(
+    stage_name: &str,
+    cbuf_binds: &[(u64, u32); 16],
+    bindless_slot: u32,
+    tex_cb_slot: u32,
+    tex_ids: &mut [u32],
+    sampler_ids: &mut [u32],
+    slot_offset: usize,
+    tex_remap: &mut Vec<String>,
+    tic_pool_gpu_va: u64,
+    tic_pool_limit: u32,
+    via_header_index: bool,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) {
+    let tex_cb_index = choose_texture_cb_index(
+        cbuf_binds,
+        bindless_slot,
+        tex_cb_slot,
+        tex_ids,
+        tic_pool_gpu_va,
+        tic_pool_limit,
+        via_header_index,
+        mappings,
+        mem_read,
+    );
+    let (tcb_addr, tcb_size) = cbuf_binds[tex_cb_index.min(15)];
+    for (local_i, unit_slot) in tex_ids.iter_mut().enumerate() {
+        let i = slot_offset + local_i;
+        let shader_id = *unit_slot;
+        let off = (shader_id as u64).saturating_mul(4);
+        let mut remap = format!(
+            "s{}:{} stage={} cb{} base={:#x}/{} off={:#x}",
+            i, shader_id, stage_name, tex_cb_index, tcb_addr, tcb_size, off
+        );
+        if tcb_addr == 0 {
+            remap.push_str(" no-tcb");
+            tex_remap.push(remap);
+            continue;
+        }
+        if off + 4 > tcb_size as u64 {
+            remap.push_str(" out-of-range");
+            tex_remap.push(remap);
+            continue;
+        }
+        let Some(cpu) = mappings.cpu_address_for(tcb_addr.wrapping_add(off)) else {
+            remap.push_str(" unmapped");
+            tex_remap.push(remap);
+            continue;
+        };
+        let mut bytes = [0u8; 4];
+        if mem_read(cpu, &mut bytes) {
+            let handle = u32::from_le_bytes(bytes);
+            let (tic, tsc) = split_texture_handle(handle, via_header_index);
+            if handle != 0
+                && texture_tic_readable(tic, tic_pool_gpu_va, tic_pool_limit, mappings, mem_read)
+            {
+                if std::env::var_os("NEXIUM_TEX_BIND_LOG").is_some() {
+                    log::warn!(
+                        "tex_handle: stage={} cb{} off={:#x} handle={:#x} -> TIC {} TSC {}",
+                        stage_name,
+                        tex_cb_index,
+                        off,
+                        handle,
+                        tic,
+                        tsc
+                    );
+                }
+                *unit_slot = tic;
+                sampler_ids[local_i] = tsc;
+                remap.push_str(&format!(" handle={:#x}->tic{} tsc{}", handle, tic, tsc));
+            } else {
+                remap.push_str(&format!(
+                    " handle={:#x} invalid tic{} tsc{}",
+                    handle, tic, tsc
+                ));
+            }
+        } else {
+            remap.push_str(" read-fail");
+        }
+        tex_remap.push(remap);
+    }
+}
+
+fn trace_vs_tex_remap(
+    vs_addr: u64,
+    fs_addr: u64,
+    vs_tex_base: u32,
+    vs_tex_count: u32,
+    shader_tex_ids: &[u32],
+    final_tex_ids: &[u32],
+    sampler_ids: &[u32],
+    tex_remap: &[String],
+    bindless_slot: u32,
+    tex_cb_slot: u32,
+    via_header_index: bool,
+    split_vs_stage: bool,
+    tic_pool_gpu_va: u64,
+    tic_pool_limit: u32,
+) {
+    if vs_tex_count == 0 || !vs_tex_bind_fs_trace(fs_addr) {
+        return;
+    }
+    log::warn!(
+        "[vs-tex-remap] vs={:#x} fs={:#x} base={} count={} shader_tex={:?} final_tex={:?} samplers={:?} remap=[{}] bindless_slot={} tex_cb_slot={} via_header={} split_vs_stage={} tic_pool={:#x} limit={}",
+        vs_addr,
+        fs_addr,
+        vs_tex_base,
+        vs_tex_count,
+        shader_tex_ids,
+        final_tex_ids,
+        sampler_ids,
+        tex_remap.join(" | "),
+        bindless_slot,
+        tex_cb_slot,
+        via_header_index,
+        split_vs_stage,
+        tic_pool_gpu_va,
+        tic_pool_limit
+    );
+}
+
+fn vs_tex_bind_fs_trace(fs_addr: u64) -> bool {
+    use std::sync::OnceLock;
+    static CONFIG: OnceLock<(bool, Vec<u64>)> = OnceLock::new();
+    let (all, list) = CONFIG.get_or_init(|| {
+        (
+            std::env::var_os("NEXIUM_VS_TEX_BIND").is_some(),
+            parse_env_u64_list("NEXIUM_VS_TEX_BIND_FS"),
+        )
+    });
+    if !list.is_empty() {
+        list.contains(&fs_addr)
+    } else {
+        *all
+    }
 }
 
 fn choose_texture_cb_index(

@@ -1,6 +1,7 @@
 use ash::vk;
 use parking_lot::Mutex;
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::collections::{hash_map::DefaultHasher, hash_map::Entry, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::descriptor::{DescriptorPool, DescriptorSetLayout};
@@ -2079,6 +2080,18 @@ impl Renderer {
                             view_format, swizzle, bound_tex_views[slot]
                         );
                     }
+                    trace_vs_tex_bind_alias(
+                        device,
+                        *cmd_pool,
+                        *queue,
+                        rt_cache,
+                        mem_props,
+                        call,
+                        slot,
+                        alias,
+                        view_format,
+                        bound_tex_views[slot],
+                    );
                     continue;
                 }
             }
@@ -2090,24 +2103,70 @@ impl Renderer {
                         slot
                     );
                 }
+                trace_vs_tex_bind_dummy(call, slot, &read_guest);
                 continue;
             };
-            if let Some(raw) = read_guest(tic.gpu_va, read_size) {
-                let tex_hash = hash_src_prefix(&raw);
-                let cur_gen = crate::tex_invalidate::region_gen_range(tic.gpu_va, read_size as u64);
+            let cur_gen = crate::tex_invalidate::region_gen_range(tic.gpu_va, read_size as u64);
+            let identity_volume =
+                key.volume && std::env::var_os("NEXIUM_VOLUME_IDENTITY").is_some();
+            let volume_slices = if key.volume && !identity_volume {
+                let sampled_key = sampled_rt_key_for_slot(call, slot);
+                find_volume_rt_slices(rt_cache, &tic, pitch_size, key.layers, sampled_key)
+            } else {
+                None
+            };
+            if let Some(slices) = volume_slices.as_ref() {
+                trace_volume_rt_pixels(
+                    device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
+                );
+            }
+            let raw = read_guest(tic.gpu_va, read_size);
+            if raw.is_some() || volume_slices.is_some() || identity_volume {
+                let raw_hash = raw.as_ref().map(|raw| hash_src_prefix(raw));
+                let mut tex_hash = raw_hash.unwrap_or_else(|| texture_seed_hash(&key));
+                if let Some(slices) = volume_slices.as_ref() {
+                    tex_hash = volume_rt_slice_hash(tex_hash, slices);
+                }
                 let force_refresh = force_refresh_texture(tic.gpu_va);
                 let need_upload = force_refresh
                     || match tex_cache.get(&key) {
-                        Some(t) => t.gen != cur_gen || t.hash != tex_hash,
+                        Some(t) => {
+                            if key.volume && volume_slices.is_none() {
+                                raw_hash.map_or(false, |raw_hash| {
+                                    if t.hash != raw_hash {
+                                        t.gen != cur_gen
+                                    } else {
+                                        t.gen != cur_gen || t.hash != tex_hash
+                                    }
+                                })
+                            } else {
+                                t.gen != cur_gen || t.hash != tex_hash
+                            }
+                        }
                         None => true,
                     };
                 if need_upload {
                     let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
                         .map(|v| v == "1")
                         .unwrap_or(false);
-                    let image_format = texture_image_format(tic.format, false, tic.is_srgb);
-                    let texels =
-                        texture_upload_data(&raw, &tic, pitch_size, force_pitch, image_format);
+                    let image_format = if identity_volume {
+                        vk::Format::R8G8B8A8_UNORM
+                    } else if let Some(slice) =
+                        volume_slices.as_ref().and_then(|slices| slices.first())
+                    {
+                        slice.format
+                    } else {
+                        texture_image_format(tic.format, false, tic.is_srgb)
+                    };
+                    let texels = if volume_slices.is_some() {
+                        Vec::new()
+                    } else if identity_volume {
+                        identity_volume_rgba8(key.width, key.height, key.layers)
+                    } else if let Some(raw) = raw.as_ref() {
+                        texture_upload_data(raw, &tic, pitch_size, force_pitch, image_format)
+                    } else {
+                        Vec::new()
+                    };
                     if std::env::var_os("NEXIUM_TEX_AVG").is_some() && texels.len() >= 4 {
                         let n = (texels.len() / 4).max(1) as u64;
                         let (mut ar, mut ag, mut ab) = (0u64, 0u64, 0u64);
@@ -2118,8 +2177,14 @@ impl Renderer {
                         }
                         log::warn!(
                             "[tex-avg] va={:#x} {}x{} {:?} srgb={} avg=({},{},{})",
-                            tic.gpu_va, tic.width, tic.height, tic.format, tic.is_srgb,
-                            ar / n, ag / n, ab / n
+                            tic.gpu_va,
+                            tic.width,
+                            tic.height,
+                            tic.format,
+                            tic.is_srgb,
+                            ar / n,
+                            ag / n,
+                            ab / n
                         );
                     }
                     log::debug!(
@@ -2140,6 +2205,7 @@ impl Renderer {
                         key.arrayed,
                         key.volume,
                         &texels,
+                        volume_slices.as_deref(),
                         tic.swizzle,
                         image_format,
                         tex_hash,
@@ -2169,6 +2235,18 @@ impl Renderer {
                     if key.volume { bound_tex_views_3d[slot] } else { bound_tex_views[slot] }
                 );
             }
+            trace_vs_tex_bind_texture(
+                call,
+                slot,
+                key,
+                tic,
+                tex_cache.get(&key).is_some(),
+                if key.volume {
+                    bound_tex_views_3d[slot]
+                } else {
+                    bound_tex_views[slot]
+                },
+            );
         }
         let mut bound_samplers = vec![default_samp; max_texture_descriptors()];
         for (slot, tsc) in tsc_entries.iter().enumerate() {
@@ -3304,6 +3382,18 @@ impl Renderer {
                                 alias_snapshotted.get(slot).copied().unwrap_or(false)
                             );
                         }
+                        trace_vs_tex_bind_alias(
+                            device,
+                            *cmd_pool,
+                            *queue,
+                            rt_cache,
+                            mem_props,
+                            call,
+                            slot,
+                            alias,
+                            view_format,
+                            bound_tex_views[slot],
+                        );
                         if !alias.depth
                             && color_keys.contains(&alias.key)
                             && !alias_snapshotted.get(slot).copied().unwrap_or(false)
@@ -3321,8 +3411,23 @@ impl Renderer {
                             slot
                         );
                     }
+                    trace_vs_tex_bind_dummy(call, slot, &read_guest);
                     continue;
                 };
+                let cur_gen = crate::tex_invalidate::region_gen_range(tic.gpu_va, read_size as u64);
+                let identity_volume =
+                    key.volume && std::env::var_os("NEXIUM_VOLUME_IDENTITY").is_some();
+                let volume_slices = if key.volume && !identity_volume {
+                    let sampled_key = sampled_rt_key_for_slot(call, slot);
+                    find_volume_rt_slices(rt_cache, &tic, pitch_size, key.layers, sampled_key)
+                } else {
+                    None
+                };
+                if let Some(slices) = volume_slices.as_ref() {
+                    trace_volume_rt_pixels(
+                        device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
+                    );
+                }
                 let raw_entry = match tex_raw_cache.entry((tic.gpu_va, read_size)) {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => {
@@ -3332,31 +3437,25 @@ impl Renderer {
                         }))
                     }
                 };
-                if let Some((tex_hash, raw)) = raw_entry.as_ref() {
-                    let raw_hash = *tex_hash;
-                    let mut tex_hash = raw_hash;
-                    let cur_gen =
-                        crate::tex_invalidate::region_gen_range(tic.gpu_va, read_size as u64);
-                    let identity_volume =
-                        key.volume && std::env::var_os("NEXIUM_VOLUME_IDENTITY").is_some();
-                    let volume_slices = if key.volume && !identity_volume {
-                        let sampled_key = call.sampled_rt_slots.get(slot).copied().flatten();
-                        find_volume_rt_slices(rt_cache, &tic, pitch_size, key.layers, sampled_key)
-                    } else {
-                        None
-                    };
+                let raw = raw_entry.as_ref().map(|(_, raw)| raw.as_slice());
+                let raw_hash = raw_entry.as_ref().map(|(tex_hash, _)| *tex_hash);
+                if raw.is_some() || volume_slices.is_some() || identity_volume {
+                    let mut tex_hash = raw_hash.unwrap_or_else(|| texture_seed_hash(&key));
                     if let Some(slices) = volume_slices.as_ref() {
                         tex_hash = volume_rt_slice_hash(tex_hash, slices);
-                        trace_volume_rt_pixels(
-                            device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
-                        );
                     }
                     let force_refresh = force_refresh_texture(tic.gpu_va);
                     let need_upload = force_refresh
                         || match tex_cache.get(&key) {
                             Some(t) => {
-                                if key.volume && volume_slices.is_none() && t.hash != raw_hash {
-                                    t.gen != cur_gen
+                                if key.volume && volume_slices.is_none() {
+                                    raw_hash.map_or(false, |raw_hash| {
+                                        if t.hash != raw_hash {
+                                            t.gen != cur_gen
+                                        } else {
+                                            t.gen != cur_gen || t.hash != tex_hash
+                                        }
+                                    })
                                 } else {
                                     t.gen != cur_gen || t.hash != tex_hash
                                 }
@@ -3380,8 +3479,10 @@ impl Renderer {
                             Vec::new()
                         } else if identity_volume {
                             identity_volume_rgba8(key.width, key.height, key.layers)
-                        } else {
+                        } else if let Some(raw) = raw {
                             texture_upload_data(raw, &tic, pitch_size, force_pitch, image_format)
+                        } else {
+                            Vec::new()
                         };
                         let dump_stats = std::env::var_os("NEXIUM_TEXDUMP")
                             .map(|v| v == "1")
@@ -3397,8 +3498,10 @@ impl Renderer {
                                     texels.clone()
                                 } else if identity_volume {
                                     identity_volume_rgba8(key.width, key.height, key.layers)
-                                } else {
+                                } else if let Some(raw) = raw {
                                     decode_texture_rgba8_layers(raw, &tic, pitch_size, force_pitch)
+                                } else {
+                                    Vec::new()
                                 },
                             )
                         } else {
@@ -3429,7 +3532,7 @@ impl Renderer {
                                     tic.is_block_linear, tic.block_height_log2, read_size, pitch_size,
                                     crate::pitch_oracle::is_pitch_dst(tic.gpu_va),
                                     sr / n, sg / n, sb / n, sa / n, amin, amax,
-                                    &raw[..16.min(raw.len())],
+                                    raw.map(|raw| &raw[..16.min(raw.len())]).unwrap_or(&[]),
                                 );
                             }
                         }
@@ -3513,6 +3616,18 @@ impl Renderer {
                         }
                     }
                 }
+                trace_vs_tex_bind_texture(
+                    call,
+                    slot,
+                    key,
+                    tic,
+                    tex_cache.get(&key).is_some(),
+                    if key.volume {
+                        bound_tex_views_3d[slot]
+                    } else {
+                        bound_tex_views[slot]
+                    },
+                );
             }
 
             let vertex_binds = upload_vertex_bindings(
@@ -4905,6 +5020,262 @@ fn bind_trace_fs(fs_gpu_va: u64) -> bool {
     list.contains(&fs_gpu_va)
 }
 
+fn vs_tex_slot(call: &crate::draw::Maxwell3dDrawCall, slot: usize) -> Option<(usize, u32)> {
+    let base = call.vs_tex_base as usize;
+    let count = call.vs_tex_count as usize;
+    if count == 0 || slot < base || slot >= base.saturating_add(count) {
+        return None;
+    }
+    Some((
+        slot - base,
+        call.fs_tex_ids.get(slot).copied().unwrap_or(u32::MAX),
+    ))
+}
+
+fn vs_tex_bind_trace(call: &crate::draw::Maxwell3dDrawCall) -> bool {
+    if call.vs_tex_count == 0 {
+        return false;
+    }
+    if let Ok(list) = std::env::var("NEXIUM_VS_TEX_BIND_FS") {
+        return list
+            .split(',')
+            .filter_map(|part| parse_u64_value(part.trim()))
+            .any(|addr| addr == call.fs_gpu_va);
+    }
+    std::env::var_os("NEXIUM_VS_TEX_BIND").is_some() || bind_trace_fs(call.fs_gpu_va)
+}
+
+fn rt_stamp(rt_cache: &RtCache, key: RtKey) -> u64 {
+    rt_cache
+        .debug_all()
+        .into_iter()
+        .find_map(|(k, stamp)| if k == key { Some(stamp) } else { None })
+        .unwrap_or(0)
+}
+
+fn trace_vs_tex_bind_alias(
+    device: &ash::Device,
+    cmd_pool: vk::CommandPool,
+    queue: vk::Queue,
+    rt_cache: &mut RtCache,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    call: &crate::draw::Maxwell3dDrawCall,
+    slot: usize,
+    alias: RtAlias,
+    view_format: vk::Format,
+    bound: vk::ImageView,
+) {
+    let Some((vs_slot, tex_id)) = vs_tex_slot(call, slot) else {
+        return;
+    };
+    if !vs_tex_bind_trace(call) {
+        return;
+    }
+    log::warn!(
+        "[vs-tex-bind] vs={:#x} fs={:#x} vs_slot={} slot={} tex_id={} base={} count={} source=ALIAS key={} fmt={:?}->{:?} stamp={} depth={} bound={:?}",
+        call.vs_gpu_va,
+        call.fs_gpu_va,
+        vs_slot,
+        slot,
+        tex_id,
+        call.vs_tex_base,
+        call.vs_tex_count,
+        alias.key.label(),
+        alias.format,
+        view_format,
+        rt_stamp(rt_cache, alias.key),
+        alias.depth,
+        bound
+    );
+    trace_vs_tex_bind_alias_stats(
+        device, cmd_pool, queue, rt_cache, mem_props, call, vs_slot, slot, tex_id, alias,
+    );
+}
+
+fn trace_vs_tex_bind_dummy<F>(call: &crate::draw::Maxwell3dDrawCall, slot: usize, read_guest: &F)
+where
+    F: Fn(u64, usize) -> Option<Vec<u8>>,
+{
+    let Some((vs_slot, tex_id)) = vs_tex_slot(call, slot) else {
+        return;
+    };
+    if !vs_tex_bind_trace(call) {
+        return;
+    }
+    let reason = vs_tex_dummy_reason(call, tex_id, read_guest);
+    log::warn!(
+        "[vs-tex-bind] vs={:#x} fs={:#x} vs_slot={} slot={} tex_id={} base={} count={} source=DUMMY tic_pool={:#x} limit={} reason={}",
+        call.vs_gpu_va,
+        call.fs_gpu_va,
+        vs_slot,
+        slot,
+        tex_id,
+        call.vs_tex_base,
+        call.vs_tex_count,
+        call.tic_pool_gpu_va,
+        call.tic_pool_limit,
+        reason
+    );
+}
+
+fn vs_tex_dummy_reason<F>(
+    call: &crate::draw::Maxwell3dDrawCall,
+    tex_id: u32,
+    read_guest: &F,
+) -> String
+where
+    F: Fn(u64, usize) -> Option<Vec<u8>>,
+{
+    if tex_id == u32::MAX {
+        return "tex-id-invalid".to_string();
+    }
+    if call.tic_pool_gpu_va == 0 {
+        return "tic-pool-zero".to_string();
+    }
+    if tex_id > call.tic_pool_limit {
+        return format!(
+            "tic-out-of-range id={} limit={}",
+            tex_id, call.tic_pool_limit
+        );
+    }
+    let tic_addr = call.tic_pool_gpu_va.wrapping_add((tex_id as u64) * 32);
+    let Some(raw) = read_guest(tic_addr, 32) else {
+        return format!("tic-read-fail addr={:#x}", tic_addr);
+    };
+    let raw_hex = raw
+        .iter()
+        .take(32)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join("");
+    match crate::texture::TicEntry::parse(&raw) {
+        Some(tic) => format!(
+            "tic-parse-ok-unexpected addr={:#x} va={:#x} {}x{} fmt={:?} raw={}",
+            tic_addr, tic.gpu_va, tic.width, tic.height, tic.format, raw_hex
+        ),
+        None => format!("tic-parse-fail addr={:#x} raw={}", tic_addr, raw_hex),
+    }
+}
+
+fn trace_vs_tex_bind_texture(
+    call: &crate::draw::Maxwell3dDrawCall,
+    slot: usize,
+    key: TexCacheKey,
+    tic: crate::texture::TicEntry,
+    cache_hit: bool,
+    bound: vk::ImageView,
+) {
+    let Some((vs_slot, tex_id)) = vs_tex_slot(call, slot) else {
+        return;
+    };
+    if !vs_tex_bind_trace(call) {
+        return;
+    }
+    log::warn!(
+        "[vs-tex-bind] vs={:#x} fs={:#x} vs_slot={} slot={} tex_id={} base={} count={} source=TEX va={:#x} {}x{}x{} fmt={:?} vol={} cache_hit={} bound={:?}",
+        call.vs_gpu_va,
+        call.fs_gpu_va,
+        vs_slot,
+        slot,
+        tex_id,
+        call.vs_tex_base,
+        call.vs_tex_count,
+        tic.gpu_va,
+        tic.width,
+        tic.height,
+        key.layers,
+        tic.format,
+        key.volume,
+        cache_hit,
+        bound
+    );
+}
+
+fn trace_vs_tex_bind_alias_stats(
+    device: &ash::Device,
+    cmd_pool: vk::CommandPool,
+    queue: vk::Queue,
+    rt_cache: &mut RtCache,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    call: &crate::draw::Maxwell3dDrawCall,
+    vs_slot: usize,
+    slot: usize,
+    tex_id: u32,
+    alias: RtAlias,
+) {
+    if alias.depth || std::env::var_os("NEXIUM_VS_TEX_BIND_STATS").is_none() {
+        return;
+    }
+    {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<std::collections::HashSet<(u64, u64, usize, RtKey)>>> =
+            OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        if !seen
+            .lock()
+            .unwrap()
+            .insert((call.vs_gpu_va, call.fs_gpu_va, slot, alias.key))
+        {
+            return;
+        }
+    }
+    let stamp = rt_stamp(rt_cache, alias.key);
+    match read_rt_image_stats(device, cmd_pool, queue, rt_cache, mem_props, alias.key) {
+        Some(stats) => {
+            let avg_rgb = if stats.pixels == 0 {
+                0.0
+            } else {
+                stats.rgb_sum as f64 / (stats.pixels as f64 * 3.0)
+            };
+            let avg_alpha = if stats.pixels == 0 {
+                0.0
+            } else {
+                stats.alpha_sum as f64 / stats.pixels as f64
+            };
+            let first = stats
+                .first
+                .map(|(x, y, rgba)| {
+                    format!(
+                        "{},{}:{:02x}{:02x}{:02x}{:02x}",
+                        x, y, rgba[0], rgba[1], rgba[2], rgba[3]
+                    )
+                })
+                .unwrap_or_else(|| "-".to_string());
+            log::warn!(
+                "[vs-tex-bind-stats] vs={:#x} fs={:#x} vs_slot={} slot={} tex_id={} key={} fmt={:?} stamp={} rawbnz={} rawwnz={} rgbnz={}/{} avg_rgb={:.2} avg_a={:.2} max={} first={}",
+                call.vs_gpu_va,
+                call.fs_gpu_va,
+                vs_slot,
+                slot,
+                tex_id,
+                alias.key.label(),
+                stats.format,
+                stamp,
+                stats.raw_nonzero_bytes,
+                stats.raw_nonzero_words,
+                stats.rgb_nonzero,
+                stats.pixels,
+                avg_rgb,
+                avg_alpha,
+                stats.rgb_max,
+                first
+            );
+        }
+        None => {
+            log::warn!(
+                "[vs-tex-bind-stats] vs={:#x} fs={:#x} vs_slot={} slot={} tex_id={} key={} stamp={} readback=failed",
+                call.vs_gpu_va,
+                call.fs_gpu_va,
+                vs_slot,
+                slot,
+                tex_id,
+                alias.key.label(),
+                stamp
+            );
+        }
+    }
+}
+
 fn verify_volume_image(
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
@@ -5037,6 +5408,12 @@ fn force_refresh_texture(gpu_va: u64) -> bool {
     u64::from_str_radix(s, 16)
         .map(|target| target == gpu_va)
         .unwrap_or(false)
+}
+
+fn texture_seed_hash(key: &TexCacheKey) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn tic_is_arrayed(tic: &crate::texture::TicEntry) -> bool {
@@ -5209,6 +5586,37 @@ fn volume_from_guest(gpu_va: u64) -> bool {
     list.contains(&gpu_va)
 }
 
+fn trace_volume_rt_skip(
+    tic: &crate::texture::TicEntry,
+    pitch_size: usize,
+    layers: u32,
+    reason: &'static str,
+) {
+    if std::env::var_os("NEXIUM_VOLUME_DBG").is_none() {
+        return;
+    }
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<(u64, u32, &'static str)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if seen.lock().unwrap().insert((tic.gpu_va, layers, reason)) {
+        log::warn!(
+            "[volume-rt-skip] va={:#x} reason={} {}x{}x{} pitch={} bl={} bw={} bh={} bd={} tw={}",
+            tic.gpu_va,
+            reason,
+            tic.width,
+            tic.height,
+            layers,
+            pitch_size,
+            tic.is_block_linear,
+            tic.block_width_log2,
+            tic.block_height_log2,
+            tic.block_depth_log2,
+            tic.tile_width_spacing
+        );
+    }
+}
+
 fn find_volume_rt_slices(
     rt_cache: &RtCache,
     tic: &crate::texture::TicEntry,
@@ -5217,14 +5625,44 @@ fn find_volume_rt_slices(
     base_key: Option<RtKey>,
 ) -> Option<Vec<VolumeRtSlice>> {
     if layers == 0 {
+        trace_volume_rt_skip(tic, pitch_size, layers, "no-layers");
         return None;
     }
     if volume_from_guest(tic.gpu_va) {
+        trace_volume_rt_skip(tic, pitch_size, layers, "forced-guest");
         return None;
     }
-    let offsets = volume_slice_offsets(tic, pitch_size, layers)?;
-    if offsets.is_empty() {
+    let Some(offsets) = volume_slice_offsets(tic, pitch_size, layers) else {
+        trace_volume_rt_skip(tic, pitch_size, layers, "no-offsets");
         return None;
+    };
+    if offsets.is_empty() {
+        trace_volume_rt_skip(tic, pitch_size, layers, "empty-offsets");
+        return None;
+    }
+    if std::env::var_os("NEXIUM_VOLUME_DBG").is_some() {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static PROBED: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+        let probed = PROBED.get_or_init(|| Mutex::new(HashSet::new()));
+        if probed.lock().unwrap().insert(tic.gpu_va) {
+            log::warn!(
+                "[volume-rt-probe] va={:#x} {}x{}x{} pitch={} offs0={:#x} offslast={:#x} bl={} bw={} bh={} bd={} tw={} base_key={}",
+                tic.gpu_va,
+                tic.width,
+                tic.height,
+                layers,
+                pitch_size,
+                offsets.first().copied().unwrap_or(0),
+                offsets.last().copied().unwrap_or(0),
+                tic.is_block_linear,
+                tic.block_width_log2,
+                tic.block_height_log2,
+                tic.block_depth_log2,
+                tic.tile_width_spacing,
+                base_key.map(|key| key.label()).unwrap_or_default()
+            );
+        }
     }
     let allow_partial = std::env::var_os("NEXIUM_VOLUME_PARTIAL").is_some();
     let mut out = Vec::with_capacity(layers as usize);
@@ -6750,6 +7188,7 @@ fn upload_texture_oneshot(
     arrayed: bool,
     volume: bool,
     rgba8: &[u8],
+    volume_slices: Option<&[VolumeRtSlice]>,
     swizzle: [crate::texture::SwizzleSource; 4],
     format: vk::Format,
     hash: u64,
@@ -6769,7 +7208,7 @@ fn upload_texture_oneshot(
         arrayed,
         volume,
         rgba8,
-        None,
+        volume_slices,
         swizzle,
         format,
         hash,

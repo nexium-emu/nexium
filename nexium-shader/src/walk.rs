@@ -27,10 +27,14 @@ pub fn walk_instructions(code: &[u8]) -> Vec<Instruction> {
             let bytes: [u8; 8] = code[inst_off..inst_off + 8].try_into().unwrap();
             let insn = u64::from_le_bytes(bytes);
             if let Some(decoded) = decode_one(insn) {
+                let exit = matches!(decoded.opcode, Opcode::EXIT);
                 out.push(Instruction {
                     byte_offset: inst_off,
                     decoded,
                 });
+                if exit {
+                    return out;
+                }
             }
         }
         off += 32;
@@ -120,5 +124,15 @@ mod tests {
     fn empty_code_returns_empty() {
         let ids = extract_fs_tex_ids(&[], 15);
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn extract_stops_at_exit() {
+        let code = make_group(0xe30000000007000f, make_ldc(0x14, 15), make_ldc(0x18, 15));
+        let ids = extract_fs_tex_ids(&code, 15);
+        assert!(
+            ids.is_empty(),
+            "post-exit bytes must not be walked: {ids:?}"
+        );
     }
 }

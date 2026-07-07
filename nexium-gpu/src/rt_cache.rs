@@ -290,7 +290,9 @@ impl RtCache {
                     .cache
                     .keys()
                     .filter(|k| same_aspect(k))
-                    .filter(|k| dims_close(k.width, want.width) && dims_close(k.height, want.height))
+                    .filter(|k| {
+                        dims_close(k.width, want.width) && dims_close(k.height, want.height)
+                    })
                     .filter(|k| !self.present_excluded.contains(k))
                     .filter_map(|k| {
                         let fd = self.frame_draws.get(k).copied().unwrap_or(0);
