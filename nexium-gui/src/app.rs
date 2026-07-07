@@ -16,8 +16,11 @@ const BG: Color32 = Color32::from_rgb(0x0F, 0x0F, 0x11);
 const BG_RAISED: Color32 = Color32::from_rgb(0x18, 0x18, 0x1C);
 const BG_INPUT: Color32 = Color32::from_rgb(0x20, 0x20, 0x26);
 const BORDER: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x32);
-const ACCENT: Color32 = Color32::from_rgb(0xE0, 0x2A, 0x2A);
-const ACCENT_HV: Color32 = Color32::from_rgb(0xF0, 0x3C, 0x3C);
+const ACCENT: Color32 = Color32::from_rgb(0x2F, 0xB4, 0xEF);
+const ACCENT_HV: Color32 = Color32::from_rgb(0x5C, 0xF2, 0xFF);
+const ACCENT_DK: Color32 = Color32::from_rgb(0x0D, 0x6F, 0xBB);
+const DANGER: Color32 = Color32::from_rgb(0xE0, 0x2A, 0x2A);
+const DANGER_HV: Color32 = Color32::from_rgb(0xF0, 0x3C, 0x3C);
 const TEXT: Color32 = Color32::from_rgb(0xEC, 0xEC, 0xF0);
 const MUTED: Color32 = Color32::from_rgb(0x70, 0x70, 0x80);
 const GREEN: Color32 = Color32::from_rgb(0x3C, 0xD4, 0x5C);
@@ -42,6 +45,9 @@ pub struct HorizonApp {
     last_buttons_logged: u64,
     last_sticks_logged: [i32; 4],
     audio_device_cache: Option<Vec<String>>,
+    splash: crate::splash::Splash,
+    library: crate::library::Library,
+    stop_fade: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,7 +97,11 @@ impl HorizonApp {
             last_buttons_logged: 0,
             last_sticks_logged: [0; 4],
             audio_device_cache: None,
+            splash: crate::splash::Splash::new(),
+            library: crate::library::Library::new(),
+            stop_fade: None,
         };
+        app.library.rescan(&cc.egui_ctx);
         if !nro_path.is_empty() {
             let backend = app.app_settings.cpu_backend.to_cpu_kind();
             if let Ok(handle) = EmulationHandle::new(&nro_path, backend, Some(cc.egui_ctx.clone()))
@@ -145,12 +155,116 @@ impl HorizonApp {
         s.visuals.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
         s.visuals.widgets.open.bg_fill = BG_INPUT;
         s.visuals.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT);
-        s.visuals.selection.bg_fill = Color32::from_rgba_premultiplied(0xE0, 0x2A, 0x2A, 0x50);
+        s.visuals.selection.bg_fill = Color32::from_rgba_premultiplied(0x2F, 0xB4, 0xEF, 0x50);
         s.spacing.item_spacing = Vec2::new(6.0, 4.0);
         s.spacing.button_padding = Vec2::new(10.0, 5.0);
         s.spacing.menu_margin = egui::Margin::same(6.0);
         s.spacing.window_margin = egui::Margin::same(12.0);
         ctx.set_style(s);
+    }
+
+    fn library_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        const MARGIN: f32 = 26.0;
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            ui.add_space(MARGIN);
+            ui.label(egui::RichText::new("Library").size(22.0).strong().color(TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(MARGIN);
+                if pill_button(ui, "Open file…", true).clicked() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Switch games", &["nro", "dxci", "dnsp"])
+                        .pick_file()
+                    {
+                        self.nro_path = p.to_string_lossy().to_string();
+                        self.boot_nro(ctx);
+                    }
+                }
+                ui.add_space(8.0);
+                if pill_button(ui, "Refresh", false).clicked() {
+                    self.library.rescan(ctx);
+                }
+            });
+        });
+        ui.add_space(12.0);
+
+        if !self.library.loaded {
+            ui.centered_and_justified(|ui| ui.add(egui::Spinner::new().size(28.0)));
+            return;
+        }
+        if self.library.games.is_empty() {
+            let dir = nexium_common::paths::nro_dir();
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("No games found").size(18.0).color(TEXT));
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!("Place .nro games in {}", dir.display()))
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                });
+            });
+            return;
+        }
+
+        {
+            let w = &mut ui.style_mut().visuals.widgets;
+            let dim = Color32::from_rgb(0x1E, 0x5D, 0x7A);
+            w.inactive.bg_fill = dim;
+            w.inactive.weak_bg_fill = dim;
+            w.hovered.bg_fill = ACCENT;
+            w.hovered.weak_bg_fill = ACCENT;
+            w.active.bg_fill = ACCENT_HV;
+            w.active.weak_bg_fill = ACCENT_HV;
+        }
+
+        let mut launch: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+            ui.add_space(8.0);
+            let tw = 154.0;
+            let gap = 20.0;
+            let n = self.library.games.len();
+            let avail = ui.clip_rect().width();
+            let cols = (((avail - 2.0 * MARGIN + gap) / (tw + gap)).floor() as usize).clamp(1, n);
+            let total = cols as f32 * tw + (cols.saturating_sub(1)) as f32 * gap;
+            let left = ((avail - total) * 0.5).max(MARGIN);
+            let mut idx = 0;
+            while idx < n {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.add_space(left);
+                    for c in 0..cols {
+                        if idx >= n {
+                            break;
+                        }
+                        let tex = self.library.texture(ctx, idx);
+                        let selected = self.library.selected == Some(idx);
+                        let resp =
+                            game_tile(ui, &self.library.games[idx], tex.as_ref(), selected);
+                        if resp.clicked() {
+                            self.library.selected = Some(idx);
+                        }
+                        if resp.double_clicked() {
+                            launch =
+                                Some(self.library.games[idx].path.to_string_lossy().to_string());
+                        }
+                        if c + 1 < cols {
+                            ui.add_space(gap);
+                        }
+                        idx += 1;
+                    }
+                });
+                ui.add_space(20.0);
+            }
+            ui.add_space(4.0);
+        });
+        if let Some(path) = launch {
+            self.nro_path = path;
+            self.boot_nro(ctx);
+        }
     }
 
     fn poll_frames(&mut self, ctx: &egui::Context) {
@@ -207,7 +321,27 @@ impl HorizonApp {
     fn stop_emulation(&mut self) {
         if let Some(mut h) = self.emulation_handle.take() {
             h.stop();
+            if self.game_texture.is_some() {
+                self.stop_fade = Some(std::time::Instant::now());
+            }
         }
+    }
+
+    fn game_draw_rect(&self, panel: egui::Rect, tsz: Vec2) -> egui::Rect {
+        let avail = panel.size();
+        let user_scale = self.app_settings.output_scale.max(1) as f32;
+        let draw_size = match self.app_settings.aspect {
+            AspectMode::Stretch => avail,
+            AspectMode::Letterbox => {
+                let s = (avail.x / tsz.x).min(avail.y / tsz.y);
+                tsz * s
+            }
+            AspectMode::Integer => {
+                let max_s = (avail.x / tsz.x).min(avail.y / tsz.y).floor().max(1.0);
+                tsz * user_scale.min(max_s)
+            }
+        };
+        egui::Rect::from_center_size(panel.center(), draw_size)
     }
 
     fn is_running(&self) -> bool {
@@ -226,6 +360,163 @@ fn parse_u64_value(s: &str) -> Option<u64> {
     }
 }
 
+fn draw_dissolve(p: &egui::Painter, rect: egui::Rect, tex: &egui::TextureHandle, t: f32) {
+    let (cols, rows) = (44usize, 26usize);
+    let cw = rect.width() / cols as f32;
+    let ch = rect.height() / rows as f32;
+    let mut mesh = egui::Mesh::with_texture(tex.id());
+    for j in 0..rows {
+        for i in 0..cols {
+            let local = (t - cell_hash(i, j) * 0.55) / 0.35;
+            if local >= 1.0 {
+                continue;
+            }
+            let a = 1.0 - local.max(0.0);
+            let drop = if local > 0.0 { local * local * ch * 12.0 } else { 0.0 };
+            let jitter = if local > 0.0 {
+                (cell_hash(i + 7, j + 3) - 0.5) * local * cw * 1.6
+            } else {
+                0.0
+            };
+            let min = egui::pos2(
+                rect.min.x + i as f32 * cw + jitter,
+                rect.min.y + j as f32 * ch + drop,
+            );
+            let cell = egui::Rect::from_min_size(min, Vec2::new(cw + 0.5, ch + 0.5));
+            let uv = egui::Rect::from_min_max(
+                egui::pos2(i as f32 / cols as f32, j as f32 / rows as f32),
+                egui::pos2((i + 1) as f32 / cols as f32, (j + 1) as f32 / rows as f32),
+            );
+            mesh.add_rect_with_uv(cell, uv, Color32::from_white_alpha((a * 255.0) as u8));
+        }
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
+fn cell_hash(i: usize, j: usize) -> f32 {
+    let mut n = (i as u32).wrapping_mul(374761393).wrapping_add((j as u32).wrapping_mul(668265263));
+    n = (n ^ (n >> 13)).wrapping_mul(1274126177);
+    (n & 0xffff) as f32 / 65535.0
+}
+
+fn game_tile(
+    ui: &mut egui::Ui,
+    game: &crate::library::GameEntry,
+    tex: Option<&egui::TextureHandle>,
+    selected: bool,
+) -> egui::Response {
+    let tile = Vec2::new(154.0, 202.0);
+    let (rect, resp) = ui.allocate_exact_size(tile, Sense::click());
+    let hovered = resp.hovered();
+    let t = ui.input(|i| i.time) as f32;
+
+    let bg = if selected {
+        BG_INPUT
+    } else if hovered {
+        Color32::from_rgb(0x1C, 0x1C, 0x22)
+    } else {
+        BG_RAISED
+    };
+    let rounding = Rounding::same(10.0);
+    ui.painter().rect_filled(rect, rounding, bg);
+
+    if selected {
+        animated_border(ui.painter(), rect, 10.0, t);
+        ui.ctx().request_repaint();
+    } else if hovered {
+        for i in 1..=3 {
+            let e = i as f32;
+            ui.painter().rect_stroke(
+                rect.expand(e * 1.5),
+                Rounding::same(10.0 + e * 1.5),
+                Stroke::new(1.5, Color32::from_rgba_unmultiplied(0x2F, 0xB4, 0xEF, (34 / i) as u8)),
+            );
+        }
+        ui.painter()
+            .rect_stroke(rect, rounding, Stroke::new(1.4, ACCENT_HV));
+    } else {
+        ui.painter()
+            .rect_stroke(rect, rounding, Stroke::new(1.0, BORDER));
+    }
+
+    let pad = 11.0;
+    let icon_sz = tile.x - pad * 2.0;
+    let icon_rect = egui::Rect::from_min_size(rect.min + Vec2::splat(pad), Vec2::splat(icon_sz));
+    if let Some(tex) = tex {
+        egui::Image::new((tex.id(), icon_rect.size()))
+            .rounding(Rounding::same(6.0))
+            .paint_at(ui, icon_rect);
+    } else {
+        ui.painter()
+            .rect_filled(icon_rect, Rounding::same(6.0), Color32::from_rgb(0x12, 0x12, 0x16));
+        ui.painter().text(
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            game.format,
+            FontId::proportional(22.0),
+            MUTED,
+        );
+    }
+
+    ui.painter().text(
+        egui::pos2(rect.center().x, icon_rect.max.y + 14.0),
+        egui::Align2::CENTER_CENTER,
+        elide(&game.title, 20),
+        FontId::proportional(12.5),
+        if selected { TEXT } else { Color32::from_rgb(0xC8, 0xC8, 0xD2) },
+    );
+
+    let sub = if game.author.is_empty() {
+        game.format.to_string()
+    } else {
+        elide(&game.author, 22)
+    };
+    ui.painter().text(
+        egui::pos2(rect.center().x, icon_rect.max.y + 32.0),
+        egui::Align2::CENTER_CENTER,
+        sub,
+        FontId::proportional(10.5),
+        MUTED,
+    );
+
+    resp.on_hover_text(&game.title)
+}
+
+fn animated_border(p: &egui::Painter, rect: egui::Rect, r: f32, t: f32) {
+    let pulse = 0.5 + 0.5 * (t * 2.1).sin();
+    for i in 1..=4 {
+        let e = i as f32 * 2.4;
+        let fade = 1.0 - (i as f32 - 1.0) / 4.0;
+        let a = (52.0 * fade * (0.5 + 0.5 * pulse)) as u8;
+        p.rect_stroke(
+            rect.expand(e),
+            Rounding::same(r + e),
+            Stroke::new(2.2, Color32::from_rgba_unmultiplied(0x2F, 0xB4, 0xEF, a)),
+        );
+    }
+    p.rect_stroke(
+        rect,
+        Rounding::same(r),
+        Stroke::new(1.8, lerp_col(ACCENT, ACCENT_HV, pulse)),
+    );
+}
+
+fn lerp_col(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
+}
+
+fn elide(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    } else {
+        s.to_string()
+    }
+}
+
 fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
     let font = FontId::proportional(12.5);
     let text_w = ui.fonts(|f| {
@@ -238,7 +529,7 @@ fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
 
     let (bg, text_col, stroke) = if filled {
         let c = if resp.is_pointer_button_down_on() {
-            Color32::from_rgb(0xBC, 0x20, 0x20)
+            ACCENT_DK
         } else if resp.hovered() {
             ACCENT_HV
         } else {
@@ -272,6 +563,16 @@ fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
 
 impl eframe::App for HorizonApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.splash.active() {
+            if self.emulation_handle.is_some() {
+                self.splash = crate::splash::Splash::finished();
+            } else if let crate::splash::Step::Intro = self.splash.step(ctx) {
+                return;
+            }
+        }
+
+        self.library.poll();
+
         if let Some(ref mut ib) = self.input {
             self.last_input = ib.poll(&self.controller_config);
             if self.last_input.connected {
@@ -547,10 +848,7 @@ impl eframe::App for HorizonApp {
                         } else if fps >= 28.0 {
                             (AMBER, format!("{:.0} fps", fps))
                         } else {
-                            (
-                                Color32::from_rgb(0xE0, 0x40, 0x40),
-                                format!("{:.0} fps", fps),
-                            )
+                            (DANGER, format!("{:.0} fps", fps))
                         };
                         ui.label(
                             egui::RichText::new(fps_str)
@@ -644,49 +942,31 @@ impl eframe::App for HorizonApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(BG))
             .show(ctx, |ui| {
-                if let Some(tex) = &self.game_texture {
-                    let avail = ui.available_size();
-                    let tsz = tex.size_vec2();
-                    let user_scale = self.app_settings.output_scale.max(1) as f32;
-                    let draw_size = match self.app_settings.aspect {
-                        AspectMode::Stretch => avail,
-                        AspectMode::Letterbox => {
-                            let s = (avail.x / tsz.x).min(avail.y / tsz.y);
-                            tsz * s
-                        }
-                        AspectMode::Integer => {
-                            let max_s = (avail.x / tsz.x).min(avail.y / tsz.y).floor().max(1.0);
-                            tsz * user_scale.min(max_s)
-                        }
-                    };
-                    log::trace!(
-                        "present: avail={:?} tsz={:?} aspect={:?} scale={} draw={:?}",
-                        avail,
-                        tsz,
-                        self.app_settings.aspect,
-                        user_scale,
-                        draw_size
-                    );
+                if let Some(start) = self.stop_fade {
+                    let t = start.elapsed().as_secs_f32() / 0.9;
+                    let panel = ui.max_rect();
+                    let tex = self.game_texture.clone();
+                    self.library_view(ui, ctx);
+                    if let Some(tex) = tex {
+                        let rect = self.game_draw_rect(panel, tex.size_vec2());
+                        let p = ctx.layer_painter(egui::LayerId::new(
+                            egui::Order::Foreground,
+                            egui::Id::new("stop_dissolve"),
+                        ));
+                        draw_dissolve(&p, rect, &tex, t);
+                    }
+                    ctx.request_repaint();
+                    if t >= 1.05 {
+                        self.stop_fade = None;
+                        self.game_texture = None;
+                    }
+                } else if let Some(tex) = &self.game_texture {
+                    let draw_size = self.game_draw_rect(ui.max_rect(), tex.size_vec2()).size();
                     ui.centered_and_justified(|ui| {
                         ui.image((tex.id(), draw_size));
                     });
                 } else {
-                    let nro_path = self.nro_path.clone();
-                    let running = self.is_running();
-                    let action = idle_screen(ui, &nro_path, running);
-                    match action {
-                        0 => {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("Switch games", &["nro", "dxci", "dnsp"])
-                                .pick_file()
-                            {
-                                self.nro_path = p.to_string_lossy().to_string();
-                            }
-                        }
-                        1 => self.boot_nro(ctx),
-                        2 => self.stop_emulation(),
-                        _ => {}
-                    }
+                    self.library_view(ui, ctx);
                 }
             });
 

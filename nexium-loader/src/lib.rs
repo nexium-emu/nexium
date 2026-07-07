@@ -11,7 +11,7 @@ pub mod romfs;
 
 pub use application::{detect, Application, ContainerKind, LazyRomfs, LoadedModule};
 pub use env::EnvBlockBuilder;
-pub use nro::Nro;
+pub use nro::{read_nro_metadata, Nro, NroMetadata};
 
 pub enum LoadedProgram {
     Nro(Nro),

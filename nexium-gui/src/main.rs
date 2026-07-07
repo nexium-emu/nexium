@@ -8,13 +8,18 @@ mod controller_art;
 mod controller_config;
 mod debugger;
 mod input;
+mod library;
 mod performance;
+mod splash;
 
 use app::HorizonApp;
 use app_settings::AppSettings;
 use nexium_common::FileLogger;
 
 fn main() -> Result<(), eframe::Error> {
+    // Re-enabled for the guest by the game window process.
+    std::env::set_var("DISABLE_MANGOHUD", "1");
+
     let settings = AppSettings::load();
 
     let (logger, log_buffer) = FileLogger::new(500).unwrap_or_else(|e| {
@@ -69,6 +74,7 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NeXium")
+            .with_app_id("NeXium")
             .with_icon(icon)
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([640.0, 480.0]),
