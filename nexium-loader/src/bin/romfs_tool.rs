@@ -2,13 +2,11 @@ use nexium_loader::application::Application;
 use std::fs;
 
 fn u16be(b: &[u8], o: usize) -> Option<u16> {
-    b.get(o..o + 2)
-        .map(|v| u16::from_be_bytes([v[0], v[1]]))
+    b.get(o..o + 2).map(|v| u16::from_be_bytes([v[0], v[1]]))
 }
 
 fn u16le(b: &[u8], o: usize) -> Option<u16> {
-    b.get(o..o + 2)
-        .map(|v| u16::from_le_bytes([v[0], v[1]]))
+    b.get(o..o + 2).map(|v| u16::from_le_bytes([v[0], v[1]]))
 }
 
 fn u32be(b: &[u8], o: usize) -> Option<u32> {
@@ -22,9 +20,8 @@ fn u32le(b: &[u8], o: usize) -> Option<u32> {
 }
 
 fn u64le(b: &[u8], o: usize) -> Option<u64> {
-    b.get(o..o + 8).map(|v| {
-        u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]])
-    })
+    b.get(o..o + 8)
+        .map(|v| u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]))
 }
 
 #[derive(Clone, Copy)]
@@ -45,7 +42,12 @@ fn romfs_header(romfs: &[u8]) -> Option<RomfsHeader> {
     })
 }
 
-fn romfs_name(romfs: &[u8], entry_abs: usize, name_off: usize, name_len_off: usize) -> Option<&str> {
+fn romfs_name(
+    romfs: &[u8],
+    entry_abs: usize,
+    name_off: usize,
+    name_len_off: usize,
+) -> Option<&str> {
     let name_len = u32le(romfs, entry_abs + name_len_off)? as usize;
     let start = entry_abs + name_off;
     let end = start.checked_add(name_len)?;
@@ -65,7 +67,12 @@ fn find_child_dir(romfs: &[u8], hdr: RomfsHeader, dir_off: u32, name: &str) -> O
     None
 }
 
-fn find_child_file(romfs: &[u8], hdr: RomfsHeader, dir_off: u32, name: &str) -> Option<(usize, usize)> {
+fn find_child_file(
+    romfs: &[u8],
+    hdr: RomfsHeader,
+    dir_off: u32,
+    name: &str,
+) -> Option<(usize, usize)> {
     let dir_abs = hdr.dir_meta_off + dir_off as usize;
     let mut child = u32le(romfs, dir_abs + 0x0c)?;
     while child != 0xffff_ffff {
@@ -249,10 +256,17 @@ fn main() {
         usage();
     }
     let app = Application::load(&args[1]).expect("load application");
-    let romfs = app.romfs.as_ref().expect("application has no RomFS").as_slice();
+    let romfs = app
+        .romfs
+        .as_ref()
+        .expect("application has no RomFS")
+        .as_slice();
     match args[2].as_str() {
         "list" => {
-            let needle = args.get(3).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+            let needle = args
+                .get(3)
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
             let hdr = romfs_header(romfs).expect("bad RomFS");
             list_romfs_dir(romfs, hdr, 0, "", &needle);
         }
@@ -264,7 +278,10 @@ fn main() {
         }
         "sarc-list" => {
             let path = args.get(3).unwrap_or_else(|| usage());
-            let needle = args.get(4).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+            let needle = args
+                .get(4)
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
             let data = romfs_file(romfs, path).expect("RomFS path not found");
             let data = yaz0(data).expect("Yaz0 decode failed");
             for (name, _, size) in sarc_entries(&data).expect("not a SARC") {

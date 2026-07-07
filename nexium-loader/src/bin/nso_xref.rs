@@ -149,7 +149,11 @@ fn find_sym(syms: &[Sym], abs: u64) -> Option<usize> {
     }
     let idx = pos - 1;
     let s = &syms[idx];
-    let end = if s.size == 0 { s.abs + 4 } else { s.abs + s.size };
+    let end = if s.size == 0 {
+        s.abs + 4
+    } else {
+        s.abs + s.size
+    };
     if abs >= s.abs && abs < end {
         Some(idx)
     } else {
@@ -189,7 +193,10 @@ fn main() {
         if let Some(addr) = hex_arg(needle) {
             for (mi, m) in modules.iter().enumerate() {
                 if let Some(si) = find_sym(&m.syms, addr) {
-                    targets.push(Target { module: mi, sym: si });
+                    targets.push(Target {
+                        module: mi,
+                        sym: si,
+                    });
                 }
             }
         } else {
@@ -197,7 +204,10 @@ fn main() {
             for (mi, m) in modules.iter().enumerate() {
                 for (si, s) in m.syms.iter().enumerate() {
                     if s.name.to_ascii_lowercase().contains(&lower) {
-                        targets.push(Target { module: mi, sym: si });
+                        targets.push(Target {
+                            module: mi,
+                            sym: si,
+                        });
                     }
                 }
             }
@@ -225,7 +235,11 @@ fn main() {
                 for t in &targets {
                     let tm = &modules[t.module];
                     let ts = &tm.syms[t.sym];
-                    let end = if ts.size == 0 { ts.abs + 4 } else { ts.abs + ts.size };
+                    let end = if ts.size == 0 {
+                        ts.abs + 4
+                    } else {
+                        ts.abs + ts.size
+                    };
                     if dst >= ts.abs && dst < end {
                         let caller = find_sym(&modules[mi].syms, pc)
                             .map(|idx| {

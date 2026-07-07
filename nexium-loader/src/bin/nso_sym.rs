@@ -8,7 +8,14 @@ fn u32at(b: &[u8], o: usize) -> u32 {
 }
 fn u64at(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes([
-        b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+        b[o],
+        b[o + 1],
+        b[o + 2],
+        b[o + 3],
+        b[o + 4],
+        b[o + 5],
+        b[o + 6],
+        b[o + 7],
     ])
 }
 
@@ -54,10 +61,10 @@ fn parse_syms(img: &[u8]) -> Vec<Sym> {
         p += 16;
         match tag {
             0 => break,
-            4 => hash = val as usize,    // DT_HASH
-            5 => strtab = val as usize,  // DT_STRTAB
-            6 => symtab = val as usize,  // DT_SYMTAB
-            10 => strsz = val as usize,  // DT_STRSZ
+            4 => hash = val as usize,   // DT_HASH
+            5 => strtab = val as usize, // DT_STRTAB
+            6 => symtab = val as usize, // DT_SYMTAB
+            10 => strsz = val as usize, // DT_STRSZ
             _ => {}
         }
     }
@@ -90,7 +97,11 @@ fn parse_syms(img: &[u8]) -> Vec<Sym> {
         if n0 >= img.len() {
             continue;
         }
-        let end = img[n0..].iter().position(|&c| c == 0).map(|e| n0 + e).unwrap_or(img.len());
+        let end = img[n0..]
+            .iter()
+            .position(|&c| c == 0)
+            .map(|e| n0 + e)
+            .unwrap_or(img.len());
         let name = String::from_utf8_lossy(&img[n0..end]).into_owned();
         if name.is_empty() {
             continue;
@@ -117,7 +128,10 @@ fn main() {
             let syms = parse_syms(&m.nso.module_image);
             println!(
                 "module {:<8} base={:#x} image={:#x} syms={}",
-                m.name, base, m.nso.image_size, syms.len()
+                m.name,
+                base,
+                m.nso.image_size,
+                syms.len()
             );
             Module {
                 name: m.name.clone(),
@@ -138,19 +152,22 @@ fn main() {
             None => println!("{:#x}  <no module>", addr),
             Some(m) => {
                 let off = addr - m.base;
-                let best = m
-                    .syms
-                    .iter()
-                    .rev()
-                    .find(|s| s.value <= off);
+                let best = m.syms.iter().rev().find(|s| s.value <= off);
                 match best {
                     Some(s) => {
                         let delta = off - s.value;
                         let within = s.size == 0 || delta < s.size;
                         println!(
                             "{:#x}  {}+{:#x}  {}{}",
-                            addr, m.name, off, s.name,
-                            if within { format!("+{:#x}", delta) } else { format!(" (+{:#x}, past sym size {:#x})", delta, s.size) }
+                            addr,
+                            m.name,
+                            off,
+                            s.name,
+                            if within {
+                                format!("+{:#x}", delta)
+                            } else {
+                                format!(" (+{:#x}, past sym size {:#x})", delta, s.size)
+                            }
                         );
                     }
                     None => println!("{:#x}  {}+{:#x}  <no symbol>", addr, m.name, off),

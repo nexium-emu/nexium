@@ -152,7 +152,11 @@ fn find_sym(syms: &[Sym], abs: u64) -> Option<usize> {
     }
     let idx = pos - 1;
     let s = &syms[idx];
-    let end = if s.size == 0 { s.abs + 4 } else { s.abs + s.size };
+    let end = if s.size == 0 {
+        s.abs + 4
+    } else {
+        s.abs + s.size
+    };
     if abs >= s.abs && abs < end {
         Some(idx)
     } else {
