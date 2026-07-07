@@ -269,6 +269,81 @@ impl Nro {
     }
 }
 
+pub struct NroMetadata {
+    pub title: String,
+    pub author: String,
+    pub icon_jpeg: Option<Vec<u8>>,
+}
+
+pub fn read_nro_metadata(path: &std::path::Path) -> Option<NroMetadata> {
+    let file = std::fs::File::open(path).ok()?;
+    let mmap = unsafe { Mmap::map(&file) }.ok()?;
+    let nro_offset = Nro::detect_nro_offset(&mmap).ok()?;
+    let header = NroHeader::from_bytes(&mmap[nro_offset..]).ok()?;
+
+    let asset_start = header.size as usize;
+    if mmap.len() < asset_start + 56 {
+        return None;
+    }
+    let asset = &mmap[asset_start..];
+    if u32::from_le_bytes([asset[0], asset[1], asset[2], asset[3]]) != 0x54_45_53_41 {
+        return None;
+    }
+
+    let read_u64 = |o: usize| {
+        u64::from_le_bytes([
+            asset[o],
+            asset[o + 1],
+            asset[o + 2],
+            asset[o + 3],
+            asset[o + 4],
+            asset[o + 5],
+            asset[o + 6],
+            asset[o + 7],
+        ]) as usize
+    };
+    let icon_off = read_u64(8);
+    let icon_size = read_u64(16);
+    let nacp_off = read_u64(24);
+    let nacp_size = read_u64(32);
+
+    let icon_jpeg = (icon_size > 0)
+        .then(|| mmap.get(asset_start + icon_off..asset_start + icon_off + icon_size))
+        .flatten()
+        .map(|b| b.to_vec());
+
+    let (title, author) = mmap
+        .get(asset_start + nacp_off..asset_start + nacp_off + nacp_size)
+        .filter(|n| n.len() >= 0x300)
+        .map(parse_nacp)
+        .unwrap_or_default();
+
+    Some(NroMetadata {
+        title,
+        author,
+        icon_jpeg,
+    })
+}
+
+fn parse_nacp(nacp: &[u8]) -> (String, String) {
+    for i in 0..16 {
+        let base = i * 0x300;
+        if base + 0x300 > nacp.len() {
+            break;
+        }
+        let name = read_cstr(&nacp[base..base + 0x200]);
+        if !name.is_empty() {
+            return (name, read_cstr(&nacp[base + 0x200..base + 0x300]));
+        }
+    }
+    (String::new(), String::new())
+}
+
+fn read_cstr(b: &[u8]) -> String {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..end]).trim().to_string()
+}
+
 fn parse_asset_romfs(mmap: &Mmap, nro_size: u32) -> Option<Range<usize>> {
     let asset_start = nro_size as usize;
     if mmap.len() < asset_start + 56 {

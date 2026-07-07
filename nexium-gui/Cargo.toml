@@ -27,6 +27,8 @@ nexium-memory.workspace = true
 nexium-core = { workspace = true, default-features = false }
 nexium-cpu = { workspace = true, default-features = false }
 nexium-gpu.workspace = true
+nexium-loader.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 # wgpu (Vulkan/DX12) backend in addition to the default glow (OpenGL). The GUI
 # runs on wgpu (see NativeOptions.renderer) so the NVIDIA OpenGL ICD
