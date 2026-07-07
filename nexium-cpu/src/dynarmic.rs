@@ -94,10 +94,17 @@ impl DynarmicCpu {
                     let lr = dyn_.reg_read_lr().unwrap_or(0);
                     let limit = watch_write_limit();
                     if limit == 0 || n < limit {
-                        log::warn!(
-                            "[watch-write] #{} addr={:#x} size={} val={:#x} pc={:#x} lr={:#x}",
-                            n, addr, size, value, pc, lr
-                        );
+                        if let Some(regs) = watch_write_reg_summary(dyn_) {
+                            log::warn!(
+                                "[watch-write] #{} addr={:#x} size={} val={:#x} pc={:#x} lr={:#x} {}",
+                                n, addr, size, value, pc, lr, regs
+                            );
+                        } else {
+                            log::warn!(
+                                "[watch-write] #{} addr={:#x} size={} val={:#x} pc={:#x} lr={:#x}",
+                                n, addr, size, value, pc, lr
+                            );
+                        }
                     }
                     let stop = limit != 0 && n + 1 >= limit;
                     if stop || (value != 0 && !watch_keep_after_hit()) {
@@ -192,15 +199,28 @@ impl DynarmicCpu {
             let lr = dyn_.reg_read_lr().unwrap_or(0);
             let limit = watch_write_limit();
             if limit == 0 || n < limit {
-                log::warn!(
-                    "[watch-write] #{} addr={:#x} size={} val={:#x} pc={:#x} lr={:#x}",
-                    n,
-                    addr,
-                    size,
-                    value,
-                    pc,
-                    lr
-                );
+                if let Some(regs) = watch_write_reg_summary(dyn_) {
+                    log::warn!(
+                        "[watch-write] #{} addr={:#x} size={} val={:#x} pc={:#x} lr={:#x} {}",
+                        n,
+                        addr,
+                        size,
+                        value,
+                        pc,
+                        lr,
+                        regs
+                    );
+                } else {
+                    log::warn!(
+                        "[watch-write] #{} addr={:#x} size={} val={:#x} pc={:#x} lr={:#x}",
+                        n,
+                        addr,
+                        size,
+                        value,
+                        pc,
+                        lr
+                    );
+                }
             }
             let stop = limit != 0 && n + 1 >= limit;
             if value != 0 || stop {
@@ -217,7 +237,9 @@ impl DynarmicCpu {
                 nexium_memory::fastmem::watch_disarm();
                 return false;
             }
-            if page_protect && nexium_memory::fastmem::watch_write_through(addr, size as usize, value) {
+            if page_protect
+                && nexium_memory::fastmem::watch_write_through(addr, size as usize, value)
+            {
                 return true;
             }
             false
@@ -578,7 +600,11 @@ fn pc_until_read_string(emu: &dynarmic_sys::Dynarmic<'static, ()>, ptr: u64) -> 
     }
     let mut buf = [0u8; 96];
     emu.mem_read(ptr, &mut buf).ok()?;
-    let len = buf.iter().position(|b| *b == 0).unwrap_or(buf.len()).min(80);
+    let len = buf
+        .iter()
+        .position(|b| *b == 0)
+        .unwrap_or(buf.len())
+        .min(80);
     if len < 3 {
         return None;
     }
@@ -643,6 +669,21 @@ fn watch_keep_after_hit() -> bool {
     env_flag("NEXIUM_WATCH_WRITE_KEEP")
 }
 
+fn watch_write_reg_summary<'a>(emu: &dynarmic_sys::Dynarmic<'a, ()>) -> Option<String> {
+    if !env_flag("NEXIUM_WATCH_WRITE_REGS") {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for reg in [
+        0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20, 21, 22, 23, 24, 25, 26,
+        27, 28, 29, 30,
+    ] {
+        parts.push(format!("x{}={:#x}", reg, emu.reg_read(reg).unwrap_or(0)));
+    }
+    parts.push(format!("sp={:#x}", emu.reg_read_sp().unwrap_or(0)));
+    Some(parts.join(" "))
+}
+
 fn initial_cpu_watch() -> Option<(u64, u64)> {
     if watch_arm_delay_ms().is_some() {
         return None;
@@ -680,7 +721,8 @@ fn parse_pc_until_u64(s: &str) -> Option<u64> {
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16).ok()
     } else {
-        s.parse::<u64>().ok()
+        s.parse::<u64>()
+            .ok()
             .or_else(|| u64::from_str_radix(s, 16).ok())
     }
 }
@@ -703,12 +745,22 @@ fn watch_target_overlaps(addr: u64, size: u64) -> bool {
 }
 
 fn watch_value_matches(size: usize, value: u64) -> bool {
-    let Some(filter) = std::env::var("NEXIUM_WATCH_WRITE_VALUE")
+    if let Some(filter) = std::env::var("NEXIUM_WATCH_WRITE_VALUE")
         .ok()
         .and_then(|v| parse_pc_until_u64(v.trim()))
-    else {
-        return true;
-    };
+    {
+        return watch_value_eq(size, value, filter);
+    }
+    if let Some(filter) = std::env::var("NEXIUM_WATCH_WRITE_VALUE_NE")
+        .ok()
+        .and_then(|v| parse_pc_until_u64(v.trim()))
+    {
+        return watch_value_ne(size, value, filter);
+    }
+    true
+}
+
+fn watch_value_eq(size: usize, value: u64, filter: u64) -> bool {
     let mask = match size {
         1 => 0xff,
         2 => 0xffff,
@@ -723,4 +775,21 @@ fn watch_value_matches(size: usize, value: u64) -> bool {
         return (value & 0xffff_ffff) == f || ((value >> 32) & 0xffff_ffff) == f;
     }
     (value & mask) == (filter & mask)
+}
+
+fn watch_value_ne(size: usize, value: u64, filter: u64) -> bool {
+    let mask = match size {
+        1 => 0xff,
+        2 => 0xffff,
+        4 => 0xffff_ffff,
+        _ => u64::MAX,
+    };
+    if size < 4 && filter > mask {
+        return true;
+    }
+    if size == 8 && filter <= u32::MAX as u64 {
+        let f = filter & 0xffff_ffff;
+        return (value & 0xffff_ffff) != f || ((value >> 32) & 0xffff_ffff) != f;
+    }
+    (value & mask) != (filter & mask)
 }

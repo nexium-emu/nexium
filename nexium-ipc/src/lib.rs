@@ -522,8 +522,6 @@ impl IpcCtx {
             cursor += 12;
         }
 
-        let _data_words_start = cursor;
-        cursor = (cursor + 15) & !15;
         let raw_data_off = cursor;
         let raw_data_len = (hipc.num_data_words() as usize) * 4;
 
