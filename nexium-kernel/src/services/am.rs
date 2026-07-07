@@ -1,6 +1,7 @@
 use crate::kernel::handles::HandleType;
 use crate::kernel::Kernel;
 use nexium_common::result::SUCCESS;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub mod msg {
     pub const EXIT_REQUESTED: u32 = 1;
@@ -101,6 +102,8 @@ pub fn proxy_subsession(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         }
         ("IGeneralService", 2) => Some("IScanRequest"),
         ("IGeneralService", 4) => Some("IRequest"),
+        ("ssl", 0) => Some("ISslContext"),
+        ("ISslContext" | "ISslContextForSystem", 2 | 100) => Some("ISslConnection"),
         ("lm", 0) => Some("ILogService"),
         _ => None,
     }
@@ -142,6 +145,10 @@ pub fn dispatch_command(
         "IGeneralService" => general_service(cmd_id),
         "IRequest" => nifm_request(kernel, cmd_id),
         "IScanRequest" => ok_empty(),
+        "bsd:u" | "bsd:s" => socket_client(cmd_id),
+        "ssl" => ssl_service(cmd_id),
+        "ISslContext" | "ISslContextForSystem" => ssl_context(cmd_id),
+        "ISslConnection" => ssl_connection(cmd_id),
         "ILogService" => ok_empty(),
         "IOverlayFunctions" => overlay_functions(cmd_id),
         "ILockAccessor" => lock_accessor(cmd_id),
@@ -653,14 +660,40 @@ fn async_context(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32
     }
 }
 
+fn nifm_forced_online() -> bool {
+    std::env::var("NEXIUM_NIFM_ONLINE").ok().as_deref() == Some("1")
+}
+
+const NIFM_REQUEST_NOT_SUBMITTED: u32 = 1;
+const NIFM_REQUEST_ACCEPTED: u32 = 3;
+const RESULT_NIFM_NETWORK_COMMUNICATION_DISABLED: u32 = (110u32) | (1111u32 << 9);
+
+static NIFM_REQUEST_STATE: AtomicU32 = AtomicU32::new(NIFM_REQUEST_NOT_SUBMITTED);
+
 fn general_service(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
         1 => ok(1u64.to_le_bytes().to_vec()),
-        12 => ok(vec![0u8; 4]),
+        4 => {
+            NIFM_REQUEST_STATE.store(NIFM_REQUEST_NOT_SUBMITTED, Ordering::Relaxed);
+            ok_empty()
+        }
+        12 => {
+            if nifm_forced_online() {
+                ok(vec![192u8, 168u8, 0u8, 2u8])
+            } else {
+                ok(vec![0u8; 4])
+            }
+        }
         15 => ok(vec![0u8; 0x16]),
         17 => ok(vec![1u8]),
-        20 | 21 => ok(vec![0u8]),
-        18 => ok(vec![1u8, 3u8, 4u8]),
+        20 | 21 => ok(vec![u8::from(nifm_forced_online())]),
+        18 => {
+            if nifm_forced_online() {
+                ok(vec![1u8, 3u8, 4u8])
+            } else {
+                ok(vec![0u8, 0u8, 0u8])
+            }
+        }
         22 => ok(vec![0u8]),
         _ => ok_empty(),
     }
@@ -668,7 +701,20 @@ fn general_service(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
 
 fn nifm_request(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
-        0 => ok(3u32.to_le_bytes().to_vec()),
+        0 => {
+            let state = NIFM_REQUEST_STATE.load(Ordering::Relaxed);
+            ok(state.to_le_bytes().to_vec())
+        }
+        1 => {
+            if nifm_forced_online() {
+                if NIFM_REQUEST_STATE.load(Ordering::Relaxed) != NIFM_REQUEST_NOT_SUBMITTED {
+                    NIFM_REQUEST_STATE.store(NIFM_REQUEST_ACCEPTED, Ordering::Relaxed);
+                }
+                ok_empty()
+            } else {
+                err(RESULT_NIFM_NETWORK_COMMUNICATION_DISABLED)
+            }
+        }
         2 => {
             let h1 = kernel.handles.create_handle(HandleType::Event);
             let h2 = kernel.handles.create_handle(HandleType::Event);
@@ -678,6 +724,65 @@ fn nifm_request(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>
             kernel.nvdrv_sync_events.insert(h2);
             Some((0, Vec::new(), vec![h1, h2]))
         }
+        3 => {
+            NIFM_REQUEST_STATE.store(NIFM_REQUEST_NOT_SUBMITTED, Ordering::Relaxed);
+            ok_empty()
+        }
+        4 => {
+            let state = if nifm_forced_online() {
+                NIFM_REQUEST_ACCEPTED
+            } else {
+                NIFM_REQUEST_NOT_SUBMITTED
+            };
+            NIFM_REQUEST_STATE.store(state, Ordering::Relaxed);
+            ok_empty()
+        }
+        5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 23 | 24 | 25 => ok_empty(),
+        _ => ok_empty(),
+    }
+}
+
+fn socket_client(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => ok(0u32.to_le_bytes().to_vec()),
+        1 => ok_empty(),
+        _ => {
+            log::debug!("bsd.cmd_{} stubbed as socket failure (-1, ENETDOWN)", cmd);
+            let mut out = Vec::with_capacity(8);
+            out.extend_from_slice(&(-1i32).to_le_bytes());
+            out.extend_from_slice(&100i32.to_le_bytes());
+            ok(out)
+        }
+    }
+}
+
+fn ssl_service(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        1 => ok(0u32.to_le_bytes().to_vec()),
+        2 | 3 => ok(0u32.to_le_bytes().to_vec()),
+        5 => err(0x3a8),
+        6 | 7 | 8 | 9 => ok_empty(),
+        101 | 102 => ok(0u64.to_le_bytes().to_vec()),
+        _ => ok_empty(),
+    }
+}
+
+fn ssl_context(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 | 9 | 10 | 11 => ok_empty(),
+        1 => ok(0i32.to_le_bytes().to_vec()),
+        3 => ok(0u32.to_le_bytes().to_vec()),
+        4 | 5 | 8 | 12 | 13 | 14 => ok(1u64.to_le_bytes().to_vec()),
+        _ => ok_empty(),
+    }
+}
+
+fn ssl_connection(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => ok((-1i32).to_le_bytes().to_vec()),
+        3 | 4 | 5 | 6 | 19 | 20 | 22 | 24 | 25 | 26 | 27 | 28 | 29 => ok_empty(),
+        8 | 11 | 12 | 13 | 14 | 15 | 16 | 18 | 23 | 30 | 31 => ok(0u32.to_le_bytes().to_vec()),
+        17 => ok((-1i32).to_le_bytes().to_vec()),
         _ => ok_empty(),
     }
 }

@@ -71,6 +71,9 @@ impl HidService {
         let entry = self.npad_assignment.entry(npad_id).or_default();
         entry.mode = NpadAssignmentMode::Single;
         entry.device_type = 0;
+        if npad_id == 0 {
+            crate::hid_state::set_player1_joy_dual(false);
+        }
         log::info!(
             "HID::SetNpadJoyAssignmentModeSingleByDefault npad_id={:#x}",
             npad_id
@@ -81,6 +84,9 @@ impl HidService {
         let entry = self.npad_assignment.entry(npad_id).or_default();
         entry.mode = NpadAssignmentMode::Single;
         entry.device_type = device_type;
+        if npad_id == 0 {
+            crate::hid_state::set_player1_joy_dual(false);
+        }
         log::info!(
             "HID::SetNpadJoyAssignmentModeSingle npad_id={:#x} device_type={}",
             npad_id,
@@ -92,6 +98,9 @@ impl HidService {
         let entry = self.npad_assignment.entry(npad_id).or_default();
         entry.mode = NpadAssignmentMode::Dual;
         entry.device_type = 0;
+        if npad_id == 0 {
+            crate::hid_state::set_player1_joy_dual(true);
+        }
         log::info!("HID::SetNpadJoyAssignmentModeDual npad_id={:#x}", npad_id);
     }
 
@@ -107,6 +116,9 @@ impl HidService {
         let r = self.npad_assignment.entry(npad_id_right).or_default();
         r.mode = NpadAssignmentMode::Dual;
         r.device_type = 0;
+        if npad_id_left == 0 || npad_id_right == 0 {
+            crate::hid_state::set_player1_joy_dual(true);
+        }
         log::info!(
             "HID::MergeSingleJoyAsDualJoy left={:#x} right={:#x}",
             npad_id_left,

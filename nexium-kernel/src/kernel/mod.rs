@@ -311,10 +311,7 @@ impl Kernel {
             return None;
         }
         let s = &bytes[..end];
-        if !s
-            .iter()
-            .all(|&b| b == b' ' || (0x21..=0x7e).contains(&b))
-        {
+        if !s.iter().all(|&b| b == b' ' || (0x21..=0x7e).contains(&b)) {
             return None;
         }
         if !s.iter().any(|&b| b.is_ascii_alphabetic()) {
@@ -579,7 +576,10 @@ impl Kernel {
             self.applet_performance_mode = if docked { 1 } else { 0 };
             crate::services::am::queue_message(self, 30);
             crate::services::am::queue_message(self, 31);
-            log::info!("console mode -> {}", if docked { "Docked" } else { "Handheld" });
+            log::info!(
+                "console mode -> {}",
+                if docked { "Docked" } else { "Handheld" }
+            );
         }
         let vsyncs: Vec<u32> = self.vsync_handles.iter().copied().collect();
         for h in vsyncs {

@@ -126,6 +126,7 @@ impl HidState {
             || input.stick_l_y != self.input.stick_l_y
             || input.stick_r_x != self.input.stick_r_x
             || input.stick_r_y != self.input.stick_r_y;
+        self.input = input;
         let elapsed = self
             .last_tick
             .map(|t| now.duration_since(t))
@@ -145,10 +146,11 @@ impl HidState {
     }
 
     pub fn update_input(&mut self, input: ControllerInput) {
-        self.input = input;
+        self.maybe_tick(input);
     }
 
     pub fn tick(&mut self, input: ControllerInput) {
+        self.input = input;
         if input.buttons != self.last_logged_buttons {
             log::info!(
                 "hid:tick buttons={:#x} (was {:#x})",
@@ -160,7 +162,8 @@ impl HidState {
         self.sampling_number = self.sampling_number.wrapping_add(1);
         let sampling = self.sampling_number;
         let docked = CONSOLE_DOCKED.load(std::sync::atomic::Ordering::Relaxed);
-        let active_entry = if docked {
+        let player1_joy_dual = PLAYER1_JOY_DUAL.load(std::sync::atomic::Ordering::Relaxed);
+        let active_entry = if docked || player1_joy_dual {
             NPAD_ENTRY_PLAYER1
         } else {
             NPAD_ENTRY_HANDHELD
@@ -170,7 +173,23 @@ impl HidState {
                 Self::write_entry_style(&mut self.buf[..], entry_idx, 0);
             }
         }
-        if docked {
+        if player1_joy_dual {
+            let attr = ATTR_IS_CONNECTED
+                | ATTR_IS_WIRED
+                | ATTR_LEFT_CONNECTED
+                | ATTR_LEFT_WIRED
+                | ATTR_RIGHT_CONNECTED
+                | ATTR_RIGHT_WIRED;
+            Self::setup_joy_dual(&mut self.buf[..], NPAD_ENTRY_PLAYER1);
+            Self::write_npad_lifo(
+                &mut self.buf[..],
+                NPAD_ENTRY_PLAYER1,
+                2,
+                &input,
+                sampling,
+                attr,
+            );
+        } else if docked {
             Self::setup_fullkey(&mut self.buf[..], NPAD_ENTRY_PLAYER1);
             Self::write_npad_lifo(
                 &mut self.buf[..],
@@ -198,7 +217,7 @@ impl HidState {
             );
         }
 
-        if !self.dumped_shmem && input.buttons != 0 {
+        if !self.dumped_shmem && self.shmem_va.is_some() && input.buttons != 0 {
             self.dumped_shmem = true;
             log::info!(
                 "hid:shmem-dump @va={:?} sampling={}",
@@ -335,6 +354,19 @@ impl HidState {
         buf[base + NPAD_APPLET_FOOTER_OFFSET] = FOOTER_HANDHELD;
     }
 
+    fn setup_joy_dual(buf: &mut [u8], entry_idx: usize) {
+        let base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
+        write_u32(buf, base + NPAD_STYLE_TAG_OFFSET, STYLE_JOY_DUAL);
+        write_u32(buf, base + NPAD_JOY_ASSIGN_OFFSET, 0);
+        write_u32(buf, base + NPAD_DEVICE_TYPE_OFFSET, DEVICE_TYPE_FULLKEY);
+        write_u64(
+            buf,
+            base + NPAD_SYSTEM_PROPERTIES_OFFSET,
+            SYSPROP_IS_VERTICAL | SYSPROP_USE_PLUS | SYSPROP_USE_MINUS | SYSPROP_USE_DIRECTIONAL,
+        );
+        buf[base + NPAD_APPLET_FOOTER_OFFSET] = FOOTER_SWITCH_PRO;
+    }
+
     fn write_npad_lifo(
         buf: &mut [u8],
         entry_idx: usize,
@@ -345,6 +377,9 @@ impl HidState {
     ) {
         let entry_base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
         let lifo = entry_base + LAYOUT_BASE_OFFSET + layout * LAYOUT_STRIDE;
+        let previous_sampling = read_u64(buf, lifo + 0x00);
+        let previous_total = read_u64(buf, lifo + 0x08);
+        let previous_tail = read_u64(buf, lifo + 0x10);
         let tail = (sampling % LIFO_STORAGE_COUNT as u64) as usize;
         let count = sampling.min((LIFO_STORAGE_COUNT - 1) as u64);
 
@@ -353,7 +388,31 @@ impl HidState {
         write_u64(buf, lifo + 0x10, tail as u64);
         write_u64(buf, lifo + 0x18, count);
 
-        let storage = lifo + LIFO_HEADER_SIZE + tail * LIFO_STORAGE_ELEM_SIZE;
+        let needs_seed = previous_total != LIFO_STORAGE_COUNT as u64
+            || previous_tail >= LIFO_STORAGE_COUNT as u64
+            || previous_sampling <= 1
+            || sampling.saturating_sub(previous_sampling) > 1;
+
+        if needs_seed {
+            for i in 0..LIFO_STORAGE_COUNT {
+                let age = (tail + LIFO_STORAGE_COUNT - i) % LIFO_STORAGE_COUNT;
+                let entry_sampling = sampling.saturating_sub(age as u64).max(1);
+                Self::write_npad_lifo_entry(buf, lifo, i, input, entry_sampling, attr);
+            }
+        } else {
+            Self::write_npad_lifo_entry(buf, lifo, tail, input, sampling, attr);
+        }
+    }
+
+    fn write_npad_lifo_entry(
+        buf: &mut [u8],
+        lifo: usize,
+        index: usize,
+        input: &ControllerInput,
+        sampling: u64,
+        attr: u32,
+    ) {
+        let storage = lifo + LIFO_HEADER_SIZE + index * LIFO_STORAGE_ELEM_SIZE;
         write_u64(buf, storage, sampling);
         let state = storage + 8;
         write_u64(buf, state + 0x00, sampling);
@@ -365,6 +424,10 @@ impl HidState {
         write_u32(buf, state + 0x20, attr);
         write_u32(buf, state + 0x24, 0);
     }
+}
+
+fn read_u64(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap_or([0; 8]))
 }
 
 fn write_u64(buf: &mut [u8], off: usize, v: u64) {
@@ -388,10 +451,9 @@ pub fn get_hid_state() -> Arc<Mutex<HidState>> {
         .clone()
 }
 
-pub static CONSOLE_DOCKED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static CONSOLE_MODE_DIRTY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static CONSOLE_DOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static CONSOLE_MODE_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static PLAYER1_JOY_DUAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn is_docked() -> bool {
     CONSOLE_DOCKED.load(std::sync::atomic::Ordering::Relaxed)
@@ -406,4 +468,11 @@ pub fn set_docked(value: bool) {
 
 pub fn take_console_mode_dirty() -> bool {
     CONSOLE_MODE_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_player1_joy_dual(value: bool) {
+    if value {
+        set_docked(true);
+    }
+    PLAYER1_JOY_DUAL.store(value, std::sync::atomic::Ordering::Relaxed);
 }

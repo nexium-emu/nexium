@@ -382,6 +382,23 @@ pub fn get_npad_joy_hold_type(
 ) -> u64 {
     kernel.services.hid.get_npad_joy_hold_type()
 }
+
+fn signal_style_change_events(kernel: &mut Kernel) {
+    {
+        let state = crate::hid_state::get_hid_state();
+        let mut hid = state.lock();
+        if hid.shmem_va.is_some() {
+            let cur = hid.input;
+            hid.tick(cur);
+        }
+    }
+    let events: Vec<u32> = kernel.services.hid.style_change_events.clone();
+    for h in events {
+        kernel.event_signals.insert(h, true);
+        kernel.threads.signal_handle(h);
+    }
+}
+
 pub fn set_npad_joy_assignment_mode_single_by_default(
     kernel: &mut Kernel,
     _ctx: &mut IpcCtx,
@@ -393,6 +410,7 @@ pub fn set_npad_joy_assignment_mode_single_by_default(
         .services
         .hid
         .set_npad_assignment_single_by_default(npad_id, aruid);
+    signal_style_change_events(kernel);
 }
 pub fn set_npad_joy_assignment_mode_single(
     kernel: &mut Kernel,
@@ -406,6 +424,7 @@ pub fn set_npad_joy_assignment_mode_single(
         .services
         .hid
         .set_npad_assignment_single(npad_id, aruid, device_type);
+    signal_style_change_events(kernel);
 }
 pub fn set_npad_joy_assignment_mode_dual(
     kernel: &mut Kernel,
@@ -415,6 +434,7 @@ pub fn set_npad_joy_assignment_mode_dual(
     aruid: u64,
 ) {
     kernel.services.hid.set_npad_assignment_dual(npad_id, aruid);
+    signal_style_change_events(kernel);
 }
 pub fn merge_single_joy_as_dual_joy(
     kernel: &mut Kernel,
@@ -428,6 +448,7 @@ pub fn merge_single_joy_as_dual_joy(
         .services
         .hid
         .merge_single_joy_as_dual_joy(npad_id_l, npad_id_r, aruid);
+    signal_style_change_events(kernel);
 }
 
 pub fn start_lr_assignment_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}

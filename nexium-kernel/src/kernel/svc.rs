@@ -1599,6 +1599,10 @@ fn build_ipc_response_full(
     copy_handles: &[u32],
     out_objects: &[u32],
 ) -> Vec<u8> {
+    if ctx.tipc.is_some() {
+        return build_tipc_response(result, out_data, move_handles, copy_handles);
+    }
+
     let is_domain = ctx.domain.is_some();
 
     let mut raw_size = 0usize;
@@ -1668,6 +1672,48 @@ fn build_ipc_response_full(
         }
     }
 
+    out
+}
+
+fn build_tipc_response(
+    result: u32,
+    out_data: &[u8],
+    move_handles: &[u32],
+    copy_handles: &[u32],
+) -> Vec<u8> {
+    let mut special_bytes: Vec<u8> = Vec::new();
+    let has_special_header = !move_handles.is_empty() || !copy_handles.is_empty();
+    if has_special_header {
+        let mut sh: u32 = 0;
+        sh |= (copy_handles.len() as u32 & 0xF) << 1;
+        sh |= (move_handles.len() as u32 & 0xF) << 5;
+        special_bytes.extend_from_slice(&sh.to_le_bytes());
+        for h in copy_handles {
+            special_bytes.extend_from_slice(&h.to_le_bytes());
+        }
+        for h in move_handles {
+            special_bytes.extend_from_slice(&h.to_le_bytes());
+        }
+    }
+
+    let raw_size = 4 + out_data.len();
+    let raw_padded = (raw_size + 3) & !3;
+    let mut hipc: u64 = ((raw_padded / 4) as u64 & 0x3FF) << 32;
+    if has_special_header {
+        hipc |= 1u64 << 63;
+    }
+
+    let mut out = vec![0u8; 8 + special_bytes.len() + raw_padded];
+    out[0..8].copy_from_slice(&hipc.to_le_bytes());
+    if !special_bytes.is_empty() {
+        out[8..8 + special_bytes.len()].copy_from_slice(&special_bytes);
+    }
+
+    let p = 8 + special_bytes.len();
+    out[p..p + 4].copy_from_slice(&result.to_le_bytes());
+    if !out_data.is_empty() {
+        out[p + 4..p + 4 + out_data.len()].copy_from_slice(out_data);
+    }
     out
 }
 
@@ -4363,7 +4409,19 @@ fn igbp_handle_transact(
                         None
                     }
                 };
-                if let Some(r_async) = kernel.nvdrv.renderer().cloned() {
+                let renderer_for_present = kernel.nvdrv.renderer().cloned();
+                let gpu_stats = kernel.nvdrv.stats.snapshot();
+                let has_gpu_activity = gpu_stats.gpfifo_submits != 0
+                    || gpu_stats.maxwell3d_draws != 0
+                    || gpu_stats.maxwell3d_clears != 0
+                    || gpu_stats.fermi_2d_blits != 0
+                    || gpu_stats.maxwell_dma_blits != 0;
+                let has_gpu_present_target = renderer_for_present
+                    .as_ref()
+                    .and_then(|r| r.rt_key_for_nvmap(gb.nvmap_id, gb.width, gb.height))
+                    .is_some()
+                    && has_gpu_activity;
+                if let Some(r_async) = renderer_for_present.filter(|_| has_gpu_present_target) {
                     let rt_worker = nexium_nvdrv::render_thread::present_thread();
                     let fq = kernel.nvdrv.frame_queue.clone();
                     let qba = kernel.nvdrv.queue_buffer_active.clone();
@@ -4775,6 +4833,7 @@ fn igbp_handle_transact(
                                 }
                             }
                         }
+                        dump_present_frame(&frame_pixels, frame_w, frame_h);
                         kernel.nvdrv.submit_frame(nexium_nvdrv::QueuedFrame {
                             width: frame_w,
                             height: frame_h,
@@ -5594,34 +5653,36 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 0
             };
 
-            let in_src = ctx
+            let in_srcs: Vec<_> = ctx
                 .send_buffers
                 .iter()
-                .find(|b| b.size > 0 && b.addr != 0)
+                .chain(ctx.send_statics.iter())
+                .filter(|b| b.size > 0 && b.addr != 0)
                 .copied()
-                .or_else(|| {
-                    ctx.send_statics
-                        .iter()
-                        .find(|b| b.size > 0 && b.addr != 0)
-                        .copied()
-                });
-            let mut in_data: Vec<u8> = Vec::new();
-            if let Some(sb) = in_src {
-                in_data.resize(sb.size as usize, 0);
-                let _ = kernel.address_space.read(sb.addr, &mut in_data);
-            }
+                .collect();
+            let read_input = |buf: Option<ipc::IpcBuffer>| -> Vec<u8> {
+                let Some(sb) = buf else {
+                    return Vec::new();
+                };
+                let mut data = vec![0u8; sb.size as usize];
+                let _ = kernel.address_space.read(sb.addr, &mut data);
+                data
+            };
+            let in_data = read_input(in_srcs.first().copied());
+            let inline_in_data = if cmd_id == 11 {
+                read_input(in_srcs.get(1).copied())
+            } else {
+                Vec::new()
+            };
 
-            let out_dst = ctx
+            let out_dsts: Vec<_> = ctx
                 .recv_buffers
                 .iter()
-                .find(|b| b.size > 0 && b.addr != 0)
+                .chain(ctx.recv_statics.iter())
+                .filter(|b| b.size > 0 && b.addr != 0)
                 .copied()
-                .or_else(|| {
-                    ctx.recv_statics
-                        .iter()
-                        .find(|b| b.size > 0 && b.addr != 0)
-                        .copied()
-                });
+                .collect();
+            let out_dst = out_dsts.first().copied();
             let out_size = out_dst.map(|b| b.size as usize).unwrap_or(0);
 
             if cmd_id == 1 {
@@ -5643,11 +5704,24 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                         .collect::<Vec<_>>()
                 );
             }
+            let ioctl_cmd = (ioctl_id & 0xFFFF) as u16;
+            if ioctl_cmd == 0x4808 || ioctl_cmd == 0x481b {
+                log::trace!(
+                    "nvdrv:SubmitGPFIFO ioctl cmd_id={} fd={} ioctl={:#x} in={} inline={} recv={:?}",
+                    cmd_id,
+                    fd,
+                    ioctl_id,
+                    in_data.len(),
+                    inline_in_data.len(),
+                    out_dst.map(|b| (b.addr, b.size))
+                );
+            }
 
             let req = nexium_nvdrv::IoctlRequest {
                 fd,
                 ioctl_id,
                 in_data,
+                inline_in_data,
                 out_size,
             };
             let addr_space = kernel.address_space.clone();
@@ -5681,9 +5755,27 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                     let n = outcome.data.len().min(buf.size as usize);
                     let _ = kernel.address_space.write(buf.addr, &outcome.data[..n]);
                 }
+                if cmd_id == 12 {
+                    if let Some(buf) = out_dsts.get(1).copied() {
+                        let inline = match ioctl_cmd {
+                            0x4705 if outcome.data.len() > 16 => &outcome.data[16..],
+                            0x4706 if outcome.data.len() >= 20 => &outcome.data[16..20],
+                            _ => &[],
+                        };
+                        if !inline.is_empty() {
+                            let n = inline.len().min(buf.size as usize);
+                            let _ = kernel.address_space.write(buf.addr, &inline[..n]);
+                            log::debug!(
+                                "nvdrv:Ioctl3 inline out ioctl={:#x} wrote {} bytes to {:#x}",
+                                ioctl_id,
+                                n,
+                                buf.addr
+                            );
+                        }
+                    }
+                }
             }
 
-            let ioctl_cmd = (ioctl_id & 0xFFFF) as u16;
             if ioctl_cmd == 0x4808 || ioctl_cmd == 0x481b {
                 let fence_handles: Vec<u32> = kernel.gpu_fence_events.drain().collect();
                 for fh in fence_handles {
@@ -6557,10 +6649,12 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         18 => 0,
         19 => 0,
         20 => 0,
-        21 => 0,
-        22 => kernel.code_base,
+        21 => kernel.total_memory,
+        22 => (kernel.code_size + kernel.stack_size + kernel.heap_committed + 0x100_0000)
+            .min(kernel.total_memory),
 
-        23 | 24 | 25 | 26 | 27 => 0,
+        23 => u64::from(kernel.is_application),
+        24 | 25 | 26 | 27 => 0,
 
         28 => 0x1000,
 
@@ -7707,9 +7801,23 @@ fn ipc_trace_request(
     } else {
         Vec::new()
     };
+    let ptr_preview = |addr: u64| -> String {
+        if addr == 0 {
+            return "-".to_string();
+        }
+        let mut bytes = [0u8; 32];
+        if kernel.address_space.read(addr, &mut bytes).is_err() {
+            return "unreadable".to_string();
+        }
+        bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
 
     log::warn!(
-        "[ipc-trace] n={} thread={:?} sess={:#x} port={} target={} cmd={} domain={} is_domain={} in_len={} pc={:#x} lr={:#x} x20={:#x} x21={:#x} send={} recv={} sstat={} rstat={} in={}",
+        "[ipc-trace] n={} thread={:?} sess={:#x} port={} target={} cmd={} domain={} is_domain={} in_len={} pc={:#x} lr={:#x} x20={:#x} x21={:#x} x20mem={} x21mem={} send={} recv={} sstat={} rstat={} in={}",
         n,
         kernel.threads.current,
         session_handle,
@@ -7723,6 +7831,8 @@ fn ipc_trace_request(
         lr,
         x20,
         x21,
+        ptr_preview(x20),
+        ptr_preview(x21),
         ipc_trace_buffers(&ctx.send_buffers),
         ipc_trace_buffers(&ctx.recv_buffers),
         ipc_trace_buffers(&ctx.send_statics),
