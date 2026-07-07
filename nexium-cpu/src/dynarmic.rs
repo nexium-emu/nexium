@@ -87,6 +87,13 @@ impl DynarmicCpu {
         emu.set_unmapped_mem_callback(move |dyn_, addr, size, value| {
             if let Some((lo, hi)) = nexium_memory::fastmem::watch_range() {
                 if addr >= lo && addr < hi {
+                    if !watch_target_overlaps(addr, size as u64)
+                        || !watch_value_matches(size, value)
+                    {
+                        if nexium_memory::fastmem::watch_write_through(addr, size as usize, value) {
+                            return true;
+                        }
+                    }
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static HITS: AtomicU64 = AtomicU64::new(0);
                     let n = HITS.fetch_add(1, Ordering::SeqCst);
@@ -173,76 +180,6 @@ impl DynarmicCpu {
             event_for_unmapped.set(Some(CpuEvent::Exception(0x0E)));
             let _ = dyn_.emu_stop();
             true
-        });
-
-        emu.set_watch_mem_callback(move |dyn_, addr, size, value| {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static HITS: AtomicU64 = AtomicU64::new(0);
-            let page_protect = env_flag("NEXIUM_WATCH_PAGE_PROTECT");
-            if nexium_memory::fastmem::watch_range().is_none() {
-                return false;
-            }
-            if !watch_target_overlaps(addr, size as u64) {
-                if page_protect {
-                    return nexium_memory::fastmem::watch_write_through(addr, size as usize, value);
-                }
-                return false;
-            }
-            if !watch_value_matches(size, value) {
-                if page_protect {
-                    return nexium_memory::fastmem::watch_write_through(addr, size as usize, value);
-                }
-                return false;
-            }
-            let n = HITS.fetch_add(1, Ordering::SeqCst);
-            let pc = dyn_.reg_read_pc().unwrap_or(0);
-            let lr = dyn_.reg_read_lr().unwrap_or(0);
-            let limit = watch_write_limit();
-            if limit == 0 || n < limit {
-                if let Some(regs) = watch_write_reg_summary(dyn_) {
-                    log::warn!(
-                        "[watch-write] #{} addr={:#x} size={} val={:#x} pc={:#x} lr={:#x} {}",
-                        n,
-                        addr,
-                        size,
-                        value,
-                        pc,
-                        lr,
-                        regs
-                    );
-                } else {
-                    log::warn!(
-                        "[watch-write] #{} addr={:#x} size={} val={:#x} pc={:#x} lr={:#x}",
-                        n,
-                        addr,
-                        size,
-                        value,
-                        pc,
-                        lr
-                    );
-                }
-            }
-            let stop = limit != 0 && n + 1 >= limit;
-            if value != 0 || stop {
-                log::warn!(
-                    "[watch-write] HIT addr={:#x} size={} val={:#x} pc={:#x} lr={:#x}",
-                    addr,
-                    size,
-                    value,
-                    pc,
-                    lr
-                );
-            }
-            if stop || (value != 0 && !watch_keep_after_hit()) {
-                nexium_memory::fastmem::watch_disarm();
-                return false;
-            }
-            if page_protect
-                && nexium_memory::fastmem::watch_write_through(addr, size as usize, value)
-            {
-                return true;
-            }
-            false
         });
 
         Ok(Self {
@@ -498,59 +435,40 @@ impl DynarmicCpu {
         } else {
             nexium_memory::fastmem::watch_exact_range()
         };
-        if page_protect && desired.is_some() && !self.watch_protected.get() {
-            if nexium_memory::fastmem::watch_reprotect() {
-                if let Some((lo, hi)) = desired {
+
+        if self.watch_applied.get() == desired && (!page_protect || self.watch_protected.get()) {
+            return;
+        }
+
+        if let Some((lo, hi)) = desired {
+            if page_protect {
+                if nexium_memory::fastmem::watch_reprotect() {
                     log::warn!(
                         "[watch-write] fastmem read-only armed va={:#x} len={:#x}",
                         lo,
                         hi - lo
                     );
-                }
-                self.watch_protected.set(true);
-            }
-        }
-        if self.watch_applied.get() == desired {
-            return;
-        }
-        if let Some((lo, hi)) = self.watch_applied.get() {
-            let _ = if page_protect {
-                self.emu.emu.watch_mem_range(lo, hi - lo, false)
-            } else {
-                self.emu.emu.watch_mem_range_soft(lo, hi - lo, false)
-            };
-        }
-        if let Some((lo, hi)) = desired {
-            let result = if page_protect {
-                self.emu.emu.watch_mem_range(lo, hi - lo, true)
-            } else {
-                self.emu.emu.watch_mem_range_soft(lo, hi - lo, true)
-            };
-            if let Err(e) = result {
-                log::warn!(
-                    "[watch-write] dynarmic arm failed va={:#x} len={:#x}: {:?}",
-                    lo,
-                    hi - lo,
-                    e
-                );
-            } else {
-                let mode = if page_protect {
-                    "fastmem-ro"
+                    self.watch_protected.set(true);
                 } else {
-                    "callback"
-                };
+                    log::warn!(
+                        "[watch-write] fastmem read-only arm failed va={:#x} len={:#x}",
+                        lo,
+                        hi - lo
+                    );
+                    self.watch_protected.set(false);
+                }
+            } else {
                 log::warn!(
-                    "[watch-write] dynarmic {} armed va={:#x} len={:#x}",
-                    mode,
+                    "[watch-write] dynarmic watch callbacks unavailable; set NEXIUM_WATCH_PAGE_PROTECT=1 for va={:#x} len={:#x}",
                     lo,
                     hi - lo
                 );
             }
-        }
-        self.watch_applied.set(desired);
-        if desired.is_none() {
+        } else {
             self.watch_protected.set(false);
         }
+
+        self.watch_applied.set(desired);
     }
 }
 
