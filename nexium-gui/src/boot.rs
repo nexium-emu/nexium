@@ -17,6 +17,261 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+struct CpuPollWatch {
+    va: u64,
+    len: usize,
+    last: Option<Vec<u8>>,
+    hits: u32,
+    max_hits: u32,
+}
+
+impl CpuPollWatch {
+    fn from_env() -> Option<Self> {
+        let spec = std::env::var("NEXIUM_CPU_POLL_WATCH").ok()?;
+        let (va, len) = spec.trim().split_once(':')?;
+        let va = parse_watch_u64(va)?;
+        let len = parse_watch_u64(len).unwrap_or(0x80) as usize;
+        if va == 0 || len == 0 {
+            return None;
+        }
+        let max_hits = std::env::var("NEXIUM_CPU_POLL_WATCH_MAX")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(8);
+        log::warn!(
+            "[cpu-poll-watch] configured va={:#x} len={:#x} max_hits={}",
+            va,
+            len,
+            max_hits
+        );
+        Some(Self {
+            va,
+            len,
+            last: None,
+            hits: 0,
+            max_hits,
+        })
+    }
+
+    fn check(
+        &mut self,
+        kernel: &nexium_core::kernel::Kernel,
+        cpu: &nexium_core::cpu::Cpu,
+        event: nexium_core::cpu::CpuEvent,
+        cycles: u64,
+        svcs: u32,
+    ) -> bool {
+        let mut cur = vec![0u8; self.len];
+        if kernel.address_space.read(self.va, &mut cur).is_err() {
+            return true;
+        }
+        let Some(last) = self.last.as_ref() else {
+            self.last = Some(cur);
+            log::warn!("[cpu-poll-watch] baseline va={:#x}", self.va);
+            return true;
+        };
+        if last == &cur {
+            return true;
+        }
+        let changed = changed_words(last, &cur);
+        let floats = float_preview_local(&cur);
+        let hex = hex_preview_local(&cur);
+        let handle = kernel.threads.current_handle();
+        let pc = cpu.get_pc();
+        let lr = cpu.get_register(30);
+        let sp = cpu.get_sp();
+        log::warn!(
+            "[cpu-poll-watch] hit={} va={:#x} changed={} handle={:?} event={:?} cycles={} svcs={} pc={:#x} lr={:#x} sp={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x19={:#x} x20={:#x} x21={:#x} x22={:#x} x29={:#x}",
+            self.hits,
+            self.va,
+            changed,
+            handle,
+            event,
+            cycles,
+            svcs,
+            pc,
+            lr,
+            sp,
+            cpu.get_register(0),
+            cpu.get_register(1),
+            cpu.get_register(2),
+            cpu.get_register(3),
+            cpu.get_register(19),
+            cpu.get_register(20),
+            cpu.get_register(21),
+            cpu.get_register(22),
+            cpu.get_register(29)
+        );
+        log::warn!("[cpu-poll-watch] floats=[{}]", floats);
+        log::warn!("[cpu-poll-watch] bytes={}", hex);
+        self.last = Some(cur);
+        self.hits += 1;
+        if self.max_hits != 0 && self.hits >= self.max_hits {
+            log::warn!("[cpu-poll-watch] disarmed");
+            return false;
+        }
+        true
+    }
+}
+
+struct PcTraceRange {
+    label: String,
+    start: u64,
+    end: u64,
+    hits: u32,
+}
+
+struct PcTrace {
+    ranges: Vec<PcTraceRange>,
+    max_hits: u32,
+}
+
+impl PcTrace {
+    fn from_env() -> Option<Self> {
+        let spec = std::env::var("NEXIUM_PC_TRACE").ok()?;
+        let mut ranges = Vec::new();
+        for item in spec.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let (label, range) = item
+                .rsplit_once(':')
+                .map(|(label, range)| (label.trim().to_string(), range.trim()))
+                .unwrap_or_else(|| (item.to_string(), item));
+            let Some((start, end)) = parse_pc_trace_range(range) else {
+                log::warn!("[pc-trace] ignored invalid range {}", item);
+                continue;
+            };
+            if start >= end {
+                log::warn!("[pc-trace] ignored empty range {}", item);
+                continue;
+            }
+            ranges.push(PcTraceRange {
+                label,
+                start,
+                end,
+                hits: 0,
+            });
+        }
+        if ranges.is_empty() {
+            return None;
+        }
+        let max_hits = std::env::var("NEXIUM_PC_TRACE_MAX")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(8);
+        for r in &ranges {
+            log::warn!(
+                "[pc-trace] configured {} {:#x}-{:#x} max_hits={}",
+                r.label,
+                r.start,
+                r.end,
+                max_hits
+            );
+        }
+        Some(Self { ranges, max_hits })
+    }
+
+    fn check(
+        &mut self,
+        core: usize,
+        kernel: &nexium_core::kernel::Kernel,
+        cpu: &nexium_core::cpu::Cpu,
+        event: nexium_core::cpu::CpuEvent,
+        cycles: u64,
+        svcs: u32,
+    ) {
+        let pc = cpu.get_pc();
+        for r in &mut self.ranges {
+            if pc < r.start || pc >= r.end {
+                continue;
+            }
+            if self.max_hits != 0 && r.hits >= self.max_hits {
+                continue;
+            }
+            let hit = r.hits;
+            r.hits = r.hits.saturating_add(1);
+            log::warn!(
+                "[pc-trace] core={} hit={} label={} pc={:#x} off={:#x} lr={:#x} sp={:#x} handle={:?} event={:?} cycles={} svcs={} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x19={:#x} x20={:#x} x21={:#x} x22={:#x} x29={:#x}",
+                core,
+                hit,
+                r.label,
+                pc,
+                pc.saturating_sub(r.start),
+                cpu.get_register(30),
+                cpu.get_sp(),
+                kernel.threads.current_handle(),
+                event,
+                cycles,
+                svcs,
+                cpu.get_register(0),
+                cpu.get_register(1),
+                cpu.get_register(2),
+                cpu.get_register(3),
+                cpu.get_register(19),
+                cpu.get_register(20),
+                cpu.get_register(21),
+                cpu.get_register(22),
+                cpu.get_register(29)
+            );
+        }
+    }
+}
+
+fn parse_pc_trace_range(s: &str) -> Option<(u64, u64)> {
+    if let Some((start, len)) = s.split_once('+') {
+        let start = parse_watch_u64(start)?;
+        let len = parse_watch_u64(len)?;
+        return Some((start, start.saturating_add(len)));
+    }
+    if let Some((start, end)) = s.split_once('-') {
+        return Some((parse_watch_u64(start)?, parse_watch_u64(end)?));
+    }
+    let start = parse_watch_u64(s)?;
+    Some((start, start.saturating_add(4)))
+}
+
+fn parse_watch_u64(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>()
+            .ok()
+            .or_else(|| u64::from_str_radix(s, 16).ok())
+    }
+}
+
+fn changed_words(old: &[u8], new: &[u8]) -> String {
+    let mut out = Vec::new();
+    for (i, (a, b)) in old.chunks(4).zip(new.chunks(4)).enumerate() {
+        if a != b {
+            out.push(format!("{:#x}", i * 4));
+        }
+        if out.len() >= 24 {
+            break;
+        }
+    }
+    out.join(",")
+}
+
+fn hex_preview_local(buf: &[u8]) -> String {
+    buf.iter()
+        .take(96)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn float_preview_local(buf: &[u8]) -> String {
+    buf.chunks_exact(4)
+        .take(24)
+        .map(|c| format!("{:.3}", f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn decode_a64_brief(insn: u32) -> String {
     let top8 = (insn >> 24) & 0xFF;
     let size = (insn >> 30) & 0b11;
@@ -233,6 +488,9 @@ impl EmulationHandle {
                                     core_id,
                                 );
                                 let mut last_map_gen = addr_aux.generation();
+                                let mut pc_trace = PcTrace::from_env();
+                                let mut aux_cycles = 0u64;
+                                let mut aux_svcs = 0u32;
                                 log::info!("[core{}] started", core_id);
                                 while !stop_aux.load(Ordering::Relaxed) {
                                     let has = {
@@ -256,13 +514,35 @@ impl EmulationHandle {
                                         last_map_gen = gen;
                                     }
                                     let event = cpu_mut().unwrap().run(200_000);
-                                    if let nexium_core::cpu::CpuEvent::Svc(imm) = event {
+                                    aux_cycles = aux_cycles.saturating_add(200_000);
+                                    if pc_trace.is_some()
+                                        || matches!(event, nexium_core::cpu::CpuEvent::Svc(_))
+                                    {
                                         let mut k = kernel_aux.lock();
                                         k.threads.save_current_ctx(cpu_ref().unwrap());
-                                        let result = k.dispatch_svc(imm);
-                                        k.tick_audio_renderers();
+                                        if let Some(trace) = pc_trace.as_mut() {
+                                            trace.check(
+                                                core_id,
+                                                &k,
+                                                cpu_ref().unwrap(),
+                                                event,
+                                                aux_cycles,
+                                                aux_svcs,
+                                            );
+                                        }
+                                        let result =
+                                            if let nexium_core::cpu::CpuEvent::Svc(imm) = event {
+                                                aux_svcs = aux_svcs.saturating_add(1);
+                                                let result = k.dispatch_svc(imm);
+                                                k.tick_audio_renderers();
+                                                Some(result)
+                                            } else {
+                                                None
+                                            };
                                         drop(k);
-                                        cpu_mut().unwrap().set_register(0, result as u64);
+                                        if let Some(result) = result {
+                                            cpu_mut().unwrap().set_register(0, result as u64);
+                                        }
                                     }
                                 }
                                 log::info!("[core{}] stopped", core_id);
@@ -392,6 +672,8 @@ impl EmulationHandle {
                 let mut last_sync_snapshot = std::time::Instant::now()
                     .checked_sub(std::time::Duration::from_secs(10))
                     .unwrap_or_else(std::time::Instant::now);
+                let mut cpu_poll_watch = CpuPollWatch::from_env();
+                let mut pc_trace = PcTrace::from_env();
 
                 let mut loop_iter: u64 = 0;
                 let mut last_loop_log = std::time::Instant::now();
@@ -418,6 +700,11 @@ impl EmulationHandle {
                     if stop_flag_clone.load(Ordering::Relaxed) {
                         log::info!("Stopping emulation");
                         break;
+                    }
+
+                    if let Some(va) = nexium_memory::fastmem::take_guest_probe_event() {
+                        log::warn!("[guest-probe-snapshot] va={:#x}", va);
+                        guard.log_thread_snapshot(&format!("guest-probe-{:#x}", va));
                     }
 
                     {
@@ -557,11 +844,17 @@ impl EmulationHandle {
                                 let mut nm = [0u8; 64];
                                 if x1 != 0 && guard.address_space.read(x1, &mut nm).is_ok() {
                                     let end = nm.iter().position(|&b| b == 0).unwrap_or(nm.len());
-                                    log::warn!("[spin-detected] *x1 ascii=\"{}\"", String::from_utf8_lossy(&nm[..end]));
+                                    log::warn!(
+                                        "[spin-detected] *x1 ascii=\"{}\"",
+                                        String::from_utf8_lossy(&nm[..end])
+                                    );
                                 }
                                 if x0 != 0 && guard.address_space.read(x0, &mut nm).is_ok() {
                                     let end = nm.iter().position(|&b| b == 0).unwrap_or(nm.len());
-                                    log::warn!("[spin-detected] *x0 ascii=\"{}\"", String::from_utf8_lossy(&nm[..end]));
+                                    log::warn!(
+                                        "[spin-detected] *x0 ascii=\"{}\"",
+                                        String::from_utf8_lossy(&nm[..end])
+                                    );
                                 }
                                 guard.log_thread_snapshot("spin-detected");
                             }
@@ -634,6 +927,14 @@ impl EmulationHandle {
                         guard.threads.save_current_ctx(cpu);
                         cycle_count += cpu_slice;
                         guard.cycle_count += cpu_slice;
+                        if let Some(watch) = cpu_poll_watch.as_mut() {
+                            if !watch.check(&guard, cpu, event, cycle_count, svc_count) {
+                                cpu_poll_watch = None;
+                            }
+                        }
+                        if let Some(trace) = pc_trace.as_mut() {
+                            trace.check(0, &guard, cpu, event, cycle_count, svc_count);
+                        }
 
                         if pc_after < 0x10000 {
                             let cur = guard.threads.current_handle();

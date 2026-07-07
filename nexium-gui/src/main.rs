@@ -28,6 +28,15 @@ fn main() -> Result<(), eframe::Error> {
 
     log::info!("=== NeXium - Nintendo Switch Emulator ===");
 
+    if let Ok(v) = std::env::var("NEXIUM_DOCKED") {
+        let docked = v != "0";
+        nexium_core::hid_state::set_docked(docked);
+        log::info!(
+            "console mode initialized from NEXIUM_DOCKED={}",
+            if docked { "1" } else { "0" }
+        );
+    }
+
     #[cfg(windows)]
     fault_logger::install();
 
@@ -149,7 +158,8 @@ mod fault_logger {
                             };
                             eprintln!("[host-AV]   {}={:#018x}{}", GP_NAMES[i], v, tag);
                         }
-                        let rip = core::ptr::read_unaligned((ctx as *const u8).add(0xf8) as *const u64);
+                        let rip =
+                            core::ptr::read_unaligned((ctx as *const u8).add(0xf8) as *const u64);
                         eprintln!("[host-AV]   rip={:#018x}", rip);
                         let exe_base = GetModuleHandleW(core::ptr::null()) as u64;
                         let mut hmod: *mut std::ffi::c_void = core::ptr::null_mut();
@@ -167,7 +177,8 @@ mod fault_logger {
                                 mod_base == exe_base
                             );
                         }
-                        let rsp = core::ptr::read_unaligned((ctx as *const u8).add(0x98) as *const u64);
+                        let rsp =
+                            core::ptr::read_unaligned((ctx as *const u8).add(0x98) as *const u64);
                         let mut found = 0u32;
                         let mut off = 0u64;
                         while off < 0x4000 && found < 24 {
