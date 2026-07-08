@@ -30,15 +30,16 @@ impl Library {
         }
     }
 
-    pub fn rescan(&mut self, ctx: &egui::Context) {
+    pub fn rescan(&mut self, ctx: &egui::Context, extra_dirs: &[PathBuf]) {
         self.loaded = false;
         self.games.clear();
         self.textures.clear();
         self.selected = None;
         let (tx, rx) = channel();
         let ctx = ctx.clone();
+        let extra: Vec<PathBuf> = extra_dirs.to_vec();
         std::thread::spawn(move || {
-            let games = scan();
+            let games = scan(&extra);
             let _ = tx.send(games);
             ctx.request_repaint();
         });
@@ -71,10 +72,15 @@ impl Library {
     }
 }
 
-fn scan() -> Vec<GameEntry> {
+fn scan(extra_dirs: &[PathBuf]) -> Vec<GameEntry> {
     let mut out = Vec::new();
     collect(&nexium_common::paths::nro_dir(), 0, &mut out);
     collect(&nexium_common::paths::sdmc_dir().join("switch"), 0, &mut out);
+    for dir in extra_dirs {
+        collect(dir, 0, &mut out);
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out.dedup_by(|a, b| a.path == b.path);
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
     out
 }
@@ -115,21 +121,22 @@ fn read_entry(path: &Path) -> Option<GameEntry> {
         .unwrap_or("Unknown")
         .to_string();
 
-    let (title, author, icon) = if format == "NRO" {
-        match nexium_loader::read_nro_metadata(path) {
-            Some(meta) => {
-                let title = if meta.title.is_empty() {
-                    stem.clone()
-                } else {
-                    meta.title
-                };
-                let icon = meta.icon_jpeg.as_deref().and_then(decode_jpeg);
-                (title, meta.author, icon)
-            }
-            None => (stem.clone(), String::new(), None),
-        }
+    let meta = if format == "NRO" {
+        nexium_loader::read_nro_metadata(path)
     } else {
-        (stem.clone(), String::new(), None)
+        nexium_loader::read_container_metadata(path)
+    };
+    let (title, author, icon) = match meta {
+        Some(meta) => {
+            let title = if meta.title.is_empty() {
+                stem.clone()
+            } else {
+                meta.title
+            };
+            let icon = meta.icon_jpeg.as_deref().and_then(decode_jpeg);
+            (title, meta.author, icon)
+        }
+        None => (stem.clone(), String::new(), None),
     };
 
     Some(GameEntry {

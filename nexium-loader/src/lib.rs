@@ -2,6 +2,7 @@ pub mod application;
 pub mod bin_read;
 pub mod cnmt;
 pub mod container;
+pub mod control;
 pub mod env;
 pub mod nca;
 pub mod npdm;
@@ -10,6 +11,7 @@ pub mod nso;
 pub mod romfs;
 
 pub use application::{detect, Application, ContainerKind, LazyRomfs, LoadedModule};
+pub use control::read_container_metadata;
 pub use env::EnvBlockBuilder;
 pub use nro::{read_nro_metadata, Nro, NroMetadata};
 

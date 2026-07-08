@@ -165,6 +165,8 @@ pub struct AppSettings {
     pub multicore: bool,
     #[serde(default)]
     pub async_shaders: bool,
+    #[serde(default)]
+    pub library_folders: Vec<PathBuf>,
 }
 
 impl Default for AppSettings {
@@ -181,6 +183,7 @@ impl Default for AppSettings {
             audio_volume: default_audio_volume(),
             multicore: default_multicore(),
             async_shaders: false,
+            library_folders: Vec::new(),
         }
     }
 }
