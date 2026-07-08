@@ -1091,9 +1091,16 @@ impl eframe::App for HorizonApp {
                             .as_ref()
                             .map(|h| h.stats.lock().clone())
                             .unwrap_or_default();
+                        let building = nexium_common::shader_progress::in_flight();
+                        let building_prefix = if building > 0 {
+                            format!("Building Shader(s): {}  ·  ", building)
+                        } else {
+                            String::new()
+                        };
                         ui.label(
                             egui::RichText::new(format!(
-                                "Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
+                                "{}Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
+                                building_prefix,
                                 self.performance.get_frame_time(),
                                 stats.svc_count,
                                 stats.cycle_count,

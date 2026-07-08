@@ -1492,6 +1492,7 @@ fn execute_one(
                     break 'translate b;
                 }
                 bundle_l2_stat(false);
+                let _translate_guard = nexium_common::shader_progress::guard();
 
                 let mut vs_cfg = nexium_shader::build_cfg(&vs_sass);
                 let fs_cfg = nexium_shader::build_cfg(&fs_sass);

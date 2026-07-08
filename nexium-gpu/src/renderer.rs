@@ -1973,13 +1973,19 @@ impl Renderer {
             match pipeline_cache.try_async_skip(req, 4) {
                 None => return Ok(None),
                 Some(req) => {
-                    let pipeline = pipeline_cache.build(device, &req)?;
+                    let pipeline = {
+                        let _g = nexium_common::shader_progress::guard();
+                        pipeline_cache.build(device, &req)?
+                    };
                     pipeline_cache.insert(key, pipeline);
                     return Ok(Some(pipeline));
                 }
             }
         }
-        let pipeline = pipeline_cache.build(device, &req)?;
+        let pipeline = {
+            let _g = nexium_common::shader_progress::guard();
+            pipeline_cache.build(device, &req)?
+        };
         pipeline_cache.insert(key, pipeline);
         Ok(Some(pipeline))
     }
