@@ -9,15 +9,19 @@ pub struct RenderThread {
 
 impl RenderThread {
     fn new() -> Self {
+        Self::new_named("nexium-render")
+    }
+
+    fn new_named(name: &str) -> Self {
         let (tx, rx) = sync_channel::<RenderJob>(32);
         std::thread::Builder::new()
-            .name("nexium-render".to_string())
+            .name(name.to_string())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
                     job();
                 }
             })
-            .expect("spawn nexium-render thread");
+            .expect("spawn render worker thread");
         RenderThread { tx }
     }
 
@@ -76,9 +80,18 @@ pub fn maybe_render_thread() -> Option<&'static RenderThread> {
 }
 
 pub fn present_thread() -> &'static RenderThread {
+    if dedicated_present_thread() {
+        static PT: OnceLock<RenderThread> = OnceLock::new();
+        return PT.get_or_init(|| RenderThread::new_named("nexium-present"));
+    }
     if let Some(rt) = maybe_render_thread() {
         return rt;
     }
     static PT: OnceLock<RenderThread> = OnceLock::new();
-    PT.get_or_init(RenderThread::new)
+    PT.get_or_init(|| RenderThread::new_named("nexium-present"))
+}
+
+fn dedicated_present_thread() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_DEDICATED_PRESENT_THREAD").is_some())
 }
