@@ -1477,14 +1477,19 @@ impl Renderer {
         cpu_addr: u64,
         copy_rect: Option<[u32; 4]>,
     ) -> Option<(u32, u32, Vec<u8>, Option<bool>)> {
-        let (w, h, raw, format, flip_y) =
-            self.readback_target_pipelined_raw(nvmap_id, width, height, gpu_va, cpu_addr, copy_rect)?;
-        if legacy_present_enabled() {
-            let out = readback_to_rgba8(&raw, format, w, h);
-            return Some((w, h, out, flip_y));
-        }
-        let vflip = flip_y.unwrap_or(!(w == 1600 && h == 900));
-        let out = readout_present_rgba8(raw, format, w, h, vflip);
+        let pp_t0 = std::time::Instant::now();
+        let raw_result =
+            self.readback_target_pipelined_raw(nvmap_id, width, height, gpu_va, cpu_addr, copy_rect);
+        let pp_raw = pp_t0.elapsed();
+        let (w, h, raw, format, flip_y) = raw_result?;
+        let pp_t1 = std::time::Instant::now();
+        let out = if legacy_present_enabled() {
+            readback_to_rgba8(&raw, format, w, h)
+        } else {
+            let vflip = flip_y.unwrap_or(!(w == 1600 && h == 900));
+            readout_present_rgba8(raw, format, w, h, vflip)
+        };
+        pprof_record(w, h, pp_raw, pp_t1.elapsed());
         Some((w, h, out, flip_y))
     }
 
@@ -1497,7 +1502,9 @@ impl Renderer {
         cpu_addr: u64,
         copy_rect: Option<[u32; 4]>,
     ) -> Option<(u32, u32, Vec<u8>, vk::Format, Option<bool>)> {
+        let pr_t0 = std::time::Instant::now();
         let mut inner = self.inner.lock();
+        pprof_raw_lock(pr_t0.elapsed());
         let RendererInner {
             device,
             cmd_pool,
@@ -2951,6 +2958,7 @@ impl Renderer {
         if calls.is_empty() {
             return Ok(());
         }
+        let rp_t0 = std::time::Instant::now();
 
         struct Prep {
             pipeline: vk::Pipeline,
@@ -3128,8 +3136,12 @@ impl Renderer {
         if preps.is_empty() {
             return Ok(());
         }
+        let rp_draws = preps.len() as u64;
+        let rp_prep = rp_t0.elapsed();
 
+        let rp_t1 = std::time::Instant::now();
         let mut inner = self.inner.lock();
+        let rp_lock = rp_t1.elapsed();
         let RendererInner {
             device,
             queue,
@@ -3158,6 +3170,7 @@ impl Renderer {
         let other_idx = (cur_idx + 1) % 2;
         let ubo_alignment = *min_ubo_offset_alignment;
 
+        let rp_t2 = std::time::Instant::now();
         {
             let slot = &mut frame_slots[cur_idx];
             if slot.in_flight {
@@ -3192,6 +3205,8 @@ impl Renderer {
                 ubo_ring.head = ubo_ring.slot_head[cur_idx];
             }
         }
+        let rp_fence = rp_t2.elapsed();
+        let rp_t3 = std::time::Instant::now();
         if dummy_white.is_none() {
             *dummy_white = Some(create_dummy_white_image(
                 device, *queue, *cmd_pool, mem_props, false, false,
@@ -4327,8 +4342,20 @@ impl Renderer {
                 .end_command_buffer(cmd)
                 .map_err(|e| format!("end_command_buffer(batch): {:?}", e))?;
         }
+        let rp_record = rp_t3.elapsed();
+        let rp_t4 = std::time::Instant::now();
         let slot_fence = frame_slots[cur_idx].fence;
         submit_with_fence(device, *queue, cmd, slot_fence)?;
+        let rp_submit = rp_t4.elapsed();
+        rprof_record(
+            rp_draws,
+            rp_prep,
+            rp_lock,
+            rp_fence,
+            rp_record,
+            rp_submit,
+            rp_t0.elapsed(),
+        );
         frame_slots[cur_idx].in_flight = true;
         frame_slots[cur_idx].retired_dsets.extend(dsets_batch);
         for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
@@ -4351,6 +4378,97 @@ impl Renderer {
         *frame_index = next_idx;
         pipeline_cache.maybe_save(device);
         Ok(())
+    }
+}
+
+fn pprof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NEXIUM_RENDER_PROFILE").is_some())
+}
+
+fn pprof_record(w: u32, h: u32, raw: std::time::Duration, convert: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    if !pprof_enabled() {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    static RAW: AtomicU64 = AtomicU64::new(0);
+    static CONVERT: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    RAW.fetch_add(raw.as_nanos() as u64, Ordering::Relaxed);
+    CONVERT.fetch_add(convert.as_nanos() as u64, Ordering::Relaxed);
+    if n % 64 == 0 {
+        log::warn!(
+            "[pprof] presents={} dims={}x{} avg_ms raw={:.2} convert={:.2}",
+            n,
+            w,
+            h,
+            RAW.load(Ordering::Relaxed) as f64 / n as f64 / 1_000_000.0,
+            CONVERT.load(Ordering::Relaxed) as f64 / n as f64 / 1_000_000.0
+        );
+    }
+}
+
+fn pprof_raw_lock(lock: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    if !pprof_enabled() {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    static LOCK: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    LOCK.fetch_add(lock.as_nanos() as u64, Ordering::Relaxed);
+    if n % 64 == 0 {
+        log::warn!(
+            "[pprof] raw_lock avg_ms={:.2}",
+            LOCK.load(Ordering::Relaxed) as f64 / n as f64 / 1_000_000.0
+        );
+    }
+}
+
+fn rprof_record(
+    draws: u64,
+    prep: std::time::Duration,
+    lock: std::time::Duration,
+    fence: std::time::Duration,
+    record: std::time::Duration,
+    submit: std::time::Duration,
+    total: std::time::Duration,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("NEXIUM_RENDER_PROFILE").is_some()) {
+        return;
+    }
+    static BATCHES: AtomicU64 = AtomicU64::new(0);
+    static DRAWS: AtomicU64 = AtomicU64::new(0);
+    static PREP: AtomicU64 = AtomicU64::new(0);
+    static LOCK: AtomicU64 = AtomicU64::new(0);
+    static FENCE: AtomicU64 = AtomicU64::new(0);
+    static RECORD: AtomicU64 = AtomicU64::new(0);
+    static SUBMIT: AtomicU64 = AtomicU64::new(0);
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    let n = BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    DRAWS.fetch_add(draws, Ordering::Relaxed);
+    PREP.fetch_add(prep.as_nanos() as u64, Ordering::Relaxed);
+    LOCK.fetch_add(lock.as_nanos() as u64, Ordering::Relaxed);
+    FENCE.fetch_add(fence.as_nanos() as u64, Ordering::Relaxed);
+    RECORD.fetch_add(record.as_nanos() as u64, Ordering::Relaxed);
+    SUBMIT.fetch_add(submit.as_nanos() as u64, Ordering::Relaxed);
+    TOTAL.fetch_add(total.as_nanos() as u64, Ordering::Relaxed);
+    if n % 64 == 0 {
+        let ms = |v: &AtomicU64| v.load(Ordering::Relaxed) as f64 / n as f64 / 1_000_000.0;
+        log::warn!(
+            "[rprof] batches={} draws={} avg_ms prep={:.2} lock={:.2} fence={:.2} record={:.2} submit={:.2} total={:.2}",
+            n,
+            DRAWS.load(Ordering::Relaxed),
+            ms(&PREP),
+            ms(&LOCK),
+            ms(&FENCE),
+            ms(&RECORD),
+            ms(&SUBMIT),
+            ms(&TOTAL)
+        );
     }
 }
 
@@ -8840,8 +8958,17 @@ fn create_staging_owned(
     let mt = find_memory_type(
         mem_props,
         req.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT
+            | vk::MemoryPropertyFlags::HOST_CACHED,
     )
+    .or_else(|| {
+        find_memory_type(
+            mem_props,
+            req.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    })
     .ok_or_else(|| "no HOST_VISIBLE memory type".to_string())?;
     let alloc_info = vk::MemoryAllocateInfo {
         s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
