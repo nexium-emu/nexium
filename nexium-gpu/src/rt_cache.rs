@@ -645,7 +645,7 @@ impl RtCache {
             let replace = match best {
                 Some((best_key, _, best_stamp)) => {
                     let best_area = best_key.width as u64 * best_key.height as u64;
-                    area < best_area || (area == best_area && stamp > best_stamp)
+                    stamp > best_stamp || (stamp == best_stamp && area < best_area)
                 }
                 None => true,
             };
@@ -682,7 +682,7 @@ impl RtCache {
             let replace = match best {
                 Some((best_key, _, best_stamp)) => {
                     let best_area = best_key.width as u64 * best_key.height as u64;
-                    area < best_area || (area == best_area && stamp > best_stamp)
+                    stamp > best_stamp || (stamp == best_stamp && area < best_area)
                 }
                 None => true,
             };
