@@ -1094,6 +1094,11 @@ impl eframe::App for HorizonApp {
                         let building = nexium_common::shader_progress::in_flight();
                         let building_prefix = if building > 0 {
                             format!("Building Shader(s): {}  ·  ", building)
+                        } else if nexium_common::shader_progress::recently_active() {
+                            format!(
+                                "Built {} Shader(s)  ·  ",
+                                nexium_common::shader_progress::burst_built()
+                            )
                         } else {
                             String::new()
                         };
