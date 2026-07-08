@@ -533,8 +533,9 @@ impl RtCache {
         &mut self,
         key: RtKey,
         device: &ash::Device,
-    ) -> Result<&mut GpuImage, String> {
-        if !self.depth_cache.contains_key(&key) {
+    ) -> Result<(&mut GpuImage, bool), String> {
+        let created = !self.depth_cache.contains_key(&key);
+        if created {
             let image = self.create_image_inner(
                 device,
                 key,
@@ -547,7 +548,7 @@ impl RtCache {
             )?;
             self.depth_cache.insert(key, image);
         }
-        Ok(self.depth_cache.get_mut(&key).unwrap())
+        Ok((self.depth_cache.get_mut(&key).unwrap(), created))
     }
 
     pub fn find_depth(
@@ -669,7 +670,7 @@ impl RtCache {
             let replace = match best {
                 Some((best_key, _, best_stamp)) => {
                     let best_area = best_key.width as u64 * best_key.height as u64;
-                    area < best_area || (area == best_area && stamp > best_stamp)
+                    stamp > best_stamp || (stamp == best_stamp && area < best_area)
                 }
                 None => true,
             };
@@ -706,7 +707,7 @@ impl RtCache {
             let replace = match best {
                 Some((best_key, _, best_stamp)) => {
                     let best_area = best_key.width as u64 * best_key.height as u64;
-                    area < best_area || (area == best_area && stamp > best_stamp)
+                    stamp > best_stamp || (stamp == best_stamp && area < best_area)
                 }
                 None => true,
             };

@@ -101,7 +101,8 @@ impl HorizonApp {
             library: crate::library::Library::new(),
             stop_fade: None,
         };
-        app.library.rescan(&cc.egui_ctx);
+        app.library
+            .rescan(&cc.egui_ctx, &app.app_settings.library_folders);
         if !nro_path.is_empty() {
             let backend = app.app_settings.cpu_backend.to_cpu_kind();
             if let Ok(handle) = EmulationHandle::new(&nro_path, backend, Some(cc.egui_ctx.clone()))
@@ -182,7 +183,7 @@ impl HorizonApp {
                 }
                 ui.add_space(8.0);
                 if pill_button(ui, "Refresh", false).clicked() {
-                    self.library.rescan(ctx);
+                    self.library.rescan(ctx, &self.app_settings.library_folders);
                 }
             });
         });
@@ -192,22 +193,6 @@ impl HorizonApp {
             ui.centered_and_justified(|ui| ui.add(egui::Spinner::new().size(28.0)));
             return;
         }
-        if self.library.games.is_empty() {
-            let dir = nexium_common::paths::nro_dir();
-            ui.centered_and_justified(|ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("No games found").size(18.0).color(TEXT));
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(format!("Place .nro games in {}", dir.display()))
-                            .size(12.0)
-                            .color(MUTED),
-                    );
-                });
-            });
-            return;
-        }
-
         {
             let w = &mut ui.style_mut().visuals.widgets;
             let dim = Color32::from_rgb(0x1E, 0x5D, 0x7A);
@@ -220,36 +205,44 @@ impl HorizonApp {
         }
 
         let mut launch: Option<String> = None;
+        let mut add_folder = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
             ui.add_space(8.0);
             let tw = 154.0;
             let gap = 20.0;
-            let n = self.library.games.len();
+            let n_games = self.library.games.len();
+            let total_tiles = n_games + 1;
             let avail = ui.clip_rect().width();
-            let cols = (((avail - 2.0 * MARGIN + gap) / (tw + gap)).floor() as usize).clamp(1, n);
+            let cols = (((avail - 2.0 * MARGIN + gap) / (tw + gap)).floor() as usize)
+                .clamp(1, total_tiles);
             let total = cols as f32 * tw + (cols.saturating_sub(1)) as f32 * gap;
             let left = ((avail - total) * 0.5).max(MARGIN);
             let mut idx = 0;
-            while idx < n {
+            while idx < total_tiles {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.add_space(left);
                     for c in 0..cols {
-                        if idx >= n {
+                        if idx >= total_tiles {
                             break;
                         }
-                        let tex = self.library.texture(ctx, idx);
-                        let selected = self.library.selected == Some(idx);
-                        let resp =
-                            game_tile(ui, &self.library.games[idx], tex.as_ref(), selected);
-                        if resp.clicked() {
-                            self.library.selected = Some(idx);
-                        }
-                        if resp.double_clicked() {
-                            launch =
-                                Some(self.library.games[idx].path.to_string_lossy().to_string());
+                        if idx < n_games {
+                            let tex = self.library.texture(ctx, idx);
+                            let selected = self.library.selected == Some(idx);
+                            let resp =
+                                game_tile(ui, &self.library.games[idx], tex.as_ref(), selected);
+                            if resp.clicked() {
+                                self.library.selected = Some(idx);
+                            }
+                            if resp.double_clicked() {
+                                launch = Some(
+                                    self.library.games[idx].path.to_string_lossy().to_string(),
+                                );
+                            }
+                        } else if add_folder_tile(ui).clicked() {
+                            add_folder = true;
                         }
                         if c + 1 < cols {
                             ui.add_space(gap);
@@ -264,6 +257,15 @@ impl HorizonApp {
         if let Some(path) = launch {
             self.nro_path = path;
             self.boot_nro(ctx);
+        }
+        if add_folder {
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                if !self.app_settings.library_folders.contains(&dir) {
+                    self.app_settings.library_folders.push(dir);
+                    let _ = self.app_settings.save();
+                }
+                self.library.rescan(ctx, &self.app_settings.library_folders);
+            }
         }
     }
 
@@ -480,6 +482,63 @@ fn game_tile(
     );
 
     resp.on_hover_text(&game.title)
+}
+
+fn add_folder_tile(ui: &mut egui::Ui) -> egui::Response {
+    let tile = Vec2::new(154.0, 202.0);
+    let (rect, resp) = ui.allocate_exact_size(tile, Sense::click());
+    let hovered = resp.hovered();
+
+    let bg = if hovered {
+        Color32::from_rgb(0x1C, 0x1C, 0x22)
+    } else {
+        BG_RAISED
+    };
+    let rounding = Rounding::same(10.0);
+    ui.painter().rect_filled(rect, rounding, bg);
+    if hovered {
+        ui.painter()
+            .rect_stroke(rect, rounding, Stroke::new(1.4, ACCENT_HV));
+    } else {
+        ui.painter()
+            .rect_stroke(rect, rounding, Stroke::new(1.0, BORDER));
+    }
+
+    let pad = 11.0;
+    let icon_sz = tile.x - pad * 2.0;
+    let icon_rect = egui::Rect::from_min_size(rect.min + Vec2::splat(pad), Vec2::splat(icon_sz));
+    ui.painter().rect_filled(
+        icon_rect,
+        Rounding::same(6.0),
+        Color32::from_rgb(0x12, 0x12, 0x16),
+    );
+    ui.painter().text(
+        icon_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "+",
+        FontId::proportional(48.0),
+        if hovered { ACCENT_HV } else { MUTED },
+    );
+    ui.painter().text(
+        egui::pos2(rect.center().x, icon_rect.max.y + 14.0),
+        egui::Align2::CENTER_CENTER,
+        "Add Folder",
+        FontId::proportional(12.5),
+        if hovered {
+            TEXT
+        } else {
+            Color32::from_rgb(0xC8, 0xC8, 0xD2)
+        },
+    );
+    ui.painter().text(
+        egui::pos2(rect.center().x, icon_rect.max.y + 32.0),
+        egui::Align2::CENTER_CENTER,
+        ".dnsp / .dxci",
+        FontId::proportional(10.5),
+        MUTED,
+    );
+
+    resp.on_hover_text("Add a folder of .dnsp / .dxci games")
 }
 
 fn animated_border(p: &egui::Painter, rect: egui::Rect, r: f32, t: f32) {

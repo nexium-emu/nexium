@@ -325,7 +325,7 @@ pub fn read_nro_metadata(path: &std::path::Path) -> Option<NroMetadata> {
     })
 }
 
-fn parse_nacp(nacp: &[u8]) -> (String, String) {
+pub(crate) fn parse_nacp(nacp: &[u8]) -> (String, String) {
     for i in 0..16 {
         let base = i * 0x300;
         if base + 0x300 > nacp.len() {
@@ -339,7 +339,7 @@ fn parse_nacp(nacp: &[u8]) -> (String, String) {
     (String::new(), String::new())
 }
 
-fn read_cstr(b: &[u8]) -> String {
+pub(crate) fn read_cstr(b: &[u8]) -> String {
     let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
     String::from_utf8_lossy(&b[..end]).trim().to_string()
 }

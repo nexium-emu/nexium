@@ -158,7 +158,7 @@ pub struct VertexBuffer {
     pub stride: u32,
     pub address_lo: u32,
     pub address_hi: u32,
-    pub size: u32,
+    pub frequency: u32,
     pub end_lo: u32,
     pub end_hi: u32,
 }
@@ -181,6 +181,7 @@ pub struct Maxwell3DRegisters {
     pub clear_stencil: u32,
     pub vertex_attribs: [VertexAttribute; 32],
     pub vertex_buffers: [VertexBuffer; 32],
+    pub vertex_stream_instances: [u32; 32],
     pub shader_programs: [ShaderProgram; 6],
     pub draw_vertex_count: u32,
     pub draw_first_vertex: u32,
@@ -296,6 +297,7 @@ impl Default for Maxwell3DRegisters {
             clear_stencil: 0,
             vertex_attribs: [VertexAttribute::default(); 32],
             vertex_buffers: [VertexBuffer::default(); 32],
+            vertex_stream_instances: [0; 32],
             shader_programs: [ShaderProgram::default(); 6],
             draw_vertex_count: 0,
             draw_first_vertex: 0,
@@ -411,6 +413,7 @@ pub struct DrawCall {
     pub rt: [RenderTarget; 8],
     pub rt_control: u32,
     pub vertex_buffers: [VertexBuffer; 32],
+    pub vertex_stream_instances: [u32; 32],
     pub vertex_attribs: [VertexAttribute; 32],
     pub viewport: Viewport,
     pub viewport_transform_en: bool,
@@ -802,6 +805,7 @@ impl Maxwell3D {
                     rt: self.regs.rt,
                     rt_control: self.regs.rt_control,
                     vertex_buffers: self.regs.vertex_buffers,
+                    vertex_stream_instances: self.regs.vertex_stream_instances,
                     vertex_attribs: self.regs.vertex_attribs,
                     viewport: self.regs.viewport,
                     viewport_transform_en: self.regs.viewport_transform_en,
@@ -1088,6 +1092,12 @@ impl Maxwell3D {
                     }
                 }
             }
+            0x620..=0x63F => {
+                let idx = (method - 0x620) as usize;
+                if idx < 32 {
+                    self.regs.vertex_stream_instances[idx] = arg;
+                }
+            }
             0x700..=0x77F => {
                 let idx = ((method - 0x700) / 4) as usize;
                 let field = (method - 0x700) % 4;
@@ -1097,7 +1107,7 @@ impl Maxwell3D {
                         0 => vb.stride = arg & 0xFFF,
                         1 => vb.address_hi = arg,
                         2 => vb.address_lo = arg,
-                        3 => vb.size = arg,
+                        3 => vb.frequency = arg,
                         _ => {}
                     }
                 }
@@ -1213,6 +1223,7 @@ impl Maxwell3D {
             rt: self.regs.rt,
             rt_control: self.regs.rt_control,
             vertex_buffers: self.regs.vertex_buffers,
+            vertex_stream_instances: self.regs.vertex_stream_instances,
             vertex_attribs: self.regs.vertex_attribs,
             viewport: self.regs.viewport,
             viewport_transform_en: self.regs.viewport_transform_en,
@@ -1318,6 +1329,7 @@ impl Maxwell3D {
             rt: self.regs.rt,
             rt_control: self.regs.rt_control,
             vertex_buffers: self.regs.vertex_buffers,
+            vertex_stream_instances: self.regs.vertex_stream_instances,
             vertex_attribs: self.regs.vertex_attribs,
             viewport: self.regs.viewport,
             viewport_transform_en: self.regs.viewport_transform_en,
