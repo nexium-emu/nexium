@@ -105,6 +105,13 @@ pub fn enqueue_draws(
                 flush_accum(batch, renderer, mappings, mem_read);
             }
             if !render_enabled(draw, mappings, mem_read) {
+                bump_draw_drop(
+                    0,
+                    &format!(
+                        "re mode={} addr={:#x}",
+                        draw.render_enable_mode, draw.render_enable_addr
+                    ),
+                );
                 continue;
             }
         }
@@ -125,6 +132,7 @@ pub fn enqueue_draws(
                 }
                 Err(e) => {
                     log::debug!("vk_dispatch: DrawTexture prepare failed: {}", e);
+                    bump_draw_drop(1, &e);
                     super::engines::sw_renderer::execute_draws(
                         std::slice::from_ref(draw),
                         mappings,
@@ -140,6 +148,7 @@ pub fn enqueue_draws(
             flush_accum(batch, renderer, mappings, mem_read);
             if let Err(e) = execute_one(draw, mappings, maxwell, renderer, mem_read) {
                 log::debug!("vk_dispatch: clear failed: {}", e);
+                bump_draw_drop(3, &e);
             }
             continue;
         }
@@ -162,6 +171,7 @@ pub fn enqueue_draws(
             Err(e) => {
                 flush_accum(batch, renderer, mappings, mem_read);
                 log::debug!("vk_dispatch: sw fallback: {}", e);
+                bump_draw_drop(2, &e);
                 super::engines::sw_renderer::execute_draws(
                     std::slice::from_ref(draw),
                     mappings,
@@ -175,7 +185,36 @@ pub fn enqueue_draws(
 }
 
 fn render_enable_needs_ordered_read(draw: &DrawCall) -> bool {
-    draw.render_enable_override == 0 && matches!(draw.render_enable_mode, 2 | 3 | 4)
+    strict_cond_render()
+        && draw.render_enable_override == 0
+        && matches!(draw.render_enable_mode, 2 | 3 | 4)
+}
+
+fn strict_cond_render() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_STRICT_COND_RENDER").is_some())
+}
+
+fn bump_draw_drop(kind: usize, detail: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTS: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    COUNTS[kind.min(3)].fetch_add(1, Ordering::Relaxed);
+    let total: u64 = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    if total <= 8 || total % 64 == 0 {
+        log::info!(
+            "[draw-drop] re_skip={} dtex_fail={} sw_fallback={} clear_fail={} last={}",
+            COUNTS[0].load(Ordering::Relaxed),
+            COUNTS[1].load(Ordering::Relaxed),
+            COUNTS[2].load(Ordering::Relaxed),
+            COUNTS[3].load(Ordering::Relaxed),
+            detail
+        );
+    }
 }
 
 fn render_enabled(
@@ -190,6 +229,10 @@ fn render_enabled(
             0 => false,
             1 => true,
             2 | 3 | 4 => {
+                if !strict_cond_render() {
+                    log_render_enable_miss(draw, "conditional-fail-open");
+                    return true;
+                }
                 let Some(cpu) = mappings.cpu_address_for(draw.render_enable_addr) else {
                     log_render_enable_miss(draw, "unmapped");
                     return true;
@@ -199,14 +242,12 @@ fn render_enabled(
                     log_render_enable_miss(draw, "read-failed");
                     return true;
                 }
-                let initial_sequence = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                let initial_mode = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
-                let current_sequence = u32::from_le_bytes([b[16], b[17], b[18], b[19]]);
-                let current_mode = u32::from_le_bytes([b[20], b[21], b[22], b[23]]);
+                let initial = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                let current = u64::from_le_bytes(b[16..24].try_into().unwrap());
                 match draw.render_enable_mode {
-                    2 => initial_sequence != 0 && initial_mode != 0,
-                    3 => initial_sequence == current_sequence && initial_mode == current_mode,
-                    4 => initial_sequence != current_sequence || initial_mode != current_mode,
+                    2 => initial != 0,
+                    3 => initial == current,
+                    4 => initial != current,
                     _ => true,
                 }
             }
