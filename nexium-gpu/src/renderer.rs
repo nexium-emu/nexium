@@ -5832,13 +5832,7 @@ fn verify_volume_image(
         }
     }
     let size = (width as usize) * (height as usize) * (layers as usize) * 4;
-    let zeros = vec![0u8; size];
-    let Ok(buf) = create_host_buffer(
-        device,
-        mem_props,
-        &zeros,
-        vk::BufferUsageFlags::TRANSFER_DST,
-    ) else {
+    let Ok(buf) = create_staging_owned(device, mem_props, size as u64) else {
         return;
     };
     let result = (|| -> Result<Vec<u8>, String> {
