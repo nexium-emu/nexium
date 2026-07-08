@@ -2287,7 +2287,7 @@ impl Renderer {
                 let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 16, 16)
                     .map_err(|e| format!("ring_alloc(const_attr): {}", e))?;
                 unsafe {
-                    let const_default = [0.0f32, 0.0, 0.0, 1.0];
+                    let const_default = [1.0f32, 1.0, 1.0, 1.0];
                     std::ptr::copy_nonoverlapping(const_default.as_ptr() as *const u8, wptr, 16);
                 }
                 Some((wb.binding, wbuf, woff))
@@ -5017,7 +5017,24 @@ fn bind_trace_fs(fs_gpu_va: u64) -> bool {
             })
             .unwrap_or_default()
     });
-    list.contains(&fs_gpu_va)
+    bind_trace_all() || list.contains(&fs_gpu_va)
+}
+
+fn bind_trace_all() -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALL.get_or_init(|| {
+        std::env::var("NEXIUM_BIND_TRACE_FS")
+            .map(|v| v.trim().eq_ignore_ascii_case("all"))
+            .unwrap_or(false)
+    })
+}
+
+fn tex_diag_once(fs_gpu_va: u64, tex_id: u32) -> bool {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u64, u32)>>> = Mutex::new(None);
+    let mut guard = SEEN.lock().unwrap();
+    guard.get_or_insert_with(HashSet::new).insert((fs_gpu_va, tex_id))
 }
 
 fn vs_tex_slot(call: &crate::draw::Maxwell3dDrawCall, slot: usize) -> Option<(usize, u32)> {
@@ -5959,19 +5976,45 @@ where
         .take(max_texture_descriptors())
         .map(|tex_id| {
             if *tex_id == u32::MAX || *tex_id > call.tic_pool_limit || call.tic_pool_gpu_va == 0 {
+                if bind_trace_fs(call.fs_gpu_va) && tex_diag_once(call.fs_gpu_va, *tex_id) {
+                    log::warn!(
+                        "[tic] fs={:#x} tex_id={} UNBOUND -> dummy_white (pool_va={:#x} limit={})",
+                        call.fs_gpu_va, tex_id, call.tic_pool_gpu_va, call.tic_pool_limit
+                    );
+                }
                 return None;
             }
             let tic_addr = call.tic_pool_gpu_va.wrapping_add((*tex_id as u64) * 32);
             read_guest(tic_addr, 32).and_then(|tic_raw| {
                 crate::texture::TicEntry::parse(&tic_raw).map(|tic| {
-                    if bind_trace_fs(call.fs_gpu_va) {
+                    if bind_trace_fs(call.fs_gpu_va) && tex_diag_once(call.fs_gpu_va, *tex_id) {
                         let w0 = u32::from_le_bytes([tic_raw[0], tic_raw[1], tic_raw[2], tic_raw[3]]);
                         let w4 = u32::from_le_bytes([tic_raw[16], tic_raw[17], tic_raw[18], tic_raw[19]]);
                         let srgb = (w4 >> 22) & 1;
+                        let (amin, amax, azero, atotal) = {
+                            let sz = tic.format.linear_size(tic.width, tic.height).min(1 << 20);
+                            match read_guest(tic.gpu_va, sz) {
+                                Some(raw) => {
+                                    let (mut mn, mut mx, mut z, mut n) = (255u8, 0u8, 0u32, 0u32);
+                                    for a in raw.iter().skip(3).step_by(4) {
+                                        mn = mn.min(*a);
+                                        mx = mx.max(*a);
+                                        if *a == 0 {
+                                            z += 1;
+                                        }
+                                        n += 1;
+                                    }
+                                    (mn, mx, z, n)
+                                }
+                                None => (0, 0, 0, 0),
+                            }
+                        };
                         log::warn!(
-                            "[tic] fs={:#x} tex_id={} {}x{} fmt={:?} ctypes={:?} swz={:?} bl={} srgb={} w0={:#010x}",
+                            "[tic] fs={:#x} tex_id={} {}x{} fmt={:?} ctypes={:?} swz={:?} bl={} bh={} gpu_va={:#x} srgb={} alpha[min={} max={} zero={}/{}] w0={:#010x}",
                             call.fs_gpu_va, tex_id, tic.width, tic.height, tic.format,
-                            tic.component_types, tic.swizzle, tic.is_block_linear, srgb, w0
+                            tic.component_types, tic.swizzle, tic.is_block_linear,
+                            tic.block_height_log2, tic.gpu_va, srgb,
+                            amin, amax, azero, atotal, w0
                         );
                     }
                     let pitch_size = tic.format.linear_size(tic.width, tic.height);
@@ -6087,6 +6130,13 @@ fn rt_alias_for_slot(
         .or_else(|| {
             rt_cache
                 .find_depth(sk)
+                .or_else(|| {
+                    if call.sampled_rt_fuzzy {
+                        rt_cache.find_depth_fuzzy(sk)
+                    } else {
+                        None
+                    }
+                })
                 .and_then(|(key, image, view, layout)| {
                     if Some(key) != call.depth_key {
                         Some(RtAlias {

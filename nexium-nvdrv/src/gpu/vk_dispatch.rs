@@ -83,6 +83,9 @@ fn tic_can_alias_render_target(format: nexium_gpu::texture::TicFormat) -> bool {
             | nexium_gpu::texture::TicFormat::R16G16
             | nexium_gpu::texture::TicFormat::R32
             | nexium_gpu::texture::TicFormat::Z32
+            | nexium_gpu::texture::TicFormat::Z24S8
+            | nexium_gpu::texture::TicFormat::X8Z24
+            | nexium_gpu::texture::TicFormat::S8Z24
             | nexium_gpu::texture::TicFormat::B10G11R11
             | nexium_gpu::texture::TicFormat::Unknown(3)
             | nexium_gpu::texture::TicFormat::Unknown(47)
@@ -816,7 +819,7 @@ struct ShaderBundle {
 #[allow(clippy::type_complexity)]
 fn shader_bundle_cache() -> &'static std::sync::Mutex<
     std::collections::HashMap<
-        (u64, u64, u32, u32, u32, u32, u32, u32, u32, u32),
+        (u64, u64, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32),
         std::sync::Arc<ShaderBundle>,
     >,
 > {
@@ -824,7 +827,7 @@ fn shader_bundle_cache() -> &'static std::sync::Mutex<
     static CACHE: OnceLock<
         std::sync::Mutex<
             std::collections::HashMap<
-                (u64, u64, u32, u32, u32, u32, u32, u32, u32, u32),
+                (u64, u64, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32),
                 std::sync::Arc<ShaderBundle>,
             >,
         >,
@@ -833,12 +836,12 @@ fn shader_bundle_cache() -> &'static std::sync::Mutex<
 }
 
 fn shader_failed_set() -> &'static std::sync::Mutex<
-    std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32, u32)>,
+    std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32)>,
 > {
     use std::sync::OnceLock;
     static FAILED: OnceLock<
         std::sync::Mutex<
-            std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32, u32)>,
+            std::collections::HashSet<(u64, u64, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32)>,
         >,
     > = OnceLock::new();
     FAILED.get_or_init(|| {
@@ -1334,6 +1337,12 @@ fn execute_one(
             );
         }
     }
+    let alpha_test_func = if draw.alpha_test_enabled {
+        draw.alpha_test_func
+    } else {
+        0
+    };
+    let alpha_test_ref = draw.alpha_test_ref;
     let shader_key = (
         vs_addr,
         fs_addr,
@@ -1345,6 +1354,8 @@ fn execute_one(
         sint_attr_mask,
         color_output_count,
         fs_output_map,
+        alpha_test_func,
+        alpha_test_ref,
     );
     if shader_failed_set().lock().unwrap().contains(&shader_key) {
         return Err("shader previously failed to emit".to_string());
@@ -1408,12 +1419,14 @@ fn execute_one(
                     let fs_debug_targets = parse_env_u64_list("NEXIUM_FS_DEBUG_TARGET");
                     let fs_debug_active =
                         fs_debug_targets.is_empty() || fs_debug_targets.contains(&fs_addr);
-                    nexium_spirv::emit_fragment_full_with_input_map_meta_outputs_debug(
+                    nexium_spirv::emit_fragment_full_with_alpha_test(
                         &fs_cfg,
                         fs_input_map,
                         color_output_count,
                         fs_output_map,
                         fs_debug_active,
+                        alpha_test_func,
+                        alpha_test_ref,
                     )
                 })) {
                     Ok(v) => v,
@@ -5267,6 +5280,8 @@ fn map_topology(t: u32) -> Option<vk::PrimitiveTopology> {
         5 => Some(vk::PrimitiveTopology::TRIANGLE_STRIP),
         6 => Some(vk::PrimitiveTopology::TRIANGLE_FAN),
         7 => Some(vk::PrimitiveTopology::TRIANGLE_LIST),
+        8 => Some(vk::PrimitiveTopology::TRIANGLE_STRIP),
+        9 => Some(vk::PrimitiveTopology::TRIANGLE_FAN),
         _ => None,
     }
 }
