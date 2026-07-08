@@ -2,6 +2,81 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewMode {
+    Grid,
+    Carousel,
+}
+
+impl Default for ViewMode {
+    fn default() -> Self {
+        ViewMode::Carousel
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CarouselTheme {
+    Adaptive,
+    Aqua,
+    Azure,
+    Violet,
+    Magenta,
+    Crimson,
+    Amber,
+    Emerald,
+    Graphite,
+}
+
+impl Default for CarouselTheme {
+    fn default() -> Self {
+        CarouselTheme::Adaptive
+    }
+}
+
+impl CarouselTheme {
+    pub fn all() -> &'static [CarouselTheme] {
+        &[
+            CarouselTheme::Adaptive,
+            CarouselTheme::Aqua,
+            CarouselTheme::Azure,
+            CarouselTheme::Violet,
+            CarouselTheme::Magenta,
+            CarouselTheme::Crimson,
+            CarouselTheme::Amber,
+            CarouselTheme::Emerald,
+            CarouselTheme::Graphite,
+        ]
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            CarouselTheme::Adaptive => "Adaptive",
+            CarouselTheme::Aqua => "Aqua",
+            CarouselTheme::Azure => "Azure",
+            CarouselTheme::Violet => "Violet",
+            CarouselTheme::Magenta => "Magenta",
+            CarouselTheme::Crimson => "Crimson",
+            CarouselTheme::Amber => "Amber",
+            CarouselTheme::Emerald => "Emerald",
+            CarouselTheme::Graphite => "Graphite",
+        }
+    }
+
+    pub fn color(&self) -> Option<(u8, u8, u8)> {
+        Some(match self {
+            CarouselTheme::Adaptive => return None,
+            CarouselTheme::Aqua => (0x2F, 0xB4, 0xEF),
+            CarouselTheme::Azure => (0x3B, 0x82, 0xF6),
+            CarouselTheme::Violet => (0x8B, 0x5C, 0xF6),
+            CarouselTheme::Magenta => (0xD9, 0x4F, 0xD0),
+            CarouselTheme::Crimson => (0xE8, 0x33, 0x50),
+            CarouselTheme::Amber => (0xF5, 0xA6, 0x23),
+            CarouselTheme::Emerald => (0x22, 0xC5, 0x5E),
+            CarouselTheme::Graphite => (0x5C, 0x6B, 0x7C),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CpuBackend {
     Dynarmic,
     Rustarmic,
@@ -167,6 +242,10 @@ pub struct AppSettings {
     pub async_shaders: bool,
     #[serde(default)]
     pub library_folders: Vec<PathBuf>,
+    #[serde(default)]
+    pub view_mode: ViewMode,
+    #[serde(default)]
+    pub carousel_theme: CarouselTheme,
 }
 
 impl Default for AppSettings {
@@ -184,6 +263,8 @@ impl Default for AppSettings {
             multicore: default_multicore(),
             async_shaders: false,
             library_folders: Vec::new(),
+            view_mode: ViewMode::Carousel,
+            carousel_theme: CarouselTheme::default(),
         }
     }
 }
