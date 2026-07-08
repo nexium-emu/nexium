@@ -33,14 +33,14 @@ pub struct PipelineKey {
     pub color_write_mask: u32,
 }
 
-const SPEC_VERSION: u32 = 13;
+const SPEC_VERSION: u32 = 14;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineSpec {
     pub key: PipelineKey,
     pub vs_spirv: Vec<u32>,
     pub fs_spirv: Vec<u32>,
-    pub bindings: Vec<(u32, u32)>,
+    pub bindings: Vec<(u32, u32, u32)>,
     pub attrs: Vec<(u32, u32, i32, u32)>,
     pub topology: i32,
     pub color_format: i32,
@@ -84,14 +84,31 @@ pub fn spec_to_request(
     spec: &PipelineSpec,
     vs_mod: vk::ShaderModule,
     fs_mod: vk::ShaderModule,
+    use_binding_divisors: bool,
 ) -> PipelineBuildRequest {
     let bindings = spec
         .bindings
         .iter()
-        .map(|(b, s)| vk::VertexInputBindingDescription {
+        .map(|(b, s, d)| vk::VertexInputBindingDescription {
             binding: *b,
             stride: *s,
-            input_rate: vk::VertexInputRate::VERTEX,
+            input_rate: if *d != 0 {
+                vk::VertexInputRate::INSTANCE
+            } else {
+                vk::VertexInputRate::VERTEX
+            },
+        })
+        .collect();
+    let binding_divisors = spec
+        .bindings
+        .iter()
+        .filter_map(|(binding, _, divisor)| {
+            (use_binding_divisors && *divisor > 1).then_some(
+                vk::VertexInputBindingDivisorDescriptionKHR {
+                    binding: *binding,
+                    divisor: *divisor,
+                },
+            )
         })
         .collect();
     let attrs = spec
@@ -132,6 +149,7 @@ pub fn spec_to_request(
         vs_mod,
         fs_mod,
         bindings,
+        binding_divisors,
         attrs,
         topology: vk::PrimitiveTopology::from_raw(spec.topology),
         color_formats: spec_color_formats(spec),
@@ -169,6 +187,7 @@ pub struct PipelineBuildRequest {
     pub vs_mod: vk::ShaderModule,
     pub fs_mod: vk::ShaderModule,
     pub bindings: Vec<vk::VertexInputBindingDescription>,
+    pub binding_divisors: Vec<vk::VertexInputBindingDivisorDescriptionKHR>,
     pub attrs: Vec<vk::VertexInputAttributeDescription>,
     pub topology: vk::PrimitiveTopology,
     pub color_formats: Vec<vk::Format>,
@@ -246,13 +265,26 @@ pub fn build_graphics_pipeline(
         },
     ];
 
+    let divisor_state = vk::PipelineVertexInputDivisorStateCreateInfoKHR {
+        vertex_binding_divisor_count: req.binding_divisors.len() as u32,
+        p_vertex_binding_divisors: if req.binding_divisors.is_empty() {
+            std::ptr::null()
+        } else {
+            req.binding_divisors.as_ptr()
+        },
+        ..Default::default()
+    };
     let vi_state = vk::PipelineVertexInputStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         vertex_binding_description_count: req.bindings.len() as u32,
         p_vertex_binding_descriptions: req.bindings.as_ptr(),
         vertex_attribute_description_count: req.attrs.len() as u32,
         p_vertex_attribute_descriptions: req.attrs.as_ptr(),
-        p_next: std::ptr::null(),
+        p_next: if req.binding_divisors.is_empty() {
+            std::ptr::null()
+        } else {
+            &divisor_state as *const _ as *const std::ffi::c_void
+        },
         flags: Default::default(),
         _marker: std::marker::PhantomData,
     };

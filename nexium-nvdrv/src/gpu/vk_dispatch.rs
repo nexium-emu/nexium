@@ -600,33 +600,11 @@ fn submit_draw_batch_async(
     let mut tic_summ: Vec<String> = Vec::new();
     for call in batch {
         for binding in &call.vertex_bindings {
-            if binding.stride == 0 {
+            let Some((addr, vbytes)) =
+                nexium_gpu::draw::vertex_binding_read_range(call, binding)
+            else {
                 continue;
-            }
-            let stride = binding.stride as u64;
-            let start_vertex = if call.state.indexed {
-                0
-            } else {
-                call.first_vertex
             };
-            let vertex_span = if call.state.indexed {
-                call.first_vertex.saturating_add(call.vertex_count)
-            } else {
-                call.vertex_count
-            };
-            let start_byte = stride.saturating_mul(start_vertex as u64);
-            let mut vbytes = stride.saturating_mul(vertex_span as u64);
-            if binding.size > 0 {
-                if start_byte >= binding.size {
-                    continue;
-                }
-                vbytes = vbytes.min(binding.size - start_byte);
-            }
-            let vbytes = vbytes as usize;
-            if vbytes == 0 {
-                continue;
-            }
-            let addr = binding.addr.wrapping_add(start_byte);
             let n = snapshot_read_once(&mut snapshot, read_guest, addr, vbytes);
             snapshot_reads += usize::from(n != 0);
             snapshot_bytes += n;
@@ -877,6 +855,61 @@ fn depth_disabled() -> bool {
     use std::sync::OnceLock;
     static D: OnceLock<bool> = OnceLock::new();
     *D.get_or_init(|| std::env::var("NEXIUM_NO_DEPTH").ok().as_deref() == Some("1"))
+}
+
+fn instancing_disabled() -> bool {
+    use std::sync::OnceLock;
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| {
+        let v = std::env::var_os("NEXIUM_NO_INSTANCING").is_some();
+        if v {
+            log::info!(
+                "nexium-nvdrv: instancing DISABLED (NEXIUM_NO_INSTANCING); all bindings forced to VERTEX rate"
+            );
+        }
+        v
+    })
+}
+
+fn zeta_dbg_enabled() -> bool {
+    use std::sync::OnceLock;
+    static Z: OnceLock<bool> = OnceLock::new();
+    *Z.get_or_init(|| std::env::var_os("NEXIUM_ZETA_DBG").is_some())
+}
+
+fn trace_zeta_key(
+    draw: &DrawCall,
+    rt_key: RtKey,
+    zeta_key: Option<RtKey>,
+    depth_key: Option<RtKey>,
+    depth_test: bool,
+    depth_write: bool,
+) {
+    if !zeta_dbg_enabled() {
+        return;
+    }
+    let op_seq = next_gpu_op_seq();
+    let zeta_va = ((draw.zeta.address_hi as u64) << 32) | draw.zeta.address_lo as u64;
+    log::warn!(
+        "[zetadbg] op={} zeta_va={:#x} zeta={}x{} fmt={:#x} rt={} func={:#x}->{:?} \
+         test={} write={} zeta_key={} depth_key={}",
+        op_seq,
+        zeta_va,
+        draw.zeta.width,
+        draw.zeta.height,
+        draw.zeta.format,
+        rt_key.label(),
+        draw.depth_func,
+        map_compare_op(draw.depth_func),
+        depth_test,
+        depth_write,
+        zeta_key
+            .map(|k| k.label())
+            .unwrap_or_else(|| "none".to_string()),
+        depth_key
+            .map(|k| k.label())
+            .unwrap_or_else(|| "none".to_string()),
+    );
 }
 
 fn small_rt_registry() -> &'static std::sync::Mutex<std::collections::HashMap<RtKey, u32>> {
@@ -1992,6 +2025,8 @@ fn execute_one(
         None
     };
 
+    trace_zeta_key(draw, rt_key, zeta_key, depth_key, depth_test, depth_write);
+
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static LOGGED: AtomicBool = AtomicBool::new(false);
@@ -2484,6 +2519,7 @@ fn execute_one(
         },
         depth_clamp_enabled: draw.viewport_clip_control.depth_clamp_enabled(),
         depth_key,
+        clear_depth_hint: draw.clear_depth,
         sampled_rt_key,
         sampled_rt_keys,
         sampled_rt_slots,
@@ -2567,8 +2603,12 @@ fn zeta_rt_key(draw: &DrawCall, mappings: &GpuMappings, fallback: RtKey) -> Opti
         return None;
     }
     let nvmap_id = mappings.nvmap_id_for(gpu_va)?;
-    let width = fallback.width;
-    let height = fallback.height;
+    let (width, height) = if draw.zeta.width != 0 && draw.zeta.height != 0 {
+        (draw.zeta.width, draw.zeta.height)
+    } else {
+        let clip = draw.surface_clip.effective(fallback.width, fallback.height);
+        (clip.width, clip.height)
+    };
     if width == 0 || height == 0 {
         return None;
     }
@@ -3985,6 +4025,20 @@ fn trace_draw(
         .map(|key| key.label())
         .collect::<Vec<_>>()
         .join(",");
+    let binds = layout
+        .bindings
+        .iter()
+        .map(|b| {
+            format!(
+                "b{}:s{}:d{}:{}",
+                b.binding,
+                b.stride,
+                b.divisor,
+                if b.divisor != 0 { "INST" } else { "VTX" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     log::warn!(
         "[drawtrace] op={} #{} rt={} va={:#x} keys=[{}] {}x{} topo={} first={} v={} i={} indexed={} pos={} \
          vp_en={} vp={:?} scale=({:.3},{:.3},{:.3}) trans=({:.3},{:.3},{:.3}) clip=({},{} {}x{}) origin={:#x} ll={} fy={} sw={:#x}/{} \
@@ -3992,7 +4046,7 @@ fn trace_draw(
          tex={:?} tics=[{}] sampled={:?} \
          blend={} per={} rgb=({:#x},{:#x},{:#x})->({:?},{:?},{:?}) \
          a=({:#x},{:#x},{:#x})->({:?},{:?},{:?}) \
-         vb={:#x} attrs={} {} cbuf={:#x}/{} masks={:#x}/{:#x} {} fs={:#x}",
+         vb={:#x} attrs={} {} cbuf={:#x}/{} masks={:#x}/{:#x} {} fs={:#x} inst={}/{} binds=[{}]",
         op_seq,
         seq,
         nvmap_id,
@@ -4058,6 +4112,9 @@ fn trace_draw(
         fs_cbuf_mask,
         cbuf,
         draw.fs_shader_gpu_va,
+        draw.instance_count,
+        draw.first_instance,
+        binds,
     );
     let attachments = color_rt_keys
         .iter()
@@ -5112,6 +5169,17 @@ fn build_vertex_layout(draw: &DrawCall) -> Result<VertexLayout, String> {
                 .get(binding as usize)
                 .map(|vb| vb.stride)
                 .unwrap_or(0);
+            let divisor = if instancing_disabled() {
+                0
+            } else {
+                draw.vertex_stream_instances
+                    .get(binding as usize)
+                    .copied()
+                    .filter(|v| *v != 0)
+                    .and_then(|_| draw.vertex_buffers.get(binding as usize))
+                    .map(|vb| vb.frequency.max(1))
+                    .unwrap_or(0)
+            };
             if stride == 0 {
                 let mut packed = 0u32;
                 for a in draw.vertex_attribs.iter() {
@@ -5127,7 +5195,11 @@ fn build_vertex_layout(draw: &DrawCall) -> Result<VertexLayout, String> {
                     loc, binding
                 ));
             }
-            bindings.push(VertexBinding { binding, stride });
+            bindings.push(VertexBinding {
+                binding,
+                stride,
+                divisor,
+            });
             seen_bindings.insert(binding);
         }
         attrs.push(VertexAttr {
@@ -5145,6 +5217,7 @@ fn build_vertex_layout(draw: &DrawCall) -> Result<VertexLayout, String> {
         bindings.push(VertexBinding {
             binding: WHITE_BINDING,
             stride: 0,
+            divisor: 0,
         });
     }
     Ok(VertexLayout { bindings, attrs })
@@ -5371,6 +5444,7 @@ fn vertex_buffer_bindings(
                 binding: b.binding,
                 addr: va,
                 stride: b.stride,
+                divisor: b.divisor,
                 size,
             })
         })

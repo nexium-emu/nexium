@@ -13,6 +13,7 @@ pub struct VertexAttr {
 pub struct VertexBinding {
     pub binding: u32,
     pub stride: u32,
+    pub divisor: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -20,6 +21,7 @@ pub struct VertexBufferBinding {
     pub binding: u32,
     pub addr: u64,
     pub stride: u32,
+    pub divisor: u32,
     pub size: u64,
 }
 
@@ -36,6 +38,8 @@ impl VertexLayout {
             h ^= b.binding as u64;
             h = h.wrapping_mul(0x100000001b3);
             h ^= b.stride as u64;
+            h = h.wrapping_mul(0x100000001b3);
+            h ^= b.divisor as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
         for a in &self.attrs {
@@ -131,6 +135,7 @@ pub struct Maxwell3dDrawCall {
     pub depth: DepthState,
     pub depth_clamp_enabled: bool,
     pub depth_key: Option<RtKey>,
+    pub clear_depth_hint: f32,
     pub sampled_rt_key: Option<RtKey>,
     pub sampled_rt_keys: Vec<RtKey>,
     pub sampled_rt_slots: Vec<Option<RtKey>>,
@@ -152,6 +157,43 @@ pub struct Maxwell3dDrawCall {
     pub poly_offset_factor: f32,
     pub ssbo_data: Vec<(u32, Vec<u8>)>,
     pub flip_y: bool,
+}
+
+pub fn vertex_binding_read_range(
+    call: &Maxwell3dDrawCall,
+    binding: &VertexBufferBinding,
+) -> Option<(u64, usize)> {
+    if binding.stride == 0 {
+        return None;
+    }
+    let stride = binding.stride as u64;
+    let instanced = binding.divisor != 0;
+    let start_vertex = if instanced || call.state.indexed {
+        0
+    } else {
+        call.first_vertex
+    };
+    let vertex_span = if instanced {
+        call.first_instance
+            .saturating_add(call.instance_count.max(1))
+    } else if call.state.indexed {
+        call.first_vertex.saturating_add(call.vertex_count)
+    } else {
+        call.vertex_count
+    };
+    let start_byte = stride.saturating_mul(start_vertex as u64);
+    let mut bytes = stride.saturating_mul(vertex_span as u64);
+    if binding.size > 0 {
+        if start_byte >= binding.size {
+            return None;
+        }
+        bytes = bytes.min(binding.size - start_byte);
+    }
+    let bytes = bytes as usize;
+    if bytes == 0 {
+        return None;
+    }
+    Some((binding.addr.wrapping_add(start_byte), bytes))
 }
 
 pub fn expand_quad_vertices(src: &[u8], stride: usize) -> Vec<u8> {

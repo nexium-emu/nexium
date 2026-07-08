@@ -47,6 +47,7 @@ struct RendererInner {
     tele_in_flight_mask: u32,
     depth_clamp_supported: bool,
     depth_clip_control_enabled: bool,
+    vertex_attribute_divisor_supported: bool,
     sampler_filter_minmax_supported: bool,
     sampler_anisotropy_supported: bool,
 }
@@ -358,6 +359,28 @@ impl Renderer {
             let name = unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) };
             name == vk::EXT_SAMPLER_FILTER_MINMAX_NAME
         });
+        let vertex_attribute_divisor_khr_supported = device_extensions.iter().any(|e| {
+            let name = unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) };
+            name == vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME
+        });
+        let vertex_attribute_divisor_ext_supported = device_extensions.iter().any(|e| {
+            let name = unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) };
+            name == vk::EXT_VERTEX_ATTRIBUTE_DIVISOR_NAME
+        });
+        let vertex_attribute_divisor_ext_present =
+            vertex_attribute_divisor_khr_supported || vertex_attribute_divisor_ext_supported;
+        let vertex_attribute_divisor_supported = if vertex_attribute_divisor_ext_present {
+            let mut vad_feat = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default();
+            let mut feats2 = vk::PhysicalDeviceFeatures2 {
+                s_type: vk::StructureType::PHYSICAL_DEVICE_FEATURES_2,
+                p_next: &mut vad_feat as *mut _ as *mut std::ffi::c_void,
+                ..Default::default()
+            };
+            unsafe { instance.get_physical_device_features2(physical_device, &mut feats2) };
+            vad_feat.vertex_attribute_instance_rate_divisor == vk::TRUE
+        } else {
+            false
+        };
         let dcc_opt_in = std::env::var("NEXIUM_DEPTH_CLIP_CTL")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -388,8 +411,19 @@ impl Renderer {
             p_next: std::ptr::null_mut(),
             _marker: std::marker::PhantomData,
         };
+        let mut vertex_attribute_divisor_feature =
+            vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default();
+        vertex_attribute_divisor_feature.vertex_attribute_instance_rate_divisor = vk::TRUE;
+        if vertex_attribute_divisor_supported {
+            vertex_attribute_divisor_feature.p_next =
+                &mut features_13 as *mut _ as *mut std::ffi::c_void;
+        }
         if enable_depth_clip_control {
-            dcc_feature.p_next = &mut features_13 as *mut _ as *mut std::ffi::c_void;
+            dcc_feature.p_next = if vertex_attribute_divisor_supported {
+                &mut vertex_attribute_divisor_feature as *mut _ as *mut std::ffi::c_void
+            } else {
+                &mut features_13 as *mut _ as *mut std::ffi::c_void
+            };
             log::info!(
                 "VK_EXT_depth_clip_control enabled via NEXIUM_DEPTH_CLIP_CTL \
                  (Maxwell -1..+1 clip-Z honored)"
@@ -418,8 +452,21 @@ impl Renderer {
                 "VK_EXT_sampler_filter_minmax unavailable; min/max samplers use weighted average"
             );
         }
+        if vertex_attribute_divisor_supported && vertex_attribute_divisor_khr_supported {
+            enabled_ext_names.push(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME.as_ptr());
+            log::info!("VK_KHR_vertex_attribute_divisor enabled (feature confirmed)");
+        } else if vertex_attribute_divisor_supported && vertex_attribute_divisor_ext_supported {
+            enabled_ext_names.push(vk::EXT_VERTEX_ATTRIBUTE_DIVISOR_NAME.as_ptr());
+            log::info!("VK_EXT_vertex_attribute_divisor enabled (feature confirmed)");
+        } else if vertex_attribute_divisor_ext_present {
+            log::info!("vertex attribute divisor extension present but feature unsupported; divisors >1 collapse to instance rate");
+        } else {
+            log::info!("vertex attribute divisor extension unavailable; divisors >1 collapse to instance rate");
+        }
         let p_next_chain: *mut std::ffi::c_void = if enable_depth_clip_control {
             &mut dcc_feature as *mut _ as *mut std::ffi::c_void
+        } else if vertex_attribute_divisor_supported {
+            &mut vertex_attribute_divisor_feature as *mut _ as *mut std::ffi::c_void
         } else {
             &mut features_13 as *mut _ as *mut std::ffi::c_void
         };
@@ -629,6 +676,7 @@ impl Renderer {
                 tele_in_flight_mask: 0,
                 depth_clamp_supported,
                 depth_clip_control_enabled: enable_depth_clip_control,
+                vertex_attribute_divisor_supported,
                 sampler_filter_minmax_supported,
                 sampler_anisotropy_supported,
             }),
@@ -650,6 +698,7 @@ impl Renderer {
             device,
             shader_compiler,
             pipeline_cache,
+            vertex_attribute_divisor_supported,
             ..
         } = &mut *inner;
         let mut queued = 0usize;
@@ -669,7 +718,12 @@ impl Renderer {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
-            let req = crate::pipeline::spec_to_request(spec, vs_mod, fs_mod);
+            let req = crate::pipeline::spec_to_request(
+                spec,
+                vs_mod,
+                fs_mod,
+                *vertex_attribute_divisor_supported,
+            );
             pipeline_cache.queue_build(req);
             queued += 1;
         }
@@ -1058,7 +1112,7 @@ impl Renderer {
             ..
         } = &mut *inner;
         let key = RtKey::new(nvmap_id, width, height, gpu_va);
-        let img = rt_cache.get_or_create_depth(key, device)?;
+        let (img, _) = rt_cache.get_or_create_depth(key, device)?;
 
         reset_command_buffer(device, utility_slot.cmd)?;
         let cmd = utility_slot.cmd;
@@ -1758,6 +1812,7 @@ impl Renderer {
             color_write_mask: blend.color_write_mask.as_raw(),
         };
         let depth_clip_control_enabled = inner.depth_clip_control_enabled;
+        let vertex_attribute_divisor_supported = inner.vertex_attribute_divisor_supported;
         let RendererInner {
             device,
             shader_compiler,
@@ -1781,7 +1836,23 @@ impl Renderer {
             .map(|b| vk::VertexInputBindingDescription {
                 binding: b.binding,
                 stride: b.stride,
-                input_rate: vk::VertexInputRate::VERTEX,
+                input_rate: if b.divisor != 0 {
+                    vk::VertexInputRate::INSTANCE
+                } else {
+                    vk::VertexInputRate::VERTEX
+                },
+            })
+            .collect();
+        let binding_divisors: Vec<vk::VertexInputBindingDivisorDescriptionKHR> = layout
+            .bindings
+            .iter()
+            .filter_map(|b| {
+                (vertex_attribute_divisor_supported && b.divisor > 1).then_some(
+                    vk::VertexInputBindingDivisorDescriptionKHR {
+                        binding: b.binding,
+                        divisor: b.divisor,
+                    },
+                )
             })
             .collect();
         let attrs: Vec<vk::VertexInputAttributeDescription> = layout
@@ -1800,6 +1871,7 @@ impl Renderer {
             vs_mod,
             fs_mod,
             bindings,
+            binding_divisors,
             attrs,
             topology,
             color_formats: color_formats.clone(),
@@ -1824,7 +1896,7 @@ impl Renderer {
             bindings: layout
                 .bindings
                 .iter()
-                .map(|b| (b.binding, b.stride))
+                .map(|b| (b.binding, b.stride, b.divisor))
                 .collect(),
             attrs: layout
                 .attrs
@@ -2528,8 +2600,10 @@ impl Renderer {
                 height: call.rt_key.height,
             });
 
+        let mut depth_fresh = false;
         let depth_bind: Option<(vk::Image, vk::ImageView, vk::ImageLayout)> = if use_depth {
-            let d = rt_cache.get_or_create_depth(call.depth_key.unwrap(), device)?;
+            let (d, fresh) = rt_cache.get_or_create_depth(call.depth_key.unwrap(), device)?;
+            depth_fresh = fresh;
             Some((d.image, d.view, d.layout))
         } else {
             None
@@ -2602,6 +2676,13 @@ impl Renderer {
                 float32: call.clear_color,
             },
         };
+        let depth_clear_far = if call.depth.compare_op == vk::CompareOp::GREATER
+            || call.depth.compare_op == vk::CompareOp::GREATER_OR_EQUAL
+        {
+            0.0
+        } else {
+            call.clear_depth_hint
+        };
         let depth_attachment = depth_bind.map(|(_, d_view, _)| vk::RenderingAttachmentInfo {
             s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
             image_view: d_view,
@@ -2609,11 +2690,15 @@ impl Renderer {
             resolve_mode: vk::ResolveModeFlags::NONE,
             resolve_image_view: vk::ImageView::null(),
             resolve_image_layout: vk::ImageLayout::UNDEFINED,
-            load_op: vk::AttachmentLoadOp::LOAD,
+            load_op: if depth_fresh {
+                vk::AttachmentLoadOp::CLEAR
+            } else {
+                vk::AttachmentLoadOp::LOAD
+            },
             store_op: vk::AttachmentStoreOp::STORE,
             clear_value: vk::ClearValue {
                 depth_stencil: vk::ClearDepthStencilValue {
-                    depth: 1.0,
+                    depth: depth_clear_far,
                     stencil: 0,
                 },
             },
@@ -2766,7 +2851,7 @@ impl Renderer {
             }
         }
         if use_depth {
-            if let Ok(d) = rt_cache.get_or_create_depth(call.depth_key.unwrap(), device) {
+            if let Ok((d, _)) = rt_cache.get_or_create_depth(call.depth_key.unwrap(), device) {
                 d.layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             }
         }
@@ -2880,7 +2965,14 @@ impl Renderer {
                 Some(p) => p,
                 None => continue,
             };
-            let (vertex_bindings, draw_vertex_count) = prepare_vertex_bindings(call, &read_guest)?;
+            let (vertex_bindings, draw_vertex_count) =
+                match prepare_vertex_bindings(call, &read_guest) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log_vertex_bindings_skip(call, &e);
+                        continue;
+                    }
+                };
             let cbuf_size = call.cbuf_size as usize;
             let cbuf_data = if let Some(d) = &call.cbuf_data {
                 d.clone()
@@ -2897,6 +2989,29 @@ impl Renderer {
             };
             if let Ok(want) = std::env::var("NEXIUM_VTX_DBG") {
                 if parse_u64_value(&want) == Some(call.vs_gpu_va) {
+                    let vertex_base_addr = call
+                        .vertex_bindings
+                        .first()
+                        .map(|b| {
+                            b.addr.wrapping_add(
+                                (b.stride as u64).saturating_mul(call.first_vertex as u64),
+                            )
+                        })
+                        .unwrap_or(call.vertex_addr);
+                    if let Ok(addr) = std::env::var("NEXIUM_VTX_DBG_ADDR") {
+                        if parse_u64_value(&addr) != Some(vertex_base_addr) {
+                            continue;
+                        }
+                    }
+                    if let Ok(min) = std::env::var("NEXIUM_VTX_DBG_MIN_VERTS") {
+                        if min
+                            .parse::<u32>()
+                            .ok()
+                            .is_some_and(|min| call.vertex_count < min)
+                        {
+                            continue;
+                        }
+                    }
                     let first_binding = vertex_bindings.first();
                     let floats: Vec<f32> = first_binding
                         .map(|b| {
@@ -2924,20 +3039,17 @@ impl Renderer {
                         })
                         .collect::<Vec<_>>()
                         .join(",");
-                    let vertex_base_addr = call
-                        .vertex_bindings
-                        .first()
-                        .map(|b| {
-                            b.addr.wrapping_add(
-                                (b.stride as u64).saturating_mul(call.first_vertex as u64),
-                            )
-                        })
-                        .unwrap_or(call.vertex_addr);
                     let vertex_stride = first_binding.map(|b| b.stride).unwrap_or(0);
                     let vertex_len: usize = vertex_bindings.iter().map(|b| b.data.len()).sum();
+                    let attr_summary = vertex_debug_attr_summary(call, &vertex_bindings);
+                    let index_summary =
+                        vertex_debug_index_summary(&index_data, index_count, index_type);
                     log::warn!(
-                        "[vtx-dbg] vs={:#x} addr={:#x} stride={} vlen={} vcount={} icount={} itype={:?} attrs=[{}] floats={:?} idx={:?}",
+                        "[vtx-dbg] vs={:#x} fs={:#x} tex={:?} rt={} addr={:#x} stride={} vlen={} vcount={} icount={} itype={:?} attrs=[{}] attr_summary={} index_summary={} floats={:?} idx={:?}",
                         call.vs_gpu_va,
+                        call.fs_gpu_va,
+                        call.fs_tex_ids,
+                        call.rt_key.label(),
                         vertex_base_addr,
                         vertex_stride,
                         vertex_len,
@@ -2945,6 +3057,8 @@ impl Renderer {
                         index_count,
                         index_type,
                         attrs,
+                        attr_summary,
+                        index_summary,
                         floats,
                         idx
                     );
@@ -3107,11 +3221,11 @@ impl Renderer {
             .unwrap_or(vk::ImageLayout::UNDEFINED);
         let any_depth = preps.iter().any(|p| p.1.use_depth);
         let depth_key = if any_depth { calls[0].depth_key } else { None };
-        let (depth_image, depth_view, depth_prev) = if any_depth {
-            let d = rt_cache.get_or_create_depth(depth_key.unwrap(), device)?;
-            (Some(d.image), Some(d.view), d.layout)
+        let (depth_image, depth_view, depth_prev, depth_fresh) = if any_depth {
+            let (d, fresh) = rt_cache.get_or_create_depth(depth_key.unwrap(), device)?;
+            (Some(d.image), Some(d.view), d.layout, fresh)
         } else {
-            (None, None, vk::ImageLayout::UNDEFINED)
+            (None, None, vk::ImageLayout::UNDEFINED, false)
         };
 
         let cmd = frame_slots[cur_idx].cmd;
@@ -3149,6 +3263,7 @@ impl Renderer {
         let mut tex_raw_cache: HashMap<(u64, usize), Option<(u64, Vec<u8>)>> = HashMap::new();
         let mut pass_open = false;
         let mut pass_depth = false;
+        let mut depth_needs_clear = depth_fresh;
         let mut pass_rt_layout = vk::ImageLayout::UNDEFINED;
         let mut pass_dirty = vec![false; color_bind.len()];
         let mut pass_trace_calls: Vec<&crate::draw::Maxwell3dDrawCall> = Vec::new();
@@ -3967,6 +4082,15 @@ impl Renderer {
                     }
                 };
                 let depth_attachment = if need_depth {
+                    let clear_now = depth_needs_clear;
+                    depth_needs_clear = false;
+                    let depth_clear_far = if call.depth.compare_op == vk::CompareOp::GREATER
+                        || call.depth.compare_op == vk::CompareOp::GREATER_OR_EQUAL
+                    {
+                        0.0
+                    } else {
+                        call.clear_depth_hint
+                    };
                     depth_view.map(|dv| vk::RenderingAttachmentInfo {
                         s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
                         image_view: dv,
@@ -3974,11 +4098,15 @@ impl Renderer {
                         resolve_mode: vk::ResolveModeFlags::NONE,
                         resolve_image_view: vk::ImageView::null(),
                         resolve_image_layout: vk::ImageLayout::UNDEFINED,
-                        load_op: vk::AttachmentLoadOp::LOAD,
+                        load_op: if clear_now {
+                            vk::AttachmentLoadOp::CLEAR
+                        } else {
+                            vk::AttachmentLoadOp::LOAD
+                        },
                         store_op: vk::AttachmentStoreOp::STORE,
                         clear_value: vk::ClearValue {
                             depth_stencil: vk::ClearDepthStencilValue {
-                                depth: 1.0,
+                                depth: depth_clear_far,
                                 stencil: 0,
                             },
                         },
@@ -4152,7 +4280,7 @@ impl Renderer {
             rt_cache.set_color_layout(*key, color_layouts[idx]);
         }
         if any_depth {
-            if let Ok(d) = rt_cache.get_or_create_depth(depth_key.unwrap(), device) {
+            if let Ok((d, _)) = rt_cache.get_or_create_depth(depth_key.unwrap(), device) {
                 d.layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             }
         }
@@ -4466,6 +4594,132 @@ fn parse_u64_value(s: &str) -> Option<u64> {
         u64::from_str_radix(hex, 16).ok()
     } else {
         t.parse().ok()
+    }
+}
+
+fn vertex_debug_index_summary(
+    index_data: &[u8],
+    index_count: u32,
+    index_type: vk::IndexType,
+) -> String {
+    if index_count == 0 || index_data.is_empty() {
+        return "empty".to_string();
+    }
+    let mut min_idx = u32::MAX;
+    let mut max_idx = 0u32;
+    let mut restarts = 0u32;
+    let mut seen = 0u32;
+    match index_type {
+        vk::IndexType::UINT32 => {
+            for c in index_data.chunks_exact(4).take(index_count as usize) {
+                let v = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                if v == u32::MAX {
+                    restarts += 1;
+                    continue;
+                }
+                seen += 1;
+                min_idx = min_idx.min(v);
+                max_idx = max_idx.max(v);
+            }
+        }
+        _ => {
+            for c in index_data.chunks_exact(2).take(index_count as usize) {
+                let v = u16::from_le_bytes([c[0], c[1]]) as u32;
+                if v == u16::MAX as u32 {
+                    restarts += 1;
+                    continue;
+                }
+                seen += 1;
+                min_idx = min_idx.min(v);
+                max_idx = max_idx.max(v);
+            }
+        }
+    }
+    if seen == 0 {
+        format!("seen=0 restarts={}", restarts)
+    } else {
+        format!(
+            "seen={} min={} max={} restarts={}",
+            seen, min_idx, max_idx, restarts
+        )
+    }
+}
+
+fn vertex_debug_attr_summary(
+    call: &crate::draw::Maxwell3dDrawCall,
+    vertex_bindings: &[PreparedVertexBinding],
+) -> String {
+    let mut parts = Vec::new();
+    for attr in call.vertex_layout.attrs.iter().take(16) {
+        let Some(binding) = vertex_bindings.iter().find(|b| b.binding == attr.binding) else {
+            continue;
+        };
+        if binding.stride == 0 {
+            continue;
+        }
+        let Some(comps) = vertex_debug_float_components(attr.format) else {
+            continue;
+        };
+        let stride = binding.stride as usize;
+        let offset = attr.offset as usize;
+        if offset + comps * 4 > stride {
+            continue;
+        }
+        let vertices = (binding.data.len() / stride).min(call.vertex_count as usize);
+        if vertices == 0 {
+            continue;
+        }
+        let mut min_v = vec![f32::INFINITY; comps];
+        let mut max_v = vec![f32::NEG_INFINITY; comps];
+        let mut seen = 0usize;
+        for vi in 0..vertices {
+            let base = vi * stride + offset;
+            let mut ok = true;
+            for c in 0..comps {
+                let off = base + c * 4;
+                let v = f32::from_le_bytes([
+                    binding.data[off],
+                    binding.data[off + 1],
+                    binding.data[off + 2],
+                    binding.data[off + 3],
+                ]);
+                if !v.is_finite() {
+                    ok = false;
+                    break;
+                }
+                min_v[c] = min_v[c].min(v);
+                max_v[c] = max_v[c].max(v);
+            }
+            if ok {
+                seen += 1;
+            }
+        }
+        if seen == 0 {
+            continue;
+        }
+        let ranges = (0..comps)
+            .map(|i| format!("{:.3}..{:.3}", min_v[i], max_v[i]))
+            .collect::<Vec<_>>()
+            .join("/");
+        parts.push(format!(
+            "l{} b{}+{} {:?} n{} [{}]",
+            attr.location, attr.binding, attr.offset, attr.format, seen, ranges
+        ));
+    }
+    if parts.is_empty() {
+        "[]".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn vertex_debug_float_components(format: vk::Format) -> Option<usize> {
+    match format {
+        vk::Format::R32_SFLOAT => Some(1),
+        vk::Format::R32G32_SFLOAT => Some(2),
+        vk::Format::R32G32B32_SFLOAT => Some(3),
+        vk::Format::R32G32B32A32_SFLOAT => Some(4),
+        _ => None,
     }
 }
 
@@ -6739,6 +6993,25 @@ fn trace_rt_alias(
     );
 }
 
+fn log_vertex_bindings_skip(call: &crate::draw::Maxwell3dDrawCall, err: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        log::warn!(
+            "[vtx-bind-skip #{}] err={} vs={:#x} fs={:#x} rt={} v={} inst={} first_inst={}",
+            n,
+            err,
+            call.vs_gpu_va,
+            call.fs_gpu_va,
+            call.rt_key.label(),
+            call.vertex_count,
+            call.instance_count,
+            call.first_instance
+        );
+    }
+}
+
 fn prepare_vertex_bindings<F>(
     call: &crate::draw::Maxwell3dDrawCall,
     read_guest: &F,
@@ -6749,35 +7022,12 @@ where
     let mut out = Vec::new();
     let mut draw_vertex_count = call.vertex_count;
     for binding in &call.vertex_bindings {
-        if binding.stride == 0 {
+        let Some((base, bytes)) = crate::draw::vertex_binding_read_range(call, binding) else {
             continue;
-        }
+        };
         let stride = binding.stride as u64;
-        let start_vertex = if call.state.indexed {
-            0
-        } else {
-            call.first_vertex
-        };
-        let vertex_span = if call.state.indexed {
-            call.first_vertex.saturating_add(call.vertex_count)
-        } else {
-            call.vertex_count
-        };
-        let start_byte = stride.saturating_mul(start_vertex as u64);
-        let base = binding.addr.wrapping_add(start_byte);
-        let mut bytes = stride.saturating_mul(vertex_span as u64);
-        if binding.size > 0 {
-            if start_byte >= binding.size {
-                continue;
-            }
-            bytes = bytes.min(binding.size - start_byte);
-        }
-        let bytes = bytes as usize;
-        let mut data = if bytes > 0 {
-            read_guest(base, bytes).ok_or_else(|| format!("vertex read failed va={:#x}", base))?
-        } else {
-            Vec::new()
-        };
+        let mut data =
+            read_guest(base, bytes).ok_or_else(|| format!("vertex read failed va={:#x}", base))?;
         if call.quad_expand && !data.is_empty() {
             data = crate::draw::expand_quad_vertices(&data, stride as usize);
             if out.is_empty() {
