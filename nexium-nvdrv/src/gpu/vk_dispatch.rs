@@ -600,8 +600,7 @@ fn submit_draw_batch_async(
     let mut tic_summ: Vec<String> = Vec::new();
     for call in batch {
         for binding in &call.vertex_bindings {
-            let Some((addr, vbytes)) =
-                nexium_gpu::draw::vertex_binding_read_range(call, binding)
+            let Some((addr, vbytes)) = nexium_gpu::draw::vertex_binding_read_range(call, binding)
             else {
                 continue;
             };
@@ -789,6 +788,48 @@ struct ShaderBundle {
     fs_cbuf_reads: Vec<(u32, u32)>,
     cbuf_used: u32,
     ssbo_descs: Vec<nexium_shader::StorageBufferAddr>,
+}
+
+fn bundle_content_key(
+    vs_sass: &[u8],
+    fs_sass: &[u8],
+    fs_sph: Option<&[u8; SPH_SIZE]>,
+    scalars: &[u32],
+) -> u64 {
+    fn eat(h: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    eat(&mut h, &(vs_sass.len() as u64).to_le_bytes());
+    eat(&mut h, vs_sass);
+    eat(&mut h, &(fs_sass.len() as u64).to_le_bytes());
+    eat(&mut h, fs_sass);
+    if let Some(sph) = fs_sph {
+        eat(&mut h, sph.as_slice());
+    }
+    for s in scalars {
+        eat(&mut h, &s.to_le_bytes());
+    }
+    h
+}
+
+fn bundle_l2_stat(hit: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+    if hit {
+        HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    let h = HITS.load(Ordering::Relaxed);
+    let m = MISSES.load(Ordering::Relaxed);
+    if (h + m) % 32 == 0 {
+        log::info!("[bundle-cache] l2_hits={} translated={}", h, m);
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -1393,30 +1434,89 @@ fn execute_one(
             let fs_sass = fetch_sass(fs_addr, mappings, mem_read)
                 .ok_or_else(|| "FS SASS read failed".to_string())?;
 
-            let mut vs_cfg = nexium_shader::build_cfg(&vs_sass);
-            let fs_cfg = nexium_shader::build_cfg(&fs_sass);
-            let fs_cbuf_reads = collect_cbuf_reads(&fs_cfg, 16);
-            let ssbo_descs = if nexium_shader::shader_uses_ldg(&vs_sass) {
-                nexium_shader::collect_storage_buffers(&mut vs_cfg)
-            } else {
-                Vec::new()
-            };
-            let num_ssbo = (ssbo_descs.len() as u32).min(8);
-            if vs_cfg.unimplemented != 0 || fs_cfg.unimplemented != 0 {
-                log::warn!(
-                    "shader unimplemented: vs_addr={:#x} fs_addr={:#x} vs={} {:?} fs={} {:?}",
-                    vs_addr,
-                    fs_addr,
-                    vs_cfg.unimplemented,
-                    unimplemented_samples(&vs_cfg),
-                    fs_cfg.unimplemented,
-                    unimplemented_samples(&fs_cfg),
-                );
-                if std::env::var_os("NEXIUM_SHADERDBG").is_some() {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static N: AtomicU64 = AtomicU64::new(0);
-                    if N.fetch_add(1, Ordering::Relaxed) < 20 {
-                        log::warn!(
+            let fs_debug_targets_key = parse_env_u64_list("NEXIUM_FS_DEBUG_TARGET");
+            let fs_debug_active_key =
+                fs_debug_targets_key.is_empty() || fs_debug_targets_key.contains(&fs_addr);
+            let vs_tex_env_key = std::env::var_os("NEXIUM_VS_TEX").is_some();
+            let content_key = bundle_content_key(
+                &vs_sass,
+                &fs_sass,
+                fs_sph.as_ref(),
+                &[
+                    vptx_scale_z.to_bits(),
+                    vptx_translate_z.to_bits(),
+                    ps_key,
+                    win_key,
+                    uint_attr_mask,
+                    sint_attr_mask,
+                    color_output_count,
+                    fs_output_map,
+                    fs_debug_active_key as u32,
+                    vs_tex_env_key as u32,
+                ],
+            );
+            let l2_store = nexium_gpu::bundle_cache::bundle_store();
+            if l2_store.is_failed(content_key) {
+                shader_failed_set().lock().unwrap().insert(shader_key);
+                return Err("shader previously failed to emit".to_string());
+            }
+            'translate: {
+                if let Some(rec) = l2_store.get(content_key) {
+                    bundle_l2_stat(true);
+                    let b = std::sync::Arc::new(ShaderBundle {
+                        vs_spirv: std::sync::Arc::new(rec.vs_spirv.clone()),
+                        vs_cbuf_mask: rec.vs_cbuf_mask,
+                        vs_hash: rec.vs_hash,
+                        fs_spirv: std::sync::Arc::new(rec.fs_spirv.clone()),
+                        fs_cbuf_mask: rec.fs_cbuf_mask,
+                        fs_hash: rec.fs_hash,
+                        fs_tex_ids: rec.fs_tex_ids.clone(),
+                        vs_tex_base: rec.vs_tex_base,
+                        vs_tex_count: rec.vs_tex_count,
+                        fs_sampler_arrayed: rec.fs_sampler_arrayed,
+                        fs_cbuf_reads: rec.fs_cbuf_reads.clone(),
+                        cbuf_used: rec.cbuf_used,
+                        ssbo_descs: rec
+                            .ssbo_descs
+                            .iter()
+                            .map(|&(cbuf_binding, cbuf_offset, align)| {
+                                nexium_shader::StorageBufferAddr {
+                                    cbuf_binding,
+                                    cbuf_offset,
+                                    align,
+                                }
+                            })
+                            .collect(),
+                    });
+                    guard.insert(shader_key, b.clone());
+                    break 'translate b;
+                }
+                bundle_l2_stat(false);
+
+                let mut vs_cfg = nexium_shader::build_cfg(&vs_sass);
+                let fs_cfg = nexium_shader::build_cfg(&fs_sass);
+                let fs_cbuf_reads = collect_cbuf_reads(&fs_cfg, 16);
+                let ssbo_descs = if nexium_shader::shader_uses_ldg(&vs_sass) {
+                    nexium_shader::collect_storage_buffers(&mut vs_cfg)
+                } else {
+                    Vec::new()
+                };
+                let num_ssbo = (ssbo_descs.len() as u32).min(8);
+                if vs_cfg.unimplemented != 0 || fs_cfg.unimplemented != 0 {
+                    log::warn!(
+                        "shader unimplemented: vs_addr={:#x} fs_addr={:#x} vs={} {:?} fs={} {:?}",
+                        vs_addr,
+                        fs_addr,
+                        vs_cfg.unimplemented,
+                        unimplemented_samples(&vs_cfg),
+                        fs_cfg.unimplemented,
+                        unimplemented_samples(&fs_cfg),
+                    );
+                    if std::env::var_os("NEXIUM_SHADERDBG").is_some() {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static N: AtomicU64 = AtomicU64::new(0);
+                        if N.fetch_add(1, Ordering::Relaxed) < 20 {
+                            log::warn!(
                             "[shaderdbg] region={:#x} vs_lo={:#x} fs_lo={:#x} cpu(vs)={:?} cpu(fs)={:?} fs_sass[0..16]={:02x?} | {}",
                             program_region,
                             vs_prog.address_lo,
@@ -1426,65 +1526,66 @@ fn execute_one(
                             &fs_sass[..16.min(fs_sass.len())],
                             mappings.describe_around(fs_addr),
                         );
+                        }
                     }
-                }
-            } else {
-                log::debug!(
-                    "shader translated: vs_addr={:#x} fs_addr={:#x} all ops covered",
-                    vs_addr,
-                    fs_addr,
-                );
-            }
-
-            let (fs_spirv, fs_cbuf_mask, mut fs_tex_ids, fs_cbuf_used, fs_sampler_arrayed) =
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let fs_debug_targets = parse_env_u64_list("NEXIUM_FS_DEBUG_TARGET");
-                    let fs_debug_active =
-                        fs_debug_targets.is_empty() || fs_debug_targets.contains(&fs_addr);
-                    nexium_spirv::emit_fragment_full_with_input_map_meta_outputs_debug(
-                        &fs_cfg,
-                        fs_input_map,
-                        color_output_count,
-                        fs_output_map,
-                        fs_debug_active,
-                    )
-                })) {
-                    Ok(v) => v,
-                    Err(panic) => {
-                        shader_failed_set().lock().unwrap().insert(shader_key);
-                        return Err(format!(
-                            "FS SPIR-V emit panicked vs_addr={:#x} fs_addr={:#x}: {}",
-                            vs_addr,
-                            fs_addr,
-                            shader_panic_message(panic)
-                        ));
-                    }
-                };
-
-            {
-                let fs_walk_len = shader_cfg_code_len(&fs_cfg).min(fs_sass.len());
-                let fs_walk_sass = if fs_walk_len == 0 {
-                    fs_sass.as_slice()
                 } else {
-                    &fs_sass[..fs_walk_len]
-                };
-                let walked = nexium_shader::extract_fs_tex_ids(fs_walk_sass, 15);
-                let before = fs_tex_ids.len();
-                let mut bindless = 0usize;
-                for id in walked {
-                    match id {
-                        nexium_shader::FsTexId::ImmediateTic(idx) => {
-                            if !fs_tex_ids.contains(&idx) {
-                                fs_tex_ids.push(idx);
+                    log::debug!(
+                        "shader translated: vs_addr={:#x} fs_addr={:#x} all ops covered",
+                        vs_addr,
+                        fs_addr,
+                    );
+                }
+
+                let (fs_spirv, fs_cbuf_mask, mut fs_tex_ids, fs_cbuf_used, fs_sampler_arrayed) =
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let fs_debug_targets = parse_env_u64_list("NEXIUM_FS_DEBUG_TARGET");
+                        let fs_debug_active =
+                            fs_debug_targets.is_empty() || fs_debug_targets.contains(&fs_addr);
+                        nexium_spirv::emit_fragment_full_with_input_map_meta_outputs_debug(
+                            &fs_cfg,
+                            fs_input_map,
+                            color_output_count,
+                            fs_output_map,
+                            fs_debug_active,
+                        )
+                    })) {
+                        Ok(v) => v,
+                        Err(panic) => {
+                            shader_failed_set().lock().unwrap().insert(shader_key);
+                            l2_store.mark_failed(content_key);
+                            return Err(format!(
+                                "FS SPIR-V emit panicked vs_addr={:#x} fs_addr={:#x}: {}",
+                                vs_addr,
+                                fs_addr,
+                                shader_panic_message(panic)
+                            ));
+                        }
+                    };
+
+                {
+                    let fs_walk_len = shader_cfg_code_len(&fs_cfg).min(fs_sass.len());
+                    let fs_walk_sass = if fs_walk_len == 0 {
+                        fs_sass.as_slice()
+                    } else {
+                        &fs_sass[..fs_walk_len]
+                    };
+                    let walked = nexium_shader::extract_fs_tex_ids(fs_walk_sass, 15);
+                    let before = fs_tex_ids.len();
+                    let mut bindless = 0usize;
+                    for id in walked {
+                        match id {
+                            nexium_shader::FsTexId::ImmediateTic(idx) => {
+                                if !fs_tex_ids.contains(&idx) {
+                                    fs_tex_ids.push(idx);
+                                }
+                            }
+                            nexium_shader::FsTexId::BindlessCbufOffset(_) => {
+                                bindless += 1;
                             }
                         }
-                        nexium_shader::FsTexId::BindlessCbufOffset(_) => {
-                            bindless += 1;
-                        }
                     }
-                }
-                let walker_imm = fs_tex_ids.len() - before;
-                log::debug!(
+                    let walker_imm = fs_tex_ids.len() - before;
+                    log::debug!(
                     "fs_tex_ids: spirv-emitter={} walker-imm={} bindless-skipped={} final={:?} \
                      tic_pool=0x{:x} (limit={:#x}) fs_sass_len={}",
                     before,
@@ -1495,71 +1596,71 @@ fn execute_one(
                     draw.tic_pool_limit,
                     fs_walk_sass.len(),
                 );
-            }
+                }
 
-            let (vs_tex_base, vs_tex_count): (u32, u32) = {
-                let vs_walked = nexium_shader::extract_fs_tex_ids(vs_sass.as_slice(), 15);
-                let mut vs_tex_ids: Vec<u32> = Vec::new();
-                let mut vs_bindless = 0usize;
-                for id in vs_walked {
-                    match id {
-                        nexium_shader::FsTexId::ImmediateTic(idx) => {
-                            if !vs_tex_ids.contains(&idx) {
-                                vs_tex_ids.push(idx);
+                let (vs_tex_base, vs_tex_count): (u32, u32) = {
+                    let vs_walked = nexium_shader::extract_fs_tex_ids(vs_sass.as_slice(), 15);
+                    let mut vs_tex_ids: Vec<u32> = Vec::new();
+                    let mut vs_bindless = 0usize;
+                    for id in vs_walked {
+                        match id {
+                            nexium_shader::FsTexId::ImmediateTic(idx) => {
+                                if !vs_tex_ids.contains(&idx) {
+                                    vs_tex_ids.push(idx);
+                                }
                             }
+                            nexium_shader::FsTexId::BindlessCbufOffset(_) => vs_bindless += 1,
                         }
-                        nexium_shader::FsTexId::BindlessCbufOffset(_) => vs_bindless += 1,
                     }
-                }
-                if !vs_tex_ids.is_empty() || vs_bindless != 0 {
-                    log::warn!(
-                        "[vs-tex] vs={:#x} fs={:#x} vs_imm={:?} vs_bindless={} fs_tex_ids={:?}",
-                        vs_addr,
-                        fs_addr,
-                        vs_tex_ids,
-                        vs_bindless,
-                        fs_tex_ids
-                    );
-                }
-                if std::env::var_os("NEXIUM_VS_TEX").is_some() && !vs_tex_ids.is_empty() {
-                    let base = fs_tex_ids.len() as u32;
-                    vs_tex_ids.sort_unstable();
-                    for id in &vs_tex_ids {
-                        fs_tex_ids.push(*id);
+                    if !vs_tex_ids.is_empty() || vs_bindless != 0 {
+                        log::warn!(
+                            "[vs-tex] vs={:#x} fs={:#x} vs_imm={:?} vs_bindless={} fs_tex_ids={:?}",
+                            vs_addr,
+                            fs_addr,
+                            vs_tex_ids,
+                            vs_bindless,
+                            fs_tex_ids
+                        );
                     }
-                    (base, vs_tex_ids.len() as u32)
-                } else {
-                    (0, 0)
-                }
-            };
+                    if std::env::var_os("NEXIUM_VS_TEX").is_some() && !vs_tex_ids.is_empty() {
+                        let base = fs_tex_ids.len() as u32;
+                        vs_tex_ids.sort_unstable();
+                        for id in &vs_tex_ids {
+                            fs_tex_ids.push(*id);
+                        }
+                        (base, vs_tex_ids.len() as u32)
+                    } else {
+                        (0, 0)
+                    }
+                };
 
-            {
-                let want_addrs = parse_env_u64_list("NEXIUM_DUMP_FS");
-                if want_addrs.contains(&fs_addr) {
-                    let fs_dis = nexium_shader::disassemble(&fs_sass)
-                        .into_iter()
-                        .map(|line| line.to_string_compact())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let _ = std::fs::write(
-                        format!("C:/Users/Mythrax/Desktop/target_fs_{:x}.txt", fs_addr),
-                        &fs_dis,
-                    );
+                {
+                    let want_addrs = parse_env_u64_list("NEXIUM_DUMP_FS");
+                    if want_addrs.contains(&fs_addr) {
+                        let fs_dis = nexium_shader::disassemble(&fs_sass)
+                            .into_iter()
+                            .map(|line| line.to_string_compact())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let _ = std::fs::write(
+                            format!("C:/Users/Mythrax/Desktop/target_fs_{:x}.txt", fs_addr),
+                            &fs_dis,
+                        );
+                    }
                 }
-            }
-            {
-                let want_addrs = parse_env_u64_list("NEXIUM_DUMP_VS");
-                if want_addrs.contains(&vs_addr) {
-                    let vs_dis = nexium_shader::disassemble(&vs_sass)
-                        .into_iter()
-                        .map(|line| line.to_string_compact())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let _ = std::fs::write(
-                        format!("C:/Users/Mythrax/Desktop/target_vs_{:x}.txt", vs_addr),
-                        &vs_dis,
-                    );
-                    log::warn!(
+                {
+                    let want_addrs = parse_env_u64_list("NEXIUM_DUMP_VS");
+                    if want_addrs.contains(&vs_addr) {
+                        let vs_dis = nexium_shader::disassemble(&vs_sass)
+                            .into_iter()
+                            .map(|line| line.to_string_compact())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let _ = std::fs::write(
+                            format!("C:/Users/Mythrax/Desktop/target_vs_{:x}.txt", vs_addr),
+                            &vs_dis,
+                        );
+                        log::warn!(
                         "[dump-vs] vs={:#x} vp_scale_z={} vp_translate_z={} applied={}/{} vp_en={}",
                         vs_addr,
                         draw.viewport.scale_z,
@@ -1568,144 +1669,171 @@ fn execute_one(
                         vptx_translate_z,
                         draw.viewport_transform_en
                     );
-                }
-            }
-            let required_outputs = nexium_spirv::scan_input_locations(&fs_spirv);
-            let (vs_spirv, vs_cbuf_mask, vs_cbuf_used) =
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    nexium_spirv::emit_vertex_with_bindings_opts(
-                        &vs_cfg,
-                        &required_outputs,
-                        nexium_spirv::VertexOptions {
-                            vptx_scale_z,
-                            vptx_translate_z,
-                            point_size: if draw.topology == 0 {
-                                Some(draw.point_size)
-                            } else {
-                                None
-                            },
-                            window_ndc,
-                            num_ssbo,
-                            uint_attr_mask,
-                            sint_attr_mask,
-                            tex_slot_base: vs_tex_base,
-                            ..Default::default()
-                        },
-                    )
-                })) {
-                    Ok(v) => v,
-                    Err(panic) => {
-                        shader_failed_set().lock().unwrap().insert(shader_key);
-                        return Err(format!(
-                            "VS SPIR-V emit panicked vs_addr={:#x} fs_addr={:#x}: {}",
-                            vs_addr,
-                            fs_addr,
-                            shader_panic_message(panic)
-                        ));
                     }
-                };
+                }
+                let required_outputs = nexium_spirv::scan_input_locations(&fs_spirv);
+                let (vs_spirv, vs_cbuf_mask, vs_cbuf_used) =
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        nexium_spirv::emit_vertex_with_bindings_opts(
+                            &vs_cfg,
+                            &required_outputs,
+                            nexium_spirv::VertexOptions {
+                                vptx_scale_z,
+                                vptx_translate_z,
+                                point_size: if draw.topology == 0 {
+                                    Some(draw.point_size)
+                                } else {
+                                    None
+                                },
+                                window_ndc,
+                                num_ssbo,
+                                uint_attr_mask,
+                                sint_attr_mask,
+                                tex_slot_base: vs_tex_base,
+                                ..Default::default()
+                            },
+                        )
+                    })) {
+                        Ok(v) => v,
+                        Err(panic) => {
+                            shader_failed_set().lock().unwrap().insert(shader_key);
+                            l2_store.mark_failed(content_key);
+                            return Err(format!(
+                                "VS SPIR-V emit panicked vs_addr={:#x} fs_addr={:#x}: {}",
+                                vs_addr,
+                                fs_addr,
+                                shader_panic_message(panic)
+                            ));
+                        }
+                    };
 
-            let vs_hash = nexium_gpu::renderer::hash_spirv(&vs_spirv);
-            let fs_hash = nexium_gpu::renderer::hash_spirv(&fs_spirv);
-            if std::env::var_os("NEXIUM_SHADER_MODULE_DBG").is_some() {
-                log::warn!(
+                let vs_hash = nexium_gpu::renderer::hash_spirv(&vs_spirv);
+                let fs_hash = nexium_gpu::renderer::hash_spirv(&fs_spirv);
+                if std::env::var_os("NEXIUM_SHADER_MODULE_DBG").is_some() {
+                    log::warn!(
                     "[shader-module-map] vs_addr={:#x} vs_hash={:016x} fs_addr={:#x} fs_hash={:016x}",
                     vs_addr,
                     vs_hash,
                     fs_addr,
                     fs_hash
                 );
-            }
-            if std::env::var_os("NEXIUM_DUMP_SPIRV").is_some() {
-                let fnv = |words: &[u32]| {
-                    let mut h: u64 = 1469598103934665603;
-                    for w in words {
-                        h ^= *w as u64;
-                        h = h.wrapping_mul(1099511628211);
-                    }
-                    h
-                };
-                log::info!(
-                    "[spv-map] vs_addr={:#x} vs_spv={:016x} fs_addr={:#x} fs_spv={:016x}",
-                    vs_addr,
-                    fnv(&vs_spirv),
-                    fs_addr,
-                    fnv(&fs_spirv)
-                );
-            }
-            let b = std::sync::Arc::new(ShaderBundle {
-                vs_spirv: std::sync::Arc::new(vs_spirv),
-                vs_cbuf_mask,
-                vs_hash,
-                fs_spirv: std::sync::Arc::new(fs_spirv),
-                fs_cbuf_mask,
-                fs_hash,
-                fs_tex_ids,
-                vs_tex_base,
-                vs_tex_count,
-                fs_sampler_arrayed,
-                fs_cbuf_reads,
-                cbuf_used: vs_cbuf_used.max(fs_cbuf_used),
-                ssbo_descs,
-            });
-            guard.insert(shader_key, b.clone());
-            if std::env::var_os("NEXIUM_PROBE_SHADE").is_some() {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static DN: AtomicU32 = AtomicU32::new(0);
-                let dk = DN.fetch_add(1, Ordering::Relaxed);
-                let target_fs = std::env::var("NEXIUM_PROBE_SHADE_FS")
-                    .ok()
-                    .and_then(|v| parse_env_u64(&v));
-                let target_vs = std::env::var("NEXIUM_PROBE_SHADE_VS")
-                    .ok()
-                    .and_then(|v| parse_env_u64(&v));
-                let target = target_fs.is_some_and(|v| v == fs_addr)
-                    || target_vs.is_some_and(|v| v == vs_addr);
-                if dk < 24 || target {
-                    let tag = if target {
-                        format!("target_{:x}_{:x}", vs_addr, fs_addr)
-                    } else {
-                        dk.to_string()
+                }
+                if std::env::var_os("NEXIUM_DUMP_SPIRV").is_some() {
+                    let fnv = |words: &[u32]| {
+                        let mut h: u64 = 1469598103934665603;
+                        for w in words {
+                            h ^= *w as u64;
+                            h = h.wrapping_mul(1099511628211);
+                        }
+                        h
                     };
-                    let vb: Vec<u8> = b.vs_spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    let fb: Vec<u8> = b.fs_spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    let _ =
-                        std::fs::write(format!("C:/Users/Mythrax/Desktop/sh_{}_vs.spv", tag), &vb);
-                    let _ =
-                        std::fs::write(format!("C:/Users/Mythrax/Desktop/sh_{}_fs.spv", tag), &fb);
-                    let _ = std::fs::write(
-                        format!("C:/Users/Mythrax/Desktop/sh_{}_vs.sass", tag),
-                        &vs_sass,
+                    log::info!(
+                        "[spv-map] vs_addr={:#x} vs_spv={:016x} fs_addr={:#x} fs_spv={:016x}",
+                        vs_addr,
+                        fnv(&vs_spirv),
+                        fs_addr,
+                        fnv(&fs_spirv)
                     );
-                    let _ = std::fs::write(
-                        format!("C:/Users/Mythrax/Desktop/sh_{}_fs.sass", tag),
-                        &fs_sass,
-                    );
-                    let vs_dis = nexium_shader::disassemble(&vs_sass)
-                        .into_iter()
-                        .map(|line| line.to_string_compact())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let fs_dis = nexium_shader::disassemble(&fs_sass)
-                        .into_iter()
-                        .map(|line| line.to_string_compact())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let _ = std::fs::write(
-                        format!("C:/Users/Mythrax/Desktop/sh_{}_vs.txt", tag),
-                        vs_dis,
-                    );
-                    let _ = std::fs::write(
-                        format!("C:/Users/Mythrax/Desktop/sh_{}_fs.txt", tag),
-                        fs_dis,
-                    );
-                    if target {
+                }
+                let b = std::sync::Arc::new(ShaderBundle {
+                    vs_spirv: std::sync::Arc::new(vs_spirv),
+                    vs_cbuf_mask,
+                    vs_hash,
+                    fs_spirv: std::sync::Arc::new(fs_spirv),
+                    fs_cbuf_mask,
+                    fs_hash,
+                    fs_tex_ids,
+                    vs_tex_base,
+                    vs_tex_count,
+                    fs_sampler_arrayed,
+                    fs_cbuf_reads,
+                    cbuf_used: vs_cbuf_used.max(fs_cbuf_used),
+                    ssbo_descs,
+                });
+                guard.insert(shader_key, b.clone());
+                l2_store.insert(std::sync::Arc::new(
+                    nexium_gpu::bundle_cache::BundleRecord {
+                        content_key,
+                        vs_spirv: (*b.vs_spirv).clone(),
+                        fs_spirv: (*b.fs_spirv).clone(),
+                        vs_cbuf_mask: b.vs_cbuf_mask,
+                        fs_cbuf_mask: b.fs_cbuf_mask,
+                        vs_hash: b.vs_hash,
+                        fs_hash: b.fs_hash,
+                        fs_tex_ids: b.fs_tex_ids.clone(),
+                        vs_tex_base: b.vs_tex_base,
+                        vs_tex_count: b.vs_tex_count,
+                        fs_sampler_arrayed: b.fs_sampler_arrayed,
+                        fs_cbuf_reads: b.fs_cbuf_reads.clone(),
+                        cbuf_used: b.cbuf_used,
+                        ssbo_descs: b
+                            .ssbo_descs
+                            .iter()
+                            .map(|d| (d.cbuf_binding, d.cbuf_offset, d.align))
+                            .collect(),
+                    },
+                ));
+                if std::env::var_os("NEXIUM_PROBE_SHADE").is_some() {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static DN: AtomicU32 = AtomicU32::new(0);
+                    let dk = DN.fetch_add(1, Ordering::Relaxed);
+                    let target_fs = std::env::var("NEXIUM_PROBE_SHADE_FS")
+                        .ok()
+                        .and_then(|v| parse_env_u64(&v));
+                    let target_vs = std::env::var("NEXIUM_PROBE_SHADE_VS")
+                        .ok()
+                        .and_then(|v| parse_env_u64(&v));
+                    let target = target_fs.is_some_and(|v| v == fs_addr)
+                        || target_vs.is_some_and(|v| v == vs_addr);
+                    if dk < 24 || target {
+                        let tag = if target {
+                            format!("target_{:x}_{:x}", vs_addr, fs_addr)
+                        } else {
+                            dk.to_string()
+                        };
+                        let vb: Vec<u8> = b.vs_spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+                        let fb: Vec<u8> = b.fs_spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
                         let _ = std::fs::write(
-                            format!("C:/Users/Mythrax/Desktop/sh_{}_fs.cfg.txt", tag),
-                            shader_cfg_dump(&fs_cfg),
+                            format!("C:/Users/Mythrax/Desktop/sh_{}_vs.spv", tag),
+                            &vb,
                         );
-                    }
-                    log::warn!(
+                        let _ = std::fs::write(
+                            format!("C:/Users/Mythrax/Desktop/sh_{}_fs.spv", tag),
+                            &fb,
+                        );
+                        let _ = std::fs::write(
+                            format!("C:/Users/Mythrax/Desktop/sh_{}_vs.sass", tag),
+                            &vs_sass,
+                        );
+                        let _ = std::fs::write(
+                            format!("C:/Users/Mythrax/Desktop/sh_{}_fs.sass", tag),
+                            &fs_sass,
+                        );
+                        let vs_dis = nexium_shader::disassemble(&vs_sass)
+                            .into_iter()
+                            .map(|line| line.to_string_compact())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let fs_dis = nexium_shader::disassemble(&fs_sass)
+                            .into_iter()
+                            .map(|line| line.to_string_compact())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let _ = std::fs::write(
+                            format!("C:/Users/Mythrax/Desktop/sh_{}_vs.txt", tag),
+                            vs_dis,
+                        );
+                        let _ = std::fs::write(
+                            format!("C:/Users/Mythrax/Desktop/sh_{}_fs.txt", tag),
+                            fs_dis,
+                        );
+                        if target {
+                            let _ = std::fs::write(
+                                format!("C:/Users/Mythrax/Desktop/sh_{}_fs.cfg.txt", tag),
+                                shader_cfg_dump(&fs_cfg),
+                            );
+                        }
+                        log::warn!(
                         "[shdump] #{} vs_addr={:#x} fs_addr={:#x} vs_mask={:#x} fs_mask={:#x} vs_bytes={} fs_bytes={} ntex={}",
                         tag,
                         vs_addr,
@@ -1716,9 +1844,10 @@ fn execute_one(
                         b.fs_spirv.len(),
                         b.fs_tex_ids.len()
                     );
+                    }
                 }
+                b
             }
-            b
         }
     };
     let vs_spirv = bundle.vs_spirv.clone();
