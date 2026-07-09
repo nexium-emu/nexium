@@ -1300,10 +1300,10 @@ pub fn carousel_view(
             Vec2::new(s_total + 52.0 * scale_factor * pop, s_sw + 92.0 * scale_factor * pop),
         );
         let interactive = state.palette_open && state.palette_t > 0.6;
-        painter.rect_filled(panel, Rounding::same(20.0 * scale_factor), Color32::from_rgba_unmultiplied(0x10, 0x10, 0x16, a(240.0)));
-        painter.rect_stroke(panel, Rounding::same(20.0 * scale_factor), Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x2C, 0x2C, 0x38, a(255.0))));
+        painter.rect_filled(panel, Rounding::same(20.0 * scale_factor), Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), a(240.0)));
+        painter.rect_stroke(panel, Rounding::same(20.0 * scale_factor), Stroke::new(1.0, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(255.0))));
 
-        shadowed_text(&painter, egui::pos2(scaled_center.x, panel.min.y + 20.0 * scale_factor), egui::Align2::CENTER_CENTER, "Background Theme", FontId::proportional(15.0 * scale_factor), Color32::from_rgba_unmultiplied(255, 255, 255, a(255.0)), true);
+        shadowed_text(&painter, egui::pos2(scaled_center.x, panel.min.y + 20.0 * scale_factor), egui::Align2::CENTER_CENTER, "Background Theme", FontId::proportional(15.0 * scale_factor), Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), a(255.0)), true);
 
         let sx = scaled_center.x - s_total * 0.5;
         let row_y = scaled_center.y + 6.0 * scale_factor;
@@ -1338,11 +1338,16 @@ pub fn carousel_view(
                     None => draw_gradient_rounded_rect(&painter, r.center(), r, 10.0 * scale_factor, t, a(255.0)),
                 }
             }
-            painter.rect_stroke(r, rounding, Stroke::new(1.3, Color32::from_rgba_unmultiplied(255, 255, 255, a(if is_sel { 235.0 } else { 55.0 }))));
+            let sw_stroke = if is_sel {
+                Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), a(235.0))
+            } else {
+                Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(160.0))
+            };
+            painter.rect_stroke(r, rounding, Stroke::new(1.3, sw_stroke));
         }
 
         let cur = themes.get(state.palette_selected).copied().unwrap_or_default();
-        shadowed_text(&painter, egui::pos2(scaled_center.x, panel.max.y - 18.0 * scale_factor), egui::Align2::CENTER_CENTER, cur.label(), FontId::proportional(14.0 * scale_factor), Color32::from_rgba_unmultiplied(0xD2, 0xD2, 0xDE, a(255.0)), false);
+        shadowed_text(&painter, egui::pos2(scaled_center.x, panel.max.y - 18.0 * scale_factor), egui::Align2::CENTER_CENTER, cur.label(), FontId::proportional(14.0 * scale_factor), Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), a(255.0)), false);
     }
 
     if ui_opacity > 0.01 {

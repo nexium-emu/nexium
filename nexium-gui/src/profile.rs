@@ -638,14 +638,21 @@ fn profile_page(
     painter.rect_stroke(scaled_btn_rect, rounding, Stroke::new(2.0 * scale_factor, border));
     let text_pos = scaled_btn_rect.center();
     let font_id = FontId::proportional(15.5 * s * scale_factor);
-    for dx in [0.0f32, 0.7, 1.4] {
-        painter.text(
-            text_pos + Vec2::new(dx, 0.0),
-            egui::Align2::CENTER_CENTER,
-            "Change Icon",
-            font_id.clone(),
-            Color32::WHITE,
-        );
+    let af = fill_a as f32 / 255.0;
+    let er = accent.r() as f32 * af + pal.panel.r() as f32 * (1.0 - af);
+    let eg = accent.g() as f32 * af + pal.panel.g() as f32 * (1.0 - af);
+    let eb = accent.b() as f32 * af + pal.panel.b() as f32 * (1.0 - af);
+    let lum = 0.299 * er + 0.587 * eg + 0.114 * eb;
+    let (txt_col, halo) = if lum > 150.0 {
+        (Color32::from_rgb(0x1A, 0x1A, 0x22), Color32::from_rgba_unmultiplied(255, 255, 255, 130))
+    } else {
+        (Color32::WHITE, Color32::from_rgba_unmultiplied(0, 0, 0, 120))
+    };
+    for off in [Vec2::new(-1.2, -1.2), Vec2::new(1.2, -1.2), Vec2::new(-1.2, 1.2), Vec2::new(1.2, 1.2)] {
+        painter.text(text_pos + off, egui::Align2::CENTER_CENTER, "Change Icon", font_id.clone(), halo);
+    }
+    for dx in [0.0f32, 0.7] {
+        painter.text(text_pos + Vec2::new(dx, 0.0), egui::Align2::CENTER_CENTER, "Change Icon", font_id.clone(), txt_col);
     }
     if btn_resp.clicked() {
         *action = ProfileAction::PickIcon;
