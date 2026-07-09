@@ -585,6 +585,31 @@ impl RtCache {
         best.map(|(k, img)| (k, img.image, img.view, img.layout))
     }
 
+    pub fn find_depth_fuzzy(
+        &self,
+        want: RtKey,
+    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
+        let mut best: Option<(RtKey, &GpuImage)> = None;
+        for (k, img) in &self.depth_cache {
+            if !dims_close(k.width, want.width) || !dims_close(k.height, want.height) {
+                continue;
+            }
+            let kd = (k.width as i64 - want.width as i64).abs()
+                + (k.height as i64 - want.height as i64).abs();
+            let replace = match best {
+                Some((bk, _)) => {
+                    kd < (bk.width as i64 - want.width as i64).abs()
+                        + (bk.height as i64 - want.height as i64).abs()
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((*k, img));
+            }
+        }
+        best.map(|(k, img)| (k, img.image, img.view, img.layout))
+    }
+
     pub fn find_color(
         &self,
         want: RtKey,

@@ -2,6 +2,121 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewMode {
+    Grid,
+    Carousel,
+}
+
+impl Default for ViewMode {
+    fn default() -> Self {
+        ViewMode::Carousel
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CarouselTheme {
+    Adaptive,
+    Rgb,
+    Aqua,
+    Azure,
+    Violet,
+    Magenta,
+    Crimson,
+    Amber,
+    Emerald,
+    Graphite,
+}
+
+impl Default for CarouselTheme {
+    fn default() -> Self {
+        CarouselTheme::Adaptive
+    }
+}
+
+impl CarouselTheme {
+    pub fn all() -> &'static [CarouselTheme] {
+        &[
+            CarouselTheme::Adaptive,
+            CarouselTheme::Rgb,
+            CarouselTheme::Aqua,
+            CarouselTheme::Azure,
+            CarouselTheme::Violet,
+            CarouselTheme::Magenta,
+            CarouselTheme::Crimson,
+            CarouselTheme::Amber,
+            CarouselTheme::Emerald,
+            CarouselTheme::Graphite,
+        ]
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            CarouselTheme::Adaptive => "Adaptive",
+            CarouselTheme::Rgb => "RGB",
+            CarouselTheme::Aqua => "Aqua",
+            CarouselTheme::Azure => "Azure",
+            CarouselTheme::Violet => "Violet",
+            CarouselTheme::Magenta => "Magenta",
+            CarouselTheme::Crimson => "Crimson",
+            CarouselTheme::Amber => "Amber",
+            CarouselTheme::Emerald => "Emerald",
+            CarouselTheme::Graphite => "Graphite",
+        }
+    }
+
+    pub fn color(&self) -> Option<(u8, u8, u8)> {
+        Some(match self {
+            CarouselTheme::Adaptive => return None,
+            CarouselTheme::Rgb => return None,
+            CarouselTheme::Aqua => (0x2F, 0xB4, 0xEF),
+            CarouselTheme::Azure => (0x3B, 0x82, 0xF6),
+            CarouselTheme::Violet => (0x8B, 0x5C, 0xF6),
+            CarouselTheme::Magenta => (0xD9, 0x4F, 0xD0),
+            CarouselTheme::Crimson => (0xE8, 0x33, 0x50),
+            CarouselTheme::Amber => (0xF5, 0xA6, 0x23),
+            CarouselTheme::Emerald => (0x22, 0xC5, 0x5E),
+            CarouselTheme::Graphite => (0x5C, 0x6B, 0x7C),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackdropTheme {
+    Waves,
+    Gradient,
+    None,
+}
+
+impl Default for BackdropTheme {
+    fn default() -> Self {
+        BackdropTheme::Waves
+    }
+}
+
+impl BackdropTheme {
+    pub fn all() -> &'static [BackdropTheme] {
+        &[BackdropTheme::Waves, BackdropTheme::Gradient, BackdropTheme::None]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            BackdropTheme::Waves => "Waves",
+            BackdropTheme::Gradient => "Gradient",
+            BackdropTheme::None => "None",
+        }
+    }
+    pub fn next(&self) -> BackdropTheme {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + 1) % all.len()]
+    }
+    pub fn prev(&self) -> BackdropTheme {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + all.len() - 1) % all.len()]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CpuBackend {
     Dynarmic,
     Rustarmic,
@@ -142,6 +257,10 @@ fn default_multicore() -> bool {
     true
 }
 
+fn default_sfx_volume() -> f32 {
+    0.5
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppSettings {
     pub log_level: LogLevel,
@@ -167,6 +286,34 @@ pub struct AppSettings {
     pub async_shaders: bool,
     #[serde(default)]
     pub library_folders: Vec<PathBuf>,
+    #[serde(default)]
+    pub view_mode: ViewMode,
+    #[serde(default)]
+    pub carousel_theme: CarouselTheme,
+    #[serde(default)]
+    pub backdrop_theme: BackdropTheme,
+    #[serde(default)]
+    pub light_mode: bool,
+    #[serde(default = "default_music_volume")]
+    pub music_volume: f32,
+    #[serde(default = "default_sfx_volume")]
+    pub sfx_volume: f32,
+    #[serde(default)]
+    pub favorites: Vec<PathBuf>,
+    #[serde(default)]
+    pub profile_avatar: Option<PathBuf>,
+    #[serde(default = "default_profile_name")]
+    pub profile_name: String,
+    #[serde(default)]
+    pub steamgriddb_key: String,
+}
+
+fn default_profile_name() -> String {
+    "Player".to_string()
+}
+
+fn default_music_volume() -> f32 {
+    0.5
 }
 
 impl Default for AppSettings {
@@ -184,6 +331,16 @@ impl Default for AppSettings {
             multicore: default_multicore(),
             async_shaders: false,
             library_folders: Vec::new(),
+            view_mode: ViewMode::Carousel,
+            carousel_theme: CarouselTheme::default(),
+            backdrop_theme: BackdropTheme::default(),
+            light_mode: false,
+            music_volume: default_music_volume(),
+            sfx_volume: default_sfx_volume(),
+            favorites: Vec::new(),
+            profile_avatar: None,
+            profile_name: default_profile_name(),
+            steamgriddb_key: String::new(),
         }
     }
 }

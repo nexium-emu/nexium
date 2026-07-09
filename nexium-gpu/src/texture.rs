@@ -13,6 +13,9 @@ pub enum TicFormat {
     R16G16,
     R32,
     Z32,
+    Z24S8,
+    X8Z24,
+    S8Z24,
     B10G11R11,
     BC1,
     BC2,
@@ -98,6 +101,9 @@ impl TicFormat {
             0x27 => TicFormat::BC4,
             0x28 => TicFormat::BC5,
             0x17 => TicFormat::BC7,
+            0x29 => TicFormat::Z24S8,
+            0x2A => TicFormat::X8Z24,
+            0x2B => TicFormat::S8Z24,
             0x2F => TicFormat::Z32,
             0x2D => TicFormat::R8G8B8A8,
             0x40 => TicFormat::Astc(4, 4),
@@ -126,6 +132,9 @@ impl TicFormat {
             | TicFormat::R8G8B8A8
             | TicFormat::R32
             | TicFormat::Z32
+            | TicFormat::Z24S8
+            | TicFormat::X8Z24
+            | TicFormat::S8Z24
             | TicFormat::B10G11R11 => 4,
             TicFormat::R5G6B5 | TicFormat::A1R5G5B5 | TicFormat::A4R4G4B4 => 2,
             TicFormat::R16 | TicFormat::R8G8 => 2,
@@ -980,6 +989,26 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
                     src[i * 4 + 3],
                 ]);
                 let v = float_to_u8(f32::from_bits(raw));
+                out[i * 4] = v;
+                out[i * 4 + 1] = v;
+                out[i * 4 + 2] = v;
+                out[i * 4 + 3] = 0xFF;
+            }
+        }
+        TicFormat::Z24S8 | TicFormat::X8Z24 | TicFormat::S8Z24 => {
+            let depth_high = matches!(format, TicFormat::Z24S8);
+            for i in 0..pixels.min(src.len() / 4) {
+                let raw = u32::from_le_bytes([
+                    src[i * 4],
+                    src[i * 4 + 1],
+                    src[i * 4 + 2],
+                    src[i * 4 + 3],
+                ]);
+                let v = if depth_high {
+                    (raw >> 24) as u8
+                } else {
+                    (raw >> 16) as u8
+                };
                 out[i * 4] = v;
                 out[i * 4 + 1] = v;
                 out[i * 4 + 2] = v;

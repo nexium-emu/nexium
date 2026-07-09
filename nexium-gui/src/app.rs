@@ -174,6 +174,33 @@ pub struct HorizonApp {
     splash: crate::splash::Splash,
     library: crate::library::Library,
     stop_fade: Option<std::time::Instant>,
+    pause_anim: Option<std::time::Instant>,
+    resume_anim: Option<std::time::Instant>,
+    stop_anim: Option<std::time::Instant>,
+    pill_fade: Option<std::time::Instant>,
+    playing_path: Option<std::path::PathBuf>,
+    last_home: bool,
+    profile_texture: Option<egui::TextureHandle>,
+    profile_reload: bool,
+    show_profile: bool,
+    profile_anim: f32,
+    profile: crate::profile::ProfileState,
+    play_times: crate::playtime::PlayTimes,
+    last_playtime_save: std::time::Instant,
+    pub carousel: crate::carousel::CarouselState,
+    icon_picker: Option<IconPicker>,
+    icon_reveal: Option<(usize, std::time::Instant, Option<egui::TextureHandle>)>,
+    key_test: Option<std::sync::Arc<std::sync::Mutex<KeyTest>>>,
+    key_test_result: Option<(bool, std::time::Instant)>,
+    confirm: Option<ConfirmDialog>,
+    teardown_at: Option<std::time::Instant>,
+    pending_boot: Option<String>,
+    modal_cd: f64,
+    modal_hold: bool,
+    modal_anim: f32,
+    modal_snap: Option<ModalSnap>,
+    pending_quick: Option<String>,
+    modal_active_frame_start: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -184,6 +211,89 @@ pub enum SettingsTab {
     Audio,
     Emulation,
     Logging,
+}
+
+enum ConfirmKind {
+    CloseGame,
+    LaunchGame(String),
+    QuickLaunch(String),
+}
+
+struct ConfirmDialog {
+    title: String,
+    body: String,
+    confirm_label: String,
+    selected: usize,
+    kind: ConfirmKind,
+}
+
+struct ModalSnap {
+    teardown: bool,
+    title: String,
+    body: String,
+    label: String,
+}
+
+#[derive(Default)]
+struct IconFetch {
+    done: bool,
+    error: Option<String>,
+    items: Vec<(String, Option<Vec<u8>>)>,
+}
+
+#[derive(Default)]
+struct IconApply {
+    done: bool,
+    bytes: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct KeyTest {
+    done: bool,
+    ok: bool,
+}
+
+struct IconPicker {
+    game_idx: usize,
+    game_path: std::path::PathBuf,
+    search: String,
+    editing: bool,
+    anim: f32,
+    selected: usize,
+    scroll: f32,
+    squish_at: Option<f64>,
+    nav_cd: f64,
+    hold: bool,
+    built: bool,
+    full_urls: Vec<String>,
+    thumbs: Vec<Option<egui::TextureHandle>>,
+    fetch: std::sync::Arc<std::sync::Mutex<IconFetch>>,
+    apply: Option<std::sync::Arc<std::sync::Mutex<IconApply>>>,
+}
+
+fn start_icon_fetch(key: String, query: String) -> std::sync::Arc<std::sync::Mutex<IconFetch>> {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(IconFetch::default()));
+    let s2 = shared.clone();
+    std::thread::spawn(move || {
+        let mut result = IconFetch { done: true, error: None, items: Vec::new() };
+        if key.trim().is_empty() {
+            result.error = Some("No SteamGridDB API key — set it in Preferences > General".into());
+        } else {
+            let icons = crate::steamgrid::fetch_icons(&key, &query, 15);
+            if icons.is_empty() {
+                result.error = Some("No icons found for that name".into());
+            } else {
+                for ic in icons {
+                    let bytes = crate::steamgrid::curl_bytes(&ic.thumb_url);
+                    result.items.push((ic.full_url, bytes));
+                }
+            }
+        }
+        if let Ok(mut g) = s2.lock() {
+            *g = result;
+        }
+    });
+    shared
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -199,6 +309,7 @@ impl HorizonApp {
         nro_arg: Option<String>,
     ) -> Self {
         Self::apply_theme(&cc.egui_ctx);
+        crate::ui_audio::init();
         let input = InputBackend::new().or_else(|| {
             log::warn!("SDL3 gamepad init failed");
             None
@@ -229,7 +340,36 @@ impl HorizonApp {
             splash: crate::splash::Splash::new(),
             library: crate::library::Library::new(),
             stop_fade: None,
+            pause_anim: None,
+            resume_anim: None,
+            stop_anim: None,
+            pill_fade: None,
+            playing_path: None,
+            last_home: false,
+            profile_texture: None,
+            profile_reload: false,
+            show_profile: false,
+            profile_anim: 0.0,
+            profile: crate::profile::ProfileState::new(),
+            play_times: crate::playtime::PlayTimes::load(),
+            last_playtime_save: std::time::Instant::now(),
+            carousel: crate::carousel::CarouselState::new(),
+            icon_picker: None,
+            icon_reveal: None,
+            key_test: None,
+            key_test_result: None,
+            confirm: None,
+            teardown_at: None,
+            pending_boot: None,
+            modal_cd: 0.0,
+            modal_hold: false,
+            modal_anim: 0.0,
+            modal_snap: None,
+            pending_quick: None,
+            modal_active_frame_start: false,
         };
+        app.reload_profile_texture(&cc.egui_ctx);
+        crate::ui_audio::set_sfx_volume(app.app_settings.sfx_volume);
         app.library
             .rescan(&cc.egui_ctx, &app.app_settings.library_folders);
         if !nro_path.is_empty() {
@@ -237,6 +377,7 @@ impl HorizonApp {
             if let Ok(handle) = EmulationHandle::new(&nro_path, backend, Some(cc.egui_ctx.clone()))
             {
                 app.emulation_handle = Some(handle);
+                app.playing_path = Some(std::path::PathBuf::from(&nro_path));
                 log::info!("Auto-loaded NRO: {} (CPU: {})", nro_path, backend.label());
             } else {
                 log::error!("Failed to load NRO: {}", nro_path);
@@ -437,6 +578,7 @@ impl HorizonApp {
                 Some(t) => t.set(img, tex_opts),
                 None => {
                     self.game_texture = Some(ctx.load_texture("game_frame", img, tex_opts));
+                    self.carousel.boot_stage = crate::carousel::BootStage::None;
                 }
             }
         }
@@ -488,6 +630,9 @@ impl HorizonApp {
                 filter,
             });
         }
+        if self.carousel.boot_stage != crate::carousel::BootStage::None {
+            self.carousel.boot_stage = crate::carousel::BootStage::None;
+        }
         let Some(t) = self.game_texture_native.as_ref() else {
             return;
         };
@@ -520,6 +665,663 @@ impl HorizonApp {
         }
     }
 
+    fn modal_active(&self) -> bool {
+        self.confirm.is_some() || self.teardown_at.is_some() || self.icon_picker.is_some()
+    }
+
+    fn update_icon_picker(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        const ICON_GRID_COLS: usize = 5;
+        if self.icon_picker.is_none() {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        let light = self.app_settings.light_mode;
+        let accent = match self.app_settings.carousel_theme.color() {
+            Some((r, g, b)) => Color32::from_rgb(r, g, b),
+            None => self.carousel.ambient_color,
+        };
+        let panel = if light { Color32::from_rgb(0xF5, 0xF5, 0xF9) } else { Color32::from_rgb(0x16, 0x16, 0x20) };
+        let text = if light { Color32::from_rgb(0x1E, 0x1E, 0x28) } else { Color32::from_rgb(0xEC, 0xEC, 0xF0) };
+        let muted = if light { Color32::from_rgb(0x60, 0x60, 0x6A) } else { Color32::from_rgb(0x9A, 0x9A, 0xA6) };
+        let border = if light { Color32::from_rgb(0xC6, 0xC6, 0xD0) } else { Color32::from_rgb(0x32, 0x32, 0x3E) };
+        let field_bg = if light { Color32::from_rgb(0xE6, 0xE6, 0xEC) } else { Color32::from_rgb(0x24, 0x24, 0x2E) };
+
+        // --- Build thumbnail textures once the fetch is done ---
+        {
+            let p = self.icon_picker.as_mut().unwrap();
+            if !p.built {
+                let mut ready: Option<Vec<(String, Option<Vec<u8>>)>> = None;
+                if let Ok(g) = p.fetch.lock() {
+                    if g.done {
+                        ready = Some(g.items.clone());
+                    }
+                }
+                if let Some(items) = ready {
+                    for (i, (url, bytes)) in items.into_iter().enumerate() {
+                        p.full_urls.push(url);
+                        let tex = bytes
+                            .as_deref()
+                            .and_then(|b| image::load_from_memory(b).ok())
+                            .map(|im| im.to_rgba8())
+                            .map(|rgba| {
+                                let (w, h) = rgba.dimensions();
+                                let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+                                ctx.load_texture(format!("sgdb_thumb_{i}"), ci, egui::TextureOptions::LINEAR)
+                            });
+                        p.thumbs.push(tex);
+                    }
+                    p.built = true;
+                }
+            }
+        }
+
+        // --- Poll an in-flight apply download ---
+        let mut apply_now: Option<Vec<u8>> = None;
+        let mut apply_failed = false;
+        if let Some(p) = self.icon_picker.as_ref() {
+            if let Some(a) = &p.apply {
+                if let Ok(g) = a.lock() {
+                    if g.done {
+                        match &g.bytes {
+                            Some(b) => apply_now = Some(b.clone()),
+                            None => apply_failed = true,
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(bytes) = apply_now {
+            if let Some(img) = image::load_from_memory(&bytes).ok().map(|im| {
+                let rgba = im.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let (rgba, w, h) = if w.max(h) > 256 {
+                    let r = image::imageops::resize(&rgba, 256, 256, image::imageops::FilterType::Lanczos3);
+                    (r.into_raw(), 256u32, 256u32)
+                } else {
+                    (rgba.into_raw(), w, h)
+                };
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba)
+            }) {
+                let (idx, path) = {
+                    let p = self.icon_picker.as_ref().unwrap();
+                    (p.game_idx, p.game_path.clone())
+                };
+                if let Some(cache) = crate::library::custom_icon_path(&path) {
+                    if let Some(parent) = cache.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&cache, &bytes);
+                }
+                let old_tex = self.library.texture(ctx, idx);
+                self.library.set_icon(idx, img);
+                self.icon_reveal = Some((idx, std::time::Instant::now(), old_tex));
+                self.carousel.pending_center = Some(idx);
+                crate::ui_audio::play(crate::ui_audio::Sfx::Celebration);
+            }
+            self.icon_picker = None;
+            return;
+        }
+        if apply_failed {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Error);
+            self.icon_picker = None;
+            return;
+        }
+
+        // --- Input ---
+        let (kb_left, kb_right, kb_enter, kb_esc, kb_up, kb_down) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+            )
+        });
+        let text_events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
+        let li = self.last_input;
+        use crate::controller_config::SwitchButton;
+        let gp_a = li.connected && li.is(SwitchButton::A);
+        let gp_b = li.connected && li.is(SwitchButton::B);
+        let a_edge = kb_enter || (gp_a && !self.hold_pick());
+        let b_edge = kb_esc || (gp_b && !self.hold_pick());
+
+        let ready_nav = now - self.icon_picker.as_ref().unwrap().nav_cd > 0.16;
+        let n = self.icon_picker.as_ref().unwrap().thumbs.len();
+        let dancing = self.icon_picker.as_ref().unwrap().squish_at.is_some();
+        let editing = self.icon_picker.as_ref().unwrap().editing;
+
+        let mut close = false;
+        let mut research = false;
+        if !dancing {
+            let p = self.icon_picker.as_mut().unwrap();
+            if editing {
+                for ev in &text_events {
+                    match ev {
+                        egui::Event::Text(txt) => {
+                            for c in txt.chars() {
+                                if !c.is_control() && p.search.chars().count() < 48 {
+                                    p.search.push(c);
+                                }
+                            }
+                        }
+                        egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                            p.search.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                if kb_enter {
+                    p.editing = false;
+                    p.built = false;
+                    p.selected = 0;
+                    p.scroll = 0.0;
+                    p.full_urls.clear();
+                    p.thumbs.clear();
+                    research = true;
+                } else if kb_esc || b_edge {
+                    p.editing = false;
+                }
+            } else {
+                let mut mv_left = kb_left;
+                let mut mv_right = kb_right;
+                let mut mv_up = kb_up;
+                let mut mv_down = kb_down;
+                if ready_nav && li.connected {
+                    if li.is(SwitchButton::DLeft) || li.lx() < -0.5 {
+                        mv_left = true;
+                        p.nav_cd = now;
+                    } else if li.is(SwitchButton::DRight) || li.lx() > 0.5 {
+                        mv_right = true;
+                        p.nav_cd = now;
+                    } else if li.is(SwitchButton::DUp) || li.ly() > 0.5 {
+                        mv_up = true;
+                        p.nav_cd = now;
+                    } else if li.is(SwitchButton::DDown) || li.ly() < -0.5 {
+                        mv_down = true;
+                        p.nav_cd = now;
+                    }
+                }
+                if mv_left && p.selected > 0 {
+                    p.selected -= 1;
+                    crate::ui_audio::play_move();
+                }
+                if mv_right && n > 0 && p.selected + 1 < n {
+                    p.selected += 1;
+                    crate::ui_audio::play_move();
+                }
+                if mv_down && p.selected + ICON_GRID_COLS < n {
+                    p.selected += ICON_GRID_COLS;
+                    crate::ui_audio::play_move();
+                }
+                if mv_up && p.selected >= ICON_GRID_COLS {
+                    p.selected -= ICON_GRID_COLS;
+                    crate::ui_audio::play_move();
+                } else if kb_up && p.selected < ICON_GRID_COLS {
+                    p.editing = true;
+                }
+                if a_edge && n > 0 && p.thumbs.get(p.selected).map_or(false, |t| t.is_some()) {
+                    p.squish_at = Some(now);
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Whistle);
+                }
+                if b_edge {
+                    close = true;
+                }
+            }
+        }
+        self.set_hold_pick(gp_a || gp_b);
+        if close {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+            self.icon_picker = None;
+            return;
+        }
+        if research {
+            let q = self.icon_picker.as_ref().map(|p| p.search.clone()).unwrap_or_default();
+            let key = self.app_settings.steamgriddb_key.clone();
+            if let Some(p) = self.icon_picker.as_mut() {
+                p.fetch = start_icon_fetch(key, q);
+            }
+        }
+
+        // --- Dance -> start apply ---
+        {
+            let p = self.icon_picker.as_mut().unwrap();
+            p.anim += (1.0 - p.anim) * (dt * 12.0).min(1.0);
+            if let Some(t0) = p.squish_at {
+                if (now - t0) as f32 > 0.34 && p.apply.is_none() {
+                    let url = p.full_urls.get(p.selected).cloned().unwrap_or_default();
+                    let shared = std::sync::Arc::new(std::sync::Mutex::new(IconApply::default()));
+                    let s2 = shared.clone();
+                    std::thread::spawn(move || {
+                        let bytes = crate::steamgrid::curl_bytes(&url);
+                        if let Ok(mut g) = s2.lock() {
+                            g.done = true;
+                            g.bytes = bytes;
+                        }
+                    });
+                    p.apply = Some(shared);
+                }
+            }
+        }
+
+        // --- Draw (snapshot state first to avoid borrow conflicts) ---
+        ctx.request_repaint();
+        let (anim, search, selected, scroll, squish_at, editing, built, thumbs) = {
+            let p = self.icon_picker.as_ref().unwrap();
+            (p.anim, p.search.clone(), p.selected, p.scroll, p.squish_at, p.editing, p.built, p.thumbs.clone())
+        };
+        let err = self
+            .icon_picker
+            .as_ref()
+            .and_then(|p| p.fetch.lock().ok().and_then(|g| g.error.clone()));
+        let ease = { let a = anim.clamp(0.0, 1.0); a * a * (3.0 - 2.0 * a) };
+        let t = ctx.input(|i| i.time) as f32;
+        let screen = ctx.screen_rect();
+        let mut paint = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("icon_picker")));
+        paint.set_opacity(ease);
+        paint.rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(205));
+
+        let pop = 0.92 + 0.08 * ease;
+        let w = (screen.width() * 0.72).clamp(560.0, 1040.0) * pop;
+        let h = (screen.height() * 0.6).clamp(360.0, 560.0) * pop;
+        let box_rect = egui::Rect::from_center_size(screen.center(), Vec2::new(w, h));
+        paint.rect_filled(box_rect.translate(Vec2::new(0.0, 12.0)), Rounding::same(20.0), Color32::from_black_alpha(90));
+        paint.rect_filled(box_rect, Rounding::same(20.0), panel);
+        paint.rect_stroke(box_rect, Rounding::same(20.0), Stroke::new(1.5, border));
+        paint.text(egui::pos2(box_rect.center().x, box_rect.min.y + 34.0), egui::Align2::CENTER_CENTER, "Choose an Icon", FontId::proportional(22.0), text);
+
+        // Search field
+        let field = egui::Rect::from_min_size(egui::pos2(box_rect.min.x + 40.0, box_rect.min.y + 58.0), Vec2::new(w - 80.0, 40.0));
+        let field_resp = ui.allocate_rect(field, egui::Sense::click());
+        paint.rect_filled(field, Rounding::same(10.0), field_bg);
+        paint.rect_stroke(field, Rounding::same(10.0), Stroke::new(if editing { 2.0 } else { 1.0 }, if editing { accent } else { border }));
+        let query_disp = if search.is_empty() { "Type a game name…".to_string() } else { search.clone() };
+        let qcol = if search.is_empty() { muted } else { text };
+        paint.text(egui::pos2(field.min.x + 14.0, field.center().y), egui::Align2::LEFT_CENTER, &query_disp, FontId::proportional(17.0), qcol);
+        if editing && (now * 1.6).fract() < 0.5 {
+            let tw = ui.fonts(|f| f.layout_no_wrap(search.clone(), FontId::proportional(17.0), text).size().x);
+            let cx = (field.min.x + 14.0 + tw).min(field.max.x - 10.0);
+            paint.line_segment([egui::pos2(cx, field.center().y - 11.0), egui::pos2(cx, field.center().y + 11.0)], Stroke::new(2.0, accent));
+        }
+
+        // Content area
+        let content = egui::Rect::from_min_max(egui::pos2(box_rect.min.x + 24.0, field.max.y + 20.0), egui::pos2(box_rect.max.x - 24.0, box_rect.max.y - 54.0));
+        let mut new_selected: Option<usize> = None;
+        let mut dbl_selected: Option<usize> = None;
+        let mut scroll_target = scroll;
+        let mut cell_px = 1.0f32;
+        let mut max_scroll_rows = 0.0f32;
+        let wheel_dy = ctx.input(|i| i.smooth_scroll_delta.y);
+        if !built {
+            paint.text(content.center(), egui::Align2::CENTER_CENTER, "Searching SteamGridDB…", FontId::proportional(18.0), muted);
+        } else if let Some(e) = err {
+            paint.text(content.center() - Vec2::new(0.0, 10.0), egui::Align2::CENTER_CENTER, &e, FontId::proportional(17.0), muted);
+            paint.text(content.center() + Vec2::new(0.0, 22.0), egui::Align2::CENTER_CENTER, "[Up] search a different name  ·  [B] Cancel", FontId::proportional(13.0), muted);
+        } else if thumbs.is_empty() {
+            paint.text(content.center() - Vec2::new(0.0, 10.0), egui::Align2::CENTER_CENTER, "No icons found for this name.", FontId::proportional(17.0), muted);
+            paint.text(content.center() + Vec2::new(0.0, 22.0), egui::Align2::CENTER_CENTER, "[Up] try a different name  ·  [B] Cancel", FontId::proportional(13.0), muted);
+        } else {
+            let cols = ICON_GRID_COLS;
+            let gap = 18.0;
+            let pad_top = 10.0;
+            let tile = (((content.width() - gap * (cols as f32 - 1.0)) / cols as f32).min(118.0)).max(48.0);
+            let cell = tile + gap;
+            let n_items = thumbs.len();
+            let rows = (n_items + cols - 1) / cols;
+            let sel_row = (selected / cols) as f32;
+            let rows_vis = ((content.height() - pad_top) / cell).max(1.0);
+            let max_scroll = (rows as f32 - rows_vis).max(0.0);
+            scroll_target = (sel_row - (rows_vis - 1.0) * 0.5).clamp(0.0, max_scroll);
+            cell_px = cell;
+            max_scroll_rows = max_scroll;
+
+            let grid_w = tile * cols as f32 + gap * (cols as f32 - 1.0);
+            let x0 = content.center().x - grid_w * 0.5;
+            let y0 = content.min.y + pad_top - scroll * cell;
+            let clip = paint.with_clip_rect(content);
+            for (i, thumb) in thumbs.iter().enumerate() {
+                let row = i / cols;
+                let col = i % cols;
+                let cx = x0 + col as f32 * cell + tile * 0.5;
+                let cy = y0 + row as f32 * cell + tile * 0.5;
+                if cy + tile < content.min.y || cy - tile > content.max.y {
+                    continue;
+                }
+                let sel = i == selected;
+                let (mut sx, mut sy) = (1.0f32, 1.0f32);
+                let mut sz = tile;
+                if sel {
+                    if let Some(t0) = squish_at {
+                        let e = (now - t0) as f32;
+                        if e < 0.34 {
+                            let q = (e * 34.0).sin() * 0.16 * (1.0 - e / 0.34);
+                            sx = 1.0 + q;
+                            sy = 1.0 - q;
+                        }
+                    }
+                    sz *= 1.06;
+                }
+                let r = egui::Rect::from_center_size(egui::pos2(cx, cy), Vec2::new(sz * sx, sz * sy));
+                clip.rect_filled(r.translate(Vec2::new(0.0, 4.0)), Rounding::same(14.0), Color32::from_black_alpha(80));
+                if sel {
+                    crate::carousel::draw_gradient_rounded_rect(&clip, r.center(), r.expand(6.0), 18.0, t, 180);
+                    crate::carousel::draw_gradient_rounded_rect(&clip, r.center(), r.expand(3.0), 16.0, t, 255);
+                }
+                clip.rect_filled(r, Rounding::same(14.0), field_bg);
+                if let Some(tex) = thumb {
+                    crate::carousel::draw_rounded_image(&clip, tex.id(), r, 14.0, Color32::WHITE);
+                } else {
+                    clip.text(r.center(), egui::Align2::CENTER_CENTER, "×", FontId::proportional(sz * 0.3), muted);
+                }
+                if content.contains(egui::pos2(cx, cy)) {
+                    let resp = ui.allocate_rect(r, egui::Sense::click());
+                    if resp.double_clicked() {
+                        dbl_selected = Some(i);
+                    } else if resp.clicked() {
+                        new_selected = Some(i);
+                    }
+                }
+            }
+        }
+
+        let hint = if editing {
+            "Type a name  ·  [Enter] Search  ·  [Esc] Done"
+        } else {
+            "[D-Pad] Browse  ·  [A] Choose  ·  Click search to rename  ·  [B] Cancel"
+        };
+        paint.text(egui::pos2(box_rect.center().x, box_rect.max.y - 26.0), egui::Align2::CENTER_CENTER, hint, FontId::proportional(13.0), muted);
+
+        let mut dbl_whistle = false;
+        if let Some(pp) = self.icon_picker.as_mut() {
+            if let Some(s) = new_selected {
+                pp.selected = s;
+            }
+            if let Some(s) = dbl_selected {
+                pp.selected = s;
+                if pp.squish_at.is_none() && pp.thumbs.get(s).map_or(false, |t| t.is_some()) {
+                    pp.squish_at = Some(now);
+                    dbl_whistle = true;
+                }
+            }
+            if wheel_dy.abs() > 0.1 && max_scroll_rows > 0.0 {
+                pp.scroll = (pp.scroll - wheel_dy / cell_px).clamp(0.0, max_scroll_rows);
+            } else {
+                pp.scroll += (scroll_target - pp.scroll) * (dt * 16.0).min(1.0);
+            }
+            if field_resp.clicked() {
+                pp.editing = true;
+            }
+        }
+        if dbl_whistle {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Whistle);
+        }
+    }
+
+    fn hold_pick(&self) -> bool {
+        self.icon_picker.as_ref().map_or(false, |p| p.hold)
+    }
+    fn set_hold_pick(&mut self, v: bool) {
+        if let Some(p) = self.icon_picker.as_mut() {
+            p.hold = v;
+        }
+    }
+
+    fn resolve_confirm(&mut self, confirmed: bool) {
+        let Some(dlg) = self.confirm.take() else { return };
+        if !confirmed {
+            return;
+        }
+        match dlg.kind {
+            ConfirmKind::CloseGame => {
+                self.stop_emulation();
+                self.teardown_at = Some(std::time::Instant::now());
+                self.pending_boot = None;
+            }
+            ConfirmKind::LaunchGame(path) => {
+                self.stop_emulation();
+                self.teardown_at = Some(std::time::Instant::now());
+                self.pending_boot = Some(path);
+            }
+            ConfirmKind::QuickLaunch(path) => {
+                if let Some(idx) = self.library.index_of_path(&std::path::PathBuf::from(&path)) {
+                    let n = self.library.move_to_front(idx);
+                    self.carousel.selected = n;
+                    self.carousel.scroll_offset = n as f32;
+                }
+                self.show_profile = false;
+                if self.app_settings.view_mode != crate::app_settings::ViewMode::Carousel {
+                    self.app_settings.view_mode = crate::app_settings::ViewMode::Carousel;
+                    let _ = self.app_settings.save();
+                }
+                self.pending_quick = Some(path);
+            }
+        }
+    }
+
+    fn quick_launch_tick(&mut self, ctx: &egui::Context) {
+        if self.pending_quick.is_none() {
+            return;
+        }
+        if self.show_profile || self.profile_anim > 0.02 {
+            ctx.request_repaint();
+            return;
+        }
+        let path = self.pending_quick.take().unwrap();
+        let running = self
+            .emulation_handle
+            .as_ref()
+            .map_or(false, |h| h.is_running());
+        if running || crate::boot::emu_alive() {
+            self.stop_emulation();
+            self.teardown_at = Some(std::time::Instant::now());
+            self.pending_boot = Some(path);
+        } else {
+            let now = ctx.input(|i| i.time) as f32;
+            self.carousel.boot_stage = crate::carousel::BootStage::Transitioning {
+                game_index: self.carousel.selected,
+                start_time: now,
+                launch_path: path,
+            };
+        }
+    }
+
+    fn handle_modal_input(&mut self, ctx: &egui::Context) {
+        if self.confirm.is_none() {
+            self.modal_hold = false;
+            return;
+        }
+        use crate::controller_config::SwitchButton;
+        let now = ctx.input(|i| i.time);
+        let (kb_left, kb_right, kb_enter, kb_esc) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        let li = self.last_input;
+        let ready = now - self.modal_cd > 0.18;
+        let mut mv = if kb_left { -1 } else if kb_right { 1 } else { 0 };
+        if ready && li.connected {
+            let lx = li.lx();
+            if li.is(SwitchButton::DLeft) || lx < -0.5 {
+                mv = -1;
+                self.modal_cd = now;
+            } else if li.is(SwitchButton::DRight) || lx > 0.5 {
+                mv = 1;
+                self.modal_cd = now;
+            }
+        }
+        if mv != 0 {
+            if let Some(c) = self.confirm.as_mut() {
+                let ns = if mv < 0 { 0 } else { 1 };
+                if ns != c.selected {
+                    c.selected = ns;
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Move);
+                }
+            }
+        }
+        let gp_a = li.connected && li.is(SwitchButton::A);
+        let gp_b = li.connected && li.is(SwitchButton::B);
+        let a_edge = kb_enter || (gp_a && !self.modal_hold);
+        let b_edge = kb_esc || (gp_b && !self.modal_hold);
+        self.modal_hold = gp_a || gp_b;
+        if b_edge {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+            self.confirm = None;
+            self.carousel.boot_stage = crate::carousel::BootStage::None;
+        } else if a_edge {
+            let confirmed = self.confirm.as_ref().map_or(false, |c| c.selected == 1);
+            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            self.resolve_confirm(confirmed);
+        }
+    }
+
+    fn teardown_tick(&mut self, ctx: &egui::Context) {
+        if let Some(start) = self.teardown_at {
+            ctx.request_repaint();
+            let elapsed = start.elapsed().as_secs_f32();
+            let dead = !crate::boot::emu_alive();
+            if elapsed >= 8.0 && !dead {
+                self.teardown_at = None;
+                self.pending_boot = None;
+            } else if elapsed >= 0.5 && dead {
+                self.teardown_at = None;
+                if let Some(path) = self.pending_boot.take() {
+                    let now = ctx.input(|i| i.time) as f32;
+                    self.carousel.boot_stage = crate::carousel::BootStage::Transitioning {
+                        game_index: self.carousel.selected,
+                        start_time: now,
+                        launch_path: path,
+                    };
+                }
+            }
+        }
+    }
+
+    fn draw_modal(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        let active = self.modal_active();
+        let target = if active { 1.0 } else { 0.0 };
+        let speed = if target > self.modal_anim { 12.0 } else { 10.0 };
+        self.modal_anim += (target - self.modal_anim) * (dt * speed).min(1.0);
+        if (self.modal_anim - target).abs() < 0.003 {
+            self.modal_anim = target;
+        }
+
+        if active {
+            let snap = if self.teardown_at.is_some() {
+                ModalSnap { teardown: true, title: String::new(), body: String::new(), label: String::new() }
+            } else if let Some(c) = &self.confirm {
+                ModalSnap { teardown: false, title: c.title.clone(), body: c.body.clone(), label: c.confirm_label.clone() }
+            } else {
+                return;
+            };
+            self.modal_snap = Some(snap);
+        }
+        if self.modal_anim <= 0.004 {
+            if !active {
+                self.modal_snap = None;
+            }
+            return;
+        }
+        let Some(snap) = self.modal_snap.as_ref() else {
+            return;
+        };
+        let (is_teardown, title, body, label) = (snap.teardown, snap.title.clone(), snap.body.clone(), snap.label.clone());
+
+        let a = self.modal_anim.clamp(0.0, 1.0);
+        let ease = a * a * (3.0 - 2.0 * a);
+
+        let light = self.app_settings.light_mode;
+        let panel = if light { Color32::from_rgb(0xF5, 0xF5, 0xF9) } else { Color32::from_rgb(0x18, 0x18, 0x22) };
+        let text = if light { Color32::from_rgb(0x1E, 0x1E, 0x28) } else { Color32::from_rgb(0xEC, 0xEC, 0xF0) };
+        let muted = if light { Color32::from_rgb(0x60, 0x60, 0x6A) } else { Color32::from_rgb(0x9A, 0x9A, 0xA6) };
+        let border = if light { Color32::from_rgb(0xC6, 0xC6, 0xD0) } else { Color32::from_rgb(0x32, 0x32, 0x3E) };
+        let btn_fill = if light { Color32::from_rgb(0xEA, 0xEA, 0xF0) } else { Color32::from_rgb(0x24, 0x24, 0x2E) };
+        let accent = match self.app_settings.carousel_theme.color() {
+            Some((r, g, b)) => Color32::from_rgb(r, g, b),
+            None => self.carousel.ambient_color,
+        };
+
+        let screen = ctx.screen_rect();
+        let mut p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("modal_overlay")));
+        p.set_opacity(ease);
+        p.rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(195));
+
+        let pop = 0.90 + 0.10 * ease;
+        let body_font = FontId::proportional(19.0);
+        let body_w = ui.fonts(|f| f.layout_no_wrap(body.clone(), body_font, text).size().x);
+        let base_w = (body_w + 72.0).clamp(380.0, (screen.width() - 60.0).max(400.0));
+        let w = base_w * pop;
+        let h = 224.0 * pop;
+        let box_rect = egui::Rect::from_center_size(screen.center(), Vec2::new(w, h));
+        p.rect_filled(box_rect.translate(Vec2::new(0.0, 10.0)), Rounding::same(18.0), Color32::from_black_alpha(90));
+        p.rect_filled(box_rect, Rounding::same(18.0), panel);
+        p.rect_stroke(box_rect, Rounding::same(18.0), Stroke::new(1.5, border));
+
+        if is_teardown {
+            p.text(box_rect.center() - Vec2::new(0.0, 14.0 * pop), egui::Align2::CENTER_CENTER, "Please Wait…", FontId::proportional(25.0 * pop), text);
+            p.text(box_rect.center() + Vec2::new(0.0, 24.0 * pop), egui::Align2::CENTER_CENTER, "Shutting down the current game", FontId::proportional(14.0 * pop), muted);
+            ctx.request_repaint();
+            return;
+        }
+
+        p.text(egui::pos2(box_rect.center().x, box_rect.min.y + 40.0 * pop), egui::Align2::CENTER_CENTER, &title, FontId::proportional(15.0 * pop), muted);
+        p.text(egui::pos2(box_rect.center().x, box_rect.center().y - 14.0 * pop), egui::Align2::CENTER_CENTER, &body, FontId::proportional(19.0 * pop), text);
+
+        let btn_w = w * 0.42;
+        let btn_h = 46.0 * pop;
+        let by = box_rect.max.y - btn_h - 18.0 * pop;
+        let gap = w * 0.05;
+        let cancel_rect = egui::Rect::from_min_size(egui::pos2(box_rect.center().x - gap * 0.5 - btn_w, by), Vec2::new(btn_w, btn_h));
+        let ok_rect = egui::Rect::from_min_size(egui::pos2(box_rect.center().x + gap * 0.5, by), Vec2::new(btn_w, btn_h));
+
+        let selected = self.confirm.as_ref().map_or(0, |c| c.selected);
+        let draw_btn = |rect: egui::Rect, label: &str, sel: bool| {
+            let rounding = Rounding::same(10.0);
+            p.rect_filled(rect, rounding, btn_fill);
+            if sel {
+                p.rect_stroke(rect, rounding, Stroke::new(2.6, accent));
+            } else {
+                p.rect_stroke(rect, rounding, Stroke::new(1.2, border));
+            }
+            let col = if sel {
+                let f = |x: u8| (x as f32 + (255.0 - x as f32) * 0.2) as u8;
+                Color32::from_rgb(f(accent.r()), f(accent.g()), f(accent.b()))
+            } else {
+                text
+            };
+            p.text(rect.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(18.0 * pop), col);
+        };
+        draw_btn(cancel_rect, "Cancel", selected == 0);
+        draw_btn(ok_rect, &label, selected == 1);
+
+        if self.confirm.is_some() {
+            let cancel_resp = ui.allocate_rect(cancel_rect, egui::Sense::click());
+            let ok_resp = ui.allocate_rect(ok_rect, egui::Sense::click());
+            if let Some(c) = self.confirm.as_mut() {
+                if cancel_resp.hovered() {
+                    c.selected = 0;
+                }
+                if ok_resp.hovered() {
+                    c.selected = 1;
+                }
+            }
+            if cancel_resp.clicked() {
+                crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+                self.confirm = None;
+                self.carousel.boot_stage = crate::carousel::BootStage::None;
+            } else if ok_resp.clicked() {
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                self.resolve_confirm(true);
+            }
+        }
+        ctx.request_repaint();
+    }
+
     fn game_display(&self) -> Option<(egui::TextureId, Vec2)> {
         if let Some(t) = &self.game_texture_native {
             Some((t.id, Vec2::new(t.width as f32, t.height as f32)))
@@ -534,24 +1336,115 @@ impl HorizonApp {
         }
         let backend = self.app_settings.cpu_backend.to_cpu_kind();
         log::info!("Boot: NRO={} CPU={}", self.nro_path, backend.label());
+        if let Some(mut old) = self.emulation_handle.take() {
+            old.stop();
+        }
+        self.stop_fade = None;
+        self.stop_anim = None;
+        self.resume_anim = None;
         match EmulationHandle::new(&self.nro_path, backend, Some(ctx.clone())) {
             Ok(h) => {
+                crate::ui_audio::play(crate::ui_audio::Sfx::GameBoot);
                 self.emulation_handle = Some(h);
                 self.game_texture = None;
                 self.free_native_texture();
                 self.frame_backlog.clear();
+                self.pause_anim = None;
+                self.pill_fade = None;
+                let path = std::path::PathBuf::from(&self.nro_path);
+                if let Some(idx) = self.library.index_of_path(&path) {
+                    let n = self.library.move_to_front(idx);
+                    self.carousel.selected = n;
+                    self.carousel.scroll_offset = n as f32;
+                }
+                self.playing_path = Some(path);
             }
             Err(e) => log::error!("Boot: {}", e),
         }
     }
 
     fn stop_emulation(&mut self) {
+        self.play_times.save_if_dirty();
+        self.carousel.boot_stage = crate::carousel::BootStage::None;
+        let was_paused = self
+            .emulation_handle
+            .as_ref()
+            .map_or(false, |h| h.is_paused());
+        let carousel = self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel;
         if let Some(mut h) = self.emulation_handle.take() {
             h.stop();
             self.frame_backlog.clear();
-            if self.game_texture.is_some() || self.game_texture_native.is_some() {
+            self.pause_anim = None;
+            self.resume_anim = None;
+            let has_frame = self.game_texture.is_some() || self.game_texture_native.is_some();
+            if carousel && self.playing_path.is_some() {
+                if !was_paused && has_frame {
+                    self.stop_anim = Some(std::time::Instant::now());
+                } else {
+                    self.pill_fade = Some(std::time::Instant::now());
+                    self.game_texture = None;
+                }
+            } else if has_frame {
                 self.stop_fade = Some(std::time::Instant::now());
+                self.playing_path = None;
+            } else {
+                self.playing_path = None;
             }
+        } else {
+            self.playing_path = None;
+        }
+    }
+
+    fn reload_profile_texture(&mut self, ctx: &egui::Context) {
+        static DEFAULT_AVATAR: &[u8] = include_bytes!("../../branding/png/logo-256.png");
+        self.profile_texture = None;
+
+        let bytes: std::borrow::Cow<[u8]> = match self.app_settings.profile_avatar.clone() {
+            Some(path) => match std::fs::read(&path) {
+                Ok(b) => std::borrow::Cow::Owned(b),
+                Err(_) => {
+                    log::warn!("profile avatar unreadable: {}", path.display());
+                    std::borrow::Cow::Borrowed(DEFAULT_AVATAR)
+                }
+            },
+            None => std::borrow::Cow::Borrowed(DEFAULT_AVATAR),
+        };
+
+        let img = match image::load_from_memory(&bytes)
+            .or_else(|_| image::load_from_memory(DEFAULT_AVATAR))
+        {
+            Ok(i) => i,
+            Err(_) => return,
+        };
+
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let side = w.min(h);
+        let ox = (w - side) / 2;
+        let oy = (h - side) / 2;
+        let cropped = image::imageops::crop_imm(&rgba, ox, oy, side, side).to_image();
+        // Downscale large avatars (huge textures blow past GPU limits / egui rejects them).
+        let cropped = if side > 256 {
+            image::imageops::resize(&cropped, 256, 256, image::imageops::FilterType::Lanczos3)
+        } else {
+            cropped
+        };
+        let (fw, fh) = cropped.dimensions();
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [fw as usize, fh as usize],
+            cropped.as_raw(),
+        );
+        self.profile_texture = Some(ctx.load_texture("profile_avatar", color, egui::TextureOptions::LINEAR));
+    }
+
+    fn pick_profile_avatar(&mut self) {
+        if let Some(p) = rfd::FileDialog::new()
+            .add_filter("Images", &["png", "jpg", "jpeg"])
+            .pick_file()
+        {
+            self.app_settings.profile_avatar = Some(p);
+            let _ = self.app_settings.save();
+            self.profile_reload = true;
         }
     }
 
@@ -619,6 +1512,22 @@ fn draw_dissolve(p: &egui::Painter, rect: egui::Rect, tex_id: egui::TextureId, t
         }
     }
     p.add(egui::Shape::mesh(mesh));
+}
+
+fn draw_zoom_fade_out(p: &egui::Painter, rect: egui::Rect, tex_id: egui::TextureId, t: f32) {
+    let t = t.clamp(0.0, 1.0);
+    let scale = 1.0 - 0.08 * t;
+    let alpha = 1.0 - t;
+    let draw_rect = egui::Rect::from_center_size(rect.center(), rect.size() * scale);
+    p.image(tex_id, draw_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
+}
+
+fn draw_zoom_fade_in(p: &egui::Painter, rect: egui::Rect, tex_id: egui::TextureId, t: f32) {
+    let t = t.clamp(0.0, 1.0);
+    let scale = 1.06 - 0.06 * t;
+    let alpha = t;
+    let draw_rect = egui::Rect::from_center_size(rect.center(), rect.size() * scale);
+    p.image(tex_id, draw_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
 }
 
 fn cell_hash(i: usize, j: usize) -> f32 {
@@ -859,6 +1768,17 @@ impl eframe::App for HorizonApp {
 
         self.library.poll();
 
+        if let Some((_, tm, _)) = &self.icon_reveal {
+            if tm.elapsed().as_secs_f32() > 1.0 {
+                self.icon_reveal = None;
+            }
+        }
+
+        if self.profile_reload {
+            self.profile_reload = false;
+            self.reload_profile_texture(ctx);
+        }
+
         if let Some(ref mut ib) = self.input {
             self.last_input = ib.poll(&self.controller_config);
             if self.last_input.connected {
@@ -869,6 +1789,111 @@ impl eframe::App for HorizonApp {
                     self.controller_config.set_pad(btn, gp);
                     let _ = self.controller_config.save();
                     self.rebinding_pad = None;
+                }
+            }
+        }
+
+        {
+            use crate::controller_config::SwitchButton;
+            let a_down = ctx.input(|i| i.key_down(egui::Key::Enter))
+                || (self.last_input.connected && self.last_input.is(SwitchButton::A));
+            let x_down = ctx.input(|i| i.key_down(egui::Key::X))
+                || (self.last_input.connected && self.last_input.is(SwitchButton::X));
+            let b_down = self.last_input.connected && self.last_input.is(SwitchButton::B);
+            self.carousel.a_edge = a_down && !self.carousel.a_held;
+            self.carousel.x_edge = x_down && !self.carousel.x_held;
+            self.carousel.b_edge = b_down && !self.carousel.b_held;
+            self.carousel.a_held = a_down;
+            self.carousel.x_held = x_down;
+            self.carousel.b_held = b_down;
+        }
+
+        self.modal_active_frame_start = self.modal_active();
+        self.handle_modal_input(ctx);
+        self.teardown_tick(ctx);
+        self.quick_launch_tick(ctx);
+
+        {
+            let (m_run, m_pause) = self
+                .emulation_handle
+                .as_ref()
+                .map_or((false, false), |h| (h.is_running(), h.is_paused()));
+            let carousel_view =
+                self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel;
+            let playing_fs = m_run && !m_pause;
+            let base_on = carousel_view && !playing_fs && !self.splash.active();
+            let mut target = if base_on { self.app_settings.music_volume } else { 0.0 };
+            let mut lowpass = 0.0f32;
+            let profiling = self.show_profile || self.profile_anim > 0.01;
+            let on_music_slider = profiling
+                && self.profile.tab == crate::profile::ProfileTab::Settings
+                && self.profile.focus_content
+                && self.profile.row_selected == 2;
+            if profiling && !on_music_slider {
+                target *= 0.62;
+                lowpass = 0.62;
+            }
+            if self.modal_active() {
+                lowpass = lowpass.max(0.6);
+            }
+            crate::ui_audio::set_music(target, lowpass);
+
+            let booting_now = m_run
+                && !m_pause
+                && carousel_view
+                && self.game_display().is_none()
+                && !self.splash.active();
+            if booting_now {
+                crate::ui_audio::play_looped(crate::ui_audio::Sfx::AwaitFrame);
+            } else {
+                crate::ui_audio::stop_loop(crate::ui_audio::Sfx::AwaitFrame);
+            }
+            if self.teardown_at.is_some() {
+                crate::ui_audio::play_looped(crate::ui_audio::Sfx::PleaseWait);
+            } else {
+                crate::ui_audio::stop_loop(crate::ui_audio::Sfx::PleaseWait);
+            }
+        }
+
+        {
+            let kb_home = ctx.input(|i| i.key_pressed(egui::Key::Home));
+            let gp_home = self.last_input.home;
+            let home_edge = kb_home || (gp_home && !self.last_home);
+            self.last_home = gp_home;
+
+            let (running, paused) = self
+                .emulation_handle
+                .as_ref()
+                .map_or((false, false), |h| (h.is_running(), h.is_paused()));
+
+            if home_edge && running && !self.modal_active() && self.rebinding.is_none() && self.rebinding_pad.is_none() {
+                if paused {
+                    if let Some(h) = self.emulation_handle.as_ref() {
+                        h.resume();
+                    }
+                    self.pause_anim = None;
+                    self.resume_anim = Some(std::time::Instant::now());
+                } else if self.game_display().is_some() {
+                    if let Some(h) = self.emulation_handle.as_ref() {
+                        h.pause();
+                    }
+                    if self.app_settings.view_mode != crate::app_settings::ViewMode::Carousel {
+                        self.app_settings.view_mode = crate::app_settings::ViewMode::Carousel;
+                        let _ = self.app_settings.save();
+                    }
+                    if let Some(pp) = self.playing_path.clone() {
+                        if let Some(idx) = self.library.index_of_path(&pp) {
+                            let n = self.library.move_to_front(idx);
+                            self.carousel.selected = n;
+                            self.carousel.scroll_offset = n as f32;
+                        }
+                    }
+                    self.carousel.active_dock = false;
+                    self.pause_anim = Some(std::time::Instant::now());
+                } else {
+                    self.stop_emulation();
+                    self.teardown_at = Some(std::time::Instant::now());
+                    self.pending_boot = None;
                 }
             }
         }
@@ -1035,228 +2060,726 @@ impl eframe::App for HorizonApp {
             .map_or(false, |h| !h.is_running())
         {
             self.emulation_handle = None;
+            self.pause_anim = None;
+            if self.stop_anim.is_none() && self.pill_fade.is_none() {
+                self.playing_path = None;
+            }
         }
 
         let fps = self.performance.get_fps();
         let running = self.is_running();
+        let paused = self
+            .emulation_handle
+            .as_ref()
+            .map_or(false, |h| h.is_paused());
 
-        egui::TopBottomPanel::top("topbar")
-            .exact_height(36.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
-                    .stroke(Stroke::new(1.0, BORDER)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.add_space(12.0);
+        if running && !paused {
+            let dt = ctx.input(|i| i.stable_dt).min(0.5) as f64;
+            if let Some(p) = self.playing_path.clone() {
+                self.play_times.add(&p, dt);
+            }
+        }
+        if self.last_playtime_save.elapsed() >= std::time::Duration::from_secs(20) {
+            self.play_times.save_if_dirty();
+            self.last_playtime_save = std::time::Instant::now();
+        }
 
-                    ui.label(
-                        egui::RichText::new("NeXium")
-                            .size(13.5)
-                            .strong()
-                            .color(TEXT),
-                    );
+        let playing_alpha = if let Some(start) = self.pill_fade {
+            let f = start.elapsed().as_secs_f32() / 0.40;
+            if f >= 1.0 {
+                self.pill_fade = None;
+                self.playing_path = None;
+                0.0
+            } else {
+                1.0 - f * f
+            }
+        } else {
+            1.0
+        };
+        let playing_index = self
+            .playing_path
+            .as_ref()
+            .and_then(|p| self.library.index_of_path(p));
 
-                    ui.add_space(8.0);
-                    ui.painter().vline(
-                        ui.cursor().left(),
-                        ui.max_rect().y_range(),
-                        Stroke::new(1.0, BORDER),
-                    );
-                    ui.add_space(8.0);
+        {
+            let ptarget = if self.show_profile { 1.0 } else { 0.0 };
+            let pdt = ctx.input(|i| i.stable_dt).min(0.1);
+            let speed = 3.6;
+            if self.profile_anim < ptarget {
+                self.profile_anim = (self.profile_anim + pdt * speed).min(ptarget);
+            } else if self.profile_anim > ptarget {
+                self.profile_anim = (self.profile_anim - pdt * speed).max(ptarget);
+            }
+        }
+        let profile_showing = self.show_profile || self.profile_anim > 0.0;
 
-                    ui.menu_button(egui::RichText::new("File").size(13.0).color(TEXT), |ui| {
-                        if ui.button("Open game…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("Switch games", &["nro", "dxci", "dnsp"])
-                                .pick_file()
+        let carousel_mode = self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel
+            && (!running
+                || self.game_display().is_none()
+                || paused
+                || self.stop_anim.is_some()
+                || self.pill_fade.is_some()
+                || self.resume_anim.is_some());
+
+        let show_chrome =
+            self.app_settings.view_mode != crate::app_settings::ViewMode::Carousel;
+
+        if show_chrome {
+            egui::TopBottomPanel::top("topbar")
+                .exact_height(36.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
+                        .stroke(Stroke::new(1.0, BORDER)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.add_space(12.0);
+
+                        ui.label(
+                            egui::RichText::new("NeXium")
+                                .size(13.5)
+                                .strong()
+                                .color(TEXT),
+                        );
+
+                        ui.add_space(8.0);
+                        ui.painter().vline(
+                            ui.cursor().left(),
+                            ui.max_rect().y_range(),
+                            Stroke::new(1.0, BORDER),
+                        );
+                        ui.add_space(8.0);
+
+                        ui.menu_button(egui::RichText::new("File").size(13.0).color(TEXT), |ui| {
+                            if ui.button("Open game…").clicked() {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("Switch games", &["nro", "dxci", "dnsp"])
+                                    .pick_file()
+                                {
+                                    self.nro_path = p.to_string_lossy().to_string();
+                                }
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Exit").clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                        ui.menu_button(
+                            egui::RichText::new("Emulation").size(13.0).color(TEXT),
+                            |ui| {
+                                ui.set_min_width(110.0);
+                                if running {
+                                    let label = if paused { "Resume" } else { "Pause" };
+                                    if ui.button(label).clicked() {
+                                        if let Some(h) = self.emulation_handle.as_ref() {
+                                            if paused {
+                                                h.resume();
+                                            } else {
+                                                h.pause();
+                                            }
+                                        }
+                                        self.pause_anim = None;
+                                        self.resume_anim = None;
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
+                                }
+                                if ui.button("Boot").clicked() {
+                                    self.boot_nro(ctx);
+                                    ui.close_menu();
+                                }
+                                if ui.button("Stop").clicked() {
+                                    self.stop_emulation();
+                                    ui.close_menu();
+                                }
+                            },
+                        );
+                        ui.menu_button(egui::RichText::new("Debug").size(13.0).color(TEXT), |ui| {
+                            if ui.button("Memory").clicked() {
+                                self.debugger.toggle_memory();
+                                ui.close_menu();
+                            }
+                            if ui.button("Registers").clicked() {
+                                self.debugger.toggle_registers();
+                                ui.close_menu();
+                            }
+                            if ui.button("Disassembler").clicked() {
+                                self.debugger.toggle_disasm();
+                                ui.close_menu();
+                            }
+                            if ui.button("Logs").clicked() {
+                                self.debugger.toggle_logs();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            let mut dumps_on = nexium_common::dumps::enabled();
+                            if ui.checkbox(&mut dumps_on, "Frame dumps (.bmp)").changed() {
+                                nexium_common::dumps::set_enabled(dumps_on);
+                            }
+                        });
+                        ui.menu_button(
+                            egui::RichText::new("Settings").size(13.0).color(TEXT),
+                            |ui| {
+                                if ui.button("Preferences").clicked() {
+                                    self.show_settings = !self.show_settings;
+                                    ui.close_menu();
+                                }
+                            },
+                        );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            let (fps_col, fps_str) = if fps >= 55.0 {
+                                (GREEN, format!("{:.0} fps", fps))
+                            } else if fps >= 28.0 {
+                                (AMBER, format!("{:.0} fps", fps))
+                            } else {
+                                (DANGER, format!("{:.0} fps", fps))
+                            };
+                            ui.label(
+                                egui::RichText::new(fps_str)
+                                    .size(12.0)
+                                    .color(fps_col)
+                                    .monospace(),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                            ui.add_space(6.0);
+                            let paused = false;
+                            let (run_icon, status, status_col) = if paused {
+                                (StatusIcon::Pause, "Paused", AMBER)
+                            } else if running {
+                                (StatusIcon::Play, "Running", GREEN)
+                            } else {
+                                (StatusIcon::Stop, "Idle", MUTED)
+                            };
+                            ui.label(
+                                egui::RichText::new(status)
+                                    .size(12.0)
+                                    .color(status_col),
+                            );
+                            ui.add_space(2.0);
+                            status_icon(ui, run_icon, status_col);
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                            ui.add_space(6.0);
+                            let docked = nexium_core::hid_state::is_docked();
+                            let (mode_icon, mode_txt, mode_col) = if docked {
+                                (StatusIcon::Dock, "Docked", GREEN)
+                            } else {
+                                (StatusIcon::Handheld, "Handheld", AMBER)
+                            };
+                            let label_resp = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(mode_txt).size(12.0).color(mode_col),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            ui.add_space(2.0);
+                            let icon_resp = status_icon(ui, mode_icon, mode_col);
+                            let mode_resp = label_resp.union(icon_resp);
+                            if mode_resp.hovered() {
+                                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if mode_resp
+                                .on_hover_text("Toggle Docked / Handheld (Pro Controller vs Handheld)")
+                                .clicked()
                             {
-                                self.nro_path = p.to_string_lossy().to_string();
+                                nexium_core::hid_state::set_docked(!docked);
                             }
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Exit").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                            ui.add_space(6.0);
+                            if pill_button(ui, "⊞ Carousel", false).clicked() {
+                                self.app_settings.view_mode = crate::app_settings::ViewMode::Carousel;
+                                let _ = self.app_settings.save();
+                            }
+                        });
                     });
-                    ui.menu_button(
-                        egui::RichText::new("Emulation").size(13.0).color(TEXT),
-                        |ui| {
-                            if ui.button("Boot").clicked() {
-                                self.boot_nro(ctx);
-                                ui.close_menu();
-                            }
-                            if ui.button("Stop").clicked() {
-                                self.stop_emulation();
-                                ui.close_menu();
-                            }
-                        },
-                    );
-                    ui.menu_button(egui::RichText::new("Debug").size(13.0).color(TEXT), |ui| {
-                        if ui.button("Memory").clicked() {
-                            self.debugger.toggle_memory();
-                            ui.close_menu();
-                        }
-                        if ui.button("Registers").clicked() {
-                            self.debugger.toggle_registers();
-                            ui.close_menu();
-                        }
-                        if ui.button("Disassembler").clicked() {
-                            self.debugger.toggle_disasm();
-                            ui.close_menu();
-                        }
-                        if ui.button("Logs").clicked() {
-                            self.debugger.toggle_logs();
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        let mut dumps_on = nexium_common::dumps::enabled();
-                        if ui.checkbox(&mut dumps_on, "Frame dumps (.bmp)").changed() {
-                            nexium_common::dumps::set_enabled(dumps_on);
-                        }
-                    });
-                    ui.menu_button(
-                        egui::RichText::new("Settings").size(13.0).color(TEXT),
-                        |ui| {
-                            if ui.button("Preferences").clicked() {
-                                self.show_settings = !self.show_settings;
-                                ui.close_menu();
-                            }
-                        },
-                    );
+                });
+        }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if show_chrome {
+            egui::TopBottomPanel::bottom("statusbar")
+                .exact_height(22.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
+                        .stroke(Stroke::new(1.0, BORDER)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal_centered(|ui| {
                         ui.add_space(12.0);
-                        let (fps_col, fps_str) = if fps >= 55.0 {
-                            (GREEN, format!("{:.0} fps", fps))
-                        } else if fps >= 28.0 {
-                            (AMBER, format!("{:.0} fps", fps))
-                        } else {
-                            (DANGER, format!("{:.0} fps", fps))
-                        };
-                        ui.label(
-                            egui::RichText::new(fps_str)
-                                .size(12.0)
-                                .color(fps_col)
+                        let name = std::path::Path::new(&self.nro_path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "No file".into());
+                        ui.label(egui::RichText::new(name).size(11.0).color(MUTED));
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            let stats = self
+                                .emulation_handle
+                                .as_ref()
+                                .map(|h| h.stats.lock().clone())
+                                .unwrap_or_default();
+                            let building = nexium_common::shader_progress::in_flight();
+                            let building_prefix = if building > 0 {
+                                format!("Building Shader(s): {}  ·  ", building)
+                            } else if nexium_common::shader_progress::recently_active() {
+                                format!(
+                                    "Built {} Shader(s)  ·  ",
+                                    nexium_common::shader_progress::burst_built()
+                                )
+                            } else {
+                                String::new()
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
+                                    building_prefix,
+                                    self.performance.get_frame_time(),
+                                    stats.svc_count,
+                                    stats.cycle_count,
+                                ))
+                                .size(11.0)
+                                .color(MUTED)
                                 .monospace(),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
-                        ui.add_space(6.0);
-                        let paused = false;
-                        let (run_icon, status, status_col) = if paused {
-                            (StatusIcon::Pause, "Paused", AMBER)
-                        } else if running {
-                            (StatusIcon::Play, "Running", GREEN)
-                        } else {
-                            (StatusIcon::Stop, "Idle", MUTED)
-                        };
-                        ui.label(
-                            egui::RichText::new(status)
-                                .size(12.0)
-                                .color(status_col),
-                        );
-                        ui.add_space(2.0);
-                        status_icon(ui, run_icon, status_col);
-
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
-                        ui.add_space(6.0);
-                        let docked = nexium_core::hid_state::is_docked();
-                        let (mode_icon, mode_txt, mode_col) = if docked {
-                            (StatusIcon::Dock, "Docked", GREEN)
-                        } else {
-                            (StatusIcon::Handheld, "Handheld", AMBER)
-                        };
-                        let label_resp = ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(mode_txt).size(12.0).color(mode_col),
-                            )
-                            .sense(egui::Sense::click()),
-                        );
-                        ui.add_space(2.0);
-                        let icon_resp = status_icon(ui, mode_icon, mode_col);
-                        let mode_resp = label_resp.union(icon_resp);
-                        if mode_resp.hovered() {
-                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        if mode_resp
-                            .on_hover_text("Toggle Docked / Handheld (Pro Controller vs Handheld)")
-                            .clicked()
-                        {
-                            nexium_core::hid_state::set_docked(!docked);
-                        }
+                            );
+                        });
                     });
                 });
-            });
-
-        egui::TopBottomPanel::bottom("statusbar")
-            .exact_height(22.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
-                    .stroke(Stroke::new(1.0, BORDER)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.add_space(12.0);
-                    let name = std::path::Path::new(&self.nro_path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "No file".into());
-                    ui.label(egui::RichText::new(name).size(11.0).color(MUTED));
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(12.0);
-                        let stats = self
-                            .emulation_handle
-                            .as_ref()
-                            .map(|h| h.stats.lock().clone())
-                            .unwrap_or_default();
-                        let building = nexium_common::shader_progress::in_flight();
-                        let building_prefix = if building > 0 {
-                            format!("Building Shader(s): {}  ·  ", building)
-                        } else if nexium_common::shader_progress::recently_active() {
-                            format!(
-                                "Built {} Shader(s)  ·  ",
-                                nexium_common::shader_progress::burst_built()
-                            )
-                        } else {
-                            String::new()
-                        };
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{}Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
-                                building_prefix,
-                                self.performance.get_frame_time(),
-                                stats.svc_count,
-                                stats.cycle_count,
-                            ))
-                            .size(11.0)
-                            .color(MUTED)
-                            .monospace(),
-                        );
-                    });
-                });
-            });
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(BG))
             .show(ctx, |ui| {
-                if let Some(start) = self.stop_fade {
+                let full_rect = ui.max_rect();
+                if profile_showing {
+                    let avatar_tex = self.profile_texture.as_ref().map(|t| t.id());
+                    let ambient = self.carousel.ambient_color;
+                    let accent = match self.app_settings.carousel_theme.color() {
+                        Some((r, g, b)) => Color32::from_rgb(r, g, b),
+                        None => self.carousel.ambient_color,
+                    };
+
+                    let smooth = |x: f32| {
+                        let x = x.clamp(0.0, 1.0);
+                        x * x * (3.0 - 2.0 * x)
+                    };
+                    let p = self.profile_anim.clamp(0.0, 1.0);
+                    let backdrop_split = 0.4;
+                    let backdrop_opacity = smooth(p / backdrop_split);
+                    let content_opacity = smooth((p - backdrop_split) / (1.0 - backdrop_split));
+
+                    let profile_tex = self.profile_texture.as_ref().map(|t| t.id());
+                    let carousel_scale = 1.0;
+                    let carousel_alpha = 1.0;
+                    let _ = crate::carousel::carousel_view(
+                        &mut self.carousel,
+                        &mut self.library,
+                        ctx,
+                        ui,
+                        &self.last_input,
+                        &mut self.input,
+                        running,
+                        playing_index,
+                        playing_alpha,
+                        self.app_settings.carousel_theme,
+                        profile_tex,
+                        &self.app_settings.profile_name,
+                        false,
+                        carousel_scale,
+                        carousel_alpha,
+                        self.app_settings.backdrop_theme,
+                        self.app_settings.light_mode,
+                        &self.app_settings.favorites,
+                        self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
+                    );
+
+                    let profile_scale = 0.92 + 0.08 * content_opacity;
+                    let profile_active = !self.modal_active() && !self.modal_active_frame_start;
+                    let action = crate::profile::profile_view(
+                        &mut self.profile,
+                        &mut self.library,
+                        &self.play_times,
+                        ctx,
+                        ui,
+                        full_rect,
+                        &self.app_settings.profile_name,
+                        avatar_tex,
+                        ambient,
+                        accent,
+                        content_opacity,
+                        backdrop_opacity,
+                        profile_scale,
+                        self.app_settings.backdrop_theme,
+                        self.app_settings.light_mode,
+                        self.app_settings.music_volume,
+                        self.app_settings.sfx_volume,
+                        profile_active,
+                        &self.last_input,
+                        &mut self.input,
+                    );
+                    if self.show_profile {
+                        match action {
+                            crate::profile::ProfileAction::Close => {
+                                self.show_profile = false;
+                                self.carousel.profile_focused = false;
+                            }
+                            crate::profile::ProfileAction::QuickLaunch(path) => {
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+                                self.confirm = Some(ConfirmDialog {
+                                    title: "Quick Launch".into(),
+                                    body: "Quick Launch this game? Any open game will be shut down first.".into(),
+                                    confirm_label: "Launch".into(),
+                                    selected: 0,
+                                    kind: ConfirmKind::QuickLaunch(path),
+                                });
+                                self.modal_hold = true;
+                            }
+                            crate::profile::ProfileAction::PickIcon => {
+                                self.pick_profile_avatar();
+                            }
+                            crate::profile::ProfileAction::SetName(name) => {
+                                self.app_settings.profile_name = name;
+                                let _ = self.app_settings.save();
+                            }
+                            crate::profile::ProfileAction::SetBackdropTheme(theme) => {
+                                if self.app_settings.backdrop_theme != theme {
+                                    self.app_settings.backdrop_theme = theme;
+                                    let _ = self.app_settings.save();
+                                }
+                            }
+                            crate::profile::ProfileAction::SetLightMode(on) => {
+                                if self.app_settings.light_mode != on {
+                                    self.app_settings.light_mode = on;
+                                    let _ = self.app_settings.save();
+                                }
+                            }
+                            crate::profile::ProfileAction::SetMusicVolume(v) => {
+                                self.app_settings.music_volume = v.clamp(0.0, 1.0);
+                                let _ = self.app_settings.save();
+                            }
+                            crate::profile::ProfileAction::SetSfxVolume(v) => {
+                                self.app_settings.sfx_volume = v.clamp(0.0, 1.0);
+                                crate::ui_audio::set_sfx_volume(self.app_settings.sfx_volume);
+                                let _ = self.app_settings.save();
+                            }
+                            crate::profile::ProfileAction::None => {}
+                        }
+                    }
+                    ctx.request_repaint();
+                } else if carousel_mode {
+                    let booting = running && !paused && self.game_display().is_none();
+                    if booting {
+                        let bg_rect = ui.max_rect();
+                        let painter = ui.painter();
+                        let t = ui.input(|i| i.time) as f32;
+
+                        painter.rect_filled(bg_rect, Rounding::ZERO, Color32::from_rgb(0x06, 0x06, 0x08));
+
+                        let game_index = self.carousel.selected;
+                        let game_info = self.library.games.get(game_index).map(|g| {
+                            (g.title.clone(), g.format.to_string(), g.dominant_color)
+                        });
+                        let dom_color = game_info.as_ref().map(|(_, _, col)| *col).unwrap_or(Color32::from_rgb(0x2F, 0xB4, 0xEF));
+
+                        let elapsed_awaiting = if let crate::carousel::BootStage::AwaitingFrame { start_time, .. } = self.carousel.boot_stage {
+                            (t - start_time).max(0.0)
+                        } else {
+                            0.0
+                        };
+                        let fade_alpha = (elapsed_awaiting / 0.55).min(1.0); // 550ms fade-in
+
+                        let glow_intensity = (((t * 2.2).sin() * 0.12 + 0.18).clamp(0.0, 1.0)) * fade_alpha;
+                        let center = bg_rect.center();
+                        for r_offset in (0..12).rev() {
+                            let r = 140.0 + r_offset as f32 * 12.0;
+                            let alpha = (4.0 * (1.0 - r_offset as f32 / 12.0) * glow_intensity * fade_alpha) as u8;
+                            let col = Color32::from_rgba_unmultiplied(dom_color.r(), dom_color.g(), dom_color.b(), alpha);
+                            painter.circle_filled(center - Vec2::new(0.0, 48.0), r, col);
+                        }
+
+                        let card_sz = 260.0f32;
+                        let card_rect = egui::Rect::from_center_size(center - Vec2::new(0.0, 48.0), Vec2::splat(card_sz));
+
+                        crate::carousel::draw_gradient_rounded_rect(&painter, card_rect.center(), card_rect.expand(6.0), 16.0, t, (120.0 * fade_alpha) as u8);
+                        crate::carousel::draw_gradient_rounded_rect(&painter, card_rect.center(), card_rect.expand(2.5), 14.0, t, (255.0 * fade_alpha) as u8);
+
+                        painter.rect_filled(card_rect, Rounding::same(14.0), Color32::from_rgba_unmultiplied(0x14, 0x14, 0x1A, (fade_alpha * 255.0) as u8));
+                        let card_tint = Color32::from_white_alpha((fade_alpha * 255.0) as u8);
+                        if let Some(tex) = self.library.texture(ctx, game_index) {
+                            crate::carousel::draw_rounded_image(&painter, tex.id(), card_rect, 14.0, card_tint);
+                        } else if let Some((_, format, _)) = &game_info {
+                            painter.text(card_rect.center(), egui::Align2::CENTER_CENTER, format, FontId::proportional(card_sz * 0.13), Color32::from_rgba_unmultiplied(0x70, 0x70, 0x80, (fade_alpha * 255.0) as u8));
+                        }
+
+                        if let Some((title, _, _)) = &game_info {
+                            let text_y = center.y + card_sz * 0.5 + 24.0;
+                            let title_alpha = (fade_alpha * 255.0) as u8;
+                            crate::carousel::shadowed_text(&painter, egui::pos2(center.x, text_y), egui::Align2::CENTER_CENTER, title, FontId::proportional(28.0), Color32::from_rgba_unmultiplied(255, 255, 255, title_alpha), true);
+
+                            let dots = match (t as u64) % 4 {
+                                0 => "",
+                                1 => ".",
+                                2 => "..",
+                                3 => "...",
+                                _ => "...",
+                            };
+                            let await_text = format!("Awaiting First Frame{}", dots);
+                            let await_alpha = (fade_alpha * 255.0) as u8;
+                            crate::carousel::shadowed_text(&painter, egui::pos2(center.x, text_y + 40.0), egui::Align2::CENTER_CENTER, &await_text, FontId::proportional(15.0), Color32::from_rgba_unmultiplied(0x00, 0xE5, 0xFF, await_alpha), false);
+                            crate::carousel::shadowed_text(&painter, egui::pos2(center.x, text_y + 74.0), egui::Align2::CENTER_CENTER, "[Home] Cancel", FontId::proportional(13.0), Color32::from_rgba_unmultiplied(0xC0, 0xC0, 0xCC, await_alpha), false);
+                        }
+
+                        ctx.request_repaint();
+                    } else {
+                        let panel = ui.max_rect();
+                        let scale_f = if let Some(start) = self.pause_anim.or(self.stop_anim) {
+                            let f = (start.elapsed().as_secs_f32() / 0.30).min(1.0);
+                            let e = 1.0 - (1.0 - f) * (1.0 - f);
+                            0.90 + 0.10 * e
+                        } else {
+                            1.0
+                        };
+                        let profile_tex = self.profile_texture.as_ref().map(|t| t.id());
+                        let modal_active = self.modal_active();
+                        let action = crate::carousel::carousel_view(
+                            &mut self.carousel,
+                            &mut self.library,
+                            ctx,
+                            ui,
+                            &self.last_input,
+                            &mut self.input,
+                            running,
+                            playing_index,
+                            playing_alpha,
+                            self.app_settings.carousel_theme,
+                            profile_tex,
+                            &self.app_settings.profile_name,
+                            !self.show_settings && !modal_active,
+                            scale_f,
+                            1.0,
+                            self.app_settings.backdrop_theme,
+                            self.app_settings.light_mode,
+                            &self.app_settings.favorites,
+                            self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
+                        );
+                        match action {
+                            crate::carousel::CarouselAction::Launch(path) => {
+                                if running {
+                                    crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+                                    self.confirm = Some(ConfirmDialog {
+                                        title: "Launch Game".into(),
+                                        body: "Close the current game and launch this one?".into(),
+                                        confirm_label: "Launch".into(),
+                                        selected: 0,
+                                        kind: ConfirmKind::LaunchGame(path),
+                                    });
+                                    self.modal_hold = true;
+                                } else if crate::boot::emu_alive() {
+                                    self.teardown_at = Some(std::time::Instant::now());
+                                    self.pending_boot = Some(path);
+                                } else {
+                                    self.nro_path = path;
+                                    self.boot_nro(ctx);
+                                }
+                            }
+                            crate::carousel::CarouselAction::SetTheme(th) => {
+                                if self.app_settings.carousel_theme != th {
+                                    self.app_settings.carousel_theme = th;
+                                    let _ = self.app_settings.save();
+                                }
+                            }
+                            crate::carousel::CarouselAction::Resume => {
+                                if let Some(h) = self.emulation_handle.as_ref() {
+                                    h.resume();
+                                }
+                                self.pause_anim = None;
+                                self.resume_anim = Some(std::time::Instant::now());
+                            }
+                            crate::carousel::CarouselAction::OpenProfile => {
+                                self.profile.tab = crate::profile::ProfileTab::Profile;
+                                self.profile.name_buf = self.app_settings.profile_name.clone();
+                                self.profile.focus_content = false;
+                                self.profile.row_selected = 0;
+                                self.show_profile = true;
+                            }
+                            crate::carousel::CarouselAction::SwitchToGrid => {
+                                self.app_settings.view_mode = crate::app_settings::ViewMode::Grid;
+                                let _ = self.app_settings.save();
+                            }
+                            crate::carousel::CarouselAction::StopEmulation => {
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+                                self.confirm = Some(ConfirmDialog {
+                                    title: "Close Game".into(),
+                                    body: "Close the current game?".into(),
+                                    confirm_label: "Close".into(),
+                                    selected: 0,
+                                    kind: ConfirmKind::CloseGame,
+                                });
+                                self.modal_hold = true;
+                            }
+                            crate::carousel::CarouselAction::OpenSettings => {
+                                self.settings_tab = SettingsTab::General;
+                                self.show_settings = true;
+                            }
+                            crate::carousel::CarouselAction::OpenController => {
+                                self.settings_tab = SettingsTab::Controller;
+                                self.show_settings = true;
+                            }
+                            crate::carousel::CarouselAction::OpenDebug => {
+                                self.debugger.toggle_logs();
+                            }
+                            crate::carousel::CarouselAction::Quit => {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            crate::carousel::CarouselAction::Rescan => {
+                                self.library.rescan(ctx, &self.app_settings.library_folders);
+                            }
+                            crate::carousel::CarouselAction::AddFolder => {
+                                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                    if !self.app_settings.library_folders.contains(&dir) {
+                                        self.app_settings.library_folders.push(dir);
+                                        let _ = self.app_settings.save();
+                                    }
+                                    self.library.rescan(ctx, &self.app_settings.library_folders);
+                                }
+                            }
+                            crate::carousel::CarouselAction::ToggleFavorite(path) => {
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Favorite);
+                                let p = std::path::PathBuf::from(path);
+                                if let Some(pos) = self.app_settings.favorites.iter().position(|x| *x == p) {
+                                    self.app_settings.favorites.remove(pos);
+                                } else {
+                                    self.app_settings.favorites.push(p);
+                                }
+                                let _ = self.app_settings.save();
+                            }
+                            crate::carousel::CarouselAction::DownloadIcon(path) => {
+                                let pb = std::path::PathBuf::from(&path);
+                                if let Some(idx) = self.library.index_of_path(&pb) {
+                                    let title = self.library.games[idx].title.clone();
+                                    crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+                                    self.icon_picker = Some(IconPicker {
+                                        game_idx: idx,
+                                        game_path: pb,
+                                        search: title.clone(),
+                                        editing: false,
+                                        anim: 0.0,
+                                        selected: 0,
+                                        scroll: 0.0,
+                                        squish_at: None,
+                                        nav_cd: 0.0,
+                                        hold: true,
+                                        built: false,
+                                        full_urls: Vec::new(),
+                                        thumbs: Vec::new(),
+                                        fetch: start_icon_fetch(
+                                            self.app_settings.steamgriddb_key.clone(),
+                                            title,
+                                        ),
+                                        apply: None,
+                                    });
+                                }
+                            }
+                            crate::carousel::CarouselAction::None => {}
+                        }
+
+                        if let Some(start) = self.pause_anim.or(self.stop_anim) {
+                            let f = (start.elapsed().as_secs_f32() / 0.30).min(1.0);
+                            if f >= 1.0 {
+                                self.pause_anim = None;
+                                if self.stop_anim.take().is_some() {
+                                    self.game_texture = None;
+                                    if self.playing_path.is_some() {
+                                        self.pill_fade = Some(std::time::Instant::now());
+                                    }
+                                }
+                            } else if let Some((tid, tsz)) = self.game_display() {
+                                let ef = 1.0 - (1.0 - f) * (1.0 - f);
+                                let rect = self.game_draw_rect(panel, tsz);
+                                let p = ctx.layer_painter(egui::LayerId::new(
+                                    egui::Order::Foreground,
+                                    egui::Id::new("home_zoom"),
+                                ));
+                                draw_zoom_fade_out(&p, rect, tid, ef);
+                            }
+                            ctx.request_repaint();
+                        } else if let Some(start) = self.resume_anim {
+                            let f = (start.elapsed().as_secs_f32() / 0.30).min(1.0);
+                            if let Some((tid, tsz)) = self.game_display() {
+                                let ef = 1.0 - (1.0 - f) * (1.0 - f);
+                                let rect = self.game_draw_rect(panel, tsz);
+                                let p = ctx.layer_painter(egui::LayerId::new(
+                                    egui::Order::Foreground,
+                                    egui::Id::new("home_zoom"),
+                                ));
+                                let cover = (ef * 1.5).min(1.0);
+                                p.rect_filled(
+                                    panel,
+                                    Rounding::ZERO,
+                                    Color32::from_rgba_unmultiplied(BG.r(), BG.g(), BG.b(), (cover * 255.0) as u8),
+                                );
+                                draw_zoom_fade_in(&p, rect, tid, ef);
+                            }
+                            if f >= 1.0 {
+                                self.resume_anim = None;
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                } else if let Some(start) = self.stop_fade {
                     let t = start.elapsed().as_secs_f32() / 0.9;
                     let panel = ui.max_rect();
-                    let display = self.game_display();
-                    self.library_view(ui, ctx);
-                    if let Some((tid, tsz)) = display {
-                        let rect = self.game_draw_rect(panel, tsz);
-                        let p = ctx.layer_painter(egui::LayerId::new(
-                            egui::Order::Foreground,
-                            egui::Id::new("stop_dissolve"),
-                        ));
-                        draw_dissolve(&p, rect, tid, t);
+                    if self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel {
+                        let scale_f = 0.92 + 0.08 * t.min(1.0);
+                        let profile_tex = self.profile_texture.as_ref().map(|t| t.id());
+                        let _ = crate::carousel::carousel_view(
+                            &mut self.carousel,
+                            &mut self.library,
+                            ctx,
+                            ui,
+                            &self.last_input,
+                            &mut self.input,
+                            running,
+                            playing_index,
+                            playing_alpha,
+                            self.app_settings.carousel_theme,
+                            profile_tex,
+                            &self.app_settings.profile_name,
+                            true,
+                            scale_f,
+                            t.min(1.0),
+                            self.app_settings.backdrop_theme,
+                            self.app_settings.light_mode,
+                            &self.app_settings.favorites,
+                            self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
+                        );
+                        if t < 1.05 {
+                            if let Some((tid, tsz)) = self.game_display() {
+                                let rect = self.game_draw_rect(panel, tsz);
+                                let p = ctx.layer_painter(egui::LayerId::new(
+                                    egui::Order::Foreground,
+                                    egui::Id::new("stop_dissolve"),
+                                ));
+                                draw_zoom_fade_out(&p, rect, tid, t);
+                            }
+                        }
+                    } else {
+                        let display = self.game_display();
+                        self.library_view(ui, ctx);
+                        if let Some((tid, tsz)) = display {
+                            let rect = self.game_draw_rect(panel, tsz);
+                            let p = ctx.layer_painter(egui::LayerId::new(
+                                egui::Order::Foreground,
+                                egui::Id::new("stop_dissolve"),
+                            ));
+                            draw_dissolve(&p, rect, tid, t);
+                        }
                     }
                     ctx.request_repaint();
                     if t >= 1.05 {
@@ -1264,14 +2787,24 @@ impl eframe::App for HorizonApp {
                         self.game_texture = None;
                         self.free_native_texture();
                     }
-                } else if let Some((tid, tsz)) = self.game_display() {
-                    let draw_size = self.game_draw_rect(ui.max_rect(), tsz).size();
-                    ui.centered_and_justified(|ui| {
-                        ui.image((tid, draw_size));
-                    });
+                } else if running {
+                    if let Some((tid, tsz)) = self.game_display() {
+                        let draw_size = self.game_draw_rect(ui.max_rect(), tsz).size();
+                        ui.centered_and_justified(|ui| {
+                            ui.image((tid, draw_size));
+                        });
+                    } else {
+                        self.library_view(ui, ctx);
+                    }
                 } else {
+                    if self.game_texture.is_some() || self.game_texture_native.is_some() {
+                        self.game_texture = None;
+                        self.free_native_texture();
+                    }
                     self.library_view(ui, ctx);
                 }
+                self.draw_modal(ctx, ui);
+                self.update_icon_picker(ctx, ui);
             });
 
         if self.show_settings {
@@ -1282,6 +2815,7 @@ impl eframe::App for HorizonApp {
             let mut save_needed = false;
             let mut app_cfg = self.app_settings.clone();
             let mut app_save_needed = false;
+            let mut test_key: Option<String> = None;
             let last_input = self.last_input;
             let gp_name = self.input.as_ref().and_then(|ib| ib.name());
             let mut rebinding_pad = self.rebinding_pad;
@@ -1339,7 +2873,38 @@ impl eframe::App for HorizonApp {
                     ui.add_space(6.0);
 
                     match tab {
-                        SettingsTab::General => settings_content(ui),
+                        SettingsTab::General => {
+                            settings_content(ui);
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("SteamGridDB").strong());
+                            ui.label(
+                                egui::RichText::new("Paste your API key to download custom game icons.")
+                                    .weak()
+                                    .size(12.0),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label("API Key");
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut app_cfg.steamgriddb_key)
+                                        .password(true)
+                                        .hint_text("Paste key here")
+                                        .desired_width(260.0),
+                                );
+                                if resp.changed() {
+                                    app_save_needed = true;
+                                }
+                                if ui.button("Test").clicked() {
+                                    test_key = Some(app_cfg.steamgriddb_key.clone());
+                                }
+                            });
+                            ui.hyperlink_to(
+                                "Get a key at steamgriddb.com/profile/preferences/api",
+                                "https://www.steamgriddb.com/profile/preferences/api",
+                            );
+                        }
                         SettingsTab::Controller => {
                             controller_settings_content(
                                 ui,
@@ -1388,6 +2953,92 @@ impl eframe::App for HorizonApp {
                 if let Err(e) = self.app_settings.save() {
                     log::warn!("Failed to save app settings: {}", e);
                 }
+            }
+            if let Some(key) = test_key {
+                let state = std::sync::Arc::new(std::sync::Mutex::new(KeyTest::default()));
+                self.key_test = Some(state.clone());
+                self.key_test_result = None;
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || {
+                    let ok = crate::steamgrid::verify_key(&key);
+                    if let Ok(mut g) = state.lock() {
+                        g.done = true;
+                        g.ok = ok;
+                    }
+                    ctx2.request_repaint();
+                });
+            }
+        }
+
+        // --- Poll SteamGridDB key test & draw its result dialog ---
+        if let Some(state) = &self.key_test {
+            let mut finished: Option<bool> = None;
+            if let Ok(g) = state.lock() {
+                if g.done {
+                    finished = Some(g.ok);
+                }
+            }
+            if let Some(ok) = finished {
+                self.key_test = None;
+                self.key_test_result = Some((ok, std::time::Instant::now()));
+                crate::ui_audio::play(if ok {
+                    crate::ui_audio::Sfx::Whistle
+                } else {
+                    crate::ui_audio::Sfx::Error
+                });
+            }
+        }
+        if self.key_test.is_some() {
+            egui::Window::new("SteamGridDB")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Testing connection…");
+                    });
+                    ui.add_space(4.0);
+                });
+            ctx.request_repaint();
+        } else if let Some((ok, _)) = self.key_test_result {
+            let mut still_open = true;
+            egui::Window::new("SteamGridDB")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| {
+                        if ok {
+                            ui.label(
+                                egui::RichText::new("✔  Connected")
+                                    .size(20.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(0x35, 0xD0, 0x6A)),
+                            );
+                            ui.add_space(4.0);
+                            ui.label("Your API key is valid. You can now download icons.");
+                        } else {
+                            ui.label(
+                                egui::RichText::new("✖  Failed")
+                                    .size(20.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(0xE8, 0x33, 0x50)),
+                            );
+                            ui.add_space(4.0);
+                            ui.label("Couldn't verify the key. Check the key and your connection.");
+                        }
+                        ui.add_space(10.0);
+                        if ui.button("OK").clicked() {
+                            still_open = false;
+                        }
+                    });
+                    ui.add_space(6.0);
+                });
+            if !still_open {
+                self.key_test_result = None;
             }
         }
 

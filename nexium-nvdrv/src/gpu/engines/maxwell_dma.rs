@@ -382,6 +382,20 @@ impl MaxwellDma {
                 let dst_pitch = self.pitch_out.max(line_length_src as u32) as usize;
                 nexium_gpu::tex_invalidate::bump_region(dst_gpu, (dst_pitch * line_count) as u64);
             }
+            (LAYOUT_BLOCK_LINEAR, LAYOUT_BLOCK_LINEAR) => {
+                self.blit_block_to_block(
+                    src_cpu,
+                    dst_cpu,
+                    dst_limit,
+                    dst_gpu,
+                    line_length_src,
+                    line_length_dst,
+                    line_count,
+                    bytes_per_element,
+                    mem_read,
+                    mem_write,
+                );
+            }
             _ => {
                 if self.clamp_log_count < 24 {
                     self.clamp_log_count += 1;
@@ -574,6 +588,77 @@ impl MaxwellDma {
         self.last_tiled_dst_bh_log2 = block_height_log2;
         self.last_tiled_dst_stride = dst_width_bytes as u32;
         self.last_tiled_dst_height = dst_height as u32;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn blit_block_to_block(
+        &mut self,
+        src_cpu: u64,
+        dst_cpu: u64,
+        dst_limit: usize,
+        dst_gpu: u64,
+        line_length_src: usize,
+        line_length_dst: usize,
+        line_count: usize,
+        bytes_per_element: usize,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
+        let src_bh = ((self.src_block_size >> 4) & 0xF) as u32;
+        let src_width_bytes = if self.src_width != 0 {
+            (self.src_width as usize) * bytes_per_element.max(1)
+        } else {
+            line_length_src
+        };
+        let src_height = if self.src_height != 0 {
+            self.src_height as usize
+        } else {
+            line_count
+        };
+        let mut src_tiled = vec![0u8; tiled_size_bytes(src_width_bytes, src_height, src_bh)];
+        mem_read(src_cpu, &mut src_tiled);
+
+        let inter_pitch = line_length_src.max(1);
+        let linear = unswizzle_block_linear_bytes(
+            &src_tiled,
+            line_length_src,
+            line_count,
+            inter_pitch,
+            src_width_bytes,
+            src_height,
+            src_bh,
+            self.src_origin_x as usize,
+            self.src_origin_y as usize,
+        );
+
+        let dst_bh = ((self.dst_block_size >> 4) & 0xF) as u32;
+        let dst_width_bytes = if self.dst_width != 0 {
+            (self.dst_width as usize) * bytes_per_element.max(1)
+        } else {
+            line_length_dst
+        };
+        let dst_height = if self.dst_height != 0 {
+            self.dst_height as usize
+        } else {
+            line_count
+        };
+        let tiled = swizzle_block_linear(
+            &linear,
+            line_length_dst,
+            line_count,
+            inter_pitch,
+            dst_width_bytes,
+            dst_height,
+            dst_bh,
+            self.dst_origin_x as usize,
+            self.dst_origin_y as usize,
+        );
+        let n = tiled.len().min(dst_limit);
+        mem_write(dst_cpu, &tiled[..n]);
+        nexium_gpu::tex_invalidate::bump_region(
+            dst_gpu,
+            tiled_size_bytes(dst_width_bytes, dst_height, dst_bh) as u64,
+        );
     }
 
     fn blit_block_to_pitch(

@@ -116,6 +116,8 @@ pub struct Emitter {
     fragment_color_outputs: u32,
     fragment_output_map: u32,
     ps_input_map: [u8; 32],
+    alpha_test_func: u32,
+    alpha_test_ref: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -337,6 +339,8 @@ impl Emitter {
             fragment_color_outputs: 1,
             fragment_output_map: 0,
             ps_input_map: [0; 32],
+            alpha_test_func: 0,
+            alpha_test_ref: 0,
         }
     }
 
@@ -558,6 +562,42 @@ impl Emitter {
                 .unwrap();
             self.b.store(ptr, c, None, []).unwrap();
         }
+    }
+
+    fn emit_alpha_test(&mut self, outputs: &[(u32, Word)]) {
+        let func = self.alpha_test_func;
+        // 0 = disabled, Always (0x207 / 8) = no discard.
+        if func == 0 || func == 0x207 || func == 8 {
+            return;
+        }
+        let Some((_, value)) = outputs.iter().find(|(loc, _)| *loc == 0).copied() else {
+            return;
+        };
+        let alpha = self.b.composite_extract(self.f32_t, None, value, [3]).unwrap();
+        let reference = self.const_f32(self.alpha_test_ref);
+        let bool_t = self.bool_t;
+        let pass = match func {
+            0x200 | 1 => self.bool_false,
+            0x201 | 2 => self.b.f_ord_less_than(bool_t, None, alpha, reference).unwrap(),
+            0x202 | 3 => self.b.f_ord_equal(bool_t, None, alpha, reference).unwrap(),
+            0x203 | 4 => self.b.f_ord_less_than_equal(bool_t, None, alpha, reference).unwrap(),
+            0x204 | 5 => self.b.f_ord_greater_than(bool_t, None, alpha, reference).unwrap(),
+            0x205 | 6 => self.b.f_ord_not_equal(bool_t, None, alpha, reference).unwrap(),
+            0x206 | 7 => self.b.f_ord_greater_than_equal(bool_t, None, alpha, reference).unwrap(),
+            _ => return,
+        };
+        let fail = self.b.logical_not(bool_t, None, pass).unwrap();
+        let kill_block = self.b.id();
+        let merge_block = self.b.id();
+        self.b
+            .selection_merge(merge_block, rspirv::spirv::SelectionControl::NONE)
+            .unwrap();
+        self.b
+            .branch_conditional(fail, kill_block, merge_block, [])
+            .unwrap();
+        self.b.begin_block(Some(kill_block)).unwrap();
+        self.b.kill().unwrap();
+        self.b.begin_block(Some(merge_block)).unwrap();
     }
 
     fn apply_fragment_output_debug_overrides(&mut self, outputs: &mut [(u32, Word)]) {
@@ -2931,6 +2971,7 @@ impl Emitter {
                             }
                         }
                         self.apply_fragment_output_debug_overrides(&mut outputs);
+                        self.emit_alpha_test(&outputs);
                         for (loc, v) in outputs {
                             self.store_fragment_output_vec(loc, v);
                         }
@@ -3442,6 +3483,7 @@ impl Emitter {
                         }
                     }
                     self.apply_fragment_output_debug_overrides(&mut outputs);
+                    self.emit_alpha_test(&outputs);
                     for (loc, v) in outputs {
                         self.store_fragment_output_vec(loc, v);
                     }
@@ -3864,6 +3906,19 @@ pub fn emit_fragment_full_with_input_map_meta_outputs_debug(
     output_map: u32,
     debug_active: bool,
 ) -> (Vec<u32>, u32, Vec<u32>, u32, bool) {
+    emit_fragment_full_with_alpha_test(cfg, ps_input_map, color_outputs, output_map, debug_active, 0, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_fragment_full_with_alpha_test(
+    cfg: &Cfg,
+    ps_input_map: [u8; 32],
+    color_outputs: u32,
+    output_map: u32,
+    debug_active: bool,
+    alpha_test_func: u32,
+    alpha_test_ref: u32,
+) -> (Vec<u32>, u32, Vec<u32>, u32, bool) {
     let vec4s = cbuf_vec4s(cfg, 1).max(UBO_VEC4S);
     let mut emitter = Emitter::new_sized(Stage::Fragment, vec4s);
     if !debug_active {
@@ -3874,6 +3929,8 @@ pub fn emit_fragment_full_with_input_map_meta_outputs_debug(
     emitter.ps_input_map = ps_input_map;
     emitter.fragment_color_outputs = color_outputs.max(1).min(8);
     emitter.fragment_output_map = output_map;
+    emitter.alpha_test_func = alpha_test_func;
+    emitter.alpha_test_ref = alpha_test_ref;
     let (words, mask, tex_ids, sampler_arrayed) = emitter.finish_full_meta(cfg, &[]);
     (words, mask, tex_ids, vec4s * 16, sampler_arrayed)
 }

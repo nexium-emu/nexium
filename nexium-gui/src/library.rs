@@ -9,6 +9,7 @@ pub struct GameEntry {
     pub format: &'static str,
     pub size: u64,
     pub icon: Option<egui::ColorImage>,
+    pub dominant_color: egui::Color32,
 }
 
 pub struct Library {
@@ -31,10 +32,9 @@ impl Library {
     }
 
     pub fn rescan(&mut self, ctx: &egui::Context, extra_dirs: &[PathBuf]) {
-        self.loaded = false;
-        self.games.clear();
-        self.textures.clear();
-        self.selected = None;
+        if self.games.is_empty() {
+            self.loaded = false;
+        }
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         let extra: Vec<PathBuf> = extra_dirs.to_vec();
@@ -52,8 +52,46 @@ impl Library {
                 self.textures = (0..games.len()).map(|_| None).collect();
                 self.games = games;
                 self.loaded = true;
+                self.selected = None;
                 self.rx = None;
             }
+        }
+    }
+
+    pub fn index_of_path(&self, path: &Path) -> Option<usize> {
+        self.games.iter().position(|g| g.path == path)
+    }
+
+    pub fn move_to_front(&mut self, idx: usize) -> usize {
+        if idx == 0 || idx >= self.games.len() {
+            return idx.min(self.games.len().saturating_sub(1));
+        }
+        let game = self.games.remove(idx);
+        self.games.insert(0, game);
+        if idx < self.textures.len() {
+            let tex = self.textures.remove(idx);
+            self.textures.insert(0, tex);
+        }
+        if let Some(sel) = self.selected {
+            self.selected = Some(if sel == idx {
+                0
+            } else if sel < idx {
+                sel + 1
+            } else {
+                sel
+            });
+        }
+        0
+    }
+
+    pub fn set_icon(&mut self, idx: usize, img: egui::ColorImage) {
+        if idx >= self.games.len() {
+            return;
+        }
+        self.games[idx].dominant_color = sample_dominant(&img);
+        self.games[idx].icon = Some(img);
+        if idx < self.textures.len() {
+            self.textures[idx] = None;
         }
     }
 
@@ -139,14 +177,34 @@ fn read_entry(path: &Path) -> Option<GameEntry> {
         None => (stem.clone(), String::new(), None),
     };
 
+    // Custom (SteamGridDB) icon override takes precedence if present.
+    let icon = custom_icon_path(path)
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::read(&p).ok())
+        .and_then(|b| decode_jpeg(&b))
+        .or(icon);
+
     Some(GameEntry {
         path: path.to_path_buf(),
         title,
         author,
         format,
         size,
+        dominant_color: icon.as_ref().map(sample_dominant)
+            .unwrap_or(egui::Color32::from_rgb(0x2F, 0xB4, 0xEF)),
         icon,
     })
+}
+
+pub fn custom_icon_path(game_path: &Path) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let base = directories::BaseDirs::new()?
+        .config_dir()
+        .join("NeXium")
+        .join("icons");
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    game_path.hash(&mut h);
+    Some(base.join(format!("{:016x}.png", h.finish())))
 }
 
 fn decode_jpeg(bytes: &[u8]) -> Option<egui::ColorImage> {
@@ -156,4 +214,74 @@ fn decode_jpeg(bytes: &[u8]) -> Option<egui::ColorImage> {
         [w as usize, h as usize],
         img.as_raw(),
     ))
+}
+
+fn sample_dominant(img: &egui::ColorImage) -> egui::Color32 {
+    let pixels = &img.pixels;
+    if pixels.is_empty() {
+        return egui::Color32::from_rgb(0x2F, 0xB4, 0xEF);
+    }
+    let stride = (pixels.len() / 128).max(1);
+    let mut rs = 0u64;
+    let mut gs = 0u64;
+    let mut bs = 0u64;
+    let mut n = 0u64;
+    for px in pixels.iter().step_by(stride) {
+        let mx = px.r().max(px.g()).max(px.b());
+        let mn = px.r().min(px.g()).min(px.b());
+        if mx < 40 || mn > 210 || (mx - mn) < 20 {
+            continue;
+        }
+        rs += px.r() as u64;
+        gs += px.g() as u64;
+        bs += px.b() as u64;
+        n += 1;
+    }
+    if n == 0 {
+        return egui::Color32::from_rgb(0x2F, 0xB4, 0xEF);
+    }
+    let r = (rs / n) as f32 / 255.0;
+    let g = (gs / n) as f32 / 255.0;
+    let b = (bs / n) as f32 / 255.0;
+    let mx = r.max(g).max(b);
+    let mn = r.min(g).min(b);
+    let chroma = mx - mn;
+    let lightness = (mx + mn) * 0.5;
+    let saturation = if lightness < 0.5 {
+        chroma / (mx + mn + 0.001)
+    } else {
+        chroma / (2.0 - mx - mn + 0.001)
+    };
+    let boosted_s = (saturation * 2.2).min(1.0);
+    let target_l = 0.48f32;
+    let hue = if chroma < 0.001 {
+        0.0f32
+    } else if mx == r {
+        ((g - b) / chroma).rem_euclid(6.0) / 6.0
+    } else if mx == g {
+        ((b - r) / chroma + 2.0) / 6.0
+    } else {
+        ((r - g) / chroma + 4.0) / 6.0
+    };
+    let q = if target_l < 0.5 {
+        target_l * (1.0 + boosted_s)
+    } else {
+        target_l + boosted_s - target_l * boosted_s
+    };
+    let p = 2.0 * target_l - q;
+    let hue_to_rgb = |mut t: f32| -> f32 {
+        t = t.rem_euclid(1.0);
+        if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
+        if t < 0.5 { return q; }
+        if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+        p
+    };
+    let fr = hue_to_rgb(hue + 1.0 / 3.0);
+    let fg = hue_to_rgb(hue);
+    let fb = hue_to_rgb(hue - 1.0 / 3.0);
+    egui::Color32::from_rgb(
+        (fr * 255.0) as u8,
+        (fg * 255.0) as u8,
+        (fb * 255.0) as u8,
+    )
 }

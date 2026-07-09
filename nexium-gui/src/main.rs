@@ -4,13 +4,18 @@ mod app;
 mod app_settings;
 mod audio;
 mod boot;
+mod carousel;
 mod controller_art;
 mod controller_config;
 mod debugger;
 mod input;
 mod library;
 mod performance;
+mod playtime;
+mod profile;
 mod splash;
+mod steamgrid;
+mod ui_audio;
 
 use app::HorizonApp;
 use app_settings::AppSettings;
