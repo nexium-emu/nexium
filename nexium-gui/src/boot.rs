@@ -9,6 +9,19 @@ use std::sync::{
 };
 use std::thread;
 
+pub static EMU_ALIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn emu_alive() -> bool {
+    EMU_ALIVE.load(Ordering::Acquire)
+}
+
+struct AliveGuard;
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        EMU_ALIVE.store(false, Ordering::Release);
+    }
+}
+
 fn now_millis() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -402,6 +415,16 @@ impl EmulationHandle {
         repaint_ctx: Option<eframe::egui::Context>,
     ) -> Result<Self, String> {
         let nro_path = nro_path.to_string();
+
+        let wait_start = std::time::Instant::now();
+        while EMU_ALIVE.load(Ordering::Acquire) {
+            if wait_start.elapsed().as_secs_f32() > 6.0 {
+                return Err("previous game is still shutting down".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        EMU_ALIVE.store(true, Ordering::Release);
+
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);
         let pause_flag = Arc::new(AtomicBool::new(false));
@@ -415,6 +438,7 @@ impl EmulationHandle {
         let stats_clone = Arc::clone(&stats);
 
         let thread_handle = thread::spawn(move || {
+            let _alive_guard = AliveGuard;
             let initial_loader_path = nro_path.clone();
             let initial_loader_filename = Path::new(&initial_loader_path)
                 .file_name()

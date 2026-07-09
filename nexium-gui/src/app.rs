@@ -526,7 +526,7 @@ impl HorizonApp {
             .emulation_handle
             .as_ref()
             .map_or(false, |h| h.is_running());
-        if running {
+        if running || crate::boot::emu_alive() {
             self.stop_emulation();
             self.teardown_at = Some(std::time::Instant::now());
             self.pending_boot = Some(path);
@@ -590,7 +590,12 @@ impl HorizonApp {
     fn teardown_tick(&mut self, ctx: &egui::Context) {
         if let Some(start) = self.teardown_at {
             ctx.request_repaint();
-            if start.elapsed().as_secs_f32() >= 3.0 {
+            let elapsed = start.elapsed().as_secs_f32();
+            let dead = !crate::boot::emu_alive();
+            if elapsed >= 8.0 && !dead {
+                self.teardown_at = None;
+                self.pending_boot = None;
+            } else if elapsed >= 0.5 && dead {
                 self.teardown_at = None;
                 if let Some(path) = self.pending_boot.take() {
                     let now = ctx.input(|i| i.time) as f32;
@@ -1887,6 +1892,9 @@ impl eframe::App for HorizonApp {
                                         kind: ConfirmKind::LaunchGame(path),
                                     });
                                     self.modal_hold = true;
+                                } else if crate::boot::emu_alive() {
+                                    self.teardown_at = Some(std::time::Instant::now());
+                                    self.pending_boot = Some(path);
                                 } else {
                                     self.nro_path = path;
                                     self.boot_nro(ctx);
