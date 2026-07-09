@@ -40,6 +40,7 @@ pub enum ProfileTab {
     Profile,
     RecentlyPlayed,
     Settings,
+    System,
 }
 
 pub struct ProfileState {
@@ -286,10 +287,11 @@ pub fn profile_view(
         }
     }
 
-    const TAB_ORDER: [ProfileTab; 3] = [
+    const TAB_ORDER: [ProfileTab; 4] = [
         ProfileTab::Profile,
         ProfileTab::RecentlyPlayed,
         ProfileTab::Settings,
+        ProfileTab::System,
     ];
     let tab_idx = TAB_ORDER.iter().position(|x| *x == state.tab).unwrap_or(0);
     const N_SETTINGS: usize = 2;
@@ -365,6 +367,7 @@ pub fn profile_view(
         (ProfileTab::Profile, "Profile"),
         (ProfileTab::RecentlyPlayed, "Recently Played"),
         (ProfileTab::Settings, "Settings"),
+        (ProfileTab::System, "System Information"),
     ];
     let item_h = 64.0 * s;
     for (idx, (tab, label)) in tabs.iter().enumerate() {
@@ -482,6 +485,9 @@ pub fn profile_view(
                 pal,
             );
         }
+        ProfileTab::System => {
+            system_page(&content_painter, content, s, scale_factor, &scale_pos, &scale_rect, pal);
+        }
     }
     if ease < 1.0 {
         ctx.request_repaint();
@@ -506,6 +512,51 @@ pub fn profile_view(
 
     ctx.request_repaint();
     action
+}
+
+#[allow(clippy::too_many_arguments)]
+fn system_page(
+    painter: &egui::Painter,
+    content: egui::Rect,
+    s: f32,
+    scale_factor: f32,
+    scale_pos: &impl Fn(egui::Pos2) -> egui::Pos2,
+    scale_rect: &impl Fn(egui::Rect) -> egui::Rect,
+    pal: Pal,
+) {
+    let rows: [(&str, String); 4] = [
+        ("NeXium Version", format!("v{}", env!("CARGO_PKG_VERSION"))),
+        ("Commit", env!("NEXIUM_GIT_HASH").to_string()),
+        ("Build", format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH)),
+        ("Update Status", "Auto-update check coming soon".to_string()),
+    ];
+
+    let row_h = 58.0 * s;
+    let row_gap = 10.0 * s;
+    for (idx, (label, value)) in rows.iter().enumerate() {
+        let row = egui::Rect::from_min_size(
+            content.min + Vec2::new(0.0, idx as f32 * (row_h + row_gap)),
+            Vec2::new(content.width(), row_h),
+        );
+        let r = scale_rect(row);
+        let rounding = Rounding::same(12.0 * s * scale_factor);
+        painter.rect_filled(r, rounding, pal.panel);
+        painter.rect_stroke(r, rounding, Stroke::new(1.0 * scale_factor, pal.border));
+        painter.text(
+            scale_pos(egui::pos2(row.min.x + 24.0 * s, row.center().y)),
+            egui::Align2::LEFT_CENTER,
+            *label,
+            FontId::proportional(17.0 * s * scale_factor),
+            pal.muted,
+        );
+        painter.text(
+            scale_pos(egui::pos2(row.max.x - 26.0 * s, row.center().y)),
+            egui::Align2::RIGHT_CENTER,
+            value,
+            FontId::proportional(18.0 * s * scale_factor),
+            pal.text,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
