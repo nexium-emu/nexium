@@ -402,6 +402,7 @@ impl HorizonApp {
                 height: frame.height,
                 filter,
             });
+            self.carousel.boot_stage = crate::carousel::BootStage::None;
         }
         let Some(t) = self.game_texture_native.as_ref() else {
             return;
@@ -897,7 +898,7 @@ impl eframe::App for HorizonApp {
                     }
                     self.pause_anim = None;
                     self.resume_anim = Some(std::time::Instant::now());
-                } else if self.game_texture.is_some() {
+                } else if self.game_display().is_some() {
                     if let Some(h) = self.emulation_handle.as_ref() {
                         h.pause();
                     }
@@ -1135,7 +1136,7 @@ impl eframe::App for HorizonApp {
 
         let carousel_mode = self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel
             && (!running
-                || self.game_texture.is_none()
+                || self.game_display().is_none()
                 || paused
                 || self.stop_anim.is_some()
                 || self.pill_fade.is_some()
@@ -1460,7 +1461,7 @@ impl eframe::App for HorizonApp {
                     }
                     ctx.request_repaint();
                 } else if carousel_mode {
-                    let booting = running && !paused && self.game_texture.is_none();
+                    let booting = running && !paused && self.game_display().is_none();
                     if booting {
                         let bg_rect = ui.max_rect();
                         let painter = ui.painter();
