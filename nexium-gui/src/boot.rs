@@ -429,7 +429,7 @@ impl EmulationHandle {
         let stop_flag_clone = Arc::clone(&stop_flag);
         let pause_flag = Arc::new(AtomicBool::new(false));
         let pause_flag_clone = Arc::clone(&pause_flag);
-        let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(2);
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(8);
         let cpu_snapshot = Arc::new(Mutex::new(CpuSnapshot::default()));
         let cpu_snapshot_clone = Arc::clone(&cpu_snapshot);
         let mem_request = Arc::new(Mutex::new(0u64));

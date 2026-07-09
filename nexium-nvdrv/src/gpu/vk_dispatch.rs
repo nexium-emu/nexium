@@ -2019,6 +2019,21 @@ fn execute_one(
         draw.tic_pool_gpu_va,
         draw.tic_pool_limit,
     );
+    if fs_remap_trace(fs_addr) && !fs_tex_remap.is_empty() {
+        log::info!(
+            "[remap-trace] fs={:#x} shader_tex={:?} final_tex={:?} samplers={:?} bindless_slot={} tex_cb_slot={} via_header={} tic_pool={:#x} limit={} remap=[{}]",
+            fs_addr,
+            shader_fs_tex_ids,
+            fs_tex_ids,
+            fs_sampler_ids,
+            maxwell.regs.bindless_texture_const_buffer_slot,
+            maxwell.regs.tex_cb_index,
+            via_header_index,
+            draw.tic_pool_gpu_va,
+            draw.tic_pool_limit,
+            fs_tex_remap.join(" | ")
+        );
+    }
 
     let mut sampled_rt_fuzzy = false;
     let mut sampled_rt_keys: Vec<RtKey> = Vec::new();
@@ -4765,6 +4780,7 @@ fn remap_texture_ids_for_stage(
         tic_pool_gpu_va,
         tic_pool_limit,
         via_header_index,
+        stage_name == "fs",
         mappings,
         mem_read,
     );
@@ -4864,6 +4880,12 @@ fn trace_vs_tex_remap(
     );
 }
 
+fn fs_remap_trace(fs_addr: u64) -> bool {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| parse_env_u64_list("NEXIUM_BIND_TRACE_FS"))
+        .contains(&fs_addr)
+}
+
 fn vs_tex_bind_fs_trace(fs_addr: u64) -> bool {
     use std::sync::OnceLock;
     static CONFIG: OnceLock<(bool, Vec<u64>)> = OnceLock::new();
@@ -4880,6 +4902,26 @@ fn vs_tex_bind_fs_trace(fs_addr: u64) -> bool {
     }
 }
 
+fn tex_cb_sticky(stage_is_fs: bool) -> &'static std::sync::atomic::AtomicUsize {
+    use std::sync::atomic::AtomicUsize;
+    static FS: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static VS: AtomicUsize = AtomicUsize::new(usize::MAX);
+    if stage_is_fs {
+        &FS
+    } else {
+        &VS
+    }
+}
+
+fn tex_cb_sticky_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("NEXIUM_TEX_CB_STICKY")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn choose_texture_cb_index(
     cbuf_binds: &[(u64, u32); 16],
     bindless_slot: u32,
@@ -4888,6 +4930,7 @@ fn choose_texture_cb_index(
     tic_pool_gpu_va: u64,
     tic_pool_limit: u32,
     via_header_index: bool,
+    stage_is_fs: bool,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> usize {
@@ -4921,6 +4964,30 @@ fn choose_texture_cb_index(
         if score > best_score {
             best = slot;
             best_score = score;
+        }
+    }
+    if tex_cb_sticky_enabled() {
+        use std::sync::atomic::Ordering;
+        let sticky = tex_cb_sticky(stage_is_fs);
+        let prev = sticky.load(Ordering::Relaxed);
+        if prev < 16 && prev != best {
+            let prev_score = texture_cb_score(
+                cbuf_binds,
+                prev,
+                shader_ids,
+                tic_pool_gpu_va,
+                tic_pool_limit,
+                via_header_index,
+                mappings,
+                mem_read,
+            );
+            if prev_score > 0 && prev_score >= best_score {
+                best = prev;
+                best_score = prev_score;
+            }
+        }
+        if best_score > 0 {
+            sticky.store(best, Ordering::Relaxed);
         }
     }
     best
