@@ -48,6 +48,20 @@ pub struct HorizonApp {
     splash: crate::splash::Splash,
     library: crate::library::Library,
     stop_fade: Option<std::time::Instant>,
+    pause_anim: Option<std::time::Instant>,
+    resume_anim: Option<std::time::Instant>,
+    stop_anim: Option<std::time::Instant>,
+    pill_fade: Option<std::time::Instant>,
+    playing_path: Option<std::path::PathBuf>,
+    last_home: bool,
+    profile_texture: Option<egui::TextureHandle>,
+    profile_reload: bool,
+    show_profile: bool,
+    profile_anim: f32,
+    profile: crate::profile::ProfileState,
+    play_times: crate::playtime::PlayTimes,
+    last_playtime_save: std::time::Instant,
+    pub carousel: crate::carousel::CarouselState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,7 +114,22 @@ impl HorizonApp {
             splash: crate::splash::Splash::new(),
             library: crate::library::Library::new(),
             stop_fade: None,
+            pause_anim: None,
+            resume_anim: None,
+            stop_anim: None,
+            pill_fade: None,
+            playing_path: None,
+            last_home: false,
+            profile_texture: None,
+            profile_reload: false,
+            show_profile: false,
+            profile_anim: 0.0,
+            profile: crate::profile::ProfileState::new(),
+            play_times: crate::playtime::PlayTimes::load(),
+            last_playtime_save: std::time::Instant::now(),
+            carousel: crate::carousel::CarouselState::new(),
         };
+        app.reload_profile_texture(&cc.egui_ctx);
         app.library
             .rescan(&cc.egui_ctx, &app.app_settings.library_folders);
         if !nro_path.is_empty() {
@@ -108,6 +137,7 @@ impl HorizonApp {
             if let Ok(handle) = EmulationHandle::new(&nro_path, backend, Some(cc.egui_ctx.clone()))
             {
                 app.emulation_handle = Some(handle);
+                app.playing_path = Some(std::path::PathBuf::from(&nro_path));
                 log::info!("Auto-loaded NRO: {} (CPU: {})", nro_path, backend.label());
             } else {
                 log::error!("Failed to load NRO: {}", nro_path);
@@ -300,6 +330,7 @@ impl HorizonApp {
                 Some(t) => t.set(img, tex_opts),
                 None => {
                     self.game_texture = Some(ctx.load_texture("game_frame", img, tex_opts));
+                    self.carousel.boot_stage = crate::carousel::BootStage::None;
                 }
             }
         }
@@ -311,21 +342,94 @@ impl HorizonApp {
         }
         let backend = self.app_settings.cpu_backend.to_cpu_kind();
         log::info!("Boot: NRO={} CPU={}", self.nro_path, backend.label());
+        if let Some(mut old) = self.emulation_handle.take() {
+            old.stop();
+        }
+        self.stop_fade = None;
+        self.stop_anim = None;
+        self.resume_anim = None;
         match EmulationHandle::new(&self.nro_path, backend, Some(ctx.clone())) {
             Ok(h) => {
                 self.emulation_handle = Some(h);
                 self.game_texture = None;
+                self.pause_anim = None;
+                self.pill_fade = None;
+                let path = std::path::PathBuf::from(&self.nro_path);
+                if let Some(idx) = self.library.index_of_path(&path) {
+                    let n = self.library.move_to_front(idx);
+                    self.carousel.selected = n;
+                    self.carousel.scroll_offset = n as f32;
+                }
+                self.playing_path = Some(path);
             }
             Err(e) => log::error!("Boot: {}", e),
         }
     }
 
     fn stop_emulation(&mut self) {
+        self.play_times.save_if_dirty();
+        let was_paused = self
+            .emulation_handle
+            .as_ref()
+            .map_or(false, |h| h.is_paused());
+        let carousel = self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel;
         if let Some(mut h) = self.emulation_handle.take() {
             h.stop();
-            if self.game_texture.is_some() {
+            self.pause_anim = None;
+            self.resume_anim = None;
+            let has_frame = self.game_texture.is_some();
+            if carousel && self.playing_path.is_some() {
+                if !was_paused && has_frame {
+                    self.stop_anim = Some(std::time::Instant::now());
+                } else {
+                    self.pill_fade = Some(std::time::Instant::now());
+                    self.game_texture = None;
+                }
+            } else if has_frame {
                 self.stop_fade = Some(std::time::Instant::now());
+                self.playing_path = None;
+            } else {
+                self.playing_path = None;
             }
+        } else {
+            self.playing_path = None;
+        }
+    }
+
+    fn reload_profile_texture(&mut self, ctx: &egui::Context) {
+        self.profile_texture = None;
+        let Some(path) = self.app_settings.profile_avatar.clone() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            log::warn!("profile avatar unreadable: {}", path.display());
+            return;
+        };
+        let Ok(img) = image::load_from_memory(&bytes) else {
+            log::warn!("profile avatar decode failed: {}", path.display());
+            return;
+        };
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let side = w.min(h);
+        let ox = (w - side) / 2;
+        let oy = (h - side) / 2;
+        let cropped = image::imageops::crop_imm(&rgba, ox, oy, side, side).to_image();
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [side as usize, side as usize],
+            cropped.as_raw(),
+        );
+        self.profile_texture = Some(ctx.load_texture("profile_avatar", color, egui::TextureOptions::LINEAR));
+    }
+
+    fn pick_profile_avatar(&mut self) {
+        if let Some(p) = rfd::FileDialog::new()
+            .add_filter("Images", &["png", "jpg", "jpeg"])
+            .pick_file()
+        {
+            self.app_settings.profile_avatar = Some(p);
+            let _ = self.app_settings.save();
+            self.profile_reload = true;
         }
     }
 
@@ -393,6 +497,22 @@ fn draw_dissolve(p: &egui::Painter, rect: egui::Rect, tex: &egui::TextureHandle,
         }
     }
     p.add(egui::Shape::mesh(mesh));
+}
+
+fn draw_zoom_fade_out(p: &egui::Painter, rect: egui::Rect, tex: &egui::TextureHandle, t: f32) {
+    let t = t.clamp(0.0, 1.0);
+    let scale = 1.0 - 0.08 * t;
+    let alpha = 1.0 - t;
+    let draw_rect = egui::Rect::from_center_size(rect.center(), rect.size() * scale);
+    p.image(tex.id(), draw_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
+}
+
+fn draw_zoom_fade_in(p: &egui::Painter, rect: egui::Rect, tex: &egui::TextureHandle, t: f32) {
+    let t = t.clamp(0.0, 1.0);
+    let scale = 1.06 - 0.06 * t;
+    let alpha = t;
+    let draw_rect = egui::Rect::from_center_size(rect.center(), rect.size() * scale);
+    p.image(tex.id(), draw_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
 }
 
 fn cell_hash(i: usize, j: usize) -> f32 {
@@ -632,6 +752,11 @@ impl eframe::App for HorizonApp {
 
         self.library.poll();
 
+        if self.profile_reload {
+            self.profile_reload = false;
+            self.reload_profile_texture(ctx);
+        }
+
         if let Some(ref mut ib) = self.input {
             self.last_input = ib.poll(&self.controller_config);
             if self.last_input.connected {
@@ -642,6 +767,45 @@ impl eframe::App for HorizonApp {
                     self.controller_config.set_pad(btn, gp);
                     let _ = self.controller_config.save();
                     self.rebinding_pad = None;
+                }
+            }
+        }
+
+        {
+            let kb_home = ctx.input(|i| i.key_pressed(egui::Key::Home));
+            let gp_home = self.last_input.home;
+            let home_edge = kb_home || (gp_home && !self.last_home);
+            self.last_home = gp_home;
+
+            let (running, paused) = self
+                .emulation_handle
+                .as_ref()
+                .map_or((false, false), |h| (h.is_running(), h.is_paused()));
+
+            if home_edge && running && self.rebinding.is_none() && self.rebinding_pad.is_none() {
+                if paused {
+                    if let Some(h) = self.emulation_handle.as_ref() {
+                        h.resume();
+                    }
+                    self.pause_anim = None;
+                    self.resume_anim = Some(std::time::Instant::now());
+                } else if self.game_texture.is_some() {
+                    if let Some(h) = self.emulation_handle.as_ref() {
+                        h.pause();
+                    }
+                    if self.app_settings.view_mode != crate::app_settings::ViewMode::Carousel {
+                        self.app_settings.view_mode = crate::app_settings::ViewMode::Carousel;
+                        let _ = self.app_settings.save();
+                    }
+                    if let Some(pp) = self.playing_path.clone() {
+                        if let Some(idx) = self.library.index_of_path(&pp) {
+                            let n = self.library.move_to_front(idx);
+                            self.carousel.selected = n;
+                            self.carousel.scroll_offset = n as f32;
+                        }
+                    }
+                    self.carousel.active_dock = false;
+                    self.pause_anim = Some(std::time::Instant::now());
                 }
             }
         }
@@ -808,211 +972,618 @@ impl eframe::App for HorizonApp {
             .map_or(false, |h| !h.is_running())
         {
             self.emulation_handle = None;
+            self.pause_anim = None;
+            if self.stop_anim.is_none() && self.pill_fade.is_none() {
+                self.playing_path = None;
+            }
         }
 
         let fps = self.performance.get_fps();
         let running = self.is_running();
+        let paused = self
+            .emulation_handle
+            .as_ref()
+            .map_or(false, |h| h.is_paused());
 
-        egui::TopBottomPanel::top("topbar")
-            .exact_height(36.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
-                    .stroke(Stroke::new(1.0, BORDER)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.add_space(12.0);
+        if running && !paused {
+            let dt = ctx.input(|i| i.stable_dt).min(0.5) as f64;
+            if let Some(p) = self.playing_path.clone() {
+                self.play_times.add(&p, dt);
+            }
+        }
+        if self.last_playtime_save.elapsed() >= std::time::Duration::from_secs(20) {
+            self.play_times.save_if_dirty();
+            self.last_playtime_save = std::time::Instant::now();
+        }
 
-                    ui.label(
-                        egui::RichText::new("NeXium")
-                            .size(13.5)
-                            .strong()
-                            .color(TEXT),
-                    );
+        let playing_alpha = if let Some(start) = self.pill_fade {
+            let f = start.elapsed().as_secs_f32() / 0.40;
+            if f >= 1.0 {
+                self.pill_fade = None;
+                self.playing_path = None;
+                0.0
+            } else {
+                1.0 - f * f
+            }
+        } else {
+            1.0
+        };
+        let playing_index = self
+            .playing_path
+            .as_ref()
+            .and_then(|p| self.library.index_of_path(p));
 
-                    ui.add_space(8.0);
-                    ui.painter().vline(
-                        ui.cursor().left(),
-                        ui.max_rect().y_range(),
-                        Stroke::new(1.0, BORDER),
-                    );
-                    ui.add_space(8.0);
+        {
+            let ptarget = if self.show_profile { 1.0 } else { 0.0 };
+            let pdt = ctx.input(|i| i.stable_dt).min(0.1);
+            let speed = 3.6;
+            if self.profile_anim < ptarget {
+                self.profile_anim = (self.profile_anim + pdt * speed).min(ptarget);
+            } else if self.profile_anim > ptarget {
+                self.profile_anim = (self.profile_anim - pdt * speed).max(ptarget);
+            }
+        }
+        let profile_showing = self.show_profile || self.profile_anim > 0.0;
 
-                    ui.menu_button(egui::RichText::new("File").size(13.0).color(TEXT), |ui| {
-                        if ui.button("Open game…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("Switch games", &["nro", "dxci", "dnsp"])
-                                .pick_file()
-                            {
-                                self.nro_path = p.to_string_lossy().to_string();
-                            }
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Exit").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                    ui.menu_button(
-                        egui::RichText::new("Emulation").size(13.0).color(TEXT),
-                        |ui| {
-                            if ui.button("Boot").clicked() {
-                                self.boot_nro(ctx);
-                                ui.close_menu();
-                            }
-                            if ui.button("Stop").clicked() {
-                                self.stop_emulation();
-                                ui.close_menu();
-                            }
-                        },
-                    );
-                    ui.menu_button(egui::RichText::new("Debug").size(13.0).color(TEXT), |ui| {
-                        if ui.button("Memory").clicked() {
-                            self.debugger.toggle_memory();
-                            ui.close_menu();
-                        }
-                        if ui.button("Registers").clicked() {
-                            self.debugger.toggle_registers();
-                            ui.close_menu();
-                        }
-                        if ui.button("Disassembler").clicked() {
-                            self.debugger.toggle_disasm();
-                            ui.close_menu();
-                        }
-                        if ui.button("Logs").clicked() {
-                            self.debugger.toggle_logs();
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        let mut dumps_on = nexium_common::dumps::enabled();
-                        if ui.checkbox(&mut dumps_on, "Frame dumps (.bmp)").changed() {
-                            nexium_common::dumps::set_enabled(dumps_on);
-                        }
-                    });
-                    ui.menu_button(
-                        egui::RichText::new("Settings").size(13.0).color(TEXT),
-                        |ui| {
-                            if ui.button("Preferences").clicked() {
-                                self.show_settings = !self.show_settings;
-                                ui.close_menu();
-                            }
-                        },
-                    );
+        let carousel_mode = self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel
+            && (!running
+                || self.game_texture.is_none()
+                || paused
+                || self.stop_anim.is_some()
+                || self.pill_fade.is_some()
+                || self.resume_anim.is_some());
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let show_chrome =
+            self.app_settings.view_mode != crate::app_settings::ViewMode::Carousel;
+
+        if show_chrome {
+            egui::TopBottomPanel::top("topbar")
+                .exact_height(36.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
+                        .stroke(Stroke::new(1.0, BORDER)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal_centered(|ui| {
                         ui.add_space(12.0);
-                        let (fps_col, fps_str) = if fps >= 55.0 {
-                            (GREEN, format!("{:.0} fps", fps))
-                        } else if fps >= 28.0 {
-                            (AMBER, format!("{:.0} fps", fps))
-                        } else {
-                            (DANGER, format!("{:.0} fps", fps))
-                        };
+
                         ui.label(
-                            egui::RichText::new(fps_str)
-                                .size(12.0)
-                                .color(fps_col)
-                                .monospace(),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
-                        ui.add_space(6.0);
-                        let (dot, status_col) = if running {
-                            ("●", GREEN)
-                        } else {
-                            ("○", MUTED)
-                        };
-                        let status = if running { "Running" } else { "Idle" };
-                        ui.label(
-                            egui::RichText::new(format!("{} {}", dot, status))
-                                .size(12.0)
-                                .color(status_col),
+                            egui::RichText::new("NeXium")
+                                .size(13.5)
+                                .strong()
+                                .color(TEXT),
                         );
 
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
-                        ui.add_space(6.0);
-                        let docked = nexium_core::hid_state::is_docked();
-                        let (mode_icon, mode_txt, mode_col) = if docked {
-                            ("⏻", "Docked", GREEN)
-                        } else {
-                            ("▢", "Handheld", AMBER)
-                        };
-                        let mode_resp = ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("{} {}", mode_icon, mode_txt))
+                        ui.add_space(8.0);
+                        ui.painter().vline(
+                            ui.cursor().left(),
+                            ui.max_rect().y_range(),
+                            Stroke::new(1.0, BORDER),
+                        );
+                        ui.add_space(8.0);
+
+                        ui.menu_button(egui::RichText::new("File").size(13.0).color(TEXT), |ui| {
+                            if ui.button("Open game…").clicked() {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("Switch games", &["nro", "dxci", "dnsp"])
+                                    .pick_file()
+                                {
+                                    self.nro_path = p.to_string_lossy().to_string();
+                                }
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Exit").clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                        ui.menu_button(
+                            egui::RichText::new("Emulation").size(13.0).color(TEXT),
+                            |ui| {
+                                if running {
+                                    let label = if paused { "Resume" } else { "Pause" };
+                                    if ui.button(label).clicked() {
+                                        if let Some(h) = self.emulation_handle.as_ref() {
+                                            if paused {
+                                                h.resume();
+                                            } else {
+                                                h.pause();
+                                            }
+                                        }
+                                        self.pause_anim = None;
+                                        self.resume_anim = None;
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
+                                }
+                                if ui.button("Boot").clicked() {
+                                    self.boot_nro(ctx);
+                                    ui.close_menu();
+                                }
+                                if ui.button("Stop").clicked() {
+                                    self.stop_emulation();
+                                    ui.close_menu();
+                                }
+                            },
+                        );
+                        ui.menu_button(egui::RichText::new("Debug").size(13.0).color(TEXT), |ui| {
+                            if ui.button("Memory").clicked() {
+                                self.debugger.toggle_memory();
+                                ui.close_menu();
+                            }
+                            if ui.button("Registers").clicked() {
+                                self.debugger.toggle_registers();
+                                ui.close_menu();
+                            }
+                            if ui.button("Disassembler").clicked() {
+                                self.debugger.toggle_disasm();
+                                ui.close_menu();
+                            }
+                            if ui.button("Logs").clicked() {
+                                self.debugger.toggle_logs();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            let mut dumps_on = nexium_common::dumps::enabled();
+                            if ui.checkbox(&mut dumps_on, "Frame dumps (.bmp)").changed() {
+                                nexium_common::dumps::set_enabled(dumps_on);
+                            }
+                        });
+                        ui.menu_button(
+                            egui::RichText::new("Settings").size(13.0).color(TEXT),
+                            |ui| {
+                                if ui.button("Preferences").clicked() {
+                                    self.show_settings = !self.show_settings;
+                                    ui.close_menu();
+                                }
+                            },
+                        );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            let (fps_col, fps_str) = if fps >= 55.0 {
+                                (GREEN, format!("{:.0} fps", fps))
+                            } else if fps >= 28.0 {
+                                (AMBER, format!("{:.0} fps", fps))
+                            } else {
+                                (DANGER, format!("{:.0} fps", fps))
+                            };
+                            ui.label(
+                                egui::RichText::new(fps_str)
                                     .size(12.0)
-                                    .color(mode_col),
-                            )
-                            .sense(egui::Sense::click()),
-                        );
-                        if mode_resp.hovered() {
-                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        if mode_resp
-                            .on_hover_text("Toggle Docked / Handheld (Pro Controller vs Handheld)")
-                            .clicked()
-                        {
-                            nexium_core::hid_state::set_docked(!docked);
-                        }
+                                    .color(fps_col)
+                                    .monospace(),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                            ui.add_space(6.0);
+                            let (dot, status_col) = if running {
+                                ("●", GREEN)
+                            } else {
+                                ("○", MUTED)
+                            };
+                            let status = if running { "Running" } else { "Idle" };
+                            ui.label(
+                                egui::RichText::new(format!("{} {}", dot, status))
+                                    .size(12.0)
+                                    .color(status_col),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                            ui.add_space(6.0);
+                            let docked = nexium_core::hid_state::is_docked();
+                            let (mode_icon, mode_txt, mode_col) = if docked {
+                                ("⏻", "Docked", GREEN)
+                            } else {
+                                ("▢", "Handheld", AMBER)
+                            };
+                            let mode_resp = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{} {}", mode_icon, mode_txt))
+                                        .size(12.0)
+                                        .color(mode_col),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if mode_resp.hovered() {
+                                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if mode_resp
+                                .on_hover_text("Toggle Docked / Handheld (Pro Controller vs Handheld)")
+                                .clicked()
+                            {
+                                nexium_core::hid_state::set_docked(!docked);
+                            }
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
+                            ui.add_space(6.0);
+                            if pill_button(ui, "⊞ Carousel", false).clicked() {
+                                self.app_settings.view_mode = crate::app_settings::ViewMode::Carousel;
+                                let _ = self.app_settings.save();
+                            }
+                        });
                     });
                 });
-            });
+        }
 
-        egui::TopBottomPanel::bottom("statusbar")
-            .exact_height(22.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
-                    .stroke(Stroke::new(1.0, BORDER)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.add_space(12.0);
-                    let name = std::path::Path::new(&self.nro_path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "No file".into());
-                    ui.label(egui::RichText::new(name).size(11.0).color(MUTED));
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if show_chrome {
+            egui::TopBottomPanel::bottom("statusbar")
+                .exact_height(22.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
+                        .stroke(Stroke::new(1.0, BORDER)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal_centered(|ui| {
                         ui.add_space(12.0);
-                        let stats = self
-                            .emulation_handle
-                            .as_ref()
-                            .map(|h| h.stats.lock().clone())
-                            .unwrap_or_default();
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
-                                self.performance.get_frame_time(),
-                                stats.svc_count,
-                                stats.cycle_count,
-                            ))
-                            .size(11.0)
-                            .color(MUTED)
-                            .monospace(),
-                        );
+                        let name = std::path::Path::new(&self.nro_path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "No file".into());
+                        ui.label(egui::RichText::new(name).size(11.0).color(MUTED));
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            let stats = self
+                                .emulation_handle
+                                .as_ref()
+                                .map(|h| h.stats.lock().clone())
+                                .unwrap_or_default();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
+                                    self.performance.get_frame_time(),
+                                    stats.svc_count,
+                                    stats.cycle_count,
+                                ))
+                                .size(11.0)
+                                .color(MUTED)
+                                .monospace(),
+                            );
+                        });
                     });
                 });
-            });
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(BG))
             .show(ctx, |ui| {
-                if let Some(start) = self.stop_fade {
+                let full_rect = ui.max_rect();
+                if profile_showing {
+                    let avatar_tex = self.profile_texture.as_ref().map(|t| t.id());
+                    let ambient = self.carousel.ambient_color;
+                    let accent = match self.app_settings.carousel_theme.color() {
+                        Some((r, g, b)) => Color32::from_rgb(r, g, b),
+                        None => self.carousel.ambient_color,
+                    };
+
+                    let smooth = |x: f32| {
+                        let x = x.clamp(0.0, 1.0);
+                        x * x * (3.0 - 2.0 * x)
+                    };
+                    let p = self.profile_anim.clamp(0.0, 1.0);
+                    let backdrop_split = 0.4;
+                    let backdrop_opacity = smooth(p / backdrop_split);
+                    let content_opacity = smooth((p - backdrop_split) / (1.0 - backdrop_split));
+
+                    let profile_tex = self.profile_texture.as_ref().map(|t| t.id());
+                    let carousel_scale = 1.0;
+                    let carousel_alpha = 1.0;
+                    let _ = crate::carousel::carousel_view(
+                        &mut self.carousel,
+                        &mut self.library,
+                        ctx,
+                        ui,
+                        &self.last_input,
+                        running,
+                        playing_index,
+                        playing_alpha,
+                        self.app_settings.carousel_theme,
+                        profile_tex,
+                        &self.app_settings.profile_name,
+                        false,
+                        carousel_scale,
+                        carousel_alpha,
+                        self.app_settings.backdrop_theme,
+                        self.app_settings.light_mode,
+                        &self.app_settings.favorites,
+                    );
+
+                    let profile_scale = 0.92 + 0.08 * content_opacity;
+                    let action = crate::profile::profile_view(
+                        &mut self.profile,
+                        &mut self.library,
+                        &self.play_times,
+                        ctx,
+                        ui,
+                        full_rect,
+                        &self.app_settings.profile_name,
+                        avatar_tex,
+                        ambient,
+                        accent,
+                        content_opacity,
+                        backdrop_opacity,
+                        profile_scale,
+                        self.app_settings.backdrop_theme,
+                        self.app_settings.light_mode,
+                        &self.last_input,
+                    );
+                    if self.show_profile {
+                        match action {
+                            crate::profile::ProfileAction::Close => {
+                                self.show_profile = false;
+                                self.carousel.profile_focused = false;
+                            }
+                            crate::profile::ProfileAction::PickIcon => {
+                                self.pick_profile_avatar();
+                            }
+                            crate::profile::ProfileAction::SetName(name) => {
+                                self.app_settings.profile_name = name;
+                                let _ = self.app_settings.save();
+                            }
+                            crate::profile::ProfileAction::SetBackdropTheme(theme) => {
+                                if self.app_settings.backdrop_theme != theme {
+                                    self.app_settings.backdrop_theme = theme;
+                                    let _ = self.app_settings.save();
+                                }
+                            }
+                            crate::profile::ProfileAction::SetLightMode(on) => {
+                                if self.app_settings.light_mode != on {
+                                    self.app_settings.light_mode = on;
+                                    let _ = self.app_settings.save();
+                                }
+                            }
+                            crate::profile::ProfileAction::None => {}
+                        }
+                    }
+                    ctx.request_repaint();
+                } else if carousel_mode {
+                    let booting = running && !paused && self.game_texture.is_none();
+                    if booting {
+                        let bg_rect = ui.max_rect();
+                        let painter = ui.painter();
+                        let t = ui.input(|i| i.time) as f32;
+
+                        painter.rect_filled(bg_rect, Rounding::ZERO, Color32::from_rgb(0x06, 0x06, 0x08));
+
+                        let game_index = self.carousel.selected;
+                        let game_info = self.library.games.get(game_index).map(|g| {
+                            (g.title.clone(), g.format.to_string(), g.dominant_color)
+                        });
+                        let dom_color = game_info.as_ref().map(|(_, _, col)| *col).unwrap_or(Color32::from_rgb(0x2F, 0xB4, 0xEF));
+
+                        let elapsed_awaiting = if let crate::carousel::BootStage::AwaitingFrame { start_time, .. } = self.carousel.boot_stage {
+                            (t - start_time).max(0.0)
+                        } else {
+                            0.0
+                        };
+                        let fade_alpha = (elapsed_awaiting / 0.55).min(1.0); // 550ms fade-in
+
+                        let glow_intensity = (((t * 2.2).sin() * 0.12 + 0.18).clamp(0.0, 1.0)) * fade_alpha;
+                        let center = bg_rect.center();
+                        for r_offset in (0..12).rev() {
+                            let r = 140.0 + r_offset as f32 * 12.0;
+                            let alpha = (4.0 * (1.0 - r_offset as f32 / 12.0) * glow_intensity * fade_alpha) as u8;
+                            let col = Color32::from_rgba_unmultiplied(dom_color.r(), dom_color.g(), dom_color.b(), alpha);
+                            painter.circle_filled(center - Vec2::new(0.0, 48.0), r, col);
+                        }
+
+                        let card_sz = 260.0f32;
+                        let card_rect = egui::Rect::from_center_size(center - Vec2::new(0.0, 48.0), Vec2::splat(card_sz));
+
+                        crate::carousel::draw_gradient_rounded_rect(&painter, card_rect.center(), card_rect.expand(6.0), 16.0, t, (120.0 * fade_alpha) as u8);
+                        crate::carousel::draw_gradient_rounded_rect(&painter, card_rect.center(), card_rect.expand(2.5), 14.0, t, (255.0 * fade_alpha) as u8);
+
+                        painter.rect_filled(card_rect, Rounding::same(14.0), Color32::from_rgba_unmultiplied(0x14, 0x14, 0x1A, (fade_alpha * 255.0) as u8));
+                        let card_tint = Color32::from_white_alpha((fade_alpha * 255.0) as u8);
+                        if let Some(tex) = self.library.texture(ctx, game_index) {
+                            crate::carousel::draw_rounded_image(&painter, tex.id(), card_rect, 14.0, card_tint);
+                        } else if let Some((_, format, _)) = &game_info {
+                            painter.text(card_rect.center(), egui::Align2::CENTER_CENTER, format, FontId::proportional(card_sz * 0.13), Color32::from_rgba_unmultiplied(0x70, 0x70, 0x80, (fade_alpha * 255.0) as u8));
+                        }
+
+                        if let Some((title, _, _)) = &game_info {
+                            let text_y = center.y + card_sz * 0.5 + 24.0;
+                            let title_alpha = (fade_alpha * 255.0) as u8;
+                            crate::carousel::shadowed_text(&painter, egui::pos2(center.x, text_y), egui::Align2::CENTER_CENTER, title, FontId::proportional(28.0), Color32::from_rgba_unmultiplied(255, 255, 255, title_alpha), true);
+
+                            let dots = match (t as u64) % 4 {
+                                0 => "",
+                                1 => ".",
+                                2 => "..",
+                                3 => "...",
+                                _ => "...",
+                            };
+                            let await_text = format!("Awaiting First Frame{}", dots);
+                            let await_alpha = (fade_alpha * 255.0) as u8;
+                            crate::carousel::shadowed_text(&painter, egui::pos2(center.x, text_y + 40.0), egui::Align2::CENTER_CENTER, &await_text, FontId::proportional(15.0), Color32::from_rgba_unmultiplied(0x00, 0xE5, 0xFF, await_alpha), false);
+                        }
+
+                        ctx.request_repaint();
+                    } else {
+                        let panel = ui.max_rect();
+                        let scale_f = if let Some(start) = self.pause_anim.or(self.stop_anim) {
+                            let f = (start.elapsed().as_secs_f32() / 0.30).min(1.0);
+                            let e = 1.0 - (1.0 - f) * (1.0 - f);
+                            0.90 + 0.10 * e
+                        } else {
+                            1.0
+                        };
+                        let profile_tex = self.profile_texture.as_ref().map(|t| t.id());
+                        let action = crate::carousel::carousel_view(
+                            &mut self.carousel,
+                            &mut self.library,
+                            ctx,
+                            ui,
+                            &self.last_input,
+                            running,
+                            playing_index,
+                            playing_alpha,
+                            self.app_settings.carousel_theme,
+                            profile_tex,
+                            &self.app_settings.profile_name,
+                            !self.show_settings,
+                            scale_f,
+                            1.0,
+                            self.app_settings.backdrop_theme,
+                            self.app_settings.light_mode,
+                            &self.app_settings.favorites,
+                        );
+                        match action {
+                            crate::carousel::CarouselAction::Launch(path) => {
+                                self.nro_path = path;
+                                self.boot_nro(ctx);
+                            }
+                            crate::carousel::CarouselAction::SetTheme(th) => {
+                                if self.app_settings.carousel_theme != th {
+                                    self.app_settings.carousel_theme = th;
+                                    let _ = self.app_settings.save();
+                                }
+                            }
+                            crate::carousel::CarouselAction::Resume => {
+                                if let Some(h) = self.emulation_handle.as_ref() {
+                                    h.resume();
+                                }
+                                self.pause_anim = None;
+                                self.resume_anim = Some(std::time::Instant::now());
+                            }
+                            crate::carousel::CarouselAction::OpenProfile => {
+                                self.profile.tab = crate::profile::ProfileTab::Profile;
+                                self.profile.name_buf = self.app_settings.profile_name.clone();
+                                self.profile.focus_content = false;
+                                self.profile.row_selected = 0;
+                                self.show_profile = true;
+                            }
+                            crate::carousel::CarouselAction::SwitchToGrid => {
+                                self.app_settings.view_mode = crate::app_settings::ViewMode::Grid;
+                                let _ = self.app_settings.save();
+                            }
+                            crate::carousel::CarouselAction::StopEmulation => {
+                                self.stop_emulation();
+                            }
+                            crate::carousel::CarouselAction::OpenSettings => {
+                                self.settings_tab = SettingsTab::General;
+                                self.show_settings = true;
+                            }
+                            crate::carousel::CarouselAction::OpenController => {
+                                self.settings_tab = SettingsTab::Controller;
+                                self.show_settings = true;
+                            }
+                            crate::carousel::CarouselAction::OpenDebug => {
+                                self.debugger.toggle_logs();
+                            }
+                            crate::carousel::CarouselAction::Quit => {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            crate::carousel::CarouselAction::Rescan => {
+                                self.library.rescan(ctx, &self.app_settings.library_folders);
+                            }
+                            crate::carousel::CarouselAction::AddFolder => {
+                                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                    if !self.app_settings.library_folders.contains(&dir) {
+                                        self.app_settings.library_folders.push(dir);
+                                        let _ = self.app_settings.save();
+                                    }
+                                    self.library.rescan(ctx, &self.app_settings.library_folders);
+                                }
+                            }
+                            crate::carousel::CarouselAction::ToggleFavorite(path) => {
+                                let p = std::path::PathBuf::from(path);
+                                if let Some(pos) = self.app_settings.favorites.iter().position(|x| *x == p) {
+                                    self.app_settings.favorites.remove(pos);
+                                } else {
+                                    self.app_settings.favorites.push(p);
+                                }
+                                let _ = self.app_settings.save();
+                            }
+                            crate::carousel::CarouselAction::None => {}
+                        }
+
+                        if let Some(start) = self.pause_anim.or(self.stop_anim) {
+                            let f = (start.elapsed().as_secs_f32() / 0.30).min(1.0);
+                            if f >= 1.0 {
+                                self.pause_anim = None;
+                                if self.stop_anim.take().is_some() {
+                                    self.game_texture = None;
+                                    if self.playing_path.is_some() {
+                                        self.pill_fade = Some(std::time::Instant::now());
+                                    }
+                                }
+                            } else if let Some(tex) = self.game_texture.clone() {
+                                let ef = 1.0 - (1.0 - f) * (1.0 - f);
+                                let rect = self.game_draw_rect(panel, tex.size_vec2());
+                                let p = ctx.layer_painter(egui::LayerId::new(
+                                    egui::Order::Foreground,
+                                    egui::Id::new("home_zoom"),
+                                ));
+                                draw_zoom_fade_out(&p, rect, &tex, ef);
+                            }
+                            ctx.request_repaint();
+                        } else if let Some(start) = self.resume_anim {
+                            let f = (start.elapsed().as_secs_f32() / 0.30).min(1.0);
+                            if let Some(tex) = self.game_texture.clone() {
+                                let ef = 1.0 - (1.0 - f) * (1.0 - f);
+                                let rect = self.game_draw_rect(panel, tex.size_vec2());
+                                let p = ctx.layer_painter(egui::LayerId::new(
+                                    egui::Order::Foreground,
+                                    egui::Id::new("home_zoom"),
+                                ));
+                                let cover = (ef * 1.5).min(1.0);
+                                p.rect_filled(
+                                    panel,
+                                    Rounding::ZERO,
+                                    Color32::from_rgba_unmultiplied(BG.r(), BG.g(), BG.b(), (cover * 255.0) as u8),
+                                );
+                                draw_zoom_fade_in(&p, rect, &tex, ef);
+                            }
+                            if f >= 1.0 {
+                                self.resume_anim = None;
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                } else if let Some(start) = self.stop_fade {
                     let t = start.elapsed().as_secs_f32() / 0.9;
                     let panel = ui.max_rect();
-                    let tex = self.game_texture.clone();
-                    self.library_view(ui, ctx);
+                    let tex = if t < 1.05 { self.game_texture.clone() } else { None };
+                    if self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel {
+                        let scale_f = 0.92 + 0.08 * t.min(1.0);
+                        let profile_tex = self.profile_texture.as_ref().map(|t| t.id());
+                        let _ = crate::carousel::carousel_view(
+                            &mut self.carousel,
+                            &mut self.library,
+                            ctx,
+                            ui,
+                            &self.last_input,
+                            running,
+                            playing_index,
+                            playing_alpha,
+                            self.app_settings.carousel_theme,
+                            profile_tex,
+                            &self.app_settings.profile_name,
+                            true,
+                            scale_f,
+                            1.0,
+                            self.app_settings.backdrop_theme,
+                            self.app_settings.light_mode,
+                            &self.app_settings.favorites,
+                        );
+                    } else {
+                        self.library_view(ui, ctx);
+                    }
                     if let Some(tex) = tex {
                         let rect = self.game_draw_rect(panel, tex.size_vec2());
                         let p = ctx.layer_painter(egui::LayerId::new(
                             egui::Order::Foreground,
                             egui::Id::new("stop_dissolve"),
                         ));
-                        draw_dissolve(&p, rect, &tex, t);
+                        if self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel {
+                            draw_zoom_fade_out(&p, rect, &tex, t);
+                        } else {
+                            draw_dissolve(&p, rect, &tex, t);
+                        }
                     }
                     ctx.request_repaint();
                     if t >= 1.05 {

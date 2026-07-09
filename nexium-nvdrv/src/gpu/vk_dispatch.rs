@@ -1548,16 +1548,27 @@ fn execute_one(
 
             {
                 let want_addrs = parse_env_u64_list("NEXIUM_DUMP_FS");
-                if want_addrs.contains(&fs_addr) {
-                    let fs_dis = nexium_shader::disassemble(&fs_sass)
-                        .into_iter()
-                        .map(|line| line.to_string_compact())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let _ = std::fs::write(
-                        format!("C:/Users/Mythrax/Desktop/target_fs_{:x}.txt", fs_addr),
-                        &fs_dis,
-                    );
+                let dump_lit = std::env::var_os("NEXIUM_DUMP_LIT").is_some()
+                    && fs_tex_ids.iter().filter(|t| **t != u32::MAX).count() >= 2;
+                if want_addrs.contains(&fs_addr) || dump_lit {
+                    use std::sync::{Mutex, OnceLock};
+                    static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+                    let first = SEEN
+                        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+                        .lock()
+                        .unwrap()
+                        .insert(fs_addr);
+                    if first {
+                        let fs_dis = nexium_shader::disassemble(&fs_sass)
+                            .into_iter()
+                            .map(|line| line.to_string_compact())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        log::warn!(
+                            "[dump-fs] fs={:#x} tex_ids={:?} input_map={:?} output_map={:#x}\n{}",
+                            fs_addr, fs_tex_ids, fs_input_map, fs_output_map, fs_dis
+                        );
+                    }
                 }
             }
             {

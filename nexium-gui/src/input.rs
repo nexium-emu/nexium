@@ -49,6 +49,7 @@ pub struct InputSnapshot {
     pub connected: bool,
     pub buttons: u64,
     pub sticks: [i32; 4],
+    pub home: bool,
 }
 
 impl InputSnapshot {
@@ -57,6 +58,7 @@ impl InputSnapshot {
             connected: false,
             buttons: 0,
             sticks: [0; 4],
+            home: false,
         }
     }
 
@@ -144,6 +146,7 @@ impl InputBackend {
             }
         }
         snap.buttons = cfg.gamepad_pressed(raw);
+        snap.home = pad.button(Button::Guide);
 
         let dz = |v: f32| if v.abs() < 0.12 { 0.0 } else { v };
         let ax = |a: Axis| pad.axis(a) as f32 / 32768.0;

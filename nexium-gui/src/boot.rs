@@ -387,6 +387,7 @@ pub struct EmuStats {
 
 pub struct EmulationHandle {
     pub stop_flag: Arc<AtomicBool>,
+    pub pause_flag: Arc<AtomicBool>,
     pub frame_rx: Receiver<Frame>,
     pub thread_handle: Option<thread::JoinHandle<Result<(), String>>>,
     pub cpu_snapshot: Arc<Mutex<CpuSnapshot>>,
@@ -403,6 +404,8 @@ impl EmulationHandle {
         let nro_path = nro_path.to_string();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);
+        let pause_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag_clone = Arc::clone(&pause_flag);
         let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(2);
         let cpu_snapshot = Arc::new(Mutex::new(CpuSnapshot::default()));
         let cpu_snapshot_clone = Arc::clone(&cpu_snapshot);
@@ -470,6 +473,7 @@ impl EmulationHandle {
                     for core_id in 1..active_cores {
                         let kernel_aux = Arc::clone(&boot_ctx.kernel);
                         let stop_aux = Arc::clone(&aux_core_stop);
+                        let pause_aux = Arc::clone(&pause_flag_clone);
                         let backend_aux = cpu_backend;
                         let addr_aux = Arc::clone(&boot_ctx.address_space);
                         if let Ok(handle) = thread::Builder::new()
@@ -493,6 +497,10 @@ impl EmulationHandle {
                                 let mut aux_svcs = 0u32;
                                 log::info!("[core{}] started", core_id);
                                 while !stop_aux.load(Ordering::Relaxed) {
+                                    if pause_aux.load(Ordering::Relaxed) {
+                                        std::thread::sleep(std::time::Duration::from_micros(500));
+                                        continue;
+                                    }
                                     let has = {
                                         let mut k = kernel_aux.lock();
                                         k.threads.wake_due_sleepers(std::time::Instant::now());
@@ -700,6 +708,12 @@ impl EmulationHandle {
                     if stop_flag_clone.load(Ordering::Relaxed) {
                         log::info!("Stopping emulation");
                         break;
+                    }
+
+                    if pause_flag_clone.load(Ordering::Relaxed) {
+                        drop(guard);
+                        std::thread::sleep(std::time::Duration::from_millis(12));
+                        continue;
                     }
 
                     if let Some(va) = nexium_memory::fastmem::take_guest_probe_event() {
@@ -1360,6 +1374,7 @@ impl EmulationHandle {
 
         Ok(Self {
             stop_flag,
+            pause_flag,
             frame_rx,
             thread_handle: Some(thread_handle),
             cpu_snapshot,
@@ -1385,6 +1400,24 @@ impl EmulationHandle {
 
     pub fn is_running(&self) -> bool {
         !self.stop_flag.load(Ordering::Relaxed)
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.pause_flag.load(Ordering::Relaxed)
+    }
+
+    pub fn pause(&self) {
+        self.pause_flag.store(true, Ordering::Relaxed);
+    }
+
+    pub fn resume(&self) {
+        self.pause_flag.store(false, Ordering::Relaxed);
+    }
+
+    pub fn toggle_pause(&self) -> bool {
+        let now = !self.is_paused();
+        self.pause_flag.store(now, Ordering::Relaxed);
+        now
     }
 }
 
