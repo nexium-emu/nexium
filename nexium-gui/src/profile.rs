@@ -82,6 +82,7 @@ pub enum ProfileAction {
     SetName(String),
     SetBackdropTheme(crate::app_settings::BackdropTheme),
     SetLightMode(bool),
+    QuickLaunch(String),
 }
 
 fn brighten(c: Color32, amt: f32) -> Color32 {
@@ -161,6 +162,7 @@ pub fn profile_view(
     scale_factor: f32,
     backdrop_theme: crate::app_settings::BackdropTheme,
     light_mode: bool,
+    active: bool,
     last_input: &InputSnapshot,
 ) -> ProfileAction {
     let mut action = ProfileAction::None;
@@ -287,6 +289,16 @@ pub fn profile_view(
         }
     }
 
+    if !active {
+        back = false;
+        up = false;
+        down = false;
+        enter = false;
+        leave = false;
+        tab_left = false;
+        tab_right = false;
+    }
+
     const TAB_ORDER: [ProfileTab; 4] = [
         ProfileTab::Profile,
         ProfileTab::RecentlyPlayed,
@@ -295,6 +307,7 @@ pub fn profile_view(
     ];
     let tab_idx = TAB_ORDER.iter().position(|x| *x == state.tab).unwrap_or(0);
     const N_SETTINGS: usize = 2;
+    let launch_enter = enter && state.focus_content;
 
     if tab_left {
         state.tab = TAB_ORDER[(tab_idx + TAB_ORDER.len() - 1) % TAB_ORDER.len()];
@@ -461,6 +474,8 @@ pub fn profile_view(
                 play,
                 accent,
                 state,
+                launch_enter,
+                &mut action,
                 scale_factor,
                 &scale_pos,
                 &scale_rect,
@@ -840,6 +855,8 @@ fn recently_played_page(
     play: &PlayTimes,
     accent: Color32,
     state: &mut ProfileState,
+    enter: bool,
+    action: &mut ProfileAction,
     scale_factor: f32,
     scale_pos: &impl Fn(egui::Pos2) -> egui::Pos2,
     scale_rect: &impl Fn(egui::Rect) -> egui::Rect,
@@ -872,6 +889,11 @@ fn recently_played_page(
         return;
     }
     state.row_selected = state.row_selected.min(order.len() - 1);
+
+    if state.focus_content && enter {
+        let path = lib.games[order[state.row_selected]].path.to_string_lossy().to_string();
+        *action = ProfileAction::QuickLaunch(path);
+    }
 
     let row_h = 52.0 * s;
     let gap = 8.0 * s;
@@ -909,10 +931,14 @@ fn recently_played_page(
         let secs = play.get(&lib.games[i].path);
         let tex = lib.texture(ctx, i);
         let scaled_rect = scale_rect(rect);
-        let row_resp = ui.allocate_rect(scaled_rect, Sense::click());
+        let row_resp = ui.interact(scaled_rect, egui::Id::new(("rp_row", i)), Sense::click());
         if row_resp.clicked() {
-            state.focus_content = true;
-            state.row_selected = vis;
+            if state.focus_content && state.row_selected == vis {
+                *action = ProfileAction::QuickLaunch(lib.games[i].path.to_string_lossy().to_string());
+            } else {
+                state.focus_content = true;
+                state.row_selected = vis;
+            }
         }
         let is_sel = state.focus_content && vis == state.row_selected;
 

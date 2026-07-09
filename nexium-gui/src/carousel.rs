@@ -500,7 +500,7 @@ pub fn draw_wave_background(
 
     let w = rect.width();
     let h = rect.height();
-    let steps = 128usize;
+    let steps = 96usize;
 
     let bands: &[(f32, f32, f32, f32, u8)] = &[
         (0.55, 0.012, 0.0,  1.5,  70),
@@ -903,7 +903,7 @@ pub fn carousel_view(
         }
 
         let is_add_dir = i == filtered_indices.len();
-        let resp = ui.allocate_rect(draw_rect, Sense::click());
+        let resp = ui.interact(draw_rect, egui::Id::new(("carousel_card", i)), Sense::click());
         if interactive && resp.clicked() && !state.drag_moved && state.boot_stage == BootStage::None {
             if state.selected == i {
                 if state.active_dock {
@@ -1366,7 +1366,7 @@ pub fn carousel_view(
         let scaled_av = screen_center + (av_center - screen_center) * scale_factor;
         let scaled_av_r = av_r * scale_factor;
         let av_rect = egui::Rect::from_center_size(scaled_av, Vec2::splat(scaled_av_r * 2.0));
-        let av_resp = ui.allocate_rect(av_rect.expand(3.0 * scale_factor), Sense::click());
+        let av_resp = ui.interact(av_rect.expand(3.0 * scale_factor), egui::Id::new("carousel_avatar"), Sense::click());
         if interactive && av_resp.clicked() && state.boot_stage == BootStage::None && !state.palette_open && state.profile_click_time.is_none() {
             state.profile_click_time = Some(t);
         }

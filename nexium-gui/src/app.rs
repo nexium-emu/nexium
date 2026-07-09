@@ -84,6 +84,8 @@ pub struct HorizonApp {
     modal_hold: bool,
     modal_anim: f32,
     modal_snap: Option<ModalSnap>,
+    pending_quick: Option<String>,
+    modal_active_frame_start: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -99,6 +101,7 @@ pub enum SettingsTab {
 enum ConfirmKind {
     CloseGame,
     LaunchGame(String),
+    QuickLaunch(String),
 }
 
 struct ConfirmDialog {
@@ -179,6 +182,8 @@ impl HorizonApp {
             modal_hold: false,
             modal_anim: 0.0,
             modal_snap: None,
+            pending_quick: None,
+            modal_active_frame_start: false,
         };
         app.reload_profile_texture(&cc.egui_ctx);
         app.library
@@ -481,12 +486,58 @@ impl HorizonApp {
         if !confirmed {
             return;
         }
-        self.stop_emulation();
-        self.teardown_at = Some(std::time::Instant::now());
-        self.pending_boot = match dlg.kind {
-            ConfirmKind::LaunchGame(path) => Some(path),
-            ConfirmKind::CloseGame => None,
-        };
+        match dlg.kind {
+            ConfirmKind::CloseGame => {
+                self.stop_emulation();
+                self.teardown_at = Some(std::time::Instant::now());
+                self.pending_boot = None;
+            }
+            ConfirmKind::LaunchGame(path) => {
+                self.stop_emulation();
+                self.teardown_at = Some(std::time::Instant::now());
+                self.pending_boot = Some(path);
+            }
+            ConfirmKind::QuickLaunch(path) => {
+                if let Some(idx) = self.library.index_of_path(&std::path::PathBuf::from(&path)) {
+                    let n = self.library.move_to_front(idx);
+                    self.carousel.selected = n;
+                    self.carousel.scroll_offset = n as f32;
+                }
+                self.show_profile = false;
+                if self.app_settings.view_mode != crate::app_settings::ViewMode::Carousel {
+                    self.app_settings.view_mode = crate::app_settings::ViewMode::Carousel;
+                    let _ = self.app_settings.save();
+                }
+                self.pending_quick = Some(path);
+            }
+        }
+    }
+
+    fn quick_launch_tick(&mut self, ctx: &egui::Context) {
+        if self.pending_quick.is_none() {
+            return;
+        }
+        if self.show_profile || self.profile_anim > 0.02 {
+            ctx.request_repaint();
+            return;
+        }
+        let path = self.pending_quick.take().unwrap();
+        let running = self
+            .emulation_handle
+            .as_ref()
+            .map_or(false, |h| h.is_running());
+        if running {
+            self.stop_emulation();
+            self.teardown_at = Some(std::time::Instant::now());
+            self.pending_boot = Some(path);
+        } else {
+            let now = ctx.input(|i| i.time) as f32;
+            self.carousel.boot_stage = crate::carousel::BootStage::Transitioning {
+                game_index: self.carousel.selected,
+                start_time: now,
+                launch_path: path,
+            };
+        }
     }
 
     fn handle_modal_input(&mut self, ctx: &egui::Context) {
@@ -599,12 +650,15 @@ impl HorizonApp {
         };
 
         let screen = ctx.screen_rect();
-        let mut p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("modal_overlay")));
+        let mut p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("modal_overlay")));
         p.set_opacity(ease);
         p.rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(195));
 
         let pop = 0.90 + 0.10 * ease;
-        let w = (screen.width() * 0.4).clamp(380.0, 560.0) * pop;
+        let body_font = FontId::proportional(19.0);
+        let body_w = ui.fonts(|f| f.layout_no_wrap(body.clone(), body_font, text).size().x);
+        let base_w = (body_w + 72.0).clamp(380.0, (screen.width() - 60.0).max(400.0));
+        let w = base_w * pop;
         let h = 224.0 * pop;
         let box_rect = egui::Rect::from_center_size(screen.center(), Vec2::new(w, h));
         p.rect_filled(box_rect.translate(Vec2::new(0.0, 10.0)), Rounding::same(18.0), Color32::from_black_alpha(90));
@@ -619,7 +673,7 @@ impl HorizonApp {
         }
 
         p.text(egui::pos2(box_rect.center().x, box_rect.min.y + 40.0 * pop), egui::Align2::CENTER_CENTER, &title, FontId::proportional(15.0 * pop), muted);
-        p.text(egui::pos2(box_rect.center().x, box_rect.center().y - 14.0 * pop), egui::Align2::CENTER_CENTER, &body, FontId::proportional(21.0 * pop), text);
+        p.text(egui::pos2(box_rect.center().x, box_rect.center().y - 14.0 * pop), egui::Align2::CENTER_CENTER, &body, FontId::proportional(19.0 * pop), text);
 
         let btn_w = w * 0.42;
         let btn_h = 46.0 * pop;
@@ -842,20 +896,20 @@ fn draw_dissolve(p: &egui::Painter, rect: egui::Rect, tex_id: egui::TextureId, t
     p.add(egui::Shape::mesh(mesh));
 }
 
-fn draw_zoom_fade_out(p: &egui::Painter, rect: egui::Rect, tex: &egui::TextureHandle, t: f32) {
+fn draw_zoom_fade_out(p: &egui::Painter, rect: egui::Rect, tex_id: egui::TextureId, t: f32) {
     let t = t.clamp(0.0, 1.0);
     let scale = 1.0 - 0.08 * t;
     let alpha = 1.0 - t;
     let draw_rect = egui::Rect::from_center_size(rect.center(), rect.size() * scale);
-    p.image(tex.id(), draw_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
+    p.image(tex_id, draw_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
 }
 
-fn draw_zoom_fade_in(p: &egui::Painter, rect: egui::Rect, tex: &egui::TextureHandle, t: f32) {
+fn draw_zoom_fade_in(p: &egui::Painter, rect: egui::Rect, tex_id: egui::TextureId, t: f32) {
     let t = t.clamp(0.0, 1.0);
     let scale = 1.06 - 0.06 * t;
     let alpha = t;
     let draw_rect = egui::Rect::from_center_size(rect.center(), rect.size() * scale);
-    p.image(tex.id(), draw_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
+    p.image(tex_id, draw_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
 }
 
 fn cell_hash(i: usize, j: usize) -> f32 {
@@ -1126,8 +1180,10 @@ impl eframe::App for HorizonApp {
             self.carousel.x_held = x_down;
         }
 
+        self.modal_active_frame_start = self.modal_active();
         self.handle_modal_input(ctx);
         self.teardown_tick(ctx);
+        self.quick_launch_tick(ctx);
 
         {
             let kb_home = ctx.input(|i| i.key_pressed(egui::Key::Home));
@@ -1443,6 +1499,7 @@ impl eframe::App for HorizonApp {
                         ui.menu_button(
                             egui::RichText::new("Emulation").size(13.0).color(TEXT),
                             |ui| {
+                                ui.set_min_width(110.0);
                                 if running {
                                     let label = if paused { "Resume" } else { "Pause" };
                                     if ui.button(label).clicked() {
@@ -1666,6 +1723,7 @@ impl eframe::App for HorizonApp {
                     );
 
                     let profile_scale = 0.92 + 0.08 * content_opacity;
+                    let profile_active = !self.modal_active() && !self.modal_active_frame_start;
                     let action = crate::profile::profile_view(
                         &mut self.profile,
                         &mut self.library,
@@ -1682,6 +1740,7 @@ impl eframe::App for HorizonApp {
                         profile_scale,
                         self.app_settings.backdrop_theme,
                         self.app_settings.light_mode,
+                        profile_active,
                         &self.last_input,
                     );
                     if self.show_profile {
@@ -1689,6 +1748,16 @@ impl eframe::App for HorizonApp {
                             crate::profile::ProfileAction::Close => {
                                 self.show_profile = false;
                                 self.carousel.profile_focused = false;
+                            }
+                            crate::profile::ProfileAction::QuickLaunch(path) => {
+                                self.confirm = Some(ConfirmDialog {
+                                    title: "Quick Launch".into(),
+                                    body: "Quick Launch this game? Any open game will be shut down first.".into(),
+                                    confirm_label: "Launch".into(),
+                                    selected: 0,
+                                    kind: ConfirmKind::QuickLaunch(path),
+                                });
+                                self.modal_hold = true;
                             }
                             crate::profile::ProfileAction::PickIcon => {
                                 self.pick_profile_avatar();
@@ -1905,21 +1974,21 @@ impl eframe::App for HorizonApp {
                                         self.pill_fade = Some(std::time::Instant::now());
                                     }
                                 }
-                            } else if let Some(tex) = self.game_texture.clone() {
+                            } else if let Some((tid, tsz)) = self.game_display() {
                                 let ef = 1.0 - (1.0 - f) * (1.0 - f);
-                                let rect = self.game_draw_rect(panel, tex.size_vec2());
+                                let rect = self.game_draw_rect(panel, tsz);
                                 let p = ctx.layer_painter(egui::LayerId::new(
                                     egui::Order::Foreground,
                                     egui::Id::new("home_zoom"),
                                 ));
-                                draw_zoom_fade_out(&p, rect, &tex, ef);
+                                draw_zoom_fade_out(&p, rect, tid, ef);
                             }
                             ctx.request_repaint();
                         } else if let Some(start) = self.resume_anim {
                             let f = (start.elapsed().as_secs_f32() / 0.30).min(1.0);
-                            if let Some(tex) = self.game_texture.clone() {
+                            if let Some((tid, tsz)) = self.game_display() {
                                 let ef = 1.0 - (1.0 - f) * (1.0 - f);
-                                let rect = self.game_draw_rect(panel, tex.size_vec2());
+                                let rect = self.game_draw_rect(panel, tsz);
                                 let p = ctx.layer_painter(egui::LayerId::new(
                                     egui::Order::Foreground,
                                     egui::Id::new("home_zoom"),
@@ -1930,7 +1999,7 @@ impl eframe::App for HorizonApp {
                                     Rounding::ZERO,
                                     Color32::from_rgba_unmultiplied(BG.r(), BG.g(), BG.b(), (cover * 255.0) as u8),
                                 );
-                                draw_zoom_fade_in(&p, rect, &tex, ef);
+                                draw_zoom_fade_in(&p, rect, tid, ef);
                             }
                             if f >= 1.0 {
                                 self.resume_anim = None;
@@ -1964,13 +2033,13 @@ impl eframe::App for HorizonApp {
                             &self.app_settings.favorites,
                         );
                         if t < 1.05 {
-                            if let Some(tex) = self.game_texture.clone() {
-                                let rect = self.game_draw_rect(panel, tex.size_vec2());
+                            if let Some((tid, tsz)) = self.game_display() {
+                                let rect = self.game_draw_rect(panel, tsz);
                                 let p = ctx.layer_painter(egui::LayerId::new(
                                     egui::Order::Foreground,
                                     egui::Id::new("stop_dissolve"),
                                 ));
-                                draw_zoom_fade_out(&p, rect, &tex, t);
+                                draw_zoom_fade_out(&p, rect, tid, t);
                             }
                         }
                     } else {
