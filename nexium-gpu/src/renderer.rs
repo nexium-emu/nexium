@@ -3648,6 +3648,12 @@ impl Renderer {
                             None => true,
                         };
                     if need_upload {
+                        if tic.is_srgb && std::env::var_os("NEXIUM_TIC_SRGB_LOG").is_some() {
+                            log::warn!(
+                                "[tic-srgb] batch {}x{} fmt={:?} bl={} va={:#x}",
+                                tic.width, tic.height, tic.format, tic.is_block_linear, tic.gpu_va
+                            );
+                        }
                         let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
                             .map(|v| v == "1")
                             .unwrap_or(false);
@@ -6497,6 +6503,18 @@ where
             let tic_addr = call.tic_pool_gpu_va.wrapping_add((*tex_id as u64) * 32);
             read_guest(tic_addr, 32).and_then(|tic_raw| {
                 crate::texture::TicEntry::parse(&tic_raw).map(|tic| {
+                    if tic.is_srgb && std::env::var_os("NEXIUM_TIC_SRGB_LOG").is_some() {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static N: AtomicU64 = AtomicU64::new(0);
+                        let n = N.fetch_add(1, Ordering::Relaxed);
+                        if n < 400 {
+                            log::warn!(
+                                "[tic-srgb] fs={:#x} id={} {}x{} fmt={:?} bl={} va={:#x}",
+                                call.fs_gpu_va, tex_id, tic.width, tic.height,
+                                tic.format, tic.is_block_linear, tic.gpu_va
+                            );
+                        }
+                    }
                     if bind_trace_fs(call.fs_gpu_va) {
                         let w0 = u32::from_le_bytes([tic_raw[0], tic_raw[1], tic_raw[2], tic_raw[3]]);
                         let w4 = u32::from_le_bytes([tic_raw[16], tic_raw[17], tic_raw[18], tic_raw[19]]);
@@ -6592,7 +6610,9 @@ fn rt_alias_for_slot(
     let found = drawn_color_alias_for_key(rt_cache, sk)
         .or_else(|| rt_cache.find_color_with_format(sk))
         .or_else(|| {
-            if call.sampled_rt_fuzzy && sk.gpu_va == 0 {
+            if call.sampled_rt_fuzzy
+                && (sk.gpu_va == 0 || !rt_cache.has_drawn_color_at_va(sk.nvmap_id, sk.gpu_va))
+            {
                 rt_cache
                     .find_color_screen(sk)
                     .map(|(key, image, view, layout)| {

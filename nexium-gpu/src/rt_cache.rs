@@ -390,7 +390,31 @@ impl RtCache {
                 best = Some((*k, img, stamp));
             }
         }
+        if best.is_none() && want.height != 0 {
+            let aw = want.width as f32 / want.height as f32;
+            for (k, img) in &self.cache {
+                if k.nvmap_id == want.nvmap_id || k.height == 0 || k.width < want.width {
+                    continue;
+                }
+                let ka = k.width as f32 / k.height as f32;
+                if (ka - aw).abs() > aw * 0.12 {
+                    continue;
+                }
+                let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+                    continue;
+                };
+                if best.as_ref().map_or(true, |(_, _, bs)| stamp > *bs) {
+                    best = Some((*k, img, stamp));
+                }
+            }
+        }
         best.map(|(k, img, _)| (k, img.image, img.view, img.layout))
+    }
+
+    pub fn has_drawn_color_at_va(&self, nvmap_id: u32, gpu_va: u64) -> bool {
+        self.cache
+            .keys()
+            .any(|k| k.nvmap_id == nvmap_id && k.gpu_va == gpu_va && self.drawn_stamp.contains_key(k))
     }
 
     pub fn set_mem_properties(&mut self, props: vk::PhysicalDeviceMemoryProperties) {

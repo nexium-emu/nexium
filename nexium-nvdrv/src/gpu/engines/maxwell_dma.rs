@@ -1,5 +1,24 @@
 use super::super::GpuMappings;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+fn jumbo_dbg() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("NEXIUM_JUMBO_DBG").map_or(false, |v| v == "1"))
+}
+
+fn sample_stats(buf: &[u8]) -> (usize, u64) {
+    let n = buf.len().min(65536);
+    let mut nonzero = 0usize;
+    let mut sum = 0u64;
+    for &b in &buf[..n] {
+        if b != 0 {
+            nonzero += 1;
+        }
+        sum = sum.wrapping_add(b as u64).wrapping_mul(31);
+    }
+    (nonzero, sum)
+}
 
 pub const MAXWELL_DMA_CLASS: u32 = 0xB0B5;
 
@@ -141,13 +160,26 @@ impl MaxwellDma {
         }
         let src_gpu = self.src_addr();
         let Some(nvmap) = mappings.nvmap_id_for(src_gpu) else {
+            if jumbo_dbg() {
+                log::warn!("[jumbo] stage MISS no-nvmap src={:#x}", self.src_addr());
+            }
             return;
         };
         let Some((src_cpu, limit)) = mappings.cpu_range_for(src_gpu) else {
+            if jumbo_dbg() {
+                log::warn!("[jumbo] stage MISS no-cpu-range src={:#x}", src_gpu);
+            }
             return;
         };
         let bh_log2 = ((self.src_block_size >> 4) & 0xF) as u32;
         if let Some((kw, kh, bpp, mut raw)) = renderer.readback_target_raw(nvmap, src_gpu) {
+            if jumbo_dbg() {
+                let (nz, ck) = sample_stats(&raw);
+                log::warn!(
+                    "[jumbo] stage RAW src={:#x} nvmap={} {}x{} bpp={} nz={} ck={:#x}",
+                    src_gpu, nvmap, kw, kh, bpp, nz, ck
+                );
+            }
             let width_bytes = (kw as usize) * bpp;
             if kh >= 2 && raw.len() >= width_bytes * kh as usize {
                 let h = kh as usize;
@@ -183,11 +215,30 @@ impl MaxwellDma {
         }
         let Some((kw, kh)) = renderer.rt_key_for_nvmap(nvmap, self.src_width, self.src_height)
         else {
+            if jumbo_dbg() {
+                log::warn!(
+                    "[jumbo] stage MISS no-rt-key src={:#x} nvmap={} {}x{}",
+                    src_gpu, nvmap, self.src_width, self.src_height
+                );
+            }
             return;
         };
         let Some(mut rgba) = renderer.readback_target(nvmap, kw, kh) else {
+            if jumbo_dbg() {
+                log::warn!(
+                    "[jumbo] stage MISS readback-none src={:#x} nvmap={} {}x{}",
+                    src_gpu, nvmap, kw, kh
+                );
+            }
             return;
         };
+        if jumbo_dbg() {
+            let (nz, ck) = sample_stats(&rgba);
+            log::warn!(
+                "[jumbo] stage FUZZY src={:#x} nvmap={} {}x{} nz={} ck={:#x}",
+                src_gpu, nvmap, kw, kh, nz, ck
+            );
+        }
         let width_bytes = (kw as usize) * 4;
         if kh >= 2 && rgba.len() >= width_bytes * kh as usize {
             let h = kh as usize;
@@ -559,6 +610,13 @@ impl MaxwellDma {
         } else {
             src_pitch
         };
+        if jumbo_dbg() && dst_width_bytes <= 512 && line_count <= 64 {
+            let (nz, ck) = sample_stats(&post_remap);
+            log::warn!(
+                "[jumbo] p2b dst={:#x} w={}B h={} nz={} ck={:#x}",
+                dst_gpu, dst_width_bytes, line_count, nz, ck
+            );
+        }
         let tiled_size = tiled_size_bytes(dst_width_bytes, dst_height, block_height_log2);
         let mut tiled = vec![0u8; tiled_size];
         let n = tiled_size.min(dst_limit);
@@ -746,6 +804,13 @@ impl MaxwellDma {
             (self.src_origin_x as usize) * bytes_per_element.max(1),
             self.src_origin_y as usize,
         );
+        if jumbo_dbg() {
+            let (nz, ck) = sample_stats(&linear);
+            log::warn!(
+                "[jumbo] b2p dst={:#x} {}x{} pitch={} nz={} ck={:#x}",
+                dst_cpu, line_length, line_count, dst_pitch, nz, ck
+            );
+        }
         for y in 0..line_count {
             let off = y * dst_pitch;
             if off >= dst_limit {
