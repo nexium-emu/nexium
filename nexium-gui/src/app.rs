@@ -39,6 +39,87 @@ fn legacy_gui_upload() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_LEGACY_GUI_UPLOAD").is_some())
 }
 
+enum StatusIcon {
+    Play,
+    Pause,
+    Stop,
+    Dock,
+    Handheld,
+}
+
+fn status_icon(ui: &mut egui::Ui, icon: StatusIcon, color: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(13.0, 13.0), Sense::click());
+    let p = ui.painter();
+    let r = rect.shrink(1.5);
+    match icon {
+        StatusIcon::Play => {
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(r.left() + 1.5, r.top() + 0.5),
+                    egui::pos2(r.right() - 0.5, r.center().y),
+                    egui::pos2(r.left() + 1.5, r.bottom() - 0.5),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        StatusIcon::Pause => {
+            let w = r.width() * 0.3;
+            p.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(r.left() + 0.5, r.top()),
+                    Vec2::new(w, r.height()),
+                ),
+                1.0,
+                color,
+            );
+            p.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(r.right() - w - 0.5, r.top()),
+                    Vec2::new(w, r.height()),
+                ),
+                1.0,
+                color,
+            );
+        }
+        StatusIcon::Stop => {
+            p.rect_filled(r.shrink(1.0), 1.5, color);
+        }
+        StatusIcon::Dock => {
+            let screen = egui::Rect::from_min_max(
+                egui::pos2(r.left() + r.width() * 0.22, r.top()),
+                egui::pos2(r.right() - r.width() * 0.22, r.top() + r.height() * 0.58),
+            );
+            p.rect_stroke(screen, 1.0, Stroke::new(1.2, color));
+            let dock = egui::Rect::from_min_max(
+                egui::pos2(r.left(), r.top() + r.height() * 0.48),
+                r.right_bottom(),
+            );
+            p.rect_filled(dock, 1.5, color);
+        }
+        StatusIcon::Handheld => {
+            let body =
+                egui::Rect::from_center_size(r.center(), Vec2::new(r.width(), r.height() * 0.64));
+            let jc_w = body.width() * 0.26;
+            p.rect_filled(
+                egui::Rect::from_min_size(body.left_top(), Vec2::new(jc_w, body.height())),
+                2.0,
+                color,
+            );
+            p.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(body.right() - jc_w, body.top()),
+                    Vec2::new(jc_w, body.height()),
+                ),
+                2.0,
+                color,
+            );
+            p.rect_stroke(body, 2.0, Stroke::new(1.1, color));
+        }
+    }
+    resp
+}
+
 fn gui_rate_stats(kind: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1064,35 +1145,40 @@ impl eframe::App for HorizonApp {
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
                         ui.add_space(6.0);
-                        let (dot, status_col) = if running {
-                            ("●", GREEN)
+                        let paused = false;
+                        let (run_icon, status, status_col) = if paused {
+                            (StatusIcon::Pause, "Paused", AMBER)
+                        } else if running {
+                            (StatusIcon::Play, "Running", GREEN)
                         } else {
-                            ("○", MUTED)
+                            (StatusIcon::Stop, "Idle", MUTED)
                         };
-                        let status = if running { "Running" } else { "Idle" };
                         ui.label(
-                            egui::RichText::new(format!("{} {}", dot, status))
+                            egui::RichText::new(status)
                                 .size(12.0)
                                 .color(status_col),
                         );
+                        ui.add_space(2.0);
+                        status_icon(ui, run_icon, status_col);
 
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new("·").color(MUTED).size(12.0));
                         ui.add_space(6.0);
                         let docked = nexium_core::hid_state::is_docked();
                         let (mode_icon, mode_txt, mode_col) = if docked {
-                            ("⏻", "Docked", GREEN)
+                            (StatusIcon::Dock, "Docked", GREEN)
                         } else {
-                            ("▢", "Handheld", AMBER)
+                            (StatusIcon::Handheld, "Handheld", AMBER)
                         };
-                        let mode_resp = ui.add(
+                        let label_resp = ui.add(
                             egui::Label::new(
-                                egui::RichText::new(format!("{} {}", mode_icon, mode_txt))
-                                    .size(12.0)
-                                    .color(mode_col),
+                                egui::RichText::new(mode_txt).size(12.0).color(mode_col),
                             )
                             .sense(egui::Sense::click()),
                         );
+                        ui.add_space(2.0);
+                        let icon_resp = status_icon(ui, mode_icon, mode_col);
+                        let mode_resp = label_resp.union(icon_resp);
                         if mode_resp.hovered() {
                             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
