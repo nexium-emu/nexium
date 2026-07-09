@@ -14,6 +14,7 @@ mod library;
 mod performance;
 mod playtime;
 mod profile;
+mod shop;
 mod splash;
 mod steamgrid;
 mod ui_audio;

@@ -108,9 +108,10 @@ pub enum CarouselAction {
     OpenProfile,
     ToggleFavorite(String),
     DownloadIcon(String),
+    OpenShop,
 }
 
-const DOCK_COUNT: usize = 9;
+const DOCK_COUNT: usize = 10;
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
@@ -1283,6 +1284,7 @@ pub fn carousel_view(
         ("■", "Stop"),
         ("⌨", "Controller"),
         ("⚙", "Settings"),
+        ("🛍", "Shop"),
         ("🎨", "Color"),
         ("🪳", "Debug"),
         ("✕", "Quit"),
@@ -1337,7 +1339,7 @@ pub fn carousel_view(
             let resp = ui.allocate_rect(base, Sense::click());
             if interactive && resp.clicked() && state.boot_stage == BootStage::None {
                 if state.active_dock && state.dock_selected == idx {
-                    if idx == 6 {
+                    if idx == 7 {
                         if state.palette_open {
                             state.palette_open = false;
                             crate::ui_audio::play(crate::ui_audio::Sfx::Back);
@@ -1363,8 +1365,9 @@ pub fn carousel_view(
                             3 => CarouselAction::StopEmulation,
                             4 => CarouselAction::OpenController,
                             5 => CarouselAction::OpenSettings,
-                            7 => CarouselAction::OpenDebug,
-                            8 => CarouselAction::Quit,
+                            6 => CarouselAction::OpenShop,
+                            8 => CarouselAction::OpenDebug,
+                            9 => CarouselAction::Quit,
                             _ => CarouselAction::None,
                         };
                     }
@@ -1442,6 +1445,28 @@ pub fn carousel_view(
                     [center + Vec2::new(-size, size), center + Vec2::new(size, -size)],
                     Stroke::new(stroke_w, final_icon_color),
                 );
+            } else if *label == "Shop" {
+                let center = draw.center();
+                let u = draw.width() * 0.20;
+                let body = egui::Rect::from_min_max(
+                    center + Vec2::new(-u, -u * 0.55),
+                    center + Vec2::new(u, u * 1.25),
+                );
+                painter.rect_filled(body, Rounding::same(2.5 * scale_factor), final_icon_color);
+                let handle_c = egui::pos2(center.x, body.min.y);
+                let arc: Vec<egui::Pos2> = (0..=12)
+                    .map(|i| {
+                        let a = std::f32::consts::PI * (1.0 + i as f32 / 12.0);
+                        handle_c + Vec2::new(a.cos() * u * 0.62, a.sin() * u * 0.62)
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(arc, Stroke::new(1.7 * scale_factor, final_icon_color)));
+                let hole = if final_icon_color.r() as u16 + final_icon_color.g() as u16 + final_icon_color.b() as u16 > 384 {
+                    Color32::from_rgb(0x18, 0x18, 0x20)
+                } else {
+                    Color32::from_rgb(0xF2, 0xF2, 0xF6)
+                };
+                painter.text(body.center() + Vec2::new(0.0, u * 0.1), egui::Align2::CENTER_CENTER, "H", FontId::proportional(u * 1.4), hole);
             } else {
                 painter.text(draw.center(), egui::Align2::CENTER_CENTER, icon, FontId::proportional(draw.width() * 0.42), final_icon_color);
             }
@@ -2130,7 +2155,7 @@ fn handle_input(
             }
         }
         if state.active_dock {
-            if state.dock_selected == 6 {
+            if state.dock_selected == 7 {
                 state.palette_open = true;
                 state.palette_selected = crate::app_settings::CarouselTheme::all()
                     .iter()
@@ -2150,8 +2175,9 @@ fn handle_input(
                     3 => CarouselAction::StopEmulation,
                     4 => CarouselAction::OpenController,
                     5 => CarouselAction::OpenSettings,
-                    7 => CarouselAction::OpenDebug,
-                    8 => CarouselAction::Quit,
+                    6 => CarouselAction::OpenShop,
+                    8 => CarouselAction::OpenDebug,
+                    9 => CarouselAction::Quit,
                     _ => CarouselAction::None,
                 };
             }

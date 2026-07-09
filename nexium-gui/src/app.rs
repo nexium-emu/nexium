@@ -189,6 +189,7 @@ pub struct HorizonApp {
     last_playtime_save: std::time::Instant,
     pub carousel: crate::carousel::CarouselState,
     icon_picker: Option<IconPicker>,
+    shop: crate::shop::ShopState,
     icon_reveal: Option<(usize, std::time::Instant, Option<egui::TextureHandle>)>,
     key_test: Option<std::sync::Arc<std::sync::Mutex<KeyTest>>>,
     key_test_result: Option<(bool, std::time::Instant)>,
@@ -355,6 +356,7 @@ impl HorizonApp {
             last_playtime_save: std::time::Instant::now(),
             carousel: crate::carousel::CarouselState::new(),
             icon_picker: None,
+            shop: crate::shop::ShopState::new(),
             icon_reveal: None,
             key_test: None,
             key_test_result: None,
@@ -666,7 +668,7 @@ impl HorizonApp {
     }
 
     fn modal_active(&self) -> bool {
-        self.confirm.is_some() || self.teardown_at.is_some() || self.icon_picker.is_some()
+        self.confirm.is_some() || self.teardown_at.is_some() || self.icon_picker.is_some() || self.shop.open
     }
 
     fn update_icon_picker(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -2701,6 +2703,10 @@ impl eframe::App for HorizonApp {
                                     });
                                 }
                             }
+                            crate::carousel::CarouselAction::OpenShop => {
+                                self.shop.open();
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+                            }
                             crate::carousel::CarouselAction::None => {}
                         }
 
@@ -2821,6 +2827,11 @@ impl eframe::App for HorizonApp {
                 }
                 self.draw_modal(ctx, ui);
                 self.update_icon_picker(ctx, ui);
+                self.shop.update(ctx, ui);
+                if self.shop.need_rescan {
+                    self.shop.need_rescan = false;
+                    self.library.rescan(ctx, &self.app_settings.library_folders);
+                }
             });
 
         if self.show_settings {
