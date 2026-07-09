@@ -2827,7 +2827,13 @@ impl eframe::App for HorizonApp {
                 }
                 self.draw_modal(ctx, ui);
                 self.update_icon_picker(ctx, ui);
-                self.shop.update(ctx, ui);
+                {
+                    let accent = match self.app_settings.carousel_theme.color() {
+                        Some((r, g, b)) => egui::Color32::from_rgb(r, g, b),
+                        None => self.carousel.ambient_color,
+                    };
+                    self.shop.update(ctx, ui, self.app_settings.light_mode, accent, &self.last_input);
+                }
                 if self.shop.need_rescan {
                     self.shop.need_rescan = false;
                     self.library.rescan(ctx, &self.app_settings.library_folders);

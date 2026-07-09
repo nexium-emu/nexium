@@ -1,7 +1,43 @@
 use crate::homebrew::{self, ShopApp};
+use crate::input::InputSnapshot;
 use eframe::egui;
+use egui::Color32;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+
+const RED: Color32 = Color32::from_rgb(0xE6, 0x00, 0x12);
+
+#[derive(Clone, Copy)]
+struct Pal {
+    bg: Color32,
+    panel: Color32,
+    panel2: Color32,
+    text: Color32,
+    muted: Color32,
+    border: Color32,
+}
+
+fn palette(light: bool) -> Pal {
+    if light {
+        Pal {
+            bg: Color32::from_rgb(0xEC, 0xEC, 0xF1),
+            panel: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            panel2: Color32::from_rgb(0xE2, 0xE2, 0xE9),
+            text: Color32::from_rgb(0x1E, 0x1E, 0x28),
+            muted: Color32::from_rgb(0x60, 0x60, 0x6C),
+            border: Color32::from_rgb(0xCE, 0xCE, 0xD6),
+        }
+    } else {
+        Pal {
+            bg: Color32::from_rgb(0x14, 0x14, 0x19),
+            panel: Color32::from_rgb(0x22, 0x22, 0x2A),
+            panel2: Color32::from_rgb(0x2C, 0x2C, 0x36),
+            text: Color32::from_rgb(0xEC, 0xEC, 0xF0),
+            muted: Color32::from_rgb(0x9A, 0x9A, 0xA6),
+            border: Color32::from_rgb(0x34, 0x34, 0x40),
+        }
+    }
+}
 
 #[derive(Default)]
 struct Fetch {
@@ -18,7 +54,7 @@ struct InstallState {
 }
 
 struct InstallJob {
-    title: String,
+    idx: usize,
     state: Arc<Mutex<InstallState>>,
 }
 
@@ -42,8 +78,12 @@ pub struct ShopState {
     filtered: Vec<usize>,
     selected: usize,
     scroll: f32,
+    desc_scroll: f32,
     view: View,
     install: Option<InstallJob>,
+    nav_cd: f64,
+    a_held: bool,
+    b_held: bool,
 }
 
 impl ShopState {
@@ -63,8 +103,12 @@ impl ShopState {
             filtered: Vec::new(),
             selected: 0,
             scroll: 0.0,
+            desc_scroll: 0.0,
             view: View::Grid,
             install: None,
+            nav_cd: 0.0,
+            a_held: false,
+            b_held: false,
         }
     }
 
@@ -87,16 +131,22 @@ impl ShopState {
     fn refilter(&mut self) {
         let q = self.search.to_lowercase();
         self.filtered = (0..self.apps.len())
-            .filter(|&i| q.is_empty() || self.apps[i].title.to_lowercase().contains(&q) || self.apps[i].author.to_lowercase().contains(&q))
+            .filter(|&i| {
+                q.is_empty()
+                    || self.apps[i].title.to_lowercase().contains(&q)
+                    || self.apps[i].author.to_lowercase().contains(&q)
+            })
             .collect();
         if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len().saturating_sub(1);
         }
     }
 
-    fn start_install(&mut self, idx: usize) {
-        let app = self.apps[idx].clone();
-        let title = app.title.clone();
+    fn start_install(&mut self, ai: usize) {
+        if self.install.is_some() {
+            return;
+        }
+        let app = self.apps[ai].clone();
         let state = Arc::new(Mutex::new(InstallState::default()));
         let s2 = state.clone();
         std::thread::spawn(move || {
@@ -110,18 +160,35 @@ impl ShopState {
                 }
             }
         });
-        self.install = Some(InstallJob { title, state });
+        self.install = Some(InstallJob { idx: ai, state });
     }
 
-    pub fn update(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+    fn request_icon(&mut self, i: usize) {
+        if self.icon_requested.contains(&i) || i >= self.apps.len() {
+            return;
+        }
+        self.icon_requested.insert(i);
+        let app = self.apps[i].clone();
+        let jobs = self.icon_jobs.clone();
+        std::thread::spawn(move || {
+            let bytes = homebrew::icon_bytes(&app);
+            if let Ok(mut m) = jobs.lock() {
+                m.insert(i, bytes);
+            }
+        });
+    }
+
+    pub fn update(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, light: bool, accent: Color32, li: &InputSnapshot) {
         if !self.open && self.anim < 0.004 {
             return;
         }
+        let pal = palette(light);
+        let now = ctx.input(|i| i.time);
         let dt = ui.input(|i| i.stable_dt).min(0.1);
         self.anim += ((if self.open { 1.0 } else { 0.0 }) - self.anim) * (dt * 14.0).min(1.0);
         let ease = { let a = self.anim.clamp(0.0, 1.0); a * a * (3.0 - 2.0 * a) };
 
-        // ingest fetch result
+        // ingest fetch
         if !self.loaded {
             let apps = self
                 .fetch
@@ -135,7 +202,7 @@ impl ShopState {
             }
         }
 
-        // build any downloaded icon textures
+        // build icon textures
         let ready: Vec<(usize, Vec<u8>)> = {
             let mut out = Vec::new();
             if let Ok(mut m) = self.icon_jobs.lock() {
@@ -164,29 +231,47 @@ impl ShopState {
         let screen = ctx.screen_rect();
         let mut paint = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("shop")));
         paint.set_opacity(ease);
-        paint.rect_filled(screen, egui::Rounding::ZERO, egui::Color32::from_rgb(0x0C, 0x0C, 0x10));
+        paint.rect_filled(screen, egui::Rounding::ZERO, pal.bg);
 
-        // top bar
-        let accent = egui::Color32::from_rgb(0xE6, 0x00, 0x12);
-        let bar = egui::Rect::from_min_size(screen.min, egui::Vec2::new(screen.width(), 54.0));
-        paint.rect_filled(bar, egui::Rounding::ZERO, egui::Color32::from_rgb(0x16, 0x16, 0x1C));
-        paint.text(egui::pos2(bar.min.x + 24.0, bar.center().y), egui::Align2::LEFT_CENTER, "NeXium Homebrew Shop", egui::FontId::proportional(20.0), egui::Color32::WHITE);
+        // top banner (red eShop-style)
+        let bar = egui::Rect::from_min_size(screen.min, egui::Vec2::new(screen.width(), 52.0));
+        paint.rect_filled(bar, egui::Rounding::ZERO, RED);
+        paint.text(egui::pos2(bar.min.x + 24.0, bar.center().y), egui::Align2::LEFT_CENTER, "NeXium  Homebrew", egui::FontId::proportional(20.0), Color32::WHITE);
 
-        // search field
-        let field = egui::Rect::from_min_size(egui::pos2(screen.center().x - 180.0, 10.0), egui::Vec2::new(360.0, 34.0));
+        // ---- keyboard / text ----
+        let (kb_esc, kb_enter, text_events) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Enter), i.events.clone()));
+        let kb_left = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+        let kb_right = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+        let kb_up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+        let kb_down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+
+        // ---- controller edges ----
+        use crate::controller_config::SwitchButton;
+        let gp_a = li.connected && li.is(SwitchButton::A);
+        let gp_b = li.connected && li.is(SwitchButton::B);
+        let a_edge = kb_enter || (gp_a && !self.a_held);
+        let b_edge = kb_esc || (gp_b && !self.b_held);
+        self.a_held = gp_a;
+        self.b_held = gp_b;
+        let ready_nav = now - self.nav_cd > 0.16;
+        let (mut nl, mut nr, mut nu, mut nd) = (kb_left, kb_right, kb_up, kb_down);
+        if ready_nav && li.connected {
+            if li.is(SwitchButton::DLeft) || li.lx() < -0.5 { nl = true; self.nav_cd = now; }
+            else if li.is(SwitchButton::DRight) || li.lx() > 0.5 { nr = true; self.nav_cd = now; }
+            else if li.is(SwitchButton::DUp) || li.ly() > 0.5 { nu = true; self.nav_cd = now; }
+            else if li.is(SwitchButton::DDown) || li.ly() < -0.5 { nd = true; self.nav_cd = now; }
+        }
+
+        // search field (top-right of banner)
+        let field = egui::Rect::from_min_size(egui::pos2(screen.max.x - 320.0, 9.0), egui::Vec2::new(292.0, 34.0));
         let field_resp = ui.allocate_rect(field, egui::Sense::click());
-        paint.rect_filled(field, egui::Rounding::same(8.0), egui::Color32::from_rgb(0x24, 0x24, 0x2C));
-        paint.rect_stroke(field, egui::Rounding::same(8.0), egui::Stroke::new(if self.editing { 2.0 } else { 1.0 }, if self.editing { accent } else { egui::Color32::from_gray(0x40) }));
-        let disp = if self.search.is_empty() { "Search games…".to_string() } else { self.search.clone() };
-        paint.text(egui::pos2(field.min.x + 12.0, field.center().y), egui::Align2::LEFT_CENTER, &disp, egui::FontId::proportional(15.0), if self.search.is_empty() { egui::Color32::from_gray(0x80) } else { egui::Color32::WHITE });
+        paint.rect_filled(field, egui::Rounding::same(8.0), Color32::from_black_alpha(60));
+        paint.rect_stroke(field, egui::Rounding::same(8.0), egui::Stroke::new(if self.editing { 2.0 } else { 1.0 }, if self.editing { Color32::WHITE } else { Color32::from_white_alpha(120) }));
+        let disp = if self.search.is_empty() { "Search…".to_string() } else { self.search.clone() };
+        paint.text(egui::pos2(field.min.x + 12.0, field.center().y), egui::Align2::LEFT_CENTER, &disp, egui::FontId::proportional(15.0), Color32::from_white_alpha(if self.search.is_empty() { 150 } else { 255 }));
         if field_resp.clicked() {
             self.editing = true;
         }
-
-        let content = egui::Rect::from_min_max(egui::pos2(screen.min.x, bar.max.y), screen.max);
-
-        // ---- input ----
-        let (kb_esc, kb_enter, text_events) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Enter), i.events.clone()));
         if self.editing {
             for ev in &text_events {
                 match ev {
@@ -207,18 +292,24 @@ impl ShopState {
             if kb_enter || kb_esc {
                 self.editing = false;
             }
+            ctx.request_repaint();
+            return;
         }
 
+        let content = egui::Rect::from_min_max(egui::pos2(screen.min.x, bar.max.y), screen.max);
         let detail_idx = if let View::Detail(i) = self.view { Some(i) } else { None };
         match detail_idx {
-            None => self.draw_grid(ctx, ui, &paint, content),
-            Some(i) => self.draw_detail(ctx, ui, &paint, content, i),
+            None => self.grid(ui, &paint, content, pal, accent, nl, nr, nu, nd, a_edge),
+            Some(i) => self.detail(ui, &paint, content, pal, i, a_edge, ui.input(|x| x.smooth_scroll_delta.y), nu, nd),
         }
 
-        // close on Escape (when not editing)
-        if kb_esc && !self.editing {
+        if b_edge {
             match self.view {
-                View::Detail(_) => self.view = View::Grid,
+                View::Detail(_) => {
+                    self.view = View::Grid;
+                    self.desc_scroll = 0.0;
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+                }
                 View::Grid => {
                     self.open = false;
                     crate::ui_audio::play(crate::ui_audio::Sfx::Back);
@@ -229,48 +320,45 @@ impl ShopState {
         ctx.request_repaint();
     }
 
-    fn request_icon(&mut self, i: usize) {
-        if self.icon_requested.contains(&i) || i >= self.apps.len() {
-            return;
-        }
-        self.icon_requested.insert(i);
-        let app = self.apps[i].clone();
-        let jobs = self.icon_jobs.clone();
-        std::thread::spawn(move || {
-            let bytes = homebrew::icon_bytes(&app);
-            if let Ok(mut m) = jobs.lock() {
-                m.insert(i, bytes);
-            }
-        });
-    }
-
-    fn draw_grid(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui, paint: &egui::Painter, content: egui::Rect) {
+    #[allow(clippy::too_many_arguments)]
+    fn grid(&mut self, ui: &mut egui::Ui, paint: &egui::Painter, content: egui::Rect, pal: Pal, accent: Color32, nl: bool, nr: bool, nu: bool, nd: bool, a_edge: bool) {
         if !self.loaded {
-            paint.text(content.center(), egui::Align2::CENTER_CENTER, "Loading shop…", egui::FontId::proportional(20.0), egui::Color32::from_gray(0x90));
+            paint.text(content.center(), egui::Align2::CENTER_CENTER, "Loading shop…", egui::FontId::proportional(20.0), pal.muted);
             return;
         }
-        if self.filtered.is_empty() {
-            paint.text(content.center(), egui::Align2::CENTER_CENTER, "No games found.", egui::FontId::proportional(18.0), egui::Color32::from_gray(0x90));
+        let n = self.filtered.len();
+        if n == 0 {
+            paint.text(content.center(), egui::Align2::CENTER_CENTER, "No games found.", egui::FontId::proportional(18.0), pal.muted);
             return;
         }
         let cols = 4usize;
-        let pad = 20.0;
-        let gap = 18.0;
-        let tile_w = ((content.width() - pad * 2.0 - gap * (cols as f32 - 1.0)) / cols as f32).min(260.0);
-        let tile_h = tile_w * 0.62;
-        let cell_h = tile_h + 34.0;
-        let x0 = content.min.x + pad;
-        let y0 = content.min.y + pad - self.scroll;
+        let pad = 26.0;
+        let gap = 20.0;
+        let tile_w = ((content.width() - pad * 2.0 - gap * (cols as f32 - 1.0)) / cols as f32).min(280.0);
+        let tile_h = tile_w * 0.58;
+        let cell_h = tile_h + 30.0;
 
-        // wheel scroll
-        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
-        let rows = (self.filtered.len() + cols - 1) / cols;
+        // nav
+        if nl && self.selected > 0 { self.selected -= 1; crate::ui_audio::play_move(); }
+        if nr && self.selected + 1 < n { self.selected += 1; crate::ui_audio::play_move(); }
+        if nd && self.selected + cols < n { self.selected += cols; crate::ui_audio::play_move(); }
+        if nu && self.selected >= cols { self.selected -= cols; crate::ui_audio::play_move(); }
+
+        let rows = (n + cols - 1) / cols;
         let total_h = rows as f32 * (cell_h + gap);
         let max_scroll = (total_h - content.height() + pad * 2.0).max(0.0);
+        // keep selected visible
+        let sel_row = (self.selected / cols) as f32;
+        let want = (sel_row * (cell_h + gap) - content.height() * 0.4).clamp(0.0, max_scroll);
+        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
         if wheel.abs() > 0.1 {
             self.scroll = (self.scroll - wheel).clamp(0.0, max_scroll);
+        } else {
+            self.scroll += (want - self.scroll) * 0.2;
         }
 
+        let x0 = content.min.x + pad;
+        let y0 = content.min.y + pad - self.scroll;
         let clip = paint.with_clip_rect(content);
         let mut open_detail = None;
         let filtered = self.filtered.clone();
@@ -285,89 +373,130 @@ impl ShopState {
             self.request_icon(ai);
             let tile = egui::Rect::from_min_size(egui::pos2(tx, ty), egui::Vec2::new(tile_w, tile_h));
             let sel = vi == self.selected;
-            clip.rect_filled(tile, egui::Rounding::same(10.0), egui::Color32::from_rgb(0x1C, 0x1C, 0x24));
-            if let Some(Some(tex)) = self.icons.get(ai) {
-                crate::carousel::draw_rounded_image(&clip, tex.id(), tile, 10.0, egui::Color32::WHITE);
-            } else {
-                clip.text(tile.center(), egui::Align2::CENTER_CENTER, &self.apps[ai].title, egui::FontId::proportional(13.0), egui::Color32::from_gray(0x70));
-            }
             if sel {
-                clip.rect_stroke(tile, egui::Rounding::same(10.0), egui::Stroke::new(2.5, egui::Color32::from_rgb(0x4F, 0x9D, 0xFF)));
+                clip.rect_filled(tile.expand(4.0), egui::Rounding::same(13.0), Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 90));
+                clip.rect_stroke(tile.expand(4.0), egui::Rounding::same(13.0), egui::Stroke::new(2.5, accent));
             }
-            clip.text(egui::pos2(tile.min.x + 2.0, tile.max.y + 6.0), egui::Align2::LEFT_TOP, &self.apps[ai].title, egui::FontId::proportional(13.0), egui::Color32::from_gray(0xE0));
+            clip.rect_filled(tile, egui::Rounding::same(10.0), pal.panel);
+            if let Some(Some(tex)) = self.icons.get(ai) {
+                crate::carousel::draw_rounded_image(&clip, tex.id(), tile, 10.0, Color32::WHITE);
+            } else {
+                clip.text(tile.center(), egui::Align2::CENTER_CENTER, &self.apps[ai].title, egui::FontId::proportional(13.0), pal.muted);
+            }
+            clip.text(egui::pos2(tile.min.x + 2.0, tile.max.y + 6.0), egui::Align2::LEFT_TOP, &self.apps[ai].title, egui::FontId::proportional(13.0), pal.text);
             let resp = ui.allocate_rect(tile, egui::Sense::click());
             if resp.clicked() {
                 self.selected = vi;
                 open_detail = Some(ai);
             }
         }
+        if a_edge && self.selected < n {
+            open_detail = Some(self.filtered[self.selected]);
+        }
         if let Some(ai) = open_detail {
             self.view = View::Detail(ai);
+            self.desc_scroll = 0.0;
             crate::ui_audio::play(crate::ui_audio::Sfx::Open);
         }
+
+        // hint bar
+        hint_bar(paint, content, pal, "[A] Select   ·   [B] Close   ·   click search to filter");
     }
 
-    fn draw_detail(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui, paint: &egui::Painter, content: egui::Rect, ai: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn detail(&mut self, ui: &mut egui::Ui, paint: &egui::Painter, content: egui::Rect, pal: Pal, ai: usize, a_edge: bool, wheel: f32, nu: bool, nd: bool) {
         let app = self.apps[ai].clone();
         self.request_icon(ai);
         let pad = 40.0;
-        let left = egui::Rect::from_min_size(egui::pos2(content.min.x + pad, content.min.y + pad), egui::Vec2::new(content.width() * 0.5, content.height() - pad * 2.0));
-        // icon
-        let icon_r = egui::Rect::from_min_size(left.min, egui::Vec2::splat(140.0));
+        let col_split = content.min.x + content.width() * 0.60;
+
+        // hero icon
+        let icon_r = egui::Rect::from_min_size(egui::pos2(content.min.x + pad, content.min.y + pad), egui::Vec2::splat(150.0));
+        paint.rect_filled(icon_r.expand(2.0), egui::Rounding::same(18.0), pal.panel2);
         if let Some(Some(tex)) = self.icons.get(ai) {
-            crate::carousel::draw_rounded_image(paint, tex.id(), icon_r, 16.0, egui::Color32::WHITE);
+            crate::carousel::draw_rounded_image(paint, tex.id(), icon_r, 16.0, Color32::WHITE);
         } else {
-            paint.rect_filled(icon_r, egui::Rounding::same(16.0), egui::Color32::from_rgb(0x22, 0x22, 0x2A));
+            paint.rect_filled(icon_r, egui::Rounding::same(16.0), pal.panel);
         }
-        paint.text(egui::pos2(left.min.x, icon_r.max.y + 20.0), egui::Align2::LEFT_TOP, &app.title, egui::FontId::proportional(26.0), egui::Color32::WHITE);
-        paint.text(egui::pos2(left.min.x, icon_r.max.y + 54.0), egui::Align2::LEFT_TOP, &format!("{}  ·  v{}  ·  {}", app.author, app.version, human_size(app.filesize)), egui::FontId::proportional(14.0), egui::Color32::from_gray(0x9A));
+        let tx = icon_r.max.x + 22.0;
+        paint.text(egui::pos2(tx, icon_r.min.y + 12.0), egui::Align2::LEFT_TOP, &app.title, egui::FontId::proportional(28.0), pal.text);
+        paint.text(egui::pos2(tx, icon_r.min.y + 52.0), egui::Align2::LEFT_TOP, &app.author, egui::FontId::proportional(16.0), pal.muted);
+        paint.text(egui::pos2(tx, icon_r.min.y + 78.0), egui::Align2::LEFT_TOP, &format!("v{}   ·   {}   ·   {}", app.version, human_size(app.filesize), app.license), egui::FontId::proportional(13.0), pal.muted);
 
-        // description (wrapped)
+        // description panel (scrollable)
         let desc = if app.details.is_empty() { app.description.clone() } else { app.details.clone() };
-        let galley = ui.fonts(|f| f.layout(desc, egui::FontId::proportional(15.0), egui::Color32::from_gray(0xCC), left.width()));
-        paint.galley(egui::pos2(left.min.x, icon_r.max.y + 90.0), galley, egui::Color32::from_gray(0xCC));
+        let desc_rect = egui::Rect::from_min_max(egui::pos2(content.min.x + pad, icon_r.max.y + 26.0), egui::pos2(col_split - 20.0, content.max.y - 60.0));
+        paint.rect_filled(desc_rect, egui::Rounding::same(12.0), pal.panel);
+        let galley = ui.fonts(|f| f.layout(desc, egui::FontId::proportional(15.0), pal.text, desc_rect.width() - 32.0));
+        let text_h = galley.size().y;
+        let max_ds = (text_h - (desc_rect.height() - 24.0)).max(0.0);
+        if desc_rect.contains(ui.input(|i| i.pointer.hover_pos()).unwrap_or(desc_rect.center())) && wheel.abs() > 0.1 {
+            self.desc_scroll = (self.desc_scroll - wheel).clamp(0.0, max_ds);
+        }
+        if nd { self.desc_scroll = (self.desc_scroll + 40.0).clamp(0.0, max_ds); }
+        if nu { self.desc_scroll = (self.desc_scroll - 40.0).clamp(0.0, max_ds); }
+        let dclip = paint.with_clip_rect(desc_rect.shrink(4.0));
+        dclip.galley(egui::pos2(desc_rect.min.x + 16.0, desc_rect.min.y + 12.0 - self.desc_scroll), galley, pal.text);
+        if max_ds > 0.0 {
+            let track = egui::Rect::from_min_size(egui::pos2(desc_rect.max.x - 6.0, desc_rect.min.y + 6.0), egui::Vec2::new(4.0, desc_rect.height() - 12.0));
+            paint.rect_filled(track, egui::Rounding::same(2.0), pal.panel2);
+            let frac = self.desc_scroll / max_ds;
+            let th = (track.height() * (desc_rect.height() / (text_h + 24.0))).clamp(20.0, track.height());
+            let ty = track.min.y + (track.height() - th) * frac;
+            paint.rect_filled(egui::Rect::from_min_size(egui::pos2(track.min.x, ty), egui::Vec2::new(4.0, th)), egui::Rounding::same(2.0), pal.muted);
+        }
 
-        // install button (right side)
-        let installing = self.install.is_some();
+        // right install panel
         let (progress, done, ok, msg) = self
             .install
             .as_ref()
+            .filter(|j| j.idx == ai)
             .and_then(|j| j.state.lock().ok().map(|g| (g.progress, g.done, g.ok, g.msg.clone())))
             .unwrap_or((0.0, false, false, String::new()));
+        let installing = self.install.as_ref().map_or(false, |j| j.idx == ai) && !done;
 
-        let btn = egui::Rect::from_min_size(egui::pos2(content.max.x - 320.0, content.min.y + pad + 40.0), egui::Vec2::new(260.0, 56.0));
+        let btn = egui::Rect::from_min_size(egui::pos2(col_split + 20.0, content.min.y + pad + 30.0), egui::Vec2::new(content.max.x - col_split - 60.0, 60.0));
         let btn_resp = ui.allocate_rect(btn, egui::Sense::click());
         let hovered = btn_resp.hovered();
-        let btn_col = if installing { egui::Color32::from_gray(0x40) } else if hovered { egui::Color32::from_rgb(0xFF, 0x2A, 0x3E) } else { egui::Color32::from_rgb(0xE6, 0x00, 0x12) };
-        paint.rect_filled(btn, egui::Rounding::same(10.0), btn_col);
-        let label = if installing {
-            if done { if ok { "Installed ✓".to_string() } else { "Failed".to_string() } } else { format!("Installing… {}%", (progress * 100.0) as u32) }
+        let btn_col = if installing { pal.panel2 } else if done && ok { Color32::from_rgb(0x2C, 0xA0, 0x4A) } else if hovered { Color32::from_rgb(0xFF, 0x2A, 0x3E) } else { RED };
+        paint.rect_filled(btn, egui::Rounding::same(12.0), btn_col);
+        let label = if done && ok {
+            "Installed ✓".to_string()
+        } else if installing {
+            format!("Installing…  {}%", (progress * 100.0) as u32)
         } else {
             "Install".to_string()
         };
-        paint.text(btn.center(), egui::Align2::CENTER_CENTER, &label, egui::FontId::proportional(18.0), egui::Color32::WHITE);
-        if installing && !done {
-            let bar = egui::Rect::from_min_size(egui::pos2(btn.min.x, btn.max.y + 8.0), egui::Vec2::new(btn.width(), 6.0));
-            paint.rect_filled(bar, egui::Rounding::same(3.0), egui::Color32::from_gray(0x30));
-            let mut fill = bar;
-            fill.set_width(bar.width() * progress);
-            paint.rect_filled(fill, egui::Rounding::same(3.0), egui::Color32::from_rgb(0x35, 0xD0, 0x6A));
+        paint.text(btn.center(), egui::Align2::CENTER_CENTER, &label, egui::FontId::proportional(20.0), Color32::WHITE);
+        if installing {
+            let barr = egui::Rect::from_min_size(egui::pos2(btn.min.x, btn.max.y + 10.0), egui::Vec2::new(btn.width(), 7.0));
+            paint.rect_filled(barr, egui::Rounding::same(3.5), pal.panel2);
+            let mut fill = barr;
+            fill.set_width(barr.width() * progress);
+            paint.rect_filled(fill, egui::Rounding::same(3.5), Color32::from_rgb(0x35, 0xD0, 0x6A));
         }
         if !msg.is_empty() {
-            paint.text(egui::pos2(btn.center().x, btn.max.y + 24.0), egui::Align2::CENTER_TOP, &msg, egui::FontId::proportional(13.0), egui::Color32::from_gray(0xA0));
+            paint.text(egui::pos2(btn.center().x, btn.max.y + 26.0), egui::Align2::CENTER_TOP, &msg, egui::FontId::proportional(13.0), pal.muted);
         }
-
-        if btn_resp.clicked() && !installing {
-            self.start_install(ai);
-            crate::ui_audio::play(crate::ui_audio::Sfx::WhistleOk);
-        }
-        // on successful completion, mark rescan + clear job
         if done && ok {
             self.need_rescan = true;
         }
 
-        paint.text(egui::pos2(content.min.x + pad, content.max.y - 24.0), egui::Align2::LEFT_CENTER, "[Esc / B]  Back to grid", egui::FontId::proportional(13.0), egui::Color32::from_gray(0x80));
+        let do_install = (btn_resp.clicked() || a_edge) && !installing && !(done && ok);
+        if do_install {
+            self.start_install(ai);
+            crate::ui_audio::play(crate::ui_audio::Sfx::WhistleOk);
+        }
+
+        hint_bar(paint, content, pal, "[A] Install   ·   [B] Back   ·   scroll / ↑↓ read");
     }
+}
+
+fn hint_bar(paint: &egui::Painter, content: egui::Rect, pal: Pal, text: &str) {
+    let bar = egui::Rect::from_min_max(egui::pos2(content.min.x, content.max.y - 40.0), content.max);
+    paint.rect_filled(bar, egui::Rounding::ZERO, Color32::from_black_alpha(40));
+    paint.line_segment([bar.min, egui::pos2(bar.max.x, bar.min.y)], egui::Stroke::new(1.0, pal.border));
+    paint.text(egui::pos2(content.max.x - 24.0, bar.center().y), egui::Align2::RIGHT_CENTER, text, egui::FontId::proportional(13.0), pal.muted);
 }
 
 fn human_size(bytes: u64) -> String {
@@ -380,18 +509,14 @@ fn human_size(bytes: u64) -> String {
 }
 
 fn install_app(app: &ShopApp, state: &Arc<Mutex<InstallState>>) -> bool {
-    let Some(base) = directories::BaseDirs::new() else {
-        return false;
-    };
     let tmp = std::env::temp_dir().join(format!("nexium_shop_{}.zip", app.name));
     if let Ok(mut g) = state.lock() {
-        g.progress = 0.15;
+        g.progress = 0.2;
     }
-    // download the zip
     let out = std::process::Command::new("curl")
         .arg("-sSL")
         .arg("--max-time")
-        .arg("180")
+        .arg("240")
         .arg("-o")
         .arg(&tmp)
         .arg(app.zip_url())
@@ -403,9 +528,8 @@ fn install_app(app: &ShopApp, state: &Arc<Mutex<InstallState>>) -> bool {
         return false;
     }
     if let Ok(mut g) = state.lock() {
-        g.progress = 0.65;
+        g.progress = 0.7;
     }
-    // fortheusers zips lay files under `switch/...`; extract into the sdmc dir
     let dest = nexium_common::paths::sdmc_dir();
     let _ = std::fs::create_dir_all(&dest);
     let unz = std::process::Command::new("unzip")
@@ -415,6 +539,5 @@ fn install_app(app: &ShopApp, state: &Arc<Mutex<InstallState>>) -> bool {
         .arg(&dest)
         .status();
     let _ = std::fs::remove_file(&tmp);
-    let _ = base;
     matches!(unz, Ok(s) if s.success())
 }
