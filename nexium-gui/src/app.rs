@@ -39,12 +39,42 @@ fn legacy_gui_upload() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_LEGACY_GUI_UPLOAD").is_some())
 }
 
+fn gui_rate_stats(kind: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("NEXIUM_GUI_PROFILE").is_some()) {
+        return;
+    }
+    static COUNTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static LAST: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
+        std::sync::OnceLock::new();
+    COUNTS[kind.min(2)].fetch_add(1, Ordering::Relaxed);
+    let last = LAST.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
+    let Ok(mut guard) = last.try_lock() else {
+        return;
+    };
+    let elapsed = guard.elapsed().as_secs_f64();
+    if elapsed >= 2.0 {
+        *guard = std::time::Instant::now();
+        let u = COUNTS[0].swap(0, Ordering::Relaxed);
+        let r = COUNTS[1].swap(0, Ordering::Relaxed);
+        let d = COUNTS[2].swap(0, Ordering::Relaxed);
+        log::info!(
+            "[gui] updates/s={:.0} frames_new/s={:.0} frames_extra_dropped/s={:.0}",
+            u as f64 / elapsed,
+            r as f64 / elapsed,
+            d as f64 / elapsed
+        );
+    }
+}
+
 pub struct HorizonApp {
     nro_path: String,
     emulation_handle: Option<EmulationHandle>,
     game_texture: Option<egui::TextureHandle>,
     wgpu_state: Option<eframe::egui_wgpu::RenderState>,
     game_texture_native: Option<NativeGameTexture>,
+    frame_backlog: std::collections::VecDeque<crate::boot::Frame>,
     show_settings: bool,
     settings_tab: SettingsTab,
     input: Option<InputBackend>,
@@ -99,6 +129,7 @@ impl HorizonApp {
             game_texture: None,
             wgpu_state: cc.wgpu_render_state.clone(),
             game_texture_native: None,
+            frame_backlog: std::collections::VecDeque::new(),
             show_settings: false,
             settings_tab: SettingsTab::General,
             input,
@@ -294,14 +325,18 @@ impl HorizonApp {
             crate::app_settings::FilterMode::Linear => egui::TextureOptions::LINEAR,
             crate::app_settings::FilterMode::Nearest => egui::TextureOptions::NEAREST,
         };
-        let mut latest = None;
         while let Ok(frame) = handle.frame_rx.try_recv() {
             if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() {
                 continue;
             }
-            latest = Some(frame);
+            self.frame_backlog.push_back(frame);
         }
-        if let Some(frame) = latest {
+        while self.frame_backlog.len() > 3 {
+            self.frame_backlog.pop_front();
+            gui_rate_stats(2);
+        }
+        if let Some(frame) = self.frame_backlog.pop_front() {
+            gui_rate_stats(1);
             self.performance.record_frame();
             log::trace!(
                 "frame in: {}x{} ({} bytes)",
@@ -423,6 +458,7 @@ impl HorizonApp {
                 self.emulation_handle = Some(h);
                 self.game_texture = None;
                 self.free_native_texture();
+                self.frame_backlog.clear();
             }
             Err(e) => log::error!("Boot: {}", e),
         }
@@ -431,6 +467,7 @@ impl HorizonApp {
     fn stop_emulation(&mut self) {
         if let Some(mut h) = self.emulation_handle.take() {
             h.stop();
+            self.frame_backlog.clear();
             if self.game_texture.is_some() || self.game_texture_native.is_some() {
                 self.stop_fade = Some(std::time::Instant::now());
             }
@@ -730,6 +767,7 @@ fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
 
 impl eframe::App for HorizonApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        gui_rate_stats(0);
         if self.splash.active() {
             if self.emulation_handle.is_some() {
                 self.splash = crate::splash::Splash::finished();

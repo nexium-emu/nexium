@@ -1,4 +1,4 @@
-use nexium_core::boot::{BootConfig, BootContext};
+﻿use nexium_core::boot::{BootConfig, BootContext};
 use nexium_core::services::FrameOut;
 use parking_lot::Mutex;
 use std::path::Path;
@@ -403,7 +403,7 @@ impl EmulationHandle {
         let nro_path = nro_path.to_string();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);
-        let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(2);
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(8);
         let cpu_snapshot = Arc::new(Mutex::new(CpuSnapshot::default()));
         let cpu_snapshot_clone = Arc::clone(&cpu_snapshot);
         let mem_request = Arc::new(Mutex::new(0u64));
@@ -944,7 +944,7 @@ impl EmulationHandle {
                             for i in 0..31 {
                                 regs[i] = cpu.get_register(i as u32);
                             }
-                            log::error!("[null-pc] PC entered null page ({:#x}) — likely null function pointer / corrupted vtable", pc_after);
+                            log::error!("[null-pc] PC entered null page ({:#x}) â€” likely null function pointer / corrupted vtable", pc_after);
                             log::error!("[null-pc] handle={:?} lr={:#x} sp={:#x}", cur, lr, sp);
                             for chunk in 0..4u32 {
                                 let b = (chunk * 8) as usize;
@@ -1135,7 +1135,7 @@ impl EmulationHandle {
 
                         if pc_check_count < 5 {
                             log::info!(
-                                "CPU exec: PC {:#x} → {:#x} (event: {:?})",
+                                "CPU exec: PC {:#x} â†’ {:#x} (event: {:?})",
                                 pc_before,
                                 pc_after,
                                 event
