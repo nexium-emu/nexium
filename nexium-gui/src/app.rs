@@ -77,6 +77,13 @@ pub struct HorizonApp {
     play_times: crate::playtime::PlayTimes,
     last_playtime_save: std::time::Instant,
     pub carousel: crate::carousel::CarouselState,
+    confirm: Option<ConfirmDialog>,
+    teardown_at: Option<std::time::Instant>,
+    pending_boot: Option<String>,
+    modal_cd: f64,
+    modal_hold: bool,
+    modal_anim: f32,
+    modal_snap: Option<ModalSnap>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,6 +94,26 @@ pub enum SettingsTab {
     Audio,
     Emulation,
     Logging,
+}
+
+enum ConfirmKind {
+    CloseGame,
+    LaunchGame(String),
+}
+
+struct ConfirmDialog {
+    title: String,
+    body: String,
+    confirm_label: String,
+    selected: usize,
+    kind: ConfirmKind,
+}
+
+struct ModalSnap {
+    teardown: bool,
+    title: String,
+    body: String,
+    label: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -145,6 +172,13 @@ impl HorizonApp {
             play_times: crate::playtime::PlayTimes::load(),
             last_playtime_save: std::time::Instant::now(),
             carousel: crate::carousel::CarouselState::new(),
+            confirm: None,
+            teardown_at: None,
+            pending_boot: None,
+            modal_cd: 0.0,
+            modal_hold: false,
+            modal_anim: 0.0,
+            modal_snap: None,
         };
         app.reload_profile_texture(&cc.egui_ctx);
         app.library
@@ -402,6 +436,8 @@ impl HorizonApp {
                 height: frame.height,
                 filter,
             });
+        }
+        if self.carousel.boot_stage != crate::carousel::BootStage::None {
             self.carousel.boot_stage = crate::carousel::BootStage::None;
         }
         let Some(t) = self.game_texture_native.as_ref() else {
@@ -434,6 +470,203 @@ impl HorizonApp {
                 rs.renderer.write().free_texture(&t.id);
             }
         }
+    }
+
+    fn modal_active(&self) -> bool {
+        self.confirm.is_some() || self.teardown_at.is_some()
+    }
+
+    fn resolve_confirm(&mut self, confirmed: bool) {
+        let Some(dlg) = self.confirm.take() else { return };
+        if !confirmed {
+            return;
+        }
+        self.stop_emulation();
+        self.teardown_at = Some(std::time::Instant::now());
+        self.pending_boot = match dlg.kind {
+            ConfirmKind::LaunchGame(path) => Some(path),
+            ConfirmKind::CloseGame => None,
+        };
+    }
+
+    fn handle_modal_input(&mut self, ctx: &egui::Context) {
+        if self.confirm.is_none() {
+            self.modal_hold = false;
+            return;
+        }
+        use crate::controller_config::SwitchButton;
+        let now = ctx.input(|i| i.time);
+        let (kb_left, kb_right, kb_enter, kb_esc) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        let li = self.last_input;
+        let ready = now - self.modal_cd > 0.18;
+        let mut mv = if kb_left { -1 } else if kb_right { 1 } else { 0 };
+        if ready && li.connected {
+            let lx = li.lx();
+            if li.is(SwitchButton::DLeft) || lx < -0.5 {
+                mv = -1;
+                self.modal_cd = now;
+            } else if li.is(SwitchButton::DRight) || lx > 0.5 {
+                mv = 1;
+                self.modal_cd = now;
+            }
+        }
+        if mv != 0 {
+            if let Some(c) = self.confirm.as_mut() {
+                c.selected = if mv < 0 { 0 } else { 1 };
+            }
+        }
+        let gp_a = li.connected && li.is(SwitchButton::A);
+        let gp_b = li.connected && li.is(SwitchButton::B);
+        let a_edge = kb_enter || (gp_a && !self.modal_hold);
+        let b_edge = kb_esc || (gp_b && !self.modal_hold);
+        self.modal_hold = gp_a || gp_b;
+        if b_edge {
+            self.confirm = None;
+            self.carousel.boot_stage = crate::carousel::BootStage::None;
+        } else if a_edge {
+            let confirmed = self.confirm.as_ref().map_or(false, |c| c.selected == 1);
+            self.resolve_confirm(confirmed);
+        }
+    }
+
+    fn teardown_tick(&mut self, ctx: &egui::Context) {
+        if let Some(start) = self.teardown_at {
+            ctx.request_repaint();
+            if start.elapsed().as_secs_f32() >= 3.0 {
+                self.teardown_at = None;
+                if let Some(path) = self.pending_boot.take() {
+                    let now = ctx.input(|i| i.time) as f32;
+                    self.carousel.boot_stage = crate::carousel::BootStage::Transitioning {
+                        game_index: self.carousel.selected,
+                        start_time: now,
+                        launch_path: path,
+                    };
+                }
+            }
+        }
+    }
+
+    fn draw_modal(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        let active = self.modal_active();
+        let target = if active { 1.0 } else { 0.0 };
+        let speed = if target > self.modal_anim { 12.0 } else { 10.0 };
+        self.modal_anim += (target - self.modal_anim) * (dt * speed).min(1.0);
+        if (self.modal_anim - target).abs() < 0.003 {
+            self.modal_anim = target;
+        }
+
+        if active {
+            let snap = if self.teardown_at.is_some() {
+                ModalSnap { teardown: true, title: String::new(), body: String::new(), label: String::new() }
+            } else if let Some(c) = &self.confirm {
+                ModalSnap { teardown: false, title: c.title.clone(), body: c.body.clone(), label: c.confirm_label.clone() }
+            } else {
+                return;
+            };
+            self.modal_snap = Some(snap);
+        }
+        if self.modal_anim <= 0.004 {
+            if !active {
+                self.modal_snap = None;
+            }
+            return;
+        }
+        let Some(snap) = self.modal_snap.as_ref() else {
+            return;
+        };
+        let (is_teardown, title, body, label) = (snap.teardown, snap.title.clone(), snap.body.clone(), snap.label.clone());
+
+        let a = self.modal_anim.clamp(0.0, 1.0);
+        let ease = a * a * (3.0 - 2.0 * a);
+
+        let light = self.app_settings.light_mode;
+        let panel = if light { Color32::from_rgb(0xF5, 0xF5, 0xF9) } else { Color32::from_rgb(0x18, 0x18, 0x22) };
+        let text = if light { Color32::from_rgb(0x1E, 0x1E, 0x28) } else { Color32::from_rgb(0xEC, 0xEC, 0xF0) };
+        let muted = if light { Color32::from_rgb(0x60, 0x60, 0x6A) } else { Color32::from_rgb(0x9A, 0x9A, 0xA6) };
+        let border = if light { Color32::from_rgb(0xC6, 0xC6, 0xD0) } else { Color32::from_rgb(0x32, 0x32, 0x3E) };
+        let btn_fill = if light { Color32::from_rgb(0xEA, 0xEA, 0xF0) } else { Color32::from_rgb(0x24, 0x24, 0x2E) };
+        let accent = match self.app_settings.carousel_theme.color() {
+            Some((r, g, b)) => Color32::from_rgb(r, g, b),
+            None => self.carousel.ambient_color,
+        };
+
+        let screen = ctx.screen_rect();
+        let mut p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("modal_overlay")));
+        p.set_opacity(ease);
+        p.rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(195));
+
+        let pop = 0.90 + 0.10 * ease;
+        let w = (screen.width() * 0.4).clamp(380.0, 560.0) * pop;
+        let h = 224.0 * pop;
+        let box_rect = egui::Rect::from_center_size(screen.center(), Vec2::new(w, h));
+        p.rect_filled(box_rect.translate(Vec2::new(0.0, 10.0)), Rounding::same(18.0), Color32::from_black_alpha(90));
+        p.rect_filled(box_rect, Rounding::same(18.0), panel);
+        p.rect_stroke(box_rect, Rounding::same(18.0), Stroke::new(1.5, border));
+
+        if is_teardown {
+            p.text(box_rect.center() - Vec2::new(0.0, 14.0 * pop), egui::Align2::CENTER_CENTER, "Please Wait…", FontId::proportional(25.0 * pop), text);
+            p.text(box_rect.center() + Vec2::new(0.0, 24.0 * pop), egui::Align2::CENTER_CENTER, "Shutting down the current game", FontId::proportional(14.0 * pop), muted);
+            ctx.request_repaint();
+            return;
+        }
+
+        p.text(egui::pos2(box_rect.center().x, box_rect.min.y + 40.0 * pop), egui::Align2::CENTER_CENTER, &title, FontId::proportional(15.0 * pop), muted);
+        p.text(egui::pos2(box_rect.center().x, box_rect.center().y - 14.0 * pop), egui::Align2::CENTER_CENTER, &body, FontId::proportional(21.0 * pop), text);
+
+        let btn_w = w * 0.42;
+        let btn_h = 46.0 * pop;
+        let by = box_rect.max.y - btn_h - 18.0 * pop;
+        let gap = w * 0.05;
+        let cancel_rect = egui::Rect::from_min_size(egui::pos2(box_rect.center().x - gap * 0.5 - btn_w, by), Vec2::new(btn_w, btn_h));
+        let ok_rect = egui::Rect::from_min_size(egui::pos2(box_rect.center().x + gap * 0.5, by), Vec2::new(btn_w, btn_h));
+
+        let selected = self.confirm.as_ref().map_or(0, |c| c.selected);
+        let mut draw_btn = |rect: egui::Rect, label: &str, sel: bool| {
+            let rounding = Rounding::same(10.0);
+            p.rect_filled(rect, rounding, btn_fill);
+            if sel {
+                p.rect_stroke(rect, rounding, Stroke::new(2.6, accent));
+            } else {
+                p.rect_stroke(rect, rounding, Stroke::new(1.2, border));
+            }
+            let col = if sel {
+                let f = |x: u8| (x as f32 + (255.0 - x as f32) * 0.2) as u8;
+                Color32::from_rgb(f(accent.r()), f(accent.g()), f(accent.b()))
+            } else {
+                text
+            };
+            p.text(rect.center(), egui::Align2::CENTER_CENTER, label, FontId::proportional(18.0 * pop), col);
+        };
+        draw_btn(cancel_rect, "Cancel", selected == 0);
+        draw_btn(ok_rect, &label, selected == 1);
+
+        if self.confirm.is_some() {
+            let cancel_resp = ui.allocate_rect(cancel_rect, egui::Sense::click());
+            let ok_resp = ui.allocate_rect(ok_rect, egui::Sense::click());
+            if let Some(c) = self.confirm.as_mut() {
+                if cancel_resp.hovered() {
+                    c.selected = 0;
+                }
+                if ok_resp.hovered() {
+                    c.selected = 1;
+                }
+            }
+            if cancel_resp.clicked() {
+                self.confirm = None;
+                self.carousel.boot_stage = crate::carousel::BootStage::None;
+            } else if ok_resp.clicked() {
+                self.resolve_confirm(true);
+            }
+        }
+        ctx.request_repaint();
     }
 
     fn game_display(&self) -> Option<(egui::TextureId, Vec2)> {
@@ -477,6 +710,7 @@ impl HorizonApp {
 
     fn stop_emulation(&mut self) {
         self.play_times.save_if_dirty();
+        self.carousel.boot_stage = crate::carousel::BootStage::None;
         let was_paused = self
             .emulation_handle
             .as_ref()
@@ -881,6 +1115,21 @@ impl eframe::App for HorizonApp {
         }
 
         {
+            use crate::controller_config::SwitchButton;
+            let a_down = ctx.input(|i| i.key_down(egui::Key::Enter))
+                || (self.last_input.connected && self.last_input.is(SwitchButton::A));
+            let x_down = ctx.input(|i| i.key_down(egui::Key::X))
+                || (self.last_input.connected && self.last_input.is(SwitchButton::X));
+            self.carousel.a_edge = a_down && !self.carousel.a_held;
+            self.carousel.x_edge = x_down && !self.carousel.x_held;
+            self.carousel.a_held = a_down;
+            self.carousel.x_held = x_down;
+        }
+
+        self.handle_modal_input(ctx);
+        self.teardown_tick(ctx);
+
+        {
             let kb_home = ctx.input(|i| i.key_pressed(egui::Key::Home));
             let gp_home = self.last_input.home;
             let home_edge = kb_home || (gp_home && !self.last_home);
@@ -891,7 +1140,7 @@ impl eframe::App for HorizonApp {
                 .as_ref()
                 .map_or((false, false), |h| (h.is_running(), h.is_paused()));
 
-            if home_edge && running && self.rebinding.is_none() && self.rebinding_pad.is_none() {
+            if home_edge && running && !self.modal_active() && self.rebinding.is_none() && self.rebinding_pad.is_none() {
                 if paused {
                     if let Some(h) = self.emulation_handle.as_ref() {
                         h.resume();
@@ -917,6 +1166,8 @@ impl eframe::App for HorizonApp {
                     self.pause_anim = Some(std::time::Instant::now());
                 } else {
                     self.stop_emulation();
+                    self.teardown_at = Some(std::time::Instant::now());
+                    self.pending_boot = None;
                 }
             }
         }
@@ -1536,6 +1787,7 @@ impl eframe::App for HorizonApp {
                             1.0
                         };
                         let profile_tex = self.profile_texture.as_ref().map(|t| t.id());
+                        let modal_active = self.modal_active();
                         let action = crate::carousel::carousel_view(
                             &mut self.carousel,
                             &mut self.library,
@@ -1548,7 +1800,7 @@ impl eframe::App for HorizonApp {
                             self.app_settings.carousel_theme,
                             profile_tex,
                             &self.app_settings.profile_name,
-                            !self.show_settings,
+                            !self.show_settings && !modal_active,
                             scale_f,
                             1.0,
                             self.app_settings.backdrop_theme,
@@ -1557,8 +1809,19 @@ impl eframe::App for HorizonApp {
                         );
                         match action {
                             crate::carousel::CarouselAction::Launch(path) => {
-                                self.nro_path = path;
-                                self.boot_nro(ctx);
+                                if running {
+                                    self.confirm = Some(ConfirmDialog {
+                                        title: "Launch Game".into(),
+                                        body: "Close the current game and launch this one?".into(),
+                                        confirm_label: "Launch".into(),
+                                        selected: 0,
+                                        kind: ConfirmKind::LaunchGame(path),
+                                    });
+                                    self.modal_hold = true;
+                                } else {
+                                    self.nro_path = path;
+                                    self.boot_nro(ctx);
+                                }
                             }
                             crate::carousel::CarouselAction::SetTheme(th) => {
                                 if self.app_settings.carousel_theme != th {
@@ -1585,7 +1848,14 @@ impl eframe::App for HorizonApp {
                                 let _ = self.app_settings.save();
                             }
                             crate::carousel::CarouselAction::StopEmulation => {
-                                self.stop_emulation();
+                                self.confirm = Some(ConfirmDialog {
+                                    title: "Close Game".into(),
+                                    body: "Close the current game?".into(),
+                                    confirm_label: "Close".into(),
+                                    selected: 0,
+                                    kind: ConfirmKind::CloseGame,
+                                });
+                                self.modal_hold = true;
                             }
                             crate::carousel::CarouselAction::OpenSettings => {
                                 self.settings_tab = SettingsTab::General;
@@ -1721,14 +1991,23 @@ impl eframe::App for HorizonApp {
                         self.game_texture = None;
                         self.free_native_texture();
                     }
-                } else if let Some((tid, tsz)) = self.game_display() {
-                    let draw_size = self.game_draw_rect(ui.max_rect(), tsz).size();
-                    ui.centered_and_justified(|ui| {
-                        ui.image((tid, draw_size));
-                    });
+                } else if running {
+                    if let Some((tid, tsz)) = self.game_display() {
+                        let draw_size = self.game_draw_rect(ui.max_rect(), tsz).size();
+                        ui.centered_and_justified(|ui| {
+                            ui.image((tid, draw_size));
+                        });
+                    } else {
+                        self.library_view(ui, ctx);
+                    }
                 } else {
+                    if self.game_texture.is_some() || self.game_texture_native.is_some() {
+                        self.game_texture = None;
+                        self.free_native_texture();
+                    }
                     self.library_view(ui, ctx);
                 }
+                self.draw_modal(ctx, ui);
             });
 
         if self.show_settings {

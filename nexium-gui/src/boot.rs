@@ -1394,7 +1394,9 @@ impl EmulationHandle {
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
         if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
+            std::thread::spawn(move || {
+                let _ = handle.join();
+            });
         }
     }
 

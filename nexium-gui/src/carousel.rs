@@ -27,6 +27,9 @@ pub struct CarouselState {
     pub dock_focus: f32,
     pub theme_t: f32,
     pub x_held: bool,
+    pub a_held: bool,
+    pub a_edge: bool,
+    pub x_edge: bool,
     pub is_dragging: bool,
     pub drag_start_x: f32,
     pub drag_start_offset: f32,
@@ -54,6 +57,9 @@ impl CarouselState {
             dock_focus: 0.0,
             theme_t: 0.0,
             x_held: false,
+            a_held: false,
+            a_edge: false,
+            x_edge: false,
             is_dragging: false,
             drag_start_x: 0.0,
             drag_start_offset: 0.0,
@@ -906,6 +912,8 @@ pub fn carousel_view(
                     action = CarouselAction::AddFolder;
                 } else if playing == Some(filtered_indices[i]) {
                     action = CarouselAction::Resume;
+                } else if is_running {
+                    action = CarouselAction::Launch(lib.games[filtered_indices[i]].path.to_string_lossy().to_string());
                 } else {
                     state.boot_stage = BootStage::Transitioning {
                         game_index: i,
@@ -1485,13 +1493,16 @@ pub fn carousel_view(
             theme,
             launch_path,
         );
-        if let CarouselAction::Launch(path) = action {
-            state.boot_stage = BootStage::Transitioning {
-                game_index: state.selected,
-                start_time: t,
-                launch_path: path,
-            };
-            action = CarouselAction::None;
+        if let CarouselAction::Launch(path) = &action {
+            if !is_running {
+                let path = path.clone();
+                state.boot_stage = BootStage::Transitioning {
+                    game_index: state.selected,
+                    start_time: t,
+                    launch_path: path,
+                };
+                action = CarouselAction::None;
+            }
         }
     }
 
@@ -1526,9 +1537,8 @@ fn handle_input(
     let mut right  = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
     let mut up     = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
     let mut down   = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
-    let mut select = ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let mut select = false;
     let mut back   = ui.input(|i| i.key_pressed(egui::Key::Escape));
-    let mut stop   = ui.input(|i| i.key_pressed(egui::Key::X));
 
     if last_input.connected {
         use crate::controller_config::SwitchButton;
@@ -1536,9 +1546,7 @@ fn handle_input(
         if last_input.is(SwitchButton::DRight) { right  = true; }
         if last_input.is(SwitchButton::DUp)    { up     = true; }
         if last_input.is(SwitchButton::DDown)  { down   = true; }
-        if last_input.is(SwitchButton::A)      { select = true; }
         if last_input.is(SwitchButton::B)      { back   = true; }
-        if last_input.is(SwitchButton::X)      { stop   = true; }
 
         use std::sync::atomic::{AtomicU64, Ordering};
         static LAST_NAV: AtomicU64 = AtomicU64::new(0);
@@ -1556,10 +1564,8 @@ fn handle_input(
         }
     }
 
-    let x_down_now = ui.input(|i| i.key_down(egui::Key::X))
-        || (last_input.connected && last_input.is(crate::controller_config::SwitchButton::X));
-    let x_edge = x_down_now && !state.x_held;
-    state.x_held = x_down_now;
+    let x_edge = state.x_edge;
+    select = state.a_edge;
 
     if state.palette_open {
         let themes = crate::app_settings::CarouselTheme::all();
@@ -1653,15 +1659,11 @@ fn handle_input(
             state.active_dock = false;
         }
     }
-    if !state.active_dock {
-        if is_running {
-            if stop {
-                *action = CarouselAction::StopEmulation;
-            }
-        } else if x_edge {
-            if let Some(p) = &launch_path {
-                *action = CarouselAction::ToggleFavorite(p.clone());
-            }
+    if !state.active_dock && x_edge {
+        if is_running && is_playing {
+            *action = CarouselAction::StopEmulation;
+        } else if let Some(p) = &launch_path {
+            *action = CarouselAction::ToggleFavorite(p.clone());
         }
     }
 }
