@@ -304,6 +304,8 @@ pub struct AppSettings {
     pub profile_avatar: Option<PathBuf>,
     #[serde(default = "default_profile_name")]
     pub profile_name: String,
+    #[serde(default)]
+    pub steamgriddb_key: String,
 }
 
 fn default_profile_name() -> String {
@@ -338,6 +340,7 @@ impl Default for AppSettings {
             favorites: Vec::new(),
             profile_avatar: None,
             profile_name: default_profile_name(),
+            steamgriddb_key: String::new(),
         }
     }
 }

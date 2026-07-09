@@ -50,6 +50,9 @@ pub struct InputSnapshot {
     pub buttons: u64,
     pub sticks: [i32; 4],
     pub home: bool,
+    pub battery: Option<i32>,
+    pub charging: bool,
+    pub wired: bool,
 }
 
 impl InputSnapshot {
@@ -59,6 +62,9 @@ impl InputSnapshot {
             buttons: 0,
             sticks: [0; 4],
             home: false,
+            battery: None,
+            charging: false,
+            wired: false,
         }
     }
 
@@ -148,6 +154,43 @@ impl InputBackend {
         snap.buttons = cfg.gamepad_pressed(raw);
         snap.home = pad.button(Button::Guide);
 
+        let power = pad.power_info();
+        snap.battery = if power.percentage >= 0 {
+            Some(power.percentage)
+        } else {
+            None
+        };
+        snap.charging = matches!(
+            power.state,
+            sdl3::joystick::PowerLevel::Charging | sdl3::joystick::PowerLevel::Charged
+        );
+
+        if let Ok(cs) = pad.connection_state() {
+            match cs {
+                sdl3::joystick::ConnectionState::Wired => {
+                    snap.wired = true;
+                    snap.charging = true;
+                }
+                sdl3::joystick::ConnectionState::Wireless => {
+                    snap.wired = false;
+                }
+                _ => {}
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Some((cap, plugged)) = read_device_power_supply() {
+                if snap.battery.is_none() {
+                    snap.battery = cap;
+                }
+                if plugged {
+                    snap.charging = true;
+                    snap.wired = true;
+                }
+            }
+        }
+
         let dz = |v: f32| if v.abs() < 0.12 { 0.0 } else { v };
         let ax = |a: Axis| pad.axis(a) as f32 / 32768.0;
         snap.sticks = [
@@ -188,4 +231,36 @@ impl InputBackend {
 pub fn is_pro_controller(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("pro controller") || n.contains("nintendo switch") || n.contains("switch pro")
+}
+
+#[cfg(target_os = "linux")]
+fn read_device_power_supply() -> Option<(Option<i32>, bool)> {
+    let entries = std::fs::read_dir("/sys/class/power_supply").ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let typ = std::fs::read_to_string(p.join("type")).unwrap_or_default();
+        if typ.trim() != "Battery" {
+            continue;
+        }
+        let scope = std::fs::read_to_string(p.join("scope")).unwrap_or_default();
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        let is_peripheral = scope.trim() == "Device"
+            || name.contains("controller")
+            || name.contains("nintendo")
+            || name.contains("joycon")
+            || name.contains("sony")
+            || name.contains("xbox")
+            || name.contains("hid");
+        if !is_peripheral {
+            continue;
+        }
+        let cap = std::fs::read_to_string(p.join("capacity"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok());
+        let status = std::fs::read_to_string(p.join("status")).unwrap_or_default();
+        let st = status.trim();
+        let plugged = st == "Charging" || st == "Full" || st == "Not charging";
+        return Some((cap, plugged));
+    }
+    None
 }

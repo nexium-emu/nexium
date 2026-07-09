@@ -77,6 +77,10 @@ pub struct HorizonApp {
     play_times: crate::playtime::PlayTimes,
     last_playtime_save: std::time::Instant,
     pub carousel: crate::carousel::CarouselState,
+    icon_picker: Option<IconPicker>,
+    icon_reveal: Option<(usize, std::time::Instant, Option<egui::TextureHandle>)>,
+    key_test: Option<std::sync::Arc<std::sync::Mutex<KeyTest>>>,
+    key_test_result: Option<(bool, std::time::Instant)>,
     confirm: Option<ConfirmDialog>,
     teardown_at: Option<std::time::Instant>,
     pending_boot: Option<String>,
@@ -117,6 +121,68 @@ struct ModalSnap {
     title: String,
     body: String,
     label: String,
+}
+
+#[derive(Default)]
+struct IconFetch {
+    done: bool,
+    error: Option<String>,
+    items: Vec<(String, Option<Vec<u8>>)>,
+}
+
+#[derive(Default)]
+struct IconApply {
+    done: bool,
+    bytes: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct KeyTest {
+    done: bool,
+    ok: bool,
+}
+
+struct IconPicker {
+    game_idx: usize,
+    game_path: std::path::PathBuf,
+    search: String,
+    editing: bool,
+    anim: f32,
+    selected: usize,
+    scroll: f32,
+    squish_at: Option<f64>,
+    nav_cd: f64,
+    hold: bool,
+    built: bool,
+    full_urls: Vec<String>,
+    thumbs: Vec<Option<egui::TextureHandle>>,
+    fetch: std::sync::Arc<std::sync::Mutex<IconFetch>>,
+    apply: Option<std::sync::Arc<std::sync::Mutex<IconApply>>>,
+}
+
+fn start_icon_fetch(key: String, query: String) -> std::sync::Arc<std::sync::Mutex<IconFetch>> {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(IconFetch::default()));
+    let s2 = shared.clone();
+    std::thread::spawn(move || {
+        let mut result = IconFetch { done: true, error: None, items: Vec::new() };
+        if key.trim().is_empty() {
+            result.error = Some("No SteamGridDB API key — set it in Preferences > General".into());
+        } else {
+            let icons = crate::steamgrid::fetch_icons(&key, &query, 15);
+            if icons.is_empty() {
+                result.error = Some("No icons found for that name".into());
+            } else {
+                for ic in icons {
+                    let bytes = crate::steamgrid::curl_bytes(&ic.thumb_url);
+                    result.items.push((ic.full_url, bytes));
+                }
+            }
+        }
+        if let Ok(mut g) = s2.lock() {
+            *g = result;
+        }
+    });
+    shared
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -176,6 +242,10 @@ impl HorizonApp {
             play_times: crate::playtime::PlayTimes::load(),
             last_playtime_save: std::time::Instant::now(),
             carousel: crate::carousel::CarouselState::new(),
+            icon_picker: None,
+            icon_reveal: None,
+            key_test: None,
+            key_test_result: None,
             confirm: None,
             teardown_at: None,
             pending_boot: None,
@@ -480,7 +550,405 @@ impl HorizonApp {
     }
 
     fn modal_active(&self) -> bool {
-        self.confirm.is_some() || self.teardown_at.is_some()
+        self.confirm.is_some() || self.teardown_at.is_some() || self.icon_picker.is_some()
+    }
+
+    fn update_icon_picker(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        const ICON_GRID_COLS: usize = 5;
+        if self.icon_picker.is_none() {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        let light = self.app_settings.light_mode;
+        let accent = match self.app_settings.carousel_theme.color() {
+            Some((r, g, b)) => Color32::from_rgb(r, g, b),
+            None => self.carousel.ambient_color,
+        };
+        let panel = if light { Color32::from_rgb(0xF5, 0xF5, 0xF9) } else { Color32::from_rgb(0x16, 0x16, 0x20) };
+        let text = if light { Color32::from_rgb(0x1E, 0x1E, 0x28) } else { Color32::from_rgb(0xEC, 0xEC, 0xF0) };
+        let muted = if light { Color32::from_rgb(0x60, 0x60, 0x6A) } else { Color32::from_rgb(0x9A, 0x9A, 0xA6) };
+        let border = if light { Color32::from_rgb(0xC6, 0xC6, 0xD0) } else { Color32::from_rgb(0x32, 0x32, 0x3E) };
+        let field_bg = if light { Color32::from_rgb(0xE6, 0xE6, 0xEC) } else { Color32::from_rgb(0x24, 0x24, 0x2E) };
+
+        // --- Build thumbnail textures once the fetch is done ---
+        {
+            let p = self.icon_picker.as_mut().unwrap();
+            if !p.built {
+                let mut ready: Option<Vec<(String, Option<Vec<u8>>)>> = None;
+                if let Ok(g) = p.fetch.lock() {
+                    if g.done {
+                        ready = Some(g.items.clone());
+                    }
+                }
+                if let Some(items) = ready {
+                    for (i, (url, bytes)) in items.into_iter().enumerate() {
+                        p.full_urls.push(url);
+                        let tex = bytes
+                            .as_deref()
+                            .and_then(|b| image::load_from_memory(b).ok())
+                            .map(|im| im.to_rgba8())
+                            .map(|rgba| {
+                                let (w, h) = rgba.dimensions();
+                                let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+                                ctx.load_texture(format!("sgdb_thumb_{i}"), ci, egui::TextureOptions::LINEAR)
+                            });
+                        p.thumbs.push(tex);
+                    }
+                    p.built = true;
+                }
+            }
+        }
+
+        // --- Poll an in-flight apply download ---
+        let mut apply_now: Option<Vec<u8>> = None;
+        let mut apply_failed = false;
+        if let Some(p) = self.icon_picker.as_ref() {
+            if let Some(a) = &p.apply {
+                if let Ok(g) = a.lock() {
+                    if g.done {
+                        match &g.bytes {
+                            Some(b) => apply_now = Some(b.clone()),
+                            None => apply_failed = true,
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(bytes) = apply_now {
+            if let Some(img) = image::load_from_memory(&bytes).ok().map(|im| {
+                let rgba = im.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let (rgba, w, h) = if w.max(h) > 256 {
+                    let r = image::imageops::resize(&rgba, 256, 256, image::imageops::FilterType::Lanczos3);
+                    (r.into_raw(), 256u32, 256u32)
+                } else {
+                    (rgba.into_raw(), w, h)
+                };
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba)
+            }) {
+                let (idx, path) = {
+                    let p = self.icon_picker.as_ref().unwrap();
+                    (p.game_idx, p.game_path.clone())
+                };
+                if let Some(cache) = crate::library::custom_icon_path(&path) {
+                    if let Some(parent) = cache.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&cache, &bytes);
+                }
+                let old_tex = self.library.texture(ctx, idx);
+                self.library.set_icon(idx, img);
+                self.icon_reveal = Some((idx, std::time::Instant::now(), old_tex));
+                self.carousel.pending_center = Some(idx);
+                crate::ui_audio::play(crate::ui_audio::Sfx::Celebration);
+            }
+            self.icon_picker = None;
+            return;
+        }
+        if apply_failed {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Error);
+            self.icon_picker = None;
+            return;
+        }
+
+        // --- Input ---
+        let (kb_left, kb_right, kb_enter, kb_esc, kb_up, kb_down) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+            )
+        });
+        let text_events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
+        let li = self.last_input;
+        use crate::controller_config::SwitchButton;
+        let gp_a = li.connected && li.is(SwitchButton::A);
+        let gp_b = li.connected && li.is(SwitchButton::B);
+        let a_edge = kb_enter || (gp_a && !self.hold_pick());
+        let b_edge = kb_esc || (gp_b && !self.hold_pick());
+
+        let ready_nav = now - self.icon_picker.as_ref().unwrap().nav_cd > 0.16;
+        let n = self.icon_picker.as_ref().unwrap().thumbs.len();
+        let dancing = self.icon_picker.as_ref().unwrap().squish_at.is_some();
+        let editing = self.icon_picker.as_ref().unwrap().editing;
+
+        let mut close = false;
+        let mut research = false;
+        if !dancing {
+            let p = self.icon_picker.as_mut().unwrap();
+            if editing {
+                for ev in &text_events {
+                    match ev {
+                        egui::Event::Text(txt) => {
+                            for c in txt.chars() {
+                                if !c.is_control() && p.search.chars().count() < 48 {
+                                    p.search.push(c);
+                                }
+                            }
+                        }
+                        egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                            p.search.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                if kb_enter {
+                    p.editing = false;
+                    p.built = false;
+                    p.selected = 0;
+                    p.scroll = 0.0;
+                    p.full_urls.clear();
+                    p.thumbs.clear();
+                    research = true;
+                } else if kb_esc || b_edge {
+                    p.editing = false;
+                }
+            } else {
+                let mut mv_left = kb_left;
+                let mut mv_right = kb_right;
+                let mut mv_up = kb_up;
+                let mut mv_down = kb_down;
+                if ready_nav && li.connected {
+                    if li.is(SwitchButton::DLeft) || li.lx() < -0.5 {
+                        mv_left = true;
+                        p.nav_cd = now;
+                    } else if li.is(SwitchButton::DRight) || li.lx() > 0.5 {
+                        mv_right = true;
+                        p.nav_cd = now;
+                    } else if li.is(SwitchButton::DUp) || li.ly() > 0.5 {
+                        mv_up = true;
+                        p.nav_cd = now;
+                    } else if li.is(SwitchButton::DDown) || li.ly() < -0.5 {
+                        mv_down = true;
+                        p.nav_cd = now;
+                    }
+                }
+                if mv_left && p.selected > 0 {
+                    p.selected -= 1;
+                    crate::ui_audio::play_move();
+                }
+                if mv_right && n > 0 && p.selected + 1 < n {
+                    p.selected += 1;
+                    crate::ui_audio::play_move();
+                }
+                if mv_down && p.selected + ICON_GRID_COLS < n {
+                    p.selected += ICON_GRID_COLS;
+                    crate::ui_audio::play_move();
+                }
+                if mv_up && p.selected >= ICON_GRID_COLS {
+                    p.selected -= ICON_GRID_COLS;
+                    crate::ui_audio::play_move();
+                } else if kb_up && p.selected < ICON_GRID_COLS {
+                    p.editing = true;
+                }
+                if a_edge && n > 0 && p.thumbs.get(p.selected).map_or(false, |t| t.is_some()) {
+                    p.squish_at = Some(now);
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Whistle);
+                }
+                if b_edge {
+                    close = true;
+                }
+            }
+        }
+        self.set_hold_pick(gp_a || gp_b);
+        if close {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+            self.icon_picker = None;
+            return;
+        }
+        if research {
+            let q = self.icon_picker.as_ref().map(|p| p.search.clone()).unwrap_or_default();
+            let key = self.app_settings.steamgriddb_key.clone();
+            if let Some(p) = self.icon_picker.as_mut() {
+                p.fetch = start_icon_fetch(key, q);
+            }
+        }
+
+        // --- Dance -> start apply ---
+        {
+            let p = self.icon_picker.as_mut().unwrap();
+            p.anim += (1.0 - p.anim) * (dt * 12.0).min(1.0);
+            if let Some(t0) = p.squish_at {
+                if (now - t0) as f32 > 0.34 && p.apply.is_none() {
+                    let url = p.full_urls.get(p.selected).cloned().unwrap_or_default();
+                    let shared = std::sync::Arc::new(std::sync::Mutex::new(IconApply::default()));
+                    let s2 = shared.clone();
+                    std::thread::spawn(move || {
+                        let bytes = crate::steamgrid::curl_bytes(&url);
+                        if let Ok(mut g) = s2.lock() {
+                            g.done = true;
+                            g.bytes = bytes;
+                        }
+                    });
+                    p.apply = Some(shared);
+                }
+            }
+        }
+
+        // --- Draw (snapshot state first to avoid borrow conflicts) ---
+        ctx.request_repaint();
+        let (anim, search, selected, scroll, squish_at, editing, built, thumbs) = {
+            let p = self.icon_picker.as_ref().unwrap();
+            (p.anim, p.search.clone(), p.selected, p.scroll, p.squish_at, p.editing, p.built, p.thumbs.clone())
+        };
+        let err = self
+            .icon_picker
+            .as_ref()
+            .and_then(|p| p.fetch.lock().ok().and_then(|g| g.error.clone()));
+        let ease = { let a = anim.clamp(0.0, 1.0); a * a * (3.0 - 2.0 * a) };
+        let t = ctx.input(|i| i.time) as f32;
+        let screen = ctx.screen_rect();
+        let mut paint = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("icon_picker")));
+        paint.set_opacity(ease);
+        paint.rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(205));
+
+        let pop = 0.92 + 0.08 * ease;
+        let w = (screen.width() * 0.72).clamp(560.0, 1040.0) * pop;
+        let h = (screen.height() * 0.6).clamp(360.0, 560.0) * pop;
+        let box_rect = egui::Rect::from_center_size(screen.center(), Vec2::new(w, h));
+        paint.rect_filled(box_rect.translate(Vec2::new(0.0, 12.0)), Rounding::same(20.0), Color32::from_black_alpha(90));
+        paint.rect_filled(box_rect, Rounding::same(20.0), panel);
+        paint.rect_stroke(box_rect, Rounding::same(20.0), Stroke::new(1.5, border));
+        paint.text(egui::pos2(box_rect.center().x, box_rect.min.y + 34.0), egui::Align2::CENTER_CENTER, "Choose an Icon", FontId::proportional(22.0), text);
+
+        // Search field
+        let field = egui::Rect::from_min_size(egui::pos2(box_rect.min.x + 40.0, box_rect.min.y + 58.0), Vec2::new(w - 80.0, 40.0));
+        let field_resp = ui.allocate_rect(field, egui::Sense::click());
+        paint.rect_filled(field, Rounding::same(10.0), field_bg);
+        paint.rect_stroke(field, Rounding::same(10.0), Stroke::new(if editing { 2.0 } else { 1.0 }, if editing { accent } else { border }));
+        let query_disp = if search.is_empty() { "Type a game name…".to_string() } else { search.clone() };
+        let qcol = if search.is_empty() { muted } else { text };
+        paint.text(egui::pos2(field.min.x + 14.0, field.center().y), egui::Align2::LEFT_CENTER, &query_disp, FontId::proportional(17.0), qcol);
+        if editing && (now * 1.6).fract() < 0.5 {
+            let tw = ui.fonts(|f| f.layout_no_wrap(search.clone(), FontId::proportional(17.0), text).size().x);
+            let cx = (field.min.x + 14.0 + tw).min(field.max.x - 10.0);
+            paint.line_segment([egui::pos2(cx, field.center().y - 11.0), egui::pos2(cx, field.center().y + 11.0)], Stroke::new(2.0, accent));
+        }
+
+        // Content area
+        let content = egui::Rect::from_min_max(egui::pos2(box_rect.min.x + 24.0, field.max.y + 20.0), egui::pos2(box_rect.max.x - 24.0, box_rect.max.y - 54.0));
+        let mut new_selected: Option<usize> = None;
+        let mut dbl_selected: Option<usize> = None;
+        let mut scroll_target = scroll;
+        let mut cell_px = 1.0f32;
+        let mut max_scroll_rows = 0.0f32;
+        let wheel_dy = ctx.input(|i| i.smooth_scroll_delta.y);
+        if !built {
+            paint.text(content.center(), egui::Align2::CENTER_CENTER, "Searching SteamGridDB…", FontId::proportional(18.0), muted);
+        } else if let Some(e) = err {
+            paint.text(content.center() - Vec2::new(0.0, 10.0), egui::Align2::CENTER_CENTER, &e, FontId::proportional(17.0), muted);
+            paint.text(content.center() + Vec2::new(0.0, 22.0), egui::Align2::CENTER_CENTER, "[Up] search a different name  ·  [B] Cancel", FontId::proportional(13.0), muted);
+        } else if thumbs.is_empty() {
+            paint.text(content.center() - Vec2::new(0.0, 10.0), egui::Align2::CENTER_CENTER, "No icons found for this name.", FontId::proportional(17.0), muted);
+            paint.text(content.center() + Vec2::new(0.0, 22.0), egui::Align2::CENTER_CENTER, "[Up] try a different name  ·  [B] Cancel", FontId::proportional(13.0), muted);
+        } else {
+            let cols = ICON_GRID_COLS;
+            let gap = 18.0;
+            let pad_top = 10.0;
+            let tile = (((content.width() - gap * (cols as f32 - 1.0)) / cols as f32).min(118.0)).max(48.0);
+            let cell = tile + gap;
+            let n_items = thumbs.len();
+            let rows = (n_items + cols - 1) / cols;
+            let sel_row = (selected / cols) as f32;
+            let rows_vis = ((content.height() - pad_top) / cell).max(1.0);
+            let max_scroll = (rows as f32 - rows_vis).max(0.0);
+            scroll_target = (sel_row - (rows_vis - 1.0) * 0.5).clamp(0.0, max_scroll);
+            cell_px = cell;
+            max_scroll_rows = max_scroll;
+
+            let grid_w = tile * cols as f32 + gap * (cols as f32 - 1.0);
+            let x0 = content.center().x - grid_w * 0.5;
+            let y0 = content.min.y + pad_top - scroll * cell;
+            let clip = paint.with_clip_rect(content);
+            for (i, thumb) in thumbs.iter().enumerate() {
+                let row = i / cols;
+                let col = i % cols;
+                let cx = x0 + col as f32 * cell + tile * 0.5;
+                let cy = y0 + row as f32 * cell + tile * 0.5;
+                if cy + tile < content.min.y || cy - tile > content.max.y {
+                    continue;
+                }
+                let sel = i == selected;
+                let (mut sx, mut sy) = (1.0f32, 1.0f32);
+                let mut sz = tile;
+                if sel {
+                    if let Some(t0) = squish_at {
+                        let e = (now - t0) as f32;
+                        if e < 0.34 {
+                            let q = (e * 34.0).sin() * 0.16 * (1.0 - e / 0.34);
+                            sx = 1.0 + q;
+                            sy = 1.0 - q;
+                        }
+                    }
+                    sz *= 1.06;
+                }
+                let r = egui::Rect::from_center_size(egui::pos2(cx, cy), Vec2::new(sz * sx, sz * sy));
+                clip.rect_filled(r.translate(Vec2::new(0.0, 4.0)), Rounding::same(14.0), Color32::from_black_alpha(80));
+                if sel {
+                    crate::carousel::draw_gradient_rounded_rect(&clip, r.center(), r.expand(6.0), 18.0, t, 180);
+                    crate::carousel::draw_gradient_rounded_rect(&clip, r.center(), r.expand(3.0), 16.0, t, 255);
+                }
+                clip.rect_filled(r, Rounding::same(14.0), field_bg);
+                if let Some(tex) = thumb {
+                    crate::carousel::draw_rounded_image(&clip, tex.id(), r, 14.0, Color32::WHITE);
+                } else {
+                    clip.text(r.center(), egui::Align2::CENTER_CENTER, "×", FontId::proportional(sz * 0.3), muted);
+                }
+                if content.contains(egui::pos2(cx, cy)) {
+                    let resp = ui.allocate_rect(r, egui::Sense::click());
+                    if resp.double_clicked() {
+                        dbl_selected = Some(i);
+                    } else if resp.clicked() {
+                        new_selected = Some(i);
+                    }
+                }
+            }
+        }
+
+        let hint = if editing {
+            "Type a name  ·  [Enter] Search  ·  [Esc] Done"
+        } else {
+            "[D-Pad] Browse  ·  [A] Choose  ·  Click search to rename  ·  [B] Cancel"
+        };
+        paint.text(egui::pos2(box_rect.center().x, box_rect.max.y - 26.0), egui::Align2::CENTER_CENTER, hint, FontId::proportional(13.0), muted);
+
+        let mut dbl_whistle = false;
+        if let Some(pp) = self.icon_picker.as_mut() {
+            if let Some(s) = new_selected {
+                pp.selected = s;
+            }
+            if let Some(s) = dbl_selected {
+                pp.selected = s;
+                if pp.squish_at.is_none() && pp.thumbs.get(s).map_or(false, |t| t.is_some()) {
+                    pp.squish_at = Some(now);
+                    dbl_whistle = true;
+                }
+            }
+            if wheel_dy.abs() > 0.1 && max_scroll_rows > 0.0 {
+                pp.scroll = (pp.scroll - wheel_dy / cell_px).clamp(0.0, max_scroll_rows);
+            } else {
+                pp.scroll += (scroll_target - pp.scroll) * (dt * 16.0).min(1.0);
+            }
+            if field_resp.clicked() {
+                pp.editing = true;
+            }
+        }
+        if dbl_whistle {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Whistle);
+        }
+    }
+
+    fn hold_pick(&self) -> bool {
+        self.icon_picker.as_ref().map_or(false, |p| p.hold)
+    }
+    fn set_hold_pick(&mut self, v: bool) {
+        if let Some(p) = self.icon_picker.as_mut() {
+            p.hold = v;
+        }
     }
 
     fn resolve_confirm(&mut self, confirmed: bool) {
@@ -572,7 +1040,11 @@ impl HorizonApp {
         }
         if mv != 0 {
             if let Some(c) = self.confirm.as_mut() {
-                c.selected = if mv < 0 { 0 } else { 1 };
+                let ns = if mv < 0 { 0 } else { 1 };
+                if ns != c.selected {
+                    c.selected = ns;
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Move);
+                }
             }
         }
         let gp_a = li.connected && li.is(SwitchButton::A);
@@ -581,10 +1053,12 @@ impl HorizonApp {
         let b_edge = kb_esc || (gp_b && !self.modal_hold);
         self.modal_hold = gp_a || gp_b;
         if b_edge {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Back);
             self.confirm = None;
             self.carousel.boot_stage = crate::carousel::BootStage::None;
         } else if a_edge {
             let confirmed = self.confirm.as_ref().map_or(false, |c| c.selected == 1);
+            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             self.resolve_confirm(confirmed);
         }
     }
@@ -721,9 +1195,11 @@ impl HorizonApp {
                 }
             }
             if cancel_resp.clicked() {
+                crate::ui_audio::play(crate::ui_audio::Sfx::Back);
                 self.confirm = None;
                 self.carousel.boot_stage = crate::carousel::BootStage::None;
             } else if ok_resp.clicked() {
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                 self.resolve_confirm(true);
             }
         }
@@ -1172,6 +1648,12 @@ impl eframe::App for HorizonApp {
         }
 
         self.library.poll();
+
+        if let Some((_, tm, _)) = &self.icon_reveal {
+            if tm.elapsed().as_secs_f32() > 1.0 {
+                self.icon_reveal = None;
+            }
+        }
 
         if self.profile_reload {
             self.profile_reload = false;
@@ -1790,6 +2272,7 @@ impl eframe::App for HorizonApp {
                         self.app_settings.backdrop_theme,
                         self.app_settings.light_mode,
                         &self.app_settings.favorites,
+                        self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
                     );
 
                     let profile_scale = 0.92 + 0.08 * content_opacity;
@@ -1823,6 +2306,7 @@ impl eframe::App for HorizonApp {
                                 self.carousel.profile_focused = false;
                             }
                             crate::profile::ProfileAction::QuickLaunch(path) => {
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Open);
                                 self.confirm = Some(ConfirmDialog {
                                     title: "Quick Launch".into(),
                                     body: "Quick Launch this game? Any open game will be shut down first.".into(),
@@ -1958,10 +2442,12 @@ impl eframe::App for HorizonApp {
                             self.app_settings.backdrop_theme,
                             self.app_settings.light_mode,
                             &self.app_settings.favorites,
+                            self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
                         );
                         match action {
                             crate::carousel::CarouselAction::Launch(path) => {
                                 if running {
+                                    crate::ui_audio::play(crate::ui_audio::Sfx::Open);
                                     self.confirm = Some(ConfirmDialog {
                                         title: "Launch Game".into(),
                                         body: "Close the current game and launch this one?".into(),
@@ -2003,6 +2489,7 @@ impl eframe::App for HorizonApp {
                                 let _ = self.app_settings.save();
                             }
                             crate::carousel::CarouselAction::StopEmulation => {
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Open);
                                 self.confirm = Some(ConfirmDialog {
                                     title: "Close Game".into(),
                                     body: "Close the current game?".into(),
@@ -2047,6 +2534,33 @@ impl eframe::App for HorizonApp {
                                     self.app_settings.favorites.push(p);
                                 }
                                 let _ = self.app_settings.save();
+                            }
+                            crate::carousel::CarouselAction::DownloadIcon(path) => {
+                                let pb = std::path::PathBuf::from(&path);
+                                if let Some(idx) = self.library.index_of_path(&pb) {
+                                    let title = self.library.games[idx].title.clone();
+                                    crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+                                    self.icon_picker = Some(IconPicker {
+                                        game_idx: idx,
+                                        game_path: pb,
+                                        search: title.clone(),
+                                        editing: false,
+                                        anim: 0.0,
+                                        selected: 0,
+                                        scroll: 0.0,
+                                        squish_at: None,
+                                        nav_cd: 0.0,
+                                        hold: true,
+                                        built: false,
+                                        full_urls: Vec::new(),
+                                        thumbs: Vec::new(),
+                                        fetch: start_icon_fetch(
+                                            self.app_settings.steamgriddb_key.clone(),
+                                            title,
+                                        ),
+                                        apply: None,
+                                    });
+                                }
                             }
                             crate::carousel::CarouselAction::None => {}
                         }
@@ -2119,6 +2633,7 @@ impl eframe::App for HorizonApp {
                             self.app_settings.backdrop_theme,
                             self.app_settings.light_mode,
                             &self.app_settings.favorites,
+                            self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
                         );
                         if t < 1.05 {
                             if let Some((tid, tsz)) = self.game_display() {
@@ -2165,6 +2680,7 @@ impl eframe::App for HorizonApp {
                     self.library_view(ui, ctx);
                 }
                 self.draw_modal(ctx, ui);
+                self.update_icon_picker(ctx, ui);
             });
 
         if self.show_settings {
@@ -2175,6 +2691,7 @@ impl eframe::App for HorizonApp {
             let mut save_needed = false;
             let mut app_cfg = self.app_settings.clone();
             let mut app_save_needed = false;
+            let mut test_key: Option<String> = None;
             let last_input = self.last_input;
             let gp_name = self.input.as_ref().and_then(|ib| ib.name());
             let mut rebinding_pad = self.rebinding_pad;
@@ -2232,7 +2749,38 @@ impl eframe::App for HorizonApp {
                     ui.add_space(6.0);
 
                     match tab {
-                        SettingsTab::General => settings_content(ui),
+                        SettingsTab::General => {
+                            settings_content(ui);
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("SteamGridDB").strong());
+                            ui.label(
+                                egui::RichText::new("Paste your API key to download custom game icons.")
+                                    .weak()
+                                    .size(12.0),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label("API Key");
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut app_cfg.steamgriddb_key)
+                                        .password(true)
+                                        .hint_text("Paste key here")
+                                        .desired_width(260.0),
+                                );
+                                if resp.changed() {
+                                    app_save_needed = true;
+                                }
+                                if ui.button("Test").clicked() {
+                                    test_key = Some(app_cfg.steamgriddb_key.clone());
+                                }
+                            });
+                            ui.hyperlink_to(
+                                "Get a key at steamgriddb.com/profile/preferences/api",
+                                "https://www.steamgriddb.com/profile/preferences/api",
+                            );
+                        }
                         SettingsTab::Controller => {
                             controller_settings_content(
                                 ui,
@@ -2281,6 +2829,92 @@ impl eframe::App for HorizonApp {
                 if let Err(e) = self.app_settings.save() {
                     log::warn!("Failed to save app settings: {}", e);
                 }
+            }
+            if let Some(key) = test_key {
+                let state = std::sync::Arc::new(std::sync::Mutex::new(KeyTest::default()));
+                self.key_test = Some(state.clone());
+                self.key_test_result = None;
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || {
+                    let ok = crate::steamgrid::verify_key(&key);
+                    if let Ok(mut g) = state.lock() {
+                        g.done = true;
+                        g.ok = ok;
+                    }
+                    ctx2.request_repaint();
+                });
+            }
+        }
+
+        // --- Poll SteamGridDB key test & draw its result dialog ---
+        if let Some(state) = &self.key_test {
+            let mut finished: Option<bool> = None;
+            if let Ok(g) = state.lock() {
+                if g.done {
+                    finished = Some(g.ok);
+                }
+            }
+            if let Some(ok) = finished {
+                self.key_test = None;
+                self.key_test_result = Some((ok, std::time::Instant::now()));
+                crate::ui_audio::play(if ok {
+                    crate::ui_audio::Sfx::Whistle
+                } else {
+                    crate::ui_audio::Sfx::Error
+                });
+            }
+        }
+        if self.key_test.is_some() {
+            egui::Window::new("SteamGridDB")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Testing connection…");
+                    });
+                    ui.add_space(4.0);
+                });
+            ctx.request_repaint();
+        } else if let Some((ok, _)) = self.key_test_result {
+            let mut still_open = true;
+            egui::Window::new("SteamGridDB")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| {
+                        if ok {
+                            ui.label(
+                                egui::RichText::new("✔  Connected")
+                                    .size(20.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(0x35, 0xD0, 0x6A)),
+                            );
+                            ui.add_space(4.0);
+                            ui.label("Your API key is valid. You can now download icons.");
+                        } else {
+                            ui.label(
+                                egui::RichText::new("✖  Failed")
+                                    .size(20.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(0xE8, 0x33, 0x50)),
+                            );
+                            ui.add_space(4.0);
+                            ui.label("Couldn't verify the key. Check the key and your connection.");
+                        }
+                        ui.add_space(10.0);
+                        if ui.button("OK").clicked() {
+                            still_open = false;
+                        }
+                    });
+                    ui.add_space(6.0);
+                });
+            if !still_open {
+                self.key_test_result = None;
             }
         }
 

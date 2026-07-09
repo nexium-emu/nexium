@@ -61,6 +61,7 @@ pub enum Sfx {
     GameBoot,
     AwaitFrame,
     PleaseWait,
+    Celebration,
 }
 
 struct Voice {
@@ -94,6 +95,7 @@ fn key(s: Sfx) -> u8 {
         Sfx::GameBoot => 8,
         Sfx::AwaitFrame => 9,
         Sfx::PleaseWait => 10,
+        Sfx::Celebration => 11,
     }
 }
 
@@ -171,6 +173,7 @@ fn build() -> Option<Engine> {
     banks.insert(key(Sfx::GameBoot), std::sync::Arc::new(render(Sfx::GameBoot)));
     banks.insert(key(Sfx::AwaitFrame), std::sync::Arc::new(render(Sfx::AwaitFrame)));
     banks.insert(key(Sfx::PleaseWait), std::sync::Arc::new(render(Sfx::PleaseWait)));
+    banks.insert(key(Sfx::Celebration), std::sync::Arc::new(render(Sfx::Celebration)));
 
     let music = std::sync::Arc::new(decode_wav_mono(MUSIC_WAV));
 
@@ -409,45 +412,7 @@ fn render(s: Sfx) -> Vec<f32> {
             tone_after_abs(&mut b, 1200.0, 783.99, 800.0, 0.08, 10.0, 400.0); // G5
         }
         Sfx::AwaitFrame => {
-            // Loop duration is exactly 3.2 seconds
-            let dur = 3.2f32;
-            let total_samples = (SR * dur) as usize;
-            b.resize(total_samples, 0.0);
-
-            // Walking Bass (Beat spacing is 400ms)
-            tone_after_abs(&mut b, 0.0, 87.1875, 400.0, 0.16, 12.0, 250.0);
-            tone_after_abs(&mut b, 400.0, 130.9375, 400.0, 0.14, 12.0, 250.0);
-            tone_after_abs(&mut b, 800.0, 82.50, 400.0, 0.16, 12.0, 250.0);
-            tone_after_abs(&mut b, 1200.0, 123.4375, 400.0, 0.14, 12.0, 250.0);
-            tone_after_abs(&mut b, 1600.0, 73.4375, 400.0, 0.16, 12.0, 250.0);
-            tone_after_abs(&mut b, 2000.0, 110.00, 400.0, 0.14, 12.0, 250.0);
-            tone_after_abs(&mut b, 2400.0, 98.125, 400.0, 0.16, 12.0, 250.0);
-            tone_after_abs(&mut b, 2800.0, 138.4375, 400.0, 0.14, 12.0, 250.0);
-
-            // Comping Chords
-            // Chord 1 (Fmaj9) at 100ms
-            tone_after_abs(&mut b, 100.0, 220.00, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 100.0, 261.5625, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 100.0, 329.6875, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 100.0, 391.875, 600.0, 0.04, 50.0, 400.0);
-
-            // Chord 2 (Em9) at 900ms
-            tone_after_abs(&mut b, 900.0, 195.9375, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 900.0, 246.875, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 900.0, 293.75, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 900.0, 370.00, 600.0, 0.04, 50.0, 400.0);
-
-            // Chord 3 (Dm9) at 1700ms
-            tone_after_abs(&mut b, 1700.0, 174.6875, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 1700.0, 220.00, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 1700.0, 261.5625, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 1700.0, 329.6875, 600.0, 0.04, 50.0, 400.0);
-
-            // Chord 4 (Dbmaj9) at 2500ms
-            tone_after_abs(&mut b, 2500.0, 174.6875, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 2500.0, 207.50, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 2500.0, 261.5625, 600.0, 0.05, 50.0, 400.0);
-            tone_after_abs(&mut b, 2500.0, 311.25, 600.0, 0.04, 50.0, 400.0);
+            b.resize((SR * 0.5) as usize, 0.0);
         }
         Sfx::PleaseWait => {
             let dur = 3.0f32;
@@ -465,6 +430,32 @@ fn render(s: Sfx) -> Vec<f32> {
                     s += wave * note_breathe;
                 }
                 b[i] = (s / freqs.len() as f32) * 0.16 * breathe;
+            }
+        }
+        Sfx::Celebration => {
+            // Cute little "ta-da!" — quick ascending C major arpeggio into a
+            // sparkly high sprinkle, with a soft chord bloom underneath.
+            let lead = [523.25f32, 659.25, 783.99, 1046.5];
+            for (i, &f) in lead.iter().enumerate() {
+                tone_after_abs(&mut b, i as f32 * 70.0, f, 260.0, 0.14, 4.0, 200.0);
+            }
+            // Sustained major chord bloom (C5/E5/G5) that lands with the top note.
+            tone_after_abs(&mut b, 210.0, 523.25, 620.0, 0.10, 10.0, 480.0);
+            tone_after_abs(&mut b, 220.0, 659.25, 620.0, 0.09, 10.0, 480.0);
+            tone_after_abs(&mut b, 230.0, 783.99, 620.0, 0.09, 10.0, 480.0);
+            // Twinkly high sprinkles (pure sine) fluttering above.
+            let sparkle = [1567.98f32, 2093.0, 1760.0, 2349.32, 2093.0];
+            for (i, &f) in sparkle.iter().enumerate() {
+                let off = 300.0 + i as f32 * 55.0;
+                let start = (SR * off / 1000.0) as usize;
+                let n = (SR * 0.09) as usize;
+                if b.len() < start + n {
+                    b.resize(start + n, 0.0);
+                }
+                for j in 0..n {
+                    let s = (f * j as f32 / SR * std::f32::consts::TAU).sin();
+                    b[start + j] += s * 0.06 * env(j, n, (SR * 0.004) as usize, (SR * 0.07) as usize);
+                }
             }
         }
     }

@@ -14,6 +14,7 @@ mod performance;
 mod playtime;
 mod profile;
 mod splash;
+mod steamgrid;
 mod ui_audio;
 
 use app::HorizonApp;

@@ -44,6 +44,7 @@ pub struct CarouselState {
     pub search_buf: String,
     pub search_focused: bool,
     pub profile_click_time: Option<f32>,
+    pub pending_center: Option<usize>,
 }
 
 impl CarouselState {
@@ -76,6 +77,7 @@ impl CarouselState {
             search_buf: String::new(),
             search_focused: false,
             profile_click_time: None,
+            pending_center: None,
         }
     }
 }
@@ -95,6 +97,7 @@ pub enum CarouselAction {
     SetTheme(crate::app_settings::CarouselTheme),
     OpenProfile,
     ToggleFavorite(String),
+    DownloadIcon(String),
 }
 
 const DOCK_COUNT: usize = 9;
@@ -578,6 +581,7 @@ pub fn carousel_view(
     backdrop_theme: crate::app_settings::BackdropTheme,
     light_mode: bool,
     favorites: &[std::path::PathBuf],
+    icon_reveal: Option<(usize, f32, Option<egui::TextureHandle>)>,
 ) -> CarouselAction {
     let mut action = CarouselAction::None;
 
@@ -595,6 +599,13 @@ pub fn carousel_view(
         let fb = favorites.iter().any(|p| *p == lib.games[b].path);
         fb.cmp(&fa)
     });
+
+    if let Some(lib_idx) = state.pending_center.take() {
+        if let Some(pos) = filtered_indices.iter().position(|&x| x == lib_idx) {
+            state.selected = pos;
+            state.scroll_offset = pos as f32;
+        }
+    }
 
     // The items in the carousel will be the filtered games, plus the "Add Dir" card!
     let n_items = filtered_indices.len() + 1;
@@ -796,6 +807,7 @@ pub fn carousel_view(
     }
 
     let mut want_fav: Option<String> = None;
+    let mut want_download: Option<String> = None;
     for i in 0..n_items {
         let diff     = i as f32 - state.scroll_offset;
         let abs_diff = diff.abs();
@@ -941,6 +953,10 @@ pub fn carousel_view(
                     want_fav = Some(path_string.clone());
                     ui.close_menu();
                 }
+                if ui.button("🖼  Download Icon…").clicked() {
+                    want_download = Some(path_string.clone());
+                    ui.close_menu();
+                }
             });
         }
 
@@ -978,6 +994,75 @@ pub fn carousel_view(
                 draw_rounded_image(&painter, tex.id(), draw_rect, 14.0 * scale_factor, tint);
             } else {
                 painter.text(draw_rect.center(), egui::Align2::CENTER_CENTER, &lib.games[real_idx].format, FontId::proportional(final_sz * 0.13), Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), (alpha_f * 255.0) as u8));
+            }
+
+            if let Some((rev_idx, rev_t, old_tex)) = &icon_reveal {
+                if *rev_idx == real_idx {
+                    const REVEAL_DUR: f32 = 0.95;
+                    if *rev_t < REVEAL_DUR {
+                        let prog = (rev_t / REVEAL_DUR).clamp(0.0, 1.0);
+                        let e = 1.0 - (1.0 - prog).powi(3);
+                        let w = draw_rect.width();
+                        let h = draw_rect.height();
+                        let skew = h * 0.28;
+                        let span = w + skew;
+                        let head = draw_rect.min.x + span * e;
+                        let accent = lib.games[real_idx].dominant_color;
+
+                        if let Some(old) = old_tex {
+                            let ahead = egui::Rect::from_min_max(
+                                egui::pos2(head, draw_rect.min.y),
+                                egui::pos2(draw_rect.max.x, draw_rect.max.y),
+                            );
+                            if ahead.width() > 1.0 {
+                                let clip = painter.with_clip_rect(ahead);
+                                draw_rounded_image(&clip, old.id(), draw_rect, 14.0 * scale_factor, tint);
+                            }
+                        }
+
+                        let pnt = painter.with_clip_rect(draw_rect);
+                        let band = (w * 0.10).max(10.0);
+                        let top_x = head;
+                        let bot_x = head - skew;
+                        let paint_quad = vec![
+                            egui::pos2(top_x - band, draw_rect.min.y),
+                            egui::pos2(top_x, draw_rect.min.y),
+                            egui::pos2(bot_x, draw_rect.max.y),
+                            egui::pos2(bot_x - band, draw_rect.max.y),
+                        ];
+                        let a = ((1.0 - (prog - 0.85).max(0.0) / 0.15) * alpha_f).clamp(0.0, 1.0);
+                        pnt.add(egui::Shape::convex_polygon(
+                            paint_quad,
+                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (230.0 * a) as u8),
+                            Stroke::NONE,
+                        ));
+                        let flick = 0.7 + 0.3 * (t * 40.0).sin();
+                        let gloss = vec![
+                            egui::pos2(top_x - band * 0.35, draw_rect.min.y),
+                            egui::pos2(top_x, draw_rect.min.y),
+                            egui::pos2(bot_x, draw_rect.max.y),
+                            egui::pos2(bot_x - band * 0.35, draw_rect.max.y),
+                        ];
+                        pnt.add(egui::Shape::convex_polygon(
+                            gloss,
+                            Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, (200.0 * a * flick) as u8),
+                            Stroke::NONE,
+                        ));
+                        let sp = (w * 0.02).max(1.0);
+                        for k in 0..8 {
+                            let ky = (k as f32 / 7.0) * h;
+                            let jig = (t * 26.0 + k as f32 * 2.1).sin() * band * 0.4;
+                            let px = (top_x - (bot_x - top_x) * (ky / h)) + jig;
+                            let rad = sp * (0.5 + 0.5 * ((t * 18.0 + k as f32).sin() * 0.5 + 0.5));
+                            pnt.circle_filled(
+                                egui::pos2(px, draw_rect.min.y + ky),
+                                rad,
+                                Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, (180.0 * a) as u8),
+                            );
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                }
             }
 
             if !is_hero {
@@ -1061,6 +1146,9 @@ pub fn carousel_view(
 
     if let Some(p) = want_fav {
         action = CarouselAction::ToggleFavorite(p);
+    }
+    if let Some(p) = want_download {
+        action = CarouselAction::DownloadIcon(p);
     }
 
     if let BootStage::Transitioning { start_time, .. } = state.boot_stage {
@@ -1491,6 +1579,112 @@ pub fn carousel_view(
         let clock_pos = egui::pos2(bg_rect.max.x - 34.0 * top_s, bg_rect.min.y + 34.0 * top_s);
         let scaled_clock = screen_center + (clock_pos - screen_center) * scale_factor;
         shadowed_text(&painter, scaled_clock, egui::Align2::RIGHT_CENTER, &clock, FontId::proportional(20.0 * top_s * scale_factor), Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), top_alpha), true);
+
+        if last_input.connected {
+            let s = top_s * scale_factor;
+            let col = Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), top_alpha);
+            let y = scaled_av.y + scaled_av_r + 24.0 * scale_factor + dance_offset.y;
+            let gx = scaled_av.x + dance_offset.x;
+
+            let gw = 22.0 * s;
+            let gh = 14.0 * s;
+            let glyph_half = 6.0 * s;
+            let gap = 9.0 * s;
+
+            let bc = egui::pos2(gx, y);
+            if last_input.wired {
+                let z = 6.0 * s;
+                let bodyr = egui::Rect::from_center_size(bc, Vec2::new(z * 0.95, z * 0.85));
+                painter.rect_filled(bodyr, Rounding::same(1.5 * scale_factor), col);
+                let prong = Stroke::new(1.6 * scale_factor, col);
+                painter.line_segment([egui::pos2(bc.x - 0.30 * z, bc.y - 0.42 * z), egui::pos2(bc.x - 0.30 * z, bc.y - 1.05 * z)], prong);
+                painter.line_segment([egui::pos2(bc.x + 0.30 * z, bc.y - 0.42 * z), egui::pos2(bc.x + 0.30 * z, bc.y - 1.05 * z)], prong);
+                painter.line_segment([egui::pos2(bc.x, bc.y + 0.42 * z), egui::pos2(bc.x, bc.y + 1.10 * z)], prong);
+            } else {
+                let bz = 6.5 * s;
+                let bt_norm = [
+                    (-0.55, 0.5),
+                    (0.55, -0.5),
+                    (0.0, -1.0),
+                    (0.0, 1.0),
+                    (0.55, 0.5),
+                    (-0.55, -0.5),
+                ];
+                let bt: Vec<egui::Pos2> = bt_norm
+                    .iter()
+                    .map(|(px, py)| bc + Vec2::new(px * bz * 0.62, py * bz))
+                    .collect();
+                painter.add(egui::Shape::line(bt, Stroke::new(1.5 * scale_factor, col)));
+            }
+
+            let gbody = egui::Rect::from_min_size(
+                egui::pos2(gx - glyph_half - gap - gw, y - gh * 0.5),
+                Vec2::new(gw, gh),
+            );
+            painter.rect_stroke(gbody, Rounding::same(gh * 0.48), Stroke::new(1.6 * scale_factor, col));
+            let lc = egui::pos2(gbody.min.x + gw * 0.27, gbody.center().y);
+            let arm = 2.3 * s;
+            painter.line_segment([lc - Vec2::new(arm, 0.0), lc + Vec2::new(arm, 0.0)], Stroke::new(1.5 * scale_factor, col));
+            painter.line_segment([lc - Vec2::new(0.0, arm), lc + Vec2::new(0.0, arm)], Stroke::new(1.5 * scale_factor, col));
+            let rc = egui::pos2(gbody.max.x - gw * 0.27, gbody.center().y);
+            painter.circle_filled(rc + Vec2::new(1.9 * s, 0.0), 1.3 * s, col);
+            painter.circle_filled(rc - Vec2::new(1.9 * s, 0.0), 1.3 * s, col);
+
+            let bw = 22.0 * s;
+            let bh = 12.0 * s;
+            let nub = 2.5 * s;
+            let x = gx + glyph_half + gap;
+            let bbody = egui::Rect::from_min_max(
+                egui::pos2(x, y - bh * 0.5),
+                egui::pos2(x + bw, y + bh * 0.5),
+            );
+            painter.rect_stroke(bbody, Rounding::same(2.5 * scale_factor), Stroke::new(1.6 * scale_factor, col));
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x + bw, y - bh * 0.22),
+                    egui::pos2(x + bw + nub, y + bh * 0.22),
+                ),
+                Rounding::same(1.0 * scale_factor),
+                col,
+            );
+            let fc = if last_input.charging {
+                Color32::from_rgb(0x35, 0xD0, 0x6A)
+            } else {
+                Color32::from_rgb(0x9A, 0x9A, 0xA6)
+            };
+            let frac = last_input
+                .battery
+                .map(|p| (p as f32 / 100.0).clamp(0.06, 1.0))
+                .unwrap_or(1.0);
+            let inner = bbody.shrink(2.2 * scale_factor);
+            let mut f = inner;
+            f.set_width(inner.width() * frac);
+            painter.rect_filled(f, Rounding::same(1.5 * scale_factor), Color32::from_rgba_unmultiplied(fc.r(), fc.g(), fc.b(), top_alpha));
+            if last_input.charging {
+                let c = bbody.center();
+                let z = 3.4 * s;
+                let bolt = vec![
+                    c + Vec2::new(0.35 * z, -1.3 * z),
+                    c + Vec2::new(-0.45 * z, 0.15 * z),
+                    c + Vec2::new(0.1 * z, 0.15 * z),
+                    c + Vec2::new(-0.35 * z, 1.3 * z),
+                ];
+                painter.add(egui::Shape::line(bolt, Stroke::new(1.8 * scale_factor, Color32::from_rgba_unmultiplied(0x10, 0x28, 0x18, top_alpha))));
+            }
+            let label = match last_input.battery {
+                Some(p) => format!("{}%", p),
+                None => "--%".to_string(),
+            };
+            shadowed_text(
+                &painter,
+                egui::pos2(bbody.max.x + nub + 7.0 * s, y),
+                egui::Align2::LEFT_CENTER,
+                &label,
+                FontId::proportional(13.0 * s),
+                col,
+                false,
+            );
+        }
     }
 
     if interactive && state.boot_stage == BootStage::None {

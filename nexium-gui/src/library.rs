@@ -84,6 +84,17 @@ impl Library {
         0
     }
 
+    pub fn set_icon(&mut self, idx: usize, img: egui::ColorImage) {
+        if idx >= self.games.len() {
+            return;
+        }
+        self.games[idx].dominant_color = sample_dominant(&img);
+        self.games[idx].icon = Some(img);
+        if idx < self.textures.len() {
+            self.textures[idx] = None;
+        }
+    }
+
     pub fn texture(&mut self, ctx: &egui::Context, idx: usize) -> Option<egui::TextureHandle> {
         if self.textures[idx].is_none() {
             if let Some(img) = self.games[idx].icon.take() {
@@ -166,6 +177,13 @@ fn read_entry(path: &Path) -> Option<GameEntry> {
         None => (stem.clone(), String::new(), None),
     };
 
+    // Custom (SteamGridDB) icon override takes precedence if present.
+    let icon = custom_icon_path(path)
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::read(&p).ok())
+        .and_then(|b| decode_jpeg(&b))
+        .or(icon);
+
     Some(GameEntry {
         path: path.to_path_buf(),
         title,
@@ -176,6 +194,17 @@ fn read_entry(path: &Path) -> Option<GameEntry> {
             .unwrap_or(egui::Color32::from_rgb(0x2F, 0xB4, 0xEF)),
         icon,
     })
+}
+
+pub fn custom_icon_path(game_path: &Path) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let base = directories::BaseDirs::new()?
+        .config_dir()
+        .join("NeXium")
+        .join("icons");
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    game_path.hash(&mut h);
+    Some(base.join(format!("{:016x}.png", h.finish())))
 }
 
 fn decode_jpeg(bytes: &[u8]) -> Option<egui::ColorImage> {
