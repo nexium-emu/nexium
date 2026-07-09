@@ -45,6 +45,11 @@ pub struct CarouselState {
     pub search_focused: bool,
     pub profile_click_time: Option<f32>,
     pub pending_center: Option<usize>,
+    pub sel_held: bool,
+    pub sel_edge: bool,
+    pub game_menu_open: bool,
+    pub game_menu_sel: usize,
+    pub game_menu_anim: f32,
 }
 
 impl CarouselState {
@@ -78,6 +83,11 @@ impl CarouselState {
             search_focused: false,
             profile_click_time: None,
             pending_center: None,
+            sel_held: false,
+            sel_edge: false,
+            game_menu_open: false,
+            game_menu_sel: 0,
+            game_menu_anim: 0.0,
         }
     }
 }
@@ -1435,6 +1445,45 @@ pub fn carousel_view(
         }
     }
 
+    let gm_target = if state.game_menu_open { 1.0 } else { 0.0 };
+    state.game_menu_anim += (gm_target - state.game_menu_anim) * (dt * 18.0).min(1.0);
+    if state.game_menu_anim > 0.004 && state.selected < filtered_indices.len() {
+        let gi = filtered_indices[state.selected];
+        let favd = favorites.iter().any(|p| *p == lib.games[gi].path);
+        let e = { let a = state.game_menu_anim.clamp(0.0, 1.0); a * a * (3.0 - 2.0 * a) };
+        let sc = |p: egui::Pos2| screen_center + (p - screen_center) * scale_factor;
+        let accent = state.ambient_color;
+        painter.rect_filled(bg_rect, Rounding::ZERO, Color32::from_black_alpha((e * 90.0) as u8));
+
+        let pw = 236.0;
+        let rowh = 44.0;
+        let ph = rowh * 2.0 + 22.0;
+        let slide = (1.0 - e) * 18.0;
+        let ax = hero_cx + hero_size * 0.5 + 30.0 + slide;
+        let ay = hero_cy - ph * 0.5;
+        let panel = egui::Rect::from_min_max(sc(egui::pos2(ax, ay)), sc(egui::pos2(ax + pw, ay + ph)));
+        painter.rect_filled(panel.translate(Vec2::new(0.0, 8.0 * scale_factor)), Rounding::same(16.0 * scale_factor), Color32::from_black_alpha((e * 120.0) as u8));
+        let pfill = tl(Color32::from_rgb(0x1B, 0x1B, 0x24), Color32::from_rgb(0xFB, 0xFB, 0xFE));
+        painter.rect_filled(panel, Rounding::same(16.0 * scale_factor), Color32::from_rgba_unmultiplied(pfill.r(), pfill.g(), pfill.b(), (e * 255.0) as u8));
+        painter.rect_stroke(panel, Rounding::same(16.0 * scale_factor), Stroke::new(1.2 * scale_factor, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (e * 255.0) as u8)));
+
+        let labels = [if favd { "Unfavorite Game" } else { "Favorite Game" }, "Download Icon"];
+        for (i, label) in labels.iter().enumerate() {
+            let ry0 = ay + 11.0 + i as f32 * rowh;
+            let row = egui::Rect::from_min_max(sc(egui::pos2(ax + 8.0, ry0)), sc(egui::pos2(ax + pw - 8.0, ry0 + rowh - 4.0)));
+            if i == state.game_menu_sel {
+                painter.rect_filled(row, Rounding::same(10.0 * scale_factor), Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (e * 60.0) as u8));
+                painter.rect_stroke(row, Rounding::same(10.0 * scale_factor), Stroke::new(1.4 * scale_factor, Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (e * 220.0) as u8)));
+            }
+            let tc = if i == 0 && favd {
+                Color32::from_rgb(0xF5, 0xC1, 0x42)
+            } else {
+                col_text
+            };
+            shadowed_text(&painter, sc(egui::pos2(ax + 22.0, ry0 + (rowh - 4.0) * 0.5)), egui::Align2::LEFT_CENTER, label, FontId::proportional(15.0 * scale_factor), Color32::from_rgba_unmultiplied(tc.r(), tc.g(), tc.b(), (e * 255.0) as u8), false);
+        }
+    }
+
     let palette_target = if state.palette_open { 1.0 } else { 0.0 };
     let palette_step = (dt * 8.0).clamp(0.0, 0.14);
     if state.palette_t < palette_target {
@@ -1890,6 +1939,45 @@ fn handle_input(
 
     let x_edge = state.x_edge;
     let select = state.a_edge;
+
+    if state.game_menu_open {
+        if up && state.game_menu_sel > 0 {
+            state.game_menu_sel -= 1;
+            crate::ui_audio::play_move();
+        }
+        if down && state.game_menu_sel < 1 {
+            state.game_menu_sel += 1;
+            crate::ui_audio::play_move();
+        }
+        if select {
+            if let Some(p) = &launch_path {
+                *action = if state.game_menu_sel == 0 {
+                    CarouselAction::ToggleFavorite(p.clone())
+                } else {
+                    CarouselAction::DownloadIcon(p.clone())
+                };
+                crate::ui_audio::play(crate::ui_audio::Sfx::WhistleOk);
+            }
+            state.game_menu_open = false;
+        }
+        if back {
+            state.game_menu_open = false;
+            crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+        }
+        return;
+    }
+
+    if state.sel_edge
+        && !state.active_dock
+        && !state.profile_focused
+        && !state.palette_open
+        && launch_path.is_some()
+    {
+        state.game_menu_open = true;
+        state.game_menu_sel = 0;
+        crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+        return;
+    }
 
     if state.palette_open {
         let themes = crate::app_settings::CarouselTheme::all();

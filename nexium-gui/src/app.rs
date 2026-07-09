@@ -1804,12 +1804,16 @@ impl eframe::App for HorizonApp {
             let x_down = ctx.input(|i| i.key_down(egui::Key::X))
                 || (self.last_input.connected && self.last_input.is(SwitchButton::X));
             let b_down = self.last_input.connected && self.last_input.is(SwitchButton::B);
+            let sel_down = ctx.input(|i| i.key_down(egui::Key::Tab))
+                || (self.last_input.connected && self.last_input.is(SwitchButton::Minus));
             self.carousel.a_edge = a_down && !self.carousel.a_held;
             self.carousel.x_edge = x_down && !self.carousel.x_held;
             self.carousel.b_edge = b_down && !self.carousel.b_held;
+            self.carousel.sel_edge = sel_down && !self.carousel.sel_held;
             self.carousel.a_held = a_down;
             self.carousel.x_held = x_down;
             self.carousel.b_held = b_down;
+            self.carousel.sel_held = sel_down;
         }
 
         self.modal_active_frame_start = self.modal_active();
