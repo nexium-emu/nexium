@@ -257,6 +257,10 @@ fn default_multicore() -> bool {
     true
 }
 
+fn default_sfx_volume() -> f32 {
+    0.5
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppSettings {
     pub log_level: LogLevel,
@@ -290,6 +294,10 @@ pub struct AppSettings {
     pub backdrop_theme: BackdropTheme,
     #[serde(default)]
     pub light_mode: bool,
+    #[serde(default = "default_music_volume")]
+    pub music_volume: f32,
+    #[serde(default = "default_sfx_volume")]
+    pub sfx_volume: f32,
     #[serde(default)]
     pub favorites: Vec<PathBuf>,
     #[serde(default)]
@@ -300,6 +308,10 @@ pub struct AppSettings {
 
 fn default_profile_name() -> String {
     "Player".to_string()
+}
+
+fn default_music_volume() -> f32 {
+    0.5
 }
 
 impl Default for AppSettings {
@@ -321,6 +333,8 @@ impl Default for AppSettings {
             carousel_theme: CarouselTheme::default(),
             backdrop_theme: BackdropTheme::default(),
             light_mode: false,
+            music_volume: default_music_volume(),
+            sfx_volume: default_sfx_volume(),
             favorites: Vec::new(),
             profile_avatar: None,
             profile_name: default_profile_name(),

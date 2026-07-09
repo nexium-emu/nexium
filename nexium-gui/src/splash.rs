@@ -42,6 +42,9 @@ impl Splash {
     }
 
     pub fn step(&mut self, ctx: &egui::Context) -> Step {
+        if self.start.is_none() {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Boot);
+        }
         let start = *self.start.get_or_insert_with(Instant::now);
         let mut elapsed = start.elapsed().as_secs_f32();
 

@@ -132,6 +132,7 @@ impl HorizonApp {
         nro_arg: Option<String>,
     ) -> Self {
         Self::apply_theme(&cc.egui_ctx);
+        crate::ui_audio::init();
         let input = InputBackend::new().or_else(|| {
             log::warn!("SDL3 gamepad init failed");
             None
@@ -186,6 +187,7 @@ impl HorizonApp {
             modal_active_frame_start: false,
         };
         app.reload_profile_texture(&cc.egui_ctx);
+        crate::ui_audio::set_sfx_volume(app.app_settings.sfx_volume);
         app.library
             .rescan(&cc.egui_ctx, &app.app_settings.library_folders);
         if !nro_path.is_empty() {
@@ -688,7 +690,7 @@ impl HorizonApp {
         let ok_rect = egui::Rect::from_min_size(egui::pos2(box_rect.center().x + gap * 0.5, by), Vec2::new(btn_w, btn_h));
 
         let selected = self.confirm.as_ref().map_or(0, |c| c.selected);
-        let mut draw_btn = |rect: egui::Rect, label: &str, sel: bool| {
+        let draw_btn = |rect: egui::Rect, label: &str, sel: bool| {
             let rounding = Rounding::same(10.0);
             p.rect_filled(rect, rounding, btn_fill);
             if sel {
@@ -750,6 +752,7 @@ impl HorizonApp {
         self.resume_anim = None;
         match EmulationHandle::new(&self.nro_path, backend, Some(ctx.clone())) {
             Ok(h) => {
+                crate::ui_audio::play(crate::ui_audio::Sfx::GameBoot);
                 self.emulation_handle = Some(h);
                 self.game_texture = None;
                 self.free_native_texture();
@@ -799,26 +802,42 @@ impl HorizonApp {
     }
 
     fn reload_profile_texture(&mut self, ctx: &egui::Context) {
+        static DEFAULT_AVATAR: &[u8] = include_bytes!("../../branding/png/logo-256.png");
         self.profile_texture = None;
-        let Some(path) = self.app_settings.profile_avatar.clone() else {
-            return;
+
+        let bytes: std::borrow::Cow<[u8]> = match self.app_settings.profile_avatar.clone() {
+            Some(path) => match std::fs::read(&path) {
+                Ok(b) => std::borrow::Cow::Owned(b),
+                Err(_) => {
+                    log::warn!("profile avatar unreadable: {}", path.display());
+                    std::borrow::Cow::Borrowed(DEFAULT_AVATAR)
+                }
+            },
+            None => std::borrow::Cow::Borrowed(DEFAULT_AVATAR),
         };
-        let Ok(bytes) = std::fs::read(&path) else {
-            log::warn!("profile avatar unreadable: {}", path.display());
-            return;
+
+        let img = match image::load_from_memory(&bytes)
+            .or_else(|_| image::load_from_memory(DEFAULT_AVATAR))
+        {
+            Ok(i) => i,
+            Err(_) => return,
         };
-        let Ok(img) = image::load_from_memory(&bytes) else {
-            log::warn!("profile avatar decode failed: {}", path.display());
-            return;
-        };
+
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
         let side = w.min(h);
         let ox = (w - side) / 2;
         let oy = (h - side) / 2;
         let cropped = image::imageops::crop_imm(&rgba, ox, oy, side, side).to_image();
+        // Downscale large avatars (huge textures blow past GPU limits / egui rejects them).
+        let cropped = if side > 256 {
+            image::imageops::resize(&cropped, 256, 256, image::imageops::FilterType::Lanczos3)
+        } else {
+            cropped
+        };
+        let (fw, fh) = cropped.dimensions();
         let color = egui::ColorImage::from_rgba_unmultiplied(
-            [side as usize, side as usize],
+            [fw as usize, fh as usize],
             cropped.as_raw(),
         );
         self.profile_texture = Some(ctx.load_texture("profile_avatar", color, egui::TextureOptions::LINEAR));
@@ -1179,16 +1198,61 @@ impl eframe::App for HorizonApp {
                 || (self.last_input.connected && self.last_input.is(SwitchButton::A));
             let x_down = ctx.input(|i| i.key_down(egui::Key::X))
                 || (self.last_input.connected && self.last_input.is(SwitchButton::X));
+            let b_down = self.last_input.connected && self.last_input.is(SwitchButton::B);
             self.carousel.a_edge = a_down && !self.carousel.a_held;
             self.carousel.x_edge = x_down && !self.carousel.x_held;
+            self.carousel.b_edge = b_down && !self.carousel.b_held;
             self.carousel.a_held = a_down;
             self.carousel.x_held = x_down;
+            self.carousel.b_held = b_down;
         }
 
         self.modal_active_frame_start = self.modal_active();
         self.handle_modal_input(ctx);
         self.teardown_tick(ctx);
         self.quick_launch_tick(ctx);
+
+        {
+            let (m_run, m_pause) = self
+                .emulation_handle
+                .as_ref()
+                .map_or((false, false), |h| (h.is_running(), h.is_paused()));
+            let carousel_view =
+                self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel;
+            let playing_fs = m_run && !m_pause;
+            let base_on = carousel_view && !playing_fs && !self.splash.active();
+            let mut target = if base_on { self.app_settings.music_volume } else { 0.0 };
+            let mut lowpass = 0.0f32;
+            let profiling = self.show_profile || self.profile_anim > 0.01;
+            let on_music_slider = profiling
+                && self.profile.tab == crate::profile::ProfileTab::Settings
+                && self.profile.focus_content
+                && self.profile.row_selected == 2;
+            if profiling && !on_music_slider {
+                target *= 0.62;
+                lowpass = 0.62;
+            }
+            if self.modal_active() {
+                lowpass = lowpass.max(0.6);
+            }
+            crate::ui_audio::set_music(target, lowpass);
+
+            let booting_now = m_run
+                && !m_pause
+                && carousel_view
+                && self.game_display().is_none()
+                && !self.splash.active();
+            if booting_now {
+                crate::ui_audio::play_looped(crate::ui_audio::Sfx::AwaitFrame);
+            } else {
+                crate::ui_audio::stop_loop(crate::ui_audio::Sfx::AwaitFrame);
+            }
+            if self.teardown_at.is_some() {
+                crate::ui_audio::play_looped(crate::ui_audio::Sfx::PleaseWait);
+            } else {
+                crate::ui_audio::stop_loop(crate::ui_audio::Sfx::PleaseWait);
+            }
+        }
 
         {
             let kb_home = ctx.input(|i| i.key_pressed(egui::Key::Home));
@@ -1713,6 +1777,7 @@ impl eframe::App for HorizonApp {
                         ctx,
                         ui,
                         &self.last_input,
+                        &mut self.input,
                         running,
                         playing_index,
                         playing_alpha,
@@ -1745,8 +1810,11 @@ impl eframe::App for HorizonApp {
                         profile_scale,
                         self.app_settings.backdrop_theme,
                         self.app_settings.light_mode,
+                        self.app_settings.music_volume,
+                        self.app_settings.sfx_volume,
                         profile_active,
                         &self.last_input,
+                        &mut self.input,
                     );
                     if self.show_profile {
                         match action {
@@ -1782,6 +1850,15 @@ impl eframe::App for HorizonApp {
                                     self.app_settings.light_mode = on;
                                     let _ = self.app_settings.save();
                                 }
+                            }
+                            crate::profile::ProfileAction::SetMusicVolume(v) => {
+                                self.app_settings.music_volume = v.clamp(0.0, 1.0);
+                                let _ = self.app_settings.save();
+                            }
+                            crate::profile::ProfileAction::SetSfxVolume(v) => {
+                                self.app_settings.sfx_volume = v.clamp(0.0, 1.0);
+                                crate::ui_audio::set_sfx_volume(self.app_settings.sfx_volume);
+                                let _ = self.app_settings.save();
                             }
                             crate::profile::ProfileAction::None => {}
                         }
@@ -1868,6 +1945,7 @@ impl eframe::App for HorizonApp {
                             ctx,
                             ui,
                             &self.last_input,
+                            &mut self.input,
                             running,
                             playing_index,
                             playing_alpha,
@@ -1961,6 +2039,7 @@ impl eframe::App for HorizonApp {
                                 }
                             }
                             crate::carousel::CarouselAction::ToggleFavorite(path) => {
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Favorite);
                                 let p = std::path::PathBuf::from(path);
                                 if let Some(pos) = self.app_settings.favorites.iter().position(|x| *x == p) {
                                     self.app_settings.favorites.remove(pos);
@@ -2027,6 +2106,7 @@ impl eframe::App for HorizonApp {
                             ctx,
                             ui,
                             &self.last_input,
+                            &mut self.input,
                             running,
                             playing_index,
                             playing_alpha,
@@ -2035,7 +2115,7 @@ impl eframe::App for HorizonApp {
                             &self.app_settings.profile_name,
                             true,
                             scale_f,
-                            1.0,
+                            t.min(1.0),
                             self.app_settings.backdrop_theme,
                             self.app_settings.light_mode,
                             &self.app_settings.favorites,

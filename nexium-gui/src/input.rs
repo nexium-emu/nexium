@@ -177,6 +177,12 @@ impl InputBackend {
     pub fn name(&self) -> Option<String> {
         self.pad.as_ref().and_then(|p| p.name())
     }
+
+    pub fn rumble(&mut self, low_freq: u16, high_freq: u16, duration_ms: u32) {
+        if let Some(ref mut pad) = self.pad {
+            let _ = pad.set_rumble(low_freq, high_freq, duration_ms);
+        }
+    }
 }
 
 pub fn is_pro_controller(name: &str) -> bool {

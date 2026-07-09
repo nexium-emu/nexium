@@ -14,6 +14,7 @@ mod performance;
 mod playtime;
 mod profile;
 mod splash;
+mod ui_audio;
 
 use app::HorizonApp;
 use app_settings::AppSettings;

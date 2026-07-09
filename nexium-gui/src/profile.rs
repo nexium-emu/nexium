@@ -82,6 +82,8 @@ pub enum ProfileAction {
     SetName(String),
     SetBackdropTheme(crate::app_settings::BackdropTheme),
     SetLightMode(bool),
+    SetMusicVolume(f32),
+    SetSfxVolume(f32),
     QuickLaunch(String),
 }
 
@@ -162,8 +164,11 @@ pub fn profile_view(
     scale_factor: f32,
     backdrop_theme: crate::app_settings::BackdropTheme,
     light_mode: bool,
+    music_volume: f32,
+    sfx_volume: f32,
     active: bool,
     last_input: &InputSnapshot,
+    ib: &mut Option<crate::input::InputBackend>,
 ) -> ProfileAction {
     let mut action = ProfileAction::None;
     let t = ui.input(|i| i.time) as f32;
@@ -245,6 +250,11 @@ pub fn profile_view(
     let b_down = last_input.connected && last_input.is(crate::controller_config::SwitchButton::B);
     let b_edge = b_down && !state.b_held;
     state.b_held = b_down;
+    if b_edge && !editing {
+        if let Some(ref mut backend) = ib {
+            let _ = backend.rumble(20000, 20000, 45);
+        }
+    }
     let mut back = (ui.input(|i| i.key_pressed(egui::Key::Escape)) || b_edge) && !editing;
     let mut up = false;
     let mut down = false;
@@ -258,34 +268,46 @@ pub fn profile_view(
         let ready = now - state.nav_cooldown > 0.16;
         let mut navved = false;
         let ly = last_input.ly();
+        let mut gp_rumble = None;
         if ready {
             if last_input.is(SwitchButton::DUp) || ly > 0.5 {
                 up = true;
                 navved = true;
+                gp_rumble = Some((15000, 15000, 35));
             }
             if last_input.is(SwitchButton::DDown) || ly < -0.5 {
                 down = true;
                 navved = true;
+                gp_rumble = Some((15000, 15000, 35));
             }
             if last_input.is(SwitchButton::L) {
                 tab_left = true;
                 navved = true;
+                gp_rumble = Some((15000, 15000, 35));
             }
             if last_input.is(SwitchButton::R) {
                 tab_right = true;
                 navved = true;
+                gp_rumble = Some((15000, 15000, 35));
             }
             if last_input.is(SwitchButton::A) || last_input.is(SwitchButton::DRight) {
                 enter = true;
                 navved = true;
+                gp_rumble = Some((28000, 28000, 60));
             }
             if last_input.is(SwitchButton::DLeft) {
                 leave = true;
                 navved = true;
+                gp_rumble = Some((15000, 15000, 35));
             }
         }
         if navved {
             state.nav_cooldown = now;
+            if let Some((low, high, ms)) = gp_rumble {
+                if let Some(ref mut backend) = ib {
+                    let _ = backend.rumble(low, high, ms);
+                }
+            }
         }
     }
 
@@ -306,26 +328,31 @@ pub fn profile_view(
         ProfileTab::System,
     ];
     let tab_idx = TAB_ORDER.iter().position(|x| *x == state.tab).unwrap_or(0);
-    const N_SETTINGS: usize = 2;
+    const N_SETTINGS: usize = 4;
     let launch_enter = enter && state.focus_content;
 
     if tab_left {
         state.tab = TAB_ORDER[(tab_idx + TAB_ORDER.len() - 1) % TAB_ORDER.len()];
         state.focus_content = false;
+        crate::ui_audio::play_move();
     }
     if tab_right {
         state.tab = TAB_ORDER[(tab_idx + 1) % TAB_ORDER.len()];
         state.focus_content = false;
+        crate::ui_audio::play_move();
     }
 
     if !state.focus_content {
         if up && tab_idx > 0 {
             state.tab = TAB_ORDER[tab_idx - 1];
+            crate::ui_audio::play_move();
         }
         if down && tab_idx < TAB_ORDER.len() - 1 {
             state.tab = TAB_ORDER[tab_idx + 1];
+            crate::ui_audio::play_move();
         }
         if enter {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             match state.tab {
                 ProfileTab::RecentlyPlayed if n_games > 0 => {
                     state.focus_content = true;
@@ -339,35 +366,73 @@ pub fn profile_view(
             }
         }
         if back {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Back);
             action = ProfileAction::Close;
         }
     } else if state.tab == ProfileTab::Settings {
         if up {
+            let prev = state.row_selected;
             state.row_selected = state.row_selected.saturating_sub(1);
+            if state.row_selected != prev {
+                crate::ui_audio::play_move();
+            }
         }
         if down {
+            let prev = state.row_selected;
             state.row_selected = (state.row_selected + 1).min(N_SETTINGS - 1);
+            if state.row_selected != prev {
+                crate::ui_audio::play_move();
+            }
         }
         if back {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Back);
             state.focus_content = false;
         }
         if state.row_selected == 0 {
             if enter {
                 action = ProfileAction::SetBackdropTheme(backdrop_theme.next());
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             } else if leave {
                 action = ProfileAction::SetBackdropTheme(backdrop_theme.prev());
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             }
         } else if state.row_selected == 1 && (enter || leave) {
             action = ProfileAction::SetLightMode(!light_mode);
+            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+        } else if state.row_selected == 2 {
+            if enter {
+                action = ProfileAction::SetMusicVolume((music_volume + 0.05).min(1.0));
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            } else if leave {
+                action = ProfileAction::SetMusicVolume((music_volume - 0.05).max(0.0));
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            }
+        } else if state.row_selected == 3 {
+            if enter {
+                action = ProfileAction::SetSfxVolume((sfx_volume + 0.05).min(1.0));
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            } else if leave {
+                action = ProfileAction::SetSfxVolume((sfx_volume - 0.05).max(0.0));
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            }
         }
     } else {
         if up {
+            let prev = state.row_selected;
             state.row_selected = state.row_selected.saturating_sub(1);
+            if state.row_selected != prev {
+                crate::ui_audio::play_move();
+            }
         }
         if down {
+            let prev = state.row_selected;
             state.row_selected = (state.row_selected + 1).min(n_games.saturating_sub(1));
+            if state.row_selected != prev {
+                crate::ui_audio::play_move();
+            }
         }
         if back || leave {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Back);
             state.focus_content = false;
         }
     }
@@ -393,6 +458,7 @@ pub fn profile_view(
         if resp.clicked() {
             state.tab = *tab;
             state.focus_content = false;
+            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
         }
         let selected = state.tab == *tab;
         let ring = if sidebar_focused { accent } else { pal.border };
@@ -493,6 +559,8 @@ pub fn profile_view(
                 state,
                 backdrop_theme,
                 light_mode,
+                music_volume,
+                sfx_volume,
                 &mut action,
                 scale_factor,
                 &scale_pos,
@@ -584,6 +652,8 @@ fn settings_page(
     state: &mut ProfileState,
     backdrop_theme: crate::app_settings::BackdropTheme,
     light_mode: bool,
+    music_volume: f32,
+    sfx_volume: f32,
     action: &mut ProfileAction,
     scale_factor: f32,
     scale_pos: &impl Fn(egui::Pos2) -> egui::Pos2,
@@ -592,7 +662,8 @@ fn settings_page(
 ) {
     let row_h = 68.0 * s;
     let row_gap = 12.0 * s;
-    let rows: [(&str, &str, String); 2] = [
+    
+    let rows: [(&str, &str, String); 4] = [
         (
             "Backdrop Theme",
             "Background style behind the menus",
@@ -603,6 +674,8 @@ fn settings_page(
             "Light or dark styling of the carousel",
             if light_mode { "Light".to_string() } else { "Dark".to_string() },
         ),
+        ("Menu Music", "Background music volume in the carousel", "".to_string()),
+        ("SFX Volume", "Sound effects volume for UI interactions", "".to_string()),
     ];
 
     for (idx, (title, subtitle, value)) in rows.iter().enumerate() {
@@ -612,16 +685,25 @@ fn settings_page(
         );
         let r = scale_rect(row);
         let resp = ui.allocate_rect(r, Sense::click());
+        
+        let focused = state.focus_content && state.row_selected == idx;
+        
         if resp.clicked() {
             state.focus_content = true;
             state.row_selected = idx;
             match idx {
-                0 => *action = ProfileAction::SetBackdropTheme(backdrop_theme.next()),
-                1 => *action = ProfileAction::SetLightMode(!light_mode),
+                0 => {
+                    *action = ProfileAction::SetBackdropTheme(backdrop_theme.next());
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                }
+                1 => {
+                    *action = ProfileAction::SetLightMode(!light_mode);
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                }
                 _ => {}
             }
         }
-        let focused = state.focus_content && state.row_selected == idx;
+        
         let rounding = Rounding::same(12.0 * s * scale_factor);
         painter.rect_filled(r, rounding, pal.panel);
         let ring = if focused { accent } else { pal.border };
@@ -643,27 +725,139 @@ fn settings_page(
         );
 
         let arrow_col = if focused { accent } else { pal.muted };
-        painter.text(
-            scale_pos(egui::pos2(row.max.x - 168.0 * s, row.center().y)),
-            egui::Align2::CENTER_CENTER,
-            "‹",
-            FontId::proportional(26.0 * s * scale_factor),
-            arrow_col,
-        );
-        painter.text(
-            scale_pos(egui::pos2(row.max.x - 100.0 * s, row.center().y)),
-            egui::Align2::CENTER_CENTER,
-            value,
-            FontId::proportional(18.0 * s * scale_factor),
-            pal.text,
-        );
-        painter.text(
-            scale_pos(egui::pos2(row.max.x - 32.0 * s, row.center().y)),
-            egui::Align2::CENTER_CENTER,
-            "›",
-            FontId::proportional(26.0 * s * scale_factor),
-            arrow_col,
-        );
+
+        if idx >= 2 {
+            let val = if idx == 2 { music_volume } else { sfx_volume };
+            
+            // Slider layout dimensions
+            let slider_w = 160.0 * s;
+            let slider_h = 6.0 * s;
+            let track_rect = egui::Rect::from_min_size(
+                egui::pos2(row.max.x - 280.0 * s, row.center().y - slider_h * 0.5),
+                Vec2::new(slider_w, slider_h),
+            );
+            let scaled_track = scale_rect(track_rect);
+            
+            // Slider interaction (drag & click)
+            let slider_resp = ui.allocate_rect(scaled_track.expand(8.0 * scale_factor), Sense::click_and_drag());
+            let mut new_val = val;
+            if slider_resp.clicked() || slider_resp.dragged() {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let pct = ((pos.x - scaled_track.min.x) / scaled_track.width()).clamp(0.0, 1.0);
+                    new_val = pct;
+                }
+            }
+            if new_val != val {
+                if idx == 2 {
+                    *action = ProfileAction::SetMusicVolume(new_val);
+                } else {
+                    *action = ProfileAction::SetSfxVolume(new_val);
+                }
+            }
+
+            // Arrow bounds
+            let left_arrow_rect = scale_rect(egui::Rect::from_center_size(
+                egui::pos2(row.max.x - 300.0 * s, row.center().y),
+                Vec2::splat(30.0 * s),
+            ));
+            let right_arrow_rect = scale_rect(egui::Rect::from_center_size(
+                egui::pos2(row.max.x - 30.0 * s, row.center().y),
+                Vec2::splat(30.0 * s),
+            ));
+
+            let la_resp = ui.allocate_rect(left_arrow_rect, Sense::click());
+            let ra_resp = ui.allocate_rect(right_arrow_rect, Sense::click());
+
+            if la_resp.clicked() {
+                let step = (val - 0.05).max(0.0);
+                if idx == 2 {
+                    *action = ProfileAction::SetMusicVolume(step);
+                } else {
+                    *action = ProfileAction::SetSfxVolume(step);
+                }
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            }
+            if ra_resp.clicked() {
+                let step = (val + 0.05).min(1.0);
+                if idx == 2 {
+                    *action = ProfileAction::SetMusicVolume(step);
+                } else {
+                    *action = ProfileAction::SetSfxVolume(step);
+                }
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            }
+
+            let arrow_col_l = if focused || la_resp.hovered() { accent } else { pal.muted };
+            let arrow_col_r = if focused || ra_resp.hovered() { accent } else { pal.muted };
+
+            // Draw track background
+            let rr = Rounding::same(slider_h * 0.5 * scale_factor);
+            painter.rect_filled(scaled_track, rr, pal.input_bg);
+            
+            // Draw filled track
+            let mut fill = scaled_track;
+            fill.max.x = scaled_track.min.x + scaled_track.width() * val.clamp(0.0, 1.0);
+            painter.rect_filled(fill, rr, accent);
+
+            // Draw slider handle circle
+            let handle_x = scaled_track.min.x + scaled_track.width() * val.clamp(0.0, 1.0);
+            let handle_center = egui::pos2(handle_x, scaled_track.center().y);
+            let handle_r = 8.0 * s * scale_factor;
+            painter.circle_filled(handle_center, handle_r, Color32::WHITE);
+            painter.circle_stroke(handle_center, handle_r, Stroke::new(1.5 * scale_factor, accent));
+
+            // Draw percentage label
+            let val_label = if val <= 0.001 {
+                "Off".to_string()
+            } else {
+                format!("{}%", (val * 100.0).round() as i32)
+            };
+            painter.text(
+                scale_pos(egui::pos2(row.max.x - 70.0 * s, row.center().y)),
+                egui::Align2::CENTER_CENTER,
+                val_label,
+                FontId::proportional(18.0 * s * scale_factor),
+                pal.text,
+            );
+
+            // Draw arrows
+            painter.text(
+                scale_pos(egui::pos2(row.max.x - 300.0 * s, row.center().y)),
+                egui::Align2::CENTER_CENTER,
+                "‹",
+                FontId::proportional(26.0 * s * scale_factor),
+                arrow_col_l,
+            );
+            painter.text(
+                scale_pos(egui::pos2(row.max.x - 30.0 * s, row.center().y)),
+                egui::Align2::CENTER_CENTER,
+                "›",
+                FontId::proportional(26.0 * s * scale_factor),
+                arrow_col_r,
+            );
+        } else {
+            painter.text(
+                scale_pos(egui::pos2(row.max.x - 168.0 * s, row.center().y)),
+                egui::Align2::CENTER_CENTER,
+                "‹",
+                FontId::proportional(26.0 * s * scale_factor),
+                arrow_col,
+            );
+            painter.text(
+                scale_pos(egui::pos2(row.max.x - 100.0 * s, row.center().y)),
+                egui::Align2::CENTER_CENTER,
+                value.clone(),
+                FontId::proportional(18.0 * s * scale_factor),
+                pal.text,
+            );
+            painter.text(
+                scale_pos(egui::pos2(row.max.x - 32.0 * s, row.center().y)),
+                egui::Align2::CENTER_CENTER,
+                "›",
+                FontId::proportional(26.0 * s * scale_factor),
+                arrow_col,
+            );
+        }
     }
 }
 

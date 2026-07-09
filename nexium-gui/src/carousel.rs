@@ -30,6 +30,8 @@ pub struct CarouselState {
     pub a_held: bool,
     pub a_edge: bool,
     pub x_edge: bool,
+    pub b_held: bool,
+    pub b_edge: bool,
     pub is_dragging: bool,
     pub drag_start_x: f32,
     pub drag_start_offset: f32,
@@ -60,6 +62,8 @@ impl CarouselState {
             a_held: false,
             a_edge: false,
             x_edge: false,
+            b_held: false,
+            b_edge: false,
             is_dragging: false,
             drag_start_x: 0.0,
             drag_start_offset: 0.0,
@@ -561,6 +565,7 @@ pub fn carousel_view(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
     last_input: &crate::input::InputSnapshot,
+    ib: &mut Option<crate::input::InputBackend>,
     is_running: bool,
     playing: Option<usize>,
     playing_alpha: f32,
@@ -1152,17 +1157,20 @@ pub fn carousel_view(
         for idx in 0..dock_items.len() {
             let x = scaled_dock_sx + idx as f32 * step_px + scaled_item_size * 0.5;
             let base = egui::Rect::from_center_size(egui::pos2(x, scaled_dock_center.y), Vec2::splat(scaled_item_size));
-
             let resp = ui.allocate_rect(base, Sense::click());
             if interactive && resp.clicked() && state.boot_stage == BootStage::None {
                 if state.active_dock && state.dock_selected == idx {
                     if idx == 6 {
-                        state.palette_open = !state.palette_open;
                         if state.palette_open {
+                            state.palette_open = false;
+                            crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+                        } else {
+                            state.palette_open = true;
                             state.palette_selected = crate::app_settings::CarouselTheme::all()
                                 .iter()
                                 .position(|x| *x == theme)
                                 .unwrap_or(0);
+                            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                         }
                     } else {
                         action = match idx {
@@ -1308,6 +1316,15 @@ pub fn carousel_view(
             Vec2::new(s_total + 52.0 * scale_factor * pop, s_sw + 92.0 * scale_factor * pop),
         );
         let interactive = state.palette_open && state.palette_t > 0.6;
+        if interactive && pointer_pressed {
+            if let Some(pos) = pointer_pos {
+                if !panel.contains(pos) {
+                    state.palette_open = false;
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+                }
+            }
+        }
+
         painter.rect_filled(panel, Rounding::same(20.0 * scale_factor), Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), a(240.0)));
         painter.rect_stroke(panel, Rounding::same(20.0 * scale_factor), Stroke::new(1.0, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(255.0))));
 
@@ -1321,10 +1338,14 @@ pub fn carousel_view(
             if interactive {
                 let resp = ui.allocate_rect(r, Sense::click());
                 if resp.hovered() {
-                    state.palette_selected = i;
+                    if state.palette_selected != i {
+                        state.palette_selected = i;
+                        crate::ui_audio::play_move();
+                    }
                 }
                 if resp.clicked() {
                     action = CarouselAction::SetTheme(*th);
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                 }
             }
             let is_sel = state.palette_selected == i;
@@ -1369,6 +1390,7 @@ pub fn carousel_view(
         let av_resp = ui.interact(av_rect.expand(3.0 * scale_factor), egui::Id::new("carousel_avatar"), Sense::click());
         if interactive && av_resp.clicked() && state.boot_stage == BootStage::None && !state.palette_open && state.profile_click_time.is_none() {
             state.profile_click_time = Some(t);
+            crate::ui_audio::play(crate::ui_audio::Sfx::Whistle);
         }
         let accent = {
             let c = state.ambient_color;
@@ -1485,6 +1507,7 @@ pub fn carousel_view(
         handle_input(
             state,
             last_input,
+            ib,
             ui,
             &mut action,
             n_items,
@@ -1525,6 +1548,7 @@ pub fn carousel_view(
 fn handle_input(
     state: &mut CarouselState,
     last_input: &crate::input::InputSnapshot,
+    ib: &mut Option<crate::input::InputBackend>,
     ui: &mut egui::Ui,
     action: &mut CarouselAction,
     n_items: usize,
@@ -1537,7 +1561,6 @@ fn handle_input(
     let mut right  = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
     let mut up     = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
     let mut down   = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
-    let mut select = false;
     let mut back   = ui.input(|i| i.key_pressed(egui::Key::Escape));
 
     if last_input.connected {
@@ -1546,7 +1569,7 @@ fn handle_input(
         if last_input.is(SwitchButton::DRight) { right  = true; }
         if last_input.is(SwitchButton::DUp)    { up     = true; }
         if last_input.is(SwitchButton::DDown)  { down   = true; }
-        if last_input.is(SwitchButton::B)      { back   = true; }
+        if state.b_edge                        { back   = true; }
 
         use std::sync::atomic::{AtomicU64, Ordering};
         static LAST_NAV: AtomicU64 = AtomicU64::new(0);
@@ -1565,23 +1588,47 @@ fn handle_input(
     }
 
     let x_edge = state.x_edge;
-    select = state.a_edge;
+    let select = state.a_edge;
 
     if state.palette_open {
         let themes = crate::app_settings::CarouselTheme::all();
         if left && state.palette_selected > 0 {
             state.palette_selected -= 1;
+            crate::ui_audio::play_move();
+            if last_input.connected {
+                if let Some(ref mut backend) = ib {
+                    let _ = backend.rumble(15000, 15000, 35);
+                }
+            }
         }
         if right && state.palette_selected + 1 < themes.len() {
             state.palette_selected += 1;
+            crate::ui_audio::play_move();
+            if last_input.connected {
+                if let Some(ref mut backend) = ib {
+                    let _ = backend.rumble(15000, 15000, 35);
+                }
+            }
         }
         if select {
             if let Some(th) = themes.get(state.palette_selected) {
                 *action = CarouselAction::SetTheme(*th);
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                if last_input.connected {
+                    if let Some(ref mut backend) = ib {
+                        let _ = backend.rumble(28000, 28000, 60);
+                    }
+                }
             }
         }
         if back {
             state.palette_open = false;
+            crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+            if last_input.connected {
+                if let Some(ref mut backend) = ib {
+                    let _ = backend.rumble(20000, 20000, 45);
+                }
+            }
         }
         return;
     }
@@ -1589,12 +1636,28 @@ fn handle_input(
     if state.profile_focused {
         if select && state.profile_click_time.is_none() {
             state.profile_click_time = Some(ui.input(|i| i.time) as f32);
+            crate::ui_audio::play(crate::ui_audio::Sfx::Whistle);
+            if last_input.connected {
+                if let Some(ref mut backend) = ib {
+                    let _ = backend.rumble(28000, 28000, 60);
+                }
+            }
         }
         if back || down || left || right {
             state.profile_focused = false;
+            if last_input.connected {
+                if let Some(ref mut backend) = ib {
+                    let _ = backend.rumble(15000, 15000, 35);
+                }
+            }
         }
         return;
     }
+
+    let pre_sel = state.selected;
+    let pre_dock = state.active_dock;
+    let pre_dsel = state.dock_selected;
+    let pre_prof = state.profile_focused;
 
     if left {
         if state.active_dock {
@@ -1619,7 +1682,26 @@ fn handle_input(
     }
     if down && !state.active_dock { state.active_dock = true; }
 
+    if state.selected != pre_sel
+        || state.active_dock != pre_dock
+        || state.dock_selected != pre_dsel
+        || state.profile_focused != pre_prof
+    {
+        crate::ui_audio::play_move();
+        if last_input.connected {
+            if let Some(ref mut backend) = ib {
+                let _ = backend.rumble(15000, 15000, 35);
+            }
+        }
+    }
+
     if select {
+        crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+        if last_input.connected {
+            if let Some(ref mut backend) = ib {
+                let _ = backend.rumble(28000, 28000, 60);
+            }
+        }
         if state.active_dock {
             if state.dock_selected == 6 {
                 state.palette_open = true;
@@ -1655,6 +1737,12 @@ fn handle_input(
         }
     }
     if back {
+        crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+        if last_input.connected {
+            if let Some(ref mut backend) = ib {
+                let _ = backend.rumble(20000, 20000, 45);
+            }
+        }
         if state.active_dock {
             state.active_dock = false;
         }
@@ -1662,8 +1750,18 @@ fn handle_input(
     if !state.active_dock && x_edge {
         if is_running && is_playing {
             *action = CarouselAction::StopEmulation;
+            if last_input.connected {
+                if let Some(ref mut backend) = ib {
+                    let _ = backend.rumble(20000, 20000, 45);
+                }
+            }
         } else if let Some(p) = &launch_path {
             *action = CarouselAction::ToggleFavorite(p.clone());
+            if last_input.connected {
+                if let Some(ref mut backend) = ib {
+                    let _ = backend.rumble(24000, 24000, 50);
+                }
+            }
         }
     }
 }
