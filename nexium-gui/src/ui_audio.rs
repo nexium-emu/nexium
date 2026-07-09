@@ -62,6 +62,8 @@ pub enum Sfx {
     AwaitFrame,
     PleaseWait,
     Celebration,
+    WhistleOk,
+    WhistleSquish,
 }
 
 struct Voice {
@@ -96,6 +98,8 @@ fn key(s: Sfx) -> u8 {
         Sfx::AwaitFrame => 9,
         Sfx::PleaseWait => 10,
         Sfx::Celebration => 11,
+        Sfx::WhistleOk => 12,
+        Sfx::WhistleSquish => 13,
     }
 }
 
@@ -174,6 +178,8 @@ fn build() -> Option<Engine> {
     banks.insert(key(Sfx::AwaitFrame), std::sync::Arc::new(render(Sfx::AwaitFrame)));
     banks.insert(key(Sfx::PleaseWait), std::sync::Arc::new(render(Sfx::PleaseWait)));
     banks.insert(key(Sfx::Celebration), std::sync::Arc::new(render(Sfx::Celebration)));
+    banks.insert(key(Sfx::WhistleOk), std::sync::Arc::new(render(Sfx::WhistleOk)));
+    banks.insert(key(Sfx::WhistleSquish), std::sync::Arc::new(render(Sfx::WhistleSquish)));
 
     let music = std::sync::Arc::new(decode_wav_mono(MUSIC_WAV));
 
@@ -327,8 +333,8 @@ fn render(s: Sfx) -> Vec<f32> {
             tone_after(&mut b, 40, 987.77, 90.0, 0.28, 2.0, 70.0);
         }
         Sfx::Back => {
-            tone(&mut b, 587.33, 55.0, 0.12, 2.0, 30.0);
-            tone_after(&mut b, 40, 440.0, 90.0, 0.12, 2.0, 70.0);
+            // downward whistle slide — a whistley "back out"
+            whistle(&mut b, 1180.0, 540.0, 0.30, 70.0, 0.18);
         }
         Sfx::Open => {
             tone(&mut b, 523.25, 60.0, 0.24, 2.0, 30.0);
@@ -382,6 +388,18 @@ fn render(s: Sfx) -> Vec<f32> {
                 let s = (phase * std::f32::consts::TAU).sin();
                 b[i] += s * 0.20 * env(i, n, attack, release);
             }
+        }
+        Sfx::WhistleOk => {
+            // bright rising accept whistle with a little high flick at the end
+            whistle(&mut b, 720.0, 1360.0, 0.24, 55.0, 0.19);
+            tone_after_abs(&mut b, 180.0, 1720.0, 120.0, 0.12, 4.0, 100.0);
+        }
+        Sfx::WhistleSquish => {
+            // playful "boing" whistle — quick up then a springy dip back down
+            whistle(&mut b, 820.0, 1300.0, 0.13, 40.0, 0.2);
+            let s = b.len();
+            let _ = s;
+            whistle_at(&mut b, 120.0, 1300.0, 880.0, 0.16, 120.0, 0.18);
         }
         Sfx::GameBoot => {
             // Chord 1: Dm9 (D3, F3, A3, C4, E4) from 0ms to 300ms
@@ -494,4 +512,26 @@ fn tone_after_abs(buf: &mut Vec<f32>, offset_ms: f32, freq: f32, dur_ms: f32, ga
         let sv = tri(freq * t) * 0.6 + (freq * t * std::f32::consts::TAU).sin() * 0.4;
         buf[off + i] += sv * gain * env(i, n, attack, release);
     }
+}
+
+fn whistle_at(buf: &mut Vec<f32>, offset_ms: f32, f0: f32, f1: f32, dur: f32, warble: f32, gain: f32) {
+    let off = (SR * offset_ms / 1000.0) as usize;
+    let n = (SR * dur) as usize;
+    if buf.len() < off + n {
+        buf.resize(off + n, 0.0);
+    }
+    let attack = (SR * 0.016) as usize;
+    let release = (SR * dur * 0.42) as usize;
+    let mut phase = 0.0f32;
+    for i in 0..n {
+        let p = i as f32 / n as f32;
+        let bend = 1.0 - (1.0 - p).powi(2);
+        let freq = f0 + (f1 - f0) * bend + warble * (p * 20.0).sin() * (1.0 - p);
+        phase += freq / SR;
+        buf[off + i] += (phase * std::f32::consts::TAU).sin() * gain * env(i, n, attack, release);
+    }
+}
+
+fn whistle(buf: &mut Vec<f32>, f0: f32, f1: f32, dur: f32, warble: f32, gain: f32) {
+    whistle_at(buf, 0.0, f0, f1, dur, warble, gain);
 }

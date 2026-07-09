@@ -1908,7 +1908,12 @@ fn handle_input(
     }
 
     if select {
-        crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+        let is_game_launch = !state.active_dock && !is_playing && launch_path.is_some();
+        crate::ui_audio::play(if is_game_launch {
+            crate::ui_audio::Sfx::WhistleSquish
+        } else {
+            crate::ui_audio::Sfx::Select
+        });
         if last_input.connected {
             if let Some(ref mut backend) = ib {
                 let _ = backend.rumble(28000, 28000, 60);

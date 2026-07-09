@@ -1174,7 +1174,11 @@ impl HorizonApp {
             self.carousel.boot_stage = crate::carousel::BootStage::None;
         } else if a_edge {
             let confirmed = self.confirm.as_ref().map_or(false, |c| c.selected == 1);
-            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            crate::ui_audio::play(if confirmed {
+                crate::ui_audio::Sfx::WhistleOk
+            } else {
+                crate::ui_audio::Sfx::Back
+            });
             self.resolve_confirm(confirmed);
         }
     }
@@ -1315,7 +1319,7 @@ impl HorizonApp {
                 self.confirm = None;
                 self.carousel.boot_stage = crate::carousel::BootStage::None;
             } else if ok_resp.clicked() {
-                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                crate::ui_audio::play(crate::ui_audio::Sfx::WhistleOk);
                 self.resolve_confirm(true);
             }
         }
