@@ -421,24 +421,6 @@ fn draw_gradient_circle(
     painter.add(egui::Shape::mesh(mesh));
 }
 
-fn glass_sheen(painter: &egui::Painter, rect: egui::Rect, inset_x: f32, y0f: f32, y1f: f32, c_top: Color32, c_bot: Color32) {
-    let x0 = rect.min.x + inset_x;
-    let x1 = rect.max.x - inset_x;
-    let y0 = rect.min.y + rect.height() * y0f;
-    let y1 = rect.min.y + rect.height() * y1f;
-    if x1 <= x0 {
-        return;
-    }
-    let mut mesh = egui::epaint::Mesh::default();
-    let v = |pos: egui::Pos2, c: Color32| egui::epaint::Vertex { pos, uv: egui::pos2(0.0, 0.0), color: c };
-    mesh.vertices.push(v(egui::pos2(x0, y0), c_top));
-    mesh.vertices.push(v(egui::pos2(x1, y0), c_top));
-    mesh.vertices.push(v(egui::pos2(x1, y1), c_bot));
-    mesh.vertices.push(v(egui::pos2(x0, y1), c_bot));
-    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-    painter.add(egui::Shape::mesh(mesh));
-}
-
 pub fn draw_backdrop(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -1245,14 +1227,19 @@ pub fn carousel_view(
         scaled_dock_center,
         Vec2::new(scaled_dock_total + 44.0 * scale_factor, scaled_item_size + 22.0 * scale_factor),
     );
-    let dock_bg_alpha = (ui_opacity * 190.0) as u8;
+    let dock_bg_alpha = (ui_opacity * if th > 0.5 { 236.0 } else { 200.0 }) as u8;
     if dock_bg_alpha > 0 {
         let round = 32.0 * scale_factor;
+        for k in 0..5 {
+            let e = (5 - k) as f32 * 2.6 * scale_factor;
+            let a = (ui_opacity * if th > 0.5 { 30.0 } else { 20.0 }) as u8;
+            painter.rect_filled(dock_bg.expand(e).translate(Vec2::new(0.0, 3.5 * scale_factor)), Rounding::same(round + e), Color32::from_black_alpha(a));
+        }
         painter.rect_filled(dock_bg, Rounding::same(round), Color32::from_rgba_premultiplied(col_bar.r(), col_bar.g(), col_bar.b(), dock_bg_alpha));
-        let inset = round * 0.14;
-        glass_sheen(&painter, dock_bg, inset, 0.0, 0.52, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 130.0 } else { 30.0 }) as u8), Color32::from_white_alpha(0));
-        glass_sheen(&painter, dock_bg, inset, 0.5, 1.0, Color32::from_white_alpha(0), Color32::from_black_alpha((ui_opacity * if th > 0.5 { 30.0 } else { 46.0 }) as u8));
-        painter.rect_stroke(dock_bg.shrink(0.75 * scale_factor), Rounding::same(round - 0.75 * scale_factor), Stroke::new(1.0 * scale_factor, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 90.0 } else { 32.0 }) as u8)));
+        let gloss = egui::Rect::from_min_max(dock_bg.min, egui::pos2(dock_bg.max.x, dock_bg.center().y));
+        painter.rect_filled(gloss, Rounding { nw: round, ne: round, sw: 0.0, se: 0.0 }, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 55.0 } else { 42.0 }) as u8));
+        painter.rect_stroke(dock_bg, Rounding::same(round), Stroke::new(1.1 * scale_factor, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
+        painter.rect_stroke(dock_bg.shrink(1.2 * scale_factor), Rounding::same(round - 1.2 * scale_factor), Stroke::new(1.0 * scale_factor, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 80.0 } else { 30.0 }) as u8)));
 
         let scaled_dock_sx = scaled_dock_center.x - scaled_dock_total * 0.5;
 
