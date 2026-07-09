@@ -1774,6 +1774,20 @@ impl eframe::App for HorizonApp {
 
         self.library.poll();
 
+        // Drain shop installs and prune finished downloads BEFORE any drawing
+        // so freed placeholder textures aren't referenced in this frame's submit.
+        for pending in self.shop.new_installs.drain(..).collect::<Vec<_>>() {
+            let icon = pending.icon.as_deref().and_then(crate::library::decode_icon);
+            self.library.add_download(pending.title, icon, pending.info);
+        }
+        if self.library.prune_downloads() {
+            self.shop.need_rescan = true;
+        }
+        if self.shop.need_rescan {
+            self.shop.need_rescan = false;
+            self.library.rescan(ctx, &self.app_settings.library_folders);
+        }
+
         if let Some((_, tm, _)) = &self.icon_reveal {
             if tm.elapsed().as_secs_f32() > 1.0 {
                 self.icon_reveal = None;
@@ -2833,17 +2847,6 @@ impl eframe::App for HorizonApp {
                         None => self.carousel.ambient_color,
                     };
                     self.shop.update(ctx, ui, self.app_settings.light_mode, accent, &self.last_input);
-                }
-                for pending in self.shop.new_installs.drain(..).collect::<Vec<_>>() {
-                    let icon = pending.icon.as_deref().and_then(crate::library::decode_icon);
-                    self.library.add_download(pending.title, icon, pending.info);
-                }
-                if self.library.prune_downloads() {
-                    self.shop.need_rescan = true;
-                }
-                if self.shop.need_rescan {
-                    self.shop.need_rescan = false;
-                    self.library.rescan(ctx, &self.app_settings.library_folders);
                 }
             });
 
