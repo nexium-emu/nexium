@@ -421,6 +421,24 @@ fn draw_gradient_circle(
     painter.add(egui::Shape::mesh(mesh));
 }
 
+fn glass_sheen(painter: &egui::Painter, rect: egui::Rect, inset_x: f32, y0f: f32, y1f: f32, c_top: Color32, c_bot: Color32) {
+    let x0 = rect.min.x + inset_x;
+    let x1 = rect.max.x - inset_x;
+    let y0 = rect.min.y + rect.height() * y0f;
+    let y1 = rect.min.y + rect.height() * y1f;
+    if x1 <= x0 {
+        return;
+    }
+    let mut mesh = egui::epaint::Mesh::default();
+    let v = |pos: egui::Pos2, c: Color32| egui::epaint::Vertex { pos, uv: egui::pos2(0.0, 0.0), color: c };
+    mesh.vertices.push(v(egui::pos2(x0, y0), c_top));
+    mesh.vertices.push(v(egui::pos2(x1, y0), c_top));
+    mesh.vertices.push(v(egui::pos2(x1, y1), c_bot));
+    mesh.vertices.push(v(egui::pos2(x0, y1), c_bot));
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 pub fn draw_backdrop(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -1206,7 +1224,7 @@ pub fn carousel_view(
         ("■", "Stop"),
         ("⌨", "Controller"),
         ("⚙", "Settings"),
-        ("🎨", "Theme"),
+        ("🎨", "Color"),
         ("🪳", "Debug"),
         ("✕", "Quit"),
     ];
@@ -1229,7 +1247,12 @@ pub fn carousel_view(
     );
     let dock_bg_alpha = (ui_opacity * 190.0) as u8;
     if dock_bg_alpha > 0 {
-        painter.rect_filled(dock_bg, Rounding::same(32.0 * scale_factor), Color32::from_rgba_premultiplied(col_bar.r(), col_bar.g(), col_bar.b(), dock_bg_alpha));
+        let round = 32.0 * scale_factor;
+        painter.rect_filled(dock_bg, Rounding::same(round), Color32::from_rgba_premultiplied(col_bar.r(), col_bar.g(), col_bar.b(), dock_bg_alpha));
+        let inset = round * 0.14;
+        glass_sheen(&painter, dock_bg, inset, 0.0, 0.52, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 130.0 } else { 30.0 }) as u8), Color32::from_white_alpha(0));
+        glass_sheen(&painter, dock_bg, inset, 0.5, 1.0, Color32::from_white_alpha(0), Color32::from_black_alpha((ui_opacity * if th > 0.5 { 30.0 } else { 46.0 }) as u8));
+        painter.rect_stroke(dock_bg.shrink(0.75 * scale_factor), Rounding::same(round - 0.75 * scale_factor), Stroke::new(1.0 * scale_factor, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 90.0 } else { 32.0 }) as u8)));
 
         let scaled_dock_sx = scaled_dock_center.x - scaled_dock_total * 0.5;
 
@@ -1286,7 +1309,15 @@ pub fn carousel_view(
             }
 
             let fill = Color32::from_rgba_premultiplied(col_surface.r(), col_surface.g(), col_surface.b(), (ui_opacity * 200.0) as u8);
-            painter.circle(base.center(), base.width() * 0.5, fill, Stroke::new(1.0, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
+            let br = base.width() * 0.5;
+            painter.circle(base.center(), br, fill, Stroke::new(1.0, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
+            let arc: Vec<egui::Pos2> = (0..=14)
+                .map(|k| {
+                    let a = std::f32::consts::PI * (1.08 + 0.84 * (k as f32 / 14.0));
+                    base.center() + Vec2::new(a.cos(), a.sin()) * (br - 1.3 * scale_factor)
+                })
+                .collect();
+            painter.add(egui::Shape::line(arc, Stroke::new(1.1 * scale_factor, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 90.0 } else { 55.0 }) as u8))));
         }
 
         if state.dock_focus > 0.004 {
@@ -1416,7 +1447,7 @@ pub fn carousel_view(
         painter.rect_filled(panel, Rounding::same(20.0 * scale_factor), Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), a(240.0)));
         painter.rect_stroke(panel, Rounding::same(20.0 * scale_factor), Stroke::new(1.0, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(255.0))));
 
-        shadowed_text(&painter, egui::pos2(scaled_center.x, panel.min.y + 20.0 * scale_factor), egui::Align2::CENTER_CENTER, "Background Theme", FontId::proportional(15.0 * scale_factor), Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), a(255.0)), true);
+        shadowed_text(&painter, egui::pos2(scaled_center.x, panel.min.y + 20.0 * scale_factor), egui::Align2::CENTER_CENTER, "Background Color", FontId::proportional(15.0 * scale_factor), Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), a(255.0)), true);
 
         let sx = scaled_center.x - s_total * 0.5;
         let row_y = scaled_center.y + 6.0 * scale_factor;
