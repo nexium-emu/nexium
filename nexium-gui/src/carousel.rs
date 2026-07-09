@@ -50,6 +50,7 @@ pub struct CarouselState {
     pub game_menu_open: bool,
     pub game_menu_sel: usize,
     pub game_menu_anim: f32,
+    pub dl_dialog: bool,
 }
 
 impl CarouselState {
@@ -88,6 +89,7 @@ impl CarouselState {
             game_menu_open: false,
             game_menu_sel: 0,
             game_menu_anim: 0.0,
+            dl_dialog: false,
         }
     }
 }
@@ -1015,6 +1017,8 @@ pub fn carousel_view(
                     state.active_dock = false;
                 } else if is_add_dir {
                     action = CarouselAction::AddFolder;
+                } else if lib.games[filtered_indices[i]].download.is_some() {
+                    state.dl_dialog = true;
                 } else if playing == Some(filtered_indices[i]) {
                     action = CarouselAction::Resume;
                 } else if is_running {
@@ -1082,6 +1086,19 @@ pub fn carousel_view(
                 draw_rounded_image(&painter, tex.id(), draw_rect, 14.0 * scale_factor, tint);
             } else {
                 painter.text(draw_rect.center(), egui::Align2::CENTER_CENTER, &lib.games[real_idx].format, FontId::proportional(final_sz * 0.13), Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), (alpha_f * 255.0) as u8));
+            }
+
+            let dl_progress = lib.games[real_idx].download.as_ref().and_then(|d| d.lock().ok().map(|g| g.progress));
+            if let Some(prog) = dl_progress {
+                painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(0, 0, 0, (alpha_f * 150.0) as u8));
+                painter.text(draw_rect.center() - Vec2::new(0.0, 8.0 * scale_factor), egui::Align2::CENTER_CENTER, "Downloading", FontId::proportional(final_sz * 0.09), Color32::from_rgba_unmultiplied(0xEC, 0xEC, 0xF0, (alpha_f * 255.0) as u8));
+                let bar_w = draw_rect.width() * 0.78;
+                let bar = egui::Rect::from_center_size(egui::pos2(draw_rect.center().x, draw_rect.max.y - 22.0 * scale_factor), Vec2::new(bar_w, 6.0 * scale_factor));
+                painter.rect_filled(bar, Rounding::same(3.0 * scale_factor), Color32::from_rgba_unmultiplied(0x40, 0x40, 0x4A, (alpha_f * 255.0) as u8));
+                let mut fill = bar;
+                fill.set_width(bar_w * prog.clamp(0.0, 1.0));
+                painter.rect_filled(fill, Rounding::same(3.0 * scale_factor), Color32::from_rgba_unmultiplied(0x35, 0xD0, 0x6A, (alpha_f * 255.0) as u8));
+                painter.text(egui::pos2(draw_rect.center().x, draw_rect.max.y - 34.0 * scale_factor), egui::Align2::CENTER_CENTER, &format!("{}%", (prog * 100.0) as u32), FontId::proportional(final_sz * 0.07), Color32::from_rgba_unmultiplied(0xC0, 0xC0, 0xCC, (alpha_f * 255.0) as u8));
             }
 
             if let Some((rev_idx, rev_t, old_tex)) = &icon_reveal {
@@ -1503,6 +1520,28 @@ pub fn carousel_view(
                 );
             }
         }
+    }
+
+    if state.dl_dialog {
+        let sc = |p: egui::Pos2| screen_center + (p - screen_center) * scale_factor;
+        let prog = if state.selected < filtered_indices.len() {
+            lib.games[filtered_indices[state.selected]].download.as_ref().and_then(|d| d.lock().ok().map(|g| g.progress)).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        painter.rect_filled(bg_rect, Rounding::ZERO, Color32::from_black_alpha(150));
+        let dlg = egui::Rect::from_center_size(sc(bg_rect.center()), Vec2::new(520.0 * scale_factor, 220.0 * scale_factor));
+        let pf = tl(Color32::from_rgb(0x3A, 0x3A, 0x42), Color32::from_rgb(0xFB, 0xFB, 0xFE));
+        painter.rect_filled(dlg, Rounding::same(14.0 * scale_factor), pf);
+        painter.text(egui::pos2(dlg.center().x, dlg.min.y + 44.0 * scale_factor), egui::Align2::CENTER_CENTER, "Downloading data…", FontId::proportional(22.0 * scale_factor), col_text);
+        painter.text(egui::pos2(dlg.center().x, dlg.min.y + 78.0 * scale_factor), egui::Align2::CENTER_CENTER, "This game will be playable once the download finishes.", FontId::proportional(13.0 * scale_factor), col_muted);
+        let bar = egui::Rect::from_center_size(egui::pos2(dlg.center().x, dlg.center().y + 6.0 * scale_factor), Vec2::new(dlg.width() * 0.8, 8.0 * scale_factor));
+        painter.rect_filled(bar, Rounding::same(4.0 * scale_factor), Color32::from_gray(0x50));
+        let mut fill = bar;
+        fill.set_width(bar.width() * prog.clamp(0.0, 1.0));
+        painter.rect_filled(fill, Rounding::same(4.0 * scale_factor), Color32::from_rgb(0x35, 0xD0, 0x6A));
+        painter.text(egui::pos2(dlg.center().x, bar.max.y + 20.0 * scale_factor), egui::Align2::CENTER_CENTER, &format!("{}%", (prog * 100.0) as u32), FontId::proportional(15.0 * scale_factor), col_text);
+        painter.text(egui::pos2(dlg.center().x, dlg.max.y - 26.0 * scale_factor), egui::Align2::CENTER_CENTER, "[A / B]  Close", FontId::proportional(13.0 * scale_factor), col_muted);
     }
 
     let gm_target = if state.game_menu_open { 1.0 } else { 0.0 };
@@ -2017,6 +2056,14 @@ fn handle_input(
     let x_edge = state.x_edge;
     let select = state.a_edge;
 
+    if state.dl_dialog {
+        if back || select {
+            state.dl_dialog = false;
+            crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+        }
+        return;
+    }
+
     if state.game_menu_open {
         if up && state.game_menu_sel > 0 {
             state.game_menu_sel -= 1;
@@ -2202,6 +2249,8 @@ fn handle_input(
             }
         } else if is_playing {
             *action = CarouselAction::Resume;
+        } else if launch_path.as_deref().map_or(false, |p| p.starts_with("__downloading__")) {
+            state.dl_dialog = true;
         } else if let Some(path) = &launch_path {
             *action = CarouselAction::Launch(path.clone());
         } else {

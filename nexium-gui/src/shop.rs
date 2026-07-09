@@ -5,7 +5,8 @@ use egui::Color32;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-const RED: Color32 = Color32::from_rgb(0xE6, 0x00, 0x12);
+const BLUE: Color32 = Color32::from_rgb(0x1F, 0x6F, 0xE0);
+const BLUE_HI: Color32 = Color32::from_rgb(0x3B, 0x8B, 0xFF);
 
 #[derive(Clone, Copy)]
 struct Pal {
@@ -39,23 +40,23 @@ fn palette(light: bool) -> Pal {
     }
 }
 
+use crate::library::DownloadInfo;
+
 #[derive(Default)]
 struct Fetch {
     done: bool,
     apps: Vec<ShopApp>,
 }
 
-#[derive(Default)]
-struct InstallState {
-    progress: f32,
-    done: bool,
-    ok: bool,
-    msg: String,
-}
-
 struct InstallJob {
     idx: usize,
-    state: Arc<Mutex<InstallState>>,
+    state: Arc<Mutex<DownloadInfo>>,
+}
+
+pub struct PendingInstall {
+    pub title: String,
+    pub icon: Option<Vec<u8>>,
+    pub info: Arc<Mutex<DownloadInfo>>,
 }
 
 enum View {
@@ -71,8 +72,10 @@ pub struct ShopState {
     loaded: bool,
     apps: Vec<ShopApp>,
     icons: Vec<Option<egui::TextureHandle>>,
+    icon_bytes: Vec<Option<Vec<u8>>>,
     icon_jobs: Arc<Mutex<HashMap<usize, Option<Vec<u8>>>>>,
     icon_requested: HashSet<usize>,
+    pub new_installs: Vec<PendingInstall>,
     search: String,
     editing: bool,
     filtered: Vec<usize>,
@@ -84,6 +87,7 @@ pub struct ShopState {
     nav_cd: f64,
     a_held: bool,
     b_held: bool,
+    confirm_install: bool,
 }
 
 impl ShopState {
@@ -96,8 +100,10 @@ impl ShopState {
             loaded: false,
             apps: Vec::new(),
             icons: Vec::new(),
+            icon_bytes: Vec::new(),
             icon_jobs: Arc::new(Mutex::new(HashMap::new())),
             icon_requested: HashSet::new(),
+            new_installs: Vec::new(),
             search: String::new(),
             editing: false,
             filtered: Vec::new(),
@@ -109,12 +115,17 @@ impl ShopState {
             nav_cd: 0.0,
             a_held: false,
             b_held: false,
+            confirm_install: false,
         }
     }
 
     pub fn open(&mut self) {
         self.open = true;
         self.view = View::Grid;
+        // swallow the still-held A/B that opened the shop so it doesn't
+        // immediately fire an edge inside the shop on the same press.
+        self.a_held = true;
+        self.b_held = true;
         if !self.loaded && self.fetch.is_none() {
             let shared = Arc::new(Mutex::new(Fetch::default()));
             self.fetch = Some(shared.clone());
@@ -147,7 +158,7 @@ impl ShopState {
             return;
         }
         let app = self.apps[ai].clone();
-        let state = Arc::new(Mutex::new(InstallState::default()));
+        let state = Arc::new(Mutex::new(DownloadInfo::default()));
         let s2 = state.clone();
         std::thread::spawn(move || {
             let ok = install_app(&app, &s2);
@@ -155,10 +166,12 @@ impl ShopState {
                 g.done = true;
                 g.ok = ok;
                 g.progress = 1.0;
-                if !ok && g.msg.is_empty() {
-                    g.msg = "Install failed".into();
-                }
             }
+        });
+        self.new_installs.push(PendingInstall {
+            title: self.apps[ai].title.clone(),
+            icon: self.icon_bytes.get(ai).cloned().flatten(),
+            info: state.clone(),
         });
         self.install = Some(InstallJob { idx: ai, state });
     }
@@ -197,6 +210,7 @@ impl ShopState {
             if let Some(apps) = apps {
                 self.apps = apps;
                 self.icons = vec![None; self.apps.len()];
+                self.icon_bytes = vec![None; self.apps.len()];
                 self.loaded = true;
                 self.refilter();
             }
@@ -226,6 +240,9 @@ impl ShopState {
                     self.icons[i] = Some(ctx.load_texture(format!("shop_icon_{i}"), img, egui::TextureOptions::LINEAR));
                 }
             }
+            if i < self.icon_bytes.len() {
+                self.icon_bytes[i] = Some(bytes);
+            }
         }
 
         let screen = ctx.screen_rect();
@@ -235,7 +252,7 @@ impl ShopState {
 
         // top banner (red eShop-style)
         let bar = egui::Rect::from_min_size(screen.min, egui::Vec2::new(screen.width(), 52.0));
-        paint.rect_filled(bar, egui::Rounding::ZERO, RED);
+        paint.rect_filled(bar, egui::Rounding::ZERO, BLUE);
         paint.text(egui::pos2(bar.min.x + 24.0, bar.center().y), egui::Align2::LEFT_CENTER, "NeXium  Homebrew", egui::FontId::proportional(20.0), Color32::WHITE);
 
         // ---- keyboard / text ----
@@ -304,15 +321,20 @@ impl ShopState {
         }
 
         if b_edge {
-            match self.view {
-                View::Detail(_) => {
-                    self.view = View::Grid;
-                    self.desc_scroll = 0.0;
-                    crate::ui_audio::play(crate::ui_audio::Sfx::Back);
-                }
-                View::Grid => {
-                    self.open = false;
-                    crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+            if self.confirm_install {
+                self.confirm_install = false;
+                crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+            } else {
+                match self.view {
+                    View::Detail(_) => {
+                        self.view = View::Grid;
+                        self.desc_scroll = 0.0;
+                        crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+                    }
+                    View::Grid => {
+                        self.open = false;
+                        crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+                    }
                 }
             }
         }
@@ -331,12 +353,12 @@ impl ShopState {
             paint.text(content.center(), egui::Align2::CENTER_CENTER, "No games found.", egui::FontId::proportional(18.0), pal.muted);
             return;
         }
-        let cols = 4usize;
-        let pad = 26.0;
-        let gap = 20.0;
-        let tile_w = ((content.width() - pad * 2.0 - gap * (cols as f32 - 1.0)) / cols as f32).min(280.0);
+        let cols = 5usize;
+        let pad = 34.0;
+        let gap = 22.0;
+        let tile_w = (content.width() - pad * 2.0 - gap * (cols as f32 - 1.0)) / cols as f32;
         let tile_h = tile_w * 0.58;
-        let cell_h = tile_h + 30.0;
+        let cell_h = tile_h + 32.0;
 
         // nav
         if nl && self.selected > 0 { self.selected -= 1; crate::ui_audio::play_move(); }
@@ -447,23 +469,37 @@ impl ShopState {
         }
 
         // right install panel
-        let (progress, done, ok, msg) = self
+        let (progress, done, ok) = self
             .install
             .as_ref()
             .filter(|j| j.idx == ai)
-            .and_then(|j| j.state.lock().ok().map(|g| (g.progress, g.done, g.ok, g.msg.clone())))
-            .unwrap_or((0.0, false, false, String::new()));
+            .and_then(|j| j.state.lock().ok().map(|g| (g.progress, g.done, g.ok)))
+            .unwrap_or((0.0, false, false));
         let installing = self.install.as_ref().map_or(false, |j| j.idx == ai) && !done;
+        let failed = self.install.as_ref().map_or(false, |j| j.idx == ai) && done && !ok;
 
         let btn = egui::Rect::from_min_size(egui::pos2(col_split + 20.0, content.min.y + pad + 30.0), egui::Vec2::new(content.max.x - col_split - 60.0, 60.0));
         let btn_resp = ui.allocate_rect(btn, egui::Sense::click());
         let hovered = btn_resp.hovered();
-        let btn_col = if installing { pal.panel2 } else if done && ok { Color32::from_rgb(0x2C, 0xA0, 0x4A) } else if hovered { Color32::from_rgb(0xFF, 0x2A, 0x3E) } else { RED };
+        let idle = !installing && !(done && ok);
+        // focus glow — the Install button is the detail's default focus
+        if idle {
+            let t = ui.input(|i| i.time) as f32;
+            let pulse = 0.6 + 0.4 * (t * 3.0).sin();
+            for k in 0..4 {
+                let e = (4 - k) as f32 * 3.0;
+                paint.rect_stroke(btn.expand(e), egui::Rounding::same(12.0 + e), egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(BLUE_HI.r(), BLUE_HI.g(), BLUE_HI.b(), (40.0 * pulse) as u8)));
+            }
+            paint.rect_stroke(btn.expand(3.0), egui::Rounding::same(15.0), egui::Stroke::new(2.5, Color32::from_rgba_unmultiplied(BLUE_HI.r(), BLUE_HI.g(), BLUE_HI.b(), (200.0 * pulse) as u8)));
+        }
+        let btn_col = if installing { pal.panel2 } else if done && ok { Color32::from_rgb(0x2C, 0xA0, 0x4A) } else if failed { Color32::from_rgb(0xB0, 0x3A, 0x3A) } else if hovered { BLUE_HI } else { BLUE };
         paint.rect_filled(btn, egui::Rounding::same(12.0), btn_col);
         let label = if done && ok {
             "Installed ✓".to_string()
         } else if installing {
             format!("Installing…  {}%", (progress * 100.0) as u32)
+        } else if failed {
+            "Retry Install".to_string()
         } else {
             "Install".to_string()
         };
@@ -475,17 +511,38 @@ impl ShopState {
             fill.set_width(barr.width() * progress);
             paint.rect_filled(fill, egui::Rounding::same(3.5), Color32::from_rgb(0x35, 0xD0, 0x6A));
         }
-        if !msg.is_empty() {
-            paint.text(egui::pos2(btn.center().x, btn.max.y + 26.0), egui::Align2::CENTER_TOP, &msg, egui::FontId::proportional(13.0), pal.muted);
-        }
         if done && ok {
             self.need_rescan = true;
         }
 
-        let do_install = (btn_resp.clicked() || a_edge) && !installing && !(done && ok);
-        if do_install {
-            self.start_install(ai);
-            crate::ui_audio::play(crate::ui_audio::Sfx::WhistleOk);
+        // confirmation flow
+        if self.confirm_install {
+            paint.rect_filled(content, egui::Rounding::ZERO, Color32::from_black_alpha(150));
+            let dlg = egui::Rect::from_center_size(content.center(), egui::Vec2::new(440.0, 190.0));
+            paint.rect_filled(dlg, egui::Rounding::same(16.0), pal.panel);
+            paint.rect_stroke(dlg, egui::Rounding::same(16.0), egui::Stroke::new(1.5, pal.border));
+            paint.text(egui::pos2(dlg.center().x, dlg.min.y + 44.0), egui::Align2::CENTER_CENTER, "Install this game?", egui::FontId::proportional(21.0), pal.text);
+            paint.text(egui::pos2(dlg.center().x, dlg.min.y + 78.0), egui::Align2::CENTER_CENTER, &app.title, egui::FontId::proportional(15.0), pal.muted);
+            let yes = egui::Rect::from_min_size(egui::pos2(dlg.center().x + 12.0, dlg.max.y - 62.0), egui::Vec2::new(180.0, 44.0));
+            let no = egui::Rect::from_min_size(egui::pos2(dlg.center().x - 192.0, dlg.max.y - 62.0), egui::Vec2::new(180.0, 44.0));
+            let yes_resp = ui.allocate_rect(yes, egui::Sense::click());
+            let no_resp = ui.allocate_rect(no, egui::Sense::click());
+            paint.rect_filled(yes, egui::Rounding::same(10.0), if yes_resp.hovered() { BLUE_HI } else { BLUE });
+            paint.rect_filled(no, egui::Rounding::same(10.0), pal.panel2);
+            paint.text(yes.center(), egui::Align2::CENTER_CENTER, "Install", egui::FontId::proportional(17.0), Color32::WHITE);
+            paint.text(no.center(), egui::Align2::CENTER_CENTER, "Cancel", egui::FontId::proportional(17.0), pal.text);
+            paint.text(egui::pos2(content.center().x, dlg.max.y + 22.0), egui::Align2::CENTER_CENTER, "[A] Install    [B] Cancel", egui::FontId::proportional(13.0), pal.muted);
+            if a_edge || yes_resp.clicked() {
+                self.confirm_install = false;
+                self.start_install(ai);
+                crate::ui_audio::play(crate::ui_audio::Sfx::WhistleOk);
+            } else if no_resp.clicked() {
+                self.confirm_install = false;
+                crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+            }
+        } else if (btn_resp.clicked() || a_edge) && idle {
+            self.confirm_install = true;
+            crate::ui_audio::play(crate::ui_audio::Sfx::Open);
         }
 
         hint_bar(paint, content, pal, "[A] Install   ·   [B] Back   ·   scroll / ↑↓ read");
@@ -508,7 +565,7 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-fn install_app(app: &ShopApp, state: &Arc<Mutex<InstallState>>) -> bool {
+fn install_app(app: &ShopApp, state: &Arc<Mutex<DownloadInfo>>) -> bool {
     let tmp = std::env::temp_dir().join(format!("nexium_shop_{}.zip", app.name));
     if let Ok(mut g) = state.lock() {
         g.progress = 0.2;
@@ -522,9 +579,6 @@ fn install_app(app: &ShopApp, state: &Arc<Mutex<InstallState>>) -> bool {
         .arg(app.zip_url())
         .status();
     if !matches!(out, Ok(s) if s.success()) || !tmp.exists() {
-        if let Ok(mut g) = state.lock() {
-            g.msg = "Download failed".into();
-        }
         return false;
     }
     if let Ok(mut g) = state.lock() {
