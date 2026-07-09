@@ -96,6 +96,9 @@ impl Library {
     }
 
     pub fn texture(&mut self, ctx: &egui::Context, idx: usize) -> Option<egui::TextureHandle> {
+        if idx >= self.textures.len() || idx >= self.games.len() {
+            return None;
+        }
         if self.textures[idx].is_none() {
             if let Some(img) = self.games[idx].icon.take() {
                 let handle = ctx.load_texture(
