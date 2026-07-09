@@ -915,6 +915,8 @@ impl eframe::App for HorizonApp {
                     }
                     self.carousel.active_dock = false;
                     self.pause_anim = Some(std::time::Instant::now());
+                } else {
+                    self.stop_emulation();
                 }
             }
         }
@@ -1520,6 +1522,7 @@ impl eframe::App for HorizonApp {
                             let await_text = format!("Awaiting First Frame{}", dots);
                             let await_alpha = (fade_alpha * 255.0) as u8;
                             crate::carousel::shadowed_text(&painter, egui::pos2(center.x, text_y + 40.0), egui::Align2::CENTER_CENTER, &await_text, FontId::proportional(15.0), Color32::from_rgba_unmultiplied(0x00, 0xE5, 0xFF, await_alpha), false);
+                            crate::carousel::shadowed_text(&painter, egui::pos2(center.x, text_y + 74.0), egui::Align2::CENTER_CENTER, "[Home] Cancel", FontId::proportional(13.0), Color32::from_rgba_unmultiplied(0xC0, 0xC0, 0xCC, await_alpha), false);
                         }
 
                         ctx.request_repaint();
