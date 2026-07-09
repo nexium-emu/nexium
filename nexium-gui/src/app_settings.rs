@@ -306,6 +306,8 @@ pub struct AppSettings {
     pub profile_name: String,
     #[serde(default)]
     pub steamgriddb_key: String,
+    #[serde(default)]
+    pub eu_dates: bool,
 }
 
 fn default_profile_name() -> String {
@@ -341,6 +343,7 @@ impl Default for AppSettings {
             profile_avatar: None,
             profile_name: default_profile_name(),
             steamgriddb_key: String::new(),
+            eu_dates: false,
         }
     }
 }

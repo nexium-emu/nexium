@@ -2404,6 +2404,7 @@ impl eframe::App for HorizonApp {
                         self.app_settings.backdrop_theme,
                         self.app_settings.light_mode,
                         &self.app_settings.favorites,
+                        self.app_settings.eu_dates,
                         self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
                     );
 
@@ -2427,6 +2428,7 @@ impl eframe::App for HorizonApp {
                         self.app_settings.light_mode,
                         self.app_settings.music_volume,
                         self.app_settings.sfx_volume,
+                        self.app_settings.eu_dates,
                         profile_active,
                         &self.last_input,
                         &mut self.input,
@@ -2474,6 +2476,10 @@ impl eframe::App for HorizonApp {
                             crate::profile::ProfileAction::SetSfxVolume(v) => {
                                 self.app_settings.sfx_volume = v.clamp(0.0, 1.0);
                                 crate::ui_audio::set_sfx_volume(self.app_settings.sfx_volume);
+                                let _ = self.app_settings.save();
+                            }
+                            crate::profile::ProfileAction::SetEuDates(on) => {
+                                self.app_settings.eu_dates = on;
                                 let _ = self.app_settings.save();
                             }
                             crate::profile::ProfileAction::None => {}
@@ -2574,6 +2580,7 @@ impl eframe::App for HorizonApp {
                             self.app_settings.backdrop_theme,
                             self.app_settings.light_mode,
                             &self.app_settings.favorites,
+                            self.app_settings.eu_dates,
                             self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
                         );
                         match action {
@@ -2765,6 +2772,7 @@ impl eframe::App for HorizonApp {
                             self.app_settings.backdrop_theme,
                             self.app_settings.light_mode,
                             &self.app_settings.favorites,
+                            self.app_settings.eu_dates,
                             self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
                         );
                         if t < 1.05 {

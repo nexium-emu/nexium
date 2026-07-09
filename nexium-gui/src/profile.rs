@@ -84,6 +84,7 @@ pub enum ProfileAction {
     SetLightMode(bool),
     SetMusicVolume(f32),
     SetSfxVolume(f32),
+    SetEuDates(bool),
     QuickLaunch(String),
 }
 
@@ -166,6 +167,7 @@ pub fn profile_view(
     light_mode: bool,
     music_volume: f32,
     sfx_volume: f32,
+    eu_dates: bool,
     active: bool,
     last_input: &InputSnapshot,
     ib: &mut Option<crate::input::InputBackend>,
@@ -328,7 +330,7 @@ pub fn profile_view(
         ProfileTab::System,
     ];
     let tab_idx = TAB_ORDER.iter().position(|x| *x == state.tab).unwrap_or(0);
-    const N_SETTINGS: usize = 4;
+    const N_SETTINGS: usize = 5;
     let launch_enter = enter && state.focus_content;
 
     if tab_left {
@@ -415,6 +417,9 @@ pub fn profile_view(
                 action = ProfileAction::SetSfxVolume((sfx_volume - 0.05).max(0.0));
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             }
+        } else if state.row_selected == 4 && (enter || leave) {
+            action = ProfileAction::SetEuDates(!eu_dates);
+            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
         }
     } else {
         if up {
@@ -561,6 +566,7 @@ pub fn profile_view(
                 light_mode,
                 music_volume,
                 sfx_volume,
+                eu_dates,
                 &mut action,
                 scale_factor,
                 &scale_pos,
@@ -654,6 +660,7 @@ fn settings_page(
     light_mode: bool,
     music_volume: f32,
     sfx_volume: f32,
+    eu_dates: bool,
     action: &mut ProfileAction,
     scale_factor: f32,
     scale_pos: &impl Fn(egui::Pos2) -> egui::Pos2,
@@ -663,7 +670,7 @@ fn settings_page(
     let row_h = 68.0 * s;
     let row_gap = 12.0 * s;
     
-    let rows: [(&str, &str, String); 4] = [
+    let rows: [(&str, &str, String); 5] = [
         (
             "Backdrop Theme",
             "Background style behind the menus",
@@ -676,6 +683,11 @@ fn settings_page(
         ),
         ("Menu Music", "Background music volume in the carousel", "".to_string()),
         ("SFX Volume", "Sound effects volume for UI interactions", "".to_string()),
+        (
+            "Date & Time",
+            "Clock and date format",
+            if eu_dates { "European (24h, D M)".to_string() } else { "US (12h, M D)".to_string() },
+        ),
     ];
 
     for (idx, (title, subtitle, value)) in rows.iter().enumerate() {

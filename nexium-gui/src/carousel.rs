@@ -657,6 +657,7 @@ pub fn carousel_view(
     backdrop_theme: crate::app_settings::BackdropTheme,
     light_mode: bool,
     favorites: &[std::path::PathBuf],
+    eu_dates: bool,
     icon_reveal: Option<(usize, f32, Option<egui::TextureHandle>)>,
 ) -> CarouselAction {
     let mut action = CarouselAction::None;
@@ -1710,8 +1711,11 @@ pub fn carousel_view(
         }
 
         let now = chrono::Local::now();
-        let clock = now.format("%-I:%M %p").to_string();
-        let date = now.format("%a  %b %-d").to_string();
+        let (clock, date) = if eu_dates {
+            (now.format("%H:%M").to_string(), now.format("%a  %-d %b").to_string())
+        } else {
+            (now.format("%-I:%M %p").to_string(), now.format("%a  %b %-d").to_string())
+        };
         let cc = Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), top_alpha);
         let clock_font = FontId::proportional(20.0 * top_s * scale_factor);
         let date_font = FontId::proportional(13.0 * top_s * scale_factor);
