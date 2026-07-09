@@ -88,6 +88,8 @@ pub struct ShopState {
     a_held: bool,
     b_held: bool,
     confirm_install: bool,
+    confirm_sel: usize,
+    view_fade: f32,
 }
 
 impl ShopState {
@@ -116,6 +118,8 @@ impl ShopState {
             a_held: false,
             b_held: false,
             confirm_install: false,
+            confirm_sel: 1,
+            view_fade: 1.0,
         }
     }
 
@@ -317,7 +321,14 @@ impl ShopState {
         let detail_idx = if let View::Detail(i) = self.view { Some(i) } else { None };
         match detail_idx {
             None => self.grid(ui, &paint, content, pal, accent, nl, nr, nu, nd, a_edge),
-            Some(i) => self.detail(ui, &paint, content, pal, i, a_edge, ui.input(|x| x.smooth_scroll_delta.y), nu, nd),
+            Some(i) => self.detail(ui, &paint, content, pal, i, a_edge, ui.input(|x| x.smooth_scroll_delta.y), nu, nd, nl, nr),
+        }
+
+        // cross-view fade transition
+        self.view_fade += (1.0 - self.view_fade) * (dt * 9.0).min(1.0);
+        if self.view_fade < 0.995 {
+            let a = ((1.0 - self.view_fade) * 255.0) as u8;
+            paint.rect_filled(content, egui::Rounding::ZERO, Color32::from_rgba_unmultiplied(pal.bg.r(), pal.bg.g(), pal.bg.b(), a));
         }
 
         if b_edge {
@@ -329,6 +340,7 @@ impl ShopState {
                     View::Detail(_) => {
                         self.view = View::Grid;
                         self.desc_scroll = 0.0;
+                        self.view_fade = 0.0;
                         crate::ui_audio::play(crate::ui_audio::Sfx::Back);
                     }
                     View::Grid => {
@@ -418,6 +430,7 @@ impl ShopState {
         if let Some(ai) = open_detail {
             self.view = View::Detail(ai);
             self.desc_scroll = 0.0;
+            self.view_fade = 0.0;
             crate::ui_audio::play(crate::ui_audio::Sfx::Open);
         }
 
@@ -426,11 +439,12 @@ impl ShopState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn detail(&mut self, ui: &mut egui::Ui, paint: &egui::Painter, content: egui::Rect, pal: Pal, ai: usize, a_edge: bool, wheel: f32, nu: bool, nd: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn detail(&mut self, ui: &mut egui::Ui, paint: &egui::Painter, content: egui::Rect, pal: Pal, ai: usize, a_edge: bool, wheel: f32, nu: bool, nd: bool, nl: bool, nr: bool) {
         let app = self.apps[ai].clone();
         self.request_icon(ai);
         let pad = 40.0;
-        let col_split = content.min.x + content.width() * 0.60;
+        let col_split = content.min.x + content.width() * 0.68;
 
         // hero icon
         let icon_r = egui::Rect::from_min_size(egui::pos2(content.min.x + pad, content.min.y + pad), egui::Vec2::splat(150.0));
@@ -515,33 +529,68 @@ impl ShopState {
             self.need_rescan = true;
         }
 
-        // confirmation flow
+        // info card fills the right column under the button
+        let info = egui::Rect::from_min_max(egui::pos2(btn.min.x, btn.max.y + 40.0), egui::pos2(content.max.x - 40.0, content.max.y - 60.0));
+        paint.rect_filled(info, egui::Rounding::same(12.0), pal.panel);
+        paint.rect_stroke(info, egui::Rounding::same(12.0), egui::Stroke::new(1.0, pal.border));
+        let rows = [
+            ("Developer", app.author.clone()),
+            ("Version", app.version.clone()),
+            ("Download size", human_size(app.filesize)),
+            ("License", if app.license.is_empty() { "—".into() } else { app.license.clone() }),
+            ("Updated", if app.updated.is_empty() { "—".into() } else { app.updated.clone() }),
+        ];
+        for (ri, (k, v)) in rows.iter().enumerate() {
+            let ry = info.min.y + 22.0 + ri as f32 * 40.0;
+            paint.text(egui::pos2(info.min.x + 18.0, ry), egui::Align2::LEFT_CENTER, *k, egui::FontId::proportional(14.0), pal.muted);
+            paint.text(egui::pos2(info.max.x - 18.0, ry), egui::Align2::RIGHT_CENTER, v, egui::FontId::proportional(14.0), pal.text);
+            if ri + 1 < rows.len() {
+                paint.line_segment([egui::pos2(info.min.x + 14.0, ry + 20.0), egui::pos2(info.max.x - 14.0, ry + 20.0)], egui::Stroke::new(1.0, pal.panel2));
+            }
+        }
+
+        // confirmation flow — matches the emulator's confirm modal (dim + panel + two nav buttons)
         if self.confirm_install {
-            paint.rect_filled(content, egui::Rounding::ZERO, Color32::from_black_alpha(150));
-            let dlg = egui::Rect::from_center_size(content.center(), egui::Vec2::new(440.0, 190.0));
-            paint.rect_filled(dlg, egui::Rounding::same(16.0), pal.panel);
-            paint.rect_stroke(dlg, egui::Rounding::same(16.0), egui::Stroke::new(1.5, pal.border));
-            paint.text(egui::pos2(dlg.center().x, dlg.min.y + 44.0), egui::Align2::CENTER_CENTER, "Install this game?", egui::FontId::proportional(21.0), pal.text);
-            paint.text(egui::pos2(dlg.center().x, dlg.min.y + 78.0), egui::Align2::CENTER_CENTER, &app.title, egui::FontId::proportional(15.0), pal.muted);
-            let yes = egui::Rect::from_min_size(egui::pos2(dlg.center().x + 12.0, dlg.max.y - 62.0), egui::Vec2::new(180.0, 44.0));
-            let no = egui::Rect::from_min_size(egui::pos2(dlg.center().x - 192.0, dlg.max.y - 62.0), egui::Vec2::new(180.0, 44.0));
-            let yes_resp = ui.allocate_rect(yes, egui::Sense::click());
+            if nl && self.confirm_sel > 0 { self.confirm_sel = 0; crate::ui_audio::play_move(); }
+            if nr && self.confirm_sel < 1 { self.confirm_sel = 1; crate::ui_audio::play_move(); }
+            paint.rect_filled(content, egui::Rounding::ZERO, Color32::from_black_alpha(160));
+            let dlg = egui::Rect::from_center_size(content.center(), egui::Vec2::new(460.0, 210.0));
+            paint.rect_filled(dlg.translate(egui::Vec2::new(0.0, 10.0)), egui::Rounding::same(18.0), Color32::from_black_alpha(120));
+            paint.rect_filled(dlg, egui::Rounding::same(18.0), pal.panel);
+            paint.rect_stroke(dlg, egui::Rounding::same(18.0), egui::Stroke::new(1.5, pal.border));
+            paint.text(egui::pos2(dlg.center().x, dlg.min.y + 46.0), egui::Align2::CENTER_CENTER, "Install this game?", egui::FontId::proportional(22.0), pal.text);
+            paint.text(egui::pos2(dlg.center().x, dlg.min.y + 80.0), egui::Align2::CENTER_CENTER, &app.title, egui::FontId::proportional(15.0), pal.muted);
+            let bw = 190.0;
+            let no = egui::Rect::from_min_size(egui::pos2(dlg.center().x - bw - 10.0, dlg.max.y - 66.0), egui::Vec2::new(bw, 46.0));
+            let yes = egui::Rect::from_min_size(egui::pos2(dlg.center().x + 10.0, dlg.max.y - 66.0), egui::Vec2::new(bw, 46.0));
             let no_resp = ui.allocate_rect(no, egui::Sense::click());
-            paint.rect_filled(yes, egui::Rounding::same(10.0), if yes_resp.hovered() { BLUE_HI } else { BLUE });
-            paint.rect_filled(no, egui::Rounding::same(10.0), pal.panel2);
-            paint.text(yes.center(), egui::Align2::CENTER_CENTER, "Install", egui::FontId::proportional(17.0), Color32::WHITE);
-            paint.text(no.center(), egui::Align2::CENTER_CENTER, "Cancel", egui::FontId::proportional(17.0), pal.text);
-            paint.text(egui::pos2(content.center().x, dlg.max.y + 22.0), egui::Align2::CENTER_CENTER, "[A] Install    [B] Cancel", egui::FontId::proportional(13.0), pal.muted);
-            if a_edge || yes_resp.clicked() {
+            let yes_resp = ui.allocate_rect(yes, egui::Sense::click());
+            if no_resp.hovered() { self.confirm_sel = 0; }
+            if yes_resp.hovered() { self.confirm_sel = 1; }
+            for (bi, (rect, txt, base)) in [(no, "Cancel", pal.panel2), (yes, "Install", BLUE)].iter().enumerate() {
+                let seld = self.confirm_sel == bi;
+                paint.rect_filled(*rect, egui::Rounding::same(11.0), if seld && bi == 1 { BLUE_HI } else { *base });
+                if seld {
+                    paint.rect_stroke(rect.expand(3.0), egui::Rounding::same(14.0), egui::Stroke::new(2.5, BLUE_HI));
+                }
+                let tc = if bi == 1 { Color32::WHITE } else { pal.text };
+                paint.text(rect.center(), egui::Align2::CENTER_CENTER, *txt, egui::FontId::proportional(17.0), tc);
+            }
+            paint.text(egui::pos2(dlg.center().x, dlg.max.y + 22.0), egui::Align2::CENTER_CENTER, "[←/→] Choose    [A] Confirm    [B] Cancel", egui::FontId::proportional(13.0), pal.muted);
+            let confirm = a_edge || no_resp.clicked() || yes_resp.clicked();
+            if confirm {
+                let install = if no_resp.clicked() { false } else if yes_resp.clicked() { true } else { self.confirm_sel == 1 };
                 self.confirm_install = false;
-                self.start_install(ai);
-                crate::ui_audio::play(crate::ui_audio::Sfx::WhistleOk);
-            } else if no_resp.clicked() {
-                self.confirm_install = false;
-                crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+                if install {
+                    self.start_install(ai);
+                    crate::ui_audio::play(crate::ui_audio::Sfx::WhistleOk);
+                } else {
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+                }
             }
         } else if (btn_resp.clicked() || a_edge) && idle {
             self.confirm_install = true;
+            self.confirm_sel = 1;
             crate::ui_audio::play(crate::ui_audio::Sfx::Open);
         }
 
