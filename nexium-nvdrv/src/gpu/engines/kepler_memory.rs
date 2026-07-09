@@ -50,6 +50,7 @@ impl KeplerMemory {
         method: u32,
         arg: u32,
         mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
         match method {
@@ -65,7 +66,7 @@ impl KeplerMemory {
             M_DST_ORIGIN_BYTES_X => self.dst_origin_x = arg,
             M_DST_ORIGIN_SAMPLES_Y => self.dst_origin_y = arg,
             M_LAUNCH_DMA => self.launch(arg),
-            M_LOAD_INLINE_DATA => self.load_inline_data(arg, mappings, mem_write),
+            M_LOAD_INLINE_DATA => self.load_inline_data(arg, mappings, mem_read, mem_write),
             _ => {
                 log::trace!(
                     "KeplerMemory: unhandled method {:#x} arg={:#x}",
@@ -90,21 +91,30 @@ impl KeplerMemory {
         &mut self,
         data: u32,
         mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
         let bytes = data.to_le_bytes();
         let off = self.write_offset;
         if off + 4 <= self.inline_buf.len() {
             self.inline_buf[off..off + 4].copy_from_slice(&bytes);
+        } else if off < self.inline_buf.len() {
+            let n = self.inline_buf.len() - off;
+            self.inline_buf[off..].copy_from_slice(&bytes[..n]);
         }
         self.write_offset += 4;
         if self.write_offset >= self.copy_size && self.copy_size > 0 {
-            self.flush(mappings, mem_write);
+            self.flush(mappings, mem_read, mem_write);
             self.copy_size = 0;
         }
     }
 
-    fn flush(&mut self, mappings: &GpuMappings, mem_write: &dyn Fn(u64, &[u8]) -> bool) {
+    fn flush(
+        &mut self,
+        mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
         let dst_gpu = ((self.offset_out_upper as u64) << 32) | self.offset_out_lower as u64;
         let Some((dst_cpu, dst_limit)) = mappings.cpu_range_for(dst_gpu) else {
             log::trace!("KeplerMemory::flush: dst gpu_va {:#x} not mapped", dst_gpu);
@@ -164,21 +174,29 @@ impl KeplerMemory {
                 } else {
                     line_count
                 };
-                let tiled = super::maxwell_dma::swizzle_block_linear(
+                let tiled_size = super::maxwell_dma::tiled_size_bytes(
+                    dst_width_bytes,
+                    dst_height,
+                    block_height_log2,
+                );
+                let mut tiled = vec![0u8; tiled_size];
+                let n = tiled_size.min(dst_limit);
+                mem_read(dst_cpu, &mut tiled[..n]);
+                super::maxwell_dma::swizzle_block_linear_into(
+                    &mut tiled,
                     &self.inline_buf,
                     line_length,
                     line_count,
                     line_length,
                     dst_width_bytes,
-                    dst_height,
                     block_height_log2,
                     self.dst_origin_x as usize,
                     self.dst_origin_y as usize,
                 );
-                if tiled.len() > dst_limit {
+                if tiled_size > dst_limit {
                     log::warn!(
                         "KeplerMemory::flush CLAMP: tiled={} > dst_limit={} (dst_cpu={:#x} dst_w={} dst_h={} line_len={} line_count={}) — truncating to avoid heap overrun",
-                        tiled.len(),
+                        tiled_size,
                         dst_limit,
                         dst_cpu,
                         self.dst_width,
@@ -187,7 +205,6 @@ impl KeplerMemory {
                         line_count,
                     );
                 }
-                let n = tiled.len().min(dst_limit);
                 mem_write(dst_cpu, &tiled[..n]);
             }
             _ => unreachable!(),

@@ -551,7 +551,7 @@ impl Pusher {
             }
         } else if bound_class == KEPLER_MEMORY_CLASS {
             self.flush_vk(mappings, mem_read);
-            kepler_memory.dispatch_method(method, arg, mappings, mem_write);
+            kepler_memory.dispatch_method(method, arg, mappings, mem_read, mem_write);
         } else if bound_class == KEPLER_COMPUTE_CLASS {
             self.flush_vk(mappings, mem_read);
             let is_last = self.state.method_count <= 1;

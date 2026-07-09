@@ -277,8 +277,13 @@ impl MaxwellDma {
         let line_length_src = line_length_units * src_bytes_per_group;
         let line_length_dst = line_length_units * dst_bytes_per_group;
 
-        let bytes_per_element = if remap_enable {
+        let src_bytes_per_element = if remap_enable {
             component_size.max(1) * num_src_components.max(1)
+        } else {
+            1
+        };
+        let dst_bytes_per_element = if remap_enable {
+            component_size.max(1) * num_dst_components.max(1)
         } else {
             1
         };
@@ -334,12 +339,12 @@ impl MaxwellDma {
                     num_src_components,
                     num_dst_components,
                     [dst_x_sel, dst_y_sel, dst_z_sel, dst_w_sel],
-                    bytes_per_element,
+                    dst_bytes_per_element,
                     mem_read,
                     mem_write,
                 );
                 let dst_w = if self.dst_width != 0 {
-                    (self.dst_width as usize) * bytes_per_element.max(1)
+                    (self.dst_width as usize) * dst_bytes_per_element.max(1)
                 } else {
                     line_length_dst
                 };
@@ -355,18 +360,21 @@ impl MaxwellDma {
                 );
             }
             (LAYOUT_BLOCK_LINEAR, LAYOUT_PITCH) => {
-                nexium_gpu::pitch_oracle::record_pitch_dst(dst_gpu);
+                let dst_pitch = self.pitch_out.max(line_length_src as u32) as usize;
+                nexium_gpu::pitch_oracle::record_pitch_dst(
+                    dst_gpu,
+                    (dst_pitch * line_count) as u64,
+                );
                 self.blit_block_to_pitch(
                     src_cpu,
                     dst_cpu,
                     dst_limit,
                     line_length_src,
                     line_count,
-                    bytes_per_element,
+                    src_bytes_per_element,
                     mem_read,
                     mem_write,
                 );
-                let dst_pitch = self.pitch_out.max(line_length_src as u32) as usize;
                 nexium_gpu::tex_invalidate::bump_region(dst_gpu, (dst_pitch * line_count) as u64);
             }
             (LAYOUT_PITCH, LAYOUT_PITCH) => {
@@ -391,7 +399,8 @@ impl MaxwellDma {
                     line_length_src,
                     line_length_dst,
                     line_count,
-                    bytes_per_element,
+                    src_bytes_per_element,
+                    dst_bytes_per_element,
                     mem_read,
                     mem_write,
                 );
@@ -550,41 +559,40 @@ impl MaxwellDma {
         } else {
             src_pitch
         };
-        let tiled = swizzle_block_linear(
+        let tiled_size = tiled_size_bytes(dst_width_bytes, dst_height, block_height_log2);
+        let mut tiled = vec![0u8; tiled_size];
+        let n = tiled_size.min(dst_limit);
+        mem_read(dst_cpu, &mut tiled[..n]);
+        swizzle_block_linear_into(
+            &mut tiled,
             &post_remap,
             line_length_dst,
             line_count,
             post_remap_pitch,
             dst_width_bytes,
-            dst_height,
             block_height_log2,
-            self.dst_origin_x as usize,
+            (self.dst_origin_x as usize) * bytes_per_element.max(1),
             self.dst_origin_y as usize,
         );
-        if tiled.len() > dst_limit {
-            if self.clamp_log_count < 16 {
-                self.clamp_log_count += 1;
-                log::warn!(
-                    "MaxwellDma::blit_pitch_to_block stale‑geometry → linear+pitch_dst: full={} > dst_limit={} \
-                     dst_gpu={:#x} dst_cpu={:#x} stale_w={} stale_h={} stale_bh={} line_count={} line_len_dst={} | {}",
-                    tiled.len(),
-                    dst_limit,
-                    dst_gpu,
-                    dst_cpu,
-                    self.dst_width,
-                    self.dst_height,
-                    block_height_log2,
-                    line_count,
-                    line_length_dst,
-                    mappings.describe_around(dst_gpu),
-                );
-            }
-            let n = post_remap.len().min(dst_limit);
-            mem_write(dst_cpu, &post_remap[..n]);
-            nexium_gpu::pitch_oracle::record_pitch_dst(dst_gpu);
-        } else {
-            mem_write(dst_cpu, &tiled);
+        if tiled_size > dst_limit && self.clamp_log_count < 16 {
+            self.clamp_log_count += 1;
+            log::warn!(
+                "MaxwellDma::blit_pitch_to_block clamp: tiled={} > dst_limit={} \
+                 dst_gpu={:#x} dst_cpu={:#x} dst_w={} dst_h={} bh={} line_count={} line_len_dst={} | {}",
+                tiled_size,
+                dst_limit,
+                dst_gpu,
+                dst_cpu,
+                self.dst_width,
+                self.dst_height,
+                block_height_log2,
+                line_count,
+                line_length_dst,
+                mappings.describe_around(dst_gpu),
+            );
         }
+        mem_write(dst_cpu, &tiled[..n]);
+        nexium_gpu::pitch_oracle::clear_pitch_range(dst_gpu, n as u64);
         self.last_tiled_dst_bh_log2 = block_height_log2;
         self.last_tiled_dst_stride = dst_width_bytes as u32;
         self.last_tiled_dst_height = dst_height as u32;
@@ -600,13 +608,14 @@ impl MaxwellDma {
         line_length_src: usize,
         line_length_dst: usize,
         line_count: usize,
-        bytes_per_element: usize,
+        src_bytes_per_element: usize,
+        dst_bytes_per_element: usize,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
         let src_bh = ((self.src_block_size >> 4) & 0xF) as u32;
         let src_width_bytes = if self.src_width != 0 {
-            (self.src_width as usize) * bytes_per_element.max(1)
+            (self.src_width as usize) * src_bytes_per_element.max(1)
         } else {
             line_length_src
         };
@@ -627,13 +636,13 @@ impl MaxwellDma {
             src_width_bytes,
             src_height,
             src_bh,
-            self.src_origin_x as usize,
+            (self.src_origin_x as usize) * src_bytes_per_element.max(1),
             self.src_origin_y as usize,
         );
 
         let dst_bh = ((self.dst_block_size >> 4) & 0xF) as u32;
         let dst_width_bytes = if self.dst_width != 0 {
-            (self.dst_width as usize) * bytes_per_element.max(1)
+            (self.dst_width as usize) * dst_bytes_per_element.max(1)
         } else {
             line_length_dst
         };
@@ -642,23 +651,24 @@ impl MaxwellDma {
         } else {
             line_count
         };
-        let tiled = swizzle_block_linear(
+        let tiled_size = tiled_size_bytes(dst_width_bytes, dst_height, dst_bh);
+        let mut tiled = vec![0u8; tiled_size];
+        let n = tiled_size.min(dst_limit);
+        mem_read(dst_cpu, &mut tiled[..n]);
+        swizzle_block_linear_into(
+            &mut tiled,
             &linear,
             line_length_dst,
             line_count,
             inter_pitch,
             dst_width_bytes,
-            dst_height,
             dst_bh,
-            self.dst_origin_x as usize,
+            (self.dst_origin_x as usize) * dst_bytes_per_element.max(1),
             self.dst_origin_y as usize,
         );
-        let n = tiled.len().min(dst_limit);
         mem_write(dst_cpu, &tiled[..n]);
-        nexium_gpu::tex_invalidate::bump_region(
-            dst_gpu,
-            tiled_size_bytes(dst_width_bytes, dst_height, dst_bh) as u64,
-        );
+        nexium_gpu::pitch_oracle::clear_pitch_range(dst_gpu, n as u64);
+        nexium_gpu::tex_invalidate::bump_region(dst_gpu, tiled_size as u64);
     }
 
     fn blit_block_to_pitch(
@@ -733,7 +743,7 @@ impl MaxwellDma {
             src_width_bytes,
             src_height,
             block_height_log2,
-            self.src_origin_x as usize,
+            (self.src_origin_x as usize) * bytes_per_element.max(1),
             self.src_origin_y as usize,
         );
         for y in 0..line_count {
@@ -776,6 +786,31 @@ pub(crate) fn swizzle_block_linear(
 ) -> Vec<u8> {
     let dst_size = tiled_size_bytes(dst_width_bytes, dst_height, block_height_log2);
     let mut dst = vec![0u8; dst_size];
+    swizzle_block_linear_into(
+        &mut dst,
+        src_linear,
+        copy_width_bytes,
+        copy_height,
+        src_pitch,
+        dst_width_bytes,
+        block_height_log2,
+        origin_x,
+        origin_y,
+    );
+    dst
+}
+
+pub(crate) fn swizzle_block_linear_into(
+    dst: &mut [u8],
+    src_linear: &[u8],
+    copy_width_bytes: usize,
+    copy_height: usize,
+    src_pitch: usize,
+    dst_width_bytes: usize,
+    block_height_log2: u32,
+    origin_x: usize,
+    origin_y: usize,
+) {
     let block_height = 1usize << block_height_log2;
     let rows_per_block = block_height * GOB_H;
     let gobs_per_row = (dst_width_bytes + GOB_W - 1) / GOB_W;
@@ -801,7 +836,6 @@ pub(crate) fn swizzle_block_linear(
             }
         }
     }
-    dst
 }
 
 fn unswizzle_block_linear_bytes(
