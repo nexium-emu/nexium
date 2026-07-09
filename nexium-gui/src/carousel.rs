@@ -108,6 +108,54 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
+fn network_kind() -> u8 {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 4 {
+        return CACHE.load(Ordering::Relaxed);
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let kind = detect_network_kind();
+    CACHE.store(kind, Ordering::Relaxed);
+    kind
+}
+
+#[cfg(target_os = "linux")]
+fn detect_network_kind() -> u8 {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return 0;
+    };
+    let mut result = 0u8;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name == "lo" || name.starts_with("docker") || name.starts_with("veth") || name.starts_with("br-") {
+            continue;
+        }
+        let p = e.path();
+        let oper = std::fs::read_to_string(p.join("operstate")).unwrap_or_default();
+        let carrier = std::fs::read_to_string(p.join("carrier")).unwrap_or_default();
+        if oper.trim() != "up" && carrier.trim() != "1" {
+            continue;
+        }
+        if p.join("wireless").exists() || name.starts_with("wl") {
+            return 2;
+        }
+        result = 1;
+    }
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_network_kind() -> u8 {
+    0
+}
+
 pub fn shadowed_text(
     painter: &egui::Painter,
     pos: egui::Pos2,
@@ -1594,9 +1642,50 @@ pub fn carousel_view(
 
         let now = chrono::Local::now();
         let clock = now.format("%-I:%M %p").to_string();
-        let clock_pos = egui::pos2(bg_rect.max.x - 34.0 * top_s, bg_rect.min.y + 34.0 * top_s);
+        let date = now.format("%a  %b %-d").to_string();
+        let cc = Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), top_alpha);
+        let clock_font = FontId::proportional(20.0 * top_s * scale_factor);
+        let date_font = FontId::proportional(13.0 * top_s * scale_factor);
+
+        let net = network_kind();
+        let net_x = bg_rect.max.x - 30.0 * top_s;
+        let clock_right = if net > 0 { net_x - 34.0 * top_s } else { bg_rect.max.x - 30.0 * top_s };
+        let clock_pos = egui::pos2(clock_right, bg_rect.min.y + 34.0 * top_s);
         let scaled_clock = screen_center + (clock_pos - screen_center) * scale_factor;
-        shadowed_text(&painter, scaled_clock, egui::Align2::RIGHT_CENTER, &clock, FontId::proportional(20.0 * top_s * scale_factor), Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), top_alpha), true);
+        shadowed_text(&painter, scaled_clock, egui::Align2::RIGHT_CENTER, &clock, clock_font.clone(), cc, true);
+
+        let clock_w = ui.fonts(|f| f.layout_no_wrap(clock.clone(), clock_font.clone(), cc).size().x) / scale_factor;
+        let date_pos = egui::pos2(clock_right - clock_w - 14.0 * top_s, bg_rect.min.y + 34.0 * top_s);
+        let scaled_date = screen_center + (date_pos - screen_center) * scale_factor;
+        shadowed_text(&painter, scaled_date, egui::Align2::RIGHT_CENTER, &date, date_font, Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), (top_alpha as f32 * 0.82) as u8), false);
+
+        if net > 0 {
+            let nc = egui::pos2(net_x, bg_rect.min.y + 34.0 * top_s);
+            let s = |p: egui::Pos2| screen_center + (p - screen_center) * scale_factor;
+            let u = 8.0 * top_s;
+            if net == 2 {
+                let base = s(nc + Vec2::new(0.0, u * 0.7));
+                painter.circle_filled(base, 1.7 * scale_factor, cc);
+                for (k, rr) in [0.45f32, 0.8, 1.15].iter().enumerate() {
+                    let rad = u * rr * scale_factor;
+                    let arc: Vec<egui::Pos2> = (0..=12)
+                        .map(|i| {
+                            let a = std::f32::consts::PI * (1.25 + 0.5 * (i as f32 / 12.0));
+                            base + Vec2::new(a.cos(), a.sin()) * rad
+                        })
+                        .collect();
+                    let al = (top_alpha as f32 * (1.0 - k as f32 * 0.18)) as u8;
+                    painter.add(egui::Shape::line(arc, Stroke::new(1.6 * scale_factor, Color32::from_rgba_unmultiplied(cc.r(), cc.g(), cc.b(), al))));
+                }
+            } else {
+                let plug = egui::Rect::from_center_size(s(nc), Vec2::new(u * 2.0 * scale_factor, u * 1.3 * scale_factor));
+                painter.rect_stroke(plug, Rounding::same(2.0 * scale_factor), Stroke::new(1.6 * scale_factor, cc));
+                let st = Stroke::new(1.6 * scale_factor, cc);
+                painter.line_segment([s(nc + Vec2::new(-u * 0.4, -u * 0.65)), s(nc + Vec2::new(-u * 0.4, -u * 1.15))], st);
+                painter.line_segment([s(nc + Vec2::new(u * 0.4, -u * 0.65)), s(nc + Vec2::new(u * 0.4, -u * 1.15))], st);
+                painter.line_segment([s(nc + Vec2::new(0.0, u * 0.65)), s(nc + Vec2::new(0.0, u * 1.2))], st);
+            }
+        }
 
         if last_input.connected {
             let s = top_s * scale_factor;
