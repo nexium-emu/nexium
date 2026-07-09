@@ -8,6 +8,7 @@ mod carousel;
 mod controller_art;
 mod controller_config;
 mod debugger;
+mod homebrew;
 mod input;
 mod library;
 mod performance;
