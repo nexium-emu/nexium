@@ -686,7 +686,7 @@ fn settings_page(
         (
             "Date & Time",
             "Clock and date format",
-            if eu_dates { "European (24h, D M)".to_string() } else { "US (12h, M D)".to_string() },
+            if eu_dates { "EU (24h)".to_string() } else { "US (12h)".to_string() },
         ),
     ];
 
@@ -710,6 +710,10 @@ fn settings_page(
                 }
                 1 => {
                     *action = ProfileAction::SetLightMode(!light_mode);
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                }
+                4 => {
+                    *action = ProfileAction::SetEuDates(!eu_dates);
                     crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                 }
                 _ => {}
@@ -738,7 +742,7 @@ fn settings_page(
 
         let arrow_col = if focused { accent } else { pal.muted };
 
-        if idx >= 2 {
+        if idx == 2 || idx == 3 {
             let val = if idx == 2 { music_volume } else { sfx_volume };
             
             // Slider layout dimensions
