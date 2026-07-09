@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod bundle_cache;
 pub mod commands;
 pub mod descriptor;
 pub mod deswizzle;

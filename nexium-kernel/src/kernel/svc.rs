@@ -4463,11 +4463,23 @@ fn igbp_handle_transact(
                                 read_rect,
                             )
                         {
-                            let (present_w, present_h, mut bytes) =
-                                prepare_vulkan_present_frame(
+                            let (present_w, present_h, bytes) = if legacy_present_enabled() {
+                                let (w, h, mut b) = prepare_vulkan_present_frame(
                                     bytes, read_w, read_h, transform, flip_y,
                                 );
-                            make_present_opaque(&mut bytes);
+                                make_present_opaque(&mut b);
+                                (w, h, b)
+                            } else {
+                                let (w, h, mut b) = if read_rect
+                                    .map_or(false, |r| r[2] == read_w && r[3] == read_h)
+                                {
+                                    (read_w, read_h, bytes)
+                                } else {
+                                    maybe_crop_present_subwindow(bytes, read_w, read_h)
+                                };
+                                apply_present_transform(&mut b, w, h, transform);
+                                (w, h, b)
+                            };
                             dump_present_frame(&bytes, present_w, present_h);
                             if std::env::var_os("NEXIUM_FRAME_PRESENT_CACHE").is_some() {
                                 nexium_common::frame_present::set_last_presented(
@@ -5176,6 +5188,11 @@ fn make_present_opaque(pixels: &mut [u8]) {
     for px in pixels.chunks_exact_mut(4) {
         px[3] = 0xFF;
     }
+}
+
+fn legacy_present_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_LEGACY_PRESENT").is_some())
 }
 
 fn outside_crop_has_visible(

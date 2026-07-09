@@ -26,10 +26,25 @@ const MUTED: Color32 = Color32::from_rgb(0x70, 0x70, 0x80);
 const GREEN: Color32 = Color32::from_rgb(0x3C, 0xD4, 0x5C);
 const AMBER: Color32 = Color32::from_rgb(0xF5, 0xA6, 0x23);
 
+struct NativeGameTexture {
+    texture: eframe::wgpu::Texture,
+    id: egui::TextureId,
+    width: u32,
+    height: u32,
+    filter: FilterMode,
+}
+
+fn legacy_gui_upload() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_LEGACY_GUI_UPLOAD").is_some())
+}
+
 pub struct HorizonApp {
     nro_path: String,
     emulation_handle: Option<EmulationHandle>,
     game_texture: Option<egui::TextureHandle>,
+    wgpu_state: Option<eframe::egui_wgpu::RenderState>,
+    game_texture_native: Option<NativeGameTexture>,
     show_settings: bool,
     settings_tab: SettingsTab,
     input: Option<InputBackend>,
@@ -96,6 +111,8 @@ impl HorizonApp {
             nro_path: nro_path.clone(),
             emulation_handle: None,
             game_texture: None,
+            wgpu_state: cc.wgpu_render_state.clone(),
+            game_texture_native: None,
             show_settings: false,
             settings_tab: SettingsTab::General,
             input,
@@ -322,6 +339,10 @@ impl HorizonApp {
                 frame.height,
                 frame.pixels.len()
             );
+            if self.wgpu_state.is_some() && !legacy_gui_upload() {
+                self.upload_frame_native(&frame);
+                return;
+            }
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
                 &frame.pixels,
@@ -333,6 +354,92 @@ impl HorizonApp {
                     self.carousel.boot_stage = crate::carousel::BootStage::None;
                 }
             }
+        }
+    }
+
+    fn upload_frame_native(&mut self, frame: &crate::boot::Frame) {
+        let Some(rs) = self.wgpu_state.clone() else {
+            return;
+        };
+        let need = frame.width as usize * frame.height as usize * 4;
+        if frame.pixels.len() < need {
+            return;
+        }
+        let filter = self.app_settings.filter;
+        let recreate = self.game_texture_native.as_ref().map_or(true, |t| {
+            t.width != frame.width || t.height != frame.height || t.filter != filter
+        });
+        if recreate {
+            self.free_native_texture();
+            let texture = rs.device.create_texture(&eframe::wgpu::TextureDescriptor {
+                label: Some("nexium_game_frame"),
+                size: eframe::wgpu::Extent3d {
+                    width: frame.width,
+                    height: frame.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: eframe::wgpu::TextureDimension::D2,
+                format: eframe::wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING
+                    | eframe::wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let wgpu_filter = match filter {
+                FilterMode::Linear => eframe::wgpu::FilterMode::Linear,
+                FilterMode::Nearest => eframe::wgpu::FilterMode::Nearest,
+            };
+            let id = rs
+                .renderer
+                .write()
+                .register_native_texture(&rs.device, &view, wgpu_filter);
+            self.game_texture_native = Some(NativeGameTexture {
+                texture,
+                id,
+                width: frame.width,
+                height: frame.height,
+                filter,
+            });
+        }
+        let Some(t) = self.game_texture_native.as_ref() else {
+            return;
+        };
+        rs.queue.write_texture(
+            eframe::wgpu::ImageCopyTexture {
+                texture: &t.texture,
+                mip_level: 0,
+                origin: eframe::wgpu::Origin3d::ZERO,
+                aspect: eframe::wgpu::TextureAspect::All,
+            },
+            &frame.pixels[..need],
+            eframe::wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(frame.width * 4),
+                rows_per_image: Some(frame.height),
+            },
+            eframe::wgpu::Extent3d {
+                width: frame.width,
+                height: frame.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    fn free_native_texture(&mut self) {
+        if let Some(t) = self.game_texture_native.take() {
+            if let Some(rs) = &self.wgpu_state {
+                rs.renderer.write().free_texture(&t.id);
+            }
+        }
+    }
+
+    fn game_display(&self) -> Option<(egui::TextureId, Vec2)> {
+        if let Some(t) = &self.game_texture_native {
+            Some((t.id, Vec2::new(t.width as f32, t.height as f32)))
+        } else {
+            self.game_texture.as_ref().map(|t| (t.id(), t.size_vec2()))
         }
     }
 
@@ -352,6 +459,7 @@ impl HorizonApp {
             Ok(h) => {
                 self.emulation_handle = Some(h);
                 self.game_texture = None;
+                self.free_native_texture();
                 self.pause_anim = None;
                 self.pill_fade = None;
                 let path = std::path::PathBuf::from(&self.nro_path);
@@ -377,7 +485,7 @@ impl HorizonApp {
             h.stop();
             self.pause_anim = None;
             self.resume_anim = None;
-            let has_frame = self.game_texture.is_some();
+            let has_frame = self.game_texture.is_some() || self.game_texture_native.is_some();
             if carousel && self.playing_path.is_some() {
                 if !was_paused && has_frame {
                     self.stop_anim = Some(std::time::Instant::now());
@@ -466,11 +574,11 @@ fn parse_u64_value(s: &str) -> Option<u64> {
     }
 }
 
-fn draw_dissolve(p: &egui::Painter, rect: egui::Rect, tex: &egui::TextureHandle, t: f32) {
+fn draw_dissolve(p: &egui::Painter, rect: egui::Rect, tex_id: egui::TextureId, t: f32) {
     let (cols, rows) = (44usize, 26usize);
     let cw = rect.width() / cols as f32;
     let ch = rect.height() / rows as f32;
-    let mut mesh = egui::Mesh::with_texture(tex.id());
+    let mut mesh = egui::Mesh::with_texture(tex_id);
     for j in 0..rows {
         for i in 0..cols {
             let local = (t - cell_hash(i, j) * 0.55) / 0.35;
@@ -1231,9 +1339,21 @@ impl eframe::App for HorizonApp {
                                 .as_ref()
                                 .map(|h| h.stats.lock().clone())
                                 .unwrap_or_default();
+                            let building = nexium_common::shader_progress::in_flight();
+                            let building_prefix = if building > 0 {
+                                format!("Building Shader(s): {}  ·  ", building)
+                            } else if nexium_common::shader_progress::recently_active() {
+                                format!(
+                                    "Built {} Shader(s)  ·  ",
+                                    nexium_common::shader_progress::burst_built()
+                                )
+                            } else {
+                                String::new()
+                            };
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
+                                    "{}Frame {:.1}ms  ·  SVCs {}  ·  Cycles {}",
+                                    building_prefix,
                                     self.performance.get_frame_time(),
                                     stats.svc_count,
                                     stats.cycle_count,
@@ -1547,7 +1667,6 @@ impl eframe::App for HorizonApp {
                 } else if let Some(start) = self.stop_fade {
                     let t = start.elapsed().as_secs_f32() / 0.9;
                     let panel = ui.max_rect();
-                    let tex = if t < 1.05 { self.game_texture.clone() } else { None };
                     if self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel {
                         let scale_f = 0.92 + 0.08 * t.min(1.0);
                         let profile_tex = self.profile_texture.as_ref().map(|t| t.id());
@@ -1570,30 +1689,38 @@ impl eframe::App for HorizonApp {
                             self.app_settings.light_mode,
                             &self.app_settings.favorites,
                         );
+                        if t < 1.05 {
+                            if let Some(tex) = self.game_texture.clone() {
+                                let rect = self.game_draw_rect(panel, tex.size_vec2());
+                                let p = ctx.layer_painter(egui::LayerId::new(
+                                    egui::Order::Foreground,
+                                    egui::Id::new("stop_dissolve"),
+                                ));
+                                draw_zoom_fade_out(&p, rect, &tex, t);
+                            }
+                        }
                     } else {
+                        let display = self.game_display();
                         self.library_view(ui, ctx);
-                    }
-                    if let Some(tex) = tex {
-                        let rect = self.game_draw_rect(panel, tex.size_vec2());
-                        let p = ctx.layer_painter(egui::LayerId::new(
-                            egui::Order::Foreground,
-                            egui::Id::new("stop_dissolve"),
-                        ));
-                        if self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel {
-                            draw_zoom_fade_out(&p, rect, &tex, t);
-                        } else {
-                            draw_dissolve(&p, rect, &tex, t);
+                        if let Some((tid, tsz)) = display {
+                            let rect = self.game_draw_rect(panel, tsz);
+                            let p = ctx.layer_painter(egui::LayerId::new(
+                                egui::Order::Foreground,
+                                egui::Id::new("stop_dissolve"),
+                            ));
+                            draw_dissolve(&p, rect, tid, t);
                         }
                     }
                     ctx.request_repaint();
                     if t >= 1.05 {
                         self.stop_fade = None;
                         self.game_texture = None;
+                        self.free_native_texture();
                     }
-                } else if let Some(tex) = &self.game_texture {
-                    let draw_size = self.game_draw_rect(ui.max_rect(), tex.size_vec2()).size();
+                } else if let Some((tid, tsz)) = self.game_display() {
+                    let draw_size = self.game_draw_rect(ui.max_rect(), tsz).size();
                     ui.centered_and_justified(|ui| {
-                        ui.image((tex.id(), draw_size));
+                        ui.image((tid, draw_size));
                     });
                 } else {
                     self.library_view(ui, ctx);

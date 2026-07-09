@@ -1477,6 +1477,26 @@ impl Renderer {
         cpu_addr: u64,
         copy_rect: Option<[u32; 4]>,
     ) -> Option<(u32, u32, Vec<u8>, Option<bool>)> {
+        let (w, h, raw, format, flip_y) =
+            self.readback_target_pipelined_raw(nvmap_id, width, height, gpu_va, cpu_addr, copy_rect)?;
+        if legacy_present_enabled() {
+            let out = readback_to_rgba8(&raw, format, w, h);
+            return Some((w, h, out, flip_y));
+        }
+        let vflip = flip_y.unwrap_or(!(w == 1600 && h == 900));
+        let out = readout_present_rgba8(raw, format, w, h, vflip);
+        Some((w, h, out, flip_y))
+    }
+
+    fn readback_target_pipelined_raw(
+        &self,
+        nvmap_id: u32,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+        cpu_addr: u64,
+        copy_rect: Option<[u32; 4]>,
+    ) -> Option<(u32, u32, Vec<u8>, vk::Format, Option<bool>)> {
         let mut inner = self.inner.lock();
         let RendererInner {
             device,
@@ -1564,8 +1584,7 @@ impl Renderer {
                 }
                 slot.in_flight = false;
             }
-            let out = readback_to_rgba8(&raw, prev.format, prev.width, prev.height);
-            ready_frame = Some((prev.width, prev.height, out, prev.flip_y));
+            ready_frame = Some((prev.width, prev.height, raw, prev.format, prev.flip_y));
         }
         let Some(slot_idx) = readback_slots.iter().position(|slot| !slot.in_flight) else {
             if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
@@ -1950,7 +1969,23 @@ impl Renderer {
             depth_clip_control_enabled,
         });
 
-        let pipeline = pipeline_cache.build(device, &req)?;
+        if async_shaders_enabled() {
+            match pipeline_cache.try_async_skip(req, 4) {
+                None => return Ok(None),
+                Some(req) => {
+                    let pipeline = {
+                        let _g = nexium_common::shader_progress::guard();
+                        pipeline_cache.build(device, &req)?
+                    };
+                    pipeline_cache.insert(key, pipeline);
+                    return Ok(Some(pipeline));
+                }
+            }
+        }
+        let pipeline = {
+            let _g = nexium_common::shader_progress::guard();
+            pipeline_cache.build(device, &req)?
+        };
         pipeline_cache.insert(key, pipeline);
         Ok(Some(pipeline))
     }
@@ -2192,7 +2227,16 @@ impl Renderer {
                     device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
                 );
             }
-            let raw = read_guest(tic.gpu_va, read_size);
+            let cache_fresh = tex_gen_gating_enabled()
+                && !force_refresh_texture(tic.gpu_va)
+                && volume_slices.is_none()
+                && !identity_volume
+                && tex_cache.get(&key).map_or(false, |t| t.gen == cur_gen);
+            let raw = if cache_fresh {
+                None
+            } else {
+                read_guest(tic.gpu_va, read_size)
+            };
             if raw.is_some() || volume_slices.is_some() || identity_volume {
                 let raw_hash = raw.as_ref().map(|raw| hash_src_prefix(raw));
                 let mut tex_hash = raw_hash.unwrap_or_else(|| texture_seed_hash(&key));
@@ -2359,7 +2403,7 @@ impl Renderer {
                 let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 16, 16)
                     .map_err(|e| format!("ring_alloc(const_attr): {}", e))?;
                 unsafe {
-                    let const_default = [1.0f32, 1.0, 1.0, 1.0];
+                    let const_default = [0.0f32, 0.0, 0.0, 1.0];
                     std::ptr::copy_nonoverlapping(const_default.as_ptr() as *const u8, wptr, 16);
                 }
                 Some((wb.binding, wbuf, woff))
@@ -3543,17 +3587,28 @@ impl Renderer {
                         device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
                     );
                 }
-                let raw_entry = match tex_raw_cache.entry((tic.gpu_va, read_size)) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => {
-                        entry.insert(read_guest(tic.gpu_va, read_size).map(|raw| {
-                            let tex_hash = hash_src_prefix(&raw);
-                            (tex_hash, raw)
-                        }))
-                    }
+                let cache_fresh = tex_gen_gating_enabled()
+                    && !force_refresh_texture(tic.gpu_va)
+                    && volume_slices.is_none()
+                    && !identity_volume
+                    && tex_cache.get(&key).map_or(false, |t| t.gen == cur_gen);
+                let (raw, raw_hash): (Option<&[u8]>, Option<u64>) = if cache_fresh {
+                    (None, None)
+                } else {
+                    let raw_entry = match tex_raw_cache.entry((tic.gpu_va, read_size)) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => {
+                            entry.insert(read_guest(tic.gpu_va, read_size).map(|raw| {
+                                let tex_hash = hash_src_prefix(&raw);
+                                (tex_hash, raw)
+                            }))
+                        }
+                    };
+                    (
+                        raw_entry.as_ref().map(|(_, raw)| raw.as_slice()),
+                        raw_entry.as_ref().map(|(tex_hash, _)| *tex_hash),
+                    )
                 };
-                let raw = raw_entry.as_ref().map(|(_, raw)| raw.as_slice());
-                let raw_hash = raw_entry.as_ref().map(|(tex_hash, _)| *tex_hash);
                 if raw.is_some() || volume_slices.is_some() || identity_volume {
                     let mut tex_hash = raw_hash.unwrap_or_else(|| texture_seed_hash(&key));
                     if let Some(slices) = volume_slices.as_ref() {
@@ -5256,6 +5311,108 @@ fn readback_to_rgba8(src: &[u8], format: vk::Format, width: u32, height: u32) ->
     out
 }
 
+fn legacy_present_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_LEGACY_PRESENT").is_some())
+}
+
+fn readout_present_rgba8(
+    mut raw: Vec<u8>,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+    vflip: bool,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let row = w * 4;
+    let need = row.saturating_mul(h);
+    if raw.len() < need {
+        raw.resize(need, 0);
+    }
+    match format {
+        vk::Format::A2B10G10R10_UNORM_PACK32 => {
+            let mut out = vec![0u8; need];
+            for y in 0..h {
+                let sy = if vflip { h - 1 - y } else { y };
+                let src_row = &raw[sy * row..sy * row + row];
+                let dst_row = &mut out[y * row..y * row + row];
+                for x in 0..w {
+                    let off = x * 4;
+                    let v = u32::from_le_bytes([
+                        src_row[off],
+                        src_row[off + 1],
+                        src_row[off + 2],
+                        src_row[off + 3],
+                    ]);
+                    let r = v & 0x3ff;
+                    let g = (v >> 10) & 0x3ff;
+                    let b = (v >> 20) & 0x3ff;
+                    dst_row[off] = ((r * 255 + 511) / 1023) as u8;
+                    dst_row[off + 1] = ((g * 255 + 511) / 1023) as u8;
+                    dst_row[off + 2] = ((b * 255 + 511) / 1023) as u8;
+                    dst_row[off + 3] = 0xFF;
+                }
+            }
+            out
+        }
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => {
+            let mut out = vec![0u8; need];
+            for y in 0..h {
+                let sy = if vflip { h - 1 - y } else { y };
+                let src_row = &raw[sy * row..sy * row + row];
+                let dst_row = &mut out[y * row..y * row + row];
+                for x in 0..w {
+                    let off = x * 4;
+                    dst_row[off] = src_row[off + 2];
+                    dst_row[off + 1] = src_row[off + 1];
+                    dst_row[off + 2] = src_row[off];
+                    dst_row[off + 3] = 0xFF;
+                }
+            }
+            out
+        }
+        vk::Format::B10G11R11_UFLOAT_PACK32 => {
+            let mut out = crate::texture::decode_to_rgba8(
+                &raw,
+                width,
+                height,
+                crate::texture::TicFormat::B10G11R11,
+            );
+            if vflip {
+                flip_rows_v(&mut out, width, height);
+            }
+            for px in out.chunks_exact_mut(4) {
+                px[3] = 0xFF;
+            }
+            out
+        }
+        _ => {
+            if vflip {
+                flip_rows_v(&mut raw, width, height);
+            }
+            for px in raw.chunks_exact_mut(4) {
+                px[3] = 0xFF;
+            }
+            raw
+        }
+    }
+}
+
+fn flip_rows_v(bytes: &mut [u8], width: u32, height: u32) {
+    let row = width as usize * 4;
+    let h = height as usize;
+    if row == 0 || h == 0 || bytes.len() < row * h {
+        return;
+    }
+    for y in 0..h / 2 {
+        let top = y * row;
+        let bot = (h - 1 - y) * row;
+        let (a, b) = bytes.split_at_mut(bot);
+        a[top..top + row].swap_with_slice(&mut b[..row]);
+    }
+}
+
 fn max_texture_descriptors() -> usize {
     crate::descriptor::MAX_TEXTURE_DESCRIPTORS as usize
 }
@@ -5271,24 +5428,7 @@ fn bind_trace_fs(fs_gpu_va: u64) -> bool {
             })
             .unwrap_or_default()
     });
-    bind_trace_all() || list.contains(&fs_gpu_va)
-}
-
-fn bind_trace_all() -> bool {
-    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ALL.get_or_init(|| {
-        std::env::var("NEXIUM_BIND_TRACE_FS")
-            .map(|v| v.trim().eq_ignore_ascii_case("all"))
-            .unwrap_or(false)
-    })
-}
-
-fn tex_diag_once(fs_gpu_va: u64, tex_id: u32) -> bool {
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<(u64, u32)>>> = Mutex::new(None);
-    let mut guard = SEEN.lock().unwrap();
-    guard.get_or_insert_with(HashSet::new).insert((fs_gpu_va, tex_id))
+    list.contains(&fs_gpu_va)
 }
 
 fn vs_tex_slot(call: &crate::draw::Maxwell3dDrawCall, slot: usize) -> Option<(usize, u32)> {
@@ -5662,6 +5802,16 @@ fn verify_volume_image(
         }
         Err(e) => log::warn!("[volume-verify] va={:#x} failed: {}", va, e),
     }
+}
+
+fn async_shaders_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_ASYNC_SHADERS").is_some())
+}
+
+fn tex_gen_gating_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_TEX_GEN_GATING").is_some())
 }
 
 fn force_refresh_texture(gpu_va: u64) -> bool {
@@ -6230,45 +6380,19 @@ where
         .take(max_texture_descriptors())
         .map(|tex_id| {
             if *tex_id == u32::MAX || *tex_id > call.tic_pool_limit || call.tic_pool_gpu_va == 0 {
-                if bind_trace_fs(call.fs_gpu_va) && tex_diag_once(call.fs_gpu_va, *tex_id) {
-                    log::warn!(
-                        "[tic] fs={:#x} tex_id={} UNBOUND -> dummy_white (pool_va={:#x} limit={})",
-                        call.fs_gpu_va, tex_id, call.tic_pool_gpu_va, call.tic_pool_limit
-                    );
-                }
                 return None;
             }
             let tic_addr = call.tic_pool_gpu_va.wrapping_add((*tex_id as u64) * 32);
             read_guest(tic_addr, 32).and_then(|tic_raw| {
                 crate::texture::TicEntry::parse(&tic_raw).map(|tic| {
-                    if bind_trace_fs(call.fs_gpu_va) && tex_diag_once(call.fs_gpu_va, *tex_id) {
+                    if bind_trace_fs(call.fs_gpu_va) {
                         let w0 = u32::from_le_bytes([tic_raw[0], tic_raw[1], tic_raw[2], tic_raw[3]]);
                         let w4 = u32::from_le_bytes([tic_raw[16], tic_raw[17], tic_raw[18], tic_raw[19]]);
                         let srgb = (w4 >> 22) & 1;
-                        let (amin, amax, azero, atotal) = {
-                            let sz = tic.format.linear_size(tic.width, tic.height).min(1 << 20);
-                            match read_guest(tic.gpu_va, sz) {
-                                Some(raw) => {
-                                    let (mut mn, mut mx, mut z, mut n) = (255u8, 0u8, 0u32, 0u32);
-                                    for a in raw.iter().skip(3).step_by(4) {
-                                        mn = mn.min(*a);
-                                        mx = mx.max(*a);
-                                        if *a == 0 {
-                                            z += 1;
-                                        }
-                                        n += 1;
-                                    }
-                                    (mn, mx, z, n)
-                                }
-                                None => (0, 0, 0, 0),
-                            }
-                        };
                         log::warn!(
-                            "[tic] fs={:#x} tex_id={} {}x{} fmt={:?} ctypes={:?} swz={:?} bl={} bh={} gpu_va={:#x} srgb={} alpha[min={} max={} zero={}/{}] w0={:#010x}",
+                            "[tic] fs={:#x} tex_id={} {}x{} fmt={:?} ctypes={:?} swz={:?} bl={} srgb={} w0={:#010x}",
                             call.fs_gpu_va, tex_id, tic.width, tic.height, tic.format,
-                            tic.component_types, tic.swizzle, tic.is_block_linear,
-                            tic.block_height_log2, tic.gpu_va, srgb,
-                            amin, amax, azero, atotal, w0
+                            tic.component_types, tic.swizzle, tic.is_block_linear, srgb, w0
                         );
                     }
                     let pitch_size = tic.format.linear_size(tic.width, tic.height);
@@ -6384,13 +6508,6 @@ fn rt_alias_for_slot(
         .or_else(|| {
             rt_cache
                 .find_depth(sk)
-                .or_else(|| {
-                    if call.sampled_rt_fuzzy {
-                        rt_cache.find_depth_fuzzy(sk)
-                    } else {
-                        None
-                    }
-                })
                 .and_then(|(key, image, view, layout)| {
                     if Some(key) != call.depth_key {
                         Some(RtAlias {

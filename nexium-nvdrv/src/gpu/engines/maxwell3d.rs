@@ -229,9 +229,6 @@ pub struct Maxwell3DRegisters {
     pub blend_pt_dst_alpha: [u32; 8],
     pub color_mask_common: bool,
     pub color_masks: [u32; 8],
-    pub alpha_test_enabled: bool,
-    pub alpha_test_ref: u32,
-    pub alpha_test_func: u32,
     pub draw_count: u64,
     pub clear_count: u64,
 
@@ -345,9 +342,6 @@ impl Default for Maxwell3DRegisters {
             blend_pt_dst_alpha: [0x4000; 8],
             color_mask_common: false,
             color_masks: [0x1111; 8],
-            alpha_test_enabled: false,
-            alpha_test_ref: 0,
-            alpha_test_func: 0x207,
             draw_count: 0,
             clear_count: 0,
             tic_pool_va_lo: 0,
@@ -456,9 +450,6 @@ pub struct DrawCall {
     pub depth_test_enable: bool,
     pub depth_write_enable: bool,
     pub depth_func: u32,
-    pub alpha_test_enabled: bool,
-    pub alpha_test_ref: u32,
-    pub alpha_test_func: u32,
     pub clear_depth: f32,
     pub clear_mask: u32,
 }
@@ -500,6 +491,17 @@ const REG_LOAD_MME_INSTRUCTION_PTR: u32 = 0x45;
 const REG_LOAD_MME_INSTRUCTION: u32 = 0x46;
 const REG_LOAD_MME_START_ADDRESS_PTR: u32 = 0x47;
 const REG_LOAD_MME_START_ADDRESS: u32 = 0x48;
+
+fn raw_counter_reports() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_RAW_COUNTER_REPORTS").is_some())
+}
+
+fn synthetic_counter_value() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static C: AtomicU32 = AtomicU32::new(0x1000);
+    C.fetch_add(0x1000, Ordering::Relaxed)
+}
 
 fn trace_sync_method(method: u32, arg: u32, pending: u32) {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -722,7 +724,7 @@ impl Maxwell3D {
                 {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static N: AtomicU32 = AtomicU32::new(0);
-                    if N.fetch_add(1, Ordering::Relaxed) < 12 {
+                    if operation != 0 || N.fetch_add(1, Ordering::Relaxed) < 12 {
                         log::info!(
                             "maxwell3d: REPORT_SEMAPHORE arg={:#x} op={} gpu_va={:#x} payload={:#x}",
                             arg,
@@ -734,9 +736,14 @@ impl Maxwell3D {
                 }
                 if operation == 0 || operation == 2 {
                     let long = ((arg >> 28) & 1) == 0;
+                    let value = if operation == 2 && !raw_counter_reports() {
+                        synthetic_counter_value()
+                    } else {
+                        payload
+                    };
                     self.regs
                         .pending_semaphore_writes
-                        .push((gpu_va, payload, long));
+                        .push((gpu_va, value, long));
                 }
             }
             0x360..=0x363 => {
@@ -852,9 +859,6 @@ impl Maxwell3D {
                     depth_test_enable: self.regs.depth_test_enable,
                     depth_write_enable: self.regs.depth_write_enable,
                     depth_func: self.regs.depth_func,
-                    alpha_test_enabled: self.regs.alpha_test_enabled,
-                    alpha_test_ref: self.regs.alpha_test_ref,
-                    alpha_test_func: self.regs.alpha_test_func,
                     clear_depth: self.regs.clear_depth,
                     clear_mask: arg,
                 });
@@ -1059,9 +1063,6 @@ impl Maxwell3D {
             0x4D3 => self.regs.blend_eq_alpha = arg,
             0x4D4 => self.regs.blend_src_alpha = arg,
             0x4D6 => self.regs.blend_dst_alpha = arg,
-            0x4BB => self.regs.alpha_test_enabled = (arg & 1) != 0,
-            0x4C4 => self.regs.alpha_test_ref = arg,
-            0x4C5 => self.regs.alpha_test_func = arg,
             0x487 => self.regs.rt_control = arg,
             0x4B9 => self.regs.blend_per_target_enabled = (arg & 1) != 0,
             0x3E4 => self.regs.color_mask_common = (arg & 1) != 0,
@@ -1259,9 +1260,6 @@ impl Maxwell3D {
             depth_test_enable: self.regs.depth_test_enable,
             depth_write_enable: self.regs.depth_write_enable,
             depth_func: self.regs.depth_func,
-            alpha_test_enabled: self.regs.alpha_test_enabled,
-            alpha_test_ref: self.regs.alpha_test_ref,
-            alpha_test_func: self.regs.alpha_test_func,
             clear_depth: self.regs.clear_depth,
             clear_mask: 0,
         });
@@ -1390,9 +1388,6 @@ impl Maxwell3D {
             depth_test_enable: self.regs.depth_test_enable,
             depth_write_enable: self.regs.depth_write_enable,
             depth_func: self.regs.depth_func,
-            alpha_test_enabled: self.regs.alpha_test_enabled,
-            alpha_test_ref: self.regs.alpha_test_ref,
-            alpha_test_func: self.regs.alpha_test_func,
             clear_depth: self.regs.clear_depth,
             clear_mask: 0,
         });

@@ -9,6 +9,7 @@ license.workspace = true
 nexium-shader.workspace = true
 nexium-spirv.workspace = true
 nexium-gpu = { path = "../nexium-gpu" }
+nexium-common.workspace = true
 nexium-memory.workspace = true
 ash = "0.38"
 

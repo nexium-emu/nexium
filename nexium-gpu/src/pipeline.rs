@@ -735,6 +735,7 @@ impl PipelineCache {
             let key = req.key;
             if w.req_tx.send(req).is_ok() {
                 w.in_flight.insert(key, 0);
+                nexium_common::shader_progress::begin();
             }
         }
     }
@@ -765,6 +766,7 @@ impl PipelineCache {
         if let Some(w) = self.worker.as_mut() {
             while let Ok(r) = w.res_rx.try_recv() {
                 w.in_flight.remove(&r.0);
+                nexium_common::shader_progress::end();
                 done.push(r);
             }
         }
@@ -805,6 +807,7 @@ impl PipelineCache {
                 match w.req_tx.send(req) {
                     Ok(()) => {
                         w.in_flight.insert(key, 1);
+                        nexium_common::shader_progress::begin();
                         None
                     }
                     Err(e) => Some(e.0),
@@ -877,6 +880,7 @@ impl PipelineCache {
                 let _ = h.join();
             }
             while let Ok((key, pipe)) = res_rx.try_recv() {
+                nexium_common::shader_progress::end();
                 if pipe != vk::Pipeline::null() {
                     self.pipelines.insert(key, pipe);
                 }
