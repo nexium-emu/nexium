@@ -118,6 +118,24 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
+fn soft_vband(painter: &egui::Painter, x0: f32, x1: f32, ya: f32, yb: f32, yc: f32, color: Color32, peak: u8) {
+    if x1 <= x0 || peak == 0 {
+        return;
+    }
+    let c0 = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0);
+    let cp = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), peak);
+    let v = |x: f32, y: f32, c: Color32| egui::epaint::Vertex { pos: egui::pos2(x, y), uv: egui::pos2(0.0, 0.0), color: c };
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.vertices.push(v(x0, ya, c0));
+    mesh.vertices.push(v(x1, ya, c0));
+    mesh.vertices.push(v(x0, yb, cp));
+    mesh.vertices.push(v(x1, yb, cp));
+    mesh.vertices.push(v(x0, yc, c0));
+    mesh.vertices.push(v(x1, yc, c0));
+    mesh.indices.extend_from_slice(&[0, 1, 3, 0, 3, 2, 2, 3, 5, 2, 5, 4]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 fn network_kind() -> u8 {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
     static CACHE: AtomicU8 = AtomicU8::new(0);
@@ -1294,10 +1312,12 @@ pub fn carousel_view(
             painter.rect_filled(dock_bg.expand(e).translate(Vec2::new(0.0, 3.5 * scale_factor)), Rounding::same(round + e), Color32::from_black_alpha(a));
         }
         painter.rect_filled(dock_bg, Rounding::same(round), Color32::from_rgba_premultiplied(col_bar.r(), col_bar.g(), col_bar.b(), dock_bg_alpha));
-        let gloss = egui::Rect::from_min_max(dock_bg.min, egui::pos2(dock_bg.max.x, dock_bg.center().y));
-        painter.rect_filled(gloss, Rounding { nw: round, ne: round, sw: 0.0, se: 0.0 }, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 55.0 } else { 42.0 }) as u8));
+        let bx0 = dock_bg.min.x + round * 0.7;
+        let bx1 = dock_bg.max.x - round * 0.7;
+        let h = dock_bg.height();
+        soft_vband(&painter, bx0, bx1, dock_bg.min.y + 1.0, dock_bg.min.y + h * 0.24, dock_bg.min.y + h * 0.62, Color32::WHITE, (ui_opacity * if th > 0.5 { 46.0 } else { 60.0 }) as u8);
+        soft_vband(&painter, bx0, bx1, dock_bg.min.y + h * 0.42, dock_bg.max.y - h * 0.16, dock_bg.max.y - 1.0, Color32::BLACK, (ui_opacity * if th > 0.5 { 40.0 } else { 26.0 }) as u8);
         painter.rect_stroke(dock_bg, Rounding::same(round), Stroke::new(1.1 * scale_factor, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
-        painter.rect_stroke(dock_bg.shrink(1.2 * scale_factor), Rounding::same(round - 1.2 * scale_factor), Stroke::new(1.0 * scale_factor, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 80.0 } else { 30.0 }) as u8)));
 
         let scaled_dock_sx = scaled_dock_center.x - scaled_dock_total * 0.5;
 
@@ -1727,12 +1747,21 @@ pub fn carousel_view(
                     painter.add(egui::Shape::line(arc, Stroke::new(1.6 * scale_factor, Color32::from_rgba_unmultiplied(cc.r(), cc.g(), cc.b(), al))));
                 }
             } else {
-                let plug = egui::Rect::from_center_size(s(nc), Vec2::new(u * 2.0 * scale_factor, u * 1.3 * scale_factor));
-                painter.rect_stroke(plug, Rounding::same(2.0 * scale_factor), Stroke::new(1.6 * scale_factor, cc));
-                let st = Stroke::new(1.6 * scale_factor, cc);
-                painter.line_segment([s(nc + Vec2::new(-u * 0.4, -u * 0.65)), s(nc + Vec2::new(-u * 0.4, -u * 1.15))], st);
-                painter.line_segment([s(nc + Vec2::new(u * 0.4, -u * 0.65)), s(nc + Vec2::new(u * 0.4, -u * 1.15))], st);
-                painter.line_segment([s(nc + Vec2::new(0.0, u * 0.65)), s(nc + Vec2::new(0.0, u * 1.2))], st);
+                let st = Stroke::new(1.7 * scale_factor, cc);
+                let sx = |x: f32, y: f32| s(nc + Vec2::new(x * u, y * u));
+                let cable: Vec<egui::Pos2> = (0..=24)
+                    .map(|i| {
+                        let t = i as f32 / 24.0;
+                        let x = -1.25 + 2.5 * t;
+                        let y = 0.72 * (t * std::f32::consts::TAU * 0.75).sin();
+                        sx(x, y)
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(cable, st));
+                let plug1 = egui::Rect::from_center_size(sx(-1.25, 0.0), Vec2::new(u * 0.7 * scale_factor, u * 1.05 * scale_factor));
+                let plug2 = egui::Rect::from_center_size(sx(1.25, 0.0), Vec2::new(u * 0.7 * scale_factor, u * 1.05 * scale_factor));
+                painter.rect_filled(plug1, Rounding::same(1.5 * scale_factor), cc);
+                painter.rect_filled(plug2, Rounding::same(1.5 * scale_factor), cc);
             }
         }
 
