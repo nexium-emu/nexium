@@ -176,6 +176,19 @@ fn scan(extra_dirs: &[PathBuf]) -> Vec<GameEntry> {
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out.dedup_by(|a, b| a.path == b.path);
+    // Never list the same game twice (e.g. a copy in switch/ and a migrated
+    // copy in NRO/). Prefer the one under a switch/ folder (keeps its assets).
+    let pref = |p: &Path| -> u8 {
+        if p.components().any(|c| c.as_os_str().eq_ignore_ascii_case("switch")) { 1 } else { 0 }
+    };
+    out.sort_by(|a, b| {
+        a.title
+            .to_lowercase()
+            .cmp(&b.title.to_lowercase())
+            .then_with(|| pref(&b.path).cmp(&pref(&a.path)))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    out.dedup_by(|a, b| a.title.eq_ignore_ascii_case(&b.title));
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
     out
 }

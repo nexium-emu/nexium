@@ -190,6 +190,8 @@ pub struct HorizonApp {
     pub carousel: crate::carousel::CarouselState,
     icon_picker: Option<IconPicker>,
     shop: crate::shop::ShopState,
+    active_downloads: Vec<(String, std::sync::Arc<std::sync::Mutex<crate::library::DownloadInfo>>)>,
+    download_toast: Option<(String, std::time::Instant)>,
     icon_reveal: Option<(usize, std::time::Instant, Option<egui::TextureHandle>)>,
     key_test: Option<std::sync::Arc<std::sync::Mutex<KeyTest>>>,
     key_test_result: Option<(bool, std::time::Instant)>,
@@ -357,6 +359,8 @@ impl HorizonApp {
             carousel: crate::carousel::CarouselState::new(),
             icon_picker: None,
             shop: crate::shop::ShopState::new(),
+            active_downloads: Vec::new(),
+            download_toast: None,
             icon_reveal: None,
             key_test: None,
             key_test_result: None,
@@ -1774,18 +1778,26 @@ impl eframe::App for HorizonApp {
 
         self.library.poll();
 
-        // Drain shop installs and prune finished downloads BEFORE any drawing
-        // so freed placeholder textures aren't referenced in this frame's submit.
+        // Track shop downloads; on completion rescan + show a "Download Complete" toast.
         for pending in self.shop.new_installs.drain(..).collect::<Vec<_>>() {
-            let icon = pending.icon.as_deref().and_then(crate::library::decode_icon);
-            self.library.add_download(pending.title, icon, pending.info);
+            self.active_downloads.push((pending.title, pending.info));
         }
-        if self.library.prune_downloads() {
-            self.shop.need_rescan = true;
-        }
-        if self.shop.need_rescan {
-            self.shop.need_rescan = false;
-            self.library.rescan(ctx, &self.app_settings.library_folders);
+        let mut di = 0;
+        while di < self.active_downloads.len() {
+            let (done, ok) = self.active_downloads[di]
+                .1
+                .lock()
+                .map(|g| (g.done, g.ok))
+                .unwrap_or((false, false));
+            if done {
+                let (title, _) = self.active_downloads.remove(di);
+                if ok {
+                    self.download_toast = Some((title, std::time::Instant::now()));
+                    self.library.rescan(ctx, &self.app_settings.library_folders);
+                }
+            } else {
+                di += 1;
+            }
         }
 
         if let Some((_, tm, _)) = &self.icon_reveal {
@@ -2847,6 +2859,28 @@ impl eframe::App for HorizonApp {
                         None => self.carousel.ambient_color,
                     };
                     self.shop.update(ctx, ui, self.app_settings.light_mode, accent, &self.last_input);
+                }
+                if let Some((title, since)) = &self.download_toast {
+                    let el = since.elapsed().as_secs_f32();
+                    if el > 4.5 {
+                        self.download_toast = None;
+                    } else {
+                        let fade = (el.min(0.3) / 0.3).min((4.5 - el) / 0.5).clamp(0.0, 1.0);
+                        let screen = ctx.screen_rect();
+                        let mut tp = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("dl_toast")));
+                        tp.set_opacity(fade);
+                        let w = 360.0;
+                        let rect = egui::Rect::from_min_size(egui::pos2(screen.center().x - w * 0.5, screen.min.y + 24.0), egui::Vec2::new(w, 62.0));
+                        tp.rect_filled(rect.translate(egui::Vec2::new(0.0, 4.0)), egui::Rounding::same(14.0), egui::Color32::from_black_alpha(90));
+                        tp.rect_filled(rect, egui::Rounding::same(14.0), egui::Color32::from_rgb(0x1C, 0x24, 0x1E));
+                        tp.rect_stroke(rect, egui::Rounding::same(14.0), egui::Stroke::new(1.5, egui::Color32::from_rgb(0x35, 0xD0, 0x6A)));
+                        let cc = egui::pos2(rect.min.x + 30.0, rect.center().y);
+                        tp.circle_filled(cc, 12.0, egui::Color32::from_rgb(0x35, 0xD0, 0x6A));
+                        tp.add(egui::Shape::line(vec![cc + egui::Vec2::new(-5.0, 0.0), cc + egui::Vec2::new(-1.5, 4.0), cc + egui::Vec2::new(6.0, -5.0)], egui::Stroke::new(2.2, egui::Color32::WHITE)));
+                        tp.text(egui::pos2(rect.min.x + 54.0, rect.center().y - 9.0), egui::Align2::LEFT_CENTER, "Download Complete!", egui::FontId::proportional(16.0), egui::Color32::WHITE);
+                        tp.text(egui::pos2(rect.min.x + 54.0, rect.center().y + 11.0), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(13.0), egui::Color32::from_gray(0xB0));
+                        ctx.request_repaint();
+                    }
                 }
             });
 
