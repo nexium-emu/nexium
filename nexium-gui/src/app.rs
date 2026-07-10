@@ -192,6 +192,16 @@ pub struct HorizonApp {
     shop: crate::shop::ShopState,
     active_downloads: Vec<(String, std::sync::Arc<std::sync::Mutex<crate::library::DownloadInfo>>)>,
     download_toast: Option<(String, std::time::Instant)>,
+    carousel_settings_open: bool,
+    cs_anim: f32,
+    cs_tab: usize,
+    cs_scroll: f32,
+    cs_selected: usize,
+    cs_focus_grid: bool,
+    cs_nav_cd: f64,
+    cs_ab_held: bool,
+    music_was_on: bool,
+    music_fade_start: Option<std::time::Instant>,
     icon_reveal: Option<(usize, std::time::Instant, Option<egui::TextureHandle>)>,
     key_test: Option<std::sync::Arc<std::sync::Mutex<KeyTest>>>,
     key_test_result: Option<(bool, std::time::Instant)>,
@@ -361,6 +371,16 @@ impl HorizonApp {
             shop: crate::shop::ShopState::new(),
             active_downloads: Vec::new(),
             download_toast: None,
+            carousel_settings_open: false,
+            cs_anim: 0.0,
+            cs_tab: 0,
+            cs_scroll: 0.0,
+            cs_selected: 0,
+            cs_focus_grid: false,
+            cs_nav_cd: 0.0,
+            cs_ab_held: false,
+            music_was_on: false,
+            music_fade_start: None,
             icon_reveal: None,
             key_test: None,
             key_test_result: None,
@@ -672,7 +692,7 @@ impl HorizonApp {
     }
 
     fn modal_active(&self) -> bool {
-        self.confirm.is_some() || self.teardown_at.is_some() || self.icon_picker.is_some() || self.shop.open
+        self.confirm.is_some() || self.teardown_at.is_some() || self.icon_picker.is_some() || self.shop.open || self.carousel_settings_open
     }
 
     fn update_icon_picker(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -978,7 +998,14 @@ impl HorizonApp {
             let sel_row = (selected / cols) as f32;
             let rows_vis = ((content.height() - pad_top) / cell).max(1.0);
             let max_scroll = (rows as f32 - rows_vis).max(0.0);
-            scroll_target = (sel_row - (rows_vis - 1.0) * 0.5).clamp(0.0, max_scroll);
+            // keep-visible target (not centering) so mouse-wheel scroll persists
+            let mut kv = scroll;
+            if sel_row < scroll {
+                kv = sel_row;
+            } else if sel_row + 1.0 > scroll + rows_vis {
+                kv = sel_row + 1.0 - rows_vis;
+            }
+            scroll_target = kv.clamp(0.0, max_scroll);
             cell_px = cell;
             max_scroll_rows = max_scroll;
 
@@ -1073,6 +1100,198 @@ impl HorizonApp {
         }
     }
 
+    fn update_carousel_settings(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let target = if self.carousel_settings_open { 1.0 } else { 0.0 };
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        self.cs_anim += (target - self.cs_anim) * (dt * 12.0).min(1.0);
+        if self.cs_anim < 0.004 {
+            return;
+        }
+        let ease = { let a = self.cs_anim.clamp(0.0, 1.0); a * a * (3.0 - 2.0 * a) };
+        let t = ctx.input(|i| i.time) as f32;
+        let full = ctx.screen_rect();
+        let s = (full.height() / 820.0).clamp(1.0, 2.4);
+        let backdrop_theme = self.app_settings.backdrop_theme;
+        let space = backdrop_theme == crate::app_settings::BackdropTheme::Space;
+        // Space is always dark, so force bright UI on it (no black-on-black).
+        let lightish = self.app_settings.light_mode && !space;
+        let pick = |dark: egui::Color32, lite: egui::Color32| if lightish { lite } else { dark };
+        let text = pick(egui::Color32::from_rgb(0xEC, 0xEC, 0xF0), egui::Color32::from_rgb(0x1E, 0x1E, 0x28));
+        let muted = pick(egui::Color32::from_rgb(0x8A, 0x8A, 0x98), egui::Color32::from_rgb(0x60, 0x60, 0x6A));
+        let panel = pick(egui::Color32::from_rgb(0x16, 0x16, 0x1E), egui::Color32::from_rgb(0xFF, 0xFF, 0xFF));
+        let border = pick(egui::Color32::from_rgb(0x30, 0x30, 0x3C), egui::Color32::from_rgb(0xC6, 0xC6, 0xD0));
+        let sel = pick(egui::Color32::from_rgb(0x1E, 0x1E, 0x28), egui::Color32::from_rgb(0xDD, 0xDD, 0xE6));
+        let hover = pick(egui::Color32::from_rgb(0x18, 0x18, 0x22), egui::Color32::from_rgb(0xEA, 0xEA, 0xF0));
+        let accent = match self.app_settings.carousel_theme.color() {
+            Some((r, g, b)) => egui::Color32::from_rgb(r, g, b),
+            None => self.carousel.ambient_color,
+        };
+
+        // scale + fade pop, exactly like the Profile page
+        let center = full.center();
+        let sf = 0.965 + 0.035 * ease;
+        let sp = |p: egui::Pos2| center + (p - center) * sf;
+        let sr = |r: egui::Rect| egui::Rect::from_center_size(center + (r.center() - center) * sf, r.size() * sf);
+
+        let mut p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("carousel_settings")));
+        p.set_opacity(ease);
+        // themed backdrop + scrim (matches Profile)
+        crate::carousel::draw_backdrop(&p, full, accent, t, backdrop_theme, 1.0, if lightish { 1.0 } else { 0.0 });
+        let scrim = if lightish {
+            egui::Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 55)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 140)
+        };
+        p.rect_filled(full, egui::Rounding::ZERO, scrim);
+
+        let mx = full.width() * 0.055;
+        let header_font = 34.0 * s;
+        p.text(sp(egui::pos2(full.min.x + mx, full.min.y + 40.0 * s)), egui::Align2::LEFT_TOP, "Carousel Settings", egui::FontId::proportional(header_font * sf), text);
+        let header_y = full.min.y + 40.0 * s + header_font + 20.0 * s;
+        p.line_segment([sp(egui::pos2(full.min.x + mx, header_y)), sp(egui::pos2(full.max.x - mx, header_y))], egui::Stroke::new(1.0, border));
+
+        // ---- input ----
+        use crate::controller_config::SwitchButton;
+        let now = ctx.input(|i| i.time);
+        let li = self.last_input;
+        let gp_a = li.connected && li.is(SwitchButton::A);
+        let gp_b = li.connected && li.is(SwitchButton::B);
+        let a_edge = ctx.input(|i| i.key_pressed(egui::Key::Enter)) || (gp_a && !self.cs_ab_held);
+        let b_edge = ctx.input(|i| i.key_pressed(egui::Key::Escape)) || (gp_b && !self.cs_ab_held);
+        self.cs_ab_held = gp_a || gp_b;
+        let ready = now - self.cs_nav_cd > 0.16;
+        let (mut nu, mut nd, mut nl, mut nr) = ctx.input(|i| (
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::ArrowLeft),
+            i.key_pressed(egui::Key::ArrowRight),
+        ));
+        if ready && li.connected {
+            if li.is(SwitchButton::DUp) || li.ly() > 0.5 { nu = true; self.cs_nav_cd = now; }
+            else if li.is(SwitchButton::DDown) || li.ly() < -0.5 { nd = true; self.cs_nav_cd = now; }
+            else if li.is(SwitchButton::DLeft) || li.lx() < -0.5 { nl = true; self.cs_nav_cd = now; }
+            else if li.is(SwitchButton::DRight) || li.lx() > 0.5 { nr = true; self.cs_nav_cd = now; }
+        }
+
+        // ---- sidebar (Profile-style pills) ----
+        let side_w = (full.width() * 0.22).max(300.0);
+        let side_x = full.min.x + mx;
+        let side_top = header_y + 34.0 * s;
+        let item_h = 64.0 * s;
+        let tabs = ["Create A List", "Manage Carousel"];
+        for (i, label) in tabs.iter().enumerate() {
+            let base = egui::Rect::from_min_size(egui::pos2(side_x, side_top + i as f32 * (item_h + 10.0 * s)), egui::Vec2::new(side_w, item_h));
+            let r = sr(base);
+            let selected = self.cs_tab == i;
+            let ring = if !self.cs_focus_grid { accent } else { border };
+            let rounding = egui::Rounding::same(12.0 * s);
+            if selected {
+                p.rect_filled(r, rounding, sel);
+                p.rect_stroke(r, rounding, egui::Stroke::new(1.8, ring));
+                let bar = sr(egui::Rect::from_min_size(base.min + egui::Vec2::new(6.0 * s, 12.0 * s), egui::Vec2::new(4.0 * s, base.height() - 24.0 * s)));
+                p.rect_filled(bar, egui::Rounding::same(2.0 * s), ring);
+            } else if ui.rect_contains_pointer(r) {
+                p.rect_filled(r, rounding, hover);
+            }
+            p.text(sp(egui::pos2(base.min.x + 26.0 * s, base.center().y)), egui::Align2::LEFT_CENTER, *label, egui::FontId::proportional(19.0 * s * sf), if selected { text } else { muted });
+            if ui.allocate_rect(r, egui::Sense::click()).clicked() {
+                self.cs_tab = i;
+                self.cs_focus_grid = false;
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            }
+        }
+        if !self.cs_focus_grid {
+            if nu && self.cs_tab > 0 { self.cs_tab -= 1; crate::ui_audio::play_move(); }
+            if nd && self.cs_tab + 1 < tabs.len() { self.cs_tab += 1; crate::ui_audio::play_move(); }
+        }
+
+        let footer_y = full.max.y - 60.0 * s;
+        p.line_segment([sp(egui::pos2(full.min.x + mx, footer_y)), sp(egui::pos2(full.max.x - mx, footer_y))], egui::Stroke::new(1.0, border));
+        let hint = if self.cs_focus_grid { "[←→↑↓] Move    ·    [B] Back" } else { "[↑↓] Move    ·    [→] Browse games    ·    [B] Back" };
+        p.text(sp(egui::pos2(full.max.x - mx, full.max.y - 30.0 * s)), egui::Align2::RIGHT_CENTER, hint, egui::FontId::proportional(14.0 * s * sf), muted);
+
+        let content = egui::Rect::from_min_max(egui::pos2(side_x + side_w + 48.0 * s, side_top), egui::pos2(full.max.x - mx, footer_y - 20.0 * s));
+
+        if self.cs_tab == 0 {
+            let games: Vec<usize> = (0..self.library.games.len()).filter(|&i| self.library.games[i].download.is_none()).collect();
+            let n = games.len();
+            if n == 0 {
+                p.text(sp(content.center()), egui::Align2::CENTER_CENTER, "No games in your library yet.", egui::FontId::proportional(18.0 * s * sf), muted);
+            } else {
+                let cols = 5usize;
+                let gap = 20.0 * s;
+                let tile = ((content.width() - gap * (cols as f32 - 1.0)) / cols as f32).min(210.0 * s);
+                let cell_w = tile + gap;
+                let cell_h = tile + 28.0 * s;
+                let rows = (n + cols - 1) / cols;
+                let max_scroll = (rows as f32 * cell_h - content.height()).max(0.0);
+                if self.cs_focus_grid {
+                    if nr && self.cs_selected + 1 < n { self.cs_selected += 1; crate::ui_audio::play_move(); }
+                    if nl { if self.cs_selected % cols == 0 { self.cs_focus_grid = false; } else { self.cs_selected -= 1; crate::ui_audio::play_move(); } }
+                    if nd && self.cs_selected + cols < n { self.cs_selected += cols; crate::ui_audio::play_move(); }
+                    if nu && self.cs_selected >= cols { self.cs_selected -= cols; crate::ui_audio::play_move(); }
+                } else if nr {
+                    self.cs_focus_grid = true;
+                    crate::ui_audio::play_move();
+                }
+                let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+                if wheel.abs() > 0.1 { self.cs_scroll = (self.cs_scroll - wheel).clamp(0.0, max_scroll); }
+                if self.cs_focus_grid {
+                    let srow = (self.cs_selected / cols) as f32 * cell_h;
+                    if srow < self.cs_scroll { self.cs_scroll = srow; }
+                    else if srow + tile > self.cs_scroll + content.height() { self.cs_scroll = srow + tile - content.height(); }
+                }
+                self.cs_scroll = self.cs_scroll.clamp(0.0, max_scroll);
+                let clip = p.with_clip_rect(sr(content));
+                for (vi, &gi) in games.iter().enumerate() {
+                    let rr = vi / cols;
+                    let cc = vi % cols;
+                    let tx = content.min.x + cc as f32 * cell_w;
+                    let ty = content.min.y + rr as f32 * cell_h - self.cs_scroll;
+                    if ty + tile < content.min.y || ty > content.max.y { continue; }
+                    let base = egui::Rect::from_min_size(egui::pos2(tx, ty), egui::Vec2::splat(tile));
+                    let rect = sr(base);
+                    let selg = self.cs_focus_grid && vi == self.cs_selected;
+                    if selg {
+                        crate::carousel::draw_gradient_rounded_rect(&clip, rect.center(), rect.expand(5.0), 13.0, t, 110);
+                        crate::carousel::draw_gradient_rounded_rect(&clip, rect.center(), rect.expand(2.5), 11.0, t, 255);
+                    }
+                    clip.rect_filled(rect, egui::Rounding::same(9.0), panel);
+                    if let Some(tex) = self.library.texture(ctx, gi) {
+                        crate::carousel::draw_rounded_image(&clip, tex.id(), rect, 9.0, egui::Color32::WHITE);
+                    } else {
+                        clip.text(rect.center(), egui::Align2::CENTER_CENTER, &self.library.games[gi].title, egui::FontId::proportional(12.0 * s), muted);
+                    }
+                }
+            }
+        } else if self.app_settings.carousel_lists.is_empty() {
+            p.text(sp(content.center() - egui::Vec2::new(0.0, 12.0)), egui::Align2::CENTER_CENTER, "No lists yet.", egui::FontId::proportional(20.0 * s * sf), text);
+            p.text(sp(content.center() + egui::Vec2::new(0.0, 22.0)), egui::Align2::CENTER_CENTER, "Use \u{201C}Create A List\u{201D} to group games, then arrange them here.", egui::FontId::proportional(15.0 * s * sf), muted);
+        } else {
+            let lists = self.app_settings.carousel_lists.clone();
+            for (i, list) in lists.iter().enumerate() {
+                let base = egui::Rect::from_min_size(egui::pos2(content.min.x, content.min.y + i as f32 * 62.0 * s), egui::Vec2::new(content.width(), 54.0 * s));
+                let r = sr(base);
+                p.rect_filled(r, egui::Rounding::same(12.0), panel);
+                p.rect_stroke(r, egui::Rounding::same(12.0), egui::Stroke::new(1.0, border));
+                p.text(sp(egui::pos2(base.min.x + 20.0 * s, base.center().y)), egui::Align2::LEFT_CENTER, &list.name, egui::FontId::proportional(18.0 * s * sf), text);
+                p.text(sp(egui::pos2(base.max.x - 20.0 * s, base.center().y)), egui::Align2::RIGHT_CENTER, &format!("{} games", list.games.len()), egui::FontId::proportional(15.0 * s * sf), muted);
+            }
+        }
+
+        if b_edge {
+            if self.cs_focus_grid {
+                self.cs_focus_grid = false;
+                crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+            } else {
+                self.carousel_settings_open = false;
+                crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+            }
+        }
+        let _ = a_edge;
+        ctx.request_repaint();
+    }
+
     fn resolve_confirm(&mut self, confirmed: bool) {
         let Some(dlg) = self.confirm.take() else { return };
         if !confirmed {
@@ -1092,8 +1311,8 @@ impl HorizonApp {
             ConfirmKind::QuickLaunch(path) => {
                 if let Some(idx) = self.library.index_of_path(&std::path::PathBuf::from(&path)) {
                     let n = self.library.move_to_front(idx);
-                    self.carousel.selected = n;
-                    self.carousel.scroll_offset = n as f32;
+                    self.carousel.selected = n + crate::carousel::CS_FRONT;
+                    self.carousel.scroll_offset = (n + crate::carousel::CS_FRONT) as f32;
                 }
                 self.show_profile = false;
                 if self.app_settings.view_mode != crate::app_settings::ViewMode::Carousel {
@@ -1364,8 +1583,8 @@ impl HorizonApp {
                 let path = std::path::PathBuf::from(&self.nro_path);
                 if let Some(idx) = self.library.index_of_path(&path) {
                     let n = self.library.move_to_front(idx);
-                    self.carousel.selected = n;
-                    self.carousel.scroll_offset = n as f32;
+                    self.carousel.selected = n + crate::carousel::CS_FRONT;
+                    self.carousel.scroll_offset = (n + crate::carousel::CS_FRONT) as f32;
                 }
                 self.playing_path = Some(path);
             }
@@ -1858,7 +2077,19 @@ impl eframe::App for HorizonApp {
                 self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel;
             let playing_fs = m_run && !m_pause;
             let base_on = carousel_view && !playing_fs && !self.splash.active();
-            let mut target = if base_on { self.app_settings.music_volume } else { 0.0 };
+            // Slowly fade the music back in (~5s) after returning from a game.
+            if base_on && !self.music_was_on {
+                self.music_fade_start = Some(std::time::Instant::now());
+            }
+            self.music_was_on = base_on;
+            let ramp = if base_on {
+                self.music_fade_start
+                    .map(|s| (s.elapsed().as_secs_f32() / 5.0).clamp(0.0, 1.0))
+                    .unwrap_or(1.0)
+            } else {
+                1.0
+            };
+            let mut target = if base_on && !self.app_settings.music_muted { self.app_settings.music_volume * ramp } else { 0.0 };
             let mut lowpass = 0.0f32;
             let profiling = self.show_profile || self.profile_anim > 0.01;
             let on_music_slider = profiling
@@ -1866,13 +2097,16 @@ impl eframe::App for HorizonApp {
                 && self.profile.focus_content
                 && self.profile.row_selected == 2;
             if profiling && !on_music_slider {
-                target *= 0.62;
-                lowpass = 0.62;
+                target *= 0.34;
+                lowpass = 0.75;
             }
             if self.modal_active() {
                 lowpass = lowpass.max(0.6);
             }
             crate::ui_audio::set_music(target, lowpass);
+            if base_on && ramp < 1.0 {
+                ctx.request_repaint();
+            }
 
             let booting_now = m_run
                 && !m_pause
@@ -1892,7 +2126,7 @@ impl eframe::App for HorizonApp {
         }
 
         {
-            let kb_home = ctx.input(|i| i.key_pressed(egui::Key::Home));
+            let kb_home = ctx.input(|i| i.key_pressed(egui::Key::Home) || i.key_pressed(egui::Key::Backtick));
             let gp_home = self.last_input.home;
             let home_edge = kb_home || (gp_home && !self.last_home);
             self.last_home = gp_home;
@@ -1920,8 +2154,8 @@ impl eframe::App for HorizonApp {
                     if let Some(pp) = self.playing_path.clone() {
                         if let Some(idx) = self.library.index_of_path(&pp) {
                             let n = self.library.move_to_front(idx);
-                            self.carousel.selected = n;
-                            self.carousel.scroll_offset = n as f32;
+                            self.carousel.selected = n + crate::carousel::CS_FRONT;
+                            self.carousel.scroll_offset = (n + crate::carousel::CS_FRONT) as f32;
                         }
                     }
                     self.carousel.active_dock = false;
@@ -2457,6 +2691,8 @@ impl eframe::App for HorizonApp {
                         self.app_settings.music_volume,
                         self.app_settings.sfx_volume,
                         self.app_settings.eu_dates,
+                        self.app_settings.music_muted,
+                        self.app_settings.sfx_muted,
                         profile_active,
                         &self.last_input,
                         &mut self.input,
@@ -2503,11 +2739,22 @@ impl eframe::App for HorizonApp {
                             }
                             crate::profile::ProfileAction::SetSfxVolume(v) => {
                                 self.app_settings.sfx_volume = v.clamp(0.0, 1.0);
-                                crate::ui_audio::set_sfx_volume(self.app_settings.sfx_volume);
+                                if !self.app_settings.sfx_muted {
+                                    crate::ui_audio::set_sfx_volume(self.app_settings.sfx_volume);
+                                }
                                 let _ = self.app_settings.save();
                             }
                             crate::profile::ProfileAction::SetEuDates(on) => {
                                 self.app_settings.eu_dates = on;
+                                let _ = self.app_settings.save();
+                            }
+                            crate::profile::ProfileAction::SetMuteMusic(on) => {
+                                self.app_settings.music_muted = on;
+                                let _ = self.app_settings.save();
+                            }
+                            crate::profile::ProfileAction::SetMuteSfx(on) => {
+                                self.app_settings.sfx_muted = on;
+                                crate::ui_audio::set_sfx_volume(if on { 0.0 } else { self.app_settings.sfx_volume });
                                 let _ = self.app_settings.save();
                             }
                             crate::profile::ProfileAction::None => {}
@@ -2574,7 +2821,7 @@ impl eframe::App for HorizonApp {
                             let await_text = format!("Awaiting First Frame{}", dots);
                             let await_alpha = (fade_alpha * 255.0) as u8;
                             crate::carousel::shadowed_text(&painter, egui::pos2(center.x, text_y + 40.0), egui::Align2::CENTER_CENTER, &await_text, FontId::proportional(15.0), Color32::from_rgba_unmultiplied(0x00, 0xE5, 0xFF, await_alpha), false);
-                            crate::carousel::shadowed_text(&painter, egui::pos2(center.x, text_y + 74.0), egui::Align2::CENTER_CENTER, "[Home] Cancel", FontId::proportional(13.0), Color32::from_rgba_unmultiplied(0xC0, 0xC0, 0xCC, await_alpha), false);
+                            crate::carousel::shadowed_text(&painter, egui::pos2(center.x, text_y + 74.0), egui::Align2::CENTER_CENTER, "[Home / `] Cancel", FontId::proportional(13.0), Color32::from_rgba_unmultiplied(0xC0, 0xC0, 0xCC, await_alpha), false);
                         }
 
                         ctx.request_repaint();
@@ -2733,6 +2980,10 @@ impl eframe::App for HorizonApp {
                                 self.shop.open();
                                 crate::ui_audio::play(crate::ui_audio::Sfx::Open);
                             }
+                            crate::carousel::CarouselAction::OpenCarouselSettings => {
+                                self.carousel_settings_open = true;
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+                            }
                             crate::carousel::CarouselAction::None => {}
                         }
 
@@ -2882,6 +3133,7 @@ impl eframe::App for HorizonApp {
                         ctx.request_repaint();
                     }
                 }
+                self.update_carousel_settings(ctx, ui);
             });
 
         if self.show_settings {

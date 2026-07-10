@@ -84,6 +84,7 @@ impl CarouselTheme {
 pub enum BackdropTheme {
     Waves,
     Gradient,
+    Space,
     None,
 }
 
@@ -95,12 +96,14 @@ impl Default for BackdropTheme {
 
 impl BackdropTheme {
     pub fn all() -> &'static [BackdropTheme] {
+        // Space is hidden from the picker while it's a work in progress.
         &[BackdropTheme::Waves, BackdropTheme::Gradient, BackdropTheme::None]
     }
     pub fn label(&self) -> &'static str {
         match self {
             BackdropTheme::Waves => "Waves",
             BackdropTheme::Gradient => "Gradient",
+            BackdropTheme::Space => "Space",
             BackdropTheme::None => "None",
         }
     }
@@ -308,6 +311,19 @@ pub struct AppSettings {
     pub steamgriddb_key: String,
     #[serde(default)]
     pub eu_dates: bool,
+    #[serde(default)]
+    pub carousel_lists: Vec<GameList>,
+    #[serde(default)]
+    pub music_muted: bool,
+    #[serde(default)]
+    pub sfx_muted: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GameList {
+    pub name: String,
+    /// Game paths — duplicates are allowed here (lists are exempt from the no-dupe rule).
+    pub games: Vec<PathBuf>,
 }
 
 fn default_profile_name() -> String {
@@ -344,6 +360,9 @@ impl Default for AppSettings {
             profile_name: default_profile_name(),
             steamgriddb_key: String::new(),
             eu_dates: false,
+            carousel_lists: Vec::new(),
+            music_muted: false,
+            sfx_muted: false,
         }
     }
 }

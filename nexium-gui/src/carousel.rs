@@ -44,6 +44,7 @@ pub struct CarouselState {
     pub search_buf: String,
     pub search_focused: bool,
     pub profile_click_time: Option<f32>,
+    pub profile_push_at: Option<f32>,
     pub pending_center: Option<usize>,
     pub sel_held: bool,
     pub sel_edge: bool,
@@ -83,6 +84,7 @@ impl CarouselState {
             search_buf: String::new(),
             search_focused: false,
             profile_click_time: None,
+            profile_push_at: None,
             pending_center: None,
             sel_held: false,
             sel_edge: false,
@@ -111,9 +113,14 @@ pub enum CarouselAction {
     ToggleFavorite(String),
     DownloadIcon(String),
     OpenShop,
+    OpenCarouselSettings,
 }
 
 const DOCK_COUNT: usize = 10;
+
+/// Number of special cards before the games (the Carousel Settings cog).
+/// Set to 0 to hide it (WIP), 1 to show it.
+pub const CS_FRONT: usize = 0;
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
@@ -532,11 +539,108 @@ pub fn draw_backdrop(
             draw_wave_background(painter, rect, color, t, cx, cy, opacity, base);
         }
         BackdropTheme::Gradient => draw_gradient_backdrop(painter, rect, color, opacity, base),
+        BackdropTheme::Space => draw_space_backdrop(painter, rect, color, t, opacity),
         BackdropTheme::None => {
             if opacity <= 0.001 { return; }
             let a = (opacity * 255.0) as u8;
             painter.rect_filled(rect, Rounding::ZERO, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a));
         }
+    }
+}
+
+fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32, t: f32, opacity: f32) {
+    if opacity <= 0.001 {
+        return;
+    }
+    let a = |x: f32| (x * opacity).clamp(0.0, 255.0) as u8;
+    let sh = |c: Color32, f: f32| -> Color32 {
+        let adj = |v: u8| if f >= 0.0 { (v as f32 + (255.0 - v as f32) * f) as u8 } else { (v as f32 * (1.0 + f)) as u8 };
+        Color32::from_rgb(adj(c.r()), adj(c.g()), adj(c.b()))
+    };
+    let hash = |i: u32| -> f32 {
+        let x = ((i.wrapping_mul(2654435761)) ^ 0x9E3779B9) as f32;
+        (x.sin() * 43758.547).fract().abs()
+    };
+    let w = rect.width();
+    let h = rect.height();
+
+    // deep-space background, faintly tinted by the theme colour
+    let deep = sh(color, -0.86);
+    painter.rect_filled(rect, Rounding::ZERO, Color32::from_rgba_unmultiplied(deep.r().max(4), deep.g().max(5), deep.b().max(8), a(255.0)));
+
+    // starfield (twinkling), some tinted toward the theme colour
+    for i in 0..160u32 {
+        let sx = rect.min.x + hash(i * 2) * w;
+        let sy = rect.min.y + hash(i * 2 + 1) * h * 0.80;
+        let tw = 0.3 + 0.7 * (0.5 + 0.5 * (t * 1.7 + hash(i * 3) * 30.0).sin());
+        let r = 0.6 + hash(i * 5) * 1.8;
+        let tinted = hash(i * 7) > 0.55;
+        let col = if tinted { sh(color, 0.55) } else { Color32::from_rgb(0xFF, 0xFF, 0xFF) };
+        painter.circle_filled(egui::pos2(sx, sy), r, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a(210.0 * tw)));
+    }
+
+    // shooting stars across the top — one every ~3.4s, tinted by theme
+    let streak = sh(color, 0.6);
+    let period = 3.4;
+    let idx = (t / period).floor();
+    let ph = (t / period).fract();
+    if ph < 0.16 {
+        let prog = ph / 0.16;
+        let sy0 = rect.min.y + h * (0.05 + hash(idx as u32 * 13 + 1) * 0.32);
+        let dir = if hash(idx as u32 * 17) > 0.5 { 1.0 } else { -1.0 };
+        let sx0 = if dir > 0.0 { rect.min.x - 60.0 + prog * (w + 120.0) } else { rect.max.x + 60.0 - prog * (w + 120.0) };
+        let head = egui::pos2(sx0, sy0 + prog * h * 0.10);
+        let fade = (prog * std::f32::consts::PI).sin();
+        for s in 0..9 {
+            let ft = s as f32 / 9.0;
+            let px = head - Vec2::new(dir * 15.0 * s as f32, 4.5 * s as f32);
+            painter.circle_filled(px, 1.9 * (1.0 - ft), Color32::from_rgba_unmultiplied(streak.r(), streak.g(), streak.b(), a(235.0 * fade * (1.0 - ft))));
+        }
+        painter.circle_filled(head, 2.6, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, a(255.0 * fade)));
+    }
+
+    // rotating planet along the bottom, coloured from the theme
+    let pr = w * 0.95;
+    let pc = egui::pos2(rect.center().x, rect.max.y + pr * 0.58);
+    let ocean = sh(color, -0.42);
+    let land = sh(color, 0.28);
+    let lit = sh(color, 0.14);
+    // atmosphere glow
+    for g in 0..6 {
+        let e = (6 - g) as f32 * 5.0;
+        let glow = sh(color, 0.5);
+        painter.circle_stroke(pc, pr + e, Stroke::new(4.5, Color32::from_rgba_unmultiplied(glow.r(), glow.g(), glow.b(), a(18.0 * (1.0 - g as f32 / 6.0)))));
+    }
+    painter.circle_filled(pc, pr, Color32::from_rgba_unmultiplied(ocean.r(), ocean.g(), ocean.b(), a(255.0)));
+    // soft lit hemisphere (sun upper-left) — clipped inside the planet
+    let planet_clip = painter.with_clip_rect(egui::Rect::from_center_size(pc, Vec2::splat(pr * 2.0)));
+    planet_clip.circle_filled(pc - Vec2::new(pr * 0.28, pr * 0.22), pr * 0.86, Color32::from_rgba_unmultiplied(lit.r(), lit.g(), lit.b(), a(90.0)));
+
+    // continents (lat/long projected onto the sphere; longitude scrolls = rotation)
+    let conts: [(f32, f32, f32); 7] = [
+        (0.0, 0.35, 1.0),
+        (1.0, -0.05, 0.8),
+        (2.1, 0.15, 1.1),
+        (3.0, 0.45, 0.7),
+        (3.9, -0.2, 0.9),
+        (4.8, 0.05, 1.0),
+        (5.6, 0.28, 0.75),
+    ];
+    for (bl, lat, sz) in conts {
+        let lam = bl + t * 0.09;
+        let coslam = lam.cos();
+        if coslam <= 0.12 {
+            continue;
+        }
+        let sx = pc.x + pr * lat.cos() * lam.sin();
+        let sy = pc.y - pr * lat.sin();
+        if sy > rect.max.y + pr * 0.06 {
+            continue;
+        }
+        let cr = pr * 0.11 * sz * (0.4 + 0.6 * coslam);
+        // darken toward the trailing (right) edge for a subtle terminator
+        let shade = (0.55 + 0.45 * ((sx - pc.x) / pr * -1.0 + 0.5)).clamp(0.35, 1.0);
+        planet_clip.circle_filled(egui::pos2(sx, sy), cr, Color32::from_rgba_unmultiplied((land.r() as f32 * shade) as u8, (land.g() as f32 * shade) as u8, (land.b() as f32 * shade) as u8, a(255.0)));
     }
 }
 
@@ -692,19 +796,31 @@ pub fn carousel_view(
 
     if let Some(lib_idx) = state.pending_center.take() {
         if let Some(pos) = filtered_indices.iter().position(|&x| x == lib_idx) {
-            state.selected = pos;
-            state.scroll_offset = pos as f32;
+            state.selected = pos + CS_FRONT;
+            state.scroll_offset = (pos + CS_FRONT) as f32;
         }
     }
 
-    // The items in the carousel will be the filtered games, plus the "Add Dir" card!
-    let n_items = filtered_indices.len() + 1;
+    // Card layout: [0..CS_FRONT) = Carousel Settings cog (hidden while WIP),
+    // then games, then Add Dir. CS_FRONT=0 hides the cog; set to 1 to re-enable.
+    let n_games = filtered_indices.len();
+    let front = CS_FRONT;
+    let n_items = n_games + 1 + front;
+    let game_of = |i: usize| -> Option<usize> {
+        if i >= front && i < front + n_games {
+            filtered_indices.get(i - front).copied()
+        } else {
+            None
+        }
+    };
 
     let bg_rect = ui.max_rect();
     let t = ui.input(|i| i.time) as f32;
     let dt = ui.input(|i| i.stable_dt).min(0.1);
 
-    let theme_target = if light_mode { 1.0 } else { 0.0 };
+    // Space is always a dark sky, so keep the UI bright on it (no black-on-black).
+    let space_bg = backdrop_theme == crate::app_settings::BackdropTheme::Space;
+    let theme_target = if light_mode && !space_bg { 1.0 } else { 0.0 };
     state.theme_t += (theme_target - state.theme_t) * (dt * 5.0).min(1.0);
     if (state.theme_t - theme_target).abs() < 0.002 {
         state.theme_t = theme_target;
@@ -833,7 +949,7 @@ pub fn carousel_view(
         state.scroll_offset += (state.selected as f32 - state.scroll_offset) * (dt * 11.0).min(1.0);
     }
 
-    let target_color = if state.selected == filtered_indices.len() {
+    let target_color = if game_of(state.selected).is_none() {
         Color32::from_rgb(0x35, 0x38, 0x42)
     } else if theme == crate::app_settings::CarouselTheme::Rgb {
         let speed = 0.025;
@@ -843,13 +959,10 @@ pub fn carousel_view(
     } else {
         match theme.color() {
             Some((r, g, b)) => Color32::from_rgb(r, g, b),
-            None => {
-                if state.selected < filtered_indices.len() {
-                    lib.games[filtered_indices[state.selected]].dominant_color
-                } else {
-                    Color32::from_rgb(0x35, 0x38, 0x42)
-                }
-            }
+            None => match game_of(state.selected) {
+                Some(gi) => lib.games[gi].dominant_color,
+                None => Color32::from_rgb(0x35, 0x38, 0x42),
+            },
         }
     };
     state.ambient_color = lerp_color(state.ambient_color, target_color, (dt * 10.0).min(1.0));
@@ -898,15 +1011,20 @@ pub fn carousel_view(
 
     let mut want_fav: Option<String> = None;
     let mut want_download: Option<String> = None;
+    let mut fav_first: Option<egui::Rect> = None;
+    let mut lib_first: Option<egui::Rect> = None;
+    // Show as many cards as fit the window so wide/stretched displays fill out.
+    let cull_max = (((bg_rect.max.x - hero_cx) / stride) + 1.6).max(4.6);
+    let fade_start = cull_max - 1.6;
     for i in 0..n_items {
         let diff     = i as f32 - state.scroll_offset;
         let abs_diff = diff.abs();
-        if abs_diff > 4.6 && state.boot_stage == BootStage::None { continue; }
+        if abs_diff > cull_max && state.boot_stage == BootStage::None { continue; }
 
         let scale   = (1.0 - abs_diff * 0.05).max(0.82);
-        let mut alpha_f = (1.0 - abs_diff * 0.14).clamp(0.0, 1.0);
-        if abs_diff > 3.6 {
-            alpha_f *= (4.6 - abs_diff).clamp(0.0, 1.0);
+        let mut alpha_f = (1.0 - abs_diff * 0.03).clamp(0.0, 1.0);
+        if abs_diff > fade_start {
+            alpha_f *= ((cull_max - abs_diff) / (cull_max - fade_start)).clamp(0.0, 1.0);
         }
         let sz      = hero_size * scale;
         let cx      = hero_cx + diff * stride;
@@ -1009,24 +1127,30 @@ pub fn carousel_view(
             }
         }
 
-        let is_add_dir = i == filtered_indices.len();
+        let is_settings = front > 0 && i == 0;
+        let is_add_dir = i == n_items - 1;
+        let card_game = game_of(i);
         let resp = ui.interact(draw_rect, egui::Id::new(("carousel_card", i)), Sense::click());
         if interactive && resp.clicked() && !state.drag_moved && state.boot_stage == BootStage::None {
             if state.selected == i {
                 if state.active_dock {
                     state.active_dock = false;
+                } else if is_settings {
+                    action = CarouselAction::OpenCarouselSettings;
                 } else if is_add_dir {
                     action = CarouselAction::AddFolder;
-                } else if playing == Some(filtered_indices[i]) {
-                    action = CarouselAction::Resume;
-                } else if is_running {
-                    action = CarouselAction::Launch(lib.games[filtered_indices[i]].path.to_string_lossy().to_string());
-                } else {
-                    state.boot_stage = BootStage::Transitioning {
-                        game_index: i,
-                        start_time: t,
-                        launch_path: lib.games[filtered_indices[i]].path.to_string_lossy().to_string(),
-                    };
+                } else if let Some(gi) = card_game {
+                    if playing == Some(gi) {
+                        action = CarouselAction::Resume;
+                    } else if is_running {
+                        action = CarouselAction::Launch(lib.games[gi].path.to_string_lossy().to_string());
+                    } else {
+                        state.boot_stage = BootStage::Transitioning {
+                            game_index: i,
+                            start_time: t,
+                            launch_path: lib.games[gi].path.to_string_lossy().to_string(),
+                        };
+                    }
                 }
             } else {
                 state.selected = i;
@@ -1034,9 +1158,10 @@ pub fn carousel_view(
             }
         }
 
-        if interactive && !is_add_dir && state.boot_stage == BootStage::None {
-            let path_string = lib.games[filtered_indices[i]].path.to_string_lossy().to_string();
-            let favd = favorites.iter().any(|p| *p == lib.games[filtered_indices[i]].path);
+        if interactive && card_game.is_some() && state.boot_stage == BootStage::None {
+            let gi = card_game.unwrap();
+            let path_string = lib.games[gi].path.to_string_lossy().to_string();
+            let favd = favorites.iter().any(|p| *p == lib.games[gi].path);
             resp.context_menu(|ui| {
                 let label = if favd { "★  Unfavorite Game" } else { "☆  Favorite Game" };
                 if ui.button(label).clicked() {
@@ -1051,7 +1176,39 @@ pub fn carousel_view(
         }
 
         let tint = Color32::from_white_alpha((alpha_f * 255.0) as u8);
-        if is_add_dir {
+        if is_settings {
+            let a8 = (alpha_f * 255.0) as u8;
+            // app-icon backdrop (indigo, with a soft top gloss)
+            let bg = Color32::from_rgb(0x53, 0x5E, 0xC8);
+            painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8));
+            let top = egui::Rect::from_min_max(draw_rect.min, egui::pos2(draw_rect.max.x, draw_rect.center().y));
+            painter.rect_filled(top, Rounding { nw: 14.0 * scale_factor, ne: 14.0 * scale_factor, sw: 0.0, se: 0.0 }, Color32::from_white_alpha((alpha_f * 22.0) as u8));
+
+            let ctr = draw_rect.center();
+            let cw = draw_rect.width();
+            let white = Color32::from_white_alpha(a8);
+            let body = cw * 0.20;
+            let tip = cw * 0.30;
+            let teeth = 8;
+            for k in 0..teeth {
+                let ang = k as f32 / teeth as f32 * std::f32::consts::TAU;
+                let radial = Vec2::new(ang.cos(), ang.sin());
+                let tangent = Vec2::new(-ang.sin(), ang.cos());
+                let hl = (tip - body) * 0.5 + cw * 0.04;
+                let rm = tip - hl;
+                let hw = cw * 0.055;
+                let c = ctr + radial * rm;
+                let quad = vec![
+                    c + radial * hl + tangent * hw,
+                    c + radial * hl - tangent * hw,
+                    c - radial * hl - tangent * hw,
+                    c - radial * hl + tangent * hw,
+                ];
+                painter.add(egui::Shape::convex_polygon(quad, white, Stroke::NONE));
+            }
+            painter.circle_filled(ctr, body, white);
+            painter.circle_filled(ctr, body * 0.42, Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8));
+        } else if is_add_dir {
             painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(col_surface.r(), col_surface.g(), col_surface.b(), (alpha_f * 255.0) as u8));
             painter.rect_stroke(draw_rect, Rounding::same(14.0 * scale_factor), Stroke::new(1.0 * scale_factor, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (alpha_f * 255.0) as u8)));
 
@@ -1077,7 +1234,7 @@ pub fn carousel_view(
                 Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), (alpha_f * 255.0) as u8),
             );
         } else {
-            let real_idx = filtered_indices[i];
+            let real_idx = game_of(i).unwrap();
             let card_fill = tl(Color32::from_rgb(0x14, 0x14, 0x1A), Color32::from_rgb(0xE6, 0xE6, 0xEC));
             painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(card_fill.r(), card_fill.g(), card_fill.b(), (alpha_f * 255.0) as u8));
             if let Some(tex) = lib.texture(ctx, real_idx) {
@@ -1168,17 +1325,13 @@ pub fn carousel_view(
                 );
             }
 
-            if favorites.iter().any(|p| *p == lib.games[real_idx].path) {
-                let badge_r = draw_rect.width() * 0.10;
-                let badge_c = egui::pos2(draw_rect.min.x + badge_r + 8.0 * scale_factor, draw_rect.min.y + badge_r + 8.0 * scale_factor);
-                painter.circle_filled(badge_c, badge_r, Color32::from_rgba_unmultiplied(0x10, 0x10, 0x16, (alpha_f * 200.0) as u8));
-                painter.text(
-                    badge_c,
-                    egui::Align2::CENTER_CENTER,
-                    "★",
-                    FontId::proportional(badge_r * 1.3),
-                    Color32::from_rgba_unmultiplied(0xF5, 0xC1, 0x42, (alpha_f * 255.0) as u8),
-                );
+            let favd_here = favorites.iter().any(|p| *p == lib.games[real_idx].path);
+            if favd_here {
+                if fav_first.is_none() || draw_rect.min.x < fav_first.unwrap().min.x {
+                    fav_first = Some(draw_rect);
+                }
+            } else if lib_first.is_none() || draw_rect.min.x < lib_first.unwrap().min.x {
+                lib_first = Some(draw_rect);
             }
 
             if playing == Some(real_idx) && playing_alpha > 0.01 && state.boot_stage == BootStage::None {
@@ -1230,8 +1383,64 @@ pub fn carousel_view(
                     pill_font,
                     Color32::from_rgba_unmultiplied(0xEA, 0xFF, 0xEE, a(255.0)),
                 );
+
+                // player avatar at the top-left, with a little idle dance every ~3s
+                let av_sz = draw_rect.width() * 0.17;
+                let mut avc = egui::pos2(draw_rect.min.x + av_sz * 0.5 + 10.0 * scale_factor, draw_rect.min.y + av_sz * 0.5 + 10.0 * scale_factor);
+                let (mut sx, mut sy) = (1.0f32, 1.0f32);
+                let cyc = t.rem_euclid(3.0);
+                if cyc < 0.55 {
+                    let e = cyc / 0.55;
+                    let wob = (e * std::f32::consts::TAU).sin() * 0.12 * (1.0 - e);
+                    sx = 1.0 + wob;
+                    sy = 1.0 - wob;
+                    avc.y -= (e * std::f32::consts::PI).sin() * av_sz * 0.10;
+                }
+                let arect = egui::Rect::from_center_size(avc, Vec2::new(av_sz * sx, av_sz * sy));
+                painter.circle_filled(avc, av_sz * 0.5 * sx.max(sy) + 2.5 * scale_factor, Color32::from_rgba_unmultiplied(0x0C, 0x14, 0x0E, a(230.0)));
+                painter.circle_stroke(avc, av_sz * 0.5 * sx.max(sy) + 2.5 * scale_factor, Stroke::new(1.6 * scale_factor, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(235.0))));
+                if let Some(tex) = profile_tex {
+                    draw_rounded_image(&painter, tex, arect, av_sz * 0.5, Color32::from_white_alpha(a(255.0)));
+                }
             }
         }
+    }
+
+    // Section headers above the rows (e.g. "Favorites"). Kept clean — text only.
+    let draw_section = |painter: &egui::Painter, rect: egui::Rect, star: bool, label: &str| {
+        let hy = rect.min.y - 30.0 * scale_factor;
+        let hx = rect.min.x + 4.0 * scale_factor;
+        let col = Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), (ui_opacity * 235.0) as u8);
+        let fs = 22.0 * scale_factor;
+        let mut x = hx;
+        if star {
+            painter.text(egui::pos2(x, hy), egui::Align2::LEFT_CENTER, "★", FontId::proportional(fs * 0.92), Color32::from_rgba_unmultiplied(0xF5, 0xC1, 0x42, (ui_opacity * 255.0) as u8));
+            x += fs * 1.1;
+        }
+        shadowed_text(painter, egui::pos2(x, hy), egui::Align2::LEFT_CENTER, label, FontId::proportional(fs), col, true);
+    };
+    if state.boot_stage == BootStage::None {
+        if let Some(r) = fav_first {
+            draw_section(&painter, r, true, "Favorites");
+        }
+        if fav_first.is_some() {
+            if let Some(r) = lib_first {
+                draw_section(&painter, r, false, "Library");
+            }
+        }
+    }
+
+    // Console-OS version tag, bottom-left — plain grey translucent text.
+    {
+        let os_tag = concat!("NexOS-", env!("NEXIUM_GIT_HASH"), "-v", env!("CARGO_PKG_VERSION"), "  ·  IN-DEV");
+        let pos = egui::pos2(bg_rect.min.x + 22.0 * scale_factor, bg_rect.max.y - 18.0 * scale_factor);
+        painter.text(
+            pos,
+            egui::Align2::LEFT_BOTTOM,
+            os_tag,
+            FontId::proportional(15.5 * scale_factor),
+            Color32::from_rgba_unmultiplied(0x80, 0x80, 0x88, (ui_opacity * 150.0) as u8),
+        );
     }
 
     if let Some(p) = want_fav {
@@ -1258,16 +1467,12 @@ pub fn carousel_view(
     let meta_x = hero_cx;
     let meta_y = hero_cy + hero_size * 0.52 + 36.0 + hero_bob;
 
-    let launch_path = if state.selected < filtered_indices.len() {
-        Some(lib.games[filtered_indices[state.selected]].path.to_string_lossy().to_string())
-    } else {
-        None
-    };
+    let launch_path = game_of(state.selected).map(|gi| lib.games[gi].path.to_string_lossy().to_string());
 
-    let (sel_title, sel_sub) = if state.selected == filtered_indices.len() {
-        ("Add Folder".to_string(), "Add folder destinations for your decrypted ROMs".to_string())
-    } else {
-        let selected_game = &lib.games[filtered_indices[state.selected]];
+    let (sel_title, sel_sub) = if CS_FRONT > 0 && state.selected == 0 {
+        ("Carousel Settings".to_string(), "Customize how your carousel looks and behaves".to_string())
+    } else if let Some(gi) = game_of(state.selected) {
+        let selected_game = &lib.games[gi];
         let title = selected_game.title.clone();
         let sub = format!(
             "{}  ·  {}  ·  {:.1} MB",
@@ -1276,6 +1481,8 @@ pub fn carousel_view(
             selected_game.size as f32 / (1024.0 * 1024.0),
         );
         (title, sub)
+    } else {
+        ("Add Folder".to_string(), "Add folder destinations for your decrypted ROMs".to_string())
     };
 
     let title_col = if state.active_dock { col_muted } else { col_text };
@@ -1509,8 +1716,8 @@ pub fn carousel_view(
 
     let gm_target = if state.game_menu_open { 1.0 } else { 0.0 };
     state.game_menu_anim += (gm_target - state.game_menu_anim) * (dt * 18.0).min(1.0);
-    if state.game_menu_anim > 0.004 && state.selected < filtered_indices.len() {
-        let gi = filtered_indices[state.selected];
+    if state.game_menu_anim > 0.004 && game_of(state.selected).is_some() {
+        let gi = game_of(state.selected).unwrap();
         let favd = favorites.iter().any(|p| *p == lib.games[gi].path);
         let e = { let a = state.game_menu_anim.clamp(0.0, 1.0); a * a * (3.0 - 2.0 * a) };
         let sc = |p: egui::Pos2| screen_center + (p - screen_center) * scale_factor;
@@ -1688,6 +1895,22 @@ pub fn carousel_view(
             } else {
                 state.profile_click_time = None;
                 action = CarouselAction::OpenProfile;
+            }
+        }
+
+        // mini "pushed-up" squeeze when the profile is focused from below
+        if let Some(pt) = state.profile_push_at {
+            let e = t - pt;
+            let dur = 0.34f32;
+            if e < dur {
+                let p = e / dur;
+                let s = (p * std::f32::consts::PI).sin() * (1.0 - p * 0.4);
+                dance_scale_y += 0.16 * s;
+                dance_scale_x -= 0.09 * s;
+                dance_offset.y -= 10.0 * scale_factor * s;
+                ui.ctx().request_repaint();
+            } else {
+                state.profile_push_at = None;
             }
         }
 
@@ -1923,16 +2146,8 @@ pub fn carousel_view(
     }
 
     if interactive && state.boot_stage == BootStage::None {
-        let launch_path = if state.selected < filtered_indices.len() {
-            Some(lib.games[filtered_indices[state.selected]].path.to_string_lossy().to_string())
-        } else {
-            None
-        };
-        let is_playing = if state.selected < filtered_indices.len() {
-            playing == Some(filtered_indices[state.selected])
-        } else {
-            false
-        };
+        let launch_path = game_of(state.selected).map(|gi| lib.games[gi].path.to_string_lossy().to_string());
+        let is_playing = game_of(state.selected).map_or(false, |gi| playing == Some(gi));
         handle_input(
             state,
             last_input,
@@ -2013,6 +2228,23 @@ fn handle_input(
             if ly >  0.5 { up    = true; nav = true; }
             if ly < -0.5 { down  = true; nav = true; }
             if nav { LAST_NAV.store(now.to_bits(), Ordering::Relaxed); }
+        }
+    }
+
+    let mut from_wheel = false;
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST_WHEEL: AtomicU64 = AtomicU64::new(0);
+        let now = ui.input(|i| i.time);
+        let (wx, wy) = ui.input(|i| (i.smooth_scroll_delta.x, i.smooth_scroll_delta.y));
+        let w = if wx.abs() > wy.abs() { wx } else { -wy };
+        if w.abs() > 1.5 {
+            let last = f64::from_bits(LAST_WHEEL.load(Ordering::Relaxed));
+            if now - last > 0.10 {
+                if w > 0.0 { right = true; } else { left = true; }
+                from_wheel = true;
+                LAST_WHEEL.store(now.to_bits(), Ordering::Relaxed);
+            }
         }
     }
 
@@ -2145,6 +2377,9 @@ fn handle_input(
         if state.active_dock {
             state.active_dock = false;
         } else {
+            if !state.profile_focused {
+                state.profile_push_at = Some(ui.input(|i| i.time) as f32);
+            }
             state.profile_focused = true;
         }
     }
@@ -2156,7 +2391,7 @@ fn handle_input(
         || state.profile_focused != pre_prof
     {
         crate::ui_audio::play_move();
-        if last_input.connected {
+        if last_input.connected && !from_wheel {
             if let Some(ref mut backend) = ib {
                 let _ = backend.rumble(15000, 15000, 35);
             }
@@ -2202,6 +2437,8 @@ fn handle_input(
                     _ => CarouselAction::None,
                 };
             }
+        } else if CS_FRONT > 0 && state.selected == 0 {
+            *action = CarouselAction::OpenCarouselSettings;
         } else if is_playing {
             *action = CarouselAction::Resume;
         } else if let Some(path) = &launch_path {

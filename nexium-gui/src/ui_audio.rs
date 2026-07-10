@@ -209,7 +209,9 @@ fn build() -> Option<Engine> {
 
     let mut cur_gain = 0.0f32;
     let mut music_pos = 0.0f64;
+    let mut music_gap = 0.0f64;
     let mut lp_y = 0.0f32;
+    let loop_gap_frames = dev_sr as f64 * 5.0;
 
     let err_cb = |e| log::warn!("ui_audio stream error: {}", e);
     let stream = device
@@ -238,12 +240,18 @@ fn build() -> Option<Engine> {
                     }
                     cur_gain += (target - cur_gain) * gain_step;
                     let m = if mlen > 0 {
-                        let idx = (music_pos as usize) % mlen;
-                        music_pos += music_step;
-                        if music_pos >= mlen as f64 {
-                            music_pos -= mlen as f64;
+                        if music_gap > 0.0 {
+                            music_gap -= 1.0;
+                            0.0
+                        } else {
+                            let idx = (music_pos as usize) % mlen;
+                            music_pos += music_step;
+                            if music_pos >= mlen as f64 {
+                                music_pos -= mlen as f64;
+                                music_gap = loop_gap_frames;
+                            }
+                            music_cb[idx]
                         }
-                        music_cb[idx]
                     } else {
                         0.0
                     };
