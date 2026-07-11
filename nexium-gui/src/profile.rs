@@ -54,7 +54,11 @@ pub struct ProfileState {
     pub shown_tab: ProfileTab,
     pub name_editing: bool,
     pub b_held: bool,
+    pub x_held: bool,
     pub theme_t: f32,
+    pub avatar_bounce: Option<f32>,
+    // celebration particles: (spawn_time, angle, speed, kind) — kind 255 = star, else confetti color idx
+    pub avatar_stars: Vec<(f32, f32, f32, u8)>,
 }
 
 impl ProfileState {
@@ -70,7 +74,10 @@ impl ProfileState {
             shown_tab: ProfileTab::Profile,
             name_editing: false,
             b_held: false,
+            x_held: false,
             theme_t: 0.0,
+            avatar_bounce: None,
+            avatar_stars: Vec::new(),
         }
     }
 }
@@ -84,6 +91,9 @@ pub enum ProfileAction {
     SetLightMode(bool),
     SetMusicVolume(f32),
     SetSfxVolume(f32),
+    SetEuDates(bool),
+    SetMuteMusic(bool),
+    SetMuteSfx(bool),
     QuickLaunch(String),
 }
 
@@ -166,6 +176,9 @@ pub fn profile_view(
     light_mode: bool,
     music_volume: f32,
     sfx_volume: f32,
+    eu_dates: bool,
+    music_muted: bool,
+    sfx_muted: bool,
     active: bool,
     last_input: &InputSnapshot,
     ib: &mut Option<crate::input::InputBackend>,
@@ -321,6 +334,14 @@ pub fn profile_view(
         tab_right = false;
     }
 
+    // X (or M) toggles mute on the volume rows
+    let x_down = last_input.connected && last_input.is(crate::controller_config::SwitchButton::X);
+    let mut mute_toggle = (x_down && !state.x_held) || ui.input(|i| i.key_pressed(egui::Key::M));
+    state.x_held = x_down;
+    if !active || editing {
+        mute_toggle = false;
+    }
+
     const TAB_ORDER: [ProfileTab; 4] = [
         ProfileTab::Profile,
         ProfileTab::RecentlyPlayed,
@@ -328,7 +349,7 @@ pub fn profile_view(
         ProfileTab::System,
     ];
     let tab_idx = TAB_ORDER.iter().position(|x| *x == state.tab).unwrap_or(0);
-    const N_SETTINGS: usize = 4;
+    const N_SETTINGS: usize = 5;
     let launch_enter = enter && state.focus_content;
 
     if tab_left {
@@ -400,7 +421,10 @@ pub fn profile_view(
             action = ProfileAction::SetLightMode(!light_mode);
             crate::ui_audio::play(crate::ui_audio::Sfx::Select);
         } else if state.row_selected == 2 {
-            if enter {
+            if mute_toggle {
+                action = ProfileAction::SetMuteMusic(!music_muted);
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            } else if enter {
                 action = ProfileAction::SetMusicVolume((music_volume + 0.05).min(1.0));
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             } else if leave {
@@ -408,13 +432,19 @@ pub fn profile_view(
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             }
         } else if state.row_selected == 3 {
-            if enter {
+            if mute_toggle {
+                action = ProfileAction::SetMuteSfx(!sfx_muted);
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            } else if enter {
                 action = ProfileAction::SetSfxVolume((sfx_volume + 0.05).min(1.0));
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             } else if leave {
                 action = ProfileAction::SetSfxVolume((sfx_volume - 0.05).max(0.0));
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             }
+        } else if state.row_selected == 4 && (enter || leave) {
+            action = ProfileAction::SetEuDates(!eu_dates);
+            crate::ui_audio::play(crate::ui_audio::Sfx::Select);
         }
     } else {
         if up {
@@ -561,6 +591,9 @@ pub fn profile_view(
                 light_mode,
                 music_volume,
                 sfx_volume,
+                eu_dates,
+                music_muted,
+                sfx_muted,
                 &mut action,
                 scale_factor,
                 &scale_pos,
@@ -576,12 +609,17 @@ pub fn profile_view(
         ctx.request_repaint();
     }
 
+    let on_volume = state.tab == ProfileTab::Settings && state.focus_content && (state.row_selected == 2 || state.row_selected == 3);
     let hint = if last_input.connected {
-        if state.focus_content {
+        if on_volume {
+            "🎮  [Up/Down] Select      [X] To Mute      [B] Back to Menu"
+        } else if state.focus_content {
             "🎮  [Up/Down] Select      [B] Back to Menu"
         } else {
             "🎮  [Up/Down] Move      [A] Enter      [B] Back"
         }
+    } else if on_volume {
+        "⌨  [Esc] Back      [M] To Mute      Click a tab"
     } else {
         "⌨  [Esc] Back      Click a tab      Scroll wheel"
     };
@@ -654,6 +692,9 @@ fn settings_page(
     light_mode: bool,
     music_volume: f32,
     sfx_volume: f32,
+    eu_dates: bool,
+    music_muted: bool,
+    sfx_muted: bool,
     action: &mut ProfileAction,
     scale_factor: f32,
     scale_pos: &impl Fn(egui::Pos2) -> egui::Pos2,
@@ -663,7 +704,7 @@ fn settings_page(
     let row_h = 68.0 * s;
     let row_gap = 12.0 * s;
     
-    let rows: [(&str, &str, String); 4] = [
+    let rows: [(&str, &str, String); 5] = [
         (
             "Backdrop Theme",
             "Background style behind the menus",
@@ -676,6 +717,11 @@ fn settings_page(
         ),
         ("Menu Music", "Background music volume in the carousel", "".to_string()),
         ("SFX Volume", "Sound effects volume for UI interactions", "".to_string()),
+        (
+            "Time Preference",
+            "Either 12 hour clock or 24 hour Military Time",
+            if eu_dates { "24h".to_string() } else { "12h".to_string() },
+        ),
     ];
 
     for (idx, (title, subtitle, value)) in rows.iter().enumerate() {
@@ -698,6 +744,10 @@ fn settings_page(
                 }
                 1 => {
                     *action = ProfileAction::SetLightMode(!light_mode);
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                }
+                4 => {
+                    *action = ProfileAction::SetEuDates(!eu_dates);
                     crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                 }
                 _ => {}
@@ -726,8 +776,25 @@ fn settings_page(
 
         let arrow_col = if focused { accent } else { pal.muted };
 
-        if idx >= 2 {
+        if idx == 2 || idx == 3 {
             let val = if idx == 2 { music_volume } else { sfx_volume };
+            // mute checkbox to the left of the slider arrows
+            let is_muted = if idx == 2 { music_muted } else { sfx_muted };
+            let cb = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 340.0 * s, row.center().y), Vec2::splat(24.0 * s)));
+            painter.rect_filled(cb, Rounding::same(5.0 * s * scale_factor), if is_muted { accent } else { pal.input_bg });
+            painter.rect_stroke(cb, Rounding::same(5.0 * s * scale_factor), Stroke::new(1.5 * scale_factor, pal.border));
+            if is_muted {
+                let c = cb.center();
+                let z = cb.width() * 0.3;
+                painter.add(egui::Shape::line(vec![c + Vec2::new(-z, 0.0), c + Vec2::new(-z * 0.2, z * 0.7), c + Vec2::new(z, -z * 0.8)], Stroke::new(2.2 * scale_factor, Color32::WHITE)));
+            }
+            painter.text(scale_pos(egui::pos2(row.max.x - 340.0 * s, row.center().y - 20.0 * s)), egui::Align2::CENTER_CENTER, "Mute", FontId::proportional(11.0 * s * scale_factor), pal.muted);
+            if ui.allocate_rect(cb, Sense::click()).clicked() {
+                *action = if idx == 2 { ProfileAction::SetMuteMusic(!is_muted) } else { ProfileAction::SetMuteSfx(!is_muted) };
+                state.focus_content = true;
+                state.row_selected = idx;
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            }
             
             // Slider layout dimensions
             let slider_w = 160.0 * s;
@@ -836,6 +903,23 @@ fn settings_page(
                 arrow_col_r,
             );
         } else {
+            // clickable left/right arrows (mouse users): left = previous, right = next
+            let la = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 168.0 * s, row.center().y), Vec2::splat(34.0 * s)));
+            let ra = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 30.0 * s, row.center().y), Vec2::splat(34.0 * s)));
+            let la_c = ui.allocate_rect(la, Sense::click()).clicked();
+            let ra_c = ui.allocate_rect(ra, Sense::click()).clicked();
+            if la_c || ra_c {
+                let fwd = ra_c;
+                match idx {
+                    0 => *action = ProfileAction::SetBackdropTheme(if fwd { backdrop_theme.next() } else { backdrop_theme.prev() }),
+                    1 => *action = ProfileAction::SetLightMode(!light_mode),
+                    4 => *action = ProfileAction::SetEuDates(!eu_dates),
+                    _ => {}
+                }
+                state.focus_content = true;
+                state.row_selected = idx;
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            }
             painter.text(
                 scale_pos(egui::pos2(row.max.x - 168.0 * s, row.center().y)),
                 egui::Align2::CENTER_CENTER,
@@ -880,7 +964,101 @@ fn profile_page(
 ) {
     let av_r = (content.height() * 0.18).clamp(90.0, 190.0);
     let av_center = egui::pos2(content.min.x + av_r + 20.0 * s, content.center().y - av_r * 0.2);
-    draw_circle_avatar(painter, scale_pos(av_center), av_r * scale_factor, avatar_tex, accent, scale_factor, pal);
+    let now = ui.input(|i| i.time) as f32;
+    let sc_av = scale_pos(av_center);
+    let sc_avr = av_r * scale_factor;
+
+    let av_resp = ui.allocate_rect(egui::Rect::from_center_size(sc_av, Vec2::splat(sc_avr * 2.0)), Sense::click());
+    if av_resp.clicked() {
+        state.avatar_bounce = Some(now);
+        // roll for a rare celebration (~1 in 4)
+        let rng = |k: f32| { let h = ((now * 61.7 + k * 13.13).sin() * 43758.5453).fract(); h.abs() };
+        if rng(1.0) < 0.24 {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Celebration);
+            state.avatar_stars.push((now, -0.85, 0.0, 255)); // the star
+            for k in 0..14 {
+                let ang = -std::f32::consts::PI * (0.15 + rng(k as f32 * 2.0) * 0.7);
+                let spd = 260.0 + rng(k as f32 * 3.1) * 360.0;
+                state.avatar_stars.push((now, ang, spd, (k % 6) as u8));
+            }
+        } else {
+            crate::ui_audio::play(crate::ui_audio::Sfx::WhistleOk);
+        }
+        if state.avatar_stars.len() > 80 {
+            let drop = state.avatar_stars.len() - 80;
+            state.avatar_stars.drain(0..drop);
+        }
+    }
+
+    // springy bounce on the avatar
+    let mut bounce = 1.0f32;
+    if let Some(bt) = state.avatar_bounce {
+        let e = now - bt;
+        if e < 0.42 {
+            let p = e / 0.42;
+            bounce = 1.0 + (p * std::f32::consts::PI * 2.0).sin() * 0.14 * (1.0 - p);
+            ui.ctx().request_repaint();
+        } else {
+            state.avatar_bounce = None;
+        }
+    }
+    draw_circle_avatar(painter, sc_av, sc_avr * bounce, avatar_tex, accent, scale_factor, pal);
+
+    // celebration particles (short-lived confetti + a star that burns up fast)
+    state.avatar_stars.retain(|(t0, _, _, kind)| now - t0 < if *kind == 255 { 1.1 } else { 1.0 });
+    let palette = [
+        Color32::from_rgb(0xE8, 0x33, 0x50),
+        Color32::from_rgb(0x2F, 0xB4, 0xEF),
+        Color32::from_rgb(0x35, 0xD0, 0x6A),
+        Color32::from_rgb(0xF5, 0xC1, 0x42),
+        Color32::from_rgb(0xC9, 0x5C, 0xF6),
+        Color32::from_rgb(0xFF, 0x8A, 0x3D),
+    ];
+    let head = sc_av + Vec2::new(sc_avr * 0.62, -sc_avr * 0.7);
+    for &(t0, ang, spd, kind) in &state.avatar_stars {
+        let age = now - t0;
+        if kind == 255 {
+            let p = (age / 1.1).min(1.0);
+            let pop = if p < 0.18 { p / 0.18 } else { 1.0 };
+            let fade = if p > 0.6 { ((1.0 - p) / 0.4).clamp(0.0, 1.0) } else { 1.0 };
+            let sp = head + Vec2::new(0.0, -sc_avr * 0.10 * p) + Vec2::new((ang).cos(), (ang).sin()) * sc_avr * 0.12 * p;
+            let sr = sc_avr * 0.16 * pop * (0.7 + 0.3 * fade);
+            let col = Color32::from_rgba_unmultiplied(0xFF, 0xCB, 0x2E, (fade * 255.0) as u8);
+            let outline = Color32::from_rgba_unmultiplied(0xC8, 0x8A, 0x00, (fade * 255.0) as u8);
+            let pts: Vec<egui::Pos2> = (0..10)
+                .map(|k| {
+                    let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::PI / 5.0;
+                    let rr = if k % 2 == 0 { sr } else { sr * 0.5 };
+                    sp + Vec2::new(a.cos() * rr, a.sin() * rr)
+                })
+                .collect();
+            // filled star via a triangle fan from the center (convex_polygon can't do concave)
+            let mut mesh = egui::epaint::Mesh::default();
+            let mk = |pos: egui::Pos2, c: Color32| egui::epaint::Vertex { pos, uv: egui::pos2(0.0, 0.0), color: c };
+            mesh.vertices.push(mk(sp, col));
+            for &pp in &pts {
+                mesh.vertices.push(mk(pp, col));
+            }
+            for k in 0..10u32 {
+                mesh.indices.extend_from_slice(&[0, 1 + k, 1 + ((k + 1) % 10)]);
+            }
+            painter.add(egui::Shape::mesh(mesh));
+            painter.add(egui::Shape::closed_line(pts, Stroke::new(1.6 * scale_factor, outline)));
+        } else {
+            let p = (age / 1.0).min(1.0);
+            let fade = (1.0 - p * p).clamp(0.0, 1.0);
+            let vel = Vec2::new(ang.cos(), ang.sin()) * spd * scale_factor;
+            let pos = sc_av + vel * age + Vec2::new(0.0, 620.0 * scale_factor * age * age);
+            let col = palette[kind as usize % palette.len()];
+            let c = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (fade * 255.0) as u8);
+            let sz = sc_avr * 0.05;
+            let rot = age * 12.0 + kind as f32;
+            let rx = Vec2::new(rot.cos(), rot.sin()) * sz;
+            let ry = Vec2::new(-rot.sin(), rot.cos()) * sz * 0.5;
+            painter.add(egui::Shape::convex_polygon(vec![pos + rx + ry, pos + rx - ry, pos - rx - ry, pos - rx + ry], c, Stroke::NONE));
+        }
+        ui.ctx().request_repaint();
+    }
 
     let btn_w = av_r * 2.0;
     let btn_h = 42.0 * s;

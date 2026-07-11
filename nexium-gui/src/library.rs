@@ -1,6 +1,14 @@
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+pub struct DownloadInfo {
+    pub progress: f32,
+    pub done: bool,
+    pub ok: bool,
+}
 
 pub struct GameEntry {
     pub path: PathBuf,
@@ -10,6 +18,7 @@ pub struct GameEntry {
     pub size: u64,
     pub icon: Option<egui::ColorImage>,
     pub dominant_color: egui::Color32,
+    pub download: Option<Arc<Mutex<DownloadInfo>>>,
 }
 
 pub struct Library {
@@ -84,6 +93,54 @@ impl Library {
         0
     }
 
+    pub fn add_download(&mut self, title: String, icon: Option<egui::ColorImage>, info: Arc<Mutex<DownloadInfo>>) {
+        let path = PathBuf::from(format!("__downloading__/{title}"));
+        if self.games.iter().any(|g| g.path == path) {
+            return;
+        }
+        let dominant = icon.as_ref().map(sample_dominant).unwrap_or(egui::Color32::from_rgb(0x2F, 0xB4, 0xEF));
+        self.games.insert(0, GameEntry {
+            path,
+            title,
+            author: String::new(),
+            format: "NRO",
+            size: 0,
+            icon,
+            dominant_color: dominant,
+            download: Some(info),
+        });
+        self.textures.insert(0, None);
+        if let Some(sel) = self.selected {
+            self.selected = Some(sel + 1);
+        }
+    }
+
+    /// Remove finished download placeholders; returns true if any completed OK (needs rescan).
+    pub fn prune_downloads(&mut self) -> bool {
+        let mut rescan = false;
+        let mut i = 0;
+        while i < self.games.len() {
+            let remove = if let Some(dl) = &self.games[i].download {
+                dl.lock().ok().map(|g| g.done).unwrap_or(false)
+            } else {
+                false
+            };
+            if remove {
+                let ok = self.games[i].download.as_ref().and_then(|d| d.lock().ok().map(|g| g.ok)).unwrap_or(false);
+                self.games.remove(i);
+                if i < self.textures.len() {
+                    self.textures.remove(i);
+                }
+                if ok {
+                    rescan = true;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        rescan
+    }
+
     pub fn set_icon(&mut self, idx: usize, img: egui::ColorImage) {
         if idx >= self.games.len() {
             return;
@@ -122,6 +179,19 @@ fn scan(extra_dirs: &[PathBuf]) -> Vec<GameEntry> {
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out.dedup_by(|a, b| a.path == b.path);
+    // Never list the same game twice (e.g. a copy in switch/ and a migrated
+    // copy in NRO/). Prefer the one under a switch/ folder (keeps its assets).
+    let pref = |p: &Path| -> u8 {
+        if p.components().any(|c| c.as_os_str().eq_ignore_ascii_case("switch")) { 1 } else { 0 }
+    };
+    out.sort_by(|a, b| {
+        a.title
+            .to_lowercase()
+            .cmp(&b.title.to_lowercase())
+            .then_with(|| pref(&b.path).cmp(&pref(&a.path)))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    out.dedup_by(|a, b| a.title.eq_ignore_ascii_case(&b.title));
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
     out
 }
@@ -196,6 +266,7 @@ fn read_entry(path: &Path) -> Option<GameEntry> {
         dominant_color: icon.as_ref().map(sample_dominant)
             .unwrap_or(egui::Color32::from_rgb(0x2F, 0xB4, 0xEF)),
         icon,
+        download: None,
     })
 }
 
@@ -208,6 +279,10 @@ pub fn custom_icon_path(game_path: &Path) -> Option<PathBuf> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     game_path.hash(&mut h);
     Some(base.join(format!("{:016x}.png", h.finish())))
+}
+
+pub fn decode_icon(bytes: &[u8]) -> Option<egui::ColorImage> {
+    decode_jpeg(bytes)
 }
 
 fn decode_jpeg(bytes: &[u8]) -> Option<egui::ColorImage> {
