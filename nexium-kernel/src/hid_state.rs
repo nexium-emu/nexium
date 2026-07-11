@@ -470,6 +470,34 @@ pub fn take_console_mode_dirty() -> bool {
     CONSOLE_MODE_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
+pub fn apply_controller_applet_style(style_set: u32) -> u32 {
+    let selected_id;
+    if style_set & STYLE_FULLKEY != 0 {
+        set_docked(true);
+        set_player1_joy_dual(false);
+        selected_id = 0;
+    } else if style_set & STYLE_JOY_DUAL != 0 {
+        set_player1_joy_dual(true);
+        selected_id = 0;
+    } else if style_set & STYLE_HANDHELD != 0 {
+        set_docked(false);
+        selected_id = 0x20;
+    } else if style_set & (STYLE_JOY_LEFT | STYLE_JOY_RIGHT) != 0 {
+        set_docked(true);
+        set_player1_joy_dual(false);
+        selected_id = 0;
+    } else {
+        set_docked(true);
+        set_player1_joy_dual(false);
+        selected_id = 0;
+    }
+    let state = get_hid_state();
+    let mut hid = state.lock();
+    let cur = hid.input;
+    hid.tick(cur);
+    selected_id
+}
+
 pub fn set_player1_joy_dual(value: bool) {
     if value {
         set_docked(true);

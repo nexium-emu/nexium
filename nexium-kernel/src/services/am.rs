@@ -6,11 +6,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub mod msg {
     pub const EXIT_REQUESTED: u32 = 1;
     pub const FOCUS_STATE_CHANGED: u32 = 15;
-    pub const REQUEST_TO_PRELOAD_NEXT_APPLET: u32 = 16;
+    pub const RESUME: u32 = 16;
     pub const OPERATION_MODE_CHANGED: u32 = 30;
     pub const PERFORMANCE_MODE_CHANGED: u32 = 31;
     pub const REQUEST_TO_DISPLAY: u32 = 51;
 }
+
+pub const FOCUS_STATE_IN_FOCUS: u8 = 1;
 
 pub const APPLET_MESSAGE_AVAILABLE_RC: u32 = 0;
 pub const APPLET_NO_MESSAGES_RC: u32 = 0x680;
@@ -89,9 +91,9 @@ pub fn proxy_subsession(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("ILibraryAppletCreator", 10) => Some("IStorage"),
         ("ILibraryAppletCreator", 11) => Some("IStorage"),
         ("IApplicationCreator", 0) => Some("IApplicationAccessor"),
-        ("ILibraryAppletAccessor", 60) => Some("ILibraryAppletAccessor"),
-        ("ILibraryAppletAccessor", 100) => Some("IStorage"),
-        ("ILibraryAppletAccessor", 101) => Some("IStorage"),
+        ("ILibraryAppletAccessor", 101) => Some("IStorageOut"),
+        ("IStorage", 0 | 1) => Some("IStorageAccessor"),
+        ("IStorageOut", 0 | 1) => Some("IStorageAccessorOut"),
         ("IApplicationFunctions", 1) => Some("ILaunchParamStorage"),
         ("ILaunchParamStorage", 0) => Some("ILaunchParamStorageAccessor"),
         ("acc:u0" | "acc:u1" | "acc:aa", 5) => Some("IProfile"),
@@ -133,7 +135,9 @@ pub fn dispatch_command(
         "IGlobalStateController" => global_state_controller(cmd_id),
         "IDebugFunctions" => debug_functions(cmd_id),
         "IStorage" => storage(cmd_id),
+        "IStorageOut" => storage(cmd_id),
         "IStorageAccessor" => storage_accessor(cmd_id),
+        "IStorageAccessorOut" => storage_accessor_out(cmd_id),
         "ILaunchParamStorage" => storage(cmd_id),
         "ILaunchParamStorageAccessor" => launch_param_storage_accessor(cmd_id),
         "acc:u0" | "acc:u1" | "acc:aa" => account_service(cmd_id),
@@ -281,6 +285,7 @@ fn self_controller(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u
             let mut slot = kernel.library_applet_launchable_event;
             let h = alloc_event(kernel, &mut slot, "LibraryAppletLaunchableEvent");
             kernel.library_applet_launchable_event = slot;
+            kernel.event_signals.insert(h, true);
             ok_with_handle(Vec::new(), h)
         }
         10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 => ok_empty(),
@@ -390,11 +395,19 @@ fn library_applet_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8
     match cmd {
         0 => {
             let h = kernel.handles.create_handle(HandleType::Event);
-            kernel.event_signals.insert(h, false);
+            kernel.event_signals.insert(h, true);
             ok_with_handle(Vec::new(), h)
         }
-        1 | 10 | 20 | 25 | 26 | 30 | 50 | 51 | 90 | 91 | 100 | 101 | 102 | 103 | 110 | 120
-        | 150 | 160 => ok_empty(),
+        1 => ok(vec![1u8]),
+        30 => {
+            kernel.applet_focus_state = FOCUS_STATE_IN_FOCUS;
+            queue_message(kernel, msg::RESUME);
+            log::info!("ILibraryAppletAccessor.GetResult → applet complete, queued Resume(16), focus=InFocus");
+            ok_empty()
+        }
+        10 | 20 | 25 | 26 | 50 | 51 | 60 | 90 | 91 | 100 | 102 | 103 | 110 | 120 | 150 | 160 => {
+            ok_empty()
+        }
         _ => {
             log::warn!(
                 "ILibraryAppletAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
@@ -542,6 +555,49 @@ fn storage_accessor(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
         _ => {
             log::warn!(
                 "IStorageAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
+                cmd
+            );
+            ok_empty()
+        }
+    }
+}
+
+static PENDING_APPLET_ID: AtomicU32 = AtomicU32::new(0);
+static CONTROLLER_SELECTED_ID: AtomicU32 = AtomicU32::new(0);
+
+pub const APPLET_ID_CONTROLLER: u32 = 0x0c;
+
+pub fn set_pending_applet_id(id: u32) {
+    PENDING_APPLET_ID.store(id, Ordering::Relaxed);
+}
+
+pub fn pending_applet_id() -> u32 {
+    PENDING_APPLET_ID.load(Ordering::Relaxed)
+}
+
+pub fn set_controller_selected_id(id: u32) {
+    CONTROLLER_SELECTED_ID.store(id, Ordering::Relaxed);
+}
+
+pub fn applet_out_data() -> Vec<u8> {
+    if PENDING_APPLET_ID.load(Ordering::Relaxed) == APPLET_ID_CONTROLLER {
+        let mut v = vec![0u8; 0xc];
+        v[0] = 1;
+        let sel = CONTROLLER_SELECTED_ID.load(Ordering::Relaxed);
+        v[4..8].copy_from_slice(&sel.to_le_bytes());
+        v
+    } else {
+        Vec::new()
+    }
+}
+
+fn storage_accessor_out(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+    match cmd {
+        0 => ok((applet_out_data().len() as u64).to_le_bytes().to_vec()),
+        10 | 11 => ok_empty(),
+        _ => {
+            log::warn!(
+                "IStorageAccessorOut.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
                 cmd
             );
             ok_empty()
