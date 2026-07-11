@@ -519,7 +519,16 @@ impl EmulationHandle {
                                 let mut pc_trace = PcTrace::from_env();
                                 let mut aux_cycles = 0u64;
                                 let mut aux_svcs = 0u32;
-                                log::info!("[core{}] started", core_id);
+                                let spin_yield_n: u32 = std::env::var("NEXIUM_SPIN_YIELD")
+                                    .ok()
+                                    .and_then(|v| v.parse::<u32>().ok())
+                                    .unwrap_or(4);
+                                let mut slice_iters: u32 = 0;
+                                log::info!(
+                                    "[core{}] started spin_yield_n={}",
+                                    core_id,
+                                    spin_yield_n
+                                );
                                 while !stop_aux.load(Ordering::Relaxed) {
                                     if pause_aux.load(Ordering::Relaxed) {
                                         std::thread::sleep(std::time::Duration::from_micros(500));
@@ -574,6 +583,19 @@ impl EmulationHandle {
                                         drop(k);
                                         if let Some(result) = result {
                                             cpu_mut().unwrap().set_register(0, result as u64);
+                                        }
+                                    }
+                                    if spin_yield_n != 0 {
+                                        slice_iters = slice_iters.saturating_add(1);
+                                        if slice_iters >= spin_yield_n {
+                                            slice_iters = 0;
+                                            let mut k = kernel_aux.lock();
+                                            if k.threads.has_ready_for_core(core_id as i32) {
+                                                k.threads.yield_with_state(
+                                                    cpu_ref().unwrap(),
+                                                    nexium_core::kernel::threads::ThreadState::Ready,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -959,7 +981,7 @@ impl EmulationHandle {
                             }
                             last_map_gen0 = gen;
                         }
-                        let event = cpu.run(cpu_slice);
+                        let event = cpu.run(0);
                         let pc_after = cpu.get_pc();
                         let mut guard = boot_ctx.kernel.lock();
                         guard.threads.save_current_ctx(cpu);
@@ -978,6 +1000,7 @@ impl EmulationHandle {
                             let cur = guard.threads.current_handle();
                             let lr = cpu.get_register(30);
                             let sp = cpu.get_sp();
+                            let mut probe_target = None;
                             let mut regs = [0u64; 32];
                             for i in 0..31 {
                                 regs[i] = cpu.get_register(i as u32);
@@ -1046,6 +1069,61 @@ impl EmulationHandle {
                                 }
                                 log::error!("[null-pc] callstack(+base): {}", frames.join(" <- "));
                             }
+                            {
+                                let x19 = regs[19];
+                                let mut slot = [0u8; 8];
+                                let readable =
+                                    x19 >= 0x1000 && guard.address_space.read(x19, &mut slot).is_ok();
+                                let slotval = if readable {
+                                    u64::from_le_bytes(slot)
+                                } else {
+                                    0
+                                };
+                                log::error!(
+                                    "[null-pc] x19(slot)={:#x} readable={} *x19={:#x} cores.current={:?}",
+                                    x19, readable, slotval, guard.threads.current
+                                );
+                                let mut frame = [0u8; 48];
+                                if guard.address_space.read(sp, &mut frame).is_ok() {
+                                    let caller_x21 = u64::from_le_bytes(frame[8..16].try_into().unwrap());
+                                    log::error!(
+                                        "[null-pc] frame@sp={:02x?} caller_x21={:#x}",
+                                        &frame,
+                                        caller_x21
+                                    );
+                                    if caller_x21 >= 0x20 {
+                                        probe_target = Some(caller_x21.saturating_add(8));
+                                        let mut record = [0u8; 96];
+                                        if guard
+                                            .address_space
+                                            .read(caller_x21 - 0x20, &mut record)
+                                            .is_ok()
+                                        {
+                                            log::error!(
+                                                "[null-pc] control@x21-0x20={:02x?}",
+                                                &record
+                                            );
+                                        }
+                                    }
+                                }
+                                let gpu_cpu = guard
+                                    .nvdrv
+                                    .gpu
+                                    .mappings
+                                    .lock()
+                                    .cpu_address_for(x19);
+                                if let Some(gpu_cpu) = gpu_cpu {
+                                    let mut backing = [0u8; 96];
+                                    let base = gpu_cpu.saturating_sub(0x20);
+                                    let readable = guard.address_space.read(base, &mut backing).is_ok();
+                                    log::error!(
+                                        "[null-pc] x19_gpu_cpu={:#x} readable={} backing[-0x20..+0x40]={:02x?}",
+                                        gpu_cpu,
+                                        readable,
+                                        &backing
+                                    );
+                                }
+                            }
                             let x20 = regs[20];
                             if x20 >= 0x10000 {
                                 let mut peek = [0u8; 64];
@@ -1059,6 +1137,20 @@ impl EmulationHandle {
                                 if guard.address_space.read(x22, &mut peek).is_ok() {
                                     log::error!("[null-pc] *x22[0..64] = {:02x?}", &peek);
                                 }
+                            }
+                            if std::env::var("NEXIUM_NULL_PROBE_CONTINUE").is_ok() {
+                                if let Some(target) = probe_target {
+                                    if nexium_memory::fastmem::watch_mark(target, 8) {
+                                        log::warn!(
+                                            "[null-probe] armed payload va={:#x}; skipping null call at lr={:#x}",
+                                            target,
+                                            lr
+                                        );
+                                    }
+                                }
+                                cpu.set_pc(lr);
+                                guard.threads.save_current_ctx(cpu);
+                                continue;
                             }
                             log::error!("[null-pc] halting emulation for diagnosis");
                             break;
