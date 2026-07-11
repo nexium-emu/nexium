@@ -1195,7 +1195,7 @@ impl Renderer {
             ..
         } = &mut *inner;
         let requested_key = RtKey::new(nvmap_id, width, height, gpu_va);
-        let key = rt_cache.resolve_present_key(requested_key)?;
+        let key = rt_cache.resolve_present_key(requested_key, false)?;
         trace_present_key(rt_cache, requested_key, key);
         for (_, mut pending) in pending_readbacks.drain() {
             while let Some(prev) = pending.pop_front() {
@@ -1522,7 +1522,10 @@ impl Renderer {
         } else {
             RtKey::request(nvmap_id, width, height)
         };
-        let key = rt_cache.resolve_present_key(requested_key)?;
+        let key = match rt_cache.resolve_present_key(requested_key, true) {
+            Some(k) => k,
+            None => rt_cache.present_fallback_key(requested_key)?,
+        };
         let resolved_flip_y = rt_cache.present_flip_y(key);
         trace_present_key(rt_cache, requested_key, key);
         if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
@@ -2980,8 +2983,8 @@ impl Renderer {
             .map(|call| {
                 let color_keys = active_color_keys_for_call(call);
                 color_formats_for_call(call, color_keys.len())
-            })
-            .unwrap_or_default();
+        })
+        .unwrap_or_default();
         for call in calls {
             let use_depth = call.depth_key.is_some();
             let depth_format = if use_depth {
@@ -3207,6 +3210,10 @@ impl Renderer {
         }
         let rp_fence = rp_t2.elapsed();
         let rp_t3 = std::time::Instant::now();
+        let mut rp_alias = std::time::Duration::ZERO;
+        let mut rp_tex = std::time::Duration::ZERO;
+        let mut rp_vtx = std::time::Duration::ZERO;
+        let mut rp_dset = std::time::Duration::ZERO;
         if dummy_white.is_none() {
             *dummy_white = Some(create_dummy_white_image(
                 device, *queue, *cmd_pool, mem_props, false, false,
@@ -3329,6 +3336,7 @@ impl Renderer {
         let mut had_pass = false;
         for (_i, (call, prep)) in preps.iter().enumerate() {
             let call = *call;
+            let rp_a0 = std::time::Instant::now();
             let mut rt_aliases: Vec<_> = (0..prep.tex_pendings.len())
                 .map(|slot| rt_alias_for_slot(rt_cache, call, slot, rt_key, true))
                 .collect();
@@ -3385,6 +3393,7 @@ impl Renderer {
                     }
                 }
             }
+            rp_alias += rp_a0.elapsed();
 
             for alias in &rt_aliases {
                 if let Some(alias) = *alias {
@@ -3494,6 +3503,7 @@ impl Renderer {
             let mut bound_tex_views_3d = vec![dummy_3d_view; max_texture_descriptors()];
             let mut bound_tex_layouts =
                 vec![vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL; max_texture_descriptors()];
+            let rp_tx0 = std::time::Instant::now();
             for (slot, pending) in prep.tex_pendings.iter().enumerate() {
                 let pending_volume = pending.map_or(false, |(k, _, _, _)| k.volume);
                 if !pending_volume {
@@ -3821,6 +3831,8 @@ impl Renderer {
                 );
             }
 
+            rp_tex += rp_tx0.elapsed();
+            let rp_vx0 = std::time::Instant::now();
             let vertex_binds = upload_vertex_bindings(
                 device,
                 frame_slots,
@@ -3829,6 +3841,7 @@ impl Renderer {
                 ubo_ring,
                 &prep.vertex_bindings,
             )?;
+            rp_vtx += rp_vx0.elapsed();
 
             let white_bind: Option<(u32, vk::Buffer, u64)> =
                 if let Some(wb) = call.vertex_layout.bindings.iter().find(|b| b.stride == 0) {
@@ -3899,6 +3912,7 @@ impl Renderer {
                 );
             }
 
+            let rp_ds0 = std::time::Instant::now();
             let set_layouts = [descriptor_layout.layout];
             let alloc_info = vk::DescriptorSetAllocateInfo {
                 s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -4086,6 +4100,7 @@ impl Renderer {
             unsafe {
                 device.update_descriptor_sets(&writes, &[]);
             }
+            rp_dset += rp_ds0.elapsed();
             dsets_batch.push(dset);
 
             let need_depth = prep.use_depth;
@@ -4362,6 +4377,7 @@ impl Renderer {
             rp_submit,
             rp_t0.elapsed(),
         );
+        rprof_record_detail(rp_alias, rp_tex, rp_vtx, rp_dset);
         frame_slots[cur_idx].in_flight = true;
         frame_slots[cur_idx].retired_dsets.extend(dsets_batch);
         for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
@@ -4478,6 +4494,40 @@ fn rprof_record(
     }
 }
 
+fn rprof_record_detail(
+    alias: std::time::Duration,
+    tex: std::time::Duration,
+    vtx: std::time::Duration,
+    dset: std::time::Duration,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("NEXIUM_RENDER_PROFILE").is_some()) {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    static ALIAS: AtomicU64 = AtomicU64::new(0);
+    static TEX: AtomicU64 = AtomicU64::new(0);
+    static VTX: AtomicU64 = AtomicU64::new(0);
+    static DSET: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    ALIAS.fetch_add(alias.as_nanos() as u64, Ordering::Relaxed);
+    TEX.fetch_add(tex.as_nanos() as u64, Ordering::Relaxed);
+    VTX.fetch_add(vtx.as_nanos() as u64, Ordering::Relaxed);
+    DSET.fetch_add(dset.as_nanos() as u64, Ordering::Relaxed);
+    if n % 64 == 0 {
+        let ms = |v: &AtomicU64| v.load(Ordering::Relaxed) as f64 / n as f64 / 1_000_000.0;
+        log::warn!(
+            "[rprof2] batches={} avg_ms alias={:.2} tex={:.2} vtx={:.2} dset={:.2}",
+            n,
+            ms(&ALIAS),
+            ms(&TEX),
+            ms(&VTX),
+            ms(&DSET)
+        );
+    }
+}
+
 fn trace_present_key(rt_cache: &RtCache, requested_key: RtKey, key: RtKey) {
     if std::env::var_os("NEXIUM_PRESENT_KEYS").is_none() {
         return;
@@ -4533,6 +4583,22 @@ fn dump_rt_bmp(key: RtKey, rgba: &[u8]) {
     };
     if key.width == 0 || key.height == 0 {
         return;
+    }
+    {
+        let (mut amin, mut amax, mut asum, mut n) = (255u8, 0u8, 0u64, 0u64);
+        for px in rgba.chunks_exact(4) {
+            amin = amin.min(px[3]);
+            amax = amax.max(px[3]);
+            asum += px[3] as u64;
+            n += 1;
+        }
+        log::warn!(
+            "[rt-alpha] {} a=[{}..{}] avg={}",
+            key.label(),
+            amin,
+            amax,
+            asum / n.max(1)
+        );
     }
     let dir = std::path::PathBuf::from(base).join("NeXium").join("logs");
     if std::fs::create_dir_all(&dir).is_err() {

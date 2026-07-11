@@ -99,6 +99,7 @@ pub struct RtCache {
     present_flip_y: HashMap<RtKey, bool>,
     drawn_counter: u64,
     frame_draws: HashMap<RtKey, u32>,
+    frame_real_draws: HashMap<RtKey, u32>,
 }
 
 impl RtCache {
@@ -113,6 +114,7 @@ impl RtCache {
             present_flip_y: HashMap::new(),
             drawn_counter: 0,
             frame_draws: HashMap::new(),
+            frame_real_draws: HashMap::new(),
         }
     }
 
@@ -151,6 +153,7 @@ impl RtCache {
         self.drawn_stamp.insert(key, self.drawn_counter);
         self.present_excluded.remove(&key);
         *self.frame_draws.entry(key).or_insert(0) += 1;
+        *self.frame_real_draws.entry(key).or_insert(0) += 1;
         self.drawn_counter
     }
 
@@ -171,17 +174,21 @@ impl RtCache {
 
     pub fn reset_frame_draws(&mut self) {
         self.frame_draws.clear();
+        self.frame_real_draws.clear();
     }
 
     pub fn mark_cleared(&mut self, key: RtKey, full_target: bool) {
         if full_target {
             self.drawn_stamp.remove(&key);
         } else if self.drawn_stamp.contains_key(&key) {
-            self.mark_drawn(key);
+            self.drawn_counter += 1;
+            self.drawn_stamp.insert(key, self.drawn_counter);
+            self.present_excluded.remove(&key);
+            *self.frame_draws.entry(key).or_insert(0) += 1;
         }
     }
 
-    pub fn resolve_present_key(&self, want: RtKey) -> Option<RtKey> {
+    pub fn resolve_present_key(&self, want: RtKey, present: bool) -> Option<RtKey> {
         let choose_cpu = || -> Option<(RtKey, u64)> {
             if want.cpu_addr == 0 {
                 return None;
@@ -258,6 +265,39 @@ impl RtCache {
             best = choose(None, false);
         }
         let best_stamp = best.map(|(_, s)| s).unwrap_or(0);
+        if present && want.height != 0 {
+            let best_real_draws = best
+                .map(|(bk, _)| self.frame_real_draws.get(&bk).copied().unwrap_or(0))
+                .unwrap_or(0);
+            if best_real_draws == 0 {
+                let aw = want.width as f32 / want.height as f32;
+                let best_key = best.map(|(k, _)| k);
+                let bridge = self
+                    .cache
+                    .keys()
+                    .filter(|k| Some(**k) != best_key)
+                    .filter(|k| want.nvmap_id == 0 || k.nvmap_id != want.nvmap_id)
+                    .filter(|k| {
+                        k.height != 0
+                            && ((k.width as f32 / k.height as f32) - aw).abs() <= aw * 0.12
+                    })
+                    .filter(|k| {
+                        dims_close(k.width, want.width) && dims_close(k.height, want.height)
+                    })
+                    .filter(|k| !self.present_excluded.contains(k))
+                    .filter_map(|k| {
+                        if self.frame_real_draws.get(k).copied().unwrap_or(0) > 0 {
+                            Some((*k, self.drawn_stamp.get(k).copied().unwrap_or(0)))
+                        } else {
+                            None
+                        }
+                    })
+                    .max_by_key(|(_, s)| *s);
+                if let Some((bk, _)) = bridge {
+                    return Some(bk);
+                }
+            }
+        }
         let strict_cpu = std::env::var_os("NEXIUM_PRESENT_STRICT_CPU").is_some();
         if want.height != 0 && want.gpu_va == 0 && (want.cpu_addr == 0 || !strict_cpu) {
             let aw = want.width as f32 / want.height as f32;
@@ -340,6 +380,28 @@ impl RtCache {
             }
         }
         res
+    }
+
+    pub fn present_fallback_key(&self, want: RtKey) -> Option<RtKey> {
+        if want.nvmap_id == 0 {
+            return None;
+        }
+        self.cache
+            .keys()
+            .filter(|k| {
+                k.nvmap_id == want.nvmap_id
+                    && !self.present_excluded.contains(k)
+                    && dims_close(k.width, want.width)
+                    && dims_close(k.height, want.height)
+            })
+            .max_by_key(|k| {
+                let exact = (want.cpu_addr != 0 && k.cpu_addr == want.cpu_addr) as u32;
+                let fd = self.frame_draws.get(k).copied().unwrap_or(0);
+                let kd = (k.width as i64 - want.width as i64).abs()
+                    + (k.height as i64 - want.height as i64).abs();
+                (exact, fd, -kd)
+            })
+            .copied()
     }
 
     pub fn debug_all(&self) -> Vec<(RtKey, u64)> {
