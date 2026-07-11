@@ -200,7 +200,8 @@ pub struct ChannelState {
     pub bound_engine: u32,
     pub bound_obj_class: u32,
     pub syncpt_id: u32,
-    pub syncpt_value: u32,
+    pub syncpt_min: u32,
+    pub syncpt_max: u32,
 }
 
 impl GpuContext {
@@ -323,7 +324,13 @@ impl GpuContext {
         let locks_ms = if profile { elapsed_ms(t0) } else { 0.0 };
 
         let t_entries = std::time::Instant::now();
-        for entry in entries {
+        let addrs: Vec<u64> = entries.iter().map(|e| e.address()).collect();
+        for (i, entry) in entries.iter().enumerate() {
+            pusher.entry_word_limit = if entry.entry_count() > 4096 {
+                crate::gpu::pusher::nearest_forward_gap(&addrs, i)
+            } else {
+                0
+            };
             pusher.process_entry(
                 entry,
                 &mappings,
@@ -337,6 +344,7 @@ impl GpuContext {
                 &mem_write,
             );
         }
+        pusher.entry_word_limit = 0;
         let entries_ms = if profile { elapsed_ms(t_entries) } else { 0.0 };
         let t_flush = std::time::Instant::now();
         pusher.flush_vk(&mappings, &mem_read);

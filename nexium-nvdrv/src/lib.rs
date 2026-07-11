@@ -3,11 +3,68 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+fn syncpoint_reached(current: u32, threshold: u32) -> bool {
+    current.wrapping_sub(threshold) < 0x8000_0000
+}
+
 pub mod bufferqueue;
 pub mod gpu;
 pub mod render_thread;
 pub use bufferqueue::{BufferQueue, GraphicBuffer, QueuedFrame};
 pub use gpu::GpuContext;
+
+fn debug_giant_entries(
+    cmd: u16,
+    num_entries: u32,
+    entries: &[gpu::CommandListHeader],
+    raw: &[u8],
+    raw_len_total: usize,
+) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("NEXIUM_MME_FORENSICS").is_some()) {
+        return;
+    }
+    let Some(gi) = entries.iter().position(|e| e.entry_count() > 16384) else {
+        return;
+    };
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return;
+    }
+    let lo = gi.saturating_sub(2);
+    let hi = (gi + 3).min(entries.len());
+    let ctx: Vec<String> = entries[lo..hi]
+        .iter()
+        .enumerate()
+        .map(|(k, e)| format!("[{}]gpu={:#x} sz={}", lo + k, e.address(), e.entry_count()))
+        .collect();
+    let rlo = gi.saturating_sub(1) * 8;
+    let rhi = ((gi + 2) * 8).min(raw.len());
+    let rawhex: Vec<String> = raw
+        .get(rlo..rhi)
+        .unwrap_or(&[])
+        .chunks(4)
+        .map(|c| {
+            let mut b = [0u8; 4];
+            b[..c.len()].copy_from_slice(c);
+            format!("{:08x}", u32::from_le_bytes(b))
+        })
+        .collect();
+    log::warn!(
+        "[giant-entry] cmd={:#x} num_entries={} entries.len={} raw_total={} giant_idx={} ctx=[{}] raw[{}..{}]=[{}]",
+        cmd,
+        num_entries,
+        entries.len(),
+        raw_len_total,
+        gi,
+        ctx.join(" "),
+        rlo,
+        rhi,
+        rawhex.join(" ")
+    );
+}
 
 #[derive(Default)]
 pub struct PipelineStats {
@@ -134,6 +191,12 @@ pub struct IoctlOutcome {
     pub data: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+pub struct CtrlEventWait {
+    pub syncpt_id: u32,
+    pub threshold: u32,
+}
+
 impl IoctlOutcome {
     pub fn ok(data: Vec<u8>) -> Self {
         Self { result: 0, data }
@@ -155,6 +218,9 @@ pub struct Nvdrv {
     pub bufferqueues: Arc<Mutex<HashMap<u32, BufferQueue>>>,
     pub frame_queue: Arc<Mutex<Vec<QueuedFrame>>>,
     pub next_event_id: u32,
+    pub next_syncpoint_id: u32,
+    pub next_ctrl_event_slot: u32,
+    pub ctrl_event_waits: HashMap<u32, CtrlEventWait>,
     pub gpu: Arc<GpuContext>,
     pub last_swap_return: Arc<Mutex<Option<std::time::Instant>>>,
     pub queue_buffer_active: Arc<std::sync::atomic::AtomicBool>,
@@ -175,6 +241,9 @@ impl Nvdrv {
             bufferqueues: Arc::new(Mutex::new(HashMap::new())),
             frame_queue: Arc::new(Mutex::new(Vec::new())),
             next_event_id: 1,
+            next_syncpoint_id: 1,
+            next_ctrl_event_slot: 0,
+            ctrl_event_waits: HashMap::new(),
             gpu: Arc::new(GpuContext::with_stats(stats.clone())),
             last_swap_return: Arc::new(Mutex::new(None)),
             queue_buffer_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -234,7 +303,87 @@ impl Nvdrv {
 
     pub fn close(&mut self, fd: u32) {
         self.files.remove(&fd);
+        self.gpu.channels.lock().remove(&fd);
         log::debug!("nvdrv:Close fd={}", fd);
+    }
+
+    fn ensure_channel_syncpoint(&mut self, fd: u32) -> (u32, u32) {
+        let mut channels = self.gpu.channels.lock();
+        let channel = channels.entry(fd).or_default();
+        if channel.syncpt_id == 0 {
+            channel.syncpt_id = self.next_syncpoint_id;
+            self.next_syncpoint_id = self.next_syncpoint_id.wrapping_add(1).max(1);
+        }
+        (channel.syncpt_id, channel.syncpt_max)
+    }
+
+    fn complete_channel_submit(
+        &mut self,
+        fd: u32,
+        flags: u32,
+        increment_value: u32,
+    ) -> (u32, u32) {
+        let (syncpt_id, _) = self.ensure_channel_syncpoint(fd);
+        let mut channels = self.gpu.channels.lock();
+        let channel = channels.get_mut(&fd).unwrap();
+        let mut increment: u32 = if flags & (1 << 1) != 0 { 2 } else { 0 };
+        if flags & (1 << 8) != 0 {
+            increment = increment.wrapping_add(increment_value);
+        }
+        channel.syncpt_max = channel.syncpt_max.wrapping_add(increment);
+        channel.syncpt_min = channel.syncpt_max;
+        if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+            log::info!(
+                "[syncpt] submit fd={} flags={:#x} id={} increment={} value={}",
+                fd,
+                flags,
+                syncpt_id,
+                increment,
+                channel.syncpt_max
+            );
+        }
+        (syncpt_id, channel.syncpt_max)
+    }
+
+    fn syncpoint_value(&self, id: u32) -> u32 {
+        self.gpu
+            .channels
+            .lock()
+            .values()
+            .find(|channel| channel.syncpt_id == id)
+            .map(|channel| channel.syncpt_min)
+            .unwrap_or(0)
+    }
+
+    fn syncpoint_max(&self, id: u32) -> u32 {
+        self.gpu
+            .channels
+            .lock()
+            .values()
+            .find(|channel| channel.syncpt_id == id)
+            .map(|channel| channel.syncpt_max)
+            .unwrap_or(0)
+    }
+
+    fn increment_syncpoint(&mut self, id: u32, amount: u32) -> u32 {
+        let mut channels = self.gpu.channels.lock();
+        let Some(channel) = channels
+            .values_mut()
+            .find(|channel| channel.syncpt_id == id)
+        else {
+            return 0;
+        };
+        channel.syncpt_max = channel.syncpt_max.wrapping_add(amount);
+        channel.syncpt_min = channel.syncpt_max;
+        channel.syncpt_min
+    }
+
+    pub fn is_syncpoint_reached(&self, id: u32, threshold: u32) -> bool {
+        syncpoint_reached(self.syncpoint_value(id), threshold)
+    }
+
+    pub fn ctrl_event_wait(&self, event_id: u32) -> Option<CtrlEventWait> {
+        self.ctrl_event_waits.get(&event_id).copied()
     }
 
     pub fn device_for_fd(&self, fd: u32) -> Option<NvDevice> {
@@ -284,7 +433,6 @@ impl Nvdrv {
         let mut out = vec![0u8; req.out_size];
         let n = req.in_data.len().min(out.len());
         out[..n].copy_from_slice(&req.in_data[..n]);
-
         match cmd {
             0x0101 => {
                 let raw_size = if req.in_data.len() >= 4 {
@@ -930,6 +1078,21 @@ impl Nvdrv {
         let mut out = vec![0u8; req.out_size];
         let n = req.in_data.len().min(out.len());
         out[..n].copy_from_slice(&req.in_data[..n]);
+        let submit_flags = req
+            .in_data
+            .get(12..16)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .unwrap_or(0);
+        let submit_fence_value = req
+            .in_data
+            .get(20..24)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .unwrap_or(0);
+        let submit_fence_id = req
+            .in_data
+            .get(16..20)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .unwrap_or(0);
 
         match cmd {
             0x4801 => {
@@ -939,6 +1102,17 @@ impl Nvdrv {
                 log::debug!("nvhost-gpu:ChannelSetTimeout");
             }
             0x4808 | 0x481b => {
+                if submit_flags & 1 != 0 && submit_flags & (1 << 8) != 0 {
+                    return IoctlOutcome::error(4);
+                }
+                if submit_flags & 1 != 0
+                    && !syncpoint_reached(
+                        self.syncpoint_value(submit_fence_id),
+                        submit_fence_value,
+                    )
+                {
+                    return IoctlOutcome::error(5);
+                }
                 let _ = self.renderer();
                 if req.in_data.len() >= 16 {
                     let address = u64::from_le_bytes([
@@ -983,19 +1157,32 @@ impl Nvdrv {
                                 }
                             })
                             .collect();
+                        debug_giant_entries(
+                            cmd,
+                            num_entries,
+                            &entries,
+                            &req.inline_in_data,
+                            req.inline_in_data.len(),
+                        );
                         self.stats.gpfifo_submits.fetch_add(1, Ordering::Relaxed);
                         self.stats
                             .gpfifo_entries
                             .fetch_add(entries.len() as u64, Ordering::Relaxed);
-                        let (syncpt_id, syncpt_value) = self
+                        let _ = self
                             .gpu
                             .process_inline_gpfifo(&entries, mem_read, mem_write);
+                        let (syncpt_id, syncpt_value) = self.complete_channel_submit(
+                            req.fd,
+                            submit_flags,
+                            submit_fence_value,
+                        );
                         log::trace!(
                             "nvhost-gpu:SubmitGPFIFO (inline) entries={} draws={}",
                             entries.len(),
                             self.gpu.maxwell3d.lock().draw_count()
                         );
                         if out.len() >= 24 {
+                            out[12..16].copy_from_slice(&0u32.to_le_bytes());
                             out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
                             out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
                         }
@@ -1020,13 +1207,25 @@ impl Nvdrv {
                                 }
                             })
                             .collect();
+                        debug_giant_entries(
+                            cmd,
+                            num_entries,
+                            &entries,
+                            req.in_data.get(24..).unwrap_or(&[]),
+                            req.in_data.len(),
+                        );
                         self.stats.gpfifo_submits.fetch_add(1, Ordering::Relaxed);
                         self.stats
                             .gpfifo_entries
                             .fetch_add(entries.len() as u64, Ordering::Relaxed);
-                        let (syncpt_id, syncpt_value) = self
+                        let _ = self
                             .gpu
                             .process_inline_gpfifo(&entries, mem_read, mem_write);
+                        let (syncpt_id, syncpt_value) = self.complete_channel_submit(
+                            req.fd,
+                            submit_flags,
+                            submit_fence_value,
+                        );
                         if log::log_enabled!(log::Level::Trace) {
                             let (dc, cc) = {
                                 let m = self.gpu.maxwell3d.lock();
@@ -1040,6 +1239,7 @@ impl Nvdrv {
                             );
                         }
                         if out.len() >= 24 {
+                            out[12..16].copy_from_slice(&0u32.to_le_bytes());
                             out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
                             out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
                         }
@@ -1048,9 +1248,14 @@ impl Nvdrv {
                         self.stats
                             .gpfifo_entries
                             .fetch_add(num_entries as u64, Ordering::Relaxed);
-                        let (syncpt_id, syncpt_value) =
-                            self.gpu
-                                .submit_gpfifo(address, num_entries, mem_read, mem_write);
+                        let _ = self
+                            .gpu
+                            .submit_gpfifo(address, num_entries, mem_read, mem_write);
+                        let (syncpt_id, syncpt_value) = self.complete_channel_submit(
+                            req.fd,
+                            submit_flags,
+                            submit_fence_value,
+                        );
                         log::trace!(
                             "nvhost-gpu:SubmitGPFIFO (kickoff) addr={:#x} entries={} draws={}",
                             address,
@@ -1058,13 +1263,14 @@ impl Nvdrv {
                             self.gpu.maxwell3d.lock().draw_count()
                         );
                         if out.len() >= 24 {
+                            out[12..16].copy_from_slice(&0u32.to_le_bytes());
                             out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
                             out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
                         }
                     } else {
-                        let syncpt_id: u32 = 0;
-                        let syncpt_value: u32 = 1;
+                        let (syncpt_id, syncpt_value) = self.ensure_channel_syncpoint(req.fd);
                         if out.len() >= 24 {
+                            out[12..16].copy_from_slice(&0u32.to_le_bytes());
                             out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
                             out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
                         }
@@ -1143,7 +1349,7 @@ impl Nvdrv {
                 log::trace!("nvhost-gpu:GetErrorNotification → status=0xFFFF (no error)");
             }
             0x481a => {
-                if req.in_data.len() >= 28 && out.len() >= 28 {
+                if req.in_data.len() >= 32 && out.len() >= 32 {
                     let num_entries = u32::from_le_bytes([
                         req.in_data[0],
                         req.in_data[1],
@@ -1156,10 +1362,9 @@ impl Nvdrv {
                         req.in_data[6],
                         req.in_data[7],
                     ]);
-                    let syncpt_id = self.next_event_id;
-                    self.next_event_id = self.next_event_id.wrapping_add(1);
+                    let (syncpt_id, syncpt_value) = self.ensure_channel_syncpoint(req.fd);
                     out[12..16].copy_from_slice(&syncpt_id.to_le_bytes());
-                    out[16..20].copy_from_slice(&0u32.to_le_bytes());
+                    out[16..20].copy_from_slice(&syncpt_value.to_le_bytes());
                     log::debug!(
                         "nvhost-gpu:AllocGpfifoEx2 num_entries={} flags={:#x} → fence_id={}",
                         num_entries,
@@ -1214,10 +1419,12 @@ impl Nvdrv {
                         req.in_data[2],
                         req.in_data[3],
                     ]);
-                    out[4..8].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+                    let value = self.syncpoint_value(id);
+                    out[4..8].copy_from_slice(&value.to_le_bytes());
                     log::debug!(
-                        "nvhost-ctrl:SyncptRead syncpt_id={} → 0x7FFFFFFF (HLE always-signaled)",
-                        id
+                        "nvhost-ctrl:SyncptRead syncpt_id={} → {}",
+                        id,
+                        value
                     );
                 }
             }
@@ -1229,7 +1436,8 @@ impl Nvdrv {
                         req.in_data[2],
                         req.in_data[3],
                     ]);
-                    log::debug!("nvhost-ctrl:SyncptIncr syncpt_id={}", id);
+                    let value = self.increment_syncpoint(id, 1);
+                    log::debug!("nvhost-ctrl:SyncptIncr syncpt_id={} → {}", id, value);
                 }
             }
             0x0016 => {
@@ -1246,11 +1454,10 @@ impl Nvdrv {
                         req.in_data[6],
                         req.in_data[7],
                     ]);
-                    log::debug!(
-                        "nvhost-ctrl:SyncptWait syncpt_id={} threshold={:#x}",
-                        id,
-                        threshold
-                    );
+                    let current = self.syncpoint_value(id);
+                    if !syncpoint_reached(current, threshold) {
+                        return IoctlOutcome::error(5);
+                    }
                 }
             }
             0x0019 => {
@@ -1267,11 +1474,19 @@ impl Nvdrv {
                         req.in_data[6],
                         req.in_data[7],
                     ]);
-                    out[12..16].copy_from_slice(&threshold.to_le_bytes());
+                    let current = self.syncpoint_value(id);
+                    out[12..16].copy_from_slice(&current.to_le_bytes());
+                    if !syncpoint_reached(current, threshold) {
+                        return IoctlOutcome {
+                            result: 5,
+                            data: out,
+                        };
+                    }
                     log::debug!(
-                        "nvhost-ctrl:SyncptWaitEx syncpt={} threshold={:#x} (ack)",
+                        "nvhost-ctrl:SyncptWaitEx syncpt={} threshold={:#x} current={}",
                         id,
-                        threshold
+                        threshold,
+                        current
                     );
                 }
             }
@@ -1283,10 +1498,12 @@ impl Nvdrv {
                         req.in_data[2],
                         req.in_data[3],
                     ]);
-                    out[4..8].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+                    let value = self.syncpoint_max(id);
+                    out[4..8].copy_from_slice(&value.to_le_bytes());
                     log::debug!(
-                        "nvhost-ctrl:SyncptReadMax syncpt={} → 0x7FFFFFFF (HLE always-signaled)",
-                        id
+                        "nvhost-ctrl:SyncptReadMax syncpt={} → {}",
+                        id,
+                        value
                     );
                 }
             }
@@ -1315,8 +1532,16 @@ impl Nvdrv {
                         req.in_data[6],
                         req.in_data[7],
                     ]);
-                    let current_val = self.gpu.pusher.lock().syncpt_value;
-                    if current_val >= threshold {
+                    let current_val = self.syncpoint_value(syncpt_id);
+                    if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                        log::info!(
+                            "[syncpt] event-wait id={} threshold={} current={}",
+                            syncpt_id,
+                            threshold,
+                            current_val
+                        );
+                    }
+                    if syncpoint_reached(current_val, threshold) {
                         out[12..16].copy_from_slice(&current_val.to_le_bytes());
                         log::debug!(
                             "nvhost-ctrl:EventWait syncpt={} threshold={:#x} current={} → Success (already reached)",
@@ -1325,8 +1550,16 @@ impl Nvdrv {
                             current_val
                         );
                     } else {
-                        let slot: u32 = 0;
+                        let slot = self.next_ctrl_event_slot & 63;
+                        self.next_ctrl_event_slot = self.next_ctrl_event_slot.wrapping_add(1);
                         let event_val: u32 = slot | ((syncpt_id & 0xFFF) << 16) | (1 << 28);
+                        self.ctrl_event_waits.insert(
+                            event_val,
+                            CtrlEventWait {
+                                syncpt_id,
+                                threshold,
+                            },
+                        );
                         out[12..16].copy_from_slice(&event_val.to_le_bytes());
                         log::debug!(
                             "nvhost-ctrl:EventWait syncpt={} threshold={:#x} current={} → Timeout (deferred, slot={}, event_val={:#x})",
@@ -1336,7 +1569,10 @@ impl Nvdrv {
                             slot,
                             event_val
                         );
-                        return IoctlOutcome::error(5);
+                        return IoctlOutcome {
+                            result: 5,
+                            data: out,
+                        };
                     }
                 }
             }
@@ -1360,8 +1596,17 @@ impl Nvdrv {
                         req.in_data[14],
                         req.in_data[15],
                     ]);
-                    let current_val = self.gpu.pusher.lock().syncpt_value;
-                    if current_val >= threshold {
+                    let current_val = self.syncpoint_value(syncpt_id);
+                    if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                        log::info!(
+                            "[syncpt] event-wait-async event={:#x} id={} threshold={} current={}",
+                            event_id,
+                            syncpt_id,
+                            threshold,
+                            current_val
+                        );
+                    }
+                    if syncpoint_reached(current_val, threshold) {
                         if out.len() >= 16 {
                             out[12..16].copy_from_slice(&current_val.to_le_bytes());
                         }
@@ -1376,6 +1621,13 @@ impl Nvdrv {
                         if out.len() >= 16 {
                             out[12..16].copy_from_slice(&event_id.to_le_bytes());
                         }
+                        self.ctrl_event_waits.insert(
+                            event_id,
+                            CtrlEventWait {
+                                syncpt_id,
+                                threshold,
+                            },
+                        );
                         log::debug!(
                             "nvhost-ctrl:EventWaitAsync syncpt={} threshold={:#x} current={} event_id={} → Timeout",
                             syncpt_id,
@@ -1383,7 +1635,10 @@ impl Nvdrv {
                             current_val,
                             event_id
                         );
-                        return IoctlOutcome::error(5);
+                        return IoctlOutcome {
+                            result: 5,
+                            data: out,
+                        };
                     }
                 }
             }
@@ -1406,6 +1661,9 @@ impl Nvdrv {
                         req.in_data[2],
                         req.in_data[3],
                     ]);
+                    let slot = event_id & 0xFF;
+                    self.ctrl_event_waits
+                        .retain(|id, _| (*id & 0xFF) != slot);
                     log::debug!("nvhost-ctrl:EventUnregister event_id={}", event_id);
                 }
             }

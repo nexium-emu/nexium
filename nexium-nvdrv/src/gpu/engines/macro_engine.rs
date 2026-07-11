@@ -248,6 +248,52 @@ impl Opcode {
 pub struct MacroOutput {
     pub writes: Vec<(u32, u32)>,
     pub draw_instance_count: Option<u32>,
+    pub hash: u64,
+    pub entry: u32,
+    pub hle: bool,
+}
+
+fn mme_forensics() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_MME_FORENSICS").is_some())
+}
+
+fn is_hi_addr_reg(m: u32) -> bool {
+    m == 0x582
+        || m == 0x6c0
+        || m == 0x8e1
+        || m == 0x1c
+        || m == 0x554
+        || (0x200..0x280).contains(&m) && (m & 0xF) == 0
+}
+
+fn suspicious_write(m: u32, a: u32) -> bool {
+    (is_hi_addr_reg(m) && a > 0xFF)
+        || (matches!(m, 0x582 | 0x583 | 0x6c0 | 0x6c1 | 0x6c2)
+            && matches!(a >> 24, 0x3E..=0x48))
+}
+
+fn forensic_report(out: &MacroOutput, params: &[u32]) {
+    if !mme_forensics() {
+        return;
+    }
+    if !out.writes.iter().any(|&(m, a)| suspicious_write(m, a)) {
+        return;
+    }
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 96 {
+        return;
+    }
+    log::warn!(
+        "[mme-garbage] entry={} hash={:#018x} hle={} params={:08x?} writes={:08x?}",
+        out.entry,
+        out.hash,
+        out.hle,
+        &params[..params.len().min(12)],
+        &out.writes[..out.writes.len().min(16)]
+    );
 }
 
 pub struct MacroEngine {
@@ -343,15 +389,24 @@ impl MacroEngine {
                 &code[..code.len().min(28)]
             );
         }
-        if let Some(out) = hle {
-            return Some(out);
-        }
-        let mut interp = Interpreter::new(&code, &params, reg_reader);
-        interp.run();
-        Some(MacroOutput {
-            writes: interp.writes,
-            draw_instance_count: None,
-        })
+        let mut out = if let Some(mut out) = hle {
+            out.hle = true;
+            out
+        } else {
+            let mut interp = Interpreter::new(&code, &params, reg_reader);
+            interp.run();
+            MacroOutput {
+                writes: interp.writes,
+                draw_instance_count: None,
+                hash: 0,
+                entry: 0,
+                hle: false,
+            }
+        };
+        out.hash = hash;
+        out.entry = entry as u32;
+        forensic_report(&out, &params);
+        Some(out)
     }
 
     fn resolve_code(&mut self, offset: u32) -> Vec<u32> {

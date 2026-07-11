@@ -485,6 +485,9 @@ pub struct Maxwell3D {
     pub macro_invocations: u32,
     pub macro_writes_logged: u32,
     macro_draw_instance_count: Option<u32>,
+    mme_active: bool,
+    mme_hash: u64,
+    mme_entry: u32,
 }
 
 const REG_LOAD_MME_INSTRUCTION_PTR: u32 = 0x45;
@@ -492,9 +495,19 @@ const REG_LOAD_MME_INSTRUCTION: u32 = 0x46;
 const REG_LOAD_MME_START_ADDRESS_PTR: u32 = 0x47;
 const REG_LOAD_MME_START_ADDRESS: u32 = 0x48;
 
+fn mme_forensics() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_MME_FORENSICS").is_some())
+}
+
 fn raw_counter_reports() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("NEXIUM_RAW_COUNTER_REPORTS").is_some())
+}
+
+fn wf_state_log() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_WATER_FORENSICS").is_some())
 }
 
 fn synthetic_counter_value() -> u32 {
@@ -541,6 +554,9 @@ impl Maxwell3D {
             macro_invocations: 0,
             macro_writes_logged: 0,
             macro_draw_instance_count: None,
+            mme_active: false,
+            mme_hash: 0,
+            mme_entry: 0,
         }
     }
 
@@ -596,9 +612,13 @@ impl Maxwell3D {
                     self.macro_writes_logged += 1;
                 }
                 self.macro_draw_instance_count = out.draw_instance_count;
+                self.mme_active = true;
+                self.mme_hash = out.hash;
+                self.mme_entry = out.entry;
                 for (m, a) in out.writes {
                     self.write_register(m, a);
                 }
+                self.mme_active = false;
                 self.macro_draw_instance_count = None;
             }
             return;
@@ -662,8 +682,54 @@ impl Maxwell3D {
                 _ => arg,
             }
         };
+
+        let addr_hi_reg = method == 0x582
+            || method == 0x6c0
+            || method == 0x8e1
+            || method == 0x554
+            || (method >= 0x200 && method < 0x280 && (method & 0xF) == 0);
+        if addr_hi_reg && arg > 0xFF {
+            if mme_forensics() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 48 {
+                    log::warn!(
+                        "[reg-reject] method={:#x} arg={:#010x} (impossible VA hi, keeping prior)",
+                        method,
+                        arg
+                    );
+                }
+            }
+            return;
+        }
+
         if (method as usize) < self.reg_file.len() {
             self.reg_file[method as usize] = arg;
+        }
+
+        if mme_forensics() {
+            let hi_reg = method == 0x582
+                || method == 0x6c0
+                || method == 0x8e1
+                || method == 0x1c
+                || method == 0x554
+                || (method >= 0x200 && method < 0x280 && (method & 0xF) == 0);
+            let floaty = matches!(method, 0x582 | 0x583 | 0x6c0 | 0x6c1 | 0x6c2)
+                && matches!(arg >> 24, 0x3E..=0x48);
+            if (hi_reg && arg > 0xFF) || floaty {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 96 {
+                    log::warn!(
+                        "[reg-garbage] method={:#x} arg={:#010x} mme={} hash={:#018x} entry={}",
+                        method,
+                        arg,
+                        self.mme_active,
+                        self.mme_hash,
+                        self.mme_entry
+                    );
+                }
+            }
         }
 
         if method >= 0x200 && method < 0x280 {
@@ -1054,9 +1120,26 @@ impl Maxwell3D {
             0x48A => self.regs.zeta.width = arg & 0x0FFF_FFFF,
             0x48B => self.regs.zeta.height = arg & 0x0001_FFFF,
             0x54E => self.regs.zeta_enable = (arg & 1) != 0,
-            0x4B3 => self.regs.depth_test_enable = (arg & 1) != 0,
-            0x4BA => self.regs.depth_write_enable = (arg & 1) != 0,
-            0x4C3 => self.regs.depth_func = arg,
+            0x4B3 => {
+                let new = (arg & 1) != 0;
+                if new != self.regs.depth_test_enable && wf_state_log() {
+                    log::warn!("[wf-state] depth_test {} -> {}", self.regs.depth_test_enable, new);
+                }
+                self.regs.depth_test_enable = new;
+            }
+            0x4BA => {
+                let new = (arg & 1) != 0;
+                if new != self.regs.depth_write_enable && wf_state_log() {
+                    log::warn!("[wf-state] depth_write {} -> {}", self.regs.depth_write_enable, new);
+                }
+                self.regs.depth_write_enable = new;
+            }
+            0x4C3 => {
+                if arg != self.regs.depth_func && wf_state_log() {
+                    log::warn!("[wf-state] depth_func {:#x} -> {:#x}", self.regs.depth_func, arg);
+                }
+                self.regs.depth_func = arg;
+            }
             0x4D0 => self.regs.blend_eq_rgb = arg,
             0x4D1 => self.regs.blend_src_rgb = arg,
             0x4D2 => self.regs.blend_dst_rgb = arg,
