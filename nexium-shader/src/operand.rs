@@ -384,6 +384,66 @@ pub fn fset_cmp(insn: u64) -> u64 {
 pub fn fset_bop(insn: u64) -> u64 {
     bits(insn, 45, 46)
 }
+
+#[inline]
+pub fn half_merge(insn: u64) -> u8 {
+    bits(insn, 49, 50) as u8
+}
+
+#[inline]
+pub fn half_swizzle_a(insn: u64) -> u8 {
+    bits(insn, 47, 48) as u8
+}
+
+#[inline]
+pub fn half_swizzle_b(insn: u64) -> u8 {
+    bits(insn, 28, 29) as u8
+}
+
+#[inline]
+pub fn half_swizzle_c(insn: u64) -> u8 {
+    bits(insn, 35, 36) as u8
+}
+
+#[inline]
+pub fn half_precision(insn: u64, lo: u32) -> u8 {
+    bits(insn, lo, lo + 1) as u8
+}
+
+#[inline]
+pub fn half_compare(insn: u64, lo: u32) -> u8 {
+    bits(insn, lo, lo + 3) as u8
+}
+
+#[inline]
+pub fn half_bop(insn: u64) -> u8 {
+    bits(insn, 45, 46) as u8
+}
+
+#[inline]
+pub fn half_h_and(insn: u64, bit: u32) -> bool {
+    bits(insn, bit, bit) != 0
+}
+
+#[inline]
+pub fn half_src_pred(insn: u64) -> u8 {
+    bits(insn, 39, 41) as u8
+}
+
+#[inline]
+pub fn half_src_pred_inv(insn: u64) -> bool {
+    bits(insn, 42, 42) != 0
+}
+
+#[inline]
+pub fn half_dest_p(insn: u64) -> u8 {
+    bits(insn, 3, 5) as u8
+}
+
+#[inline]
+pub fn half_dest_np(insn: u64) -> u8 {
+    bits(insn, 0, 2) as u8
+}
 #[inline]
 pub fn fset_bf(insn: u64) -> bool {
     bits(insn, 52, 52) != 0

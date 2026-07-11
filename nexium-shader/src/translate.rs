@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use super::decode::decode_one;
-use super::ir::{BoolOp, FComp, ICmp, LogicOp, MufuFunc, Op, Predicate, Program, Value, ValueId};
+use super::ir::{
+    BoolOp, FComp, HalfMerge, HalfPrecision, HalfSwizzle, ICmp, LogicOp, MufuFunc, Op,
+    Predicate, Program, Value, ValueId,
+};
 use super::opcodes::Opcode;
 use super::operand::{
     ald_num_elements, attr_slot_ald, attr_slot_ipa, bfe_signed, cbuf, csetp_bop, csetp_bop_pred,
@@ -20,7 +23,9 @@ use super::operand::{
     psetp_neg_pred_b, psetp_neg_pred_c, psetp_pred_a, psetp_pred_b, psetp_pred_c, reg_a, reg_b,
     reg_c, reg_dest, sel_neg_pred, sel_pred, shr_signed, texs_tex_id, xmad_cr_mrg, xmad_cr_psl,
     xmad_half_a, xmad_imm_src_b, xmad_rc_half_b, xmad_rc_select, xmad_reg_half_b, xmad_reg_mrg,
-    xmad_reg_psl, xmad_reg_select, xmad_signed_a, xmad_signed_b, RZ,
+    xmad_reg_psl, xmad_reg_select, xmad_signed_a, xmad_signed_b, half_bop, half_compare,
+    half_dest_np, half_dest_p, half_h_and, half_merge, half_precision, half_src_pred,
+    half_src_pred_inv, half_swizzle_a, half_swizzle_b, half_swizzle_c, RZ,
 };
 
 const PT: u8 = 7;
@@ -158,6 +163,200 @@ impl Translator {
             },
             pred,
         );
+    }
+
+    fn half_swizzle(bits: u8) -> HalfSwizzle {
+        match bits & 3 {
+            0 => HalfSwizzle::H1_H0,
+            1 => HalfSwizzle::F32,
+            2 => HalfSwizzle::H0_H0,
+            _ => HalfSwizzle::H1_H1,
+        }
+    }
+
+    fn half_merge(bits: u8) -> HalfMerge {
+        match bits & 3 {
+            0 => HalfMerge::H1_H0,
+            1 => HalfMerge::F32,
+            2 => HalfMerge::MRG_H0,
+            _ => HalfMerge::MRG_H1,
+        }
+    }
+
+    fn half_precision(bits: u8) -> HalfPrecision {
+        match bits & 3 {
+            1 => HalfPrecision::FTZ,
+            2 => HalfPrecision::FMZ,
+            _ => HalfPrecision::None,
+        }
+    }
+
+    fn half_imm(raw: u64) -> Value {
+        let low = ((raw >> 20) & 0x1ff) as u32;
+        let high = ((raw >> 30) & 0x1ff) as u32;
+        let value = (low << 6)
+            | ((((raw >> 29) & 1) as u32) << 15)
+            | (high << 22)
+            | ((((raw >> 56) & 1) as u32) << 31);
+        Value::ImmU32(value)
+    }
+
+    fn emit_hadd2(
+        &mut self,
+        raw: u64,
+        src_b: Value,
+        swizzle_a: HalfSwizzle,
+        swizzle_b: HalfSwizzle,
+        abs_a: bool,
+        neg_a: bool,
+        abs_b: bool,
+        neg_b: bool,
+        merge: HalfMerge,
+        sat: bool,
+        ftz: bool,
+        pred: Option<Predicate>,
+    ) {
+        let old = self.read_reg(reg_dest(raw));
+        self.write_reg(
+            reg_dest(raw),
+            Op::HAdd {
+                a: self.read_reg(reg_a(raw)),
+                b: src_b,
+                old,
+                merge,
+                swizzle_a,
+                swizzle_b,
+                abs_a,
+                neg_a,
+                abs_b,
+                neg_b,
+                sat,
+                ftz,
+            },
+            pred,
+        );
+    }
+
+    fn emit_hmul2(
+        &mut self,
+        raw: u64,
+        src_b: Value,
+        swizzle_a: HalfSwizzle,
+        swizzle_b: HalfSwizzle,
+        abs_a: bool,
+        neg_a: bool,
+        abs_b: bool,
+        neg_b: bool,
+        merge: HalfMerge,
+        sat: bool,
+        precision: HalfPrecision,
+        pred: Option<Predicate>,
+    ) {
+        let old = self.read_reg(reg_dest(raw));
+        self.write_reg(
+            reg_dest(raw),
+            Op::HMul {
+                a: self.read_reg(reg_a(raw)),
+                b: src_b,
+                old,
+                merge,
+                swizzle_a,
+                swizzle_b,
+                abs_a,
+                neg_a,
+                abs_b,
+                neg_b,
+                sat,
+                precision,
+            },
+            pred,
+        );
+    }
+
+    fn emit_hfma2(
+        &mut self,
+        raw: u64,
+        src_b: Value,
+        swizzle_a: HalfSwizzle,
+        swizzle_b: HalfSwizzle,
+        src_c: Value,
+        swizzle_c: HalfSwizzle,
+        neg_b: bool,
+        neg_c: bool,
+        merge: HalfMerge,
+        sat: bool,
+        precision: HalfPrecision,
+        pred: Option<Predicate>,
+    ) {
+        let old = self.read_reg(reg_dest(raw));
+        self.write_reg(
+            reg_dest(raw),
+            Op::HFma {
+                a: self.read_reg(reg_a(raw)),
+                b: src_b,
+                c: src_c,
+                old,
+                merge,
+                swizzle_a,
+                swizzle_b,
+                swizzle_c,
+                neg_b,
+                neg_c,
+                sat,
+                precision,
+            },
+            pred,
+        );
+    }
+
+    fn emit_hsetp2(
+        &mut self,
+        raw: u64,
+        src_b: Value,
+        swizzle_a: HalfSwizzle,
+        swizzle_b: HalfSwizzle,
+        neg_a: bool,
+        abs_a: bool,
+        neg_b: bool,
+        abs_b: bool,
+        cmp: FComp,
+        bop: BoolOp,
+        src_pred: u8,
+        src_pred_inv: bool,
+        h_and: bool,
+        ftz: bool,
+        pred: Option<Predicate>,
+    ) {
+        let dest_p = half_dest_p(raw);
+        let dest_np = half_dest_np(raw);
+        let id = self.program.emit_pred(
+            Op::HSetPred {
+                cmp,
+                bop,
+                src_a: self.read_reg(reg_a(raw)),
+                src_b,
+                swizzle_a,
+                swizzle_b,
+                neg_a,
+                abs_a,
+                neg_b,
+                abs_b,
+                src_pred,
+                src_pred_inv,
+                dest_p,
+                dest_np,
+                h_and,
+                ftz,
+            },
+            None,
+            pred,
+        );
+        if dest_p != PT {
+            self.pred_state.insert(dest_p, id);
+        }
+        if dest_np != PT {
+            self.pred_state.insert(dest_np, id);
+        }
     }
 
     fn emit_isetp(&mut self, raw: u64, src_b: Value, pred: Option<Predicate>) {
@@ -858,6 +1057,258 @@ impl Translator {
                 );
             }
 
+            Opcode::HADD2_reg => self.emit_hadd2(
+                raw,
+                self.read_reg(reg_b(raw)),
+                Self::half_swizzle(half_swizzle_a(raw)),
+                Self::half_swizzle(half_swizzle_b(raw)),
+                ((raw >> 44) & 1) != 0,
+                ((raw >> 43) & 1) != 0,
+                ((raw >> 30) & 1) != 0,
+                ((raw >> 31) & 1) != 0,
+                Self::half_merge(half_merge(raw)),
+                ((raw >> 32) & 1) != 0,
+                ((raw >> 39) & 1) != 0,
+                pred,
+            ),
+            Opcode::HADD2_cbuf => {
+                let b = Value::Inst(self.load_cbuf(raw));
+                self.emit_hadd2(
+                    raw,
+                    b,
+                    Self::half_swizzle(half_swizzle_a(raw)),
+                    HalfSwizzle::F32,
+                    ((raw >> 44) & 1) != 0,
+                    ((raw >> 43) & 1) != 0,
+                    ((raw >> 54) & 1) != 0,
+                    ((raw >> 56) & 1) != 0,
+                    Self::half_merge(half_merge(raw)),
+                    ((raw >> 52) & 1) != 0,
+                    ((raw >> 39) & 1) != 0,
+                    pred,
+                );
+            }
+            Opcode::HADD2_imm => self.emit_hadd2(
+                raw,
+                Self::half_imm(raw),
+                Self::half_swizzle(half_swizzle_a(raw)),
+                HalfSwizzle::H1_H0,
+                ((raw >> 44) & 1) != 0,
+                ((raw >> 43) & 1) != 0,
+                false,
+                false,
+                Self::half_merge(half_merge(raw)),
+                ((raw >> 52) & 1) != 0,
+                ((raw >> 39) & 1) != 0,
+                pred,
+            ),
+            Opcode::HADD2_32I => self.emit_hadd2(
+                raw,
+                Value::ImmU32(imm32(raw)),
+                Self::half_swizzle(((raw >> 53) & 3) as u8),
+                HalfSwizzle::H1_H0,
+                false,
+                ((raw >> 56) & 1) != 0,
+                false,
+                false,
+                HalfMerge::H1_H0,
+                ((raw >> 52) & 1) != 0,
+                ((raw >> 55) & 1) != 0,
+                pred,
+            ),
+
+            Opcode::HMUL2_reg => self.emit_hmul2(
+                raw,
+                self.read_reg(reg_b(raw)),
+                Self::half_swizzle(half_swizzle_a(raw)),
+                Self::half_swizzle(half_swizzle_b(raw)),
+                ((raw >> 44) & 1) != 0,
+                false,
+                ((raw >> 30) & 1) != 0,
+                ((raw >> 31) & 1) != 0,
+                Self::half_merge(half_merge(raw)),
+                ((raw >> 32) & 1) != 0,
+                Self::half_precision(half_precision(raw, 39)),
+                pred,
+            ),
+            Opcode::HMUL2_cbuf => {
+                let b = Value::Inst(self.load_cbuf(raw));
+                self.emit_hmul2(
+                    raw,
+                    b,
+                    Self::half_swizzle(half_swizzle_a(raw)),
+                    HalfSwizzle::F32,
+                    ((raw >> 44) & 1) != 0,
+                    ((raw >> 43) & 1) != 0,
+                    ((raw >> 54) & 1) != 0,
+                    false,
+                    Self::half_merge(half_merge(raw)),
+                    ((raw >> 52) & 1) != 0,
+                    Self::half_precision(half_precision(raw, 39)),
+                    pred,
+                );
+            }
+            Opcode::HMUL2_imm => self.emit_hmul2(
+                raw,
+                Self::half_imm(raw),
+                Self::half_swizzle(half_swizzle_a(raw)),
+                HalfSwizzle::H1_H0,
+                ((raw >> 44) & 1) != 0,
+                ((raw >> 43) & 1) != 0,
+                false,
+                false,
+                Self::half_merge(half_merge(raw)),
+                ((raw >> 52) & 1) != 0,
+                Self::half_precision(half_precision(raw, 39)),
+                pred,
+            ),
+            Opcode::HMUL2_32I => self.emit_hmul2(
+                raw,
+                Value::ImmU32(imm32(raw)),
+                Self::half_swizzle(((raw >> 53) & 3) as u8),
+                HalfSwizzle::H1_H0,
+                false,
+                false,
+                false,
+                false,
+                HalfMerge::H1_H0,
+                ((raw >> 52) & 1) != 0,
+                Self::half_precision(half_precision(raw, 55)),
+                pred,
+            ),
+
+            Opcode::HFMA2_reg => self.emit_hfma2(
+                raw,
+                self.read_reg(reg_b(raw)),
+                Self::half_swizzle(half_swizzle_a(raw)),
+                Self::half_swizzle(half_swizzle_b(raw)),
+                self.read_reg(reg_c(raw)),
+                Self::half_swizzle(half_swizzle_c(raw)),
+                ((raw >> 31) & 1) != 0,
+                ((raw >> 30) & 1) != 0,
+                Self::half_merge(half_merge(raw)),
+                ((raw >> 32) & 1) != 0,
+                Self::half_precision(half_precision(raw, 37)),
+                pred,
+            ),
+            Opcode::HFMA2_rc => {
+                let c = Value::Inst(self.load_cbuf(raw));
+                self.emit_hfma2(
+                    raw,
+                    self.read_reg(reg_c(raw)),
+                    Self::half_swizzle(half_swizzle_a(raw)),
+                    Self::half_swizzle(((raw >> 53) & 3) as u8),
+                    c,
+                    HalfSwizzle::F32,
+                    ((raw >> 56) & 1) != 0,
+                    ((raw >> 51) & 1) != 0,
+                    Self::half_merge(half_merge(raw)),
+                    ((raw >> 52) & 1) != 0,
+                    Self::half_precision(half_precision(raw, 57)),
+                    pred,
+                );
+            }
+            Opcode::HFMA2_cr => {
+                let b = Value::Inst(self.load_cbuf(raw));
+                self.emit_hfma2(
+                    raw,
+                    b,
+                    Self::half_swizzle(half_swizzle_a(raw)),
+                    HalfSwizzle::F32,
+                    self.read_reg(reg_c(raw)),
+                    Self::half_swizzle(((raw >> 53) & 3) as u8),
+                    ((raw >> 56) & 1) != 0,
+                    ((raw >> 51) & 1) != 0,
+                    Self::half_merge(half_merge(raw)),
+                    ((raw >> 52) & 1) != 0,
+                    Self::half_precision(half_precision(raw, 57)),
+                    pred,
+                );
+            }
+            Opcode::HFMA2_imm => self.emit_hfma2(
+                raw,
+                Self::half_imm(raw),
+                Self::half_swizzle(half_swizzle_a(raw)),
+                HalfSwizzle::H1_H0,
+                self.read_reg(reg_c(raw)),
+                Self::half_swizzle(((raw >> 53) & 3) as u8),
+                false,
+                ((raw >> 51) & 1) != 0,
+                Self::half_merge(half_merge(raw)),
+                ((raw >> 52) & 1) != 0,
+                Self::half_precision(half_precision(raw, 57)),
+                pred,
+            ),
+            Opcode::HFMA2_32I => self.emit_hfma2(
+                raw,
+                Value::ImmU32(imm32(raw)),
+                Self::half_swizzle(((raw >> 53) & 3) as u8),
+                HalfSwizzle::H1_H0,
+                self.read_reg(reg_dest(raw)),
+                HalfSwizzle::H1_H0,
+                false,
+                ((raw >> 52) & 1) != 0,
+                HalfMerge::H1_H0,
+                false,
+                Self::half_precision(half_precision(raw, 55)),
+                pred,
+            ),
+
+            Opcode::HSETP2_reg => self.emit_hsetp2(
+                raw,
+                self.read_reg(reg_b(raw)),
+                Self::half_swizzle(half_swizzle_a(raw)),
+                Self::half_swizzle(half_swizzle_b(raw)),
+                ((raw >> 43) & 1) != 0,
+                ((raw >> 44) & 1) != 0,
+                ((raw >> 31) & 1) != 0,
+                ((raw >> 30) & 1) != 0,
+                FComp::from_bits(half_compare(raw, 35) as u64),
+                BoolOp::from_bits(half_bop(raw) as u64),
+                half_src_pred(raw),
+                half_src_pred_inv(raw),
+                half_h_and(raw, 49),
+                half_h_and(raw, 6),
+                pred,
+            ),
+            Opcode::HSETP2_cbuf => {
+                let b = Value::Inst(self.load_cbuf(raw));
+                self.emit_hsetp2(
+                    raw,
+                    b,
+                    Self::half_swizzle(half_swizzle_a(raw)),
+                    HalfSwizzle::F32,
+                    ((raw >> 43) & 1) != 0,
+                    ((raw >> 44) & 1) != 0,
+                    ((raw >> 56) & 1) != 0,
+                    ((raw >> 54) & 1) != 0,
+                    FComp::from_bits(half_compare(raw, 49) as u64),
+                    BoolOp::from_bits(half_bop(raw) as u64),
+                    half_src_pred(raw),
+                    half_src_pred_inv(raw),
+                    half_h_and(raw, 53),
+                    half_h_and(raw, 6),
+                    pred,
+                );
+            }
+            Opcode::HSETP2_imm => self.emit_hsetp2(
+                raw,
+                Self::half_imm(raw),
+                Self::half_swizzle(half_swizzle_a(raw)),
+                HalfSwizzle::H1_H0,
+                ((raw >> 43) & 1) != 0,
+                ((raw >> 44) & 1) != 0,
+                false,
+                false,
+                FComp::from_bits(half_compare(raw, 49) as u64),
+                BoolOp::from_bits(half_bop(raw) as u64),
+                half_src_pred(raw),
+                half_src_pred_inv(raw),
+                half_h_and(raw, 53),
+                half_h_and(raw, 6),
+                pred,
+            ),
+
             Opcode::F2F_reg => {
                 let s = self.read_reg(reg_b(raw));
                 self.emit_f2f(raw, s, pred);
@@ -1158,30 +1609,58 @@ impl Translator {
                     1
                 };
 
-                let mut store_index: u8 = 0;
-                for component in 0..4u8 {
-                    if (mask >> component) & 1 == 0 {
-                        continue;
+                let fp16 = ((raw >> 59) & 1) == 0;
+                if fp16 {
+                    let mut sampled: Vec<Value> = Vec::new();
+                    for component in 0..4u8 {
+                        if (mask >> component) & 1 == 0 {
+                            continue;
+                        }
+                        let id = self.program.emit(
+                            Op::SampleTex {
+                                tex_id,
+                                u,
+                                v,
+                                array,
+                                volume,
+                                component,
+                            },
+                            None,
+                        );
+                        sampled.push(Value::Inst(id));
                     }
-                    let dst_reg = match store_index {
-                        0 => dest_a,
-                        1 => dest_a.wrapping_add(1),
-                        2 => dest_b,
-                        _ => dest_b.wrapping_add(1),
-                    };
-                    self.write_reg(
-                        dst_reg,
-                        Op::SampleTex {
-                            tex_id,
-                            u,
-                            v,
-                            array,
-                            volume,
-                            component,
-                        },
-                        pred,
-                    );
-                    store_index += 1;
+                    for (i, pair) in sampled.chunks(2).enumerate() {
+                        let dst_reg = if i == 0 { dest_a } else { dest_b };
+                        let lo = pair[0];
+                        let hi = pair.get(1).copied().unwrap_or(Value::Zero);
+                        self.write_reg(dst_reg, Op::PackHalf2 { lo, hi }, pred);
+                    }
+                } else {
+                    let mut store_index: u8 = 0;
+                    for component in 0..4u8 {
+                        if (mask >> component) & 1 == 0 {
+                            continue;
+                        }
+                        let dst_reg = match store_index {
+                            0 => dest_a,
+                            1 => dest_a.wrapping_add(1),
+                            2 => dest_b,
+                            _ => dest_b.wrapping_add(1),
+                        };
+                        self.write_reg(
+                            dst_reg,
+                            Op::SampleTex {
+                                tex_id,
+                                u,
+                                v,
+                                array,
+                                volume,
+                                component,
+                            },
+                            pred,
+                        );
+                        store_index += 1;
+                    }
                 }
             }
 

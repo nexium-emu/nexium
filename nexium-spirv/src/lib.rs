@@ -5,8 +5,8 @@ mod opt;
 use std::collections::HashMap;
 
 use nexium_shader::{
-    BasicBlock, BlockId, BoolOp, BranchKind, Cfg, FComp, ICmp, IrInst, IrOp, IrValue, LogicOp,
-    MufuFunc, ValueId,
+    BasicBlock, BlockId, BoolOp, BranchKind, Cfg, FComp, HalfMerge, HalfPrecision, HalfSwizzle,
+    ICmp, IrInst, IrOp, IrValue, LogicOp, MufuFunc, ValueId,
 };
 use rspirv::binary::Assemble;
 use rspirv::dr::Operand;
@@ -1204,6 +1204,144 @@ impl Emitter {
         }
     }
 
+    fn lower_half_pair(&mut self, value: &IrValue, swizzle: HalfSwizzle) -> [Word; 2] {
+        let raw = self.lower_value(value);
+        match swizzle {
+            HalfSwizzle::F32 => [raw, raw],
+            HalfSwizzle::H1_H0
+            | HalfSwizzle::H0_H0
+            | HalfSwizzle::H1_H1 => {
+                let bits = self.as_u32(raw);
+                let vector = self
+                    .b
+                    .ext_inst(
+                        self.vec2_t,
+                        None,
+                        self.glsl,
+                        62,
+                        [Operand::IdRef(bits)],
+                    )
+                    .unwrap();
+                let low = self
+                    .b
+                    .composite_extract(self.f32_t, None, vector, [0])
+                    .unwrap();
+                let high = self
+                    .b
+                    .composite_extract(self.f32_t, None, vector, [1])
+                    .unwrap();
+                match swizzle {
+                    HalfSwizzle::H1_H0 => [low, high],
+                    HalfSwizzle::H0_H0 => [low, low],
+                    HalfSwizzle::H1_H1 => [high, high],
+                    HalfSwizzle::F32 => unreachable!(),
+                }
+            }
+        }
+    }
+
+    fn lower_half_pack(
+        &mut self,
+        lhs: Word,
+        rhs: Word,
+        old: &IrValue,
+        merge: HalfMerge,
+    ) -> Word {
+        if matches!(merge, HalfMerge::F32) {
+            return self.round_half_pair(lhs, rhs)[0];
+        }
+        let vector = match merge {
+            HalfMerge::H1_H0 => self
+                .b
+                .composite_construct(self.vec2_t, None, [lhs, rhs])
+                .unwrap(),
+            HalfMerge::MRG_H0 | HalfMerge::MRG_H1 => {
+                let old_raw = self.lower_value(old);
+                let old_bits = self.as_u32(old_raw);
+                let old_vector = self
+                    .b
+                    .ext_inst(
+                        self.vec2_t,
+                        None,
+                        self.glsl,
+                        62,
+                        [Operand::IdRef(old_bits)],
+                    )
+                    .unwrap();
+                let index = if matches!(merge, HalfMerge::MRG_H0) { 0 } else { 1 };
+                let value = if index == 0 { lhs } else { rhs };
+                self.b
+                    .composite_insert(self.vec2_t, None, value, old_vector, [index])
+                    .unwrap()
+            }
+            HalfMerge::F32 => unreachable!(),
+        };
+        let packed = self
+            .b
+            .ext_inst(
+                self.u32_t,
+                None,
+                self.glsl,
+                58,
+                [Operand::IdRef(vector)],
+            )
+            .unwrap();
+        self.store_bits(packed)
+    }
+
+    fn round_half_pair(&mut self, lhs: Word, rhs: Word) -> [Word; 2] {
+        let vector = self
+            .b
+            .composite_construct(self.vec2_t, None, [lhs, rhs])
+            .unwrap();
+        let packed = self
+            .b
+            .ext_inst(
+                self.u32_t,
+                None,
+                self.glsl,
+                58,
+                [Operand::IdRef(vector)],
+            )
+            .unwrap();
+        let unpacked = self
+            .b
+            .ext_inst(
+                self.vec2_t,
+                None,
+                self.glsl,
+                62,
+                [Operand::IdRef(packed)],
+            )
+            .unwrap();
+        [
+            self.b
+                .composite_extract(self.f32_t, None, unpacked, [0])
+                .unwrap(),
+            self.b
+                .composite_extract(self.f32_t, None, unpacked, [1])
+                .unwrap(),
+        ]
+    }
+
+    fn half_pair_promotes(
+        swizzle_a: HalfSwizzle,
+        swizzle_b: HalfSwizzle,
+        swizzle_c: Option<HalfSwizzle>,
+    ) -> bool {
+        if !matches!(swizzle_a, HalfSwizzle::F32) {
+            return true;
+        }
+        if !matches!(swizzle_b, HalfSwizzle::F32) {
+            return true;
+        }
+        swizzle_c.map_or(false, |swizzle| !matches!(swizzle, HalfSwizzle::F32))
+    }
+
+    fn lower_half_abs_neg(&mut self, value: Word, abs: bool, neg: bool) -> Word {
+        self.apply_neg_abs(value, neg, abs)
+    }
+
     fn lower_op(&mut self, inst: &IrInst) {
         let result = inst.result;
         let word = match &inst.op {
@@ -1257,6 +1395,168 @@ impl Emitter {
                     )
                     .unwrap();
                 Some(self.apply_sat(r, mods.sat))
+            }
+            IrOp::HAdd {
+                a,
+                b,
+                old,
+                merge,
+                swizzle_a,
+                swizzle_b,
+                abs_a,
+                neg_a,
+                abs_b,
+                neg_b,
+                sat,
+                ..
+            } => {
+                let [a0, a1] = self.lower_half_pair(a, *swizzle_a);
+                let [b0, b1] = self.lower_half_pair(b, *swizzle_b);
+                let a0 = self.lower_half_abs_neg(a0, *abs_a, *neg_a);
+                let a1 = self.lower_half_abs_neg(a1, *abs_a, *neg_a);
+                let b0 = self.lower_half_abs_neg(b0, *abs_b, *neg_b);
+                let b1 = self.lower_half_abs_neg(b1, *abs_b, *neg_b);
+                let lhs = self.b.f_add(self.f32_t, None, a0, b0).unwrap();
+                let rhs = self.b.f_add(self.f32_t, None, a1, b1).unwrap();
+                let [lhs, rhs] = if Self::half_pair_promotes(*swizzle_a, *swizzle_b, None) {
+                    self.round_half_pair(lhs, rhs)
+                } else {
+                    [lhs, rhs]
+                };
+                let lhs = self.apply_sat(lhs, *sat);
+                let rhs = self.apply_sat(rhs, *sat);
+                let packed = self.lower_half_pack(lhs, rhs, old, *merge);
+                Some(packed)
+            }
+            IrOp::HMul {
+                a,
+                b,
+                old,
+                merge,
+                swizzle_a,
+                swizzle_b,
+                abs_a,
+                neg_a,
+                abs_b,
+                neg_b,
+                sat,
+                precision,
+                ..
+            } => {
+                let [a0, a1] = self.lower_half_pair(a, *swizzle_a);
+                let [b0, b1] = self.lower_half_pair(b, *swizzle_b);
+                let a0 = self.lower_half_abs_neg(a0, *abs_a, *neg_a);
+                let a1 = self.lower_half_abs_neg(a1, *abs_a, *neg_a);
+                let b0 = self.lower_half_abs_neg(b0, *abs_b, *neg_b);
+                let b1 = self.lower_half_abs_neg(b1, *abs_b, *neg_b);
+                let mut lhs = self.b.f_mul(self.f32_t, None, a0, b0).unwrap();
+                let mut rhs = self.b.f_mul(self.f32_t, None, a1, b1).unwrap();
+                if matches!(precision, HalfPrecision::FMZ) && !*sat {
+                    let z = self.f32_zero;
+                    let az0 = self.b.f_ord_equal(self.bool_t, None, a0, z).unwrap();
+                    let bz0 = self.b.f_ord_equal(self.bool_t, None, b0, z).unwrap();
+                    let az1 = self.b.f_ord_equal(self.bool_t, None, a1, z).unwrap();
+                    let bz1 = self.b.f_ord_equal(self.bool_t, None, b1, z).unwrap();
+                    let z0 = self.b.logical_or(self.bool_t, None, az0, bz0).unwrap();
+                    let z1 = self.b.logical_or(self.bool_t, None, az1, bz1).unwrap();
+                    lhs = self.b.select(self.f32_t, None, z0, z, lhs).unwrap();
+                    rhs = self.b.select(self.f32_t, None, z1, z, rhs).unwrap();
+                }
+                let [lhs, rhs] = if Self::half_pair_promotes(*swizzle_a, *swizzle_b, None) {
+                    self.round_half_pair(lhs, rhs)
+                } else {
+                    [lhs, rhs]
+                };
+                let lhs = self.apply_sat(lhs, *sat);
+                let rhs = self.apply_sat(rhs, *sat);
+                let packed = self.lower_half_pack(lhs, rhs, old, *merge);
+                Some(packed)
+            }
+            IrOp::HFma {
+                a,
+                b,
+                c,
+                old,
+                merge,
+                swizzle_a,
+                swizzle_b,
+                swizzle_c,
+                neg_b,
+                neg_c,
+                sat,
+                precision,
+                ..
+            } => {
+                let [a0, a1] = self.lower_half_pair(a, *swizzle_a);
+                let [b0, b1] = self.lower_half_pair(b, *swizzle_b);
+                let [c0, c1] = self.lower_half_pair(c, *swizzle_c);
+                let b0 = self.lower_half_abs_neg(b0, false, *neg_b);
+                let b1 = self.lower_half_abs_neg(b1, false, *neg_b);
+                let c0 = self.lower_half_abs_neg(c0, false, *neg_c);
+                let c1 = self.lower_half_abs_neg(c1, false, *neg_c);
+                let mut lhs = self
+                    .b
+                    .ext_inst(
+                        self.f32_t,
+                        None,
+                        self.glsl,
+                        50,
+                        [Operand::IdRef(a0), Operand::IdRef(b0), Operand::IdRef(c0)],
+                    )
+                    .unwrap();
+                let mut rhs = self
+                    .b
+                    .ext_inst(
+                        self.f32_t,
+                        None,
+                        self.glsl,
+                        50,
+                        [Operand::IdRef(a1), Operand::IdRef(b1), Operand::IdRef(c1)],
+                    )
+                    .unwrap();
+                if matches!(precision, HalfPrecision::FMZ) && !*sat {
+                    let z = self.f32_zero;
+                    let az0 = self.b.f_ord_equal(self.bool_t, None, a0, z).unwrap();
+                    let bz0 = self.b.f_ord_equal(self.bool_t, None, b0, z).unwrap();
+                    let az1 = self.b.f_ord_equal(self.bool_t, None, a1, z).unwrap();
+                    let bz1 = self.b.f_ord_equal(self.bool_t, None, b1, z).unwrap();
+                    let z0 = self.b.logical_or(self.bool_t, None, az0, bz0).unwrap();
+                    let z1 = self.b.logical_or(self.bool_t, None, az1, bz1).unwrap();
+                    lhs = self.b.select(self.f32_t, None, z0, c0, lhs).unwrap();
+                    rhs = self.b.select(self.f32_t, None, z1, c1, rhs).unwrap();
+                }
+                let [lhs, rhs] = if Self::half_pair_promotes(
+                    *swizzle_a,
+                    *swizzle_b,
+                    Some(*swizzle_c),
+                ) {
+                    self.round_half_pair(lhs, rhs)
+                } else {
+                    [lhs, rhs]
+                };
+                let lhs = self.apply_sat(lhs, *sat);
+                let rhs = self.apply_sat(rhs, *sat);
+                let packed = self.lower_half_pack(lhs, rhs, old, *merge);
+                Some(packed)
+            }
+            IrOp::PackHalf2 { lo, hi } => {
+                let l = self.lower_value(lo);
+                let h = self.lower_value(hi);
+                let vector = self
+                    .b
+                    .composite_construct(self.vec2_t, None, [l, h])
+                    .unwrap();
+                let packed = self
+                    .b
+                    .ext_inst(
+                        self.u32_t,
+                        None,
+                        self.glsl,
+                        58,
+                        [Operand::IdRef(vector)],
+                    )
+                    .unwrap();
+                Some(self.store_bits(packed))
             }
             IrOp::FMin { a, b, mods } => {
                 let av = self.lower_value(a);
@@ -1836,6 +2136,48 @@ impl Emitter {
                         .composite_extract(self.f32_t, None, gathered, [(*lane).min(3) as u32])
                         .unwrap_or(self.f32_zero),
                 )
+            }
+            IrOp::HSetPred {
+                cmp,
+                bop,
+                src_a,
+                src_b,
+                swizzle_a,
+                swizzle_b,
+                neg_a,
+                abs_a,
+                neg_b,
+                abs_b,
+                src_pred,
+                src_pred_inv,
+                dest_p,
+                dest_np,
+                h_and,
+                ..
+            } => {
+                let [a0, a1] = self.lower_half_pair(src_a, *swizzle_a);
+                let [b0, b1] = self.lower_half_pair(src_b, *swizzle_b);
+                let a0 = self.lower_half_abs_neg(a0, *abs_a, *neg_a);
+                let a1 = self.lower_half_abs_neg(a1, *abs_a, *neg_a);
+                let b0 = self.lower_half_abs_neg(b0, *abs_b, *neg_b);
+                let b1 = self.lower_half_abs_neg(b1, *abs_b, *neg_b);
+                let src_pred_word = self.resolve_pred(*src_pred, *src_pred_inv);
+                let cmp0 = self.lower_fcompare(cmp, a0, b0);
+                let cmp1 = self.lower_fcompare(cmp, a1, b1);
+                let result0 = self.lower_boolop(bop, cmp0, src_pred_word);
+                let result1 = self.lower_boolop(bop, cmp1, src_pred_word);
+                let (result_p, result_np) = if *h_and {
+                    let both = self.b.logical_and(self.bool_t, None, result0, result1).unwrap();
+                    (both, self.b.logical_not(self.bool_t, None, both).unwrap())
+                } else {
+                    (result0, result1)
+                };
+                let guard = inst
+                    .pred
+                    .map(|pred| self.resolve_pred(pred.idx, pred.negate));
+                self.write_pred_reg(*dest_p, result_p, guard);
+                self.write_pred_reg(*dest_np, result_np, guard);
+                Some(result_p)
             }
             IrOp::FSetPred {
                 cmp,
@@ -3003,7 +3345,13 @@ impl Emitter {
                 }
                 let next = block.id + 1;
                 if self.block_labels.contains_key(&next) {
-                    let cond = self.resolve_pred(pred.idx, pred.negate);
+                    let cond = if std::env::var("NEXIUM_FORCE_GATE").is_ok()
+                        && matches!(self.stage, Stage::Fragment)
+                    {
+                        self.bool_false
+                    } else {
+                        self.resolve_pred(pred.idx, pred.negate)
+                    };
                     let true_lbl = self.merge_redirect(block.id, target);
                     let false_lbl = self.merge_redirect(block.id, next);
                     if target == next {

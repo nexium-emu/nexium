@@ -79,6 +79,29 @@ pub enum BoolOp {
     Xor,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HalfSwizzle {
+    H1_H0,
+    F32,
+    H0_H0,
+    H1_H1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HalfMerge {
+    H1_H0,
+    F32,
+    MRG_H0,
+    MRG_H1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HalfPrecision {
+    None,
+    FTZ,
+    FMZ,
+}
+
 impl BoolOp {
     pub fn from_bits(v: u64) -> Self {
         match v & 3 {
@@ -306,6 +329,56 @@ pub enum Op {
         component: u8,
     },
 
+    HAdd {
+        a: Value,
+        b: Value,
+        old: Value,
+        merge: HalfMerge,
+        swizzle_a: HalfSwizzle,
+        swizzle_b: HalfSwizzle,
+        abs_a: bool,
+        neg_a: bool,
+        abs_b: bool,
+        neg_b: bool,
+        sat: bool,
+        ftz: bool,
+    },
+
+    HMul {
+        a: Value,
+        b: Value,
+        old: Value,
+        merge: HalfMerge,
+        swizzle_a: HalfSwizzle,
+        swizzle_b: HalfSwizzle,
+        abs_a: bool,
+        neg_a: bool,
+        abs_b: bool,
+        neg_b: bool,
+        sat: bool,
+        precision: HalfPrecision,
+    },
+
+    HFma {
+        a: Value,
+        b: Value,
+        c: Value,
+        old: Value,
+        merge: HalfMerge,
+        swizzle_a: HalfSwizzle,
+        swizzle_b: HalfSwizzle,
+        swizzle_c: HalfSwizzle,
+        neg_b: bool,
+        neg_c: bool,
+        sat: bool,
+        precision: HalfPrecision,
+    },
+
+    PackHalf2 {
+        lo: Value,
+        hi: Value,
+    },
+
     GatherTex {
         tex_id: u32,
         u: Value,
@@ -370,6 +443,25 @@ pub enum Op {
         src_pred_inv: bool,
         dest_p: u8,
         dest_np: u8,
+    },
+
+    HSetPred {
+        cmp: FComp,
+        bop: BoolOp,
+        src_a: Value,
+        src_b: Value,
+        swizzle_a: HalfSwizzle,
+        swizzle_b: HalfSwizzle,
+        neg_a: bool,
+        abs_a: bool,
+        neg_b: bool,
+        abs_b: bool,
+        src_pred: u8,
+        src_pred_inv: bool,
+        dest_p: u8,
+        dest_np: u8,
+        h_and: bool,
+        ftz: bool,
     },
 
     PSetPred {
@@ -591,6 +683,10 @@ impl Inst {
             Op::FMul { a, b, .. } => write!(f, "FMul  {a}, {b}"),
             Op::FAdd { a, b, .. } => write!(f, "FAdd  {a}, {b}"),
             Op::FFma { a, b, c, .. } => write!(f, "FFma  {a}, {b}, {c}"),
+            Op::HAdd { a, b, .. } => write!(f, "HAdd  {a}, {b}"),
+            Op::HMul { a, b, .. } => write!(f, "HMul  {a}, {b}"),
+            Op::HFma { a, b, c, .. } => write!(f, "HFma  {a}, {b}, {c}"),
+            Op::PackHalf2 { lo, hi } => write!(f, "PackH {lo}, {hi}"),
             Op::FMin { a, b, .. } => write!(f, "FMin  {a}, {b}"),
             Op::FMax { a, b, .. } => write!(f, "FMax  {a}, {b}"),
             Op::FMinMaxPred {
@@ -733,6 +829,18 @@ impl Inst {
             } => {
                 write!(f, "ISetP.{cmp:?}.{bop:?} P{dest_p}, {src_a}, {src_b}")
             }
+            Op::HSetPred {
+                cmp,
+                bop,
+                src_a,
+                src_b,
+                dest_p,
+                src_pred,
+                ..
+            } => write!(
+                f,
+                "HSetP.{cmp:?}.{bop:?} P{dest_p}, {src_a}, {src_b}, P{src_pred}"
+            ),
             Op::PSetPred {
                 dest_p,
                 pred_a,
