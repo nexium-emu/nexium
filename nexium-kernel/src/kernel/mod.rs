@@ -67,7 +67,8 @@ pub struct Kernel {
     pub applet_message_event: Option<u32>,
     pub vsync_handles: HashSet<u32>,
     pub nvdrv_sync_events: HashSet<u32>,
-    pub gpu_fence_events: HashSet<u32>,
+    pub gpu_fence_events: HashMap<u32, (u32, u32)>,
+    pub gpu_event_tokens: HashMap<u32, u32>,
     pub last_vsync: std::time::Instant,
     /// Last time we refreshed the HID shmem from `hid_input`. Refreshed on
     /// both vsync and applet-event polls (the latter being how SDL2-using
@@ -119,10 +120,12 @@ pub struct Kernel {
     pub time_shmem: Option<Vec<u8>>,
     pub time_shmem_handle: Option<u32>,
 
-    pub audio_out_buffers: HashMap<u32, VecDeque<u64>>,
+    pub audio_out_buffers: HashMap<u32, VecDeque<(u64, std::time::Instant, u64)>>,
     pub audio_buffer_events: HashMap<u32, u32>,
     pub audio_out_volumes: HashMap<u32, u32>,
     pub audio_out_state: HashMap<u32, u8>,
+    pub audio_out_next_free: HashMap<u32, std::time::Instant>,
+    pub audio_out_played_samples: HashMap<u32, u64>,
 
     pub audio_renderers: HashMap<(u32, u32), AudioRendererState>,
     pub audio_renderer_events: HashMap<(u32, u32), u32>,
@@ -214,7 +217,8 @@ impl Kernel {
             applet_message_event: None,
             vsync_handles: HashSet::new(),
             nvdrv_sync_events: HashSet::new(),
-            gpu_fence_events: HashSet::new(),
+            gpu_fence_events: HashMap::new(),
+            gpu_event_tokens: HashMap::new(),
             last_vsync: std::time::Instant::now(),
             last_hid_tick: std::time::Instant::now(),
             last_generic_svc_imm: 0xFFFF,
@@ -255,6 +259,8 @@ impl Kernel {
             audio_buffer_events: HashMap::new(),
             audio_out_volumes: HashMap::new(),
             audio_out_state: HashMap::new(),
+            audio_out_next_free: HashMap::new(),
+            audio_out_played_samples: HashMap::new(),
             audio_renderers: HashMap::new(),
             audio_renderer_events: HashMap::new(),
             audio_renderer_frame_counter: 0,
@@ -399,7 +405,7 @@ impl Kernel {
         if self.nvdrv_sync_events.contains(&handle) {
             tags.push("nvdrv_sync");
         }
-        if self.gpu_fence_events.contains(&handle) {
+        if self.gpu_fence_events.contains_key(&handle) {
             tags.push("gpu_fence");
         }
         if self.audio_renderer_events.values().any(|&h| h == handle) {
@@ -740,7 +746,7 @@ impl Kernel {
         };
         let holder = cur_word & !MUTEX_HAS_LISTENERS;
         if holder == 0 || holder == handle {
-            let more = self.threads.has_mutex_waiters_for_owner(mutex_addr, handle);
+            let more = self.threads.has_mutex_waiters(mutex_addr);
             let new_word = if more {
                 tag | MUTEX_HAS_LISTENERS
             } else {

@@ -664,16 +664,6 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         return SUCCESS;
     }
 
-    for (i, h) in handles.iter().enumerate() {
-        if kernel.nvdrv_sync_events.contains(h) {
-            if let Some(cpu) = cpu_mut() {
-                cpu.set_register(0, SUCCESS as u64);
-                cpu.set_register(1, i as u64);
-            }
-            return SUCCESS;
-        }
-    }
-
     let mut vsync_idx: Option<usize> = None;
     for (i, h) in handles.iter().enumerate() {
         if kernel.vsync_handles.contains(h) {
@@ -729,14 +719,19 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
             let mut last = cell.lock();
             if last.elapsed() >= AUDIO_PERIOD {
                 *last = std::time::Instant::now();
+                let now = std::time::Instant::now();
                 let sessions_with_pending: Vec<u32> = kernel
                     .audio_out_buffers
                     .iter()
-                    .filter_map(|(s, q)| if !q.is_empty() { Some(*s) } else { None })
+                    .filter_map(|(s, q)| match q.front() {
+                        Some(&(_, release_at, _)) if release_at <= now => Some(*s),
+                        _ => None,
+                    })
                     .collect();
                 for sess in sessions_with_pending {
                     if let Some(&ev) = kernel.audio_buffer_events.get(&sess) {
                         kernel.event_signals.insert(ev, true);
+                        kernel.threads.signal_handle(ev);
                     }
                 }
             }
@@ -776,14 +771,19 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
                 hid.tick(cur);
             }
         }
+        let now_audio = std::time::Instant::now();
         let sessions_with_pending: Vec<u32> = kernel
             .audio_out_buffers
             .iter()
-            .filter_map(|(s, q)| if !q.is_empty() { Some(*s) } else { None })
+            .filter_map(|(s, q)| match q.front() {
+                Some(&(_, release_at, _)) if release_at <= now_audio => Some(*s),
+                _ => None,
+            })
             .collect();
         for sess in sessions_with_pending {
             if let Some(&ev) = kernel.audio_buffer_events.get(&sess) {
                 kernel.event_signals.insert(ev, true);
+                kernel.threads.signal_handle(ev);
             }
         }
         if let Some(cpu) = cpu_mut() {
@@ -1095,7 +1095,7 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
         return 1;
     };
 
-    let max = if count < 0 { i32::MAX } else { count };
+    let max = if count <= 0 { i32::MAX } else { count };
     let mut woken = 0;
     for _ in 0..max {
         let Some((handle, mutex_addr)) = kernel.threads.peek_one_condvar_waiter(condvar_addr)
@@ -1112,9 +1112,14 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
         let holder = cur_word & !MUTEX_HAS_LISTENERS;
 
         if holder == 0 {
+            let new_word = if kernel.threads.has_mutex_waiters(mutex_addr) {
+                handle | MUTEX_HAS_LISTENERS
+            } else {
+                handle
+            };
             let _ = kernel
                 .address_space
-                .write(mutex_addr, &handle.to_le_bytes());
+                .write(mutex_addr, &new_word.to_le_bytes());
             kernel.threads.wake_condvar_to_ready(handle);
             log::trace!(
                 "svcSignalProcessWideKey cond={:#x} → handle={:#x} mutex={:#x} (mutex was free, handed off)",
@@ -1927,6 +1932,40 @@ fn dispatch_service_v2(
         return handle_binder_transact(kernel, ctx, session_handle);
     }
 
+    if port_name == "IStorageAccessor"
+        && cmd_id == 10
+        && crate::services::am::pending_applet_id() == crate::services::am::APPLET_ID_CONTROLLER
+    {
+        let sb = ctx
+            .send_buffers
+            .iter()
+            .chain(ctx.send_statics.iter())
+            .find(|b| b.size > 0 && b.addr != 0)
+            .copied();
+        if let Some(b) = sb {
+            if b.size == 0x14 {
+                let mut tmp = [0u8; 0x14];
+                if kernel.address_space.read(b.addr, &mut tmp).is_ok()
+                    && u32::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3]]) == 0x14
+                {
+                    let style_set = u32::from_le_bytes([tmp[0xc], tmp[0xd], tmp[0xe], tmp[0xf]]);
+                    let sel = crate::hid_state::apply_controller_applet_style(style_set);
+                    crate::services::am::set_controller_selected_id(sel);
+                    let events: Vec<u32> = kernel.services.hid.style_change_events.clone();
+                    for h in events {
+                        kernel.event_signals.insert(h, true);
+                        kernel.threads.signal_handle(h);
+                    }
+                    log::info!(
+                        "am: controller applet configured style_set={:#x} selected_id={:#x}",
+                        style_set,
+                        sel
+                    );
+                }
+            }
+        }
+    }
+
     if let Some(buffer_data) = applet_buffer_response(port_name, cmd_id) {
         let target_buf = ctx
             .recv_buffers
@@ -1951,6 +1990,30 @@ fn dispatch_service_v2(
                 port_name,
                 cmd_id
             );
+        }
+    }
+
+    if port_name == "ILibraryAppletCreator" && cmd_id == 0 {
+        let off = ctx.cmif_in_data_off;
+        if off + 4 <= ctx.buf.len() {
+            let applet_id =
+                u32::from_le_bytes([ctx.buf[off], ctx.buf[off + 1], ctx.buf[off + 2], ctx.buf[off + 3]]);
+            let applet_mode = if off + 8 <= ctx.buf.len() {
+                u32::from_le_bytes([
+                    ctx.buf[off + 4],
+                    ctx.buf[off + 5],
+                    ctx.buf[off + 6],
+                    ctx.buf[off + 7],
+                ])
+            } else {
+                0
+            };
+            log::info!(
+                "am: CreateLibraryApplet applet_id={:#x} mode={}",
+                applet_id,
+                applet_mode
+            );
+            crate::services::am::set_pending_applet_id(applet_id);
         }
     }
 
@@ -3898,7 +3961,27 @@ fn dispatch_service_v2(
         }
     }
 
-    if port_name == "audout:u" && cmd_id == 1 {
+    if port_name == "audout:u" && (cmd_id == 0 || cmd_id == 2) {
+        let name_buf = ctx
+            .recv_statics
+            .iter()
+            .find(|b| b.size > 0 && b.addr != 0)
+            .or_else(|| ctx.recv_buffers.iter().find(|b| b.size > 0 && b.addr != 0))
+            .copied();
+        if let Some(buf) = name_buf {
+            let cap = (buf.size as usize).min(0x100);
+            let mut name = vec![0u8; cap];
+            let bytes = b"DeviceOut";
+            let n = bytes.len().min(cap);
+            name[..n].copy_from_slice(&bytes[..n]);
+            let _ = kernel.address_space.write(buf.addr, &name);
+        }
+        let count: u32 = 1;
+        log::info!("audout:u ListAudioOuts cmd_{} → count=1 (DeviceOut)", cmd_id);
+        return build_ipc_response(ctx, 0, &count.to_le_bytes(), &[]);
+    }
+
+    if port_name == "audout:u" && (cmd_id == 1 || cmd_id == 3) {
         let name_buf = ctx
             .recv_statics
             .iter()
@@ -3963,6 +4046,83 @@ fn dispatch_service_v2(
             let session = Session::new(h, "IAudioOut".to_string());
             kernel.sessions.insert(h, session);
             return build_ipc_response(ctx, 0, &out, &[h]);
+        }
+    }
+
+    if port_name == "IAudioOut" {
+        use crate::services::audio_out::handlers as aout;
+        let in_off = ctx.cmif_in_data_off;
+        let in_avail = ctx.cmif_in_data_len as usize;
+        let in_u32 = if in_avail >= 4 {
+            u32::from_le_bytes([
+                ctx.buf[in_off],
+                ctx.buf[in_off + 1],
+                ctx.buf[in_off + 2],
+                ctx.buf[in_off + 3],
+            ])
+        } else {
+            0
+        };
+        let in_u64 = if in_avail >= 8 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&ctx.buf[in_off..in_off + 8]);
+            u64::from_le_bytes(b)
+        } else {
+            0
+        };
+        match cmd_id {
+            0 => {
+                let v = aout::get_audio_out_state(kernel, ctx, session_handle);
+                return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
+            }
+            1 => {
+                aout::start_audio_out(kernel, ctx, session_handle);
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            2 => {
+                aout::stop_audio_out(kernel, ctx, session_handle);
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            3 | 7 => {
+                aout::append_audio_out_buffer(kernel, ctx, session_handle, in_u64);
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            4 => {
+                let h = aout::register_buffer_event(kernel, ctx, session_handle);
+                return build_ipc_response_copy(ctx, 0, &[], &[h]);
+            }
+            5 | 8 => {
+                let n = aout::get_released_audio_out_buffer(kernel, ctx, session_handle);
+                return build_ipc_response(ctx, 0, &n.to_le_bytes(), &[]);
+            }
+            6 => {
+                let v = aout::contains_audio_out_buffer(kernel, ctx, session_handle, in_u64) as u8;
+                return build_ipc_response(ctx, 0, &[v, 0, 0, 0], &[]);
+            }
+            9 => {
+                let v = aout::get_audio_out_buffer_count(kernel, ctx, session_handle);
+                return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
+            }
+            10 => {
+                let v = aout::get_audio_out_played_sample_count(kernel, ctx, session_handle);
+                return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
+            }
+            11 => {
+                let v = aout::flush_audio_out_buffers(kernel, ctx, session_handle) as u8;
+                return build_ipc_response(ctx, 0, &[v, 0, 0, 0], &[]);
+            }
+            12 => {
+                aout::set_audio_out_volume(kernel, ctx, session_handle, in_u32);
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            13 => {
+                let v = aout::get_audio_out_volume(kernel, ctx, session_handle);
+                return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
+            }
+            other => {
+                log::debug!("IAudioOut.cmd_{} → empty SUCCESS", other);
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
         }
     }
 
@@ -5734,6 +5894,9 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 );
             }
 
+            let ctrl_event_id_in = in_data
+                .get(12..16)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
             let req = nexium_nvdrv::IoctlRequest {
                 fd,
                 ioctl_id,
@@ -5793,10 +5956,44 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 }
             }
 
+            if kernel.nvdrv.device_for_fd(fd) == Some(nexium_nvdrv::NvDevice::NvhostCtrl)
+                && ioctl_cmd == 0x001e
+            {
+                if let Some(event_id) = ctrl_event_id_in {
+                    if let (Some(&handle), Some(wait)) = (
+                        kernel.gpu_event_tokens.get(&event_id),
+                        kernel.nvdrv.ctrl_event_wait(event_id),
+                    ) {
+                        if kernel
+                            .nvdrv
+                            .is_syncpoint_reached(wait.syncpt_id, wait.threshold)
+                        {
+                            kernel.event_signals.insert(handle, true);
+                            kernel.threads.signal_handle(handle);
+                        } else {
+                            kernel
+                                .gpu_fence_events
+                                .insert(handle, (wait.syncpt_id, wait.threshold));
+                        }
+                    }
+                }
+            }
+
             if ioctl_cmd == 0x4808 || ioctl_cmd == 0x481b {
-                let fence_handles: Vec<u32> = kernel.gpu_fence_events.drain().collect();
+                let fence_handles: Vec<u32> = kernel
+                    .gpu_fence_events
+                    .iter()
+                    .filter_map(|(&handle, &(syncpt_id, threshold))| {
+                        kernel
+                            .nvdrv
+                            .is_syncpoint_reached(syncpt_id, threshold)
+                            .then_some(handle)
+                    })
+                    .collect();
                 for fh in fence_handles {
+                    kernel.gpu_fence_events.remove(&fh);
                     kernel.event_signals.insert(fh, true);
+                    kernel.threads.signal_handle(fh);
                     log::debug!(
                         "nvdrv:SubmitGPFIFO → signaling gpu_fence_event handle={:#x}",
                         fh
@@ -5835,6 +6032,16 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             } else {
                 0
             };
+            let event_id = if ctx.cmif_in_data_len >= 8 {
+                u32::from_le_bytes([
+                    ctx.buf[ctx.cmif_in_data_off + 4],
+                    ctx.buf[ctx.cmif_in_data_off + 5],
+                    ctx.buf[ctx.cmif_in_data_off + 6],
+                    ctx.buf[ctx.cmif_in_data_off + 7],
+                ])
+            } else {
+                0
+            };
             let is_nvhost_ctrl_fd = kernel
                 .nvdrv
                 .files
@@ -5842,20 +6049,43 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 .map(|f| f.device == nexium_nvdrv::NvDevice::NvhostCtrl)
                 .unwrap_or(false);
             let h = kernel.handles.create_handle(HandleType::Event);
-            if is_nvhost_ctrl_fd {
-                kernel.event_signals.insert(h, false);
-                kernel.gpu_fence_events.insert(h);
-                log::debug!(
-                    "nvdrv:QueryEvent fd={} (nvhost-ctrl) → fence event handle={:#x} (unsignaled, will signal on GPU submit)",
+            if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                log::info!(
+                    "[syncpt] query-event fd={} event_id={:#x} ctrl={}",
                     fd,
-                    h
+                    event_id,
+                    is_nvhost_ctrl_fd
+                );
+            }
+            if is_nvhost_ctrl_fd {
+                kernel.gpu_event_tokens.insert(event_id, h);
+                let wait = kernel.nvdrv.ctrl_event_wait(event_id);
+                let signaled = wait
+                    .map(|wait| {
+                        kernel
+                            .nvdrv
+                            .is_syncpoint_reached(wait.syncpt_id, wait.threshold)
+                    })
+                    .unwrap_or(false);
+                kernel.event_signals.insert(h, signaled);
+                if let Some(wait) = wait.filter(|_| !signaled) {
+                    kernel
+                        .gpu_fence_events
+                        .insert(h, (wait.syncpt_id, wait.threshold));
+                }
+                log::debug!(
+                    "nvdrv:QueryEvent fd={} event_id={:#x} (nvhost-ctrl) → fence event handle={:#x} signaled={}",
+                    fd,
+                    event_id,
+                    h,
+                    signaled
                 );
             } else {
-                kernel.event_signals.insert(h, true);
-                kernel.nvdrv_sync_events.insert(h);
+                kernel.event_signals.insert(h, false);
                 log::debug!(
-                    "nvdrv:QueryEvent fd={} → event handle={:#x} (COPY, always-signaled)",
+                    "nvdrv:QueryEvent fd={} event_id={:#x} → event handle={:#x} (unsignaled)",
                     fd,
+                    event_id,
                     h
                 );
             }
@@ -5883,6 +6113,7 @@ fn applet_buffer_response(port_name: &str, cmd_id: u32) -> Option<Vec<u8>> {
         | ("IManagerDisplayService", 2012) => Some(build_native_window_parcel(0x100)),
         ("IHOSBinderDriver", 0) | ("IHOSBinderDriver", 3) => Some(build_igbp_success_parcel()),
         ("ILaunchParamStorageAccessor", 11) => Some(build_launch_parameter()),
+        ("IStorageAccessorOut", 11) => Some(crate::services::am::applet_out_data()),
         ("acc:u0" | "acc:u1" | "acc:aa", 2) | ("acc:u0" | "acc:u1" | "acc:aa", 3) => {
             Some(build_user_id_list())
         }
