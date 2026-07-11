@@ -173,6 +173,10 @@ impl ShopState {
         }
     }
 
+    pub fn visible(&self) -> bool {
+        self.open || self.anim >= 0.004
+    }
+
     fn refilter(&mut self) {
         let q = self.search.to_lowercase();
         self.filtered = (0..self.apps.len())

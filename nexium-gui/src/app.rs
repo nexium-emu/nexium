@@ -2077,6 +2077,12 @@ impl eframe::App for HorizonApp {
                 self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel;
             let playing_fs = m_run && !m_pause;
             let base_on = carousel_view && !playing_fs && !self.splash.active();
+            let shop_music = self.shop.visible();
+            let music_mode = if shop_music {
+                crate::ui_audio::MusicMode::Shop
+            } else {
+                crate::ui_audio::MusicMode::Carousel
+            };
             // Slowly fade the music back in (~5s) after returning from a game.
             if base_on && !self.music_was_on {
                 self.music_fade_start = Some(std::time::Instant::now());
@@ -2100,10 +2106,10 @@ impl eframe::App for HorizonApp {
                 target *= 0.34;
                 lowpass = 0.75;
             }
-            if self.modal_active() {
+            if self.modal_active() && !shop_music {
                 lowpass = lowpass.max(0.6);
             }
-            crate::ui_audio::set_music(target, lowpass);
+            crate::ui_audio::set_music(music_mode, target, lowpass);
             if base_on && ramp < 1.0 {
                 ctx.request_repaint();
             }

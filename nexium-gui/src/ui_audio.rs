@@ -1,18 +1,44 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::hash::{BuildHasher, Hasher};
+use std::io::Cursor;
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 
 const SR: f32 = 48_000.0;
-const MUSIC_SR: f32 = 32_000.0;
 
-static MUSIC_WAV: &[u8] = include_bytes!("assets/carousel_music.wav");
+static CAROUSEL_MUSIC: [&[u8]; 4] = [
+    include_bytes!("assets/carousel_bgm_01.mp3"),
+    include_bytes!("assets/carousel_bgm_02.mp3"),
+    include_bytes!("assets/carousel_bgm_03.mp3"),
+    include_bytes!("assets/carousel_bgm_04.mp3"),
+];
+static SHOP_MUSIC: [&[u8]; 2] = [
+    include_bytes!("assets/shop_bgm_01.mp3"),
+    include_bytes!("assets/shop_bgm_02.mp3"),
+];
 
 // f32 bits: target music gain (post-volume) and lowpass amount (0=clean, 1=muffled)
 static MUSIC_TARGET: AtomicU32 = AtomicU32::new(0);
 static MUSIC_LOWPASS: AtomicU32 = AtomicU32::new(0);
+static MUSIC_MODE: AtomicU8 = AtomicU8::new(MusicMode::Carousel as u8);
 static SFX_VOLUME: AtomicU32 = AtomicU32::new(1056964608); // 0.5f32.to_bits()
 
-pub fn set_music(target_gain: f32, lowpass: f32) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MusicMode {
+    Carousel,
+    Shop,
+}
+
+pub fn set_music(mode: MusicMode, target_gain: f32, lowpass: f32) {
+    MUSIC_MODE.store(mode as u8, Ordering::Relaxed);
     MUSIC_TARGET.store(target_gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     MUSIC_LOWPASS.store(lowpass.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
 }
@@ -21,31 +47,149 @@ pub fn set_sfx_volume(volume: f32) {
     SFX_VOLUME.store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
 }
 
-fn decode_wav_mono(bytes: &[u8]) -> Vec<f32> {
-    // minimal PCM-s16 WAV parse: locate "data" chunk, read i16 samples
-    let mut i = 12; // skip RIFF header
-    let mut data: Option<(usize, usize)> = None;
-    while i + 8 <= bytes.len() {
-        let id = &bytes[i..i + 4];
-        let sz = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
-        let body = i + 8;
-        if id == b"data" {
-            data = Some((body, sz.min(bytes.len().saturating_sub(body))));
-            break;
+struct MusicTrack {
+    samples: Vec<[f32; 2]>,
+    sample_rate: f64,
+}
+
+impl MusicTrack {
+    fn silent() -> Self {
+        Self {
+            samples: Vec::new(),
+            sample_rate: SR as f64,
         }
-        i = body + sz + (sz & 1);
     }
-    let Some((off, len)) = data else {
-        return Vec::new();
+}
+
+fn decode_mp3_stereo(bytes: &'static [u8]) -> Option<MusicTrack> {
+    let source = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+    let format_options = FormatOptions {
+        enable_gapless: true,
+        ..FormatOptions::default()
     };
-    let mut out = Vec::with_capacity(len / 2);
-    let mut j = off;
-    while j + 1 < off + len {
-        let s = i16::from_le_bytes([bytes[j], bytes[j + 1]]);
-        out.push(s as f32 / 32768.0);
-        j += 2;
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            source,
+            &format_options,
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    let mut format = probed.format;
+    let track = format.default_track()?;
+    let track_id = track.id;
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(SR as u32) as f64;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .ok()?;
+    let mut samples = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(err) => {
+                log::warn!("Failed to read UI music packet: {err}");
+                break;
+            }
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(err) => {
+                log::warn!("Failed to decode UI music packet: {err}");
+                return None;
+            }
+        };
+        let spec = *decoded.spec();
+        let channels = spec.channels.count();
+        if channels == 0 {
+            continue;
+        }
+        let mut interleaved = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        interleaved.copy_interleaved_ref(decoded);
+        for frame in interleaved.samples().chunks(channels) {
+            let left = frame[0];
+            let right = frame.get(1).copied().unwrap_or(left);
+            samples.push([left, right]);
+        }
     }
-    out
+
+    (!samples.is_empty()).then_some(MusicTrack {
+        samples,
+        sample_rate,
+    })
+}
+
+fn decode_music_variant(
+    variants: &[&'static [u8]],
+    preferred: usize,
+    mode: &str,
+) -> (MusicTrack, usize) {
+    if variants.is_empty() {
+        log::warn!("No {mode} music variants are embedded");
+        return (MusicTrack::silent(), 0);
+    }
+    let preferred = preferred % variants.len();
+    for offset in 0..variants.len() {
+        let variant = (preferred + offset) % variants.len();
+        if let Some(track) = decode_mp3_stereo(variants[variant]) {
+            return (track, variant);
+        }
+        log::warn!("Failed to decode {mode} music variant {}", variant + 1);
+    }
+    log::warn!("All {mode} music variants failed to decode");
+    (MusicTrack::silent(), preferred)
+}
+
+fn random_music_variants() -> (usize, usize) {
+    let choice = getrandom::u64().unwrap_or_else(|err| {
+        log::warn!("OS randomness unavailable for UI music selection: {err}");
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
+        hasher.write_u32(std::process::id());
+        hasher.finish()
+    });
+    (
+        choice as usize % CAROUSEL_MUSIC.len(),
+        (choice >> 32) as usize % SHOP_MUSIC.len(),
+    )
+}
+
+fn next_music_sample(
+    track: &MusicTrack,
+    position: &mut f64,
+    output_sample_rate: f64,
+) -> [f32; 2] {
+    let len = track.samples.len();
+    if len == 0 {
+        return [0.0; 2];
+    }
+    let index = *position as usize;
+    let next = (index + 1) % len;
+    let fraction = (*position - index as f64) as f32;
+    let sample = [
+        track.samples[index][0]
+            + (track.samples[next][0] - track.samples[index][0]) * fraction,
+        track.samples[index][1]
+            + (track.samples[next][1] - track.samples[index][1]) * fraction,
+    ];
+    *position += track.sample_rate / output_sample_rate;
+    if *position >= len as f64 {
+        *position %= len as f64;
+    }
+    sample
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -181,10 +325,20 @@ fn build() -> Option<Engine> {
     banks.insert(key(Sfx::WhistleOk), std::sync::Arc::new(render(Sfx::WhistleOk)));
     banks.insert(key(Sfx::WhistleSquish), std::sync::Arc::new(render(Sfx::WhistleSquish)));
 
-    let music = std::sync::Arc::new(decode_wav_mono(MUSIC_WAV));
+    let (carousel_variant, shop_variant) = random_music_variants();
+    let (carousel_music, carousel_variant) =
+        decode_music_variant(&CAROUSEL_MUSIC, carousel_variant, "carousel");
+    let (shop_music, shop_variant) = decode_music_variant(&SHOP_MUSIC, shop_variant, "shop");
+    let music = [carousel_music, shop_music];
+    log::info!(
+        "UI music selected: carousel variant {}, shop variant {}",
+        carousel_variant + 1,
+        shop_variant + 1
+    );
 
     let host = cpal::default_host();
     let device = host.default_output_device()?;
+    let device_name = device.name().unwrap_or_else(|_| "default output".to_string());
 
     // Prefer an F32 config so our mixer output maps directly.
     let cfg = device
@@ -200,18 +354,16 @@ fn build() -> Option<Engine> {
     let channels = cfg.channels() as usize;
     let dev_sr = cfg.sample_rate().0 as f32;
     let sfx_ratio = SR / dev_sr;
-    let music_step = (MUSIC_SR / dev_sr) as f64;
     let gain_step = 1.0 / (0.45 * dev_sr);
+    let mode_step = 1.0 / (0.45 * dev_sr);
 
     let active: std::sync::Arc<Mutex<Vec<Voice>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
     let active_cb = active.clone();
-    let music_cb = music.clone();
 
     let mut cur_gain = 0.0f32;
-    let mut music_pos = 0.0f64;
-    let mut music_gap = 0.0f64;
-    let mut lp_y = 0.0f32;
-    let loop_gap_frames = dev_sr as f64 * 5.0;
+    let mut music_pos = [0.0f64; 2];
+    let mut shop_mix = 0.0f32;
+    let mut lp_y = [0.0f32; 2];
 
     let err_cb = |e| log::warn!("ui_audio stream error: {}", e);
     let stream = device
@@ -222,7 +374,11 @@ fn build() -> Option<Engine> {
                 let target = f32::from_bits(MUSIC_TARGET.load(Ordering::Relaxed));
                 let lp = f32::from_bits(MUSIC_LOWPASS.load(Ordering::Relaxed));
                 let alpha = 1.0 - lp * 0.9;
-                let mlen = music_cb.len();
+                let shop_target = if MUSIC_MODE.load(Ordering::Relaxed) == MusicMode::Shop as u8 {
+                    1.0
+                } else {
+                    0.0
+                };
                 let mut act = active_cb.lock().ok();
                 for f in 0..frames {
                     let mut sfx = 0.0f32;
@@ -239,27 +395,42 @@ fn build() -> Option<Engine> {
                         }
                     }
                     cur_gain += (target - cur_gain) * gain_step;
-                    let m = if mlen > 0 {
-                        if music_gap > 0.0 {
-                            music_gap -= 1.0;
-                            0.0
+                    if shop_mix < shop_target {
+                        shop_mix = (shop_mix + mode_step).min(shop_target);
+                    } else if shop_mix > shop_target {
+                        shop_mix = (shop_mix - mode_step).max(shop_target);
+                    }
+                    let m = if target > 0.0001 || cur_gain > 0.0001 {
+                        let carousel = if shop_mix < 1.0 {
+                            next_music_sample(&music[0], &mut music_pos[0], dev_sr as f64)
                         } else {
-                            let idx = (music_pos as usize) % mlen;
-                            music_pos += music_step;
-                            if music_pos >= mlen as f64 {
-                                music_pos -= mlen as f64;
-                                music_gap = loop_gap_frames;
-                            }
-                            music_cb[idx]
-                        }
+                            [0.0; 2]
+                        };
+                        let shop = if shop_mix > 0.0 {
+                            next_music_sample(&music[1], &mut music_pos[1], dev_sr as f64)
+                        } else {
+                            [0.0; 2]
+                        };
+                        [
+                            carousel[0] * (1.0 - shop_mix) + shop[0] * shop_mix,
+                            carousel[1] * (1.0 - shop_mix) + shop[1] * shop_mix,
+                        ]
                     } else {
-                        0.0
+                        [0.0; 2]
                     };
-                    lp_y += alpha * (m - lp_y);
+                    lp_y[0] += alpha * (m[0] - lp_y[0]);
+                    lp_y[1] += alpha * (m[1] - lp_y[1]);
                     let sfx_vol = f32::from_bits(SFX_VOLUME.load(Ordering::Relaxed));
-                    let s = ((sfx * sfx_vol) + lp_y * cur_gain).clamp(-1.0, 1.0);
                     for c in 0..channels {
-                        out[f * channels + c] = s;
+                        let music_sample = if channels == 1 {
+                            (lp_y[0] + lp_y[1]) * 0.5
+                        } else if c < 2 {
+                            lp_y[c]
+                        } else {
+                            0.0
+                        };
+                        out[f * channels + c] =
+                            ((sfx * sfx_vol) + music_sample * cur_gain).clamp(-1.0, 1.0);
                     }
                 }
                 if let Some(a) = act.as_mut() {
@@ -271,6 +442,12 @@ fn build() -> Option<Engine> {
         )
         .ok()?;
     stream.play().ok()?;
+    log::info!(
+        "UI audio stream: '{}' @ {} Hz, {} channels",
+        device_name,
+        dev_sr as u32,
+        channels
+    );
 
     Some(Engine {
         active,
@@ -542,4 +719,23 @@ fn whistle_at(buf: &mut Vec<f32>, offset_ms: f32, f0: f32, f1: f32, dur: f32, wa
 
 fn whistle(buf: &mut Vec<f32>, f0: f32, f1: f32, dur: f32, warble: f32, gain: f32) {
     whistle_at(buf, 0.0, f0, f1, dur, warble, gain);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_music_decodes() {
+        for bytes in CAROUSEL_MUSIC.into_iter().chain(SHOP_MUSIC) {
+            assert!(!bytes.starts_with(b"ID3"));
+            let track = decode_mp3_stereo(bytes).expect("embedded MP3 should decode");
+            assert_eq!(track.sample_rate, 48_000.0);
+            assert!(track.samples.len() > 45 * 48_000);
+            assert!(track
+                .samples
+                .iter()
+                .any(|sample| (sample[0] - sample[1]).abs() > 0.000_001));
+        }
+    }
 }
