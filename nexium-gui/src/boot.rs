@@ -642,10 +642,10 @@ impl EmulationHandle {
                 let _wd_guard = WatchdogGuard(Arc::clone(&watchdog_stop));
 
                 let vsync_stop = Arc::new(AtomicBool::new(false));
-                {
+                let vsync_handle = {
                     let kernel_v = Arc::clone(&boot_ctx.kernel);
                     let stop_v = Arc::clone(&vsync_stop);
-                    let _ = thread::Builder::new()
+                    thread::Builder::new()
                         .name("nexium-vsync".into())
                         .spawn(move || {
                             const PERIOD: std::time::Duration =
@@ -671,15 +671,19 @@ impl EmulationHandle {
                                     next = after + PERIOD;
                                 }
                             }
-                        });
-                }
-                struct VsyncGuard(Arc<AtomicBool>);
+                        })
+                        .ok()
+                };
+                struct VsyncGuard(Arc<AtomicBool>, Option<thread::JoinHandle<()>>);
                 impl Drop for VsyncGuard {
                     fn drop(&mut self) {
                         self.0.store(true, Ordering::Relaxed);
+                        if let Some(h) = self.1.take() {
+                            let _ = h.join();
+                        }
                     }
                 }
-                let _vsync_guard = VsyncGuard(Arc::clone(&vsync_stop));
+                let _vsync_guard = VsyncGuard(Arc::clone(&vsync_stop), vsync_handle);
 
                 log::info!("Starting emulation loop [BUILD: heartbeat-v2-gpu-diag]");
                 let max_cycles = u64::MAX;
@@ -1421,6 +1425,13 @@ impl EmulationHandle {
             std::thread::spawn(move || {
                 let _ = handle.join();
             });
+        }
+    }
+
+    pub fn stop_blocking(&mut self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread_handle.take() {
+            let _ = handle.join();
         }
     }
 

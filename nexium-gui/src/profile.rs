@@ -88,6 +88,7 @@ pub enum ProfileAction {
     PickIcon,
     SetName(String),
     SetBackdropTheme(crate::app_settings::BackdropTheme),
+    SetDockbarTheme(crate::app_settings::DockbarTheme),
     SetLightMode(bool),
     SetMusicVolume(f32),
     SetSfxVolume(f32),
@@ -173,6 +174,7 @@ pub fn profile_view(
     backdrop_opacity: f32,
     scale_factor: f32,
     backdrop_theme: crate::app_settings::BackdropTheme,
+    dockbar_theme: crate::app_settings::DockbarTheme,
     light_mode: bool,
     music_volume: f32,
     sfx_volume: f32,
@@ -349,7 +351,7 @@ pub fn profile_view(
         ProfileTab::System,
     ];
     let tab_idx = TAB_ORDER.iter().position(|x| *x == state.tab).unwrap_or(0);
-    const N_SETTINGS: usize = 5;
+    const N_SETTINGS: usize = 6;
     let launch_enter = enter && state.focus_content;
 
     if tab_left {
@@ -417,10 +419,18 @@ pub fn profile_view(
                 action = ProfileAction::SetBackdropTheme(backdrop_theme.prev());
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             }
-        } else if state.row_selected == 1 && (enter || leave) {
+        } else if state.row_selected == 1 {
+            if enter {
+                action = ProfileAction::SetDockbarTheme(dockbar_theme.next());
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            } else if leave {
+                action = ProfileAction::SetDockbarTheme(dockbar_theme.prev());
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            }
+        } else if state.row_selected == 2 && (enter || leave) {
             action = ProfileAction::SetLightMode(!light_mode);
             crate::ui_audio::play(crate::ui_audio::Sfx::Select);
-        } else if state.row_selected == 2 {
+        } else if state.row_selected == 3 {
             if mute_toggle {
                 action = ProfileAction::SetMuteMusic(!music_muted);
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
@@ -431,7 +441,7 @@ pub fn profile_view(
                 action = ProfileAction::SetMusicVolume((music_volume - 0.05).max(0.0));
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             }
-        } else if state.row_selected == 3 {
+        } else if state.row_selected == 4 {
             if mute_toggle {
                 action = ProfileAction::SetMuteSfx(!sfx_muted);
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
@@ -442,7 +452,7 @@ pub fn profile_view(
                 action = ProfileAction::SetSfxVolume((sfx_volume - 0.05).max(0.0));
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             }
-        } else if state.row_selected == 4 && (enter || leave) {
+        } else if state.row_selected == 5 && (enter || leave) {
             action = ProfileAction::SetEuDates(!eu_dates);
             crate::ui_audio::play(crate::ui_audio::Sfx::Select);
         }
@@ -588,6 +598,7 @@ pub fn profile_view(
                 accent,
                 state,
                 backdrop_theme,
+                dockbar_theme,
                 light_mode,
                 music_volume,
                 sfx_volume,
@@ -609,7 +620,7 @@ pub fn profile_view(
         ctx.request_repaint();
     }
 
-    let on_volume = state.tab == ProfileTab::Settings && state.focus_content && (state.row_selected == 2 || state.row_selected == 3);
+    let on_volume = state.tab == ProfileTab::Settings && state.focus_content && (state.row_selected == 3 || state.row_selected == 4);
     let hint = if last_input.connected {
         if on_volume {
             "🎮  [Up/Down] Select      [X] To Mute      [B] Back to Menu"
@@ -689,6 +700,7 @@ fn settings_page(
     accent: Color32,
     state: &mut ProfileState,
     backdrop_theme: crate::app_settings::BackdropTheme,
+    dockbar_theme: crate::app_settings::DockbarTheme,
     light_mode: bool,
     music_volume: f32,
     sfx_volume: f32,
@@ -704,11 +716,16 @@ fn settings_page(
     let row_h = 68.0 * s;
     let row_gap = 12.0 * s;
     
-    let rows: [(&str, &str, String); 5] = [
+    let rows: [(&str, &str, String); 6] = [
         (
             "Backdrop Theme",
             "Background style behind the menus",
             backdrop_theme.label().to_string(),
+        ),
+        (
+            "Dockbar Theme",
+            "Look of the bottom dockbar",
+            dockbar_theme.label().to_string(),
         ),
         (
             "Appearance",
@@ -743,10 +760,14 @@ fn settings_page(
                     crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                 }
                 1 => {
+                    *action = ProfileAction::SetDockbarTheme(dockbar_theme.next());
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                }
+                2 => {
                     *action = ProfileAction::SetLightMode(!light_mode);
                     crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                 }
-                4 => {
+                5 => {
                     *action = ProfileAction::SetEuDates(!eu_dates);
                     crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                 }
@@ -776,10 +797,10 @@ fn settings_page(
 
         let arrow_col = if focused { accent } else { pal.muted };
 
-        if idx == 2 || idx == 3 {
-            let val = if idx == 2 { music_volume } else { sfx_volume };
+        if idx == 3 || idx == 4 {
+            let val = if idx == 3 { music_volume } else { sfx_volume };
             // mute checkbox to the left of the slider arrows
-            let is_muted = if idx == 2 { music_muted } else { sfx_muted };
+            let is_muted = if idx == 3 { music_muted } else { sfx_muted };
             let cb = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 340.0 * s, row.center().y), Vec2::splat(24.0 * s)));
             painter.rect_filled(cb, Rounding::same(5.0 * s * scale_factor), if is_muted { accent } else { pal.input_bg });
             painter.rect_stroke(cb, Rounding::same(5.0 * s * scale_factor), Stroke::new(1.5 * scale_factor, pal.border));
@@ -790,7 +811,7 @@ fn settings_page(
             }
             painter.text(scale_pos(egui::pos2(row.max.x - 340.0 * s, row.center().y - 20.0 * s)), egui::Align2::CENTER_CENTER, "Mute", FontId::proportional(11.0 * s * scale_factor), pal.muted);
             if ui.allocate_rect(cb, Sense::click()).clicked() {
-                *action = if idx == 2 { ProfileAction::SetMuteMusic(!is_muted) } else { ProfileAction::SetMuteSfx(!is_muted) };
+                *action = if idx == 3 { ProfileAction::SetMuteMusic(!is_muted) } else { ProfileAction::SetMuteSfx(!is_muted) };
                 state.focus_content = true;
                 state.row_selected = idx;
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
@@ -815,7 +836,7 @@ fn settings_page(
                 }
             }
             if new_val != val {
-                if idx == 2 {
+                if idx == 3 {
                     *action = ProfileAction::SetMusicVolume(new_val);
                 } else {
                     *action = ProfileAction::SetSfxVolume(new_val);
@@ -837,7 +858,7 @@ fn settings_page(
 
             if la_resp.clicked() {
                 let step = (val - 0.05).max(0.0);
-                if idx == 2 {
+                if idx == 3 {
                     *action = ProfileAction::SetMusicVolume(step);
                 } else {
                     *action = ProfileAction::SetSfxVolume(step);
@@ -846,7 +867,7 @@ fn settings_page(
             }
             if ra_resp.clicked() {
                 let step = (val + 0.05).min(1.0);
-                if idx == 2 {
+                if idx == 3 {
                     *action = ProfileAction::SetMusicVolume(step);
                 } else {
                     *action = ProfileAction::SetSfxVolume(step);
@@ -912,8 +933,9 @@ fn settings_page(
                 let fwd = ra_c;
                 match idx {
                     0 => *action = ProfileAction::SetBackdropTheme(if fwd { backdrop_theme.next() } else { backdrop_theme.prev() }),
-                    1 => *action = ProfileAction::SetLightMode(!light_mode),
-                    4 => *action = ProfileAction::SetEuDates(!eu_dates),
+                    1 => *action = ProfileAction::SetDockbarTheme(if fwd { dockbar_theme.next() } else { dockbar_theme.prev() }),
+                    2 => *action = ProfileAction::SetLightMode(!light_mode),
+                    5 => *action = ProfileAction::SetEuDates(!eu_dates),
                     _ => {}
                 }
                 state.focus_content = true;
