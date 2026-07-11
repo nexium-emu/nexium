@@ -939,6 +939,12 @@ fn depth_disabled() -> bool {
     *D.get_or_init(|| std::env::var("NEXIUM_NO_DEPTH").ok().as_deref() == Some("1"))
 }
 
+fn water_no_ztest() -> bool {
+    use std::sync::OnceLock;
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| std::env::var("NEXIUM_WATER_NO_ZTEST").ok().as_deref() == Some("1"))
+}
+
 fn instancing_disabled() -> bool {
     use std::sync::OnceLock;
     static D: OnceLock<bool> = OnceLock::new();
@@ -1324,6 +1330,18 @@ fn execute_one(
                 )?;
             }
         }
+        if std::env::var_os("NEXIUM_WATER_FORENSICS").is_some() {
+            log::warn!(
+                "[wf-clear] color={} rt={}x{}@{:#x} depth={} dkey={} cd={}",
+                want_color_clear,
+                rt.width,
+                rt.height,
+                rt_gpu_va,
+                do_depth,
+                depth_clear_key.label(),
+                draw.clear_depth
+            );
+        }
         return Ok(None);
     }
 
@@ -1470,10 +1488,20 @@ fn execute_one(
         if let Some(b) = guard.get(&shader_key) {
             b.clone()
         } else {
-            let vs_sass = fetch_sass(vs_addr, mappings, mem_read)
-                .ok_or_else(|| "VS SASS read failed".to_string())?;
-            let fs_sass = fetch_sass(fs_addr, mappings, mem_read)
-                .ok_or_else(|| "FS SASS read failed".to_string())?;
+            let vs_sass = match fetch_sass(vs_addr, mappings, mem_read) {
+                Some(s) => s,
+                None => {
+                    sass_read_diag("VS", vs_addr, program_region, vs_prog.address_lo, mappings);
+                    return Err("VS SASS read failed".to_string());
+                }
+            };
+            let fs_sass = match fetch_sass(fs_addr, mappings, mem_read) {
+                Some(s) => s,
+                None => {
+                    sass_read_diag("FS", fs_addr, program_region, fs_prog.address_lo, mappings);
+                    return Err("FS SASS read failed".to_string());
+                }
+            };
 
             let fs_debug_targets_key = parse_env_u64_list("NEXIUM_FS_DEBUG_TARGET");
             let fs_debug_active_key =
@@ -2203,8 +2231,9 @@ fn execute_one(
         }
     }
 
-    let depth_test = !no_depth && draw.depth_test_enable && draw.zeta_enable;
-    let depth_write = !no_depth && draw.depth_write_enable && draw.zeta_enable;
+    let water_probe = water_no_ztest() && maxwell.regs.blend_enable[0];
+    let depth_test = !no_depth && !water_probe && draw.depth_test_enable && draw.zeta_enable;
+    let depth_write = !no_depth && !water_probe && draw.depth_write_enable && draw.zeta_enable;
     let depth_key = if depth_test || depth_write {
         zeta_key.or(Some(rt_key))
     } else {
@@ -2269,6 +2298,47 @@ fn execute_one(
     } else {
         (fallback_cbuf_addr, fallback_cbuf_size)
     };
+
+    if std::env::var_os("NEXIUM_WATER_FORENSICS").is_some() {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static SEEN_OMAP: OnceLock<Mutex<HashSet<(u64, u32, u32)>>> = OnceLock::new();
+        let k = (fs_addr, fs_output_map, maxwell.regs.color_masks[0]);
+        if SEEN_OMAP
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert(k)
+        {
+            log::warn!("[wf-omap] fs={:#x} omap={:#x} cmask0={:#x}", k.0, k.1, k.2);
+        }
+    }
+
+    trace_water_forensics(
+        draw,
+        rt_key,
+        &color_rt_keys,
+        vs_addr,
+        fs_addr,
+        vs_cbuf_mask,
+        fs_cbuf_mask,
+        &maxwell.regs.cbuf_binds,
+        (
+            maxwell.regs.blend_enable[0],
+            if maxwell.regs.blend_per_target_enabled {
+                maxwell.regs.blend_pt_src_rgb[0]
+            } else {
+                maxwell.regs.blend_src_rgb
+            },
+            if maxwell.regs.blend_per_target_enabled {
+                maxwell.regs.blend_pt_dst_rgb[0]
+            } else {
+                maxwell.regs.blend_dst_rgb
+            },
+        ),
+        mappings,
+        mem_read,
+    );
 
     trace_grade_discover(
         draw,
@@ -2718,7 +2788,8 @@ fn execute_one(
         tsc_pool_limit: draw.tsc_pool_limit,
         fs_sampler_ids,
         fs_sampler_arrayed,
-        cull_test_enable: draw.cull_test_enable,
+        cull_test_enable: draw.cull_test_enable
+            && std::env::var_os("NEXIUM_NO_CULL").is_none(),
         cull_face: draw.cull_face,
         front_face: if draw.window_origin.flip_y() {
             flip_front_face(draw.front_face)
@@ -3955,6 +4026,239 @@ fn parse_env_u64_list(name: &str) -> Vec<u64> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn trace_water_forensics(
+    draw: &DrawCall,
+    fallback_key: RtKey,
+    color_rt_keys: &[RtKey],
+    vs_addr: u64,
+    fs_addr: u64,
+    vs_cbuf_mask: u32,
+    fs_cbuf_mask: u32,
+    cbuf_binds: &[[(u64, u32); 16]; 5],
+    blend: (bool, u32, u32),
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) {
+    if std::env::var_os("NEXIUM_WATER_FORENSICS").is_none() {
+        return;
+    }
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static PREV: OnceLock<Mutex<HashMap<(u64, u32), Vec<u8>>>> = OnceLock::new();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let key = color_rt_keys.first().copied().unwrap_or(fallback_key);
+    let fnv = |bytes: &[u8]| -> u64 {
+        bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
+            (h ^ (*b as u64)).wrapping_mul(0x100000001b3)
+        })
+    };
+    let vb = &draw.vertex_buffers[0];
+    let vb_addr = ((vb.address_hi as u64) << 32) | vb.address_lo as u64;
+    let mut vb_bytes: Option<Vec<u8>> = None;
+    let vb_hash = if vb_addr != 0 {
+        mappings
+            .cpu_address_for(vb_addr)
+            .and_then(|cpu| {
+                let mut b = vec![0u8; 512];
+                mem_read(cpu, &mut b).then(|| {
+                    let h = fnv(&b);
+                    vb_bytes = Some(b);
+                    h
+                })
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if blend.0 && vb.stride == 40 {
+        if let Some(cpu) = mappings.cpu_address_for(vb_addr) {
+            let count = draw.index_count.max(draw.vertex_count).min(4096) as usize;
+            let mut buf = vec![0u8; (count * 40).min(163840)];
+            if mem_read(cpu, &mut buf) {
+                let (mut gmin, mut gmax, mut neg) = (f32::MAX, f32::MIN, 0usize);
+                for v in buf.chunks_exact(40) {
+                    let g = f32::from_le_bytes([v[36], v[37], v[38], v[39]]);
+                    if g.is_finite() {
+                        gmin = gmin.min(g);
+                        gmax = gmax.max(g);
+                        if g < 0.0 {
+                            neg += 1;
+                        }
+                    }
+                }
+                let attrs: Vec<String> = draw
+                    .vertex_attribs
+                    .iter()
+                    .take(4)
+                    .enumerate()
+                    .map(|(i, a)| {
+                        format!(
+                            "L{}:b{},o{},f{:#x},c{}",
+                            i, a.buffer, a.offset, a.format, a.constant as u8
+                        )
+                    })
+                    .collect();
+                log::warn!(
+                    "[wf-gate] d={} fs={:#x} verts={} gate=[{:.2}..{:.2}] neg={} ifirst={} attrs={}",
+                    SEQ.load(Ordering::Relaxed),
+                    fs_addr,
+                    buf.len() / 40,
+                    gmin,
+                    gmax,
+                    neg,
+                    draw.index_first,
+                    attrs.join(" ")
+                );
+            }
+        }
+    }
+    if blend.0 {
+        let floats: Vec<String> = vb_bytes
+            .as_deref()
+            .unwrap_or(&[])
+            .chunks_exact(4)
+            .take(24)
+            .map(|c| {
+                let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                if f.abs() < 1e6 && (f == 0.0 || f.abs() > 1e-6) {
+                    format!("{:.2}", f)
+                } else {
+                    format!("{:x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                }
+            })
+            .collect();
+        log::warn!(
+            "[wf-blend] d={} fs={:#x} ic={} stride={} vp={:?} sc={:?} vb0={:#x} f=[{}]",
+            SEQ.load(Ordering::Relaxed),
+            fs_addr,
+            draw.index_count,
+            vb.stride,
+            draw.viewport,
+            draw.scissor,
+            vb_addr,
+            floats.join(",")
+        );
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mask = (vs_cbuf_mask as u64) | ((fs_cbuf_mask as u64) << 16);
+    for logical in 0..32u32 {
+        if mask & (1u64 << logical) == 0 {
+            continue;
+        }
+        let (addr, size) = cbuf_bind_for_slot(cbuf_binds, logical);
+        if addr == 0 || size == 0 {
+            continue;
+        }
+        let len = (size as usize).min(384);
+        let Some(cpu) = mappings.cpu_address_for(addr) else {
+            continue;
+        };
+        let mut bytes = vec![0u8; len];
+        if !mem_read(cpu, &mut bytes) {
+            continue;
+        }
+        let h = fnv(&bytes);
+        let mut prev_map = PREV
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        let slot_key = (fs_addr, logical);
+        let mut delta = String::new();
+        match prev_map.get(&slot_key) {
+            Some(old) if old.as_slice() != bytes.as_slice() => {
+                let n = old.len().min(bytes.len()) / 4;
+                let mut changed: Vec<(usize, u32, u32)> = Vec::new();
+                for w in 0..n {
+                    let ow = u32::from_le_bytes([
+                        old[w * 4],
+                        old[w * 4 + 1],
+                        old[w * 4 + 2],
+                        old[w * 4 + 3],
+                    ]);
+                    let nw = u32::from_le_bytes([
+                        bytes[w * 4],
+                        bytes[w * 4 + 1],
+                        bytes[w * 4 + 2],
+                        bytes[w * 4 + 3],
+                    ]);
+                    if ow != nw {
+                        changed.push((w, ow, nw));
+                    }
+                }
+                let shown: Vec<String> = changed
+                    .iter()
+                    .take(8)
+                    .map(|(w, o, v)| format!("{}:{:x}->{:x}", w, o, v))
+                    .collect();
+                delta = format!("~{}[{}]", changed.len(), shown.join(","));
+            }
+            None => {
+                let words: Vec<String> = bytes
+                    .chunks_exact(4)
+                    .take(96)
+                    .map(|c| format!("{:x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                    .collect();
+                log::warn!(
+                    "[wf-full] fs={:#x} c{} va={:#x} sz={} words={}",
+                    fs_addr,
+                    logical,
+                    addr,
+                    size,
+                    words.join(",")
+                );
+            }
+            _ => {}
+        }
+        prev_map.insert(slot_key, bytes);
+        parts.push(format!("c{}={:08x}{}", logical, h & 0xffffffff, delta));
+    }
+    let z0 = vb_bytes
+        .as_deref()
+        .filter(|b| b.len() >= 12)
+        .map(|b| f32::from_le_bytes([b[8], b[9], b[10], b[11]]))
+        .unwrap_or(f32::NAN);
+    let bbox = vb_bytes
+        .as_deref()
+        .filter(|_| vb.stride >= 12 && vb.stride <= 64)
+        .map(|b| {
+            let s = vb.stride as usize;
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for v in b.chunks_exact(s) {
+                let x = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+                let y = f32::from_le_bytes([v[4], v[5], v[6], v[7]]);
+                if x.is_finite() && y.is_finite() && x.abs() < 1e5 && y.abs() < 1e5 {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+            format!("[{:.0},{:.0}..{:.0},{:.0}]", x0, y0, x1, y1)
+        })
+        .unwrap_or_default();
+    log::warn!(
+        "[wf] d={} vs={:#x} fs={:#x} rt={} v={} ic={} z0={:.3} bb={} bl={}:{}/{} z={}{}f{} vh={:08x} {}",
+        seq,
+        vs_addr,
+        fs_addr,
+        key.label(),
+        draw.vertex_count,
+        draw.index_count,
+        z0,
+        bbox,
+        blend.0 as u8,
+        blend.1,
+        blend.2,
+        draw.depth_test_enable as u8,
+        draw.depth_write_enable as u8,
+        draw.depth_func,
+        vb_hash & 0xffffffff,
+        parts.join(" ")
+    );
 }
 
 fn trace_grade_discover(
@@ -5315,14 +5619,54 @@ fn read_attr_vec4(
     }
 }
 
+fn sass_read_diag(
+    stage: &str,
+    addr: u64,
+    program_region: u64,
+    offset: u32,
+    mappings: &GpuMappings,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 32 {
+        return;
+    }
+    let start = addr.wrapping_add(SPH_SIZE as u64);
+    let range = mappings.cpu_range_for(start);
+    log::warn!(
+        "[sassfail] {} addr={:#x} region={:#x} off={:#x} start={:#x} range={:?} {}",
+        stage,
+        addr,
+        program_region,
+        offset,
+        start,
+        range,
+        mappings.describe_around(addr)
+    );
+}
+
 fn fetch_sass(
     gpu_va: u64,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Option<Vec<u8>> {
-    let cpu = mappings.cpu_address_for(gpu_va)?;
+    let start = gpu_va.wrapping_add(SPH_SIZE as u64);
     let mut buf = vec![0u8; MAX_SASS_BYTES];
-    if !mem_read(cpu + SPH_SIZE as u64, &mut buf) {
+    let mut filled = 0usize;
+    while filled < MAX_SASS_BYTES {
+        let va = start.wrapping_add(filled as u64);
+        let cpu = match mappings.cpu_address_for(va) {
+            Some(c) => c,
+            None => break,
+        };
+        let page_end = (va & !0xFFF).wrapping_add(0x1000);
+        let chunk = std::cmp::min((page_end - va) as usize, MAX_SASS_BYTES - filled);
+        if !mem_read(cpu, &mut buf[filled..filled + chunk]) {
+            break;
+        }
+        filled += chunk;
+    }
+    if filled == 0 {
         return None;
     }
     Some(buf)
