@@ -319,6 +319,35 @@ impl DynarmicCpu {
         self.emu.emu.reg_read_tpidrr0_el0().unwrap_or(0)
     }
 
+    pub fn alloc_thread_context(&self) -> dynarmic_sys::DynarmicContext {
+        self.emu.emu.context_alloc()
+    }
+
+    pub fn save_thread_context(
+        &self,
+        context: &mut dynarmic_sys::DynarmicContext,
+    ) -> Result<(), String> {
+        self.emu
+            .emu
+            .context_save(context)
+            .map_err(|e| format!("save context failed: {:?}", e))
+    }
+
+    pub fn restore_thread_context(
+        &self,
+        context: &dynarmic_sys::DynarmicContext,
+    ) -> Result<(), String> {
+        self.emu
+            .emu
+            .context_restore(context)
+            .map_err(|e| format!("restore context failed: {:?}", e))
+    }
+
+    pub fn reset_thread_context(&self) -> Result<(), String> {
+        let context = self.alloc_thread_context();
+        self.restore_thread_context(&context)
+    }
+
     pub fn run(&mut self, _max_insn: u64) -> CpuEvent {
         self.last_event.set(None);
         if nexium_memory::fastmem::watch_range().is_none() {
@@ -352,7 +381,11 @@ impl DynarmicCpu {
         } else {
             u64::MAX - 16
         };
-        let _ = self.emu.emu.emu_start(pc, until);
+        let _ = if _max_insn == 0 {
+            self.emu.emu.emu_start(pc, until)
+        } else {
+            self.emu.emu.emu_start_bounded(pc, until, _max_insn)
+        };
         if let Some((target, label)) = pc_until {
             let after = self.get_pc();
             if after == target && pc != target {
@@ -674,6 +707,15 @@ fn watch_value_matches(size: usize, value: u64) -> bool {
         .and_then(|v| parse_pc_until_u64(v.trim()))
     {
         return watch_value_ne(size, value, filter);
+    }
+    let min = std::env::var("NEXIUM_WATCH_WRITE_VALUE_MIN")
+        .ok()
+        .and_then(|v| parse_pc_until_u64(v.trim()));
+    let max = std::env::var("NEXIUM_WATCH_WRITE_VALUE_MAX")
+        .ok()
+        .and_then(|v| parse_pc_until_u64(v.trim()));
+    if min.is_some() || max.is_some() {
+        return value >= min.unwrap_or(0) && value <= max.unwrap_or(u64::MAX);
     }
     true
 }

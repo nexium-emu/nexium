@@ -5,12 +5,13 @@ use std::time::Instant;
 
 pub const NUM_CORES: usize = 4;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct ThreadCtx {
     pub x: [u64; 31],
     pub sp: u64,
     pub pc: u64,
     pub tpidrro_el0: u64,
+    pub backend: Option<nexium_cpu::CpuThreadContext>,
 }
 
 impl ThreadCtx {
@@ -20,6 +21,7 @@ impl ThreadCtx {
             sp: 0,
             pc: 0,
             tpidrro_el0: 0,
+            backend: None,
         }
     }
 }
@@ -183,12 +185,22 @@ impl Threads {
         t.ctx.sp = cpu.get_register(31);
         t.ctx.pc = cpu.get_pc();
         t.ctx.tpidrro_el0 = cpu.get_tpidrro_el0();
+        if let Err(e) = cpu.save_thread_context(&mut t.ctx.backend) {
+            log::error!("failed to save thread context for {:#x}: {}", h, e);
+        }
     }
 
     pub fn load_thread(&self, handle: u32, cpu: &mut Cpu) {
         let Some(t) = self.threads.get(&handle) else {
             return;
         };
+        let result = match t.ctx.backend.as_ref() {
+            Some(context) => cpu.restore_thread_context(context),
+            None => cpu.reset_thread_context(),
+        };
+        if let Err(e) = result {
+            log::error!("failed to restore thread context for {:#x}: {}", handle, e);
+        }
         for i in 0..31 {
             cpu.set_register(i as u32, t.ctx.x[i]);
         }
@@ -230,17 +242,15 @@ impl Threads {
     pub fn wake_one_on_mutex_owned(
         &mut self,
         mutex_addr: u64,
-        owner_handle: u32,
+        _owner_handle: u32,
     ) -> Option<(u32, u32, bool)> {
         let h = self
             .threads
             .iter()
             .filter_map(|(h, t)| match &t.state {
                 ThreadState::WaitingMutex {
-                    mutex_addr: m,
-                    owner_handle: o,
-                    ..
-                } if *m == mutex_addr && *o == owner_handle => Some((*h, t.priority)),
+                    mutex_addr: m, ..
+                } if *m == mutex_addr => Some((*h, t.priority)),
                 _ => None,
             })
             .min_by_key(|(h, priority)| (*priority, *h))
@@ -260,7 +270,7 @@ impl Threads {
                 ..
             } = &mut t.state
             {
-                if *m == mutex_addr && *o == owner_handle {
+                if *m == mutex_addr {
                     *o = h;
                     has_more = true;
                 }
@@ -288,14 +298,18 @@ impl Threads {
     }
 
     pub fn peek_one_condvar_waiter(&self, condvar_addr: u64) -> Option<(u32, u64)> {
-        self.threads.iter().find_map(|(h, t)| match &t.state {
-            ThreadState::WaitingCondvar {
-                condvar_addr: c,
-                mutex_addr,
-                ..
-            } if *c == condvar_addr => Some((*h, *mutex_addr)),
-            _ => None,
-        })
+        self.threads
+            .iter()
+            .filter_map(|(h, t)| match &t.state {
+                ThreadState::WaitingCondvar {
+                    condvar_addr: c,
+                    mutex_addr,
+                    ..
+                } if *c == condvar_addr => Some((*h, t.priority, *mutex_addr)),
+                _ => None,
+            })
+            .min_by_key(|(h, priority, _)| (*priority, *h))
+            .map(|(h, _, mutex_addr)| (h, mutex_addr))
     }
 
     pub fn wake_condvar_into_mutex_waiter(
@@ -340,6 +354,10 @@ impl Threads {
 
     pub fn has_condvar_waiters(&self, condvar_addr: u64) -> bool {
         self.threads.values().any(|t| matches!(&t.state, ThreadState::WaitingCondvar { condvar_addr: c, .. } if *c == condvar_addr))
+    }
+
+    pub fn has_mutex_waiters(&self, mutex_addr: u64) -> bool {
+        self.threads.values().any(|t| matches!(&t.state, ThreadState::WaitingMutex { mutex_addr: m, .. } if *m == mutex_addr))
     }
 
     pub fn wake_all_on_condvar(&mut self, condvar_addr: u64) -> usize {
@@ -423,6 +441,14 @@ impl Threads {
             }
         }
         Some(handle)
+    }
+
+    pub fn has_ready_for_core(&self, core: i32) -> bool {
+        self.ready.iter().any(|h| {
+            self.threads
+                .get(h)
+                .map_or(false, |t| t.core == core || t.core < 0)
+        })
     }
 
     pub fn yield_current(&mut self, cpu: &Cpu) {

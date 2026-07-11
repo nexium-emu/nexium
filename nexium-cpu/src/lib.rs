@@ -41,6 +41,25 @@ pub struct FaultSnapshot {
     pub regs: [u64; 31],
 }
 
+#[derive(Clone)]
+pub enum CpuThreadContext {
+    #[cfg(feature = "backend-dynarmic")]
+    Dynarmic(dynarmic_sys::DynarmicContext),
+    #[cfg(feature = "backend-rustarmic")]
+    Rustarmic(rustarmic::RustarmicThreadContext),
+}
+
+impl std::fmt::Debug for CpuThreadContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(feature = "backend-dynarmic")]
+            Self::Dynarmic(_) => f.write_str("Dynarmic"),
+            #[cfg(feature = "backend-rustarmic")]
+            Self::Rustarmic(_) => f.write_str("Rustarmic"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum CpuEvent {
     Running,
@@ -191,6 +210,60 @@ impl Cpu {
     }
     pub fn get_tpidrro_el0(&self) -> u64 {
         dispatch!(self, cpu => cpu.get_tpidrro_el0())
+    }
+
+    pub fn save_thread_context(
+        &self,
+        context: &mut Option<CpuThreadContext>,
+    ) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "backend-dynarmic")]
+            Cpu::Dynarmic(cpu) => {
+                if !matches!(context.as_ref(), Some(CpuThreadContext::Dynarmic(_))) {
+                    *context = Some(CpuThreadContext::Dynarmic(cpu.alloc_thread_context()));
+                }
+                let Some(CpuThreadContext::Dynarmic(context)) = context.as_mut() else {
+                    unreachable!()
+                };
+                cpu.save_thread_context(context)
+            }
+            #[cfg(feature = "backend-rustarmic")]
+            Cpu::Rustarmic(cpu) => {
+                *context = Some(CpuThreadContext::Rustarmic(cpu.save_thread_context()));
+                Ok(())
+            }
+        }
+    }
+
+    pub fn restore_thread_context(
+        &mut self,
+        context: &CpuThreadContext,
+    ) -> Result<(), String> {
+        match (self, context) {
+            #[cfg(feature = "backend-dynarmic")]
+            (Cpu::Dynarmic(cpu), CpuThreadContext::Dynarmic(context)) => {
+                cpu.restore_thread_context(context)
+            }
+            #[cfg(feature = "backend-rustarmic")]
+            (Cpu::Rustarmic(cpu), CpuThreadContext::Rustarmic(context)) => {
+                cpu.restore_thread_context(context);
+                Ok(())
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err("CPU thread context backend mismatch".to_string()),
+        }
+    }
+
+    pub fn reset_thread_context(&mut self) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "backend-dynarmic")]
+            Cpu::Dynarmic(cpu) => cpu.reset_thread_context(),
+            #[cfg(feature = "backend-rustarmic")]
+            Cpu::Rustarmic(cpu) => {
+                cpu.reset_thread_context();
+                Ok(())
+            }
+        }
     }
 
     pub fn run(&mut self, cycle_count: u64) -> CpuEvent {

@@ -17,6 +17,15 @@ struct Region {
 unsafe impl Send for Region {}
 unsafe impl Sync for Region {}
 
+#[derive(Clone, Debug)]
+pub struct RustarmicThreadContext {
+    v: [[u64; 2]; 32],
+    tpidr_el0: u64,
+    fpcr: u32,
+    fpsr: u32,
+    nzcv: u8,
+}
+
 #[repr(C)]
 struct State {
     ctx: CpuContext,
@@ -212,6 +221,36 @@ impl RustarmicCpu {
     }
     pub fn get_tpidrro_el0(&self) -> u64 {
         self.state.ctx.tpidrro_el0
+    }
+
+    pub fn save_thread_context(&self) -> RustarmicThreadContext {
+        RustarmicThreadContext {
+            v: self.state.ctx.v,
+            tpidr_el0: self.state.ctx.tpidr_el0,
+            fpcr: self.state.ctx.fpcr,
+            fpsr: self.state.ctx.fpsr,
+            nzcv: self.state.ctx.nzcv,
+        }
+    }
+
+    pub fn restore_thread_context(&mut self, context: &RustarmicThreadContext) {
+        self.state.ctx.v = context.v;
+        self.state.ctx.tpidr_el0 = context.tpidr_el0;
+        self.state.ctx.fpcr = context.fpcr;
+        self.state.ctx.fpsr = context.fpsr;
+        self.state.ctx.nzcv = context.nzcv;
+        self.state.ctx.exclusive_addr = 0;
+        self.state.ctx.exclusive_size = 0;
+    }
+
+    pub fn reset_thread_context(&mut self) {
+        self.state.ctx.v = [[0; 2]; 32];
+        self.state.ctx.tpidr_el0 = 0;
+        self.state.ctx.fpcr = 0;
+        self.state.ctx.fpsr = 0;
+        self.state.ctx.nzcv = 0;
+        self.state.ctx.exclusive_addr = 0;
+        self.state.ctx.exclusive_size = 0;
     }
 
     pub fn run(&mut self, _max_insn: u64) -> CpuEvent {
