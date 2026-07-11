@@ -4,9 +4,24 @@ use super::engines::{
     KEPLER_COMPUTE_CLASS, KEPLER_MEMORY_CLASS, MAXWELL_DMA_CLASS,
 };
 use super::GpuMappings;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Duration;
+
+static UNMAPPED_PB_WARNS: AtomicU64 = AtomicU64::new(0);
+
+fn warn_unmapped_pushbuffer(kind: &str, gpu_va: u64, mappings: &GpuMappings) {
+    let n = UNMAPPED_PB_WARNS.fetch_add(1, Ordering::Relaxed);
+    if n < 64 || n % 4096 == 0 {
+        log::warn!(
+            "pusher: {} gpu_va={:#x} not in GMMU — skipping (#{}) {}",
+            kind,
+            gpu_va,
+            n,
+            mappings.bracket(gpu_va)
+        );
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
@@ -17,7 +32,7 @@ pub struct CommandListHeader {
 
 impl CommandListHeader {
     pub fn address(&self) -> u64 {
-        ((self.address_hi_and_count as u64 & 0xFF) << 32) | self.address_lo as u64
+        ((self.address_hi_and_count as u64 & 0xFF) << 32) | (self.address_lo as u64 & 0xFFFF_FFFC)
     }
 
     pub fn entry_count(&self) -> u32 {
@@ -68,6 +83,8 @@ const METHOD_SYNCPOINT_PAYLOAD: u32 = 0x1C;
 const METHOD_SYNCPOINT_OPERATION: u32 = 0x1D;
 const NON_PULLER_METHODS: u32 = 0x40;
 
+const POISON_SENTINEL: u32 = 0xBEEF_2929;
+
 static GPU_SEM_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn ordered_gpu_sync_enabled() -> bool {
@@ -106,6 +123,7 @@ pub struct Pusher {
     active_entry_cpu_va: u64,
     active_word_index: usize,
     active_header: u32,
+    pub entry_word_limit: u32,
     pub renderer: Option<Arc<nexium_gpu::Renderer>>,
     vk_batch: Vec<nexium_gpu::draw::Maxwell3dDrawCall>,
 }
@@ -122,6 +140,7 @@ impl Pusher {
             active_entry_cpu_va: 0,
             active_word_index: 0,
             active_header: 0,
+            entry_word_limit: 0,
             renderer: None,
             vk_batch: Vec::new(),
         }
@@ -186,34 +205,62 @@ impl Pusher {
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
-        let cpu_addr = mappings.cpu_address_for(address).unwrap_or(address);
+        let cpu_addr = match mappings.cpu_address_for(address) {
+            Some(c) => c,
+            None => {
+                warn_unmapped_pushbuffer("GPFIFO entry list", address, mappings);
+                return;
+            }
+        };
 
         let bytes_needed = (num_entries as usize) * 8;
-        let mut buf = vec![0u8; bytes_needed];
-        if !mem_read(cpu_addr, &mut buf) {
-            log::debug!(
-                "pusher: failed to read GPFIFO entries at cpu {:#x} (input addr {:#x})",
-                cpu_addr,
-                address
-            );
-            return;
+        if direct_forensics() {
+            let remaining = mappings.cpu_range_for(address).map(|(_, sz)| sz).unwrap_or(0);
+            if (bytes_needed as u64) > remaining {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 32 {
+                    log::warn!(
+                        "[el-overrun] entry_list gpu_va={:#x} num_entries={} need={:#x} remaining={:#x}",
+                        address,
+                        num_entries,
+                        bytes_needed,
+                        remaining
+                    );
+                }
+            }
         }
+        let _ = cpu_addr;
+        let mut buf = vec![0u8; bytes_needed];
+        read_gpu_scattered(mappings, address, &mut buf, mem_read);
+
+        let decoded: Vec<CommandListHeader> = (0..num_entries as usize)
+            .map(|i| {
+                let off = i * 8;
+                CommandListHeader {
+                    address_lo: u32::from_le_bytes([
+                        buf[off],
+                        buf[off + 1],
+                        buf[off + 2],
+                        buf[off + 3],
+                    ]),
+                    address_hi_and_count: u32::from_le_bytes([
+                        buf[off + 4],
+                        buf[off + 5],
+                        buf[off + 6],
+                        buf[off + 7],
+                    ]),
+                }
+            })
+            .collect();
+        let addrs: Vec<u64> = decoded.iter().map(|e| e.address()).collect();
 
         for i in 0..num_entries as usize {
-            let off = i * 8;
-            let entry = CommandListHeader {
-                address_lo: u32::from_le_bytes([
-                    buf[off],
-                    buf[off + 1],
-                    buf[off + 2],
-                    buf[off + 3],
-                ]),
-                address_hi_and_count: u32::from_le_bytes([
-                    buf[off + 4],
-                    buf[off + 5],
-                    buf[off + 6],
-                    buf[off + 7],
-                ]),
+            let entry = decoded[i];
+            self.entry_word_limit = if entry.entry_count() > 4096 {
+                nearest_forward_gap(&addrs, i)
+            } else {
+                0
             };
             self.process_entry(
                 &entry,
@@ -228,6 +275,7 @@ impl Pusher {
                 mem_write,
             );
         }
+        self.entry_word_limit = 0;
         self.flush_vk(mappings, mem_read);
         if let Some(r) = self.renderer.clone() {
             super::vk_dispatch::writeback_small_rts(&r, mappings, mem_write);
@@ -248,7 +296,23 @@ impl Pusher {
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
         let address = entry.address();
-        let word_count = entry.entry_count();
+        let mut word_count = entry.entry_count();
+
+        if self.entry_word_limit != 0 && word_count > self.entry_word_limit {
+            if direct_forensics() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 48 {
+                    log::warn!(
+                        "[pb-clamp] gpu_va={:#x} declared={} clamped_to={} (next entry overlaps)",
+                        address,
+                        word_count,
+                        self.entry_word_limit
+                    );
+                }
+            }
+            word_count = self.entry_word_limit;
+        }
 
         if self.entries_logged < 16 {
             log::info!(
@@ -268,24 +332,56 @@ impl Pusher {
             return;
         }
 
-        let cpu_addr = mappings.cpu_address_for(address).unwrap_or(address);
+        let cpu_addr = match mappings.cpu_address_for(address) {
+            Some(c) => c,
+            None => {
+                warn_unmapped_pushbuffer("pushbuffer", address, mappings);
+                return;
+            }
+        };
 
         let bytes_needed = (word_count as usize) * 4;
-        let mut buf = vec![0u8; bytes_needed];
-        if !mem_read(cpu_addr, &mut buf) {
-            log::debug!("pusher: failed to read cmd buffer at cpu {:#x}", cpu_addr);
-            return;
+        if direct_forensics() {
+            let remaining = mappings.cpu_range_for(address).map(|(_, sz)| sz).unwrap_or(0);
+            if (bytes_needed as u64) > remaining {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 64 {
+                    log::warn!(
+                        "[pb-overrun] gpu_va={:#x} cpu={:#x} need={:#x} remaining_in_mapping={:#x} {}",
+                        address,
+                        cpu_addr,
+                        bytes_needed,
+                        remaining,
+                        mappings.bracket(address)
+                    );
+                }
+            }
+            if word_count > 16384 {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 48 {
+                    log::warn!(
+                        "[pb-bogus-entry] gpu_va={:#x} word_count={} raw_lo={:#010x} raw_hi={:#010x} no_prefetch={} not_main={}",
+                        address,
+                        word_count,
+                        entry.address_lo,
+                        entry.address_hi_and_count,
+                        entry.no_prefetch(),
+                        entry.not_main()
+                    );
+                }
+            }
         }
+        let _ = cpu_addr;
+        let mut buf = vec![0u8; bytes_needed];
+        read_gpu_scattered(mappings, address, &mut buf, mem_read);
 
         let mut words: Vec<u32> = Vec::with_capacity(word_count as usize);
         for i in 0..word_count as usize {
             let off = i * 4;
-            words.push(u32::from_le_bytes([
-                buf[off],
-                buf[off + 1],
-                buf[off + 2],
-                buf[off + 3],
-            ]));
+            let w = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            words.push(if w == POISON_SENTINEL { 0 } else { w });
         }
 
         self.active_entry_gpu_va = address;
@@ -302,10 +398,29 @@ impl Pusher {
             mem_read,
             mem_write,
         );
+        if direct_forensics() && self.state.method_count > 0 {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 64 {
+                log::warn!(
+                    "[pb-leak] entry_gpu={:#x} words={} ended with method={:#x} count_left={} noninc={} subch={}",
+                    address,
+                    word_count,
+                    self.state.method,
+                    self.state.method_count,
+                    self.state.non_incrementing,
+                    self.state.subchannel
+                );
+            }
+        }
+        if self.state.method_count > 4096 {
+            self.state.method_count = 0;
+        }
         self.active_entry_gpu_va = 0;
         self.active_entry_cpu_va = 0;
         self.active_word_index = 0;
         self.active_header = 0;
+        self.entry_word_limit = 0;
     }
 
     fn process_commands(
@@ -328,6 +443,20 @@ impl Pusher {
 
             if self.state.method_count > 0 {
                 self.active_word_index = i;
+                let cls = self.bound_classes[self.state.subchannel as usize & 7];
+                if suspicious_direct(cls, self.state.method, header) {
+                    dump_direct_ctx(
+                        self.active_entry_gpu_va,
+                        self.active_entry_cpu_va,
+                        self.state.method,
+                        header,
+                        cls,
+                        self.state.method_count,
+                        self.state.non_incrementing,
+                        commands,
+                        i,
+                    );
+                }
                 self.dispatch_method(
                     header,
                     mappings,
@@ -368,9 +497,53 @@ impl Pusher {
                 continue;
             };
 
+            if mode != Mode::Inline
+                && arg_count > 512
+                && (i + 1).saturating_add(arg_count as usize) > commands.len()
+            {
+                if direct_forensics() {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static N: AtomicU32 = AtomicU32::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 48 {
+                        log::warn!(
+                            "[pb-runaway-skip] entry_gpu={:#x} word={} of {} header={:#010x} method={:#x} count={} — data misread, skipping",
+                            self.active_entry_gpu_va,
+                            i,
+                            commands.len(),
+                            header,
+                            method,
+                            arg_count
+                        );
+                    }
+                }
+                i += 1;
+                continue;
+            }
+
             self.state.method = method;
             self.state.subchannel = subchannel;
             self.state.method_count = arg_count;
+
+            if direct_forensics() && arg_count > 512 && mode != Mode::Inline {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 64 {
+                    let cls = self.bound_classes[subchannel as usize & 7];
+                    log::warn!(
+                        "[pb-bighdr] entry_gpu={:#x} word={} of {} header={:#010x} method={:#x} count={} mode={:?} subch={} class={:#x} {}",
+                        self.active_entry_gpu_va,
+                        i,
+                        commands.len(),
+                        header,
+                        method,
+                        arg_count,
+                        mode,
+                        subchannel,
+                        cls,
+                        mappings.bracket(self.active_entry_gpu_va)
+                    );
+                }
+            }
 
             match mode {
                 Mode::Increasing | Mode::IncreasingOld => {
@@ -516,8 +689,14 @@ impl Pusher {
                 self.flush_vk(mappings, mem_read);
                 self.sync_renderer_idle("maxwell-barrier");
                 if texture_invalidates != 0 {
-                    if let Some(r) = self.renderer.clone() {
-                        r.clear_texture_cache();
+                    static CLEAR_ON_TIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let clear_on_tic = *CLEAR_ON_TIC.get_or_init(|| {
+                        std::env::var_os("NEXIUM_TIC_INVALIDATE_CLEAR").is_some()
+                    });
+                    if clear_on_tic {
+                        if let Some(r) = self.renderer.clone() {
+                            r.clear_texture_cache();
+                        }
                     }
                 }
                 if std::env::var_os("NEXIUM_MW3D_SYNC_DBG").is_some() {
@@ -623,14 +802,24 @@ impl Pusher {
     ) {
         match method {
             METHOD_BIND_OBJECT => {
-                self.bound_classes[subchannel & 7] = arg & 0xFFFF;
-                log::debug!(
-                    "puller: BindObject subch={} class={:#x}",
-                    subchannel,
-                    arg & 0xFFFF
-                );
+                let class = arg & 0xFFFF;
+                if is_known_gpu_class(class) {
+                    self.bound_classes[subchannel & 7] = class;
+                    log::debug!("puller: BindObject subch={} class={:#x}", subchannel, class);
+                } else {
+                    log::trace!(
+                        "puller: BindObject subch={} class={:#x} rejected (unknown) keeping {:#x}",
+                        subchannel,
+                        class,
+                        self.bound_classes[subchannel & 7]
+                    );
+                }
             }
-            METHOD_SEMAPHORE_ADDR_HIGH => self.puller.semaphore_addr_high = arg,
+            METHOD_SEMAPHORE_ADDR_HIGH => {
+                if arg <= 0xFF {
+                    self.puller.semaphore_addr_high = arg;
+                }
+            }
             METHOD_SEMAPHORE_ADDR_LOW => self.puller.semaphore_addr_low = arg,
             METHOD_SEMAPHORE_PAYLOAD => self.puller.semaphore_payload = arg,
             METHOD_SEMAPHORE_OPERATION => {
@@ -718,6 +907,121 @@ impl Pusher {
             f32::from_bits(dword)
         );
     }
+}
+
+fn direct_forensics() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_MME_FORENSICS").is_some())
+}
+
+pub(crate) fn nearest_forward_gap(addrs: &[u64], i: usize) -> u32 {
+    let cur = addrs[i];
+    let mut best: Option<u64> = None;
+    for (j, &a) in addrs.iter().enumerate() {
+        if j == i || a <= cur {
+            continue;
+        }
+        let d = a - cur;
+        if best.map_or(true, |b| d < b) {
+            best = Some(d);
+        }
+    }
+    match best {
+        Some(d) if d <= 0x100000 * 4 => (d / 4) as u32,
+        _ => 0,
+    }
+}
+
+fn read_gpu_scattered(
+    mappings: &GpuMappings,
+    gpu_va: u64,
+    out: &mut [u8],
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) {
+    let mut off = 0usize;
+    let mut va = gpu_va;
+    while off < out.len() {
+        match mappings.cpu_range_for(va) {
+            Some((cpu, remain)) if remain > 0 => {
+                let take = (remain as usize).min(out.len() - off);
+                let _ = mem_read(cpu, &mut out[off..off + take]);
+                off += take;
+                va = va.wrapping_add(take as u64);
+            }
+            _ => {
+                let page_left = (0x1000 - (va & 0xFFF)) as usize;
+                let step = page_left.min(out.len() - off).max(1);
+                off += step;
+                va = va.wrapping_add(step as u64);
+            }
+        }
+    }
+}
+
+fn suspicious_direct(class: u32, method: u32, arg: u32) -> bool {
+    if !direct_forensics() {
+        return false;
+    }
+    if class == 0xB197 {
+        let hi_reg = method == 0x582
+            || method == 0x6c0
+            || method == 0x8e1
+            || method == 0x554
+            || (method >= 0x200 && method < 0x280 && (method & 0xF) == 0);
+        if hi_reg && arg > 0xFF {
+            return true;
+        }
+        if (method == 0x47 || method == 0x48) && arg > 0x1000 {
+            return true;
+        }
+    }
+    if method == METHOD_SEMAPHORE_ADDR_HIGH && arg > 0xFF {
+        return true;
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dump_direct_ctx(
+    entry_gpu_va: u64,
+    entry_cpu_va: u64,
+    method: u32,
+    arg: u32,
+    class: u32,
+    method_count: u32,
+    non_incrementing: bool,
+    commands: &[u32],
+    i: usize,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 64 {
+        return;
+    }
+    let lo = i.saturating_sub(3);
+    let hi = (i + 6).min(commands.len());
+    log::warn!(
+        "[pb-garbage] entry_gpu={:#x} cpu={:#x} word={} class={:#x} method={:#x} arg={:#010x} mcount={} noninc={} words[{}..{}]={:08x?}",
+        entry_gpu_va,
+        entry_cpu_va,
+        i,
+        class,
+        method,
+        arg,
+        method_count,
+        non_incrementing,
+        lo,
+        hi,
+        &commands[lo..hi]
+    );
+}
+
+fn is_known_gpu_class(class: u32) -> bool {
+    matches!(
+        class,
+        0xB197 | MAXWELL_DMA_CLASS | FERMI_2D_CLASS | KEPLER_MEMORY_CLASS | KEPLER_COMPUTE_CLASS
+    )
 }
 
 fn constbuf_upload_watch() -> Option<(u64, u64)> {
