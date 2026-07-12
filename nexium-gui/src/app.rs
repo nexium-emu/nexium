@@ -90,7 +90,7 @@ fn status_icon(ui: &mut egui::Ui, icon: StatusIcon, color: Color32) -> egui::Res
                 egui::pos2(r.left() + r.width() * 0.22, r.top()),
                 egui::pos2(r.right() - r.width() * 0.22, r.top() + r.height() * 0.58),
             );
-            p.rect_stroke(screen, 1.0, Stroke::new(1.2, color));
+            p.rect_stroke(screen, 1.0, Stroke::new(1.2_f32, color));
             let dock = egui::Rect::from_min_max(
                 egui::pos2(r.left(), r.top() + r.height() * 0.48),
                 r.right_bottom(),
@@ -114,7 +114,7 @@ fn status_icon(ui: &mut egui::Ui, icon: StatusIcon, color: Color32) -> egui::Res
                 2.0,
                 color,
             );
-            p.rect_stroke(body, 2.0, Stroke::new(1.1, color));
+            p.rect_stroke(body, 2.0, Stroke::new(1.1_f32, color));
         }
     }
     resp
@@ -468,7 +468,7 @@ impl HorizonApp {
         s.visuals.faint_bg_color = BG_RAISED;
         s.visuals.extreme_bg_color = BG;
         s.visuals.override_text_color = Some(TEXT);
-        s.visuals.window_stroke = Stroke::new(1.0, BORDER);
+        s.visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
         s.visuals.window_rounding = Rounding::same(8.0);
         s.visuals.menu_rounding = Rounding::same(6.0);
         s.visuals.popup_shadow = egui::epaint::Shadow {
@@ -487,19 +487,19 @@ impl HorizonApp {
             w.rounding = Rounding::same(4.0);
         }
         s.visuals.widgets.noninteractive.bg_fill = BG_RAISED;
-        s.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-        s.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, MUTED);
+        s.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+        s.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, MUTED);
         s.visuals.widgets.inactive.bg_fill = BG_INPUT;
-        s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-        s.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+        s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+        s.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
         s.visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x28, 0x28, 0x30);
-        s.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x44, 0x44, 0x52));
-        s.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+        s.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x44, 0x44, 0x52));
+        s.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
         s.visuals.widgets.active.bg_fill = ACCENT;
-        s.visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
-        s.visuals.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+        s.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+        s.visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
         s.visuals.widgets.open.bg_fill = BG_INPUT;
-        s.visuals.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT);
+        s.visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, ACCENT);
         s.visuals.selection.bg_fill = Color32::from_rgba_premultiplied(0x2F, 0xB4, 0xEF, 0x50);
         s.spacing.item_spacing = Vec2::new(6.0, 4.0);
         s.spacing.button_padding = Vec2::new(10.0, 5.0);
@@ -1007,21 +1007,21 @@ impl HorizonApp {
         let box_rect = egui::Rect::from_center_size(screen.center(), Vec2::new(w, h));
         paint.rect_filled(box_rect.translate(Vec2::new(0.0, 12.0)), Rounding::same(20.0), Color32::from_black_alpha(90));
         paint.rect_filled(box_rect, Rounding::same(20.0), panel);
-        paint.rect_stroke(box_rect, Rounding::same(20.0), Stroke::new(1.5, border));
+        paint.rect_stroke(box_rect, Rounding::same(20.0), Stroke::new(1.5_f32, border));
         paint.text(egui::pos2(box_rect.center().x, box_rect.min.y + 34.0), egui::Align2::CENTER_CENTER, "Choose an Icon", FontId::proportional(22.0), text);
 
         // Search field
         let field = egui::Rect::from_min_size(egui::pos2(box_rect.min.x + 40.0, box_rect.min.y + 58.0), Vec2::new(w - 80.0, 40.0));
         let field_resp = ui.allocate_rect(field, egui::Sense::click());
         paint.rect_filled(field, Rounding::same(10.0), field_bg);
-        paint.rect_stroke(field, Rounding::same(10.0), Stroke::new(if editing { 2.0 } else { 1.0 }, if editing { accent } else { border }));
+        paint.rect_stroke(field, Rounding::same(10.0), Stroke::new(if editing { 2.0_f32 } else { 1.0_f32 }, if editing { accent } else { border }));
         let query_disp = if search.is_empty() { "Type a game name…".to_string() } else { search.clone() };
         let qcol = if search.is_empty() { muted } else { text };
         paint.text(egui::pos2(field.min.x + 14.0, field.center().y), egui::Align2::LEFT_CENTER, &query_disp, FontId::proportional(17.0), qcol);
         if editing && (now * 1.6).fract() < 0.5 {
             let tw = ui.fonts(|f| f.layout_no_wrap(search.clone(), FontId::proportional(17.0), text).size().x);
             let cx = (field.min.x + 14.0 + tw).min(field.max.x - 10.0);
-            paint.line_segment([egui::pos2(cx, field.center().y - 11.0), egui::pos2(cx, field.center().y + 11.0)], Stroke::new(2.0, accent));
+            paint.line_segment([egui::pos2(cx, field.center().y - 11.0), egui::pos2(cx, field.center().y + 11.0)], Stroke::new(2.0_f32, accent));
         }
 
         // Content area
@@ -1225,7 +1225,7 @@ impl HorizonApp {
         let header_font = 34.0 * s;
         p.text(sp(egui::pos2(full.min.x + mx, full.min.y + 40.0 * s)), egui::Align2::LEFT_TOP, "Carousel Settings", egui::FontId::proportional(header_font * sf), text);
         let header_y = full.min.y + 40.0 * s + header_font + 20.0 * s;
-        p.line_segment([sp(egui::pos2(full.min.x + mx, header_y)), sp(egui::pos2(full.max.x - mx, header_y))], egui::Stroke::new(1.0, border));
+        p.line_segment([sp(egui::pos2(full.min.x + mx, header_y)), sp(egui::pos2(full.max.x - mx, header_y))], egui::Stroke::new(1.0_f32, border));
 
         // ---- input ----
         use crate::controller_config::SwitchButton;
@@ -1276,7 +1276,7 @@ impl HorizonApp {
             let rounding = egui::Rounding::same(12.0 * s);
             if selected {
                 p.rect_filled(r, rounding, sel);
-                p.rect_stroke(r, rounding, egui::Stroke::new(1.8, ring));
+                p.rect_stroke(r, rounding, egui::Stroke::new(1.8_f32, ring));
                 let bar = sr(egui::Rect::from_min_size(base.min + egui::Vec2::new(6.0 * s, 12.0 * s), egui::Vec2::new(4.0 * s, base.height() - 24.0 * s)));
                 p.rect_filled(bar, egui::Rounding::same(2.0 * s), ring);
             } else if ui.rect_contains_pointer(r) {
@@ -1297,7 +1297,7 @@ impl HorizonApp {
         }
 
         let footer_y = full.max.y - 60.0 * s;
-        p.line_segment([sp(egui::pos2(full.min.x + mx, footer_y)), sp(egui::pos2(full.max.x - mx, footer_y))], egui::Stroke::new(1.0, border));
+        p.line_segment([sp(egui::pos2(full.min.x + mx, footer_y)), sp(egui::pos2(full.max.x - mx, footer_y))], egui::Stroke::new(1.0_f32, border));
         let pad = self.last_input.connected;
         let hint = if self.cs_creating {
             if pad { "Change    ·    [A] Edit    ·    [B] Cancel" } else { "[Arrows] Change    ·    [Enter] Edit    ·    [Esc] Cancel" }
@@ -1396,7 +1396,7 @@ impl HorizonApp {
                         let bc = rect.right_top() + egui::Vec2::new(-br - 5.0 * s, br + 5.0 * s);
                         let a = (fade * 255.0) as u8;
                         clip.circle_filled(bc, br, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), a));
-                        clip.circle_stroke(bc, br, egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (a as f32 * 0.5) as u8)));
+                        clip.circle_stroke(bc, br, egui::Stroke::new(1.5_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (a as f32 * 0.5) as u8)));
                         draw_check(&clip, bc, br * 1.15, egui::Color32::from_rgba_unmultiplied(255, 255, 255, a));
                     }
                     if !dlg && !block && ui.rect_contains_pointer(rect) && ui.allocate_rect(rect, egui::Sense::click()).clicked() {
@@ -1534,7 +1534,7 @@ impl HorizonApp {
                         let lx = slot_x(k) - gap / 2.0;
                         let active = k == self.cs_build_insert;
                         let col = if active { accent } else { egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 70) };
-                        let w = if active { 5.0 } else { 2.5 };
+                        let w = if active { 5.0_f32 } else { 2.5_f32 };
                         let top = row_cy - tile / 2.0 - 10.0 * s;
                         let bot = row_cy + tile / 2.0 + 10.0 * s;
                         clip.line_segment([sp(egui::pos2(lx, top)), sp(egui::pos2(lx, bot))], egui::Stroke::new(w, col));
@@ -1624,7 +1624,7 @@ impl HorizonApp {
                 let mc = full.center();
                 let mr = sr(egui::Rect::from_center_size(mc, egui::vec2(mw, mh)));
                 p.rect_filled(mr, egui::Rounding::same(14.0 * s), panel);
-                p.rect_stroke(mr, egui::Rounding::same(14.0 * s), egui::Stroke::new(1.5, border));
+                p.rect_stroke(mr, egui::Rounding::same(14.0 * s), egui::Stroke::new(1.5_f32, border));
                 let name = self.app_settings.carousel_lists[li].name.clone();
                 p.text(sp(egui::pos2(mc.x, mc.y - mh / 2.0 + 26.0 * s)), egui::Align2::CENTER_CENTER, &name, egui::FontId::proportional(17.0 * s * sf), text);
                 let red = egui::Color32::from_rgb(0xE0, 0x5A, 0x5A);
@@ -1640,7 +1640,7 @@ impl HorizonApp {
                     let accent_row = if i == 1 { red } else { accent };
                     if selrow {
                         p.rect_filled(r, egui::Rounding::same(9.0 * s), sel);
-                        p.rect_stroke(r, egui::Rounding::same(9.0 * s), egui::Stroke::new(2.0, accent_row));
+                        p.rect_stroke(r, egui::Rounding::same(9.0 * s), egui::Stroke::new(2.0_f32, accent_row));
                     } else if ui.rect_contains_pointer(r) {
                         p.rect_filled(r, egui::Rounding::same(9.0 * s), hover);
                     }
@@ -1687,7 +1687,7 @@ impl HorizonApp {
             let top = full.center().y - dh / 2.0;
             let dr = sr(egui::Rect::from_center_size(full.center(), egui::vec2(dw, dh)));
             p.rect_filled(dr, egui::Rounding::same(16.0 * s), panel);
-            p.rect_stroke(dr, egui::Rounding::same(16.0 * s), egui::Stroke::new(1.5, border));
+            p.rect_stroke(dr, egui::Rounding::same(16.0 * s), egui::Stroke::new(1.5_f32, border));
             p.text(sp(egui::pos2(cx, top + 34.0 * s)), egui::Align2::CENTER_CENTER, if self.cs_rename_idx.is_some() { "Rename List" } else { "Create List" }, egui::FontId::proportional(24.0 * s * sf), text);
 
             let field_w = dw - 88.0 * s;
@@ -1741,7 +1741,7 @@ impl HorizonApp {
                 let r = sr(base);
                 let selected = self.cs_dialog_row == row;
                 p.rect_filled(r, egui::Rounding::same(10.0 * s), sel);
-                p.rect_stroke(r, egui::Rounding::same(10.0 * s), egui::Stroke::new(if selected { 2.0 } else { 1.0 }, if selected { accent } else { border }));
+                p.rect_stroke(r, egui::Rounding::same(10.0 * s), egui::Stroke::new(if selected { 2.0_f32 } else { 1.0_f32 }, if selected { accent } else { border }));
                 p.text(sp(egui::pos2(base.min.x + 18.0 * s, base.min.y + 14.0 * s)), egui::Align2::LEFT_TOP, label, egui::FontId::proportional(12.0 * s * sf), muted);
                 let val_y = base.min.y + 38.0 * s;
                 p.text(sp(egui::pos2(base.min.x + 18.0 * s, val_y)), egui::Align2::LEFT_TOP, value, egui::FontId::proportional(18.0 * s * sf), text);
@@ -1769,7 +1769,7 @@ impl HorizonApp {
                     p.rect_filled(r, egui::Rounding::same(11.0 * s), sel);
                     p.text(r.center(), egui::Align2::CENTER_CENTER, lbl, egui::FontId::proportional(18.0 * s * sf), text);
                 }
-                if selected { p.rect_stroke(r, egui::Rounding::same(11.0 * s), egui::Stroke::new(2.0, accent)); }
+                if selected { p.rect_stroke(r, egui::Rounding::same(11.0 * s), egui::Stroke::new(2.0_f32, accent)); }
             }
 
             if ui.allocate_rect(sr(name_base), egui::Sense::click()).clicked() { self.cs_dialog_row = 0; self.cs_name_editing = true; }
@@ -1924,7 +1924,7 @@ impl HorizonApp {
 
         let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("perf_overlay")));
         p.rect_filled(rect, egui::Rounding::same(6.0 * sc), egui::Color32::from_rgba_unmultiplied(0x0A, 0x0A, 0x0D, 236));
-        p.rect_stroke(rect, egui::Rounding::same(6.0 * sc), egui::Stroke::new(1.0, if resp.hovered() || self.perf_drag || resizing { egui::Color32::from_gray(110) } else { egui::Color32::from_gray(54) }));
+        p.rect_stroke(rect, egui::Rounding::same(6.0 * sc), egui::Stroke::new(1.0_f32, if resp.hovered() || self.perf_drag || resizing { egui::Color32::from_gray(110) } else { egui::Color32::from_gray(54) }));
         let mono = |sz: f32| egui::FontId::monospace(sz * sc);
         let white = egui::Color32::from_rgb(0xE8, 0xE8, 0xEC);
         let lx = rect.min.x + 9.0 * sc;
@@ -1948,7 +1948,7 @@ impl HorizonApp {
         p.rect_filled(graph, egui::Rounding::same(2.0 * sc), egui::Color32::from_black_alpha(140));
         for k in 1..4 {
             let gx = graph.min.x + graph.width() * k as f32 / 4.0;
-            p.line_segment([egui::pos2(gx, graph.min.y), egui::pos2(gx, graph.max.y)], egui::Stroke::new(1.0, egui::Color32::from_gray(30)));
+            p.line_segment([egui::pos2(gx, graph.min.y), egui::pos2(gx, graph.max.y)], egui::Stroke::new(1.0_f32, egui::Color32::from_gray(30)));
         }
         let n = self.perf_hist.len();
         if n > 1 {
@@ -2173,7 +2173,7 @@ impl HorizonApp {
         let box_rect = egui::Rect::from_center_size(screen.center(), Vec2::new(w, h));
         p.rect_filled(box_rect.translate(Vec2::new(0.0, 10.0)), Rounding::same(18.0), Color32::from_black_alpha(90));
         p.rect_filled(box_rect, Rounding::same(18.0), panel);
-        p.rect_stroke(box_rect, Rounding::same(18.0), Stroke::new(1.5, border));
+        p.rect_stroke(box_rect, Rounding::same(18.0), Stroke::new(1.5_f32, border));
 
         if is_teardown {
             p.text(box_rect.center() - Vec2::new(0.0, 14.0 * pop), egui::Align2::CENTER_CENTER, "Please Wait…", FontId::proportional(25.0 * pop), text);
@@ -2198,9 +2198,9 @@ impl HorizonApp {
             p.rect_filled(rect, rounding, btn_fill);
             if sel {
                 p.rect_filled(rect, rounding, Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 42));
-                p.rect_stroke(rect, rounding, Stroke::new(2.6, accent));
+                p.rect_stroke(rect, rounding, Stroke::new(2.6_f32, accent));
             } else {
-                p.rect_stroke(rect, rounding, Stroke::new(1.2, border));
+                p.rect_stroke(rect, rounding, Stroke::new(1.2_f32, border));
             }
             let col = if sel {
                 let f = |x: u8| (x as f32 + (255.0 - x as f32) * 0.2) as u8;
@@ -2496,14 +2496,14 @@ fn game_tile(
             ui.painter().rect_stroke(
                 rect.expand(e * 1.5),
                 Rounding::same(10.0 + e * 1.5),
-                Stroke::new(1.5, Color32::from_rgba_unmultiplied(0x2F, 0xB4, 0xEF, (34 / i) as u8)),
+                Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(0x2F, 0xB4, 0xEF, (34 / i) as u8)),
             );
         }
         ui.painter()
-            .rect_stroke(rect, rounding, Stroke::new(1.4, ACCENT_HV));
+            .rect_stroke(rect, rounding, Stroke::new(1.4_f32, ACCENT_HV));
     } else {
         ui.painter()
-            .rect_stroke(rect, rounding, Stroke::new(1.0, BORDER));
+            .rect_stroke(rect, rounding, Stroke::new(1.0_f32, BORDER));
     }
 
     let pad = 11.0;
@@ -2563,10 +2563,10 @@ fn add_folder_tile(ui: &mut egui::Ui) -> egui::Response {
     ui.painter().rect_filled(rect, rounding, bg);
     if hovered {
         ui.painter()
-            .rect_stroke(rect, rounding, Stroke::new(1.4, ACCENT_HV));
+            .rect_stroke(rect, rounding, Stroke::new(1.4_f32, ACCENT_HV));
     } else {
         ui.painter()
-            .rect_stroke(rect, rounding, Stroke::new(1.0, BORDER));
+            .rect_stroke(rect, rounding, Stroke::new(1.0_f32, BORDER));
     }
 
     let pad = 11.0;
@@ -2615,13 +2615,13 @@ fn animated_border(p: &egui::Painter, rect: egui::Rect, r: f32, t: f32) {
         p.rect_stroke(
             rect.expand(e),
             Rounding::same(r + e),
-            Stroke::new(2.2, Color32::from_rgba_unmultiplied(0x2F, 0xB4, 0xEF, a)),
+            Stroke::new(2.2_f32, Color32::from_rgba_unmultiplied(0x2F, 0xB4, 0xEF, a)),
         );
     }
     p.rect_stroke(
         rect,
         Rounding::same(r),
-        Stroke::new(1.8, lerp_col(ACCENT, ACCENT_HV, pulse)),
+        Stroke::new(1.8_f32, lerp_col(ACCENT, ACCENT_HV, pulse)),
     );
 }
 
@@ -2671,7 +2671,7 @@ fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
         } else {
             BORDER
         };
-        (c, TEXT, Stroke::new(1.0, bc))
+        (c, TEXT, Stroke::new(1.0_f32, bc))
     };
 
     ui.painter().rect(rect, Rounding::same(5.0), bg, stroke);
@@ -3114,7 +3114,7 @@ impl eframe::App for HorizonApp {
                 .frame(
                     egui::Frame::none()
                         .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
-                        .stroke(Stroke::new(1.0, BORDER)),
+                        .stroke(Stroke::new(1.0_f32, BORDER)),
                 )
                 .show(ctx, |ui| {
                     ui.horizontal_centered(|ui| {
@@ -3131,7 +3131,7 @@ impl eframe::App for HorizonApp {
                         ui.painter().vline(
                             ui.cursor().left(),
                             ui.max_rect().y_range(),
-                            Stroke::new(1.0, BORDER),
+                            Stroke::new(1.0_f32, BORDER),
                         );
                         ui.add_space(8.0);
 
@@ -3291,7 +3291,7 @@ impl eframe::App for HorizonApp {
                 .frame(
                     egui::Frame::none()
                         .fill(Color32::from_rgb(0x0C, 0x0C, 0x0E))
-                        .stroke(Stroke::new(1.0, BORDER)),
+                        .stroke(Stroke::new(1.0_f32, BORDER)),
                 )
                 .show(ctx, |ui| {
                     ui.horizontal_centered(|ui| {
@@ -3860,10 +3860,10 @@ impl eframe::App for HorizonApp {
                         let rect = egui::Rect::from_min_size(egui::pos2(screen.center().x - w * 0.5, screen.min.y + 24.0), egui::Vec2::new(w, 62.0));
                         tp.rect_filled(rect.translate(egui::Vec2::new(0.0, 4.0)), egui::Rounding::same(14.0), egui::Color32::from_black_alpha(90));
                         tp.rect_filled(rect, egui::Rounding::same(14.0), egui::Color32::from_rgb(0x1C, 0x24, 0x1E));
-                        tp.rect_stroke(rect, egui::Rounding::same(14.0), egui::Stroke::new(1.5, egui::Color32::from_rgb(0x35, 0xD0, 0x6A)));
+                        tp.rect_stroke(rect, egui::Rounding::same(14.0), egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0x35, 0xD0, 0x6A)));
                         let cc = egui::pos2(rect.min.x + 30.0, rect.center().y);
                         tp.circle_filled(cc, 12.0, egui::Color32::from_rgb(0x35, 0xD0, 0x6A));
-                        tp.add(egui::Shape::line(vec![cc + egui::Vec2::new(-5.0, 0.0), cc + egui::Vec2::new(-1.5, 4.0), cc + egui::Vec2::new(6.0, -5.0)], egui::Stroke::new(2.2, egui::Color32::WHITE)));
+                        tp.add(egui::Shape::line(vec![cc + egui::Vec2::new(-5.0, 0.0), cc + egui::Vec2::new(-1.5, 4.0), cc + egui::Vec2::new(6.0, -5.0)], egui::Stroke::new(2.2_f32, egui::Color32::WHITE)));
                         tp.text(egui::pos2(rect.min.x + 54.0, rect.center().y - 9.0), egui::Align2::LEFT_CENTER, "Download Complete!", egui::FontId::proportional(16.0), egui::Color32::WHITE);
                         tp.text(egui::pos2(rect.min.x + 54.0, rect.center().y + 11.0), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(13.0), egui::Color32::from_gray(0xB0));
                         ctx.request_repaint();
@@ -4165,7 +4165,7 @@ fn idle_screen(ui: &mut egui::Ui, nro_path: &str, running: bool) -> u8 {
             card_rect,
             Rounding::same(10.0),
             BG_RAISED,
-            Stroke::new(1.0, BORDER),
+            Stroke::new(1.0_f32, BORDER),
         );
 
         ui.allocate_ui_with_layout(
@@ -4467,7 +4467,7 @@ fn draw_controller_diagram(ui: &mut egui::Ui, input: &InputSnapshot) {
 
     let face = |center: egui::Pos2, r: f32, label: &str, on: bool| {
         let fill = if on { ACCENT } else { BG_INPUT };
-        painter.circle(center, r, fill, Stroke::new(1.0, BORDER));
+        painter.circle(center, r, fill, Stroke::new(1.0_f32, BORDER));
         if !label.is_empty() {
             let tc = if on { Color32::WHITE } else { MUTED };
             painter.text(
@@ -4482,7 +4482,7 @@ fn draw_controller_diagram(ui: &mut egui::Ui, input: &InputSnapshot) {
     let pad = |center: egui::Pos2, sz: Vec2, label: &str, on: bool| {
         let r = egui::Rect::from_center_size(center, sz);
         let fill = if on { ACCENT } else { BG_INPUT };
-        painter.rect(r, Rounding::same(3.0), fill, Stroke::new(1.0, BORDER));
+        painter.rect(r, Rounding::same(3.0), fill, Stroke::new(1.0_f32, BORDER));
         if !label.is_empty() {
             let tc = if on { Color32::WHITE } else { MUTED };
             painter.text(
@@ -4497,14 +4497,14 @@ fn draw_controller_diagram(ui: &mut egui::Ui, input: &InputSnapshot) {
     let stick = |base: egui::Pos2, sx: f32, sy: f32, clicked: bool| {
         let ring = 22.0 * s;
         let knob = 13.0 * s;
-        painter.circle(base, ring, BG_INPUT, Stroke::new(1.5, outline));
+        painter.circle(base, ring, BG_INPUT, Stroke::new(1.5_f32, outline));
         let off = Vec2::new(sx, -sy) * (ring - knob - 1.0);
         let kc = if clicked {
             ACCENT
         } else {
             Color32::from_rgb(0x62, 0x62, 0x72)
         };
-        painter.circle(base + off, knob, kc, Stroke::new(1.0, BORDER));
+        painter.circle(base + off, knob, kc, Stroke::new(1.0_f32, BORDER));
     };
 
     pad(

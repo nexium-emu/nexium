@@ -321,7 +321,7 @@ impl ShopState {
         let field = egui::Rect::from_min_size(egui::pos2(screen.max.x - 320.0, 9.0), egui::Vec2::new(292.0, 34.0));
         let field_resp = ui.allocate_rect(field, egui::Sense::click());
         paint.rect_filled(field, egui::Rounding::same(8.0), Color32::from_black_alpha(60));
-        paint.rect_stroke(field, egui::Rounding::same(8.0), egui::Stroke::new(if self.editing { 2.0 } else { 1.0 }, if self.editing { Color32::WHITE } else { Color32::from_white_alpha(120) }));
+        paint.rect_stroke(field, egui::Rounding::same(8.0), egui::Stroke::new(if self.editing { 2.0_f32 } else { 1.0_f32 }, if self.editing { Color32::WHITE } else { Color32::from_white_alpha(120) }));
         let disp = if self.search.is_empty() { "Search…".to_string() } else { self.search.clone() };
         paint.text(egui::pos2(field.min.x + 12.0, field.center().y), egui::Align2::LEFT_CENTER, &disp, egui::FontId::proportional(15.0), Color32::from_white_alpha(if self.search.is_empty() { 150 } else { 255 }));
         if field_resp.clicked() {
@@ -456,7 +456,7 @@ impl ShopState {
             let sel = vi == self.selected;
             if sel {
                 clip.rect_filled(tile.expand(4.0), egui::Rounding::same(13.0), Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 90));
-                clip.rect_stroke(tile.expand(4.0), egui::Rounding::same(13.0), egui::Stroke::new(2.5, accent));
+                clip.rect_stroke(tile.expand(4.0), egui::Rounding::same(13.0), egui::Stroke::new(2.5_f32, accent));
             }
             clip.rect_filled(tile, egui::Rounding::same(10.0), pal.panel);
             if let Some(Some(tex)) = self.icons.get(ai) {
@@ -550,9 +550,9 @@ impl ShopState {
             let pulse = 0.6 + 0.4 * (t * 3.0).sin();
             for k in 0..4 {
                 let e = (4 - k) as f32 * 3.0;
-                paint.rect_stroke(btn.expand(e), egui::Rounding::same(12.0 + e), egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(BLUE_HI.r(), BLUE_HI.g(), BLUE_HI.b(), (40.0 * pulse) as u8)));
+                paint.rect_stroke(btn.expand(e), egui::Rounding::same(12.0 + e), egui::Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(BLUE_HI.r(), BLUE_HI.g(), BLUE_HI.b(), (40.0 * pulse) as u8)));
             }
-            paint.rect_stroke(btn.expand(3.0), egui::Rounding::same(15.0), egui::Stroke::new(2.5, Color32::from_rgba_unmultiplied(BLUE_HI.r(), BLUE_HI.g(), BLUE_HI.b(), (200.0 * pulse) as u8)));
+            paint.rect_stroke(btn.expand(3.0), egui::Rounding::same(15.0), egui::Stroke::new(2.5_f32, Color32::from_rgba_unmultiplied(BLUE_HI.r(), BLUE_HI.g(), BLUE_HI.b(), (200.0 * pulse) as u8)));
         }
         let btn_col = if installing { pal.panel2 } else if done && ok { Color32::from_rgb(0x2C, 0xA0, 0x4A) } else if failed { Color32::from_rgb(0xB0, 0x3A, 0x3A) } else if hovered { BLUE_HI } else { BLUE };
         paint.rect_filled(btn, egui::Rounding::same(12.0), btn_col);
@@ -570,7 +570,7 @@ impl ShopState {
         paint.text(egui::pos2(lx, btn.center().y), egui::Align2::CENTER_CENTER, &label, egui::FontId::proportional(20.0), Color32::WHITE);
         if done && ok {
             let cc = egui::pos2(lx - tw * 0.5 - 18.0, btn.center().y);
-            paint.add(egui::Shape::line(vec![cc + egui::Vec2::new(-6.0, 0.0), cc + egui::Vec2::new(-2.0, 5.0), cc + egui::Vec2::new(7.0, -6.0)], egui::Stroke::new(2.6, Color32::WHITE)));
+            paint.add(egui::Shape::line(vec![cc + egui::Vec2::new(-6.0, 0.0), cc + egui::Vec2::new(-2.0, 5.0), cc + egui::Vec2::new(7.0, -6.0)], egui::Stroke::new(2.6_f32, Color32::WHITE)));
         }
         if installing {
             let barr = egui::Rect::from_min_size(egui::pos2(btn.min.x, btn.max.y + 10.0), egui::Vec2::new(btn.width(), 7.0));
@@ -586,7 +586,7 @@ impl ShopState {
         // info card fills the right column under the button
         let info = egui::Rect::from_min_max(egui::pos2(btn.min.x, btn.max.y + 40.0), egui::pos2(content.max.x - 40.0, content.max.y - 60.0));
         paint.rect_filled(info, egui::Rounding::same(12.0), pal.panel);
-        paint.rect_stroke(info, egui::Rounding::same(12.0), egui::Stroke::new(1.0, pal.border));
+        paint.rect_stroke(info, egui::Rounding::same(12.0), egui::Stroke::new(1.0_f32, pal.border));
         let rows = [
             ("Developer", app.author.clone()),
             ("Version", app.version.clone()),
@@ -599,7 +599,7 @@ impl ShopState {
             paint.text(egui::pos2(info.min.x + 18.0, ry), egui::Align2::LEFT_CENTER, *k, egui::FontId::proportional(14.0), pal.muted);
             paint.text(egui::pos2(info.max.x - 18.0, ry), egui::Align2::RIGHT_CENTER, v, egui::FontId::proportional(14.0), pal.text);
             if ri + 1 < rows.len() {
-                paint.line_segment([egui::pos2(info.min.x + 14.0, ry + 20.0), egui::pos2(info.max.x - 14.0, ry + 20.0)], egui::Stroke::new(1.0, pal.panel2));
+                paint.line_segment([egui::pos2(info.min.x + 14.0, ry + 20.0), egui::pos2(info.max.x - 14.0, ry + 20.0)], egui::Stroke::new(1.0_f32, pal.panel2));
             }
         }
 
@@ -617,9 +617,9 @@ impl ShopState {
         dp.rect_filled(rect, egui::Rounding::same(10.0), pal.btn_fill);
         if selected {
             dp.rect_filled(rect, egui::Rounding::same(10.0), Color32::from_rgba_unmultiplied(self.accent.r(), self.accent.g(), self.accent.b(), 42));
-            dp.rect_stroke(rect, egui::Rounding::same(10.0), egui::Stroke::new(2.6, self.accent));
+            dp.rect_stroke(rect, egui::Rounding::same(10.0), egui::Stroke::new(2.6_f32, self.accent));
         } else {
-            dp.rect_stroke(rect, egui::Rounding::same(10.0), egui::Stroke::new(1.2, pal.border));
+            dp.rect_stroke(rect, egui::Rounding::same(10.0), egui::Stroke::new(1.2_f32, pal.border));
         }
         let col = if selected { tint_toward(self.accent, Color32::WHITE, 0.2) } else { pal.text };
         dp.text(rect.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(18.0 * pop), col);
@@ -650,7 +650,7 @@ impl ShopState {
                 let dlg = egui::Rect::from_center_size(screen.center(), egui::Vec2::new(w, h));
                 dp.rect_filled(dlg.translate(egui::Vec2::new(0.0, 10.0)), egui::Rounding::same(18.0), Color32::from_black_alpha(90));
                 dp.rect_filled(dlg, egui::Rounding::same(18.0), pal.panel);
-                dp.rect_stroke(dlg, egui::Rounding::same(18.0), egui::Stroke::new(1.5, pal.border));
+                dp.rect_stroke(dlg, egui::Rounding::same(18.0), egui::Stroke::new(1.5_f32, pal.border));
                 dp.text(egui::pos2(dlg.center().x, dlg.min.y + 40.0 * pop), egui::Align2::CENTER_CENTER, "Install this game?", egui::FontId::proportional(15.0 * pop), pal.muted);
                 dp.text(egui::pos2(dlg.center().x, dlg.center().y - 14.0 * pop), egui::Align2::CENTER_CENTER, &title, egui::FontId::proportional(19.0 * pop), pal.text);
                 let bw = w * 0.42;
@@ -693,7 +693,7 @@ impl ShopState {
                 let dlg = egui::Rect::from_center_size(screen.center(), egui::Vec2::new(w, h));
                 dp.rect_filled(dlg.translate(egui::Vec2::new(0.0, 10.0)), egui::Rounding::same(18.0), Color32::from_black_alpha(90));
                 dp.rect_filled(dlg, egui::Rounding::same(18.0), pal.panel);
-                dp.rect_stroke(dlg, egui::Rounding::same(18.0), egui::Stroke::new(1.5, pal.border));
+                dp.rect_stroke(dlg, egui::Rounding::same(18.0), egui::Stroke::new(1.5_f32, pal.border));
                 dp.text(egui::pos2(dlg.center().x, dlg.min.y + 40.0 * pop), egui::Align2::CENTER_CENTER, "Welcome to the Homebrew Shop", egui::FontId::proportional(21.0 * pop), pal.text);
                 let lines = [
                     "Games are provided by the Homebrew App Store (hb-app.store/switch).",
@@ -724,7 +724,7 @@ impl ShopState {
 fn hint_bar(paint: &egui::Painter, content: egui::Rect, pal: Pal, text: &str) {
     let bar = egui::Rect::from_min_max(egui::pos2(content.min.x, content.max.y - 40.0), content.max);
     paint.rect_filled(bar, egui::Rounding::ZERO, Color32::from_black_alpha(40));
-    paint.line_segment([bar.min, egui::pos2(bar.max.x, bar.min.y)], egui::Stroke::new(1.0, pal.border));
+    paint.line_segment([bar.min, egui::pos2(bar.max.x, bar.min.y)], egui::Stroke::new(1.0_f32, pal.border));
     paint.text(egui::pos2(content.max.x - 24.0, bar.center().y), egui::Align2::RIGHT_CENTER, text, egui::FontId::proportional(13.0), pal.muted);
 }
 

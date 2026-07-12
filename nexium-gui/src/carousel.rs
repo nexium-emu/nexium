@@ -586,7 +586,7 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
     for g in 0..6 {
         let e = (6 - g) as f32 * 5.0;
         let glow = sh(color, 0.5);
-        painter.circle_stroke(pc, pr + e, Stroke::new(4.5, Color32::from_rgba_unmultiplied(glow.r(), glow.g(), glow.b(), a(18.0 * (1.0 - g as f32 / 6.0)))));
+        painter.circle_stroke(pc, pr + e, Stroke::new(4.5_f32, Color32::from_rgba_unmultiplied(glow.r(), glow.g(), glow.b(), a(18.0 * (1.0 - g as f32 / 6.0)))));
     }
     painter.circle_filled(pc, pr, Color32::from_rgba_unmultiplied(ocean.r(), ocean.g(), ocean.b(), a(255.0)));
     // soft lit hemisphere (sun upper-left) — clipped inside the planet
@@ -726,9 +726,9 @@ pub fn draw_wave_background(
         let crest_pts: Vec<egui::Pos2> = (0..=steps).map(|s| mesh.vertices[2 * s].pos).collect();
         painter.add(egui::Shape::mesh(mesh));
         let outer_col = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), (band_alpha / 2).max(1));
-        painter.add(egui::Shape::line(crest_pts.clone(), Stroke::new(2.0, outer_col)));
+        painter.add(egui::Shape::line(crest_pts.clone(), Stroke::new(2.0_f32, outer_col)));
         let inner_col = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), band_alpha);
-        painter.add(egui::Shape::line(crest_pts, Stroke::new(1.0, inner_col)));
+        painter.add(egui::Shape::line(crest_pts, Stroke::new(1.0_f32, inner_col)));
     }
 }
 
@@ -1445,7 +1445,7 @@ pub fn carousel_view(
                 painter.rect_stroke(
                     pill_rect,
                     Rounding::same(pill_h * 0.5),
-                    Stroke::new(1.4, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(235.0))),
+                    Stroke::new(1.4_f32, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(235.0))),
                 );
                 let dot_c = egui::pos2(pill_rect.min.x + pad_x + dot_r, pill_rect.center().y);
                 painter.circle_filled(dot_c, dot_r * (0.85 + 0.15 * pulse), Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(255.0)));
@@ -1717,7 +1717,7 @@ pub fn carousel_view(
 
             let fill = Color32::from_rgba_premultiplied(col_surface.r(), col_surface.g(), col_surface.b(), (ui_opacity * 200.0) as u8);
             let br = base.width() * 0.5;
-            painter.circle(base.center(), br, fill, Stroke::new(1.0, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
+            painter.circle(base.center(), br, fill, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
             if !dockbar_simple {
                 let arc: Vec<egui::Pos2> = (0..=14)
                     .map(|k| {
@@ -1915,7 +1915,7 @@ pub fn carousel_view(
         }
 
         painter.rect_filled(panel, Rounding::same(20.0 * scale_factor), Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), a(240.0)));
-        painter.rect_stroke(panel, Rounding::same(20.0 * scale_factor), Stroke::new(1.0, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(255.0))));
+        painter.rect_stroke(panel, Rounding::same(20.0 * scale_factor), Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(255.0))));
 
         shadowed_text(&painter, egui::pos2(scaled_center.x, panel.min.y + 20.0 * scale_factor), egui::Align2::CENTER_CENTER, "Background Color", FontId::proportional(15.0 * scale_factor), Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), a(255.0)), true);
 
@@ -1961,7 +1961,7 @@ pub fn carousel_view(
             } else {
                 Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(160.0))
             };
-            painter.rect_stroke(r, rounding, Stroke::new(1.3, sw_stroke));
+            painter.rect_stroke(r, rounding, Stroke::new(1.3_f32, sw_stroke));
         }
 
         let cur = themes.get(state.palette_selected).copied().unwrap_or_default();
