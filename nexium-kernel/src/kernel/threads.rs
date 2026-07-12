@@ -239,11 +239,7 @@ impl Threads {
         }
     }
 
-    pub fn wake_one_on_mutex_owned(
-        &mut self,
-        mutex_addr: u64,
-        _owner_handle: u32,
-    ) -> Option<(u32, u32, bool)> {
+    pub fn peek_one_mutex_waiter(&self, mutex_addr: u64) -> Option<(u32, u32, bool)> {
         let h = self
             .threads
             .iter()
@@ -259,7 +255,17 @@ impl Threads {
             Some(ThreadState::WaitingMutex { tag, .. }) => *tag,
             _ => h,
         };
-        let mut has_more = false;
+        let has_more = self.threads.iter().any(|(other_h, t)| {
+            *other_h != h
+                && matches!(
+                    &t.state,
+                    ThreadState::WaitingMutex { mutex_addr: m, .. } if *m == mutex_addr
+                )
+        });
+        Some((h, tag, has_more))
+    }
+
+    pub fn commit_wake_mutex_waiter(&mut self, mutex_addr: u64, h: u32) {
         for (other_h, t) in self.threads.iter_mut() {
             if *other_h == h {
                 continue;
@@ -272,7 +278,6 @@ impl Threads {
             {
                 if *m == mutex_addr {
                     *o = h;
-                    has_more = true;
                 }
             }
         }
@@ -280,6 +285,15 @@ impl Threads {
             t.ctx.x[0] = nexium_common::result::SUCCESS as u64;
         }
         self.transition_state(h, ThreadState::Ready);
+    }
+
+    pub fn wake_one_on_mutex_owned(
+        &mut self,
+        mutex_addr: u64,
+        _owner_handle: u32,
+    ) -> Option<(u32, u32, bool)> {
+        let (h, tag, has_more) = self.peek_one_mutex_waiter(mutex_addr)?;
+        self.commit_wake_mutex_waiter(mutex_addr, h);
         Some((h, tag, has_more))
     }
 

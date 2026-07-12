@@ -51,6 +51,7 @@ pub struct Kernel {
     pub title_id: u64,
     pub total_memory: u64,
     pub heap_committed: u64,
+    pub system_resource_size: u64,
 
     pub cycle_count: u64,
     pub next_vsync_cycle: u64,
@@ -119,12 +120,17 @@ pub struct Kernel {
     pub time_shmem: Option<Vec<u8>>,
     pub time_shmem_handle: Option<u32>,
 
-    pub audio_out_buffers: HashMap<u32, VecDeque<(u64, std::time::Instant, u64)>>,
+    pub audio_out_buffers: HashMap<u32, VecDeque<(u64, std::time::Instant, u64, u64)>>,
     pub audio_buffer_events: HashMap<u32, u32>,
     pub audio_out_volumes: HashMap<u32, u32>,
     pub audio_out_state: HashMap<u32, u8>,
     pub audio_out_next_free: HashMap<u32, std::time::Instant>,
     pub audio_out_played_samples: HashMap<u32, u64>,
+    pub audio_out_spill: HashMap<u32, VecDeque<f32>>,
+    pub audio_out_released_count: HashMap<u32, u64>,
+    pub audio_out_due_signaled: HashMap<u32, u64>,
+    pub audio_out_consumed_base: HashMap<u32, u64>,
+    pub audio_out_appended_frames: HashMap<u32, u64>,
 
     pub audio_renderers: HashMap<(u32, u32), AudioRendererState>,
     pub audio_renderer_events: HashMap<(u32, u32), u32>,
@@ -204,6 +210,7 @@ impl Kernel {
             title_id: 0,
             total_memory: 0x8000_0000,
             heap_committed: 0,
+            system_resource_size: 0,
             cycle_count: 0,
             next_vsync_cycle: 16_666_667,
             last_sdl_capture: std::time::Instant::now(),
@@ -260,6 +267,11 @@ impl Kernel {
             audio_out_state: HashMap::new(),
             audio_out_next_free: HashMap::new(),
             audio_out_played_samples: HashMap::new(),
+            audio_out_spill: HashMap::new(),
+            audio_out_released_count: HashMap::new(),
+            audio_out_due_signaled: HashMap::new(),
+            audio_out_consumed_base: HashMap::new(),
+            audio_out_appended_frames: HashMap::new(),
             audio_renderers: HashMap::new(),
             audio_renderer_events: HashMap::new(),
             audio_renderer_frame_counter: 0,
@@ -704,12 +716,21 @@ impl Kernel {
             } else {
                 false
             };
+            log::debug!(
+                "cond_timeout: handle={:#x} mutex={:#x} cond={:#x} had_pending={} spurious={}",
+                h,
+                mutex_addr,
+                condvar_addr,
+                had_pending,
+                spurious_wake
+            );
             if !had_pending && !spurious_wake {
                 if let Some(t) = self.threads.threads.get_mut(&h) {
                     t.ctx.x[0] = nexium_common::result::KERNEL_TIMEOUT as u64;
                 }
-            }
-            if self.reacquire_condvar_mutex(h, mutex_addr, h) {
+                self.threads
+                    .transition_state(h, threads::ThreadState::Ready);
+            } else if self.reacquire_condvar_mutex(h, mutex_addr, h) {
                 self.threads
                     .transition_state(h, threads::ThreadState::Ready);
             } else {
@@ -737,29 +758,50 @@ impl Kernel {
     }
 
     pub fn reacquire_condvar_mutex(&mut self, handle: u32, mutex_addr: u64, tag: u32) -> bool {
-        let mut cur = [0u8; 4];
-        let cur_word = if self.address_space.read(mutex_addr, &mut cur).is_ok() {
-            u32::from_le_bytes(cur)
-        } else {
-            0
-        };
-        let holder = cur_word & !MUTEX_HAS_LISTENERS;
-        if holder == 0 || holder == handle {
-            let more = self.threads.has_mutex_waiters(mutex_addr);
-            let new_word = if more {
-                tag | MUTEX_HAS_LISTENERS
-            } else {
-                tag | (cur_word & MUTEX_HAS_LISTENERS)
+        loop {
+            let cur_word = match self.address_space.atomic_load_u32(mutex_addr) {
+                Ok(w) => w,
+                Err(_) => return false,
             };
-            let _ = self
-                .address_space
-                .write(mutex_addr, &new_word.to_le_bytes());
-            true
-        } else {
-            let _ = self
-                .address_space
-                .write(mutex_addr, &(cur_word | MUTEX_HAS_LISTENERS).to_le_bytes());
-            false
+            let holder = cur_word & !MUTEX_HAS_LISTENERS;
+            if holder == 0 || holder == handle {
+                let more = self.threads.has_mutex_waiters(mutex_addr);
+                let new_word = if more {
+                    tag | MUTEX_HAS_LISTENERS
+                } else {
+                    tag | (cur_word & MUTEX_HAS_LISTENERS)
+                };
+                match self
+                    .address_space
+                    .atomic_cas_u32(mutex_addr, cur_word, new_word)
+                {
+                    Ok(true) => {
+                        log::debug!(
+                            "cond_reacquire: handle={:#x} mutex={:#x} word {:#x}->{:#x}",
+                            handle,
+                            mutex_addr,
+                            cur_word,
+                            new_word
+                        );
+                        return true;
+                    }
+                    Ok(false) => continue,
+                    Err(_) => return false,
+                }
+            } else {
+                if cur_word & MUTEX_HAS_LISTENERS == 0 {
+                    match self.address_space.atomic_cas_u32(
+                        mutex_addr,
+                        cur_word,
+                        cur_word | MUTEX_HAS_LISTENERS,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_) => return false,
+                    }
+                }
+                return false;
+            }
         }
     }
 

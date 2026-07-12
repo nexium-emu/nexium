@@ -369,6 +369,16 @@ impl BootContext {
         kernel.is_application = true;
         kernel.title_id = app.title_id;
         kernel.total_memory = 0xCD50_0000;
+        kernel.system_resource_size = app.npdm.system_resource_size as u64;
+        log::info!(
+            "npdm system_resource_size={:#x} (VAMM {})",
+            kernel.system_resource_size,
+            if kernel.system_resource_size != 0 {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
 
         nexium_common::paths::init();
 

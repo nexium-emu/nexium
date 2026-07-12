@@ -232,7 +232,7 @@ fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, V
             ok(mode.to_le_bytes().to_vec())
         }
         6 => {
-            let mode: u8 = if crate::hid_state::is_docked() { 1 } else { 0 };
+            let mode: u32 = if crate::hid_state::is_docked() { 1 } else { 0 };
             ok(mode.to_le_bytes().to_vec())
         }
         7 => ok(0u8.to_le_bytes().to_vec()),

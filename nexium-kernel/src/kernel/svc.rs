@@ -375,7 +375,7 @@ fn synthesize_memory_info(kernel: &Kernel, address: u64) -> SynthMemInfo {
                 0x10
             } else if r.name.contains("data") || r.name.contains("bss") {
                 0x11
-            } else if r.name.starts_with("heap") {
+            } else if r.name.starts_with("heap") || r.name.starts_with("physmem") {
                 0x05
             } else if r.name.starts_with("stack") {
                 0x07
@@ -718,21 +718,9 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
             let mut last = cell.lock();
             if last.elapsed() >= AUDIO_PERIOD {
                 *last = std::time::Instant::now();
+                crate::services::audio_out::handlers::drain_audio_spill(kernel);
                 let now = std::time::Instant::now();
-                let sessions_with_pending: Vec<u32> = kernel
-                    .audio_out_buffers
-                    .iter()
-                    .filter_map(|(s, q)| match q.front() {
-                        Some(&(_, release_at, _)) if release_at <= now => Some(*s),
-                        _ => None,
-                    })
-                    .collect();
-                for sess in sessions_with_pending {
-                    if let Some(&ev) = kernel.audio_buffer_events.get(&sess) {
-                        kernel.event_signals.insert(ev, true);
-                        kernel.threads.signal_handle(ev);
-                    }
-                }
+                signal_due_audio_sessions(kernel, now);
             }
         }
 
@@ -770,21 +758,9 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
                 hid.tick(cur);
             }
         }
+        crate::services::audio_out::handlers::drain_audio_spill(kernel);
         let now_audio = std::time::Instant::now();
-        let sessions_with_pending: Vec<u32> = kernel
-            .audio_out_buffers
-            .iter()
-            .filter_map(|(s, q)| match q.front() {
-                Some(&(_, release_at, _)) if release_at <= now_audio => Some(*s),
-                _ => None,
-            })
-            .collect();
-        for sess in sessions_with_pending {
-            if let Some(&ev) = kernel.audio_buffer_events.get(&sess) {
-                kernel.event_signals.insert(ev, true);
-                kernel.threads.signal_handle(ev);
-            }
-        }
+        signal_due_audio_sessions(kernel, now_audio);
         if let Some(cpu) = cpu_mut() {
             cpu.set_register(0, SUCCESS as u64);
             cpu.set_register(1, i as u64);
@@ -907,6 +883,16 @@ fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
         return KERNEL_INVALID_HANDLE;
     }
 
+    let cur = kernel.threads.current_handle().unwrap_or(0);
+    if owner_handle == self_handle || cur != self_handle {
+        log::warn!(
+            "svcArbitrateLock SELF/MISMATCH park: mutex={:#x} owner={:#x} self={:#x} current={:#x}",
+            mutex_addr,
+            owner_handle,
+            self_handle,
+            cur
+        );
+    }
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
@@ -929,6 +915,53 @@ fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+fn release_mutex_word(kernel: &mut Kernel, mutex_addr: u64, caller: u32) -> (u32, u32, u32) {
+    loop {
+        let cur = match kernel.address_space.atomic_load_u32(mutex_addr) {
+            Ok(w) => w,
+            Err(_) => return (0, 0, 0),
+        };
+        let holder = cur & !MUTEX_HAS_LISTENERS;
+        if holder != 0 && holder != caller {
+            if kernel.threads.has_mutex_waiters(mutex_addr)
+                && cur & MUTEX_HAS_LISTENERS == 0
+            {
+                match kernel.address_space.atomic_cas_u32(
+                    mutex_addr,
+                    cur,
+                    cur | MUTEX_HAS_LISTENERS,
+                ) {
+                    Ok(true) => return (cur, cur | MUTEX_HAS_LISTENERS, 0),
+                    Ok(false) => continue,
+                    Err(_) => return (cur, cur, 0),
+                }
+            }
+            return (cur, cur, 0);
+        }
+        let peek = kernel.threads.peek_one_mutex_waiter(mutex_addr);
+        let new_word = match peek {
+            Some((_h, tag, more)) => {
+                if more {
+                    tag | MUTEX_HAS_LISTENERS
+                } else {
+                    tag
+                }
+            }
+            None => 0,
+        };
+        match kernel.address_space.atomic_cas_u32(mutex_addr, cur, new_word) {
+            Ok(true) => {
+                if let Some((h, _, _)) = peek {
+                    kernel.threads.commit_wake_mutex_waiter(mutex_addr, h);
+                }
+                return (cur, new_word, peek.map(|(h, _, _)| h).unwrap_or(0));
+            }
+            Ok(false) => continue,
+            Err(_) => return (cur, cur, 0),
+        }
+    }
+}
+
 fn svc_arbitrate_unlock(kernel: &mut Kernel) -> u32 {
     let mutex_addr = if let Some(cpu) = cpu_ref() {
         cpu.get_register(0)
@@ -936,31 +969,15 @@ fn svc_arbitrate_unlock(kernel: &mut Kernel) -> u32 {
         return 1;
     };
     let owner_handle = kernel.threads.current_handle().unwrap_or(0);
-    let woken = kernel
-        .threads
-        .wake_one_on_mutex_owned(mutex_addr, owner_handle);
-    let new_word = match woken {
-        Some((_h, tag, more)) => {
-            if more {
-                tag | MUTEX_HAS_LISTENERS
-            } else {
-                tag
-            }
-        }
-        None => 0,
-    };
-    let _ = kernel
-        .address_space
-        .write(mutex_addr, &new_word.to_le_bytes());
-    if let Some((h, _, _)) = woken {
-        log::debug!(
-            "svcArbitrateUnlock mutex={:#x} owner={:#x} handed to handle={:#x} (word={:#x})",
-            mutex_addr,
-            owner_handle,
-            h,
-            new_word
-        );
-    }
+    let (prev_word, new_word, handed) = release_mutex_word(kernel, mutex_addr, owner_handle);
+    log::debug!(
+        "svcArbitrateUnlock mutex={:#x} self={:#x} word {:#x}->{:#x} handed={:#x}",
+        mutex_addr,
+        owner_handle,
+        prev_word,
+        new_word,
+        handed
+    );
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
@@ -989,31 +1006,20 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
     );
 
     let owner_handle = kernel.threads.current_handle().unwrap_or(0);
-    let woken = kernel
-        .threads
-        .wake_one_on_mutex_owned(mutex_addr, owner_handle);
-    let new_word = match woken {
-        Some((_h, tag, more)) => {
-            if more {
-                tag | MUTEX_HAS_LISTENERS
-            } else {
-                tag
-            }
-        }
-        None => 0,
-    };
     let _ = kernel
         .address_space
-        .write(mutex_addr, &new_word.to_le_bytes());
-    if let Some((h, _, _)) = woken {
-        log::debug!(
-            "cond_wait release: mutex={:#x} owner={:#x} handed to handle={:#x} (word={:#x})",
-            mutex_addr,
-            owner_handle,
-            h,
-            new_word
-        );
-    }
+        .write(condvar_addr, &1u32.to_le_bytes());
+    let (prev_word, new_word, handed) = release_mutex_word(kernel, mutex_addr, owner_handle);
+    log::debug!(
+        "cond_wait: self={:#x} mutex={:#x} cond={:#x} word {:#x}->{:#x} handed={:#x} timeout={}",
+        self_handle,
+        mutex_addr,
+        condvar_addr,
+        prev_word,
+        new_word,
+        handed,
+        timeout_ns
+    );
 
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
@@ -1030,6 +1036,12 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
         false
     };
     if had_pending {
+        log::debug!(
+            "cond_wait pending-consume: self={:#x} mutex={:#x} cond={:#x}",
+            self_handle,
+            mutex_addr,
+            condvar_addr
+        );
         if kernel.reacquire_condvar_mutex(self_handle, mutex_addr, self_handle) {
             if let Some(cpu) = cpu_mut() {
                 cpu.set_register(0, SUCCESS as u64);
@@ -1096,51 +1108,68 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
 
     let max = if count <= 0 { i32::MAX } else { count };
     let mut woken = 0;
-    for _ in 0..max {
+    'outer: for _ in 0..max {
         let Some((handle, mutex_addr)) = kernel.threads.peek_one_condvar_waiter(condvar_addr)
         else {
             break;
         };
 
-        let mut cur = [0u8; 4];
-        let cur_word = if kernel.address_space.read(mutex_addr, &mut cur).is_ok() {
-            u32::from_le_bytes(cur)
-        } else {
-            0
-        };
-        let holder = cur_word & !MUTEX_HAS_LISTENERS;
-
-        if holder == 0 {
-            let new_word = if kernel.threads.has_mutex_waiters(mutex_addr) {
-                handle | MUTEX_HAS_LISTENERS
-            } else {
-                handle
+        loop {
+            let cur_word = match kernel.address_space.atomic_load_u32(mutex_addr) {
+                Ok(w) => w,
+                Err(_) => break 'outer,
             };
-            let _ = kernel
-                .address_space
-                .write(mutex_addr, &new_word.to_le_bytes());
-            kernel.threads.wake_condvar_to_ready(handle);
-            log::trace!(
-                "svcSignalProcessWideKey cond={:#x} → handle={:#x} mutex={:#x} (mutex was free, handed off)",
-                condvar_addr,
-                handle,
-                mutex_addr
-            );
-        } else {
-            let new_word = cur_word | MUTEX_HAS_LISTENERS;
-            let _ = kernel
-                .address_space
-                .write(mutex_addr, &new_word.to_le_bytes());
-            kernel
-                .threads
-                .wake_condvar_into_mutex_waiter(handle, mutex_addr, holder, handle);
-            log::trace!(
-                "svcSignalProcessWideKey cond={:#x} → handle={:#x} mutex={:#x} (held by {:#x}, requeued as WaitingMutex)",
-                condvar_addr,
-                handle,
-                mutex_addr,
-                holder
-            );
+            let holder = cur_word & !MUTEX_HAS_LISTENERS;
+
+            if holder == 0 {
+                let new_word = if kernel.threads.has_mutex_waiters(mutex_addr) {
+                    handle | MUTEX_HAS_LISTENERS
+                } else {
+                    handle
+                };
+                match kernel
+                    .address_space
+                    .atomic_cas_u32(mutex_addr, cur_word, new_word)
+                {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(_) => break 'outer,
+                }
+                kernel.threads.wake_condvar_to_ready(handle);
+                log::debug!(
+                    "cond_signal handoff: cond={:#x} handle={:#x} mutex={:#x} word {:#x}->{:#x}",
+                    condvar_addr,
+                    handle,
+                    mutex_addr,
+                    cur_word,
+                    new_word
+                );
+            } else {
+                let new_word = cur_word | MUTEX_HAS_LISTENERS;
+                if new_word != cur_word {
+                    match kernel
+                        .address_space
+                        .atomic_cas_u32(mutex_addr, cur_word, new_word)
+                    {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_) => break 'outer,
+                    }
+                }
+                kernel
+                    .threads
+                    .wake_condvar_into_mutex_waiter(handle, mutex_addr, holder, handle);
+                log::debug!(
+                    "cond_signal requeue: cond={:#x} handle={:#x} mutex={:#x} word {:#x}->{:#x} holder={:#x}",
+                    condvar_addr,
+                    handle,
+                    mutex_addr,
+                    cur_word,
+                    new_word,
+                    holder
+                );
+            }
+            break;
         }
         woken += 1;
     }
@@ -4083,6 +4112,14 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
             3 | 7 => {
+                const RESULT_BUFFER_COUNT_REACHED: u32 = 153 | (8 << 9);
+                let full = kernel
+                    .audio_out_buffers
+                    .get(&session_handle)
+                    .map_or(false, |q| q.len() >= 32);
+                if full {
+                    return build_ipc_response(ctx, RESULT_BUFFER_COUNT_REACHED, &[], &[]);
+                }
                 aout::append_audio_out_buffer(kernel, ctx, session_handle, in_u64);
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
@@ -6891,7 +6928,7 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         13 => kernel.aslr_size,
         14 => kernel.stack_base,
         15 => 0x4_000_000,
-        16 => 0,
+        16 => kernel.system_resource_size,
         17 => 0,
         18 => 0,
         19 => 0,
@@ -6933,13 +6970,117 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_map_physical_memory(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcMapPhysicalMemory");
+fn svc_map_physical_memory(kernel: &mut Kernel) -> u32 {
+    const KERNEL_OUT_OF_MEMORY: u32 = 1 | (104 << 9);
+    let (addr, size) = if let Some(cpu) = cpu_ref() {
+        (cpu.get_register(0), cpu.get_register(1))
+    } else {
+        return 1;
+    };
+
+    if size == 0 || (addr & 0xFFF) != 0 || (size & 0xFFF) != 0 {
+        log::warn!(
+            "svcMapPhysicalMemory: bad args addr={:#x} size={:#x}",
+            addr,
+            size
+        );
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(0, KERNEL_INVALID_ADDRESS as u64);
+        }
+        return KERNEL_INVALID_ADDRESS;
+    }
+
+    let end = addr + size;
+    let mut gaps: Vec<(u64, u64)> = Vec::new();
+    {
+        let mut cursor = addr;
+        for r in kernel.address_space.regions() {
+            let rb = r.base;
+            let re = r.base + r.size;
+            if re <= cursor {
+                continue;
+            }
+            if rb >= end {
+                break;
+            }
+            if rb > cursor {
+                gaps.push((cursor, rb));
+            }
+            cursor = cursor.max(re);
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            gaps.push((cursor, end));
+        }
+    }
+
+    for (gs, ge) in &gaps {
+        if let Err(e) =
+            kernel
+                .address_space
+                .map(*gs, ge - gs, nexium_memory::Perm::RW, "physmem")
+        {
+            log::error!(
+                "svcMapPhysicalMemory: map {:#x}..{:#x} failed: {:?}",
+                gs,
+                ge,
+                e
+            );
+            if let Some(cpu) = cpu_mut() {
+                cpu.set_register(0, KERNEL_OUT_OF_MEMORY as u64);
+            }
+            return KERNEL_OUT_OF_MEMORY;
+        }
+        if let Some(region) = kernel.address_space.host_region_at(*gs) {
+            if let Some(cpu) = cpu_mut() {
+                let plumb = unsafe {
+                    cpu.map_host(
+                        region.base,
+                        region.size,
+                        region.perm,
+                        region.host_ptr as *mut u8,
+                    )
+                };
+                if let Err(e) = plumb {
+                    log::warn!(
+                        "svcMapPhysicalMemory: dynarmic map_host {:#x} len={:#x} failed: {}",
+                        gs,
+                        ge - gs,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    log::info!(
+        "svcMapPhysicalMemory addr={:#x} size={:#x} → {} new region(s)",
+        addr,
+        size,
+        gaps.len()
+    );
+    if let Some(cpu) = cpu_mut() {
+        cpu.set_register(0, SUCCESS as u64);
+    }
     SUCCESS
 }
 
 fn svc_unmap_physical_memory(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcUnmapPhysicalMemory");
+    let (addr, size) = if let Some(cpu) = cpu_ref() {
+        (cpu.get_register(0), cpu.get_register(1))
+    } else {
+        return 1;
+    };
+    log::info!(
+        "svcUnmapPhysicalMemory addr={:#x} size={:#x} (kept mapped)",
+        addr,
+        size
+    );
+    if let Some(cpu) = cpu_mut() {
+        cpu.set_register(0, SUCCESS as u64);
+    }
     SUCCESS
 }
 
@@ -7923,6 +8064,30 @@ fn fs_trace_matches(path: &str) -> bool {
     }
     let hay = path.to_ascii_lowercase();
     filters.iter().any(|needle| hay.contains(needle))
+}
+
+fn signal_due_audio_sessions(kernel: &mut Kernel, now: std::time::Instant) {
+    use crate::services::audio_out::handlers as aout;
+    let sessions: Vec<(u32, u32)> = kernel
+        .audio_buffer_events
+        .iter()
+        .map(|(s, e)| (*s, *e))
+        .collect();
+    for (sess, ev) in sessions {
+        let due = aout::check_due_signal(kernel, sess, now);
+        if matches!(due, aout::DueSignal::None) {
+            continue;
+        }
+        let slot = kernel.event_signals.entry(ev).or_insert(false);
+        if *slot {
+            continue;
+        }
+        *slot = true;
+        kernel.threads.signal_handle(ev);
+        if matches!(due, aout::DueSignal::BufferDue) {
+            aout::mark_due_signaled(kernel, sess);
+        }
+    }
 }
 
 fn fs_trace_path(kind: &str, path: &str, detail: &str) {

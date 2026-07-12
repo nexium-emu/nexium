@@ -235,6 +235,38 @@ impl AddressSpace {
         Ok(())
     }
 
+    pub fn atomic_load_u32(&self, va: u64) -> Result<u32> {
+        if va & 3 != 0 {
+            let mut b = [0u8; 4];
+            self.read(va, &mut b)?;
+            return Ok(u32::from_le_bytes(b));
+        }
+        let (region, off) = self.locate(va, 4)?;
+        unsafe {
+            let p = region.buf.as_ptr().add(off) as *const std::sync::atomic::AtomicU32;
+            Ok((*p).load(Ordering::SeqCst))
+        }
+    }
+
+    pub fn atomic_cas_u32(&self, va: u64, current: u32, new: u32) -> Result<bool> {
+        if va & 3 != 0 {
+            let mut b = [0u8; 4];
+            self.read(va, &mut b)?;
+            if u32::from_le_bytes(b) != current {
+                return Ok(false);
+            }
+            self.write(va, &new.to_le_bytes())?;
+            return Ok(true);
+        }
+        let (region, off) = self.locate(va, 4)?;
+        unsafe {
+            let p = region.buf.as_ptr().add(off) as *const std::sync::atomic::AtomicU32;
+            Ok((*p)
+                .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok())
+        }
+    }
+
     pub fn read_pod<T: Pod>(&self, va: u64) -> Result<T> {
         let mut value = T::zeroed();
         let bytes: &mut [u8] = bytemuck::bytes_of_mut(&mut value);
