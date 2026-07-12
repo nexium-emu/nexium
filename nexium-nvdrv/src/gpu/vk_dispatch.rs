@@ -1350,6 +1350,21 @@ fn execute_one(
 
     let vs_prog = &maxwell.regs.shader_programs[1];
     let fs_prog = &maxwell.regs.shader_programs[5];
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            let progs = maxwell
+                .regs
+                .shader_programs
+                .iter()
+                .enumerate()
+                .map(|(i, p)| format!("[{}] en={} lo={:#x}", i, p.enabled, p.address_lo))
+                .collect::<Vec<_>>()
+                .join(" ");
+            log::info!("[progmap] {}", progs);
+        }
+    }
     let vs_active = vs_prog.enabled || vs_prog.address_lo != 0;
     let fs_active = fs_prog.enabled || fs_prog.address_lo != 0;
     if !vs_active || !fs_active {

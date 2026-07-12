@@ -87,7 +87,10 @@ struct CachedTexture {
     memory: vk::DeviceMemory,
     hash: u64,
     gen: u64,
+    verified: std::time::Instant,
 }
+
+const TEX_VERIFY_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Clone, Copy)]
 struct VolumeRtSlice {
@@ -2237,18 +2240,44 @@ impl Renderer {
                     device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
                 );
             }
+            let force_refresh_early = force_refresh_texture(tic.gpu_va);
             let cache_fresh = tex_gen_gating_enabled()
-                && !force_refresh_texture(tic.gpu_va)
+                && !force_refresh_early
                 && volume_slices.is_none()
                 && !identity_volume
                 && tex_cache.get(&key).map_or(false, |t| t.gen == cur_gen);
-            let raw = if cache_fresh {
+            let mut refresh_verified = false;
+            let sampled_fresh = !cache_fresh
+                && !force_refresh_early
+                && volume_slices.is_none()
+                && !identity_volume
+                && !key.volume
+                && tex_cache.get(&key).map_or(false, |t| {
+                    if t.gen != cur_gen {
+                        return false;
+                    }
+                    if t.verified.elapsed() < TEX_VERIFY_PERIOD {
+                        return true;
+                    }
+                    if hash_sampled_guest(&read_guest, tic.gpu_va, read_size) == Some(t.hash) {
+                        refresh_verified = true;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            if refresh_verified {
+                if let Some(t) = tex_cache.get_mut(&key) {
+                    t.verified = std::time::Instant::now();
+                }
+            }
+            let raw = if cache_fresh || sampled_fresh {
                 None
             } else {
                 read_guest(tic.gpu_va, read_size)
             };
             if raw.is_some() || volume_slices.is_some() || identity_volume {
-                let raw_hash = raw.as_ref().map(|raw| hash_src_prefix(raw));
+                let raw_hash = raw.as_ref().map(|raw| hash_sampled(raw));
                 let mut tex_hash = raw_hash.unwrap_or_else(|| texture_seed_hash(&key));
                 if let Some(slices) = volume_slices.as_ref() {
                     tex_hash = volume_rt_slice_hash(tex_hash, slices);
@@ -2343,6 +2372,10 @@ impl Renderer {
                             }
                         }
                         Err(e) => log::warn!("texture upload failed: {}", e),
+                    }
+                } else if raw.is_some() {
+                    if let Some(t) = tex_cache.get_mut(&key) {
+                        t.verified = std::time::Instant::now();
                     }
                 }
             }
@@ -3327,6 +3360,7 @@ impl Renderer {
         let mut dsets_batch: Vec<vk::DescriptorSet> = Vec::new();
         let mut alias_used: Vec<(RtKey, bool)> = Vec::new();
         let mut tex_raw_cache: HashMap<(u64, usize), Option<(u64, Vec<u8>)>> = HashMap::new();
+        let mut tex_sam_cache: HashMap<(u64, usize), Option<u64>> = HashMap::new();
         let mut pass_open = false;
         let mut pass_depth = false;
         let mut depth_needs_clear = depth_fresh;
@@ -3612,23 +3646,69 @@ impl Renderer {
                         device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
                     );
                 }
+                let force_refresh_early = force_refresh_texture(tic.gpu_va);
                 let cache_fresh = tex_gen_gating_enabled()
-                    && !force_refresh_texture(tic.gpu_va)
+                    && !force_refresh_early
                     && volume_slices.is_none()
                     && !identity_volume
                     && tex_cache.get(&key).map_or(false, |t| t.gen == cur_gen);
-                let (raw, raw_hash): (Option<&[u8]>, Option<u64>) = if cache_fresh {
+                let mut refresh_verified = false;
+                let sampled_fresh = !cache_fresh
+                    && !force_refresh_early
+                    && volume_slices.is_none()
+                    && !identity_volume
+                    && !key.volume
+                    && tex_cache.get(&key).map_or(false, |t| {
+                        if t.gen != cur_gen {
+                            texstat_event(5, 0);
+                            return false;
+                        }
+                        if t.verified.elapsed() < TEX_VERIFY_PERIOD {
+                            return true;
+                        }
+                        let sam = *tex_sam_cache
+                            .entry((tic.gpu_va, read_size))
+                            .or_insert_with(|| {
+                                hash_sampled_guest(&read_guest, tic.gpu_va, read_size)
+                            });
+                        match sam {
+                            None => {
+                                texstat_event(3, 0);
+                                false
+                            }
+                            Some(h) if h != t.hash => {
+                                texstat_event(4, 0);
+                                false
+                            }
+                            Some(_) => {
+                                refresh_verified = true;
+                                true
+                            }
+                        }
+                    });
+                if refresh_verified {
+                    if let Some(t) = tex_cache.get_mut(&key) {
+                        t.verified = std::time::Instant::now();
+                    }
+                }
+                let (raw, raw_hash): (Option<&[u8]>, Option<u64>) = if cache_fresh || sampled_fresh
+                {
+                    texstat_event(0, 0);
                     (None, None)
                 } else {
+                    let fresh_read = !tex_raw_cache.contains_key(&(tic.gpu_va, read_size));
                     let raw_entry = match tex_raw_cache.entry((tic.gpu_va, read_size)) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => {
                             entry.insert(read_guest(tic.gpu_va, read_size).map(|raw| {
-                                let tex_hash = hash_src_prefix(&raw);
+                                let tex_hash = hash_sampled(&raw);
                                 (tex_hash, raw)
                             }))
                         }
                     };
+                    if fresh_read {
+                        texstat_event(1, raw_entry.as_ref().map_or(0, |(_, r)| r.len()));
+                    }
                     (
                         raw_entry.as_ref().map(|(_, raw)| raw.as_slice()),
                         raw_entry.as_ref().map(|(tex_hash, _)| *tex_hash),
@@ -3685,6 +3765,7 @@ impl Renderer {
                         } else {
                             Vec::new()
                         };
+                        texstat_event(2, texels.len());
                         let dump_stats = std::env::var_os("NEXIUM_TEXDUMP")
                             .map(|v| v == "1")
                             .unwrap_or(false);
@@ -3791,6 +3872,10 @@ impl Renderer {
                                 }
                             }
                             Err(e) => log::warn!("texture upload failed: {}", e),
+                        }
+                    } else if raw_hash.is_some() {
+                        if let Some(t) = tex_cache.get_mut(&key) {
+                            t.verified = std::time::Instant::now();
                         }
                     }
                 }
@@ -8218,6 +8303,7 @@ fn create_texture_image(
             memory,
             hash,
             gen,
+            verified: std::time::Instant::now(),
         },
         stage.map(|stage| (stage.buffer, stage.memory)),
     ))
@@ -8557,6 +8643,127 @@ pub fn hash_spirv(spirv: &[u32]) -> u64 {
     h
 }
 
+fn texstat_event(kind: u8, bytes: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("NEXIUM_RENDER_PROFILE").is_some()) {
+        return;
+    }
+    static FRESH: AtomicU64 = AtomicU64::new(0);
+    static READS: AtomicU64 = AtomicU64::new(0);
+    static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+    static UPLOADS: AtomicU64 = AtomicU64::new(0);
+    static UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static SAM_NONE: AtomicU64 = AtomicU64::new(0);
+    static SAM_MISS: AtomicU64 = AtomicU64::new(0);
+    static GEN_MISS: AtomicU64 = AtomicU64::new(0);
+    match kind {
+        0 => {
+            FRESH.fetch_add(1, Ordering::Relaxed);
+        }
+        1 => {
+            READS.fetch_add(1, Ordering::Relaxed);
+            READ_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        2 => {
+            UPLOADS.fetch_add(1, Ordering::Relaxed);
+            UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        3 => {
+            SAM_NONE.fetch_add(1, Ordering::Relaxed);
+        }
+        4 => {
+            SAM_MISS.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            GEN_MISS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    static LAST: OnceLock<Mutex<(std::time::Instant, [u64; 8])>> = OnceLock::new();
+    let cell = LAST.get_or_init(|| Mutex::new((std::time::Instant::now(), [0; 8])));
+    let mut last = cell.lock().unwrap();
+    if last.0.elapsed() >= std::time::Duration::from_secs(1) {
+        let dt = last.0.elapsed().as_secs_f64();
+        let cur = [
+            FRESH.load(Ordering::Relaxed),
+            READS.load(Ordering::Relaxed),
+            READ_BYTES.load(Ordering::Relaxed),
+            UPLOADS.load(Ordering::Relaxed),
+            UPLOAD_BYTES.load(Ordering::Relaxed),
+            SAM_NONE.load(Ordering::Relaxed),
+            SAM_MISS.load(Ordering::Relaxed),
+            GEN_MISS.load(Ordering::Relaxed),
+        ];
+        let d: Vec<u64> = cur.iter().zip(last.1.iter()).map(|(c, p)| c - p).collect();
+        *last = (std::time::Instant::now(), cur);
+        log::warn!(
+            "[texstat] fresh/s={:.0} reads/s={:.0} read_mb/s={:.1} uploads/s={:.0} upload_mb/s={:.1} sam_none/s={:.0} sam_miss/s={:.0} gen_miss/s={:.0}",
+            d[0] as f64 / dt,
+            d[1] as f64 / dt,
+            d[2] as f64 / dt / 1e6,
+            d[3] as f64 / dt,
+            d[4] as f64 / dt / 1e6,
+            d[5] as f64 / dt,
+            d[6] as f64 / dt,
+            d[7] as f64 / dt
+        );
+    }
+}
+
+const TEX_SAMPLE_CHUNKS: usize = 64;
+const TEX_SAMPLE_CHUNK_LEN: usize = 1024;
+
+fn tex_sample_spans(len: usize) -> Vec<(usize, usize)> {
+    if len <= TEX_SAMPLE_CHUNKS * TEX_SAMPLE_CHUNK_LEN {
+        return vec![(0, len)];
+    }
+    (0..TEX_SAMPLE_CHUNKS)
+        .map(|i| {
+            (
+                i * (len - TEX_SAMPLE_CHUNK_LEN) / (TEX_SAMPLE_CHUNKS - 1),
+                TEX_SAMPLE_CHUNK_LEN,
+            )
+        })
+        .collect()
+}
+
+fn fnv_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn hash_sampled(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    h ^= bytes.len() as u64;
+    h = h.wrapping_mul(0x100000001b3);
+    for (off, len) in tex_sample_spans(bytes.len()) {
+        h = fnv_bytes(h, &bytes[off..off + len]);
+    }
+    h
+}
+
+fn hash_sampled_guest<F>(read_guest: &F, gpu_va: u64, len: usize) -> Option<u64>
+where
+    F: Fn(u64, usize) -> Option<Vec<u8>>,
+{
+    let mut h: u64 = 0xcbf29ce484222325;
+    h ^= len as u64;
+    h = h.wrapping_mul(0x100000001b3);
+    for (off, chunk_len) in tex_sample_spans(len) {
+        let chunk = read_guest(gpu_va + off as u64, chunk_len)?;
+        if chunk.len() != chunk_len {
+            return None;
+        }
+        h = fnv_bytes(h, &chunk);
+    }
+    Some(h)
+}
+
+#[allow(dead_code)]
 fn hash_src_prefix(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
 
