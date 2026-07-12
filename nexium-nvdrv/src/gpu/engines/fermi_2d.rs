@@ -4,10 +4,57 @@ use std::sync::{Arc, Mutex};
 
 pub const FERMI_2D_CLASS: u32 = 0x902D;
 
-const FMT_A8R8G8B8: u32 = 0xCF;
-const FMT_A8B8G8R8: u32 = 0xD5;
-const FMT_X8R8G8B8: u32 = 0xE6;
-const FMT_X8B8G8R8: u32 = 0xCB;
+const FMT_R32G32B32A32_FLOAT    : u32 = 0xC0;
+const FMT_R32G32B32A32_SINT     : u32 = 0xC1;
+const FMT_R32G32B32A32_UINT     : u32 = 0xC2;
+const FMT_R32G32B32X32_FLOAT    : u32 = 0xC3;
+const FMT_R32G32B32X32_SINT     : u32 = 0xC4;
+const FMT_R32G32B32X32_UINT     : u32 = 0xC5;
+const FMT_R16G16B16A16_UNORM    : u32 = 0xC6;
+const FMT_R16G16B16A16_SNORM    : u32 = 0xC7;
+const FMT_R16G16B16A16_SINT     : u32 = 0xC8;
+const FMT_R16G16B16A16_UINT     : u32 = 0xC9;
+const FMT_R16G16B16A16_FLOAT    : u32 = 0xCA;
+const FMT_R32G32_FLOAT          : u32 = 0xCB;
+const FMT_R32G32_SINT           : u32 = 0xCC;
+const FMT_R32G32_UINT           : u32 = 0xCD;
+const FMT_R16G16B16X16_FLOAT    : u32 = 0xCE;
+const FMT_A8R8G8B8_UNORM        : u32 = 0xCF;
+const FMT_A8R8G8B8_SRGB         : u32 = 0xD0;
+const FMT_A2B10G10R10_UNORM     : u32 = 0xD1;
+const FMT_A2B10G10R10_UINT      : u32 = 0xD2;
+const FMT_A8B8G8R8_UNORM        : u32 = 0xD5;
+const FMT_A8B8G8R8_SRGB         : u32 = 0xD6;
+const FMT_A8B8G8R8_SNORM        : u32 = 0xD7;
+const FMT_A8B8G8R8_SINT         : u32 = 0xD8;
+const FMT_A8B8G8R8_UINT         : u32 = 0xD9;
+const FMT_R16G16_UNORM          : u32 = 0xDA;
+const FMT_R16G16_SNORM          : u32 = 0xDB;
+const FMT_R16G16_SINT           : u32 = 0xDC;
+const FMT_R16G16_UINT           : u32 = 0xDD;
+const FMT_R16G16_FLOAT          : u32 = 0xDE;
+const FMT_A2R10G10B10_UNORM     : u32 = 0xDF;
+const FMT_B10G11R11_FLOAT       : u32 = 0xE0;
+const FMT_R32_SINT              : u32 = 0xE3;
+const FMT_R32_UINT              : u32 = 0xE4;
+const FMT_R32_FLOAT             : u32 = 0xE5;
+const FMT_X8R8G8B8_UNORM        : u32 = 0xE6;
+const FMT_X8R8G8B8_SRGB         : u32 = 0xE7;
+const FMT_R5G6B5_UNORM          : u32 = 0xE8;
+const FMT_A1R5G5B5_UNORM        : u32 = 0xE9;
+const FMT_R8G8_UNORM            : u32 = 0xEA;
+const FMT_R8G8_SNORM            : u32 = 0xEB;
+const FMT_R8G8_SINT             : u32 = 0xEC;
+const FMT_R8G8_UINT             : u32 = 0xED;
+const FMT_R16_UNORM             : u32 = 0xEE;
+const FMT_R16_SNORM             : u32 = 0xEF;
+const FMT_R16_SINT              : u32 = 0xF0;
+const FMT_R16_UINT              : u32 = 0xF1;
+const FMT_R16_FLOAT             : u32 = 0xF2;
+const FMT_R8_UNORM              : u32 = 0xF3;
+const FMT_R8_SNORM              : u32 = 0xF4;
+const FMT_R8_SINT               : u32 = 0xF5;
+const FMT_R8_UINT               : u32 = 0xF6;
 
 const DST_BASE: u32 = 0x80;
 const SRC_BASE: u32 = 0x9C;
@@ -227,7 +274,7 @@ impl Fermi2D {
             && self.dst.pitch >= self.dst.width * (bpp as u32)
             && matches!(
                 self.dst.format,
-                FMT_A8R8G8B8 | FMT_A8B8G8R8 | FMT_X8R8G8B8 | FMT_X8B8G8R8
+                FMT_A8R8G8B8_UNORM | FMT_A8B8G8R8_UNORM | FMT_X8R8G8B8_UNORM | FMT_R32G32_FLOAT
             );
         if framebuffer_like {
             self.try_publish_frame(dst_cpu, bpp, mem_read);
@@ -257,8 +304,8 @@ impl Fermi2D {
             }
         }
         let rgba = match self.dst.format {
-            FMT_A8B8G8R8 | FMT_X8B8G8R8 => pixels,
-            FMT_A8R8G8B8 | FMT_X8R8G8B8 => {
+            FMT_A2R10G10B10_UNORM => pixels,
+            FMT_R16_SNORM => {
                 let mut out = pixels;
                 for px in out.chunks_exact_mut(4) {
                     px.swap(0, 2);
