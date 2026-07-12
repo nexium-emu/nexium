@@ -507,6 +507,12 @@ fn drain_stereo_to_i16(
 }
 
 fn post_audio_events(new_consumed: u64) {
+    const CLK_MARK_FRAMES: u64 = 480_000;
+    static LAST_MARK: AtomicU64 = AtomicU64::new(0);
+    let mark = new_consumed / CLK_MARK_FRAMES;
+    if mark > 0 && LAST_MARK.swap(mark, Ordering::Relaxed) != mark {
+        log::info!("[aclk] consumed={} frames ({}x480k)", new_consumed, mark);
+    }
     const FRAMES_PER_AUDIO_FRAME: u64 = 240;
     static LAST_SIGNALED: AtomicU64 = AtomicU64::new(0);
     let last = LAST_SIGNALED.load(Ordering::Relaxed);
