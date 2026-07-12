@@ -716,6 +716,8 @@ impl EmulationHandle {
                 let mut stuck_pc: Option<u64> = None;
                 let mut stuck_count = 0u32;
                 let mut last_svc_cycle = 0u64;
+                let no_svc_exit = std::env::var("NEXIUM_NO_SVC_EXIT").is_ok();
+                let mut last_no_svc_warn = 0u64;
                 let mut no_svc_in_spin = 0u32;
                 let mut last_heartbeat = std::time::Instant::now();
                 let mut last_heartbeat_svc = 0u32;
@@ -736,6 +738,7 @@ impl EmulationHandle {
                 let mut loop_iter: u64 = 0;
                 let mut last_loop_log = std::time::Instant::now();
                 let mut last_halts: u64 = 0;
+                let mut preempt_count: u64 = 0;
                 loop {
                     loop_iter += 1;
                     let mut guard = boot_ctx.kernel.lock();
@@ -985,7 +988,7 @@ impl EmulationHandle {
                             }
                             last_map_gen0 = gen;
                         }
-                        let event = cpu.run(0);
+                        let event = cpu.run(cpu_slice);
                         let pc_after = cpu.get_pc();
                         let mut guard = boot_ctx.kernel.lock();
                         guard.threads.save_current_ctx(cpu);
@@ -1160,13 +1163,12 @@ impl EmulationHandle {
                             break;
                         }
 
-                        let in_libnx = pc_after >= 0x8000_0000_00 && pc_after < 0x8000_a0_0000;
                         let no_svc_progress =
-                            matches!(event, nexium_core::cpu::CpuEvent::Running) && in_libnx;
+                            matches!(event, nexium_core::cpu::CpuEvent::Running);
                         if matches!(event, nexium_core::cpu::CpuEvent::Svc(_)) {
                             no_svc_in_spin = 0;
                         }
-                        const SPIN_PREEMPT_THRESHOLD: u32 = 20;
+                        const SPIN_PREEMPT_THRESHOLD: u32 = 2;
                         if no_svc_progress {
                             no_svc_in_spin = no_svc_in_spin.saturating_add(1);
                         }
@@ -1187,7 +1189,10 @@ impl EmulationHandle {
                                     nexium_core::kernel::threads::ThreadState::Ready,
                                 );
                                 no_svc_in_spin = 0;
-                                log::info!("[preempt] halted in libnx pc={:#x}, yielded handle={:?}, ready_q={} total={}", pc_after, from, n_ready, n_threads);
+                                preempt_count += 1;
+                                if preempt_count % 512 == 1 {
+                                    log::info!("[preempt] #{} slice-expired pc={:#x}, yielded handle={:?}, ready_q={} total={}", preempt_count, pc_after, from, n_ready, n_threads);
+                                }
                             } else {
                                 stuck_log_counter += 1;
                                 if stuck_log_counter % 50 == 1 {
@@ -1374,8 +1379,18 @@ impl EmulationHandle {
                         }
 
                         if svc_count > 0 && (cycle_count - last_svc_cycle) > 500_000_000 {
-                            log::warn!("Program stuck without SVCs for 500M+ cycles at PC {:#x}. Likely waiting for events/interrupts that aren't implemented. Exiting.", pc_before);
-                            break;
+                            if no_svc_exit {
+                                log::warn!("Program stuck without SVCs for 500M+ cycles at PC {:#x}. Likely waiting for events/interrupts that aren't implemented. Exiting.", pc_before);
+                                break;
+                            }
+                            if cycle_count - last_no_svc_warn > 2_000_000_000 {
+                                last_no_svc_warn = cycle_count;
+                                log::warn!(
+                                    "[no-svc] {}M cycles without SVCs at PC {:#x} (continuing)",
+                                    (cycle_count - last_svc_cycle) / 1_000_000,
+                                    pc_before
+                                );
+                            }
                         }
 
                         let event_copy = event;
