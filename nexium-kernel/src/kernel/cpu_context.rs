@@ -14,11 +14,7 @@ impl CpuContext {
     }
 
     pub fn get_arg(&self, idx: usize) -> u64 {
-        if idx < 8 {
-            self.x_regs[idx]
-        } else {
-            0
-        }
+        self.x_regs[idx]
     }
 
     pub fn set_ret0(&mut self, val: u64) {

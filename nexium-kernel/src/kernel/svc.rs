@@ -1,5 +1,4 @@
 use super::{Kernel, MUTEX_HAS_LISTENERS};
-use crate::kernel::audio_lut::NX_SRC_LUT_UP;
 use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
 use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
@@ -3542,10 +3541,10 @@ fn dispatch_service_v2(
                             let mut read_idx: usize = 0;
                             for i in 0..TARGET_FRAMES {
                                 let p = ((frac_q15 >> 8) as usize & 127) * 4;
-                                let c0 = NX_SRC_LUT_UP[p];
-                                let c1 = NX_SRC_LUT_UP[p + 1];
-                                let c2 = NX_SRC_LUT_UP[p + 2];
-                                let c3 = NX_SRC_LUT_UP[p + 3];
+                                let c0 = 0.0f32.max(((p as f32 + 0.0f32) * (2.0f32 * std::f32::consts::PI / 4.0f32)).sin());
+                                let c1 = 0.0f32.max(((p as f32 + 1.0f32) * (2.0f32 * std::f32::consts::PI / 4.0f32)).sin());
+                                let c2 = 0.0f32.max(((p as f32 + 2.0f32) * (2.0f32 * std::f32::consts::PI / 4.0f32)).sin());
+                                let c3 = 0.0f32.max(((p as f32 + 3.0f32) * (2.0f32 * std::f32::consts::PI / 4.0f32)).sin());
                                 let bi = read_idx as isize;
                                 let ol = smp_l(bi - 1) * c0
                                     + smp_l(bi) * c1
