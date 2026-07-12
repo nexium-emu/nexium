@@ -81,18 +81,18 @@ pub enum BoolOp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HalfSwizzle {
-    H1_H0,
+    H1H0,
     F32,
-    H0_H0,
-    H1_H1,
+    H0H0,
+    H1H1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HalfMerge {
-    H1_H0,
+    H1H0,
     F32,
-    MRG_H0,
-    MRG_H1,
+    MrgH0,
+    MrgH1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

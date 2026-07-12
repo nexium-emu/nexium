@@ -69,6 +69,41 @@ impl Translator {
         self.reg_state.get(&r).copied().unwrap_or(Value::GprIn(r))
     }
 
+    fn trace_cbuf_word_offset(&self, v: &Value) -> Option<u32> {
+        self.trace_cbuf_word_offset_depth(v, 0)
+    }
+
+    fn trace_cbuf_word_offset_depth(&self, v: &Value, depth: u32) -> Option<u32> {
+        if depth > 8 {
+            return None;
+        }
+        match *v {
+            Value::Inst(id) => {
+                let inst = self
+                    .program
+                    .instructions
+                    .iter()
+                    .find(|i| i.result == Some(id))?;
+                match &inst.op {
+                    Op::Mov(inner) => self.trace_cbuf_word_offset_depth(inner, depth + 1),
+                    Op::LoadCbuf { byte_offset, .. } => Some(byte_offset / 4),
+                    Op::ILop { a, b, .. } => {
+                        let oa = self.trace_cbuf_word_offset_depth(a, depth + 1);
+                        let ob = self.trace_cbuf_word_offset_depth(b, depth + 1);
+                        match (oa, ob) {
+                            (Some(x), Some(y)) => Some(x.min(y)),
+                            (Some(x), None) => Some(x),
+                            (None, Some(y)) => Some(y),
+                            (None, None) => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub fn snapshot_reg_state(&self) -> HashMap<u8, Value> {
         self.reg_state.clone()
     }
@@ -167,19 +202,19 @@ impl Translator {
 
     fn half_swizzle(bits: u8) -> HalfSwizzle {
         match bits & 3 {
-            0 => HalfSwizzle::H1_H0,
+            0 => HalfSwizzle::H1H0,
             1 => HalfSwizzle::F32,
-            2 => HalfSwizzle::H0_H0,
-            _ => HalfSwizzle::H1_H1,
+            2 => HalfSwizzle::H0H0,
+            _ => HalfSwizzle::H1H1,
         }
     }
 
     fn half_merge(bits: u8) -> HalfMerge {
         match bits & 3 {
-            0 => HalfMerge::H1_H0,
+            0 => HalfMerge::H1H0,
             1 => HalfMerge::F32,
-            2 => HalfMerge::MRG_H0,
-            _ => HalfMerge::MRG_H1,
+            2 => HalfMerge::MrgH0,
+            _ => HalfMerge::MrgH1,
         }
     }
 
@@ -1092,7 +1127,7 @@ impl Translator {
                 raw,
                 Self::half_imm(raw),
                 Self::half_swizzle(half_swizzle_a(raw)),
-                HalfSwizzle::H1_H0,
+                HalfSwizzle::H1H0,
                 ((raw >> 44) & 1) != 0,
                 ((raw >> 43) & 1) != 0,
                 false,
@@ -1106,12 +1141,12 @@ impl Translator {
                 raw,
                 Value::ImmU32(imm32(raw)),
                 Self::half_swizzle(((raw >> 53) & 3) as u8),
-                HalfSwizzle::H1_H0,
+                HalfSwizzle::H1H0,
                 false,
                 ((raw >> 56) & 1) != 0,
                 false,
                 false,
-                HalfMerge::H1_H0,
+                HalfMerge::H1H0,
                 ((raw >> 52) & 1) != 0,
                 ((raw >> 55) & 1) != 0,
                 pred,
@@ -1152,7 +1187,7 @@ impl Translator {
                 raw,
                 Self::half_imm(raw),
                 Self::half_swizzle(half_swizzle_a(raw)),
-                HalfSwizzle::H1_H0,
+                HalfSwizzle::H1H0,
                 ((raw >> 44) & 1) != 0,
                 ((raw >> 43) & 1) != 0,
                 false,
@@ -1166,12 +1201,12 @@ impl Translator {
                 raw,
                 Value::ImmU32(imm32(raw)),
                 Self::half_swizzle(((raw >> 53) & 3) as u8),
-                HalfSwizzle::H1_H0,
+                HalfSwizzle::H1H0,
                 false,
                 false,
                 false,
                 false,
-                HalfMerge::H1_H0,
+                HalfMerge::H1H0,
                 ((raw >> 52) & 1) != 0,
                 Self::half_precision(half_precision(raw, 55)),
                 pred,
@@ -1229,7 +1264,7 @@ impl Translator {
                 raw,
                 Self::half_imm(raw),
                 Self::half_swizzle(half_swizzle_a(raw)),
-                HalfSwizzle::H1_H0,
+                HalfSwizzle::H1H0,
                 self.read_reg(reg_c(raw)),
                 Self::half_swizzle(((raw >> 53) & 3) as u8),
                 false,
@@ -1243,12 +1278,12 @@ impl Translator {
                 raw,
                 Value::ImmU32(imm32(raw)),
                 Self::half_swizzle(((raw >> 53) & 3) as u8),
-                HalfSwizzle::H1_H0,
+                HalfSwizzle::H1H0,
                 self.read_reg(reg_dest(raw)),
-                HalfSwizzle::H1_H0,
+                HalfSwizzle::H1H0,
                 false,
                 ((raw >> 52) & 1) != 0,
-                HalfMerge::H1_H0,
+                HalfMerge::H1H0,
                 false,
                 Self::half_precision(half_precision(raw, 55)),
                 pred,
@@ -1295,7 +1330,7 @@ impl Translator {
                 raw,
                 Self::half_imm(raw),
                 Self::half_swizzle(half_swizzle_a(raw)),
-                HalfSwizzle::H1_H0,
+                HalfSwizzle::H1H0,
                 ((raw >> 43) & 1) != 0,
                 ((raw >> 44) & 1) != 0,
                 false,
@@ -1534,6 +1569,47 @@ impl Translator {
                 }
             }
 
+            Opcode::TEX_b => {
+                let handle_reg = reg_b(raw);
+                let handle = self.read_reg(handle_reg);
+                let Some(tex_id) = self.trace_cbuf_word_offset(&handle) else {
+                    log::debug!("TEX_b handle not traceable to LDC raw={:#018x}", raw);
+                    self.program
+                        .emit_void(Op::Unimplemented { opcode: Opcode::TEX_b, raw });
+                    self.unimplemented_count += 1;
+                    return false;
+                };
+                let coord = reg_a(raw);
+                let tex_type = ((raw >> 28) & 0x7) as u32;
+                let u = self.read_reg(coord);
+                let v = self.read_reg(coord.wrapping_add(1));
+                let volume = if tex_type == 4 {
+                    Some(self.read_reg(coord.wrapping_add(2)))
+                } else {
+                    None
+                };
+                let mask = ((raw >> 31) & 0xF) as u8;
+                let mut dst = reg_dest(raw);
+                for component in 0..4u8 {
+                    if (mask >> component) & 1 == 0 {
+                        continue;
+                    }
+                    self.write_reg(
+                        dst,
+                        Op::SampleTex {
+                            tex_id,
+                            u,
+                            v,
+                            array: None,
+                            volume,
+                            component,
+                        },
+                        pred,
+                    );
+                    dst = dst.wrapping_add(1);
+                }
+            }
+
             Opcode::TLD4S => {
                 let dest_a = reg_dest(raw);
                 let dest_b = ((raw >> 28) & 0xFF) as u8;
@@ -1696,9 +1772,14 @@ impl Translator {
             }
 
             Opcode::EXIT => {
-                self.program.exit_reg_state = Some(self.reg_state.clone());
-                self.program.emit_void_pred(Op::Exit, pred);
-                self.finished = true;
+                let flow_test = (raw & 0x1F) as u32;
+                if flow_test == 0x1C {
+                    log::debug!("EXIT FCSM_TR treated as fall-through raw={:#018x}", raw);
+                } else {
+                    self.program.exit_reg_state = Some(self.reg_state.clone());
+                    self.program.emit_void_pred(Op::Exit, pred);
+                    self.finished = true;
+                }
             }
 
             Opcode::LDC => {
@@ -2035,6 +2116,28 @@ impl Translator {
             }
 
             Opcode::DEPBAR => {}
+
+            Opcode::S2R => {
+                let dest = reg_dest(raw);
+                let sr = ((raw >> 20) & 0xFF) as u32;
+                match sr {
+                    0 => {
+                        self.write_reg(dest, Op::Mov(Value::ImmU32(0)), pred);
+                    }
+                    30 | 31 => {
+                        self.write_reg(dest, Op::Mov(Value::ImmU32(0x3F80_0000)), pred);
+                    }
+                    _ => {
+                        log::debug!("S2R unhandled sr={} raw={:#018x}", sr, raw);
+                        self.program
+                            .emit_void(Op::Unimplemented { opcode: Opcode::S2R, raw });
+                        self.unimplemented_count += 1;
+                        return false;
+                    }
+                }
+            }
+
+            Opcode::VOTE_vtg => {}
 
             other => {
                 log::debug!(

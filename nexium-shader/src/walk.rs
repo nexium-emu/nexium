@@ -1,6 +1,6 @@
 use super::decode::{decode_one, Decoded};
 use super::opcodes::Opcode;
-use super::operand::{ldc_ref, texs_tex_id};
+use super::operand::{exit_never_taken, ldc_ref, texs_tex_id};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Instruction {
@@ -27,7 +27,7 @@ pub fn walk_instructions(code: &[u8]) -> Vec<Instruction> {
             let bytes: [u8; 8] = code[inst_off..inst_off + 8].try_into().unwrap();
             let insn = u64::from_le_bytes(bytes);
             if let Some(decoded) = decode_one(insn) {
-                let exit = matches!(decoded.opcode, Opcode::EXIT);
+                let exit = matches!(decoded.opcode, Opcode::EXIT) && !exit_never_taken(insn);
                 out.push(Instruction {
                     byte_offset: inst_off,
                     decoded,

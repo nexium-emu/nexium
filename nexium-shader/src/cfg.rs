@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use super::decode::decode_one;
 use super::ir::{Inst, Op, Predicate, Program, Value, ValueId};
 use super::opcodes::Opcode;
-use super::operand::{decoded_pred, RZ};
+use super::operand::{decoded_pred, exit_never_taken, RZ};
 use super::translate::Translator;
 
 pub type BlockId = u32;
@@ -263,7 +263,7 @@ fn discover_sync_targets(bytes: &[u8]) -> HashMap<usize, usize> {
                         }
                         break;
                     }
-                    Opcode::EXIT if decoded_pred(raw).is_none() => break,
+                    Opcode::EXIT if decoded_pred(raw).is_none() && !exit_never_taken(raw) => break,
                     _ => {}
                 }
             }
@@ -293,7 +293,7 @@ fn discover_leaders(bytes: &[u8], sync_targets: &HashMap<usize, usize>) -> BTree
             };
             let pred = decoded_pred(raw);
             match d.opcode {
-                Opcode::EXIT if pred.is_none() => break,
+                Opcode::EXIT if pred.is_none() && !exit_never_taken(raw) => break,
                 Opcode::BRA | Opcode::JMP => {
                     let target = bra_target(offset, raw);
                     if target < bytes.len() && leaders.insert(target) {
@@ -440,7 +440,7 @@ fn discover_topology(
             let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
             if let Some(d) = decode_one(raw) {
                 match d.opcode {
-                    Opcode::EXIT if decoded_pred(raw).is_none() => {
+                    Opcode::EXIT if decoded_pred(raw).is_none() && !exit_never_taken(raw) => {
                         branch = BranchKind::Exit;
                         terminator_offset = Some(offset);
                         break;

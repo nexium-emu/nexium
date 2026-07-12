@@ -1208,9 +1208,9 @@ impl Emitter {
         let raw = self.lower_value(value);
         match swizzle {
             HalfSwizzle::F32 => [raw, raw],
-            HalfSwizzle::H1_H0
-            | HalfSwizzle::H0_H0
-            | HalfSwizzle::H1_H1 => {
+            HalfSwizzle::H1H0
+            | HalfSwizzle::H0H0
+            | HalfSwizzle::H1H1 => {
                 let bits = self.as_u32(raw);
                 let vector = self
                     .b
@@ -1231,9 +1231,9 @@ impl Emitter {
                     .composite_extract(self.f32_t, None, vector, [1])
                     .unwrap();
                 match swizzle {
-                    HalfSwizzle::H1_H0 => [low, high],
-                    HalfSwizzle::H0_H0 => [low, low],
-                    HalfSwizzle::H1_H1 => [high, high],
+                    HalfSwizzle::H1H0 => [low, high],
+                    HalfSwizzle::H0H0 => [low, low],
+                    HalfSwizzle::H1H1 => [high, high],
                     HalfSwizzle::F32 => unreachable!(),
                 }
             }
@@ -1251,11 +1251,11 @@ impl Emitter {
             return self.round_half_pair(lhs, rhs)[0];
         }
         let vector = match merge {
-            HalfMerge::H1_H0 => self
+            HalfMerge::H1H0 => self
                 .b
                 .composite_construct(self.vec2_t, None, [lhs, rhs])
                 .unwrap(),
-            HalfMerge::MRG_H0 | HalfMerge::MRG_H1 => {
+            HalfMerge::MrgH0 | HalfMerge::MrgH1 => {
                 let old_raw = self.lower_value(old);
                 let old_bits = self.as_u32(old_raw);
                 let old_vector = self
@@ -1268,7 +1268,7 @@ impl Emitter {
                         [Operand::IdRef(old_bits)],
                     )
                     .unwrap();
-                let index = if matches!(merge, HalfMerge::MRG_H0) { 0 } else { 1 };
+                let index = if matches!(merge, HalfMerge::MrgH0) { 0 } else { 1 };
                 let value = if index == 0 { lhs } else { rhs };
                 self.b
                     .composite_insert(self.vec2_t, None, value, old_vector, [index])

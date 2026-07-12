@@ -76,6 +76,10 @@ pub const RZ: u8 = 0xFF;
 
 pub const PT: u8 = 7;
 
+pub fn exit_never_taken(insn: u64) -> bool {
+    (insn & 0x1F) == 0x1C
+}
+
 pub fn decoded_pred(insn: u64) -> Option<super::ir::Predicate> {
     let idx = pred_idx(insn);
     if idx == PT {
@@ -175,18 +179,8 @@ pub fn ldg_offset(insn: u64) -> i32 {
 }
 
 #[inline]
-pub fn ldg_e(insn: u64) -> bool {
-    bits(insn, 45, 45) != 0
-}
-
-#[inline]
 pub fn ldg_size(insn: u64) -> u32 {
     bits(insn, 48, 50) as u32
-}
-
-#[inline]
-pub fn stg_data_reg(insn: u64) -> u8 {
-    bits(insn, 0, 7) as u8
 }
 
 #[inline]

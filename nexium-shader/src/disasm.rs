@@ -38,7 +38,9 @@ pub fn disassemble(bytes: &[u8]) -> Vec<DisasmLine> {
         }
         let kind = match decode_one(raw) {
             Some(d) => {
-                if matches!(d.opcode, super::opcodes::Opcode::EXIT) {
+                if matches!(d.opcode, super::opcodes::Opcode::EXIT)
+                    && !super::operand::exit_never_taken(raw)
+                {
                     hit_exit = true;
                 }
                 DisasmKind::Insn(d)
