@@ -357,9 +357,10 @@ impl ShopState {
         let dialog_before = self.dialog.is_some();
         // suppress view input while a dialog is up (so A/nav go to the dialog)
         let view_a = a_edge && !dialog_before;
+        let (vnl, vnr, vnu, vnd) = if dialog_before { (false, false, false, false) } else { (nl, nr, nu, nd) };
         match detail_idx {
-            None => self.grid(ui, &paint, content, pal, accent, nl, nr, nu, nd, view_a),
-            Some(i) => self.detail(ui, &paint, content, pal, i, view_a, ui.input(|x| x.smooth_scroll_delta.y), nu, nd),
+            None => self.grid(ui, &paint, content, pal, accent, vnl, vnr, vnu, vnd, view_a),
+            Some(i) => self.detail(ui, &paint, content, pal, i, view_a, if dialog_before { 0.0 } else { ui.input(|x| x.smooth_scroll_delta.y) }, vnu, vnd),
         }
 
         // cross-view fade transition
@@ -615,6 +616,7 @@ impl ShopState {
     fn tmpl_btn(&self, dp: &egui::Painter, rect: egui::Rect, label: &str, selected: bool, pal: Pal, pop: f32) {
         dp.rect_filled(rect, egui::Rounding::same(10.0), pal.btn_fill);
         if selected {
+            dp.rect_filled(rect, egui::Rounding::same(10.0), Color32::from_rgba_unmultiplied(self.accent.r(), self.accent.g(), self.accent.b(), 42));
             dp.rect_stroke(rect, egui::Rounding::same(10.0), egui::Stroke::new(2.6, self.accent));
         } else {
             dp.rect_stroke(rect, egui::Rounding::same(10.0), egui::Stroke::new(1.2, pal.border));

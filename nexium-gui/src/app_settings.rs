@@ -96,8 +96,7 @@ impl Default for BackdropTheme {
 
 impl BackdropTheme {
     pub fn all() -> &'static [BackdropTheme] {
-        // Space is hidden from the picker while it's a work in progress.
-        &[BackdropTheme::Waves, BackdropTheme::Gradient, BackdropTheme::None]
+        &[BackdropTheme::Waves, BackdropTheme::Gradient, BackdropTheme::Space, BackdropTheme::None]
     }
     pub fn label(&self) -> &'static str {
         match self {
@@ -314,9 +313,53 @@ pub struct AppSettings {
     #[serde(default)]
     pub carousel_lists: Vec<GameList>,
     #[serde(default)]
+    pub carousel_order: Vec<CarouselRef>,
+    #[serde(default)]
     pub music_muted: bool,
     #[serde(default)]
     pub sfx_muted: bool,
+    #[serde(default)]
+    pub dockbar_theme: DockbarTheme,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DockbarTheme {
+    Metallic,
+    Simple,
+}
+
+impl Default for DockbarTheme {
+    fn default() -> Self {
+        DockbarTheme::Metallic
+    }
+}
+
+impl DockbarTheme {
+    pub fn all() -> &'static [DockbarTheme] {
+        &[DockbarTheme::Metallic, DockbarTheme::Simple]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            DockbarTheme::Metallic => "Metallic",
+            DockbarTheme::Simple => "Simple",
+        }
+    }
+    pub fn next(&self) -> DockbarTheme {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + 1) % all.len()]
+    }
+    pub fn prev(&self) -> DockbarTheme {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + all.len() - 1) % all.len()]
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CarouselRef {
+    Game(PathBuf),
+    List(String),
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -324,6 +367,44 @@ pub struct GameList {
     pub name: String,
     /// Game paths — duplicates are allowed here (lists are exempt from the no-dupe rule).
     pub games: Vec<PathBuf>,
+    #[serde(default)]
+    pub align: ListAlignment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListAlignment {
+    Manual,
+    Alphabetical,
+    ReverseAlphabetical,
+}
+
+impl Default for ListAlignment {
+    fn default() -> Self {
+        ListAlignment::Manual
+    }
+}
+
+impl ListAlignment {
+    pub fn all() -> &'static [ListAlignment] {
+        &[ListAlignment::Manual, ListAlignment::Alphabetical, ListAlignment::ReverseAlphabetical]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            ListAlignment::Manual => "Manual",
+            ListAlignment::Alphabetical => "A-Z",
+            ListAlignment::ReverseAlphabetical => "Z-A",
+        }
+    }
+    pub fn next(&self) -> ListAlignment {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + 1) % all.len()]
+    }
+    pub fn prev(&self) -> ListAlignment {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + all.len() - 1) % all.len()]
+    }
 }
 
 fn default_profile_name() -> String {
@@ -361,8 +442,10 @@ impl Default for AppSettings {
             steamgriddb_key: String::new(),
             eu_dates: false,
             carousel_lists: Vec::new(),
+            carousel_order: Vec::new(),
             music_muted: false,
             sfx_muted: false,
+            dockbar_theme: DockbarTheme::default(),
         }
     }
 }

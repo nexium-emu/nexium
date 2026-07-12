@@ -52,13 +52,15 @@ pub struct CarouselState {
     pub game_menu_sel: usize,
     pub game_menu_anim: f32,
     pub dl_dialog: bool,
+    pub active_list: Option<usize>,
+    pub list_anim: f32,
 }
 
 impl CarouselState {
     pub fn new() -> Self {
         Self {
-            selected: 0,
-            scroll_offset: 0.0,
+            selected: CS_FRONT,
+            scroll_offset: CS_FRONT as f32,
             hover_scale: 1.0,
             ambient_color: Color32::from_rgb(0x2F, 0xB4, 0xEF),
             active_dock: false,
@@ -92,6 +94,8 @@ impl CarouselState {
             game_menu_sel: 0,
             game_menu_anim: 0.0,
             dl_dialog: false,
+            active_list: None,
+            list_anim: 0.0,
         }
     }
 }
@@ -120,7 +124,7 @@ const DOCK_COUNT: usize = 10;
 
 /// Number of special cards before the games (the Carousel Settings cog).
 /// Set to 0 to hide it (WIP), 1 to show it.
-pub const CS_FRONT: usize = 0;
+pub const CS_FRONT: usize = 1;
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
@@ -128,33 +132,6 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
-fn soft_vband(painter: &egui::Painter, x0: f32, x1: f32, ya: f32, yb: f32, yc: f32, color: Color32, peak: u8) {
-    if x1 <= x0 || peak == 0 {
-        return;
-    }
-    let inset = (x1 - x0) * 0.12;
-    let xl = x0 + inset;
-    let xr = x1 - inset;
-    let a0 = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0);
-    let ap = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), peak);
-    let v = |x: f32, y: f32, c: Color32| egui::epaint::Vertex { pos: egui::pos2(x, y), uv: egui::pos2(0.0, 0.0), color: c };
-    let mut mesh = egui::epaint::Mesh::default();
-    let xs = [x0, xl, xr, x1];
-    let ys = [ya, yb, yc];
-    for (ri, &y) in ys.iter().enumerate() {
-        for (ci, &x) in xs.iter().enumerate() {
-            let on = ri == 1 && ci >= 1 && ci <= 2;
-            mesh.vertices.push(v(x, y, if on { ap } else { a0 }));
-        }
-    }
-    for r in 0..2u32 {
-        for c in 0..3u32 {
-            let i = r * 4 + c;
-            mesh.indices.extend_from_slice(&[i, i + 1, i + 5, i, i + 5, i + 4]);
-        }
-    }
-    painter.add(egui::Shape::mesh(mesh));
-}
 
 fn network_kind() -> u8 {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -775,6 +752,9 @@ pub fn carousel_view(
     light_mode: bool,
     favorites: &[std::path::PathBuf],
     eu_dates: bool,
+    dockbar_theme: crate::app_settings::DockbarTheme,
+    carousel_order: &[crate::app_settings::CarouselRef],
+    lists: &[crate::app_settings::GameList],
     icon_reveal: Option<(usize, f32, Option<egui::TextureHandle>)>,
 ) -> CarouselAction {
     let mut action = CarouselAction::None;
@@ -788,27 +768,68 @@ pub fn carousel_view(
             .filter(|&idx| lib.games[idx].title.to_lowercase().contains(&q))
             .collect()
     };
+    let order_rank: std::collections::HashMap<&std::path::PathBuf, usize> = carousel_order
+        .iter()
+        .filter_map(|e| match e { crate::app_settings::CarouselRef::Game(p) => Some(p), _ => None })
+        .enumerate()
+        .map(|(i, p)| (p, i))
+        .collect();
+    filtered_indices.sort_by_key(|&idx| order_rank.get(&lib.games[idx].path).copied().unwrap_or(usize::MAX));
     filtered_indices.sort_by(|&a, &b| {
         let fa = favorites.iter().any(|p| *p == lib.games[a].path);
         let fb = favorites.iter().any(|p| *p == lib.games[b].path);
         fb.cmp(&fa)
     });
 
-    if let Some(lib_idx) = state.pending_center.take() {
-        if let Some(pos) = filtered_indices.iter().position(|&x| x == lib_idx) {
-            state.selected = pos + CS_FRONT;
-            state.scroll_offset = (pos + CS_FRONT) as f32;
+    let in_list = state.active_list.filter(|&li| li < lists.len());
+    let list_games: Vec<usize> = if let Some(li) = in_list {
+        lists[li].games.iter().filter_map(|pth| lib.games.iter().position(|g| &g.path == pth)).collect()
+    } else {
+        Vec::new()
+    };
+
+    let list_order: Vec<usize> = if in_list.is_none() && state.search_buf.is_empty() {
+        let mut ord: Vec<usize> = Vec::new();
+        for e in carousel_order {
+            if let crate::app_settings::CarouselRef::List(nm) = e {
+                if let Some(li) = lists.iter().position(|l| &l.name == nm) {
+                    if !ord.contains(&li) { ord.push(li); }
+                }
+            }
+        }
+        for li in 0..lists.len() {
+            if !ord.contains(&li) { ord.push(li); }
+        }
+        ord
+    } else {
+        Vec::new()
+    };
+    let n_lists = list_order.len();
+    let front = CS_FRONT;
+
+    if in_list.is_none() {
+        if let Some(lib_idx) = state.pending_center.take() {
+            if let Some(pos) = filtered_indices.iter().position(|&x| x == lib_idx) {
+                state.selected = pos + front + n_lists;
+                state.scroll_offset = (pos + front + n_lists) as f32;
+            }
         }
     }
 
-    // Card layout: [0..CS_FRONT) = Carousel Settings cog (hidden while WIP),
-    // then games, then Add Dir. CS_FRONT=0 hides the cog; set to 1 to re-enable.
-    let n_games = filtered_indices.len();
-    let front = CS_FRONT;
-    let n_items = n_games + 1 + front;
+    let games_base = if in_list.is_some() { front } else { front + n_lists };
+    let n_games = if in_list.is_some() { list_games.len() } else { filtered_indices.len() };
+    let n_items = if in_list.is_some() { front + list_games.len() } else { games_base + n_games + 1 };
+    let game_src = if in_list.is_some() { &list_games } else { &filtered_indices };
     let game_of = |i: usize| -> Option<usize> {
-        if i >= front && i < front + n_games {
-            filtered_indices.get(i - front).copied()
+        if i >= games_base && i < games_base + n_games {
+            game_src.get(i - games_base).copied()
+        } else {
+            None
+        }
+    };
+    let list_of = |i: usize| -> Option<usize> {
+        if in_list.is_none() && i >= front && i < front + n_lists {
+            list_order.get(i - front).copied()
         } else {
             None
         }
@@ -817,6 +838,7 @@ pub fn carousel_view(
     let bg_rect = ui.max_rect();
     let t = ui.input(|i| i.time) as f32;
     let dt = ui.input(|i| i.stable_dt).min(0.1);
+    state.list_anim += ((if in_list.is_some() { 1.0 } else { 0.0 }) - state.list_anim) * (dt * 8.0).min(1.0);
 
     // Space is always a dark sky, so keep the UI bright on it (no black-on-black).
     let space_bg = backdrop_theme == crate::app_settings::BackdropTheme::Space;
@@ -1011,6 +1033,7 @@ pub fn carousel_view(
 
     let mut want_fav: Option<String> = None;
     let mut want_download: Option<String> = None;
+    let mut want_close = false;
     let mut fav_first: Option<egui::Rect> = None;
     let mut lib_first: Option<egui::Rect> = None;
     // Show as many cards as fit the window so wide/stretched displays fill out.
@@ -1095,6 +1118,15 @@ pub fn carousel_view(
 
         alpha_f *= alpha_factor;
 
+        if in_list.is_some() && state.list_anim < 0.999 {
+            let pop = (state.list_anim * (n_items as f32 + 1.5) - i as f32).clamp(0.0, 1.0);
+            let e = pop * pop * (3.0 - 2.0 * pop);
+            alpha_f *= e;
+            draw_sz *= 0.5 + 0.5 * e;
+            draw_cx += (1.0 - e) * hero_size * 0.22;
+            draw_cy += (1.0 - e) * hero_size * 0.12;
+        }
+
         if alpha_f <= 0.001 { continue; }
 
         let card_scale_hover = if is_hero && state.boot_stage == BootStage::None {
@@ -1127,16 +1159,28 @@ pub fn carousel_view(
             }
         }
 
-        let is_settings = front > 0 && i == 0;
-        let is_add_dir = i == n_items - 1;
+        let is_exit_list = in_list.is_some() && i == 0;
+        let is_settings = in_list.is_none() && front > 0 && i == 0;
+        let is_add_dir = in_list.is_none() && i == n_items - 1;
         let card_game = game_of(i);
         let resp = ui.interact(draw_rect, egui::Id::new(("carousel_card", i)), Sense::click());
         if interactive && resp.clicked() && !state.drag_moved && state.boot_stage == BootStage::None {
             if state.selected == i {
                 if state.active_dock {
                     state.active_dock = false;
+                } else if is_exit_list {
+                    state.active_list = None;
+                    state.selected = CS_FRONT;
+                    state.scroll_offset = CS_FRONT as f32;
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Back);
                 } else if is_settings {
                     action = CarouselAction::OpenCarouselSettings;
+                } else if let Some(li) = list_of(i) {
+                    state.active_list = Some(li);
+                    state.selected = 1;
+                    state.scroll_offset = 1.0;
+                    state.list_anim = 0.0;
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Open);
                 } else if is_add_dir {
                     action = CarouselAction::AddFolder;
                 } else if let Some(gi) = card_game {
@@ -1162,7 +1206,12 @@ pub fn carousel_view(
             let gi = card_game.unwrap();
             let path_string = lib.games[gi].path.to_string_lossy().to_string();
             let favd = favorites.iter().any(|p| *p == lib.games[gi].path);
+            let is_playing_card = playing == Some(gi);
             resp.context_menu(|ui| {
+                if is_playing_card && ui.button("⏹  Close Game").clicked() {
+                    want_close = true;
+                    ui.close_menu();
+                }
                 let label = if favd { "★  Unfavorite Game" } else { "☆  Favorite Game" };
                 if ui.button(label).clicked() {
                     want_fav = Some(path_string.clone());
@@ -1176,7 +1225,19 @@ pub fn carousel_view(
         }
 
         let tint = Color32::from_white_alpha((alpha_f * 255.0) as u8);
-        if is_settings {
+        if is_exit_list {
+            let a8 = (alpha_f * 255.0) as u8;
+            let bg = Color32::from_rgb(0xC0, 0x39, 0x3B);
+            painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8));
+            let top = egui::Rect::from_min_max(draw_rect.min, egui::pos2(draw_rect.max.x, draw_rect.center().y));
+            painter.rect_filled(top, Rounding { nw: 14.0 * scale_factor, ne: 14.0 * scale_factor, sw: 0.0, se: 0.0 }, Color32::from_white_alpha((alpha_f * 22.0) as u8));
+            let ctr = draw_rect.center();
+            let r = draw_rect.width() * 0.22;
+            let white = Color32::from_white_alpha(a8);
+            let w = draw_rect.width() * 0.052;
+            painter.line_segment([ctr + Vec2::new(-r, -r), ctr + Vec2::new(r, r)], Stroke::new(w, white));
+            painter.line_segment([ctr + Vec2::new(r, -r), ctr + Vec2::new(-r, r)], Stroke::new(w, white));
+        } else if is_settings {
             let a8 = (alpha_f * 255.0) as u8;
             // app-icon backdrop (indigo, with a soft top gloss)
             let bg = Color32::from_rgb(0x53, 0x5E, 0xC8);
@@ -1208,6 +1269,18 @@ pub fn carousel_view(
             }
             painter.circle_filled(ctr, body, white);
             painter.circle_filled(ctr, body * 0.42, Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8));
+        } else if let Some(li) = list_of(i) {
+            let a8 = (alpha_f * 255.0) as u8;
+            let base = tl(Color32::from_rgb(0x14, 0x14, 0x1A), Color32::from_rgb(0xE6, 0xE6, 0xEC));
+            painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a8));
+            let acc = state.ambient_color;
+            painter.rect_filled(draw_rect.shrink(3.0 * scale_factor), Rounding::same(12.0 * scale_factor), Color32::from_rgba_unmultiplied(acc.r(), acc.g(), acc.b(), (alpha_f * 235.0) as u8));
+            let list = &lists[li];
+            painter.text(draw_rect.center() - Vec2::new(0.0, draw_rect.height() * 0.06), egui::Align2::CENTER_CENTER, &list.name, FontId::proportional(final_sz * 0.11), Color32::from_white_alpha(a8));
+            painter.text(draw_rect.center() + Vec2::new(0.0, draw_rect.height() * 0.10), egui::Align2::CENTER_CENTER, &format!("{} games", list.games.len()), FontId::proportional(final_sz * 0.075), Color32::from_white_alpha((alpha_f * 210.0) as u8));
+            if !is_hero {
+                painter.rect_stroke(draw_rect, Rounding::same(14.0 * scale_factor), Stroke::new(1.5 * scale_factor, Color32::from_rgba_unmultiplied(0x50, 0x50, 0x60, (alpha_f * 170.0) as u8)));
+            }
         } else if is_add_dir {
             painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(col_surface.r(), col_surface.g(), col_surface.b(), (alpha_f * 255.0) as u8));
             painter.rect_stroke(draw_rect, Rounding::same(14.0 * scale_factor), Stroke::new(1.0 * scale_factor, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (alpha_f * 255.0) as u8)));
@@ -1419,7 +1492,7 @@ pub fn carousel_view(
         }
         shadowed_text(painter, egui::pos2(x, hy), egui::Align2::LEFT_CENTER, label, FontId::proportional(fs), col, true);
     };
-    if state.boot_stage == BootStage::None {
+    if state.boot_stage == BootStage::None && in_list.is_none() {
         if let Some(r) = fav_first {
             draw_section(&painter, r, true, "Favorites");
         }
@@ -1443,6 +1516,9 @@ pub fn carousel_view(
         );
     }
 
+    if want_close {
+        action = CarouselAction::StopEmulation;
+    }
     if let Some(p) = want_fav {
         action = CarouselAction::ToggleFavorite(p);
     }
@@ -1469,8 +1545,13 @@ pub fn carousel_view(
 
     let launch_path = game_of(state.selected).map(|gi| lib.games[gi].path.to_string_lossy().to_string());
 
-    let (sel_title, sel_sub) = if CS_FRONT > 0 && state.selected == 0 {
-        ("Carousel Settings".to_string(), "Customize how your carousel looks and behaves".to_string())
+    let (sel_title, sel_sub) = if in_list.is_some() && state.selected == 0 {
+        let li = in_list.unwrap();
+        ("Exit List".to_string(), format!("Back to the main carousel  ·  {}", lists[li].name))
+    } else if CS_FRONT > 0 && state.selected == 0 {
+        ("Carousel Settings".to_string(), "Create Lists, & build your Carousel how you see fit.".to_string())
+    } else if let Some(li) = list_of(state.selected) {
+        (lists[li].name.clone(), format!("List  ·  {} games  ·  Press A to open", lists[li].games.len()))
     } else if let Some(gi) = game_of(state.selected) {
         let selected_game = &lib.games[gi];
         let title = selected_game.title.clone();
@@ -1525,24 +1606,58 @@ pub fn carousel_view(
         scaled_dock_center,
         Vec2::new(scaled_dock_total + 44.0 * scale_factor, scaled_item_size + 22.0 * scale_factor),
     );
+    let dockbar_simple = dockbar_theme == crate::app_settings::DockbarTheme::Simple;
     let dock_bg_alpha = (ui_opacity * if th > 0.5 { 236.0 } else { 200.0 }) as u8;
     if dock_bg_alpha > 0 {
         let round = 32.0 * scale_factor;
-        for k in 0..9 {
-            let e = (k as f32 + 1.0) * 1.7 * scale_factor;
-            let fade = 1.0 - k as f32 / 9.0;
-            let a = (ui_opacity * if th > 0.5 { 15.0 } else { 11.0 } * fade) as u8;
-            if a == 0 {
-                continue;
+        if !dockbar_simple {
+            for k in 0..9 {
+                let e = (k as f32 + 1.0) * 1.7 * scale_factor;
+                let fade = 1.0 - k as f32 / 9.0;
+                let a = (ui_opacity * if th > 0.5 { 15.0 } else { 11.0 } * fade) as u8;
+                if a == 0 {
+                    continue;
+                }
+                painter.rect_filled(dock_bg.expand(e).translate(Vec2::new(0.0, e * 0.9)), Rounding::same(round + e), Color32::from_black_alpha(a));
             }
-            painter.rect_filled(dock_bg.expand(e).translate(Vec2::new(0.0, e * 0.9)), Rounding::same(round + e), Color32::from_black_alpha(a));
         }
-        painter.rect_filled(dock_bg, Rounding::same(round), Color32::from_rgba_premultiplied(col_bar.r(), col_bar.g(), col_bar.b(), dock_bg_alpha));
-        let bx0 = dock_bg.min.x + round * 0.16;
-        let bx1 = dock_bg.max.x - round * 0.16;
-        let h = dock_bg.height();
-        soft_vband(&painter, bx0, bx1, dock_bg.min.y + 1.0, dock_bg.min.y + h * 0.24, dock_bg.min.y + h * 0.62, Color32::WHITE, (ui_opacity * if th > 0.5 { 46.0 } else { 60.0 }) as u8);
-        soft_vband(&painter, bx0, bx1, dock_bg.min.y + h * 0.42, dock_bg.max.y - h * 0.16, dock_bg.max.y - 1.0, Color32::BLACK, (ui_opacity * if th > 0.5 { 40.0 } else { 26.0 }) as u8);
+        let bar_alpha = if dockbar_simple { (ui_opacity * 190.0) as u8 } else { dock_bg_alpha };
+        painter.rect_filled(dock_bg, Rounding::same(round), Color32::from_rgba_premultiplied(col_bar.r(), col_bar.g(), col_bar.b(), bar_alpha));
+        if !dockbar_simple {
+            let h = dock_bg.height();
+            let edge = |dy: f32| -> f32 {
+                if dy >= round { 0.0 } else { round - (round * round - (round - dy) * (round - dy)).max(0.0).sqrt() }
+            };
+            let uv = egui::epaint::WHITE_UV;
+            let band_mesh = |top: bool, band: f32, rows: usize, peak: f32, peak_at: f32, black: bool| {
+                let mut mesh = egui::epaint::Mesh::default();
+                for k in 0..=rows {
+                    let f = k as f32 / rows as f32;
+                    let dy = 1.0 * scale_factor + f * band;
+                    let ins = edge(dy);
+                    let y = if top { dock_bg.min.y + dy } else { dock_bg.max.y - dy };
+                    let g = if peak_at <= 0.001 {
+                        1.0 - f
+                    } else if f <= peak_at {
+                        f / peak_at
+                    } else {
+                        (1.0 - f) / (1.0 - peak_at)
+                    };
+                    let g = g.clamp(0.0, 1.0);
+                    let a = (peak * g * g) as u8;
+                    let col = if black { Color32::from_black_alpha(a) } else { Color32::from_white_alpha(a) };
+                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(dock_bg.min.x + ins, y), uv, color: col });
+                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(dock_bg.max.x - ins, y), uv, color: col });
+                }
+                for k in 0..rows as u32 {
+                    let i = k * 2;
+                    mesh.indices.extend_from_slice(&[i, i + 1, i + 2, i + 1, i + 3, i + 2]);
+                }
+                painter.add(egui::Shape::mesh(mesh));
+            };
+            band_mesh(true, h * 0.60, 26, ui_opacity * if th > 0.5 { 46.0 } else { 60.0 }, 0.26, false);
+            band_mesh(false, h * 0.40, 20, ui_opacity * if th > 0.5 { 34.0 } else { 26.0 }, 0.0, true);
+        }
         painter.rect_stroke(dock_bg, Rounding::same(round), Stroke::new(1.1 * scale_factor, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
 
         let scaled_dock_sx = scaled_dock_center.x - scaled_dock_total * 0.5;
@@ -1603,13 +1718,15 @@ pub fn carousel_view(
             let fill = Color32::from_rgba_premultiplied(col_surface.r(), col_surface.g(), col_surface.b(), (ui_opacity * 200.0) as u8);
             let br = base.width() * 0.5;
             painter.circle(base.center(), br, fill, Stroke::new(1.0, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
-            let arc: Vec<egui::Pos2> = (0..=14)
-                .map(|k| {
-                    let a = std::f32::consts::PI * (1.08 + 0.84 * (k as f32 / 14.0));
-                    base.center() + Vec2::new(a.cos(), a.sin()) * (br - 1.3 * scale_factor)
-                })
-                .collect();
-            painter.add(egui::Shape::line(arc, Stroke::new(1.1 * scale_factor, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 90.0 } else { 55.0 }) as u8))));
+            if !dockbar_simple {
+                let arc: Vec<egui::Pos2> = (0..=14)
+                    .map(|k| {
+                        let a = std::f32::consts::PI * (1.08 + 0.84 * (k as f32 / 14.0));
+                        base.center() + Vec2::new(a.cos(), a.sin()) * (br - 1.3 * scale_factor)
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(arc, Stroke::new(1.1 * scale_factor, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 90.0 } else { 55.0 }) as u8))));
+            }
         }
 
         if state.dock_focus > 0.004 {
@@ -2148,6 +2265,7 @@ pub fn carousel_view(
     if interactive && state.boot_stage == BootStage::None {
         let launch_path = game_of(state.selected).map(|gi| lib.games[gi].path.to_string_lossy().to_string());
         let is_playing = game_of(state.selected).map_or(false, |gi| playing == Some(gi));
+        let list_selected = list_of(state.selected);
         handle_input(
             state,
             last_input,
@@ -2159,6 +2277,7 @@ pub fn carousel_view(
             is_playing,
             theme,
             launch_path,
+            list_selected,
         );
         if let CarouselAction::Launch(path) = &action {
             if !is_running {
@@ -2200,6 +2319,7 @@ fn handle_input(
     is_playing: bool,
     theme: crate::app_settings::CarouselTheme,
     launch_path: Option<String>,
+    list_selected: Option<usize>,
 ) {
     let mut left   = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
     let mut right  = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
@@ -2437,8 +2557,17 @@ fn handle_input(
                     _ => CarouselAction::None,
                 };
             }
+        } else if state.active_list.is_some() && state.selected == 0 {
+            state.active_list = None;
+            state.selected = CS_FRONT;
+            state.scroll_offset = CS_FRONT as f32;
         } else if CS_FRONT > 0 && state.selected == 0 {
             *action = CarouselAction::OpenCarouselSettings;
+        } else if let Some(li) = list_selected {
+            state.active_list = Some(li);
+            state.selected = 1;
+            state.scroll_offset = 1.0;
+            state.list_anim = 0.0;
         } else if is_playing {
             *action = CarouselAction::Resume;
         } else if let Some(path) = &launch_path {
@@ -2456,6 +2585,10 @@ fn handle_input(
         }
         if state.active_dock {
             state.active_dock = false;
+        } else if state.active_list.is_some() {
+            state.active_list = None;
+            state.selected = CS_FRONT;
+            state.scroll_offset = CS_FRONT as f32;
         }
     }
     if !state.active_dock && x_edge {
