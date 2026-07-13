@@ -173,17 +173,28 @@ impl Updater {
             return Err("failed to extract archive".into());
         }
         let newbin = find_binary(&tmp, "nexium").ok_or("new binary not found in archive")?;
-        backup_current(&exe)?;
-        std::fs::copy(&newbin, &exe).map_err(|e| e.to_string())?;
+
+        let parent = exe.parent().ok_or("no parent directory")?;
+        let backups = parent.join("backups");
+        std::fs::create_dir_all(&backups).map_err(|e| e.to_string())?;
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let base = exe.file_name().and_then(|n| n.to_str()).unwrap_or("nexium");
+        let backup_dest = backups.join(format!("{}-{}", base, stamp));
+
+        std::fs::rename(&exe, &backup_dest).map_err(|e| format!("could not move current binary aside: {}", e))?;
+        prune_backups(&backups, 20);
+
+        if let Err(e) = std::fs::copy(&newbin, &exe) {
+            let _ = std::fs::rename(&backup_dest, &exe);
+            return Err(format!("could not write new binary: {}", e));
+        }
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&exe) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o755);
-                let _ = std::fs::set_permissions(&exe, perms);
-            }
+            let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
         }
+
         std::process::Command::new(&exe)
+            .current_dir(std::env::current_dir().unwrap_or_else(|_| parent.to_path_buf()))
             .spawn()
             .map_err(|e| e.to_string())?;
         Ok(())

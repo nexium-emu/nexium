@@ -730,9 +730,10 @@ fn system_page(
         let hovered = actionable && ui.rect_contains_pointer(r);
         let stroke_col = if actionable { update_color } else { pal.border };
         painter.rect_stroke(r, rounding, Stroke::new(if actionable { if hovered { 2.4 } else { 1.8 } } else { 1.0 } * scale_factor, stroke_col));
+        let label_y = if actionable { row.center().y - 10.0 * s } else { row.center().y };
         if actionable {
             painter.text(
-                scale_pos(egui::pos2(row.min.x + 24.0 * s, row.center().y + 18.0 * s)),
+                scale_pos(egui::pos2(row.min.x + 24.0 * s, row.center().y + 11.0 * s)),
                 egui::Align2::LEFT_CENTER,
                 "Press A / click to install",
                 FontId::proportional(11.5 * s * scale_factor),
@@ -740,7 +741,7 @@ fn system_page(
             );
         }
         painter.text(
-            scale_pos(egui::pos2(row.min.x + 24.0 * s, row.center().y)),
+            scale_pos(egui::pos2(row.min.x + 24.0 * s, label_y)),
             egui::Align2::LEFT_CENTER,
             *label,
             FontId::proportional(17.0 * s * scale_factor),

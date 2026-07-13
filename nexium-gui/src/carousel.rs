@@ -136,6 +136,7 @@ pub enum CarouselAction {
     DownloadIcon(String),
     OpenShop,
     OpenCarouselSettings,
+    OpenUpdate,
 }
 
 const DOCK_COUNT: usize = 10;
@@ -862,6 +863,7 @@ pub fn carousel_view(
     carousel_order: &[crate::app_settings::CarouselRef],
     lists: &[crate::app_settings::GameList],
     icon_reveal: Option<(usize, f32, Option<egui::TextureHandle>)>,
+    update_available: bool,
 ) -> CarouselAction {
     let mut action = CarouselAction::None;
 
@@ -2231,8 +2233,39 @@ pub fn carousel_view(
 
         let clock_w = ui.fonts(|f| f.layout_no_wrap(clock.clone(), clock_font.clone(), cc).size().x) / scale_factor;
         let date_pos = egui::pos2(clock_right - clock_w - 14.0 * top_s, bg_rect.min.y + 34.0 * top_s);
+        let date_w = ui.fonts(|f| f.layout_no_wrap(date.clone(), date_font.clone(), cc).size().x) / scale_factor;
         let scaled_date = screen_center + (date_pos - screen_center) * scale_factor;
-        shadowed_text(&painter, scaled_date, egui::Align2::RIGHT_CENTER, &date, date_font, Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), (top_alpha as f32 * 0.82) as u8), false);
+        shadowed_text(&painter, scaled_date, egui::Align2::RIGHT_CENTER, &date, date_font.clone(), Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), (top_alpha as f32 * 0.82) as u8), false);
+
+        if update_available
+            && interactive
+            && top_alpha > 40
+            && state.boot_stage == BootStage::None
+            && !state.palette_open
+            && !state.profile_focused
+            && !state.game_menu_open
+            && !state.search_kb.open
+        {
+            let green = Color32::from_rgb(0x35, 0xD0, 0x6A);
+            let cy = bg_rect.min.y + 35.5 * top_s;
+            let pill_r = date_pos.x - date_w - 34.0 * top_s;
+            let pw = 162.0 * top_s;
+            let ph = 26.0 * top_s;
+            let pill = egui::Rect::from_min_max(egui::pos2(pill_r - pw, cy - ph * 0.5), egui::pos2(pill_r, cy + ph * 0.5));
+            let sp = |p: egui::Pos2| screen_center + (p - screen_center) * scale_factor;
+            let spill = egui::Rect::from_min_max(sp(pill.min), sp(pill.max));
+            painter.rect_filled(spill.translate(Vec2::new(0.0, 2.0 * scale_factor)), Rounding::same(9.0 * scale_factor), Color32::from_black_alpha((top_alpha as f32 * 0.28) as u8));
+            painter.rect_filled(spill, Rounding::same(9.0 * scale_factor), Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), top_alpha));
+            painter.rect_stroke(spill, Rounding::same(9.0 * scale_factor), Stroke::new(1.4 * scale_factor, Color32::from_rgba_unmultiplied(green.r(), green.g(), green.b(), (top_alpha as f32 * 0.7) as u8)));
+            let pulse = 0.5 + 0.5 * (t * 2.2).sin();
+            let dc = sp(egui::pos2(pill.min.x + 16.0 * top_s, cy));
+            painter.circle_filled(dc, 5.5 * scale_factor, Color32::from_rgba_unmultiplied(green.r(), green.g(), green.b(), (((90.0 + 140.0 * pulse) * top_alpha as f32) / 255.0) as u8));
+            painter.circle_filled(dc, 3.3 * scale_factor, Color32::from_rgba_unmultiplied(green.r(), green.g(), green.b(), top_alpha));
+            painter.text(sp(egui::pos2(pill.min.x + 29.0 * top_s, cy)), egui::Align2::LEFT_CENTER, "Update Available!", FontId::proportional(13.5 * top_s * scale_factor), Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), top_alpha));
+            if ui.allocate_rect(spill, egui::Sense::click()).clicked() {
+                action = CarouselAction::OpenUpdate;
+            }
+        }
 
         if net > 0 {
             let nc = egui::pos2(net_x, bg_rect.min.y + 34.0 * top_s);
