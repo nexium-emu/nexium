@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use super::engines::maxwell3d::{DrawCall, RenderTarget, VertexBuffer};
 use super::engines::Maxwell3D;
+use super::formats::map_surface_format;
 use super::GpuMappings;
 
 use nexium_gpu::draw::{
@@ -2939,52 +2940,7 @@ fn draw_color_rt_slot(draw: &DrawCall) -> usize {
 }
 
 fn map_rt_format(format: u32) -> vk::Format {
-    match format {
-        0xC0 | 0xC3 => vk::Format::R32G32B32A32_SFLOAT,
-        0xC1 | 0xC4 => vk::Format::R32G32B32A32_SINT,
-        0xC2 | 0xC5 => vk::Format::R32G32B32A32_UINT,
-        0xC6 => vk::Format::R16G16B16A16_UNORM,
-        0xC7 => vk::Format::R16G16B16A16_SNORM,
-        0xC8 => vk::Format::R16G16B16A16_SINT,
-        0xC9 => vk::Format::R16G16B16A16_UINT,
-        0xCA | 0xCE => vk::Format::R16G16B16A16_SFLOAT,
-        0xCB => vk::Format::R32G32_SFLOAT,
-        0xCC => vk::Format::R32G32_SINT,
-        0xCD => vk::Format::R32G32_UINT,
-        0xCF | 0xE6 => vk::Format::B8G8R8A8_UNORM,
-        0xD1 => vk::Format::A2B10G10R10_UNORM_PACK32,
-        0xD2 => vk::Format::A2B10G10R10_UINT_PACK32,
-        0xD5 | 0xF9 => vk::Format::A8B8G8R8_UNORM_PACK32,
-        0xD6 | 0xFA => vk::Format::A8B8G8R8_SRGB_PACK32,
-        0xD7 => vk::Format::A8B8G8R8_SNORM_PACK32,
-        0xD8 => vk::Format::A8B8G8R8_SINT_PACK32,
-        0xD9 => vk::Format::A8B8G8R8_UINT_PACK32,
-        0xDA => vk::Format::R16G16_UNORM,
-        0xDB => vk::Format::R16G16_SNORM,
-        0xDC => vk::Format::R16G16_SINT,
-        0xDD => vk::Format::R16G16_UINT,
-        0xDE => vk::Format::R16G16_SFLOAT,
-        0xDF => vk::Format::A2R10G10B10_UNORM_PACK32,
-        0xE0 => vk::Format::B10G11R11_UFLOAT_PACK32,
-        0xE3 => vk::Format::R32_SINT,
-        0xE4 => vk::Format::R32_UINT,
-        0xE5 => vk::Format::R32_SFLOAT,
-        0xE8 => vk::Format::R5G6B5_UNORM_PACK16,
-        0xEA => vk::Format::R8G8_UNORM,
-        0xEB => vk::Format::R8G8_SNORM,
-        0xEC => vk::Format::R8G8_SINT,
-        0xED => vk::Format::R8G8_UINT,
-        0xEE => vk::Format::R16_UNORM,
-        0xEF => vk::Format::R16_SNORM,
-        0xF0 => vk::Format::R16_SINT,
-        0xF1 => vk::Format::R16_UINT,
-        0xF2 => vk::Format::R16_SFLOAT,
-        0xF3 => vk::Format::R8_UNORM,
-        0xF4 => vk::Format::R8_SNORM,
-        0xF5 => vk::Format::R8_SINT,
-        0xF6 => vk::Format::R8_UINT,
-        _ => vk::Format::R8G8B8A8_UNORM,
-    }
+    map_surface_format(format)
 }
 
 fn map_rt_format_for_key(format: u32, _key: RtKey) -> vk::Format {
