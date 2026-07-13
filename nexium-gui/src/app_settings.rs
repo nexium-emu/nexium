@@ -152,6 +152,93 @@ impl CpuBackend {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GpuBackend {
+    Vulkan,
+}
+
+impl Default for GpuBackend {
+    fn default() -> Self {
+        GpuBackend::Vulkan
+    }
+}
+
+impl GpuBackend {
+    pub fn all() -> &'static [GpuBackend] {
+        &[GpuBackend::Vulkan]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            GpuBackend::Vulkan => "Vulkan (ash)",
+        }
+    }
+    pub fn next(&self) -> GpuBackend {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + 1) % all.len()]
+    }
+    pub fn prev(&self) -> GpuBackend {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + all.len() - 1) % all.len()]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolutionPreset {
+    /// 1280 × 720 (native Switch docked)
+    P720,
+    /// 1920 × 1080
+    P1080,
+    /// 2560 × 1440
+    P1440,
+    /// 3840 × 2160
+    P2160,
+}
+
+impl Default for ResolutionPreset {
+    fn default() -> Self {
+        ResolutionPreset::P720
+    }
+}
+
+impl ResolutionPreset {
+    pub fn all() -> &'static [ResolutionPreset] {
+        &[
+            ResolutionPreset::P720,
+            ResolutionPreset::P1080,
+            ResolutionPreset::P1440,
+            ResolutionPreset::P2160,
+        ]
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            ResolutionPreset::P720  => "1280 \u{00D7} 720",
+            ResolutionPreset::P1080 => "1920 \u{00D7} 1080",
+            ResolutionPreset::P1440 => "2560 \u{00D7} 1440",
+            ResolutionPreset::P2160 => "3840 \u{00D7} 2160",
+        }
+    }
+    pub fn scale(&self) -> u32 {
+        match self {
+            ResolutionPreset::P720  => 1,
+            ResolutionPreset::P1080 => 2,
+            ResolutionPreset::P1440 => 2,
+            ResolutionPreset::P2160 => 3,
+        }
+    }
+    pub fn next(&self) -> ResolutionPreset {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + 1) % all.len()]
+    }
+    pub fn prev(&self) -> ResolutionPreset {
+        let all = Self::all();
+        let i = all.iter().position(|x| x == self).unwrap_or(0);
+        all[(i + all.len() - 1) % all.len()]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogLevel {
     Error,
     Warn,
@@ -263,6 +350,14 @@ fn default_sfx_volume() -> f32 {
     0.5
 }
 
+fn default_left_deadzone() -> f32 {
+    0.12
+}
+
+fn default_right_deadzone() -> f32 {
+    0.12
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppSettings {
     pub log_level: LogLevel,
@@ -278,6 +373,10 @@ pub struct AppSettings {
     pub vsync: bool,
     #[serde(default)]
     pub cpu_backend: CpuBackend,
+    #[serde(default)]
+    pub gpu_backend: GpuBackend,
+    #[serde(default)]
+    pub resolution_preset: ResolutionPreset,
     #[serde(default)]
     pub audio_output_device: Option<String>,
     #[serde(default = "default_audio_volume")]
@@ -320,6 +419,10 @@ pub struct AppSettings {
     pub sfx_muted: bool,
     #[serde(default)]
     pub dockbar_theme: DockbarTheme,
+    #[serde(default = "default_left_deadzone")]
+    pub left_deadzone: f32,
+    #[serde(default = "default_right_deadzone")]
+    pub right_deadzone: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,6 +528,8 @@ impl Default for AppSettings {
             dpi_aware: false,
             vsync: default_vsync(),
             cpu_backend: CpuBackend::default(),
+            gpu_backend: GpuBackend::default(),
+            resolution_preset: ResolutionPreset::default(),
             audio_output_device: None,
             audio_volume: default_audio_volume(),
             multicore: default_multicore(),
@@ -446,6 +551,8 @@ impl Default for AppSettings {
             music_muted: false,
             sfx_muted: false,
             dockbar_theme: DockbarTheme::default(),
+            left_deadzone: default_left_deadzone(),
+            right_deadzone: default_right_deadzone(),
         }
     }
 }

@@ -158,6 +158,25 @@ pub struct HorizonApp {
     frame_backlog: std::collections::VecDeque<crate::boot::Frame>,
     show_settings: bool,
     settings_tab: SettingsTab,
+    prefs_anim: f32,
+    prefs_focus: bool,
+    prefs_row: usize,
+    prefs_col: usize,
+    prefs_col1_row: usize,
+    prefs_dropdown_open: bool,
+    prefs_dropdown_sel: usize,
+    prefs_lr_held: bool,
+    prefs_nav_cd: f64,
+    prefs_nav_held_dir: u8,   // 0=none 1=up 2=down 3=left 4=right
+    prefs_nav_held_since: f64,
+    prefs_ab_held: bool,
+    prefs_key_editing: bool,
+    prefs_key_menu: bool,
+    prefs_ctrl_scroll: usize,
+    prefs_key_caret: usize,
+    prefs_key_anchor: usize,
+    vkeyboard: crate::vkeyboard::VirtualKeyboard,
+    vk_target: VkTarget,
     input: Option<InputBackend>,
     last_input: InputSnapshot,
     debugger: DebuggerState,
@@ -166,6 +185,9 @@ pub struct HorizonApp {
     controller_config: ControllerConfig,
     rebinding: Option<SwitchButton>,
     rebinding_pad: Option<SwitchButton>,
+    rebinding_pad_wait_release: bool,
+    prefs_rebind_cool: bool,
+    prefs_enter_held: bool,
     input_device: InputDevice,
     app_settings: AppSettings,
     last_buttons_logged: u64,
@@ -199,6 +221,8 @@ pub struct HorizonApp {
     cs_selected: usize,
     cs_focus_grid: bool,
     cs_nav_cd: f64,
+    cs_nav_held_dir: u8,
+    cs_nav_held_since: f64,
     cs_ab_held: bool,
     cs_list_picks: Vec<std::path::PathBuf>,
     cs_pick_anim: std::collections::HashMap<std::path::PathBuf, (f32, f32)>,
@@ -207,6 +231,8 @@ pub struct HorizonApp {
     cs_new_align: crate::app_settings::ListAlignment,
     cs_dialog_row: usize,
     cs_name_editing: bool,
+    cs_name_caret: usize,
+    cs_name_anchor: usize,
     cs_create_btn: f32,
     cs_plus_held: bool,
     cs_rename_idx: Option<usize>,
@@ -340,6 +366,13 @@ pub enum InputDevice {
     Gamepad,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VkTarget {
+    None,
+    ApiKey,
+    ListName,
+}
+
 impl HorizonApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -362,6 +395,25 @@ impl HorizonApp {
             frame_backlog: std::collections::VecDeque::new(),
             show_settings: false,
             settings_tab: SettingsTab::General,
+            prefs_anim: 0.0,
+            prefs_focus: false,
+            prefs_row: 0,
+            prefs_col: 0,
+            prefs_col1_row: 0,
+            prefs_dropdown_open: false,
+            prefs_dropdown_sel: 0,
+            prefs_lr_held: false,
+            prefs_nav_cd: 0.0,
+            prefs_nav_held_dir: 0,
+            prefs_nav_held_since: 0.0,
+            prefs_ab_held: false,
+            prefs_key_editing: false,
+            prefs_key_menu: false,
+            prefs_ctrl_scroll: 0,
+            prefs_key_caret: 0,
+            prefs_key_anchor: 0,
+            vkeyboard: crate::vkeyboard::VirtualKeyboard::new(),
+            vk_target: VkTarget::None,
             input,
             last_input: InputSnapshot::default(),
             debugger: DebuggerState::new(),
@@ -370,6 +422,9 @@ impl HorizonApp {
             controller_config: ControllerConfig::load(),
             rebinding: None,
             rebinding_pad: None,
+            rebinding_pad_wait_release: false,
+            prefs_rebind_cool: false,
+            prefs_enter_held: false,
             input_device: InputDevice::Keyboard,
             app_settings: AppSettings::load(),
             last_buttons_logged: 0,
@@ -403,6 +458,8 @@ impl HorizonApp {
             cs_selected: 0,
             cs_focus_grid: false,
             cs_nav_cd: 0.0,
+            cs_nav_held_dir: 0,
+            cs_nav_held_since: 0.0,
             cs_ab_held: false,
             cs_list_picks: Vec::new(),
             cs_pick_anim: std::collections::HashMap::new(),
@@ -411,6 +468,8 @@ impl HorizonApp {
             cs_new_align: crate::app_settings::ListAlignment::Manual,
             cs_dialog_row: 0,
             cs_name_editing: false,
+            cs_name_caret: 0,
+            cs_name_anchor: 0,
             cs_create_btn: 0.0,
             cs_plus_held: false,
             cs_rename_idx: None,
@@ -752,10 +811,7 @@ impl HorizonApp {
         let now = ctx.input(|i| i.time);
         let dt = ui.input(|i| i.stable_dt).min(0.1);
         let light = self.app_settings.light_mode;
-        let accent = match self.app_settings.carousel_theme.color() {
-            Some((r, g, b)) => Color32::from_rgb(r, g, b),
-            None => self.carousel.ambient_color,
-        };
+        let accent = self.theme_accent();
         let panel = if light { Color32::from_rgb(0xF5, 0xF5, 0xF9) } else { Color32::from_rgb(0x16, 0x16, 0x20) };
         let text = if light { Color32::from_rgb(0x1E, 0x1E, 0x28) } else { Color32::from_rgb(0xEC, 0xEC, 0xF0) };
         let muted = if light { Color32::from_rgb(0x60, 0x60, 0x6A) } else { Color32::from_rgb(0x9A, 0x9A, 0xA6) };
@@ -1189,9 +1245,7 @@ impl HorizonApp {
         let full = ctx.screen_rect();
         let s = (full.height() / 820.0).clamp(1.0, 2.4);
         let backdrop_theme = self.app_settings.backdrop_theme;
-        let space = backdrop_theme == crate::app_settings::BackdropTheme::Space;
-        // Space is always dark, so force bright UI on it (no black-on-black).
-        let lightish = self.app_settings.light_mode && !space;
+        let lightish = self.app_settings.light_mode;
         let pick = |dark: egui::Color32, lite: egui::Color32| if lightish { lite } else { dark };
         let text = pick(egui::Color32::from_rgb(0xEC, 0xEC, 0xF0), egui::Color32::from_rgb(0x1E, 0x1E, 0x28));
         let muted = pick(egui::Color32::from_rgb(0x8A, 0x8A, 0x98), egui::Color32::from_rgb(0x60, 0x60, 0x6A));
@@ -1199,10 +1253,7 @@ impl HorizonApp {
         let border = pick(egui::Color32::from_rgb(0x30, 0x30, 0x3C), egui::Color32::from_rgb(0xC6, 0xC6, 0xD0));
         let sel = pick(egui::Color32::from_rgb(0x1E, 0x1E, 0x28), egui::Color32::from_rgb(0xDD, 0xDD, 0xE6));
         let hover = pick(egui::Color32::from_rgb(0x18, 0x18, 0x22), egui::Color32::from_rgb(0xEA, 0xEA, 0xF0));
-        let accent = match self.app_settings.carousel_theme.color() {
-            Some((r, g, b)) => egui::Color32::from_rgb(r, g, b),
-            None => self.carousel.ambient_color,
-        };
+        let accent = self.theme_accent();
 
         // scale + fade pop, exactly like the Profile page
         let center = full.center();
@@ -1215,7 +1266,7 @@ impl HorizonApp {
         // themed backdrop + scrim (matches Profile)
         crate::carousel::draw_backdrop(&p, full, accent, t, backdrop_theme, 1.0, if lightish { 1.0 } else { 0.0 });
         let scrim = if lightish {
-            egui::Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 55)
+            egui::Color32::from_rgba_unmultiplied(0xFA, 0xFA, 0xFC, 235)
         } else {
             egui::Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 140)
         };
@@ -1233,10 +1284,10 @@ impl HorizonApp {
         let li = self.last_input;
         let gp_a = li.connected && li.is(SwitchButton::A);
         let gp_b = li.connected && li.is(SwitchButton::B);
+        let cs_gp_a_edge = gp_a && !self.cs_ab_held;
         let a_edge = ctx.input(|i| i.key_pressed(egui::Key::Enter)) || (gp_a && !self.cs_ab_held);
         let b_edge = ctx.input(|i| i.key_pressed(egui::Key::Escape)) || (gp_b && !self.cs_ab_held);
         self.cs_ab_held = gp_a || gp_b;
-        let ready = now - self.cs_nav_cd > 0.16;
         let (mut nu, mut nd, mut nl, mut nr) = ctx.input(|i| (
             i.key_pressed(egui::Key::ArrowUp),
             i.key_pressed(egui::Key::ArrowDown),
@@ -1249,16 +1300,39 @@ impl HorizonApp {
         let gp_x = li.connected && li.is(SwitchButton::X);
         let x_edge = (gp_x && !self.cs_x_held) || ctx.input(|i| i.key_pressed(egui::Key::E));
         self.cs_x_held = gp_x;
-        if ready && li.connected {
-            if li.is(SwitchButton::DUp) || li.ly() > 0.5 { nu = true; self.cs_nav_cd = now; }
-            else if li.is(SwitchButton::DDown) || li.ly() < -0.5 { nd = true; self.cs_nav_cd = now; }
-            else if li.is(SwitchButton::DLeft) || li.lx() < -0.5 { nl = true; self.cs_nav_cd = now; }
-            else if li.is(SwitchButton::DRight) || li.lx() > 0.5 { nr = true; self.cs_nav_cd = now; }
+
+        // Proper key-repeat: fire once on first press, wait 0.7s, then repeat at 0.14s.
+        const INITIAL_DELAY: f64 = 0.70;
+        const REPEAT_RATE:   f64 = 0.14;
+        if li.connected {
+            let cur_dir: u8 = if li.is(SwitchButton::DUp) || li.ly() > 0.5 { 1 }
+                else if li.is(SwitchButton::DDown) || li.ly() < -0.5 { 2 }
+                else if li.is(SwitchButton::DLeft) || li.lx() < -0.5 { 3 }
+                else if li.is(SwitchButton::DRight) || li.lx() > 0.5 { 4 }
+                else { 0 };
+            if cur_dir == 0 {
+                self.cs_nav_held_dir = 0;
+                self.cs_nav_held_since = 0.0;
+            } else if cur_dir != self.cs_nav_held_dir {
+                self.cs_nav_held_dir = cur_dir;
+                self.cs_nav_held_since = now;
+                self.cs_nav_cd = now;
+                match cur_dir { 1 => nu = true, 2 => nd = true, 3 => nl = true, _ => nr = true }
+            } else {
+                let held_for = now - self.cs_nav_held_since;
+                if held_for >= INITIAL_DELAY && now - self.cs_nav_cd >= REPEAT_RATE {
+                    self.cs_nav_cd = now;
+                    match cur_dir { 1 => nu = true, 2 => nd = true, 3 => nl = true, _ => nr = true }
+                }
+            }
+        } else {
+            self.cs_nav_held_dir = 0;
+            self.cs_nav_held_since = 0.0;
         }
 
         let menu_open = self.cs_list_menu.is_some();
         let (raw_nu, raw_nd, raw_a, raw_b) = (nu, nd, a_edge, b_edge);
-        let block = self.confirm.is_some() || menu_open;
+        let block = self.confirm.is_some() || menu_open || self.vkeyboard.open;
         let (a_edge, b_edge, plus_edge, x_edge) = if block { (false, false, false, false) } else { (a_edge, b_edge, plus_edge, x_edge) };
         let (nu, nd, nl, nr) = if block { (false, false, false, false) } else { (nu, nd, nl, nr) };
 
@@ -1702,20 +1776,6 @@ impl HorizonApp {
             let mut do_cancel = false;
 
             if self.cs_name_editing {
-                let events = ui.input(|i| i.events.clone());
-                for ev in events {
-                    match ev {
-                        egui::Event::Text(txt) => {
-                            for ch in txt.chars() {
-                                if !ch.is_control() && self.cs_new_name.chars().count() < 28 { self.cs_new_name.push(ch); }
-                            }
-                        }
-                        egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => { self.cs_new_name.pop(); }
-                        egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => { self.cs_name_editing = false; }
-                        egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => { self.cs_name_editing = false; }
-                        _ => {}
-                    }
-                }
             } else {
                 if nu && self.cs_dialog_row > 0 { self.cs_dialog_row -= 1; crate::ui_audio::play_move(); }
                 if nd && self.cs_dialog_row < 3 { self.cs_dialog_row += 1; crate::ui_audio::play_move(); }
@@ -1725,7 +1785,13 @@ impl HorizonApp {
                 }
                 if a_edge {
                     match self.cs_dialog_row {
-                        0 => self.cs_name_editing = true,
+                        0 => {
+                            if cs_gp_a_edge {
+                                self.open_vkeyboard(VkTarget::ListName);
+                            } else {
+                                self.cs_name_editing = true;
+                            }
+                        }
                         1 => { self.cs_new_align = self.cs_new_align.next(); crate::ui_audio::play(crate::ui_audio::Sfx::Select); }
                         2 => do_create = true,
                         _ => do_cancel = true,
@@ -1755,8 +1821,20 @@ impl HorizonApp {
                     p.text(sp(egui::pos2(base.max.x - 16.0 * s, base.center().y)), egui::Align2::CENTER_CENTER, "\u{203A}", egui::FontId::proportional(22.0 * s * sf), muted);
                 }
             };
-            draw_field(&p, name_base, 0, "List Name", &self.cs_new_name, false, self.cs_name_editing);
+            draw_field(&p, name_base, 0, "List Name", "", false, false);
             draw_field(&p, align_base, 1, "List Alignment", self.cs_new_align.label(), true, false);
+            let nm_tp = sp(egui::pos2(name_base.min.x + 18.0 * s, name_base.min.y + 46.0 * s));
+            let nm_sel = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 90);
+            let nm_events = ui.input(|i| i.events.clone());
+            let nfr = text_field(&p, ui, sr(name_base), nm_tp.x, nm_tp.y, &mut self.cs_new_name, &mut self.cs_name_caret, &mut self.cs_name_anchor, value_font.clone(), text, muted, nm_sel, "", false, 28, self.cs_name_editing, caret_on, if self.cs_name_editing { &nm_events } else { &[] });
+            if nfr.clicked { self.cs_dialog_row = 0; self.cs_name_editing = true; }
+            if nfr.secondary_clicked {
+                self.cs_dialog_row = 0;
+                self.cs_name_editing = true;
+                let c = clipboard_text();
+                for ch in c.chars() { if !ch.is_control() && self.cs_new_name.chars().count() < 28 { self.cs_new_name.push(ch); } }
+            }
+            if self.cs_name_editing && (nfr.commit || nfr.cancel) { self.cs_name_editing = false; }
 
             let create_label = if self.cs_rename_idx.is_some() { "Save" } else { "Create" };
             for (row, base, lbl, fill) in [(2usize, create_base, create_label, true), (3usize, cancel_base, "Cancel", false)] {
@@ -1772,7 +1850,6 @@ impl HorizonApp {
                 if selected { p.rect_stroke(r, egui::Rounding::same(11.0 * s), egui::Stroke::new(2.0_f32, accent)); }
             }
 
-            if ui.allocate_rect(sr(name_base), egui::Sense::click()).clicked() { self.cs_dialog_row = 0; self.cs_name_editing = true; }
             if ui.allocate_rect(sr(align_base), egui::Sense::click()).clicked() { self.cs_dialog_row = 1; self.cs_new_align = self.cs_new_align.next(); }
             if ui.allocate_rect(sr(create_base), egui::Sense::click()).clicked() { do_create = true; }
             if ui.allocate_rect(sr(cancel_base), egui::Sense::click()).clicked() { do_cancel = true; }
@@ -1840,16 +1917,1099 @@ impl HorizonApp {
         match self.app_settings.carousel_theme.color() {
             Some((r, g, b)) => Color32::from_rgb(r, g, b),
             None => {
-                let a = self.carousel.ambient_color;
-                let mx = a.r().max(a.g()).max(a.b());
-                let mn = a.r().min(a.g()).min(a.b());
-                if (mx as i32 - mn as i32) < 28 || mx < 96 {
+                let c = self.carousel.theme_color;
+                let mx = c.r().max(c.g()).max(c.b());
+                let mn = c.r().min(c.g()).min(c.b());
+                if (mx as i32 - mn as i32) < 20 && mx < 110 {
                     Color32::from_rgb(0x2F, 0xB4, 0xEF)
                 } else {
-                    a
+                    c
                 }
             }
         }
+    }
+
+    fn open_vkeyboard(&mut self, target: VkTarget) {
+        let cur = match target {
+            VkTarget::ApiKey => self.app_settings.steamgriddb_key.clone(),
+            VkTarget::ListName => self.cs_new_name.clone(),
+            VkTarget::None => return,
+        };
+        let max = match target {
+            VkTarget::ApiKey => 80,
+            _ => 28,
+        };
+        self.vk_target = target;
+        self.vkeyboard.show(&cur, max);
+    }
+
+    fn drive_vkeyboard(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        if self.vkeyboard.open {
+            let stale = match self.vk_target {
+                VkTarget::ApiKey => !self.show_settings,
+                VkTarget::ListName => !self.cs_creating,
+                VkTarget::None => true,
+            };
+            if stale {
+                self.vkeyboard.open = false;
+            }
+        }
+        if self.vk_target == VkTarget::None && !self.vkeyboard.active() {
+            return;
+        }
+        let accent = self.theme_accent();
+        let light = self.app_settings.light_mode;
+        let res = match self.vk_target {
+            VkTarget::ApiKey => {
+                let before = self.app_settings.steamgriddb_key.clone();
+                let r = self.vkeyboard.update(ctx, ui, &mut self.app_settings.steamgriddb_key, &self.last_input, accent, light);
+                if self.app_settings.steamgriddb_key != before {
+                    let _ = self.app_settings.save();
+                }
+                r
+            }
+            VkTarget::ListName => self.vkeyboard.update(ctx, ui, &mut self.cs_new_name, &self.last_input, accent, light),
+            VkTarget::None => {
+                let mut discard = String::new();
+                self.vkeyboard.update(ctx, ui, &mut discard, &self.last_input, accent, light)
+            }
+        };
+        let _ = res;
+        if !self.vkeyboard.active() {
+            self.vk_target = VkTarget::None;
+        }
+    }
+
+    fn update_preferences(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let target = if self.show_settings { 1.0 } else { 0.0 };
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        self.prefs_anim += (target - self.prefs_anim) * (dt * 12.0).min(1.0);
+        if self.prefs_anim < 0.004 {
+            self.prefs_key_editing = false;
+            self.prefs_key_menu = false;
+            return;
+        }
+        let ease = { let a = self.prefs_anim.clamp(0.0, 1.0); a * a * (3.0 - 2.0 * a) };
+        let t = ctx.input(|i| i.time) as f32;
+        let full = ctx.screen_rect();
+        let s = (full.height() / 820.0).clamp(1.0, 2.4);
+        let backdrop_theme = self.app_settings.backdrop_theme;
+        let lightish = self.app_settings.light_mode;
+        let pick = |dark: egui::Color32, lite: egui::Color32| if lightish { lite } else { dark };
+        let text = pick(egui::Color32::from_rgb(0xEC, 0xEC, 0xF0), egui::Color32::from_rgb(0x1E, 0x1E, 0x28));
+        let muted = pick(egui::Color32::from_rgb(0x8A, 0x8A, 0x98), egui::Color32::from_rgb(0x60, 0x60, 0x6A));
+        let panel = pick(egui::Color32::from_rgb(0x16, 0x16, 0x1E), egui::Color32::from_rgb(0xFF, 0xFF, 0xFF));
+        let border = pick(egui::Color32::from_rgb(0x30, 0x30, 0x3C), egui::Color32::from_rgb(0xC6, 0xC6, 0xD0));
+        let sel = pick(egui::Color32::from_rgb(0x1E, 0x1E, 0x28), egui::Color32::from_rgb(0xDD, 0xDD, 0xE6));
+        let hover = pick(egui::Color32::from_rgb(0x18, 0x18, 0x22), egui::Color32::from_rgb(0xEA, 0xEA, 0xF0));
+        let field_bg = pick(egui::Color32::from_rgb(0x20, 0x20, 0x2A), egui::Color32::from_rgb(0xE4, 0xE4, 0xEC));
+        let accent = self.theme_accent();
+
+        let center = full.center();
+        let sf = 0.965 + 0.035 * ease;
+        let sp = |p: egui::Pos2| center + (p - center) * sf;
+        let sr = |r: egui::Rect| egui::Rect::from_center_size(center + (r.center() - center) * sf, r.size() * sf);
+
+        let mut p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("preferences")));
+        p.set_opacity(ease);
+        crate::carousel::draw_backdrop(&p, full, accent, t, backdrop_theme, 1.0, if lightish { 1.0 } else { 0.0 });
+        let scrim = if lightish {
+            egui::Color32::from_rgba_unmultiplied(0xFA, 0xFA, 0xFC, 235)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 140)
+        };
+        p.rect_filled(full, egui::Rounding::ZERO, scrim);
+
+        let mx = full.width() * 0.055;
+        let header_font = 34.0 * s;
+        p.text(sp(egui::pos2(full.min.x + mx, full.min.y + 40.0 * s)), egui::Align2::LEFT_TOP, "Preferences", egui::FontId::proportional(header_font * sf), text);
+        let header_y = full.min.y + 40.0 * s + header_font + 20.0 * s;
+        p.line_segment([sp(egui::pos2(full.min.x + mx, header_y)), sp(egui::pos2(full.max.x - mx, header_y))], egui::Stroke::new(1.0, border));
+
+        use crate::controller_config::SwitchButton;
+        let now = ctx.input(|i| i.time);
+        let li = self.last_input;
+        let gp_a = li.connected && li.is(SwitchButton::A);
+        let gp_b = li.connected && li.is(SwitchButton::B);
+        let gp_a_edge = gp_a && !self.prefs_ab_held;
+        let a_edge = ctx.input(|i| i.key_pressed(egui::Key::Enter)) || (gp_a && !self.prefs_ab_held);
+        let b_edge = ctx.input(|i| i.key_pressed(egui::Key::Escape)) || (gp_b && !self.prefs_ab_held);
+        self.prefs_ab_held = gp_a || gp_b;
+        // Suppress a/b edges for one frame after a pad rebind completes, so the completing
+        // button press doesn't immediately re-trigger a new rebind (A) or back out (B).
+        let (a_edge, b_edge) = if self.prefs_rebind_cool {
+            self.prefs_rebind_cool = false;
+            (false, false)
+        } else {
+            (a_edge, b_edge)
+        };
+        let (mut nu, mut nd, mut nl, mut nr) = ctx.input(|i| (
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::ArrowLeft),
+            i.key_pressed(egui::Key::ArrowRight),
+        ));
+        // Proper key-repeat: fire once on first press, wait 0.7s, then repeat at 0.14s.
+        const INITIAL_DELAY: f64 = 0.70;
+        const REPEAT_RATE:   f64 = 0.14;
+        let mut nav_stick = false;
+        if li.connected {
+            let (cur_dir, cur_is_dpad): (u8, bool) = if li.is(SwitchButton::DUp) { (1, true) }
+                else if li.ly() > 0.5 { (1, false) }
+                else if li.is(SwitchButton::DDown) { (2, true) }
+                else if li.ly() < -0.5 { (2, false) }
+                else if li.is(SwitchButton::DLeft) { (3, true) }
+                else if li.lx() < -0.5 { (3, false) }
+                else if li.is(SwitchButton::DRight) { (4, true) }
+                else if li.lx() > 0.5 { (4, false) }
+                else { (0, false) };
+            if cur_dir == 0 {
+                self.prefs_nav_held_dir = 0;
+                self.prefs_nav_held_since = 0.0;
+            } else if cur_dir != self.prefs_nav_held_dir {
+                // Fresh press or direction change — fire immediately, start hold timer.
+                self.prefs_nav_held_dir = cur_dir;
+                self.prefs_nav_held_since = now;
+                self.prefs_nav_cd = now;
+                match cur_dir { 1 => nu = true, 2 => nd = true, 3 => nl = true, _ => nr = true }
+                nav_stick = !cur_is_dpad;
+            } else {
+                // Same direction still held — only repeat after initial delay.
+                let held_for = now - self.prefs_nav_held_since;
+                if held_for >= INITIAL_DELAY && now - self.prefs_nav_cd >= REPEAT_RATE {
+                    self.prefs_nav_cd = now;
+                    match cur_dir { 1 => nu = true, 2 => nd = true, 3 => nl = true, _ => nr = true }
+                    nav_stick = !cur_is_dpad;
+                }
+            }
+        } else {
+            self.prefs_nav_held_dir = 0;
+            self.prefs_nav_held_since = 0.0;
+        }
+        let gp_l = li.connected && li.is(SwitchButton::L);
+        let gp_r = li.connected && li.is(SwitchButton::R);
+        let l_bumper_edge = gp_l && !self.prefs_lr_held;
+        let r_bumper_edge = gp_r && !self.prefs_lr_held;
+        self.prefs_lr_held = gp_l || gp_r;
+
+        let rebinding_active = self.rebinding.is_some() || self.rebinding_pad.is_some();
+        let editing = self.prefs_key_editing;
+        let block = self.prefs_key_menu || rebinding_active || self.vkeyboard.open;
+        let (a_edge, b_edge, nu, nd, nl, nr, l_bumper_edge, r_bumper_edge) = if editing || block {
+            (false, false, false, false, false, false, false, false)
+        } else {
+            (a_edge, b_edge, nu, nd, nl, nr, l_bumper_edge, r_bumper_edge)
+        };
+        let mut b_edge = b_edge;
+
+        let side_w = (full.width() * 0.22).max(300.0);
+        let side_x = full.min.x + mx;
+        let side_top = header_y + 34.0 * s;
+        let item_h = 60.0 * s;
+        let tabs = ["General", "Controller", "Graphics", "Audio", "Emulation", "Logging"];
+        let tab_of = [SettingsTab::General, SettingsTab::Controller, SettingsTab::Graphics, SettingsTab::Audio, SettingsTab::Emulation, SettingsTab::Logging];
+        let cur = tab_of.iter().position(|x| *x == self.settings_tab).unwrap_or(0);
+        for (i, label) in tabs.iter().enumerate() {
+            let base = egui::Rect::from_min_size(egui::pos2(side_x, side_top + i as f32 * (item_h + 9.0 * s)), egui::Vec2::new(side_w, item_h));
+            let r = sr(base);
+            let selected = cur == i;
+            let ring = if !self.prefs_focus { accent } else { border };
+            let rounding = egui::Rounding::same(12.0 * s);
+            if selected {
+                p.rect_filled(r, rounding, sel);
+                p.rect_stroke(r, rounding, egui::Stroke::new(1.8, ring));
+                let bar = sr(egui::Rect::from_min_size(base.min + egui::Vec2::new(6.0 * s, 12.0 * s), egui::Vec2::new(4.0 * s, base.height() - 24.0 * s)));
+                p.rect_filled(bar, egui::Rounding::same(2.0 * s), ring);
+            } else if ui.rect_contains_pointer(r) {
+                p.rect_filled(r, rounding, hover);
+            }
+            p.text(sp(egui::pos2(base.min.x + 26.0 * s, base.center().y)), egui::Align2::LEFT_CENTER, *label, egui::FontId::proportional(19.0 * s * sf), if selected { text } else { muted });
+            if !editing && ui.allocate_rect(r, egui::Sense::click()).clicked() {
+                self.settings_tab = tab_of[i];
+                self.prefs_focus = false;
+                self.prefs_row = 0;
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            }
+        }
+        // Track whether right is still held from the transition into the content panel.
+        // If the D-pad/stick right is no longer active this frame, clear the hold guard.
+        let right_held = li.connected && (li.is(SwitchButton::DRight) || li.lx() > 0.5);
+        if !right_held { self.prefs_enter_held = false; }
+
+        if !self.prefs_focus && !editing {
+            if nu && cur > 0 { self.settings_tab = tab_of[cur - 1]; self.prefs_row = 0; crate::ui_audio::play_move(); }
+            if nd && cur + 1 < tabs.len() { self.settings_tab = tab_of[cur + 1]; self.prefs_row = 0; crate::ui_audio::play_move(); }
+            if nr {
+                self.prefs_focus = true;
+                self.prefs_row = 0;
+                self.prefs_enter_held = true; // suppress nr while right stays held
+                crate::ui_audio::play_move();
+            }
+        }
+        // Suppress nr for as long as the D-pad right is held from the entry press.
+        let nr = nr && !self.prefs_enter_held;
+
+        let footer_y = full.max.y - 60.0 * s;
+        p.line_segment([sp(egui::pos2(full.min.x + mx, footer_y)), sp(egui::pos2(full.max.x - mx, footer_y))], egui::Stroke::new(1.0, border));
+        let pad = li.connected;
+        let hint = if editing {
+            "Type your key    ·    [Enter] Save    ·    [Esc] Cancel"
+        } else if !self.prefs_focus {
+            if pad { "Move    ·    [B] Back" } else { "[Arrows] Move    ·    [Esc] Back" }
+        } else if self.settings_tab == SettingsTab::Controller {
+            if pad {
+                "Move    ·    [L/R] Left/Right Option Columns    ·    [A] Select    ·    [B] Back"
+            } else {
+                "[Arrows] Move    ·    [Enter] Select    ·    [Esc] Back"
+            }
+        } else if pad {
+            "Move    ·    [A] Select    ·    [B] Back"
+        } else {
+            "[Arrows] Move    ·    [Enter] Select    ·    [Esc] Back"
+        };
+        let hint_font = egui::FontId::proportional(14.0 * s * sf);
+        let hy = full.max.y - 30.0 * s;
+        let hint_w = ui.fonts(|f| f.layout_no_wrap(hint.to_string(), hint_font.clone(), muted).size().x);
+        p.text(sp(egui::pos2(full.max.x - mx, hy)), egui::Align2::RIGHT_CENTER, hint, hint_font, muted);
+        if pad && !editing {
+            let dp_r = 8.0 * s * sf;
+            draw_dpad(&p, sp(egui::pos2(full.max.x - mx - hint_w - dp_r - 8.0 * s, hy)), dp_r, muted);
+        }
+
+        let content = egui::Rect::from_min_max(egui::pos2(side_x + side_w + 48.0 * s, side_top), egui::pos2(full.max.x - mx, footer_y - 20.0 * s));
+
+        if self.settings_tab == SettingsTab::General {
+            let backends = crate::app_settings::CpuBackend::all();
+            let rows: [(&str, String, bool); 3] = [
+                ("CPU Backend", self.app_settings.cpu_backend.label().to_string(), true),
+                ("GPU Backend", self.app_settings.gpu_backend.label().to_string(), true),
+                ("Resolution", self.app_settings.resolution_preset.label().to_string(), true),
+            ];
+            let n_rows = rows.len();
+            let key_idx = n_rows;
+            let n = n_rows + 1;
+            if !self.prefs_focus { self.prefs_row = 0; }
+            self.prefs_row = self.prefs_row.min(n - 1);
+            if self.prefs_focus && !editing && !block {
+                if nu && self.prefs_row > 0 { self.prefs_row -= 1; crate::ui_audio::play_move(); }
+                if nd && self.prefs_row + 1 < n { self.prefs_row += 1; crate::ui_audio::play_move(); }
+            }
+            let row_h = 60.0 * s;
+            let mut y = content.min.y + 4.0 * s;
+            let mut act_row = usize::MAX;
+            let mut dir = 0i32;
+            for (i, (label, value, interactive)) in rows.iter().enumerate() {
+                let base = egui::Rect::from_min_size(egui::pos2(content.min.x, y), egui::Vec2::new(content.width(), row_h - 12.0 * s));
+                let r = sr(base);
+                let selrow = self.prefs_focus && self.prefs_row == i;
+                if selrow {
+                    p.rect_filled(r, egui::Rounding::same(12.0 * s), sel);
+                    p.rect_stroke(r, egui::Rounding::same(12.0 * s), egui::Stroke::new(2.0, accent));
+                } else {
+                    p.rect_filled(r, egui::Rounding::same(12.0 * s), egui::Color32::from_rgba_unmultiplied(panel.r(), panel.g(), panel.b(), (ease * 90.0) as u8));
+                    p.rect_stroke(r, egui::Rounding::same(12.0 * s), egui::Stroke::new(1.0, border));
+                }
+                p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y)), egui::Align2::LEFT_CENTER, *label, egui::FontId::proportional(18.0 * s * sf), text);
+                let lx = base.max.x - 210.0 * s;
+                let rx = base.max.x - 22.0 * s;
+                let vcol = if *interactive && selrow { accent } else { muted };
+                if *interactive {
+                    p.text(sp(egui::pos2((lx + rx) * 0.5, base.center().y)), egui::Align2::CENTER_CENTER, value, egui::FontId::proportional(16.0 * s * sf), vcol);
+                    let la = egui::Rect::from_center_size(egui::pos2(lx, base.center().y), egui::Vec2::splat(34.0 * s));
+                    let ra = egui::Rect::from_center_size(egui::pos2(rx, base.center().y), egui::Vec2::splat(34.0 * s));
+                    p.text(sp(la.center()), egui::Align2::CENTER_CENTER, "\u{2039}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
+                    p.text(sp(ra.center()), egui::Align2::CENTER_CENTER, "\u{203A}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
+                    if !block && ui.rect_contains_pointer(r) {
+                        let rowc = ui.allocate_rect(r, egui::Sense::click()).clicked();
+                        let lc = ui.allocate_rect(sr(la), egui::Sense::click()).clicked();
+                        let rc = ui.allocate_rect(sr(ra), egui::Sense::click()).clicked();
+                        if lc || rc || rowc { self.prefs_focus = true; self.prefs_row = i; act_row = i; dir = if lc { -1 } else { 1 }; }
+                    }
+                } else {
+                    p.text(sp(egui::pos2(base.max.x - 22.0 * s, base.center().y)), egui::Align2::RIGHT_CENTER, value, egui::FontId::proportional(16.0 * s * sf), muted);
+                }
+                y += row_h;
+            }
+            if self.prefs_focus && self.prefs_row < n_rows && rows[self.prefs_row].2 && act_row == usize::MAX {
+                if nl { act_row = self.prefs_row; dir = -1; } else if nr || a_edge { act_row = self.prefs_row; dir = 1; }
+            }
+            if act_row != usize::MAX {
+                match act_row {
+                    0 => {
+                        let idx = backends.iter().position(|x| *x == self.app_settings.cpu_backend).unwrap_or(0);
+                        self.app_settings.cpu_backend = backends[((idx as i32 + dir).rem_euclid(backends.len() as i32)) as usize];
+                    }
+                    1 => {
+                        self.app_settings.gpu_backend = if dir >= 0 {
+                            self.app_settings.gpu_backend.next()
+                        } else {
+                            self.app_settings.gpu_backend.prev()
+                        };
+                    }
+                    2 => {
+                        self.app_settings.resolution_preset = if dir >= 0 {
+                            self.app_settings.resolution_preset.next()
+                        } else {
+                            self.app_settings.resolution_preset.prev()
+                        };
+                    }
+                    _ => {}
+                }
+                let _ = self.app_settings.save();
+                crate::ui_audio::play_move();
+            }
+            y += 12.0 * s;
+            p.text(sp(egui::pos2(content.min.x + 2.0 * s, y)), egui::Align2::LEFT_TOP, "STEAMGRIDDB", egui::FontId::proportional(13.0 * s * sf), muted);
+            y += 26.0 * s;
+            let key_h = 66.0 * s;
+            let key_base = egui::Rect::from_min_size(egui::pos2(content.min.x, y), egui::Vec2::new(content.width(), key_h));
+            let key_r = sr(key_base);
+            let key_sel = self.prefs_focus && self.prefs_row == key_idx;
+            p.rect_filled(key_r, egui::Rounding::same(12.0 * s), field_bg);
+            p.rect_stroke(key_r, egui::Rounding::same(12.0 * s), egui::Stroke::new(if key_sel || editing { 2.0 } else { 1.0 }, if key_sel || editing { accent } else { border }));
+            p.text(sp(egui::pos2(key_base.min.x + 18.0 * s, key_base.min.y + 14.0 * s)), egui::Align2::LEFT_TOP, "SteamGridDB API Key", egui::FontId::proportional(12.0 * s * sf), muted);
+            let ktx = key_base.min.x + 18.0 * s;
+            let ktmy = key_base.min.y + 46.0 * s;
+            let ktp = sp(egui::pos2(ktx, ktmy));
+            let kfont = egui::FontId::proportional(18.0 * s * sf);
+            let sel_col = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 90);
+            let blink = editing && (t * 1.6).fract() < 0.5;
+            let key_events = ui.input(|i| i.events.clone());
+            let fr = text_field(&p, ui, key_r, ktp.x, ktp.y, &mut self.app_settings.steamgriddb_key, &mut self.prefs_key_caret, &mut self.prefs_key_anchor, kfont, text, muted, sel_col, "Not set", true, 80, editing && !block, blink, if editing && !block { &key_events } else { &[] });
+            p.text(sp(egui::pos2(content.min.x + 2.0 * s, y + key_h + 12.0 * s)), egui::Align2::LEFT_TOP, "Get a key at steamgriddb.com/profile/preferences/api", egui::FontId::proportional(13.0 * s * sf), muted);
+            if fr.changed { let _ = self.app_settings.save(); }
+            if !block {
+                if fr.secondary_clicked {
+                    self.prefs_focus = true;
+                    self.prefs_row = key_idx;
+                    self.prefs_key_editing = true;
+                    self.prefs_key_menu = true;
+                } else if fr.clicked {
+                    self.prefs_focus = true;
+                    self.prefs_row = key_idx;
+                    self.prefs_key_editing = true;
+                } else if self.prefs_focus && self.prefs_row == key_idx && a_edge {
+                    if gp_a_edge {
+                        self.open_vkeyboard(VkTarget::ApiKey);
+                    } else {
+                        self.prefs_key_editing = true;
+                    }
+                }
+            }
+            if editing && (fr.commit || fr.cancel) { self.prefs_key_editing = false; let _ = self.app_settings.save(); }
+            if self.prefs_key_menu {
+                let items = ["Paste", "Copy", "Clear"];
+                let mw = 180.0 * s;
+                let ih = 42.0 * s;
+                let mtop = key_base.max.y + 6.0 * s;
+                let mrect = sr(egui::Rect::from_min_size(egui::pos2(key_base.min.x + 12.0 * s, mtop), egui::vec2(mw, ih * items.len() as f32 + 12.0 * s)));
+                p.rect_filled(mrect, egui::Rounding::same(10.0 * s), panel);
+                p.rect_stroke(mrect, egui::Rounding::same(10.0 * s), egui::Stroke::new(1.5, border));
+                let mut act: Option<usize> = None;
+                for (i, label) in items.iter().enumerate() {
+                    let ib = egui::Rect::from_min_size(egui::pos2(key_base.min.x + 18.0 * s, mtop + 6.0 * s + i as f32 * ih), egui::vec2(mw - 12.0 * s, ih - 4.0 * s));
+                    let ir = sr(ib);
+                    if ui.rect_contains_pointer(ir) {
+                        p.rect_filled(ir, egui::Rounding::same(8.0 * s), hover);
+                        if ui.allocate_rect(ir, egui::Sense::click()).clicked() { act = Some(i); }
+                    }
+                    p.text(sp(egui::pos2(ib.min.x + 12.0 * s, ib.center().y)), egui::Align2::LEFT_CENTER, *label, egui::FontId::proportional(16.0 * s * sf), text);
+                }
+                let outside = ui.input(|i| i.pointer.primary_clicked()) && !ui.rect_contains_pointer(mrect);
+                if let Some(a) = act {
+                    match a {
+                        0 => {
+                            let c = clipboard_text();
+                            for ch in c.chars() { if !ch.is_control() && self.app_settings.steamgriddb_key.chars().count() < 80 { self.app_settings.steamgriddb_key.push(ch); } }
+                            let _ = self.app_settings.save();
+                        }
+                        1 => { let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(self.app_settings.steamgriddb_key.clone())); }
+                        _ => { self.app_settings.steamgriddb_key.clear(); let _ = self.app_settings.save(); }
+                    }
+                    self.prefs_key_menu = false;
+                } else if outside {
+                    self.prefs_key_menu = false;
+                }
+            }
+        } else if self.settings_tab == SettingsTab::Graphics {
+            let scale = self.app_settings.output_scale.clamp(1, 3);
+            let on = |b: bool| if b { "On".to_string() } else { "Off".to_string() };
+            let rows: [(&str, String); 6] = [
+                ("Aspect Mode", self.app_settings.aspect.label().to_string()),
+                ("Output Scale", format!("{}x", scale)),
+                ("Texture Filter", self.app_settings.filter.label().to_string()),
+                ("High-DPI Aware", on(self.app_settings.dpi_aware)),
+                ("V-Sync", on(self.app_settings.vsync)),
+                ("Async Shaders", on(self.app_settings.async_shaders)),
+            ];
+            let n = rows.len();
+            if !self.prefs_focus { self.prefs_row = 0; }
+            self.prefs_row = self.prefs_row.min(n - 1);
+            if self.prefs_focus {
+                if nu && self.prefs_row > 0 { self.prefs_row -= 1; crate::ui_audio::play_move(); }
+                if nd && self.prefs_row + 1 < n { self.prefs_row += 1; crate::ui_audio::play_move(); }
+            }
+            let row_h = 62.0 * s;
+            let mut y = content.min.y + 4.0 * s;
+            let mut dir = 0i32;
+            for (i, (label, value)) in rows.iter().enumerate() {
+                let base = egui::Rect::from_min_size(egui::pos2(content.min.x, y), egui::Vec2::new(content.width(), row_h - 12.0 * s));
+                let r = sr(base);
+                let selrow = self.prefs_focus && i == self.prefs_row;
+                if selrow {
+                    p.rect_filled(r, egui::Rounding::same(12.0 * s), sel);
+                    p.rect_stroke(r, egui::Rounding::same(12.0 * s), egui::Stroke::new(2.0, accent));
+                } else {
+                    p.rect_filled(r, egui::Rounding::same(12.0 * s), egui::Color32::from_rgba_unmultiplied(panel.r(), panel.g(), panel.b(), (ease * 90.0) as u8));
+                    p.rect_stroke(r, egui::Rounding::same(12.0 * s), egui::Stroke::new(1.0, border));
+                }
+                p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y)), egui::Align2::LEFT_CENTER, *label, egui::FontId::proportional(18.0 * s * sf), text);
+                let val_col = if selrow { accent } else { muted };
+                let lx = base.max.x - 150.0 * s;
+                let rx = base.max.x - 22.0 * s;
+                p.text(sp(egui::pos2((lx + rx) * 0.5, base.center().y)), egui::Align2::CENTER_CENTER, value, egui::FontId::proportional(16.0 * s * sf), val_col);
+                let la = egui::Rect::from_center_size(egui::pos2(lx, base.center().y), egui::Vec2::splat(34.0 * s));
+                let ra = egui::Rect::from_center_size(egui::pos2(rx, base.center().y), egui::Vec2::splat(34.0 * s));
+                p.text(sp(la.center()), egui::Align2::CENTER_CENTER, "\u{2039}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
+                p.text(sp(ra.center()), egui::Align2::CENTER_CENTER, "\u{203A}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
+                if ui.rect_contains_pointer(r) {
+                    let rowc = ui.allocate_rect(r, egui::Sense::click()).clicked();
+                    let lc = ui.allocate_rect(sr(la), egui::Sense::click()).clicked();
+                    let rc = ui.allocate_rect(sr(ra), egui::Sense::click()).clicked();
+                    if lc || rc || rowc {
+                        self.prefs_focus = true;
+                        self.prefs_row = i;
+                        if lc { dir = -1; } else if rc { dir = 1; } else { dir = 1; }
+                    }
+                }
+                y += row_h;
+            }
+            if self.prefs_focus && dir == 0 {
+                if nl { dir = -1; } else if nr || a_edge { dir = 1; }
+            }
+            if dir != 0 {
+                match self.prefs_row {
+                    0 => {
+                        let all = crate::app_settings::AspectMode::all();
+                        let idx = all.iter().position(|x| *x == self.app_settings.aspect).unwrap_or(0);
+                        self.app_settings.aspect = all[((idx as i32 + dir).rem_euclid(all.len() as i32)) as usize];
+                    }
+                    1 => {
+                        self.app_settings.output_scale = (((scale as i32 - 1 + dir).rem_euclid(3)) + 1) as u8;
+                    }
+                    2 => {
+                        let all = crate::app_settings::FilterMode::all();
+                        let idx = all.iter().position(|x| *x == self.app_settings.filter).unwrap_or(0);
+                        self.app_settings.filter = all[((idx as i32 + dir).rem_euclid(all.len() as i32)) as usize];
+                    }
+                    3 => self.app_settings.dpi_aware = !self.app_settings.dpi_aware,
+                    4 => self.app_settings.vsync = !self.app_settings.vsync,
+                    5 => {
+                        self.app_settings.async_shaders = !self.app_settings.async_shaders;
+                        nexium_common::async_compile::set_enabled(self.app_settings.async_shaders);
+                    }
+                    _ => {}
+                }
+                let _ = self.app_settings.save();
+                crate::ui_audio::play_move();
+            }
+        } else if self.settings_tab == SettingsTab::Controller {
+            let (nu, nd, nl, nr) = if nav_stick { (false, false, false, false) } else { (nu, nd, nl, nr) };
+            let events = ui.input(|i| i.events.clone());
+            if let Some(btn) = self.rebinding {
+                let mut done: Option<String> = None;
+                let mut cancel = false;
+                for ev in &events {
+                    if let egui::Event::Key { key, pressed: true, .. } = ev {
+                        if *key == egui::Key::Escape { cancel = true; } else { done = Some(format!("{:?}", key)); }
+                    }
+                }
+                if cancel { self.rebinding = None; crate::ui_audio::play(crate::ui_audio::Sfx::Back); }
+                else if let Some(k) = done {
+                    self.controller_config.set_binding(btn, k);
+                    self.rebinding = None;
+                    let _ = self.controller_config.save();
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                }
+            } else if self.rebinding_pad.is_some() {
+                let esc = events.iter().any(|ev| matches!(ev, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. }));
+                if esc { self.rebinding_pad = None; crate::ui_audio::play(crate::ui_audio::Sfx::Back); }
+            }
+
+            let kb = self.input_device == InputDevice::Keyboard;
+            let binds: Vec<SwitchButton> = if kb { SwitchButton::all().to_vec() } else { ControllerConfig::pad_list().to_vec() };
+            let n = binds.len() + 1;
+            if !self.prefs_focus {
+                self.prefs_row = 0;
+                self.prefs_col = 0;
+            }
+
+            let nav_gamepads = self.input.as_ref().map(|ib| ib.list_gamepads()).unwrap_or_default();
+
+            // Column switching (disabled while the dropdown is open)
+            if self.prefs_focus && !rebinding_active && !self.prefs_dropdown_open {
+                if r_bumper_edge || (self.prefs_col == 0 && self.prefs_row >= 1 && nr) {
+                    self.prefs_col = 1;
+                    self.prefs_col1_row = 0;
+                    crate::ui_audio::play_move();
+                } else if l_bumper_edge || (self.prefs_col == 1 && self.prefs_col1_row == 0 && nl) {
+                    self.prefs_col = 0;
+                    crate::ui_audio::play_move();
+                }
+            }
+
+            self.prefs_row = self.prefs_row.min(n - 1);
+
+            // Column 0 (bindings list) row navigation
+            if self.prefs_focus && self.prefs_col == 0 && !rebinding_active {
+                if nu && self.prefs_row > 0 { self.prefs_row -= 1; crate::ui_audio::play_move(); }
+                if nd && self.prefs_row + 1 < n { self.prefs_row += 1; crate::ui_audio::play_move(); }
+            }
+
+            // Column 1 (controller selector + deadzone sliders)
+            if self.prefs_focus && self.prefs_col == 1 && !rebinding_active {
+                if self.prefs_dropdown_open {
+                    let cnt = nav_gamepads.len().max(1);
+                    if nu { self.prefs_dropdown_sel = (self.prefs_dropdown_sel + cnt - 1) % cnt; crate::ui_audio::play_move(); }
+                    if nd { self.prefs_dropdown_sel = (self.prefs_dropdown_sel + 1) % cnt; crate::ui_audio::play_move(); }
+                    if a_edge {
+                        if let Some((gid, _)) = nav_gamepads.get(self.prefs_dropdown_sel) {
+                            let gid = *gid;
+                            if let Some(ref mut ib) = self.input { ib.set_active_id(gid); }
+                        }
+                        self.prefs_dropdown_open = false;
+                        crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                    }
+                    if b_edge { self.prefs_dropdown_open = false; b_edge = false; crate::ui_audio::play(crate::ui_audio::Sfx::Back); }
+                } else {
+                    if nu && self.prefs_col1_row > 0 { self.prefs_col1_row -= 1; crate::ui_audio::play_move(); }
+                    if nd && self.prefs_col1_row < 2 { self.prefs_col1_row += 1; crate::ui_audio::play_move(); }
+                    match self.prefs_col1_row {
+                        0 => {
+                            if a_edge {
+                                let active_id = self.input.as_ref().and_then(|ib| ib.get_active_id());
+                                self.prefs_dropdown_sel = active_id.and_then(|id| nav_gamepads.iter().position(|(g, _)| *g == id)).unwrap_or(0);
+                                self.prefs_dropdown_open = true;
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+                            }
+                        }
+                        1 => {
+                            if nl { self.app_settings.left_deadzone = (self.app_settings.left_deadzone - 0.02).clamp(0.0, 0.5); let _ = self.app_settings.save(); crate::ui_audio::play_move(); }
+                            if nr { self.app_settings.left_deadzone = (self.app_settings.left_deadzone + 0.02).clamp(0.0, 0.5); let _ = self.app_settings.save(); crate::ui_audio::play_move(); }
+                        }
+                        _ => {
+                            if nl { self.app_settings.right_deadzone = (self.app_settings.right_deadzone - 0.02).clamp(0.0, 0.5); let _ = self.app_settings.save(); crate::ui_audio::play_move(); }
+                            if nr { self.app_settings.right_deadzone = (self.app_settings.right_deadzone + 0.02).clamp(0.0, 0.5); let _ = self.app_settings.save(); crate::ui_audio::play_move(); }
+                        }
+                    }
+                }
+            }
+            if !self.prefs_focus || self.prefs_col != 1 { self.prefs_dropdown_open = false; }
+
+            let head_h = 56.0 * s;
+            let list_w = (content.width() * 0.46).max(300.0 * s);
+            let head = egui::Rect::from_min_size(egui::pos2(content.min.x, content.min.y + 2.0 * s), egui::Vec2::new(list_w, head_h - 10.0 * s));
+            let hr = sr(head);
+            let head_sel = self.prefs_focus && self.prefs_col == 0 && self.prefs_row == 0;
+            if head_sel {
+                p.rect_filled(hr, egui::Rounding::same(12.0 * s), sel);
+                p.rect_stroke(hr, egui::Rounding::same(12.0 * s), egui::Stroke::new(2.0, accent));
+            } else {
+                p.rect_filled(hr, egui::Rounding::same(12.0 * s), egui::Color32::from_rgba_unmultiplied(panel.r(), panel.g(), panel.b(), (ease * 90.0) as u8));
+                p.rect_stroke(hr, egui::Rounding::same(12.0 * s), egui::Stroke::new(1.0, border));
+            }
+            p.text(sp(egui::pos2(head.min.x + 22.0 * s, head.center().y)), egui::Align2::LEFT_CENTER, "Input Device", egui::FontId::proportional(18.0 * s * sf), text);
+            let dev_val = if kb { "Keyboard" } else { "Gamepad" };
+            let dvcol = if head_sel { accent } else { muted };
+            let hlx = head.max.x - 150.0 * s;
+            let hrx = head.max.x - 22.0 * s;
+            p.text(sp(egui::pos2((hlx + hrx) * 0.5, head.center().y)), egui::Align2::CENTER_CENTER, dev_val, egui::FontId::proportional(16.0 * s * sf), dvcol);
+            let hla = egui::Rect::from_center_size(egui::pos2(hlx, head.center().y), egui::Vec2::splat(34.0 * s));
+            let hra = egui::Rect::from_center_size(egui::pos2(hrx, head.center().y), egui::Vec2::splat(34.0 * s));
+            p.text(sp(hla.center()), egui::Align2::CENTER_CENTER, "\u{2039}", egui::FontId::proportional(22.0 * s * sf), dvcol);
+            p.text(sp(hra.center()), egui::Align2::CENTER_CENTER, "\u{203A}", egui::FontId::proportional(22.0 * s * sf), dvcol);
+            let mut dev_toggle = false;
+            if !rebinding_active && ui.rect_contains_pointer(hr) {
+                let hc = ui.allocate_rect(hr, egui::Sense::click()).clicked();
+                let hlc = ui.allocate_rect(sr(hla), egui::Sense::click()).clicked();
+                let hrc = ui.allocate_rect(sr(hra), egui::Sense::click()).clicked();
+                if hc || hlc || hrc { self.prefs_focus = true; self.prefs_row = 0; self.prefs_col = 0; dev_toggle = true; }
+            }
+            if self.prefs_focus && self.prefs_col == 0 && self.prefs_row == 0 && !rebinding_active && (nl || nr || a_edge) { dev_toggle = true; }
+            if dev_toggle {
+                self.input_device = if kb { InputDevice::Gamepad } else { InputDevice::Keyboard };
+                self.prefs_row = 0;
+                crate::ui_audio::play_move();
+            }
+
+            let pad_label = |g: crate::controller_config::GpButton| -> &'static str {
+                use crate::controller_config::GpButton::*;
+                match g {
+                    South => "Bottom Btn", East => "Right Btn", West => "Left Btn", North => "Top Btn",
+                    L => "L Bumper", R => "R Bumper", ZL => "L Trigger", ZR => "R Trigger",
+                    Plus => "Start", Minus => "Back", LStick => "L Stick", RStick => "R Stick",
+                    Up => "Pad Up", Down => "Pad Down", Left => "Pad Left", Right => "Pad Right",
+                }
+            };
+            let list_top = content.min.y + head_h + 6.0 * s;
+            let list_right = content.min.x + list_w;
+            let row_h = 48.0 * s;
+            let avail = (content.max.y - list_top).max(row_h);
+            let vis = (avail / row_h).floor().max(1.0) as usize;
+            let selb = if self.prefs_row >= 1 { self.prefs_row - 1 } else { 0 };
+            let max_first = binds.len().saturating_sub(vis);
+            let list_clip = sr(egui::Rect::from_min_max(egui::pos2(content.min.x, list_top - 2.0 * s), egui::pos2(list_right, content.max.y)));
+            let hover_in_list = ctx.input(|i| i.pointer.hover_pos().map_or(false, |p| list_clip.contains(p)));
+            if hover_in_list {
+                // Use smooth_scroll_delta only (raw_scroll_delta double-counts on some platforms).
+                // Sign-based stepping gives exactly 1 row per wheel notch regardless of delta magnitude.
+                let wheel = ctx.input(|i| i.smooth_scroll_delta.y);
+                if wheel > 2.0 {
+                    self.prefs_ctrl_scroll = self.prefs_ctrl_scroll.saturating_sub(1);
+                } else if wheel < -2.0 {
+                    self.prefs_ctrl_scroll = (self.prefs_ctrl_scroll + 1).min(max_first);
+                }
+            }
+            if self.prefs_focus && self.prefs_col == 0 {
+                if selb < self.prefs_ctrl_scroll { self.prefs_ctrl_scroll = selb; }
+                if selb >= self.prefs_ctrl_scroll + vis { self.prefs_ctrl_scroll = selb + 1 - vis; }
+            }
+            if vis < binds.len() {
+                let track = sr(egui::Rect::from_min_max(egui::pos2(list_right - 9.0 * s, list_top), egui::pos2(list_right - 2.0 * s, content.max.y)));
+                let tresp = ui.allocate_rect(track, egui::Sense::click_and_drag());
+                if (tresp.dragged() || tresp.clicked()) && !rebinding_active {
+                    if let Some(pos) = tresp.interact_pointer_pos() {
+                        let frac = ((pos.y - track.min.y) / track.height().max(1.0)).clamp(0.0, 1.0);
+                        self.prefs_ctrl_scroll = (frac * max_first as f32).round() as usize;
+                    }
+                }
+            }
+            self.prefs_ctrl_scroll = self.prefs_ctrl_scroll.min(max_first);
+            let first = self.prefs_ctrl_scroll;
+            let lp = p.with_clip_rect(list_clip);
+            let mut clicked_bind: Option<usize> = None;
+            for vi in 0..vis {
+                let bi = first + vi;
+                if bi >= binds.len() { break; }
+                let btn = binds[bi];
+                let base = egui::Rect::from_min_size(egui::pos2(content.min.x, list_top + vi as f32 * row_h), egui::Vec2::new(list_w - 10.0 * s, row_h - 8.0 * s));
+                let r = sr(base);
+                let selrow = self.prefs_focus && self.prefs_col == 0 && self.prefs_row == bi + 1;
+                let this_rebind = (kb && self.rebinding == Some(btn)) || (!kb && self.rebinding_pad == Some(btn));
+                if this_rebind {
+                    lp.rect_filled(r, egui::Rounding::same(10.0 * s), egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 40));
+                    lp.rect_stroke(r, egui::Rounding::same(10.0 * s), egui::Stroke::new(2.0, accent));
+                } else if selrow {
+                    lp.rect_filled(r, egui::Rounding::same(10.0 * s), sel);
+                    lp.rect_stroke(r, egui::Rounding::same(10.0 * s), egui::Stroke::new(2.0, accent));
+                } else {
+                    lp.rect_filled(r, egui::Rounding::same(10.0 * s), egui::Color32::from_rgba_unmultiplied(panel.r(), panel.g(), panel.b(), (ease * 70.0) as u8));
+                    lp.rect_stroke(r, egui::Rounding::same(10.0 * s), egui::Stroke::new(1.0, border));
+                }
+                lp.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y)), egui::Align2::LEFT_CENTER, btn.display_name(), egui::FontId::proportional(16.0 * s * sf), text);
+                let cur = if kb {
+                    self.controller_config.binding_for(btn).unwrap_or("\u{2014}").to_string()
+                } else {
+                    self.controller_config.pad_for(btn).map(pad_label).unwrap_or("\u{2014}").to_string()
+                };
+                let vcol = if this_rebind { accent } else if selrow { accent } else { muted };
+                let vtext = if this_rebind { "Press a key\u{2026}".to_string() } else { cur };
+                lp.text(sp(egui::pos2(base.max.x - 22.0 * s, base.center().y)), egui::Align2::RIGHT_CENTER, &vtext, egui::FontId::proportional(15.0 * s * sf), vcol);
+                if !rebinding_active && ui.rect_contains_pointer(r) && ui.allocate_rect(r, egui::Sense::click()).clicked() {
+                    clicked_bind = Some(bi);
+                }
+            }
+            if vis < binds.len() {
+                let sb_x = list_right - 8.0 * s;
+                p.rect_filled(sr(egui::Rect::from_min_size(egui::pos2(sb_x, list_top), egui::Vec2::new(5.0 * s, avail))), egui::Rounding::same(3.0 * s), egui::Color32::from_rgba_unmultiplied(muted.r(), muted.g(), muted.b(), 40));
+                let frac_h = (vis as f32 / binds.len() as f32) * avail;
+                let frac_y = list_top + (first as f32 / binds.len().max(1) as f32) * avail;
+                p.rect_filled(sr(egui::Rect::from_min_size(egui::pos2(sb_x, frac_y), egui::Vec2::new(5.0 * s, frac_h))), egui::Rounding::same(3.0 * s), egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 200));
+            }
+
+            let hl_btn: Option<SwitchButton> = if kb {
+                self.rebinding.or(if self.prefs_focus && self.prefs_col == 0 && self.prefs_row >= 1 { Some(binds[selb]) } else { None })
+            } else {
+                self.rebinding_pad.or(if self.prefs_focus && self.prefs_col == 0 && self.prefs_row >= 1 { Some(binds[selb]) } else { None })
+            };
+            let cw_area = egui::Rect::from_min_max(egui::pos2(list_right + 30.0 * s, list_top), egui::pos2(content.max.x, content.max.y));
+            let controller_area = egui::Rect::from_min_max(
+                egui::pos2(cw_area.min.x, cw_area.min.y),
+                egui::pos2(cw_area.max.x, cw_area.max.y - 135.0 * s)
+            );
+            let cw = controller_area.width().min(controller_area.height() * 1.34);
+            let ch = cw / 1.34;
+            let cbase = egui::Rect::from_center_size(controller_area.center(), egui::Vec2::new(cw, ch));
+
+            // Query gamepad information
+            let mut gamepads = Vec::new();
+            let mut active_id = None;
+            if let Some(ref ib) = self.input {
+                gamepads = ib.list_gamepads();
+                active_id = ib.get_active_id();
+            }
+
+            // Draw controller selection tab (shifted up to align with Input Device row)
+            let tab_rect = egui::Rect::from_min_max(
+                egui::pos2(cbase.min.x, content.min.y + 2.0 * s),
+                egui::pos2(cbase.max.x, content.min.y + 2.0 * s + head_h - 10.0 * s)
+            );
+            let tab_sr = sr(tab_rect);
+
+            // Draw the tab background and border (highlighted if focused/active column)
+            let tab_focused = self.prefs_focus && self.prefs_col == 1 && self.prefs_col1_row == 0;
+            if tab_focused {
+                p.rect_filled(tab_sr, egui::Rounding::same(8.0 * s), sel);
+                p.rect_stroke(tab_sr, egui::Rounding::same(8.0 * s), egui::Stroke::new(2.0, accent));
+            } else {
+                p.rect_filled(tab_sr, egui::Rounding::same(8.0 * s), egui::Color32::from_rgba_unmultiplied(panel.r(), panel.g(), panel.b(), (ease * 90.0) as u8));
+                p.rect_stroke(tab_sr, egui::Rounding::same(8.0 * s), egui::Stroke::new(1.0, border));
+            }
+
+            // Draw the divider line in the middle of the pill
+            let divider_x = tab_sr.min.x + 130.0 * s * sf;
+            p.line_segment(
+                [egui::pos2(divider_x, tab_sr.min.y + 6.0 * s * sf), egui::pos2(divider_x, tab_sr.max.y - 6.0 * s * sf)],
+                egui::Stroke::new(1.0, border)
+            );
+
+            // Draw the label "Controller" in the left part
+            p.text(
+                sp(egui::pos2(tab_rect.min.x + 15.0 * s, tab_rect.center().y)),
+                egui::Align2::LEFT_CENTER,
+                "Controller",
+                egui::FontId::proportional(14.0 * s * sf),
+                text
+            );
+
+            let selected_name = if let Some(id) = active_id {
+                gamepads.iter().find(|(gid, _)| *gid == id).map(|(_, name)| name.clone()).unwrap_or_else(|| "Gamepad".to_string())
+            } else {
+                "No Gamepad Connected".to_string()
+            };
+            let name_col = if gamepads.is_empty() { muted } else { text };
+            let name_x = divider_x + 12.0 * s * sf;
+            let name_clip = egui::Rect::from_min_max(egui::pos2(name_x - 2.0 * s, tab_sr.min.y), egui::pos2(tab_sr.max.x - 22.0 * s * sf, tab_sr.max.y));
+            let np = p.with_clip_rect(name_clip);
+            np.text(sp(egui::pos2(name_x, tab_rect.center().y)), egui::Align2::LEFT_CENTER, &selected_name, egui::FontId::proportional(14.0 * s * sf), name_col);
+
+            let cvx = tab_rect.max.x - 16.0 * s;
+            let cvy = tab_rect.center().y;
+            let cv_col = if tab_focused { accent } else { muted };
+            let cv_stroke = egui::Stroke::new(1.6 * sf, cv_col);
+            if self.prefs_dropdown_open {
+                p.line_segment([sp(egui::pos2(cvx - 5.0 * s, cvy + 3.0 * s)), sp(egui::pos2(cvx, cvy - 3.0 * s))], cv_stroke);
+                p.line_segment([sp(egui::pos2(cvx, cvy - 3.0 * s)), sp(egui::pos2(cvx + 5.0 * s, cvy + 3.0 * s))], cv_stroke);
+            } else {
+                p.line_segment([sp(egui::pos2(cvx - 5.0 * s, cvy - 3.0 * s)), sp(egui::pos2(cvx, cvy + 3.0 * s))], cv_stroke);
+                p.line_segment([sp(egui::pos2(cvx, cvy + 3.0 * s)), sp(egui::pos2(cvx + 5.0 * s, cvy - 3.0 * s))], cv_stroke);
+            }
+
+            if !rebinding_active && ui.rect_contains_pointer(tab_sr) && ui.allocate_rect(tab_sr, egui::Sense::click()).clicked() {
+                self.prefs_focus = true;
+                self.prefs_col = 1;
+                self.prefs_col1_row = 0;
+                if self.prefs_dropdown_open {
+                    self.prefs_dropdown_open = false;
+                } else {
+                    self.prefs_dropdown_sel = active_id.and_then(|id| gamepads.iter().position(|(g, _)| *g == id)).unwrap_or(0);
+                    self.prefs_dropdown_open = true;
+                }
+            }
+
+            draw_controller(&p, sr(cbase), hl_btn, accent, lightish, &self.last_input);
+
+            if self.prefs_dropdown_open {
+                let items = gamepads.len().max(1);
+                let ih = 40.0 * s;
+                let dd = egui::Rect::from_min_max(
+                    egui::pos2(tab_rect.min.x, tab_rect.max.y + 5.0 * s),
+                    egui::pos2(tab_rect.max.x, tab_rect.max.y + 5.0 * s + ih * items as f32 + 8.0 * s),
+                );
+                let dd_sr = sr(dd);
+                p.rect_filled(dd_sr, egui::Rounding::same(9.0 * s), panel);
+                p.rect_stroke(dd_sr, egui::Rounding::same(9.0 * s), egui::Stroke::new(1.5, accent));
+                if gamepads.is_empty() {
+                    p.text(sp(egui::pos2(dd.center().x, dd.min.y + 4.0 * s + ih * 0.5)), egui::Align2::CENTER_CENTER, "No gamepads detected", egui::FontId::proportional(13.0 * s * sf), muted);
+                } else {
+                    for (i, (gid, gname)) in gamepads.iter().enumerate() {
+                        let ib_rect = egui::Rect::from_min_size(egui::pos2(dd.min.x + 6.0 * s, dd.min.y + 4.0 * s + i as f32 * ih), egui::vec2(dd.width() - 12.0 * s, ih - 2.0 * s));
+                        let ir = sr(ib_rect);
+                        let sel_item = self.prefs_dropdown_sel == i;
+                        let is_active = Some(*gid) == active_id;
+                        if sel_item {
+                            p.rect_filled(ir, egui::Rounding::same(6.0 * s), egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 70));
+                        } else if ui.rect_contains_pointer(ir) {
+                            p.rect_filled(ir, egui::Rounding::same(6.0 * s), hover);
+                        }
+                        let ip = p.with_clip_rect(ir);
+                        ip.text(sp(egui::pos2(ib_rect.min.x + 12.0 * s, ib_rect.center().y)), egui::Align2::LEFT_CENTER, gname, egui::FontId::proportional(13.0 * s * sf), if sel_item { accent } else { text });
+                        if is_active {
+                            p.text(sp(egui::pos2(ib_rect.max.x - 12.0 * s, ib_rect.center().y)), egui::Align2::RIGHT_CENTER, "\u{2022}", egui::FontId::proportional(18.0 * s * sf), accent);
+                        }
+                        if !rebinding_active && ui.rect_contains_pointer(ir) && ui.allocate_rect(ir, egui::Sense::click()).clicked() {
+                            let gid = *gid;
+                            if let Some(ref mut ib) = self.input {
+                                ib.set_active_id(gid);
+                            }
+                            self.prefs_dropdown_open = false;
+                        }
+                    }
+                }
+                let outside = ui.input(|i| i.pointer.primary_clicked()) && !ui.rect_contains_pointer(dd_sr) && !ui.rect_contains_pointer(tab_sr);
+                if outside { self.prefs_dropdown_open = false; }
+            }
+
+            // Draw visual joystick deadzone preview & sliders below the controller graphic
+            let vis_center_y = cbase.max.y + 40.0 * s;
+            
+            // Draw left stick circle
+            let ls_center = egui::pos2(cw_area.center().x - 90.0 * s, vis_center_y);
+            let rs_center = egui::pos2(cw_area.center().x + 90.0 * s, vis_center_y);
+            let circle_r = 38.0 * s;
+            
+            // Background circles
+            p.circle_filled(sp(ls_center), circle_r, egui::Color32::from_rgba_unmultiplied(panel.r(), panel.g(), panel.b(), 100));
+            p.circle_stroke(sp(ls_center), circle_r, egui::Stroke::new(1.0, border));
+            p.circle_filled(sp(rs_center), circle_r, egui::Color32::from_rgba_unmultiplied(panel.r(), panel.g(), panel.b(), 100));
+            p.circle_stroke(sp(rs_center), circle_r, egui::Stroke::new(1.0, border));
+            
+            // Deadzone shaded area (outline and fill)
+            let ls_dz_r = circle_r * self.app_settings.left_deadzone;
+            let rs_dz_r = circle_r * self.app_settings.right_deadzone;
+            p.circle_filled(sp(ls_center), ls_dz_r, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 60));
+            p.circle_stroke(sp(ls_center), ls_dz_r, egui::Stroke::new(1.2, accent));
+            p.circle_filled(sp(rs_center), rs_dz_r, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 60));
+            p.circle_stroke(sp(rs_center), rs_dz_r, egui::Stroke::new(1.2, accent));
+
+            // Crosshairs
+            p.line_segment([sp(egui::pos2(ls_center.x - circle_r, ls_center.y)), sp(egui::pos2(ls_center.x + circle_r, ls_center.y))], egui::Stroke::new(0.5, border));
+            p.line_segment([sp(egui::pos2(ls_center.x, ls_center.y - circle_r)), sp(egui::pos2(ls_center.x, ls_center.y + circle_r))], egui::Stroke::new(0.5, border));
+            p.line_segment([sp(egui::pos2(rs_center.x - circle_r, rs_center.y)), sp(egui::pos2(rs_center.x + circle_r, rs_center.y))], egui::Stroke::new(0.5, border));
+            p.line_segment([sp(egui::pos2(rs_center.x, rs_center.y - circle_r)), sp(egui::pos2(rs_center.x, rs_center.y + circle_r))], egui::Stroke::new(0.5, border));
+
+            // Stick aim dots (limit raw values to -1.0..=1.0 circle)
+            let ls_raw = [self.last_input.raw_sticks[0], self.last_input.raw_sticks[1]];
+            let rs_raw = [self.last_input.raw_sticks[2], self.last_input.raw_sticks[3]];
+            
+            let ls_dot = egui::pos2(ls_center.x + ls_raw[0] * circle_r, ls_center.y - ls_raw[1] * circle_r);
+            let rs_dot = egui::pos2(rs_center.x + rs_raw[0] * circle_r, rs_center.y - rs_raw[1] * circle_r);
+            
+            // Draw line from center to dot
+            p.line_segment([sp(ls_center), sp(ls_dot)], egui::Stroke::new(1.5, accent));
+            p.line_segment([sp(rs_center), sp(rs_dot)], egui::Stroke::new(1.5, accent));
+            
+            p.circle_filled(sp(ls_dot), 4.0 * s, accent);
+            p.circle_stroke(sp(ls_dot), 4.0 * s, egui::Stroke::new(1.0, text));
+            p.circle_filled(sp(rs_dot), 4.0 * s, accent);
+            p.circle_stroke(sp(rs_dot), 4.0 * s, egui::Stroke::new(1.0, text));
+
+            // Text labels
+            p.text(sp(egui::pos2(ls_center.x, ls_center.y - circle_r - 12.0 * s)), egui::Align2::CENTER_CENTER, "Left Stick", egui::FontId::proportional(11.0 * s * sf), text);
+            p.text(sp(egui::pos2(rs_center.x, rs_center.y - circle_r - 12.0 * s)), egui::Align2::CENTER_CENTER, "Right Stick", egui::FontId::proportional(11.0 * s * sf), text);
+
+            let dz_sel = self.prefs_focus && self.prefs_col == 1 && !self.prefs_dropdown_open;
+            let mut dz_drag: Option<(bool, f32)> = None;
+            let dz_slider = |p: &egui::Painter, cx: f32, label: &str, value: f32, selected: bool| -> egui::Rect {
+                let track_w = 150.0 * s;
+                let ty = cbase.max.y + 100.0 * s;
+                let tl = cx - track_w * 0.5;
+                let tr = cx + track_w * 0.5;
+                p.text(sp(egui::pos2(cx, ty - 20.0 * s)), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(11.0 * s * sf), if selected { accent } else { text });
+                let track = egui::Rect::from_min_max(egui::pos2(tl, ty - 3.0 * s), egui::pos2(tr, ty + 3.0 * s));
+                p.rect_filled(sr(track), egui::Rounding::same(3.0 * s), egui::Color32::from_rgba_unmultiplied(muted.r(), muted.g(), muted.b(), 70));
+                let frac = (value / 0.5).clamp(0.0, 1.0);
+                let knobx = tl + frac * (tr - tl);
+                let fill = egui::Rect::from_min_max(egui::pos2(tl, ty - 3.0 * s), egui::pos2(knobx, ty + 3.0 * s));
+                p.rect_filled(sr(fill), egui::Rounding::same(3.0 * s), accent);
+                if selected {
+                    p.rect_stroke(sr(track.expand(4.0 * s)), egui::Rounding::same(6.0 * s), egui::Stroke::new(1.5, accent));
+                }
+                p.circle(sp(egui::pos2(knobx, ty)), 8.0 * s * sf, if selected { accent } else { text }, egui::Stroke::new(2.0, accent));
+                p.text(sp(egui::pos2(cx, ty + 20.0 * s)), egui::Align2::CENTER_CENTER, format!("{:.0}%", value * 200.0), egui::FontId::proportional(11.0 * s * sf), if selected { accent } else { muted });
+                sr(egui::Rect::from_min_max(egui::pos2(tl, ty - 14.0 * s), egui::pos2(tr, ty + 14.0 * s)))
+            };
+            let lgrab = dz_slider(&p, cw_area.center().x - 90.0 * s, "L Deadzone", self.app_settings.left_deadzone, dz_sel && self.prefs_col1_row == 1);
+            let rgrab = dz_slider(&p, cw_area.center().x + 90.0 * s, "R Deadzone", self.app_settings.right_deadzone, dz_sel && self.prefs_col1_row == 2);
+            if !rebinding_active && !self.prefs_dropdown_open {
+                for (is_left, grab) in [(true, lgrab), (false, rgrab)] {
+                    if ui.rect_contains_pointer(grab) {
+                        let resp = ui.allocate_rect(grab, egui::Sense::click_and_drag());
+                        if resp.dragged() || resp.clicked() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                let frac = ((pos.x - grab.min.x) / grab.width().max(1.0)).clamp(0.0, 1.0);
+                                dz_drag = Some((is_left, frac * 0.5));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((is_left, v)) = dz_drag {
+                self.prefs_focus = true;
+                self.prefs_col = 1;
+                if is_left { self.app_settings.left_deadzone = v; self.prefs_col1_row = 1; }
+                else { self.app_settings.right_deadzone = v; self.prefs_col1_row = 2; }
+                let _ = self.app_settings.save();
+            }
+            let start_rebind = |app: &mut Self, bi: usize| {
+                let btn = binds[bi];
+                app.prefs_focus = true;
+                app.prefs_row = bi + 1;
+                if kb {
+                    app.rebinding = Some(btn);
+                } else {
+                    app.rebinding_pad = Some(btn);
+                    app.rebinding_pad_wait_release = true;
+                }
+                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+            };
+            if let Some(bi) = clicked_bind { start_rebind(self, bi); }
+            else if self.prefs_focus && self.prefs_row >= 1 && !rebinding_active && a_edge { start_rebind(self, self.prefs_row - 1); }
+        } else if self.settings_tab == SettingsTab::Audio {
+            let n = 4usize;
+            if !self.prefs_focus { self.prefs_row = 0; }
+            self.prefs_row = self.prefs_row.min(n - 1);
+            if self.prefs_focus && !block {
+                if nu && self.prefs_row > 0 { self.prefs_row -= 1; crate::ui_audio::play_move(); }
+                if nd && self.prefs_row + 1 < n { self.prefs_row += 1; crate::ui_audio::play_move(); }
+            }
+            let labels = ["Master Volume", "Music Volume", "Sound Effects", "Mute Music"];
+            let vals = [self.app_settings.audio_volume, self.app_settings.music_volume, self.app_settings.sfx_volume];
+            let row_h = 66.0 * s;
+            let mut y = content.min.y + 6.0 * s;
+            let mut drag_set: Option<(usize, f32)> = None;
+            for i in 0..n {
+                let base = egui::Rect::from_min_size(egui::pos2(content.min.x, y), egui::Vec2::new(content.width(), row_h - 12.0 * s));
+                let r = sr(base);
+                let selrow = self.prefs_focus && self.prefs_row == i;
+                if selrow {
+                    p.rect_filled(r, egui::Rounding::same(12.0 * s), sel);
+                    p.rect_stroke(r, egui::Rounding::same(12.0 * s), egui::Stroke::new(2.0, accent));
+                } else {
+                    p.rect_filled(r, egui::Rounding::same(12.0 * s), egui::Color32::from_rgba_unmultiplied(panel.r(), panel.g(), panel.b(), (ease * 90.0) as u8));
+                    p.rect_stroke(r, egui::Rounding::same(12.0 * s), egui::Stroke::new(1.0, border));
+                }
+                p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y)), egui::Align2::LEFT_CENTER, labels[i], egui::FontId::proportional(18.0 * s * sf), text);
+                if i < 3 {
+                    let val = vals[i];
+                    let tl = base.min.x + 230.0 * s;
+                    let tr = base.max.x - 96.0 * s;
+                    let ty = base.center().y;
+                    let track = egui::Rect::from_min_max(egui::pos2(tl, ty - 3.0 * s), egui::pos2(tr, ty + 3.0 * s));
+                    p.rect_filled(sr(track), egui::Rounding::same(3.0 * s), egui::Color32::from_rgba_unmultiplied(muted.r(), muted.g(), muted.b(), 70));
+                    let knobx = tl + val * (tr - tl);
+                    let fill = egui::Rect::from_min_max(egui::pos2(tl, ty - 3.0 * s), egui::pos2(knobx, ty + 3.0 * s));
+                    p.rect_filled(sr(fill), egui::Rounding::same(3.0 * s), accent);
+                    p.circle(sp(egui::pos2(knobx, ty)), 9.0 * s * sf, if selrow { accent } else { text }, egui::Stroke::new(2.0, accent));
+                    p.text(sp(egui::pos2(base.max.x - 22.0 * s, base.center().y)), egui::Align2::RIGHT_CENTER, format!("{}%", (val * 100.0).round() as i32), egui::FontId::proportional(16.0 * s * sf), if selrow { accent } else { muted });
+                    let grab = sr(egui::Rect::from_min_max(egui::pos2(tl - 12.0 * s, ty - 16.0 * s), egui::pos2(tr + 12.0 * s, ty + 16.0 * s)));
+                    if !block && ui.rect_contains_pointer(grab) {
+                        let resp = ui.allocate_rect(grab, egui::Sense::click_and_drag());
+                        if resp.dragged() || resp.clicked() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                let line = sr(egui::Rect::from_min_max(egui::pos2(tl, ty), egui::pos2(tr, ty)));
+                                let frac = ((pos.x - line.min.x) / line.width().max(1.0)).clamp(0.0, 1.0);
+                                drag_set = Some((i, frac));
+                                self.prefs_focus = true;
+                                self.prefs_row = i;
+                            }
+                        }
+                    }
+                } else {
+                    let lx = base.max.x - 150.0 * s;
+                    let rx = base.max.x - 22.0 * s;
+                    let mv = if self.app_settings.music_muted { "On" } else { "Off" };
+                    p.text(sp(egui::pos2((lx + rx) * 0.5, base.center().y)), egui::Align2::CENTER_CENTER, mv, egui::FontId::proportional(16.0 * s * sf), if selrow { accent } else { muted });
+                    let la = egui::Rect::from_center_size(egui::pos2(lx, base.center().y), egui::Vec2::splat(34.0 * s));
+                    let ra = egui::Rect::from_center_size(egui::pos2(rx, base.center().y), egui::Vec2::splat(34.0 * s));
+                    p.text(sp(la.center()), egui::Align2::CENTER_CENTER, "\u{2039}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
+                    p.text(sp(ra.center()), egui::Align2::CENTER_CENTER, "\u{203A}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
+                    if !block && ui.rect_contains_pointer(r) && ui.allocate_rect(r, egui::Sense::click()).clicked() {
+                        self.prefs_focus = true;
+                        self.prefs_row = i;
+                        self.app_settings.music_muted = !self.app_settings.music_muted;
+                        let _ = self.app_settings.save();
+                        crate::ui_audio::play_move();
+                    }
+                }
+                y += row_h;
+            }
+            let mut key_dir = 0i32;
+            if self.prefs_focus && !block {
+                if nl { key_dir = -1; } else if nr || a_edge { key_dir = 1; }
+            }
+            if let Some((ri, frac)) = drag_set {
+                match ri {
+                    0 => self.app_settings.audio_volume = frac,
+                    1 => self.app_settings.music_volume = frac,
+                    2 => self.app_settings.sfx_volume = frac,
+                    _ => {}
+                }
+                crate::ui_audio::set_sfx_volume(self.app_settings.sfx_volume);
+                let _ = self.app_settings.save();
+            } else if key_dir != 0 {
+                let step = 0.05 * key_dir as f32;
+                match self.prefs_row {
+                    0 => self.app_settings.audio_volume = (self.app_settings.audio_volume + step).clamp(0.0, 1.0),
+                    1 => self.app_settings.music_volume = (self.app_settings.music_volume + step).clamp(0.0, 1.0),
+                    2 => self.app_settings.sfx_volume = (self.app_settings.sfx_volume + step).clamp(0.0, 1.0),
+                    3 => self.app_settings.music_muted = !self.app_settings.music_muted,
+                    _ => {}
+                }
+                crate::ui_audio::set_sfx_volume(self.app_settings.sfx_volume);
+                let _ = self.app_settings.save();
+                crate::ui_audio::play_move();
+            }
+        } else if self.settings_tab == SettingsTab::Emulation {
+            let rows: Vec<(String, String)> = vec![
+                ("Multicore CPU".to_string(), if self.app_settings.multicore { "On" } else { "Off" }.to_string()),
+                ("Async Shader Compile".to_string(), if self.app_settings.async_shaders { "On" } else { "Off" }.to_string()),
+            ];
+            let mut row = self.prefs_row;
+            let hit = pref_value_rows(&p, ui, &sp, &sr, content, s, sf, ease, accent, text, muted, border, panel, sel, self.prefs_focus, block, &mut row, &rows, nu, nd, nl, nr, a_edge);
+            self.prefs_row = row;
+            if let Some((ri, _)) = hit {
+                match ri {
+                    0 => self.app_settings.multicore = !self.app_settings.multicore,
+                    1 => {
+                        self.app_settings.async_shaders = !self.app_settings.async_shaders;
+                        nexium_common::async_compile::set_enabled(self.app_settings.async_shaders);
+                    }
+                    _ => {}
+                }
+                let _ = self.app_settings.save();
+                crate::ui_audio::play_move();
+            }
+        } else if self.settings_tab == SettingsTab::Logging {
+            let levels = crate::app_settings::LogLevel::all();
+            let rows: Vec<(String, String)> = vec![
+                ("Log Level".to_string(), self.app_settings.log_level.label().to_string()),
+            ];
+            let mut row = self.prefs_row;
+            let hit = pref_value_rows(&p, ui, &sp, &sr, content, s, sf, ease, accent, text, muted, border, panel, sel, self.prefs_focus, block, &mut row, &rows, nu, nd, nl, nr, a_edge);
+            self.prefs_row = row;
+            if let Some((_, dir)) = hit {
+                let idx = levels.iter().position(|x| *x == self.app_settings.log_level).unwrap_or(0);
+                self.app_settings.log_level = levels[((idx as i32 + dir).rem_euclid(levels.len() as i32)) as usize];
+                log::set_max_level(self.app_settings.log_level.to_filter());
+                let _ = self.app_settings.save();
+                crate::ui_audio::play_move();
+            }
+        } else {
+            p.text(sp(content.center() - egui::Vec2::new(0.0, 14.0)), egui::Align2::CENTER_CENTER, "Not in the console UI yet.", egui::FontId::proportional(20.0 * s * sf), text);
+            p.text(sp(content.center() + egui::Vec2::new(0.0, 20.0)), egui::Align2::CENTER_CENTER, "Switch to Grid View to change these for now.", egui::FontId::proportional(15.0 * s * sf), muted);
+        }
+
+        if !editing && b_edge {
+            if self.prefs_focus {
+                self.prefs_focus = false;
+                crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+            } else {
+                self.show_settings = false;
+                crate::ui_audio::play(crate::ui_audio::Sfx::Back);
+            }
+        }
+        ctx.request_repaint();
     }
 
     fn draw_perf_overlay(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -2119,7 +3279,7 @@ impl HorizonApp {
 
     fn draw_modal(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let dt = ui.input(|i| i.stable_dt).min(0.1);
-        let active = self.modal_active();
+        let active = self.confirm.is_some() || self.teardown_at.is_some();
         let target = if active { 1.0 } else { 0.0 };
         let speed = if target > self.modal_anim { 12.0 } else { 10.0 };
         self.modal_anim += (target - self.modal_anim) * (dt * speed).min(1.0);
@@ -2395,6 +3555,203 @@ fn parse_u64_value(s: &str) -> Option<u64> {
     }
 }
 
+pub fn clipboard_text() -> String {
+    arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default()
+}
+
+pub fn feed_text_input(events: &[egui::Event], buf: &mut String, max: usize, paste_now: bool) {
+    let mut ctrl_v = false;
+    let mut saw_paste = false;
+    let push = |buf: &mut String, s: &str| {
+        for ch in s.chars() {
+            if !ch.is_control() && buf.chars().count() < max {
+                buf.push(ch);
+            }
+        }
+    };
+    for ev in events {
+        match ev {
+            egui::Event::Text(txt) => push(buf, txt),
+            egui::Event::Paste(txt) => { saw_paste = true; push(buf, txt); }
+            egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => { buf.pop(); }
+            egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. } if modifiers.ctrl || modifiers.command => { ctrl_v = true; }
+            _ => {}
+        }
+    }
+    if paste_now || (ctrl_v && !saw_paste) {
+        let c = clipboard_text();
+        push(buf, &c);
+    }
+}
+
+#[derive(Default)]
+pub struct FieldResp {
+    pub clicked: bool,
+    pub secondary_clicked: bool,
+    pub commit: bool,
+    pub cancel: bool,
+    pub changed: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn text_field(
+    p: &egui::Painter,
+    ui: &mut egui::Ui,
+    area: egui::Rect,
+    text_x: f32,
+    mid_y: f32,
+    buf: &mut String,
+    caret: &mut usize,
+    anchor: &mut usize,
+    font: egui::FontId,
+    text_col: Color32,
+    muted_col: Color32,
+    sel_col: Color32,
+    placeholder: &str,
+    password: bool,
+    max: usize,
+    active: bool,
+    blink_on: bool,
+    events: &[egui::Event],
+) -> FieldResp {
+    let mut resp = FieldResp::default();
+    let mut cs: Vec<char> = buf.chars().collect();
+    let mut car = (*caret).min(cs.len());
+    let mut anc = (*anchor).min(cs.len());
+
+    let disp_of = |cs: &[char]| -> String {
+        if password { "\u{2022}".repeat(cs.len()) } else { cs.iter().collect() }
+    };
+    let width_to = |ui: &egui::Ui, cs: &[char], idx: usize| -> f32 {
+        let d = disp_of(&cs[..idx.min(cs.len())]);
+        ui.fonts(|f| f.layout_no_wrap(d, font.clone(), text_col).size().x)
+    };
+    let hit = |ui: &egui::Ui, cs: &[char], px: f32| -> usize {
+        let mut best = 0usize;
+        let mut bd = f32::MAX;
+        for i in 0..=cs.len() {
+            let x = text_x + width_to(ui, cs, i);
+            let d = (x - px).abs();
+            if d < bd { bd = d; best = i; }
+        }
+        best
+    };
+
+    let ir = ui.allocate_rect(area, egui::Sense::click_and_drag());
+    if ir.secondary_clicked() { resp.secondary_clicked = true; }
+    if ir.clicked() { resp.clicked = true; }
+    if ir.double_clicked() {
+        anc = 0;
+        car = cs.len();
+    } else if let Some(pos) = ir.interact_pointer_pos() {
+        if ir.drag_started() || ir.clicked() {
+            let h = hit(ui, &cs, pos.x);
+            car = h;
+            anc = h;
+        } else if ir.dragged() {
+            car = hit(ui, &cs, pos.x);
+        }
+    }
+
+    if active {
+        let del_sel = |cs: &mut Vec<char>, car: &mut usize, anc: &mut usize| -> bool {
+            let lo = (*car).min(*anc);
+            let hi = (*car).max(*anc);
+            if lo != hi { cs.drain(lo..hi); *car = lo; *anc = lo; true } else { false }
+        };
+        let insert = |cs: &mut Vec<char>, car: &mut usize, anc: &mut usize, s: &str| {
+            let lo = (*car).min(*anc);
+            let hi = (*car).max(*anc);
+            if lo != hi { cs.drain(lo..hi); *car = lo; }
+            for ch in s.chars() {
+                if !ch.is_control() && cs.len() < max { cs.insert(*car, ch); *car += 1; }
+            }
+            *anc = *car;
+        };
+        let copy_sel = |cs: &[char], car: usize, anc: usize| {
+            let lo = car.min(anc);
+            let hi = car.max(anc);
+            if lo != hi {
+                let sel: String = cs[lo..hi].iter().collect();
+                let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(sel));
+            }
+        };
+        let mut saw_paste = false;
+        let mut ctrl_v = false;
+        for ev in events {
+            match ev {
+                egui::Event::Text(s) => { insert(&mut cs, &mut car, &mut anc, s); resp.changed = true; }
+                egui::Event::Paste(s) => { saw_paste = true; insert(&mut cs, &mut car, &mut anc, s); resp.changed = true; }
+                egui::Event::Copy => copy_sel(&cs, car, anc),
+                egui::Event::Cut => { copy_sel(&cs, car, anc); if del_sel(&mut cs, &mut car, &mut anc) { resp.changed = true; } }
+                egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                    if !del_sel(&mut cs, &mut car, &mut anc) && car > 0 { cs.remove(car - 1); car -= 1; }
+                    anc = car;
+                    resp.changed = true;
+                }
+                egui::Event::Key { key: egui::Key::Delete, pressed: true, .. } => {
+                    if !del_sel(&mut cs, &mut car, &mut anc) && car < cs.len() { cs.remove(car); }
+                    anc = car;
+                    resp.changed = true;
+                }
+                egui::Event::Key { key: egui::Key::ArrowLeft, pressed: true, modifiers, .. } => {
+                    if car > 0 { car -= 1; }
+                    if !modifiers.shift { anc = car; }
+                }
+                egui::Event::Key { key: egui::Key::ArrowRight, pressed: true, modifiers, .. } => {
+                    if car < cs.len() { car += 1; }
+                    if !modifiers.shift { anc = car; }
+                }
+                egui::Event::Key { key: egui::Key::Home, pressed: true, modifiers, .. } => { car = 0; if !modifiers.shift { anc = 0; } }
+                egui::Event::Key { key: egui::Key::End, pressed: true, modifiers, .. } => { car = cs.len(); if !modifiers.shift { anc = car; } }
+                egui::Event::Key { key: egui::Key::A, pressed: true, modifiers, .. } if modifiers.ctrl || modifiers.command => { anc = 0; car = cs.len(); }
+                egui::Event::Key { key: egui::Key::C, pressed: true, modifiers, .. } if modifiers.ctrl || modifiers.command => copy_sel(&cs, car, anc),
+                egui::Event::Key { key: egui::Key::X, pressed: true, modifiers, .. } if modifiers.ctrl || modifiers.command => { copy_sel(&cs, car, anc); if del_sel(&mut cs, &mut car, &mut anc) { resp.changed = true; } }
+                egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. } if modifiers.ctrl || modifiers.command => { ctrl_v = true; }
+                egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => { resp.commit = true; }
+                egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => { resp.cancel = true; }
+                _ => {}
+            }
+        }
+        if ctrl_v && !saw_paste {
+            let c = clipboard_text();
+            insert(&mut cs, &mut car, &mut anc, &c);
+            resp.changed = true;
+        }
+    }
+
+    car = car.min(cs.len());
+    anc = anc.min(cs.len());
+
+    let disp = disp_of(&cs);
+    if cs.is_empty() && !active {
+        p.text(egui::pos2(text_x, mid_y), egui::Align2::LEFT_CENTER, placeholder, font.clone(), muted_col);
+    } else {
+        if active {
+            let lo = car.min(anc);
+            let hi = car.max(anc);
+            if lo != hi {
+                let x0 = text_x + width_to(ui, &cs, lo);
+                let x1 = text_x + width_to(ui, &cs, hi);
+                let fh = font.size;
+                let selr = egui::Rect::from_min_max(egui::pos2(x0, mid_y - fh * 0.62), egui::pos2(x1, mid_y + fh * 0.62));
+                p.rect_filled(selr, egui::Rounding::same(2.0), sel_col);
+            }
+        }
+        p.text(egui::pos2(text_x, mid_y), egui::Align2::LEFT_CENTER, &disp, font.clone(), text_col);
+        if active && blink_on {
+            let cx = text_x + width_to(ui, &cs, car);
+            let fh = font.size;
+            p.rect_filled(egui::Rect::from_min_max(egui::pos2(cx, mid_y - fh * 0.6), egui::pos2(cx + 1.5_f32.max(fh * 0.06), mid_y + fh * 0.6)), egui::Rounding::ZERO, text_col);
+        }
+    }
+
+    *caret = car;
+    *anchor = anc;
+    *buf = cs.iter().collect();
+    resp
+}
+
 fn draw_check(p: &egui::Painter, c: egui::Pos2, sz: f32, col: Color32) {
     let a = c + egui::Vec2::new(-sz * 0.42, sz * 0.02);
     let b = c + egui::Vec2::new(-sz * 0.10, sz * 0.32);
@@ -2409,6 +3766,189 @@ fn draw_dpad(p: &egui::Painter, c: egui::Pos2, r: f32, col: Color32) {
     let round = egui::Rounding::same(thick * 0.28);
     p.rect_filled(egui::Rect::from_center_size(c, egui::Vec2::new(r * 2.0, thick)), round, col);
     p.rect_filled(egui::Rect::from_center_size(c, egui::Vec2::new(thick, r * 2.0)), round, col);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pref_value_rows(
+    p: &egui::Painter,
+    ui: &mut egui::Ui,
+    sp: &dyn Fn(egui::Pos2) -> egui::Pos2,
+    sr: &dyn Fn(egui::Rect) -> egui::Rect,
+    content: egui::Rect,
+    s: f32,
+    sf: f32,
+    ease: f32,
+    accent: Color32,
+    text: Color32,
+    muted: Color32,
+    border: Color32,
+    panel: Color32,
+    sel: Color32,
+    focus: bool,
+    block: bool,
+    row: &mut usize,
+    rows: &[(String, String)],
+    nu: bool,
+    nd: bool,
+    nl: bool,
+    nr: bool,
+    a_edge: bool,
+) -> Option<(usize, i32)> {
+    let n = rows.len();
+    if !focus {
+        *row = 0;
+    }
+    *row = (*row).min(n.saturating_sub(1));
+    if focus && !block {
+        if nu && *row > 0 {
+            *row -= 1;
+            crate::ui_audio::play_move();
+        }
+        if nd && *row + 1 < n {
+            *row += 1;
+            crate::ui_audio::play_move();
+        }
+    }
+    let row_h = 62.0 * s;
+    let mut y = content.min.y + 4.0 * s;
+    let mut result = None;
+    for (i, (label, value)) in rows.iter().enumerate() {
+        let base = egui::Rect::from_min_size(egui::pos2(content.min.x, y), egui::Vec2::new(content.width(), row_h - 12.0 * s));
+        let r = sr(base);
+        let selrow = focus && i == *row;
+        if selrow {
+            p.rect_filled(r, egui::Rounding::same(12.0 * s), sel);
+            p.rect_stroke(r, egui::Rounding::same(12.0 * s), egui::Stroke::new(2.0, accent));
+        } else {
+            p.rect_filled(r, egui::Rounding::same(12.0 * s), Color32::from_rgba_unmultiplied(panel.r(), panel.g(), panel.b(), (ease * 90.0) as u8));
+            p.rect_stroke(r, egui::Rounding::same(12.0 * s), egui::Stroke::new(1.0, border));
+        }
+        p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y)), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(18.0 * s * sf), text);
+        let lx = base.max.x - 150.0 * s;
+        let rx = base.max.x - 22.0 * s;
+        p.text(sp(egui::pos2((lx + rx) * 0.5, base.center().y)), egui::Align2::CENTER_CENTER, value, egui::FontId::proportional(16.0 * s * sf), if selrow { accent } else { muted });
+        let la = egui::Rect::from_center_size(egui::pos2(lx, base.center().y), egui::Vec2::splat(34.0 * s));
+        let ra = egui::Rect::from_center_size(egui::pos2(rx, base.center().y), egui::Vec2::splat(34.0 * s));
+        p.text(sp(la.center()), egui::Align2::CENTER_CENTER, "\u{2039}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
+        p.text(sp(ra.center()), egui::Align2::CENTER_CENTER, "\u{203A}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
+        if !block && ui.rect_contains_pointer(r) {
+            let rowc = ui.allocate_rect(r, egui::Sense::click()).clicked();
+            let lc = ui.allocate_rect(sr(la), egui::Sense::click()).clicked();
+            let rc = ui.allocate_rect(sr(ra), egui::Sense::click()).clicked();
+            if lc || rc || rowc {
+                *row = i;
+                result = Some((i, if lc { -1 } else { 1 }));
+            }
+        }
+        y += row_h;
+    }
+    if focus && !block && result.is_none() {
+        if nl {
+            result = Some((*row, -1));
+        } else if nr || a_edge {
+            result = Some((*row, 1));
+        }
+    }
+    result
+}
+
+fn draw_controller(p: &egui::Painter, cr: egui::Rect, hl: Option<SwitchButton>, accent: Color32, light: bool, live: &crate::input::InputSnapshot) {
+    use crate::controller_config::SwitchButton::*;
+    let s = (cr.width() / 430.0).min(cr.height() / 320.0);
+    let c = cr.center();
+    let map = |x: f32, y: f32| c + Vec2::new(x * s, (y + 6.0) * s);
+    
+    // Theme-specific colors
+    let outline = if light { Color32::from_rgb(0x90, 0x90, 0x9F) } else { Color32::from_rgb(0x4C, 0x4C, 0x58) };
+    let body_fill = if light { Color32::from_rgb(0xE6, 0xE6, 0xEB) } else { Color32::from_rgb(0x22, 0x22, 0x2C) };
+    let btn_bg = if light { Color32::from_rgb(0xCD, 0xCD, 0xD6) } else { Color32::from_rgb(0x20, 0x20, 0x26) };
+    let btn_border = if light { Color32::from_rgb(0xAC, 0xAC, 0xBA) } else { Color32::from_rgb(0x2A, 0x2A, 0x32) };
+    let btn_muted = if light { Color32::from_rgb(0x3C, 0x3C, 0x4C) } else { Color32::from_rgb(0x70, 0x70, 0x80) };
+    let knob_default = if light { Color32::from_rgb(0x8A, 0x8A, 0x9A) } else { Color32::from_rgb(0x62, 0x62, 0x72) };
+
+    let body_stroke = egui::Stroke::new((2.0 * s).max(1.2), outline);
+    // Combine selected-row highlight with live button state
+    let is = |b: SwitchButton| hl == Some(b) || (live.connected && live.is(b));
+    let lstick_on = is(StickL) || is(StickLUp) || is(StickLDown) || is(StickLLeft) || is(StickLRight);
+    let rstick_on = is(StickR) || is(StickRUp) || is(StickRDown) || is(StickRLeft) || is(StickRRight);
+
+    let n = PRO_BODY.len() / 2;
+    let mut body: Vec<egui::Pos2> = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        body.push(map(PRO_BODY[i * 2], PRO_BODY[i * 2 + 1]));
+    }
+    for i in (0..n).rev() {
+        body.push(map(-PRO_BODY[i * 2], PRO_BODY[i * 2 + 1]));
+    }
+    let hn = PRO_LEFT_HANDLE.len() / 2;
+    let lh: Vec<egui::Pos2> = (0..hn).map(|i| map(PRO_LEFT_HANDLE[i * 2], PRO_LEFT_HANDLE[i * 2 + 1])).collect();
+    let rh: Vec<egui::Pos2> = (0..hn).map(|i| map(-PRO_LEFT_HANDLE[i * 2], PRO_LEFT_HANDLE[i * 2 + 1])).collect();
+    // Filled bodies first, outlines on top
+    p.add(egui::Shape::convex_polygon(lh.clone(), body_fill, egui::Stroke::NONE));
+    p.add(egui::Shape::convex_polygon(rh.clone(), body_fill, egui::Stroke::NONE));
+    p.add(egui::Shape::convex_polygon(body.clone(), body_fill, egui::Stroke::NONE));
+    p.add(egui::Shape::closed_line(lh, body_stroke));
+    p.add(egui::Shape::closed_line(rh, body_stroke));
+    p.add(egui::Shape::closed_line(body, body_stroke));
+
+    let face = |center: egui::Pos2, r: f32, label: &str, on: bool| {
+        let fill = if on { accent } else { btn_bg };
+        p.circle(center, r, fill, egui::Stroke::new(1.0, btn_border));
+        if !label.is_empty() {
+            let tc = if on { Color32::WHITE } else { btn_muted };
+            p.text(center, egui::Align2::CENTER_CENTER, label, FontId::proportional((r * 0.95).max(7.0)), tc);
+        }
+    };
+    let pad = |center: egui::Pos2, sz: Vec2, label: &str, on: bool| {
+        let r = egui::Rect::from_center_size(center, sz);
+        let fill = if on { accent } else { btn_bg };
+        p.rect(r, Rounding::same(3.0), fill, egui::Stroke::new(1.0, btn_border));
+        if !label.is_empty() {
+            let tc = if on { Color32::WHITE } else { btn_muted };
+            p.text(center, egui::Align2::CENTER_CENTER, label, FontId::proportional(9.0 * s.max(0.8)), tc);
+        }
+    };
+    // Animated stick: offset the knob by live axis values (clamped to ring radius)
+    let stick = |base: egui::Pos2, ax: f32, ay: f32, on: bool| {
+        let ring = 22.0 * s;
+        let knob = 13.0 * s;
+        let max_off = ring - knob;
+        let koff = Vec2::new(ax.clamp(-1.0, 1.0) * max_off, (-ay).clamp(-1.0, 1.0) * max_off);
+        let kc = base + koff;
+        p.circle(base, ring, btn_bg, egui::Stroke::new(1.5, if on { accent } else { outline }));
+        let kcol = if on { accent } else { knob_default };
+        p.circle(kc, knob, kcol, egui::Stroke::new(1.0, btn_border));
+    };
+
+    pad(map(-120.0, -139.0), Vec2::new(52.0 * s, 13.0 * s), "ZL", is(ZL));
+    pad(map(120.0, -139.0), Vec2::new(52.0 * s, 13.0 * s), "ZR", is(ZR));
+    pad(map(-120.0, -122.0), Vec2::new(62.0 * s, 14.0 * s), "L", is(L));
+    pad(map(120.0, -122.0), Vec2::new(62.0 * s, 14.0 * s), "R", is(R));
+
+    let lx = if live.connected { live.lx() } else { 0.0 };
+    let ly = if live.connected { live.ly() } else { 0.0 };
+    let rx = if live.connected { live.rx() } else { 0.0 };
+    let ry = if live.connected { live.ry() } else { 0.0 };
+    stick(map(-111.0, -55.0), lx, ly, lstick_on);
+
+    let dd = 19.0 * s;
+    let dsz = Vec2::splat(16.0 * s);
+    let dp = map(-61.0, 0.0);
+    pad(dp + Vec2::new(0.0, -dd), dsz, "", is(DUp));
+    pad(dp + Vec2::new(0.0, dd), dsz, "", is(DDown));
+    pad(dp + Vec2::new(-dd, 0.0), dsz, "", is(DLeft));
+    pad(dp + Vec2::new(dd, 0.0), dsz, "", is(DRight));
+
+    let fr = 15.0 * s;
+    face(map(136.0, -56.0), fr, "A", is(A));
+    face(map(105.0, -25.0), fr, "B", is(B));
+    face(map(105.0, -87.0), fr, "X", is(X));
+    face(map(74.0, -56.0), fr, "Y", is(Y));
+
+    stick(map(51.0, 0.0), rx, ry, rstick_on);
+
+    face(map(-50.0, -86.0), 9.0 * s, "-", is(Minus));
+    face(map(50.0, -86.0), 9.0 * s, "+", is(Plus));
 }
 
 fn draw_dissolve(p: &egui::Painter, rect: egui::Rect, tex_id: egui::TextureId, t: f32) {
@@ -2739,16 +4279,26 @@ impl eframe::App for HorizonApp {
         }
 
         if let Some(ref mut ib) = self.input {
-            self.last_input = ib.poll(&self.controller_config);
+            self.last_input = ib.poll(&self.controller_config, self.app_settings.left_deadzone, self.app_settings.right_deadzone);
             if self.last_input.connected {
                 ctx.request_repaint_after(std::time::Duration::from_millis(8));
             }
             if let Some(btn) = self.rebinding_pad {
-                if let Some(gp) = ib.first_pressed() {
+                // Wait until all gamepad buttons are released after the rebind was started,
+                // so the button that triggered start_rebind (A) doesn't immediately resolve.
+                if self.rebinding_pad_wait_release {
+                    // Still holding something — check if everything is released now
+                    if ib.first_pressed().is_none() {
+                        self.rebinding_pad_wait_release = false;
+                    }
+                } else if let Some(gp) = ib.first_pressed() {
                     self.controller_config.set_pad(btn, gp);
                     let _ = self.controller_config.save();
                     self.rebinding_pad = None;
+                    self.prefs_rebind_cool = true;
+                    crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                 }
+                let _ = btn; // suppress unused warning
             }
         }
 
@@ -3344,10 +4894,7 @@ impl eframe::App for HorizonApp {
                 if profile_showing {
                     let avatar_tex = self.profile_texture.as_ref().map(|t| t.id());
                     let ambient = self.carousel.ambient_color;
-                    let accent = match self.app_settings.carousel_theme.color() {
-                        Some((r, g, b)) => Color32::from_rgb(r, g, b),
-                        None => self.carousel.ambient_color,
-                    };
+                    let accent = self.theme_accent();
 
                     let smooth = |x: f32| {
                         let x = x.clamp(0.0, 1.0);
@@ -3870,9 +5417,13 @@ impl eframe::App for HorizonApp {
                     }
                 }
                 self.update_carousel_settings(ctx, ui);
+                if self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel {
+                    self.update_preferences(ctx, ui);
+                }
+                self.drive_vkeyboard(ctx, ui);
             });
 
-        if self.show_settings {
+        if self.show_settings && self.app_settings.view_mode != crate::app_settings::ViewMode::Carousel {
             let mut open = self.show_settings;
             let mut tab = self.settings_tab;
             let mut cfg = self.controller_config.clone();
