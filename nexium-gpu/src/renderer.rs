@@ -3076,7 +3076,17 @@ impl Renderer {
                 _ => (Vec::new(), 0u32, call.index_type),
             };
             if let Ok(want) = std::env::var("NEXIUM_VTX_DBG") {
-                if parse_u64_value(&want) == Some(call.vs_gpu_va) {
+                let all_mode = want.trim().eq_ignore_ascii_case("all");
+                let under_cap = if all_mode {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    N.fetch_add(1, Ordering::Relaxed) < 40
+                } else {
+                    true
+                };
+                if under_cap
+                    && (all_mode || parse_u64_value(&want) == Some(call.vs_gpu_va))
+                {
                     let vertex_base_addr = call
                         .vertex_bindings
                         .first()
@@ -5693,6 +5703,13 @@ fn max_texture_descriptors() -> usize {
 }
 
 fn bind_trace_fs(fs_gpu_va: u64) -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ALL.get_or_init(|| {
+        std::env::var("NEXIUM_BIND_TRACE_FS")
+            .map_or(false, |v| v.trim().eq_ignore_ascii_case("all"))
+    }) {
+        return true;
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let list = LIST.get_or_init(|| {
         std::env::var("NEXIUM_BIND_TRACE_FS")
