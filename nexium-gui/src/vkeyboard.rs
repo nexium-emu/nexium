@@ -400,7 +400,7 @@ impl VirtualKeyboard {
 
         p.rect_filled(egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, panel.min.y)), Rounding::ZERO, Color32::from_rgba_unmultiplied(0, 0, 0, (ease * 90.0) as u8));
         p.rect_filled(panel, Rounding { nw: 18.0, ne: 18.0, sw: 0.0, se: 0.0 }, bg);
-        p.rect_stroke(panel, Rounding { nw: 18.0, ne: 18.0, sw: 0.0, se: 0.0 }, Stroke::new(1.5, key_border));
+        p.rect_stroke(panel, Rounding { nw: 18.0, ne: 18.0, sw: 0.0, se: 0.0 }, Stroke::new(1.5_f32, key_border));
 
         let pad = 24.0;
         let preview = egui::Rect::from_min_max(
@@ -408,7 +408,7 @@ impl VirtualKeyboard {
             egui::pos2(panel.max.x - pad, panel.min.y + 58.0),
         );
         p.rect_filled(preview, Rounding::same(9.0), key_bg);
-        p.rect_stroke(preview, Rounding::same(9.0), Stroke::new(1.5, accent));
+        p.rect_stroke(preview, Rounding::same(9.0), Stroke::new(1.5_f32, accent));
         let pv_font = FontId::proportional(20.0);
         let shown = if buf.is_empty() { "" } else { buf };
         let pre: String = buf.chars().take(self.caret).collect();
@@ -438,9 +438,9 @@ impl VirtualKeyboard {
                 let selected = self.open && self.row == row && self.col == col;
                 p.rect_filled(r, Rounding::same(7.0), key_bg);
                 if selected {
-                    p.rect_stroke(r, Rounding::same(7.0), Stroke::new(2.6, accent));
+                    p.rect_stroke(r, Rounding::same(7.0), Stroke::new(2.6_f32, accent));
                 } else {
-                    p.rect_stroke(r, Rounding::same(7.0), Stroke::new(1.0, key_border));
+                    p.rect_stroke(r, Rounding::same(7.0), Stroke::new(1.0_f32, key_border));
                 }
                 p.text(r.center(), egui::Align2::CENTER_CENTER, ch.to_string(), FontId::proportional(cell_h * 0.44), text);
             }
@@ -466,9 +466,9 @@ impl VirtualKeyboard {
             let fill = if is_ok { accent } else { key_bg };
             p.rect_filled(r, Rounding::same(7.0), fill);
             if selected {
-                p.rect_stroke(r, Rounding::same(7.0), Stroke::new(2.6, accent));
+                p.rect_stroke(r, Rounding::same(7.0), Stroke::new(2.6_f32, accent));
             } else {
-                p.rect_stroke(r, Rounding::same(7.0), Stroke::new(1.0, key_border));
+                p.rect_stroke(r, Rounding::same(7.0), Stroke::new(1.0_f32, key_border));
             }
             let lc = if is_ok { Color32::WHITE } else { text };
             p.text(r.center(), egui::Align2::CENTER_CENTER, *lbl, FontId::proportional(cell_h * 0.34), lc);
