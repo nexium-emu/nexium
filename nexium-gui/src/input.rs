@@ -49,6 +49,7 @@ pub struct InputSnapshot {
     pub connected: bool,
     pub buttons: u64,
     pub sticks: [i32; 4],
+    pub raw_sticks: [f32; 4],
     pub home: bool,
     pub battery: Option<i32>,
     pub charging: bool,
@@ -61,6 +62,7 @@ impl InputSnapshot {
             connected: false,
             buttons: 0,
             sticks: [0; 4],
+            raw_sticks: [0.0; 4],
             home: false,
             battery: None,
             charging: false,
@@ -97,42 +99,104 @@ impl Default for InputSnapshot {
 }
 
 pub struct InputBackend {
+    sdl: sdl3::Sdl,
     gamepad: GamepadSubsystem,
     pad: Option<Gamepad>,
+    selected_id: Option<sdl3::joystick::JoystickId>,
 }
 
 impl InputBackend {
     pub fn new() -> Option<Self> {
+        sdl3::hint::set("SDL_JOYSTICK_THREAD", "1");
+        sdl3::hint::set("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
         let sdl = sdl3::init().ok()?;
         let gamepad = sdl.gamepad().ok()?;
         log::info!("SDL3 gamepad subsystem initialized");
-        Some(Self { gamepad, pad: None })
+        Some(Self { sdl, gamepad, pad: None, selected_id: None })
     }
 
     fn ensure_pad(&mut self) {
-        let alive = self.pad.as_ref().map(|p| p.connected()).unwrap_or(false);
-        if alive {
+        let mut target_id = self.selected_id;
+        if target_id.is_none() {
+            if let Ok(ids) = self.gamepad.gamepads() {
+                target_id = ids.first().copied();
+            }
+        }
+
+        let current_ok = if let Some(ref p) = self.pad {
+            if p.connected() {
+                if let Ok(curr_id) = p.id() {
+                    Some(curr_id) == target_id
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if current_ok {
             return;
         }
+
         self.pad = None;
-        if let Ok(ids) = self.gamepad.gamepads() {
-            if let Some(&id) = ids.first() {
-                match self.gamepad.open(id) {
-                    Ok(p) => {
-                        log::info!(
-                            "gamepad connected: {} (type {:?})",
-                            p.name().unwrap_or_else(|| "unknown".to_string()),
-                            p.r#type()
-                        );
-                        self.pad = Some(p);
-                    }
-                    Err(e) => log::warn!("gamepad open failed: {}", e),
+        if let Some(id) = target_id {
+            match self.gamepad.open(id) {
+                Ok(p) => {
+                    log::info!(
+                        "gamepad connected: {} (type {:?})",
+                        p.name().unwrap_or_else(|| "unknown".to_string()),
+                        p.r#type()
+                    );
+                    self.pad = Some(p);
+                    self.selected_id = Some(id);
+                }
+                Err(e) => {
+                    log::warn!("gamepad open failed: {}", e);
+                    self.selected_id = None;
                 }
             }
         }
     }
 
-    pub fn poll(&mut self, cfg: &ControllerConfig) -> InputSnapshot {
+    pub fn list_gamepads(&self) -> Vec<(sdl3::joystick::JoystickId, String)> {
+        let mut list = Vec::new();
+        if let Ok(ids) = self.gamepad.gamepads() {
+            for id in ids {
+                let name = if let Some(ref p) = self.pad {
+                    if let Ok(pid) = p.id() {
+                        if pid == id {
+                            p.name().unwrap_or_else(|| "Gamepad".to_string())
+                        } else {
+                            self.gamepad.name_for_id(id).unwrap_or_else(|_| "Gamepad".to_string())
+                        }
+                    } else {
+                        self.gamepad.name_for_id(id).unwrap_or_else(|_| "Gamepad".to_string())
+                    }
+                } else {
+                    self.gamepad.name_for_id(id).unwrap_or_else(|_| "Gamepad".to_string())
+                };
+                list.push((id, name));
+            }
+        }
+        list
+    }
+
+    pub fn get_active_id(&self) -> Option<sdl3::joystick::JoystickId> {
+        self.pad.as_ref().and_then(|p| p.id().ok())
+    }
+
+    pub fn set_active_id(&mut self, id: sdl3::joystick::JoystickId) {
+        self.selected_id = Some(id);
+        self.ensure_pad();
+    }
+
+    pub fn poll(&mut self, cfg: &ControllerConfig, left_dz: f32, right_dz: f32) -> InputSnapshot {
+        if let Ok(mut ep) = self.sdl.event_pump() {
+            ep.pump_events();
+        }
         self.gamepad.update();
         self.ensure_pad();
 
@@ -191,13 +255,18 @@ impl InputBackend {
             }
         }
 
-        let dz = |v: f32| if v.abs() < 0.12 { 0.0 } else { v };
+        let dz = |v: f32, limit: f32| if v.abs() < limit { 0.0 } else { v };
         let ax = |a: Axis| pad.axis(a) as f32 / 32768.0;
+        let lx = ax(Axis::LeftX);
+        let ly = -ax(Axis::LeftY);
+        let rx = ax(Axis::RightX);
+        let ry = -ax(Axis::RightY);
+        snap.raw_sticks = [lx, ly, rx, ry];
         snap.sticks = [
-            (dz(ax(Axis::LeftX)) * 30000.0) as i32,
-            (dz(-ax(Axis::LeftY)) * 30000.0) as i32,
-            (dz(ax(Axis::RightX)) * 30000.0) as i32,
-            (dz(-ax(Axis::RightY)) * 30000.0) as i32,
+            (dz(lx, left_dz) * 30000.0) as i32,
+            (dz(ly, left_dz) * 30000.0) as i32,
+            (dz(rx, right_dz) * 30000.0) as i32,
+            (dz(ry, right_dz) * 30000.0) as i32,
         ];
         snap
     }

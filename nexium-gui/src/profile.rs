@@ -46,6 +46,8 @@ pub enum ProfileTab {
 pub struct ProfileState {
     pub tab: ProfileTab,
     pub name_buf: String,
+    pub name_caret: usize,
+    pub name_anchor: usize,
     pub list_scroll: f32,
     pub nav_cooldown: f64,
     pub focus_content: bool,
@@ -53,6 +55,9 @@ pub struct ProfileState {
     pub tab_anim: f32,
     pub shown_tab: ProfileTab,
     pub name_editing: bool,
+    pub name_kb: crate::vkeyboard::VirtualKeyboard,
+    pub name_y_held: bool,
+    pub pad_connected: bool,
     pub b_held: bool,
     pub x_held: bool,
     pub theme_t: f32,
@@ -66,6 +71,8 @@ impl ProfileState {
         Self {
             tab: ProfileTab::Profile,
             name_buf: String::new(),
+            name_caret: 0,
+            name_anchor: 0,
             list_scroll: 0.0,
             nav_cooldown: 0.0,
             focus_content: false,
@@ -73,6 +80,9 @@ impl ProfileState {
             tab_anim: 1.0,
             shown_tab: ProfileTab::Profile,
             name_editing: false,
+            name_kb: crate::vkeyboard::VirtualKeyboard::new(),
+            name_y_held: false,
+            pad_connected: false,
             b_held: false,
             x_held: false,
             theme_t: 0.0,
@@ -186,6 +196,7 @@ pub fn profile_view(
     ib: &mut Option<crate::input::InputBackend>,
 ) -> ProfileAction {
     let mut action = ProfileAction::None;
+    state.pad_connected = last_input.connected;
     let t = ui.input(|i| i.time) as f32;
     let now = ui.input(|i| i.time);
     let s = (full.height() / 820.0).clamp(1.0, 2.4);
@@ -259,7 +270,15 @@ pub fn profile_view(
         Stroke::new(1.0 * scale_factor, pal.border),
     );
 
-    let editing = state.name_editing;
+    let y_down = last_input.connected && last_input.is(crate::controller_config::SwitchButton::Y);
+    if y_down && !state.name_y_held && !state.name_kb.open && active {
+        let cur = state.name_buf.clone();
+        state.name_kb.show(&cur, 24);
+        state.name_editing = false;
+    }
+    state.name_y_held = y_down;
+
+    let editing = state.name_editing || state.name_kb.open;
 
     let n_games = lib.games.len();
     let b_down = last_input.connected && last_input.is(crate::controller_config::SwitchButton::B);
@@ -625,9 +644,9 @@ pub fn profile_view(
         if on_volume {
             "🎮  [Up/Down] Select      [X] To Mute      [B] Back to Menu"
         } else if state.focus_content {
-            "🎮  [Up/Down] Select      [B] Back to Menu"
+            "🎮  [Up/Down] Select      [Y] Edit Name      [B] Back to Menu"
         } else {
-            "🎮  [Up/Down] Move      [A] Enter      [B] Back"
+            "🎮  [Up/Down] Move      [A] Enter      [Y] Edit Name      [B] Back"
         }
     } else if on_volume {
         "⌨  [Esc] Back      [M] To Mute      Click a tab"
@@ -641,6 +660,26 @@ pub fn profile_view(
         FontId::proportional(14.0 * s * scale_factor),
         pal.muted,
     );
+
+    if state.name_kb.open && !active {
+        state.name_kb.open = false;
+    }
+    if state.name_kb.active() {
+        let before = state.name_buf.clone();
+        let res = state.name_kb.update(ctx, ui, &mut state.name_buf, last_input, accent, light_mode);
+        let _ = before;
+        match res {
+            crate::vkeyboard::VkResult::Accept => {
+                let name = state.name_buf.trim().to_string();
+                let name = if name.is_empty() { "Player".to_string() } else { name };
+                state.name_buf = name.clone();
+                if name != profile_name {
+                    action = ProfileAction::SetName(name);
+                }
+            }
+            _ => {}
+        }
+    }
 
     ctx.request_repaint();
     action
@@ -1136,52 +1175,8 @@ fn profile_page(
     let scaled_field_rect = scale_rect(field_rect);
 
     let primary_clicked = ui.input(|i| i.pointer.primary_clicked());
-    if primary_clicked {
-        state.name_editing = ui.rect_contains_pointer(scaled_field_rect);
-    }
-
-    if state.name_editing {
-        let events = ui.input(|i| i.events.clone());
-        for ev in events {
-            match ev {
-                egui::Event::Text(txt) => {
-                    for ch in txt.chars() {
-                        if !ch.is_control() && state.name_buf.chars().count() < 24 {
-                            state.name_buf.push(ch);
-                        }
-                    }
-                }
-                egui::Event::Key {
-                    key: egui::Key::Backspace,
-                    pressed: true,
-                    ..
-                } => {
-                    state.name_buf.pop();
-                }
-                egui::Event::Key {
-                    key: egui::Key::Enter,
-                    pressed: true,
-                    ..
-                } => {
-                    let name = state.name_buf.trim().to_string();
-                    let name = if name.is_empty() { "Player".to_string() } else { name };
-                    state.name_buf = name.clone();
-                    state.name_editing = false;
-                    if name != profile_name {
-                        *action = ProfileAction::SetName(name);
-                    }
-                }
-                egui::Event::Key {
-                    key: egui::Key::Escape,
-                    pressed: true,
-                    ..
-                } => {
-                    state.name_buf = profile_name.to_string();
-                    state.name_editing = false;
-                }
-                _ => {}
-            }
-        }
+    if primary_clicked && state.name_editing && !ui.rect_contains_pointer(scaled_field_rect) {
+        state.name_editing = false;
     }
 
     painter.rect_filled(scaled_field_rect, Rounding::same(9.0 * s * scale_factor), pal.input_bg);
@@ -1193,46 +1188,46 @@ fn profile_page(
 
     let font = FontId::proportional(22.0 * s * scale_factor);
     let inner_pad = 14.0 * s * scale_factor;
-    let avail = field_w * scale_factor - inner_pad * 2.0;
-    let galley = painter.layout_no_wrap(state.name_buf.clone(), font.clone(), pal.soft_text);
-    let tw = galley.size().x;
-    let scroll_off = (tw - avail).max(0.0);
+    let text_x = scaled_field_rect.min.x + inner_pad;
+    let mid_y = scaled_field_rect.center().y;
+    let sel_c = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 90);
+    let blink = state.name_editing && (ui.input(|i| i.time) * 1.6).fract() < 0.5;
     let text_clip = scaled_field_rect.shrink2(Vec2::new(inner_pad * 0.5, 0.0));
     let tp = painter.with_clip_rect(text_clip);
-    let text_x = scaled_field_rect.min.x + inner_pad - scroll_off;
-    tp.text(
-        egui::pos2(text_x, scaled_field_rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        &state.name_buf,
-        font.clone(),
-        pal.soft_text,
-    );
-    if state.name_editing {
-        let blink = (ui.input(|i| i.time) * 1.6).fract() < 0.5;
-        if blink {
-            let caret_x = (text_x + tw).min(scaled_field_rect.max.x - inner_pad * 0.4);
-            tp.line_segment(
-                [
-                    egui::pos2(caret_x, scaled_field_rect.center().y - 13.0 * s * scale_factor),
-                    egui::pos2(caret_x, scaled_field_rect.center().y + 13.0 * s * scale_factor),
-                ],
-                Stroke::new(2.0 * scale_factor, pal.soft_text),
-            );
+    let name_events = ui.input(|i| i.events.clone());
+    let nfr = crate::app::text_field(&tp, ui, scaled_field_rect, text_x, mid_y, &mut state.name_buf, &mut state.name_caret, &mut state.name_anchor, font, pal.soft_text, pal.muted, sel_c, "Enter a name…", false, 24, state.name_editing, blink, if state.name_editing { &name_events } else { &[] });
+    if nfr.clicked || nfr.secondary_clicked { state.name_editing = true; }
+    if state.name_editing && nfr.commit {
+        let name = state.name_buf.trim().to_string();
+        let name = if name.is_empty() { "Player".to_string() } else { name };
+        state.name_buf = name.clone();
+        state.name_editing = false;
+        if name != profile_name {
+            *action = ProfileAction::SetName(name);
         }
-    } else if state.name_buf.is_empty() {
-        tp.text(
-            egui::pos2(scaled_field_rect.min.x + inner_pad, scaled_field_rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            "Enter a name…",
-            font,
-            pal.muted,
-        );
+    }
+    if state.name_editing && nfr.cancel {
+        state.name_buf = profile_name.to_string();
+        state.name_editing = false;
     }
 
+    if state.pad_connected && !state.name_editing && !state.name_kb.open {
+        let badge = egui::pos2(scaled_field_rect.max.x - 18.0 * scale_factor, scaled_field_rect.center().y);
+        painter.circle_filled(badge, 10.0 * scale_factor, accent);
+        painter.text(badge, egui::Align2::CENTER_CENTER, "Y", FontId::proportional(13.0 * scale_factor), Color32::from_rgb(0x10, 0x14, 0x1C));
+    }
+
+    let sub_hint = if state.name_editing {
+        "Press Enter to save  ·  Esc to cancel"
+    } else if state.pad_connected {
+        "[Y] Edit with keyboard  ·  or click to edit"
+    } else {
+        "Click to edit  ·  Enter to save"
+    };
     painter.text(
         scale_pos(egui::pos2(right_x, field_rect.max.y + 20.0 * s)),
         egui::Align2::LEFT_TOP,
-        if state.name_editing { "Press Enter to save  ·  Esc to cancel" } else { "Click to edit  ·  Enter to save" },
+        sub_hint,
         FontId::proportional(12.5 * s * scale_factor),
         pal.muted,
     );

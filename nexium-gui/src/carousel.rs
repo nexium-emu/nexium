@@ -21,6 +21,7 @@ pub struct CarouselState {
     pub scroll_offset: f32,
     pub hover_scale: f32,
     pub ambient_color: Color32,
+    pub theme_color: Color32,
     pub active_dock: bool,
     pub dock_selected: usize,
     pub dock_anim: f32,
@@ -30,6 +31,7 @@ pub struct CarouselState {
     pub a_held: bool,
     pub a_edge: bool,
     pub x_edge: bool,
+    pub y_held: bool,
     pub b_held: bool,
     pub b_edge: bool,
     pub is_dragging: bool,
@@ -43,6 +45,10 @@ pub struct CarouselState {
     pub profile_focused: bool,
     pub search_buf: String,
     pub search_focused: bool,
+    pub search_nav: bool,
+    pub search_caret: usize,
+    pub search_anchor: usize,
+    pub search_kb: crate::vkeyboard::VirtualKeyboard,
     pub profile_click_time: Option<f32>,
     pub profile_push_at: Option<f32>,
     pub pending_center: Option<usize>,
@@ -54,6 +60,9 @@ pub struct CarouselState {
     pub dl_dialog: bool,
     pub active_list: Option<usize>,
     pub list_anim: f32,
+    pub nav_held_dir: u8,
+    pub nav_held_since: f64,
+    pub nav_cd: f64,
 }
 
 impl CarouselState {
@@ -63,6 +72,7 @@ impl CarouselState {
             scroll_offset: CS_FRONT as f32,
             hover_scale: 1.0,
             ambient_color: Color32::from_rgb(0x2F, 0xB4, 0xEF),
+            theme_color: Color32::from_rgb(0x2F, 0xB4, 0xEF),
             active_dock: false,
             dock_selected: 0,
             dock_anim: 0.0,
@@ -72,6 +82,7 @@ impl CarouselState {
             a_held: false,
             a_edge: false,
             x_edge: false,
+            y_held: false,
             b_held: false,
             b_edge: false,
             is_dragging: false,
@@ -84,6 +95,10 @@ impl CarouselState {
             palette_t: 0.0,
             profile_focused: false,
             search_buf: String::new(),
+            search_nav: false,
+            search_caret: 0,
+            search_anchor: 0,
+            search_kb: crate::vkeyboard::VirtualKeyboard::new(),
             search_focused: false,
             profile_click_time: None,
             profile_push_at: None,
@@ -96,6 +111,9 @@ impl CarouselState {
             dl_dialog: false,
             active_list: None,
             list_anim: 0.0,
+            nav_held_dir: 0,
+            nav_held_since: 0.0,
+            nav_cd: 0.0,
         }
     }
 }
@@ -534,6 +552,10 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
         let adj = |v: u8| if f >= 0.0 { (v as f32 + (255.0 - v as f32) * f) as u8 } else { (v as f32 * (1.0 + f)) as u8 };
         Color32::from_rgb(adj(c.r()), adj(c.g()), adj(c.b()))
     };
+    let mix = |c: Color32, d: Color32, f: f32| -> Color32 {
+        let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f) as u8;
+        Color32::from_rgb(m(c.r(), d.r()), m(c.g(), d.g()), m(c.b(), d.b()))
+    };
     let hash = |i: u32| -> f32 {
         let x = ((i.wrapping_mul(2654435761)) ^ 0x9E3779B9) as f32;
         (x.sin() * 43758.547).fract().abs()
@@ -541,83 +563,167 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
     let w = rect.width();
     let h = rect.height();
 
-    // deep-space background, faintly tinted by the theme colour
-    let deep = sh(color, -0.86);
-    painter.rect_filled(rect, Rounding::ZERO, Color32::from_rgba_unmultiplied(deep.r().max(4), deep.g().max(5), deep.b().max(8), a(255.0)));
-
-    // starfield (twinkling), some tinted toward the theme colour
-    for i in 0..160u32 {
-        let sx = rect.min.x + hash(i * 2) * w;
-        let sy = rect.min.y + hash(i * 2 + 1) * h * 0.80;
-        let tw = 0.3 + 0.7 * (0.5 + 0.5 * (t * 1.7 + hash(i * 3) * 30.0).sin());
-        let r = 0.6 + hash(i * 5) * 1.8;
-        let tinted = hash(i * 7) > 0.55;
-        let col = if tinted { sh(color, 0.55) } else { Color32::from_rgb(0xFF, 0xFF, 0xFF) };
-        painter.circle_filled(egui::pos2(sx, sy), r, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a(210.0 * tw)));
-    }
-
-    // shooting stars across the top — one every ~3.4s, tinted by theme
-    let streak = sh(color, 0.6);
-    let period = 3.4;
-    let idx = (t / period).floor();
-    let ph = (t / period).fract();
-    if ph < 0.16 {
-        let prog = ph / 0.16;
-        let sy0 = rect.min.y + h * (0.05 + hash(idx as u32 * 13 + 1) * 0.32);
-        let dir = if hash(idx as u32 * 17) > 0.5 { 1.0 } else { -1.0 };
-        let sx0 = if dir > 0.0 { rect.min.x - 60.0 + prog * (w + 120.0) } else { rect.max.x + 60.0 - prog * (w + 120.0) };
-        let head = egui::pos2(sx0, sy0 + prog * h * 0.10);
-        let fade = (prog * std::f32::consts::PI).sin();
-        for s in 0..9 {
-            let ft = s as f32 / 9.0;
-            let px = head - Vec2::new(dir * 15.0 * s as f32, 4.5 * s as f32);
-            painter.circle_filled(px, 1.9 * (1.0 - ft), Color32::from_rgba_unmultiplied(streak.r(), streak.g(), streak.b(), a(235.0 * fade * (1.0 - ft))));
-        }
-        painter.circle_filled(head, 2.6, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, a(255.0 * fade)));
-    }
-
-    // rotating planet along the bottom, coloured from the theme
-    let pr = w * 0.95;
-    let pc = egui::pos2(rect.center().x, rect.max.y + pr * 0.58);
-    let ocean = sh(color, -0.42);
-    let land = sh(color, 0.28);
-    let lit = sh(color, 0.14);
-    // atmosphere glow
+    // deep space + a faint theme-tinted nebula glow low-centre
+    painter.rect_filled(rect, Rounding::ZERO, Color32::from_rgba_unmultiplied(4, 5, 9, a(255.0)));
+    let neb = sh(color, -0.1);
     for g in 0..6 {
-        let e = (6 - g) as f32 * 5.0;
-        let glow = sh(color, 0.5);
-        painter.circle_stroke(pc, pr + e, Stroke::new(4.5_f32, Color32::from_rgba_unmultiplied(glow.r(), glow.g(), glow.b(), a(18.0 * (1.0 - g as f32 / 6.0)))));
+        painter.circle_filled(egui::pos2(rect.center().x, rect.max.y + h * 0.06), w * (0.52 - g as f32 * 0.03), Color32::from_rgba_unmultiplied(neb.r(), neb.g(), neb.b(), a(5.0)));
     }
-    painter.circle_filled(pc, pr, Color32::from_rgba_unmultiplied(ocean.r(), ocean.g(), ocean.b(), a(255.0)));
-    // soft lit hemisphere (sun upper-left) — clipped inside the planet
-    let planet_clip = painter.with_clip_rect(egui::Rect::from_center_size(pc, Vec2::splat(pr * 2.0)));
-    planet_clip.circle_filled(pc - Vec2::new(pr * 0.28, pr * 0.22), pr * 0.86, Color32::from_rgba_unmultiplied(lit.r(), lit.g(), lit.b(), a(90.0)));
 
-    // continents (lat/long projected onto the sphere; longitude scrolls = rotation)
-    let conts: [(f32, f32, f32); 7] = [
-        (0.0, 0.35, 1.0),
-        (1.0, -0.05, 0.8),
-        (2.1, 0.15, 1.1),
-        (3.0, 0.45, 0.7),
-        (3.9, -0.2, 0.9),
-        (4.8, 0.05, 1.0),
-        (5.6, 0.28, 0.75),
+    // distant planets in the far (top) band — small, like a solar system
+    // (fx, fy, radius, color, has_ring, bob_amplitude, bob_period, bob_phase)
+    let planets: [(f32, f32, f32, Color32, bool, f32, f32, f32); 3] = [
+        (0.86, 0.11, 15.0, Color32::from_rgb(0xC9, 0x8A, 0x4B), true,  3.5, 7.0, 0.0),
+        (0.15, 0.17,  9.0, sh(color, 0.15),                     false, 2.8, 9.0, 2.1),
+        (0.63, 0.06,  6.0, Color32::from_rgb(0x9C, 0x5A, 0x4A), false, 2.2, 6.0, 4.5),
     ];
-    for (bl, lat, sz) in conts {
-        let lam = bl + t * 0.09;
-        let coslam = lam.cos();
-        if coslam <= 0.12 {
+    for (fx, fy, pr2, pcol, ring, bob_amp, bob_period, bob_phase) in planets {
+        let bob = bob_amp * (t / bob_period * std::f32::consts::TAU + bob_phase).sin();
+        let c = egui::pos2(rect.min.x + fx * w, rect.min.y + fy * h + bob);
+        painter.circle_filled(c, pr2, Color32::from_rgba_unmultiplied(pcol.r(), pcol.g(), pcol.b(), a(175.0)));
+        let hl = sh(pcol, 0.3);
+        painter.circle_filled(c - Vec2::new(pr2 * 0.32, pr2 * 0.32), pr2 * 0.66, Color32::from_rgba_unmultiplied(hl.r(), hl.g(), hl.b(), a(120.0)));
+        if ring {
+            for r in 0..2 {
+                let rr = pr2 * (1.7 + r as f32 * 0.2);
+                let mut pts = Vec::with_capacity(41);
+                for k in 0..=40 {
+                    let ang = k as f32 / 40.0 * std::f32::consts::TAU;
+                    pts.push(c + Vec2::new(ang.cos() * rr, ang.sin() * rr * 0.32));
+                }
+                painter.add(egui::Shape::line(pts, Stroke::new(1.4, Color32::from_rgba_unmultiplied(0xD8, 0xBE, 0x8C, a(110.0)))));
+            }
+        }
+    }
+
+    // dense drifting starfield — stars move right-to-left at parallax speeds
+    // Larger stars drift faster, giving a sense of depth.
+    let planet_top = rect.max.y - h * 0.30;
+    for i in 0..700u32 {
+        let base_x = hash(i * 2) * w;
+        let r = 0.5 + hash(i * 5).powf(2.2) * 2.1;
+        // drift speed: 4–18 px/s, larger stars drift faster (parallax)
+        let speed = 4.0 + r * 4.0;
+        let sx = rect.min.x + (base_x - t * speed).rem_euclid(w);
+        let sy = rect.min.y + hash(i * 2 + 1) * h;
+        if sy > planet_top - 6.0 && hash(i * 11) > 0.30 {
             continue;
         }
-        let sx = pc.x + pr * lat.cos() * lam.sin();
-        let sy = pc.y - pr * lat.sin();
-        if sy > rect.max.y + pr * 0.06 {
+        let tw = 0.4 + 0.6 * (0.5 + 0.5 * (t * 1.6 + hash(i * 3) * 40.0).sin());
+        let roll = hash(i * 7);
+        let col = if roll > 0.80 {
+            sh(color, 0.5)
+        } else if roll > 0.68 {
+            Color32::from_rgb(0xC0, 0xD2, 0xFF)
+        } else {
+            Color32::from_rgb(0xFF, 0xFF, 0xFF)
+        };
+        let base_a = if sy < rect.min.y + h * 0.34 { 235.0 } else { 195.0 };
+        
+        // Add pulsating glow to larger stars (r > 1.6)
+        if r > 1.6 {
+            let glow_pulse = 0.5 + 0.5 * (t * 2.5 + hash(i * 13) * 10.0).sin();
+            let glow_r = r * (1.5 + 0.8 * glow_pulse);
+            let glow_a = (base_a * tw * 0.25 * (0.6 + 0.4 * glow_pulse)).min(255.0);
+            painter.circle_filled(egui::pos2(sx, sy), glow_r, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a(glow_a)));
+        }
+
+        painter.circle_filled(egui::pos2(sx, sy), r, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a(base_a * tw)));
+    }
+
+    // shooting stars — 3 staggered emitters spread across the top third
+    for k in 0..3u32 {
+        let period = 5.0 + k as f32 * 1.7;
+        let off = hash(k * 131) * period;
+        let local = (t + off) % period;
+        let dur = 0.55;
+        if local < dur {
+            let cyc = ((t + off) / period).floor() as u32;
+            let seed = cyc.wrapping_mul(7).wrapping_add(k * 53);
+            let prog = local / dur;
+            let fade = (prog * std::f32::consts::PI).sin();
+            let zx = (0.10 + 0.32 * k as f32 + hash(seed) * 0.14) * w;
+            let zy = (0.03 + hash(seed + 1) * 0.26) * h;
+            let dir = if hash(seed + 2) > 0.42 { 1.0 } else { -1.0 };
+            let slope = 0.30 + hash(seed + 3) * 0.24;
+            let len = w * 0.55;
+            let hx = rect.min.x + zx + dir * prog * len;
+            let hy = rect.min.y + zy + prog * len * slope;
+            let head = egui::pos2(hx, hy);
+            let stt = sh(color, 0.5);
+            for s in 0..14 {
+                let ft = s as f32 / 14.0;
+                let px = head - Vec2::new(dir * 13.0 * s as f32, 13.0 * slope * s as f32);
+                let sc = if ft < 0.45 { mix(Color32::WHITE, stt, ft * 2.2) } else { stt };
+                painter.circle_filled(px, 1.9 * (1.0 - ft), Color32::from_rgba_unmultiplied(sc.r(), sc.g(), sc.b(), a(230.0 * fade * (1.0 - ft))));
+            }
+            painter.circle_filled(head, 2.4, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, a(255.0 * fade)));
+        }
+    }
+
+    // Earth — a small rotating horizon arc hugging the bottom (behind the dock)
+    let pr = w * 1.15;
+    let pc = egui::pos2(rect.center().x, planet_top + pr);
+    let ocean = sh(mix(Color32::from_rgb(0x14, 0x3A, 0x6E), color, 0.22), -0.03);
+    let land = mix(Color32::from_rgb(0x33, 0x72, 0x40), color, 0.08);
+    let atmo = mix(Color32::from_rgb(0x6E, 0xC6, 0xFF), color, 0.35);
+    let uv = egui::epaint::WHITE_UV;
+    let planet_clip = painter.with_clip_rect(egui::Rect::from_min_max(egui::pos2(rect.min.x, planet_top - 30.0), rect.max));
+    for g in 0..4 {
+        let e = (4 - g) as f32 * 3.0;
+        planet_clip.circle_stroke(pc, pr + e, Stroke::new(2.6, Color32::from_rgba_unmultiplied(atmo.r(), atmo.g(), atmo.b(), a(13.0 * (1.0 - g as f32 / 4.0)))));
+    }
+    planet_clip.circle_filled(pc, pr, Color32::from_rgba_unmultiplied(ocean.r(), ocean.g(), ocean.b(), a(255.0)));
+    let lit = sh(ocean, 0.30);
+    planet_clip.circle_stroke(pc, pr - 5.0, Stroke::new(9.0, Color32::from_rgba_unmultiplied(lit.r(), lit.g(), lit.b(), a(80.0))));
+
+    let spin = t * 0.14;
+    let land_col = Color32::from_rgba_unmultiplied(land.r(), land.g(), land.b(), a(255.0));
+    // (lon, lat, angular size, aspect = width/height)
+    let conts: [(f32, f32, f32, f32); 11] = [
+        (0.20, 1.14, 0.13, 1.9), (0.85, 1.28, 0.055, 0.8), (1.45, 1.10, 0.13, 0.65), (2.05, 1.26, 0.050, 1.2),
+        (2.65, 1.16, 0.11, 1.6), (3.25, 1.30, 0.040, 1.0), (3.80, 1.11, 0.12, 0.75), (4.45, 1.24, 0.065, 1.3),
+        (5.05, 1.15, 0.10, 1.7), (5.55, 1.29, 0.045, 0.9), (6.05, 1.18, 0.085, 1.1),
+    ];
+    for (ci, (clon, clat, csz, aspect)) in conts.iter().enumerate() {
+        let clam = clon + spin;
+        let cz = clat.cos() * clam.cos();
+        if cz <= 0.12 {
             continue;
         }
-        let cr = pr * 0.11 * sz * (0.4 + 0.6 * coslam);
-        // darken toward the trailing (right) edge for a subtle terminator
-        let shade = (0.55 + 0.45 * ((sx - pc.x) / pr * -1.0 + 0.5)).clamp(0.35, 1.0);
-        planet_clip.circle_filled(egui::pos2(sx, sy), cr, Color32::from_rgba_unmultiplied((land.r() as f32 * shade) as u8, (land.g() as f32 * shade) as u8, (land.b() as f32 * shade) as u8, a(255.0)));
+        let ccy = pc.y - pr * clat.sin();
+        if ccy > rect.max.y + 40.0 {
+            continue;
+        }
+        let term = ((cz - 0.12) / 0.22).clamp(0.0, 1.0);
+        let ts = term * term * (3.0 - 2.0 * term);
+        let sz = csz * ts;
+        if sz < 0.004 {
+            continue;
+        }
+        let ccx = pc.x + pr * clat.cos() * clam.sin();
+        let ph1 = hash(ci as u32 * 17) * 6.283;
+        let ph2 = hash(ci as u32 * 29) * 6.283;
+        let ph3 = hash(ci as u32 * 41) * 6.283;
+        let n = 34usize;
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(ccx, ccy), uv, color: land_col });
+        for k in 0..n {
+            let ang = k as f32 / n as f32 * std::f32::consts::TAU;
+            let wob = (0.72 + 0.22 * (ang * 2.0 + ph1).sin() + 0.14 * (ang * 3.0 + ph2).sin() + 0.08 * (ang * 5.0 + ph3).sin()).max(0.25);
+            let dlam = ang.cos() * sz * aspect * wob;
+            let dphi = ang.sin() * sz * wob;
+            let lat = clat + dphi;
+            let lon = clam + dlam;
+            let lc = lat.cos();
+            let px = pc.x + pr * lc * lon.sin();
+            let py = pc.y - pr * lat.sin();
+            mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(px, py), uv, color: land_col });
+        }
+        for k in 0..n as u32 {
+            mesh.indices.extend_from_slice(&[0, 1 + k, 1 + ((k + 1) % n as u32)]);
+        }
+        planet_clip.add(egui::Shape::mesh(mesh));
     }
 }
 
@@ -726,9 +832,9 @@ pub fn draw_wave_background(
         let crest_pts: Vec<egui::Pos2> = (0..=steps).map(|s| mesh.vertices[2 * s].pos).collect();
         painter.add(egui::Shape::mesh(mesh));
         let outer_col = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), (band_alpha / 2).max(1));
-        painter.add(egui::Shape::line(crest_pts.clone(), Stroke::new(2.0_f32, outer_col)));
+        painter.add(egui::Shape::line(crest_pts.clone(), Stroke::new(2.0, outer_col)));
         let inner_col = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), band_alpha);
-        painter.add(egui::Shape::line(crest_pts, Stroke::new(1.0_f32, inner_col)));
+        painter.add(egui::Shape::line(crest_pts, Stroke::new(1.0, inner_col)));
     }
 }
 
@@ -758,6 +864,22 @@ pub fn carousel_view(
     icon_reveal: Option<(usize, f32, Option<egui::TextureHandle>)>,
 ) -> CarouselAction {
     let mut action = CarouselAction::None;
+
+    if state.search_kb.open
+        && (!interactive
+            || state.boot_stage != BootStage::None
+            || state.palette_open
+            || state.profile_focused
+            || state.game_menu_open)
+    {
+        state.search_kb.open = false;
+        state.search_focused = false;
+        state.search_nav = false;
+    }
+    if (state.palette_open || state.profile_focused || state.game_menu_open) && state.search_nav {
+        state.search_nav = false;
+    }
+    let interactive = interactive && !state.search_kb.open;
 
     // 1. Filter games based on search_buf
     let mut filtered_indices: Vec<usize> = if state.search_buf.is_empty() {
@@ -884,45 +1006,20 @@ pub fn carousel_view(
 
     if interactive && state.boot_stage == BootStage::None && !state.palette_open && !state.profile_focused {
         let primary_clicked = ui.input(|i| i.pointer.primary_clicked());
-        if primary_clicked {
+        if primary_clicked && state.search_focused {
             if let Some(pos) = pointer_pos {
-                let clicked_search = search_rect.contains(pos);
-                if clicked_search != state.search_focused {
-                    state.search_focused = clicked_search;
+                if !search_rect.contains(pos) {
+                    state.search_focused = false;
                 }
             }
         }
-
-        if state.search_focused {
-            let events = ui.input(|i| i.events.clone());
-            let mut changed = false;
-            for ev in events {
-                match ev {
-                    egui::Event::Text(txt) => {
-                        for ch in txt.chars() {
-                            if !ch.is_control() && state.search_buf.chars().count() < 30 {
-                                state.search_buf.push(ch);
-                                changed = true;
-                            }
-                        }
-                    }
-                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
-                        state.search_buf.pop();
-                        changed = true;
-                    }
-                    egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
-                        state.search_focused = false;
-                    }
-                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
-                        state.search_focused = false;
-                    }
-                    _ => {}
-                }
-            }
-            if changed {
-                state.selected = 0;
-            }
+        let y_down = last_input.connected && last_input.is(crate::controller_config::SwitchButton::Y);
+        if y_down && !state.y_held && !state.search_kb.open && !state.game_menu_open {
+            let buf = state.search_buf.clone();
+            state.search_kb.show(&buf, 30);
+            state.search_focused = true;
         }
+        state.y_held = y_down;
     }
 
     if interactive && state.boot_stage == BootStage::None && !state.search_focused && !state.palette_open {
@@ -989,6 +1086,19 @@ pub fn carousel_view(
     };
     state.ambient_color = lerp_color(state.ambient_color, target_color, (dt * 10.0).min(1.0));
 
+    let ui_target: Option<Color32> = if theme == crate::app_settings::CarouselTheme::Rgb {
+        let (cr, cg, cb) = hsv_to_rgb((t * 0.025) % 1.0, 0.85, 0.85);
+        Some(Color32::from_rgb(cr, cg, cb))
+    } else {
+        match theme.color() {
+            Some((r, g, b)) => Some(Color32::from_rgb(r, g, b)),
+            None => game_of(state.selected).map(|gi| lib.games[gi].dominant_color),
+        }
+    };
+    if let Some(c) = ui_target {
+        state.theme_color = lerp_color(state.theme_color, c, (dt * 10.0).min(1.0));
+    }
+
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("carousel_bg")));
     draw_backdrop(&painter, bg_rect, state.ambient_color, t, backdrop_theme, ui_opacity, th);
 
@@ -1006,7 +1116,7 @@ pub fn carousel_view(
             Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
         };
         let sb_bg = Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), (ui_opacity * 220.0) as u8);
-        let sb_border = if state.search_focused {
+        let sb_border = if state.search_focused || state.search_kb.open || state.search_nav {
             accent
         } else {
             Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), sb_alpha)
@@ -1017,18 +1127,29 @@ pub fn carousel_view(
         let icon_pos = scale_pos(search_rect.min + Vec2::new(16.0 * s, search_rect.height() * 0.5));
         painter.text(icon_pos, egui::Align2::LEFT_CENTER, "🔍", FontId::proportional(14.0 * s * scale_factor), Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sb_alpha));
 
-        let text_pos = scale_pos(search_rect.min + Vec2::new(38.0 * s, search_rect.height() * 0.5));
-        if state.search_buf.is_empty() {
-            painter.text(text_pos, egui::Align2::LEFT_CENTER, "Search games...", FontId::proportional(14.0 * s * scale_factor), Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sb_alpha));
-        } else {
-            painter.text(text_pos, egui::Align2::LEFT_CENTER, &state.search_buf, FontId::proportional(14.0 * s * scale_factor), Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), sb_alpha));
+        if last_input.connected && sb_alpha > 0 {
+            let badge = scale_pos(egui::pos2(search_rect.max.x - 18.0 * s, search_rect.center().y));
+            let bcol = if state.search_nav || state.search_kb.open { accent } else { Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sb_alpha) };
+            painter.circle_filled(badge, 9.0 * s * scale_factor, bcol);
+            painter.text(badge, egui::Align2::CENTER_CENTER, "Y", FontId::proportional(12.0 * s * scale_factor), Color32::from_rgb(0x10, 0x14, 0x1C));
         }
 
-        if state.search_focused && (t * 2.0) as usize % 2 == 0 {
-            let text_w = ui.fonts(|f| f.layout_no_wrap(state.search_buf.clone(), FontId::proportional(14.0 * s * scale_factor), Color32::WHITE).size().x);
-            let caret_pos = text_pos + Vec2::new(text_w + 2.0 * scale_factor, 0.0);
-            painter.line_segment([caret_pos - Vec2::new(0.0, 8.0 * s * scale_factor), caret_pos + Vec2::new(0.0, 8.0 * s * scale_factor)], Stroke::new(1.8 * scale_factor, accent));
+        let text_pos = scale_pos(search_rect.min + Vec2::new(38.0 * s, search_rect.height() * 0.5));
+        let sf_font = FontId::proportional(14.0 * s * scale_factor);
+        let txt_c = Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), sb_alpha);
+        let mut_c = Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sb_alpha);
+        let sel_c = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (sb_alpha as f32 * 0.35) as u8);
+        let allow = interactive && state.boot_stage == BootStage::None && !state.palette_open && !state.profile_focused;
+        let blink = state.search_focused && !state.search_kb.open && (t * 1.6).fract() < 0.5;
+        let sf_events = ui.input(|i| i.events.clone());
+        let before = state.search_buf.clone();
+        let active = allow && state.search_focused && !state.search_kb.open;
+        let fr = crate::app::text_field(&painter, ui, search_rect, text_pos.x, text_pos.y, &mut state.search_buf, &mut state.search_caret, &mut state.search_anchor, sf_font, txt_c, mut_c, sel_c, "Search games...", false, 30, active, blink, if active { &sf_events } else { &[] });
+        if allow && !state.search_kb.open {
+            if fr.clicked || fr.secondary_clicked { state.search_focused = true; }
+            if fr.commit || fr.cancel { state.search_focused = false; }
         }
+        if state.search_buf != before { state.selected = 0; }
     }
 
     let mut want_fav: Option<String> = None;
@@ -1445,7 +1566,7 @@ pub fn carousel_view(
                 painter.rect_stroke(
                     pill_rect,
                     Rounding::same(pill_h * 0.5),
-                    Stroke::new(1.4_f32, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(235.0))),
+                    Stroke::new(1.4, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(235.0))),
                 );
                 let dot_c = egui::pos2(pill_rect.min.x + pad_x + dot_r, pill_rect.center().y);
                 painter.circle_filled(dot_c, dot_r * (0.85 + 0.15 * pulse), Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(255.0)));
@@ -1717,7 +1838,7 @@ pub fn carousel_view(
 
             let fill = Color32::from_rgba_premultiplied(col_surface.r(), col_surface.g(), col_surface.b(), (ui_opacity * 200.0) as u8);
             let br = base.width() * 0.5;
-            painter.circle(base.center(), br, fill, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
+            painter.circle(base.center(), br, fill, Stroke::new(1.0, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
             if !dockbar_simple {
                 let arc: Vec<egui::Pos2> = (0..=14)
                     .map(|k| {
@@ -1915,7 +2036,7 @@ pub fn carousel_view(
         }
 
         painter.rect_filled(panel, Rounding::same(20.0 * scale_factor), Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), a(240.0)));
-        painter.rect_stroke(panel, Rounding::same(20.0 * scale_factor), Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(255.0))));
+        painter.rect_stroke(panel, Rounding::same(20.0 * scale_factor), Stroke::new(1.0, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(255.0))));
 
         shadowed_text(&painter, egui::pos2(scaled_center.x, panel.min.y + 20.0 * scale_factor), egui::Align2::CENTER_CENTER, "Background Color", FontId::proportional(15.0 * scale_factor), Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), a(255.0)), true);
 
@@ -1961,7 +2082,7 @@ pub fn carousel_view(
             } else {
                 Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(160.0))
             };
-            painter.rect_stroke(r, rounding, Stroke::new(1.3_f32, sw_stroke));
+            painter.rect_stroke(r, rounding, Stroke::new(1.3, sw_stroke));
         }
 
         let cur = themes.get(state.palette_selected).copied().unwrap_or_default();
@@ -2303,6 +2424,22 @@ pub fn carousel_view(
         }
     }
 
+    {
+        let kb_accent = {
+            let c = state.theme_color;
+            let f = |x: u8| (x as f32 + (255.0 - x as f32) * 0.35) as u8;
+            Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+        };
+        let before_kb = state.search_buf.clone();
+        let res = state.search_kb.update(ctx, ui, &mut state.search_buf, last_input, kb_accent, light_mode);
+        if state.search_buf != before_kb {
+            state.selected = 0;
+        }
+        if matches!(res, crate::vkeyboard::VkResult::Accept | crate::vkeyboard::VkResult::Cancel) {
+            state.search_focused = false;
+        }
+    }
+
     ctx.request_repaint();
     action
 }
@@ -2321,6 +2458,9 @@ fn handle_input(
     launch_path: Option<String>,
     list_selected: Option<usize>,
 ) {
+    if state.search_kb.open {
+        return;
+    }
     let mut left   = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
     let mut right  = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
     let mut up     = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
@@ -2329,10 +2469,40 @@ fn handle_input(
 
     if last_input.connected {
         use crate::controller_config::SwitchButton;
-        if last_input.is(SwitchButton::DLeft)  { left   = true; }
-        if last_input.is(SwitchButton::DRight) { right  = true; }
-        if last_input.is(SwitchButton::DUp)    { up     = true; }
-        if last_input.is(SwitchButton::DDown)  { down   = true; }
+        let now = ui.input(|i| i.time);
+        let cur_dir = if last_input.is(SwitchButton::DUp) { 1 }
+            else if last_input.is(SwitchButton::DDown) { 2 }
+            else if last_input.is(SwitchButton::DLeft) { 3 }
+            else if last_input.is(SwitchButton::DRight) { 4 }
+            else { 0 };
+
+        if cur_dir == 0 {
+            state.nav_held_dir = 0;
+            state.nav_held_since = 0.0;
+        } else if cur_dir != state.nav_held_dir {
+            state.nav_held_dir = cur_dir;
+            state.nav_held_since = now;
+            state.nav_cd = now;
+            match cur_dir {
+                1 => up = true,
+                2 => down = true,
+                3 => left = true,
+                _ => right = true,
+            }
+        } else {
+            const INITIAL_DELAY: f64 = 0.70;
+            const REPEAT_RATE:   f64 = 0.14;
+            let held_for = now - state.nav_held_since;
+            if held_for >= INITIAL_DELAY && now - state.nav_cd >= REPEAT_RATE {
+                state.nav_cd = now;
+                match cur_dir {
+                    1 => up = true,
+                    2 => down = true,
+                    3 => left = true,
+                    _ => right = true,
+                }
+            }
+        }
         if state.b_edge                        { back   = true; }
 
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2496,6 +2666,11 @@ fn handle_input(
     if up {
         if state.active_dock {
             state.active_dock = false;
+        } else if state.search_nav {
+            // already at the top
+        } else if state.profile_focused {
+            state.profile_focused = false;
+            state.search_nav = true;
         } else {
             if !state.profile_focused {
                 state.profile_push_at = Some(ui.input(|i| i.time) as f32);
@@ -2503,7 +2678,13 @@ fn handle_input(
             state.profile_focused = true;
         }
     }
-    if down && !state.active_dock { state.active_dock = true; }
+    if down {
+        if state.search_nav {
+            state.search_nav = false;
+        } else if !state.active_dock {
+            state.active_dock = true;
+        }
+    }
 
     if state.selected != pre_sel
         || state.active_dock != pre_dock
@@ -2516,6 +2697,14 @@ fn handle_input(
                 let _ = backend.rumble(15000, 15000, 35);
             }
         }
+    }
+
+    if select && state.search_nav {
+        let buf = state.search_buf.clone();
+        state.search_kb.show(&buf, 30);
+        state.search_focused = true;
+        crate::ui_audio::play(crate::ui_audio::Sfx::Select);
+        return;
     }
 
     if select {

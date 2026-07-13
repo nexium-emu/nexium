@@ -18,6 +18,7 @@ mod shop;
 mod splash;
 mod steamgrid;
 mod ui_audio;
+mod vkeyboard;
 
 use app::HorizonApp;
 use app_settings::AppSettings;

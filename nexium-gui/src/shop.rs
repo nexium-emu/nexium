@@ -87,6 +87,9 @@ pub struct ShopState {
     pub new_installs: Vec<PendingInstall>,
     search: String,
     editing: bool,
+    search_kb: crate::vkeyboard::VirtualKeyboard,
+    search_nav: bool,
+    y_held: bool,
     filtered: Vec<usize>,
     selected: usize,
     scroll: f32,
@@ -129,6 +132,9 @@ impl ShopState {
             new_installs: Vec::new(),
             search: String::new(),
             editing: false,
+            search_kb: crate::vkeyboard::VirtualKeyboard::new(),
+            search_nav: false,
+            y_held: false,
             filtered: Vec::new(),
             selected: 0,
             scroll: 0.0,
@@ -233,6 +239,11 @@ impl ShopState {
         if !self.open && self.anim < 0.004 {
             return;
         }
+        if !self.open {
+            self.search_kb.open = false;
+            self.search_nav = false;
+            self.editing = false;
+        }
         let pal = palette(light);
         let now = ctx.input(|i| i.time);
         let dt = ui.input(|i| i.stable_dt).min(0.1);
@@ -304,8 +315,8 @@ impl ShopState {
         use crate::controller_config::SwitchButton;
         let gp_a = li.connected && li.is(SwitchButton::A);
         let gp_b = li.connected && li.is(SwitchButton::B);
-        let a_edge = kb_enter || (gp_a && !self.a_held);
-        let b_edge = kb_esc || (gp_b && !self.b_held);
+        let mut a_edge = kb_enter || (gp_a && !self.a_held);
+        let mut b_edge = kb_esc || (gp_b && !self.b_held);
         self.a_held = gp_a;
         self.b_held = gp_b;
         let ready_nav = now - self.nav_cd > 0.16;
@@ -317,15 +328,57 @@ impl ShopState {
             else if li.is(SwitchButton::DDown) || li.ly() < -0.5 { nd = true; self.nav_cd = now; }
         }
 
+        let can_focus_search = matches!(self.view, View::Grid) && self.dialog.is_none();
+        let y_down = li.connected && li.is(SwitchButton::Y);
+        if y_down && !self.y_held && !self.search_kb.open && can_focus_search {
+            let cur = self.search.clone();
+            self.search_kb.show(&cur, 40);
+            self.editing = false;
+        }
+        self.y_held = y_down;
+
+        if !self.editing && !self.search_kb.open && can_focus_search {
+            if self.search_nav {
+                if nd {
+                    self.search_nav = false;
+                    crate::ui_audio::play_move();
+                } else if a_edge {
+                    let cur = self.search.clone();
+                    self.search_kb.show(&cur, 40);
+                } else if b_edge {
+                    self.search_nav = false;
+                }
+                a_edge = false;
+                b_edge = false;
+                nu = false;
+                nd = false;
+                nl = false;
+                nr = false;
+            } else if nu && self.selected < 5 {
+                self.search_nav = true;
+                nu = false;
+                crate::ui_audio::play_move();
+            }
+        } else {
+            self.search_nav = false;
+        }
+
         // search field (top-right of banner)
         let field = egui::Rect::from_min_size(egui::pos2(screen.max.x - 320.0, 9.0), egui::Vec2::new(292.0, 34.0));
         let field_resp = ui.allocate_rect(field, egui::Sense::click());
+        let field_hot = self.editing || self.search_nav || self.search_kb.open;
         paint.rect_filled(field, egui::Rounding::same(8.0), Color32::from_black_alpha(60));
-        paint.rect_stroke(field, egui::Rounding::same(8.0), egui::Stroke::new(if self.editing { 2.0_f32 } else { 1.0_f32 }, if self.editing { Color32::WHITE } else { Color32::from_white_alpha(120) }));
+        paint.rect_stroke(field, egui::Rounding::same(8.0), egui::Stroke::new(if field_hot { 2.0_f32 } else { 1.0_f32 }, if field_hot { accent } else { Color32::from_white_alpha(120) }));
         let disp = if self.search.is_empty() { "Search…".to_string() } else { self.search.clone() };
         paint.text(egui::pos2(field.min.x + 12.0, field.center().y), egui::Align2::LEFT_CENTER, &disp, egui::FontId::proportional(15.0), Color32::from_white_alpha(if self.search.is_empty() { 150 } else { 255 }));
+        if li.connected {
+            let badge = egui::pos2(field.max.x - 16.0, field.center().y);
+            paint.circle_filled(badge, 9.0, if field_hot { accent } else { Color32::from_white_alpha(60) });
+            paint.text(badge, egui::Align2::CENTER_CENTER, "Y", egui::FontId::proportional(12.0), Color32::from_rgb(0x10, 0x14, 0x1C));
+        }
         if field_resp.clicked() {
             self.editing = true;
+            self.search_nav = false;
         }
         if self.editing {
             for ev in &text_events {
@@ -347,9 +400,21 @@ impl ShopState {
             if kb_enter || kb_esc {
                 self.editing = false;
             }
-            ctx.request_repaint();
-            return;
         }
+        if self.search_kb.active() {
+            let before = self.search.clone();
+            let _ = self.search_kb.update(ctx, ui, &mut self.search, li, accent, light);
+            if self.search != before {
+                self.refilter();
+                self.selected = 0;
+            }
+        }
+        let block_search = self.editing || self.search_kb.open;
+        let (a_edge, b_edge, nl, nr, nu, nd) = if block_search {
+            (false, false, false, false, false, false)
+        } else {
+            (a_edge, b_edge, nl, nr, nu, nd)
+        };
 
         self.accent = accent;
         let content = egui::Rect::from_min_max(egui::pos2(screen.min.x, bar.max.y), screen.max);
@@ -482,7 +547,12 @@ impl ShopState {
         }
 
         // hint bar
-        hint_bar(paint, content, pal, "[A] Select   ·   [B] Close   ·   click search to filter");
+        let hint = if self.search_nav {
+            "[A] Type   ·   [\u{2193}/B] Back to games"
+        } else {
+            "[A] Select   ·   [B] Close   ·   [\u{2191}/Y] Search"
+        };
+        hint_bar(paint, content, pal, hint);
     }
 
     #[allow(clippy::too_many_arguments)]
