@@ -263,6 +263,7 @@ pub struct HorizonApp {
     modal_snap: Option<ModalSnap>,
     pending_quick: Option<String>,
     modal_active_frame_start: bool,
+    game_info_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -280,6 +281,12 @@ enum ConfirmKind {
     LaunchGame(String),
     QuickLaunch(String),
     DeleteList(usize),
+}
+
+enum GameInfoAction {
+    Launch(std::path::PathBuf),
+    ToggleFavorite(std::path::PathBuf),
+    DownloadIcon(std::path::PathBuf),
 }
 
 struct ConfirmDialog {
@@ -500,6 +507,7 @@ impl HorizonApp {
             modal_snap: None,
             pending_quick: None,
             modal_active_frame_start: false,
+            game_info_path: None,
         };
         app.reload_profile_texture(&cc.egui_ctx);
         crate::ui_audio::set_sfx_volume(app.app_settings.sfx_volume);
@@ -567,6 +575,211 @@ impl HorizonApp {
         ctx.set_style(s);
     }
 
+    fn toggle_favorite_path(&mut self, path: std::path::PathBuf) {
+        crate::ui_audio::play(crate::ui_audio::Sfx::Favorite);
+        if let Some(pos) = self.app_settings.favorites.iter().position(|item| *item == path) {
+            self.app_settings.favorites.remove(pos);
+        } else {
+            self.app_settings.favorites.push(path);
+        }
+        let _ = self.app_settings.save();
+    }
+
+    fn open_icon_picker(&mut self, path: std::path::PathBuf) {
+        let Some(idx) = self.library.index_of_path(&path) else {
+            return;
+        };
+        let title = self.library.games[idx].title.clone();
+        crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+        self.icon_picker = Some(IconPicker {
+            game_idx: idx,
+            game_path: path,
+            search: title.clone(),
+            editing: false,
+            anim: 0.0,
+            selected: 0,
+            scroll: 0.0,
+            follow_sel: true,
+            squish_at: None,
+            nav_cd: 0.0,
+            hold: true,
+            built: false,
+            full_urls: Vec::new(),
+            thumbs: Vec::new(),
+            fetch: start_icon_fetch(self.app_settings.steamgriddb_key.clone(), title),
+            apply: None,
+        });
+    }
+
+    fn draw_game_info(&mut self, ctx: &egui::Context) -> Option<GameInfoAction> {
+        let Some(path) = self.game_info_path.clone() else {
+            return None;
+        };
+        let Some(game_idx) = self.library.index_of_path(&path) else {
+            self.game_info_path = None;
+            return None;
+        };
+
+        let game = &self.library.games[game_idx];
+        let title = game.title.clone();
+        let author = game.author.clone();
+        let format = game.format.to_string();
+        let size = game.size;
+        let dominant = game.dominant_color;
+        let favorite = self.app_settings.favorites.iter().any(|item| *item == path);
+        let icon = self.library.texture(ctx, game_idx).map(|texture| texture.id());
+        let metadata = std::fs::metadata(&path).ok();
+        let exists = metadata.is_some();
+        let file_size = metadata.as_ref().map(|item| item.len()).unwrap_or(size);
+        let modified = metadata.and_then(|item| item.modified().ok());
+        let path_text = path.to_string_lossy().to_string();
+        let modified_text = modified
+            .map(format_system_time)
+            .unwrap_or_else(|| "Unavailable".to_string());
+        let status_text = if exists { "Available" } else { "Missing" };
+        let status_color = if exists { GREEN } else { DANGER_HV };
+        let mut open = true;
+        let mut close_requested = false;
+        let mut action = None;
+
+        egui::Window::new("Game Information")
+            .id(egui::Id::new("game_information_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([650.0, 490.0])
+            .min_width(560.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let cover_size = Vec2::splat(164.0);
+                    let (cover_rect, _) = ui.allocate_exact_size(cover_size, Sense::hover());
+                    if let Some(texture) = icon {
+                        egui::Image::new((texture, cover_size))
+                            .rounding(Rounding::same(8.0))
+                            .paint_at(ui, cover_rect);
+                    } else {
+                        ui.painter().rect_filled(
+                            cover_rect,
+                            Rounding::same(8.0),
+                            dominant.gamma_multiply(0.45),
+                        );
+                        ui.painter().rect_stroke(
+                            cover_rect,
+                            Rounding::same(8.0),
+                            Stroke::new(1.0_f32, BORDER),
+                        );
+                        ui.painter().text(
+                            cover_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            &format,
+                            FontId::proportional(24.0),
+                            TEXT,
+                        );
+                    }
+                    ui.add_space(16.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(&title).size(24.0).strong().color(TEXT));
+                        if author.trim().is_empty() {
+                            ui.label(egui::RichText::new("Unknown developer").color(MUTED));
+                        } else {
+                            ui.label(egui::RichText::new(&author).size(14.0).color(MUTED));
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&format).strong().color(ACCENT_HV));
+                            ui.label(egui::RichText::new("  |  ").color(BORDER));
+                            ui.label(egui::RichText::new(format_file_size(file_size)).color(MUTED));
+                        });
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(if favorite {
+                                "Favorite"
+                            } else {
+                                "Not a favorite"
+                            })
+                            .color(if favorite { AMBER } else { MUTED }),
+                        );
+                    });
+                });
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("File Details").size(15.0).strong().color(TEXT));
+                ui.add_space(4.0);
+                egui::Grid::new("game_information_details")
+                    .num_columns(2)
+                    .spacing(Vec2::new(18.0, 8.0))
+                    .show(ui, |ui| {
+                        let detail = |ui: &mut egui::Ui, label: &str, value: &str| {
+                            ui.label(egui::RichText::new(label).color(MUTED));
+                            ui.label(egui::RichText::new(value).color(TEXT));
+                            ui.end_row();
+                        };
+                        detail(ui, "Format", &format);
+                        detail(ui, "Size", &format_file_size(file_size));
+                        detail(ui, "Status", status_text);
+                        detail(ui, "Last modified", &modified_text);
+                        ui.label(egui::RichText::new("Location").color(MUTED));
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(&path_text)
+                                    .monospace()
+                                    .color(TEXT),
+                            );
+                            if ui.small_button("Copy").clicked() {
+                                let _ = arboard::Clipboard::new().and_then(|mut clipboard| {
+                                    clipboard.set_text(path_text.clone())
+                                });
+                            }
+                        });
+                        ui.end_row();
+                    });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(exists, egui::Button::new("Launch"))
+                        .clicked()
+                    {
+                        action = Some(GameInfoAction::Launch(path.clone()));
+                    }
+                    if ui
+                        .button(if favorite { "Unfavorite" } else { "Favorite" })
+                        .clicked()
+                    {
+                        action = Some(GameInfoAction::ToggleFavorite(path.clone()));
+                    }
+                    if ui.button("Change Icon").clicked() {
+                        action = Some(GameInfoAction::DownloadIcon(path.clone()));
+                    }
+                    if ui.button("Open Containing Folder").clicked() {
+                        reveal_in_file_manager(&path);
+                    }
+                    if ui.button("Close").clicked() {
+                        close_requested = true;
+                    }
+                });
+                ui.colored_label(status_color, status_text);
+            });
+
+        if close_requested || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+        if !open {
+            self.game_info_path = None;
+        } else if matches!(
+            &action,
+            Some(GameInfoAction::Launch(_) | GameInfoAction::DownloadIcon(_))
+        ) {
+            self.game_info_path = None;
+        }
+        action
+    }
+
     fn library_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         const MARGIN: f32 = 26.0;
         ui.add_space(16.0);
@@ -608,7 +821,12 @@ impl HorizonApp {
         }
 
         let mut launch: Option<String> = None;
+        let mut info_request: Option<std::path::PathBuf> = None;
+        let mut favorite_request: Option<std::path::PathBuf> = None;
+        let mut download_request: Option<std::path::PathBuf> = None;
+        let mut reveal_request: Option<std::path::PathBuf> = None;
         let mut add_folder = false;
+        let info_open = self.game_info_path.is_some();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -634,15 +852,56 @@ impl HorizonApp {
                         if idx < n_games {
                             let tex = self.library.texture(ctx, idx);
                             let selected = self.library.selected == Some(idx);
+                            let game_path = self.library.games[idx].path.clone();
+                            let favorite = self
+                                .app_settings
+                                .favorites
+                                .iter()
+                                .any(|path| *path == game_path);
                             let resp =
                                 game_tile(ui, &self.library.games[idx], tex.as_ref(), selected);
                             if resp.clicked() {
                                 self.library.selected = Some(idx);
                             }
                             if resp.double_clicked() {
-                                launch = Some(
-                                    self.library.games[idx].path.to_string_lossy().to_string(),
-                                );
+                                launch = Some(game_path.to_string_lossy().to_string());
+                            }
+                            if !info_open {
+                                resp.context_menu(|menu| {
+                                    if menu.button("Launch").clicked() {
+                                        launch = Some(game_path.to_string_lossy().to_string());
+                                        menu.close_menu();
+                                    }
+                                    if menu.button("View Game Information").clicked() {
+                                        info_request = Some(game_path.clone());
+                                        menu.close_menu();
+                                    }
+                                    menu.separator();
+                                    let favorite_label = if favorite {
+                                        "Unfavorite Game"
+                                    } else {
+                                        "Favorite Game"
+                                    };
+                                    if menu.button(favorite_label).clicked() {
+                                        favorite_request = Some(game_path.clone());
+                                        menu.close_menu();
+                                    }
+                                    if menu.button("Download Icon").clicked() {
+                                        download_request = Some(game_path.clone());
+                                        menu.close_menu();
+                                    }
+                                    menu.separator();
+                                    if menu.button("Open Containing Folder").clicked() {
+                                        reveal_request = Some(game_path.clone());
+                                        menu.close_menu();
+                                    }
+                                    if menu.button("Copy Path").clicked() {
+                                        let _ = arboard::Clipboard::new().and_then(|mut clipboard| {
+                                            clipboard.set_text(game_path.to_string_lossy().to_string())
+                                        });
+                                        menu.close_menu();
+                                    }
+                                });
                             }
                         } else if add_folder_tile(ui).clicked() {
                             add_folder = true;
@@ -660,6 +919,15 @@ impl HorizonApp {
         if let Some(path) = launch {
             self.nro_path = path;
             self.boot_nro(ctx);
+        } else if let Some(path) = info_request {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+            self.game_info_path = Some(path);
+        } else if let Some(path) = favorite_request {
+            self.toggle_favorite_path(path);
+        } else if let Some(path) = download_request {
+            self.open_icon_picker(path);
+        } else if let Some(path) = reveal_request {
+            reveal_in_file_manager(&path);
         }
         if add_folder {
             if let Some(dir) = rfd::FileDialog::new().pick_folder() {
@@ -800,7 +1068,12 @@ impl HorizonApp {
     }
 
     fn modal_active(&self) -> bool {
-        self.confirm.is_some() || self.teardown_at.is_some() || self.icon_picker.is_some() || self.shop.open || self.carousel_settings_open
+        self.confirm.is_some()
+            || self.teardown_at.is_some()
+            || self.icon_picker.is_some()
+            || self.shop.open
+            || self.carousel_settings_open
+            || self.game_info_path.is_some()
     }
 
     fn update_icon_picker(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -3404,6 +3677,26 @@ impl HorizonApp {
         }
     }
 
+    fn request_launch(&mut self, path: String, ctx: &egui::Context, running: bool) {
+        if running {
+            crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+            self.confirm = Some(ConfirmDialog {
+                title: "Launch Game".into(),
+                body: "Close the current game and launch this one?".into(),
+                confirm_label: "Launch".into(),
+                selected: 0,
+                kind: ConfirmKind::LaunchGame(path),
+            });
+            self.modal_hold = true;
+        } else if crate::boot::emu_alive() {
+            self.teardown_at = Some(std::time::Instant::now());
+            self.pending_boot = Some(path);
+        } else {
+            self.nro_path = path;
+            self.boot_nro(ctx);
+        }
+    }
+
     fn boot_nro(&mut self, ctx: &egui::Context) {
         if self.nro_path.is_empty() {
             return;
@@ -4178,6 +4471,54 @@ fn elide(s: &str, max: usize) -> String {
         t
     } else {
         s.to_string()
+    }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let size = bytes as f64;
+    if size >= GB {
+        format!("{:.2} GB", size / GB)
+    } else if size >= MB {
+        format!("{:.2} MB", size / MB)
+    } else if size >= KB {
+        format!("{:.1} KB", size / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_system_time(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(time)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+fn reveal_in_file_manager(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        if path.is_dir() {
+            let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+        } else {
+            let _ = std::process::Command::new("explorer.exe")
+                .arg(format!("/select,{}", path.display()))
+                .spawn();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+        let _ = std::process::Command::new("xdg-open").arg(target).spawn();
     }
 }
 
@@ -5135,23 +5476,7 @@ impl eframe::App for HorizonApp {
                         );
                         match action {
                             crate::carousel::CarouselAction::Launch(path) => {
-                                if running {
-                                    crate::ui_audio::play(crate::ui_audio::Sfx::Open);
-                                    self.confirm = Some(ConfirmDialog {
-                                        title: "Launch Game".into(),
-                                        body: "Close the current game and launch this one?".into(),
-                                        confirm_label: "Launch".into(),
-                                        selected: 0,
-                                        kind: ConfirmKind::LaunchGame(path),
-                                    });
-                                    self.modal_hold = true;
-                                } else if crate::boot::emu_alive() {
-                                    self.teardown_at = Some(std::time::Instant::now());
-                                    self.pending_boot = Some(path);
-                                } else {
-                                    self.nro_path = path;
-                                    self.boot_nro(ctx);
-                                }
+                                self.request_launch(path, ctx, running);
                             }
                             crate::carousel::CarouselAction::SetTheme(th) => {
                                 if self.app_settings.carousel_theme != th {
@@ -5215,42 +5540,14 @@ impl eframe::App for HorizonApp {
                                 }
                             }
                             crate::carousel::CarouselAction::ToggleFavorite(path) => {
-                                crate::ui_audio::play(crate::ui_audio::Sfx::Favorite);
-                                let p = std::path::PathBuf::from(path);
-                                if let Some(pos) = self.app_settings.favorites.iter().position(|x| *x == p) {
-                                    self.app_settings.favorites.remove(pos);
-                                } else {
-                                    self.app_settings.favorites.push(p);
-                                }
-                                let _ = self.app_settings.save();
+                                self.toggle_favorite_path(std::path::PathBuf::from(path));
                             }
                             crate::carousel::CarouselAction::DownloadIcon(path) => {
-                                let pb = std::path::PathBuf::from(&path);
-                                if let Some(idx) = self.library.index_of_path(&pb) {
-                                    let title = self.library.games[idx].title.clone();
-                                    crate::ui_audio::play(crate::ui_audio::Sfx::Open);
-                                    self.icon_picker = Some(IconPicker {
-                                        game_idx: idx,
-                                        game_path: pb,
-                                        search: title.clone(),
-                                        editing: false,
-                                        anim: 0.0,
-                                        selected: 0,
-                                        scroll: 0.0,
-                                        follow_sel: true,
-                                        squish_at: None,
-                                        nav_cd: 0.0,
-                                        hold: true,
-                                        built: false,
-                                        full_urls: Vec::new(),
-                                        thumbs: Vec::new(),
-                                        fetch: start_icon_fetch(
-                                            self.app_settings.steamgriddb_key.clone(),
-                                            title,
-                                        ),
-                                        apply: None,
-                                    });
-                                }
+                                self.open_icon_picker(std::path::PathBuf::from(path));
+                            }
+                            crate::carousel::CarouselAction::ViewGameInfo(path) => {
+                                crate::ui_audio::play(crate::ui_audio::Sfx::Open);
+                                self.game_info_path = Some(std::path::PathBuf::from(path));
                             }
                             crate::carousel::CarouselAction::OpenShop => {
                                 self.shop.open();
@@ -5382,7 +5679,21 @@ impl eframe::App for HorizonApp {
                     self.library_view(ui, ctx);
                 }
                 self.draw_modal(ctx, ui);
+                let game_info_action = self.draw_game_info(ctx);
                 self.update_icon_picker(ctx, ui);
+                if let Some(action) = game_info_action {
+                    match action {
+                        GameInfoAction::Launch(path) => {
+                            self.request_launch(path.to_string_lossy().to_string(), ctx, running);
+                        }
+                        GameInfoAction::ToggleFavorite(path) => {
+                            self.toggle_favorite_path(path);
+                        }
+                        GameInfoAction::DownloadIcon(path) => {
+                            self.open_icon_picker(path);
+                        }
+                    }
+                }
                 if running
                     && !carousel_mode
                     && self.game_display().is_some()

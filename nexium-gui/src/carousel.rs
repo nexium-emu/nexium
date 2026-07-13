@@ -134,6 +134,7 @@ pub enum CarouselAction {
     OpenProfile,
     ToggleFavorite(String),
     DownloadIcon(String),
+    ViewGameInfo(String),
     OpenShop,
     OpenCarouselSettings,
 }
@@ -1154,6 +1155,8 @@ pub fn carousel_view(
 
     let mut want_fav: Option<String> = None;
     let mut want_download: Option<String> = None;
+    let mut want_info: Option<String> = None;
+    let mut want_launch: Option<String> = None;
     let mut want_close = false;
     let mut fav_first: Option<egui::Rect> = None;
     let mut lib_first: Option<egui::Rect> = None;
@@ -1329,6 +1332,10 @@ pub fn carousel_view(
             let favd = favorites.iter().any(|p| *p == lib.games[gi].path);
             let is_playing_card = playing == Some(gi);
             resp.context_menu(|ui| {
+                if !is_playing_card && ui.button("Launch").clicked() {
+                    want_launch = Some(path_string.clone());
+                    ui.close_menu();
+                }
                 if is_playing_card && ui.button("⏹  Close Game").clicked() {
                     want_close = true;
                     ui.close_menu();
@@ -1340,6 +1347,10 @@ pub fn carousel_view(
                 }
                 if ui.button("🖼  Download Icon…").clicked() {
                     want_download = Some(path_string.clone());
+                    ui.close_menu();
+                }
+                if ui.button("View Game Information").clicked() {
+                    want_info = Some(path_string.clone());
                     ui.close_menu();
                 }
             });
@@ -1645,6 +1656,12 @@ pub fn carousel_view(
     }
     if let Some(p) = want_download {
         action = CarouselAction::DownloadIcon(p);
+    }
+    if let Some(p) = want_info {
+        action = CarouselAction::ViewGameInfo(p);
+    }
+    if let Some(p) = want_launch {
+        action = CarouselAction::Launch(p);
     }
 
     if let BootStage::Transitioning { start_time, .. } = state.boot_stage {
@@ -1964,7 +1981,7 @@ pub fn carousel_view(
 
         let pw = 236.0;
         let rowh = 44.0;
-        let ph = rowh * 2.0 + 22.0;
+        let ph = rowh * 3.0 + 22.0;
         let slide = (1.0 - e) * 18.0;
         let ax = hero_cx + hero_size * 0.5 + 30.0 + slide;
         let ay = hero_cy - ph * 0.5;
@@ -1974,7 +1991,11 @@ pub fn carousel_view(
         painter.rect_filled(panel, Rounding::same(16.0 * scale_factor), Color32::from_rgba_unmultiplied(pfill.r(), pfill.g(), pfill.b(), (e * 255.0) as u8));
         painter.rect_stroke(panel, Rounding::same(16.0 * scale_factor), Stroke::new(1.2 * scale_factor, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (e * 255.0) as u8)));
 
-        let labels = [if favd { "Unfavorite Game" } else { "Favorite Game" }, "Download Icon"];
+        let labels = [
+            if favd { "Unfavorite Game" } else { "Favorite Game" },
+            "View Game Information",
+            "Download Icon",
+        ];
         for (i, label) in labels.iter().enumerate() {
             let ry0 = ay + 11.0 + i as f32 * rowh;
             let row = egui::Rect::from_min_max(sc(egui::pos2(ax + 8.0, ry0)), sc(egui::pos2(ax + pw - 8.0, ry0 + rowh - 4.0)));
@@ -2546,16 +2567,16 @@ fn handle_input(
             state.game_menu_sel -= 1;
             crate::ui_audio::play_move();
         }
-        if down && state.game_menu_sel < 1 {
+        if down && state.game_menu_sel < 2 {
             state.game_menu_sel += 1;
             crate::ui_audio::play_move();
         }
         if select {
             if let Some(p) = &launch_path {
-                *action = if state.game_menu_sel == 0 {
-                    CarouselAction::ToggleFavorite(p.clone())
-                } else {
-                    CarouselAction::DownloadIcon(p.clone())
+                *action = match state.game_menu_sel {
+                    0 => CarouselAction::ToggleFavorite(p.clone()),
+                    1 => CarouselAction::ViewGameInfo(p.clone()),
+                    _ => CarouselAction::DownloadIcon(p.clone()),
                 };
                 crate::ui_audio::play(crate::ui_audio::Sfx::WhistleOk);
             }
