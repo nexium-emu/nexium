@@ -1,7 +1,9 @@
 use crate::kernel::Kernel;
 use nexium_ipc::IpcCtx;
 
-pub fn get_current_time_point(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) {}
+pub fn get_current_time_point(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> Vec<u8> {
+    crate::services::time::steady_clock_time_point()
+}
 
 pub fn get_test_offset(_kernel: &mut Kernel, _ctx: &mut IpcCtx, _session: u32) -> u64 {
     0
