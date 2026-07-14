@@ -106,6 +106,7 @@ pub enum ProfileAction {
     SetMuteMusic(bool),
     SetMuteSfx(bool),
     QuickLaunch(String),
+    StartUpdate,
 }
 
 fn brighten(c: Color32, amt: f32) -> Color32 {
@@ -191,6 +192,9 @@ pub fn profile_view(
     eu_dates: bool,
     music_muted: bool,
     sfx_muted: bool,
+    update_text: &str,
+    update_color: Color32,
+    update_clickable: bool,
     active: bool,
     last_input: &InputSnapshot,
     ib: &mut Option<crate::input::InputBackend>,
@@ -372,6 +376,10 @@ pub fn profile_view(
     let tab_idx = TAB_ORDER.iter().position(|x| *x == state.tab).unwrap_or(0);
     const N_SETTINGS: usize = 6;
     let launch_enter = enter && state.focus_content;
+
+    if state.tab == ProfileTab::System && update_clickable && enter {
+        action = ProfileAction::StartUpdate;
+    }
 
     if tab_left {
         state.tab = TAB_ORDER[(tab_idx + TAB_ORDER.len() - 1) % TAB_ORDER.len()];
@@ -632,7 +640,7 @@ pub fn profile_view(
             );
         }
         ProfileTab::System => {
-            system_page(&content_painter, content, s, scale_factor, &scale_pos, &scale_rect, pal);
+            system_page(ui, &content_painter, content, s, scale_factor, &scale_pos, &scale_rect, pal, update_text, update_color, update_clickable, &mut action);
         }
     }
     if ease < 1.0 {
@@ -687,6 +695,7 @@ pub fn profile_view(
 
 #[allow(clippy::too_many_arguments)]
 fn system_page(
+    ui: &mut egui::Ui,
     painter: &egui::Painter,
     content: egui::Rect,
     s: f32,
@@ -694,12 +703,16 @@ fn system_page(
     scale_pos: &impl Fn(egui::Pos2) -> egui::Pos2,
     scale_rect: &impl Fn(egui::Rect) -> egui::Rect,
     pal: Pal,
+    update_text: &str,
+    update_color: Color32,
+    update_clickable: bool,
+    action: &mut ProfileAction,
 ) {
     let rows: [(&str, String); 4] = [
         ("NeXium Version", format!("v{}", env!("CARGO_PKG_VERSION"))),
         ("Commit", env!("NEXIUM_GIT_HASH").to_string()),
         ("Build", format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH)),
-        ("Update Status", "Auto-update check coming soon".to_string()),
+        ("Update Status", update_text.to_string()),
     ];
 
     let row_h = 58.0 * s;
@@ -711,22 +724,40 @@ fn system_page(
         );
         let r = scale_rect(row);
         let rounding = Rounding::same(12.0 * s * scale_factor);
+        let is_update = idx == 3;
+        let actionable = is_update && update_clickable;
         painter.rect_filled(r, rounding, pal.panel);
-        painter.rect_stroke(r, rounding, Stroke::new(1.0 * scale_factor, pal.border));
+        let hovered = actionable && ui.rect_contains_pointer(r);
+        let stroke_col = if actionable { update_color } else { pal.border };
+        painter.rect_stroke(r, rounding, Stroke::new(if actionable { if hovered { 2.4 } else { 1.8 } } else { 1.0 } * scale_factor, stroke_col));
+        let label_y = if actionable { row.center().y - 10.0 * s } else { row.center().y };
+        if actionable {
+            painter.text(
+                scale_pos(egui::pos2(row.min.x + 24.0 * s, row.center().y + 11.0 * s)),
+                egui::Align2::LEFT_CENTER,
+                "Press A / click to install",
+                FontId::proportional(11.5 * s * scale_factor),
+                pal.muted,
+            );
+        }
         painter.text(
-            scale_pos(egui::pos2(row.min.x + 24.0 * s, row.center().y)),
+            scale_pos(egui::pos2(row.min.x + 24.0 * s, label_y)),
             egui::Align2::LEFT_CENTER,
             *label,
             FontId::proportional(17.0 * s * scale_factor),
             pal.muted,
         );
+        let vcol = if is_update { update_color } else { pal.text };
         painter.text(
             scale_pos(egui::pos2(row.max.x - 26.0 * s, row.center().y)),
             egui::Align2::RIGHT_CENTER,
             value,
             FontId::proportional(18.0 * s * scale_factor),
-            pal.text,
+            vcol,
         );
+        if is_update && update_clickable && ui.allocate_rect(r, egui::Sense::click()).clicked() {
+            *action = ProfileAction::StartUpdate;
+        }
     }
 }
 

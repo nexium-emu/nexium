@@ -18,6 +18,7 @@ mod shop;
 mod splash;
 mod steamgrid;
 mod ui_audio;
+mod updater;
 mod vkeyboard;
 
 use app::HorizonApp;
@@ -27,6 +28,27 @@ use nexium_common::FileLogger;
 fn main() -> Result<(), eframe::Error> {
     // Re-enabled for the guest by the game window process.
     std::env::set_var("DISABLE_MANGOHUD", "1");
+
+    if std::env::var_os("NEXIUM_DIAG").is_some() {
+        let defaults: [(&str, &str); 11] = [
+            ("NEXIUM_RT_STATS", "1"),
+            ("NEXIUM_RT_STATS_PERIOD", "120"),
+            ("NEXIUM_TEXDUMP", "1"),
+            ("NEXIUM_PROBE_SHADE", "1"),
+            ("NEXIUM_TEX_BIND_LOG", "1"),
+            ("NEXIUM_CBUF_WATCH", "0:0:0x40,16:0:0x40"),
+            ("NEXIUM_BIND_TRACE_FS", "all"),
+            ("NEXIUM_DUMP_SHADERS", "all"),
+            ("NEXIUM_RT_ALIAS_DBG", "1"),
+            ("NEXIUM_RT_ALIAS_SYNC_DBG", "1"),
+            ("NEXIUM_VTX_DBG", "all"),
+        ];
+        for (k, v) in defaults {
+            if std::env::var_os(k).is_none() {
+                std::env::set_var(k, v);
+            }
+        }
+    }
 
     let settings = AppSettings::load();
 

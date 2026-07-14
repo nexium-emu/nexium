@@ -183,6 +183,17 @@ pub fn vertex_binding_read_range(
     };
     let start_byte = stride.saturating_mul(start_vertex as u64);
     let mut bytes = stride.saturating_mul(vertex_span as u64);
+    let attr_end_max = call
+        .vertex_layout
+        .attrs
+        .iter()
+        .filter(|a| a.binding == binding.binding)
+        .map(|a| a.offset as u64 + attr_format_byte_size(a.format))
+        .max()
+        .unwrap_or(0);
+    if attr_end_max > stride {
+        bytes = bytes.saturating_add(attr_end_max - stride);
+    }
     if binding.size > 0 {
         if start_byte >= binding.size {
             return None;
@@ -194,6 +205,56 @@ pub fn vertex_binding_read_range(
         return None;
     }
     Some((binding.addr.wrapping_add(start_byte), bytes))
+}
+
+fn attr_format_byte_size(format: vk::Format) -> u64 {
+    match format {
+        vk::Format::R8_UNORM
+        | vk::Format::R8_SNORM
+        | vk::Format::R8_UINT
+        | vk::Format::R8_SINT => 1,
+        vk::Format::R8G8_UNORM
+        | vk::Format::R8G8_SNORM
+        | vk::Format::R8G8_UINT
+        | vk::Format::R8G8_SINT
+        | vk::Format::R16_SFLOAT
+        | vk::Format::R16_UNORM
+        | vk::Format::R16_SNORM
+        | vk::Format::R16_UINT
+        | vk::Format::R16_SINT => 2,
+        vk::Format::R8G8B8_UNORM | vk::Format::R8G8B8_SNORM => 3,
+        vk::Format::R8G8B8A8_UNORM
+        | vk::Format::R8G8B8A8_SNORM
+        | vk::Format::R8G8B8A8_UINT
+        | vk::Format::R8G8B8A8_SINT
+        | vk::Format::B8G8R8A8_UNORM
+        | vk::Format::A2B10G10R10_UNORM_PACK32
+        | vk::Format::A2B10G10R10_SNORM_PACK32
+        | vk::Format::R16G16_SFLOAT
+        | vk::Format::R16G16_UNORM
+        | vk::Format::R16G16_SNORM
+        | vk::Format::R16G16_UINT
+        | vk::Format::R16G16_SINT
+        | vk::Format::R32_SFLOAT
+        | vk::Format::R32_UINT
+        | vk::Format::R32_SINT => 4,
+        vk::Format::R16G16B16_SFLOAT => 6,
+        vk::Format::R16G16B16A16_SFLOAT
+        | vk::Format::R16G16B16A16_UNORM
+        | vk::Format::R16G16B16A16_SNORM
+        | vk::Format::R16G16B16A16_UINT
+        | vk::Format::R16G16B16A16_SINT
+        | vk::Format::R32G32_SFLOAT
+        | vk::Format::R32G32_UINT
+        | vk::Format::R32G32_SINT => 8,
+        vk::Format::R32G32B32_SFLOAT
+        | vk::Format::R32G32B32_UINT
+        | vk::Format::R32G32B32_SINT => 12,
+        vk::Format::R32G32B32A32_SFLOAT
+        | vk::Format::R32G32B32A32_UINT
+        | vk::Format::R32G32B32A32_SINT => 16,
+        _ => 16,
+    }
 }
 
 pub fn expand_quad_vertices(src: &[u8], stride: usize) -> Vec<u8> {

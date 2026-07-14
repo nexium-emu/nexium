@@ -452,6 +452,7 @@ impl EmulationHandle {
             );
             let mut cur_nro_path = nro_path;
 
+            let mut chained_argv: Option<String> = None;
             'launcher: loop {
                 log::info!("Booting NRO: {}", cur_nro_path);
 
@@ -468,6 +469,7 @@ impl EmulationHandle {
 
                 let mut config = BootConfig::new(&cur_nro_path);
                 config.loader_path = Some(initial_loader_argv.clone());
+                config.argv_override = chained_argv.take();
                 config.cpu_backend = cpu_backend;
                 let mut boot_ctx = BootContext::new(config)?;
 
@@ -1495,7 +1497,13 @@ impl EmulationHandle {
                 }
 
                 if let Some(next_path) = boot_ctx.chained_load_path() {
-                    log::info!("Chain-launch: {} -> {}", cur_nro_path, next_path);
+                    chained_argv = boot_ctx.chained_load_argv();
+                    log::info!(
+                        "Chain-launch: {} -> {} argv={:?}",
+                        cur_nro_path,
+                        next_path,
+                        chained_argv
+                    );
                     drop(_wd_guard);
                     drop(boot_ctx);
                     cur_nro_path = next_path;

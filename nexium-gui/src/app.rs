@@ -177,6 +177,8 @@ pub struct HorizonApp {
     prefs_key_anchor: usize,
     vkeyboard: crate::vkeyboard::VirtualKeyboard,
     vk_target: VkTarget,
+    updater: crate::updater::Updater,
+    update_restart_shown: bool,
     input: Option<InputBackend>,
     last_input: InputSnapshot,
     debugger: DebuggerState,
@@ -281,6 +283,8 @@ enum ConfirmKind {
     LaunchGame(String),
     QuickLaunch(String),
     DeleteList(usize),
+    UpdateInstall,
+    UpdateRestart,
 }
 
 enum GameInfoAction {
@@ -421,6 +425,8 @@ impl HorizonApp {
             prefs_key_anchor: 0,
             vkeyboard: crate::vkeyboard::VirtualKeyboard::new(),
             vk_target: VkTarget::None,
+            updater: crate::updater::Updater::new(),
+            update_restart_shown: false,
             input,
             last_input: InputSnapshot::default(),
             debugger: DebuggerState::new(),
@@ -2253,6 +2259,77 @@ impl HorizonApp {
         }
     }
 
+    fn update_status_display(&self, t: f32) -> (String, Color32, bool) {
+        let light = self.app_settings.light_mode;
+        let grey = if light { Color32::from_rgb(0x88, 0x88, 0x92) } else { Color32::from_rgb(0x70, 0x70, 0x7A) };
+        let green = Color32::from_rgb(0x35, 0xD0, 0x6A);
+        let red = if light { Color32::from_rgb(0xC0, 0x3A, 0x3A) } else { Color32::from_rgb(0xE0, 0x6A, 0x6A) };
+        if !crate::updater::Updater::supported() {
+            return ("Windows: use GitHub releases".to_string(), grey, false);
+        }
+        if self.updater.is_downloading() {
+            let pct = (self.updater.progress() * 100.0) as i32;
+            return (format!("Downloading  {}%", pct), green, false);
+        }
+        match self.updater.status() {
+            crate::updater::Status::Idle | crate::updater::Status::Checking => {
+                let dots = ((t * 2.0) as usize % 3) + 1;
+                (format!("Checking{}", ".".repeat(dots)), grey, false)
+            }
+            crate::updater::Status::UpToDate => ("Fully up-to-date.".to_string(), grey, false),
+            crate::updater::Status::Available(_) => ("Update Available!".to_string(), green, true),
+            crate::updater::Status::Error(_) => ("Update check failed".to_string(), red, false),
+        }
+    }
+
+    fn drive_updater(&mut self, ctx: &egui::Context) {
+        self.updater.check();
+        if self.updater.is_downloading() {
+            ctx.request_repaint();
+        }
+        if let Some(ok) = self.updater.download_result() {
+            if ok && !self.update_restart_shown && self.confirm.is_none() && self.teardown_at.is_none() {
+                self.update_restart_shown = true;
+                self.confirm = Some(ConfirmDialog {
+                    title: "Software Update".into(),
+                    body: "Download Complete!\nWould you like to restart & open the latest release now?".into(),
+                    confirm_label: "Yes".into(),
+                    selected: 1,
+                    kind: ConfirmKind::UpdateRestart,
+                });
+            }
+        }
+    }
+
+    fn open_update_confirm(&mut self) {
+        if self.confirm.is_some() || self.updater.available_release().is_none() {
+            return;
+        }
+        let exe_path = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "the executable location".to_string());
+        let parent_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "app folder".to_string());
+
+        let body = format!(
+            "You are about to install the latest Linux build.\n\n\
+             This will replace the active binary at:\n{}\n\n\
+             A backup of the current build will be saved in:\n{}/backups/\n\n\
+             Would you like to proceed?",
+            exe_path, parent_dir
+        );
+
+        self.confirm = Some(ConfirmDialog {
+            title: "Software Update".into(),
+            body,
+            confirm_label: "Yes".into(),
+            selected: 1,
+            kind: ConfirmKind::UpdateInstall,
+        });
+    }
+
     fn update_preferences(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let target = if self.show_settings { 1.0 } else { 0.0 };
         let dt = ui.input(|i| i.stable_dt).min(0.1);
@@ -2719,13 +2796,31 @@ impl HorizonApp {
 
             let nav_gamepads = self.input.as_ref().map(|ib| ib.list_gamepads()).unwrap_or_default();
 
-            // Column switching (disabled while the dropdown is open)
+            // Column switching + L/R across the deadzone sliders (disabled while the dropdown is open)
             if self.prefs_focus && !rebinding_active && !self.prefs_dropdown_open {
-                if r_bumper_edge || (self.prefs_col == 0 && self.prefs_row >= 1 && nr) {
+                if r_bumper_edge {
+                    if self.prefs_col == 0 {
+                        self.prefs_col = 1;
+                        self.prefs_col1_row = 0;
+                        crate::ui_audio::play_move();
+                    } else if self.prefs_col1_row == 1 {
+                        self.prefs_col1_row = 2;
+                        crate::ui_audio::play_move();
+                    }
+                } else if l_bumper_edge {
+                    if self.prefs_col == 1 {
+                        if self.prefs_col1_row == 2 {
+                            self.prefs_col1_row = 1;
+                        } else {
+                            self.prefs_col = 0;
+                        }
+                        crate::ui_audio::play_move();
+                    }
+                } else if self.prefs_col == 0 && self.prefs_row >= 1 && nr {
                     self.prefs_col = 1;
                     self.prefs_col1_row = 0;
                     crate::ui_audio::play_move();
-                } else if l_bumper_edge || (self.prefs_col == 1 && self.prefs_col1_row == 0 && nl) {
+                } else if self.prefs_col == 1 && self.prefs_col1_row == 0 && nl {
                     self.prefs_col = 0;
                     crate::ui_audio::play_move();
                 }
@@ -3137,7 +3232,7 @@ impl HorizonApp {
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             };
             if let Some(bi) = clicked_bind { start_rebind(self, bi); }
-            else if self.prefs_focus && self.prefs_row >= 1 && !rebinding_active && a_edge { start_rebind(self, self.prefs_row - 1); }
+            else if self.prefs_focus && self.prefs_col == 0 && self.prefs_row >= 1 && !rebinding_active && !self.prefs_dropdown_open && a_edge { start_rebind(self, self.prefs_row - 1); }
         } else if self.settings_tab == SettingsTab::Audio {
             let n = 4usize;
             if !self.prefs_focus { self.prefs_row = 0; }
@@ -3441,6 +3536,23 @@ impl HorizonApp {
                     self.cs_build_grab = None;
                 }
             }
+            ConfirmKind::UpdateInstall => {
+                if let Some(rel) = self.updater.available_release() {
+                    self.update_restart_shown = false;
+                    self.updater.start_download(&rel);
+                }
+            }
+            ConfirmKind::UpdateRestart => {
+                self.stop_emulation();
+                match self.updater.install_and_relaunch() {
+                    Ok(()) => {
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        log::error!("update install failed: {}", e);
+                    }
+                }
+            }
         }
     }
 
@@ -3599,10 +3711,15 @@ impl HorizonApp {
 
         let pop = 0.90 + 0.10 * ease;
         let body_font = FontId::proportional(19.0);
-        let body_w = ui.fonts(|f| f.layout_no_wrap(body.clone(), body_font, text).size().x);
+        let lines: Vec<&str> = body.split('\n').collect();
+        let body_w = lines
+            .iter()
+            .map(|ln| ui.fonts(|f| f.layout_no_wrap(ln.to_string(), body_font.clone(), text).size().x))
+            .fold(0.0_f32, f32::max);
         let base_w = (body_w + 72.0).clamp(380.0, (screen.width() - 60.0).max(400.0));
         let w = base_w * pop;
-        let h = 224.0 * pop;
+        let extra_lines = lines.len().saturating_sub(1) as f32;
+        let h = (224.0 + extra_lines * 26.0) * pop;
         let box_rect = egui::Rect::from_center_size(screen.center(), Vec2::new(w, h));
         p.rect_filled(box_rect.translate(Vec2::new(0.0, 10.0)), Rounding::same(18.0), Color32::from_black_alpha(90));
         p.rect_filled(box_rect, Rounding::same(18.0), panel);
@@ -3616,7 +3733,11 @@ impl HorizonApp {
         }
 
         p.text(egui::pos2(box_rect.center().x, box_rect.min.y + 40.0 * pop), egui::Align2::CENTER_CENTER, &title, FontId::proportional(15.0 * pop), muted);
-        p.text(egui::pos2(box_rect.center().x, box_rect.center().y - 14.0 * pop), egui::Align2::CENTER_CENTER, &body, FontId::proportional(19.0 * pop), text);
+        let line_h = 26.0 * pop;
+        let block_top = box_rect.center().y - 14.0 * pop - extra_lines * line_h * 0.5;
+        for (i, ln) in lines.iter().enumerate() {
+            p.text(egui::pos2(box_rect.center().x, block_top + i as f32 * line_h), egui::Align2::CENTER_CENTER, *ln, FontId::proportional(19.0 * pop), text);
+        }
 
         let btn_w = w * 0.42;
         let btn_h = 46.0 * pop;
@@ -5273,10 +5394,12 @@ impl eframe::App for HorizonApp {
                         &self.app_settings.carousel_order,
                         &self.app_settings.carousel_lists,
                         self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
+                        matches!(self.updater.status(), crate::updater::Status::Available(_)) && !self.updater.is_downloading(),
                     );
 
                     let profile_scale = 0.92 + 0.08 * content_opacity;
                     let profile_active = !self.modal_active() && !self.modal_active_frame_start;
+                    let (upd_text, upd_color, upd_click) = self.update_status_display(ctx.input(|i| i.time) as f32);
                     let action = crate::profile::profile_view(
                         &mut self.profile,
                         &mut self.library,
@@ -5299,6 +5422,9 @@ impl eframe::App for HorizonApp {
                         self.app_settings.eu_dates,
                         self.app_settings.music_muted,
                         self.app_settings.sfx_muted,
+                        &upd_text,
+                        upd_color,
+                        upd_click,
                         profile_active,
                         &self.last_input,
                         &mut self.input,
@@ -5319,6 +5445,9 @@ impl eframe::App for HorizonApp {
                                     kind: ConfirmKind::QuickLaunch(path),
                                 });
                                 self.modal_hold = true;
+                            }
+                            crate::profile::ProfileAction::StartUpdate => {
+                                self.open_update_confirm();
                             }
                             crate::profile::ProfileAction::PickIcon => {
                                 self.pick_profile_avatar();
@@ -5473,6 +5602,7 @@ impl eframe::App for HorizonApp {
                             &self.app_settings.carousel_order,
                             &self.app_settings.carousel_lists,
                             self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
+                            matches!(self.updater.status(), crate::updater::Status::Available(_)) && !self.updater.is_downloading(),
                         );
                         match action {
                             crate::carousel::CarouselAction::Launch(path) => {
@@ -5557,6 +5687,9 @@ impl eframe::App for HorizonApp {
                                 self.carousel_settings_open = true;
                                 crate::ui_audio::play(crate::ui_audio::Sfx::Open);
                             }
+                            crate::carousel::CarouselAction::OpenUpdate => {
+                                self.open_update_confirm();
+                            }
                             crate::carousel::CarouselAction::None => {}
                         }
 
@@ -5633,6 +5766,7 @@ impl eframe::App for HorizonApp {
                             &self.app_settings.carousel_order,
                             &self.app_settings.carousel_lists,
                             self.icon_reveal.as_ref().map(|(gi, tm, tx)| (*gi, tm.elapsed().as_secs_f32(), tx.clone())),
+                            matches!(self.updater.status(), crate::updater::Status::Available(_)) && !self.updater.is_downloading(),
                         );
                         if t < 1.05 {
                             if let Some((tid, tsz)) = self.game_display() {
@@ -5732,6 +5866,7 @@ impl eframe::App for HorizonApp {
                     self.update_preferences(ctx, ui);
                 }
                 self.drive_vkeyboard(ctx, ui);
+                self.drive_updater(ctx);
             });
 
         if self.show_settings && self.app_settings.view_mode != crate::app_settings::ViewMode::Carousel {

@@ -1519,6 +1519,32 @@ fn execute_one(
                 }
             };
 
+            if env_dump_shader("NEXIUM_DUMP_FS", fs_addr) {
+                let path = shader_dump_path(&format!("target_fs_{:x}.txt", fs_addr));
+                let _ = std::fs::write(
+                    &path,
+                    format_shader_dump(&fs_sass, fs_sph.as_ref(), Some(fs_input_map), fs_output_map),
+                );
+                log::warn!("[dump-fs] wrote {}", path.display());
+            }
+            if env_dump_shader("NEXIUM_DUMP_VS", vs_addr) {
+                let vs_sph = fetch_sph(vs_addr, mappings, mem_read);
+                let path = shader_dump_path(&format!("target_vs_{:x}.txt", vs_addr));
+                let _ = std::fs::write(
+                    &path,
+                    format_shader_dump(&vs_sass, vs_sph.as_ref(), None, 0),
+                );
+                log::warn!(
+                    "[dump-vs] wrote {} vp_scale_z={} vp_translate_z={} applied={}/{} vp_en={}",
+                    path.display(),
+                    draw.viewport.scale_z,
+                    draw.viewport.translate_z,
+                    vptx_scale_z,
+                    vptx_translate_z,
+                    draw.viewport_transform_en
+                );
+            }
+
             let fs_debug_targets_key = parse_env_u64_list("NEXIUM_FS_DEBUG_TARGET");
             let fs_debug_active_key =
                 fs_debug_targets_key.is_empty() || fs_debug_targets_key.contains(&fs_addr);
@@ -1720,43 +1746,6 @@ fn execute_one(
                     }
                 };
 
-                {
-                    let want_addrs = parse_env_u64_list("NEXIUM_DUMP_FS");
-                    if want_addrs.contains(&fs_addr) {
-                        let fs_dis = nexium_shader::disassemble(&fs_sass)
-                            .into_iter()
-                            .map(|line| line.to_string_compact())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let _ = std::fs::write(
-                            format!("C:/Users/Mythrax/Desktop/target_fs_{:x}.txt", fs_addr),
-                            &fs_dis,
-                        );
-                    }
-                }
-                {
-                    let want_addrs = parse_env_u64_list("NEXIUM_DUMP_VS");
-                    if want_addrs.contains(&vs_addr) {
-                        let vs_dis = nexium_shader::disassemble(&vs_sass)
-                            .into_iter()
-                            .map(|line| line.to_string_compact())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let _ = std::fs::write(
-                            format!("C:/Users/Mythrax/Desktop/target_vs_{:x}.txt", vs_addr),
-                            &vs_dis,
-                        );
-                        log::warn!(
-                        "[dump-vs] vs={:#x} vp_scale_z={} vp_translate_z={} applied={}/{} vp_en={}",
-                        vs_addr,
-                        draw.viewport.scale_z,
-                        draw.viewport.translate_z,
-                        vptx_scale_z,
-                        vptx_translate_z,
-                        draw.viewport_transform_en
-                    );
-                    }
-                }
                 let required_outputs = nexium_spirv::scan_input_locations(&fs_spirv);
                 let (vs_spirv, vs_cbuf_mask, vs_cbuf_used) =
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2160,7 +2149,21 @@ fn execute_one(
                 if let Some(mcpu) = mappings.cpu_address_for(mid) {
                     let mut probe = [0u8; 64];
                     if mem_read(mcpu, &mut probe) && probe.iter().all(|b| *b == 0) {
-                        sampled_rt_fuzzy = true;
+                        let size = (tic.width as u64) * (tic.height as u64) * 4;
+                        let gen = nexium_gpu::tex_invalidate::region_gen_range(tic.gpu_va, size);
+                        let guest_written = {
+                            use std::collections::HashMap;
+                            use std::sync::{Mutex, OnceLock};
+                            static LAST: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+                            let mut m = LAST
+                                .get_or_init(|| Mutex::new(HashMap::new()))
+                                .lock()
+                                .unwrap();
+                            m.insert(tic.gpu_va, gen) != Some(gen)
+                        };
+                        if !guest_written {
+                            sampled_rt_fuzzy = true;
+                        }
                     }
                 }
             }
@@ -3999,6 +4002,64 @@ fn parse_env_u64_list(name: &str) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+fn shader_dump_path(filename: &str) -> std::path::PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".config/NeXium/dump"))
+        .filter(|p| std::fs::create_dir_all(p).is_ok())
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(filename)
+}
+
+fn env_is_all(name: &str) -> bool {
+    std::env::var(name).map_or(false, |v| v.trim().eq_ignore_ascii_case("all"))
+}
+
+fn env_dump_shader(name: &str, addr: u64) -> bool {
+    env_is_all(name)
+        || env_is_all("NEXIUM_DUMP_SHADERS")
+        || parse_env_u64_list(name).contains(&addr)
+}
+
+fn format_shader_dump(
+    sass: &[u8],
+    sph: Option<&[u8; SPH_SIZE]>,
+    input_map: Option<[u8; 32]>,
+    output_map: u32,
+) -> String {
+    let dis = nexium_shader::disassemble(sass)
+        .into_iter()
+        .map(|line| line.to_string_compact())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let raw_hex = sass
+        .chunks(8)
+        .enumerate()
+        .map(|(i, w)| {
+            let mut q = [0u8; 8];
+            q[..w.len()].copy_from_slice(w);
+            format!("{:03x}: {:016x}", i * 8, u64::from_le_bytes(q))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = format!("{}\n\nraw:\n{}\n", dis, raw_hex);
+    if let Some(sph) = sph {
+        out.push_str("\nsph:\n");
+        for (i, chunk) in sph.chunks(16).enumerate() {
+            let hex = chunk
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push_str(&format!("{:02x}: {}\n", i * 16, hex));
+        }
+    }
+    if let Some(imap) = input_map {
+        out.push_str(&format!("\nps_input_map (generic 0..31): {:02x?}\n", imap));
+        out.push_str(&format!("ps_output_map: {:#010x}\n", output_map));
+    }
+    out
+}
+
 fn trace_water_forensics(
     draw: &DrawCall,
     fallback_key: RtKey,
@@ -5047,18 +5108,26 @@ fn remap_texture_ids_for_stage(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) {
-    let tex_cb_index = choose_texture_cb_index(
-        cbuf_binds,
-        bindless_slot,
-        tex_cb_slot,
-        tex_ids,
-        tic_pool_gpu_va,
-        tic_pool_limit,
-        via_header_index,
-        stage_name == "fs",
-        mappings,
-        mem_read,
-    );
+    let designated = (tex_cb_slot as usize).min(15);
+    let trusted = tex_cb_slot != 0
+        && cbuf_binds[designated].0 != 0
+        && cbuf_binds[designated].1 > 0;
+    let tex_cb_index = if trusted {
+        designated
+    } else {
+        choose_texture_cb_index(
+            cbuf_binds,
+            bindless_slot,
+            tex_cb_slot,
+            tex_ids,
+            tic_pool_gpu_va,
+            tic_pool_limit,
+            via_header_index,
+            stage_name == "fs",
+            mappings,
+            mem_read,
+        )
+    };
     let (tcb_addr, tcb_size) = cbuf_binds[tex_cb_index.min(15)];
     for (local_i, unit_slot) in tex_ids.iter_mut().enumerate() {
         let i = slot_offset + local_i;
@@ -5087,9 +5156,21 @@ fn remap_texture_ids_for_stage(
         if mem_read(cpu, &mut bytes) {
             let handle = u32::from_le_bytes(bytes);
             let (tic, tsc) = split_texture_handle(handle, via_header_index);
-            if handle != 0
-                && texture_tic_readable(tic, tic_pool_gpu_va, tic_pool_limit, mappings, mem_read)
-            {
+            let accept = if trusted {
+                tic <= tic_pool_limit
+            } else if handle != 0 {
+                texture_tic_readable(tic, tic_pool_gpu_va, tic_pool_limit, mappings, mem_read)
+            } else {
+                texture_tic_readable(0, tic_pool_gpu_va, tic_pool_limit, mappings, mem_read)
+                    && !texture_tic_readable(
+                        shader_id,
+                        tic_pool_gpu_va,
+                        tic_pool_limit,
+                        mappings,
+                        mem_read,
+                    )
+            };
+            if accept {
                 if std::env::var_os("NEXIUM_TEX_BIND_LOG").is_some() {
                     log::warn!(
                         "tex_handle: stage={} cb{} off={:#x} handle={:#x} -> TIC {} TSC {}",
@@ -5156,6 +5237,10 @@ fn trace_vs_tex_remap(
 }
 
 fn fs_remap_trace(fs_addr: u64) -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ALL.get_or_init(|| env_is_all("NEXIUM_BIND_TRACE_FS")) {
+        return true;
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| parse_env_u64_list("NEXIUM_BIND_TRACE_FS"))
         .contains(&fs_addr)
@@ -5285,6 +5370,17 @@ fn texture_cb_score(
             continue;
         };
         if handle == 0 {
+            if texture_tic_readable(0, tic_pool_gpu_va, tic_pool_limit, mappings, mem_read)
+                && !texture_tic_readable(
+                    *shader_id,
+                    tic_pool_gpu_va,
+                    tic_pool_limit,
+                    mappings,
+                    mem_read,
+                )
+            {
+                score = score.saturating_add(1);
+            }
             continue;
         }
         let (tic, _) = split_texture_handle(handle, via_header_index);
