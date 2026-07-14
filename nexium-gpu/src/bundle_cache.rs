@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const BUNDLE_MAGIC: [u8; 8] = *b"NXBUNDL1";
-const BUNDLE_VERSION: u32 = 1;
+const BUNDLE_VERSION: u32 = 2;
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -39,20 +39,15 @@ fn build_id() -> u64 {
     static ID: OnceLock<u64> = OnceLock::new();
     *ID.get_or_init(|| {
         let mut h: u64 = 0xcbf29ce484222325;
-        let mut eat = |v: u64| {
-            for b in v.to_le_bytes() {
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
                 h ^= b as u64;
                 h = h.wrapping_mul(0x100000001b3);
             }
         };
-        if let Ok(meta) = std::env::current_exe().and_then(std::fs::metadata) {
-            eat(meta.len());
-            if let Ok(modified) = meta.modified() {
-                if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
-                    eat(d.as_nanos() as u64);
-                }
-            }
-        }
+        eat(env!("CARGO_PKG_NAME").as_bytes());
+        eat(env!("CARGO_PKG_VERSION").as_bytes());
+        eat(&BUNDLE_VERSION.to_le_bytes());
         h
     })
 }

@@ -1983,7 +1983,7 @@ impl Renderer {
         });
 
         if async_shaders_enabled() {
-            match pipeline_cache.try_async_skip(req, 4) {
+            match pipeline_cache.try_async_skip(req) {
                 None => return Ok(None),
                 Some(req) => {
                     let pipeline = {
@@ -6091,8 +6091,8 @@ fn verify_volume_image(
 }
 
 fn async_shaders_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("NEXIUM_ASYNC_SHADERS").is_some())
+    nexium_common::async_compile::enabled()
+        || std::env::var_os("NEXIUM_ASYNC_SHADERS").is_some()
 }
 
 fn tex_gen_gating_enabled() -> bool {

@@ -1,5 +1,5 @@
 use ash::vk;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 fn cache_path(device_tag: &str) -> Option<PathBuf> {
@@ -508,6 +508,7 @@ pub struct PipelineCache {
     last_saved_len: usize,
     save_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     worker: Option<CompileWorker>,
+    failed: HashSet<PipelineKey>,
     cache_lock: std::sync::Arc<std::sync::RwLock<()>>,
     specs: HashMap<PipelineKey, PipelineSpec>,
     specs_dirty: bool,
@@ -710,6 +711,7 @@ impl PipelineCache {
             last_saved_len: initial.len(),
             save_tx: Some(save_tx),
             worker,
+            failed: HashSet::new(),
             cache_lock,
             specs,
             specs_dirty: false,
@@ -772,6 +774,7 @@ impl PipelineCache {
         }
         for (key, pipe) in done {
             if pipe == vk::Pipeline::null() {
+                self.failed.insert(key);
                 continue;
             }
             if self.pipelines.contains_key(&key) {
@@ -785,34 +788,24 @@ impl PipelineCache {
         }
     }
 
-    pub fn try_async_skip(
-        &mut self,
-        req: PipelineBuildRequest,
-        max_skip: u32,
-    ) -> Option<PipelineBuildRequest> {
+    pub fn try_async_skip(&mut self, req: PipelineBuildRequest) -> Option<PipelineBuildRequest> {
         let Some(w) = self.worker.as_mut() else {
             return Some(req);
         };
-        match w.in_flight.get_mut(&req.key) {
-            Some(count) => {
-                if *count >= max_skip {
-                    Some(req)
-                } else {
-                    *count += 1;
-                    None
-                }
+        if self.failed.contains(&req.key) {
+            return Some(req);
+        }
+        if w.in_flight.contains_key(&req.key) {
+            return None;
+        }
+        let key = req.key;
+        match w.req_tx.send(req) {
+            Ok(()) => {
+                w.in_flight.insert(key, 0);
+                nexium_common::shader_progress::begin();
+                None
             }
-            None => {
-                let key = req.key;
-                match w.req_tx.send(req) {
-                    Ok(()) => {
-                        w.in_flight.insert(key, 1);
-                        nexium_common::shader_progress::begin();
-                        None
-                    }
-                    Err(e) => Some(e.0),
-                }
-            }
+            Err(e) => Some(e.0),
         }
     }
 
@@ -883,6 +876,8 @@ impl PipelineCache {
                 nexium_common::shader_progress::end();
                 if pipe != vk::Pipeline::null() {
                     self.pipelines.insert(key, pipe);
+                } else {
+                    self.failed.insert(key);
                 }
             }
         }
