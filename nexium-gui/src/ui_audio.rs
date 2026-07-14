@@ -29,6 +29,30 @@ static MUSIC_TARGET: AtomicU32 = AtomicU32::new(0);
 static MUSIC_LOWPASS: AtomicU32 = AtomicU32::new(0);
 static MUSIC_MODE: AtomicU8 = AtomicU8::new(MusicMode::Carousel as u8);
 static SFX_VOLUME: AtomicU32 = AtomicU32::new(1056964608); // 0.5f32.to_bits()
+static CAROUSEL_SELECTION: AtomicU8 = AtomicU8::new(CAROUSEL_ALL);
+
+pub const CAROUSEL_ALL: u8 = 255;
+pub const CAROUSEL_TRACK_COUNT: usize = 4;
+
+const CAROUSEL_TRACK_NAMES: [&str; CAROUSEL_TRACK_COUNT] =
+    ["Drift", "Signal", "Voyage", "Afterglow"];
+
+pub fn carousel_track_label(sel: u8) -> &'static str {
+    if (sel as usize) < CAROUSEL_TRACK_COUNT {
+        CAROUSEL_TRACK_NAMES[sel as usize]
+    } else {
+        "All"
+    }
+}
+
+pub fn set_carousel_track(sel: u8) {
+    let v = if (sel as usize) < CAROUSEL_TRACK_COUNT {
+        sel
+    } else {
+        CAROUSEL_ALL
+    };
+    CAROUSEL_SELECTION.store(v, Ordering::Relaxed);
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -171,6 +195,7 @@ fn next_music_sample(
     track: &MusicTrack,
     position: &mut f64,
     output_sample_rate: f64,
+    wrapped: &mut bool,
 ) -> [f32; 2] {
     let len = track.samples.len();
     if len == 0 {
@@ -188,6 +213,7 @@ fn next_music_sample(
     *position += track.sample_rate / output_sample_rate;
     if *position >= len as f64 {
         *position %= len as f64;
+        *wrapped = true;
     }
     sample
 }
@@ -325,14 +351,21 @@ fn build() -> Option<Engine> {
     banks.insert(key(Sfx::WhistleOk), std::sync::Arc::new(render(Sfx::WhistleOk)));
     banks.insert(key(Sfx::WhistleSquish), std::sync::Arc::new(render(Sfx::WhistleSquish)));
 
-    let (carousel_variant, shop_variant) = random_music_variants();
-    let (carousel_music, carousel_variant) =
-        decode_music_variant(&CAROUSEL_MUSIC, carousel_variant, "carousel");
+    let (carousel_start, shop_variant) = random_music_variants();
+    let carousel_tracks: Vec<MusicTrack> = CAROUSEL_MUSIC
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| decode_mp3_stereo(bytes).unwrap_or_else(|| {
+            log::warn!("Failed to decode carousel music variant {}", i + 1);
+            MusicTrack::silent()
+        }))
+        .collect();
     let (shop_music, shop_variant) = decode_music_variant(&SHOP_MUSIC, shop_variant, "shop");
-    let music = [carousel_music, shop_music];
+    let mut carousel_idx = carousel_start % carousel_tracks.len().max(1);
     log::info!(
-        "UI music selected: carousel variant {}, shop variant {}",
-        carousel_variant + 1,
+        "UI music: {} carousel tracks decoded, shuffle start {}, shop variant {}",
+        carousel_tracks.len(),
+        carousel_idx + 1,
         shop_variant + 1
     );
 
@@ -401,13 +434,32 @@ fn build() -> Option<Engine> {
                         shop_mix = (shop_mix - mode_step).max(shop_target);
                     }
                     let m = if target > 0.0001 || cur_gain > 0.0001 {
-                        let carousel = if shop_mix < 1.0 {
-                            next_music_sample(&music[0], &mut music_pos[0], dev_sr as f64)
+                        let carousel = if shop_mix < 1.0 && !carousel_tracks.is_empty() {
+                            let sel = CAROUSEL_SELECTION.load(Ordering::Relaxed);
+                            if (sel as usize) < carousel_tracks.len()
+                                && carousel_idx != sel as usize
+                            {
+                                carousel_idx = sel as usize;
+                                music_pos[0] = 0.0;
+                            }
+                            let mut wrapped = false;
+                            let s = next_music_sample(
+                                &carousel_tracks[carousel_idx],
+                                &mut music_pos[0],
+                                dev_sr as f64,
+                                &mut wrapped,
+                            );
+                            if wrapped && (sel as usize) >= carousel_tracks.len() {
+                                carousel_idx = (carousel_idx + 1) % carousel_tracks.len();
+                                music_pos[0] = 0.0;
+                            }
+                            s
                         } else {
                             [0.0; 2]
                         };
                         let shop = if shop_mix > 0.0 {
-                            next_music_sample(&music[1], &mut music_pos[1], dev_sr as f64)
+                            let mut wrapped = false;
+                            next_music_sample(&shop_music, &mut music_pos[1], dev_sr as f64, &mut wrapped)
                         } else {
                             [0.0; 2]
                         };
