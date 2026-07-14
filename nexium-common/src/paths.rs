@@ -21,11 +21,8 @@ pub fn init() {
         root(),
         sdmc_dir(),
         nand_dir(),
-        save_dir(),
         load_dir(),
-        dump_dir(),
         nro_dir(),
-        shader_dir(),
         log_dir(),
     );
 }
@@ -38,24 +35,12 @@ pub fn nand_dir() -> PathBuf {
     ensure(data_root().join("nand"))
 }
 
-pub fn save_dir() -> PathBuf {
-    ensure(data_root().join("save"))
-}
-
 pub fn load_dir() -> PathBuf {
     ensure(data_root().join("load"))
 }
 
-pub fn dump_dir() -> PathBuf {
-    ensure(data_root().join("dump"))
-}
-
 pub fn nro_dir() -> PathBuf {
     ensure(data_root().join("NRO"))
-}
-
-pub fn shader_dir() -> PathBuf {
-    ensure(data_root().join("shader"))
 }
 
 pub fn log_dir() -> PathBuf {
