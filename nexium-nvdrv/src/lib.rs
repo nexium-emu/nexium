@@ -219,6 +219,7 @@ pub struct Nvdrv {
     pub frame_queue: Arc<Mutex<Vec<QueuedFrame>>>,
     pub next_event_id: u32,
     pub next_syncpoint_id: u32,
+    pub retired_syncpts: HashMap<u32, (u32, u32)>,
     pub next_ctrl_event_slot: u32,
     pub ctrl_event_waits: HashMap<u32, CtrlEventWait>,
     pub gpu: Arc<GpuContext>,
@@ -242,6 +243,7 @@ impl Nvdrv {
             frame_queue: Arc::new(Mutex::new(Vec::new())),
             next_event_id: 1,
             next_syncpoint_id: 1,
+            retired_syncpts: HashMap::new(),
             next_ctrl_event_slot: 0,
             ctrl_event_waits: HashMap::new(),
             gpu: Arc::new(GpuContext::with_stats(stats.clone())),
@@ -303,7 +305,14 @@ impl Nvdrv {
 
     pub fn close(&mut self, fd: u32) {
         self.files.remove(&fd);
-        self.gpu.channels.lock().remove(&fd);
+        if let Some(channel) = self.gpu.channels.lock().remove(&fd) {
+            if channel.syncpt_id != 0 {
+                self.retired_syncpts.insert(
+                    channel.syncpt_id,
+                    (channel.syncpt_min, channel.syncpt_max),
+                );
+            }
+        }
         log::debug!("nvdrv:Close fd={}", fd);
     }
 
@@ -352,6 +361,7 @@ impl Nvdrv {
             .values()
             .find(|channel| channel.syncpt_id == id)
             .map(|channel| channel.syncpt_min)
+            .or_else(|| self.retired_syncpts.get(&id).map(|(min, _)| *min))
             .unwrap_or(0)
     }
 
@@ -362,6 +372,7 @@ impl Nvdrv {
             .values()
             .find(|channel| channel.syncpt_id == id)
             .map(|channel| channel.syncpt_max)
+            .or_else(|| self.retired_syncpts.get(&id).map(|(_, max)| *max))
             .unwrap_or(0)
     }
 
@@ -371,7 +382,11 @@ impl Nvdrv {
             .values_mut()
             .find(|channel| channel.syncpt_id == id)
         else {
-            return 0;
+            drop(channels);
+            let e = self.retired_syncpts.entry(id).or_insert((0, 0));
+            e.1 = e.1.wrapping_add(amount);
+            e.0 = e.1;
+            return e.0;
         };
         channel.syncpt_max = channel.syncpt_max.wrapping_add(amount);
         channel.syncpt_min = channel.syncpt_max;

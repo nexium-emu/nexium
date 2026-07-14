@@ -11,6 +11,7 @@ pub struct BootConfig {
     pub heap_size: u64,
     pub stack_size: u64,
     pub loader_path: Option<String>,
+    pub argv_override: Option<String>,
     pub cpu_backend: nexium_cpu::CpuBackendKind,
 }
 
@@ -22,6 +23,7 @@ impl BootConfig {
             heap_size: 1536 * 1024 * 1024,
             stack_size: 16 * 1024 * 1024,
             loader_path: None,
+            argv_override: None,
             cpu_backend: nexium_cpu::CpuBackendKind::default(),
         }
     }
@@ -180,6 +182,7 @@ impl BootContext {
         let app_name = nexium_common::paths::app_name_from_nro(&config.nro_path);
         let _ = nexium_common::paths::sdmc_app_dir(&app_name);
         let argv_path = format!("sdmc:/switch/{}/{}", app_name, nro_filename);
+        let argv_string = config.argv_override.clone().unwrap_or_else(|| argv_path.clone());
         let next_load_path = config
             .loader_path
             .clone()
@@ -187,7 +190,7 @@ impl BootContext {
         let env_builder = nexium_loader::EnvBlockBuilder::new()
             .with_handles(kernel.main_thread_handle, kernel.process_handle)
             .with_heap(heap_base, config.heap_size)
-            .with_argv(&argv_path)
+            .with_argv(&argv_string)
             .with_next_load_path(&next_load_path);
         env_builder.build_into(&address_space, env_base)?;
 
@@ -449,6 +452,22 @@ impl BootContext {
             return None;
         }
         Some(host_path.to_string_lossy().into_owned())
+    }
+
+    pub fn chained_load_argv(&self) -> Option<String> {
+        const ENV_BASE: u64 = 0xB0_0000_0000;
+        const NEXTLOAD_ARGV_VA: u64 = ENV_BASE + 0xC00;
+        let mut buf = vec![0u8; 0x400];
+        self.address_space.read(NEXTLOAD_ARGV_VA, &mut buf).ok()?;
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if end == 0 {
+            return None;
+        }
+        let raw = std::str::from_utf8(&buf[..end]).ok()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        Some(raw.to_string())
     }
 
     pub fn run(&mut self) -> Result<u32, String> {
