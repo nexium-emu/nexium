@@ -1483,6 +1483,11 @@ fn execute_one(
             );
         }
     }
+    let alpha_test_key: u32 = if draw.alpha_test_enabled {
+        (draw.alpha_test_func & 0xFFFF) | 0x8000_0000
+    } else {
+        0
+    };
     let shader_key = (
         vs_addr,
         fs_addr,
@@ -1493,7 +1498,7 @@ fn execute_one(
         uint_attr_mask,
         sint_attr_mask,
         color_output_count,
-        fs_output_map,
+        fs_output_map ^ (alpha_test_key as u32).rotate_left(16) ^ draw.alpha_test_ref.rotate_left(8),
     );
     if shader_failed_set().lock().unwrap().contains(&shader_key) {
         return Err("shader previously failed to emit".to_string());
@@ -1564,6 +1569,8 @@ fn execute_one(
                     fs_output_map,
                     fs_debug_active_key as u32,
                     vs_tex_env_key as u32,
+                    alpha_test_key,
+                    draw.alpha_test_ref,
                 ],
             );
             let l2_store = nexium_gpu::bundle_cache::bundle_store();
@@ -1653,13 +1660,25 @@ fn execute_one(
                         let fs_debug_targets = parse_env_u64_list("NEXIUM_FS_DEBUG_TARGET");
                         let fs_debug_active =
                             fs_debug_targets.is_empty() || fs_debug_targets.contains(&fs_addr);
-                        nexium_spirv::emit_fragment_full_with_input_map_meta_outputs_debug(
-                            &fs_cfg,
-                            fs_input_map,
-                            color_output_count,
-                            fs_output_map,
-                            fs_debug_active,
-                        )
+                        if draw.alpha_test_enabled {
+                            nexium_spirv::emit_fragment_full_with_alpha_test(
+                                &fs_cfg,
+                                fs_input_map,
+                                color_output_count,
+                                fs_output_map,
+                                fs_debug_active,
+                                draw.alpha_test_func,
+                                draw.alpha_test_ref,
+                            )
+                        } else {
+                            nexium_spirv::emit_fragment_full_with_input_map_meta_outputs_debug(
+                                &fs_cfg,
+                                fs_input_map,
+                                color_output_count,
+                                fs_output_map,
+                                fs_debug_active,
+                            )
+                        }
                     })) {
                         Ok(v) => v,
                         Err(panic) => {
