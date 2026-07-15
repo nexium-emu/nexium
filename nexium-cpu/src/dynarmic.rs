@@ -263,6 +263,13 @@ impl DynarmicCpu {
         result
     }
 
+    pub unsafe fn unmap_host(&mut self, va: u64, len: u64) -> Result<(), String> {
+        self.emu
+            .emu
+            .mem_unmap(va, len as usize)
+            .map_err(|e| format!("unmap_host failed: {:?}", e))
+    }
+
     pub fn write_bytes(&self, va: u64, bytes: &[u8]) -> Result<(), String> {
         self.emu
             .emu

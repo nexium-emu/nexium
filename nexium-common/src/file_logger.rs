@@ -74,8 +74,8 @@ impl log::Log for FileLogger {
         {
             return false;
         }
-        if metadata.level() >= log::Level::Debug {
-            if t.starts_with("dynarmic_sys") || t.starts_with("dynarmic_sys_mythrax") {
+        if t.starts_with("dynarmic_sys") || t.starts_with("dynarmic_sys_mythrax") || t.contains("dynarmic") {
+            if metadata.level() > log::Level::Error {
                 return false;
             }
         }
