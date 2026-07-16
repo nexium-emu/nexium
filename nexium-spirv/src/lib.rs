@@ -2826,7 +2826,7 @@ impl Emitter {
         for block in &cfg.blocks {
             if let BranchKind::Conditional { target, .. } = block.branch {
                 let next = block.id + 1;
-                if self.block_labels.contains_key(&next) && target != next {
+                if self.block_labels.contains_key(&next) && target != next && target > block.id {
                     let m = ipd[block.id as usize];
                     by_merge.entry(m).or_default().push(block.id);
                 }

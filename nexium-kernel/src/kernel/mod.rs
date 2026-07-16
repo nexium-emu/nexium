@@ -1010,8 +1010,7 @@ impl Kernel {
         if let Some(h) = self.time_shmem_handle {
             return h;
         }
-        const TIME_SHMEM_SIZE: usize = 0x1000;
-        self.time_shmem = Some(vec![0u8; TIME_SHMEM_SIZE]);
+        self.time_shmem = Some(build_time_shmem());
         let h = self
             .handles
             .create_handle(handles::HandleType::SharedMemory);
@@ -1027,4 +1026,49 @@ impl Kernel {
     pub fn dispatch_svc(&mut self, imm: u16) -> u32 {
         svc::dispatch(self, imm)
     }
+}
+
+pub(crate) const TIME_SHMEM_SIZE: usize = 0x1000;
+
+fn build_time_shmem() -> Vec<u8> {
+    let mut buf = vec![0u8; TIME_SHMEM_SIZE];
+    let now_unix_s: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let source_id: [u8; 16] = *b"NeXiumSteady\0\0\0\0";
+
+    let put_i64 = |buf: &mut [u8], off: usize, v: i64| {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    };
+    let put_u32 = |buf: &mut [u8], off: usize, v: u32| {
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    };
+
+    put_u32(&mut buf, 0x00, 1);
+    put_i64(&mut buf, 0x20, now_unix_s);
+    buf[0x28..0x38].copy_from_slice(&source_id);
+
+    put_u32(&mut buf, 0x38, 1);
+    put_i64(&mut buf, 0x60, now_unix_s);
+    put_i64(&mut buf, 0x68, 0);
+    buf[0x70..0x80].copy_from_slice(&source_id);
+
+    put_u32(&mut buf, 0x80, 1);
+    put_i64(&mut buf, 0xA8, now_unix_s);
+    put_i64(&mut buf, 0xB0, 0);
+    buf[0xB8..0xC8].copy_from_slice(&source_id);
+
+    put_u32(&mut buf, 0xC8, 1);
+    buf[0xCD] = 0;
+
+    put_u32(&mut buf, 0xD0, 1);
+    put_i64(&mut buf, 0x110, 0);
+    put_i64(&mut buf, 0x118, 1 << 14);
+    put_i64(&mut buf, 0x120, 14);
+    put_i64(&mut buf, 0x128, 0);
+    put_i64(&mut buf, 0x130, i64::MAX);
+    buf[0x138..0x148].copy_from_slice(&source_id);
+
+    buf
 }

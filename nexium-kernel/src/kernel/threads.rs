@@ -443,11 +443,20 @@ impl Threads {
 
     pub fn pick_next(&mut self) -> Option<u32> {
         let core = current_core() as i32;
-        let pos = self.ready.iter().position(|h| {
-            self.threads
-                .get(h)
-                .map_or(false, |t| t.core == core || t.core < 0)
-        })?;
+        let pos = self
+            .ready
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| {
+                self.threads
+                    .get(*h)
+                    .map_or(false, |t| t.core == core || t.core < 0)
+            })
+            .min_by_key(|(idx, h)| {
+                let prio = self.threads.get(*h).map(|t| t.priority).unwrap_or(i32::MAX);
+                (prio, *idx)
+            })
+            .map(|(idx, _)| idx)?;
         let handle = self.ready.remove(pos)?;
         if let Some(t) = self.threads.get_mut(&handle) {
             if t.core < 0 {

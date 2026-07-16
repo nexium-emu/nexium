@@ -4218,7 +4218,108 @@ fn dispatch_service_v2(
     if matches!(port_name, "time:u" | "time:s" | "time:a" | "time:r") && cmd_id == 20 {
         let h = kernel.ensure_time_shmem_handle();
         log::info!("time:u GetSharedMemoryNativeHandle → handle={:#x}", h);
-        return build_ipc_response(ctx, 0, &[], &[h]);
+        return build_ipc_response_copy(ctx, 0, &[], &[h]);
+    }
+
+    if port_name == "hwopus" && matches!(cmd_id, 1 | 3 | 5 | 7 | 8 | 9) {
+        let in_off = ctx.cmif_in_data_off;
+        let channels = if ctx.cmif_in_data_len as usize >= 8 {
+            u32::from_le_bytes([
+                ctx.buf[in_off + 4],
+                ctx.buf[in_off + 5],
+                ctx.buf[in_off + 6],
+                ctx.buf[in_off + 7],
+            ])
+        } else {
+            2
+        };
+        let size = crate::services::hwopus::HwOpusService::work_buffer_size(channels);
+        log::info!("hwopus GetWorkBufferSize channels={} → {:#x}", channels, size);
+        return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
+    }
+
+    if port_name == "hwopus" && (cmd_id == 0 || cmd_id == 2 || cmd_id == 4 || cmd_id == 6) {
+        let in_off = ctx.cmif_in_data_off;
+        let sample_rate = u32::from_le_bytes([
+            ctx.buf[in_off],
+            ctx.buf[in_off + 1],
+            ctx.buf[in_off + 2],
+            ctx.buf[in_off + 3],
+        ]);
+        let channels = u32::from_le_bytes([
+            ctx.buf[in_off + 4],
+            ctx.buf[in_off + 5],
+            ctx.buf[in_off + 6],
+            ctx.buf[in_off + 7],
+        ]);
+        kernel.services.hwopus.open(session_handle, sample_rate, channels);
+        log::info!(
+            "hwopus OpenHardwareOpusDecoder rate={} ch={} → IHardwareOpusDecoder",
+            sample_rate,
+            channels
+        );
+        let is_domain = kernel
+            .sessions
+            .get(&session_handle)
+            .map(|s| s.is_domain)
+            .unwrap_or(false);
+        if is_domain {
+            let object_id = alloc_domain_object(kernel, session_handle, "IHardwareOpusDecoder");
+            return build_ipc_response_full(ctx, 0, &[], &[], &[], &[object_id]);
+        } else {
+            let h = kernel.handles.create_handle(HandleType::Session);
+            kernel
+                .sessions
+                .insert(h, Session::new(h, "IHardwareOpusDecoder".to_string()));
+            return build_ipc_response(ctx, 0, &[], &[h]);
+        }
+    }
+
+    if port_name == "IHardwareOpusDecoder" {
+        if cmd_id == 1 || cmd_id == 3 {
+            return build_ipc_response(ctx, 0, &[], &[]);
+        }
+        if matches!(cmd_id, 0 | 2 | 4 | 5 | 6 | 7 | 8 | 9) {
+            let in_off = ctx.cmif_in_data_off;
+            let reset = if cmd_id == 6 || cmd_id == 7 {
+                true
+            } else {
+                ctx.cmif_in_data_len as usize >= 1 && ctx.buf[in_off] != 0
+            };
+            let sb = ctx
+                .send_buffers
+                .iter()
+                .find(|b| b.size > 0 && b.addr != 0)
+                .copied();
+            let input: Vec<u8> = if let Some(b) = sb {
+                let mut d = vec![0u8; b.size as usize];
+                if kernel.address_space.read(b.addr, &mut d).is_ok() {
+                    d
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            let (data_size, sample_count, pcm) =
+                kernel.services.hwopus.decode(session_handle, &input, reset);
+            if let Some(rb) = ctx
+                .recv_buffers
+                .iter()
+                .find(|b| b.size > 0 && b.addr != 0)
+                .copied()
+            {
+                let n = (rb.size as usize).min(pcm.len());
+                let _ = kernel.address_space.write(rb.addr, &pcm[..n]);
+            }
+            let mut out = Vec::new();
+            out.extend_from_slice(&data_size.to_le_bytes());
+            out.extend_from_slice(&sample_count.to_le_bytes());
+            if matches!(cmd_id, 4 | 5 | 6 | 7 | 8 | 9) {
+                out.extend_from_slice(&0u64.to_le_bytes());
+            }
+            return build_ipc_response(ctx, 0, &out, &[]);
+        }
     }
 
     if port_name == "IAppletResource" && cmd_id == 0 {
@@ -4524,11 +4625,20 @@ fn igbp_handle_transact(
             let _has = reader.read_u32();
             let _timestamp = reader.read_u64();
             let _is_auto = reader.read_i32();
-            let _crop_l = reader.read_i32();
-            let _crop_t = reader.read_i32();
-            let _crop_r = reader.read_i32();
-            let _crop_b = reader.read_i32();
-            let _scaling = reader.read_i32();
+            let _data_space = reader.read_i32();
+            let crop_l = reader.read_i32().unwrap_or(0);
+            let crop_t = reader.read_i32().unwrap_or(0);
+            let crop_r = reader.read_i32().unwrap_or(0);
+            let crop_b = reader.read_i32().unwrap_or(0);
+            let scaling = reader.read_i32().unwrap_or(0);
+            log::info!(
+                "IGBP::QueueBuffer crop=({},{},{},{}) scaling={}",
+                crop_l,
+                crop_t,
+                crop_r,
+                crop_b,
+                scaling
+            );
             let transform = reader.read_i32().unwrap_or(0) as u32;
             let _sticky = reader.read_u32();
             let _async = reader.read_i32();
@@ -4650,6 +4760,22 @@ fn igbp_handle_transact(
                     } else {
                         0
                     };
+                    let queue_crop: Option<(u32, u32, u32, u32)> = {
+                        let cw = crop_r.saturating_sub(crop_l).max(0) as u32;
+                        let ch = crop_b.saturating_sub(crop_t).max(0) as u32;
+                        if crop_l >= 0
+                            && crop_t >= 0
+                            && cw > 0
+                            && ch > 0
+                            && crop_r as u32 <= gb.width
+                            && crop_b as u32 <= gb.height
+                            && (cw < gb.width || ch < gb.height)
+                        {
+                            Some((crop_l as u32, crop_t as u32, cw, ch))
+                        } else {
+                            None
+                        }
+                    };
                     let submitted = rt_worker.try_submit(Box::new(move || {
                         let t0 = std::time::Instant::now();
                         let crop = cached_present_crop(pw, ph);
@@ -4686,6 +4812,19 @@ fn igbp_handle_transact(
                                 };
                                 apply_present_transform(&mut b, w, h, transform);
                                 (w, h, b)
+                            };
+                            let (present_w, present_h, bytes) = match queue_crop {
+                                Some((cx, cy, cw, ch))
+                                    if cx + cw <= present_w
+                                        && cy + ch <= present_h
+                                        && (cw < present_w || ch < present_h) =>
+                                {
+                                    let cropped = crop_and_upscale(
+                                        &bytes, present_w, cx, cy, cw, ch, cw, ch,
+                                    );
+                                    (cw, ch, cropped)
+                                }
+                                _ => (present_w, present_h, bytes),
                             };
                             dump_present_frame(&bytes, present_w, present_h);
                             if std::env::var_os("NEXIUM_FRAME_PRESENT_CACHE").is_some() {
@@ -4857,8 +4996,19 @@ fn igbp_handle_transact(
                                         a[top..top + row].swap_with_slice(&mut b[..row]);
                                     }
                                 }
+                                let readback_len = bytes.len();
                                 let (present_w, present_h, mut bytes) =
                                     maybe_crop_present_subwindow(bytes, gb.width, gb.height);
+                                log::info!(
+                                    "QueueBuffer vk_readback: gb={}x{} stride={} readback_bytes={} → present {}x{} (cropped={})",
+                                    gb.width,
+                                    gb.height,
+                                    gb.stride,
+                                    readback_len,
+                                    present_w,
+                                    present_h,
+                                    present_w != gb.width || present_h != gb.height
+                                );
                                 make_present_opaque(&mut bytes);
                                 dump_present_frame(&bytes, present_w, present_h);
                                 (present_w, present_h, bytes)
@@ -5052,6 +5202,29 @@ fn igbp_handle_transact(
                                 }
                             }
                         }
+                        let (frame_w, frame_h, frame_pixels) = {
+                            let cw = crop_r.saturating_sub(crop_l).max(0) as u32;
+                            let ch = crop_b.saturating_sub(crop_t).max(0) as u32;
+                            let valid = crop_l >= 0
+                                && crop_t >= 0
+                                && cw > 0
+                                && ch > 0
+                                && crop_r as u32 <= frame_w
+                                && crop_b as u32 <= frame_h;
+                            if valid && (cw < frame_w || ch < frame_h) {
+                                log::info!(
+                                    "QueueBuffer honoring crop rect ({},{},{},{}) → present {}x{} (was {}x{})",
+                                    crop_l, crop_t, crop_r, crop_b, cw, ch, frame_w, frame_h
+                                );
+                                let cropped = crop_and_upscale(
+                                    &frame_pixels, frame_w, crop_l as u32, crop_t as u32, cw, ch,
+                                    cw, ch,
+                                );
+                                (cw, ch, cropped)
+                            } else {
+                                (frame_w, frame_h, frame_pixels)
+                            }
+                        };
                         dump_present_frame(&frame_pixels, frame_w, frame_h);
                         kernel.nvdrv.submit_frame(nexium_nvdrv::QueuedFrame {
                             width: frame_w,
@@ -5585,6 +5758,12 @@ fn flip_present_v(bytes: &mut [u8], width: u32, height: u32) {
 }
 
 fn maybe_crop_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> (u32, u32, Vec<u8>) {
+    if std::env::var_os("NEXIUM_PRESENT_SUBWINDOW_CROP").is_none() {
+        if let Ok(mut slot) = present_crop_slot().lock() {
+            *slot = None;
+        }
+        return (width, height, bytes);
+    }
     if width < 1600 || height < 900 || bytes.len() < (width as usize) * (height as usize) * 4 {
         return (width, height, bytes);
     }
