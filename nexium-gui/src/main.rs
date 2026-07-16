@@ -30,7 +30,7 @@ fn main() -> Result<(), eframe::Error> {
     std::env::set_var("DISABLE_MANGOHUD", "1");
 
     if std::env::var_os("NEXIUM_DIAG").is_some() {
-        let defaults: [(&str, &str); 11] = [
+        let defaults: [(&str, &str); 12] = [
             ("NEXIUM_RT_STATS", "1"),
             ("NEXIUM_RT_STATS_PERIOD", "120"),
             ("NEXIUM_TEXDUMP", "1"),
@@ -42,6 +42,7 @@ fn main() -> Result<(), eframe::Error> {
             ("NEXIUM_RT_ALIAS_DBG", "1"),
             ("NEXIUM_RT_ALIAS_SYNC_DBG", "1"),
             ("NEXIUM_VTX_DBG", "all"),
+            ("NEXIUM_ZETA_DBG", "1"),
         ];
         for (k, v) in defaults {
             if std::env::var_os(k).is_none() {

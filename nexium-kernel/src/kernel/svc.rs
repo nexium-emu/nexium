@@ -2863,12 +2863,16 @@ fn dispatch_service_v2(
                         slice.len(),
                         romfs.len()
                     );
-                    let path = romfs_path_for_data_offset(romfs, start)
-                        .map(|(path, file_off, _)| {
-                            let rel = start.saturating_sub(file_off);
-                            format!("{}+{:#x}", path, rel)
-                        })
-                        .unwrap_or_else(|| "<romfs-meta>".to_string());
+                    let path = if fs_trace_enabled() {
+                        romfs_path_for_data_offset(romfs, start)
+                            .map(|(path, file_off, _)| {
+                                let rel = start.saturating_sub(file_off);
+                                format!("{}+{:#x}", path, rel)
+                            })
+                            .unwrap_or_else(|| "<romfs-meta>".to_string())
+                    } else {
+                        String::new()
+                    };
                     fs_trace_read(
                         "IFsStorage.Read",
                         &path,
@@ -7052,11 +7056,28 @@ fn svc_map_physical_memory(kernel: &mut Kernel) -> u32 {
                 };
                 if let Err(e) = plumb {
                     log::warn!(
-                        "svcMapPhysicalMemory: dynarmic map_host {:#x} len={:#x} failed: {}",
-                        gs,
-                        ge - gs,
+                        "svcMapPhysicalMemory: JIT map_host {:#x} len={:#x} failed (error: {}), attempting unmap-and-remap",
+                        region.base,
+                        region.size,
                         e
                     );
+                    let _ = unsafe { cpu.unmap_host(region.base, region.size) };
+                    let retry = unsafe {
+                        cpu.map_host(
+                            region.base,
+                            region.size,
+                            region.perm,
+                            region.host_ptr as *mut u8,
+                        )
+                    };
+                    if let Err(re) = retry {
+                        log::error!(
+                            "svcMapPhysicalMemory: JIT map_host retry {:#x} len={:#x} failed: {}",
+                            region.base,
+                            region.size,
+                            re
+                        );
+                    }
                 }
             }
         }
@@ -7081,11 +7102,12 @@ fn svc_unmap_physical_memory(_kernel: &mut Kernel) -> u32 {
         return 1;
     };
     log::info!(
-        "svcUnmapPhysicalMemory addr={:#x} size={:#x} (kept mapped)",
+        "svcUnmapPhysicalMemory addr={:#x} size={:#x}",
         addr,
         size
     );
     if let Some(cpu) = cpu_mut() {
+        let _ = unsafe { cpu.unmap_host(addr, size) };
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS

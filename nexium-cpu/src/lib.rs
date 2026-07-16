@@ -185,6 +185,10 @@ impl Cpu {
         dispatch!(self, cpu => unsafe { cpu.map_host(va, len, perm, ptr) })
     }
 
+    pub unsafe fn unmap_host(&mut self, va: u64, len: u64) -> Result<(), String> {
+        dispatch!(self, cpu => unsafe { cpu.unmap_host(va, len) })
+    }
+
     pub fn set_register(&mut self, reg: u32, val: u64) {
         dispatch!(self, cpu => cpu.set_register(reg, val))
     }

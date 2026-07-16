@@ -135,6 +135,16 @@ impl RustarmicCpu {
         Ok(())
     }
 
+    pub unsafe fn unmap_host(&mut self, va: u64, len: u64) -> Result<(), String> {
+        let end = va
+            .checked_add(len)
+            .ok_or_else(|| format!("unmap_host overflow va={:#x} len={:#x}", va, len))?;
+        self.state.regions.write().retain(|r| {
+            r.end <= va || r.va >= end
+        });
+        Ok(())
+    }
+
     pub fn write_bytes(&self, va: u64, bytes: &[u8]) -> Result<(), String> {
         let regions = self.state.regions.read();
         for r in regions.iter() {

@@ -3077,10 +3077,19 @@ impl Renderer {
             };
             if let Ok(want) = std::env::var("NEXIUM_VTX_DBG") {
                 let all_mode = want.trim().eq_ignore_ascii_case("all");
+                let is_3d = call.vertex_layout.attrs.iter().any(|a| {
+                    a.location == 0
+                        && vertex_debug_float_components(a.format).is_some_and(|c| c >= 3)
+                });
                 let under_cap = if all_mode {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static N: AtomicU64 = AtomicU64::new(0);
-                    N.fetch_add(1, Ordering::Relaxed) < 40
+                    static N3D: AtomicU64 = AtomicU64::new(0);
+                    if is_3d {
+                        N3D.fetch_add(1, Ordering::Relaxed) < 60
+                    } else {
+                        N.fetch_add(1, Ordering::Relaxed) < 20
+                    }
                 } else {
                     true
                 };
