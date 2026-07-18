@@ -10,6 +10,7 @@ A Nintendo Switch emulator written in Rust.
 
 [![CI](https://github.com/nexium-emu/nexium/actions/workflows/ci.yml/badge.svg)](https://github.com/nexium-emu/nexium/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-support%20NeXium-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/nexium_emu)
 
 </div>
 
@@ -66,6 +67,16 @@ Drop the `--no-default-features --features backend-rustarmic` flags to build bot
 | nexium-common | Shared utilities |
 
 The recompiler lives in its own repo: https://github.com/nexium-emu/rustarmic
+
+## Support
+
+NeXium is a passion project I build as a hobby, and watching it boot more titles and improve line by line is the fun part. With my day job cutting hours, the time and money I'd like to spend on development are getting harder to come by, so Ko-fi subscriptions are now open.
+
+If you like NeXium and want to get me a coffee (or beer) while I code, it goes straight into new features, further optimizations, and making more games available:
+
+**https://ko-fi.com/nexium_emu**
+
+Thanks to all the testers who put time into quality builds and bug reports, and to everyone who supports the project. Special thanks to Collecting, who is working hard on new titles with me.
 
 ## Thanks
 
