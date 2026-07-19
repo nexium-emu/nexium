@@ -893,27 +893,61 @@ impl Nvdrv {
                     } else {
                         mapping_size_in
                     };
-                    let gpu_va = if (flags & 0x1) != 0 && requested_offset != 0 {
-                        self.gpu
-                            .alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
-                        requested_offset
-                    } else {
-                        let big = self
-                            .nvmap_handles
-                            .get(&nvmap_id)
-                            .map(|h| h.align >= 0x10000)
-                            .unwrap_or(false);
-                        self.gpu.alloc_va(mapping_size.max(0x1000), big)
-                    };
-                    let cpu_addr = self
+                    let handle_cpu = self
                         .nvmap_handles
                         .get(&nvmap_id)
                         .map(|h| h.address.wrapping_add(buffer_offset))
                         .unwrap_or(0);
+                    let (gpu_va, cpu_addr, final_nvmap) =
+                        if (flags & 0x1) != 0 && requested_offset != 0 {
+                            self.gpu
+                                .alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
+                            (requested_offset, handle_cpu, nvmap_id)
+                        } else if (flags & 0x100) != 0 && requested_offset != 0 {
+                            let remap_va = requested_offset.wrapping_add(buffer_offset);
+                            self.gpu
+                                .alloc_va_fixed(remap_va, mapping_size.max(0x1000));
+                            let handle_valid =
+                                nvmap_id != 0 && self.nvmap_handles.contains_key(&nvmap_id);
+                            let (cpu, nv) = if handle_valid {
+                                (handle_cpu, nvmap_id)
+                            } else {
+                                let m = self.gpu.mappings.lock();
+                                match m.cpu_address_for(remap_va) {
+                                    Some(cpu) => {
+                                        (cpu, m.nvmap_id_for(remap_va).unwrap_or(nvmap_id))
+                                    }
+                                    None => (handle_cpu, nvmap_id),
+                                }
+                            };
+                            log::debug!(
+                                "nvhost-as-gpu:MapBufferEx REMAP offset={:#x} buffer_offset={:#x} → gpu_va={:#x} cpu={:#x} nvmap={} handle_valid={}",
+                                requested_offset,
+                                buffer_offset,
+                                remap_va,
+                                cpu,
+                                nv,
+                                handle_valid
+                            );
+                            (remap_va, cpu, nv)
+                        } else if requested_offset != 0 {
+                            self.gpu
+                                .alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
+                            (requested_offset, handle_cpu, nvmap_id)
+                        } else {
+                            let big = self
+                                .nvmap_handles
+                                .get(&nvmap_id)
+                                .map(|h| h.align >= 0x10000)
+                                .unwrap_or(false);
+                            (self.gpu.alloc_va(mapping_size.max(0x1000), big), handle_cpu, nvmap_id)
+                        };
+                    let nvmap_id = final_nvmap;
                     log::debug!(
-                        "nvhost-as-gpu:MapBufferEx flags={:#x} nvmap_id={} cpu_addr={:#x} size={:#x} → gpu_va={:#x}",
+                        "nvhost-as-gpu:MapBufferEx flags={:#x} nvmap_id={} req_off={:#x} cpu_addr={:#x} size={:#x} → gpu_va={:#x}",
                         flags,
                         nvmap_id,
+                        requested_offset,
                         cpu_addr,
                         mapping_size,
                         gpu_va

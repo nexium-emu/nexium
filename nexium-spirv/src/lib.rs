@@ -29,6 +29,7 @@ const UBO_VEC4S: u32 = 4096;
 const CBUF_LOGICAL_SLOTS: u32 = 32;
 const CBUF_SLOT_VEC4S: u32 = UBO_VEC4S / CBUF_LOGICAL_SLOTS;
 const MAX_TEXTURE_DESCRIPTORS: u32 = 32;
+const LOCAL_MEM_WORDS: u32 = 1024;
 const SSBO_BINDING_BASE: u32 = 3;
 pub const MAX_SSBO: u32 = 8;
 
@@ -59,6 +60,8 @@ pub struct Emitter {
     ptr_image_3d_array: Word,
     image_3d_var: Option<Word>,
     ubo_var: Word,
+    local_mem_var: Word,
+    ptr_private_u32: Word,
     f32_zero: Word,
     f32_one: Word,
     glsl: Word,
@@ -66,6 +69,9 @@ pub struct Emitter {
     output_vars: HashMap<u32, AttrVar>,
     pos_var: Option<Word>,
     point_size_var: Option<Word>,
+    subgroup_id_var: Option<Word>,
+    fswzadd_lut_a: Option<Word>,
+    fswzadd_lut_b: Option<Word>,
     frag_coord_var: Option<Word>,
     frag_color_vars: HashMap<u32, Word>,
     vertex_index_var: Option<Word>,
@@ -135,7 +141,7 @@ impl Emitter {
 
     fn new_sized(stage: Stage, ubo_vec4s: u32) -> Self {
         let mut b = rspirv::dr::Builder::new();
-        b.set_version(1, 0);
+        b.set_version(1, 3);
         b.capability(Capability::Shader);
         let glsl = b.ext_inst_import("GLSL.std.450");
         b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
@@ -176,6 +182,12 @@ impl Emitter {
             [Operand::LiteralBit32(0)],
         );
         b.decorate(ubo_var, Decoration::Binding, [Operand::LiteralBit32(0)]);
+
+        let local_mem_words_const = b.constant_bit32(u32_t, LOCAL_MEM_WORDS);
+        let local_mem_arr_t = b.type_array(u32_t, local_mem_words_const);
+        let ptr_private_arr = b.type_pointer(None, StorageClass::Private, local_mem_arr_t);
+        let local_mem_var = b.variable(ptr_private_arr, None, StorageClass::Private, None);
+        let ptr_private_u32 = b.type_pointer(None, StorageClass::Private, u32_t);
 
         let image_t = b.type_image(
             f32_t,
@@ -268,6 +280,8 @@ impl Emitter {
             ptr_image_3d_array,
             image_3d_var: None,
             ubo_var,
+            local_mem_var,
+            ptr_private_u32,
             f32_zero,
             f32_one,
             glsl,
@@ -275,6 +289,9 @@ impl Emitter {
             output_vars: HashMap::new(),
             pos_var: None,
             point_size_var: None,
+            subgroup_id_var: None,
+            fswzadd_lut_a: None,
+            fswzadd_lut_b: None,
             frag_coord_var: None,
             frag_color_vars: HashMap::new(),
             vertex_index_var: None,
@@ -427,6 +444,92 @@ impl Emitter {
         v
     }
 
+    fn subgroup_id_var(&mut self) -> Word {
+        if let Some(v) = self.subgroup_id_var {
+            return v;
+        }
+        self.b.capability(Capability::GroupNonUniform);
+        self.b.capability(Capability::GroupNonUniformShuffle);
+        let v = self
+            .b
+            .variable(self.ptr_input_u32, None, StorageClass::Input, None);
+        self.b.decorate(
+            v,
+            Decoration::BuiltIn,
+            [Operand::BuiltIn(BuiltIn::SubgroupLocalInvocationId)],
+        );
+        self.b.decorate(v, Decoration::Flat, []);
+        self.interface.push(v);
+        self.subgroup_id_var = Some(v);
+        v
+    }
+
+    fn subgroup_lane_id(&mut self) -> Word {
+        let v = self.subgroup_id_var();
+        self.b.load(self.u32_t, None, v, None, []).unwrap()
+    }
+
+    fn fswzadd_luts(&mut self) -> (Word, Word) {
+        if let (Some(a), Some(b)) = (self.fswzadd_lut_a, self.fswzadd_lut_b) {
+            return (a, b);
+        }
+        let n1 = self.const_f32((-1.0f32).to_bits());
+        let p1 = self.const_f32((1.0f32).to_bits());
+        let z = self.const_f32((0.0f32).to_bits());
+        let a = self.b.constant_composite(self.vec4_t, [n1, p1, n1, z]);
+        let b = self.b.constant_composite(self.vec4_t, [n1, n1, p1, n1]);
+        self.fswzadd_lut_a = Some(a);
+        self.fswzadd_lut_b = Some(b);
+        (a, b)
+    }
+
+    fn shfl_target(&mut self, mode: u8, index: Word, mask: Word) -> (Word, Word) {
+        let u32_t = self.u32_t;
+        let bool_t = self.bool_t;
+        let c0 = self.const_u32(0);
+        let c5 = self.const_u32(5);
+        let c8 = self.const_u32(8);
+        let clamp = self
+            .b
+            .bit_field_u_extract(u32_t, None, mask, c0, c5)
+            .unwrap();
+        let seg_mask = self
+            .b
+            .bit_field_u_extract(u32_t, None, mask, c8, c5)
+            .unwrap();
+        let tid = self.subgroup_lane_id();
+        let not_seg = self.b.not(u32_t, None, seg_mask).unwrap();
+        let min_tid = self.b.bitwise_and(u32_t, None, tid, seg_mask).unwrap();
+        let clamp_notseg = self.b.bitwise_and(u32_t, None, clamp, not_seg).unwrap();
+        let max_tid = self.b.bitwise_or(u32_t, None, min_tid, clamp_notseg).unwrap();
+        match mode {
+            0 => {
+                let lhs = self.b.bitwise_and(u32_t, None, index, not_seg).unwrap();
+                let src = self.b.bitwise_or(u32_t, None, lhs, min_tid).unwrap();
+                let in_range = self.b.s_less_than_equal(bool_t, None, src, max_tid).unwrap();
+                (src, in_range)
+            }
+            1 => {
+                let src = self.b.i_sub(u32_t, None, tid, index).unwrap();
+                let in_range = self
+                    .b
+                    .s_greater_than_equal(bool_t, None, src, max_tid)
+                    .unwrap();
+                (src, in_range)
+            }
+            2 => {
+                let src = self.b.i_add(u32_t, None, tid, index).unwrap();
+                let in_range = self.b.s_less_than_equal(bool_t, None, src, max_tid).unwrap();
+                (src, in_range)
+            }
+            _ => {
+                let src = self.b.bitwise_xor(u32_t, None, tid, index).unwrap();
+                let in_range = self.b.s_less_than_equal(bool_t, None, src, max_tid).unwrap();
+                (src, in_range)
+            }
+        }
+    }
+
     fn frag_coord_var(&mut self) -> Word {
         if let Some(v) = self.frag_coord_var {
             return v;
@@ -537,6 +640,20 @@ impl Emitter {
     }
 
     fn store_fragment_output_vec(&mut self, location: u32, value: Word) {
+        let value = {
+            use std::sync::OnceLock;
+            static SOLID: OnceLock<bool> = OnceLock::new();
+            let on = *SOLID.get_or_init(|| std::env::var_os("NEXIUM_FS_SOLID").is_some());
+            if on {
+                let one = self.const_f32(1.0f32.to_bits());
+                let zero = self.const_f32(0.0f32.to_bits());
+                self.b
+                    .composite_construct(self.vec4_t, None, [one, zero, one, one])
+                    .unwrap()
+            } else {
+                value
+            }
+        };
         if self.fragment_output_map == 0 {
             let fc = self.frag_color_var_at(location);
             self.b.store(fc, value, None, []).unwrap();
@@ -1726,6 +1843,49 @@ impl Emitter {
                 )
             }
             IrOp::LoadGlobal { .. } => Some(self.f32_zero),
+            IrOp::LoadLocal { addr } => {
+                let addr_v = self.lower_value(addr);
+                let addr_u = self.as_u32(addr_v);
+                let two = self.const_u32(2);
+                let word = self
+                    .b
+                    .shift_right_logical(self.u32_t, None, addr_u, two)
+                    .unwrap();
+                let mask = self.const_u32(LOCAL_MEM_WORDS - 1);
+                let idx = self.b.bitwise_and(self.u32_t, None, word, mask).unwrap();
+                let ac = self
+                    .b
+                    .access_chain(self.ptr_private_u32, None, self.local_mem_var, [idx])
+                    .unwrap();
+                let loaded = self.b.load(self.u32_t, None, ac, None, []).unwrap();
+                Some(self.store_bits(loaded))
+            }
+            IrOp::StoreLocal { addr, value } => {
+                let guard = inst
+                    .pred
+                    .map(|pred| self.resolve_pred(pred.idx, pred.negate));
+                let addr_v = self.lower_value(addr);
+                let addr_u = self.as_u32(addr_v);
+                let val_v = self.lower_value(value);
+                let mut val_u = self.as_u32(val_v);
+                let two = self.const_u32(2);
+                let word = self
+                    .b
+                    .shift_right_logical(self.u32_t, None, addr_u, two)
+                    .unwrap();
+                let mask = self.const_u32(LOCAL_MEM_WORDS - 1);
+                let idx = self.b.bitwise_and(self.u32_t, None, word, mask).unwrap();
+                let ac = self
+                    .b
+                    .access_chain(self.ptr_private_u32, None, self.local_mem_var, [idx])
+                    .unwrap();
+                if let Some(cond) = guard {
+                    let old = self.b.load(self.u32_t, None, ac, None, []).unwrap();
+                    val_u = self.b.select(self.u32_t, None, cond, val_u, old).unwrap();
+                }
+                self.b.store(ac, val_u, None, []).unwrap();
+                None
+            }
             IrOp::LoadStorage {
                 buffer_index,
                 addr_lo,
@@ -2507,6 +2667,95 @@ impl Emitter {
                         .unwrap()
                 };
                 Some(self.store_bits(r))
+            }
+            IrOp::Bfi {
+                base,
+                insert,
+                control,
+            } => {
+                let basev = self.lower_value(base);
+                let insertv = self.lower_value(insert);
+                let controlv = self.lower_value(control);
+                let baseu = self.as_u32(basev);
+                let insertu = self.as_u32(insertv);
+                let controlu = self.as_u32(controlv);
+                let mask = self.const_u32(0xff);
+                let pos = self.b.bitwise_and(self.u32_t, None, controlu, mask).unwrap();
+                let eight = self.const_u32(8);
+                let size_raw = self
+                    .b
+                    .shift_right_logical(self.u32_t, None, controlu, eight)
+                    .unwrap();
+                let cnt = self
+                    .b
+                    .bitwise_and(self.u32_t, None, size_raw, mask)
+                    .unwrap();
+                let r = self
+                    .b
+                    .bit_field_insert(self.u32_t, None, baseu, insertu, pos, cnt)
+                    .unwrap();
+                Some(self.store_bits(r))
+            }
+            IrOp::Shfl {
+                value,
+                index,
+                mask,
+                mode,
+                pred_dest,
+            } => {
+                let valv = self.lower_value(value);
+                let val = self.as_u32(valv);
+                let idxv = self.lower_value(index);
+                let idx = self.as_u32(idxv);
+                let maskv = self.lower_value(mask);
+                let mask_u = self.as_u32(maskv);
+                let (src_tid, in_range) = self.shfl_target(*mode, idx, mask_u);
+                let scope = self.const_u32(3);
+                let shuffled = self
+                    .b
+                    .group_non_uniform_shuffle(self.u32_t, None, scope, val, src_tid)
+                    .unwrap();
+                let sel = self
+                    .b
+                    .select(self.u32_t, None, in_range, shuffled, val)
+                    .unwrap();
+                if *pred_dest < 7 {
+                    let guard = inst
+                        .pred
+                        .map(|p| self.resolve_pred(p.idx, p.negate));
+                    self.write_pred_reg(*pred_dest, in_range, guard);
+                }
+                Some(self.store_bits(sel))
+            }
+            IrOp::FSwzAdd { a, b, swizzle } => {
+                let af = self.lower_value(a);
+                let bf = self.lower_value(b);
+                let lane = self.subgroup_lane_id();
+                let three = self.const_u32(3);
+                let one = self.const_u32(1);
+                let laneq = self.b.bitwise_and(self.u32_t, None, lane, three).unwrap();
+                let sh = self
+                    .b
+                    .shift_left_logical(self.u32_t, None, laneq, one)
+                    .unwrap();
+                let sw = self.const_u32(*swizzle);
+                let shifted = self
+                    .b
+                    .shift_right_logical(self.u32_t, None, sw, sh)
+                    .unwrap();
+                let sel = self.b.bitwise_and(self.u32_t, None, shifted, three).unwrap();
+                let (lut_a, lut_b) = self.fswzadd_luts();
+                let mod_a = self
+                    .b
+                    .vector_extract_dynamic(self.f32_t, None, lut_a, sel)
+                    .unwrap();
+                let mod_b = self
+                    .b
+                    .vector_extract_dynamic(self.f32_t, None, lut_b, sel)
+                    .unwrap();
+                let ra = self.b.f_mul(self.f32_t, None, af, mod_a).unwrap();
+                let rb = self.b.f_mul(self.f32_t, None, bf, mod_b).unwrap();
+                Some(self.b.f_add(self.f32_t, None, ra, rb).unwrap())
             }
             IrOp::ISet {
                 cmp,

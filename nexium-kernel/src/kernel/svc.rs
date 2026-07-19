@@ -4745,6 +4745,17 @@ fn igbp_handle_transact(
                     let stats = kernel.nvdrv.stats.clone();
                     let (pw, ph, pnv) = (gb.width, gb.height, gb.nvmap_id);
                     let present_cpu_addr = resolved.map(|(addr, _)| addr).unwrap_or(0);
+                    if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+                        use std::sync::atomic::{AtomicU64, Ordering as O2};
+                        static QP: AtomicU64 = AtomicU64::new(0);
+                        let n = QP.fetch_add(1, O2::Relaxed);
+                        if n % 20 == 0 {
+                            log::warn!(
+                                "[queue-present #{}] slot={} nvmap={} buf_off={:#x} present_cpu_addr={:#x}",
+                                n, slot, gb.nvmap_id, gb.buffer_offset, present_cpu_addr
+                            );
+                        }
+                    }
                     qba.store(true, std::sync::atomic::Ordering::Relaxed);
                     let present_profile = std::env::var_os("NEXIUM_NVDRV_PROFILE").is_some();
                     use std::sync::atomic::{AtomicU64, Ordering};

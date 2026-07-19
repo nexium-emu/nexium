@@ -304,13 +304,20 @@ pub fn flush_accum(
     let t0 = std::time::Instant::now();
     let rt_thread = crate::render_thread::maybe_render_thread();
     let read_guest = |gpu_va: u64, len: usize| -> Option<Vec<u8>> {
-        let cpu = mappings.cpu_address_for(gpu_va)?;
         let mut buf = vec![0u8; len];
-        if mem_read(cpu, &mut buf) {
-            Some(buf)
-        } else {
-            None
+        let mut filled = 0usize;
+        while filled < len {
+            let (cpu, avail) = mappings.cpu_range_for(gpu_va.wrapping_add(filled as u64))?;
+            let chunk = ((len - filled) as u64).min(avail) as usize;
+            if chunk == 0 {
+                return None;
+            }
+            if !mem_read(cpu, &mut buf[filled..filled + chunk]) {
+                return None;
+            }
+            filled += chunk;
         }
+        Some(buf)
     };
     let before = batch.len();
     let flushed = flush_batch(batch, renderer, rt_thread, &read_guest);
@@ -824,6 +831,7 @@ struct ShaderBundle {
     fs_cbuf_mask: u32,
     fs_hash: u64,
     fs_tex_ids: Vec<u32>,
+    fs_tex_or_partners: std::collections::HashMap<u32, u32>,
     vs_tex_base: u32,
     vs_tex_count: u32,
     fs_sampler_arrayed: bool,
@@ -998,6 +1006,15 @@ fn trace_zeta_key(
         depth_key
             .map(|k| k.label())
             .unwrap_or_else(|| "none".to_string()),
+    );
+    log::warn!(
+        "[zetadbg-cull] op={} cull_en={} cull_face={:#x} front_face={:#x} flip_y={} zeta_en={}",
+        op_seq,
+        draw.cull_test_enable,
+        draw.cull_face,
+        draw.front_face,
+        draw.window_origin.flip_y(),
+        draw.zeta_enable,
     );
 }
 
@@ -1582,6 +1599,7 @@ fn execute_one(
                         fs_cbuf_mask: rec.fs_cbuf_mask,
                         fs_hash: rec.fs_hash,
                         fs_tex_ids: rec.fs_tex_ids.clone(),
+                        fs_tex_or_partners: rec.fs_tex_or_partners.iter().copied().collect(),
                         vs_tex_base: rec.vs_tex_base,
                         vs_tex_count: rec.vs_tex_count,
                         fs_sampler_arrayed: rec.fs_sampler_arrayed,
@@ -1818,6 +1836,7 @@ fn execute_one(
                     fs_cbuf_mask,
                     fs_hash,
                     fs_tex_ids,
+                    fs_tex_or_partners: fs_cfg.bindless_or_partners.clone(),
                     vs_tex_base,
                     vs_tex_count,
                     fs_sampler_arrayed,
@@ -1845,6 +1864,11 @@ fn execute_one(
                             .ssbo_descs
                             .iter()
                             .map(|d| (d.cbuf_binding, d.cbuf_offset, d.align))
+                            .collect(),
+                        fs_tex_or_partners: b
+                            .fs_tex_or_partners
+                            .iter()
+                            .map(|(&k, &v)| (k, v))
                             .collect(),
                     },
                 ));
@@ -2010,6 +2034,7 @@ fn execute_one(
                 via_header_index,
                 mappings,
                 mem_read,
+                &bundle.fs_tex_or_partners,
             );
         }
         if split_vs_stage && vs_tex_count != 0 {
@@ -2032,6 +2057,7 @@ fn execute_one(
                     via_header_index,
                     mappings,
                     mem_read,
+                    &bundle.fs_tex_or_partners,
                 );
             }
         }
@@ -5107,6 +5133,7 @@ fn remap_texture_ids_for_stage(
     via_header_index: bool,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    or_partners: &std::collections::HashMap<u32, u32>,
 ) {
     let designated = (tex_cb_slot as usize).min(15);
     let trusted = tex_cb_slot != 0
@@ -5154,7 +5181,18 @@ fn remap_texture_ids_for_stage(
         };
         let mut bytes = [0u8; 4];
         if mem_read(cpu, &mut bytes) {
-            let handle = u32::from_le_bytes(bytes);
+            let mut handle = u32::from_le_bytes(bytes);
+            if let Some(&partner_word) = or_partners.get(&shader_id) {
+                let poff = (partner_word as u64).saturating_mul(4);
+                if poff + 4 <= tcb_size as u64 {
+                    if let Some(pcpu) = mappings.cpu_address_for(tcb_addr.wrapping_add(poff)) {
+                        let mut pbytes = [0u8; 4];
+                        if mem_read(pcpu, &mut pbytes) {
+                            handle |= u32::from_le_bytes(pbytes);
+                        }
+                    }
+                }
+            }
             let (tic, tsc) = split_texture_handle(handle, via_header_index);
             let accept = if trusted {
                 tic <= tic_pool_limit

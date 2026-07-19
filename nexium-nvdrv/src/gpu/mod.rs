@@ -125,6 +125,15 @@ impl GpuMappings {
         None
     }
 
+    pub fn mapping_at(&self, gpu_va: u64) -> Option<(u64, u64, u64)> {
+        for m in self.mappings.iter().rev() {
+            if gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size {
+                return Some((m.gpu_va, m.size, m.cpu_addr));
+            }
+        }
+        None
+    }
+
     pub fn cpu_range_for(&self, gpu_va: u64) -> Option<(u64, u64)> {
         for m in self.mappings.iter().rev() {
             if gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size {

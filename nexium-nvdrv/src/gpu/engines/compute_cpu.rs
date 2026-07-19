@@ -59,6 +59,7 @@ pub fn try_execute(
         tex_logs: 0,
         writes: 0,
         unsupported: None,
+        map_cache: std::cell::Cell::new(None),
     };
 
     for gz in 0..grid_z.max(1) {
@@ -117,6 +118,7 @@ struct ComputeExec<'a> {
     tex_logs: u32,
     writes: u64,
     unsupported: Option<(usize, u64, nexium_shader::Opcode)>,
+    map_cache: std::cell::Cell<Option<(u64, u64, u64)>>,
 }
 
 struct TextureData {
@@ -438,8 +440,23 @@ impl ComputeExec<'_> {
         self.read_gpu_u32(gpu.wrapping_add(offset as u64))
     }
 
+    fn resolve_gpu(&self, gpu: u64) -> Option<u64> {
+        if let Some((start, end, cpu_base)) = self.map_cache.get() {
+            if gpu >= start && gpu < end {
+                return Some(cpu_base + (gpu - start));
+            }
+        }
+        if let Some((start, size, cpu_base)) = self.mappings.mapping_at(gpu) {
+            self.map_cache.set(Some((start, start + size, cpu_base)));
+            return Some(cpu_base + (gpu - start));
+        }
+        self.mappings
+            .cpu_address_for_any32(gpu)
+            .map(|(_, cpu, _)| cpu)
+    }
+
     fn read_gpu_u32(&self, gpu: u64) -> u32 {
-        let Some(cpu) = map_gpu(self.mappings, gpu) else {
+        let Some(cpu) = self.resolve_gpu(gpu) else {
             return 0;
         };
         let mut b = [0u8; 4];
@@ -451,7 +468,7 @@ impl ComputeExec<'_> {
     }
 
     fn write_gpu_u32(&mut self, gpu: u64, value: u32) {
-        let Some(cpu) = map_gpu(self.mappings, gpu) else {
+        let Some(cpu) = self.resolve_gpu(gpu) else {
             return;
         };
         if (self.mem_write)(cpu, &value.to_le_bytes()) {

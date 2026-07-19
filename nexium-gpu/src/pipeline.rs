@@ -325,7 +325,12 @@ pub fn build_graphics_pipeline(
         0x0901 => vk::FrontFace::COUNTER_CLOCKWISE,
         _ => vk::FrontFace::COUNTER_CLOCKWISE,
     };
-    let host_cull = if !req.cull_test_enable {
+    let no_cull = {
+        use std::sync::OnceLock;
+        static NC: OnceLock<bool> = OnceLock::new();
+        *NC.get_or_init(|| std::env::var_os("NEXIUM_NO_CULL").is_some())
+    };
+    let host_cull = if !req.cull_test_enable || no_cull {
         vk::CullModeFlags::NONE
     } else {
         match req.cull_face {

@@ -184,6 +184,15 @@ pub fn ldg_size(insn: u64) -> u32 {
 }
 
 #[inline]
+pub fn ldls_word_count(insn: u64) -> u32 {
+    match bits(insn, 48, 50) {
+        5 => 2,
+        6 => 4,
+        _ => 1,
+    }
+}
+
+#[inline]
 pub fn fsetp_dest_p(insn: u64) -> u8 {
     bits(insn, 3, 5) as u8
 }
