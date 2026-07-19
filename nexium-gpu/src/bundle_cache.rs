@@ -6,7 +6,8 @@ const BUNDLE_MAGIC: [u8; 8] = *b"NXBUNDL1";
 const BUNDLE_VERSION: u32 = 3;
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
-const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
+const FLUSH_EVERY_N_RECORDS: u32 = 200;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct BundleRecord {
@@ -67,11 +68,9 @@ pub struct BundleStore {
 }
 
 fn bundles_path() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
     let title = nexium_common::title::title_key().unwrap_or_else(|| "default".to_string());
     Some(
-        PathBuf::from(base)
-            .join("NeXium")
+        nexium_common::paths::root()
             .join("shader_cache")
             .join(format!("{}.bundles", title)),
     )
@@ -130,6 +129,7 @@ fn spawn_writer(
             let mut dirty = false;
             let mut oversize = false;
             let mut last_flush = std::time::Instant::now();
+            let mut since_flush: u32 = 0;
             let flush = |records: &HashMap<u64, Arc<BundleRecord>>,
                          failed: &HashSet<u64>|
              -> bool {
@@ -170,6 +170,7 @@ fn spawn_writer(
                     Ok(WriterMsg::Record(rec)) => {
                         if records.insert(rec.content_key, rec).is_none() {
                             dirty = true;
+                            since_flush += 1;
                         }
                     }
                     Ok(WriterMsg::Failed(key)) => {
@@ -187,9 +188,15 @@ fn spawn_writer(
                         break;
                     }
                 }
-                if dirty && !oversize && (quiet || last_flush.elapsed() >= FLUSH_INTERVAL) {
+                if dirty
+                    && !oversize
+                    && (quiet
+                        || since_flush >= FLUSH_EVERY_N_RECORDS
+                        || last_flush.elapsed() >= FLUSH_INTERVAL)
+                {
                     oversize = flush(&records, &failed);
                     dirty = false;
+                    since_flush = 0;
                     last_flush = std::time::Instant::now();
                 }
             }

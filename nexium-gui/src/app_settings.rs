@@ -346,6 +346,10 @@ fn default_multicore() -> bool {
     true
 }
 
+fn default_menu_music_track() -> u8 {
+    255
+}
+
 fn default_sfx_volume() -> f32 {
     0.5
 }
@@ -415,6 +419,8 @@ pub struct AppSettings {
     pub carousel_order: Vec<CarouselRef>,
     #[serde(default)]
     pub music_muted: bool,
+    #[serde(default = "default_menu_music_track")]
+    pub menu_music_track: u8,
     #[serde(default)]
     pub sfx_muted: bool,
     #[serde(default)]
@@ -549,6 +555,7 @@ impl Default for AppSettings {
             carousel_lists: Vec::new(),
             carousel_order: Vec::new(),
             music_muted: false,
+            menu_music_track: default_menu_music_track(),
             sfx_muted: false,
             dockbar_theme: DockbarTheme::default(),
             left_deadzone: default_left_deadzone(),
