@@ -44,6 +44,7 @@ pub struct PredPhi {
 pub struct Cfg {
     pub blocks: Vec<BasicBlock>,
     pub unimplemented: u32,
+    pub bindless_or_partners: std::collections::HashMap<u32, u32>,
 }
 
 impl Cfg {
@@ -351,6 +352,8 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
     let mut blocks: Vec<BasicBlock> = Vec::with_capacity(topology.len());
     let mut total_unimpl: u32 = 0;
     let mut next_value: u32 = 0;
+    let mut bindless_or_partners: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
 
     for (bid, info) in topology.iter().enumerate() {
         let (initial_state, phis, after_phis) =
@@ -388,6 +391,9 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
         }
 
         total_unimpl += t.unimplemented_count;
+        for (k, v) in t.bindless_or_partners.drain() {
+            bindless_or_partners.insert(k, v);
+        }
         next_value = t.program.next_value_id();
         let reg_exit = t.snapshot_reg_state();
         let pred_exit = t.snapshot_pred_state();
@@ -409,6 +415,7 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
     Cfg {
         blocks,
         unimplemented: total_unimpl,
+        bindless_or_partners,
     }
 }
 

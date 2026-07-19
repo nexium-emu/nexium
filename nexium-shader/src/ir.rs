@@ -295,6 +295,15 @@ pub enum Op {
         offset: i32,
     },
 
+    LoadLocal {
+        addr: Value,
+    },
+
+    StoreLocal {
+        addr: Value,
+        value: Value,
+    },
+
     LoadStorage {
         buffer_index: u32,
         addr_lo: Value,
@@ -557,6 +566,26 @@ pub enum Op {
         signed: bool,
     },
 
+    Bfi {
+        base: Value,
+        insert: Value,
+        control: Value,
+    },
+
+    Shfl {
+        value: Value,
+        index: Value,
+        mask: Value,
+        mode: u8,
+        pred_dest: u8,
+    },
+
+    FSwzAdd {
+        a: Value,
+        b: Value,
+        swizzle: u32,
+    },
+
     ISet {
         cmp: ICmp,
         signed: bool,
@@ -713,6 +742,8 @@ impl Inst {
             Op::LoadGlobal { addr_lo, offset } => {
                 write!(f, "LdGbl [{addr_lo}+{offset:#x}]")
             }
+            Op::LoadLocal { addr } => write!(f, "LdLcl [{addr}]"),
+            Op::StoreLocal { addr, value } => write!(f, "StLcl [{addr}], {value}"),
             Op::LoadStorage {
                 buffer_index,
                 addr_lo,
@@ -870,6 +901,22 @@ impl Inst {
                 write!(f, "F2I   {src} signed={signed} round={round}")
             }
             Op::Bfe { a, b, signed } => write!(f, "Bfe   {a}, {b} signed={signed}"),
+            Op::Bfi {
+                base,
+                insert,
+                control,
+            } => write!(f, "Bfi   {base}, {insert}, {control}"),
+            Op::Shfl {
+                value,
+                index,
+                mask,
+                mode,
+                pred_dest,
+            } => write!(
+                f,
+                "Shfl.{mode} {value}, {index}, {mask} -> p{pred_dest}"
+            ),
+            Op::FSwzAdd { a, b, swizzle } => write!(f, "FSwzAdd {a}, {b} sw={swizzle:#x}"),
             Op::ISet { cmp, a, b, .. } => write!(f, "ISet.{cmp:?} {a}, {b}"),
             Op::Kill => write!(f, "Kill"),
             Op::Exit => write!(f, "Exit"),

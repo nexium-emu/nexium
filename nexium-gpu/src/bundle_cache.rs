@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const BUNDLE_MAGIC: [u8; 8] = *b"NXBUNDL1";
-const BUNDLE_VERSION: u32 = 2;
+const BUNDLE_VERSION: u32 = 3;
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -24,6 +24,8 @@ pub struct BundleRecord {
     pub fs_cbuf_reads: Vec<(u32, u32)>,
     pub cbuf_used: u32,
     pub ssbo_descs: Vec<(u8, u32, u32)>,
+    #[serde(default)]
+    pub fs_tex_or_partners: Vec<(u32, u32)>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

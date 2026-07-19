@@ -232,10 +232,17 @@ impl Fermi2D {
         let dst_bpp = dst_format.bytes_per_pixel();
         let mut src_pixel = vec![0u8; src_bpp];
         let mut dst_pixel = vec![0u8; dst_bpp];
-        let src_end = src_cpu.saturating_add(self.src.storage_size() as u64);
-        let dst_end = dst_cpu.saturating_add(self.dst.storage_size() as u64);
+        let src_size = self.src.storage_size();
+        let dst_size = self.dst.storage_size();
+
+        let mut src_buf = vec![0u8; src_size];
+        let mut dst_buf = vec![0u8; dst_size];
+        let bulk = mem_read(src_cpu, &mut src_buf) && mem_read(dst_cpu, &mut dst_buf);
+
+        let src_end = src_cpu.saturating_add(src_size as u64);
+        let dst_end = dst_cpu.saturating_add(dst_size as u64);
         let overlaps = src_cpu < dst_end && dst_cpu < src_end;
-        let mut deferred_writes = overlaps.then(Vec::new);
+        let mut deferred_writes = (!bulk && overlaps).then(Vec::new);
 
         for y in 0..height {
             let dst_y = self.dst_y0 as i64 + y as i64 * dst_y_step;
@@ -255,7 +262,12 @@ impl Fermi2D {
                 let Some(dst_offset) = self.dst.pixel_offset(dst_x as usize, dst_y as usize) else {
                     continue;
                 };
-                if !mem_read(src_cpu + src_offset as u64, &mut src_pixel) {
+                if bulk {
+                    if src_offset + src_bpp > src_buf.len() {
+                        continue;
+                    }
+                    src_pixel.copy_from_slice(&src_buf[src_offset..src_offset + src_bpp]);
+                } else if !mem_read(src_cpu + src_offset as u64, &mut src_pixel) {
                     continue;
                 }
                 if src_format == dst_format {
@@ -268,15 +280,23 @@ impl Fermi2D {
                         continue;
                     }
                 }
-                let dst_address = dst_cpu + dst_offset as u64;
-                if let Some(writes) = deferred_writes.as_mut() {
-                    writes.push((dst_address, dst_pixel.clone()));
+                if bulk {
+                    if dst_offset + dst_bpp <= dst_buf.len() {
+                        dst_buf[dst_offset..dst_offset + dst_bpp].copy_from_slice(&dst_pixel);
+                    }
                 } else {
-                    mem_write(dst_address, &dst_pixel);
+                    let dst_address = dst_cpu + dst_offset as u64;
+                    if let Some(writes) = deferred_writes.as_mut() {
+                        writes.push((dst_address, dst_pixel.clone()));
+                    } else {
+                        mem_write(dst_address, &dst_pixel);
+                    }
                 }
             }
         }
-        if let Some(writes) = deferred_writes {
+        if bulk {
+            mem_write(dst_cpu, &dst_buf);
+        } else if let Some(writes) = deferred_writes {
             for (address, pixel) in writes {
                 mem_write(address, &pixel);
             }

@@ -4682,29 +4682,40 @@ struct RtImageStats {
 
 fn dump_rt_bmp(key: RtKey, rgba: &[u8]) {
     use std::io::Write;
-    let Some(base) = std::env::var_os("APPDATA") else {
-        return;
-    };
     if key.width == 0 || key.height == 0 {
         return;
     }
     {
-        let (mut amin, mut amax, mut asum, mut n) = (255u8, 0u8, 0u64, 0u64);
+        let (mut amin, mut amax, mut asum) = (255u8, 0u8, 0u64);
+        let (mut rsum, mut gsum, mut bsum, mut nonblack, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
         for px in rgba.chunks_exact(4) {
             amin = amin.min(px[3]);
             amax = amax.max(px[3]);
             asum += px[3] as u64;
+            rsum += px[0] as u64;
+            gsum += px[1] as u64;
+            bsum += px[2] as u64;
+            if px[0] | px[1] | px[2] != 0 {
+                nonblack += 1;
+            }
             n += 1;
         }
+        let d = n.max(1);
         log::warn!(
-            "[rt-alpha] {} a=[{}..{}] avg={}",
+            "[rt-content] {} rgb_avg=({},{},{}) a=[{}..{}] a_avg={} nonblack={}/{} ({}%)",
             key.label(),
+            rsum / d,
+            gsum / d,
+            bsum / d,
             amin,
             amax,
-            asum / n.max(1)
+            asum / d,
+            nonblack,
+            n,
+            nonblack * 100 / d
         );
     }
-    let dir = std::path::PathBuf::from(base).join("NeXium").join("logs");
+    let dir = nexium_common::paths::log_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }

@@ -925,6 +925,25 @@ impl EmulationHandle {
                                         String::from_utf8_lossy(&nm[..end])
                                     );
                                 }
+                                let code_start = cur_pc.saturating_sub(0x40);
+                                let mut code = [0u8; 0x100];
+                                if guard.address_space.read(code_start, &mut code).is_ok() {
+                                    let words: Vec<String> = code
+                                        .chunks_exact(4)
+                                        .map(|c| {
+                                            format!(
+                                                "{:08x}",
+                                                u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                                            )
+                                        })
+                                        .collect();
+                                    log::warn!(
+                                        "[spin-detected] code@{:#x} pc={:#x} words=[{}]",
+                                        code_start,
+                                        cur_pc,
+                                        words.join(",")
+                                    );
+                                }
                                 guard.log_thread_snapshot("spin-detected");
                             }
                             last_halts = halts;

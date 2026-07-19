@@ -18,7 +18,8 @@ use super::operand::{
     iadd_neg_b, imm20, imm32, ipa_interpolation_mode, ipa_saturate, iscadd_shift, iset_bf,
     iset_cmp, iset_signed, isetp_bop, isetp_cmp, isetp_dest_np, isetp_dest_p, isetp_signed,
     isetp_src_pred, isetp_src_pred_inv, ldc_ref, ldc_size, ldc_src_reg, ldg_addr_reg, ldg_offset,
-    ldg_size, lop32i_not_a, lop32i_not_b, lop32i_op, lop_not_a, lop_not_b, lop_op, mufu_func_bits,
+    ldg_size, ldls_word_count, lop32i_not_a, lop32i_not_b, lop32i_op, lop_not_a, lop_not_b, lop_op,
+    mufu_func_bits,
     pset_bool_float, psetp_bop_1, psetp_bop_2, psetp_dest_np, psetp_dest_p, psetp_neg_pred_a,
     psetp_neg_pred_b, psetp_neg_pred_c, psetp_pred_a, psetp_pred_b, psetp_pred_c, reg_a, reg_b,
     reg_c, reg_dest, sel_neg_pred, sel_pred, shr_signed, texs_tex_id, xmad_cr_mrg, xmad_cr_psl,
@@ -37,6 +38,7 @@ pub struct Translator {
     pred_state: HashMap<u8, ValueId>,
     pub finished: bool,
     pub unimplemented_count: u32,
+    pub bindless_or_partners: HashMap<u32, u32>,
 }
 
 impl Translator {
@@ -59,7 +61,35 @@ impl Translator {
             pred_state: initial_pred,
             finished: false,
             unimplemented_count: 0,
+            bindless_or_partners: HashMap::new(),
         }
+    }
+
+    fn trace_cbuf_or_partner(&self, v: &Value) -> Option<(u32, u32)> {
+        let mut cur = *v;
+        for _ in 0..8 {
+            let Value::Inst(id) = cur else { return None };
+            let inst = self.program.instructions.iter().find(|i| i.result == Some(id))?;
+            match &inst.op {
+                Op::Mov(inner) => cur = *inner,
+                Op::ILop {
+                    a,
+                    b,
+                    op: LogicOp::Or,
+                    not_a: false,
+                    not_b: false,
+                } => {
+                    let oa = self.trace_cbuf_word_offset(a)?;
+                    let ob = self.trace_cbuf_word_offset(b)?;
+                    if oa == ob {
+                        return None;
+                    }
+                    return Some((oa.min(ob), oa.max(ob)));
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     fn read_reg(&self, r: u8) -> Value {
@@ -834,6 +864,23 @@ impl Translator {
         );
     }
 
+    fn ldl_addr(&mut self, raw: u64) -> Value {
+        let off_reg = reg_a(raw);
+        let raw_off = ((raw >> 20) & 0x00FF_FFFF) as u32;
+        if off_reg == RZ {
+            Value::ImmU32(raw_off)
+        } else {
+            let rel = ((raw_off << 8) as i32) >> 8;
+            let base = self.read_reg(off_reg);
+            self.emit_value(Op::IAdd {
+                a: base,
+                b: Value::ImmU32(rel as u32),
+                neg_a: false,
+                neg_b: false,
+            })
+        }
+    }
+
     fn emit_f2i(&mut self, raw: u64, src: Value, pred: Option<Predicate>) {
         let dest = reg_dest(raw);
         self.write_reg(
@@ -1579,6 +1626,9 @@ impl Translator {
                     self.unimplemented_count += 1;
                     return false;
                 };
+                if let Some((primary, partner)) = self.trace_cbuf_or_partner(&handle) {
+                    self.bindless_or_partners.insert(primary, partner);
+                }
                 let coord = reg_a(raw);
                 let tex_type = ((raw >> 28) & 0x7) as u32;
                 let u = self.read_reg(coord);
@@ -1880,6 +1930,89 @@ impl Translator {
                 }
             }
 
+            Opcode::LDL => {
+                let dest = reg_dest(raw);
+                let addr = self.ldl_addr(raw);
+                let count = ldls_word_count(raw);
+                for w in 0..count {
+                    let a = if w == 0 {
+                        addr
+                    } else {
+                        self.emit_value(Op::IAdd {
+                            a: addr,
+                            b: Value::ImmU32(4 * w),
+                            neg_a: false,
+                            neg_b: false,
+                        })
+                    };
+                    let id = self.program.emit(Op::LoadLocal { addr: a }, None);
+                    let dst = if dest == RZ {
+                        RZ
+                    } else {
+                        dest.wrapping_add(w as u8)
+                    };
+                    self.write_reg(dst, Op::Mov(Value::Inst(id)), pred);
+                }
+            }
+            Opcode::STL => {
+                let src = reg_dest(raw);
+                let addr = self.ldl_addr(raw);
+                let count = ldls_word_count(raw);
+                for w in 0..count {
+                    let a = if w == 0 {
+                        addr
+                    } else {
+                        self.emit_value(Op::IAdd {
+                            a: addr,
+                            b: Value::ImmU32(4 * w),
+                            neg_a: false,
+                            neg_b: false,
+                        })
+                    };
+                    let value = self.read_reg(src.wrapping_add(w as u8));
+                    self.program
+                        .emit_void_pred(Op::StoreLocal { addr: a, value }, pred);
+                }
+            }
+
+            Opcode::FSWZADD => {
+                let dest = reg_dest(raw);
+                let a = self.read_reg(reg_a(raw));
+                let b = self.read_reg(reg_b(raw));
+                let swizzle = ((raw >> 28) & 0xff) as u32;
+                self.write_reg(dest, Op::FSwzAdd { a, b, swizzle }, pred);
+            }
+
+            Opcode::SHFL => {
+                let dest = reg_dest(raw);
+                let value = self.read_reg(reg_a(raw));
+                let mode = ((raw >> 30) & 0x3) as u8;
+                let src_a_flag = (raw >> 28) & 1 != 0;
+                let src_b_flag = (raw >> 29) & 1 != 0;
+                let index = if src_a_flag {
+                    Value::ImmU32(((raw >> 20) & 0x1f) as u32)
+                } else {
+                    self.read_reg(reg_b(raw))
+                };
+                let mask = if src_b_flag {
+                    Value::ImmU32(((raw >> 34) & 0x1fff) as u32)
+                } else {
+                    self.read_reg(reg_c(raw))
+                };
+                let pred_dest = ((raw >> 48) & 0x7) as u8;
+                let id = self.program.emit(
+                    Op::Shfl {
+                        value,
+                        index,
+                        mask,
+                        mode,
+                        pred_dest,
+                    },
+                    None,
+                );
+                self.write_reg(dest, Op::Mov(Value::Inst(id)), pred);
+            }
+
             Opcode::FSETP_reg | Opcode::FSETP_cbuf | Opcode::FSETP_imm => {
                 let dest_p = fsetp_dest_p(raw);
                 let dest_np = fsetp_dest_np(raw);
@@ -2076,6 +2209,66 @@ impl Translator {
                 self.emit_bfe(raw, Value::ImmU32(imm20(raw) as u32), pred);
             }
 
+            Opcode::BFI_reg => {
+                let dest = reg_dest(raw);
+                let insert = self.read_reg(reg_a(raw));
+                let control = self.read_reg(reg_b(raw));
+                let base = self.read_reg(reg_c(raw));
+                self.write_reg(
+                    dest,
+                    Op::Bfi {
+                        base,
+                        insert,
+                        control,
+                    },
+                    pred,
+                );
+            }
+            Opcode::BFI_cr => {
+                let dest = reg_dest(raw);
+                let insert = self.read_reg(reg_a(raw));
+                let cb_id = self.load_cbuf(raw);
+                let base = self.read_reg(reg_c(raw));
+                self.write_reg(
+                    dest,
+                    Op::Bfi {
+                        base,
+                        insert,
+                        control: Value::Inst(cb_id),
+                    },
+                    pred,
+                );
+            }
+            Opcode::BFI_rc => {
+                let dest = reg_dest(raw);
+                let insert = self.read_reg(reg_a(raw));
+                let control = self.read_reg(reg_c(raw));
+                let cb_id = self.load_cbuf(raw);
+                self.write_reg(
+                    dest,
+                    Op::Bfi {
+                        base: Value::Inst(cb_id),
+                        insert,
+                        control,
+                    },
+                    pred,
+                );
+            }
+            Opcode::BFI_imm => {
+                let dest = reg_dest(raw);
+                let insert = self.read_reg(reg_a(raw));
+                let base = self.read_reg(reg_c(raw));
+                self.write_reg(
+                    dest,
+                    Op::Bfi {
+                        base,
+                        insert,
+                        control: Value::ImmU32(imm20(raw) as u32),
+                    },
+                    pred,
+                );
+            }
+
             Opcode::F2I_reg => {
                 let src = self.read_reg(reg_b(raw));
                 self.emit_f2i(raw, src, pred);
@@ -2124,15 +2317,15 @@ impl Translator {
                     0 => {
                         self.write_reg(dest, Op::Mov(Value::ImmU32(0)), pred);
                     }
+                    0x12 => {
+                        self.write_reg(dest, Op::Mov(Value::ImmU32(0x3F80_0000)), pred);
+                    }
                     30 | 31 => {
                         self.write_reg(dest, Op::Mov(Value::ImmU32(0x3F80_0000)), pred);
                     }
                     _ => {
-                        log::debug!("S2R unhandled sr={} raw={:#018x}", sr, raw);
-                        self.program
-                            .emit_void(Op::Unimplemented { opcode: Opcode::S2R, raw });
-                        self.unimplemented_count += 1;
-                        return false;
+                        log::debug!("S2R sr={} → 0 (approx) raw={:#018x}", sr, raw);
+                        self.write_reg(dest, Op::Mov(Value::ImmU32(0)), pred);
                     }
                 }
             }

@@ -441,13 +441,44 @@ impl Threads {
         count
     }
 
+    pub fn effective_priority(&self, handle: u32) -> i32 {
+        let base = self
+            .threads
+            .get(&handle)
+            .map(|t| t.priority)
+            .unwrap_or(i32::MAX);
+        let inherited = self
+            .threads
+            .values()
+            .filter_map(|t| match &t.state {
+                ThreadState::WaitingMutex { owner_handle, .. } if *owner_handle == handle => {
+                    Some(t.priority)
+                }
+                _ => None,
+            })
+            .min();
+        match inherited {
+            Some(p) => base.min(p),
+            None => base,
+        }
+    }
+
     pub fn pick_next(&mut self) -> Option<u32> {
         let core = current_core() as i32;
-        let pos = self.ready.iter().position(|h| {
-            self.threads
-                .get(h)
-                .map_or(false, |t| t.core == core || t.core < 0)
-        })?;
+        let pos = self
+            .ready
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| {
+                self.threads
+                    .get(*h)
+                    .map_or(false, |t| t.core == core || t.core < 0)
+            })
+            .min_by_key(|(idx, h)| {
+                let prio = self.effective_priority(**h);
+                (prio, *idx)
+            })
+            .map(|(idx, _)| idx)?;
         let handle = self.ready.remove(pos)?;
         if let Some(t) = self.threads.get_mut(&handle) {
             if t.core < 0 {
