@@ -299,28 +299,64 @@ fn sample_dominant(img: &egui::ColorImage) -> egui::Color32 {
     if pixels.is_empty() {
         return egui::Color32::from_rgb(0x2F, 0xB4, 0xEF);
     }
-    let stride = (pixels.len() / 128).max(1);
-    let mut rs = 0u64;
-    let mut gs = 0u64;
-    let mut bs = 0u64;
-    let mut n = 0u64;
+    // most-populated hue: bin colourful pixels into hue buckets weighted by
+    // vividness, pick the fullest bucket, then average that bucket's colour
+    const NB: usize = 24;
+    let stride = (pixels.len() / 4096).max(1);
+    let mut weight = [0.0f32; NB];
+    let mut sr = [0u64; NB];
+    let mut sg = [0u64; NB];
+    let mut sb = [0u64; NB];
+    let mut cnt = [0u64; NB];
+    let hue_of = |r: f32, g: f32, b: f32, mx: f32, chroma: f32| -> f32 {
+        if chroma < 0.001 {
+            0.0
+        } else if mx == r {
+            ((g - b) / chroma).rem_euclid(6.0) / 6.0
+        } else if mx == g {
+            ((b - r) / chroma + 2.0) / 6.0
+        } else {
+            ((r - g) / chroma + 4.0) / 6.0
+        }
+    };
     for px in pixels.iter().step_by(stride) {
-        let mx = px.r().max(px.g()).max(px.b());
-        let mn = px.r().min(px.g()).min(px.b());
-        if mx < 40 || mn > 210 || (mx - mn) < 20 {
+        if px.a() < 40 {
             continue;
         }
-        rs += px.r() as u64;
-        gs += px.g() as u64;
-        bs += px.b() as u64;
-        n += 1;
+        let (rf, gf, bf) = (px.r() as f32 / 255.0, px.g() as f32 / 255.0, px.b() as f32 / 255.0);
+        let mx = rf.max(gf).max(bf);
+        let mn = rf.min(gf).min(bf);
+        let chroma = mx - mn;
+        if mx < 0.16 || chroma < 0.14 {
+            continue;
+        }
+        let sat = chroma / (mx + 0.001);
+        let bucket = ((hue_of(rf, gf, bf, mx, chroma) * NB as f32) as usize) % NB;
+        weight[bucket] += sat * mx;
+        sr[bucket] += px.r() as u64;
+        sg[bucket] += px.g() as u64;
+        sb[bucket] += px.b() as u64;
+        cnt[bucket] += 1;
     }
-    if n == 0 {
+    let best = (0..NB)
+        .max_by(|&i, &j| weight[i].partial_cmp(&weight[j]).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(0);
+    if weight[best] <= 0.0 {
         return egui::Color32::from_rgb(0x2F, 0xB4, 0xEF);
     }
-    let r = (rs / n) as f32 / 255.0;
-    let g = (gs / n) as f32 / 255.0;
-    let b = (bs / n) as f32 / 255.0;
+    // average the dominant bucket + its two neighbours for a stable colour
+    let (mut rr, mut gg, mut bb, mut nn) = (0u64, 0u64, 0u64, 0u64);
+    for d in [NB - 1, 0, 1] {
+        let bk = (best + d) % NB;
+        rr += sr[bk];
+        gg += sg[bk];
+        bb += sb[bk];
+        nn += cnt[bk];
+    }
+    let nn = nn.max(1);
+    let r = (rr / nn) as f32 / 255.0;
+    let g = (gg / nn) as f32 / 255.0;
+    let b = (bb / nn) as f32 / 255.0;
     let mx = r.max(g).max(b);
     let mn = r.min(g).min(b);
     let chroma = mx - mn;

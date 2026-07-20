@@ -23,6 +23,7 @@ static SHOP_MUSIC: [&[u8]; 2] = [
     include_bytes!("assets/shop_bgm_01.mp3"),
     include_bytes!("assets/shop_bgm_02.mp3"),
 ];
+static SETTINGS_MUSIC: &[u8] = include_bytes!("assets/settings_bgm_01.mp3");
 
 // f32 bits: target music gain (post-volume) and lowpass amount (0=clean, 1=muffled)
 static MUSIC_TARGET: AtomicU32 = AtomicU32::new(0);
@@ -59,6 +60,7 @@ pub fn set_carousel_track(sel: u8) {
 pub enum MusicMode {
     Carousel,
     Shop,
+    Settings,
 }
 
 pub fn set_music(mode: MusicMode, target_gain: f32, lowpass: f32) {
@@ -149,27 +151,6 @@ fn decode_mp3_stereo(bytes: &'static [u8]) -> Option<MusicTrack> {
         samples,
         sample_rate,
     })
-}
-
-fn decode_music_variant(
-    variants: &[&'static [u8]],
-    preferred: usize,
-    mode: &str,
-) -> (MusicTrack, usize) {
-    if variants.is_empty() {
-        log::warn!("No {mode} music variants are embedded");
-        return (MusicTrack::silent(), 0);
-    }
-    let preferred = preferred % variants.len();
-    for offset in 0..variants.len() {
-        let variant = (preferred + offset) % variants.len();
-        if let Some(track) = decode_mp3_stereo(variants[variant]) {
-            return (track, variant);
-        }
-        log::warn!("Failed to decode {mode} music variant {}", variant + 1);
-    }
-    log::warn!("All {mode} music variants failed to decode");
-    (MusicTrack::silent(), preferred)
 }
 
 fn random_music_variants() -> (usize, usize) {
@@ -360,8 +341,20 @@ fn build() -> Option<Engine> {
             MusicTrack::silent()
         }))
         .collect();
-    let (shop_music, shop_variant) = decode_music_variant(&SHOP_MUSIC, shop_variant, "shop");
+    let shop_tracks: Vec<MusicTrack> = SHOP_MUSIC
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| decode_mp3_stereo(bytes).unwrap_or_else(|| {
+            log::warn!("Failed to decode shop music variant {}", i + 1);
+            MusicTrack::silent()
+        }))
+        .collect();
+    let settings_track = decode_mp3_stereo(SETTINGS_MUSIC).unwrap_or_else(|| {
+        log::warn!("Failed to decode settings music");
+        MusicTrack::silent()
+    });
     let mut carousel_idx = carousel_start % carousel_tracks.len().max(1);
+    let mut shop_idx = shop_variant % shop_tracks.len().max(1);
     log::info!(
         "UI music: {} carousel tracks decoded, shuffle start {}, shop variant {}",
         carousel_tracks.len(),
@@ -394,8 +387,9 @@ fn build() -> Option<Engine> {
     let active_cb = active.clone();
 
     let mut cur_gain = 0.0f32;
-    let mut music_pos = [0.0f64; 2];
+    let mut music_pos = [0.0f64; 3];
     let mut shop_mix = 0.0f32;
+    let mut settings_mix = 0.0f32;
     let mut lp_y = [0.0f32; 2];
 
     let err_cb = |e| log::warn!("ui_audio stream error: {}", e);
@@ -407,11 +401,9 @@ fn build() -> Option<Engine> {
                 let target = f32::from_bits(MUSIC_TARGET.load(Ordering::Relaxed));
                 let lp = f32::from_bits(MUSIC_LOWPASS.load(Ordering::Relaxed));
                 let alpha = 1.0 - lp * 0.9;
-                let shop_target = if MUSIC_MODE.load(Ordering::Relaxed) == MusicMode::Shop as u8 {
-                    1.0
-                } else {
-                    0.0
-                };
+                let mode = MUSIC_MODE.load(Ordering::Relaxed);
+                let shop_target = if mode == MusicMode::Shop as u8 { 1.0 } else { 0.0 };
+                let settings_target = if mode == MusicMode::Settings as u8 { 1.0 } else { 0.0 };
                 let mut act = active_cb.lock().ok();
                 for f in 0..frames {
                     let mut sfx = 0.0f32;
@@ -433,8 +425,14 @@ fn build() -> Option<Engine> {
                     } else if shop_mix > shop_target {
                         shop_mix = (shop_mix - mode_step).max(shop_target);
                     }
+                    if settings_mix < settings_target {
+                        settings_mix = (settings_mix + mode_step).min(settings_target);
+                    } else if settings_mix > settings_target {
+                        settings_mix = (settings_mix - mode_step).max(settings_target);
+                    }
+                    let carousel_mix = (1.0 - shop_mix - settings_mix).max(0.0);
                     let m = if target > 0.0001 || cur_gain > 0.0001 {
-                        let carousel = if shop_mix < 1.0 && !carousel_tracks.is_empty() {
+                        let carousel = if carousel_mix > 0.0 && !carousel_tracks.is_empty() {
                             let sel = CAROUSEL_SELECTION.load(Ordering::Relaxed);
                             if (sel as usize) < carousel_tracks.len()
                                 && carousel_idx != sel as usize
@@ -457,15 +455,26 @@ fn build() -> Option<Engine> {
                         } else {
                             [0.0; 2]
                         };
-                        let shop = if shop_mix > 0.0 {
+                        let shop = if shop_mix > 0.0 && !shop_tracks.is_empty() {
                             let mut wrapped = false;
-                            next_music_sample(&shop_music, &mut music_pos[1], dev_sr as f64, &mut wrapped)
+                            let s = next_music_sample(&shop_tracks[shop_idx], &mut music_pos[1], dev_sr as f64, &mut wrapped);
+                            if wrapped {
+                                shop_idx = (shop_idx + 1) % shop_tracks.len();
+                                music_pos[1] = 0.0;
+                            }
+                            s
+                        } else {
+                            [0.0; 2]
+                        };
+                        let settings = if settings_mix > 0.0 {
+                            let mut wrapped = false;
+                            next_music_sample(&settings_track, &mut music_pos[2], dev_sr as f64, &mut wrapped)
                         } else {
                             [0.0; 2]
                         };
                         [
-                            carousel[0] * (1.0 - shop_mix) + shop[0] * shop_mix,
-                            carousel[1] * (1.0 - shop_mix) + shop[1] * shop_mix,
+                            carousel[0] * carousel_mix + shop[0] * shop_mix + settings[0] * settings_mix,
+                            carousel[1] * carousel_mix + shop[1] * shop_mix + settings[1] * settings_mix,
                         ]
                     } else {
                         [0.0; 2]

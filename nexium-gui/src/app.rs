@@ -1550,7 +1550,7 @@ impl HorizonApp {
         let mut p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("carousel_settings")));
         p.set_opacity(ease);
         // themed backdrop + scrim (matches Profile)
-        crate::carousel::draw_backdrop(&p, full, accent, t, backdrop_theme, 1.0, if lightish { 1.0 } else { 0.0 });
+        crate::carousel::draw_backdrop(&p, full, accent, t, backdrop_theme, 1.0, if lightish { 1.0 } else { 0.0 }, None);
         let scrim = if lightish {
             egui::Color32::from_rgba_unmultiplied(0xFA, 0xFA, 0xFC, 235)
         } else {
@@ -1745,7 +1745,9 @@ impl HorizonApp {
                     }
                     clip.rect_filled(rect, egui::Rounding::same(9.0), panel);
                     if let Some(tex) = self.library.texture(ctx, gi) {
-                        let g = (66.0 + 189.0 * fade) as u8;
+                        // Light Mode dims unselected tiles to grey, not near-black
+                        let base_g = if lightish { 155.0 } else { 66.0 };
+                        let g = (base_g + (255.0 - base_g) * fade) as u8;
                         crate::carousel::draw_rounded_image(&clip, tex.id(), rect, 9.0, egui::Color32::from_rgb(g, g, g));
                     } else {
                         let g = (110.0 + 90.0 * fade) as u8;
@@ -2335,6 +2337,9 @@ impl HorizonApp {
             selected: 1,
             kind: ConfirmKind::UpdateInstall,
         });
+        // swallow the still-held A that opened this dialog so it doesn't
+        // immediately confirm the download on the same press (controller bug)
+        self.modal_hold = true;
     }
 
     fn update_preferences(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -2369,7 +2374,7 @@ impl HorizonApp {
 
         let mut p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("preferences")));
         p.set_opacity(ease);
-        crate::carousel::draw_backdrop(&p, full, accent, t, backdrop_theme, 1.0, if lightish { 1.0 } else { 0.0 });
+        crate::carousel::draw_backdrop(&p, full, accent, t, backdrop_theme, 1.0, if lightish { 1.0 } else { 0.0 }, None);
         let scrim = if lightish {
             egui::Color32::from_rgba_unmultiplied(0xFA, 0xFA, 0xFC, 235)
         } else {
@@ -3241,16 +3246,19 @@ impl HorizonApp {
             if let Some(bi) = clicked_bind { start_rebind(self, bi); }
             else if self.prefs_focus && self.prefs_col == 0 && self.prefs_row >= 1 && !rebinding_active && !self.prefs_dropdown_open && a_edge { start_rebind(self, self.prefs_row - 1); }
         } else if self.settings_tab == SettingsTab::Audio {
-            let n = 5usize;
+            if self.audio_device_cache.is_none() {
+                self.audio_device_cache = Some(list_output_devices());
+            }
+            let devices: Vec<String> = self.audio_device_cache.clone().unwrap_or_default();
+            let n = 7usize;
             if !self.prefs_focus { self.prefs_row = 0; }
             self.prefs_row = self.prefs_row.min(n - 1);
             if self.prefs_focus && !block {
                 if nu && self.prefs_row > 0 { self.prefs_row -= 1; crate::ui_audio::play_move(); }
                 if nd && self.prefs_row + 1 < n { self.prefs_row += 1; crate::ui_audio::play_move(); }
             }
-            let labels = ["Master Volume", "Music Volume", "Sound Effects", "Mute Music", "Menu Music"];
-            let vals = [self.app_settings.audio_volume, self.app_settings.music_volume, self.app_settings.sfx_volume];
-            let row_h = 66.0 * s;
+            let labels = ["Output Device", "Master Volume", "Music Volume", "SFX Volume", "Mute Music", "Mute SFX", "Menu Music"];
+            let row_h = 58.0 * s;
             let mut y = content.min.y + 6.0 * s;
             let mut drag_set: Option<(usize, f32)> = None;
             for i in 0..n {
@@ -3264,14 +3272,19 @@ impl HorizonApp {
                     p.rect_filled(r, egui::Rounding::same(12.0 * s), egui::Color32::from_rgba_unmultiplied(panel.r(), panel.g(), panel.b(), (ease * 90.0) as u8));
                     p.rect_stroke(r, egui::Rounding::same(12.0 * s), egui::Stroke::new(1.0_f32, border));
                 }
-                if i == 4 {
-                    p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y - 10.0 * s)), egui::Align2::LEFT_CENTER, labels[i], egui::FontId::proportional(18.0 * s * sf), text);
-                    p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y + 12.0 * s)), egui::Align2::LEFT_CENTER, "Either Select All, or specific tracks for your Main Carousel Music Themes.", egui::FontId::proportional(12.0 * s * sf), muted);
-                } else {
+                let desc = match i {
+                    0 => "Output device for all audio. Applies on next boot.",
+                    6 => "Either Select All, or specific tracks for your Main Carousel Music Themes.",
+                    _ => "",
+                };
+                if desc.is_empty() {
                     p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y)), egui::Align2::LEFT_CENTER, labels[i], egui::FontId::proportional(18.0 * s * sf), text);
+                } else {
+                    p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y - 10.0 * s)), egui::Align2::LEFT_CENTER, labels[i], egui::FontId::proportional(18.0 * s * sf), text);
+                    p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y + 12.0 * s)), egui::Align2::LEFT_CENTER, desc, egui::FontId::proportional(12.0 * s * sf), muted);
                 }
-                if i < 3 {
-                    let val = vals[i];
+                if (1..=3).contains(&i) {
+                    let val = match i { 1 => self.app_settings.audio_volume, 2 => self.app_settings.music_volume, _ => self.app_settings.sfx_volume };
                     let tl = base.min.x + 230.0 * s;
                     let tr = base.max.x - 96.0 * s;
                     let ty = base.center().y;
@@ -3298,29 +3311,29 @@ impl HorizonApp {
                 } else {
                     let lx = base.max.x - 190.0 * s;
                     let rx = base.max.x - 22.0 * s;
-                    let mv: std::borrow::Cow<str> = if i == 4 {
-                        crate::ui_audio::carousel_track_label(self.app_settings.menu_music_track).into()
-                    } else if self.app_settings.music_muted { "On".into() } else { "Off".into() };
-                    p.text(sp(egui::pos2((lx + rx) * 0.5, base.center().y)), egui::Align2::CENTER_CENTER, mv.as_ref(), egui::FontId::proportional(16.0 * s * sf), if selrow { accent } else { muted });
+                    let mv: std::borrow::Cow<str> = match i {
+                        0 => shorten_device(&self.app_settings.audio_output_device).into(),
+                        4 => if self.app_settings.music_muted { "On".into() } else { "Off".into() },
+                        5 => if self.app_settings.sfx_muted { "On".into() } else { "Off".into() },
+                        _ => crate::ui_audio::carousel_track_label(self.app_settings.menu_music_track).into(),
+                    };
+                    let mvsize = if i == 0 { 13.5 } else { 16.0 };
+                    p.text(sp(egui::pos2((lx + rx) * 0.5, base.center().y)), egui::Align2::CENTER_CENTER, mv.as_ref(), egui::FontId::proportional(mvsize * s * sf), if selrow { accent } else { muted });
                     let la = egui::Rect::from_center_size(egui::pos2(lx, base.center().y), egui::Vec2::splat(34.0 * s));
                     let ra = egui::Rect::from_center_size(egui::pos2(rx, base.center().y), egui::Vec2::splat(34.0 * s));
                     p.text(sp(la.center()), egui::Align2::CENTER_CENTER, "\u{2039}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
                     p.text(sp(ra.center()), egui::Align2::CENTER_CENTER, "\u{203A}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
                     if !block && ui.rect_contains_pointer(r) {
+                        // allocate the row first so the arrows sit on top of it,
+                        // otherwise the row swallows arrow clicks (left never fired)
+                        let rowc = ui.allocate_rect(r, egui::Sense::click()).clicked();
                         let lc = ui.allocate_rect(sr(la), egui::Sense::click()).clicked();
                         let rc = ui.allocate_rect(sr(ra), egui::Sense::click()).clicked();
-                        let rowc = ui.allocate_rect(r, egui::Sense::click()).clicked();
                         if lc || rc || rowc {
                             self.prefs_focus = true;
                             self.prefs_row = i;
                             let dir = if lc { -1 } else { 1 };
-                            if i == 4 {
-                                self.app_settings.menu_music_track = cycle_menu_music(self.app_settings.menu_music_track, dir);
-                                crate::ui_audio::set_carousel_track(self.app_settings.menu_music_track);
-                            } else {
-                                self.app_settings.music_muted = !self.app_settings.music_muted;
-                            }
-                            let _ = self.app_settings.save();
+                            apply_audio_cycle(&mut self.app_settings, i, dir, &devices);
                             crate::ui_audio::play_move();
                         }
                     }
@@ -3333,27 +3346,22 @@ impl HorizonApp {
             }
             if let Some((ri, frac)) = drag_set {
                 match ri {
-                    0 => self.app_settings.audio_volume = frac,
-                    1 => self.app_settings.music_volume = frac,
-                    2 => self.app_settings.sfx_volume = frac,
+                    1 => self.app_settings.audio_volume = frac,
+                    2 => self.app_settings.music_volume = frac,
+                    3 => self.app_settings.sfx_volume = frac,
                     _ => {}
                 }
-                crate::ui_audio::set_sfx_volume(self.app_settings.sfx_volume);
+                crate::ui_audio::set_sfx_volume(if self.app_settings.sfx_muted { 0.0 } else { self.app_settings.sfx_volume });
                 let _ = self.app_settings.save();
             } else if key_dir != 0 {
                 let step = 0.05 * key_dir as f32;
                 match self.prefs_row {
-                    0 => self.app_settings.audio_volume = (self.app_settings.audio_volume + step).clamp(0.0, 1.0),
-                    1 => self.app_settings.music_volume = (self.app_settings.music_volume + step).clamp(0.0, 1.0),
-                    2 => self.app_settings.sfx_volume = (self.app_settings.sfx_volume + step).clamp(0.0, 1.0),
-                    3 => self.app_settings.music_muted = !self.app_settings.music_muted,
-                    4 => {
-                        self.app_settings.menu_music_track = cycle_menu_music(self.app_settings.menu_music_track, key_dir);
-                        crate::ui_audio::set_carousel_track(self.app_settings.menu_music_track);
-                    }
-                    _ => {}
+                    1 => self.app_settings.audio_volume = (self.app_settings.audio_volume + step).clamp(0.0, 1.0),
+                    2 => self.app_settings.music_volume = (self.app_settings.music_volume + step).clamp(0.0, 1.0),
+                    3 => self.app_settings.sfx_volume = (self.app_settings.sfx_volume + step).clamp(0.0, 1.0),
+                    r => apply_audio_cycle(&mut self.app_settings, r, key_dir, &devices),
                 }
-                crate::ui_audio::set_sfx_volume(self.app_settings.sfx_volume);
+                crate::ui_audio::set_sfx_volume(if self.app_settings.sfx_muted { 0.0 } else { self.app_settings.sfx_volume });
                 let _ = self.app_settings.save();
                 crate::ui_audio::play_move();
             }
@@ -4211,6 +4219,49 @@ fn draw_dpad(p: &egui::Painter, c: egui::Pos2, r: f32, col: Color32) {
     p.rect_filled(egui::Rect::from_center_size(c, egui::Vec2::new(thick, r * 2.0)), round, col);
 }
 
+fn shorten_device(dev: &Option<String>) -> String {
+    match dev {
+        None => "System default".to_string(),
+        Some(name) => {
+            let max = 22;
+            if name.chars().count() > max {
+                let s: String = name.chars().take(max - 1).collect();
+                format!("{}…", s)
+            } else {
+                name.clone()
+            }
+        }
+    }
+}
+
+fn cycle_audio_device(current: &Option<String>, devices: &[String], dir: i32) -> Option<String> {
+    // ordered list: [System default, dev0, dev1, ...]
+    let cur = match current {
+        None => 0usize,
+        Some(name) => devices.iter().position(|d| d == name).map(|p| p + 1).unwrap_or(0),
+    };
+    let len = (devices.len() + 1) as i32;
+    let next = (cur as i32 + dir).rem_euclid(len) as usize;
+    if next == 0 { None } else { devices.get(next - 1).cloned() }
+}
+
+fn apply_audio_cycle(cfg: &mut AppSettings, row: usize, dir: i32, devices: &[String]) {
+    match row {
+        0 => cfg.audio_output_device = cycle_audio_device(&cfg.audio_output_device, devices, dir),
+        4 => cfg.music_muted = !cfg.music_muted,
+        5 => {
+            cfg.sfx_muted = !cfg.sfx_muted;
+            crate::ui_audio::set_sfx_volume(if cfg.sfx_muted { 0.0 } else { cfg.sfx_volume });
+        }
+        6 => {
+            cfg.menu_music_track = cycle_menu_music(cfg.menu_music_track, dir);
+            crate::ui_audio::set_carousel_track(cfg.menu_music_track);
+        }
+        _ => {}
+    }
+    let _ = cfg.save();
+}
+
 fn cycle_menu_music(current: u8, dir: i32) -> u8 {
     let order: [u8; crate::ui_audio::CAROUSEL_TRACK_COUNT + 1] = {
         let mut o = [crate::ui_audio::CAROUSEL_ALL; crate::ui_audio::CAROUSEL_TRACK_COUNT + 1];
@@ -4843,6 +4894,8 @@ impl eframe::App for HorizonApp {
             let shop_music = self.shop.visible();
             let music_mode = if shop_music {
                 crate::ui_audio::MusicMode::Shop
+            } else if self.carousel_settings_open {
+                crate::ui_audio::MusicMode::Settings
             } else {
                 crate::ui_audio::MusicMode::Carousel
             };
@@ -4869,7 +4922,7 @@ impl eframe::App for HorizonApp {
                 target *= 0.34;
                 lowpass = 0.75;
             }
-            if self.modal_active() && !shop_music {
+            if self.modal_active() && !shop_music && !self.carousel_settings_open {
                 lowpass = lowpass.max(0.6);
             }
             crate::ui_audio::set_music(music_mode, target, lowpass);
