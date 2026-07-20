@@ -525,7 +525,13 @@ impl HorizonApp {
             if let Ok(handle) = EmulationHandle::new(&nro_path, backend, Some(cc.egui_ctx.clone()))
             {
                 app.emulation_handle = Some(handle);
-                app.playing_path = Some(std::path::PathBuf::from(&nro_path));
+                let launched = std::path::PathBuf::from(&nro_path);
+                let game_index = app.library.index_of_path(&launched).unwrap_or(0);
+                app.carousel.boot_stage = crate::carousel::BootStage::AwaitingFrame {
+                    game_index,
+                    start_time: 0.0,
+                };
+                app.playing_path = Some(launched);
                 log::info!("Auto-loaded NRO: {} (CPU: {})", nro_path, backend.label());
             } else {
                 log::error!("Failed to load NRO: {}", nro_path);
@@ -4205,7 +4211,6 @@ fn draw_dpad(p: &egui::Painter, c: egui::Pos2, r: f32, col: Color32) {
     p.rect_filled(egui::Rect::from_center_size(c, egui::Vec2::new(thick, r * 2.0)), round, col);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cycle_menu_music(current: u8, dir: i32) -> u8 {
     let order: [u8; crate::ui_audio::CAROUSEL_TRACK_COUNT + 1] = {
         let mut o = [crate::ui_audio::CAROUSEL_ALL; crate::ui_audio::CAROUSEL_TRACK_COUNT + 1];
@@ -4220,6 +4225,7 @@ fn cycle_menu_music(current: u8, dir: i32) -> u8 {
     order[next as usize]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pref_value_rows(
     p: &egui::Painter,
     ui: &mut egui::Ui,
