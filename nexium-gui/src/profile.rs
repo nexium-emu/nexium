@@ -231,7 +231,7 @@ pub fn profile_view(
     ));
     backdrop_painter.set_opacity(backdrop_opacity);
 
-    crate::carousel::draw_backdrop(&backdrop_painter, full, ambient, t, backdrop_theme, 1.0, state.theme_t);
+    crate::carousel::draw_backdrop(&backdrop_painter, full, ambient, t, backdrop_theme, 1.0, state.theme_t, None);
 
     let scrim = if state.theme_t < 0.5 {
         Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, (140.0 * (1.0 - state.theme_t * 2.0)) as u8)
@@ -359,13 +359,8 @@ pub fn profile_view(
         tab_right = false;
     }
 
-    // X (or M) toggles mute on the volume rows
     let x_down = last_input.connected && last_input.is(crate::controller_config::SwitchButton::X);
-    let mut mute_toggle = (x_down && !state.x_held) || ui.input(|i| i.key_pressed(egui::Key::M));
     state.x_held = x_down;
-    if !active || editing {
-        mute_toggle = false;
-    }
 
     const TAB_ORDER: [ProfileTab; 4] = [
         ProfileTab::Profile,
@@ -374,7 +369,7 @@ pub fn profile_view(
         ProfileTab::System,
     ];
     let tab_idx = TAB_ORDER.iter().position(|x| *x == state.tab).unwrap_or(0);
-    const N_SETTINGS: usize = 6;
+    const N_SETTINGS: usize = 4;
     let launch_enter = enter && state.focus_content;
 
     if state.tab == ProfileTab::System && update_clickable && enter {
@@ -457,29 +452,7 @@ pub fn profile_view(
         } else if state.row_selected == 2 && (enter || leave) {
             action = ProfileAction::SetLightMode(!light_mode);
             crate::ui_audio::play(crate::ui_audio::Sfx::Select);
-        } else if state.row_selected == 3 {
-            if mute_toggle {
-                action = ProfileAction::SetMuteMusic(!music_muted);
-                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
-            } else if enter {
-                action = ProfileAction::SetMusicVolume((music_volume + 0.05).min(1.0));
-                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
-            } else if leave {
-                action = ProfileAction::SetMusicVolume((music_volume - 0.05).max(0.0));
-                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
-            }
-        } else if state.row_selected == 4 {
-            if mute_toggle {
-                action = ProfileAction::SetMuteSfx(!sfx_muted);
-                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
-            } else if enter {
-                action = ProfileAction::SetSfxVolume((sfx_volume + 0.05).min(1.0));
-                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
-            } else if leave {
-                action = ProfileAction::SetSfxVolume((sfx_volume - 0.05).max(0.0));
-                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
-            }
-        } else if state.row_selected == 5 && (enter || leave) {
+        } else if state.row_selected == 3 && (enter || leave) {
             action = ProfileAction::SetEuDates(!eu_dates);
             crate::ui_audio::play(crate::ui_audio::Sfx::Select);
         }
@@ -772,11 +745,11 @@ fn settings_page(
     backdrop_theme: crate::app_settings::BackdropTheme,
     dockbar_theme: crate::app_settings::DockbarTheme,
     light_mode: bool,
-    music_volume: f32,
-    sfx_volume: f32,
+    _music_volume: f32,
+    _sfx_volume: f32,
     eu_dates: bool,
-    music_muted: bool,
-    sfx_muted: bool,
+    _music_muted: bool,
+    _sfx_muted: bool,
     action: &mut ProfileAction,
     scale_factor: f32,
     scale_pos: &impl Fn(egui::Pos2) -> egui::Pos2,
@@ -786,7 +759,7 @@ fn settings_page(
     let row_h = 68.0 * s;
     let row_gap = 12.0 * s;
     
-    let rows: [(&str, &str, String); 6] = [
+    let rows: [(&str, &str, String); 4] = [
         (
             "Backdrop Theme",
             "Background style behind the menus",
@@ -802,8 +775,6 @@ fn settings_page(
             "Light or dark styling of the carousel",
             if light_mode { "Light".to_string() } else { "Dark".to_string() },
         ),
-        ("Menu Music", "Background music volume in the carousel", "".to_string()),
-        ("SFX Volume", "Sound effects volume for UI interactions", "".to_string()),
         (
             "Time Preference",
             "Either 12 hour clock or 24 hour Military Time",
@@ -837,7 +808,7 @@ fn settings_page(
                     *action = ProfileAction::SetLightMode(!light_mode);
                     crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                 }
-                5 => {
+                3 => {
                     *action = ProfileAction::SetEuDates(!eu_dates);
                     crate::ui_audio::play(crate::ui_audio::Sfx::Select);
                 }
@@ -867,135 +838,9 @@ fn settings_page(
 
         let arrow_col = if focused { accent } else { pal.muted };
 
-        if idx == 3 || idx == 4 {
-            let val = if idx == 3 { music_volume } else { sfx_volume };
-            // mute checkbox to the left of the slider arrows
-            let is_muted = if idx == 3 { music_muted } else { sfx_muted };
-            let cb = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 340.0 * s, row.center().y), Vec2::splat(24.0 * s)));
-            painter.rect_filled(cb, Rounding::same(5.0 * s * scale_factor), if is_muted { accent } else { pal.input_bg });
-            painter.rect_stroke(cb, Rounding::same(5.0 * s * scale_factor), Stroke::new(1.5 * scale_factor, pal.border));
-            if is_muted {
-                let c = cb.center();
-                let z = cb.width() * 0.3;
-                painter.add(egui::Shape::line(vec![c + Vec2::new(-z, 0.0), c + Vec2::new(-z * 0.2, z * 0.7), c + Vec2::new(z, -z * 0.8)], Stroke::new(2.2 * scale_factor, Color32::WHITE)));
-            }
-            painter.text(scale_pos(egui::pos2(row.max.x - 340.0 * s, row.center().y - 20.0 * s)), egui::Align2::CENTER_CENTER, "Mute", FontId::proportional(11.0 * s * scale_factor), pal.muted);
-            if ui.allocate_rect(cb, Sense::click()).clicked() {
-                *action = if idx == 3 { ProfileAction::SetMuteMusic(!is_muted) } else { ProfileAction::SetMuteSfx(!is_muted) };
-                state.focus_content = true;
-                state.row_selected = idx;
-                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
-            }
-            
-            // Slider layout dimensions
-            let slider_w = 160.0 * s;
-            let slider_h = 6.0 * s;
-            let track_rect = egui::Rect::from_min_size(
-                egui::pos2(row.max.x - 280.0 * s, row.center().y - slider_h * 0.5),
-                Vec2::new(slider_w, slider_h),
-            );
-            let scaled_track = scale_rect(track_rect);
-            
-            // Slider interaction (drag & click)
-            let slider_resp = ui.allocate_rect(scaled_track.expand(8.0 * scale_factor), Sense::click_and_drag());
-            let mut new_val = val;
-            if slider_resp.clicked() || slider_resp.dragged() {
-                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                    let pct = ((pos.x - scaled_track.min.x) / scaled_track.width()).clamp(0.0, 1.0);
-                    new_val = pct;
-                }
-            }
-            if new_val != val {
-                if idx == 3 {
-                    *action = ProfileAction::SetMusicVolume(new_val);
-                } else {
-                    *action = ProfileAction::SetSfxVolume(new_val);
-                }
-            }
-
-            // Arrow bounds
-            let left_arrow_rect = scale_rect(egui::Rect::from_center_size(
-                egui::pos2(row.max.x - 300.0 * s, row.center().y),
-                Vec2::splat(30.0 * s),
-            ));
-            let right_arrow_rect = scale_rect(egui::Rect::from_center_size(
-                egui::pos2(row.max.x - 30.0 * s, row.center().y),
-                Vec2::splat(30.0 * s),
-            ));
-
-            let la_resp = ui.allocate_rect(left_arrow_rect, Sense::click());
-            let ra_resp = ui.allocate_rect(right_arrow_rect, Sense::click());
-
-            if la_resp.clicked() {
-                let step = (val - 0.05).max(0.0);
-                if idx == 3 {
-                    *action = ProfileAction::SetMusicVolume(step);
-                } else {
-                    *action = ProfileAction::SetSfxVolume(step);
-                }
-                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
-            }
-            if ra_resp.clicked() {
-                let step = (val + 0.05).min(1.0);
-                if idx == 3 {
-                    *action = ProfileAction::SetMusicVolume(step);
-                } else {
-                    *action = ProfileAction::SetSfxVolume(step);
-                }
-                crate::ui_audio::play(crate::ui_audio::Sfx::Select);
-            }
-
-            let arrow_col_l = if focused || la_resp.hovered() { accent } else { pal.muted };
-            let arrow_col_r = if focused || ra_resp.hovered() { accent } else { pal.muted };
-
-            // Draw track background
-            let rr = Rounding::same(slider_h * 0.5 * scale_factor);
-            painter.rect_filled(scaled_track, rr, pal.input_bg);
-            
-            // Draw filled track
-            let mut fill = scaled_track;
-            fill.max.x = scaled_track.min.x + scaled_track.width() * val.clamp(0.0, 1.0);
-            painter.rect_filled(fill, rr, accent);
-
-            // Draw slider handle circle
-            let handle_x = scaled_track.min.x + scaled_track.width() * val.clamp(0.0, 1.0);
-            let handle_center = egui::pos2(handle_x, scaled_track.center().y);
-            let handle_r = 8.0 * s * scale_factor;
-            painter.circle_filled(handle_center, handle_r, Color32::WHITE);
-            painter.circle_stroke(handle_center, handle_r, Stroke::new(1.5 * scale_factor, accent));
-
-            // Draw percentage label
-            let val_label = if val <= 0.001 {
-                "Off".to_string()
-            } else {
-                format!("{}%", (val * 100.0).round() as i32)
-            };
-            painter.text(
-                scale_pos(egui::pos2(row.max.x - 70.0 * s, row.center().y)),
-                egui::Align2::CENTER_CENTER,
-                val_label,
-                FontId::proportional(18.0 * s * scale_factor),
-                pal.text,
-            );
-
-            // Draw arrows
-            painter.text(
-                scale_pos(egui::pos2(row.max.x - 300.0 * s, row.center().y)),
-                egui::Align2::CENTER_CENTER,
-                "‹",
-                FontId::proportional(26.0 * s * scale_factor),
-                arrow_col_l,
-            );
-            painter.text(
-                scale_pos(egui::pos2(row.max.x - 30.0 * s, row.center().y)),
-                egui::Align2::CENTER_CENTER,
-                "›",
-                FontId::proportional(26.0 * s * scale_factor),
-                arrow_col_r,
-            );
-        } else {
+        {
             // clickable left/right arrows (mouse users): left = previous, right = next
-            let la = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 168.0 * s, row.center().y), Vec2::splat(34.0 * s)));
+            let la = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 270.0 * s, row.center().y), Vec2::splat(34.0 * s)));
             let ra = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 30.0 * s, row.center().y), Vec2::splat(34.0 * s)));
             let la_c = ui.allocate_rect(la, Sense::click()).clicked();
             let ra_c = ui.allocate_rect(ra, Sense::click()).clicked();
@@ -1005,7 +850,7 @@ fn settings_page(
                     0 => *action = ProfileAction::SetBackdropTheme(if fwd { backdrop_theme.next() } else { backdrop_theme.prev() }),
                     1 => *action = ProfileAction::SetDockbarTheme(if fwd { dockbar_theme.next() } else { dockbar_theme.prev() }),
                     2 => *action = ProfileAction::SetLightMode(!light_mode),
-                    5 => *action = ProfileAction::SetEuDates(!eu_dates),
+                    3 => *action = ProfileAction::SetEuDates(!eu_dates),
                     _ => {}
                 }
                 state.focus_content = true;
@@ -1013,14 +858,14 @@ fn settings_page(
                 crate::ui_audio::play(crate::ui_audio::Sfx::Select);
             }
             painter.text(
-                scale_pos(egui::pos2(row.max.x - 168.0 * s, row.center().y)),
+                scale_pos(egui::pos2(row.max.x - 270.0 * s, row.center().y)),
                 egui::Align2::CENTER_CENTER,
                 "‹",
                 FontId::proportional(26.0 * s * scale_factor),
                 arrow_col,
             );
             painter.text(
-                scale_pos(egui::pos2(row.max.x - 100.0 * s, row.center().y)),
+                scale_pos(egui::pos2(row.max.x - 150.0 * s, row.center().y)),
                 egui::Align2::CENTER_CENTER,
                 value.clone(),
                 FontId::proportional(18.0 * s * scale_factor),

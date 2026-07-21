@@ -63,6 +63,7 @@ pub struct CarouselState {
     pub nav_held_dir: u8,
     pub nav_held_since: f64,
     pub nav_cd: f64,
+    pub nx_logo: Option<egui::TextureHandle>,
 }
 
 impl CarouselState {
@@ -114,6 +115,7 @@ impl CarouselState {
             nav_held_dir: 0,
             nav_held_since: 0.0,
             nav_cd: 0.0,
+            nx_logo: None,
         }
     }
 }
@@ -522,6 +524,7 @@ pub fn draw_backdrop(
     theme: crate::app_settings::BackdropTheme,
     opacity: f32,
     light_t: f32,
+    logo: Option<egui::TextureId>,
 ) {
     use crate::app_settings::BackdropTheme;
     let (dark_base, light_base) = match theme {
@@ -536,7 +539,8 @@ pub fn draw_backdrop(
             draw_wave_background(painter, rect, color, t, cx, cy, opacity, base);
         }
         BackdropTheme::Gradient => draw_gradient_backdrop(painter, rect, color, opacity, base),
-        BackdropTheme::Space => draw_space_backdrop(painter, rect, color, t, opacity),
+        BackdropTheme::Space => draw_space_backdrop(painter, rect, color, t, opacity, logo),
+        BackdropTheme::CherryBlossom => draw_cherry_blossom_backdrop(painter, rect, color, t, opacity, logo, light_t),
         BackdropTheme::None => {
             if opacity <= 0.001 { return; }
             let a = (opacity * 255.0) as u8;
@@ -545,7 +549,7 @@ pub fn draw_backdrop(
     }
 }
 
-fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32, t: f32, opacity: f32) {
+fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32, t: f32, opacity: f32, logo: Option<egui::TextureId>) {
     if opacity <= 0.001 {
         return;
     }
@@ -727,6 +731,622 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
         }
         planet_clip.add(egui::Shape::mesh(mesh));
     }
+
+    // ---- easter egg: NeXium logo drifts across in a space helmet (~every 30s) ----
+    if let Some(logo) = logo {
+        let period = 80.0;
+        let ph = (t / period).fract();
+        let dur = 0.09;
+        if ph < dur {
+            let p = ph / dur;
+            let cyc = (t / period).floor().max(0.0) as u32;
+            let x = rect.min.x - w * 0.14 + p * (w * 1.28);
+            // route through the clear upper sky, above the game icons
+            let y = rect.min.y + (0.09 + hash(cyc.wrapping_mul(97).wrapping_add(3)) * 0.06) * h + (t * 1.4).sin() * h * 0.012;
+            let sz = w * 0.058;
+            let c = egui::pos2(x, y);
+            let uv01 = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            // ---- layered rocket flame trailing behind (flickering) ----
+            let flick = 0.75 + 0.25 * (t * 26.0).sin();
+            let base_x = c.x - sz * 0.72;
+            let base_y = c.y + sz * 0.14;
+            for (col, len_f, r0, al) in [
+                ((0xFF_u8, 0x46_u8, 0x1E_u8), 2.6_f32, 0.42_f32, 150.0_f32),
+                ((0xFF, 0x92, 0x2E), 2.0, 0.34, 195.0),
+                ((0xFF, 0xD8, 0x64), 1.4, 0.25, 225.0),
+                ((0xFF, 0xFB, 0xE8), 0.85, 0.17, 248.0),
+            ] {
+                let len = sz * len_f * flick;
+                for k in 0..7u32 {
+                    let kt = k as f32 / 6.0;
+                    let px = base_x - len * kt;
+                    let pr = (sz * r0 * (1.0 - kt * 0.85) * (0.82 + 0.18 * (t * 22.0 + k as f32 * 1.6).sin())).max(0.5);
+                    let py = base_y + (t * 24.0 + k as f32).sin() * sz * 0.05 * kt;
+                    painter.circle_filled(egui::pos2(px, py), pr, Color32::from_rgba_unmultiplied(col.0, col.1, col.2, a(al)));
+                }
+            }
+            // ---- astronaut helmet: glow, white shell, dark visor, logo face, glass + shine ----
+            painter.circle_filled(c, sz * 0.86, Color32::from_rgba_unmultiplied(0x7C, 0x9A, 0xD8, a(45.0)));
+            painter.circle_filled(c, sz * 0.78, Color32::from_rgba_unmultiplied(0xEE, 0xF1, 0xFA, a(255.0)));
+            painter.circle_filled(c, sz * 0.66, Color32::from_rgba_unmultiplied(0x27, 0x33, 0x54, a(255.0)));
+            painter.image(logo, egui::Rect::from_center_size(c, egui::Vec2::splat(sz * 0.74)), uv01, Color32::from_rgba_unmultiplied(255, 255, 255, a(255.0)));
+            painter.circle_filled(c, sz * 0.66, Color32::from_rgba_unmultiplied(0x86, 0xC0, 0xFF, a(42.0)));
+            painter.circle_stroke(c, sz * 0.66, Stroke::new(3.0_f32, Color32::from_rgba_unmultiplied(0xC0, 0xCE, 0xEC, a(230.0))));
+            let shine: Vec<egui::Pos2> = (0..12).map(|k| { let ang = -2.55 + k as f32 * 0.1; c + Vec2::new(ang.cos(), ang.sin()) * sz * 0.5 }).collect();
+            painter.add(egui::Shape::line(shine, Stroke::new(4.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, a(160.0)))));
+            painter.circle_filled(c + Vec2::new(-sz * 0.26, -sz * 0.3), sz * 0.11, Color32::from_rgba_unmultiplied(255, 255, 255, a(215.0)));
+            painter.add(egui::Shape::line(vec![c + Vec2::new(sz * 0.52, -sz * 0.52), c + Vec2::new(sz * 0.72, -sz * 0.84)], Stroke::new(2.5_f32, Color32::from_rgba_unmultiplied(0xEE, 0xF1, 0xFA, a(235.0)))));
+            painter.circle_filled(c + Vec2::new(sz * 0.72, -sz * 0.84), sz * 0.075, Color32::from_rgba_unmultiplied(0xFF, 0x4E, 0x4E, a(255.0)));
+        }
+    }
+}
+
+fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32, t: f32, opacity: f32, logo: Option<egui::TextureId>, light_t: f32) {
+    if opacity <= 0.001 {
+        return;
+    }
+    let a = |x: f32| (x * opacity).clamp(0.0, 255.0) as u8;
+    let mix = |c: Color32, d: Color32, f: f32| -> Color32 {
+        let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f) as u8;
+        Color32::from_rgb(m(c.r(), d.r()), m(c.g(), d.g()), m(c.b(), d.b()))
+    };
+    let rgba = |c: Color32, al: u8| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), al);
+    let hash = |i: u32| -> f32 {
+        let x = ((i.wrapping_mul(2654435761)) ^ 0x9E3779B9) as f32;
+        (x.sin() * 43758.547).fract().abs()
+    };
+    let uv = egui::epaint::WHITE_UV;
+    let tau = std::f32::consts::TAU;
+    let w = rect.width();
+    let h = rect.height();
+    // Light mode = day, Dark mode = night
+    let day = light_t.clamp(0.0, 1.0);
+    let night = 1.0 - day;
+    // three quadrants: sky (top) · island of cherry trees (mid) · water (bottom)
+    let island_top = rect.min.y + h * 0.42;
+    let water_top = rect.min.y + h * 0.80;
+
+    // ---- sky: warm pink by day, deep indigo dusk by night ----
+    let sky_top = mix(mix(Color32::from_rgb(0x22, 0x1D, 0x38), Color32::from_rgb(0xD6, 0xC2, 0xD9), day), color, 0.05);
+    let sky_bot = mix(mix(Color32::from_rgb(0x45, 0x36, 0x52), Color32::from_rgb(0xF3, 0xDC, 0xE6), day), color, 0.04);
+    {
+        let ct = rgba(sky_top, a(255.0));
+        let cb = rgba(sky_bot, a(255.0));
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.vertices.push(egui::epaint::Vertex { pos: rect.left_top(), uv, color: ct });
+        mesh.vertices.push(egui::epaint::Vertex { pos: rect.right_top(), uv, color: ct });
+        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(rect.max.x, water_top), uv, color: cb });
+        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(rect.min.x, water_top), uv, color: cb });
+        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    // ---- stars (night only) ----
+    if night > 0.01 {
+        for i in 0..110u32 {
+            let sx = rect.min.x + hash(i * 2) * w;
+            let sy = rect.min.y + hash(i * 3 + 1) * h * 0.5;
+            let r = 0.5 + hash(i * 5 + 2).powf(2.0) * 1.8;
+            let tw = 0.4 + 0.6 * (0.5 + 0.5 * (t * 1.8 + hash(i * 7) * 30.0).sin());
+            let col = if hash(i * 11) > 0.85 { Color32::from_rgb(0xFF, 0xE6, 0xF2) } else { Color32::WHITE };
+            painter.circle_filled(egui::pos2(sx, sy), r, rgba(col, a(210.0 * night * tw)));
+        }
+    }
+    // drifting soft clouds
+    for ci in 0..5u32 {
+        let speed = 4.0 + hash(ci * 13) * 5.0;
+        let cx = rect.min.x + (hash(ci * 3) * w + t * speed).rem_euclid(w + w * 0.3) - w * 0.15;
+        let cy = rect.min.y + (0.05 + hash(ci * 7) * 0.22) * h;
+        let cw = w * (0.07 + hash(ci * 11) * 0.05);
+        let cloud = mix(Color32::from_rgb(0x4E, 0x44, 0x60), Color32::from_rgb(0xFF, 0xF6, 0xFB), day);
+        for j in 0..5u32 {
+            let jx = (j as f32 - 2.0) * cw * 0.42;
+            let jr = cw * (0.5 - (j as f32 - 2.0).abs() * 0.1);
+            painter.circle_filled(egui::pos2(cx + jx, cy + (hash(ci * 17 + j) - 0.5) * cw * 0.15), jr, rgba(cloud, a(65.0 * (0.5 + 0.5 * day))));
+        }
+    }
+    // ---- sun (day) / moon (night): glow + disc with a gentle heat bob ----
+    let sun_x = rect.min.x + w * 0.32;
+    let sun_bob = (t * 0.6).sin() * h * 0.006 + (t * 1.7).sin() * h * 0.0025;
+    let sun_c = egui::pos2(sun_x, island_top - h * 0.02 + sun_bob);
+    let pulse = 0.5 + 0.5 * (t * 1.3).sin();
+    let glow_col = mix(Color32::from_rgb(0xCE, 0xDA, 0xFF), Color32::from_rgb(0xFF, 0xF3, 0xF8), day);
+    let disc_col = mix(Color32::from_rgb(0xE9, 0xEF, 0xFF), Color32::from_rgb(0xFF, 0xFB, 0xFD), day);
+    for g in 0..6 {
+        painter.circle_filled(sun_c, w * (0.22 - g as f32 * 0.028), rgba(glow_col, a((9.0 + g as f32 * 1.5) * (0.6 + 0.4 * day))));
+    }
+    let sun_r = w * 0.085;
+    // blazing rays are a daytime thing
+    if day > 0.02 {
+        for k in 0..14u32 {
+            let ang = k as f32 / 14.0 * tau + t * 0.04;
+            let rr = sun_r * (1.28 + 0.16 * (t * 2.0 + k as f32).sin());
+            painter.add(egui::Shape::line(
+                vec![sun_c + Vec2::new(ang.cos(), ang.sin()) * sun_r * 1.15, sun_c + Vec2::new(ang.cos(), ang.sin()) * rr],
+                Stroke::new(2.0_f32, rgba(Color32::from_rgb(0xFF, 0xF6, 0xE8), a(28.0 * pulse * day))),
+            ));
+        }
+    }
+    painter.circle_filled(sun_c, sun_r * 1.14, rgba(mix(Color32::from_rgb(0xD8, 0xE2, 0xFF), Color32::from_rgb(0xFF, 0xEC, 0xF2), day), a(70.0 + 25.0 * pulse * day)));
+    painter.circle_filled(sun_c, sun_r, rgba(disc_col, a(238.0)));
+    painter.circle_filled(sun_c - Vec2::new(sun_r * 0.18, sun_r * 0.22), sun_r * 0.66, rgba(mix(Color32::from_rgb(0xF2, 0xF6, 0xFF), Color32::WHITE, day), a(255.0)));
+    // moon craters (night)
+    if night > 0.02 {
+        let cr = Color32::from_rgb(0xC4, 0xCE, 0xEA);
+        painter.circle_filled(sun_c + Vec2::new(sun_r * 0.28, -sun_r * 0.1), sun_r * 0.2, rgba(cr, a(150.0 * night)));
+        painter.circle_filled(sun_c + Vec2::new(-sun_r * 0.1, sun_r * 0.34), sun_r * 0.14, rgba(cr, a(140.0 * night)));
+        painter.circle_filled(sun_c + Vec2::new(sun_r * 0.05, -sun_r * 0.36), sun_r * 0.1, rgba(cr, a(130.0 * night)));
+    }
+    // soft god rays fanning down from the sun (day)
+    if day > 0.02 {
+        let ray = mix(glow_col, Color32::WHITE, 0.4);
+        for k in 0..7u32 {
+            let base = (k as f32 - 3.0) * 0.14 + (t * 0.05).sin() * 0.03;
+            let a1 = std::f32::consts::FRAC_PI_2 + base - 0.045;
+            let a2 = std::f32::consts::FRAC_PI_2 + base + 0.045;
+            let len = h * 0.6;
+            let mut m = egui::epaint::Mesh::default();
+            m.vertices.push(egui::epaint::Vertex { pos: sun_c, uv, color: rgba(ray, a(24.0 * day)) });
+            m.vertices.push(egui::epaint::Vertex { pos: sun_c + Vec2::new(a1.cos(), a1.sin()) * len, uv, color: rgba(ray, 0) });
+            m.vertices.push(egui::epaint::Vertex { pos: sun_c + Vec2::new(a2.cos(), a2.sin()) * len, uv, color: rgba(ray, 0) });
+            m.indices.extend_from_slice(&[0, 1, 2]);
+            painter.add(egui::Shape::mesh(m));
+        }
+    }
+    // birds drifting across the far sky (day)
+    if day > 0.02 {
+        for i in 0..4u32 {
+            let speed = 7.0 + hash(i * 3) * 6.0;
+            let bx = rect.min.x + (hash(i * 5) * w + t * speed).rem_euclid(w * 1.2) - w * 0.1;
+            let by = rect.min.y + (0.10 + hash(i * 7) * 0.14) * h + (t * 0.8 + i as f32).sin() * h * 0.008;
+            let bs = w * 0.009;
+            let flap = 0.35 + 0.25 * (t * 5.0 + i as f32 * 1.3).sin();
+            let bcol = rgba(Color32::from_rgb(0x4A, 0x44, 0x52), a(150.0 * day));
+            let mid = egui::pos2(bx, by);
+            painter.add(egui::Shape::line(vec![egui::pos2(bx - bs, by - bs * flap), mid], Stroke::new(1.6_f32, bcol)));
+            painter.add(egui::Shape::line(vec![mid, egui::pos2(bx + bs, by - bs * flap)], Stroke::new(1.6_f32, bcol)));
+        }
+    }
+
+    // ---- far shore: island landmass + dense cherry-blossom forest ----
+    // fills an irregular top edge down to a flat baseline (landmasses / hills)
+    let fill_to_baseline = |top: &[egui::Pos2], baseline: f32, col: Color32| {
+        let mut mesh = egui::epaint::Mesh::default();
+        for p in top {
+            mesh.vertices.push(egui::epaint::Vertex { pos: *p, uv, color: col });
+            mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(p.x, baseline), uv, color: col });
+        }
+        for i in 0..top.len().saturating_sub(1) {
+            let t0 = (2 * i) as u32;
+            mesh.indices.extend_from_slice(&[t0, t0 + 1, t0 + 2, t0 + 1, t0 + 3, t0 + 2]);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    };
+    // distant hazy hills for depth (two soft bands)
+    for hl in 0..2u32 {
+        let steps = 30usize;
+        let mut top = Vec::with_capacity(steps + 1);
+        let band = h * (0.13 - hl as f32 * 0.03);
+        for k in 0..=steps {
+            let x = rect.min.x + k as f32 / steps as f32 * w;
+            let yy = water_top - band - (x * 0.005 + hl as f32 * 1.7).sin() * h * 0.025 - hash(k as u32 * 7 + hl * 50) * h * 0.015;
+            top.push(egui::pos2(x, yy));
+        }
+        let hillcol = mix(sky_bot, if hl == 0 { Color32::from_rgb(0xCF, 0xAE, 0xCA) } else { Color32::from_rgb(0xBC, 0x98, 0xB8) }, 0.6);
+        fill_to_baseline(&top, water_top, rgba(hillcol, a(225.0)));
+    }
+    // island landmass — a peninsula jutting from the left, receding right into the water
+    let land_edge = |fx: f32| -> f32 {
+        // gentle far shore across the whole width, a taller island on the left
+        let hump = (1.0 - fx).clamp(0.0, 1.0).powf(1.2);
+        water_top - h * (0.02 + 0.06 * hump)
+    };
+    let draw_land = |painter: &egui::Painter| {
+        let steps = 40usize;
+        let mut top = Vec::with_capacity(steps + 1);
+        for k in 0..=steps {
+            let fx = k as f32 / steps as f32;
+            let x = rect.min.x + fx * w;
+            let y = land_edge(fx) - hash(k as u32 * 11) * h * 0.01;
+            top.push(egui::pos2(x, y));
+        }
+        let landcol = mix(Color32::from_rgb(0x4C, 0x58, 0x3B), color, 0.03);
+        let mut mesh = egui::epaint::Mesh::default();
+        for p in &top {
+            mesh.vertices.push(egui::epaint::Vertex { pos: *p, uv, color: rgba(landcol, a(255.0)) });
+            mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(p.x, water_top + 1.5), uv, color: rgba(mix(landcol, Color32::from_rgb(0x30, 0x3A, 0x28), 0.5), a(255.0)) });
+        }
+        for i in 0..top.len().saturating_sub(1) {
+            let t0 = (2 * i) as u32;
+            mesh.indices.extend_from_slice(&[t0, t0 + 1, t0 + 2, t0 + 1, t0 + 3, t0 + 2]);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+        painter.add(egui::Shape::line(top, Stroke::new(2.5_f32, rgba(mix(landcol, Color32::from_rgb(0x8E, 0xA6, 0x62), 0.6), a(220.0)))));
+    };
+    // ---- far-shore blossom forest: short flat silhouettes across the full width ----
+    let gen_crowns = |seed: u32, n: u32, lift: f32, rmin: f32, rmax: f32| -> Vec<(f32, f32, f32)> {
+        let mut v = Vec::new();
+        for i in 0..n {
+            let fx = ((i as f32 + 0.5) / n as f32) + (hash(seed + i * 7) - 0.5) * 0.03;
+            let island = (1.0 - fx).clamp(0.0, 1.0).powf(1.1);
+            let cx = rect.min.x + fx * w;
+            let r = w * (rmin + hash(seed + i * 13) * (rmax - rmin)) * (0.7 + island * 0.5);
+            let cy = land_edge(fx) - h * (lift + 0.03 * island) - hash(seed + i * 17) * h * 0.01;
+            v.push((cx, cy, r));
+        }
+        v
+    };
+    let silhouette = |crowns: &[(f32, f32, f32)]| -> Vec<egui::Pos2> {
+        let steps = 160usize;
+        let mut top = Vec::with_capacity(steps + 1);
+        for k in 0..=steps {
+            let x = rect.min.x + k as f32 / steps as f32 * w;
+            let mut y = water_top;
+            for &(cx, cy, r) in crowns {
+                let dx = (x - cx).abs();
+                if dx < r {
+                    let yy = cy - (r * r - dx * dx).sqrt();
+                    if yy < y {
+                        y = yy;
+                    }
+                }
+            }
+            top.push(egui::pos2(x, y));
+        }
+        top
+    };
+    let draw_forest = |top: &[egui::Pos2], col: Color32, al: u8| {
+        fill_to_baseline(top, water_top + 1.0, rgba(col, al));
+        painter.add(egui::Shape::line(top.to_vec(), Stroke::new(2.0_f32, rgba(mix(col, Color32::from_rgb(0xFF, 0xF2, 0xF8), 0.5), (al as f32 * 0.6) as u8))));
+    };
+    // box-blur a treeline so its silhouette has no gaps / craters
+    let smooth = |pts: Vec<egui::Pos2>, win: usize| -> Vec<egui::Pos2> {
+        (0..pts.len())
+            .map(|i| {
+                let lo = i.saturating_sub(win);
+                let hi = (i + win).min(pts.len().saturating_sub(1));
+                let avg = (lo..=hi).map(|k| pts[k].y).sum::<f32>() / (hi - lo + 1) as f32;
+                egui::pos2(pts[i].x, avg)
+            })
+            .collect()
+    };
+    // distant hazy tree-line (smoothed → continuous, no crater)
+    let back = smooth(silhouette(&gen_crowns(11, 30, 0.05, 0.035, 0.06)), 8);
+    draw_forest(&back, mix(Color32::from_rgb(0xE7, 0xC2, 0xDB), sky_bot, 0.5), a(228.0));
+    // visible landmass the trees stand on (drawn over the haze so it's not buried)
+    draw_land(painter);
+    // grass tufts scattered over the land
+    for i in 0..90u32 {
+        let fx = hash(i * 3 + 200);
+        let gx = rect.min.x + fx * w;
+        let top = land_edge(fx);
+        let gy = top + hash(i * 7 + 200) * (water_top - top) * 0.95 + h * 0.003;
+        let gh = h * (0.005 + hash(i * 11 + 200) * 0.008);
+        let lean = (hash(i * 13 + 200) - 0.5) * gh * 0.7;
+        let gcol = mix(Color32::from_rgb(0x6E, 0x8C, 0x4C), color, 0.0);
+        painter.add(egui::Shape::line(vec![egui::pos2(gx, gy), egui::pos2(gx + lean, gy - gh)], Stroke::new(1.6_f32, rgba(gcol, a(175.0)))));
+    }
+    // fallen petals resting on the ground
+    for i in 0..48u32 {
+        let fx = hash(i * 5 + 400);
+        let px = rect.min.x + fx * w;
+        let top = land_edge(fx);
+        let py = top + (0.12 + hash(i * 7 + 400) * 0.82) * (water_top - top);
+        let pr = 1.8 + hash(i * 11 + 400) * 2.4;
+        let pcol = if hash(i * 13 + 400) > 0.5 { Color32::from_rgb(0xF3, 0xB6, 0xD2) } else { Color32::from_rgb(0xE7, 0x9B, 0xC4) };
+        painter.circle_filled(egui::pos2(px, py), pr, rgba(pcol, a(205.0)));
+    }
+    // clean rounded cherry canopy with tasteful variety (3 symmetric styles + aspect)
+    let draw_canopy = |cx: f32, cy: f32, cr: f32, seed: u32| {
+        let base = Color32::from_rgb(0xDB, 0x8A, 0xBB);
+        let shadow = mix(base, Color32::from_rgb(0x8E, 0x3F, 0x66), 0.32);
+        let hi = mix(base, Color32::from_rgb(0xFF, 0xF1, 0xF8), 0.42);
+        let bc = rgba(base, a(255.0));
+        let aspect = 0.92 + hash(seed * 3) * 0.28;
+        painter.circle_filled(egui::pos2(cx, cy + cr * 0.3), cr * 0.9 * aspect, rgba(shadow, a(255.0)));
+        painter.circle_filled(egui::pos2(cx, cy), cr * 0.92, bc);
+        match (hash(seed * 7) * 3.0) as u32 {
+            0 => {
+                painter.circle_filled(egui::pos2(cx - cr * 0.5 * aspect, cy - cr * 0.08), cr * 0.55, bc);
+                painter.circle_filled(egui::pos2(cx + cr * 0.5 * aspect, cy - cr * 0.08), cr * 0.55, bc);
+                painter.circle_filled(egui::pos2(cx, cy - cr * 0.5), cr * 0.55, bc);
+            }
+            1 => {
+                painter.circle_filled(egui::pos2(cx - cr * 0.62 * aspect, cy + cr * 0.06), cr * 0.5, bc);
+                painter.circle_filled(egui::pos2(cx + cr * 0.62 * aspect, cy + cr * 0.06), cr * 0.5, bc);
+                painter.circle_filled(egui::pos2(cx, cy - cr * 0.46), cr * 0.5, bc);
+            }
+            _ => {
+                painter.circle_filled(egui::pos2(cx - cr * 0.36 * aspect, cy - cr * 0.34), cr * 0.5, bc);
+                painter.circle_filled(egui::pos2(cx + cr * 0.36 * aspect, cy - cr * 0.34), cr * 0.5, bc);
+                painter.circle_filled(egui::pos2(cx, cy - cr * 0.6), cr * 0.46, bc);
+            }
+        }
+        // fluffy blossom bumps along the top edge for a detailed crown
+        for tb in 0..4u32 {
+            let ba = (tb as f32 / 3.0 - 0.5) * 1.5;
+            let bx = cx + ba * cr * aspect;
+            let by = cy - cr * (0.5 + hash(seed.wrapping_mul(53).wrapping_add(tb)) * 0.18);
+            painter.circle_filled(egui::pos2(bx, by), cr * 0.26, bc);
+        }
+        painter.circle_filled(egui::pos2(cx - cr * 0.24, cy - cr * 0.4), cr * 0.38, rgba(hi, a(255.0)));
+    };
+    // trees scattered at varying depths across the whole land (back → front)
+    let mut tlist: Vec<(f32, f32, f32, u32)> = Vec::new(); // cx, base_y, cr, seed
+    let ntrees = 72u32;
+    for i in 0..ntrees {
+        // even spacing + small jitter so there are no gaps
+        let fx = (i as f32 + 0.5) / ntrees as f32 + (hash(i * 3 + 7) - 0.5) * (1.4 / ntrees as f32);
+        let cx = rect.min.x + fx * w;
+        let island = (1.0 - fx).clamp(0.0, 1.0);
+        let depth = hash(i * 5 + 11);
+        let base_y = land_edge(fx) + depth * (water_top - land_edge(fx)) * 0.9 + h * 0.004;
+        let cr = w * (0.026 + 0.016 * depth) * (0.78 + island * 0.38);
+        tlist.push((cx, base_y, cr, i.wrapping_mul(131).wrapping_add(1)));
+    }
+    tlist.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap());
+    let mut tree_crowns: Vec<(f32, f32, f32)> = Vec::new();
+    for &(cx, base_y, cr, seed) in &tlist {
+        let th = cr * (1.5 + hash(seed * 13) * 0.8);
+        let cy = base_y - th - cr * 0.3;
+        tree_crowns.push((cx, cy, cr));
+        let hw = (cr * 0.15).max(1.5);
+        let cc = rgba(mix(Color32::from_rgb(0x46, 0x2C, 0x22), color, 0.0), a(235.0));
+        let mut m = egui::epaint::Mesh::default();
+        m.vertices.push(egui::epaint::Vertex { pos: egui::pos2(cx - hw, base_y), uv, color: cc });
+        m.vertices.push(egui::epaint::Vertex { pos: egui::pos2(cx + hw, base_y), uv, color: cc });
+        m.vertices.push(egui::epaint::Vertex { pos: egui::pos2(cx + hw * 0.45, cy + cr * 0.25), uv, color: cc });
+        m.vertices.push(egui::epaint::Vertex { pos: egui::pos2(cx - hw * 0.45, cy + cr * 0.25), uv, color: cc });
+        m.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        painter.add(egui::Shape::mesh(m));
+        // branches fanning up into the canopy for detail (tips peek through)
+        let btop = egui::pos2(cx, cy + cr * 0.4);
+        let brc = rgba(mix(Color32::from_rgb(0x46, 0x2C, 0x22), color, 0.0), a(220.0));
+        for br in 0..3u32 {
+            let ang = -2.0 + br as f32 * 0.7 + (hash(seed.wrapping_mul(41).wrapping_add(br)) - 0.5) * 0.5;
+            let len = cr * (0.35 + hash(seed.wrapping_mul(43).wrapping_add(br)) * 0.3);
+            let bend = btop + Vec2::new(ang.cos() * len, ang.sin() * len);
+            painter.add(egui::Shape::line(vec![btop, bend], Stroke::new((cr * 0.07).max(1.0), brc)));
+        }
+        draw_canopy(cx, cy, cr, seed);
+    }
+    // smoothed treeline for a clean (non-jagged) water reflection
+    let front = smooth(silhouette(&tree_crowns), 7);
+
+    // ---- water (bottom quadrant) ----
+    let water_hi = mix(mix(Color32::from_rgb(0x4C, 0x3E, 0x56), Color32::from_rgb(0xC6, 0xA2, 0xBC), day), color, 0.06);
+    let water_lo = mix(mix(Color32::from_rgb(0x28, 0x20, 0x38), Color32::from_rgb(0x82, 0x62, 0x7C), day), color, 0.05);
+    {
+        let ct = rgba(water_hi, a(255.0));
+        let cb = rgba(water_lo, a(255.0));
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(rect.min.x, water_top), uv, color: ct });
+        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(rect.max.x, water_top), uv, color: ct });
+        mesh.vertices.push(egui::epaint::Vertex { pos: rect.right_bottom(), uv, color: cb });
+        mesh.vertices.push(egui::epaint::Vertex { pos: rect.left_bottom(), uv, color: cb });
+        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    // sun reflection — a broken shimmering column under the sun
+    let sun_x = rect.min.x + w * 0.32;
+    for j in 0..24u32 {
+        let fy = j as f32 / 24.0;
+        let y = water_top + fy * (rect.max.y - water_top) * 0.92;
+        let wob = (t * 1.3 + fy * 8.0).sin() * (6.0 + fy * 34.0);
+        let width = (28.0 + fy * 100.0) * (0.55 + 0.45 * (t * 2.0 + j as f32).sin());
+        let al = a(78.0 * (1.0 - fy * 0.8) * (0.45 + 0.55 * (t * 3.0 + j as f32 * 1.7).sin()));
+        let seg = egui::Rect::from_center_size(egui::pos2(sun_x + wob, y), Vec2::new(width, 2.5 + fy * 2.0));
+        painter.rect_filled(seg, Rounding::same(2.0), rgba(mix(water_hi, Color32::from_rgb(0xFF, 0xF6, 0xFA), 0.72), al));
+    }
+    // mirrored forest reflection in the water (flipped, faded, rippling)
+    {
+        let refl = mix(Color32::from_rgb(0xD4, 0x86, 0xB6), water_hi, 0.35);
+        let mut mesh = egui::epaint::Mesh::default();
+        for p in &front {
+            let depth = (water_top - p.y).max(0.0);
+            let by = water_top + depth * 0.8 + (p.x * 0.04 + t * 1.4).sin() * 4.0;
+            mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(p.x, water_top), uv, color: rgba(refl, a(90.0)) });
+            mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(p.x, by), uv, color: rgba(refl, a(0.0)) });
+        }
+        for k in 0..front.len().saturating_sub(1) {
+            let t0 = (2 * k) as u32;
+            mesh.indices.extend_from_slice(&[t0, t0 + 1, t0 + 2, t0 + 1, t0 + 3, t0 + 2]);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    // drifting, shimmering ripple lines
+    for j in 0..15u32 {
+        let fy = (j as f32 + 0.5) / 15.0;
+        let y = water_top + fy * (rect.max.y - water_top);
+        let amp = 1.2 + fy * 3.2;
+        let phase = hash(j * 13) * tau;
+        let speed = 0.6 + hash(j * 7) * 0.5;
+        let shimmer = 0.35 + 0.65 * (0.5 + 0.5 * (t * speed + phase).sin());
+        let steps = 44;
+        let mut pts = Vec::with_capacity(steps + 1);
+        for k in 0..=steps {
+            let fxx = k as f32 / steps as f32;
+            let x = rect.min.x + fxx * w;
+            let yy = y + (x * 0.018 + t * 1.1 * speed + phase).sin() * amp;
+            pts.push(egui::pos2(x, yy));
+        }
+        painter.add(egui::Shape::line(pts, Stroke::new(1.4_f32, rgba(mix(water_hi, Color32::WHITE, 0.45), a(34.0 * shimmer * (1.0 - fy * 0.35))))));
+    }
+
+    // ---- overhanging cherry branch (top-right): recursively forked wood with
+    //      5-petal blossoms strung along the branches, dense toward the tips ----
+    let branch_col = mix(Color32::from_rgb(0x4A, 0x2E, 0x22), color, 0.0);
+    let flower = |c: egui::Pos2, r: f32, col: Color32, al: u8| {
+        for k in 0..5u32 {
+            let ang = k as f32 / 5.0 * tau - 1.2;
+            painter.circle_filled(c + Vec2::new(ang.cos(), ang.sin()) * r * 0.58, r * 0.5, rgba(col, al));
+        }
+        painter.circle_filled(c, r * 0.32, rgba(mix(col, Color32::from_rgb(0xFF, 0xF2, 0xD6), 0.3), al));
+        for k in 0..3u32 {
+            let ang = k as f32 / 3.0 * tau + 0.5;
+            painter.circle_filled(c + Vec2::new(ang.cos(), ang.sin()) * r * 0.17, r * 0.07, rgba(Color32::from_rgb(0x9C, 0x3C, 0x2C), al));
+        }
+    };
+    let wood = |a0: egui::Pos2, b0: egui::Pos2, wa: f32, wb: f32| {
+        let d = (b0 - a0).normalized();
+        let p = d.rot90();
+        let cc = rgba(branch_col, a(255.0));
+        let mut m = egui::epaint::Mesh::default();
+        m.vertices.push(egui::epaint::Vertex { pos: a0 + p * wa * 0.5, uv, color: cc });
+        m.vertices.push(egui::epaint::Vertex { pos: a0 - p * wa * 0.5, uv, color: cc });
+        m.vertices.push(egui::epaint::Vertex { pos: b0 - p * wb * 0.5, uv, color: cc });
+        m.vertices.push(egui::epaint::Vertex { pos: b0 + p * wb * 0.5, uv, color: cc });
+        m.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        painter.add(egui::Shape::mesh(m));
+        painter.circle_filled(b0, wb * 0.5, cc);
+    };
+    // grow the bough from the top-right corner, collecting flower positions as we go
+    let mut stack: Vec<(egui::Pos2, f32, f32, f32, u32)> = Vec::new();
+    stack.push((egui::pos2(rect.max.x + 8.0, rect.min.y + h * 0.03), 2.85, w * 0.18, 13.0, 3));
+    let mut flowers: Vec<(egui::Pos2, f32)> = Vec::new();
+    let mut si = 0u32;
+    while let Some((start, angle, len, width, depth)) = stack.pop() {
+        let dir = Vec2::new(angle.cos(), angle.sin());
+        let end = start + dir * len + Vec2::new(0.0, len * 0.04);
+        wood(start, end, width, width * 0.55);
+        // blossoms only on the thin outer branches, never the thick main bough
+        if depth <= 1 {
+            let perp = (end - start).normalized().rot90();
+            let nf = ((len / 22.0) as u32).max(1);
+            for f in 0..nf {
+                let tt = 0.15 + 0.85 * (f as f32 + 0.5) / nf as f32;
+                let side = if (f + si) % 2 == 0 { 1.0 } else { -1.0 };
+                let off = width * 0.5 + 3.0 + hash(si * 7 + f) * 7.0;
+                flowers.push((start + (end - start) * tt + perp * side * off, 8.0 + hash(si * 13 + f) * 7.0));
+            }
+        }
+        si = si.wrapping_add(1);
+        if depth > 0 && len > 30.0 {
+            let spread = 0.4 + hash(si * 5) * 0.4;
+            stack.push((start + (end - start) * 0.55, angle - spread, len * 0.66, width * 0.62, depth - 1));
+            stack.push((start + (end - start) * 0.82, angle + spread * 0.6, len * 0.55, width * 0.52, depth - 1));
+            if hash(si * 11) > 0.4 {
+                stack.push((start + (end - start) * 0.7, angle + spread * 1.5, len * 0.42, width * 0.44, depth - 1));
+            }
+        } else {
+            for b in 0..4u32 {
+                let bp = end + Vec2::new((hash(si * 3 + b) - 0.5) * 18.0, (hash(si * 9 + b) - 0.5) * 18.0);
+                flowers.push((bp, 7.0 + hash(si * 5 + b) * 6.0));
+            }
+        }
+    }
+    for (i, (fp, r)) in flowers.iter().enumerate() {
+        let roll = hash(i as u32 * 3 + 1);
+        let col = if roll > 0.66 {
+            Color32::from_rgb(0xF9, 0xCF, 0xE3)
+        } else if roll > 0.33 {
+            Color32::from_rgb(0xF2, 0xA6, 0xCE)
+        } else {
+            Color32::from_rgb(0xE8, 0x7C, 0xB2)
+        };
+        let sway = (t * 0.5 + i as f32 * 0.3).sin() * 1.6;
+        flower(*fp + Vec2::new(sway, 0.0), *r, col, a(252.0));
+    }
+
+    // ---- easter egg: the NeXium logo fishing from a little boat (petals fall over it) ----
+    if let Some(logo) = logo {
+        let bob = (t * 0.9).sin() * h * 0.006;
+        let bx = rect.min.x + w * 0.14;
+        let by = water_top + h * 0.085 + bob;
+        let bw = w * 0.045;
+        let bh = h * 0.022;
+        let hull = Color32::from_rgb(0x7A, 0x4E, 0x30);
+        painter.add(egui::Shape::convex_polygon(
+            vec![egui::pos2(bx - bw, by), egui::pos2(bx + bw, by), egui::pos2(bx + bw * 0.68, by + bh), egui::pos2(bx - bw * 0.68, by + bh)],
+            rgba(hull, a(255.0)),
+            Stroke::NONE,
+        ));
+        painter.add(egui::Shape::line(vec![egui::pos2(bx - bw, by), egui::pos2(bx + bw, by)], Stroke::new(2.5_f32, rgba(mix(hull, Color32::from_rgb(0xC9, 0x9A, 0x6E), 0.6), a(255.0)))));
+        let lsz = bw * 0.95;
+        let lr = egui::Rect::from_center_size(egui::pos2(bx - bw * 0.15, by - lsz * 0.42), egui::Vec2::splat(lsz));
+        painter.image(logo, lr, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_rgba_unmultiplied(255, 255, 255, a(255.0)));
+        let hand = egui::pos2(bx + bw * 0.2, by - lsz * 0.35);
+        let tip = egui::pos2(bx + bw * 1.5, by - lsz * 0.95);
+        painter.add(egui::Shape::line(vec![hand, tip], Stroke::new(2.0_f32, rgba(Color32::from_rgb(0x3A, 0x2A, 0x22), a(255.0)))));
+        let dip = water_top + h * 0.075;
+        let bob_end = egui::pos2(tip.x + w * 0.014, dip);
+        painter.add(egui::Shape::line(vec![tip, bob_end], Stroke::new(1.0_f32, rgba(Color32::from_rgb(0xEE, 0xEE, 0xF4), a(150.0)))));
+        painter.circle_filled(bob_end, 3.0, rgba(Color32::from_rgb(0xE0, 0x50, 0x50), a(255.0)));
+        painter.circle_filled(bob_end - Vec2::new(0.0, 3.0), 3.0, rgba(Color32::WHITE, a(255.0)));
+        painter.circle_stroke(bob_end, 6.0 + (t * 2.0).sin().abs() * 4.0, Stroke::new(1.0_f32, rgba(Color32::WHITE, a(60.0))));
+    }
+
+    // ---- falling petals (drift + tumble) ----
+    let petal = |c: egui::Pos2, size: f32, ang: f32, col: Color32| {
+        let (sa, ca) = ang.sin_cos();
+        let n = 8usize;
+        let mut pts = Vec::with_capacity(n);
+        for k in 0..n {
+            let th = k as f32 / n as f32 * tau;
+            let ex = th.cos() * size;
+            let ey = th.sin() * size * 0.5;
+            pts.push(c + Vec2::new(ex * ca - ey * sa, ex * sa + ey * ca));
+        }
+        painter.add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
+    };
+    for i in 0..130u32 {
+        let speed = 26.0 + hash(i * 3) * 62.0;
+        let sway_amp = 10.0 + hash(i * 5) * 28.0;
+        let sway_speed = 0.5 + hash(i * 11) * 0.9;
+        let fall = (hash(i * 7) * h + t * speed).rem_euclid(h + 48.0);
+        let y = rect.min.y - 24.0 + fall;
+        let sway = (t * sway_speed + hash(i * 13) * tau).sin() * sway_amp;
+        let x = rect.min.x + (hash(i * 2) * w + sway).rem_euclid(w);
+        let ang = t * (0.6 + hash(i * 17)) + hash(i * 19) * tau;
+        let size = 2.6 + hash(i * 23) * 3.6;
+        let roll = hash(i * 29);
+        let pcol = if roll > 0.7 {
+            Color32::from_rgb(0xFB, 0xEA, 0xF2)
+        } else if roll > 0.4 {
+            Color32::from_rgb(0xF3, 0xB6, 0xD2)
+        } else {
+            Color32::from_rgb(0xE7, 0x9B, 0xC4)
+        };
+        let flick = 0.55 + 0.45 * (0.5 + 0.5 * ang.sin());
+        petal(egui::pos2(x, y), size, ang, rgba(pcol, a(205.0 * flick)));
+    }
+
+
+    // ---- fireflies drifting near the treeline / water's edge (night) ----
+    if night > 0.01 {
+        for i in 0..16u32 {
+            let drift = t * (7.0 + hash(i * 11) * 9.0) / w;
+            let fxr = (hash(i * 3) + drift).fract();
+            let x = rect.min.x + fxr * w;
+            let ly = land_edge(fxr);
+            let y = ly - h * 0.015 + hash(i * 13) * (water_top - ly) * 0.7 + (t * (0.8 + hash(i * 5)) + hash(i * 7) * tau).sin() * h * 0.025;
+            let ph = 0.4 + 0.6 * (t * (2.0 + hash(i * 17) * 2.0) + hash(i * 19) * tau).sin().max(0.0);
+            let fr = 1.6 + hash(i * 23) * 1.2;
+            painter.circle_filled(egui::pos2(x, y), fr * 2.6, rgba(Color32::from_rgb(0xC8, 0xFF, 0x8C), a(45.0 * night * ph)));
+            painter.circle_filled(egui::pos2(x, y), fr, rgba(Color32::from_rgb(0xEC, 0xFF, 0xB0), a(210.0 * night * ph)));
+        }
+    }
+
+    // ---- soft vignette around the borders ----
+    {
+        let vc = Color32::from_rgb(0x2A, 0x16, 0x24);
+        let vout = rgba(vc, a(70.0));
+        let vin = rgba(vc, 0);
+        let quad = |a0: egui::Pos2, b0: egui::Pos2, b1: egui::Pos2, a1: egui::Pos2| {
+            let mut m = egui::epaint::Mesh::default();
+            m.vertices.push(egui::epaint::Vertex { pos: a0, uv, color: vout });
+            m.vertices.push(egui::epaint::Vertex { pos: b0, uv, color: vout });
+            m.vertices.push(egui::epaint::Vertex { pos: b1, uv, color: vin });
+            m.vertices.push(egui::epaint::Vertex { pos: a1, uv, color: vin });
+            m.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            painter.add(egui::Shape::mesh(m));
+        };
+        let vw = w * 0.13;
+        let vh = h * 0.17;
+        quad(rect.left_top(), rect.right_top(), egui::pos2(rect.max.x, rect.min.y + vh), egui::pos2(rect.min.x, rect.min.y + vh));
+        quad(rect.left_bottom(), rect.right_bottom(), egui::pos2(rect.max.x, rect.max.y - vh), egui::pos2(rect.min.x, rect.max.y - vh));
+        quad(rect.left_top(), rect.left_bottom(), egui::pos2(rect.min.x + vw, rect.max.y), egui::pos2(rect.min.x + vw, rect.min.y));
+        quad(rect.right_top(), rect.right_bottom(), egui::pos2(rect.max.x - vw, rect.max.y), egui::pos2(rect.max.x - vw, rect.min.y));
+    }
 }
 
 fn draw_gradient_backdrop(
@@ -787,22 +1407,28 @@ pub fn draw_wave_background(
     let h = rect.height();
     let steps = 96usize;
 
-    let bands: &[(f32, f32, f32, f32, u8)] = &[
-        (0.55, 0.012, 0.0,  1.5,  70),
-        (0.42, 0.018, 1.1,  1.2,  58),
-        (0.70, 0.009, 2.3,  0.9,  44),
-        (0.30, 0.022, 0.6,  1.7,  34),
-        (0.85, 0.007, 3.5,  0.7,  24),
+    // per-band shade (alternating lighter/darker) so adjacent waves contrast
+    let sh = |c: Color32, f: f32| -> Color32 {
+        let adj = |v: u8| if f >= 0.0 { (v as f32 + (255.0 - v as f32) * f) as u8 } else { (v as f32 * (1.0 + f)) as u8 };
+        Color32::from_rgb(adj(c.r()), adj(c.g()), adj(c.b()))
+    };
+    let bands: &[(f32, f32, f32, f32, u8, f32)] = &[
+        (0.55, 0.012, 0.0,  1.5,  95,  0.28),
+        (0.42, 0.018, 1.1,  1.2,  88, -0.30),
+        (0.70, 0.009, 2.3,  0.9,  78,  0.50),
+        (0.30, 0.022, 0.6,  1.7,  70, -0.42),
+        (0.85, 0.007, 3.5,  0.7,  60,  0.66),
     ];
 
-    for &(base_frac, amp_frac, phase_off, speed, alpha) in bands {
+    for &(base_frac, amp_frac, phase_off, speed, alpha, shade) in bands {
         let base_y = rect.min.y + h * base_frac;
         let amp    = h * amp_frac;
         let phase  = t * speed + phase_off;
 
         let band_alpha = ((alpha as f32) * opacity) as u8;
         if band_alpha == 0 { continue; }
-        let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), band_alpha);
+        let bcol = sh(color, shade);
+        let fill = Color32::from_rgba_unmultiplied(bcol.r(), bcol.g(), bcol.b(), band_alpha);
 
         let mut mesh = egui::epaint::Mesh::default();
         for s in 0..=steps {
@@ -833,10 +1459,11 @@ pub fn draw_wave_background(
         }
         let crest_pts: Vec<egui::Pos2> = (0..=steps).map(|s| mesh.vertices[2 * s].pos).collect();
         painter.add(egui::Shape::mesh(mesh));
-        let outer_col = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), (band_alpha / 2).max(1));
-        painter.add(egui::Shape::line(crest_pts.clone(), Stroke::new(2.0_f32, outer_col)));
-        let inner_col = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), band_alpha);
-        painter.add(egui::Shape::line(crest_pts, Stroke::new(1.0_f32, inner_col)));
+        // crest edge in a contrasting shade so the wave is always legible
+        let crest = sh(color, if shade >= 0.0 { -0.4 } else { 0.55 });
+        let ca = ((alpha as f32 + 70.0).min(210.0) * opacity) as u8;
+        painter.add(egui::Shape::line(crest_pts.clone(), Stroke::new(2.4_f32, Color32::from_rgba_unmultiplied(crest.r(), crest.g(), crest.b(), (ca as f32 * 0.5) as u8))));
+        painter.add(egui::Shape::line(crest_pts, Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(crest.r(), crest.g(), crest.b(), ca))));
     }
 }
 
@@ -1103,7 +1730,16 @@ pub fn carousel_view(
     }
 
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("carousel_bg")));
-    draw_backdrop(&painter, bg_rect, state.ambient_color, t, backdrop_theme, ui_opacity, th);
+    if state.nx_logo.is_none() {
+        if let Ok(img) = image::load_from_memory(include_bytes!("../../branding/png/logo-256.png")) {
+            let rgba = img.to_rgba8();
+            let (iw, ih) = rgba.dimensions();
+            let ci = egui::ColorImage::from_rgba_unmultiplied([iw as usize, ih as usize], rgba.as_raw());
+            state.nx_logo = Some(ctx.load_texture("nx_logo", ci, egui::TextureOptions::LINEAR));
+        }
+    }
+    let logo_id = state.nx_logo.as_ref().map(|tx| tx.id());
+    draw_backdrop(&painter, bg_rect, state.ambient_color, t, backdrop_theme, ui_opacity, th, logo_id);
 
     let screen_center = bg_rect.center();
     let scale_pos = |p: egui::Pos2| -> egui::Pos2 {
@@ -1134,7 +1770,9 @@ pub fn carousel_view(
             let badge = scale_pos(egui::pos2(search_rect.max.x - 18.0 * s, search_rect.center().y));
             let bcol = if state.search_nav || state.search_kb.open { accent } else { Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sb_alpha) };
             painter.circle_filled(badge, 9.0 * s * scale_factor, bcol);
-            painter.text(badge, egui::Align2::CENTER_CENTER, "Y", FontId::proportional(12.0 * s * scale_factor), Color32::from_rgb(0x10, 0x14, 0x1C));
+            let lum = 0.299 * bcol.r() as f32 + 0.587 * bcol.g() as f32 + 0.114 * bcol.b() as f32;
+            let ycol = if lum > 130.0 { Color32::from_rgb(0x10, 0x14, 0x1C) } else { Color32::WHITE };
+            painter.text(badge, egui::Align2::CENTER_CENTER, "Y", FontId::proportional(12.0 * s * scale_factor), ycol);
         }
 
         let text_pos = scale_pos(search_rect.min + Vec2::new(38.0 * s, search_rect.height() * 0.5));
