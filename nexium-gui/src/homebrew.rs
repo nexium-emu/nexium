@@ -28,6 +28,9 @@ impl ShopApp {
     pub fn zip_url(&self) -> String {
         format!("{BASE}zips/{}.zip", self.name)
     }
+    pub fn page_url(&self) -> String {
+        format!("https://hb-app.store/switch/{}", self.name)
+    }
 }
 
 fn curl_bytes(url: &str, timeout: u32) -> Option<Vec<u8>> {

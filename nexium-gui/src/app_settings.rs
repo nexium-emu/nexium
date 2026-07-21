@@ -68,7 +68,7 @@ impl CarouselTheme {
         Some(match self {
             CarouselTheme::Adaptive => return None,
             CarouselTheme::Rgb => return None,
-            CarouselTheme::Aqua => (0x2F, 0xB4, 0xEF),
+            CarouselTheme::Aqua => (0x14, 0xB8, 0xA6),
             CarouselTheme::Azure => (0x3B, 0x82, 0xF6),
             CarouselTheme::Violet => (0x8B, 0x5C, 0xF6),
             CarouselTheme::Magenta => (0xD9, 0x4F, 0xD0),
@@ -85,6 +85,7 @@ pub enum BackdropTheme {
     Waves,
     Gradient,
     Space,
+    CherryBlossom,
     None,
 }
 
@@ -96,13 +97,14 @@ impl Default for BackdropTheme {
 
 impl BackdropTheme {
     pub fn all() -> &'static [BackdropTheme] {
-        &[BackdropTheme::Waves, BackdropTheme::Gradient, BackdropTheme::Space, BackdropTheme::None]
+        &[BackdropTheme::Waves, BackdropTheme::Gradient, BackdropTheme::Space, BackdropTheme::CherryBlossom, BackdropTheme::None]
     }
     pub fn label(&self) -> &'static str {
         match self {
             BackdropTheme::Waves => "Waves",
             BackdropTheme::Gradient => "Gradient",
             BackdropTheme::Space => "Space",
+            BackdropTheme::CherryBlossom => "Cherry Blossom",
             BackdropTheme::None => "None",
         }
     }
