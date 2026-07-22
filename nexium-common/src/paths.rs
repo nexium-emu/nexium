@@ -34,10 +34,6 @@ pub fn nand_dir() -> PathBuf {
     ensure(data_root().join("nand"))
 }
 
-pub fn load_dir() -> PathBuf {
-    data_root().join("load")
-}
-
 pub fn nro_dir() -> PathBuf {
     ensure(data_root().join("NRO"))
 }
