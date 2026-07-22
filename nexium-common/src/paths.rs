@@ -21,7 +21,6 @@ pub fn init() {
         root(),
         sdmc_dir(),
         nand_dir(),
-        load_dir(),
         nro_dir(),
         log_dir(),
     );
@@ -36,7 +35,7 @@ pub fn nand_dir() -> PathBuf {
 }
 
 pub fn load_dir() -> PathBuf {
-    ensure(data_root().join("load"))
+    data_root().join("load")
 }
 
 pub fn nro_dir() -> PathBuf {
