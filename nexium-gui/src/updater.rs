@@ -53,7 +53,10 @@ impl Updater {
     }
 
     pub fn status(&self) -> Status {
-        self.status.lock().map(|g| g.clone()).unwrap_or(Status::Idle)
+        self.status
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(Status::Idle)
     }
 
     pub fn available_release(&self) -> Option<Release> {
@@ -64,7 +67,9 @@ impl Updater {
     }
 
     pub fn is_downloading(&self) -> bool {
-        self.download.as_ref().map_or(false, |d| d.lock().map(|g| !g.done).unwrap_or(false))
+        self.download
+            .as_ref()
+            .map_or(false, |d| d.lock().map(|g| !g.done).unwrap_or(false))
     }
 
     pub fn progress(&self) -> f32 {
@@ -181,7 +186,8 @@ impl Updater {
         let base = exe.file_name().and_then(|n| n.to_str()).unwrap_or("nexium");
         let backup_dest = backups.join(format!("{}-{}", base, stamp));
 
-        std::fs::rename(&exe, &backup_dest).map_err(|e| format!("could not move current binary aside: {}", e))?;
+        std::fs::rename(&exe, &backup_dest)
+            .map_err(|e| format!("could not move current binary aside: {}", e))?;
         prune_backups(&backups, 20);
 
         if let Err(e) = std::fs::copy(&newbin, &exe) {
@@ -241,16 +247,26 @@ fn fetch_latest() -> Result<Release, String> {
     if !out.status.success() {
         return Err("could not reach update server".into());
     }
-    let list: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| "bad response".to_string())?;
+    let list: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|_| "bad response".to_string())?;
     let json = list
         .as_array()
-        .and_then(|arr| arr.iter().find(|r| !r["draft"].as_bool().unwrap_or(false)).cloned())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|r| !r["draft"].as_bool().unwrap_or(false))
+                .cloned()
+        })
         .ok_or("no releases found")?;
 
     let tag = json["tag_name"].as_str().unwrap_or("").to_string();
     let name = json["name"].as_str().unwrap_or("").to_string();
     let body = json["body"].as_str().unwrap_or("");
-    let date = json["published_at"].as_str().unwrap_or("").chars().take(10).collect::<String>();
+    let date = json["published_at"]
+        .as_str()
+        .unwrap_or("")
+        .chars()
+        .take(10)
+        .collect::<String>();
 
     let commit = extract_commit(&name)
         .or_else(|| extract_commit(&tag))
@@ -263,14 +279,27 @@ fn fetch_latest() -> Result<Release, String> {
         n.contains("linux") && n.ends_with(".tar.gz")
     });
     let asset = asset.ok_or("no Linux build in latest release")?;
-    let url = asset["browser_download_url"].as_str().unwrap_or("").to_string();
-    let filename = asset["name"].as_str().unwrap_or("nexium-linux-x86_64.tar.gz").to_string();
+    let url = asset["browser_download_url"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let filename = asset["name"]
+        .as_str()
+        .unwrap_or("nexium-linux-x86_64.tar.gz")
+        .to_string();
     let size = asset["size"].as_u64().unwrap_or(0);
     if url.is_empty() {
         return Err("no download url".into());
     }
 
-    Ok(Release { tag, date, commit, url, size, filename })
+    Ok(Release {
+        tag,
+        date,
+        commit,
+        url,
+        size,
+        filename,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -339,7 +368,10 @@ fn prune_backups(dir: &std::path::Path, keep: usize) {
         .filter_map(|e| {
             let p = e.path();
             if p.is_file() {
-                let t = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                let t = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
                 Some((t, p))
             } else {
                 None

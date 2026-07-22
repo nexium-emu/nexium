@@ -112,7 +112,12 @@ impl InputBackend {
         let sdl = sdl3::init().ok()?;
         let gamepad = sdl.gamepad().ok()?;
         log::info!("SDL3 gamepad subsystem initialized");
-        Some(Self { sdl, gamepad, pad: None, selected_id: None })
+        Some(Self {
+            sdl,
+            gamepad,
+            pad: None,
+            selected_id: None,
+        })
     }
 
     fn ensure_pad(&mut self) {
@@ -170,13 +175,19 @@ impl InputBackend {
                         if pid == id {
                             p.name().unwrap_or_else(|| "Gamepad".to_string())
                         } else {
-                            self.gamepad.name_for_id(id).unwrap_or_else(|_| "Gamepad".to_string())
+                            self.gamepad
+                                .name_for_id(id)
+                                .unwrap_or_else(|_| "Gamepad".to_string())
                         }
                     } else {
-                        self.gamepad.name_for_id(id).unwrap_or_else(|_| "Gamepad".to_string())
+                        self.gamepad
+                            .name_for_id(id)
+                            .unwrap_or_else(|_| "Gamepad".to_string())
                     }
                 } else {
-                    self.gamepad.name_for_id(id).unwrap_or_else(|_| "Gamepad".to_string())
+                    self.gamepad
+                        .name_for_id(id)
+                        .unwrap_or_else(|_| "Gamepad".to_string())
                 };
                 list.push((id, name));
             }
@@ -194,6 +205,9 @@ impl InputBackend {
     }
 
     pub fn poll(&mut self, cfg: &ControllerConfig, left_dz: f32, right_dz: f32) -> InputSnapshot {
+        if std::env::var_os("NEXIUM_NO_GAMEPAD").is_some() {
+            return InputSnapshot::new();
+        }
         if let Ok(mut ep) = self.sdl.event_pump() {
             ep.pump_events();
         }

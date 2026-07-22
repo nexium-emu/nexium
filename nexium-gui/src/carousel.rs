@@ -1,6 +1,6 @@
+use crate::library::Library;
 use eframe::egui;
 use eframe::egui::{Color32, FontId, Rounding, Sense, Stroke, Vec2};
-use crate::library::Library;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BootStage {
@@ -144,8 +144,6 @@ pub enum CarouselAction {
 
 const DOCK_COUNT: usize = 10;
 
-/// Number of special cards before the games (the Carousel Settings cog).
-/// Set to 0 to hide it (WIP), 1 to show it.
 pub const CS_FRONT: usize = 1;
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -153,7 +151,6 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
-
 
 fn network_kind() -> u8 {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -181,7 +178,11 @@ fn detect_network_kind() -> u8 {
     let mut result = 0u8;
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if name == "lo" || name.starts_with("docker") || name.starts_with("veth") || name.starts_with("br-") {
+        if name == "lo"
+            || name.starts_with("docker")
+            || name.starts_with("veth")
+            || name.starts_with("br-")
+        {
             continue;
         }
         let p = e.path();
@@ -214,15 +215,31 @@ pub fn shadowed_text(
 ) {
     let alpha_pct = color.a() as f32 / 255.0;
     let lum = 0.299 * color.r() as f32 + 0.587 * color.g() as f32 + 0.114 * color.b() as f32;
-    let (oc, oa) = if lum < 130.0 { (255u8, 130.0f32) } else { (0u8, 240.0f32) };
+    let (oc, oa) = if lum < 130.0 {
+        (255u8, 130.0f32)
+    } else {
+        (0u8, 240.0f32)
+    };
     let outline_col = Color32::from_rgba_unmultiplied(oc, oc, oc, (oa * alpha_pct) as u8);
     let offsets = [-1.5f32, 0.0f32, 1.5f32];
     for &dx in &offsets {
         for &dy in &offsets {
             if dx != 0.0 || dy != 0.0 {
-                painter.text(pos + Vec2::new(dx, dy), align, text, font.clone(), outline_col);
+                painter.text(
+                    pos + Vec2::new(dx, dy),
+                    align,
+                    text,
+                    font.clone(),
+                    outline_col,
+                );
                 if bold {
-                    painter.text(pos + Vec2::new(dx + 0.8, dy), align, text, font.clone(), outline_col);
+                    painter.text(
+                        pos + Vec2::new(dx + 0.8, dy),
+                        align,
+                        text,
+                        font.clone(),
+                        outline_col,
+                    );
                 }
             }
         }
@@ -241,51 +258,67 @@ pub fn draw_rounded_image(
     tint: Color32,
 ) {
     let mut mesh = egui::epaint::Mesh::with_texture(tex_id);
-    
-    // Center vertex
+
     let center = rect.center();
     mesh.vertices.push(egui::epaint::Vertex {
         pos: center,
         uv: egui::pos2(0.5, 0.5),
         color: tint,
     });
-    
+
     let x0 = rect.min.x;
     let y0 = rect.min.y;
     let x1 = rect.max.x;
     let y1 = rect.max.y;
-    
+
     let mut pts = Vec::new();
-    
+
     let corners = [
-        (egui::pos2(x1 - r, y0 + r), -std::f32::consts::FRAC_PI_2, 0.0f32),
-        (egui::pos2(x1 - r, y1 - r), 0.0f32, std::f32::consts::FRAC_PI_2),
-        (egui::pos2(x0 + r, y1 - r), std::f32::consts::FRAC_PI_2, std::f32::consts::PI),
-        (egui::pos2(x0 + r, y0 + r), std::f32::consts::PI, 3.0 * std::f32::consts::FRAC_PI_2),
+        (
+            egui::pos2(x1 - r, y0 + r),
+            -std::f32::consts::FRAC_PI_2,
+            0.0f32,
+        ),
+        (
+            egui::pos2(x1 - r, y1 - r),
+            0.0f32,
+            std::f32::consts::FRAC_PI_2,
+        ),
+        (
+            egui::pos2(x0 + r, y1 - r),
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+        ),
+        (
+            egui::pos2(x0 + r, y0 + r),
+            std::f32::consts::PI,
+            3.0 * std::f32::consts::FRAC_PI_2,
+        ),
     ];
-    
+
     let steps_per_corner = 8;
     for &(c_center, start_angle, end_angle) in &corners {
         for s in 0..=steps_per_corner {
-            let angle = start_angle + (s as f32 / steps_per_corner as f32) * (end_angle - start_angle);
+            let angle =
+                start_angle + (s as f32 / steps_per_corner as f32) * (end_angle - start_angle);
             pts.push(c_center + Vec2::new(angle.cos(), angle.sin()) * r);
         }
     }
-    
+
     let w = rect.width();
     let h = rect.height();
-    
+
     for pt in pts {
         let uv_x = if w > 0.0 { (pt.x - x0) / w } else { 0.0 };
         let uv_y = if h > 0.0 { (pt.y - y0) / h } else { 0.0 };
-        
+
         mesh.vertices.push(egui::epaint::Vertex {
             pos: pt,
             uv: egui::pos2(uv_x, uv_y),
             color: tint,
         });
     }
-    
+
     let n_vertices = mesh.vertices.len() as u32;
     for i in 1..(n_vertices - 1) {
         mesh.indices.push(0);
@@ -295,7 +328,7 @@ pub fn draw_rounded_image(
     mesh.indices.push(0);
     mesh.indices.push(n_vertices - 1);
     mesh.indices.push(1);
-    
+
     painter.add(egui::Shape::mesh(mesh));
 }
 
@@ -308,44 +341,69 @@ pub fn draw_gradient_rounded_rect(
     alpha: u8,
 ) {
     let mut mesh = egui::epaint::Mesh::default();
-    
+
     mesh.vertices.push(egui::epaint::Vertex {
         pos: center,
         uv: egui::pos2(0.0, 0.0),
         color: Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
     });
-    
+
     let x0 = rect.min.x;
     let y0 = rect.min.y;
     let x1 = rect.max.x;
     let y1 = rect.max.y;
-    
+
     let mut pts = Vec::new();
-    
+
     let corners = [
-        (egui::pos2(x1 - r, y0 + r), -std::f32::consts::FRAC_PI_2, 0.0f32),
-        (egui::pos2(x1 - r, y1 - r), 0.0f32, std::f32::consts::FRAC_PI_2),
-        (egui::pos2(x0 + r, y1 - r), std::f32::consts::FRAC_PI_2, std::f32::consts::PI),
-        (egui::pos2(x0 + r, y0 + r), std::f32::consts::PI, 3.0 * std::f32::consts::FRAC_PI_2),
+        (
+            egui::pos2(x1 - r, y0 + r),
+            -std::f32::consts::FRAC_PI_2,
+            0.0f32,
+        ),
+        (
+            egui::pos2(x1 - r, y1 - r),
+            0.0f32,
+            std::f32::consts::FRAC_PI_2,
+        ),
+        (
+            egui::pos2(x0 + r, y1 - r),
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+        ),
+        (
+            egui::pos2(x0 + r, y0 + r),
+            std::f32::consts::PI,
+            3.0 * std::f32::consts::FRAC_PI_2,
+        ),
     ];
-    
+
     let steps_per_corner = 8;
     for &(c_center, start_angle, end_angle) in &corners {
         for s in 0..=steps_per_corner {
-            let angle = start_angle + (s as f32 / steps_per_corner as f32) * (end_angle - start_angle);
+            let angle =
+                start_angle + (s as f32 / steps_per_corner as f32) * (end_angle - start_angle);
             pts.push(c_center + Vec2::new(angle.cos(), angle.sin()) * r);
         }
     }
-    
+
     let min_y = rect.min.y;
     let max_y = rect.max.y;
     let min_x = rect.min.x;
     let max_x = rect.max.x;
     let h = max_y - min_y;
     let w = max_x - min_x;
-    
-    let center_dx = if w > 0.0 { (center.x - min_x) / w - 0.5 } else { 0.0 };
-    let center_dy = if h > 0.0 { (center.y - min_y) / h - 0.5 } else { 0.0 };
+
+    let center_dx = if w > 0.0 {
+        (center.x - min_x) / w - 0.5
+    } else {
+        0.0
+    };
+    let center_dy = if h > 0.0 {
+        (center.y - min_y) / h - 0.5
+    } else {
+        0.0
+    };
     let center_angle = center_dy.atan2(center_dx);
     let center_phase = center_angle + t * 1.5;
     let cr = ((center_phase.sin() * 0.45 + 0.55) * 255.0) as u8;
@@ -355,22 +413,22 @@ pub fn draw_gradient_rounded_rect(
     for pt in pts {
         let tx = if w > 0.0 { (pt.x - min_x) / w } else { 0.0 };
         let ty = if h > 0.0 { (pt.y - min_y) / h } else { 0.0 };
-        
+
         let dx = tx - 0.5;
         let dy = ty - 0.5;
         let angle = dy.atan2(dx);
         let phase = angle + t * 1.5;
-        
+
         let r_val = ((phase.sin() * 0.45 + 0.55) * 255.0).clamp(0.0, 255.0) as u8;
         let g_val = (((phase + 2.09).sin() * 0.35 + 0.65) * 255.0).clamp(0.0, 255.0) as u8;
-        
+
         mesh.vertices.push(egui::epaint::Vertex {
             pos: pt,
             uv: egui::pos2(0.0, 0.0),
             color: Color32::from_rgba_unmultiplied(r_val, g_val, 255, alpha),
         });
     }
-    
+
     let n_vertices = mesh.vertices.len() as u32;
     for i in 1..(n_vertices - 1) {
         mesh.indices.push(0);
@@ -380,7 +438,7 @@ pub fn draw_gradient_rounded_rect(
     mesh.indices.push(0);
     mesh.indices.push(n_vertices - 1);
     mesh.indices.push(1);
-    
+
     painter.add(egui::Shape::mesh(mesh));
 }
 
@@ -393,59 +451,76 @@ pub fn draw_rainbow_rounded_rect(
     alpha: u8,
 ) {
     let mut mesh = egui::epaint::Mesh::default();
-    
+
     mesh.vertices.push(egui::epaint::Vertex {
         pos: center,
         uv: egui::pos2(0.0, 0.0),
         color: Color32::from_rgba_unmultiplied(200, 200, 200, alpha),
     });
-    
+
     let x0 = rect.min.x;
     let y0 = rect.min.y;
     let x1 = rect.max.x;
     let y1 = rect.max.y;
-    
+
     let mut pts = Vec::new();
     let corners = [
-        (egui::pos2(x1 - r, y0 + r), -std::f32::consts::FRAC_PI_2, 0.0f32),
-        (egui::pos2(x1 - r, y1 - r), 0.0f32, std::f32::consts::FRAC_PI_2),
-        (egui::pos2(x0 + r, y1 - r), std::f32::consts::FRAC_PI_2, std::f32::consts::PI),
-        (egui::pos2(x0 + r, y0 + r), std::f32::consts::PI, 3.0 * std::f32::consts::FRAC_PI_2),
+        (
+            egui::pos2(x1 - r, y0 + r),
+            -std::f32::consts::FRAC_PI_2,
+            0.0f32,
+        ),
+        (
+            egui::pos2(x1 - r, y1 - r),
+            0.0f32,
+            std::f32::consts::FRAC_PI_2,
+        ),
+        (
+            egui::pos2(x0 + r, y1 - r),
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+        ),
+        (
+            egui::pos2(x0 + r, y0 + r),
+            std::f32::consts::PI,
+            3.0 * std::f32::consts::FRAC_PI_2,
+        ),
     ];
-    
+
     let steps_per_corner = 8;
     for &(c_center, start_angle, end_angle) in &corners {
         for s in 0..=steps_per_corner {
-            let angle = start_angle + (s as f32 / steps_per_corner as f32) * (end_angle - start_angle);
+            let angle =
+                start_angle + (s as f32 / steps_per_corner as f32) * (end_angle - start_angle);
             pts.push(c_center + Vec2::new(angle.cos(), angle.sin()) * r);
         }
     }
-    
+
     let min_y = rect.min.y;
     let max_y = rect.max.y;
     let min_x = rect.min.x;
     let max_x = rect.max.x;
     let h = max_y - min_y;
     let w = max_x - min_x;
-    
+
     for pt in pts {
         let tx = if w > 0.0 { (pt.x - min_x) / w } else { 0.0 };
         let ty = if h > 0.0 { (pt.y - min_y) / h } else { 0.0 };
-        
+
         let dx = tx - 0.5;
         let dy = ty - 0.5;
         let angle = dy.atan2(dx);
         let hue = ((angle / std::f32::consts::TAU) + t * 0.08) % 1.0;
         let hue = if hue < 0.0 { hue + 1.0 } else { hue };
         let (cr, cg, cb) = hsv_to_rgb(hue, 0.85, 0.85);
-        
+
         mesh.vertices.push(egui::epaint::Vertex {
             pos: pt,
             uv: egui::pos2(0.0, 0.0),
             color: Color32::from_rgba_unmultiplied(cr, cg, cb, alpha),
         });
     }
-    
+
     let n_vertices = mesh.vertices.len() as u32;
     for i in 1..(n_vertices - 1) {
         mesh.indices.push(0);
@@ -455,7 +530,7 @@ pub fn draw_rainbow_rounded_rect(
     mesh.indices.push(0);
     mesh.indices.push(n_vertices - 1);
     mesh.indices.push(1);
-    
+
     painter.add(egui::Shape::mesh(mesh));
 }
 
@@ -465,7 +540,7 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     let p = v * (1.0 - s);
     let q = v * (1.0 - f * s);
     let t = v * (1.0 - (1.0 - f) * s);
-    
+
     let (r, g, b) = match h_i % 6 {
         0 => (v, t, p),
         1 => (q, v, p),
@@ -474,7 +549,7 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
         4 => (t, p, v),
         _ => (v, p, q),
     };
-    
+
     ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
 
@@ -497,11 +572,11 @@ fn draw_gradient_circle(
     for i in 0..=n_points {
         let angle = (i as f32 / n_points as f32) * std::f32::consts::TAU;
         let pos = center + Vec2::new(angle.cos(), angle.sin()) * outer_r;
-        
+
         let phase = angle + t * 1.5;
         let r = ((phase.sin() * 0.45 + 0.55) * 255.0).clamp(0.0, 255.0) as u8;
         let g = (((phase + 2.09).sin() * 0.35 + 0.65) * 255.0).clamp(0.0, 255.0) as u8;
-        
+
         mesh.vertices.push(egui::epaint::Vertex {
             pos,
             uv: egui::pos2(0.0, 0.0),
@@ -528,8 +603,14 @@ pub fn draw_backdrop(
 ) {
     use crate::app_settings::BackdropTheme;
     let (dark_base, light_base) = match theme {
-        BackdropTheme::None => (Color32::from_rgb(0x18, 0x18, 0x1F), Color32::from_rgb(0xCE, 0xCE, 0xD8)),
-        _ => (Color32::from_rgb(0x08, 0x08, 0x0C), Color32::from_rgb(0xD6, 0xD6, 0xE0)),
+        BackdropTheme::None => (
+            Color32::from_rgb(0x18, 0x18, 0x1F),
+            Color32::from_rgb(0xCE, 0xCE, 0xD8),
+        ),
+        _ => (
+            Color32::from_rgb(0x08, 0x08, 0x0C),
+            Color32::from_rgb(0xD6, 0xD6, 0xE0),
+        ),
     };
     let base = lerp_color(dark_base, light_base, light_t);
     match theme {
@@ -542,9 +623,15 @@ pub fn draw_backdrop(
         BackdropTheme::Space => draw_space_backdrop(painter, rect, color, t, opacity, logo),
         BackdropTheme::CherryBlossom => draw_cherry_blossom_backdrop(painter, rect, color, t, opacity, logo, light_t),
         BackdropTheme::None => {
-            if opacity <= 0.001 { return; }
+            if opacity <= 0.001 {
+                return;
+            }
             let a = (opacity * 255.0) as u8;
-            painter.rect_filled(rect, Rounding::ZERO, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a));
+            painter.rect_filled(
+                rect,
+                Rounding::ZERO,
+                Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a),
+            );
         }
     }
 }
@@ -555,7 +642,13 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
     }
     let a = |x: f32| (x * opacity).clamp(0.0, 255.0) as u8;
     let sh = |c: Color32, f: f32| -> Color32 {
-        let adj = |v: u8| if f >= 0.0 { (v as f32 + (255.0 - v as f32) * f) as u8 } else { (v as f32 * (1.0 + f)) as u8 };
+        let adj = |v: u8| {
+            if f >= 0.0 {
+                (v as f32 + (255.0 - v as f32) * f) as u8
+            } else {
+                (v as f32 * (1.0 + f)) as u8
+            }
+        };
         Color32::from_rgb(adj(c.r()), adj(c.g()), adj(c.b()))
     };
     let mix = |c: Color32, d: Color32, f: f32| -> Color32 {
@@ -569,26 +662,57 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
     let w = rect.width();
     let h = rect.height();
 
-    // deep space + a faint theme-tinted nebula glow low-centre
-    painter.rect_filled(rect, Rounding::ZERO, Color32::from_rgba_unmultiplied(4, 5, 9, a(255.0)));
+    painter.rect_filled(
+        rect,
+        Rounding::ZERO,
+        Color32::from_rgba_unmultiplied(4, 5, 9, a(255.0)),
+    );
     let neb = sh(color, -0.1);
     for g in 0..6 {
-        painter.circle_filled(egui::pos2(rect.center().x, rect.max.y + h * 0.06), w * (0.52 - g as f32 * 0.03), Color32::from_rgba_unmultiplied(neb.r(), neb.g(), neb.b(), a(5.0)));
+        painter.circle_filled(
+            egui::pos2(rect.center().x, rect.max.y + h * 0.06),
+            w * (0.52 - g as f32 * 0.03),
+            Color32::from_rgba_unmultiplied(neb.r(), neb.g(), neb.b(), a(5.0)),
+        );
     }
 
-    // distant planets in the far (top) band — small, like a solar system
-    // (fx, fy, radius, color, has_ring, bob_amplitude, bob_period, bob_phase)
     let planets: [(f32, f32, f32, Color32, bool, f32, f32, f32); 3] = [
-        (0.86, 0.11, 15.0, Color32::from_rgb(0xC9, 0x8A, 0x4B), true,  3.5, 7.0, 0.0),
-        (0.15, 0.17,  9.0, sh(color, 0.15),                     false, 2.8, 9.0, 2.1),
-        (0.63, 0.06,  6.0, Color32::from_rgb(0x9C, 0x5A, 0x4A), false, 2.2, 6.0, 4.5),
+        (
+            0.86,
+            0.11,
+            15.0,
+            Color32::from_rgb(0xC9, 0x8A, 0x4B),
+            true,
+            3.5,
+            7.0,
+            0.0,
+        ),
+        (0.15, 0.17, 9.0, sh(color, 0.15), false, 2.8, 9.0, 2.1),
+        (
+            0.63,
+            0.06,
+            6.0,
+            Color32::from_rgb(0x9C, 0x5A, 0x4A),
+            false,
+            2.2,
+            6.0,
+            4.5,
+        ),
     ];
     for (fx, fy, pr2, pcol, ring, bob_amp, bob_period, bob_phase) in planets {
         let bob = bob_amp * (t / bob_period * std::f32::consts::TAU + bob_phase).sin();
         let c = egui::pos2(rect.min.x + fx * w, rect.min.y + fy * h + bob);
-        painter.circle_filled(c, pr2, Color32::from_rgba_unmultiplied(pcol.r(), pcol.g(), pcol.b(), a(175.0)));
+        painter.circle_filled(
+            c,
+            pr2,
+            Color32::from_rgba_unmultiplied(pcol.r(), pcol.g(), pcol.b(), a(175.0)),
+        );
         let hl = sh(pcol, 0.3);
-        painter.circle_filled(c - Vec2::new(pr2 * 0.32, pr2 * 0.32), pr2 * 0.66, Color32::from_rgba_unmultiplied(hl.r(), hl.g(), hl.b(), a(120.0)));
+        painter.circle_filled(
+            c - Vec2::new(pr2 * 0.32, pr2 * 0.32),
+            pr2 * 0.66,
+            Color32::from_rgba_unmultiplied(hl.r(), hl.g(), hl.b(), a(120.0)),
+        );
         if ring {
             for r in 0..2 {
                 let rr = pr2 * (1.7 + r as f32 * 0.2);
@@ -597,18 +721,21 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
                     let ang = k as f32 / 40.0 * std::f32::consts::TAU;
                     pts.push(c + Vec2::new(ang.cos() * rr, ang.sin() * rr * 0.32));
                 }
-                painter.add(egui::Shape::line(pts, Stroke::new(1.4_f32, Color32::from_rgba_unmultiplied(0xD8, 0xBE, 0x8C, a(110.0)))));
+                painter.add(egui::Shape::line(
+                    pts,
+                    Stroke::new(
+                        1.4_f32,
+                        Color32::from_rgba_unmultiplied(0xD8, 0xBE, 0x8C, a(110.0)),
+                    ),
+                ));
             }
         }
     }
 
-    // dense drifting starfield — stars move right-to-left at parallax speeds
-    // Larger stars drift faster, giving a sense of depth.
     let planet_top = rect.max.y - h * 0.30;
     for i in 0..700u32 {
         let base_x = hash(i * 2) * w;
         let r = 0.5 + hash(i * 5).powf(2.2) * 2.1;
-        // drift speed: 4–18 px/s, larger stars drift faster (parallax)
         let speed = 4.0 + r * 4.0;
         let sx = rect.min.x + (base_x - t * speed).rem_euclid(w);
         let sy = rect.min.y + hash(i * 2 + 1) * h;
@@ -624,20 +751,30 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
         } else {
             Color32::from_rgb(0xFF, 0xFF, 0xFF)
         };
-        let base_a = if sy < rect.min.y + h * 0.34 { 235.0 } else { 195.0 };
-        
-        // Add pulsating glow to larger stars (r > 1.6)
+        let base_a = if sy < rect.min.y + h * 0.34 {
+            235.0
+        } else {
+            195.0
+        };
+
         if r > 1.6 {
             let glow_pulse = 0.5 + 0.5 * (t * 2.5 + hash(i * 13) * 10.0).sin();
             let glow_r = r * (1.5 + 0.8 * glow_pulse);
             let glow_a = (base_a * tw * 0.25 * (0.6 + 0.4 * glow_pulse)).min(255.0);
-            painter.circle_filled(egui::pos2(sx, sy), glow_r, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a(glow_a)));
+            painter.circle_filled(
+                egui::pos2(sx, sy),
+                glow_r,
+                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a(glow_a)),
+            );
         }
 
-        painter.circle_filled(egui::pos2(sx, sy), r, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a(base_a * tw)));
+        painter.circle_filled(
+            egui::pos2(sx, sy),
+            r,
+            Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a(base_a * tw)),
+        );
     }
 
-    // shooting stars — 3 staggered emitters spread across the top third
     for k in 0..3u32 {
         let period = 5.0 + k as f32 * 1.7;
         let off = hash(k * 131) * period;
@@ -660,36 +797,85 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
             for s in 0..14 {
                 let ft = s as f32 / 14.0;
                 let px = head - Vec2::new(dir * 13.0 * s as f32, 13.0 * slope * s as f32);
-                let sc = if ft < 0.45 { mix(Color32::WHITE, stt, ft * 2.2) } else { stt };
-                painter.circle_filled(px, 1.9 * (1.0 - ft), Color32::from_rgba_unmultiplied(sc.r(), sc.g(), sc.b(), a(230.0 * fade * (1.0 - ft))));
+                let sc = if ft < 0.45 {
+                    mix(Color32::WHITE, stt, ft * 2.2)
+                } else {
+                    stt
+                };
+                painter.circle_filled(
+                    px,
+                    1.9 * (1.0 - ft),
+                    Color32::from_rgba_unmultiplied(
+                        sc.r(),
+                        sc.g(),
+                        sc.b(),
+                        a(230.0 * fade * (1.0 - ft)),
+                    ),
+                );
             }
-            painter.circle_filled(head, 2.4, Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, a(255.0 * fade)));
+            painter.circle_filled(
+                head,
+                2.4,
+                Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, a(255.0 * fade)),
+            );
         }
     }
 
-    // Earth — a small rotating horizon arc hugging the bottom (behind the dock)
     let pr = w * 1.15;
     let pc = egui::pos2(rect.center().x, planet_top + pr);
     let ocean = sh(mix(Color32::from_rgb(0x14, 0x3A, 0x6E), color, 0.22), -0.03);
     let land = mix(Color32::from_rgb(0x33, 0x72, 0x40), color, 0.08);
     let atmo = mix(Color32::from_rgb(0x6E, 0xC6, 0xFF), color, 0.35);
     let uv = egui::epaint::WHITE_UV;
-    let planet_clip = painter.with_clip_rect(egui::Rect::from_min_max(egui::pos2(rect.min.x, planet_top - 30.0), rect.max));
+    let planet_clip = painter.with_clip_rect(egui::Rect::from_min_max(
+        egui::pos2(rect.min.x, planet_top - 30.0),
+        rect.max,
+    ));
     for g in 0..4 {
         let e = (4 - g) as f32 * 3.0;
-        planet_clip.circle_stroke(pc, pr + e, Stroke::new(2.6_f32, Color32::from_rgba_unmultiplied(atmo.r(), atmo.g(), atmo.b(), a(13.0 * (1.0 - g as f32 / 4.0)))));
+        planet_clip.circle_stroke(
+            pc,
+            pr + e,
+            Stroke::new(
+                2.6_f32,
+                Color32::from_rgba_unmultiplied(
+                    atmo.r(),
+                    atmo.g(),
+                    atmo.b(),
+                    a(13.0 * (1.0 - g as f32 / 4.0)),
+                ),
+            ),
+        );
     }
-    planet_clip.circle_filled(pc, pr, Color32::from_rgba_unmultiplied(ocean.r(), ocean.g(), ocean.b(), a(255.0)));
+    planet_clip.circle_filled(
+        pc,
+        pr,
+        Color32::from_rgba_unmultiplied(ocean.r(), ocean.g(), ocean.b(), a(255.0)),
+    );
     let lit = sh(ocean, 0.30);
-    planet_clip.circle_stroke(pc, pr - 5.0, Stroke::new(9.0_f32, Color32::from_rgba_unmultiplied(lit.r(), lit.g(), lit.b(), a(80.0))));
+    planet_clip.circle_stroke(
+        pc,
+        pr - 5.0,
+        Stroke::new(
+            9.0_f32,
+            Color32::from_rgba_unmultiplied(lit.r(), lit.g(), lit.b(), a(80.0)),
+        ),
+    );
 
     let spin = t * 0.14;
     let land_col = Color32::from_rgba_unmultiplied(land.r(), land.g(), land.b(), a(255.0));
-    // (lon, lat, angular size, aspect = width/height)
     let conts: [(f32, f32, f32, f32); 11] = [
-        (0.20, 1.14, 0.13, 1.9), (0.85, 1.28, 0.055, 0.8), (1.45, 1.10, 0.13, 0.65), (2.05, 1.26, 0.050, 1.2),
-        (2.65, 1.16, 0.11, 1.6), (3.25, 1.30, 0.040, 1.0), (3.80, 1.11, 0.12, 0.75), (4.45, 1.24, 0.065, 1.3),
-        (5.05, 1.15, 0.10, 1.7), (5.55, 1.29, 0.045, 0.9), (6.05, 1.18, 0.085, 1.1),
+        (0.20, 1.14, 0.13, 1.9),
+        (0.85, 1.28, 0.055, 0.8),
+        (1.45, 1.10, 0.13, 0.65),
+        (2.05, 1.26, 0.050, 1.2),
+        (2.65, 1.16, 0.11, 1.6),
+        (3.25, 1.30, 0.040, 1.0),
+        (3.80, 1.11, 0.12, 0.75),
+        (4.45, 1.24, 0.065, 1.3),
+        (5.05, 1.15, 0.10, 1.7),
+        (5.55, 1.29, 0.045, 0.9),
+        (6.05, 1.18, 0.085, 1.1),
     ];
     for (ci, (clon, clat, csz, aspect)) in conts.iter().enumerate() {
         let clam = clon + spin;
@@ -713,10 +899,18 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
         let ph3 = hash(ci as u32 * 41) * 6.283;
         let n = 34usize;
         let mut mesh = egui::epaint::Mesh::default();
-        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(ccx, ccy), uv, color: land_col });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(ccx, ccy),
+            uv,
+            color: land_col,
+        });
         for k in 0..n {
             let ang = k as f32 / n as f32 * std::f32::consts::TAU;
-            let wob = (0.72 + 0.22 * (ang * 2.0 + ph1).sin() + 0.14 * (ang * 3.0 + ph2).sin() + 0.08 * (ang * 5.0 + ph3).sin()).max(0.25);
+            let wob = (0.72
+                + 0.22 * (ang * 2.0 + ph1).sin()
+                + 0.14 * (ang * 3.0 + ph2).sin()
+                + 0.08 * (ang * 5.0 + ph3).sin())
+            .max(0.25);
             let dlam = ang.cos() * sz * aspect * wob;
             let dphi = ang.sin() * sz * wob;
             let lat = clat + dphi;
@@ -724,15 +918,19 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
             let lc = lat.cos();
             let px = pc.x + pr * lc * lon.sin();
             let py = pc.y - pr * lat.sin();
-            mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(px, py), uv, color: land_col });
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(px, py),
+                uv,
+                color: land_col,
+            });
         }
         for k in 0..n as u32 {
-            mesh.indices.extend_from_slice(&[0, 1 + k, 1 + ((k + 1) % n as u32)]);
+            mesh.indices
+                .extend_from_slice(&[0, 1 + k, 1 + ((k + 1) % n as u32)]);
         }
         planet_clip.add(egui::Shape::mesh(mesh));
     }
 
-    // ---- easter egg: NeXium logo drifts across in a space helmet (~every 30s) ----
     if let Some(logo) = logo {
         let period = 80.0;
         let ph = (t / period).fract();
@@ -741,12 +939,10 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
             let p = ph / dur;
             let cyc = (t / period).floor().max(0.0) as u32;
             let x = rect.min.x - w * 0.14 + p * (w * 1.28);
-            // route through the clear upper sky, above the game icons
             let y = rect.min.y + (0.09 + hash(cyc.wrapping_mul(97).wrapping_add(3)) * 0.06) * h + (t * 1.4).sin() * h * 0.012;
             let sz = w * 0.058;
             let c = egui::pos2(x, y);
             let uv01 = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-            // ---- layered rocket flame trailing behind (flickering) ----
             let flick = 0.75 + 0.25 * (t * 26.0).sin();
             let base_x = c.x - sz * 0.72;
             let base_y = c.y + sz * 0.14;
@@ -765,7 +961,6 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
                     painter.circle_filled(egui::pos2(px, py), pr, Color32::from_rgba_unmultiplied(col.0, col.1, col.2, a(al)));
                 }
             }
-            // ---- astronaut helmet: glow, white shell, dark visor, logo face, glass + shine ----
             painter.circle_filled(c, sz * 0.86, Color32::from_rgba_unmultiplied(0x7C, 0x9A, 0xD8, a(45.0)));
             painter.circle_filled(c, sz * 0.78, Color32::from_rgba_unmultiplied(0xEE, 0xF1, 0xFA, a(255.0)));
             painter.circle_filled(c, sz * 0.66, Color32::from_rgba_unmultiplied(0x27, 0x33, 0x54, a(255.0)));
@@ -799,14 +994,11 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
     let tau = std::f32::consts::TAU;
     let w = rect.width();
     let h = rect.height();
-    // Light mode = day, Dark mode = night
     let day = light_t.clamp(0.0, 1.0);
     let night = 1.0 - day;
-    // three quadrants: sky (top) · island of cherry trees (mid) · water (bottom)
     let island_top = rect.min.y + h * 0.42;
     let water_top = rect.min.y + h * 0.80;
 
-    // ---- sky: warm pink by day, deep indigo dusk by night ----
     let sky_top = mix(mix(Color32::from_rgb(0x22, 0x1D, 0x38), Color32::from_rgb(0xD6, 0xC2, 0xD9), day), color, 0.05);
     let sky_bot = mix(mix(Color32::from_rgb(0x45, 0x36, 0x52), Color32::from_rgb(0xF3, 0xDC, 0xE6), day), color, 0.04);
     {
@@ -820,7 +1012,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(mesh));
     }
-    // ---- stars (night only) ----
     if night > 0.01 {
         for i in 0..110u32 {
             let sx = rect.min.x + hash(i * 2) * w;
@@ -831,7 +1022,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
             painter.circle_filled(egui::pos2(sx, sy), r, rgba(col, a(210.0 * night * tw)));
         }
     }
-    // drifting soft clouds
     for ci in 0..5u32 {
         let speed = 4.0 + hash(ci * 13) * 5.0;
         let cx = rect.min.x + (hash(ci * 3) * w + t * speed).rem_euclid(w + w * 0.3) - w * 0.15;
@@ -844,7 +1034,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
             painter.circle_filled(egui::pos2(cx + jx, cy + (hash(ci * 17 + j) - 0.5) * cw * 0.15), jr, rgba(cloud, a(65.0 * (0.5 + 0.5 * day))));
         }
     }
-    // ---- sun (day) / moon (night): glow + disc with a gentle heat bob ----
     let sun_x = rect.min.x + w * 0.32;
     let sun_bob = (t * 0.6).sin() * h * 0.006 + (t * 1.7).sin() * h * 0.0025;
     let sun_c = egui::pos2(sun_x, island_top - h * 0.02 + sun_bob);
@@ -855,7 +1044,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         painter.circle_filled(sun_c, w * (0.22 - g as f32 * 0.028), rgba(glow_col, a((9.0 + g as f32 * 1.5) * (0.6 + 0.4 * day))));
     }
     let sun_r = w * 0.085;
-    // blazing rays are a daytime thing
     if day > 0.02 {
         for k in 0..14u32 {
             let ang = k as f32 / 14.0 * tau + t * 0.04;
@@ -869,14 +1057,12 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
     painter.circle_filled(sun_c, sun_r * 1.14, rgba(mix(Color32::from_rgb(0xD8, 0xE2, 0xFF), Color32::from_rgb(0xFF, 0xEC, 0xF2), day), a(70.0 + 25.0 * pulse * day)));
     painter.circle_filled(sun_c, sun_r, rgba(disc_col, a(238.0)));
     painter.circle_filled(sun_c - Vec2::new(sun_r * 0.18, sun_r * 0.22), sun_r * 0.66, rgba(mix(Color32::from_rgb(0xF2, 0xF6, 0xFF), Color32::WHITE, day), a(255.0)));
-    // moon craters (night)
     if night > 0.02 {
         let cr = Color32::from_rgb(0xC4, 0xCE, 0xEA);
         painter.circle_filled(sun_c + Vec2::new(sun_r * 0.28, -sun_r * 0.1), sun_r * 0.2, rgba(cr, a(150.0 * night)));
         painter.circle_filled(sun_c + Vec2::new(-sun_r * 0.1, sun_r * 0.34), sun_r * 0.14, rgba(cr, a(140.0 * night)));
         painter.circle_filled(sun_c + Vec2::new(sun_r * 0.05, -sun_r * 0.36), sun_r * 0.1, rgba(cr, a(130.0 * night)));
     }
-    // soft god rays fanning down from the sun (day)
     if day > 0.02 {
         let ray = mix(glow_col, Color32::WHITE, 0.4);
         for k in 0..7u32 {
@@ -892,7 +1078,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
             painter.add(egui::Shape::mesh(m));
         }
     }
-    // birds drifting across the far sky (day)
     if day > 0.02 {
         for i in 0..4u32 {
             let speed = 7.0 + hash(i * 3) * 6.0;
@@ -907,8 +1092,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         }
     }
 
-    // ---- far shore: island landmass + dense cherry-blossom forest ----
-    // fills an irregular top edge down to a flat baseline (landmasses / hills)
     let fill_to_baseline = |top: &[egui::Pos2], baseline: f32, col: Color32| {
         let mut mesh = egui::epaint::Mesh::default();
         for p in top {
@@ -921,7 +1104,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         }
         painter.add(egui::Shape::mesh(mesh));
     };
-    // distant hazy hills for depth (two soft bands)
     for hl in 0..2u32 {
         let steps = 30usize;
         let mut top = Vec::with_capacity(steps + 1);
@@ -934,9 +1116,7 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let hillcol = mix(sky_bot, if hl == 0 { Color32::from_rgb(0xCF, 0xAE, 0xCA) } else { Color32::from_rgb(0xBC, 0x98, 0xB8) }, 0.6);
         fill_to_baseline(&top, water_top, rgba(hillcol, a(225.0)));
     }
-    // island landmass — a peninsula jutting from the left, receding right into the water
     let land_edge = |fx: f32| -> f32 {
-        // gentle far shore across the whole width, a taller island on the left
         let hump = (1.0 - fx).clamp(0.0, 1.0).powf(1.2);
         water_top - h * (0.02 + 0.06 * hump)
     };
@@ -962,7 +1142,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         painter.add(egui::Shape::mesh(mesh));
         painter.add(egui::Shape::line(top, Stroke::new(2.5_f32, rgba(mix(landcol, Color32::from_rgb(0x8E, 0xA6, 0x62), 0.6), a(220.0)))));
     };
-    // ---- far-shore blossom forest: short flat silhouettes across the full width ----
     let gen_crowns = |seed: u32, n: u32, lift: f32, rmin: f32, rmax: f32| -> Vec<(f32, f32, f32)> {
         let mut v = Vec::new();
         for i in 0..n {
@@ -998,7 +1177,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         fill_to_baseline(top, water_top + 1.0, rgba(col, al));
         painter.add(egui::Shape::line(top.to_vec(), Stroke::new(2.0_f32, rgba(mix(col, Color32::from_rgb(0xFF, 0xF2, 0xF8), 0.5), (al as f32 * 0.6) as u8))));
     };
-    // box-blur a treeline so its silhouette has no gaps / craters
     let smooth = |pts: Vec<egui::Pos2>, win: usize| -> Vec<egui::Pos2> {
         (0..pts.len())
             .map(|i| {
@@ -1009,12 +1187,9 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
             })
             .collect()
     };
-    // distant hazy tree-line (smoothed → continuous, no crater)
     let back = smooth(silhouette(&gen_crowns(11, 30, 0.05, 0.035, 0.06)), 8);
     draw_forest(&back, mix(Color32::from_rgb(0xE7, 0xC2, 0xDB), sky_bot, 0.5), a(228.0));
-    // visible landmass the trees stand on (drawn over the haze so it's not buried)
     draw_land(painter);
-    // grass tufts scattered over the land
     for i in 0..90u32 {
         let fx = hash(i * 3 + 200);
         let gx = rect.min.x + fx * w;
@@ -1025,7 +1200,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let gcol = mix(Color32::from_rgb(0x6E, 0x8C, 0x4C), color, 0.0);
         painter.add(egui::Shape::line(vec![egui::pos2(gx, gy), egui::pos2(gx + lean, gy - gh)], Stroke::new(1.6_f32, rgba(gcol, a(175.0)))));
     }
-    // fallen petals resting on the ground
     for i in 0..48u32 {
         let fx = hash(i * 5 + 400);
         let px = rect.min.x + fx * w;
@@ -1035,7 +1209,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let pcol = if hash(i * 13 + 400) > 0.5 { Color32::from_rgb(0xF3, 0xB6, 0xD2) } else { Color32::from_rgb(0xE7, 0x9B, 0xC4) };
         painter.circle_filled(egui::pos2(px, py), pr, rgba(pcol, a(205.0)));
     }
-    // clean rounded cherry canopy with tasteful variety (3 symmetric styles + aspect)
     let draw_canopy = |cx: f32, cy: f32, cr: f32, seed: u32| {
         let base = Color32::from_rgb(0xDB, 0x8A, 0xBB);
         let shadow = mix(base, Color32::from_rgb(0x8E, 0x3F, 0x66), 0.32);
@@ -1061,7 +1234,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
                 painter.circle_filled(egui::pos2(cx, cy - cr * 0.6), cr * 0.46, bc);
             }
         }
-        // fluffy blossom bumps along the top edge for a detailed crown
         for tb in 0..4u32 {
             let ba = (tb as f32 / 3.0 - 0.5) * 1.5;
             let bx = cx + ba * cr * aspect;
@@ -1070,11 +1242,9 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         }
         painter.circle_filled(egui::pos2(cx - cr * 0.24, cy - cr * 0.4), cr * 0.38, rgba(hi, a(255.0)));
     };
-    // trees scattered at varying depths across the whole land (back → front)
-    let mut tlist: Vec<(f32, f32, f32, u32)> = Vec::new(); // cx, base_y, cr, seed
+    let mut tlist: Vec<(f32, f32, f32, u32)> = Vec::new();
     let ntrees = 72u32;
     for i in 0..ntrees {
-        // even spacing + small jitter so there are no gaps
         let fx = (i as f32 + 0.5) / ntrees as f32 + (hash(i * 3 + 7) - 0.5) * (1.4 / ntrees as f32);
         let cx = rect.min.x + fx * w;
         let island = (1.0 - fx).clamp(0.0, 1.0);
@@ -1098,7 +1268,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         m.vertices.push(egui::epaint::Vertex { pos: egui::pos2(cx - hw * 0.45, cy + cr * 0.25), uv, color: cc });
         m.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(m));
-        // branches fanning up into the canopy for detail (tips peek through)
         let btop = egui::pos2(cx, cy + cr * 0.4);
         let brc = rgba(mix(Color32::from_rgb(0x46, 0x2C, 0x22), color, 0.0), a(220.0));
         for br in 0..3u32 {
@@ -1109,10 +1278,8 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         }
         draw_canopy(cx, cy, cr, seed);
     }
-    // smoothed treeline for a clean (non-jagged) water reflection
     let front = smooth(silhouette(&tree_crowns), 7);
 
-    // ---- water (bottom quadrant) ----
     let water_hi = mix(mix(Color32::from_rgb(0x4C, 0x3E, 0x56), Color32::from_rgb(0xC6, 0xA2, 0xBC), day), color, 0.06);
     let water_lo = mix(mix(Color32::from_rgb(0x28, 0x20, 0x38), Color32::from_rgb(0x82, 0x62, 0x7C), day), color, 0.05);
     {
@@ -1126,7 +1293,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(mesh));
     }
-    // sun reflection — a broken shimmering column under the sun
     let sun_x = rect.min.x + w * 0.32;
     for j in 0..24u32 {
         let fy = j as f32 / 24.0;
@@ -1137,7 +1303,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let seg = egui::Rect::from_center_size(egui::pos2(sun_x + wob, y), Vec2::new(width, 2.5 + fy * 2.0));
         painter.rect_filled(seg, Rounding::same(2.0), rgba(mix(water_hi, Color32::from_rgb(0xFF, 0xF6, 0xFA), 0.72), al));
     }
-    // mirrored forest reflection in the water (flipped, faded, rippling)
     {
         let refl = mix(Color32::from_rgb(0xD4, 0x86, 0xB6), water_hi, 0.35);
         let mut mesh = egui::epaint::Mesh::default();
@@ -1153,7 +1318,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         }
         painter.add(egui::Shape::mesh(mesh));
     }
-    // drifting, shimmering ripple lines
     for j in 0..15u32 {
         let fy = (j as f32 + 0.5) / 15.0;
         let y = water_top + fy * (rect.max.y - water_top);
@@ -1172,8 +1336,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         painter.add(egui::Shape::line(pts, Stroke::new(1.4_f32, rgba(mix(water_hi, Color32::WHITE, 0.45), a(34.0 * shimmer * (1.0 - fy * 0.35))))));
     }
 
-    // ---- overhanging cherry branch (top-right): recursively forked wood with
-    //      5-petal blossoms strung along the branches, dense toward the tips ----
     let branch_col = mix(Color32::from_rgb(0x4A, 0x2E, 0x22), color, 0.0);
     let flower = |c: egui::Pos2, r: f32, col: Color32, al: u8| {
         for k in 0..5u32 {
@@ -1199,7 +1361,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         painter.add(egui::Shape::mesh(m));
         painter.circle_filled(b0, wb * 0.5, cc);
     };
-    // grow the bough from the top-right corner, collecting flower positions as we go
     let mut stack: Vec<(egui::Pos2, f32, f32, f32, u32)> = Vec::new();
     stack.push((egui::pos2(rect.max.x + 8.0, rect.min.y + h * 0.03), 2.85, w * 0.18, 13.0, 3));
     let mut flowers: Vec<(egui::Pos2, f32)> = Vec::new();
@@ -1208,7 +1369,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let dir = Vec2::new(angle.cos(), angle.sin());
         let end = start + dir * len + Vec2::new(0.0, len * 0.04);
         wood(start, end, width, width * 0.55);
-        // blossoms only on the thin outer branches, never the thick main bough
         if depth <= 1 {
             let perp = (end - start).normalized().rot90();
             let nf = ((len / 22.0) as u32).max(1);
@@ -1247,7 +1407,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         flower(*fp + Vec2::new(sway, 0.0), *r, col, a(252.0));
     }
 
-    // ---- easter egg: the NeXium logo fishing from a little boat (petals fall over it) ----
     if let Some(logo) = logo {
         let bob = (t * 0.9).sin() * h * 0.006;
         let bx = rect.min.x + w * 0.14;
@@ -1275,7 +1434,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         painter.circle_stroke(bob_end, 6.0 + (t * 2.0).sin().abs() * 4.0, Stroke::new(1.0_f32, rgba(Color32::WHITE, a(60.0))));
     }
 
-    // ---- falling petals (drift + tumble) ----
     let petal = |c: egui::Pos2, size: f32, ang: f32, col: Color32| {
         let (sa, ca) = ang.sin_cos();
         let n = 8usize;
@@ -1311,7 +1469,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
     }
 
 
-    // ---- fireflies drifting near the treeline / water's edge (night) ----
     if night > 0.01 {
         for i in 0..16u32 {
             let drift = t * (7.0 + hash(i * 11) * 9.0) / w;
@@ -1326,7 +1483,6 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         }
     }
 
-    // ---- soft vignette around the borders ----
     {
         let vc = Color32::from_rgb(0x2A, 0x16, 0x24);
         let vout = rgba(vc, a(70.0));
@@ -1356,9 +1512,15 @@ fn draw_gradient_backdrop(
     opacity: f32,
     base: Color32,
 ) {
-    if opacity <= 0.001 { return; }
+    if opacity <= 0.001 {
+        return;
+    }
     let base_alpha = (opacity * 255.0) as u8;
-    painter.rect_filled(rect, Rounding::ZERO, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), base_alpha));
+    painter.rect_filled(
+        rect,
+        Rounding::ZERO,
+        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), base_alpha),
+    );
 
     let top_y = rect.min.y + rect.height() * 0.42;
     let bot_y = rect.max.y;
@@ -1375,9 +1537,18 @@ fn draw_gradient_backdrop(
         };
         let bottom_alpha = ((peak * horiz * opacity).clamp(0.0, 255.0)) as u8;
         let top_col = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0);
-        let bot_col = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), bottom_alpha);
-        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x, top_y), uv: egui::pos2(0.0, 0.0), color: top_col });
-        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x, bot_y), uv: egui::pos2(0.0, 0.0), color: bot_col });
+        let bot_col =
+            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), bottom_alpha);
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(x, top_y),
+            uv: egui::pos2(0.0, 0.0),
+            color: top_col,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(x, bot_y),
+            uv: egui::pos2(0.0, 0.0),
+            color: bot_col,
+        });
     }
     for c in 0..cols {
         let tl = 2 * c as u32;
@@ -1399,15 +1570,20 @@ pub fn draw_wave_background(
     opacity: f32,
     base: Color32,
 ) {
-    if opacity <= 0.001 { return; }
+    if opacity <= 0.001 {
+        return;
+    }
     let bg_alpha = (opacity * 255.0) as u8;
-    painter.rect_filled(rect, Rounding::ZERO, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), bg_alpha));
+    painter.rect_filled(
+        rect,
+        Rounding::ZERO,
+        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), bg_alpha),
+    );
 
     let w = rect.width();
     let h = rect.height();
     let steps = 96usize;
 
-    // per-band shade (alternating lighter/darker) so adjacent waves contrast
     let sh = |c: Color32, f: f32| -> Color32 {
         let adj = |v: u8| if f >= 0.0 { (v as f32 + (255.0 - v as f32) * f) as u8 } else { (v as f32 * (1.0 + f)) as u8 };
         Color32::from_rgb(adj(c.r()), adj(c.g()), adj(c.b()))
@@ -1422,8 +1598,8 @@ pub fn draw_wave_background(
 
     for &(base_frac, amp_frac, phase_off, speed, alpha, shade) in bands {
         let base_y = rect.min.y + h * base_frac;
-        let amp    = h * amp_frac;
-        let phase  = t * speed + phase_off;
+        let amp = h * amp_frac;
+        let phase = t * speed + phase_off;
 
         let band_alpha = ((alpha as f32) * opacity) as u8;
         if band_alpha == 0 { continue; }
@@ -1432,12 +1608,12 @@ pub fn draw_wave_background(
 
         let mut mesh = egui::epaint::Mesh::default();
         for s in 0..=steps {
-            let x  = rect.min.x + (s as f32 / steps as f32) * w;
+            let x = rect.min.x + (s as f32 / steps as f32) * w;
             let nx = s as f32 / steps as f32;
-            let y  = base_y
+            let y = base_y
                 + (nx * std::f32::consts::TAU + phase).sin() * amp
                 + (nx * std::f32::consts::TAU * 1.7 + phase * 0.8).cos() * amp * 0.4;
-            
+
             mesh.vertices.push(egui::epaint::Vertex {
                 pos: egui::pos2(x, y),
                 uv: egui::pos2(0.0, 0.0),
@@ -1449,7 +1625,7 @@ pub fn draw_wave_background(
                 color: fill,
             });
         }
-        
+
         for i in 0..steps {
             let tl = 2 * i as u32;
             let bl = tl + 1;
@@ -1459,7 +1635,6 @@ pub fn draw_wave_background(
         }
         let crest_pts: Vec<egui::Pos2> = (0..=steps).map(|s| mesh.vertices[2 * s].pos).collect();
         painter.add(egui::Shape::mesh(mesh));
-        // crest edge in a contrasting shade so the wave is always legible
         let crest = sh(color, if shade >= 0.0 { -0.4 } else { 0.55 });
         let ca = ((alpha as f32 + 70.0).min(210.0) * opacity) as u8;
         painter.add(egui::Shape::line(crest_pts.clone(), Stroke::new(2.4_f32, Color32::from_rgba_unmultiplied(crest.r(), crest.g(), crest.b(), (ca as f32 * 0.5) as u8))));
@@ -1511,7 +1686,6 @@ pub fn carousel_view(
     }
     let interactive = interactive && !state.search_kb.open;
 
-    // 1. Filter games based on search_buf
     let mut filtered_indices: Vec<usize> = if state.search_buf.is_empty() {
         (0..lib.games.len()).collect()
     } else {
@@ -1522,11 +1696,19 @@ pub fn carousel_view(
     };
     let order_rank: std::collections::HashMap<&std::path::PathBuf, usize> = carousel_order
         .iter()
-        .filter_map(|e| match e { crate::app_settings::CarouselRef::Game(p) => Some(p), _ => None })
+        .filter_map(|e| match e {
+            crate::app_settings::CarouselRef::Game(p) => Some(p),
+            _ => None,
+        })
         .enumerate()
         .map(|(i, p)| (p, i))
         .collect();
-    filtered_indices.sort_by_key(|&idx| order_rank.get(&lib.games[idx].path).copied().unwrap_or(usize::MAX));
+    filtered_indices.sort_by_key(|&idx| {
+        order_rank
+            .get(&lib.games[idx].path)
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
     filtered_indices.sort_by(|&a, &b| {
         let fa = favorites.iter().any(|p| *p == lib.games[a].path);
         let fb = favorites.iter().any(|p| *p == lib.games[b].path);
@@ -1535,7 +1717,11 @@ pub fn carousel_view(
 
     let in_list = state.active_list.filter(|&li| li < lists.len());
     let list_games: Vec<usize> = if let Some(li) = in_list {
-        lists[li].games.iter().filter_map(|pth| lib.games.iter().position(|g| &g.path == pth)).collect()
+        lists[li]
+            .games
+            .iter()
+            .filter_map(|pth| lib.games.iter().position(|g| &g.path == pth))
+            .collect()
     } else {
         Vec::new()
     };
@@ -1545,12 +1731,16 @@ pub fn carousel_view(
         for e in carousel_order {
             if let crate::app_settings::CarouselRef::List(nm) = e {
                 if let Some(li) = lists.iter().position(|l| &l.name == nm) {
-                    if !ord.contains(&li) { ord.push(li); }
+                    if !ord.contains(&li) {
+                        ord.push(li);
+                    }
                 }
             }
         }
         for li in 0..lists.len() {
-            if !ord.contains(&li) { ord.push(li); }
+            if !ord.contains(&li) {
+                ord.push(li);
+            }
         }
         ord
     } else {
@@ -1568,10 +1758,26 @@ pub fn carousel_view(
         }
     }
 
-    let games_base = if in_list.is_some() { front } else { front + n_lists };
-    let n_games = if in_list.is_some() { list_games.len() } else { filtered_indices.len() };
-    let n_items = if in_list.is_some() { front + list_games.len() } else { games_base + n_games + 1 };
-    let game_src = if in_list.is_some() { &list_games } else { &filtered_indices };
+    let games_base = if in_list.is_some() {
+        front
+    } else {
+        front + n_lists
+    };
+    let n_games = if in_list.is_some() {
+        list_games.len()
+    } else {
+        filtered_indices.len()
+    };
+    let n_items = if in_list.is_some() {
+        front + list_games.len()
+    } else {
+        games_base + n_games + 1
+    };
+    let game_src = if in_list.is_some() {
+        &list_games
+    } else {
+        &filtered_indices
+    };
     let game_of = |i: usize| -> Option<usize> {
         if i >= games_base && i < games_base + n_games {
             game_src.get(i - games_base).copied()
@@ -1590,9 +1796,9 @@ pub fn carousel_view(
     let bg_rect = ui.max_rect();
     let t = ui.input(|i| i.time) as f32;
     let dt = ui.input(|i| i.stable_dt).min(0.1);
-    state.list_anim += ((if in_list.is_some() { 1.0 } else { 0.0 }) - state.list_anim) * (dt * 8.0).min(1.0);
+    state.list_anim +=
+        ((if in_list.is_some() { 1.0 } else { 0.0 }) - state.list_anim) * (dt * 8.0).min(1.0);
 
-    // Space is always a dark sky, so keep the UI bright on it (no black-on-black).
     let space_bg = backdrop_theme == crate::app_settings::BackdropTheme::Space;
     let theme_target = if light_mode && !space_bg { 1.0 } else { 0.0 };
     state.theme_t += (theme_target - state.theme_t) * (dt * 5.0).min(1.0);
@@ -1602,18 +1808,33 @@ pub fn carousel_view(
     let th = state.theme_t;
     let tl = |dark: Color32, light: Color32| lerp_color(dark, light, th);
     let col_text = tl(Color32::WHITE, Color32::from_rgb(0x1E, 0x1E, 0x28));
-    let col_muted = tl(Color32::from_rgb(0xD0, 0xD0, 0xDC), Color32::from_rgb(0x5A, 0x5A, 0x66));
-    let col_surface = tl(Color32::from_rgb(0x18, 0x18, 0x20), Color32::from_rgb(0xFF, 0xFF, 0xFF));
-    let col_bar = tl(Color32::from_rgb(0x10, 0x10, 0x14), Color32::from_rgb(0xF2, 0xF2, 0xF6));
-    let col_border = tl(Color32::from_rgb(0x2C, 0x2C, 0x36), Color32::from_rgb(0xC6, 0xC6, 0xD0));
-    let col_clock = tl(Color32::from_rgb(0xF0, 0xF0, 0xF6), Color32::from_rgb(0x20, 0x20, 0x2A));
+    let col_muted = tl(
+        Color32::from_rgb(0xD0, 0xD0, 0xDC),
+        Color32::from_rgb(0x5A, 0x5A, 0x66),
+    );
+    let col_surface = tl(
+        Color32::from_rgb(0x18, 0x18, 0x20),
+        Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    );
+    let col_bar = tl(
+        Color32::from_rgb(0x10, 0x10, 0x14),
+        Color32::from_rgb(0xF2, 0xF2, 0xF6),
+    );
+    let col_border = tl(
+        Color32::from_rgb(0x2C, 0x2C, 0x36),
+        Color32::from_rgb(0xC6, 0xC6, 0xD0),
+    );
+    let col_clock = tl(
+        Color32::from_rgb(0xF0, 0xF0, 0xF6),
+        Color32::from_rgb(0x20, 0x20, 0x2A),
+    );
 
     let screen_height = bg_rect.height();
     let hero_size = (screen_height * 0.35).clamp(260.0, 480.0);
     let stride = hero_size + (bg_rect.width() * 0.012).clamp(10.0, 22.0);
 
-    let hero_cx   = bg_rect.min.x + bg_rect.width() * 0.22;
-    let hero_cy   = bg_rect.min.y + bg_rect.height() * 0.44;
+    let hero_cx = bg_rect.min.x + bg_rect.width() * 0.22;
+    let hero_cy = bg_rect.min.y + bg_rect.height() * 0.44;
 
     let ui_opacity = if let BootStage::Transitioning { start_time, .. } = state.boot_stage {
         ((1.0 - (t - start_time) / 0.35).clamp(0.0, 1.0)) * alpha_factor
@@ -1627,14 +1848,17 @@ pub fn carousel_view(
     let pointer_released = ui.input(|i| i.pointer.any_released());
     let dock_y = bg_rect.max.y - 112.0;
 
-    // Draw and handle Search Bar (centered top)
     let s = (screen_height / 820.0).clamp(1.0, 2.4);
     let search_h = 36.0 * s * scale_factor;
     let search_w = 320.0 * s * scale_factor;
     let search_center = egui::pos2(bg_rect.center().x, bg_rect.min.y + 42.0 * s);
     let search_rect = egui::Rect::from_center_size(search_center, Vec2::new(search_w, search_h));
 
-    if interactive && state.boot_stage == BootStage::None && !state.palette_open && !state.profile_focused {
+    if interactive
+        && state.boot_stage == BootStage::None
+        && !state.palette_open
+        && !state.profile_focused
+    {
         let primary_clicked = ui.input(|i| i.pointer.primary_clicked());
         if primary_clicked && state.search_focused {
             if let Some(pos) = pointer_pos {
@@ -1643,7 +1867,8 @@ pub fn carousel_view(
                 }
             }
         }
-        let y_down = last_input.connected && last_input.is(crate::controller_config::SwitchButton::Y);
+        let y_down =
+            last_input.connected && last_input.is(crate::controller_config::SwitchButton::Y);
         if y_down && !state.y_held && !state.search_kb.open && !state.game_menu_open {
             let buf = state.search_buf.clone();
             state.search_kb.show(&buf, 30);
@@ -1652,7 +1877,11 @@ pub fn carousel_view(
         state.y_held = y_down;
     }
 
-    if interactive && state.boot_stage == BootStage::None && !state.search_focused && !state.palette_open {
+    if interactive
+        && state.boot_stage == BootStage::None
+        && !state.search_focused
+        && !state.palette_open
+    {
         if pointer_pressed {
             if let Some(pos) = pointer_pos {
                 if pos.y < dock_y && pos.y > bg_rect.min.y + 70.0 * s {
@@ -1670,9 +1899,14 @@ pub fn carousel_view(
                 if delta_x.abs() > 8.0 {
                     state.drag_moved = true;
                 }
-                state.scroll_offset = (state.drag_start_offset - delta_x / stride).clamp(0.0, (n_items.saturating_sub(1)) as f32);
-                
-                let nearest = state.scroll_offset.round().clamp(0.0, (n_items.saturating_sub(1)) as f32) as usize;
+                state.scroll_offset = (state.drag_start_offset - delta_x / stride)
+                    .clamp(0.0, (n_items.saturating_sub(1)) as f32);
+
+                let nearest = state
+                    .scroll_offset
+                    .round()
+                    .clamp(0.0, (n_items.saturating_sub(1)) as f32)
+                    as usize;
                 if nearest != state.selected {
                     state.selected = nearest;
                     state.active_dock = false;
@@ -1683,7 +1917,11 @@ pub fn carousel_view(
         if pointer_released || !pointer_down {
             if state.is_dragging {
                 state.is_dragging = false;
-                state.selected = state.scroll_offset.round().clamp(0.0, (n_items.saturating_sub(1)) as f32) as usize;
+                state.selected = state
+                    .scroll_offset
+                    .round()
+                    .clamp(0.0, (n_items.saturating_sub(1)) as f32)
+                    as usize;
             }
         }
     }
@@ -1693,7 +1931,6 @@ pub fn carousel_view(
     }
 
     if state.is_dragging {
-        // Controlled directly by drag
     } else if state.boot_stage == BootStage::None {
         state.scroll_offset += (state.selected as f32 - state.scroll_offset) * (dt * 11.0).min(1.0);
     }
@@ -1742,11 +1979,9 @@ pub fn carousel_view(
     draw_backdrop(&painter, bg_rect, state.ambient_color, t, backdrop_theme, ui_opacity, th, logo_id);
 
     let screen_center = bg_rect.center();
-    let scale_pos = |p: egui::Pos2| -> egui::Pos2 {
-        screen_center + (p - screen_center) * scale_factor
-    };
+    let scale_pos =
+        |p: egui::Pos2| -> egui::Pos2 { screen_center + (p - screen_center) * scale_factor };
 
-    // Draw Search Bar UI
     let sb_alpha = (ui_opacity * 255.0) as u8;
     if sb_alpha > 0 {
         let accent = {
@@ -1754,21 +1989,53 @@ pub fn carousel_view(
             let f = |x: u8| (x as f32 + (255.0 - x as f32) * 0.4) as u8;
             Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
         };
-        let sb_bg = Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), (ui_opacity * 220.0) as u8);
+        let sb_bg = Color32::from_rgba_unmultiplied(
+            col_bar.r(),
+            col_bar.g(),
+            col_bar.b(),
+            (ui_opacity * 220.0) as u8,
+        );
         let sb_border = if state.search_focused || state.search_kb.open || state.search_nav {
             accent
         } else {
-            Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), sb_alpha)
+            Color32::from_rgba_unmultiplied(
+                col_border.r(),
+                col_border.g(),
+                col_border.b(),
+                sb_alpha,
+            )
         };
         painter.rect_filled(search_rect, Rounding::same(18.0 * s * scale_factor), sb_bg);
-        painter.rect_stroke(search_rect, Rounding::same(18.0 * s * scale_factor), Stroke::new(1.5 * scale_factor, sb_border));
+        painter.rect_stroke(
+            search_rect,
+            Rounding::same(18.0 * s * scale_factor),
+            Stroke::new(1.5 * scale_factor, sb_border),
+        );
 
         let icon_pos = scale_pos(search_rect.min + Vec2::new(16.0 * s, search_rect.height() * 0.5));
-        painter.text(icon_pos, egui::Align2::LEFT_CENTER, "🔍", FontId::proportional(14.0 * s * scale_factor), Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sb_alpha));
+        painter.text(
+            icon_pos,
+            egui::Align2::LEFT_CENTER,
+            "🔍",
+            FontId::proportional(14.0 * s * scale_factor),
+            Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sb_alpha),
+        );
 
         if last_input.connected && sb_alpha > 0 {
-            let badge = scale_pos(egui::pos2(search_rect.max.x - 18.0 * s, search_rect.center().y));
-            let bcol = if state.search_nav || state.search_kb.open { accent } else { Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sb_alpha) };
+            let badge = scale_pos(egui::pos2(
+                search_rect.max.x - 18.0 * s,
+                search_rect.center().y,
+            ));
+            let bcol = if state.search_nav || state.search_kb.open {
+                accent
+            } else {
+                Color32::from_rgba_unmultiplied(
+                    col_muted.r(),
+                    col_muted.g(),
+                    col_muted.b(),
+                    sb_alpha,
+                )
+            };
             painter.circle_filled(badge, 9.0 * s * scale_factor, bcol);
             let lum = 0.299 * bcol.r() as f32 + 0.587 * bcol.g() as f32 + 0.114 * bcol.b() as f32;
             let ycol = if lum > 130.0 { Color32::from_rgb(0x10, 0x14, 0x1C) } else { Color32::WHITE };
@@ -1777,20 +2044,55 @@ pub fn carousel_view(
 
         let text_pos = scale_pos(search_rect.min + Vec2::new(38.0 * s, search_rect.height() * 0.5));
         let sf_font = FontId::proportional(14.0 * s * scale_factor);
-        let txt_c = Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), sb_alpha);
-        let mut_c = Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sb_alpha);
-        let sel_c = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (sb_alpha as f32 * 0.35) as u8);
-        let allow = interactive && state.boot_stage == BootStage::None && !state.palette_open && !state.profile_focused;
+        let txt_c =
+            Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), sb_alpha);
+        let mut_c =
+            Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sb_alpha);
+        let sel_c = Color32::from_rgba_unmultiplied(
+            accent.r(),
+            accent.g(),
+            accent.b(),
+            (sb_alpha as f32 * 0.35) as u8,
+        );
+        let allow = interactive
+            && state.boot_stage == BootStage::None
+            && !state.palette_open
+            && !state.profile_focused;
         let blink = state.search_focused && !state.search_kb.open && (t * 1.6).fract() < 0.5;
         let sf_events = ui.input(|i| i.events.clone());
         let before = state.search_buf.clone();
         let active = allow && state.search_focused && !state.search_kb.open;
-        let fr = crate::app::text_field(&painter, ui, search_rect, text_pos.x, text_pos.y, &mut state.search_buf, &mut state.search_caret, &mut state.search_anchor, sf_font, txt_c, mut_c, sel_c, "Search games...", false, 30, active, blink, if active { &sf_events } else { &[] });
+        let fr = crate::app::text_field(
+            &painter,
+            ui,
+            search_rect,
+            text_pos.x,
+            text_pos.y,
+            &mut state.search_buf,
+            &mut state.search_caret,
+            &mut state.search_anchor,
+            sf_font,
+            txt_c,
+            mut_c,
+            sel_c,
+            "Search games...",
+            false,
+            30,
+            active,
+            blink,
+            if active { &sf_events } else { &[] },
+        );
         if allow && !state.search_kb.open {
-            if fr.clicked || fr.secondary_clicked { state.search_focused = true; }
-            if fr.commit || fr.cancel { state.search_focused = false; }
+            if fr.clicked || fr.secondary_clicked {
+                state.search_focused = true;
+            }
+            if fr.commit || fr.cancel {
+                state.search_focused = false;
+            }
         }
-        if state.search_buf != before { state.selected = 0; }
+        if state.search_buf != before {
+            state.selected = 0;
+        }
     }
 
     let mut want_fav: Option<String> = None;
@@ -1800,22 +2102,23 @@ pub fn carousel_view(
     let mut want_close = false;
     let mut fav_first: Option<egui::Rect> = None;
     let mut lib_first: Option<egui::Rect> = None;
-    // Show as many cards as fit the window so wide/stretched displays fill out.
     let cull_max = (((bg_rect.max.x - hero_cx) / stride) + 1.6).max(4.6);
     let fade_start = cull_max - 1.6;
     for i in 0..n_items {
-        let diff     = i as f32 - state.scroll_offset;
+        let diff = i as f32 - state.scroll_offset;
         let abs_diff = diff.abs();
-        if abs_diff > cull_max && state.boot_stage == BootStage::None { continue; }
+        if abs_diff > cull_max && state.boot_stage == BootStage::None {
+            continue;
+        }
 
-        let scale   = (1.0 - abs_diff * 0.05).max(0.82);
+        let scale = (1.0 - abs_diff * 0.05).max(0.82);
         let mut alpha_f = (1.0 - abs_diff * 0.03).clamp(0.0, 1.0);
         if abs_diff > fade_start {
             alpha_f *= ((cull_max - abs_diff) / (cull_max - fade_start)).clamp(0.0, 1.0);
         }
-        let sz      = hero_size * scale;
-        let cx      = hero_cx + diff * stride;
-        let cy      = hero_cy + abs_diff * 6.0;
+        let sz = hero_size * scale;
+        let cx = hero_cx + diff * stride;
+        let cy = hero_cy + abs_diff * 6.0;
 
         let mut draw_cx = cx;
         let mut draw_cy = cy;
@@ -1825,10 +2128,15 @@ pub fn carousel_view(
         let mut glow_expansion = 6.0f32;
         let mut glow_alpha = 100u8;
         let mut border_alpha = 255u8;
-        
+
         let is_hero = i == state.selected && !state.active_dock && !state.profile_focused;
 
-        if let BootStage::Transitioning { game_index, start_time, .. } = &state.boot_stage {
+        if let BootStage::Transitioning {
+            game_index,
+            start_time,
+            ..
+        } = &state.boot_stage
+        {
             let elapsed = t - *start_time;
             if i == *game_index {
                 let land_end = 0.42f32;
@@ -1891,7 +2199,9 @@ pub fn carousel_view(
             draw_cy += (1.0 - e) * hero_size * 0.12;
         }
 
-        if alpha_f <= 0.001 { continue; }
+        if alpha_f <= 0.001 {
+            continue;
+        }
 
         let card_scale_hover = if is_hero && state.boot_stage == BootStage::None {
             state.hover_scale
@@ -1899,13 +2209,13 @@ pub fn carousel_view(
             1.0
         };
         let final_sz = draw_sz * card_scale_hover * scale_factor;
-        
+
         let card_center = egui::pos2(draw_cx, draw_cy);
         let scaled_center = screen_center + (card_center - screen_center) * scale_factor;
 
         let draw_rect = egui::Rect::from_center_size(
             scaled_center,
-            Vec2::new(final_sz * scale_x, final_sz * scale_y)
+            Vec2::new(final_sz * scale_x, final_sz * scale_y),
         );
 
         painter.rect_filled(
@@ -1918,8 +2228,22 @@ pub fn carousel_view(
             let final_glow_alpha = ((glow_alpha as f32) * alpha_f).clamp(0.0, 255.0) as u8;
             let final_border_alpha = ((border_alpha as f32) * alpha_f).clamp(0.0, 255.0) as u8;
             if final_border_alpha > 0 {
-                draw_gradient_rounded_rect(&painter, draw_rect.center(), draw_rect.expand(glow_expansion * scale_factor), 16.0 * scale_factor, t, final_glow_alpha);
-                draw_gradient_rounded_rect(&painter, draw_rect.center(), draw_rect.expand(2.5 * scale_factor), 14.0 * scale_factor, t, final_border_alpha);
+                draw_gradient_rounded_rect(
+                    &painter,
+                    draw_rect.center(),
+                    draw_rect.expand(glow_expansion * scale_factor),
+                    16.0 * scale_factor,
+                    t,
+                    final_glow_alpha,
+                );
+                draw_gradient_rounded_rect(
+                    &painter,
+                    draw_rect.center(),
+                    draw_rect.expand(2.5 * scale_factor),
+                    14.0 * scale_factor,
+                    t,
+                    final_border_alpha,
+                );
             }
         }
 
@@ -1927,8 +2251,13 @@ pub fn carousel_view(
         let is_settings = in_list.is_none() && front > 0 && i == 0;
         let is_add_dir = in_list.is_none() && i == n_items - 1;
         let card_game = game_of(i);
-        let resp = ui.interact(draw_rect, egui::Id::new(("carousel_card", i)), Sense::click());
-        if interactive && resp.clicked() && !state.drag_moved && state.boot_stage == BootStage::None {
+        let resp = ui.interact(
+            draw_rect,
+            egui::Id::new(("carousel_card", i)),
+            Sense::click(),
+        );
+        if interactive && resp.clicked() && !state.drag_moved && state.boot_stage == BootStage::None
+        {
             if state.selected == i {
                 if state.active_dock {
                     state.active_dock = false;
@@ -1951,7 +2280,9 @@ pub fn carousel_view(
                     if playing == Some(gi) {
                         action = CarouselAction::Resume;
                     } else if is_running {
-                        action = CarouselAction::Launch(lib.games[gi].path.to_string_lossy().to_string());
+                        action = CarouselAction::Launch(
+                            lib.games[gi].path.to_string_lossy().to_string(),
+                        );
                     } else {
                         state.boot_stage = BootStage::Transitioning {
                             game_index: i,
@@ -1980,7 +2311,11 @@ pub fn carousel_view(
                     want_close = true;
                     ui.close_menu();
                 }
-                let label = if favd { "★  Unfavorite Game" } else { "☆  Favorite Game" };
+                let label = if favd {
+                    "★  Unfavorite Game"
+                } else {
+                    "☆  Favorite Game"
+                };
                 if ui.button(label).clicked() {
                     want_fav = Some(path_string.clone());
                     ui.close_menu();
@@ -2000,22 +2335,59 @@ pub fn carousel_view(
         if is_exit_list {
             let a8 = (alpha_f * 255.0) as u8;
             let bg = Color32::from_rgb(0xC0, 0x39, 0x3B);
-            painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8));
-            let top = egui::Rect::from_min_max(draw_rect.min, egui::pos2(draw_rect.max.x, draw_rect.center().y));
-            painter.rect_filled(top, Rounding { nw: 14.0 * scale_factor, ne: 14.0 * scale_factor, sw: 0.0, se: 0.0 }, Color32::from_white_alpha((alpha_f * 22.0) as u8));
+            painter.rect_filled(
+                draw_rect,
+                Rounding::same(14.0 * scale_factor),
+                Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8),
+            );
+            let top = egui::Rect::from_min_max(
+                draw_rect.min,
+                egui::pos2(draw_rect.max.x, draw_rect.center().y),
+            );
+            painter.rect_filled(
+                top,
+                Rounding {
+                    nw: 14.0 * scale_factor,
+                    ne: 14.0 * scale_factor,
+                    sw: 0.0,
+                    se: 0.0,
+                },
+                Color32::from_white_alpha((alpha_f * 22.0) as u8),
+            );
             let ctr = draw_rect.center();
             let r = draw_rect.width() * 0.22;
             let white = Color32::from_white_alpha(a8);
             let w = draw_rect.width() * 0.052;
-            painter.line_segment([ctr + Vec2::new(-r, -r), ctr + Vec2::new(r, r)], Stroke::new(w, white));
-            painter.line_segment([ctr + Vec2::new(r, -r), ctr + Vec2::new(-r, r)], Stroke::new(w, white));
+            painter.line_segment(
+                [ctr + Vec2::new(-r, -r), ctr + Vec2::new(r, r)],
+                Stroke::new(w, white),
+            );
+            painter.line_segment(
+                [ctr + Vec2::new(r, -r), ctr + Vec2::new(-r, r)],
+                Stroke::new(w, white),
+            );
         } else if is_settings {
             let a8 = (alpha_f * 255.0) as u8;
-            // app-icon backdrop (indigo, with a soft top gloss)
             let bg = Color32::from_rgb(0x53, 0x5E, 0xC8);
-            painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8));
-            let top = egui::Rect::from_min_max(draw_rect.min, egui::pos2(draw_rect.max.x, draw_rect.center().y));
-            painter.rect_filled(top, Rounding { nw: 14.0 * scale_factor, ne: 14.0 * scale_factor, sw: 0.0, se: 0.0 }, Color32::from_white_alpha((alpha_f * 22.0) as u8));
+            painter.rect_filled(
+                draw_rect,
+                Rounding::same(14.0 * scale_factor),
+                Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8),
+            );
+            let top = egui::Rect::from_min_max(
+                draw_rect.min,
+                egui::pos2(draw_rect.max.x, draw_rect.center().y),
+            );
+            painter.rect_filled(
+                top,
+                Rounding {
+                    nw: 14.0 * scale_factor,
+                    ne: 14.0 * scale_factor,
+                    sw: 0.0,
+                    se: 0.0,
+                },
+                Color32::from_white_alpha((alpha_f * 22.0) as u8),
+            );
 
             let ctr = draw_rect.center();
             let cw = draw_rect.width();
@@ -2040,34 +2412,100 @@ pub fn carousel_view(
                 painter.add(egui::Shape::convex_polygon(quad, white, Stroke::NONE));
             }
             painter.circle_filled(ctr, body, white);
-            painter.circle_filled(ctr, body * 0.42, Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8));
+            painter.circle_filled(
+                ctr,
+                body * 0.42,
+                Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8),
+            );
         } else if let Some(li) = list_of(i) {
             let a8 = (alpha_f * 255.0) as u8;
-            let base = tl(Color32::from_rgb(0x14, 0x14, 0x1A), Color32::from_rgb(0xE6, 0xE6, 0xEC));
-            painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a8));
+            let base = tl(
+                Color32::from_rgb(0x14, 0x14, 0x1A),
+                Color32::from_rgb(0xE6, 0xE6, 0xEC),
+            );
+            painter.rect_filled(
+                draw_rect,
+                Rounding::same(14.0 * scale_factor),
+                Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a8),
+            );
             let acc = state.ambient_color;
-            painter.rect_filled(draw_rect.shrink(3.0 * scale_factor), Rounding::same(12.0 * scale_factor), Color32::from_rgba_unmultiplied(acc.r(), acc.g(), acc.b(), (alpha_f * 235.0) as u8));
+            painter.rect_filled(
+                draw_rect.shrink(3.0 * scale_factor),
+                Rounding::same(12.0 * scale_factor),
+                Color32::from_rgba_unmultiplied(acc.r(), acc.g(), acc.b(), (alpha_f * 235.0) as u8),
+            );
             let list = &lists[li];
-            painter.text(draw_rect.center() - Vec2::new(0.0, draw_rect.height() * 0.06), egui::Align2::CENTER_CENTER, &list.name, FontId::proportional(final_sz * 0.11), Color32::from_white_alpha(a8));
-            painter.text(draw_rect.center() + Vec2::new(0.0, draw_rect.height() * 0.10), egui::Align2::CENTER_CENTER, &format!("{} games", list.games.len()), FontId::proportional(final_sz * 0.075), Color32::from_white_alpha((alpha_f * 210.0) as u8));
+            painter.text(
+                draw_rect.center() - Vec2::new(0.0, draw_rect.height() * 0.06),
+                egui::Align2::CENTER_CENTER,
+                &list.name,
+                FontId::proportional(final_sz * 0.11),
+                Color32::from_white_alpha(a8),
+            );
+            painter.text(
+                draw_rect.center() + Vec2::new(0.0, draw_rect.height() * 0.10),
+                egui::Align2::CENTER_CENTER,
+                &format!("{} games", list.games.len()),
+                FontId::proportional(final_sz * 0.075),
+                Color32::from_white_alpha((alpha_f * 210.0) as u8),
+            );
             if !is_hero {
-                painter.rect_stroke(draw_rect, Rounding::same(14.0 * scale_factor), Stroke::new(1.5 * scale_factor, Color32::from_rgba_unmultiplied(0x50, 0x50, 0x60, (alpha_f * 170.0) as u8)));
+                painter.rect_stroke(
+                    draw_rect,
+                    Rounding::same(14.0 * scale_factor),
+                    Stroke::new(
+                        1.5 * scale_factor,
+                        Color32::from_rgba_unmultiplied(0x50, 0x50, 0x60, (alpha_f * 170.0) as u8),
+                    ),
+                );
             }
         } else if is_add_dir {
-            painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(col_surface.r(), col_surface.g(), col_surface.b(), (alpha_f * 255.0) as u8));
-            painter.rect_stroke(draw_rect, Rounding::same(14.0 * scale_factor), Stroke::new(1.0 * scale_factor, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (alpha_f * 255.0) as u8)));
+            painter.rect_filled(
+                draw_rect,
+                Rounding::same(14.0 * scale_factor),
+                Color32::from_rgba_unmultiplied(
+                    col_surface.r(),
+                    col_surface.g(),
+                    col_surface.b(),
+                    (alpha_f * 255.0) as u8,
+                ),
+            );
+            painter.rect_stroke(
+                draw_rect,
+                Rounding::same(14.0 * scale_factor),
+                Stroke::new(
+                    1.0 * scale_factor,
+                    Color32::from_rgba_unmultiplied(
+                        col_border.r(),
+                        col_border.g(),
+                        col_border.b(),
+                        (alpha_f * 255.0) as u8,
+                    ),
+                ),
+            );
 
             let center = draw_rect.center() - Vec2::new(0.0, 20.0 * scale_factor);
             let cross_len = 24.0 * scale_factor;
             let stroke_w = 3.0 * scale_factor;
-            let stroke_color = Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), (alpha_f * 255.0) as u8);
-            
+            let stroke_color = Color32::from_rgba_unmultiplied(
+                col_muted.r(),
+                col_muted.g(),
+                col_muted.b(),
+                (alpha_f * 255.0) as u8,
+            );
+
             painter.line_segment(
-                [center - Vec2::new(cross_len * 0.5, 0.0), center + Vec2::new(cross_len * 0.5, 0.0)],
+                [
+                    center - Vec2::new(cross_len * 0.5, 0.0),
+                    center + Vec2::new(cross_len * 0.5, 0.0),
+                ],
                 Stroke::new(stroke_w, stroke_color),
             );
             painter.line_segment(
-                [center - Vec2::new(0.0, cross_len * 0.5), center + Vec2::new(0.0, cross_len * 0.5)],
+                [
+                    center - Vec2::new(0.0, cross_len * 0.5),
+                    center + Vec2::new(0.0, cross_len * 0.5),
+                ],
                 Stroke::new(stroke_w, stroke_color),
             );
 
@@ -2076,16 +2514,44 @@ pub fn carousel_view(
                 egui::Align2::CENTER_CENTER,
                 "Add Dir",
                 FontId::proportional(final_sz * 0.085),
-                Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), (alpha_f * 255.0) as u8),
+                Color32::from_rgba_unmultiplied(
+                    col_muted.r(),
+                    col_muted.g(),
+                    col_muted.b(),
+                    (alpha_f * 255.0) as u8,
+                ),
             );
         } else {
             let real_idx = game_of(i).unwrap();
-            let card_fill = tl(Color32::from_rgb(0x14, 0x14, 0x1A), Color32::from_rgb(0xE6, 0xE6, 0xEC));
-            painter.rect_filled(draw_rect, Rounding::same(14.0 * scale_factor), Color32::from_rgba_unmultiplied(card_fill.r(), card_fill.g(), card_fill.b(), (alpha_f * 255.0) as u8));
+            let card_fill = tl(
+                Color32::from_rgb(0x14, 0x14, 0x1A),
+                Color32::from_rgb(0xE6, 0xE6, 0xEC),
+            );
+            painter.rect_filled(
+                draw_rect,
+                Rounding::same(14.0 * scale_factor),
+                Color32::from_rgba_unmultiplied(
+                    card_fill.r(),
+                    card_fill.g(),
+                    card_fill.b(),
+                    (alpha_f * 255.0) as u8,
+                ),
+            );
             if let Some(tex) = lib.texture(ctx, real_idx) {
                 draw_rounded_image(&painter, tex.id(), draw_rect, 14.0 * scale_factor, tint);
             } else {
-                painter.text(draw_rect.center(), egui::Align2::CENTER_CENTER, &lib.games[real_idx].format, FontId::proportional(final_sz * 0.13), Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), (alpha_f * 255.0) as u8));
+                painter.text(
+                    draw_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &lib.games[real_idx].format,
+                    FontId::proportional(final_sz * 0.13),
+                    Color32::from_rgba_unmultiplied(
+                        col_muted.r(),
+                        col_muted.g(),
+                        col_muted.b(),
+                        (alpha_f * 255.0) as u8,
+                    ),
+                );
             }
 
             if let Some((rev_idx, rev_t, old_tex)) = &icon_reveal {
@@ -2108,7 +2574,13 @@ pub fn carousel_view(
                             );
                             if ahead.width() > 1.0 {
                                 let clip = painter.with_clip_rect(ahead);
-                                draw_rounded_image(&clip, old.id(), draw_rect, 14.0 * scale_factor, tint);
+                                draw_rounded_image(
+                                    &clip,
+                                    old.id(),
+                                    draw_rect,
+                                    14.0 * scale_factor,
+                                    tint,
+                                );
                             }
                         }
 
@@ -2125,7 +2597,12 @@ pub fn carousel_view(
                         let a = ((1.0 - (prog - 0.85).max(0.0) / 0.15) * alpha_f).clamp(0.0, 1.0);
                         pnt.add(egui::Shape::convex_polygon(
                             paint_quad,
-                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (230.0 * a) as u8),
+                            Color32::from_rgba_unmultiplied(
+                                accent.r(),
+                                accent.g(),
+                                accent.b(),
+                                (230.0 * a) as u8,
+                            ),
                             Stroke::NONE,
                         ));
                         let flick = 0.7 + 0.3 * (t * 40.0).sin();
@@ -2137,7 +2614,12 @@ pub fn carousel_view(
                         ];
                         pnt.add(egui::Shape::convex_polygon(
                             gloss,
-                            Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, (200.0 * a * flick) as u8),
+                            Color32::from_rgba_unmultiplied(
+                                0xFF,
+                                0xFF,
+                                0xFF,
+                                (200.0 * a * flick) as u8,
+                            ),
                             Stroke::NONE,
                         ));
                         let sp = (w * 0.02).max(1.0);
@@ -2149,7 +2631,12 @@ pub fn carousel_view(
                             pnt.circle_filled(
                                 egui::pos2(px, draw_rect.min.y + ky),
                                 rad,
-                                Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, (180.0 * a) as u8),
+                                Color32::from_rgba_unmultiplied(
+                                    0xFF,
+                                    0xFF,
+                                    0xFF,
+                                    (180.0 * a) as u8,
+                                ),
                             );
                         }
                         ui.ctx().request_repaint();
@@ -2161,12 +2648,18 @@ pub fn carousel_view(
                 painter.rect_stroke(
                     draw_rect,
                     Rounding::same(14.0 * scale_factor),
-                    Stroke::new(1.5 * scale_factor, Color32::from_rgba_unmultiplied(0x50, 0x50, 0x60, (alpha_f * 170.0) as u8)),
+                    Stroke::new(
+                        1.5 * scale_factor,
+                        Color32::from_rgba_unmultiplied(0x50, 0x50, 0x60, (alpha_f * 170.0) as u8),
+                    ),
                 );
                 painter.rect_stroke(
                     draw_rect.expand(1.0 * scale_factor),
                     Rounding::same(15.0 * scale_factor),
-                    Stroke::new(1.0 * scale_factor, Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, (alpha_f * 120.0) as u8)),
+                    Stroke::new(
+                        1.0 * scale_factor,
+                        Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, (alpha_f * 120.0) as u8),
+                    ),
                 );
             }
 
@@ -2179,7 +2672,10 @@ pub fn carousel_view(
                 lib_first = Some(draw_rect);
             }
 
-            if playing == Some(real_idx) && playing_alpha > 0.01 && state.boot_stage == BootStage::None {
+            if playing == Some(real_idx)
+                && playing_alpha > 0.01
+                && state.boot_stage == BootStage::None
+            {
                 let pill_font = FontId::proportional((draw_rect.width() * 0.072).clamp(10.0, 20.0));
                 let fh = pill_font.size;
                 let label = "Playing";
@@ -2217,10 +2713,17 @@ pub fn carousel_view(
                 painter.rect_stroke(
                     pill_rect,
                     Rounding::same(pill_h * 0.5),
-                    Stroke::new(1.4_f32, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(235.0))),
+                    Stroke::new(
+                        1.4_f32,
+                        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(235.0)),
+                    ),
                 );
                 let dot_c = egui::pos2(pill_rect.min.x + pad_x + dot_r, pill_rect.center().y);
-                painter.circle_filled(dot_c, dot_r * (0.85 + 0.15 * pulse), Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(255.0)));
+                painter.circle_filled(
+                    dot_c,
+                    dot_r * (0.85 + 0.15 * pulse),
+                    Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(255.0)),
+                );
                 painter.text(
                     egui::pos2(dot_c.x + dot_r + gap, pill_rect.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -2229,9 +2732,11 @@ pub fn carousel_view(
                     Color32::from_rgba_unmultiplied(0xEA, 0xFF, 0xEE, a(255.0)),
                 );
 
-                // player avatar at the top-left, with a little idle dance every ~3s
                 let av_sz = draw_rect.width() * 0.17;
-                let mut avc = egui::pos2(draw_rect.min.x + av_sz * 0.5 + 10.0 * scale_factor, draw_rect.min.y + av_sz * 0.5 + 10.0 * scale_factor);
+                let mut avc = egui::pos2(
+                    draw_rect.min.x + av_sz * 0.5 + 10.0 * scale_factor,
+                    draw_rect.min.y + av_sz * 0.5 + 10.0 * scale_factor,
+                );
                 let (mut sx, mut sy) = (1.0f32, 1.0f32);
                 let cyc = t.rem_euclid(3.0);
                 if cyc < 0.55 {
@@ -2242,27 +2747,62 @@ pub fn carousel_view(
                     avc.y -= (e * std::f32::consts::PI).sin() * av_sz * 0.10;
                 }
                 let arect = egui::Rect::from_center_size(avc, Vec2::new(av_sz * sx, av_sz * sy));
-                painter.circle_filled(avc, av_sz * 0.5 * sx.max(sy) + 2.5 * scale_factor, Color32::from_rgba_unmultiplied(0x0C, 0x14, 0x0E, a(230.0)));
-                painter.circle_stroke(avc, av_sz * 0.5 * sx.max(sy) + 2.5 * scale_factor, Stroke::new(1.6 * scale_factor, Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(235.0))));
+                painter.circle_filled(
+                    avc,
+                    av_sz * 0.5 * sx.max(sy) + 2.5 * scale_factor,
+                    Color32::from_rgba_unmultiplied(0x0C, 0x14, 0x0E, a(230.0)),
+                );
+                painter.circle_stroke(
+                    avc,
+                    av_sz * 0.5 * sx.max(sy) + 2.5 * scale_factor,
+                    Stroke::new(
+                        1.6 * scale_factor,
+                        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(235.0)),
+                    ),
+                );
                 if let Some(tex) = profile_tex {
-                    draw_rounded_image(&painter, tex, arect, av_sz * 0.5, Color32::from_white_alpha(a(255.0)));
+                    draw_rounded_image(
+                        &painter,
+                        tex,
+                        arect,
+                        av_sz * 0.5,
+                        Color32::from_white_alpha(a(255.0)),
+                    );
                 }
             }
         }
     }
 
-    // Section headers above the rows (e.g. "Favorites"). Kept clean — text only.
     let draw_section = |painter: &egui::Painter, rect: egui::Rect, star: bool, label: &str| {
         let hy = rect.min.y - 30.0 * scale_factor;
         let hx = rect.min.x + 4.0 * scale_factor;
-        let col = Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), (ui_opacity * 235.0) as u8);
+        let col = Color32::from_rgba_unmultiplied(
+            col_text.r(),
+            col_text.g(),
+            col_text.b(),
+            (ui_opacity * 235.0) as u8,
+        );
         let fs = 22.0 * scale_factor;
         let mut x = hx;
         if star {
-            painter.text(egui::pos2(x, hy), egui::Align2::LEFT_CENTER, "★", FontId::proportional(fs * 0.92), Color32::from_rgba_unmultiplied(0xF5, 0xC1, 0x42, (ui_opacity * 255.0) as u8));
+            painter.text(
+                egui::pos2(x, hy),
+                egui::Align2::LEFT_CENTER,
+                "★",
+                FontId::proportional(fs * 0.92),
+                Color32::from_rgba_unmultiplied(0xF5, 0xC1, 0x42, (ui_opacity * 255.0) as u8),
+            );
             x += fs * 1.1;
         }
-        shadowed_text(painter, egui::pos2(x, hy), egui::Align2::LEFT_CENTER, label, FontId::proportional(fs), col, true);
+        shadowed_text(
+            painter,
+            egui::pos2(x, hy),
+            egui::Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(fs),
+            col,
+            true,
+        );
     };
     if state.boot_stage == BootStage::None && in_list.is_none() {
         if let Some(r) = fav_first {
@@ -2275,10 +2815,18 @@ pub fn carousel_view(
         }
     }
 
-    // Console-OS version tag, bottom-left — plain grey translucent text.
     {
-        let os_tag = concat!("NexOS-", env!("NEXIUM_GIT_HASH"), "-v", env!("CARGO_PKG_VERSION"), "  ·  IN-DEV");
-        let pos = egui::pos2(bg_rect.min.x + 22.0 * scale_factor, bg_rect.max.y - 18.0 * scale_factor);
+        let os_tag = concat!(
+            "NexOS-",
+            env!("NEXIUM_GIT_HASH"),
+            "-v",
+            env!("CARGO_PKG_VERSION"),
+            "  ·  IN-DEV"
+        );
+        let pos = egui::pos2(
+            bg_rect.min.x + 22.0 * scale_factor,
+            bg_rect.max.y - 18.0 * scale_factor,
+        );
         painter.text(
             pos,
             egui::Align2::LEFT_BOTTOM,
@@ -2309,7 +2857,11 @@ pub fn carousel_view(
         if elapsed >= 0.42 {
             let p = ((elapsed - 0.42) / (0.90 - 0.42)).min(1.0);
             let overlay_alpha = (p * p * 255.0) as u8;
-            painter.rect_filled(bg_rect, Rounding::ZERO, Color32::from_rgba_unmultiplied(0, 0, 0, overlay_alpha));
+            painter.rect_filled(
+                bg_rect,
+                Rounding::ZERO,
+                Color32::from_rgba_unmultiplied(0, 0, 0, overlay_alpha),
+            );
         }
     }
 
@@ -2321,39 +2873,83 @@ pub fn carousel_view(
     let meta_x = hero_cx;
     let meta_y = hero_cy + hero_size * 0.52 + 36.0 + hero_bob;
 
-    let launch_path = game_of(state.selected).map(|gi| lib.games[gi].path.to_string_lossy().to_string());
+    let launch_path =
+        game_of(state.selected).map(|gi| lib.games[gi].path.to_string_lossy().to_string());
 
     let (sel_title, sel_sub) = if in_list.is_some() && state.selected == 0 {
         let li = in_list.unwrap();
-        ("Exit List".to_string(), format!("Back to the main carousel  ·  {}", lists[li].name))
+        (
+            "Exit List".to_string(),
+            format!("Back to the main carousel  ·  {}", lists[li].name),
+        )
     } else if CS_FRONT > 0 && state.selected == 0 {
-        ("Carousel Settings".to_string(), "Create Lists, & build your Carousel how you see fit.".to_string())
+        (
+            "Carousel Settings".to_string(),
+            "Create Lists, & build your Carousel how you see fit.".to_string(),
+        )
     } else if let Some(li) = list_of(state.selected) {
-        (lists[li].name.clone(), format!("List  ·  {} games  ·  Press A to open", lists[li].games.len()))
+        (
+            lists[li].name.clone(),
+            format!(
+                "List  ·  {} games  ·  Press A to open",
+                lists[li].games.len()
+            ),
+        )
     } else if let Some(gi) = game_of(state.selected) {
         let selected_game = &lib.games[gi];
         let title = selected_game.title.clone();
         let sub = format!(
             "{}  ·  {}  ·  {:.1} MB",
-            if selected_game.author.is_empty() { "Unknown" } else { &selected_game.author },
+            if selected_game.author.is_empty() {
+                "Unknown"
+            } else {
+                &selected_game.author
+            },
             selected_game.format,
             selected_game.size as f32 / (1024.0 * 1024.0),
         );
         (title, sub)
     } else {
-        ("Add Folder".to_string(), "Add folder destinations for your decrypted ROMs".to_string())
+        (
+            "Add Folder".to_string(),
+            "Add folder destinations for your decrypted ROMs".to_string(),
+        )
     };
 
-    let title_col = if state.active_dock { col_muted } else { col_text };
+    let title_col = if state.active_dock {
+        col_muted
+    } else {
+        col_text
+    };
     let title_alpha = (ui_opacity * 255.0) as u8;
     if title_alpha > 0 {
         let meta_pos = egui::pos2(meta_x, meta_y);
         let scaled_meta_pos = screen_center + (meta_pos - screen_center) * scale_factor;
-        shadowed_text(&painter, scaled_meta_pos, egui::Align2::CENTER_CENTER, &sel_title, FontId::proportional(28.0 * scale_factor), Color32::from_rgba_unmultiplied(title_col.r(), title_col.g(), title_col.b(), title_alpha), true);
+        shadowed_text(
+            &painter,
+            scaled_meta_pos,
+            egui::Align2::CENTER_CENTER,
+            &sel_title,
+            FontId::proportional(28.0 * scale_factor),
+            Color32::from_rgba_unmultiplied(
+                title_col.r(),
+                title_col.g(),
+                title_col.b(),
+                title_alpha,
+            ),
+            true,
+        );
         let sub_alpha = (ui_opacity * 222.0) as u8;
-        shadowed_text(&painter, scaled_meta_pos + Vec2::new(0.0, 32.0 * scale_factor), egui::Align2::CENTER_CENTER, &sel_sub, FontId::proportional(14.0 * scale_factor), Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sub_alpha), false);
+        shadowed_text(
+            &painter,
+            scaled_meta_pos + Vec2::new(0.0, 32.0 * scale_factor),
+            egui::Align2::CENTER_CENTER,
+            &sel_sub,
+            FontId::proportional(14.0 * scale_factor),
+            Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), sub_alpha),
+            false,
+        );
     }
-
 
     let dock_items: [(&str, &str); DOCK_COUNT] = [
         ("⊞", "Grid View"),
@@ -2368,11 +2964,11 @@ pub fn carousel_view(
         ("✕", "Quit"),
     ];
 
-    let item_size  = 52.0f32;
-    let dock_gap   = 14.0f32;
+    let item_size = 52.0f32;
+    let dock_gap = 14.0f32;
     let dock_total = dock_items.len() as f32 * item_size + (dock_items.len() - 1) as f32 * dock_gap;
-    let dock_cx    = bg_rect.center().x;
-    let dock_y     = bg_rect.max.y - 112.0;
+    let dock_cx = bg_rect.center().x;
+    let dock_y = bg_rect.max.y - 112.0;
 
     let dock_center = egui::pos2(dock_cx, dock_y + item_size * 0.5);
     let scaled_dock_center = screen_center + (dock_center - screen_center) * scale_factor;
@@ -2382,7 +2978,10 @@ pub fn carousel_view(
 
     let dock_bg = egui::Rect::from_center_size(
         scaled_dock_center,
-        Vec2::new(scaled_dock_total + 44.0 * scale_factor, scaled_item_size + 22.0 * scale_factor),
+        Vec2::new(
+            scaled_dock_total + 44.0 * scale_factor,
+            scaled_item_size + 22.0 * scale_factor,
+        ),
     );
     let dockbar_simple = dockbar_theme == crate::app_settings::DockbarTheme::Simple;
     let dock_bg_alpha = (ui_opacity * if th > 0.5 { 236.0 } else { 200.0 }) as u8;
@@ -2396,47 +2995,110 @@ pub fn carousel_view(
                 if a == 0 {
                     continue;
                 }
-                painter.rect_filled(dock_bg.expand(e).translate(Vec2::new(0.0, e * 0.9)), Rounding::same(round + e), Color32::from_black_alpha(a));
+                painter.rect_filled(
+                    dock_bg.expand(e).translate(Vec2::new(0.0, e * 0.9)),
+                    Rounding::same(round + e),
+                    Color32::from_black_alpha(a),
+                );
             }
         }
-        let bar_alpha = if dockbar_simple { (ui_opacity * 190.0) as u8 } else { dock_bg_alpha };
-        painter.rect_filled(dock_bg, Rounding::same(round), Color32::from_rgba_premultiplied(col_bar.r(), col_bar.g(), col_bar.b(), bar_alpha));
+        let bar_alpha = if dockbar_simple {
+            (ui_opacity * 190.0) as u8
+        } else {
+            dock_bg_alpha
+        };
+        painter.rect_filled(
+            dock_bg,
+            Rounding::same(round),
+            Color32::from_rgba_premultiplied(col_bar.r(), col_bar.g(), col_bar.b(), bar_alpha),
+        );
         if !dockbar_simple {
             let h = dock_bg.height();
             let edge = |dy: f32| -> f32 {
-                if dy >= round { 0.0 } else { round - (round * round - (round - dy) * (round - dy)).max(0.0).sqrt() }
+                if dy >= round {
+                    0.0
+                } else {
+                    round
+                        - (round * round - (round - dy) * (round - dy))
+                            .max(0.0)
+                            .sqrt()
+                }
             };
             let uv = egui::epaint::WHITE_UV;
-            let band_mesh = |top: bool, band: f32, rows: usize, peak: f32, peak_at: f32, black: bool| {
-                let mut mesh = egui::epaint::Mesh::default();
-                for k in 0..=rows {
-                    let f = k as f32 / rows as f32;
-                    let dy = 1.0 * scale_factor + f * band;
-                    let ins = edge(dy);
-                    let y = if top { dock_bg.min.y + dy } else { dock_bg.max.y - dy };
-                    let g = if peak_at <= 0.001 {
-                        1.0 - f
-                    } else if f <= peak_at {
-                        f / peak_at
-                    } else {
-                        (1.0 - f) / (1.0 - peak_at)
-                    };
-                    let g = g.clamp(0.0, 1.0);
-                    let a = (peak * g * g) as u8;
-                    let col = if black { Color32::from_black_alpha(a) } else { Color32::from_white_alpha(a) };
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(dock_bg.min.x + ins, y), uv, color: col });
-                    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(dock_bg.max.x - ins, y), uv, color: col });
-                }
-                for k in 0..rows as u32 {
-                    let i = k * 2;
-                    mesh.indices.extend_from_slice(&[i, i + 1, i + 2, i + 1, i + 3, i + 2]);
-                }
-                painter.add(egui::Shape::mesh(mesh));
-            };
-            band_mesh(true, h * 0.60, 26, ui_opacity * if th > 0.5 { 46.0 } else { 60.0 }, 0.26, false);
-            band_mesh(false, h * 0.40, 20, ui_opacity * if th > 0.5 { 34.0 } else { 26.0 }, 0.0, true);
+            let band_mesh =
+                |top: bool, band: f32, rows: usize, peak: f32, peak_at: f32, black: bool| {
+                    let mut mesh = egui::epaint::Mesh::default();
+                    for k in 0..=rows {
+                        let f = k as f32 / rows as f32;
+                        let dy = 1.0 * scale_factor + f * band;
+                        let ins = edge(dy);
+                        let y = if top {
+                            dock_bg.min.y + dy
+                        } else {
+                            dock_bg.max.y - dy
+                        };
+                        let g = if peak_at <= 0.001 {
+                            1.0 - f
+                        } else if f <= peak_at {
+                            f / peak_at
+                        } else {
+                            (1.0 - f) / (1.0 - peak_at)
+                        };
+                        let g = g.clamp(0.0, 1.0);
+                        let a = (peak * g * g) as u8;
+                        let col = if black {
+                            Color32::from_black_alpha(a)
+                        } else {
+                            Color32::from_white_alpha(a)
+                        };
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: egui::pos2(dock_bg.min.x + ins, y),
+                            uv,
+                            color: col,
+                        });
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: egui::pos2(dock_bg.max.x - ins, y),
+                            uv,
+                            color: col,
+                        });
+                    }
+                    for k in 0..rows as u32 {
+                        let i = k * 2;
+                        mesh.indices
+                            .extend_from_slice(&[i, i + 1, i + 2, i + 1, i + 3, i + 2]);
+                    }
+                    painter.add(egui::Shape::mesh(mesh));
+                };
+            band_mesh(
+                true,
+                h * 0.60,
+                26,
+                ui_opacity * if th > 0.5 { 46.0 } else { 60.0 },
+                0.26,
+                false,
+            );
+            band_mesh(
+                false,
+                h * 0.40,
+                20,
+                ui_opacity * if th > 0.5 { 34.0 } else { 26.0 },
+                0.0,
+                true,
+            );
         }
-        painter.rect_stroke(dock_bg, Rounding::same(round), Stroke::new(1.1 * scale_factor, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
+        painter.rect_stroke(
+            dock_bg,
+            Rounding::same(round),
+            Stroke::new(
+                1.1 * scale_factor,
+                Color32::from_rgba_unmultiplied(
+                    col_border.r(),
+                    col_border.g(),
+                    col_border.b(),
+                    (ui_opacity * 255.0) as u8,
+                ),
+            ),
+        );
 
         let scaled_dock_sx = scaled_dock_center.x - scaled_dock_total * 0.5;
 
@@ -2451,7 +3113,10 @@ pub fn carousel_view(
 
         for idx in 0..dock_items.len() {
             let x = scaled_dock_sx + idx as f32 * step_px + scaled_item_size * 0.5;
-            let base = egui::Rect::from_center_size(egui::pos2(x, scaled_dock_center.y), Vec2::splat(scaled_item_size));
+            let base = egui::Rect::from_center_size(
+                egui::pos2(x, scaled_dock_center.y),
+                Vec2::splat(scaled_item_size),
+            );
             let resp = ui.allocate_rect(base, Sense::click());
             if interactive && resp.clicked() && state.boot_stage == BootStage::None {
                 if state.active_dock && state.dock_selected == idx {
@@ -2493,9 +3158,27 @@ pub fn carousel_view(
                 }
             }
 
-            let fill = Color32::from_rgba_premultiplied(col_surface.r(), col_surface.g(), col_surface.b(), (ui_opacity * 200.0) as u8);
+            let fill = Color32::from_rgba_premultiplied(
+                col_surface.r(),
+                col_surface.g(),
+                col_surface.b(),
+                (ui_opacity * 200.0) as u8,
+            );
             let br = base.width() * 0.5;
-            painter.circle(base.center(), br, fill, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (ui_opacity * 255.0) as u8)));
+            painter.circle(
+                base.center(),
+                br,
+                fill,
+                Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgba_unmultiplied(
+                        col_border.r(),
+                        col_border.g(),
+                        col_border.b(),
+                        (ui_opacity * 255.0) as u8,
+                    ),
+                ),
+            );
             if !dockbar_simple {
                 let arc: Vec<egui::Pos2> = (0..=14)
                     .map(|k| {
@@ -2503,7 +3186,15 @@ pub fn carousel_view(
                         base.center() + Vec2::new(a.cos(), a.sin()) * (br - 1.3 * scale_factor)
                     })
                     .collect();
-                painter.add(egui::Shape::line(arc, Stroke::new(1.1 * scale_factor, Color32::from_white_alpha((ui_opacity * if th > 0.5 { 90.0 } else { 55.0 }) as u8))));
+                painter.add(egui::Shape::line(
+                    arc,
+                    Stroke::new(
+                        1.1 * scale_factor,
+                        Color32::from_white_alpha(
+                            (ui_opacity * if th > 0.5 { 90.0 } else { 55.0 }) as u8,
+                        ),
+                    ),
+                ));
             }
         }
 
@@ -2512,55 +3203,142 @@ pub fn carousel_view(
             let hl_center = egui::pos2(hl_x, scaled_dock_center.y);
             let hl_r = scaled_item_size * 0.5 + 4.0 * scale_factor;
             let fo = ui_opacity * state.dock_focus;
-            draw_gradient_circle(&painter, hl_center, hl_r, 4.0 * scale_factor, t, (fo * 110.0) as u8);
-            draw_gradient_circle(&painter, hl_center, hl_r, 1.5 * scale_factor, t, (fo * 255.0) as u8);
-            painter.circle_filled(hl_center, hl_r, Color32::from_rgba_premultiplied(col_surface.r(), col_surface.g(), col_surface.b(), (fo * 200.0) as u8));
+            draw_gradient_circle(
+                &painter,
+                hl_center,
+                hl_r,
+                4.0 * scale_factor,
+                t,
+                (fo * 110.0) as u8,
+            );
+            draw_gradient_circle(
+                &painter,
+                hl_center,
+                hl_r,
+                1.5 * scale_factor,
+                t,
+                (fo * 255.0) as u8,
+            );
+            painter.circle_filled(
+                hl_center,
+                hl_r,
+                Color32::from_rgba_premultiplied(
+                    col_surface.r(),
+                    col_surface.g(),
+                    col_surface.b(),
+                    (fo * 200.0) as u8,
+                ),
+            );
         }
 
         for (idx, (icon, label)) in dock_items.iter().enumerate() {
             let x = scaled_dock_sx + idx as f32 * step_px + scaled_item_size * 0.5;
-            let draw = egui::Rect::from_center_size(egui::pos2(x, scaled_dock_center.y), Vec2::splat(scaled_item_size));
-            let prox = (1.0 - (idx as f32 - state.dock_anim).abs()).clamp(0.0, 1.0) * state.dock_focus;
+            let draw = egui::Rect::from_center_size(
+                egui::pos2(x, scaled_dock_center.y),
+                Vec2::splat(scaled_item_size),
+            );
+            let prox =
+                (1.0 - (idx as f32 - state.dock_anim).abs()).clamp(0.0, 1.0) * state.dock_focus;
             let icon_color = lerp_color(col_muted, col_text, prox);
-            let final_icon_color = Color32::from_rgba_unmultiplied(icon_color.r(), icon_color.g(), icon_color.b(), (ui_opacity * 255.0) as u8);
+            let final_icon_color = Color32::from_rgba_unmultiplied(
+                icon_color.r(),
+                icon_color.g(),
+                icon_color.b(),
+                (ui_opacity * 255.0) as u8,
+            );
 
             if *label == "Debug" {
                 let center = draw.center() + Vec2::new(0.0, 2.0 * scale_factor);
                 let head_r = 2.5 * scale_factor;
                 let head_center = center - Vec2::new(0.0, 7.5 * scale_factor);
-                
-                // Antennae (curved lines)
+
                 let ant_stroke = Stroke::new(1.0 * scale_factor, final_icon_color);
-                painter.line_segment([head_center, head_center + Vec2::new(-4.5, -6.5) * scale_factor], ant_stroke);
-                painter.line_segment([head_center, head_center + Vec2::new(4.5, -6.5) * scale_factor], ant_stroke);
-                
-                // Legs
+                painter.line_segment(
+                    [
+                        head_center,
+                        head_center + Vec2::new(-4.5, -6.5) * scale_factor,
+                    ],
+                    ant_stroke,
+                );
+                painter.line_segment(
+                    [
+                        head_center,
+                        head_center + Vec2::new(4.5, -6.5) * scale_factor,
+                    ],
+                    ant_stroke,
+                );
+
                 let leg_stroke = Stroke::new(1.2 * scale_factor, final_icon_color);
-                // Left legs
-                painter.line_segment([center - Vec2::new(2.5, 3.5) * scale_factor, center - Vec2::new(7.5, 6.0) * scale_factor], leg_stroke);
-                painter.line_segment([center - Vec2::new(3.0, 0.0) * scale_factor, center - Vec2::new(8.5, 0.0) * scale_factor], leg_stroke);
-                painter.line_segment([center - Vec2::new(2.5, -3.5) * scale_factor, center - Vec2::new(7.5, -6.0) * scale_factor], leg_stroke);
-                // Right legs
-                painter.line_segment([center + Vec2::new(2.5, -3.5) * scale_factor, center + Vec2::new(7.5, -6.0) * scale_factor], leg_stroke);
-                painter.line_segment([center + Vec2::new(3.0, 0.0) * scale_factor, center + Vec2::new(8.5, 0.0) * scale_factor], leg_stroke);
-                painter.line_segment([center + Vec2::new(2.5, 3.5) * scale_factor, center + Vec2::new(7.5, 6.0) * scale_factor], leg_stroke);
-                
-                // Head
+                painter.line_segment(
+                    [
+                        center - Vec2::new(2.5, 3.5) * scale_factor,
+                        center - Vec2::new(7.5, 6.0) * scale_factor,
+                    ],
+                    leg_stroke,
+                );
+                painter.line_segment(
+                    [
+                        center - Vec2::new(3.0, 0.0) * scale_factor,
+                        center - Vec2::new(8.5, 0.0) * scale_factor,
+                    ],
+                    leg_stroke,
+                );
+                painter.line_segment(
+                    [
+                        center - Vec2::new(2.5, -3.5) * scale_factor,
+                        center - Vec2::new(7.5, -6.0) * scale_factor,
+                    ],
+                    leg_stroke,
+                );
+                painter.line_segment(
+                    [
+                        center + Vec2::new(2.5, -3.5) * scale_factor,
+                        center + Vec2::new(7.5, -6.0) * scale_factor,
+                    ],
+                    leg_stroke,
+                );
+                painter.line_segment(
+                    [
+                        center + Vec2::new(3.0, 0.0) * scale_factor,
+                        center + Vec2::new(8.5, 0.0) * scale_factor,
+                    ],
+                    leg_stroke,
+                );
+                painter.line_segment(
+                    [
+                        center + Vec2::new(2.5, 3.5) * scale_factor,
+                        center + Vec2::new(7.5, 6.0) * scale_factor,
+                    ],
+                    leg_stroke,
+                );
+
                 painter.circle_filled(head_center, head_r, final_icon_color);
-                
-                // Body (ellipse/rounded rect)
-                let body_rect = egui::Rect::from_center_size(center + Vec2::new(0.0, 0.5 * scale_factor), Vec2::new(8.0 * scale_factor, 13.0 * scale_factor));
-                painter.rect_filled(body_rect, Rounding::same(4.0 * scale_factor), final_icon_color);
+
+                let body_rect = egui::Rect::from_center_size(
+                    center + Vec2::new(0.0, 0.5 * scale_factor),
+                    Vec2::new(8.0 * scale_factor, 13.0 * scale_factor),
+                );
+                painter.rect_filled(
+                    body_rect,
+                    Rounding::same(4.0 * scale_factor),
+                    final_icon_color,
+                );
             } else if *label == "Quit" {
                 let center = draw.center();
                 let size = 6.0 * scale_factor;
                 let stroke_w = 2.2 * scale_factor;
                 painter.line_segment(
-                    [center - Vec2::new(size, size), center + Vec2::new(size, size)],
+                    [
+                        center - Vec2::new(size, size),
+                        center + Vec2::new(size, size),
+                    ],
                     Stroke::new(stroke_w, final_icon_color),
                 );
                 painter.line_segment(
-                    [center + Vec2::new(-size, size), center + Vec2::new(size, -size)],
+                    [
+                        center + Vec2::new(-size, size),
+                        center + Vec2::new(size, -size),
+                    ],
                     Stroke::new(stroke_w, final_icon_color),
                 );
             } else if *label == "Shop" {
@@ -2578,15 +3356,34 @@ pub fn carousel_view(
                         handle_c + Vec2::new(a.cos() * u * 0.62, a.sin() * u * 0.62)
                     })
                     .collect();
-                painter.add(egui::Shape::line(arc, Stroke::new(1.7 * scale_factor, final_icon_color)));
-                let hole = if final_icon_color.r() as u16 + final_icon_color.g() as u16 + final_icon_color.b() as u16 > 384 {
+                painter.add(egui::Shape::line(
+                    arc,
+                    Stroke::new(1.7 * scale_factor, final_icon_color),
+                ));
+                let hole = if final_icon_color.r() as u16
+                    + final_icon_color.g() as u16
+                    + final_icon_color.b() as u16
+                    > 384
+                {
                     Color32::from_rgb(0x18, 0x18, 0x20)
                 } else {
                     Color32::from_rgb(0xF2, 0xF2, 0xF6)
                 };
-                painter.text(body.center() + Vec2::new(0.0, u * 0.1), egui::Align2::CENTER_CENTER, "H", FontId::proportional(u * 1.4), hole);
+                painter.text(
+                    body.center() + Vec2::new(0.0, u * 0.1),
+                    egui::Align2::CENTER_CENTER,
+                    "H",
+                    FontId::proportional(u * 1.4),
+                    hole,
+                );
             } else {
-                painter.text(draw.center(), egui::Align2::CENTER_CENTER, icon, FontId::proportional(draw.width() * 0.42), final_icon_color);
+                painter.text(
+                    draw.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon,
+                    FontId::proportional(draw.width() * 0.42),
+                    final_icon_color,
+                );
             }
         }
 
@@ -2595,14 +3392,21 @@ pub fn carousel_view(
             let label = dock_items[sel].1;
             let alpha = ((1.0 - state.palette_t) * ui_opacity * state.dock_focus * 255.0) as u8;
             if alpha > 0 {
-                let text_y = scaled_dock_center.y - (scaled_item_size + 22.0 * scale_factor) * 0.5 - 14.0 * scale_factor;
+                let text_y = scaled_dock_center.y
+                    - (scaled_item_size + 22.0 * scale_factor) * 0.5
+                    - 14.0 * scale_factor;
                 shadowed_text(
                     &painter,
                     egui::pos2(scaled_dock_center.x, text_y),
                     egui::Align2::CENTER_BOTTOM,
                     label,
                     FontId::proportional(17.5 * scale_factor),
-                    Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), alpha),
+                    Color32::from_rgba_unmultiplied(
+                        col_text.r(),
+                        col_text.g(),
+                        col_text.b(),
+                        alpha,
+                    ),
                     true,
                 );
             }
@@ -2614,10 +3418,17 @@ pub fn carousel_view(
     if state.game_menu_anim > 0.004 && game_of(state.selected).is_some() {
         let gi = game_of(state.selected).unwrap();
         let favd = favorites.iter().any(|p| *p == lib.games[gi].path);
-        let e = { let a = state.game_menu_anim.clamp(0.0, 1.0); a * a * (3.0 - 2.0 * a) };
+        let e = {
+            let a = state.game_menu_anim.clamp(0.0, 1.0);
+            a * a * (3.0 - 2.0 * a)
+        };
         let sc = |p: egui::Pos2| screen_center + (p - screen_center) * scale_factor;
         let accent = state.ambient_color;
-        painter.rect_filled(bg_rect, Rounding::ZERO, Color32::from_black_alpha((e * 90.0) as u8));
+        painter.rect_filled(
+            bg_rect,
+            Rounding::ZERO,
+            Color32::from_black_alpha((e * 90.0) as u8),
+        );
 
         let pw = 236.0;
         let rowh = 44.0;
@@ -2625,30 +3436,90 @@ pub fn carousel_view(
         let slide = (1.0 - e) * 18.0;
         let ax = hero_cx + hero_size * 0.5 + 30.0 + slide;
         let ay = hero_cy - ph * 0.5;
-        let panel = egui::Rect::from_min_max(sc(egui::pos2(ax, ay)), sc(egui::pos2(ax + pw, ay + ph)));
-        painter.rect_filled(panel.translate(Vec2::new(0.0, 8.0 * scale_factor)), Rounding::same(16.0 * scale_factor), Color32::from_black_alpha((e * 120.0) as u8));
-        let pfill = tl(Color32::from_rgb(0x1B, 0x1B, 0x24), Color32::from_rgb(0xFB, 0xFB, 0xFE));
-        painter.rect_filled(panel, Rounding::same(16.0 * scale_factor), Color32::from_rgba_unmultiplied(pfill.r(), pfill.g(), pfill.b(), (e * 255.0) as u8));
-        painter.rect_stroke(panel, Rounding::same(16.0 * scale_factor), Stroke::new(1.2 * scale_factor, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), (e * 255.0) as u8)));
+        let panel =
+            egui::Rect::from_min_max(sc(egui::pos2(ax, ay)), sc(egui::pos2(ax + pw, ay + ph)));
+        painter.rect_filled(
+            panel.translate(Vec2::new(0.0, 8.0 * scale_factor)),
+            Rounding::same(16.0 * scale_factor),
+            Color32::from_black_alpha((e * 120.0) as u8),
+        );
+        let pfill = tl(
+            Color32::from_rgb(0x1B, 0x1B, 0x24),
+            Color32::from_rgb(0xFB, 0xFB, 0xFE),
+        );
+        painter.rect_filled(
+            panel,
+            Rounding::same(16.0 * scale_factor),
+            Color32::from_rgba_unmultiplied(pfill.r(), pfill.g(), pfill.b(), (e * 255.0) as u8),
+        );
+        painter.rect_stroke(
+            panel,
+            Rounding::same(16.0 * scale_factor),
+            Stroke::new(
+                1.2 * scale_factor,
+                Color32::from_rgba_unmultiplied(
+                    col_border.r(),
+                    col_border.g(),
+                    col_border.b(),
+                    (e * 255.0) as u8,
+                ),
+            ),
+        );
 
         let labels = [
-            if favd { "Unfavorite Game" } else { "Favorite Game" },
+            if favd {
+                "Unfavorite Game"
+            } else {
+                "Favorite Game"
+            },
             "View Game Information",
             "Download Icon",
         ];
         for (i, label) in labels.iter().enumerate() {
             let ry0 = ay + 11.0 + i as f32 * rowh;
-            let row = egui::Rect::from_min_max(sc(egui::pos2(ax + 8.0, ry0)), sc(egui::pos2(ax + pw - 8.0, ry0 + rowh - 4.0)));
+            let row = egui::Rect::from_min_max(
+                sc(egui::pos2(ax + 8.0, ry0)),
+                sc(egui::pos2(ax + pw - 8.0, ry0 + rowh - 4.0)),
+            );
             if i == state.game_menu_sel {
-                painter.rect_filled(row, Rounding::same(10.0 * scale_factor), Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (e * 60.0) as u8));
-                painter.rect_stroke(row, Rounding::same(10.0 * scale_factor), Stroke::new(1.4 * scale_factor, Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (e * 220.0) as u8)));
+                painter.rect_filled(
+                    row,
+                    Rounding::same(10.0 * scale_factor),
+                    Color32::from_rgba_unmultiplied(
+                        accent.r(),
+                        accent.g(),
+                        accent.b(),
+                        (e * 60.0) as u8,
+                    ),
+                );
+                painter.rect_stroke(
+                    row,
+                    Rounding::same(10.0 * scale_factor),
+                    Stroke::new(
+                        1.4 * scale_factor,
+                        Color32::from_rgba_unmultiplied(
+                            accent.r(),
+                            accent.g(),
+                            accent.b(),
+                            (e * 220.0) as u8,
+                        ),
+                    ),
+                );
             }
             let tc = if i == 0 && favd {
                 Color32::from_rgb(0xF5, 0xC1, 0x42)
             } else {
                 col_text
             };
-            shadowed_text(&painter, sc(egui::pos2(ax + 22.0, ry0 + (rowh - 4.0) * 0.5)), egui::Align2::LEFT_CENTER, label, FontId::proportional(15.0 * scale_factor), Color32::from_rgba_unmultiplied(tc.r(), tc.g(), tc.b(), (e * 255.0) as u8), false);
+            shadowed_text(
+                &painter,
+                sc(egui::pos2(ax + 22.0, ry0 + (rowh - 4.0) * 0.5)),
+                egui::Align2::LEFT_CENTER,
+                label,
+                FontId::proportional(15.0 * scale_factor),
+                Color32::from_rgba_unmultiplied(tc.r(), tc.g(), tc.b(), (e * 255.0) as u8),
+                false,
+            );
         }
     }
 
@@ -2684,7 +3555,10 @@ pub fn carousel_view(
 
         let panel = egui::Rect::from_center_size(
             scaled_center,
-            Vec2::new(s_total + 52.0 * scale_factor * pop, s_sw + 92.0 * scale_factor * pop),
+            Vec2::new(
+                s_total + 52.0 * scale_factor * pop,
+                s_sw + 92.0 * scale_factor * pop,
+            ),
         );
         let interactive = state.palette_open && state.palette_t > 0.6;
         if interactive && pointer_pressed {
@@ -2696,10 +3570,34 @@ pub fn carousel_view(
             }
         }
 
-        painter.rect_filled(panel, Rounding::same(20.0 * scale_factor), Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), a(240.0)));
-        painter.rect_stroke(panel, Rounding::same(20.0 * scale_factor), Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(255.0))));
+        painter.rect_filled(
+            panel,
+            Rounding::same(20.0 * scale_factor),
+            Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), a(240.0)),
+        );
+        painter.rect_stroke(
+            panel,
+            Rounding::same(20.0 * scale_factor),
+            Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(
+                    col_border.r(),
+                    col_border.g(),
+                    col_border.b(),
+                    a(255.0),
+                ),
+            ),
+        );
 
-        shadowed_text(&painter, egui::pos2(scaled_center.x, panel.min.y + 20.0 * scale_factor), egui::Align2::CENTER_CENTER, "Background Color", FontId::proportional(15.0 * scale_factor), Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), a(255.0)), true);
+        shadowed_text(
+            &painter,
+            egui::pos2(scaled_center.x, panel.min.y + 20.0 * scale_factor),
+            egui::Align2::CENTER_CENTER,
+            "Background Color",
+            FontId::proportional(15.0 * scale_factor),
+            Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), a(255.0)),
+            true,
+        );
 
         let sx = scaled_center.x - s_total * 0.5;
         let row_y = scaled_center.y + 6.0 * scale_factor;
@@ -2723,43 +3621,103 @@ pub fn carousel_view(
             let rounding = Rounding::same(10.0 * scale_factor);
             if is_sel {
                 if *th == crate::app_settings::CarouselTheme::Rgb {
-                    draw_rainbow_rounded_rect(&painter, r.center(), r.expand(4.5 * scale_factor), 13.0 * scale_factor, t, a(210.0));
+                    draw_rainbow_rounded_rect(
+                        &painter,
+                        r.center(),
+                        r.expand(4.5 * scale_factor),
+                        13.0 * scale_factor,
+                        t,
+                        a(210.0),
+                    );
                 } else {
-                    draw_gradient_rounded_rect(&painter, r.center(), r.expand(4.5 * scale_factor), 13.0 * scale_factor, t, a(210.0));
+                    draw_gradient_rounded_rect(
+                        &painter,
+                        r.center(),
+                        r.expand(4.5 * scale_factor),
+                        13.0 * scale_factor,
+                        t,
+                        a(210.0),
+                    );
                 }
             }
             if *th == crate::app_settings::CarouselTheme::Rgb {
-                draw_rainbow_rounded_rect(&painter, r.center(), r, 10.0 * scale_factor, t, a(255.0));
+                draw_rainbow_rounded_rect(
+                    &painter,
+                    r.center(),
+                    r,
+                    10.0 * scale_factor,
+                    t,
+                    a(255.0),
+                );
             } else {
                 match th.color() {
                     Some((cr, cg, cb)) => {
-                        painter.rect_filled(r, rounding, Color32::from_rgba_unmultiplied(cr, cg, cb, a(255.0)));
+                        painter.rect_filled(
+                            r,
+                            rounding,
+                            Color32::from_rgba_unmultiplied(cr, cg, cb, a(255.0)),
+                        );
                     }
-                    None => draw_gradient_rounded_rect(&painter, r.center(), r, 10.0 * scale_factor, t, a(255.0)),
+                    None => draw_gradient_rounded_rect(
+                        &painter,
+                        r.center(),
+                        r,
+                        10.0 * scale_factor,
+                        t,
+                        a(255.0),
+                    ),
                 }
             }
             let sw_stroke = if is_sel {
                 Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), a(235.0))
             } else {
-                Color32::from_rgba_unmultiplied(col_border.r(), col_border.g(), col_border.b(), a(160.0))
+                Color32::from_rgba_unmultiplied(
+                    col_border.r(),
+                    col_border.g(),
+                    col_border.b(),
+                    a(160.0),
+                )
             };
             painter.rect_stroke(r, rounding, Stroke::new(1.3_f32, sw_stroke));
         }
 
-        let cur = themes.get(state.palette_selected).copied().unwrap_or_default();
-        shadowed_text(&painter, egui::pos2(scaled_center.x, panel.max.y - 18.0 * scale_factor), egui::Align2::CENTER_CENTER, cur.label(), FontId::proportional(14.0 * scale_factor), Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), a(255.0)), false);
+        let cur = themes
+            .get(state.palette_selected)
+            .copied()
+            .unwrap_or_default();
+        shadowed_text(
+            &painter,
+            egui::pos2(scaled_center.x, panel.max.y - 18.0 * scale_factor),
+            egui::Align2::CENTER_CENTER,
+            cur.label(),
+            FontId::proportional(14.0 * scale_factor),
+            Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), a(255.0)),
+            false,
+        );
     }
 
     if ui_opacity > 0.01 {
         let top_alpha = (ui_opacity * 255.0) as u8;
         let top_s = (bg_rect.height() / 820.0).clamp(1.0, 2.4);
         let av_r = 26.0f32 * top_s;
-        let av_center = egui::pos2(bg_rect.min.x + 34.0 * top_s + av_r, bg_rect.min.y + 26.0 * top_s + av_r);
+        let av_center = egui::pos2(
+            bg_rect.min.x + 34.0 * top_s + av_r,
+            bg_rect.min.y + 26.0 * top_s + av_r,
+        );
         let scaled_av = screen_center + (av_center - screen_center) * scale_factor;
         let scaled_av_r = av_r * scale_factor;
         let av_rect = egui::Rect::from_center_size(scaled_av, Vec2::splat(scaled_av_r * 2.0));
-        let av_resp = ui.interact(av_rect.expand(3.0 * scale_factor), egui::Id::new("carousel_avatar"), Sense::click());
-        if interactive && av_resp.clicked() && state.boot_stage == BootStage::None && !state.palette_open && state.profile_click_time.is_none() {
+        let av_resp = ui.interact(
+            av_rect.expand(3.0 * scale_factor),
+            egui::Id::new("carousel_avatar"),
+            Sense::click(),
+        );
+        if interactive
+            && av_resp.clicked()
+            && state.boot_stage == BootStage::None
+            && !state.palette_open
+            && state.profile_click_time.is_none()
+        {
             state.profile_click_time = Some(t);
             crate::ui_audio::play(crate::ui_audio::Sfx::Whistle);
         }
@@ -2771,7 +3729,10 @@ pub fn carousel_view(
         let ring_c = if state.profile_focused || av_resp.hovered() {
             accent
         } else {
-            tl(Color32::from_rgb(0x3A, 0x3A, 0x46), Color32::from_rgb(0xC6, 0xC6, 0xD0))
+            tl(
+                Color32::from_rgb(0x3A, 0x3A, 0x46),
+                Color32::from_rgb(0xC6, 0xC6, 0xD0),
+            )
         };
 
         let mut dance_scale_x = 1.0f32;
@@ -2797,7 +3758,6 @@ pub fn carousel_view(
             }
         }
 
-        // mini "pushed-up" squeeze when the profile is focused from below
         if let Some(pt) = state.profile_push_at {
             let e = t - pt;
             let dur = 0.34f32;
@@ -2817,10 +3777,11 @@ pub fn carousel_view(
         let sin_r = dance_rotation.sin();
         let transform_pt = |pt: egui::Pos2| -> egui::Pos2 {
             let scaled = scaled_av + (pt - scaled_av) * Vec2::new(dance_scale_x, dance_scale_y);
-            let rotated = scaled_av + Vec2::new(
-                (scaled.x - scaled_av.x) * cos_r - (scaled.y - scaled_av.y) * sin_r,
-                (scaled.x - scaled_av.x) * sin_r + (scaled.y - scaled_av.y) * cos_r,
-            );
+            let rotated = scaled_av
+                + Vec2::new(
+                    (scaled.x - scaled_av.x) * cos_r - (scaled.y - scaled_av.y) * sin_r,
+                    (scaled.x - scaled_av.x) * sin_r + (scaled.y - scaled_av.y) * cos_r,
+                );
             rotated + dance_offset
         };
 
@@ -2830,18 +3791,43 @@ pub fn carousel_view(
         if show_glow {
             let final_glow_alpha = (100.0 * ui_opacity).clamp(0.0, 255.0) as u8;
             let final_border_alpha = (255.0 * ui_opacity).clamp(0.0, 255.0) as u8;
-            draw_gradient_circle(&painter, transformed_av, scaled_av_r, 6.0 * scale_factor, t, final_glow_alpha);
-            draw_gradient_circle(&painter, transformed_av, scaled_av_r - 1.5 * scale_factor, 1.5 * scale_factor, t, final_border_alpha);
+            draw_gradient_circle(
+                &painter,
+                transformed_av,
+                scaled_av_r,
+                6.0 * scale_factor,
+                t,
+                final_glow_alpha,
+            );
+            draw_gradient_circle(
+                &painter,
+                transformed_av,
+                scaled_av_r - 1.5 * scale_factor,
+                1.5 * scale_factor,
+                t,
+                final_border_alpha,
+            );
         }
 
-        let av_bg = tl(Color32::from_rgb(0x0C, 0x0C, 0x12), Color32::from_rgb(0xFF, 0xFF, 0xFF));
-        painter.circle_filled(transformed_av, (scaled_av_r + 2.0 * scale_factor) * dance_scale_x.max(dance_scale_y), Color32::from_rgba_unmultiplied(av_bg.r(), av_bg.g(), av_bg.b(), top_alpha));
+        let av_bg = tl(
+            Color32::from_rgb(0x0C, 0x0C, 0x12),
+            Color32::from_rgb(0xFF, 0xFF, 0xFF),
+        );
+        painter.circle_filled(
+            transformed_av,
+            (scaled_av_r + 2.0 * scale_factor) * dance_scale_x.max(dance_scale_y),
+            Color32::from_rgba_unmultiplied(av_bg.r(), av_bg.g(), av_bg.b(), top_alpha),
+        );
         match profile_tex {
             Some(tid) => {
                 let mut mesh = egui::epaint::Mesh::with_texture(tid);
                 let segs = 40;
                 let tint = Color32::from_white_alpha(top_alpha);
-                mesh.vertices.push(egui::epaint::Vertex { pos: transformed_av, uv: egui::pos2(0.5, 0.5), color: tint });
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: transformed_av,
+                    uv: egui::pos2(0.5, 0.5),
+                    color: tint,
+                });
                 for i in 0..=segs {
                     let ang = (i as f32 / segs as f32) * std::f32::consts::TAU;
                     let (s, c) = ang.sin_cos();
@@ -2860,41 +3846,125 @@ pub fn carousel_view(
                 painter.add(egui::Shape::mesh(mesh));
             }
             None => {
-                painter.circle_filled(transformed_av, scaled_av_r * dance_scale_x.max(dance_scale_y), Color32::from_rgba_unmultiplied(col_surface.r(), col_surface.g(), col_surface.b(), top_alpha));
-                painter.text(transformed_av, egui::Align2::CENTER_CENTER, "＋", FontId::proportional(scaled_av_r * 0.9 * dance_scale_x.max(dance_scale_y)), Color32::from_rgba_unmultiplied(col_muted.r(), col_muted.g(), col_muted.b(), top_alpha));
+                painter.circle_filled(
+                    transformed_av,
+                    scaled_av_r * dance_scale_x.max(dance_scale_y),
+                    Color32::from_rgba_unmultiplied(
+                        col_surface.r(),
+                        col_surface.g(),
+                        col_surface.b(),
+                        top_alpha,
+                    ),
+                );
+                painter.text(
+                    transformed_av,
+                    egui::Align2::CENTER_CENTER,
+                    "＋",
+                    FontId::proportional(scaled_av_r * 0.9 * dance_scale_x.max(dance_scale_y)),
+                    Color32::from_rgba_unmultiplied(
+                        col_muted.r(),
+                        col_muted.g(),
+                        col_muted.b(),
+                        top_alpha,
+                    ),
+                );
             }
         }
         if !show_glow {
-            painter.circle_stroke(transformed_av, scaled_av_r, Stroke::new(2.0 * scale_factor, Color32::from_rgba_unmultiplied(ring_c.r(), ring_c.g(), ring_c.b(), top_alpha)));
+            painter.circle_stroke(
+                transformed_av,
+                scaled_av_r,
+                Stroke::new(
+                    2.0 * scale_factor,
+                    Color32::from_rgba_unmultiplied(ring_c.r(), ring_c.g(), ring_c.b(), top_alpha),
+                ),
+            );
         }
 
         if state.profile_focused || av_resp.hovered() {
-            let name_pos = egui::pos2(scaled_av.x + scaled_av_r + 12.0 * scale_factor, scaled_av.y) + dance_offset;
-            shadowed_text(&painter, name_pos, egui::Align2::LEFT_CENTER, profile_name, FontId::proportional(16.0 * top_s * scale_factor), Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), top_alpha), true);
+            let name_pos = egui::pos2(scaled_av.x + scaled_av_r + 12.0 * scale_factor, scaled_av.y)
+                + dance_offset;
+            shadowed_text(
+                &painter,
+                name_pos,
+                egui::Align2::LEFT_CENTER,
+                profile_name,
+                FontId::proportional(16.0 * top_s * scale_factor),
+                Color32::from_rgba_unmultiplied(
+                    col_text.r(),
+                    col_text.g(),
+                    col_text.b(),
+                    top_alpha,
+                ),
+                true,
+            );
         }
 
         let now = chrono::Local::now();
         let (clock, date) = if eu_dates {
-            (now.format("%H:%M").to_string(), now.format("%a  %-d %b").to_string())
+            (
+                now.format("%H:%M").to_string(),
+                now.format("%a  %-d %b").to_string(),
+            )
         } else {
-            (now.format("%-I:%M %p").to_string(), now.format("%a  %b %-d").to_string())
+            (
+                now.format("%-I:%M %p").to_string(),
+                now.format("%a  %b %-d").to_string(),
+            )
         };
-        let cc = Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), top_alpha);
+        let cc =
+            Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), top_alpha);
         let clock_font = FontId::proportional(20.0 * top_s * scale_factor);
         let date_font = FontId::proportional(13.0 * top_s * scale_factor);
 
         let net = network_kind();
         let net_x = bg_rect.max.x - 30.0 * top_s;
-        let clock_right = if net > 0 { net_x - 34.0 * top_s } else { bg_rect.max.x - 30.0 * top_s };
+        let clock_right = if net > 0 {
+            net_x - 34.0 * top_s
+        } else {
+            bg_rect.max.x - 30.0 * top_s
+        };
         let clock_pos = egui::pos2(clock_right, bg_rect.min.y + 34.0 * top_s);
         let scaled_clock = screen_center + (clock_pos - screen_center) * scale_factor;
-        shadowed_text(&painter, scaled_clock, egui::Align2::RIGHT_CENTER, &clock, clock_font.clone(), cc, true);
+        shadowed_text(
+            &painter,
+            scaled_clock,
+            egui::Align2::RIGHT_CENTER,
+            &clock,
+            clock_font.clone(),
+            cc,
+            true,
+        );
 
-        let clock_w = ui.fonts(|f| f.layout_no_wrap(clock.clone(), clock_font.clone(), cc).size().x) / scale_factor;
-        let date_pos = egui::pos2(clock_right - clock_w - 14.0 * top_s, bg_rect.min.y + 34.0 * top_s);
-        let date_w = ui.fonts(|f| f.layout_no_wrap(date.clone(), date_font.clone(), cc).size().x) / scale_factor;
+        let clock_w = ui.fonts(|f| {
+            f.layout_no_wrap(clock.clone(), clock_font.clone(), cc)
+                .size()
+                .x
+        }) / scale_factor;
+        let date_pos = egui::pos2(
+            clock_right - clock_w - 14.0 * top_s,
+            bg_rect.min.y + 34.0 * top_s,
+        );
+        let date_w = ui.fonts(|f| {
+            f.layout_no_wrap(date.clone(), date_font.clone(), cc)
+                .size()
+                .x
+        }) / scale_factor;
         let scaled_date = screen_center + (date_pos - screen_center) * scale_factor;
-        shadowed_text(&painter, scaled_date, egui::Align2::RIGHT_CENTER, &date, date_font.clone(), Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), (top_alpha as f32 * 0.82) as u8), false);
+        shadowed_text(
+            &painter,
+            scaled_date,
+            egui::Align2::RIGHT_CENTER,
+            &date,
+            date_font.clone(),
+            Color32::from_rgba_unmultiplied(
+                col_clock.r(),
+                col_clock.g(),
+                col_clock.b(),
+                (top_alpha as f32 * 0.82) as u8,
+            ),
+            false,
+        );
 
         if update_available
             && interactive
@@ -2910,17 +3980,64 @@ pub fn carousel_view(
             let pill_r = date_pos.x - date_w - 34.0 * top_s;
             let pw = 162.0 * top_s;
             let ph = 26.0 * top_s;
-            let pill = egui::Rect::from_min_max(egui::pos2(pill_r - pw, cy - ph * 0.5), egui::pos2(pill_r, cy + ph * 0.5));
+            let pill = egui::Rect::from_min_max(
+                egui::pos2(pill_r - pw, cy - ph * 0.5),
+                egui::pos2(pill_r, cy + ph * 0.5),
+            );
             let sp = |p: egui::Pos2| screen_center + (p - screen_center) * scale_factor;
             let spill = egui::Rect::from_min_max(sp(pill.min), sp(pill.max));
-            painter.rect_filled(spill.translate(Vec2::new(0.0, 2.0 * scale_factor)), Rounding::same(9.0 * scale_factor), Color32::from_black_alpha((top_alpha as f32 * 0.28) as u8));
-            painter.rect_filled(spill, Rounding::same(9.0 * scale_factor), Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), top_alpha));
-            painter.rect_stroke(spill, Rounding::same(9.0 * scale_factor), Stroke::new(1.4 * scale_factor, Color32::from_rgba_unmultiplied(green.r(), green.g(), green.b(), (top_alpha as f32 * 0.7) as u8)));
+            painter.rect_filled(
+                spill.translate(Vec2::new(0.0, 2.0 * scale_factor)),
+                Rounding::same(9.0 * scale_factor),
+                Color32::from_black_alpha((top_alpha as f32 * 0.28) as u8),
+            );
+            painter.rect_filled(
+                spill,
+                Rounding::same(9.0 * scale_factor),
+                Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), top_alpha),
+            );
+            painter.rect_stroke(
+                spill,
+                Rounding::same(9.0 * scale_factor),
+                Stroke::new(
+                    1.4 * scale_factor,
+                    Color32::from_rgba_unmultiplied(
+                        green.r(),
+                        green.g(),
+                        green.b(),
+                        (top_alpha as f32 * 0.7) as u8,
+                    ),
+                ),
+            );
             let pulse = 0.5 + 0.5 * (t * 2.2).sin();
             let dc = sp(egui::pos2(pill.min.x + 16.0 * top_s, cy));
-            painter.circle_filled(dc, 5.5 * scale_factor, Color32::from_rgba_unmultiplied(green.r(), green.g(), green.b(), (((90.0 + 140.0 * pulse) * top_alpha as f32) / 255.0) as u8));
-            painter.circle_filled(dc, 3.3 * scale_factor, Color32::from_rgba_unmultiplied(green.r(), green.g(), green.b(), top_alpha));
-            painter.text(sp(egui::pos2(pill.min.x + 29.0 * top_s, cy)), egui::Align2::LEFT_CENTER, "Update Available!", FontId::proportional(13.5 * top_s * scale_factor), Color32::from_rgba_unmultiplied(col_text.r(), col_text.g(), col_text.b(), top_alpha));
+            painter.circle_filled(
+                dc,
+                5.5 * scale_factor,
+                Color32::from_rgba_unmultiplied(
+                    green.r(),
+                    green.g(),
+                    green.b(),
+                    (((90.0 + 140.0 * pulse) * top_alpha as f32) / 255.0) as u8,
+                ),
+            );
+            painter.circle_filled(
+                dc,
+                3.3 * scale_factor,
+                Color32::from_rgba_unmultiplied(green.r(), green.g(), green.b(), top_alpha),
+            );
+            painter.text(
+                sp(egui::pos2(pill.min.x + 29.0 * top_s, cy)),
+                egui::Align2::LEFT_CENTER,
+                "Update Available!",
+                FontId::proportional(13.5 * top_s * scale_factor),
+                Color32::from_rgba_unmultiplied(
+                    col_text.r(),
+                    col_text.g(),
+                    col_text.b(),
+                    top_alpha,
+                ),
+            );
             if ui.allocate_rect(spill, egui::Sense::click()).clicked() {
                 action = CarouselAction::OpenUpdate;
             }
@@ -2942,7 +4059,13 @@ pub fn carousel_view(
                         })
                         .collect();
                     let al = (top_alpha as f32 * (1.0 - k as f32 * 0.18)) as u8;
-                    painter.add(egui::Shape::line(arc, Stroke::new(1.6 * scale_factor, Color32::from_rgba_unmultiplied(cc.r(), cc.g(), cc.b(), al))));
+                    painter.add(egui::Shape::line(
+                        arc,
+                        Stroke::new(
+                            1.6 * scale_factor,
+                            Color32::from_rgba_unmultiplied(cc.r(), cc.g(), cc.b(), al),
+                        ),
+                    ));
                 }
             } else {
                 let sx = |x: f32, y: f32| s(nc + Vec2::new(x * u, y * u));
@@ -2958,11 +4081,17 @@ pub fn carousel_view(
                 let pts: Vec<egui::Pos2> = cable.iter().map(|(x, y)| sx(*x, *y)).collect();
                 painter.add(egui::Shape::line(pts, st));
                 for (py, dir) in [(-1.28f32, -1.0f32), (1.28f32, 1.0f32)] {
-                    let body = egui::Rect::from_center_size(sx(0.0, py), Vec2::new(u * 1.05 * scale_factor, u * 0.74 * scale_factor));
+                    let body = egui::Rect::from_center_size(
+                        sx(0.0, py),
+                        Vec2::new(u * 1.05 * scale_factor, u * 0.74 * scale_factor),
+                    );
                     painter.rect_filled(body, Rounding::same(1.6 * scale_factor), cc);
                     for k in -1..=1 {
                         let px = k as f32 * 0.3;
-                        painter.line_segment([sx(px, py + dir * 0.34), sx(px, py + dir * 0.62)], Stroke::new(1.4 * scale_factor, cc));
+                        painter.line_segment(
+                            [sx(px, py + dir * 0.34), sx(px, py + dir * 0.62)],
+                            Stroke::new(1.4 * scale_factor, cc),
+                        );
                     }
                 }
             }
@@ -2970,7 +4099,12 @@ pub fn carousel_view(
 
         if last_input.connected {
             let s = top_s * scale_factor;
-            let col = Color32::from_rgba_unmultiplied(col_clock.r(), col_clock.g(), col_clock.b(), top_alpha);
+            let col = Color32::from_rgba_unmultiplied(
+                col_clock.r(),
+                col_clock.g(),
+                col_clock.b(),
+                top_alpha,
+            );
             let y = scaled_av.y + scaled_av_r + 24.0 * scale_factor + dance_offset.y;
             let gx = scaled_av.x + dance_offset.x;
 
@@ -2985,9 +4119,27 @@ pub fn carousel_view(
                 let bodyr = egui::Rect::from_center_size(bc, Vec2::new(z * 0.95, z * 0.85));
                 painter.rect_filled(bodyr, Rounding::same(1.5 * scale_factor), col);
                 let prong = Stroke::new(1.6 * scale_factor, col);
-                painter.line_segment([egui::pos2(bc.x - 0.30 * z, bc.y - 0.42 * z), egui::pos2(bc.x - 0.30 * z, bc.y - 1.05 * z)], prong);
-                painter.line_segment([egui::pos2(bc.x + 0.30 * z, bc.y - 0.42 * z), egui::pos2(bc.x + 0.30 * z, bc.y - 1.05 * z)], prong);
-                painter.line_segment([egui::pos2(bc.x, bc.y + 0.42 * z), egui::pos2(bc.x, bc.y + 1.10 * z)], prong);
+                painter.line_segment(
+                    [
+                        egui::pos2(bc.x - 0.30 * z, bc.y - 0.42 * z),
+                        egui::pos2(bc.x - 0.30 * z, bc.y - 1.05 * z),
+                    ],
+                    prong,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(bc.x + 0.30 * z, bc.y - 0.42 * z),
+                        egui::pos2(bc.x + 0.30 * z, bc.y - 1.05 * z),
+                    ],
+                    prong,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(bc.x, bc.y + 0.42 * z),
+                        egui::pos2(bc.x, bc.y + 1.10 * z),
+                    ],
+                    prong,
+                );
             } else {
                 let bz = 6.5 * s;
                 let bt_norm = [
@@ -3009,11 +4161,21 @@ pub fn carousel_view(
                 egui::pos2(gx - glyph_half - gap - gw, y - gh * 0.5),
                 Vec2::new(gw, gh),
             );
-            painter.rect_stroke(gbody, Rounding::same(gh * 0.48), Stroke::new(1.6 * scale_factor, col));
+            painter.rect_stroke(
+                gbody,
+                Rounding::same(gh * 0.48),
+                Stroke::new(1.6 * scale_factor, col),
+            );
             let lc = egui::pos2(gbody.min.x + gw * 0.27, gbody.center().y);
             let arm = 2.3 * s;
-            painter.line_segment([lc - Vec2::new(arm, 0.0), lc + Vec2::new(arm, 0.0)], Stroke::new(1.5 * scale_factor, col));
-            painter.line_segment([lc - Vec2::new(0.0, arm), lc + Vec2::new(0.0, arm)], Stroke::new(1.5 * scale_factor, col));
+            painter.line_segment(
+                [lc - Vec2::new(arm, 0.0), lc + Vec2::new(arm, 0.0)],
+                Stroke::new(1.5 * scale_factor, col),
+            );
+            painter.line_segment(
+                [lc - Vec2::new(0.0, arm), lc + Vec2::new(0.0, arm)],
+                Stroke::new(1.5 * scale_factor, col),
+            );
             let rc = egui::pos2(gbody.max.x - gw * 0.27, gbody.center().y);
             painter.circle_filled(rc + Vec2::new(1.9 * s, 0.0), 1.3 * s, col);
             painter.circle_filled(rc - Vec2::new(1.9 * s, 0.0), 1.3 * s, col);
@@ -3026,7 +4188,11 @@ pub fn carousel_view(
                 egui::pos2(x, y - bh * 0.5),
                 egui::pos2(x + bw, y + bh * 0.5),
             );
-            painter.rect_stroke(bbody, Rounding::same(2.5 * scale_factor), Stroke::new(1.6 * scale_factor, col));
+            painter.rect_stroke(
+                bbody,
+                Rounding::same(2.5 * scale_factor),
+                Stroke::new(1.6 * scale_factor, col),
+            );
             painter.rect_filled(
                 egui::Rect::from_min_max(
                     egui::pos2(x + bw, y - bh * 0.22),
@@ -3047,7 +4213,11 @@ pub fn carousel_view(
             let inner = bbody.shrink(2.2 * scale_factor);
             let mut f = inner;
             f.set_width(inner.width() * frac);
-            painter.rect_filled(f, Rounding::same(1.5 * scale_factor), Color32::from_rgba_unmultiplied(fc.r(), fc.g(), fc.b(), top_alpha));
+            painter.rect_filled(
+                f,
+                Rounding::same(1.5 * scale_factor),
+                Color32::from_rgba_unmultiplied(fc.r(), fc.g(), fc.b(), top_alpha),
+            );
             if last_input.charging {
                 let c = bbody.center();
                 let z = 3.4 * s;
@@ -3057,7 +4227,13 @@ pub fn carousel_view(
                     c + Vec2::new(0.1 * z, 0.15 * z),
                     c + Vec2::new(-0.35 * z, 1.3 * z),
                 ];
-                painter.add(egui::Shape::line(bolt, Stroke::new(1.8 * scale_factor, Color32::from_rgba_unmultiplied(0x10, 0x28, 0x18, top_alpha))));
+                painter.add(egui::Shape::line(
+                    bolt,
+                    Stroke::new(
+                        1.8 * scale_factor,
+                        Color32::from_rgba_unmultiplied(0x10, 0x28, 0x18, top_alpha),
+                    ),
+                ));
             }
             let label = match last_input.battery {
                 Some(p) => format!("{}%", p),
@@ -3076,7 +4252,8 @@ pub fn carousel_view(
     }
 
     if interactive && state.boot_stage == BootStage::None {
-        let launch_path = game_of(state.selected).map(|gi| lib.games[gi].path.to_string_lossy().to_string());
+        let launch_path =
+            game_of(state.selected).map(|gi| lib.games[gi].path.to_string_lossy().to_string());
         let is_playing = game_of(state.selected).map_or(false, |gi| playing == Some(gi));
         let list_selected = list_of(state.selected);
         handle_input(
@@ -3105,7 +4282,12 @@ pub fn carousel_view(
         }
     }
 
-    if let BootStage::Transitioning { game_index, start_time, launch_path } = &state.boot_stage {
+    if let BootStage::Transitioning {
+        game_index,
+        start_time,
+        launch_path,
+    } = &state.boot_stage
+    {
         let elapsed = t - *start_time;
         if elapsed >= 0.90 {
             action = CarouselAction::Launch(launch_path.clone());
@@ -3123,11 +4305,21 @@ pub fn carousel_view(
             Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
         };
         let before_kb = state.search_buf.clone();
-        let res = state.search_kb.update(ctx, ui, &mut state.search_buf, last_input, kb_accent, light_mode);
+        let res = state.search_kb.update(
+            ctx,
+            ui,
+            &mut state.search_buf,
+            last_input,
+            kb_accent,
+            light_mode,
+        );
         if state.search_buf != before_kb {
             state.selected = 0;
         }
-        if matches!(res, crate::vkeyboard::VkResult::Accept | crate::vkeyboard::VkResult::Cancel) {
+        if matches!(
+            res,
+            crate::vkeyboard::VkResult::Accept | crate::vkeyboard::VkResult::Cancel
+        ) {
             state.search_focused = false;
         }
     }
@@ -3153,20 +4345,26 @@ fn handle_input(
     if state.search_kb.open {
         return;
     }
-    let mut left   = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
-    let mut right  = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
-    let mut up     = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
-    let mut down   = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
-    let mut back   = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let mut left = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+    let mut right = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
+    let mut up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+    let mut down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+    let mut back = ui.input(|i| i.key_pressed(egui::Key::Escape));
 
     if last_input.connected {
         use crate::controller_config::SwitchButton;
         let now = ui.input(|i| i.time);
-        let cur_dir = if last_input.is(SwitchButton::DUp) { 1 }
-            else if last_input.is(SwitchButton::DDown) { 2 }
-            else if last_input.is(SwitchButton::DLeft) { 3 }
-            else if last_input.is(SwitchButton::DRight) { 4 }
-            else { 0 };
+        let cur_dir = if last_input.is(SwitchButton::DUp) {
+            1
+        } else if last_input.is(SwitchButton::DDown) {
+            2
+        } else if last_input.is(SwitchButton::DLeft) {
+            3
+        } else if last_input.is(SwitchButton::DRight) {
+            4
+        } else {
+            0
+        };
 
         if cur_dir == 0 {
             state.nav_held_dir = 0;
@@ -3183,7 +4381,7 @@ fn handle_input(
             }
         } else {
             const INITIAL_DELAY: f64 = 0.70;
-            const REPEAT_RATE:   f64 = 0.14;
+            const REPEAT_RATE: f64 = 0.14;
             let held_for = now - state.nav_held_since;
             if held_for >= INITIAL_DELAY && now - state.nav_cd >= REPEAT_RATE {
                 state.nav_cd = now;
@@ -3195,21 +4393,37 @@ fn handle_input(
                 }
             }
         }
-        if state.b_edge                        { back   = true; }
+        if state.b_edge {
+            back = true;
+        }
 
         use std::sync::atomic::{AtomicU64, Ordering};
         static LAST_NAV: AtomicU64 = AtomicU64::new(0);
-        let now  = ui.input(|i| i.time);
+        let now = ui.input(|i| i.time);
         let last = f64::from_bits(LAST_NAV.load(Ordering::Relaxed));
         if now - last > 0.18 {
             let lx = last_input.lx();
             let ly = last_input.ly();
             let mut nav = false;
-            if lx < -0.5 { left  = true; nav = true; }
-            if lx >  0.5 { right = true; nav = true; }
-            if ly >  0.5 { up    = true; nav = true; }
-            if ly < -0.5 { down  = true; nav = true; }
-            if nav { LAST_NAV.store(now.to_bits(), Ordering::Relaxed); }
+            if lx < -0.5 {
+                left = true;
+                nav = true;
+            }
+            if lx > 0.5 {
+                right = true;
+                nav = true;
+            }
+            if ly > 0.5 {
+                up = true;
+                nav = true;
+            }
+            if ly < -0.5 {
+                down = true;
+                nav = true;
+            }
+            if nav {
+                LAST_NAV.store(now.to_bits(), Ordering::Relaxed);
+            }
         }
     }
 
@@ -3223,7 +4437,11 @@ fn handle_input(
         if w.abs() > 1.5 {
             let last = f64::from_bits(LAST_WHEEL.load(Ordering::Relaxed));
             if now - last > 0.10 {
-                if w > 0.0 { right = true; } else { left = true; }
+                if w > 0.0 {
+                    right = true;
+                } else {
+                    left = true;
+                }
                 from_wheel = true;
                 LAST_WHEEL.store(now.to_bits(), Ordering::Relaxed);
             }
@@ -3343,14 +4561,18 @@ fn handle_input(
 
     if left {
         if state.active_dock {
-            if state.dock_selected > 0 { state.dock_selected -= 1; }
+            if state.dock_selected > 0 {
+                state.dock_selected -= 1;
+            }
         } else if state.selected > 0 {
             state.selected -= 1;
         }
     }
     if right {
         if state.active_dock {
-            if state.dock_selected < DOCK_COUNT - 1 { state.dock_selected += 1; }
+            if state.dock_selected < DOCK_COUNT - 1 {
+                state.dock_selected += 1;
+            }
         } else if state.selected < n_items - 1 {
             state.selected += 1;
         }
@@ -3359,7 +4581,6 @@ fn handle_input(
         if state.active_dock {
             state.active_dock = false;
         } else if state.search_nav {
-            // already at the top
         } else if state.profile_focused {
             state.profile_focused = false;
             state.search_nav = true;

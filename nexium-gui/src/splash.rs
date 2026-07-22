@@ -75,7 +75,11 @@ impl Splash {
                 egui::Id::new("splash_fade"),
             ));
             let rect = ctx.screen_rect();
-            painter.rect_filled(rect, 0.0, Color32::from_black_alpha((black_a * 255.0) as u8));
+            painter.rect_filled(
+                rect,
+                0.0,
+                Color32::from_black_alpha((black_a * 255.0) as u8),
+            );
             paint_scene(&painter, rect, elapsed, scene_a);
             ctx.request_repaint();
             Step::Fade
@@ -116,7 +120,11 @@ fn paint_scene(p: &egui::Painter, rect: egui::Rect, e: f32, ga: f32) {
             if s > 0.0 && s < 1.0 {
                 let rad = ease_out(s) * diag;
                 let a = ((1.0 - s).powi(2) * 230.0 * ga) as u8;
-                p.circle_stroke(center, rad, Stroke::new(4.0 * (1.0 - s) + 1.0, alpha(RING, a)));
+                p.circle_stroke(
+                    center,
+                    rad,
+                    Stroke::new(4.0 * (1.0 - s) + 1.0, alpha(RING, a)),
+                );
             }
         }
     }
@@ -151,7 +159,12 @@ fn paint_scene(p: &egui::Painter, rect: egui::Rect, e: f32, ga: f32) {
     if dt >= 0.0 {
         let core = smoothstep(CONV_END, CONV_END + 0.4, e) * ga;
         let pulse = 1.0 + 0.05 * (e * 7.0).sin();
-        orb(p, center, r * (0.13 + flash * 0.14) * pulse, (core + flash * 0.7).min(1.0));
+        orb(
+            p,
+            center,
+            r * (0.13 + flash * 0.14) * pulse,
+            (core + flash * 0.7).min(1.0),
+        );
     }
 
     let text_a = smoothstep(TEXT_START, TEXT_START + 0.6, e) * ga;
@@ -172,12 +185,27 @@ fn spark(p: &egui::Painter, c: Pos2, r: f32, sf: f32, ga: f32) {
 
     let flash = (1.0 - (sf / 0.12).clamp(0.0, 1.0)).powi(2);
     if flash > 0.0 {
-        p.circle_filled(c, r * (0.09 + flash * 0.20), alpha(Color32::WHITE, (flash * 255.0 * ga) as u8));
-        p.circle_filled(c, r * (0.26 + flash * 0.34), alpha(RING, (flash * 130.0 * ga) as u8));
+        p.circle_filled(
+            c,
+            r * (0.09 + flash * 0.20),
+            alpha(Color32::WHITE, (flash * 255.0 * ga) as u8),
+        );
+        p.circle_filled(
+            c,
+            r * (0.26 + flash * 0.34),
+            alpha(RING, (flash * 130.0 * ga) as u8),
+        );
     }
 
     let rr = ease_out(k) * r * 0.95;
-    p.circle_stroke(c, rr, Stroke::new((1.0 - k) * 3.2 + 0.5, alpha(RING, (fade * 210.0 * ga) as u8)));
+    p.circle_stroke(
+        c,
+        rr,
+        Stroke::new(
+            (1.0 - k) * 3.2 + 0.5,
+            alpha(RING, (fade * 210.0 * ga) as u8),
+        ),
+    );
 
     let n = 8;
     for i in 0..n {
@@ -191,7 +219,10 @@ fn spark(p: &egui::Painter, c: Pos2, r: f32, sf: f32, ga: f32) {
         let a1 = c + dir * (d0 + len);
         p.add(Shape::line(
             vec![a0, a1],
-            Stroke::new((1.0 - k) * 2.2 + 0.4, alpha(RING, (fade * flick * 235.0 * ga) as u8)),
+            Stroke::new(
+                (1.0 - k) * 2.2 + 0.4,
+                alpha(RING, (fade * flick * 235.0 * ga) as u8),
+            ),
         ));
     }
 }
@@ -209,8 +240,14 @@ fn ring(p: &egui::Painter, c: Pos2, rx: f32, ry: f32, rot: f32, a: f32, draw_t: 
         return;
     }
     let w = rx * 0.03;
-    p.add(Shape::line(pts.clone(), Stroke::new(w * 2.6, alpha(RING_DIM, (55.0 * a) as u8))));
-    p.add(Shape::line(pts, Stroke::new(w, alpha(RING, (255.0 * a) as u8))));
+    p.add(Shape::line(
+        pts.clone(),
+        Stroke::new(w * 2.6, alpha(RING_DIM, (55.0 * a) as u8)),
+    ));
+    p.add(Shape::line(
+        pts,
+        Stroke::new(w, alpha(RING, (255.0 * a) as u8)),
+    ));
     if draw_t < 1.0 {
         let tip = ellipse_pt(c, rx, ry, rot, draw_t.clamp(0.0, 1.0) * TAU);
         p.circle_filled(tip, w * 2.4, alpha(Color32::WHITE, (a * 235.0) as u8));
@@ -237,7 +274,14 @@ fn title(p: &egui::Painter, cx: f32, y: f32, size: f32, a: f32) {
     for off in [(-4.0, 0.0), (4.0, 0.0), (0.0, -4.0), (0.0, 4.0)] {
         tracked(p, cx + off.0, y + off.1, size, soft);
     }
-    for off in [(-2.0, 0.0), (2.0, 0.0), (0.0, -2.0), (0.0, 2.0), (-2.0, -2.0), (2.0, 2.0)] {
+    for off in [
+        (-2.0, 0.0),
+        (2.0, 0.0),
+        (0.0, -2.0),
+        (0.0, 2.0),
+        (-2.0, -2.0),
+        (2.0, 2.0),
+    ] {
         tracked(p, cx + off.0, y + off.1, size, glow);
     }
     tracked(p, cx, y, size, main);

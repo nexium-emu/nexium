@@ -24,14 +24,46 @@ fn lerp_col(a: Color32, b: Color32, t: f32) -> Color32 {
 
 fn palette(t: f32) -> Pal {
     Pal {
-        text: lerp_col(Color32::from_rgb(0xEC, 0xEC, 0xF0), Color32::from_rgb(0x1E, 0x1E, 0x28), t),
-        muted: lerp_col(Color32::from_rgb(0x8A, 0x8A, 0x98), Color32::from_rgb(0x60, 0x60, 0x6A), t),
-        panel: lerp_col(Color32::from_rgb(0x16, 0x16, 0x1E), Color32::from_rgb(0xFF, 0xFF, 0xFF), t),
-        input_bg: lerp_col(Color32::from_rgb(0x20, 0x20, 0x2A), Color32::from_rgb(0xE4, 0xE4, 0xEC), t),
-        border: lerp_col(Color32::from_rgb(0x30, 0x30, 0x3C), Color32::from_rgb(0xC6, 0xC6, 0xD0), t),
-        sel: lerp_col(Color32::from_rgb(0x1E, 0x1E, 0x28), Color32::from_rgb(0xDD, 0xDD, 0xE6), t),
-        hover: lerp_col(Color32::from_rgb(0x18, 0x18, 0x22), Color32::from_rgb(0xEA, 0xEA, 0xF0), t),
-        soft_text: lerp_col(Color32::from_rgb(0xEC, 0xEC, 0xF0), Color32::from_rgb(0x3E, 0x3E, 0x4A), t),
+        text: lerp_col(
+            Color32::from_rgb(0xEC, 0xEC, 0xF0),
+            Color32::from_rgb(0x1E, 0x1E, 0x28),
+            t,
+        ),
+        muted: lerp_col(
+            Color32::from_rgb(0x8A, 0x8A, 0x98),
+            Color32::from_rgb(0x60, 0x60, 0x6A),
+            t,
+        ),
+        panel: lerp_col(
+            Color32::from_rgb(0x16, 0x16, 0x1E),
+            Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            t,
+        ),
+        input_bg: lerp_col(
+            Color32::from_rgb(0x20, 0x20, 0x2A),
+            Color32::from_rgb(0xE4, 0xE4, 0xEC),
+            t,
+        ),
+        border: lerp_col(
+            Color32::from_rgb(0x30, 0x30, 0x3C),
+            Color32::from_rgb(0xC6, 0xC6, 0xD0),
+            t,
+        ),
+        sel: lerp_col(
+            Color32::from_rgb(0x1E, 0x1E, 0x28),
+            Color32::from_rgb(0xDD, 0xDD, 0xE6),
+            t,
+        ),
+        hover: lerp_col(
+            Color32::from_rgb(0x18, 0x18, 0x22),
+            Color32::from_rgb(0xEA, 0xEA, 0xF0),
+            t,
+        ),
+        soft_text: lerp_col(
+            Color32::from_rgb(0xEC, 0xEC, 0xF0),
+            Color32::from_rgb(0x3E, 0x3E, 0x4A),
+            t,
+        ),
     }
 }
 
@@ -62,7 +94,6 @@ pub struct ProfileState {
     pub x_held: bool,
     pub theme_t: f32,
     pub avatar_bounce: Option<f32>,
-    // celebration particles: (spawn_time, angle, speed, kind) — kind 255 = star, else confetti color idx
     pub avatar_stars: Vec<(f32, f32, f32, u8)>,
 }
 
@@ -124,7 +155,8 @@ fn draw_circle_avatar(
     pal: Pal,
 ) {
     let alpha = 255;
-    let bg_color = Color32::from_rgba_unmultiplied(pal.panel.r(), pal.panel.g(), pal.panel.b(), alpha);
+    let bg_color =
+        Color32::from_rgba_unmultiplied(pal.panel.r(), pal.panel.g(), pal.panel.b(), alpha);
     painter.circle_filled(center, radius + 4.0 * scale_factor, bg_color);
     match tex {
         Some(tid) => {
@@ -153,9 +185,15 @@ fn draw_circle_avatar(
             painter.add(egui::Shape::mesh(mesh));
         }
         None => {
-            let default_bg = Color32::from_rgba_unmultiplied(pal.input_bg.r(), pal.input_bg.g(), pal.input_bg.b(), alpha);
+            let default_bg = Color32::from_rgba_unmultiplied(
+                pal.input_bg.r(),
+                pal.input_bg.g(),
+                pal.input_bg.b(),
+                alpha,
+            );
             painter.circle_filled(center, radius, default_bg);
-            let text_color = Color32::from_rgba_unmultiplied(pal.muted.r(), pal.muted.g(), pal.muted.b(), alpha);
+            let text_color =
+                Color32::from_rgba_unmultiplied(pal.muted.r(), pal.muted.g(), pal.muted.b(), alpha);
             painter.text(
                 center,
                 egui::Align2::CENTER_CENTER,
@@ -215,9 +253,8 @@ pub fn profile_view(
     let pal = palette(state.theme_t);
 
     let screen_center = full.center();
-    let scale_pos = |p: egui::Pos2| -> egui::Pos2 {
-        screen_center + (p - screen_center) * scale_factor
-    };
+    let scale_pos =
+        |p: egui::Pos2| -> egui::Pos2 { screen_center + (p - screen_center) * scale_factor };
     let scale_rect = |r: egui::Rect| -> egui::Rect {
         egui::Rect::from_center_size(
             screen_center + (r.center() - screen_center) * scale_factor,
@@ -234,9 +271,19 @@ pub fn profile_view(
     crate::carousel::draw_backdrop(&backdrop_painter, full, ambient, t, backdrop_theme, 1.0, state.theme_t, None);
 
     let scrim = if state.theme_t < 0.5 {
-        Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, (140.0 * (1.0 - state.theme_t * 2.0)) as u8)
+        Color32::from_rgba_unmultiplied(
+            0x00,
+            0x00,
+            0x00,
+            (140.0 * (1.0 - state.theme_t * 2.0)) as u8,
+        )
     } else {
-        Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, (55.0 * (state.theme_t * 2.0 - 1.0)) as u8)
+        Color32::from_rgba_unmultiplied(
+            0xFF,
+            0xFF,
+            0xFF,
+            (55.0 * (state.theme_t * 2.0 - 1.0)) as u8,
+        )
     };
     backdrop_painter.rect_filled(full, Rounding::ZERO, scrim);
 
@@ -256,7 +303,7 @@ pub fn profile_view(
         pal.text,
     );
     let header_y = full.min.y + 40.0 * s + header_font + 20.0 * s;
-    
+
     let h_y = scale_pos(egui::pos2(0.0, header_y)).y;
     let x_start = scale_pos(egui::pos2(full.min.x + mx, 0.0)).x;
     let x_end = scale_pos(egui::pos2(full.max.x - mx, 0.0)).x;
@@ -265,7 +312,7 @@ pub fn profile_view(
         h_y,
         Stroke::new(1.0 * scale_factor, pal.border),
     );
-    
+
     let footer_y = full.max.y - 60.0 * s;
     let f_y = scale_pos(egui::pos2(0.0, footer_y)).y;
     painter.hline(
@@ -506,16 +553,12 @@ pub fn profile_view(
         if selected {
             painter.rect_filled(r, rounding, pal.sel);
             painter.rect_stroke(r, rounding, Stroke::new(1.8 * scale_factor, ring));
-            
+
             let bar_rect = scale_rect(egui::Rect::from_min_size(
                 base_rect.min + Vec2::new(6.0 * s, 12.0 * s),
                 Vec2::new(4.0 * s, base_rect.height() - 24.0 * s),
             ));
-            painter.rect_filled(
-                bar_rect,
-                Rounding::same(2.0 * s * scale_factor),
-                ring,
-            );
+            painter.rect_filled(bar_rect, Rounding::same(2.0 * s * scale_factor), ring);
         } else if resp.hovered() {
             painter.rect_filled(r, rounding, pal.hover);
         }
@@ -613,14 +656,29 @@ pub fn profile_view(
             );
         }
         ProfileTab::System => {
-            system_page(ui, &content_painter, content, s, scale_factor, &scale_pos, &scale_rect, pal, update_text, update_color, update_clickable, &mut action);
+            system_page(
+                ui,
+                &content_painter,
+                content,
+                s,
+                scale_factor,
+                &scale_pos,
+                &scale_rect,
+                pal,
+                update_text,
+                update_color,
+                update_clickable,
+                &mut action,
+            );
         }
     }
     if ease < 1.0 {
         ctx.request_repaint();
     }
 
-    let on_volume = state.tab == ProfileTab::Settings && state.focus_content && (state.row_selected == 3 || state.row_selected == 4);
+    let on_volume = state.tab == ProfileTab::Settings
+        && state.focus_content
+        && (state.row_selected == 3 || state.row_selected == 4);
     let hint = if last_input.connected {
         if on_volume {
             "🎮  [Up/Down] Select      [X] To Mute      [B] Back to Menu"
@@ -647,12 +705,19 @@ pub fn profile_view(
     }
     if state.name_kb.active() {
         let before = state.name_buf.clone();
-        let res = state.name_kb.update(ctx, ui, &mut state.name_buf, last_input, accent, light_mode);
+        let res =
+            state
+                .name_kb
+                .update(ctx, ui, &mut state.name_buf, last_input, accent, light_mode);
         let _ = before;
         match res {
             crate::vkeyboard::VkResult::Accept => {
                 let name = state.name_buf.trim().to_string();
-                let name = if name.is_empty() { "Player".to_string() } else { name };
+                let name = if name.is_empty() {
+                    "Player".to_string()
+                } else {
+                    name
+                };
                 state.name_buf = name.clone();
                 if name != profile_name {
                     action = ProfileAction::SetName(name);
@@ -684,7 +749,10 @@ fn system_page(
     let rows: [(&str, String); 4] = [
         ("NeXium Version", format!("v{}", env!("CARGO_PKG_VERSION"))),
         ("Commit", env!("NEXIUM_GIT_HASH").to_string()),
-        ("Build", format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH)),
+        (
+            "Build",
+            format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH),
+        ),
         ("Update Status", update_text.to_string()),
     ];
 
@@ -702,8 +770,27 @@ fn system_page(
         painter.rect_filled(r, rounding, pal.panel);
         let hovered = actionable && ui.rect_contains_pointer(r);
         let stroke_col = if actionable { update_color } else { pal.border };
-        painter.rect_stroke(r, rounding, Stroke::new(if actionable { if hovered { 2.4 } else { 1.8 } } else { 1.0 } * scale_factor, stroke_col));
-        let label_y = if actionable { row.center().y - 10.0 * s } else { row.center().y };
+        painter.rect_stroke(
+            r,
+            rounding,
+            Stroke::new(
+                if actionable {
+                    if hovered {
+                        2.4
+                    } else {
+                        1.8
+                    }
+                } else {
+                    1.0
+                } * scale_factor,
+                stroke_col,
+            ),
+        );
+        let label_y = if actionable {
+            row.center().y - 10.0 * s
+        } else {
+            row.center().y
+        };
         if actionable {
             painter.text(
                 scale_pos(egui::pos2(row.min.x + 24.0 * s, row.center().y + 11.0 * s)),
@@ -758,7 +845,7 @@ fn settings_page(
 ) {
     let row_h = 68.0 * s;
     let row_gap = 12.0 * s;
-    
+
     let rows: [(&str, &str, String); 4] = [
         (
             "Backdrop Theme",
@@ -789,9 +876,9 @@ fn settings_page(
         );
         let r = scale_rect(row);
         let resp = ui.allocate_rect(r, Sense::click());
-        
+
         let focused = state.focus_content && state.row_selected == idx;
-        
+
         if resp.clicked() {
             state.focus_content = true;
             state.row_selected = idx;
@@ -815,7 +902,7 @@ fn settings_page(
                 _ => {}
             }
         }
-        
+
         let rounding = Rounding::same(12.0 * s * scale_factor);
         painter.rect_filled(r, rounding, pal.panel);
         let ring = if focused { accent } else { pal.border };
@@ -839,7 +926,6 @@ fn settings_page(
         let arrow_col = if focused { accent } else { pal.muted };
 
         {
-            // clickable left/right arrows (mouse users): left = previous, right = next
             let la = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 270.0 * s, row.center().y), Vec2::splat(34.0 * s)));
             let ra = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 30.0 * s, row.center().y), Vec2::splat(34.0 * s)));
             let la_c = ui.allocate_rect(la, Sense::click()).clicked();
@@ -847,8 +933,20 @@ fn settings_page(
             if la_c || ra_c {
                 let fwd = ra_c;
                 match idx {
-                    0 => *action = ProfileAction::SetBackdropTheme(if fwd { backdrop_theme.next() } else { backdrop_theme.prev() }),
-                    1 => *action = ProfileAction::SetDockbarTheme(if fwd { dockbar_theme.next() } else { dockbar_theme.prev() }),
+                    0 => {
+                        *action = ProfileAction::SetBackdropTheme(if fwd {
+                            backdrop_theme.next()
+                        } else {
+                            backdrop_theme.prev()
+                        })
+                    }
+                    1 => {
+                        *action = ProfileAction::SetDockbarTheme(if fwd {
+                            dockbar_theme.next()
+                        } else {
+                            dockbar_theme.prev()
+                        })
+                    }
                     2 => *action = ProfileAction::SetLightMode(!light_mode),
                     3 => *action = ProfileAction::SetEuDates(!eu_dates),
                     _ => {}
@@ -900,19 +998,27 @@ fn profile_page(
     pal: Pal,
 ) {
     let av_r = (content.height() * 0.18).clamp(90.0, 190.0);
-    let av_center = egui::pos2(content.min.x + av_r + 20.0 * s, content.center().y - av_r * 0.2);
+    let av_center = egui::pos2(
+        content.min.x + av_r + 20.0 * s,
+        content.center().y - av_r * 0.2,
+    );
     let now = ui.input(|i| i.time) as f32;
     let sc_av = scale_pos(av_center);
     let sc_avr = av_r * scale_factor;
 
-    let av_resp = ui.allocate_rect(egui::Rect::from_center_size(sc_av, Vec2::splat(sc_avr * 2.0)), Sense::click());
+    let av_resp = ui.allocate_rect(
+        egui::Rect::from_center_size(sc_av, Vec2::splat(sc_avr * 2.0)),
+        Sense::click(),
+    );
     if av_resp.clicked() {
         state.avatar_bounce = Some(now);
-        // roll for a rare celebration (~1 in 4)
-        let rng = |k: f32| { let h = ((now * 61.7 + k * 13.13).sin() * 43758.5453).fract(); h.abs() };
+        let rng = |k: f32| {
+            let h = ((now * 61.7 + k * 13.13).sin() * 43758.5453).fract();
+            h.abs()
+        };
         if rng(1.0) < 0.24 {
             crate::ui_audio::play(crate::ui_audio::Sfx::Celebration);
-            state.avatar_stars.push((now, -0.85, 0.0, 255)); // the star
+            state.avatar_stars.push((now, -0.85, 0.0, 255));
             for k in 0..14 {
                 let ang = -std::f32::consts::PI * (0.15 + rng(k as f32 * 2.0) * 0.7);
                 let spd = 260.0 + rng(k as f32 * 3.1) * 360.0;
@@ -927,7 +1033,6 @@ fn profile_page(
         }
     }
 
-    // springy bounce on the avatar
     let mut bounce = 1.0f32;
     if let Some(bt) = state.avatar_bounce {
         let e = now - bt;
@@ -939,10 +1044,19 @@ fn profile_page(
             state.avatar_bounce = None;
         }
     }
-    draw_circle_avatar(painter, sc_av, sc_avr * bounce, avatar_tex, accent, scale_factor, pal);
+    draw_circle_avatar(
+        painter,
+        sc_av,
+        sc_avr * bounce,
+        avatar_tex,
+        accent,
+        scale_factor,
+        pal,
+    );
 
-    // celebration particles (short-lived confetti + a star that burns up fast)
-    state.avatar_stars.retain(|(t0, _, _, kind)| now - t0 < if *kind == 255 { 1.1 } else { 1.0 });
+    state
+        .avatar_stars
+        .retain(|(t0, _, _, kind)| now - t0 < if *kind == 255 { 1.1 } else { 1.0 });
     let palette = [
         Color32::from_rgb(0xE8, 0x33, 0x50),
         Color32::from_rgb(0x2F, 0xB4, 0xEF),
@@ -957,8 +1071,14 @@ fn profile_page(
         if kind == 255 {
             let p = (age / 1.1).min(1.0);
             let pop = if p < 0.18 { p / 0.18 } else { 1.0 };
-            let fade = if p > 0.6 { ((1.0 - p) / 0.4).clamp(0.0, 1.0) } else { 1.0 };
-            let sp = head + Vec2::new(0.0, -sc_avr * 0.10 * p) + Vec2::new((ang).cos(), (ang).sin()) * sc_avr * 0.12 * p;
+            let fade = if p > 0.6 {
+                ((1.0 - p) / 0.4).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let sp = head
+                + Vec2::new(0.0, -sc_avr * 0.10 * p)
+                + Vec2::new((ang).cos(), (ang).sin()) * sc_avr * 0.12 * p;
             let sr = sc_avr * 0.16 * pop * (0.7 + 0.3 * fade);
             let col = Color32::from_rgba_unmultiplied(0xFF, 0xCB, 0x2E, (fade * 255.0) as u8);
             let outline = Color32::from_rgba_unmultiplied(0xC8, 0x8A, 0x00, (fade * 255.0) as u8);
@@ -969,30 +1089,42 @@ fn profile_page(
                     sp + Vec2::new(a.cos() * rr, a.sin() * rr)
                 })
                 .collect();
-            // filled star via a triangle fan from the center (convex_polygon can't do concave)
             let mut mesh = egui::epaint::Mesh::default();
-            let mk = |pos: egui::Pos2, c: Color32| egui::epaint::Vertex { pos, uv: egui::pos2(0.0, 0.0), color: c };
+            let mk = |pos: egui::Pos2, c: Color32| egui::epaint::Vertex {
+                pos,
+                uv: egui::pos2(0.0, 0.0),
+                color: c,
+            };
             mesh.vertices.push(mk(sp, col));
             for &pp in &pts {
                 mesh.vertices.push(mk(pp, col));
             }
             for k in 0..10u32 {
-                mesh.indices.extend_from_slice(&[0, 1 + k, 1 + ((k + 1) % 10)]);
+                mesh.indices
+                    .extend_from_slice(&[0, 1 + k, 1 + ((k + 1) % 10)]);
             }
             painter.add(egui::Shape::mesh(mesh));
-            painter.add(egui::Shape::closed_line(pts, Stroke::new(1.6 * scale_factor, outline)));
+            painter.add(egui::Shape::closed_line(
+                pts,
+                Stroke::new(1.6 * scale_factor, outline),
+            ));
         } else {
             let p = (age / 1.0).min(1.0);
             let fade = (1.0 - p * p).clamp(0.0, 1.0);
             let vel = Vec2::new(ang.cos(), ang.sin()) * spd * scale_factor;
             let pos = sc_av + vel * age + Vec2::new(0.0, 620.0 * scale_factor * age * age);
             let col = palette[kind as usize % palette.len()];
-            let c = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (fade * 255.0) as u8);
+            let c =
+                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (fade * 255.0) as u8);
             let sz = sc_avr * 0.05;
             let rot = age * 12.0 + kind as f32;
             let rx = Vec2::new(rot.cos(), rot.sin()) * sz;
             let ry = Vec2::new(-rot.sin(), rot.cos()) * sz * 0.5;
-            painter.add(egui::Shape::convex_polygon(vec![pos + rx + ry, pos + rx - ry, pos - rx - ry, pos - rx + ry], c, Stroke::NONE));
+            painter.add(egui::Shape::convex_polygon(
+                vec![pos + rx + ry, pos + rx - ry, pos - rx - ry, pos - rx + ry],
+                c,
+                Stroke::NONE,
+            ));
         }
         ui.ctx().request_repaint();
     }
@@ -1008,9 +1140,17 @@ fn profile_page(
     let rounding = Rounding::same(9.0 * s * scale_factor);
     let fill_a = if btn_resp.hovered() { 150 } else { 115 };
     let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), fill_a);
-    let border = if btn_resp.hovered() { brighten(accent, 0.2) } else { accent };
+    let border = if btn_resp.hovered() {
+        brighten(accent, 0.2)
+    } else {
+        accent
+    };
     painter.rect_filled(scaled_btn_rect, rounding, fill);
-    painter.rect_stroke(scaled_btn_rect, rounding, Stroke::new(2.0 * scale_factor, border));
+    painter.rect_stroke(
+        scaled_btn_rect,
+        rounding,
+        Stroke::new(2.0 * scale_factor, border),
+    );
     let text_pos = scaled_btn_rect.center();
     let font_id = FontId::proportional(15.5 * s * scale_factor);
     let af = fill_a as f32 / 255.0;
@@ -1019,15 +1159,38 @@ fn profile_page(
     let eb = accent.b() as f32 * af + pal.panel.b() as f32 * (1.0 - af);
     let lum = 0.299 * er + 0.587 * eg + 0.114 * eb;
     let (txt_col, halo) = if lum > 150.0 {
-        (Color32::from_rgb(0x1A, 0x1A, 0x22), Color32::from_rgba_unmultiplied(255, 255, 255, 130))
+        (
+            Color32::from_rgb(0x1A, 0x1A, 0x22),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 130),
+        )
     } else {
-        (Color32::WHITE, Color32::from_rgba_unmultiplied(0, 0, 0, 120))
+        (
+            Color32::WHITE,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+        )
     };
-    for off in [Vec2::new(-1.2, -1.2), Vec2::new(1.2, -1.2), Vec2::new(-1.2, 1.2), Vec2::new(1.2, 1.2)] {
-        painter.text(text_pos + off, egui::Align2::CENTER_CENTER, "Change Icon", font_id.clone(), halo);
+    for off in [
+        Vec2::new(-1.2, -1.2),
+        Vec2::new(1.2, -1.2),
+        Vec2::new(-1.2, 1.2),
+        Vec2::new(1.2, 1.2),
+    ] {
+        painter.text(
+            text_pos + off,
+            egui::Align2::CENTER_CENTER,
+            "Change Icon",
+            font_id.clone(),
+            halo,
+        );
     }
     for dx in [0.0f32, 0.7] {
-        painter.text(text_pos + Vec2::new(dx, 0.0), egui::Align2::CENTER_CENTER, "Change Icon", font_id.clone(), txt_col);
+        painter.text(
+            text_pos + Vec2::new(dx, 0.0),
+            egui::Align2::CENTER_CENTER,
+            "Change Icon",
+            font_id.clone(),
+            txt_col,
+        );
     }
     if btn_resp.clicked() {
         *action = ProfileAction::PickIcon;
@@ -1055,11 +1218,22 @@ fn profile_page(
         state.name_editing = false;
     }
 
-    painter.rect_filled(scaled_field_rect, Rounding::same(9.0 * s * scale_factor), pal.input_bg);
+    painter.rect_filled(
+        scaled_field_rect,
+        Rounding::same(9.0 * s * scale_factor),
+        pal.input_bg,
+    );
     painter.rect_stroke(
         scaled_field_rect,
         Rounding::same(9.0 * s * scale_factor),
-        Stroke::new(1.8 * scale_factor, if state.name_editing { accent } else { pal.border }),
+        Stroke::new(
+            1.8 * scale_factor,
+            if state.name_editing {
+                accent
+            } else {
+                pal.border
+            },
+        ),
     );
 
     let font = FontId::proportional(22.0 * s * scale_factor);
@@ -1071,11 +1245,40 @@ fn profile_page(
     let text_clip = scaled_field_rect.shrink2(Vec2::new(inner_pad * 0.5, 0.0));
     let tp = painter.with_clip_rect(text_clip);
     let name_events = ui.input(|i| i.events.clone());
-    let nfr = crate::app::text_field(&tp, ui, scaled_field_rect, text_x, mid_y, &mut state.name_buf, &mut state.name_caret, &mut state.name_anchor, font, pal.soft_text, pal.muted, sel_c, "Enter a name…", false, 24, state.name_editing, blink, if state.name_editing { &name_events } else { &[] });
-    if nfr.clicked || nfr.secondary_clicked { state.name_editing = true; }
+    let nfr = crate::app::text_field(
+        &tp,
+        ui,
+        scaled_field_rect,
+        text_x,
+        mid_y,
+        &mut state.name_buf,
+        &mut state.name_caret,
+        &mut state.name_anchor,
+        font,
+        pal.soft_text,
+        pal.muted,
+        sel_c,
+        "Enter a name…",
+        false,
+        24,
+        state.name_editing,
+        blink,
+        if state.name_editing {
+            &name_events
+        } else {
+            &[]
+        },
+    );
+    if nfr.clicked || nfr.secondary_clicked {
+        state.name_editing = true;
+    }
     if state.name_editing && nfr.commit {
         let name = state.name_buf.trim().to_string();
-        let name = if name.is_empty() { "Player".to_string() } else { name };
+        let name = if name.is_empty() {
+            "Player".to_string()
+        } else {
+            name
+        };
         state.name_buf = name.clone();
         state.name_editing = false;
         if name != profile_name {
@@ -1088,9 +1291,18 @@ fn profile_page(
     }
 
     if state.pad_connected && !state.name_editing && !state.name_kb.open {
-        let badge = egui::pos2(scaled_field_rect.max.x - 18.0 * scale_factor, scaled_field_rect.center().y);
+        let badge = egui::pos2(
+            scaled_field_rect.max.x - 18.0 * scale_factor,
+            scaled_field_rect.center().y,
+        );
         painter.circle_filled(badge, 10.0 * scale_factor, accent);
-        painter.text(badge, egui::Align2::CENTER_CENTER, "Y", FontId::proportional(13.0 * scale_factor), Color32::from_rgb(0x10, 0x14, 0x1C));
+        painter.text(
+            badge,
+            egui::Align2::CENTER_CENTER,
+            "Y",
+            FontId::proportional(13.0 * scale_factor),
+            Color32::from_rgb(0x10, 0x14, 0x1C),
+        );
     }
 
     let sub_hint = if state.name_editing {
@@ -1156,7 +1368,10 @@ fn recently_played_page(
     state.row_selected = state.row_selected.min(order.len() - 1);
 
     if state.focus_content && enter {
-        let path = lib.games[order[state.row_selected]].path.to_string_lossy().to_string();
+        let path = lib.games[order[state.row_selected]]
+            .path
+            .to_string_lossy()
+            .to_string();
         *action = ProfileAction::QuickLaunch(path);
     }
 
@@ -1199,7 +1414,8 @@ fn recently_played_page(
         let row_resp = ui.interact(scaled_rect, egui::Id::new(("rp_row", i)), Sense::click());
         if row_resp.clicked() {
             if state.focus_content && state.row_selected == vis {
-                *action = ProfileAction::QuickLaunch(lib.games[i].path.to_string_lossy().to_string());
+                *action =
+                    ProfileAction::QuickLaunch(lib.games[i].path.to_string_lossy().to_string());
             } else {
                 state.focus_content = true;
                 state.row_selected = vis;
@@ -1215,7 +1431,14 @@ fn recently_played_page(
         painter.rect_stroke(
             scaled_rect,
             Rounding::same(9.0 * s * scale_factor),
-            Stroke::new(if is_sel { 2.0 * scale_factor } else { 1.0 * scale_factor }, if is_sel { accent } else { pal.border }),
+            Stroke::new(
+                if is_sel {
+                    2.0 * scale_factor
+                } else {
+                    1.0 * scale_factor
+                },
+                if is_sel { accent } else { pal.border },
+            ),
         );
 
         let pad = 7.0 * s;
@@ -1234,11 +1457,18 @@ fn recently_played_page(
             );
             painter.add(egui::Shape::mesh(mesh));
         } else {
-            painter.rect_filled(scaled_icon, Rounding::same(7.0 * s * scale_factor), Color32::from_rgb(0x22, 0x22, 0x2C));
+            painter.rect_filled(
+                scaled_icon,
+                Rounding::same(7.0 * s * scale_factor),
+                Color32::from_rgb(0x22, 0x22, 0x2C),
+            );
         }
 
         painter.text(
-            scale_pos(egui::pos2(icon.max.x + 14.0 * s, rect.center().y - 10.0 * s)),
+            scale_pos(egui::pos2(
+                icon.max.x + 14.0 * s,
+                rect.center().y - 10.0 * s,
+            )),
             egui::Align2::LEFT_CENTER,
             &title,
             FontId::proportional(16.0 * s * scale_factor),
@@ -1250,7 +1480,10 @@ fn recently_played_page(
             format_playtime(secs)
         };
         painter.text(
-            scale_pos(egui::pos2(icon.max.x + 14.0 * s, rect.center().y + 11.0 * s)),
+            scale_pos(egui::pos2(
+                icon.max.x + 14.0 * s,
+                rect.center().y + 11.0 * s,
+            )),
             egui::Align2::LEFT_CENTER,
             &time_str,
             FontId::proportional(12.5 * s * scale_factor),
@@ -1263,19 +1496,21 @@ fn recently_played_page(
         let frac_view = (view_h / total).min(1.0);
         let bar_h = (view_h * frac_view).max(30.0 * s);
         let bar_y = content.min.y + (state.list_scroll / max_scroll) * (view_h - bar_h);
-        
-        let track_rect = scale_rect(egui::Rect::from_min_size(egui::pos2(track_x, content.min.y), Vec2::new(4.0 * s, view_h)));
-        let bar_rect = scale_rect(egui::Rect::from_min_size(egui::pos2(track_x, bar_y), Vec2::new(4.0 * s, bar_h)));
+
+        let track_rect = scale_rect(egui::Rect::from_min_size(
+            egui::pos2(track_x, content.min.y),
+            Vec2::new(4.0 * s, view_h),
+        ));
+        let bar_rect = scale_rect(egui::Rect::from_min_size(
+            egui::pos2(track_x, bar_y),
+            Vec2::new(4.0 * s, bar_h),
+        ));
 
         painter.rect_filled(
             track_rect,
             Rounding::same(2.0 * s * scale_factor),
             Color32::from_rgb(0x20, 0x20, 0x2A),
         );
-        painter.rect_filled(
-            bar_rect,
-            Rounding::same(2.0 * s * scale_factor),
-            accent,
-        );
+        painter.rect_filled(bar_rect, Rounding::same(2.0 * s * scale_factor), accent);
     }
 }

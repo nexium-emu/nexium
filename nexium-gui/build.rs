@@ -19,8 +19,13 @@ fn main() {
             .filter(|s| !s.is_empty())
     };
     let hash = git(&["rev-parse", "--short=10", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).map_or(false, |s| !s.is_empty());
-    let hash = if dirty { format!("{}-dirty", hash) } else { hash };
+    let dirty =
+        git(&["status", "--porcelain", "--untracked-files=no"]).map_or(false, |s| !s.is_empty());
+    let hash = if dirty {
+        format!("{}-dirty", hash)
+    } else {
+        hash
+    };
     println!("cargo:rustc-env=NEXIUM_GIT_HASH={}", hash);
 
     for p in ["../.git/HEAD", "../.git/index"] {

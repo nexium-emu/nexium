@@ -55,7 +55,6 @@ pub fn screen_bytes(app: &ShopApp, i: u32) -> Option<Vec<u8>> {
     curl_bytes(&app.screen_url(i), 25)
 }
 
-/// Fetch the repo and return only entries whose category is exactly "game".
 pub fn fetch_games() -> Vec<ShopApp> {
     let Some(bytes) = curl_bytes(&format!("{BASE}repo.json"), 25) else {
         return Vec::new();
@@ -69,9 +68,8 @@ pub fn fetch_games() -> Vec<ShopApp> {
     let str_of = |v: &serde_json::Value, k: &str| -> String {
         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
     };
-    let u64_of = |v: &serde_json::Value, k: &str| -> u64 {
-        v.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
-    };
+    let u64_of =
+        |v: &serde_json::Value, k: &str| -> u64 { v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) };
     let mut out: Vec<ShopApp> = pkgs
         .iter()
         .filter(|p| p.get("category").and_then(|c| c.as_str()) == Some("game"))
@@ -79,7 +77,11 @@ pub fn fetch_games() -> Vec<ShopApp> {
             name: str_of(p, "name"),
             title: {
                 let t = str_of(p, "title");
-                if t.is_empty() { str_of(p, "name") } else { t }
+                if t.is_empty() {
+                    str_of(p, "name")
+                } else {
+                    t
+                }
             },
             author: str_of(p, "author"),
             description: str_of(p, "description"),

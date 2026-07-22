@@ -93,29 +93,39 @@ impl Library {
         0
     }
 
-    pub fn add_download(&mut self, title: String, icon: Option<egui::ColorImage>, info: Arc<Mutex<DownloadInfo>>) {
+    pub fn add_download(
+        &mut self,
+        title: String,
+        icon: Option<egui::ColorImage>,
+        info: Arc<Mutex<DownloadInfo>>,
+    ) {
         let path = PathBuf::from(format!("__downloading__/{title}"));
         if self.games.iter().any(|g| g.path == path) {
             return;
         }
-        let dominant = icon.as_ref().map(sample_dominant).unwrap_or(egui::Color32::from_rgb(0x2F, 0xB4, 0xEF));
-        self.games.insert(0, GameEntry {
-            path,
-            title,
-            author: String::new(),
-            format: "NRO",
-            size: 0,
-            icon,
-            dominant_color: dominant,
-            download: Some(info),
-        });
+        let dominant = icon
+            .as_ref()
+            .map(sample_dominant)
+            .unwrap_or(egui::Color32::from_rgb(0x2F, 0xB4, 0xEF));
+        self.games.insert(
+            0,
+            GameEntry {
+                path,
+                title,
+                author: String::new(),
+                format: "NRO",
+                size: 0,
+                icon,
+                dominant_color: dominant,
+                download: Some(info),
+            },
+        );
         self.textures.insert(0, None);
         if let Some(sel) = self.selected {
             self.selected = Some(sel + 1);
         }
     }
 
-    /// Remove finished download placeholders; returns true if any completed OK (needs rescan).
     pub fn prune_downloads(&mut self) -> bool {
         let mut rescan = false;
         let mut i = 0;
@@ -126,7 +136,11 @@ impl Library {
                 false
             };
             if remove {
-                let ok = self.games[i].download.as_ref().and_then(|d| d.lock().ok().map(|g| g.ok)).unwrap_or(false);
+                let ok = self.games[i]
+                    .download
+                    .as_ref()
+                    .and_then(|d| d.lock().ok().map(|g| g.ok))
+                    .unwrap_or(false);
                 self.games.remove(i);
                 if i < self.textures.len() {
                     self.textures.remove(i);
@@ -173,16 +187,24 @@ impl Library {
 fn scan(extra_dirs: &[PathBuf]) -> Vec<GameEntry> {
     let mut out = Vec::new();
     collect(&nexium_common::paths::nro_dir(), 0, &mut out);
-    collect(&nexium_common::paths::sdmc_dir().join("switch"), 0, &mut out);
+    collect(
+        &nexium_common::paths::sdmc_dir().join("switch"),
+        0,
+        &mut out,
+    );
     for dir in extra_dirs {
         collect(dir, 0, &mut out);
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out.dedup_by(|a, b| a.path == b.path);
-    // Never list the same game twice (e.g. a copy in switch/ and a migrated
-    // copy in NRO/). Prefer the one under a switch/ folder (keeps its assets).
     let pref = |p: &Path| -> u8 {
-        if p.components().any(|c| c.as_os_str().eq_ignore_ascii_case("switch")) { 1 } else { 0 }
+        if p.components()
+            .any(|c| c.as_os_str().eq_ignore_ascii_case("switch"))
+        {
+            1
+        } else {
+            0
+        }
     };
     out.sort_by(|a, b| {
         a.title
@@ -250,7 +272,6 @@ fn read_entry(path: &Path) -> Option<GameEntry> {
         None => (stem.clone(), String::new(), None),
     };
 
-    // Custom (SteamGridDB) icon override takes precedence if present.
     let icon = custom_icon_path(path)
         .filter(|p| p.exists())
         .and_then(|p| std::fs::read(&p).ok())
@@ -263,7 +284,9 @@ fn read_entry(path: &Path) -> Option<GameEntry> {
         author,
         format,
         size,
-        dominant_color: icon.as_ref().map(sample_dominant)
+        dominant_color: icon
+            .as_ref()
+            .map(sample_dominant)
             .unwrap_or(egui::Color32::from_rgb(0x2F, 0xB4, 0xEF)),
         icon,
         download: None,
@@ -299,8 +322,6 @@ fn sample_dominant(img: &egui::ColorImage) -> egui::Color32 {
     if pixels.is_empty() {
         return egui::Color32::from_rgb(0x2F, 0xB4, 0xEF);
     }
-    // most-populated hue: bin colourful pixels into hue buckets weighted by
-    // vividness, pick the fullest bucket, then average that bucket's colour
     const NB: usize = 24;
     let stride = (pixels.len() / 4096).max(1);
     let mut weight = [0.0f32; NB];
@@ -344,7 +365,6 @@ fn sample_dominant(img: &egui::ColorImage) -> egui::Color32 {
     if weight[best] <= 0.0 {
         return egui::Color32::from_rgb(0x2F, 0xB4, 0xEF);
     }
-    // average the dominant bucket + its two neighbours for a stable colour
     let (mut rr, mut gg, mut bb, mut nn) = (0u64, 0u64, 0u64, 0u64);
     for d in [NB - 1, 0, 1] {
         let bk = (best + d) % NB;
@@ -385,17 +405,19 @@ fn sample_dominant(img: &egui::ColorImage) -> egui::Color32 {
     let p = 2.0 * target_l - q;
     let hue_to_rgb = |mut t: f32| -> f32 {
         t = t.rem_euclid(1.0);
-        if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
-        if t < 0.5 { return q; }
-        if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+        if t < 1.0 / 6.0 {
+            return p + (q - p) * 6.0 * t;
+        }
+        if t < 0.5 {
+            return q;
+        }
+        if t < 2.0 / 3.0 {
+            return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+        }
         p
     };
     let fr = hue_to_rgb(hue + 1.0 / 3.0);
     let fg = hue_to_rgb(hue);
     let fb = hue_to_rgb(hue - 1.0 / 3.0);
-    egui::Color32::from_rgb(
-        (fr * 255.0) as u8,
-        (fg * 255.0) as u8,
-        (fb * 255.0) as u8,
-    )
+    egui::Color32::from_rgb((fr * 255.0) as u8, (fg * 255.0) as u8, (fb * 255.0) as u8)
 }

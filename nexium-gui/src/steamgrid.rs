@@ -46,7 +46,6 @@ fn search_game_id(key: &str, title: &str) -> Option<u64> {
     arr.first()?.get("id")?.as_u64()
 }
 
-/// Search for a game by title and return up to `limit` icon options.
 pub fn fetch_icons(key: &str, title: &str, limit: usize) -> Vec<IconOption> {
     let Some(game_id) = search_game_id(key, title) else {
         return Vec::new();
@@ -62,10 +61,7 @@ pub fn fetch_icons(key: &str, title: &str, limit: usize) -> Vec<IconOption> {
     if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
         for item in arr.iter().take(limit) {
             let full = item.get("url").and_then(|u| u.as_str()).unwrap_or("");
-            let thumb = item
-                .get("thumb")
-                .and_then(|u| u.as_str())
-                .unwrap_or(full);
+            let thumb = item.get("thumb").and_then(|u| u.as_str()).unwrap_or(full);
             if !full.is_empty() {
                 out.push(IconOption {
                     full_url: full.to_string(),
@@ -77,14 +73,16 @@ pub fn fetch_icons(key: &str, title: &str, limit: usize) -> Vec<IconOption> {
     out
 }
 
-/// Verify an API key by hitting a lightweight authenticated endpoint.
 pub fn verify_key(key: &str) -> bool {
     if key.trim().is_empty() {
         return false;
     }
     let url = "https://www.steamgriddb.com/api/v2/search/autocomplete/mario";
     match curl_json(url, key) {
-        Some(json) => json.get("success").and_then(|s| s.as_bool()).unwrap_or(false),
+        Some(json) => json
+            .get("success")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false),
         None => false,
     }
 }

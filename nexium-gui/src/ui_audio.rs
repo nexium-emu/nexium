@@ -25,11 +25,10 @@ static SHOP_MUSIC: [&[u8]; 2] = [
 ];
 static SETTINGS_MUSIC: &[u8] = include_bytes!("assets/settings_bgm_01.mp3");
 
-// f32 bits: target music gain (post-volume) and lowpass amount (0=clean, 1=muffled)
 static MUSIC_TARGET: AtomicU32 = AtomicU32::new(0);
 static MUSIC_LOWPASS: AtomicU32 = AtomicU32::new(0);
 static MUSIC_MODE: AtomicU8 = AtomicU8::new(MusicMode::Carousel as u8);
-static SFX_VOLUME: AtomicU32 = AtomicU32::new(1056964608); // 0.5f32.to_bits()
+static SFX_VOLUME: AtomicU32 = AtomicU32::new(1056964608);
 static CAROUSEL_SELECTION: AtomicU8 = AtomicU8::new(CAROUSEL_ALL);
 
 pub const CAROUSEL_ALL: u8 = 255;
@@ -96,12 +95,7 @@ fn decode_mp3_stereo(bytes: &'static [u8]) -> Option<MusicTrack> {
         ..FormatOptions::default()
     };
     let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            source,
-            &format_options,
-            &MetadataOptions::default(),
-        )
+        .format(&hint, source, &format_options, &MetadataOptions::default())
         .ok()?;
     let mut format = probed.format;
     let track = format.default_track()?;
@@ -186,10 +180,8 @@ fn next_music_sample(
     let next = (index + 1) % len;
     let fraction = (*position - index as f64) as f32;
     let sample = [
-        track.samples[index][0]
-            + (track.samples[next][0] - track.samples[index][0]) * fraction,
-        track.samples[index][1]
-            + (track.samples[next][1] - track.samples[index][1]) * fraction,
+        track.samples[index][0] + (track.samples[next][0] - track.samples[index][0]) * fraction,
+        track.samples[index][1] + (track.samples[next][1] - track.samples[index][1]) * fraction,
     ];
     *position += track.sample_rate / output_sample_rate;
     if *position >= len as f64 {
@@ -321,25 +313,48 @@ fn build() -> Option<Engine> {
     banks.insert(key(Sfx::Select), std::sync::Arc::new(render(Sfx::Select)));
     banks.insert(key(Sfx::Back), std::sync::Arc::new(render(Sfx::Back)));
     banks.insert(key(Sfx::Error), std::sync::Arc::new(render(Sfx::Error)));
-    banks.insert(key(Sfx::Favorite), std::sync::Arc::new(render(Sfx::Favorite)));
+    banks.insert(
+        key(Sfx::Favorite),
+        std::sync::Arc::new(render(Sfx::Favorite)),
+    );
     banks.insert(key(Sfx::Open), std::sync::Arc::new(render(Sfx::Open)));
     banks.insert(key(Sfx::Boot), std::sync::Arc::new(render(Sfx::Boot)));
     banks.insert(key(Sfx::Whistle), std::sync::Arc::new(render(Sfx::Whistle)));
-    banks.insert(key(Sfx::GameBoot), std::sync::Arc::new(render(Sfx::GameBoot)));
-    banks.insert(key(Sfx::AwaitFrame), std::sync::Arc::new(render(Sfx::AwaitFrame)));
-    banks.insert(key(Sfx::PleaseWait), std::sync::Arc::new(render(Sfx::PleaseWait)));
-    banks.insert(key(Sfx::Celebration), std::sync::Arc::new(render(Sfx::Celebration)));
-    banks.insert(key(Sfx::WhistleOk), std::sync::Arc::new(render(Sfx::WhistleOk)));
-    banks.insert(key(Sfx::WhistleSquish), std::sync::Arc::new(render(Sfx::WhistleSquish)));
+    banks.insert(
+        key(Sfx::GameBoot),
+        std::sync::Arc::new(render(Sfx::GameBoot)),
+    );
+    banks.insert(
+        key(Sfx::AwaitFrame),
+        std::sync::Arc::new(render(Sfx::AwaitFrame)),
+    );
+    banks.insert(
+        key(Sfx::PleaseWait),
+        std::sync::Arc::new(render(Sfx::PleaseWait)),
+    );
+    banks.insert(
+        key(Sfx::Celebration),
+        std::sync::Arc::new(render(Sfx::Celebration)),
+    );
+    banks.insert(
+        key(Sfx::WhistleOk),
+        std::sync::Arc::new(render(Sfx::WhistleOk)),
+    );
+    banks.insert(
+        key(Sfx::WhistleSquish),
+        std::sync::Arc::new(render(Sfx::WhistleSquish)),
+    );
 
     let (carousel_start, shop_variant) = random_music_variants();
     let carousel_tracks: Vec<MusicTrack> = CAROUSEL_MUSIC
         .iter()
         .enumerate()
-        .map(|(i, bytes)| decode_mp3_stereo(bytes).unwrap_or_else(|| {
-            log::warn!("Failed to decode carousel music variant {}", i + 1);
-            MusicTrack::silent()
-        }))
+        .map(|(i, bytes)| {
+            decode_mp3_stereo(bytes).unwrap_or_else(|| {
+                log::warn!("Failed to decode carousel music variant {}", i + 1);
+                MusicTrack::silent()
+            })
+        })
         .collect();
     let shop_tracks: Vec<MusicTrack> = SHOP_MUSIC
         .iter()
@@ -364,9 +379,10 @@ fn build() -> Option<Engine> {
 
     let host = cpal::default_host();
     let device = host.default_output_device()?;
-    let device_name = device.name().unwrap_or_else(|_| "default output".to_string());
+    let device_name = device
+        .name()
+        .unwrap_or_else(|_| "default output".to_string());
 
-    // Prefer an F32 config so our mixer output maps directly.
     let cfg = device
         .supported_output_configs()
         .ok()?
@@ -495,7 +511,9 @@ fn build() -> Option<Engine> {
                     }
                 }
                 if let Some(a) = act.as_mut() {
-                    a.retain(|v| v.looping || (v.pos as f32 * sfx_ratio) < v.buf.len() as f32 + 1.0);
+                    a.retain(|v| {
+                        v.looping || (v.pos as f32 * sfx_ratio) < v.buf.len() as f32 + 1.0
+                    });
                 }
             },
             err_cb,
@@ -579,7 +597,6 @@ fn render(s: Sfx) -> Vec<f32> {
             tone_after(&mut b, 40, 987.77, 90.0, 0.28, 2.0, 70.0);
         }
         Sfx::Back => {
-            // downward whistle slide — a whistley "back out"
             whistle(&mut b, 1180.0, 540.0, 0.30, 70.0, 0.18);
         }
         Sfx::Open => {
@@ -597,14 +614,12 @@ fn render(s: Sfx) -> Vec<f32> {
             tone_after(&mut b, 60, 174.61, 130.0, 0.28, 1.0, 90.0);
         }
         Sfx::Boot => {
-            // Low warm swell chord (C3, G3, B3, D4, F#4) swelling up to 2.4 seconds
             tone_after_abs(&mut b, 0.0, 130.81, 2400.0, 0.12, 1800.0, 200.0);
             tone_after_abs(&mut b, 0.0, 196.00, 2400.0, 0.09, 1800.0, 200.0);
             tone_after_abs(&mut b, 400.0, 246.94, 2000.0, 0.09, 1500.0, 200.0);
             tone_after_abs(&mut b, 800.0, 293.66, 1600.0, 0.08, 1200.0, 200.0);
             tone_after_abs(&mut b, 1200.0, 369.99, 1200.0, 0.08, 900.0, 200.0);
 
-            // Convergence point chime starting at 2.35s (2350 ms) with a long release
             tone_after_abs(&mut b, 2350.0, 523.25, 2650.0, 0.08, 15.0, 2200.0);
             tone_after_abs(&mut b, 2350.0, 659.25, 2650.0, 0.08, 15.0, 2200.0);
             tone_after_abs(&mut b, 2350.0, 783.99, 2650.0, 0.08, 20.0, 2200.0);
@@ -612,14 +627,12 @@ fn render(s: Sfx) -> Vec<f32> {
             tone_after_abs(&mut b, 2350.0, 1174.66, 2650.0, 0.06, 30.0, 2200.0);
             tone_after_abs(&mut b, 2350.0, 1760.00, 2650.0, 0.05, 40.0, 2200.0);
 
-            // Shimmering arpeggio notes cascading upwards
             tone_after_abs(&mut b, 2450.0, 1318.51, 1500.0, 0.04, 10.0, 1200.0);
             tone_after_abs(&mut b, 2600.0, 1567.98, 1500.0, 0.04, 10.0, 1200.0);
             tone_after_abs(&mut b, 2750.0, 1975.53, 1500.0, 0.03, 10.0, 1200.0);
             tone_after_abs(&mut b, 2900.0, 2349.32, 1500.0, 0.03, 10.0, 1200.0);
         }
         Sfx::Whistle => {
-            // cute upward whistle slide (pure sine, pitch bends up then a little flick)
             let dur = 0.34f32;
             let n = (SR * dur) as usize;
             b.resize(n, 0.0);
@@ -636,33 +649,28 @@ fn render(s: Sfx) -> Vec<f32> {
             }
         }
         Sfx::WhistleOk => {
-            // bright rising accept whistle with a little high flick at the end
             whistle(&mut b, 720.0, 1360.0, 0.24, 55.0, 0.19);
             tone_after_abs(&mut b, 180.0, 1720.0, 120.0, 0.12, 4.0, 100.0);
         }
         Sfx::WhistleSquish => {
-            // playful "boing" whistle — quick up then a springy dip back down
             whistle(&mut b, 820.0, 1300.0, 0.13, 40.0, 0.2);
             let s = b.len();
             let _ = s;
             whistle_at(&mut b, 120.0, 1300.0, 880.0, 0.16, 120.0, 0.18);
         }
         Sfx::GameBoot => {
-            // Chord 1: Dm9 (D3, F3, A3, C4, E4) from 0ms to 300ms
             tone_after_abs(&mut b, 0.0, 146.83, 300.0, 0.12, 10.0, 60.0);
             tone_after_abs(&mut b, 20.0, 174.61, 300.0, 0.12, 10.0, 60.0);
             tone_after_abs(&mut b, 40.0, 220.00, 300.0, 0.12, 10.0, 60.0);
             tone_after_abs(&mut b, 60.0, 261.63, 300.0, 0.10, 10.0, 60.0);
             tone_after_abs(&mut b, 80.0, 329.63, 300.0, 0.10, 10.0, 60.0);
 
-            // Chord 2: G13 (G3, B3, F4, A4, E5) from 300ms to 600ms
             tone_after_abs(&mut b, 300.0, 196.00, 300.0, 0.12, 10.0, 60.0);
             tone_after_abs(&mut b, 320.0, 246.94, 300.0, 0.12, 10.0, 60.0);
             tone_after_abs(&mut b, 340.0, 349.23, 300.0, 0.10, 10.0, 60.0);
             tone_after_abs(&mut b, 360.0, 440.00, 300.0, 0.10, 10.0, 60.0);
             tone_after_abs(&mut b, 380.0, 659.25, 300.0, 0.08, 10.0, 60.0);
 
-            // Chord 3: Cmaj9 (C3, G3, B3, D4, E4, G4) starting at 600ms, sustained with long release
             tone_after_abs(&mut b, 600.0, 130.81, 1400.0, 0.14, 15.0, 800.0);
             tone_after_abs(&mut b, 620.0, 196.00, 1400.0, 0.12, 15.0, 800.0);
             tone_after_abs(&mut b, 640.0, 246.94, 1400.0, 0.12, 15.0, 800.0);
@@ -670,10 +678,9 @@ fn render(s: Sfx) -> Vec<f32> {
             tone_after_abs(&mut b, 680.0, 329.63, 1400.0, 0.10, 15.0, 800.0);
             tone_after_abs(&mut b, 700.0, 392.00, 1400.0, 0.08, 15.0, 800.0);
 
-            // Top melodic jazzy lead notes
-            tone_after_abs(&mut b, 800.0, 493.88, 200.0, 0.09, 10.0, 80.0); // B4
-            tone_after_abs(&mut b, 1000.0, 587.33, 200.0, 0.09, 10.0, 80.0); // D5
-            tone_after_abs(&mut b, 1200.0, 783.99, 800.0, 0.08, 10.0, 400.0); // G5
+            tone_after_abs(&mut b, 800.0, 493.88, 200.0, 0.09, 10.0, 80.0);
+            tone_after_abs(&mut b, 1000.0, 587.33, 200.0, 0.09, 10.0, 80.0);
+            tone_after_abs(&mut b, 1200.0, 783.99, 800.0, 0.08, 10.0, 400.0);
         }
         Sfx::AwaitFrame => {
             b.resize((SR * 0.5) as usize, 0.0);
@@ -690,24 +697,24 @@ fn render(s: Sfx) -> Vec<f32> {
                 for (idx, &f) in freqs.iter().enumerate() {
                     let phase = f * t;
                     let wave = tri(phase) * 0.6 + (phase * std::f32::consts::TAU).sin() * 0.4;
-                    let note_breathe = 0.4 + 0.6 * (t * std::f32::consts::TAU / 3.0 + idx as f32 * 0.5).cos().abs();
+                    let note_breathe = 0.4
+                        + 0.6
+                            * (t * std::f32::consts::TAU / 3.0 + idx as f32 * 0.5)
+                                .cos()
+                                .abs();
                     s += wave * note_breathe;
                 }
                 b[i] = (s / freqs.len() as f32) * 0.16 * breathe;
             }
         }
         Sfx::Celebration => {
-            // Cute little "ta-da!" — quick ascending C major arpeggio into a
-            // sparkly high sprinkle, with a soft chord bloom underneath.
             let lead = [523.25f32, 659.25, 783.99, 1046.5];
             for (i, &f) in lead.iter().enumerate() {
                 tone_after_abs(&mut b, i as f32 * 70.0, f, 260.0, 0.14, 4.0, 200.0);
             }
-            // Sustained major chord bloom (C5/E5/G5) that lands with the top note.
             tone_after_abs(&mut b, 210.0, 523.25, 620.0, 0.10, 10.0, 480.0);
             tone_after_abs(&mut b, 220.0, 659.25, 620.0, 0.09, 10.0, 480.0);
             tone_after_abs(&mut b, 230.0, 783.99, 620.0, 0.09, 10.0, 480.0);
-            // Twinkly high sprinkles (pure sine) fluttering above.
             let sparkle = [1567.98f32, 2093.0, 1760.0, 2349.32, 2093.0];
             for (i, &f) in sparkle.iter().enumerate() {
                 let off = 300.0 + i as f32 * 55.0;
@@ -718,7 +725,8 @@ fn render(s: Sfx) -> Vec<f32> {
                 }
                 for j in 0..n {
                     let s = (f * j as f32 / SR * std::f32::consts::TAU).sin();
-                    b[start + j] += s * 0.06 * env(j, n, (SR * 0.004) as usize, (SR * 0.07) as usize);
+                    b[start + j] +=
+                        s * 0.06 * env(j, n, (SR * 0.004) as usize, (SR * 0.07) as usize);
                 }
             }
         }
@@ -726,7 +734,15 @@ fn render(s: Sfx) -> Vec<f32> {
     b
 }
 
-fn tone_after(buf: &mut Vec<f32>, gap_ms: usize, freq: f32, dur_ms: f32, gain: f32, attack_ms: f32, release_ms: f32) {
+fn tone_after(
+    buf: &mut Vec<f32>,
+    gap_ms: usize,
+    freq: f32,
+    dur_ms: f32,
+    gain: f32,
+    attack_ms: f32,
+    release_ms: f32,
+) {
     let target = buf.len() + (SR * gap_ms as f32 / 1000.0) as usize;
     if buf.len() < target {
         buf.resize(target, 0.0);
@@ -744,7 +760,15 @@ fn tone_after(buf: &mut Vec<f32>, gap_ms: usize, freq: f32, dur_ms: f32, gain: f
     }
 }
 
-fn tone_after_abs(buf: &mut Vec<f32>, offset_ms: f32, freq: f32, dur_ms: f32, gain: f32, attack_ms: f32, release_ms: f32) {
+fn tone_after_abs(
+    buf: &mut Vec<f32>,
+    offset_ms: f32,
+    freq: f32,
+    dur_ms: f32,
+    gain: f32,
+    attack_ms: f32,
+    release_ms: f32,
+) {
     let off = (SR * offset_ms / 1000.0) as usize;
     let n = (SR * dur_ms / 1000.0) as usize;
     let end = off + n;
@@ -760,7 +784,15 @@ fn tone_after_abs(buf: &mut Vec<f32>, offset_ms: f32, freq: f32, dur_ms: f32, ga
     }
 }
 
-fn whistle_at(buf: &mut Vec<f32>, offset_ms: f32, f0: f32, f1: f32, dur: f32, warble: f32, gain: f32) {
+fn whistle_at(
+    buf: &mut Vec<f32>,
+    offset_ms: f32,
+    f0: f32,
+    f1: f32,
+    dur: f32,
+    warble: f32,
+    gain: f32,
+) {
     let off = (SR * offset_ms / 1000.0) as usize;
     let n = (SR * dur) as usize;
     if buf.len() < off + n {

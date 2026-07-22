@@ -114,12 +114,20 @@ pub struct ShopState {
 }
 
 fn btn_fill(light: bool) -> Color32 {
-    if light { Color32::from_rgb(0xEA, 0xEA, 0xF0) } else { Color32::from_rgb(0x24, 0x24, 0x2E) }
+    if light {
+        Color32::from_rgb(0xEA, 0xEA, 0xF0)
+    } else {
+        Color32::from_rgb(0x24, 0x24, 0x2E)
+    }
 }
 
 fn tint_toward(c: Color32, other: Color32, t: f32) -> Color32 {
     let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
-    Color32::from_rgb(f(c.r(), other.r()), f(c.g(), other.g()), f(c.b(), other.b()))
+    Color32::from_rgb(
+        f(c.r(), other.r()),
+        f(c.g(), other.g()),
+        f(c.b(), other.b()),
+    )
 }
 
 impl ShopState {
@@ -174,8 +182,6 @@ impl ShopState {
         self.open = true;
         self.view = View::Grid;
         self.open_dialog(Dlg::Disclaimer);
-        // swallow the still-held A/B that opened the shop so it doesn't
-        // immediately fire an edge inside the shop on the same press.
         self.a_held = true;
         self.b_held = true;
         if !self.loaded && self.fetch.is_none() {
@@ -247,7 +253,14 @@ impl ShopState {
         });
     }
 
-    pub fn update(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, light: bool, accent: Color32, li: &InputSnapshot) {
+    pub fn update(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        light: bool,
+        accent: Color32,
+        li: &InputSnapshot,
+    ) {
         if !self.open && self.anim < 0.004 {
             return;
         }
@@ -260,14 +273,17 @@ impl ShopState {
         let now = ctx.input(|i| i.time);
         let dt = ui.input(|i| i.stable_dt).min(0.1);
         self.anim += ((if self.open { 1.0 } else { 0.0 }) - self.anim) * (dt * 14.0).min(1.0);
-        let ease = { let a = self.anim.clamp(0.0, 1.0); a * a * (3.0 - 2.0 * a) };
+        let ease = {
+            let a = self.anim.clamp(0.0, 1.0);
+            a * a * (3.0 - 2.0 * a)
+        };
 
-        // ingest fetch
         if !self.loaded {
-            let apps = self
-                .fetch
-                .as_ref()
-                .and_then(|f| f.lock().ok().and_then(|g| if g.done { Some(g.apps.clone()) } else { None }));
+            let apps = self.fetch.as_ref().and_then(|f| {
+                f.lock()
+                    .ok()
+                    .and_then(|g| if g.done { Some(g.apps.clone()) } else { None })
+            });
             if let Some(apps) = apps {
                 self.apps = apps;
                 self.icons = vec![None; self.apps.len()];
@@ -277,7 +293,6 @@ impl ShopState {
             }
         }
 
-        // build icon textures
         let ready: Vec<(usize, Vec<u8>)> = {
             let mut out = Vec::new();
             if let Ok(mut m) = self.icon_jobs.lock() {
@@ -298,7 +313,11 @@ impl ShopState {
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw())
             }) {
                 if i < self.icons.len() {
-                    self.icons[i] = Some(ctx.load_texture(format!("shop_icon_{i}"), img, egui::TextureOptions::LINEAR));
+                    self.icons[i] = Some(ctx.load_texture(
+                        format!("shop_icon_{i}"),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    ));
                 }
             }
             if i < self.icon_bytes.len() {
@@ -307,23 +326,35 @@ impl ShopState {
         }
 
         let screen = ctx.screen_rect();
-        let mut paint = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("shop")));
+        let mut paint = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("shop"),
+        ));
         paint.set_opacity(ease);
         paint.rect_filled(screen, egui::Rounding::ZERO, pal.bg);
 
-        // top banner (red eShop-style)
         let bar = egui::Rect::from_min_size(screen.min, egui::Vec2::new(screen.width(), 52.0));
         paint.rect_filled(bar, egui::Rounding::ZERO, BLUE);
-        paint.text(egui::pos2(bar.min.x + 24.0, bar.center().y), egui::Align2::LEFT_CENTER, "NeXium  Homebrew", egui::FontId::proportional(20.0), Color32::WHITE);
+        paint.text(
+            egui::pos2(bar.min.x + 24.0, bar.center().y),
+            egui::Align2::LEFT_CENTER,
+            "NeXium  Homebrew",
+            egui::FontId::proportional(20.0),
+            Color32::WHITE,
+        );
 
-        // ---- keyboard / text ----
-        let (kb_esc, kb_enter, text_events) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Enter), i.events.clone()));
+        let (kb_esc, kb_enter, text_events) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Enter),
+                i.events.clone(),
+            )
+        });
         let kb_left = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
         let kb_right = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
         let kb_up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
         let kb_down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
 
-        // ---- controller edges ----
         use crate::controller_config::SwitchButton;
         let gp_a = li.connected && li.is(SwitchButton::A);
         let gp_b = li.connected && li.is(SwitchButton::B);
@@ -334,10 +365,19 @@ impl ShopState {
         let ready_nav = now - self.nav_cd > 0.16;
         let (mut nl, mut nr, mut nu, mut nd) = (kb_left, kb_right, kb_up, kb_down);
         if ready_nav && li.connected {
-            if li.is(SwitchButton::DLeft) || li.lx() < -0.5 { nl = true; self.nav_cd = now; }
-            else if li.is(SwitchButton::DRight) || li.lx() > 0.5 { nr = true; self.nav_cd = now; }
-            else if li.is(SwitchButton::DUp) || li.ly() > 0.5 { nu = true; self.nav_cd = now; }
-            else if li.is(SwitchButton::DDown) || li.ly() < -0.5 { nd = true; self.nav_cd = now; }
+            if li.is(SwitchButton::DLeft) || li.lx() < -0.5 {
+                nl = true;
+                self.nav_cd = now;
+            } else if li.is(SwitchButton::DRight) || li.lx() > 0.5 {
+                nr = true;
+                self.nav_cd = now;
+            } else if li.is(SwitchButton::DUp) || li.ly() > 0.5 {
+                nu = true;
+                self.nav_cd = now;
+            } else if li.is(SwitchButton::DDown) || li.ly() < -0.5 {
+                nd = true;
+                self.nav_cd = now;
+            }
         }
 
         let can_focus_search = matches!(self.view, View::Grid) && self.dialog.is_none();
@@ -375,18 +415,59 @@ impl ShopState {
             self.search_nav = false;
         }
 
-        // search field (top-right of banner)
-        let field = egui::Rect::from_min_size(egui::pos2(screen.max.x - 320.0, 9.0), egui::Vec2::new(292.0, 34.0));
+        let field = egui::Rect::from_min_size(
+            egui::pos2(screen.max.x - 320.0, 9.0),
+            egui::Vec2::new(292.0, 34.0),
+        );
         let field_resp = ui.allocate_rect(field, egui::Sense::click());
         let field_hot = self.editing || self.search_nav || self.search_kb.open;
-        paint.rect_filled(field, egui::Rounding::same(8.0), Color32::from_black_alpha(60));
-        paint.rect_stroke(field, egui::Rounding::same(8.0), egui::Stroke::new(if field_hot { 2.0_f32 } else { 1.0_f32 }, if field_hot { accent } else { Color32::from_white_alpha(120) }));
-        let disp = if self.search.is_empty() { "Search…".to_string() } else { self.search.clone() };
-        paint.text(egui::pos2(field.min.x + 12.0, field.center().y), egui::Align2::LEFT_CENTER, &disp, egui::FontId::proportional(15.0), Color32::from_white_alpha(if self.search.is_empty() { 150 } else { 255 }));
+        paint.rect_filled(
+            field,
+            egui::Rounding::same(8.0),
+            Color32::from_black_alpha(60),
+        );
+        paint.rect_stroke(
+            field,
+            egui::Rounding::same(8.0),
+            egui::Stroke::new(
+                if field_hot { 2.0_f32 } else { 1.0_f32 },
+                if field_hot {
+                    accent
+                } else {
+                    Color32::from_white_alpha(120)
+                },
+            ),
+        );
+        let disp = if self.search.is_empty() {
+            "Search…".to_string()
+        } else {
+            self.search.clone()
+        };
+        paint.text(
+            egui::pos2(field.min.x + 12.0, field.center().y),
+            egui::Align2::LEFT_CENTER,
+            &disp,
+            egui::FontId::proportional(15.0),
+            Color32::from_white_alpha(if self.search.is_empty() { 150 } else { 255 }),
+        );
         if li.connected {
             let badge = egui::pos2(field.max.x - 16.0, field.center().y);
-            paint.circle_filled(badge, 9.0, if field_hot { accent } else { Color32::from_white_alpha(60) });
-            paint.text(badge, egui::Align2::CENTER_CENTER, "Y", egui::FontId::proportional(12.0), Color32::from_rgb(0x10, 0x14, 0x1C));
+            paint.circle_filled(
+                badge,
+                9.0,
+                if field_hot {
+                    accent
+                } else {
+                    Color32::from_white_alpha(60)
+                },
+            );
+            paint.text(
+                badge,
+                egui::Align2::CENTER_CENTER,
+                "Y",
+                egui::FontId::proportional(12.0),
+                Color32::from_rgb(0x10, 0x14, 0x1C),
+            );
         }
         if field_resp.clicked() {
             self.editing = true;
@@ -402,7 +483,11 @@ impl ShopState {
                             }
                         }
                     }
-                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    } => {
                         self.search.pop();
                     }
                     _ => {}
@@ -415,7 +500,9 @@ impl ShopState {
         }
         if self.search_kb.active() {
             let before = self.search.clone();
-            let _ = self.search_kb.update(ctx, ui, &mut self.search, li, accent, light);
+            let _ = self
+                .search_kb
+                .update(ctx, ui, &mut self.search, li, accent, light);
             if self.search != before {
                 self.refilter();
                 self.selected = 0;
@@ -430,25 +517,61 @@ impl ShopState {
 
         self.accent = accent;
         let content = egui::Rect::from_min_max(egui::pos2(screen.min.x, bar.max.y), screen.max);
-        let detail_idx = if let View::Detail(i) = self.view { Some(i) } else { None };
+        let detail_idx = if let View::Detail(i) = self.view {
+            Some(i)
+        } else {
+            None
+        };
         let dialog_before = self.dialog.is_some();
-        // suppress view input while a dialog is up (so A/nav go to the dialog)
         let view_a = a_edge && !dialog_before;
-        let (vnl, vnr, vnu, vnd) = if dialog_before { (false, false, false, false) } else { (nl, nr, nu, nd) };
+        let (vnl, vnr, vnu, vnd) = if dialog_before {
+            (false, false, false, false)
+        } else {
+            (nl, nr, nu, nd)
+        };
         match detail_idx {
             None => self.grid(ui, &paint, content, pal, accent, vnl, vnr, vnu, vnd, view_a),
-            Some(i) => self.detail(ui, &paint, content, pal, i, view_a, if dialog_before { 0.0 } else { ui.input(|x| x.smooth_scroll_delta.y) }, vnu, vnd),
+            Some(i) => self.detail(
+                ui,
+                &paint,
+                content,
+                pal,
+                i,
+                view_a,
+                if dialog_before {
+                    0.0
+                } else {
+                    ui.input(|x| x.smooth_scroll_delta.y)
+                },
+                vnu,
+                vnd,
+            ),
         }
 
-        // cross-view fade transition
         self.view_fade += (1.0 - self.view_fade) * (dt * 9.0).min(1.0);
         if self.view_fade < 0.995 {
             let a = ((1.0 - self.view_fade) * 255.0) as u8;
-            paint.rect_filled(content, egui::Rounding::ZERO, Color32::from_rgba_unmultiplied(pal.bg.r(), pal.bg.g(), pal.bg.b(), a));
+            paint.rect_filled(
+                content,
+                egui::Rounding::ZERO,
+                Color32::from_rgba_unmultiplied(pal.bg.r(), pal.bg.g(), pal.bg.b(), a),
+            );
         }
 
-        // dialogs (confirm / disclaimer) with the shared popup fade
-        self.render_dialog(ui, ctx, screen, pal, ease, dt, detail_idx, a_edge, b_edge, nl, nr, dialog_before);
+        self.render_dialog(
+            ui,
+            ctx,
+            screen,
+            pal,
+            ease,
+            dt,
+            detail_idx,
+            a_edge,
+            b_edge,
+            nl,
+            nr,
+            dialog_before,
+        );
 
         if b_edge && !dialog_before {
             match self.view {
@@ -468,17 +591,13 @@ impl ShopState {
         ctx.request_repaint();
     }
 
-    /// Decorative auto-scrolling strip of wide game posters with a centered
-    /// tagline and fade-out edges. `band` is where the strip lives (it may sit
-    /// partly above `clip_rect` while sliding away); everything is clipped to
-    /// `clip_rect` so it collapses cleanly as the grid scrolls up.
     fn marquee(&mut self, ui: &mut egui::Ui, paint: &egui::Painter, band: egui::Rect, clip_rect: egui::Rect, pal: Pal) {
         let band_bg = tint_toward(pal.bg, pal.panel2, 0.5);
         let clip = paint.with_clip_rect(clip_rect);
         clip.rect_filled(clip_rect, egui::Rounding::ZERO, band_bg);
         let t = ui.input(|i| i.time) as f32;
-        let ph = band.height() - 34.0; // poster height
-        let pw = ph * 1.72; // match the grid's landscape aspect
+        let ph = band.height() - 34.0;
+        let pw = ph * 1.72;
         let gap = 16.0;
         let step = pw + gap;
         let count = self.apps.len().min(28).max(1);
@@ -486,7 +605,7 @@ impl ShopState {
             self.request_icon(i);
         }
         let strip = step * count as f32;
-        let speed = 26.0; // px/s, drifting left→right
+        let speed = 26.0;
         let off = (t * speed).rem_euclid(strip);
         let y = band.center().y - ph * 0.5;
         let reps = (band.width() / step).ceil() as i32 + count as i32 + 2;
@@ -506,11 +625,9 @@ impl ShopState {
                 clip.text(tile.center(), egui::Align2::CENTER_CENTER, &init, egui::FontId::proportional(ph * 0.42), pal.muted);
             }
         }
-        // fade the posters out toward both edges
         let fade_w = (band.width() * 0.20).min(220.0);
         hfade(&clip, egui::Rect::from_min_max(egui::pos2(band.min.x, band.min.y), egui::pos2(band.min.x + fade_w, band.max.y)), band_bg, true);
         hfade(&clip, egui::Rect::from_min_max(egui::pos2(band.max.x - fade_w, band.min.y), egui::pos2(band.max.x, band.max.y)), band_bg, false);
-        // centered tagline on a soft backing pill — rotates every 6s w/ a crossfade
         const TAGLINES: [&str; 3] = [
             "Homebrew has never been easier to get into.",
             "Enjoy Homebrew straight from the emulator.",
@@ -538,9 +655,27 @@ impl ShopState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn grid(&mut self, ui: &mut egui::Ui, paint: &egui::Painter, content: egui::Rect, pal: Pal, accent: Color32, nl: bool, nr: bool, nu: bool, nd: bool, a_edge: bool) {
+    fn grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        paint: &egui::Painter,
+        content: egui::Rect,
+        pal: Pal,
+        accent: Color32,
+        nl: bool,
+        nr: bool,
+        nu: bool,
+        nd: bool,
+        a_edge: bool,
+    ) {
         if !self.loaded {
-            paint.text(content.center(), egui::Align2::CENTER_CENTER, "Loading shop…", egui::FontId::proportional(20.0), pal.muted);
+            paint.text(
+                content.center(),
+                egui::Align2::CENTER_CENTER,
+                "Loading shop…",
+                egui::FontId::proportional(20.0),
+                pal.muted,
+            );
             return;
         }
         let n = self.filtered.len();
@@ -552,16 +687,27 @@ impl ShopState {
         let tile_h = tile_w * 0.58;
         let cell_h = tile_h + 32.0;
 
-        // nav (track whether the selection actually moved)
         let mut nav_moved = false;
-        if nl && self.selected > 0 { self.selected -= 1; nav_moved = true; }
-        if nr && self.selected + 1 < n { self.selected += 1; nav_moved = true; }
-        if nd && self.selected + cols < n { self.selected += cols; nav_moved = true; }
-        if nu && self.selected >= cols { self.selected -= cols; nav_moved = true; }
-        if nav_moved { crate::ui_audio::play_move(); }
+        if nl && self.selected > 0 {
+            self.selected -= 1;
+            nav_moved = true;
+        }
+        if nr && self.selected + 1 < n {
+            self.selected += 1;
+            nav_moved = true;
+        }
+        if nd && self.selected + cols < n {
+            self.selected += cols;
+            nav_moved = true;
+        }
+        if nu && self.selected >= cols {
+            self.selected -= cols;
+            nav_moved = true;
+        }
+        if nav_moved {
+            crate::ui_audio::play_move();
+        }
 
-        // the marquee lives at the top of the scroll space so it slides away as
-        // you scroll down and only sits at the very top.
         let rows = (n + cols - 1) / cols;
         let grid_h = rows as f32 * (cell_h + gap);
         let total_h = marquee_h + grid_h;
@@ -573,7 +719,7 @@ impl ShopState {
         if nav_moved {
             let row = self.selected / cols;
             if row == 0 {
-                self.scroll = 0.0; // reveal the marquee at the very top
+                self.scroll = 0.0;
             } else {
                 let sel_top = marquee_h + row as f32 * (cell_h + gap);
                 let sel_bot = sel_top + cell_h;
@@ -587,7 +733,6 @@ impl ShopState {
         }
         self.scroll = self.scroll.clamp(0.0, max_scroll);
 
-        // touch-style drag-to-scroll: press and drag anywhere over the menu
         if max_scroll > 0.0 {
             let (ptr, pdown, ppressed) = ui.input(|i| {
                 (i.pointer.interact_pos(), i.pointer.primary_down(), i.pointer.primary_pressed())
@@ -614,7 +759,6 @@ impl ShopState {
             self.grid_dragging = false;
         }
 
-        // marquee, sliding up with scroll and clipped so it collapses cleanly
         if self.scroll < marquee_h {
             let vis_h = marquee_h - self.scroll;
             let band = egui::Rect::from_min_max(
@@ -628,10 +772,8 @@ impl ShopState {
         let now_t = ui.input(|i| i.time) as f32;
         let x0 = content.min.x + pad;
         let y0 = content.min.y + marquee_h + pad - self.scroll;
-        // clip the grid to the area below whatever of the marquee is still visible
         let grid_top = content.min.y + (marquee_h - self.scroll).max(0.0);
         let clip = paint.with_clip_rect(egui::Rect::from_min_max(egui::pos2(content.min.x, grid_top), content.max));
-        // animated selection highlight that glides between tiles (like the dockbar)
         if n > 0 {
             let tvx = content.min.x + pad + (self.selected % cols) as f32 * (tile_w + gap);
             let tvy = content.min.y + marquee_h + pad + (self.selected / cols) as f32 * (cell_h + gap);
@@ -660,15 +802,21 @@ impl ShopState {
                 continue;
             }
             self.request_icon(ai);
-            let tile = egui::Rect::from_min_size(egui::pos2(tx, ty), egui::Vec2::new(tile_w, tile_h));
+            let tile =
+                egui::Rect::from_min_size(egui::pos2(tx, ty), egui::Vec2::new(tile_w, tile_h));
             let sel = vi == self.selected;
-            // soft drop shadow for depth
             clip.rect_filled(tile.translate(egui::Vec2::new(0.0, 4.0)).expand(1.0), egui::Rounding::same(11.0), Color32::from_black_alpha(70));
             clip.rect_filled(tile, egui::Rounding::same(10.0), pal.panel);
             if let Some(Some(tex)) = self.icons.get(ai) {
                 crate::carousel::draw_rounded_image(&clip, tex.id(), tile, 10.0, Color32::WHITE);
             } else {
-                clip.text(tile.center(), egui::Align2::CENTER_CENTER, &self.apps[ai].title, egui::FontId::proportional(13.0), pal.muted);
+                clip.text(
+                    tile.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &self.apps[ai].title,
+                    egui::FontId::proportional(13.0),
+                    pal.muted,
+                );
             }
             let label_col = if sel { tint_toward(pal.text, accent, 0.5) } else { pal.text };
             clip.text(egui::pos2(tile.min.x + 2.0, tile.max.y + 6.0), egui::Align2::LEFT_TOP, &self.apps[ai].title, egui::FontId::proportional(13.0), label_col);
@@ -690,8 +838,6 @@ impl ShopState {
             open_detail = Some(self.filtered[self.selected]);
         }
 
-        // scrollbar (draggable) on the right — manual pointer tracking so it
-        // can't get stuck by egui drag-capture on the shop's overlay layer
         if max_scroll > 0.0 {
             let track = egui::Rect::from_min_size(egui::pos2(content.max.x - 16.0, content.min.y + 8.0), egui::Vec2::new(7.0, content.height() - 56.0));
             let hit = track.expand2(egui::Vec2::new(10.0, 4.0));
@@ -726,7 +872,6 @@ impl ShopState {
             crate::ui_audio::play(crate::ui_audio::Sfx::Open);
         }
 
-        // hint bar
         let hint = if self.search_nav {
             "[A] Type   ·   [\u{2193}/B] Back to games"
         } else {
@@ -734,7 +879,6 @@ impl ShopState {
         };
         hint_bar(paint, content, pal, hint);
 
-        // homebrew site link (bottom-left) — jump straight to the real store
         let link = "Browse at hb-app.store";
         let fid = egui::FontId::proportional(13.0);
         let lw = ui.fonts(|f| f.layout_no_wrap(link.to_string(), fid.clone(), accent).size().x);
@@ -751,16 +895,33 @@ impl ShopState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn detail(&mut self, ui: &mut egui::Ui, paint: &egui::Painter, content: egui::Rect, pal: Pal, ai: usize, a_edge: bool, wheel: f32, nu: bool, nd: bool) {
+    fn detail(
+        &mut self,
+        ui: &mut egui::Ui,
+        paint: &egui::Painter,
+        content: egui::Rect,
+        pal: Pal,
+        ai: usize,
+        a_edge: bool,
+        wheel: f32,
+        nu: bool,
+        nd: bool,
+    ) {
         let app = self.apps[ai].clone();
         self.request_icon(ai);
         let pad = 40.0;
         let col_split = content.min.x + content.width() * 0.68;
 
-        // hero icon (large)
         let isz = 210.0;
-        let icon_r = egui::Rect::from_min_size(egui::pos2(content.min.x + pad, content.min.y + pad), egui::Vec2::splat(isz));
-        paint.rect_filled(icon_r.expand(2.0).translate(egui::Vec2::new(0.0, 5.0)), egui::Rounding::same(22.0), Color32::from_black_alpha(70));
+        let icon_r = egui::Rect::from_min_size(
+            egui::pos2(content.min.x + pad, content.min.y + pad),
+            egui::Vec2::splat(isz),
+        );
+        paint.rect_filled(
+            icon_r.expand(2.0).translate(egui::Vec2::new(0.0, 5.0)),
+            egui::Rounding::same(22.0),
+            Color32::from_black_alpha(70),
+        );
         paint.rect_filled(icon_r.expand(2.0), egui::Rounding::same(22.0), pal.panel2);
         if let Some(Some(tex)) = self.icons.get(ai) {
             crate::carousel::draw_rounded_image(paint, tex.id(), icon_r, 20.0, Color32::WHITE);
@@ -771,7 +932,6 @@ impl ShopState {
         paint.text(egui::pos2(tx, icon_r.min.y + 22.0), egui::Align2::LEFT_TOP, &app.title, egui::FontId::proportional(34.0), pal.text);
         paint.text(egui::pos2(tx, icon_r.min.y + 70.0), egui::Align2::LEFT_TOP, &app.author, egui::FontId::proportional(18.0), pal.muted);
         paint.text(egui::pos2(tx, icon_r.min.y + 100.0), egui::Align2::LEFT_TOP, &format!("v{}   ·   {}   ·   {}", app.version, human_size(app.filesize), app.license), egui::FontId::proportional(14.0), pal.muted);
-        // link straight to this game's page on the store
         let link = "View on hb-app.store";
         let lfid = egui::FontId::proportional(14.0);
         let lw = ui.fonts(|f| f.layout_no_wrap(link.to_string(), lfid.clone(), self.accent).size().x);
@@ -786,30 +946,65 @@ impl ShopState {
             open_url(&app.page_url());
         }
 
-        // description panel (scrollable)
-        let desc = if app.details.is_empty() { app.description.clone() } else { app.details.clone() };
-        let desc_rect = egui::Rect::from_min_max(egui::pos2(content.min.x + pad, icon_r.max.y + 26.0), egui::pos2(col_split - 20.0, content.max.y - 60.0));
+        let desc = if app.details.is_empty() {
+            app.description.clone()
+        } else {
+            app.details.clone()
+        };
+        let desc_rect = egui::Rect::from_min_max(
+            egui::pos2(content.min.x + pad, icon_r.max.y + 26.0),
+            egui::pos2(col_split - 20.0, content.max.y - 60.0),
+        );
         paint.rect_filled(desc_rect, egui::Rounding::same(12.0), pal.panel);
-        let galley = ui.fonts(|f| f.layout(desc, egui::FontId::proportional(15.0), pal.text, desc_rect.width() - 32.0));
+        let galley = ui.fonts(|f| {
+            f.layout(
+                desc,
+                egui::FontId::proportional(15.0),
+                pal.text,
+                desc_rect.width() - 32.0,
+            )
+        });
         let text_h = galley.size().y;
         let max_ds = (text_h - (desc_rect.height() - 24.0)).max(0.0);
-        if desc_rect.contains(ui.input(|i| i.pointer.hover_pos()).unwrap_or(desc_rect.center())) && wheel.abs() > 0.1 {
+        if desc_rect.contains(
+            ui.input(|i| i.pointer.hover_pos())
+                .unwrap_or(desc_rect.center()),
+        ) && wheel.abs() > 0.1
+        {
             self.desc_scroll = (self.desc_scroll - wheel).clamp(0.0, max_ds);
         }
-        if nd { self.desc_scroll = (self.desc_scroll + 40.0).clamp(0.0, max_ds); }
-        if nu { self.desc_scroll = (self.desc_scroll - 40.0).clamp(0.0, max_ds); }
+        if nd {
+            self.desc_scroll = (self.desc_scroll + 40.0).clamp(0.0, max_ds);
+        }
+        if nu {
+            self.desc_scroll = (self.desc_scroll - 40.0).clamp(0.0, max_ds);
+        }
         let dclip = paint.with_clip_rect(desc_rect.shrink(4.0));
-        dclip.galley(egui::pos2(desc_rect.min.x + 16.0, desc_rect.min.y + 12.0 - self.desc_scroll), galley, pal.text);
+        dclip.galley(
+            egui::pos2(
+                desc_rect.min.x + 16.0,
+                desc_rect.min.y + 12.0 - self.desc_scroll,
+            ),
+            galley,
+            pal.text,
+        );
         if max_ds > 0.0 {
-            let track = egui::Rect::from_min_size(egui::pos2(desc_rect.max.x - 6.0, desc_rect.min.y + 6.0), egui::Vec2::new(4.0, desc_rect.height() - 12.0));
+            let track = egui::Rect::from_min_size(
+                egui::pos2(desc_rect.max.x - 6.0, desc_rect.min.y + 6.0),
+                egui::Vec2::new(4.0, desc_rect.height() - 12.0),
+            );
             paint.rect_filled(track, egui::Rounding::same(2.0), pal.panel2);
             let frac = self.desc_scroll / max_ds;
-            let th = (track.height() * (desc_rect.height() / (text_h + 24.0))).clamp(20.0, track.height());
+            let th = (track.height() * (desc_rect.height() / (text_h + 24.0)))
+                .clamp(20.0, track.height());
             let ty = track.min.y + (track.height() - th) * frac;
-            paint.rect_filled(egui::Rect::from_min_size(egui::pos2(track.min.x, ty), egui::Vec2::new(4.0, th)), egui::Rounding::same(2.0), pal.muted);
+            paint.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(track.min.x, ty), egui::Vec2::new(4.0, th)),
+                egui::Rounding::same(2.0),
+                pal.muted,
+            );
         }
 
-        // right install panel
         let (progress, done, ok) = self
             .install
             .as_ref()
@@ -819,21 +1014,57 @@ impl ShopState {
         let installing = self.install.as_ref().map_or(false, |j| j.idx == ai) && !done;
         let failed = self.install.as_ref().map_or(false, |j| j.idx == ai) && done && !ok;
 
-        let btn = egui::Rect::from_min_size(egui::pos2(col_split + 20.0, content.min.y + pad + 30.0), egui::Vec2::new(content.max.x - col_split - 60.0, 60.0));
+        let btn = egui::Rect::from_min_size(
+            egui::pos2(col_split + 20.0, content.min.y + pad + 30.0),
+            egui::Vec2::new(content.max.x - col_split - 60.0, 60.0),
+        );
         let btn_resp = ui.allocate_rect(btn, egui::Sense::click());
         let hovered = btn_resp.hovered();
         let idle = !installing && !(done && ok);
-        // focus glow — the Install button is the detail's default focus
         if idle {
             let t = ui.input(|i| i.time) as f32;
             let pulse = 0.6 + 0.4 * (t * 3.0).sin();
             for k in 0..4 {
                 let e = (4 - k) as f32 * 3.0;
-                paint.rect_stroke(btn.expand(e), egui::Rounding::same(12.0 + e), egui::Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(BLUE_HI.r(), BLUE_HI.g(), BLUE_HI.b(), (40.0 * pulse) as u8)));
+                paint.rect_stroke(
+                    btn.expand(e),
+                    egui::Rounding::same(12.0 + e),
+                    egui::Stroke::new(
+                        2.0_f32,
+                        Color32::from_rgba_unmultiplied(
+                            BLUE_HI.r(),
+                            BLUE_HI.g(),
+                            BLUE_HI.b(),
+                            (40.0 * pulse) as u8,
+                        ),
+                    ),
+                );
             }
-            paint.rect_stroke(btn.expand(3.0), egui::Rounding::same(15.0), egui::Stroke::new(2.5_f32, Color32::from_rgba_unmultiplied(BLUE_HI.r(), BLUE_HI.g(), BLUE_HI.b(), (200.0 * pulse) as u8)));
+            paint.rect_stroke(
+                btn.expand(3.0),
+                egui::Rounding::same(15.0),
+                egui::Stroke::new(
+                    2.5_f32,
+                    Color32::from_rgba_unmultiplied(
+                        BLUE_HI.r(),
+                        BLUE_HI.g(),
+                        BLUE_HI.b(),
+                        (200.0 * pulse) as u8,
+                    ),
+                ),
+            );
         }
-        let btn_col = if installing { pal.panel2 } else if done && ok { Color32::from_rgb(0x2C, 0xA0, 0x4A) } else if failed { Color32::from_rgb(0xB0, 0x3A, 0x3A) } else if hovered { BLUE_HI } else { BLUE };
+        let btn_col = if installing {
+            pal.panel2
+        } else if done && ok {
+            Color32::from_rgb(0x2C, 0xA0, 0x4A)
+        } else if failed {
+            Color32::from_rgb(0xB0, 0x3A, 0x3A)
+        } else if hovered {
+            BLUE_HI
+        } else {
+            BLUE
+        };
         paint.rect_filled(btn, egui::Rounding::same(12.0), btn_col);
         let label = if done && ok {
             "Installed".to_string()
@@ -844,107 +1075,279 @@ impl ShopState {
         } else {
             "Install".to_string()
         };
-        let tw = ui.fonts(|f| f.layout_no_wrap(label.clone(), egui::FontId::proportional(20.0), Color32::WHITE).size().x);
-        let lx = if done && ok { btn.center().x + 14.0 } else { btn.center().x };
-        paint.text(egui::pos2(lx, btn.center().y), egui::Align2::CENTER_CENTER, &label, egui::FontId::proportional(20.0), Color32::WHITE);
+        let tw = ui.fonts(|f| {
+            f.layout_no_wrap(
+                label.clone(),
+                egui::FontId::proportional(20.0),
+                Color32::WHITE,
+            )
+            .size()
+            .x
+        });
+        let lx = if done && ok {
+            btn.center().x + 14.0
+        } else {
+            btn.center().x
+        };
+        paint.text(
+            egui::pos2(lx, btn.center().y),
+            egui::Align2::CENTER_CENTER,
+            &label,
+            egui::FontId::proportional(20.0),
+            Color32::WHITE,
+        );
         if done && ok {
             let cc = egui::pos2(lx - tw * 0.5 - 18.0, btn.center().y);
-            paint.add(egui::Shape::line(vec![cc + egui::Vec2::new(-6.0, 0.0), cc + egui::Vec2::new(-2.0, 5.0), cc + egui::Vec2::new(7.0, -6.0)], egui::Stroke::new(2.6_f32, Color32::WHITE)));
+            paint.add(egui::Shape::line(
+                vec![
+                    cc + egui::Vec2::new(-6.0, 0.0),
+                    cc + egui::Vec2::new(-2.0, 5.0),
+                    cc + egui::Vec2::new(7.0, -6.0),
+                ],
+                egui::Stroke::new(2.6_f32, Color32::WHITE),
+            ));
         }
         if installing {
-            let barr = egui::Rect::from_min_size(egui::pos2(btn.min.x, btn.max.y + 10.0), egui::Vec2::new(btn.width(), 7.0));
+            let barr = egui::Rect::from_min_size(
+                egui::pos2(btn.min.x, btn.max.y + 10.0),
+                egui::Vec2::new(btn.width(), 7.0),
+            );
             paint.rect_filled(barr, egui::Rounding::same(3.5), pal.panel2);
             let mut fill = barr;
             fill.set_width(barr.width() * progress);
-            paint.rect_filled(fill, egui::Rounding::same(3.5), Color32::from_rgb(0x35, 0xD0, 0x6A));
+            paint.rect_filled(
+                fill,
+                egui::Rounding::same(3.5),
+                Color32::from_rgb(0x35, 0xD0, 0x6A),
+            );
         }
         if done && ok {
             self.need_rescan = true;
         }
 
-        // info card fills the right column under the button
-        let info = egui::Rect::from_min_max(egui::pos2(btn.min.x, btn.max.y + 40.0), egui::pos2(content.max.x - 40.0, content.max.y - 60.0));
+        let info = egui::Rect::from_min_max(
+            egui::pos2(btn.min.x, btn.max.y + 40.0),
+            egui::pos2(content.max.x - 40.0, content.max.y - 60.0),
+        );
         paint.rect_filled(info, egui::Rounding::same(12.0), pal.panel);
-        paint.rect_stroke(info, egui::Rounding::same(12.0), egui::Stroke::new(1.0_f32, pal.border));
+        paint.rect_stroke(
+            info,
+            egui::Rounding::same(12.0),
+            egui::Stroke::new(1.0_f32, pal.border),
+        );
         let rows = [
             ("Developer", app.author.clone()),
             ("Version", app.version.clone()),
             ("Download size", human_size(app.filesize)),
-            ("License", if app.license.is_empty() { "—".into() } else { app.license.clone() }),
-            ("Updated", if app.updated.is_empty() { "—".into() } else { app.updated.clone() }),
+            (
+                "License",
+                if app.license.is_empty() {
+                    "—".into()
+                } else {
+                    app.license.clone()
+                },
+            ),
+            (
+                "Updated",
+                if app.updated.is_empty() {
+                    "—".into()
+                } else {
+                    app.updated.clone()
+                },
+            ),
         ];
         for (ri, (k, v)) in rows.iter().enumerate() {
             let ry = info.min.y + 22.0 + ri as f32 * 40.0;
-            paint.text(egui::pos2(info.min.x + 18.0, ry), egui::Align2::LEFT_CENTER, *k, egui::FontId::proportional(14.0), pal.muted);
-            paint.text(egui::pos2(info.max.x - 18.0, ry), egui::Align2::RIGHT_CENTER, v, egui::FontId::proportional(14.0), pal.text);
+            paint.text(
+                egui::pos2(info.min.x + 18.0, ry),
+                egui::Align2::LEFT_CENTER,
+                *k,
+                egui::FontId::proportional(14.0),
+                pal.muted,
+            );
+            paint.text(
+                egui::pos2(info.max.x - 18.0, ry),
+                egui::Align2::RIGHT_CENTER,
+                v,
+                egui::FontId::proportional(14.0),
+                pal.text,
+            );
             if ri + 1 < rows.len() {
-                paint.line_segment([egui::pos2(info.min.x + 14.0, ry + 20.0), egui::pos2(info.max.x - 14.0, ry + 20.0)], egui::Stroke::new(1.0_f32, pal.panel2));
+                paint.line_segment(
+                    [
+                        egui::pos2(info.min.x + 14.0, ry + 20.0),
+                        egui::pos2(info.max.x - 14.0, ry + 20.0),
+                    ],
+                    egui::Stroke::new(1.0_f32, pal.panel2),
+                );
             }
         }
 
-        // clicking Install (or pressing A) opens the confirm dialog (drawn by update)
         if self.dialog.is_none() && (btn_resp.clicked() || a_edge) && idle {
             self.confirm_sel = 1;
             self.open_dialog(Dlg::Confirm);
             crate::ui_audio::play(crate::ui_audio::Sfx::Open);
         }
 
-        hint_bar(paint, content, pal, "[A] Install   ·   [B] Back   ·   scroll / ↑↓ read");
+        hint_bar(
+            paint,
+            content,
+            pal,
+            "[A] Install   ·   [B] Back   ·   scroll / ↑↓ read",
+        );
     }
 
-    fn tmpl_btn(&self, dp: &egui::Painter, rect: egui::Rect, label: &str, selected: bool, pal: Pal, pop: f32) {
+    fn tmpl_btn(
+        &self,
+        dp: &egui::Painter,
+        rect: egui::Rect,
+        label: &str,
+        selected: bool,
+        pal: Pal,
+        pop: f32,
+    ) {
         dp.rect_filled(rect, egui::Rounding::same(10.0), pal.btn_fill);
         if selected {
-            dp.rect_filled(rect, egui::Rounding::same(10.0), Color32::from_rgba_unmultiplied(self.accent.r(), self.accent.g(), self.accent.b(), 42));
-            dp.rect_stroke(rect, egui::Rounding::same(10.0), egui::Stroke::new(2.6_f32, self.accent));
+            dp.rect_filled(
+                rect,
+                egui::Rounding::same(10.0),
+                Color32::from_rgba_unmultiplied(
+                    self.accent.r(),
+                    self.accent.g(),
+                    self.accent.b(),
+                    42,
+                ),
+            );
+            dp.rect_stroke(
+                rect,
+                egui::Rounding::same(10.0),
+                egui::Stroke::new(2.6_f32, self.accent),
+            );
         } else {
-            dp.rect_stroke(rect, egui::Rounding::same(10.0), egui::Stroke::new(1.2_f32, pal.border));
+            dp.rect_stroke(
+                rect,
+                egui::Rounding::same(10.0),
+                egui::Stroke::new(1.2_f32, pal.border),
+            );
         }
-        let col = if selected { tint_toward(self.accent, Color32::WHITE, 0.2) } else { pal.text };
-        dp.text(rect.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(18.0 * pop), col);
+        let col = if selected {
+            tint_toward(self.accent, Color32::WHITE, 0.2)
+        } else {
+            pal.text
+        };
+        dp.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(18.0 * pop),
+            col,
+        );
     }
 
-    /// Draws the active dialog (confirm / disclaimer) with the shared popup fade.
     #[allow(clippy::too_many_arguments)]
-    fn render_dialog(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, screen: egui::Rect, pal: Pal, shop_ease: f32, dt: f32, ai_opt: Option<usize>, a_edge: bool, b_edge: bool, nl: bool, nr: bool, interactive: bool) -> bool {
-        let dtarget = if self.dialog.is_some() && !self.dialog_closing { 1.0 } else { 0.0 };
+    fn render_dialog(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        screen: egui::Rect,
+        pal: Pal,
+        shop_ease: f32,
+        dt: f32,
+        ai_opt: Option<usize>,
+        a_edge: bool,
+        b_edge: bool,
+        nl: bool,
+        nr: bool,
+        interactive: bool,
+    ) -> bool {
+        let dtarget = if self.dialog.is_some() && !self.dialog_closing {
+            1.0
+        } else {
+            0.0
+        };
         self.dialog_anim += (dtarget - self.dialog_anim) * (dt * 12.0).min(1.0);
         if self.dialog_anim < 0.004 && self.dialog_closing {
             self.dialog = None;
             self.dialog_closing = false;
         }
-        let Some(kind) = self.dialog else { return false };
-        let de = { let a = self.dialog_anim.clamp(0.0, 1.0); a * a * (3.0 - 2.0 * a) };
+        let Some(kind) = self.dialog else {
+            return false;
+        };
+        let de = {
+            let a = self.dialog_anim.clamp(0.0, 1.0);
+            a * a * (3.0 - 2.0 * a)
+        };
         let pop = 0.90 + 0.10 * de;
-        let mut dp = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("shop_dialog")));
+        let mut dp = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("shop_dialog"),
+        ));
         dp.set_opacity(shop_ease * de);
         dp.rect_filled(screen, egui::Rounding::ZERO, Color32::from_black_alpha(195));
         let handle = interactive && !self.dialog_closing;
 
         match kind {
             Dlg::Confirm => {
-                let title = ai_opt.map(|i| self.apps[i].title.clone()).unwrap_or_default();
+                let title = ai_opt
+                    .map(|i| self.apps[i].title.clone())
+                    .unwrap_or_default();
                 let w = 460.0 * pop;
                 let h = 210.0 * pop;
                 let dlg = egui::Rect::from_center_size(screen.center(), egui::Vec2::new(w, h));
-                dp.rect_filled(dlg.translate(egui::Vec2::new(0.0, 10.0)), egui::Rounding::same(18.0), Color32::from_black_alpha(90));
+                dp.rect_filled(
+                    dlg.translate(egui::Vec2::new(0.0, 10.0)),
+                    egui::Rounding::same(18.0),
+                    Color32::from_black_alpha(90),
+                );
                 dp.rect_filled(dlg, egui::Rounding::same(18.0), pal.panel);
-                dp.rect_stroke(dlg, egui::Rounding::same(18.0), egui::Stroke::new(1.5_f32, pal.border));
-                dp.text(egui::pos2(dlg.center().x, dlg.min.y + 40.0 * pop), egui::Align2::CENTER_CENTER, "Install this game?", egui::FontId::proportional(15.0 * pop), pal.muted);
-                dp.text(egui::pos2(dlg.center().x, dlg.center().y - 14.0 * pop), egui::Align2::CENTER_CENTER, &title, egui::FontId::proportional(19.0 * pop), pal.text);
+                dp.rect_stroke(
+                    dlg,
+                    egui::Rounding::same(18.0),
+                    egui::Stroke::new(1.5_f32, pal.border),
+                );
+                dp.text(
+                    egui::pos2(dlg.center().x, dlg.min.y + 40.0 * pop),
+                    egui::Align2::CENTER_CENTER,
+                    "Install this game?",
+                    egui::FontId::proportional(15.0 * pop),
+                    pal.muted,
+                );
+                dp.text(
+                    egui::pos2(dlg.center().x, dlg.center().y - 14.0 * pop),
+                    egui::Align2::CENTER_CENTER,
+                    &title,
+                    egui::FontId::proportional(19.0 * pop),
+                    pal.text,
+                );
                 let bw = w * 0.42;
                 let bh = 46.0 * pop;
                 let by = dlg.max.y - bh - 18.0 * pop;
                 let gap = w * 0.05;
-                let no = egui::Rect::from_min_size(egui::pos2(dlg.center().x - gap * 0.5 - bw, by), egui::Vec2::new(bw, bh));
-                let yes = egui::Rect::from_min_size(egui::pos2(dlg.center().x + gap * 0.5, by), egui::Vec2::new(bw, bh));
+                let no = egui::Rect::from_min_size(
+                    egui::pos2(dlg.center().x - gap * 0.5 - bw, by),
+                    egui::Vec2::new(bw, bh),
+                );
+                let yes = egui::Rect::from_min_size(
+                    egui::pos2(dlg.center().x + gap * 0.5, by),
+                    egui::Vec2::new(bw, bh),
+                );
                 let no_resp = ui.allocate_rect(no, egui::Sense::click());
                 let yes_resp = ui.allocate_rect(yes, egui::Sense::click());
                 if handle {
-                    if nl && self.confirm_sel > 0 { self.confirm_sel = 0; crate::ui_audio::play_move(); }
-                    if nr && self.confirm_sel < 1 { self.confirm_sel = 1; crate::ui_audio::play_move(); }
-                    if no_resp.hovered() { self.confirm_sel = 0; }
-                    if yes_resp.hovered() { self.confirm_sel = 1; }
+                    if nl && self.confirm_sel > 0 {
+                        self.confirm_sel = 0;
+                        crate::ui_audio::play_move();
+                    }
+                    if nr && self.confirm_sel < 1 {
+                        self.confirm_sel = 1;
+                        crate::ui_audio::play_move();
+                    }
+                    if no_resp.hovered() {
+                        self.confirm_sel = 0;
+                    }
+                    if yes_resp.hovered() {
+                        self.confirm_sel = 1;
+                    }
                 }
                 self.tmpl_btn(&dp, no, "Cancel", self.confirm_sel == 0, pal, pop);
                 self.tmpl_btn(&dp, yes, "Install", self.confirm_sel == 1, pal, pop);
@@ -970,10 +1373,24 @@ impl ShopState {
                 let w = 660.0 * pop;
                 let h = 320.0 * pop;
                 let dlg = egui::Rect::from_center_size(screen.center(), egui::Vec2::new(w, h));
-                dp.rect_filled(dlg.translate(egui::Vec2::new(0.0, 10.0)), egui::Rounding::same(18.0), Color32::from_black_alpha(90));
+                dp.rect_filled(
+                    dlg.translate(egui::Vec2::new(0.0, 10.0)),
+                    egui::Rounding::same(18.0),
+                    Color32::from_black_alpha(90),
+                );
                 dp.rect_filled(dlg, egui::Rounding::same(18.0), pal.panel);
-                dp.rect_stroke(dlg, egui::Rounding::same(18.0), egui::Stroke::new(1.5_f32, pal.border));
-                dp.text(egui::pos2(dlg.center().x, dlg.min.y + 40.0 * pop), egui::Align2::CENTER_CENTER, "Welcome to the Homebrew Shop", egui::FontId::proportional(21.0 * pop), pal.text);
+                dp.rect_stroke(
+                    dlg,
+                    egui::Rounding::same(18.0),
+                    egui::Stroke::new(1.5_f32, pal.border),
+                );
+                dp.text(
+                    egui::pos2(dlg.center().x, dlg.min.y + 40.0 * pop),
+                    egui::Align2::CENTER_CENTER,
+                    "Welcome to the Homebrew Shop",
+                    egui::FontId::proportional(21.0 * pop),
+                    pal.text,
+                );
                 let lines = [
                     "Games are provided by the Homebrew App Store (hb-app.store/switch).",
                     "NeXium uses their public API — we don't host any of these apps.",
@@ -983,11 +1400,23 @@ impl ShopState {
                     "bugs and games that don't work yet.",
                 ];
                 for (i, ln) in lines.iter().enumerate() {
-                    dp.text(egui::pos2(dlg.min.x + 40.0 * pop, dlg.min.y + 78.0 * pop + i as f32 * 24.0 * pop), egui::Align2::LEFT_TOP, *ln, egui::FontId::proportional(15.0 * pop), if ln.is_empty() { pal.muted } else { pal.muted });
+                    dp.text(
+                        egui::pos2(
+                            dlg.min.x + 40.0 * pop,
+                            dlg.min.y + 78.0 * pop + i as f32 * 24.0 * pop,
+                        ),
+                        egui::Align2::LEFT_TOP,
+                        *ln,
+                        egui::FontId::proportional(15.0 * pop),
+                        if ln.is_empty() { pal.muted } else { pal.muted },
+                    );
                 }
                 let bw = 220.0 * pop;
                 let bh = 46.0 * pop;
-                let ok = egui::Rect::from_min_size(egui::pos2(dlg.center().x - bw * 0.5, dlg.max.y - bh - 20.0 * pop), egui::Vec2::new(bw, bh));
+                let ok = egui::Rect::from_min_size(
+                    egui::pos2(dlg.center().x - bw * 0.5, dlg.max.y - bh - 20.0 * pop),
+                    egui::Vec2::new(bw, bh),
+                );
                 let ok_resp = ui.allocate_rect(ok, egui::Sense::click());
                 self.tmpl_btn(&dp, ok, "Continue", true, pal, pop);
                 if handle && (a_edge || b_edge || ok_resp.clicked()) {
@@ -1002,10 +1431,8 @@ impl ShopState {
 
 fn hint_bar(paint: &egui::Painter, content: egui::Rect, pal: Pal, text: &str) {
     let bar = egui::Rect::from_min_max(egui::pos2(content.min.x, content.max.y - 40.0), content.max);
-    // soft shadow so the solid bar doesn't hard-cut the content above it
     let shadow = egui::Rect::from_min_max(egui::pos2(bar.min.x, bar.min.y - 16.0), egui::pos2(bar.max.x, bar.min.y));
     vfade(paint, shadow, Color32::from_black_alpha(70), false);
-    // opaque elevated bar — legible over the scrolling grid behind it
     let fill = tint_toward(pal.bg, pal.panel2, 0.7);
     paint.rect_filled(bar, egui::Rounding::ZERO, fill);
     paint.line_segment([bar.min, egui::pos2(bar.max.x, bar.min.y)], egui::Stroke::new(1.0_f32, pal.border));
@@ -1021,16 +1448,12 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
-/// Horizontal gradient from `color` (solid at the outer edge) to transparent,
-/// used to fade the marquee icons out at the left/right band edges.
 fn hfade(paint: &egui::Painter, rect: egui::Rect, color: Color32, solid_left: bool) {
     let clear = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0);
     let (lc, rc) = if solid_left { (color, clear) } else { (clear, color) };
     grad_quad(paint, rect, lc, rc, lc, rc);
 }
 
-/// Vertical gradient from transparent (top) to `color` (bottom) when `solid_top`
-/// is false, else the reverse.
 fn vfade(paint: &egui::Painter, rect: egui::Rect, color: Color32, solid_top: bool) {
     let clear = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0);
     let (tc, bc) = if solid_top { (color, clear) } else { (clear, color) };

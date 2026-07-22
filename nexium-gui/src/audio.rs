@@ -3,6 +3,7 @@ use cpal::{Device, SampleFormat, SampleRate, StreamConfig};
 use nexium_kernel::audio_sink::{set_host_audio_sink, HostPcmSink};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -55,6 +56,103 @@ impl PrebufState {
 }
 
 type Prod = <HeapRb<f32> as Split>::Prod;
+
+const MAX_AUDIO_OUT_STREAMS: usize = 12;
+
+struct AudioOutHostStream {
+    id: u64,
+    started: bool,
+    samples: VecDeque<f32>,
+    consumed_frames: u64,
+    volume: f32,
+}
+
+#[derive(Default)]
+struct AudioOutMixer {
+    streams: Vec<AudioOutHostStream>,
+}
+
+impl AudioOutMixer {
+    fn open(&mut self, id: u64) -> bool {
+        if self.streams.iter().any(|stream| stream.id == id) {
+            return true;
+        }
+        if self.streams.len() >= MAX_AUDIO_OUT_STREAMS {
+            return false;
+        }
+        self.streams.push(AudioOutHostStream {
+            id,
+            started: false,
+            samples: VecDeque::new(),
+            consumed_frames: 0,
+            volume: 1.0,
+        });
+        true
+    }
+
+    fn close(&mut self, id: u64) {
+        self.streams.retain(|stream| stream.id != id);
+    }
+
+    fn start(&mut self, id: u64) {
+        if let Some(stream) = self.streams.iter_mut().find(|stream| stream.id == id) {
+            stream.started = true;
+        }
+    }
+
+    fn stop(&mut self, id: u64) {
+        if let Some(stream) = self.streams.iter_mut().find(|stream| stream.id == id) {
+            stream.started = false;
+            stream.samples.clear();
+        }
+    }
+
+    fn push(&mut self, id: u64, samples: &[f32]) -> usize {
+        let Some(stream) = self.streams.iter_mut().find(|stream| stream.id == id) else {
+            return 0;
+        };
+        let sample_count = samples.len() & !1;
+        stream
+            .samples
+            .extend(samples[..sample_count].iter().copied());
+        sample_count / 2
+    }
+
+    fn consumed(&self, id: u64) -> u64 {
+        self.streams
+            .iter()
+            .find(|stream| stream.id == id)
+            .map_or(0, |stream| stream.consumed_frames)
+    }
+
+    fn set_volume(&mut self, id: u64, volume: f32) {
+        if let Some(stream) = self.streams.iter_mut().find(|stream| stream.id == id) {
+            stream.volume = volume;
+        }
+    }
+
+    fn has_ready_frame(&self) -> bool {
+        self.streams
+            .iter()
+            .any(|stream| stream.started && stream.samples.len() >= 2)
+    }
+
+    fn mix_next_frame(&mut self) -> (f32, f32) {
+        let mut left = 0.0f32;
+        let mut right = 0.0f32;
+        for stream in &mut self.streams {
+            if !stream.started || stream.samples.len() < 2 {
+                continue;
+            }
+            let sample_l = stream.samples.pop_front().unwrap_or(0.0);
+            let sample_r = stream.samples.pop_front().unwrap_or(0.0);
+            left += sample_l * stream.volume;
+            right += sample_r * stream.volume;
+            stream.consumed_frames = stream.consumed_frames.saturating_add(1);
+        }
+        (left, right)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AudioStreamInfo {
@@ -138,6 +236,7 @@ pub struct HostAudioSink {
     producer: Mutex<Prod>,
     consumed: Arc<AtomicU64>,
     volume: Arc<AtomicU32>,
+    audio_out: Arc<Mutex<AudioOutMixer>>,
 }
 
 impl HostPcmSink for HostAudioSink {
@@ -168,6 +267,41 @@ impl HostPcmSink for HostAudioSink {
 
     fn samples_consumed(&self) -> u64 {
         self.consumed.load(Ordering::Relaxed)
+    }
+
+    fn open_audio_out_stream(&self, stream_id: u64) -> bool {
+        let mut mixer = self.audio_out.lock().unwrap_or_else(|p| p.into_inner());
+        mixer.open(stream_id)
+    }
+
+    fn close_audio_out_stream(&self, stream_id: u64) {
+        let mut mixer = self.audio_out.lock().unwrap_or_else(|p| p.into_inner());
+        mixer.close(stream_id);
+    }
+
+    fn start_audio_out_stream(&self, stream_id: u64) {
+        let mut mixer = self.audio_out.lock().unwrap_or_else(|p| p.into_inner());
+        mixer.start(stream_id);
+    }
+
+    fn stop_audio_out_stream(&self, stream_id: u64) {
+        let mut mixer = self.audio_out.lock().unwrap_or_else(|p| p.into_inner());
+        mixer.stop(stream_id);
+    }
+
+    fn push_audio_out_stereo_f32(&self, stream_id: u64, samples: &[f32]) -> usize {
+        let mut mixer = self.audio_out.lock().unwrap_or_else(|p| p.into_inner());
+        mixer.push(stream_id, samples)
+    }
+
+    fn audio_out_samples_consumed(&self, stream_id: u64) -> u64 {
+        let mixer = self.audio_out.lock().unwrap_or_else(|p| p.into_inner());
+        mixer.consumed(stream_id)
+    }
+
+    fn set_audio_out_volume(&self, stream_id: u64, volume: f32) {
+        let mut mixer = self.audio_out.lock().unwrap_or_else(|p| p.into_inner());
+        mixer.set_volume(stream_id, volume);
     }
 
     fn sample_rate(&self) -> u32 {
@@ -240,6 +374,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
     let consumed_cb = consumed.clone();
     let volume = Arc::new(AtomicU32::new(initial_volume.clamp(0.0, 2.0).to_bits()));
     let volume_cb = volume.clone();
+    let audio_out = Arc::new(Mutex::new(AudioOutMixer::default()));
 
     let resample_ratio = RENDER_SR as f32 / device_sr as f32;
     let _need_resample = (RENDER_SR != device_sr) || (device_ch != 2);
@@ -251,6 +386,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
     let stream_result = match sample_format {
         SampleFormat::F32 => {
             let vol = volume_cb.clone();
+            let audio_out_cb = audio_out.clone();
             let mut prebuf = PrebufState::new(resample_ratio);
             device.build_output_stream(
                 &config,
@@ -262,6 +398,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
                         resample_ratio,
                         &consumed_cb,
                         &vol,
+                        &audio_out_cb,
                         &mut prebuf,
                     );
                 },
@@ -272,6 +409,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
         SampleFormat::I16 => {
             let consumed_cb = consumed_cb.clone();
             let vol = volume_cb.clone();
+            let audio_out_cb = audio_out.clone();
             let mut prebuf = PrebufState::new(resample_ratio);
             device.build_output_stream(
                 &config,
@@ -283,6 +421,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
                         resample_ratio,
                         &consumed_cb,
                         &vol,
+                        &audio_out_cb,
                         &mut prebuf,
                     );
                 },
@@ -340,6 +479,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
         producer: Mutex::new(producer),
         consumed,
         volume,
+        audio_out,
     });
     let _ = SINK_HANDLE.set(sink.clone());
     let sink_dyn: Arc<dyn HostPcmSink> = sink;
@@ -359,6 +499,7 @@ fn drain_stereo_to(
     resample_ratio: f32,
     consumed: &AtomicU64,
     volume: &AtomicU32,
+    audio_out: &Mutex<AudioOutMixer>,
     prebuf: &mut PrebufState,
 ) {
     use std::sync::atomic::{AtomicBool, AtomicU32 as AU32};
@@ -378,11 +519,12 @@ fn drain_stereo_to(
     let vol = f32::from_bits(volume.load(Ordering::Relaxed));
 
     let occ = consumer.occupied_len();
+    let mut audio_out = audio_out.lock().unwrap_or_else(|p| p.into_inner());
     MIN_OCC.fetch_min(occ as u32, Ordering::Relaxed);
     if occ == 0 {
         EMPTY_CT.fetch_add(1, Ordering::Relaxed);
     }
-    if prebuf.priming && occ >= PREBUF_TARGET_SAMPLES {
+    if prebuf.priming && (occ >= PREBUF_TARGET_SAMPLES || audio_out.has_ready_frame()) {
         prebuf.priming = false;
     }
     let priming = prebuf.priming;
@@ -395,10 +537,7 @@ fn drain_stereo_to(
             while prebuf.pos >= 1.0 {
                 prebuf.prev_l = prebuf.cur_l;
                 prebuf.prev_r = prebuf.cur_r;
-                if let (Some(l), Some(r)) = (consumer.try_pop(), consumer.try_pop()) {
-                    prebuf.cur_l = l;
-                    prebuf.cur_r = r;
-                }
+                (prebuf.cur_l, prebuf.cur_r) = pop_mixed_stereo_frame(consumer, &mut audio_out);
                 prebuf.pos -= 1.0;
             }
         }
@@ -411,6 +550,7 @@ fn drain_stereo_to(
                 (prebuf.prev_r + (prebuf.cur_r - prebuf.prev_r) * f) * vol,
             )
         };
+        let (l, r) = clamp_stereo_output(l, r);
         peak = peak.max(l.abs()).max(r.abs());
         if dev_ch == 1 {
             chunk[0] = 0.5 * (l + r);
@@ -452,12 +592,14 @@ fn drain_stereo_to_i16(
     resample_ratio: f32,
     consumed: &AtomicU64,
     volume: &AtomicU32,
+    audio_out: &Mutex<AudioOutMixer>,
     prebuf: &mut PrebufState,
 ) {
     let vol = f32::from_bits(volume.load(Ordering::Relaxed));
 
     let occ = consumer.occupied_len();
-    if prebuf.priming && occ >= PREBUF_TARGET_SAMPLES {
+    let mut audio_out = audio_out.lock().unwrap_or_else(|p| p.into_inner());
+    if prebuf.priming && (occ >= PREBUF_TARGET_SAMPLES || audio_out.has_ready_frame()) {
         prebuf.priming = false;
     }
     let priming = prebuf.priming;
@@ -469,10 +611,7 @@ fn drain_stereo_to_i16(
             while prebuf.pos >= 1.0 {
                 prebuf.prev_l = prebuf.cur_l;
                 prebuf.prev_r = prebuf.cur_r;
-                if let (Some(l), Some(r)) = (consumer.try_pop(), consumer.try_pop()) {
-                    prebuf.cur_l = l;
-                    prebuf.cur_r = r;
-                }
+                (prebuf.cur_l, prebuf.cur_r) = pop_mixed_stereo_frame(consumer, &mut audio_out);
                 prebuf.pos -= 1.0;
             }
         }
@@ -506,6 +645,28 @@ fn drain_stereo_to_i16(
     post_audio_events(new_consumed);
 }
 
+fn pop_mixed_stereo_frame(
+    consumer: &mut <HeapRb<f32> as Split>::Cons,
+    audio_out: &mut AudioOutMixer,
+) -> (f32, f32) {
+    let (mut left, mut right) = if consumer.occupied_len() >= 2 {
+        (
+            consumer.try_pop().unwrap_or(0.0),
+            consumer.try_pop().unwrap_or(0.0),
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    let (audio_out_left, audio_out_right) = audio_out.mix_next_frame();
+    left += audio_out_left;
+    right += audio_out_right;
+    (left, right)
+}
+
+fn clamp_stereo_output(left: f32, right: f32) -> (f32, f32) {
+    (left.clamp(-1.0, 1.0), right.clamp(-1.0, 1.0))
+}
+
 fn post_audio_events(new_consumed: u64) {
     const CLK_MARK_FRAMES: u64 = 480_000;
     static LAST_MARK: AtomicU64 = AtomicU64::new(0);
@@ -525,4 +686,59 @@ fn post_audio_events(new_consumed: u64) {
     }
     LAST_SIGNALED.store(last + blocks * FRAMES_PER_AUDIO_FRAME, Ordering::Relaxed);
     AUDIO_EVENTS_PENDING.fetch_add(blocks, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_stereo_output, AudioOutMixer};
+
+    #[test]
+    fn audio_out_streams_mix_samplewise_with_independent_clocks() {
+        let mut mixer = AudioOutMixer::default();
+        assert!(mixer.open(1));
+        assert!(mixer.open(2));
+        mixer.start(1);
+        mixer.start(2);
+        assert_eq!(mixer.push(1, &[0.25, 0.5, 0.1, 0.2]), 2);
+        assert_eq!(mixer.push(2, &[0.5, 0.25]), 1);
+
+        assert_eq!(mixer.mix_next_frame(), (0.75, 0.75));
+        assert_eq!(mixer.consumed(1), 1);
+        assert_eq!(mixer.consumed(2), 1);
+
+        assert_eq!(mixer.mix_next_frame(), (0.1, 0.2));
+        assert_eq!(mixer.consumed(1), 2);
+        assert_eq!(mixer.consumed(2), 1);
+    }
+
+    #[test]
+    fn stopped_audio_out_stream_does_not_consume_queued_samples() {
+        let mut mixer = AudioOutMixer::default();
+        assert!(mixer.open(3));
+        assert_eq!(mixer.push(3, &[0.5, -0.5]), 1);
+        assert_eq!(mixer.mix_next_frame(), (0.0, 0.0));
+        assert_eq!(mixer.consumed(3), 0);
+
+        mixer.start(3);
+        assert_eq!(mixer.mix_next_frame(), (0.5, -0.5));
+        assert_eq!(mixer.consumed(3), 1);
+    }
+
+    #[test]
+    fn audio_out_volume_is_per_stream_and_push_does_not_drop() {
+        let mut mixer = AudioOutMixer::default();
+        assert!(mixer.open(4));
+        mixer.start(4);
+        mixer.set_volume(4, 0.25);
+        let samples = vec![1.0; 32_768];
+        assert_eq!(mixer.push(4, &samples), samples.len() / 2);
+        assert_eq!(mixer.mix_next_frame(), (0.25, 0.25));
+        assert_eq!(mixer.consumed(4), 1);
+    }
+
+    #[test]
+    fn mixed_f32_output_saturates_after_summing() {
+        assert_eq!(clamp_stereo_output(1.75, -2.0), (1.0, -1.0));
+        assert_eq!(clamp_stereo_output(0.25, -0.5), (0.25, -0.5));
+    }
 }

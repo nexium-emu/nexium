@@ -187,13 +187,9 @@ impl GpuBackend {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolutionPreset {
-    /// 1280 × 720 (native Switch docked)
     P720,
-    /// 1920 × 1080
     P1080,
-    /// 2560 × 1440
     P1440,
-    /// 3840 × 2160
     P2160,
 }
 
@@ -214,7 +210,7 @@ impl ResolutionPreset {
     }
     pub fn label(&self) -> &'static str {
         match self {
-            ResolutionPreset::P720  => "1280 \u{00D7} 720",
+            ResolutionPreset::P720 => "1280 \u{00D7} 720",
             ResolutionPreset::P1080 => "1920 \u{00D7} 1080",
             ResolutionPreset::P1440 => "2560 \u{00D7} 1440",
             ResolutionPreset::P2160 => "3840 \u{00D7} 2160",
@@ -222,7 +218,7 @@ impl ResolutionPreset {
     }
     pub fn scale(&self) -> u32 {
         match self {
-            ResolutionPreset::P720  => 1,
+            ResolutionPreset::P720 => 1,
             ResolutionPreset::P1080 => 2,
             ResolutionPreset::P1440 => 2,
             ResolutionPreset::P2160 => 3,
@@ -476,7 +472,6 @@ pub enum CarouselRef {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GameList {
     pub name: String,
-    /// Game paths — duplicates are allowed here (lists are exempt from the no-dupe rule).
     pub games: Vec<PathBuf>,
     #[serde(default)]
     pub align: ListAlignment,
@@ -497,7 +492,11 @@ impl Default for ListAlignment {
 
 impl ListAlignment {
     pub fn all() -> &'static [ListAlignment] {
-        &[ListAlignment::Manual, ListAlignment::Alphabetical, ListAlignment::ReverseAlphabetical]
+        &[
+            ListAlignment::Manual,
+            ListAlignment::Alphabetical,
+            ListAlignment::ReverseAlphabetical,
+        ]
     }
     pub fn label(&self) -> &'static str {
         match self {

@@ -30,6 +30,44 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn sync_host_region_changes(
+    cpu: &mut nexium_core::cpu::Cpu,
+    address_space: &nexium_memory::AddressSpace,
+    last_generation: &mut u64,
+    core_id: usize,
+) -> Result<usize, String> {
+    let updates = address_space.host_region_changes_since(*last_generation);
+    let count = updates.changes.len();
+    for change in updates.changes {
+        match change {
+            nexium_memory::HostRegionChange::Upsert(region) => unsafe {
+                let _ = cpu.unmap_host(region.base, region.size);
+                cpu.map_host(region.base, region.size, region.perm, region.host_ptr)
+                    .map_err(|error| {
+                        format!(
+                            "core{} host-map sync failed for {:#x} len={:#x}: {}",
+                            core_id, region.base, region.size, error
+                        )
+                    })?;
+            },
+            nexium_memory::HostRegionChange::Remove { base, size } => unsafe {
+                let _ = cpu.unmap_host(base, size);
+            },
+        }
+    }
+    if count != 0 {
+        log::trace!(
+            "[core{}] host-map sync generation {} -> {} changes={}",
+            core_id,
+            *last_generation,
+            updates.generation,
+            count
+        );
+    }
+    *last_generation = updates.generation;
+    Ok(count)
+}
+
 struct CpuPollWatch {
     va: u64,
     len: usize,
@@ -505,6 +543,7 @@ impl EmulationHandle {
                         if let Ok(handle) = thread::Builder::new()
                             .name(format!("nexium-core{}", core_id))
                             .spawn(move || {
+                                let mut last_map_gen = addr_aux.generation();
                                 let mut cpu_aux = match kernel_aux.lock().init_cpu(backend_aux) {
                                     Ok(c) => c,
                                     Err(e) => {
@@ -517,7 +556,6 @@ impl EmulationHandle {
                                     &mut cpu_aux,
                                     core_id,
                                 );
-                                let mut last_map_gen = addr_aux.generation();
                                 let mut pc_trace = PcTrace::from_env();
                                 let mut aux_cycles = 0u64;
                                 let mut aux_svcs = 0u32;
@@ -547,14 +585,14 @@ impl EmulationHandle {
                                     }
                                     let gen = addr_aux.generation();
                                     if gen != last_map_gen {
-                                        for r in addr_aux.host_regions() {
-                                            unsafe {
-                                                let _ = cpu_mut()
-                                                    .unwrap()
-                                                    .map_host(r.base, r.size, r.perm, r.host_ptr);
-                                            }
+                                        if let Err(error) = sync_host_region_changes(
+                                            cpu_mut().unwrap(),
+                                            &addr_aux,
+                                            &mut last_map_gen,
+                                            core_id,
+                                        ) {
+                                            log::error!("{}", error);
                                         }
-                                        last_map_gen = gen;
                                     }
                                     let event = cpu_mut().unwrap().run(200_000);
                                     aux_cycles = aux_cycles.saturating_add(200_000);
@@ -573,19 +611,33 @@ impl EmulationHandle {
                                                 aux_svcs,
                                             );
                                         }
-                                        let result =
-                                            if let nexium_core::cpu::CpuEvent::Svc(imm) = event {
-                                                aux_svcs = aux_svcs.saturating_add(1);
-                                                let result = k.dispatch_svc(imm);
-                                                k.tick_audio_renderers();
-                                                Some(result)
-                                            } else {
-                                                None
-                                            };
-                                        drop(k);
-                                        if let Some(result) = result {
-                                            cpu_mut().unwrap().set_register(0, result as u64);
+                                        if let nexium_core::cpu::CpuEvent::Svc(imm) = event {
+                                            aux_svcs = aux_svcs.saturating_add(1);
+                                            let result = k.dispatch_svc(imm);
+                                            k.tick_audio_renderers();
+                                            if imm != 0x7f {
+                                                cpu_mut().unwrap().set_register(0, result as u64);
+                                            }
+                                            let pace_until = k.present_pace_until.take();
+                                            let should_yield =
+                                                k.yield_after_svc || pace_until.is_some();
+                                            k.yield_after_svc = false;
+                                            if should_yield {
+                                                let state = match pace_until {
+                                                    Some(wake_at)
+                                                        if wake_at > std::time::Instant::now() =>
+                                                    {
+                                                        nexium_core::kernel::threads::ThreadState::Sleeping {
+                                                            wake_at,
+                                                        }
+                                                    }
+                                                    _ => nexium_core::kernel::threads::ThreadState::Ready,
+                                                };
+                                                k.threads
+                                                    .yield_with_state(cpu_ref().unwrap(), state);
+                                            }
                                         }
+                                        drop(k);
                                     }
                                     if spin_yield_n != 0 {
                                         slice_iters = slice_iters.saturating_add(1);
@@ -821,6 +873,12 @@ impl EmulationHandle {
                                 x20_bytes[24], x20_bytes[25], x20_bytes[26], x20_bytes[27], x20_bytes[28], x20_bytes[29], x20_bytes[30], x20_bytes[31],
                             );
                             }
+                            if std::env::var_os("NEXIUM_HEARTBEAT_THREAD_SNAPSHOT").is_some()
+                                && last_sync_snapshot.elapsed() >= std::time::Duration::from_secs(5)
+                            {
+                                guard.log_thread_snapshot("heartbeat");
+                                last_sync_snapshot = std::time::Instant::now();
+                            }
                             let _ = (cur, nthreads, nready);
 
                             let cur_stats = guard.nvdrv.stats.snapshot();
@@ -1002,12 +1060,14 @@ impl EmulationHandle {
                         drop(guard);
                         let gen = boot_ctx.address_space.generation();
                         if gen != last_map_gen0 {
-                            for r in boot_ctx.address_space.host_regions() {
-                                unsafe {
-                                    let _ = cpu.map_host(r.base, r.size, r.perm, r.host_ptr);
-                                }
+                            if let Err(error) = sync_host_region_changes(
+                                cpu,
+                                &boot_ctx.address_space,
+                                &mut last_map_gen0,
+                                0,
+                            ) {
+                                log::error!("{}", error);
                             }
-                            last_map_gen0 = gen;
                         }
                         let event = cpu.run(cpu_slice);
                         let pc_after = cpu.get_pc();
@@ -1100,8 +1160,8 @@ impl EmulationHandle {
                             {
                                 let x19 = regs[19];
                                 let mut slot = [0u8; 8];
-                                let readable =
-                                    x19 >= 0x1000 && guard.address_space.read(x19, &mut slot).is_ok();
+                                let readable = x19 >= 0x1000
+                                    && guard.address_space.read(x19, &mut slot).is_ok();
                                 let slotval = if readable {
                                     u64::from_le_bytes(slot)
                                 } else {
@@ -1113,7 +1173,8 @@ impl EmulationHandle {
                                 );
                                 let mut frame = [0u8; 48];
                                 if guard.address_space.read(sp, &mut frame).is_ok() {
-                                    let caller_x21 = u64::from_le_bytes(frame[8..16].try_into().unwrap());
+                                    let caller_x21 =
+                                        u64::from_le_bytes(frame[8..16].try_into().unwrap());
                                     log::error!(
                                         "[null-pc] frame@sp={:02x?} caller_x21={:#x}",
                                         &frame,
@@ -1134,16 +1195,12 @@ impl EmulationHandle {
                                         }
                                     }
                                 }
-                                let gpu_cpu = guard
-                                    .nvdrv
-                                    .gpu
-                                    .mappings
-                                    .lock()
-                                    .cpu_address_for(x19);
+                                let gpu_cpu = guard.nvdrv.gpu.mappings.lock().cpu_address_for(x19);
                                 if let Some(gpu_cpu) = gpu_cpu {
                                     let mut backing = [0u8; 96];
                                     let base = gpu_cpu.saturating_sub(0x20);
-                                    let readable = guard.address_space.read(base, &mut backing).is_ok();
+                                    let readable =
+                                        guard.address_space.read(base, &mut backing).is_ok();
                                     log::error!(
                                         "[null-pc] x19_gpu_cpu={:#x} readable={} backing[-0x20..+0x40]={:02x?}",
                                         gpu_cpu,
@@ -1184,8 +1241,7 @@ impl EmulationHandle {
                             break;
                         }
 
-                        let no_svc_progress =
-                            matches!(event, nexium_core::cpu::CpuEvent::Running);
+                        let no_svc_progress = matches!(event, nexium_core::cpu::CpuEvent::Running);
                         if matches!(event, nexium_core::cpu::CpuEvent::Svc(_)) {
                             no_svc_in_spin = 0;
                         }
@@ -1326,7 +1382,7 @@ impl EmulationHandle {
                         match event {
                             nexium_core::cpu::CpuEvent::Running => {
                                 if cycle_count % 10_000_000 == 0 {
-                                    log::info!("CPU running... {} cycles executed", cycle_count);
+                                    log::trace!("CPU running... {} cycles executed", cycle_count);
                                 }
                             }
                             nexium_core::cpu::CpuEvent::Svc(imm) => {
@@ -1419,8 +1475,10 @@ impl EmulationHandle {
 
                         if let nexium_core::cpu::CpuEvent::Svc(imm) = event_copy {
                             let result = guard.dispatch_svc(imm);
-                            if let Some(cpu) = cpu_mut() {
-                                cpu.set_register(0, result as u64);
+                            if imm != 0x7f {
+                                if let Some(cpu) = cpu_mut() {
+                                    cpu.set_register(0, result as u64);
+                                }
                             }
                             let pace_present = guard.present_pace_until.take();
                             let timeslice = guard

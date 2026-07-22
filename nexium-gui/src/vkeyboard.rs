@@ -1,5 +1,5 @@
-use crate::input::InputSnapshot;
 use crate::controller_config::SwitchButton;
+use crate::input::InputSnapshot;
 use egui::{Color32, FontId, Rounding, Stroke, Vec2};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -31,24 +31,9 @@ pub enum VkResult {
     Cancel,
 }
 
-const LOWER: [&str; 4] = [
-    "1234567890",
-    "qwertyuiop",
-    "asdfghjkl'",
-    "zxcvbnm,.?",
-];
-const UPPER: [&str; 4] = [
-    "!@#$%^&*()",
-    "QWERTYUIOP",
-    "ASDFGHJKL\"",
-    "ZXCVBNM;:/",
-];
-const SYMBOL: [&str; 4] = [
-    "+-*/=_<>[]",
-    "{}\\|~`:;-+",
-    "!@#$%^&()?",
-    ".,'\"~=_<>|",
-];
+const LOWER: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm,.?"];
+const UPPER: [&str; 4] = ["!@#$%^&*()", "QWERTYUIOP", "ASDFGHJKL\"", "ZXCVBNM;:/"];
+const SYMBOL: [&str; 4] = ["+-*/=_<>[]", "{}\\|~`:;-+", "!@#$%^&()?", ".,'\"~=_<>|"];
 
 pub struct VirtualKeyboard {
     pub open: bool,
@@ -261,15 +246,35 @@ impl VirtualKeyboard {
                             self.insert_str(buf, &clean);
                         }
                     }
-                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => self.backspace(buf),
-                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => result = VkResult::Accept,
-                    egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => result = VkResult::Cancel,
-                    egui::Event::Key { key: egui::Key::ArrowLeft, pressed: true, .. } => {
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    } => self.backspace(buf),
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        ..
+                    } => result = VkResult::Accept,
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        ..
+                    } => result = VkResult::Cancel,
+                    egui::Event::Key {
+                        key: egui::Key::ArrowLeft,
+                        pressed: true,
+                        ..
+                    } => {
                         if self.caret > 0 {
                             self.caret -= 1;
                         }
                     }
-                    egui::Event::Key { key: egui::Key::ArrowRight, pressed: true, .. } => {
+                    egui::Event::Key {
+                        key: egui::Key::ArrowRight,
+                        pressed: true,
+                        ..
+                    } => {
                         let n = buf.chars().count();
                         if self.caret < n {
                             self.caret += 1;
@@ -380,9 +385,20 @@ impl VirtualKeyboard {
         result
     }
 
-    fn draw(&self, ctx: &egui::Context, ui: &mut egui::Ui, buf: &str, ease: f32, accent: Color32, light: bool) {
+    fn draw(
+        &self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        buf: &str,
+        ease: f32,
+        accent: Color32,
+        light: bool,
+    ) {
         let full = ctx.screen_rect();
-        let mut p = ctx.layer_painter(egui::LayerId::new(egui::Order::Debug, egui::Id::new("vkeyboard")));
+        let mut p = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Debug,
+            egui::Id::new("vkeyboard"),
+        ));
         p.set_opacity(ease);
 
         let panel_h = (full.height() * 0.46).min(360.0);
@@ -392,15 +408,57 @@ impl VirtualKeyboard {
             egui::pos2(full.max.x, full.max.y + slide),
         );
 
-        let bg = if light { Color32::from_rgb(0xEC, 0xEC, 0xF0) } else { Color32::from_rgb(0x1A, 0x1A, 0x22) };
-        let key_bg = if light { Color32::from_rgb(0xFF, 0xFF, 0xFF) } else { Color32::from_rgb(0x2A, 0x2A, 0x34) };
-        let key_border = if light { Color32::from_rgb(0xC8, 0xC8, 0xD2) } else { Color32::from_rgb(0x3C, 0x3C, 0x48) };
-        let text = if light { Color32::from_rgb(0x1E, 0x1E, 0x28) } else { Color32::from_rgb(0xEC, 0xEC, 0xF0) };
-        let muted = if light { Color32::from_rgb(0x70, 0x70, 0x7A) } else { Color32::from_rgb(0x8A, 0x8A, 0x98) };
+        let bg = if light {
+            Color32::from_rgb(0xEC, 0xEC, 0xF0)
+        } else {
+            Color32::from_rgb(0x1A, 0x1A, 0x22)
+        };
+        let key_bg = if light {
+            Color32::from_rgb(0xFF, 0xFF, 0xFF)
+        } else {
+            Color32::from_rgb(0x2A, 0x2A, 0x34)
+        };
+        let key_border = if light {
+            Color32::from_rgb(0xC8, 0xC8, 0xD2)
+        } else {
+            Color32::from_rgb(0x3C, 0x3C, 0x48)
+        };
+        let text = if light {
+            Color32::from_rgb(0x1E, 0x1E, 0x28)
+        } else {
+            Color32::from_rgb(0xEC, 0xEC, 0xF0)
+        };
+        let muted = if light {
+            Color32::from_rgb(0x70, 0x70, 0x7A)
+        } else {
+            Color32::from_rgb(0x8A, 0x8A, 0x98)
+        };
 
-        p.rect_filled(egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, panel.min.y)), Rounding::ZERO, Color32::from_rgba_unmultiplied(0, 0, 0, (ease * 90.0) as u8));
-        p.rect_filled(panel, Rounding { nw: 18.0, ne: 18.0, sw: 0.0, se: 0.0 }, bg);
-        p.rect_stroke(panel, Rounding { nw: 18.0, ne: 18.0, sw: 0.0, se: 0.0 }, Stroke::new(1.5_f32, key_border));
+        p.rect_filled(
+            egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, panel.min.y)),
+            Rounding::ZERO,
+            Color32::from_rgba_unmultiplied(0, 0, 0, (ease * 90.0) as u8),
+        );
+        p.rect_filled(
+            panel,
+            Rounding {
+                nw: 18.0,
+                ne: 18.0,
+                sw: 0.0,
+                se: 0.0,
+            },
+            bg,
+        );
+        p.rect_stroke(
+            panel,
+            Rounding {
+                nw: 18.0,
+                ne: 18.0,
+                sw: 0.0,
+                se: 0.0,
+            },
+            Stroke::new(1.5_f32, key_border),
+        );
 
         let pad = 24.0;
         let preview = egui::Rect::from_min_max(
@@ -413,10 +471,23 @@ impl VirtualKeyboard {
         let shown = if buf.is_empty() { "" } else { buf };
         let pre: String = buf.chars().take(self.caret).collect();
         let pre_w = ui.fonts(|f| f.layout_no_wrap(pre, pv_font.clone(), text).size().x);
-        p.text(egui::pos2(preview.min.x + 14.0, preview.center().y), egui::Align2::LEFT_CENTER, shown, pv_font.clone(), text);
+        p.text(
+            egui::pos2(preview.min.x + 14.0, preview.center().y),
+            egui::Align2::LEFT_CENTER,
+            shown,
+            pv_font.clone(),
+            text,
+        );
         if (ctx.input(|i| i.time) * 1.6).fract() < 0.5 {
             let cx = preview.min.x + 14.0 + pre_w;
-            p.rect_filled(egui::Rect::from_min_max(egui::pos2(cx, preview.center().y - 11.0), egui::pos2(cx + 2.0, preview.center().y + 11.0)), Rounding::ZERO, accent);
+            p.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(cx, preview.center().y - 11.0),
+                    egui::pos2(cx + 2.0, preview.center().y + 11.0),
+                ),
+                Rounding::ZERO,
+                accent,
+            );
         }
 
         let grid_top = preview.max.y + 16.0;
@@ -442,14 +513,27 @@ impl VirtualKeyboard {
                 } else {
                     p.rect_stroke(r, Rounding::same(7.0), Stroke::new(1.0_f32, key_border));
                 }
-                p.text(r.center(), egui::Align2::CENTER_CENTER, ch.to_string(), FontId::proportional(cell_h * 0.44), text);
+                p.text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    ch.to_string(),
+                    FontId::proportional(cell_h * 0.44),
+                    text,
+                );
             }
         }
 
         let fy = grid_top + 4.0 * (cell_h + gap);
         let labels = [
             (if self.caps { "SHIFT" } else { "shift" }, 1.0f32),
-            (if self.layer == Layer::Symbol { "ABC" } else { "?12" }, 1.0),
+            (
+                if self.layer == Layer::Symbol {
+                    "ABC"
+                } else {
+                    "?12"
+                },
+                1.0,
+            ),
             ("Space", 3.6),
             ("Del", 1.4),
             ("OK", 2.0),
@@ -471,11 +555,23 @@ impl VirtualKeyboard {
                 p.rect_stroke(r, Rounding::same(7.0), Stroke::new(1.0_f32, key_border));
             }
             let lc = if is_ok { Color32::WHITE } else { text };
-            p.text(r.center(), egui::Align2::CENTER_CENTER, *lbl, FontId::proportional(cell_h * 0.34), lc);
+            p.text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                *lbl,
+                FontId::proportional(cell_h * 0.34),
+                lc,
+            );
             fx += cw + gap;
         }
 
         let legend = "A Select    B Delete    Y Shift    X Cancel    L / R Move    Start OK";
-        p.text(egui::pos2(panel.center().x, panel.max.y - legend_h * 0.5), egui::Align2::CENTER_CENTER, legend, FontId::proportional(13.0), muted);
+        p.text(
+            egui::pos2(panel.center().x, panel.max.y - legend_h * 0.5),
+            egui::Align2::CENTER_CENTER,
+            legend,
+            FontId::proportional(13.0),
+            muted,
+        );
     }
 }
