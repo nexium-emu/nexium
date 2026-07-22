@@ -1,6 +1,6 @@
 use super::decode::{decode_one, Decoded};
 use super::opcodes::Opcode;
-use super::operand::{exit_never_taken, ldc_ref, texs_tex_id};
+use super::operand::{decoded_pred, exit_never_taken, ldc_mode, ldc_ref, texs_tex_id, LdcMode};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Instruction {
@@ -27,7 +27,9 @@ pub fn walk_instructions(code: &[u8]) -> Vec<Instruction> {
             let bytes: [u8; 8] = code[inst_off..inst_off + 8].try_into().unwrap();
             let insn = u64::from_le_bytes(bytes);
             if let Some(decoded) = decode_one(insn) {
-                let exit = matches!(decoded.opcode, Opcode::EXIT) && !exit_never_taken(insn);
+                let exit = matches!(decoded.opcode, Opcode::EXIT)
+                    && !exit_never_taken(insn)
+                    && decoded_pred(insn).is_none();
                 out.push(Instruction {
                     byte_offset: inst_off,
                     decoded,
@@ -46,6 +48,12 @@ pub fn shader_uses_ldg(code: &[u8]) -> bool {
     walk_instructions(code)
         .iter()
         .any(|i| matches!(i.decoded.opcode, Opcode::LDG))
+}
+
+pub fn shader_uses_stg(code: &[u8]) -> bool {
+    walk_instructions(code)
+        .iter()
+        .any(|i| matches!(i.decoded.opcode, Opcode::STG))
 }
 
 pub fn extract_fs_tex_ids(code: &[u8], bindless_slot: u8) -> Vec<FsTexId> {
@@ -73,7 +81,7 @@ pub fn extract_fs_tex_ids(code: &[u8], bindless_slot: u8) -> Vec<FsTexId> {
 
             Opcode::LDC => {
                 let r = ldc_ref(raw);
-                if r.binding == bindless_slot {
+                if ldc_mode(raw) == LdcMode::Default && r.binding == bindless_slot {
                     let off = r.byte_offset.max(0) as u32;
                     push(FsTexId::BindlessCbufOffset(off), &mut out);
                 }
@@ -121,6 +129,13 @@ mod tests {
     }
 
     #[test]
+    fn segmented_ldc_is_not_misidentified_as_a_static_bindless_handle() {
+        let segmented = make_ldc(0x14, 15) | (2 << 44);
+        let code = make_group(segmented, 0, 0);
+        assert!(extract_fs_tex_ids(&code, 15).is_empty());
+    }
+
+    #[test]
     fn empty_code_returns_empty() {
         let ids = extract_fs_tex_ids(&[], 15);
         assert!(ids.is_empty());
@@ -133,6 +148,26 @@ mod tests {
         assert!(
             ids.is_empty(),
             "post-exit bytes must not be walked: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn extract_continues_after_predicated_exit_until_unpredicated_exit() {
+        let mut code = make_group(0xe30000000000000f, make_ldc(0x14, 15), make_ldc(0x18, 15));
+        code.extend(make_group(
+            0xe30000000007000f,
+            make_ldc(0x1c, 15),
+            make_ldc(0x20, 15),
+        ));
+
+        let ids = extract_fs_tex_ids(&code, 15);
+
+        assert_eq!(
+            ids,
+            vec![
+                FsTexId::BindlessCbufOffset(0x14),
+                FsTexId::BindlessCbufOffset(0x18),
+            ]
         );
     }
 }

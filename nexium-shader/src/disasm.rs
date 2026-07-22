@@ -40,6 +40,7 @@ pub fn disassemble(bytes: &[u8]) -> Vec<DisasmLine> {
             Some(d) => {
                 if matches!(d.opcode, super::opcodes::Opcode::EXIT)
                     && !super::operand::exit_never_taken(raw)
+                    && super::operand::decoded_pred(raw).is_none()
                 {
                     hit_exit = true;
                 }
@@ -79,4 +80,32 @@ impl DisasmLine {
 
 fn mnemonic_only(display: &str) -> &str {
     display.split_once(' ').map(|(m, _)| m).unwrap_or(display)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn predicated_exit_keeps_disassembling_until_unpredicated_exit() {
+        let words = [
+            0u64,
+            0xe300_0000_0000_000f,
+            0x4c98_0788_05a7_0004,
+            0xe300_0000_0007_000f,
+            0u64,
+            0x4c47_0208_15c7_0404,
+        ];
+        let bytes = words
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let lines = disassemble(&bytes);
+
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[1].raw, 0xe300_0000_0000_000f);
+        assert_eq!(lines[2].raw, 0x4c98_0788_05a7_0004);
+        assert_eq!(lines[3].raw, 0xe300_0000_0007_000f);
+    }
 }

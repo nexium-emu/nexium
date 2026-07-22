@@ -1,6 +1,7 @@
 use super::opcodes::Opcode;
 use super::operand::{
-    cbuf, fmt_cbuf, fmt_reg, imm20, imm32, ldc_ref, ldc_src_reg, reg_a, reg_b, reg_c, reg_dest,
+    cbuf, fmt_cbuf, fmt_reg, imm20, imm32, ldc_mode, ldc_ref, ldc_src_reg, reg_a, reg_b, reg_c,
+    reg_dest, LdcMode,
 };
 
 pub fn pretty_operands(opcode: Opcode, insn: u64) -> Option<String> {
@@ -126,21 +127,33 @@ pub fn pretty_operands(opcode: Opcode, insn: u64) -> Option<String> {
         LDC => {
             let r = ldc_ref(insn);
             let src = ldc_src_reg(insn);
-            if src == super::operand::RZ {
-                Some(format!(
+            match ldc_mode(insn) {
+                LdcMode::Default if src == super::operand::RZ => Some(format!(
                     "{}, c[{:#x}]:{:#x}",
                     fmt_reg(reg_dest(insn)),
                     r.binding,
                     r.byte_offset
-                ))
-            } else {
-                Some(format!(
+                )),
+                LdcMode::Default => Some(format!(
                     "{}, c[{:#x}]:{}+{}",
                     fmt_reg(reg_dest(insn)),
                     r.binding,
                     fmt_reg(src),
                     r.byte_offset
-                ))
+                )),
+                mode => Some(format!(
+                    "{}, c.{}[{:#x}]:{}+{}",
+                    fmt_reg(reg_dest(insn)),
+                    match mode {
+                        LdcMode::Il => "IL",
+                        LdcMode::Is => "IS",
+                        LdcMode::Isl => "ISL",
+                        LdcMode::Default => unreachable!(),
+                    },
+                    r.binding,
+                    fmt_reg(src),
+                    r.byte_offset
+                )),
             }
         }
         LDG | LDL | LDS | STG | STL | STS => Some(format!(

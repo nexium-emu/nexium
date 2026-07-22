@@ -1,20 +1,47 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::decode::decode_one;
-use super::ir::{Inst, Op, Predicate, Program, Value, ValueId};
+use super::ir::{Inst, Op, Predicate, Program, ShaderStage, Value, ValueId};
 use super::opcodes::Opcode;
-use super::operand::{decoded_pred, exit_never_taken, RZ};
-use super::translate::Translator;
+use super::operand::{
+    decoded_pred, exit_never_taken, imm20, ldc_mode, ldc_ref, ldc_size, ldc_src_reg, pred_negate,
+    reg_a, reg_dest, LdcMode, RZ,
+};
+use super::translate::{
+    resolve_cbuf_handle_origin, PendingBindlessOriginCheck, Translator, ValueDefs,
+};
 
 pub type BlockId = u32;
+pub const MAX_INDIRECT_BRANCH_TARGETS: usize = 32;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndirectBranchTarget {
+    pub selector: u32,
+    pub target: BlockId,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BranchKind {
     FallThrough,
 
-    Unconditional { target: BlockId },
+    Unconditional {
+        target: BlockId,
+    },
 
-    Conditional { target: BlockId, pred: Predicate },
+    Conditional {
+        target: BlockId,
+        pred: Predicate,
+    },
+
+    Indirect {
+        register: u8,
+        base: u32,
+        cbuf_binding: u8,
+        cbuf_offset: u32,
+        table_entries: u8,
+        count: u8,
+        targets: [IndirectBranchTarget; MAX_INDIRECT_BRANCH_TARGETS],
+    },
 
     Exit,
 }
@@ -63,6 +90,15 @@ impl Cfg {
                 } else {
                     vec![target]
                 }
+            }
+            BranchKind::Indirect { count, targets, .. } => {
+                let mut successors = Vec::with_capacity(count as usize);
+                for entry in targets.iter().take(count as usize) {
+                    if !successors.contains(&entry.target) {
+                        successors.push(entry.target);
+                    }
+                }
+                successors
             }
             BranchKind::FallThrough => {
                 let fall = id + 1;
@@ -194,6 +230,189 @@ fn bra_target(pc: usize, raw: u64) -> usize {
     (pc as i64 + signed as i64 + 8) as usize
 }
 
+fn signed_24(raw: u64) -> i32 {
+    let value = ((raw >> 20) & 0x00FF_FFFF) as u32;
+    if value & 0x0080_0000 != 0 {
+        (value | 0xFF00_0000) as i32
+    } else {
+        value as i32
+    }
+}
+
+fn previous_instruction(mut offset: usize) -> Option<usize> {
+    loop {
+        offset = offset.checked_sub(8)?;
+        if !is_schedule(offset) {
+            return Some(offset);
+        }
+    }
+}
+
+fn find_previous<F>(bytes: &[u8], offset: &mut usize, mut matches: F) -> Option<u64>
+where
+    F: FnMut(u64, Opcode) -> bool,
+{
+    while let Some(candidate) = previous_instruction(*offset) {
+        *offset = candidate;
+        let raw = u64::from_le_bytes(bytes[candidate..candidate + 8].try_into().ok()?);
+        if let Some(decoded) = decode_one(raw) {
+            if matches(raw, decoded.opcode) {
+                return Some(raw);
+            }
+        }
+    }
+    None
+}
+
+fn track_indirect_branch<F>(
+    bytes: &[u8],
+    pc: usize,
+    raw: u64,
+    read_cbuf: &mut F,
+) -> Option<BranchKind>
+where
+    F: FnMut(u8, u32) -> Option<u32>,
+{
+    if raw & 0x1F != 0x0F || decoded_pred(raw).is_some() || pred_negate(raw) || raw & 0x60 != 0 {
+        return None;
+    }
+
+    let branch_register = reg_a(raw);
+    let mut scan = pc;
+    let ldc = find_previous(bytes, &mut scan, |candidate, opcode| {
+        opcode == Opcode::LDC
+            && reg_dest(candidate) == branch_register
+            && ldc_size(candidate) == 4
+            && ldc_mode(candidate) == LdcMode::Default
+            && decoded_pred(candidate).is_none()
+            && !pred_negate(candidate)
+    })?;
+    let reference = ldc_ref(ldc);
+    let table_offset = u32::try_from(reference.byte_offset).ok()?;
+    let ldc_register = ldc_src_reg(ldc);
+
+    let shl = find_previous(bytes, &mut scan, |candidate, opcode| {
+        opcode == Opcode::SHL_imm
+            && reg_dest(candidate) == ldc_register
+            && imm20(candidate) == 2
+            && decoded_pred(candidate).is_none()
+            && !pred_negate(candidate)
+    })?;
+    let index_register = reg_a(shl);
+
+    let imnmx = find_previous(bytes, &mut scan, |candidate, opcode| {
+        opcode == Opcode::IMNMX_imm
+            && reg_dest(candidate) == index_register
+            && decoded_pred(candidate).is_none()
+            && !pred_negate(candidate)
+    })?;
+    if (imnmx >> 56) & 1 != 0 {
+        return None;
+    }
+    let entry_count = ((imnmx >> 20) & 0x7_FFFF) as usize + 1;
+    if entry_count == 0 || entry_count > MAX_INDIRECT_BRANCH_TARGETS {
+        return None;
+    }
+
+    let base = (pc as u32)
+        .wrapping_add(8)
+        .wrapping_add(signed_24(raw) as u32);
+    let mut targets = [IndirectBranchTarget::default(); MAX_INDIRECT_BRANCH_TARGETS];
+    let mut count = 0usize;
+    for index in 0..entry_count {
+        let byte_offset = table_offset.checked_add((index as u32).checked_mul(4)?)?;
+        let Some(table_value) = read_cbuf(reference.binding, byte_offset) else {
+            if std::env::var_os("NEXIUM_BRX_TRACE").is_some() {
+                log::warn!(
+                    "[brx-track] pc={:#x} c[{}]+{:#x} unavailable",
+                    pc,
+                    reference.binding,
+                    byte_offset
+                );
+            }
+            return None;
+        };
+        let selector = base.wrapping_add(table_value);
+        let raw_target = selector as usize;
+        let target = if is_schedule(raw_target) {
+            raw_target.saturating_add(8)
+        } else {
+            raw_target
+        };
+        if target <= pc || target + 8 > bytes.len() || target % 8 != 0 {
+            if std::env::var_os("NEXIUM_BRX_TRACE").is_some() {
+                log::warn!(
+                    "[brx-track] pc={:#x} index={} table={:#010x} base={:#010x} target={:#x}->{:#x} len={:#x} rejected",
+                    pc,
+                    index,
+                    table_value,
+                    base,
+                    raw_target,
+                    target,
+                    bytes.len()
+                );
+            }
+            return None;
+        }
+        if targets[..count]
+            .iter()
+            .any(|entry| entry.selector == selector)
+        {
+            continue;
+        }
+        targets[count] = IndirectBranchTarget {
+            selector,
+            target: target as BlockId,
+        };
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+
+    if std::env::var_os("NEXIUM_BRX_TRACE").is_some() {
+        log::warn!(
+            "[brx-track] pc={:#x} register=R{} base={:#010x} c[{}]+{:#x} entries={} targets={}",
+            pc,
+            branch_register,
+            base,
+            reference.binding,
+            table_offset,
+            entry_count,
+            count
+        );
+    }
+
+    Some(BranchKind::Indirect {
+        register: branch_register,
+        base,
+        cbuf_binding: reference.binding,
+        cbuf_offset: table_offset,
+        table_entries: entry_count as u8,
+        count: count as u8,
+        targets,
+    })
+}
+
+fn discover_indirect_branches<F>(bytes: &[u8], read_cbuf: &mut F) -> HashMap<usize, BranchKind>
+where
+    F: FnMut(u8, u32) -> Option<u32>,
+{
+    let mut branches = HashMap::new();
+    for offset in (0..bytes.len().saturating_sub(7)).step_by(8) {
+        if is_schedule(offset) {
+            continue;
+        }
+        let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        if decode_one(raw).is_some_and(|decoded| decoded.opcode == Opcode::BRX) {
+            if let Some(branch) = track_indirect_branch(bytes, offset, raw, read_cbuf) {
+                branches.insert(offset, branch);
+            }
+        }
+    }
+    branches
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum FlowToken {
     Ssy,
@@ -221,7 +440,10 @@ fn push_flow_state(
     }
 }
 
-fn discover_sync_targets(bytes: &[u8]) -> HashMap<usize, usize> {
+fn discover_sync_targets(
+    bytes: &[u8],
+    indirect_branches: &HashMap<usize, BranchKind>,
+) -> HashMap<usize, usize> {
     let mut targets = HashMap::new();
     let mut worklist = vec![(0usize, FlowStack::new())];
     let mut visited: HashSet<(usize, FlowStack)> = HashSet::new();
@@ -264,6 +486,21 @@ fn discover_sync_targets(bytes: &[u8]) -> HashMap<usize, usize> {
                         }
                         break;
                     }
+                    Opcode::BRX => {
+                        if let Some(BranchKind::Indirect { count, targets, .. }) =
+                            indirect_branches.get(&offset)
+                        {
+                            for entry in targets.iter().take(*count as usize) {
+                                push_flow_state(
+                                    &mut worklist,
+                                    entry.target as usize,
+                                    &stack,
+                                    bytes.len(),
+                                );
+                            }
+                            break;
+                        }
+                    }
                     Opcode::EXIT if decoded_pred(raw).is_none() && !exit_never_taken(raw) => break,
                     _ => {}
                 }
@@ -274,7 +511,11 @@ fn discover_sync_targets(bytes: &[u8]) -> HashMap<usize, usize> {
     targets
 }
 
-fn discover_leaders(bytes: &[u8], sync_targets: &HashMap<usize, usize>) -> BTreeSet<usize> {
+fn discover_leaders(
+    bytes: &[u8],
+    sync_targets: &HashMap<usize, usize>,
+    indirect_branches: &HashMap<usize, BranchKind>,
+) -> BTreeSet<usize> {
     let mut leaders: BTreeSet<usize> = BTreeSet::new();
     let mut worklist: Vec<usize> = vec![0];
     leaders.insert(0);
@@ -324,6 +565,19 @@ fn discover_leaders(bytes: &[u8], sync_targets: &HashMap<usize, usize>) -> BTree
                         break;
                     }
                 }
+                Opcode::BRX => {
+                    if let Some(BranchKind::Indirect { count, targets, .. }) =
+                        indirect_branches.get(&offset)
+                    {
+                        for entry in targets.iter().take(*count as usize) {
+                            let target = entry.target as usize;
+                            if leaders.insert(target) {
+                                worklist.push(target);
+                            }
+                        }
+                        break;
+                    }
+                }
                 _ => {}
             }
             offset = next;
@@ -341,12 +595,55 @@ fn make_offset_to_block(leaders: &BTreeSet<usize>) -> HashMap<usize, BlockId> {
 }
 
 pub fn build_cfg(bytes: &[u8]) -> Cfg {
-    let sync_targets = discover_sync_targets(bytes);
-    let leaders = discover_leaders(bytes, &sync_targets);
+    build_cfg_with_cbuf_stage(bytes, |_, _| None, ShaderStage::Vertex)
+}
+
+pub fn build_fragment_cfg(bytes: &[u8]) -> Cfg {
+    build_cfg_with_cbuf_stage(bytes, |_, _| None, ShaderStage::Fragment)
+}
+
+pub fn build_compute_cfg(bytes: &[u8]) -> Cfg {
+    build_cfg_with_cbuf_stage(bytes, |_, _| None, ShaderStage::Compute)
+}
+
+pub fn build_cfg_with_cbuf<F>(bytes: &[u8], mut read_cbuf: F) -> Cfg
+where
+    F: FnMut(u8, u32) -> Option<u32>,
+{
+    build_cfg_with_cbuf_stage(bytes, &mut read_cbuf, ShaderStage::Vertex)
+}
+
+pub fn build_fragment_cfg_with_cbuf<F>(bytes: &[u8], mut read_cbuf: F) -> Cfg
+where
+    F: FnMut(u8, u32) -> Option<u32>,
+{
+    build_cfg_with_cbuf_stage(bytes, &mut read_cbuf, ShaderStage::Fragment)
+}
+
+pub fn build_compute_cfg_with_cbuf<F>(bytes: &[u8], mut read_cbuf: F) -> Cfg
+where
+    F: FnMut(u8, u32) -> Option<u32>,
+{
+    build_cfg_with_cbuf_stage(bytes, &mut read_cbuf, ShaderStage::Compute)
+}
+
+fn build_cfg_with_cbuf_stage<F>(bytes: &[u8], mut read_cbuf: F, stage: ShaderStage) -> Cfg
+where
+    F: FnMut(u8, u32) -> Option<u32>,
+{
+    let indirect_branches = discover_indirect_branches(bytes, &mut read_cbuf);
+    let sync_targets = discover_sync_targets(bytes, &indirect_branches);
+    let leaders = discover_leaders(bytes, &sync_targets, &indirect_branches);
     let offset_to_block = make_offset_to_block(&leaders);
     let leader_vec: Vec<usize> = leaders.iter().copied().collect();
 
-    let topology = discover_topology(bytes, &leader_vec, &offset_to_block, &sync_targets);
+    let topology = discover_topology(
+        bytes,
+        &leader_vec,
+        &offset_to_block,
+        &sync_targets,
+        &indirect_branches,
+    );
     let preds = compute_predecessors(&topology);
 
     let mut blocks: Vec<BasicBlock> = Vec::with_capacity(topology.len());
@@ -354,6 +651,8 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
     let mut next_value: u32 = 0;
     let mut bindless_or_partners: std::collections::HashMap<u32, u32> =
         std::collections::HashMap::new();
+    let mut value_defs = ValueDefs::new();
+    let mut pending_bindless_checks: Vec<(BlockId, PendingBindlessOriginCheck)> = Vec::new();
 
     for (bid, info) in topology.iter().enumerate() {
         let (initial_state, phis, after_phis) =
@@ -364,7 +663,8 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
             compute_initial_pred_state(&blocks, &preds, bid as BlockId, next_value);
         next_value = after_pred_phis;
 
-        let mut t = Translator::with_initial(initial_state, initial_pred_state, next_value);
+        let mut t =
+            Translator::with_initial_stage(initial_state, initial_pred_state, next_value, stage);
         for phi in phis {
             t.program.instructions.push(phi);
         }
@@ -379,16 +679,25 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
                 break;
             }
             let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-            t.translate(raw);
+            t.translate_with_defs(raw, &value_defs);
             offset += 8;
         }
 
         if let Some(term_off) = info.terminator_offset {
             if term_off + 8 <= bytes.len() && matches!(info.branch, BranchKind::Exit) {
                 let raw = u64::from_le_bytes(bytes[term_off..term_off + 8].try_into().unwrap());
-                t.translate(raw);
+                t.translate_with_defs(raw, &value_defs);
             }
         }
+
+        for inst in &t.program.instructions {
+            value_defs.insert_inst(inst);
+        }
+        pending_bindless_checks.extend(
+            t.take_pending_bindless_origin_checks()
+                .into_iter()
+                .map(|check| (bid as BlockId, check)),
+        );
 
         total_unimpl += t.unimplemented_count;
         for (k, v) in t.bindless_or_partners.drain() {
@@ -411,6 +720,7 @@ pub fn build_cfg(bytes: &[u8]) -> Cfg {
 
     patch_back_edge_phi_sources(&mut blocks);
     patch_back_edge_pred_phi_sources(&mut blocks);
+    total_unimpl += finalize_bindless_origin_checks(&mut blocks, pending_bindless_checks);
 
     Cfg {
         blocks,
@@ -432,6 +742,7 @@ fn discover_topology(
     leader_vec: &[usize],
     offset_to_block: &HashMap<usize, BlockId>,
     sync_targets: &HashMap<usize, usize>,
+    indirect_branches: &HashMap<usize, BranchKind>,
 ) -> Vec<BlockInfo> {
     let mut out = Vec::with_capacity(leader_vec.len());
     for (i, &start) in leader_vec.iter().enumerate() {
@@ -473,6 +784,43 @@ fn discover_topology(
                             break;
                         }
                     }
+                    Opcode::BRX => {
+                        if let Some(BranchKind::Indirect {
+                            register,
+                            base,
+                            cbuf_binding,
+                            cbuf_offset,
+                            table_entries,
+                            count,
+                            targets,
+                        }) = indirect_branches.get(&offset)
+                        {
+                            let mut resolved = *targets;
+                            let mut all_resolved = true;
+                            for entry in resolved.iter_mut().take(*count as usize) {
+                                let target_offset = entry.target as usize;
+                                match offset_to_block.get(&target_offset).copied() {
+                                    Some(target) => entry.target = target,
+                                    None => all_resolved = false,
+                                }
+                            }
+                            if !all_resolved {
+                                offset += 8;
+                                continue;
+                            }
+                            branch = BranchKind::Indirect {
+                                register: *register,
+                                base: *base,
+                                cbuf_binding: *cbuf_binding,
+                                cbuf_offset: *cbuf_offset,
+                                table_entries: *table_entries,
+                                count: *count,
+                                targets: resolved,
+                            };
+                            terminator_offset = Some(offset);
+                            break;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -502,6 +850,14 @@ fn compute_predecessors(topology: &[BlockInfo]) -> Vec<Vec<BlockId>> {
                 let fall = src + 1;
                 if (fall as usize) < topology.len() {
                     preds[fall as usize].push(src);
+                }
+            }
+            BranchKind::Indirect { count, targets, .. } => {
+                for entry in targets.iter().take(count as usize) {
+                    let incoming = &mut preds[entry.target as usize];
+                    if !incoming.contains(&src) {
+                        incoming.push(src);
+                    }
                 }
             }
             BranchKind::FallThrough => {
@@ -691,6 +1047,83 @@ fn patch_back_edge_pred_phi_sources(blocks: &mut [BasicBlock]) {
     }
 }
 
+fn finalize_bindless_origin_checks(
+    blocks: &mut [BasicBlock],
+    checks: Vec<(BlockId, PendingBindlessOriginCheck)>,
+) -> u32 {
+    if checks.is_empty() {
+        return 0;
+    }
+
+    let mut defs = ValueDefs::new();
+    for block in blocks.iter() {
+        for inst in &block.program.instructions {
+            defs.insert_inst(inst);
+        }
+    }
+
+    let mut rejected = 0;
+    for (block_id, check) in checks {
+        let resolved = resolve_cbuf_handle_origin(&check.handle, check.consumer_pred, &defs);
+        let Some(block) = blocks.get_mut(block_id as usize) else {
+            rejected += 1;
+            continue;
+        };
+        let sample_indices_valid = check.samples.iter().all(|(index, _)| {
+            block
+                .program
+                .instructions
+                .get(*index)
+                .is_some_and(|inst| match check.opcode {
+                    Opcode::TEX_b => {
+                        matches!(inst.op, Op::SampleTex { .. } | Op::SampleTexHandle { .. })
+                    }
+                    Opcode::TLD_b => matches!(inst.op, Op::TexelFetchHandle { .. }),
+                    Opcode::SUATOM => matches!(inst.op, Op::ImageAtomic { .. }),
+                    _ => false,
+                })
+        });
+
+        if let Some(origin) = resolved.filter(|_| sample_indices_valid) {
+            for (index, _) in &check.samples {
+                match &mut block.program.instructions[*index].op {
+                    Op::SampleTex { tex_id, .. } if check.opcode == Opcode::TEX_b => {
+                        *tex_id = origin.texture_id();
+                    }
+                    Op::SampleTexHandle { handle, .. } if check.opcode == Opcode::TEX_b => {
+                        *handle = origin.as_texture_handle();
+                    }
+                    Op::TexelFetchHandle { handle, .. } if check.opcode == Opcode::TLD_b => {
+                        *handle = origin.as_texture_handle();
+                    }
+                    Op::ImageAtomic { handle, .. } if check.opcode == Opcode::SUATOM => {
+                        *handle = origin.as_texture_handle();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            continue;
+        }
+
+        for (index, old_value) in check.samples {
+            if let Some(inst) = block.program.instructions.get_mut(index) {
+                inst.op = Op::Mov(old_value);
+            }
+        }
+        block.program.emit_void(Op::Unimplemented {
+            opcode: check.opcode,
+            raw: check.raw,
+        });
+        log::debug!(
+            "{:?} finalized handle origin rejected raw={:#018x}",
+            check.opcode,
+            check.raw,
+        );
+        rejected += 1;
+    }
+    rejected
+}
+
 fn values_equal(a: &Value, b: &Value) -> bool {
     matches!((a, b), (Value::Zero, Value::Zero))
         || match (a, b) {
@@ -700,6 +1133,51 @@ fn values_equal(a: &Value, b: &Value) -> bool {
             (Value::ImmF32(a), Value::ImmF32(b)) => a.to_bits() == b.to_bits(),
             _ => false,
         }
+}
+
+pub fn merge_dual_vertex_sass(vertex_a: &[u8], vertex_b: &[u8]) -> Option<Vec<u8>> {
+    const NOP: u64 = 0x50B0_0000_0007_0F00;
+    let mut exit_offset = None;
+    let mut offset = 0usize;
+    while offset + 8 <= vertex_a.len() {
+        if !is_schedule(offset) {
+            let raw = u64::from_le_bytes(vertex_a[offset..offset + 8].try_into().ok()?);
+            if let Some(decoded) = decode_one(raw) {
+                match decoded.opcode {
+                    Opcode::EXIT if decoded_pred(raw).is_none() && !exit_never_taken(raw) => {
+                        exit_offset = Some(offset);
+                        break;
+                    }
+                    Opcode::BRA
+                    | Opcode::JMP
+                    | Opcode::BRX
+                    | Opcode::SSY
+                    | Opcode::PBK
+                    | Opcode::SYNC
+                    | Opcode::BRK => {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        offset += 8;
+    }
+    let exit_offset = exit_offset?;
+    let bundle_end = (exit_offset & !0x1F) + 0x20;
+    if bundle_end > vertex_a.len() {
+        return None;
+    }
+    let mut merged = vertex_a[..bundle_end].to_vec();
+    let mut slot = exit_offset;
+    while slot < bundle_end {
+        if !is_schedule(slot) {
+            merged[slot..slot + 8].copy_from_slice(&NOP.to_le_bytes());
+        }
+        slot += 8;
+    }
+    merged.extend_from_slice(vertex_b);
+    Some(merged)
 }
 
 #[cfg(test)]
@@ -805,6 +1283,333 @@ mod tests {
         0xE240_0000_0000_0000u64 | ((raw_24 as u64) << 20) | 0x0007_0000
     }
 
+    fn write_word(bytes: &mut [u8], offset: usize, word: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
+    }
+
+    fn sample_tex_ids(cfg: &Cfg) -> Vec<u32> {
+        cfg.blocks
+            .iter()
+            .flat_map(|block| &block.program.instructions)
+            .filter_map(|inst| match inst.op {
+                Op::SampleTex { tex_id, .. } => Some(tex_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tex_b_phi_program(second_mov: u64) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x78];
+        write_word(&mut bytes, 0x08, 0xe240_0000_0380_0000);
+        write_word(&mut bytes, 0x10, 0x4c98_0788_0687_0012);
+        write_word(&mut bytes, 0x18, 0xe240_0000_0487_0000);
+        write_word(&mut bytes, 0x48, second_mov);
+        write_word(&mut bytes, 0x50, 0xe240_0000_0107_0000);
+        write_word(&mut bytes, 0x68, 0xdeba_0007_a127_1010);
+        write_word(&mut bytes, 0x70, enc_exit());
+        bytes
+    }
+
+    fn pps_loop_tex_b_program() -> Vec<u8> {
+        [
+            0x001f_c400_e220_07f0,
+            0x4c98_078c_0007_0009,
+            0xe003_ff87_4ff7_ff00,
+            0x5c98_0780_0ff7_000b,
+            0x001f_c800_fe20_07f1,
+            0x5c98_0780_0ff7_0008,
+            0x5c98_0780_0ff7_0007,
+            0x5c98_0780_0ff7_0006,
+            0x003f_c000_fda0_07e6,
+            0x38f8_7f80_0017_0909,
+            0x5b66_0380_0ff7_090f,
+            0x36b1_83bf_8007_0007,
+            0x001c_4400_fe00_07ed,
+            0xe240_0000_0a01_000f,
+            0x4c98_0788_05a7_000e,
+            0xe003_ff88_0ff7_ff04,
+            0x001f_c800_fec0_07f5,
+            0x5c98_0780_0ff7_000a,
+            0x4c47_0208_15a7_0e0e,
+            0x3818_0080_0017_0a0c,
+            0x103e_fc02_fe40_073d,
+            0x5cb8_0000_00c7_0a05,
+            0x4c68_1010_0017_0505,
+            0xdeba_0007_a0e7_0400,
+            0x041f_c400_fda0_07f6,
+            0x1c00_0000_0017_0a0a,
+            0x5b6c_0380_0097_0a0f,
+            0x5c58_1000_00b7_000b,
+            0x001f_c000_fe20_07e1,
+            0x5c58_1000_0087_0108,
+            0x5c58_1000_0077_0207,
+            0x5c58_1000_0067_0306,
+            0x001f_c400_fe20_07fd,
+            0xe240_0fff_f889_000f,
+            0x5c98_0780_00b0_0000,
+            0x5c98_0780_0080_0001,
+            0x001f_f400_fe00_07f1,
+            0x5c98_0780_0070_0002,
+            0x5c98_0780_0060_0003,
+            0xe300_0000_0000_000f,
+        ]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect()
+    }
+
+    fn indirect_program(entry_count: usize, valid_shift: bool) -> (Vec<u8>, Vec<u32>) {
+        let all_targets = [0x30u32, 0x38, 0x48, 0x50, 0x58];
+        let targets = all_targets[..entry_count].to_vec();
+        let mut bytes = vec![0u8; 0x60];
+        let imnmx = 0x3820_0380_0007_0000u64 | (((entry_count - 1) as u64) << 20);
+        let shift = if valid_shift { 2u64 } else { 1u64 };
+        let shl = 0x3848_0000_0007_0000u64 | (shift << 20);
+        let ldc = 0xEF94_0010_0007_0000u64;
+        let branch_offset = ((-0x30i32 as u32) & 0x00FF_FFFF) as u64;
+        let brx = 0xE250_0000_0007_000Fu64 | (branch_offset << 20);
+        write_word(&mut bytes, 0x08, imnmx);
+        write_word(&mut bytes, 0x10, shl);
+        write_word(&mut bytes, 0x18, ldc);
+        write_word(&mut bytes, 0x28, brx);
+        for &target in &targets {
+            write_word(&mut bytes, target as usize, enc_exit());
+        }
+        (bytes, targets)
+    }
+
+    fn tracked_indirect_cfg(entry_count: usize) -> (Cfg, Vec<u32>) {
+        let (bytes, targets) = indirect_program(entry_count, true);
+        let cfg = build_cfg_with_cbuf(&bytes, |binding, offset| {
+            (binding == 1)
+                .then(|| targets.get((offset / 4) as usize).copied())
+                .flatten()
+        });
+        (cfg, targets)
+    }
+
+    #[test]
+    fn decodes_canonical_brx_raw() {
+        let raw = 0xE250_0FFF_FC07_000Fu64;
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::BRX)
+        );
+    }
+
+    #[test]
+    fn tracks_five_entry_indirect_branch() {
+        let (cfg, selectors) = tracked_indirect_cfg(5);
+        let BranchKind::Indirect {
+            register,
+            base,
+            cbuf_binding,
+            cbuf_offset,
+            table_entries,
+            count,
+            targets,
+        } = cfg.blocks[0].branch
+        else {
+            panic!("expected tracked BRX")
+        };
+        assert_eq!(register, 0);
+        assert_eq!(base, 0);
+        assert_eq!((cbuf_binding, cbuf_offset, table_entries), (1, 0, 5));
+        assert_eq!(count, 5);
+        assert_eq!(
+            targets[..count as usize]
+                .iter()
+                .map(|entry| entry.selector)
+                .collect::<Vec<_>>(),
+            selectors
+        );
+        assert_eq!(cfg.successors(0), vec![1, 2, 3, 4, 5]);
+        assert_eq!(cfg.unimplemented, 0);
+    }
+
+    #[test]
+    fn tracks_four_entry_indirect_branch() {
+        let (cfg, _) = tracked_indirect_cfg(4);
+        assert!(matches!(
+            cfg.blocks[0].branch,
+            BranchKind::Indirect {
+                table_entries: 4,
+                count: 4,
+                ..
+            }
+        ));
+        assert_eq!(cfg.successors(0), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn indirect_scheduler_target_advances_to_first_instruction() {
+        let (mut bytes, _) = indirect_program(1, true);
+        write_word(&mut bytes, 0x48, enc_exit());
+        let cfg = build_cfg_with_cbuf(&bytes, |binding, offset| {
+            (binding == 1 && offset == 0).then_some(0x40)
+        });
+        let BranchKind::Indirect { count, targets, .. } = cfg.blocks[0].branch else {
+            panic!("expected tracked BRX")
+        };
+        assert_eq!(count, 1);
+        assert_eq!(targets[0].selector, 0x40);
+        assert_eq!(cfg.block(targets[0].target).start_offset, 0x48);
+    }
+
+    #[test]
+    fn invalid_indirect_pattern_stays_unimplemented() {
+        let (bytes, targets) = indirect_program(5, false);
+        let cfg = build_cfg_with_cbuf(&bytes, |binding, offset| {
+            (binding == 1)
+                .then(|| targets.get((offset / 4) as usize).copied())
+                .flatten()
+        });
+        assert!(cfg.blocks.iter().any(|block| {
+            block.program.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.op,
+                    Op::Unimplemented {
+                        opcode: Opcode::BRX,
+                        ..
+                    }
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn pps_tex_b_traces_predicated_handle_across_blocks() {
+        let mut bytes = vec![0u8; 0x40];
+        write_word(&mut bytes, 0x08, 0x4c98_0788_0683_0012);
+        write_word(&mut bytes, 0x10, 0xe240_0000_0107_0000);
+        write_word(&mut bytes, 0x28, 0x4c47_0208_1683_1212);
+        write_word(&mut bytes, 0x30, 0xdeba_0007_a123_1010);
+        write_word(&mut bytes, 0x38, enc_exit());
+
+        let cfg = build_cfg(&bytes);
+        assert_eq!(cfg.blocks.len(), 2);
+        assert_eq!(cfg.unimplemented, 0);
+        assert_eq!(
+            sample_tex_ids(&cfg),
+            vec![crate::bindless_texture_id_pair(2, 0x68, Some(0x168)); 4]
+        );
+    }
+
+    #[test]
+    fn tex_b_unanimous_phi_preserves_cbuf_origin() {
+        let bytes = tex_b_phi_program(0x4c98_0788_0687_0012);
+        let cfg = build_cfg(&bytes);
+
+        assert_eq!(cfg.blocks.len(), 4);
+        assert_eq!(cfg.unimplemented, 0);
+        assert!(cfg.blocks[3]
+            .program
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst.op, Op::Phi { .. }) && inst.dest_reg == Some(18)));
+        assert_eq!(
+            sample_tex_ids(&cfg),
+            vec![crate::bindless_texture_id_pair(2, 0x68, None); 4]
+        );
+    }
+
+    #[test]
+    fn tex_b_differing_phi_origins_fail_closed() {
+        let bytes = tex_b_phi_program(0x4c98_0788_0697_0012);
+        let cfg = build_cfg(&bytes);
+
+        assert_eq!(cfg.unimplemented, 1);
+        assert!(cfg
+            .blocks
+            .iter()
+            .any(
+                |block| block.program.instructions.iter().any(|inst| matches!(
+                    inst.op,
+                    Op::Unimplemented {
+                        opcode: Opcode::TEX_b,
+                        ..
+                    }
+                ))
+            ));
+        assert!(sample_tex_ids(&cfg).is_empty());
+    }
+
+    #[test]
+    fn pps_tex_b_resolves_loop_invariant_self_phi() {
+        let cfg = build_cfg(&pps_loop_tex_b_program());
+
+        assert_eq!(cfg.unimplemented, 0);
+        assert_eq!(
+            sample_tex_ids(&cfg),
+            vec![crate::bindless_texture_id_pair(2, 0x5a, Some(0x15a)); 4]
+        );
+        let loop_block = cfg
+            .blocks
+            .iter()
+            .find(|block| block.start_offset == 0x98)
+            .expect("PPS loop block");
+        let phi = loop_block
+            .program
+            .instructions
+            .iter()
+            .find(|inst| matches!(inst.op, Op::Phi { .. }) && inst.dest_reg == Some(14))
+            .expect("R14 loop phi");
+        let phi_id = phi.result.expect("R14 phi result");
+        let Op::Phi { sources } = &phi.op else {
+            unreachable!()
+        };
+        assert!(sources
+            .iter()
+            .any(|(_, source)| *source == Value::Inst(phi_id)));
+    }
+
+    #[test]
+    fn bindless_tld_resolves_loop_invariant_self_phi() {
+        let mut bytes = pps_loop_tex_b_program();
+        write_word(&mut bytes, 0xb8, 0xdd3a_0007_a0e7_0400);
+
+        let cfg = build_compute_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+        let expected = crate::ir::TextureHandleOrigin::Bindless {
+            cbuf_binding: 2,
+            cbuf_word_offset: 0x5a,
+            cbuf_secondary_word_offset: Some(0x15a),
+        };
+        let handles = cfg
+            .blocks
+            .iter()
+            .flat_map(|block| &block.program.instructions)
+            .filter_map(|inst| match inst.op {
+                Op::TexelFetchHandle { handle, .. } => Some(handle),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(handles, vec![expected; 4]);
+    }
+
+    #[test]
+    fn pps_tex_b_loop_phi_revalidation_fails_closed_on_changed_handle() {
+        let mut bytes = pps_loop_tex_b_program();
+        write_word(&mut bytes, 0xf8, 0x4c98_0788_05b7_000e);
+
+        let cfg = build_cfg(&bytes);
+
+        assert_eq!(cfg.unimplemented, 1);
+        assert!(sample_tex_ids(&cfg).is_empty());
+        assert!(cfg
+            .blocks
+            .iter()
+            .any(
+                |block| block.program.instructions.iter().any(|inst| matches!(
+                    inst.op,
+                    Op::Unimplemented {
+                        opcode: Opcode::TEX_b,
+                        raw: 0xdeba_0007_a0e7_0400,
+                    }
+                ))
+            ));
+    }
+
     #[test]
     fn back_edge_creates_phi_with_patched_source() {
         let mut bytes = Vec::new();
@@ -887,5 +1692,47 @@ mod tests {
         let cfg = build_cfg(&bytes);
         assert_eq!(cfg.blocks.len(), 1);
         assert!(matches!(cfg.blocks[0].branch, BranchKind::Exit));
+    }
+
+    #[test]
+    fn merge_dual_vertex_replaces_exit_and_appends_b() {
+        let nop = 0x50B0_0000_0007_0F00u64;
+        let exit = 0xE300_0000_0007_000Fu64;
+        let mut a = Vec::new();
+        a.extend_from_slice(&0u64.to_le_bytes());
+        a.extend_from_slice(&nop.to_le_bytes());
+        a.extend_from_slice(&exit.to_le_bytes());
+        a.extend_from_slice(&exit.to_le_bytes());
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&nop.to_le_bytes());
+        b.extend_from_slice(&exit.to_le_bytes());
+        b.extend_from_slice(&nop.to_le_bytes());
+        let merged = merge_dual_vertex_sass(&a, &b).unwrap();
+        assert_eq!(merged.len(), a.len() + b.len());
+        for slot in [0x10usize, 0x18] {
+            let raw = u64::from_le_bytes(merged[slot..slot + 8].try_into().unwrap());
+            assert_eq!(raw, nop);
+        }
+        let b_exit = u64::from_le_bytes(merged[0x20 + 0x10..0x20 + 0x18].try_into().unwrap());
+        assert_eq!(b_exit, exit);
+        let cfg = build_cfg(&merged);
+        assert!(matches!(
+            cfg.blocks.last().unwrap().branch,
+            BranchKind::Exit
+        ));
+    }
+
+    #[test]
+    fn merge_dual_vertex_bails_without_terminal_exit() {
+        let nop = 0x50B0_0000_0007_0F00u64;
+        let predicated_exit = 0xE300_0000_0000_000Fu64;
+        let mut a = Vec::new();
+        a.extend_from_slice(&0u64.to_le_bytes());
+        a.extend_from_slice(&nop.to_le_bytes());
+        a.extend_from_slice(&predicated_exit.to_le_bytes());
+        a.extend_from_slice(&nop.to_le_bytes());
+        let b = a.clone();
+        assert!(merge_dual_vertex_sass(&a, &b).is_none());
     }
 }

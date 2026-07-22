@@ -102,6 +102,97 @@ pub enum HalfPrecision {
     FMZ,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShaderStage {
+    Vertex,
+    Fragment,
+    Compute,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryBarrierScope {
+    Workgroup,
+    Device,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImageDimension {
+    D1,
+    Buffer,
+    D2,
+    D3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImageAtomicOp {
+    Add,
+    Min,
+    Max,
+    Increment,
+    Decrement,
+    And,
+    Or,
+    Xor,
+    Exchange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImageAtomicType {
+    U32,
+    S32,
+    Sd32,
+}
+
+impl ImageAtomicType {
+    pub const fn is_signed(self) -> bool {
+        matches!(self, Self::S32)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TextureHandleOrigin {
+    Bound {
+        cbuf_word_offset: u32,
+    },
+    Bindless {
+        cbuf_binding: u8,
+        cbuf_word_offset: u32,
+        cbuf_secondary_word_offset: Option<u32>,
+    },
+}
+
+impl fmt::Display for ImageDimension {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::D1 => "1d",
+            Self::Buffer => "buffer",
+            Self::D2 => "2d",
+            Self::D3 => "3d",
+        })
+    }
+}
+
+impl fmt::Display for TextureHandleOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bound { cbuf_word_offset } => {
+                write!(f, "bound[{:#x}]", cbuf_word_offset * 4)
+            }
+            Self::Bindless {
+                cbuf_binding,
+                cbuf_word_offset,
+                cbuf_secondary_word_offset,
+            } => {
+                write!(f, "c[{cbuf_binding}][{:#x}]", cbuf_word_offset * 4)?;
+                if let Some(secondary) = cbuf_secondary_word_offset {
+                    write!(f, "|c[{cbuf_binding}][{:#x}]", secondary * 4)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl BoolOp {
     pub fn from_bits(v: u64) -> Self {
         match v & 3 {
@@ -210,6 +301,22 @@ pub struct Predicate {
     pub negate: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubgroupMask {
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoteMode {
+    All,
+    Any,
+    Equal,
+}
+
 impl fmt::Display for Predicate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.negate {
@@ -229,6 +336,13 @@ pub struct FMods {
     pub neg_c: bool,
     pub sat: bool,
     pub scale: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CbufAddressMode {
+    #[default]
+    Default,
+    Segmented,
 }
 
 #[derive(Clone, Debug)]
@@ -253,6 +367,16 @@ pub enum Op {
         c: Value,
         mods: FMods,
     },
+
+    DpdxFine {
+        src: Value,
+    },
+
+    DpdyFine {
+        src: Value,
+    },
+
+    YDirection,
 
     FMin {
         a: Value,
@@ -288,6 +412,7 @@ pub enum Op {
         binding: u8,
         byte_offset: u32,
         index: Value,
+        address_mode: CbufAddressMode,
     },
 
     LoadGlobal {
@@ -302,6 +427,27 @@ pub enum Op {
     StoreLocal {
         addr: Value,
         value: Value,
+    },
+
+    LoadShared {
+        addr: Value,
+    },
+
+    StoreShared {
+        addr: Value,
+        value: Value,
+    },
+
+    SharedAtomic {
+        addr: Value,
+        value: Value,
+        op: ImageAtomicOp,
+    },
+
+    WorkgroupBarrier,
+
+    MemoryBarrier {
+        scope: MemoryBarrierScope,
     },
 
     LoadStorage {
@@ -335,7 +481,86 @@ pub enum Op {
         v: Value,
         array: Option<Value>,
         volume: Option<Value>,
+        cube: Option<Value>,
+        implicit_lod: bool,
+        lod_bias: Option<Value>,
+        explicit_lod: Option<Value>,
+        texel_offset: Option<(Value, Value)>,
+        dref: Option<Value>,
         component: u8,
+    },
+
+    SampleTexHandle {
+        handle: TextureHandleOrigin,
+        dimension: ImageDimension,
+        u: Value,
+        v: Option<Value>,
+        w: Option<Value>,
+        implicit_lod: bool,
+        lod_bias: Option<Value>,
+        explicit_lod: Option<Value>,
+        texel_offset: Option<(Value, Value)>,
+        dref: Option<Value>,
+        component: u8,
+    },
+
+    TexelFetch {
+        cbuf_binding: u8,
+        cbuf_word_offset: u32,
+        cbuf_secondary_word_offset: Option<u32>,
+        x: Value,
+        y: Option<Value>,
+        z: Option<Value>,
+        component: u8,
+    },
+
+    TexelFetchHandle {
+        handle: TextureHandleOrigin,
+        dimension: ImageDimension,
+        x: Value,
+        y: Option<Value>,
+        z: Option<Value>,
+        component: u8,
+    },
+
+    TextureQueryDimension {
+        handle: TextureHandleOrigin,
+        lod: Value,
+        component: u8,
+    },
+
+    LocalInvocationId {
+        component: u8,
+    },
+
+    WorkgroupId {
+        component: u8,
+    },
+
+    SubgroupLaneId,
+
+    SubgroupMask {
+        kind: SubgroupMask,
+    },
+
+    ImageWrite {
+        handle: TextureHandleOrigin,
+        dimension: ImageDimension,
+        x: Value,
+        y: Option<Value>,
+        z: Option<Value>,
+        values: [Value; 4],
+    },
+
+    ImageAtomic {
+        handle: TextureHandleOrigin,
+        dimension: ImageDimension,
+        x: Value,
+        y: Option<Value>,
+        z: Option<Value>,
+        value: Value,
+        op: ImageAtomicOp,
+        data_type: ImageAtomicType,
     },
 
     HAdd {
@@ -543,6 +768,21 @@ pub enum Op {
         not_b: bool,
     },
 
+    ILop3 {
+        a: Value,
+        b: Value,
+        c: Value,
+        lut: u8,
+    },
+
+    FindUMsb {
+        value: Value,
+    },
+
+    BitCount {
+        value: Value,
+    },
+
     IShl {
         a: Value,
         b: Value,
@@ -578,6 +818,13 @@ pub enum Op {
         mask: Value,
         mode: u8,
         pred_dest: u8,
+    },
+
+    SubgroupVote {
+        source_pred: Predicate,
+        mode: VoteMode,
+        pred_dest: u8,
+        old: Value,
     },
 
     FSwzAdd {
@@ -712,6 +959,9 @@ impl Inst {
             Op::FMul { a, b, .. } => write!(f, "FMul  {a}, {b}"),
             Op::FAdd { a, b, .. } => write!(f, "FAdd  {a}, {b}"),
             Op::FFma { a, b, c, .. } => write!(f, "FFma  {a}, {b}, {c}"),
+            Op::DpdxFine { src } => write!(f, "DPdxFine {src}"),
+            Op::DpdyFine { src } => write!(f, "DPdyFine {src}"),
+            Op::YDirection => write!(f, "YDirection"),
             Op::HAdd { a, b, .. } => write!(f, "HAdd  {a}, {b}"),
             Op::HMul { a, b, .. } => write!(f, "HMul  {a}, {b}"),
             Op::HFma { a, b, c, .. } => write!(f, "HFma  {a}, {b}, {c}"),
@@ -736,14 +986,30 @@ impl Inst {
                 binding,
                 byte_offset,
                 index,
+                address_mode,
             } => {
-                write!(f, "LdCbufIdx c[{binding:#x}]:{byte_offset:#x}+{index}")
+                match address_mode {
+                    CbufAddressMode::Default => {
+                        write!(f, "LdCbufIdx c[{binding:#x}]:{byte_offset:#x}+{index}")
+                    }
+                    CbufAddressMode::Segmented => write!(
+                        f,
+                        "LdCbufIS c[{binding:#x}+(({index}+{byte_offset:#x})>>16)]:(({index}+{byte_offset:#x})&0xffff)"
+                    ),
+                }
             }
             Op::LoadGlobal { addr_lo, offset } => {
                 write!(f, "LdGbl [{addr_lo}+{offset:#x}]")
             }
             Op::LoadLocal { addr } => write!(f, "LdLcl [{addr}]"),
             Op::StoreLocal { addr, value } => write!(f, "StLcl [{addr}], {value}"),
+            Op::LoadShared { addr } => write!(f, "LdShared [{addr}]"),
+            Op::StoreShared { addr, value } => write!(f, "StShared [{addr}], {value}"),
+            Op::SharedAtomic { addr, value, op } => {
+                write!(f, "SharedAtomic.{op:?} [{addr}], {value}")
+            }
+            Op::WorkgroupBarrier => write!(f, "Barrier.Workgroup"),
+            Op::MemoryBarrier { scope } => write!(f, "MemoryBarrier.{scope:?}"),
             Op::LoadStorage {
                 buffer_index,
                 addr_lo,
@@ -776,22 +1042,204 @@ impl Inst {
                 v,
                 array,
                 volume,
+                cube,
+                implicit_lod,
+                lod_bias,
+                explicit_lod,
+                texel_offset,
+                dref,
                 component,
             } => {
-                let coords = if let Some(w) = volume {
+                let coords = if let Some(w) = cube {
+                    if let Some(array) = array {
+                        format!("({u}, {v}, {w}, {array})cube[]")
+                    } else {
+                        format!("({u}, {v}, {w})cube")
+                    }
+                } else if let Some(w) = volume {
                     format!("({u}, {v}, {w})3d")
                 } else if let Some(array) = array {
                     format!("({u}, {v}, {array})")
                 } else {
                     format!("({u}, {v})")
                 };
+                let offset = texel_offset
+                    .map(|(x, y)| format!(".offset({x}, {y})"))
+                    .unwrap_or_default();
+                write!(f, "TexSamp")?;
+                if *implicit_lod {
+                    write!(f, ".implicit")?;
+                    if let Some(bias) = lod_bias {
+                        write!(f, ".bias({bias})")?;
+                    }
+                } else if let Some(lod) = explicit_lod {
+                    write!(f, ".lod({lod})")?;
+                } else {
+                    write!(f, ".lod0")?;
+                }
+                if let Some(dref) = dref {
+                    write!(f, ".dref({dref})")?;
+                }
                 write!(
                     f,
-                    "TexSamp t[{tex_id:#x}], {coords}.{}",
+                    "{offset} t[{tex_id:#x}], {coords}.{}",
                     ["r", "g", "b", "a"]
                         .get(*component as usize)
                         .copied()
                         .unwrap_or("?")
+                )
+            }
+            Op::SampleTexHandle {
+                handle,
+                dimension,
+                u,
+                v,
+                w,
+                implicit_lod,
+                lod_bias,
+                explicit_lod,
+                texel_offset,
+                dref,
+                component,
+            } => {
+                let coords = match (v, w) {
+                    (None, None) => format!("({u})"),
+                    (Some(v), None) => format!("({u}, {v})"),
+                    (Some(v), Some(w)) => format!("({u}, {v}, {w})"),
+                    (None, Some(w)) => format!("({u}, ?, {w})"),
+                };
+                write!(f, "TexSampHandle")?;
+                if *implicit_lod {
+                    write!(f, ".implicit")?;
+                    if let Some(bias) = lod_bias {
+                        write!(f, ".bias({bias})")?;
+                    }
+                } else if let Some(lod) = explicit_lod {
+                    write!(f, ".lod({lod})")?;
+                } else {
+                    write!(f, ".lod0")?;
+                }
+                if let Some((x, y)) = texel_offset {
+                    write!(f, ".offset({x}, {y})")?;
+                }
+                if let Some(reference) = dref {
+                    write!(f, ".dref({reference})")?;
+                }
+                write!(
+                    f,
+                    " {handle}, {coords}{dimension}.{}",
+                    ["r", "g", "b", "a"]
+                        .get(*component as usize)
+                        .copied()
+                        .unwrap_or("?")
+                )
+            }
+            Op::TexelFetch {
+                cbuf_binding,
+                cbuf_word_offset,
+                cbuf_secondary_word_offset,
+                x,
+                y,
+                z,
+                component,
+            } => {
+                let coords = match (y, z) {
+                    (None, None) => format!("({x})1d"),
+                    (Some(y), None) => format!("({x}, {y})2d"),
+                    (Some(y), Some(z)) => format!("({x}, {y}, {z})3d"),
+                    (None, Some(z)) => format!("({x}, ?, {z})invalid"),
+                };
+                let handle = if let Some(secondary) = cbuf_secondary_word_offset {
+                    format!(
+                        "c[{cbuf_binding}][{:#x}]|c[{cbuf_binding}][{:#x}]",
+                        cbuf_word_offset * 4,
+                        secondary * 4,
+                    )
+                } else {
+                    format!("c[{cbuf_binding}][{:#x}]", cbuf_word_offset * 4)
+                };
+                write!(
+                    f,
+                    "TexelFetch {handle}, {coords}.{}",
+                    ["r", "g", "b", "a"]
+                        .get(*component as usize)
+                        .copied()
+                        .unwrap_or("?")
+                )
+            }
+            Op::TexelFetchHandle {
+                handle,
+                dimension,
+                x,
+                y,
+                z,
+                component,
+            } => {
+                let coords = match (y, z) {
+                    (None, None) => format!("({x})"),
+                    (Some(y), None) => format!("({x}, {y})"),
+                    (Some(y), Some(z)) => format!("({x}, {y}, {z})"),
+                    (None, Some(z)) => format!("({x}, ?, {z})"),
+                };
+                write!(
+                    f,
+                    "TexelFetch {handle}, {coords}{dimension}.{}",
+                    ["r", "g", "b", "a"]
+                        .get(*component as usize)
+                        .copied()
+                        .unwrap_or("?")
+                )
+            }
+            Op::TextureQueryDimension {
+                handle,
+                lod,
+                component,
+            } => write!(f, "TexQueryDim {handle}, lod={lod}[{component}]"),
+            Op::LocalInvocationId { component } => {
+                write!(f, "LocalInvocationId[{component}]")
+            }
+            Op::WorkgroupId { component } => write!(f, "WorkgroupId[{component}]"),
+            Op::SubgroupLaneId => write!(f, "SubgroupLaneId"),
+            Op::SubgroupMask { kind } => write!(f, "SubgroupMask.{kind:?}"),
+            Op::ImageWrite {
+                handle,
+                dimension,
+                x,
+                y,
+                z,
+                values,
+            } => {
+                let coords = match (y, z) {
+                    (None, None) => format!("({x})"),
+                    (Some(y), None) => format!("({x}, {y})"),
+                    (Some(y), Some(z)) => format!("({x}, {y}, {z})"),
+                    (None, Some(z)) => format!("({x}, ?, {z})"),
+                };
+                write!(
+                    f,
+                    "ImageWrite {handle}, {coords}{dimension}, ({}, {}, {}, {})",
+                    values[0], values[1], values[2], values[3]
+                )
+            }
+            Op::ImageAtomic {
+                handle,
+                dimension,
+                x,
+                y,
+                z,
+                value,
+                op,
+                data_type,
+            } => {
+                let coords = match (y, z) {
+                    (None, None) => format!("({x})"),
+                    (Some(y), None) => format!("({x}, {y})"),
+                    (Some(y), Some(z)) => format!("({x}, {y}, {z})"),
+                    (None, Some(z)) => format!("({x}, ?, {z})"),
+                };
+                write!(
+                    f,
+                    "ImageAtomic.{op:?}.{data_type:?} {handle}, {coords}{dimension}, {value}"
                 )
             }
             Op::GatherTex {
@@ -895,6 +1343,9 @@ impl Inst {
             } => write!(f, "IMnMx {a}, {b} signed={signed} P{pred}"),
             Op::IScAdd { a, b, shift, .. } => write!(f, "IScAdd {a}, {b} << {shift}"),
             Op::ILop { a, b, op, .. } => write!(f, "ILop.{op:?} {a}, {b}"),
+            Op::ILop3 { a, b, c, lut } => write!(f, "ILop3.{lut:#04x} {a}, {b}, {c}"),
+            Op::FindUMsb { value } => write!(f, "FindUMsb {value}"),
+            Op::BitCount { value } => write!(f, "BitCount {value}"),
             Op::IShl { a, b } => write!(f, "IShl  {a}, {b}"),
             Op::IShr { a, b, signed } => write!(f, "IShr  {a}, {b} signed={signed}"),
             Op::F2I { src, signed, round } => {
@@ -912,9 +1363,17 @@ impl Inst {
                 mask,
                 mode,
                 pred_dest,
+            } => write!(f, "Shfl.{mode} {value}, {index}, {mask} -> p{pred_dest}"),
+            Op::SubgroupVote {
+                source_pred,
+                mode,
+                pred_dest,
+                ..
             } => write!(
                 f,
-                "Shfl.{mode} {value}, {index}, {mask} -> p{pred_dest}"
+                "Vote.{mode:?} P{}{} -> p{pred_dest}",
+                if source_pred.negate { "!" } else { "" },
+                source_pred.idx
             ),
             Op::FSwzAdd { a, b, swizzle } => write!(f, "FSwzAdd {a}, {b} sw={swizzle:#x}"),
             Op::ISet { cmp, a, b, .. } => write!(f, "ISet.{cmp:?} {a}, {b}"),

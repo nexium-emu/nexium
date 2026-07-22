@@ -137,6 +137,14 @@ pub struct LdcRef {
     pub byte_offset: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LdcMode {
+    Default,
+    Il,
+    Is,
+    Isl,
+}
+
 #[inline]
 pub fn ldc_ref(insn: u64) -> LdcRef {
     let raw_off = bits(insn, 20, 35) as u32;
@@ -150,6 +158,16 @@ pub fn ldc_ref(insn: u64) -> LdcRef {
     LdcRef {
         binding,
         byte_offset,
+    }
+}
+
+#[inline]
+pub fn ldc_mode(insn: u64) -> LdcMode {
+    match bits(insn, 44, 45) {
+        0 => LdcMode::Default,
+        1 => LdcMode::Il,
+        2 => LdcMode::Is,
+        _ => LdcMode::Isl,
     }
 }
 
