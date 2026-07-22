@@ -1104,27 +1104,6 @@ pub(crate) fn register_video_tic_cpu_target(cpu_va: u64, size: u64) {
     }
 }
 
-pub(crate) fn video_tic_cpu_target_match(
-    mappings: &GpuMappings,
-    gpu_va: u64,
-    size: u64,
-) -> Option<(u64, u64, u32)> {
-    let mapping = mappings
-        .iter()
-        .filter(|mapping| {
-            gpu_va >= mapping.gpu_va && gpu_va < mapping.gpu_va.saturating_add(mapping.size)
-        })
-        .last()?;
-    let offset = gpu_va - mapping.gpu_va;
-    let cpu_va = mapping.cpu_addr.saturating_add(offset);
-    let end = cpu_va.saturating_add(size.min(mapping.size.saturating_sub(offset)));
-    let targets = video_tic_cpu_targets().lock().ok()?;
-    let (target, _) = targets.iter().copied().find(|(target, target_size)| {
-        cpu_va < target.saturating_add(*target_size) && *target < end
-    })?;
-    Some((target, cpu_va, mapping.nvmap_id))
-}
-
 fn trace_tic_cpu_targets(
     mappings: &GpuMappings,
     call: &Maxwell3dDrawCall,

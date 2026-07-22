@@ -141,7 +141,7 @@ fn find_import_slots(m: &Module, needle: &str) -> Vec<(u64, String)> {
     if img.len() < 8 {
         return out;
     }
-    let mut mod0 = u32at(img, 4) as usize;
+    let mod0 = u32at(img, 4) as usize;
     if mod0 + 4 > img.len() || u32at(img, mod0) != MOD0_MAGIC {
         return out;
     }
