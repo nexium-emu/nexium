@@ -6,6 +6,26 @@ pub trait HostPcmSink: Send + Sync {
 
     fn samples_consumed(&self) -> u64;
 
+    fn open_audio_out_stream(&self, _stream_id: u64) -> bool {
+        false
+    }
+
+    fn close_audio_out_stream(&self, _stream_id: u64) {}
+
+    fn start_audio_out_stream(&self, _stream_id: u64) {}
+
+    fn stop_audio_out_stream(&self, _stream_id: u64) {}
+
+    fn push_audio_out_stereo_f32(&self, _stream_id: u64, _samples: &[f32]) -> usize {
+        0
+    }
+
+    fn audio_out_samples_consumed(&self, _stream_id: u64) -> u64 {
+        0
+    }
+
+    fn set_audio_out_volume(&self, _stream_id: u64, _volume: f32) {}
+
     fn sample_rate(&self) -> u32 {
         48_000
     }

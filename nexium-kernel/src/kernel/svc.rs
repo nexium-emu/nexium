@@ -4,9 +4,12 @@ use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
 use crate::kernel::AudioRendererState;
 use nexium_common::result::{
-    KERNEL_INVALID_ADDRESS, KERNEL_INVALID_HANDLE, KERNEL_NOT_IMPLEMENTED, KERNEL_TIMEOUT, SUCCESS,
+    KERNEL_CANCELLED, KERNEL_INVALID_ADDRESS, KERNEL_INVALID_HANDLE, KERNEL_NOT_IMPLEMENTED,
+    KERNEL_TIMEOUT, SUCCESS,
 };
 use nexium_ipc as ipc;
+
+const KERNEL_EVENT_INVALID_STATE: u32 = 1 | (125 << 9);
 
 fn svc_trace_capture() -> Option<(u64, u64, u64, u64, u64, u64, u64)> {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -132,6 +135,7 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
         0x7c => svc_create_resource_limit(kernel),
         0x7d => svc_set_resource_limit_limit_value(kernel),
         0x7e => svc_call_secure_monitor(kernel),
+        0x7f => svc_guest_probe(kernel),
         _ => {
             log::warn!("unknown SVC: {:#04x}", imm);
             if let Some(cpu) = cpu_mut() {
@@ -157,6 +161,99 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
     __svc_res
 }
 
+pub fn guest_probe_actions() -> &'static std::collections::HashMap<u64, (String, u64)> {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<std::collections::HashMap<u64, (String, u64)>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = std::collections::HashMap::new();
+        if let Ok(spec) = std::env::var("NEXIUM_GUEST_PROBE_SVC") {
+            for item in spec.split(',') {
+                let parts: Vec<&str> = item.trim().split(':').collect();
+                if parts.len() != 3 {
+                    continue;
+                }
+                let pc = u64::from_str_radix(parts[0].trim_start_matches("0x"), 16);
+                let arg = u64::from_str_radix(parts[2].trim_start_matches("0x"), 16);
+                if let (Ok(pc), Ok(arg)) = (pc, arg) {
+                    map.insert(pc, (parts[1].to_string(), arg));
+                }
+            }
+        }
+        map
+    })
+}
+
+fn svc_guest_probe(kernel: &mut Kernel) -> u32 {
+    let Some(cpu) = cpu_mut() else {
+        return 0;
+    };
+    let pc_now = cpu.get_pc();
+    let probe_pc = if guest_probe_actions().contains_key(&pc_now.wrapping_sub(4)) {
+        pc_now.wrapping_sub(4)
+    } else {
+        pc_now
+    };
+    let Some((kind, arg)) = guest_probe_actions().get(&probe_pc) else {
+        log::warn!("[guest-probe] svc 0x7f at pc={:#x} with no action", pc_now);
+        return 0;
+    };
+    let lr = cpu.get_register(30);
+    let sp = cpu.get_sp();
+    let x0 = cpu.get_register(0);
+    let x1 = cpu.get_register(1);
+    let x2 = cpu.get_register(2);
+    let x3 = cpu.get_register(3);
+    log::warn!(
+        "[guest-probe] hit pc={:#x} kind={} arg={:#x} lr={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} sp={:#x} thread={:?}",
+        probe_pc,
+        kind,
+        arg,
+        lr,
+        x0,
+        x1,
+        x2,
+        x3,
+        sp,
+        kernel.threads.current_handle()
+    );
+    if std::env::var_os("NEXIUM_GUEST_PROBE_DUMP").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DUMPS: AtomicU64 = AtomicU64::new(0);
+        let sequence = DUMPS.fetch_add(1, Ordering::Relaxed);
+        if sequence < 8 {
+            for (name, address) in [("x1", x1), ("x3", x3)] {
+                let mut bytes = [0u8; 64];
+                if address != 0 && kernel.address_space.read(address, &mut bytes).is_ok() {
+                    log::warn!(
+                        "[guest-probe-dump] #{} {}={:#x} bytes={:02x?}",
+                        sequence,
+                        name,
+                        address,
+                        bytes
+                    );
+                }
+            }
+        }
+    }
+    match kind.as_str() {
+        "subsp" => {
+            cpu.set_sp(sp.wrapping_sub(*arg));
+        }
+        "stpfp" => {
+            let nsp = sp.wrapping_sub(*arg);
+            let mut buf = [0u8; 16];
+            buf[..8].copy_from_slice(&cpu.get_register(29).to_le_bytes());
+            buf[8..].copy_from_slice(&lr.to_le_bytes());
+            let _ = kernel.address_space.write(nsp, &buf);
+            cpu.set_sp(nsp);
+        }
+        other => {
+            log::warn!("[guest-probe] unknown action kind {}", other);
+        }
+    }
+    0
+}
+
 fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
     let size = if let Some(cpu) = cpu_ref() {
         cpu.get_register(1)
@@ -170,7 +267,24 @@ fn svc_set_heap_size(kernel: &mut Kernel) -> u32 {
             kernel.heap_size
         );
     }
-    kernel.heap_committed = size.min(kernel.heap_size);
+    let committed = size.min(kernel.heap_size);
+    if let Err(error) = kernel
+        .address_space
+        .resize_committed(kernel.heap_base, committed)
+    {
+        const KERNEL_OUT_OF_MEMORY: u32 = 1 | (104 << 9);
+        log::error!(
+            "svcSetHeapSize failed to resize heap @ {:#x} to {:#x}: {}",
+            kernel.heap_base,
+            committed,
+            error
+        );
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(0, KERNEL_OUT_OF_MEMORY as u64);
+        }
+        return KERNEL_OUT_OF_MEMORY;
+    }
+    kernel.heap_committed = committed;
     log::debug!(
         "svcSetHeapSize size={:#x} -> heap_base={:#x} (heap mapped {:#x})",
         size,
@@ -425,8 +539,85 @@ fn svc_exit_process(kernel: &mut Kernel) -> u32 {
         x0,
         lr
     );
+    if exit_trace_enabled() {
+        trace_process_exit(kernel);
+    }
     kernel.process_exited = true;
     SUCCESS
+}
+
+fn exit_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_EXIT_TRACE")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    })
+}
+
+fn trace_process_exit(kernel: &Kernel) {
+    let Some(cpu) = cpu_ref() else {
+        return;
+    };
+
+    let pc = cpu.get_pc();
+    let lr = cpu.get_register(30);
+    let sp = cpu.get_sp();
+    let fp = cpu.get_register(29);
+    log::warn!(
+        "[exit-trace] pc={:#x} lr={:#x} sp={:#x} fp={:#x} code={:#x}..{:#x}",
+        pc,
+        lr,
+        sp,
+        fp,
+        kernel.code_base,
+        kernel.code_base.saturating_add(kernel.code_size)
+    );
+
+    let mut cur_fp = fp;
+    for depth in 0..24 {
+        if cur_fp == 0 || cur_fp & 7 != 0 {
+            break;
+        }
+        let mut frame = [0u8; 16];
+        if kernel.address_space.read(cur_fp, &mut frame).is_err() {
+            break;
+        }
+        let next_fp = u64::from_le_bytes(frame[0..8].try_into().unwrap());
+        let saved_lr = u64::from_le_bytes(frame[8..16].try_into().unwrap());
+        log::warn!(
+            "[exit-trace] frame={} fp={:#x} next_fp={:#x} lr={:#x} code_off={:#x}",
+            depth,
+            cur_fp,
+            next_fp,
+            saved_lr,
+            saved_lr.wrapping_sub(kernel.code_base)
+        );
+        if next_fp <= cur_fp || next_fp.saturating_sub(cur_fp) > 0x10_0000 {
+            break;
+        }
+        cur_fp = next_fp;
+    }
+
+    let mut stack = [0u8; 0x800];
+    if kernel.address_space.read(sp, &mut stack).is_err() {
+        return;
+    }
+    let code_end = kernel.code_base.saturating_add(kernel.code_size);
+    for (slot, bytes) in stack.chunks_exact(8).enumerate() {
+        let value = u64::from_le_bytes(bytes.try_into().unwrap());
+        if value >= kernel.code_base && value < code_end {
+            log::warn!(
+                "[exit-trace] stack+{:#x}={:#x} code_off={:#x}",
+                slot * 8,
+                value,
+                value - kernel.code_base
+            );
+        }
+    }
 }
 
 fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
@@ -636,6 +827,85 @@ fn completed_thread_wait_index(kernel: &Kernel, handles: &[u32]) -> Option<usize
     })
 }
 
+fn ready_event_wait_index(
+    handles: &[u32],
+    applet_message_event: Option<u32>,
+    applet_messages_pending: bool,
+    event_signals: &std::collections::HashMap<u32, bool>,
+) -> Option<usize> {
+    handles.iter().position(|handle| {
+        (Some(*handle) == applet_message_event && applet_messages_pending)
+            || event_signals.get(handle).copied().unwrap_or(false)
+    })
+}
+
+fn reset_event_signal(
+    event_signals: &mut std::collections::HashMap<u32, bool>,
+    is_event: bool,
+    handle: u32,
+) -> u32 {
+    if !is_event {
+        return KERNEL_INVALID_HANDLE;
+    }
+    let Some(signaled) = event_signals.get_mut(&handle) else {
+        return KERNEL_EVENT_INVALID_STATE;
+    };
+    if !*signaled {
+        return KERNEL_EVENT_INVALID_STATE;
+    }
+    *signaled = false;
+    SUCCESS
+}
+
+#[cfg(test)]
+mod event_wait_tests {
+    use super::ready_event_wait_index;
+    use super::{reset_event_signal, KERNEL_EVENT_INVALID_STATE, KERNEL_INVALID_HANDLE, SUCCESS};
+    use std::collections::HashMap;
+
+    #[test]
+    fn readable_event_wait_does_not_consume_signal() {
+        let signals = HashMap::from([(0x123, true)]);
+        assert_eq!(
+            ready_event_wait_index(&[0x122, 0x123], None, false, &signals),
+            Some(1)
+        );
+        assert_eq!(signals.get(&0x123), Some(&true));
+        assert_eq!(
+            ready_event_wait_index(&[0x123], None, false, &signals),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn applet_message_event_keeps_handle_ordering() {
+        let signals = HashMap::from([(0x125, true)]);
+        assert_eq!(
+            ready_event_wait_index(&[0x124, 0x125], Some(0x124), true, &signals),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn reset_signal_requires_a_pending_event() {
+        let mut signals = HashMap::from([(0x123, true), (0x124, false)]);
+        assert_eq!(reset_event_signal(&mut signals, true, 0x123), SUCCESS);
+        assert_eq!(signals.get(&0x123), Some(&false));
+        assert_eq!(
+            reset_event_signal(&mut signals, true, 0x123),
+            KERNEL_EVENT_INVALID_STATE
+        );
+        assert_eq!(
+            reset_event_signal(&mut signals, true, 0x124),
+            KERNEL_EVENT_INVALID_STATE
+        );
+        assert_eq!(
+            reset_event_signal(&mut signals, false, 0x123),
+            KERNEL_INVALID_HANDLE
+        );
+    }
+}
+
 fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
     let (handles_addr, count, timeout_ns) = if let Some(cpu) = cpu_ref() {
         (
@@ -686,26 +956,17 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
             kernel.applet_messages.len(),
             vsync_idx
         );
-        for (i, h) in handles.iter().enumerate() {
-            if let Some(msg_evt) = kernel.applet_message_event {
-                if *h == msg_evt && !kernel.applet_messages.is_empty() {
-                    if let Some(cpu) = cpu_mut() {
-                        cpu.set_register(0, SUCCESS as u64);
-                        cpu.set_register(1, i as u64);
-                    }
-                    return SUCCESS;
-                }
+        if let Some(i) = ready_event_wait_index(
+            &handles,
+            kernel.applet_message_event,
+            !kernel.applet_messages.is_empty(),
+            &kernel.event_signals,
+        ) {
+            if let Some(cpu) = cpu_mut() {
+                cpu.set_register(0, SUCCESS as u64);
+                cpu.set_register(1, i as u64);
             }
-            if let Some(slot) = kernel.event_signals.get_mut(h) {
-                if *slot {
-                    *slot = false;
-                    if let Some(cpu) = cpu_mut() {
-                        cpu.set_register(0, SUCCESS as u64);
-                        cpu.set_register(1, i as u64);
-                    }
-                    return SUCCESS;
-                }
-            }
+            return SUCCESS;
         }
 
         {
@@ -784,25 +1045,26 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         return SUCCESS;
     }
 
-    for (i, h) in handles.iter().enumerate() {
-        if let Some(msg_evt) = kernel.applet_message_event {
-            if *h == msg_evt && !kernel.applet_messages.is_empty() {
-                if let Some(cpu) = cpu_mut() {
-                    cpu.set_register(0, SUCCESS as u64);
-                    cpu.set_register(1, i as u64);
-                }
-                return SUCCESS;
-            }
+    if let Some(i) = ready_event_wait_index(
+        &handles,
+        kernel.applet_message_event,
+        !kernel.applet_messages.is_empty(),
+        &kernel.event_signals,
+    ) {
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(0, SUCCESS as u64);
+            cpu.set_register(1, i as u64);
         }
-        if let Some(slot) = kernel.event_signals.get_mut(h) {
-            if *slot {
-                *slot = false;
-                if let Some(cpu) = cpu_mut() {
-                    cpu.set_register(0, SUCCESS as u64);
-                    cpu.set_register(1, i as u64);
-                }
-                return SUCCESS;
+        return SUCCESS;
+    }
+
+    if let Some(handle) = kernel.threads.current_handle() {
+        if kernel.threads.take_wait_cancelled(handle) {
+            if let Some(cpu) = cpu_mut() {
+                cpu.set_register(0, KERNEL_CANCELLED as u64);
+                cpu.set_register(1, 0);
             }
+            return KERNEL_CANCELLED;
         }
     }
 
@@ -842,9 +1104,40 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_cancel_synchronization(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcCancelSynchronization");
-    SUCCESS
+fn svc_cancel_synchronization(kernel: &mut Kernel) -> u32 {
+    let handle = if let Some(cpu) = cpu_ref() {
+        cpu.get_register(0) as u32
+    } else {
+        return KERNEL_INVALID_HANDLE;
+    };
+    let is_thread = matches!(
+        kernel.handles.get_handle(handle),
+        Some(entry) if entry.handle_type == HandleType::Thread
+    );
+    let action = if is_thread {
+        kernel.threads.cancel_synchronization(handle)
+    } else {
+        None
+    };
+    let result = if is_thread {
+        SUCCESS
+    } else {
+        KERNEL_INVALID_HANDLE
+    };
+    log::debug!(
+        "svcCancelSynchronization handle={:#x} action={} result={:#x}",
+        handle,
+        match action {
+            Some(true) => "woke",
+            Some(false) => "pending",
+            None => "missing",
+        },
+        result
+    );
+    if let Some(cpu) = cpu_mut() {
+        cpu.set_register(0, result as u64);
+    }
+    result
 }
 
 fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
@@ -930,9 +1223,7 @@ fn release_mutex_word(kernel: &mut Kernel, mutex_addr: u64, caller: u32) -> (u32
         };
         let holder = cur & !MUTEX_HAS_LISTENERS;
         if holder != 0 && holder != caller {
-            if kernel.threads.has_mutex_waiters(mutex_addr)
-                && cur & MUTEX_HAS_LISTENERS == 0
-            {
+            if kernel.threads.has_mutex_waiters(mutex_addr) && cur & MUTEX_HAS_LISTENERS == 0 {
                 match kernel.address_space.atomic_cas_u32(
                     mutex_addr,
                     cur,
@@ -956,7 +1247,10 @@ fn release_mutex_word(kernel: &mut Kernel, mutex_addr: u64, caller: u32) -> (u32
             }
             None => 0,
         };
-        match kernel.address_space.atomic_cas_u32(mutex_addr, cur, new_word) {
+        match kernel
+            .address_space
+            .atomic_cas_u32(mutex_addr, cur, new_word)
+        {
             Ok(true) => {
                 if let Some((h, _, _)) = peek {
                     kernel.threads.commit_wake_mutex_waiter(mutex_addr, h);
@@ -991,6 +1285,43 @@ fn svc_arbitrate_unlock(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+fn condvar_trace_enabled(condvar_addr: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_CONDVAR_TRACE")
+            .ok()
+            .map(|value| value.parse::<u64>().unwrap_or(20_000))
+            .unwrap_or(0)
+    });
+    if limit == 0 {
+        return false;
+    }
+
+    static FILTERS: OnceLock<Vec<u64>> = OnceLock::new();
+    let filters = FILTERS.get_or_init(|| {
+        std::env::var("NEXIUM_CONDVAR_TRACE_FILTER")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter_map(|part| {
+                        u64::from_str_radix(part.trim().trim_start_matches("0x"), 16).ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if !filters.is_empty() && !filters.contains(&condvar_addr) {
+        return false;
+    }
+
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    COUNT.fetch_add(1, Ordering::Relaxed) < limit
+}
+
 fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
     let (mutex_addr, condvar_addr, self_handle, timeout_ns) = if let Some(cpu) = cpu_ref() {
         (
@@ -1017,6 +1348,20 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
         .address_space
         .write(condvar_addr, &1u32.to_le_bytes());
     let (prev_word, new_word, handed) = release_mutex_word(kernel, mutex_addr, owner_handle);
+    if condvar_trace_enabled(condvar_addr) {
+        log::warn!(
+            "[condvar-trace] wait current={:#x} self={:#x} mutex={:#x} cond={:#x} word={:#x}->{:#x} handed={:#x} timeout={} lr={:#x}",
+            owner_handle,
+            self_handle,
+            mutex_addr,
+            condvar_addr,
+            prev_word,
+            new_word,
+            handed,
+            timeout_ns,
+            lr
+        );
+    }
     log::debug!(
         "cond_wait: self={:#x} mutex={:#x} cond={:#x} word {:#x}->{:#x} handed={:#x} timeout={}",
         self_handle,
@@ -1030,48 +1375,6 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
 
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
-    }
-
-    let had_pending = if let Some(n) = kernel.pending_condvar_signals.get_mut(&condvar_addr) {
-        *n = n.saturating_sub(1);
-        let remove = *n == 0;
-        if remove {
-            kernel.pending_condvar_signals.remove(&condvar_addr);
-        }
-        true
-    } else {
-        false
-    };
-    if had_pending {
-        log::debug!(
-            "cond_wait pending-consume: self={:#x} mutex={:#x} cond={:#x}",
-            self_handle,
-            mutex_addr,
-            condvar_addr
-        );
-        if kernel.reacquire_condvar_mutex(self_handle, mutex_addr, self_handle) {
-            if let Some(cpu) = cpu_mut() {
-                cpu.set_register(0, SUCCESS as u64);
-            }
-        } else if let Some(cpu) = cpu_ref() {
-            let owner_handle = {
-                let mut cur = [0u8; 4];
-                if kernel.address_space.read(mutex_addr, &mut cur).is_ok() {
-                    u32::from_le_bytes(cur) & !MUTEX_HAS_LISTENERS
-                } else {
-                    0
-                }
-            };
-            kernel.threads.yield_with_state(
-                cpu,
-                crate::kernel::threads::ThreadState::WaitingMutex {
-                    mutex_addr,
-                    owner_handle,
-                    tag: self_handle,
-                },
-            );
-        }
-        return SUCCESS;
     }
 
     if timeout_ns == 0 {
@@ -1180,18 +1483,23 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
         }
         woken += 1;
     }
-    if woken == 0 && count != 0 {
-        let pending = if count < 0 { 32 } else { count as u32 };
-        let entry = kernel
-            .pending_condvar_signals
-            .entry(condvar_addr)
-            .or_insert(0);
-        *entry = entry.saturating_add(pending);
-    }
     if !kernel.threads.has_condvar_waiters(condvar_addr) {
         let _ = kernel
             .address_space
             .write(condvar_addr, &0u32.to_le_bytes());
+    }
+    if condvar_trace_enabled(condvar_addr) {
+        let current = kernel.threads.current_handle().unwrap_or(0);
+        let lr = cpu_ref().map(|cpu| cpu.get_register(30)).unwrap_or(0);
+        log::warn!(
+            "[condvar-trace] signal current={:#x} cond={:#x} count={} woken={} remaining={} lr={:#x}",
+            current,
+            condvar_addr,
+            count,
+            woken,
+            kernel.threads.has_condvar_waiters(condvar_addr),
+            lr
+        );
     }
     log::trace!(
         "svcSignalProcessWideKey cond={:#x} count={} woken={}",
@@ -1307,6 +1615,29 @@ fn domain_object_keys(kernel: &Kernel, session_handle: u32, object_id: u32) -> V
     keys
 }
 
+fn release_hwopus_session_state(kernel: &mut Kernel, session_handle: u32) {
+    kernel.services.hwopus.close(session_handle);
+    let Some(session) = kernel.sessions.get(&session_handle) else {
+        return;
+    };
+    if !session.is_domain {
+        kernel
+            .hwopus_decoders
+            .retain(|(handle, _), _| *handle != session_handle);
+        return;
+    }
+
+    let group = session.domain_group;
+    let has_sibling = kernel.sessions.iter().any(|(&handle, candidate)| {
+        handle != session_handle && candidate.is_domain && candidate.domain_group == group
+    });
+    if !has_sibling {
+        kernel
+            .hwopus_decoders
+            .retain(|(handle, _), _| *handle != group);
+    }
+}
+
 fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
     let (tls_addr, session_handle) = if let Some(cpu) = cpu_ref() {
         let x0 = cpu.get_register(0) as u32;
@@ -1346,6 +1677,13 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
                 session_handle,
                 port_name
             );
+            release_hwopus_session_state(kernel, session_handle);
+            if port_name == "IAudioOut" {
+                crate::services::audio_out::handlers::close_audio_out_session(
+                    kernel,
+                    session_handle,
+                );
+            }
             kernel.sessions.remove(&session_handle);
             if let Some(cpu) = cpu_mut() {
                 cpu.set_register(0, SUCCESS as u64);
@@ -1396,7 +1734,9 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
 
     let dispatch_target = if let Some(d) = ctx.domain {
         if d.kind == 2 {
+            let group = domain_group(kernel, session_handle);
             let domain_handles = close_domain_object(kernel, session_handle, d.object_id);
+            kernel.hwopus_decoders.remove(&(group, d.object_id));
             for handle in domain_handles {
                 kernel.open_files.remove(&(handle, d.object_id));
                 kernel.file_system_roots.remove(&(handle, d.object_id));
@@ -1405,6 +1745,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
                 kernel.open_romfs_file_paths.remove(&(handle, d.object_id));
                 kernel.open_file_handles.remove(&(handle, d.object_id));
                 kernel.open_dir_lists.remove(&(handle, d.object_id));
+                kernel.hwopus_decoders.remove(&(handle, d.object_id));
             }
             log::debug!(
                 "domain Close-object session={:#x} object_id={}",
@@ -1967,6 +2308,46 @@ fn dispatch_service_v2(
         return handle_binder_transact(kernel, ctx, session_handle);
     }
 
+    if port_name == "csrng" && cmd_id == 0 {
+        let target = ctx
+            .recv_buffers
+            .iter()
+            .chain(ctx.recv_statics.iter())
+            .find(|b| b.size > 0 && b.addr != 0)
+            .copied();
+        if let Some(buf) = target {
+            let size = match usize::try_from(buf.size) {
+                Ok(size) => size,
+                Err(_) => {
+                    log::error!("csrng: receive buffer too large: {:#x}", buf.size);
+                    return build_ipc_response(ctx, 0xD401, &[], &[]);
+                }
+            };
+            let mut bytes = vec![0u8; size];
+            if let Err(err) = getrandom::fill(&mut bytes) {
+                log::error!("csrng: OS random source failed: {}", err);
+                return build_ipc_response(ctx, 0xD401, &[], &[]);
+            }
+            if let Err(err) = kernel.address_space.write(buf.addr, &bytes) {
+                log::error!(
+                    "csrng: failed to write {} bytes at {:#x}: {:?}",
+                    size,
+                    buf.addr,
+                    err
+                );
+                return build_ipc_response(ctx, 0xD401, &[], &[]);
+            }
+            log::debug!(
+                "csrng.GenerateRandomBytes size={} addr={:#x}",
+                size,
+                buf.addr
+            );
+        } else {
+            log::warn!("csrng.GenerateRandomBytes: no receive buffer");
+        }
+        return build_ipc_response(ctx, 0, &[], &[]);
+    }
+
     if port_name == "IStorageAccessor"
         && cmd_id == 10
         && crate::services::am::pending_applet_id() == crate::services::am::APPLET_ID_CONTROLLER
@@ -2031,8 +2412,12 @@ fn dispatch_service_v2(
     if port_name == "ILibraryAppletCreator" && cmd_id == 0 {
         let off = ctx.cmif_in_data_off;
         if off + 4 <= ctx.buf.len() {
-            let applet_id =
-                u32::from_le_bytes([ctx.buf[off], ctx.buf[off + 1], ctx.buf[off + 2], ctx.buf[off + 3]]);
+            let applet_id = u32::from_le_bytes([
+                ctx.buf[off],
+                ctx.buf[off + 1],
+                ctx.buf[off + 2],
+                ctx.buf[off + 3],
+            ]);
             let applet_mode = if off + 8 <= ctx.buf.len() {
                 u32::from_le_bytes([
                     ctx.buf[off + 4],
@@ -2062,10 +2447,11 @@ fn dispatch_service_v2(
         return return_subsession(kernel, ctx, session_handle, sub_service);
     }
 
-    if port_name == "fsp-srv" && cmd_id == 51 {
+    if port_name == "fsp-srv" && matches!(cmd_id, 51 | 52 | 53) {
         if let Some(root) = fs_save_data_root(kernel, ctx) {
             log::debug!(
-                "fsp-srv.OpenSaveDataFileSystem title_id={:#018x} root={}",
+                "fsp-srv.OpenSaveDataFileSystem cmd={} title_id={:#018x} root={}",
+                cmd_id,
                 kernel.title_id,
                 root.display()
             );
@@ -2074,8 +2460,35 @@ fn dispatch_service_v2(
         return build_ipc_response(ctx, 0x202, &[], &[]);
     }
 
+    if port_name == "fsp-srv" && cmd_id == 202 && ctx.cmif_in_data_len >= 16 {
+        let title_id_off = ctx.cmif_in_data_off + 8;
+        let title_id = u64::from_le_bytes([
+            ctx.buf[title_id_off],
+            ctx.buf[title_id_off + 1],
+            ctx.buf[title_id_off + 2],
+            ctx.buf[title_id_off + 3],
+            ctx.buf[title_id_off + 4],
+            ctx.buf[title_id_off + 5],
+            ctx.buf[title_id_off + 6],
+            ctx.buf[title_id_off + 7],
+        ]);
+        if title_id == 0x0100_0000_0000_0823 {
+            return return_subsession(kernel, ctx, session_handle, "IFsStorageNgWord2");
+        }
+    }
+
     if let Some(sub_service) = subsession_service(port_name, cmd_id) {
         return return_subsession(kernel, ctx, session_handle, sub_service);
+    }
+
+    if matches!(port_name, "bsd:u" | "bsd:s") {
+        let address_space = std::sync::Arc::clone(&kernel.address_space);
+        let (rc, data, wait) = kernel.services.bsd.dispatch_ipc(&address_space, ctx);
+        if wait {
+            kernel.present_pace_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(1));
+        }
+        return build_ipc_response(ctx, rc, &data, &[]);
     }
 
     if let Some((rc, data, handles)) =
@@ -2533,7 +2946,14 @@ fn dispatch_service_v2(
                             let start = (offset.max(0) as usize).min(m.len());
                             let end = start.saturating_add(want).min(m.len());
                             let slice = &m[start..end];
-                            let _ = kernel.address_space.write(buf.addr, slice);
+                            if let Err(err) = kernel.address_space.write(buf.addr, slice) {
+                                log::error!(
+                                    "IFile.Read: guest write addr={:#x} len={:#x} failed: {}",
+                                    buf.addr,
+                                    slice.len(),
+                                    err
+                                );
+                            }
                             bytes_read = slice.len() as u64;
                         }
                         log::debug!(
@@ -2551,7 +2971,14 @@ fn dispatch_service_v2(
                         let want = (read_size as usize).min(buf.size as usize).min(remaining);
                         let end = start.saturating_add(want).min(romfs.len());
                         let slice = &romfs[start..end];
-                        let _ = kernel.address_space.write(buf.addr, slice);
+                        if let Err(err) = kernel.address_space.write(buf.addr, slice) {
+                            log::error!(
+                                "IFile.Read: guest write addr={:#x} len={:#x} failed: {}",
+                                buf.addr,
+                                slice.len(),
+                                err
+                            );
+                        }
                         bytes_read = slice.len() as u64;
                         log::debug!(
                             "IFile.Read (romfs off={:#x}) read_off={:#x} size={:#x} → {} bytes",
@@ -2577,7 +3004,14 @@ fn dispatch_service_v2(
                         let want = (read_size as usize).min(buf.size as usize);
                         let end = start.saturating_add(want).min(file_bytes.len());
                         let slice = &file_bytes[start..end];
-                        let _ = kernel.address_space.write(buf.addr, slice);
+                        if let Err(err) = kernel.address_space.write(buf.addr, slice) {
+                            log::error!(
+                                "IFile.Read: guest write addr={:#x} len={:#x} failed: {}",
+                                buf.addr,
+                                slice.len(),
+                                err
+                            );
+                        }
                         bytes_read = slice.len() as u64;
                         log::debug!(
                             "IFile.Read (sess={:#x} obj={}) off={:#x} size={:#x} → {} bytes",
@@ -2602,6 +3036,7 @@ fn dispatch_service_v2(
                     .iter()
                     .find_map(|key| kernel.open_host_files.get(key).cloned());
                 if let Some(host) = host_path {
+                    kernel.host_file_cache.remove(&host);
                     use std::io::{Seek, SeekFrom, Write};
                     let in_off = ctx.cmif_in_data_off;
                     if ctx.cmif_in_data_len >= 24 {
@@ -2669,6 +3104,7 @@ fn dispatch_service_v2(
                     .iter()
                     .find_map(|key| kernel.open_host_files.get(key).cloned());
                 if let Some(host) = host_path {
+                    kernel.host_file_cache.remove(&host);
                     let in_off = ctx.cmif_in_data_off;
                     if ctx.cmif_in_data_len >= 8 {
                         let new_size = u64::from_le_bytes([
@@ -2824,7 +3260,12 @@ fn dispatch_service_v2(
         }
     }
 
-    if port_name == "IFsStorage" {
+    if matches!(port_name, "IFsStorage" | "IFsStorageNgWord2") {
+        let storage = if port_name == "IFsStorageNgWord2" {
+            ng_word2_romfs()
+        } else {
+            kernel.nro_romfs()
+        };
         match cmd_id {
             0 => {
                 let off_lo = ctx.cmif_in_data_off;
@@ -2843,7 +3284,6 @@ fn dispatch_service_v2(
                     read_in[14],
                     read_in[15],
                 ]);
-                let romfs = kernel.nro_romfs();
                 let target = ctx
                     .recv_buffers
                     .iter()
@@ -2851,20 +3291,27 @@ fn dispatch_service_v2(
                     .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0))
                     .copied();
                 if let Some(buf) = target {
-                    let start = (offset.max(0) as usize).min(romfs.len());
+                    let start = (offset.max(0) as usize).min(storage.len());
                     let want = (read_size as usize).min(buf.size as usize);
-                    let end = start.saturating_add(want).min(romfs.len());
-                    let slice = &romfs[start..end];
-                    let _ = kernel.address_space.write(buf.addr, slice);
+                    let end = start.saturating_add(want).min(storage.len());
+                    let slice = &storage[start..end];
+                    if let Err(err) = kernel.address_space.write(buf.addr, slice) {
+                        log::error!(
+                            "IFsStorage.Read: guest write addr={:#x} len={:#x} failed: {}",
+                            buf.addr,
+                            slice.len(),
+                            err
+                        );
+                    }
                     log::debug!(
                         "IFsStorage.Read off={:#x} size={:#x} bytes={} total={}",
                         offset,
                         read_size,
                         slice.len(),
-                        romfs.len()
+                        storage.len()
                     );
                     let path = if fs_trace_enabled() {
-                        romfs_path_for_data_offset(romfs, start)
+                        romfs_path_for_data_offset(storage, start)
                             .map(|(path, file_off, _)| {
                                 let rel = start.saturating_sub(file_off);
                                 format!("{}+{:#x}", path, rel)
@@ -2891,7 +3338,7 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
             4 => {
-                let size = kernel.nro_romfs().len() as i64;
+                let size = storage.len() as i64;
                 log::debug!("IFsStorage.GetSize → {}", size);
                 return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
             }
@@ -3581,10 +4028,26 @@ fn dispatch_service_v2(
                             let mut read_idx: usize = 0;
                             for i in 0..TARGET_FRAMES {
                                 let p = ((frac_q15 >> 8) as usize & 127) * 4;
-                                let c0 = 0.0f32.max(((p as f32 + 0.0f32) * (2.0f32 * std::f32::consts::PI / 4.0f32)).sin());
-                                let c1 = 0.0f32.max(((p as f32 + 1.0f32) * (2.0f32 * std::f32::consts::PI / 4.0f32)).sin());
-                                let c2 = 0.0f32.max(((p as f32 + 2.0f32) * (2.0f32 * std::f32::consts::PI / 4.0f32)).sin());
-                                let c3 = 0.0f32.max(((p as f32 + 3.0f32) * (2.0f32 * std::f32::consts::PI / 4.0f32)).sin());
+                                let c0 = 0.0f32.max(
+                                    ((p as f32 + 0.0f32)
+                                        * (2.0f32 * std::f32::consts::PI / 4.0f32))
+                                        .sin(),
+                                );
+                                let c1 = 0.0f32.max(
+                                    ((p as f32 + 1.0f32)
+                                        * (2.0f32 * std::f32::consts::PI / 4.0f32))
+                                        .sin(),
+                                );
+                                let c2 = 0.0f32.max(
+                                    ((p as f32 + 2.0f32)
+                                        * (2.0f32 * std::f32::consts::PI / 4.0f32))
+                                        .sin(),
+                                );
+                                let c3 = 0.0f32.max(
+                                    ((p as f32 + 3.0f32)
+                                        * (2.0f32 * std::f32::consts::PI / 4.0f32))
+                                        .sin(),
+                                );
                                 let bi = read_idx as isize;
                                 let ol = smp_l(bi - 1) * c0
                                     + smp_l(bi) * c1
@@ -4016,7 +4479,10 @@ fn dispatch_service_v2(
             let _ = kernel.address_space.write(buf.addr, &name);
         }
         let count: u32 = 1;
-        log::info!("audout:u ListAudioOuts cmd_{} → count=1 (DeviceOut)", cmd_id);
+        log::info!(
+            "audout:u ListAudioOuts cmd_{} → count=1 (DeviceOut)",
+            cmd_id
+        );
         return build_ipc_response(ctx, 0, &count.to_le_bytes(), &[]);
     }
 
@@ -4084,6 +4550,7 @@ fn dispatch_service_v2(
             let h = kernel.handles.create_handle(HandleType::Session);
             let session = Session::new(h, "IAudioOut".to_string());
             kernel.sessions.insert(h, session);
+            crate::services::audio_out::handlers::open_audio_out_session(kernel, h);
             return build_ipc_response(ctx, 0, &out, &[h]);
         }
     }
@@ -4115,8 +4582,8 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
             }
             1 => {
-                aout::start_audio_out(kernel, ctx, session_handle);
-                return build_ipc_response(ctx, 0, &[], &[]);
+                let result = aout::start_audio_out_result(kernel, ctx, session_handle);
+                return build_ipc_response(ctx, result, &[], &[]);
             }
             2 => {
                 aout::stop_audio_out(kernel, ctx, session_handle);
@@ -4124,10 +4591,7 @@ fn dispatch_service_v2(
             }
             3 | 7 => {
                 const RESULT_BUFFER_COUNT_REACHED: u32 = 153 | (8 << 9);
-                let full = kernel
-                    .audio_out_buffers
-                    .get(&session_handle)
-                    .map_or(false, |q| q.len() >= 32);
+                let full = aout::total_buffer_count(kernel, session_handle) >= 32;
                 if full {
                     return build_ipc_response(ctx, RESULT_BUFFER_COUNT_REACHED, &[], &[]);
                 }
@@ -4234,7 +4698,11 @@ fn dispatch_service_v2(
             2
         };
         let size = crate::services::hwopus::HwOpusService::work_buffer_size(channels);
-        log::info!("hwopus GetWorkBufferSize channels={} → {:#x}", channels, size);
+        log::info!(
+            "hwopus GetWorkBufferSize channels={} → {:#x}",
+            channels,
+            size
+        );
         return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
     }
 
@@ -4252,7 +4720,10 @@ fn dispatch_service_v2(
             ctx.buf[in_off + 6],
             ctx.buf[in_off + 7],
         ]);
-        kernel.services.hwopus.open(session_handle, sample_rate, channels);
+        kernel
+            .services
+            .hwopus
+            .open(session_handle, sample_rate, channels);
         log::info!(
             "hwopus OpenHardwareOpusDecoder rate={} ch={} → IHardwareOpusDecoder",
             sample_rate,
@@ -5228,8 +5699,14 @@ fn igbp_handle_transact(
                                     crop_l, crop_t, crop_r, crop_b, cw, ch, frame_w, frame_h
                                 );
                                 let cropped = crop_and_upscale(
-                                    &frame_pixels, frame_w, crop_l as u32, crop_t as u32, cw, ch,
-                                    cw, ch,
+                                    &frame_pixels,
+                                    frame_w,
+                                    crop_l as u32,
+                                    crop_t as u32,
+                                    cw,
+                                    ch,
+                                    cw,
+                                    ch,
                                 );
                                 (cw, ch, cropped)
                             } else {
@@ -5768,6 +6245,45 @@ fn flip_present_v(bytes: &mut [u8], width: u32, height: u32) {
     }
 }
 
+fn present_subwindow_has_content(
+    pixels: &[u8],
+    width: u32,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+) -> bool {
+    let mut sampled = 0usize;
+    let mut visible = 0usize;
+    let mut cell_sampled = [0usize; 9];
+    let mut cell_visible = [0usize; 9];
+    let row = width as usize * 4;
+    for y in (y0..y0.saturating_add(h)).step_by(4) {
+        let cell_y = ((y - y0) as usize * 3 / h as usize).min(2);
+        let row_off = y as usize * row;
+        for x in (x0..x0.saturating_add(w)).step_by(4) {
+            let cell_x = ((x - x0) as usize * 3 / w as usize).min(2);
+            let cell = cell_y * 3 + cell_x;
+            sampled += 1;
+            cell_sampled[cell] += 1;
+            let p = row_off + x as usize * 4;
+            if p + 2 < pixels.len() && pixels[p].max(pixels[p + 1]).max(pixels[p + 2]) > 4 {
+                visible += 1;
+                cell_visible[cell] += 1;
+            }
+        }
+    }
+    if sampled == 0 || visible * 100 < sampled * 15 {
+        return false;
+    }
+    cell_visible
+        .iter()
+        .zip(cell_sampled.iter())
+        .filter(|(visible, sampled)| **sampled != 0 && **visible * 100 >= **sampled)
+        .count()
+        >= 6
+}
+
 fn maybe_crop_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> (u32, u32, Vec<u8>) {
     if std::env::var_os("NEXIUM_PRESENT_SUBWINDOW_CROP").is_none() {
         if let Ok(mut slot) = present_crop_slot().lock() {
@@ -5813,6 +6329,7 @@ fn maybe_crop_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> (u32
         && area_ratio >= 0.30
         && area_ratio <= 0.80
         && aspect_delta <= 0.05
+        && present_subwindow_has_content(&bytes, width, x0, y0, w, h)
     {
         if let Ok(mut slot) = present_crop_slot().lock() {
             *slot = Some((width, height, x0, y0, w, h));
@@ -5827,6 +6344,47 @@ fn maybe_crop_present_subwindow(bytes: Vec<u8>, width: u32, height: u32) -> (u32
         (w, h, crop_and_upscale(&bytes, width, x0, y0, w, h, w, h))
     } else {
         (width, height, bytes)
+    }
+}
+
+#[cfg(test)]
+mod present_crop_tests {
+    use super::{active_bbox, maybe_crop_present_subwindow};
+
+    fn fill_rect(pixels: &mut [u8], width: u32, x0: u32, y0: u32, w: u32, h: u32, color: [u8; 4]) {
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                let p = ((y * width + x) * 4) as usize;
+                pixels[p..p + 4].copy_from_slice(&color);
+            }
+        }
+    }
+
+    #[test]
+    fn hud_only_frame_does_not_latch_present_crop() {
+        let (width, height) = (1920, 1080);
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        fill_rect(&mut pixels, width, 64, 900, 1266, 178, [32, 96, 224, 255]);
+        fill_rect(&mut pixels, width, 950, 371, 32, 32, [255, 255, 255, 255]);
+        assert_eq!(
+            active_bbox(&pixels, width, height),
+            Some((64, 371, 1266, 707))
+        );
+
+        let (present_w, present_h, returned) = maybe_crop_present_subwindow(pixels, width, height);
+        assert_eq!((present_w, present_h), (width, height));
+        assert_eq!(returned.len(), width as usize * height as usize * 4);
+    }
+
+    #[test]
+    fn populated_subwindow_is_still_cropped() {
+        let (width, height) = (1920, 1080);
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        fill_rect(&mut pixels, width, 0, 180, 1280, 720, [24, 48, 96, 255]);
+
+        let (present_w, present_h, returned) = maybe_crop_present_subwindow(pixels, width, height);
+        assert_eq!((present_w, present_h), (1280, 720));
+        assert_eq!(returned.len(), 1280 * 720 * 4);
     }
 }
 
@@ -6216,7 +6774,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 }
             }
 
-            if ioctl_cmd == 0x4808 || ioctl_cmd == 0x481b {
+            {
                 let fence_handles: Vec<u32> = kernel
                     .gpu_fence_events
                     .iter()
@@ -6796,11 +7354,15 @@ fn svc_reset_signal(kernel: &mut Kernel) -> u32 {
     } else {
         0
     };
-    kernel.event_signals.insert(handle, false);
+    let is_event = matches!(
+        kernel.handles.get_handle(handle),
+        Some(entry) if entry.handle_type == HandleType::Event
+    );
+    let result = reset_event_signal(&mut kernel.event_signals, is_event, handle);
     if let Some(cpu) = cpu_mut() {
-        cpu.set_register(0, SUCCESS as u64);
+        cpu.set_register(0, result as u64);
     }
-    SUCCESS
+    result
 }
 
 fn svc_wait_for_address(kernel: &mut Kernel) -> u32 {
@@ -6950,7 +7512,7 @@ fn svc_break(kernel: &mut Kernel) -> u32 {
         let mut callers = Vec::new();
         let mut cur_fp = fp;
         for i in 0..8 {
-            if cur_fp < 0x80_0000_0000 || cur_fp > 0xc0_0000_0000 {
+            if cur_fp == 0 || cur_fp & 7 != 0 {
                 break;
             }
             let mut frame = [0u8; 16];
@@ -6965,7 +7527,7 @@ fn svc_break(kernel: &mut Kernel) -> u32 {
                 frame[15],
             ]);
             callers.push((i, saved_lr));
-            if next_fp == 0 || next_fp <= cur_fp {
+            if next_fp <= cur_fp || next_fp.saturating_sub(cur_fp) > 0x10_0000 {
                 break;
             }
             cur_fp = next_fp;
@@ -7191,37 +7753,26 @@ fn svc_map_physical_memory(kernel: &mut Kernel) -> u32 {
         return KERNEL_INVALID_ADDRESS;
     }
 
-    let end = addr + size;
-    let mut gaps: Vec<(u64, u64)> = Vec::new();
-    {
-        let mut cursor = addr;
-        for r in kernel.address_space.regions() {
-            let rb = r.base;
-            let re = r.base + r.size;
-            if re <= cursor {
-                continue;
+    let gaps = match kernel.address_space.unmapped_gaps(addr, size) {
+        Ok(gaps) => gaps,
+        Err(e) => {
+            log::warn!(
+                "svcMapPhysicalMemory: invalid range addr={:#x} size={:#x}: {:?}",
+                addr,
+                size,
+                e
+            );
+            if let Some(cpu) = cpu_mut() {
+                cpu.set_register(0, KERNEL_INVALID_ADDRESS as u64);
             }
-            if rb >= end {
-                break;
-            }
-            if rb > cursor {
-                gaps.push((cursor, rb));
-            }
-            cursor = cursor.max(re);
-            if cursor >= end {
-                break;
-            }
+            return KERNEL_INVALID_ADDRESS;
         }
-        if cursor < end {
-            gaps.push((cursor, end));
-        }
-    }
+    };
 
     for (gs, ge) in &gaps {
-        if let Err(e) =
-            kernel
-                .address_space
-                .map(*gs, ge - gs, nexium_memory::Perm::RW, "physmem")
+        if let Err(e) = kernel
+            .address_space
+            .map(*gs, ge - gs, nexium_memory::Perm::RW, "physmem")
         {
             log::error!(
                 "svcMapPhysicalMemory: map {:#x}..{:#x} failed: {:?}",
@@ -7273,7 +7824,7 @@ fn svc_map_physical_memory(kernel: &mut Kernel) -> u32 {
         }
     }
 
-    log::info!(
+    log::trace!(
         "svcMapPhysicalMemory addr={:#x} size={:#x} → {} new region(s)",
         addr,
         size,
@@ -7291,11 +7842,7 @@ fn svc_unmap_physical_memory(_kernel: &mut Kernel) -> u32 {
     } else {
         return 1;
     };
-    log::info!(
-        "svcUnmapPhysicalMemory addr={:#x} size={:#x}",
-        addr,
-        size
-    );
+    log::info!("svcUnmapPhysicalMemory addr={:#x} size={:#x}", addr, size);
     if let Some(cpu) = cpu_mut() {
         let _ = unsafe { cpu.unmap_host(addr, size) };
         cpu.set_register(0, SUCCESS as u64);
@@ -7386,6 +7933,15 @@ fn svc_close_handle(kernel: &mut Kernel) -> u32 {
         .unwrap_or_else(|| "unknown".into());
     log::debug!("svcCloseHandle handle={:#x} ({})", handle, kind);
     dump_regs(kernel, "CloseHandle ENTRY");
+    release_hwopus_session_state(kernel, handle);
+    let is_audio_out = kernel
+        .sessions
+        .get(&handle)
+        .is_some_and(|session| session.port_name == "IAudioOut");
+    if is_audio_out {
+        crate::services::audio_out::handlers::close_audio_out_session(kernel, handle);
+        kernel.sessions.remove(&handle);
+    }
     if let Some(closed) = kernel.handles.close_handle(handle) {
         if closed.handle_type == HandleType::Thread {
             kernel.exited_thread_handles.remove(&handle);
@@ -7502,7 +8058,7 @@ fn svc_sleep_thread(kernel: &mut Kernel) -> u32 {
                 crate::kernel::threads::ThreadState::Sleeping { wake_at },
             );
         }
-    } else if signed == 0 || signed == -1 {
+    } else if matches!(signed, 0 | -1 | -2) {
         if let Some(cpu) = cpu_ref() {
             kernel
                 .threads
@@ -8088,6 +8644,129 @@ fn fs_read_path(ctx: &ipc::IpcCtx, addr_space: &nexium_memory::AddressSpace) -> 
     }
     let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn ng_word2_romfs() -> &'static [u8] {
+    use std::sync::OnceLock;
+
+    static ROMFS: OnceLock<Vec<u8>> = OnceLock::new();
+    ROMFS.get_or_init(build_ng_word2_romfs).as_slice()
+}
+
+fn build_ng_word2_romfs() -> Vec<u8> {
+    const AC_NX_DATA: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x08, 0xd5, 0x2c, 0x09, 0x5c, 0x04, 0x00, 0x61, 0x63, 0x72, 0x61, 0x77,
+        0x00, 0xed, 0xc1, 0x01, 0x0d, 0x00, 0x00, 0x00, 0xc2, 0x20, 0xfb, 0xa7, 0xb6, 0xc7, 0x07,
+        0x0c, 0x00, 0x00, 0x00, 0xc8, 0x3b, 0x11, 0x00, 0x1c, 0xc7, 0x00, 0x10, 0x00, 0x00,
+    ];
+
+    let mut files = Vec::with_capacity(52);
+    for index in 0..16 {
+        for suffix in ["b1_nx", "b2_nx", "not_b_nx"] {
+            files.push((format!("ac_{}_{}", index, suffix), AC_NX_DATA.to_vec()));
+        }
+    }
+    files.extend([
+        ("ac_common_b1_nx".to_string(), AC_NX_DATA.to_vec()),
+        ("ac_common_b2_nx".to_string(), AC_NX_DATA.to_vec()),
+        ("ac_common_not_b_nx".to_string(), AC_NX_DATA.to_vec()),
+        ("version.dat".to_string(), vec![0, 0, 0, 0x1a]),
+    ]);
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let align4 = |value: usize| (value + 3) & !3;
+    let align16 = |value: usize| (value + 15) & !15;
+    let dir_hash_count = 3usize;
+    let file_hash_count = 53usize;
+    let dir_hash_size = dir_hash_count * 4;
+    let file_hash_size = file_hash_count * 4;
+    let dir_table_size = 0x18usize;
+    let file_table_size = files
+        .iter()
+        .map(|(name, _)| 0x20 + align4(name.len()))
+        .sum::<usize>();
+
+    let mut file_offsets = Vec::with_capacity(files.len());
+    let mut file_partition_size = 0usize;
+    for (_, data) in &files {
+        file_partition_size = align16(file_partition_size);
+        file_offsets.push(file_partition_size);
+        file_partition_size += data.len();
+    }
+
+    let file_partition_ofs = 0x200usize;
+    let dir_hash_ofs = align4(file_partition_ofs + file_partition_size);
+    let dir_table_ofs = dir_hash_ofs + dir_hash_size;
+    let file_hash_ofs = dir_table_ofs + dir_table_size;
+    let file_table_ofs = file_hash_ofs + file_hash_size;
+    let mut romfs =
+        vec![0u8; (file_table_ofs + file_table_size).max(file_partition_ofs + file_partition_size)];
+
+    romfs[0..8].copy_from_slice(&0x50u64.to_le_bytes());
+    romfs[8..16].copy_from_slice(&(dir_hash_ofs as u64).to_le_bytes());
+    romfs[16..24].copy_from_slice(&(dir_hash_size as u64).to_le_bytes());
+    romfs[24..32].copy_from_slice(&(dir_table_ofs as u64).to_le_bytes());
+    romfs[32..40].copy_from_slice(&(dir_table_size as u64).to_le_bytes());
+    romfs[40..48].copy_from_slice(&(file_hash_ofs as u64).to_le_bytes());
+    romfs[48..56].copy_from_slice(&(file_hash_size as u64).to_le_bytes());
+    romfs[56..64].copy_from_slice(&(file_table_ofs as u64).to_le_bytes());
+    romfs[64..72].copy_from_slice(&(file_table_size as u64).to_le_bytes());
+    romfs[72..80].copy_from_slice(&(file_partition_ofs as u64).to_le_bytes());
+
+    let mut dir_hash = vec![u32::MAX; dir_hash_count];
+    let mut file_hash = vec![u32::MAX; file_hash_count];
+    let root_hash = ng_word2_hash(0, &[]);
+    dir_hash[(root_hash as usize) % dir_hash_count] = 0;
+    for (index, word) in dir_hash.iter().enumerate() {
+        let offset = dir_hash_ofs + index * 4;
+        romfs[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    }
+
+    romfs[dir_table_ofs..dir_table_ofs + 4].copy_from_slice(&0u32.to_le_bytes());
+    romfs[dir_table_ofs + 4..dir_table_ofs + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+    romfs[dir_table_ofs + 8..dir_table_ofs + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+    romfs[dir_table_ofs + 12..dir_table_ofs + 16].copy_from_slice(&0u32.to_le_bytes());
+    romfs[dir_table_ofs + 16..dir_table_ofs + 20].copy_from_slice(&root_hash.to_le_bytes());
+    romfs[dir_table_ofs + 20..dir_table_ofs + 24].copy_from_slice(&0u32.to_le_bytes());
+
+    let mut entry_offset = 0usize;
+    for (index, ((name, data), &data_offset)) in files.iter().zip(&file_offsets).enumerate() {
+        let entry_size = 0x20 + align4(name.len());
+        let sibling = if index + 1 < files.len() {
+            (entry_offset + entry_size) as u32
+        } else {
+            u32::MAX
+        };
+        let hash = ng_word2_hash(0, name.as_bytes());
+        let bucket = (hash as usize) % file_hash_count;
+        let table_entry = file_hash[bucket];
+        file_hash[bucket] = entry_offset as u32;
+        let base = file_table_ofs + entry_offset;
+        romfs[base..base + 4].copy_from_slice(&0u32.to_le_bytes());
+        romfs[base + 4..base + 8].copy_from_slice(&sibling.to_le_bytes());
+        romfs[base + 8..base + 16].copy_from_slice(&(data_offset as u64).to_le_bytes());
+        romfs[base + 16..base + 24].copy_from_slice(&(data.len() as u64).to_le_bytes());
+        romfs[base + 24..base + 28].copy_from_slice(&table_entry.to_le_bytes());
+        romfs[base + 28..base + 32].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        romfs[base + 32..base + 32 + name.len()].copy_from_slice(name.as_bytes());
+        let data_base = file_partition_ofs + data_offset;
+        romfs[data_base..data_base + data.len()].copy_from_slice(data);
+        entry_offset += entry_size;
+    }
+
+    for (index, word) in file_hash.iter().enumerate() {
+        let offset = file_hash_ofs + index * 4;
+        romfs[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    romfs
+}
+
+fn ng_word2_hash(parent: u32, name: &[u8]) -> u32 {
+    let mut hash = parent ^ 123_456_789;
+    for byte in name {
+        hash = hash.rotate_right(5) ^ u32::from(*byte);
+    }
+    hash
 }
 
 #[derive(Clone, Copy)]

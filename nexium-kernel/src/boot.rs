@@ -182,7 +182,10 @@ impl BootContext {
         let app_name = nexium_common::paths::app_name_from_nro(&config.nro_path);
         let _ = nexium_common::paths::sdmc_app_dir(&app_name);
         let argv_path = format!("sdmc:/switch/{}/{}", app_name, nro_filename);
-        let argv_string = config.argv_override.clone().unwrap_or_else(|| argv_path.clone());
+        let argv_string = config
+            .argv_override
+            .clone()
+            .unwrap_or_else(|| argv_path.clone());
         let next_load_path = config
             .loader_path
             .clone()
@@ -256,7 +259,11 @@ impl BootContext {
         let exit_stub_va: u64 = env_base + 0x2000;
         let aslr_base: u64 = code_base;
         let aslr_size: u64 = space - code_base;
-        let alias_size: u64 = (space / 16).min(0x1_8000_0000);
+        let alias_size: u64 = if bits == 39 {
+            0x10_0000_0000
+        } else {
+            0x1_8000_0000
+        };
         let heap_size: u64 = 0xCC00_0000;
 
         const PAGE_SIZE: u64 = 0x1000;
@@ -319,9 +326,22 @@ impl BootContext {
             );
         }
 
+        for (&pc, (kind, arg)) in crate::kernel::svc::guest_probe_actions() {
+            let insn: u32 = 0xD400_0FE1;
+            match address_space.write(pc, &insn.to_le_bytes()) {
+                Ok(()) => log::warn!(
+                    "[guest-probe] patched svc 0x7f at pc={:#x} kind={} arg={:#x}",
+                    pc,
+                    kind,
+                    arg
+                ),
+                Err(e) => log::warn!("[guest-probe] patch failed at pc={:#x}: {:?}", pc, e),
+            }
+        }
+
         log::info!("  Mapping heap @ {:#x} (size {:#x})", heap_base, heap_size);
         address_space
-            .map(heap_base, heap_size, Perm::RW, "heap")
+            .map_reserved(heap_base, heap_size, Perm::RW, "heap")
             .map_err(|e| format!("Failed to map heap: {:?}", e))?;
 
         log::info!(
@@ -492,7 +512,7 @@ impl BootContext {
             match event {
                 nexium_cpu::CpuEvent::Running => {
                     if cycle_count % 10_000_000 == 0 {
-                        log::info!(
+                        log::trace!(
                             "CPU running... {} cycles executed (no SVCs yet)",
                             cycle_count
                         );
@@ -504,7 +524,9 @@ impl BootContext {
 
                     let result = self.kernel.lock().dispatch_svc(imm);
 
-                    cpu_mut().unwrap().set_register(0, result as u64);
+                    if imm != 0x7f {
+                        cpu_mut().unwrap().set_register(0, result as u64);
+                    }
 
                     if result == 0 || result == 1 {
                         continue;

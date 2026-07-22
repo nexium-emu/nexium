@@ -67,6 +67,7 @@ pub struct Thread {
     pub entry_arg: u64,
     pub priority: i32,
     pub core: i32,
+    pub wait_cancelled: bool,
 }
 
 pub struct Threads {
@@ -99,6 +100,7 @@ impl Threads {
                 entry_arg: 0,
                 priority: 0x2C,
                 core: 0,
+                wait_cancelled: false,
             },
         );
         Self {
@@ -153,6 +155,7 @@ impl Threads {
                 entry_arg,
                 priority: 0x2C,
                 core: -2,
+                wait_cancelled: false,
             },
         );
     }
@@ -244,9 +247,9 @@ impl Threads {
             .threads
             .iter()
             .filter_map(|(h, t)| match &t.state {
-                ThreadState::WaitingMutex {
-                    mutex_addr: m, ..
-                } if *m == mutex_addr => Some((*h, t.priority)),
+                ThreadState::WaitingMutex { mutex_addr: m, .. } if *m == mutex_addr => {
+                    Some((*h, t.priority))
+                }
                 _ => None,
             })
             .min_by_key(|(h, priority)| (*priority, *h))
@@ -412,6 +415,29 @@ impl Threads {
         }
     }
 
+    pub fn cancel_synchronization(&mut self, handle: u32) -> Option<bool> {
+        let waiting = matches!(
+            self.threads.get(&handle).map(|thread| &thread.state),
+            Some(ThreadState::WaitingHandle { .. })
+        );
+        let thread = self.threads.get_mut(&handle)?;
+        if waiting {
+            thread.wait_cancelled = false;
+            thread.ctx.x[0] = nexium_common::result::KERNEL_CANCELLED as u64;
+            self.transition_state(handle, ThreadState::Ready);
+        } else {
+            thread.wait_cancelled = true;
+        }
+        Some(waiting)
+    }
+
+    pub fn take_wait_cancelled(&mut self, handle: u32) -> bool {
+        let Some(thread) = self.threads.get_mut(&handle) else {
+            return false;
+        };
+        std::mem::take(&mut thread.wait_cancelled)
+    }
+
     pub fn wake_one_on_arbiter(&mut self, addr: u64) -> Option<u32> {
         let h = self.threads.iter().find_map(|(h, t)| match &t.state {
             ThreadState::WaitingArbiter { addr: a, .. } if *a == addr => Some(*h),
@@ -465,20 +491,11 @@ impl Threads {
 
     pub fn pick_next(&mut self) -> Option<u32> {
         let core = current_core() as i32;
-        let pos = self
-            .ready
-            .iter()
-            .enumerate()
-            .filter(|(_, h)| {
-                self.threads
-                    .get(*h)
-                    .map_or(false, |t| t.core == core || t.core < 0)
-            })
-            .min_by_key(|(idx, h)| {
-                let prio = self.effective_priority(**h);
-                (prio, *idx)
-            })
-            .map(|(idx, _)| idx)?;
+        let pos = self.ready.iter().position(|h| {
+            self.threads
+                .get(h)
+                .map_or(false, |t| t.core == core || t.core < 0)
+        })?;
         let handle = self.ready.remove(pos)?;
         if let Some(t) = self.threads.get_mut(&handle) {
             if t.core < 0 {
@@ -577,5 +594,72 @@ impl Threads {
 impl Default for Threads {
     fn default() -> Self {
         Self::new(0, 0, 0, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ThreadCtx, ThreadState, Threads};
+
+    fn add_ready_thread(threads: &mut Threads, handle: u32, priority: i32) {
+        threads.add_thread(handle, ThreadCtx::zero(), 0, 0, 0);
+        threads.threads.get_mut(&handle).unwrap().priority = priority;
+        threads.transition_state(handle, ThreadState::Ready);
+    }
+
+    #[test]
+    fn scheduler_is_deterministic_fifo_with_core_affinity() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_ready_thread(&mut threads, 0x200, 0);
+        threads.threads.get_mut(&0x200).unwrap().core = 1;
+
+        let fifo_handles: Vec<u32> = (0..9).map(|index| 0x210 + index).collect();
+        for (index, &handle) in fifo_handles.iter().enumerate() {
+            add_ready_thread(&mut threads, handle, 0x2c);
+            if index % 2 == 0 {
+                threads.threads.get_mut(&handle).unwrap().core = 0;
+            }
+        }
+        add_ready_thread(&mut threads, 0x300, 1);
+
+        for &handle in &fifo_handles {
+            assert_eq!(threads.pick_next(), Some(handle));
+            assert_eq!(threads.threads.get(&handle).unwrap().core, 0);
+        }
+        assert_eq!(threads.pick_next(), Some(0x300));
+        assert_eq!(
+            threads.ready.iter().copied().collect::<Vec<_>>(),
+            vec![0x200]
+        );
+    }
+
+    #[test]
+    fn cancel_synchronization_wakes_waiting_thread() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        threads.transition_state(
+            0x100,
+            ThreadState::WaitingHandle {
+                handles: Vec::new(),
+                wake_at: None,
+            },
+        );
+
+        assert_eq!(threads.cancel_synchronization(0x100), Some(true));
+        let thread = threads.threads.get(&0x100).unwrap();
+        assert!(matches!(thread.state, ThreadState::Ready));
+        assert_eq!(
+            thread.ctx.x[0],
+            nexium_common::result::KERNEL_CANCELLED as u64
+        );
+        assert!(!thread.wait_cancelled);
+    }
+
+    #[test]
+    fn early_cancel_is_consumed_by_next_wait_once() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+
+        assert_eq!(threads.cancel_synchronization(0x100), Some(false));
+        assert!(threads.take_wait_cancelled(0x100));
+        assert!(!threads.take_wait_cancelled(0x100));
     }
 }

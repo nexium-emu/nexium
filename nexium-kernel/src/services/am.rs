@@ -816,7 +816,7 @@ fn ssl_service(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
         1 => ok(0u32.to_le_bytes().to_vec()),
         2 | 3 => ok(0u32.to_le_bytes().to_vec()),
-        5 => err(0x3a8),
+        5 => ok_empty(),
         6 | 7 | 8 | 9 => ok_empty(),
         101 | 102 => ok(0u64.to_le_bytes().to_vec()),
         _ => ok_empty(),

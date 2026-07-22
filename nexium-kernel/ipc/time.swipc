@@ -44,8 +44,8 @@ service ITimeZoneService as time_zone {
     [8] ParseTimeZoneBinary();
     [20] GetDeviceLocationNameOperationEventReadableHandle() -> out_handle;
     # NOTE [100] also takes a 0x4000 TimeZoneRule MapAlias In; ignored.
-    [100] ToCalendarTime(u64 posix_time) -> zeros(0x20);
-    [101] ToCalendarTimeWithMyRule(u64 posix_time) -> zeros(0x20);
+    [100] ToCalendarTime(i64 posix_time) -> bytes(0x20);
+    [101] ToCalendarTimeWithMyRule(i64 posix_time) -> bytes(0x20);
     # NOTE [201] takes a 0x4000 TimeZoneRule In and writes posix times to an Out|Pointer buffer; ignored.
     [201] ToPosixTime(u64 calendar_time) -> u32;
     # NOTE [202] writes posix times to an Out|Pointer buffer; ignored.

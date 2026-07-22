@@ -70,16 +70,7 @@ pub struct Kernel {
     pub gpu_fence_events: HashMap<u32, (u32, u32)>,
     pub gpu_event_tokens: HashMap<u32, u32>,
     pub last_vsync: std::time::Instant,
-    /// Last time we refreshed the HID shmem from `hid_input`. Refreshed on
-    /// both vsync and applet-event polls (the latter being how SDL2-using
-    /// games drive their input loop, since SDL_PollEvent pumps applet
-    /// events without ever waiting on a vsync handle). The timestamp
-    /// throttles those refreshes to ~60 Hz so we don't spam the shmem on
-    /// the kHz-rate timeout=0 polls. (RustSwitch commit 49ca133)
     pub last_hid_tick: std::time::Instant,
-    /// Per-(svc_imm, calling_lr) streak detector across all SVCs so a guest
-    /// spinning on any particular call site shows up. Fires the first time
-    /// we cross each power-of-two threshold so logs grow O(log N).
     pub last_generic_svc_imm: u16,
     pub last_generic_svc_lr: u64,
     pub generic_svc_streak: u64,
@@ -120,23 +111,16 @@ pub struct Kernel {
     pub time_shmem: Option<Vec<u8>>,
     pub time_shmem_handle: Option<u32>,
 
-    pub audio_out_buffers: HashMap<u32, VecDeque<(u64, std::time::Instant, u64, u64)>>,
+    pub audio_out_sessions: HashMap<u32, crate::services::audio_out::handlers::AudioOutSession>,
     pub audio_buffer_events: HashMap<u32, u32>,
-    pub audio_out_volumes: HashMap<u32, u32>,
-    pub audio_out_state: HashMap<u32, u8>,
-    pub audio_out_next_free: HashMap<u32, std::time::Instant>,
-    pub audio_out_played_samples: HashMap<u32, u64>,
-    pub audio_out_spill: HashMap<u32, VecDeque<f32>>,
-    pub audio_out_released_count: HashMap<u32, u64>,
-    pub audio_out_due_signaled: HashMap<u32, u64>,
-    pub audio_out_consumed_base: HashMap<u32, u64>,
-    pub audio_out_appended_frames: HashMap<u32, u64>,
+    pub audio_out_last_tick: std::time::Instant,
 
     pub audio_renderers: HashMap<(u32, u32), AudioRendererState>,
     pub audio_renderer_events: HashMap<(u32, u32), u32>,
     pub audio_renderer_frame_counter: u64,
     pub audio_renderer_last_tick: std::time::Instant,
     pub audio_renderer_last_consumed: u64,
+    pub hwopus_decoders: HashMap<(u32, u32), crate::services::hwopus::DecoderState>,
 }
 
 #[derive(Clone, Debug)]
@@ -261,22 +245,15 @@ impl Kernel {
             font_offsets: [(0, 0); 6],
             time_shmem: None,
             time_shmem_handle: None,
-            audio_out_buffers: HashMap::new(),
+            audio_out_sessions: HashMap::new(),
             audio_buffer_events: HashMap::new(),
-            audio_out_volumes: HashMap::new(),
-            audio_out_state: HashMap::new(),
-            audio_out_next_free: HashMap::new(),
-            audio_out_played_samples: HashMap::new(),
-            audio_out_spill: HashMap::new(),
-            audio_out_released_count: HashMap::new(),
-            audio_out_due_signaled: HashMap::new(),
-            audio_out_consumed_base: HashMap::new(),
-            audio_out_appended_frames: HashMap::new(),
+            audio_out_last_tick: std::time::Instant::now(),
             audio_renderers: HashMap::new(),
             audio_renderer_events: HashMap::new(),
             audio_renderer_frame_counter: 0,
             audio_renderer_last_tick: std::time::Instant::now(),
             audio_renderer_last_consumed: 0,
+            hwopus_decoders: HashMap::new(),
         }
     }
 
@@ -613,6 +590,14 @@ impl Kernel {
         const FRAMES_PER_AUDIO_FRAME: u64 = 240;
         const MAX_BACKLOG_BLOCKS: u64 = 400;
         const TARGET_QUEUE_BLOCKS: u64 = 16;
+
+        let now = std::time::Instant::now();
+        if now.saturating_duration_since(self.audio_out_last_tick)
+            >= std::time::Duration::from_millis(5)
+        {
+            self.audio_out_last_tick = now;
+            crate::services::audio_out::handlers::poll_audio_outs(self);
+        }
 
         let to_signal: Vec<u32> = self
             .audio_renderers
