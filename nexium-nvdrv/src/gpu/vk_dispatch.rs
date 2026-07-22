@@ -4840,11 +4840,7 @@ fn execute_one(
     } else {
         stencil_front
     };
-    let (front_face, present_flip_y) = maxwell_draw_orientation(
-        draw.window_origin,
-        draw.viewport.y_negate(),
-        draw.front_face,
-    );
+    let (front_face, present_flip_y) = maxwell_draw_orientation(draw.window_origin, draw.front_face);
 
     let call = Maxwell3dDrawCall {
         vs_spirv,
@@ -6020,18 +6016,14 @@ fn flip_front_face(v: u32) -> u32 {
     }
 }
 
-fn maxwell_draw_orientation(
-    window_origin: WindowOrigin,
-    viewport_y_negate: bool,
-    front_face: u32,
-) -> (u32, bool) {
+fn maxwell_draw_orientation(window_origin: WindowOrigin, front_face: u32) -> (u32, bool) {
     let front_face = if window_origin.triangle_rast_flip() {
         flip_front_face(front_face)
     } else {
         front_face
     };
 
-    (front_face, window_origin.lower_left() ^ viewport_y_negate)
+    (front_face, false)
 }
 
 fn map_color_write_mask(raw: u32) -> vk::ColorComponentFlags {
@@ -9758,24 +9750,16 @@ mod tests {
     };
 
     #[test]
-    fn window_origin_controls_present_row_order() {
+    fn triangle_rast_flip_changes_winding_not_present_row_order() {
         use crate::gpu::engines::maxwell3d::WindowOrigin;
 
         assert_eq!(
-            maxwell_draw_orientation(WindowOrigin { raw: 0x10 }, false, 0x0900),
+            maxwell_draw_orientation(WindowOrigin { raw: 0x10 }, 0x0900),
             (0x0901, false)
         );
         assert_eq!(
-            maxwell_draw_orientation(WindowOrigin { raw: 0 }, false, 0x0900),
+            maxwell_draw_orientation(WindowOrigin { raw: 0 }, 0x0900),
             (0x0900, false)
-        );
-        assert_eq!(
-            maxwell_draw_orientation(WindowOrigin { raw: 1 }, false, 0x0900),
-            (0x0900, true)
-        );
-        assert_eq!(
-            maxwell_draw_orientation(WindowOrigin { raw: 0 }, true, 0x0900),
-            (0x0900, true)
         );
     }
 
