@@ -32,6 +32,8 @@ impl ShaderCompiler {
             return Ok(module);
         }
 
+        Self::validate_module_spirv(spirv, label, hash)?;
+
         if std::env::var_os("NEXIUM_SHADER_MODULE_DBG").is_some() {
             log::warn!(
                 "[shader-module] create {} hash={:016x} words={}",
@@ -65,6 +67,16 @@ impl ShaderCompiler {
         Ok(module)
     }
 
+    fn validate_module_spirv(spirv: &[u32], label: &str, hash: u64) -> Result<(), String> {
+        if nexium_spirv::phi_preds_consistent(spirv) {
+            return Ok(());
+        }
+        Err(format!(
+            "Rejected shader module {} hash={:016x}: invalid SPIR-V phi predecessors",
+            label, hash
+        ))
+    }
+
     fn hash_spirv(spirv: &[u32]) -> u64 {
         let mut hash: u64 = 0xcbf29ce484222325;
         for word in spirv {
@@ -88,5 +100,19 @@ impl Drop for ShaderCompiler {
         if !self.modules.is_empty() {
             log::warn!("ShaderCompiler dropped without explicit cleanup");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShaderCompiler;
+
+    #[test]
+    fn malformed_spirv_is_rejected_before_module_creation() {
+        let words = [0];
+        let hash = ShaderCompiler::hash_spirv(&words);
+        let error = ShaderCompiler::validate_module_spirv(&words, "cached-fs", hash)
+            .expect_err("malformed SPIR-V must be rejected");
+        assert!(error.contains("invalid SPIR-V phi predecessors"));
     }
 }

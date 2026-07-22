@@ -1,9 +1,45 @@
 use ash::vk;
 
+pub use nexium_spirv::{
+    GFX_BINDING_CBUF as CBUF_BINDING, GFX_BINDING_FLOAT_2D as IMAGE2D_BINDING,
+    GFX_BINDING_FLOAT_3D as IMAGE3D_BINDING, GFX_BINDING_FLOAT_CUBE as IMAGE_CUBE_BINDING,
+    GFX_BINDING_FLOAT_CUBE_ARRAY as IMAGE_CUBE_ARRAY_BINDING,
+    GFX_BINDING_FLOAT_TEXEL_BUFFER as TEXEL_BUFFER_BINDING,
+    GFX_BINDING_SAMPLERS as SAMPLER_BINDING, GFX_BINDING_SINT_2D as SINT_IMAGE2D_BINDING,
+    GFX_BINDING_SINT_3D as SINT_IMAGE3D_BINDING,
+    GFX_BINDING_SINT_CUBE as SINT_IMAGE_CUBE_BINDING,
+    GFX_BINDING_SINT_CUBE_ARRAY as SINT_IMAGE_CUBE_ARRAY_BINDING,
+    GFX_BINDING_SINT_TEXEL_BUFFER as SINT_TEXEL_BUFFER_BINDING,
+    GFX_BINDING_SSBO_BASE as SSBO_BINDING_BASE, GFX_BINDING_UINT_2D as UINT_IMAGE2D_BINDING,
+    GFX_BINDING_UINT_3D as UINT_IMAGE3D_BINDING,
+    GFX_BINDING_UINT_CUBE as UINT_IMAGE_CUBE_BINDING,
+    GFX_BINDING_UINT_CUBE_ARRAY as UINT_IMAGE_CUBE_ARRAY_BINDING,
+    GFX_BINDING_UINT_TEXEL_BUFFER as UINT_TEXEL_BUFFER_BINDING,
+};
+
 pub const MAX_TEXTURE_DESCRIPTORS: u32 = 32;
-pub const SSBO_BINDING_BASE: u32 = 3;
 pub const MAX_SSBO: u32 = 8;
-pub const IMAGE3D_BINDING: u32 = 11;
+
+pub const SAMPLED_IMAGE_BINDINGS: [u32; 12] = [
+    IMAGE2D_BINDING,
+    IMAGE3D_BINDING,
+    IMAGE_CUBE_BINDING,
+    IMAGE_CUBE_ARRAY_BINDING,
+    UINT_IMAGE2D_BINDING,
+    UINT_IMAGE3D_BINDING,
+    UINT_IMAGE_CUBE_BINDING,
+    UINT_IMAGE_CUBE_ARRAY_BINDING,
+    SINT_IMAGE2D_BINDING,
+    SINT_IMAGE3D_BINDING,
+    SINT_IMAGE_CUBE_BINDING,
+    SINT_IMAGE_CUBE_ARRAY_BINDING,
+];
+
+pub const TEXEL_BUFFER_BINDINGS: [u32; 3] = [
+    TEXEL_BUFFER_BINDING,
+    UINT_TEXEL_BUFFER_BINDING,
+    SINT_TEXEL_BUFFER_BINDING,
+];
 
 pub struct DescriptorSetLayout {
     pub layout: vk::DescriptorSetLayout,
@@ -13,52 +49,126 @@ pub struct DescriptorPool {
     pub pool: vk::DescriptorPool,
 }
 
-impl DescriptorSetLayout {
-    pub fn new(device: &ash::Device) -> Result<Self, String> {
-        let mut bindings = vec![
-            vk::DescriptorSetLayoutBinding {
-                binding: 0,
-                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                p_immutable_samplers: std::ptr::null(),
-                _marker: std::marker::PhantomData,
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 1,
-                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: MAX_TEXTURE_DESCRIPTORS,
-                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                p_immutable_samplers: std::ptr::null(),
-                _marker: std::marker::PhantomData,
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 2,
-                descriptor_type: vk::DescriptorType::SAMPLER,
-                descriptor_count: MAX_TEXTURE_DESCRIPTORS,
-                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                p_immutable_samplers: std::ptr::null(),
-                _marker: std::marker::PhantomData,
-            },
-        ];
-        for i in 0..MAX_SSBO {
-            bindings.push(vk::DescriptorSetLayoutBinding {
-                binding: SSBO_BINDING_BASE + i,
-                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                p_immutable_samplers: std::ptr::null(),
-                _marker: std::marker::PhantomData,
-            });
-        }
+fn graphics_layout_bindings() -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
+    let mut bindings = vec![
+        vk::DescriptorSetLayoutBinding {
+            binding: CBUF_BINDING,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            p_immutable_samplers: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: IMAGE2D_BINDING,
+            descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+            descriptor_count: MAX_TEXTURE_DESCRIPTORS,
+            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            p_immutable_samplers: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: SAMPLER_BINDING,
+            descriptor_type: vk::DescriptorType::SAMPLER,
+            descriptor_count: MAX_TEXTURE_DESCRIPTORS,
+            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            p_immutable_samplers: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        },
+    ];
+    for i in 0..MAX_SSBO {
         bindings.push(vk::DescriptorSetLayoutBinding {
-            binding: IMAGE3D_BINDING,
+            binding: SSBO_BINDING_BASE + i,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            p_immutable_samplers: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        });
+    }
+    for binding in SAMPLED_IMAGE_BINDINGS.into_iter().skip(1) {
+        bindings.push(vk::DescriptorSetLayoutBinding {
+            binding,
             descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
             descriptor_count: MAX_TEXTURE_DESCRIPTORS,
             stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
             p_immutable_samplers: std::ptr::null(),
             _marker: std::marker::PhantomData,
         });
+    }
+    for binding in TEXEL_BUFFER_BINDINGS {
+        bindings.push(vk::DescriptorSetLayoutBinding {
+            binding,
+            descriptor_type: vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+            descriptor_count: MAX_TEXTURE_DESCRIPTORS,
+            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            p_immutable_samplers: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        });
+    }
+    bindings.sort_unstable_by_key(|binding| binding.binding);
+    bindings
+}
+
+fn graphics_pool_sizes(max_sets: u32) -> [vk::DescriptorPoolSize; 4] {
+    [
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::SAMPLED_IMAGE,
+            descriptor_count: max_sets.saturating_mul(MAX_TEXTURE_DESCRIPTORS * 12),
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::SAMPLER,
+            descriptor_count: max_sets.saturating_mul(MAX_TEXTURE_DESCRIPTORS),
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: max_sets.saturating_mul(MAX_SSBO + 1),
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+            descriptor_count: max_sets.saturating_mul(MAX_TEXTURE_DESCRIPTORS * 3),
+        },
+    ]
+}
+
+#[cfg(test)]
+fn graphics_write_specs() -> Vec<(u32, vk::DescriptorType, u32)> {
+    let mut specs = vec![
+        (CBUF_BINDING, vk::DescriptorType::STORAGE_BUFFER, 1),
+        (
+            SAMPLER_BINDING,
+            vk::DescriptorType::SAMPLER,
+            MAX_TEXTURE_DESCRIPTORS,
+        ),
+    ];
+    specs.extend((0..MAX_SSBO).map(|slot| {
+        (
+            SSBO_BINDING_BASE + slot,
+            vk::DescriptorType::STORAGE_BUFFER,
+            1,
+        )
+    }));
+    specs.extend(SAMPLED_IMAGE_BINDINGS.map(|binding| {
+        (
+            binding,
+            vk::DescriptorType::SAMPLED_IMAGE,
+            MAX_TEXTURE_DESCRIPTORS,
+        )
+    }));
+    specs.extend(TEXEL_BUFFER_BINDINGS.map(|binding| {
+        (
+            binding,
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+            MAX_TEXTURE_DESCRIPTORS,
+        )
+    }));
+    specs.sort_unstable_by_key(|spec| spec.0);
+    specs
+}
+
+impl DescriptorSetLayout {
+    pub fn new(device: &ash::Device) -> Result<Self, String> {
+        let bindings = graphics_layout_bindings();
 
         let layout_info = vk::DescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -81,24 +191,7 @@ impl DescriptorSetLayout {
 
 impl DescriptorPool {
     pub fn new(device: &ash::Device, max_sets: u32) -> Result<Self, String> {
-        let pool_sizes = [
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: max_sets,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: max_sets.saturating_mul(MAX_TEXTURE_DESCRIPTORS * 2),
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: max_sets.saturating_mul(MAX_TEXTURE_DESCRIPTORS),
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: max_sets.saturating_mul(MAX_SSBO),
-            },
-        ];
+        let pool_sizes = graphics_pool_sizes(max_sets);
 
         let pool_info = vk::DescriptorPoolCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
@@ -118,6 +211,12 @@ impl DescriptorPool {
 
         Ok(Self { pool })
     }
+
+    pub fn into_raw(mut self) -> vk::DescriptorPool {
+        let pool = self.pool;
+        self.pool = vk::DescriptorPool::null();
+        pool
+    }
 }
 
 impl Drop for DescriptorSetLayout {
@@ -132,6 +231,86 @@ impl Drop for DescriptorPool {
     fn drop(&mut self) {
         if self.pool != vk::DescriptorPool::null() {
             log::warn!("DescriptorPool dropped without explicit cleanup");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphics_typed_image_bindings_match_the_public_abi() {
+        assert_eq!(
+            SAMPLED_IMAGE_BINDINGS,
+            [1, 11, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23]
+        );
+        assert_eq!(TEXEL_BUFFER_BINDINGS, [14, 19, 24]);
+
+        let bindings = SAMPLED_IMAGE_BINDINGS
+            .into_iter()
+            .chain(TEXEL_BUFFER_BINDINGS);
+        let unique = bindings.clone().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), bindings.count());
+        assert!(unique.iter().all(|binding| {
+            *binding != SAMPLER_BINDING
+                && !(*binding >= SSBO_BINDING_BASE
+                    && *binding < SSBO_BINDING_BASE + MAX_SSBO)
+        }));
+
+        let layout = graphics_layout_bindings();
+        assert_eq!(layout.len(), 25);
+        assert_eq!(
+            layout.iter().map(|binding| binding.binding).collect::<Vec<_>>(),
+            (0..=24).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            layout
+                .iter()
+                .filter(|binding| binding.descriptor_type == vk::DescriptorType::SAMPLED_IMAGE)
+                .count(),
+            12
+        );
+        assert_eq!(
+            layout
+                .iter()
+                .filter(|binding| {
+                    binding.descriptor_type == vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                })
+                .count(),
+            3
+        );
+        let cbuf = &layout[CBUF_BINDING as usize];
+        assert_eq!(cbuf.descriptor_type, vk::DescriptorType::STORAGE_BUFFER);
+        assert_eq!(cbuf.descriptor_count, 1);
+
+        let pool = graphics_pool_sizes(7);
+        assert_eq!(pool.len(), 4);
+        let count = |ty| {
+            pool.iter()
+                .find(|size| size.ty == ty)
+                .map(|size| size.descriptor_count)
+        };
+        assert_eq!(count(vk::DescriptorType::SAMPLED_IMAGE), Some(7 * 32 * 12));
+        assert_eq!(count(vk::DescriptorType::UNIFORM_TEXEL_BUFFER), Some(7 * 32 * 3));
+        assert_eq!(count(vk::DescriptorType::SAMPLER), Some(7 * 32));
+        assert_eq!(count(vk::DescriptorType::STORAGE_BUFFER), Some(7 * 9));
+        assert_eq!(count(vk::DescriptorType::UNIFORM_BUFFER), None);
+
+        let writes = graphics_write_specs();
+        assert_eq!(writes.len(), 25);
+        assert_eq!(
+            writes.iter().map(|spec| spec.0).collect::<Vec<_>>(),
+            (0..=24).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            writes[CBUF_BINDING as usize],
+            (CBUF_BINDING, vk::DescriptorType::STORAGE_BUFFER, 1)
+        );
+        for (layout, write) in layout.iter().zip(writes) {
+            assert_eq!(layout.binding, write.0);
+            assert_eq!(layout.descriptor_type, write.1);
+            assert_eq!(layout.descriptor_count, write.2);
         }
     }
 }

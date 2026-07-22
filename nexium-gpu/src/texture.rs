@@ -1,6 +1,8 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TicFormat {
     R32G32B32A32,
+    R32G32,
+    R16G16B16A16,
     A8B8G8R8,
     A2B10G10R10,
     R8G8B8A8,
@@ -12,6 +14,7 @@ pub enum TicFormat {
     R16,
     R16G16,
     R32,
+    G24R8,
     Z32,
     Z24S8,
     X8Z24,
@@ -83,17 +86,20 @@ impl TicFormat {
     pub fn from_raw(format_word: u32) -> Self {
         match format_word & 0x7F {
             0x01 => TicFormat::R32G32B32A32,
+            0x04 => TicFormat::R32G32,
+            0x03 => TicFormat::R16G16B16A16,
             0x08 => TicFormat::A8B8G8R8,
             0x09 => TicFormat::A2B10G10R10,
             0x0A => TicFormat::A1R5G5B5,
             0x0B => TicFormat::A4R4G4B4,
             0x0C => TicFormat::R16G16,
             0x0F => TicFormat::R32,
+            0x0E => TicFormat::G24R8,
             0x15 => TicFormat::R5G6B5,
             0x12 => TicFormat::R16,
             0x1B => TicFormat::R16,
-            0x1C => TicFormat::R8G8,
-            0x1D => TicFormat::R8,
+            0x18 => TicFormat::R8G8,
+            0x1C | 0x1D => TicFormat::R8,
             0x21 => TicFormat::B10G11R11,
             0x24 => TicFormat::BC1,
             0x25 => TicFormat::BC2,
@@ -127,10 +133,12 @@ impl TicFormat {
     pub fn src_bpp(&self) -> usize {
         match self {
             TicFormat::R32G32B32A32 => 16,
+            TicFormat::R32G32 | TicFormat::R16G16B16A16 => 8,
             TicFormat::A8B8G8R8
             | TicFormat::A2B10G10R10
             | TicFormat::R8G8B8A8
             | TicFormat::R32
+            | TicFormat::G24R8
             | TicFormat::Z32
             | TicFormat::Z24S8
             | TicFormat::X8Z24
@@ -148,23 +156,24 @@ impl TicFormat {
     }
 
     pub fn storage_extent(&self, width: u32, height: u32) -> (u32, u32, usize) {
+        let (block_width, block_height) = self.block_extent();
+        (
+            (width + block_width - 1) / block_width,
+            (height + block_height - 1) / block_height,
+            self.src_bpp(),
+        )
+    }
+
+    pub fn block_extent(&self) -> (u32, u32) {
         match self {
             TicFormat::BC1
             | TicFormat::BC2
             | TicFormat::BC3
             | TicFormat::BC4
             | TicFormat::BC5
-            | TicFormat::BC7 => ((width + 3) / 4, (height + 3) / 4, self.src_bpp()),
-            TicFormat::Astc(bw, bh) => {
-                let bw = *bw as u32;
-                let bh = *bh as u32;
-                (
-                    (width + bw - 1) / bw,
-                    (height + bh - 1) / bh,
-                    self.src_bpp(),
-                )
-            }
-            _ => (width, height, self.src_bpp()),
+            | TicFormat::BC7 => (4, 4),
+            TicFormat::Astc(bw, bh) => (*bw as u32, *bh as u32),
+            _ => (1, 1),
         }
     }
 
@@ -197,6 +206,9 @@ pub struct TicEntry {
     pub base_layer: u32,
     pub normalized_coords: bool,
     pub is_srgb: bool,
+    pub max_mip_level: u32,
+    pub res_min_mip_level: u32,
+    pub res_max_mip_level: u32,
 }
 
 impl TicEntry {
@@ -229,14 +241,19 @@ impl TicEntry {
         let gpu_va = (addr_hi << 32) | addr_lo;
 
         let header_version = (w2 >> 21) & 0x7;
-        let is_block_linear = header_version == 3;
+        let is_buffer_header = header_version == 0;
+        let is_block_linear = matches!(header_version, 3 | 4);
 
         let block_width_log2 = if is_block_linear { w3 & 0x7 } else { 0 };
         let block_height_log2 = if is_block_linear { (w3 >> 3) & 0x7 } else { 0 };
         let block_depth_log2 = if is_block_linear { (w3 >> 6) & 0x7 } else { 0 };
         let tile_width_spacing = if is_block_linear { (w3 >> 10) & 0x7 } else { 0 };
 
-        let width = (w4 & 0xFFFF) + 1;
+        let width = if is_buffer_header {
+            ((w3 & 0xFFFF) << 16 | (w4 & 0xFFFF)).checked_add(1)?
+        } else {
+            (w4 & 0xFFFF) + 1
+        };
         let layer_base_0_2 = (w4 >> 16) & 0x7;
         let layer_base_3_7 = (w2 >> 16) & 0x1F;
         let layer_base_8_10 = (w2 >> 29) & 0x7;
@@ -247,8 +264,17 @@ impl TicEntry {
         let height = (w5 & 0xFFFF) + 1;
         let depth = ((w5 >> 16) & 0x3FFF) + 1;
         let normalized_coords = (w5 >> 31) & 1 != 0;
+        let w7 = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
+        let max_mip_level = (w3 >> 28) & 0xF;
+        let res_min_mip_level = w7 & 0xF;
+        let res_max_mip_level = (w7 >> 4) & 0xF;
 
-        if gpu_va == 0 || width == 0 || height == 0 || width > 16384 || height > 16384 {
+        if gpu_va == 0
+            || width == 0
+            || height == 0
+            || (!is_buffer_header && width > 16384)
+            || (!is_buffer_header && height > 16384)
+        {
             return None;
         }
 
@@ -269,8 +295,219 @@ impl TicEntry {
             base_layer,
             normalized_coords,
             is_srgb,
+            max_mip_level,
+            res_min_mip_level,
+            res_max_mip_level,
         })
     }
+
+    pub fn mip_levels(&self) -> u32 {
+        if self.is_buffer() {
+            1
+        } else {
+            self.max_mip_level.saturating_add(1)
+        }
+    }
+
+    pub fn is_buffer(&self) -> bool {
+        self.texture_type == 6
+    }
+
+    pub fn view_base_mip(&self) -> u32 {
+        self.res_min_mip_level.min(self.max_mip_level)
+    }
+
+    pub fn view_mip_levels(&self) -> u32 {
+        let base = self.view_base_mip();
+        self.res_max_mip_level
+            .min(self.max_mip_level)
+            .saturating_sub(base)
+            .saturating_add(1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockLinearMipLevel {
+    pub level: u32,
+    pub width: u32,
+    pub height: u32,
+    pub storage_width: u32,
+    pub storage_height: u32,
+    pub block_height_log2: u32,
+    pub stride_alignment_log2: u32,
+    pub guest_offset: usize,
+    pub guest_size: usize,
+    pub linear_size: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockLinearMipLayout {
+    pub levels: Vec<BlockLinearMipLevel>,
+    pub layer_size: usize,
+    pub layer_stride: usize,
+}
+
+impl BlockLinearMipLayout {
+    pub fn guest_size_bytes(&self, layers: u32) -> usize {
+        if layers > 1 {
+            self.layer_stride.saturating_mul(layers as usize)
+        } else {
+            self.layer_size
+        }
+    }
+}
+
+pub fn block_linear_mip_layout(tic: &TicEntry) -> Option<BlockLinearMipLayout> {
+    if !tic.is_block_linear || tic.texture_type == 2 {
+        return None;
+    }
+
+    let mip_levels = tic.mip_levels();
+    let bpp = tic.format.src_bpp();
+    let bpp_log2 = bpp.checked_ilog2()?;
+    if (1usize << bpp_log2) != bpp {
+        return None;
+    }
+
+    let mut levels = Vec::with_capacity(mip_levels as usize);
+    let mut layer_size = 0usize;
+    for level in 0..mip_levels {
+        let width = (tic.width >> level).max(1);
+        let height = (tic.height >> level).max(1);
+        let (storage_width, storage_height, _) = tic.format.storage_extent(width, height);
+        let width_bytes = storage_width.saturating_mul(bpp as u32);
+
+        let single_base_level = level == 0 && mip_levels == 1;
+        let block_width_log2 = if single_base_level {
+            tic.block_width_log2
+        } else {
+            adjusted_mip_block_log2(width_bytes, tic.block_width_log2, 64)
+        };
+        let block_height_log2 = if single_base_level {
+            tic.block_height_log2
+        } else {
+            adjusted_mip_block_log2(storage_height, tic.block_height_log2, 8)
+        };
+        let block_depth_log2 = if single_base_level {
+            tic.block_depth_log2
+        } else {
+            adjusted_mip_block_log2(1, tic.block_depth_log2, 1)
+        };
+
+        let stride_gob_width_log2 = 6u32
+            .saturating_sub(bpp_log2)
+            .saturating_add(tic.tile_width_spacing);
+        let stride_gob_height_log2 = 3u32.saturating_add(tic.block_height_log2);
+        let stride_is_small = storage_width <= (1u32 << stride_gob_width_log2.min(31))
+            || storage_height <= (1u32 << stride_gob_height_log2.min(31))
+            || 1 < (1u32 << tic.block_depth_log2.min(31));
+        let stride_alignment_log2 =
+            6u32.saturating_sub(bpp_log2)
+                .saturating_add(if stride_is_small {
+                    0
+                } else {
+                    tic.tile_width_spacing
+                });
+
+        let mut gobs_w = div_ceil_u32(width_bytes, 64);
+        let gobs_h = div_ceil_u32(storage_height, 8);
+        let gob_width_log2 = 6u32
+            .saturating_sub(bpp_log2)
+            .saturating_add(tic.tile_width_spacing);
+        let gob_height_log2 = 3u32.saturating_add(tic.block_height_log2);
+        let is_small = width_bytes <= (1u32 << gob_width_log2.min(31))
+            || storage_height <= (1u32 << gob_height_log2.min(31))
+            || 1 < (1u32 << tic.block_depth_log2.min(31));
+        if !is_small && tic.tile_width_spacing != 0 {
+            gobs_w = align_up_log2_u32(gobs_w, tic.tile_width_spacing);
+        }
+
+        let tiles_w = div_ceil_pow2_u32(gobs_w, block_width_log2);
+        let tiles_h = div_ceil_pow2_u32(gobs_h, block_height_log2);
+        let tiles_d = div_ceil_pow2_u32(1, block_depth_log2);
+        let tile_count = (tiles_w as usize)
+            .saturating_mul(tiles_h as usize)
+            .saturating_mul(tiles_d as usize);
+        let guest_size = tile_count
+            .checked_shl(
+                9u32.saturating_add(block_width_log2)
+                    .saturating_add(block_height_log2)
+                    .saturating_add(block_depth_log2),
+            )
+            .unwrap_or(usize::MAX);
+        let linear_size = tic.format.linear_size(width, height);
+        levels.push(BlockLinearMipLevel {
+            level,
+            width,
+            height,
+            storage_width,
+            storage_height,
+            block_height_log2,
+            stride_alignment_log2,
+            guest_offset: layer_size,
+            guest_size,
+            linear_size,
+        });
+        layer_size = layer_size.saturating_add(guest_size);
+    }
+
+    let alignment_log2 = if tic.tile_width_spacing != 0 {
+        9u32.saturating_add(tic.tile_width_spacing)
+            .saturating_add(tic.block_height_log2)
+            .saturating_add(tic.block_depth_log2)
+    } else {
+        let (_, tile_height) = tic.format.block_extent();
+        let aligned_height = align_up_u32(tic.height, tile_height.max(1));
+        let block_height_log2 = adjusted_mip_block_log2(aligned_height, tic.block_height_log2, 8);
+        let block_depth_log2 = adjusted_mip_block_log2(1, tic.block_depth_log2, 1);
+        9u32.saturating_add(block_height_log2)
+            .saturating_add(block_depth_log2)
+    };
+    let layer_stride = align_up_log2_usize(layer_size, alignment_log2);
+    Some(BlockLinearMipLayout {
+        levels,
+        layer_size,
+        layer_stride,
+    })
+}
+
+pub fn texture_guest_size_bytes(tic: &TicEntry, layers: u32) -> Option<usize> {
+    block_linear_mip_layout(tic).map(|layout| layout.guest_size_bytes(layers.max(1)))
+}
+
+fn adjusted_mip_block_log2(size: u32, mut block_log2: u32, gob_extent: u32) -> u32 {
+    while block_log2 > 0 && size <= (1u32 << (block_log2 - 1).min(31)).saturating_mul(gob_extent) {
+        block_log2 -= 1;
+    }
+    block_log2
+}
+
+fn div_ceil_u32(value: u32, divisor: u32) -> u32 {
+    value / divisor + u32::from(value % divisor != 0)
+}
+
+fn div_ceil_pow2_u32(value: u32, shift: u32) -> u32 {
+    let divisor = 1u32 << shift.min(31);
+    div_ceil_u32(value, divisor)
+}
+
+fn align_up_u32(value: u32, alignment: u32) -> u32 {
+    div_ceil_u32(value, alignment).saturating_mul(alignment)
+}
+
+fn align_up_log2_u32(value: u32, shift: u32) -> u32 {
+    let alignment = 1u32 << shift.min(31);
+    align_up_u32(value, alignment)
+}
+
+fn align_up_log2_usize(value: usize, shift: u32) -> usize {
+    let Some(alignment) = 1usize.checked_shl(shift) else {
+        return usize::MAX;
+    };
+    value
+        .checked_add(alignment - 1)
+        .map(|v| v & !(alignment - 1))
+        .unwrap_or(usize::MAX)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -451,15 +688,35 @@ pub fn unswizzle_block_linear(
     bpp: usize,
     block_height_log2: u32,
 ) -> Vec<u8> {
+    let stride_alignment_log2 = 6u32.saturating_sub(bpp.checked_ilog2().unwrap_or(0));
+    unswizzle_block_linear_strided(
+        src,
+        width_px,
+        height_px,
+        bpp,
+        block_height_log2,
+        stride_alignment_log2,
+    )
+}
+
+pub fn unswizzle_block_linear_strided(
+    src: &[u8],
+    width_px: u32,
+    height_px: u32,
+    bpp: usize,
+    block_height_log2: u32,
+    stride_alignment_log2: u32,
+) -> Vec<u8> {
     let width = width_px as usize;
     let height = height_px as usize;
     let dst_stride = width * bpp;
     let mut dst = vec![0u8; dst_stride * height];
 
-    let width_bytes = width * bpp;
     let block_height = 1usize << block_height_log2 as usize;
     let rows_per_block = block_height * GOB_H;
-    let gobs_per_row = (width_bytes + GOB_W - 1) / GOB_W;
+    let aligned_width = align_up_pow2_usize(width, stride_alignment_log2);
+    let aligned_width_bytes = aligned_width.saturating_mul(bpp);
+    let gobs_per_row = (aligned_width_bytes + GOB_W - 1) / GOB_W;
     let block_row_stride_bytes = gobs_per_row * block_height * GOB_SIZE;
 
     for y in 0..height {
@@ -490,6 +747,57 @@ pub fn unswizzle_block_linear(
     dst
 }
 
+pub fn swizzle_block_linear_strided(
+    src: &[u8],
+    width_px: u32,
+    height_px: u32,
+    bpp: usize,
+    block_height_log2: u32,
+    stride_alignment_log2: u32,
+) -> Vec<u8> {
+    let width = width_px as usize;
+    let height = height_px as usize;
+    let src_stride = width.saturating_mul(bpp);
+
+    let block_height = 1usize << block_height_log2 as usize;
+    let rows_per_block = block_height.saturating_mul(GOB_H);
+    let aligned_width = align_up_pow2_usize(width, stride_alignment_log2);
+    let aligned_width_bytes = aligned_width.saturating_mul(bpp);
+    let gobs_per_row = aligned_width_bytes.div_ceil(GOB_W);
+    let block_row_stride_bytes = gobs_per_row
+        .saturating_mul(block_height)
+        .saturating_mul(GOB_SIZE);
+    let block_rows = height.div_ceil(rows_per_block);
+    let mut dst = vec![0u8; block_rows.saturating_mul(block_row_stride_bytes)];
+
+    for y in 0..height {
+        let block_y = y / rows_per_block;
+        let y_in_block = y - block_y * rows_per_block;
+        let gob_row_in_block = y_in_block / GOB_H;
+        let y_in_gob = y_in_block - gob_row_in_block * GOB_H;
+        let block_row_offset = block_y * block_row_stride_bytes;
+        for x in 0..width {
+            let byte_x = x * bpp;
+            let gob_col = byte_x / GOB_W;
+            let x_in_gob = byte_x - gob_col * GOB_W;
+            let gob_offset =
+                block_row_offset + gob_col * block_height * GOB_SIZE + gob_row_in_block * GOB_SIZE;
+            let in_gob = ((x_in_gob >> 5) & 1) * 256
+                + ((y_in_gob >> 1) & 3) * 64
+                + ((x_in_gob >> 4) & 1) * 32
+                + (y_in_gob & 1) * 16
+                + (x_in_gob & 15);
+            let dst_off = gob_offset + in_gob;
+            let src_off = y * src_stride + byte_x;
+            if src_off + bpp <= src.len() && dst_off + bpp <= dst.len() {
+                dst[dst_off..dst_off + bpp].copy_from_slice(&src[src_off..src_off + bpp]);
+            }
+        }
+    }
+
+    dst
+}
+
 pub fn unswizzle_block_linear_3d(
     src: &[u8],
     width_px: u32,
@@ -505,9 +813,15 @@ pub fn unswizzle_block_linear_3d(
     let depth = depth_px as usize;
     let dst_stride = width.saturating_mul(bpp);
     let mut dst = vec![0u8; dst_stride.saturating_mul(height).saturating_mul(depth)];
-    let width_aligned = align_up_pow2_usize(width, tile_width_spacing);
-    let stride_bytes = width_aligned.saturating_mul(bpp);
-    let gobs_in_x = (stride_bytes + GOB_W - 1) / GOB_W;
+    let gobs_in_x = block_linear_gobs_in_x(
+        width,
+        height,
+        depth,
+        bpp,
+        block_height_log2,
+        block_depth_log2,
+        tile_width_spacing,
+    );
     let block_height = 1usize << block_height_log2 as usize;
     let block_depth = 1usize << block_depth_log2 as usize;
     let block_size = gobs_in_x << (9 + block_height_log2 as usize + block_depth_log2 as usize);
@@ -543,6 +857,126 @@ pub fn unswizzle_block_linear_3d(
     }
 
     dst
+}
+
+pub fn swizzle_block_linear_3d(
+    src: &[u8],
+    width_px: u32,
+    height_px: u32,
+    depth_px: u32,
+    bpp: usize,
+    block_height_log2: u32,
+    block_depth_log2: u32,
+    tile_width_spacing: u32,
+) -> Vec<u8> {
+    let width = width_px as usize;
+    let height = height_px as usize;
+    let depth = depth_px as usize;
+    let src_stride = width.saturating_mul(bpp);
+    let mut dst = vec![
+        0u8;
+        block_linear_byte_size_3d(
+            width_px,
+            height_px,
+            depth_px,
+            bpp,
+            block_height_log2,
+            block_depth_log2,
+            tile_width_spacing,
+        )
+    ];
+    let gobs_in_x = block_linear_gobs_in_x(
+        width,
+        height,
+        depth,
+        bpp,
+        block_height_log2,
+        block_depth_log2,
+        tile_width_spacing,
+    );
+    let block_height = 1usize << block_height_log2 as usize;
+    let block_depth = 1usize << block_depth_log2 as usize;
+    let block_size = gobs_in_x << (9 + block_height_log2 as usize + block_depth_log2 as usize);
+    let slice_size = ((height + block_height * GOB_H - 1) / (block_height * GOB_H)) * block_size;
+    let block_height_mask = block_height - 1;
+    let block_depth_mask = block_depth - 1;
+    let x_shift = 9usize + block_height_log2 as usize + block_depth_log2 as usize;
+
+    for z in 0..depth {
+        let offset_z = (z / block_depth) * slice_size
+            + (z & block_depth_mask) * (GOB_SIZE << block_height_log2 as usize);
+        for y in 0..height {
+            let block_y = y / GOB_H;
+            let offset_y =
+                (block_y / block_height) * block_size + (block_y & block_height_mask) * GOB_SIZE;
+            let y_in_gob = y & (GOB_H - 1);
+            for x in 0..width {
+                let byte_x = x.saturating_mul(bpp);
+                let offset_x = (byte_x / GOB_W) << x_shift;
+                let x_in_gob = byte_x & (GOB_W - 1);
+                let in_gob = ((x_in_gob >> 5) & 1) * 256
+                    + ((y_in_gob >> 1) & 3) * 64
+                    + ((x_in_gob >> 4) & 1) * 32
+                    + (y_in_gob & 1) * 16
+                    + (x_in_gob & 15);
+                let dst_off = offset_z + offset_y + offset_x + in_gob;
+                let src_off = (z * height * src_stride) + y * src_stride + byte_x;
+                if src_off + bpp <= src.len() && dst_off + bpp <= dst.len() {
+                    dst[dst_off..dst_off + bpp].copy_from_slice(&src[src_off..src_off + bpp]);
+                }
+            }
+        }
+    }
+
+    dst
+}
+
+pub fn block_linear_byte_size_3d(
+    width_px: u32,
+    height_px: u32,
+    depth_px: u32,
+    bpp: usize,
+    block_height_log2: u32,
+    block_depth_log2: u32,
+    tile_width_spacing: u32,
+) -> usize {
+    let gobs_in_x = block_linear_gobs_in_x(
+        width_px as usize,
+        height_px as usize,
+        depth_px as usize,
+        bpp,
+        block_height_log2,
+        block_depth_log2,
+        tile_width_spacing,
+    );
+    let block_height = 1usize << block_height_log2 as usize;
+    let block_depth = 1usize << block_depth_log2 as usize;
+    let block_size = gobs_in_x << (9 + block_height_log2 as usize + block_depth_log2 as usize);
+    let slice_size =
+        ((height_px as usize + block_height * GOB_H - 1) / (block_height * GOB_H)) * block_size;
+    ((depth_px as usize + block_depth - 1) / block_depth).saturating_mul(slice_size)
+}
+
+fn block_linear_gobs_in_x(
+    width: usize,
+    height: usize,
+    depth: usize,
+    bpp: usize,
+    block_height_log2: u32,
+    block_depth_log2: u32,
+    tile_width_spacing: u32,
+) -> usize {
+    let width_bytes = width.saturating_mul(bpp);
+    let raw_gobs = (width_bytes + GOB_W - 1) / GOB_W;
+    let gob_width_bytes = GOB_W.checked_shl(tile_width_spacing).unwrap_or(usize::MAX);
+    let gob_height = GOB_H.checked_shl(block_height_log2).unwrap_or(usize::MAX);
+    let block_depth = 1usize.checked_shl(block_depth_log2).unwrap_or(usize::MAX);
+    let small = width_bytes <= gob_width_bytes || height <= gob_height || depth < block_depth;
+    if small {
+        raw_gobs
+    } else {
+        align_up_pow2_usize(raw_gobs, tile_width_spacing)
+    }
 }
 
 fn align_up_pow2_usize(value: usize, shift: u32) -> usize {
@@ -794,6 +1228,18 @@ fn float_to_u8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exponent = (bits >> 10) & 0x1f;
+    let mantissa = bits & 0x03ff;
+    match exponent {
+        0 => sign * 2f32.powi(-14) * (mantissa as f32 / 1024.0),
+        0x1f if mantissa == 0 => sign * f32::INFINITY,
+        0x1f => f32::NAN,
+        _ => sign * 2f32.powi(exponent as i32 - 15) * (1.0 + mantissa as f32 / 1024.0),
+    }
+}
+
 fn decode_b10g11r11(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
     let pixels = width as usize * height as usize;
     for i in 0..pixels.min(src.len() / 4) {
@@ -924,12 +1370,10 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
         }
         TicFormat::R8G8 => {
             for i in 0..pixels.min(src.len() / 2) {
-                let intensity = src[i * 2];
-                let alpha = src[i * 2 + 1];
-                out[i * 4] = intensity;
-                out[i * 4 + 1] = intensity;
-                out[i * 4 + 2] = intensity;
-                out[i * 4 + 3] = alpha;
+                out[i * 4] = src[i * 2];
+                out[i * 4 + 1] = src[i * 2 + 1];
+                out[i * 4 + 2] = 0;
+                out[i * 4 + 3] = 0xFF;
             }
         }
         TicFormat::R16 => {
@@ -980,6 +1424,25 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
                 ])));
             }
         }
+        TicFormat::R32G32 => {
+            for i in 0..pixels.min(src.len() / 8) {
+                let off = i * 8;
+                out[i * 4] = float_to_u8(f32::from_bits(u32::from_le_bytes([
+                    src[off],
+                    src[off + 1],
+                    src[off + 2],
+                    src[off + 3],
+                ])));
+                out[i * 4 + 1] = float_to_u8(f32::from_bits(u32::from_le_bytes([
+                    src[off + 4],
+                    src[off + 5],
+                    src[off + 6],
+                    src[off + 7],
+                ])));
+                out[i * 4 + 2] = 0;
+                out[i * 4 + 3] = 0xFF;
+            }
+        }
         TicFormat::R32 | TicFormat::Z32 => {
             for i in 0..pixels.min(src.len() / 4) {
                 let raw = u32::from_le_bytes([
@@ -993,6 +1456,31 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
                 out[i * 4 + 1] = v;
                 out[i * 4 + 2] = v;
                 out[i * 4 + 3] = 0xFF;
+            }
+        }
+        TicFormat::G24R8 => {
+            for i in 0..pixels.min(src.len() / 4) {
+                let raw = u32::from_le_bytes([
+                    src[i * 4],
+                    src[i * 4 + 1],
+                    src[i * 4 + 2],
+                    src[i * 4 + 3],
+                ]);
+                out[i * 4] = (raw & 0xff) as u8;
+                out[i * 4 + 1] = (raw >> 24) as u8;
+                out[i * 4 + 2] = 0;
+                out[i * 4 + 3] = 0xff;
+            }
+        }
+        TicFormat::R16G16B16A16 => {
+            for i in 0..pixels.min(src.len() / 8) {
+                let src_off = i * 8;
+                let dst_off = i * 4;
+                for component in 0..4 {
+                    let off = src_off + component * 2;
+                    let value = u16::from_le_bytes([src[off], src[off + 1]]);
+                    out[dst_off + component] = float_to_u8(f16_to_f32(value));
+                }
             }
         }
         TicFormat::Z24S8 | TicFormat::X8Z24 | TicFormat::S8Z24 => {
@@ -1064,4 +1552,268 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        block_linear_byte_size_3d, block_linear_mip_layout, decode_to_rgba8,
+        swizzle_block_linear_3d, swizzle_block_linear_strided, texture_guest_size_bytes,
+        unswizzle_block_linear_3d, unswizzle_block_linear_strided, ComponentType, SwizzleSource,
+        TicEntry, TicFormat,
+    };
+
+    #[test]
+    fn parses_named_g24r8_target_descriptor() {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&0x2492_4a0eu32.to_le_bytes());
+        raw[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let tic = TicEntry::parse(&raw).unwrap();
+        assert_eq!(tic.format, TicFormat::G24R8);
+        assert_eq!(tic.format.src_bpp(), 4);
+        assert_eq!(
+            tic.component_types,
+            [
+                ComponentType::Uint,
+                ComponentType::Unorm,
+                ComponentType::Unorm,
+                ComponentType::Unorm,
+            ]
+        );
+        assert_eq!(tic.swizzle, [SwizzleSource::R; 4]);
+    }
+
+    #[test]
+    fn decodes_g24r8_logical_stencil_and_depth_channels() {
+        let rgba = decode_to_rgba8(&0x1234_56abu32.to_le_bytes(), 1, 1, TicFormat::G24R8);
+        assert_eq!(rgba, [0xab, 0x12, 0, 0xff]);
+    }
+
+    #[test]
+    fn decodes_r8g8_as_independent_red_and_green_channels() {
+        let rgba = decode_to_rgba8(&[0x21, 0xe3, 0x7f, 0x80], 2, 1, TicFormat::R8G8);
+        assert_eq!(rgba, [0x21, 0xe3, 0, 0xff, 0x7f, 0x80, 0, 0xff]);
+    }
+
+    #[test]
+    fn parses_maxwell_g8r8_and_maps_video_luma_formats() {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&0x18u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let tic = TicEntry::parse(&raw).unwrap();
+        assert_eq!(tic.format, TicFormat::R8G8);
+        assert_eq!(tic.format.src_bpp(), 2);
+        assert_eq!(TicFormat::from_raw(0x1c), TicFormat::R8);
+        assert_eq!(TicFormat::from_raw(0x1d), TicFormat::R8);
+    }
+
+    #[test]
+    fn parses_r16g16b16a16_float_and_mip_ranges() {
+        let mut raw = [0u8; 32];
+        let w0: u32 = 0x03 | (7 << 7) | (7 << 10) | (7 << 13) | (7 << 16);
+        raw[0..4].copy_from_slice(&w0.to_le_bytes());
+        raw[4..8].copy_from_slice(&1u32.to_le_bytes());
+        raw[12..16].copy_from_slice(&(7u32 << 28).to_le_bytes());
+        raw[28..32].copy_from_slice(&(2u32 | (6 << 4)).to_le_bytes());
+        let tic = TicEntry::parse(&raw).unwrap();
+        assert_eq!(tic.format, TicFormat::R16G16B16A16);
+        assert_eq!(tic.format.src_bpp(), 8);
+        assert_eq!(tic.component_types, [ComponentType::Float; 4]);
+        assert_eq!(tic.mip_levels(), 8);
+        assert_eq!(tic.view_base_mip(), 2);
+        assert_eq!(tic.view_mip_levels(), 5);
+    }
+
+    #[test]
+    fn parses_one_d_buffer_width_from_both_descriptor_words() {
+        let slot8 = [
+            0x1b, 0x92, 0x14, 0x60, 0x00, 0x00, 0x77, 0x03, 0x04, 0x00, 0x00, 0x00, 0x0b, 0x00,
+            0x00, 0x00, 0xff, 0xb7, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let tic = TicEntry::parse(&slot8).unwrap();
+        assert!(tic.is_buffer());
+        assert_eq!(tic.texture_type, 6);
+        assert_eq!(tic.format, TicFormat::R16);
+        assert_eq!(tic.component_types, [ComponentType::Uint; 4]);
+        assert_eq!(
+            tic.swizzle,
+            [
+                SwizzleSource::R,
+                SwizzleSource::Zero,
+                SwizzleSource::Zero,
+                SwizzleSource::One,
+            ]
+        );
+        assert_eq!(tic.gpu_va, 0x403770000);
+        assert_eq!(tic.width, 768_000);
+        assert_eq!(tic.mip_levels(), 1);
+        assert_eq!(tic.format.linear_size(tic.width, 1), 1_536_000);
+
+        let slot9 = [
+            0x0f, 0x92, 0x14, 0x60, 0x00, 0x00, 0x6d, 0x05, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x7f, 0xbb, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let tic = TicEntry::parse(&slot9).unwrap();
+        assert!(tic.is_buffer());
+        assert_eq!(tic.format, TicFormat::R32);
+        assert_eq!(tic.gpu_va, 0x4056d0000);
+        assert_eq!(tic.width, 48_000);
+        assert_eq!(tic.format.linear_size(tic.width, 1), 192_000);
+    }
+
+    #[test]
+    fn decodes_r16g16b16a16_float_for_diagnostics() {
+        let raw = [0x00, 0x00, 0x00, 0x38, 0x00, 0x3c, 0x00, 0x3c];
+        let rgba = decode_to_rgba8(&raw, 1, 1, TicFormat::R16G16B16A16);
+        assert_eq!(rgba, [0, 128, 255, 255]);
+    }
+
+    #[test]
+    fn r16g16b16a16_cube_mips_match_maxwell_layer_stride() {
+        let tic = TicEntry {
+            format: TicFormat::R16G16B16A16,
+            component_types: [ComponentType::Float; 4],
+            swizzle: [
+                SwizzleSource::R,
+                SwizzleSource::G,
+                SwizzleSource::B,
+                SwizzleSource::A,
+            ],
+            gpu_va: 0x5a4fd0000,
+            width: 128,
+            height: 128,
+            block_width_log2: 0,
+            block_height_log2: 4,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            is_block_linear: true,
+            texture_type: 3,
+            depth: 1,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            max_mip_level: 7,
+            res_min_mip_level: 0,
+            res_max_mip_level: 7,
+        };
+        let layout = block_linear_mip_layout(&tic).unwrap();
+        assert_eq!(
+            layout
+                .levels
+                .iter()
+                .map(|level| level.guest_size)
+                .collect::<Vec<_>>(),
+            [0x20000, 0x8000, 0x2000, 0x800, 0x200, 0x200, 0x200, 0x200]
+        );
+        assert_eq!(layout.layer_size, 0x2b000);
+        assert_eq!(layout.layer_stride, 0x2c000);
+        assert_eq!(texture_guest_size_bytes(&tic, 6), Some(0x108000));
+    }
+
+    #[test]
+    fn tile_width_spacing_controls_large_mip_row_stride() {
+        let tic = TicEntry {
+            format: TicFormat::R8,
+            component_types: [ComponentType::Unorm; 4],
+            swizzle: [SwizzleSource::R; 4],
+            gpu_va: 1,
+            width: 1025,
+            height: 9,
+            block_width_log2: 0,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+            tile_width_spacing: 4,
+            is_block_linear: true,
+            texture_type: 1,
+            depth: 1,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            max_mip_level: 1,
+            res_min_mip_level: 0,
+            res_max_mip_level: 1,
+        };
+        let layout = block_linear_mip_layout(&tic).unwrap();
+        assert_eq!(layout.levels[0].stride_alignment_log2, 10);
+        assert_eq!(layout.levels[1].stride_alignment_log2, 6);
+
+        let mut guest = vec![0u8; 12_289];
+        guest[12_288] = 0xa5;
+        let linear = unswizzle_block_linear_strided(&guest, 513, 9, 1, 0, 10);
+        assert_eq!(linear[8 * 513 + 512], 0xa5);
+    }
+
+    #[test]
+    fn strided_block_linear_mip_swizzle_round_trips() {
+        let linear: Vec<u8> = (0..64usize * 32 * 2)
+            .map(|index| index.wrapping_mul(37) as u8)
+            .collect();
+        let guest = swizzle_block_linear_strided(&linear, 64, 32, 2, 2, 5);
+        assert_eq!(guest.len(), 0x1000);
+        assert_eq!(
+            unswizzle_block_linear_strided(&guest, 64, 32, 2, 2, 5),
+            linear
+        );
+    }
+
+    #[test]
+    fn single_mip_preserves_maxwell_base_block_height() {
+        let tic = TicEntry {
+            format: TicFormat::R8,
+            component_types: [ComponentType::Unorm; 4],
+            swizzle: [SwizzleSource::R; 4],
+            gpu_va: 1,
+            width: 1,
+            height: 1,
+            block_width_log2: 0,
+            block_height_log2: 4,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            is_block_linear: true,
+            texture_type: 1,
+            depth: 1,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            max_mip_level: 0,
+            res_min_mip_level: 0,
+            res_max_mip_level: 0,
+        };
+        let layout = block_linear_mip_layout(&tic).unwrap();
+        assert_eq!(layout.levels[0].block_height_log2, 4);
+        assert_eq!(layout.levels[0].guest_size, 0x2000);
+        assert_eq!(texture_guest_size_bytes(&tic, 1), Some(0x2000));
+    }
+
+    #[test]
+    fn block_linear_3d_round_trip_preserves_tight_texels() {
+        let (width, height, depth, bpp) = (13, 11, 5, 4usize);
+        let linear: Vec<u8> = (0..width * height * depth * bpp as u32)
+            .map(|index| index.wrapping_mul(37).wrapping_add(11) as u8)
+            .collect();
+        let tiled = swizzle_block_linear_3d(&linear, width, height, depth, bpp, 1, 1, 2);
+        assert_eq!(
+            tiled.len(),
+            block_linear_byte_size_3d(width, height, depth, bpp, 1, 1, 2)
+        );
+        assert_eq!(
+            unswizzle_block_linear_3d(&tiled, width, height, depth, bpp, 1, 1, 2),
+            linear
+        );
+    }
+
+    #[test]
+    fn block_linear_3d_large_level_uses_maxwell_tile_spacing_stride() {
+        let (width, height, depth, bpp) = (1025, 17, 2, 4usize);
+        let mut linear = vec![0u8; width as usize * height as usize * depth as usize * bpp];
+        let tight_offset = 0x22084;
+        let marker = [0x12, 0x34, 0x56, 0x78];
+        linear[tight_offset..tight_offset + marker.len()].copy_from_slice(&marker);
+
+        let tiled = swizzle_block_linear_3d(&linear, width, height, depth, bpp, 1, 1, 4);
+        assert_eq!(tiled.len(), 0x50000);
+        assert_eq!(&tiled[0x48400..0x48404], &marker);
+    }
 }

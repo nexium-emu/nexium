@@ -28,12 +28,23 @@ pub struct PipelineKey {
     pub blend_signature: u64,
     pub raster_state_packed: u32,
     pub depth_state_packed: u32,
+    pub depth_format: i32,
+    pub depth_aspects: u32,
+    pub stencil_enabled: bool,
+    pub stencil_front: [u32; 7],
+    pub stencil_back: [u32; 7],
     pub depth_clamp_enabled: bool,
     pub poly_offset_packed: u64,
     pub color_write_mask: u32,
 }
 
-const SPEC_VERSION: u32 = 14;
+const SPEC_VERSION: u32 = 30;
+const KNOWN_DRIVER_HOSTILE_PIPELINES: &[(u64, u64)] =
+    &[(0x59b9_0e74_4b2a_7537, 0xe505_d075_601e_e633)];
+
+pub(crate) fn known_driver_hostile_pipeline(vs_hash: u64, fs_hash: u64) -> bool {
+    KNOWN_DRIVER_HOSTILE_PIPELINES.contains(&(vs_hash, fs_hash))
+}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineSpec {
@@ -48,10 +59,14 @@ pub struct PipelineSpec {
     pub color_attachment_count: u32,
     pub depth_format: i32,
     pub has_depth: bool,
+    pub depth_aspects: u32,
     pub blend: (bool, i32, i32, i32, i32, i32, i32),
     pub blend_attachments: Vec<(bool, i32, i32, i32, i32, i32, i32, u32)>,
     pub color_write_mask: u32,
     pub depth: (bool, bool, i32),
+    pub stencil_enabled: bool,
+    pub stencil_front: (i32, i32, i32, i32, u32, u32, u32),
+    pub stencil_back: (i32, i32, i32, i32, u32, u32, u32),
     pub depth_clamp_enabled: bool,
     pub cull_test_enable: bool,
     pub cull_face: u32,
@@ -144,6 +159,15 @@ pub fn spec_to_request(
             color_write_mask: vk::ColorComponentFlags::from_raw(att.7),
         };
     }
+    let stencil_face = |face: (i32, i32, i32, i32, u32, u32, u32)| crate::draw::StencilFaceState {
+        fail_op: vk::StencilOp::from_raw(face.0),
+        pass_op: vk::StencilOp::from_raw(face.1),
+        depth_fail_op: vk::StencilOp::from_raw(face.2),
+        compare_op: vk::CompareOp::from_raw(face.3),
+        compare_mask: face.4,
+        write_mask: face.5,
+        reference: face.6,
+    };
     PipelineBuildRequest {
         key: spec.key,
         vs_mod,
@@ -155,6 +179,7 @@ pub fn spec_to_request(
         color_formats: spec_color_formats(spec),
         depth_format: vk::Format::from_raw(spec.depth_format),
         has_depth: spec.has_depth,
+        depth_aspects: vk::ImageAspectFlags::from_raw(spec.depth_aspects),
         blend: crate::draw::BlendState {
             enabled: attachments[0].enabled,
             src_factor: attachments[0].src_factor,
@@ -170,6 +195,11 @@ pub fn spec_to_request(
             test_enabled: spec.depth.0,
             write_enabled: spec.depth.1,
             compare_op: vk::CompareOp::from_raw(spec.depth.2),
+        },
+        stencil: crate::draw::StencilState {
+            enabled: spec.stencil_enabled,
+            front: stencil_face(spec.stencil_front),
+            back: stencil_face(spec.stencil_back),
         },
         depth_clamp_enabled: spec.depth_clamp_enabled,
         cull_test_enable: spec.cull_test_enable,
@@ -193,8 +223,10 @@ pub struct PipelineBuildRequest {
     pub color_formats: Vec<vk::Format>,
     pub depth_format: vk::Format,
     pub has_depth: bool,
+    pub depth_aspects: vk::ImageAspectFlags,
     pub blend: crate::draw::BlendState,
     pub depth: crate::draw::DepthState,
+    pub stencil: crate::draw::StencilState,
     pub depth_clamp_enabled: bool,
     pub cull_test_enable: bool,
     pub cull_face: u32,
@@ -241,6 +273,12 @@ pub fn build_graphics_pipeline(
     cache_lock: &std::sync::RwLock<()>,
     req: &PipelineBuildRequest,
 ) -> Result<vk::Pipeline, String> {
+    if known_driver_hostile_pipeline(req.key.vs_hash, req.key.fs_hash) {
+        return Err(format!(
+            "rejected driver-hostile shader pair vs_hash={:016x} fs_hash={:016x}",
+            req.key.vs_hash, req.key.fs_hash
+        ));
+    }
     let entry = c"main";
     let stages = [
         vk::PipelineShaderStageCreateInfo {
@@ -409,7 +447,13 @@ pub fn build_graphics_pipeline(
         _marker: std::marker::PhantomData,
     };
 
-    let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dyn_states = [
+        vk::DynamicState::VIEWPORT,
+        vk::DynamicState::SCISSOR,
+        vk::DynamicState::STENCIL_REFERENCE,
+        vk::DynamicState::STENCIL_COMPARE_MASK,
+        vk::DynamicState::STENCIL_WRITE_MASK,
+    ];
     let dyn_state = vk::PipelineDynamicStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         dynamic_state_count: dyn_states.len() as u32,
@@ -419,6 +463,15 @@ pub fn build_graphics_pipeline(
         _marker: std::marker::PhantomData,
     };
 
+    let stencil_face = |face: crate::draw::StencilFaceState| vk::StencilOpState {
+        fail_op: face.fail_op,
+        pass_op: face.pass_op,
+        depth_fail_op: face.depth_fail_op,
+        compare_op: face.compare_op,
+        compare_mask: face.compare_mask,
+        write_mask: face.write_mask,
+        reference: face.reference,
+    };
     let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         depth_test_enable: if req.depth.test_enabled {
@@ -433,20 +486,25 @@ pub fn build_graphics_pipeline(
         },
         depth_compare_op: req.depth.compare_op,
         depth_bounds_test_enable: vk::FALSE,
-        stencil_test_enable: vk::FALSE,
-        front: vk::StencilOpState::default(),
-        back: vk::StencilOpState::default(),
+        stencil_test_enable: if req.stencil.enabled {
+            vk::TRUE
+        } else {
+            vk::FALSE
+        },
+        front: stencil_face(req.stencil.front),
+        back: stencil_face(req.stencil.back),
         min_depth_bounds: 0.0,
         max_depth_bounds: 1.0,
         p_next: std::ptr::null(),
         flags: Default::default(),
         _marker: std::marker::PhantomData,
     };
-    let p_depth_stencil_state: *const vk::PipelineDepthStencilStateCreateInfo = if req.has_depth {
-        &depth_stencil_state
-    } else {
-        std::ptr::null()
-    };
+    let p_depth_stencil_state: *const vk::PipelineDepthStencilStateCreateInfo =
+        if !req.depth_aspects.is_empty() {
+            &depth_stencil_state
+        } else {
+            std::ptr::null()
+        };
 
     let mut rendering_info = vk::PipelineRenderingCreateInfo {
         s_type: vk::StructureType::PIPELINE_RENDERING_CREATE_INFO,
@@ -457,8 +515,16 @@ pub fn build_graphics_pipeline(
         } else {
             color_formats.as_ptr()
         },
-        depth_attachment_format: req.depth_format,
-        stencil_attachment_format: vk::Format::UNDEFINED,
+        depth_attachment_format: if req.depth_aspects.contains(vk::ImageAspectFlags::DEPTH) {
+            req.depth_format
+        } else {
+            vk::Format::UNDEFINED
+        },
+        stencil_attachment_format: if req.depth_aspects.contains(vk::ImageAspectFlags::STENCIL) {
+            req.depth_format
+        } else {
+            vk::Format::UNDEFINED
+        },
         p_next: std::ptr::null(),
         _marker: std::marker::PhantomData,
     };
@@ -488,11 +554,31 @@ pub fn build_graphics_pipeline(
 
     let pipelines = {
         let _guard = cache_lock.read().unwrap_or_else(|e| e.into_inner());
-        unsafe {
+        let pipeline_debug = std::env::var_os("NEXIUM_PIPELINE_DBG").is_some();
+        if pipeline_debug {
+            log::warn!(
+                "[pipeline-build] begin vs_hash={:016x} fs_hash={:016x} topology={} color_attachments={} depth_format={} has_depth={}",
+                req.key.vs_hash,
+                req.key.fs_hash,
+                req.topology.as_raw(),
+                color_attachment_count,
+                req.depth_format.as_raw(),
+                req.has_depth
+            );
+        }
+        let result = unsafe {
             device
                 .create_graphics_pipelines(vk_cache, &[pipeline_info], None)
                 .map_err(|(_, e)| format!("create_graphics_pipelines: {:?}", e))?
+        };
+        if pipeline_debug {
+            log::warn!(
+                "[pipeline-build] end vs_hash={:016x} fs_hash={:016x}",
+                req.key.vs_hash,
+                req.key.fs_hash
+            );
         }
+        result
     };
     Ok(pipelines[0])
 }
@@ -913,5 +999,26 @@ impl Drop for PipelineCache {
         if !self.pipelines.is_empty() || self.layout != vk::PipelineLayout::null() {
             log::warn!("PipelineCache dropped without explicit cleanup");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::known_driver_hostile_pipeline;
+
+    #[test]
+    fn driver_hostile_pipeline_guard_is_pair_specific() {
+        assert!(known_driver_hostile_pipeline(
+            0x59b9_0e74_4b2a_7537,
+            0xe505_d075_601e_e633
+        ));
+        assert!(!known_driver_hostile_pipeline(
+            0x59b9_0e74_4b2a_7537,
+            0xe505_d075_601e_e632
+        ));
+        assert!(!known_driver_hostile_pipeline(
+            0x59b9_0e74_4b2a_7536,
+            0xe505_d075_601e_e633
+        ));
     }
 }
