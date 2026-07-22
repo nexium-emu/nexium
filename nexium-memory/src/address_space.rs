@@ -1,7 +1,7 @@
 use bytemuck::{NoUninit, Pod};
 use parking_lot::Mutex;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -28,6 +28,8 @@ pub enum AddressSpaceError {
     PermissionDenied { va: u64, have: Perm, need: Perm },
     #[error("integer overflow computing va={va:#x} + len={len:#x}")]
     Overflow { va: u64, len: u64 },
+    #[error("failed to commit va={va:#x} len={len:#x}")]
+    CommitFailed { va: u64, len: u64 },
 }
 
 pub type Result<T> = core::result::Result<T, AddressSpaceError>;
@@ -36,6 +38,7 @@ struct Region {
     base: u64,
     buf: NonNull<u8>,
     len: usize,
+    committed_len: AtomicUsize,
     perm: Mutex<Perm>,
     name: String,
     arena: bool,
@@ -52,6 +55,7 @@ impl Region {
                 base,
                 buf,
                 len,
+                committed_len: AtomicUsize::new(len),
                 perm: Mutex::new(perm),
                 name,
                 arena: true,
@@ -64,6 +68,39 @@ impl Region {
             base,
             buf,
             len,
+            committed_len: AtomicUsize::new(len),
+            perm: Mutex::new(perm),
+            name,
+            arena: false,
+        }
+    }
+
+    fn reserved(base: u64, len: usize, perm: Perm, name: String) -> Self {
+        if base
+            .checked_add(len as u64)
+            .is_some_and(|end| end <= crate::fastmem::ARENA_SIZE)
+        {
+            if let Some(arena) = crate::fastmem::base() {
+                let buf = unsafe { NonNull::new_unchecked(arena.add(base as usize)) };
+                return Self {
+                    base,
+                    buf,
+                    len,
+                    committed_len: AtomicUsize::new(0),
+                    perm: Mutex::new(perm),
+                    name,
+                    arena: true,
+                };
+            }
+        }
+        let boxed: Box<[u8]> = vec![0u8; len].into_boxed_slice();
+        let raw = Box::into_raw(boxed);
+        let buf = unsafe { NonNull::new_unchecked(raw as *mut u8) };
+        Self {
+            base,
+            buf,
+            len,
+            committed_len: AtomicUsize::new(0),
             perm: Mutex::new(perm),
             name,
             arena: false,
@@ -78,6 +115,21 @@ impl Region {
     #[inline]
     fn contains(&self, va: u64) -> bool {
         va >= self.base && va < self.end()
+    }
+
+    #[inline]
+    fn committed_len(&self) -> usize {
+        self.committed_len.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn committed_end(&self) -> u64 {
+        self.base + self.committed_len() as u64
+    }
+
+    #[inline]
+    fn committed_contains(&self, va: u64) -> bool {
+        va >= self.base && va < self.committed_end()
     }
 
     #[inline]
@@ -120,8 +172,27 @@ pub struct HostRegion {
 unsafe impl Send for HostRegion {}
 unsafe impl Sync for HostRegion {}
 
+#[derive(Clone, Debug)]
+pub enum HostRegionChange {
+    Upsert(HostRegion),
+    Remove { base: u64, size: u64 },
+}
+
+#[derive(Clone, Debug)]
+pub struct HostRegionChanges {
+    pub generation: u64,
+    pub changes: Vec<HostRegionChange>,
+}
+
+#[derive(Clone, Debug)]
+struct VersionedHostRegionChange {
+    generation: u64,
+    change: HostRegionChange,
+}
+
 pub struct AddressSpace {
     regions: Mutex<Vec<Arc<Region>>>,
+    host_changes: Mutex<Vec<VersionedHostRegionChange>>,
     generation: AtomicU64,
 }
 
@@ -129,6 +200,7 @@ impl AddressSpace {
     pub fn new() -> Self {
         Self {
             regions: Mutex::new(Vec::new()),
+            host_changes: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
         }
     }
@@ -138,6 +210,27 @@ impl AddressSpace {
     }
 
     pub fn map(&self, va: u64, len: u64, perm: Perm, name: impl Into<String>) -> Result<usize> {
+        self.map_inner(va, len, perm, name.into(), true)
+    }
+
+    pub fn map_reserved(
+        &self,
+        va: u64,
+        len: u64,
+        perm: Perm,
+        name: impl Into<String>,
+    ) -> Result<usize> {
+        self.map_inner(va, len, perm, name.into(), false)
+    }
+
+    fn map_inner(
+        &self,
+        va: u64,
+        len: u64,
+        perm: Perm,
+        name: String,
+        commit: bool,
+    ) -> Result<usize> {
         check_aligned("va", va)?;
         check_aligned("len", len)?;
         if len == 0 {
@@ -184,21 +277,76 @@ impl AddressSpace {
             }
         }
 
-        let region = Arc::new(Region::new(va, len as usize, perm, name.into()));
-        log::debug!(
+        let region = Arc::new(if commit {
+            Region::new(va, len as usize, perm, name)
+        } else {
+            Region::reserved(va, len as usize, perm, name)
+        });
+        log::trace!(
             "map va={va:#x} len={len:#x} perm={perm} name={}",
             region.name
         );
+        let host_region = HostRegion {
+            base: region.base,
+            size: region.len as u64,
+            perm: region.perm(),
+            host_ptr: region.buf.as_ptr(),
+        };
         regs.insert(insert_at, region);
-        self.generation.fetch_add(1, Ordering::Release);
+        self.publish_host_change(HostRegionChange::Upsert(host_region));
         Ok(insert_at)
+    }
+
+    pub fn resize_committed(&self, va: u64, len: u64) -> Result<()> {
+        check_aligned("va", va)?;
+        check_aligned("len", len)?;
+
+        let regs = self.regions.lock();
+        let region = regs
+            .binary_search_by_key(&va, |region| region.base)
+            .ok()
+            .and_then(|index| regs.get(index))
+            .filter(|region| len <= region.len as u64)
+            .ok_or(AddressSpaceError::Unmapped {
+                va,
+                len: len as usize,
+            })?;
+        let old_len = region.committed_len();
+        let new_len = len as usize;
+
+        if new_len > old_len {
+            let delta = new_len - old_len;
+            if region.arena {
+                let commit_va = va + old_len as u64;
+                let ptr = crate::fastmem::commit(commit_va, delta).ok_or(
+                    AddressSpaceError::CommitFailed {
+                        va: commit_va,
+                        len: delta as u64,
+                    },
+                )?;
+                debug_assert_eq!(ptr, unsafe { region.buf.as_ptr().add(old_len) });
+            }
+            region.committed_len.store(new_len, Ordering::Release);
+        } else if new_len < old_len {
+            let delta = old_len - new_len;
+            region.committed_len.store(new_len, Ordering::Release);
+            let ptr = unsafe { region.buf.as_ptr().add(new_len) };
+            if region.arena {
+                crate::fastmem::decommit(ptr, delta);
+            } else {
+                unsafe { std::ptr::write_bytes(ptr, 0, delta) };
+            }
+        }
+        Ok(())
     }
 
     pub fn protect(&self, va: u64, len: u64, perm: Perm) -> Result<()> {
         let regs = self.regions.lock();
         let r = regs
-            .iter()
-            .find(|r| r.base == va && r.len as u64 == len)
+            .binary_search_by_key(&va, |r| r.base)
+            .ok()
+            .and_then(|idx| regs.get(idx))
+            .filter(|r| r.len as u64 == len)
             .ok_or(AddressSpaceError::Unmapped {
                 va,
                 len: len as usize,
@@ -211,27 +359,42 @@ impl AddressSpace {
             r.name
         );
         *p = perm;
+        let host_region = HostRegion {
+            base: r.base,
+            size: r.len as u64,
+            perm,
+            host_ptr: r.buf.as_ptr(),
+        };
+        drop(p);
+        self.publish_host_change(HostRegionChange::Upsert(host_region));
         Ok(())
     }
 
     pub fn read(&self, va: u64, buf: &mut [u8]) -> Result<()> {
-        let (region, off) = self.locate(va, buf.len())?;
-        unsafe {
+        let plan = self.plan_range(va, buf.len(), None)?;
+        plan.for_each_chunk(va, buf.len(), |region, region_off, buf_off, len| unsafe {
             std::ptr::copy_nonoverlapping(
-                region.buf.as_ptr().add(off),
-                buf.as_mut_ptr(),
-                buf.len(),
+                region.buf.as_ptr().add(region_off),
+                buf.as_mut_ptr().add(buf_off),
+                len,
             );
-        }
+        });
         Ok(())
     }
 
     pub fn write(&self, va: u64, buf: &[u8]) -> Result<()> {
-        let (region, off) = self.locate(va, buf.len())?;
-        trace_host_write(&region, va, off, buf);
-        unsafe {
-            std::ptr::copy_nonoverlapping(buf.as_ptr(), region.buf.as_ptr().add(off), buf.len());
-        }
+        let plan = self.plan_range(va, buf.len(), None)?;
+        plan.for_each_chunk(va, buf.len(), |region, region_off, buf_off, len| {
+            let chunk = &buf[buf_off..buf_off + len];
+            trace_host_write(region, va + buf_off as u64, region_off, chunk);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    region.buf.as_ptr().add(region_off),
+                    len,
+                );
+            }
+        });
         Ok(())
     }
 
@@ -279,37 +442,30 @@ impl AddressSpace {
     }
 
     pub fn read_checked(&self, va: u64, buf: &mut [u8]) -> Result<()> {
-        let (region, off) = self.locate(va, buf.len())?;
-        if !region.perm().contains(Perm::R) {
-            return Err(AddressSpaceError::PermissionDenied {
-                va,
-                have: region.perm(),
-                need: Perm::R,
-            });
-        }
-        unsafe {
+        let plan = self.plan_range(va, buf.len(), Some(Perm::R))?;
+        plan.for_each_chunk(va, buf.len(), |region, region_off, buf_off, len| unsafe {
             std::ptr::copy_nonoverlapping(
-                region.buf.as_ptr().add(off),
-                buf.as_mut_ptr(),
-                buf.len(),
+                region.buf.as_ptr().add(region_off),
+                buf.as_mut_ptr().add(buf_off),
+                len,
             );
-        }
+        });
         Ok(())
     }
 
     pub fn write_checked(&self, va: u64, buf: &[u8]) -> Result<()> {
-        let (region, off) = self.locate(va, buf.len())?;
-        if !region.perm().contains(Perm::W) {
-            return Err(AddressSpaceError::PermissionDenied {
-                va,
-                have: region.perm(),
-                need: Perm::W,
-            });
-        }
-        trace_host_write(&region, va, off, buf);
-        unsafe {
-            std::ptr::copy_nonoverlapping(buf.as_ptr(), region.buf.as_ptr().add(off), buf.len());
-        }
+        let plan = self.plan_range(va, buf.len(), Some(Perm::W))?;
+        plan.for_each_chunk(va, buf.len(), |region, region_off, buf_off, len| {
+            let chunk = &buf[buf_off..buf_off + len];
+            trace_host_write(region, va + buf_off as u64, region_off, chunk);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    region.buf.as_ptr().add(region_off),
+                    len,
+                );
+            }
+        });
         Ok(())
     }
 
@@ -337,9 +493,31 @@ impl AddressSpace {
             .collect()
     }
 
+    pub fn host_region_changes_since(&self, generation: u64) -> HostRegionChanges {
+        let changes = self.host_changes.lock();
+        let current = self.generation.load(Ordering::Acquire);
+        let first = if generation <= current {
+            changes.partition_point(|change| change.generation <= generation)
+        } else {
+            0
+        };
+        HostRegionChanges {
+            generation: current,
+            changes: changes[first..]
+                .iter()
+                .map(|change| change.change.clone())
+                .collect(),
+        }
+    }
+
     pub fn host_region_at(&self, va: u64) -> Option<HostRegion> {
         let regs = self.regions.lock();
-        regs.iter().find(|r| r.base == va).map(|r| HostRegion {
+        let idx = regs.partition_point(|r| r.base <= va).checked_sub(1)?;
+        let r = &regs[idx];
+        if !r.contains(va) {
+            return None;
+        }
+        Some(HostRegion {
             base: r.base,
             size: r.len as u64,
             perm: r.perm(),
@@ -347,22 +525,162 @@ impl AddressSpace {
         })
     }
 
+    pub fn unmapped_gaps(&self, va: u64, len: u64) -> Result<Vec<(u64, u64)>> {
+        if len == 0 {
+            return Err(AddressSpaceError::ZeroLength { va });
+        }
+        let end = va
+            .checked_add(len)
+            .ok_or(AddressSpaceError::Overflow { va, len })?;
+
+        let regs = self.regions.lock();
+        let first = regs.partition_point(|r| r.end() <= va);
+        let mut gaps = Vec::new();
+        let mut cursor = va;
+
+        for r in &regs[first..] {
+            if r.base >= end {
+                break;
+            }
+            if r.base > cursor {
+                gaps.push((cursor, r.base.min(end)));
+            }
+            cursor = cursor.max(r.end());
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            gaps.push((cursor, end));
+        }
+        Ok(gaps)
+    }
+
     fn locate(&self, va: u64, len: usize) -> Result<(Arc<Region>, usize)> {
         let regs = self.regions.lock();
-        let region = regs
-            .iter()
-            .find(|r| r.contains(va))
+        let idx = regs.partition_point(|r| r.base <= va);
+        let region = idx
+            .checked_sub(1)
+            .and_then(|idx| regs.get(idx))
+            .filter(|r| r.contains(va))
             .cloned()
             .ok_or(AddressSpaceError::Unmapped { va, len })?;
         let off = (va - region.base) as usize;
         if off
             .checked_add(len)
-            .map(|end| end > region.len)
+            .map(|end| end > region.committed_len())
             .unwrap_or(true)
         {
             return Err(AddressSpaceError::Unmapped { va, len });
         }
         Ok((region, off))
+    }
+
+    fn plan_range(&self, va: u64, len: usize, required: Option<Perm>) -> Result<RangePlan> {
+        let regs = self.regions.lock();
+        let (first, last) = validate_range(&regs, va, len, required)?;
+        if first == last {
+            Ok(RangePlan::Single(regs[first].clone()))
+        } else {
+            Ok(RangePlan::Multiple(regs[first..=last].to_vec()))
+        }
+    }
+
+    fn publish_host_change(&self, change: HostRegionChange) {
+        let mut changes = self.host_changes.lock();
+        let generation = self
+            .generation
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .expect("address-space generation overflow");
+        changes.push(VersionedHostRegionChange { generation, change });
+        self.generation.store(generation, Ordering::Release);
+    }
+}
+
+enum RangePlan {
+    Single(Arc<Region>),
+    Multiple(Vec<Arc<Region>>),
+}
+
+impl RangePlan {
+    fn for_each_chunk(&self, va: u64, len: usize, visit: impl FnMut(&Region, usize, usize, usize)) {
+        match self {
+            Self::Single(region) => {
+                for_each_range_chunk(std::slice::from_ref(region), va, len, visit)
+            }
+            Self::Multiple(regions) => for_each_range_chunk(regions, va, len, visit),
+        }
+    }
+}
+
+fn validate_range(
+    regs: &[Arc<Region>],
+    va: u64,
+    len: usize,
+    required: Option<Perm>,
+) -> Result<(usize, usize)> {
+    let end = va
+        .checked_add(len as u64)
+        .ok_or(AddressSpaceError::Overflow {
+            va,
+            len: len as u64,
+        })?;
+    let first = regs
+        .partition_point(|r| r.base <= va)
+        .checked_sub(1)
+        .filter(|idx| regs[*idx].committed_contains(va))
+        .ok_or(AddressSpaceError::Unmapped { va, len })?;
+
+    let mut index = first;
+    let mut cursor = va;
+    loop {
+        let region = regs
+            .get(index)
+            .filter(|r| r.committed_contains(cursor))
+            .ok_or(AddressSpaceError::Unmapped { va, len })?;
+        if let Some(need) = required {
+            let have = region.perm();
+            if !have.contains(need) {
+                return Err(AddressSpaceError::PermissionDenied {
+                    va: cursor,
+                    have,
+                    need,
+                });
+            }
+        }
+        if cursor == end {
+            return Ok((first, index));
+        }
+
+        cursor = region.committed_end().min(end);
+        if cursor == end {
+            return Ok((first, index));
+        }
+        index += 1;
+        if regs.get(index).map(|r| r.base) != Some(cursor) {
+            return Err(AddressSpaceError::Unmapped { va, len });
+        }
+    }
+}
+
+fn for_each_range_chunk(
+    regs: &[Arc<Region>],
+    va: u64,
+    len: usize,
+    mut visit: impl FnMut(&Region, usize, usize, usize),
+) {
+    let mut index = 0;
+    let mut cursor = va;
+    let mut buf_off = 0;
+    while buf_off < len {
+        let region = &regs[index];
+        let region_off = (cursor - region.base) as usize;
+        let chunk_len = (region.len - region_off).min(len - buf_off);
+        visit(region, region_off, buf_off, chunk_len);
+        cursor += chunk_len as u64;
+        buf_off += chunk_len;
+        index += 1;
     }
 }
 
@@ -501,6 +819,58 @@ mod tests {
     }
 
     #[test]
+    fn reserved_region_commits_on_demand() {
+        let a = fresh();
+        let base = 0x7E_0000_0000;
+        a.map_reserved(base, PAGE_SIZE * 3, Perm::RW, "reserved")
+            .unwrap();
+        assert_eq!(a.regions()[0].size, PAGE_SIZE * 3);
+        assert_eq!(
+            a.host_region_at(base + 2 * PAGE_SIZE).unwrap().size,
+            PAGE_SIZE * 3
+        );
+
+        let mut byte = [0u8; 1];
+        assert!(matches!(
+            a.read(base, &mut byte),
+            Err(AddressSpaceError::Unmapped { .. })
+        ));
+
+        a.resize_committed(base, PAGE_SIZE).unwrap();
+        a.write(base + 8, &[0x5a]).unwrap();
+        a.resize_committed(base, PAGE_SIZE * 2).unwrap();
+        a.read(base + 8, &mut byte).unwrap();
+        assert_eq!(byte, [0x5a]);
+        a.write(base + PAGE_SIZE + 8, &[0xa5]).unwrap();
+        a.read(base + PAGE_SIZE + 8, &mut byte).unwrap();
+        assert_eq!(byte, [0xa5]);
+    }
+
+    #[test]
+    fn reserved_region_shrinks_and_regrows_zeroed() {
+        let a = fresh();
+        let base = 0x7E_0100_0000;
+        a.map_reserved(base, PAGE_SIZE * 3, Perm::RW, "reserved")
+            .unwrap();
+        a.resize_committed(base, PAGE_SIZE * 3).unwrap();
+        a.write(base + 2 * PAGE_SIZE + 8, &[0x7c]).unwrap();
+
+        a.resize_committed(base, PAGE_SIZE).unwrap();
+        let mut byte = [0u8; 1];
+        assert!(matches!(
+            a.read(base + PAGE_SIZE, &mut byte),
+            Err(AddressSpaceError::Unmapped { .. })
+        ));
+        a.write(base + 8, &[0x3d]).unwrap();
+        a.read(base + 8, &mut byte).unwrap();
+        assert_eq!(byte, [0x3d]);
+
+        a.resize_committed(base, PAGE_SIZE * 3).unwrap();
+        a.read(base + 2 * PAGE_SIZE + 8, &mut byte).unwrap();
+        assert_eq!(byte, [0]);
+    }
+
+    #[test]
     fn write_spans_page_boundary_within_region() {
         let a = fresh();
         a.map(0x1_0000, PAGE_SIZE * 4, Perm::RW, "multi").unwrap();
@@ -532,13 +902,37 @@ mod tests {
     }
 
     #[test]
-    fn read_crossing_region_boundary_fails() {
+    fn read_write_cross_adjacent_regions() {
         let a = fresh();
-        a.map(0x1_0000, PAGE_SIZE, Perm::RW, "first").unwrap();
-        a.map(0x1_0000 + PAGE_SIZE, PAGE_SIZE, Perm::RW, "second")
+        let base = 0x40_0000;
+        a.map(base, PAGE_SIZE, Perm::RW, "first").unwrap();
+        a.map(base + PAGE_SIZE, PAGE_SIZE, Perm::RW, "second")
             .unwrap();
+
+        let payload = [1, 2, 3, 4, 5, 6, 7, 8];
+        a.write(base + PAGE_SIZE - 4, &payload).unwrap();
         let mut buf = [0u8; 8];
-        let err = a.read(0x1_0000 + PAGE_SIZE - 4, &mut buf).unwrap_err();
+        a.read(base + PAGE_SIZE - 4, &mut buf).unwrap();
+        assert_eq!(buf, payload);
+    }
+
+    #[test]
+    fn range_crossing_gap_fails_without_partial_write() {
+        let a = fresh();
+        let base = 0x50_0000;
+        a.map(base, PAGE_SIZE, Perm::RW, "first").unwrap();
+        a.map(base + PAGE_SIZE * 2, PAGE_SIZE, Perm::RW, "second")
+            .unwrap();
+        a.write(base + PAGE_SIZE - 4, &[0xaa; 4]).unwrap();
+
+        let err = a.write(base + PAGE_SIZE - 4, &[0x55; 8]).unwrap_err();
+        assert!(matches!(err, AddressSpaceError::Unmapped { .. }));
+        let mut tail = [0; 4];
+        a.read(base + PAGE_SIZE - 4, &mut tail).unwrap();
+        assert_eq!(tail, [0xaa; 4]);
+
+        let mut crossing = [0; 8];
+        let err = a.read(base + PAGE_SIZE - 4, &mut crossing).unwrap_err();
         assert!(matches!(err, AddressSpaceError::Unmapped { .. }));
     }
 
@@ -584,6 +978,177 @@ mod tests {
         let mut buf = [0u8; 4];
         let err = a.read_checked(0x1_0000, &mut buf).unwrap_err();
         assert!(matches!(err, AddressSpaceError::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn checked_ranges_prevalidate_all_region_permissions() {
+        let a = fresh();
+        let base = 0x60_0000;
+        a.map(base, PAGE_SIZE, Perm::RW, "rw").unwrap();
+        a.map(base + PAGE_SIZE, PAGE_SIZE, Perm::RO, "ro").unwrap();
+        a.map(base + PAGE_SIZE * 2, PAGE_SIZE, Perm::W, "write-only")
+            .unwrap();
+        a.write(base + PAGE_SIZE - 4, &[0xaa; 8]).unwrap();
+
+        let err = a
+            .write_checked(base + PAGE_SIZE - 4, &[0x55; 8])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AddressSpaceError::PermissionDenied {
+                va,
+                need,
+                ..
+            } if va == base + PAGE_SIZE && need == Perm::W
+        ));
+        let mut unchanged = [0; 8];
+        a.read(base + PAGE_SIZE - 4, &mut unchanged).unwrap();
+        assert_eq!(unchanged, [0xaa; 8]);
+
+        let mut readable = [0; 8];
+        a.read_checked(base + PAGE_SIZE - 4, &mut readable).unwrap();
+        assert_eq!(readable, [0xaa; 8]);
+
+        let mut unreadable = [0; 8];
+        let err = a
+            .read_checked(base + PAGE_SIZE * 2 - 4, &mut unreadable)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AddressSpaceError::PermissionDenied {
+                va,
+                need,
+                ..
+            } if va == base + PAGE_SIZE * 2 && need == Perm::R
+        ));
+    }
+
+    #[test]
+    fn binary_lookups_find_later_regions() {
+        let a = fresh();
+        a.map(0x10_0000, PAGE_SIZE, Perm::RW, "first").unwrap();
+        a.map(0x12_0000, PAGE_SIZE, Perm::RO, "middle").unwrap();
+        a.map(0x14_0000, PAGE_SIZE, Perm::RW, "last").unwrap();
+
+        let middle = a.host_region_at(0x12_0000).unwrap();
+        assert_eq!(middle.base, 0x12_0000);
+        assert_eq!(middle.size, PAGE_SIZE);
+        assert_eq!(middle.perm, Perm::RO);
+        assert_eq!(a.host_region_at(0x12_0080).unwrap().base, 0x12_0000);
+        assert!(a.host_region_at(0x13_0000).is_none());
+
+        a.write(0x14_0080, &[0x5a]).unwrap();
+        let mut byte = [0];
+        a.read(0x14_0080, &mut byte).unwrap();
+        assert_eq!(byte, [0x5a]);
+    }
+
+    #[test]
+    fn host_region_changes_are_incremental_and_track_protection() {
+        let a = fresh();
+        assert_eq!(a.generation(), 0);
+        assert!(a.host_region_changes_since(0).changes.is_empty());
+
+        a.map(0x80_0000, PAGE_SIZE, Perm::RW, "later").unwrap();
+        let first_generation = a.generation();
+        a.map(0x70_0000, PAGE_SIZE, Perm::RO, "earlier").unwrap();
+        let second_generation = a.generation();
+
+        let all = a.host_region_changes_since(0);
+        assert_eq!(all.generation, second_generation);
+        assert_eq!(all.changes.len(), 2);
+        assert!(matches!(
+            &all.changes[0],
+            HostRegionChange::Upsert(region)
+                if region.base == 0x80_0000 && region.perm == Perm::RW
+        ));
+        assert!(matches!(
+            &all.changes[1],
+            HostRegionChange::Upsert(region)
+                if region.base == 0x70_0000 && region.perm == Perm::RO
+        ));
+
+        let incremental = a.host_region_changes_since(first_generation);
+        assert_eq!(incremental.generation, second_generation);
+        assert_eq!(incremental.changes.len(), 1);
+        assert!(matches!(
+            &incremental.changes[0],
+            HostRegionChange::Upsert(region) if region.base == 0x70_0000
+        ));
+
+        a.protect(0x70_0000, PAGE_SIZE, Perm::X).unwrap();
+        let protected = a.host_region_changes_since(second_generation);
+        assert_eq!(protected.generation, a.generation());
+        assert_eq!(protected.changes.len(), 1);
+        assert!(matches!(
+            &protected.changes[0],
+            HostRegionChange::Upsert(region)
+                if region.base == 0x70_0000 && region.perm == Perm::X
+        ));
+        assert!(a
+            .host_region_changes_since(protected.generation)
+            .changes
+            .is_empty());
+    }
+
+    #[test]
+    fn host_region_change_cursors_are_independent() {
+        let a = fresh();
+        let mut cursor_a = 0;
+        let mut cursor_b = 0;
+
+        for page in 0..8u64 {
+            a.map(
+                0x90_0000 + page * PAGE_SIZE,
+                PAGE_SIZE,
+                Perm::RW,
+                "incremental",
+            )
+            .unwrap();
+            let update_a = a.host_region_changes_since(cursor_a);
+            assert_eq!(update_a.changes.len(), 1);
+            cursor_a = update_a.generation;
+        }
+
+        let update_b = a.host_region_changes_since(cursor_b);
+        assert_eq!(update_b.changes.len(), 8);
+        cursor_b = update_b.generation;
+        assert_eq!(cursor_a, cursor_b);
+        assert!(a.host_region_changes_since(cursor_a).changes.is_empty());
+        assert!(a.host_region_changes_since(cursor_b).changes.is_empty());
+    }
+
+    #[test]
+    fn unmapped_gaps_clip_overlapping_regions() {
+        let a = fresh();
+        a.map(0x20_e000, PAGE_SIZE * 4, Perm::RW, "head").unwrap();
+        a.map(0x21_3000, PAGE_SIZE, Perm::RW, "middle").unwrap();
+        a.map(0x21_6000, PAGE_SIZE * 3, Perm::RW, "tail").unwrap();
+
+        assert_eq!(
+            a.unmapped_gaps(0x21_0000, PAGE_SIZE * 8).unwrap(),
+            vec![(0x21_2000, 0x21_3000), (0x21_4000, 0x21_6000)]
+        );
+    }
+
+    #[test]
+    fn unmapped_gaps_handle_empty_covered_and_overflowing_ranges() {
+        let a = fresh();
+        assert_eq!(
+            a.unmapped_gaps(0x30_0000, PAGE_SIZE * 2).unwrap(),
+            vec![(0x30_0000, 0x30_2000)]
+        );
+
+        a.map(0x30_0000, PAGE_SIZE * 2, Perm::RW, "covered")
+            .unwrap();
+        assert!(a
+            .unmapped_gaps(0x30_0000, PAGE_SIZE * 2)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            a.unmapped_gaps(u64::MAX - 0x7ff, PAGE_SIZE),
+            Err(AddressSpaceError::Overflow { .. })
+        ));
     }
 
     #[test]

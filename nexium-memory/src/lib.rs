@@ -3,7 +3,10 @@ pub mod fastmem;
 pub mod perm;
 pub mod region;
 
-pub use address_space::{align_request, AddressSpace, AddressSpaceError, HostRegion, RegionInfo};
+pub use address_space::{
+    align_request, AddressSpace, AddressSpaceError, HostRegion, HostRegionChange,
+    HostRegionChanges, RegionInfo,
+};
 pub use perm::Perm;
 pub use region::{page_align_down, page_align_up};
 pub use region::{CODE_BASE, HEAP_BASE, STACK_BASE};

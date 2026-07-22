@@ -76,7 +76,12 @@ pub fn romfs_header(romfs: &[u8]) -> Option<RomfsHeader> {
     })
 }
 
-fn romfs_name(romfs: &[u8], entry_abs: usize, name_off: usize, name_len_off: usize) -> Option<&str> {
+fn romfs_name(
+    romfs: &[u8],
+    entry_abs: usize,
+    name_off: usize,
+    name_len_off: usize,
+) -> Option<&str> {
     let name_len = u32le(romfs, entry_abs + name_len_off)? as usize;
     let start = entry_abs + name_off;
     let end = start.checked_add(name_len)?;
@@ -132,7 +137,11 @@ pub fn romfs_file<'a>(romfs: &'a [u8], path: &str) -> Option<&'a [u8]> {
     romfs.get(off..off.checked_add(size)?)
 }
 
-pub fn romfs_dir_files(romfs: &[u8], hdr: RomfsHeader, dir_off: u32) -> Vec<(String, usize, usize)> {
+pub fn romfs_dir_files(
+    romfs: &[u8],
+    hdr: RomfsHeader,
+    dir_off: u32,
+) -> Vec<(String, usize, usize)> {
     let mut out = Vec::new();
     let dir_abs = hdr.dir_meta_off + dir_off as usize;
     let mut file = match u32le(romfs, dir_abs + 0x0c) {
