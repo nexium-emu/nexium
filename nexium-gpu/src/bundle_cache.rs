@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const BUNDLE_MAGIC: [u8; 8] = *b"NXBUNDL1";
-const BUNDLE_VERSION: u32 = 26;
+const BUNDLE_VERSION: u32 = 27;
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -495,6 +495,32 @@ mod tests {
             bincode::serialize(&borrowed).unwrap(),
             bincode::serialize(&owned).unwrap()
         );
+    }
+
+    #[test]
+    fn previous_bundle_version_is_rejected() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nexium-bundle-cache-{}-{}.bin",
+            std::process::id(),
+            nonce
+        ));
+        let file = BundleFile {
+            magic: BUNDLE_MAGIC,
+            version: BUNDLE_VERSION - 1,
+            build_id: build_id(),
+            records: Vec::new(),
+            failed: Vec::new(),
+        };
+
+        std::fs::write(&path, bincode::serialize(&file).unwrap()).unwrap();
+        let loaded = load_file(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(loaded.is_none());
     }
 
     #[test]

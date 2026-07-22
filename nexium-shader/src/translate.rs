@@ -3028,12 +3028,10 @@ impl Translator {
                 let flow_test = (raw & 0x1F) as u32;
                 if flow_test == 0x1C {
                     log::debug!("EXIT FCSM_TR treated as fall-through raw={:#018x}", raw);
-                } else {
-                    self.program.emit_void_pred(Op::Exit, pred);
-                    if pred.is_none() {
-                        self.program.exit_reg_state = Some(self.reg_state.clone());
-                        self.finished = true;
-                    }
+                } else if pred.is_none() {
+                    self.program.emit_void(Op::Exit);
+                    self.program.exit_reg_state = Some(self.reg_state.clone());
+                    self.finished = true;
                 }
             }
 
@@ -4241,7 +4239,53 @@ mod tests {
         let exit = 0xE300_0000_0007_000Fu64;
         assert!(t.translate(exit));
         assert!(t.finished);
-        assert_eq!(t.program.instructions.len(), 1);
+        assert!(t.program.exit_reg_state.is_some());
+        assert!(matches!(
+            t.program.instructions.as_slice(),
+            [Inst {
+                op: Op::Exit,
+                pred: None,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn predicated_exit_is_cfg_only_and_falls_through() {
+        for exit in [0xE300_0000_0000_000Fu64, 0xE300_0000_0008_000Fu64] {
+            let mut t = Translator::new();
+            assert!(t.translate(exit));
+            assert!(!t.finished);
+            assert!(t.program.exit_reg_state.is_none());
+            assert!(t.program.instructions.is_empty());
+
+            assert!(t.translate(0x5C68_1000_0007_0203));
+            assert!(matches!(
+                t.program.instructions.as_slice(),
+                [Inst {
+                    op: Op::FMul { .. },
+                    ..
+                }]
+            ));
+        }
+    }
+
+    #[test]
+    fn fcsm_tr_exit_remains_fallthrough() {
+        let mut t = Translator::new();
+        assert!(t.translate(0xE300_0000_0007_001Cu64));
+        assert!(!t.finished);
+        assert!(t.program.exit_reg_state.is_none());
+        assert!(t.program.instructions.is_empty());
+
+        assert!(t.translate(0x5C68_1000_0007_0203));
+        assert!(matches!(
+            t.program.instructions.as_slice(),
+            [Inst {
+                op: Op::FMul { .. },
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -4264,17 +4308,11 @@ mod tests {
 
         assert!(!t.finished);
         assert!(t.program.exit_reg_state.is_none());
-        assert!(matches!(
-            t.program.instructions.first(),
-            Some(Inst {
-                op: Op::Exit,
-                pred: Some(Predicate {
-                    idx: 0,
-                    negate: false
-                }),
-                ..
-            })
-        ));
+        assert!(t
+            .program
+            .instructions
+            .iter()
+            .all(|inst| !matches!(inst.op, Op::Exit)));
         assert_eq!(
             t.program
                 .instructions

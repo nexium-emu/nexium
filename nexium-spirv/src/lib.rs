@@ -10047,6 +10047,93 @@ mod tests {
         }
     }
 
+    fn fragment_output_store_values(words: &[u32]) -> Vec<(Word, [u32; 4])> {
+        let module = rspirv::dr::load_words(words).expect("valid SPIR-V");
+        let output = module
+            .annotations
+            .iter()
+            .find_map(|instruction| match instruction.operands.as_slice() {
+                [
+                    Operand::IdRef(id),
+                    Operand::Decoration(Decoration::Location),
+                    Operand::LiteralBit32(0),
+                ] => module
+                    .types_global_values
+                    .iter()
+                    .find(|global| {
+                        global.result_id == Some(*id)
+                            && global.class.opcode == rspirv::spirv::Op::Variable
+                            && global.operands.first()
+                                == Some(&Operand::StorageClass(StorageClass::Output))
+                    })
+                    .map(|_| *id),
+                _ => None,
+            })
+            .expect("fragment color output");
+        let constants = module
+            .types_global_values
+            .iter()
+            .filter_map(|instruction| {
+                let id = instruction.result_id?;
+                match (instruction.class.opcode, instruction.operands.as_slice()) {
+                    (rspirv::spirv::Op::Constant, [Operand::LiteralBit32(bits)]) => {
+                        Some((id, *bits))
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<HashMap<_, _>>();
+        module.functions[0]
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                let store = block.instructions.iter().find(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::Store
+                        && instruction.operands.first() == Some(&Operand::IdRef(output))
+                })?;
+                let Operand::IdRef(value) = store.operands[1] else {
+                    panic!("fragment output store value");
+                };
+                let composite = block
+                    .instructions
+                    .iter()
+                    .find(|instruction| instruction.result_id == Some(value))
+                    .expect("path-local fragment output composite");
+                assert_eq!(
+                    composite.class.opcode,
+                    rspirv::spirv::Op::CompositeConstruct
+                );
+                let components = composite
+                    .operands
+                    .iter()
+                    .map(|operand| match operand {
+                        Operand::IdRef(id) => constants[id],
+                        _ => panic!("fragment output component"),
+                    })
+                    .collect::<Vec<_>>();
+                let values: [u32; 4] = components.try_into().expect("four output components");
+                let label = block
+                    .label
+                    .as_ref()
+                    .and_then(|instruction| instruction.result_id)
+                    .expect("output block label");
+                Some((label, values))
+            })
+            .collect()
+    }
+
+    fn fragment_exit_program(values: [f32; 4]) -> nexium_shader::IrProgram {
+        let mut program = nexium_shader::IrProgram::new();
+        program.exit_reg_state = Some(
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(register, value)| (register as u8, IrValue::ImmF32(value)))
+                .collect(),
+        );
+        program
+    }
+
     fn assert_graphics_cbuf_sample_operand(
         module: &rspirv::dr::Module,
         sample_operand: Word,
@@ -10841,6 +10928,178 @@ mod tests {
                     })
             })
         }));
+    }
+
+    #[test]
+    fn predicated_exit_keeps_fragment_output_states_path_local() {
+        let (entry_program, entry_predicate) = psetp_program(0, 0, 7, None);
+        let mut entry = cfg_block(
+            0,
+            BranchKind::Conditional {
+                target: 2,
+                pred: nexium_shader::Predicate {
+                    idx: 0,
+                    negate: true,
+                },
+            },
+            entry_program,
+        );
+        entry.pred_exit.insert(0, entry_predicate);
+        let cfg = Cfg {
+            blocks: vec![
+                entry,
+                cfg_block(
+                    1,
+                    BranchKind::Exit,
+                    fragment_exit_program([1.0, 1.0, 1.0, 1.0]),
+                ),
+                cfg_block(
+                    2,
+                    BranchKind::Exit,
+                    fragment_exit_program([0.125, 0.25, 0.5, 0.75]),
+                ),
+            ],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+
+        let words = emit_fragment(&cfg);
+        assert!(validate_structured_cfg(&words).is_ok());
+        validates_with_naga(&words);
+        validates_with_spirv_val_if_available(&words);
+
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let condition = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .find_map(|instruction| {
+                (instruction.class.opcode == rspirv::spirv::Op::BranchConditional).then(|| {
+                    match instruction.operands[0] {
+                        Operand::IdRef(condition) => condition,
+                        _ => panic!("conditional branch condition"),
+                    }
+                })
+            })
+            .expect("predicated exit branch");
+        assert!(module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| {
+                instruction.result_id == Some(condition)
+                    && instruction.class.opcode == rspirv::spirv::Op::LogicalNot
+            }));
+
+        let stores = fragment_output_store_values(&words);
+        assert_eq!(stores.len(), 2);
+        assert_ne!(stores[0].0, stores[1].0);
+        let mut values = stores
+            .into_iter()
+            .map(|(_, values)| values)
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        let mut expected = vec![
+            [
+                1.0f32.to_bits(),
+                1.0f32.to_bits(),
+                1.0f32.to_bits(),
+                1.0f32.to_bits(),
+            ],
+            [
+                0.125f32.to_bits(),
+                0.25f32.to_bits(),
+                0.5f32.to_bits(),
+                0.75f32.to_bits(),
+            ],
+        ];
+        expected.sort_unstable();
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn multiple_predicated_exits_keep_distinct_fragment_outputs() {
+        let cfg = Cfg {
+            blocks: vec![
+                empty_cfg_block(
+                    0,
+                    BranchKind::Conditional {
+                        target: 3,
+                        pred: always_pred(),
+                    },
+                ),
+                empty_cfg_block(
+                    1,
+                    BranchKind::Conditional {
+                        target: 4,
+                        pred: nexium_shader::Predicate {
+                            idx: 7,
+                            negate: true,
+                        },
+                    },
+                ),
+                cfg_block(
+                    2,
+                    BranchKind::Exit,
+                    fragment_exit_program([1.0, 0.75, 0.5, 1.0]),
+                ),
+                cfg_block(
+                    3,
+                    BranchKind::Exit,
+                    fragment_exit_program([0.125, 0.25, 0.375, 0.5]),
+                ),
+                cfg_block(
+                    4,
+                    BranchKind::Exit,
+                    fragment_exit_program([0.625, 0.75, 0.875, 1.0]),
+                ),
+            ],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+
+        let words = emit_fragment(&cfg);
+        assert!(validate_structured_cfg(&words).is_ok());
+        validates_with_naga(&words);
+        validates_with_spirv_val_if_available(&words);
+
+        let stores = fragment_output_store_values(&words);
+        assert_eq!(stores.len(), 3);
+        assert_eq!(
+            stores
+                .iter()
+                .map(|(label, _)| *label)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+        let mut values = stores
+            .into_iter()
+            .map(|(_, values)| values)
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        let mut expected = vec![
+            [
+                1.0f32.to_bits(),
+                0.75f32.to_bits(),
+                0.5f32.to_bits(),
+                1.0f32.to_bits(),
+            ],
+            [
+                0.125f32.to_bits(),
+                0.25f32.to_bits(),
+                0.375f32.to_bits(),
+                0.5f32.to_bits(),
+            ],
+            [
+                0.625f32.to_bits(),
+                0.75f32.to_bits(),
+                0.875f32.to_bits(),
+                1.0f32.to_bits(),
+            ],
+        ];
+        expected.sort_unstable();
+        assert_eq!(values, expected);
     }
 
     #[test]

@@ -535,7 +535,14 @@ fn discover_leaders(
             };
             let pred = decoded_pred(raw);
             match d.opcode {
-                Opcode::EXIT if pred.is_none() && !exit_never_taken(raw) => break,
+                Opcode::EXIT if !exit_never_taken(raw) => {
+                    if pred.is_some() {
+                        if next < bytes.len() && leaders.insert(next) {
+                            worklist.push(next);
+                        }
+                    }
+                    break;
+                }
                 Opcode::BRA | Opcode::JMP => {
                     let target = bra_target(offset, raw);
                     if target < bytes.len() && leaders.insert(target) {
@@ -705,6 +712,9 @@ where
         }
         next_value = t.program.next_value_id();
         let reg_exit = t.snapshot_reg_state();
+        if info.synthetic_exit {
+            t.program.exit_reg_state = Some(reg_exit.clone());
+        }
         let pred_exit = t.snapshot_pred_state();
         blocks.push(BasicBlock {
             id: bid as BlockId,
@@ -735,6 +745,7 @@ struct BlockInfo {
     branch: BranchKind,
 
     terminator_offset: Option<usize>,
+    synthetic_exit: bool,
 }
 
 fn discover_topology(
@@ -745,6 +756,7 @@ fn discover_topology(
     indirect_branches: &HashMap<usize, BranchKind>,
 ) -> Vec<BlockInfo> {
     let mut out = Vec::with_capacity(leader_vec.len());
+    let mut predicated_exit_sources = Vec::new();
     for (i, &start) in leader_vec.iter().enumerate() {
         let end = leader_vec.get(i + 1).copied().unwrap_or(bytes.len());
         let mut branch = BranchKind::FallThrough;
@@ -758,8 +770,14 @@ fn discover_topology(
             let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
             if let Some(d) = decode_one(raw) {
                 match d.opcode {
-                    Opcode::EXIT if decoded_pred(raw).is_none() && !exit_never_taken(raw) => {
-                        branch = BranchKind::Exit;
+                    Opcode::EXIT if !exit_never_taken(raw) => {
+                        match decoded_pred(raw) {
+                            None => branch = BranchKind::Exit,
+                            Some(pred) => {
+                                branch = BranchKind::Conditional { target: 0, pred };
+                                predicated_exit_sources.push(i);
+                            }
+                        }
                         terminator_offset = Some(offset);
                         break;
                     }
@@ -831,6 +849,28 @@ fn discover_topology(
             end,
             branch,
             terminator_offset,
+            synthetic_exit: false,
+        });
+    }
+
+    let synthetic_base = out.len() as BlockId;
+    for (index, source) in predicated_exit_sources.into_iter().enumerate() {
+        let target = synthetic_base + index as BlockId;
+        let pred = match out[source].branch {
+            BranchKind::Conditional { pred, .. } => pred,
+            _ => unreachable!(),
+        };
+        out[source].branch = BranchKind::Conditional { target, pred };
+        let offset = out[source]
+            .terminator_offset
+            .map(|offset| offset.saturating_add(8).min(bytes.len()))
+            .unwrap_or(bytes.len());
+        out.push(BlockInfo {
+            start: offset,
+            end: offset,
+            branch: BranchKind::Exit,
+            terminator_offset: None,
+            synthetic_exit: true,
         });
     }
     out
@@ -1217,6 +1257,10 @@ mod tests {
             | ((ra as u64) << 8)
             | (rd as u64)
             | 0x0007_0000
+    }
+
+    fn enc_psetp_p2() -> u64 {
+        0x5090_0000_0007_0017u64
     }
 
     fn enc_bra_p0(ofs: i32) -> u64 {
@@ -1692,6 +1736,120 @@ mod tests {
         let cfg = build_cfg(&bytes);
         assert_eq!(cfg.blocks.len(), 1);
         assert!(matches!(cfg.blocks[0].branch, BranchKind::Exit));
+    }
+
+    #[test]
+    fn negated_predicated_exit_splits_to_stateful_synthetic_exit() {
+        let predicated_exit = 0xe300_0000_0008_000f;
+        let bytes = build_program(&[
+            enc_psetp_p2(),
+            enc_fmul_reg(2, 0, 1),
+            predicated_exit,
+            enc_fadd_reg(3, 2, 1),
+            enc_exit(),
+        ]);
+        let cfg = build_cfg(&bytes);
+
+        assert_eq!(cfg.blocks.len(), 3);
+        assert_eq!(
+            cfg.blocks[0].branch,
+            BranchKind::Conditional {
+                target: 2,
+                pred: Predicate {
+                    idx: 0,
+                    negate: true,
+                },
+            }
+        );
+        assert_eq!(cfg.successors(0), vec![2, 1]);
+        assert!(matches!(cfg.blocks[1].branch, BranchKind::Exit));
+        assert!(matches!(cfg.blocks[2].branch, BranchKind::Exit));
+        assert!(cfg.blocks[2].program.instructions.is_empty());
+        assert_eq!(cfg.blocks[2].reg_exit, cfg.blocks[0].reg_exit);
+        assert_eq!(cfg.blocks[2].pred_exit, cfg.blocks[0].pred_exit);
+        assert!(cfg.blocks[0].pred_exit.contains_key(&2));
+        assert_eq!(
+            cfg.blocks[2].program.exit_reg_state.as_ref(),
+            Some(&cfg.blocks[0].reg_exit)
+        );
+        assert!(cfg.blocks[1]
+            .program
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst.op, Op::FAdd { .. })));
+    }
+
+    #[test]
+    fn exit_fcsm_tr_remains_fallthrough() {
+        let fcsm_tr = 0xe300_0000_0008_001c;
+        let bytes = build_program(&[
+            enc_fmul_reg(2, 0, 1),
+            fcsm_tr,
+            enc_fadd_reg(3, 2, 1),
+            enc_exit(),
+        ]);
+        let cfg = build_cfg(&bytes);
+
+        assert_eq!(cfg.blocks.len(), 1);
+        assert!(matches!(cfg.blocks[0].branch, BranchKind::Exit));
+        assert!(cfg.blocks[0]
+            .program
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst.op, Op::FAdd { .. })));
+    }
+
+    #[test]
+    fn multiple_predicated_exits_get_unique_synthetic_targets() {
+        let bytes = build_program(&[
+            enc_fmul_reg(2, 0, 1),
+            0xe300_0000_0008_000f,
+            enc_fadd_reg(3, 2, 1),
+            0xe300_0000_0001_000f,
+            enc_fmul_reg(4, 3, 1),
+            enc_exit(),
+        ]);
+        let cfg = build_cfg(&bytes);
+
+        assert_eq!(cfg.blocks.len(), 5);
+        assert_eq!(
+            cfg.blocks[0].branch,
+            BranchKind::Conditional {
+                target: 3,
+                pred: Predicate {
+                    idx: 0,
+                    negate: true,
+                },
+            }
+        );
+        assert_eq!(
+            cfg.blocks[1].branch,
+            BranchKind::Conditional {
+                target: 4,
+                pred: Predicate {
+                    idx: 1,
+                    negate: false,
+                },
+            }
+        );
+        assert_eq!(cfg.successors(0), vec![3, 1]);
+        assert_eq!(cfg.successors(1), vec![4, 2]);
+        assert_eq!(cfg.predecessors()[3], vec![0]);
+        assert_eq!(cfg.predecessors()[4], vec![1]);
+        assert_eq!(cfg.blocks[3].reg_exit, cfg.blocks[0].reg_exit);
+        assert_eq!(cfg.blocks[4].reg_exit, cfg.blocks[1].reg_exit);
+        assert_eq!(
+            cfg.blocks[3].program.exit_reg_state.as_ref(),
+            Some(&cfg.blocks[0].reg_exit)
+        );
+        assert_eq!(
+            cfg.blocks[4].program.exit_reg_state.as_ref(),
+            Some(&cfg.blocks[1].reg_exit)
+        );
+        assert!(!cfg.blocks[3].reg_exit.contains_key(&3));
+        assert!(cfg.blocks[4].reg_exit.contains_key(&3));
+        assert!(!cfg.blocks[4].reg_exit.contains_key(&4));
+        assert!(cfg.blocks[2].reg_exit.contains_key(&4));
     }
 
     #[test]
