@@ -199,7 +199,7 @@ pub struct Maxwell3dDrawCall {
     pub poly_offset_units: f32,
     pub poly_offset_factor: f32,
     pub ssbo_data: Vec<(u32, Vec<u8>)>,
-    pub flip_y: bool,
+    pub present_flip_y: bool,
 }
 
 pub fn vertex_binding_read_range(

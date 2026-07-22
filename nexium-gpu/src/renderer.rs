@@ -5135,7 +5135,7 @@ impl Renderer {
                 .is_some_and(|att| !att.color_write_mask.is_empty())
             {
                 let stamp = rt_cache.mark_drawn(*key);
-                rt_cache.record_present_flip(*key, call.flip_y);
+                rt_cache.record_present_flip(*key, call.present_flip_y);
                 trace_rt_stamp(stamp, *key, &[call]);
             }
         }
@@ -8392,7 +8392,7 @@ fn finish_color_pass(
         if pass_dirty.get(idx).copied().unwrap_or(false) {
             let stamp = rt_cache.mark_drawn(*key);
             if let Some(c) = trace_calls.last() {
-                rt_cache.record_present_flip(*key, c.flip_y);
+                rt_cache.record_present_flip(*key, c.present_flip_y);
             }
             trace_rt_stamp(stamp, *key, trace_calls);
         }

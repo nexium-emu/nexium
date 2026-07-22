@@ -168,7 +168,7 @@ impl WindowOrigin {
         self.raw & 1 != 0
     }
 
-    pub fn flip_y(self) -> bool {
+    pub fn triangle_rast_flip(self) -> bool {
         self.raw & 0x10 != 0
     }
 }

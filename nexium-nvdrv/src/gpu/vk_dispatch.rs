@@ -1,7 +1,7 @@
 use ash::vk;
 use std::sync::Arc;
 
-use super::engines::maxwell3d::{DrawCall, RenderTarget, VertexBuffer};
+use super::engines::maxwell3d::{DrawCall, RenderTarget, VertexBuffer, WindowOrigin};
 use super::engines::Maxwell3D;
 use super::formats::map_surface_format;
 use super::GpuMappings;
@@ -2225,7 +2225,7 @@ fn trace_zeta_key(
         draw.cull_test_enable,
         draw.cull_face,
         draw.front_face,
-        draw.window_origin.flip_y(),
+        draw.window_origin.triangle_rast_flip(),
         draw.zeta_enable,
     );
 }
@@ -4869,6 +4869,8 @@ fn execute_one(
     } else {
         stencil_front
     };
+    let (front_face, present_flip_y) =
+        maxwell_draw_orientation(draw.window_origin, draw.front_face);
 
     let call = Maxwell3dDrawCall {
         vs_spirv,
@@ -4952,16 +4954,12 @@ fn execute_one(
         depth_compare_cube_array_mask,
         cull_test_enable: draw.cull_test_enable && std::env::var_os("NEXIUM_NO_CULL").is_none(),
         cull_face: draw.cull_face,
-        front_face: if draw.window_origin.flip_y() {
-            flip_front_face(draw.front_face)
-        } else {
-            draw.front_face
-        },
+        front_face,
         poly_offset_enable: draw.poly_offset_fill_enable,
         poly_offset_units: draw.poly_offset_units,
         poly_offset_factor: draw.poly_offset_factor,
         ssbo_data,
-        flip_y: draw.window_origin.flip_y(),
+        present_flip_y,
     };
 
     Ok(Some(call))
@@ -6045,6 +6043,16 @@ fn flip_front_face(v: u32) -> u32 {
         0x0901 => 0x0900,
         _ => v,
     }
+}
+
+fn maxwell_draw_orientation(window_origin: WindowOrigin, front_face: u32) -> (u32, bool) {
+    let front_face = if window_origin.triangle_rast_flip() {
+        flip_front_face(front_face)
+    } else {
+        front_face
+    };
+
+    (front_face, false)
 }
 
 fn map_color_write_mask(raw: u32) -> vk::ColorComponentFlags {
@@ -7202,7 +7210,7 @@ fn trace_draw(
         draw.scissor.max_y,
         draw.window_origin.raw,
         draw.window_origin.lower_left(),
-        draw.window_origin.flip_y(),
+        draw.window_origin.triangle_rast_flip(),
         draw.viewport.swizzle,
         draw.viewport.y_swizzle(),
         depth_test,
@@ -7390,7 +7398,7 @@ fn trace_clear(
         clip.height,
         draw.window_origin.raw,
         draw.window_origin.lower_left(),
-        draw.window_origin.flip_y(),
+        draw.window_origin.triangle_rast_flip(),
         draw.zeta_enable,
     );
     log::warn!(
@@ -9756,6 +9764,7 @@ mod tests {
         format_cbuf_read, fragment_texture_numeric_metadata, graphics_ring_chunk_ranges_for_costs,
         graphics_texture_layout_from_metadata,
         has_unimplemented_brx, map_stencil_op, map_zeta_format, pack_cbuf_data,
+        maxwell_draw_orientation,
         aliased_guest_ranges, guest_write_alias_ranges, normalize_guest_ranges,
         packed_cbuf_slot, packed_cbuf_word, plan_guest_write_chunks, read_gpu_strict,
         register_small_rt_after_prior_work,
@@ -9768,6 +9777,20 @@ mod tests {
         tic_snapshot_layer_count, vertex_buffer_bindings, write_guest_strict, y_direction_key,
         FragmentTextureNumericMetadata, GuestRange, GuestWriteChunk,
     };
+
+    #[test]
+    fn triangle_rast_flip_changes_winding_not_present_row_order() {
+        use crate::gpu::engines::maxwell3d::WindowOrigin;
+
+        assert_eq!(
+            maxwell_draw_orientation(WindowOrigin { raw: 0x10 }, 0x0900),
+            (0x0901, false)
+        );
+        assert_eq!(
+            maxwell_draw_orientation(WindowOrigin { raw: 0 }, 0x0900),
+            (0x0900, false)
+        );
+    }
 
     #[test]
     fn small_rt_registration_happens_after_prior_batch_work() {
