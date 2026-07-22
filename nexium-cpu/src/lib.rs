@@ -239,10 +239,7 @@ impl Cpu {
         }
     }
 
-    pub fn restore_thread_context(
-        &mut self,
-        context: &CpuThreadContext,
-    ) -> Result<(), String> {
+    pub fn restore_thread_context(&mut self, context: &CpuThreadContext) -> Result<(), String> {
         match (self, context) {
             #[cfg(feature = "backend-dynarmic")]
             (Cpu::Dynarmic(cpu), CpuThreadContext::Dynarmic(context)) => {

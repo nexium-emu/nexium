@@ -90,11 +90,6 @@ impl RustarmicCpu {
             inner: Arc::new(move || unsafe {
                 (*(halt_addr as *const AtomicBool)).store(true, Ordering::Relaxed);
             }),
-            // Block-boundary peek: rustarmic's dispatcher writes ctx.pc after
-            // every block exit, so reading directly here gives the last-block
-            // PC rather than only the last-run() PC (which is what the prior
-            // `peek_pc` cache served). The watchdog in nexium-gui samples this
-            // mid-execution; stale snapshots produced false hang verdicts.
             peek: Arc::new(move || unsafe {
                 let ctx = ctx_addr as *const CpuContext;
                 let p = std::ptr::read_volatile(&(*ctx).pc);
@@ -139,9 +134,10 @@ impl RustarmicCpu {
         let end = va
             .checked_add(len)
             .ok_or_else(|| format!("unmap_host overflow va={:#x} len={:#x}", va, len))?;
-        self.state.regions.write().retain(|r| {
-            r.end <= va || r.va >= end
-        });
+        self.state
+            .regions
+            .write()
+            .retain(|r| r.end <= va || r.va >= end);
         Ok(())
     }
 
@@ -276,9 +272,6 @@ impl RustarmicCpu {
             }
         }
 
-        // Consume any event posted between runs (inject_svc, NULL_SKIP_MAX
-        // overflow). Clearing unconditionally — as the prior code did —
-        // dropped injected SVCs and the null-deref escalation on the floor.
         if let Some(ev) = self.state.last_event.lock().unwrap().take() {
             return ev;
         }

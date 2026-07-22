@@ -421,6 +421,7 @@ impl DynarmicCpu {
                     x21,
                     x22
                 );
+                pc_until_video_probe(&self.emu.emu, &label, x0);
                 if pc_until_strings_enabled() {
                     let ptrs = pc_until_string_probe(
                         &self.emu.emu,
@@ -539,6 +540,52 @@ fn pc_until_max_hits() -> u64 {
 
 fn pc_until_strings_enabled() -> bool {
     env_flag("NEXIUM_PC_UNTIL_STRINGS")
+}
+
+fn pc_until_video_probe(emu: &dynarmic_sys::Dynarmic<'static, ()>, label: &str, sink: u64) {
+    if !env_flag("NEXIUM_PC_UNTIL_VIDEO") || !label.starts_with("video-") {
+        return;
+    }
+    static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let max_hits = std::env::var("NEXIUM_PC_UNTIL_VIDEO_MAX")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(4);
+    let hit = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if hit >= max_hits {
+        return;
+    }
+    let mut bytes = [0u8; 0x40];
+    if emu.mem_read(sink.saturating_add(0x40), &mut bytes).is_err() {
+        log::warn!(
+            "[pc-until-video] hit={} label={} sink={:#x} bytes40_80=<unreadable>",
+            hit,
+            label,
+            sink
+        );
+        return;
+    }
+    let u32_at = |offset: usize| {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    };
+    log::warn!(
+        "[pc-until-video] hit={} label={} sink={:#x} output_format={} field54={} decoder_mode={} width={} height={} native={} bytes40_80={:02x?}",
+        hit,
+        label,
+        sink,
+        u32_at(0x08),
+        u32_at(0x14),
+        u32_at(0x18),
+        u32_at(0x1c),
+        u32_at(0x20),
+        bytes[0x2f],
+        bytes
+    );
 }
 
 fn pc_until_string_probe(
