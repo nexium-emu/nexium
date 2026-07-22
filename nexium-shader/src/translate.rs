@@ -1354,6 +1354,18 @@ impl Translator {
         self.write_reg(reg_dest(raw), Op::Mov(selected), pred);
     }
 
+    fn emit_icmp(&mut self, raw: u64, src_a: Value, operand: Value, pred: Option<Predicate>) {
+        let compare_mask = self.emit_value(Op::ISet {
+            cmp: ICmp::from_bits((raw >> 49) & 0x7),
+            signed: ((raw >> 48) & 1) != 0,
+            a: operand,
+            b: Value::Zero,
+            bool_float: false,
+        });
+        let selected = self.emit_mask_select(compare_mask, self.read_reg(reg_a(raw)), src_a);
+        self.write_reg(reg_dest(raw), Op::Mov(selected), pred);
+    }
+
     fn emit_predicate_mask(&mut self, pred: Predicate) -> Value {
         self.emit_value(Op::PSet {
             pred_a: pred.idx,
@@ -3954,19 +3966,25 @@ impl Translator {
             Opcode::ISET_imm => {
                 self.emit_iset(raw, Value::ImmU32(imm20(raw) as u32), pred);
             }
-            Opcode::ICMP_imm => {
-                let select_src = self.read_reg(reg_a(raw));
+            Opcode::ICMP_reg => {
+                let select_src = self.read_reg(reg_b(raw));
                 let compare_src = self.read_reg(reg_c(raw));
-                let mask = self.emit_value(Op::ISet {
-                    cmp: ICmp::from_bits((raw >> 49) & 0x7),
-                    signed: ((raw >> 48) & 1) != 0,
-                    a: compare_src,
-                    b: Value::Zero,
-                    bool_float: false,
-                });
-                let result =
-                    self.emit_mask_select(mask, select_src, Value::ImmU32(imm20(raw) as u32));
-                self.write_reg(reg_dest(raw), Op::Mov(result), pred);
+                self.emit_icmp(raw, select_src, compare_src, pred);
+            }
+            Opcode::ICMP_rc => {
+                let select_src = self.read_reg(reg_c(raw));
+                let compare_src = Value::Inst(self.load_cbuf(raw));
+                self.emit_icmp(raw, select_src, compare_src, pred);
+            }
+            Opcode::ICMP_cr => {
+                let select_src = Value::Inst(self.load_cbuf(raw));
+                let compare_src = self.read_reg(reg_c(raw));
+                self.emit_icmp(raw, select_src, compare_src, pred);
+            }
+            Opcode::ICMP_imm => {
+                let select_src = Value::ImmU32(imm20(raw) as u32);
+                let compare_src = self.read_reg(reg_c(raw));
+                self.emit_icmp(raw, select_src, compare_src, pred);
             }
 
             Opcode::DEPBAR => {}
@@ -5944,6 +5962,69 @@ mod tests {
             ));
             assert_eq!(t.program.instructions[4].dest_reg, Some(dest));
         }
+    }
+
+    #[test]
+    fn pps_icmp_forms_lower_with_yuzu_operand_order() {
+        let cr = 0x4b4a_1680_0767_2828u64;
+        let forms = [
+            (cr & 0x0000_ffff_ffff_ffff) | (0x5b4au64 << 48),
+            (cr & 0x0000_ffff_ffff_ffff) | (0x534au64 << 48),
+            cr,
+            (cr & 0x0000_ffff_ffff_ffff) | (0x364au64 << 48),
+        ];
+        for raw in forms {
+            let mut t = Translator::new();
+            assert!(t.translate(raw), "raw={raw:#018x}");
+            assert_eq!(t.unimplemented_count, 0, "raw={raw:#018x}");
+            assert!(!t
+                .program
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst.op, Op::Unimplemented { .. })));
+        }
+
+        let mut t = Translator::new();
+        assert!(t.translate(0x4b4a_0880_0a17_0a0du64));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(t.program.instructions.iter().any(|inst| {
+            matches!(
+                inst.op,
+                Op::LoadCbuf {
+                    binding: 0,
+                    byte_offset: 644,
+                }
+            )
+        }));
+        assert!(t.program.instructions.iter().any(|inst| {
+            matches!(
+                inst.op,
+                Op::ISet {
+                    cmp: ICmp::Ne,
+                    signed: false,
+                    a: Value::GprIn(17),
+                    b: Value::Zero,
+                    bool_float: false,
+                }
+            )
+        }));
+        assert!(t.program.instructions.iter().any(|inst| {
+            matches!(
+                inst.op,
+                Op::ILop {
+                    b: Value::GprIn(10),
+                    op: LogicOp::And,
+                    not_a: false,
+                    not_b: false,
+                    ..
+                }
+            )
+        }));
+        assert!(t
+            .program
+            .instructions
+            .iter()
+            .any(|inst| inst.dest_reg == Some(13)));
     }
 
     #[test]

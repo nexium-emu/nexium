@@ -611,9 +611,6 @@ impl Pusher {
                 );
             }
         }
-        if self.state.method_count > 4096 {
-            self.state.method_count = 0;
-        }
         self.active_entry_gpu_va = 0;
         self.active_entry_cpu_va = 0;
         self.active_word_index = 0;
@@ -712,29 +709,6 @@ impl Pusher {
                 i += 1;
                 continue;
             };
-
-            if mode != Mode::Inline
-                && arg_count > 512
-                && (i + 1).saturating_add(arg_count as usize) > commands.len()
-            {
-                if direct_forensics() {
-                    use std::sync::atomic::{AtomicU32, Ordering};
-                    static N: AtomicU32 = AtomicU32::new(0);
-                    if N.fetch_add(1, Ordering::Relaxed) < 48 {
-                        log::warn!(
-                            "[pb-runaway-skip] entry_gpu={:#x} word={} of {} header={:#010x} method={:#x} count={} — data misread, skipping",
-                            self.active_entry_gpu_va,
-                            i,
-                            commands.len(),
-                            header,
-                            method,
-                            arg_count
-                        );
-                    }
-                }
-                i += 1;
-                continue;
-            }
 
             self.state.method = method;
             self.state.subchannel = subchannel;
@@ -870,6 +844,11 @@ impl Pusher {
             let kp_m3d = kickprof::start();
             maxwell.dispatch_method(method, arg, is_last);
             kickprof::add(kickprof::M3D, kp_m3d);
+            let upload_launch = maxwell.inline_upload_launch_pending();
+            if upload_launch {
+                self.flush_vk(mappings, mem_read, mem_write);
+            }
+            maxwell.process_inline_uploads(mappings, mem_read, mem_write);
             let d = maxwell.regs.draw_count - pre_draws;
             let c = maxwell.regs.clear_count - pre_clears;
             if d > 0 {
@@ -1455,6 +1434,7 @@ impl Default for Pusher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn macro_argument_refresh_reads_the_live_pushbuffer_word() {
@@ -1477,5 +1457,183 @@ mod tests {
         let mappings = GpuMappings::new();
         let read = |_: u64, _: &mut [u8]| false;
         assert_eq!(read_live_word(&mappings, 0x5020, &read), None);
+    }
+
+    #[test]
+    fn split_non_incrementing_upload_preserves_payload_state() {
+        let mut pusher = Pusher::new();
+        let mappings = GpuMappings::new();
+        let mut maxwell = Maxwell3D::new();
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let mem_read = |_: u64, _: &mut [u8]| true;
+        let mem_write = |_: u64, _: &[u8]| true;
+
+        let mut first = vec![0x8100_0000; 9];
+        first.push(0x6300_006D);
+        pusher.process_commands(
+            &first,
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &mem_write,
+        );
+        assert_eq!(pusher.state.method, 0x6D);
+        assert_eq!(pusher.state.method_count, 768);
+        assert!(pusher.state.non_incrementing);
+
+        let payload: Vec<u32> = (0..768).map(|i| 0x1000_0000 | i).collect();
+        pusher.process_commands(
+            &payload,
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &mem_write,
+        );
+        assert_eq!(pusher.state.method_count, 0);
+
+        pusher.process_commands(
+            &[0x2001_0100, 0x1234_5678],
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &mem_write,
+        );
+        assert_eq!(pusher.state.method, 0x101);
+        assert_eq!(pusher.state.method_count, 0);
+    }
+
+    #[test]
+    fn method_count_above_entry_limit_survives_boundary() {
+        let mut pusher = Pusher::new();
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x4000, 0x100, 0x1000, 1);
+        let mut maxwell = Maxwell3D::new();
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let mem_read = |_: u64, _: &mut [u8]| true;
+        let mem_write = |_: u64, _: &[u8]| true;
+        let entry = CommandListHeader {
+            address_lo: 0x4000,
+            address_hi_and_count: 1 << 10,
+        };
+        pusher.state.method = 0x101;
+        pusher.state.method_count = 4097;
+
+        pusher.process_entry(
+            &entry,
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &mem_write,
+        );
+        assert_eq!(pusher.state.method_count, 4096);
+    }
+
+    #[test]
+    fn maxwell3d_inline_upload_writes_mapped_bytes() {
+        let mut pusher = Pusher::new();
+        pusher.bound_classes[0] = 0xB197;
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x6000, 0x100, 0x1000, 1);
+        let mut maxwell = Maxwell3D::new();
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let memory = Arc::new(Mutex::new(vec![0u8; 0x100]));
+        let read_memory = memory.clone();
+        let mem_read = move |cpu: u64, out: &mut [u8]| {
+            let memory = read_memory.lock().unwrap();
+            let start = cpu.saturating_sub(0x1000) as usize;
+            if start.saturating_add(out.len()) > memory.len() {
+                return false;
+            }
+            out.copy_from_slice(&memory[start..start + out.len()]);
+            true
+        };
+        let write_memory = memory.clone();
+        let mem_write = move |cpu: u64, data: &[u8]| {
+            let mut memory = write_memory.lock().unwrap();
+            let start = cpu.saturating_sub(0x1000) as usize;
+            if start.saturating_add(data.len()) > memory.len() {
+                return false;
+            }
+            memory[start..start + data.len()].copy_from_slice(data);
+            true
+        };
+
+        let setup = [
+            0x200D_0060,
+            6,
+            1,
+            0,
+            0x6000,
+            6,
+            0,
+            6,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+        ];
+        pusher.process_commands(
+            &setup,
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &mem_write,
+        );
+        pusher.process_commands(
+            &[0x6002_006D, 0x1122_3344, 0x5566],
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &mem_write,
+        );
+
+        let memory = memory.lock().unwrap();
+        assert_eq!(&memory[..6], &[0x44, 0x33, 0x22, 0x11, 0x66, 0x55]);
+        assert_eq!(maxwell.reg_file[0x47], 0);
+        assert_eq!(maxwell.reg_file[0x48], 0);
     }
 }

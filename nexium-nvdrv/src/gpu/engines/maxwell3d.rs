@@ -1,3 +1,6 @@
+use super::kepler_memory::KeplerMemory;
+use super::super::GpuMappings;
+
 pub const MAXWELL3D_CLASS: u32 = 0xB197;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -557,6 +560,9 @@ pub struct Maxwell3D {
 
     pub pending_draws: Vec<DrawCall>,
 
+    inline_upload: KeplerMemory,
+    pending_inline_upload_methods: Vec<(u32, u32)>,
+
     pub macro_uploads_logged: u32,
     pub macro_invocations: u32,
     pub macro_writes_logged: u32,
@@ -648,6 +654,8 @@ impl Maxwell3D {
                 .map(|v| v != "0")
                 .unwrap_or(false),
             pending_draws: Vec::new(),
+            inline_upload: KeplerMemory::new(),
+            pending_inline_upload_methods: Vec::new(),
             macro_uploads_logged: 0,
             macro_invocations: 0,
             macro_writes_logged: 0,
@@ -673,6 +681,25 @@ impl Maxwell3D {
         v.sort_by(|a, b| b.1.cmp(&a.1));
         v.truncate(n);
         v
+    }
+
+    pub(crate) fn inline_upload_launch_pending(&self) -> bool {
+        self.pending_inline_upload_methods
+            .iter()
+            .any(|&(method, _)| method == 0x6C)
+    }
+
+    pub(crate) fn process_inline_uploads(
+        &mut self,
+        mappings: &GpuMappings,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
+        let methods = std::mem::take(&mut self.pending_inline_upload_methods);
+        for (method, arg) in methods {
+            self.inline_upload
+                .dispatch_method(method, arg, mappings, mem_read, mem_write);
+        }
     }
 
     pub fn dispatch_method(&mut self, method: u32, arg: u32, is_last: bool) {
@@ -818,6 +845,10 @@ impl Maxwell3D {
 
         if (method as usize) < self.reg_file.len() {
             self.reg_file[method as usize] = arg;
+        }
+
+        if (0x60..=0x6D).contains(&method) {
+            self.pending_inline_upload_methods.push((method, arg));
         }
 
         if mme_forensics() {
