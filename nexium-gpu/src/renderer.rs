@@ -28,6 +28,13 @@ fn note_queue_submission() {
     SUBMIT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+fn note_queue_drained() {
+    LAST_IDLE_GENERATION.store(
+        SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
 fn idle_skip_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| std::env::var_os("NEXIUM_NO_IDLE_SKIP").is_some())
@@ -2672,6 +2679,17 @@ impl Renderer {
             .map(|(k, _, _, _)| (k.width, k.height))
     }
 
+    pub fn render_target_at_va(&self, nvmap_id: u32, gpu_va: u64) -> Option<(RtKey, u64)> {
+        let inner = self.inner.lock();
+        let key = inner.rt_cache.find_color_key_at_va(nvmap_id, gpu_va)?;
+        let stamp = inner.rt_cache.drawn_stamp(key)?;
+        Some((key, stamp))
+    }
+
+    pub fn render_target_stamp(&self, key: RtKey) -> Option<u64> {
+        self.inner.lock().rt_cache.drawn_stamp(key)
+    }
+
     pub fn readback_target(&self, nvmap_id: u32, width: u32, height: u32) -> Option<Vec<u8>> {
         self.readback_target_at(nvmap_id, width, height, 0)
     }
@@ -2973,6 +2991,7 @@ impl Renderer {
         let waited = unsafe { device.wait_for_fences(&[fence], true, 1_000_000_000) };
         match waited {
             Ok(()) => unsafe {
+                note_queue_drained();
                 let Ok(ptr) =
                     device.map_memory(stage.memory, 0, stage.size, vk::MemoryMapFlags::empty())
                 else {
@@ -13038,6 +13057,10 @@ fn call_samples_rt(call: &crate::draw::Maxwell3dDrawCall, rt_key: RtKey) -> bool
             .sampled_rt_slots
             .iter()
             .any(|slot| *slot == Some(rt_key))
+        || call
+            .sampled_rt_copy_sources
+            .iter()
+            .any(|slot| *slot == Some(rt_key))
 }
 
 fn rt_alias_for_slot(
@@ -13053,7 +13076,7 @@ fn rt_alias_for_slot(
     if tic.is_some_and(tic_requires_dedicated_sampled_view) && !direct_volume {
         return None;
     }
-    let mut used_fuzzy_color = false;
+    let mut used_copy_color = false;
     let found_color = (if direct_volume {
         rt_cache
             .color_exact_with_format(sk)
@@ -13062,28 +13085,14 @@ fn rt_alias_for_slot(
         drawn_color_alias_for_key(rt_cache, sk).or_else(|| rt_cache.find_color_with_format(sk))
     })
     .or_else(|| {
-        if call.sampled_rt_fuzzy
-            && sk.width >= 512
-            && sk.height >= 256
-            && (sk.gpu_va == 0 || !rt_cache.has_drawn_color_at_va(sk.nvmap_id, sk.gpu_va))
-        {
-            let found = rt_cache
-                .find_color_screen(sk)
-                .map(|(key, image, view, layout)| {
-                    let format = rt_cache
-                        .find_color_with_format(key)
-                        .map(|(_, _, _, _, format)| format)
-                        .unwrap_or(vk::Format::R8G8B8A8_UNORM);
-                    (key, image, view, layout, format)
-                });
-            used_fuzzy_color = found.is_some();
-            found
-        } else {
-            None
-        }
+        let source = call.sampled_rt_copy_sources.get(slot).copied().flatten()?;
+        let found = drawn_color_alias_for_key(rt_cache, source)
+            .or_else(|| rt_cache.find_color_with_format(source));
+        used_copy_color = found.is_some();
+        found
     })
     .filter(|(candidate, _, _, _, _)| {
-        if !used_fuzzy_color || call.fs_gpu_va != 0x4000b3030 || slot != 0 {
+        if !used_copy_color || call.fs_gpu_va != 0x4000b3030 || slot != 0 {
             return true;
         }
         let duplicates_exact_input = call
@@ -13141,7 +13150,7 @@ fn rt_alias_for_slot(
         sk,
         found_key,
         filtered.is_some(),
-        call.sampled_rt_fuzzy,
+        used_copy_color,
     );
     filtered
 }
@@ -17280,6 +17289,7 @@ fn submit_and_wait(
             .queue_wait_idle(queue)
             .map_err(|e| format!("queue_wait_idle: {:?}", e))?;
     }
+    note_queue_drained();
     Ok(())
 }
 

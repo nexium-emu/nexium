@@ -178,7 +178,7 @@ pub struct Maxwell3dDrawCall {
     pub sampled_rt_key: Option<RtKey>,
     pub sampled_rt_keys: Vec<RtKey>,
     pub sampled_rt_slots: Vec<Option<RtKey>>,
-    pub sampled_rt_fuzzy: bool,
+    pub sampled_rt_copy_sources: Vec<Option<RtKey>>,
     pub clear: bool,
     pub clear_color: [f32; 4],
     pub tic_pool_gpu_va: u64,

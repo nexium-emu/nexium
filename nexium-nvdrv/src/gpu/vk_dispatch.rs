@@ -367,13 +367,13 @@ pub fn enqueue_draws(
         }
         if draw.is_clear {
             flush_accum(batch, renderer, mappings, mem_read, mem_write);
-            if let Err(e) = execute_one(draw, mappings, maxwell, renderer, mem_read) {
+            if let Err(e) = execute_one(draw, mappings, maxwell, maxwell_dma, renderer, mem_read) {
                 log::debug!("vk_dispatch: clear failed: {}", e);
                 bump_draw_drop(3, &e);
             }
             continue;
         }
-        match execute_one(draw, mappings, maxwell, renderer, mem_read) {
+        match execute_one(draw, mappings, maxwell, maxwell_dma, renderer, mem_read) {
             Ok(None) => {}
             Ok(Some(call)) => {
                 let flush_prior = batch.last().is_some_and(|last| {
@@ -2813,6 +2813,7 @@ fn execute_one(
     draw: &DrawCall,
     mappings: &GpuMappings,
     maxwell: &Maxwell3D,
+    maxwell_dma: &super::engines::MaxwellDma,
     renderer: &Arc<nexium_gpu::Renderer>,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Result<Option<Maxwell3dDrawCall>, String> {
@@ -4198,9 +4199,9 @@ fn execute_one(
         mem_read,
     );
 
-    let mut sampled_rt_fuzzy = false;
     let mut sampled_rt_keys: Vec<RtKey> = Vec::new();
     let mut sampled_rt_slots: Vec<Option<RtKey>> = vec![None; fs_tex_ids.len()];
+    let mut sampled_rt_copy_sources: Vec<Option<RtKey>> = vec![None; fs_tex_ids.len()];
     if std::env::var_os("NEXIUM_TEXDBG").is_some() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static D: AtomicU64 = AtomicU64::new(0);
@@ -4274,33 +4275,13 @@ fn execute_one(
                 1
             });
             sampled_rt_slots[slot] = Some(key);
+            if let Some((source, stamp)) = maxwell_dma.rt_copy_source(tic.gpu_va) {
+                if renderer.render_target_stamp(source) == Some(stamp) {
+                    sampled_rt_copy_sources[slot] = Some(source);
+                }
+            }
             if !sampled_rt_keys.contains(&key) {
                 sampled_rt_keys.push(key);
-            }
-            if tic.width >= 512 && tic.height >= 256 {
-                let mid = tic.gpu_va
-                    + (tic.width as u64 * 4) * (tic.height as u64 / 2)
-                    + (tic.width as u64 * 2);
-                if let Some(mcpu) = mappings.cpu_address_for(mid) {
-                    let mut probe = [0u8; 64];
-                    if mem_read(mcpu, &mut probe) && probe.iter().all(|b| *b == 0) {
-                        let size = (tic.width as u64) * (tic.height as u64) * 4;
-                        let gen = nexium_gpu::tex_invalidate::region_gen_range(tic.gpu_va, size);
-                        let guest_written = {
-                            use std::collections::HashMap;
-                            use std::sync::{Mutex, OnceLock};
-                            static LAST: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
-                            let mut m = LAST
-                                .get_or_init(|| Mutex::new(HashMap::new()))
-                                .lock()
-                                .unwrap();
-                            m.insert(tic.gpu_va, gen) != Some(gen)
-                        };
-                        if !guest_written {
-                            sampled_rt_fuzzy = true;
-                        }
-                    }
-                }
             }
         }
     }
@@ -4939,7 +4920,7 @@ fn execute_one(
         sampled_rt_key,
         sampled_rt_keys,
         sampled_rt_slots,
-        sampled_rt_fuzzy,
+        sampled_rt_copy_sources,
         clear: false,
         clear_color: [0.0, 0.0, 0.0, 1.0],
         tic_pool_gpu_va: draw.tic_pool_gpu_va,

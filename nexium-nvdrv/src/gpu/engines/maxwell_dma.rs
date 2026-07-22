@@ -1,4 +1,5 @@
 use super::super::GpuMappings;
+use nexium_gpu::rt_cache::RtKey;
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -87,6 +88,14 @@ const LAUNCH_REMAP_ENABLE_BIT: u32 = 10;
 const LAYOUT_BLOCK_LINEAR: u32 = 0;
 const LAYOUT_PITCH: u32 = 1;
 
+#[derive(Clone, Copy, Debug)]
+pub struct RtCopyRecord {
+    pub source: RtKey,
+    pub source_stamp: u64,
+    pub size: u64,
+    pub generation: u64,
+}
+
 #[derive(Default)]
 pub struct MaxwellDma {
     offset_in_upper: u32,
@@ -112,7 +121,8 @@ pub struct MaxwellDma {
     dst_origin_y: u32,
     pub blit_count: u64,
 
-    pub blit_dst_by_src: HashMap<u64, u64>,
+    rt_copy_sources: HashMap<u64, RtCopyRecord>,
+    pending_rt_source: Option<(RtKey, u64, usize)>,
 
     pub last_tiled_dst_cpu: u64,
 
@@ -190,13 +200,20 @@ impl MaxwellDma {
         ]
     }
 
+    pub fn rt_copy_source(&self, gpu_va: u64) -> Option<(RtKey, u64)> {
+        let record = self.rt_copy_sources.get(&gpu_va)?;
+        let generation = nexium_gpu::tex_invalidate::region_gen_range(gpu_va, record.size);
+        (generation == record.generation).then_some((record.source, record.source_stamp))
+    }
+
     pub fn stage_rt_source(
-        &self,
+        &mut self,
         flags: u32,
         mappings: &GpuMappings,
         renderer: &nexium_gpu::renderer::Renderer,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
+        self.pending_rt_source = None;
         let src_layout = (flags >> LAUNCH_SRC_LAYOUT_BIT) & 1;
         let dst_layout = (flags >> LAUNCH_DST_LAYOUT_BIT) & 1;
         if src_layout != LAYOUT_BLOCK_LINEAR {
@@ -215,6 +232,11 @@ impl MaxwellDma {
             }
             return;
         };
+        if let Some((source, stamp)) = self.rt_copy_source(src_gpu) {
+            self.pending_rt_source = Some((source, stamp, 4));
+            return;
+        }
+        let exact_source = renderer.render_target_at_va(nvmap, src_gpu);
         let Some((src_cpu, limit)) = mappings.cpu_range_for(src_gpu) else {
             if jumbo_dbg() {
                 log::warn!("[jumbo] stage MISS no-cpu-range src={:#x}", src_gpu);
@@ -257,7 +279,11 @@ impl MaxwellDma {
                 0,
             );
             let n = tiled.len().min(limit as usize);
-            mem_write(src_cpu, &tiled[..n]);
+            if mem_write(src_cpu, &tiled[..n]) {
+                if let Some((source, stamp)) = exact_source {
+                    self.pending_rt_source = Some((source, stamp, bpp));
+                }
+            }
             log::debug!(
                 "MaxwellDma::stage_rt_source raw va={:#x} nvmap={} {}x{} bpp={} bytes={}",
                 src_gpu,
@@ -345,6 +371,7 @@ impl MaxwellDma {
         let dst_layout = (flags >> LAUNCH_DST_LAYOUT_BIT) & 1;
         let multi_line = (flags >> LAUNCH_MULTI_LINE_BIT) & 1 != 0;
         let remap_enable = (flags >> LAUNCH_REMAP_ENABLE_BIT) & 1 != 0;
+        let pending_rt_source = self.pending_rt_source.take();
 
         let src_gpu = self.src_addr();
         let dst_gpu = self.dst_addr();
@@ -496,6 +523,15 @@ impl MaxwellDma {
         } else {
             1
         };
+        let source_compatible = pending_rt_source.is_some_and(|(_, _, bpp)| {
+            !remap_enable
+                && src_layout == LAYOUT_BLOCK_LINEAR
+                && self.src_origin_x == 0
+                && self.src_origin_y == 0
+                && line_length_src == self.src_width.max(1) as usize * bpp
+                && line_count == self.src_height.max(1) as usize
+        });
+        let mut copied_size = 0u64;
 
         if self.blit_count < 64 {
             log::info!(
@@ -567,6 +603,7 @@ impl MaxwellDma {
                     dst_gpu,
                     tiled_size_bytes(dst_w, dst_h, bh) as u64,
                 );
+                copied_size = tiled_size_bytes(dst_w, dst_h, bh) as u64;
             }
             (LAYOUT_BLOCK_LINEAR, LAYOUT_PITCH) => {
                 let dst_pitch = self.pitch_out.max(line_length_src as u32) as usize;
@@ -585,6 +622,7 @@ impl MaxwellDma {
                     mem_write,
                 );
                 nexium_gpu::tex_invalidate::bump_region(dst_gpu, (dst_pitch * line_count) as u64);
+                copied_size = (dst_pitch * line_count) as u64;
             }
             (LAYOUT_PITCH, LAYOUT_PITCH) => {
                 self.blit_pitch_to_pitch(
@@ -598,6 +636,7 @@ impl MaxwellDma {
                 );
                 let dst_pitch = self.pitch_out.max(line_length_src as u32) as usize;
                 nexium_gpu::tex_invalidate::bump_region(dst_gpu, (dst_pitch * line_count) as u64);
+                copied_size = (dst_pitch * line_count) as u64;
             }
             (LAYOUT_BLOCK_LINEAR, LAYOUT_BLOCK_LINEAR) => {
                 self.blit_block_to_block(
@@ -633,6 +672,24 @@ impl MaxwellDma {
                     );
                 }
             }
+        }
+        if source_compatible && copied_size != 0 {
+            if let Some((source, source_stamp, _)) = pending_rt_source {
+                self.rt_copy_sources.insert(
+                    dst_gpu,
+                    RtCopyRecord {
+                        source,
+                        source_stamp,
+                        size: copied_size,
+                        generation: nexium_gpu::tex_invalidate::region_gen_range(
+                            dst_gpu,
+                            copied_size,
+                        ),
+                    },
+                );
+            }
+        } else {
+            self.rt_copy_sources.remove(&dst_gpu);
         }
         if let Some(sequence) = video_sequence.filter(|sequence| *sequence < 512) {
             trace_video_sample("dst", sequence, dst_gpu, dst_cpu, line_length_dst, mem_read);
@@ -951,7 +1008,6 @@ impl MaxwellDma {
                 tiled_size_dbg,
             );
         }
-        self.blit_dst_by_src.insert(src_cpu, dst_cpu);
         let dst_pitch = self.pitch_out.max(line_length as u32) as usize;
         let block_height_log2 = ((self.src_block_size >> 4) & 0xF) as u32;
         let src_width_bytes = if self.src_width != 0 {

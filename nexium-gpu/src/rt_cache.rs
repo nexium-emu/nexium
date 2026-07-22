@@ -767,6 +767,10 @@ impl RtCache {
             .copied()
     }
 
+    pub fn drawn_stamp(&self, key: RtKey) -> Option<u64> {
+        self.drawn_stamp.get(&key).copied()
+    }
+
     pub fn color_keys_for_nvmap(&self, nvmap_id: u32) -> Vec<(RtKey, vk::Format, u64, u32)> {
         self.cache
             .iter()
