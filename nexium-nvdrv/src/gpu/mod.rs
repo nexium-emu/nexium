@@ -148,6 +148,38 @@ impl GpuMappings {
         self.mappings.iter()
     }
 
+    pub fn mapping_starting_at(&self, gpu_va: u64) -> Option<&GpuMapping> {
+        self.mappings
+            .iter()
+            .rev()
+            .find(|mapping| mapping.gpu_va == gpu_va)
+    }
+
+    pub fn gpu_regions_for_cpu_range(&self, cpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
+        if size == 0 {
+            return Vec::new();
+        }
+        let cpu_end = cpu_addr.saturating_add(size);
+        let mut regions = self
+            .mappings
+            .iter()
+            .filter_map(|mapping| {
+                let mapping_end = mapping.cpu_addr.saturating_add(mapping.size);
+                let overlap_start = cpu_addr.max(mapping.cpu_addr);
+                let overlap_end = cpu_end.min(mapping_end);
+                (overlap_start < overlap_end).then(|| {
+                    (
+                        mapping.gpu_va + (overlap_start - mapping.cpu_addr),
+                        overlap_end - overlap_start,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        regions.sort_unstable();
+        regions.dedup();
+        regions
+    }
+
     pub fn describe_around(&self, gpu_va: u64) -> String {
         let lo = gpu_va.saturating_sub(0x40000);
         let hi = gpu_va.saturating_add(0x60000);
@@ -288,6 +320,8 @@ impl GpuContext {
         mem_read: impl Fn(u64, &mut [u8]) -> bool,
         mem_write: impl Fn(u64, &[u8]) -> bool,
     ) -> (u32, u32) {
+        let kp_total = pusher::kickprof::start();
+        let kp_locks = pusher::kickprof::start();
         let mut pusher = self.pusher.lock();
         let mut maxwell = self.maxwell3d.lock();
         let mut maxwell_dma = self.maxwell_dma.lock();
@@ -295,6 +329,7 @@ impl GpuContext {
         let mut kepler_compute = self.kepler_compute.lock();
         let mut kepler_memory = self.kepler_memory.lock();
         let mappings = self.mappings.lock();
+        pusher::kickprof::add(pusher::kickprof::LOCKS, kp_locks);
 
         pusher.process_gpfifo(
             address,
@@ -310,6 +345,7 @@ impl GpuContext {
             &mem_write,
         );
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
+        pusher::kickprof::kick_done(kp_total);
 
         let syncpt_id = 0u32;
         let syncpt_value = pusher.syncpt_value;
@@ -323,6 +359,8 @@ impl GpuContext {
         mem_write: impl Fn(u64, &[u8]) -> bool,
     ) -> (u32, u32) {
         let profile = nvprof_enabled();
+        let kp_total = pusher::kickprof::start();
+        let kp_locks = pusher::kickprof::start();
         let t0 = std::time::Instant::now();
         let mut pusher = self.pusher.lock();
         let mut maxwell = self.maxwell3d.lock();
@@ -331,6 +369,7 @@ impl GpuContext {
         let mut kepler_compute = self.kepler_compute.lock();
         let mut kepler_memory = self.kepler_memory.lock();
         let mappings = self.mappings.lock();
+        pusher::kickprof::add(pusher::kickprof::LOCKS, kp_locks);
         let locks_ms = if profile { elapsed_ms(t0) } else { 0.0 };
 
         let t_entries = std::time::Instant::now();
@@ -357,13 +396,17 @@ impl GpuContext {
         pusher.entry_word_limit = 0;
         let entries_ms = if profile { elapsed_ms(t_entries) } else { 0.0 };
         let t_flush = std::time::Instant::now();
-        pusher.flush_vk(&mappings, &mem_read);
+        pusher.resolve_pending_compute(&mappings, &mem_write);
+        pusher.flush_vk(&mappings, &mem_read, &mem_write);
         if let Some(r) = pusher.renderer.clone() {
+            let kp_wb = pusher::kickprof::start();
             vk_dispatch::writeback_small_rts(&r, &mappings, &mem_write);
+            pusher::kickprof::add(pusher::kickprof::SMALLRT, kp_wb);
         }
         vk_dispatch::guest_probe(&mappings, &mem_read);
         let flush_ms = if profile { elapsed_ms(t_flush) } else { 0.0 };
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
+        pusher::kickprof::kick_done(kp_total);
         if profile {
             log::warn!(
                 "[nvprof] inline entries={} locks_ms={:.3} entries_ms={:.3} flush_ms={:.3} total_ms={:.3}",
@@ -402,5 +445,23 @@ impl GpuContext {
 impl Default for GpuContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GpuMappings;
+
+    #[test]
+    fn cpu_range_aliases_include_partial_overlaps() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x1000, 0x1_0000, 7);
+        mappings.add(0x3000, 0x800, 0x1_0800, 7);
+
+        assert_eq!(
+            mappings.gpu_regions_for_cpu_range(0x1_0700, 0x300),
+            vec![(0x1700, 0x300), (0x3000, 0x200)]
+        );
+        assert!(mappings.gpu_regions_for_cpu_range(0x1_0700, 0).is_empty());
     }
 }

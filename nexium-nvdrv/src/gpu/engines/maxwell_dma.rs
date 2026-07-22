@@ -1,10 +1,43 @@
 use super::super::GpuMappings;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
+};
 
 fn jumbo_dbg() -> bool {
     static F: OnceLock<bool> = OnceLock::new();
     *F.get_or_init(|| std::env::var_os("NEXIUM_JUMBO_DBG").map_or(false, |v| v == "1"))
+}
+
+fn video_dma_trace() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("NEXIUM_VIDEO_DMA_TRACE").is_some())
+}
+
+fn trace_video_sample(
+    phase: &str,
+    sequence: u64,
+    gpu_va: u64,
+    cpu_va: u64,
+    sample_len: usize,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> (bool, usize, u64) {
+    let mut sample = vec![0u8; sample_len.min(4096)];
+    let read = mem_read(cpu_va, &mut sample);
+    let (nonzero, checksum) = if read { sample_stats(&sample) } else { (0, 0) };
+    log::warn!(
+        "[video-dma] {} #{} gpu={:#x} cpu={:#x} bytes={} read={} nz={} ck={:#x}",
+        phase,
+        sequence,
+        gpu_va,
+        cpu_va,
+        sample.len(),
+        read,
+        nonzero,
+        checksum
+    );
+    (read, nonzero, checksum)
 }
 
 fn sample_stats(buf: &[u8]) -> (usize, u64) {
@@ -146,6 +179,17 @@ impl MaxwellDma {
         ((self.offset_in_upper as u64) << 32) | self.offset_in_lower as u64
     }
 
+    pub fn transfer_spans(&self) -> [(u64, usize); 2] {
+        let lines = self.line_count.max(1) as usize;
+        let src_stride = self.line_length_in.max(self.pitch_in) as usize;
+        let dst_stride = self.line_length_in.max(self.pitch_out) as usize;
+        let dst_addr = ((self.offset_out_upper as u64) << 32) | self.offset_out_lower as u64;
+        [
+            (self.src_addr(), src_stride.saturating_mul(lines)),
+            (dst_addr, dst_stride.saturating_mul(lines)),
+        ]
+    }
+
     pub fn stage_rt_source(
         &self,
         flags: u32,
@@ -155,8 +199,14 @@ impl MaxwellDma {
     ) {
         let src_layout = (flags >> LAUNCH_SRC_LAYOUT_BIT) & 1;
         let dst_layout = (flags >> LAUNCH_DST_LAYOUT_BIT) & 1;
-        if src_layout != LAYOUT_BLOCK_LINEAR || dst_layout != LAYOUT_PITCH {
+        if src_layout != LAYOUT_BLOCK_LINEAR {
             return;
+        }
+        if dst_layout != LAYOUT_PITCH {
+            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *OFF.get_or_init(|| std::env::var_os("NEXIUM_NO_DMA_BLOCK_STAGE").is_some()) {
+                return;
+            }
         }
         let src_gpu = self.src_addr();
         let Some(nvmap) = mappings.nvmap_id_for(src_gpu) else {
@@ -177,7 +227,13 @@ impl MaxwellDma {
                 let (nz, ck) = sample_stats(&raw);
                 log::warn!(
                     "[jumbo] stage RAW src={:#x} nvmap={} {}x{} bpp={} nz={} ck={:#x}",
-                    src_gpu, nvmap, kw, kh, bpp, nz, ck
+                    src_gpu,
+                    nvmap,
+                    kw,
+                    kh,
+                    bpp,
+                    nz,
+                    ck
                 );
             }
             let width_bytes = (kw as usize) * bpp;
@@ -218,7 +274,10 @@ impl MaxwellDma {
             if jumbo_dbg() {
                 log::warn!(
                     "[jumbo] stage MISS no-rt-key src={:#x} nvmap={} {}x{}",
-                    src_gpu, nvmap, self.src_width, self.src_height
+                    src_gpu,
+                    nvmap,
+                    self.src_width,
+                    self.src_height
                 );
             }
             return;
@@ -227,7 +286,10 @@ impl MaxwellDma {
             if jumbo_dbg() {
                 log::warn!(
                     "[jumbo] stage MISS readback-none src={:#x} nvmap={} {}x{}",
-                    src_gpu, nvmap, kw, kh
+                    src_gpu,
+                    nvmap,
+                    kw,
+                    kh
                 );
             }
             return;
@@ -236,7 +298,12 @@ impl MaxwellDma {
             let (nz, ck) = sample_stats(&rgba);
             log::warn!(
                 "[jumbo] stage FUZZY src={:#x} nvmap={} {}x{} nz={} ck={:#x}",
-                src_gpu, nvmap, kw, kh, nz, ck
+                src_gpu,
+                nvmap,
+                kw,
+                kh,
+                nz,
+                ck
             );
         }
         let width_bytes = (kw as usize) * 4;
@@ -281,12 +348,33 @@ impl MaxwellDma {
 
         let src_gpu = self.src_addr();
         let dst_gpu = self.dst_addr();
+        static DMA_DROPPED: AtomicU64 = AtomicU64::new(0);
         let Some(src_cpu) = mappings.cpu_address_for(src_gpu) else {
-            log::trace!("MaxwellDma::launch: src gpu_va {:#x} not mapped", src_gpu);
+            let n = DMA_DROPPED.fetch_add(1, Ordering::Relaxed);
+            if n < 32 || n % 1024 == 0 {
+                log::warn!(
+                    "[dma-drop] #{} src gpu_va={:#x} dst={:#x} units={} lines={}",
+                    n,
+                    src_gpu,
+                    dst_gpu,
+                    self.line_length_in,
+                    self.line_count
+                );
+            }
             return;
         };
         let Some((dst_cpu, dst_limit)) = mappings.cpu_range_for(dst_gpu) else {
-            log::trace!("MaxwellDma::launch: dst gpu_va {:#x} not mapped", dst_gpu);
+            let n = DMA_DROPPED.fetch_add(1, Ordering::Relaxed);
+            if n < 32 || n % 1024 == 0 {
+                log::warn!(
+                    "[dma-drop] #{} dst gpu_va={:#x} src={:#x} units={} lines={}",
+                    n,
+                    dst_gpu,
+                    src_gpu,
+                    self.line_length_in,
+                    self.line_count
+                );
+            }
             return;
         };
         let dst_limit = dst_limit as usize;
@@ -327,6 +415,76 @@ impl MaxwellDma {
         let dst_bytes_per_group = component_size * num_dst_components;
         let line_length_src = line_length_units * src_bytes_per_group;
         let line_length_dst = line_length_units * dst_bytes_per_group;
+
+        static VIDEO_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        static VIDEO_GEOMETRIES: OnceLock<Mutex<std::collections::HashSet<[u64; 18]>>> =
+            OnceLock::new();
+        let movie_sized = line_count >= 100 && (line_length_src >= 256 || line_length_dst >= 256);
+        let video_sequence = if video_dma_trace() && movie_sized {
+            let geometry = [
+                src_layout as u64,
+                dst_layout as u64,
+                line_length_units as u64,
+                line_count as u64,
+                line_length_src as u64,
+                line_length_dst as u64,
+                self.pitch_in as u64,
+                self.pitch_out as u64,
+                self.src_width as u64,
+                self.src_height as u64,
+                self.dst_width as u64,
+                self.dst_height as u64,
+                self.src_block_size as u64,
+                self.dst_block_size as u64,
+                remap_enable as u64,
+                component_size as u64,
+                num_src_components as u64,
+                num_dst_components as u64,
+            ];
+            VIDEO_GEOMETRIES
+                .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+                .lock()
+                .ok()
+                .and_then(|mut set| {
+                    set.insert(geometry)
+                        .then(|| VIDEO_SEQUENCE.fetch_add(1, Ordering::Relaxed))
+                })
+        } else {
+            None
+        };
+        if let Some(sequence) = video_sequence.filter(|sequence| *sequence < 512) {
+            log::warn!(
+                "[video-dma] launch #{} blit={} src={:#x} dst={:#x} layout={}->{} flags={:#x} units={} lines={} src_bytes={} dst_bytes={} pitch={}->{} size={}x{}->{:}x{} block={:#x}->{:#x} remap={} comp={} nsrc={} ndst={} sel={}{}{}{}",
+                sequence,
+                self.blit_count,
+                src_gpu,
+                dst_gpu,
+                src_layout,
+                dst_layout,
+                flags,
+                line_length_units,
+                line_count,
+                line_length_src,
+                line_length_dst,
+                self.pitch_in,
+                self.pitch_out,
+                self.src_width,
+                self.src_height,
+                self.dst_width,
+                self.dst_height,
+                self.src_block_size,
+                self.dst_block_size,
+                remap_enable,
+                component_size,
+                num_src_components,
+                num_dst_components,
+                dst_x_sel,
+                dst_y_sel,
+                dst_z_sel,
+                dst_w_sel
+            );
+            trace_video_sample("src", sequence, src_gpu, src_cpu, line_length_src, mem_read);
+        }
 
         let src_bytes_per_element = if remap_enable {
             component_size.max(1) * num_src_components.max(1)
@@ -476,6 +634,18 @@ impl MaxwellDma {
                 }
             }
         }
+        if let Some(sequence) = video_sequence.filter(|sequence| *sequence < 512) {
+            trace_video_sample("dst", sequence, dst_gpu, dst_cpu, line_length_dst, mem_read);
+            log::warn!(
+                "[video-dma] done #{} gen={} range={}",
+                sequence,
+                nexium_gpu::tex_invalidate::region_gen_range(
+                    dst_gpu,
+                    line_length_dst.saturating_mul(line_count) as u64
+                ),
+                line_length_dst.saturating_mul(line_count)
+            );
+        }
         self.blit_count = self.blit_count.wrapping_add(1);
     }
 
@@ -614,7 +784,11 @@ impl MaxwellDma {
             let (nz, ck) = sample_stats(&post_remap);
             log::warn!(
                 "[jumbo] p2b dst={:#x} w={}B h={} nz={} ck={:#x}",
-                dst_gpu, dst_width_bytes, line_count, nz, ck
+                dst_gpu,
+                dst_width_bytes,
+                line_count,
+                nz,
+                ck
             );
         }
         let tiled_size = tiled_size_bytes(dst_width_bytes, dst_height, block_height_log2);
@@ -808,7 +982,12 @@ impl MaxwellDma {
             let (nz, ck) = sample_stats(&linear);
             log::warn!(
                 "[jumbo] b2p dst={:#x} {}x{} pitch={} nz={} ck={:#x}",
-                dst_cpu, line_length, line_count, dst_pitch, nz, ck
+                dst_cpu,
+                line_length,
+                line_count,
+                dst_pitch,
+                nz,
+                ck
             );
         }
         for y in 0..line_count {
@@ -888,7 +1067,8 @@ pub(crate) fn swizzle_block_linear_into(
         let y_in_gob = y_in_block - gob_row_in_block * GOB_H;
         let block_row_off = block_y * block_row_stride;
         let src_row_off = y * src_pitch;
-        for x in 0..copy_width_bytes {
+        let mut x = 0usize;
+        while x < copy_width_bytes {
             let dst_byte_x = origin_x + x;
             let gob_col = dst_byte_x / GOB_W;
             let x_in_gob = dst_byte_x - gob_col * GOB_W;
@@ -896,9 +1076,15 @@ pub(crate) fn swizzle_block_linear_into(
                 block_row_off + gob_col * block_height * GOB_SIZE + gob_row_in_block * GOB_SIZE;
             let dst_off = gob_offset + in_gob_offset(x_in_gob, y_in_gob);
             let src_off = src_row_off + x;
-            if dst_off < dst.len() && src_off < src_linear.len() {
-                dst[dst_off] = src_linear[src_off];
+            let span = (16 - (dst_byte_x & 15)).min(copy_width_bytes - x);
+            let copy_len = span
+                .min(dst.len().saturating_sub(dst_off))
+                .min(src_linear.len().saturating_sub(src_off));
+            if copy_len != 0 {
+                dst[dst_off..dst_off + copy_len]
+                    .copy_from_slice(&src_linear[src_off..src_off + copy_len]);
             }
+            x += span;
         }
     }
 }
@@ -941,4 +1127,93 @@ fn unswizzle_block_linear_bytes(
         }
     }
     dst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        in_gob_offset, swizzle_block_linear_into, tiled_size_bytes, GOB_H, GOB_SIZE, GOB_W,
+    };
+
+    fn swizzle_reference(
+        dst: &mut [u8],
+        src_linear: &[u8],
+        copy_width_bytes: usize,
+        copy_height: usize,
+        src_pitch: usize,
+        dst_width_bytes: usize,
+        block_height_log2: u32,
+        origin_x: usize,
+        origin_y: usize,
+    ) {
+        let block_height = 1usize << block_height_log2;
+        let rows_per_block = block_height * GOB_H;
+        let gobs_per_row = dst_width_bytes.div_ceil(GOB_W);
+        let block_row_stride = gobs_per_row * block_height * GOB_SIZE;
+        for y in 0..copy_height {
+            let dst_y = origin_y + y;
+            let block_y = dst_y / rows_per_block;
+            let y_in_block = dst_y - block_y * rows_per_block;
+            let gob_row_in_block = y_in_block / GOB_H;
+            let y_in_gob = y_in_block - gob_row_in_block * GOB_H;
+            let block_row_off = block_y * block_row_stride;
+            let src_row_off = y * src_pitch;
+            for x in 0..copy_width_bytes {
+                let dst_byte_x = origin_x + x;
+                let gob_col = dst_byte_x / GOB_W;
+                let x_in_gob = dst_byte_x - gob_col * GOB_W;
+                let gob_offset =
+                    block_row_off + gob_col * block_height * GOB_SIZE + gob_row_in_block * GOB_SIZE;
+                let dst_off = gob_offset + in_gob_offset(x_in_gob, y_in_gob);
+                let src_off = src_row_off + x;
+                if dst_off < dst.len() && src_off < src_linear.len() {
+                    dst[dst_off] = src_linear[src_off];
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_swizzle_matches_byte_reference() {
+        for block_height_log2 in 0..=5 {
+            for (dst_width, dst_height, origin_x, origin_y, copy_width, copy_height) in [
+                (17, 9, 0, 0, 17, 9),
+                (65, 33, 1, 3, 61, 27),
+                (137, 73, 15, 7, 119, 61),
+                (320, 180, 32, 16, 257, 129),
+            ] {
+                let src_pitch = copy_width + 13;
+                let mut src = vec![0u8; src_pitch * copy_height];
+                for (index, byte) in src.iter_mut().enumerate() {
+                    *byte = index.wrapping_mul(37).wrapping_add(11) as u8;
+                }
+                let dst_size = tiled_size_bytes(dst_width, dst_height, block_height_log2);
+                let mut expected = vec![0xa5; dst_size];
+                let mut actual = expected.clone();
+                swizzle_reference(
+                    &mut expected,
+                    &src,
+                    copy_width,
+                    copy_height,
+                    src_pitch,
+                    dst_width,
+                    block_height_log2,
+                    origin_x,
+                    origin_y,
+                );
+                swizzle_block_linear_into(
+                    &mut actual,
+                    &src,
+                    copy_width,
+                    copy_height,
+                    src_pitch,
+                    dst_width,
+                    block_height_log2,
+                    origin_x,
+                    origin_y,
+                );
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 }

@@ -28,11 +28,21 @@ const M_CODE_LOC_LOWER: u32 = 0x583;
 const M_TEX_CB_INDEX: u32 = 0x982;
 const LAUNCH_WORDS: usize = 0x40;
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct ComputeTextureState {
+    pub tic_pool_gpu_va: u64,
+    pub tic_limit: u32,
+    pub tsc_pool_gpu_va: u64,
+    pub tsc_limit: u32,
+    pub tex_cb_index: u32,
+}
+
 pub struct KeplerCompute {
     regs: Vec<u32>,
     upload: ComputeUpload,
     launch_description: [u32; LAUNCH_WORDS],
     pub launch_count: u64,
+    target_dumped: bool,
 }
 
 impl KeplerCompute {
@@ -42,6 +52,7 @@ impl KeplerCompute {
             upload: ComputeUpload::default(),
             launch_description: [0; LAUNCH_WORDS],
             launch_count: 0,
+            target_dumped: false,
         }
     }
 
@@ -50,6 +61,7 @@ impl KeplerCompute {
         method: u32,
         arg: u32,
         is_last_call: bool,
+        renderer: Option<&std::sync::Arc<nexium_gpu::Renderer>>,
         mappings: &GpuMappings,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
@@ -68,17 +80,19 @@ impl KeplerCompute {
                 self.upload
                     .data(arg, is_last_call, mappings, mem_read, mem_write, &self.regs)
             }
-            M_LAUNCH => self.launch(mappings, mem_read, mem_write),
+            M_LAUNCH => self.launch(renderer, mappings, mem_read, mem_write),
             _ => {}
         }
     }
 
     fn launch(
         &mut self,
+        renderer: Option<&std::sync::Arc<nexium_gpu::Renderer>>,
         mappings: &GpuMappings,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
+        let kp = crate::gpu::pusher::kickprof::start();
         let launch_gpu = (self.reg(M_LAUNCH_DESC_LOC) as u64) << 8;
         let launch_cpu = mappings.cpu_address_for(launch_gpu).unwrap_or(launch_gpu);
         let mut bytes = [0u8; LAUNCH_WORDS * 4];
@@ -103,7 +117,7 @@ impl KeplerCompute {
 
         let code_base =
             ((self.reg(M_CODE_LOC_UPPER) as u64) << 32) | self.reg(M_CODE_LOC_LOWER) as u64;
-        let texture = super::compute_cpu::ComputeTextureState {
+        let texture = ComputeTextureState {
             tic_pool_gpu_va: ((self.reg(M_TIC_ADDRESS_HIGH) as u64) << 32)
                 | self.reg(M_TIC_ADDRESS_LOW) as u64,
             tic_limit: self.reg(M_TIC_LIMIT),
@@ -112,20 +126,123 @@ impl KeplerCompute {
             tsc_limit: self.reg(M_TSC_LIMIT),
             tex_cb_index: self.reg(M_TEX_CB_INDEX),
         };
-        let executed = super::compute_cpu::try_execute(
-            &self.launch_description,
-            code_base,
-            texture,
-            mappings,
-            mem_read,
-            mem_write,
-            self.launch_count,
-        );
+        let profile_started = std::env::var_os("NEXIUM_NVDRV_PROFILE")
+            .is_some()
+            .then(std::time::Instant::now);
+        let mut backend = "unsupported";
+        let mut handled = false;
+        let mut executed = false;
 
-        if self.launch_count < 8 {
+        if renderer.is_some() {
+            match super::maxwell_compute::try_execute(
+                &self.launch_description,
+                code_base,
+                texture,
+                renderer.map(|renderer| renderer.as_ref()),
+                mappings,
+                mem_read,
+                mem_write,
+            ) {
+                super::maxwell_compute::MaxwellComputeOutcome::Executed => {
+                    backend = "vulkan-recompiler";
+                    handled = true;
+                    executed = true;
+                    if std::env::var_os("NEXIUM_COMPUTE_RECOMPILER_TRACE").is_some() {
+                        use std::sync::{Mutex, OnceLock};
+                        static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> =
+                            OnceLock::new();
+                        let program = self.launch_description[0x08];
+                        if SEEN
+                            .get_or_init(|| Mutex::new(Default::default()))
+                            .lock()
+                            .unwrap()
+                            .insert(program)
+                        {
+                            log::warn!(
+                                "[compute-recompiler] program={:#x} backend=vulkan local={:?} groups={:?}",
+                                program,
+                                [
+                                    self.launch_description[0x12] >> 16,
+                                    self.launch_description[0x13] & 0xffff,
+                                    self.launch_description[0x13] >> 16,
+                                ],
+                                [
+                                    self.launch_description[0x0c] & 0x7fff_ffff,
+                                    self.launch_description[0x0d] & 0xffff,
+                                    self.launch_description[0x0d] >> 16,
+                                ],
+                            );
+                        }
+                    }
+                }
+                super::maxwell_compute::MaxwellComputeOutcome::Unsupported(reason) => {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    backend = "unsupported";
+                    static RECOMPILER_SKIPS: AtomicU64 = AtomicU64::new(0);
+                    let skipped = RECOMPILER_SKIPS.fetch_add(1, Ordering::Relaxed);
+                    if skipped < 24 {
+                        log::warn!(
+                            "[compute-recompiler-skip #{}] program={:#x} reason={}",
+                            skipped + 1,
+                            self.launch_description[0x08],
+                            reason
+                        );
+                    }
+                }
+                super::maxwell_compute::MaxwellComputeOutcome::SubmittedFailure(reason) => {
+                    backend = "vulkan-recompiler-error";
+                    handled = true;
+                    log::error!(
+                        "[compute-recompiler-error] program={:#x} reason={}",
+                        self.launch_description[0x08],
+                        reason
+                    );
+                }
+            }
+        }
+
+        if let Some(profile_started) = profile_started {
+            let elapsed = profile_started.elapsed();
+            if elapsed >= std::time::Duration::from_millis(1) {
+                let invocations = launch_invocations(&self.launch_description);
+                log::warn!(
+                    "[compute-profile] launch={} program={:#x} invocations={} backend={} executed={} elapsed_ms={:.3}",
+                    self.launch_count,
+                    self.launch_description[0x08],
+                    invocations,
+                    backend,
+                    executed,
+                    elapsed.as_secs_f64() * 1000.0,
+                );
+            }
+        }
+
+        let program_start = self.launch_description[0x08];
+        if !handled {
+            use std::sync::{Mutex, OnceLock};
+            static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+            let mut seen = SEEN
+                .get_or_init(|| Mutex::new(Default::default()))
+                .lock()
+                .unwrap();
+            if seen.insert(program_start) {
+                let invocations = launch_invocations(&self.launch_description);
+                log::warn!(
+                    "[compute-unsupported] program={:#x} invocations={}",
+                    program_start,
+                    invocations
+                );
+            }
+        }
+        let dump_invocations = compute_dump_invocations();
+        let target_dump = !self.target_dumped
+            && compute_dump_program().is_some_and(|program| program == program_start)
+            && dump_invocations
+                .is_none_or(|expected| expected == launch_invocations(&self.launch_description));
+        if (self.launch_count < 16 && dump_invocations.is_none()) || target_dump {
             log::warn!(
                 "KeplerCompute::launch {} gpu={:#x} code={:#x} program_start={:#x} grid=({}, {}, {}) block=({}, {}, {}) tic={:#x}/{} tsc={:#x}/{} tex_cb={}",
-                if executed { "cpu" } else { "ignored" },
+                backend,
                 launch_gpu,
                 code_base,
                 self.launch_description[0x8],
@@ -142,8 +259,10 @@ impl KeplerCompute {
                 texture.tex_cb_index
             );
             self.dump_launch(launch_gpu, code_base, mappings, mem_read);
+            self.target_dumped |= target_dump;
         }
         self.launch_count = self.launch_count.wrapping_add(1);
+        crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KC_LAUNCH, kp);
     }
 
     fn dump_launch(
@@ -239,6 +358,38 @@ impl KeplerCompute {
     }
 }
 
+fn compute_dump_program() -> Option<u32> {
+    let value = std::env::var("NEXIUM_COMPUTE_DUMP_PROGRAM").ok()?;
+    let value = value.trim();
+    u32::from_str_radix(value.strip_prefix("0x").unwrap_or(value), 16).ok()
+}
+
+fn compute_dump_invocations() -> Option<u64> {
+    let value = std::env::var("NEXIUM_COMPUTE_DUMP_INVOCATIONS").ok()?;
+    parse_u64(&value)
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn launch_invocations(desc: &[u32; LAUNCH_WORDS]) -> u64 {
+    (desc[0x0c] & 0x7fff_ffff) as u64
+        * (desc[0x0d] & 0xffff).max(1) as u64
+        * (desc[0x0d] >> 16).max(1) as u64
+        * (desc[0x12] >> 16).max(1) as u64
+        * (desc[0x13] & 0xffff).max(1) as u64
+        * (desc[0x13] >> 16).max(1) as u64
+}
+
 #[derive(Default)]
 struct ComputeUpload {
     write_offset: usize,
@@ -286,11 +437,13 @@ impl ComputeUpload {
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
         regs: &[u32],
     ) {
+        let kp = crate::gpu::pusher::kickprof::start();
         let dst_gpu =
             ((reg(regs, M_OFFSET_OUT_UPPER) as u64) << 32) | reg(regs, M_OFFSET_OUT_LOWER) as u64;
         let line_length = reg(regs, M_LINE_LENGTH_IN) as usize;
         let line_count = reg(regs, M_LINE_COUNT).max(1) as usize;
         if dst_gpu == 0 || line_length == 0 {
+            crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KCU_FLUSH, kp);
             return;
         }
 
@@ -316,6 +469,7 @@ impl ComputeUpload {
                 true,
                 self.inline_buf.len(),
             );
+            crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KCU_FLUSH, kp);
             return;
         }
 
@@ -324,6 +478,7 @@ impl ComputeUpload {
                 "KeplerCompute::upload: dst gpu_va {:#x} not mapped",
                 dst_gpu
             );
+            crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KCU_FLUSH, kp);
             return;
         };
 
@@ -353,6 +508,7 @@ impl ComputeUpload {
         mem_write(dst_cpu, &tiled[..n]);
         nexium_gpu::tex_invalidate::bump_region(dst_gpu, n as u64);
         trace_upload(dst_gpu, line_length, line_count, dst_width_bytes, false, n);
+        crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KCU_FLUSH, kp);
     }
 }
 
@@ -420,4 +576,37 @@ fn trace_upload(
         linear,
         bytes
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{launch_invocations, parse_u64, LAUNCH_WORDS};
+
+    #[test]
+    fn invocation_count_multiplies_grid_and_block_dimensions() {
+        let mut desc = [0; LAUNCH_WORDS];
+        desc[0x0c] = 27;
+        desc[0x0d] = 2 | (3 << 16);
+        desc[0x12] = 4 << 16;
+        desc[0x13] = 2 | (2 << 16);
+        assert_eq!(launch_invocations(&desc), 27 * 2 * 3 * 4 * 2 * 2);
+    }
+
+    #[test]
+    fn pps_2fb200_dispatch_shape_is_100_by_57_workgroups_of_64_threads() {
+        let mut desc = [0; LAUNCH_WORDS];
+        desc[0x0c] = 100;
+        desc[0x0d] = 57 | (1 << 16);
+        desc[0x12] = 64 << 16;
+        desc[0x13] = 1 | (1 << 16);
+        assert_eq!(launch_invocations(&desc), 100 * 57 * 64);
+        assert_eq!(launch_invocations(&desc), 364_800);
+    }
+
+    #[test]
+    fn dump_invocation_filter_accepts_decimal_and_hex() {
+        assert_eq!(parse_u64("3456"), Some(3456));
+        assert_eq!(parse_u64(" 0xD80 "), Some(3456));
+        assert_eq!(parse_u64("not-a-count"), None);
+    }
 }

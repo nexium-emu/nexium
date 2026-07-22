@@ -270,8 +270,7 @@ fn is_hi_addr_reg(m: u32) -> bool {
 
 fn suspicious_write(m: u32, a: u32) -> bool {
     (is_hi_addr_reg(m) && a > 0xFF)
-        || (matches!(m, 0x582 | 0x583 | 0x6c0 | 0x6c1 | 0x6c2)
-            && matches!(a >> 24, 0x3E..=0x48))
+        || (matches!(m, 0x582 | 0x583 | 0x6c0 | 0x6c1 | 0x6c2) && matches!(a >> 24, 0x3E..=0x48))
 }
 
 fn forensic_report(out: &MacroOutput, params: &[u32]) {

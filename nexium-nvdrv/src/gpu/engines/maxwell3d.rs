@@ -1,5 +1,25 @@
 pub const MAXWELL3D_CLASS: u32 = 0xB197;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemaphoreWriteOrdering {
+    RendererOrdered,
+    SyntheticCounter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingSemaphoreWrite {
+    pub gpu_va: u64,
+    pub payload: u32,
+    pub long: bool,
+    pub ordering: SemaphoreWriteOrdering,
+}
+
+impl PendingSemaphoreWrite {
+    pub fn requires_renderer_completion(self) -> bool {
+        self.ordering == SemaphoreWriteOrdering::RendererOrdered
+    }
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct RenderTarget {
     pub address_lo: u32,
@@ -22,6 +42,31 @@ pub struct ZetaSurface {
     pub format: u32,
     pub block_size: u32,
     pub array_pitch: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StencilFaceState {
+    pub fail_op: u32,
+    pub depth_fail_op: u32,
+    pub depth_pass_op: u32,
+    pub compare_op: u32,
+    pub reference: u32,
+    pub compare_mask: u32,
+    pub write_mask: u32,
+}
+
+impl Default for StencilFaceState {
+    fn default() -> Self {
+        Self {
+            fail_op: 1,
+            depth_fail_op: 1,
+            depth_pass_op: 1,
+            compare_op: 0x207,
+            reference: 0,
+            compare_mask: u32::MAX,
+            write_mask: u32::MAX,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -156,6 +201,7 @@ pub struct VertexAttribute {
 #[derive(Clone, Copy, Default, Debug)]
 pub struct VertexBuffer {
     pub stride: u32,
+    pub enabled: bool,
     pub address_lo: u32,
     pub address_hi: u32,
     pub frequency: u32,
@@ -202,12 +248,21 @@ pub struct Maxwell3DRegisters {
     pub index_format: u32,
     pub index_count: u32,
     pub index_first: u32,
+    pub depth_mode: u32,
     pub depth_test_enable: bool,
     pub zeta: ZetaSurface,
     pub zeta_enable: bool,
+    pub multisample_mode: u32,
     pub depth_write_enable: bool,
     pub depth_func: u32,
+    pub stencil_enable: bool,
+    pub stencil_two_side_enable: bool,
+    pub stencil_front: StencilFaceState,
+    pub stencil_back: StencilFaceState,
     pub cull_test_enable: bool,
+    pub alpha_test_enabled: bool,
+    pub alpha_test_ref: u32,
+    pub alpha_test_func: u32,
     pub cull_face: u32,
     pub front_face: u32,
     pub poly_offset_fill_enable: bool,
@@ -262,7 +317,8 @@ pub struct Maxwell3DRegisters {
     pub constbuf_load_offset: u32,
 
     pub pending_constbuf_writes: Vec<(u64, u32)>,
-    pub pending_semaphore_writes: Vec<(u64, u32, bool)>,
+    pub pending_semaphore_writes: Vec<PendingSemaphoreWrite>,
+    pub pending_semaphore_acquires: Vec<(u64, u32, u32)>,
     pub pending_barrier_flushes: u32,
     pub pending_texture_cache_invalidates: u32,
     pub sync_info: u32,
@@ -290,7 +346,7 @@ impl Default for Maxwell3DRegisters {
             rt_control: 1,
             viewport: Viewport::default(),
             clear_color: ClearColor::default(),
-            clear_depth: 1.0,
+            clear_depth: 0.0,
             clear_stencil: 0,
             vertex_attribs: [VertexAttribute::default(); 32],
             vertex_buffers: [VertexBuffer::default(); 32],
@@ -315,12 +371,21 @@ impl Default for Maxwell3DRegisters {
             index_format: 0,
             index_count: 0,
             index_first: 0,
+            depth_mode: 0,
             depth_test_enable: false,
             zeta: ZetaSurface::default(),
             zeta_enable: false,
-            depth_write_enable: true,
+            multisample_mode: 0,
+            depth_write_enable: false,
             depth_func: 0x207,
+            stencil_enable: false,
+            stencil_two_side_enable: true,
+            stencil_front: StencilFaceState::default(),
+            stencil_back: StencilFaceState::default(),
             cull_test_enable: false,
+            alpha_test_enabled: false,
+            alpha_test_ref: 0,
+            alpha_test_func: 7,
             cull_face: 0x405,
             front_face: 0x901,
             poly_offset_fill_enable: false,
@@ -371,6 +436,7 @@ impl Default for Maxwell3DRegisters {
             constbuf_load_offset: 0,
             pending_constbuf_writes: Vec::new(),
             pending_semaphore_writes: Vec::new(),
+            pending_semaphore_acquires: Vec::new(),
             pending_barrier_flushes: 0,
             pending_texture_cache_invalidates: 0,
             sync_info: 0,
@@ -439,6 +505,9 @@ pub struct DrawCall {
     pub render_enable_override: u32,
 
     pub cull_test_enable: bool,
+    pub alpha_test_enabled: bool,
+    pub alpha_test_ref: u32,
+    pub alpha_test_func: u32,
     pub cull_face: u32,
     pub front_face: u32,
     pub poly_offset_fill_enable: bool,
@@ -450,7 +519,13 @@ pub struct DrawCall {
     pub depth_test_enable: bool,
     pub depth_write_enable: bool,
     pub depth_func: u32,
+    pub stencil_enable: bool,
+    pub stencil_two_side_enable: bool,
+    pub stencil_front: StencilFaceState,
+    pub stencil_back: StencilFaceState,
+    pub multisample_mode: u32,
     pub clear_depth: f32,
+    pub clear_stencil: u32,
     pub clear_mask: u32,
 }
 
@@ -500,6 +575,16 @@ fn mme_forensics() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_MME_FORENSICS").is_some())
 }
 
+fn mme_trace() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_MME_TRACE").is_some())
+}
+
+fn cbuf_bind_trace() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_CBUF_BIND_TRACE").is_some())
+}
+
 fn raw_counter_reports() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("NEXIUM_RAW_COUNTER_REPORTS").is_some())
@@ -514,6 +599,18 @@ fn synthetic_counter_value() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static C: AtomicU32 = AtomicU32::new(0x1000);
     C.fetch_add(0x1000, Ordering::Relaxed)
+}
+
+fn report_semaphore_write_ordering(
+    operation: u32,
+    raw_counter_reports: bool,
+) -> Option<SemaphoreWriteOrdering> {
+    match operation {
+        0 => Some(SemaphoreWriteOrdering::RendererOrdered),
+        2 if !raw_counter_reports => Some(SemaphoreWriteOrdering::SyntheticCounter),
+        2 => Some(SemaphoreWriteOrdering::RendererOrdered),
+        _ => None,
+    }
 }
 
 fn trace_sync_method(method: u32, arg: u32, pending: u32) {
@@ -584,7 +681,7 @@ impl Maxwell3D {
         }
 
         if method >= super::MACRO_REGISTERS_START {
-            if self.macro_invocations < 24 {
+            if self.macro_invocations < 24 || (mme_trace() && self.macro_invocations < 1024) {
                 log::info!(
                     "maxwell3d: MME invoke method={:#x} arg={:#x} is_last={} (slot offset {:#x})",
                     method,
@@ -602,7 +699,8 @@ impl Maxwell3D {
                         rf.get(idx as usize).copied().unwrap_or(0)
                     });
             if let Some(out) = writes {
-                if self.macro_writes_logged < 24 {
+                if self.macro_writes_logged < 24 || (mme_trace() && self.macro_writes_logged < 512)
+                {
                     log::info!(
                         "maxwell3d: MME produced {} writes inst={:?}: {:?}",
                         out.writes.len(),
@@ -660,6 +758,7 @@ impl Maxwell3D {
     }
 
     pub fn write_register(&mut self, method: u32, arg: u32) {
+        let incoming_arg = arg;
         let arg = if method == 0x49 {
             self.shadow_ram_control = arg;
             arg
@@ -682,6 +781,19 @@ impl Maxwell3D {
                 _ => arg,
             }
         };
+
+        if matches!(method, 0x35F | 0x4B3 | 0x4BA | 0x4C3) && wf_state_log() {
+            log::warn!(
+                "[depth-method] method={:#x} incoming={:#010x} applied={:#010x} shadow={} mme={} hash={:#018x} entry={}",
+                method,
+                incoming_arg,
+                arg,
+                self.shadow_ram_control,
+                self.mme_active,
+                self.mme_hash,
+                self.mme_entry
+            );
+        }
 
         let addr_hi_reg = method == 0x582
             || method == 0x6c0
@@ -787,7 +899,21 @@ impl Maxwell3D {
                 let off_lo = self.reg_file.get(0x6c1).copied().unwrap_or(0);
                 let payload = self.reg_file.get(0x6c2).copied().unwrap_or(0);
                 let gpu_va = ((off_hi as u64) << 32) | (off_lo as u64);
-                {
+                if operation == 2 {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static N: AtomicU32 = AtomicU32::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 || n % 4096 == 0 {
+                        log::debug!(
+                            "maxwell3d: REPORT_SEMAPHORE #{} arg={:#x} op={} gpu_va={:#x} payload={:#x}",
+                            n,
+                            arg,
+                            operation,
+                            gpu_va,
+                            payload
+                        );
+                    }
+                } else {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static N: AtomicU32 = AtomicU32::new(0);
                     if operation != 0 || N.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -800,16 +926,28 @@ impl Maxwell3D {
                         );
                     }
                 }
-                if operation == 0 || operation == 2 {
+                if let Some(ordering) =
+                    report_semaphore_write_ordering(operation, raw_counter_reports())
+                {
                     let long = ((arg >> 28) & 1) == 0;
-                    let value = if operation == 2 && !raw_counter_reports() {
+                    let value = if ordering == SemaphoreWriteOrdering::SyntheticCounter {
                         synthetic_counter_value()
                     } else {
                         payload
                     };
                     self.regs
                         .pending_semaphore_writes
-                        .push((gpu_va, value, long));
+                        .push(PendingSemaphoreWrite {
+                            gpu_va,
+                            payload: value,
+                            long,
+                            ordering,
+                        });
+                } else if operation == 1 {
+                    let acquire_mode = (arg >> 12) & 0x7;
+                    self.regs
+                        .pending_semaphore_acquires
+                        .push((gpu_va, payload, acquire_mode));
                 }
             }
             0x360..=0x363 => {
@@ -825,6 +963,9 @@ impl Maxwell3D {
             }
             0x364 => self.regs.clear_depth = f32::from_bits(arg),
             0x368 => self.regs.clear_stencil = arg,
+            0x3d5 => self.regs.stencil_back.reference = arg,
+            0x3d6 => self.regs.stencil_back.write_mask = arg,
+            0x3d7 => self.regs.stencil_back.compare_mask = arg,
             0x380 => self.regs.scissor.enabled = (arg & 1) != 0,
             0x381 => {
                 self.regs.scissor.min_x = arg & 0xFFFF;
@@ -915,6 +1056,9 @@ impl Maxwell3D {
                     render_enable_mode: self.regs.render_enable_mode,
                     render_enable_override: self.regs.render_enable_override,
                     cull_test_enable: self.regs.cull_test_enable,
+                    alpha_test_enabled: self.regs.alpha_test_enabled,
+                    alpha_test_ref: self.regs.alpha_test_ref,
+                    alpha_test_func: self.regs.alpha_test_func,
                     cull_face: self.regs.cull_face,
                     front_face: self.regs.front_face,
                     poly_offset_fill_enable: self.regs.poly_offset_fill_enable,
@@ -922,10 +1066,16 @@ impl Maxwell3D {
                     poly_offset_factor: self.regs.poly_offset_factor,
                     zeta: self.regs.zeta,
                     zeta_enable: self.regs.zeta_enable,
+                    multisample_mode: self.regs.multisample_mode,
                     depth_test_enable: self.regs.depth_test_enable,
                     depth_write_enable: self.regs.depth_write_enable,
                     depth_func: self.regs.depth_func,
+                    stencil_enable: self.regs.stencil_enable,
+                    stencil_two_side_enable: self.regs.stencil_two_side_enable,
+                    stencil_front: self.regs.stencil_front,
+                    stencil_back: self.regs.stencil_back,
                     clear_depth: self.regs.clear_depth,
+                    clear_stencil: self.regs.clear_stencil,
                     clear_mask: arg,
                 });
             }
@@ -953,6 +1103,19 @@ impl Maxwell3D {
                 self.regs.surface_clip.height = arg >> 16;
             }
             0x4EB => self.regs.window_origin.raw = arg,
+            0x4e0 => self.regs.stencil_enable = (arg & 1) != 0,
+            0x4e1 => self.regs.stencil_front.fail_op = arg,
+            0x4e2 => self.regs.stencil_front.depth_fail_op = arg,
+            0x4e3 => self.regs.stencil_front.depth_pass_op = arg,
+            0x4e4 => self.regs.stencil_front.compare_op = arg,
+            0x4e5 => self.regs.stencil_front.reference = arg,
+            0x4e6 => self.regs.stencil_front.compare_mask = arg,
+            0x4e7 => self.regs.stencil_front.write_mask = arg,
+            0x565 => self.regs.stencil_two_side_enable = (arg & 1) != 0,
+            0x566 => self.regs.stencil_back.fail_op = arg,
+            0x567 => self.regs.stencil_back.depth_fail_op = arg,
+            0x568 => self.regs.stencil_back.depth_pass_op = arg,
+            0x569 => self.regs.stencil_back.compare_op = arg,
             0x64B => {
                 self.regs.viewport_transform_en = arg & 1 != 0;
                 if std::env::var_os("NEXIUM_VPEN_DBG").is_some() {
@@ -988,7 +1151,7 @@ impl Maxwell3D {
                     );
                 }
             }
-            0x35F => self.regs.draw_first_vertex = arg,
+            0x35F => self.regs.depth_mode = arg & 1,
             0x485 | 0x486 => {
                 self.regs.draw_count += 1;
                 let first = arg & 0xFFFF;
@@ -1095,19 +1258,57 @@ impl Maxwell3D {
             0x904 | 0x90C | 0x914 | 0x91C | 0x924 => {
                 let stage = ((method - 0x904) / 8) as usize;
                 let valid = (arg & 1) != 0;
-                let slot = ((arg >> 4) & 0xF) as usize;
+                let slot = ((arg >> 4) & 0x1F) as usize;
+                let cb_addr = ((self.regs.constbuf_selector_addr_hi as u64) << 32)
+                    | self.regs.constbuf_selector_addr_lo as u64;
+                let cb_size = self.regs.constbuf_selector_size;
+                if cbuf_bind_trace() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    static N1136: AtomicU64 = AtomicU64::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    let hot = cb_size == 1136 || cb_size == 80 || slot >= 16;
+                    let hot_n = if hot {
+                        N1136.fetch_add(1, Ordering::Relaxed)
+                    } else {
+                        0
+                    };
+                    if n < 2048 || (hot && hot_n < 512) || n % 65536 == 0 {
+                        log::warn!(
+                            "[cbuf-bind] #{} stage={} slot={} valid={} addr={:#x} size={} mme={}",
+                            n,
+                            stage,
+                            slot,
+                            valid as u8,
+                            cb_addr,
+                            cb_size,
+                            self.mme_active
+                        );
+                    }
+                }
                 if valid && stage < 5 && slot < 16 {
-                    let cb_addr = ((self.regs.constbuf_selector_addr_hi as u64) << 32)
-                        | self.regs.constbuf_selector_addr_lo as u64;
-                    self.regs.cbuf_binds[stage][slot] = (cb_addr, self.regs.constbuf_selector_size);
+                    self.regs.cbuf_binds[stage][slot] = (cb_addr, cb_size);
                 }
             }
             0x982 => self.regs.tex_cb_index = arg & 0x1F,
             0x1234 => self.regs.sampler_binding = arg,
             0x2608 => self.regs.bindless_texture_const_buffer_slot = arg & 0x1F,
-            0x645 => self.regs.cull_test_enable = (arg & 1) != 0,
-            0x646 => self.regs.cull_face = arg,
+            0x4BB => self.regs.alpha_test_enabled = (arg & 1) != 0,
+            0x4C4 => self.regs.alpha_test_ref = arg,
+            0x4C5 => self.regs.alpha_test_func = arg,
+            0x574 => {
+                if self.regs.multisample_mode != arg {
+                    log::info!(
+                        "maxwell3d: multisample mode {:#x} -> {:#x}",
+                        self.regs.multisample_mode,
+                        arg
+                    );
+                }
+                self.regs.multisample_mode = arg;
+            }
+            0x646 => self.regs.cull_test_enable = (arg & 1) != 0,
             0x647 => self.regs.front_face = arg,
+            0x648 => self.regs.cull_face = arg,
 
             0x372 => self.regs.poly_offset_fill_enable = (arg & 1) != 0,
             0x55B => self.regs.poly_offset_factor = f32::from_bits(arg),
@@ -1123,20 +1324,32 @@ impl Maxwell3D {
             0x4B3 => {
                 let new = (arg & 1) != 0;
                 if new != self.regs.depth_test_enable && wf_state_log() {
-                    log::warn!("[wf-state] depth_test {} -> {}", self.regs.depth_test_enable, new);
+                    log::warn!(
+                        "[wf-state] depth_test {} -> {}",
+                        self.regs.depth_test_enable,
+                        new
+                    );
                 }
                 self.regs.depth_test_enable = new;
             }
             0x4BA => {
                 let new = (arg & 1) != 0;
                 if new != self.regs.depth_write_enable && wf_state_log() {
-                    log::warn!("[wf-state] depth_write {} -> {}", self.regs.depth_write_enable, new);
+                    log::warn!(
+                        "[wf-state] depth_write {} -> {}",
+                        self.regs.depth_write_enable,
+                        new
+                    );
                 }
                 self.regs.depth_write_enable = new;
             }
             0x4C3 => {
                 if arg != self.regs.depth_func && wf_state_log() {
-                    log::warn!("[wf-state] depth_func {:#x} -> {:#x}", self.regs.depth_func, arg);
+                    log::warn!(
+                        "[wf-state] depth_func {:#x} -> {:#x}",
+                        self.regs.depth_func,
+                        arg
+                    );
                 }
                 self.regs.depth_func = arg;
             }
@@ -1188,7 +1401,10 @@ impl Maxwell3D {
                 if idx < 32 {
                     let vb = &mut self.regs.vertex_buffers[idx];
                     match field {
-                        0 => vb.stride = arg & 0xFFF,
+                        0 => {
+                            vb.stride = arg & 0xFFF;
+                            vb.enabled = arg & 0x1000 != 0;
+                        }
                         1 => vb.address_hi = arg,
                         2 => vb.address_lo = arg,
                         3 => vb.frequency = arg,
@@ -1333,6 +1549,9 @@ impl Maxwell3D {
             render_enable_mode: self.regs.render_enable_mode,
             render_enable_override: self.regs.render_enable_override,
             cull_test_enable: self.regs.cull_test_enable,
+            alpha_test_enabled: self.regs.alpha_test_enabled,
+            alpha_test_ref: self.regs.alpha_test_ref,
+            alpha_test_func: self.regs.alpha_test_func,
             cull_face: self.regs.cull_face,
             front_face: self.regs.front_face,
             poly_offset_fill_enable: self.regs.poly_offset_fill_enable,
@@ -1340,10 +1559,16 @@ impl Maxwell3D {
             poly_offset_factor: self.regs.poly_offset_factor,
             zeta: self.regs.zeta,
             zeta_enable: self.regs.zeta_enable,
+            multisample_mode: self.regs.multisample_mode,
             depth_test_enable: self.regs.depth_test_enable,
             depth_write_enable: self.regs.depth_write_enable,
             depth_func: self.regs.depth_func,
+            stencil_enable: self.regs.stencil_enable,
+            stencil_two_side_enable: self.regs.stencil_two_side_enable,
+            stencil_front: self.regs.stencil_front,
+            stencil_back: self.regs.stencil_back,
             clear_depth: self.regs.clear_depth,
+            clear_stencil: self.regs.clear_stencil,
             clear_mask: 0,
         });
     }
@@ -1461,6 +1686,9 @@ impl Maxwell3D {
             render_enable_mode: self.regs.render_enable_mode,
             render_enable_override: self.regs.render_enable_override,
             cull_test_enable: self.regs.cull_test_enable,
+            alpha_test_enabled: self.regs.alpha_test_enabled,
+            alpha_test_ref: self.regs.alpha_test_ref,
+            alpha_test_func: self.regs.alpha_test_func,
             cull_face: self.regs.cull_face,
             front_face: self.regs.front_face,
             poly_offset_fill_enable: self.regs.poly_offset_fill_enable,
@@ -1468,10 +1696,16 @@ impl Maxwell3D {
             poly_offset_factor: self.regs.poly_offset_factor,
             zeta: self.regs.zeta,
             zeta_enable: self.regs.zeta_enable,
+            multisample_mode: self.regs.multisample_mode,
             depth_test_enable: self.regs.depth_test_enable,
             depth_write_enable: self.regs.depth_write_enable,
             depth_func: self.regs.depth_func,
+            stencil_enable: self.regs.stencil_enable,
+            stencil_two_side_enable: self.regs.stencil_two_side_enable,
+            stencil_front: self.regs.stencil_front,
+            stencil_back: self.regs.stencil_back,
             clear_depth: self.regs.clear_depth,
+            clear_stencil: self.regs.clear_stencil,
             clear_mask: 0,
         });
     }
@@ -1505,5 +1739,132 @@ impl Maxwell3D {
 impl Default for Maxwell3D {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_counter_report_does_not_require_renderer_completion() {
+        let synthetic = report_semaphore_write_ordering(2, false).unwrap();
+        let release = report_semaphore_write_ordering(0, false).unwrap();
+        let raw_counter = report_semaphore_write_ordering(2, true).unwrap();
+
+        assert_eq!(synthetic, SemaphoreWriteOrdering::SyntheticCounter);
+        assert_eq!(release, SemaphoreWriteOrdering::RendererOrdered);
+        assert_eq!(raw_counter, SemaphoreWriteOrdering::RendererOrdered);
+        assert!(report_semaphore_write_ordering(1, false).is_none());
+
+        let write = PendingSemaphoreWrite {
+            gpu_va: 0x1234,
+            payload: 0x5678,
+            long: true,
+            ordering: synthetic,
+        };
+        assert!(!write.requires_renderer_completion());
+        assert!(PendingSemaphoreWrite {
+            ordering: release,
+            ..write
+        }
+        .requires_renderer_completion());
+    }
+
+    #[test]
+    fn face_state_methods_decode_in_order() {
+        let mut engine = Maxwell3D::new();
+        engine.dispatch_method(0x646, 1, true);
+        engine.dispatch_method(0x647, 0x900, true);
+        engine.dispatch_method(0x648, 0x405, true);
+        assert!(engine.regs.cull_test_enable);
+        assert_eq!(engine.regs.front_face, 0x900);
+        assert_eq!(engine.regs.cull_face, 0x405);
+    }
+
+    #[test]
+    fn depth_register_defaults_match_maxwell_reset_state() {
+        let regs = Maxwell3DRegisters::default();
+        assert!(!regs.depth_write_enable);
+        assert_eq!(regs.clear_depth, 0.0);
+        assert_eq!(regs.depth_mode, 0);
+    }
+
+    #[test]
+    fn vertex_stream_format_preserves_enable_bit() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x700, 0x40, true);
+        assert_eq!(engine.regs.vertex_buffers[0].stride, 0x40);
+        assert!(!engine.regs.vertex_buffers[0].enabled);
+
+        engine.dispatch_method(0x700, 0x1000 | 0x20, true);
+        assert_eq!(engine.regs.vertex_buffers[0].stride, 0x20);
+        assert!(engine.regs.vertex_buffers[0].enabled);
+    }
+
+    #[test]
+    fn depth_mode_does_not_alias_first_vertex() {
+        let mut engine = Maxwell3D::new();
+        engine.dispatch_method(0x35d, 17, true);
+        engine.dispatch_method(0x35f, 1, true);
+        assert_eq!(engine.regs.draw_first_vertex, 17);
+        assert_eq!(engine.regs.depth_mode, 1);
+    }
+
+    #[test]
+    fn stencil_state_methods_decode_yuzu_register_layout() {
+        let mut engine = Maxwell3D::new();
+        engine.dispatch_method(0x4e0, 1, true);
+        engine.dispatch_method(0x4e1, 0x1e01, true);
+        engine.dispatch_method(0x4e2, 0x1e02, true);
+        engine.dispatch_method(0x4e3, 0x8507, true);
+        engine.dispatch_method(0x4e4, 0x206, true);
+        engine.dispatch_method(0x4e5, 0x44, true);
+        engine.dispatch_method(0x4e6, 0x7f, true);
+        engine.dispatch_method(0x4e7, 0x3f, true);
+        engine.dispatch_method(0x565, 1, true);
+        engine.dispatch_method(0x566, 3, true);
+        engine.dispatch_method(0x567, 4, true);
+        engine.dispatch_method(0x568, 5, true);
+        engine.dispatch_method(0x569, 6, true);
+        engine.dispatch_method(0x3d5, 0x55, true);
+        engine.dispatch_method(0x3d6, 0xaa, true);
+        engine.dispatch_method(0x3d7, 0xf0, true);
+
+        assert!(engine.regs.stencil_enable);
+        assert!(engine.regs.stencil_two_side_enable);
+        assert_eq!(engine.regs.stencil_front.fail_op, 0x1e01);
+        assert_eq!(engine.regs.stencil_front.depth_fail_op, 0x1e02);
+        assert_eq!(engine.regs.stencil_front.depth_pass_op, 0x8507);
+        assert_eq!(engine.regs.stencil_front.compare_op, 0x206);
+        assert_eq!(engine.regs.stencil_front.reference, 0x44);
+        assert_eq!(engine.regs.stencil_front.compare_mask, 0x7f);
+        assert_eq!(engine.regs.stencil_front.write_mask, 0x3f);
+        assert_eq!(engine.regs.stencil_back.fail_op, 3);
+        assert_eq!(engine.regs.stencil_back.depth_fail_op, 4);
+        assert_eq!(engine.regs.stencil_back.depth_pass_op, 5);
+        assert_eq!(engine.regs.stencil_back.compare_op, 6);
+        assert_eq!(engine.regs.stencil_back.reference, 0x55);
+        assert_eq!(engine.regs.stencil_back.write_mask, 0xaa);
+        assert_eq!(engine.regs.stencil_back.compare_mask, 0xf0);
+
+        engine.dispatch_method(0x35e, 3, true);
+        let draw = engine.pending_draws.last().unwrap();
+        assert!(draw.stencil_enable);
+        assert!(draw.stencil_two_side_enable);
+        assert_eq!(draw.stencil_front, engine.regs.stencil_front);
+        assert_eq!(draw.stencil_back, engine.regs.stencil_back);
+    }
+
+    #[test]
+    fn clear_snapshots_independent_stencil_value_and_mask() {
+        let mut engine = Maxwell3D::new();
+        engine.dispatch_method(0x368, 0x6d, true);
+        engine.dispatch_method(0x674, 0x2, true);
+        let clear = engine.pending_draws.last().unwrap();
+        assert!(clear.is_clear);
+        assert_eq!(clear.clear_stencil, 0x6d);
+        assert_eq!(clear.clear_mask, 0x2);
     }
 }

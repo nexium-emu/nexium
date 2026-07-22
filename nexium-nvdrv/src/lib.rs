@@ -1,5 +1,5 @@
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -7,11 +7,290 @@ fn syncpoint_reached(current: u32, threshold: u32) -> bool {
     current.wrapping_sub(threshold) < 0x8000_0000
 }
 
+fn gpfifo_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_GPFIFO_TRACE").is_some())
+}
+
+fn video_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_VIDEO_TRACE").is_some())
+}
+
+fn trace_video_ioctl(device: NvDevice, req: &IoctlRequest, cmd: u16) {
+    if !video_trace_enabled() || !matches!(device, NvDevice::NvhostNvdec | NvDevice::NvhostVic) {
+        return;
+    }
+    static TRACES: AtomicU64 = AtomicU64::new(0);
+    let sequence = TRACES.fetch_add(1, Ordering::Relaxed);
+    if sequence >= 512 {
+        return;
+    }
+    let in_head = &req.in_data[..req.in_data.len().min(128)];
+    let inline_head = &req.inline_in_data[..req.inline_in_data.len().min(128)];
+    log::info!(
+        "[video-ioctl] seq={} fd={} device={:?} ioctl={:#010x} cmd={:#06x} in_size={} inline_in_size={} out_size={} in_head={:02x?} inline_head={:02x?}",
+        sequence,
+        req.fd,
+        device,
+        req.ioctl_id,
+        cmd,
+        req.in_data.len(),
+        req.inline_in_data.len(),
+        req.out_size,
+        in_head,
+        inline_head,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_gpfifo_submit(
+    warning: bool,
+    cmd: u16,
+    fd: u32,
+    flags: u32,
+    fence: Option<(u32, u32, u32)>,
+    address: Option<u64>,
+    num_entries: Option<u32>,
+    in_size: usize,
+    inline_in_size: usize,
+    out_size: usize,
+    branch: &str,
+) {
+    if !gpfifo_trace_enabled() {
+        return;
+    }
+    static TRACES: AtomicU64 = AtomicU64::new(0);
+    static WARNINGS: AtomicU64 = AtomicU64::new(0);
+    let (counter, limit) = if warning {
+        (&WARNINGS, 64)
+    } else {
+        (&TRACES, 256)
+    };
+    let sequence = counter.fetch_add(1, Ordering::Relaxed);
+    if sequence >= limit {
+        return;
+    }
+    let fence_id = fence
+        .map(|value| value.0.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let fence_value = fence
+        .map(|value| value.1.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let fence_current = fence
+        .map(|value| value.2.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let address = address
+        .map(|value| format!("{value:#x}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let num_entries = num_entries
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let level = if warning {
+        log::Level::Warn
+    } else {
+        log::Level::Info
+    };
+    log::log!(
+        level,
+        "[gpfifo-trace] seq={} cmd={:#06x} fd={} flags={:#x} fence_id={} fence_value={} fence_current={} addr={} num_entries={} in_size={} inline_in_size={} out_size={} branch={}",
+        sequence,
+        cmd,
+        fd,
+        flags,
+        fence_id,
+        fence_value,
+        fence_current,
+        address,
+        num_entries,
+        in_size,
+        inline_in_size,
+        out_size,
+        branch,
+    );
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn write_u32(data: &mut [u8], offset: usize, value: u32) -> bool {
+    let Some(end) = offset.checked_add(4) else {
+        return false;
+    };
+    let Some(bytes) = data.get_mut(offset..end) else {
+        return false;
+    };
+    bytes.copy_from_slice(&value.to_le_bytes());
+    true
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ChannelSubmitLayout {
+    command_buffer_count: u32,
+    relocation_count: u32,
+    syncpoint_count: u32,
+    fence_count: u32,
+    command_buffers_offset: usize,
+    relocations_offset: usize,
+    relocation_shifts_offset: usize,
+    syncpoints_offset: usize,
+    fences_offset: usize,
+    total_size: usize,
+}
+
+impl ChannelSubmitLayout {
+    fn parse(data: &[u8]) -> Option<Self> {
+        let command_buffer_count = read_u32(data, 0)?;
+        let relocation_count = read_u32(data, 4)?;
+        let syncpoint_count = read_u32(data, 8)?;
+        let fence_count = read_u32(data, 12)?;
+        let command_buffers_offset = 0x10usize;
+        let relocations_offset = command_buffers_offset.checked_add(
+            usize::try_from(command_buffer_count)
+                .ok()?
+                .checked_mul(0x0c)?,
+        )?;
+        let relocation_shifts_offset = relocations_offset
+            .checked_add(usize::try_from(relocation_count).ok()?.checked_mul(0x10)?)?;
+        let syncpoints_offset = relocation_shifts_offset
+            .checked_add(usize::try_from(relocation_count).ok()?.checked_mul(4)?)?;
+        let fences_offset = syncpoints_offset
+            .checked_add(usize::try_from(syncpoint_count).ok()?.checked_mul(0x14)?)?;
+        let total_size =
+            fences_offset.checked_add(usize::try_from(fence_count).ok()?.checked_mul(4)?)?;
+        if total_size > data.len() {
+            return None;
+        }
+        Some(Self {
+            command_buffer_count,
+            relocation_count,
+            syncpoint_count,
+            fence_count,
+            command_buffers_offset,
+            relocations_offset,
+            relocation_shifts_offset,
+            syncpoints_offset,
+            fences_offset,
+            total_size,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Host1xMethodTrace {
+    word_index: usize,
+    class_id: u32,
+    method: u32,
+    argument: u32,
+}
+
+fn decode_host1x_methods(
+    words: &[u32],
+    initial_class: u32,
+    max_methods: usize,
+) -> Vec<Host1xMethodTrace> {
+    let mut traces = Vec::new();
+    let mut current_class = initial_class;
+    let mut method_offset = 0u32;
+    let mut mask = 0u32;
+    let mut count = 0u32;
+    let mut incrementing = false;
+
+    for (word_index, &raw) in words.iter().enumerate() {
+        if traces.len() >= max_methods {
+            break;
+        }
+        let method = if mask != 0 {
+            let bit = mask.trailing_zeros();
+            mask &= !(1u32 << bit);
+            Some(method_offset.wrapping_add(bit))
+        } else if count != 0 {
+            count -= 1;
+            let method = method_offset;
+            if incrementing {
+                method_offset = method_offset.wrapping_add(1);
+            }
+            Some(method)
+        } else {
+            let value = raw & 0xffff;
+            method_offset = (raw >> 16) & 0x0fff;
+            match raw >> 28 {
+                0 => {
+                    mask = value & 0x3f;
+                    current_class = (value >> 6) & 0x03ff;
+                    None
+                }
+                1 | 2 => {
+                    count = value;
+                    incrementing = raw >> 28 == 1;
+                    None
+                }
+                3 => {
+                    mask = value;
+                    None
+                }
+                4 => {
+                    traces.push(Host1xMethodTrace {
+                        word_index,
+                        class_id: current_class,
+                        method: method_offset,
+                        argument: value & 0x0fff,
+                    });
+                    None
+                }
+                _ => None,
+            }
+        };
+        if let Some(method) = method {
+            traces.push(Host1xMethodTrace {
+                word_index,
+                class_id: current_class,
+                method,
+                argument: raw,
+            });
+        }
+    }
+    traces
+}
+
 pub mod bufferqueue;
 pub mod gpu;
 pub mod render_thread;
+pub mod video_decode;
+pub mod video_ffmpeg;
+pub mod video_host1x;
+pub mod video_surface;
 pub use bufferqueue::{BufferQueue, GraphicBuffer, QueuedFrame};
 pub use gpu::GpuContext;
+
+struct VideoChannelRuntime {
+    parser: video_host1x::VideoHost1xParser,
+    decoder: Option<openh264::decoder::Decoder>,
+    ffmpeg: Option<video_ffmpeg::FfmpegDecoder>,
+    ffmpeg_failed: bool,
+    composer: video_decode::H264AnnexBComposer,
+}
+
+impl VideoChannelRuntime {
+    fn new(device: NvDevice) -> Self {
+        let initial_class = match device {
+            NvDevice::NvhostNvdec => video_host1x::NVDEC_CLASS_ID,
+            NvDevice::NvhostVic => video_host1x::VIC_CLASS_ID,
+            _ => 0,
+        };
+        Self {
+            parser: video_host1x::VideoHost1xParser::new(initial_class),
+            decoder: None,
+            ffmpeg: None,
+            ffmpeg_failed: false,
+            composer: video_decode::H264AnnexBComposer::new(),
+        }
+    }
+}
 
 fn debug_giant_entries(
     cmd: u16,
@@ -168,6 +447,8 @@ impl NvDevice {
 #[derive(Clone, Debug)]
 pub struct NvFile {
     pub device: NvDevice,
+    pub nvmap_fd: Option<u32>,
+    pub submit_timeout: u32,
 }
 
 pub struct NvmapHandle {
@@ -176,6 +457,8 @@ pub struct NvmapHandle {
     pub address: u64,
     pub kind: u32,
     pub align: u32,
+    pub channel_map_address: u32,
+    pub channel_pin_count: u32,
 }
 
 pub struct IoctlRequest {
@@ -227,6 +510,9 @@ pub struct Nvdrv {
     pub queue_buffer_active: Arc<std::sync::atomic::AtomicBool>,
     pub stats: Arc<PipelineStats>,
     pub channel_client_data: u64,
+    video_channels: HashMap<u32, VideoChannelRuntime>,
+    video_frames: HashMap<u64, video_decode::OwnedI420Frame>,
+    video_frame_order: VecDeque<u64>,
     pub legacy_gfx: std::sync::atomic::AtomicBool,
     pub renderer: std::sync::OnceLock<Option<Arc<nexium_gpu::Renderer>>>,
 }
@@ -251,6 +537,9 @@ impl Nvdrv {
             queue_buffer_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stats,
             channel_client_data: 0,
+            video_channels: HashMap::new(),
+            video_frames: HashMap::new(),
+            video_frame_order: VecDeque::new(),
             legacy_gfx: std::sync::atomic::AtomicBool::new(false),
             renderer: std::sync::OnceLock::new(),
         }
@@ -298,19 +587,36 @@ impl Nvdrv {
         let device = NvDevice::from_path(path).ok_or(())?;
         let fd = self.next_fd;
         self.next_fd = self.next_fd.wrapping_add(1);
-        self.files.insert(fd, NvFile { device });
+        self.files.insert(
+            fd,
+            NvFile {
+                device,
+                nvmap_fd: None,
+                submit_timeout: 0,
+            },
+        );
+        if matches!(device, NvDevice::NvhostNvdec | NvDevice::NvhostVic) {
+            let (syncpt_id, _) = self.ensure_channel_syncpoint(fd);
+            self.video_channels
+                .insert(fd, VideoChannelRuntime::new(device));
+            log::debug!(
+                "nvdrv:Open channel device={:?} fd={} syncpt_id={}",
+                device,
+                fd,
+                syncpt_id
+            );
+        }
         log::debug!("nvdrv:Open '{}' → fd={}", path, fd);
         Ok(fd)
     }
 
     pub fn close(&mut self, fd: u32) {
         self.files.remove(&fd);
+        self.video_channels.remove(&fd);
         if let Some(channel) = self.gpu.channels.lock().remove(&fd) {
             if channel.syncpt_id != 0 {
-                self.retired_syncpts.insert(
-                    channel.syncpt_id,
-                    (channel.syncpt_min, channel.syncpt_max),
-                );
+                self.retired_syncpts
+                    .insert(channel.syncpt_id, (channel.syncpt_min, channel.syncpt_max));
             }
         }
         log::debug!("nvdrv:Close fd={}", fd);
@@ -326,12 +632,7 @@ impl Nvdrv {
         (channel.syncpt_id, channel.syncpt_max)
     }
 
-    fn complete_channel_submit(
-        &mut self,
-        fd: u32,
-        flags: u32,
-        increment_value: u32,
-    ) -> (u32, u32) {
+    fn complete_channel_submit(&mut self, fd: u32, flags: u32, increment_value: u32) -> (u32, u32) {
         let (syncpt_id, _) = self.ensure_channel_syncpoint(fd);
         let mut channels = self.gpu.channels.lock();
         let channel = channels.get_mut(&fd).unwrap();
@@ -393,6 +694,36 @@ impl Nvdrv {
         channel.syncpt_min
     }
 
+    fn reserve_syncpoint_max(&mut self, id: u32, amount: u32) -> u32 {
+        let mut channels = self.gpu.channels.lock();
+        let Some(channel) = channels
+            .values_mut()
+            .find(|channel| channel.syncpt_id == id)
+        else {
+            drop(channels);
+            let entry = self.retired_syncpts.entry(id).or_insert((0, 0));
+            entry.1 = entry.1.wrapping_add(amount);
+            return entry.1;
+        };
+        channel.syncpt_max = channel.syncpt_max.wrapping_add(amount);
+        channel.syncpt_max
+    }
+
+    fn complete_syncpoint_to(&mut self, id: u32, threshold: u32) {
+        let mut channels = self.gpu.channels.lock();
+        let Some(channel) = channels
+            .values_mut()
+            .find(|channel| channel.syncpt_id == id)
+        else {
+            drop(channels);
+            let entry = self.retired_syncpts.entry(id).or_insert((0, threshold));
+            entry.0 = threshold;
+            entry.1 = entry.1.max(threshold);
+            return;
+        };
+        channel.syncpt_min = threshold;
+    }
+
     pub fn is_syncpoint_reached(&self, id: u32, threshold: u32) -> bool {
         syncpoint_reached(self.syncpoint_value(id), threshold)
     }
@@ -433,6 +764,7 @@ impl Nvdrv {
             req.inline_in_data.len(),
             req.out_size
         );
+        trace_video_ioctl(device, &req, cmd);
 
         match device {
             NvDevice::Nvmap => self.nvmap_ioctl(cmd, &req),
@@ -440,8 +772,956 @@ impl Nvdrv {
             NvDevice::NvhostAsGpu => self.nvhost_as_gpu_ioctl(cmd, &req),
             NvDevice::NvhostGpu => self.nvhost_gpu_ioctl_with_mem(cmd, &req, mem_read, mem_write),
             NvDevice::NvhostCtrl => self.nvhost_ctrl_ioctl(cmd, &req),
+            NvDevice::NvhostNvdec | NvDevice::NvhostVic => {
+                self.nvhost_channel_ioctl_with_mem(device, cmd, &req, mem_read, mem_write)
+            }
             _ => IoctlOutcome::ok(vec![0u8; req.out_size]),
         }
+    }
+
+    fn pin_channel_buffer(&mut self, handle_id: u32) -> u32 {
+        let Some(handle) = self.nvmap_handles.get_mut(&handle_id) else {
+            return 0;
+        };
+        if handle.channel_map_address != 0 {
+            handle.channel_pin_count = handle.channel_pin_count.saturating_add(1);
+            return handle.channel_map_address;
+        }
+        let size = handle.size;
+        let cpu_address = handle.address;
+        if size == 0 || cpu_address == 0 {
+            return 0;
+        }
+
+        let allocation_size = u64::from(size).max(0x1000);
+        let map_address = self.gpu.alloc_gpu_va(allocation_size);
+        let Ok(map_address_u32) = u32::try_from(map_address) else {
+            if map_address != 0 {
+                self.gpu.free_va(map_address, allocation_size);
+            }
+            return 0;
+        };
+        if map_address_u32 == 0 {
+            return 0;
+        }
+
+        self.gpu
+            .mappings
+            .lock()
+            .add(map_address, u64::from(size), cpu_address, handle_id);
+        handle.channel_map_address = map_address_u32;
+        handle.channel_pin_count = 1;
+        map_address_u32
+    }
+
+    fn unpin_channel_buffer(&mut self, handle_id: u32) {
+        if let Some(handle) = self.nvmap_handles.get_mut(&handle_id) {
+            handle.channel_pin_count = handle.channel_pin_count.saturating_sub(1);
+        }
+    }
+
+    fn video_cpu_address(&self, gpu_va: u64) -> Option<u64> {
+        let mappings = self.gpu.mappings.lock();
+        mappings.cpu_address_for(gpu_va).or_else(|| {
+            mappings
+                .cpu_address_for_any32(gpu_va)
+                .map(|(_, cpu, _)| cpu)
+        })
+    }
+
+    fn gpu_regions_for_cpu_range(&self, cpu_address: u64, size: u64) -> Vec<(u64, u64)> {
+        self.gpu
+            .mappings
+            .lock()
+            .gpu_regions_for_cpu_range(cpu_address, size)
+    }
+
+    fn read_channel_command_buffer(
+        &self,
+        memory_id: u32,
+        offset: u32,
+        word_count: i32,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<Vec<u32>> {
+        const MAX_VIDEO_COMMAND_WORDS: usize = 0x1_0000;
+        let handle = self.nvmap_handles.get(&memory_id)?;
+        let word_count = usize::try_from(word_count).ok()?;
+        if word_count == 0 || word_count > MAX_VIDEO_COMMAND_WORDS {
+            log::warn!(
+                "video channel rejected command buffer nvmap={} words={}",
+                memory_id,
+                word_count
+            );
+            return None;
+        }
+        let byte_count = word_count.checked_mul(4)?;
+        let end = usize::try_from(offset).ok()?.checked_add(byte_count)?;
+        if end > usize::try_from(handle.size).ok()? {
+            log::warn!(
+                "video channel command buffer exceeds nvmap={} offset={:#x} bytes={:#x} size={:#x}",
+                memory_id,
+                offset,
+                byte_count,
+                handle.size
+            );
+            return None;
+        }
+        let cpu_address = handle.address.checked_add(u64::from(offset))?;
+        let mut bytes = vec![0u8; byte_count];
+        if !mem_read(cpu_address, &mut bytes) {
+            log::warn!(
+                "video channel failed to read command buffer nvmap={} cpu={:#x} bytes={:#x}",
+                memory_id,
+                cpu_address,
+                byte_count
+            );
+            return None;
+        }
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect(),
+        )
+    }
+
+    fn process_video_command_buffer(
+        &mut self,
+        device: NvDevice,
+        fd: u32,
+        memory_id: u32,
+        offset: u32,
+        word_count: i32,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
+        let Some(words) = self.read_channel_command_buffer(memory_id, offset, word_count, mem_read)
+        else {
+            return;
+        };
+        let mut runtime = self
+            .video_channels
+            .remove(&fd)
+            .unwrap_or_else(|| VideoChannelRuntime::new(device));
+
+        for word in words {
+            let writes = runtime.parser.feed(std::slice::from_ref(&word));
+            for write in writes {
+                if !write.is_execute() {
+                    continue;
+                }
+                let registers = *runtime.parser.registers(write.engine);
+                match write.engine {
+                    video_host1x::VideoEngine::Nvdec => {
+                        self.process_nvdec_execute(fd, &registers, &mut runtime, mem_read);
+                    }
+                    video_host1x::VideoEngine::Vic => {
+                        self.process_vic_execute(fd, &registers, mem_read, mem_write);
+                    }
+                }
+            }
+        }
+
+        self.video_channels.insert(fd, runtime);
+    }
+
+    fn process_nvdec_execute(
+        &mut self,
+        fd: u32,
+        registers: &[u32; video_host1x::ENGINE_REGISTER_COUNT],
+        runtime: &mut VideoChannelRuntime,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) {
+        const CODEC_METHOD: usize = 0x80;
+        const PICTURE_INFO_METHOD: usize = 0x101;
+        const BITSTREAM_METHOD: usize = 0x102;
+        const SURFACE_LUMA_BASE_METHOD: usize = 0x10c;
+        const MAX_BITSTREAM_SIZE: usize = 32 * 1024 * 1024;
+
+        if registers[CODEC_METHOD] != 3 {
+            log::warn!(
+                "[video-decode] fd={} unsupported NVDEC codec {}",
+                fd,
+                registers[CODEC_METHOD]
+            );
+            return;
+        }
+
+        let context_iova = u64::from(registers[PICTURE_INFO_METHOD]) << 8;
+        let bitstream_iova = u64::from(registers[BITSTREAM_METHOD]) << 8;
+        let Some(context_cpu) = self.video_cpu_address(context_iova) else {
+            log::warn!(
+                "[video-decode] fd={} unmapped context iova={:#x}",
+                fd,
+                context_iova
+            );
+            return;
+        };
+        let Some(bitstream_cpu) = self.video_cpu_address(bitstream_iova) else {
+            log::warn!(
+                "[video-decode] fd={} unmapped bitstream iova={:#x}",
+                fd,
+                bitstream_iova
+            );
+            return;
+        };
+
+        let mut context_bytes = vec![0u8; video_decode::H264_DECODER_CONTEXT_SIZE];
+        if !mem_read(context_cpu, &mut context_bytes) {
+            log::warn!(
+                "[video-decode] fd={} failed context read cpu={:#x}",
+                fd,
+                context_cpu
+            );
+            return;
+        }
+        let context = match video_decode::H264DecoderContext::parse(&context_bytes) {
+            Ok(context) => context,
+            Err(error) => {
+                log::warn!("[video-decode] fd={} invalid H.264 context: {}", fd, error);
+                return;
+            }
+        };
+        let bitstream_len = context.stream_len as usize;
+        if bitstream_len == 0 || bitstream_len > MAX_BITSTREAM_SIZE {
+            log::warn!(
+                "[video-decode] fd={} invalid bitstream size {}",
+                fd,
+                bitstream_len
+            );
+            return;
+        }
+        let mut bitstream = vec![0u8; bitstream_len];
+        if !mem_read(bitstream_cpu, &mut bitstream) {
+            log::warn!(
+                "[video-decode] fd={} failed bitstream read cpu={:#x} bytes={}",
+                fd,
+                bitstream_cpu,
+                bitstream_len
+            );
+            return;
+        }
+        let packet = match runtime.composer.compose(&context_bytes, &bitstream) {
+            Ok(packet) => packet,
+            Err(error) => {
+                log::warn!("[video-decode] fd={} compose failed: {}", fd, error);
+                return;
+            }
+        };
+
+        let mut ffmpeg_frame: Option<video_decode::OwnedI420Frame> = None;
+        if video_ffmpeg::enabled() && !runtime.ffmpeg_failed {
+            if runtime.ffmpeg.is_none() {
+                let dims = context
+                    .frame_width()
+                    .and_then(|width| context.frame_height().map(|height| (width, height)));
+                match dims {
+                    Ok((width, height)) => match video_ffmpeg::FfmpegDecoder::new(width, height) {
+                        Ok(decoder) => {
+                            log::info!(
+                                "[video-decode] fd={} ffmpeg software decoder {}x{}",
+                                fd,
+                                width,
+                                height
+                            );
+                            runtime.ffmpeg = Some(decoder);
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "[video-decode] fd={} ffmpeg init failed ({}), using OpenH264",
+                                fd,
+                                error
+                            );
+                            runtime.ffmpeg_failed = true;
+                        }
+                    },
+                    Err(error) => {
+                        log::warn!(
+                            "[video-decode] fd={} ffmpeg dims unavailable ({}), using OpenH264",
+                            fd,
+                            error
+                        );
+                        runtime.ffmpeg_failed = true;
+                    }
+                }
+            }
+            if let Some(decoder) = runtime.ffmpeg.as_mut() {
+                match decoder.decode(&packet) {
+                    Ok(Some(raw)) => {
+                        match video_ffmpeg::i420_frame(decoder.width(), decoder.height(), &raw) {
+                            Ok(frame) => ffmpeg_frame = Some(frame),
+                            Err(error) => {
+                                log::warn!(
+                                    "[video-decode] fd={} ffmpeg frame invalid ({}), using OpenH264",
+                                    fd,
+                                    error
+                                );
+                                runtime.ffmpeg = None;
+                                runtime.ffmpeg_failed = true;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        log::debug!("[video-decode] fd={} ffmpeg needs more data", fd);
+                        return;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "[video-decode] fd={} ffmpeg decode failed ({}), using OpenH264",
+                            fd,
+                            error
+                        );
+                        runtime.ffmpeg = None;
+                        runtime.ffmpeg_failed = true;
+                    }
+                }
+            }
+        }
+        let frame = if let Some(frame) = ffmpeg_frame {
+            frame
+        } else {
+            if runtime.decoder.is_none() {
+                match openh264::decoder::Decoder::new(openh264::OpenH264API::from_source()) {
+                    Ok(decoder) => runtime.decoder = Some(decoder),
+                    Err(error) => {
+                        log::warn!("[video-decode] fd={} OpenH264 init failed: {}", fd, error);
+                        return;
+                    }
+                }
+            }
+            let decoded = match runtime.decoder.as_mut().unwrap().decode(&packet) {
+                Ok(Some(decoded)) => decoded,
+                Ok(None) => {
+                    log::debug!("[video-decode] fd={} decoder needs more data", fd);
+                    return;
+                }
+                Err(error) => {
+                    log::warn!("[video-decode] fd={} OpenH264 decode failed: {}", fd, error);
+                    return;
+                }
+            };
+            let (width, height) = decoded.dimension_rgb();
+            match video_decode::OwnedI420Frame::from_strided_planes(
+                width,
+                height,
+                decoded.strides_yuv(),
+                decoded.y_with_stride(),
+                decoded.u_with_stride(),
+                decoded.v_with_stride(),
+            ) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    log::warn!(
+                        "[video-decode] fd={} decoded frame copy failed: {}",
+                        fd,
+                        error
+                    );
+                    return;
+                }
+            }
+        };
+        let (width, height) = (frame.width(), frame.height());
+
+        let picture_index = context.parameter_set.current_picture_index as usize;
+        let Some(surface_register) = registers.get(SURFACE_LUMA_BASE_METHOD + picture_index) else {
+            log::warn!(
+                "[video-decode] fd={} invalid picture index {}",
+                fd,
+                picture_index
+            );
+            return;
+        };
+        let luma_iova = (u64::from(*surface_register) << 8)
+            .wrapping_add(u64::from(context.parameter_set.luma_frame_offset));
+        self.video_frames.insert(luma_iova, frame);
+        self.video_frame_order.retain(|key| *key != luma_iova);
+        self.video_frame_order.push_back(luma_iova);
+        while self.video_frame_order.len() > 32 {
+            if let Some(old_key) = self.video_frame_order.pop_front() {
+                self.video_frames.remove(&old_key);
+            }
+        }
+
+        static DECODED_FRAMES: AtomicU64 = AtomicU64::new(0);
+        let frame_index = DECODED_FRAMES.fetch_add(1, Ordering::Relaxed);
+        if frame_index < 32 || frame_index % 300 == 0 {
+            log::info!(
+                "[video-decode] frame={} fd={} {}x{} bytes={} luma_iova={:#x} picture={} guest_frame={}",
+                frame_index,
+                fd,
+                width,
+                height,
+                bitstream_len,
+                luma_iova,
+                picture_index,
+                context.parameter_set.frame_number
+            );
+        }
+    }
+
+    fn process_vic_execute(
+        &mut self,
+        fd: u32,
+        registers: &[u32; video_host1x::ENGINE_REGISTER_COUNT],
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
+        const SURFACE_BASE_METHOD: usize = 0x100;
+        const SURFACE_REGISTERS_PER_SLOT: usize = 8 * 3;
+        const CONFIG_METHOD: usize = 0x1c2;
+        const OUTPUT_LUMA_METHOD: usize = 0x1c8;
+        const OUTPUT_CHROMA_METHOD: usize = 0x1c9;
+
+        let config_iova = u64::from(registers[CONFIG_METHOD]) << 8;
+        let Some(config_cpu) = self.video_cpu_address(config_iova) else {
+            log::warn!(
+                "[video-vic] fd={} unmapped config iova={:#x}",
+                fd,
+                config_iova
+            );
+            return;
+        };
+        let mut config_bytes = vec![0u8; video_surface::VIC_CONFIG_SIZE];
+        if !mem_read(config_cpu, &mut config_bytes) {
+            log::warn!(
+                "[video-vic] fd={} failed config read cpu={:#x}",
+                fd,
+                config_cpu
+            );
+            return;
+        }
+        let summary = match video_surface::parse_vic_config(&config_bytes) {
+            Ok(summary) => summary,
+            Err(error) => {
+                log::warn!("[video-vic] fd={} invalid config: {}", fd, error);
+                return;
+            }
+        };
+        let Some(input_slot) = summary.enabled_slots.first() else {
+            log::debug!("[video-vic] fd={} has no enabled input slot", fd);
+            return;
+        };
+        let input_method = SURFACE_BASE_METHOD
+            .saturating_add(input_slot.index.saturating_mul(SURFACE_REGISTERS_PER_SLOT));
+        let Some(input_luma_register) = registers.get(input_method) else {
+            return;
+        };
+        let input_luma_iova = u64::from(*input_luma_register) << 8;
+        if video_trace_enabled() {
+            static VIC_CONFIG_TRACES: AtomicU64 = AtomicU64::new(0);
+            let sequence = VIC_CONFIG_TRACES.fetch_add(1, Ordering::Relaxed);
+            if sequence < 64 {
+                log::info!(
+                    "[video-vic-config] seq={} fd={} input={:#x} input_format={} input_block={:?}/{} input_size={}x{} output=[{:#x},{:#x}] output_format={} output_block={:?}/{} output_size={}x{} matrix={} shift={} clamp={}..{} alpha={} target={:?} source={:?} dest={:?}",
+                    sequence,
+                    fd,
+                    input_luma_iova,
+                    input_slot.pixel_format,
+                    input_slot.block_kind,
+                    input_slot.block_height_log2,
+                    input_slot.surface.width,
+                    input_slot.surface.height,
+                    u64::from(registers[OUTPUT_LUMA_METHOD]) << 8,
+                    u64::from(registers[OUTPUT_CHROMA_METHOD]) << 8,
+                    summary.output.pixel_format,
+                    summary.output.block_kind,
+                    summary.output.block_height_log2,
+                    summary.output.surface.width,
+                    summary.output.surface.height,
+                    input_slot.color_matrix.enabled,
+                    input_slot.color_matrix.shift,
+                    input_slot.color_matrix.clamp_min,
+                    input_slot.color_matrix.clamp_max,
+                    input_slot.color_matrix.alpha,
+                    summary.target_rect,
+                    input_slot.source_rect,
+                    input_slot.destination_rect,
+                );
+            }
+        }
+
+        let (frame_key, exact_frame, frame) =
+            if let Some(frame) = self.video_frames.get(&input_luma_iova).cloned() {
+                (input_luma_iova, true, frame)
+            } else {
+                let fallback_key = self
+                    .video_frame_order
+                    .iter()
+                    .rev()
+                    .find(|key| self.video_frames.contains_key(key))
+                    .copied();
+                let Some(fallback_key) = fallback_key else {
+                    log::warn!(
+                        "[video-vic] fd={} no decoded frame for input luma={:#x}",
+                        fd,
+                        input_luma_iova
+                    );
+                    return;
+                };
+                (
+                    fallback_key,
+                    false,
+                    self.video_frames[&fallback_key].clone(),
+                )
+            };
+
+        let strides = frame.strides();
+        let surface_frame = video_surface::I420Frame {
+            width: frame.width(),
+            height: frame.height(),
+            y_stride: strides.0,
+            u_stride: strides.1,
+            v_stride: strides.2,
+            y: frame.y().to_vec(),
+            u: frame.u().to_vec(),
+            v: frame.v().to_vec(),
+        };
+        let output_luma_iova = u64::from(registers[OUTPUT_LUMA_METHOD]) << 8;
+        let output_chroma_iova = u64::from(registers[OUTPUT_CHROMA_METHOD]) << 8;
+        let output_is_nv12 = matches!(
+            summary.output.pixel_format,
+            video_surface::VIC_FORMAT_Y8_U8V8_420 | video_surface::VIC_FORMAT_Y8_V8U8_420
+        );
+        let writes = if output_is_nv12 {
+            let output_config =
+                match summary
+                    .output
+                    .nv12_config(video_surface::OutputPlaneAddresses {
+                        luma: output_luma_iova,
+                        chroma: output_chroma_iova,
+                    }) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        log::warn!("[video-vic] fd={} unsupported output: {}", fd, error);
+                        return;
+                    }
+                };
+            match video_surface::write_i420_to_nv12(surface_frame, output_config) {
+                Ok(writes) => vec![writes.luma, writes.chroma],
+                Err(error) => {
+                    log::warn!("[video-vic] fd={} conversion failed: {}", fd, error);
+                    return;
+                }
+            }
+        } else {
+            let output_config = match summary
+                .output
+                .rgba_config(output_luma_iova, input_slot.color_matrix)
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    log::warn!("[video-vic] fd={} unsupported output: {}", fd, error);
+                    return;
+                }
+            };
+            match video_surface::write_i420_to_rgba(surface_frame, output_config) {
+                Ok(write) => vec![write],
+                Err(error) => {
+                    log::warn!("[video-vic] fd={} conversion failed: {}", fd, error);
+                    return;
+                }
+            }
+        };
+
+        let mut mapped_writes = Vec::with_capacity(writes.len());
+        for write in writes {
+            let Some(cpu_address) = self.video_cpu_address(write.address) else {
+                log::warn!(
+                    "[video-vic] fd={} unmapped output plane iova={:#x}",
+                    fd,
+                    write.address
+                );
+                return;
+            };
+            let mut aliases = self.gpu_regions_for_cpu_range(cpu_address, write.bytes.len() as u64);
+            aliases.push((write.address, write.bytes.len() as u64));
+            aliases.sort_unstable();
+            aliases.dedup();
+            mapped_writes.push((write, cpu_address, aliases));
+        }
+        for (write, cpu_address, _) in &mapped_writes {
+            gpu::vk_dispatch::register_video_tic_cpu_target(*cpu_address, write.bytes.len() as u64);
+            if !mem_write(*cpu_address, &write.bytes) {
+                log::warn!(
+                    "[video-vic] fd={} failed output write iova={:#x} cpu={:#x} bytes={}",
+                    fd,
+                    write.address,
+                    cpu_address,
+                    write.bytes.len()
+                );
+                return;
+            }
+        }
+        for (_, _, aliases) in &mapped_writes {
+            for &(alias, size) in aliases {
+                nexium_gpu::tex_invalidate::bump_region(alias, size);
+            }
+        }
+        if let Some(renderer) = self.renderer.get().and_then(|renderer| renderer.as_ref()) {
+            for (_, _, aliases) in &mapped_writes {
+                for &(alias, _) in aliases {
+                    renderer.invalidate_texture_address(alias);
+                }
+            }
+        }
+
+        if output_is_nv12 {
+            if exact_frame {
+                self.video_frames.remove(&frame_key);
+                self.video_frame_order.retain(|key| *key != frame_key);
+            }
+            self.video_frames.insert(output_luma_iova, frame);
+            self.video_frame_order
+                .retain(|key| *key != output_luma_iova);
+            self.video_frame_order.push_back(output_luma_iova);
+            while self.video_frame_order.len() > 32 {
+                if let Some(old_key) = self.video_frame_order.pop_front() {
+                    self.video_frames.remove(&old_key);
+                }
+            }
+        } else if exact_frame {
+            self.video_frames.remove(&frame_key);
+            self.video_frame_order.retain(|key| *key != frame_key);
+        }
+
+        let first_output = mapped_writes[0].0.address;
+        let second_output = mapped_writes
+            .get(1)
+            .map(|write| write.0.address)
+            .unwrap_or(0);
+        let first_aliases = &mapped_writes[0].2;
+        let second_aliases = mapped_writes
+            .get(1)
+            .map(|write| write.2.as_slice())
+            .unwrap_or(&[]);
+        static CONVERTED_FRAMES: AtomicU64 = AtomicU64::new(0);
+        let frame_index = CONVERTED_FRAMES.fetch_add(1, Ordering::Relaxed);
+        if frame_index < 32 || frame_index % 300 == 0 {
+            log::info!(
+                "[video-vic] frame={} fd={} input={:#x} exact={} output=[{:#x},{:#x}] aliases={:?}/{:?} format={} block={:?}/{} {}x{} target={:?} source={:?} dest={:?}",
+                frame_index,
+                fd,
+                input_luma_iova,
+                exact_frame,
+                first_output,
+                second_output,
+                first_aliases,
+                second_aliases,
+                summary.output.pixel_format,
+                summary.output.block_kind,
+                summary.output.block_height_log2,
+                summary.output.surface.width,
+                summary.output.surface.height,
+                summary.target_rect,
+                input_slot.source_rect,
+                input_slot.destination_rect,
+            );
+        }
+    }
+
+    fn trace_channel_command_buffer(
+        &self,
+        device: NvDevice,
+        fd: u32,
+        buffer_index: usize,
+        memory_id: u32,
+        offset: u32,
+        word_count: i32,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) {
+        if !video_trace_enabled() {
+            return;
+        }
+        static TRACES: AtomicU64 = AtomicU64::new(0);
+        let sequence = TRACES.fetch_add(1, Ordering::Relaxed);
+        if sequence >= 128 {
+            return;
+        }
+        let Some(handle) = self.nvmap_handles.get(&memory_id) else {
+            log::warn!(
+                "[video-cmdbuf] seq={} device={:?} fd={} index={} nvmap={} missing",
+                sequence,
+                device,
+                fd,
+                buffer_index,
+                memory_id
+            );
+            return;
+        };
+        if word_count <= 0 {
+            log::warn!(
+                "[video-cmdbuf] seq={} device={:?} fd={} index={} nvmap={} offset={:#x} invalid_word_count={}",
+                sequence,
+                device,
+                fd,
+                buffer_index,
+                memory_id,
+                offset,
+                word_count
+            );
+            return;
+        }
+        let requested_words = word_count as usize;
+        let captured_words = requested_words.min(256);
+        let Some(cpu_address) = handle.address.checked_add(u64::from(offset)) else {
+            return;
+        };
+        let mut bytes = vec![0u8; captured_words.saturating_mul(4)];
+        let read_ok = mem_read(cpu_address, &mut bytes);
+        let in_bounds = u64::from(offset)
+            .checked_add((requested_words as u64).saturating_mul(4))
+            .map(|end| end <= u64::from(handle.size))
+            .unwrap_or(false);
+        if !read_ok {
+            log::warn!(
+                "[video-cmdbuf] seq={} device={:?} fd={} index={} nvmap={} map={:#x} cpu={:#x} offset={:#x} words={} in_bounds={} read=false",
+                sequence,
+                device,
+                fd,
+                buffer_index,
+                memory_id,
+                handle.channel_map_address,
+                cpu_address,
+                offset,
+                requested_words,
+                in_bounds
+            );
+            return;
+        }
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        let initial_class = match device {
+            NvDevice::NvhostNvdec => 0xf0,
+            NvDevice::NvhostVic => 0x5d,
+            _ => 0,
+        };
+        let methods = decode_host1x_methods(&words, initial_class, 512);
+        let word_dump = words
+            .iter()
+            .map(|word| format!("{word:08x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let method_dump = methods
+            .iter()
+            .map(|trace| {
+                format!(
+                    "@{}:c={:#x},m={:#x},a={:#x}",
+                    trace.word_index, trace.class_id, trace.method, trace.argument
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        log::info!(
+            "[video-cmdbuf] seq={} device={:?} fd={} index={} nvmap={} map={:#x} cpu={:#x} offset={:#x} words={} captured={} in_bounds={} raw=[{}] methods=[{}]",
+            sequence,
+            device,
+            fd,
+            buffer_index,
+            memory_id,
+            handle.channel_map_address,
+            cpu_address,
+            offset,
+            requested_words,
+            captured_words,
+            in_bounds,
+            word_dump,
+            method_dump
+        );
+    }
+
+    fn nvhost_channel_ioctl_with_mem(
+        &mut self,
+        device: NvDevice,
+        cmd: u16,
+        req: &IoctlRequest,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) -> IoctlOutcome {
+        let mut out = vec![0u8; req.out_size];
+        let copy_size = req.in_data.len().min(out.len());
+        out[..copy_size].copy_from_slice(&req.in_data[..copy_size]);
+
+        match cmd {
+            0x4801 => {
+                let nvmap_fd = read_u32(&req.in_data, 0).unwrap_or(0);
+                if let Some(file) = self.files.get_mut(&req.fd) {
+                    file.nvmap_fd = Some(nvmap_fd);
+                }
+                log::debug!(
+                    "nvhost-channel:SetNVMAPfd device={:?} fd={} nvmap_fd={}",
+                    device,
+                    req.fd,
+                    nvmap_fd
+                );
+            }
+            0x0002 => {
+                let (syncpoint_id, _) = self.ensure_channel_syncpoint(req.fd);
+                write_u32(&mut out, 4, syncpoint_id);
+                log::debug!(
+                    "nvhost-channel:GetSyncpoint device={:?} fd={} param={} syncpt_id={}",
+                    device,
+                    req.fd,
+                    read_u32(&req.in_data, 0).unwrap_or(0),
+                    syncpoint_id
+                );
+            }
+            0x0003 => {
+                write_u32(&mut out, 4, 0);
+                log::debug!(
+                    "nvhost-channel:GetWaitbase device={:?} fd={} value=0",
+                    device,
+                    req.fd
+                );
+            }
+            0x0007 if device == NvDevice::NvhostNvdec => {
+                let timeout = read_u32(&req.in_data, 0).unwrap_or(0);
+                if let Some(file) = self.files.get_mut(&req.fd) {
+                    file.submit_timeout = timeout;
+                }
+                log::debug!(
+                    "nvhost-channel:SetSubmitTimeout fd={} timeout={}",
+                    req.fd,
+                    timeout
+                );
+            }
+            0x0009 => {
+                let num_entries = read_u32(&req.in_data, 0).unwrap_or(0) as usize;
+                let parsed_entries = req.in_data.len().saturating_sub(0x0c) / 8;
+                let mapped_entries = num_entries.min(parsed_entries);
+                for index in 0..mapped_entries {
+                    let entry_offset = 0x0c + index * 8;
+                    let handle_id = read_u32(&req.in_data, entry_offset).unwrap_or(0);
+                    let map_address = self.pin_channel_buffer(handle_id);
+                    write_u32(&mut out, entry_offset + 4, map_address);
+                    if video_trace_enabled() {
+                        let cpu_address = self
+                            .nvmap_handles
+                            .get(&handle_id)
+                            .map(|handle| handle.address)
+                            .unwrap_or(0);
+                        log::info!(
+                            "[video-map] device={:?} fd={} index={} nvmap={} map={:#x} cpu={:#x}",
+                            device,
+                            req.fd,
+                            index,
+                            handle_id,
+                            map_address,
+                            cpu_address
+                        );
+                    }
+                }
+                log::debug!(
+                    "nvhost-channel:MapBuffer device={:?} fd={} requested={} parsed={} mapped={}",
+                    device,
+                    req.fd,
+                    num_entries,
+                    parsed_entries,
+                    mapped_entries
+                );
+            }
+            0x000a => {
+                let num_entries = read_u32(&req.in_data, 0).unwrap_or(0) as usize;
+                let parsed_entries = req.in_data.len().saturating_sub(0x0c) / 8;
+                let unmapped_entries = num_entries.min(parsed_entries);
+                let header_size = out.len().min(0x0c);
+                out[..header_size].fill(0);
+                for index in 0..unmapped_entries {
+                    let entry_offset = 0x0c + index * 8;
+                    let handle_id = read_u32(&req.in_data, entry_offset).unwrap_or(0);
+                    self.unpin_channel_buffer(handle_id);
+                    if let Some(entry) = out.get_mut(entry_offset..entry_offset + 8) {
+                        entry.fill(0);
+                    }
+                }
+                log::debug!(
+                    "nvhost-channel:UnmapBuffer device={:?} fd={} requested={} parsed={} unmapped={}",
+                    device,
+                    req.fd,
+                    num_entries,
+                    parsed_entries,
+                    unmapped_entries
+                );
+            }
+            0x0001 => {
+                let Some(layout) = ChannelSubmitLayout::parse(&req.in_data) else {
+                    log::warn!(
+                        "nvhost-channel:Submit device={:?} fd={} malformed_size={}",
+                        device,
+                        req.fd,
+                        req.in_data.len()
+                    );
+                    return IoctlOutcome::ok(out);
+                };
+                log::debug!(
+                    "nvhost-channel:Submit device={:?} fd={} command_buffers={} relocations={} syncpoints={} fences={} offsets=[cb:{:#x} reloc:{:#x} shifts:{:#x} syncpt:{:#x} fence:{:#x}] total={:#x}",
+                    device,
+                    req.fd,
+                    layout.command_buffer_count,
+                    layout.relocation_count,
+                    layout.syncpoint_count,
+                    layout.fence_count,
+                    layout.command_buffers_offset,
+                    layout.relocations_offset,
+                    layout.relocation_shifts_offset,
+                    layout.syncpoints_offset,
+                    layout.fences_offset,
+                    layout.total_size
+                );
+                for index in 0..layout.command_buffer_count as usize {
+                    let offset = layout.command_buffers_offset + index * 0x0c;
+                    let memory_id = read_u32(&req.in_data, offset).unwrap_or(0);
+                    let memory_offset = read_u32(&req.in_data, offset + 4).unwrap_or(0);
+                    let word_count = read_u32(&req.in_data, offset + 8).unwrap_or(0) as i32;
+                    self.trace_channel_command_buffer(
+                        device,
+                        req.fd,
+                        index,
+                        memory_id,
+                        memory_offset,
+                        word_count,
+                        mem_read,
+                    );
+                    self.process_video_command_buffer(
+                        device,
+                        req.fd,
+                        memory_id,
+                        memory_offset,
+                        word_count,
+                        mem_read,
+                        mem_write,
+                    );
+                }
+                for index in 0..layout.syncpoint_count as usize {
+                    let offset = layout.syncpoints_offset + index * 0x14;
+                    let syncpoint_id = read_u32(&req.in_data, offset).unwrap_or(0);
+                    let increments = read_u32(&req.in_data, offset + 4).unwrap_or(0);
+                    let threshold = self.reserve_syncpoint_max(syncpoint_id, increments);
+                    if index < layout.fence_count as usize {
+                        write_u32(&mut out, layout.fences_offset + index * 4, threshold);
+                    }
+                    self.complete_syncpoint_to(syncpoint_id, threshold);
+                    log::debug!(
+                        "nvhost-channel:Submit syncpt_index={} id={} increments={} threshold={}",
+                        index,
+                        syncpoint_id,
+                        increments,
+                        threshold
+                    );
+                }
+            }
+            other => {
+                out.fill(0);
+                log::debug!(
+                    "nvhost-channel: unknown ioctl device={:?} cmd={:#x}",
+                    device,
+                    other
+                );
+            }
+        }
+
+        IoctlOutcome::ok(out)
     }
 
     fn nvmap_ioctl(&mut self, cmd: u16, req: &IoctlRequest) -> IoctlOutcome {
@@ -471,6 +1751,8 @@ impl Nvdrv {
                         address: 0,
                         kind: 0,
                         align: 0,
+                        channel_map_address: 0,
+                        channel_pin_count: 0,
                     },
                 );
                 self.stats.nvmap_creates.fetch_add(1, Ordering::Relaxed);
@@ -885,6 +2167,34 @@ impl Nvdrv {
                         req.in_data[39],
                     ]);
 
+                    if (flags & 0x100) != 0 {
+                        let valid = self
+                            .gpu
+                            .mappings
+                            .lock()
+                            .mapping_starting_at(requested_offset)
+                            .is_some_and(|mapping| mapping.size >= mapping_size_in);
+                        if !valid {
+                            log::warn!(
+                                "nvhost-as-gpu:MapBufferEx remap rejected base={:#x} buffer_offset={:#x} size={:#x}",
+                                requested_offset,
+                                buffer_offset,
+                                mapping_size_in,
+                            );
+                            return IoctlOutcome::error(0xB);
+                        }
+                        if out.len() >= 40 {
+                            out[32..40].copy_from_slice(&requested_offset.to_le_bytes());
+                        }
+                        log::debug!(
+                            "nvhost-as-gpu:MapBufferEx remap base={:#x} buffer_offset={:#x} size={:#x}",
+                            requested_offset,
+                            buffer_offset,
+                            mapping_size_in,
+                        );
+                        return IoctlOutcome::ok(out);
+                    }
+
                     let mapping_size = if mapping_size_in == 0 {
                         self.nvmap_handles
                             .get(&nvmap_id)
@@ -898,29 +2208,27 @@ impl Nvdrv {
                         .get(&nvmap_id)
                         .map(|h| h.address.wrapping_add(buffer_offset))
                         .unwrap_or(0);
-                    let (gpu_va, cpu_addr, final_nvmap) =
-                        if (flags & 0x1) != 0 && requested_offset != 0 {
-                            self.gpu
-                                .alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
-                            (requested_offset, handle_cpu, nvmap_id)
-                        } else if (flags & 0x100) != 0 && requested_offset != 0 {
-                            let remap_va = requested_offset.wrapping_add(buffer_offset);
-                            self.gpu
-                                .alloc_va_fixed(remap_va, mapping_size.max(0x1000));
-                            let handle_valid =
-                                nvmap_id != 0 && self.nvmap_handles.contains_key(&nvmap_id);
-                            let (cpu, nv) = if handle_valid {
-                                (handle_cpu, nvmap_id)
-                            } else {
-                                let m = self.gpu.mappings.lock();
-                                match m.cpu_address_for(remap_va) {
-                                    Some(cpu) => {
-                                        (cpu, m.nvmap_id_for(remap_va).unwrap_or(nvmap_id))
-                                    }
-                                    None => (handle_cpu, nvmap_id),
-                                }
-                            };
-                            log::debug!(
+                    let (gpu_va, cpu_addr, final_nvmap) = if (flags & 0x1) != 0
+                        && requested_offset != 0
+                    {
+                        self.gpu
+                            .alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
+                        (requested_offset, handle_cpu, nvmap_id)
+                    } else if (flags & 0x100) != 0 && requested_offset != 0 {
+                        let remap_va = requested_offset.wrapping_add(buffer_offset);
+                        self.gpu.alloc_va_fixed(remap_va, mapping_size.max(0x1000));
+                        let handle_valid =
+                            nvmap_id != 0 && self.nvmap_handles.contains_key(&nvmap_id);
+                        let (cpu, nv) = if handle_valid {
+                            (handle_cpu, nvmap_id)
+                        } else {
+                            let m = self.gpu.mappings.lock();
+                            match m.cpu_address_for(remap_va) {
+                                Some(cpu) => (cpu, m.nvmap_id_for(remap_va).unwrap_or(nvmap_id)),
+                                None => (handle_cpu, nvmap_id),
+                            }
+                        };
+                        log::debug!(
                                 "nvhost-as-gpu:MapBufferEx REMAP offset={:#x} buffer_offset={:#x} → gpu_va={:#x} cpu={:#x} nvmap={} handle_valid={}",
                                 requested_offset,
                                 buffer_offset,
@@ -929,19 +2237,23 @@ impl Nvdrv {
                                 nv,
                                 handle_valid
                             );
-                            (remap_va, cpu, nv)
-                        } else if requested_offset != 0 {
-                            self.gpu
-                                .alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
-                            (requested_offset, handle_cpu, nvmap_id)
-                        } else {
-                            let big = self
-                                .nvmap_handles
-                                .get(&nvmap_id)
-                                .map(|h| h.align >= 0x10000)
-                                .unwrap_or(false);
-                            (self.gpu.alloc_va(mapping_size.max(0x1000), big), handle_cpu, nvmap_id)
-                        };
+                        (remap_va, cpu, nv)
+                    } else if requested_offset != 0 {
+                        self.gpu
+                            .alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
+                        (requested_offset, handle_cpu, nvmap_id)
+                    } else {
+                        let big = self
+                            .nvmap_handles
+                            .get(&nvmap_id)
+                            .map(|h| h.align >= 0x10000)
+                            .unwrap_or(false);
+                        (
+                            self.gpu.alloc_va(mapping_size.max(0x1000), big),
+                            handle_cpu,
+                            nvmap_id,
+                        )
+                    };
                     let nvmap_id = final_nvmap;
                     log::debug!(
                         "nvhost-as-gpu:MapBufferEx flags={:#x} nvmap_id={} req_off={:#x} cpu_addr={:#x} size={:#x} → gpu_va={:#x}",
@@ -1151,16 +2463,52 @@ impl Nvdrv {
                 log::debug!("nvhost-gpu:ChannelSetTimeout");
             }
             0x4808 | 0x481b => {
+                let submit_address = req
+                    .in_data
+                    .get(0..8)
+                    .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
+                let submit_num_entries = req
+                    .in_data
+                    .get(8..12)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+                let trace_fence_current = if gpfifo_trace_enabled() && req.in_data.len() >= 24 {
+                    Some(self.syncpoint_value(submit_fence_id))
+                } else {
+                    None
+                };
+                let trace_fence = trace_fence_current
+                    .map(|current| (submit_fence_id, submit_fence_value, current));
+                let trace_submit = |warning, branch| {
+                    trace_gpfifo_submit(
+                        warning,
+                        cmd,
+                        req.fd,
+                        submit_flags,
+                        trace_fence,
+                        submit_address,
+                        submit_num_entries,
+                        req.in_data.len(),
+                        req.inline_in_data.len(),
+                        req.out_size,
+                        branch,
+                    );
+                };
+                let submit_payload_present = submit_address.unwrap_or(0) != 0
+                    || submit_num_entries.unwrap_or(0) != 0
+                    || !req.inline_in_data.is_empty()
+                    || req.in_data.len() > 24
+                    || (!req.in_data.is_empty() && req.in_data.len() < 16);
                 if submit_flags & 1 != 0 && submit_flags & (1 << 8) != 0 {
+                    trace_submit(false, "reject-error4-conflicting-flags");
                     return IoctlOutcome::error(4);
                 }
-                if submit_flags & 1 != 0
-                    && !syncpoint_reached(
-                        self.syncpoint_value(submit_fence_id),
-                        submit_fence_value,
-                    )
-                {
-                    return IoctlOutcome::error(5);
+                if submit_flags & 1 != 0 {
+                    let current = trace_fence_current
+                        .unwrap_or_else(|| self.syncpoint_value(submit_fence_id));
+                    if !syncpoint_reached(current, submit_fence_value) {
+                        trace_submit(true, "reject-error5-unsignalled-wait");
+                        return IoctlOutcome::error(5);
+                    }
                 }
                 let _ = self.renderer();
                 if req.in_data.len() >= 16 {
@@ -1187,6 +2535,7 @@ impl Nvdrv {
                     );
 
                     if cmd == 0x481b && req.inline_in_data.len() >= (num_entries as usize) * 8 {
+                        trace_submit(false, "inline-481b");
                         let entries: Vec<gpu::CommandListHeader> = (0..num_entries as usize)
                             .map(|i| {
                                 let off = i * 8;
@@ -1220,11 +2569,8 @@ impl Nvdrv {
                         let _ = self
                             .gpu
                             .process_inline_gpfifo(&entries, mem_read, mem_write);
-                        let (syncpt_id, syncpt_value) = self.complete_channel_submit(
-                            req.fd,
-                            submit_flags,
-                            submit_fence_value,
-                        );
+                        let (syncpt_id, syncpt_value) =
+                            self.complete_channel_submit(req.fd, submit_flags, submit_fence_value);
                         log::trace!(
                             "nvhost-gpu:SubmitGPFIFO (inline) entries={} draws={}",
                             entries.len(),
@@ -1237,6 +2583,7 @@ impl Nvdrv {
                         }
                     } else if cmd == 0x4808 && req.in_data.len() >= 24 + (num_entries as usize) * 8
                     {
+                        trace_submit(false, "embedded-4808");
                         let entries: Vec<gpu::CommandListHeader> = (0..num_entries as usize)
                             .map(|i| {
                                 let off = 24 + i * 8;
@@ -1270,11 +2617,8 @@ impl Nvdrv {
                         let _ = self
                             .gpu
                             .process_inline_gpfifo(&entries, mem_read, mem_write);
-                        let (syncpt_id, syncpt_value) = self.complete_channel_submit(
-                            req.fd,
-                            submit_flags,
-                            submit_fence_value,
-                        );
+                        let (syncpt_id, syncpt_value) =
+                            self.complete_channel_submit(req.fd, submit_flags, submit_fence_value);
                         if log::log_enabled!(log::Level::Trace) {
                             let (dc, cc) = {
                                 let m = self.gpu.maxwell3d.lock();
@@ -1293,6 +2637,7 @@ impl Nvdrv {
                             out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
                         }
                     } else if cmd == 0x481b && address != 0 {
+                        trace_submit(false, "kickoff-481b");
                         self.stats.gpfifo_submits.fetch_add(1, Ordering::Relaxed);
                         self.stats
                             .gpfifo_entries
@@ -1300,11 +2645,8 @@ impl Nvdrv {
                         let _ = self
                             .gpu
                             .submit_gpfifo(address, num_entries, mem_read, mem_write);
-                        let (syncpt_id, syncpt_value) = self.complete_channel_submit(
-                            req.fd,
-                            submit_flags,
-                            submit_fence_value,
-                        );
+                        let (syncpt_id, syncpt_value) =
+                            self.complete_channel_submit(req.fd, submit_flags, submit_fence_value);
                         log::trace!(
                             "nvhost-gpu:SubmitGPFIFO (kickoff) addr={:#x} entries={} draws={}",
                             address,
@@ -1317,6 +2659,14 @@ impl Nvdrv {
                             out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
                         }
                     } else {
+                        trace_submit(
+                            submit_payload_present,
+                            if submit_payload_present {
+                                "payload-no-processing"
+                            } else {
+                                "empty-no-processing"
+                            },
+                        );
                         let (syncpt_id, syncpt_value) = self.ensure_channel_syncpoint(req.fd);
                         if out.len() >= 24 {
                             out[12..16].copy_from_slice(&0u32.to_le_bytes());
@@ -1324,6 +2674,15 @@ impl Nvdrv {
                             out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
                         }
                     }
+                } else {
+                    trace_submit(
+                        submit_payload_present,
+                        if submit_payload_present {
+                            "short-header-payload-no-processing"
+                        } else {
+                            "short-header-empty-no-processing"
+                        },
+                    );
                 }
             }
             0x4809 => {
@@ -1470,11 +2829,7 @@ impl Nvdrv {
                     ]);
                     let value = self.syncpoint_value(id);
                     out[4..8].copy_from_slice(&value.to_le_bytes());
-                    log::debug!(
-                        "nvhost-ctrl:SyncptRead syncpt_id={} → {}",
-                        id,
-                        value
-                    );
+                    log::debug!("nvhost-ctrl:SyncptRead syncpt_id={} → {}", id, value);
                 }
             }
             0x0015 => {
@@ -1549,11 +2904,7 @@ impl Nvdrv {
                     ]);
                     let value = self.syncpoint_max(id);
                     out[4..8].copy_from_slice(&value.to_le_bytes());
-                    log::debug!(
-                        "nvhost-ctrl:SyncptReadMax syncpt={} → {}",
-                        id,
-                        value
-                    );
+                    log::debug!("nvhost-ctrl:SyncptReadMax syncpt={} → {}", id, value);
                 }
             }
             0x001c => {
@@ -1711,8 +3062,7 @@ impl Nvdrv {
                         req.in_data[3],
                     ]);
                     let slot = event_id & 0xFF;
-                    self.ctrl_event_waits
-                        .retain(|id, _| (*id & 0xFF) != slot);
+                    self.ctrl_event_waits.retain(|id, _| (*id & 0xFF) != slot);
                     log::debug!("nvhost-ctrl:EventUnregister event_id={}", event_id);
                 }
             }
@@ -1900,5 +3250,275 @@ impl Nvdrv {
 impl Default for Nvdrv {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(fd: u32, ioctl_id: u32, in_data: Vec<u8>, out_size: usize) -> IoctlRequest {
+        IoctlRequest {
+            fd,
+            ioctl_id,
+            in_data,
+            inline_in_data: Vec::new(),
+            out_size,
+        }
+    }
+
+    fn test_nvmap_handle(id: u32, size: u32, address: u64) -> NvmapHandle {
+        NvmapHandle {
+            id,
+            size,
+            address,
+            kind: 0,
+            align: 0x1000,
+            channel_map_address: 0,
+            channel_pin_count: 0,
+        }
+    }
+
+    #[test]
+    fn video_channels_get_distinct_nonzero_syncpoints() {
+        let mut nvdrv = Nvdrv::new();
+        let nvdec_fd = nvdrv.open("/dev/nvhost-nvdec").unwrap();
+        let vic_fd = nvdrv.open("/dev/nvhost-vic").unwrap();
+
+        let mut nvdec_input = vec![0u8; 8];
+        write_u32(&mut nvdec_input, 0, 7);
+        let nvdec = nvdrv.dispatch_ioctl(request(nvdec_fd, 0xc008_0002, nvdec_input.clone(), 8));
+        let vic = nvdrv.dispatch_ioctl(request(vic_fd, 0xc008_0002, vec![0u8; 8], 8));
+        let nvdec_syncpoint = read_u32(&nvdec.data, 4).unwrap();
+        let vic_syncpoint = read_u32(&vic.data, 4).unwrap();
+
+        assert_eq!(nvdec.result, 0);
+        assert_eq!(vic.result, 0);
+        assert_eq!(read_u32(&nvdec.data, 0), Some(7));
+        assert_ne!(nvdec_syncpoint, 0);
+        assert_ne!(vic_syncpoint, 0);
+        assert_ne!(nvdec_syncpoint, vic_syncpoint);
+
+        let again = nvdrv.dispatch_ioctl(request(nvdec_fd, 0xc008_0002, nvdec_input, 8));
+        assert_eq!(read_u32(&again.data, 4), Some(nvdec_syncpoint));
+    }
+
+    #[test]
+    fn map_buffer_ex_remap_reuses_exact_base_without_new_mapping() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let base = 0x5_04d3_0000u64;
+        let cpu = 0x4a_0200_0000u64;
+        nvdrv.gpu.mappings.lock().add(base, 0x400000, cpu, 77);
+
+        let mut input = vec![0u8; 40];
+        input[0..4].copy_from_slice(&0x100u32.to_le_bytes());
+        input[16..24].copy_from_slice(&0x2f0000u64.to_le_bytes());
+        input[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        input[32..40].copy_from_slice(&base.to_le_bytes());
+        let before = nvdrv.gpu.mappings.lock().iter().count();
+
+        let first = nvdrv.dispatch_ioctl(request(fd, 0xc028_4106, input.clone(), 40));
+        let second = nvdrv.dispatch_ioctl(request(fd, 0xc028_4106, input, 40));
+
+        assert_eq!(first.result, 0);
+        assert_eq!(second.result, 0);
+        assert_eq!(
+            u64::from_le_bytes(first.data[32..40].try_into().unwrap()),
+            base
+        );
+        let mappings = nvdrv.gpu.mappings.lock();
+        assert_eq!(mappings.iter().count(), before);
+        assert_eq!(
+            mappings.cpu_address_for(base + 0x2f0000),
+            Some(cpu + 0x2f0000)
+        );
+        assert!(mappings.iter().all(|mapping| mapping.nvmap_id != 0));
+    }
+
+    #[test]
+    fn map_buffer_ex_remap_rejects_missing_or_oversized_base() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let base = 0x5_04d3_0000u64;
+        nvdrv
+            .gpu
+            .mappings
+            .lock()
+            .add(base, 0x10000, 0x4a_0200_0000, 77);
+
+        let remap = |offset: u64, size: u64| {
+            let mut input = vec![0u8; 40];
+            input[0..4].copy_from_slice(&0x100u32.to_le_bytes());
+            input[24..32].copy_from_slice(&size.to_le_bytes());
+            input[32..40].copy_from_slice(&offset.to_le_bytes());
+            input
+        };
+
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4106, remap(base + 0x1000, 0x1000), 40))
+                .result,
+            0xB
+        );
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4106, remap(base, 0x20000), 40))
+                .result,
+            0xB
+        );
+    }
+
+    #[test]
+    fn video_channel_stores_nvmap_fd_and_submit_timeout() {
+        let mut nvdrv = Nvdrv::new();
+        let nvdec_fd = nvdrv.open("/dev/nvhost-nvdec").unwrap();
+        let nvmap_fd = nvdrv.open("/dev/nvmap").unwrap();
+
+        let nvmap = nvdrv.dispatch_ioctl(request(
+            nvdec_fd,
+            0x4004_4801,
+            nvmap_fd.to_le_bytes().to_vec(),
+            4,
+        ));
+        let timeout = nvdrv.dispatch_ioctl(request(
+            nvdec_fd,
+            0x4004_0007,
+            1000u32.to_le_bytes().to_vec(),
+            4,
+        ));
+
+        assert_eq!(nvmap.result, 0);
+        assert_eq!(timeout.result, 0);
+        assert_eq!(nvdrv.files[&nvdec_fd].nvmap_fd, Some(nvmap_fd));
+        assert_eq!(nvdrv.files[&nvdec_fd].submit_timeout, 1000);
+    }
+
+    #[test]
+    fn video_channel_map_and_unmap_match_variable_wire_layout() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-nvdec").unwrap();
+        let cpu_address = 0x4a07_f000_00u64;
+        nvdrv
+            .nvmap_handles
+            .insert(497, test_nvmap_handle(497, 0x8000, cpu_address));
+
+        let mut input = vec![0u8; 0x0c + 2 * 8];
+        write_u32(&mut input, 0, 1);
+        write_u32(&mut input, 4, 0x1122_3344);
+        write_u32(&mut input, 8, 0x5566_7788);
+        write_u32(&mut input, 0x0c, 497);
+        write_u32(&mut input, 0x10, 0xffff_ffff);
+        write_u32(&mut input, 0x14, 999);
+        write_u32(&mut input, 0x18, 0xaabb_ccdd);
+
+        let mapped = nvdrv.dispatch_ioctl(request(fd, 0xc01c_0009, input.clone(), input.len()));
+        let map_address = read_u32(&mapped.data, 0x10).unwrap();
+        assert_ne!(map_address, 0);
+        assert_eq!(&mapped.data[..0x10], &input[..0x10]);
+        assert_eq!(&mapped.data[0x14..], &input[0x14..]);
+        assert_eq!(
+            nvdrv
+                .gpu
+                .mappings
+                .lock()
+                .cpu_address_for(u64::from(map_address)),
+            Some(cpu_address)
+        );
+        assert_eq!(nvdrv.nvmap_handles[&497].channel_pin_count, 1);
+
+        let unmapped = nvdrv.dispatch_ioctl(request(fd, 0xc01c_000a, mapped.data, input.len()));
+        assert_eq!(&unmapped.data[..0x14], &[0u8; 0x14]);
+        assert_eq!(&unmapped.data[0x14..], &input[0x14..]);
+        assert_eq!(nvdrv.nvmap_handles[&497].channel_pin_count, 0);
+    }
+
+    #[test]
+    fn video_channel_submit_preserves_payload_and_reserves_fence() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-nvdec").unwrap();
+        let syncpoint = nvdrv.ensure_channel_syncpoint(fd).0;
+        let cpu_address = 0x4a07_f000_00u64;
+        nvdrv
+            .nvmap_handles
+            .insert(497, test_nvmap_handle(497, 0x8000, cpu_address));
+
+        let mut input = vec![0u8; 0x40];
+        write_u32(&mut input, 0, 2);
+        write_u32(&mut input, 4, 0);
+        write_u32(&mut input, 8, 1);
+        write_u32(&mut input, 12, 1);
+        write_u32(&mut input, 0x10, 497);
+        write_u32(&mut input, 0x14, 0);
+        write_u32(&mut input, 0x18, 139);
+        write_u32(&mut input, 0x1c, 497);
+        write_u32(&mut input, 0x20, 0x22c);
+        write_u32(&mut input, 0x24, 2);
+        write_u32(&mut input, 0x28, syncpoint);
+        write_u32(&mut input, 0x2c, 1);
+        write_u32(&mut input, 0x30, 0x1111_1111);
+        write_u32(&mut input, 0x34, 0x2222_2222);
+        write_u32(&mut input, 0x38, 0x3333_3333);
+        write_u32(&mut input, 0x3c, 0xffff_ffff);
+
+        let memory = vec![0u8; 0x234];
+        let mem_read = |address: u64, output: &mut [u8]| {
+            let Some(offset) = address.checked_sub(cpu_address) else {
+                return false;
+            };
+            let offset = offset as usize;
+            let Some(source) = memory.get(offset..offset.saturating_add(output.len())) else {
+                return false;
+            };
+            output.copy_from_slice(source);
+            true
+        };
+        let submitted = nvdrv.dispatch_ioctl_with_mem(
+            request(fd, 0xc040_0001, input.clone(), input.len()),
+            &mem_read,
+            &|_, _| false,
+        );
+
+        assert_eq!(submitted.result, 0);
+        assert_eq!(&submitted.data[..0x3c], &input[..0x3c]);
+        assert_eq!(read_u32(&submitted.data, 0x3c), Some(1));
+        assert_eq!(nvdrv.syncpoint_max(syncpoint), 1);
+        assert_eq!(nvdrv.syncpoint_value(syncpoint), 1);
+    }
+
+    #[test]
+    fn host1x_trace_decodes_incrementing_and_immediate_methods() {
+        let words = [
+            (0x10 << 16) | (0xf0 << 6),
+            (1 << 28) | (0x20 << 16) | 2,
+            0xaaaa_0001,
+            0xbbbb_0002,
+            (4 << 28) | (0x12 << 16) | 0x123,
+        ];
+        let methods = decode_host1x_methods(&words, 0, 8);
+
+        assert_eq!(
+            methods,
+            vec![
+                Host1xMethodTrace {
+                    word_index: 2,
+                    class_id: 0xf0,
+                    method: 0x20,
+                    argument: 0xaaaa_0001,
+                },
+                Host1xMethodTrace {
+                    word_index: 3,
+                    class_id: 0xf0,
+                    method: 0x21,
+                    argument: 0xbbbb_0002,
+                },
+                Host1xMethodTrace {
+                    word_index: 4,
+                    class_id: 0xf0,
+                    method: 0x12,
+                    argument: 0x123,
+                },
+            ]
+        );
     }
 }

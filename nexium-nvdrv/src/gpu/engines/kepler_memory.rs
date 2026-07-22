@@ -115,9 +115,21 @@ impl KeplerMemory {
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
+        let kp = crate::gpu::pusher::kickprof::start();
         let dst_gpu = ((self.offset_out_upper as u64) << 32) | self.offset_out_lower as u64;
         let Some((dst_cpu, dst_limit)) = mappings.cpu_range_for(dst_gpu) else {
-            log::trace!("KeplerMemory::flush: dst gpu_va {:#x} not mapped", dst_gpu);
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static DROPPED: AtomicU64 = AtomicU64::new(0);
+            let n = DROPPED.fetch_add(1, Ordering::Relaxed);
+            if n < 32 || n % 1024 == 0 {
+                log::warn!(
+                    "[i2m-drop] #{} dst gpu_va={:#x} bytes={}",
+                    n,
+                    dst_gpu,
+                    self.copy_size
+                );
+            }
+            crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KM_FLUSH, kp);
             return;
         };
         let dst_limit = dst_limit as usize;
@@ -125,6 +137,7 @@ impl KeplerMemory {
         let line_length = self.line_length_in as usize;
         let line_count = self.line_count.max(1) as usize;
         if line_length == 0 {
+            crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KM_FLUSH, kp);
             return;
         }
 
@@ -233,5 +246,6 @@ impl KeplerMemory {
         nexium_gpu::tex_invalidate::bump_region(dst_gpu, bump_size);
 
         self.upload_count = self.upload_count.wrapping_add(1);
+        crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KM_FLUSH, kp);
     }
 }
