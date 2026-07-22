@@ -189,7 +189,6 @@ pub struct RtCache {
     depth_generation_counter: u64,
     depth_generations: HashMap<RtKey, u64>,
     depth_shadow_generations: HashMap<RtKey, (RtKey, u64)>,
-    depth_pass_targets: HashMap<RtKey, Vec<RtKey>>,
 }
 
 impl RtCache {
@@ -208,7 +207,6 @@ impl RtCache {
             depth_generation_counter: 0,
             depth_generations: HashMap::new(),
             depth_shadow_generations: HashMap::new(),
-            depth_pass_targets: HashMap::new(),
         }
     }
 
@@ -243,27 +241,6 @@ impl RtCache {
         let generation = self.next_depth_generation();
         self.depth_generations.insert(canonical, generation);
         generation
-    }
-
-    /// Starts a logical color/depth pass for a shared zeta allocation.
-    ///
-    /// Maxwell titles commonly reuse one zeta allocation while switching
-    /// color targets.  Those switches are separate logical passes even when
-    /// the host image is physically shared, so the first batch of a new
-    /// target must not inherit the previous pass's depth values.
-    pub(crate) fn begin_depth_pass(&mut self, depth: RtKey, targets: &[RtKey]) -> bool {
-        let canonical = self.canonical_depth_key(depth);
-        let changed = self
-            .depth_pass_targets
-            .get(&canonical)
-            .is_none_or(|previous| previous.as_slice() != targets);
-        self.depth_pass_targets.insert(canonical, targets.to_vec());
-        changed
-    }
-
-    pub(crate) fn invalidate_depth_pass(&mut self, depth: RtKey) {
-        let canonical = self.canonical_depth_key(depth);
-        self.depth_pass_targets.remove(&canonical);
     }
 
     pub(crate) fn depth_generation(&self, key: RtKey) -> Option<u64> {
@@ -1600,7 +1577,6 @@ impl RtCache {
         }
         self.depth_generations.clear();
         self.depth_shadow_generations.clear();
-        self.depth_pass_targets.clear();
     }
 }
 
@@ -1935,22 +1911,6 @@ mod tests {
         cache.forget_depth_tracking(source);
         assert_eq!(cache.depth_generation(source), None);
         assert!(!cache.depth_shadow_is_current(source, shadow));
-    }
-
-    #[test]
-    fn logical_depth_pass_restarts_when_color_target_changes() {
-        let depth = RtKey::with_cpu(84, 1920, 1080, 0x532c70000, 0x1000);
-        let first_target = RtKey::with_cpu(3, 864, 480, 0x5615d0a00, 0x2000);
-        let second_target = RtKey::with_cpu(3, 896, 480, 0x56123ba00, 0x3000);
-        let mut cache = RtCache::new();
-
-        assert!(cache.begin_depth_pass(depth, &[first_target]));
-        assert!(!cache.begin_depth_pass(depth, &[first_target]));
-        assert!(cache.begin_depth_pass(depth, &[second_target]));
-        assert!(!cache.begin_depth_pass(depth, &[second_target]));
-
-        cache.invalidate_depth_pass(depth);
-        assert!(cache.begin_depth_pass(depth, &[first_target]));
     }
 
     #[test]

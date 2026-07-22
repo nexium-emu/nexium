@@ -2653,7 +2653,6 @@ impl Renderer {
         }
         submit_with_fence(device, *queue, cmd, clear_slot.fence)?;
         clear_slot.in_flight = true;
-        rt_cache.invalidate_depth_pass(key);
         rt_cache.mark_depth_written(key);
         Ok(())
     }
@@ -5625,11 +5624,6 @@ impl Renderer {
             .unwrap_or(vk::ImageLayout::UNDEFINED);
         let any_depth = preps.iter().any(|p| p.1.use_depth);
         let depth_key = if any_depth { calls[0].depth_key } else { None };
-        let logical_depth_pass = if let Some(depth_key) = depth_key {
-            rt_cache.begin_depth_pass(depth_key, &color_keys)
-        } else {
-            false
-        };
         let (depth_image, depth_view, depth_prev, depth_fresh, depth_extent) = if any_depth {
             let (d, fresh) = rt_cache.get_or_create_depth(
                 depth_key.unwrap(),
@@ -5683,7 +5677,7 @@ impl Renderer {
         let mut tex_sam_cache: HashMap<(u64, usize), Option<u64>> = HashMap::new();
         let mut pass_open = false;
         let mut pass_depth = false;
-        let mut depth_needs_clear = depth_fresh || logical_depth_pass;
+        let mut depth_needs_clear = depth_fresh;
         let mut pass_rt_layout = vk::ImageLayout::UNDEFINED;
         let mut pass_dirty = vec![false; color_bind.len()];
         let mut pass_trace_calls: Vec<&crate::draw::Maxwell3dDrawCall> = Vec::new();
