@@ -3083,12 +3083,22 @@ fn execute_one(
             mem_read,
         );
     }
-    let (vptx_scale_z, vptx_translate_z) =
+    let guest_vptx =
         if draw.viewport.scale_z != 0.0 || draw.viewport.translate_z != 0.0 {
             (draw.viewport.scale_z, draw.viewport.translate_z)
         } else {
             (1.0, 0.0)
         };
+    let depth_clip_control = std::env::var("NEXIUM_DEPTH_CLIP_CTL")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let apply_z_remap = draw.depth_mode == 0 && !depth_clip_control;
+    let (vptx_scale_z, vptx_translate_z) = if apply_z_remap {
+        (1.0, 0.0)
+    } else {
+        guest_vptx
+    };
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static LOGGED: AtomicBool = AtomicBool::new(false);
@@ -3749,6 +3759,7 @@ fn execute_one(
                             nexium_spirv::VertexOptions {
                                 vptx_scale_z,
                                 vptx_translate_z,
+                                apply_z_remap,
                                 point_size: if draw.topology == 0 {
                                     Some(draw.point_size)
                                 } else {
@@ -4885,6 +4896,7 @@ fn execute_one(
             write_enabled: depth_write,
             compare_op: map_compare_op(draw.depth_func),
         },
+        depth_mode: draw.depth_mode,
         depth_format,
         depth_aspects,
         stencil: StencilState {

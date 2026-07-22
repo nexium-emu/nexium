@@ -168,6 +168,7 @@ pub struct Maxwell3dDrawCall {
     pub state: DrawState,
     pub blend: BlendState,
     pub depth: DepthState,
+    pub depth_mode: u32,
     pub depth_format: vk::Format,
     pub depth_aspects: vk::ImageAspectFlags,
     pub stencil: StencilState,
