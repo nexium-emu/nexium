@@ -1891,6 +1891,7 @@ struct FragmentTextureNumericMetadata {
 #[derive(Clone, Debug)]
 struct GraphicsTextureLayout {
     fs_ids: Vec<u32>,
+    fs_tic_ids: Vec<Option<u32>>,
     vs_tex_base: u32,
     vs_tex_count: u32,
     manifest: Vec<TextureNumericBinding>,
@@ -1967,6 +1968,25 @@ fn texture_view_metadata_fingerprint(layout: &GraphicsTextureLayout) -> u64 {
         ^ (layout.depth_compare_cube_array_mask as u64)
             .wrapping_mul(0xc2b2_ae35)
             .rotate_left(47)
+}
+
+fn fragment_sprite_batch_mirror(layout: &GraphicsTextureLayout) -> bool {
+    static TICS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let tics = TICS.get_or_init(|| {
+        std::env::var("NEXIUM_20XX_MIRROR_TICS")
+            .ok()
+            .map(|list| {
+                list.split(',')
+                    .filter_map(|part| part.trim().parse::<u32>().ok())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![1528])
+    });
+    layout
+        .fs_tic_ids
+        .iter()
+        .flatten()
+        .any(|tic_id| tics.contains(tic_id))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4852,6 +4872,9 @@ fn execute_one(
         vs_cbuf_mask,
         fs_cbuf_mask,
         fs_tex_ids,
+        sprite_batch_mirror: texture_layout
+            .as_ref()
+            .is_some_and(fragment_sprite_batch_mirror),
         texture_numeric_manifest,
         texel_buffer_mask,
         vs_tex_base,
@@ -8146,7 +8169,7 @@ fn graphics_texture_layout_from_metadata(
         ));
     }
 
-    let (mut bindings, fs_texel_buffer_mask, mut uses) = stage_texture_numeric_bindings(
+    let (mut bindings, fs_texel_buffer_mask, fs_uses) = stage_texture_numeric_bindings(
         "fs",
         fs_metadata,
         0,
@@ -8159,6 +8182,7 @@ fn graphics_texture_layout_from_metadata(
         mappings,
         mem_read,
     )?;
+    let fs_tic_ids = fs_uses.iter().map(|usage| usage.tic_id).collect();
     let (vs_bindings, vs_texel_buffer_mask, vs_uses) = stage_texture_numeric_bindings(
         "vs",
         vs_metadata,
@@ -8173,6 +8197,7 @@ fn graphics_texture_layout_from_metadata(
         mem_read,
     )?;
     bindings.extend(vs_bindings);
+    let mut uses = fs_uses;
     uses.extend(vs_uses);
 
     let mut resources = std::collections::HashMap::<u32, ResolvedTextureNumericUse>::new();
@@ -8243,6 +8268,7 @@ fn graphics_texture_layout_from_metadata(
     );
     Ok(GraphicsTextureLayout {
         fs_ids,
+        fs_tic_ids,
         vs_tex_base,
         vs_tex_count,
         manifest,

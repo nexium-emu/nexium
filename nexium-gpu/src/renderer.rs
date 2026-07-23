@@ -14238,7 +14238,41 @@ where
             });
         }
     }
+    if call.sprite_batch_mirror {
+        mirror_20xx_sprite_batch(call, &mut out);
+    }
     Ok((out, draw_vertex_count))
+}
+
+fn mirror_20xx_sprite_batch(
+    call: &crate::draw::Maxwell3dDrawCall,
+    bindings: &mut [PreparedVertexBinding],
+) {
+    let Some(pos_attr) = call.vertex_layout.attrs.iter().find(|a| a.location == 0) else {
+        return;
+    };
+    let Some(binding) = bindings.iter_mut().find(|b| b.binding == pos_attr.binding) else {
+        return;
+    };
+    let stride = binding.stride as usize;
+    let offset = pos_attr.offset as usize + std::mem::size_of::<f32>();
+    if stride == 0 || offset + std::mem::size_of::<f32>() > stride {
+        return;
+    }
+    let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+    for vertex in binding.data.chunks_exact(stride) {
+        let y = f32::from_le_bytes(vertex[offset..offset + 4].try_into().unwrap());
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    if !min_y.is_finite() || !max_y.is_finite() {
+        return;
+    }
+    let pivot = min_y + max_y;
+    for vertex in binding.data.chunks_exact_mut(stride) {
+        let y = f32::from_le_bytes(vertex[offset..offset + 4].try_into().unwrap());
+        vertex[offset..offset + 4].copy_from_slice(&(pivot - y).to_le_bytes());
+    }
 }
 
 fn upload_vertex_bindings(

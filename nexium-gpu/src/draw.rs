@@ -139,6 +139,7 @@ pub struct Maxwell3dDrawCall {
     pub vs_cbuf_mask: u32,
     pub fs_cbuf_mask: u32,
     pub fs_tex_ids: Vec<u32>,
+    pub sprite_batch_mirror: bool,
     pub texture_numeric_manifest: Vec<crate::texture_manifest::TextureNumericBinding>,
     pub texel_buffer_mask: u32,
     pub vs_tex_base: u32,
