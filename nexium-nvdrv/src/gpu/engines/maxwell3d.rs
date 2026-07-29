@@ -1,5 +1,5 @@
-use super::kepler_memory::KeplerMemory;
 use super::super::GpuMappings;
+use super::kepler_memory::KeplerMemory;
 
 pub const MAXWELL3D_CLASS: u32 = 0xB197;
 
@@ -251,6 +251,8 @@ pub struct Maxwell3DRegisters {
     pub index_format: u32,
     pub index_count: u32,
     pub index_first: u32,
+    pub primitive_restart_enabled: bool,
+    pub primitive_restart_index: u32,
     pub depth_mode: u32,
     pub depth_test_enable: bool,
     pub zeta: ZetaSurface,
@@ -374,6 +376,8 @@ impl Default for Maxwell3DRegisters {
             index_format: 0,
             index_count: 0,
             index_first: 0,
+            primitive_restart_enabled: false,
+            primitive_restart_index: 0,
             depth_mode: 0,
             depth_test_enable: false,
             zeta: ZetaSurface::default(),
@@ -459,7 +463,7 @@ impl Default for Maxwell3DRegisters {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DrawCall {
     pub topology: u32,
     pub first_vertex: u32,
@@ -471,6 +475,8 @@ pub struct DrawCall {
     pub index_gpu_va: u64,
     pub index_format: u32,
     pub index_first: u32,
+    pub primitive_restart_enabled: bool,
+    pub primitive_restart_index: u32,
     pub point_size: f32,
 
     pub rt: [RenderTarget; 8],
@@ -570,6 +576,10 @@ pub struct Maxwell3D {
     mme_active: bool,
     mme_hash: u64,
     mme_entry: u32,
+    legacy_draw_instance_id: u32,
+    legacy_draw_begin_pending: bool,
+    draw_state_dirty_since_last_draw: bool,
+    last_draw_allows_continuation: bool,
 }
 
 const REG_LOAD_MME_INSTRUCTION_PTR: u32 = 0x45;
@@ -663,6 +673,10 @@ impl Maxwell3D {
             mme_active: false,
             mme_hash: 0,
             mme_entry: 0,
+            legacy_draw_instance_id: 0,
+            legacy_draw_begin_pending: false,
+            draw_state_dirty_since_last_draw: true,
+            last_draw_allows_continuation: false,
         }
     }
 
@@ -709,7 +723,7 @@ impl Maxwell3D {
         }
 
         if method >= super::MACRO_REGISTERS_START {
-            if self.macro_invocations < 24 || (mme_trace() && self.macro_invocations < 1024) {
+            if mme_trace() && self.macro_invocations < 1024 {
                 log::info!(
                     "maxwell3d: MME invoke method={:#x} arg={:#x} is_last={} (slot offset {:#x})",
                     method,
@@ -727,8 +741,7 @@ impl Maxwell3D {
                         rf.get(idx as usize).copied().unwrap_or(0)
                     });
             if let Some(out) = writes {
-                if self.macro_writes_logged < 24 || (mme_trace() && self.macro_writes_logged < 512)
-                {
+                if mme_trace() && self.macro_writes_logged < 512 {
                     log::info!(
                         "maxwell3d: MME produced {} writes inst={:?}: {:?}",
                         out.writes.len(),
@@ -752,14 +765,14 @@ impl Maxwell3D {
 
         match method {
             REG_LOAD_MME_INSTRUCTION_PTR => {
-                if self.macro_uploads_logged < 4 {
+                if mme_trace() && self.macro_uploads_logged < 4 {
                     log::info!("maxwell3d: MME set_instruction_ptr = {:#x}", arg);
                 }
                 self.macro_engine.set_instruction_ptr(arg);
                 return;
             }
             REG_LOAD_MME_INSTRUCTION => {
-                if self.macro_uploads_logged < 4 {
+                if mme_trace() && self.macro_uploads_logged < 4 {
                     self.macro_uploads_logged += 1;
                     log::info!(
                         "maxwell3d: MME upload_instruction (first dword = {:#x})",
@@ -770,12 +783,16 @@ impl Maxwell3D {
                 return;
             }
             REG_LOAD_MME_START_ADDRESS_PTR => {
-                log::info!("maxwell3d: MME set_start_address_ptr = {:#x}", arg);
+                if mme_trace() {
+                    log::info!("maxwell3d: MME set_start_address_ptr = {:#x}", arg);
+                }
                 self.macro_engine.set_start_address_ptr(arg);
                 return;
             }
             REG_LOAD_MME_START_ADDRESS => {
-                log::info!("maxwell3d: MME bind_macro_entry = {:#x}", arg);
+                if mme_trace() {
+                    log::info!("maxwell3d: MME bind_macro_entry = {:#x}", arg);
+                }
                 self.macro_engine.bind_macro_entry(arg);
                 return;
             }
@@ -809,6 +826,10 @@ impl Maxwell3D {
                 _ => arg,
             }
         };
+
+        if !matches!(method, 0x35D | 0x35E | 0x585 | 0x586 | 0x5F7 | 0x5F8) {
+            self.draw_state_dirty_since_last_draw = true;
+        }
 
         if matches!(method, 0x35F | 0x4B3 | 0x4BA | 0x4C3) && wf_state_log() {
             log::warn!(
@@ -1047,6 +1068,8 @@ impl Maxwell3D {
                     index_gpu_va: 0,
                     index_format: 0,
                     index_first: 0,
+                    primitive_restart_enabled: self.regs.primitive_restart_enabled,
+                    primitive_restart_index: self.regs.primitive_restart_index,
                     point_size: 1.0,
                     rt: self.regs.rt,
                     rt_control: self.regs.rt_control,
@@ -1173,6 +1196,7 @@ impl Maxwell3D {
                 self.regs.draw_vertex_count = arg;
                 if arg > 0 {
                     self.regs.draw_count += 1;
+                    let legacy_instance_id = self.take_legacy_draw_instance_id();
                     self.push_draw(
                         self.regs.draw_topology,
                         self.regs.draw_first_vertex,
@@ -1181,6 +1205,7 @@ impl Maxwell3D {
                         0,
                         1,
                         self.regs.global_base_instance_index,
+                        legacy_instance_id,
                     );
                 }
             }
@@ -1203,13 +1228,17 @@ impl Maxwell3D {
                     topology,
                     first_instance
                 );
-                self.push_draw(topology, first, count, false, 0, 1, first_instance);
+                self.push_draw(topology, first, count, false, 0, 1, first_instance, None);
             }
 
             0x586 => {
                 self.regs.draw_topology = arg & 0xFFFF;
+                self.legacy_draw_instance_id = (arg >> 26) & 0x3;
+                self.legacy_draw_begin_pending = true;
             }
             0x585 => {}
+            0x591 => self.regs.primitive_restart_enabled = (arg & 1) != 0,
+            0x592 => self.regs.primitive_restart_index = arg,
             0x5F2 => self.regs.index_buffer_hi = arg,
             0x5F3 => self.regs.index_buffer_lo = arg,
             0x5F4 => self.regs.index_buffer_end_hi = arg,
@@ -1224,6 +1253,7 @@ impl Maxwell3D {
                     arg,
                     self.regs.draw_topology
                 );
+                let legacy_instance_id = self.take_legacy_draw_instance_id();
                 self.push_draw(
                     self.regs.draw_topology,
                     self.regs.global_base_vertex_index,
@@ -1232,6 +1262,7 @@ impl Maxwell3D {
                     arg,
                     1,
                     self.regs.global_base_instance_index,
+                    legacy_instance_id,
                 );
             }
 
@@ -1319,8 +1350,9 @@ impl Maxwell3D {
                         );
                     }
                 }
-                if valid && stage < 5 && slot < 16 {
-                    self.regs.cbuf_binds[stage][slot] = (cb_addr, cb_size);
+                if stage < 5 && slot < 16 {
+                    self.regs.cbuf_binds[stage][slot] =
+                        if valid { (cb_addr, cb_size) } else { (0, 0) };
                 }
             }
             0x982 => self.regs.tex_cb_index = arg & 0x1F,
@@ -1518,12 +1550,44 @@ impl Maxwell3D {
         index_count: u32,
         instance_count: u32,
         first_instance: u32,
+        legacy_instance_id: Option<u32>,
     ) {
         let instance_count = self
             .macro_draw_instance_count
             .take()
             .unwrap_or(instance_count)
             .max(1);
+        let index_gpu_va =
+            ((self.regs.index_buffer_hi as u64) << 32) | self.regs.index_buffer_lo as u64;
+
+        let is_first_or_subsequent = matches!(legacy_instance_id, Some(0 | 1));
+        let can_coalesce = legacy_instance_id == Some(1)
+            && self.last_draw_allows_continuation
+            && !self.draw_state_dirty_since_last_draw;
+        self.last_draw_allows_continuation = is_first_or_subsequent;
+        self.draw_state_dirty_since_last_draw = false;
+
+        if can_coalesce {
+            if let Some(previous) = self.pending_draws.last_mut() {
+                let same_draw = !previous.is_clear
+                    && previous.draw_texture.is_none()
+                    && previous.topology == topology
+                    && previous.first_vertex == first
+                    && previous.vertex_count == count
+                    && previous.first_instance == first_instance
+                    && previous.indexed == indexed
+                    && previous.index_count == index_count
+                    && previous.index_gpu_va == index_gpu_va
+                    && previous.index_format == self.regs.index_format
+                    && previous.index_first == self.regs.index_first;
+                if same_draw {
+                    previous.instance_count =
+                        previous.instance_count.saturating_add(instance_count);
+                    return;
+                }
+            }
+        }
+
         let tic_pool_gpu_va =
             ((self.regs.tic_pool_va_hi as u64) << 32) | self.regs.tic_pool_va_lo as u64;
         let tsc_pool_gpu_va =
@@ -1548,10 +1612,11 @@ impl Maxwell3D {
             first_instance,
             indexed,
             index_count,
-            index_gpu_va: ((self.regs.index_buffer_hi as u64) << 32)
-                | self.regs.index_buffer_lo as u64,
+            index_gpu_va,
             index_format: self.regs.index_format,
             index_first: self.regs.index_first,
+            primitive_restart_enabled: self.regs.primitive_restart_enabled,
+            primitive_restart_index: self.regs.primitive_restart_index,
             point_size,
             rt: self.regs.rt,
             rt_control: self.regs.rt_control,
@@ -1605,6 +1670,13 @@ impl Maxwell3D {
             clear_stencil: self.regs.clear_stencil,
             clear_mask: 0,
         });
+    }
+
+    fn take_legacy_draw_instance_id(&mut self) -> Option<u32> {
+        if !std::mem::replace(&mut self.legacy_draw_begin_pending, false) {
+            return None;
+        }
+        Some(self.legacy_draw_instance_id)
     }
 
     fn push_draw_texture(&mut self) {
@@ -1665,6 +1737,8 @@ impl Maxwell3D {
             index_gpu_va: 0,
             index_format: 0,
             index_first: 0,
+            primitive_restart_enabled: self.regs.primitive_restart_enabled,
+            primitive_restart_index: self.regs.primitive_restart_index,
             point_size: 1.0,
             rt: self.regs.rt,
             rt_control: self.regs.rt_control,
@@ -1826,6 +1900,21 @@ mod tests {
     }
 
     #[test]
+    fn constant_buffer_disable_clears_stale_binding() {
+        let mut engine = Maxwell3D::new();
+        let slot = 3usize;
+
+        engine.dispatch_method(0x8e0, 0x630, true);
+        engine.dispatch_method(0x8e1, 0x12, true);
+        engine.dispatch_method(0x8e2, 0x3456_7000, true);
+        engine.dispatch_method(0x904, ((slot as u32) << 4) | 1, true);
+        assert_eq!(engine.regs.cbuf_binds[0][slot], (0x12_3456_7000, 0x630));
+
+        engine.dispatch_method(0x904, (slot as u32) << 4, true);
+        assert_eq!(engine.regs.cbuf_binds[0][slot], (0, 0));
+    }
+
+    #[test]
     fn vertex_stream_format_preserves_enable_bit() {
         let mut engine = Maxwell3D::new();
 
@@ -1845,6 +1934,21 @@ mod tests {
         engine.dispatch_method(0x35f, 1, true);
         assert_eq!(engine.regs.draw_first_vertex, 17);
         assert_eq!(engine.regs.depth_mode, 1);
+    }
+
+    #[test]
+    fn primitive_restart_registers_are_snapshotted_by_draws() {
+        let mut engine = Maxwell3D::new();
+        engine.dispatch_method(0x591, 1, true);
+        engine.dispatch_method(0x592, 0x1234_5678, true);
+        engine.dispatch_method(0x586, 5, true);
+        engine.dispatch_method(0x5f8, 3, true);
+
+        assert!(engine.regs.primitive_restart_enabled);
+        assert_eq!(engine.regs.primitive_restart_index, 0x1234_5678);
+        let draw = engine.pending_draws.last().unwrap();
+        assert!(draw.primitive_restart_enabled);
+        assert_eq!(draw.primitive_restart_index, 0x1234_5678);
     }
 
     #[test]
@@ -1901,5 +2005,85 @@ mod tests {
         assert!(clear.is_clear);
         assert_eq!(clear.clear_stencil, 0x6d);
         assert_eq!(clear.clear_mask, 0x2);
+    }
+
+    #[test]
+    fn normal_draws_remain_separate_without_instance_continuation() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x35d, 4, true);
+        engine.dispatch_method(0x35e, 6, true);
+        engine.dispatch_method(0x35e, 6, true);
+
+        assert_eq!(engine.pending_draws.len(), 2);
+        assert_eq!(engine.pending_draws[0].instance_count, 1);
+        assert_eq!(engine.pending_draws[1].instance_count, 1);
+    }
+
+    #[test]
+    fn legacy_nonindexed_continuations_accumulate_instances() {
+        let mut engine = Maxwell3D::new();
+
+        for instance_id in [0, 1, 1] {
+            engine.dispatch_method(0x586, 5 | (instance_id << 26), true);
+            engine.dispatch_method(0x35d, 4, true);
+            engine.dispatch_method(0x35e, 6, true);
+            engine.dispatch_method(0x585, 0, true);
+        }
+
+        assert_eq!(engine.pending_draws.len(), 1);
+        let draw = &engine.pending_draws[0];
+        assert!(!draw.indexed);
+        assert_eq!(draw.topology, 5);
+        assert_eq!(draw.first_vertex, 4);
+        assert_eq!(draw.vertex_count, 6);
+        assert_eq!(draw.instance_count, 3);
+    }
+
+    #[test]
+    fn legacy_indexed_continuations_accumulate_instances() {
+        let mut engine = Maxwell3D::new();
+        engine.dispatch_method(0x5f2, 0, true);
+        engine.dispatch_method(0x5f3, 0x1234_0000, true);
+        engine.dispatch_method(0x5f6, 2, true);
+
+        for instance_id in [0, 1] {
+            engine.dispatch_method(0x586, 4 | (instance_id << 26), true);
+            engine.dispatch_method(0x5f7, 7, true);
+            engine.dispatch_method(0x5f8, 12, true);
+            engine.dispatch_method(0x585, 0, true);
+        }
+
+        assert_eq!(engine.pending_draws.len(), 1);
+        let draw = &engine.pending_draws[0];
+        assert!(draw.indexed);
+        assert_eq!(draw.topology, 4);
+        assert_eq!(draw.index_first, 7);
+        assert_eq!(draw.index_count, 12);
+        assert_eq!(draw.index_gpu_va, 0x1234_0000);
+        assert_eq!(draw.index_format, 2);
+        assert_eq!(draw.instance_count, 2);
+    }
+
+    #[test]
+    fn legacy_continuation_stops_at_state_change() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x586, 5, true);
+        engine.dispatch_method(0x35d, 4, true);
+        engine.dispatch_method(0x35e, 6, true);
+        engine.dispatch_method(0x585, 0, true);
+
+        engine.dispatch_method(0x35f, 1, true);
+        engine.dispatch_method(0x586, 5 | (1 << 26), true);
+        engine.dispatch_method(0x35d, 4, true);
+        engine.dispatch_method(0x35e, 6, true);
+        engine.dispatch_method(0x585, 0, true);
+
+        assert_eq!(engine.pending_draws.len(), 2);
+        assert_eq!(engine.pending_draws[0].instance_count, 1);
+        assert_eq!(engine.pending_draws[0].depth_mode, 0);
+        assert_eq!(engine.pending_draws[1].instance_count, 1);
+        assert_eq!(engine.pending_draws[1].depth_mode, 1);
     }
 }

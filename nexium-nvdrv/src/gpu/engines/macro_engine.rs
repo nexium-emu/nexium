@@ -24,76 +24,190 @@ const REG_GLOBAL_BASE_INSTANCE: u32 = 0x50E;
 const REG_VERTEX_FIRST: u32 = 0x35D;
 const REG_VERTEX_COUNT: u32 = 0x35E;
 const REG_DRAW_BEGIN: u32 = 0x586;
+const REG_DRAW_END: u32 = 0x585;
 const REG_INDEX_FIRST: u32 = 0x5F7;
 const REG_INDEX_COUNT: u32 = 0x5F8;
 const REG_DRAW_INSTANCE_COUNT: u32 = 0xD1B;
+const REG_VERTEX_ID_BASE: u32 = 0x446;
+const REG_VERTEX_BUFFER_INSTANCE: u32 = 0x573;
 const REG_CB_SIZE: u32 = 0x8E0;
 const REG_CB_ADDR_HI: u32 = 0x8E1;
 const REG_CB_ADDR_LO: u32 = 0x8E2;
 const REG_CB_OFFSET: u32 = 0x8E3;
+const REG_CB_DATA: u32 = 0x8E4;
+const REG_MME_SCRATCH_DRAW_TOPOLOGY: u32 = 0xD03;
+const REG_MME_SCRATCH_DRAW_ARGUMENT: u32 = 0xD06;
+const REG_MME_SCRATCH_VERTEX_BUFFER_MASK: u32 = 0xD07;
+const REG_MME_SCRATCH_DRAW_BASE: u32 = 0xD1B;
+const REG_MME_SCRATCH_TOPOLOGY: u32 = 0xD1C;
+const REG_MME_SCRATCH_VERTEX_BUFFER: u32 = 0xD1D;
 const REG_UPLOAD_LINE_LENGTH: u32 = 0x60;
 const REG_UPLOAD_LINE_COUNT: u32 = 0x61;
 const REG_UPLOAD_DST_HI: u32 = 0x62;
 const REG_UPLOAD_DST_LO: u32 = 0x63;
 const REG_LAUNCH_DMA: u32 = 0x6C;
 
-fn hle_macro(hash: u64, params: &[u32], reg_reader: &dyn Fn(u32) -> u32) -> Option<MacroOutput> {
+#[derive(Clone, Copy)]
+enum HleMacro {
+    DrawArrays { base_instance: bool },
+    DrawIndexed { base_instance: bool },
+    DrawInstancedWithVbMask { indexed: bool },
+    ConstantBuffer { size: u32 },
+    Upload,
+}
+
+fn hle_macro_kind(hash: u64) -> Option<HleMacro> {
+    match hash {
+        0x0D61_FC9F_AAC9_FCAD => Some(HleMacro::DrawArrays {
+            base_instance: false,
+        }),
+        0x8A4D_173E_B99A_8603 => Some(HleMacro::DrawArrays {
+            base_instance: true,
+        }),
+        0x771B_B18C_6244_4DA0 => Some(HleMacro::DrawIndexed {
+            base_instance: false,
+        }),
+        0x0217_9201_0048_8FF7 => Some(HleMacro::DrawIndexed {
+            base_instance: true,
+        }),
+        0x62AB_88C4_D2DF_58E3 => Some(HleMacro::DrawInstancedWithVbMask { indexed: false }),
+        0xD00E_2028_0475_8F38 => Some(HleMacro::DrawInstancedWithVbMask { indexed: true }),
+        0x6C97_861D_891E_DF7E => Some(HleMacro::ConstantBuffer { size: 0x5F00 }),
+        0xD246_FDDF_3A61_73D7 => Some(HleMacro::ConstantBuffer { size: 0x7000 }),
+        0xEE4D_0004_BEC8_ECF4 => Some(HleMacro::Upload),
+        _ => None,
+    }
+}
+
+fn hle_macro(
+    kind: HleMacro,
+    params: &[u32],
+    reg_reader: &dyn Fn(u32) -> u32,
+) -> Option<MacroOutput> {
     let p = |i: usize| params.get(i).copied().unwrap_or(0);
     let macro_instance_count = || (reg_reader(REG_DRAW_INSTANCE_COUNT) & p(2)).max(1);
     let mut out = MacroOutput::default();
-    match hash {
-        0x0D61_FC9F_AAC9_FCAD | 0x8A4D_173E_B99A_8603 => {
+    match kind {
+        HleMacro::DrawArrays { base_instance } => {
             let topology = p(0) & 0xFFFF;
             let vertex_count = p(1);
             let vertex_first = p(3);
             out.draw_instance_count = Some(macro_instance_count());
-            if hash == 0x8A4D_173E_B99A_8603 {
+            if base_instance {
                 out.writes.push((REG_GLOBAL_BASE_INSTANCE, p(4)));
             }
             out.writes.push((REG_DRAW_BEGIN, topology));
             out.writes.push((REG_VERTEX_FIRST, vertex_first));
             out.writes.push((REG_VERTEX_COUNT, vertex_count));
-            if hash == 0x8A4D_173E_B99A_8603 {
+            if base_instance {
                 out.writes.push((REG_GLOBAL_BASE_INSTANCE, 0));
             }
         }
-        0x771B_B18C_6244_4DA0 | 0x0217_9201_0048_8FF7 => {
+        HleMacro::DrawIndexed { base_instance } => {
             let topology = p(0) & 0xFFFF;
             let index_count = p(1);
             let index_first = p(3);
             let base_vertex = p(4);
             out.draw_instance_count = Some(macro_instance_count());
             out.writes.push((REG_GLOBAL_BASE_VERTEX, base_vertex));
-            if hash == 0x0217_9201_0048_8FF7 {
+            if base_instance {
                 out.writes.push((REG_GLOBAL_BASE_INSTANCE, p(5)));
             }
             out.writes.push((REG_DRAW_BEGIN, topology));
             out.writes.push((REG_INDEX_FIRST, index_first));
             out.writes.push((REG_INDEX_COUNT, index_count));
             out.writes.push((REG_GLOBAL_BASE_VERTEX, 0));
-            if hash == 0x0217_9201_0048_8FF7 {
+            if base_instance {
                 out.writes.push((REG_GLOBAL_BASE_INSTANCE, 0));
             }
         }
-        0x6C97_861D_891E_DF7E | 0xD246_FDDF_3A61_73D7 => {
-            let size = if hash == 0x6C97_861D_891E_DF7E {
-                0x5F00
+        HleMacro::DrawInstancedWithVbMask { indexed } => {
+            let vertex_buffer_mask = reg_reader(REG_MME_SCRATCH_VERTEX_BUFFER_MASK);
+            let group_count = if vertex_buffer_mask == 0 {
+                1
             } else {
-                0x7000
+                vertex_buffer_mask.count_ones()
             };
+            let draw_count = u64::from(p(2)) * u64::from(group_count);
+
+            if draw_count > 128 {
+                return None;
+            }
+
+            let extra_group_writes = if vertex_buffer_mask == 0 {
+                0
+            } else {
+                group_count as usize * 4
+            };
+            out.writes
+                .reserve(15 + extra_group_writes + draw_count as usize * 4);
+
+            let base_vertex = if indexed { p(4) } else { 0 };
+            let base_instance = if indexed { p(5) } else { p(4) };
+            let draw_base = if indexed { p(4) } else { p(3) };
+
+            out.writes.push((REG_MME_SCRATCH_DRAW_BASE, draw_base));
+            out.writes.push((REG_CB_OFFSET, 0));
+            out.writes.push((REG_CB_DATA, draw_base));
+            out.writes.push((REG_GLOBAL_BASE_INSTANCE, base_instance));
+            out.writes.push((REG_CB_OFFSET, 4));
+            out.writes.push((REG_CB_DATA, base_instance));
+            out.writes.push((REG_MME_SCRATCH_TOPOLOGY, p(0)));
+            out.writes.push((REG_CB_OFFSET, 8));
+            out.writes.push((REG_CB_DATA, p(0)));
+            out.writes.push((REG_MME_SCRATCH_VERTEX_BUFFER, 0));
+            out.writes.push((REG_CB_OFFSET, 12));
+            out.writes.push((REG_CB_DATA, 0));
+            out.writes.push((REG_GLOBAL_BASE_VERTEX, base_vertex));
+            out.writes.push((REG_VERTEX_ID_BASE, base_vertex));
+            out.writes.push((REG_MME_SCRATCH_DRAW_ARGUMENT, p(0)));
+
+            let draw_topology = reg_reader(REG_MME_SCRATCH_DRAW_TOPOLOGY);
+            let push_draws = |out: &mut MacroOutput| {
+                let mut topology = draw_topology;
+                for _ in 0..p(2) {
+                    out.writes.push((REG_DRAW_BEGIN, topology));
+                    if indexed {
+                        out.writes.push((REG_INDEX_FIRST, p(3)));
+                        out.writes.push((REG_INDEX_COUNT, p(1)));
+                    } else {
+                        out.writes.push((REG_VERTEX_FIRST, p(3)));
+                        out.writes.push((REG_VERTEX_COUNT, p(1)));
+                    }
+                    out.writes.push((REG_DRAW_END, 0));
+                    topology = (topology & !(3 << 26)) | (1 << 26);
+                }
+            };
+
+            if vertex_buffer_mask == 0 {
+                push_draws(&mut out);
+            } else {
+                for vertex_buffer in 0..32 {
+                    if vertex_buffer_mask & (1 << vertex_buffer) == 0 {
+                        continue;
+                    }
+                    out.writes
+                        .push((REG_MME_SCRATCH_VERTEX_BUFFER, vertex_buffer));
+                    out.writes.push((REG_CB_OFFSET, 12));
+                    out.writes.push((REG_CB_DATA, vertex_buffer));
+                    out.writes.push((REG_VERTEX_BUFFER_INSTANCE, vertex_buffer));
+                    push_draws(&mut out);
+                }
+            }
+        }
+        HleMacro::ConstantBuffer { size } => {
             out.writes.push((REG_CB_SIZE, size));
             out.writes.push((REG_CB_ADDR_HI, p(0)));
             out.writes.push((REG_CB_ADDR_LO, p(1)));
             out.writes.push((REG_CB_OFFSET, 0));
         }
-        0xEE4D_0004_BEC8_ECF4 => {
+        HleMacro::Upload => {
             out.writes.push((REG_UPLOAD_LINE_LENGTH, p(2)));
             out.writes.push((REG_UPLOAD_LINE_COUNT, 1));
             out.writes.push((REG_UPLOAD_DST_HI, p(0)));
             out.writes.push((REG_UPLOAD_DST_LO, p(1)));
             out.writes.push((REG_LAUNCH_DMA, 0x1011));
         }
-        _ => return None,
     }
     Some(out)
 }
@@ -259,6 +373,12 @@ fn mme_forensics() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_MME_FORENSICS").is_some())
 }
 
+fn mme_full_code() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_MME_FULL_CODE").is_some())
+}
+
 fn is_hi_addr_reg(m: u32) -> bool {
     m == 0x582
         || m == 0x6c0
@@ -297,13 +417,30 @@ fn forensic_report(out: &MacroOutput, params: &[u32]) {
 
 pub struct MacroEngine {
     uploaded_code: HashMap<u32, Vec<u32>>,
-    compiled: HashMap<u32, Vec<u32>>,
+    compiled: HashMap<u32, CompiledMacro>,
     macro_positions: [u32; NUM_MACRO_POSITIONS],
     instruction_ptr: u32,
     start_address_ptr: u32,
     executing_macro: u32,
     pending_params: Vec<u32>,
     seen_hashes: HashSet<u64>,
+}
+
+struct CompiledMacro {
+    code: Vec<u32>,
+    hash: u64,
+    hle: Option<HleMacro>,
+}
+
+impl CompiledMacro {
+    fn new(code: Vec<u32>) -> Self {
+        let hash = macro_hash(&code);
+        Self {
+            code,
+            hash,
+            hle: hle_macro_kind(hash),
+        }
+    }
 }
 
 impl MacroEngine {
@@ -363,20 +500,29 @@ impl MacroEngine {
         self.executing_macro = 0;
         let entry = ((trigger - MACRO_REGISTERS_START) >> 1) as usize % NUM_MACRO_POSITIONS;
         let offset = self.macro_positions[entry];
-        let params = std::mem::take(&mut self.pending_params);
-        let code = self.resolve_code(offset);
-        if code.is_empty() {
+        self.resolve_code(offset);
+        let Some(compiled) = self.compiled.get(&offset) else {
             log::trace!(
                 "MME: trigger {:#x} entry={} offset={} - no code",
                 trigger,
                 entry,
                 offset
             );
+            self.pending_params.clear();
             return Some(MacroOutput::default());
-        }
-        let hash = macro_hash(&code);
-        let hle = hle_macro(hash, &params, reg_reader);
-        if self.seen_hashes.insert(hash) {
+        };
+        let params = self.pending_params.as_slice();
+        let code = compiled.code.as_slice();
+        let hash = compiled.hash;
+        let hle = compiled
+            .hle
+            .and_then(|kind| hle_macro(kind, params, reg_reader));
+        if mme_forensics() && self.seen_hashes.insert(hash) {
+            let logged_code = if mme_full_code() {
+                code
+            } else {
+                &code[..code.len().min(28)]
+            };
             log::info!(
                 "MME: macro entry={} offset={} hash={:#018x} len={} params={} hle={} code={:08x?}",
                 entry,
@@ -385,7 +531,7 @@ impl MacroEngine {
                 code.len(),
                 params.len(),
                 hle.is_some(),
-                &code[..code.len().min(28)]
+                logged_code
             );
         }
         let mut out = if let Some(mut out) = hle {
@@ -404,18 +550,18 @@ impl MacroEngine {
         };
         out.hash = hash;
         out.entry = entry as u32;
-        forensic_report(&out, &params);
+        forensic_report(&out, params);
+        self.pending_params.clear();
         Some(out)
     }
 
-    fn resolve_code(&mut self, offset: u32) -> Vec<u32> {
-        if let Some(c) = self.compiled.get(&offset) {
-            return c.clone();
+    fn resolve_code(&mut self, offset: u32) {
+        if self.compiled.contains_key(&offset) {
+            return;
         }
         if let Some(c) = self.uploaded_code.get(&offset) {
-            let v = c.clone();
-            self.compiled.insert(offset, v.clone());
-            return v;
+            self.compiled.insert(offset, CompiledMacro::new(c.clone()));
+            return;
         }
         let mut found: Option<Vec<u32>> = None;
         for (&base, code) in self.uploaded_code.iter() {
@@ -427,9 +573,8 @@ impl MacroEngine {
         }
         let v = found.unwrap_or_default();
         if !v.is_empty() {
-            self.compiled.insert(offset, v.clone());
+            self.compiled.insert(offset, CompiledMacro::new(v));
         }
-        v
     }
 }
 
@@ -686,5 +831,393 @@ impl<'a> Interpreter<'a> {
             return false;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DRAW_ARRAYS_INSTANCED_WITH_VB_MASK_CODE: [u32; 85] = [
+        0x0000_0200,
+        0x0000_0300,
+        0x0000_0400,
+        0x0000_0500,
+        0x0746_C021,
+        0x0000_2040,
+        0x0638_C021,
+        0x0000_0040,
+        0x0639_0021,
+        0x0000_2040,
+        0x0543_8021,
+        0x0000_2840,
+        0x0638_C021,
+        0x0001_0641,
+        0x0639_0021,
+        0x0000_2840,
+        0x0747_0021,
+        0x0000_0840,
+        0x0638_C021,
+        0x0002_0641,
+        0x0639_0021,
+        0x0000_0840,
+        0x0747_4021,
+        0x0000_0040,
+        0x0638_C021,
+        0x0003_0641,
+        0x0639_0021,
+        0x0000_0040,
+        0x0543_4021,
+        0x0000_0040,
+        0x0511_8021,
+        0x0000_0040,
+        0x0741_8021,
+        0x0000_0840,
+        0x0341_C115,
+        0x0003_C837,
+        0x0340_C115,
+        0x0000_1D10,
+        0x0002_C027,
+        0x0561_8021,
+        0x0000_0840,
+        0x04D7_4021,
+        0x0000_2040,
+        0x0000_1040,
+        0x0561_4021,
+        0x0000_0040,
+        0x0000_4611,
+        0xD081_8912,
+        0xFFFF_ED11,
+        0xFFFD_A837,
+        0x0341_C115,
+        0x0007_C827,
+        0x0000_0110,
+        0x0006_C027,
+        0x0341_C515,
+        0x0041_4E13,
+        0x0005_F027,
+        0x0747_4021,
+        0x0000_0840,
+        0x0638_C021,
+        0x0003_0541,
+        0x0639_0021,
+        0x0000_0840,
+        0x055C_C021,
+        0x0000_0840,
+        0x0340_C515,
+        0x0000_1E10,
+        0x0002_C027,
+        0x0561_8021,
+        0x0000_2840,
+        0x04D7_4021,
+        0x0000_2040,
+        0x0000_1040,
+        0x0561_4021,
+        0x0000_0040,
+        0x0000_4711,
+        0xD081_ED12,
+        0xFFFF_F611,
+        0xFFFD_B037,
+        0x0000_4911,
+        0xFFF8_0D11,
+        0xFFF9_6837,
+        0x0341_8115,
+        0x0000_0090,
+        0x0000_0010,
+    ];
+
+    const DRAW_INDEXED_INSTANCED_WITH_VB_MASK_CODE: [u32; 86] = [
+        0x0000_0200,
+        0x0000_0300,
+        0x0000_0400,
+        0x0000_0500,
+        0x0000_0600,
+        0x0746_C021,
+        0x0000_2840,
+        0x0638_C021,
+        0x0000_0040,
+        0x0639_0021,
+        0x0000_2840,
+        0x0543_8021,
+        0x0000_3040,
+        0x0638_C021,
+        0x0001_0741,
+        0x0639_0021,
+        0x0000_3040,
+        0x0747_0021,
+        0x0000_0840,
+        0x0638_C021,
+        0x0002_0741,
+        0x0639_0021,
+        0x0000_0840,
+        0x0747_4021,
+        0x0000_0040,
+        0x0638_C021,
+        0x0003_0741,
+        0x0639_0021,
+        0x0000_0040,
+        0x0543_4021,
+        0x0000_2840,
+        0x0511_8021,
+        0x0000_2840,
+        0x0741_8021,
+        0x0000_0840,
+        0x0341_C115,
+        0x0003_C837,
+        0x0340_C115,
+        0x0000_1D10,
+        0x0002_C027,
+        0x0561_8021,
+        0x0000_0840,
+        0x057D_C021,
+        0x0000_2040,
+        0x0000_1040,
+        0x0561_4021,
+        0x0000_0040,
+        0x0000_4611,
+        0xD081_8912,
+        0xFFFF_ED11,
+        0xFFFD_A837,
+        0x0341_C115,
+        0x0007_C827,
+        0x0000_0110,
+        0x0006_C027,
+        0x0341_C515,
+        0x0041_4E13,
+        0x0005_F027,
+        0x0747_4021,
+        0x0000_0840,
+        0x0638_C021,
+        0x0003_0541,
+        0x0639_0021,
+        0x0000_0840,
+        0x055C_C021,
+        0x0000_0840,
+        0x0340_C515,
+        0x0000_1E10,
+        0x0002_C027,
+        0x0561_8021,
+        0x0000_2840,
+        0x057D_C021,
+        0x0000_2040,
+        0x0000_1040,
+        0x0561_4021,
+        0x0000_0040,
+        0x0000_4711,
+        0xD081_ED12,
+        0xFFFF_F611,
+        0xFFFD_B037,
+        0x0000_4911,
+        0xFFF8_0D11,
+        0xFFF9_6837,
+        0x0341_8115,
+        0x0000_0090,
+        0x0000_0010,
+    ];
+
+    fn upload_entry_11(engine: &mut MacroEngine, code: &[u32]) {
+        engine.set_instruction_ptr(0);
+        for &word in code {
+            engine.upload_instruction(word);
+        }
+        engine.set_start_address_ptr(11);
+        engine.bind_macro_entry(0);
+    }
+
+    fn invoke_entry_11(engine: &mut MacroEngine) -> MacroOutput {
+        let mut output = None;
+        for param in 0..6u32 {
+            output = engine.on_macro_method(0xE17, param, param == 5, &|_| 0);
+        }
+        output.expect("the final parameter must execute the macro")
+    }
+
+    #[test]
+    fn compiled_macro_and_parameter_storage_are_reused() {
+        let mut engine = MacroEngine::new();
+        let code = [0x0000_0090, 0x0000_0010, 0xDEAD_BEEF];
+        upload_entry_11(&mut engine, &code);
+
+        let first = invoke_entry_11(&mut engine);
+        let compiled = engine.compiled.get(&0).unwrap();
+        let code_ptr = compiled.code.as_ptr();
+        let params_capacity = engine.pending_params.capacity();
+        assert_eq!(first.hash, macro_hash(&code));
+        assert_eq!(compiled.hash, first.hash);
+        assert!(compiled.hle.is_none());
+        assert!(params_capacity >= 6);
+
+        let second = invoke_entry_11(&mut engine);
+        let compiled = engine.compiled.get(&0).unwrap();
+        assert_eq!(compiled.code.as_ptr(), code_ptr);
+        assert_eq!(second.hash, first.hash);
+        assert_eq!(engine.pending_params.capacity(), params_capacity);
+        assert!(engine.pending_params.is_empty());
+    }
+
+    #[test]
+    fn replacing_uploaded_code_invalidates_compiled_metadata() {
+        let mut engine = MacroEngine::new();
+        let original = [0x0000_0090, 0x0000_0010];
+        upload_entry_11(&mut engine, &original);
+        let original_hash = invoke_entry_11(&mut engine).hash;
+
+        let replacement = [0x0000_0090, 0x0000_0010, 0x1234_5678];
+        upload_entry_11(&mut engine, &replacement);
+        assert!(engine.compiled.is_empty());
+
+        let replacement_hash = invoke_entry_11(&mut engine).hash;
+        assert_eq!(replacement_hash, macro_hash(&replacement));
+        assert_ne!(replacement_hash, original_hash);
+    }
+
+    fn assert_draw_instanced_with_vb_mask_hle_matches_interpreter(
+        code: &[u32],
+        expected_hash: u64,
+        indexed: bool,
+        param_count: usize,
+        mut random: u32,
+    ) {
+        let hash = macro_hash(code);
+        assert_eq!(hash, expected_hash);
+        let kind =
+            hle_macro_kind(hash).expect("the captured macro must have an HLE implementation");
+        let HleMacro::DrawInstancedWithVbMask {
+            indexed: actual_indexed,
+        } = kind
+        else {
+            panic!("captured draw macro resolved to the wrong HLE kind");
+        };
+        assert_eq!(actual_indexed, indexed);
+
+        let mut next_random = || {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            random
+        };
+
+        for case in 0..256u32 {
+            let params = [
+                next_random(),
+                next_random(),
+                next_random() % 4,
+                next_random(),
+                next_random(),
+                next_random(),
+            ];
+            let params = &params[..param_count];
+            let vertex_buffer_mask = match case % 8 {
+                0 => 0,
+                1 => 1,
+                2 => 1 << 31,
+                3 => u32::MAX,
+                _ => next_random(),
+            };
+            let draw_topology = next_random();
+            let reg_reader = |reg| match reg {
+                REG_MME_SCRATCH_DRAW_TOPOLOGY => draw_topology,
+                REG_MME_SCRATCH_VERTEX_BUFFER_MASK => vertex_buffer_mask,
+                _ => 0xC001_C0DE,
+            };
+
+            let mut interpreter = Interpreter::new(code, params, &reg_reader);
+            interpreter.run();
+            let hle = hle_macro(kind, params, &reg_reader)
+                .expect("bounded randomized draws must use the HLE path");
+
+            assert_eq!(
+                hle.writes, interpreter.writes,
+                "write mismatch for hash {hash:#018x}, case {case}, params={params:08x?}, mask={vertex_buffer_mask:#010x}, topology={draw_topology:#010x}"
+            );
+            assert_eq!(hle.draw_instance_count, None);
+        }
+
+        let oversized_params = [0, 1, 129, 0, 0, 0];
+        assert!(hle_macro(kind, &oversized_params[..param_count], &|_| 0).is_none());
+    }
+
+    #[test]
+    fn draw_arrays_instanced_with_vb_mask_hle_matches_interpreter() {
+        assert_draw_instanced_with_vb_mask_hle_matches_interpreter(
+            &DRAW_ARRAYS_INSTANCED_WITH_VB_MASK_CODE,
+            0x62AB_88C4_D2DF_58E3,
+            false,
+            5,
+            0x51A2_7E10,
+        );
+    }
+
+    #[test]
+    fn draw_indexed_instanced_with_vb_mask_hle_matches_interpreter() {
+        assert_draw_instanced_with_vb_mask_hle_matches_interpreter(
+            &DRAW_INDEXED_INSTANCED_WITH_VB_MASK_CODE,
+            0xD00E_2028_0475_8F38,
+            true,
+            6,
+            0xA5A5_1234,
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn benchmark_draw_instanced_with_vb_mask_hle() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        fn measure(
+            code: &[u32],
+            params: &[u32],
+            kind: HleMacro,
+            iterations: u32,
+        ) -> (Duration, Duration) {
+            let reg_reader = |reg| match reg {
+                REG_MME_SCRATCH_DRAW_TOPOLOGY => 3,
+                REG_MME_SCRATCH_VERTEX_BUFFER_MASK => 0,
+                _ => 0,
+            };
+
+            let interpreter_start = Instant::now();
+            for _ in 0..iterations {
+                let mut interpreter =
+                    Interpreter::new(black_box(code), black_box(params), &reg_reader);
+                interpreter.run();
+                black_box(interpreter.writes);
+            }
+            let interpreter_elapsed = interpreter_start.elapsed();
+
+            let hle_start = Instant::now();
+            for _ in 0..iterations {
+                let output = hle_macro(kind, black_box(params), &reg_reader).unwrap();
+                black_box(output.writes);
+            }
+
+            (interpreter_elapsed, hle_start.elapsed())
+        }
+
+        let iterations = 100_000;
+        let arrays_params = [3, 6, 1, 0, 0];
+        let indexed_params = [3, 6, 1, 0, 0, 0];
+        for (name, code, params) in [
+            (
+                "arrays-instanced",
+                DRAW_ARRAYS_INSTANCED_WITH_VB_MASK_CODE.as_slice(),
+                arrays_params.as_slice(),
+            ),
+            (
+                "indexed-instanced",
+                DRAW_INDEXED_INSTANCED_WITH_VB_MASK_CODE.as_slice(),
+                indexed_params.as_slice(),
+            ),
+        ] {
+            let kind = hle_macro_kind(macro_hash(code)).unwrap();
+            let (interpreter_elapsed, hle_elapsed) = measure(code, params, kind, iterations);
+            eprintln!(
+                "{name} macro: interpreter={:.1} ns/call, hle={:.1} ns/call, speedup={:.2}x",
+                interpreter_elapsed.as_nanos() as f64 / iterations as f64,
+                hle_elapsed.as_nanos() as f64 / iterations as f64,
+                interpreter_elapsed.as_secs_f64() / hle_elapsed.as_secs_f64()
+            );
+        }
     }
 }
