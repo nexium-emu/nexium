@@ -19,6 +19,7 @@ pub struct PipelineKey {
     pub vs_hash: u64,
     pub fs_hash: u64,
     pub topology: u32,
+    pub primitive_restart_enable: bool,
     pub color_format: u32,
     pub color_formats: [u32; 8],
     pub color_attachment_count: u32,
@@ -38,12 +39,17 @@ pub struct PipelineKey {
     pub color_write_mask: u32,
 }
 
-const SPEC_VERSION: u32 = 31;
+const SPEC_VERSION: u32 = 34;
+const CACHE_SAVE_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const KNOWN_DRIVER_HOSTILE_PIPELINES: &[(u64, u64)] =
     &[(0x59b9_0e74_4b2a_7537, 0xe505_d075_601e_e633)];
 
 pub(crate) fn known_driver_hostile_pipeline(vs_hash: u64, fs_hash: u64) -> bool {
     KNOWN_DRIVER_HOSTILE_PIPELINES.contains(&(vs_hash, fs_hash))
+}
+
+fn cache_save_due(dirty: bool, specs_dirty: bool, idle: std::time::Duration) -> bool {
+    (dirty || specs_dirty) && idle >= CACHE_SAVE_IDLE_INTERVAL
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -176,6 +182,7 @@ pub fn spec_to_request(
         binding_divisors,
         attrs,
         topology: vk::PrimitiveTopology::from_raw(spec.topology),
+        primitive_restart_enable: spec.key.primitive_restart_enable,
         color_formats: spec_color_formats(spec),
         depth_format: vk::Format::from_raw(spec.depth_format),
         has_depth: spec.has_depth,
@@ -220,6 +227,7 @@ pub struct PipelineBuildRequest {
     pub binding_divisors: Vec<vk::VertexInputBindingDivisorDescriptionKHR>,
     pub attrs: Vec<vk::VertexInputAttributeDescription>,
     pub topology: vk::PrimitiveTopology,
+    pub primitive_restart_enable: bool,
     pub color_formats: Vec<vk::Format>,
     pub depth_format: vk::Format,
     pub has_depth: bool,
@@ -330,7 +338,11 @@ pub fn build_graphics_pipeline(
     let ia_state = vk::PipelineInputAssemblyStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         topology: req.topology,
-        primitive_restart_enable: vk::FALSE,
+        primitive_restart_enable: if req.primitive_restart_enable {
+            vk::TRUE
+        } else {
+            vk::FALSE
+        },
         p_next: std::ptr::null(),
         flags: Default::default(),
         _marker: std::marker::PhantomData,
@@ -595,7 +607,7 @@ pub struct PipelineCache {
     pub layout: vk::PipelineLayout,
     pub vk_cache: vk::PipelineCache,
     dirty: bool,
-    last_save: std::time::Instant,
+    last_change: std::time::Instant,
     last_saved_len: usize,
     save_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     worker: Option<CompileWorker>,
@@ -798,7 +810,7 @@ impl PipelineCache {
             layout,
             vk_cache,
             dirty: false,
-            last_save: std::time::Instant::now(),
+            last_change: std::time::Instant::now(),
             last_saved_len: initial.len(),
             save_tx: Some(save_tx),
             worker,
@@ -814,6 +826,7 @@ impl PipelineCache {
     pub fn register_spec(&mut self, spec: PipelineSpec) {
         if self.specs.insert(spec.key, spec).is_none() {
             self.specs_dirty = true;
+            self.last_change = std::time::Instant::now();
         }
     }
 
@@ -875,6 +888,7 @@ impl PipelineCache {
             } else {
                 self.pipelines.insert(key, pipe);
                 self.dirty = true;
+                self.last_change = std::time::Instant::now();
             }
         }
     }
@@ -901,13 +915,10 @@ impl PipelineCache {
     }
 
     pub fn maybe_save(&mut self, device: &ash::Device) {
-        if (self.dirty || self.specs_dirty)
-            && self.last_save.elapsed() >= std::time::Duration::from_secs(4)
-        {
+        if cache_save_due(self.dirty, self.specs_dirty, self.last_change.elapsed()) {
             self.save(device);
             self.save_specs();
             self.dirty = false;
-            self.last_save = std::time::Instant::now();
         }
     }
 
@@ -949,6 +960,7 @@ impl PipelineCache {
     pub fn insert(&mut self, key: PipelineKey, pipeline: vk::Pipeline) {
         self.pipelines.insert(key, pipeline);
         self.dirty = true;
+        self.last_change = std::time::Instant::now();
     }
 
     pub fn clear(&mut self, device: &ash::Device) {
@@ -1004,7 +1016,7 @@ impl Drop for PipelineCache {
 
 #[cfg(test)]
 mod tests {
-    use super::known_driver_hostile_pipeline;
+    use super::{cache_save_due, known_driver_hostile_pipeline, CACHE_SAVE_IDLE_INTERVAL};
 
     #[test]
     fn driver_hostile_pipeline_guard_is_pair_specific() {
@@ -1020,5 +1032,17 @@ mod tests {
             0x59b9_0e74_4b2a_7536,
             0xe505_d075_601e_e633
         ));
+    }
+
+    #[test]
+    fn cache_save_waits_for_idle_interval() {
+        assert!(!cache_save_due(
+            true,
+            false,
+            CACHE_SAVE_IDLE_INTERVAL - std::time::Duration::from_nanos(1)
+        ));
+        assert!(cache_save_due(true, false, CACHE_SAVE_IDLE_INTERVAL));
+        assert!(cache_save_due(false, true, CACHE_SAVE_IDLE_INTERVAL));
+        assert!(!cache_save_due(false, false, CACHE_SAVE_IDLE_INTERVAL));
     }
 }

@@ -64,6 +64,23 @@ pub struct DrawState {
     pub indexed: bool,
 }
 
+pub fn primitive_restart_fixed_index(index_type: vk::IndexType) -> Option<u32> {
+    match index_type {
+        vk::IndexType::UINT16 => Some(u16::MAX as u32),
+        vk::IndexType::UINT32 => Some(u32::MAX),
+        _ => None,
+    }
+}
+
+pub fn primitive_restart_topology_supported(topology: vk::PrimitiveTopology) -> bool {
+    matches!(
+        topology,
+        vk::PrimitiveTopology::LINE_STRIP
+            | vk::PrimitiveTopology::TRIANGLE_STRIP
+            | vk::PrimitiveTopology::TRIANGLE_FAN
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct BlendAttachmentState {
     pub enabled: bool,
@@ -129,6 +146,15 @@ pub struct StencilState {
 }
 
 #[derive(Clone, Debug)]
+pub struct StorageBufferSnapshot {
+    pub binding: u32,
+    pub guest_addr: u64,
+    pub logical_size: usize,
+    pub data_offset: usize,
+    pub data: std::sync::Arc<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Maxwell3dDrawCall {
     pub vs_spirv: std::sync::Arc<Vec<u32>>,
     pub fs_spirv: std::sync::Arc<Vec<u32>>,
@@ -158,6 +184,8 @@ pub struct Maxwell3dDrawCall {
     pub index_count: Option<u32>,
     pub index_type: vk::IndexType,
     pub index_data: Option<Vec<u8>>,
+    pub primitive_restart_enabled: bool,
+    pub primitive_restart_index: u32,
     pub quad_expand: bool,
     pub rt_key: RtKey,
     pub small_rt_tile_mode: Option<u32>,
@@ -200,8 +228,17 @@ pub struct Maxwell3dDrawCall {
     pub poly_offset_enable: bool,
     pub poly_offset_units: f32,
     pub poly_offset_factor: f32,
-    pub ssbo_data: Vec<(u32, Vec<u8>)>,
+    pub ssbo_data: Vec<StorageBufferSnapshot>,
     pub present_flip_y: bool,
+}
+
+impl Maxwell3dDrawCall {
+    pub fn host_primitive_restart_enabled(&self) -> bool {
+        self.state.indexed
+            && self.primitive_restart_enabled
+            && primitive_restart_topology_supported(self.state.topology)
+            && primitive_restart_fixed_index(self.index_type) == Some(self.primitive_restart_index)
+    }
 }
 
 pub fn vertex_binding_read_range(
@@ -326,12 +363,56 @@ pub fn expand_quad_vertices(src: &[u8], stride: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::indexed_vertex_span;
+    use ash::vk;
+
+    use super::{
+        indexed_vertex_span, primitive_restart_fixed_index, primitive_restart_topology_supported,
+        StorageBufferSnapshot,
+    };
+
+    #[test]
+    fn primitive_restart_helpers_match_core_vulkan_rules() {
+        assert_eq!(
+            primitive_restart_fixed_index(vk::IndexType::UINT16),
+            Some(u16::MAX as u32)
+        );
+        assert_eq!(
+            primitive_restart_fixed_index(vk::IndexType::UINT32),
+            Some(u32::MAX)
+        );
+        assert!(primitive_restart_topology_supported(
+            vk::PrimitiveTopology::LINE_STRIP
+        ));
+        assert!(primitive_restart_topology_supported(
+            vk::PrimitiveTopology::TRIANGLE_STRIP
+        ));
+        assert!(primitive_restart_topology_supported(
+            vk::PrimitiveTopology::TRIANGLE_FAN
+        ));
+        assert!(!primitive_restart_topology_supported(
+            vk::PrimitiveTopology::TRIANGLE_LIST
+        ));
+    }
 
     #[test]
     fn indexed_vertex_span_treats_base_vertex_as_signed() {
         assert_eq!(indexed_vertex_span((-1024i32) as u32, 1227), 203);
         assert_eq!(indexed_vertex_span(32, 1227), 1259);
         assert_eq!(indexed_vertex_span((-2048i32) as u32, 1227), 0);
+    }
+
+    #[test]
+    fn storage_snapshot_clone_shares_immutable_payload() {
+        let snapshot = StorageBufferSnapshot {
+            binding: 1,
+            guest_addr: 0x1234,
+            logical_size: 4,
+            data_offset: 0,
+            data: std::sync::Arc::new(vec![1, 2, 3, 4]),
+        };
+        let cloned = snapshot.clone();
+
+        assert!(std::sync::Arc::ptr_eq(&snapshot.data, &cloned.data));
+        assert_eq!(cloned.data.as_slice(), [1, 2, 3, 4]);
     }
 }

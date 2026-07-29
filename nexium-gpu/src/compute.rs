@@ -203,6 +203,7 @@ pub struct ComputeTexelBuffer {
     pub bindings: Vec<u32>,
     pub bytes: Vec<u8>,
     pub format: ComputeTexelFormat,
+    pub raw: bool,
     pub writable: bool,
     pub requires_atomics: bool,
 }
@@ -308,6 +309,7 @@ pub enum ComputeDispatchOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum ComputeDescriptorKind {
     UniformBuffer,
+    StorageBuffer,
     StorageTexelBuffer,
     UniformTexelBuffer,
     CombinedSampledImage,
@@ -319,6 +321,7 @@ impl ComputeDescriptorKind {
     fn vk_type(self) -> vk::DescriptorType {
         match self {
             Self::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
+            Self::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
             Self::StorageTexelBuffer => vk::DescriptorType::STORAGE_TEXEL_BUFFER,
             Self::UniformTexelBuffer => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
             Self::CombinedSampledImage => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
@@ -348,7 +351,11 @@ pub(crate) fn descriptor_spec(dispatch: &ComputeDispatch) -> Vec<ComputeDescript
     for buffer in &dispatch.texel_buffers {
         descriptors.extend(buffer.bindings.iter().map(|binding| ComputeDescriptorSpec {
             binding: *binding,
-            kind: ComputeDescriptorKind::StorageTexelBuffer,
+            kind: if buffer.raw {
+                ComputeDescriptorKind::StorageBuffer
+            } else {
+                ComputeDescriptorKind::StorageTexelBuffer
+            },
         }));
     }
     descriptors.extend(
@@ -649,12 +656,13 @@ impl ComputeProgram {
                 }
             };
 
-        let mut descriptor_counts = [0u32; 6];
+        let mut descriptor_counts = [0u32; 7];
         for descriptor in descriptors {
             descriptor_counts[descriptor.kind as usize] += 1;
         }
         let descriptor_kinds = [
             ComputeDescriptorKind::UniformBuffer,
+            ComputeDescriptorKind::StorageBuffer,
             ComputeDescriptorKind::StorageTexelBuffer,
             ComputeDescriptorKind::UniformTexelBuffer,
             ComputeDescriptorKind::CombinedSampledImage,

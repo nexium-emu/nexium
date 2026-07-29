@@ -4,22 +4,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const BUNDLE_MAGIC: [u8; 8] = *b"NXBUNDL1";
-const BUNDLE_VERSION: u32 = 28;
+const BUNDLE_VERSION: u32 = 37;
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub enum CbufIndexOrigin {
     Static,
@@ -29,16 +20,7 @@ pub enum CbufIndexOrigin {
 }
 
 #[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub struct CbufRead {
     pub logical_slot: u8,
@@ -80,7 +62,7 @@ pub struct BundleRecord {
     pub depth_compare_cube_array_mask: u32,
     pub graphics_cbuf_reads: Vec<CbufRead>,
     pub cbuf_used: u32,
-    pub ssbo_descs: Vec<(u8, u32, u32)>,
+    pub ssbo_descs: Vec<(u8, u32, u32, Option<(u32, u32)>, u32)>,
     #[serde(default)]
     pub fs_tex_or_partners: Vec<(u32, u32)>,
 }
@@ -200,7 +182,7 @@ fn spawn_writer(
         .spawn(move || {
             let mut dirty = false;
             let mut oversize = false;
-            let mut last_flush = std::time::Instant::now();
+            let mut last_change = std::time::Instant::now();
             let flush =
                 |records: &HashMap<u64, Arc<BundleRecord>>, failed: &HashSet<u64>| -> bool {
                     let file = BorrowedBundleFile {
@@ -263,11 +245,13 @@ fn spawn_writer(
                     Ok(WriterMsg::Record(rec)) => {
                         if records.insert(rec.content_key, rec).is_none() {
                             dirty = true;
+                            last_change = std::time::Instant::now();
                         }
                     }
                     Ok(WriterMsg::Failed(key)) => {
                         if failed.insert(key) {
                             dirty = true;
+                            last_change = std::time::Instant::now();
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -278,10 +262,9 @@ fn spawn_writer(
                         break;
                     }
                 }
-                if should_flush(dirty, oversize, last_flush.elapsed()) {
+                if should_flush(dirty, oversize, last_change.elapsed()) {
                     oversize = flush(&records, &failed);
                     dirty = false;
-                    last_flush = std::time::Instant::now();
                 }
             }
         })
@@ -400,8 +383,8 @@ mod tests {
             vs_hash: 0x5678,
             fs_hash: 0x9abc,
             fs_tex_ids: vec![7, 8],
-            texture_numeric_manifest:
-                crate::texture_manifest::normalize_texture_numeric_manifest(vec![
+            texture_numeric_manifest: crate::texture_manifest::normalize_texture_numeric_manifest(
+                vec![
                     crate::texture_manifest::TextureNumericBinding::new(
                         8,
                         1,
@@ -419,8 +402,9 @@ mod tests {
                         nexium_spirv::TextureNumericType::Float,
                     )
                     .with_image_kind(crate::texture_manifest::GraphicsTextureImageKind::Buffer),
-                ])
-                .unwrap(),
+                ],
+            )
+            .unwrap(),
             vs_tex_base: 9,
             vs_tex_count: 10,
             fs_sampler_arrayed: true,
@@ -451,13 +435,13 @@ mod tests {
                 },
             ],
             cbuf_used: 0x33,
-            ssbo_descs: vec![(4, 5, 6)],
+            ssbo_descs: vec![(4, 5, 6, Some((1, 8)), 16)],
             fs_tex_or_partners: vec![(11, 12)],
         }
     }
 
     #[test]
-    fn bundle_flush_waits_for_interval() {
+    fn bundle_flush_waits_for_idle_interval() {
         assert!(!should_flush(
             true,
             false,
@@ -539,6 +523,7 @@ mod tests {
 
         assert!(record_valid(&decoded));
         assert_eq!(decoded.graphics_cbuf_reads, record.graphics_cbuf_reads);
+        assert_eq!(decoded.ssbo_descs, record.ssbo_descs);
         assert_eq!(
             decoded.texture_numeric_manifest,
             record.texture_numeric_manifest
@@ -549,8 +534,7 @@ mod tests {
         );
         assert!(decoded.texture_numeric_manifest.iter().any(|binding| {
             binding.descriptor_slot == 10
-                && binding.image_kind
-                    == crate::texture_manifest::GraphicsTextureImageKind::Buffer
+                && binding.image_kind == crate::texture_manifest::GraphicsTextureImageKind::Buffer
         }));
         assert_eq!(
             (
@@ -561,7 +545,10 @@ mod tests {
             ),
             expected_identity
         );
-        assert_eq!(decoded.graphics_cbuf_reads[1].effective_byte_offset(), Some(0));
+        assert_eq!(
+            decoded.graphics_cbuf_reads[1].effective_byte_offset(),
+            Some(0)
+        );
         assert_eq!(decoded.graphics_cbuf_reads[2].effective_byte_offset(), None);
     }
 }

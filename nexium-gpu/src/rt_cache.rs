@@ -154,6 +154,10 @@ fn dims_close(a: u32, b: u32) -> bool {
     lo != 0 && hi <= lo.saturating_mul(2)
 }
 
+pub(crate) fn is_synthetic_copy_key(key: RtKey) -> bool {
+    key.nvmap_id == u32::MAX
+}
+
 pub fn same_physical_backing(a: RtKey, b: RtKey) -> bool {
     a.width == b.width
         && a.height == b.height
@@ -343,19 +347,29 @@ impl RtCache {
         Ok((snap.image, snap.view, snap.base_format))
     }
 
+    fn mark_drawn_watch() -> Option<(u32, u32)> {
+        use std::sync::OnceLock;
+        static V: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+        *V.get_or_init(|| {
+            let spec = std::env::var("NEXIUM_MARK_DRAWN_WATCH").ok()?;
+            let (w, h) = spec.trim().split_once('x')?;
+            Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+        })
+    }
+
     pub fn mark_drawn(&mut self, key: RtKey) -> u64 {
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
         self.present_excluded.remove(&key);
         *self.frame_draws.entry(key).or_insert(0) += 1;
         *self.frame_real_draws.entry(key).or_insert(0) += 1;
-        if key.width == 1600 && key.height == 900 {
+        if Self::mark_drawn_watch().is_some_and(|(w, h)| key.width == w && key.height == h) {
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
             if n < 24 || n % 1000 == 0 {
                 log::warn!(
-                    "[mark-drawn-1600] n={} key={} nvmap={} va={:#x} stamp={}",
+                    "[mark-drawn] n={} key={} nvmap={} va={:#x} stamp={}",
                     n,
                     key.label(),
                     key.nvmap_id,
@@ -423,13 +437,17 @@ impl RtCache {
     }
 
     pub fn resolve_present_key(&self, want: RtKey, present: bool) -> Option<RtKey> {
+        if is_synthetic_copy_key(want) {
+            return None;
+        }
         let choose_cpu = || -> Option<(RtKey, u64)> {
             if want.cpu_addr == 0 {
                 return None;
             }
             let mut best: Option<(RtKey, u64)> = None;
             for k in self.cache.keys() {
-                if k.width != want.width
+                if is_synthetic_copy_key(*k)
+                    || k.width != want.width
                     || k.height != want.height
                     || k.cpu_addr != want.cpu_addr
                     || self.present_excluded.contains(k)
@@ -458,7 +476,7 @@ impl RtCache {
         let choose = |gpu_va: Option<u64>, same_nvmap: bool| -> Option<(RtKey, u64)> {
             let mut best: Option<(RtKey, u64)> = None;
             for k in self.cache.keys() {
-                if k.width != want.width || k.height != want.height {
+                if is_synthetic_copy_key(*k) || k.width != want.width || k.height != want.height {
                     continue;
                 }
                 if let Some(gpu_va) = gpu_va {
@@ -510,6 +528,7 @@ impl RtCache {
                     .cache
                     .keys()
                     .filter(|k| Some(**k) != best_key)
+                    .filter(|k| !is_synthetic_copy_key(**k))
                     .filter(|k| want.nvmap_id == 0 || k.nvmap_id != want.nvmap_id)
                     .filter(|k| {
                         k.height != 0
@@ -541,6 +560,7 @@ impl RtCache {
             let alt = self
                 .cache
                 .keys()
+                .filter(|k| !is_synthetic_copy_key(**k))
                 .filter(|k| same_aspect(k))
                 .filter(|k| dims_close(k.width, want.width) && dims_close(k.height, want.height))
                 .filter(|k| !self.present_excluded.contains(k))
@@ -563,6 +583,7 @@ impl RtCache {
                 let by_draws = self
                     .cache
                     .keys()
+                    .filter(|k| !is_synthetic_copy_key(**k))
                     .filter(|k| same_aspect(k))
                     .filter(|k| {
                         dims_close(k.width, want.width) && dims_close(k.height, want.height)
@@ -616,14 +637,46 @@ impl RtCache {
         res
     }
 
-    pub fn present_fallback_key(&self, want: RtKey) -> Option<RtKey> {
-        if want.nvmap_id == 0 {
+    pub fn present_key_pinned_at_va(&self, want: RtKey) -> Option<RtKey> {
+        if is_synthetic_copy_key(want) || want.gpu_va == 0 || want.nvmap_id == 0 {
             return None;
         }
         self.cache
             .keys()
             .filter(|k| {
-                k.nvmap_id == want.nvmap_id
+                !is_synthetic_copy_key(**k)
+                    && k.nvmap_id == want.nvmap_id
+                    && k.gpu_va == want.gpu_va
+                    && k.width == want.width
+                    && k.height == want.height
+                    && !self.present_excluded.contains(k)
+                    && self.drawn_stamp.contains_key(k)
+            })
+            .max_by_key(|k| self.drawn_stamp.get(*k).copied().unwrap_or(0))
+            .copied()
+    }
+
+    pub fn present_alias_vas(&self, want: RtKey) -> Vec<u64> {
+        let mut vas: Vec<u64> = self
+            .present_candidates(want)
+            .into_iter()
+            .filter(|(k, _)| k.nvmap_id == want.nvmap_id && k.gpu_va != 0)
+            .map(|(k, _)| k.gpu_va)
+            .collect();
+        vas.sort_unstable();
+        vas.dedup();
+        vas
+    }
+
+    pub fn present_fallback_key(&self, want: RtKey) -> Option<RtKey> {
+        if is_synthetic_copy_key(want) || want.nvmap_id == 0 {
+            return None;
+        }
+        self.cache
+            .keys()
+            .filter(|k| {
+                !is_synthetic_copy_key(**k)
+                    && k.nvmap_id == want.nvmap_id
                     && !self.present_excluded.contains(k)
                     && dims_close(k.width, want.width)
                     && dims_close(k.height, want.height)
@@ -650,8 +703,11 @@ impl RtCache {
 
     pub fn present_candidates(&self, want: RtKey) -> Vec<(RtKey, u64)> {
         let mut out = Vec::new();
+        if is_synthetic_copy_key(want) {
+            return out;
+        }
         for k in self.cache.keys() {
-            if self.present_excluded.contains(k) {
+            if is_synthetic_copy_key(*k) || self.present_excluded.contains(k) {
                 continue;
             }
             if k.width != want.width || k.height != want.height {
@@ -674,9 +730,16 @@ impl RtCache {
         &self,
         want: RtKey,
     ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout)> {
+        if is_synthetic_copy_key(want) {
+            return None;
+        }
         let mut best: Option<(RtKey, &GpuImage, u64)> = None;
         for (k, img) in &self.cache {
-            if k.nvmap_id == want.nvmap_id || k.width != want.width || k.height != want.height {
+            if is_synthetic_copy_key(*k)
+                || k.nvmap_id == want.nvmap_id
+                || k.width != want.width
+                || k.height != want.height
+            {
                 continue;
             }
             let Some(stamp) = self.drawn_stamp.get(k).copied() else {
@@ -689,7 +752,11 @@ impl RtCache {
         if best.is_none() && want.height != 0 {
             let aw = want.width as f32 / want.height as f32;
             for (k, img) in &self.cache {
-                if k.nvmap_id == want.nvmap_id || k.height == 0 || k.width < want.width {
+                if is_synthetic_copy_key(*k)
+                    || k.nvmap_id == want.nvmap_id
+                    || k.height == 0
+                    || k.width < want.width
+                {
                     continue;
                 }
                 let ka = k.width as f32 / k.height as f32;
@@ -709,7 +776,10 @@ impl RtCache {
 
     pub fn has_drawn_color_at_va(&self, nvmap_id: u32, gpu_va: u64) -> bool {
         self.cache.keys().any(|k| {
-            k.nvmap_id == nvmap_id && k.gpu_va == gpu_va && self.drawn_stamp.contains_key(k)
+            !is_synthetic_copy_key(*k)
+                && k.nvmap_id == nvmap_id
+                && k.gpu_va == gpu_va
+                && self.drawn_stamp.contains_key(k)
         })
     }
 
@@ -762,7 +832,7 @@ impl RtCache {
     pub fn find_color_key_at_va(&self, nvmap_id: u32, gpu_va: u64) -> Option<RtKey> {
         self.cache
             .keys()
-            .filter(|k| k.nvmap_id == nvmap_id && k.gpu_va == gpu_va)
+            .filter(|k| !is_synthetic_copy_key(**k) && k.nvmap_id == nvmap_id && k.gpu_va == gpu_va)
             .max_by_key(|k| self.drawn_stamp.get(*k).copied().unwrap_or(0))
             .copied()
     }
@@ -774,7 +844,7 @@ impl RtCache {
     pub fn color_keys_for_nvmap(&self, nvmap_id: u32) -> Vec<(RtKey, vk::Format, u64, u32)> {
         self.cache
             .iter()
-            .filter(|(k, _)| k.nvmap_id == nvmap_id)
+            .filter(|(k, _)| !is_synthetic_copy_key(**k) && k.nvmap_id == nvmap_id)
             .map(|(k, img)| {
                 (
                     *k,
@@ -813,11 +883,15 @@ impl RtCache {
         key: RtKey,
     ) -> Vec<(RtKey, vk::Image, vk::ImageLayout, vk::Format, u64)> {
         let mut out = Vec::new();
-        if key.gpu_va == 0 {
+        if is_synthetic_copy_key(key) || key.gpu_va == 0 {
             return out;
         }
         for (k, img) in &self.cache {
-            if *k == key || k.nvmap_id != key.nvmap_id || k.gpu_va != key.gpu_va {
+            if is_synthetic_copy_key(*k)
+                || *k == key
+                || k.nvmap_id != key.nvmap_id
+                || k.gpu_va != key.gpu_va
+            {
                 continue;
             }
             let Some(stamp) = self.drawn_stamp.get(k).copied() else {
@@ -827,6 +901,12 @@ impl RtCache {
         }
         out.sort_by_key(|(_, _, _, _, stamp)| *stamp);
         out
+    }
+
+    pub(crate) fn color_requires_recreate(&self, key: RtKey, format: vk::Format) -> bool {
+        self.cache.get(&key).is_some_and(|image| {
+            image.format != format && !rt_formats_compatible(image.base_format, format)
+        })
     }
 
     pub fn get_or_create_with_format(
@@ -1192,9 +1272,12 @@ impl RtCache {
         if let Some(img) = self.cache.get(&want) {
             return Some((want, img.image, img.view, img.layout, img.format));
         }
+        if is_synthetic_copy_key(want) {
+            return None;
+        }
         let mut best: Option<(RtKey, &GpuImage)> = None;
         for (k, img) in &self.cache {
-            if k.nvmap_id != want.nvmap_id {
+            if is_synthetic_copy_key(*k) || k.nvmap_id != want.nvmap_id {
                 continue;
             }
             if want.gpu_va != 0 && k.gpu_va != want.gpu_va {
@@ -1227,7 +1310,11 @@ impl RtCache {
     ) -> Option<(RtKey, vk::Image, vk::ImageLayout, vk::Format, u64)> {
         let mut best: Option<(RtKey, &GpuImage, u64)> = None;
         for (k, img) in &self.cache {
-            if k.gpu_va != gpu_va || k.width < width || k.height < height {
+            if is_synthetic_copy_key(*k)
+                || k.gpu_va != gpu_va
+                || k.width < width
+                || k.height < height
+            {
                 continue;
             }
             let Some(stamp) = self.drawn_stamp.get(k).copied() else {
@@ -1256,7 +1343,11 @@ impl RtCache {
     ) -> Option<(RtKey, vk::Image, vk::ImageLayout, vk::Format, u64)> {
         let mut best: Option<(RtKey, &GpuImage, u64, bool)> = None;
         for (k, img) in &self.cache {
-            if k.gpu_va != gpu_va || k.width < width || k.height < height {
+            if is_synthetic_copy_key(*k)
+                || k.gpu_va != gpu_va
+                || k.width < width
+                || k.height < height
+            {
                 continue;
             }
             let Some(stamp) = self.drawn_stamp.get(k).copied() else {
@@ -1294,7 +1385,8 @@ impl RtCache {
         }
         let mut best: Option<(RtKey, &GpuImage, u64)> = None;
         for (k, img) in &self.cache {
-            if k.nvmap_id != nvmap_id
+            if is_synthetic_copy_key(*k)
+                || k.nvmap_id != nvmap_id
                 || k.cpu_addr != cpu_addr
                 || k.width < width
                 || k.height < height
@@ -1330,6 +1422,9 @@ impl RtCache {
         }
         let mut best: Option<(RtKey, &GpuImage, u64, u32, u32, bool)> = None;
         for (k, img) in &self.cache {
+            if is_synthetic_copy_key(*k) {
+                continue;
+            }
             let Some((src_x, src_y, exact)) =
                 rt_region_offset(*k, img.format, width, height, gpu_va)
             else {
@@ -1375,7 +1470,7 @@ impl RtCache {
         }
         let mut best: Option<(RtKey, &GpuImage, u64, u32, u32, bool)> = None;
         for (k, img) in &self.cache {
-            if k.nvmap_id != nvmap_id {
+            if is_synthetic_copy_key(*k) || k.nvmap_id != nvmap_id {
                 continue;
             }
             let Some((src_x, src_y, exact)) =
@@ -1851,8 +1946,8 @@ impl Drop for RtCache {
 #[cfg(test)]
 mod tests {
     use super::{
-        rt_formats_compatible, same_d24_depth_allocation_covering, same_physical_backing, GpuImage,
-        RtCache, RtKey, RtSampleViewKey,
+        is_synthetic_copy_key, rt_formats_compatible, same_d24_depth_allocation_covering,
+        same_physical_backing, GpuImage, RtCache, RtKey, RtSampleViewKey,
     };
     use ash::vk;
     use std::collections::HashMap;
@@ -1873,6 +1968,111 @@ mod tests {
             },
             layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         }
+    }
+
+    fn test_color_image(format: vk::Format, base_format: vk::Format) -> GpuImage {
+        GpuImage {
+            image: vk::Image::null(),
+            view: vk::ImageView::null(),
+            views: HashMap::new(),
+            sample_views: HashMap::new(),
+            memory: vk::DeviceMemory::null(),
+            format,
+            base_format,
+            aspects: vk::ImageAspectFlags::COLOR,
+            extent: vk::Extent2D {
+                width: 640,
+                height: 480,
+            },
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        }
+    }
+
+    #[test]
+    fn synthetic_copy_keys_are_only_visible_through_exact_lookup() {
+        const VA: u64 = 0x5123_4000;
+        let guest = RtKey::new(7, 640, 480, VA);
+        let synthetic = RtKey::new(u32::MAX, 640, 480, VA);
+        let mut cache = RtCache::new();
+        cache.cache.insert(
+            guest,
+            test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+        );
+        cache.cache.insert(
+            synthetic,
+            test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+        );
+        cache.mark_drawn(guest);
+        cache.mark_drawn(synthetic);
+
+        assert!(is_synthetic_copy_key(synthetic));
+        assert!(!is_synthetic_copy_key(guest));
+        assert_eq!(
+            cache
+                .color_exact_with_format(synthetic)
+                .map(|result| result.0),
+            Some(synthetic)
+        );
+        assert_eq!(
+            cache
+                .find_color_with_format(synthetic)
+                .map(|result| result.0),
+            Some(synthetic)
+        );
+        assert!(cache.drawn_stamp(synthetic).is_some());
+
+        assert_eq!(
+            cache
+                .find_drawn_color_at(640, 480, VA)
+                .map(|result| result.0),
+            Some(guest)
+        );
+        assert_eq!(
+            cache
+                .find_content_bearing_color_at(640, 480, VA)
+                .map(|result| result.0),
+            Some(guest)
+        );
+        assert_eq!(
+            cache
+                .find_drawn_color_region_at(640, 480, VA)
+                .map(|result| result.key),
+            Some(guest)
+        );
+        assert_eq!(cache.resolve_present_key(guest, false), Some(guest));
+        assert_eq!(cache.present_candidates(guest), vec![(guest, 1)]);
+        assert_eq!(
+            cache
+                .find_color_screen(RtKey::request(99, 640, 480))
+                .map(|result| result.0),
+            Some(guest)
+        );
+        assert_eq!(cache.find_color_key_at_va(u32::MAX, VA), None);
+        assert!(!cache.has_drawn_color_at_va(u32::MAX, VA));
+        assert!(cache.color_keys_for_nvmap(u32::MAX).is_empty());
+        assert!(cache.drawn_color_aliases(synthetic).is_empty());
+        assert!(cache
+            .find_color_with_format(RtKey::new(u32::MAX, 639, 480, VA))
+            .is_none());
+
+        cache.cache.clear();
+    }
+
+    #[test]
+    fn color_recreation_query_matches_format_view_compatibility() {
+        let key = RtKey::new(7, 640, 480, 0x5123_4000);
+        let mut cache = RtCache::new();
+        assert!(!cache.color_requires_recreate(key, vk::Format::R8G8B8A8_UNORM));
+
+        cache.cache.insert(
+            key,
+            test_color_image(vk::Format::R8G8B8A8_UINT, vk::Format::R8G8B8A8_UNORM),
+        );
+        assert!(!cache.color_requires_recreate(key, vk::Format::R8G8B8A8_UINT));
+        assert!(!cache.color_requires_recreate(key, vk::Format::R8G8B8A8_SINT));
+        assert!(cache.color_requires_recreate(key, vk::Format::R16G16B16A16_UNORM));
+
+        cache.cache.clear();
     }
 
     #[test]
