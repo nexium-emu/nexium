@@ -10,6 +10,7 @@ pub use engines::{
 pub use pusher::{CommandListHeader, Pusher};
 
 use parking_lot::Mutex;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -29,15 +30,93 @@ pub struct GpuMapping {
     pub nvmap_id: u32,
 }
 
+const MAPPING_LOOKUP_CACHE_SIZE: usize = 8;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MappingLookupCacheEntry {
+    gpu_lo: u64,
+    gpu_hi: u64,
+    mapping_index: usize,
+}
+
 pub struct GpuMappings {
     mappings: Vec<GpuMapping>,
+    lookup_cache: [Cell<Option<MappingLookupCacheEntry>>; MAPPING_LOOKUP_CACHE_SIZE],
+    lookup_cache_cursor: Cell<usize>,
 }
 
 impl GpuMappings {
     pub fn new() -> Self {
         Self {
             mappings: Vec::new(),
+            lookup_cache: std::array::from_fn(|_| Cell::new(None)),
+            lookup_cache_cursor: Cell::new(0),
         }
+    }
+
+    #[inline]
+    fn clear_lookup_cache(&self) {
+        for entry in &self.lookup_cache {
+            entry.set(None);
+        }
+        self.lookup_cache_cursor.set(0);
+    }
+
+    #[inline]
+    fn contains(mapping: &GpuMapping, gpu_va: u64) -> bool {
+        gpu_va >= mapping.gpu_va && gpu_va < mapping.gpu_va.saturating_add(mapping.size)
+    }
+
+    #[inline]
+    fn mapping_index_for(&self, gpu_va: u64) -> Option<usize> {
+        for cached in &self.lookup_cache {
+            let Some(cached) = cached.get() else {
+                continue;
+            };
+            if gpu_va >= cached.gpu_lo && gpu_va < cached.gpu_hi {
+                debug_assert!(
+                    self.mappings
+                        .get(cached.mapping_index)
+                        .is_some_and(|mapping| Self::contains(mapping, gpu_va)),
+                    "stale GMMU lookup cache entry"
+                );
+                return Some(cached.mapping_index);
+            }
+        }
+
+        let mapping_index = self
+            .mappings
+            .iter()
+            .rposition(|mapping| Self::contains(mapping, gpu_va))?;
+        let mapping = &self.mappings[mapping_index];
+        let mut gpu_lo = mapping.gpu_va;
+        let mut gpu_hi = mapping.gpu_va.saturating_add(mapping.size);
+
+        for newer in &self.mappings[mapping_index + 1..] {
+            let newer_lo = newer.gpu_va;
+            let newer_hi = newer.gpu_va.saturating_add(newer.size);
+            if newer_hi <= gpu_va {
+                gpu_lo = gpu_lo.max(newer_hi);
+            } else if newer_lo > gpu_va {
+                gpu_hi = gpu_hi.min(newer_lo);
+            } else {
+                debug_assert!(
+                    !Self::contains(newer, gpu_va),
+                    "reverse lookup skipped a newer mapping"
+                );
+            }
+        }
+
+        debug_assert!(gpu_va >= gpu_lo && gpu_va < gpu_hi);
+        let slot = self.lookup_cache_cursor.get() % MAPPING_LOOKUP_CACHE_SIZE;
+        self.lookup_cache[slot].set(Some(MappingLookupCacheEntry {
+            gpu_lo,
+            gpu_hi,
+            mapping_index,
+        }));
+        self.lookup_cache_cursor
+            .set((slot + 1) % MAPPING_LOOKUP_CACHE_SIZE);
+        Some(mapping_index)
     }
 
     pub fn add(&mut self, gpu_va: u64, size: u64, cpu_addr: u64, nvmap_id: u32) {
@@ -54,6 +133,7 @@ impl GpuMappings {
             cpu_addr,
             nvmap_id,
         });
+        self.clear_lookup_cache();
     }
 
     pub fn cpu_address_for_any32(&self, gpu_va: u64) -> Option<(u64, u64, u64)> {
@@ -109,39 +189,31 @@ impl GpuMappings {
 
     pub fn remove(&mut self, gpu_va: u64) -> Option<u64> {
         if let Some(pos) = self.mappings.iter().rposition(|m| m.gpu_va == gpu_va) {
-            Some(self.mappings.remove(pos).size)
+            let size = self.mappings.remove(pos).size;
+            self.clear_lookup_cache();
+            Some(size)
         } else {
             None
         }
     }
 
+    #[inline]
     pub fn cpu_address_for(&self, gpu_va: u64) -> Option<u64> {
-        for m in self.mappings.iter().rev() {
-            if gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size {
-                let offset = gpu_va - m.gpu_va;
-                return Some(m.cpu_addr + offset);
-            }
-        }
-        None
+        let mapping = &self.mappings[self.mapping_index_for(gpu_va)?];
+        Some(mapping.cpu_addr + (gpu_va - mapping.gpu_va))
     }
 
+    #[inline]
     pub fn mapping_at(&self, gpu_va: u64) -> Option<(u64, u64, u64)> {
-        for m in self.mappings.iter().rev() {
-            if gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size {
-                return Some((m.gpu_va, m.size, m.cpu_addr));
-            }
-        }
-        None
+        let mapping = &self.mappings[self.mapping_index_for(gpu_va)?];
+        Some((mapping.gpu_va, mapping.size, mapping.cpu_addr))
     }
 
+    #[inline]
     pub fn cpu_range_for(&self, gpu_va: u64) -> Option<(u64, u64)> {
-        for m in self.mappings.iter().rev() {
-            if gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size {
-                let offset = gpu_va - m.gpu_va;
-                return Some((m.cpu_addr + offset, m.size - offset));
-            }
-        }
-        None
+        let mapping = &self.mappings[self.mapping_index_for(gpu_va)?];
+        let offset = gpu_va - mapping.gpu_va;
+        Some((mapping.cpu_addr + offset, mapping.size - offset))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &GpuMapping> {
@@ -205,13 +277,9 @@ impl GpuMappings {
         )
     }
 
+    #[inline]
     pub fn nvmap_id_for(&self, gpu_va: u64) -> Option<u32> {
-        for m in self.mappings.iter().rev() {
-            if gpu_va >= m.gpu_va && gpu_va < m.gpu_va + m.size {
-                return Some(m.nvmap_id);
-            }
-        }
-        None
+        Some(self.mappings[self.mapping_index_for(gpu_va)?].nvmap_id)
     }
 }
 
@@ -319,6 +387,7 @@ impl GpuContext {
         num_entries: u32,
         mem_read: impl Fn(u64, &mut [u8]) -> bool,
         mem_write: impl Fn(u64, &[u8]) -> bool,
+        mem_copy: impl Fn(u64, u64, usize) -> bool,
     ) -> (u32, u32) {
         let kp_total = pusher::kickprof::start();
         let kp_locks = pusher::kickprof::start();
@@ -343,6 +412,7 @@ impl GpuContext {
             &*self.stats,
             &mem_read,
             &mem_write,
+            &mem_copy,
         );
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         pusher::kickprof::kick_done(kp_total);
@@ -357,6 +427,7 @@ impl GpuContext {
         entries: &[CommandListHeader],
         mem_read: impl Fn(u64, &mut [u8]) -> bool,
         mem_write: impl Fn(u64, &[u8]) -> bool,
+        mem_copy: impl Fn(u64, u64, usize) -> bool,
     ) -> (u32, u32) {
         let profile = nvprof_enabled();
         let kp_total = pusher::kickprof::start();
@@ -371,6 +442,8 @@ impl GpuContext {
         let mappings = self.mappings.lock();
         pusher::kickprof::add(pusher::kickprof::LOCKS, kp_locks);
         let locks_ms = if profile { elapsed_ms(t0) } else { 0.0 };
+
+        pusher.begin_ssbo_snapshot_epoch();
 
         let t_entries = std::time::Instant::now();
         let addrs: Vec<u64> = entries.iter().map(|e| e.address()).collect();
@@ -391,6 +464,7 @@ impl GpuContext {
                 &*self.stats,
                 &mem_read,
                 &mem_write,
+                &mem_copy,
             );
         }
         pusher.entry_word_limit = 0;
@@ -404,6 +478,7 @@ impl GpuContext {
             pusher::kickprof::add(pusher::kickprof::SMALLRT, kp_wb);
         }
         vk_dispatch::guest_probe(&mappings, &mem_read);
+        pusher.end_ssbo_snapshot_epoch();
         let flush_ms = if profile { elapsed_ms(t_flush) } else { 0.0 };
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         pusher::kickprof::kick_done(kp_total);
@@ -463,5 +538,51 @@ mod tests {
             vec![(0x1700, 0x300), (0x3000, 0x200)]
         );
         assert!(mappings.gpu_regions_for_cpu_range(0x1_0700, 0).is_empty());
+    }
+
+    #[test]
+    fn mapping_lookup_cache_respects_newest_overlapping_mapping() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x2000, 0x1_0000, 1);
+        mappings.add(0x1400, 0x800, 0x2_0000, 2);
+        mappings.add(0x1800, 0x200, 0x3_0000, 3);
+
+        assert_eq!(mappings.cpu_address_for(0x1200), Some(0x1_0200));
+        let cursor_after_miss = mappings.lookup_cache_cursor.get();
+
+        assert_eq!(mappings.nvmap_id_for(0x1300), Some(1));
+        assert_eq!(mappings.lookup_cache_cursor.get(), cursor_after_miss);
+
+        assert_eq!(mappings.cpu_address_for(0x1500), Some(0x2_0100));
+        assert_eq!(mappings.nvmap_id_for(0x1900), Some(3));
+        assert_eq!(mappings.mapping_at(0x1b00), Some((0x1400, 0x800, 0x2_0000)));
+        assert_eq!(mappings.cpu_range_for(0x1d00), Some((0x1_0d00, 0x1300)));
+    }
+
+    #[test]
+    fn mapping_mutations_invalidate_cached_intervals() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x1000, 0x1_0000, 1);
+
+        assert_eq!(mappings.cpu_address_for(0x1500), Some(0x1_0500));
+        assert!(mappings
+            .lookup_cache
+            .iter()
+            .any(|entry| entry.get().is_some()));
+
+        mappings.add(0x1400, 0x200, 0x2_0000, 2);
+        assert!(mappings
+            .lookup_cache
+            .iter()
+            .all(|entry| entry.get().is_none()));
+        assert_eq!(mappings.cpu_address_for(0x1500), Some(0x2_0100));
+
+        assert_eq!(mappings.remove(0x1400), Some(0x200));
+        assert!(mappings
+            .lookup_cache
+            .iter()
+            .all(|entry| entry.get().is_none()));
+        assert_eq!(mappings.cpu_address_for(0x1500), Some(0x1_0500));
+        assert_eq!(mappings.nvmap_id_for(0x1500), Some(1));
     }
 }
