@@ -420,6 +420,12 @@ pub enum Op {
         offset: i32,
     },
 
+    StoreGlobal {
+        addr_lo: Value,
+        offset: i32,
+        value: Value,
+    },
+
     LoadLocal {
         addr: Value,
     },
@@ -453,7 +459,19 @@ pub enum Op {
     LoadStorage {
         buffer_index: u32,
         addr_lo: Value,
+        base_addr_lo: Value,
         imm: i32,
+        cbuf_binding: u8,
+        cbuf_offset: u32,
+        align: u32,
+    },
+
+    StoreStorage {
+        buffer_index: u32,
+        addr_lo: Value,
+        base_addr_lo: Value,
+        imm: i32,
+        value: Value,
         cbuf_binding: u8,
         cbuf_offset: u32,
         align: u32,
@@ -744,6 +762,13 @@ pub enum Op {
         b: Value,
     },
 
+    IMulHigh {
+        a: Value,
+        b: Value,
+        signed_a: bool,
+        signed_b: bool,
+    },
+
     IMinMaxPred {
         a: Value,
         b: Value,
@@ -1001,6 +1026,11 @@ impl Inst {
             Op::LoadGlobal { addr_lo, offset } => {
                 write!(f, "LdGbl [{addr_lo}+{offset:#x}]")
             }
+            Op::StoreGlobal {
+                addr_lo,
+                offset,
+                value,
+            } => write!(f, "StGbl [{addr_lo}+{offset:#x}], {value}"),
             Op::LoadLocal { addr } => write!(f, "LdLcl [{addr}]"),
             Op::StoreLocal { addr, value } => write!(f, "StLcl [{addr}], {value}"),
             Op::LoadShared { addr } => write!(f, "LdShared [{addr}]"),
@@ -1013,6 +1043,7 @@ impl Inst {
             Op::LoadStorage {
                 buffer_index,
                 addr_lo,
+                base_addr_lo,
                 imm,
                 cbuf_binding,
                 cbuf_offset,
@@ -1020,9 +1051,22 @@ impl Inst {
             } => {
                 write!(
                     f,
-                    "LdStor ssbo{buffer_index}[{addr_lo}+{imm:#x} - (c[{cbuf_binding:#x}]:{cbuf_offset:#x}&~{align:#x})]"
+                    "LdStor ssbo{buffer_index}[{addr_lo}+{imm:#x} - ({base_addr_lo}&~{align:#x}); c[{cbuf_binding:#x}]:{cbuf_offset:#x}]"
                 )
             }
+            Op::StoreStorage {
+                buffer_index,
+                addr_lo,
+                base_addr_lo,
+                imm,
+                value,
+                cbuf_binding,
+                cbuf_offset,
+                align,
+            } => write!(
+                f,
+                "StStor ssbo{buffer_index}[{addr_lo}+{imm:#x} - ({base_addr_lo}&~{align:#x}); c[{cbuf_binding:#x}]:{cbuf_offset:#x}], {value}"
+            ),
             Op::LoadAttr { slot } => write!(f, "LdAttr a[{slot:#x}]"),
             Op::StoreAttr { slot, src } => write!(f, "StAttr a[{slot:#x}], {src}"),
             Op::InterpAttr {
@@ -1338,6 +1382,12 @@ impl Inst {
             } => write!(f, "PSet P{pred_a}, P{pred_b}, P{pred_c}"),
             Op::IAdd { a, b, .. } => write!(f, "IAdd  {a}, {b}"),
             Op::IMul { a, b } => write!(f, "IMul  {a}, {b}"),
+            Op::IMulHigh {
+                a,
+                b,
+                signed_a,
+                signed_b,
+            } => write!(f, "IMulHi {a}, {b} signed={signed_a}/{signed_b}"),
             Op::IMinMaxPred {
                 a, b, signed, pred, ..
             } => write!(f, "IMnMx {a}, {b} signed={signed} P{pred}"),

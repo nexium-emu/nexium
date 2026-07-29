@@ -123,20 +123,157 @@ impl Cfg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageBufferIndirection {
+    pub parent_buffer_index: u32,
+    pub pointer_offset: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageBufferAddr {
     pub cbuf_binding: u8,
     pub cbuf_offset: u32,
     pub align: u32,
+    pub indirect: Option<StorageBufferIndirection>,
+    pub required_size: u32,
 }
 
-fn track_cbuf_base(start: Value, defs: &HashMap<u32, Op>) -> Option<(u8, u32, u32)> {
-    if let Some((b, o)) = track_dfs(start, defs, true, 0) {
-        return Some((b, o, 16));
+impl StorageBufferAddr {
+    pub const fn direct(cbuf_binding: u8, cbuf_offset: u32, align: u32) -> Self {
+        Self {
+            cbuf_binding,
+            cbuf_offset,
+            align,
+            indirect: None,
+            required_size: 0,
+        }
     }
-    track_dfs(start, defs, false, 0).map(|(b, o)| (b, o, 8))
+
+    pub const fn is_direct(self) -> bool {
+        self.indirect.is_none()
+    }
 }
 
-fn track_dfs(v: Value, defs: &HashMap<u32, Op>, biased: bool, depth: u32) -> Option<(u8, u32)> {
+#[derive(Clone, Copy, Debug)]
+struct TrackedStorageAddr {
+    descriptor: StorageBufferAddr,
+    base_addr_lo: Value,
+    relative_offset: Option<i64>,
+}
+
+fn constant_offset(v: Value, defs: &HashMap<u32, Op>, depth: u32) -> Option<i64> {
+    if depth > 24 {
+        return None;
+    }
+    match v {
+        Value::Zero => Some(0),
+        Value::ImmU32(value) => Some(value as i32 as i64),
+        Value::ImmF32(value) => Some(value.to_bits() as i32 as i64),
+        Value::GprIn(_) => None,
+        Value::Inst(id) => match defs.get(&id.0)? {
+            Op::Mov(source) => constant_offset(*source, defs, depth + 1),
+            Op::IAdd { a, b, neg_a, neg_b } => {
+                let a = constant_offset(*a, defs, depth + 1)?;
+                let b = constant_offset(*b, defs, depth + 1)?;
+                let a = if *neg_a { a.checked_neg()? } else { a };
+                let b = if *neg_b { b.checked_neg()? } else { b };
+                a.checked_add(b)
+            }
+            Op::IScAdd {
+                a,
+                b,
+                shift,
+                neg_a,
+                neg_b,
+            } => {
+                let a = constant_offset(*a, defs, depth + 1)?;
+                let b = constant_offset(*b, defs, depth + 1)?;
+                let a = if *neg_a { a.checked_neg()? } else { a };
+                let b = if *neg_b { b.checked_neg()? } else { b };
+                a.checked_shl(u32::from(*shift))?.checked_add(b)
+            }
+            _ => None,
+        },
+    }
+}
+
+fn add_relative_offset(base: Option<i64>, delta: Option<i64>) -> Option<i64> {
+    base.and_then(|base| delta.and_then(|delta| base.checked_add(delta)))
+}
+
+fn static_offset_from_base(
+    v: Value,
+    base: Value,
+    defs: &HashMap<u32, Op>,
+    depth: u32,
+) -> Option<i64> {
+    if depth > 24 {
+        return None;
+    }
+    if values_equal(&v, &base) {
+        return Some(0);
+    }
+    let Value::Inst(id) = v else {
+        return None;
+    };
+    match defs.get(&id.0)? {
+        Op::Mov(source) => static_offset_from_base(*source, base, defs, depth + 1),
+        Op::IAdd { a, b, neg_a, neg_b } => {
+            if !*neg_a {
+                if let Some(offset) = static_offset_from_base(*a, base, defs, depth + 1) {
+                    let delta = constant_offset(*b, defs, depth + 1)?;
+                    let delta = if *neg_b { delta.checked_neg()? } else { delta };
+                    return offset.checked_add(delta);
+                }
+            }
+            if !*neg_b {
+                let offset = static_offset_from_base(*b, base, defs, depth + 1)?;
+                let delta = constant_offset(*a, defs, depth + 1)?;
+                let delta = if *neg_a { delta.checked_neg()? } else { delta };
+                return offset.checked_add(delta);
+            }
+            None
+        }
+        Op::IScAdd {
+            a,
+            b,
+            shift,
+            neg_a,
+            neg_b,
+        } => {
+            if *shift == 0 && !*neg_a {
+                if let Some(offset) = static_offset_from_base(*a, base, defs, depth + 1) {
+                    let delta = constant_offset(*b, defs, depth + 1)?;
+                    let delta = if *neg_b { delta.checked_neg()? } else { delta };
+                    return offset.checked_add(delta);
+                }
+            }
+            if !*neg_b {
+                let offset = static_offset_from_base(*b, base, defs, depth + 1)?;
+                let delta = constant_offset(*a, defs, depth + 1)?;
+                let delta = if *neg_a { delta.checked_neg()? } else { delta };
+                return delta.checked_shl(u32::from(*shift))?.checked_add(offset);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn track_storage_base(
+    start: Value,
+    defs: &HashMap<u32, Op>,
+    buffers: &[StorageBufferAddr],
+) -> Option<TrackedStorageAddr> {
+    track_dfs(start, defs, buffers, true, 0).or_else(|| track_dfs(start, defs, buffers, false, 0))
+}
+
+fn track_dfs(
+    v: Value,
+    defs: &HashMap<u32, Op>,
+    buffers: &[StorageBufferAddr],
+    biased: bool,
+    depth: u32,
+) -> Option<TrackedStorageAddr> {
     if depth > 24 {
         return None;
     }
@@ -155,15 +292,145 @@ fn track_dfs(v: Value, defs: &HashMap<u32, Op>, biased: bool, depth: u32) -> Opt
             if biased && !(*binding == 0 && *byte_offset >= 0x110 && *byte_offset < 0x610) {
                 return None;
             }
-            Some((*binding, *byte_offset))
+            Some(TrackedStorageAddr {
+                descriptor: StorageBufferAddr::direct(*binding, *byte_offset, align),
+                base_addr_lo: v,
+                relative_offset: Some(0),
+            })
         }
-        Op::Mov(s) => track_dfs(*s, defs, biased, depth + 1),
-        Op::IAdd { a, b, .. } => track_dfs(*a, defs, biased, depth + 1)
-            .or_else(|| track_dfs(*b, defs, biased, depth + 1)),
-        Op::IScAdd { a, b, .. } => track_dfs(*a, defs, biased, depth + 1)
-            .or_else(|| track_dfs(*b, defs, biased, depth + 1)),
+        Op::LoadStorage {
+            buffer_index,
+            addr_lo,
+            base_addr_lo,
+            imm,
+            ..
+        } => {
+            let parent = *buffers.get(*buffer_index as usize)?;
+            let pointer_offset = static_offset_from_base(*addr_lo, *base_addr_lo, defs, depth + 1)?;
+            let pointer_offset = pointer_offset.checked_add(i64::from(*imm))?;
+            let pointer_offset = u32::try_from(pointer_offset).ok()?;
+            Some(TrackedStorageAddr {
+                descriptor: StorageBufferAddr {
+                    cbuf_binding: parent.cbuf_binding,
+                    cbuf_offset: parent.cbuf_offset,
+                    align: parent.align,
+                    indirect: Some(StorageBufferIndirection {
+                        parent_buffer_index: *buffer_index,
+                        pointer_offset,
+                    }),
+                    required_size: 0,
+                },
+                base_addr_lo: v,
+                relative_offset: Some(0),
+            })
+        }
+        Op::Mov(source) => track_dfs(*source, defs, buffers, biased, depth + 1),
+        Op::IAdd { a, b, neg_a, neg_b } => {
+            if !*neg_a {
+                if let Some(mut tracked) = track_dfs(*a, defs, buffers, biased, depth + 1) {
+                    let delta = constant_offset(*b, defs, depth + 1).and_then(|delta| {
+                        if *neg_b {
+                            delta.checked_neg()
+                        } else {
+                            Some(delta)
+                        }
+                    });
+                    tracked.relative_offset = add_relative_offset(tracked.relative_offset, delta);
+                    return Some(tracked);
+                }
+            }
+            if !*neg_b {
+                let mut tracked = track_dfs(*b, defs, buffers, biased, depth + 1)?;
+                let delta = constant_offset(*a, defs, depth + 1).and_then(|delta| {
+                    if *neg_a {
+                        delta.checked_neg()
+                    } else {
+                        Some(delta)
+                    }
+                });
+                tracked.relative_offset = add_relative_offset(tracked.relative_offset, delta);
+                Some(tracked)
+            } else {
+                None
+            }
+        }
+        Op::IScAdd {
+            a,
+            b,
+            shift,
+            neg_a,
+            neg_b,
+        } => {
+            if *shift == 0 && !*neg_a {
+                if let Some(mut tracked) = track_dfs(*a, defs, buffers, biased, depth + 1) {
+                    let delta = constant_offset(*b, defs, depth + 1).and_then(|delta| {
+                        if *neg_b {
+                            delta.checked_neg()
+                        } else {
+                            Some(delta)
+                        }
+                    });
+                    tracked.relative_offset = add_relative_offset(tracked.relative_offset, delta);
+                    return Some(tracked);
+                }
+            }
+            if !*neg_b {
+                let mut tracked = track_dfs(*b, defs, buffers, biased, depth + 1)?;
+                let delta = constant_offset(*a, defs, depth + 1)
+                    .and_then(|delta| {
+                        if *neg_a {
+                            delta.checked_neg()
+                        } else {
+                            Some(delta)
+                        }
+                    })
+                    .and_then(|delta| delta.checked_shl(u32::from(*shift)));
+                tracked.relative_offset = add_relative_offset(tracked.relative_offset, delta);
+                Some(tracked)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
+}
+
+fn required_access_end(relative_offset: Option<i64>, immediate: i32) -> Option<u32> {
+    let start = relative_offset?.checked_add(i64::from(immediate))?;
+    u32::try_from(start).ok()?.checked_add(4)
+}
+
+fn same_storage_origin(a: StorageBufferAddr, b: StorageBufferAddr) -> bool {
+    a.cbuf_binding == b.cbuf_binding
+        && a.cbuf_offset == b.cbuf_offset
+        && a.align == b.align
+        && a.indirect == b.indirect
+}
+
+fn intern_storage_buffer(
+    buffers: &mut Vec<StorageBufferAddr>,
+    mut descriptor: StorageBufferAddr,
+) -> u32 {
+    if let Some(indirect) = descriptor.indirect {
+        if let Some(parent) = buffers.get_mut(indirect.parent_buffer_index as usize) {
+            parent.required_size = parent
+                .required_size
+                .max(indirect.pointer_offset.saturating_add(8));
+        }
+    }
+
+    if let Some(index) = buffers
+        .iter()
+        .position(|existing| same_storage_origin(*existing, descriptor))
+    {
+        buffers[index].required_size = buffers[index].required_size.max(descriptor.required_size);
+        return index as u32;
+    }
+
+    let index = buffers.len() as u32;
+    descriptor.required_size = descriptor.required_size.max(4);
+    buffers.push(descriptor);
+    index
 }
 
 pub fn collect_storage_buffers(cfg: &mut Cfg) -> Vec<StorageBufferAddr> {
@@ -177,41 +444,68 @@ pub fn collect_storage_buffers(cfg: &mut Cfg) -> Vec<StorageBufferAddr> {
     }
 
     let mut buffers: Vec<StorageBufferAddr> = Vec::new();
-    let mut rewrites: Vec<(usize, usize, Op)> = Vec::new();
-    for (bi, b) in cfg.blocks.iter().enumerate() {
-        for (ii, inst) in b.program.instructions.iter().enumerate() {
-            if let Op::LoadGlobal { addr_lo, offset } = inst.op {
-                if let Some((binding, coff, align)) = track_cbuf_base(addr_lo, &defs) {
-                    let sba = StorageBufferAddr {
-                        cbuf_binding: binding,
-                        cbuf_offset: coff,
-                        align,
-                    };
-                    let buffer_index = match buffers.iter().position(|x| *x == sba) {
-                        Some(p) => p as u32,
-                        None => {
-                            buffers.push(sba);
-                            (buffers.len() - 1) as u32
-                        }
-                    };
-                    rewrites.push((
-                        bi,
-                        ii,
-                        Op::LoadStorage {
-                            buffer_index,
-                            addr_lo,
-                            imm: offset,
-                            cbuf_binding: binding,
-                            cbuf_offset: coff,
-                            align,
-                        },
-                    ));
+    loop {
+        let mut rewrites: Vec<(usize, usize, Op, Option<ValueId>)> = Vec::new();
+        for (bi, block) in cfg.blocks.iter().enumerate() {
+            for (ii, inst) in block.program.instructions.iter().enumerate() {
+                let global = match inst.op {
+                    Op::LoadGlobal { addr_lo, offset } => Some((addr_lo, offset, None)),
+                    Op::StoreGlobal {
+                        addr_lo,
+                        offset,
+                        value,
+                    } => Some((addr_lo, offset, Some(value))),
+                    _ => None,
+                };
+                let Some((addr_lo, offset, value)) = global else {
+                    continue;
+                };
+                let Some(mut tracked) = track_storage_base(addr_lo, &defs, &buffers) else {
+                    continue;
+                };
+
+                let required_size = required_access_end(tracked.relative_offset, offset);
+                if tracked.descriptor.indirect.is_some() && required_size.is_none() {
+                    continue;
                 }
+                tracked.descriptor.required_size = required_size.unwrap_or(0);
+                let buffer_index = intern_storage_buffer(&mut buffers, tracked.descriptor);
+                let descriptor = buffers[buffer_index as usize];
+                let op = if let Some(value) = value {
+                    Op::StoreStorage {
+                        buffer_index,
+                        addr_lo,
+                        base_addr_lo: tracked.base_addr_lo,
+                        imm: offset,
+                        value,
+                        cbuf_binding: descriptor.cbuf_binding,
+                        cbuf_offset: descriptor.cbuf_offset,
+                        align: descriptor.align,
+                    }
+                } else {
+                    Op::LoadStorage {
+                        buffer_index,
+                        addr_lo,
+                        base_addr_lo: tracked.base_addr_lo,
+                        imm: offset,
+                        cbuf_binding: descriptor.cbuf_binding,
+                        cbuf_offset: descriptor.cbuf_offset,
+                        align: descriptor.align,
+                    }
+                };
+                rewrites.push((bi, ii, op, inst.result));
             }
         }
-    }
-    for (bi, ii, op) in rewrites {
-        cfg.blocks[bi].program.instructions[ii].op = op;
+
+        if rewrites.is_empty() {
+            break;
+        }
+        for (bi, ii, op, result) in rewrites {
+            cfg.blocks[bi].program.instructions[ii].op = op.clone();
+            if let Some(result) = result {
+                defs.insert(result.0, op);
+            }
+        }
     }
     buffers
 }
@@ -417,6 +711,7 @@ where
 enum FlowToken {
     Ssy,
     Pbk,
+    Pcnt,
 }
 
 type FlowStack = Vec<(FlowToken, usize)>;
@@ -463,11 +758,13 @@ fn discover_sync_targets(
                 match d.opcode {
                     Opcode::SSY => stack.push((FlowToken::Ssy, bra_target(offset, raw))),
                     Opcode::PBK => stack.push((FlowToken::Pbk, bra_target(offset, raw))),
-                    Opcode::SYNC | Opcode::BRK => {
-                        let token = if matches!(d.opcode, Opcode::SYNC) {
-                            FlowToken::Ssy
-                        } else {
-                            FlowToken::Pbk
+                    Opcode::PCNT => stack.push((FlowToken::Pcnt, bra_target(offset, raw))),
+                    Opcode::SYNC | Opcode::BRK | Opcode::CONT => {
+                        let token = match d.opcode {
+                            Opcode::SYNC => FlowToken::Ssy,
+                            Opcode::BRK => FlowToken::Pbk,
+                            Opcode::CONT => FlowToken::Pcnt,
+                            _ => unreachable!(),
                         };
                         if let Some((target, popped)) = pop_flow_token(&stack, token) {
                             targets.entry(offset).or_insert(target);
@@ -557,7 +854,7 @@ fn discover_leaders(
                     }
                     break;
                 }
-                Opcode::SYNC | Opcode::BRK => {
+                Opcode::SYNC | Opcode::BRK | Opcode::CONT => {
                     if let Some(&target) = sync_targets.get(&offset) {
                         if target < bytes.len() && leaders.insert(target) {
                             worklist.push(target);
@@ -791,7 +1088,7 @@ fn discover_topology(
                         terminator_offset = Some(offset);
                         break;
                     }
-                    Opcode::SYNC | Opcode::BRK => {
+                    Opcode::SYNC | Opcode::BRK | Opcode::CONT => {
                         if let Some(&target_off) = sync_targets.get(&offset) {
                             let target = *offset_to_block.get(&target_off).unwrap_or(&(i as u32));
                             match decoded_pred(raw) {
@@ -1118,13 +1415,18 @@ fn finalize_bindless_origin_checks(
                     Opcode::TEX_b => {
                         matches!(inst.op, Op::SampleTex { .. } | Op::SampleTexHandle { .. })
                     }
-                    Opcode::TLD_b => matches!(inst.op, Op::TexelFetchHandle { .. }),
+                    Opcode::TLD_b => {
+                        matches!(inst.op, Op::TexelFetch { .. } | Op::TexelFetchHandle { .. })
+                    }
                     Opcode::SUATOM => matches!(inst.op, Op::ImageAtomic { .. }),
                     _ => false,
                 })
         });
 
-        if let Some(origin) = resolved.filter(|_| sample_indices_valid) {
+        if let Some(origin) = resolved.filter(|origin| {
+            sample_indices_valid
+                && (check.opcode != Opcode::TLD_b || origin.cross_binding_partner_id().is_none())
+        }) {
             for (index, _) in &check.samples {
                 match &mut block.program.instructions[*index].op {
                     Op::SampleTex { tex_id, .. } if check.opcode == Opcode::TEX_b => {
@@ -1135,6 +1437,24 @@ fn finalize_bindless_origin_checks(
                     }
                     Op::TexelFetchHandle { handle, .. } if check.opcode == Opcode::TLD_b => {
                         *handle = origin.as_texture_handle();
+                    }
+                    Op::TexelFetch {
+                        cbuf_binding,
+                        cbuf_word_offset,
+                        cbuf_secondary_word_offset,
+                        ..
+                    } if check.opcode == Opcode::TLD_b => {
+                        let super::ir::TextureHandleOrigin::Bindless {
+                            cbuf_binding: binding,
+                            cbuf_word_offset: word_offset,
+                            cbuf_secondary_word_offset: secondary_word_offset,
+                        } = origin.as_texture_handle()
+                        else {
+                            unreachable!()
+                        };
+                        *cbuf_binding = binding;
+                        *cbuf_word_offset = word_offset;
+                        *cbuf_secondary_word_offset = secondary_word_offset;
                     }
                     Op::ImageAtomic { handle, .. } if check.opcode == Opcode::SUATOM => {
                         *handle = origin.as_texture_handle();
@@ -1193,8 +1513,10 @@ pub fn merge_dual_vertex_sass(vertex_a: &[u8], vertex_b: &[u8]) -> Option<Vec<u8
                     | Opcode::BRX
                     | Opcode::SSY
                     | Opcode::PBK
+                    | Opcode::PCNT
                     | Opcode::SYNC
-                    | Opcode::BRK => {
+                    | Opcode::BRK
+                    | Opcode::CONT => {
                         return None;
                     }
                     _ => {}
@@ -1329,6 +1651,235 @@ mod tests {
 
     fn write_word(bytes: &mut [u8], offset: usize, word: u64) {
         bytes[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
+    }
+
+    fn cfg_with_program(program: Program) -> Cfg {
+        Cfg {
+            blocks: vec![BasicBlock {
+                id: 0,
+                start_offset: 0,
+                end_offset: 0,
+                branch: BranchKind::Exit,
+                program,
+                reg_exit: HashMap::new(),
+                pred_phis: Vec::new(),
+                pred_exit: HashMap::new(),
+            }],
+            unimplemented: 0,
+            bindless_or_partners: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn storage_buffer_collection_rewrites_nested_pointer_loads_iteratively() {
+        let mut program = Program::new();
+        let root = program.emit(
+            Op::LoadCbuf {
+                binding: 0,
+                byte_offset: 0x128,
+            },
+            Some(8),
+        );
+        let root_addr = program.emit(Op::Mov(Value::Inst(root)), Some(8));
+        let child_pointer = program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(root_addr),
+                offset: 0,
+            },
+            Some(8),
+        );
+        program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(root_addr),
+                offset: 4,
+            },
+            Some(9),
+        );
+        let child_addr = program.emit(Op::Mov(Value::Inst(child_pointer)), Some(8));
+        let child_value = program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(child_addr),
+                offset: 12,
+            },
+            Some(12),
+        );
+        let mut cfg = cfg_with_program(program);
+
+        let buffers = collect_storage_buffers(&mut cfg);
+
+        assert_eq!(
+            buffers,
+            vec![
+                StorageBufferAddr {
+                    cbuf_binding: 0,
+                    cbuf_offset: 0x128,
+                    align: 8,
+                    indirect: None,
+                    required_size: 8,
+                },
+                StorageBufferAddr {
+                    cbuf_binding: 0,
+                    cbuf_offset: 0x128,
+                    align: 8,
+                    indirect: Some(StorageBufferIndirection {
+                        parent_buffer_index: 0,
+                        pointer_offset: 0,
+                    }),
+                    required_size: 16,
+                },
+            ]
+        );
+        let instructions = &cfg.blocks[0].program.instructions;
+        assert!(matches!(
+            instructions[2].op,
+            Op::LoadStorage {
+                buffer_index: 0,
+                base_addr_lo: Value::Inst(id),
+                ..
+            } if id == root
+        ));
+        assert!(matches!(
+            instructions[5].op,
+            Op::LoadStorage {
+                buffer_index: 1,
+                base_addr_lo: Value::Inst(id),
+                ..
+            } if id == child_pointer
+        ));
+        assert_eq!(instructions[5].result, Some(child_value));
+    }
+
+    #[test]
+    fn storage_buffer_collection_records_recursive_parent_chain_and_store_span() {
+        let mut program = Program::new();
+        let root = program.emit(
+            Op::LoadCbuf {
+                binding: 0,
+                byte_offset: 0x128,
+            },
+            Some(8),
+        );
+        let first_pointer = program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(root),
+                offset: 0,
+            },
+            Some(8),
+        );
+        program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(root),
+                offset: 4,
+            },
+            Some(9),
+        );
+        let first_addr = program.emit(Op::Mov(Value::Inst(first_pointer)), Some(8));
+        let second_pointer = program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(first_addr),
+                offset: 8,
+            },
+            Some(8),
+        );
+        program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(first_addr),
+                offset: 12,
+            },
+            Some(9),
+        );
+        let second_addr = program.emit(Op::Mov(Value::Inst(second_pointer)), Some(8));
+        program.emit_void(Op::StoreGlobal {
+            addr_lo: Value::Inst(second_addr),
+            offset: 12,
+            value: Value::ImmU32(0x1234_5678),
+        });
+        let mut cfg = cfg_with_program(program);
+
+        let buffers = collect_storage_buffers(&mut cfg);
+
+        assert_eq!(buffers.len(), 3);
+        assert_eq!(buffers[0].required_size, 8);
+        assert_eq!(
+            buffers[1].indirect,
+            Some(StorageBufferIndirection {
+                parent_buffer_index: 0,
+                pointer_offset: 0,
+            })
+        );
+        assert_eq!(buffers[1].required_size, 16);
+        assert_eq!(
+            buffers[2].indirect,
+            Some(StorageBufferIndirection {
+                parent_buffer_index: 1,
+                pointer_offset: 8,
+            })
+        );
+        assert_eq!(buffers[2].required_size, 16);
+        assert!(cfg.blocks[0]
+            .program
+            .instructions
+            .iter()
+            .all(|inst| !matches!(inst.op, Op::LoadGlobal { .. } | Op::StoreGlobal { .. })));
+        assert!(matches!(
+            cfg.blocks[0].program.instructions[7].op,
+            Op::StoreStorage {
+                buffer_index: 2,
+                base_addr_lo: Value::Inst(id),
+                ..
+            } if id == second_pointer
+        ));
+    }
+
+    #[test]
+    fn storage_buffer_collection_leaves_dynamic_indirect_span_unresolved() {
+        let mut program = Program::new();
+        let root = program.emit(
+            Op::LoadCbuf {
+                binding: 0,
+                byte_offset: 0x128,
+            },
+            Some(8),
+        );
+        let child_pointer = program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(root),
+                offset: 0,
+            },
+            Some(8),
+        );
+        program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(root),
+                offset: 4,
+            },
+            Some(9),
+        );
+        let dynamic_addr = program.emit(
+            Op::IAdd {
+                a: Value::Inst(child_pointer),
+                b: Value::GprIn(4),
+                neg_a: false,
+                neg_b: false,
+            },
+            Some(8),
+        );
+        program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(dynamic_addr),
+                offset: 0,
+            },
+            Some(12),
+        );
+        let mut cfg = cfg_with_program(program);
+
+        let buffers = collect_storage_buffers(&mut cfg);
+
+        assert_eq!(buffers.len(), 1);
+        assert!(matches!(
+            cfg.blocks[0].program.instructions[4].op,
+            Op::LoadGlobal { .. }
+        ));
     }
 
     fn sample_tex_ids(cfg: &Cfg) -> Vec<u32> {
@@ -1632,6 +2183,61 @@ mod tests {
     }
 
     #[test]
+    fn fragment_tld_b_resolves_dusk_loop_invariant_self_phi() {
+        let bytes = build_program(&[
+            0x4c98_0784_0047_0003,
+            0x0400_00ff_fff7_0303,
+            0x4c98_0784_0057_0006,
+            0x040f_ff00_0007_0606,
+            0x5c47_0200_0067_0306,
+            0x5c98_0780_0037_0006,
+            enc_bra_pt(24),
+            0x50b0_0000_0007_0f00,
+            0x50b0_0000_0007_0f00,
+            0xdd38_0003_a067_1400,
+            enc_bra_p0(16),
+            enc_bra_pt(-24),
+            enc_exit(),
+        ]);
+        let cfg = build_fragment_cfg(&bytes);
+
+        assert_eq!(cfg.unimplemented, 0);
+        let fetches = cfg
+            .blocks
+            .iter()
+            .flat_map(|block| &block.program.instructions)
+            .filter_map(|inst| match inst.op {
+                Op::TexelFetch {
+                    cbuf_binding,
+                    cbuf_word_offset,
+                    cbuf_secondary_word_offset,
+                    component,
+                    ..
+                } => Some((
+                    cbuf_binding,
+                    cbuf_word_offset,
+                    cbuf_secondary_word_offset,
+                    component,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fetches,
+            vec![(1, 4, None, 0), (1, 4, None, 1), (1, 4, None, 2)]
+        );
+        assert!(cfg.blocks.iter().any(|block| {
+            block.program.instructions.iter().any(|inst| {
+                let Some(result) = inst.result else {
+                    return false;
+                };
+                matches!(&inst.op, Op::Phi { sources } if inst.dest_reg == Some(6)
+                    && sources.iter().any(|(_, value)| *value == Value::Inst(result)))
+            })
+        }));
+    }
+
+    #[test]
     fn pps_tex_b_loop_phi_revalidation_fails_closed_on_changed_handle() {
         let mut bytes = pps_loop_tex_b_program();
         write_word(&mut bytes, 0xf8, 0x4c98_0788_05b7_000e);
@@ -1727,6 +2333,43 @@ mod tests {
             matches!(back_source.1, Value::Inst(id) if id == fadd_id),
             "back-edge phi source should be FAdd result, got {:?}",
             back_source.1
+        );
+    }
+
+    #[test]
+    fn pcnt_cont_forms_loop_with_pbk_break_exit() {
+        const PBK_EXIT: u64 = 0xE2A0_0000_0207_000F;
+        const PCNT_SELF: u64 = 0xE2B0_0FFF_FF87_000F;
+        const BRK_P0: u64 = 0xE340_0000_0000_000F;
+        const CONT_PT: u64 = 0xE350_0000_0007_000F;
+
+        assert_eq!(decode_one(PCNT_SELF).unwrap().opcode, Opcode::PCNT);
+        assert_eq!(decode_one(CONT_PT).unwrap().opcode, Opcode::CONT);
+
+        let bytes = build_program(&[PBK_EXIT, PCNT_SELF, BRK_P0, CONT_PT, enc_exit()]);
+        let cfg = build_fragment_cfg(&bytes);
+
+        assert_eq!(cfg.unimplemented, 0);
+        assert_eq!(cfg.blocks.len(), 4);
+        assert_eq!(cfg.blocks[0].branch, BranchKind::FallThrough);
+        assert_eq!(
+            cfg.blocks[1].branch,
+            BranchKind::Conditional {
+                target: 3,
+                pred: Predicate {
+                    idx: 0,
+                    negate: false,
+                },
+            }
+        );
+        assert_eq!(
+            cfg.blocks[2].branch,
+            BranchKind::Unconditional { target: 1 }
+        );
+        assert_eq!(cfg.blocks[3].branch, BranchKind::Exit);
+        assert_eq!(
+            cfg.predecessors(),
+            vec![vec![], vec![0, 2], vec![1], vec![1]]
         );
     }
 

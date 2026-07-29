@@ -12,7 +12,7 @@ pub use cfg::{
     build_cfg, build_cfg_with_cbuf, build_compute_cfg, build_compute_cfg_with_cbuf,
     build_fragment_cfg, build_fragment_cfg_with_cbuf, collect_storage_buffers,
     merge_dual_vertex_sass, BasicBlock, BlockId, BranchKind, Cfg, IndirectBranchTarget,
-    StorageBufferAddr, MAX_INDIRECT_BRANCH_TARGETS,
+    StorageBufferAddr, StorageBufferIndirection, MAX_INDIRECT_BRANCH_TARGETS,
 };
 pub use decode::{decode_one, Decoded};
 pub use disasm::{disassemble, DisasmKind, DisasmLine};
@@ -75,10 +75,7 @@ pub fn decode_bindless_texture_id(texture_id: u32) -> Option<(u8, u32, Option<u3
     ))
 }
 
-pub fn texel_fetch_buffer_coordinates_compatible(
-    y: Option<&IrValue>,
-    z: Option<&IrValue>,
-) -> bool {
+pub fn texel_fetch_buffer_coordinates_compatible(y: Option<&IrValue>, z: Option<&IrValue>) -> bool {
     if z.is_some() {
         return false;
     }
@@ -115,7 +112,9 @@ impl IrConstantFacts {
                     continue;
                 };
                 if facts.values.contains_key(&result)
-                    || instruction.pred.is_some_and(|pred| pred.idx != 7 || pred.negate)
+                    || instruction
+                        .pred
+                        .is_some_and(|pred| pred.idx != 7 || pred.negate)
                 {
                     continue;
                 }
@@ -158,9 +157,7 @@ impl IrConstantFacts {
         match op {
             IrOp::Mov(source) => value(source),
             IrOp::SelectPred {
-                if_true,
-                if_false,
-                ..
+                if_true, if_false, ..
             } if value(if_true) == value(if_false) => value(if_true),
             IrOp::Phi { sources } if !sources.is_empty() => {
                 let first = value(&sources[0].1)?;
@@ -324,14 +321,11 @@ mod tests {
         let cfg = single_block_cfg(program);
         let facts = IrConstantFacts::analyze(&cfg);
 
-        assert!(facts.texel_fetch_buffer_coordinates_compatible(
-            Some(&IrValue::Inst(selected_zero)),
-            None,
-        ));
-        assert!(!facts.texel_fetch_buffer_coordinates_compatible(
-            Some(&IrValue::Inst(dynamic)),
-            None,
-        ));
+        assert!(facts
+            .texel_fetch_buffer_coordinates_compatible(Some(&IrValue::Inst(selected_zero)), None,));
+        assert!(
+            !facts.texel_fetch_buffer_coordinates_compatible(Some(&IrValue::Inst(dynamic)), None,)
+        );
         assert!(!facts.texel_fetch_buffer_coordinates_compatible(
             Some(&IrValue::Inst(arithmetic_zero)),
             None,

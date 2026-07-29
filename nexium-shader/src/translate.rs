@@ -75,14 +75,37 @@ pub(crate) struct CbufHandleOrigin {
     binding: u8,
     word_offset: u32,
     secondary_word_offset: Option<u32>,
+    secondary_binding: Option<u8>,
 }
 
 impl CbufHandleOrigin {
     pub(crate) fn texture_id(self) -> u32 {
-        bindless_texture_id_pair(self.binding, self.word_offset, self.secondary_word_offset)
+        let same_binding_secondary = self
+            .secondary_binding
+            .is_none_or(|binding| binding == self.binding)
+            .then_some(self.secondary_word_offset)
+            .flatten();
+        bindless_texture_id_pair(self.binding, self.word_offset, same_binding_secondary)
+    }
+
+    pub(crate) fn cross_binding_partner_id(self) -> Option<u32> {
+        let binding = self.secondary_binding?;
+        (binding != self.binding).then(|| {
+            bindless_texture_id_pair(
+                binding,
+                self.secondary_word_offset
+                    .expect("cross-buffer texture handle requires a partner word"),
+                None,
+            )
+        })
     }
 
     pub(crate) fn as_texture_handle(self) -> TextureHandleOrigin {
+        debug_assert!(
+            self.secondary_binding
+                .is_none_or(|binding| binding == self.binding),
+            "cross-buffer handles are lowered to graphics descriptor IDs before SPIR-V"
+        );
         TextureHandleOrigin::Bindless {
             cbuf_binding: self.binding,
             cbuf_word_offset: self.word_offset,
@@ -162,6 +185,7 @@ impl CbufOriginTracer<'_> {
                     binding,
                     word_offset: byte_offset / 4,
                     secondary_word_offset: None,
+                    secondary_binding: None,
                 },
                 deferred: false,
             }),
@@ -243,6 +267,18 @@ impl CbufOriginTracer<'_> {
             Op::ILop {
                 a,
                 b,
+                op: LogicOp::And,
+                not_a: false,
+                not_b: false,
+            } => match (a, b) {
+                (Value::ImmU32(mask), value) | (value, Value::ImmU32(mask)) if mask != 0 => {
+                    self.trace_inner(&value)
+                }
+                _ => None,
+            },
+            Op::ILop {
+                a,
+                b,
                 op: LogicOp::Or,
                 not_a: false,
                 not_b: false,
@@ -261,11 +297,17 @@ impl CbufOriginTracer<'_> {
                 else {
                     return None;
                 };
-                let origin = if a.binding != b.binding
-                    || a.secondary_word_offset.is_some()
+                let origin = if a.secondary_word_offset.is_some()
                     || b.secondary_word_offset.is_some()
                 {
                     return None;
+                } else if a.binding != b.binding {
+                    CbufHandleOrigin {
+                        binding: a.binding,
+                        word_offset: a.word_offset,
+                        secondary_word_offset: Some(b.word_offset),
+                        secondary_binding: Some(b.binding),
+                    }
                 } else if a.word_offset == b.word_offset {
                     a
                 } else {
@@ -278,6 +320,7 @@ impl CbufOriginTracer<'_> {
                         binding: a.binding,
                         word_offset,
                         secondary_word_offset: Some(secondary_word_offset),
+                        secondary_binding: None,
                     }
                 };
                 Some(CbufHandleTrace::Origin {
@@ -431,72 +474,6 @@ impl Translator {
             finished: false,
             unimplemented_count: 0,
             bindless_or_partners: HashMap::new(),
-        }
-    }
-
-    fn trace_cbuf_or_partner(&self, v: &Value) -> Option<(u32, u32)> {
-        let mut cur = *v;
-        for _ in 0..8 {
-            let Value::Inst(id) = cur else { return None };
-            let inst = self
-                .program
-                .instructions
-                .iter()
-                .find(|i| i.result == Some(id))?;
-            match &inst.op {
-                Op::Mov(inner) => cur = *inner,
-                Op::ILop {
-                    a,
-                    b,
-                    op: LogicOp::Or,
-                    not_a: false,
-                    not_b: false,
-                } => {
-                    let oa = self.trace_cbuf_word_offset(a)?;
-                    let ob = self.trace_cbuf_word_offset(b)?;
-                    if oa == ob {
-                        return None;
-                    }
-                    return Some((oa.min(ob), oa.max(ob)));
-                }
-                _ => return None,
-            }
-        }
-        None
-    }
-
-    fn trace_cbuf_word_offset(&self, v: &Value) -> Option<u32> {
-        self.trace_cbuf_word_offset_depth(v, 0)
-    }
-
-    fn trace_cbuf_word_offset_depth(&self, v: &Value, depth: u32) -> Option<u32> {
-        if depth > 8 {
-            return None;
-        }
-        match *v {
-            Value::Inst(id) => {
-                let inst = self
-                    .program
-                    .instructions
-                    .iter()
-                    .find(|i| i.result == Some(id))?;
-                match &inst.op {
-                    Op::Mov(inner) => self.trace_cbuf_word_offset_depth(inner, depth + 1),
-                    Op::LoadCbuf { byte_offset, .. } => Some(byte_offset / 4),
-                    Op::ILop { a, b, .. } => {
-                        let oa = self.trace_cbuf_word_offset_depth(a, depth + 1);
-                        let ob = self.trace_cbuf_word_offset_depth(b, depth + 1);
-                        match (oa, ob) {
-                            (Some(x), Some(y)) => Some(x.min(y)),
-                            (Some(x), None) => Some(x),
-                            (None, Some(y)) => Some(y),
-                            (None, None) => None,
-                        }
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
         }
     }
 
@@ -1059,6 +1036,59 @@ impl Translator {
             },
             pred,
         );
+    }
+
+    fn emit_imul(
+        &mut self,
+        raw: u64,
+        b: Value,
+        pred: Option<Predicate>,
+        high: bool,
+        signed_a: bool,
+        signed_b: bool,
+    ) {
+        let a = self.read_reg(reg_a(raw));
+        let op = if high {
+            Op::IMulHigh {
+                a,
+                b,
+                signed_a,
+                signed_b,
+            }
+        } else {
+            Op::IMul { a, b }
+        };
+        self.write_reg(reg_dest(raw), op, pred);
+    }
+
+    fn emit_prmt_imm(&mut self, raw: u64, pred: Option<Predicate>) -> bool {
+        if ((raw >> 47) & 1) != 0 || ((raw >> 48) & 0x7) != 0 {
+            return false;
+        }
+
+        let a = self.read_reg(reg_a(raw));
+        let b = self.read_reg(reg_c(raw));
+        let selector = ((raw >> 20) & 0xffff) as u16;
+        let mut result = Value::Zero;
+
+        for output_byte in 0..4u32 {
+            let select = u32::from((selector >> (output_byte * 4)) & 0xf);
+            let source = if select & 0x7 < 4 { a } else { b };
+            let source_byte = select & 0x3;
+            let mut byte = if select & 0x8 != 0 {
+                self.emit_bfe_value(source, source_byte * 8 + 7, 1, true)
+            } else {
+                self.emit_bfe_value(source, source_byte * 8, 8, false)
+            };
+            byte = self.emit_ilop_imm_value(byte, 0xff, LogicOp::And, false, false);
+            if output_byte != 0 {
+                byte = self.emit_ishl_imm_value(byte, output_byte * 8);
+            }
+            result = self.emit_ilop_value(result, byte, LogicOp::Or, false, false);
+        }
+
+        self.write_reg(reg_dest(raw), Op::Mov(result), pred);
+        true
     }
 
     fn emit_imnmx(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
@@ -2435,7 +2465,12 @@ impl Translator {
                 self.emit_isetp(raw, Value::ImmU32(imm20(raw) as u32), pred);
             }
 
-            Opcode::SSY | Opcode::SYNC | Opcode::PBK | Opcode::BRK => {}
+            Opcode::SSY
+            | Opcode::SYNC
+            | Opcode::PBK
+            | Opcode::BRK
+            | Opcode::PCNT
+            | Opcode::CONT => {}
 
             Opcode::IMAD_reg => {
                 let b = self.read_reg(reg_b(raw));
@@ -2620,8 +2655,9 @@ impl Translator {
                     self.unimplemented_count += 1;
                     return false;
                 };
-                if let Some((primary, partner)) = self.trace_cbuf_or_partner(&handle) {
-                    self.bindless_or_partners.insert(primary, partner);
+                if let Some(partner) = origin.cross_binding_partner_id() {
+                    self.bindless_or_partners
+                        .insert(origin.texture_id(), partner);
                 }
                 let compute_handle = if self.stage == ShaderStage::Compute {
                     let dimension = match form.tex_type {
@@ -2723,6 +2759,15 @@ impl Translator {
                         self.unimplemented_count += 1;
                         return false;
                     };
+                    if origin.cross_binding_partner_id().is_some() {
+                        log::debug!("TLD_b cross-buffer handle is unsupported raw={:#018x}", raw);
+                        self.program.emit_void(Op::Unimplemented {
+                            opcode: Opcode::TLD_b,
+                            raw,
+                        });
+                        self.unimplemented_count += 1;
+                        return false;
+                    }
                     (origin.as_texture_handle(), deferred.then_some(handle))
                 } else {
                     (
@@ -3174,6 +3219,48 @@ impl Translator {
                         dest.wrapping_add(w as u8)
                     };
                     self.write_reg(dst, Op::Mov(Value::Inst(id)), pred);
+                }
+            }
+
+            Opcode::STG => {
+                let src = reg_dest(raw);
+                let addr_reg = ldg_addr_reg(raw);
+                let offset = ldg_offset(raw);
+                let size = ldg_size(raw);
+                let count = match size {
+                    4 => 1u32,
+                    5 => 2,
+                    6 | 7 => 4,
+                    _ => {
+                        log::warn!(
+                            "STG sub-word size not yet lifted raw={:#018x} size={}",
+                            raw,
+                            size,
+                        );
+                        self.program.emit_void(Op::Unimplemented {
+                            opcode: Opcode::STG,
+                            raw,
+                        });
+                        self.unimplemented_count += 1;
+                        return false;
+                    }
+                };
+                let addr_lo = self.read_reg(addr_reg);
+                for w in 0..count {
+                    let off = offset.wrapping_add((w * 4) as i32);
+                    let value = self.read_reg(if src == RZ {
+                        RZ
+                    } else {
+                        src.wrapping_add(w as u8)
+                    });
+                    self.program.emit_void_pred(
+                        Op::StoreGlobal {
+                            addr_lo,
+                            offset: off,
+                            value,
+                        },
+                        pred,
+                    );
                 }
             }
 
@@ -3653,6 +3740,56 @@ impl Translator {
             }
             Opcode::IADD32I => {
                 self.emit_iadd(raw, Value::ImmU32(imm32(raw)), pred);
+            }
+
+            Opcode::IMUL_imm => {
+                if ((raw >> 39) & 0x1ff) != 0 {
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::IMUL_imm,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                self.emit_imul(
+                    raw,
+                    Value::ImmU32(imm20(raw) as u32),
+                    pred,
+                    false,
+                    false,
+                    false,
+                );
+            }
+            Opcode::IMUL_reg => {
+                self.emit_imul(
+                    raw,
+                    self.read_reg(reg_b(raw)),
+                    pred,
+                    ((raw >> 53) & 1) != 0,
+                    ((raw >> 54) & 1) != 0,
+                    ((raw >> 55) & 1) != 0,
+                );
+            }
+            Opcode::IMUL32I => {
+                self.emit_imul(
+                    raw,
+                    Value::ImmU32(imm32(raw)),
+                    pred,
+                    ((raw >> 53) & 1) != 0,
+                    ((raw >> 54) & 1) != 0,
+                    ((raw >> 55) & 1) != 0,
+                );
+            }
+
+            Opcode::PRMT_imm => {
+                if !self.emit_prmt_imm(raw, pred) {
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::PRMT_imm,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
             }
 
             Opcode::IADD3_reg => {
@@ -4232,6 +4369,109 @@ mod tests {
             other => panic!("expected FMul, got {other:?}"),
         }
         assert_eq!(t.program.instructions[0].dest_reg, Some(3));
+    }
+
+    #[test]
+    fn dusk_nvk_prmt_immediates_translate_generic_byte_permutations() {
+        for (raw, dest, source) in [
+            (0x36c0_7f84_4437_0403, 3, 4),
+            (0x36c0_7f84_4437_0504, 4, 5),
+            (0x36c0_7f84_4437_0605, 5, 6),
+        ] {
+            assert_eq!(decode_one(raw).unwrap().opcode, Opcode::PRMT_imm);
+            let mut t = Translator::new();
+            assert!(t.translate(raw));
+            assert_eq!(t.unimplemented_count, 0);
+            assert!(t.program.instructions.iter().any(|inst| matches!(
+                inst.op,
+                Op::Bfe {
+                    a: Value::GprIn(reg),
+                    b: Value::ImmU32(0x818),
+                    signed: false,
+                } if reg == source
+            )));
+            assert!(matches!(
+                t.program.instructions.last(),
+                Some(Inst {
+                    op: Op::Mov(Value::Inst(_)),
+                    dest_reg: Some(reg),
+                    ..
+                }) if *reg == dest
+            ));
+        }
+    }
+
+    #[test]
+    fn prmt_sign_selectors_replicate_only_the_selected_sign_bit() {
+        const BASE_RAW: u64 = 0x36c0_7f84_4437_0403;
+        const SELECTOR_MASK: u64 = 0xffff << 20;
+        let raw = (BASE_RAW & !SELECTOR_MASK) | (0x8888 << 20);
+        assert_eq!(decode_one(raw).unwrap().opcode, Opcode::PRMT_imm);
+
+        let mut t = Translator::new();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(
+            t.program.instructions.iter().any(|inst| matches!(
+                inst.op,
+                Op::Bfe {
+                    a: Value::GprIn(4),
+                    b: Value::ImmU32(0x107),
+                    signed: true,
+                }
+            )),
+            "{:#?}",
+            t.program.instructions
+        );
+        assert!(!t
+            .program
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst.op, Op::IShr { signed: true, .. })));
+    }
+
+    #[test]
+    fn dusk_nvk_imul_immediate_multiplies_vertex_index_by_stride() {
+        const RAW: u64 = 0x3838_0000_0307_0000;
+        assert_eq!(decode_one(RAW).unwrap().opcode, Opcode::IMUL_imm);
+
+        let mut t = Translator::new();
+        assert!(t.translate(RAW));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(matches!(
+            t.program.instructions.as_slice(),
+            [Inst {
+                op: Op::IMul {
+                    a: Value::GprIn(0),
+                    b: Value::ImmU32(48),
+                },
+                dest_reg: Some(0),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn dusk_nvk_imul32i_high_extracts_unsigned_product_high_word() {
+        const RAW: u64 = 0x1f2a_aaaa_aab7_0101;
+        assert_eq!(decode_one(RAW).unwrap().opcode, Opcode::IMUL32I);
+
+        let mut t = Translator::new();
+        assert!(t.translate(RAW));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(matches!(
+            t.program.instructions.as_slice(),
+            [Inst {
+                op: Op::IMulHigh {
+                    a: Value::GprIn(1),
+                    b: Value::ImmU32(0xaaaa_aaab),
+                    signed_a: false,
+                    signed_b: false,
+                },
+                dest_reg: Some(1),
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -5202,6 +5442,59 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+        }
+    }
+
+    #[test]
+    fn dusk_tld_b_preserves_masked_handle_origin() {
+        let mut t = Translator::new();
+        for raw in [
+            0x4c98_0784_0047_0003,
+            0x0400_00ff_fff7_0303,
+            0x4c98_0784_0057_0006,
+            0x040f_ff00_0007_0606,
+            0x5c47_0200_0067_0306,
+        ] {
+            assert!(t.translate(raw), "raw={raw:#018x}");
+        }
+        assert_eq!(
+            t.trace_cbuf_handle_origin(&t.read_reg(6), None, None),
+            Some((
+                CbufHandleOrigin {
+                    binding: 1,
+                    word_offset: 4,
+                    secondary_word_offset: Some(5),
+                    secondary_binding: None,
+                },
+                false,
+            ))
+        );
+
+        assert!(t.translate(0x5c98_0780_0037_0006));
+        assert!(t.translate(0xdd38_0003_a067_1400));
+        assert_eq!(t.unimplemented_count, 0);
+
+        let fetches: Vec<_> = t
+            .program
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::TexelFetch { .. }))
+            .collect();
+        assert_eq!(fetches.len(), 3);
+        for (component, fetch) in fetches.into_iter().enumerate() {
+            assert_eq!(fetch.dest_reg, Some(component as u8));
+            assert!(matches!(
+                fetch.op,
+                Op::TexelFetch {
+                    cbuf_binding: 1,
+                    cbuf_word_offset: 4,
+                    cbuf_secondary_word_offset: None,
+                    x: Value::GprIn(20),
+                    y: Some(Value::GprIn(21)),
+                    z: None,
+                    component: actual,
+                } if actual == component as u8
+            ));
         }
     }
 
@@ -6426,6 +6719,7 @@ mod tests {
                     binding: 2,
                     word_offset: 0x15c,
                     secondary_word_offset: None,
+                    secondary_binding: None,
                 },
                 false,
             ))
@@ -6590,6 +6884,39 @@ mod tests {
             .instructions
             .iter()
             .any(|inst| matches!(inst.op, Op::Unimplemented { .. })));
+    }
+
+    #[test]
+    fn dusk_tex_b_traces_masked_cross_cbuf_texture_sampler_handle() {
+        let mut t = Translator::new_fragment();
+        for raw in [
+            0x4c98_0788_0007_0000,
+            0x4c98_0784_0007_0001,
+            0x0400_00ff_fff7_0000,
+            0x040f_ff00_0007_0101,
+            0x5c47_0200_0017_0000,
+            0xdeba_0003_a007_0204,
+        ] {
+            assert!(t.translate(raw), "raw={raw:#018x}");
+        }
+
+        let texture_id = crate::bindless_texture_id(2, 0);
+        assert_eq!(t.unimplemented_count, 0);
+        assert_eq!(
+            t.bindless_or_partners.get(&texture_id),
+            Some(&crate::bindless_texture_id(1, 0))
+        );
+        assert_eq!(
+            t.program
+                .instructions
+                .iter()
+                .filter_map(|inst| match inst.op {
+                    Op::SampleTex { tex_id, .. } => Some(tex_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![texture_id; 3]
+        );
     }
 
     #[test]
