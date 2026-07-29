@@ -149,6 +149,11 @@ fn gui_rate_stats(kind: usize) {
     }
 }
 
+fn diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_DIAG").is_some())
+}
+
 pub struct HorizonApp {
     nro_path: String,
     emulation_handle: Option<EmulationHandle>,
@@ -1015,11 +1020,12 @@ impl HorizonApp {
                 self.upload_frame_native(&frame);
                 return;
             }
-            let img = egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &frame.pixels,
-            );
+            let image_size = [frame.width as usize, frame.height as usize];
+            let img = egui::ColorImage::from_rgba_unmultiplied(image_size, &frame.pixels);
             match &mut self.game_texture {
+                Some(t) if t.size() == image_size => {
+                    t.set_partial([0, 0], img, tex_opts);
+                }
                 Some(t) => t.set(img, tex_opts),
                 None => {
                     self.game_texture = Some(ctx.load_texture("game_frame", img, tex_opts));
@@ -1777,7 +1783,16 @@ impl HorizonApp {
             egui::Id::new("carousel_settings"),
         ));
         p.set_opacity(ease);
-        crate::carousel::draw_backdrop(&p, full, accent, t, backdrop_theme, 1.0, if lightish { 1.0 } else { 0.0 }, None);
+        crate::carousel::draw_backdrop(
+            &p,
+            full,
+            accent,
+            t,
+            backdrop_theme,
+            1.0,
+            if lightish { 1.0 } else { 0.0 },
+            None,
+        );
         let scrim = if lightish {
             egui::Color32::from_rgba_unmultiplied(0xFA, 0xFA, 0xFC, 235)
         } else {
@@ -2129,7 +2144,13 @@ impl HorizonApp {
                     if let Some(tex) = self.library.texture(ctx, gi) {
                         let base_g = if lightish { 155.0 } else { 66.0 };
                         let g = (base_g + (255.0 - base_g) * fade) as u8;
-                        crate::carousel::draw_rounded_image(&clip, tex.id(), rect, 9.0, egui::Color32::from_rgb(g, g, g));
+                        crate::carousel::draw_rounded_image(
+                            &clip,
+                            tex.id(),
+                            rect,
+                            9.0,
+                            egui::Color32::from_rgb(g, g, g),
+                        );
                     } else {
                         let g = (110.0 + 90.0 * fade) as u8;
                         clip.text(
@@ -3293,7 +3314,16 @@ impl HorizonApp {
             egui::Id::new("preferences"),
         ));
         p.set_opacity(ease);
-        crate::carousel::draw_backdrop(&p, full, accent, t, backdrop_theme, 1.0, if lightish { 1.0 } else { 0.0 }, None);
+        crate::carousel::draw_backdrop(
+            &p,
+            full,
+            accent,
+            t,
+            backdrop_theme,
+            1.0,
+            if lightish { 1.0 } else { 0.0 },
+            None,
+        );
         let scrim = if lightish {
             egui::Color32::from_rgba_unmultiplied(0xFA, 0xFA, 0xFC, 235)
         } else {
@@ -5033,7 +5063,9 @@ impl HorizonApp {
             }
             let devices: Vec<String> = self.audio_device_cache.clone().unwrap_or_default();
             let n = 7usize;
-            if !self.prefs_focus { self.prefs_row = 0; }
+            if !self.prefs_focus {
+                self.prefs_row = 0;
+            }
             self.prefs_row = self.prefs_row.min(n - 1);
             if self.prefs_focus && !block {
                 if nu && self.prefs_row > 0 {
@@ -5045,7 +5077,15 @@ impl HorizonApp {
                     crate::ui_audio::play_move();
                 }
             }
-            let labels = ["Output Device", "Master Volume", "Music Volume", "SFX Volume", "Mute Music", "Mute SFX", "Menu Music"];
+            let labels = [
+                "Output Device",
+                "Master Volume",
+                "Music Volume",
+                "SFX Volume",
+                "Mute Music",
+                "Mute SFX",
+                "Menu Music",
+            ];
             let row_h = 58.0 * s;
             let mut y = content.min.y + 6.0 * s;
             let mut drag_set: Option<(usize, f32)> = None;
@@ -5082,17 +5122,47 @@ impl HorizonApp {
                 }
                 let desc = match i {
                     0 => "Output device for all audio. Applies on next boot.",
-                    6 => "Either Select All, or specific tracks for your Main Carousel Music Themes.",
+                    6 => {
+                        "Either Select All, or specific tracks for your Main Carousel Music Themes."
+                    }
                     _ => "",
                 };
                 if desc.is_empty() {
-                    p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y)), egui::Align2::LEFT_CENTER, labels[i], egui::FontId::proportional(18.0 * s * sf), text);
+                    p.text(
+                        sp(egui::pos2(base.min.x + 22.0 * s, base.center().y)),
+                        egui::Align2::LEFT_CENTER,
+                        labels[i],
+                        egui::FontId::proportional(18.0 * s * sf),
+                        text,
+                    );
                 } else {
-                    p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y - 10.0 * s)), egui::Align2::LEFT_CENTER, labels[i], egui::FontId::proportional(18.0 * s * sf), text);
-                    p.text(sp(egui::pos2(base.min.x + 22.0 * s, base.center().y + 12.0 * s)), egui::Align2::LEFT_CENTER, desc, egui::FontId::proportional(12.0 * s * sf), muted);
+                    p.text(
+                        sp(egui::pos2(
+                            base.min.x + 22.0 * s,
+                            base.center().y - 10.0 * s,
+                        )),
+                        egui::Align2::LEFT_CENTER,
+                        labels[i],
+                        egui::FontId::proportional(18.0 * s * sf),
+                        text,
+                    );
+                    p.text(
+                        sp(egui::pos2(
+                            base.min.x + 22.0 * s,
+                            base.center().y + 12.0 * s,
+                        )),
+                        egui::Align2::LEFT_CENTER,
+                        desc,
+                        egui::FontId::proportional(12.0 * s * sf),
+                        muted,
+                    );
                 }
                 if (1..=3).contains(&i) {
-                    let val = match i { 1 => self.app_settings.audio_volume, 2 => self.app_settings.music_volume, _ => self.app_settings.sfx_volume };
+                    let val = match i {
+                        1 => self.app_settings.audio_volume,
+                        2 => self.app_settings.music_volume,
+                        _ => self.app_settings.sfx_volume,
+                    };
                     let tl = base.min.x + 230.0 * s;
                     let tr = base.max.x - 96.0 * s;
                     let ty = base.center().y;
@@ -5149,16 +5219,55 @@ impl HorizonApp {
                     let rx = base.max.x - 22.0 * s;
                     let mv: std::borrow::Cow<str> = match i {
                         0 => shorten_device(&self.app_settings.audio_output_device).into(),
-                        4 => if self.app_settings.music_muted { "On".into() } else { "Off".into() },
-                        5 => if self.app_settings.sfx_muted { "On".into() } else { "Off".into() },
-                        _ => crate::ui_audio::carousel_track_label(self.app_settings.menu_music_track).into(),
+                        4 => {
+                            if self.app_settings.music_muted {
+                                "On".into()
+                            } else {
+                                "Off".into()
+                            }
+                        }
+                        5 => {
+                            if self.app_settings.sfx_muted {
+                                "On".into()
+                            } else {
+                                "Off".into()
+                            }
+                        }
+                        _ => crate::ui_audio::carousel_track_label(
+                            self.app_settings.menu_music_track,
+                        )
+                        .into(),
                     };
                     let mvsize = if i == 0 { 13.5 } else { 16.0 };
-                    p.text(sp(egui::pos2((lx + rx) * 0.5, base.center().y)), egui::Align2::CENTER_CENTER, mv.as_ref(), egui::FontId::proportional(mvsize * s * sf), if selrow { accent } else { muted });
-                    let la = egui::Rect::from_center_size(egui::pos2(lx, base.center().y), egui::Vec2::splat(34.0 * s));
-                    let ra = egui::Rect::from_center_size(egui::pos2(rx, base.center().y), egui::Vec2::splat(34.0 * s));
-                    p.text(sp(la.center()), egui::Align2::CENTER_CENTER, "\u{2039}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
-                    p.text(sp(ra.center()), egui::Align2::CENTER_CENTER, "\u{203A}", egui::FontId::proportional(22.0 * s * sf), if selrow { accent } else { muted });
+                    p.text(
+                        sp(egui::pos2((lx + rx) * 0.5, base.center().y)),
+                        egui::Align2::CENTER_CENTER,
+                        mv.as_ref(),
+                        egui::FontId::proportional(mvsize * s * sf),
+                        if selrow { accent } else { muted },
+                    );
+                    let la = egui::Rect::from_center_size(
+                        egui::pos2(lx, base.center().y),
+                        egui::Vec2::splat(34.0 * s),
+                    );
+                    let ra = egui::Rect::from_center_size(
+                        egui::pos2(rx, base.center().y),
+                        egui::Vec2::splat(34.0 * s),
+                    );
+                    p.text(
+                        sp(la.center()),
+                        egui::Align2::CENTER_CENTER,
+                        "\u{2039}",
+                        egui::FontId::proportional(22.0 * s * sf),
+                        if selrow { accent } else { muted },
+                    );
+                    p.text(
+                        sp(ra.center()),
+                        egui::Align2::CENTER_CENTER,
+                        "\u{203A}",
+                        egui::FontId::proportional(22.0 * s * sf),
+                        if selrow { accent } else { muted },
+                    );
                     if !block && ui.rect_contains_pointer(r) {
                         let rowc = ui.allocate_rect(r, egui::Sense::click()).clicked();
                         let lc = ui.allocate_rect(sr(la), egui::Sense::click()).clicked();
@@ -5189,17 +5298,34 @@ impl HorizonApp {
                     3 => self.app_settings.sfx_volume = frac,
                     _ => {}
                 }
-                crate::ui_audio::set_sfx_volume(if self.app_settings.sfx_muted { 0.0 } else { self.app_settings.sfx_volume });
+                crate::ui_audio::set_sfx_volume(if self.app_settings.sfx_muted {
+                    0.0
+                } else {
+                    self.app_settings.sfx_volume
+                });
                 let _ = self.app_settings.save();
             } else if key_dir != 0 {
                 let step = 0.05 * key_dir as f32;
                 match self.prefs_row {
-                    1 => self.app_settings.audio_volume = (self.app_settings.audio_volume + step).clamp(0.0, 1.0),
-                    2 => self.app_settings.music_volume = (self.app_settings.music_volume + step).clamp(0.0, 1.0),
-                    3 => self.app_settings.sfx_volume = (self.app_settings.sfx_volume + step).clamp(0.0, 1.0),
+                    1 => {
+                        self.app_settings.audio_volume =
+                            (self.app_settings.audio_volume + step).clamp(0.0, 1.0)
+                    }
+                    2 => {
+                        self.app_settings.music_volume =
+                            (self.app_settings.music_volume + step).clamp(0.0, 1.0)
+                    }
+                    3 => {
+                        self.app_settings.sfx_volume =
+                            (self.app_settings.sfx_volume + step).clamp(0.0, 1.0)
+                    }
                     r => apply_audio_cycle(&mut self.app_settings, r, key_dir, &devices),
                 }
-                crate::ui_audio::set_sfx_volume(if self.app_settings.sfx_muted { 0.0 } else { self.app_settings.sfx_volume });
+                crate::ui_audio::set_sfx_volume(if self.app_settings.sfx_muted {
+                    0.0
+                } else {
+                    self.app_settings.sfx_volume
+                });
                 let _ = self.app_settings.save();
                 crate::ui_audio::play_move();
             }
@@ -6135,15 +6261,6 @@ impl HorizonApp {
     }
 }
 
-fn parse_u64_value(s: &str) -> Option<u64> {
-    let t = s.trim();
-    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        u64::from_str_radix(hex, 16).ok()
-    } else {
-        t.parse::<u64>().ok()
-    }
-}
-
 pub fn clipboard_text() -> String {
     arboard::Clipboard::new()
         .and_then(|mut c| c.get_text())
@@ -6552,11 +6669,19 @@ fn shorten_device(dev: &Option<String>) -> String {
 fn cycle_audio_device(current: &Option<String>, devices: &[String], dir: i32) -> Option<String> {
     let cur = match current {
         None => 0usize,
-        Some(name) => devices.iter().position(|d| d == name).map(|p| p + 1).unwrap_or(0),
+        Some(name) => devices
+            .iter()
+            .position(|d| d == name)
+            .map(|p| p + 1)
+            .unwrap_or(0),
     };
     let len = (devices.len() + 1) as i32;
     let next = (cur as i32 + dir).rem_euclid(len) as usize;
-    if next == 0 { None } else { devices.get(next - 1).cloned() }
+    if next == 0 {
+        None
+    } else {
+        devices.get(next - 1).cloned()
+    }
 }
 
 fn apply_audio_cycle(cfg: &mut AppSettings, row: usize, dir: i32, devices: &[String]) {
@@ -7320,12 +7445,6 @@ impl eframe::App for HorizonApp {
             self.reload_profile_texture(ctx);
         }
 
-        let auto_input_enabled = std::env::var_os("NEXIUM_AUTO_PRESS_A_MS").is_some()
-            || std::env::var_os("NEXIUM_AUTO_PRESS_SEQUENCE").is_some();
-        if auto_input_enabled {
-            ctx.request_repaint_after(std::time::Duration::from_millis(8));
-        }
-
         if let Some(ref mut ib) = self.input {
             self.last_input = ib.poll(
                 &self.controller_config,
@@ -7565,65 +7684,16 @@ impl eframe::App for HorizonApp {
             } else {
                 (0u64, [0i32; 4])
             };
-            let mut buttons = kb_buttons | gp_buttons;
-            if auto_input_enabled {
-                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed_ms = START
-                    .get_or_init(std::time::Instant::now)
-                    .elapsed()
-                    .as_millis() as u64;
-                let mut auto_buttons = 0u64;
-                if let Ok(sequence) = std::env::var("NEXIUM_AUTO_PRESS_SEQUENCE") {
-                    for step in sequence.split(',') {
-                        let mut parts = step.split(':');
-                        let Some(delay_ms) = parts.next().and_then(parse_u64_value) else {
-                            continue;
-                        };
-                        let len_ms = parts.next().and_then(parse_u64_value).unwrap_or(2000);
-                        let mask = parts
-                            .next()
-                            .and_then(parse_u64_value)
-                            .unwrap_or(nexium_core::hid_state::NPAD_BUTTON_A);
-                        if elapsed_ms >= delay_ms && elapsed_ms < delay_ms.saturating_add(len_ms) {
-                            auto_buttons |= mask;
-                        }
-                    }
-                } else if let Some(delay_ms) = std::env::var("NEXIUM_AUTO_PRESS_A_MS")
-                    .ok()
-                    .and_then(|s| parse_u64_value(&s))
-                {
-                    let len_ms = std::env::var("NEXIUM_AUTO_PRESS_A_LEN_MS")
-                        .ok()
-                        .and_then(|s| parse_u64_value(&s))
-                        .unwrap_or(2000);
-                    let mask = std::env::var("NEXIUM_AUTO_PRESS_MASK")
-                        .ok()
-                        .and_then(|s| parse_u64_value(&s))
-                        .unwrap_or(nexium_core::hid_state::NPAD_BUTTON_A);
-                    if elapsed_ms >= delay_ms && elapsed_ms < delay_ms.saturating_add(len_ms) {
-                        auto_buttons |= mask;
-                    }
-                }
-                buttons |= auto_buttons;
-                static LAST_AUTO_BUTTONS: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(u64::MAX);
-                let last =
-                    LAST_AUTO_BUTTONS.swap(auto_buttons, std::sync::atomic::Ordering::Relaxed);
-                if last != auto_buttons {
-                    log::info!(
-                        "auto input elapsed_ms={} buttons={:#x}",
-                        elapsed_ms,
-                        auto_buttons
-                    );
-                }
-            }
+            let buttons = kb_buttons | gp_buttons;
             let mut sticks = kb_sticks;
             for i in 0..4 {
                 if gp_sticks[i].abs() > sticks[i].abs() {
                     sticks[i] = gp_sticks[i];
                 }
             }
-            if buttons != self.last_buttons_logged || sticks != self.last_sticks_logged {
+            if diagnostics_enabled()
+                && (buttons != self.last_buttons_logged || sticks != self.last_sticks_logged)
+            {
                 self.last_buttons_logged = buttons;
                 self.last_sticks_logged = sticks;
                 log::info!(

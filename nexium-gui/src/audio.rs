@@ -502,28 +502,10 @@ fn drain_stereo_to(
     audio_out: &Mutex<AudioOutMixer>,
     prebuf: &mut PrebufState,
 ) {
-    use std::sync::atomic::{AtomicBool, AtomicU32 as AU32};
-    static FIRED: AtomicBool = AtomicBool::new(false);
-    static CALL_COUNT: AU32 = AU32::new(0);
-    static MIN_OCC: AU32 = AU32::new(u32::MAX);
-    static EMPTY_CT: AU32 = AU32::new(0);
-    if !FIRED.swap(true, Ordering::Relaxed) {
-        log::info!(
-            "cpal callback FIRST FIRE: out_len={} dev_ch={} ratio={:.3}",
-            out.len(),
-            dev_ch,
-            resample_ratio
-        );
-    }
-    let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     let vol = f32::from_bits(volume.load(Ordering::Relaxed));
 
     let occ = consumer.occupied_len();
     let mut audio_out = audio_out.lock().unwrap_or_else(|p| p.into_inner());
-    MIN_OCC.fetch_min(occ as u32, Ordering::Relaxed);
-    if occ == 0 {
-        EMPTY_CT.fetch_add(1, Ordering::Relaxed);
-    }
     if prebuf.priming && (occ >= PREBUF_TARGET_SAMPLES || audio_out.has_ready_frame()) {
         prebuf.priming = false;
     }
@@ -531,7 +513,6 @@ fn drain_stereo_to(
     let ratio = prebuf.callback_ratio(out.len() / dev_ch, resample_ratio);
 
     let mut frames_written = 0usize;
-    let mut peak: f32 = 0.0;
     for chunk in out.chunks_mut(dev_ch) {
         if !priming {
             while prebuf.pos >= 1.0 {
@@ -551,7 +532,6 @@ fn drain_stereo_to(
             )
         };
         let (l, r) = clamp_stereo_output(l, r);
-        peak = peak.max(l.abs()).max(r.abs());
         if dev_ch == 1 {
             chunk[0] = 0.5 * (l + r);
         } else {
@@ -565,20 +545,6 @@ fn drain_stereo_to(
             prebuf.pos += ratio;
         }
         frames_written += 1;
-    }
-    if n == 1 || (n > 0 && n % 50 == 0) {
-        let min_occ = MIN_OCC.swap(u32::MAX, Ordering::Relaxed);
-        let empty_ct = EMPTY_CT.swap(0, Ordering::Relaxed);
-        log::debug!(
-            "cpal callback #{}: peak_amp={:.4} priming={} occ={} min_occ={} empty={} ratio={:.3}",
-            n,
-            peak,
-            priming,
-            occ,
-            min_occ,
-            empty_ct,
-            prebuf.ratio
-        );
     }
     let render_frames = ((frames_written as f32) * ratio).round() as u64;
     let new_consumed = consumed.fetch_add(render_frames, Ordering::Relaxed) + render_frames;
@@ -668,12 +634,6 @@ fn clamp_stereo_output(left: f32, right: f32) -> (f32, f32) {
 }
 
 fn post_audio_events(new_consumed: u64) {
-    const CLK_MARK_FRAMES: u64 = 480_000;
-    static LAST_MARK: AtomicU64 = AtomicU64::new(0);
-    let mark = new_consumed / CLK_MARK_FRAMES;
-    if mark > 0 && LAST_MARK.swap(mark, Ordering::Relaxed) != mark {
-        log::info!("[aclk] consumed={} frames ({}x480k)", new_consumed, mark);
-    }
     const FRAMES_PER_AUDIO_FRAME: u64 = 240;
     static LAST_SIGNALED: AtomicU64 = AtomicU64::new(0);
     let last = LAST_SIGNALED.load(Ordering::Relaxed);

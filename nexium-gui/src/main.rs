@@ -26,7 +26,6 @@ use app_settings::AppSettings;
 use nexium_common::FileLogger;
 
 fn main() -> Result<(), eframe::Error> {
-    // Re-enabled for the guest by the game window process.
     std::env::set_var("DISABLE_MANGOHUD", "1");
 
     if std::env::var_os("NEXIUM_DIAG").is_some() {
@@ -111,7 +110,7 @@ fn main() -> Result<(), eframe::Error> {
             .with_icon(icon)
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([640.0, 480.0]),
-        renderer: eframe::Renderer::Wgpu,
+        renderer: eframe::Renderer::Glow,
         vsync: settings.vsync,
         ..Default::default()
     };
