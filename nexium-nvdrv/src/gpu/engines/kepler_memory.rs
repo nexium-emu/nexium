@@ -17,6 +17,8 @@ const M_DST_ORIGIN_SAMPLES_Y: u32 = 0x6B;
 const M_LAUNCH_DMA: u32 = 0x6C;
 const M_LOAD_INLINE_DATA: u32 = 0x6D;
 
+const MAX_INLINE_BYTES: usize = 16 * 1024 * 1024;
+
 const LAUNCH_DST_LAYOUT_BIT: u32 = 0;
 const LAYOUT_BLOCK_LINEAR: u32 = 0;
 const LAYOUT_PITCH: u32 = 1;
@@ -81,10 +83,28 @@ impl KeplerMemory {
         self.launch_flags = flags;
         let line_length = self.line_length_in as usize;
         let line_count = self.line_count.max(1) as usize;
-        self.copy_size = line_length * line_count;
+        let requested = line_length.saturating_mul(line_count);
+        let copy_size = requested.min(MAX_INLINE_BYTES);
+        if copy_size != requested {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CLAMPED: AtomicU64 = AtomicU64::new(0);
+            let n = CLAMPED.fetch_add(1, Ordering::Relaxed);
+            if n < 32 || n % 1024 == 0 {
+                log::warn!(
+                    "[i2m-clamp] #{} bogus inline upload line_len={} line_count={} requested={} → clamped to {} (flags={:#x})",
+                    n,
+                    line_length,
+                    line_count,
+                    requested,
+                    copy_size,
+                    flags
+                );
+            }
+        }
+        self.copy_size = copy_size;
         self.write_offset = 0;
         self.inline_buf.clear();
-        self.inline_buf.resize(self.copy_size, 0);
+        self.inline_buf.resize(copy_size, 0);
     }
 
     fn load_inline_data(
@@ -192,6 +212,25 @@ impl KeplerMemory {
                     dst_height,
                     block_height_log2,
                 );
+                if tiled_size > MAX_INLINE_BYTES {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+                    let n = SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 || n % 1024 == 0 {
+                        log::warn!(
+                            "[i2m-skip] #{} block-linear dst too large: tiled={} dst_w={} dst_h={} bh_log2={} line_len={} line_count={} — skipping upload",
+                            n,
+                            tiled_size,
+                            dst_width_bytes,
+                            dst_height,
+                            block_height_log2,
+                            line_length,
+                            line_count
+                        );
+                    }
+                    crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KM_FLUSH, kp);
+                    return;
+                }
                 let mut tiled = vec![0u8; tiled_size];
                 let n = tiled_size.min(dst_limit);
                 mem_read(dst_cpu, &mut tiled[..n]);
