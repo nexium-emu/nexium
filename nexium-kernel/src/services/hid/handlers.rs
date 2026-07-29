@@ -307,6 +307,7 @@ pub fn set_supported_npad_style_set(
     let events: Vec<u32> = kernel.services.hid.style_change_events.clone();
     for h in events {
         kernel.event_signals.insert(h, true);
+        kernel.threads.signal_handle(h);
     }
 }
 pub fn get_supported_npad_style_set(
@@ -331,6 +332,7 @@ pub fn activate_npad(kernel: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64)
     let events: Vec<u32> = kernel.services.hid.style_change_events.clone();
     for h in events {
         kernel.event_signals.insert(h, true);
+        kernel.threads.signal_handle(h);
     }
 }
 pub fn deactivate_npad(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32, _aruid: u64) {}

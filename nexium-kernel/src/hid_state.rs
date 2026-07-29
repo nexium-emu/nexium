@@ -94,24 +94,22 @@ pub struct ControllerInput {
 
 pub struct HidState {
     buf: Box<[u8; HID_SHMEM_SIZE]>,
+    mapped_host_ptr: usize,
     pub input: ControllerInput,
     pub sampling_number: u64,
     pub shmem_va: Option<u64>,
-    last_logged_buttons: u64,
     last_tick: Option<std::time::Instant>,
-    dumped_shmem: bool,
 }
 
 impl HidState {
     pub fn new() -> Self {
         let mut s = Self {
             buf: Box::new([0u8; HID_SHMEM_SIZE]),
+            mapped_host_ptr: 0,
             input: ControllerInput::default(),
             sampling_number: 0,
             shmem_va: None,
-            last_logged_buttons: 0,
             last_tick: None,
-            dumped_shmem: false,
         };
         s.init_metadata();
         s.tick(ControllerInput::default());
@@ -141,6 +139,22 @@ impl HidState {
         self.buf.as_mut_ptr()
     }
 
+    pub unsafe fn bind_mapped_host(&mut self, ptr: *mut u8) {
+        self.mapped_host_ptr = ptr as usize;
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.buf.as_ptr(), ptr, HID_SHMEM_SIZE);
+        }
+    }
+
+    pub fn unbind_mapped_host(&mut self, ptr: usize) -> bool {
+        if self.mapped_host_ptr != ptr {
+            return false;
+        }
+        self.mapped_host_ptr = 0;
+        self.shmem_va = None;
+        true
+    }
+
     pub fn size(&self) -> usize {
         HID_SHMEM_SIZE
     }
@@ -151,14 +165,6 @@ impl HidState {
 
     pub fn tick(&mut self, input: ControllerInput) {
         self.input = input;
-        if input.buttons != self.last_logged_buttons {
-            log::info!(
-                "hid:tick buttons={:#x} (was {:#x})",
-                input.buttons,
-                self.last_logged_buttons
-            );
-            self.last_logged_buttons = input.buttons;
-        }
         self.sampling_number = self.sampling_number.wrapping_add(1);
         let sampling = self.sampling_number;
         let docked = CONSOLE_DOCKED.load(std::sync::atomic::Ordering::Relaxed);
@@ -181,20 +187,18 @@ impl HidState {
                 | ATTR_RIGHT_CONNECTED
                 | ATTR_RIGHT_WIRED;
             Self::setup_joy_dual(&mut self.buf[..], NPAD_ENTRY_PLAYER1);
-            Self::write_npad_lifo(
+            Self::write_standard_npad_lifos(
                 &mut self.buf[..],
                 NPAD_ENTRY_PLAYER1,
-                2,
                 &input,
                 sampling,
                 attr,
             );
         } else if docked {
             Self::setup_fullkey(&mut self.buf[..], NPAD_ENTRY_PLAYER1);
-            Self::write_npad_lifo(
+            Self::write_standard_npad_lifos(
                 &mut self.buf[..],
                 NPAD_ENTRY_PLAYER1,
-                0,
                 &input,
                 sampling,
                 ATTR_IS_CONNECTED | ATTR_IS_WIRED,
@@ -207,83 +211,22 @@ impl HidState {
                 | ATTR_RIGHT_CONNECTED
                 | ATTR_RIGHT_WIRED;
             Self::setup_handheld(&mut self.buf[..], NPAD_ENTRY_HANDHELD);
-            Self::write_npad_lifo(
+            Self::write_standard_npad_lifos(
                 &mut self.buf[..],
                 NPAD_ENTRY_HANDHELD,
-                1,
                 &input,
                 sampling,
                 attr,
             );
         }
 
-        if !self.dumped_shmem && self.shmem_va.is_some() && input.buttons != 0 {
-            self.dumped_shmem = true;
-            log::info!(
-                "hid:shmem-dump @va={:?} sampling={}",
-                self.shmem_va,
-                sampling
-            );
-            for (entry_idx, name) in [
-                (NPAD_ENTRY_PLAYER1, "Player1"),
-                (1usize, "Player2"),
-                (NPAD_ENTRY_HANDHELD, "Handheld"),
-                (NPAD_ENTRY_OTHER, "Other"),
-            ] {
-                let base = NPAD_OFFSET + entry_idx * NPAD_ENTRY_SIZE;
-                let style =
-                    u32::from_le_bytes(self.buf[base..base + 4].try_into().unwrap_or([0; 4]));
-                log::info!(
-                    "hid:shmem {} (entry={}) style_tag={:#x}",
-                    name,
-                    entry_idx,
-                    style
+        if self.mapped_host_ptr != 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.buf.as_ptr(),
+                    self.mapped_host_ptr as *mut u8,
+                    HID_SHMEM_SIZE,
                 );
-                for (layout_idx, layout_name) in
-                    [(0usize, "FullKey"), (1, "Handheld"), (2, "JoyDual")]
-                {
-                    let lifo = base + LAYOUT_BASE_OFFSET + layout_idx * LAYOUT_STRIDE;
-                    let hdr0 =
-                        u64::from_le_bytes(self.buf[lifo..lifo + 8].try_into().unwrap_or([0; 8]));
-                    let hdr1 = u64::from_le_bytes(
-                        self.buf[lifo + 8..lifo + 16].try_into().unwrap_or([0; 8]),
-                    );
-                    let hdr2 = u64::from_le_bytes(
-                        self.buf[lifo + 0x10..lifo + 0x18]
-                            .try_into()
-                            .unwrap_or([0; 8]),
-                    );
-                    let hdr3 = u64::from_le_bytes(
-                        self.buf[lifo + 0x18..lifo + 0x20]
-                            .try_into()
-                            .unwrap_or([0; 8]),
-                    );
-                    let current = (hdr2 as usize).min(LIFO_STORAGE_COUNT - 1);
-                    let state = lifo + LIFO_HEADER_SIZE + current * LIFO_STORAGE_ELEM_SIZE + 8;
-                    let st_sample =
-                        u64::from_le_bytes(self.buf[state..state + 8].try_into().unwrap_or([0; 8]));
-                    let st_btn = u64::from_le_bytes(
-                        self.buf[state + 8..state + 16].try_into().unwrap_or([0; 8]),
-                    );
-                    let st_attr = u32::from_le_bytes(
-                        self.buf[state + 0x20..state + 0x24]
-                            .try_into()
-                            .unwrap_or([0; 4]),
-                    );
-                    log::info!(
-                        "  layout[{}={}] lifo_off=+{:#x} hdr=({},{},{},{}) state.sample={} state.buttons={:#x} state.attr={:#x}",
-                        layout_idx,
-                        layout_name,
-                        lifo - base,
-                        hdr0,
-                        hdr1,
-                        hdr2,
-                        hdr3,
-                        st_sample,
-                        st_btn,
-                        st_attr
-                    );
-                }
             }
         }
     }
@@ -381,7 +324,7 @@ impl HidState {
         let previous_total = read_u64(buf, lifo + 0x08);
         let previous_tail = read_u64(buf, lifo + 0x10);
         let tail = (sampling % LIFO_STORAGE_COUNT as u64) as usize;
-        let count = sampling.min((LIFO_STORAGE_COUNT - 1) as u64);
+        let count = sampling.min(LIFO_STORAGE_COUNT as u64);
 
         write_u64(buf, lifo + 0x00, sampling);
         write_u64(buf, lifo + 0x08, LIFO_STORAGE_COUNT as u64);
@@ -401,6 +344,18 @@ impl HidState {
             }
         } else {
             Self::write_npad_lifo_entry(buf, lifo, tail, input, sampling, attr);
+        }
+    }
+
+    fn write_standard_npad_lifos(
+        buf: &mut [u8],
+        entry_idx: usize,
+        input: &ControllerInput,
+        sampling: u64,
+        attr: u32,
+    ) {
+        for layout in 0..LAYOUT_COUNT {
+            Self::write_npad_lifo(buf, entry_idx, layout, input, sampling, attr);
         }
     }
 
@@ -503,4 +458,55 @@ pub fn set_player1_joy_dual(value: bool) {
         set_docked(true);
     }
     PLAYER1_JOY_DUAL.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_npad_lifos_expose_the_latest_sample() {
+        let mut hid = HidState::new();
+        let input = ControllerInput {
+            buttons: NPAD_BUTTON_PLUS,
+            stick_l_x: 1234,
+            ..ControllerInput::default()
+        };
+        for _ in 0..20 {
+            hid.tick(input);
+        }
+
+        let base = NPAD_OFFSET + NPAD_ENTRY_PLAYER1 * NPAD_ENTRY_SIZE;
+        for layout in 0..LAYOUT_COUNT {
+            let lifo = base + LAYOUT_BASE_OFFSET + layout * LAYOUT_STRIDE;
+            assert_eq!(read_u64(&hid.buf[..], lifo + 0x08), 17);
+            assert_eq!(read_u64(&hid.buf[..], lifo + 0x18), 17);
+            let tail = read_u64(&hid.buf[..], lifo + 0x10) as usize;
+            let state = lifo + LIFO_HEADER_SIZE + tail * LIFO_STORAGE_ELEM_SIZE + 8;
+            assert_eq!(read_u64(&hid.buf[..], state), hid.sampling_number);
+            assert_eq!(read_u64(&hid.buf[..], state + 0x08), NPAD_BUTTON_PLUS);
+            assert_eq!(
+                i32::from_le_bytes(hid.buf[state + 0x10..state + 0x14].try_into().unwrap()),
+                1234
+            );
+        }
+    }
+
+    #[test]
+    fn mapped_host_binding_requires_its_owner_to_unbind() {
+        let mut hid = HidState::new();
+        let mut mapped = Box::new([0u8; HID_SHMEM_SIZE]);
+        let ptr = mapped.as_mut_ptr() as usize;
+        unsafe {
+            hid.bind_mapped_host(ptr as *mut u8);
+        }
+        hid.shmem_va = Some(0x1000);
+
+        assert!(!hid.unbind_mapped_host(ptr.wrapping_add(1)));
+        assert_eq!(hid.mapped_host_ptr, ptr);
+        assert_eq!(hid.shmem_va, Some(0x1000));
+        assert!(hid.unbind_mapped_host(ptr));
+        assert_eq!(hid.mapped_host_ptr, 0);
+        assert!(hid.shmem_va.is_none());
+    }
 }

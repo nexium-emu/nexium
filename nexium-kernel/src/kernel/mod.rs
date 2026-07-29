@@ -26,6 +26,7 @@ pub struct Kernel {
     pub services: Services,
     pub nvdrv: Nvdrv,
     pub hid: Arc<Mutex<hid::HidShared>>,
+    hid_mapped_host_ptr: Option<usize>,
     pub sessions: HashMap<u32, session::Session>,
     pub event_signals: HashMap<u32, bool>,
     pub exited_thread_handles: HashSet<u32>,
@@ -85,6 +86,8 @@ pub struct Kernel {
     pub friend_invitation_event: Option<u32>,
     pub notification_event: Option<u32>,
     pub acquired_sleep_lock_event: Option<u32>,
+    pub aoc_change_event: Option<u32>,
+    pub bcat_progress_event: Option<u32>,
 
     pub nro_mmap: Option<Arc<memmap2::Mmap>>,
     pub nro_romfs_range: Option<std::ops::Range<usize>>,
@@ -138,7 +141,6 @@ pub struct AudioRendererState {
     pub voice_played_samples: Vec<u64>,
     pub voice_wbufs_consumed: Vec<u32>,
     pub voice_last_wb_index: Vec<u16>,
-    pub voice_is_new_seen: Vec<bool>,
     pub voice_wb_progress_frames: Vec<u64>,
     pub voice_frac_q15: Vec<i32>,
     pub voice_hist: Vec<[f32; 6]>,
@@ -171,6 +173,7 @@ impl Kernel {
             services: Services::new(),
             nvdrv: Nvdrv::new(),
             hid: Arc::new(Mutex::new(hid::HidShared::new())),
+            hid_mapped_host_ptr: None,
             sessions: HashMap::new(),
             event_signals: HashMap::new(),
             exited_thread_handles: HashSet::new(),
@@ -225,6 +228,8 @@ impl Kernel {
             friend_invitation_event: None,
             notification_event: None,
             acquired_sleep_lock_event: None,
+            aoc_change_event: None,
+            bcat_progress_event: None,
             nro_mmap: None,
             nro_romfs_range: None,
             homebrew_dir: None,
@@ -673,7 +678,38 @@ impl Kernel {
         }
     }
 
+    pub fn drain_gpu_fence_events(&mut self) {
+        if self.gpu_fence_events.is_empty() {
+            return;
+        }
+        let reached: Vec<u32> = self
+            .gpu_fence_events
+            .iter()
+            .filter_map(|(&handle, &(syncpt_id, threshold))| {
+                self.nvdrv
+                    .is_syncpoint_reached(syncpt_id, threshold)
+                    .then_some(handle)
+            })
+            .collect();
+        for handle in reached {
+            let pending = self.gpu_fence_events.remove(&handle);
+            self.event_signals.insert(handle, true);
+            self.threads.signal_handle(handle);
+            if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                if let Some((syncpt_id, threshold)) = pending {
+                    log::info!(
+                        "[syncpt] scheduler drained gpu_fence_event handle={:#x} syncpt={} threshold={}",
+                        handle,
+                        syncpt_id,
+                        threshold
+                    );
+                }
+            }
+        }
+    }
+
     pub fn wake_due_sleepers(&mut self, now: std::time::Instant) {
+        self.drain_gpu_fence_events();
         let timed_out: Vec<(u32, u64, u64, bool)> = self
             .threads
             .threads
@@ -1010,6 +1046,15 @@ impl Kernel {
 
     pub fn dispatch_svc(&mut self, imm: u16) -> u32 {
         svc::dispatch(self, imm)
+    }
+}
+
+impl Drop for Kernel {
+    fn drop(&mut self) {
+        if let Some(ptr) = self.hid_mapped_host_ptr.take() {
+            let state = crate::hid_state::get_hid_state();
+            state.lock().unbind_mapped_host(ptr);
+        }
     }
 }
 

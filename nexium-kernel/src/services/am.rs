@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 pub mod msg {
     pub const EXIT_REQUESTED: u32 = 1;
+    pub const EXIT: u32 = 4;
     pub const FOCUS_STATE_CHANGED: u32 = 15;
     pub const RESUME: u32 = 16;
     pub const OPERATION_MODE_CHANGED: u32 = 30;
@@ -210,7 +211,7 @@ fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, V
         }
         1 => {
             if let Some(m) = kernel.applet_messages.pop_front() {
-                log::warn!("AMDBG ReceiveMessage → {}", m);
+                log::debug!("ICommonStateGetter.ReceiveMessage → {}", m);
                 if kernel.applet_messages.is_empty() {
                     if let Some(h) = kernel.applet_message_event {
                         kernel.event_signals.insert(h, false);
@@ -401,8 +402,17 @@ fn library_applet_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8
         1 => ok(vec![1u8]),
         30 => {
             kernel.applet_focus_state = FOCUS_STATE_IN_FOCUS;
-            queue_message(kernel, msg::RESUME);
-            log::info!("ILibraryAppletAccessor.GetResult → applet complete, queued Resume(16), focus=InFocus");
+            let exit_on_result = std::env::var_os("NEXIUM_APPLET_EXIT_ON_RESULT").is_some();
+            let msg = if exit_on_result {
+                msg::EXIT
+            } else {
+                msg::RESUME
+            };
+            queue_message(kernel, msg);
+            log::info!(
+                "ILibraryAppletAccessor.GetResult → applet complete, queued {}, focus=InFocus",
+                msg
+            );
             ok_empty()
         }
         10 | 20 | 25 | 26 | 50 | 51 | 60 | 90 | 91 | 100 | 102 | 103 | 110 | 120 | 150 | 160 => {
@@ -625,6 +635,7 @@ fn account_service(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
         2 | 3 => ok_empty(),
         4 => ok(ACCOUNT_UID.to_vec()),
         100 | 102 | 103 | 110 | 140 | 141 => ok_empty(),
+        150 => ok(vec![0u8]),
         _ => {
             log::warn!("acc.cmd_{} → returning empty SUCCESS (likely wrong)", cmd);
             ok_empty()
