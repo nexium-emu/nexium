@@ -97,7 +97,13 @@ impl Default for BackdropTheme {
 
 impl BackdropTheme {
     pub fn all() -> &'static [BackdropTheme] {
-        &[BackdropTheme::Waves, BackdropTheme::Gradient, BackdropTheme::Space, BackdropTheme::CherryBlossom, BackdropTheme::None]
+        &[
+            BackdropTheme::Waves,
+            BackdropTheme::Gradient,
+            BackdropTheme::Space,
+            BackdropTheme::CherryBlossom,
+            BackdropTheme::None,
+        ]
     }
     pub fn label(&self) -> &'static str {
         match self {

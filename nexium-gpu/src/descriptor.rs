@@ -6,13 +6,11 @@ pub use nexium_spirv::{
     GFX_BINDING_FLOAT_CUBE_ARRAY as IMAGE_CUBE_ARRAY_BINDING,
     GFX_BINDING_FLOAT_TEXEL_BUFFER as TEXEL_BUFFER_BINDING,
     GFX_BINDING_SAMPLERS as SAMPLER_BINDING, GFX_BINDING_SINT_2D as SINT_IMAGE2D_BINDING,
-    GFX_BINDING_SINT_3D as SINT_IMAGE3D_BINDING,
-    GFX_BINDING_SINT_CUBE as SINT_IMAGE_CUBE_BINDING,
+    GFX_BINDING_SINT_3D as SINT_IMAGE3D_BINDING, GFX_BINDING_SINT_CUBE as SINT_IMAGE_CUBE_BINDING,
     GFX_BINDING_SINT_CUBE_ARRAY as SINT_IMAGE_CUBE_ARRAY_BINDING,
     GFX_BINDING_SINT_TEXEL_BUFFER as SINT_TEXEL_BUFFER_BINDING,
     GFX_BINDING_SSBO_BASE as SSBO_BINDING_BASE, GFX_BINDING_UINT_2D as UINT_IMAGE2D_BINDING,
-    GFX_BINDING_UINT_3D as UINT_IMAGE3D_BINDING,
-    GFX_BINDING_UINT_CUBE as UINT_IMAGE_CUBE_BINDING,
+    GFX_BINDING_UINT_3D as UINT_IMAGE3D_BINDING, GFX_BINDING_UINT_CUBE as UINT_IMAGE_CUBE_BINDING,
     GFX_BINDING_UINT_CUBE_ARRAY as UINT_IMAGE_CUBE_ARRAY_BINDING,
     GFX_BINDING_UINT_TEXEL_BUFFER as UINT_TEXEL_BUFFER_BINDING,
 };
@@ -254,14 +252,16 @@ mod tests {
         assert_eq!(unique.len(), bindings.count());
         assert!(unique.iter().all(|binding| {
             *binding != SAMPLER_BINDING
-                && !(*binding >= SSBO_BINDING_BASE
-                    && *binding < SSBO_BINDING_BASE + MAX_SSBO)
+                && !(*binding >= SSBO_BINDING_BASE && *binding < SSBO_BINDING_BASE + MAX_SSBO)
         }));
 
         let layout = graphics_layout_bindings();
         assert_eq!(layout.len(), 25);
         assert_eq!(
-            layout.iter().map(|binding| binding.binding).collect::<Vec<_>>(),
+            layout
+                .iter()
+                .map(|binding| binding.binding)
+                .collect::<Vec<_>>(),
             (0..=24).collect::<Vec<_>>()
         );
         assert_eq!(
@@ -292,7 +292,10 @@ mod tests {
                 .map(|size| size.descriptor_count)
         };
         assert_eq!(count(vk::DescriptorType::SAMPLED_IMAGE), Some(7 * 32 * 12));
-        assert_eq!(count(vk::DescriptorType::UNIFORM_TEXEL_BUFFER), Some(7 * 32 * 3));
+        assert_eq!(
+            count(vk::DescriptorType::UNIFORM_TEXEL_BUFFER),
+            Some(7 * 32 * 3)
+        );
         assert_eq!(count(vk::DescriptorType::SAMPLER), Some(7 * 32));
         assert_eq!(count(vk::DescriptorType::STORAGE_BUFFER), Some(7 * 9));
         assert_eq!(count(vk::DescriptorType::UNIFORM_BUFFER), None);

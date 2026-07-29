@@ -621,7 +621,9 @@ pub fn draw_backdrop(
         }
         BackdropTheme::Gradient => draw_gradient_backdrop(painter, rect, color, opacity, base),
         BackdropTheme::Space => draw_space_backdrop(painter, rect, color, t, opacity, logo),
-        BackdropTheme::CherryBlossom => draw_cherry_blossom_backdrop(painter, rect, color, t, opacity, logo, light_t),
+        BackdropTheme::CherryBlossom => {
+            draw_cherry_blossom_backdrop(painter, rect, color, t, opacity, logo, light_t)
+        }
         BackdropTheme::None => {
             if opacity <= 0.001 {
                 return;
@@ -636,7 +638,14 @@ pub fn draw_backdrop(
     }
 }
 
-fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32, t: f32, opacity: f32, logo: Option<egui::TextureId>) {
+fn draw_space_backdrop(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: Color32,
+    t: f32,
+    opacity: f32,
+    logo: Option<egui::TextureId>,
+) {
     if opacity <= 0.001 {
         return;
     }
@@ -939,7 +948,9 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
             let p = ph / dur;
             let cyc = (t / period).floor().max(0.0) as u32;
             let x = rect.min.x - w * 0.14 + p * (w * 1.28);
-            let y = rect.min.y + (0.09 + hash(cyc.wrapping_mul(97).wrapping_add(3)) * 0.06) * h + (t * 1.4).sin() * h * 0.012;
+            let y = rect.min.y
+                + (0.09 + hash(cyc.wrapping_mul(97).wrapping_add(3)) * 0.06) * h
+                + (t * 1.4).sin() * h * 0.012;
             let sz = w * 0.058;
             let c = egui::pos2(x, y);
             let uv01 = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -956,27 +967,99 @@ fn draw_space_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32
                 for k in 0..7u32 {
                     let kt = k as f32 / 6.0;
                     let px = base_x - len * kt;
-                    let pr = (sz * r0 * (1.0 - kt * 0.85) * (0.82 + 0.18 * (t * 22.0 + k as f32 * 1.6).sin())).max(0.5);
+                    let pr = (sz
+                        * r0
+                        * (1.0 - kt * 0.85)
+                        * (0.82 + 0.18 * (t * 22.0 + k as f32 * 1.6).sin()))
+                    .max(0.5);
                     let py = base_y + (t * 24.0 + k as f32).sin() * sz * 0.05 * kt;
-                    painter.circle_filled(egui::pos2(px, py), pr, Color32::from_rgba_unmultiplied(col.0, col.1, col.2, a(al)));
+                    painter.circle_filled(
+                        egui::pos2(px, py),
+                        pr,
+                        Color32::from_rgba_unmultiplied(col.0, col.1, col.2, a(al)),
+                    );
                 }
             }
-            painter.circle_filled(c, sz * 0.86, Color32::from_rgba_unmultiplied(0x7C, 0x9A, 0xD8, a(45.0)));
-            painter.circle_filled(c, sz * 0.78, Color32::from_rgba_unmultiplied(0xEE, 0xF1, 0xFA, a(255.0)));
-            painter.circle_filled(c, sz * 0.66, Color32::from_rgba_unmultiplied(0x27, 0x33, 0x54, a(255.0)));
-            painter.image(logo, egui::Rect::from_center_size(c, egui::Vec2::splat(sz * 0.74)), uv01, Color32::from_rgba_unmultiplied(255, 255, 255, a(255.0)));
-            painter.circle_filled(c, sz * 0.66, Color32::from_rgba_unmultiplied(0x86, 0xC0, 0xFF, a(42.0)));
-            painter.circle_stroke(c, sz * 0.66, Stroke::new(3.0_f32, Color32::from_rgba_unmultiplied(0xC0, 0xCE, 0xEC, a(230.0))));
-            let shine: Vec<egui::Pos2> = (0..12).map(|k| { let ang = -2.55 + k as f32 * 0.1; c + Vec2::new(ang.cos(), ang.sin()) * sz * 0.5 }).collect();
-            painter.add(egui::Shape::line(shine, Stroke::new(4.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, a(160.0)))));
-            painter.circle_filled(c + Vec2::new(-sz * 0.26, -sz * 0.3), sz * 0.11, Color32::from_rgba_unmultiplied(255, 255, 255, a(215.0)));
-            painter.add(egui::Shape::line(vec![c + Vec2::new(sz * 0.52, -sz * 0.52), c + Vec2::new(sz * 0.72, -sz * 0.84)], Stroke::new(2.5_f32, Color32::from_rgba_unmultiplied(0xEE, 0xF1, 0xFA, a(235.0)))));
-            painter.circle_filled(c + Vec2::new(sz * 0.72, -sz * 0.84), sz * 0.075, Color32::from_rgba_unmultiplied(0xFF, 0x4E, 0x4E, a(255.0)));
+            painter.circle_filled(
+                c,
+                sz * 0.86,
+                Color32::from_rgba_unmultiplied(0x7C, 0x9A, 0xD8, a(45.0)),
+            );
+            painter.circle_filled(
+                c,
+                sz * 0.78,
+                Color32::from_rgba_unmultiplied(0xEE, 0xF1, 0xFA, a(255.0)),
+            );
+            painter.circle_filled(
+                c,
+                sz * 0.66,
+                Color32::from_rgba_unmultiplied(0x27, 0x33, 0x54, a(255.0)),
+            );
+            painter.image(
+                logo,
+                egui::Rect::from_center_size(c, egui::Vec2::splat(sz * 0.74)),
+                uv01,
+                Color32::from_rgba_unmultiplied(255, 255, 255, a(255.0)),
+            );
+            painter.circle_filled(
+                c,
+                sz * 0.66,
+                Color32::from_rgba_unmultiplied(0x86, 0xC0, 0xFF, a(42.0)),
+            );
+            painter.circle_stroke(
+                c,
+                sz * 0.66,
+                Stroke::new(
+                    3.0_f32,
+                    Color32::from_rgba_unmultiplied(0xC0, 0xCE, 0xEC, a(230.0)),
+                ),
+            );
+            let shine: Vec<egui::Pos2> = (0..12)
+                .map(|k| {
+                    let ang = -2.55 + k as f32 * 0.1;
+                    c + Vec2::new(ang.cos(), ang.sin()) * sz * 0.5
+                })
+                .collect();
+            painter.add(egui::Shape::line(
+                shine,
+                Stroke::new(
+                    4.0_f32,
+                    Color32::from_rgba_unmultiplied(255, 255, 255, a(160.0)),
+                ),
+            ));
+            painter.circle_filled(
+                c + Vec2::new(-sz * 0.26, -sz * 0.3),
+                sz * 0.11,
+                Color32::from_rgba_unmultiplied(255, 255, 255, a(215.0)),
+            );
+            painter.add(egui::Shape::line(
+                vec![
+                    c + Vec2::new(sz * 0.52, -sz * 0.52),
+                    c + Vec2::new(sz * 0.72, -sz * 0.84),
+                ],
+                Stroke::new(
+                    2.5_f32,
+                    Color32::from_rgba_unmultiplied(0xEE, 0xF1, 0xFA, a(235.0)),
+                ),
+            ));
+            painter.circle_filled(
+                c + Vec2::new(sz * 0.72, -sz * 0.84),
+                sz * 0.075,
+                Color32::from_rgba_unmultiplied(0xFF, 0x4E, 0x4E, a(255.0)),
+            );
         }
     }
 }
 
-fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color: Color32, t: f32, opacity: f32, logo: Option<egui::TextureId>, light_t: f32) {
+fn draw_cherry_blossom_backdrop(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: Color32,
+    t: f32,
+    opacity: f32,
+    logo: Option<egui::TextureId>,
+    light_t: f32,
+) {
     if opacity <= 0.001 {
         return;
     }
@@ -999,16 +1082,48 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
     let island_top = rect.min.y + h * 0.42;
     let water_top = rect.min.y + h * 0.80;
 
-    let sky_top = mix(mix(Color32::from_rgb(0x22, 0x1D, 0x38), Color32::from_rgb(0xD6, 0xC2, 0xD9), day), color, 0.05);
-    let sky_bot = mix(mix(Color32::from_rgb(0x45, 0x36, 0x52), Color32::from_rgb(0xF3, 0xDC, 0xE6), day), color, 0.04);
+    let sky_top = mix(
+        mix(
+            Color32::from_rgb(0x22, 0x1D, 0x38),
+            Color32::from_rgb(0xD6, 0xC2, 0xD9),
+            day,
+        ),
+        color,
+        0.05,
+    );
+    let sky_bot = mix(
+        mix(
+            Color32::from_rgb(0x45, 0x36, 0x52),
+            Color32::from_rgb(0xF3, 0xDC, 0xE6),
+            day,
+        ),
+        color,
+        0.04,
+    );
     {
         let ct = rgba(sky_top, a(255.0));
         let cb = rgba(sky_bot, a(255.0));
         let mut mesh = egui::epaint::Mesh::default();
-        mesh.vertices.push(egui::epaint::Vertex { pos: rect.left_top(), uv, color: ct });
-        mesh.vertices.push(egui::epaint::Vertex { pos: rect.right_top(), uv, color: ct });
-        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(rect.max.x, water_top), uv, color: cb });
-        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(rect.min.x, water_top), uv, color: cb });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rect.left_top(),
+            uv,
+            color: ct,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rect.right_top(),
+            uv,
+            color: ct,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(rect.max.x, water_top),
+            uv,
+            color: cb,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(rect.min.x, water_top),
+            uv,
+            color: cb,
+        });
         mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(mesh));
     }
@@ -1018,7 +1133,11 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
             let sy = rect.min.y + hash(i * 3 + 1) * h * 0.5;
             let r = 0.5 + hash(i * 5 + 2).powf(2.0) * 1.8;
             let tw = 0.4 + 0.6 * (0.5 + 0.5 * (t * 1.8 + hash(i * 7) * 30.0).sin());
-            let col = if hash(i * 11) > 0.85 { Color32::from_rgb(0xFF, 0xE6, 0xF2) } else { Color32::WHITE };
+            let col = if hash(i * 11) > 0.85 {
+                Color32::from_rgb(0xFF, 0xE6, 0xF2)
+            } else {
+                Color32::WHITE
+            };
             painter.circle_filled(egui::pos2(sx, sy), r, rgba(col, a(210.0 * night * tw)));
         }
     }
@@ -1027,21 +1146,41 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let cx = rect.min.x + (hash(ci * 3) * w + t * speed).rem_euclid(w + w * 0.3) - w * 0.15;
         let cy = rect.min.y + (0.05 + hash(ci * 7) * 0.22) * h;
         let cw = w * (0.07 + hash(ci * 11) * 0.05);
-        let cloud = mix(Color32::from_rgb(0x4E, 0x44, 0x60), Color32::from_rgb(0xFF, 0xF6, 0xFB), day);
+        let cloud = mix(
+            Color32::from_rgb(0x4E, 0x44, 0x60),
+            Color32::from_rgb(0xFF, 0xF6, 0xFB),
+            day,
+        );
         for j in 0..5u32 {
             let jx = (j as f32 - 2.0) * cw * 0.42;
             let jr = cw * (0.5 - (j as f32 - 2.0).abs() * 0.1);
-            painter.circle_filled(egui::pos2(cx + jx, cy + (hash(ci * 17 + j) - 0.5) * cw * 0.15), jr, rgba(cloud, a(65.0 * (0.5 + 0.5 * day))));
+            painter.circle_filled(
+                egui::pos2(cx + jx, cy + (hash(ci * 17 + j) - 0.5) * cw * 0.15),
+                jr,
+                rgba(cloud, a(65.0 * (0.5 + 0.5 * day))),
+            );
         }
     }
     let sun_x = rect.min.x + w * 0.32;
     let sun_bob = (t * 0.6).sin() * h * 0.006 + (t * 1.7).sin() * h * 0.0025;
     let sun_c = egui::pos2(sun_x, island_top - h * 0.02 + sun_bob);
     let pulse = 0.5 + 0.5 * (t * 1.3).sin();
-    let glow_col = mix(Color32::from_rgb(0xCE, 0xDA, 0xFF), Color32::from_rgb(0xFF, 0xF3, 0xF8), day);
-    let disc_col = mix(Color32::from_rgb(0xE9, 0xEF, 0xFF), Color32::from_rgb(0xFF, 0xFB, 0xFD), day);
+    let glow_col = mix(
+        Color32::from_rgb(0xCE, 0xDA, 0xFF),
+        Color32::from_rgb(0xFF, 0xF3, 0xF8),
+        day,
+    );
+    let disc_col = mix(
+        Color32::from_rgb(0xE9, 0xEF, 0xFF),
+        Color32::from_rgb(0xFF, 0xFB, 0xFD),
+        day,
+    );
     for g in 0..6 {
-        painter.circle_filled(sun_c, w * (0.22 - g as f32 * 0.028), rgba(glow_col, a((9.0 + g as f32 * 1.5) * (0.6 + 0.4 * day))));
+        painter.circle_filled(
+            sun_c,
+            w * (0.22 - g as f32 * 0.028),
+            rgba(glow_col, a((9.0 + g as f32 * 1.5) * (0.6 + 0.4 * day))),
+        );
     }
     let sun_r = w * 0.085;
     if day > 0.02 {
@@ -1049,19 +1188,55 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
             let ang = k as f32 / 14.0 * tau + t * 0.04;
             let rr = sun_r * (1.28 + 0.16 * (t * 2.0 + k as f32).sin());
             painter.add(egui::Shape::line(
-                vec![sun_c + Vec2::new(ang.cos(), ang.sin()) * sun_r * 1.15, sun_c + Vec2::new(ang.cos(), ang.sin()) * rr],
-                Stroke::new(2.0_f32, rgba(Color32::from_rgb(0xFF, 0xF6, 0xE8), a(28.0 * pulse * day))),
+                vec![
+                    sun_c + Vec2::new(ang.cos(), ang.sin()) * sun_r * 1.15,
+                    sun_c + Vec2::new(ang.cos(), ang.sin()) * rr,
+                ],
+                Stroke::new(
+                    2.0_f32,
+                    rgba(Color32::from_rgb(0xFF, 0xF6, 0xE8), a(28.0 * pulse * day)),
+                ),
             ));
         }
     }
-    painter.circle_filled(sun_c, sun_r * 1.14, rgba(mix(Color32::from_rgb(0xD8, 0xE2, 0xFF), Color32::from_rgb(0xFF, 0xEC, 0xF2), day), a(70.0 + 25.0 * pulse * day)));
+    painter.circle_filled(
+        sun_c,
+        sun_r * 1.14,
+        rgba(
+            mix(
+                Color32::from_rgb(0xD8, 0xE2, 0xFF),
+                Color32::from_rgb(0xFF, 0xEC, 0xF2),
+                day,
+            ),
+            a(70.0 + 25.0 * pulse * day),
+        ),
+    );
     painter.circle_filled(sun_c, sun_r, rgba(disc_col, a(238.0)));
-    painter.circle_filled(sun_c - Vec2::new(sun_r * 0.18, sun_r * 0.22), sun_r * 0.66, rgba(mix(Color32::from_rgb(0xF2, 0xF6, 0xFF), Color32::WHITE, day), a(255.0)));
+    painter.circle_filled(
+        sun_c - Vec2::new(sun_r * 0.18, sun_r * 0.22),
+        sun_r * 0.66,
+        rgba(
+            mix(Color32::from_rgb(0xF2, 0xF6, 0xFF), Color32::WHITE, day),
+            a(255.0),
+        ),
+    );
     if night > 0.02 {
         let cr = Color32::from_rgb(0xC4, 0xCE, 0xEA);
-        painter.circle_filled(sun_c + Vec2::new(sun_r * 0.28, -sun_r * 0.1), sun_r * 0.2, rgba(cr, a(150.0 * night)));
-        painter.circle_filled(sun_c + Vec2::new(-sun_r * 0.1, sun_r * 0.34), sun_r * 0.14, rgba(cr, a(140.0 * night)));
-        painter.circle_filled(sun_c + Vec2::new(sun_r * 0.05, -sun_r * 0.36), sun_r * 0.1, rgba(cr, a(130.0 * night)));
+        painter.circle_filled(
+            sun_c + Vec2::new(sun_r * 0.28, -sun_r * 0.1),
+            sun_r * 0.2,
+            rgba(cr, a(150.0 * night)),
+        );
+        painter.circle_filled(
+            sun_c + Vec2::new(-sun_r * 0.1, sun_r * 0.34),
+            sun_r * 0.14,
+            rgba(cr, a(140.0 * night)),
+        );
+        painter.circle_filled(
+            sun_c + Vec2::new(sun_r * 0.05, -sun_r * 0.36),
+            sun_r * 0.1,
+            rgba(cr, a(130.0 * night)),
+        );
     }
     if day > 0.02 {
         let ray = mix(glow_col, Color32::WHITE, 0.4);
@@ -1071,9 +1246,21 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
             let a2 = std::f32::consts::FRAC_PI_2 + base + 0.045;
             let len = h * 0.6;
             let mut m = egui::epaint::Mesh::default();
-            m.vertices.push(egui::epaint::Vertex { pos: sun_c, uv, color: rgba(ray, a(24.0 * day)) });
-            m.vertices.push(egui::epaint::Vertex { pos: sun_c + Vec2::new(a1.cos(), a1.sin()) * len, uv, color: rgba(ray, 0) });
-            m.vertices.push(egui::epaint::Vertex { pos: sun_c + Vec2::new(a2.cos(), a2.sin()) * len, uv, color: rgba(ray, 0) });
+            m.vertices.push(egui::epaint::Vertex {
+                pos: sun_c,
+                uv,
+                color: rgba(ray, a(24.0 * day)),
+            });
+            m.vertices.push(egui::epaint::Vertex {
+                pos: sun_c + Vec2::new(a1.cos(), a1.sin()) * len,
+                uv,
+                color: rgba(ray, 0),
+            });
+            m.vertices.push(egui::epaint::Vertex {
+                pos: sun_c + Vec2::new(a2.cos(), a2.sin()) * len,
+                uv,
+                color: rgba(ray, 0),
+            });
             m.indices.extend_from_slice(&[0, 1, 2]);
             painter.add(egui::Shape::mesh(m));
         }
@@ -1082,25 +1269,42 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         for i in 0..4u32 {
             let speed = 7.0 + hash(i * 3) * 6.0;
             let bx = rect.min.x + (hash(i * 5) * w + t * speed).rem_euclid(w * 1.2) - w * 0.1;
-            let by = rect.min.y + (0.10 + hash(i * 7) * 0.14) * h + (t * 0.8 + i as f32).sin() * h * 0.008;
+            let by = rect.min.y
+                + (0.10 + hash(i * 7) * 0.14) * h
+                + (t * 0.8 + i as f32).sin() * h * 0.008;
             let bs = w * 0.009;
             let flap = 0.35 + 0.25 * (t * 5.0 + i as f32 * 1.3).sin();
             let bcol = rgba(Color32::from_rgb(0x4A, 0x44, 0x52), a(150.0 * day));
             let mid = egui::pos2(bx, by);
-            painter.add(egui::Shape::line(vec![egui::pos2(bx - bs, by - bs * flap), mid], Stroke::new(1.6_f32, bcol)));
-            painter.add(egui::Shape::line(vec![mid, egui::pos2(bx + bs, by - bs * flap)], Stroke::new(1.6_f32, bcol)));
+            painter.add(egui::Shape::line(
+                vec![egui::pos2(bx - bs, by - bs * flap), mid],
+                Stroke::new(1.6_f32, bcol),
+            ));
+            painter.add(egui::Shape::line(
+                vec![mid, egui::pos2(bx + bs, by - bs * flap)],
+                Stroke::new(1.6_f32, bcol),
+            ));
         }
     }
 
     let fill_to_baseline = |top: &[egui::Pos2], baseline: f32, col: Color32| {
         let mut mesh = egui::epaint::Mesh::default();
         for p in top {
-            mesh.vertices.push(egui::epaint::Vertex { pos: *p, uv, color: col });
-            mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(p.x, baseline), uv, color: col });
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: *p,
+                uv,
+                color: col,
+            });
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(p.x, baseline),
+                uv,
+                color: col,
+            });
         }
         for i in 0..top.len().saturating_sub(1) {
             let t0 = (2 * i) as u32;
-            mesh.indices.extend_from_slice(&[t0, t0 + 1, t0 + 2, t0 + 1, t0 + 3, t0 + 2]);
+            mesh.indices
+                .extend_from_slice(&[t0, t0 + 1, t0 + 2, t0 + 1, t0 + 3, t0 + 2]);
         }
         painter.add(egui::Shape::mesh(mesh));
     };
@@ -1110,10 +1314,21 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let band = h * (0.13 - hl as f32 * 0.03);
         for k in 0..=steps {
             let x = rect.min.x + k as f32 / steps as f32 * w;
-            let yy = water_top - band - (x * 0.005 + hl as f32 * 1.7).sin() * h * 0.025 - hash(k as u32 * 7 + hl * 50) * h * 0.015;
+            let yy = water_top
+                - band
+                - (x * 0.005 + hl as f32 * 1.7).sin() * h * 0.025
+                - hash(k as u32 * 7 + hl * 50) * h * 0.015;
             top.push(egui::pos2(x, yy));
         }
-        let hillcol = mix(sky_bot, if hl == 0 { Color32::from_rgb(0xCF, 0xAE, 0xCA) } else { Color32::from_rgb(0xBC, 0x98, 0xB8) }, 0.6);
+        let hillcol = mix(
+            sky_bot,
+            if hl == 0 {
+                Color32::from_rgb(0xCF, 0xAE, 0xCA)
+            } else {
+                Color32::from_rgb(0xBC, 0x98, 0xB8)
+            },
+            0.6,
+        );
         fill_to_baseline(&top, water_top, rgba(hillcol, a(225.0)));
     }
     let land_edge = |fx: f32| -> f32 {
@@ -1132,15 +1347,36 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let landcol = mix(Color32::from_rgb(0x4C, 0x58, 0x3B), color, 0.03);
         let mut mesh = egui::epaint::Mesh::default();
         for p in &top {
-            mesh.vertices.push(egui::epaint::Vertex { pos: *p, uv, color: rgba(landcol, a(255.0)) });
-            mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(p.x, water_top + 1.5), uv, color: rgba(mix(landcol, Color32::from_rgb(0x30, 0x3A, 0x28), 0.5), a(255.0)) });
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: *p,
+                uv,
+                color: rgba(landcol, a(255.0)),
+            });
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(p.x, water_top + 1.5),
+                uv,
+                color: rgba(
+                    mix(landcol, Color32::from_rgb(0x30, 0x3A, 0x28), 0.5),
+                    a(255.0),
+                ),
+            });
         }
         for i in 0..top.len().saturating_sub(1) {
             let t0 = (2 * i) as u32;
-            mesh.indices.extend_from_slice(&[t0, t0 + 1, t0 + 2, t0 + 1, t0 + 3, t0 + 2]);
+            mesh.indices
+                .extend_from_slice(&[t0, t0 + 1, t0 + 2, t0 + 1, t0 + 3, t0 + 2]);
         }
         painter.add(egui::Shape::mesh(mesh));
-        painter.add(egui::Shape::line(top, Stroke::new(2.5_f32, rgba(mix(landcol, Color32::from_rgb(0x8E, 0xA6, 0x62), 0.6), a(220.0)))));
+        painter.add(egui::Shape::line(
+            top,
+            Stroke::new(
+                2.5_f32,
+                rgba(
+                    mix(landcol, Color32::from_rgb(0x8E, 0xA6, 0x62), 0.6),
+                    a(220.0),
+                ),
+            ),
+        ));
     };
     let gen_crowns = |seed: u32, n: u32, lift: f32, rmin: f32, rmax: f32| -> Vec<(f32, f32, f32)> {
         let mut v = Vec::new();
@@ -1175,7 +1411,16 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
     };
     let draw_forest = |top: &[egui::Pos2], col: Color32, al: u8| {
         fill_to_baseline(top, water_top + 1.0, rgba(col, al));
-        painter.add(egui::Shape::line(top.to_vec(), Stroke::new(2.0_f32, rgba(mix(col, Color32::from_rgb(0xFF, 0xF2, 0xF8), 0.5), (al as f32 * 0.6) as u8))));
+        painter.add(egui::Shape::line(
+            top.to_vec(),
+            Stroke::new(
+                2.0_f32,
+                rgba(
+                    mix(col, Color32::from_rgb(0xFF, 0xF2, 0xF8), 0.5),
+                    (al as f32 * 0.6) as u8,
+                ),
+            ),
+        ));
     };
     let smooth = |pts: Vec<egui::Pos2>, win: usize| -> Vec<egui::Pos2> {
         (0..pts.len())
@@ -1188,7 +1433,11 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
             .collect()
     };
     let back = smooth(silhouette(&gen_crowns(11, 30, 0.05, 0.035, 0.06)), 8);
-    draw_forest(&back, mix(Color32::from_rgb(0xE7, 0xC2, 0xDB), sky_bot, 0.5), a(228.0));
+    draw_forest(
+        &back,
+        mix(Color32::from_rgb(0xE7, 0xC2, 0xDB), sky_bot, 0.5),
+        a(228.0),
+    );
     draw_land(painter);
     for i in 0..90u32 {
         let fx = hash(i * 3 + 200);
@@ -1198,7 +1447,10 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let gh = h * (0.005 + hash(i * 11 + 200) * 0.008);
         let lean = (hash(i * 13 + 200) - 0.5) * gh * 0.7;
         let gcol = mix(Color32::from_rgb(0x6E, 0x8C, 0x4C), color, 0.0);
-        painter.add(egui::Shape::line(vec![egui::pos2(gx, gy), egui::pos2(gx + lean, gy - gh)], Stroke::new(1.6_f32, rgba(gcol, a(175.0)))));
+        painter.add(egui::Shape::line(
+            vec![egui::pos2(gx, gy), egui::pos2(gx + lean, gy - gh)],
+            Stroke::new(1.6_f32, rgba(gcol, a(175.0))),
+        ));
     }
     for i in 0..48u32 {
         let fx = hash(i * 5 + 400);
@@ -1206,7 +1458,11 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let top = land_edge(fx);
         let py = top + (0.12 + hash(i * 7 + 400) * 0.82) * (water_top - top);
         let pr = 1.8 + hash(i * 11 + 400) * 2.4;
-        let pcol = if hash(i * 13 + 400) > 0.5 { Color32::from_rgb(0xF3, 0xB6, 0xD2) } else { Color32::from_rgb(0xE7, 0x9B, 0xC4) };
+        let pcol = if hash(i * 13 + 400) > 0.5 {
+            Color32::from_rgb(0xF3, 0xB6, 0xD2)
+        } else {
+            Color32::from_rgb(0xE7, 0x9B, 0xC4)
+        };
         painter.circle_filled(egui::pos2(px, py), pr, rgba(pcol, a(205.0)));
     }
     let draw_canopy = |cx: f32, cy: f32, cr: f32, seed: u32| {
@@ -1215,22 +1471,50 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let hi = mix(base, Color32::from_rgb(0xFF, 0xF1, 0xF8), 0.42);
         let bc = rgba(base, a(255.0));
         let aspect = 0.92 + hash(seed * 3) * 0.28;
-        painter.circle_filled(egui::pos2(cx, cy + cr * 0.3), cr * 0.9 * aspect, rgba(shadow, a(255.0)));
+        painter.circle_filled(
+            egui::pos2(cx, cy + cr * 0.3),
+            cr * 0.9 * aspect,
+            rgba(shadow, a(255.0)),
+        );
         painter.circle_filled(egui::pos2(cx, cy), cr * 0.92, bc);
         match (hash(seed * 7) * 3.0) as u32 {
             0 => {
-                painter.circle_filled(egui::pos2(cx - cr * 0.5 * aspect, cy - cr * 0.08), cr * 0.55, bc);
-                painter.circle_filled(egui::pos2(cx + cr * 0.5 * aspect, cy - cr * 0.08), cr * 0.55, bc);
+                painter.circle_filled(
+                    egui::pos2(cx - cr * 0.5 * aspect, cy - cr * 0.08),
+                    cr * 0.55,
+                    bc,
+                );
+                painter.circle_filled(
+                    egui::pos2(cx + cr * 0.5 * aspect, cy - cr * 0.08),
+                    cr * 0.55,
+                    bc,
+                );
                 painter.circle_filled(egui::pos2(cx, cy - cr * 0.5), cr * 0.55, bc);
             }
             1 => {
-                painter.circle_filled(egui::pos2(cx - cr * 0.62 * aspect, cy + cr * 0.06), cr * 0.5, bc);
-                painter.circle_filled(egui::pos2(cx + cr * 0.62 * aspect, cy + cr * 0.06), cr * 0.5, bc);
+                painter.circle_filled(
+                    egui::pos2(cx - cr * 0.62 * aspect, cy + cr * 0.06),
+                    cr * 0.5,
+                    bc,
+                );
+                painter.circle_filled(
+                    egui::pos2(cx + cr * 0.62 * aspect, cy + cr * 0.06),
+                    cr * 0.5,
+                    bc,
+                );
                 painter.circle_filled(egui::pos2(cx, cy - cr * 0.46), cr * 0.5, bc);
             }
             _ => {
-                painter.circle_filled(egui::pos2(cx - cr * 0.36 * aspect, cy - cr * 0.34), cr * 0.5, bc);
-                painter.circle_filled(egui::pos2(cx + cr * 0.36 * aspect, cy - cr * 0.34), cr * 0.5, bc);
+                painter.circle_filled(
+                    egui::pos2(cx - cr * 0.36 * aspect, cy - cr * 0.34),
+                    cr * 0.5,
+                    bc,
+                );
+                painter.circle_filled(
+                    egui::pos2(cx + cr * 0.36 * aspect, cy - cr * 0.34),
+                    cr * 0.5,
+                    bc,
+                );
                 painter.circle_filled(egui::pos2(cx, cy - cr * 0.6), cr * 0.46, bc);
             }
         }
@@ -1240,7 +1524,11 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
             let by = cy - cr * (0.5 + hash(seed.wrapping_mul(53).wrapping_add(tb)) * 0.18);
             painter.circle_filled(egui::pos2(bx, by), cr * 0.26, bc);
         }
-        painter.circle_filled(egui::pos2(cx - cr * 0.24, cy - cr * 0.4), cr * 0.38, rgba(hi, a(255.0)));
+        painter.circle_filled(
+            egui::pos2(cx - cr * 0.24, cy - cr * 0.4),
+            cr * 0.38,
+            rgba(hi, a(255.0)),
+        );
     };
     let mut tlist: Vec<(f32, f32, f32, u32)> = Vec::new();
     let ntrees = 72u32;
@@ -1260,36 +1548,94 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let cy = base_y - th - cr * 0.3;
         tree_crowns.push((cx, cy, cr));
         let hw = (cr * 0.15).max(1.5);
-        let cc = rgba(mix(Color32::from_rgb(0x46, 0x2C, 0x22), color, 0.0), a(235.0));
+        let cc = rgba(
+            mix(Color32::from_rgb(0x46, 0x2C, 0x22), color, 0.0),
+            a(235.0),
+        );
         let mut m = egui::epaint::Mesh::default();
-        m.vertices.push(egui::epaint::Vertex { pos: egui::pos2(cx - hw, base_y), uv, color: cc });
-        m.vertices.push(egui::epaint::Vertex { pos: egui::pos2(cx + hw, base_y), uv, color: cc });
-        m.vertices.push(egui::epaint::Vertex { pos: egui::pos2(cx + hw * 0.45, cy + cr * 0.25), uv, color: cc });
-        m.vertices.push(egui::epaint::Vertex { pos: egui::pos2(cx - hw * 0.45, cy + cr * 0.25), uv, color: cc });
+        m.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(cx - hw, base_y),
+            uv,
+            color: cc,
+        });
+        m.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(cx + hw, base_y),
+            uv,
+            color: cc,
+        });
+        m.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(cx + hw * 0.45, cy + cr * 0.25),
+            uv,
+            color: cc,
+        });
+        m.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(cx - hw * 0.45, cy + cr * 0.25),
+            uv,
+            color: cc,
+        });
         m.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(m));
         let btop = egui::pos2(cx, cy + cr * 0.4);
-        let brc = rgba(mix(Color32::from_rgb(0x46, 0x2C, 0x22), color, 0.0), a(220.0));
+        let brc = rgba(
+            mix(Color32::from_rgb(0x46, 0x2C, 0x22), color, 0.0),
+            a(220.0),
+        );
         for br in 0..3u32 {
-            let ang = -2.0 + br as f32 * 0.7 + (hash(seed.wrapping_mul(41).wrapping_add(br)) - 0.5) * 0.5;
+            let ang =
+                -2.0 + br as f32 * 0.7 + (hash(seed.wrapping_mul(41).wrapping_add(br)) - 0.5) * 0.5;
             let len = cr * (0.35 + hash(seed.wrapping_mul(43).wrapping_add(br)) * 0.3);
             let bend = btop + Vec2::new(ang.cos() * len, ang.sin() * len);
-            painter.add(egui::Shape::line(vec![btop, bend], Stroke::new((cr * 0.07).max(1.0), brc)));
+            painter.add(egui::Shape::line(
+                vec![btop, bend],
+                Stroke::new((cr * 0.07).max(1.0), brc),
+            ));
         }
         draw_canopy(cx, cy, cr, seed);
     }
     let front = smooth(silhouette(&tree_crowns), 7);
 
-    let water_hi = mix(mix(Color32::from_rgb(0x4C, 0x3E, 0x56), Color32::from_rgb(0xC6, 0xA2, 0xBC), day), color, 0.06);
-    let water_lo = mix(mix(Color32::from_rgb(0x28, 0x20, 0x38), Color32::from_rgb(0x82, 0x62, 0x7C), day), color, 0.05);
+    let water_hi = mix(
+        mix(
+            Color32::from_rgb(0x4C, 0x3E, 0x56),
+            Color32::from_rgb(0xC6, 0xA2, 0xBC),
+            day,
+        ),
+        color,
+        0.06,
+    );
+    let water_lo = mix(
+        mix(
+            Color32::from_rgb(0x28, 0x20, 0x38),
+            Color32::from_rgb(0x82, 0x62, 0x7C),
+            day,
+        ),
+        color,
+        0.05,
+    );
     {
         let ct = rgba(water_hi, a(255.0));
         let cb = rgba(water_lo, a(255.0));
         let mut mesh = egui::epaint::Mesh::default();
-        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(rect.min.x, water_top), uv, color: ct });
-        mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(rect.max.x, water_top), uv, color: ct });
-        mesh.vertices.push(egui::epaint::Vertex { pos: rect.right_bottom(), uv, color: cb });
-        mesh.vertices.push(egui::epaint::Vertex { pos: rect.left_bottom(), uv, color: cb });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(rect.min.x, water_top),
+            uv,
+            color: ct,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(rect.max.x, water_top),
+            uv,
+            color: ct,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rect.right_bottom(),
+            uv,
+            color: cb,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rect.left_bottom(),
+            uv,
+            color: cb,
+        });
         mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(mesh));
     }
@@ -1300,8 +1646,15 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let wob = (t * 1.3 + fy * 8.0).sin() * (6.0 + fy * 34.0);
         let width = (28.0 + fy * 100.0) * (0.55 + 0.45 * (t * 2.0 + j as f32).sin());
         let al = a(78.0 * (1.0 - fy * 0.8) * (0.45 + 0.55 * (t * 3.0 + j as f32 * 1.7).sin()));
-        let seg = egui::Rect::from_center_size(egui::pos2(sun_x + wob, y), Vec2::new(width, 2.5 + fy * 2.0));
-        painter.rect_filled(seg, Rounding::same(2.0), rgba(mix(water_hi, Color32::from_rgb(0xFF, 0xF6, 0xFA), 0.72), al));
+        let seg = egui::Rect::from_center_size(
+            egui::pos2(sun_x + wob, y),
+            Vec2::new(width, 2.5 + fy * 2.0),
+        );
+        painter.rect_filled(
+            seg,
+            Rounding::same(2.0),
+            rgba(mix(water_hi, Color32::from_rgb(0xFF, 0xF6, 0xFA), 0.72), al),
+        );
     }
     {
         let refl = mix(Color32::from_rgb(0xD4, 0x86, 0xB6), water_hi, 0.35);
@@ -1309,12 +1662,21 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         for p in &front {
             let depth = (water_top - p.y).max(0.0);
             let by = water_top + depth * 0.8 + (p.x * 0.04 + t * 1.4).sin() * 4.0;
-            mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(p.x, water_top), uv, color: rgba(refl, a(90.0)) });
-            mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(p.x, by), uv, color: rgba(refl, a(0.0)) });
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(p.x, water_top),
+                uv,
+                color: rgba(refl, a(90.0)),
+            });
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(p.x, by),
+                uv,
+                color: rgba(refl, a(0.0)),
+            });
         }
         for k in 0..front.len().saturating_sub(1) {
             let t0 = (2 * k) as u32;
-            mesh.indices.extend_from_slice(&[t0, t0 + 1, t0 + 2, t0 + 1, t0 + 3, t0 + 2]);
+            mesh.indices
+                .extend_from_slice(&[t0, t0 + 1, t0 + 2, t0 + 1, t0 + 3, t0 + 2]);
         }
         painter.add(egui::Shape::mesh(mesh));
     }
@@ -1333,19 +1695,40 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
             let yy = y + (x * 0.018 + t * 1.1 * speed + phase).sin() * amp;
             pts.push(egui::pos2(x, yy));
         }
-        painter.add(egui::Shape::line(pts, Stroke::new(1.4_f32, rgba(mix(water_hi, Color32::WHITE, 0.45), a(34.0 * shimmer * (1.0 - fy * 0.35))))));
+        painter.add(egui::Shape::line(
+            pts,
+            Stroke::new(
+                1.4_f32,
+                rgba(
+                    mix(water_hi, Color32::WHITE, 0.45),
+                    a(34.0 * shimmer * (1.0 - fy * 0.35)),
+                ),
+            ),
+        ));
     }
 
     let branch_col = mix(Color32::from_rgb(0x4A, 0x2E, 0x22), color, 0.0);
     let flower = |c: egui::Pos2, r: f32, col: Color32, al: u8| {
         for k in 0..5u32 {
             let ang = k as f32 / 5.0 * tau - 1.2;
-            painter.circle_filled(c + Vec2::new(ang.cos(), ang.sin()) * r * 0.58, r * 0.5, rgba(col, al));
+            painter.circle_filled(
+                c + Vec2::new(ang.cos(), ang.sin()) * r * 0.58,
+                r * 0.5,
+                rgba(col, al),
+            );
         }
-        painter.circle_filled(c, r * 0.32, rgba(mix(col, Color32::from_rgb(0xFF, 0xF2, 0xD6), 0.3), al));
+        painter.circle_filled(
+            c,
+            r * 0.32,
+            rgba(mix(col, Color32::from_rgb(0xFF, 0xF2, 0xD6), 0.3), al),
+        );
         for k in 0..3u32 {
             let ang = k as f32 / 3.0 * tau + 0.5;
-            painter.circle_filled(c + Vec2::new(ang.cos(), ang.sin()) * r * 0.17, r * 0.07, rgba(Color32::from_rgb(0x9C, 0x3C, 0x2C), al));
+            painter.circle_filled(
+                c + Vec2::new(ang.cos(), ang.sin()) * r * 0.17,
+                r * 0.07,
+                rgba(Color32::from_rgb(0x9C, 0x3C, 0x2C), al),
+            );
         }
     };
     let wood = |a0: egui::Pos2, b0: egui::Pos2, wa: f32, wb: f32| {
@@ -1353,16 +1736,38 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let p = d.rot90();
         let cc = rgba(branch_col, a(255.0));
         let mut m = egui::epaint::Mesh::default();
-        m.vertices.push(egui::epaint::Vertex { pos: a0 + p * wa * 0.5, uv, color: cc });
-        m.vertices.push(egui::epaint::Vertex { pos: a0 - p * wa * 0.5, uv, color: cc });
-        m.vertices.push(egui::epaint::Vertex { pos: b0 - p * wb * 0.5, uv, color: cc });
-        m.vertices.push(egui::epaint::Vertex { pos: b0 + p * wb * 0.5, uv, color: cc });
+        m.vertices.push(egui::epaint::Vertex {
+            pos: a0 + p * wa * 0.5,
+            uv,
+            color: cc,
+        });
+        m.vertices.push(egui::epaint::Vertex {
+            pos: a0 - p * wa * 0.5,
+            uv,
+            color: cc,
+        });
+        m.vertices.push(egui::epaint::Vertex {
+            pos: b0 - p * wb * 0.5,
+            uv,
+            color: cc,
+        });
+        m.vertices.push(egui::epaint::Vertex {
+            pos: b0 + p * wb * 0.5,
+            uv,
+            color: cc,
+        });
         m.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(m));
         painter.circle_filled(b0, wb * 0.5, cc);
     };
     let mut stack: Vec<(egui::Pos2, f32, f32, f32, u32)> = Vec::new();
-    stack.push((egui::pos2(rect.max.x + 8.0, rect.min.y + h * 0.03), 2.85, w * 0.18, 13.0, 3));
+    stack.push((
+        egui::pos2(rect.max.x + 8.0, rect.min.y + h * 0.03),
+        2.85,
+        w * 0.18,
+        13.0,
+        3,
+    ));
     let mut flowers: Vec<(egui::Pos2, f32)> = Vec::new();
     let mut si = 0u32;
     while let Some((start, angle, len, width, depth)) = stack.pop() {
@@ -1376,20 +1781,45 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
                 let tt = 0.15 + 0.85 * (f as f32 + 0.5) / nf as f32;
                 let side = if (f + si) % 2 == 0 { 1.0 } else { -1.0 };
                 let off = width * 0.5 + 3.0 + hash(si * 7 + f) * 7.0;
-                flowers.push((start + (end - start) * tt + perp * side * off, 8.0 + hash(si * 13 + f) * 7.0));
+                flowers.push((
+                    start + (end - start) * tt + perp * side * off,
+                    8.0 + hash(si * 13 + f) * 7.0,
+                ));
             }
         }
         si = si.wrapping_add(1);
         if depth > 0 && len > 30.0 {
             let spread = 0.4 + hash(si * 5) * 0.4;
-            stack.push((start + (end - start) * 0.55, angle - spread, len * 0.66, width * 0.62, depth - 1));
-            stack.push((start + (end - start) * 0.82, angle + spread * 0.6, len * 0.55, width * 0.52, depth - 1));
+            stack.push((
+                start + (end - start) * 0.55,
+                angle - spread,
+                len * 0.66,
+                width * 0.62,
+                depth - 1,
+            ));
+            stack.push((
+                start + (end - start) * 0.82,
+                angle + spread * 0.6,
+                len * 0.55,
+                width * 0.52,
+                depth - 1,
+            ));
             if hash(si * 11) > 0.4 {
-                stack.push((start + (end - start) * 0.7, angle + spread * 1.5, len * 0.42, width * 0.44, depth - 1));
+                stack.push((
+                    start + (end - start) * 0.7,
+                    angle + spread * 1.5,
+                    len * 0.42,
+                    width * 0.44,
+                    depth - 1,
+                ));
             }
         } else {
             for b in 0..4u32 {
-                let bp = end + Vec2::new((hash(si * 3 + b) - 0.5) * 18.0, (hash(si * 9 + b) - 0.5) * 18.0);
+                let bp = end
+                    + Vec2::new(
+                        (hash(si * 3 + b) - 0.5) * 18.0,
+                        (hash(si * 9 + b) - 0.5) * 18.0,
+                    );
                 flowers.push((bp, 7.0 + hash(si * 5 + b) * 6.0));
             }
         }
@@ -1415,23 +1845,63 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let bh = h * 0.022;
         let hull = Color32::from_rgb(0x7A, 0x4E, 0x30);
         painter.add(egui::Shape::convex_polygon(
-            vec![egui::pos2(bx - bw, by), egui::pos2(bx + bw, by), egui::pos2(bx + bw * 0.68, by + bh), egui::pos2(bx - bw * 0.68, by + bh)],
+            vec![
+                egui::pos2(bx - bw, by),
+                egui::pos2(bx + bw, by),
+                egui::pos2(bx + bw * 0.68, by + bh),
+                egui::pos2(bx - bw * 0.68, by + bh),
+            ],
             rgba(hull, a(255.0)),
             Stroke::NONE,
         ));
-        painter.add(egui::Shape::line(vec![egui::pos2(bx - bw, by), egui::pos2(bx + bw, by)], Stroke::new(2.5_f32, rgba(mix(hull, Color32::from_rgb(0xC9, 0x9A, 0x6E), 0.6), a(255.0)))));
+        painter.add(egui::Shape::line(
+            vec![egui::pos2(bx - bw, by), egui::pos2(bx + bw, by)],
+            Stroke::new(
+                2.5_f32,
+                rgba(
+                    mix(hull, Color32::from_rgb(0xC9, 0x9A, 0x6E), 0.6),
+                    a(255.0),
+                ),
+            ),
+        ));
         let lsz = bw * 0.95;
-        let lr = egui::Rect::from_center_size(egui::pos2(bx - bw * 0.15, by - lsz * 0.42), egui::Vec2::splat(lsz));
-        painter.image(logo, lr, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_rgba_unmultiplied(255, 255, 255, a(255.0)));
+        let lr = egui::Rect::from_center_size(
+            egui::pos2(bx - bw * 0.15, by - lsz * 0.42),
+            egui::Vec2::splat(lsz),
+        );
+        painter.image(
+            logo,
+            lr,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            Color32::from_rgba_unmultiplied(255, 255, 255, a(255.0)),
+        );
         let hand = egui::pos2(bx + bw * 0.2, by - lsz * 0.35);
         let tip = egui::pos2(bx + bw * 1.5, by - lsz * 0.95);
-        painter.add(egui::Shape::line(vec![hand, tip], Stroke::new(2.0_f32, rgba(Color32::from_rgb(0x3A, 0x2A, 0x22), a(255.0)))));
+        painter.add(egui::Shape::line(
+            vec![hand, tip],
+            Stroke::new(2.0_f32, rgba(Color32::from_rgb(0x3A, 0x2A, 0x22), a(255.0))),
+        ));
         let dip = water_top + h * 0.075;
         let bob_end = egui::pos2(tip.x + w * 0.014, dip);
-        painter.add(egui::Shape::line(vec![tip, bob_end], Stroke::new(1.0_f32, rgba(Color32::from_rgb(0xEE, 0xEE, 0xF4), a(150.0)))));
-        painter.circle_filled(bob_end, 3.0, rgba(Color32::from_rgb(0xE0, 0x50, 0x50), a(255.0)));
-        painter.circle_filled(bob_end - Vec2::new(0.0, 3.0), 3.0, rgba(Color32::WHITE, a(255.0)));
-        painter.circle_stroke(bob_end, 6.0 + (t * 2.0).sin().abs() * 4.0, Stroke::new(1.0_f32, rgba(Color32::WHITE, a(60.0))));
+        painter.add(egui::Shape::line(
+            vec![tip, bob_end],
+            Stroke::new(1.0_f32, rgba(Color32::from_rgb(0xEE, 0xEE, 0xF4), a(150.0))),
+        ));
+        painter.circle_filled(
+            bob_end,
+            3.0,
+            rgba(Color32::from_rgb(0xE0, 0x50, 0x50), a(255.0)),
+        );
+        painter.circle_filled(
+            bob_end - Vec2::new(0.0, 3.0),
+            3.0,
+            rgba(Color32::WHITE, a(255.0)),
+        );
+        painter.circle_stroke(
+            bob_end,
+            6.0 + (t * 2.0).sin().abs() * 4.0,
+            Stroke::new(1.0_f32, rgba(Color32::WHITE, a(60.0))),
+        );
     }
 
     let petal = |c: egui::Pos2, size: f32, ang: f32, col: Color32| {
@@ -1468,18 +1938,31 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         petal(egui::pos2(x, y), size, ang, rgba(pcol, a(205.0 * flick)));
     }
 
-
     if night > 0.01 {
         for i in 0..16u32 {
             let drift = t * (7.0 + hash(i * 11) * 9.0) / w;
             let fxr = (hash(i * 3) + drift).fract();
             let x = rect.min.x + fxr * w;
             let ly = land_edge(fxr);
-            let y = ly - h * 0.015 + hash(i * 13) * (water_top - ly) * 0.7 + (t * (0.8 + hash(i * 5)) + hash(i * 7) * tau).sin() * h * 0.025;
-            let ph = 0.4 + 0.6 * (t * (2.0 + hash(i * 17) * 2.0) + hash(i * 19) * tau).sin().max(0.0);
+            let y = ly - h * 0.015
+                + hash(i * 13) * (water_top - ly) * 0.7
+                + (t * (0.8 + hash(i * 5)) + hash(i * 7) * tau).sin() * h * 0.025;
+            let ph = 0.4
+                + 0.6
+                    * (t * (2.0 + hash(i * 17) * 2.0) + hash(i * 19) * tau)
+                        .sin()
+                        .max(0.0);
             let fr = 1.6 + hash(i * 23) * 1.2;
-            painter.circle_filled(egui::pos2(x, y), fr * 2.6, rgba(Color32::from_rgb(0xC8, 0xFF, 0x8C), a(45.0 * night * ph)));
-            painter.circle_filled(egui::pos2(x, y), fr, rgba(Color32::from_rgb(0xEC, 0xFF, 0xB0), a(210.0 * night * ph)));
+            painter.circle_filled(
+                egui::pos2(x, y),
+                fr * 2.6,
+                rgba(Color32::from_rgb(0xC8, 0xFF, 0x8C), a(45.0 * night * ph)),
+            );
+            painter.circle_filled(
+                egui::pos2(x, y),
+                fr,
+                rgba(Color32::from_rgb(0xEC, 0xFF, 0xB0), a(210.0 * night * ph)),
+            );
         }
     }
 
@@ -1489,19 +1972,55 @@ fn draw_cherry_blossom_backdrop(painter: &egui::Painter, rect: egui::Rect, color
         let vin = rgba(vc, 0);
         let quad = |a0: egui::Pos2, b0: egui::Pos2, b1: egui::Pos2, a1: egui::Pos2| {
             let mut m = egui::epaint::Mesh::default();
-            m.vertices.push(egui::epaint::Vertex { pos: a0, uv, color: vout });
-            m.vertices.push(egui::epaint::Vertex { pos: b0, uv, color: vout });
-            m.vertices.push(egui::epaint::Vertex { pos: b1, uv, color: vin });
-            m.vertices.push(egui::epaint::Vertex { pos: a1, uv, color: vin });
+            m.vertices.push(egui::epaint::Vertex {
+                pos: a0,
+                uv,
+                color: vout,
+            });
+            m.vertices.push(egui::epaint::Vertex {
+                pos: b0,
+                uv,
+                color: vout,
+            });
+            m.vertices.push(egui::epaint::Vertex {
+                pos: b1,
+                uv,
+                color: vin,
+            });
+            m.vertices.push(egui::epaint::Vertex {
+                pos: a1,
+                uv,
+                color: vin,
+            });
             m.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
             painter.add(egui::Shape::mesh(m));
         };
         let vw = w * 0.13;
         let vh = h * 0.17;
-        quad(rect.left_top(), rect.right_top(), egui::pos2(rect.max.x, rect.min.y + vh), egui::pos2(rect.min.x, rect.min.y + vh));
-        quad(rect.left_bottom(), rect.right_bottom(), egui::pos2(rect.max.x, rect.max.y - vh), egui::pos2(rect.min.x, rect.max.y - vh));
-        quad(rect.left_top(), rect.left_bottom(), egui::pos2(rect.min.x + vw, rect.max.y), egui::pos2(rect.min.x + vw, rect.min.y));
-        quad(rect.right_top(), rect.right_bottom(), egui::pos2(rect.max.x - vw, rect.max.y), egui::pos2(rect.max.x - vw, rect.min.y));
+        quad(
+            rect.left_top(),
+            rect.right_top(),
+            egui::pos2(rect.max.x, rect.min.y + vh),
+            egui::pos2(rect.min.x, rect.min.y + vh),
+        );
+        quad(
+            rect.left_bottom(),
+            rect.right_bottom(),
+            egui::pos2(rect.max.x, rect.max.y - vh),
+            egui::pos2(rect.min.x, rect.max.y - vh),
+        );
+        quad(
+            rect.left_top(),
+            rect.left_bottom(),
+            egui::pos2(rect.min.x + vw, rect.max.y),
+            egui::pos2(rect.min.x + vw, rect.min.y),
+        );
+        quad(
+            rect.right_top(),
+            rect.right_bottom(),
+            egui::pos2(rect.max.x - vw, rect.max.y),
+            egui::pos2(rect.max.x - vw, rect.min.y),
+        );
     }
 }
 
@@ -1585,15 +2104,21 @@ pub fn draw_wave_background(
     let steps = 96usize;
 
     let sh = |c: Color32, f: f32| -> Color32 {
-        let adj = |v: u8| if f >= 0.0 { (v as f32 + (255.0 - v as f32) * f) as u8 } else { (v as f32 * (1.0 + f)) as u8 };
+        let adj = |v: u8| {
+            if f >= 0.0 {
+                (v as f32 + (255.0 - v as f32) * f) as u8
+            } else {
+                (v as f32 * (1.0 + f)) as u8
+            }
+        };
         Color32::from_rgb(adj(c.r()), adj(c.g()), adj(c.b()))
     };
     let bands: &[(f32, f32, f32, f32, u8, f32)] = &[
-        (0.55, 0.012, 0.0,  1.5,  95,  0.28),
-        (0.42, 0.018, 1.1,  1.2,  88, -0.30),
-        (0.70, 0.009, 2.3,  0.9,  78,  0.50),
-        (0.30, 0.022, 0.6,  1.7,  70, -0.42),
-        (0.85, 0.007, 3.5,  0.7,  60,  0.66),
+        (0.55, 0.012, 0.0, 1.5, 95, 0.28),
+        (0.42, 0.018, 1.1, 1.2, 88, -0.30),
+        (0.70, 0.009, 2.3, 0.9, 78, 0.50),
+        (0.30, 0.022, 0.6, 1.7, 70, -0.42),
+        (0.85, 0.007, 3.5, 0.7, 60, 0.66),
     ];
 
     for &(base_frac, amp_frac, phase_off, speed, alpha, shade) in bands {
@@ -1602,7 +2127,9 @@ pub fn draw_wave_background(
         let phase = t * speed + phase_off;
 
         let band_alpha = ((alpha as f32) * opacity) as u8;
-        if band_alpha == 0 { continue; }
+        if band_alpha == 0 {
+            continue;
+        }
         let bcol = sh(color, shade);
         let fill = Color32::from_rgba_unmultiplied(bcol.r(), bcol.g(), bcol.b(), band_alpha);
 
@@ -1637,8 +2164,25 @@ pub fn draw_wave_background(
         painter.add(egui::Shape::mesh(mesh));
         let crest = sh(color, if shade >= 0.0 { -0.4 } else { 0.55 });
         let ca = ((alpha as f32 + 70.0).min(210.0) * opacity) as u8;
-        painter.add(egui::Shape::line(crest_pts.clone(), Stroke::new(2.4_f32, Color32::from_rgba_unmultiplied(crest.r(), crest.g(), crest.b(), (ca as f32 * 0.5) as u8))));
-        painter.add(egui::Shape::line(crest_pts, Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(crest.r(), crest.g(), crest.b(), ca))));
+        painter.add(egui::Shape::line(
+            crest_pts.clone(),
+            Stroke::new(
+                2.4_f32,
+                Color32::from_rgba_unmultiplied(
+                    crest.r(),
+                    crest.g(),
+                    crest.b(),
+                    (ca as f32 * 0.5) as u8,
+                ),
+            ),
+        ));
+        painter.add(egui::Shape::line(
+            crest_pts,
+            Stroke::new(
+                1.2_f32,
+                Color32::from_rgba_unmultiplied(crest.r(), crest.g(), crest.b(), ca),
+            ),
+        ));
     }
 }
 
@@ -1966,17 +2510,31 @@ pub fn carousel_view(
         state.theme_color = lerp_color(state.theme_color, c, (dt * 10.0).min(1.0));
     }
 
-    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("carousel_bg")));
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Background,
+        egui::Id::new("carousel_bg"),
+    ));
     if state.nx_logo.is_none() {
-        if let Ok(img) = image::load_from_memory(include_bytes!("../../branding/png/logo-256.png")) {
+        if let Ok(img) = image::load_from_memory(include_bytes!("../../branding/png/logo-256.png"))
+        {
             let rgba = img.to_rgba8();
             let (iw, ih) = rgba.dimensions();
-            let ci = egui::ColorImage::from_rgba_unmultiplied([iw as usize, ih as usize], rgba.as_raw());
+            let ci =
+                egui::ColorImage::from_rgba_unmultiplied([iw as usize, ih as usize], rgba.as_raw());
             state.nx_logo = Some(ctx.load_texture("nx_logo", ci, egui::TextureOptions::LINEAR));
         }
     }
     let logo_id = state.nx_logo.as_ref().map(|tx| tx.id());
-    draw_backdrop(&painter, bg_rect, state.ambient_color, t, backdrop_theme, ui_opacity, th, logo_id);
+    draw_backdrop(
+        &painter,
+        bg_rect,
+        state.ambient_color,
+        t,
+        backdrop_theme,
+        ui_opacity,
+        th,
+        logo_id,
+    );
 
     let screen_center = bg_rect.center();
     let scale_pos =
@@ -2038,8 +2596,18 @@ pub fn carousel_view(
             };
             painter.circle_filled(badge, 9.0 * s * scale_factor, bcol);
             let lum = 0.299 * bcol.r() as f32 + 0.587 * bcol.g() as f32 + 0.114 * bcol.b() as f32;
-            let ycol = if lum > 130.0 { Color32::from_rgb(0x10, 0x14, 0x1C) } else { Color32::WHITE };
-            painter.text(badge, egui::Align2::CENTER_CENTER, "Y", FontId::proportional(12.0 * s * scale_factor), ycol);
+            let ycol = if lum > 130.0 {
+                Color32::from_rgb(0x10, 0x14, 0x1C)
+            } else {
+                Color32::WHITE
+            };
+            painter.text(
+                badge,
+                egui::Align2::CENTER_CENTER,
+                "Y",
+                FontId::proportional(12.0 * s * scale_factor),
+                ycol,
+            );
         }
 
         let text_pos = scale_pos(search_rect.min + Vec2::new(38.0 * s, search_rect.height() * 0.5));

@@ -591,7 +591,14 @@ impl ShopState {
         ctx.request_repaint();
     }
 
-    fn marquee(&mut self, ui: &mut egui::Ui, paint: &egui::Painter, band: egui::Rect, clip_rect: egui::Rect, pal: Pal) {
+    fn marquee(
+        &mut self,
+        ui: &mut egui::Ui,
+        paint: &egui::Painter,
+        band: egui::Rect,
+        clip_rect: egui::Rect,
+        pal: Pal,
+    ) {
         let band_bg = tint_toward(pal.bg, pal.panel2, 0.5);
         let clip = paint.with_clip_rect(clip_rect);
         clip.rect_filled(clip_rect, egui::Rounding::ZERO, band_bg);
@@ -616,18 +623,50 @@ impl ShopState {
             }
             let idx = (j as usize) % count;
             let tile = egui::Rect::from_min_size(egui::pos2(x, y), egui::Vec2::new(pw, ph));
-            clip.rect_filled(tile.translate(egui::Vec2::new(0.0, 3.0)), egui::Rounding::same(9.0), Color32::from_black_alpha(55));
+            clip.rect_filled(
+                tile.translate(egui::Vec2::new(0.0, 3.0)),
+                egui::Rounding::same(9.0),
+                Color32::from_black_alpha(55),
+            );
             clip.rect_filled(tile, egui::Rounding::same(9.0), pal.panel);
             if let Some(Some(tex)) = self.icons.get(idx) {
                 crate::carousel::draw_rounded_image(&clip, tex.id(), tile, 9.0, Color32::WHITE);
             } else {
-                let init = self.apps[idx].title.chars().next().unwrap_or('?').to_uppercase().to_string();
-                clip.text(tile.center(), egui::Align2::CENTER_CENTER, &init, egui::FontId::proportional(ph * 0.42), pal.muted);
+                let init = self.apps[idx]
+                    .title
+                    .chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_uppercase()
+                    .to_string();
+                clip.text(
+                    tile.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &init,
+                    egui::FontId::proportional(ph * 0.42),
+                    pal.muted,
+                );
             }
         }
         let fade_w = (band.width() * 0.20).min(220.0);
-        hfade(&clip, egui::Rect::from_min_max(egui::pos2(band.min.x, band.min.y), egui::pos2(band.min.x + fade_w, band.max.y)), band_bg, true);
-        hfade(&clip, egui::Rect::from_min_max(egui::pos2(band.max.x - fade_w, band.min.y), egui::pos2(band.max.x, band.max.y)), band_bg, false);
+        hfade(
+            &clip,
+            egui::Rect::from_min_max(
+                egui::pos2(band.min.x, band.min.y),
+                egui::pos2(band.min.x + fade_w, band.max.y),
+            ),
+            band_bg,
+            true,
+        );
+        hfade(
+            &clip,
+            egui::Rect::from_min_max(
+                egui::pos2(band.max.x - fade_w, band.min.y),
+                egui::pos2(band.max.x, band.max.y),
+            ),
+            band_bg,
+            false,
+        );
         const TAGLINES: [&str; 3] = [
             "Homebrew has never been easier to get into.",
             "Enjoy Homebrew straight from the emulator.",
@@ -646,12 +685,36 @@ impl ShopState {
         };
         let tag = TAGLINES[idx];
         let fid = egui::FontId::proportional(19.0);
-        let tw = ui.fonts(|f| f.layout_no_wrap(tag.to_string(), fid.clone(), pal.text).size().x);
+        let tw = ui.fonts(|f| {
+            f.layout_no_wrap(tag.to_string(), fid.clone(), pal.text)
+                .size()
+                .x
+        });
         let pill = egui::Rect::from_center_size(band.center(), egui::Vec2::new(tw + 56.0, 44.0));
-        clip.rect_filled(pill, egui::Rounding::same(22.0), Color32::from_rgba_unmultiplied(band_bg.r(), band_bg.g(), band_bg.b(), 236));
-        clip.rect_stroke(pill, egui::Rounding::same(22.0), egui::Stroke::new(1.0_f32, pal.border));
-        clip.text(band.center(), egui::Align2::CENTER_CENTER, tag, fid, pal.text.gamma_multiply(ta));
-        clip.line_segment([egui::pos2(band.min.x, band.max.y), egui::pos2(band.max.x, band.max.y)], egui::Stroke::new(1.0_f32, pal.border));
+        clip.rect_filled(
+            pill,
+            egui::Rounding::same(22.0),
+            Color32::from_rgba_unmultiplied(band_bg.r(), band_bg.g(), band_bg.b(), 236),
+        );
+        clip.rect_stroke(
+            pill,
+            egui::Rounding::same(22.0),
+            egui::Stroke::new(1.0_f32, pal.border),
+        );
+        clip.text(
+            band.center(),
+            egui::Align2::CENTER_CENTER,
+            tag,
+            fid,
+            pal.text.gamma_multiply(ta),
+        );
+        clip.line_segment(
+            [
+                egui::pos2(band.min.x, band.max.y),
+                egui::pos2(band.max.x, band.max.y),
+            ],
+            egui::Stroke::new(1.0_f32, pal.border),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -735,9 +798,16 @@ impl ShopState {
 
         if max_scroll > 0.0 {
             let (ptr, pdown, ppressed) = ui.input(|i| {
-                (i.pointer.interact_pos(), i.pointer.primary_down(), i.pointer.primary_pressed())
+                (
+                    i.pointer.interact_pos(),
+                    i.pointer.primary_down(),
+                    i.pointer.primary_pressed(),
+                )
             });
-            let drag_area = egui::Rect::from_min_max(content.min, egui::pos2(content.max.x - 22.0, content.max.y - 40.0));
+            let drag_area = egui::Rect::from_min_max(
+                content.min,
+                egui::pos2(content.max.x - 22.0, content.max.y - 40.0),
+            );
             if ppressed && !self.sb_drag && ptr.map_or(false, |p| drag_area.contains(p)) {
                 self.drag_from = Some((ptr.unwrap().y, self.scroll));
                 self.grid_dragging = false;
@@ -765,7 +835,10 @@ impl ShopState {
                 egui::pos2(content.min.x, content.min.y - self.scroll),
                 egui::pos2(content.max.x, content.min.y - self.scroll + marquee_h),
             );
-            let cr = egui::Rect::from_min_max(content.min, egui::pos2(content.max.x, content.min.y + vis_h));
+            let cr = egui::Rect::from_min_max(
+                content.min,
+                egui::pos2(content.max.x, content.min.y + vis_h),
+            );
             self.marquee(ui, paint, band, cr, pal);
         }
 
@@ -773,10 +846,14 @@ impl ShopState {
         let x0 = content.min.x + pad;
         let y0 = content.min.y + marquee_h + pad - self.scroll;
         let grid_top = content.min.y + (marquee_h - self.scroll).max(0.0);
-        let clip = paint.with_clip_rect(egui::Rect::from_min_max(egui::pos2(content.min.x, grid_top), content.max));
+        let clip = paint.with_clip_rect(egui::Rect::from_min_max(
+            egui::pos2(content.min.x, grid_top),
+            content.max,
+        ));
         if n > 0 {
             let tvx = content.min.x + pad + (self.selected % cols) as f32 * (tile_w + gap);
-            let tvy = content.min.y + marquee_h + pad + (self.selected / cols) as f32 * (cell_h + gap);
+            let tvy =
+                content.min.y + marquee_h + pad + (self.selected / cols) as f32 * (cell_h + gap);
             let sdt = ui.input(|i| i.stable_dt).min(0.1);
             if !self.sel_init {
                 self.sel_px = tvx;
@@ -786,10 +863,26 @@ impl ShopState {
             let k = (sdt * 16.0).min(1.0);
             self.sel_px += (tvx - self.sel_px) * k;
             self.sel_py += (tvy - self.sel_py) * k;
-            let sr = egui::Rect::from_min_size(egui::pos2(self.sel_px, self.sel_py - self.scroll), egui::Vec2::new(tile_w, tile_h));
+            let sr = egui::Rect::from_min_size(
+                egui::pos2(self.sel_px, self.sel_py - self.scroll),
+                egui::Vec2::new(tile_w, tile_h),
+            );
             let pulse = 0.7 + 0.3 * (now_t * 3.0).sin();
-            clip.rect_filled(sr.expand(6.0), egui::Rounding::same(15.0), Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (70.0 * pulse) as u8));
-            clip.rect_stroke(sr.expand(4.0), egui::Rounding::same(13.0), egui::Stroke::new(2.5_f32, accent));
+            clip.rect_filled(
+                sr.expand(6.0),
+                egui::Rounding::same(15.0),
+                Color32::from_rgba_unmultiplied(
+                    accent.r(),
+                    accent.g(),
+                    accent.b(),
+                    (70.0 * pulse) as u8,
+                ),
+            );
+            clip.rect_stroke(
+                sr.expand(4.0),
+                egui::Rounding::same(13.0),
+                egui::Stroke::new(2.5_f32, accent),
+            );
         }
         let mut open_detail = None;
         let filtered = self.filtered.clone();
@@ -805,7 +898,11 @@ impl ShopState {
             let tile =
                 egui::Rect::from_min_size(egui::pos2(tx, ty), egui::Vec2::new(tile_w, tile_h));
             let sel = vi == self.selected;
-            clip.rect_filled(tile.translate(egui::Vec2::new(0.0, 4.0)).expand(1.0), egui::Rounding::same(11.0), Color32::from_black_alpha(70));
+            clip.rect_filled(
+                tile.translate(egui::Vec2::new(0.0, 4.0)).expand(1.0),
+                egui::Rounding::same(11.0),
+                Color32::from_black_alpha(70),
+            );
             clip.rect_filled(tile, egui::Rounding::same(10.0), pal.panel);
             if let Some(Some(tex)) = self.icons.get(ai) {
                 crate::carousel::draw_rounded_image(&clip, tex.id(), tile, 10.0, Color32::WHITE);
@@ -818,8 +915,18 @@ impl ShopState {
                     pal.muted,
                 );
             }
-            let label_col = if sel { tint_toward(pal.text, accent, 0.5) } else { pal.text };
-            clip.text(egui::pos2(tile.min.x + 2.0, tile.max.y + 6.0), egui::Align2::LEFT_TOP, &self.apps[ai].title, egui::FontId::proportional(13.0), label_col);
+            let label_col = if sel {
+                tint_toward(pal.text, accent, 0.5)
+            } else {
+                pal.text
+            };
+            clip.text(
+                egui::pos2(tile.min.x + 2.0, tile.max.y + 6.0),
+                egui::Align2::LEFT_TOP,
+                &self.apps[ai].title,
+                egui::FontId::proportional(13.0),
+                label_col,
+            );
             let resp = ui.allocate_rect(tile, egui::Sense::click());
             if !self.grid_dragging {
                 if resp.double_clicked() {
@@ -832,20 +939,33 @@ impl ShopState {
         }
         if n == 0 {
             let cy = (content.min.y + marquee_h + content.max.y) * 0.5;
-            paint.text(egui::pos2(content.center().x, cy), egui::Align2::CENTER_CENTER, "No games found.", egui::FontId::proportional(18.0), pal.muted);
+            paint.text(
+                egui::pos2(content.center().x, cy),
+                egui::Align2::CENTER_CENTER,
+                "No games found.",
+                egui::FontId::proportional(18.0),
+                pal.muted,
+            );
         }
         if a_edge && self.selected < n {
             open_detail = Some(self.filtered[self.selected]);
         }
 
         if max_scroll > 0.0 {
-            let track = egui::Rect::from_min_size(egui::pos2(content.max.x - 16.0, content.min.y + 8.0), egui::Vec2::new(7.0, content.height() - 56.0));
+            let track = egui::Rect::from_min_size(
+                egui::pos2(content.max.x - 16.0, content.min.y + 8.0),
+                egui::Vec2::new(7.0, content.height() - 56.0),
+            );
             let hit = track.expand2(egui::Vec2::new(10.0, 4.0));
             let view_frac = (content.height() / total_h).clamp(0.06, 1.0);
             let thumb_h = (track.height() * view_frac).max(30.0);
             let range = (track.height() - thumb_h).max(1.0);
             let (ptr_pos, ptr_down, ptr_pressed) = ui.input(|i| {
-                (i.pointer.interact_pos(), i.pointer.primary_down(), i.pointer.primary_pressed())
+                (
+                    i.pointer.interact_pos(),
+                    i.pointer.primary_down(),
+                    i.pointer.primary_pressed(),
+                )
             });
             if ptr_pressed && ptr_pos.map_or(false, |p| hit.contains(p)) {
                 self.sb_drag = true;
@@ -860,10 +980,25 @@ impl ShopState {
                 }
             }
             let hot = self.sb_drag || ptr_pos.map_or(false, |p| hit.contains(p));
-            paint.rect_filled(track, egui::Rounding::same(3.5), tint_toward(pal.bg, pal.panel2, 0.6));
+            paint.rect_filled(
+                track,
+                egui::Rounding::same(3.5),
+                tint_toward(pal.bg, pal.panel2, 0.6),
+            );
             let thumb_y = track.min.y + range * (self.scroll / max_scroll);
-            let thumb = egui::Rect::from_min_size(egui::pos2(track.min.x, thumb_y), egui::Vec2::new(7.0, thumb_h));
-            paint.rect_filled(thumb, egui::Rounding::same(3.5), if hot { pal.muted } else { tint_toward(pal.panel2, pal.muted, 0.5) });
+            let thumb = egui::Rect::from_min_size(
+                egui::pos2(track.min.x, thumb_y),
+                egui::Vec2::new(7.0, thumb_h),
+            );
+            paint.rect_filled(
+                thumb,
+                egui::Rounding::same(3.5),
+                if hot {
+                    pal.muted
+                } else {
+                    tint_toward(pal.panel2, pal.muted, 0.5)
+                },
+            );
         }
         if let Some(ai) = open_detail {
             self.view = View::Detail(ai);
@@ -881,13 +1016,36 @@ impl ShopState {
 
         let link = "Browse at hb-app.store";
         let fid = egui::FontId::proportional(13.0);
-        let lw = ui.fonts(|f| f.layout_no_wrap(link.to_string(), fid.clone(), accent).size().x);
-        let lrect = egui::Rect::from_min_size(egui::pos2(content.min.x + 24.0, content.max.y - 40.0), egui::Vec2::new(lw + 10.0, 40.0));
+        let lw = ui.fonts(|f| {
+            f.layout_no_wrap(link.to_string(), fid.clone(), accent)
+                .size()
+                .x
+        });
+        let lrect = egui::Rect::from_min_size(
+            egui::pos2(content.min.x + 24.0, content.max.y - 40.0),
+            egui::Vec2::new(lw + 10.0, 40.0),
+        );
         let lresp = ui.allocate_rect(lrect, egui::Sense::click());
-        let lcol = if lresp.hovered() { tint_toward(accent, Color32::WHITE, 0.35) } else { accent };
-        paint.text(egui::pos2(content.min.x + 24.0, content.max.y - 20.0), egui::Align2::LEFT_CENTER, link, fid, lcol);
+        let lcol = if lresp.hovered() {
+            tint_toward(accent, Color32::WHITE, 0.35)
+        } else {
+            accent
+        };
+        paint.text(
+            egui::pos2(content.min.x + 24.0, content.max.y - 20.0),
+            egui::Align2::LEFT_CENTER,
+            link,
+            fid,
+            lcol,
+        );
         if lresp.hovered() {
-            paint.line_segment([egui::pos2(lrect.min.x, content.max.y - 8.0), egui::pos2(lrect.min.x + lw, content.max.y - 8.0)], egui::Stroke::new(1.0_f32, lcol));
+            paint.line_segment(
+                [
+                    egui::pos2(lrect.min.x, content.max.y - 8.0),
+                    egui::pos2(lrect.min.x + lw, content.max.y - 8.0),
+                ],
+                egui::Stroke::new(1.0_f32, lcol),
+            );
         }
         if lresp.clicked() {
             open_url("https://hb-app.store/switch");
@@ -929,18 +1087,64 @@ impl ShopState {
             paint.rect_filled(icon_r, egui::Rounding::same(20.0), pal.panel);
         }
         let tx = icon_r.max.x + 30.0;
-        paint.text(egui::pos2(tx, icon_r.min.y + 22.0), egui::Align2::LEFT_TOP, &app.title, egui::FontId::proportional(34.0), pal.text);
-        paint.text(egui::pos2(tx, icon_r.min.y + 70.0), egui::Align2::LEFT_TOP, &app.author, egui::FontId::proportional(18.0), pal.muted);
-        paint.text(egui::pos2(tx, icon_r.min.y + 100.0), egui::Align2::LEFT_TOP, &format!("v{}   ·   {}   ·   {}", app.version, human_size(app.filesize), app.license), egui::FontId::proportional(14.0), pal.muted);
+        paint.text(
+            egui::pos2(tx, icon_r.min.y + 22.0),
+            egui::Align2::LEFT_TOP,
+            &app.title,
+            egui::FontId::proportional(34.0),
+            pal.text,
+        );
+        paint.text(
+            egui::pos2(tx, icon_r.min.y + 70.0),
+            egui::Align2::LEFT_TOP,
+            &app.author,
+            egui::FontId::proportional(18.0),
+            pal.muted,
+        );
+        paint.text(
+            egui::pos2(tx, icon_r.min.y + 100.0),
+            egui::Align2::LEFT_TOP,
+            &format!(
+                "v{}   ·   {}   ·   {}",
+                app.version,
+                human_size(app.filesize),
+                app.license
+            ),
+            egui::FontId::proportional(14.0),
+            pal.muted,
+        );
         let link = "View on hb-app.store";
         let lfid = egui::FontId::proportional(14.0);
-        let lw = ui.fonts(|f| f.layout_no_wrap(link.to_string(), lfid.clone(), self.accent).size().x);
-        let lrect = egui::Rect::from_min_size(egui::pos2(tx, icon_r.min.y + 130.0), egui::Vec2::new(lw + 10.0, 24.0));
+        let lw = ui.fonts(|f| {
+            f.layout_no_wrap(link.to_string(), lfid.clone(), self.accent)
+                .size()
+                .x
+        });
+        let lrect = egui::Rect::from_min_size(
+            egui::pos2(tx, icon_r.min.y + 130.0),
+            egui::Vec2::new(lw + 10.0, 24.0),
+        );
         let lresp = ui.allocate_rect(lrect, egui::Sense::click());
-        let lcol = if lresp.hovered() { tint_toward(self.accent, Color32::WHITE, 0.35) } else { self.accent };
-        paint.text(egui::pos2(tx, icon_r.min.y + 130.0), egui::Align2::LEFT_TOP, link, lfid, lcol);
+        let lcol = if lresp.hovered() {
+            tint_toward(self.accent, Color32::WHITE, 0.35)
+        } else {
+            self.accent
+        };
+        paint.text(
+            egui::pos2(tx, icon_r.min.y + 130.0),
+            egui::Align2::LEFT_TOP,
+            link,
+            lfid,
+            lcol,
+        );
         if lresp.hovered() {
-            paint.line_segment([egui::pos2(tx, icon_r.min.y + 150.0), egui::pos2(tx + lw, icon_r.min.y + 150.0)], egui::Stroke::new(1.0_f32, lcol));
+            paint.line_segment(
+                [
+                    egui::pos2(tx, icon_r.min.y + 150.0),
+                    egui::pos2(tx + lw, icon_r.min.y + 150.0),
+                ],
+                egui::Stroke::new(1.0_f32, lcol),
+            );
         }
         if lresp.clicked() {
             open_url(&app.page_url());
@@ -1430,18 +1634,33 @@ impl ShopState {
 }
 
 fn hint_bar(paint: &egui::Painter, content: egui::Rect, pal: Pal, text: &str) {
-    let bar = egui::Rect::from_min_max(egui::pos2(content.min.x, content.max.y - 40.0), content.max);
-    let shadow = egui::Rect::from_min_max(egui::pos2(bar.min.x, bar.min.y - 16.0), egui::pos2(bar.max.x, bar.min.y));
+    let bar =
+        egui::Rect::from_min_max(egui::pos2(content.min.x, content.max.y - 40.0), content.max);
+    let shadow = egui::Rect::from_min_max(
+        egui::pos2(bar.min.x, bar.min.y - 16.0),
+        egui::pos2(bar.max.x, bar.min.y),
+    );
     vfade(paint, shadow, Color32::from_black_alpha(70), false);
     let fill = tint_toward(pal.bg, pal.panel2, 0.7);
     paint.rect_filled(bar, egui::Rounding::ZERO, fill);
-    paint.line_segment([bar.min, egui::pos2(bar.max.x, bar.min.y)], egui::Stroke::new(1.0_f32, pal.border));
-    paint.text(egui::pos2(content.max.x - 24.0, bar.center().y), egui::Align2::RIGHT_CENTER, text, egui::FontId::proportional(13.0), pal.text);
+    paint.line_segment(
+        [bar.min, egui::pos2(bar.max.x, bar.min.y)],
+        egui::Stroke::new(1.0_f32, pal.border),
+    );
+    paint.text(
+        egui::pos2(content.max.x - 24.0, bar.center().y),
+        egui::Align2::RIGHT_CENTER,
+        text,
+        egui::FontId::proportional(13.0),
+        pal.text,
+    );
 }
 
 fn open_url(url: &str) {
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -1450,20 +1669,39 @@ fn open_url(url: &str) {
 
 fn hfade(paint: &egui::Painter, rect: egui::Rect, color: Color32, solid_left: bool) {
     let clear = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0);
-    let (lc, rc) = if solid_left { (color, clear) } else { (clear, color) };
+    let (lc, rc) = if solid_left {
+        (color, clear)
+    } else {
+        (clear, color)
+    };
     grad_quad(paint, rect, lc, rc, lc, rc);
 }
 
 fn vfade(paint: &egui::Painter, rect: egui::Rect, color: Color32, solid_top: bool) {
     let clear = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0);
-    let (tc, bc) = if solid_top { (color, clear) } else { (clear, color) };
+    let (tc, bc) = if solid_top {
+        (color, clear)
+    } else {
+        (clear, color)
+    };
     grad_quad(paint, rect, tc, tc, bc, bc);
 }
 
-fn grad_quad(paint: &egui::Painter, rect: egui::Rect, lt: Color32, rt: Color32, lb: Color32, rb: Color32) {
+fn grad_quad(
+    paint: &egui::Painter,
+    rect: egui::Rect,
+    lt: Color32,
+    rt: Color32,
+    lb: Color32,
+    rb: Color32,
+) {
     let mut mesh = egui::epaint::Mesh::default();
     let uv = egui::epaint::WHITE_UV;
-    let v = |p: egui::Pos2, c: Color32| egui::epaint::Vertex { pos: p, uv, color: c };
+    let v = |p: egui::Pos2, c: Color32| egui::epaint::Vertex {
+        pos: p,
+        uv,
+        color: c,
+    };
     mesh.vertices.push(v(rect.left_top(), lt));
     mesh.vertices.push(v(rect.right_top(), rt));
     mesh.vertices.push(v(rect.right_bottom(), rb));

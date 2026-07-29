@@ -92,16 +92,7 @@ impl From<TextureNumericType> for GraphicsTextureNumericType {
 }
 
 #[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub struct TextureNumericBinding {
     pub shader_id: u32,
@@ -358,16 +349,30 @@ mod tests {
             TextureNumericType::Uint,
         )])
         .unwrap();
-        let changed_kind = normalize_texture_numeric_manifest(vec![
-            TextureNumericBinding::new(0x44, 2, TextureNumericType::Float)
-                .with_image_kind(GraphicsTextureImageKind::CubeArray),
-        ])
+        let changed_kind = normalize_texture_numeric_manifest(vec![TextureNumericBinding::new(
+            0x44,
+            2,
+            TextureNumericType::Float,
+        )
+        .with_image_kind(GraphicsTextureImageKind::CubeArray)])
         .unwrap();
 
         let fingerprint = texture_numeric_manifest_fingerprint(&base);
-        assert_ne!(fingerprint, texture_numeric_manifest_fingerprint(&changed_id));
-        assert_ne!(fingerprint, texture_numeric_manifest_fingerprint(&changed_slot));
-        assert_ne!(fingerprint, texture_numeric_manifest_fingerprint(&changed_type));
-        assert_ne!(fingerprint, texture_numeric_manifest_fingerprint(&changed_kind));
+        assert_ne!(
+            fingerprint,
+            texture_numeric_manifest_fingerprint(&changed_id)
+        );
+        assert_ne!(
+            fingerprint,
+            texture_numeric_manifest_fingerprint(&changed_slot)
+        );
+        assert_ne!(
+            fingerprint,
+            texture_numeric_manifest_fingerprint(&changed_type)
+        );
+        assert_ne!(
+            fingerprint,
+            texture_numeric_manifest_fingerprint(&changed_kind)
+        );
     }
 }

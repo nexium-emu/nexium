@@ -17,13 +17,7 @@ pub fn root() -> PathBuf {
 }
 
 pub fn init() {
-    let _ = (
-        root(),
-        sdmc_dir(),
-        nand_dir(),
-        nro_dir(),
-        log_dir(),
-    );
+    let _ = (root(), sdmc_dir(), nand_dir(), nro_dir(), log_dir());
 }
 
 pub fn sdmc_dir() -> PathBuf {

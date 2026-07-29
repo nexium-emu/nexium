@@ -359,10 +359,12 @@ fn build() -> Option<Engine> {
     let shop_tracks: Vec<MusicTrack> = SHOP_MUSIC
         .iter()
         .enumerate()
-        .map(|(i, bytes)| decode_mp3_stereo(bytes).unwrap_or_else(|| {
-            log::warn!("Failed to decode shop music variant {}", i + 1);
-            MusicTrack::silent()
-        }))
+        .map(|(i, bytes)| {
+            decode_mp3_stereo(bytes).unwrap_or_else(|| {
+                log::warn!("Failed to decode shop music variant {}", i + 1);
+                MusicTrack::silent()
+            })
+        })
         .collect();
     let settings_track = decode_mp3_stereo(SETTINGS_MUSIC).unwrap_or_else(|| {
         log::warn!("Failed to decode settings music");
@@ -418,8 +420,16 @@ fn build() -> Option<Engine> {
                 let lp = f32::from_bits(MUSIC_LOWPASS.load(Ordering::Relaxed));
                 let alpha = 1.0 - lp * 0.9;
                 let mode = MUSIC_MODE.load(Ordering::Relaxed);
-                let shop_target = if mode == MusicMode::Shop as u8 { 1.0 } else { 0.0 };
-                let settings_target = if mode == MusicMode::Settings as u8 { 1.0 } else { 0.0 };
+                let shop_target = if mode == MusicMode::Shop as u8 {
+                    1.0
+                } else {
+                    0.0
+                };
+                let settings_target = if mode == MusicMode::Settings as u8 {
+                    1.0
+                } else {
+                    0.0
+                };
                 let mut act = active_cb.lock().ok();
                 for f in 0..frames {
                     let mut sfx = 0.0f32;
@@ -473,7 +483,12 @@ fn build() -> Option<Engine> {
                         };
                         let shop = if shop_mix > 0.0 && !shop_tracks.is_empty() {
                             let mut wrapped = false;
-                            let s = next_music_sample(&shop_tracks[shop_idx], &mut music_pos[1], dev_sr as f64, &mut wrapped);
+                            let s = next_music_sample(
+                                &shop_tracks[shop_idx],
+                                &mut music_pos[1],
+                                dev_sr as f64,
+                                &mut wrapped,
+                            );
                             if wrapped {
                                 shop_idx = (shop_idx + 1) % shop_tracks.len();
                                 music_pos[1] = 0.0;
@@ -484,13 +499,22 @@ fn build() -> Option<Engine> {
                         };
                         let settings = if settings_mix > 0.0 {
                             let mut wrapped = false;
-                            next_music_sample(&settings_track, &mut music_pos[2], dev_sr as f64, &mut wrapped)
+                            next_music_sample(
+                                &settings_track,
+                                &mut music_pos[2],
+                                dev_sr as f64,
+                                &mut wrapped,
+                            )
                         } else {
                             [0.0; 2]
                         };
                         [
-                            carousel[0] * carousel_mix + shop[0] * shop_mix + settings[0] * settings_mix,
-                            carousel[1] * carousel_mix + shop[1] * shop_mix + settings[1] * settings_mix,
+                            carousel[0] * carousel_mix
+                                + shop[0] * shop_mix
+                                + settings[0] * settings_mix,
+                            carousel[1] * carousel_mix
+                                + shop[1] * shop_mix
+                                + settings[1] * settings_mix,
                         ]
                     } else {
                         [0.0; 2]

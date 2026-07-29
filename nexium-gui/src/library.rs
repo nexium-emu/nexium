@@ -344,7 +344,11 @@ fn sample_dominant(img: &egui::ColorImage) -> egui::Color32 {
         if px.a() < 40 {
             continue;
         }
-        let (rf, gf, bf) = (px.r() as f32 / 255.0, px.g() as f32 / 255.0, px.b() as f32 / 255.0);
+        let (rf, gf, bf) = (
+            px.r() as f32 / 255.0,
+            px.g() as f32 / 255.0,
+            px.b() as f32 / 255.0,
+        );
         let mx = rf.max(gf).max(bf);
         let mn = rf.min(gf).min(bf);
         let chroma = mx - mn;
@@ -360,7 +364,11 @@ fn sample_dominant(img: &egui::ColorImage) -> egui::Color32 {
         cnt[bucket] += 1;
     }
     let best = (0..NB)
-        .max_by(|&i, &j| weight[i].partial_cmp(&weight[j]).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|&i, &j| {
+            weight[i]
+                .partial_cmp(&weight[j])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .unwrap_or(0);
     if weight[best] <= 0.0 {
         return egui::Color32::from_rgb(0x2F, 0xB4, 0xEF);

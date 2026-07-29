@@ -268,7 +268,16 @@ pub fn profile_view(
     ));
     backdrop_painter.set_opacity(backdrop_opacity);
 
-    crate::carousel::draw_backdrop(&backdrop_painter, full, ambient, t, backdrop_theme, 1.0, state.theme_t, None);
+    crate::carousel::draw_backdrop(
+        &backdrop_painter,
+        full,
+        ambient,
+        t,
+        backdrop_theme,
+        1.0,
+        state.theme_t,
+        None,
+    );
 
     let scrim = if state.theme_t < 0.5 {
         Color32::from_rgba_unmultiplied(
@@ -860,12 +869,20 @@ fn settings_page(
         (
             "Appearance",
             "Light or dark styling of the carousel",
-            if light_mode { "Light".to_string() } else { "Dark".to_string() },
+            if light_mode {
+                "Light".to_string()
+            } else {
+                "Dark".to_string()
+            },
         ),
         (
             "Time Preference",
             "Either 12 hour clock or 24 hour Military Time",
-            if eu_dates { "24h".to_string() } else { "12h".to_string() },
+            if eu_dates {
+                "24h".to_string()
+            } else {
+                "12h".to_string()
+            },
         ),
     ];
 
@@ -926,8 +943,14 @@ fn settings_page(
         let arrow_col = if focused { accent } else { pal.muted };
 
         {
-            let la = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 270.0 * s, row.center().y), Vec2::splat(34.0 * s)));
-            let ra = scale_rect(egui::Rect::from_center_size(egui::pos2(row.max.x - 30.0 * s, row.center().y), Vec2::splat(34.0 * s)));
+            let la = scale_rect(egui::Rect::from_center_size(
+                egui::pos2(row.max.x - 270.0 * s, row.center().y),
+                Vec2::splat(34.0 * s),
+            ));
+            let ra = scale_rect(egui::Rect::from_center_size(
+                egui::pos2(row.max.x - 30.0 * s, row.center().y),
+                Vec2::splat(34.0 * s),
+            ));
             let la_c = ui.allocate_rect(la, Sense::click()).clicked();
             let ra_c = ui.allocate_rect(ra, Sense::click()).clicked();
             if la_c || ra_c {
