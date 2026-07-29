@@ -2618,6 +2618,55 @@ fn dispatch_service_v2(
                     Err(_) => return build_ipc_response(ctx, 0x202, &[], &[]),
                 }
             }
+            5 | 6 => {
+                // RenameFile / RenameDirectory: source = path_str, dest = 2nd buffer.
+                let all: Vec<_> = ctx
+                    .send_statics
+                    .iter()
+                    .chain(ctx.send_buffers.iter())
+                    .filter(|b| b.size > 0 && b.addr != 0)
+                    .copied()
+                    .collect();
+                let mut new_path = String::new();
+                if let Some(b) = all.get(1) {
+                    let n = (b.size as usize).min(0x301);
+                    let mut bytes = vec![0u8; n];
+                    if kernel.address_space.read(b.addr, &mut bytes).is_ok() {
+                        let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+                        new_path = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                    }
+                }
+                let old_host = fs_host_path(kernel, session_handle, fs_obj_id, &path_str);
+                let new_host = fs_host_path(kernel, session_handle, fs_obj_id, &new_path);
+                match (old_host, new_host) {
+                    (Some(o), Some(n)) => {
+                        if let Some(parent) = n.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        match std::fs::rename(&o, &n) {
+                            Ok(()) => {
+                                log::debug!(
+                                    "IFileSystem.Rename{} {:?} -> {:?} → SUCCESS",
+                                    if cmd_id == 5 { "File" } else { "Directory" },
+                                    path_str,
+                                    new_path
+                                );
+                                return build_ipc_response(ctx, 0, &[], &[]);
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "IFileSystem.Rename {:?} -> {:?} → err {}",
+                                    path_str,
+                                    new_path,
+                                    e
+                                );
+                                return build_ipc_response(ctx, 0x202, &[], &[]);
+                            }
+                        }
+                    }
+                    _ => return build_ipc_response(ctx, 0x202, &[], &[]),
+                }
+            }
             7 => {
                 let entry_type: u32 = {
                     let in_homebrew = !basename.is_empty()
