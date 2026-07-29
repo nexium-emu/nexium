@@ -515,8 +515,17 @@ impl EmulationHandle {
                     .cpu
                     .take()
                     .expect("BootContext CPU not initialized");
-                cpu.set_continue_on_null(true);
-                log::info!("dynarmic: continue_on_null=ON (will absorb null-zone reads as 0 to keep going)");
+                let rustarmic_strict_memory =
+                    matches!(cpu_backend, nexium_core::cpu::CpuBackendKind::Rustarmic);
+                cpu.set_continue_on_null(!rustarmic_strict_memory);
+                log::info!(
+                    "cpu memory null policy: {}",
+                    if rustarmic_strict_memory {
+                        "strict fault (rustarmic)"
+                    } else {
+                        "legacy continue (dynarmic)"
+                    }
+                );
                 let halt = Some(cpu.halt_handle());
                 let _cpu_guard = nexium_kernel::kernel::cpu_local::set_current_cpu(&mut cpu, 0);
                 use nexium_kernel::kernel::cpu_local::{cpu_mut, cpu_ref};
@@ -551,7 +560,10 @@ impl EmulationHandle {
                                         return;
                                     }
                                 };
-                                cpu_aux.set_continue_on_null(true);
+                                cpu_aux.set_continue_on_null(!matches!(
+                                    backend_aux,
+                                    nexium_core::cpu::CpuBackendKind::Rustarmic
+                                ));
                                 let _g_aux = nexium_kernel::kernel::cpu_local::set_current_cpu(
                                     &mut cpu_aux,
                                     core_id,
@@ -594,8 +606,9 @@ impl EmulationHandle {
                                             log::error!("{}", error);
                                         }
                                     }
-                                    let event = cpu_mut().unwrap().run(200_000);
-                                    aux_cycles = aux_cycles.saturating_add(200_000);
+                                    let run = cpu_mut().unwrap().run_with_count(200_000);
+                                    let event = run.event;
+                                    aux_cycles = aux_cycles.saturating_add(run.retired);
                                     if pc_trace.is_some()
                                         || matches!(event, nexium_core::cpu::CpuEvent::Svc(_))
                                     {
@@ -664,6 +677,7 @@ impl EmulationHandle {
                 let last_svc_ms = Arc::new(AtomicU64::new(0));
                 let watchdog_stop = Arc::new(AtomicBool::new(false));
                 let watchdog_halts = Arc::new(AtomicU64::new(0));
+                let runtime_diagnostics = std::env::var_os("NEXIUM_DIAG").is_some();
                 if let Some(halt) = halt {
                     let last_svc_ms_wd = Arc::clone(&last_svc_ms);
                     let watchdog_stop_wd = Arc::clone(&watchdog_stop);
@@ -692,13 +706,13 @@ impl EmulationHandle {
                                     continue;
                                 }
                                 peek_counter += 1;
-                                if peek_counter % 25 == 1 {
+                                if runtime_diagnostics && peek_counter % 25 == 1 {
                                     log::warn!(
                                         "[watchdog-peek #{}] pc={:#x} lr={:#x} sp={:#x} same_pc_streak={}",
                                         peek_counter, pc, lr, sp, same_pc_streak
                                     );
                                 }
-                                if peek_counter == 1 {
+                                if runtime_diagnostics && peek_counter == 1 {
                                     log::warn!("[spin-dump] {}", halt.peek_dump());
                                 }
                                 halt.halt();
@@ -761,7 +775,7 @@ impl EmulationHandle {
                 }
                 let _vsync_guard = VsyncGuard(Arc::clone(&vsync_stop), vsync_handle);
 
-                log::info!("Starting emulation loop [BUILD: heartbeat-v2-gpu-diag]");
+                log::info!("Starting emulation loop");
                 let max_cycles = u64::MAX;
                 let mut cycle_count = 0u64;
                 let mut svc_count = 0u32;
@@ -791,12 +805,15 @@ impl EmulationHandle {
 
                 let mut loop_iter: u64 = 0;
                 let mut last_loop_log = std::time::Instant::now();
+                let mut last_stats_update = std::time::Instant::now();
                 let mut last_halts: u64 = 0;
                 let mut preempt_count: u64 = 0;
                 loop {
                     loop_iter += 1;
                     let mut guard = boot_ctx.kernel.lock();
-                    if last_loop_log.elapsed() >= std::time::Duration::from_secs(1) {
+                    if runtime_diagnostics
+                        && last_loop_log.elapsed() >= std::time::Duration::from_secs(1)
+                    {
                         let cur = guard.threads.current_handle();
                         let pc_now = cpu_ref().map(|c| c.get_pc()).unwrap_or(0);
                         let halts = watchdog_halts.load(Ordering::Relaxed);
@@ -828,7 +845,16 @@ impl EmulationHandle {
                         guard.log_thread_snapshot(&format!("guest-probe-{:#x}", va));
                     }
 
+                    if (loop_iter & 0xff) == 0
+                        && last_stats_update.elapsed() >= std::time::Duration::from_millis(250)
                     {
+                        let mut stats = stats_clone.lock();
+                        stats.svc_count = svc_count as u64;
+                        stats.cycle_count = cycle_count;
+                        last_stats_update = std::time::Instant::now();
+                    }
+
+                    if runtime_diagnostics {
                         let elapsed = last_heartbeat.elapsed();
                         if elapsed >= std::time::Duration::from_secs(1) {
                             let secs = elapsed.as_secs_f64();
@@ -1012,10 +1038,6 @@ impl EmulationHandle {
                             last_heartbeat = std::time::Instant::now();
                             last_heartbeat_svc = svc_count;
                             last_heartbeat_cycles = cycle_count;
-
-                            let mut st = stats_clone.lock();
-                            st.svc_count = svc_count as u64;
-                            st.cycle_count = cycle_count;
                         }
                     }
 
@@ -1069,12 +1091,13 @@ impl EmulationHandle {
                                 log::error!("{}", error);
                             }
                         }
-                        let event = cpu.run(cpu_slice);
+                        let run = cpu.run_with_count(cpu_slice);
+                        let event = run.event;
                         let pc_after = cpu.get_pc();
                         let mut guard = boot_ctx.kernel.lock();
                         guard.threads.save_current_ctx(cpu);
-                        cycle_count += cpu_slice;
-                        guard.cycle_count += cpu_slice;
+                        cycle_count += run.retired;
+                        guard.cycle_count += run.retired;
                         if let Some(watch) = cpu_poll_watch.as_mut() {
                             if !watch.check(&guard, cpu, event, cycle_count, svc_count) {
                                 cpu_poll_watch = None;
@@ -1267,10 +1290,10 @@ impl EmulationHandle {
                                 );
                                 no_svc_in_spin = 0;
                                 preempt_count += 1;
-                                if preempt_count % 512 == 1 {
+                                if runtime_diagnostics && preempt_count % 512 == 1 {
                                     log::info!("[preempt] #{} slice-expired pc={:#x}, yielded handle={:?}, ready_q={} total={}", preempt_count, pc_after, from, n_ready, n_threads);
                                 }
-                            } else {
+                            } else if runtime_diagnostics {
                                 stuck_log_counter += 1;
                                 if stuck_log_counter % 50 == 1 {
                                     let cur = guard.threads.current_handle();
@@ -1349,7 +1372,7 @@ impl EmulationHandle {
                             log::info!("Simulating display ready");
                         }
 
-                        if pc_check_count < 5 {
+                        if runtime_diagnostics && pc_check_count < 5 {
                             log::info!(
                                 "CPU exec: PC {:#x} → {:#x} (event: {:?})",
                                 pc_before,

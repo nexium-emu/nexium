@@ -505,9 +505,10 @@ impl BootContext {
         use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
 
         loop {
-            let event = cpu_mut().unwrap().run(100_000);
+            let run = cpu_mut().unwrap().run_with_count(100_000);
+            let event = run.event;
 
-            cycle_count += 100_000;
+            cycle_count += run.retired;
 
             match event {
                 nexium_cpu::CpuEvent::Running => {

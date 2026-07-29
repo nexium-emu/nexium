@@ -55,10 +55,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut guard = boot_ctx.kernel.lock();
         if let Some(cpu) = cpu_mut() {
             let pc_before = cpu.get_pc();
-            let event = cpu.run(100_000);
+            let run = cpu.run_with_count(100_000);
+            let event = run.event;
             let pc_after = cpu.get_pc();
-            cycle_count += 100_000;
-            guard.cycle_count += 100_000;
+            cycle_count += run.retired;
+            guard.cycle_count += run.retired;
 
             if guard.cycle_count >= guard.next_vsync_cycle && !guard.display_ready {
                 guard.display_ready = true;
@@ -73,7 +74,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pc_check_count += 1;
             }
 
-            // Log every SVC call in detail
             if matches!(event, nexium_core::cpu::CpuEvent::Svc(_)) || cycle_count < 500_000 {
                 if cycle_count % 50_000 == 0 {
                     writeln!(log, "[{}] >> PC {:#x}", cycle_count, cpu.get_pc())?;

@@ -45,9 +45,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut guard = boot_ctx.kernel.lock();
         if let Some(cpu) = cpu_mut() {
             let pc_before = cpu.get_pc();
-            let event = cpu.run(100_000);
-            cycle_count += 100_000;
-            guard.cycle_count += 100_000;
+            let run = cpu.run_with_count(100_000);
+            let event = run.event;
+            cycle_count += run.retired;
+            guard.cycle_count += run.retired;
 
             if guard.cycle_count >= guard.next_vsync_cycle {
                 guard.next_vsync_cycle += 16_666_667;
@@ -76,7 +77,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cpu.set_register(0, result as u64);
                     }
 
-                    // IMPORTANT: Don't exit on Break, just log it and continue
                     if imm == 0x26 {
                         break_count += 1;
                         writeln!(

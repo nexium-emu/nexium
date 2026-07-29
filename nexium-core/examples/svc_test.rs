@@ -29,10 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         cpu.inject_svc(0x1b);
 
-        if let CpuEvent::Svc(imm) = cpu.run(100) {
-            println!("Got SVC {:#04x}", imm);
-            let result = boot_ctx.kernel.dispatch_svc(imm);
-            println!("SVC returned: {:#x}\n", result);
+        if let Ok(result) = cpu.run(100) {
+            if let CpuEvent::Svc(imm) = result.event {
+                println!("Got SVC {:#04x}", imm);
+                let result = boot_ctx.kernel.dispatch_svc(imm);
+                println!("SVC returned: {:#x}\n", result);
+            }
         }
     }
 
@@ -42,10 +44,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         cpu.inject_svc(0x07);
 
-        if let CpuEvent::Svc(imm) = cpu.run(100) {
-            println!("Got SVC {:#04x}", imm);
-            let result = boot_ctx.kernel.dispatch_svc(imm);
-            println!("SVC returned: {:#x}\n", result);
+        if let Ok(result) = cpu.run(100) {
+            if let CpuEvent::Svc(imm) = result.event {
+                println!("Got SVC {:#04x}", imm);
+                let result = boot_ctx.kernel.dispatch_svc(imm);
+                println!("SVC returned: {:#x}\n", result);
+            }
         }
     }
 

@@ -2,6 +2,9 @@
 pub mod dynarmic;
 #[cfg(feature = "backend-rustarmic")]
 pub mod rustarmic;
+pub mod system;
+
+pub use system::{CpuCore, CpuSystem, CpuSystemConfig};
 
 #[cfg(feature = "backend-dynarmic")]
 use dynarmic::DynarmicCpu;
@@ -9,6 +12,23 @@ use dynarmic::DynarmicCpu;
 use rustarmic::RustarmicCpu;
 
 use nexium_memory::Perm;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CpuError {
+    Backend(String),
+    Stalled,
+}
+
+impl std::fmt::Display for CpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(message) => write!(f, "CPU backend error: {message}"),
+            Self::Stalled => f.write_str("CPU backend stalled"),
+        }
+    }
+}
+
+impl std::error::Error for CpuError {}
 
 #[derive(Clone)]
 pub struct HaltHandle {
@@ -67,6 +87,12 @@ pub enum CpuEvent {
     Interrupted,
     Svc(u16),
     Exception(u32),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CpuRunResult {
+    pub event: CpuEvent,
+    pub retired: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -146,6 +172,11 @@ impl Cpu {
         RustarmicCpu::new().map(Cpu::Rustarmic)
     }
 
+    #[cfg(feature = "backend-rustarmic")]
+    pub fn new_rustarmic_with_config(config: &::rustarmic::EngineConfig) -> Result<Self, String> {
+        RustarmicCpu::new_with_engine_config(config).map(Cpu::Rustarmic)
+    }
+
     pub fn new(backend: CpuBackendKind) -> Result<Self, String> {
         match backend {
             CpuBackendKind::Dynarmic => {
@@ -198,6 +229,17 @@ impl Cpu {
 
     pub fn set_pc(&mut self, pc: u64) {
         dispatch!(self, cpu => cpu.set_pc(pc))
+    }
+
+    pub fn set_core_id(&mut self, core_id: u64) {
+        match self {
+            #[cfg(feature = "backend-dynarmic")]
+            Cpu::Dynarmic(_) => {
+                let _ = core_id;
+            }
+            #[cfg(feature = "backend-rustarmic")]
+            Cpu::Rustarmic(cpu) => cpu.set_core_id(core_id),
+        }
     }
     pub fn get_pc(&self) -> u64 {
         dispatch!(self, cpu => cpu.get_pc())
@@ -267,11 +309,41 @@ impl Cpu {
         }
     }
 
-    pub fn run(&mut self, cycle_count: u64) -> CpuEvent {
-        dispatch!(self, cpu => cpu.run(cycle_count))
+    pub fn run_with_count(&mut self, cycle_count: u64) -> CpuRunResult {
+        match self {
+            #[cfg(feature = "backend-dynarmic")]
+            Cpu::Dynarmic(cpu) => {
+                let event = cpu.run(cycle_count);
+                CpuRunResult {
+                    event,
+                    retired: cycle_count,
+                }
+            }
+            #[cfg(feature = "backend-rustarmic")]
+            Cpu::Rustarmic(cpu) => {
+                let (event, retired) = cpu.run_with_count(cycle_count);
+                CpuRunResult { event, retired }
+            }
+        }
     }
+
+    pub fn run(&mut self, cycle_count: u64) -> Result<CpuRunResult, CpuError> {
+        let result = self.run_with_count(cycle_count);
+        if matches!(result.event, CpuEvent::Stalled) {
+            Err(CpuError::Stalled)
+        } else {
+            Ok(result)
+        }
+    }
+
+    pub fn run_event(&mut self, cycle_count: u64) -> CpuEvent {
+        self.run(cycle_count)
+            .map(|result| result.event)
+            .unwrap_or(CpuEvent::Stalled)
+    }
+
     pub fn step(&mut self) -> CpuEvent {
-        dispatch!(self, cpu => cpu.step())
+        self.run_event(1)
     }
     pub fn inject_svc(&mut self, imm: u16) {
         dispatch!(self, cpu => cpu.inject_svc(imm))

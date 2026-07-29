@@ -1,7 +1,4 @@
 #![cfg(feature = "backend-rustarmic")]
-//! Regression for the M1.1 SVC-imm bug + verification that the M2 nexium-cpu
-//! integration carries the SVC immediate end-to-end through Rustarmic.
-
 use nexium_cpu::{Cpu, CpuEvent};
 use nexium_memory::Perm;
 
@@ -11,7 +8,7 @@ fn run_svc(imm: u16) -> CpuEvent {
     let mut code = vec![0u8; 0x1000];
     let svc = 0xD400_0001u32 | ((imm as u32) << 5);
     code[0..4].copy_from_slice(&svc.to_le_bytes());
-    code[4..8].copy_from_slice(&0xD420_0000u32.to_le_bytes()); // brk #0
+    code[4..8].copy_from_slice(&0xD420_0000u32.to_le_bytes());
 
     let mut cpu = Cpu::new_rustarmic().expect("rustarmic init");
     unsafe {
@@ -19,7 +16,7 @@ fn run_svc(imm: u16) -> CpuEvent {
             .expect("map_host");
     }
     cpu.set_pc(CODE_BASE);
-    cpu.run(100_000)
+    cpu.run(100_000).expect("CPU run").event
 }
 
 #[test]
@@ -53,10 +50,17 @@ fn register_roundtrip() {
 }
 
 #[test]
+fn halt_handle_survives_cpu_drop() {
+    let handle = {
+        let cpu = Cpu::new_rustarmic().expect("rustarmic init");
+        cpu.halt_handle()
+    };
+    handle.halt();
+    assert_eq!(handle.peek_pc_lr_sp(), (0, 0, 0));
+}
+
+#[test]
 fn arithmetic_through_jit() {
-    // movz x0, #100
-    // add  x0, x0, #50
-    // svc  #0
     let mut code = vec![0u8; 0x1000];
     let prog = [0xD280_0C80u32, 0x9100_C800u32, 0xD400_0001u32];
     for (i, w) in prog.iter().enumerate() {
@@ -68,7 +72,7 @@ fn arithmetic_through_jit() {
             .unwrap();
     }
     cpu.set_pc(CODE_BASE);
-    let event = cpu.run(100_000);
+    let event = cpu.run(100_000).expect("CPU run").event;
     assert!(
         matches!(event, CpuEvent::Svc(0)),
         "expected Svc(0), got {:?}",

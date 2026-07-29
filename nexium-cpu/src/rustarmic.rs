@@ -1,5 +1,5 @@
 use nexium_memory::Perm;
-use rustarmic::{CpuContext, ExitReason, Jit, JitConfig, Memory};
+use rustarmic::{CpuContext, Jit, JitConfig, Memory, StopReason};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -30,15 +30,21 @@ pub struct RustarmicThreadContext {
 struct State {
     ctx: CpuContext,
     regions: parking_lot::RwLock<Vec<Region>>,
-    halt: AtomicBool,
+    control: Arc<Control>,
     last_event: Mutex<Option<CpuEvent>>,
     last_fault: Mutex<Option<FaultSnapshot>>,
     continue_on_null: AtomicBool,
     null_skip_count: AtomicU32,
+    pending_invalidations: Mutex<Vec<(u64, u64)>>,
+}
+
+#[repr(C)]
+struct Control {
+    halt: AtomicBool,
+    snapshot_seq: AtomicU64,
     peek_pc: AtomicU64,
     peek_lr: AtomicU64,
     peek_sp: AtomicU64,
-    pending_invalidations: Mutex<Vec<(u64, u64)>>,
 }
 
 pub struct RustarmicCpu {
@@ -51,23 +57,39 @@ unsafe impl Sync for RustarmicCpu {}
 
 impl RustarmicCpu {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_jit_config(JitConfig::default())
+    }
+
+    pub fn new_with_engine_config(config: &rustarmic::EngineConfig) -> Result<Self, String> {
+        let mut jit = JitConfig::default();
+        jit.code_cache_bytes = config.code_cache_bytes;
+        jit.use_fastmem = matches!(config.memory_mode, rustarmic::MemoryMode::Fastmem);
+        jit.translate.max_insts = config.max_block_insts;
+        jit.host_features = Some(config.host_features);
+        Self::new_with_jit_config(jit)
+    }
+
+    fn new_with_jit_config(jit_config: JitConfig) -> Result<Self, String> {
         let mut state = Box::new(State {
             ctx: CpuContext::default(),
             regions: parking_lot::RwLock::new(Vec::new()),
-            halt: AtomicBool::new(false),
+            control: Arc::new(Control {
+                halt: AtomicBool::new(false),
+                snapshot_seq: AtomicU64::new(0),
+                peek_pc: AtomicU64::new(0),
+                peek_lr: AtomicU64::new(0),
+                peek_sp: AtomicU64::new(0),
+            }),
             last_event: Mutex::new(None),
             last_fault: Mutex::new(None),
             continue_on_null: AtomicBool::new(false),
             null_skip_count: AtomicU32::new(0),
-            peek_pc: AtomicU64::new(0),
-            peek_lr: AtomicU64::new(0),
-            peek_sp: AtomicU64::new(0),
             pending_invalidations: Mutex::new(Vec::new()),
         });
+        state.ctx.stop_token = Arc::as_ptr(&state.control).cast();
         state.ctx.mem_read = mem_read_hook;
         state.ctx.mem_write = mem_write_hook;
-        let jit =
-            Jit::new(JitConfig::default()).map_err(|e| format!("rustarmic Jit init: {:?}", e))?;
+        let jit = Jit::new(jit_config).map_err(|e| format!("rustarmic Jit init: {:?}", e))?;
         Ok(Self { state, jit })
     }
 
@@ -84,18 +106,25 @@ impl RustarmicCpu {
     }
 
     pub fn halt_handle(&self) -> HaltHandle {
-        let halt_addr = &self.state.halt as *const AtomicBool as usize;
-        let ctx_addr = &self.state.ctx as *const CpuContext as usize;
+        let control = Arc::clone(&self.state.control);
+        let peek_control = Arc::clone(&self.state.control);
         HaltHandle {
-            inner: Arc::new(move || unsafe {
-                (*(halt_addr as *const AtomicBool)).store(true, Ordering::Relaxed);
+            inner: Arc::new(move || {
+                control.halt.store(true, Ordering::Release);
             }),
-            peek: Arc::new(move || unsafe {
-                let ctx = ctx_addr as *const CpuContext;
-                let p = std::ptr::read_volatile(&(*ctx).pc);
-                let l = std::ptr::read_volatile(&(*ctx).x[30]);
-                let s = std::ptr::read_volatile(&(*ctx).sp);
-                (p, l, s)
+            peek: Arc::new(move || loop {
+                let before = peek_control.snapshot_seq.load(Ordering::Acquire);
+                if before & 1 != 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let p = peek_control.peek_pc.load(Ordering::Relaxed);
+                let l = peek_control.peek_lr.load(Ordering::Relaxed);
+                let s = peek_control.peek_sp.load(Ordering::Relaxed);
+                let after = peek_control.snapshot_seq.load(Ordering::Acquire);
+                if before == after {
+                    break (p, l, s);
+                }
             }),
             peek_dump: Arc::new(|| String::from("(peek_dump unsupported on rustarmic)")),
         }
@@ -143,29 +172,23 @@ impl RustarmicCpu {
 
     pub fn write_bytes(&self, va: u64, bytes: &[u8]) -> Result<(), String> {
         let regions = self.state.regions.read();
-        for r in regions.iter() {
-            if va >= r.va && va.saturating_add(bytes.len() as u64) <= r.end {
-                if !r.perm.contains(Perm::W) {
-                    return Err(format!(
-                        "write_bytes: read-only region va={:#x} perm={}",
-                        va, r.perm
-                    ));
-                }
-                unsafe {
-                    let dst = r.host_ptr.add((va - r.va) as usize);
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
-                }
-                if r.perm.contains(Perm::X) {
-                    self.state
-                        .pending_invalidations
-                        .lock()
-                        .unwrap()
-                        .push((va, bytes.len() as u64));
-                }
-                return Ok(());
-            }
+        copy_to_regions(&regions, va, bytes, true)?;
+        if !bytes.is_empty()
+            && regions.iter().any(|r| {
+                r.perm.contains(Perm::X)
+                    && va < r.end
+                    && va
+                        .checked_add(bytes.len() as u64)
+                        .is_some_and(|end| end > r.va)
+            })
+        {
+            self.state
+                .pending_invalidations
+                .lock()
+                .unwrap()
+                .push((va, bytes.len() as u64));
         }
-        Err(format!("write_bytes: unmapped va={:#x}", va))
+        Ok(())
     }
 
     pub fn invalidate_range(&mut self, va: u64, len: u64) {
@@ -179,16 +202,7 @@ impl RustarmicCpu {
 
     pub fn read_bytes(&self, va: u64, buf: &mut [u8]) -> Result<(), String> {
         let regions = self.state.regions.read();
-        for r in regions.iter() {
-            if va >= r.va && va.saturating_add(buf.len() as u64) <= r.end {
-                unsafe {
-                    let src = r.host_ptr.add((va - r.va) as usize);
-                    std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len());
-                }
-                return Ok(());
-            }
-        }
-        Err(format!("read_bytes: unmapped va={:#x}", va))
+        copy_from_regions(&regions, va, buf, false)
     }
 
     pub fn set_register(&mut self, reg: u32, val: u64) {
@@ -211,6 +225,10 @@ impl RustarmicCpu {
 
     pub fn set_pc(&mut self, pc: u64) {
         self.state.ctx.pc = pc;
+    }
+
+    pub fn set_core_id(&mut self, core_id: u64) {
+        self.state.ctx.core_id = core_id;
     }
     pub fn get_pc(&self) -> u64 {
         self.state.ctx.pc
@@ -259,7 +277,7 @@ impl RustarmicCpu {
         self.state.ctx.exclusive_size = 0;
     }
 
-    pub fn run(&mut self, _max_insn: u64) -> CpuEvent {
+    pub fn run_with_count(&mut self, max_insn: u64) -> (CpuEvent, u64) {
         let queued: Vec<(u64, u64)> =
             std::mem::take(&mut *self.state.pending_invalidations.lock().unwrap());
         if !queued.is_empty() {
@@ -273,31 +291,75 @@ impl RustarmicCpu {
         }
 
         if let Some(ev) = self.state.last_event.lock().unwrap().take() {
-            return ev;
+            return (ev, 0);
         }
-        self.state.halt.store(false, Ordering::Relaxed);
+        if self.state.control.halt.load(Ordering::Acquire) {
+            self.state.ctx.should_halt = 1;
+        }
 
         let regions: Vec<Region> = self.state.regions.read().iter().copied().collect();
         let mut mem = RegionMemory { regions };
 
-        let exit = self.jit.run(&mut self.state.ctx, &mut mem);
+        self.state
+            .control
+            .snapshot_seq
+            .fetch_add(1, Ordering::Release);
+        let exit = self
+            .jit
+            .run_bounded(&mut self.state.ctx, &mut mem, max_insn);
 
         self.state
+            .control
             .peek_pc
             .store(self.state.ctx.pc, Ordering::Relaxed);
         self.state
+            .control
             .peek_lr
             .store(self.state.ctx.x[30], Ordering::Relaxed);
         self.state
+            .control
             .peek_sp
             .store(self.state.ctx.sp, Ordering::Relaxed);
+        self.state
+            .control
+            .snapshot_seq
+            .fetch_add(1, Ordering::Release);
 
         match exit {
-            Ok(ExitReason::Svc(imm)) => CpuEvent::Svc(imm as u16),
-            Ok(ExitReason::Brk(imm)) => CpuEvent::Exception(0x100 | imm),
-            Ok(ExitReason::Hvc(imm)) => CpuEvent::Exception(0x200 | imm),
-            Ok(ExitReason::MemoryFault(_)) => CpuEvent::Exception(0x0E),
-            Ok(ExitReason::Stopped) => CpuEvent::Interrupted,
+            Ok(outcome) => {
+                self.state.control.halt.store(false, Ordering::Release);
+                let event = match outcome.stop {
+                    StopReason::Unsupported(info) => {
+                        log::warn!(
+                            "rustarmic unsupported stop: pc={:#x} opcode={:#010x} class={} retired={}",
+                            info.pc,
+                            info.opcode,
+                            info.decoded_class,
+                            outcome.retired,
+                        );
+                        CpuEvent::Stalled
+                    }
+                    StopReason::MemoryFault(fault) => {
+                        log::warn!(
+                            "rustarmic memory fault: pc={:#x} address={:#x} size={} access={:?} cause={:?} retired={}",
+                            fault.pc,
+                            fault.address,
+                            fault.size,
+                            fault.access,
+                            fault.cause,
+                            outcome.retired,
+                        );
+                        CpuEvent::Exception(0x0E)
+                    }
+                    StopReason::BudgetExhausted => CpuEvent::Running,
+                    StopReason::Halted => CpuEvent::Interrupted,
+                    StopReason::Svc(imm) => CpuEvent::Svc(imm as u16),
+                    StopReason::Brk(imm) => CpuEvent::Exception(0x100 | imm),
+                    StopReason::Hvc(imm) => CpuEvent::Exception(0x200 | imm),
+                    StopReason::Yield | StopReason::Wait => CpuEvent::Interrupted,
+                };
+                return (event, outcome.retired);
+            }
             Err(e) => {
                 match &e {
                     rustarmic::Error::Unsupported { pc, opcode } => {
@@ -328,9 +390,13 @@ impl RustarmicCpu {
                     }
                     other => log::warn!("rustarmic Jit::run error: {:?}", other),
                 }
-                CpuEvent::Stalled
+                (CpuEvent::Stalled, 0)
             }
         }
+    }
+
+    pub fn run(&mut self, max_insn: u64) -> CpuEvent {
+        self.run_with_count(max_insn).0
     }
 
     pub fn step(&mut self) -> CpuEvent {
@@ -348,15 +414,9 @@ struct RegionMemory {
 
 impl Memory for RegionMemory {
     fn fetch_inst(&mut self, addr: u64) -> Option<u32> {
-        for r in &self.regions {
-            if addr >= r.va && addr.checked_add(4)? <= r.end && r.perm.contains(Perm::X) {
-                unsafe {
-                    let host = r.host_ptr.add((addr - r.va) as usize);
-                    let mut buf = [0u8; 4];
-                    std::ptr::copy_nonoverlapping(host, buf.as_mut_ptr(), 4);
-                    return Some(u32::from_le_bytes(buf));
-                }
-            }
+        let mut buf = [0u8; 4];
+        if copy_from_regions(&self.regions, addr, &mut buf, true).is_ok() {
+            return Some(u32::from_le_bytes(buf));
         }
         log::warn!(
             "rustarmic fetch_inst miss at {:#x} ({} regions)",
@@ -376,27 +436,86 @@ impl Memory for RegionMemory {
     }
 }
 
-fn find_region(regions: &[Region], va: u64, len: u64) -> Option<&Region> {
-    regions
-        .iter()
-        .find(|r| va >= r.va && va.checked_add(len).map_or(false, |e| e <= r.end))
+fn region_at(regions: &[Region], va: u64) -> Option<&Region> {
+    regions.iter().find(|r| va >= r.va && va < r.end)
+}
+
+fn copy_from_regions(
+    regions: &[Region],
+    va: u64,
+    out: &mut [u8],
+    execute: bool,
+) -> Result<(), String> {
+    va.checked_add(out.len() as u64)
+        .ok_or_else(|| format!("read: address overflow va={va:#x} len={}", out.len()))?;
+    let mut cursor = va;
+    let mut copied = 0usize;
+    while copied < out.len() {
+        let region =
+            region_at(regions, cursor).ok_or_else(|| format!("read: unmapped va={cursor:#x}"))?;
+        let perm = if execute { Perm::X } else { Perm::R };
+        if !region.perm.contains(perm) {
+            return Err(format!("read: permission fault va={cursor:#x}"));
+        }
+        let available = usize::try_from(region.end - cursor).unwrap_or(usize::MAX);
+        let count = available.min(out.len() - copied);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                region.host_ptr.add((cursor - region.va) as usize),
+                out.as_mut_ptr().add(copied),
+                count,
+            );
+        }
+        copied += count;
+        cursor = cursor.saturating_add(count as u64);
+    }
+    Ok(())
+}
+
+fn copy_to_regions(regions: &[Region], va: u64, input: &[u8], write: bool) -> Result<(), String> {
+    va.checked_add(input.len() as u64)
+        .ok_or_else(|| format!("write: address overflow va={va:#x} len={}", input.len()))?;
+    let mut cursor = va;
+    let mut copied = 0usize;
+    while copied < input.len() {
+        let region =
+            region_at(regions, cursor).ok_or_else(|| format!("write: unmapped va={cursor:#x}"))?;
+        if write && !region.perm.contains(Perm::W) {
+            return Err(format!("write: permission fault va={cursor:#x}"));
+        }
+        let available = usize::try_from(region.end - cursor).unwrap_or(usize::MAX);
+        let count = available.min(input.len() - copied);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr().add(copied),
+                region.host_ptr.add((cursor - region.va) as usize),
+                count,
+            );
+        }
+        copied += count;
+        cursor = cursor.saturating_add(count as u64);
+    }
+    Ok(())
 }
 
 unsafe extern "C" fn mem_read_hook(ctx_ptr: *mut CpuContext, addr: u64, size: u8) {
     let state = unsafe { &*(ctx_ptr as *mut State) };
     let regions = state.regions.read();
-    if let Some(r) = find_region(&regions, addr, size as u64) {
+    let mut buf = [0u8; 16];
+    if size <= 16 && copy_from_regions(&regions, addr, &mut buf[..size as usize], false).is_ok() {
         unsafe {
-            let host = r.host_ptr.add((addr - r.va) as usize);
-            let mut buf = [0u8; 16];
-            std::ptr::copy_nonoverlapping(host, buf.as_mut_ptr(), size as usize);
             let lo = u64::from_le_bytes(buf[..8].try_into().unwrap());
             let hi = u64::from_le_bytes(buf[8..].try_into().unwrap());
             (*ctx_ptr).io_value = [lo, hi];
         }
         return;
     }
-    handle_unmapped(state, ctx_ptr, addr, size, false, 0);
+    let cause = if region_at(&regions, addr).is_some() {
+        1
+    } else {
+        0
+    };
+    handle_unmapped(state, ctx_ptr, addr, size, false, 0, cause);
     unsafe {
         (*ctx_ptr).io_value = [0, 0];
     }
@@ -428,26 +547,29 @@ unsafe extern "C" fn mem_write_hook(ctx_ptr: *mut CpuContext, addr: u64, size: u
         }
     }
     let regions = state.regions.read();
-    if let Some(r) = find_region(&regions, addr, size as u64) {
-        if r.perm.contains(Perm::W) {
+    if size <= 16 && copy_to_regions(&regions, addr, &buf[..size as usize], true).is_ok() {
+        if regions.iter().any(|r| {
+            r.perm.contains(Perm::X)
+                && addr < r.end
+                && addr.checked_add(size as u64).is_some_and(|end| end > r.va)
+        }) {
+            state
+                .pending_invalidations
+                .lock()
+                .unwrap()
+                .push((addr, size as u64));
             unsafe {
-                let host = r.host_ptr.add((addr - r.va) as usize);
-                std::ptr::copy_nonoverlapping(buf.as_ptr(), host, size as usize);
+                (*ctx_ptr).should_halt = 1;
             }
-            if r.perm.contains(Perm::X) {
-                state
-                    .pending_invalidations
-                    .lock()
-                    .unwrap()
-                    .push((addr, size as u64));
-                unsafe {
-                    (*ctx_ptr).should_halt = 1;
-                }
-            }
-            return;
         }
+        return;
     }
-    handle_unmapped(state, ctx_ptr, addr, size, true, value);
+    let cause = if region_at(&regions, addr).is_some() {
+        1
+    } else {
+        0
+    };
+    handle_unmapped(state, ctx_ptr, addr, size, true, value, cause);
 }
 
 fn rustarmic_watch_overlaps(addr: u64, size: u64) -> bool {
@@ -487,6 +609,7 @@ fn handle_unmapped(
     size: u8,
     is_write: bool,
     value: u64,
+    cause: u8,
 ) {
     let is_null_zone = addr < 0x1000;
     let mut regs = [0u64; 31];
@@ -511,6 +634,22 @@ fn handle_unmapped(
         regs,
     };
     *state.last_fault.lock().unwrap() = Some(snap);
+    unsafe {
+        let ctx = &mut *ctx_ptr;
+        ctx.mem_fault = 1;
+        ctx.mem_fault_access = u8::from(is_write);
+        ctx.mem_fault_size = size;
+        ctx.mem_fault_cause = cause;
+        ctx.mem_fault_addr = addr;
+        ctx.mem_fault_pc = ctx.pc;
+    }
+    let continue_null = state.continue_on_null.load(Ordering::Relaxed);
+    if !is_null_zone || !continue_null {
+        unsafe {
+            (*ctx_ptr).should_halt = 1;
+        }
+        *state.last_event.lock().unwrap() = Some(CpuEvent::Exception(0x0E));
+    }
     if is_null_zone {
         log::error!(
             "[null-deref] addr={:#x} size={} write={} val={:#x}",
@@ -519,7 +658,7 @@ fn handle_unmapped(
             is_write,
             value
         );
-        if state.continue_on_null.load(Ordering::Relaxed) {
+        if continue_null {
             let n = state.null_skip_count.fetch_add(1, Ordering::Relaxed) + 1;
             if n > NULL_SKIP_MAX {
                 *state.last_event.lock().unwrap() = Some(CpuEvent::Exception(0x0E));
