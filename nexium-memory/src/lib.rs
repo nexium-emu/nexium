@@ -5,7 +5,7 @@ pub mod region;
 
 pub use address_space::{
     align_request, AddressSpace, AddressSpaceError, HostRegion, HostRegionChange,
-    HostRegionChanges, RegionInfo,
+    HostRegionChanges, HostRegionLease, RegionInfo,
 };
 pub use perm::Perm;
 pub use region::{page_align_down, page_align_up};

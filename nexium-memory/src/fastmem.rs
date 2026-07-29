@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 pub const ARENA_BITS: u32 = 40;
 pub const ARENA_SIZE: u64 = 1u64 << ARENA_BITS;
@@ -9,6 +9,8 @@ mod sys {
     const MEM_RESERVE: u32 = 0x2000;
     const MEM_COMMIT: u32 = 0x1000;
     const MEM_DECOMMIT: u32 = 0x4000;
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    const WRITE_WATCH_FLAG_RESET: u32 = 0x1;
     const PAGE_NOACCESS: u32 = 0x01;
     const PAGE_READONLY: u32 = 0x02;
     const PAGE_READWRITE: u32 = 0x04;
@@ -18,10 +20,30 @@ mod sys {
         fn VirtualAlloc(addr: *mut u8, size: usize, alloc_type: u32, protect: u32) -> *mut u8;
         fn VirtualFree(addr: *mut u8, size: usize, free_type: u32) -> i32;
         fn VirtualProtect(addr: *mut u8, size: usize, protect: u32, old: *mut u32) -> i32;
+        fn GetWriteWatch(
+            flags: u32,
+            base: *mut u8,
+            size: usize,
+            addresses: *mut *mut u8,
+            count: *mut usize,
+            granularity: *mut u32,
+        ) -> u32;
     }
 
-    pub fn reserve(size: usize) -> *mut u8 {
-        unsafe { VirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE, PAGE_NOACCESS) }
+    pub fn reserve(size: usize) -> (*mut u8, bool) {
+        let watched = unsafe {
+            VirtualAlloc(
+                std::ptr::null_mut(),
+                size,
+                MEM_RESERVE | MEM_WRITE_WATCH,
+                PAGE_NOACCESS,
+            )
+        };
+        if !watched.is_null() {
+            return (watched, true);
+        }
+        let plain = unsafe { VirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE, PAGE_NOACCESS) };
+        (plain, false)
     }
 
     pub fn commit(ptr: *mut u8, len: usize) -> bool {
@@ -39,6 +61,22 @@ mod sys {
         let p = if trap { PAGE_READONLY } else { PAGE_READWRITE };
         unsafe { VirtualProtect(ptr, len, p, &mut old) != 0 }
     }
+
+    pub fn take_write_watch(ptr: *mut u8, len: usize, addresses: &mut [usize]) -> Option<bool> {
+        let mut count = addresses.len();
+        let mut granularity = 0u32;
+        let result = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                ptr,
+                len,
+                addresses.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        (result == 0).then_some(count != 0)
+    }
 }
 
 #[cfg(unix)]
@@ -52,7 +90,7 @@ mod sys {
         unsafe { libc::mprotect(ptr as *mut libc::c_void, len, p) == 0 }
     }
 
-    pub fn reserve(size: usize) -> *mut u8 {
+    pub fn reserve(size: usize) -> (*mut u8, bool) {
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -64,9 +102,9 @@ mod sys {
             )
         };
         if p == libc::MAP_FAILED {
-            std::ptr::null_mut()
+            (std::ptr::null_mut(), false)
         } else {
-            p as *mut u8
+            (p as *mut u8, false)
         }
     }
 
@@ -95,11 +133,21 @@ mod sys {
 }
 
 static ARENA: OnceLock<AtomicPtr<u8>> = OnceLock::new();
+static ARENA_WRITE_WATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static COMMITTED_RANGES: OnceLock<Mutex<Vec<CommittedRange>>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug)]
+struct CommittedRange {
+    lo: u64,
+    hi: u64,
+    refs: u32,
+}
 
 fn arena() -> *mut u8 {
     ARENA
         .get_or_init(|| {
-            let base = sys::reserve(ARENA_SIZE as usize);
+            let (base, write_watch) = sys::reserve(ARENA_SIZE as usize);
+            ARENA_WRITE_WATCH.store(write_watch, Ordering::Release);
             if base.is_null() {
                 log::warn!(
                     "fastmem: failed to reserve {}GB arena; falling back to heap regions",
@@ -107,9 +155,10 @@ fn arena() -> *mut u8 {
                 );
             } else {
                 log::info!(
-                    "fastmem: reserved {}GB arena at {:p}",
+                    "fastmem: reserved {}GB arena at {:p} (write-watch={})",
                     ARENA_SIZE >> 30,
-                    base
+                    base,
+                    write_watch,
                 );
             }
             AtomicPtr::new(base)
@@ -141,6 +190,9 @@ pub fn commit(va: u64, len: usize) -> Option<*mut u8> {
         return None;
     }
     let ptr = unsafe { base.add(va as usize) };
+    let mut ranges = committed_ranges()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !sys::commit(ptr, len) {
         log::warn!(
             "fastmem: commit failed va={:#x} len={:#x}; using heap",
@@ -149,11 +201,186 @@ pub fn commit(va: u64, len: usize) -> Option<*mut u8> {
         );
         return None;
     }
+    update_commit_refs(&mut ranges, va, end, true);
     Some(ptr)
 }
 
 pub fn decommit(ptr: *mut u8, len: usize) {
-    sys::decommit(ptr, len);
+    let base = arena();
+    let base_addr = base as usize;
+    let ptr_addr = ptr as usize;
+    let Some(lo) = ptr_addr.checked_sub(base_addr).map(|offset| offset as u64) else {
+        return;
+    };
+    let Some(hi) = lo.checked_add(len as u64) else {
+        return;
+    };
+    if hi > ARENA_SIZE || hi <= lo {
+        return;
+    }
+    let mut ranges = committed_ranges()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let released = update_commit_refs(&mut ranges, lo, hi, false);
+    for (released_lo, released_hi) in released {
+        let released_ptr = unsafe { base.add(released_lo as usize) };
+        sys::decommit(released_ptr, (released_hi - released_lo) as usize);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteWatchResult {
+    Clean,
+    Dirty,
+    Unavailable,
+}
+
+pub fn write_watch_query_range(va: u64, len: usize) -> Option<(u64, usize)> {
+    const PAGE_MASK: u64 = 0xfff;
+    if len == 0 {
+        return None;
+    }
+    let lo = va & !PAGE_MASK;
+    let end = va.checked_add(len as u64)?;
+    let hi = end.checked_add(PAGE_MASK)? & !PAGE_MASK;
+    if hi <= lo || hi > ARENA_SIZE {
+        return None;
+    }
+    Some((lo, usize::try_from(hi - lo).ok()?))
+}
+
+pub fn take_write_watch(va: u64, len: usize) -> WriteWatchResult {
+    #[cfg(not(windows))]
+    {
+        let _ = (va, len);
+        return WriteWatchResult::Unavailable;
+    }
+
+    #[cfg(windows)]
+    {
+        if !ARENA_WRITE_WATCH.load(Ordering::Acquire) {
+            return WriteWatchResult::Unavailable;
+        }
+        let Some((lo, query_len)) = write_watch_query_range(va, len) else {
+            return WriteWatchResult::Unavailable;
+        };
+        let hi = lo + query_len as u64;
+        let base = arena();
+        if base.is_null() {
+            return WriteWatchResult::Unavailable;
+        }
+        let ranges = committed_ranges()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !is_committed(&ranges, lo, hi) {
+            return WriteWatchResult::Unavailable;
+        }
+        let page_count = query_len >> 12;
+        thread_local! {
+            static ADDRESSES: std::cell::RefCell<Vec<usize>> = const {
+                std::cell::RefCell::new(Vec::new())
+            };
+        }
+        let result = ADDRESSES.with(|addresses| {
+            let mut addresses = addresses.borrow_mut();
+            addresses.resize(page_count, 0);
+            let ptr = unsafe { base.add(lo as usize) };
+            match sys::take_write_watch(ptr, query_len, &mut addresses) {
+                Some(false) => WriteWatchResult::Clean,
+                Some(true) => WriteWatchResult::Dirty,
+                None => WriteWatchResult::Unavailable,
+            }
+        });
+        drop(ranges);
+        result
+    }
+}
+
+fn committed_ranges() -> &'static Mutex<Vec<CommittedRange>> {
+    COMMITTED_RANGES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn update_commit_refs(
+    ranges: &mut Vec<CommittedRange>,
+    lo: u64,
+    hi: u64,
+    increment: bool,
+) -> Vec<(u64, u64)> {
+    let mut boundaries = Vec::with_capacity(ranges.len().saturating_mul(2).saturating_add(2));
+    boundaries.extend([lo, hi]);
+    for range in ranges.iter() {
+        boundaries.extend([range.lo, range.hi]);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut rebuilt: Vec<CommittedRange> = Vec::with_capacity(ranges.len().saturating_add(2));
+    let mut released = Vec::new();
+    for segment in boundaries.windows(2) {
+        let segment_lo = segment[0];
+        let segment_hi = segment[1];
+        if segment_hi <= segment_lo {
+            continue;
+        }
+        let old_refs = ranges
+            .iter()
+            .find(|range| range.lo <= segment_lo && range.hi >= segment_hi)
+            .map_or(0, |range| range.refs);
+        let affected = segment_lo >= lo && segment_hi <= hi;
+        let new_refs = if affected {
+            if increment {
+                old_refs.saturating_add(1)
+            } else {
+                old_refs.saturating_sub(1)
+            }
+        } else {
+            old_refs
+        };
+        if old_refs != 0 && new_refs == 0 {
+            if let Some((_, released_hi)) = released.last_mut() {
+                if *released_hi == segment_lo {
+                    *released_hi = segment_hi;
+                } else {
+                    released.push((segment_lo, segment_hi));
+                }
+            } else {
+                released.push((segment_lo, segment_hi));
+            }
+        }
+        if new_refs == 0 {
+            continue;
+        }
+        if let Some(last) = rebuilt.last_mut() {
+            if last.hi == segment_lo && last.refs == new_refs {
+                last.hi = segment_hi;
+                continue;
+            }
+        }
+        rebuilt.push(CommittedRange {
+            lo: segment_lo,
+            hi: segment_hi,
+            refs: new_refs,
+        });
+    }
+    *ranges = rebuilt;
+    released
+}
+
+fn is_committed(ranges: &[CommittedRange], lo: u64, hi: u64) -> bool {
+    let mut cursor = lo;
+    for range in ranges {
+        if range.hi <= cursor {
+            continue;
+        }
+        if range.lo > cursor {
+            return false;
+        }
+        cursor = cursor.max(range.hi);
+        if cursor >= hi {
+            return true;
+        }
+    }
+    false
 }
 
 use std::sync::atomic::AtomicU64;
@@ -277,4 +504,41 @@ pub fn watch_write_through(addr: u64, size: usize, value: u64) -> bool {
     }
     let _ = sys::protect(ptr, (hi - lo) as usize, true);
     true
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_watch_detects_direct_fastmem_stores_and_resets_atomically() {
+        const VA: u64 = 0xf0_0000_0000;
+        const LEN: usize = 0x2000;
+        let ptr = commit(VA, LEN).expect("write-watched fastmem allocation");
+
+        let _ = take_write_watch(VA, LEN);
+        unsafe { ptr.add(0x123).write_volatile(0x5a) };
+        assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Dirty);
+        assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Clean);
+
+        decommit(ptr, LEN);
+        assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Unavailable);
+    }
+
+    #[test]
+    fn overlapping_fastmem_leases_do_not_decommit_each_other() {
+        const VA: u64 = 0xf1_0000_0000;
+        const LEN: usize = 0x1000;
+        let first = commit(VA, LEN).expect("first fastmem lease");
+        let second = commit(VA, LEN).expect("overlapping fastmem lease");
+        assert_eq!(first, second);
+        unsafe { first.write_volatile(0xa5) };
+
+        decommit(first, LEN);
+        assert_eq!(unsafe { second.read_volatile() }, 0xa5);
+        assert_ne!(take_write_watch(VA, LEN), WriteWatchResult::Unavailable);
+
+        decommit(second, LEN);
+        assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Unavailable);
+    }
 }

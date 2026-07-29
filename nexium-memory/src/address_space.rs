@@ -141,7 +141,10 @@ impl Region {
 impl Drop for Region {
     fn drop(&mut self) {
         if self.arena {
-            crate::fastmem::decommit(self.buf.as_ptr(), self.len);
+            let committed_len = self.committed_len();
+            if committed_len != 0 {
+                crate::fastmem::decommit(self.buf.as_ptr(), committed_len);
+            }
             return;
         }
         unsafe {
@@ -171,6 +174,30 @@ pub struct HostRegion {
 
 unsafe impl Send for HostRegion {}
 unsafe impl Sync for HostRegion {}
+
+#[derive(Clone)]
+pub struct HostRegionLease {
+    backing: Arc<Region>,
+    generation: u64,
+}
+
+impl HostRegionLease {
+    pub fn base(&self) -> u64 {
+        self.backing.base
+    }
+
+    pub fn size(&self) -> u64 {
+        self.backing.len as u64
+    }
+
+    pub fn perm(&self) -> Perm {
+        self.backing.perm()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum HostRegionChange {
@@ -398,6 +425,42 @@ impl AddressSpace {
         Ok(())
     }
 
+    pub fn copy(&self, src_va: u64, dst_va: u64, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let regs = self.regions.lock();
+        let (src_first, src_last) = validate_range(&regs, src_va, len, None)?;
+        let (dst_first, dst_last) = validate_range(&regs, dst_va, len, None)?;
+        if src_va == dst_va {
+            return Ok(());
+        }
+
+        if src_first == src_last && dst_first == dst_last {
+            let src = &regs[src_first];
+            let dst = &regs[dst_first];
+            let src_off = (src_va - src.base) as usize;
+            let dst_off = (dst_va - dst.base) as usize;
+            unsafe {
+                let src_ptr = src.buf.as_ptr().add(src_off);
+                trace_host_write(
+                    dst,
+                    dst_va,
+                    dst_off,
+                    std::slice::from_raw_parts(src_ptr, len),
+                );
+                std::ptr::copy(src_ptr, dst.buf.as_ptr().add(dst_off), len);
+            }
+            return Ok(());
+        }
+        drop(regs);
+
+        let mut staging = vec![0u8; len];
+        self.read(src_va, &mut staging)?;
+        self.write(dst_va, &staging)
+    }
+
     pub fn atomic_load_u32(&self, va: u64) -> Result<u32> {
         if va & 3 != 0 {
             let mut b = [0u8; 4];
@@ -491,6 +554,30 @@ impl AddressSpace {
                 host_ptr: r.buf.as_ptr(),
             })
             .collect()
+    }
+
+    pub fn host_region_leases(&self) -> Vec<HostRegionLease> {
+        let generation = self.generation();
+        self.regions
+            .lock()
+            .iter()
+            .map(|backing| HostRegionLease {
+                backing: Arc::clone(backing),
+                generation,
+            })
+            .collect()
+    }
+
+    pub fn host_region_lease_at(&self, va: u64) -> Option<HostRegionLease> {
+        let generation = self.generation();
+        self.regions
+            .lock()
+            .iter()
+            .find(|region| region.contains(va))
+            .map(|backing| HostRegionLease {
+                backing: Arc::clone(backing),
+                generation,
+            })
     }
 
     pub fn host_region_changes_since(&self, generation: u64) -> HostRegionChanges {
@@ -819,6 +906,72 @@ mod tests {
     }
 
     #[test]
+    fn copy_handles_distinct_and_overlapping_ranges() {
+        let a = fresh();
+        let base = 0x2_0000;
+        a.map(base, PAGE_SIZE, Perm::RW, "copy").unwrap();
+        let initial: Vec<u8> = (0..64u8).collect();
+        a.write(base, &initial).unwrap();
+
+        a.copy(base, base + 128, initial.len()).unwrap();
+        let mut distinct = vec![0u8; initial.len()];
+        a.read(base + 128, &mut distinct).unwrap();
+        assert_eq!(distinct, initial);
+
+        let mut forward_expected = initial.clone();
+        forward_expected.copy_within(0..48, 8);
+        a.write(base, &initial).unwrap();
+        a.copy(base, base + 8, 48).unwrap();
+        let mut forward = vec![0u8; initial.len()];
+        a.read(base, &mut forward).unwrap();
+        assert_eq!(forward, forward_expected);
+
+        let mut backward_expected = initial.clone();
+        backward_expected.copy_within(8..56, 0);
+        a.write(base, &initial).unwrap();
+        a.copy(base + 8, base, 48).unwrap();
+        let mut backward = vec![0u8; initial.len()];
+        a.read(base, &mut backward).unwrap();
+        assert_eq!(backward, backward_expected);
+    }
+
+    #[test]
+    fn copy_crosses_adjacent_backing_regions() {
+        let a = fresh();
+        let base = 0x30_0000;
+        a.map(base, PAGE_SIZE, Perm::RW, "src-a").unwrap();
+        a.map(base + PAGE_SIZE, PAGE_SIZE, Perm::RW, "src-b")
+            .unwrap();
+        a.map(base + PAGE_SIZE * 3, PAGE_SIZE * 2, Perm::RW, "dst")
+            .unwrap();
+        let src = base + PAGE_SIZE - 32;
+        let dst = base + PAGE_SIZE * 3 + 17;
+        let payload: Vec<u8> = (0..96).map(|v| (v * 13) as u8).collect();
+        a.write(src, &payload).unwrap();
+
+        a.copy(src, dst, payload.len()).unwrap();
+        let mut actual = vec![0u8; payload.len()];
+        a.read(dst, &mut actual).unwrap();
+        assert_eq!(actual, payload);
+    }
+
+    #[test]
+    fn failed_copy_does_not_modify_destination() {
+        let a = fresh();
+        let base = 0x40_0000;
+        a.map(base, PAGE_SIZE, Perm::RW, "dst").unwrap();
+        a.write(base, &[0xa5; 32]).unwrap();
+
+        assert!(matches!(
+            a.copy(base + PAGE_SIZE * 2, base, 32),
+            Err(AddressSpaceError::Unmapped { .. })
+        ));
+        let mut actual = [0u8; 32];
+        a.read(base, &mut actual).unwrap();
+        assert_eq!(actual, [0xa5; 32]);
+    }
+
+    #[test]
     fn reserved_region_commits_on_demand() {
         let a = fresh();
         let base = 0x7E_0000_0000;
@@ -868,6 +1021,31 @@ mod tests {
         a.resize_committed(base, PAGE_SIZE * 3).unwrap();
         a.read(base + 2 * PAGE_SIZE + 8, &mut byte).unwrap();
         assert_eq!(byte, [0]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dropping_partial_reserved_overlap_preserves_live_fastmem_lease() {
+        const BASE: u64 = 0xf2_0000_0000;
+        const LEN: u64 = PAGE_SIZE * 3;
+        let live = fresh();
+        live.map(BASE, LEN, Perm::RW, "live").unwrap();
+
+        let reserved = fresh();
+        reserved
+            .map_reserved(BASE, LEN, Perm::RW, "reserved")
+            .unwrap();
+        reserved.resize_committed(BASE, PAGE_SIZE).unwrap();
+        drop(reserved);
+
+        assert_ne!(
+            crate::fastmem::take_write_watch(BASE, LEN as usize),
+            crate::fastmem::WriteWatchResult::Unavailable
+        );
+        live.write(BASE + PAGE_SIZE * 2, &[0x5a]).unwrap();
+        let mut actual = [0];
+        live.read(BASE + PAGE_SIZE * 2, &mut actual).unwrap();
+        assert_eq!(actual, [0x5a]);
     }
 
     #[test]
