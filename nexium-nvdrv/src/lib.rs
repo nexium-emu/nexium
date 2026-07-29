@@ -480,6 +480,26 @@ pub struct CtrlEventWait {
     pub threshold: u32,
 }
 
+pub const NVRESULT_NOT_IMPLEMENTED: u32 = 1;
+
+fn log_unknown_ioctl(device: &str, cmd: u16) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<(String, u16)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.insert((device.to_string(), cmd)) {
+        log::warn!(
+            "{}: UNHANDLED ioctl cmd={:#x} → returning fake SUCCESS with zeroed output",
+            device,
+            cmd
+        );
+    }
+}
+
 impl IoctlOutcome {
     pub fn ok(data: Vec<u8>) -> Self {
         Self { result: 0, data }
@@ -746,6 +766,16 @@ impl Nvdrv {
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) -> IoctlOutcome {
+        self.dispatch_ioctl_with_mem_and_copy(req, mem_read, mem_write, &|_, _, _| false)
+    }
+
+    pub fn dispatch_ioctl_with_mem_and_copy(
+        &mut self,
+        req: IoctlRequest,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        mem_copy: &dyn Fn(u64, u64, usize) -> bool,
+    ) -> IoctlOutcome {
         let device = match self.files.get(&req.fd) {
             Some(f) => f.device,
             None => {
@@ -770,7 +800,9 @@ impl Nvdrv {
             NvDevice::Nvmap => self.nvmap_ioctl(cmd, &req),
             NvDevice::NvhostCtrlGpu => self.nvhost_ctrl_gpu_ioctl(cmd, &req),
             NvDevice::NvhostAsGpu => self.nvhost_as_gpu_ioctl(cmd, &req),
-            NvDevice::NvhostGpu => self.nvhost_gpu_ioctl_with_mem(cmd, &req, mem_read, mem_write),
+            NvDevice::NvhostGpu => {
+                self.nvhost_gpu_ioctl_with_mem(cmd, &req, mem_read, mem_write, mem_copy)
+            }
             NvDevice::NvhostCtrl => self.nvhost_ctrl_ioctl(cmd, &req),
             NvDevice::NvhostNvdec | NvDevice::NvhostVic => {
                 self.nvhost_channel_ioctl_with_mem(device, cmd, &req, mem_read, mem_write)
@@ -1876,7 +1908,7 @@ impl Nvdrv {
                 }
             }
             other => {
-                log::debug!("nvmap: unknown ioctl cmd={:#x}", other);
+                log_unknown_ioctl("nvmap", other);
             }
         }
         IoctlOutcome::ok(out)
@@ -2005,7 +2037,7 @@ impl Nvdrv {
                 log::debug!("nvhost-ctrl-gpu:GetGpuTime → {}ns", ns);
             }
             other => {
-                log::debug!("nvhost-ctrl-gpu: unknown ioctl cmd={:#x}", other);
+                log_unknown_ioctl("nvhost-ctrl-gpu", other);
             }
         }
         IoctlOutcome::ok(out)
@@ -2322,7 +2354,7 @@ impl Nvdrv {
                 } else {
                     0
                 };
-                log::warn!(
+                log::debug!(
                     "nvhost-as-gpu:AllocAsEx big_page_size={:#x} va_start={:#x} in_len={}",
                     big_page_size,
                     va_start,
@@ -2422,8 +2454,20 @@ impl Nvdrv {
                     }
                 }
             }
+            0x4118 => {
+                if std::env::var_os("NEXIUM_SYNC_RO_MAP_FAKE_OK").is_some() {
+                    log::warn!(
+                        "nvhost-as-gpu:GetSyncPointRoMap → fake SUCCESS (base=0) [NEXIUM_SYNC_RO_MAP_FAKE_OK]"
+                    );
+                } else {
+                    log::warn!(
+                        "nvhost-as-gpu:GetSyncPointRoMap → NotImplemented (guest must use ioctl syncpt waits)"
+                    );
+                    return IoctlOutcome::error(NVRESULT_NOT_IMPLEMENTED);
+                }
+            }
             other => {
-                log::debug!("nvhost-as-gpu: unknown ioctl cmd={:#x}", other);
+                log_unknown_ioctl("nvhost-as-gpu", other);
             }
         }
         IoctlOutcome::ok(out)
@@ -2435,6 +2479,7 @@ impl Nvdrv {
         req: &IoctlRequest,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        mem_copy: &dyn Fn(u64, u64, usize) -> bool,
     ) -> IoctlOutcome {
         let mut out = vec![0u8; req.out_size];
         let n = req.in_data.len().min(out.len());
@@ -2568,7 +2613,7 @@ impl Nvdrv {
                             .fetch_add(entries.len() as u64, Ordering::Relaxed);
                         let _ = self
                             .gpu
-                            .process_inline_gpfifo(&entries, mem_read, mem_write);
+                            .process_inline_gpfifo(&entries, mem_read, mem_write, mem_copy);
                         let (syncpt_id, syncpt_value) =
                             self.complete_channel_submit(req.fd, submit_flags, submit_fence_value);
                         log::trace!(
@@ -2616,7 +2661,7 @@ impl Nvdrv {
                             .fetch_add(entries.len() as u64, Ordering::Relaxed);
                         let _ = self
                             .gpu
-                            .process_inline_gpfifo(&entries, mem_read, mem_write);
+                            .process_inline_gpfifo(&entries, mem_read, mem_write, mem_copy);
                         let (syncpt_id, syncpt_value) =
                             self.complete_channel_submit(req.fd, submit_flags, submit_fence_value);
                         if log::log_enabled!(log::Level::Trace) {
@@ -2642,9 +2687,13 @@ impl Nvdrv {
                         self.stats
                             .gpfifo_entries
                             .fetch_add(num_entries as u64, Ordering::Relaxed);
-                        let _ = self
-                            .gpu
-                            .submit_gpfifo(address, num_entries, mem_read, mem_write);
+                        let _ = self.gpu.submit_gpfifo(
+                            address,
+                            num_entries,
+                            mem_read,
+                            mem_write,
+                            mem_copy,
+                        );
                         let (syncpt_id, syncpt_value) =
                             self.complete_channel_submit(req.fd, submit_flags, submit_fence_value);
                         log::trace!(
@@ -2807,7 +2856,7 @@ impl Nvdrv {
                 log::debug!("nvhost-gpu:ChannelSetTimeslice");
             }
             other => {
-                log::debug!("nvhost-gpu: unknown ioctl cmd={:#x}", other);
+                log_unknown_ioctl("nvhost-gpu", other);
             }
         }
         IoctlOutcome::ok(out)
@@ -3084,7 +3133,7 @@ impl Nvdrv {
                 return IoctlOutcome::error(0x0003_0006);
             }
             other => {
-                log::debug!("nvhost-ctrl: unknown ioctl cmd={:#x}", other);
+                log_unknown_ioctl("nvhost-ctrl", other);
             }
         }
         IoctlOutcome::ok(out)
@@ -3120,7 +3169,9 @@ impl Nvdrv {
     pub fn submit_frame(&self, frame: QueuedFrame) {
         self.queue_buffer_active
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.frame_queue.lock().push(frame);
+        let mut queue = self.frame_queue.lock();
+        queue.clear();
+        queue.push(frame);
         self.stats.frames_submitted.fetch_add(1, Ordering::Relaxed);
     }
 

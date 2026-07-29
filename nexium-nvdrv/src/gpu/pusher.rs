@@ -8,6 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Duration;
 
+fn gpfifo_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_GPFIFO_TRACE").is_some())
+}
+
 pub(crate) mod kickprof {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
@@ -37,16 +42,61 @@ pub(crate) mod kickprof {
     pub const KC_EXEC: usize = 20;
     pub const KC_WB: usize = 21;
     pub const KC_RESOLVE: usize = 22;
-    pub const COUNT: usize = 23;
+    pub const DMA_COPY: usize = 23;
+    pub const DMA_FALLBACK: usize = 24;
+    pub const DMA_STAGE: usize = 25;
+    pub const DMA_MAP: usize = 26;
+    pub const DMA_META: usize = 27;
+    pub const DMA_RT_LINEAR: usize = 28;
+    pub const DMA_VIRTUAL: usize = 29;
+    pub const ENQ_WATCH: usize = 30;
+    pub const ENQ_BUILD: usize = 31;
+    pub const VK_FLUSH: usize = 32;
+    pub const HOST_DRAWS: usize = 33;
+    pub const DRAW_INSTANCES: usize = 34;
+    pub const COUNT: usize = 35;
 
     const NAMES: [&str; COUNT] = [
-        "locks", "elist", "pbread", "m3d", "macro", "cbufwb", "semacq", "semrel", "barrier",
-        "enq", "flushp", "dma", "fermi", "kepler", "puller", "smallrt", "kmflush", "kcuflush",
-        "kclaunch", "kcsync", "kcexec", "kcwb", "kcresolve",
+        "locks",
+        "elist",
+        "pbread",
+        "m3d",
+        "macro",
+        "cbufwb",
+        "semacq",
+        "semrel",
+        "barrier",
+        "enq",
+        "flushp",
+        "dma",
+        "fermi",
+        "kepler",
+        "puller",
+        "smallrt",
+        "kmflush",
+        "kcuflush",
+        "kclaunch",
+        "kcsync",
+        "kcexec",
+        "kcwb",
+        "kcresolve",
+        "dmacopy",
+        "dmafallback",
+        "dmastage",
+        "dmamap",
+        "dmameta",
+        "dmartlinear",
+        "dmavirtual",
+        "enqwatch",
+        "enqbuild",
+        "vkflush",
+        "hostdraw",
+        "drawinst",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
     static CALLS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
+    static BYTES: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
     static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
     static KICKS: AtomicU64 = AtomicU64::new(0);
     static WINDOW_KICKS: AtomicU64 = AtomicU64::new(0);
@@ -69,11 +119,24 @@ pub(crate) mod kickprof {
 
     #[inline]
     pub fn add(phase: usize, started: Option<Instant>) {
+        add_sized(phase, started, 0);
+    }
+
+    #[inline]
+    pub fn add_sized(phase: usize, started: Option<Instant>, bytes: usize) {
         let Some(started) = started else {
             return;
         };
         NS[phase].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         CALLS[phase].fetch_add(1, Ordering::Relaxed);
+        BYTES[phase].fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn count(phase: usize, amount: u64) {
+        if enabled() {
+            CALLS[phase].fetch_add(amount, Ordering::Relaxed);
+        }
     }
 
     pub fn kick_done(started: Option<Instant>) {
@@ -94,6 +157,7 @@ pub(crate) mod kickprof {
         for i in 0..COUNT {
             let ns = NS[i].swap(0, Ordering::Relaxed);
             let n = CALLS[i].swap(0, Ordering::Relaxed);
+            let bytes = BYTES[i].swap(0, Ordering::Relaxed);
             if i < DISJOINT {
                 accounted += ns;
             }
@@ -101,11 +165,16 @@ pub(crate) mod kickprof {
                 continue;
             }
             parts.push_str(&format!(
-                " {}={:.2}ms/{:.0}%/n{}",
+                " {}={:.2}ms/{:.0}%/n{}{}",
                 NAMES[i],
                 ns as f64 / kicks / 1_000_000.0,
                 ns as f64 * 100.0 / total as f64,
-                n
+                n,
+                if bytes == 0 {
+                    String::new()
+                } else {
+                    format!("/{:.1}MiB", bytes as f64 / (1024.0 * 1024.0))
+                }
             ));
         }
         let other = total.saturating_sub(accounted);
@@ -149,7 +218,7 @@ impl CommandListHeader {
     }
 
     pub fn entry_count(&self) -> u32 {
-        (self.address_hi_and_count >> 10) & 0xFFFFF
+        (self.address_hi_and_count >> 10) & 0x1F_FFFF
     }
 
     pub fn no_prefetch(&self) -> bool {
@@ -157,15 +226,13 @@ impl CommandListHeader {
     }
 
     pub fn not_main(&self) -> bool {
-        (self.address_hi_and_count & 0x4000_0000) != 0
+        (self.address_hi_and_count & 0x200) != 0
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Mode {
-    IncreasingOld,
     Increasing,
-    NonIncreasingOld,
     NonIncreasing,
     Inline,
     IncreaseOnce,
@@ -174,10 +241,8 @@ enum Mode {
 impl Mode {
     fn from_bits(v: u32) -> Option<Mode> {
         Some(match v {
-            0 => Mode::IncreasingOld,
-            1 => Mode::Increasing,
-            2 => Mode::NonIncreasingOld,
-            3 => Mode::NonIncreasing,
+            0 | 1 => Mode::Increasing,
+            2 | 3 => Mode::NonIncreasing,
             4 => Mode::Inline,
             5 => Mode::IncreaseOnce,
             _ => return None,
@@ -199,15 +264,6 @@ const NON_PULLER_METHODS: u32 = 0x40;
 const POISON_SENTINEL: u32 = 0xBEEF_2929;
 
 static GPU_SEM_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-fn ordered_gpu_sync_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("NEXIUM_RELAXED_GPU_SYNC")
-            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
-    })
-}
 
 fn gpu_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -267,13 +323,23 @@ pub struct Pusher {
     pub entry_word_limit: u32,
     pub renderer: Option<Arc<nexium_gpu::Renderer>>,
     vk_batch: Vec<nexium_gpu::draw::Maxwell3dDrawCall>,
+    ssbo_snapshot_cache: super::vk_dispatch::SsboSnapshotCache,
 }
 
 impl Pusher {
     pub fn new() -> Self {
         Self {
             syncpt_value: 0,
-            bound_classes: [0; 8],
+            bound_classes: [
+                0xB197,
+                KEPLER_COMPUTE_CLASS,
+                KEPLER_MEMORY_CLASS,
+                FERMI_2D_CLASS,
+                MAXWELL_DMA_CLASS,
+                0,
+                0,
+                0,
+            ],
             state: DmaState::default(),
             puller: PullerState::default(),
             entries_logged: 0,
@@ -284,11 +350,29 @@ impl Pusher {
             entry_word_limit: 0,
             renderer: None,
             vk_batch: Vec::new(),
+            ssbo_snapshot_cache: super::vk_dispatch::SsboSnapshotCache::default(),
         }
     }
 
     pub fn set_renderer(&mut self, r: Option<Arc<nexium_gpu::Renderer>>) {
         self.renderer = r;
+    }
+
+    pub(crate) fn begin_ssbo_snapshot_epoch(&mut self) {
+        self.ssbo_snapshot_cache.reset_epoch();
+    }
+
+    pub(crate) fn end_ssbo_snapshot_epoch(&mut self) {
+        self.ssbo_snapshot_cache.profile_epoch();
+        self.ssbo_snapshot_cache.clear();
+    }
+
+    fn begin_ssbo_snapshot_entry(&mut self) {
+        let watch_started = kickprof::start();
+        self.ssbo_snapshot_cache.refresh_guest_writes();
+        kickprof::add(kickprof::ENQ_WATCH, watch_started);
+        self.ssbo_snapshot_cache
+            .retain_watchable_full_aurora_snapshots();
     }
 
     pub(crate) fn flush_vk(
@@ -302,13 +386,16 @@ impl Pusher {
         }
         let kp = kickprof::start();
         if let Some(r) = self.renderer.clone() {
-            super::vk_dispatch::flush_accum(
+            let guest_writeback = super::vk_dispatch::flush_accum(
                 &mut self.vk_batch,
                 &r,
                 mappings,
                 mem_read,
                 mem_write,
             );
+            if guest_writeback {
+                self.ssbo_snapshot_cache.clear();
+            }
         } else {
             self.vk_batch.clear();
         }
@@ -316,7 +403,7 @@ impl Pusher {
     }
 
     pub(crate) fn resolve_pending_compute(
-        &self,
+        &mut self,
         mappings: &GpuMappings,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
@@ -327,19 +414,11 @@ impl Pusher {
             return;
         };
         super::engines::maxwell_compute::resolve_pending_writebacks(renderer, mappings, mem_write);
+        self.ssbo_snapshot_cache.clear();
     }
 
     fn sync_renderer_idle(&self, reason: &str) {
         let profile = gpu_profile_enabled();
-        if !ordered_gpu_sync_enabled() {
-            if profile {
-                static SKIPS: AtomicU64 = AtomicU64::new(0);
-                if SKIPS.fetch_add(1, Ordering::Relaxed) < 8 {
-                    log::warn!("[gpu-sync] {} skipped (relaxed)", reason);
-                }
-            }
-            return;
-        }
         let started = profile.then(std::time::Instant::now);
         let Some(renderer) = self.renderer.clone() else {
             return;
@@ -386,7 +465,9 @@ impl Pusher {
         stats: &PipelineStats,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        mem_copy: &dyn Fn(u64, u64, usize) -> bool,
     ) {
+        self.begin_ssbo_snapshot_epoch();
         let cpu_addr = match mappings.cpu_address_for(address) {
             Some(c) => c,
             None => {
@@ -460,6 +541,7 @@ impl Pusher {
                 stats,
                 mem_read,
                 mem_write,
+                mem_copy,
             );
         }
         self.entry_word_limit = 0;
@@ -470,6 +552,7 @@ impl Pusher {
             super::vk_dispatch::writeback_small_rts(&r, mappings, mem_write);
             kickprof::add(kickprof::SMALLRT, kp);
         }
+        self.end_ssbo_snapshot_epoch();
     }
 
     pub fn process_entry(
@@ -484,7 +567,9 @@ impl Pusher {
         stats: &PipelineStats,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        mem_copy: &dyn Fn(u64, u64, usize) -> bool,
     ) {
+        self.begin_ssbo_snapshot_entry();
         let address = entry.address();
         let mut word_count = entry.entry_count();
         let profile = gpu_profile_enabled();
@@ -504,10 +589,14 @@ impl Pusher {
                     );
                 }
             }
+            self.state.method_count = self
+                .state
+                .method_count
+                .saturating_sub(word_count - self.entry_word_limit);
             word_count = self.entry_word_limit;
         }
 
-        if self.entries_logged < 16 {
+        if gpfifo_trace_enabled() && self.entries_logged < 16 {
             log::info!(
                 "gpfifo[{}]: gpu_va={:#x} word_count={} no_prefetch={} not_main={} raw_lo={:#010x} raw_hi={:#010x}",
                 self.entries_logged,
@@ -522,6 +611,7 @@ impl Pusher {
         }
 
         if word_count == 0 || word_count > 0x100000 {
+            self.state.method_count = self.state.method_count.saturating_sub(word_count);
             return;
         }
 
@@ -529,6 +619,7 @@ impl Pusher {
             Some(c) => c,
             None => {
                 warn_unmapped_pushbuffer("pushbuffer", address, mappings);
+                self.state.method_count = self.state.method_count.saturating_sub(word_count);
                 return;
             }
         };
@@ -595,6 +686,7 @@ impl Pusher {
             stats,
             mem_read,
             mem_write,
+            mem_copy,
         );
         if direct_forensics() && self.state.method_count > 0 {
             use std::sync::atomic::{AtomicU32, Ordering};
@@ -646,6 +738,7 @@ impl Pusher {
         stats: &PipelineStats,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        mem_copy: &dyn Fn(u64, u64, usize) -> bool,
     ) {
         let mut i = 0;
         let mut methods_dispatched = 0u64;
@@ -681,6 +774,7 @@ impl Pusher {
                     stats,
                     mem_read,
                     mem_write,
+                    mem_copy,
                 );
                 methods_dispatched += 1;
                 if !self.state.non_incrementing {
@@ -736,11 +830,11 @@ impl Pusher {
             }
 
             match mode {
-                Mode::Increasing | Mode::IncreasingOld => {
+                Mode::Increasing => {
                     self.state.non_incrementing = false;
                     self.state.increment_once = false;
                 }
-                Mode::NonIncreasing | Mode::NonIncreasingOld => {
+                Mode::NonIncreasing => {
                     self.state.non_incrementing = true;
                     self.state.increment_once = false;
                 }
@@ -750,6 +844,8 @@ impl Pusher {
                 }
                 Mode::Inline => {
                     self.state.method_count = 0;
+                    self.state.non_incrementing = true;
+                    self.state.increment_once = false;
                     self.active_word_index = i;
                     self.dispatch_method(
                         arg_count,
@@ -763,6 +859,7 @@ impl Pusher {
                         stats,
                         mem_read,
                         mem_write,
+                        mem_copy,
                     );
                     methods_dispatched += 1;
                 }
@@ -789,6 +886,7 @@ impl Pusher {
         stats: &PipelineStats,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        mem_copy: &dyn Fn(u64, u64, usize) -> bool,
     ) {
         let method = self.state.method;
         let subchannel = self.state.subchannel as usize;
@@ -847,6 +945,7 @@ impl Pusher {
             let upload_launch = maxwell.inline_upload_launch_pending();
             if upload_launch {
                 self.flush_vk(mappings, mem_read, mem_write);
+                self.ssbo_snapshot_cache.clear();
             }
             maxwell.process_inline_uploads(mappings, mem_read, mem_write);
             let d = maxwell.regs.draw_count - pre_draws;
@@ -861,24 +960,7 @@ impl Pusher {
 
             if !maxwell.regs.pending_constbuf_writes.is_empty() {
                 let kp = kickprof::start();
-                let writes = std::mem::take(&mut maxwell.regs.pending_constbuf_writes);
-                for (gpu_va, dword) in writes {
-                    if let Some(cpu) = mappings.cpu_address_for(gpu_va) {
-                        self.trace_constbuf_upload(maxwell, gpu_va, cpu, dword);
-                        mem_write(cpu, &dword.to_le_bytes());
-                    } else {
-                        static DROPPED: AtomicU64 = AtomicU64::new(0);
-                        let n = DROPPED.fetch_add(1, Ordering::Relaxed);
-                        if n < 32 || n % 4096 == 0 {
-                            log::warn!(
-                                "[cbuf-upload-drop] #{} gpu_va={:#x} dword={:#010x}",
-                                n,
-                                gpu_va,
-                                dword
-                            );
-                        }
-                    }
-                }
+                self.commit_pending_constbuf_writes(maxwell, mappings, mem_write);
                 kickprof::add(kickprof::CBUFWB, kp);
             }
             if !maxwell.regs.pending_semaphore_acquires.is_empty() {
@@ -953,6 +1035,11 @@ impl Pusher {
                         kickprof::add(kickprof::SEMREL, kp);
                         renderer_ordered = true;
                     }
+                    self.ssbo_snapshot_cache.invalidate_gpu_write(
+                        mappings,
+                        write.gpu_va,
+                        if write.long { 16 } else { 4 },
+                    );
                     if let Some(cpu) = mappings.cpu_address_for(write.gpu_va) {
                         let ok = if write.long {
                             let ts = GPU_SEM_TICK.fetch_add(1, Ordering::Relaxed);
@@ -982,12 +1069,28 @@ impl Pusher {
                 }
             }
             if !maxwell.pending_draws.is_empty() {
+                self.resolve_pending_compute(mappings, mem_write);
                 let draws = std::mem::take(&mut maxwell.pending_draws);
                 if let Some(r) = self.renderer.clone() {
+                    if kickprof::enabled() {
+                        kickprof::count(
+                            kickprof::HOST_DRAWS,
+                            draws.iter().filter(|draw| !draw.is_clear).count() as u64,
+                        );
+                        kickprof::count(
+                            kickprof::DRAW_INSTANCES,
+                            draws
+                                .iter()
+                                .filter(|draw| !draw.is_clear)
+                                .map(|draw| draw.instance_count.max(1) as u64)
+                                .sum(),
+                        );
+                    }
                     let kp = kickprof::start();
                     super::vk_dispatch::enqueue_draws(
                         &draws,
                         &mut self.vk_batch,
+                        &mut self.ssbo_snapshot_cache,
                         mappings,
                         maxwell,
                         &r,
@@ -1006,14 +1109,20 @@ impl Pusher {
             if barrier_flushes != 0 || texture_invalidates != 0 {
                 self.flush_vk(mappings, mem_read, mem_write);
                 let kp = kickprof::start();
-                self.sync_renderer_idle("maxwell-barrier");
                 if texture_invalidates != 0 {
                     static CLEAR_ON_TIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                     let clear_on_tic = *CLEAR_ON_TIC
                         .get_or_init(|| std::env::var_os("NEXIUM_TIC_INVALIDATE_CLEAR").is_some());
                     if clear_on_tic {
                         if let Some(r) = self.renderer.clone() {
-                            r.clear_texture_cache();
+                            if let Some(rt) = crate::render_thread::maybe_render_thread() {
+                                rt.submit_named(
+                                    "texture-cache-invalidate",
+                                    Box::new(move || r.clear_texture_cache()),
+                                );
+                            } else {
+                                r.clear_texture_cache();
+                            }
                         }
                     }
                 }
@@ -1030,8 +1139,11 @@ impl Pusher {
             self.flush_vk(mappings, mem_read, mem_write);
             let kp = kickprof::start();
             if method == super::engines::maxwell_dma::M_LAUNCH_DMA {
+                let spans = maxwell_dma.transfer_spans();
+                let (dst_gpu, dst_size) = spans[1];
+                self.ssbo_snapshot_cache
+                    .invalidate_gpu_write(mappings, dst_gpu, dst_size);
                 if super::engines::maxwell_compute::has_pending_writebacks() {
-                    let spans = maxwell_dma.transfer_spans();
                     let overlaps = spans.iter().any(|&(gpu_va, size)| {
                         let cpu_addr = mappings
                             .cpu_range_for(gpu_va)
@@ -1046,11 +1158,13 @@ impl Pusher {
                     }
                 }
                 if let Some(r) = self.renderer.clone() {
+                    let stage_started = kickprof::start();
                     maxwell_dma.stage_rt_source(arg, mappings, &r, mem_write);
+                    kickprof::add(kickprof::DMA_STAGE, stage_started);
                 }
             }
             let pre = maxwell_dma.blit_count;
-            maxwell_dma.dispatch_method(method, arg, mappings, mem_read, mem_write);
+            maxwell_dma.dispatch_method(method, arg, mappings, mem_read, mem_write, mem_copy);
             let n = maxwell_dma.blit_count - pre;
             if n > 0 {
                 stats.maxwell_dma_blits.fetch_add(n, Ordering::Relaxed);
@@ -1058,6 +1172,7 @@ impl Pusher {
             kickprof::add(kickprof::DMA, kp);
         } else if bound_class == FERMI_2D_CLASS {
             self.flush_vk(mappings, mem_read, mem_write);
+            self.ssbo_snapshot_cache.clear();
             let kp = kickprof::start();
             let r = self.renderer.clone();
             let pre = fermi_2d.blit_count;
@@ -1069,11 +1184,13 @@ impl Pusher {
             kickprof::add(kickprof::FERMI, kp);
         } else if bound_class == KEPLER_MEMORY_CLASS {
             self.flush_vk(mappings, mem_read, mem_write);
+            self.ssbo_snapshot_cache.clear();
             let kp = kickprof::start();
             kepler_memory.dispatch_method(method, arg, mappings, mem_read, mem_write);
             kickprof::add(kickprof::KEPLER, kp);
         } else if bound_class == KEPLER_COMPUTE_CLASS {
             self.flush_vk(mappings, mem_read, mem_write);
+            self.ssbo_snapshot_cache.clear();
             let kp = kickprof::start();
             let is_last = self.state.method_count <= 1;
             kepler_compute.dispatch_method(
@@ -1207,7 +1324,7 @@ impl Pusher {
     }
 
     fn write_semaphore(
-        &self,
+        &mut self,
         mappings: &GpuMappings,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
         payload: u32,
@@ -1215,6 +1332,8 @@ impl Pusher {
     ) {
         let gpu_va = ((self.puller.semaphore_addr_high as u64) << 32)
             | (self.puller.semaphore_addr_low as u64);
+        self.ssbo_snapshot_cache
+            .invalidate_gpu_write(mappings, gpu_va, if long { 16 } else { 4 });
         if let Some(cpu) = mappings.cpu_address_for(gpu_va) {
             if long {
                 let ts = GPU_SEM_TICK.fetch_add(1, Ordering::Relaxed);
@@ -1238,6 +1357,62 @@ impl Pusher {
                 gpu_va,
                 payload
             );
+        }
+    }
+
+    fn commit_pending_constbuf_writes(
+        &mut self,
+        maxwell: &mut Maxwell3D,
+        mappings: &GpuMappings,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
+        let writes = std::mem::take(&mut maxwell.regs.pending_constbuf_writes);
+        let mut run_bytes = Vec::new();
+        let mut run_start = 0usize;
+        while run_start < writes.len() {
+            let run_end = contiguous_constbuf_write_run_end(&writes, run_start);
+            let run = &writes[run_start..run_end];
+            let gpu_va = run[0].0;
+            let run_len = run.len().saturating_mul(std::mem::size_of::<u32>());
+            self.ssbo_snapshot_cache
+                .invalidate_gpu_write(mappings, gpu_va, run_len);
+
+            let contiguous_mapping = mappings
+                .cpu_range_for(gpu_va)
+                .filter(|(_, remaining)| *remaining >= run_len as u64);
+            if let Some((cpu, _)) = contiguous_mapping {
+                run_bytes.clear();
+                run_bytes.reserve(run_len);
+                for (index, &(write_gpu_va, dword)) in run.iter().enumerate() {
+                    self.trace_constbuf_upload(
+                        maxwell,
+                        write_gpu_va,
+                        cpu + (index * std::mem::size_of::<u32>()) as u64,
+                        dword,
+                    );
+                    run_bytes.extend_from_slice(&dword.to_le_bytes());
+                }
+                mem_write(cpu, &run_bytes);
+            } else {
+                for &(write_gpu_va, dword) in run {
+                    if let Some(cpu) = mappings.cpu_address_for(write_gpu_va) {
+                        self.trace_constbuf_upload(maxwell, write_gpu_va, cpu, dword);
+                        mem_write(cpu, &dword.to_le_bytes());
+                    } else {
+                        static DROPPED: AtomicU64 = AtomicU64::new(0);
+                        let n = DROPPED.fetch_add(1, Ordering::Relaxed);
+                        if n < 32 || n % 4096 == 0 {
+                            log::warn!(
+                                "[cbuf-upload-drop] #{} gpu_va={:#x} dword={:#010x}",
+                                n,
+                                write_gpu_va,
+                                dword
+                            );
+                        }
+                    }
+                }
+            }
+            run_start = run_end;
         }
     }
 
@@ -1425,6 +1600,22 @@ fn parse_u64ish(s: &str) -> Option<u64> {
     }
 }
 
+fn contiguous_constbuf_write_run_end(writes: &[(u64, u32)], start: usize) -> usize {
+    if start >= writes.len() {
+        return start;
+    }
+    let mut end = start + 1;
+    while end < writes.len()
+        && writes[end - 1]
+            .0
+            .checked_add(std::mem::size_of::<u32>() as u64)
+            == Some(writes[end].0)
+    {
+        end += 1;
+    }
+    end
+}
+
 impl Default for Pusher {
     fn default() -> Self {
         Self::new()
@@ -1435,6 +1626,75 @@ impl Default for Pusher {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn legacy_pushbuffer_modes_decode_to_current_semantics() {
+        assert_eq!(Mode::from_bits(0), Some(Mode::Increasing));
+        assert_eq!(Mode::from_bits(1), Some(Mode::Increasing));
+        assert_eq!(Mode::from_bits(2), Some(Mode::NonIncreasing));
+        assert_eq!(Mode::from_bits(3), Some(Mode::NonIncreasing));
+        assert_eq!(Mode::from_bits(4), Some(Mode::Inline));
+        assert_eq!(Mode::from_bits(5), Some(Mode::IncreaseOnce));
+        assert_eq!(Mode::from_bits(6), None);
+        assert_eq!(Mode::from_bits(7), None);
+    }
+
+    #[test]
+    fn constbuf_write_runs_coalesce_only_strictly_contiguous_dwords() {
+        let writes = [
+            (0x1000, 1),
+            (0x1004, 2),
+            (0x1008, 3),
+            (0x1008, 4),
+            (0x2000, 5),
+            (0x2004, 6),
+            (u64::MAX - 3, 7),
+            (0, 8),
+        ];
+
+        assert_eq!(contiguous_constbuf_write_run_end(&writes, 0), 3);
+        assert_eq!(contiguous_constbuf_write_run_end(&writes, 3), 4);
+        assert_eq!(contiguous_constbuf_write_run_end(&writes, 4), 6);
+        assert_eq!(contiguous_constbuf_write_run_end(&writes, 6), 7);
+        assert_eq!(contiguous_constbuf_write_run_end(&writes, 7), 8);
+        assert_eq!(
+            contiguous_constbuf_write_run_end(&writes, writes.len()),
+            writes.len()
+        );
+    }
+
+    #[test]
+    fn pending_constbuf_writes_commit_contiguous_runs_in_single_host_writes() {
+        let mut pusher = Pusher::new();
+        let mut maxwell = Maxwell3D::new();
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5000, 0x100, 0x9000, 1);
+        maxwell.regs.pending_constbuf_writes = vec![
+            (0x5000, 0x1122_3344),
+            (0x5004, 0x5566_7788),
+            (0x5008, 0x99aa_bbcc),
+            (0x5010, 0xddee_ff00),
+        ];
+        let committed = Mutex::new(Vec::<(u64, Vec<u8>)>::new());
+        let mem_write = |cpu: u64, data: &[u8]| {
+            committed.lock().unwrap().push((cpu, data.to_vec()));
+            true
+        };
+
+        pusher.commit_pending_constbuf_writes(&mut maxwell, &mappings, &mem_write);
+
+        assert!(maxwell.regs.pending_constbuf_writes.is_empty());
+        assert_eq!(
+            *committed.lock().unwrap(),
+            vec![
+                (
+                    0x9000,
+                    vec![0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0xcc, 0xbb, 0xaa, 0x99,],
+                ),
+                (0x9010, vec![0x00, 0xff, 0xee, 0xdd]),
+            ]
+        );
+    }
 
     #[test]
     fn macro_argument_refresh_reads_the_live_pushbuffer_word() {
@@ -1457,6 +1717,127 @@ mod tests {
         let mappings = GpuMappings::new();
         let read = |_: u64, _: &mut [u8]| false;
         assert_eq!(read_live_word(&mappings, 0x5020, &read), None);
+    }
+
+    #[test]
+    fn ssbo_snapshot_cache_survives_empty_read_only_flush() {
+        let mut pusher = Pusher::new();
+        let key = crate::gpu::vk_dispatch::SsboSnapshotCacheKey {
+            storage_binding: 0,
+            descriptor_binding: 2,
+            descriptor_offset: 0,
+            descriptor_align: 16,
+            descriptor_indirect: false,
+            descriptor_size: 3 * 1024 * 1024,
+            guest_addr: 0x7000_0000,
+            logical_size: 3 * 1024 * 1024,
+            data_offset: 0,
+            read_len: 16,
+        };
+        let read = |_: u64, dst: &mut [u8]| {
+            dst.fill(0x7b);
+            true
+        };
+        let write = |_: u64, _: &[u8]| true;
+        let mappings = GpuMappings::new();
+
+        let before_flush = pusher
+            .ssbo_snapshot_cache
+            .read_or_insert(key, 0x8000_0000, &read)
+            .unwrap();
+        pusher.flush_vk(&mappings, &read, &write);
+        assert!(!pusher.ssbo_snapshot_cache.is_empty());
+
+        let after_flush = pusher
+            .ssbo_snapshot_cache
+            .read_or_insert(key, 0x8000_0000, &read)
+            .unwrap();
+        assert!(Arc::ptr_eq(&before_flush, &after_flush));
+    }
+
+    #[test]
+    fn entry_boundary_drops_partial_non_watchable_ssbo_snapshot() {
+        let mut pusher = Pusher::new();
+        let key = crate::gpu::vk_dispatch::SsboSnapshotCacheKey {
+            storage_binding: 0,
+            descriptor_binding: 2,
+            descriptor_offset: 0,
+            descriptor_align: 16,
+            descriptor_indirect: false,
+            descriptor_size: 3 * 1024 * 1024,
+            guest_addr: 0x7000_0000,
+            logical_size: 3 * 1024 * 1024,
+            data_offset: 0,
+            read_len: 16,
+        };
+        let read = |_: u64, dst: &mut [u8]| {
+            dst.fill(0x7b);
+            true
+        };
+
+        pusher
+            .ssbo_snapshot_cache
+            .read_or_insert(key, 0x8000_0000, &read)
+            .unwrap();
+        assert!(!pusher.ssbo_snapshot_cache.is_empty());
+
+        pusher.begin_ssbo_snapshot_entry();
+        assert!(pusher.ssbo_snapshot_cache.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn entry_boundary_retains_write_watched_full_aurora_snapshot() {
+        const CPU_VA: u64 = 0xea_0000_0000;
+        const LEN: usize = 3 * 1024 * 1024;
+
+        let ptr = nexium_memory::fastmem::commit(CPU_VA, LEN).expect("fastmem test arena");
+        unsafe { std::ptr::write_bytes(ptr, 0x6d, LEN) };
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            assert_eq!(cpu_addr, CPU_VA);
+            unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), dst.len()) };
+            true
+        };
+        let key = crate::gpu::vk_dispatch::SsboSnapshotCacheKey {
+            storage_binding: 0,
+            descriptor_binding: 2,
+            descriptor_offset: 0,
+            descriptor_align: 16,
+            descriptor_indirect: false,
+            descriptor_size: LEN as u32,
+            guest_addr: 0x7000_0000,
+            logical_size: LEN,
+            data_offset: 0,
+            read_len: LEN,
+        };
+        let mut pusher = Pusher::new();
+
+        let before_entry = pusher
+            .ssbo_snapshot_cache
+            .read_or_insert(key, CPU_VA, &read)
+            .unwrap();
+        assert!(!pusher.ssbo_snapshot_cache.is_empty());
+
+        pusher.begin_ssbo_snapshot_entry();
+
+        assert!(!pusher.ssbo_snapshot_cache.is_empty());
+        let after_entry = pusher
+            .ssbo_snapshot_cache
+            .read_or_insert(key, CPU_VA, &read)
+            .unwrap();
+        assert!(Arc::ptr_eq(&before_entry, &after_entry));
+
+        unsafe { ptr.add(0x1234).write_volatile(0xa7) };
+        pusher.begin_ssbo_snapshot_entry();
+        assert!(pusher.ssbo_snapshot_cache.is_empty());
+
+        let after_cpu_write = pusher
+            .ssbo_snapshot_cache
+            .read_or_insert(key, CPU_VA, &read)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&before_entry, &after_cpu_write));
+        assert_eq!(after_cpu_write[0x1234], 0xa7);
+        nexium_memory::fastmem::decommit(ptr, LEN);
     }
 
     #[test]
@@ -1485,6 +1866,7 @@ mod tests {
             &stats,
             &mem_read,
             &mem_write,
+            &|_, _, _| false,
         );
         assert_eq!(pusher.state.method, 0x6D);
         assert_eq!(pusher.state.method_count, 768);
@@ -1502,6 +1884,7 @@ mod tests {
             &stats,
             &mem_read,
             &mem_write,
+            &|_, _, _| false,
         );
         assert_eq!(pusher.state.method_count, 0);
 
@@ -1516,13 +1899,14 @@ mod tests {
             &stats,
             &mem_read,
             &mem_write,
+            &|_, _, _| false,
         );
         assert_eq!(pusher.state.method, 0x101);
         assert_eq!(pusher.state.method_count, 0);
     }
 
     #[test]
-    fn method_count_above_entry_limit_survives_boundary() {
+    fn payload_spans_gpfifo_entry_boundaries_by_default() {
         let mut pusher = Pusher::new();
         let mut mappings = GpuMappings::new();
         mappings.add(0x4000, 0x100, 0x1000, 1);
@@ -1534,15 +1918,20 @@ mod tests {
         let stats = PipelineStats::default();
         let mem_read = |_: u64, _: &mut [u8]| true;
         let mem_write = |_: u64, _: &[u8]| true;
-        let entry = CommandListHeader {
+        let first_entry = CommandListHeader {
             address_lo: 0x4000,
             address_hi_and_count: 1 << 10,
         };
+        let second_entry = CommandListHeader {
+            address_lo: 0x4004,
+            address_hi_and_count: 1 << 10,
+        };
         pusher.state.method = 0x101;
-        pusher.state.method_count = 4097;
+        pusher.state.subchannel = 7;
+        pusher.state.method_count = 2;
 
         pusher.process_entry(
-            &entry,
+            &first_entry,
             &mappings,
             &mut maxwell,
             &mut maxwell_dma,
@@ -1552,14 +1941,30 @@ mod tests {
             &stats,
             &mem_read,
             &mem_write,
+            &|_, _, _| false,
         );
-        assert_eq!(pusher.state.method_count, 4096);
+        assert_eq!(pusher.state.method_count, 1);
+
+        pusher.process_entry(
+            &second_entry,
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &mem_write,
+            &|_, _, _| false,
+        );
+        assert_eq!(pusher.state.method_count, 0);
+        assert_eq!(stats.methods_dispatched.load(Ordering::Relaxed), 2);
     }
 
     #[test]
     fn maxwell3d_inline_upload_writes_mapped_bytes() {
         let mut pusher = Pusher::new();
-        pusher.bound_classes[0] = 0xB197;
         let mut mappings = GpuMappings::new();
         mappings.add(0x6000, 0x100, 0x1000, 1);
         let mut maxwell = Maxwell3D::new();
@@ -1590,22 +1995,7 @@ mod tests {
             true
         };
 
-        let setup = [
-            0x200D_0060,
-            6,
-            1,
-            0,
-            0x6000,
-            6,
-            0,
-            6,
-            1,
-            1,
-            0,
-            0,
-            0,
-            1,
-        ];
+        let setup = [0x200D_0060, 6, 1, 0, 0x6000, 6, 0, 6, 1, 1, 0, 0, 0, 1];
         pusher.process_commands(
             &setup,
             &mappings,
@@ -1617,6 +2007,7 @@ mod tests {
             &stats,
             &mem_read,
             &mem_write,
+            &|_, _, _| false,
         );
         pusher.process_commands(
             &[0x6002_006D, 0x1122_3344, 0x5566],
@@ -1629,11 +2020,81 @@ mod tests {
             &stats,
             &mem_read,
             &mem_write,
+            &|_, _, _| false,
         );
 
         let memory = memory.lock().unwrap();
         assert_eq!(&memory[..6], &[0x44, 0x33, 0x22, 0x11, 0x66, 0x55]);
         assert_eq!(maxwell.reg_file[0x47], 0);
         assert_eq!(maxwell.reg_file[0x48], 0);
+    }
+
+    #[test]
+    fn nvk_implicit_copy_subchannel_executes_dma_without_set_object() {
+        let mut pusher = Pusher::new();
+        assert_eq!(pusher.bound_classes[4], MAXWELL_DMA_CLASS);
+
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x6000, 0x200, 0x1000, 1);
+        let mut maxwell = Maxwell3D::new();
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let memory = Arc::new(Mutex::new(vec![0u8; 0x200]));
+        memory.lock().unwrap()[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+
+        let read_memory = memory.clone();
+        let mem_read = move |cpu: u64, out: &mut [u8]| {
+            let memory = read_memory.lock().unwrap();
+            let start = cpu.saturating_sub(0x1000) as usize;
+            if start.saturating_add(out.len()) > memory.len() {
+                return false;
+            }
+            out.copy_from_slice(&memory[start..start + out.len()]);
+            true
+        };
+        let write_memory = memory.clone();
+        let mem_write = move |cpu: u64, data: &[u8]| {
+            let mut memory = write_memory.lock().unwrap();
+            let start = cpu.saturating_sub(0x1000) as usize;
+            if start.saturating_add(data.len()) > memory.len() {
+                return false;
+            }
+            memory[start..start + data.len()].copy_from_slice(data);
+            true
+        };
+
+        let setup_header = (1 << 29) | (8 << 16) | (4 << 13) | 0x100;
+        let launch_header = (4 << 29) | (0x180 << 16) | (4 << 13) | 0xC0;
+        pusher.process_commands(
+            &[
+                setup_header,
+                0,
+                0x6000,
+                0,
+                0x6100,
+                4,
+                4,
+                4,
+                1,
+                launch_header,
+            ],
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &mem_write,
+            &|_, _, _| false,
+        );
+
+        let memory = memory.lock().unwrap();
+        assert_eq!(&memory[0x100..0x104], &[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(maxwell_dma.blit_count, 1);
     }
 }

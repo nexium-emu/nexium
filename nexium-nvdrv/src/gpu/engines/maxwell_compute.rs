@@ -128,6 +128,8 @@ struct FrontendCacheKey {
 struct FrontendPlan {
     cfg: nexium_shader::Cfg,
     needs: Vec<ResourceNeed>,
+    storage_buffers: Vec<nexium_shader::StorageBufferAddr>,
+    writable_storage_buffers: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -141,6 +143,7 @@ struct ModuleCacheKey {
     texture_bound_cbuf: u8,
     cbuf_sizes: [u32; nexium_spirv::COMPUTE_CBUF_SLOTS],
     resources: Vec<ComputeImageResource>,
+    num_storage_buffers: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -195,7 +198,14 @@ fn prepare_uniform_buffers(
 }
 
 fn is_image_resource_descriptor(descriptor: &ComputeDescriptor) -> bool {
-    nexium_spirv::compute_cbuf_slot_for_descriptor_binding(descriptor.binding).is_none()
+    matches!(
+        descriptor.kind,
+        ComputeDescriptorKind::CombinedSampledImage
+            | ComputeDescriptorKind::UniformTexelBuffer
+            | ComputeDescriptorKind::StorageTexelBuffer
+            | ComputeDescriptorKind::SampledImage
+            | ComputeDescriptorKind::StorageImage
+    )
 }
 
 const MAX_TRANSLATION_CACHE_ENTRIES: usize = 128;
@@ -472,6 +482,7 @@ fn prepare_and_execute(
         shared_memory_size: qmd[0x11] & 0x3ffff,
         texture_bound_cbuf,
         cbuf_sizes,
+        num_storage_buffers: frontend.storage_buffers.len() as u32,
         resources: resolved.iter().map(|resource| resource.metadata).collect(),
     };
     let module_key = ModuleCacheKey {
@@ -484,6 +495,7 @@ fn prepare_and_execute(
         texture_bound_cbuf,
         cbuf_sizes,
         resources: options.resources.clone(),
+        num_storage_buffers: options.num_storage_buffers,
     };
     let module = cached_compute_module(module_key, &frontend.cfg, &options)?;
     if module.texture_bound_cbuf != texture_bound_cbuf {
@@ -539,6 +551,71 @@ fn prepare_and_execute(
     let mut sampled_images = Vec::new();
     let mut outputs = Vec::new();
     let mut output_targets: Vec<OutputTarget> = Vec::new();
+
+    for (index, descriptor) in frontend.storage_buffers.iter().enumerate() {
+        let cbuf = cbufs
+            .get(descriptor.cbuf_binding as usize)
+            .and_then(Option::as_deref)
+            .ok_or_else(|| {
+                format!(
+                    "raw compute buffer {} references unavailable cbuf {}",
+                    index, descriptor.cbuf_binding
+                )
+            })?;
+        let offset = descriptor.cbuf_offset as usize;
+        let raw = cbuf.get(offset..offset.saturating_add(12)).ok_or_else(|| {
+            format!(
+                "raw compute buffer {} descriptor at c[{}]:{:#x} is truncated",
+                index, descriptor.cbuf_binding, descriptor.cbuf_offset
+            )
+        })?;
+        let base_lo = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as u64;
+        let base_hi = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as u64;
+        let size = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+        let base = (base_hi << 32) | base_lo;
+        if base == 0 || size == 0 || size > MAX_RESOURCE_BYTES {
+            return Err(format!(
+                "raw compute buffer {} has invalid base/size {base:#x}/{size:#x}",
+                index
+            )
+            .into());
+        }
+        let align = u64::from(descriptor.align.max(1));
+        let aligned = base & !(align - 1);
+        let slack = (base - aligned) as usize;
+        let byte_len = size
+            .checked_add(slack)
+            .ok_or_else(|| "raw compute buffer size overflow".to_string())?;
+        let bytes = read_gpu_vec(mappings, mem_read, aligned, byte_len, "raw storage buffer")?;
+        let resource_index = texel_buffers.len();
+        let writable = frontend.writable_storage_buffers[index];
+        texel_buffers.push(ComputeTexelBuffer {
+            bindings: vec![nexium_spirv::COMPUTE_STORAGE_BUFFER_BINDING_BASE + index as u32],
+            bytes,
+            format: ComputeTexelFormat::R32Uint,
+            raw: true,
+            writable,
+            requires_atomics: false,
+        });
+        if writable {
+            let (cpu_addr, available) = mapped_range(mappings, aligned)
+                .ok_or_else(|| format!("raw compute output {aligned:#x} is unmapped"))?;
+            if byte_len as u64 > available {
+                return Err(format!(
+                    "raw compute output mapping is short ({available:#x} < {byte_len:#x})"
+                )
+                .into());
+            }
+            texel_targets.push(TexelTarget {
+                resource_index,
+                binding: nexium_spirv::COMPUTE_STORAGE_BUFFER_BINDING_BASE + index as u32,
+                gpu_va: aligned,
+                cpu_addr,
+                guest_size: byte_len,
+            });
+        }
+    }
+
     for descriptor in module
         .descriptors
         .iter()
@@ -581,10 +658,10 @@ fn prepare_and_execute(
             .into());
         }
         match descriptor.kind {
-            ComputeDescriptorKind::UniformBuffer => {
+            ComputeDescriptorKind::UniformBuffer | ComputeDescriptorKind::StorageBuffer => {
                 return Err(format!(
-                    "unexpected nonzero uniform-buffer binding {}",
-                    descriptor.binding
+                    "unexpected non-image descriptor {:?} at binding {}",
+                    descriptor.kind, descriptor.binding
                 )
                 .into());
             }
@@ -670,6 +747,7 @@ fn prepare_and_execute(
                         bindings: vec![descriptor.binding],
                         bytes,
                         format,
+                        raw: false,
                         writable: true,
                         requires_atomics,
                     });
@@ -1130,7 +1208,7 @@ fn cached_frontend_plan(
         return Ok((base_key, Arc::clone(plan)));
     }
 
-    let cfg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let mut cfg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         nexium_shader::build_compute_cfg_with_cbuf(code, |binding, byte_offset| {
             cbufs
                 .get(binding as usize)
@@ -1166,6 +1244,19 @@ fn cached_frontend_plan(
             }
         ));
     }
+    let storage_buffers = nexium_shader::collect_storage_buffers(&mut cfg);
+    let mut writable_storage_buffers = vec![false; storage_buffers.len()];
+    for instruction in cfg
+        .blocks
+        .iter()
+        .flat_map(|block| &block.program.instructions)
+    {
+        if let IrOp::StoreStorage { buffer_index, .. } = instruction.op {
+            if let Some(writable) = writable_storage_buffers.get_mut(buffer_index as usize) {
+                *writable = true;
+            }
+        }
+    }
     let needs = collect_resource_needs(&cfg)?;
     let uses_indirect = cfg
         .blocks
@@ -1178,7 +1269,12 @@ fn cached_frontend_plan(
     } else {
         base_key
     };
-    let plan = Arc::new(FrontendPlan { cfg, needs });
+    let plan = Arc::new(FrontendPlan {
+        cfg,
+        needs,
+        storage_buffers,
+        writable_storage_buffers,
+    });
     let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(existing) = cache.get(&key) {
         return Ok((key, Arc::clone(existing)));
@@ -1845,14 +1941,14 @@ fn validate_sampled_writable_aliases(
     for descriptor in module
         .descriptors
         .iter()
-        .filter(|descriptor| descriptor.kind != ComputeDescriptorKind::UniformBuffer)
+        .filter(|descriptor| is_image_resource_descriptor(descriptor))
     {
         let writable = match descriptor.kind {
             ComputeDescriptorKind::StorageTexelBuffer | ComputeDescriptorKind::StorageImage => true,
             ComputeDescriptorKind::CombinedSampledImage
             | ComputeDescriptorKind::UniformTexelBuffer
             | ComputeDescriptorKind::SampledImage => false,
-            ComputeDescriptorKind::UniformBuffer => continue,
+            ComputeDescriptorKind::UniformBuffer | ComputeDescriptorKind::StorageBuffer => continue,
         };
         let resource = resolved
             .iter()

@@ -1,10 +1,12 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 pub type RenderJob = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct RenderThread {
     tx: SyncSender<RenderJob>,
+    pending: Arc<AtomicUsize>,
 }
 
 impl RenderThread {
@@ -15,6 +17,8 @@ impl RenderThread {
     fn new_named(name: &str) -> Self {
         let queue_depth = render_queue_depth();
         let (tx, rx) = sync_channel::<RenderJob>(queue_depth);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let worker_pending = pending.clone();
         std::thread::Builder::new()
             .name(name.to_string())
             .spawn(move || {
@@ -32,10 +36,11 @@ impl RenderThread {
                             );
                         }
                     }
+                    worker_pending.fetch_sub(1, Ordering::Release);
                 }
             })
             .expect("spawn render worker thread");
-        RenderThread { tx }
+        RenderThread { tx, pending }
     }
 
     pub fn submit(&self, job: RenderJob) {
@@ -45,7 +50,10 @@ impl RenderThread {
     pub fn submit_named(&self, label: &'static str, job: RenderJob) {
         let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
         let started = profile.then(std::time::Instant::now);
-        let _ = self.tx.send(job);
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        if self.tx.send(job).is_err() {
+            self.pending.fetch_sub(1, Ordering::Release);
+        }
         if let Some(started) = started {
             let elapsed = started.elapsed();
             if elapsed >= std::time::Duration::from_millis(1) {
@@ -59,10 +67,18 @@ impl RenderThread {
     }
 
     pub fn try_submit(&self, job: RenderJob) -> bool {
+        self.pending.fetch_add(1, Ordering::AcqRel);
         match self.tx.try_send(job) {
             Ok(()) => true,
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.pending.fetch_sub(1, Ordering::Release);
+                false
+            }
         }
+    }
+
+    pub(crate) fn has_pending_jobs(&self) -> bool {
+        self.pending.load(Ordering::Acquire) != 0
     }
 
     pub fn submit_timeout(&self, job: RenderJob, timeout: std::time::Duration) -> bool {
@@ -80,16 +96,21 @@ impl RenderThread {
         let deadline = std::time::Instant::now() + timeout;
         let mut job = job;
         let submitted = loop {
+            self.pending.fetch_add(1, Ordering::AcqRel);
             match self.tx.try_send(job) {
                 Ok(()) => break true,
                 Err(TrySendError::Full(j)) => {
+                    self.pending.fetch_sub(1, Ordering::Release);
                     if std::time::Instant::now() >= deadline {
                         break false;
                     }
                     job = j;
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                Err(TrySendError::Disconnected(_)) => break false,
+                Err(TrySendError::Disconnected(_)) => {
+                    self.pending.fetch_sub(1, Ordering::Release);
+                    break false;
+                }
             }
         };
         if let Some(started) = started {
@@ -153,4 +174,43 @@ pub fn present_thread() -> &'static RenderThread {
 fn dedicated_present_thread() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("NEXIUM_DEDICATED_PRESENT_THREAD").is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RenderThread;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn wait_until_idle(worker: &RenderThread) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.has_pending_jobs() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            !worker.has_pending_jobs(),
+            "render worker did not become idle"
+        );
+    }
+
+    #[test]
+    fn pending_jobs_tracks_queued_in_flight_and_idle_transitions() {
+        let worker = RenderThread::new_named("nexium-render-pending-test");
+        assert!(!worker.has_pending_jobs());
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        assert!(worker.try_submit(Box::new(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })));
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(worker.has_pending_jobs());
+
+        assert!(worker.try_submit(Box::new(|| {})));
+        assert_eq!(worker.pending.load(std::sync::atomic::Ordering::Acquire), 2);
+
+        release_tx.send(()).unwrap();
+        wait_until_idle(&worker);
+    }
 }

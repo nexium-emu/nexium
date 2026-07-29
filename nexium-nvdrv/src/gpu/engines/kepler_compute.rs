@@ -147,7 +147,7 @@ impl KeplerCompute {
                     backend = "vulkan-recompiler";
                     handled = true;
                     executed = true;
-                    if std::env::var_os("NEXIUM_COMPUTE_RECOMPILER_TRACE").is_some() {
+                    if compute_recompiler_trace_enabled() {
                         use std::sync::{Mutex, OnceLock};
                         static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> =
                             OnceLock::new();
@@ -239,7 +239,10 @@ impl KeplerCompute {
             && compute_dump_program().is_some_and(|program| program == program_start)
             && dump_invocations
                 .is_none_or(|expected| expected == launch_invocations(&self.launch_description));
-        if (self.launch_count < 16 && dump_invocations.is_none()) || target_dump {
+        let sampled_launch_diagnostics = self.launch_count < 16
+            && dump_invocations.is_none()
+            && (compute_recompiler_trace_enabled() || compute_launch_dump_enabled());
+        if sampled_launch_diagnostics || target_dump {
             log::warn!(
                 "KeplerCompute::launch {} gpu={:#x} code={:#x} program_start={:#x} grid=({}, {}, {}) block=({}, {}, {}) tic={:#x}/{} tsc={:#x}/{} tex_cb={}",
                 backend,
@@ -362,6 +365,18 @@ fn compute_dump_program() -> Option<u32> {
     let value = std::env::var("NEXIUM_COMPUTE_DUMP_PROGRAM").ok()?;
     let value = value.trim();
     u32::from_str_radix(value.strip_prefix("0x").unwrap_or(value), 16).ok()
+}
+
+fn compute_recompiler_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_COMPUTE_RECOMPILER_TRACE").is_some())
+}
+
+fn compute_launch_dump_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_COMPUTE_LAUNCH_DUMP").is_some())
 }
 
 fn compute_dump_invocations() -> Option<u64> {
