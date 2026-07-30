@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const BUNDLE_MAGIC: [u8; 8] = *b"NXBUNDL1";
-const BUNDLE_VERSION: u32 = 37;
+const BUNDLE_VERSION: u32 = 40;
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
