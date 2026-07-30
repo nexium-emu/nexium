@@ -252,6 +252,8 @@ pub enum SpirvEmitError {
     UnsupportedCbufAddressMode(CbufAddressMode),
     #[error("graphics shader references cbuf bank {0}, outside Maxwell's 16 stage-local banks")]
     InvalidGraphicsCbufBinding(u8),
+    #[error("graphics shader pair exceeds the 32-location varying interface")]
+    TooManyGraphicsVaryings,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -449,6 +451,87 @@ fn validate_spirv_ir(cfg: &Cfg, stage: Stage) -> Result<(), SpirvEmitError> {
 
 fn slot_is_gl_position(aligned_slot: u32) -> bool {
     matches!(aligned_slot, 0x70 | 0x1c0)
+}
+
+fn generic_varying_location(slot: u32) -> Option<u32> {
+    let aligned_slot = slot & !0xf;
+    (0x80..=0x270)
+        .contains(&aligned_slot)
+        .then(|| (aligned_slot - 0x80) / 16)
+}
+
+fn fixed_varying_index(slot: u32) -> Option<usize> {
+    let aligned_slot = slot & !0xf;
+    match aligned_slot {
+        0x280..=0x2b0 => Some(((aligned_slot - 0x280) / 16) as usize),
+        0x300..=0x390 => Some((4 + (aligned_slot - 0x300) / 16) as usize),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GraphicsVaryingMap {
+    fixed: [Option<u8>; 14],
+}
+
+impl GraphicsVaryingMap {
+    fn location(self, slot: u32) -> Option<u32> {
+        generic_varying_location(slot).or_else(|| {
+            fixed_varying_index(slot)
+                .and_then(|index| self.fixed[index])
+                .map(u32::from)
+        })
+    }
+}
+
+pub fn link_graphics_varyings(
+    vertex: &Cfg,
+    fragment: &Cfg,
+) -> Result<GraphicsVaryingMap, SpirvEmitError> {
+    fn record(slot: u32, generic: &mut u32, fixed: &mut u16) {
+        if let Some(location) = generic_varying_location(slot) {
+            *generic |= 1 << location;
+        } else if let Some(index) = fixed_varying_index(slot) {
+            *fixed |= 1 << index;
+        }
+    }
+
+    let mut generic = 0u32;
+    let mut fixed = 0u16;
+    for block in &vertex.blocks {
+        for instruction in &block.program.instructions {
+            if let IrOp::StoreAttr { slot, .. } = &instruction.op {
+                if !slot_is_gl_position(*slot & !0xf) {
+                    record(*slot, &mut generic, &mut fixed);
+                }
+            }
+        }
+    }
+    for block in &fragment.blocks {
+        for instruction in &block.program.instructions {
+            match &instruction.op {
+                IrOp::LoadAttr { slot } | IrOp::InterpAttr { slot, .. } => {
+                    record(*slot, &mut generic, &mut fixed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut available = !generic;
+    let mut map = GraphicsVaryingMap::default();
+    for index in 0..map.fixed.len() {
+        if fixed & (1 << index) == 0 {
+            continue;
+        }
+        let location = available.trailing_zeros();
+        if location >= 32 {
+            return Err(SpirvEmitError::TooManyGraphicsVaryings);
+        }
+        map.fixed[index] = Some(location as u8);
+        available &= !(1 << location);
+    }
+    Ok(map)
 }
 
 const UBO_VEC4S: u32 = 4096;
@@ -649,6 +732,7 @@ pub struct Emitter {
     texture_numeric_manifest: Vec<GraphicsTextureResource>,
     typed_image_decls: HashMap<(TextureNumericType, GraphicsImageKind), GraphicsImageDecl>,
     vertex_opts: VertexOptions,
+    varying_map: GraphicsVaryingMap,
     const_cache_f32: HashMap<u32, Word>,
     const_cache_u32: HashMap<u32, Word>,
     bool_t: Word,
@@ -1000,6 +1084,7 @@ impl Emitter {
             texture_numeric_manifest: Vec::new(),
             typed_image_decls: HashMap::new(),
             vertex_opts: VertexOptions::default(),
+            varying_map: GraphicsVaryingMap::default(),
             const_cache_f32,
             const_cache_u32,
             bool_t,
@@ -1252,6 +1337,7 @@ impl Emitter {
 
     pub fn new_with_vertex_opts(stage: Stage, vertex_opts: VertexOptions) -> Self {
         let mut e = Self::new_sized(stage, UBO_VEC4S);
+        e.varying_map = vertex_opts.varying_map;
         e.texel_buffer_mask = vertex_opts.texel_buffer_mask;
         e.texture_numeric_manifest =
             normalize_graphics_texture_manifest(vertex_opts.texture_numeric_manifest.clone())
@@ -1268,6 +1354,7 @@ impl Emitter {
         ubo_vec4s: u32,
     ) -> Self {
         let mut e = Self::new_sized(stage, ubo_vec4s);
+        e.varying_map = vertex_opts.varying_map;
         e.setup_ssbos(vertex_opts.num_ssbo);
         e.texel_buffer_mask = vertex_opts.texel_buffer_mask;
         e.texture_numeric_manifest =
@@ -1735,6 +1822,9 @@ impl Emitter {
     }
 
     fn apply_fragment_output_debug_overrides(&mut self, outputs: &mut [(u32, Word)]) {
+        if !self.fragment_debug_active {
+            return;
+        }
         let Some(loc) = std::env::var("NEXIUM_FS_FORCE_OUTPUT_LOC")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -1875,23 +1965,23 @@ impl Emitter {
     }
 
     fn input_var(&mut self, slot: u32) -> AttrVar {
-        if let Some(av) = self.input_vars.get(&slot) {
-            return *av;
-        }
-        let location = if slot >= 0x80 { (slot - 0x80) / 16 } else { 0 };
-        if location >= 32 {
-            let av = AttrVar {
+        let Some(location) = self.varying_map.location(slot) else {
+            return AttrVar {
                 var: 0,
                 ptr_f32: self.ptr_input_f32,
                 is_uint: false,
                 is_sint: false,
             };
-            self.input_vars.insert(slot, av);
-            return av;
+        };
+        if let Some(av) = self.input_vars.get(&location) {
+            return *av;
         }
-        let is_uint = matches!(self.stage, Stage::Vertex)
+        let is_generic = generic_varying_location(slot).is_some();
+        let is_uint = is_generic
+            && matches!(self.stage, Stage::Vertex)
             && (self.vertex_opts.uint_attr_mask >> location) & 1 == 1;
-        let is_sint = matches!(self.stage, Stage::Vertex)
+        let is_sint = is_generic
+            && matches!(self.stage, Stage::Vertex)
             && (self.vertex_opts.sint_attr_mask >> location) & 1 == 1;
         let av = if is_uint {
             let uvec4_t = self.b.type_vector(self.u32_t, 4);
@@ -1925,7 +2015,7 @@ impl Emitter {
                 .variable(self.ptr_input_vec4, None, StorageClass::Input, None);
             self.b
                 .decorate(var, Decoration::Location, [Operand::LiteralBit32(location)]);
-            self.decorate_fs_input_interpolation(var, location);
+            self.decorate_fs_input_interpolation(var, slot);
             AttrVar {
                 var,
                 ptr_f32: self.ptr_input_f32,
@@ -1933,13 +2023,16 @@ impl Emitter {
                 is_sint: false,
             }
         };
-        self.input_vars.insert(slot, av);
+        self.input_vars.insert(location, av);
         self.interface.push(av.var);
         av
     }
 
-    fn decorate_fs_input_interpolation(&mut self, var: Word, location: u32) {
-        if !matches!(self.stage, Stage::Fragment) || location >= 32 {
+    fn decorate_fs_input_interpolation(&mut self, var: Word, slot: u32) {
+        let Some(location) = generic_varying_location(slot) else {
+            return;
+        };
+        if !matches!(self.stage, Stage::Fragment) {
             return;
         }
         let raw = self.ps_input_map[location as usize];
@@ -1976,19 +2069,16 @@ impl Emitter {
     }
 
     fn output_var(&mut self, slot: u32) -> AttrVar {
-        if let Some(av) = self.output_vars.get(&slot) {
-            return *av;
-        }
-        let location = if slot >= 0x80 { (slot - 0x80) / 16 } else { 0 };
-        if location >= 32 {
-            let av = AttrVar {
+        let Some(location) = self.varying_map.location(slot) else {
+            return AttrVar {
                 var: 0,
                 ptr_f32: self.ptr_output_f32,
                 is_uint: false,
                 is_sint: false,
             };
-            self.output_vars.insert(slot, av);
-            return av;
+        };
+        if let Some(av) = self.output_vars.get(&location) {
+            return *av;
         }
         let var = self
             .b
@@ -2001,7 +2091,7 @@ impl Emitter {
             is_uint: false,
             is_sint: false,
         };
-        self.output_vars.insert(slot, av);
+        self.output_vars.insert(location, av);
         self.interface.push(var);
         av
     }
@@ -4465,8 +4555,7 @@ impl Emitter {
                 } else {
                     let av = self.input_var(aligned_slot);
                     let mut val = self.read_attr_component(av, component);
-                    if aligned_slot >= 0x80 {
-                        let loc = (aligned_slot - 0x80) / 16;
+                    if let Some(loc) = generic_varying_location(aligned_slot) {
                         if self.ps_input_component_mode(loc, component) == 2 {
                             let fc = self.frag_coord_var();
                             let idx = self.const_u32(3);
@@ -4480,7 +4569,7 @@ impl Emitter {
                     }
                     val
                 };
-                if *mode == 1 {
+                if *mode == 1 && fixed_varying_index(aligned_slot).is_none() {
                     let p = self.lower_value(perspective);
                     val = self.b.f_mul(self.f32_t, None, val, p).unwrap();
                 }
@@ -7261,11 +7350,13 @@ impl Emitter {
                                     .unwrap();
                             }
                         }
-                        if let Ok(scale) = std::env::var("NEXIUM_FS_COLOR_SCALE")
-                            .ok()
-                            .and_then(|v| v.parse::<f32>().ok())
-                            .ok_or(())
-                        {
+                        if let (true, Ok(scale)) = (
+                            self.fragment_debug_active,
+                            std::env::var("NEXIUM_FS_COLOR_SCALE")
+                                .ok()
+                                .and_then(|v| v.parse::<f32>().ok())
+                                .ok_or(()),
+                        ) {
                             let s = self.const_f32(scale.to_bits());
                             let sv = self
                                 .b
@@ -7275,7 +7366,10 @@ impl Emitter {
                                 *v = self.b.f_mul(self.vec4_t, None, *v, sv).unwrap();
                             }
                         }
-                        if std::env::var("NEXIUM_FS_COLOR_ALPHA_ONE").ok().as_deref() == Some("1") {
+                        if self.fragment_debug_active
+                            && std::env::var("NEXIUM_FS_COLOR_ALPHA_ONE").ok().as_deref()
+                                == Some("1")
+                        {
                             for (_, v) in &mut outputs {
                                 let r =
                                     self.b.composite_extract(self.f32_t, None, *v, [0]).unwrap();
@@ -8180,11 +8274,13 @@ impl Emitter {
                                 .unwrap();
                         }
                     }
-                    if let Ok(scale) = std::env::var("NEXIUM_FS_COLOR_SCALE")
-                        .ok()
-                        .and_then(|v| v.parse::<f32>().ok())
-                        .ok_or(())
-                    {
+                    if let (true, Ok(scale)) = (
+                        self.fragment_debug_active,
+                        std::env::var("NEXIUM_FS_COLOR_SCALE")
+                            .ok()
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .ok_or(()),
+                    ) {
                         let s = self.const_f32(scale.to_bits());
                         let sv = self
                             .b
@@ -8194,7 +8290,9 @@ impl Emitter {
                             *v = self.b.f_mul(self.vec4_t, None, *v, sv).unwrap();
                         }
                     }
-                    if std::env::var("NEXIUM_FS_COLOR_ALPHA_ONE").ok().as_deref() == Some("1") {
+                    if self.fragment_debug_active
+                        && std::env::var("NEXIUM_FS_COLOR_ALPHA_ONE").ok().as_deref() == Some("1")
+                    {
                         for (_, v) in &mut outputs {
                             let r = self.b.composite_extract(self.f32_t, None, *v, [0]).unwrap();
                             let g = self.b.composite_extract(self.f32_t, None, *v, [1]).unwrap();
@@ -8215,7 +8313,7 @@ impl Emitter {
                             *out = value;
                         }
                     }
-                    if std::env::var("NEXIUM_FRAG_2X").is_ok() {
+                    if self.fragment_debug_active && std::env::var("NEXIUM_FRAG_2X").is_ok() {
                         let two = self.const_f32(2.0f32.to_bits());
                         let two_vec = self
                             .b
@@ -9699,6 +9797,7 @@ pub struct VertexOptions {
     pub texture_numeric_manifest: Vec<GraphicsTextureResource>,
     pub texel_buffer_mask: u32,
     pub layer_output_slot: Option<u32>,
+    pub varying_map: GraphicsVaryingMap,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -9708,6 +9807,7 @@ pub struct FragmentOptions {
     pub texture_numeric_manifest: Vec<GraphicsTextureResource>,
     pub texel_buffer_mask: u32,
     pub y_negate: bool,
+    pub varying_map: GraphicsVaryingMap,
 }
 
 impl Default for VertexOptions {
@@ -9726,6 +9826,7 @@ impl Default for VertexOptions {
             texture_numeric_manifest: Vec::new(),
             texel_buffer_mask: 0,
             layer_output_slot: None,
+            varying_map: GraphicsVaryingMap::default(),
         }
     }
 }
@@ -9846,6 +9947,7 @@ pub fn emit_fragment_full_with_options(
 ) -> (Vec<u32>, u32, Vec<u32>, u32, bool) {
     let vec4s = cbuf_vec4s(cfg, 1).max(UBO_VEC4S);
     let mut emitter = Emitter::new_sized(Stage::Fragment, vec4s);
+    emitter.varying_map = options.varying_map;
     emitter.fragment_debug_active = debug_active;
     emitter.texture_numeric_manifest = normalize_graphics_texture_manifest(
         options.texture_numeric_manifest,
@@ -9869,12 +9971,12 @@ pub fn emit_fragment_full_with_options(
     (words, mask, tex_ids, vec4s * 16, sampler_arrayed)
 }
 
-pub fn scan_input_locations(words: &[u32]) -> Vec<u32> {
+fn scan_interface_locations(words: &[u32], storage_class: u32) -> Vec<u32> {
     use std::collections::{HashMap, HashSet};
     if words.len() < 5 || words[0] != 0x07230203 {
         return Vec::new();
     }
-    let mut input_var_ids: HashSet<u32> = HashSet::new();
+    let mut interface_var_ids: HashSet<u32> = HashSet::new();
     let mut id_to_location: HashMap<u32, u32> = HashMap::new();
     let mut i = 5;
     while i < words.len() {
@@ -9897,9 +9999,8 @@ pub fn scan_input_locations(words: &[u32]) -> Vec<u32> {
             59 => {
                 if word_count >= 4 {
                     let result_id = words[i + 2];
-                    let storage_class = words[i + 3];
-                    if storage_class == 1 {
-                        input_var_ids.insert(result_id);
+                    if words[i + 3] == storage_class {
+                        interface_var_ids.insert(result_id);
                     }
                 }
             }
@@ -9907,13 +10008,17 @@ pub fn scan_input_locations(words: &[u32]) -> Vec<u32> {
         }
         i += word_count;
     }
-    let mut locations: Vec<u32> = input_var_ids
+    let mut locations: Vec<u32> = interface_var_ids
         .iter()
         .filter_map(|id| id_to_location.get(id).copied())
         .collect();
     locations.sort_unstable();
     locations.dedup();
     locations
+}
+
+pub fn scan_input_locations(words: &[u32]) -> Vec<u32> {
+    scan_interface_locations(words, 1)
 }
 
 #[cfg(test)]
@@ -14088,6 +14193,227 @@ mod tests {
         let words = emit_vertex(&cfg);
         let locs = scan_input_locations(&words);
         assert_eq!(locs, vec![0]);
+    }
+
+    #[test]
+    fn linked_fixed_varyings_avoid_generic_locations() {
+        let mut vertex_program = nexium_shader::IrProgram::new();
+        vertex_program.emit_void(IrOp::StoreAttr {
+            slot: 0x80,
+            src: IrValue::Zero,
+        });
+        vertex_program.emit_void(IrOp::StoreAttr {
+            slot: 0x280,
+            src: IrValue::Zero,
+        });
+        let vertex = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, vertex_program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+
+        let mut fragment_program = nexium_shader::IrProgram::new();
+        fragment_program.emit(
+            IrOp::InterpAttr {
+                slot: 0xc0,
+                perspective: IrValue::ImmF32(1.0),
+                mode: 0,
+                sat: false,
+            },
+            Some(0),
+        );
+        fragment_program.emit(
+            IrOp::InterpAttr {
+                slot: 0x300,
+                perspective: IrValue::ImmF32(1.0),
+                mode: 0,
+                sat: false,
+            },
+            Some(1),
+        );
+        let fragment = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, fragment_program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+
+        let map = link_graphics_varyings(&vertex, &fragment).expect("linked varying map");
+        let color = map.location(0x280).expect("fixed color location");
+        let texcoord = map.location(0x300).expect("fixed texcoord location");
+        assert!(![0, 4].contains(&color));
+        assert!(![0, 4].contains(&texcoord));
+        assert_ne!(color, texcoord);
+    }
+
+    #[test]
+    fn linked_fixed_varyings_reject_interface_exhaustion() {
+        let vertex = Cfg {
+            blocks: vec![empty_cfg_block(0, BranchKind::Exit)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let mut program = nexium_shader::IrProgram::new();
+        for location in 0..32 {
+            program.emit(
+                IrOp::InterpAttr {
+                    slot: 0x80 + location * 16,
+                    perspective: IrValue::ImmF32(1.0),
+                    mode: 0,
+                    sat: false,
+                },
+                Some(location as u8),
+            );
+        }
+        program.emit(
+            IrOp::InterpAttr {
+                slot: 0x280,
+                perspective: IrValue::ImmF32(1.0),
+                mode: 0,
+                sat: false,
+            },
+            Some(32),
+        );
+        let fragment = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+
+        assert_eq!(
+            link_graphics_varyings(&vertex, &fragment),
+            Err(SpirvEmitError::TooManyGraphicsVaryings)
+        );
+    }
+
+    #[test]
+    fn simpsons_fixed_varyings_link_spirv_interfaces() {
+        let vertex = nexium_shader::build_cfg(&build_test_program(&[
+            0xEFD9_FF80_0907_FF00,
+            0xEFF1_FF80_2807_FF00,
+            0xEFD9_FF80_0A07_FF00,
+            0xEFF1_FF80_3007_FF00,
+            enc_exit(),
+        ]));
+        let fragment = nexium_shader::build_cfg(&build_test_program(&[
+            0xE003_FF87_CFF7_FF00,
+            0x5080_0000_0047_0004,
+            0xE043_FFB0_0047_FF00,
+            0xE0C3_FFA8_0047_FF05,
+            enc_exit(),
+        ]));
+        assert_eq!(vertex.unimplemented, 0);
+        assert_eq!(fragment.unimplemented, 0);
+
+        let varying_map = link_graphics_varyings(&vertex, &fragment).expect("linked varying map");
+        let (fs_words, _, _, _, _) = emit_fragment_full_with_options(
+            &fragment,
+            [0; 32],
+            1,
+            0,
+            false,
+            0,
+            0,
+            FragmentOptions {
+                varying_map,
+                ..FragmentOptions::default()
+            },
+        );
+        let required_outputs = scan_input_locations(&fs_words);
+        let (vs_words, _, _) = emit_vertex_with_bindings_opts(
+            &vertex,
+            &required_outputs,
+            VertexOptions {
+                varying_map,
+                ..VertexOptions::default()
+            },
+        );
+
+        validates_with_naga(&fs_words);
+        validates_with_naga(&vs_words);
+        assert_eq!(required_outputs.len(), 2);
+        assert_eq!(scan_interface_locations(&vs_words, 3), required_outputs);
+    }
+
+    #[test]
+    fn fixed_interpolation_ignores_generic_input_modes() {
+        fn fragment_cfg(slot: u32) -> Cfg {
+            let mut program = nexium_shader::IrProgram::new();
+            program.emit(
+                IrOp::InterpAttr {
+                    slot,
+                    perspective: IrValue::ImmF32(2.0),
+                    mode: 1,
+                    sat: false,
+                },
+                Some(0),
+            );
+            Cfg {
+                blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+                unimplemented: 0,
+                bindless_or_partners: Default::default(),
+            }
+        }
+
+        fn interpolation_state(words: &[u32]) -> (bool, bool) {
+            let module = rspirv::dr::load_words(words).expect("valid SPIR-V");
+            let decorated = module.annotations.iter().any(|instruction| {
+                matches!(
+                    instruction.operands.get(1),
+                    Some(Operand::Decoration(
+                        Decoration::Flat | Decoration::NoPerspective
+                    ))
+                )
+            });
+            let multiplied = module
+                .functions
+                .iter()
+                .flat_map(|function| &function.blocks)
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| instruction.class.opcode == rspirv::spirv::Op::FMul);
+            (decorated, multiplied)
+        }
+
+        let mut vertex_program = nexium_shader::IrProgram::new();
+        vertex_program.emit_void(IrOp::StoreAttr {
+            slot: 0x280,
+            src: IrValue::Zero,
+        });
+        let vertex = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, vertex_program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let fixed_fragment = fragment_cfg(0x280);
+        let varying_map =
+            link_graphics_varyings(&vertex, &fixed_fragment).expect("linked varying map");
+        let (fixed_words, _, _, _, _) = emit_fragment_full_with_options(
+            &fixed_fragment,
+            [0xff; 32],
+            1,
+            0,
+            false,
+            0,
+            0,
+            FragmentOptions {
+                varying_map,
+                ..FragmentOptions::default()
+            },
+        );
+        let (generic_words, _, _, _, _) = emit_fragment_full_with_options(
+            &fragment_cfg(0x80),
+            [0xff; 32],
+            1,
+            0,
+            false,
+            0,
+            0,
+            FragmentOptions::default(),
+        );
+
+        validates_with_naga(&fixed_words);
+        validates_with_naga(&generic_words);
+        assert_eq!(interpolation_state(&fixed_words), (false, false));
+        assert_eq!(interpolation_state(&generic_words), (true, true));
     }
 
     #[test]
