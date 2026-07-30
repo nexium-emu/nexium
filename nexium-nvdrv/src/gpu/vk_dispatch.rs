@@ -2609,6 +2609,8 @@ fn indirect_table_fingerprint(
     vs_tables: &[IndirectTableKey],
     fs_tables: &[IndirectTableKey],
     cbuf_binds: &[[(u64, u32); 16]; 5],
+    vs_cbuf_group: usize,
+    fs_cbuf_group: usize,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> u64 {
@@ -2616,7 +2618,7 @@ fn indirect_table_fingerprint(
         return 0;
     }
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for (stage, tables) in [(0usize, vs_tables), (4usize, fs_tables)] {
+    for (stage, tables) in [(vs_cbuf_group, vs_tables), (fs_cbuf_group, fs_tables)] {
         for table in tables {
             for byte in [stage as u8, table.binding, table.entries] {
                 hash ^= byte as u64;
@@ -3612,18 +3614,18 @@ fn execute_one_inner(
         return Ok(None);
     }
 
-    let program_region = ((maxwell.regs.program_region_va_hi as u64) << 32)
-        | maxwell.regs.program_region_va_lo as u64;
-
-    let vs_prog = &maxwell.regs.shader_programs[1];
-    let gs_prog = &maxwell.regs.shader_programs[4];
-    let fs_prog = &maxwell.regs.shader_programs[5];
+    let program_region = draw.program_region_gpu_va;
+    let cbuf_binds = &draw.cbuf_binds;
+    let vs_prog = &draw.shader_programs[1];
+    let gs_prog = &draw.shader_programs[4];
+    let fs_prog = &draw.shader_programs[5];
+    let vs_cbuf_group = vs_prog.cbuf_group(0);
+    let fs_cbuf_group = fs_prog.cbuf_group(4);
     if shader_map_debug_enabled() {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 8 {
-            let progs = maxwell
-                .regs
+            let progs = draw
                 .shader_programs
                 .iter()
                 .enumerate()
@@ -3636,33 +3638,10 @@ fn execute_one_inner(
     let vs_active = vs_prog.enabled || vs_prog.address_lo != 0;
     let gs_active = gs_prog.enabled || gs_prog.address_lo != 0;
     let fs_active = fs_prog.enabled || fs_prog.address_lo != 0;
-    {
-        use std::sync::OnceLock;
-        static TARGET: OnceLock<Option<u64>> = OnceLock::new();
-        let target = TARGET.get_or_init(|| {
-            std::env::var("NEXIUM_PROGMAP_FS")
-                .ok()
-                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        });
-        if let Some(t) = target {
-            let fs_addr = program_region.wrapping_add(fs_prog.address_lo as u64);
-            if fs_addr == *t || fs_prog.address_lo as u64 == *t {
-                let progs = maxwell
-                    .regs
-                    .shader_programs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| format!("[{}] en={} lo={:#x}", i, p.enabled, p.address_lo))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                log::info!("[progmap-fs] fs={:#x} {}", fs_addr, progs);
-            }
-        }
-    }
     if !vs_active || !fs_active {
         return Err("VS or FS program disabled".to_string());
     }
-    let vsa_prog = &maxwell.regs.shader_programs[0];
+    let vsa_prog = &draw.shader_programs[0];
     let vsa_active = {
         use std::sync::OnceLock;
         static OFF: OnceLock<bool> = OnceLock::new();
@@ -3798,7 +3777,7 @@ fn execute_one_inner(
         .collect::<Vec<_>>();
     let (fragment_uint_output_mask, fragment_sint_output_mask) =
         fragment_output_numeric_masks(&color_rts);
-    let via_header_index = maxwell.regs.sampler_binding == 1;
+    let via_header_index = draw.sampler_binding == 1;
     let color_output_count = (color_rt_formats.len() as u32).clamp(1, 8);
     if shader_map_debug_enabled() {
         use std::collections::HashSet;
@@ -3855,7 +3834,9 @@ fn execute_one_inner(
     let initial_indirect_fingerprint = indirect_table_fingerprint(
         &cached_vs_tables,
         &cached_fs_tables,
-        &maxwell.regs.cbuf_binds,
+        cbuf_binds,
+        vs_cbuf_group,
+        fs_cbuf_group,
         mappings,
         mem_read,
     );
@@ -3879,9 +3860,11 @@ fn execute_one_inner(
             graphics_texture_layout_from_metadata(
                 fs_metadata,
                 vs_metadata,
-                &maxwell.regs.cbuf_binds,
-                maxwell.regs.bindless_texture_const_buffer_slot,
-                maxwell.regs.tex_cb_index,
+                cbuf_binds,
+                vs_cbuf_group,
+                fs_cbuf_group,
+                draw.bindless_texture_const_buffer_slot,
+                draw.tex_cb_index,
                 draw.tic_pool_gpu_va,
                 draw.tic_pool_limit,
                 via_header_index,
@@ -4036,10 +4019,10 @@ fn execute_one_inner(
 
             let mut vs_cfg = nexium_shader::build_cfg_with_cbuf(&vs_sass, |binding, offset| {
                 read_stage_cbuf_u32(
-                    0,
+                    vs_cbuf_group,
                     binding,
                     offset,
-                    &maxwell.regs.cbuf_binds,
+                    cbuf_binds,
                     mappings,
                     mem_read,
                 )
@@ -4052,10 +4035,10 @@ fn execute_one_inner(
             let fs_cfg =
                 nexium_shader::build_fragment_cfg_with_cbuf(&fs_sass, |binding, offset| {
                     read_stage_cbuf_u32(
-                        4,
+                        fs_cbuf_group,
                         binding,
                         offset,
-                        &maxwell.regs.cbuf_binds,
+                        cbuf_binds,
                         mappings,
                         mem_read,
                     )
@@ -4094,9 +4077,11 @@ fn execute_one_inner(
             let resolved_texture_layout = graphics_texture_layout_from_metadata(
                 &fs_texture_numeric_metadata,
                 &vs_texture_numeric_metadata,
-                &maxwell.regs.cbuf_binds,
-                maxwell.regs.bindless_texture_const_buffer_slot,
-                maxwell.regs.tex_cb_index,
+                cbuf_binds,
+                vs_cbuf_group,
+                fs_cbuf_group,
+                draw.bindless_texture_const_buffer_slot,
+                draw.tex_cb_index,
                 draw.tic_pool_gpu_va,
                 draw.tic_pool_limit,
                 via_header_index,
@@ -4148,7 +4133,9 @@ fn execute_one_inner(
                 indirect_table_fingerprint(
                     &vs_tables,
                     &fs_tables,
-                    &maxwell.regs.cbuf_binds,
+                    cbuf_binds,
+                    vs_cbuf_group,
+                    fs_cbuf_group,
                     mappings,
                     mem_read,
                 ),
@@ -4296,6 +4283,16 @@ fn execute_one_inner(
                     Vec::new()
                 };
                 let graphics_cbuf_reads = collect_graphics_cbuf_reads(&vs_cfg, &fs_cfg);
+                let varying_map = match nexium_spirv::link_graphics_varyings(&vs_cfg, &fs_cfg) {
+                    Ok(map) => map,
+                    Err(error) => {
+                        shader_failed_set().lock().unwrap().insert(shader_key);
+                        l2_store.mark_failed(content_key);
+                        return Err(format!(
+                            "graphics varying link failed vs_addr={vs_addr:#x} fs_addr={fs_addr:#x}: {error}"
+                        ));
+                    }
+                };
                 let num_ssbo = (ssbo_descs.len() as u32).min(8);
                 if vs_cfg.unimplemented != 0 || fs_cfg.unimplemented != 0 {
                     log::warn!(
@@ -4362,6 +4359,7 @@ fn execute_one_inner(
                                 ),
                                 texel_buffer_mask: active_texture_layout.fs_texel_buffer_mask,
                                 y_negate: draw.window_origin.lower_left(),
+                                varying_map,
                             },
                         )
                     })) {
@@ -4420,6 +4418,7 @@ fn execute_one_inner(
                                 ),
                                 texel_buffer_mask: active_texture_layout.vs_texel_buffer_mask,
                                 layer_output_slot,
+                                varying_map,
                                 ..Default::default()
                             },
                         )
@@ -4639,7 +4638,7 @@ fn execute_one_inner(
     let mut topology = map_topology(draw.topology)
         .ok_or_else(|| format!("unsupported topology {}", draw.topology))?;
 
-    let (cbuf_addr, cbuf_size) = resolve_cbuf(draw, &maxwell.regs.cbuf_binds);
+    let (cbuf_addr, cbuf_size) = resolve_cbuf(draw, cbuf_binds);
 
     {
         use std::sync::{Mutex, OnceLock};
@@ -4687,7 +4686,7 @@ fn execute_one_inner(
         let k = N.fetch_add(1, Ordering::Relaxed);
         if k % 2000 == 0 {
             let stage = |s: usize| -> String {
-                maxwell.regs.cbuf_binds[s]
+                cbuf_binds[s]
                     .iter()
                     .enumerate()
                     .filter(|(_, (a, sz))| *a != 0 && *sz > 0)
@@ -4714,9 +4713,7 @@ fn execute_one_inner(
         "cbuf_resolve: addr={:#x} size={} cb_binds_nonzero={}",
         cbuf_addr,
         cbuf_size,
-        maxwell
-            .regs
-            .cbuf_binds
+        cbuf_binds
             .iter()
             .flat_map(|stage| stage.iter())
             .filter(|(a, s)| *a != 0 && *s > 0)
@@ -4736,9 +4733,9 @@ fn execute_one_inner(
         if fs_end != 0 {
             remap_texture_ids_for_stage(
                 "fs",
-                &maxwell.regs.cbuf_binds[4],
-                maxwell.regs.bindless_texture_const_buffer_slot,
-                maxwell.regs.tex_cb_index,
+                &cbuf_binds[fs_cbuf_group],
+                draw.bindless_texture_const_buffer_slot,
+                draw.tex_cb_index,
                 &mut fs_tex_ids[..fs_end],
                 &mut fs_sampler_ids[..fs_end],
                 0,
@@ -4759,9 +4756,9 @@ fn execute_one_inner(
             if vs_start < vs_end {
                 remap_texture_ids_for_stage(
                     "vs",
-                    &maxwell.regs.cbuf_binds[0],
-                    maxwell.regs.bindless_texture_const_buffer_slot,
-                    maxwell.regs.tex_cb_index,
+                    &cbuf_binds[vs_cbuf_group],
+                    draw.bindless_texture_const_buffer_slot,
+                    draw.tex_cb_index,
                     &mut fs_tex_ids[vs_start..vs_end],
                     &mut fs_sampler_ids[vs_start..vs_end],
                     vs_start,
@@ -4785,8 +4782,8 @@ fn execute_one_inner(
         &fs_tex_ids,
         &fs_sampler_ids,
         &fs_tex_remap,
-        maxwell.regs.bindless_texture_const_buffer_slot,
-        maxwell.regs.tex_cb_index,
+        draw.bindless_texture_const_buffer_slot,
+        draw.tex_cb_index,
         via_header_index,
         split_vs_stage,
         draw.tic_pool_gpu_va,
@@ -4821,8 +4818,8 @@ fn execute_one_inner(
             shader_fs_tex_ids,
             fs_tex_ids,
             fs_sampler_ids,
-            maxwell.regs.bindless_texture_const_buffer_slot,
-            maxwell.regs.tex_cb_index,
+            draw.bindless_texture_const_buffer_slot,
+            draw.tex_cb_index,
             via_header_index,
             draw.tic_pool_gpu_va,
             draw.tic_pool_limit,
@@ -5003,7 +5000,7 @@ fn execute_one_inner(
         }
     }
 
-    let water_probe = water_no_ztest() && maxwell.regs.blend_enable[0];
+    let water_probe = water_no_ztest() && draw.color_blend.blend_enable[0];
     let (depth_test, depth_write, stencil_test) = effective_depth_states(
         no_depth || water_probe,
         draw.zeta_enable,
@@ -5040,7 +5037,7 @@ fn execute_one_inner(
     }
 
     let (fallback_cbuf_addr, fallback_cbuf_size) = {
-        let (a, s) = resolve_vs_cbuf(&maxwell.regs.cbuf_binds);
+        let (a, s) = resolve_vs_cbuf(cbuf_binds, vs_cbuf_group);
         if a != 0 && vs_cbuf_debug_enabled() {
             (a, s)
         } else {
@@ -5049,9 +5046,11 @@ fn execute_one_inner(
     };
     let _fallback_cbuf_size = fallback_cbuf_size.min(bundle.cbuf_used);
     let cbuf_data = Some(pack_cbuf_data(
-        &maxwell.regs.cbuf_binds,
+        cbuf_binds,
         vs_cbuf_mask,
         fs_cbuf_mask,
+        vs_cbuf_group,
+        fs_cbuf_group,
         mappings,
         mem_read,
     ));
@@ -5065,7 +5064,7 @@ fn execute_one_inner(
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
         static SEEN_OMAP: OnceLock<Mutex<HashSet<(u64, u32, u32)>>> = OnceLock::new();
-        let k = (fs_addr, fs_output_map, maxwell.regs.color_masks[0]);
+        let k = (fs_addr, fs_output_map, draw.color_blend.color_masks[0]);
         if SEEN_OMAP
             .get_or_init(|| Mutex::new(HashSet::new()))
             .lock()
@@ -5084,18 +5083,18 @@ fn execute_one_inner(
         fs_addr,
         vs_cbuf_mask,
         fs_cbuf_mask,
-        &maxwell.regs.cbuf_binds,
+        cbuf_binds,
         (
-            maxwell.regs.blend_enable[0],
-            if maxwell.regs.blend_per_target_enabled {
-                maxwell.regs.blend_pt_src_rgb[0]
+            draw.color_blend.blend_enable[0],
+            if draw.color_blend.blend_per_target_enabled {
+                draw.color_blend.blend_pt_src_rgb[0]
             } else {
-                maxwell.regs.blend_src_rgb
+                draw.color_blend.blend_src_rgb
             },
-            if maxwell.regs.blend_per_target_enabled {
-                maxwell.regs.blend_pt_dst_rgb[0]
+            if draw.color_blend.blend_per_target_enabled {
+                draw.color_blend.blend_pt_dst_rgb[0]
             } else {
-                maxwell.regs.blend_dst_rgb
+                draw.color_blend.blend_dst_rgb
             },
         ),
         mappings,
@@ -5113,7 +5112,7 @@ fn execute_one_inner(
         &fs_input_map,
         vs_cbuf_mask,
         fs_cbuf_mask,
-        &maxwell.regs.cbuf_binds,
+        cbuf_binds,
         mappings,
         mem_read,
         &fs_tex_ids,
@@ -5124,7 +5123,31 @@ fn execute_one_inner(
     let mut primitive_restart_enabled = false;
     let mut primitive_restart_index = 0;
     let (out_index_data, out_index_count, out_index_type, eff_vertex_count) =
-        if draw.indexed && draw.index_count > 0 && draw.index_gpu_va != 0 {
+        if !draw.inline_indices.is_empty() {
+            let mut raw = Vec::with_capacity(draw.inline_indices.len() * 4);
+            for &index in &draw.inline_indices {
+                raw.extend_from_slice(&index.to_le_bytes());
+            }
+            let prepared = prepare_index_data(
+                raw,
+                2,
+                draw.topology,
+                topology,
+                draw.primitive_restart_enabled,
+                draw.primitive_restart_index,
+            );
+            topology = prepared.topology;
+            primitive_restart_enabled = prepared.primitive_restart_enabled;
+            primitive_restart_index = prepared.primitive_restart_index;
+            (
+                Some(prepared.data),
+                Some(prepared.count),
+                prepared.index_type,
+                prepared
+                    .max_index
+                    .map_or(0, |index| index.saturating_add(1)),
+            )
+        } else if draw.indexed && draw.index_count > 0 && draw.index_gpu_va != 0 {
             let isz: usize = match draw.index_format {
                 0 => 1,
                 2 => 4,
@@ -5172,40 +5195,41 @@ fn execute_one_inner(
             blend_raw_src_alpha,
             blend_raw_dst_alpha,
             blend_raw_eq_alpha,
-        ) = if maxwell.regs.blend_per_target_enabled {
+        ) = if draw.color_blend.blend_per_target_enabled {
             (
-                maxwell.regs.blend_pt_src_rgb[rt],
-                maxwell.regs.blend_pt_dst_rgb[rt],
-                maxwell.regs.blend_pt_eq_rgb[rt],
-                maxwell.regs.blend_pt_src_alpha[rt],
-                maxwell.regs.blend_pt_dst_alpha[rt],
-                maxwell.regs.blend_pt_eq_alpha[rt],
+                draw.color_blend.blend_pt_src_rgb[rt],
+                draw.color_blend.blend_pt_dst_rgb[rt],
+                draw.color_blend.blend_pt_eq_rgb[rt],
+                draw.color_blend.blend_pt_src_alpha[rt],
+                draw.color_blend.blend_pt_dst_alpha[rt],
+                draw.color_blend.blend_pt_eq_alpha[rt],
             )
         } else {
             (
-                maxwell.regs.blend_src_rgb,
-                maxwell.regs.blend_dst_rgb,
-                maxwell.regs.blend_eq_rgb,
-                maxwell.regs.blend_src_alpha,
-                maxwell.regs.blend_dst_alpha,
-                maxwell.regs.blend_eq_alpha,
+                draw.color_blend.blend_src_rgb,
+                draw.color_blend.blend_dst_rgb,
+                draw.color_blend.blend_eq_rgb,
+                draw.color_blend.blend_src_alpha,
+                draw.color_blend.blend_dst_alpha,
+                draw.color_blend.blend_eq_alpha,
             )
         };
-        let mask_rt = if maxwell.regs.color_mask_common {
+        let mask_rt = if draw.color_blend.color_mask_common {
             0
         } else {
             rt
         };
         let shader_mask = map_output_component_mask(fragment_output_mask(fs_output_map, rt as u32));
         BlendAttachmentState {
-            enabled: maxwell.regs.blend_enable[rt] && !blend_forced_off(),
+            enabled: draw.color_blend.blend_enable[rt] && !blend_forced_off(),
             src_factor: map_blend_factor(blend_raw_src),
             dst_factor: map_blend_factor(blend_raw_dst),
             op: map_blend_op(blend_raw_eq),
             src_alpha_factor: map_blend_factor(blend_raw_src_alpha),
             dst_alpha_factor: map_blend_factor(blend_raw_dst_alpha),
             alpha_op: map_blend_op(blend_raw_eq_alpha),
-            color_write_mask: map_color_write_mask(maxwell.regs.color_masks[mask_rt]) & shader_mask,
+            color_write_mask: map_color_write_mask(draw.color_blend.color_masks[mask_rt])
+                & shader_mask,
         }
     });
     let compact_attachments: [BlendAttachmentState; 8] = std::array::from_fn(|index| {
@@ -5253,7 +5277,7 @@ fn execute_one_inner(
         vs_cbuf_mask,
         fs_cbuf_mask,
         cbuf_data.as_deref(),
-        &maxwell.regs.cbuf_binds,
+        cbuf_binds,
     );
 
     trace_draw(
@@ -5277,7 +5301,7 @@ fn execute_one_inner(
         depth_write,
         (
             blend_state.enabled,
-            maxwell.regs.blend_per_target_enabled,
+            draw.color_blend.blend_per_target_enabled,
             attachments[0].src_factor.as_raw() as u32,
             attachments[0].dst_factor.as_raw() as u32,
             attachments[0].op.as_raw() as u32,
@@ -5287,11 +5311,11 @@ fn execute_one_inner(
         ),
         &blend_state,
         fs_output_map,
-        &maxwell.regs.color_masks,
-        maxwell.regs.color_mask_common,
+        &draw.color_blend.color_masks,
+        draw.color_blend.color_mask_common,
         vs_cbuf_mask,
         fs_cbuf_mask,
-        &maxwell.regs.cbuf_binds,
+        cbuf_binds,
         cbuf_data.as_deref(),
         &bundle.graphics_cbuf_reads,
     );
@@ -5303,7 +5327,7 @@ fn execute_one_inner(
         fs_addr,
         vs_cbuf_mask,
         fs_cbuf_mask,
-        &maxwell.regs.cbuf_binds,
+        cbuf_binds,
         cbuf_data.as_deref(),
         &fs_tex_ids,
         &sampled_rt_slots,
@@ -5354,7 +5378,7 @@ fn execute_one_inner(
         let mut guest_addr = 0u64;
         let mut logical_size = 16usize;
         let mut data_offset = 0usize;
-        let (cb_va, _cb_sz) = maxwell.regs.cbuf_binds[0][(d.cbuf_binding as usize).min(15)];
+        let (cb_va, _cb_sz) = cbuf_binds[vs_cbuf_group][(d.cbuf_binding as usize).min(15)];
         let mut dbg_base: u64 = 0;
         let mut dbg_slack: usize = 0;
         let mut dbg_size: u32 = 0;
@@ -5827,7 +5851,7 @@ fn active_color_rts(
 fn draw_rt_binding_signature(
     draw: &DrawCall,
     mappings: &GpuMappings,
-    maxwell: &Maxwell3D,
+    _maxwell: &Maxwell3D,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Result<RtBindingSignature, String> {
     let rt_slot = draw_color_rt_slot(draw);
@@ -5848,9 +5872,8 @@ fn draw_rt_binding_signature(
         mappings.cpu_address_for(rt_gpu_va).unwrap_or(0),
     )
     .with_volume_depth(render_target_volume_depth(rt));
-    let program_region = ((maxwell.regs.program_region_va_hi as u64) << 32)
-        | maxwell.regs.program_region_va_lo as u64;
-    let fs_prog = &maxwell.regs.shader_programs[5];
+    let program_region = draw.program_region_gpu_va;
+    let fs_prog = &draw.shader_programs[5];
     let fs_addr = program_region.wrapping_add(fs_prog.address_lo as u64);
     let fs_output_map = fetch_sph(fs_addr, mappings, mem_read)
         .map(ps_output_map)
@@ -5860,7 +5883,7 @@ fn draw_rt_binding_signature(
     let color_rt_keys = color_rts.iter().map(|(_, key, _)| *key).collect();
     let color_rt_formats = color_rts.iter().map(|(_, _, format)| *format).collect();
 
-    let water_probe = water_no_ztest() && maxwell.regs.blend_enable[0];
+    let water_probe = water_no_ztest() && draw.color_blend.blend_enable[0];
     let (depth_test, _, stencil_test) = effective_depth_states(
         depth_disabled() || water_probe,
         draw.zeta_enable,
@@ -8983,6 +9006,8 @@ fn graphics_texture_layout_from_metadata(
     fs_metadata: &FragmentTextureNumericMetadata,
     vs_metadata: &FragmentTextureNumericMetadata,
     cbuf_binds: &[[(u64, u32); 16]; 5],
+    vs_cbuf_group: usize,
+    fs_cbuf_group: usize,
     bindless_slot: u32,
     tex_cb_slot: u32,
     tic_pool_gpu_va: u64,
@@ -9006,7 +9031,7 @@ fn graphics_texture_layout_from_metadata(
         "fs",
         fs_metadata,
         0,
-        &cbuf_binds[4],
+        &cbuf_binds[fs_cbuf_group],
         bindless_slot,
         tex_cb_slot,
         tic_pool_gpu_va,
@@ -9020,7 +9045,7 @@ fn graphics_texture_layout_from_metadata(
         "vs",
         vs_metadata,
         vs_tex_base,
-        &cbuf_binds[0],
+        &cbuf_binds[vs_cbuf_group],
         bindless_slot,
         tex_cb_slot,
         tic_pool_gpu_va,
@@ -10561,6 +10586,8 @@ fn pack_cbuf_data(
     cbuf_binds: &[[(u64, u32); 16]; 5],
     vs_mask: u32,
     fs_mask: u32,
+    vs_cbuf_group: usize,
+    fs_cbuf_group: usize,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Vec<u8> {
@@ -10608,23 +10635,17 @@ fn pack_cbuf_data(
         }
         guard.clear();
     }
-    let prefer_vertex_b = {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var_os("NEXIUM_CBUF_VS_STAGE1").is_some())
-    };
     for logical_slot in 0..PACKED_CBUF_SLOTS {
         if (used & (1u32 << logical_slot)) == 0 {
             continue;
         }
-        let stage = if logical_slot < 16 { 0 } else { 4 };
-        let binding = logical_slot & 15;
-        let (addr, size) = if prefer_vertex_b && logical_slot < 16 && cbuf_binds[1][binding].0 != 0
-        {
-            cbuf_binds[1][binding]
+        let stage = if logical_slot < 16 {
+            vs_cbuf_group
         } else {
-            cbuf_binds[stage][binding]
+            fs_cbuf_group
         };
+        let binding = logical_slot & 15;
+        let (addr, size) = cbuf_binds[stage][binding];
         if addr == 0 || size == 0 {
             continue;
         }
@@ -10735,8 +10756,8 @@ fn resolve_cbuf(draw: &DrawCall, cbuf_binds: &[[(u64, u32); 16]; 5]) -> (u64, u3
     (0, 0)
 }
 
-fn resolve_vs_cbuf(cbuf_binds: &[[(u64, u32); 16]; 5]) -> (u64, u32) {
-    for &(addr, size) in cbuf_binds[0].iter().rev() {
+fn resolve_vs_cbuf(cbuf_binds: &[[(u64, u32); 16]; 5], vs_cbuf_group: usize) -> (u64, u32) {
+    for &(addr, size) in cbuf_binds[vs_cbuf_group].iter().rev() {
         if addr != 0 && size > 0 {
             return (addr, size);
         }
@@ -11774,7 +11795,7 @@ mod tests {
         binds[0][6] = (0x1000, 0x1_0000);
         binds[4][6] = (0x20_000, 0x1_0000);
         binds[0][7] = (0x40_000, 0x24);
-        let packed = pack_cbuf_data(&binds, (1 << 6) | (1 << 7), 1 << 22, &mappings, &read);
+        let packed = pack_cbuf_data(&binds, (1 << 6) | (1 << 7), 1 << 22, 0, 4, &mappings, &read);
 
         assert_eq!(packed_cbuf_slot(&packed, 6).unwrap().len(), 0x1_0000);
         assert_eq!(packed_cbuf_slot(&packed, 22).unwrap().len(), 0x1_0000);
@@ -11816,12 +11837,37 @@ mod tests {
 
         let mut binds = [[(0u64, 0u32); 16]; 5];
         binds[0][8] = (0x5000, 0x24);
-        let packed = pack_cbuf_data(&binds, 1 << 8, 0, &mappings, &read);
+        let packed = pack_cbuf_data(&binds, 1 << 8, 0, 0, 4, &mappings, &read);
         let slot = packed_cbuf_slot(&packed, 8).expect("packed VS cbuf 8");
 
         assert_eq!(slot.len(), 0x24);
         assert_eq!(&slot[..0x10], source.as_slice());
         assert_eq!(&slot[0x10..], &[0u8; 0x14]);
+    }
+
+    #[test]
+    fn graphics_cbuf_packer_uses_program_binding_groups() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x1000, 4, 0x3000, 1);
+        mappings.add(0x2000, 4, 0x4000, 2);
+        let read = |cpu: u64, dst: &mut [u8]| match cpu {
+            0x3000 => {
+                dst.copy_from_slice(&0x1111_1111u32.to_le_bytes());
+                true
+            }
+            0x4000 => {
+                dst.copy_from_slice(&0x2222_2222u32.to_le_bytes());
+                true
+            }
+            _ => false,
+        };
+        let mut binds = [[(0u64, 0u32); 16]; 5];
+        binds[0][0] = (0x1000, 4);
+        binds[1][0] = (0x2000, 4);
+
+        let packed = pack_cbuf_data(&binds, 1, 0, 1, 4, &mappings, &read);
+
+        assert_eq!(packed_cbuf_word(&packed, 0, 0), Some(0x2222_2222));
     }
 
     fn cfg_with_unimplemented(opcode: nexium_shader::Opcode) -> nexium_shader::Cfg {
@@ -12455,6 +12501,8 @@ mod tests {
             &vs_metadata,
             &[[(0, 0); 16]; 5],
             0,
+            4,
+            0,
             0,
             0,
             0,
@@ -12625,6 +12673,8 @@ mod tests {
             &vs_metadata,
             &cbuf_binds,
             0,
+            4,
+            0,
             0,
             0x1000,
             1,
@@ -12713,6 +12763,8 @@ mod tests {
             &FragmentTextureNumericMetadata::default(),
             &cbuf_binds,
             0,
+            4,
+            0,
             2,
             0x1000,
             0,
@@ -12761,6 +12813,8 @@ mod tests {
             &FragmentTextureNumericMetadata::default(),
             &[[(0, 0); 16]; 5],
             0,
+            4,
+            0,
             0,
             0x1000,
             0,
@@ -12794,6 +12848,8 @@ mod tests {
             &fs_metadata,
             &vs_metadata,
             &[[(0, 0); 16]; 5],
+            0,
+            4,
             0,
             0,
             0,

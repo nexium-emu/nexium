@@ -212,12 +212,64 @@ pub struct VertexBuffer {
     pub end_hi: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ColorBlendState {
+    pub blend_enable: [bool; 8],
+    pub blend_eq_rgb: u32,
+    pub blend_src_rgb: u32,
+    pub blend_dst_rgb: u32,
+    pub blend_eq_alpha: u32,
+    pub blend_src_alpha: u32,
+    pub blend_dst_alpha: u32,
+    pub blend_per_target_enabled: bool,
+    pub blend_pt_eq_rgb: [u32; 8],
+    pub blend_pt_src_rgb: [u32; 8],
+    pub blend_pt_dst_rgb: [u32; 8],
+    pub blend_pt_eq_alpha: [u32; 8],
+    pub blend_pt_src_alpha: [u32; 8],
+    pub blend_pt_dst_alpha: [u32; 8],
+    pub color_mask_common: bool,
+    pub color_masks: [u32; 8],
+}
+
+impl Default for ColorBlendState {
+    fn default() -> Self {
+        Self {
+            blend_enable: [false; 8],
+            blend_eq_rgb: 0x8006,
+            blend_src_rgb: 0x4001,
+            blend_dst_rgb: 0x4000,
+            blend_eq_alpha: 0x8006,
+            blend_src_alpha: 0x4001,
+            blend_dst_alpha: 0x4000,
+            blend_per_target_enabled: false,
+            blend_pt_eq_rgb: [0x8006; 8],
+            blend_pt_src_rgb: [0x4001; 8],
+            blend_pt_dst_rgb: [0x4000; 8],
+            blend_pt_eq_alpha: [0x8006; 8],
+            blend_pt_src_alpha: [0x4001; 8],
+            blend_pt_dst_alpha: [0x4000; 8],
+            color_mask_common: false,
+            color_masks: [0x1111; 8],
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct ShaderProgram {
     pub address_lo: u32,
     pub address_hi: u32,
     pub gpr_count: u32,
+    pub binding_group: Option<u32>,
     pub enabled: bool,
+}
+
+impl ShaderProgram {
+    pub fn cbuf_group(self, fallback: usize) -> usize {
+        self.binding_group
+            .and_then(|group| (group < 5).then_some(group as usize))
+            .unwrap_or(fallback)
+    }
 }
 
 #[derive(Clone)]
@@ -463,6 +515,29 @@ impl Default for Maxwell3DRegisters {
     }
 }
 
+impl Maxwell3DRegisters {
+    fn color_blend_state(&self) -> ColorBlendState {
+        ColorBlendState {
+            blend_enable: self.blend_enable,
+            blend_eq_rgb: self.blend_eq_rgb,
+            blend_src_rgb: self.blend_src_rgb,
+            blend_dst_rgb: self.blend_dst_rgb,
+            blend_eq_alpha: self.blend_eq_alpha,
+            blend_src_alpha: self.blend_src_alpha,
+            blend_dst_alpha: self.blend_dst_alpha,
+            blend_per_target_enabled: self.blend_per_target_enabled,
+            blend_pt_eq_rgb: self.blend_pt_eq_rgb,
+            blend_pt_src_rgb: self.blend_pt_src_rgb,
+            blend_pt_dst_rgb: self.blend_pt_dst_rgb,
+            blend_pt_eq_alpha: self.blend_pt_eq_alpha,
+            blend_pt_src_alpha: self.blend_pt_src_alpha,
+            blend_pt_dst_alpha: self.blend_pt_dst_alpha,
+            color_mask_common: self.color_mask_common,
+            color_masks: self.color_masks,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DrawCall {
     pub topology: u32,
@@ -475,6 +550,7 @@ pub struct DrawCall {
     pub index_gpu_va: u64,
     pub index_format: u32,
     pub index_first: u32,
+    pub inline_indices: Vec<u32>,
     pub primitive_restart_enabled: bool,
     pub primitive_restart_index: u32,
     pub point_size: f32,
@@ -493,6 +569,7 @@ pub struct DrawCall {
     pub scissor: ScissorTest,
     pub clear_control: u32,
     pub clear_color: ClearColor,
+    pub color_blend: ColorBlendState,
     pub is_clear: bool,
 
     pub draw_texture: Option<DrawTextureCall>,
@@ -501,6 +578,14 @@ pub struct DrawCall {
     pub tic_pool_limit: u32,
     pub tsc_pool_gpu_va: u64,
     pub tsc_pool_limit: u32,
+
+    pub shader_programs: [ShaderProgram; 6],
+    pub program_region_gpu_va: u64,
+    pub cbuf_binds: [[(u64, u32); 16]; 5],
+    pub sampler_binding: u32,
+    pub bindless_texture_const_buffer_slot: u32,
+    pub tex_cb_index: u32,
+    pub constbuf_write_count: usize,
 
     pub last_constbuf_addr: u64,
     pub last_constbuf_size: u32,
@@ -568,6 +653,9 @@ pub struct Maxwell3D {
 
     inline_upload: KeplerMemory,
     pending_inline_upload_methods: Vec<(u32, u32)>,
+    inline_indices: Vec<u32>,
+    inline_u8_setup: Option<(usize, usize)>,
+    inline_u16_setup: Option<(usize, usize)>,
 
     pub macro_uploads_logged: u32,
     pub macro_invocations: u32,
@@ -578,6 +666,8 @@ pub struct Maxwell3D {
     mme_entry: u32,
     legacy_draw_instance_id: u32,
     legacy_draw_begin_pending: bool,
+    legacy_draw_vertex_pending: bool,
+    legacy_draw_index_pending: bool,
     draw_state_dirty_since_last_draw: bool,
     last_draw_allows_continuation: bool,
 }
@@ -666,6 +756,9 @@ impl Maxwell3D {
             pending_draws: Vec::new(),
             inline_upload: KeplerMemory::new(),
             pending_inline_upload_methods: Vec::new(),
+            inline_indices: Vec::new(),
+            inline_u8_setup: None,
+            inline_u16_setup: None,
             macro_uploads_logged: 0,
             macro_invocations: 0,
             macro_writes_logged: 0,
@@ -675,6 +768,8 @@ impl Maxwell3D {
             mme_entry: 0,
             legacy_draw_instance_id: 0,
             legacy_draw_begin_pending: false,
+            legacy_draw_vertex_pending: false,
+            legacy_draw_index_pending: false,
             draw_state_dirty_since_last_draw: true,
             last_draw_allows_continuation: false,
         }
@@ -827,7 +922,10 @@ impl Maxwell3D {
             }
         };
 
-        if !matches!(method, 0x35D | 0x35E | 0x585 | 0x586 | 0x5F7 | 0x5F8) {
+        if !matches!(
+            method,
+            0x35D | 0x35E | 0x4C0 | 0x4C1 | 0x57A | 0x57B | 0x57C | 0x585 | 0x586 | 0x5F7 | 0x5F8
+        ) {
             self.draw_state_dirty_since_last_draw = true;
         }
 
@@ -1068,6 +1166,7 @@ impl Maxwell3D {
                     index_gpu_va: 0,
                     index_format: 0,
                     index_first: 0,
+                    inline_indices: Vec::new(),
                     primitive_restart_enabled: self.regs.primitive_restart_enabled,
                     primitive_restart_index: self.regs.primitive_restart_index,
                     point_size: 1.0,
@@ -1085,6 +1184,7 @@ impl Maxwell3D {
                     scissor: self.regs.scissor,
                     clear_control: self.regs.clear_control,
                     clear_color: self.regs.clear_color,
+                    color_blend: self.regs.color_blend_state(),
                     is_clear: true,
                     draw_texture: None,
                     tic_pool_gpu_va: ((self.regs.tic_pool_va_hi as u64) << 32)
@@ -1093,10 +1193,24 @@ impl Maxwell3D {
                     tsc_pool_gpu_va: ((self.regs.tsc_pool_va_hi as u64) << 32)
                         | self.regs.tsc_pool_va_lo as u64,
                     tsc_pool_limit: self.regs.tsc_pool_limit,
+                    shader_programs: self.regs.shader_programs,
+                    program_region_gpu_va: ((self.regs.program_region_va_hi as u64) << 32)
+                        | self.regs.program_region_va_lo as u64,
+                    cbuf_binds: self.regs.cbuf_binds,
+                    sampler_binding: self.regs.sampler_binding,
+                    bindless_texture_const_buffer_slot: self
+                        .regs
+                        .bindless_texture_const_buffer_slot,
+                    tex_cb_index: self.regs.tex_cb_index,
+                    constbuf_write_count: self.regs.pending_constbuf_writes.len(),
                     last_constbuf_addr: self.regs.last_constbuf_addr,
                     last_constbuf_size: self.regs.last_constbuf_size,
-                    fs_bindless_cb_addr: self.regs.cbuf_binds[4][15].0,
-                    fs_bindless_cb_size: self.regs.cbuf_binds[4][15].1,
+                    fs_bindless_cb_addr: self.regs.cbuf_binds
+                        [self.regs.shader_programs[5].cbuf_group(4)][15]
+                        .0,
+                    fs_bindless_cb_size: self.regs.cbuf_binds
+                        [self.regs.shader_programs[5].cbuf_group(4)][15]
+                        .1,
                     fs_shader_gpu_va: {
                         let fs = &self.regs.shader_programs[5];
                         let region = ((self.regs.program_region_va_hi as u64) << 32)
@@ -1195,18 +1309,23 @@ impl Maxwell3D {
             0x35E => {
                 self.regs.draw_vertex_count = arg;
                 if arg > 0 {
-                    self.regs.draw_count += 1;
-                    let legacy_instance_id = self.take_legacy_draw_instance_id();
-                    self.push_draw(
-                        self.regs.draw_topology,
-                        self.regs.draw_first_vertex,
-                        arg,
-                        false,
-                        0,
-                        1,
-                        self.regs.global_base_instance_index,
-                        legacy_instance_id,
-                    );
+                    if self.legacy_draw_begin_pending && !self.mme_active {
+                        self.legacy_draw_vertex_pending = true;
+                    } else {
+                        self.regs.draw_count += 1;
+                        let legacy_instance_id = self.take_legacy_draw_instance_id();
+                        self.push_draw(
+                            self.regs.draw_topology,
+                            self.regs.draw_first_vertex,
+                            arg,
+                            false,
+                            0,
+                            1,
+                            self.regs.global_base_instance_index,
+                            legacy_instance_id,
+                            Vec::new(),
+                        );
+                    }
                 }
             }
             0x35F => self.regs.depth_mode = arg & 1,
@@ -1228,15 +1347,92 @@ impl Maxwell3D {
                     topology,
                     first_instance
                 );
-                self.push_draw(topology, first, count, false, 0, 1, first_instance, None);
+                self.push_draw(
+                    topology,
+                    first,
+                    count,
+                    false,
+                    0,
+                    1,
+                    first_instance,
+                    None,
+                    Vec::new(),
+                );
             }
 
             0x586 => {
                 self.regs.draw_topology = arg & 0xFFFF;
                 self.legacy_draw_instance_id = (arg >> 26) & 0x3;
                 self.legacy_draw_begin_pending = true;
+                self.legacy_draw_vertex_pending = false;
+                self.legacy_draw_index_pending = false;
+                self.inline_indices.clear();
+                self.inline_u8_setup = None;
+                self.inline_u16_setup = None;
             }
-            0x585 => {}
+            0x585 => {
+                let inline_indices = std::mem::take(&mut self.inline_indices);
+                let inline_index_count = inline_indices.len().min(u32::MAX as usize) as u32;
+                let draw = if inline_index_count > 0 {
+                    Some((
+                        self.regs.global_base_vertex_index,
+                        0,
+                        true,
+                        inline_index_count,
+                        inline_indices,
+                    ))
+                } else if self.legacy_draw_index_pending && self.regs.index_count > 0 {
+                    Some((
+                        self.regs.global_base_vertex_index,
+                        0,
+                        true,
+                        self.regs.index_count,
+                        Vec::new(),
+                    ))
+                } else if self.legacy_draw_vertex_pending && self.regs.draw_vertex_count > 0 {
+                    Some((
+                        self.regs.draw_first_vertex,
+                        self.regs.draw_vertex_count,
+                        false,
+                        0,
+                        Vec::new(),
+                    ))
+                } else {
+                    None
+                };
+                if let Some((first, count, indexed, index_count, inline_indices)) = draw {
+                    self.regs.draw_count += 1;
+                    let legacy_instance_id = self.take_legacy_draw_instance_id();
+                    self.push_draw(
+                        self.regs.draw_topology,
+                        first,
+                        count,
+                        indexed,
+                        index_count,
+                        1,
+                        self.regs.global_base_instance_index,
+                        legacy_instance_id,
+                        inline_indices,
+                    );
+                } else {
+                    self.legacy_draw_begin_pending = false;
+                }
+                self.legacy_draw_vertex_pending = false;
+                self.legacy_draw_index_pending = false;
+                self.inline_u8_setup = None;
+                self.inline_u16_setup = None;
+            }
+            0x4C0 => {
+                let count = (arg & 0x3FFF_FFFF) as usize;
+                self.inline_u8_setup = (count != 0).then_some((((arg >> 30) & 3) as usize, count));
+            }
+            0x4C1 => self.push_packed_inline_indices(arg, 8),
+            0x57A => self.inline_indices.push(arg),
+            0x57B => {
+                let count = (arg & 0x7FFF_FFFF) as usize;
+                self.inline_u16_setup = (count != 0).then_some((((arg >> 31) & 1) as usize, count));
+            }
+            0x57C => self.push_packed_inline_indices(arg, 16),
             0x591 => self.regs.primitive_restart_enabled = (arg & 1) != 0,
             0x592 => self.regs.primitive_restart_index = arg,
             0x5F2 => self.regs.index_buffer_hi = arg,
@@ -1246,24 +1442,31 @@ impl Maxwell3D {
             0x5F6 => self.regs.index_format = arg,
             0x5F7 => self.regs.index_first = arg,
             0x5F8 => {
-                self.regs.draw_count += 1;
                 self.regs.index_count = arg;
                 log::trace!(
                     "maxwell3d: DrawElementsCount count={} topology={}",
                     arg,
                     self.regs.draw_topology
                 );
-                let legacy_instance_id = self.take_legacy_draw_instance_id();
-                self.push_draw(
-                    self.regs.draw_topology,
-                    self.regs.global_base_vertex_index,
-                    0,
-                    true,
-                    arg,
-                    1,
-                    self.regs.global_base_instance_index,
-                    legacy_instance_id,
-                );
+                if arg > 0 {
+                    if self.legacy_draw_begin_pending && !self.mme_active {
+                        self.legacy_draw_index_pending = true;
+                    } else {
+                        self.regs.draw_count += 1;
+                        let legacy_instance_id = self.take_legacy_draw_instance_id();
+                        self.push_draw(
+                            self.regs.draw_topology,
+                            self.regs.global_base_vertex_index,
+                            0,
+                            true,
+                            arg,
+                            1,
+                            self.regs.global_base_instance_index,
+                            legacy_instance_id,
+                            Vec::new(),
+                        );
+                    }
+                }
             }
 
             0x557 => {
@@ -1531,6 +1734,7 @@ impl Maxwell3D {
 
                         1 => sp.address_lo = arg,
                         3 => sp.gpr_count = arg,
+                        4 => sp.binding_group = Some(arg & 0x7),
                         _ => {}
                     }
                 }
@@ -1551,6 +1755,7 @@ impl Maxwell3D {
         instance_count: u32,
         first_instance: u32,
         legacy_instance_id: Option<u32>,
+        inline_indices: Vec<u32>,
     ) {
         let instance_count = self
             .macro_draw_instance_count
@@ -1579,7 +1784,8 @@ impl Maxwell3D {
                     && previous.index_count == index_count
                     && previous.index_gpu_va == index_gpu_va
                     && previous.index_format == self.regs.index_format
-                    && previous.index_first == self.regs.index_first;
+                    && previous.index_first == self.regs.index_first
+                    && previous.inline_indices == inline_indices;
                 if same_draw {
                     previous.instance_count =
                         previous.instance_count.saturating_add(instance_count);
@@ -1592,8 +1798,8 @@ impl Maxwell3D {
             ((self.regs.tic_pool_va_hi as u64) << 32) | self.regs.tic_pool_va_lo as u64;
         let tsc_pool_gpu_va =
             ((self.regs.tsc_pool_va_hi as u64) << 32) | self.regs.tsc_pool_va_lo as u64;
-        let (fs_bindless_cb_addr, fs_bindless_cb_size) = self.regs.cbuf_binds[4][15];
         let fs = &self.regs.shader_programs[5];
+        let (fs_bindless_cb_addr, fs_bindless_cb_size) = self.regs.cbuf_binds[fs.cbuf_group(4)][15];
 
         let program_region =
             ((self.regs.program_region_va_hi as u64) << 32) | self.regs.program_region_va_lo as u64;
@@ -1615,6 +1821,7 @@ impl Maxwell3D {
             index_gpu_va,
             index_format: self.regs.index_format,
             index_first: self.regs.index_first,
+            inline_indices,
             primitive_restart_enabled: self.regs.primitive_restart_enabled,
             primitive_restart_index: self.regs.primitive_restart_index,
             point_size,
@@ -1632,12 +1839,20 @@ impl Maxwell3D {
             scissor: self.regs.scissor,
             clear_control: self.regs.clear_control,
             clear_color: self.regs.clear_color,
+            color_blend: self.regs.color_blend_state(),
             is_clear: false,
             draw_texture: None,
             tic_pool_gpu_va,
             tic_pool_limit: self.regs.tic_pool_limit,
             tsc_pool_gpu_va,
             tsc_pool_limit: self.regs.tsc_pool_limit,
+            shader_programs: self.regs.shader_programs,
+            program_region_gpu_va: program_region,
+            cbuf_binds: self.regs.cbuf_binds,
+            sampler_binding: self.regs.sampler_binding,
+            bindless_texture_const_buffer_slot: self.regs.bindless_texture_const_buffer_slot,
+            tex_cb_index: self.regs.tex_cb_index,
+            constbuf_write_count: self.regs.pending_constbuf_writes.len(),
             last_constbuf_addr: self.regs.last_constbuf_addr,
             last_constbuf_size: self.regs.last_constbuf_size,
             fs_bindless_cb_addr,
@@ -1677,6 +1892,31 @@ impl Maxwell3D {
             return None;
         }
         Some(self.legacy_draw_instance_id)
+    }
+
+    fn push_packed_inline_indices(&mut self, arg: u32, bits: u32) {
+        let slots = (32 / bits) as usize;
+        let mask = (1u32 << bits) - 1;
+        let setup = if bits == 8 {
+            &mut self.inline_u8_setup
+        } else {
+            &mut self.inline_u16_setup
+        };
+        let constrained = setup.is_some();
+        let (skip, limit) = setup.as_ref().copied().unwrap_or((0, slots));
+        let mut pushed = 0usize;
+        for slot in skip.min(slots)..slots {
+            if constrained && pushed >= limit {
+                break;
+            }
+            self.inline_indices
+                .push((arg >> (slot as u32 * bits)) & mask);
+            pushed += 1;
+        }
+        if let Some((skip, remaining)) = setup.as_mut() {
+            *skip = 0;
+            *remaining = remaining.saturating_sub(pushed);
+        }
     }
 
     fn push_draw_texture(&mut self) {
@@ -1737,6 +1977,7 @@ impl Maxwell3D {
             index_gpu_va: 0,
             index_format: 0,
             index_first: 0,
+            inline_indices: Vec::new(),
             primitive_restart_enabled: self.regs.primitive_restart_enabled,
             primitive_restart_index: self.regs.primitive_restart_index,
             point_size: 1.0,
@@ -1754,6 +1995,7 @@ impl Maxwell3D {
             scissor: self.regs.scissor,
             clear_control: self.regs.clear_control,
             clear_color: self.regs.clear_color,
+            color_blend: self.regs.color_blend_state(),
             is_clear: false,
             draw_texture: Some(DrawTextureCall {
                 dst_x,
@@ -1776,10 +2018,22 @@ impl Maxwell3D {
             tsc_pool_gpu_va: ((self.regs.tsc_pool_va_hi as u64) << 32)
                 | self.regs.tsc_pool_va_lo as u64,
             tsc_pool_limit: self.regs.tsc_pool_limit,
+            shader_programs: self.regs.shader_programs,
+            program_region_gpu_va: ((self.regs.program_region_va_hi as u64) << 32)
+                | self.regs.program_region_va_lo as u64,
+            cbuf_binds: self.regs.cbuf_binds,
+            sampler_binding: self.regs.sampler_binding,
+            bindless_texture_const_buffer_slot: self.regs.bindless_texture_const_buffer_slot,
+            tex_cb_index: self.regs.tex_cb_index,
+            constbuf_write_count: self.regs.pending_constbuf_writes.len(),
             last_constbuf_addr: self.regs.last_constbuf_addr,
             last_constbuf_size: self.regs.last_constbuf_size,
-            fs_bindless_cb_addr: self.regs.cbuf_binds[4][15].0,
-            fs_bindless_cb_size: self.regs.cbuf_binds[4][15].1,
+            fs_bindless_cb_addr: self.regs.cbuf_binds[self.regs.shader_programs[5].cbuf_group(4)]
+                [15]
+            .0,
+            fs_bindless_cb_size: self.regs.cbuf_binds[self.regs.shader_programs[5].cbuf_group(4)]
+                [15]
+            .1,
             fs_shader_gpu_va: {
                 let fs = &self.regs.shader_programs[5];
                 let region = ((self.regs.program_region_va_hi as u64) << 32)
@@ -1915,6 +2169,98 @@ mod tests {
     }
 
     #[test]
+    fn shader_program_captures_binding_group() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x814, 0xffff_fffbu32, true);
+
+        assert_eq!(engine.regs.shader_programs[1].binding_group, Some(3));
+    }
+
+    #[test]
+    fn draws_snapshot_shader_and_constant_buffer_state() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x582, 1, true);
+        engine.dispatch_method(0x583, 0x8000, true);
+        engine.dispatch_method(0x810, 1, true);
+        engine.dispatch_method(0x811, 0x40, true);
+        engine.dispatch_method(0x8e0, 0x100, true);
+        engine.dispatch_method(0x8e1, 0, true);
+        engine.dispatch_method(0x8e2, 0x1000, true);
+        engine.dispatch_method(0x904, 1, true);
+        engine.dispatch_method(0x1234, 1, true);
+        engine.dispatch_method(0x2608, 7, true);
+        engine.dispatch_method(0x982, 3, true);
+        engine.dispatch_method(0x8e3, 0, true);
+        engine.dispatch_method(0x8e4, 0x1111_1111, true);
+        engine.dispatch_method(0x35e, 3, true);
+
+        engine.dispatch_method(0x583, 0x9000, true);
+        engine.dispatch_method(0x811, 0x80, true);
+        engine.dispatch_method(0x8e0, 0x200, true);
+        engine.dispatch_method(0x8e2, 0x2000, true);
+        engine.dispatch_method(0x904, 1, true);
+        engine.dispatch_method(0x1234, 0, true);
+        engine.dispatch_method(0x2608, 8, true);
+        engine.dispatch_method(0x982, 4, true);
+        engine.dispatch_method(0x8e3, 0, true);
+        engine.dispatch_method(0x8e4, 0x2222_2222, true);
+        engine.dispatch_method(0x35e, 3, true);
+
+        let first = &engine.pending_draws[0];
+        assert_eq!(first.shader_programs[1].address_lo, 0x40);
+        assert_eq!(first.program_region_gpu_va, 0x1_0000_8000);
+        assert_eq!(first.cbuf_binds[0][0], (0x1000, 0x100));
+        assert_eq!(first.sampler_binding, 1);
+        assert_eq!(first.bindless_texture_const_buffer_slot, 7);
+        assert_eq!(first.tex_cb_index, 3);
+        assert_eq!(first.constbuf_write_count, 1);
+
+        let second = &engine.pending_draws[1];
+        assert_eq!(second.shader_programs[1].address_lo, 0x80);
+        assert_eq!(second.program_region_gpu_va, 0x1_0000_9000);
+        assert_eq!(second.cbuf_binds[0][0], (0x2000, 0x200));
+        assert_eq!(second.sampler_binding, 0);
+        assert_eq!(second.bindless_texture_const_buffer_slot, 8);
+        assert_eq!(second.tex_cb_index, 4);
+        assert_eq!(second.constbuf_write_count, 2);
+    }
+
+    #[test]
+    fn draws_snapshot_blend_and_color_mask_state() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x4b9, 1, true);
+        engine.dispatch_method(0x4d8, 1, true);
+        engine.dispatch_method(0x782, 0x0302, true);
+        engine.dispatch_method(0x783, 0x0303, true);
+        engine.dispatch_method(0x680, 0x0111, true);
+        engine.dispatch_method(0x35e, 3, true);
+
+        engine.dispatch_method(0x4b9, 0, true);
+        engine.dispatch_method(0x4d8, 0, true);
+        engine.dispatch_method(0x4d1, 0x0304, true);
+        engine.dispatch_method(0x4d2, 0x0305, true);
+        engine.dispatch_method(0x680, 0x1110, true);
+        engine.dispatch_method(0x35e, 3, true);
+
+        let first = engine.pending_draws[0].color_blend;
+        assert!(first.blend_per_target_enabled);
+        assert!(first.blend_enable[0]);
+        assert_eq!(first.blend_pt_src_rgb[0], 0x0302);
+        assert_eq!(first.blend_pt_dst_rgb[0], 0x0303);
+        assert_eq!(first.color_masks[0], 0x0111);
+
+        let second = engine.pending_draws[1].color_blend;
+        assert!(!second.blend_per_target_enabled);
+        assert!(!second.blend_enable[0]);
+        assert_eq!(second.blend_src_rgb, 0x0304);
+        assert_eq!(second.blend_dst_rgb, 0x0305);
+        assert_eq!(second.color_masks[0], 0x1110);
+    }
+
+    #[test]
     fn vertex_stream_format_preserves_enable_bit() {
         let mut engine = Maxwell3D::new();
 
@@ -1943,6 +2289,7 @@ mod tests {
         engine.dispatch_method(0x592, 0x1234_5678, true);
         engine.dispatch_method(0x586, 5, true);
         engine.dispatch_method(0x5f8, 3, true);
+        engine.dispatch_method(0x585, 0, true);
 
         assert!(engine.regs.primitive_restart_enabled);
         assert_eq!(engine.regs.primitive_restart_index, 0x1234_5678);
@@ -2018,6 +2365,43 @@ mod tests {
         assert_eq!(engine.pending_draws.len(), 2);
         assert_eq!(engine.pending_draws[0].instance_count, 1);
         assert_eq!(engine.pending_draws[1].instance_count, 1);
+    }
+
+    #[test]
+    fn inline_index_methods_emit_one_indexed_draw_at_end() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x586, 4, true);
+        engine.dispatch_method(0x35d, 0, true);
+        engine.dispatch_method(0x35e, 114, true);
+        engine.dispatch_method(0x57a, 7, true);
+        engine.dispatch_method(0x57c, (11 << 16) | 9, true);
+        assert!(engine.pending_draws.is_empty());
+        engine.dispatch_method(0x585, 0, true);
+
+        assert_eq!(engine.pending_draws.len(), 1);
+        let draw = &engine.pending_draws[0];
+        assert!(draw.indexed);
+        assert_eq!(draw.vertex_count, 0);
+        assert_eq!(draw.index_count, 3);
+        assert_eq!(draw.inline_indices, [7, 9, 11]);
+    }
+
+    #[test]
+    fn packed_inline_index_setup_applies_offset_and_count() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x586, 4, true);
+        engine.dispatch_method(0x57b, (1 << 31) | 3, true);
+        engine.dispatch_method(0x57c, (2 << 16) | 1, true);
+        engine.dispatch_method(0x57c, (4 << 16) | 3, true);
+        engine.dispatch_method(0x57c, (6 << 16) | 5, true);
+        engine.dispatch_method(0x57b, 0, true);
+        engine.dispatch_method(0x57c, (8 << 16) | 7, true);
+        engine.dispatch_method(0x585, 0, true);
+
+        let draw = &engine.pending_draws[0];
+        assert_eq!(draw.inline_indices, [2, 3, 4, 7, 8]);
     }
 
     #[test]

@@ -958,11 +958,22 @@ impl Pusher {
             }
             maxwell.record_method(method);
 
-            if !maxwell.regs.pending_constbuf_writes.is_empty() {
-                let kp = kickprof::start();
-                self.commit_pending_constbuf_writes(maxwell, mappings, mem_write);
-                kickprof::add(kickprof::CBUFWB, kp);
-            }
+            let constbuf_write_count = maxwell.regs.pending_constbuf_writes.len();
+            let replay_constbuf_writes = if constbuf_write_count != 0
+                && maxwell
+                    .pending_draws
+                    .iter()
+                    .any(|draw| draw.constbuf_write_count < constbuf_write_count)
+            {
+                std::mem::take(&mut maxwell.regs.pending_constbuf_writes)
+            } else {
+                if constbuf_write_count != 0 {
+                    let kp = kickprof::start();
+                    self.commit_pending_constbuf_writes(maxwell, mappings, mem_write);
+                    kickprof::add(kickprof::CBUFWB, kp);
+                }
+                Vec::new()
+            };
             if !maxwell.regs.pending_semaphore_acquires.is_empty() {
                 let kp = kickprof::start();
                 let acquires = std::mem::take(&mut maxwell.regs.pending_semaphore_acquires);
@@ -1023,6 +1034,108 @@ impl Pusher {
                 }
                 kickprof::add(kickprof::SEMACQ, kp);
             }
+            if !maxwell.pending_draws.is_empty() {
+                self.resolve_pending_compute(mappings, mem_write);
+                let draws = std::mem::take(&mut maxwell.pending_draws);
+                let mut committed_constbuf_writes = 0;
+                if let Some(r) = self.renderer.clone() {
+                    if kickprof::enabled() {
+                        kickprof::count(
+                            kickprof::HOST_DRAWS,
+                            draws.iter().filter(|draw| !draw.is_clear).count() as u64,
+                        );
+                        kickprof::count(
+                            kickprof::DRAW_INSTANCES,
+                            draws
+                                .iter()
+                                .filter(|draw| !draw.is_clear)
+                                .map(|draw| draw.instance_count.max(1) as u64)
+                                .sum(),
+                        );
+                    }
+                    if replay_constbuf_writes.is_empty() {
+                        let kp = kickprof::start();
+                        super::vk_dispatch::enqueue_draws(
+                            &draws,
+                            &mut self.vk_batch,
+                            &mut self.ssbo_snapshot_cache,
+                            mappings,
+                            maxwell,
+                            &r,
+                            maxwell_dma,
+                            mem_read,
+                            mem_write,
+                        );
+                        kickprof::add(kickprof::ENQ, kp);
+                    } else {
+                        for draw in &draws {
+                            let end = constbuf_replay_end(
+                                draw.constbuf_write_count,
+                                committed_constbuf_writes,
+                                replay_constbuf_writes.len(),
+                            );
+                            let kp = kickprof::start();
+                            self.commit_constbuf_writes(
+                                maxwell,
+                                &replay_constbuf_writes[committed_constbuf_writes..end],
+                                mappings,
+                                mem_write,
+                            );
+                            kickprof::add(kickprof::CBUFWB, kp);
+                            committed_constbuf_writes = end;
+                            let kp = kickprof::start();
+                            super::vk_dispatch::enqueue_draws(
+                                std::slice::from_ref(draw),
+                                &mut self.vk_batch,
+                                &mut self.ssbo_snapshot_cache,
+                                mappings,
+                                maxwell,
+                                &r,
+                                maxwell_dma,
+                                mem_read,
+                                mem_write,
+                            );
+                            kickprof::add(kickprof::ENQ, kp);
+                        }
+                    }
+                } else if replay_constbuf_writes.is_empty() {
+                    sw_renderer::execute_draws(&draws, mappings, maxwell_dma, mem_read, mem_write);
+                } else {
+                    for draw in &draws {
+                        let end = constbuf_replay_end(
+                            draw.constbuf_write_count,
+                            committed_constbuf_writes,
+                            replay_constbuf_writes.len(),
+                        );
+                        let kp = kickprof::start();
+                        self.commit_constbuf_writes(
+                            maxwell,
+                            &replay_constbuf_writes[committed_constbuf_writes..end],
+                            mappings,
+                            mem_write,
+                        );
+                        kickprof::add(kickprof::CBUFWB, kp);
+                        committed_constbuf_writes = end;
+                        sw_renderer::execute_draws(
+                            std::slice::from_ref(draw),
+                            mappings,
+                            maxwell_dma,
+                            mem_read,
+                            mem_write,
+                        );
+                    }
+                }
+                if committed_constbuf_writes < replay_constbuf_writes.len() {
+                    let kp = kickprof::start();
+                    self.commit_constbuf_writes(
+                        maxwell,
+                        &replay_constbuf_writes[committed_constbuf_writes..],
+                        mappings,
+                        mem_write,
+                    );
+                    kickprof::add(kickprof::CBUFWB, kp);
+                }
+            }
             if !maxwell.regs.pending_semaphore_writes.is_empty() {
                 self.resolve_pending_compute(mappings, mem_write);
                 let writes = std::mem::take(&mut maxwell.regs.pending_semaphore_writes);
@@ -1066,41 +1179,6 @@ impl Pusher {
                             write.payload
                         );
                     }
-                }
-            }
-            if !maxwell.pending_draws.is_empty() {
-                self.resolve_pending_compute(mappings, mem_write);
-                let draws = std::mem::take(&mut maxwell.pending_draws);
-                if let Some(r) = self.renderer.clone() {
-                    if kickprof::enabled() {
-                        kickprof::count(
-                            kickprof::HOST_DRAWS,
-                            draws.iter().filter(|draw| !draw.is_clear).count() as u64,
-                        );
-                        kickprof::count(
-                            kickprof::DRAW_INSTANCES,
-                            draws
-                                .iter()
-                                .filter(|draw| !draw.is_clear)
-                                .map(|draw| draw.instance_count.max(1) as u64)
-                                .sum(),
-                        );
-                    }
-                    let kp = kickprof::start();
-                    super::vk_dispatch::enqueue_draws(
-                        &draws,
-                        &mut self.vk_batch,
-                        &mut self.ssbo_snapshot_cache,
-                        mappings,
-                        maxwell,
-                        &r,
-                        maxwell_dma,
-                        mem_read,
-                        mem_write,
-                    );
-                    kickprof::add(kickprof::ENQ, kp);
-                } else {
-                    sw_renderer::execute_draws(&draws, mappings, maxwell_dma, mem_read, mem_write);
                 }
             }
             let barrier_flushes = std::mem::take(&mut maxwell.regs.pending_barrier_flushes);
@@ -1367,6 +1445,16 @@ impl Pusher {
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
         let writes = std::mem::take(&mut maxwell.regs.pending_constbuf_writes);
+        self.commit_constbuf_writes(maxwell, &writes, mappings, mem_write);
+    }
+
+    fn commit_constbuf_writes(
+        &mut self,
+        maxwell: &Maxwell3D,
+        writes: &[(u64, u32)],
+        mappings: &GpuMappings,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    ) {
         let mut run_bytes = Vec::new();
         let mut run_start = 0usize;
         while run_start < writes.len() {
@@ -1616,6 +1704,10 @@ fn contiguous_constbuf_write_run_end(writes: &[(u64, u32)], start: usize) -> usi
     end
 }
 
+fn constbuf_replay_end(requested: usize, committed: usize, total: usize) -> usize {
+    requested.min(total).max(committed)
+}
+
 impl Default for Pusher {
     fn default() -> Self {
         Self::new()
@@ -1661,6 +1753,13 @@ mod tests {
             contiguous_constbuf_write_run_end(&writes, writes.len()),
             writes.len()
         );
+    }
+
+    #[test]
+    fn constbuf_replay_boundaries_are_monotonic_and_clamped() {
+        assert_eq!(constbuf_replay_end(3, 0, 8), 3);
+        assert_eq!(constbuf_replay_end(2, 3, 8), 3);
+        assert_eq!(constbuf_replay_end(20, 3, 8), 8);
     }
 
     #[test]
