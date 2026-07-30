@@ -211,9 +211,18 @@ impl GpuMappings {
 
     #[inline]
     pub fn cpu_range_for(&self, gpu_va: u64) -> Option<(u64, u64)> {
-        let mapping = &self.mappings[self.mapping_index_for(gpu_va)?];
+        let mapping_index = self.mapping_index_for(gpu_va)?;
+        let mapping = &self.mappings[mapping_index];
         let offset = gpu_va - mapping.gpu_va;
-        Some((mapping.cpu_addr + offset, mapping.size - offset))
+        let mapping_end = mapping.gpu_va.saturating_add(mapping.size);
+        let contiguous_end = self.mappings[mapping_index + 1..]
+            .iter()
+            .filter_map(|newer| {
+                (newer.gpu_va > gpu_va && newer.gpu_va < mapping_end).then_some(newer.gpu_va)
+            })
+            .min()
+            .unwrap_or(mapping_end);
+        Some((mapping.cpu_addr + offset, contiguous_end - gpu_va))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &GpuMapping> {
@@ -556,6 +565,10 @@ mod tests {
         assert_eq!(mappings.cpu_address_for(0x1500), Some(0x2_0100));
         assert_eq!(mappings.nvmap_id_for(0x1900), Some(3));
         assert_eq!(mappings.mapping_at(0x1b00), Some((0x1400, 0x800, 0x2_0000)));
+        assert_eq!(mappings.cpu_range_for(0x1200), Some((0x1_0200, 0x200)));
+        assert_eq!(mappings.cpu_range_for(0x1500), Some((0x2_0100, 0x300)));
+        assert_eq!(mappings.cpu_range_for(0x1900), Some((0x3_0100, 0x100)));
+        assert_eq!(mappings.cpu_range_for(0x1b00), Some((0x2_0700, 0x100)));
         assert_eq!(mappings.cpu_range_for(0x1d00), Some((0x1_0d00, 0x1300)));
     }
 
