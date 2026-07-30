@@ -16243,7 +16243,7 @@ fn create_ubo_ring(
         buffer,
         memory,
         mapped,
-        size: req.size,
+        size,
         head: 0,
         slot_head: [0, 0],
     })
