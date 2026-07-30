@@ -1,127 +1,109 @@
-use std::collections::HashMap;
+use rspirv::binary::Assemble;
+use rspirv::dr::{Instruction, Operand};
+use rspirv::spirv::{Op, Word};
+use std::collections::{HashMap, HashSet};
 
-#[derive(Clone)]
-struct Inst {
-    opcode: u16,
-    words: Vec<u32>,
+#[derive(PartialEq, Eq, Hash)]
+struct CanonKey {
+    opcode: Op,
+    result_type: Option<Word>,
+    operands: Vec<Operand>,
 }
 
-impl Inst {
-    #[allow(dead_code)]
-    fn result_id(&self) -> Option<u32> {
-        let (has_rtype, has_rid) = opcode_meta(self.opcode);
-        if has_rid {
-            let idx = if has_rtype { 2 } else { 1 };
-            self.words.get(idx).copied()
-        } else {
-            None
+fn resolve_id(mut id: Word, remap: &HashMap<Word, Word>) -> Word {
+    while let Some(&next) = remap.get(&id) {
+        if next == id {
+            break;
         }
+        id = next;
+    }
+    id
+}
+
+fn operand_id(operand: &Operand) -> Option<Word> {
+    match operand {
+        Operand::IdRef(id) | Operand::IdScope(id) | Operand::IdMemorySemantics(id) => Some(*id),
+        _ => None,
     }
 }
 
-fn opcode_meta(op: u16) -> (bool, bool) {
-    match op {
-        19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 32 | 33 => (false, true),
-        41 | 42 | 43 | 44 | 46 | 48 | 49 | 50 => (true, true),
-        1 => (true, true),
-        _ => (false, false),
-    }
-}
-
-fn parse(words: &[u32]) -> Option<(Vec<u32>, Vec<Inst>)> {
-    if words.len() < 5 || words[0] != 0x07230203 {
-        return None;
-    }
-    let header = words[..5].to_vec();
-    let mut insts = Vec::new();
-    let mut i = 5;
-    while i < words.len() {
-        let w0 = words[i];
-        let wc = (w0 >> 16) as usize;
-        let op = (w0 & 0xFFFF) as u16;
-        if wc == 0 || i + wc > words.len() {
-            return None;
+fn remap_operand(operand: &mut Operand, remap: &HashMap<Word, Word>) {
+    match operand {
+        Operand::IdRef(id) | Operand::IdScope(id) | Operand::IdMemorySemantics(id) => {
+            *id = resolve_id(*id, remap);
         }
-        insts.push(Inst {
-            opcode: op,
-            words: words[i..i + wc].to_vec(),
-        });
-        i += wc;
+        _ => {}
     }
-    Some((header, insts))
 }
 
-#[derive(PartialEq, Eq, Hash, Clone)]
-struct CanonKey(Vec<u32>);
+fn is_deduplicable_constant(opcode: Op) -> bool {
+    matches!(
+        opcode,
+        Op::ConstantTrue
+            | Op::ConstantFalse
+            | Op::Constant
+            | Op::ConstantComposite
+            | Op::ConstantSampler
+            | Op::ConstantNull
+    )
+}
 
-fn make_canon_key(inst: &Inst, remap: &HashMap<u32, u32>) -> Option<CanonKey> {
-    let op = inst.opcode;
-    let is_type = matches!(op, 19..=33);
-    let is_const = matches!(op, 41..=50 | 1);
-    if !is_type && !is_const {
-        return None;
+fn make_canon_key(inst: &Instruction, remap: &HashMap<Word, Word>) -> CanonKey {
+    let mut operands = inst.operands.clone();
+    for operand in &mut operands {
+        remap_operand(operand, remap);
     }
-
-    let mut key = vec![op as u32];
-
-    let (has_rtype, has_rid) = opcode_meta(op);
-    let skip_start = if has_rtype { 1 } else { 0 } + if has_rid { 1 } else { 0 };
-    let operand_start = 1 + skip_start;
-
-    if has_rtype && inst.words.len() > 1 {
-        let raw_type = inst.words[1];
-        key.push(*remap.get(&raw_type).unwrap_or(&raw_type));
+    CanonKey {
+        opcode: inst.class.opcode,
+        result_type: inst.result_type.map(|id| resolve_id(id, remap)),
+        operands,
     }
-
-    for &w in &inst.words[operand_start..] {
-        key.push(*remap.get(&w).unwrap_or(&w));
-    }
-
-    Some(CanonKey(key))
 }
 
 pub fn dedup_constants(words: Vec<u32>) -> Vec<u32> {
-    let Some((header, mut insts)) = parse(&words) else {
+    let Ok(mut module) = rspirv::dr::load_words(&words) else {
         return words;
     };
 
-    let mut remap: HashMap<u32, u32> = HashMap::new();
-    let mut dead: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut protected = HashSet::new();
+    for inst in module.debug_names.iter().chain(&module.annotations) {
+        protected.extend(inst.operands.iter().filter_map(operand_id));
+    }
+    for inst in &module.types_global_values {
+        if inst.class.opcode == Op::TypeForwardPointer {
+            protected.extend(inst.operands.iter().filter_map(operand_id));
+        }
+    }
 
-    let mut canon: HashMap<CanonKey, u32> = HashMap::new();
+    let has_continued_constants = module.types_global_values.iter().any(|inst| {
+        matches!(
+            inst.class.opcode,
+            Op::ConstantCompositeContinuedINTEL | Op::SpecConstantCompositeContinuedINTEL
+        )
+    });
+    let mut remap = HashMap::new();
+    let mut canon = HashMap::new();
 
-    for _round in 0..3 {
-        for inst in &insts {
-            let (has_rtype, has_rid) = opcode_meta(inst.opcode);
-            if !has_rid {
-                continue;
-            }
-            let raw_id = if has_rtype && inst.words.len() > 2 {
-                inst.words[2]
-            } else if !has_rtype && inst.words.len() > 1 {
-                inst.words[1]
-            } else {
-                continue;
-            };
+    for inst in &module.types_global_values {
+        let Some(result_id) = inst.result_id else {
+            continue;
+        };
+        if protected.contains(&result_id) {
+            continue;
+        }
+        let opcode = inst.class.opcode;
+        let deduplicable = rspirv::grammar::reflect::is_type(opcode)
+            || is_deduplicable_constant(opcode)
+                && !(has_continued_constants && opcode == Op::ConstantComposite);
+        if !deduplicable {
+            continue;
+        }
 
-            if dead.contains(&raw_id) {
-                continue;
-            }
-
-            let Some(key) = make_canon_key(inst, &remap) else {
-                continue;
-            };
-
-            match canon.get(&key) {
-                Some(&survivor) if survivor != raw_id => {
-                    remap.insert(raw_id, survivor);
-                    dead.insert(raw_id);
-                }
-                Some(_) => {}
-                None => {
-                    canon.insert(key, raw_id);
-                }
-            }
+        let key = make_canon_key(inst, &remap);
+        if let Some(&survivor) = canon.get(&key) {
+            remap.insert(result_id, survivor);
+        } else {
+            canon.insert(key, result_id);
         }
     }
 
@@ -129,74 +111,60 @@ pub fn dedup_constants(words: Vec<u32>) -> Vec<u32> {
         return words;
     }
 
-    let resolve = |id: u32| -> u32 { *remap.get(&id).unwrap_or(&id) };
-
-    let mut out_insts: Vec<Inst> = Vec::with_capacity(insts.len());
-    for mut inst in insts.drain(..) {
-        let (has_rtype, has_rid) = opcode_meta(inst.opcode);
-
-        let result_word_idx = if has_rtype && has_rid {
-            Some(2usize)
-        } else if !has_rtype && has_rid {
-            Some(1usize)
-        } else {
-            None
-        };
-
-        if let Some(ri) = result_word_idx {
-            if ri < inst.words.len() {
-                let rid = inst.words[ri];
-                if dead.contains(&rid) {
-                    continue;
-                }
-            }
+    module
+        .types_global_values
+        .retain(|inst| inst.result_id.is_none_or(|id| !remap.contains_key(&id)));
+    for inst in module.all_inst_iter_mut() {
+        if let Some(result_type) = &mut inst.result_type {
+            *result_type = resolve_id(*result_type, &remap);
         }
-
-        let literal_start = match inst.opcode {
-            43 | 50 => Some(3usize),
-            41 | 42 | 48 | 49 => Some(2usize),
-            44 => None,
-            _ => None,
-        };
-
-        for j in 1..inst.words.len() {
-            if let Some(ls) = literal_start {
-                if j >= ls {
-                    break;
-                }
-            }
-            inst.words[j] = resolve(inst.words[j]);
+        for operand in &mut inst.operands {
+            remap_operand(operand, &remap);
         }
-
-        let wc = inst.words.len() as u32;
-        inst.words[0] = (wc << 16) | inst.opcode as u32;
-
-        out_insts.push(inst);
     }
 
-    let bound = header[3];
-    let mut out = header.clone();
-    out[3] = bound;
-    for inst in &out_insts {
-        out.extend_from_slice(&inst.words);
-    }
-    out
+    module.assemble()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rspirv::spirv::{ExecutionMode, StorageClass};
 
     fn spv_header(bound: u32) -> Vec<u32> {
         vec![0x07230203, 0x00010000, 0, bound, 0]
     }
 
     fn op_type_float(result_id: u32) -> Vec<u32> {
-        vec![(3 << 16) | 22, result_id, 32]
+        vec![(3 << 16) | Op::TypeFloat as u32, result_id, 32]
+    }
+
+    fn op_type_int(result_id: u32, width: u32, signedness: u32) -> Vec<u32> {
+        vec![(4 << 16) | Op::TypeInt as u32, result_id, width, signedness]
+    }
+
+    fn op_type_pointer(result_id: u32, storage_class: StorageClass, pointee: u32) -> Vec<u32> {
+        vec![
+            (4 << 16) | Op::TypePointer as u32,
+            result_id,
+            storage_class as u32,
+            pointee,
+        ]
     }
 
     fn op_constant_f32(type_id: u32, result_id: u32, bits: u32) -> Vec<u32> {
-        vec![(4 << 16) | 43, type_id, result_id, bits]
+        vec![(4 << 16) | Op::Constant as u32, type_id, result_id, bits]
+    }
+
+    fn op_execution_mode(entry_point: u32, x: u32, y: u32, z: u32) -> Vec<u32> {
+        vec![
+            (6 << 16) | Op::ExecutionMode as u32,
+            entry_point,
+            ExecutionMode::LocalSize as u32,
+            x,
+            y,
+            z,
+        ]
     }
 
     #[test]
@@ -204,11 +172,9 @@ mod tests {
         let mut words = spv_header(4);
         words.extend_from_slice(&op_type_float(1));
         words.extend_from_slice(&op_type_float(2));
-        words.extend_from_slice(&[(1 << 16) | 253]);
 
         let out = dedup_constants(words);
-        let count = count_opcode(&out, 22);
-        assert_eq!(count, 1);
+        assert_eq!(count_opcode(&out, Op::TypeFloat), 1);
     }
 
     #[test]
@@ -217,11 +183,9 @@ mod tests {
         words.extend_from_slice(&op_type_float(1));
         words.extend_from_slice(&op_constant_f32(1, 2, 0));
         words.extend_from_slice(&op_constant_f32(1, 3, 0));
-        words.extend_from_slice(&[(1 << 16) | 253]);
 
         let out = dedup_constants(words);
-        let count = count_opcode(&out, 43);
-        assert_eq!(count, 1);
+        assert_eq!(count_opcode(&out, Op::Constant), 1);
     }
 
     #[test]
@@ -230,11 +194,85 @@ mod tests {
         words.extend_from_slice(&op_type_float(1));
         words.extend_from_slice(&op_constant_f32(1, 2, 0));
         words.extend_from_slice(&op_constant_f32(1, 3, 1065353216));
-        words.extend_from_slice(&[(1 << 16) | 253]);
 
         let out = dedup_constants(words);
-        let count = count_opcode(&out, 43);
-        assert_eq!(count, 2);
+        assert_eq!(count_opcode(&out, Op::Constant), 2);
+    }
+
+    #[test]
+    fn literal_equal_to_remapped_id_is_unchanged() {
+        let mut words = spv_header(34);
+        words.extend_from_slice(&op_type_float(31));
+        words.extend_from_slice(&op_type_float(32));
+        words.extend_from_slice(&op_type_int(33, 32, 0));
+
+        let out = dedup_constants(words);
+        let module = rspirv::dr::load_words(out).unwrap();
+        let int_type = module
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::TypeInt)
+            .unwrap();
+        assert_eq!(int_type.operands[0], Operand::LiteralBit32(32));
+    }
+
+    #[test]
+    fn enum_equal_to_remapped_id_is_unchanged() {
+        let mut words = spv_header(4);
+        words.extend_from_slice(&op_type_float(1));
+        words.extend_from_slice(&op_type_float(2));
+        words.extend_from_slice(&op_type_pointer(3, StorageClass::Uniform, 2));
+
+        let out = dedup_constants(words);
+        let module = rspirv::dr::load_words(out).unwrap();
+        let pointer = module
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::TypePointer)
+            .unwrap();
+        assert_eq!(
+            pointer.operands[0],
+            Operand::StorageClass(StorageClass::Uniform)
+        );
+        assert_eq!(pointer.operands[1], Operand::IdRef(1));
+    }
+
+    #[test]
+    fn instruction_literals_equal_to_remapped_id_are_unchanged() {
+        let mut words = spv_header(5);
+        words.extend_from_slice(&op_execution_mode(4, 2, 3, 4));
+        words.extend_from_slice(&op_type_float(1));
+        words.extend_from_slice(&op_type_float(2));
+
+        let out = dedup_constants(words);
+        let module = rspirv::dr::load_words(out).unwrap();
+        assert_eq!(
+            module.execution_modes[0].operands,
+            [
+                Operand::IdRef(4),
+                Operand::ExecutionMode(ExecutionMode::LocalSize),
+                Operand::LiteralBit32(2),
+                Operand::LiteralBit32(3),
+                Operand::LiteralBit32(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn constant_literal_equal_to_remapped_id_is_unchanged() {
+        let mut words = spv_header(4);
+        words.extend_from_slice(&op_type_float(1));
+        words.extend_from_slice(&op_type_float(2));
+        words.extend_from_slice(&op_constant_f32(1, 3, 2));
+
+        let out = dedup_constants(words);
+        let module = rspirv::dr::load_words(out).unwrap();
+        let constant = module
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::Constant)
+            .unwrap();
+        assert_eq!(constant.operands[0], Operand::LiteralBit32(2));
     }
 
     #[test]
@@ -244,17 +282,16 @@ mod tests {
         assert_eq!(out, garbage);
     }
 
-    fn count_opcode(words: &[u32], opcode: u16) -> usize {
+    fn count_opcode(words: &[u32], opcode: Op) -> usize {
         let mut i = 5;
         let mut count = 0;
         while i < words.len() {
             let w0 = words[i];
             let wc = (w0 >> 16) as usize;
-            let op = (w0 & 0xFFFF) as u16;
             if wc == 0 {
                 break;
             }
-            if op == opcode {
+            if (w0 & 0xFFFF) == opcode as u32 {
                 count += 1;
             }
             i += wc;
