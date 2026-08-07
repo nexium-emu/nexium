@@ -23,8 +23,8 @@ pub struct PipelineKey {
     pub color_format: u32,
     pub color_formats: [u32; 8],
     pub color_attachment_count: u32,
-    pub vs_cbuf_mask: u32,
-    pub fs_cbuf_mask: u32,
+    pub vs_cbuf_mask: u64,
+    pub fs_cbuf_mask: u64,
     pub vertex_layout_hash: u64,
     pub blend_signature: u64,
     pub raster_state_packed: u32,
@@ -39,7 +39,7 @@ pub struct PipelineKey {
     pub color_write_mask: u32,
 }
 
-const SPEC_VERSION: u32 = 37;
+const SPEC_VERSION: u32 = 39;
 const CACHE_SAVE_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const KNOWN_DRIVER_HOSTILE_PIPELINES: &[(u64, u64)] =
     &[(0x59b9_0e74_4b2a_7537, 0xe505_d075_601e_e633)];

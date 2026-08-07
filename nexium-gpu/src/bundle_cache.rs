@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const BUNDLE_MAGIC: [u8; 8] = *b"NXBUNDL1";
-const BUNDLE_VERSION: u32 = 40;
+const BUNDLE_VERSION: u32 = 43;
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -47,8 +47,8 @@ pub struct BundleRecord {
     pub content_key: u64,
     pub vs_spirv: Vec<u32>,
     pub fs_spirv: Vec<u32>,
-    pub vs_cbuf_mask: u32,
-    pub fs_cbuf_mask: u32,
+    pub vs_cbuf_mask: u64,
+    pub fs_cbuf_mask: u64,
     pub vs_hash: u64,
     pub fs_hash: u64,
     pub fs_tex_ids: Vec<u32>,
@@ -424,12 +424,12 @@ mod tests {
                     index_origin: CbufIndexOrigin::Constant(0xffff_fff0),
                 },
                 CbufRead {
-                    logical_slot: 22,
+                    logical_slot: 24,
                     byte_offset: 0x2aa0,
                     index_origin: CbufIndexOrigin::Gpr(37),
                 },
                 CbufRead {
-                    logical_slot: 23,
+                    logical_slot: 25,
                     byte_offset: 0x1550,
                     index_origin: CbufIndexOrigin::Instruction(73),
                 },

@@ -113,6 +113,21 @@ pub struct DepthState {
     pub compare_op: vk::CompareOp,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FermiExactRtToken {
+    pub key: RtKey,
+    pub stamp: u64,
+    pub guest_va: u64,
+    pub guest_size: u64,
+    pub guest_generation: u64,
+    pub bytes_per_pixel: usize,
+    pub fermi_block_size: u32,
+    pub block_width_log2: u32,
+    pub block_height_log2: u32,
+    pub block_depth_log2: u32,
+    pub tile_width_spacing: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct StencilFaceState {
     pub fail_op: vk::StencilOp,
@@ -155,6 +170,287 @@ pub struct StorageBufferSnapshot {
 }
 
 #[derive(Clone, Debug)]
+pub struct GraphicsCbufSlotSnapshot {
+    logical_slot: u8,
+    read_len: u32,
+    packed_offset: u32,
+    word_count: u32,
+    source_offset: u32,
+    data: std::sync::Arc<Vec<u8>>,
+}
+
+impl GraphicsCbufSlotSnapshot {
+    pub fn new(
+        logical_slot: usize,
+        read_len: usize,
+        packed_offset: usize,
+        data: std::sync::Arc<Vec<u8>>,
+    ) -> Option<Self> {
+        Self::new_with_offset(logical_slot, read_len, packed_offset, 0, data)
+    }
+
+    pub fn new_with_offset(
+        logical_slot: usize,
+        read_len: usize,
+        packed_offset: usize,
+        source_offset: usize,
+        data: std::sync::Arc<Vec<u8>>,
+    ) -> Option<Self> {
+        let word_count = read_len.div_ceil(4);
+        if logical_slot >= nexium_spirv::GFX_CBUF_SLOTS as usize
+            || source_offset.checked_add(read_len)? > data.len()
+            || packed_offset < nexium_spirv::GFX_CBUF_MIN_SIZE as usize
+            || packed_offset % 16 != 0
+        {
+            return None;
+        }
+        Some(Self {
+            logical_slot: logical_slot.try_into().ok()?,
+            read_len: read_len.try_into().ok()?,
+            packed_offset: packed_offset.try_into().ok()?,
+            word_count: word_count.try_into().ok()?,
+            source_offset: source_offset.try_into().ok()?,
+            data,
+        })
+    }
+
+    pub fn logical_slot(&self) -> usize {
+        self.logical_slot as usize
+    }
+
+    pub fn read_len(&self) -> usize {
+        self.read_len as usize
+    }
+
+    pub fn packed_offset(&self) -> usize {
+        self.packed_offset as usize
+    }
+
+    pub fn word_count(&self) -> usize {
+        self.word_count as usize
+    }
+
+    pub fn source_offset(&self) -> usize {
+        self.source_offset as usize
+    }
+
+    pub fn data(&self) -> &std::sync::Arc<Vec<u8>> {
+        &self.data
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum GraphicsCbufPayload {
+    Owned(std::sync::Arc<Vec<u8>>),
+    Slots {
+        packed_size: u32,
+        slots: Vec<GraphicsCbufSlotSnapshot>,
+    },
+}
+
+impl GraphicsCbufPayload {
+    pub fn owned(data: std::sync::Arc<Vec<u8>>) -> Self {
+        Self::Owned(data)
+    }
+
+    pub fn from_slots(packed_size: usize, slots: Vec<GraphicsCbufSlotSnapshot>) -> Option<Self> {
+        if packed_size < nexium_spirv::GFX_CBUF_MIN_SIZE as usize {
+            return None;
+        }
+        let mut occupied = [false; nexium_spirv::GFX_CBUF_SLOTS as usize];
+        for slot in &slots {
+            let logical_slot = slot.logical_slot();
+            let payload_len = slot.word_count().checked_mul(4)?;
+            let end = slot.packed_offset().checked_add(payload_len)?;
+            if occupied[logical_slot]
+                || end > packed_size
+                || slot.read_len() > payload_len
+                || slot.source_offset().saturating_add(slot.read_len()) > slot.data().len()
+            {
+                return None;
+            }
+            occupied[logical_slot] = true;
+        }
+        Some(Self::Slots {
+            packed_size: packed_size.try_into().ok()?,
+            slots,
+        })
+    }
+
+    pub fn packed_len(&self) -> usize {
+        match self {
+            Self::Owned(data) if data.len() >= nexium_spirv::GFX_CBUF_MIN_SIZE as usize => {
+                data.len()
+            }
+            Self::Owned(_) => nexium_spirv::GFX_CBUF_MIN_SIZE as usize,
+            Self::Slots { packed_size, .. } => *packed_size as usize,
+        }
+    }
+
+    pub fn slots(&self) -> Option<&[GraphicsCbufSlotSnapshot]> {
+        match self {
+            Self::Owned(_) => None,
+            Self::Slots { slots, .. } => Some(slots),
+        }
+    }
+
+    pub fn word(&self, logical_slot: usize, byte_offset: usize) -> Option<u32> {
+        if logical_slot >= nexium_spirv::GFX_CBUF_SLOTS as usize {
+            return None;
+        }
+        match self {
+            Self::Owned(data) => {
+                let directory = logical_slot.checked_mul(8)?;
+                let base_word =
+                    u32::from_le_bytes(data.get(directory..directory + 4)?.try_into().ok()?);
+                let word_count =
+                    u32::from_le_bytes(data.get(directory + 4..directory + 8)?.try_into().ok()?);
+                let start = usize::try_from(base_word)
+                    .ok()?
+                    .checked_mul(4)?
+                    .checked_add(byte_offset)?;
+                let slot_end = usize::try_from(base_word)
+                    .ok()?
+                    .checked_add(usize::try_from(word_count).ok()?)?
+                    .checked_mul(4)?;
+                let end = start.checked_add(4)?;
+                (end <= slot_end)
+                    .then(|| data.get(start..end))
+                    .flatten()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u32::from_le_bytes)
+            }
+            Self::Slots { slots, .. } => {
+                let slot = slots
+                    .iter()
+                    .find(|slot| slot.logical_slot() == logical_slot)?;
+                let end = byte_offset.checked_add(4)?;
+                if end > slot.word_count().checked_mul(4)? {
+                    return None;
+                }
+                let mut bytes = [0u8; 4];
+                if byte_offset < slot.read_len() {
+                    let copy_len = (slot.read_len() - byte_offset).min(4);
+                    let source_offset = slot.source_offset().checked_add(byte_offset)?;
+                    bytes[..copy_len]
+                        .copy_from_slice(slot.data().get(source_offset..source_offset + copy_len)?);
+                }
+                Some(u32::from_le_bytes(bytes))
+            }
+        }
+    }
+
+    pub fn write_packed_to(&self, dst: &mut [u8]) -> bool {
+        let packed_len = self.packed_len();
+        let Some(dst) = dst.get_mut(..packed_len) else {
+            return false;
+        };
+        match self {
+            Self::Owned(data) if data.len() >= nexium_spirv::GFX_CBUF_MIN_SIZE as usize => {
+                dst.copy_from_slice(data);
+                true
+            }
+            Self::Owned(_) => write_empty_graphics_cbuf(dst),
+            Self::Slots { slots, .. } => {
+                if !write_empty_graphics_cbuf(dst) {
+                    return false;
+                }
+                for slot in slots {
+                    let directory = slot.logical_slot() * 8;
+                    let base_word = slot.packed_offset() / 4;
+                    dst[directory..directory + 4]
+                        .copy_from_slice(&(base_word as u32).to_le_bytes());
+                    dst[directory + 4..directory + 8]
+                        .copy_from_slice(&(slot.word_count() as u32).to_le_bytes());
+                    let start = slot.packed_offset();
+                    let read_end = start + slot.read_len();
+                    let source_start = slot.source_offset();
+                    dst[start..read_end].copy_from_slice(
+                        &slot.data()[source_start..source_start + slot.read_len()],
+                    );
+                }
+                true
+            }
+        }
+    }
+
+    pub fn materialize(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Self::Owned(data) if data.len() >= nexium_spirv::GFX_CBUF_MIN_SIZE as usize => {
+                std::borrow::Cow::Borrowed(data.as_slice())
+            }
+            _ => {
+                let mut data = vec![0u8; self.packed_len()];
+                let written = self.write_packed_to(&mut data);
+                debug_assert!(written);
+                std::borrow::Cow::Owned(data)
+            }
+        }
+    }
+}
+
+fn write_empty_graphics_cbuf(dst: &mut [u8]) -> bool {
+    if dst.len() < nexium_spirv::GFX_CBUF_MIN_SIZE as usize {
+        return false;
+    }
+    dst.fill(0);
+    for logical_slot in 0..nexium_spirv::GFX_CBUF_SLOTS as usize {
+        let directory = logical_slot * 8;
+        dst[directory..directory + 4]
+            .copy_from_slice(&nexium_spirv::GFX_CBUF_ZERO_WORD.to_le_bytes());
+    }
+    true
+}
+
+pub const RESIDENT_CHUNK_SHIFT: u32 = 16;
+pub const RESIDENT_CHUNK_SIZE: usize = 1 << RESIDENT_CHUNK_SHIFT;
+
+#[derive(Clone, Debug)]
+pub struct ResidentVertexChunk {
+    pub chunk_key: u64,
+    pub serial: u64,
+    pub data: std::sync::Arc<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResidentVertexRange {
+    pub binding: u32,
+    pub stride: u64,
+    pub cpu_va: u64,
+    pub len: usize,
+    pub chunks: Vec<ResidentVertexChunk>,
+}
+
+impl ResidentVertexRange {
+    pub fn assemble(&self) -> Option<Vec<u8>> {
+        let first_base = self.chunks.first()?.chunk_key << RESIDENT_CHUNK_SHIFT;
+        let mut out = vec![0u8; self.len];
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            if chunk.data.len() != RESIDENT_CHUNK_SIZE
+                || chunk.chunk_key != self.chunks[0].chunk_key + index as u64
+            {
+                return None;
+            }
+            let chunk_base = chunk.chunk_key << RESIDENT_CHUNK_SHIFT;
+            let range_end = self.cpu_va.checked_add(self.len as u64)?;
+            let lo = self.cpu_va.max(chunk_base);
+            let hi = range_end.min(chunk_base + RESIDENT_CHUNK_SIZE as u64);
+            if hi <= lo {
+                return None;
+            }
+            let src = (lo - chunk_base) as usize;
+            let dst = (lo - self.cpu_va) as usize;
+            let len = (hi - lo) as usize;
+            out[dst..dst + len].copy_from_slice(&chunk.data[src..src + len]);
+        }
+        if self.cpu_va < first_base {
+            return None;
+        }
+        Some(out)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Maxwell3dDrawCall {
     pub vs_spirv: std::sync::Arc<Vec<u32>>,
     pub fs_spirv: std::sync::Arc<Vec<u32>>,
@@ -162,8 +458,8 @@ pub struct Maxwell3dDrawCall {
     pub fs_gpu_va: u64,
     pub vs_hash: u64,
     pub fs_hash: u64,
-    pub vs_cbuf_mask: u32,
-    pub fs_cbuf_mask: u32,
+    pub vs_cbuf_mask: u64,
+    pub fs_cbuf_mask: u64,
     pub fs_tex_ids: Vec<u32>,
     pub sprite_batch_mirror: bool,
     pub texture_numeric_manifest: Vec<crate::texture_manifest::TextureNumericBinding>,
@@ -173,9 +469,10 @@ pub struct Maxwell3dDrawCall {
     pub vertex_layout: VertexLayout,
     pub cbuf_addr: u64,
     pub cbuf_size: u32,
-    pub cbuf_data: Option<Vec<u8>>,
+    pub cbuf_data: Option<GraphicsCbufPayload>,
     pub vertex_addr: u64,
     pub vertex_bindings: Vec<VertexBufferBinding>,
+    pub resident_vertex: Vec<ResidentVertexRange>,
     pub vertex_count: u32,
     pub first_vertex: u32,
     pub instance_count: u32,
@@ -183,7 +480,7 @@ pub struct Maxwell3dDrawCall {
     pub index_addr: Option<u64>,
     pub index_count: Option<u32>,
     pub index_type: vk::IndexType,
-    pub index_data: Option<Vec<u8>>,
+    pub index_data: Option<std::sync::Arc<Vec<u8>>>,
     pub primitive_restart_enabled: bool,
     pub primitive_restart_index: u32,
     pub quad_expand: bool,
@@ -209,6 +506,11 @@ pub struct Maxwell3dDrawCall {
     pub sampled_rt_keys: Vec<RtKey>,
     pub sampled_rt_slots: Vec<Option<RtKey>>,
     pub sampled_rt_copy_sources: Vec<Option<RtKey>>,
+    pub sampled_rt_fermi_exact_slots: Vec<Option<FermiExactRtToken>>,
+    pub sampled_rt_fermi_snapshot_slots: Vec<Option<u64>>,
+    pub sampled_rt_snapshot_slots: Vec<bool>,
+    pub fragment_barrier_after: bool,
+    pub texture_cache_invalidate_after: bool,
     pub clear: bool,
     pub clear_color: [f32; 4],
     pub tic_pool_gpu_va: u64,
@@ -367,7 +669,7 @@ mod tests {
 
     use super::{
         indexed_vertex_span, primitive_restart_fixed_index, primitive_restart_topology_supported,
-        StorageBufferSnapshot,
+        GraphicsCbufPayload, GraphicsCbufSlotSnapshot, StorageBufferSnapshot,
     };
 
     #[test]
@@ -414,5 +716,37 @@ mod tests {
 
         assert!(std::sync::Arc::ptr_eq(&snapshot.data, &cloned.data));
         assert_eq!(cloned.data.as_slice(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn graphics_cbuf_slot_payload_writes_packed_abi() {
+        let first = std::sync::Arc::new(vec![1, 2, 3, 4, 5]);
+        let second = std::sync::Arc::new(vec![9, 8, 7, 6]);
+        let slots = vec![
+            GraphicsCbufSlotSnapshot::new(0, 5, 304, first.clone()).unwrap(),
+            GraphicsCbufSlotSnapshot::new(24, 4, 320, second.clone()).unwrap(),
+        ];
+        let payload = GraphicsCbufPayload::from_slots(324, slots).unwrap();
+        let mut packed = vec![0xff; payload.packed_len()];
+
+        assert!(payload.write_packed_to(&mut packed));
+        assert_eq!(u32::from_le_bytes(packed[0..4].try_into().unwrap()), 76);
+        assert_eq!(u32::from_le_bytes(packed[4..8].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(packed[8..12].try_into().unwrap()),
+            nexium_spirv::GFX_CBUF_ZERO_WORD
+        );
+        assert_eq!(
+            u32::from_le_bytes(packed[24 * 8..24 * 8 + 4].try_into().unwrap()),
+            80
+        );
+        assert_eq!(&packed[304..309], first.as_slice());
+        assert_eq!(&packed[309..320], &[0; 11]);
+        assert_eq!(&packed[320..324], second.as_slice());
+        assert_eq!(payload.word(0, 4), Some(5));
+        assert!(std::sync::Arc::ptr_eq(
+            payload.slots().unwrap()[0].data(),
+            &first
+        ));
     }
 }

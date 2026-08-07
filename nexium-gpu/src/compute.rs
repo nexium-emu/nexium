@@ -198,12 +198,23 @@ pub struct ComputeUniformBuffer {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ComputeRawStorageKey {
+    pub mapping_epoch: u64,
+    pub nvmap_id: u32,
+    pub gpu_va: u64,
+    pub cpu_addr: u64,
+    pub size: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ComputeTexelBuffer {
     pub bindings: Vec<u32>,
     pub bytes: Vec<u8>,
+    pub byte_len: usize,
     pub format: ComputeTexelFormat,
     pub raw: bool,
+    pub raw_storage_key: Option<ComputeRawStorageKey>,
     pub writable: bool,
     pub requires_atomics: bool,
 }
@@ -225,6 +236,7 @@ pub struct ComputeSampledRt {
     pub guest_bytes: Option<Vec<u8>>,
     pub guest_bytes_authoritative: bool,
     pub require_live: bool,
+    pub content_key: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +248,7 @@ pub struct ComputeSampledImage {
     pub guest_bytes: Vec<u8>,
     pub guest_bytes_authoritative: bool,
     pub require_live: bool,
+    pub content_key: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -259,6 +272,7 @@ pub struct ComputeImageAlias {
 pub struct ComputeDispatch {
     pub program_key: u64,
     pub spirv: Arc<[u32]>,
+    pub spirv_hash: u64,
     pub group_count: [u32; 3],
     pub local_size: [u32; 3],
     pub shared_memory_size: u32,
@@ -393,6 +407,24 @@ pub(crate) fn descriptor_spec(dispatch: &ComputeDispatch) -> Vec<ComputeDescript
     descriptors
 }
 
+pub(crate) fn compute_buffer_binding_counts(buffers: &[ComputeTexelBuffer]) -> (usize, usize) {
+    buffers
+        .iter()
+        .fold((0, 0), |(raw_storage, storage_texel), buffer| {
+            if buffer.raw {
+                (
+                    raw_storage.saturating_add(buffer.bindings.len()),
+                    storage_texel,
+                )
+            } else {
+                (
+                    raw_storage,
+                    storage_texel.saturating_add(buffer.bindings.len()),
+                )
+            }
+        })
+}
+
 pub(crate) fn validate_compute_local_size(
     local_size: [u32; 3],
     max_size: [u32; 3],
@@ -423,7 +455,7 @@ pub(crate) fn validate_compute_local_size(
     Ok(invocations)
 }
 
-fn compute_spirv_hash(words: &[u32]) -> u64 {
+pub fn compute_spirv_hash(words: &[u32]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in words.iter().flat_map(|word| word.to_le_bytes()) {
         hash ^= u64::from(byte);
@@ -450,6 +482,8 @@ struct ComputeProgram {
 
 const COMPUTE_UNIFORM_POOL_MAX_ITEMS: usize = 16;
 const COMPUTE_UNIFORM_POOL_MAX_BYTES: u64 = 1024 * 1024;
+const COMPUTE_RAW_STORAGE_POOL_MAX_ITEMS: usize = 512;
+const COMPUTE_RAW_STORAGE_POOL_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const COMPUTE_OUTPUT_POOL_MAX_ITEMS: usize = 8;
 const COMPUTE_OUTPUT_POOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const COMPUTE_READBACK_POOL_MAX_ITEMS: usize = 8;
@@ -523,6 +557,7 @@ struct ComputeOutputPoolKey {
 
 struct ComputeResourcePool {
     uniforms: BoundedResourcePool<u64, ComputeBufferResource>,
+    raw_storage: BoundedResourcePool<u64, ComputeBufferResource>,
     outputs: BoundedResourcePool<ComputeOutputPoolKey, ComputeImageResource>,
     readbacks: BoundedResourcePool<u64, ComputeBufferResource>,
     stats: ComputeResourcePoolStats,
@@ -533,6 +568,8 @@ struct ComputeResourcePoolStats {
     completed_dispatches: u64,
     uniform_hits: u64,
     uniform_misses: u64,
+    raw_storage_hits: u64,
+    raw_storage_misses: u64,
     output_hits: u64,
     output_misses: u64,
     readback_hits: u64,
@@ -545,6 +582,10 @@ impl ComputeResourcePool {
             uniforms: BoundedResourcePool::new(
                 COMPUTE_UNIFORM_POOL_MAX_ITEMS,
                 COMPUTE_UNIFORM_POOL_MAX_BYTES,
+            ),
+            raw_storage: BoundedResourcePool::new(
+                COMPUTE_RAW_STORAGE_POOL_MAX_ITEMS,
+                COMPUTE_RAW_STORAGE_POOL_MAX_BYTES,
             ),
             outputs: BoundedResourcePool::new(
                 COMPUTE_OUTPUT_POOL_MAX_ITEMS,
@@ -565,19 +606,24 @@ impl ComputeResourcePool {
             return;
         }
         log::info!(
-            "[compute-pool] dispatches={} uniform_hit_miss={}/{} output_hit_miss={}/{} \
-             readback_hit_miss={}/{} retained_items={}/{}/{} retained_bytes={}/{}/{}",
+            "[compute-pool] dispatches={} uniform_hit_miss={}/{} raw_storage_hit_miss={}/{} \
+             output_hit_miss={}/{} readback_hit_miss={}/{} retained_items={}/{}/{}/{} \
+             retained_bytes={}/{}/{}/{}",
             dispatches,
             self.stats.uniform_hits,
             self.stats.uniform_misses,
+            self.stats.raw_storage_hits,
+            self.stats.raw_storage_misses,
             self.stats.output_hits,
             self.stats.output_misses,
             self.stats.readback_hits,
             self.stats.readback_misses,
             self.uniforms.entries.len(),
+            self.raw_storage.entries.len(),
             self.outputs.entries.len(),
             self.readbacks.entries.len(),
             self.uniforms.retained_bytes,
+            self.raw_storage.retained_bytes,
             self.outputs.retained_bytes,
             self.readbacks.retained_bytes,
         );
@@ -585,6 +631,9 @@ impl ComputeResourcePool {
 
     fn destroy(&mut self, device: &ash::Device) {
         for buffer in self.uniforms.drain_values() {
+            buffer.destroy(device);
+        }
+        for buffer in self.raw_storage.drain_values() {
             buffer.destroy(device);
         }
         for image in self.outputs.drain_values() {
@@ -820,7 +869,7 @@ pub(crate) struct PreparedComputeProgram {
     pub descriptor_set: vk::DescriptorSet,
 }
 
-pub(crate) const COMPUTE_PROGRAM_SET_CAPACITY: u32 = 16;
+pub(crate) const COMPUTE_PROGRAM_SET_CAPACITY: u32 = 64;
 
 pub(crate) struct ComputeBackend {
     programs: HashMap<ComputePipelineKey, ComputeProgram>,
@@ -836,6 +885,8 @@ pub(crate) struct ComputeBackend {
     pub max_image_dimension_3d: u32,
     pub max_uniform_buffer_range: u32,
     pub max_uniform_buffers: u32,
+    pub max_storage_buffer_range: u32,
+    pub max_storage_buffers: u32,
     pub max_storage_texel_buffers: u32,
     pub max_samplers: u32,
     pub max_sampled_images: u32,
@@ -869,6 +920,10 @@ impl ComputeBackend {
             max_image_dimension_3d: limits.max_image_dimension3_d,
             max_uniform_buffer_range: limits.max_uniform_buffer_range,
             max_uniform_buffers: limits.max_per_stage_descriptor_uniform_buffers,
+            max_storage_buffer_range: limits.max_storage_buffer_range,
+            max_storage_buffers: limits
+                .max_per_stage_descriptor_storage_buffers
+                .min(limits.max_descriptor_set_storage_buffers),
             max_storage_texel_buffers: limits.max_per_stage_descriptor_storage_images,
             max_samplers: limits.max_per_stage_descriptor_samplers,
             max_sampled_images: limits.max_per_stage_descriptor_sampled_images,
@@ -884,6 +939,7 @@ impl ComputeBackend {
         device: &ash::Device,
         program_key: u64,
         spirv: &[u32],
+        spirv_hash: u64,
         local_size: [u32; 3],
         required_subgroup_size: Option<u32>,
         descriptors: Vec<ComputeDescriptorSpec>,
@@ -896,7 +952,7 @@ impl ComputeBackend {
         )?;
         let key = ComputePipelineKey {
             program_key,
-            spirv_hash: compute_spirv_hash(spirv),
+            spirv_hash,
             local_size,
             required_subgroup_size: required_subgroup_size.unwrap_or(0),
             descriptors,
@@ -938,13 +994,40 @@ impl ComputeBackend {
         }
         self.resource_pool.stats.uniform_misses =
             self.resource_pool.stats.uniform_misses.saturating_add(1);
-        create_compute_buffer(
+        create_compute_buffer_allocation(
             device,
             mem_props,
-            data,
+            data.len().max(16) as u64,
+            Some(data),
             vk::BufferUsageFlags::UNIFORM_BUFFER,
+            None,
             false,
+            true,
         )
+    }
+
+    pub fn acquire_raw_storage_buffer(
+        &mut self,
+        device: &ash::Device,
+        mem_props: &vk::PhysicalDeviceMemoryProperties,
+        data: &[u8],
+    ) -> Result<ComputeBufferResource, String> {
+        let key = data.len().max(16) as u64;
+        if let Some(resource) = self.resource_pool.raw_storage.take(&key) {
+            self.resource_pool.stats.raw_storage_hits =
+                self.resource_pool.stats.raw_storage_hits.saturating_add(1);
+            if let Err(error) = resource.write(device, data) {
+                resource.destroy(device);
+                return Err(error);
+            }
+            return Ok(resource);
+        }
+        self.resource_pool.stats.raw_storage_misses = self
+            .resource_pool
+            .stats
+            .raw_storage_misses
+            .saturating_add(1);
+        create_compute_raw_storage_buffer(device, mem_props, data)
     }
 
     pub fn acquire_output_image(
@@ -999,6 +1082,7 @@ impl ComputeBackend {
         &mut self,
         device: &ash::Device,
         uniforms: Vec<ComputeBufferResource>,
+        raw_storage: Vec<ComputeBufferResource>,
         outputs: Vec<ComputeImageResource>,
         readbacks: Vec<ComputeBufferResource>,
     ) {
@@ -1006,6 +1090,13 @@ impl ComputeBackend {
             let key = resource.size;
             let bytes = resource.allocation_size;
             for evicted in self.resource_pool.uniforms.insert(key, resource, bytes) {
+                evicted.destroy(device);
+            }
+        }
+        for resource in raw_storage {
+            let key = resource.size;
+            let bytes = resource.allocation_size;
+            for evicted in self.resource_pool.raw_storage.insert(key, resource, bytes) {
                 evicted.destroy(device);
             }
         }
@@ -1047,6 +1138,7 @@ pub(crate) struct ComputeBufferResource {
     pub allocation_size: u64,
     pub size: u64,
     pub view: vk::BufferView,
+    mapped: *mut u8,
 }
 
 impl ComputeBufferResource {
@@ -1054,6 +1146,9 @@ impl ComputeBufferResource {
         unsafe {
             if self.view != vk::BufferView::null() {
                 device.destroy_buffer_view(self.view, None);
+            }
+            if !self.mapped.is_null() {
+                device.unmap_memory(self.memory);
             }
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);
@@ -1072,17 +1167,24 @@ impl ComputeBufferResource {
             return Ok(bytes);
         }
         unsafe {
-            let ptr = device
-                .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
-                .map_err(|e| format!("map compute readback buffer: {e:?}"))?
-                as *const u8;
+            let transient = self.mapped.is_null();
+            let ptr = if transient {
+                device
+                    .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
+                    .map_err(|e| format!("map compute readback buffer: {e:?}"))?
+                    as *const u8
+            } else {
+                self.mapped.cast_const()
+            };
             std::ptr::copy_nonoverlapping(ptr, bytes.as_mut_ptr(), byte_len);
-            device.unmap_memory(self.memory);
+            if transient {
+                device.unmap_memory(self.memory);
+            }
         }
         Ok(bytes)
     }
 
-    fn write(&self, device: &ash::Device, data: &[u8]) -> Result<(), String> {
+    pub(crate) fn write(&self, device: &ash::Device, data: &[u8]) -> Result<(), String> {
         if data.len() as u64 > self.size {
             return Err(format!(
                 "compute buffer write exceeds allocation: {} > {}",
@@ -1094,15 +1196,39 @@ impl ComputeBufferResource {
             return Ok(());
         }
         unsafe {
-            let ptr = device
-                .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
-                .map_err(|e| format!("map compute upload buffer: {e:?}"))?
-                as *mut u8;
+            let transient = self.mapped.is_null();
+            let ptr = if transient {
+                device
+                    .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
+                    .map_err(|e| format!("map compute upload buffer: {e:?}"))?
+                    as *mut u8
+            } else {
+                self.mapped
+            };
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            device.unmap_memory(self.memory);
+            if transient {
+                device.unmap_memory(self.memory);
+            }
         }
         Ok(())
     }
+}
+
+fn create_compute_raw_storage_buffer(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    data: &[u8],
+) -> Result<ComputeBufferResource, String> {
+    create_compute_buffer_allocation(
+        device,
+        mem_props,
+        data.len().max(16) as u64,
+        Some(data),
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        None,
+        false,
+        true,
+    )
 }
 
 pub(crate) fn create_compute_buffer(
@@ -1119,6 +1245,7 @@ pub(crate) fn create_compute_buffer(
         Some(data),
         usage,
         with_r32_uint_view.then_some(vk::Format::R32_UINT),
+        false,
         false,
     )
 }
@@ -1138,6 +1265,7 @@ pub(crate) fn create_compute_texel_buffer(
         usage,
         Some(format),
         false,
+        false,
     )
 }
 
@@ -1154,6 +1282,7 @@ fn create_compute_readback_buffer(
         vk::BufferUsageFlags::TRANSFER_DST,
         None,
         true,
+        false,
     )
 }
 
@@ -1165,6 +1294,7 @@ fn create_compute_buffer_allocation(
     usage: vk::BufferUsageFlags,
     view_format: Option<vk::Format>,
     prefer_host_cached: bool,
+    persistently_mapped: bool,
 ) -> Result<ComputeBufferResource, String> {
     let info = vk::BufferCreateInfo {
         s_type: vk::StructureType::BUFFER_CREATE_INFO,
@@ -1225,11 +1355,13 @@ fn create_compute_buffer_allocation(
         }
         return Err(format!("bind compute buffer memory: {e:?}"));
     }
-    if let Some(data) = initial_data.filter(|data| !data.is_empty()) {
-        let mapped = match unsafe {
+    let should_map = persistently_mapped || initial_data.is_some_and(|data| !data.is_empty());
+    let mut mapped = std::ptr::null_mut();
+    if should_map {
+        mapped = match unsafe {
             device.map_memory(memory, 0, requirements.size, vk::MemoryMapFlags::empty())
         } {
-            Ok(mapped) => mapped,
+            Ok(mapped) => mapped.cast(),
             Err(e) => {
                 unsafe {
                     device.destroy_buffer(buffer, None);
@@ -1238,10 +1370,17 @@ fn create_compute_buffer_allocation(
                 return Err(format!("map compute upload buffer: {e:?}"));
             }
         };
+    }
+    if let Some(data) = initial_data.filter(|data| !data.is_empty()) {
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped as *mut u8, data.len());
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped, data.len());
+        }
+    }
+    if !persistently_mapped && !mapped.is_null() {
+        unsafe {
             device.unmap_memory(memory);
         }
+        mapped = std::ptr::null_mut();
     }
     let view = if let Some(format) = view_format {
         let view_range = initial_data.map_or(size, |data| data.len() as u64);
@@ -1257,6 +1396,9 @@ fn create_compute_buffer_allocation(
             Ok(view) => view,
             Err(e) => {
                 unsafe {
+                    if !mapped.is_null() {
+                        device.unmap_memory(memory);
+                    }
                     device.destroy_buffer(buffer, None);
                     device.free_memory(memory, None);
                 }
@@ -1272,6 +1414,7 @@ fn create_compute_buffer_allocation(
         allocation_size: requirements.size,
         size,
         view,
+        mapped,
     })
 }
 
@@ -1445,14 +1588,146 @@ pub(crate) fn create_compute_sampled_alias_view(
         .map_err(|error| format!("create compute sampled/storage alias view: {error:?}"))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_compute_sampled_image(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    width: u32,
+    height: u32,
+    depth: u32,
+    is_3d: bool,
+    format: vk::Format,
+    components: vk::ComponentMapping,
+    mip_levels: u32,
+    view_base_mip: u32,
+    view_mip_levels: u32,
+) -> Result<ComputeImageResource, String> {
+    let mip_levels = mip_levels.max(1);
+    let max_mip_levels = u32::BITS - width.max(height).max(depth).max(1).leading_zeros();
+    if width == 0
+        || height == 0
+        || depth == 0
+        || (is_3d && mip_levels != 1)
+        || mip_levels > max_mip_levels
+        || view_mip_levels == 0
+        || view_base_mip >= mip_levels
+        || view_base_mip.saturating_add(view_mip_levels) > mip_levels
+    {
+        return Err(format!(
+            "invalid cached compute sampled image/view: levels={mip_levels} view={view_base_mip}/{view_mip_levels} extent={width}x{height}x{depth} 3d={is_3d}"
+        ));
+    }
+    let info = vk::ImageCreateInfo {
+        s_type: vk::StructureType::IMAGE_CREATE_INFO,
+        image_type: if is_3d {
+            vk::ImageType::TYPE_3D
+        } else {
+            vk::ImageType::TYPE_2D
+        },
+        format,
+        extent: vk::Extent3D {
+            width,
+            height,
+            depth,
+        },
+        mip_levels,
+        array_layers: 1,
+        samples: vk::SampleCountFlags::TYPE_1,
+        tiling: vk::ImageTiling::OPTIMAL,
+        usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        initial_layout: vk::ImageLayout::UNDEFINED,
+        ..Default::default()
+    };
+    let image = unsafe {
+        device
+            .create_image(&info, None)
+            .map_err(|error| format!("create cached compute sampled image: {error:?}"))?
+    };
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+    let Some(memory_type_index) = find_memory_type(
+        mem_props,
+        requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    ) else {
+        unsafe { device.destroy_image(image, None) };
+        return Err("no DEVICE_LOCAL memory for cached compute sampled image".to_string());
+    };
+    let allocation = vk::MemoryAllocateInfo {
+        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+        allocation_size: requirements.size,
+        memory_type_index,
+        ..Default::default()
+    };
+    let memory = match unsafe { device.allocate_memory(&allocation, None) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            unsafe { device.destroy_image(image, None) };
+            return Err(format!("allocate cached compute sampled image: {error:?}"));
+        }
+    };
+    if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
+        unsafe {
+            device.destroy_image(image, None);
+            device.free_memory(memory, None);
+        }
+        return Err(format!("bind cached compute sampled image: {error:?}"));
+    }
+    let view_info = vk::ImageViewCreateInfo {
+        s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+        image,
+        view_type: if is_3d {
+            vk::ImageViewType::TYPE_3D
+        } else {
+            vk::ImageViewType::TYPE_2D
+        },
+        format,
+        components,
+        subresource_range: vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: view_base_mip,
+            level_count: view_mip_levels,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        ..Default::default()
+    };
+    let view = match unsafe { device.create_image_view(&view_info, None) } {
+        Ok(view) => view,
+        Err(error) => {
+            unsafe {
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+            }
+            return Err(format!(
+                "create cached compute sampled image view: {error:?}"
+            ));
+        }
+    };
+    Ok(ComputeImageResource {
+        image,
+        view,
+        memory,
+        allocation_size: requirements.size,
+        width,
+        height,
+        depth,
+        is_3d,
+        format,
+        sampled: true,
+    })
+}
+
 pub(crate) struct ComputeGuestImageResource {
     pub image: ComputeImageResource,
     pub upload: ComputeBufferResource,
+    pub needs_upload: bool,
     pub width: u32,
     pub height: u32,
     pub depth: u32,
     pub mip_levels: u32,
     pub copies: Vec<vk::BufferImageCopy>,
+    pub layout: vk::ImageLayout,
 }
 
 impl ComputeGuestImageResource {
@@ -1477,6 +1752,7 @@ pub(crate) fn create_compute_guest_image(
     height: u32,
     depth: u32,
     is_3d: bool,
+    is_cube: bool,
     format: vk::Format,
     components: vk::ComponentMapping,
     mip_levels: u32,
@@ -1488,6 +1764,12 @@ pub(crate) fn create_compute_guest_image(
     if upload_bytes.is_empty() {
         return Err("compute guest sampled image has no upload bytes".to_string());
     }
+    if is_cube && (is_3d || depth != 1 || width != height) {
+        return Err(format!(
+            "invalid compute guest cube image: extent={width}x{height}x{depth} 3d={is_3d} levels={mip_levels}"
+        ));
+    }
+    let array_layers = if is_cube { 6 } else { 1 };
     let mip_levels = mip_levels.max(1);
     let max_mip_levels = u32::BITS - width.max(height).max(depth).max(1).leading_zeros();
     if (is_3d && mip_levels != 1)
@@ -1510,12 +1792,15 @@ pub(crate) fn create_compute_guest_image(
     {
         return Err("compute guest sampled image has invalid mip copy regions".to_string());
     }
-    let upload = create_compute_buffer(
+    let upload = create_compute_buffer_allocation(
         device,
         mem_props,
-        upload_bytes,
+        upload_bytes.len().max(16) as u64,
+        Some(upload_bytes),
         vk::BufferUsageFlags::TRANSFER_SRC,
+        None,
         false,
+        true,
     )?;
     let info = vk::ImageCreateInfo {
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
@@ -1531,7 +1816,12 @@ pub(crate) fn create_compute_guest_image(
             depth,
         },
         mip_levels,
-        array_layers: 1,
+        array_layers,
+        flags: if is_cube {
+            vk::ImageCreateFlags::CUBE_COMPATIBLE
+        } else {
+            vk::ImageCreateFlags::empty()
+        },
         samples: vk::SampleCountFlags::TYPE_1,
         tiling: vk::ImageTiling::OPTIMAL,
         usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
@@ -1583,6 +1873,8 @@ pub(crate) fn create_compute_guest_image(
         image,
         view_type: if is_3d {
             vk::ImageViewType::TYPE_3D
+        } else if is_cube {
+            vk::ImageViewType::CUBE
         } else {
             vk::ImageViewType::TYPE_2D
         },
@@ -1593,7 +1885,7 @@ pub(crate) fn create_compute_guest_image(
             base_mip_level: view_base_mip,
             level_count: view_mip_levels,
             base_array_layer: 0,
-            layer_count: 1,
+            layer_count: array_layers,
         },
         ..Default::default()
     };
@@ -1624,6 +1916,7 @@ pub(crate) fn create_compute_guest_image(
             sampled: true,
         },
         upload,
+        needs_upload: true,
         width,
         height,
         depth,
@@ -1638,7 +1931,7 @@ pub(crate) fn create_compute_guest_image(
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: copy.mip_level,
                     base_array_layer: 0,
-                    layer_count: 1,
+                    layer_count: array_layers,
                 },
                 image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
                 image_extent: vk::Extent3D {
@@ -1648,14 +1941,16 @@ pub(crate) fn create_compute_guest_image(
                 },
             })
             .collect(),
+        layout: vk::ImageLayout::UNDEFINED,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_spirv_hash, validate_compute_local_size, BoundedResourcePool, ComputeOutputPoolKey,
-        ComputePipelineKey, ComputeStorageFormat,
+        compute_buffer_binding_counts, compute_spirv_hash, validate_compute_local_size,
+        BoundedResourcePool, ComputeOutputPoolKey, ComputePipelineKey, ComputeStorageFormat,
+        ComputeTexelBuffer, ComputeTexelFormat,
     };
     use crate::texture::{ComponentType, SwizzleSource, TicEntry, TicFormat};
     use ash::vk;
@@ -1677,6 +1972,7 @@ mod tests {
             block_height_log2: 0,
             block_depth_log2: 0,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: true,
             texture_type: 1,
             depth: 1,
@@ -1833,6 +2129,33 @@ mod tests {
         )
         .unwrap_err()
         .contains("overflows"));
+    }
+
+    #[test]
+    fn compute_buffer_limits_count_raw_and_typed_descriptors_separately() {
+        let buffers = vec![
+            ComputeTexelBuffer {
+                bindings: (0..11).collect(),
+                bytes: vec![0; 4],
+                byte_len: 4,
+                format: ComputeTexelFormat::R32Uint,
+                raw: true,
+                raw_storage_key: None,
+                writable: true,
+                requires_atomics: false,
+            },
+            ComputeTexelBuffer {
+                bindings: vec![32, 33, 34],
+                bytes: vec![0; 4],
+                byte_len: 4,
+                format: ComputeTexelFormat::R32Uint,
+                raw: false,
+                raw_storage_key: None,
+                writable: true,
+                requires_atomics: false,
+            },
+        ];
+        assert_eq!(compute_buffer_binding_counts(&buffers), (11, 3));
     }
 
     #[test]

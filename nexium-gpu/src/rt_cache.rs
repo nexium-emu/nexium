@@ -2,6 +2,8 @@ use ash::vk;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
+const RT_COLOR_GPU_PAGE_SHIFT: u32 = 20;
+
 #[derive(Clone, Copy, Debug)]
 pub struct RtKey {
     pub nvmap_id: u32,
@@ -181,10 +183,14 @@ fn same_d24_depth_allocation_covering(existing: RtKey, want: RtKey) -> bool {
 
 pub struct RtCache {
     cache: HashMap<RtKey, GpuImage>,
+    color_gpu_base_index: HashMap<u64, Vec<RtKey>>,
+    color_gpu_page_index: HashMap<u64, Vec<RtKey>>,
     depth_cache: HashMap<RtKey, GpuImage>,
     snapshots: HashMap<RtKey, GpuImage>,
     mem_properties: Option<vk::PhysicalDeviceMemoryProperties>,
     drawn_stamp: HashMap<RtKey, u64>,
+    guest_stale_color: HashSet<RtKey>,
+    guest_stale_depth: HashSet<RtKey>,
     present_excluded: HashSet<RtKey>,
     present_flip_y: HashMap<RtKey, bool>,
     drawn_counter: u64,
@@ -193,16 +199,115 @@ pub struct RtCache {
     depth_generation_counter: u64,
     depth_generations: HashMap<RtKey, u64>,
     depth_shadow_generations: HashMap<RtKey, (RtKey, u64)>,
+    guest_cpu_lo: u64,
+    guest_cpu_hi: u64,
+    guest_gpu_lo: u64,
+    guest_gpu_hi: u64,
+    color_guest_ranges: Vec<GuestRangeEntry>,
+    color_guest_range_index: HashMap<RtKey, usize>,
+    depth_guest_ranges: Vec<GuestRangeEntry>,
+    depth_guest_range_index: HashMap<RtKey, usize>,
+}
+
+#[derive(Clone, Copy)]
+struct GuestRangeEntry {
+    key: RtKey,
+    cpu_lo: u64,
+    cpu_hi: u64,
+    gpu_lo: u64,
+    gpu_hi: u64,
+}
+
+fn guest_range_entry(key: RtKey, base_format: vk::Format) -> Option<GuestRangeEntry> {
+    let image_size = (key.width as u64)
+        .saturating_mul(key.height as u64)
+        .saturating_mul(key.render_layer_count() as u64)
+        .saturating_mul(rt_format_bytes(base_format));
+    if image_size == 0 {
+        return None;
+    }
+    let (cpu_lo, cpu_hi) = if key.cpu_addr != 0 {
+        (key.cpu_addr, key.cpu_addr.saturating_add(image_size))
+    } else {
+        (0, 0)
+    };
+    let (gpu_lo, gpu_hi) = if key.gpu_va != 0 {
+        (key.gpu_va, key.gpu_va.saturating_add(image_size))
+    } else {
+        (0, 0)
+    };
+    Some(GuestRangeEntry {
+        key,
+        cpu_lo,
+        cpu_hi,
+        gpu_lo,
+        gpu_hi,
+    })
+}
+
+fn insert_guest_range(
+    ranges: &mut Vec<GuestRangeEntry>,
+    index: &mut HashMap<RtKey, usize>,
+    key: RtKey,
+    base_format: vk::Format,
+) {
+    let Some(entry) = guest_range_entry(key, base_format) else {
+        return;
+    };
+    if let Some(&pos) = index.get(&key) {
+        ranges[pos] = entry;
+    } else {
+        index.insert(key, ranges.len());
+        ranges.push(entry);
+    }
+}
+
+fn remove_guest_range(
+    ranges: &mut Vec<GuestRangeEntry>,
+    index: &mut HashMap<RtKey, usize>,
+    key: RtKey,
+) {
+    if let Some(pos) = index.remove(&key) {
+        ranges.swap_remove(pos);
+        if pos < ranges.len() {
+            index.insert(ranges[pos].key, pos);
+        }
+    }
+}
+
+fn guest_range_hits(
+    ranges: &[GuestRangeEntry],
+    cpu_addr: u64,
+    cpu_end: u64,
+    gpu_ranges: &[(u64, u64)],
+) -> Vec<RtKey> {
+    ranges
+        .iter()
+        .filter_map(|entry| {
+            let cpu_hit = entry.cpu_hi != 0 && cpu_addr < entry.cpu_hi && entry.cpu_lo < cpu_end;
+            let gpu_hit = entry.gpu_hi != 0
+                && gpu_ranges.iter().any(|&(gpu_va, gpu_size)| {
+                    gpu_size != 0
+                        && gpu_va < entry.gpu_hi
+                        && entry.gpu_lo < gpu_va.saturating_add(gpu_size)
+                });
+            (cpu_hit || gpu_hit).then_some(entry.key)
+        })
+        .collect()
 }
 
 impl RtCache {
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            color_gpu_base_index: HashMap::new(),
+            color_gpu_page_index: HashMap::new(),
             depth_cache: HashMap::new(),
             snapshots: HashMap::new(),
             mem_properties: None,
             drawn_stamp: HashMap::new(),
+            guest_stale_color: HashSet::new(),
+            guest_stale_depth: HashSet::new(),
             present_excluded: HashSet::new(),
             present_flip_y: HashMap::new(),
             drawn_counter: 0,
@@ -211,7 +316,102 @@ impl RtCache {
             depth_generation_counter: 0,
             depth_generations: HashMap::new(),
             depth_shadow_generations: HashMap::new(),
+            guest_cpu_lo: u64::MAX,
+            guest_cpu_hi: 0,
+            guest_gpu_lo: u64::MAX,
+            guest_gpu_hi: 0,
+            color_guest_ranges: Vec::new(),
+            color_guest_range_index: HashMap::new(),
+            depth_guest_ranges: Vec::new(),
+            depth_guest_range_index: HashMap::new(),
         }
+    }
+
+    fn index_color_lookup(&mut self, key: RtKey, format: vk::Format) {
+        if is_synthetic_copy_key(key) {
+            return;
+        }
+        let base = self.color_gpu_base_index.entry(key.gpu_va).or_default();
+        if !base.contains(&key) {
+            base.push(key);
+        }
+        let Some((first_page, last_page)) = rt_color_gpu_page_span(key, format) else {
+            return;
+        };
+        for page in first_page..=last_page {
+            let bucket = self.color_gpu_page_index.entry(page).or_default();
+            if !bucket.contains(&key) {
+                bucket.push(key);
+            }
+        }
+    }
+
+    fn unindex_color_lookup(&mut self, key: RtKey, format: vk::Format) {
+        if is_synthetic_copy_key(key) {
+            return;
+        }
+        remove_lookup_key(&mut self.color_gpu_base_index, key.gpu_va, key);
+        let Some((first_page, last_page)) = rt_color_gpu_page_span(key, format) else {
+            return;
+        };
+        for page in first_page..=last_page {
+            remove_lookup_key(&mut self.color_gpu_page_index, page, key);
+        }
+    }
+
+    fn extend_guest_bounds(&mut self, key: RtKey, base_format: vk::Format) {
+        let image_size = (key.width as u64)
+            .saturating_mul(key.height as u64)
+            .saturating_mul(key.render_layer_count() as u64)
+            .saturating_mul(rt_format_bytes(base_format));
+        if image_size == 0 {
+            return;
+        }
+        if key.cpu_addr != 0 {
+            self.guest_cpu_lo = self.guest_cpu_lo.min(key.cpu_addr);
+            self.guest_cpu_hi = self
+                .guest_cpu_hi
+                .max(key.cpu_addr.saturating_add(image_size));
+        }
+        if key.gpu_va != 0 {
+            self.guest_gpu_lo = self.guest_gpu_lo.min(key.gpu_va);
+            self.guest_gpu_hi = self.guest_gpu_hi.max(key.gpu_va.saturating_add(image_size));
+        }
+    }
+
+    fn insert_color_image(&mut self, key: RtKey, image: GpuImage) {
+        let format = image.format;
+        debug_assert!(!self.cache.contains_key(&key));
+        self.extend_guest_bounds(key, image.base_format);
+        insert_guest_range(
+            &mut self.color_guest_ranges,
+            &mut self.color_guest_range_index,
+            key,
+            image.base_format,
+        );
+        self.cache.insert(key, image);
+        let canonical = self
+            .cache
+            .get_key_value(&key)
+            .map(|(stored, _)| *stored)
+            .unwrap();
+        self.index_color_lookup(canonical, format);
+    }
+
+    fn remove_color_image(&mut self, key: RtKey) -> Option<(RtKey, GpuImage)> {
+        let (canonical, image) = self.cache.remove_entry(&key)?;
+        self.unindex_color_lookup(canonical, image.format);
+        remove_guest_range(
+            &mut self.color_guest_ranges,
+            &mut self.color_guest_range_index,
+            canonical,
+        );
+        Some((canonical, image))
+    }
+
+    fn clear_color_lookup_index(&mut self) {
+        self.color_gpu_base_index.clear();
+        self.color_gpu_page_index.clear();
     }
 
     fn canonical_depth_key(&self, key: RtKey) -> RtKey {
@@ -233,6 +433,7 @@ impl RtCache {
     fn forget_depth_tracking(&mut self, key: RtKey) {
         let canonical = self.canonical_depth_key(key);
         self.depth_generations.remove(&canonical);
+        self.guest_stale_depth.remove(&canonical);
         self.depth_shadow_generations.retain(|shadow, (source, _)| {
             *shadow != canonical
                 && *source != canonical
@@ -242,6 +443,7 @@ impl RtCache {
 
     pub(crate) fn mark_depth_written(&mut self, key: RtKey) -> u64 {
         let canonical = self.canonical_depth_key(key);
+        self.guest_stale_depth.remove(&canonical);
         let generation = self.next_depth_generation();
         self.depth_generations.insert(canonical, generation);
         generation
@@ -360,6 +562,7 @@ impl RtCache {
     pub fn mark_drawn(&mut self, key: RtKey) -> u64 {
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
+        self.guest_stale_color.remove(&key);
         self.present_excluded.remove(&key);
         *self.frame_draws.entry(key).or_insert(0) += 1;
         *self.frame_real_draws.entry(key).or_insert(0) += 1;
@@ -392,6 +595,7 @@ impl RtCache {
     pub fn mark_synced_sample(&mut self, key: RtKey) -> u64 {
         self.drawn_counter += 1;
         self.drawn_stamp.insert(key, self.drawn_counter);
+        self.guest_stale_color.remove(&key);
         self.present_excluded.insert(key);
         self.drawn_counter
     }
@@ -405,6 +609,7 @@ impl RtCache {
             .collect();
         for stale_key in stale {
             self.drawn_stamp.remove(&stale_key);
+            self.guest_stale_color.insert(stale_key);
             self.present_excluded.insert(stale_key);
             self.frame_draws.remove(&stale_key);
             self.frame_real_draws.remove(&stale_key);
@@ -417,7 +622,49 @@ impl RtCache {
             .collect();
         for stale_key in stale_depth {
             self.mark_depth_written(stale_key);
+            self.guest_stale_depth.insert(stale_key);
         }
+    }
+
+    pub fn mark_guest_written_range(
+        &mut self,
+        cpu_addr: u64,
+        size: u64,
+        gpu_ranges: &[(u64, u64)],
+    ) {
+        if cpu_addr == 0 || size == 0 {
+            return;
+        }
+        let cpu_may_overlap =
+            cpu_addr < self.guest_cpu_hi && self.guest_cpu_lo < cpu_addr.saturating_add(size);
+        let gpu_may_overlap = gpu_ranges.iter().any(|(gpu_va, gpu_size)| {
+            *gpu_va < self.guest_gpu_hi && self.guest_gpu_lo < gpu_va.saturating_add(*gpu_size)
+        });
+        if !cpu_may_overlap && !gpu_may_overlap {
+            return;
+        }
+        let cpu_end = cpu_addr.saturating_add(size);
+        let stale_color = guest_range_hits(&self.color_guest_ranges, cpu_addr, cpu_end, gpu_ranges);
+        for stale_key in stale_color {
+            self.drawn_stamp.remove(&stale_key);
+            self.guest_stale_color.insert(stale_key);
+            self.present_excluded.insert(stale_key);
+            self.frame_draws.remove(&stale_key);
+            self.frame_real_draws.remove(&stale_key);
+        }
+        let stale_depth = guest_range_hits(&self.depth_guest_ranges, cpu_addr, cpu_end, gpu_ranges);
+        for stale_key in stale_depth {
+            self.mark_depth_written(stale_key);
+            self.guest_stale_depth.insert(stale_key);
+        }
+    }
+
+    pub fn color_is_guest_stale(&self, key: RtKey) -> bool {
+        self.guest_stale_color.contains(&key)
+    }
+
+    pub fn depth_is_guest_stale(&self, key: RtKey) -> bool {
+        self.guest_stale_depth.contains(&key)
     }
 
     pub fn reset_frame_draws(&mut self) {
@@ -428,6 +675,7 @@ impl RtCache {
     pub fn mark_cleared(&mut self, key: RtKey, full_target: bool) {
         if full_target {
             self.drawn_stamp.remove(&key);
+            self.guest_stale_color.remove(&key);
         } else if self.drawn_stamp.contains_key(&key) {
             self.drawn_counter += 1;
             self.drawn_stamp.insert(key, self.drawn_counter);
@@ -649,6 +897,8 @@ impl RtCache {
                     && k.gpu_va == want.gpu_va
                     && k.width == want.width
                     && k.height == want.height
+                    && k.depth == 1
+                    && !k.is_3d
                     && !self.present_excluded.contains(k)
                     && self.drawn_stamp.contains_key(k)
             })
@@ -829,6 +1079,16 @@ impl RtCache {
         self.depth_cache.get_mut(&matching)
     }
 
+    pub fn color_target_touches_va(&self, gpu_va: u64) -> bool {
+        if gpu_va == 0 {
+            return false;
+        }
+        self.color_gpu_base_index.contains_key(&gpu_va)
+            || self
+                .color_gpu_page_index
+                .contains_key(&(gpu_va >> RT_COLOR_GPU_PAGE_SHIFT))
+    }
+
     pub fn find_color_key_at_va(&self, nvmap_id: u32, gpu_va: u64) -> Option<RtKey> {
         self.cache
             .keys()
@@ -886,18 +1146,47 @@ impl RtCache {
         if is_synthetic_copy_key(key) || key.gpu_va == 0 {
             return out;
         }
-        for (k, img) in &self.cache {
-            if is_synthetic_copy_key(*k)
-                || *k == key
-                || k.nvmap_id != key.nvmap_id
-                || k.gpu_va != key.gpu_va
+        let Some(candidates) = self.color_gpu_base_index.get(&key.gpu_va) else {
+            return out;
+        };
+        for candidate in candidates {
+            let Some((stored, img)) = self.cache.get_key_value(candidate) else {
+                continue;
+            };
+            let stored = *stored;
+            if stored == key || stored.nvmap_id != key.nvmap_id || stored.gpu_va != key.gpu_va {
+                continue;
+            }
+            let Some(stamp) = self.drawn_stamp.get(&stored).copied() else {
+                continue;
+            };
+            out.push((stored, img.image, img.layout, img.format, stamp));
+        }
+        out.sort_by_key(|(_, _, _, _, stamp)| *stamp);
+        out
+    }
+
+    #[cfg(test)]
+    fn drawn_color_aliases_full_scan(
+        &self,
+        key: RtKey,
+    ) -> Vec<(RtKey, vk::Image, vk::ImageLayout, vk::Format, u64)> {
+        let mut out = Vec::new();
+        if is_synthetic_copy_key(key) || key.gpu_va == 0 {
+            return out;
+        }
+        for (stored, img) in &self.cache {
+            if is_synthetic_copy_key(*stored)
+                || *stored == key
+                || stored.nvmap_id != key.nvmap_id
+                || stored.gpu_va != key.gpu_va
             {
                 continue;
             }
-            let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+            let Some(stamp) = self.drawn_stamp.get(stored).copied() else {
                 continue;
             };
-            out.push((*k, img.image, img.layout, img.format, stamp));
+            out.push((*stored, img.image, img.layout, img.format, stamp));
         }
         out.sort_by_key(|(_, _, _, _, stamp)| *stamp);
         out
@@ -909,19 +1198,19 @@ impl RtCache {
         })
     }
 
-    pub fn get_or_create_with_format(
+    fn get_or_create_color_image(
         &mut self,
         key: RtKey,
         device: &ash::Device,
         format: vk::Format,
-    ) -> Result<&mut GpuImage, String> {
+    ) -> Result<Option<GpuImage>, String> {
         let existing = self
             .cache
             .get(&key)
             .map(|image| (image.format, image.base_format));
         match existing {
             Some((current, _)) if current == format => {
-                return Ok(self.cache.get_mut(&key).unwrap());
+                return Ok(None);
             }
             Some((current, base)) if rt_formats_compatible(base, format) => {
                 if rt_format_dbg_enabled(key.nvmap_id) {
@@ -946,32 +1235,55 @@ impl RtCache {
                 }
                 image.view = image.views[&format];
                 image.format = format;
-                return Ok(image);
+                return Ok(None);
             }
             Some(_) => {}
             None => {}
         }
-        if existing.is_some() {
-            if let Some(image) = self.cache.remove(&key) {
-                if rt_format_dbg_enabled(key.nvmap_id) {
-                    log::warn!(
-                        "[rt-format-churn] key={} {:?}->{:?} stamp={}",
-                        key.label(),
-                        image.format,
-                        format,
-                        self.drawn_stamp.get(&key).copied().unwrap_or(0)
-                    );
-                }
-                destroy_gpu_image(device, image);
+        let replacement = self.create_image(device, key, format)?;
+        let retired = if let Some((canonical, image)) = self.remove_color_image(key) {
+            if rt_format_dbg_enabled(key.nvmap_id) {
+                log::warn!(
+                    "[rt-format-churn] key={} {:?}->{:?} stamp={}",
+                    canonical.label(),
+                    image.format,
+                    format,
+                    self.drawn_stamp.get(&canonical).copied().unwrap_or(0)
+                );
             }
-            self.drawn_stamp.remove(&key);
-            self.present_excluded.remove(&key);
-            self.present_flip_y.remove(&key);
-            self.frame_draws.remove(&key);
+            self.drawn_stamp.remove(&canonical);
+            self.present_excluded.remove(&canonical);
+            self.present_flip_y.remove(&canonical);
+            self.frame_draws.remove(&canonical);
+            Some(image)
+        } else {
+            None
+        };
+        self.insert_color_image(key, replacement);
+        Ok(retired)
+    }
+
+    pub fn get_or_create_with_format(
+        &mut self,
+        key: RtKey,
+        device: &ash::Device,
+        format: vk::Format,
+    ) -> Result<&mut GpuImage, String> {
+        if let Some(image) = self.get_or_create_color_image(key, device, format)? {
+            destroy_gpu_image(device, image);
         }
-        if !self.cache.contains_key(&key) {
-            let image = self.create_image(device, key, format)?;
-            self.cache.insert(key, image);
+        Ok(self.cache.get_mut(&key).unwrap())
+    }
+
+    pub fn get_or_create_with_format_retiring(
+        &mut self,
+        key: RtKey,
+        device: &ash::Device,
+        format: vk::Format,
+        retired: &mut Vec<GpuImage>,
+    ) -> Result<&mut GpuImage, String> {
+        if let Some(image) = self.get_or_create_color_image(key, device, format)? {
+            retired.push(image);
         }
         Ok(self.cache.get_mut(&key).unwrap())
     }
@@ -1010,35 +1322,49 @@ impl RtCache {
         let Some(target) = target else {
             return Ok(None);
         };
-        let cache_key = RtSampleViewKey::new(format, aspect, view_type, components);
-        if let Some(view) = target.sample_views.get(&cache_key) {
-            return Ok(Some(*view));
-        }
-
-        let view_info = vk::ImageViewCreateInfo {
-            s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
-            image: source_image,
-            view_type,
+        get_or_create_sample_view(
+            device,
+            target,
+            source_image,
             format,
-            subresource_range: vk::ImageSubresourceRange {
-                aspect_mask: aspect,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
+            aspect,
+            view_type,
             components,
-            p_next: std::ptr::null(),
-            flags: vk::ImageViewCreateFlags::empty(),
-            _marker: std::marker::PhantomData,
-        };
-        let view = unsafe {
-            device
-                .create_image_view(&view_info, None)
-                .map_err(|error| format!("create_image_view(rt sample): {:?}", error))?
-        };
-        target.sample_views.insert(cache_key, view);
-        Ok(Some(view))
+        )
+        .map(Some)
+    }
+
+    pub(crate) fn create_detached_color_image(
+        &self,
+        device: &ash::Device,
+        key: RtKey,
+        format: vk::Format,
+    ) -> Result<GpuImage, String> {
+        self.create_image(device, key, format)
+    }
+
+    pub(crate) fn get_or_create_detached_sample_view(
+        device: &ash::Device,
+        image: &mut GpuImage,
+        format: vk::Format,
+        aspect: vk::ImageAspectFlags,
+        view_type: vk::ImageViewType,
+        components: vk::ComponentMapping,
+    ) -> Result<vk::ImageView, String> {
+        let source_image = image.image;
+        get_or_create_sample_view(
+            device,
+            image,
+            source_image,
+            format,
+            aspect,
+            view_type,
+            components,
+        )
+    }
+
+    pub(crate) fn destroy_detached_image(device: &ash::Device, image: GpuImage) {
+        destroy_gpu_image(device, image);
     }
 
     pub fn get_or_create_depth(
@@ -1067,6 +1393,11 @@ impl RtCache {
         if recreate {
             self.forget_depth_tracking(cache_key);
             if let Some(image) = self.depth_cache.remove(&cache_key) {
+                remove_guest_range(
+                    &mut self.depth_guest_ranges,
+                    &mut self.depth_guest_range_index,
+                    cache_key,
+                );
                 destroy_gpu_image(device, image);
             }
         }
@@ -1082,7 +1413,15 @@ impl RtCache {
                     | vk::ImageUsageFlags::SAMPLED,
                 aspects,
             )?;
+            let depth_base_format = image.base_format;
             self.depth_cache.insert(cache_key, image);
+            self.extend_guest_bounds(cache_key, depth_base_format);
+            insert_guest_range(
+                &mut self.depth_guest_ranges,
+                &mut self.depth_guest_range_index,
+                cache_key,
+                depth_base_format,
+            );
             self.mark_depth_written(cache_key);
         }
         Ok((self.depth_cache.get_mut(&cache_key).unwrap(), created))
@@ -1153,6 +1492,21 @@ impl RtCache {
             }
         }
         best.map(|(k, img)| (k, img.image, img.view, img.layout, img.format, img.aspects))
+    }
+
+    pub fn find_sampleable_depth(
+        &self,
+        want: RtKey,
+    ) -> Option<(
+        RtKey,
+        vk::Image,
+        vk::ImageView,
+        vk::ImageLayout,
+        vk::Format,
+        vk::ImageAspectFlags,
+    )> {
+        self.find_depth(want)
+            .filter(|(key, _, _, _, _, _)| !self.depth_is_guest_stale(*key))
     }
 
     pub fn find_d24_depth_covering(
@@ -1302,25 +1656,48 @@ impl RtCache {
         best.map(|(k, img)| (k, img.image, img.view, img.layout, img.format))
     }
 
+    pub fn find_sampleable_color_with_format(
+        &self,
+        want: RtKey,
+    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
+        self.find_color_with_format(want)
+            .filter(|(key, _, _, _, _)| !self.color_is_guest_stale(*key))
+    }
+
     pub fn find_drawn_color_at(
         &self,
         width: u32,
         height: u32,
         gpu_va: u64,
     ) -> Option<(RtKey, vk::Image, vk::ImageLayout, vk::Format, u64)> {
+        let candidates = self.color_gpu_base_index.get(&gpu_va)?;
+        self.find_drawn_color_at_candidates(width, height, gpu_va, candidates)
+    }
+
+    fn find_drawn_color_at_candidates<'a>(
+        &'a self,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+        candidates: impl IntoIterator<Item = &'a RtKey>,
+    ) -> Option<(RtKey, vk::Image, vk::ImageLayout, vk::Format, u64)> {
         let mut best: Option<(RtKey, &GpuImage, u64)> = None;
-        for (k, img) in &self.cache {
-            if is_synthetic_copy_key(*k)
-                || k.gpu_va != gpu_va
-                || k.width < width
-                || k.height < height
+        for candidate in candidates {
+            let Some((stored, img)) = self.cache.get_key_value(candidate) else {
+                continue;
+            };
+            let stored = *stored;
+            if is_synthetic_copy_key(stored)
+                || stored.gpu_va != gpu_va
+                || stored.width < width
+                || stored.height < height
             {
                 continue;
             }
-            let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+            let Some(stamp) = self.drawn_stamp.get(&stored).copied() else {
                 continue;
             };
-            let area = k.width as u64 * k.height as u64;
+            let area = stored.width as u64 * stored.height as u64;
             let replace = match best {
                 Some((best_key, _, best_stamp)) => {
                     let best_area = best_key.width as u64 * best_key.height as u64;
@@ -1329,10 +1706,20 @@ impl RtCache {
                 None => true,
             };
             if replace {
-                best = Some((*k, img, stamp));
+                best = Some((stored, img, stamp));
             }
         }
         best.map(|(k, img, stamp)| (k, img.image, img.layout, img.format, stamp))
+    }
+
+    #[cfg(test)]
+    fn find_drawn_color_at_full_scan(
+        &self,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+    ) -> Option<(RtKey, vk::Image, vk::ImageLayout, vk::Format, u64)> {
+        self.find_drawn_color_at_candidates(width, height, gpu_va, self.cache.keys())
     }
 
     pub fn find_content_bearing_color_at(
@@ -1417,23 +1804,61 @@ impl RtCache {
         height: u32,
         gpu_va: u64,
     ) -> Option<RtColorRegion> {
+        self.find_drawn_color_region_at_inner(width, height, gpu_va, None)
+    }
+
+    pub fn find_drawn_color_region_at_excluding(
+        &self,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+        excluded: RtKey,
+    ) -> Option<RtColorRegion> {
+        self.find_drawn_color_region_at_inner(width, height, gpu_va, Some(excluded))
+    }
+
+    fn find_drawn_color_region_at_inner(
+        &self,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+        excluded: Option<RtKey>,
+    ) -> Option<RtColorRegion> {
         if gpu_va == 0 {
             return None;
         }
+        let candidates = self
+            .color_gpu_page_index
+            .get(&(gpu_va >> RT_COLOR_GPU_PAGE_SHIFT))?;
+        self.find_drawn_color_region_at_candidates(width, height, gpu_va, excluded, candidates)
+    }
+
+    fn find_drawn_color_region_at_candidates<'a>(
+        &'a self,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+        excluded: Option<RtKey>,
+        candidates: impl IntoIterator<Item = &'a RtKey>,
+    ) -> Option<RtColorRegion> {
         let mut best: Option<(RtKey, &GpuImage, u64, u32, u32, bool)> = None;
-        for (k, img) in &self.cache {
-            if is_synthetic_copy_key(*k) {
+        for candidate in candidates {
+            let Some((stored, img)) = self.cache.get_key_value(candidate) else {
+                continue;
+            };
+            let stored = *stored;
+            if is_synthetic_copy_key(stored) || excluded == Some(stored) {
                 continue;
             }
             let Some((src_x, src_y, exact)) =
-                rt_region_offset(*k, img.format, width, height, gpu_va)
+                rt_region_offset(stored, img.format, width, height, gpu_va)
             else {
                 continue;
             };
-            let Some(stamp) = self.drawn_stamp.get(k).copied() else {
+            let Some(stamp) = self.drawn_stamp.get(&stored).copied() else {
                 continue;
             };
-            let area = k.width as u64 * k.height as u64;
+            let area = stored.width as u64 * stored.height as u64;
             let replace = match best {
                 Some((best_key, _, best_stamp, _, _, best_exact)) => {
                     let best_area = best_key.width as u64 * best_key.height as u64;
@@ -1444,7 +1869,7 @@ impl RtCache {
                 None => true,
             };
             if replace {
-                best = Some((*k, img, stamp, src_x, src_y, exact));
+                best = Some((stored, img, stamp, src_x, src_y, exact));
             }
         }
         best.map(|(key, img, stamp, src_x, src_y, _)| RtColorRegion {
@@ -1456,6 +1881,23 @@ impl RtCache {
             src_x,
             src_y,
         })
+    }
+
+    #[cfg(test)]
+    fn find_drawn_color_region_at_full_scan(
+        &self,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+        excluded: Option<RtKey>,
+    ) -> Option<RtColorRegion> {
+        self.find_drawn_color_region_at_candidates(
+            width,
+            height,
+            gpu_va,
+            excluded,
+            self.cache.keys(),
+        )
     }
 
     pub fn find_drawn_color_region_at_cpu(
@@ -1517,14 +1959,19 @@ impl RtCache {
     }
 
     pub fn set_depth_layout(&mut self, key: RtKey, layout: vk::ImageLayout) {
-        if let Some(img) = self.depth_cache.get_mut(&key) {
-            img.layout = layout;
+        let image = self.depth_cache.get(&key).map(|img| img.image).or_else(|| {
+            self.depth_cache
+                .iter()
+                .find(|(existing, _)| same_physical_backing(**existing, key))
+                .map(|(_, img)| img.image)
+        });
+        let Some(image) = image else {
             return;
-        }
-        if let Some((_, img)) = self
+        };
+        for img in self
             .depth_cache
-            .iter_mut()
-            .find(|(existing, _)| same_physical_backing(**existing, key))
+            .values_mut()
+            .filter(|img| img.image == image)
         {
             img.layout = layout;
         }
@@ -1662,6 +2109,11 @@ impl RtCache {
     }
 
     pub fn clear(&mut self, device: &ash::Device) {
+        self.clear_color_lookup_index();
+        self.color_guest_ranges.clear();
+        self.color_guest_range_index.clear();
+        self.depth_guest_ranges.clear();
+        self.depth_guest_range_index.clear();
         for (_, img) in self
             .cache
             .drain()
@@ -1673,6 +2125,46 @@ impl RtCache {
         self.depth_generations.clear();
         self.depth_shadow_generations.clear();
     }
+}
+
+fn get_or_create_sample_view(
+    device: &ash::Device,
+    image: &mut GpuImage,
+    source_image: vk::Image,
+    format: vk::Format,
+    aspect: vk::ImageAspectFlags,
+    view_type: vk::ImageViewType,
+    components: vk::ComponentMapping,
+) -> Result<vk::ImageView, String> {
+    let cache_key = RtSampleViewKey::new(format, aspect, view_type, components);
+    if let Some(view) = image.sample_views.get(&cache_key) {
+        return Ok(*view);
+    }
+
+    let view_info = vk::ImageViewCreateInfo {
+        s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+        image: source_image,
+        view_type,
+        format,
+        subresource_range: vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        components,
+        p_next: std::ptr::null(),
+        flags: vk::ImageViewCreateFlags::empty(),
+        _marker: std::marker::PhantomData,
+    };
+    let view = unsafe {
+        device
+            .create_image_view(&view_info, None)
+            .map_err(|error| format!("create_image_view(rt sample): {:?}", error))?
+    };
+    image.sample_views.insert(cache_key, view);
+    Ok(view)
 }
 
 fn create_image_view(
@@ -1723,60 +2215,69 @@ fn destroy_gpu_image(device: &ash::Device, image: GpuImage) {
     }
 }
 
-pub(crate) fn rt_formats_compatible(base: vk::Format, view: vk::Format) -> bool {
+pub fn rt_formats_compatible(base: vk::Format, view: vk::Format) -> bool {
     base == view
         || rt_format_compatibility_class(base)
             .zip(rt_format_compatibility_class(view))
             .is_some_and(|(a, b)| a == b)
 }
 
-fn rt_format_compatibility_class(format: vk::Format) -> Option<u8> {
-    match format {
-        vk::Format::R32G32B32A32_SFLOAT
-        | vk::Format::R32G32B32A32_SINT
-        | vk::Format::R32G32B32A32_UINT => Some(1),
-        vk::Format::R16G16B16A16_UNORM
-        | vk::Format::R16G16B16A16_SNORM
-        | vk::Format::R16G16B16A16_SINT
-        | vk::Format::R16G16B16A16_UINT
-        | vk::Format::R16G16B16A16_SFLOAT => Some(2),
-        vk::Format::R32G32_SFLOAT | vk::Format::R32G32_SINT | vk::Format::R32G32_UINT => Some(3),
-        vk::Format::R16G16_UNORM
-        | vk::Format::R16G16_SNORM
-        | vk::Format::R16G16_SINT
-        | vk::Format::R16G16_UINT
-        | vk::Format::R16G16_SFLOAT => Some(4),
-        vk::Format::A8B8G8R8_UNORM_PACK32
-        | vk::Format::A8B8G8R8_SNORM_PACK32
-        | vk::Format::A8B8G8R8_SINT_PACK32
-        | vk::Format::A8B8G8R8_UINT_PACK32
-        | vk::Format::A8B8G8R8_SRGB_PACK32
-        | vk::Format::R8G8B8A8_UNORM
-        | vk::Format::R8G8B8A8_SNORM
-        | vk::Format::R8G8B8A8_SINT
-        | vk::Format::R8G8B8A8_UINT
-        | vk::Format::R8G8B8A8_SRGB
-        | vk::Format::B8G8R8A8_UNORM
-        | vk::Format::B8G8R8A8_SRGB => Some(5),
-        vk::Format::A2B10G10R10_UNORM_PACK32
-        | vk::Format::A2B10G10R10_UINT_PACK32
-        | vk::Format::A2B10G10R10_SINT_PACK32 => Some(6),
-        vk::Format::B10G11R11_UFLOAT_PACK32 => Some(7),
-        vk::Format::R32_SFLOAT | vk::Format::R32_SINT | vk::Format::R32_UINT => Some(8),
-        vk::Format::R16_UNORM
-        | vk::Format::R16_SNORM
-        | vk::Format::R16_SINT
-        | vk::Format::R16_UINT
-        | vk::Format::R16_SFLOAT => Some(9),
-        vk::Format::R8G8_UNORM
-        | vk::Format::R8G8_SNORM
-        | vk::Format::R8G8_SINT
-        | vk::Format::R8G8_UINT => Some(10),
-        vk::Format::R8_UNORM | vk::Format::R8_SNORM | vk::Format::R8_SINT | vk::Format::R8_UINT => {
-            Some(11)
-        }
-        vk::Format::R5G6B5_UNORM_PACK16 => Some(12),
-        _ => None,
+fn rt_format_compatibility_class(format: vk::Format) -> Option<u32> {
+    rt_format_class_bits(format)
+}
+
+fn rt_guest_ranges_overlap(
+    key: RtKey,
+    image: &GpuImage,
+    cpu_addr: u64,
+    size: u64,
+    gpu_ranges: &[(u64, u64)],
+) -> bool {
+    let image_size = (key.width as u64)
+        .saturating_mul(key.height as u64)
+        .saturating_mul(key.render_layer_count() as u64)
+        .saturating_mul(rt_format_bytes(image.base_format));
+    if image_size == 0 {
+        return false;
+    }
+    (key.cpu_addr != 0 && ranges_overlap(key.cpu_addr, image_size, cpu_addr, size))
+        || (key.gpu_va != 0
+            && gpu_ranges.iter().any(|(gpu_va, gpu_size)| {
+                ranges_overlap(key.gpu_va, image_size, *gpu_va, *gpu_size)
+            }))
+}
+
+fn ranges_overlap(left: u64, left_size: u64, right: u64, right_size: u64) -> bool {
+    left_size != 0
+        && right_size != 0
+        && left < right.saturating_add(right_size)
+        && right < left.saturating_add(left_size)
+}
+
+fn rt_color_gpu_page_span(key: RtKey, format: vk::Format) -> Option<(u64, u64)> {
+    if key.gpu_va == 0 || key.width == 0 || key.height == 0 {
+        return None;
+    }
+    let size = (key.width as u64)
+        .checked_mul(key.height as u64)?
+        .checked_mul(key.render_layer_count() as u64)?
+        .checked_mul(rt_format_bytes(format))?;
+    let end = key.gpu_va.checked_add(size.checked_sub(1)?)?;
+    Some((
+        key.gpu_va >> RT_COLOR_GPU_PAGE_SHIFT,
+        end >> RT_COLOR_GPU_PAGE_SHIFT,
+    ))
+}
+
+fn remove_lookup_key(index: &mut HashMap<u64, Vec<RtKey>>, bucket: u64, key: RtKey) {
+    let remove_bucket = if let Some(keys) = index.get_mut(&bucket) {
+        keys.retain(|candidate| *candidate != key);
+        keys.is_empty()
+    } else {
+        false
+    };
+    if remove_bucket {
+        index.remove(&bucket);
     }
 }
 
@@ -1795,6 +2296,16 @@ fn rt_region_offset(
     }
     let offset = gpu_va.checked_sub(key.gpu_va)?;
     rt_region_from_offset(key, format, width, height, offset)
+}
+
+pub fn rt_color_region_covers(
+    key: RtKey,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+    gpu_va: u64,
+) -> bool {
+    rt_region_offset(key, format, width, height, gpu_va).is_some()
 }
 
 fn rt_region_cpu_offset(
@@ -1947,7 +2458,7 @@ impl Drop for RtCache {
 mod tests {
     use super::{
         is_synthetic_copy_key, rt_formats_compatible, same_d24_depth_allocation_covering,
-        same_physical_backing, GpuImage, RtCache, RtKey, RtSampleViewKey,
+        same_physical_backing, GpuImage, RtCache, RtColorRegion, RtKey, RtSampleViewKey,
     };
     use ash::vk;
     use std::collections::HashMap;
@@ -1988,17 +2499,31 @@ mod tests {
         }
     }
 
+    fn region_signature(
+        region: Option<RtColorRegion>,
+    ) -> Option<(RtKey, vk::Format, u64, u32, u32)> {
+        region.map(|region| {
+            (
+                region.key,
+                region.format,
+                region.stamp,
+                region.src_x,
+                region.src_y,
+            )
+        })
+    }
+
     #[test]
     fn synthetic_copy_keys_are_only_visible_through_exact_lookup() {
         const VA: u64 = 0x5123_4000;
         let guest = RtKey::new(7, 640, 480, VA);
         let synthetic = RtKey::new(u32::MAX, 640, 480, VA);
         let mut cache = RtCache::new();
-        cache.cache.insert(
+        cache.insert_color_image(
             guest,
             test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
         );
-        cache.cache.insert(
+        cache.insert_color_image(
             synthetic,
             test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
         );
@@ -2056,6 +2581,366 @@ mod tests {
             .is_none());
 
         cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn region_lookup_can_exclude_stale_exact_destination() {
+        const VA: u64 = 0x5a0e_a1000;
+        let exact = RtKey::new(584, 2, 1, VA);
+        let padded = RtKey::new(584, 16, 1, VA);
+        let mut cache = RtCache::new();
+        cache.insert_color_image(
+            exact,
+            test_color_image(
+                vk::Format::B10G11R11_UFLOAT_PACK32,
+                vk::Format::B10G11R11_UFLOAT_PACK32,
+            ),
+        );
+        cache.insert_color_image(
+            padded,
+            test_color_image(
+                vk::Format::B10G11R11_UFLOAT_PACK32,
+                vk::Format::B10G11R11_UFLOAT_PACK32,
+            ),
+        );
+        let exact_stamp = cache.mark_synced_sample(exact);
+        let padded_stamp = cache.mark_drawn(padded);
+
+        let preferred = cache.find_drawn_color_region_at(2, 1, VA).unwrap();
+        assert_eq!(preferred.key, exact);
+        assert_eq!(preferred.stamp, exact_stamp);
+
+        let source = cache
+            .find_drawn_color_region_at_excluding(2, 1, VA, exact)
+            .unwrap();
+        assert_eq!(source.key, padded);
+        assert_eq!(source.stamp, padded_stamp);
+        assert_eq!((source.src_x, source.src_y), (0, 0));
+
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn indexed_exact_base_lookup_matches_full_scan_ranking_and_aliases() {
+        const VA: u64 = 0x6200_4000;
+        let small = RtKey::new(41, 16, 16, VA);
+        let padded = RtKey::new(41, 32, 32, VA);
+        let other_nvmap = RtKey::new(42, 16, 16, VA);
+        let mut cache = RtCache::new();
+        for key in [small, padded, other_nvmap] {
+            cache.insert_color_image(
+                key,
+                test_color_image(vk::Format::R8_UNORM, vk::Format::R8_UNORM),
+            );
+        }
+        cache.drawn_stamp.insert(small, 10);
+        cache.drawn_stamp.insert(padded, 10);
+        cache.drawn_stamp.insert(other_nvmap, 9);
+
+        assert_eq!(
+            cache.find_drawn_color_at(8, 8, VA),
+            cache.find_drawn_color_at_full_scan(8, 8, VA)
+        );
+        assert_eq!(
+            cache.find_drawn_color_at(8, 8, VA).map(|result| result.0),
+            Some(small)
+        );
+
+        cache.drawn_stamp.insert(other_nvmap, 11);
+        assert_eq!(
+            cache.find_drawn_color_at(8, 8, VA),
+            cache.find_drawn_color_at_full_scan(8, 8, VA)
+        );
+        assert_eq!(
+            cache.find_drawn_color_at(8, 8, VA).map(|result| result.0),
+            Some(other_nvmap)
+        );
+        assert_eq!(
+            cache.drawn_color_aliases(small),
+            cache.drawn_color_aliases_full_scan(small)
+        );
+        assert_eq!(
+            cache
+                .drawn_color_aliases(small)
+                .into_iter()
+                .map(|result| result.0)
+                .collect::<Vec<_>>(),
+            vec![padded]
+        );
+
+        cache.mark_guest_written(padded);
+        assert_eq!(
+            cache.drawn_color_aliases(small),
+            cache.drawn_color_aliases_full_scan(small)
+        );
+        assert!(cache.drawn_color_aliases(small).is_empty());
+        cache.drawn_counter = 20;
+        cache.mark_drawn(padded);
+        assert_eq!(
+            cache.drawn_color_aliases(small),
+            cache.drawn_color_aliases_full_scan(small)
+        );
+
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn indexed_region_lookup_matches_nested_ranking_and_exclusion() {
+        const VA: u64 = 0x6300_4000;
+        const TIED_VA: u64 = 0x6300_8000;
+        let exact = RtKey::new(51, 8, 8, VA);
+        let padded = RtKey::new(51, 16, 16, VA);
+        let large = RtKey::new(52, 64, 64, VA);
+        let tied_old = RtKey::new(53, 32, 32, TIED_VA - 8);
+        let tied_new = RtKey::new(54, 32, 32, TIED_VA - 16);
+        let mut cache = RtCache::new();
+        for key in [exact, padded, large, tied_old, tied_new] {
+            cache.insert_color_image(
+                key,
+                test_color_image(vk::Format::R8_UNORM, vk::Format::R8_UNORM),
+            );
+        }
+        cache.drawn_stamp.insert(exact, 1);
+        cache.drawn_stamp.insert(padded, 100);
+        cache.drawn_stamp.insert(large, 200);
+        cache.drawn_stamp.insert(tied_old, 300);
+        cache.drawn_stamp.insert(tied_new, 301);
+
+        assert_eq!(
+            region_signature(cache.find_drawn_color_region_at(8, 8, VA)),
+            region_signature(cache.find_drawn_color_region_at_full_scan(8, 8, VA, None))
+        );
+        assert_eq!(
+            cache
+                .find_drawn_color_region_at(8, 8, VA)
+                .map(|region| region.key),
+            Some(exact)
+        );
+        assert_eq!(
+            region_signature(cache.find_drawn_color_region_at_excluding(8, 8, VA, exact)),
+            region_signature(cache.find_drawn_color_region_at_full_scan(8, 8, VA, Some(exact)))
+        );
+        assert_eq!(
+            cache
+                .find_drawn_color_region_at_excluding(8, 8, VA, exact)
+                .map(|region| region.key),
+            Some(padded)
+        );
+        assert_eq!(
+            region_signature(cache.find_drawn_color_region_at(4, 4, TIED_VA)),
+            region_signature(cache.find_drawn_color_region_at_full_scan(4, 4, TIED_VA, None))
+        );
+        assert_eq!(
+            cache
+                .find_drawn_color_region_at(4, 4, TIED_VA)
+                .map(|region| region.key),
+            Some(tied_new)
+        );
+
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn indexed_region_lookup_covers_page_boundaries_and_volume_layers() {
+        const PAGE: u64 = 1 << 20;
+        let crossing = RtKey::new(61, 64, 4, 0x40 * PAGE + PAGE - 128);
+        let volume = RtKey::new(62, 1024, 512, 0x50 * PAGE + PAGE - 256).with_volume_depth(4);
+        let later_layer_va = volume.gpu_va + 3 * 1024 * 512;
+        let later_slice = RtKey::new(63, 64, 64, later_layer_va);
+        let mut cache = RtCache::new();
+        cache.insert_color_image(
+            crossing,
+            test_color_image(vk::Format::R8_UNORM, vk::Format::R8_UNORM),
+        );
+        cache.insert_color_image(
+            volume,
+            test_color_image(vk::Format::R8_UNORM, vk::Format::R8_UNORM),
+        );
+        cache.insert_color_image(
+            later_slice,
+            test_color_image(vk::Format::R8_UNORM, vk::Format::R8_UNORM),
+        );
+        cache.mark_drawn(crossing);
+        cache.mark_drawn(volume);
+        cache.mark_drawn(later_slice);
+
+        let crossing_va = crossing.gpu_va + 128;
+        assert_eq!(
+            region_signature(cache.find_drawn_color_region_at(16, 1, crossing_va)),
+            region_signature(cache.find_drawn_color_region_at_full_scan(16, 1, crossing_va, None))
+        );
+        assert_eq!(
+            cache
+                .find_drawn_color_region_at(16, 1, crossing_va)
+                .map(|region| region.key),
+            Some(crossing)
+        );
+
+        let later_page = later_layer_va >> super::RT_COLOR_GPU_PAGE_SHIFT;
+        assert!(cache
+            .color_gpu_page_index
+            .get(&later_page)
+            .is_some_and(|bucket| bucket.contains(&volume)));
+        assert_eq!(
+            region_signature(cache.find_drawn_color_region_at(64, 64, later_layer_va)),
+            region_signature(cache.find_drawn_color_region_at_full_scan(
+                64,
+                64,
+                later_layer_va,
+                None
+            ))
+        );
+        assert_eq!(
+            cache
+                .find_drawn_color_region_at(64, 64, later_layer_va)
+                .map(|region| region.key),
+            Some(later_slice)
+        );
+
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn color_lookup_index_tracks_format_recreation_clear_and_canonical_keys() {
+        const PAGE: u64 = 1 << 20;
+        let old = RtKey::with_cpu(71, 256, 2, 0x70 * PAGE + PAGE - 512, 0x1000);
+        let removal_alias = RtKey::with_cpu(71, 256, 2, old.gpu_va, 0x2000);
+        let mut cache = RtCache::new();
+        cache.insert_color_image(
+            old,
+            test_color_image(vk::Format::R8_UNORM, vk::Format::R8_UNORM),
+        );
+        cache.mark_drawn(old);
+        let next_page_va = old.gpu_va + 512;
+        assert_eq!(
+            region_signature(cache.find_drawn_color_region_at(1, 1, next_page_va)),
+            region_signature(cache.find_drawn_color_region_at_full_scan(1, 1, next_page_va, None))
+        );
+        assert!(cache
+            .find_drawn_color_region_at(1, 1, next_page_va)
+            .is_none());
+
+        let (removed_key, _) = cache.remove_color_image(removal_alias).unwrap();
+        assert_eq!(removed_key.cpu_addr, old.cpu_addr);
+        assert!(!cache
+            .color_gpu_base_index
+            .get(&old.gpu_va)
+            .is_some_and(|bucket| bucket.contains(&old)));
+
+        let recreated = RtKey::with_cpu(71, 256, 2, old.gpu_va, 0x3000);
+        cache.insert_color_image(
+            recreated,
+            test_color_image(vk::Format::R16_UNORM, vk::Format::R16_UNORM),
+        );
+        cache.mark_drawn(recreated);
+        assert_eq!(
+            region_signature(cache.find_drawn_color_region_at(1, 1, next_page_va)),
+            region_signature(cache.find_drawn_color_region_at_full_scan(1, 1, next_page_va, None))
+        );
+        assert_eq!(
+            cache
+                .find_drawn_color_region_at(1, 1, next_page_va)
+                .map(|region| region.key.cpu_addr),
+            Some(recreated.cpu_addr)
+        );
+
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+        assert!(cache.find_drawn_color_at(1, 1, old.gpu_va).is_none());
+        assert!(cache
+            .find_drawn_color_region_at(1, 1, next_page_va)
+            .is_none());
+
+        let after_clear = RtKey::with_cpu(71, 256, 2, old.gpu_va, 0x4000);
+        cache.insert_color_image(
+            after_clear,
+            test_color_image(vk::Format::R16_UNORM, vk::Format::R16_UNORM),
+        );
+        cache.mark_drawn(after_clear);
+        assert_eq!(
+            cache
+                .find_drawn_color_at(1, 1, old.gpu_va)
+                .map(|result| result.0.cpu_addr),
+            Some(after_clear.cpu_addr)
+        );
+        assert_eq!(
+            cache.find_drawn_color_at(1, 1, old.gpu_va),
+            cache.find_drawn_color_at_full_scan(1, 1, old.gpu_va)
+        );
+
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn guest_write_range_stales_overlapping_rt_aliases() {
+        const CPU: u64 = 0x10_0000;
+        const VA: u64 = 0x50_0000;
+        let large = RtKey::with_cpu(12, 1024, 1024, VA, CPU);
+        let sampled = RtKey::new(12, 480, 272, VA);
+        let cleared = RtKey::with_cpu(12, 128, 128, VA + 0x10_000, CPU + 0x10_000);
+        let untouched = RtKey::with_cpu(13, 64, 64, VA + 0x40_000, CPU + 0x40_000);
+        let depth = RtKey::with_cpu(12, 64, 64, VA + 0x20_000, CPU + 0x20_000);
+        let mut cache = RtCache::new();
+        cache.insert_color_image(
+            large,
+            test_color_image(vk::Format::R16_SFLOAT, vk::Format::R16_SFLOAT),
+        );
+        cache.insert_color_image(
+            sampled,
+            test_color_image(vk::Format::R8_UNORM, vk::Format::R8_UNORM),
+        );
+        cache.insert_color_image(
+            cleared,
+            test_color_image(vk::Format::R8_UNORM, vk::Format::R8_UNORM),
+        );
+        cache.insert_color_image(
+            untouched,
+            test_color_image(vk::Format::R8_UNORM, vk::Format::R8_UNORM),
+        );
+        let depth_image = test_depth_image();
+        super::insert_guest_range(
+            &mut cache.depth_guest_ranges,
+            &mut cache.depth_guest_range_index,
+            depth,
+            depth_image.base_format,
+        );
+        cache.depth_cache.insert(depth, depth_image);
+        cache.mark_drawn(large);
+        cache.mark_drawn(sampled);
+        cache.mark_drawn(cleared);
+        cache.mark_drawn(untouched);
+
+        cache.mark_guest_written_range(CPU, 0x30_000, &[(VA, 0x30_000)]);
+
+        assert!(cache.color_is_guest_stale(large));
+        assert!(cache.color_is_guest_stale(sampled));
+        assert!(cache.color_is_guest_stale(cleared));
+        assert!(!cache.color_is_guest_stale(untouched));
+        assert!(cache.depth_is_guest_stale(depth));
+        assert_eq!(cache.drawn_stamp(large), None);
+        assert!(cache.find_color_with_format(sampled).is_some());
+        assert!(cache.find_sampleable_color_with_format(sampled).is_none());
+
+        cache.mark_drawn(large);
+        cache.mark_synced_sample(sampled);
+        cache.mark_cleared(cleared, true);
+        cache.mark_depth_written(depth);
+
+        assert!(!cache.color_is_guest_stale(large));
+        assert!(!cache.color_is_guest_stale(sampled));
+        assert!(!cache.color_is_guest_stale(cleared));
+        assert!(!cache.depth_is_guest_stale(depth));
+        assert!(cache.find_sampleable_color_with_format(sampled).is_some());
+
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+        cache.depth_cache.clear();
     }
 
     #[test]
@@ -2064,7 +2949,7 @@ mod tests {
         let mut cache = RtCache::new();
         assert!(!cache.color_requires_recreate(key, vk::Format::R8G8B8A8_UNORM));
 
-        cache.cache.insert(
+        cache.insert_color_image(
             key,
             test_color_image(vk::Format::R8G8B8A8_UINT, vk::Format::R8G8B8A8_UNORM),
         );
@@ -2073,6 +2958,7 @@ mod tests {
         assert!(cache.color_requires_recreate(key, vk::Format::R16G16B16A16_UNORM));
 
         cache.cache.clear();
+        cache.clear_color_lookup_index();
     }
 
     #[test]
@@ -2080,6 +2966,34 @@ mod tests {
         assert!(rt_formats_compatible(
             vk::Format::R8G8B8A8_UNORM,
             vk::Format::R8G8B8A8_UINT
+        ));
+    }
+
+    #[test]
+    fn rt_view_compatibility_follows_vulkan_bit_classes() {
+        assert!(rt_formats_compatible(
+            vk::Format::R32_SFLOAT,
+            vk::Format::B10G11R11_UFLOAT_PACK32
+        ));
+        assert!(rt_formats_compatible(
+            vk::Format::R16G16_SNORM,
+            vk::Format::A8B8G8R8_SRGB_PACK32
+        ));
+        assert!(rt_formats_compatible(
+            vk::Format::R32G32_SFLOAT,
+            vk::Format::R16G16B16A16_SFLOAT
+        ));
+        assert!(rt_formats_compatible(
+            vk::Format::R16_SFLOAT,
+            vk::Format::R8G8_UNORM
+        ));
+        assert!(!rt_formats_compatible(
+            vk::Format::R32_SFLOAT,
+            vk::Format::R16_SFLOAT
+        ));
+        assert!(!rt_formats_compatible(
+            vk::Format::R32G32_SFLOAT,
+            vk::Format::R32_SFLOAT
         ));
     }
 
@@ -2147,6 +3061,26 @@ mod tests {
         assert_eq!(d3.depth, 32);
         assert_eq!(d3.render_layer_count(), 32);
         assert_ne!(d2, d3);
+    }
+
+    #[test]
+    fn pinned_present_key_rejects_volume_targets() {
+        let d2 = RtKey::with_cpu(33, 32, 32, 0x50b900000, 0x8000);
+        let d3 = d2.with_volume_depth(4);
+        let mut cache = RtCache::new();
+        cache.insert_color_image(
+            d3,
+            test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+        );
+        cache.mark_drawn(d3);
+        assert_eq!(cache.present_key_pinned_at_va(d2), None);
+
+        cache.insert_color_image(
+            d2,
+            test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+        );
+        cache.mark_drawn(d2);
+        assert_eq!(cache.present_key_pinned_at_va(d2), Some(d2));
     }
 
     #[test]

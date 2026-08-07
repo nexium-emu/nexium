@@ -1,4 +1,5 @@
 use ash::vk;
+use ash::vk::Handle;
 use parking_lot::Mutex;
 use std::collections::{hash_map::DefaultHasher, hash_map::Entry, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -8,7 +9,8 @@ use crate::compute::ComputeBackend;
 use crate::descriptor::{DescriptorPool, DescriptorSetLayout};
 use crate::pipeline::PipelineCache;
 use crate::rt_cache::{
-    find_memory_type, rt_formats_compatible, same_physical_backing, RtCache, RtKey,
+    find_memory_type, is_synthetic_copy_key, rt_color_region_covers, rt_formats_compatible,
+    same_physical_backing, GpuImage, RtCache, RtKey,
 };
 use crate::shader::ShaderCompiler;
 use crate::texture_manifest::{
@@ -18,11 +20,55 @@ use crate::texture_manifest::{
 
 pub struct Renderer {
     inner: Mutex<RendererInner>,
+    device: ash::Device,
+    submit_timeline: vk::Semaphore,
 }
 
 static SUBMIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_IDLE_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
+static SUBMIT_TIMELINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUBMIT_SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RtAliasTelemetry {
+    pub binds: u64,
+    pub binds_after_raw_snapshot: u64,
+}
+
+static RT_ALIAS_TELEMETRY_BINDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static RT_ALIAS_TELEMETRY_BINDS_AFTER_RAW_SNAPSHOT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn rt_alias_telemetry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_KICKOFF_PROFILE").is_some())
+}
+
+#[inline]
+fn record_rt_alias_bind(after_raw_snapshot: bool) {
+    if !rt_alias_telemetry_enabled() {
+        return;
+    }
+    RT_ALIAS_TELEMETRY_BINDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if after_raw_snapshot {
+        RT_ALIAS_TELEMETRY_BINDS_AFTER_RAW_SNAPSHOT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub fn take_rt_alias_telemetry() -> RtAliasTelemetry {
+    if !rt_alias_telemetry_enabled() {
+        return RtAliasTelemetry::default();
+    }
+    RtAliasTelemetry {
+        binds: RT_ALIAS_TELEMETRY_BINDS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        binds_after_raw_snapshot: RT_ALIAS_TELEMETRY_BINDS_AFTER_RAW_SNAPSHOT
+            .swap(0, std::sync::atomic::Ordering::Relaxed),
+    }
+}
 
 fn note_queue_submission() {
     SUBMIT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -42,7 +88,110 @@ fn idle_skip_disabled() -> bool {
 
 pub const GRAPHICS_RING_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
 pub const GRAPHICS_RING_SAFE_BATCH_BYTES: u64 = GRAPHICS_RING_CAPACITY_BYTES / 2;
+const GRAPHICS_FRAME_SLOT_COUNT: usize = 2;
 const MAX_STORAGE_BUFFER_OFFSET_ALIGNMENT: u64 = 256;
+const DEFAULT_CLEAR_SLOT_COUNT: usize = 4;
+const MAX_CLEAR_SLOT_COUNT: usize = 64;
+
+fn graphics_frame_slot_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let requested = std::env::var("NEXIUM_RENDER_FRAME_SLOTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|count| (2..=8).contains(count))
+            .unwrap_or(GRAPHICS_FRAME_SLOT_COUNT);
+        const SAFE_RING_SLOT_COUNT: usize = GRAPHICS_FRAME_SLOT_COUNT;
+        if requested != SAFE_RING_SLOT_COUNT {
+            log::warn!(
+                "Vulkan graphics frame slots requested {}; forcing {} until the shared graphics ring has per-slot ranges",
+                requested,
+                SAFE_RING_SLOT_COUNT
+            );
+        }
+        SAFE_RING_SLOT_COUNT
+    })
+}
+
+fn clear_slot_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let count = std::env::var("NEXIUM_CLEAR_SLOT_COUNT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|count| (1..=MAX_CLEAR_SLOT_COUNT).contains(count))
+            .unwrap_or(DEFAULT_CLEAR_SLOT_COUNT);
+        if count != DEFAULT_CLEAR_SLOT_COUNT {
+            log::info!(
+                "Vulkan clear-slot pool configured for {} slots (default {})",
+                count,
+                DEFAULT_CLEAR_SLOT_COUNT
+            );
+        }
+        count
+    })
+}
+
+fn frame_slot_submission_complete(device: &ash::Device, generation: u64) -> bool {
+    if generation == 0 {
+        return false;
+    }
+    let raw = SUBMIT_TIMELINE.load(std::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    let semaphore = vk::Semaphore::from_raw(raw);
+    unsafe {
+        device
+            .get_semaphore_counter_value(semaphore)
+            .is_ok_and(|completed| completed >= generation)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedGuestSnapshot {
+    data: Arc<Vec<u8>>,
+    len: usize,
+}
+
+impl SharedGuestSnapshot {
+    pub fn new(data: Arc<Vec<u8>>, len: usize) -> Option<Self> {
+        (len <= data.len()).then_some(Self { data, len })
+    }
+
+    pub fn from_vec(data: Vec<u8>) -> Self {
+        let len = data.len();
+        Self {
+            data: Arc::new(data),
+            len,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+
+    fn make_mut(&mut self) -> &mut Vec<u8> {
+        if self.len != self.data.len() {
+            self.data = Arc::new(self.as_slice().to_vec());
+        }
+        Arc::make_mut(&mut self.data)
+    }
+}
+
+impl std::ops::Deref for SharedGuestSnapshot {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for SharedGuestSnapshot {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
 
 fn ring_request_upper_bound(size: u64, alignment: u64) -> u64 {
     align_up(size, alignment).saturating_add(alignment.saturating_sub(1))
@@ -230,6 +379,218 @@ impl AuroraResidentSsboCache {
     }
 }
 
+pub(crate) fn resident_vb_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_RESIDENT_VB").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
+fn resident_vb_force_fallback() -> bool {
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCE.get_or_init(|| std::env::var_os("NEXIUM_RESIDENT_VB_FORCE_FALLBACK").is_some())
+}
+
+fn resident_vb_bytes() -> u64 {
+    static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("NEXIUM_RESIDENT_VB_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(256)
+            .saturating_mul(1024 * 1024)
+    })
+}
+
+struct ResidentVbSlab {
+    offset: u64,
+    serials: Vec<u64>,
+    in_flight_mask: u8,
+    last_used: u64,
+}
+
+struct ResidentVbCache {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut u8,
+    size: u64,
+    head: u64,
+    free: HashMap<u32, Vec<u64>>,
+    slabs: HashMap<(u64, u32), ResidentVbSlab>,
+    clock: u64,
+}
+
+unsafe impl Send for ResidentVbCache {}
+
+impl ResidentVbCache {
+    fn complete_frame_slot(&mut self, frame_slot: usize) {
+        let clear = !(1u8 << frame_slot);
+        for slab in self.slabs.values_mut() {
+            slab.in_flight_mask &= clear;
+        }
+    }
+
+    fn mark_submitted(&mut self, frame_slot: usize, used: &[(u64, u32)]) {
+        let bit = 1u8 << frame_slot;
+        for key in used {
+            if let Some(slab) = self.slabs.get_mut(key) {
+                slab.in_flight_mask |= bit;
+            }
+        }
+    }
+
+    fn alloc(&mut self, chunk_count: u32, used: &[(u64, u32)]) -> Option<u64> {
+        if let Some(list) = self.free.get_mut(&chunk_count) {
+            if let Some(offset) = list.pop() {
+                return Some(offset);
+            }
+        }
+        let bytes = (chunk_count as u64) << crate::draw::RESIDENT_CHUNK_SHIFT;
+        if self.head.saturating_add(bytes) <= self.size {
+            let offset = self.head;
+            self.head += bytes;
+            return Some(offset);
+        }
+        let victim = self
+            .slabs
+            .iter()
+            .filter(|(key, slab)| {
+                key.1 == chunk_count && slab.in_flight_mask == 0 && !used.contains(key)
+            })
+            .min_by_key(|(_, slab)| slab.last_used)
+            .map(|(&key, _)| key)?;
+        let offset = self.slabs.remove(&victim).map(|slab| slab.offset)?;
+        Some(offset)
+    }
+
+    fn resolve(
+        &mut self,
+        range: &crate::draw::ResidentVertexRange,
+        used: &mut Vec<(u64, u32)>,
+    ) -> Option<(vk::Buffer, u64)> {
+        let chunk_size = crate::draw::RESIDENT_CHUNK_SIZE;
+        let count = u32::try_from(range.chunks.len()).ok()?;
+        let first = range.chunks.first()?.chunk_key;
+        if range.chunks.iter().enumerate().any(|(index, chunk)| {
+            chunk.chunk_key != first + index as u64 || chunk.data.len() != chunk_size
+        }) {
+            return None;
+        }
+        let first_base = first << crate::draw::RESIDENT_CHUNK_SHIFT;
+        if range.cpu_va < first_base {
+            return None;
+        }
+        let delta = range.cpu_va - first_base;
+        let key = (first, count);
+        self.clock = self.clock.wrapping_add(1);
+        let clock = self.clock;
+        if let Some(slab) = self.slabs.get_mut(&key) {
+            let changed = slab
+                .serials
+                .iter()
+                .zip(range.chunks.iter())
+                .any(|(serial, chunk)| *serial != chunk.serial);
+            if changed && (slab.in_flight_mask != 0 || used.contains(&key)) {
+                return None;
+            }
+            if changed {
+                for (index, chunk) in range.chunks.iter().enumerate() {
+                    if slab.serials[index] != chunk.serial {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                chunk.data.as_ptr(),
+                                self.mapped.add(
+                                    (slab.offset
+                                        + ((index as u64) << crate::draw::RESIDENT_CHUNK_SHIFT))
+                                        as usize,
+                                ),
+                                chunk_size,
+                            );
+                        }
+                        slab.serials[index] = chunk.serial;
+                    }
+                }
+            }
+            slab.last_used = clock;
+            if !used.contains(&key) {
+                used.push(key);
+            }
+            return Some((self.buffer, slab.offset + delta));
+        }
+        let offset = self.alloc(count, used)?;
+        let mut serials = Vec::with_capacity(range.chunks.len());
+        for (index, chunk) in range.chunks.iter().enumerate() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    chunk.data.as_ptr(),
+                    self.mapped.add(
+                        (offset + ((index as u64) << crate::draw::RESIDENT_CHUNK_SHIFT)) as usize,
+                    ),
+                    chunk_size,
+                );
+            }
+            serials.push(chunk.serial);
+        }
+        self.slabs.insert(
+            key,
+            ResidentVbSlab {
+                offset,
+                serials,
+                in_flight_mask: 0,
+                last_used: clock,
+            },
+        );
+        used.push(key);
+        Some((self.buffer, offset + delta))
+    }
+
+    fn destroy(mut self, device: &ash::Device) {
+        unsafe {
+            device.unmap_memory(self.memory);
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+        self.mapped = std::ptr::null_mut();
+    }
+}
+
+fn create_resident_vb_cache(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+) -> Result<ResidentVbCache, String> {
+    let size = resident_vb_bytes();
+    let buffer = create_persistent_upload_buffer_sized(
+        device,
+        mem_props,
+        size,
+        vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
+    )?;
+    Ok(ResidentVbCache {
+        buffer: buffer.buffer,
+        memory: buffer.memory,
+        mapped: buffer.mapped,
+        size,
+        head: 0,
+        free: HashMap::new(),
+        slabs: HashMap::new(),
+        clock: 0,
+    })
+}
+
+fn assemble_resident_binding(
+    range: &crate::draw::ResidentVertexRange,
+) -> Option<PreparedVertexBinding> {
+    let data = range.assemble()?;
+    Some(PreparedVertexBinding {
+        binding: range.binding,
+        stride: range.stride,
+        data: SharedGuestSnapshot::from_vec(data),
+    })
+}
+
 impl SharedSsboGroupPlan {
     fn immutable_full_source(&self) -> Option<&std::sync::Arc<Vec<u8>>> {
         if self.initialized.as_slice() != [(0, self.key.1)] || self.patches.len() != 1 {
@@ -373,6 +734,14 @@ fn build_shared_ssbo_plan<'a>(
     }
 }
 
+fn build_grouped_shared_ssbo_plans<'a, Groups, Draws>(groups: Groups) -> Vec<SharedSsboPlan>
+where
+    Groups: IntoIterator<Item = Draws>,
+    Draws: IntoIterator<Item = &'a [crate::draw::StorageBufferSnapshot]>,
+{
+    groups.into_iter().map(build_shared_ssbo_plan).collect()
+}
+
 pub fn graphics_draw_ring_bytes_upper_bound(call: &crate::draw::Maxwell3dDrawCall) -> u64 {
     let mut bytes = 0u64;
     for binding in &call.vertex_bindings {
@@ -407,13 +776,7 @@ pub fn graphics_draw_ring_bytes_upper_bound(call: &crate::draw::Maxwell3dDrawCal
             4,
         ));
     }
-    let cbuf_len = call
-        .cbuf_data
-        .as_ref()
-        .filter(|data| data.len() >= nexium_spirv::GFX_CBUF_MIN_SIZE as usize)
-        .map_or(nexium_spirv::GFX_CBUF_MIN_SIZE as u64, |data| {
-            data.len() as u64
-        });
+    let cbuf_len = graphics_cbuf_data_len(call.cbuf_data.as_ref()) as u64;
     bytes = bytes.saturating_add(ring_request_upper_bound(
         cbuf_len,
         MAX_STORAGE_BUFFER_OFFSET_ALIGNMENT,
@@ -449,6 +812,9 @@ struct RendererInner {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     cmd_pool: vk::CommandPool,
     rt_cache: RtCache,
+    fermi_exact_rt_snapshot_leases: HashMap<u64, FermiExactRtSnapshotLease>,
+    fermi_exact_rt_snapshot_ids: HashMap<crate::draw::FermiExactRtToken, u64>,
+    next_fermi_exact_rt_snapshot_id: u64,
     staging: HashMap<(u32, u32), StagingBuffer>,
     descriptor_layout: DescriptorSetLayout,
     descriptor_pool: DescriptorPool,
@@ -462,9 +828,14 @@ struct RendererInner {
     sampler_cache: HashMap<crate::texture::TscEntry, vk::Sampler>,
     integer_sampler_cache: HashMap<crate::texture::TscEntry, vk::Sampler>,
     tex_cache: HashMap<TexCacheKey, CachedTexture>,
+    tex_cache_vas: HashMap<u64, u32>,
     texel_buffer_cache: HashMap<TexelBufferCacheKey, CachedTexelBuffer>,
     rt_reinterpret_cache: HashMap<RtReinterpretKey, RtReinterpretTexture>,
-    frame_slots: [FrameSlot; 2],
+    compute_volume_cache: Vec<CachedComputeVolume>,
+    compute_guest_image_pool: VecDeque<CachedComputeGuestImage>,
+    compute_raw_storage_cache:
+        HashMap<crate::compute::ComputeRawStorageKey, CachedComputeRawStorage>,
+    frame_slots: Vec<FrameSlot>,
     frame_index: usize,
     utility_slot: FrameSlot,
     pending_computes: Vec<PendingCompute>,
@@ -476,6 +847,8 @@ struct RendererInner {
     rt_copy_slot_index: usize,
     ubo_ring: UboRing,
     aurora_resident_ssbos: Option<AuroraResidentSsboCache>,
+    resident_vb: Option<ResidentVbCache>,
+    compute_guest_content_memo: HashMap<(u64, usize), ComputeGuestImageContent>,
     min_storage_buffer_offset_alignment: u64,
     max_storage_buffer_range: u64,
     max_texel_buffer_elements: u32,
@@ -493,6 +866,7 @@ struct RendererInner {
     vertex_attribute_divisor_supported: bool,
     sampler_filter_minmax_supported: bool,
     sampler_anisotropy_supported: bool,
+    submit_timeline: vk::Semaphore,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -519,12 +893,13 @@ struct TexCacheKey {
     block_height_log2: u32,
     block_depth_log2: u32,
     tile_width_spacing: u32,
+    pitch_bytes: u32,
     numeric_type: u8,
 }
 
 type PendingTexture = (TexCacheKey, crate::texture::TicEntry, usize, usize);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TextureMipCopy {
     buffer_offset: u64,
     mip_level: u32,
@@ -571,6 +946,7 @@ const GRAPHICS_TEXTURE_NUMERIC_TYPES: [nexium_spirv::TextureNumericType; 3] = [
     nexium_spirv::TextureNumericType::Uint,
     nexium_spirv::TextureNumericType::Sint,
 ];
+const MAX_TEXTURE_DESCRIPTOR_COUNT: usize = crate::descriptor::MAX_TEXTURE_DESCRIPTORS as usize;
 
 fn texture_numeric_index(numeric_type: nexium_spirv::TextureNumericType) -> usize {
     texture_numeric_cache_key(numeric_type) as usize
@@ -962,32 +1338,33 @@ fn typed_sampled_image_infos(
     selected_layouts: Option<&[vk::ImageLayout]>,
     manifest: &[TextureNumericBinding],
     dummy_views: &[[vk::ImageView; 3]],
-) -> [Vec<vk::DescriptorImageInfo>; 3] {
+) -> [[vk::DescriptorImageInfo; MAX_TEXTURE_DESCRIPTOR_COUNT]; 3] {
+    debug_assert_eq!(selected_views.len(), MAX_TEXTURE_DESCRIPTOR_COUNT);
+    debug_assert_eq!(dummy_views.len(), MAX_TEXTURE_DESCRIPTOR_COUNT);
+    debug_assert!(
+        selected_layouts.is_none_or(|layouts| { layouts.len() == MAX_TEXTURE_DESCRIPTOR_COUNT })
+    );
     std::array::from_fn(|family| {
-        selected_views
-            .iter()
-            .enumerate()
-            .map(|(slot, selected_view)| {
-                let selected_family =
-                    texture_numeric_index(texture_numeric_type_for_slot(manifest, slot));
-                let selected = selected_family == family;
-                vk::DescriptorImageInfo {
-                    sampler: vk::Sampler::null(),
-                    image_view: if selected {
-                        *selected_view
-                    } else {
-                        dummy_views[slot][family]
-                    },
-                    image_layout: if selected {
-                        selected_layouts
-                            .and_then(|layouts| layouts.get(slot).copied())
-                            .unwrap_or(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    } else {
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                    },
-                }
-            })
-            .collect()
+        std::array::from_fn(|slot| {
+            let selected_family =
+                texture_numeric_index(texture_numeric_type_for_slot(manifest, slot));
+            let selected = selected_family == family;
+            vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view: if selected {
+                    selected_views[slot]
+                } else {
+                    dummy_views[slot][family]
+                },
+                image_layout: if selected {
+                    selected_layouts
+                        .and_then(|layouts| layouts.get(slot).copied())
+                        .unwrap_or(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                } else {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                },
+            }
+        })
     })
 }
 
@@ -995,20 +1372,43 @@ fn typed_texel_buffer_views(
     selected_views: &[vk::BufferView],
     manifest: &[TextureNumericBinding],
     dummy_views: [vk::BufferView; 3],
-) -> [Vec<vk::BufferView>; 3] {
+) -> [[vk::BufferView; MAX_TEXTURE_DESCRIPTOR_COUNT]; 3] {
+    debug_assert_eq!(selected_views.len(), MAX_TEXTURE_DESCRIPTOR_COUNT);
     std::array::from_fn(|family| {
-        selected_views
-            .iter()
-            .enumerate()
-            .map(|(slot, selected_view)| {
-                if texture_numeric_index(texture_numeric_type_for_slot(manifest, slot)) == family {
-                    *selected_view
-                } else {
-                    dummy_views[family]
-                }
-            })
-            .collect()
+        std::array::from_fn(|slot| {
+            if texture_numeric_index(texture_numeric_type_for_slot(manifest, slot)) == family {
+                selected_views[slot]
+            } else {
+                dummy_views[family]
+            }
+        })
     })
+}
+
+const GRAPHICS_TEXTURE_DESCRIPTOR_BINDING_COUNT: usize = crate::descriptor::SAMPLED_IMAGE_BINDINGS
+    .len()
+    + crate::descriptor::TEXEL_BUFFER_BINDINGS.len();
+
+fn graphics_texture_descriptor_binding_mask(
+    manifest: &[TextureNumericBinding],
+) -> [bool; GRAPHICS_TEXTURE_DESCRIPTOR_BINDING_COUNT] {
+    if manifest.is_empty() {
+        return [true; GRAPHICS_TEXTURE_DESCRIPTOR_BINDING_COUNT];
+    }
+
+    let mut selected = [false; GRAPHICS_TEXTURE_DESCRIPTOR_BINDING_COUNT];
+    for texture in manifest {
+        let binding =
+            nexium_spirv::graphics_image_binding(texture.spirv_type(), texture.spirv_image_kind());
+        if let Some(index) = crate::descriptor::SAMPLED_IMAGE_BINDINGS
+            .iter()
+            .chain(crate::descriptor::TEXEL_BUFFER_BINDINGS.iter())
+            .position(|candidate| *candidate == binding)
+        {
+            selected[index] = true;
+        }
+    }
+    selected
 }
 
 fn texture_key_has_special_view(key: TexCacheKey) -> bool {
@@ -1116,13 +1516,14 @@ fn texture_requires_integer_sampler(
 struct PreparedVertexBinding {
     binding: u32,
     stride: u64,
-    data: Vec<u8>,
+    data: SharedGuestSnapshot,
 }
 
 struct CachedTexture {
     image: vk::Image,
     view: vk::ImageView,
     memory: vk::DeviceMemory,
+    layout: vk::ImageLayout,
     hash: u64,
     gen: u64,
     verified: std::time::Instant,
@@ -1163,6 +1564,103 @@ struct VolumeRtSlice {
     src_y: u32,
 }
 
+const COMPUTE_VOLUME_CACHE_MAX_ITEMS: usize = 8;
+const COMPUTE_VOLUME_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ComputeVolumeSliceIdentity {
+    layer: u32,
+    key: RtKey,
+    image: u64,
+    format: i32,
+    src_x: u32,
+    src_y: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ComputeVolumeCacheKey {
+    width: u32,
+    height: u32,
+    depth: u32,
+    format: i32,
+    components: [i32; 4],
+    mip_levels: u32,
+    view_base_mip: u32,
+    view_mip_levels: u32,
+    slices: Vec<ComputeVolumeSliceIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ComputeVolumeSourceSignature {
+    stamps: Vec<u64>,
+}
+
+struct CachedComputeVolume {
+    key: ComputeVolumeCacheKey,
+    signature: Option<ComputeVolumeSourceSignature>,
+    resource: crate::compute::ComputeImageResource,
+}
+
+const COMPUTE_GUEST_IMAGE_POOL_MAX_ITEMS: usize = 32;
+const COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ComputeGuestImagePoolKey {
+    width: u32,
+    height: u32,
+    depth: u32,
+    is_3d: bool,
+    is_cube: bool,
+    format: i32,
+    components: [i32; 4],
+    mip_levels: u32,
+    view_base_mip: u32,
+    view_mip_levels: u32,
+    upload_len: usize,
+    copies: Vec<TextureMipCopy>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ComputeGuestUploadSpec {
+    tic: crate::texture::TicEntry,
+    effective_block_linear: bool,
+    layer_count: u32,
+    pitch_size: usize,
+    force_pitch: bool,
+    format: i32,
+}
+
+#[derive(Clone)]
+struct ComputeGuestImageContent {
+    spec: ComputeGuestUploadSpec,
+    source_hash: u64,
+    source: Arc<[u8]>,
+    upload: Arc<[u8]>,
+    copies: Arc<[TextureMipCopy]>,
+}
+
+fn fnv_chunked(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325 ^ bytes.len() as u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        h ^= u64::from_le_bytes(chunk.try_into().unwrap());
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let mut tail = 0u64;
+    for (index, &byte) in chunks.remainder().iter().enumerate() {
+        tail |= (byte as u64) << (index * 8);
+    }
+    h ^= tail;
+    h.wrapping_mul(0x100000001b3)
+}
+
+struct CachedComputeGuestImage {
+    key: ComputeGuestImagePoolKey,
+    content: Option<ComputeGuestImageContent>,
+    resource: crate::compute::ComputeGuestImageResource,
+}
+
 #[derive(Clone, Copy)]
 struct RtAlias {
     key: RtKey,
@@ -1172,6 +1670,16 @@ struct RtAlias {
     format: vk::Format,
     aspects: vk::ImageAspectFlags,
     depth: bool,
+    frozen: bool,
+    fermi_exact_rt_snapshot_id: Option<u64>,
+}
+
+struct FermiExactRtSnapshotLease {
+    token: crate::draw::FermiExactRtToken,
+    image: GpuImage,
+    bytes: u64,
+    ready_generation: u64,
+    refs: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1244,6 +1752,28 @@ struct StagingBuffer {
 struct HostBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    size: u64,
+}
+
+struct PersistentUploadBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    size: u64,
+    mapped: *mut u8,
+}
+
+unsafe impl Send for PersistentUploadBuffer {}
+unsafe impl Sync for PersistentUploadBuffer {}
+
+struct TextureUploadArena {
+    buffer: PersistentUploadBuffer,
+    head: u64,
+}
+
+struct TextureUploadLease {
+    buffer: vk::Buffer,
+    base_offset: u64,
+    dedicated: Option<PersistentUploadBuffer>,
 }
 
 struct DummyImage {
@@ -1269,20 +1799,178 @@ struct FrameSlot {
     fence: vk::Fence,
     cmd: vk::CommandBuffer,
     in_flight: bool,
+    submit_generation: u64,
     retired_dsets: Vec<vk::DescriptorSet>,
     retired_dset_pools: Vec<vk::DescriptorPool>,
     retired_buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    upload_buffers: Vec<PersistentUploadBuffer>,
+    free_upload_buffers: Vec<PersistentUploadBuffer>,
+    texture_upload_arena: Option<TextureUploadArena>,
+    texture_upload_arena_unavailable: bool,
     retired_textures: Vec<CachedTexture>,
     retired_texel_buffers: Vec<CachedTexelBuffer>,
     retired_rt_reinterprets: Vec<RtReinterpretTexture>,
+    retired_rt_images: Vec<GpuImage>,
     retired_views: Vec<vk::ImageView>,
+    fermi_exact_rt_snapshot_leases: Vec<u64>,
+}
+
+const FERMI_EXACT_RT_SNAPSHOT_LEASE_CAPACITY: usize = 32;
+const FERMI_EXACT_RT_SNAPSHOT_LEASE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn fermi_exact_rt_snapshot_token_matches_tic(
+    token: crate::draw::FermiExactRtToken,
+    tic: crate::texture::TicEntry,
+) -> bool {
+    tic.is_block_linear
+        && matches!(tic.texture_type, 1 | 5)
+        && tic.depth == 1
+        && tic.base_layer == 0
+        && tic.max_mip_level == 0
+        && tic.res_min_mip_level == 0
+        && tic.res_max_mip_level == 0
+        && token.key.width == tic.width
+        && token.key.height == tic.height
+        && token.key.depth == 1
+        && !token.key.is_3d
+        && token.key.gpu_va == tic.gpu_va
+        && token.guest_va == tic.gpu_va
+        && token.guest_size != 0
+        && token.bytes_per_pixel == tic.format.src_bpp()
+        && token.fermi_block_size & !0xff == 0
+        && token.fermi_block_size & 0xf == tic.block_width_log2
+        && (token.fermi_block_size >> 4) & 0xf == tic.block_height_log2
+        && token.block_width_log2 == tic.block_width_log2
+        && token.block_height_log2 == tic.block_height_log2
+        && token.block_depth_log2 == 0
+        && token.block_depth_log2 == tic.block_depth_log2
+        && token.tile_width_spacing == 0
+        && token.tile_width_spacing == tic.tile_width_spacing
+}
+
+fn fermi_exact_rt_snapshot_requires_reinterpret(
+    tic: crate::texture::TicEntry,
+    source_format: vk::Format,
+    view_format: vk::Format,
+) -> bool {
+    tic.gpu_va != 0
+        && tic.width == 1
+        && tic.height == 1
+        && tic.depth == 1
+        && tic.base_layer == 0
+        && source_format == vk::Format::R32G32B32A32_SFLOAT
+        && tic.format == crate::texture::TicFormat::A8B8G8R8
+        && view_format == vk::Format::A8B8G8R8_UNORM_PACK32
+}
+
+fn reap_fermi_exact_rt_snapshot_leases(
+    device: &ash::Device,
+    leases: &mut HashMap<u64, FermiExactRtSnapshotLease>,
+    ids: &mut HashMap<crate::draw::FermiExactRtToken, u64>,
+) {
+    let retired = leases
+        .iter()
+        .filter_map(|(id, lease)| {
+            (lease.refs == 0 && frame_slot_submission_complete(device, lease.ready_generation))
+                .then_some(*id)
+        })
+        .collect::<Vec<_>>();
+    for id in retired {
+        if let Some(lease) = leases.remove(&id) {
+            ids.remove(&lease.token);
+            RtCache::destroy_detached_image(device, lease.image);
+        }
+    }
+}
+
+fn release_fermi_exact_rt_snapshot_lease_refs(
+    device: &ash::Device,
+    leases: &mut HashMap<u64, FermiExactRtSnapshotLease>,
+    ids: &mut HashMap<crate::draw::FermiExactRtToken, u64>,
+    refs: &mut Vec<u64>,
+) {
+    for id in refs.drain(..) {
+        if let Some(lease) = leases.get_mut(&id) {
+            lease.refs = lease.refs.saturating_sub(1);
+        }
+    }
+    reap_fermi_exact_rt_snapshot_leases(device, leases, ids);
+}
+
+const FRAME_SLOT_UPLOAD_POOL_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const TEXTURE_UPLOAD_ARENA_BYTES: u64 = 64 * 1024 * 1024;
+const TEXTURE_UPLOAD_ARENA_ALIGNMENT: u64 = 256;
+
+fn destroy_persistent_upload_buffer(device: &ash::Device, buffer: PersistentUploadBuffer) {
+    unsafe {
+        device.unmap_memory(buffer.memory);
+        device.destroy_buffer(buffer.buffer, None);
+        device.free_memory(buffer.memory, None);
+    }
+}
+
+fn destroy_retired_rt_images(device: &ash::Device, images: &mut Vec<GpuImage>) {
+    for image in images.drain(..) {
+        RtCache::destroy_detached_image(device, image);
+    }
+}
+
+fn recycle_slot_upload_buffers(device: &ash::Device, slot: &mut FrameSlot) {
+    if let Some(arena) = slot.texture_upload_arena.as_mut() {
+        arena.head = 0;
+    }
+    if slot.upload_buffers.is_empty() {
+        return;
+    }
+    slot.free_upload_buffers.append(&mut slot.upload_buffers);
+    slot.free_upload_buffers
+        .sort_unstable_by(|a, b| b.size.cmp(&a.size));
+    let mut retained_bytes = 0u64;
+    let mut retained = Vec::with_capacity(slot.free_upload_buffers.len());
+    for buffer in slot.free_upload_buffers.drain(..) {
+        if retained_bytes.saturating_add(buffer.size) <= FRAME_SLOT_UPLOAD_POOL_MAX_BYTES {
+            retained_bytes = retained_bytes.saturating_add(buffer.size);
+            retained.push(buffer);
+        } else {
+            destroy_persistent_upload_buffer(device, buffer);
+        }
+    }
+    slot.free_upload_buffers = retained;
+}
+
+fn texture_upload_arena_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_UPLOAD_ARENA").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON")
+        )
+    })
 }
 
 const BATCH_DESCRIPTOR_POOL_SETS: u32 = 4096;
+const BATCH_DESCRIPTOR_SET_ALLOCATION: usize = 64;
+
+#[derive(Default)]
+struct DescriptorSetBatchCache {
+    sets: Vec<vk::DescriptorSet>,
+}
+
+impl DescriptorSetBatchCache {
+    fn take(&mut self) -> Option<vk::DescriptorSet> {
+        self.sets.pop()
+    }
+
+    fn refill(&mut self, mut sets: Vec<vk::DescriptorSet>) {
+        debug_assert!(self.sets.is_empty());
+        self.sets.append(&mut sets);
+    }
+}
 
 struct DescriptorPoolBatch<'a> {
     device: &'a ash::Device,
     pools: Vec<vk::DescriptorPool>,
+    cached_sets: DescriptorSetBatchCache,
 }
 
 impl<'a> DescriptorPoolBatch<'a> {
@@ -1290,6 +1978,7 @@ impl<'a> DescriptorPoolBatch<'a> {
         Ok(Self {
             device,
             pools: vec![DescriptorPool::new(device, BATCH_DESCRIPTOR_POOL_SETS)?.into_raw()],
+            cached_sets: DescriptorSetBatchCache::default(),
         })
     }
 
@@ -1301,6 +1990,47 @@ impl<'a> DescriptorPoolBatch<'a> {
         let pool = DescriptorPool::new(self.device, BATCH_DESCRIPTOR_POOL_SETS)?.into_raw();
         self.pools.push(pool);
         Ok(pool)
+    }
+
+    fn allocate_set(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+    ) -> Result<vk::DescriptorSet, String> {
+        if let Some(set) = self.cached_sets.take() {
+            return Ok(set);
+        }
+
+        let set_layouts = [layout; BATCH_DESCRIPTOR_SET_ALLOCATION];
+        let mut grew_pool = false;
+        loop {
+            let alloc_info = vk::DescriptorSetAllocateInfo {
+                s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
+                descriptor_pool: self.current(),
+                descriptor_set_count: BATCH_DESCRIPTOR_SET_ALLOCATION as u32,
+                p_set_layouts: set_layouts.as_ptr(),
+                p_next: std::ptr::null(),
+                _marker: std::marker::PhantomData,
+            };
+            match unsafe { self.device.allocate_descriptor_sets(&alloc_info) } {
+                Ok(sets) => {
+                    debug_assert_eq!(sets.len(), BATCH_DESCRIPTOR_SET_ALLOCATION);
+                    self.cached_sets.refill(sets);
+                    return Ok(self
+                        .cached_sets
+                        .take()
+                        .expect("descriptor-set allocation returned no sets"));
+                }
+                Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {
+                    if grew_pool {
+                        return Err("allocate_descriptor_sets exhausted a fresh descriptor pool"
+                            .to_string());
+                    }
+                    self.grow()?;
+                    grew_pool = true;
+                }
+                Err(error) => return Err(format!("allocate_descriptor_sets: {error:?}")),
+            }
+        }
     }
 
     fn into_raw(mut self) -> Vec<vk::DescriptorPool> {
@@ -1318,6 +2048,93 @@ struct ClearSlot {
     fence: vk::Fence,
     cmd: vk::CommandBuffer,
     in_flight: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ClearProfileKind {
+    Color,
+    Rect,
+    Depth,
+    Combined,
+}
+
+struct ClearProfileStats {
+    count: std::sync::atomic::AtomicU64,
+    waits: std::sync::atomic::AtomicU64,
+    settle_ns: std::sync::atomic::AtomicU64,
+    wait_ns: std::sync::atomic::AtomicU64,
+    record_ns: std::sync::atomic::AtomicU64,
+    submit_ns: std::sync::atomic::AtomicU64,
+}
+
+impl ClearProfileStats {
+    const fn new() -> Self {
+        Self {
+            count: std::sync::atomic::AtomicU64::new(0),
+            waits: std::sync::atomic::AtomicU64::new(0),
+            settle_ns: std::sync::atomic::AtomicU64::new(0),
+            wait_ns: std::sync::atomic::AtomicU64::new(0),
+            record_ns: std::sync::atomic::AtomicU64::new(0),
+            submit_ns: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+static CLEAR_PROFILE_COLOR: ClearProfileStats = ClearProfileStats::new();
+static CLEAR_PROFILE_RECT: ClearProfileStats = ClearProfileStats::new();
+static CLEAR_PROFILE_DEPTH: ClearProfileStats = ClearProfileStats::new();
+static CLEAR_PROFILE_COMBINED: ClearProfileStats = ClearProfileStats::new();
+
+fn clear_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_CLEAR_PROFILE").is_some())
+}
+
+fn note_clear_profile(
+    kind: ClearProfileKind,
+    settle: std::time::Duration,
+    wait: std::time::Duration,
+    waited: bool,
+    record: std::time::Duration,
+    submit: std::time::Duration,
+) {
+    if !clear_profile_enabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    let (label, stats) = match kind {
+        ClearProfileKind::Color => ("color", &CLEAR_PROFILE_COLOR),
+        ClearProfileKind::Rect => ("rect", &CLEAR_PROFILE_RECT),
+        ClearProfileKind::Depth => ("depth", &CLEAR_PROFILE_DEPTH),
+        ClearProfileKind::Combined => ("combined", &CLEAR_PROFILE_COMBINED),
+    };
+    let count = stats.count.fetch_add(1, Ordering::Relaxed) + 1;
+    stats.waits.fetch_add(u64::from(waited), Ordering::Relaxed);
+    stats
+        .settle_ns
+        .fetch_add(settle.as_nanos() as u64, Ordering::Relaxed);
+    stats
+        .wait_ns
+        .fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
+    stats
+        .record_ns
+        .fetch_add(record.as_nanos() as u64, Ordering::Relaxed);
+    stats
+        .submit_ns
+        .fetch_add(submit.as_nanos() as u64, Ordering::Relaxed);
+    if count % 256 == 0 {
+        let to_ms = |value| value as f64 / count as f64 / 1_000_000.0;
+        log::warn!(
+            "[clearprof] kind={} count={} waits={} avg_ms settle={:.3} wait={:.3} record={:.3} submit={:.3}",
+            label,
+            count,
+            stats.waits.load(Ordering::Relaxed),
+            to_ms(stats.settle_ns.load(Ordering::Relaxed)),
+            to_ms(stats.wait_ns.load(Ordering::Relaxed)),
+            to_ms(stats.record_ns.load(Ordering::Relaxed)),
+            to_ms(stats.submit_ns.load(Ordering::Relaxed)),
+        );
+    }
 }
 
 struct RtCopySlot {
@@ -1377,6 +2194,33 @@ fn take_latest_completed_readback(
         *pending = keep;
         !pending.is_empty()
     });
+    (latest, superseded_slots)
+}
+
+fn take_latest_completed_readback_for_key(
+    pending: &mut VecDeque<PendingReadback>,
+    mut is_ready: impl FnMut(usize) -> bool,
+) -> (Option<PendingReadback>, Vec<usize>) {
+    let mut latest = None;
+    let mut keep = VecDeque::with_capacity(pending.len());
+    let mut superseded_slots = Vec::new();
+    while let Some(readback) = pending.pop_front() {
+        if !is_ready(readback.slot) {
+            keep.push_back(readback);
+            continue;
+        }
+        if latest
+            .as_ref()
+            .is_none_or(|current: &PendingReadback| readback.sequence > current.sequence)
+        {
+            if let Some(superseded) = latest.replace(readback) {
+                superseded_slots.push(superseded.slot);
+            }
+        } else {
+            superseded_slots.push(readback.slot);
+        }
+    }
+    *pending = keep;
     (latest, superseded_slots)
 }
 
@@ -1520,6 +2364,16 @@ struct PendingComputeTexel {
     byte_len: usize,
 }
 
+const COMPUTE_RAW_STORAGE_CACHE_MAX_ITEMS: usize = 512;
+const COMPUTE_RAW_STORAGE_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+struct CachedComputeRawStorage {
+    resource: crate::compute::ComputeBufferResource,
+    ready: bool,
+    valid: bool,
+    dirty: bool,
+}
+
 struct PendingCompute {
     id: u64,
     program_key: u64,
@@ -1530,6 +2384,7 @@ struct PendingCompute {
     resources: Option<PreparedComputeResources>,
     outputs: Vec<PendingComputeOutput>,
     texels: Vec<PendingComputeTexel>,
+    resident_raw_storage: Vec<crate::compute::ComputeRawStorageKey>,
     result: Option<Result<crate::compute::ComputeDispatchResult, String>>,
 }
 
@@ -1539,13 +2394,29 @@ struct UboRing {
     mapped: *mut u8,
     size: u64,
     head: u64,
-    slot_head: [u64; 2],
+    slot_head: Vec<u64>,
 }
 
 unsafe impl Send for UboRing {}
 unsafe impl Sync for UboRing {}
 
 impl Renderer {
+    pub fn compute_raw_storage_is_resident(
+        &self,
+        key: crate::compute::ComputeRawStorageKey,
+    ) -> bool {
+        self.inner
+            .lock()
+            .compute_raw_storage_cache
+            .get(&key)
+            .is_some_and(|entry| entry.ready && entry.valid)
+    }
+
+    pub fn release_unreferenced_compute_raw_storage(&self) {
+        let mut inner = self.inner.lock();
+        release_unreferenced_compute_raw_storage(&mut inner);
+    }
+
     pub fn dispatch_compute_sync(
         &self,
         dispatch: crate::compute::ComputeDispatch,
@@ -1679,13 +2550,78 @@ impl Renderer {
         Ok(Some(bytes))
     }
 
+    pub fn timeline_sync_available(&self) -> bool {
+        self.submit_timeline != vk::Semaphore::null()
+    }
+
+    pub fn submitted_generation(&self) -> u64 {
+        SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn completed_generation(&self) -> Option<u64> {
+        if self.submit_timeline == vk::Semaphore::null() {
+            return None;
+        }
+        unsafe {
+            self.device
+                .get_semaphore_counter_value(self.submit_timeline)
+        }
+        .ok()
+    }
+
+    pub fn wait_submit_generation(&self, target: u64, timeout: std::time::Duration) -> bool {
+        if self.submit_timeline == vk::Semaphore::null() {
+            return self.wait_idle_checked();
+        }
+        if self
+            .completed_generation()
+            .is_some_and(|done| done >= target)
+        {
+            return true;
+        }
+        let semaphore = self.submit_timeline;
+        let info = vk::SemaphoreWaitInfo {
+            s_type: vk::StructureType::SEMAPHORE_WAIT_INFO,
+            semaphore_count: 1,
+            p_semaphores: &semaphore,
+            p_values: &target,
+            ..Default::default()
+        };
+        let nanos = timeout.as_nanos().min(u64::MAX as u128) as u64;
+        match unsafe { self.device.wait_semaphores(&info, nanos) } {
+            Ok(()) => true,
+            Err(vk::Result::TIMEOUT) => {
+                log::warn!(
+                    "[gpu-sync] timeline wait timeout target={} completed={:?}",
+                    target,
+                    self.completed_generation()
+                );
+                false
+            }
+            Err(error) => {
+                log::warn!("[gpu-sync] timeline wait error {:?}", error);
+                false
+            }
+        }
+    }
+
     pub fn wait_idle(&self) {
+        let _ = self.wait_idle_checked();
+    }
+
+    pub fn wait_idle_checked(&self) -> bool {
         let generation = SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire);
         let inner = self.inner.lock();
-        unsafe {
-            let _ = inner.device.device_wait_idle();
+        match unsafe { inner.device.device_wait_idle() } {
+            Ok(()) => {
+                LAST_IDLE_GENERATION.store(generation, std::sync::atomic::Ordering::Release);
+                true
+            }
+            Err(error) => {
+                log::error!("[gpu-sync] device idle wait error {:?}", error);
+                false
+            }
         }
-        LAST_IDLE_GENERATION.store(generation, std::sync::atomic::Ordering::Release);
     }
 
     pub fn wait_idle_if_dirty(&self) -> bool {
@@ -1699,10 +2635,21 @@ impl Renderer {
         true
     }
 
+    pub fn wait_idle_if_dirty_checked(&self) -> bool {
+        if !idle_skip_disabled()
+            && LAST_IDLE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+                == SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return true;
+        }
+        self.wait_idle_checked()
+    }
+
     pub fn clear_texture_cache(&self) {
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
         let drained: Vec<_> = inner.tex_cache.drain().map(|(_, t)| t).collect();
+        inner.tex_cache_vas.clear();
         let texel_drained: Vec<_> = inner
             .texel_buffer_cache
             .drain()
@@ -1748,6 +2695,9 @@ impl Renderer {
 
     pub fn invalidate_texture_address(&self, gpu_va: u64) {
         let mut inner = self.inner.lock();
+        if !inner.tex_cache_vas.contains_key(&gpu_va) {
+            return;
+        }
         let keys: Vec<_> = inner
             .tex_cache
             .keys()
@@ -1759,7 +2709,11 @@ impl Renderer {
         }
         let drained: Vec<_> = keys
             .into_iter()
-            .filter_map(|key| inner.tex_cache.remove(&key))
+            .filter_map(|key| {
+                let texture = inner.tex_cache.remove(&key)?;
+                release_tex_cache_va(&mut inner.tex_cache_vas, key.gpu_va);
+                Some(texture)
+            })
             .collect();
         let retire_idx = (inner.frame_index + 1) % inner.frame_slots.len();
         if inner.frame_slots[retire_idx].in_flight {
@@ -1779,6 +2733,18 @@ impl Renderer {
 
     pub fn invalidate_render_target_content(&self, key: RtKey) {
         self.inner.lock().rt_cache.mark_guest_written(key);
+    }
+
+    pub fn invalidate_render_target_range(
+        &self,
+        cpu_addr: u64,
+        size: u64,
+        gpu_ranges: &[(u64, u64)],
+    ) {
+        self.inner
+            .lock()
+            .rt_cache
+            .mark_guest_written_range(cpu_addr, size, gpu_ranges);
     }
 
     pub fn new() -> Result<Arc<Self>, String> {
@@ -2006,6 +2972,7 @@ impl Renderer {
         let shader_output_layer_supported = supported_features_12.shader_output_layer == vk::TRUE;
         let uniform_buffer_standard_layout_supported =
             supported_features_12.uniform_buffer_standard_layout == vk::TRUE;
+        let timeline_semaphore_supported = supported_features_12.timeline_semaphore == vk::TRUE;
         let subgroup_size_control_supported =
             supported_features_13.subgroup_size_control == vk::TRUE;
         let mut subgroup_size_properties =
@@ -2039,6 +3006,11 @@ impl Renderer {
                 vk::FALSE
             },
             uniform_buffer_standard_layout: if uniform_buffer_standard_layout_supported {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
+            timeline_semaphore: if timeline_semaphore_supported {
                 vk::TRUE
             } else {
                 vk::FALSE
@@ -2152,6 +3124,10 @@ impl Renderer {
             core_features.shader_storage_image_extended_formats == vk::TRUE;
         let image_gather_extended_supported =
             core_features.shader_image_gather_extended == vk::TRUE;
+        let image_cube_array_supported = core_features.image_cube_array == vk::TRUE;
+        if !image_cube_array_supported {
+            log::warn!("Vulkan imageCubeArray feature unavailable; cube-array views unsupported");
+        }
         if !depth_clamp_supported {
             log::info!("Vulkan depthClamp feature unavailable; Maxwell depth clamp disabled");
         }
@@ -2202,6 +3178,11 @@ impl Renderer {
                 vk::FALSE
             },
             shader_image_gather_extended: if image_gather_extended_supported {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
+            image_cube_array: if image_cube_array_supported {
                 vk::TRUE
             } else {
                 vk::FALSE
@@ -2334,11 +3315,12 @@ impl Renderer {
             );
         }
 
+        let frame_slot_count = graphics_frame_slot_count();
         let cb_alloc = vk::CommandBufferAllocateInfo {
             s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
             command_pool: cmd_pool,
             level: vk::CommandBufferLevel::PRIMARY,
-            command_buffer_count: 3,
+            command_buffer_count: (frame_slot_count + 1) as u32,
             p_next: std::ptr::null(),
             _marker: std::marker::PhantomData,
         };
@@ -2354,62 +3336,99 @@ impl Renderer {
             p_next: std::ptr::null(),
             _marker: std::marker::PhantomData,
         };
-        let fence_a = unsafe {
-            device
-                .create_fence(&fence_info, None)
-                .map_err(|e| format!("create_fence(0): {:?}", e))?
+        let frame_fences = (0..=frame_slot_count)
+            .map(|i| unsafe {
+                device
+                    .create_fence(&fence_info, None)
+                    .map_err(|e| format!("create_fence({i}): {:?}", e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let submit_timeline = if timeline_semaphore_supported
+            && std::env::var_os("NEXIUM_NO_SEMREL_TIMELINE").is_none()
+        {
+            let mut type_info = vk::SemaphoreTypeCreateInfo {
+                s_type: vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO,
+                semaphore_type: vk::SemaphoreType::TIMELINE,
+                initial_value: 0,
+                ..Default::default()
+            };
+            let info = vk::SemaphoreCreateInfo {
+                s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
+                p_next: &mut type_info as *mut _ as *mut std::ffi::c_void,
+                ..Default::default()
+            };
+            match unsafe { device.create_semaphore(&info, None) } {
+                Ok(semaphore) => semaphore,
+                Err(error) => {
+                    log::warn!(
+                        "timeline semaphore unavailable ({:?}); semrel falls back to device_wait_idle",
+                        error
+                    );
+                    vk::Semaphore::null()
+                }
+            }
+        } else {
+            vk::Semaphore::null()
         };
-        let fence_b = unsafe {
-            device
-                .create_fence(&fence_info, None)
-                .map_err(|e| format!("create_fence(1): {:?}", e))?
-        };
-        let fence_util = unsafe {
-            device
-                .create_fence(&fence_info, None)
-                .map_err(|e| format!("create_fence(utility): {:?}", e))?
-        };
-        let frame_slots = [
-            FrameSlot {
-                fence: fence_a,
-                cmd: frame_cmds[0],
+        {
+            use ash::vk::Handle;
+            SUBMIT_TIMELINE.store(
+                submit_timeline.as_raw(),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+        log::info!(
+            "submit timeline semaphore {}",
+            if submit_timeline == vk::Semaphore::null() {
+                "disabled (semrel uses device_wait_idle)"
+            } else {
+                "enabled"
+            }
+        );
+        let frame_slots = (0..frame_slot_count)
+            .map(|index| FrameSlot {
+                fence: frame_fences[index],
+                cmd: frame_cmds[index],
                 in_flight: false,
+                submit_generation: 0,
                 retired_dsets: Vec::new(),
                 retired_dset_pools: Vec::new(),
                 retired_buffers: Vec::new(),
+                upload_buffers: Vec::new(),
+                free_upload_buffers: Vec::new(),
+                texture_upload_arena: None,
+                texture_upload_arena_unavailable: false,
                 retired_textures: Vec::new(),
                 retired_texel_buffers: Vec::new(),
                 retired_rt_reinterprets: Vec::new(),
+                retired_rt_images: Vec::new(),
                 retired_views: Vec::new(),
-            },
-            FrameSlot {
-                fence: fence_b,
-                cmd: frame_cmds[1],
-                in_flight: false,
-                retired_dsets: Vec::new(),
-                retired_dset_pools: Vec::new(),
-                retired_buffers: Vec::new(),
-                retired_textures: Vec::new(),
-                retired_texel_buffers: Vec::new(),
-                retired_rt_reinterprets: Vec::new(),
-                retired_views: Vec::new(),
-            },
-        ];
+                fermi_exact_rt_snapshot_leases: Vec::new(),
+            })
+            .collect::<Vec<_>>();
         let utility_slot = FrameSlot {
-            fence: fence_util,
-            cmd: frame_cmds[2],
+            fence: frame_fences[frame_slot_count],
+            cmd: frame_cmds[frame_slot_count],
             in_flight: false,
+            submit_generation: 0,
             retired_dsets: Vec::new(),
             retired_dset_pools: Vec::new(),
             retired_buffers: Vec::new(),
+            upload_buffers: Vec::new(),
+            free_upload_buffers: Vec::new(),
+            texture_upload_arena: None,
+            texture_upload_arena_unavailable: false,
             retired_textures: Vec::new(),
             retired_texel_buffers: Vec::new(),
             retired_rt_reinterprets: Vec::new(),
+            retired_rt_images: Vec::new(),
             retired_views: Vec::new(),
+            fermi_exact_rt_snapshot_leases: Vec::new(),
         };
 
-        let mut clear_slots = Vec::with_capacity(4);
-        for i in 0..4 {
+        let clear_slot_count = clear_slot_count();
+        let mut clear_slots = Vec::with_capacity(clear_slot_count);
+        for i in 0..clear_slot_count {
             let fence = unsafe {
                 device
                     .create_fence(&fence_info, None)
@@ -2475,7 +3494,12 @@ impl Renderer {
             in_flight: false,
         };
 
-        let ubo_ring = create_ubo_ring(&device, &mem_props, GRAPHICS_RING_CAPACITY_BYTES)?;
+        let ubo_ring = create_ubo_ring(
+            &device,
+            &mem_props,
+            GRAPHICS_RING_CAPACITY_BYTES,
+            frame_slot_count,
+        )?;
         let aurora_resident_ssbos = match create_aurora_resident_ssbo_cache(&device, &mem_props) {
             Ok(cache) => Some(cache),
             Err(error) => {
@@ -2486,9 +3510,24 @@ impl Renderer {
                 None
             }
         };
+        let resident_vb = if resident_vb_enabled() {
+            match create_resident_vb_cache(&device, &mem_props) {
+                Ok(cache) => Some(cache),
+                Err(error) => {
+                    log::warn!(
+                        "resident vertex buffer cache unavailable; using ring uploads: {}",
+                        error
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         log::info!("nexium-gpu Renderer init OK: {} (Vulkan via Ash)", name);
 
+        let device_handle = device.clone();
         let renderer = Arc::new(Self {
             inner: Mutex::new(RendererInner {
                 entry,
@@ -2500,6 +3539,9 @@ impl Renderer {
                 mem_props,
                 cmd_pool,
                 rt_cache,
+                fermi_exact_rt_snapshot_leases: HashMap::new(),
+                fermi_exact_rt_snapshot_ids: HashMap::new(),
+                next_fermi_exact_rt_snapshot_id: 1,
                 staging: HashMap::new(),
                 descriptor_layout,
                 descriptor_pool,
@@ -2513,8 +3555,12 @@ impl Renderer {
                 sampler_cache: HashMap::new(),
                 integer_sampler_cache: HashMap::new(),
                 tex_cache: HashMap::new(),
+                tex_cache_vas: HashMap::new(),
                 texel_buffer_cache: HashMap::new(),
                 rt_reinterpret_cache: HashMap::new(),
+                compute_volume_cache: Vec::new(),
+                compute_guest_image_pool: VecDeque::new(),
+                compute_raw_storage_cache: HashMap::new(),
                 frame_slots,
                 frame_index: 0,
                 utility_slot,
@@ -2527,6 +3573,8 @@ impl Renderer {
                 rt_copy_slot_index: 0,
                 ubo_ring,
                 aurora_resident_ssbos,
+                resident_vb,
+                compute_guest_content_memo: HashMap::new(),
                 min_storage_buffer_offset_alignment,
                 max_storage_buffer_range,
                 max_texel_buffer_elements,
@@ -2544,7 +3592,10 @@ impl Renderer {
                 vertex_attribute_divisor_supported,
                 sampler_filter_minmax_supported,
                 sampler_anisotropy_supported,
+                submit_timeline,
             }),
+            device: device_handle,
+            submit_timeline,
         });
         renderer.prewarm();
         Ok(renderer)
@@ -2626,8 +3677,10 @@ impl Renderer {
         rgba: [f32; 4],
         format: vk::Format,
     ) -> Result<(), String> {
+        let clear_settle_started = std::time::Instant::now();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
+        let clear_settle = clear_settle_started.elapsed();
         let RendererInner {
             device,
             queue,
@@ -2648,7 +3701,9 @@ impl Renderer {
         )?;
         let img = rt_cache.get_or_create_with_format(key, device, format)?;
 
-        let clear_slot = acquire_clear_slot(device, clear_slots, clear_slot_index)?;
+        let (clear_slot, clear_wait, clear_waited) =
+            acquire_clear_slot(device, clear_slots, clear_slot_index)?;
+        let clear_record_started = std::time::Instant::now();
         reset_command_buffer(device, clear_slot.cmd)?;
         let cmd = clear_slot.cmd;
 
@@ -2713,9 +3768,189 @@ impl Renderer {
                 .end_command_buffer(cmd)
                 .map_err(|e| format!("end_command_buffer(utility): {:?}", e))?;
         }
+        let clear_record = clear_record_started.elapsed();
+        let clear_submit_started = std::time::Instant::now();
         submit_with_fence(device, *queue, cmd, clear_slot.fence)?;
+        let clear_submit = clear_submit_started.elapsed();
         clear_slot.in_flight = true;
         rt_cache.mark_cleared(key, true);
+        note_clear_profile(
+            ClearProfileKind::Color,
+            clear_settle,
+            clear_wait,
+            clear_waited,
+            clear_record,
+            clear_submit,
+        );
+        Ok(())
+    }
+
+    pub fn clear_target_and_depth_stencil_with_format(
+        &self,
+        color_key: RtKey,
+        rgba: [f32; 4],
+        color_format: vk::Format,
+        depth_key: RtKey,
+        depth_format: vk::Format,
+        depth_aspects: vk::ImageAspectFlags,
+        clear_aspects: vk::ImageAspectFlags,
+        depth: f32,
+        stencil: u32,
+    ) -> Result<(), String> {
+        let width = color_key.width;
+        let height = color_key.height;
+        if width == 0
+            || height == 0
+            || depth_aspects.is_empty()
+            || clear_aspects.is_empty()
+            || !depth_aspects.contains(clear_aspects)
+            || color_key.render_layer_count() != 1
+            || depth_key.width != width
+            || depth_key.height != height
+            || depth_key.render_layer_count() != 1
+            || color_key == depth_key
+            || same_physical_backing(color_key, depth_key)
+        {
+            return Err(
+                "combined color/depth clear requires distinct matching 2D targets".to_string(),
+            );
+        }
+
+        let clear_settle_started = std::time::Instant::now();
+        let mut inner = self.inner.lock();
+        settle_all_pending_computes(&mut inner);
+        let clear_settle = clear_settle_started.elapsed();
+        let RendererInner {
+            device,
+            queue,
+            rt_cache,
+            clear_slots,
+            clear_slot_index,
+            rt_copy_slots,
+            ..
+        } = &mut *inner;
+        drain_rt_copies_before_color_recreate(
+            device,
+            *queue,
+            rt_cache,
+            rt_copy_slots,
+            color_key,
+            color_format,
+        )?;
+        let (color_image, color_view, color_layout) = {
+            let image = rt_cache.get_or_create_with_format(color_key, device, color_format)?;
+            (image.image, image.view, image.layout)
+        };
+        let (depth_image, depth_layout) = {
+            let (image, _) =
+                rt_cache.get_or_create_depth(depth_key, device, depth_format, depth_aspects)?;
+            (image.image, image.layout)
+        };
+
+        let (clear_slot, clear_wait, clear_waited) =
+            acquire_clear_slot(device, clear_slots, clear_slot_index)?;
+        let clear_record_started = std::time::Instant::now();
+        reset_command_buffer(device, clear_slot.cmd)?;
+        let cmd = clear_slot.cmd;
+        let begin = vk::CommandBufferBeginInfo {
+            s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+            flags: vk::CommandBufferUsageFlags::empty(),
+            p_inheritance_info: std::ptr::null(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        unsafe {
+            device
+                .begin_command_buffer(cmd, &begin)
+                .map_err(|e| format!("begin_command_buffer(combined clear): {:?}", e))?;
+        }
+        transition_image(
+            device,
+            cmd,
+            color_image,
+            color_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        let color_attachment = vk::RenderingAttachmentInfo {
+            s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
+            image_view: color_view,
+            image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            resolve_mode: vk::ResolveModeFlags::NONE,
+            resolve_image_view: vk::ImageView::null(),
+            resolve_image_layout: vk::ImageLayout::UNDEFINED,
+            load_op: vk::AttachmentLoadOp::CLEAR,
+            store_op: vk::AttachmentStoreOp::STORE,
+            clear_value: vk::ClearValue {
+                color: vk::ClearColorValue { float32: rgba },
+            },
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        let render_info = vk::RenderingInfo {
+            s_type: vk::StructureType::RENDERING_INFO,
+            render_area: vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width, height },
+            },
+            layer_count: 1,
+            view_mask: 0,
+            color_attachment_count: 1,
+            p_color_attachments: &color_attachment,
+            p_depth_attachment: std::ptr::null(),
+            p_stencil_attachment: std::ptr::null(),
+            p_next: std::ptr::null(),
+            flags: Default::default(),
+            _marker: std::marker::PhantomData,
+        };
+        unsafe {
+            device.cmd_begin_rendering(cmd, &render_info);
+            device.cmd_end_rendering(cmd);
+        }
+        transition_image_aspect(
+            device,
+            cmd,
+            depth_image,
+            depth_layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            depth_aspects,
+        );
+        let clear = vk::ClearDepthStencilValue { depth, stencil };
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: clear_aspects,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        unsafe {
+            device.cmd_clear_depth_stencil_image(
+                cmd,
+                depth_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear,
+                &[range],
+            );
+            device
+                .end_command_buffer(cmd)
+                .map_err(|e| format!("end_command_buffer(combined clear): {:?}", e))?;
+        }
+        let clear_record = clear_record_started.elapsed();
+        let clear_submit_started = std::time::Instant::now();
+        submit_with_fence(device, *queue, cmd, clear_slot.fence)?;
+        let clear_submit = clear_submit_started.elapsed();
+        clear_slot.in_flight = true;
+        rt_cache.set_color_layout(color_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        rt_cache.set_depth_layout(depth_key, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        rt_cache.mark_cleared(color_key, true);
+        rt_cache.mark_depth_written(depth_key);
+        note_clear_profile(
+            ClearProfileKind::Combined,
+            clear_settle,
+            clear_wait,
+            clear_waited,
+            clear_record,
+            clear_submit,
+        );
         Ok(())
     }
 
@@ -2761,8 +3996,10 @@ impl Renderer {
         if x == 0 && y == 0 && w == width && h == height {
             return self.clear_target_with_format(nvmap_id, width, height, gpu_va, rgba, format);
         }
+        let clear_settle_started = std::time::Instant::now();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
+        let clear_settle = clear_settle_started.elapsed();
         let RendererInner {
             device,
             queue,
@@ -2783,7 +4020,9 @@ impl Renderer {
         )?;
         let img = rt_cache.get_or_create_with_format(key, device, format)?;
 
-        let clear_slot = acquire_clear_slot(device, clear_slots, clear_slot_index)?;
+        let (clear_slot, clear_wait, clear_waited) =
+            acquire_clear_slot(device, clear_slots, clear_slot_index)?;
+        let clear_record_started = std::time::Instant::now();
         reset_command_buffer(device, clear_slot.cmd)?;
         let cmd = clear_slot.cmd;
 
@@ -2868,9 +4107,20 @@ impl Renderer {
                 .end_command_buffer(cmd)
                 .map_err(|e| format!("end_command_buffer(rect clear): {:?}", e))?;
         }
+        let clear_record = clear_record_started.elapsed();
+        let clear_submit_started = std::time::Instant::now();
         submit_with_fence(device, *queue, cmd, clear_slot.fence)?;
+        let clear_submit = clear_submit_started.elapsed();
         clear_slot.in_flight = true;
         rt_cache.mark_cleared(key, false);
+        note_clear_profile(
+            ClearProfileKind::Rect,
+            clear_settle,
+            clear_wait,
+            clear_waited,
+            clear_record,
+            clear_submit,
+        );
         Ok(())
     }
 
@@ -3001,10 +4251,43 @@ impl Renderer {
         expected_bpp: usize,
         dst_va: u64,
     ) -> Result<Option<(RtKey, u64)>, String> {
-        if src_key.width == 0 || src_key.height == 0 || src_key.depth != 1 || src_key.is_3d {
+        let dst_key = resolved_rt_copy_key(src_key.width, src_key.height, dst_va);
+        self.resolve_rt_copy_exact_to_key(src_key, expected_src_stamp, expected_bpp, dst_key)
+    }
+
+    pub fn resolve_rt_copy_exact_guest(
+        &self,
+        src_key: RtKey,
+        expected_src_stamp: u64,
+        expected_bpp: usize,
+        dst_nvmap_id: u32,
+        dst_va: u64,
+    ) -> Result<Option<(RtKey, u64)>, String> {
+        if dst_nvmap_id == RESOLVED_RT_COPY_NVMAP_ID {
             return Ok(None);
         }
-        let dst_key = resolved_rt_copy_key(src_key.width, src_key.height, dst_va);
+        let dst_key = RtKey::new(dst_nvmap_id, src_key.width, src_key.height, dst_va);
+        self.resolve_rt_copy_exact_to_key(src_key, expected_src_stamp, expected_bpp, dst_key)
+    }
+
+    fn resolve_rt_copy_exact_to_key(
+        &self,
+        src_key: RtKey,
+        expected_src_stamp: u64,
+        expected_bpp: usize,
+        dst_key: RtKey,
+    ) -> Result<Option<(RtKey, u64)>, String> {
+        if src_key.width == 0
+            || src_key.height == 0
+            || src_key.depth != 1
+            || src_key.is_3d
+            || dst_key.width != src_key.width
+            || dst_key.height != src_key.height
+            || dst_key.depth != 1
+            || dst_key.is_3d
+        {
+            return Ok(None);
+        }
         if src_key == dst_key {
             return Ok(None);
         }
@@ -3132,8 +4415,237 @@ impl Renderer {
         if let Some(flip_y) = rt_cache.present_flip_y(src_key) {
             rt_cache.record_present_flip(dst_key, flip_y);
         }
-        let dst_stamp = rt_cache.mark_synced_sample(dst_key);
+        let dst_stamp = if is_synthetic_copy_key(dst_key) {
+            rt_cache.mark_synced_sample(dst_key)
+        } else {
+            rt_cache.mark_drawn(dst_key)
+        };
         Ok(Some((dst_key, dst_stamp)))
+    }
+
+    pub fn reserve_fermi_exact_rt_snapshot(
+        &self,
+        token: crate::draw::FermiExactRtToken,
+        tic: crate::texture::TicEntry,
+        numeric_type: nexium_spirv::TextureNumericType,
+    ) -> Result<Option<u64>, String> {
+        if !fermi_exact_rt_snapshot_token_matches_tic(token, tic) {
+            return Ok(None);
+        }
+        let mut inner = self.inner.lock();
+        settle_all_pending_computes(&mut inner);
+        let RendererInner {
+            device,
+            queue,
+            rt_cache,
+            rt_copy_slots,
+            rt_copy_slot_index,
+            fermi_exact_rt_snapshot_leases,
+            fermi_exact_rt_snapshot_ids,
+            next_fermi_exact_rt_snapshot_id,
+            submit_timeline,
+            ..
+        } = &mut *inner;
+        if *submit_timeline == vk::Semaphore::null() {
+            return Ok(None);
+        }
+        reap_fermi_exact_rt_snapshot_leases(
+            device,
+            fermi_exact_rt_snapshot_leases,
+            fermi_exact_rt_snapshot_ids,
+        );
+        if let Some(id) = fermi_exact_rt_snapshot_ids.get(&token).copied() {
+            if let Some(lease) = fermi_exact_rt_snapshot_leases.get_mut(&id) {
+                lease.refs = lease.refs.saturating_add(1);
+                return Ok(Some(id));
+            }
+            fermi_exact_rt_snapshot_ids.remove(&token);
+        }
+        let leased_bytes = fermi_exact_rt_snapshot_leases
+            .values()
+            .fold(0u64, |total, lease| total.saturating_add(lease.bytes));
+        if fermi_exact_rt_snapshot_leases.len() >= FERMI_EXACT_RT_SNAPSHOT_LEASE_CAPACITY
+            || leased_bytes.saturating_add(token.guest_size) > FERMI_EXACT_RT_SNAPSHOT_LEASE_BYTES
+        {
+            return Ok(None);
+        }
+        let Some((source_key, source_image, _source_view, source_layout, source_format, stamp)) =
+            rt_cache.color_exact_with_format(token.key)
+        else {
+            return Ok(None);
+        };
+        if source_key != token.key
+            || stamp != token.stamp
+            || stamp == 0
+            || source_layout == vk::ImageLayout::UNDEFINED
+            || rt_cache.color_is_guest_stale(source_key)
+            || exact_rt_copy_format_bpp(source_format) != Some(token.bytes_per_pixel)
+            || crate::tex_invalidate::region_gen_range(token.guest_va, token.guest_size)
+                != token.guest_generation
+        {
+            return Ok(None);
+        }
+        let view_format = rt_alias_view_format(token.key, tic, source_format);
+        let source_alias = RtAlias {
+            key: token.key,
+            image: source_image,
+            view: vk::ImageView::null(),
+            layout: source_layout,
+            format: source_format,
+            aspects: vk::ImageAspectFlags::COLOR,
+            depth: false,
+            frozen: false,
+            fermi_exact_rt_snapshot_id: None,
+        };
+        if !rt_alias_numeric_type_matches(source_alias, Some(tic), numeric_type, view_format)
+            || !rt_formats_compatible(source_format, view_format)
+            || fermi_exact_rt_snapshot_requires_reinterpret(tic, source_format, view_format)
+        {
+            return Ok(None);
+        }
+        let mut image = rt_cache.create_detached_color_image(device, token.key, source_format)?;
+        let direct_view = tic.swizzle == TEXTURE_IDENTITY_SWIZZLE && view_format == source_format;
+        if !direct_view {
+            let components = texture_component_mapping(tic.swizzle);
+            if let Err(error) = RtCache::get_or_create_detached_sample_view(
+                device,
+                &mut image,
+                view_format,
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageViewType::TYPE_2D,
+                components,
+            ) {
+                RtCache::destroy_detached_image(device, image);
+                return Err(error);
+            }
+        }
+        let copy_result = (|| -> Result<u64, String> {
+            let copy_slot = acquire_rt_copy_slot(device, rt_copy_slots, rt_copy_slot_index)?;
+            reset_command_buffer(device, copy_slot.cmd)?;
+            let cmd = copy_slot.cmd;
+            let begin = vk::CommandBufferBeginInfo {
+                s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                p_inheritance_info: std::ptr::null(),
+                p_next: std::ptr::null(),
+                _marker: std::marker::PhantomData,
+            };
+            unsafe {
+                device
+                    .begin_command_buffer(cmd, &begin)
+                    .map_err(|error| format!("begin_command_buffer(fermi snapshot): {error:?}"))?;
+            }
+            transition_image(
+                device,
+                cmd,
+                source_image,
+                source_layout,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            transition_image(
+                device,
+                cmd,
+                image.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            let copy = vk::ImageCopy {
+                src_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                src_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                dst_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                dst_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                extent: vk::Extent3D {
+                    width: token.key.width,
+                    height: token.key.height,
+                    depth: 1,
+                },
+            };
+            unsafe {
+                device.cmd_copy_image(
+                    cmd,
+                    source_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[copy],
+                );
+            }
+            transition_image(
+                device,
+                cmd,
+                source_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                source_layout,
+            );
+            transition_image(
+                device,
+                cmd,
+                image.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+            unsafe {
+                device
+                    .end_command_buffer(cmd)
+                    .map_err(|error| format!("end_command_buffer(fermi snapshot): {error:?}"))?;
+            }
+            submit_with_fence(device, *queue, cmd, copy_slot.fence)?;
+            copy_slot.in_flight = true;
+            Ok(SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire))
+        })();
+        let ready_generation = match copy_result {
+            Ok(generation) => generation,
+            Err(error) => {
+                RtCache::destroy_detached_image(device, image);
+                return Err(error);
+            }
+        };
+        image.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        rt_cache.set_color_layout(source_key, source_layout);
+        let id = *next_fermi_exact_rt_snapshot_id;
+        *next_fermi_exact_rt_snapshot_id = next_fermi_exact_rt_snapshot_id.wrapping_add(1).max(1);
+        fermi_exact_rt_snapshot_leases.insert(
+            id,
+            FermiExactRtSnapshotLease {
+                token,
+                image,
+                bytes: token.guest_size,
+                ready_generation,
+                refs: 1,
+            },
+        );
+        fermi_exact_rt_snapshot_ids.insert(token, id);
+        Ok(Some(id))
+    }
+
+    pub fn release_fermi_exact_rt_snapshot_leases(&self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        let RendererInner {
+            device,
+            fermi_exact_rt_snapshot_leases,
+            fermi_exact_rt_snapshot_ids,
+            ..
+        } = &mut *inner;
+        let mut released = ids.to_vec();
+        release_fermi_exact_rt_snapshot_lease_refs(
+            device,
+            fermi_exact_rt_snapshot_leases,
+            fermi_exact_rt_snapshot_ids,
+            &mut released,
+        );
     }
 
     pub fn resolve_rt_copy(
@@ -3337,8 +4849,10 @@ impl Renderer {
                 clear_aspects, aspects
             ));
         }
+        let clear_settle_started = std::time::Instant::now();
         let mut inner = self.inner.lock();
         settle_all_pending_computes(&mut inner);
+        let clear_settle = clear_settle_started.elapsed();
         let RendererInner {
             device,
             queue,
@@ -3349,7 +4863,9 @@ impl Renderer {
         } = &mut *inner;
         let (img, _) = rt_cache.get_or_create_depth(key, device, format, aspects)?;
 
-        let clear_slot = acquire_clear_slot(device, clear_slots, clear_slot_index)?;
+        let (clear_slot, clear_wait, clear_waited) =
+            acquire_clear_slot(device, clear_slots, clear_slot_index)?;
+        let clear_record_started = std::time::Instant::now();
         reset_command_buffer(device, clear_slot.cmd)?;
         let cmd = clear_slot.cmd;
         let begin = vk::CommandBufferBeginInfo {
@@ -3395,9 +4911,20 @@ impl Renderer {
                 .end_command_buffer(cmd)
                 .map_err(|e| format!("end_command_buffer(depth clear): {:?}", e))?;
         }
+        let clear_record = clear_record_started.elapsed();
+        let clear_submit_started = std::time::Instant::now();
         submit_with_fence(device, *queue, cmd, clear_slot.fence)?;
+        let clear_submit = clear_submit_started.elapsed();
         clear_slot.in_flight = true;
         rt_cache.mark_depth_written(key);
+        note_clear_profile(
+            ClearProfileKind::Depth,
+            clear_settle,
+            clear_wait,
+            clear_waited,
+            clear_record,
+            clear_submit,
+        );
         Ok(())
     }
 
@@ -3623,6 +5150,10 @@ impl Renderer {
         Some(out)
     }
 
+    pub fn has_color_target_touching(&self, gpu_va: u64) -> bool {
+        self.inner.lock().rt_cache.color_target_touches_va(gpu_va)
+    }
+
     pub fn readback_target_raw(
         &self,
         nvmap_id: u32,
@@ -3641,6 +5172,13 @@ impl Renderer {
         self.readback_key_raw(key)
     }
 
+    pub fn readback_targets_raw_keys(
+        &self,
+        keys: &[RtKey],
+    ) -> Vec<Option<(u32, u32, usize, Vec<u8>)>> {
+        self.readback_keys_raw(keys)
+    }
+
     pub fn readback_target_raw_content(
         &self,
         nvmap_id: u32,
@@ -3655,6 +5193,25 @@ impl Renderer {
     }
 
     fn readback_key_raw(&self, key: RtKey) -> Option<(u32, u32, usize, Vec<u8>)> {
+        self.readback_keys_raw(&[key]).pop().flatten()
+    }
+
+    fn readback_keys_raw(&self, keys: &[RtKey]) -> Vec<Option<(u32, u32, usize, Vec<u8>)>> {
+        struct ReadbackPlan {
+            output_index: usize,
+            key: RtKey,
+            width: u32,
+            height: u32,
+            bpp: usize,
+            offset: u64,
+            byte_len: usize,
+        }
+
+        let mut outputs: Vec<Option<(u32, u32, usize, Vec<u8>)>> =
+            std::iter::repeat_with(|| None).take(keys.len()).collect();
+        if keys.is_empty() {
+            return outputs;
+        }
         let mut inner = self.inner.lock();
         let RendererInner {
             device,
@@ -3664,9 +5221,40 @@ impl Renderer {
             sync_readback_slot,
             ..
         } = &mut *inner;
-        let format = rt_cache.get_existing(key)?.format;
-        let bpp = readback_format_bpp(format);
-        let total = (key.width as u64) * (key.height as u64) * bpp as u64;
+        let mut plans = Vec::with_capacity(keys.len());
+        let mut required_size = 0u64;
+        for (output_index, key) in keys.iter().copied().enumerate() {
+            let Some(image) = rt_cache.get_existing(key) else {
+                continue;
+            };
+            let bpp = readback_format_bpp(image.format);
+            let Some(byte_len) = (key.width as u64)
+                .checked_mul(key.height as u64)
+                .and_then(|pixels| pixels.checked_mul(bpp as u64))
+            else {
+                continue;
+            };
+            let offset = align_up(required_size, 256);
+            let Some(end) = offset.checked_add(byte_len) else {
+                continue;
+            };
+            let Ok(byte_len) = usize::try_from(byte_len) else {
+                continue;
+            };
+            plans.push(ReadbackPlan {
+                output_index,
+                key,
+                width: key.width,
+                height: key.height,
+                bpp,
+                offset,
+                byte_len,
+            });
+            required_size = end;
+        }
+        if plans.is_empty() {
+            return outputs;
+        }
 
         if sync_readback_slot.in_flight {
             match unsafe {
@@ -3681,14 +5269,16 @@ impl Renderer {
                         "readback_target_raw previous fence wait failed: {:?}",
                         error
                     );
-                    return None;
+                    return outputs;
                 }
             }
         }
 
         let current_stage_size = sync_readback_slot.stage.as_ref().map(|stage| stage.size);
-        if readback_stage_needs_growth(current_stage_size, total) {
-            let replacement = create_staging_owned(device, mem_props, total).ok()?;
+        if readback_stage_needs_growth(current_stage_size, required_size) {
+            let Ok(replacement) = create_staging_owned(device, mem_props, required_size) else {
+                return outputs;
+            };
             if let Some(previous) = sync_readback_slot.stage.replace(replacement) {
                 unsafe {
                     device.destroy_buffer(previous.buffer, None);
@@ -3696,111 +5286,118 @@ impl Renderer {
                 }
             }
         }
-        let stage = sync_readback_slot.stage.as_ref()?;
+        let Some(stage) = sync_readback_slot.stage.as_ref() else {
+            return outputs;
+        };
         let stage_buffer = stage.buffer;
         let stage_memory = stage.memory;
         let stage_size = stage.size;
         let cmd = sync_readback_slot.cmd;
         let fence = sync_readback_slot.fence;
+        let mut layouts_to_commit = Vec::new();
 
         if reset_command_buffer(device, cmd).is_err() || begin_one_time(device, cmd).is_err() {
-            return None;
+            return outputs;
         }
-        let img = match rt_cache.get_existing(key) {
-            Some(i) => i,
-            None => {
+        for plan in &plans {
+            let Some(img) = rt_cache.get_existing(plan.key) else {
                 unsafe {
                     let _ = device.end_command_buffer(cmd);
                 }
-                return None;
-            }
-        };
-        let prev_layout = img.layout;
-        transition_image(
-            device,
-            cmd,
-            img.image,
-            prev_layout,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        );
-        let copy = vk::BufferImageCopy {
-            buffer_offset: 0,
-            buffer_row_length: 0,
-            buffer_image_height: 0,
-            image_subresource: vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-            image_extent: vk::Extent3D {
-                width: key.width,
-                height: key.height,
-                depth: 1,
-            },
-        };
-        unsafe {
-            device.cmd_copy_image_to_buffer(
-                cmd,
-                img.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                stage_buffer,
-                &[copy],
-            );
-        }
-        let leaves_transfer_src = prev_layout == vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-            || prev_layout == vk::ImageLayout::UNDEFINED;
-        if !leaves_transfer_src {
+                return outputs;
+            };
+            let prev_layout = img.layout;
             transition_image(
                 device,
                 cmd,
                 img.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 prev_layout,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             );
+            let copy = vk::BufferImageCopy {
+                buffer_offset: plan.offset,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                image_extent: vk::Extent3D {
+                    width: plan.width,
+                    height: plan.height,
+                    depth: 1,
+                },
+            };
+            unsafe {
+                device.cmd_copy_image_to_buffer(
+                    cmd,
+                    img.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    stage_buffer,
+                    &[copy],
+                );
+            }
+            let leaves_transfer_src = prev_layout == vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                || prev_layout == vk::ImageLayout::UNDEFINED;
+            if !leaves_transfer_src {
+                transition_image(
+                    device,
+                    cmd,
+                    img.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    prev_layout,
+                );
+            } else {
+                layouts_to_commit.push((plan.key, readback_layout_after_submit(prev_layout, true)));
+            }
         }
         if end_one_time(device, cmd).is_err()
             || submit_with_fence(device, *queue, cmd, fence).is_err()
         {
-            return None;
+            return outputs;
         }
-        if leaves_transfer_src {
-            img.layout = readback_layout_after_submit(prev_layout, true);
-        }
-        sync_readback_slot.in_flight = true;
-        let mut raw = vec![0u8; total as usize];
-        let waited = unsafe { device.wait_for_fences(&[fence], true, 1_000_000_000) };
-        match waited {
-            Ok(()) => unsafe {
-                sync_readback_slot.in_flight = false;
-                note_queue_drained();
-                let Ok(ptr) =
-                    device.map_memory(stage_memory, 0, stage_size, vk::MemoryMapFlags::empty())
-                else {
-                    return None;
-                };
-                std::ptr::copy_nonoverlapping(ptr as *const u8, raw.as_mut_ptr(), total as usize);
-                device.unmap_memory(stage_memory);
-            },
-            Err(e) => {
-                log::warn!("readback_target_raw fence wait failed: {:?}", e);
-                match unsafe { device.wait_for_fences(&[fence], true, 5_000_000_000) } {
-                    Ok(()) => {
-                        sync_readback_slot.in_flight = false;
-                        note_queue_drained();
-                    }
-                    Err(error) => {
-                        log::warn!(
-                            "readback_target_raw extended fence wait failed: {:?}",
-                            error
-                        );
-                    }
-                }
-                return None;
+        for (key, layout) in layouts_to_commit {
+            if let Some(image) = rt_cache.get_existing(key) {
+                image.layout = layout;
             }
         }
-        Some((key.width, key.height, bpp, raw))
+        sync_readback_slot.in_flight = true;
+        if let Err(error) = unsafe { device.wait_for_fences(&[fence], true, 1_000_000_000) } {
+            log::warn!("readback_target_raw fence wait failed: {:?}", error);
+            if let Err(extended_error) =
+                unsafe { device.wait_for_fences(&[fence], true, 5_000_000_000) }
+            {
+                log::warn!(
+                    "readback_target_raw extended fence wait failed: {:?}",
+                    extended_error
+                );
+                return outputs;
+            }
+        }
+        sync_readback_slot.in_flight = false;
+        note_queue_drained();
+        unsafe {
+            let Ok(ptr) =
+                device.map_memory(stage_memory, 0, stage_size, vk::MemoryMapFlags::empty())
+            else {
+                return outputs;
+            };
+            let ptr = ptr as *const u8;
+            for plan in plans {
+                let mut raw = vec![0u8; plan.byte_len];
+                std::ptr::copy_nonoverlapping(
+                    ptr.add(plan.offset as usize),
+                    raw.as_mut_ptr(),
+                    plan.byte_len,
+                );
+                outputs[plan.output_index] = Some((plan.width, plan.height, plan.bpp, raw));
+            }
+            device.unmap_memory(stage_memory);
+        }
+        outputs
     }
 
     pub fn readback_depth_target_raw(
@@ -3976,7 +5573,24 @@ impl Renderer {
         copy_rect: Option<[u32; 4]>,
     ) -> Option<(u32, u32, Vec<u8>, Option<bool>)> {
         self.readback_target_pipelined_selected(
-            nvmap_id, width, height, gpu_va, cpu_addr, copy_rect, None,
+            nvmap_id, width, height, gpu_va, cpu_addr, copy_rect, None, false,
+        )
+    }
+
+    pub fn readback_target_pipelined_pinned_at_va(
+        &self,
+        nvmap_id: u32,
+        width: u32,
+        height: u32,
+        gpu_va: u64,
+        cpu_addr: u64,
+        copy_rect: Option<[u32; 4]>,
+    ) -> Option<(u32, u32, Vec<u8>, Option<bool>)> {
+        if gpu_va == 0 {
+            return None;
+        }
+        self.readback_target_pipelined_selected(
+            nvmap_id, width, height, gpu_va, cpu_addr, copy_rect, None, true,
         )
     }
 
@@ -3997,6 +5611,7 @@ impl Renderer {
             key.cpu_addr,
             copy_rect,
             Some((key, ExactReadbackStamp::Equal(expected_stamp))),
+            false,
         )
     }
 
@@ -4017,6 +5632,7 @@ impl Renderer {
             key.cpu_addr,
             copy_rect,
             Some((key, ExactReadbackStamp::AtLeast(minimum_stamp))),
+            false,
         )
     }
 
@@ -4029,10 +5645,18 @@ impl Renderer {
         cpu_addr: u64,
         copy_rect: Option<[u32; 4]>,
         exact_copy: Option<(RtKey, ExactReadbackStamp)>,
+        pinned_only: bool,
     ) -> Option<(u32, u32, Vec<u8>, Option<bool>)> {
         let pp_t0 = std::time::Instant::now();
         let raw_result = self.readback_target_pipelined_raw(
-            nvmap_id, width, height, gpu_va, cpu_addr, copy_rect, exact_copy,
+            nvmap_id,
+            width,
+            height,
+            gpu_va,
+            cpu_addr,
+            copy_rect,
+            exact_copy,
+            pinned_only,
         );
         let pp_raw = pp_t0.elapsed();
         let (w, h, raw, format, flip_y) = raw_result?;
@@ -4056,6 +5680,7 @@ impl Renderer {
         cpu_addr: u64,
         copy_rect: Option<[u32; 4]>,
         exact_copy: Option<(RtKey, ExactReadbackStamp)>,
+        pinned_only: bool,
     ) -> Option<(u32, u32, Vec<u8>, vk::Format, Option<bool>)> {
         let pr_t0 = std::time::Instant::now();
         let mut inner = self.inner.lock();
@@ -4093,6 +5718,10 @@ impl Renderer {
                         && stamp_requirement.accepts(stamp))
                     .then_some((exact_key, true))
                 })
+        } else if pinned_only {
+            rt_cache
+                .present_key_pinned_at_va(requested_key)
+                .map(|key| (key, true))
         } else {
             let pinned_key = rt_cache.present_key_pinned_at_va(requested_key);
             pinned_key
@@ -4101,6 +5730,9 @@ impl Renderer {
                 .map(|key| (key, pinned_key.is_some()))
         };
         let Some((key, pinned)) = selected else {
+            if pinned_only {
+                return None;
+            }
             let (latest, superseded_slots) =
                 take_latest_completed_readback(pending_readbacks, |slot_idx| {
                     readback_slots.get(slot_idx).is_some_and(|slot| {
@@ -4141,19 +5773,31 @@ impl Renderer {
         );
         rt_cache.reset_frame_draws();
 
-        let (latest_ready, superseded_slots) =
-            take_latest_completed_readback(pending_readbacks, |slot_idx| {
-                readback_slots.get(slot_idx).is_some_and(|slot| {
-                    readback_fence_is_ready(unsafe { device.get_fence_status(slot.fence) })
-                })
-            });
+        let (latest_ready, superseded_slots, mut keep_pending) = if pinned_only {
+            let mut pending = pending_readbacks.remove(&key).unwrap_or_default();
+            let (latest_ready, superseded_slots) =
+                take_latest_completed_readback_for_key(&mut pending, |slot_idx| {
+                    readback_slots.get(slot_idx).is_some_and(|slot| {
+                        readback_fence_is_ready(unsafe { device.get_fence_status(slot.fence) })
+                    })
+                });
+            (latest_ready, superseded_slots, pending)
+        } else {
+            let (latest_ready, superseded_slots) =
+                take_latest_completed_readback(pending_readbacks, |slot_idx| {
+                    readback_slots.get(slot_idx).is_some_and(|slot| {
+                        readback_fence_is_ready(unsafe { device.get_fence_status(slot.fence) })
+                    })
+                });
+            let pending = pending_readbacks.remove(&key).unwrap_or_default();
+            (latest_ready, superseded_slots, pending)
+        };
         for slot_idx in superseded_slots {
             if let Some(slot) = readback_slots.get_mut(slot_idx) {
                 slot.in_flight = false;
             }
         }
         let ready_frame = materialize_completed_readback(device, readback_slots, latest_ready);
-        let mut keep_pending = pending_readbacks.remove(&key).unwrap_or_default();
         let Some(slot_idx) = readback_slots.iter().position(|slot| !slot.in_flight) else {
             if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
                 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4346,8 +5990,8 @@ impl Renderer {
         fs_spirv: &[u32],
         vs_hash: u64,
         fs_hash: u64,
-        vs_cbuf_mask: u32,
-        fs_cbuf_mask: u32,
+        vs_cbuf_mask: u64,
+        fs_cbuf_mask: u64,
         layout: &crate::draw::VertexLayout,
         topology: vk::PrimitiveTopology,
         primitive_restart_enable: bool,
@@ -4681,26 +6325,22 @@ impl Renderer {
 
         let (vertex_bindings, draw_vertex_count) = prepare_vertex_bindings(call, &read_guest)?;
 
-        let cbuf_data = if let Some(d) = &call.cbuf_data {
-            if d.len() >= nexium_spirv::GFX_CBUF_MIN_SIZE as usize {
-                d.clone()
-            } else {
-                empty_graphics_cbuf_data()
-            }
-        } else {
-            empty_graphics_cbuf_data()
-        };
+        let cbuf_data = call.cbuf_data.as_ref();
+        let cbuf_len = graphics_cbuf_data_len(cbuf_data);
 
         let (index_data, index_count, index_type) = match (&call.index_data, call.index_count) {
-            (Some(d), Some(c)) if c > 0 && !d.is_empty() => (d.clone(), c, call.index_type),
-            _ => (Vec::new(), 0u32, call.index_type),
+            (Some(d), Some(c)) if c > 0 && !d.is_empty() => (d.as_slice(), c, call.index_type),
+            _ => (&[][..], 0u32, call.index_type),
         };
 
         log::debug!(
             "cbuf_data: addr={:#x} size={} all_zero={}",
             call.cbuf_addr,
             call.cbuf_size,
-            cbuf_data.iter().all(|&b| b == 0),
+            cbuf_data.map_or_else(
+                || empty_graphics_cbuf_data().iter().all(|&byte| byte == 0),
+                |data| data.materialize().iter().all(|&byte| byte == 0),
+            ),
         );
 
         let tex_pendings = collect_tex_pendings(call, &read_guest)?;
@@ -4713,6 +6353,8 @@ impl Renderer {
             cmd_pool,
             rt_cache,
             rt_copy_slots,
+            fermi_exact_rt_snapshot_leases,
+            fermi_exact_rt_snapshot_ids,
             descriptor_layout,
             descriptor_pool,
             pipeline_cache,
@@ -4724,6 +6366,7 @@ impl Renderer {
             sampler_filter_minmax_supported,
             sampler_anisotropy_supported,
             tex_cache,
+            tex_cache_vas,
             texel_buffer_cache,
             rt_reinterpret_cache,
             frame_slots,
@@ -4741,13 +6384,15 @@ impl Renderer {
         } = &mut *inner;
 
         let cur_idx = *frame_index;
-        let other_idx = (cur_idx + 1) % 2;
+        let other_idx = (cur_idx + 1) % frame_slots.len();
         let cbuf_alignment = *min_storage_buffer_offset_alignment;
         {
             let slot = &mut frame_slots[cur_idx];
             if slot.in_flight {
-                wait_fence(device, slot.fence)?;
-                *tele_ring_waits += 1;
+                if !frame_slot_submission_complete(device, slot.submit_generation) {
+                    wait_fence(device, slot.fence)?;
+                    *tele_ring_waits += 1;
+                }
                 if !slot.retired_dsets.is_empty() {
                     unsafe {
                         let _ =
@@ -4756,12 +6401,19 @@ impl Renderer {
                     slot.retired_dsets.clear();
                 }
                 destroy_descriptor_pools(device, &mut slot.retired_dset_pools);
+                release_fermi_exact_rt_snapshot_lease_refs(
+                    device,
+                    fermi_exact_rt_snapshot_leases,
+                    fermi_exact_rt_snapshot_ids,
+                    &mut slot.fermi_exact_rt_snapshot_leases,
+                );
                 for (b, m) in slot.retired_buffers.drain(..) {
                     unsafe {
                         device.destroy_buffer(b, None);
                         device.free_memory(m, None);
                     }
                 }
+                recycle_slot_upload_buffers(device, slot);
                 for view in slot.retired_views.drain(..) {
                     unsafe {
                         device.destroy_image_view(view, None);
@@ -4777,6 +6429,7 @@ impl Renderer {
                 for buffer in slot.retired_texel_buffers.drain(..) {
                     destroy_texel_buffer(device, buffer.resource);
                 }
+                destroy_retired_rt_images(device, &mut slot.retired_rt_images);
                 for t in slot.retired_rt_reinterprets.drain(..) {
                     unsafe {
                         device.destroy_image_view(t.view, None);
@@ -4786,6 +6439,7 @@ impl Renderer {
                 }
                 reset_command_buffer(device, slot.cmd)?;
                 slot.in_flight = false;
+                slot.submit_generation = 0;
                 ubo_ring.head = ubo_ring.slot_head[cur_idx];
             }
         }
@@ -4811,7 +6465,7 @@ impl Renderer {
                 let tic = tex_pendings
                     .get(slot)
                     .and_then(|pending| pending.as_ref().map(|(_, tic, _, _)| tic));
-                rt_alias_for_slot(rt_cache, call, slot, call.rt_key, false, tic)
+                rt_alias_for_slot(rt_cache, None, call, slot, call.rt_key, false, tic)
             })
             .map(|alias| alias.filter(|alias| alias.depth || !color_keys.contains(&alias.key)))
             .collect();
@@ -4969,6 +6623,7 @@ impl Renderer {
                         if let Some(alias_view) = rt_alias_sample_view(
                             device,
                             rt_cache,
+                            None,
                             &mut frame_slots[cur_idx],
                             alias,
                             pending.map(|(_, tic, _, _)| tic),
@@ -5089,8 +6744,7 @@ impl Renderer {
             let numeric_type = texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot);
             let numeric_family = texture_numeric_index(numeric_type);
             let mut binding_failure_reason = None;
-            let identity_volume =
-                key.volume && std::env::var_os("NEXIUM_VOLUME_IDENTITY").is_some();
+            let identity_volume = key.volume && volume_identity_enabled();
             let volume_slices = if key.volume
                 && !identity_volume
                 && numeric_type == nexium_spirv::TextureNumericType::Float
@@ -5148,6 +6802,8 @@ impl Renderer {
                     tex_hash = volume_rt_slice_hash(tex_hash, slices);
                 }
                 let force_refresh = force_refresh_texture(tic.gpu_va);
+                let content_hash_authoritative =
+                    raw_hash.is_some() && volume_slices.is_none() && !identity_volume;
                 let need_upload = force_refresh
                     || match tex_cache.get(&key) {
                         Some(t) => {
@@ -5159,16 +6815,22 @@ impl Renderer {
                                         t.gen != cur_gen || t.hash != tex_hash
                                     }
                                 })
+                            } else if content_hash_authoritative {
+                                t.hash != tex_hash
                             } else {
                                 t.gen != cur_gen || t.hash != tex_hash
                             }
                         }
                         None => true,
                     };
+                if !need_upload && content_hash_authoritative {
+                    if let Some(t) = tex_cache.get_mut(&key) {
+                        t.gen = cur_gen;
+                        t.verified = std::time::Instant::now();
+                    }
+                }
                 if need_upload {
-                    let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
-                        .map(|v| v == "1")
-                        .unwrap_or(false);
+                    let force_pitch = force_pitch_enabled();
                     let image_format = if identity_volume {
                         Ok(texture_image_format(
                             crate::texture::TicFormat::R8G8B8A8,
@@ -5232,7 +6894,7 @@ impl Renderer {
                         }
                     };
                     let texels = &upload.bytes;
-                    if std::env::var_os("NEXIUM_TEX_AVG").is_some() && texels.len() >= 4 {
+                    if tex_avg_enabled() && texels.len() >= 4 {
                         let n = (texels.len() / 4).max(1) as u64;
                         let (mut ar, mut ag, mut ab) = (0u64, 0u64, 0u64);
                         for px in texels.chunks_exact(4) {
@@ -5285,6 +6947,8 @@ impl Renderer {
                         Ok(tex) => {
                             if let Some(old) = tex_cache.insert(key, tex) {
                                 frame_slots[cur_idx].retired_textures.push(old);
+                            } else {
+                                retain_tex_cache_va(tex_cache_vas, key.gpu_va);
                             }
                         }
                         Err(error) => {
@@ -5441,7 +7105,7 @@ impl Renderer {
             };
         }
 
-        let vertex_binds = upload_vertex_bindings(
+        let mut vertex_binds = upload_vertex_bindings(
             device,
             frame_slots,
             other_idx,
@@ -5449,7 +7113,29 @@ impl Renderer {
             ubo_ring,
             &vertex_bindings,
             true,
+            fermi_exact_rt_snapshot_leases,
+            fermi_exact_rt_snapshot_ids,
         )?;
+        if !call.resident_vertex.is_empty() {
+            let fallback_bindings: Vec<PreparedVertexBinding> = call
+                .resident_vertex
+                .iter()
+                .filter_map(assemble_resident_binding)
+                .collect();
+            if !fallback_bindings.is_empty() {
+                vertex_binds.extend(upload_vertex_bindings(
+                    device,
+                    frame_slots,
+                    other_idx,
+                    descriptor_pool.pool,
+                    ubo_ring,
+                    &fallback_bindings,
+                    true,
+                    fermi_exact_rt_snapshot_leases,
+                    fermi_exact_rt_snapshot_ids,
+                )?);
+            }
+        }
 
         let white_bind: Option<(u32, vk::Buffer, u64)> =
             if let Some(wb) = call.vertex_layout.bindings.iter().find(|b| b.stride == 0) {
@@ -5460,6 +7146,8 @@ impl Renderer {
                         other_idx,
                         descriptor_pool.pool,
                         ubo_ring,
+                        fermi_exact_rt_snapshot_leases,
+                        fermi_exact_rt_snapshot_ids,
                     )?;
                 }
                 let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 16, 16)
@@ -5482,6 +7170,8 @@ impl Renderer {
                     other_idx,
                     descriptor_pool.pool,
                     ubo_ring,
+                    fermi_exact_rt_snapshot_leases,
+                    fermi_exact_rt_snapshot_ids,
                 )?;
             }
             let (ibuf, ioff, iptr) =
@@ -5494,11 +7184,8 @@ impl Renderer {
             None
         };
 
-        let (_cbuf_range, cbuf_size_aligned) = graphics_cbuf_allocation_size(
-            cbuf_data.len(),
-            cbuf_alignment,
-            *max_storage_buffer_range,
-        )?;
+        let (_cbuf_range, cbuf_size_aligned) =
+            graphics_cbuf_allocation_size(cbuf_len, cbuf_alignment, *max_storage_buffer_range)?;
         {
             let v_size = vertex_bindings_size(&vertex_bindings);
             debug_assert!(
@@ -5511,8 +7198,10 @@ impl Renderer {
             *tele_ring_wraps += 1;
             let other = &mut frame_slots[other_idx];
             if other.in_flight {
-                wait_fence(device, other.fence)?;
-                *tele_ring_waits += 1;
+                if !frame_slot_submission_complete(device, other.submit_generation) {
+                    wait_fence(device, other.fence)?;
+                    *tele_ring_waits += 1;
+                }
                 if !other.retired_dsets.is_empty() {
                     unsafe {
                         let _ =
@@ -5521,6 +7210,13 @@ impl Renderer {
                     other.retired_dsets.clear();
                 }
                 destroy_descriptor_pools(device, &mut other.retired_dset_pools);
+                release_fermi_exact_rt_snapshot_lease_refs(
+                    device,
+                    fermi_exact_rt_snapshot_leases,
+                    fermi_exact_rt_snapshot_ids,
+                    &mut other.fermi_exact_rt_snapshot_leases,
+                );
+                recycle_slot_upload_buffers(device, other);
                 for view in other.retired_views.drain(..) {
                     unsafe {
                         device.destroy_image_view(view, None);
@@ -5528,6 +7224,7 @@ impl Renderer {
                 }
                 reset_command_buffer(device, other.cmd)?;
                 other.in_flight = false;
+                other.submit_generation = 0;
             }
             ubo_ring.head = 0;
             ubo_ring.slot_head[other_idx] = 0;
@@ -5535,8 +7232,9 @@ impl Renderer {
         let (ubo_buffer, ubo_offset, ubo_ptr) =
             ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
                 .map_err(|e| format!("ring_alloc(graphics-cbuf): {}", e))?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(cbuf_data.as_ptr(), ubo_ptr, cbuf_data.len());
+        let cbuf_dst = unsafe { std::slice::from_raw_parts_mut(ubo_ptr, cbuf_len) };
+        if !write_graphics_cbuf_data(cbuf_data, cbuf_dst) {
+            return Err("invalid graphics cbuf snapshot".to_string());
         }
 
         let set_layouts = [descriptor_layout.layout];
@@ -5558,7 +7256,7 @@ impl Renderer {
         let ubo_info = vk::DescriptorBufferInfo {
             buffer: ubo_buffer,
             offset: ubo_offset,
-            range: cbuf_data.len() as u64,
+            range: cbuf_len as u64,
         };
         let image_infos = typed_sampled_image_infos(
             &bound_tex_views,
@@ -5589,6 +7287,8 @@ impl Renderer {
             &call.texture_numeric_manifest,
             graphics_dummies.texel_buffer,
         );
+        let texture_descriptor_bindings =
+            graphics_texture_descriptor_binding_mask(&call.texture_numeric_manifest);
         let sampler_infos: Vec<vk::DescriptorImageInfo> = bound_samplers
             .iter()
             .map(|sampler| vk::DescriptorImageInfo {
@@ -5614,6 +7314,8 @@ impl Renderer {
                     other_idx,
                     descriptor_pool.pool,
                     ubo_ring,
+                    fermi_exact_rt_snapshot_leases,
+                    fermi_exact_rt_snapshot_ids,
                 )?;
             }
             let (sbuf, soff, sptr) =
@@ -5641,6 +7343,8 @@ impl Renderer {
                     other_idx,
                     descriptor_pool.pool,
                     ubo_ring,
+                    fermi_exact_rt_snapshot_leases,
+                    fermi_exact_rt_snapshot_ids,
                 )?;
             }
             let (dbuf, doff, dptr) = ring_alloc(ubo_ring, 16, 16)
@@ -5702,20 +7406,27 @@ impl Renderer {
                 _marker: std::marker::PhantomData,
             });
         }
-        for (binding, infos) in crate::descriptor::SAMPLED_IMAGE_BINDINGS.into_iter().zip([
-            &image_infos[0],
-            &image_infos_3d[0],
-            &image_infos_cube[0],
-            &image_infos_cube_array[0],
-            &image_infos[1],
-            &image_infos_3d[1],
-            &image_infos_cube[1],
-            &image_infos_cube_array[1],
-            &image_infos[2],
-            &image_infos_3d[2],
-            &image_infos_cube[2],
-            &image_infos_cube_array[2],
-        ]) {
+        for (index, (binding, infos)) in crate::descriptor::SAMPLED_IMAGE_BINDINGS
+            .into_iter()
+            .zip([
+                &image_infos[0],
+                &image_infos_3d[0],
+                &image_infos_cube[0],
+                &image_infos_cube_array[0],
+                &image_infos[1],
+                &image_infos_3d[1],
+                &image_infos_cube[1],
+                &image_infos_cube_array[1],
+                &image_infos[2],
+                &image_infos_3d[2],
+                &image_infos_cube[2],
+                &image_infos_cube_array[2],
+            ])
+            .enumerate()
+        {
+            if !texture_descriptor_bindings[index] {
+                continue;
+            }
             writes.push(vk::WriteDescriptorSet {
                 s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                 dst_set: dset,
@@ -5730,11 +7441,19 @@ impl Renderer {
                 _marker: std::marker::PhantomData,
             });
         }
-        for (binding, views) in crate::descriptor::TEXEL_BUFFER_BINDINGS.into_iter().zip([
-            &typed_texel_views[0],
-            &typed_texel_views[1],
-            &typed_texel_views[2],
-        ]) {
+        for (index, (binding, views)) in crate::descriptor::TEXEL_BUFFER_BINDINGS
+            .into_iter()
+            .zip([
+                &typed_texel_views[0],
+                &typed_texel_views[1],
+                &typed_texel_views[2],
+            ])
+            .enumerate()
+        {
+            if !texture_descriptor_bindings[crate::descriptor::SAMPLED_IMAGE_BINDINGS.len() + index]
+            {
+                continue;
+            }
             writes.push(vk::WriteDescriptorSet {
                 s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                 dst_set: dset,
@@ -5838,6 +7557,9 @@ impl Renderer {
         }
         for alias in &rt_aliases {
             if let Some(alias) = *alias {
+                if alias.depth && depth_bind.is_some_and(|(image, _, _, _)| image == alias.image) {
+                    continue;
+                }
                 if alias.layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
                     if alias.depth {
                         transition_image_aspect(
@@ -6045,6 +7767,8 @@ impl Renderer {
         let slot_fence = frame_slots[cur_idx].fence;
         submit_with_fence(device, *queue, cmd, slot_fence)?;
         frame_slots[cur_idx].in_flight = true;
+        frame_slots[cur_idx].submit_generation =
+            SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire);
         frame_slots[cur_idx].retired_dsets.push(dset);
 
         for (key, _, _, _, _) in &color_bind {
@@ -6074,6 +7798,9 @@ impl Renderer {
         }
         for alias in rt_aliases {
             if let Some(alias) = alias {
+                if alias.depth && depth_bind.is_some_and(|(image, _, _, _)| image == alias.image) {
+                    continue;
+                }
                 if alias.depth {
                     rt_cache.set_depth_layout(alias.key, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 } else if !color_keys.contains(&alias.key) {
@@ -6087,24 +7814,29 @@ impl Renderer {
         *frame_index = next_idx;
         pipeline_cache.maybe_save(device);
 
-        *tele_in_flight_mask =
-            (frame_slots[0].in_flight as u32) | ((frame_slots[1].in_flight as u32) << 1);
+        *tele_in_flight_mask = frame_slots
+            .iter()
+            .enumerate()
+            .fold(0u32, |mask, (index, slot)| {
+                mask | ((slot.in_flight as u32) << index)
+            });
         let now_ns = monotonic_nanos();
         if now_ns.saturating_sub(*tele_last_emit_ns) >= 1_000_000_000 {
             log::info!(
-                "[ring] head={} slot_head=[{},{}] wraps={} waits={} in_flight=0b{:02b}",
+                "[ring] head={} slot_head={:?} wraps={} waits={} in_flight=0b{:04b}",
                 ubo_ring.head,
-                ubo_ring.slot_head[0],
-                ubo_ring.slot_head[1],
+                ubo_ring.slot_head,
                 *tele_ring_wraps,
                 *tele_ring_waits,
                 *tele_in_flight_mask,
             );
             log::info!(
-                "[frameslot] cur_idx={} dsets=[{},{}]",
+                "[frameslot] cur_idx={} dsets={:?}",
                 *frame_index,
-                frame_slots[0].retired_dsets.len(),
-                frame_slots[1].retired_dsets.len(),
+                frame_slots
+                    .iter()
+                    .map(|slot| slot.retired_dsets.len())
+                    .collect::<Vec<_>>(),
             );
             *tele_ring_wraps = 0;
             *tele_ring_waits = 0;
@@ -6136,180 +7868,219 @@ impl Renderer {
         F: Fn(u64, usize) -> Option<Vec<u8>>,
         G: Fn(u64, usize) -> u64,
     {
-        if calls.is_empty() {
-            return Ok(());
+        self.execute_draw_groups_with_texture_generations(
+            &[calls],
+            |_, gpu_va, len| read_guest(gpu_va, len).map(SharedGuestSnapshot::from_vec),
+            |_, gpu_va, len| texture_generation(gpu_va, len),
+        )
+    }
+
+    pub fn execute_draw_groups_with_texture_generations<F, G>(
+        &self,
+        groups: &[&[crate::draw::Maxwell3dDrawCall]],
+        read_guest: F,
+        texture_generation: G,
+    ) -> Result<(), String>
+    where
+        F: Fn(usize, u64, usize) -> Option<SharedGuestSnapshot>,
+        G: Fn(usize, u64, usize) -> u64,
+    {
+        self.execute_draw_groups_with_texture_generations_and_fermi_exact_rt_snapshot_leases(
+            groups,
+            read_guest,
+            texture_generation,
+            &[],
+        )
+        .map(|_| ())
+    }
+
+    pub fn execute_draw_groups_with_texture_generations_and_fermi_exact_rt_snapshot_leases<F, G>(
+        &self,
+        groups: &[&[crate::draw::Maxwell3dDrawCall]],
+        read_guest: F,
+        texture_generation: G,
+        fermi_exact_rt_snapshot_lease_ids: &[u64],
+    ) -> Result<bool, String>
+    where
+        F: Fn(usize, u64, usize) -> Option<SharedGuestSnapshot>,
+        G: Fn(usize, u64, usize) -> u64,
+    {
+        if groups.iter().all(|calls| calls.is_empty()) {
+            return Ok(false);
         }
+        let attachment_uses = draw_group_attachment_uses(groups);
+        preflight_draw_group_attachment_uses(&attachment_uses)?;
         self.settle_pending_computes();
         let rp_t0 = std::time::Instant::now();
 
-        struct Prep {
+        struct Prep<'a> {
             pipeline: vk::Pipeline,
             vertex_bindings: Vec<PreparedVertexBinding>,
-            cbuf_data: Vec<u8>,
+            cbuf_data: Option<&'a crate::draw::GraphicsCbufPayload>,
+            cbuf_len: usize,
             tex_pendings: Vec<Option<PendingTexture>>,
             use_depth: bool,
             tsc_entries: Vec<Option<crate::texture::TscEntry>>,
-            index_data: Vec<u8>,
+            index_data: &'a [u8],
             index_count: u32,
             index_type: vk::IndexType,
             draw_vertex_count: u32,
         }
-        let mut preps: Vec<(&crate::draw::Maxwell3dDrawCall, Prep)> =
-            Vec::with_capacity(calls.len());
-        let batch_color_formats = calls
-            .iter()
-            .find(|call| call_writes_any_color(call))
-            .map(|call| {
-                let color_keys = active_color_keys_for_call(call);
-                color_formats_for_call(call, color_keys.len())
-            })
-            .unwrap_or_default();
-        for (call_index, call) in calls.iter().enumerate() {
-            let use_depth = call.depth_key.is_some();
-            let depth_format = if use_depth {
-                call.depth_format
-            } else {
-                vk::Format::UNDEFINED
-            };
-            let depth_aspects = if use_depth {
-                call.depth_aspects
-            } else {
-                vk::ImageAspectFlags::empty()
-            };
-            if !use_depth && !call_writes_any_color(call) {
-                continue;
-            }
-            let pipeline = match self
-                .compile_pipeline(
-                    &call.vs_spirv,
-                    &call.fs_spirv,
-                    call.vs_hash,
-                    call.fs_hash,
-                    call.vs_cbuf_mask,
-                    call.fs_cbuf_mask,
-                    &call.vertex_layout,
-                    call.state.topology,
-                    call.host_primitive_restart_enabled(),
-                    &batch_color_formats,
-                    call.blend,
-                    call.cull_test_enable,
-                    call.cull_face,
-                    call.front_face,
-                    call.depth_clamp_enabled,
-                    call.poly_offset_enable,
-                    call.poly_offset_units,
-                    call.poly_offset_factor,
-                    call.depth,
-                    depth_format,
-                    depth_aspects,
-                    call.stencil,
-                    call.vertex_count,
-                )
-                .map_err(|error| graphics_draw_call_error(call_index, call, "pipeline", error))?
-            {
-                Some(p) => p,
-                None => continue,
-            };
-            let (vertex_bindings, draw_vertex_count) =
-                match prepare_vertex_bindings(call, &read_guest) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log_vertex_bindings_skip(call, &e);
-                        continue;
-                    }
-                };
-            let cbuf_data = if let Some(d) = &call.cbuf_data {
-                if d.len() >= nexium_spirv::GFX_CBUF_MIN_SIZE as usize {
-                    d.clone()
+        let mut group_preps = Vec::with_capacity(groups.len());
+        for (group_index, calls) in groups.iter().copied().enumerate() {
+            let mut preps = Vec::with_capacity(calls.len());
+            let batch_color_formats = calls
+                .iter()
+                .find(|call| call_writes_any_color(call))
+                .map(|call| {
+                    let color_keys = active_color_keys_for_call(call);
+                    color_formats_for_call(call, color_keys.len())
+                })
+                .unwrap_or_default();
+            let read_group = |gpu_va, len| read_guest(group_index, gpu_va, len);
+            for (call_index, call) in calls.iter().enumerate() {
+                let use_depth = call.depth_key.is_some();
+                let depth_format = if use_depth {
+                    call.depth_format
                 } else {
-                    empty_graphics_cbuf_data()
+                    vk::Format::UNDEFINED
+                };
+                let depth_aspects = if use_depth {
+                    call.depth_aspects
+                } else {
+                    vk::ImageAspectFlags::empty()
+                };
+                if !use_depth && !call_writes_any_color(call) {
+                    continue;
                 }
-            } else {
-                empty_graphics_cbuf_data()
-            };
-            let tex_pendings = collect_tex_pendings(call, &read_guest).map_err(|error| {
-                graphics_draw_call_error(call_index, call, "texture-prepare", error)
-            })?;
-            let tsc_entries = collect_tsc_entries(call, &read_guest);
-            let (index_data, index_count, index_type) = match (&call.index_data, call.index_count) {
-                (Some(d), Some(c)) if c > 0 && !d.is_empty() => (d.clone(), c, call.index_type),
-                _ => (Vec::new(), 0u32, call.index_type),
-            };
-            if let Ok(want) = std::env::var("NEXIUM_VTX_DBG") {
-                let all_mode = want.trim().eq_ignore_ascii_case("all");
-                let is_3d = call.vertex_layout.attrs.iter().any(|a| {
-                    a.location == 0
-                        && vertex_debug_float_components(a.format).is_some_and(|c| c >= 3)
-                });
-                let under_cap = if all_mode {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static N: AtomicU64 = AtomicU64::new(0);
-                    static N3D: AtomicU64 = AtomicU64::new(0);
-                    if is_3d {
-                        N3D.fetch_add(1, Ordering::Relaxed) < 60
-                    } else {
-                        N.fetch_add(1, Ordering::Relaxed) < 20
-                    }
-                } else {
-                    true
+                let pipeline = match self
+                    .compile_pipeline(
+                        &call.vs_spirv,
+                        &call.fs_spirv,
+                        call.vs_hash,
+                        call.fs_hash,
+                        call.vs_cbuf_mask,
+                        call.fs_cbuf_mask,
+                        &call.vertex_layout,
+                        call.state.topology,
+                        call.host_primitive_restart_enabled(),
+                        &batch_color_formats,
+                        call.blend,
+                        call.cull_test_enable,
+                        call.cull_face,
+                        call.front_face,
+                        call.depth_clamp_enabled,
+                        call.poly_offset_enable,
+                        call.poly_offset_units,
+                        call.poly_offset_factor,
+                        call.depth,
+                        depth_format,
+                        depth_aspects,
+                        call.stencil,
+                        call.vertex_count,
+                    )
+                    .map_err(|error| {
+                        graphics_draw_call_error(call_index, call, "pipeline", error)
+                    })? {
+                    Some(p) => p,
+                    None => continue,
                 };
-                if under_cap && (all_mode || parse_u64_value(&want) == Some(call.vs_gpu_va)) {
-                    let vertex_base_addr = call
-                        .vertex_bindings
-                        .first()
-                        .map(|b| {
-                            b.addr.wrapping_add(
-                                (b.stride as u64).saturating_mul(call.first_vertex as u64),
-                            )
-                        })
-                        .unwrap_or(call.vertex_addr);
-                    if let Ok(addr) = std::env::var("NEXIUM_VTX_DBG_ADDR") {
-                        if parse_u64_value(&addr) != Some(vertex_base_addr) {
+                let (vertex_bindings, draw_vertex_count) =
+                    match prepare_vertex_bindings_shared(call, &read_group) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log_vertex_bindings_skip(call, &e);
                             continue;
                         }
-                    }
-                    if let Ok(min) = std::env::var("NEXIUM_VTX_DBG_MIN_VERTS") {
-                        if min
-                            .parse::<u32>()
-                            .ok()
-                            .is_some_and(|min| call.vertex_count < min)
-                        {
-                            continue;
+                    };
+                let cbuf_data = call.cbuf_data.as_ref();
+                let cbuf_len = graphics_cbuf_data_len(cbuf_data);
+                let tex_pendings = collect_tex_pendings(call, &read_group).map_err(|error| {
+                    graphics_draw_call_error(call_index, call, "texture-prepare", error)
+                })?;
+                let tsc_entries = collect_tsc_entries(call, &read_group);
+                let (index_data, index_count, index_type) =
+                    match (&call.index_data, call.index_count) {
+                        (Some(d), Some(c)) if c > 0 && !d.is_empty() => {
+                            (d.as_slice(), c, call.index_type)
                         }
-                    }
-                    let first_binding = vertex_bindings.first();
-                    let floats: Vec<f32> = first_binding
-                        .map(|b| {
-                            b.data
-                                .chunks_exact(4)
-                                .take(24)
-                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let idx: Vec<u16> = index_data
-                        .chunks_exact(2)
-                        .take(8)
-                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                        .collect();
-                    let attrs = call
-                        .vertex_layout
-                        .attrs
-                        .iter()
-                        .map(|a| {
-                            format!(
-                                "loc{}:b{}:{:?}:off{}",
-                                a.location, a.binding, a.format, a.offset
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let vertex_stride = first_binding.map(|b| b.stride).unwrap_or(0);
-                    let vertex_len: usize = vertex_bindings.iter().map(|b| b.data.len()).sum();
-                    let attr_summary = vertex_debug_attr_summary(call, &vertex_bindings);
-                    let index_summary =
-                        vertex_debug_index_summary(&index_data, index_count, index_type);
-                    log::warn!(
+                        _ => (&[][..], 0u32, call.index_type),
+                    };
+                if let Ok(want) = std::env::var("NEXIUM_VTX_DBG") {
+                    let all_mode = want.trim().eq_ignore_ascii_case("all");
+                    let is_3d = call.vertex_layout.attrs.iter().any(|a| {
+                        a.location == 0
+                            && vertex_debug_float_components(a.format).is_some_and(|c| c >= 3)
+                    });
+                    let under_cap = if all_mode {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static N: AtomicU64 = AtomicU64::new(0);
+                        static N3D: AtomicU64 = AtomicU64::new(0);
+                        if is_3d {
+                            N3D.fetch_add(1, Ordering::Relaxed) < 60
+                        } else {
+                            N.fetch_add(1, Ordering::Relaxed) < 20
+                        }
+                    } else {
+                        true
+                    };
+                    if under_cap && (all_mode || parse_u64_value(&want) == Some(call.vs_gpu_va)) {
+                        let vertex_base_addr = call
+                            .vertex_bindings
+                            .first()
+                            .map(|b| {
+                                b.addr.wrapping_add(
+                                    (b.stride as u64).saturating_mul(call.first_vertex as u64),
+                                )
+                            })
+                            .unwrap_or(call.vertex_addr);
+                        if let Ok(addr) = std::env::var("NEXIUM_VTX_DBG_ADDR") {
+                            if parse_u64_value(&addr) != Some(vertex_base_addr) {
+                                continue;
+                            }
+                        }
+                        if let Ok(min) = std::env::var("NEXIUM_VTX_DBG_MIN_VERTS") {
+                            if min
+                                .parse::<u32>()
+                                .ok()
+                                .is_some_and(|min| call.vertex_count < min)
+                            {
+                                continue;
+                            }
+                        }
+                        let first_binding = vertex_bindings.first();
+                        let floats: Vec<f32> = first_binding
+                            .map(|b| {
+                                b.data
+                                    .chunks_exact(4)
+                                    .take(24)
+                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let idx: Vec<u16> = index_data
+                            .chunks_exact(2)
+                            .take(8)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .collect();
+                        let attrs = call
+                            .vertex_layout
+                            .attrs
+                            .iter()
+                            .map(|a| {
+                                format!(
+                                    "loc{}:b{}:{:?}:off{}",
+                                    a.location, a.binding, a.format, a.offset
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let vertex_stride = first_binding.map(|b| b.stride).unwrap_or(0);
+                        let vertex_len: usize = vertex_bindings.iter().map(|b| b.data.len()).sum();
+                        let attr_summary = vertex_debug_attr_summary(call, &vertex_bindings);
+                        let index_summary =
+                            vertex_debug_index_summary(index_data, index_count, index_type);
+                        log::warn!(
                         "[vtx-dbg] vs={:#x} fs={:#x} tex={:?} rt={} addr={:#x} stride={} vlen={} vcount={} icount={} itype={:?} attrs=[{}] attr_summary={} index_summary={} floats={:?} idx={:?}",
                         call.vs_gpu_va,
                         call.fs_gpu_va,
@@ -6327,29 +8098,37 @@ impl Renderer {
                         floats,
                         idx
                     );
+                    }
                 }
+                preps.push((
+                    call,
+                    Prep {
+                        pipeline,
+                        vertex_bindings,
+                        cbuf_data,
+                        cbuf_len,
+                        tex_pendings,
+                        use_depth,
+                        tsc_entries,
+                        index_data,
+                        index_count,
+                        index_type,
+                        draw_vertex_count,
+                    },
+                ));
             }
-            preps.push((
-                call,
-                Prep {
-                    pipeline,
-                    vertex_bindings,
-                    cbuf_data,
-                    tex_pendings,
-                    use_depth,
-                    tsc_entries,
-                    index_data,
-                    index_count,
-                    index_type,
-                    draw_vertex_count,
-                },
-            ));
+            if !preps.is_empty() {
+                group_preps.push((group_index, preps));
+            }
         }
 
-        if preps.is_empty() {
-            return Ok(());
+        if group_preps.is_empty() {
+            return Ok(false);
         }
-        let rp_draws = preps.len() as u64;
+        let rp_draws = group_preps
+            .iter()
+            .map(|(_, preps)| preps.len() as u64)
+            .sum();
         let rp_prep = rp_t0.elapsed();
 
         let rp_t1 = std::time::Instant::now();
@@ -6362,6 +8141,8 @@ impl Renderer {
             cmd_pool,
             rt_cache,
             rt_copy_slots,
+            fermi_exact_rt_snapshot_leases,
+            fermi_exact_rt_snapshot_ids,
             descriptor_layout,
             descriptor_pool,
             pipeline_cache,
@@ -6373,12 +8154,14 @@ impl Renderer {
             sampler_filter_minmax_supported,
             sampler_anisotropy_supported,
             tex_cache,
+            tex_cache_vas,
             texel_buffer_cache,
             rt_reinterpret_cache,
             frame_slots,
             frame_index,
             ubo_ring,
             aurora_resident_ssbos,
+            resident_vb,
             min_storage_buffer_offset_alignment,
             max_storage_buffer_range,
             max_texel_buffer_elements,
@@ -6386,14 +8169,19 @@ impl Renderer {
         } = &mut *inner;
 
         let cur_idx = *frame_index;
-        let other_idx = (cur_idx + 1) % 2;
+        let other_idx = (cur_idx + 1) % frame_slots.len();
         let cbuf_alignment = *min_storage_buffer_offset_alignment;
 
         let rp_t2 = std::time::Instant::now();
+        let mut rp_fence_wait = std::time::Duration::ZERO;
         {
             let slot = &mut frame_slots[cur_idx];
             if slot.in_flight {
-                wait_fence(device, slot.fence)?;
+                let wait_t0 = std::time::Instant::now();
+                if !frame_slot_submission_complete(device, slot.submit_generation) {
+                    wait_fence(device, slot.fence)?;
+                }
+                rp_fence_wait = wait_t0.elapsed();
                 if !slot.retired_dsets.is_empty() {
                     unsafe {
                         let _ =
@@ -6402,12 +8190,19 @@ impl Renderer {
                     slot.retired_dsets.clear();
                 }
                 destroy_descriptor_pools(device, &mut slot.retired_dset_pools);
+                release_fermi_exact_rt_snapshot_lease_refs(
+                    device,
+                    fermi_exact_rt_snapshot_leases,
+                    fermi_exact_rt_snapshot_ids,
+                    &mut slot.fermi_exact_rt_snapshot_leases,
+                );
                 for (b, m) in slot.retired_buffers.drain(..) {
                     unsafe {
                         device.destroy_buffer(b, None);
                         device.free_memory(m, None);
                     }
                 }
+                recycle_slot_upload_buffers(device, slot);
                 for view in slot.retired_views.drain(..) {
                     unsafe {
                         device.destroy_image_view(view, None);
@@ -6423,6 +8218,7 @@ impl Renderer {
                 for buffer in slot.retired_texel_buffers.drain(..) {
                     destroy_texel_buffer(device, buffer.resource);
                 }
+                destroy_retired_rt_images(device, &mut slot.retired_rt_images);
                 for t in slot.retired_rt_reinterprets.drain(..) {
                     unsafe {
                         device.destroy_image_view(t.view, None);
@@ -6432,10 +8228,14 @@ impl Renderer {
                 }
                 reset_command_buffer(device, slot.cmd)?;
                 slot.in_flight = false;
+                slot.submit_generation = 0;
                 ubo_ring.head = ubo_ring.slot_head[cur_idx];
             }
         }
         if let Some(cache) = aurora_resident_ssbos.as_mut() {
+            cache.complete_frame_slot(cur_idx);
+        }
+        if let Some(cache) = resident_vb.as_mut() {
             cache.complete_frame_slot(cur_idx);
         }
         let rp_fence = rp_t2.elapsed();
@@ -6446,29 +8246,45 @@ impl Renderer {
             ));
         }
         let shared_plan_t0 = std::time::Instant::now();
-        let shared_ssbo_plan =
-            build_shared_ssbo_plan(preps.iter().map(|(call, _)| call.ssbo_data.as_slice()));
+        let shared_ssbo_plans = build_grouped_shared_ssbo_plans(
+            group_preps
+                .iter()
+                .map(|(_, preps)| preps.iter().map(|(call, _)| call.ssbo_data.as_slice())),
+        );
         let shared_plan_elapsed = shared_plan_t0.elapsed();
         let shared_upload_t0 = std::time::Instant::now();
         let mut resident_slots_used = Vec::new();
-        let mut shared_ssbo_infos = vec![None; shared_ssbo_plan.groups.len()];
+        let mut resident_vb_used: Vec<(u64, u32)> = Vec::new();
+        let mut shared_ssbo_infos = shared_ssbo_plans
+            .iter()
+            .map(|plan| vec![None; plan.groups.len()])
+            .collect::<Vec<_>>();
         if let Some(cache) = aurora_resident_ssbos.as_mut() {
-            for (group_index, group) in shared_ssbo_plan.groups.iter().enumerate() {
-                if let Some((info, resident_slot)) =
-                    cache.get_or_upload(group, &resident_slots_used)
-                {
-                    shared_ssbo_infos[group_index] = Some(info);
-                    resident_slots_used.push(resident_slot);
+            for (prepared_group_index, plan) in shared_ssbo_plans.iter().enumerate() {
+                for (plan_group_index, group) in plan.groups.iter().enumerate() {
+                    if let Some((info, resident_slot)) =
+                        cache.get_or_upload(group, &resident_slots_used)
+                    {
+                        shared_ssbo_infos[prepared_group_index][plan_group_index] = Some(info);
+                        if !resident_slots_used.contains(&resident_slot) {
+                            resident_slots_used.push(resident_slot);
+                        }
+                    }
                 }
             }
         }
-        let mut batch_ring_upper = preps.iter().fold(0u64, |total, (call, _)| {
-            total.saturating_add(graphics_draw_ring_bytes_upper_bound(call))
-        });
-        for (group_index, group) in shared_ssbo_plan.groups.iter().enumerate() {
-            if shared_ssbo_infos[group_index].is_none() {
-                batch_ring_upper = batch_ring_upper
-                    .saturating_add(ring_request_upper_bound(group.key.1 as u64, 16));
+        let mut batch_ring_upper = group_preps
+            .iter()
+            .flat_map(|(_, preps)| preps.iter())
+            .fold(0u64, |total, (call, _)| {
+                total.saturating_add(graphics_draw_ring_bytes_upper_bound(call))
+            });
+        for (prepared_group_index, plan) in shared_ssbo_plans.iter().enumerate() {
+            for (plan_group_index, group) in plan.groups.iter().enumerate() {
+                if shared_ssbo_infos[prepared_group_index][plan_group_index].is_none() {
+                    batch_ring_upper = batch_ring_upper
+                        .saturating_add(ring_request_upper_bound(group.key.1 as u64, 16));
+                }
             }
         }
         if batch_ring_upper > ubo_ring.size {
@@ -6484,51 +8300,68 @@ impl Renderer {
                 other_idx,
                 descriptor_pool.pool,
                 ubo_ring,
+                fermi_exact_rt_snapshot_leases,
+                fermi_exact_rt_snapshot_ids,
             )?;
             if let Some(cache) = aurora_resident_ssbos.as_mut() {
                 cache.complete_frame_slot(other_idx);
             }
+            if let Some(cache) = resident_vb.as_mut() {
+                cache.complete_frame_slot(other_idx);
+            }
         }
-        for (group_index, group) in shared_ssbo_plan.groups.iter().enumerate() {
-            if shared_ssbo_infos[group_index].is_some() {
-                continue;
-            }
-            let (_, logical_size, _) = group.key;
-            let size_aligned = align_up(logical_size as u64, 16);
-            let (buffer, offset, ptr) = ring_alloc(ubo_ring, size_aligned, 16)
-                .map_err(|e| format!("ring_alloc(shared Aurora ssbo): {}", e))?;
-            for patch in &group.patches {
-                let bytes = patch.bytes();
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        ptr.add(patch.start),
-                        bytes.len(),
-                    );
+        for (prepared_group_index, plan) in shared_ssbo_plans.iter().enumerate() {
+            for (plan_group_index, group) in plan.groups.iter().enumerate() {
+                if shared_ssbo_infos[prepared_group_index][plan_group_index].is_some() {
+                    continue;
                 }
+                let (_, logical_size, _) = group.key;
+                let size_aligned = align_up(logical_size as u64, 16);
+                let (buffer, offset, ptr) = ring_alloc(ubo_ring, size_aligned, 16)
+                    .map_err(|e| format!("ring_alloc(shared Aurora ssbo): {}", e))?;
+                for patch in &group.patches {
+                    let bytes = patch.bytes();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            ptr.add(patch.start),
+                            bytes.len(),
+                        );
+                    }
+                }
+                shared_ssbo_infos[prepared_group_index][plan_group_index] =
+                    Some(vk::DescriptorBufferInfo {
+                        buffer,
+                        offset,
+                        range: logical_size as u64,
+                    });
             }
-            shared_ssbo_infos[group_index] = Some(vk::DescriptorBufferInfo {
-                buffer,
-                offset,
-                range: logical_size as u64,
-            });
         }
         let shared_ssbo_infos = shared_ssbo_infos
             .into_iter()
-            .map(|info| info.expect("every shared SSBO group has an upload"))
+            .map(|infos| {
+                infos
+                    .into_iter()
+                    .map(|info| info.expect("every shared SSBO group has an upload"))
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
-        if pprof_enabled() && (rp_draws >= 50 || !shared_ssbo_plan.groups.is_empty()) {
-            let initialized_bytes = shared_ssbo_plan
-                .groups
+        let shared_ssbo_group_count = shared_ssbo_plans
+            .iter()
+            .map(|plan| plan.groups.len())
+            .sum::<usize>();
+        if pprof_enabled() && (rp_draws >= 50 || shared_ssbo_group_count != 0) {
+            let initialized_bytes = shared_ssbo_plans
                 .iter()
+                .flat_map(|plan| plan.groups.iter())
                 .flat_map(|group| group.initialized.iter())
                 .map(|(start, end)| end - start)
                 .sum::<usize>();
             log::warn!(
                 "[rprof-ssbo] draws={} groups={} logical_mib={:.1} initialized_mib={:.1} plan_ms={:.3} upload_ms={:.3}",
                 rp_draws,
-                shared_ssbo_plan.groups.len(),
-                shared_ssbo_plan.groups.iter().map(|group| group.key.1).sum::<usize>() as f64
+                shared_ssbo_group_count,
+                shared_ssbo_plans.iter().flat_map(|plan| plan.groups.iter()).map(|group| group.key.1).sum::<usize>() as f64
                     / (1024.0 * 1024.0),
                 initialized_bytes as f64 / (1024.0 * 1024.0),
                 shared_plan_elapsed.as_secs_f64() * 1000.0,
@@ -6538,6 +8371,20 @@ impl Renderer {
         let rp_t3 = std::time::Instant::now();
         let mut rp_alias = std::time::Duration::ZERO;
         let mut rp_tex = std::time::Duration::ZERO;
+        let mut rp_tex_sync = std::time::Duration::ZERO;
+        let mut rp_tex_view = std::time::Duration::ZERO;
+        let mut rp_tex_gen = std::time::Duration::ZERO;
+        let mut rp_tex_upload = std::time::Duration::ZERO;
+        let mut rp_tex_finish = std::time::Duration::ZERO;
+        let mut rp_tex_slots = 0usize;
+        let mut rp_tex_alias_hits = 0usize;
+        let mut rp_tex_generic_slots = 0usize;
+        let mut rp_tex_raw_slots = 0usize;
+        let mut rp_tex_uploads = 0usize;
+        let mut rp_tex_alias_syncs = 0usize;
+        let mut rp_tex_region_syncs = 0usize;
+        let mut rp_rt_snapshot_slots = 0usize;
+        let mut rp_rt_snapshot_alias_hits = 0usize;
         let mut rp_vtx = std::time::Duration::ZERO;
         let mut rp_dset = std::time::Duration::ZERO;
         let graphics_dummies = ensure_graphics_dummy_views(
@@ -6552,82 +8399,6 @@ impl Renderer {
             *default_sampler = Some(create_default_sampler(device)?);
         }
         let default_samp = default_sampler.unwrap();
-
-        let color_source = preps
-            .iter()
-            .map(|(call, _)| *call)
-            .find(|call| call_writes_any_color(call))
-            .unwrap_or(preps[0].0);
-        let rt_key = color_source.rt_key;
-        let color_keys = active_color_keys_for_call(color_source);
-        let color_formats = color_formats_for_call(color_source, color_keys.len());
-        let mut color_bind = Vec::with_capacity(color_keys.len());
-        for (idx, key) in color_keys.iter().enumerate() {
-            let format = color_formats
-                .get(idx)
-                .copied()
-                .unwrap_or(calls[0].rt_format);
-            if std::env::var_os("NEXIUM_RT_FORMAT_BIND_DBG").is_some() && key.nvmap_id == 16 {
-                let sampled = calls[0]
-                    .sampled_rt_slots
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, sampled)| {
-                        sampled.map(|sampled| format!("s{}={}", slot, sampled.label()))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                log::warn!(
-                    "[rt-format-bind] fs={:#x} rt={} idx={} fmt={:?} sampled=[{}] tex={:?}",
-                    calls[0].fs_gpu_va,
-                    key.label(),
-                    idx,
-                    format,
-                    sampled,
-                    calls[0].fs_tex_ids
-                );
-            }
-            drain_rt_copies_before_color_recreate(
-                device,
-                *queue,
-                rt_cache,
-                rt_copy_slots,
-                *key,
-                format,
-            )?;
-            let rt = rt_cache.get_or_create_with_format(*key, device, format)?;
-            color_bind.push((*key, rt.image, rt.view, rt.extent, rt.layout));
-        }
-        let mut rt_extent = vk::Extent2D {
-            width: rt_key.width,
-            height: rt_key.height,
-        };
-        for (_, _, _, extent, _) in &color_bind {
-            rt_extent.width = rt_extent.width.min(extent.width);
-            rt_extent.height = rt_extent.height.min(extent.height);
-        }
-        let rt_prev_layout = color_bind
-            .first()
-            .map(|(_, _, _, _, layout)| *layout)
-            .unwrap_or(vk::ImageLayout::UNDEFINED);
-        let any_depth = preps.iter().any(|p| p.1.use_depth);
-        let depth_key = if any_depth { calls[0].depth_key } else { None };
-        let (depth_image, depth_view, depth_prev, depth_fresh, depth_extent) = if any_depth {
-            let (d, fresh) = rt_cache.get_or_create_depth(
-                depth_key.unwrap(),
-                device,
-                calls[0].depth_format,
-                calls[0].depth_aspects,
-            )?;
-            (Some(d.image), Some(d.view), d.layout, fresh, Some(d.extent))
-        } else {
-            (None, None, vk::ImageLayout::UNDEFINED, false, None)
-        };
-        if let Some(extent) = depth_extent {
-            rt_extent.width = rt_extent.width.min(extent.width);
-            rt_extent.height = rt_extent.height.min(extent.height);
-        }
-
         let mut dset_pools = DescriptorPoolBatch::new(device)?;
         let cmd = frame_slots[cur_idx].cmd;
         let begin = vk::CommandBufferBeginInfo {
@@ -6642,548 +8413,240 @@ impl Renderer {
                 .begin_command_buffer(cmd, &begin)
                 .map_err(|e| format!("begin_command_buffer(batch): {:?}", e))?;
         }
-        let mut color_layouts = color_bind
-            .iter()
-            .map(|(_, _, _, _, layout)| *layout)
-            .collect::<Vec<_>>();
-        if let Some(di) = depth_image {
-            transition_image_aspect(
-                device,
-                cmd,
-                di,
-                depth_prev,
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                calls[0].depth_aspects,
-            );
-        }
-
-        let clear_rt = !color_bind.is_empty() && rt_prev_layout == vk::ImageLayout::UNDEFINED;
-
-        let mut alias_used: Vec<(RtKey, bool)> = Vec::new();
-        let mut post_submit_texture_probe: [Option<PostSubmitTextureProbe>; 2] = [None, None];
-        let mut tex_raw_cache: HashMap<(u64, usize), Option<(u64, Vec<u8>)>> = HashMap::new();
-        let mut tex_sam_cache: HashMap<(u64, usize), Option<u64>> = HashMap::new();
-        let mut pass_open = false;
-        let mut pass_depth = false;
-        let mut depth_needs_clear = depth_fresh;
-        let mut pass_rt_layout = vk::ImageLayout::UNDEFINED;
-        let mut pass_dirty = vec![false; color_bind.len()];
-        let mut pass_trace_calls: Vec<&crate::draw::Maxwell3dDrawCall> = Vec::new();
-        let mut had_pass = false;
-        for (_i, (call, prep)) in preps.iter().enumerate() {
-            let call = *call;
-            let rp_a0 = std::time::Instant::now();
-            let mut rt_aliases: Vec<_> = (0..prep.tex_pendings.len())
-                .map(|slot| {
-                    let tic = prep
-                        .tex_pendings
-                        .get(slot)
-                        .and_then(|pending| pending.as_ref().map(|(_, tic, _, _)| tic));
-                    rt_alias_for_slot(rt_cache, call, slot, rt_key, true, tic)
-                })
-                .collect();
-            let feedback_loop = color_keys
+        let mut post_submit_texture_probes = Vec::with_capacity(group_preps.len());
+        let mut color_sync_checked = Vec::<RtKey>::new();
+        let mut descriptor_ssbo_infos =
+            Vec::<vk::DescriptorBufferInfo>::with_capacity(crate::descriptor::MAX_SSBO as usize);
+        let mut descriptor_ssbo_bindings =
+            Vec::<u32>::with_capacity(crate::descriptor::MAX_SSBO as usize);
+        let mut descriptor_writes = Vec::with_capacity(17 + crate::descriptor::MAX_SSBO as usize);
+        for (prepared_group_index, (group_index, preps)) in group_preps.iter().enumerate() {
+            let group_index = *group_index;
+            let read_guest = |gpu_va, len| read_guest(group_index, gpu_va, len);
+            let texture_generation = |gpu_va, len| texture_generation(group_index, gpu_va, len);
+            let color_source = preps
                 .iter()
-                .copied()
-                .any(|key| call_samples_rt(call, key))
-                || rt_aliases
+                .map(|(call, _)| *call)
+                .find(|call| call_writes_any_color(call))
+                .unwrap_or(preps[0].0);
+            let rt_key = color_source.rt_key;
+            let color_keys = active_color_keys_for_call(color_source);
+            let color_formats = color_formats_for_call(color_source, color_keys.len());
+            let mut color_bind = Vec::with_capacity(color_keys.len());
+            for (idx, key) in color_keys.iter().enumerate() {
+                let format = color_formats
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(color_source.rt_format);
+                if rt_format_bind_debug_enabled() && key.nvmap_id == 16 {
+                    let sampled = color_source
+                        .sampled_rt_slots
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, sampled)| {
+                            sampled.map(|sampled| format!("s{}={}", slot, sampled.label()))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    log::warn!(
+                        "[rt-format-bind] fs={:#x} rt={} idx={} fmt={:?} sampled=[{}] tex={:?}",
+                        color_source.fs_gpu_va,
+                        key.label(),
+                        idx,
+                        format,
+                        sampled,
+                        color_source.fs_tex_ids
+                    );
+                }
+                let rt = rt_cache.get_or_create_with_format_retiring(
+                    *key,
+                    device,
+                    format,
+                    &mut frame_slots[cur_idx].retired_rt_images,
+                )?;
+                color_bind.push((*key, rt.image, rt.view, rt.extent, rt.layout));
+            }
+            let mut rt_extent = vk::Extent2D {
+                width: rt_key.width,
+                height: rt_key.height,
+            };
+            for (_, _, _, extent, _) in &color_bind {
+                rt_extent.width = rt_extent.width.min(extent.width);
+                rt_extent.height = rt_extent.height.min(extent.height);
+            }
+            let rt_prev_layout = color_bind
+                .first()
+                .map(|(_, _, _, _, layout)| *layout)
+                .unwrap_or(vk::ImageLayout::UNDEFINED);
+            let depth_source = preps
+                .iter()
+                .find(|(_, prep)| prep.use_depth)
+                .map(|(call, _)| *call);
+            let depth_key = depth_source.and_then(|call| call.depth_key);
+            let (depth_image, depth_view, depth_prev, depth_fresh, depth_extent) =
+                if let Some(call) = depth_source {
+                    let (d, fresh) = rt_cache.get_or_create_depth(
+                        depth_key.unwrap(),
+                        device,
+                        call.depth_format,
+                        call.depth_aspects,
+                    )?;
+                    (Some(d.image), Some(d.view), d.layout, fresh, Some(d.extent))
+                } else {
+                    (None, None, vk::ImageLayout::UNDEFINED, false, None)
+                };
+            if let Some(extent) = depth_extent {
+                rt_extent.width = rt_extent.width.min(extent.width);
+                rt_extent.height = rt_extent.height.min(extent.height);
+            }
+            let mut color_layouts = color_bind
+                .iter()
+                .map(|(_, _, _, _, layout)| *layout)
+                .collect::<Vec<_>>();
+            let mut depth_layout = depth_prev;
+
+            let clear_rt = !color_bind.is_empty() && rt_prev_layout == vk::ImageLayout::UNDEFINED;
+
+            let mut alias_used: Vec<(RtKey, bool)> = Vec::new();
+            let mut post_submit_texture_probe: [Option<PostSubmitTextureProbe>; 2] = [None, None];
+            let mut tex_raw_cache: HashMap<(u64, usize), Option<(u64, SharedGuestSnapshot)>> =
+                HashMap::new();
+            let mut tex_sam_cache: HashMap<(u64, usize), Option<u64>> = HashMap::new();
+            let mut volume_slice_cache: HashMap<
+                (TexCacheKey, usize, Option<RtKey>),
+                Vec<VolumeRtSlice>,
+            > = HashMap::new();
+            let mut pass_open = false;
+            let mut pass_depth = false;
+            let mut pass_depth_layout = vk::ImageLayout::UNDEFINED;
+            let mut depth_needs_clear = depth_fresh;
+            let mut pass_rt_layout = vk::ImageLayout::UNDEFINED;
+            let mut pass_dirty = vec![false; color_bind.len()];
+            let mut pass_trace_calls: Vec<&crate::draw::Maxwell3dDrawCall> = Vec::new();
+            let mut had_pass = false;
+            let mut group_color_sync_clean = Vec::<RtKey>::new();
+            for (_i, (call, prep)) in preps.iter().enumerate() {
+                let call = *call;
+                color_sync_checked.clear();
+                let readonly_depth_self = prep.use_depth
+                    && prep.tex_pendings.iter().enumerate().any(|(slot, pending)| {
+                        let Some((_, tic, _, _)) = *pending else {
+                            return false;
+                        };
+                        sampled_rt_key_for_slot(call, slot).is_some_and(|sk| {
+                            direct_sampled_depth_read_only_alias(
+                                rt_cache,
+                                call,
+                                sk,
+                                tic,
+                                depth_needs_clear,
+                                depth_key,
+                                depth_image,
+                            )
+                            .is_some()
+                        })
+                    });
+                let desired_depth_layout = if readonly_depth_self {
+                    vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                };
+                let rp_a0 = std::time::Instant::now();
+                debug_assert!(prep.tex_pendings.len() <= MAX_TEXTURE_DESCRIPTOR_COUNT);
+                debug_assert!(prep.tsc_entries.len() <= MAX_TEXTURE_DESCRIPTOR_COUNT);
+                let mut rt_aliases: [Option<RtAlias>; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    std::array::from_fn(|slot| {
+                        if slot >= prep.tex_pendings.len() {
+                            return None;
+                        }
+                        let tic = prep
+                            .tex_pendings
+                            .get(slot)
+                            .and_then(|pending| pending.as_ref().map(|(_, tic, _, _)| tic));
+                        rt_alias_for_slot(
+                            rt_cache,
+                            Some(&*fermi_exact_rt_snapshot_leases),
+                            call,
+                            slot,
+                            rt_key,
+                            true,
+                            tic,
+                        )
+                    });
+                let feedback_loop = color_keys.iter().copied().any(|key| {
+                    call_samples_rt(call, key)
+                        && !call_samples_only_frozen_rt_aliases(call, key, &rt_aliases)
+                }) || rt_aliases
                     .iter()
                     .flatten()
-                    .any(|alias| !alias.depth && color_keys.contains(&alias.key));
-            let required_rt_layout = if feedback_loop {
-                vk::ImageLayout::GENERAL
-            } else {
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-            };
-            if feedback_loop && pass_open {
-                unsafe {
-                    device.cmd_end_rendering(cmd);
+                    .any(|alias| !alias.depth && !alias.frozen && color_keys.contains(&alias.key));
+                let required_rt_layout = if feedback_loop {
+                    vk::ImageLayout::GENERAL
+                } else {
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                };
+                if feedback_loop && pass_open {
+                    unsafe {
+                        device.cmd_end_rendering(cmd);
+                    }
+                    finish_color_pass(
+                        device,
+                        cmd,
+                        rt_cache,
+                        &color_bind,
+                        &mut color_layouts,
+                        pass_rt_layout,
+                        &mut pass_dirty,
+                        &pass_trace_calls,
+                    );
+                    pass_open = false;
+                    pass_trace_calls.clear();
                 }
-                finish_color_pass(
-                    device,
-                    cmd,
-                    rt_cache,
-                    &color_bind,
-                    &mut color_layouts,
-                    pass_rt_layout,
-                    &mut pass_dirty,
-                    &pass_trace_calls,
-                );
-                pass_open = false;
-                pass_trace_calls.clear();
-            }
-            let mut alias_snapshotted = vec![false; rt_aliases.len()];
-            if feedback_loop {
-                for (slot, alias_opt) in rt_aliases.iter_mut().enumerate() {
-                    let Some(alias) = alias_opt else {
-                        continue;
-                    };
-                    if alias.depth || !color_keys.contains(&alias.key) {
-                        continue;
-                    }
-                    match snapshot_feedback_alias(device, cmd, rt_cache, alias.key) {
-                        Ok((snap_image, snap_view, snap_format)) => {
-                            alias.image = snap_image;
-                            alias.view = snap_view;
-                            alias.format = snap_format;
-                            alias.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-                            alias_snapshotted[slot] = true;
-                        }
-                        Err(e) => {
-                            log::debug!("feedback snapshot failed: {}", e);
-                        }
-                    }
-                }
-            }
-            rp_alias += rp_a0.elapsed();
-
-            for alias in &rt_aliases {
-                if let Some(alias) = *alias {
-                    if !alias.depth && color_keys.contains(&alias.key) {
-                        continue;
-                    }
-                    let used_key = (alias.key, alias.depth);
-                    if !alias_used.contains(&used_key) {
-                        let alias_prev = if alias.depth {
-                            rt_cache.depth_layout(alias.key).unwrap_or(alias.layout)
-                        } else {
-                            rt_cache.color_layout(alias.key).unwrap_or(alias.layout)
+                let mut alias_snapshotted = [false; MAX_TEXTURE_DESCRIPTOR_COUNT];
+                if feedback_loop {
+                    for (slot, alias_opt) in rt_aliases.iter_mut().enumerate() {
+                        let Some(alias) = alias_opt else {
+                            continue;
                         };
-                        if alias_prev != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-                            if pass_open {
-                                unsafe {
-                                    device.cmd_end_rendering(cmd);
-                                }
-                                finish_color_pass(
-                                    device,
-                                    cmd,
-                                    rt_cache,
-                                    &color_bind,
-                                    &mut color_layouts,
-                                    pass_rt_layout,
-                                    &mut pass_dirty,
-                                    &pass_trace_calls,
-                                );
-                                pass_open = false;
-                                pass_trace_calls.clear();
+                        if alias.depth || alias.frozen || !color_keys.contains(&alias.key) {
+                            continue;
+                        }
+                        match snapshot_feedback_alias(device, cmd, rt_cache, alias.key) {
+                            Ok((snap_image, snap_view, snap_format)) => {
+                                alias.image = snap_image;
+                                alias.view = snap_view;
+                                alias.format = snap_format;
+                                alias.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                                alias_snapshotted[slot] = true;
                             }
-                            if alias.depth {
-                                transition_image_aspect(
-                                    device,
-                                    cmd,
-                                    alias.image,
-                                    alias_prev,
-                                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                                    alias.aspects,
-                                );
-                                rt_cache.set_depth_layout(
-                                    alias.key,
-                                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                                );
-                            } else {
-                                if alias_prev == vk::ImageLayout::UNDEFINED {
-                                    transition_image(
-                                        device,
-                                        cmd,
-                                        alias.image,
-                                        vk::ImageLayout::UNDEFINED,
-                                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                                    );
-                                    let clear = vk::ClearColorValue {
-                                        float32: [0.0, 0.0, 0.0, 0.0],
-                                    };
-                                    let range = vk::ImageSubresourceRange {
-                                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                                        base_mip_level: 0,
-                                        level_count: 1,
-                                        base_array_layer: 0,
-                                        layer_count: 1,
-                                    };
-                                    unsafe {
-                                        device.cmd_clear_color_image(
-                                            cmd,
-                                            alias.image,
-                                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                                            &clear,
-                                            &[range],
-                                        );
-                                    }
-                                    transition_image(
-                                        device,
-                                        cmd,
-                                        alias.image,
-                                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                                    );
-                                } else {
-                                    transition_image(
-                                        device,
-                                        cmd,
-                                        alias.image,
-                                        alias_prev,
-                                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                                    );
-                                }
-                                rt_cache.set_color_layout(
-                                    alias.key,
-                                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                                );
+                            Err(e) => {
+                                log::debug!("feedback snapshot failed: {}", e);
                             }
                         }
-                        alias_used.push(used_key);
                     }
                 }
-            }
+                rp_alias += rp_a0.elapsed();
 
-            let dummy_views_2d = (0..max_texture_descriptors())
-                .map(|slot| graphics_dummies.image_2d_for_slot(call, slot))
-                .collect::<Vec<_>>();
-            let dummy_views_3d = vec![graphics_dummies.image_3d; max_texture_descriptors()];
-            let dummy_views_cube = (0..max_texture_descriptors())
-                .map(|slot| graphics_dummies.image_cube_for_slot(call, slot))
-                .collect::<Vec<_>>();
-            let dummy_views_cube_array = (0..max_texture_descriptors())
-                .map(|slot| graphics_dummies.image_cube_array_for_slot(call, slot))
-                .collect::<Vec<_>>();
-            let mut bound_tex_views = (0..max_texture_descriptors())
-                .map(|slot| {
-                    let family = texture_numeric_index(texture_numeric_type_for_slot(
-                        &call.texture_numeric_manifest,
-                        slot,
-                    ));
-                    dummy_views_2d[slot][family]
-                })
-                .collect::<Vec<_>>();
-            let mut bound_tex_views_3d = (0..max_texture_descriptors())
-                .map(|slot| {
-                    dummy_views_3d[slot][texture_numeric_index(texture_numeric_type_for_slot(
-                        &call.texture_numeric_manifest,
-                        slot,
-                    ))]
-                })
-                .collect::<Vec<_>>();
-            let mut bound_tex_views_cube = (0..max_texture_descriptors())
-                .map(|slot| {
-                    dummy_views_cube[slot][texture_numeric_index(texture_numeric_type_for_slot(
-                        &call.texture_numeric_manifest,
-                        slot,
-                    ))]
-                })
-                .collect::<Vec<_>>();
-            let mut bound_tex_views_cube_array = (0..max_texture_descriptors())
-                .map(|slot| {
-                    dummy_views_cube_array[slot][texture_numeric_index(
-                        texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
-                    )]
-                })
-                .collect::<Vec<_>>();
-            let mut bound_texel_views = (0..max_texture_descriptors())
-                .map(|slot| {
-                    graphics_dummies.texel_buffer[texture_numeric_index(
-                        texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
-                    )]
-                })
-                .collect::<Vec<_>>();
-            let mut stencil_alias_bound = vec![false; max_texture_descriptors()];
-            let mut bound_tex_layouts =
-                vec![vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL; max_texture_descriptors()];
-            let rp_tx0 = std::time::Instant::now();
-            for (slot, pending) in prep.tex_pendings.iter().enumerate() {
-                if let Some((_, tic, _, read_size)) = *pending {
-                    if tic.is_buffer() && slot < 32 && call.texel_buffer_mask & (1u32 << slot) != 0
-                    {
-                        let numeric_type =
-                            texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot);
-                        match texel_buffer_view_for_tic(
-                            device,
-                            mem_props,
-                            *max_texel_buffer_elements,
-                            texel_buffer_cache,
-                            &mut frame_slots[cur_idx].retired_texel_buffers,
-                            &tic,
-                            numeric_type,
-                            read_size,
-                            texture_generation(tic.gpu_va, read_size),
-                            &read_guest,
-                        ) {
-                            Ok(Some(view)) => {
-                                bound_texel_views[slot] = view;
-                                trace_graphics_texture_binding!(
-                                    call,
-                                    slot,
-                                    *pending,
-                                    None,
-                                    numeric_type,
-                                    GraphicsTextureBindOutcome::TexelBuffer,
-                                    "texel-buffer",
-                                    format!("{view:?}"),
-                                    texel_buffer_format(&tic, numeric_type)
-                                        .map(|(format, _)| format!("{format:?}")),
-                                    None,
-                                );
-                                continue;
-                            }
-                            Ok(None) => {
-                                trace_graphics_texture_binding!(
-                                    call,
-                                    slot,
-                                    *pending,
-                                    None,
-                                    numeric_type,
-                                    GraphicsTextureBindOutcome::Rejection,
-                                    "texel-buffer",
-                                    "-",
-                                    None,
-                                    Some("view creation produced no view".to_string()),
-                                );
-                                return Err(format!(
-                                    "texel buffer slot {} va={:#x} produced no view",
-                                    slot, tic.gpu_va
-                                ));
-                            }
-                            Err(error) => {
-                                trace_graphics_texture_binding!(
-                                    call,
-                                    slot,
-                                    *pending,
-                                    None,
-                                    numeric_type,
-                                    GraphicsTextureBindOutcome::Rejection,
-                                    "texel-buffer",
-                                    "-",
-                                    None,
-                                    Some(error.clone()),
-                                );
-                                return Err(format!(
-                                    "texel buffer slot {} va={:#x}: {}",
-                                    slot, tic.gpu_va, error
-                                ));
-                            }
+                for alias in &rt_aliases {
+                    if let Some(alias) = *alias {
+                        if alias.frozen {
+                            continue;
                         }
-                    }
-                }
-                let direct_volume_rt = pending.map_or(false, |(key, _, _, _)| key.volume)
-                    && sampled_rt_key_for_slot(call, slot).is_some_and(|key| key.is_3d);
-                let pending_special = pending
-                    .map_or(false, |(key, _, _, _)| texture_key_has_special_view(key))
-                    && !direct_volume_rt;
-                if !pending_special {
-                    if let Some(sk) = sampled_rt_key_for_slot(call, slot) {
-                        let depth_self = pending
-                            .map(|(_, tic, _, _)| tic_format_prefers_depth_alias(tic.format))
-                            .unwrap_or(false)
-                            && sampled_active_depth_key(rt_cache, call, sk).is_some();
-                        let depth_self_needs_sync =
-                            depth_self && depth_self_shadow_needs_sync(rt_cache, call, sk);
-                        let depth_as_color = pending
-                            .map(|(_, tic, _, _)| tic_reads_depth_as_color(tic.format))
-                            .unwrap_or(false)
-                            && rt_cache.find_depth(sk).is_some();
-                        if !depth_as_color
-                            && pending.map_or(false, |(_, tic, _, _)| {
-                                !tic_format_prefers_depth_alias(tic.format)
-                            })
-                            && rt_cache.find_depth(sk).is_some()
-                        {
-                            use std::sync::atomic::{AtomicU64, Ordering};
-                            static N: AtomicU64 = AtomicU64::new(0);
-                            if N.fetch_add(1, Ordering::Relaxed) < 12 {
-                                log::warn!(
-                                    "[depth-as-color-miss] slot={} tic_fmt={:?} sk={} fs={:#x}",
-                                    slot,
-                                    pending.map(|(_, tic, _, _)| tic.format),
-                                    sk.label(),
-                                    call.fs_gpu_va
-                                );
-                            }
+                        if !alias.depth && color_keys.contains(&alias.key) {
+                            continue;
                         }
-                        if pass_open
-                            && (sampled_color_needs_sync(rt_cache, sk)
-                                || depth_self_needs_sync
-                                || depth_as_color)
-                        {
-                            unsafe {
-                                device.cmd_end_rendering(cmd);
-                            }
-                            finish_color_pass(
-                                device,
-                                cmd,
-                                rt_cache,
-                                &color_bind,
-                                &mut color_layouts,
-                                pass_rt_layout,
-                                &mut pass_dirty,
-                                &pass_trace_calls,
-                            );
-                            pass_open = false;
-                            pass_trace_calls.clear();
+                        if alias.depth && depth_image == Some(alias.image) {
+                            continue;
                         }
-                        let alias_synced = sync_sampled_color_alias(
-                            device,
-                            cmd,
-                            rt_cache,
-                            mem_props,
-                            &mut frame_slots[cur_idx],
-                            sk,
-                        )?;
-                        let region_synced = sync_sampled_color_region(
-                            device,
-                            *queue,
-                            cmd,
-                            rt_cache,
-                            rt_copy_slots,
-                            sk,
-                        )?;
-                        if alias_synced || region_synced {
-                            if let Some(alias_slot) = rt_aliases.get_mut(slot) {
-                                let tic = prep
-                                    .tex_pendings
-                                    .get(slot)
-                                    .and_then(|pending| pending.as_ref().map(|(_, tic, _, _)| tic));
-                                *alias_slot =
-                                    rt_alias_for_slot(rt_cache, call, slot, rt_key, true, tic);
-                            }
-                        }
-                        if depth_self {
-                            if let Some(alias) =
-                                sync_sampled_depth_self(device, cmd, rt_cache, call, sk)?
-                            {
-                                if let Some(alias_slot) = rt_aliases.get_mut(slot) {
-                                    *alias_slot = Some(alias);
-                                }
-                            }
-                        }
-                        if depth_as_color && rt_aliases.get(slot).copied().flatten().is_none() {
-                            if let Some(alias) = sync_sampled_depth_as_color(
-                                device,
-                                *queue,
-                                cmd,
-                                rt_cache,
-                                rt_copy_slots,
-                                mem_props,
-                                &mut frame_slots[cur_idx],
-                                sk,
-                            )? {
-                                if let Some(alias_slot) = rt_aliases.get_mut(slot) {
-                                    *alias_slot = Some(alias);
-                                }
-                            }
-                        }
-                    }
-                }
-                if !pending_special {
-                    if let Some(alias) = rt_aliases.get(slot).copied().flatten().filter(|alias| {
-                        let view_format = pending
-                            .map(|(_, tic, _, _)| {
-                                rt_alias_view_format(alias.key, tic, alias.format)
-                            })
-                            .unwrap_or(alias.format);
-                        rt_alias_numeric_type_matches(
-                            *alias,
-                            pending.map(|(_, tic, _, _)| tic),
-                            texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
-                            view_format,
-                        )
-                    }) {
-                        let view_format = pending
-                            .map(|(_, tic, _, _)| {
-                                rt_alias_view_format(alias.key, tic, alias.format)
-                            })
-                            .unwrap_or(alias.format);
-                        let reinterpret_supported =
-                            pending.map_or(false, |(texture_key, tic, _, _)| {
-                                rt_alias_reinterpret_supported(texture_key, tic, alias, view_format)
-                            });
-                        if !reinterpret_supported {
-                            if let Some(alias_view) = rt_alias_sample_view(
-                                device,
-                                rt_cache,
-                                &mut frame_slots[cur_idx],
-                                alias,
-                                pending.map(|(_, tic, _, _)| tic),
-                                view_format,
-                            ) {
-                                if direct_volume_rt {
-                                    bound_tex_views_3d[slot] = alias_view;
-                                } else {
-                                    bound_tex_views[slot] = alias_view;
-                                }
-                                stencil_alias_bound[slot] = pending
-                                    .map(|(_, tic, _, _)| {
-                                        rt_alias_sample_aspect(alias, tic)
-                                            == Some(vk::ImageAspectFlags::STENCIL)
-                                    })
-                                    .unwrap_or(false);
-                                if slot < post_submit_texture_probe.len()
-                                    && !alias.depth
-                                    && post_submit_texture_probe_enabled(call.fs_gpu_va)
-                                    && post_submit_texture_probe[slot].is_none()
-                                {
-                                    post_submit_texture_probe[slot] =
-                                        Some(PostSubmitTextureProbe {
-                                            source: "ALIAS",
-                                            key: alias.key,
-                                            image: alias.image,
-                                            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                                            format: alias.format,
-                                        });
-                                }
-                                let selected_view = if direct_volume_rt {
-                                    bound_tex_views_3d[slot]
-                                } else {
-                                    bound_tex_views[slot]
-                                };
-                                let snapshotted =
-                                    alias_snapshotted.get(slot).copied().unwrap_or(false);
-                                trace_graphics_texture_binding!(
-                                    call,
-                                    slot,
-                                    *pending,
-                                    Some(GraphicsTextureTraceResource::rt_alias(alias)),
-                                    texture_numeric_type_for_slot(
-                                        &call.texture_numeric_manifest,
-                                        slot,
-                                    ),
-                                    GraphicsTextureBindOutcome::RtAlias,
-                                    format!(
-                                        "rt-alias:{}:{}",
-                                        alias.key.label(),
-                                        if snapshotted { "snapshot" } else { "live" }
-                                    ),
-                                    format!("{selected_view:?}"),
-                                    Some(format!("{view_format:?}")),
-                                    None,
-                                );
-                                trace_vs_tex_bind_alias(
-                                    device,
-                                    *cmd_pool,
-                                    *queue,
-                                    rt_cache,
-                                    mem_props,
-                                    call,
-                                    slot,
-                                    alias,
-                                    view_format,
-                                    bound_tex_views[slot],
-                                );
-                                if !alias.depth
-                                    && color_keys.contains(&alias.key)
-                                    && !alias_snapshotted.get(slot).copied().unwrap_or(false)
-                                {
-                                    bound_tex_layouts[slot] = required_rt_layout;
-                                }
-                                continue;
-                            }
-                        }
-                        if let Some((texture_key, tic, _, _)) = *pending {
-                            if rt_alias_reinterpret_supported(texture_key, tic, alias, view_format)
-                            {
-                                let source_is_snapshot =
-                                    alias_snapshotted.get(slot).copied().unwrap_or(false);
-                                if pass_open
-                                    && !source_is_snapshot
-                                    && color_keys.contains(&alias.key)
-                                {
+                        let used_key = (alias.key, alias.depth);
+                        if !alias_used.contains(&used_key) {
+                            let alias_prev = if alias.depth {
+                                rt_cache.depth_layout(alias.key).unwrap_or(alias.layout)
+                            } else {
+                                rt_cache.color_layout(alias.key).unwrap_or(alias.layout)
+                            };
+                            if alias_prev != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+                                if pass_open {
                                     unsafe {
                                         device.cmd_end_rendering(cmd);
                                     }
@@ -7200,48 +8663,448 @@ impl Renderer {
                                     pass_open = false;
                                     pass_trace_calls.clear();
                                 }
-                                if let Some((reinterpret_view, reinterpret_copy)) =
-                                    prepare_rt_alias_reinterpret(
+                                if alias.depth {
+                                    transition_image_aspect(
                                         device,
-                                        mem_props,
+                                        cmd,
+                                        alias.image,
+                                        alias_prev,
+                                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                        alias.aspects,
+                                    );
+                                    rt_cache.set_depth_layout(
+                                        alias.key,
+                                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                    );
+                                } else {
+                                    if alias_prev == vk::ImageLayout::UNDEFINED {
+                                        transition_image(
+                                            device,
+                                            cmd,
+                                            alias.image,
+                                            vk::ImageLayout::UNDEFINED,
+                                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                        );
+                                        let clear = vk::ClearColorValue {
+                                            float32: [0.0, 0.0, 0.0, 0.0],
+                                        };
+                                        let range = vk::ImageSubresourceRange {
+                                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                                            base_mip_level: 0,
+                                            level_count: 1,
+                                            base_array_layer: 0,
+                                            layer_count: 1,
+                                        };
+                                        unsafe {
+                                            device.cmd_clear_color_image(
+                                                cmd,
+                                                alias.image,
+                                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                                &clear,
+                                                &[range],
+                                            );
+                                        }
+                                        transition_image(
+                                            device,
+                                            cmd,
+                                            alias.image,
+                                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                        );
+                                    } else {
+                                        transition_image(
+                                            device,
+                                            cmd,
+                                            alias.image,
+                                            alias_prev,
+                                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                        );
+                                    }
+                                    rt_cache.set_color_layout(
+                                        alias.key,
+                                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                    );
+                                }
+                            }
+                            alias_used.push(used_key);
+                        }
+                    }
+                }
+
+                let dummy_views_2d: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    std::array::from_fn(|slot| graphics_dummies.image_2d_for_slot(call, slot));
+                let dummy_views_3d = [graphics_dummies.image_3d; MAX_TEXTURE_DESCRIPTOR_COUNT];
+                let dummy_views_cube: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    std::array::from_fn(|slot| graphics_dummies.image_cube_for_slot(call, slot));
+                let dummy_views_cube_array: [[vk::ImageView; 3]; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    std::array::from_fn(|slot| {
+                        graphics_dummies.image_cube_array_for_slot(call, slot)
+                    });
+                let mut bound_tex_views: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    std::array::from_fn(|slot| {
+                        let family = texture_numeric_index(texture_numeric_type_for_slot(
+                            &call.texture_numeric_manifest,
+                            slot,
+                        ));
+                        dummy_views_2d[slot][family]
+                    });
+                let mut bound_tex_views_3d: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    std::array::from_fn(|slot| {
+                        dummy_views_3d[slot][texture_numeric_index(texture_numeric_type_for_slot(
+                            &call.texture_numeric_manifest,
+                            slot,
+                        ))]
+                    });
+                let mut bound_tex_views_cube: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    std::array::from_fn(|slot| {
+                        dummy_views_cube[slot][texture_numeric_index(
+                            texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
+                        )]
+                    });
+                let mut bound_tex_views_cube_array: [vk::ImageView; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    std::array::from_fn(|slot| {
+                        dummy_views_cube_array[slot][texture_numeric_index(
+                            texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
+                        )]
+                    });
+                let mut bound_texel_views: [vk::BufferView; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    std::array::from_fn(|slot| {
+                        graphics_dummies.texel_buffer[texture_numeric_index(
+                            texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
+                        )]
+                    });
+                let mut stencil_alias_bound = [false; MAX_TEXTURE_DESCRIPTOR_COUNT];
+                let mut bound_tex_layouts =
+                    [vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL; MAX_TEXTURE_DESCRIPTOR_COUNT];
+                let rp_tx0 = std::time::Instant::now();
+                for (slot, pending) in prep.tex_pendings.iter().enumerate() {
+                    rp_tex_slots += 1;
+                    let rt_snapshot = call
+                        .sampled_rt_snapshot_slots
+                        .get(slot)
+                        .copied()
+                        .unwrap_or(false);
+                    rp_rt_snapshot_slots += rt_snapshot as usize;
+                    if let Some((_, tic, _, read_size)) = *pending {
+                        if tic.is_buffer()
+                            && slot < 32
+                            && call.texel_buffer_mask & (1u32 << slot) != 0
+                        {
+                            let numeric_type =
+                                texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot);
+                            match texel_buffer_view_for_tic(
+                                device,
+                                mem_props,
+                                *max_texel_buffer_elements,
+                                texel_buffer_cache,
+                                &mut frame_slots[cur_idx].retired_texel_buffers,
+                                &tic,
+                                numeric_type,
+                                read_size,
+                                texture_generation(tic.gpu_va, read_size),
+                                &read_guest,
+                            ) {
+                                Ok(Some(view)) => {
+                                    bound_texel_views[slot] = view;
+                                    trace_graphics_texture_binding!(
+                                        call,
+                                        slot,
+                                        *pending,
+                                        None,
+                                        numeric_type,
+                                        GraphicsTextureBindOutcome::TexelBuffer,
+                                        "texel-buffer",
+                                        format!("{view:?}"),
+                                        texel_buffer_format(&tic, numeric_type)
+                                            .map(|(format, _)| format!("{format:?}")),
+                                        None,
+                                    );
+                                    continue;
+                                }
+                                Ok(None) => {
+                                    trace_graphics_texture_binding!(
+                                        call,
+                                        slot,
+                                        *pending,
+                                        None,
+                                        numeric_type,
+                                        GraphicsTextureBindOutcome::Rejection,
+                                        "texel-buffer",
+                                        "-",
+                                        None,
+                                        Some("view creation produced no view".to_string()),
+                                    );
+                                    return Err(format!(
+                                        "texel buffer slot {} va={:#x} produced no view",
+                                        slot, tic.gpu_va
+                                    ));
+                                }
+                                Err(error) => {
+                                    trace_graphics_texture_binding!(
+                                        call,
+                                        slot,
+                                        *pending,
+                                        None,
+                                        numeric_type,
+                                        GraphicsTextureBindOutcome::Rejection,
+                                        "texel-buffer",
+                                        "-",
+                                        None,
+                                        Some(error.clone()),
+                                    );
+                                    return Err(format!(
+                                        "texel buffer slot {} va={:#x}: {}",
+                                        slot, tic.gpu_va, error
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    let rp_sync_t0 = std::time::Instant::now();
+                    let direct_volume_rt = pending.map_or(false, |(key, _, _, _)| key.volume)
+                        && sampled_rt_key_for_slot(call, slot).is_some_and(|key| key.is_3d);
+                    let pending_special = pending
+                        .map_or(false, |(key, _, _, _)| texture_key_has_special_view(key))
+                        && !direct_volume_rt;
+                    let frozen_rt_alias = rt_aliases
+                        .get(slot)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|alias| alias.frozen);
+                    if !pending_special && !frozen_rt_alias {
+                        if let Some(sk) = sampled_rt_key_for_slot(call, slot) {
+                            let depth_self = pending
+                                .map(|(_, tic, _, _)| tic_format_prefers_depth_alias(tic.format))
+                                .unwrap_or(false)
+                                && sampled_active_depth_key(rt_cache, call, sk).is_some();
+                            let depth_self_read_only = pending.and_then(|(_, tic, _, _)| {
+                                direct_sampled_depth_read_only_alias(
+                                    rt_cache,
+                                    call,
+                                    sk,
+                                    tic,
+                                    depth_needs_clear,
+                                    depth_key,
+                                    depth_image,
+                                )
+                            });
+                            let depth_self_needs_sync = depth_self
+                                && depth_self_read_only.is_none()
+                                && depth_self_shadow_needs_sync(rt_cache, call, sk);
+                            let depth_as_color = pending
+                                .map(|(_, tic, _, _)| tic_reads_depth_as_color(tic.format))
+                                .unwrap_or(false)
+                                && rt_cache.find_depth(sk).is_some();
+                            if !depth_as_color
+                                && pending.map_or(false, |(_, tic, _, _)| {
+                                    !tic_format_prefers_depth_alias(tic.format)
+                                })
+                                && rt_cache.find_depth(sk).is_some()
+                            {
+                                use std::sync::atomic::{AtomicU64, Ordering};
+                                static N: AtomicU64 = AtomicU64::new(0);
+                                if N.fetch_add(1, Ordering::Relaxed) < 12 {
+                                    log::warn!(
+                                        "[depth-as-color-miss] slot={} tic_fmt={:?} sk={} fs={:#x}",
+                                        slot,
+                                        pending.map(|(_, tic, _, _)| tic.format),
+                                        sk.label(),
+                                        call.fs_gpu_va
+                                    );
+                                }
+                            }
+                            let color_sync_known_clean = group_color_sync_clean.contains(&sk)
+                                || color_sync_checked.contains(&sk);
+                            let color_needs_sync = if color_sync_known_clean {
+                                false
+                            } else {
+                                sampled_color_needs_sync(rt_cache, sk)
+                            };
+                            let mut pass_finished = false;
+                            if pass_open
+                                && (color_needs_sync || depth_self_needs_sync || depth_as_color)
+                            {
+                                unsafe {
+                                    device.cmd_end_rendering(cmd);
+                                }
+                                finish_color_pass(
+                                    device,
+                                    cmd,
+                                    rt_cache,
+                                    &color_bind,
+                                    &mut color_layouts,
+                                    pass_rt_layout,
+                                    &mut pass_dirty,
+                                    &pass_trace_calls,
+                                );
+                                pass_open = false;
+                                pass_trace_calls.clear();
+                                color_sync_checked.clear();
+                                pass_finished = true;
+                            }
+                            let alias_synced = if color_needs_sync || pass_finished {
+                                sync_sampled_color_alias(
+                                    device,
+                                    cmd,
+                                    rt_cache,
+                                    mem_props,
+                                    &mut frame_slots[cur_idx],
+                                    sk,
+                                )?
+                            } else {
+                                false
+                            };
+                            rp_tex_alias_syncs += alias_synced as usize;
+                            let region_synced = if color_needs_sync || pass_finished {
+                                sync_sampled_color_region(
+                                    device,
+                                    *queue,
+                                    cmd,
+                                    rt_cache,
+                                    rt_copy_slots,
+                                    sk,
+                                )?
+                            } else {
+                                false
+                            };
+                            rp_tex_region_syncs += region_synced as usize;
+                            if alias_synced || region_synced {
+                                volume_slice_cache.clear();
+                                group_color_sync_clean.clear();
+                                color_sync_checked.clear();
+                                if let Some(alias_slot) = rt_aliases.get_mut(slot) {
+                                    let tic = prep.tex_pendings.get(slot).and_then(|pending| {
+                                        pending.as_ref().map(|(_, tic, _, _)| tic)
+                                    });
+                                    *alias_slot = rt_alias_for_slot(
                                         rt_cache,
-                                        rt_reinterpret_cache,
+                                        Some(&*fermi_exact_rt_snapshot_leases),
+                                        call,
+                                        slot,
+                                        rt_key,
+                                        true,
+                                        tic,
+                                    );
+                                }
+                            }
+                            if color_sync_clean_across_group(sk, &color_keys, &color_formats) {
+                                if !group_color_sync_clean.contains(&sk) {
+                                    group_color_sync_clean.push(sk);
+                                }
+                            } else if !color_sync_checked.contains(&sk) {
+                                color_sync_checked.push(sk);
+                            }
+                            if let Some(alias) = depth_self_read_only {
+                                if let Some(alias_slot) = rt_aliases.get_mut(slot) {
+                                    *alias_slot = Some(alias);
+                                }
+                            } else if depth_self {
+                                if let Some(alias) =
+                                    sync_sampled_depth_self(device, cmd, rt_cache, call, sk)?
+                                {
+                                    if let Some(alias_slot) = rt_aliases.get_mut(slot) {
+                                        *alias_slot = Some(alias);
+                                    }
+                                }
+                            }
+                            if depth_as_color && rt_aliases.get(slot).copied().flatten().is_none() {
+                                if let Some(alias) = sync_sampled_depth_as_color(
+                                    device,
+                                    *queue,
+                                    cmd,
+                                    rt_cache,
+                                    rt_copy_slots,
+                                    mem_props,
+                                    &mut frame_slots[cur_idx],
+                                    sk,
+                                )? {
+                                    volume_slice_cache.clear();
+                                    group_color_sync_clean.clear();
+                                    color_sync_checked.clear();
+                                    if let Some(alias_slot) = rt_aliases.get_mut(slot) {
+                                        *alias_slot = Some(alias);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    rp_tex_sync += rp_sync_t0.elapsed();
+                    let rp_view_t0 = std::time::Instant::now();
+                    if !pending_special {
+                        if let Some(alias) =
+                            rt_aliases.get(slot).copied().flatten().filter(|alias| {
+                                let view_format = pending
+                                    .map(|(_, tic, _, _)| {
+                                        rt_alias_view_format(alias.key, tic, alias.format)
+                                    })
+                                    .unwrap_or(alias.format);
+                                rt_alias_numeric_type_matches(
+                                    *alias,
+                                    pending.map(|(_, tic, _, _)| tic),
+                                    texture_numeric_type_for_slot(
+                                        &call.texture_numeric_manifest,
+                                        slot,
+                                    ),
+                                    view_format,
+                                )
+                            })
+                        {
+                            let view_format = pending
+                                .map(|(_, tic, _, _)| {
+                                    rt_alias_view_format(alias.key, tic, alias.format)
+                                })
+                                .unwrap_or(alias.format);
+                            let reinterpret_supported =
+                                pending.map_or(false, |(texture_key, tic, _, _)| {
+                                    rt_alias_reinterpret_supported(
                                         texture_key,
                                         tic,
                                         alias,
                                         view_format,
-                                        source_is_snapshot,
-                                    )?
-                                {
-                                    if reinterpret_copy.is_some() && pass_open {
-                                        unsafe {
-                                            device.cmd_end_rendering(cmd);
-                                        }
-                                        finish_color_pass(
-                                            device,
-                                            cmd,
-                                            rt_cache,
-                                            &color_bind,
-                                            &mut color_layouts,
-                                            pass_rt_layout,
-                                            &mut pass_dirty,
-                                            &pass_trace_calls,
-                                        );
-                                        pass_open = false;
-                                        pass_trace_calls.clear();
+                                    )
+                                });
+                            if !reinterpret_supported {
+                                if let Some(alias_view) = rt_alias_sample_view(
+                                    device,
+                                    rt_cache,
+                                    Some(&mut *fermi_exact_rt_snapshot_leases),
+                                    &mut frame_slots[cur_idx],
+                                    alias,
+                                    pending.map(|(_, tic, _, _)| tic),
+                                    view_format,
+                                ) {
+                                    if direct_volume_rt {
+                                        bound_tex_views_3d[slot] = alias_view;
+                                    } else {
+                                        bound_tex_views[slot] = alias_view;
                                     }
-                                    if let Some(reinterpret_copy) = reinterpret_copy {
-                                        record_rt_alias_reinterpret(
-                                            device,
-                                            cmd,
-                                            mem_props,
-                                            rt_cache,
-                                            &mut frame_slots[cur_idx],
-                                            rt_reinterpret_cache,
-                                            reinterpret_copy,
-                                        )?;
+                                    stencil_alias_bound[slot] = pending
+                                        .map(|(_, tic, _, _)| {
+                                            rt_alias_sample_aspect(alias, tic)
+                                                == Some(vk::ImageAspectFlags::STENCIL)
+                                        })
+                                        .unwrap_or(false);
+                                    if slot < post_submit_texture_probe.len()
+                                        && !alias.depth
+                                        && post_submit_texture_probe_enabled(call.fs_gpu_va)
+                                        && post_submit_texture_probe[slot].is_none()
+                                    {
+                                        post_submit_texture_probe[slot] =
+                                            Some(PostSubmitTextureProbe {
+                                                source: "ALIAS",
+                                                key: alias.key,
+                                                image: alias.image,
+                                                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                                format: alias.format,
+                                            });
                                     }
-                                    bound_tex_views[slot] = reinterpret_view;
+                                    let selected_view = if direct_volume_rt {
+                                        bound_tex_views_3d[slot]
+                                    } else {
+                                        bound_tex_views[slot]
+                                    };
+                                    let snapshotted =
+                                        alias_snapshotted.get(slot).copied().unwrap_or(false);
                                     trace_graphics_texture_binding!(
                                         call,
                                         slot,
@@ -7253,15 +9116,11 @@ impl Renderer {
                                         ),
                                         GraphicsTextureBindOutcome::RtAlias,
                                         format!(
-                                            "rt-reinterpret:{}:{}",
+                                            "rt-alias:{}:{}",
                                             alias.key.label(),
-                                            if source_is_snapshot {
-                                                "snapshot"
-                                            } else {
-                                                "live"
-                                            }
+                                            if snapshotted { "snapshot" } else { "live" }
                                         ),
-                                        format!("{:?}", bound_tex_views[slot]),
+                                        format!("{selected_view:?}"),
                                         Some(format!("{view_format:?}")),
                                         None,
                                     );
@@ -7277,63 +9136,224 @@ impl Renderer {
                                         view_format,
                                         bound_tex_views[slot],
                                     );
+                                    if alias.depth
+                                        && alias.layout
+                                            == vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                    {
+                                        bound_tex_layouts[slot] = alias.layout;
+                                    } else if !alias.depth
+                                        && !alias.frozen
+                                        && color_keys.contains(&alias.key)
+                                        && !alias_snapshotted.get(slot).copied().unwrap_or(false)
+                                    {
+                                        bound_tex_layouts[slot] = required_rt_layout;
+                                    }
+                                    rp_tex_alias_hits += 1;
+                                    rp_rt_snapshot_alias_hits += rt_snapshot as usize;
+                                    record_rt_alias_bind(rt_snapshot);
+                                    rp_tex_view += rp_view_t0.elapsed();
                                     continue;
+                                }
+                            }
+                            if let Some((texture_key, tic, _, _)) = *pending {
+                                if rt_alias_reinterpret_supported(
+                                    texture_key,
+                                    tic,
+                                    alias,
+                                    view_format,
+                                ) {
+                                    let source_is_snapshot =
+                                        alias_snapshotted.get(slot).copied().unwrap_or(false);
+                                    if pass_open
+                                        && !source_is_snapshot
+                                        && !alias.frozen
+                                        && color_keys.contains(&alias.key)
+                                    {
+                                        unsafe {
+                                            device.cmd_end_rendering(cmd);
+                                        }
+                                        finish_color_pass(
+                                            device,
+                                            cmd,
+                                            rt_cache,
+                                            &color_bind,
+                                            &mut color_layouts,
+                                            pass_rt_layout,
+                                            &mut pass_dirty,
+                                            &pass_trace_calls,
+                                        );
+                                        pass_open = false;
+                                        pass_trace_calls.clear();
+                                        color_sync_checked.clear();
+                                    }
+                                    if let Some((reinterpret_view, reinterpret_copy)) =
+                                        prepare_rt_alias_reinterpret(
+                                            device,
+                                            mem_props,
+                                            rt_cache,
+                                            rt_reinterpret_cache,
+                                            texture_key,
+                                            tic,
+                                            alias,
+                                            view_format,
+                                            source_is_snapshot,
+                                        )?
+                                    {
+                                        if reinterpret_copy.is_some() && pass_open {
+                                            unsafe {
+                                                device.cmd_end_rendering(cmd);
+                                            }
+                                            finish_color_pass(
+                                                device,
+                                                cmd,
+                                                rt_cache,
+                                                &color_bind,
+                                                &mut color_layouts,
+                                                pass_rt_layout,
+                                                &mut pass_dirty,
+                                                &pass_trace_calls,
+                                            );
+                                            pass_open = false;
+                                            pass_trace_calls.clear();
+                                            color_sync_checked.clear();
+                                        }
+                                        if let Some(reinterpret_copy) = reinterpret_copy {
+                                            record_rt_alias_reinterpret(
+                                                device,
+                                                cmd,
+                                                mem_props,
+                                                rt_cache,
+                                                &mut frame_slots[cur_idx],
+                                                rt_reinterpret_cache,
+                                                reinterpret_copy,
+                                            )?;
+                                        }
+                                        bound_tex_views[slot] = reinterpret_view;
+                                        trace_graphics_texture_binding!(
+                                            call,
+                                            slot,
+                                            *pending,
+                                            Some(GraphicsTextureTraceResource::rt_alias(alias)),
+                                            texture_numeric_type_for_slot(
+                                                &call.texture_numeric_manifest,
+                                                slot,
+                                            ),
+                                            GraphicsTextureBindOutcome::RtAlias,
+                                            format!(
+                                                "rt-reinterpret:{}:{}",
+                                                alias.key.label(),
+                                                if source_is_snapshot {
+                                                    "snapshot"
+                                                } else {
+                                                    "live"
+                                                }
+                                            ),
+                                            format!("{:?}", bound_tex_views[slot]),
+                                            Some(format!("{view_format:?}")),
+                                            None,
+                                        );
+                                        trace_vs_tex_bind_alias(
+                                            device,
+                                            *cmd_pool,
+                                            *queue,
+                                            rt_cache,
+                                            mem_props,
+                                            call,
+                                            slot,
+                                            alias,
+                                            view_format,
+                                            bound_tex_views[slot],
+                                        );
+                                        rp_tex_alias_hits += 1;
+                                        rp_rt_snapshot_alias_hits += rt_snapshot as usize;
+                                        record_rt_alias_bind(rt_snapshot);
+                                        rp_tex_view += rp_view_t0.elapsed();
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                let Some((key, tic, pitch_size, read_size)) = *pending else {
-                    trace_graphics_texture_binding!(
-                        call,
-                        slot,
-                        None,
-                        None,
-                        texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
-                        GraphicsTextureBindOutcome::Dummy,
-                        "dummy-descriptor",
-                        format!("{:?}", bound_tex_views[slot]),
-                        None,
-                        Some(
-                            call.fs_tex_ids
-                                .get(slot)
-                                .map(|tex_id| vs_tex_dummy_reason(call, *tex_id, &read_guest))
-                                .unwrap_or_else(|| "tex-slot-out-of-range".to_string()),
-                        ),
-                    );
-                    trace_vs_tex_bind_dummy(call, slot, &read_guest);
-                    continue;
-                };
-                let cur_gen = texture_generation(tic.gpu_va, read_size);
-                let numeric_type =
-                    texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot);
-                let numeric_family = texture_numeric_index(numeric_type);
-                let mut binding_failure_reason = None;
-                let identity_volume =
-                    key.volume && std::env::var_os("NEXIUM_VOLUME_IDENTITY").is_some();
-                let volume_slices = if key.volume
-                    && !identity_volume
-                    && numeric_type == nexium_spirv::TextureNumericType::Float
-                {
-                    let sampled_key = sampled_rt_key_for_slot(call, slot);
-                    find_volume_rt_slices(rt_cache, &tic, pitch_size, key.layers, sampled_key)
-                } else {
-                    None
-                };
-                if let Some(slices) = volume_slices.as_ref() {
-                    trace_volume_rt_pixels(
-                        device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
-                    );
-                }
-                let force_refresh_early = force_refresh_texture(tic.gpu_va);
-                let cache_fresh = tex_gen_gating_enabled()
-                    && !force_refresh_early
-                    && volume_slices.is_none()
-                    && !identity_volume
-                    && tex_cache.get(&key).map_or(false, |t| t.gen == cur_gen);
-                let mut refresh_verified = false;
-                let sampled_fresh =
-                    !cache_fresh
+                    rp_tex_view += rp_view_t0.elapsed();
+                    let rp_gen_t0 = std::time::Instant::now();
+                    let Some((key, tic, pitch_size, read_size)) = *pending else {
+                        trace_graphics_texture_binding!(
+                            call,
+                            slot,
+                            None,
+                            None,
+                            texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
+                            GraphicsTextureBindOutcome::Dummy,
+                            "dummy-descriptor",
+                            format!("{:?}", bound_tex_views[slot]),
+                            None,
+                            Some(
+                                call.fs_tex_ids
+                                    .get(slot)
+                                    .map(|tex_id| vs_tex_dummy_reason(call, *tex_id, &read_guest))
+                                    .unwrap_or_else(|| "tex-slot-out-of-range".to_string()),
+                            ),
+                        );
+                        trace_vs_tex_bind_dummy(call, slot, &read_guest);
+                        rp_tex_gen += rp_gen_t0.elapsed();
+                        continue;
+                    };
+                    rp_tex_generic_slots += 1;
+                    let cur_gen = texture_generation(tic.gpu_va, read_size);
+                    let numeric_type =
+                        texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot);
+                    let numeric_family = texture_numeric_index(numeric_type);
+                    let mut binding_failure_reason = None;
+                    let identity_volume = key.volume && volume_identity_enabled();
+                    let volume_slices = if key.volume
+                        && !identity_volume
+                        && numeric_type == nexium_spirv::TextureNumericType::Float
+                    {
+                        let sampled_key = sampled_rt_key_for_slot(call, slot);
+                        let cache_key = (key, pitch_size, sampled_key);
+                        if let Some(slices) = volume_slice_cache.get(&cache_key) {
+                            let mut slices = slices.clone();
+                            for slice in &mut slices {
+                                if let Some(layout) = rt_cache.color_layout(slice.key) {
+                                    slice.layout = layout;
+                                }
+                            }
+                            Some(slices)
+                        } else {
+                            let slices = find_volume_rt_slices(
+                                rt_cache,
+                                &tic,
+                                pitch_size,
+                                key.layers,
+                                sampled_key,
+                            );
+                            if let Some(slices) = slices.as_ref().filter(|slices| {
+                                volume_rt_slices_disjoint_from_attachments(
+                                    slices,
+                                    &color_keys,
+                                    depth_key,
+                                )
+                            }) {
+                                volume_slice_cache.insert(cache_key, slices.clone());
+                            }
+                            slices
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(slices) = volume_slices.as_ref() {
+                        trace_volume_rt_pixels(
+                            device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
+                        );
+                    }
+                    let force_refresh_early = force_refresh_texture(tic.gpu_va);
+                    let cache_fresh = tex_gen_gating_enabled()
+                        && !force_refresh_early
+                        && volume_slices.is_none()
+                        && !identity_volume
+                        && tex_cache.get(&key).map_or(false, |t| t.gen == cur_gen);
+                    let mut refresh_verified = false;
+                    let sampled_fresh = !cache_fresh
                         && !force_refresh_early
                         && volume_slices.is_none()
                         && !identity_volume
@@ -7364,184 +9384,192 @@ impl Renderer {
                                 }
                             }
                         });
-                if refresh_verified {
-                    if let Some(t) = tex_cache.get_mut(&key) {
-                        t.verified = std::time::Instant::now();
-                    }
-                }
-                let (raw, raw_hash): (Option<&[u8]>, Option<u64>) = if cache_fresh || sampled_fresh
-                {
-                    texstat_event(0, 0);
-                    (None, None)
-                } else {
-                    let fresh_read = !tex_raw_cache.contains_key(&(tic.gpu_va, read_size));
-                    let raw_entry = match tex_raw_cache.entry((tic.gpu_va, read_size)) {
-                        Entry::Occupied(entry) => entry.into_mut(),
-                        Entry::Vacant(entry) => {
-                            entry.insert(read_guest(tic.gpu_va, read_size).map(|raw| {
-                                let tex_hash = hash_sampled(&raw);
-                                (tex_hash, raw)
-                            }))
+                    if refresh_verified {
+                        if let Some(t) = tex_cache.get_mut(&key) {
+                            t.verified = std::time::Instant::now();
                         }
-                    };
-                    if fresh_read {
-                        texstat_event(1, raw_entry.as_ref().map_or(0, |(_, r)| r.len()));
                     }
-                    (
-                        raw_entry.as_ref().map(|(_, raw)| raw.as_slice()),
-                        raw_entry.as_ref().map(|(tex_hash, _)| *tex_hash),
-                    )
-                };
-                if raw.is_some() || volume_slices.is_some() || identity_volume {
-                    let mut tex_hash = raw_hash.unwrap_or_else(|| texture_seed_hash(&key));
-                    if let Some(slices) = volume_slices.as_ref() {
-                        tex_hash = volume_rt_slice_hash(tex_hash, slices);
-                    }
-                    let force_refresh = force_refresh_texture(tic.gpu_va);
-                    let need_upload = force_refresh
-                        || match tex_cache.get(&key) {
-                            Some(t) => {
-                                if key.volume && volume_slices.is_none() {
-                                    raw_hash.map_or(false, |raw_hash| {
-                                        if t.hash != raw_hash {
-                                            t.gen != cur_gen
-                                        } else {
-                                            t.gen != cur_gen || t.hash != tex_hash
-                                        }
-                                    })
-                                } else {
-                                    t.gen != cur_gen || t.hash != tex_hash
+                    let (raw, raw_hash): (Option<&[u8]>, Option<u64>) =
+                        if cache_fresh || sampled_fresh {
+                            texstat_event(0, 0);
+                            (None, None)
+                        } else {
+                            let fresh_read = !tex_raw_cache.contains_key(&(tic.gpu_va, read_size));
+                            let raw_entry = match tex_raw_cache.entry((tic.gpu_va, read_size)) {
+                                Entry::Occupied(entry) => entry.into_mut(),
+                                Entry::Vacant(entry) => {
+                                    entry.insert(read_guest(tic.gpu_va, read_size).map(|raw| {
+                                        let tex_hash = hash_sampled(&raw);
+                                        (tex_hash, raw)
+                                    }))
                                 }
+                            };
+                            if fresh_read {
+                                texstat_event(1, raw_entry.as_ref().map_or(0, |(_, r)| r.len()));
                             }
-                            None => true,
+                            (
+                                raw_entry.as_ref().map(|(_, raw)| raw.as_slice()),
+                                raw_entry.as_ref().map(|(tex_hash, _)| *tex_hash),
+                            )
                         };
-                    if need_upload {
-                        if tic.is_srgb && std::env::var_os("NEXIUM_TIC_SRGB_LOG").is_some() {
-                            log::warn!(
-                                "[tic-srgb] batch {}x{} fmt={:?} bl={} va={:#x}",
-                                tic.width,
-                                tic.height,
-                                tic.format,
-                                tic.is_block_linear,
-                                tic.gpu_va
-                            );
+                    rp_tex_raw_slots += raw.is_some() as usize;
+                    rp_tex_gen += rp_gen_t0.elapsed();
+                    let rp_upload_t0 = std::time::Instant::now();
+                    if raw.is_some() || volume_slices.is_some() || identity_volume {
+                        let mut tex_hash = raw_hash.unwrap_or_else(|| texture_seed_hash(&key));
+                        if let Some(slices) = volume_slices.as_ref() {
+                            tex_hash = volume_rt_slice_hash(tex_hash, slices);
                         }
-                        let force_pitch = std::env::var_os("NEXIUM_FORCE_PITCH")
-                            .map(|v| v == "1")
-                            .unwrap_or(false);
-                        let image_format = if identity_volume {
-                            Ok(texture_image_format(
-                                crate::texture::TicFormat::R8G8B8A8,
-                                false,
-                                false,
-                                numeric_type,
-                            ))
-                        } else if let Some(slice) =
-                            volume_slices.as_ref().and_then(|slices| slices.first())
-                        {
-                            Ok(slice.format)
-                        } else {
-                            texture_image_format_for_tic(&tic, numeric_type)
-                        };
-                        let image_format = match image_format {
-                            Ok(format) => format,
-                            Err(error) => {
-                                log_graphics_texture_rejection(
-                                    call,
-                                    slot,
-                                    *pending,
-                                    numeric_type,
-                                    "format",
-                                    &error,
-                                );
-                                continue;
-                            }
-                        };
-                        let upload = if volume_slices.is_some() {
-                            Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
-                        } else if identity_volume {
-                            Ok(TextureUploadData::base(
-                                identity_volume_rgba8(key.width, key.height, key.layers),
-                                key.width,
-                                key.height,
-                            ))
-                        } else if let Some(raw) = raw {
-                            texture_upload_data(
-                                raw,
-                                &tic,
-                                key.layers,
-                                pitch_size,
-                                force_pitch,
-                                image_format,
-                            )
-                        } else {
-                            Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
-                        };
-                        let upload = match upload {
-                            Ok(upload) => upload,
-                            Err(error) => {
-                                log_graphics_texture_rejection(
-                                    call,
-                                    slot,
-                                    *pending,
-                                    numeric_type,
-                                    "decode",
-                                    &error,
-                                );
-                                continue;
-                            }
-                        };
-                        let texels = &upload.bytes;
-                        texstat_event(2, texels.len());
-                        let dump_stats = std::env::var_os("NEXIUM_TEXDUMP")
-                            .map(|v| v == "1")
-                            .unwrap_or(false);
-                        let dump_img = std::env::var_os("NEXIUM_TEXDUMP_IMG")
-                            .map(|v| v == "1")
-                            .unwrap_or(false);
-                        let dump_rgba8 = if dump_stats || dump_img {
-                            Some(
-                                if image_format == vk::Format::R8G8B8A8_UNORM
-                                    && volume_slices.is_none()
-                                {
-                                    upload.bytes.clone()
-                                } else if identity_volume {
-                                    identity_volume_rgba8(key.width, key.height, key.layers)
-                                } else if let Some(raw) = raw {
-                                    decode_texture_rgba8_layers(
-                                        raw,
-                                        &tic,
-                                        key.layers,
-                                        pitch_size,
-                                        force_pitch,
-                                    )
-                                } else {
-                                    Vec::new()
-                                },
-                            )
-                        } else {
-                            None
-                        };
-                        if dump_stats {
-                            use std::sync::{Mutex, OnceLock};
-                            static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> =
-                                OnceLock::new();
-                            let s =
-                                SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-                            if s.lock().unwrap().insert(tic.gpu_va) {
-                                let rgba8 = dump_rgba8.as_deref().unwrap_or(&[]);
-                                let (mut sr, mut sg, mut sb, mut sa) = (0u64, 0u64, 0u64, 0u64);
-                                let (mut amin, mut amax) = (255u8, 0u8);
-                                for c in rgba8.chunks_exact(4) {
-                                    sr += c[0] as u64;
-                                    sg += c[1] as u64;
-                                    sb += c[2] as u64;
-                                    sa += c[3] as u64;
-                                    amin = amin.min(c[3]);
-                                    amax = amax.max(c[3]);
+                        let force_refresh = force_refresh_texture(tic.gpu_va);
+                        let content_hash_authoritative =
+                            raw_hash.is_some() && volume_slices.is_none() && !identity_volume;
+                        let need_upload = force_refresh
+                            || match tex_cache.get(&key) {
+                                Some(t) => {
+                                    if key.volume && volume_slices.is_none() {
+                                        raw_hash.map_or(false, |raw_hash| {
+                                            if t.hash != raw_hash {
+                                                t.gen != cur_gen
+                                            } else {
+                                                t.gen != cur_gen || t.hash != tex_hash
+                                            }
+                                        })
+                                    } else if content_hash_authoritative {
+                                        t.hash != tex_hash
+                                    } else {
+                                        t.gen != cur_gen || t.hash != tex_hash
+                                    }
                                 }
-                                let n = (rgba8.len() / 4).max(1) as u64;
+                                None => true,
+                            };
+                        if !need_upload && content_hash_authoritative {
+                            if let Some(t) = tex_cache.get_mut(&key) {
+                                t.gen = cur_gen;
+                                t.verified = std::time::Instant::now();
+                            }
+                        }
+                        if need_upload {
+                            rp_tex_uploads += 1;
+                            if tic.is_srgb && tic_srgb_log_enabled() {
                                 log::warn!(
+                                    "[tic-srgb] batch {}x{} fmt={:?} bl={} va={:#x}",
+                                    tic.width,
+                                    tic.height,
+                                    tic.format,
+                                    tic.is_block_linear,
+                                    tic.gpu_va
+                                );
+                            }
+                            let force_pitch = force_pitch_enabled();
+                            let image_format = if identity_volume {
+                                Ok(texture_image_format(
+                                    crate::texture::TicFormat::R8G8B8A8,
+                                    false,
+                                    false,
+                                    numeric_type,
+                                ))
+                            } else if let Some(slice) =
+                                volume_slices.as_ref().and_then(|slices| slices.first())
+                            {
+                                Ok(slice.format)
+                            } else {
+                                texture_image_format_for_tic(&tic, numeric_type)
+                            };
+                            let image_format = match image_format {
+                                Ok(format) => format,
+                                Err(error) => {
+                                    log_graphics_texture_rejection(
+                                        call,
+                                        slot,
+                                        *pending,
+                                        numeric_type,
+                                        "format",
+                                        &error,
+                                    );
+                                    continue;
+                                }
+                            };
+                            let upload = if volume_slices.is_some() {
+                                Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
+                            } else if identity_volume {
+                                Ok(TextureUploadData::base(
+                                    identity_volume_rgba8(key.width, key.height, key.layers),
+                                    key.width,
+                                    key.height,
+                                ))
+                            } else if let Some(raw) = raw {
+                                texture_upload_data(
+                                    raw,
+                                    &tic,
+                                    key.layers,
+                                    pitch_size,
+                                    force_pitch,
+                                    image_format,
+                                )
+                            } else {
+                                Ok(TextureUploadData::base(Vec::new(), key.width, key.height))
+                            };
+                            let upload = match upload {
+                                Ok(upload) => upload,
+                                Err(error) => {
+                                    log_graphics_texture_rejection(
+                                        call,
+                                        slot,
+                                        *pending,
+                                        numeric_type,
+                                        "decode",
+                                        &error,
+                                    );
+                                    continue;
+                                }
+                            };
+                            let texels = &upload.bytes;
+                            texstat_event(2, texels.len());
+                            let dump_stats = texdump_stats_enabled();
+                            let dump_img = texdump_image_enabled();
+                            let dump_rgba8 = if dump_stats || dump_img {
+                                Some(
+                                    if image_format == vk::Format::R8G8B8A8_UNORM
+                                        && volume_slices.is_none()
+                                    {
+                                        upload.bytes.clone()
+                                    } else if identity_volume {
+                                        identity_volume_rgba8(key.width, key.height, key.layers)
+                                    } else if let Some(raw) = raw {
+                                        decode_texture_rgba8_layers(
+                                            raw,
+                                            &tic,
+                                            key.layers,
+                                            pitch_size,
+                                            force_pitch,
+                                        )
+                                    } else {
+                                        Vec::new()
+                                    },
+                                )
+                            } else {
+                                None
+                            };
+                            if dump_stats {
+                                use std::sync::{Mutex, OnceLock};
+                                static SEEN: OnceLock<Mutex<std::collections::HashSet<u64>>> =
+                                    OnceLock::new();
+                                let s = SEEN
+                                    .get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+                                if s.lock().unwrap().insert(tic.gpu_va) {
+                                    let rgba8 = dump_rgba8.as_deref().unwrap_or(&[]);
+                                    let (mut sr, mut sg, mut sb, mut sa) = (0u64, 0u64, 0u64, 0u64);
+                                    let (mut amin, mut amax) = (255u8, 0u8);
+                                    for c in rgba8.chunks_exact(4) {
+                                        sr += c[0] as u64;
+                                        sg += c[1] as u64;
+                                        sb += c[2] as u64;
+                                        sa += c[3] as u64;
+                                        amin = amin.min(c[3]);
+                                        amax = amax.max(c[3]);
+                                    }
+                                    let n = (rgba8.len() / 4).max(1) as u64;
+                                    log::warn!(
                                     "TEXDUMP va={:#x} {}x{} fmt={:?} bl={} bh_log2={} read_size={} pitch_size={} pitchdst={} avg=({},{},{},{}) a=[{}..{}] raw16={:02x?}",
                                     tic.gpu_va, tic.width, tic.height, tic.format,
                                     tic.is_block_linear, tic.block_height_log2, read_size, pitch_size,
@@ -7549,180 +9577,169 @@ impl Renderer {
                                     sr / n, sg / n, sb / n, sa / n, amin, amax,
                                     raw.map(|raw| &raw[..16.min(raw.len())]).unwrap_or(&[]),
                                 );
-                            }
-                        }
-                        if dump_img {
-                            dump_texture_bmp_once(
-                                tic.gpu_va,
-                                tic.width,
-                                tic.height,
-                                key.layers,
-                                dump_rgba8.as_deref().unwrap_or(&[]),
-                                tic.swizzle,
-                            );
-                        }
-                        if pass_open {
-                            unsafe {
-                                device.cmd_end_rendering(cmd);
-                            }
-                            finish_color_pass(
-                                device,
-                                cmd,
-                                rt_cache,
-                                &color_bind,
-                                &mut color_layouts,
-                                pass_rt_layout,
-                                &mut pass_dirty,
-                                &pass_trace_calls,
-                            );
-                            pass_open = false;
-                            pass_trace_calls.clear();
-                        }
-                        match create_texture_image(
-                            device,
-                            cmd,
-                            mem_props,
-                            key.width,
-                            key.height,
-                            key.layers,
-                            key.base_layer,
-                            key.view_layers,
-                            key.arrayed,
-                            key.cube,
-                            key.cube_array,
-                            key.volume,
-                            key.mip_levels,
-                            key.base_mip,
-                            key.view_mips,
-                            texels,
-                            &upload.copies,
-                            volume_slices.as_deref(),
-                            texture_view_swizzle(tic.format, numeric_type, tic.swizzle),
-                            image_format,
-                            tex_hash,
-                            cur_gen,
-                        ) {
-                            Ok((tex, stage)) => {
-                                if let Some(old) = tex_cache.insert(key, tex) {
-                                    frame_slots[cur_idx].retired_textures.push(old);
-                                }
-                                if let Some((sbuf, smem)) = stage {
-                                    frame_slots[cur_idx].retired_buffers.push((sbuf, smem));
                                 }
                             }
-                            Err(error) => {
-                                if !bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
-                                    log::warn!("texture upload failed: {}", error);
+                            if dump_img {
+                                dump_texture_bmp_once(
+                                    tic.gpu_va,
+                                    tic.width,
+                                    tic.height,
+                                    key.layers,
+                                    dump_rgba8.as_deref().unwrap_or(&[]),
+                                    tic.swizzle,
+                                );
+                            }
+                            if pass_open {
+                                unsafe {
+                                    device.cmd_end_rendering(cmd);
                                 }
-                                binding_failure_reason = Some(error);
+                                finish_color_pass(
+                                    device,
+                                    cmd,
+                                    rt_cache,
+                                    &color_bind,
+                                    &mut color_layouts,
+                                    pass_rt_layout,
+                                    &mut pass_dirty,
+                                    &pass_trace_calls,
+                                );
+                                pass_open = false;
+                                pass_trace_calls.clear();
+                                color_sync_checked.clear();
+                            }
+                            let mut updated_in_place = false;
+                            if texture_update_in_place_enabled() && volume_slices.is_none() {
+                                let existing = tex_cache
+                                    .get(&key)
+                                    .map(|texture| (texture.image, texture.layout));
+                                if let Some((image, old_layout)) = existing {
+                                    match update_texture_image(
+                                        device,
+                                        cmd,
+                                        mem_props,
+                                        image,
+                                        old_layout,
+                                        key.layers,
+                                        key.volume,
+                                        key.mip_levels,
+                                        texels,
+                                        &upload.copies,
+                                        &mut frame_slots[cur_idx],
+                                    ) {
+                                        Ok(stage) => {
+                                            if let Some(stage) = stage {
+                                                frame_slots[cur_idx].upload_buffers.push(stage);
+                                            }
+                                            if let Some(texture) = tex_cache.get_mut(&key) {
+                                                texture.layout =
+                                                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                                                texture.hash = tex_hash;
+                                                texture.gen = cur_gen;
+                                                texture.verified = std::time::Instant::now();
+                                            }
+                                            updated_in_place = true;
+                                        }
+                                        Err(error) => {
+                                            log::debug!(
+                                                "in-place texture update fell back to replacement: {}",
+                                                error
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if !updated_in_place {
+                                match create_texture_image(
+                                    device,
+                                    cmd,
+                                    mem_props,
+                                    key.width,
+                                    key.height,
+                                    key.layers,
+                                    key.base_layer,
+                                    key.view_layers,
+                                    key.arrayed,
+                                    key.cube,
+                                    key.cube_array,
+                                    key.volume,
+                                    key.mip_levels,
+                                    key.base_mip,
+                                    key.view_mips,
+                                    texels,
+                                    &upload.copies,
+                                    volume_slices.as_deref(),
+                                    texture_view_swizzle(tic.format, numeric_type, tic.swizzle),
+                                    image_format,
+                                    tex_hash,
+                                    cur_gen,
+                                    Some(&mut frame_slots[cur_idx]),
+                                ) {
+                                    Ok((tex, stage)) => {
+                                        if let Some(old) = tex_cache.insert(key, tex) {
+                                            frame_slots[cur_idx].retired_textures.push(old);
+                                        } else {
+                                            retain_tex_cache_va(tex_cache_vas, key.gpu_va);
+                                        }
+                                        if let Some(stage) = stage {
+                                            frame_slots[cur_idx].upload_buffers.push(stage);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        if !bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
+                                            log::warn!("texture upload failed: {}", error);
+                                        }
+                                        binding_failure_reason = Some(error);
+                                    }
+                                }
+                            }
+                        } else if raw_hash.is_some() {
+                            if let Some(t) = tex_cache.get_mut(&key) {
+                                t.verified = std::time::Instant::now();
                             }
                         }
-                    } else if raw_hash.is_some() {
-                        if let Some(t) = tex_cache.get_mut(&key) {
-                            t.verified = std::time::Instant::now();
-                        }
                     }
-                }
-                if key.cube_array {
-                    bound_tex_views_cube_array[slot] = tex_cache
-                        .get(&key)
-                        .map(|t| t.view)
-                        .unwrap_or(dummy_views_cube_array[slot][numeric_family]);
-                } else if key.cube {
-                    bound_tex_views_cube[slot] = tex_cache
-                        .get(&key)
-                        .map(|t| t.view)
-                        .unwrap_or(dummy_views_cube[slot][numeric_family]);
-                } else if key.volume {
-                    bound_tex_views_3d[slot] = tex_cache
-                        .get(&key)
-                        .map(|t| t.view)
-                        .unwrap_or(dummy_views_3d[slot][numeric_family]);
-                } else {
-                    let fallback_view = dummy_views_2d[slot][numeric_family];
-                    bound_tex_views[slot] =
-                        tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
-                }
-                if slot < post_submit_texture_probe.len()
-                    && !key.volume
-                    && !key.cube
-                    && !key.cube_array
-                    && post_submit_texture_probe_enabled(call.fs_gpu_va)
-                    && post_submit_texture_probe[slot].is_none()
-                {
-                    if let Some(texture) = tex_cache.get(&key) {
-                        post_submit_texture_probe[slot] = Some(PostSubmitTextureProbe {
-                            source: "TEX",
-                            key: RtKey::new(0, key.width, key.height, key.gpu_va),
-                            image: texture.image,
-                            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            format: texture_image_format_for_tic(&tic, numeric_type)
-                                .unwrap_or(vk::Format::UNDEFINED),
-                        });
-                    }
-                }
-                let cache_hit = tex_cache.get(&key).is_some();
-                let selected_view = if key.cube_array {
-                    bound_tex_views_cube_array[slot]
-                } else if key.cube {
-                    bound_tex_views_cube[slot]
-                } else if key.volume {
-                    bound_tex_views_3d[slot]
-                } else {
-                    bound_tex_views[slot]
-                };
-                let source = if key.cube_array {
-                    "texture-cube-array"
-                } else if key.cube {
-                    "texture-cube"
-                } else if key.volume {
-                    "texture-3d"
-                } else if key.arrayed {
-                    "texture-2d-array"
-                } else {
-                    "texture-2d"
-                };
-                let (outcome, reason) = if cache_hit {
-                    (GraphicsTextureBindOutcome::Success, None)
-                } else if let Some(reason) = binding_failure_reason {
-                    (GraphicsTextureBindOutcome::Rejection, Some(reason))
-                } else {
-                    (
-                        GraphicsTextureBindOutcome::Dummy,
-                        Some("resource data unavailable and no cached view".to_string()),
-                    )
-                };
-                trace_graphics_texture_binding!(
-                    call,
-                    slot,
-                    *pending,
-                    None,
-                    numeric_type,
-                    outcome,
-                    source,
-                    format!("{selected_view:?}"),
-                    texture_image_format_for_tic(&tic, numeric_type)
-                        .ok()
-                        .map(|format| format!("{format:?}")),
-                    reason,
-                );
-                if bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
-                    if key.volume {
-                        if let Some(t) = tex_cache.get(&key) {
-                            verify_volume_image(
-                                device, *cmd_pool, *queue, mem_props, t.image, key.width,
-                                key.height, key.layers, tic.gpu_va,
-                            );
-                        }
-                    }
-                }
-                trace_vs_tex_bind_texture(
-                    call,
-                    slot,
-                    key,
-                    tic,
-                    tex_cache.get(&key).is_some(),
+                    rp_tex_upload += rp_upload_t0.elapsed();
+                    let rp_finish_t0 = std::time::Instant::now();
                     if key.cube_array {
+                        bound_tex_views_cube_array[slot] = tex_cache
+                            .get(&key)
+                            .map(|t| t.view)
+                            .unwrap_or(dummy_views_cube_array[slot][numeric_family]);
+                    } else if key.cube {
+                        bound_tex_views_cube[slot] = tex_cache
+                            .get(&key)
+                            .map(|t| t.view)
+                            .unwrap_or(dummy_views_cube[slot][numeric_family]);
+                    } else if key.volume {
+                        bound_tex_views_3d[slot] = tex_cache
+                            .get(&key)
+                            .map(|t| t.view)
+                            .unwrap_or(dummy_views_3d[slot][numeric_family]);
+                    } else {
+                        let fallback_view = dummy_views_2d[slot][numeric_family];
+                        bound_tex_views[slot] =
+                            tex_cache.get(&key).map(|t| t.view).unwrap_or(fallback_view);
+                    }
+                    if slot < post_submit_texture_probe.len()
+                        && !key.volume
+                        && !key.cube
+                        && !key.cube_array
+                        && post_submit_texture_probe_enabled(call.fs_gpu_va)
+                        && post_submit_texture_probe[slot].is_none()
+                    {
+                        if let Some(texture) = tex_cache.get(&key) {
+                            post_submit_texture_probe[slot] = Some(PostSubmitTextureProbe {
+                                source: "TEX",
+                                key: RtKey::new(0, key.width, key.height, key.gpu_va),
+                                image: texture.image,
+                                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                format: texture_image_format_for_tic(&tic, numeric_type)
+                                    .unwrap_or(vk::Format::UNDEFINED),
+                            });
+                        }
+                    }
+                    let cache_hit = tex_cache.get(&key).is_some();
+                    let selected_view = if key.cube_array {
                         bound_tex_views_cube_array[slot]
                     } else if key.cube {
                         bound_tex_views_cube[slot]
@@ -7730,296 +9747,371 @@ impl Renderer {
                         bound_tex_views_3d[slot]
                     } else {
                         bound_tex_views[slot]
-                    },
-                );
-            }
+                    };
+                    let source = if key.cube_array {
+                        "texture-cube-array"
+                    } else if key.cube {
+                        "texture-cube"
+                    } else if key.volume {
+                        "texture-3d"
+                    } else if key.arrayed {
+                        "texture-2d-array"
+                    } else {
+                        "texture-2d"
+                    };
+                    let (outcome, reason) = if cache_hit {
+                        (GraphicsTextureBindOutcome::Success, None)
+                    } else if let Some(reason) = binding_failure_reason {
+                        (GraphicsTextureBindOutcome::Rejection, Some(reason))
+                    } else {
+                        (
+                            GraphicsTextureBindOutcome::Dummy,
+                            Some("resource data unavailable and no cached view".to_string()),
+                        )
+                    };
+                    trace_graphics_texture_binding!(
+                        call,
+                        slot,
+                        *pending,
+                        None,
+                        numeric_type,
+                        outcome,
+                        source,
+                        format!("{selected_view:?}"),
+                        texture_image_format_for_tic(&tic, numeric_type)
+                            .ok()
+                            .map(|format| format!("{format:?}")),
+                        reason,
+                    );
+                    if bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
+                        if key.volume {
+                            if let Some(t) = tex_cache.get(&key) {
+                                verify_volume_image(
+                                    device, *cmd_pool, *queue, mem_props, t.image, key.width,
+                                    key.height, key.layers, tic.gpu_va,
+                                );
+                            }
+                        }
+                    }
+                    trace_vs_tex_bind_texture(
+                        call,
+                        slot,
+                        key,
+                        tic,
+                        tex_cache.get(&key).is_some(),
+                        if key.cube_array {
+                            bound_tex_views_cube_array[slot]
+                        } else if key.cube {
+                            bound_tex_views_cube[slot]
+                        } else if key.volume {
+                            bound_tex_views_3d[slot]
+                        } else {
+                            bound_tex_views[slot]
+                        },
+                    );
+                    rp_tex_finish += rp_finish_t0.elapsed();
+                }
 
-            rp_tex += rp_tx0.elapsed();
-            let rp_vx0 = std::time::Instant::now();
-            let vertex_binds = upload_vertex_bindings(
-                device,
-                frame_slots,
-                other_idx,
-                descriptor_pool.pool,
-                ubo_ring,
-                &prep.vertex_bindings,
-                false,
-            )?;
-            rp_vtx += rp_vx0.elapsed();
+                rp_tex += rp_tx0.elapsed();
+                let rp_vx0 = std::time::Instant::now();
+                let mut vertex_binds = upload_vertex_bindings(
+                    device,
+                    frame_slots,
+                    other_idx,
+                    descriptor_pool.pool,
+                    ubo_ring,
+                    &prep.vertex_bindings,
+                    false,
+                    fermi_exact_rt_snapshot_leases,
+                    fermi_exact_rt_snapshot_ids,
+                )?;
+                if !call.resident_vertex.is_empty() {
+                    let mut fallback_bindings = Vec::new();
+                    for range in &call.resident_vertex {
+                        let bound = if resident_vb_force_fallback() {
+                            None
+                        } else {
+                            resident_vb
+                                .as_mut()
+                                .and_then(|cache| cache.resolve(range, &mut resident_vb_used))
+                        };
+                        if let Some((buffer, offset)) = bound {
+                            vertex_binds.push((range.binding, buffer, offset));
+                        } else if let Some(binding) = assemble_resident_binding(range) {
+                            fallback_bindings.push(binding);
+                        }
+                    }
+                    if !fallback_bindings.is_empty() {
+                        vertex_binds.extend(upload_vertex_bindings(
+                            device,
+                            frame_slots,
+                            other_idx,
+                            descriptor_pool.pool,
+                            ubo_ring,
+                            &fallback_bindings,
+                            false,
+                            fermi_exact_rt_snapshot_leases,
+                            fermi_exact_rt_snapshot_ids,
+                        )?);
+                    }
+                }
+                rp_vtx += rp_vx0.elapsed();
 
-            let white_bind: Option<(u32, vk::Buffer, u64)> =
-                if let Some(wb) = call.vertex_layout.bindings.iter().find(|b| b.stride == 0) {
-                    if !ring_allocation_fits(ubo_ring, 16, 16) {
-                        return Err(
+                let white_bind: Option<(u32, vk::Buffer, u64)> =
+                    if let Some(wb) = call.vertex_layout.bindings.iter().find(|b| b.stride == 0) {
+                        if !ring_allocation_fits(ubo_ring, 16, 16) {
+                            return Err(
                         "batched graphics ring preflight underestimated constant-attribute upload"
                             .to_string(),
                     );
+                        }
+                        let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 16, 16)
+                            .map_err(|e| format!("ring_alloc(white): {}", e))?;
+                        unsafe {
+                            let default = [0.0f32, 0.0, 0.0, 1.0];
+                            std::ptr::copy_nonoverlapping(default.as_ptr() as *const u8, wptr, 16);
+                        }
+                        Some((wb.binding, wbuf, woff))
+                    } else {
+                        None
+                    };
+
+                let index_bind: Option<(vk::Buffer, u64)> = if prep.index_count > 0
+                    && !prep.index_data.is_empty()
+                {
+                    let isz = align_up(prep.index_data.len() as u64, 4);
+                    if !ring_allocation_fits(ubo_ring, isz, 4) {
+                        return Err(format!(
+                            "batched graphics ring preflight underestimated index upload ({isz:#x} bytes)"
+                        ));
                     }
-                    let (wbuf, woff, wptr) = ring_alloc(ubo_ring, 16, 16)
-                        .map_err(|e| format!("ring_alloc(white): {}", e))?;
+                    let (ibuf, ioff, iptr) = ring_alloc(ubo_ring, isz, 4)
+                        .map_err(|e| format!("ring_alloc(index): {}", e))?;
                     unsafe {
-                        let default = [0.0f32, 0.0, 0.0, 1.0];
-                        std::ptr::copy_nonoverlapping(default.as_ptr() as *const u8, wptr, 16);
+                        std::ptr::copy_nonoverlapping(
+                            prep.index_data.as_ptr(),
+                            iptr,
+                            prep.index_data.len(),
+                        );
                     }
-                    Some((wb.binding, wbuf, woff))
+                    Some((ibuf, ioff))
                 } else {
                     None
                 };
 
-            let index_bind: Option<(vk::Buffer, u64)> = if prep.index_count > 0
-                && !prep.index_data.is_empty()
-            {
-                let isz = align_up(prep.index_data.len() as u64, 4);
-                if !ring_allocation_fits(ubo_ring, isz, 4) {
+                let (_cbuf_range, cbuf_size_aligned) = graphics_cbuf_allocation_size(
+                    prep.cbuf_len,
+                    cbuf_alignment,
+                    *max_storage_buffer_range,
+                )?;
+                if !ring_allocation_fits(ubo_ring, cbuf_size_aligned, cbuf_alignment) {
                     return Err(format!(
-                            "batched graphics ring preflight underestimated index upload ({isz:#x} bytes)"
-                        ));
-                }
-                let (ibuf, ioff, iptr) = ring_alloc(ubo_ring, isz, 4)
-                    .map_err(|e| format!("ring_alloc(index): {}", e))?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        prep.index_data.as_ptr(),
-                        iptr,
-                        prep.index_data.len(),
-                    );
-                }
-                Some((ibuf, ioff))
-            } else {
-                None
-            };
-
-            let (_cbuf_range, cbuf_size_aligned) = graphics_cbuf_allocation_size(
-                prep.cbuf_data.len(),
-                cbuf_alignment,
-                *max_storage_buffer_range,
-            )?;
-            if !ring_allocation_fits(ubo_ring, cbuf_size_aligned, cbuf_alignment) {
-                return Err(format!(
                     "batched graphics ring preflight underestimated graphics cbuf upload ({cbuf_size_aligned:#x} bytes, alignment {cbuf_alignment})"
                 ));
-            }
-            let (ubo_buffer, ubo_offset, ubo_ptr) =
-                ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
-                    .map_err(|e| format!("ring_alloc(graphics-cbuf): {}", e))?;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    prep.cbuf_data.as_ptr(),
-                    ubo_ptr,
-                    prep.cbuf_data.len(),
-                );
-            }
-
-            if bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
-                for binding in &call.texture_numeric_manifest {
-                    let slot = binding.descriptor_slot as usize;
-                    if slot < prep.tex_pendings.len() || slot >= max_texture_descriptors() {
-                        continue;
-                    }
-                    let texel_buffer = descriptor_slot_masked(call.texel_buffer_mask, slot);
-                    trace_graphics_texture_binding!(
-                        call,
-                        slot,
-                        None,
-                        None,
-                        texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
-                        GraphicsTextureBindOutcome::Dummy,
-                        if texel_buffer {
-                            "dummy-texel-buffer"
-                        } else {
-                            "dummy-descriptor"
-                        },
-                        if texel_buffer {
-                            format!("{:?}", bound_texel_views[slot])
-                        } else {
-                            format!("{:?}", bound_tex_views[slot])
-                        },
-                        None,
-                        Some("manifest slot has no resolved TIC descriptor".to_string()),
-                    );
                 }
-            }
+                let (ubo_buffer, ubo_offset, ubo_ptr) =
+                    ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
+                        .map_err(|e| format!("ring_alloc(graphics-cbuf): {}", e))?;
+                let cbuf_dst = unsafe { std::slice::from_raw_parts_mut(ubo_ptr, prep.cbuf_len) };
+                if !write_graphics_cbuf_data(prep.cbuf_data, cbuf_dst) {
+                    return Err("invalid batched graphics cbuf snapshot".to_string());
+                }
 
-            let rp_ds0 = std::time::Instant::now();
-            let set_layouts = [descriptor_layout.layout];
-            let alloc_info = vk::DescriptorSetAllocateInfo {
-                s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
-                descriptor_pool: dset_pools.current(),
-                descriptor_set_count: 1,
-                p_set_layouts: set_layouts.as_ptr(),
-                p_next: std::ptr::null(),
-                _marker: std::marker::PhantomData,
-            };
-            let mut alloc_info = alloc_info;
-            let dset = loop {
-                match unsafe { device.allocate_descriptor_sets(&alloc_info) } {
-                    Ok(dsets) => break dsets[0],
-                    Err(
-                        vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL,
-                    ) => {
-                        let pool = match dset_pools.grow() {
-                            Ok(pool) => pool,
-                            Err(error) => {
-                                unsafe {
-                                    let _ = device.end_command_buffer(cmd);
-                                }
-                                let _ = reset_command_buffer(device, cmd);
-                                return Err(error);
-                            }
-                        };
-                        alloc_info.descriptor_pool = pool;
+                if bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
+                    for binding in &call.texture_numeric_manifest {
+                        let slot = binding.descriptor_slot as usize;
+                        if slot < prep.tex_pendings.len() || slot >= max_texture_descriptors() {
+                            continue;
+                        }
+                        let texel_buffer = descriptor_slot_masked(call.texel_buffer_mask, slot);
+                        trace_graphics_texture_binding!(
+                            call,
+                            slot,
+                            None,
+                            None,
+                            texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
+                            GraphicsTextureBindOutcome::Dummy,
+                            if texel_buffer {
+                                "dummy-texel-buffer"
+                            } else {
+                                "dummy-descriptor"
+                            },
+                            if texel_buffer {
+                                format!("{:?}", bound_texel_views[slot])
+                            } else {
+                                format!("{:?}", bound_tex_views[slot])
+                            },
+                            None,
+                            Some("manifest slot has no resolved TIC descriptor".to_string()),
+                        );
                     }
-                    Err(e) => {
+                }
+
+                let rp_ds0 = std::time::Instant::now();
+                let dset = match dset_pools.allocate_set(descriptor_layout.layout) {
+                    Ok(set) => set,
+                    Err(error) => {
                         unsafe {
                             let _ = device.end_command_buffer(cmd);
                         }
                         let _ = reset_command_buffer(device, cmd);
-                        return Err(format!("allocate_descriptor_sets: {:?}", e));
+                        return Err(error);
                     }
-                }
-            };
-            let ubo_info = vk::DescriptorBufferInfo {
-                buffer: ubo_buffer,
-                offset: ubo_offset,
-                range: prep.cbuf_data.len() as u64,
-            };
-            let image_infos = typed_sampled_image_infos(
-                &bound_tex_views,
-                Some(&bound_tex_layouts),
-                &call.texture_numeric_manifest,
-                &dummy_views_2d,
-            );
-            let image_infos_3d = typed_sampled_image_infos(
-                &bound_tex_views_3d,
-                None,
-                &call.texture_numeric_manifest,
-                &dummy_views_3d,
-            );
-            let image_infos_cube = typed_sampled_image_infos(
-                &bound_tex_views_cube,
-                None,
-                &call.texture_numeric_manifest,
-                &dummy_views_cube,
-            );
-            let image_infos_cube_array = typed_sampled_image_infos(
-                &bound_tex_views_cube_array,
-                None,
-                &call.texture_numeric_manifest,
-                &dummy_views_cube_array,
-            );
-            let typed_texel_views = typed_texel_buffer_views(
-                &bound_texel_views,
-                &call.texture_numeric_manifest,
-                graphics_dummies.texel_buffer,
-            );
-            let mut bound_samplers = vec![default_samp; max_texture_descriptors()];
-            for (slot, tsc) in prep.tsc_entries.iter().enumerate() {
-                let Some(t) = *tsc else {
-                    continue;
                 };
-                let integer_sample = texture_requires_integer_sampler(
-                    texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
-                    stencil_alias_bound.get(slot).copied().unwrap_or(false),
+                let ubo_info = vk::DescriptorBufferInfo {
+                    buffer: ubo_buffer,
+                    offset: ubo_offset,
+                    range: prep.cbuf_len as u64,
+                };
+                let image_infos = typed_sampled_image_infos(
+                    &bound_tex_views,
+                    Some(&bound_tex_layouts),
+                    &call.texture_numeric_manifest,
+                    &dummy_views_2d,
                 );
-                let cache = if integer_sample {
-                    &mut *integer_sampler_cache
-                } else {
-                    &mut *sampler_cache
-                };
-                bound_samplers[slot] = match cached_sampler_for_tsc(
-                    device,
-                    cache,
-                    t,
-                    integer_sample,
-                    *sampler_filter_minmax_supported,
-                    *sampler_anisotropy_supported,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!("tsc sampler create failed: {}", e);
-                        default_samp
+                let image_infos_3d = typed_sampled_image_infos(
+                    &bound_tex_views_3d,
+                    None,
+                    &call.texture_numeric_manifest,
+                    &dummy_views_3d,
+                );
+                let image_infos_cube = typed_sampled_image_infos(
+                    &bound_tex_views_cube,
+                    None,
+                    &call.texture_numeric_manifest,
+                    &dummy_views_cube,
+                );
+                let image_infos_cube_array = typed_sampled_image_infos(
+                    &bound_tex_views_cube_array,
+                    None,
+                    &call.texture_numeric_manifest,
+                    &dummy_views_cube_array,
+                );
+                let typed_texel_views = typed_texel_buffer_views(
+                    &bound_texel_views,
+                    &call.texture_numeric_manifest,
+                    graphics_dummies.texel_buffer,
+                );
+                let texture_descriptor_bindings =
+                    graphics_texture_descriptor_binding_mask(&call.texture_numeric_manifest);
+                let mut bound_samplers = [default_samp; MAX_TEXTURE_DESCRIPTOR_COUNT];
+                for (slot, tsc) in prep.tsc_entries.iter().enumerate() {
+                    let Some(t) = *tsc else {
+                        continue;
+                    };
+                    let integer_sample = texture_requires_integer_sampler(
+                        texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot),
+                        stencil_alias_bound.get(slot).copied().unwrap_or(false),
+                    );
+                    let cache = if integer_sample {
+                        &mut *integer_sampler_cache
+                    } else {
+                        &mut *sampler_cache
+                    };
+                    bound_samplers[slot] = match cached_sampler_for_tsc(
+                        device,
+                        cache,
+                        t,
+                        integer_sample,
+                        *sampler_filter_minmax_supported,
+                        *sampler_anisotropy_supported,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("tsc sampler create failed: {}", e);
+                            default_samp
+                        }
+                    };
+                }
+                let sampler_infos: [vk::DescriptorImageInfo; MAX_TEXTURE_DESCRIPTOR_COUNT] =
+                    std::array::from_fn(|slot| vk::DescriptorImageInfo {
+                        sampler: bound_samplers[slot],
+                        image_view: vk::ImageView::null(),
+                        image_layout: vk::ImageLayout::UNDEFINED,
+                    });
+                descriptor_ssbo_infos.clear();
+                descriptor_ssbo_bindings.clear();
+                let ssbo_capacity = call
+                    .ssbo_data
+                    .len()
+                    .saturating_add(crate::descriptor::MAX_SSBO as usize);
+                descriptor_ssbo_infos.reserve(ssbo_capacity);
+                descriptor_ssbo_bindings.reserve(ssbo_capacity);
+                let ssbo_infos = &mut descriptor_ssbo_infos;
+                let ssbo_bindings = &mut descriptor_ssbo_bindings;
+                let mut ssbo_provided = [false; crate::descriptor::MAX_SSBO as usize];
+                for snapshot in &call.ssbo_data {
+                    if snapshot.binding >= crate::descriptor::MAX_SSBO {
+                        continue;
                     }
-                };
-            }
-            let sampler_infos: Vec<vk::DescriptorImageInfo> = bound_samplers
-                .iter()
-                .map(|sampler| vk::DescriptorImageInfo {
-                    sampler: *sampler,
-                    image_view: vk::ImageView::null(),
-                    image_layout: vk::ImageLayout::UNDEFINED,
-                })
-                .collect();
-            let mut ssbo_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
-            let mut ssbo_bindings: Vec<u32> = Vec::new();
-            let mut ssbo_provided = [false; crate::descriptor::MAX_SSBO as usize];
-            for snapshot in &call.ssbo_data {
-                if snapshot.binding >= crate::descriptor::MAX_SSBO {
-                    continue;
-                }
-                let idx = snapshot.binding;
-                if let Some(info) = shared_aurora_ssbo_key(snapshot).and_then(|key| {
-                    shared_ssbo_plan.draw_groups[_i]
-                        .get(&key)
-                        .and_then(|&group_index| shared_ssbo_infos.get(group_index))
-                }) {
-                    ssbo_infos.push(*info);
-                    ssbo_bindings.push(idx);
-                    ssbo_provided[idx as usize] = true;
-                    continue;
-                }
-                if snapshot.data.is_empty() {
-                    continue;
-                }
-                let sz = snapshot.logical_size as u64;
-                let sz_al = align_up(sz, 16);
-                if !ring_allocation_fits(ubo_ring, sz_al, 16) {
-                    return Err(format!(
+                    let idx = snapshot.binding;
+                    if let Some(info) = shared_aurora_ssbo_key(snapshot).and_then(|key| {
+                        shared_ssbo_plans[prepared_group_index].draw_groups[_i]
+                            .get(&key)
+                            .and_then(|&plan_group_index| {
+                                shared_ssbo_infos[prepared_group_index].get(plan_group_index)
+                            })
+                    }) {
+                        ssbo_infos.push(*info);
+                        ssbo_bindings.push(idx);
+                        ssbo_provided[idx as usize] = true;
+                        continue;
+                    }
+                    if snapshot.data.is_empty() {
+                        continue;
+                    }
+                    let sz = snapshot.logical_size as u64;
+                    let sz_al = align_up(sz, 16);
+                    if !ring_allocation_fits(ubo_ring, sz_al, 16) {
+                        return Err(format!(
                         "batched graphics ring preflight underestimated storage-buffer {} upload ({sz_al:#x} bytes)",
                         idx
                     ));
+                    }
+                    let (sbuf, soff, sptr) = ring_alloc(ubo_ring, sz_al, 16)
+                        .map_err(|e| format!("ring_alloc(ssbo): {}", e))?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            snapshot.data.as_ptr(),
+                            sptr.add(snapshot.data_offset),
+                            snapshot.data.len(),
+                        );
+                    }
+                    ssbo_infos.push(vk::DescriptorBufferInfo {
+                        buffer: sbuf,
+                        offset: soff,
+                        range: sz,
+                    });
+                    ssbo_bindings.push(idx);
+                    ssbo_provided[idx as usize] = true;
                 }
-                let (sbuf, soff, sptr) = ring_alloc(ubo_ring, sz_al, 16)
-                    .map_err(|e| format!("ring_alloc(ssbo): {}", e))?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        snapshot.data.as_ptr(),
-                        sptr.add(snapshot.data_offset),
-                        snapshot.data.len(),
-                    );
-                }
-                ssbo_infos.push(vk::DescriptorBufferInfo {
-                    buffer: sbuf,
-                    offset: soff,
-                    range: sz,
-                });
-                ssbo_bindings.push(idx);
-                ssbo_provided[idx as usize] = true;
-            }
-            if ssbo_provided.iter().any(|p| !p) {
-                if !ring_allocation_fits(ubo_ring, 16, 16) {
-                    return Err(
+                if ssbo_provided.iter().any(|p| !p) {
+                    if !ring_allocation_fits(ubo_ring, 16, 16) {
+                        return Err(
                         "batched graphics ring preflight underestimated dummy storage-buffer upload"
                             .to_string(),
                     );
-                }
-                let (dbuf, doff, dptr) = ring_alloc(ubo_ring, 16, 16)
-                    .map_err(|e| format!("ring_alloc(ssbo-dummy): {}", e))?;
-                unsafe {
-                    std::ptr::write_bytes(dptr, 0, 16);
-                }
-                for i in 0..crate::descriptor::MAX_SSBO {
-                    if !ssbo_provided[i as usize] {
-                        ssbo_infos.push(vk::DescriptorBufferInfo {
-                            buffer: dbuf,
-                            offset: doff,
-                            range: 16,
-                        });
-                        ssbo_bindings.push(i);
+                    }
+                    let (dbuf, doff, dptr) = ring_alloc(ubo_ring, 16, 16)
+                        .map_err(|e| format!("ring_alloc(ssbo-dummy): {}", e))?;
+                    unsafe {
+                        std::ptr::write_bytes(dptr, 0, 16);
+                    }
+                    for i in 0..crate::descriptor::MAX_SSBO {
+                        if !ssbo_provided[i as usize] {
+                            ssbo_infos.push(vk::DescriptorBufferInfo {
+                                buffer: dbuf,
+                                offset: doff,
+                                range: 16,
+                            });
+                            ssbo_bindings.push(i);
+                        }
                     }
                 }
-            }
-            let mut writes = vec![
-                vk::WriteDescriptorSet {
+                descriptor_writes.clear();
+                descriptor_writes.reserve(17 + ssbo_bindings.len());
+                let writes = &mut descriptor_writes;
+                writes.push(vk::WriteDescriptorSet {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                     dst_set: dset,
                     dst_binding: crate::descriptor::CBUF_BINDING,
@@ -8031,8 +10123,8 @@ impl Renderer {
                     p_texel_buffer_view: std::ptr::null(),
                     p_next: std::ptr::null(),
                     _marker: std::marker::PhantomData,
-                },
-                vk::WriteDescriptorSet {
+                });
+                writes.push(vk::WriteDescriptorSet {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                     dst_set: dset,
                     dst_binding: crate::descriptor::SAMPLER_BINDING,
@@ -8044,353 +10136,453 @@ impl Renderer {
                     p_texel_buffer_view: std::ptr::null(),
                     p_next: std::ptr::null(),
                     _marker: std::marker::PhantomData,
-                },
-            ];
-            for (i, binding) in ssbo_bindings.iter().enumerate() {
-                writes.push(vk::WriteDescriptorSet {
-                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: dset,
-                    dst_binding: crate::descriptor::SSBO_BINDING_BASE + *binding,
-                    dst_array_element: 0,
-                    descriptor_count: 1,
-                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                    p_buffer_info: &ssbo_infos[i],
-                    p_image_info: std::ptr::null(),
-                    p_texel_buffer_view: std::ptr::null(),
-                    p_next: std::ptr::null(),
-                    _marker: std::marker::PhantomData,
                 });
-            }
-            for (binding, infos) in crate::descriptor::SAMPLED_IMAGE_BINDINGS.into_iter().zip([
-                &image_infos[0],
-                &image_infos_3d[0],
-                &image_infos_cube[0],
-                &image_infos_cube_array[0],
-                &image_infos[1],
-                &image_infos_3d[1],
-                &image_infos_cube[1],
-                &image_infos_cube_array[1],
-                &image_infos[2],
-                &image_infos_3d[2],
-                &image_infos_cube[2],
-                &image_infos_cube_array[2],
-            ]) {
-                writes.push(vk::WriteDescriptorSet {
-                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: dset,
-                    dst_binding: binding,
-                    dst_array_element: 0,
-                    descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
-                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                    p_image_info: infos.as_ptr(),
-                    p_buffer_info: std::ptr::null(),
-                    p_texel_buffer_view: std::ptr::null(),
-                    p_next: std::ptr::null(),
-                    _marker: std::marker::PhantomData,
-                });
-            }
-            for (binding, views) in crate::descriptor::TEXEL_BUFFER_BINDINGS.into_iter().zip([
-                &typed_texel_views[0],
-                &typed_texel_views[1],
-                &typed_texel_views[2],
-            ]) {
-                writes.push(vk::WriteDescriptorSet {
-                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: dset,
-                    dst_binding: binding,
-                    dst_array_element: 0,
-                    descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
-                    descriptor_type: vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
-                    p_image_info: std::ptr::null(),
-                    p_buffer_info: std::ptr::null(),
-                    p_texel_buffer_view: views.as_ptr(),
-                    p_next: std::ptr::null(),
-                    _marker: std::marker::PhantomData,
-                });
-            }
-            unsafe {
-                device.update_descriptor_sets(&writes, &[]);
-            }
-            rp_dset += rp_ds0.elapsed();
+                for (i, binding) in ssbo_bindings.iter().enumerate() {
+                    writes.push(vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: dset,
+                        dst_binding: crate::descriptor::SSBO_BINDING_BASE + *binding,
+                        dst_array_element: 0,
+                        descriptor_count: 1,
+                        descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                        p_buffer_info: &ssbo_infos[i],
+                        p_image_info: std::ptr::null(),
+                        p_texel_buffer_view: std::ptr::null(),
+                        p_next: std::ptr::null(),
+                        _marker: std::marker::PhantomData,
+                    });
+                }
+                for (index, (binding, infos)) in crate::descriptor::SAMPLED_IMAGE_BINDINGS
+                    .into_iter()
+                    .zip([
+                        &image_infos[0],
+                        &image_infos_3d[0],
+                        &image_infos_cube[0],
+                        &image_infos_cube_array[0],
+                        &image_infos[1],
+                        &image_infos_3d[1],
+                        &image_infos_cube[1],
+                        &image_infos_cube_array[1],
+                        &image_infos[2],
+                        &image_infos_3d[2],
+                        &image_infos_cube[2],
+                        &image_infos_cube_array[2],
+                    ])
+                    .enumerate()
+                {
+                    if !texture_descriptor_bindings[index] {
+                        continue;
+                    }
+                    writes.push(vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: dset,
+                        dst_binding: binding,
+                        dst_array_element: 0,
+                        descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        p_image_info: infos.as_ptr(),
+                        p_buffer_info: std::ptr::null(),
+                        p_texel_buffer_view: std::ptr::null(),
+                        p_next: std::ptr::null(),
+                        _marker: std::marker::PhantomData,
+                    });
+                }
+                for (index, (binding, views)) in crate::descriptor::TEXEL_BUFFER_BINDINGS
+                    .into_iter()
+                    .zip([
+                        &typed_texel_views[0],
+                        &typed_texel_views[1],
+                        &typed_texel_views[2],
+                    ])
+                    .enumerate()
+                {
+                    if !texture_descriptor_bindings
+                        [crate::descriptor::SAMPLED_IMAGE_BINDINGS.len() + index]
+                    {
+                        continue;
+                    }
+                    writes.push(vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: dset,
+                        dst_binding: binding,
+                        dst_array_element: 0,
+                        descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
+                        descriptor_type: vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+                        p_image_info: std::ptr::null(),
+                        p_buffer_info: std::ptr::null(),
+                        p_texel_buffer_view: views.as_ptr(),
+                        p_next: std::ptr::null(),
+                        _marker: std::marker::PhantomData,
+                    });
+                }
+                unsafe {
+                    device.update_descriptor_sets(writes, &[]);
+                }
+                rp_dset += rp_ds0.elapsed();
 
-            let need_depth = prep.use_depth;
-            if !pass_open {
-                for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
-                    if let Some(layout) = rt_cache.color_layout(*key) {
-                        color_layouts[idx] = layout;
-                    }
-                }
-            }
-            if !pass_open || pass_depth != need_depth || pass_rt_layout != required_rt_layout {
-                if pass_open {
-                    unsafe {
-                        device.cmd_end_rendering(cmd);
-                    }
-                    finish_color_pass(
-                        device,
-                        cmd,
-                        rt_cache,
-                        &color_bind,
-                        &mut color_layouts,
-                        pass_rt_layout,
-                        &mut pass_dirty,
-                        &pass_trace_calls,
-                    );
-                    pass_trace_calls.clear();
-                }
-                let needs_color_transition = color_layouts
-                    .iter()
-                    .any(|layout| *layout != required_rt_layout);
-                if needs_color_transition {
-                    for (idx, (key, image, _, _, _)) in color_bind.iter().enumerate() {
-                        transition_image(
-                            device,
-                            cmd,
-                            *image,
-                            color_layouts[idx],
-                            required_rt_layout,
-                        );
-                        color_layouts[idx] = required_rt_layout;
-                        rt_cache.set_color_layout(*key, required_rt_layout);
-                    }
-                }
-                if had_pass {
-                    if let Some(di) = depth_image {
-                        if need_depth {
-                            transition_image_aspect(
-                                device,
-                                cmd,
-                                di,
-                                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                                call.depth_aspects,
-                            );
+                let need_depth = prep.use_depth;
+                if !pass_open {
+                    for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
+                        if let Some(layout) = rt_cache.color_layout(*key) {
+                            color_layouts[idx] = layout;
                         }
                     }
                 }
-                let first = !had_pass;
-                let clear_value = if first && clear_rt {
-                    vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.0, 0.0, 0.0, 1.0],
-                        },
-                    }
-                } else {
-                    vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: call.clear_color,
-                        },
-                    }
-                };
-                let depth_attachment = if need_depth {
-                    let clear_now = depth_needs_clear;
-                    depth_needs_clear = false;
-                    if clear_now {
-                        rt_cache.mark_depth_written(depth_key.unwrap());
-                    }
-                    let depth_clear_far = if call.depth.compare_op == vk::CompareOp::GREATER
-                        || call.depth.compare_op == vk::CompareOp::GREATER_OR_EQUAL
-                    {
-                        0.0
-                    } else {
-                        call.clear_depth_hint
-                    };
-                    depth_view.map(|dv| vk::RenderingAttachmentInfo {
-                        s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
-                        image_view: dv,
-                        image_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                        resolve_mode: vk::ResolveModeFlags::NONE,
-                        resolve_image_view: vk::ImageView::null(),
-                        resolve_image_layout: vk::ImageLayout::UNDEFINED,
-                        load_op: if clear_now {
-                            vk::AttachmentLoadOp::CLEAR
-                        } else {
-                            vk::AttachmentLoadOp::LOAD
-                        },
-                        store_op: vk::AttachmentStoreOp::STORE,
-                        clear_value: vk::ClearValue {
-                            depth_stencil: vk::ClearDepthStencilValue {
-                                depth: depth_clear_far,
-                                stencil: call.clear_stencil_hint,
-                            },
-                        },
-                        p_next: std::ptr::null(),
-                        _marker: std::marker::PhantomData,
-                    })
-                } else {
-                    None
-                };
-                let p_depth_attachment = if call.depth_aspects.contains(vk::ImageAspectFlags::DEPTH)
+                if !pass_open
+                    || pass_depth != need_depth
+                    || pass_rt_layout != required_rt_layout
+                    || (need_depth && pass_depth_layout != desired_depth_layout)
                 {
-                    depth_attachment
-                        .as_ref()
-                        .map_or(std::ptr::null(), |a| a as *const _)
-                } else {
-                    std::ptr::null()
-                };
-                let p_stencil_attachment =
-                    if call.depth_aspects.contains(vk::ImageAspectFlags::STENCIL) {
-                        depth_attachment
-                            .as_ref()
-                            .map_or(std::ptr::null(), |a| a as *const _)
+                    if pass_open {
+                        unsafe {
+                            device.cmd_end_rendering(cmd);
+                        }
+                        finish_color_pass(
+                            device,
+                            cmd,
+                            rt_cache,
+                            &color_bind,
+                            &mut color_layouts,
+                            pass_rt_layout,
+                            &mut pass_dirty,
+                            &pass_trace_calls,
+                        );
+                        pass_trace_calls.clear();
+                    }
+                    let needs_color_transition = color_layouts
+                        .iter()
+                        .any(|layout| *layout != required_rt_layout);
+                    if needs_color_transition {
+                        for (idx, (key, image, _, _, _)) in color_bind.iter().enumerate() {
+                            transition_image(
+                                device,
+                                cmd,
+                                *image,
+                                color_layouts[idx],
+                                required_rt_layout,
+                            );
+                            color_layouts[idx] = required_rt_layout;
+                            rt_cache.set_color_layout(*key, required_rt_layout);
+                        }
+                    }
+                    if need_depth {
+                        if let Some(di) = depth_image {
+                            if depth_layout != desired_depth_layout {
+                                transition_image_aspect(
+                                    device,
+                                    cmd,
+                                    di,
+                                    depth_layout,
+                                    desired_depth_layout,
+                                    call.depth_aspects,
+                                );
+                                depth_layout = desired_depth_layout;
+                                if let Some(key) = depth_key {
+                                    rt_cache.set_depth_layout(key, depth_layout);
+                                }
+                            } else if had_pass
+                                && desired_depth_layout
+                                    == vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                            {
+                                transition_image_aspect(
+                                    device,
+                                    cmd,
+                                    di,
+                                    depth_layout,
+                                    depth_layout,
+                                    call.depth_aspects,
+                                );
+                            }
+                        }
+                    }
+                    let first = !had_pass;
+                    let clear_value = if first && clear_rt {
+                        vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [0.0, 0.0, 0.0, 1.0],
+                            },
+                        }
                     } else {
-                        std::ptr::null()
+                        vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: call.clear_color,
+                            },
+                        }
                     };
-                let attachments = color_bind
-                    .iter()
-                    .map(|(_, _, view, _, _)| vk::RenderingAttachmentInfo {
-                        s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
-                        image_view: *view,
-                        image_layout: required_rt_layout,
-                        resolve_mode: vk::ResolveModeFlags::NONE,
-                        resolve_image_view: vk::ImageView::null(),
-                        resolve_image_layout: vk::ImageLayout::UNDEFINED,
-                        load_op: if first && clear_rt {
-                            vk::AttachmentLoadOp::CLEAR
+                    let depth_attachment = if need_depth {
+                        let clear_now = depth_needs_clear;
+                        depth_needs_clear = false;
+                        if clear_now {
+                            rt_cache.mark_depth_written(depth_key.unwrap());
+                        }
+                        let depth_clear_far = if call.depth.compare_op == vk::CompareOp::GREATER
+                            || call.depth.compare_op == vk::CompareOp::GREATER_OR_EQUAL
+                        {
+                            0.0
                         } else {
-                            vk::AttachmentLoadOp::LOAD
+                            call.clear_depth_hint
+                        };
+                        depth_view.map(|dv| vk::RenderingAttachmentInfo {
+                            s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
+                            image_view: dv,
+                            image_layout: desired_depth_layout,
+                            resolve_mode: vk::ResolveModeFlags::NONE,
+                            resolve_image_view: vk::ImageView::null(),
+                            resolve_image_layout: vk::ImageLayout::UNDEFINED,
+                            load_op: if clear_now {
+                                vk::AttachmentLoadOp::CLEAR
+                            } else {
+                                vk::AttachmentLoadOp::LOAD
+                            },
+                            store_op: vk::AttachmentStoreOp::STORE,
+                            clear_value: vk::ClearValue {
+                                depth_stencil: vk::ClearDepthStencilValue {
+                                    depth: depth_clear_far,
+                                    stencil: call.clear_stencil_hint,
+                                },
+                            },
+                            p_next: std::ptr::null(),
+                            _marker: std::marker::PhantomData,
+                        })
+                    } else {
+                        None
+                    };
+                    let p_depth_attachment =
+                        if call.depth_aspects.contains(vk::ImageAspectFlags::DEPTH) {
+                            depth_attachment
+                                .as_ref()
+                                .map_or(std::ptr::null(), |a| a as *const _)
+                        } else {
+                            std::ptr::null()
+                        };
+                    let p_stencil_attachment =
+                        if call.depth_aspects.contains(vk::ImageAspectFlags::STENCIL) {
+                            depth_attachment
+                                .as_ref()
+                                .map_or(std::ptr::null(), |a| a as *const _)
+                        } else {
+                            std::ptr::null()
+                        };
+                    let attachments = color_bind
+                        .iter()
+                        .map(|(_, _, view, _, _)| vk::RenderingAttachmentInfo {
+                            s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
+                            image_view: *view,
+                            image_layout: required_rt_layout,
+                            resolve_mode: vk::ResolveModeFlags::NONE,
+                            resolve_image_view: vk::ImageView::null(),
+                            resolve_image_layout: vk::ImageLayout::UNDEFINED,
+                            load_op: if first && clear_rt {
+                                vk::AttachmentLoadOp::CLEAR
+                            } else {
+                                vk::AttachmentLoadOp::LOAD
+                            },
+                            store_op: vk::AttachmentStoreOp::STORE,
+                            clear_value,
+                            p_next: std::ptr::null(),
+                            _marker: std::marker::PhantomData,
+                        })
+                        .collect::<Vec<_>>();
+                    let render_layer_count = attachment_render_layer_count(
+                        &color_keys,
+                        if prep.use_depth { call.depth_key } else { None },
+                    )?;
+                    let render_info = vk::RenderingInfo {
+                        s_type: vk::StructureType::RENDERING_INFO,
+                        render_area: vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: rt_extent,
                         },
-                        store_op: vk::AttachmentStoreOp::STORE,
-                        clear_value,
+                        layer_count: render_layer_count,
+                        view_mask: 0,
+                        color_attachment_count: attachments.len() as u32,
+                        p_color_attachments: attachments.as_ptr(),
+                        p_depth_attachment,
+                        p_stencil_attachment,
                         p_next: std::ptr::null(),
+                        flags: Default::default(),
                         _marker: std::marker::PhantomData,
-                    })
-                    .collect::<Vec<_>>();
-                let render_layer_count = attachment_render_layer_count(
-                    &color_keys,
-                    if prep.use_depth { call.depth_key } else { None },
-                )?;
-                let render_info = vk::RenderingInfo {
-                    s_type: vk::StructureType::RENDERING_INFO,
-                    render_area: vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: rt_extent,
-                    },
-                    layer_count: render_layer_count,
-                    view_mask: 0,
-                    color_attachment_count: attachments.len() as u32,
-                    p_color_attachments: attachments.as_ptr(),
-                    p_depth_attachment,
-                    p_stencil_attachment,
-                    p_next: std::ptr::null(),
-                    flags: Default::default(),
-                    _marker: std::marker::PhantomData,
-                };
-                let viewport = vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: rt_extent.width as f32,
-                    height: rt_extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                };
-                let scissor = draw_scissor(call.scissor, rt_extent);
-                unsafe {
-                    device.cmd_begin_rendering(cmd, &render_info);
-                    device.cmd_set_viewport(cmd, 0, &[viewport]);
-                    device.cmd_set_scissor(cmd, 0, &[scissor]);
-                }
-                pass_open = true;
-                pass_depth = need_depth;
-                pass_rt_layout = required_rt_layout;
-                pass_dirty.fill(false);
-                pass_trace_calls.clear();
-                had_pass = true;
-            }
-            unsafe {
-                let vp = match call.vp_rect {
-                    Some([x, y, w, h]) => vk::Viewport {
-                        x,
-                        y,
-                        width: w,
-                        height: h,
-                        min_depth: 0.0,
-                        max_depth: 1.0,
-                    },
-                    None => vk::Viewport {
+                    };
+                    let viewport = vk::Viewport {
                         x: 0.0,
                         y: 0.0,
                         width: rt_extent.width as f32,
                         height: rt_extent.height as f32,
                         min_depth: 0.0,
                         max_depth: 1.0,
-                    },
-                };
-                device.cmd_set_viewport(cmd, 0, &[vp]);
-                let scissor = draw_scissor(call.scissor, rt_extent);
-                device.cmd_set_scissor(cmd, 0, &[scissor]);
-                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, prep.pipeline);
-                set_dynamic_stencil_state(device, cmd, call.stencil);
-                device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline_cache.layout,
-                    0,
-                    &[dset],
-                    &[],
-                );
-                for (binding, vbuf, voff) in &vertex_binds {
-                    device.cmd_bind_vertex_buffers(cmd, *binding, &[*vbuf], &[*voff]);
-                }
-                if let Some((wbinding, wbuf, woff)) = white_bind {
-                    device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]);
-                }
-                let cmd_first_vertex = if !vertex_binds.is_empty() {
-                    0
-                } else {
-                    call.first_vertex
-                };
-                if let Some((ibuf, ioff)) = index_bind {
-                    device.cmd_bind_index_buffer(cmd, ibuf, ioff, prep.index_type);
-                    let vertex_offset = if !vertex_binds.is_empty() {
-                        call.first_vertex as i32
-                    } else {
-                        0
                     };
-                    device.cmd_draw_indexed(
+                    let scissor = draw_scissor(call.scissor, rt_extent);
+                    unsafe {
+                        device.cmd_begin_rendering(cmd, &render_info);
+                        device.cmd_set_viewport(cmd, 0, &[viewport]);
+                        device.cmd_set_scissor(cmd, 0, &[scissor]);
+                    }
+                    pass_open = true;
+                    pass_depth = need_depth;
+                    pass_depth_layout = if need_depth {
+                        desired_depth_layout
+                    } else {
+                        vk::ImageLayout::UNDEFINED
+                    };
+                    pass_rt_layout = required_rt_layout;
+                    pass_dirty.fill(false);
+                    pass_trace_calls.clear();
+                    had_pass = true;
+                }
+                unsafe {
+                    let vp = match call.vp_rect {
+                        Some([x, y, w, h]) => vk::Viewport {
+                            x,
+                            y,
+                            width: w,
+                            height: h,
+                            min_depth: 0.0,
+                            max_depth: 1.0,
+                        },
+                        None => vk::Viewport {
+                            x: 0.0,
+                            y: 0.0,
+                            width: rt_extent.width as f32,
+                            height: rt_extent.height as f32,
+                            min_depth: 0.0,
+                            max_depth: 1.0,
+                        },
+                    };
+                    device.cmd_set_viewport(cmd, 0, &[vp]);
+                    let scissor = draw_scissor(call.scissor, rt_extent);
+                    device.cmd_set_scissor(cmd, 0, &[scissor]);
+                    device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, prep.pipeline);
+                    set_dynamic_stencil_state(device, cmd, call.stencil);
+                    device.cmd_bind_descriptor_sets(
                         cmd,
-                        prep.index_count,
-                        call.instance_count.max(1),
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipeline_cache.layout,
                         0,
-                        vertex_offset,
-                        call.first_instance,
+                        &[dset],
+                        &[],
                     );
-                } else {
-                    device.cmd_draw(
-                        cmd,
-                        prep.draw_vertex_count,
-                        call.instance_count.max(1),
-                        cmd_first_vertex,
-                        call.first_instance,
-                    );
+                    for (binding, vbuf, voff) in &vertex_binds {
+                        device.cmd_bind_vertex_buffers(cmd, *binding, &[*vbuf], &[*voff]);
+                    }
+                    if let Some((wbinding, wbuf, woff)) = white_bind {
+                        device.cmd_bind_vertex_buffers(cmd, wbinding, &[wbuf], &[woff]);
+                    }
+                    let cmd_first_vertex = if !vertex_binds.is_empty() {
+                        0
+                    } else {
+                        call.first_vertex
+                    };
+                    if let Some((ibuf, ioff)) = index_bind {
+                        device.cmd_bind_index_buffer(cmd, ibuf, ioff, prep.index_type);
+                        let vertex_offset = if !vertex_binds.is_empty() {
+                            call.first_vertex as i32
+                        } else {
+                            0
+                        };
+                        device.cmd_draw_indexed(
+                            cmd,
+                            prep.index_count,
+                            call.instance_count.max(1),
+                            0,
+                            vertex_offset,
+                            call.first_instance,
+                        );
+                    } else {
+                        device.cmd_draw(
+                            cmd,
+                            prep.draw_vertex_count,
+                            call.instance_count.max(1),
+                            cmd_first_vertex,
+                            call.first_instance,
+                        );
+                    }
+                }
+                if prep.use_depth && call_writes_depth_stencil(call) {
+                    rt_cache.mark_depth_written(call.depth_key.unwrap());
+                }
+                for (idx, dirty) in pass_dirty.iter_mut().enumerate() {
+                    if call_writes_color(call, idx) {
+                        *dirty = true;
+                    }
+                }
+                pass_trace_calls.push(call);
+                if call.fragment_barrier_after || call.texture_cache_invalidate_after {
+                    if pass_open {
+                        unsafe {
+                            device.cmd_end_rendering(cmd);
+                        }
+                        finish_color_pass(
+                            device,
+                            cmd,
+                            rt_cache,
+                            &color_bind,
+                            &mut color_layouts,
+                            pass_rt_layout,
+                            &mut pass_dirty,
+                            &pass_trace_calls,
+                        );
+                        pass_open = false;
+                        pass_trace_calls.clear();
+                    }
+                    color_sync_checked.clear();
+                    group_color_sync_clean.clear();
+                    volume_slice_cache.clear();
+                    if call.texture_cache_invalidate_after {
+                        if texture_cache_invalidate_clear_enabled() {
+                            frame_slots[cur_idx]
+                                .retired_textures
+                                .extend(tex_cache.drain().map(|(_, texture)| texture));
+                            tex_cache_vas.clear();
+                            frame_slots[cur_idx]
+                                .retired_texel_buffers
+                                .extend(texel_buffer_cache.drain().map(|(_, buffer)| buffer));
+                            frame_slots[cur_idx]
+                                .retired_rt_reinterprets
+                                .extend(rt_reinterpret_cache.drain().map(|(_, image)| image));
+                            tex_raw_cache.clear();
+                            tex_sam_cache.clear();
+                        }
+                        barrier_wait_for_idle(device, cmd);
+                    }
                 }
             }
-            if prep.use_depth && call_writes_depth_stencil(call) {
-                rt_cache.mark_depth_written(call.depth_key.unwrap());
+            if pass_open {
+                unsafe {
+                    device.cmd_end_rendering(cmd);
+                }
+                finish_color_pass(
+                    device,
+                    cmd,
+                    rt_cache,
+                    &color_bind,
+                    &mut color_layouts,
+                    pass_rt_layout,
+                    &mut pass_dirty,
+                    &pass_trace_calls,
+                );
             }
-            for (idx, dirty) in pass_dirty.iter_mut().enumerate() {
-                if call_writes_color(call, idx) {
-                    *dirty = true;
+            for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
+                rt_cache.set_color_layout(*key, color_layouts[idx]);
+            }
+            if let Some(call) = depth_source {
+                if let Ok((d, _)) = rt_cache.get_or_create_depth(
+                    depth_key.unwrap(),
+                    device,
+                    call.depth_format,
+                    call.depth_aspects,
+                ) {
+                    d.layout = depth_layout;
                 }
             }
-            pass_trace_calls.push(call);
-        }
-        if pass_open {
-            unsafe {
-                device.cmd_end_rendering(cmd);
+            for (ak, is_depth) in alias_used {
+                if is_depth {
+                    rt_cache.set_depth_layout(ak, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                } else if !color_keys.contains(&ak) {
+                    rt_cache.set_color_layout(ak, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                }
             }
-            finish_color_pass(
-                device,
-                cmd,
-                rt_cache,
-                &color_bind,
-                &mut color_layouts,
-                pass_rt_layout,
-                &mut pass_dirty,
-                &pass_trace_calls,
-            );
+            post_submit_texture_probes.push(post_submit_texture_probe);
         }
-
         unsafe {
             device
                 .end_command_buffer(cmd)
@@ -8400,18 +10592,59 @@ impl Renderer {
         let rp_t4 = std::time::Instant::now();
         let slot_fence = frame_slots[cur_idx].fence;
         submit_with_fence(device, *queue, cmd, slot_fence)?;
+        frame_slots[cur_idx].submit_generation =
+            SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        frame_slots[cur_idx]
+            .fermi_exact_rt_snapshot_leases
+            .extend_from_slice(fermi_exact_rt_snapshot_lease_ids);
         if let Some(cache) = aurora_resident_ssbos.as_mut() {
             cache.mark_submitted(cur_idx, &resident_slots_used);
         }
+        if let Some(cache) = resident_vb.as_mut() {
+            cache.mark_submitted(cur_idx, &resident_vb_used);
+        }
         let rp_submit = rp_t4.elapsed();
-        run_post_submit_texture_probe(
-            device,
-            *cmd_pool,
-            *queue,
-            mem_props,
-            slot_fence,
-            post_submit_texture_probe,
-        );
+        for post_submit_texture_probe in post_submit_texture_probes {
+            run_post_submit_texture_probe(
+                device,
+                *cmd_pool,
+                *queue,
+                mem_props,
+                slot_fence,
+                post_submit_texture_probe,
+            );
+        }
+        if pprof_enabled() && rp_t0.elapsed() >= std::time::Duration::from_millis(10) {
+            let rp_tex_known =
+                rp_tex_sync + rp_tex_view + rp_tex_gen + rp_tex_upload + rp_tex_finish;
+            log::warn!(
+                "[rprof-slow2] groups={} draws={} fence_ms={:.3} fence_wait_ms={:.3} fence_retire_ms={:.3} alias_ms={:.3} tex_ms={:.3} tex_sync_ms={:.3} tex_view_ms={:.3} tex_gen_ms={:.3} tex_upload_ms={:.3} tex_finish_ms={:.3} tex_other_ms={:.3} tex_slots={} alias_hits={} generic_slots={} raw_slots={} uploads={} alias_syncs={} region_syncs={} rt_snapshot_slots={} rt_snapshot_alias_hits={} vtx_ms={:.3} dset_ms={:.3}",
+                group_preps.len(),
+                rp_draws,
+                rp_fence.as_secs_f64() * 1000.0,
+                rp_fence_wait.as_secs_f64() * 1000.0,
+                rp_fence.saturating_sub(rp_fence_wait).as_secs_f64() * 1000.0,
+                rp_alias.as_secs_f64() * 1000.0,
+                rp_tex.as_secs_f64() * 1000.0,
+                rp_tex_sync.as_secs_f64() * 1000.0,
+                rp_tex_view.as_secs_f64() * 1000.0,
+                rp_tex_gen.as_secs_f64() * 1000.0,
+                rp_tex_upload.as_secs_f64() * 1000.0,
+                rp_tex_finish.as_secs_f64() * 1000.0,
+                rp_tex.saturating_sub(rp_tex_known).as_secs_f64() * 1000.0,
+                rp_tex_slots,
+                rp_tex_alias_hits,
+                rp_tex_generic_slots,
+                rp_tex_raw_slots,
+                rp_tex_uploads,
+                rp_tex_alias_syncs,
+                rp_tex_region_syncs,
+                rp_rt_snapshot_slots,
+                rp_rt_snapshot_alias_hits,
+                rp_vtx.as_secs_f64() * 1000.0,
+                rp_dset.as_secs_f64() * 1000.0,
+            );
+        }
         rprof_record(
             rp_draws,
             rp_prep,
@@ -8426,31 +10659,11 @@ impl Renderer {
         frame_slots[cur_idx]
             .retired_dset_pools
             .extend(dset_pools.into_raw());
-        for (idx, (key, _, _, _, _)) in color_bind.iter().enumerate() {
-            rt_cache.set_color_layout(*key, color_layouts[idx]);
-        }
-        if any_depth {
-            if let Ok((d, _)) = rt_cache.get_or_create_depth(
-                depth_key.unwrap(),
-                device,
-                calls[0].depth_format,
-                calls[0].depth_aspects,
-            ) {
-                d.layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-            }
-        }
-        for (ak, is_depth) in alias_used {
-            if is_depth {
-                rt_cache.set_depth_layout(ak, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-            } else if !color_keys.contains(&ak) {
-                rt_cache.set_color_layout(ak, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-            }
-        }
         let next_idx = other_idx;
         ubo_ring.slot_head[next_idx] = ubo_ring.head;
         *frame_index = next_idx;
         pipeline_cache.maybe_save(device);
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -8459,9 +10672,78 @@ fn pprof_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("NEXIUM_RENDER_PROFILE").is_some())
 }
 
+fn retain_tex_cache_va(vas: &mut HashMap<u64, u32>, gpu_va: u64) {
+    *vas.entry(gpu_va).or_insert(0) += 1;
+}
+
+fn release_tex_cache_va(vas: &mut HashMap<u64, u32>, gpu_va: u64) {
+    if let std::collections::hash_map::Entry::Occupied(mut entry) = vas.entry(gpu_va) {
+        let count = entry.get_mut();
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            entry.remove();
+        }
+    }
+}
+
+fn volume_identity_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NEXIUM_VOLUME_IDENTITY").is_some())
+}
+
+fn force_pitch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("NEXIUM_FORCE_PITCH")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
+fn texdump_stats_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("NEXIUM_TEXDUMP")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
+fn texdump_image_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("NEXIUM_TEXDUMP_IMG")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
+fn rt_format_bind_debug_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NEXIUM_RT_FORMAT_BIND_DBG").is_some())
+}
+
+fn tic_srgb_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NEXIUM_TIC_SRGB_LOG").is_some())
+}
+
+fn tex_avg_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NEXIUM_TEX_AVG").is_some())
+}
+
+fn present_rate_profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("NEXIUM_RENDER_PROFILE").is_some()
+            || std::env::var_os("NEXIUM_PRESENT_RATE_PROFILE").is_some()
+    })
+}
+
 fn pprof_record(w: u32, h: u32, raw: std::time::Duration, convert: std::time::Duration) {
     use std::sync::atomic::{AtomicU64, Ordering};
-    if !pprof_enabled() {
+    if !present_rate_profile_enabled() {
         return;
     }
     static N: AtomicU64 = AtomicU64::new(0);
@@ -8484,7 +10766,7 @@ fn pprof_record(w: u32, h: u32, raw: std::time::Duration, convert: std::time::Du
 
 fn pprof_raw_lock(lock: std::time::Duration) {
     use std::sync::atomic::{AtomicU64, Ordering};
-    if !pprof_enabled() {
+    if !present_rate_profile_enabled() {
         return;
     }
     static N: AtomicU64 = AtomicU64::new(0);
@@ -8529,6 +10811,18 @@ fn rprof_record(
     RECORD.fetch_add(record.as_nanos() as u64, Ordering::Relaxed);
     SUBMIT.fetch_add(submit.as_nanos() as u64, Ordering::Relaxed);
     TOTAL.fetch_add(total.as_nanos() as u64, Ordering::Relaxed);
+    if total >= std::time::Duration::from_millis(10) {
+        log::warn!(
+            "[rprof-slow] draws={} prep_ms={:.3} lock_ms={:.3} fence_ms={:.3} record_ms={:.3} submit_ms={:.3} total_ms={:.3}",
+            draws,
+            prep.as_secs_f64() * 1000.0,
+            lock.as_secs_f64() * 1000.0,
+            fence.as_secs_f64() * 1000.0,
+            record.as_secs_f64() * 1000.0,
+            submit.as_secs_f64() * 1000.0,
+            total.as_secs_f64() * 1000.0,
+        );
+    }
     if n % 64 == 0 {
         let ms = |v: &AtomicU64| v.load(Ordering::Relaxed) as f64 / n as f64 / 1_000_000.0;
         log::warn!(
@@ -9406,6 +11700,124 @@ fn active_color_keys_for_call(call: &crate::draw::Maxwell3dDrawCall) -> Vec<RtKe
     }
 }
 
+#[derive(Default)]
+struct DrawGroupAttachmentUse {
+    colors: Vec<(RtKey, vk::Format)>,
+    depths: Vec<(RtKey, vk::Format, vk::ImageAspectFlags)>,
+    sampled: Vec<RtKey>,
+}
+
+fn is_ordered_exact_sampled_color_transition(sampled: RtKey, attachment: RtKey) -> bool {
+    sampled == attachment
+        && sampled.gpu_va != 0
+        && sampled.nvmap_id != u32::MAX
+        && !sampled.is_3d
+        && sampled.depth == 1
+}
+
+fn draw_group_attachment_uses(
+    groups: &[&[crate::draw::Maxwell3dDrawCall]],
+) -> Vec<DrawGroupAttachmentUse> {
+    groups
+        .iter()
+        .map(|calls| {
+            let mut usage = DrawGroupAttachmentUse::default();
+            for call in *calls {
+                let color_keys = active_color_keys_for_call(call);
+                let color_formats = color_formats_for_call(call, color_keys.len());
+                usage
+                    .colors
+                    .extend(color_keys.into_iter().enumerate().map(|(index, key)| {
+                        (
+                            key,
+                            color_formats.get(index).copied().unwrap_or(call.rt_format),
+                        )
+                    }));
+                if let Some(key) = call.depth_key {
+                    usage
+                        .depths
+                        .push((key, call.depth_format, call.depth_aspects));
+                }
+                usage
+                    .sampled
+                    .extend(call.sampled_rt_slots.iter().flatten().copied());
+            }
+            usage
+        })
+        .collect()
+}
+
+fn preflight_draw_group_attachment_uses(groups: &[DrawGroupAttachmentUse]) -> Result<(), String> {
+    let mut color_formats = HashMap::<RtKey, (usize, vk::Format)>::new();
+    let mut depth_formats = Vec::<(RtKey, usize, vk::Format, vk::ImageAspectFlags)>::new();
+    for (group_index, usage) in groups.iter().enumerate() {
+        for &(key, format) in &usage.colors {
+            if let Some(&(previous_group, previous_format)) = color_formats.get(&key) {
+                if previous_group != group_index && !rt_formats_compatible(previous_format, format)
+                {
+                    return Err(format!(
+                        "draw groups {} and {} bind color target {} with differing formats {:?} and {:?}",
+                        previous_group,
+                        group_index,
+                        key.label(),
+                        previous_format,
+                        format
+                    ));
+                }
+            } else {
+                color_formats.insert(key, (group_index, format));
+            }
+        }
+        for &(key, format, aspects) in &usage.depths {
+            if let Some(&(_, previous_group, previous_format, previous_aspects)) =
+                depth_formats.iter().find(|(previous_key, _, _, _)| {
+                    *previous_key == key || same_physical_backing(*previous_key, key)
+                })
+            {
+                if previous_group != group_index
+                    && (previous_format != format || previous_aspects != aspects)
+                {
+                    return Err(format!(
+                        "draw groups {} and {} bind depth target {} with differing format/aspects {:?}/{:?} and {:?}/{:?}",
+                        previous_group,
+                        group_index,
+                        key.label(),
+                        previous_format,
+                        previous_aspects,
+                        format,
+                        aspects
+                    ));
+                }
+            } else {
+                depth_formats.push((key, group_index, format, aspects));
+            }
+        }
+    }
+    for (group_index, usage) in groups.iter().enumerate() {
+        for &sampled in &usage.sampled {
+            for (later_group, later_usage) in groups.iter().enumerate().skip(group_index + 1) {
+                let color_conflict = later_usage.colors.iter().any(|(key, _)| {
+                    (*key == sampled || same_physical_backing(*key, sampled))
+                        && !is_ordered_exact_sampled_color_transition(sampled, *key)
+                });
+                let depth_conflict = later_usage
+                    .depths
+                    .iter()
+                    .any(|(key, _, _)| *key == sampled || same_physical_backing(*key, sampled));
+                if color_conflict || depth_conflict {
+                    return Err(format!(
+                        "draw group {} samples later attachment {} from group {}",
+                        group_index,
+                        sampled.label(),
+                        later_group
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn attachment_render_layer_count(
     color_keys: &[RtKey],
     depth_key: Option<RtKey>,
@@ -9432,6 +11844,12 @@ fn legacy_color_attachments() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_LEGACY_COLOR_ATTACH").is_some())
+}
+
+fn texture_cache_invalidate_clear_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_TIC_INVALIDATE_CLEAR").is_some())
 }
 
 fn finish_color_pass(
@@ -9573,6 +11991,11 @@ struct PreparedComputeSample {
 
 enum ComputeSamplePlan {
     Live(PreparedComputeSample),
+    CachedVolume {
+        binding: u32,
+        sampler: vk::Sampler,
+        volume: PreparedCachedComputeVolume,
+    },
     CrossAccess {
         binding: u32,
         sampler: vk::Sampler,
@@ -9586,14 +12009,34 @@ enum ComputeSamplePlan {
         height: u32,
         depth: u32,
         is_3d: bool,
+        is_cube: bool,
         format: vk::Format,
         components: vk::ComponentMapping,
         mip_levels: u32,
         view_base_mip: u32,
         view_mip_levels: u32,
-        upload_bytes: Vec<u8>,
-        upload_copies: Vec<TextureMipCopy>,
+        content: ComputeGuestImageContent,
     },
+}
+
+#[derive(Clone)]
+struct PreparedCachedComputeVolume {
+    cache_index: usize,
+    key: ComputeVolumeCacheKey,
+    signature: ComputeVolumeSourceSignature,
+    image: vk::Image,
+    view: vk::ImageView,
+    width: u32,
+    height: u32,
+    mip_levels: u32,
+    old_layout: vk::ImageLayout,
+    needs_copy: bool,
+    slices: Vec<VolumeRtSlice>,
+}
+
+enum PreparedComputeGuestSource {
+    Transient(usize),
+    CachedVolume(PreparedCachedComputeVolume),
 }
 
 struct PreparedComputeImage {
@@ -9615,6 +12058,599 @@ fn compute_sampled_image_alias_extent_matches(
         && alias.key.width == tic.width
         && alias.key.height == tic.height
         && (!is_3d || alias.key.depth == depth)
+}
+
+fn complete_compute_volume_rt_slices(
+    slices: Option<Vec<VolumeRtSlice>>,
+    depth: u32,
+    format: vk::Format,
+) -> Option<Vec<VolumeRtSlice>> {
+    let slices = slices?;
+    if depth == 0
+        || slices.len() != depth as usize
+        || slices.iter().enumerate().any(|(layer, slice)| {
+            slice.layer != layer as u32
+                || slice.layout == vk::ImageLayout::UNDEFINED
+                || slice.format != format
+                || slice.stamp == 0
+        })
+    {
+        return None;
+    }
+    Some(slices)
+}
+
+fn compute_volume_cache_identity(
+    width: u32,
+    height: u32,
+    depth: u32,
+    format: vk::Format,
+    components: vk::ComponentMapping,
+    mip_levels: u32,
+    view_base_mip: u32,
+    view_mip_levels: u32,
+    slices: &[VolumeRtSlice],
+) -> (ComputeVolumeCacheKey, ComputeVolumeSourceSignature) {
+    let key = ComputeVolumeCacheKey {
+        width,
+        height,
+        depth,
+        format: format.as_raw(),
+        components: [
+            components.r.as_raw(),
+            components.g.as_raw(),
+            components.b.as_raw(),
+            components.a.as_raw(),
+        ],
+        mip_levels,
+        view_base_mip,
+        view_mip_levels,
+        slices: slices
+            .iter()
+            .map(|slice| ComputeVolumeSliceIdentity {
+                layer: slice.layer,
+                key: slice.key,
+                image: slice.image.as_raw(),
+                format: slice.format.as_raw(),
+                src_x: slice.src_x,
+                src_y: slice.src_y,
+            })
+            .collect(),
+    };
+    let signature = ComputeVolumeSourceSignature {
+        stamps: slices.iter().map(|slice| slice.stamp).collect(),
+    };
+    (key, signature)
+}
+
+fn compute_volume_cache_needs_copy(
+    cached: Option<&ComputeVolumeSourceSignature>,
+    current: &ComputeVolumeSourceSignature,
+) -> bool {
+    cached != Some(current)
+}
+
+fn compute_volume_cache_can_admit(
+    retained_items: usize,
+    retained_bytes: u64,
+    allocation_bytes: u64,
+) -> bool {
+    retained_items < COMPUTE_VOLUME_CACHE_MAX_ITEMS
+        && allocation_bytes <= COMPUTE_VOLUME_CACHE_MAX_BYTES
+        && retained_bytes.saturating_add(allocation_bytes) <= COMPUTE_VOLUME_CACHE_MAX_BYTES
+}
+
+fn prepared_cached_compute_volume(
+    cache_index: usize,
+    entry: &CachedComputeVolume,
+    signature: ComputeVolumeSourceSignature,
+    slices: Vec<VolumeRtSlice>,
+) -> PreparedCachedComputeVolume {
+    PreparedCachedComputeVolume {
+        cache_index,
+        key: entry.key.clone(),
+        needs_copy: compute_volume_cache_needs_copy(entry.signature.as_ref(), &signature),
+        old_layout: if entry.signature.is_some() {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        } else {
+            vk::ImageLayout::UNDEFINED
+        },
+        signature,
+        image: entry.resource.image,
+        view: entry.resource.view,
+        width: entry.resource.width,
+        height: entry.resource.height,
+        mip_levels: entry.key.mip_levels,
+        slices,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn acquire_compute_volume_cache(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    cache: &mut Vec<CachedComputeVolume>,
+    width: u32,
+    height: u32,
+    depth: u32,
+    format: vk::Format,
+    components: vk::ComponentMapping,
+    mip_levels: u32,
+    view_base_mip: u32,
+    view_mip_levels: u32,
+    slices: Vec<VolumeRtSlice>,
+) -> Option<PreparedCachedComputeVolume> {
+    let (key, signature) = compute_volume_cache_identity(
+        width,
+        height,
+        depth,
+        format,
+        components,
+        mip_levels,
+        view_base_mip,
+        view_mip_levels,
+        &slices,
+    );
+    if let Some(index) = cache.iter().position(|entry| entry.key == key) {
+        return Some(prepared_cached_compute_volume(
+            index,
+            &cache[index],
+            signature,
+            slices,
+        ));
+    }
+
+    let retained_bytes = cache.iter().fold(0u64, |bytes, entry| {
+        bytes.saturating_add(entry.resource.allocation_size)
+    });
+    if cache.len() >= COMPUTE_VOLUME_CACHE_MAX_ITEMS
+        || retained_bytes >= COMPUTE_VOLUME_CACHE_MAX_BYTES
+    {
+        return None;
+    }
+    let resource = match crate::compute::create_compute_sampled_image(
+        device,
+        mem_props,
+        width,
+        height,
+        depth,
+        true,
+        format,
+        components,
+        mip_levels,
+        view_base_mip,
+        view_mip_levels,
+    ) {
+        Ok(resource) => resource,
+        Err(error) => {
+            log::debug!("live compute volume cache allocation skipped: {error}");
+            return None;
+        }
+    };
+    if !compute_volume_cache_can_admit(cache.len(), retained_bytes, resource.allocation_size) {
+        resource.destroy(device);
+        return None;
+    }
+
+    let index = cache.len();
+    cache.push(CachedComputeVolume {
+        key,
+        signature: None,
+        resource,
+    });
+    Some(prepared_cached_compute_volume(
+        index,
+        &cache[index],
+        signature,
+        slices,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_guest_image_pool_key(
+    width: u32,
+    height: u32,
+    depth: u32,
+    is_3d: bool,
+    is_cube: bool,
+    format: vk::Format,
+    components: vk::ComponentMapping,
+    mip_levels: u32,
+    view_base_mip: u32,
+    view_mip_levels: u32,
+    upload_len: usize,
+    copies: &[TextureMipCopy],
+) -> ComputeGuestImagePoolKey {
+    ComputeGuestImagePoolKey {
+        width,
+        height,
+        depth,
+        is_3d,
+        is_cube,
+        format: format.as_raw(),
+        components: [
+            components.r.as_raw(),
+            components.g.as_raw(),
+            components.b.as_raw(),
+            components.a.as_raw(),
+        ],
+        mip_levels: mip_levels.max(1),
+        view_base_mip,
+        view_mip_levels,
+        upload_len,
+        copies: copies.to_vec(),
+    }
+}
+
+fn compute_guest_image_retained_bytes(resource: &crate::compute::ComputeGuestImageResource) -> u64 {
+    resource
+        .image
+        .allocation_size
+        .saturating_add(resource.upload.allocation_size)
+}
+
+fn compute_guest_image_content_bytes(content: Option<&ComputeGuestImageContent>) -> usize {
+    content.map_or(0, |content| {
+        content.source.len().saturating_add(content.upload.len())
+    })
+}
+
+fn compute_guest_content_matches(
+    cached: Option<&ComputeGuestImageContent>,
+    incoming: &ComputeGuestImageContent,
+) -> bool {
+    cached.is_some_and(|cached| {
+        Arc::ptr_eq(&cached.upload, &incoming.upload)
+            || (cached.spec == incoming.spec
+                && cached.source_hash == incoming.source_hash
+                && cached.source.len() == incoming.source.len())
+    })
+}
+
+fn compute_guest_upload_is_current(
+    layout: vk::ImageLayout,
+    needs_upload: bool,
+    cached: Option<&ComputeGuestImageContent>,
+    incoming: &ComputeGuestImageContent,
+) -> bool {
+    layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        && !needs_upload
+        && compute_guest_content_matches(cached, incoming)
+}
+
+fn compute_guest_source_matches(
+    content: &ComputeGuestImageContent,
+    spec: &ComputeGuestUploadSpec,
+    source_hash: u64,
+    source_len: usize,
+) -> bool {
+    content.spec == *spec
+        && content.source_hash == source_hash
+        && content.source.len() == source_len
+}
+
+fn compute_guest_upload_spec(
+    tic: crate::texture::TicEntry,
+    layer_count: u32,
+    pitch_size: usize,
+    force_pitch: bool,
+    format: vk::Format,
+) -> ComputeGuestUploadSpec {
+    ComputeGuestUploadSpec {
+        tic,
+        effective_block_linear: effective_texture_block_linear(&tic),
+        layer_count,
+        pitch_size,
+        force_pitch,
+        format: format.as_raw(),
+    }
+}
+
+fn prepare_compute_guest_image_content(
+    pool: &VecDeque<CachedComputeGuestImage>,
+    memo: &mut HashMap<(u64, usize), ComputeGuestImageContent>,
+    content_key: Option<u64>,
+    raw: &[u8],
+    tic: crate::texture::TicEntry,
+    layer_count: u32,
+    pitch_size: usize,
+    force_pitch: bool,
+    format: vk::Format,
+) -> Result<ComputeGuestImageContent, String> {
+    let spec = compute_guest_upload_spec(tic, layer_count, pitch_size, force_pitch, format);
+    if let Some(key) = content_key {
+        if let Some(content) = memo.get(&(key, raw.len())) {
+            if content.spec == spec {
+                profile_compute_guest_decode_reuse(true, raw.len());
+                return Ok(content.clone());
+            }
+        }
+    }
+    let source_hash = fnv_chunked(raw);
+    if let Some(content) = pool.iter().rev().find_map(|entry| {
+        entry
+            .content
+            .as_ref()
+            .filter(|content| compute_guest_source_matches(content, &spec, source_hash, raw.len()))
+    }) {
+        profile_compute_guest_decode_reuse(true, raw.len());
+        if let Some(key) = content_key {
+            if memo.len() >= 256 {
+                memo.clear();
+            }
+            memo.insert((key, raw.len()), content.clone());
+        }
+        return Ok(content.clone());
+    }
+    let upload = texture_upload_data_with_layout(
+        raw,
+        &tic,
+        layer_count,
+        pitch_size,
+        spec.effective_block_linear,
+        force_pitch,
+        format,
+    )?;
+    let source: Arc<[u8]> = Arc::from(raw);
+    let upload_bytes = if upload.bytes.as_slice() == raw {
+        source.clone()
+    } else {
+        Arc::from(upload.bytes)
+    };
+    profile_compute_guest_decode_reuse(false, raw.len());
+    let content = ComputeGuestImageContent {
+        spec,
+        source_hash,
+        source,
+        upload: upload_bytes,
+        copies: Arc::from(upload.copies),
+    };
+    if let Some(key) = content_key {
+        if memo.len() >= 256 {
+            memo.clear();
+        }
+        memo.insert((key, raw.len()), content.clone());
+    }
+    Ok(content)
+}
+
+fn compute_guest_content_can_retain(retained_bytes: usize, requested_bytes: usize) -> bool {
+    requested_bytes != 0
+        && requested_bytes <= COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES
+        && retained_bytes.saturating_add(requested_bytes) <= COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES
+}
+
+fn compute_guest_image_pool_can_admit(
+    retained_items: usize,
+    retained_bytes: u64,
+    requested_bytes: u64,
+) -> bool {
+    requested_bytes != 0
+        && retained_items < COMPUTE_GUEST_IMAGE_POOL_MAX_ITEMS
+        && requested_bytes <= COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES
+        && retained_bytes.saturating_add(requested_bytes) <= COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES
+}
+
+#[allow(clippy::too_many_arguments)]
+fn acquire_compute_guest_image(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    pool: &mut VecDeque<CachedComputeGuestImage>,
+    width: u32,
+    height: u32,
+    depth: u32,
+    is_3d: bool,
+    is_cube: bool,
+    format: vk::Format,
+    components: vk::ComponentMapping,
+    mip_levels: u32,
+    view_base_mip: u32,
+    view_mip_levels: u32,
+    content: &ComputeGuestImageContent,
+) -> Result<
+    (
+        ComputeGuestImagePoolKey,
+        Option<ComputeGuestImageContent>,
+        crate::compute::ComputeGuestImageResource,
+    ),
+    String,
+> {
+    let key = compute_guest_image_pool_key(
+        width,
+        height,
+        depth,
+        is_3d,
+        is_cube,
+        format,
+        components,
+        mip_levels,
+        view_base_mip,
+        view_mip_levels,
+        content.upload.len(),
+        &content.copies,
+    );
+    let matching_index = pool
+        .iter()
+        .rposition(|entry| {
+            entry.key == key
+                && compute_guest_upload_is_current(
+                    entry.resource.layout,
+                    entry.resource.needs_upload,
+                    entry.content.as_ref(),
+                    content,
+                )
+        })
+        .or_else(|| pool.iter().position(|entry| entry.key == key));
+    if let Some(index) = matching_index {
+        let cached = pool.remove(index).unwrap();
+        let mut resource = cached.resource;
+        resource.needs_upload = !compute_guest_upload_is_current(
+            resource.layout,
+            resource.needs_upload,
+            cached.content.as_ref(),
+            content,
+        );
+        profile_compute_guest_upload_reuse(resource.needs_upload, content.upload.len());
+        if resource.needs_upload {
+            if let Err(error) = resource.upload.write(device, &content.upload) {
+                resource.destroy(device);
+                return Err(error);
+            }
+        }
+        return Ok((cached.key, Some(content.clone()), resource));
+    }
+    let copies: Vec<_> = content
+        .copies
+        .iter()
+        .map(|copy| crate::compute::ComputeGuestImageCopy {
+            buffer_offset: copy.buffer_offset,
+            mip_level: copy.mip_level,
+            width: copy.width,
+            height: copy.height,
+        })
+        .collect();
+    let resource = crate::compute::create_compute_guest_image(
+        device,
+        mem_props,
+        width,
+        height,
+        depth,
+        is_3d,
+        is_cube,
+        format,
+        components,
+        mip_levels,
+        view_base_mip,
+        view_mip_levels,
+        &content.upload,
+        &copies,
+    )?;
+    profile_compute_guest_upload_reuse(true, content.upload.len());
+    Ok((key, Some(content.clone()), resource))
+}
+
+fn recycle_compute_guest_images(
+    device: &ash::Device,
+    pool: &mut VecDeque<CachedComputeGuestImage>,
+    keys: Vec<ComputeGuestImagePoolKey>,
+    contents: Vec<Option<ComputeGuestImageContent>>,
+    resources: Vec<crate::compute::ComputeGuestImageResource>,
+) {
+    if keys.len() != resources.len() || contents.len() != resources.len() {
+        for resource in resources {
+            resource.destroy(device);
+        }
+        return;
+    }
+    let mut retained_bytes = pool.iter().fold(0u64, |total, entry| {
+        total.saturating_add(compute_guest_image_retained_bytes(&entry.resource))
+    });
+    let mut retained_content_bytes = pool.iter().fold(0usize, |total, entry| {
+        total.saturating_add(compute_guest_image_content_bytes(entry.content.as_ref()))
+    });
+    for ((key, mut content), resource) in keys.into_iter().zip(contents).zip(resources) {
+        let requested_bytes = compute_guest_image_retained_bytes(&resource);
+        if requested_bytes > COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES {
+            resource.destroy(device);
+            continue;
+        }
+        while !compute_guest_image_pool_can_admit(pool.len(), retained_bytes, requested_bytes) {
+            let Some(evicted) = pool.pop_front() else {
+                break;
+            };
+            retained_bytes = retained_bytes
+                .saturating_sub(compute_guest_image_retained_bytes(&evicted.resource));
+            retained_content_bytes = retained_content_bytes
+                .saturating_sub(compute_guest_image_content_bytes(evicted.content.as_ref()));
+            evicted.resource.destroy(device);
+        }
+        if compute_guest_image_pool_can_admit(pool.len(), retained_bytes, requested_bytes) {
+            let requested_content_bytes = compute_guest_image_content_bytes(content.as_ref());
+            if compute_guest_content_can_retain(retained_content_bytes, requested_content_bytes) {
+                retained_content_bytes =
+                    retained_content_bytes.saturating_add(requested_content_bytes);
+            } else {
+                content = None;
+            }
+            retained_bytes = retained_bytes.saturating_add(requested_bytes);
+            pool.push_back(CachedComputeGuestImage {
+                key,
+                content,
+                resource,
+            });
+        } else {
+            resource.destroy(device);
+        }
+    }
+}
+
+fn copy_compute_volume_rt_slices(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    destination: vk::Image,
+    width: u32,
+    height: u32,
+    slices: &[VolumeRtSlice],
+) {
+    for slice in slices {
+        if slice.layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+            transition_image(
+                device,
+                cmd,
+                slice.image,
+                slice.layout,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+        }
+        let region = vk::ImageCopy {
+            src_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            src_offset: vk::Offset3D {
+                x: slice.src_x as i32,
+                y: slice.src_y as i32,
+                z: 0,
+            },
+            dst_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            dst_offset: vk::Offset3D {
+                x: 0,
+                y: 0,
+                z: slice.layer as i32,
+            },
+            extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+        };
+        unsafe {
+            device.cmd_copy_image(
+                cmd,
+                slice.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                destination,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+        }
+        if slice.layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+            transition_image(
+                device,
+                cmd,
+                slice.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                slice.layout,
+            );
+        }
+    }
 }
 
 fn prepare_compute_live_sampled_image(
@@ -9668,6 +12704,7 @@ fn prepare_compute_live_sampled_image(
         rt_alias_sample_view(
             device,
             rt_cache,
+            None,
             utility_slot,
             alias,
             Some(tic),
@@ -9709,8 +12746,7 @@ enum ComputeImagePlan {
         mip_levels: u32,
         view_base_mip: u32,
         view_mip_levels: u32,
-        upload_bytes: Vec<u8>,
-        upload_copies: Vec<TextureMipCopy>,
+        content: ComputeGuestImageContent,
     },
 }
 
@@ -9884,22 +12920,111 @@ struct ComputeSampleTransition {
 #[derive(Default)]
 struct PreparedComputeResources {
     uniforms: Vec<crate::compute::ComputeBufferResource>,
-    texels: Vec<crate::compute::ComputeBufferResource>,
+    texels: Vec<PreparedComputeTexel>,
     uniform_texels: Vec<crate::compute::ComputeBufferResource>,
     guest_images: Vec<crate::compute::ComputeGuestImageResource>,
+    guest_image_keys: Vec<ComputeGuestImagePoolKey>,
+    guest_image_contents: Vec<Option<ComputeGuestImageContent>>,
+    guest_sources: Vec<PreparedComputeGuestSource>,
     sampled_alias_views: Vec<vk::ImageView>,
     outputs: Vec<crate::compute::ComputeImageResource>,
     output_uploads: Vec<Option<crate::compute::ComputeBufferResource>>,
     readbacks: Vec<crate::compute::ComputeBufferResource>,
 }
 
+struct PreparedComputeTexel {
+    buffer: vk::Buffer,
+    view: vk::BufferView,
+    owned: Option<crate::compute::ComputeBufferResource>,
+    resident_key: Option<crate::compute::ComputeRawStorageKey>,
+    resident_dirty_hit: bool,
+    pooled_raw: bool,
+}
+
+impl PreparedComputeTexel {
+    fn owned(resource: crate::compute::ComputeBufferResource, pooled_raw: bool) -> Self {
+        Self {
+            buffer: resource.buffer,
+            view: resource.view,
+            owned: Some(resource),
+            resident_key: None,
+            resident_dirty_hit: false,
+            pooled_raw,
+        }
+    }
+
+    fn resident(
+        key: crate::compute::ComputeRawStorageKey,
+        entry: &CachedComputeRawStorage,
+    ) -> Self {
+        Self {
+            buffer: entry.resource.buffer,
+            view: entry.resource.view,
+            owned: None,
+            resident_key: Some(key),
+            resident_dirty_hit: entry.dirty,
+            pooled_raw: false,
+        }
+    }
+}
+
 impl PreparedComputeResources {
+    fn commit_cached_volumes(&self, cache: &mut [CachedComputeVolume]) {
+        for source in &self.guest_sources {
+            let PreparedComputeGuestSource::CachedVolume(prepared) = source else {
+                continue;
+            };
+            if !prepared.needs_copy {
+                continue;
+            }
+            let Some(entry) = cache.get_mut(prepared.cache_index) else {
+                continue;
+            };
+            if entry.key == prepared.key {
+                entry.signature = Some(prepared.signature.clone());
+            }
+        }
+    }
+
+    fn take_pooled_raw_texels(&mut self) -> Vec<crate::compute::ComputeBufferResource> {
+        let mut reusable = Vec::new();
+        for texel in &mut self.texels {
+            if texel.pooled_raw {
+                if let Some(resource) = texel.owned.take() {
+                    reusable.push(resource);
+                }
+            }
+        }
+        reusable
+    }
+
+    fn commit_resident_raw_storage(
+        &self,
+        dispatch: &crate::compute::ComputeDispatch,
+        cache: &mut HashMap<crate::compute::ComputeRawStorageKey, CachedComputeRawStorage>,
+    ) {
+        for (request, texel) in dispatch.texel_buffers.iter().zip(&self.texels) {
+            let Some(key) = texel.resident_key else {
+                continue;
+            };
+            let Some(entry) = cache.get_mut(&key) else {
+                continue;
+            };
+            entry.ready = true;
+            if request.writable {
+                entry.dirty = true;
+            }
+        }
+    }
+
     fn destroy(mut self, device: &ash::Device) {
         for buffer in self.uniforms.drain(..) {
             buffer.destroy(device);
         }
-        for buffer in self.texels.drain(..) {
-            buffer.destroy(device);
+        for mut texel in self.texels.drain(..) {
+            if let Some(buffer) = texel.owned.take() {
+                buffer.destroy(device);
+            }
         }
         for buffer in self.uniform_texels.drain(..) {
             buffer.destroy(device);
@@ -9922,12 +13047,378 @@ impl PreparedComputeResources {
     }
 }
 
+fn compute_raw_storage_ranges_overlap(a: u64, a_size: u64, b: u64, b_size: u64) -> bool {
+    if a_size == 0 || b_size == 0 {
+        return false;
+    }
+    if a <= b {
+        b - a < a_size
+    } else {
+        a - b < b_size
+    }
+}
+
+fn compute_raw_storage_keys_conflict(
+    a: crate::compute::ComputeRawStorageKey,
+    b: crate::compute::ComputeRawStorageKey,
+) -> bool {
+    a != b
+        && (compute_raw_storage_ranges_overlap(a.gpu_va, a.size, b.gpu_va, b.size)
+            || compute_raw_storage_ranges_overlap(a.cpu_addr, a.size, b.cpu_addr, b.size))
+}
+
+fn compute_raw_storage_cache_can_admit(
+    item_count: usize,
+    retained_bytes: u64,
+    requested_bytes: u64,
+) -> bool {
+    requested_bytes != 0
+        && item_count < COMPUTE_RAW_STORAGE_CACHE_MAX_ITEMS
+        && requested_bytes <= COMPUTE_RAW_STORAGE_CACHE_MAX_BYTES
+        && retained_bytes
+            .checked_add(requested_bytes)
+            .is_some_and(|total| total <= COMPUTE_RAW_STORAGE_CACHE_MAX_BYTES)
+}
+
+fn compute_raw_storage_seed_is_valid(byte_len: usize, seed_len: usize, resident: bool) -> bool {
+    byte_len != 0 && (seed_len == byte_len || (seed_len == 0 && resident))
+}
+
+fn acquire_compute_raw_storage(
+    inner: &mut RendererInner,
+    key: crate::compute::ComputeRawStorageKey,
+    seed: &[u8],
+) -> Result<Option<PreparedComputeTexel>, String> {
+    if key.size == 0 {
+        return Err("compute raw storage key has an empty range".to_string());
+    }
+    if let Some(entry) = inner.compute_raw_storage_cache.get(&key) {
+        if !entry.valid {
+            return Ok(None);
+        }
+        if seed.is_empty() && !entry.ready {
+            return Err("compute raw storage cache hit is not ready".to_string());
+        }
+        return Ok(Some(PreparedComputeTexel::resident(key, entry)));
+    }
+    if usize::try_from(key.size).ok() != Some(seed.len()) {
+        return Err(format!(
+            "compute raw storage seed/key size mismatch: seed={:#x} key={:#x}",
+            seed.len(),
+            key.size
+        ));
+    }
+    if inner
+        .compute_raw_storage_cache
+        .keys()
+        .copied()
+        .any(|existing| compute_raw_storage_keys_conflict(existing, key))
+    {
+        return Ok(None);
+    }
+    let retained_bytes = inner
+        .compute_raw_storage_cache
+        .keys()
+        .fold(0u64, |total, existing| total.saturating_add(existing.size));
+    if !compute_raw_storage_cache_can_admit(
+        inner.compute_raw_storage_cache.len(),
+        retained_bytes,
+        key.size,
+    ) {
+        return Ok(None);
+    }
+    let resource = {
+        let RendererInner {
+            device,
+            mem_props,
+            compute_backend,
+            ..
+        } = &mut *inner;
+        compute_backend
+            .as_mut()
+            .ok_or_else(|| "generic Vulkan compute backend is unavailable".to_string())?
+            .acquire_raw_storage_buffer(device, mem_props, seed)?
+    };
+    inner.compute_raw_storage_cache.insert(
+        key,
+        CachedComputeRawStorage {
+            resource,
+            ready: false,
+            valid: true,
+            dirty: false,
+        },
+    );
+    Ok(inner
+        .compute_raw_storage_cache
+        .get(&key)
+        .map(|entry| PreparedComputeTexel::resident(key, entry)))
+}
+
+fn release_unreferenced_compute_raw_storage(inner: &mut RendererInner) {
+    let referenced: std::collections::HashSet<_> = inner
+        .pending_computes
+        .iter()
+        .filter(|pending| pending.resources.is_some())
+        .flat_map(|pending| pending.resident_raw_storage.iter().copied())
+        .collect();
+    let removable: Vec<_> = inner
+        .compute_raw_storage_cache
+        .keys()
+        .copied()
+        .filter(|key| !referenced.contains(key))
+        .collect();
+    if removable.is_empty() {
+        return;
+    }
+    let raw_storage: Vec<_> = removable
+        .into_iter()
+        .filter_map(|key| inner.compute_raw_storage_cache.remove(&key))
+        .map(|entry| entry.resource)
+        .collect();
+    let RendererInner {
+        device,
+        compute_backend,
+        ..
+    } = &mut *inner;
+    if let Some(backend) = compute_backend.as_mut() {
+        backend.recycle_dispatch_resources(device, Vec::new(), raw_storage, Vec::new(), Vec::new());
+    } else {
+        std::mem::forget(raw_storage);
+    }
+}
+
 fn compute_readback_trace_enabled() -> bool {
     std::env::var_os("NEXIUM_COMPUTE_READBACK_TRACE").is_some_and(|value| {
         let value = value.to_string_lossy();
         let value = value.trim();
         !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
     })
+}
+
+fn profile_compute_prep_stage(stage: usize, started: &mut Option<std::time::Instant>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let Some(prev) = started else {
+        return;
+    };
+    NS[stage].fetch_add(prev.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    *started = Some(std::time::Instant::now());
+    if stage != 4 {
+        return;
+    }
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if calls % 512 != 0 {
+        return;
+    }
+    let take = |i: usize| NS[i].swap(0, Ordering::Relaxed) as f64 / 512_000.0;
+    log::warn!(
+        "[compute-stage-prep] calls=512 avg_us validate={:.2} rt_plans={:.2} img_plans={:.2} program={:.2} resources={:.2}",
+        take(0),
+        take(1),
+        take(2),
+        take(3),
+        take(4),
+    );
+}
+
+fn compute_stage_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_COMPUTE_STAGE_PROFILE").is_some())
+}
+
+fn profile_compute_guest_upload_reuse(needs_upload: bool, bytes: usize) {
+    if !compute_stage_profile_enabled() {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static HIT_BYTES: AtomicU64 = AtomicU64::new(0);
+    static MISS_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if needs_upload {
+        MISS_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    } else {
+        HITS.fetch_add(1, Ordering::Relaxed);
+        HIT_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    if calls % 512 != 0 {
+        return;
+    }
+    let hits = HITS.swap(0, Ordering::Relaxed);
+    let hit_bytes = HIT_BYTES.swap(0, Ordering::Relaxed);
+    let miss_bytes = MISS_BYTES.swap(0, Ordering::Relaxed);
+    log::warn!(
+        "[compute-guest-upload] calls=512 hits={} misses={} hit_mib={:.2} miss_mib={:.2}",
+        hits,
+        512 - hits,
+        hit_bytes as f64 / (1024.0 * 1024.0),
+        miss_bytes as f64 / (1024.0 * 1024.0),
+    );
+}
+
+fn profile_compute_guest_decode_reuse(hit: bool, bytes: usize) {
+    if !compute_stage_profile_enabled() {
+        return;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static HIT_BYTES: AtomicU64 = AtomicU64::new(0);
+    static MISS_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if hit {
+        HITS.fetch_add(1, Ordering::Relaxed);
+        HIT_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    } else {
+        MISS_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    if calls % 512 != 0 {
+        return;
+    }
+    let hits = HITS.swap(0, Ordering::Relaxed);
+    let hit_bytes = HIT_BYTES.swap(0, Ordering::Relaxed);
+    let miss_bytes = MISS_BYTES.swap(0, Ordering::Relaxed);
+    log::warn!(
+        "[compute-guest-decode] calls=512 hits={} misses={} hit_mib={:.2} miss_mib={:.2}",
+        hits,
+        512 - hits,
+        hit_bytes as f64 / (1024.0 * 1024.0),
+        miss_bytes as f64 / (1024.0 * 1024.0),
+    );
+}
+
+fn profile_compute_dispatch_stages(
+    prep: std::time::Duration,
+    record: std::time::Duration,
+    submit: std::time::Duration,
+    total: std::time::Duration,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static PREP_NS: AtomicU64 = AtomicU64::new(0);
+    static RECORD_NS: AtomicU64 = AtomicU64::new(0);
+    static SUBMIT_NS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    PREP_NS.fetch_add(prep.as_nanos() as u64, Ordering::Relaxed);
+    RECORD_NS.fetch_add(record.as_nanos() as u64, Ordering::Relaxed);
+    SUBMIT_NS.fetch_add(submit.as_nanos() as u64, Ordering::Relaxed);
+    TOTAL_NS.fetch_add(total.as_nanos() as u64, Ordering::Relaxed);
+    if calls % 512 != 0 {
+        return;
+    }
+    let prep_ns = PREP_NS.swap(0, Ordering::Relaxed);
+    let record_ns = RECORD_NS.swap(0, Ordering::Relaxed);
+    let submit_ns = SUBMIT_NS.swap(0, Ordering::Relaxed);
+    let total_ns = TOTAL_NS.swap(0, Ordering::Relaxed);
+    let tail_ns =
+        total_ns.saturating_sub(prep_ns.saturating_add(record_ns).saturating_add(submit_ns));
+    log::warn!(
+        "[compute-stage-dispatch] calls=512 avg_us prep={:.2} record={:.2} submit={:.2} tail={:.2} total={:.2}",
+        prep_ns as f64 / 512_000.0,
+        record_ns as f64 / 512_000.0,
+        submit_ns as f64 / 512_000.0,
+        tail_ns as f64 / 512_000.0,
+        total_ns as f64 / 512_000.0,
+    );
+}
+
+fn profile_compute_settle_stages(
+    wait: std::time::Duration,
+    read: std::time::Duration,
+    recycle: std::time::Duration,
+    total: std::time::Duration,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    static READ_NS: AtomicU64 = AtomicU64::new(0);
+    static RECYCLE_NS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    WAIT_NS.fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
+    READ_NS.fetch_add(read.as_nanos() as u64, Ordering::Relaxed);
+    RECYCLE_NS.fetch_add(recycle.as_nanos() as u64, Ordering::Relaxed);
+    TOTAL_NS.fetch_add(total.as_nanos() as u64, Ordering::Relaxed);
+    if calls % 512 != 0 {
+        return;
+    }
+    let wait_ns = WAIT_NS.swap(0, Ordering::Relaxed);
+    let read_ns = READ_NS.swap(0, Ordering::Relaxed);
+    let recycle_ns = RECYCLE_NS.swap(0, Ordering::Relaxed);
+    let total_ns = TOTAL_NS.swap(0, Ordering::Relaxed);
+    let other_ns =
+        total_ns.saturating_sub(wait_ns.saturating_add(read_ns).saturating_add(recycle_ns));
+    log::warn!(
+        "[compute-stage-settle] calls=512 avg_us wait={:.2} read={:.2} recycle={:.2} other={:.2} total={:.2}",
+        wait_ns as f64 / 512_000.0,
+        read_ns as f64 / 512_000.0,
+        recycle_ns as f64 / 512_000.0,
+        other_ns as f64 / 512_000.0,
+        total_ns as f64 / 512_000.0,
+    );
+}
+
+fn profile_compute_recycle_stages(
+    extract: std::time::Duration,
+    destroy: std::time::Duration,
+    pool: std::time::Duration,
+    descriptor: std::time::Duration,
+    slot: std::time::Duration,
+    counts: [usize; 9],
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static EXTRACT_NS: AtomicU64 = AtomicU64::new(0);
+    static DESTROY_NS: AtomicU64 = AtomicU64::new(0);
+    static POOL_NS: AtomicU64 = AtomicU64::new(0);
+    static DESCRIPTOR_NS: AtomicU64 = AtomicU64::new(0);
+    static SLOT_NS: AtomicU64 = AtomicU64::new(0);
+    static COUNTS: std::sync::Mutex<[u64; 9]> = std::sync::Mutex::new([0; 9]);
+
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    EXTRACT_NS.fetch_add(extract.as_nanos() as u64, Ordering::Relaxed);
+    DESTROY_NS.fetch_add(destroy.as_nanos() as u64, Ordering::Relaxed);
+    POOL_NS.fetch_add(pool.as_nanos() as u64, Ordering::Relaxed);
+    DESCRIPTOR_NS.fetch_add(descriptor.as_nanos() as u64, Ordering::Relaxed);
+    SLOT_NS.fetch_add(slot.as_nanos() as u64, Ordering::Relaxed);
+    let mut count_totals = COUNTS.lock().unwrap();
+    for (total, count) in count_totals.iter_mut().zip(counts) {
+        *total = total.saturating_add(count as u64);
+    }
+    if calls % 512 != 0 {
+        return;
+    }
+    let count_snapshot = std::mem::take(&mut *count_totals);
+    drop(count_totals);
+    let extract_ns = EXTRACT_NS.swap(0, Ordering::Relaxed);
+    let destroy_ns = DESTROY_NS.swap(0, Ordering::Relaxed);
+    let pool_ns = POOL_NS.swap(0, Ordering::Relaxed);
+    let descriptor_ns = DESCRIPTOR_NS.swap(0, Ordering::Relaxed);
+    let slot_ns = SLOT_NS.swap(0, Ordering::Relaxed);
+    log::warn!(
+        "[compute-stage-recycle] calls=512 avg_us extract={:.2} destroy={:.2} pool={:.2} descriptor={:.2} slot={:.2} avg_counts uniforms={:.2} raw={:.2} residual_texels={:.2} uniform_texels={:.2} guest_images={:.2} alias_views={:.2} outputs={:.2} uploads={:.2} readbacks={:.2}",
+        extract_ns as f64 / 512_000.0,
+        destroy_ns as f64 / 512_000.0,
+        pool_ns as f64 / 512_000.0,
+        descriptor_ns as f64 / 512_000.0,
+        slot_ns as f64 / 512_000.0,
+        count_snapshot[0] as f64 / 512.0,
+        count_snapshot[1] as f64 / 512.0,
+        count_snapshot[2] as f64 / 512.0,
+        count_snapshot[3] as f64 / 512.0,
+        count_snapshot[4] as f64 / 512.0,
+        count_snapshot[5] as f64 / 512.0,
+        count_snapshot[6] as f64 / 512.0,
+        count_snapshot[7] as f64 / 512.0,
+        count_snapshot[8] as f64 / 512.0,
+    );
 }
 
 fn acquire_compute_slot(
@@ -9986,13 +13477,44 @@ fn settle_pending_compute_record(
 ) -> Result<crate::compute::ComputeDispatchResult, String> {
     use crate::compute::{ComputeDispatchResult, ComputeImageReadback, ComputeTexelReadback};
 
+    let settle_started = compute_stage_profile_enabled().then(std::time::Instant::now);
+
     let Some(mut resources) = pending.resources.take() else {
         return Err(format!(
             "pending compute dispatch {} has no transient resources",
             pending.id
         ));
     };
-    if let Err(error) = wait_fence(&inner.device, pending.fence) {
+    let mut foreign_fences = Vec::new();
+    for key in pending.texels.iter().filter_map(|meta| {
+        resources
+            .texels
+            .get(meta.resource_index)
+            .and_then(|texel| texel.resident_key)
+    }) {
+        let latest = inner
+            .pending_computes
+            .iter()
+            .filter(|candidate| {
+                candidate.resources.is_some()
+                    && candidate.id > pending.id
+                    && candidate.resident_raw_storage.contains(&key)
+            })
+            .max_by_key(|candidate| candidate.id);
+        if let Some(latest) = latest {
+            if !foreign_fences.contains(&latest.fence) {
+                foreign_fences.push(latest.fence);
+            }
+        }
+    }
+    let wait_started = settle_started.map(|_| std::time::Instant::now());
+    let wait_result = wait_fence(&inner.device, pending.fence).and_then(|()| {
+        foreign_fences
+            .into_iter()
+            .try_for_each(|fence| wait_fence_no_reset(&inner.device, fence))
+    });
+    let wait_elapsed = wait_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+    if let Err(error) = wait_result {
         match unsafe { inner.device.device_wait_idle() } {
             Ok(()) => {
                 resources.destroy(&inner.device);
@@ -10014,6 +13536,7 @@ fn settle_pending_compute_record(
             }
         }
     }
+    let read_started = settle_started.map(|_| std::time::Instant::now());
     let trace = compute_readback_trace_enabled();
     let mut image_readbacks = Vec::with_capacity(pending.outputs.len());
     for (resource_index, (meta, readback)) in
@@ -10055,7 +13578,21 @@ fn settle_pending_compute_record(
     }
     let mut texel_readbacks = Vec::with_capacity(pending.texels.len());
     for meta in &pending.texels {
-        match resources.texels[meta.resource_index].read(&inner.device, meta.byte_len) {
+        let texel = &resources.texels[meta.resource_index];
+        let readback = if let Some(key) = texel.resident_key {
+            inner
+                .compute_raw_storage_cache
+                .get(&key)
+                .ok_or_else(|| "resident compute raw storage disappeared".to_string())
+                .and_then(|entry| entry.resource.read(&inner.device, meta.byte_len))
+        } else {
+            texel
+                .owned
+                .as_ref()
+                .ok_or_else(|| "compute texel buffer has no backing resource".to_string())
+                .and_then(|resource| resource.read(&inner.device, meta.byte_len))
+        };
+        match readback {
             Ok(bytes) => texel_readbacks.push(ComputeTexelReadback {
                 resource_index: meta.resource_index,
                 bytes,
@@ -10068,22 +13605,58 @@ fn settle_pending_compute_record(
             }
         }
     }
+    let read_elapsed = read_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+    let recycle_started = settle_started.map(|_| std::time::Instant::now());
+    let extract_started = settle_started.map(|_| std::time::Instant::now());
+    let raw_storage = resources.take_pooled_raw_texels();
     let uniforms = std::mem::take(&mut resources.uniforms);
+    let guest_images = std::mem::take(&mut resources.guest_images);
+    let guest_image_keys = std::mem::take(&mut resources.guest_image_keys);
+    let guest_image_contents = std::mem::take(&mut resources.guest_image_contents);
     let outputs = std::mem::take(&mut resources.outputs);
     let readbacks = std::mem::take(&mut resources.readbacks);
+    let recycle_counts = [
+        uniforms.len(),
+        raw_storage.len(),
+        resources
+            .texels
+            .iter()
+            .filter(|texel| texel.owned.is_some())
+            .count(),
+        resources.uniform_texels.len(),
+        guest_images.len(),
+        resources.sampled_alias_views.len(),
+        outputs.len(),
+        resources.output_uploads.iter().flatten().count(),
+        readbacks.len(),
+    ];
+    let extract_elapsed =
+        extract_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+    let destroy_started = settle_started.map(|_| std::time::Instant::now());
     resources.destroy(&inner.device);
+    let destroy_elapsed =
+        destroy_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+    let pool_started = settle_started.map(|_| std::time::Instant::now());
     {
         let RendererInner {
             device,
             compute_backend,
+            compute_guest_image_pool,
             ..
         } = &mut *inner;
         match compute_backend.as_mut() {
-            Some(backend) => {
-                backend.recycle_dispatch_resources(device, uniforms, outputs, readbacks)
-            }
+            Some(backend) => backend.recycle_dispatch_resources(
+                device,
+                uniforms,
+                raw_storage,
+                outputs,
+                readbacks,
+            ),
             None => {
                 for resource in uniforms {
+                    resource.destroy(device);
+                }
+                for resource in raw_storage {
                     resource.destroy(device);
                 }
                 for resource in outputs {
@@ -10094,9 +13667,38 @@ fn settle_pending_compute_record(
                 }
             }
         }
+        recycle_compute_guest_images(
+            device,
+            compute_guest_image_pool,
+            guest_image_keys,
+            guest_image_contents,
+            guest_images,
+        );
     }
+    let pool_elapsed = pool_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+    let descriptor_started = settle_started.map(|_| std::time::Instant::now());
     free_compute_descriptor_set(inner, pending.descriptor_pool, pending.descriptor_set);
+    let descriptor_elapsed =
+        descriptor_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+    let slot_started = settle_started.map(|_| std::time::Instant::now());
     inner.compute_slot_pool.push((pending.cmd, pending.fence));
+    let slot_elapsed = slot_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+    if let Some(started) = settle_started {
+        profile_compute_recycle_stages(
+            extract_elapsed,
+            destroy_elapsed,
+            pool_elapsed,
+            descriptor_elapsed,
+            slot_elapsed,
+            recycle_counts,
+        );
+        profile_compute_settle_stages(
+            wait_elapsed,
+            read_elapsed,
+            recycle_started.map_or(std::time::Duration::ZERO, |started| started.elapsed()),
+            started.elapsed(),
+        );
+    }
     Ok(ComputeDispatchResult {
         image_readbacks,
         texel_readbacks,
@@ -10157,18 +13759,27 @@ fn execute_compute_dispatch(
         ComputeDispatchOutcome, ComputeDispatchResult, ComputeImageReadback, ComputeTexelReadback,
     };
 
+    let dispatch_started = compute_stage_profile_enabled().then(std::time::Instant::now);
+
+    let mut prep_stage_started = dispatch_started;
     if let Err(reason) = validate_compute_dispatch(inner, &dispatch) {
         return ComputeDispatchOutcome::Unsupported(reason);
     }
 
+    profile_compute_prep_stage(0, &mut prep_stage_started);
     let mut sample_plans = Vec::with_capacity(dispatch.sampled_rts.len());
     for sampled in &dispatch.sampled_rts {
         let numeric_type = sampled.sample_type.spirv_type();
+        let is_3d = tic_is_volume(&sampled.tic);
+        let is_cube = tic_is_cube(&sampled.tic);
+        let depth = if is_3d { sampled.tic.depth.max(1) } else { 1 };
         let cross_access_output = compute_cross_access_output_index(&dispatch, sampled.binding);
         let live_view_compatible = sampled.tic.mip_levels() == 1
             && sampled.tic.view_base_mip() == 0
             && sampled.tic.view_mip_levels() == 1;
-        let alias = if cross_access_output.is_none()
+        let alias = if !is_3d
+            && !is_cube
+            && cross_access_output.is_none()
             && live_view_compatible
             && (!sampled.guest_bytes_authoritative || sampled.guest_bytes.is_none())
         {
@@ -10290,6 +13901,7 @@ fn execute_compute_dispatch(
                 rt_alias_sample_view(
                     device,
                     rt_cache,
+                    None,
                     utility_slot,
                     alias,
                     Some(sampled.tic),
@@ -10318,34 +13930,6 @@ fn execute_compute_dispatch(
                 texture_requires_integer_sampler(numeric_type, stencil_alias),
             )
         } else {
-            if sampled.require_live {
-                log::warn!(
-                    "[compute-alias-miss] binding={} tic_fmt={:?} :: {}",
-                    sampled.binding,
-                    sampled.tic.format,
-                    inner.rt_cache.debug_depth_resolution(sampled.key)
-                );
-                return ComputeDispatchOutcome::Unsupported(format!(
-                    "no content-bearing live render target for required compute binding {} ({})",
-                    sampled.binding,
-                    sampled.key.label()
-                ));
-            }
-            let Some(raw) = sampled.guest_bytes.as_deref() else {
-                return ComputeDispatchOutcome::Unsupported(format!(
-                    "compute binding {} has neither a live target nor guest bytes",
-                    sampled.binding
-                ));
-            };
-            if raw.is_empty()
-                || sampled.tic.is_buffer()
-                || tic_requires_dedicated_sampled_view(&sampled.tic)
-            {
-                return ComputeDispatchOutcome::Unsupported(format!(
-                    "compute guest fallback binding {} is not a supported 2D image",
-                    sampled.binding
-                ));
-            }
             let format = match texture_image_format_for_tic(&sampled.tic, numeric_type) {
                 Ok(format) => format,
                 Err(error) => return ComputeDispatchOutcome::Unsupported(error),
@@ -10383,30 +13967,146 @@ fn execute_compute_dispatch(
                     format_features3.optimal_tiling_features
                 ));
             }
-            let upload = match texture_upload_data(raw, &sampled.tic, 1, raw.len(), false, format) {
-                Ok(upload) => upload,
-                Err(error) => return ComputeDispatchOutcome::Unsupported(error),
-            };
             let swizzle =
                 texture_view_swizzle(sampled.tic.format, numeric_type, sampled.tic.swizzle);
-            (
-                ComputeSamplePlan::Guest {
-                    binding: sampled.binding,
-                    sampler: vk::Sampler::null(),
-                    width: sampled.tic.width,
-                    height: sampled.tic.height,
-                    depth: 1,
-                    is_3d: false,
+            let components = texture_component_mapping(swizzle);
+            let live_volume = if is_3d
+                && live_view_compatible
+                && sampled.tic.base_layer == 0
+                && sampled.sample_type == crate::compute::ComputeSampleType::Float
+                && !sampled.guest_bytes_authoritative
+            {
+                let pitch_size = sampled
+                    .tic
+                    .format
+                    .linear_size(sampled.tic.width, sampled.tic.height);
+                complete_compute_volume_rt_slices(
+                    find_volume_rt_slices(
+                        &inner.rt_cache,
+                        &sampled.tic,
+                        pitch_size,
+                        depth,
+                        Some(sampled.key),
+                    ),
+                    depth,
                     format,
-                    components: texture_component_mapping(swizzle),
-                    mip_levels: sampled.tic.mip_levels(),
-                    view_base_mip: sampled.tic.view_base_mip(),
-                    view_mip_levels: sampled.tic.view_mip_levels(),
-                    upload_bytes: upload.bytes,
-                    upload_copies: upload.copies,
-                },
-                integer_sample,
-            )
+                )
+                .and_then(|slices| {
+                    let RendererInner {
+                        device,
+                        mem_props,
+                        compute_volume_cache,
+                        ..
+                    } = &mut *inner;
+                    acquire_compute_volume_cache(
+                        device,
+                        mem_props,
+                        compute_volume_cache,
+                        sampled.tic.width,
+                        sampled.tic.height,
+                        depth,
+                        format,
+                        components,
+                        sampled.tic.mip_levels(),
+                        sampled.tic.view_base_mip(),
+                        sampled.tic.view_mip_levels(),
+                        slices,
+                    )
+                })
+            } else {
+                None
+            };
+            if let Some(volume) = live_volume {
+                (
+                    ComputeSamplePlan::CachedVolume {
+                        binding: sampled.binding,
+                        sampler: vk::Sampler::null(),
+                        volume,
+                    },
+                    integer_sample,
+                )
+            } else {
+                if sampled.require_live {
+                    log::warn!(
+                        "[compute-alias-miss] binding={} tic_fmt={:?} :: {}",
+                        sampled.binding,
+                        sampled.tic.format,
+                        inner.rt_cache.debug_depth_resolution(sampled.key)
+                    );
+                    return ComputeDispatchOutcome::Unsupported(format!(
+                        "no content-bearing live render target for required compute binding {} ({})",
+                        sampled.binding,
+                        sampled.key.label()
+                    ));
+                }
+                let Some(raw) = sampled.guest_bytes.as_deref() else {
+                    return ComputeDispatchOutcome::Unsupported(format!(
+                        "compute binding {} has neither a live target nor guest bytes",
+                        sampled.binding
+                    ));
+                };
+                if raw.is_empty()
+                    || sampled.tic.is_buffer()
+                    || (tic_requires_dedicated_sampled_view(&sampled.tic) && !is_3d && !is_cube)
+                    || sampled.tic.base_layer != 0
+                    || (is_3d && sampled.tic.mip_levels() != 1)
+                {
+                    return ComputeDispatchOutcome::Unsupported(format!(
+                        "compute guest fallback binding {} is not a supported 2D/3D/cube image",
+                        sampled.binding
+                    ));
+                }
+                if is_cube && (sampled.tic.width != sampled.tic.height || sampled.tic.depth != 1) {
+                    return ComputeDispatchOutcome::Unsupported(format!(
+                        "compute guest cube binding {} has non-square or layered extent {}x{}x{}",
+                        sampled.binding, sampled.tic.width, sampled.tic.height, sampled.tic.depth
+                    ));
+                }
+                let slice_pitch = if (is_3d || is_cube)
+                    && (!sampled.tic.is_block_linear
+                        || crate::pitch_oracle::is_pitch_dst(sampled.tic.gpu_va))
+                {
+                    sampled
+                        .tic
+                        .format
+                        .linear_size(sampled.tic.width, sampled.tic.height)
+                } else {
+                    raw.len()
+                };
+                let layer_count = if is_cube { 6 } else { depth };
+                let content = match prepare_compute_guest_image_content(
+                    &inner.compute_guest_image_pool,
+                    &mut inner.compute_guest_content_memo,
+                    sampled.content_key,
+                    raw,
+                    sampled.tic,
+                    layer_count,
+                    slice_pitch,
+                    false,
+                    format,
+                ) {
+                    Ok(content) => content,
+                    Err(error) => return ComputeDispatchOutcome::Unsupported(error),
+                };
+                (
+                    ComputeSamplePlan::Guest {
+                        binding: sampled.binding,
+                        sampler: vk::Sampler::null(),
+                        width: sampled.tic.width,
+                        height: sampled.tic.height,
+                        depth,
+                        is_3d,
+                        is_cube,
+                        format,
+                        components,
+                        mip_levels: sampled.tic.mip_levels(),
+                        view_base_mip: sampled.tic.view_base_mip(),
+                        view_mip_levels: sampled.tic.view_mip_levels(),
+                        content,
+                    },
+                    integer_sample,
+                )
+            }
         };
         let sampler = {
             let RendererInner {
@@ -10439,6 +14139,13 @@ fn execute_compute_dispatch(
                 live.sampler = sampler;
                 ComputeSamplePlan::Live(live)
             }
+            ComputeSamplePlan::CachedVolume {
+                binding, volume, ..
+            } => ComputeSamplePlan::CachedVolume {
+                binding,
+                sampler,
+                volume,
+            },
             ComputeSamplePlan::CrossAccess {
                 binding,
                 output_index,
@@ -10456,13 +14163,13 @@ fn execute_compute_dispatch(
                 height,
                 depth,
                 is_3d,
+                is_cube,
                 format,
                 components,
                 mip_levels,
                 view_base_mip,
                 view_mip_levels,
-                upload_bytes,
-                upload_copies,
+                content,
                 ..
             } => ComputeSamplePlan::Guest {
                 binding,
@@ -10471,18 +14178,19 @@ fn execute_compute_dispatch(
                 height,
                 depth,
                 is_3d,
+                is_cube,
                 format,
                 components,
                 mip_levels,
                 view_base_mip,
                 view_mip_levels,
-                upload_bytes,
-                upload_copies,
+                content,
             },
         };
         sample_plans.push(plan);
     }
 
+    profile_compute_prep_stage(1, &mut prep_stage_started);
     let mut image_plans = Vec::with_capacity(dispatch.sampled_images.len());
     for sampled in &dispatch.sampled_images {
         let tic = &sampled.tic;
@@ -10634,12 +14342,20 @@ fn execute_compute_dispatch(
             } else {
                 sampled.guest_bytes.len()
             };
-        let upload =
-            match texture_upload_data(&sampled.guest_bytes, tic, depth, slice_pitch, false, format)
-            {
-                Ok(upload) => upload,
-                Err(error) => return ComputeDispatchOutcome::Unsupported(error),
-            };
+        let content = match prepare_compute_guest_image_content(
+            &inner.compute_guest_image_pool,
+            &mut inner.compute_guest_content_memo,
+            sampled.content_key,
+            &sampled.guest_bytes,
+            *tic,
+            depth,
+            slice_pitch,
+            false,
+            format,
+        ) {
+            Ok(content) => content,
+            Err(error) => return ComputeDispatchOutcome::Unsupported(error),
+        };
         let swizzle = texture_view_swizzle(tic.format, numeric_type, tic.swizzle);
         image_plans.push(ComputeImagePlan::Guest {
             binding: sampled.binding,
@@ -10652,15 +14368,16 @@ fn execute_compute_dispatch(
             mip_levels: tic.mip_levels(),
             view_base_mip: tic.view_base_mip(),
             view_mip_levels: tic.view_mip_levels(),
-            upload_bytes: upload.bytes,
-            upload_copies: upload.copies,
+            content,
         });
     }
 
     let mut sample_transitions: Vec<ComputeSampleTransition> = Vec::new();
     for sample in sample_plans.iter().filter_map(|plan| match plan {
         ComputeSamplePlan::Live(sample) => Some(sample),
-        ComputeSamplePlan::CrossAccess { .. } | ComputeSamplePlan::Guest { .. } => None,
+        ComputeSamplePlan::CachedVolume { .. }
+        | ComputeSamplePlan::CrossAccess { .. }
+        | ComputeSamplePlan::Guest { .. } => None,
     }) {
         if let Some(existing) = sample_transitions
             .iter_mut()
@@ -10705,6 +14422,7 @@ fn execute_compute_dispatch(
         }
     }
 
+    profile_compute_prep_stage(2, &mut prep_stage_started);
     let descriptor_spec = crate::compute::descriptor_spec(&dispatch);
     let reuse_sets = lazy && !inner.pending_computes.is_empty();
     let prepared = {
@@ -10713,6 +14431,7 @@ fn execute_compute_dispatch(
             device,
             dispatch.program_key,
             &dispatch.spirv,
+            dispatch.spirv_hash,
             dispatch.local_size,
             dispatch.required_subgroup_size,
             descriptor_spec.clone(),
@@ -10732,6 +14451,7 @@ fn execute_compute_dispatch(
                 &inner.device,
                 dispatch.program_key,
                 &dispatch.spirv,
+                dispatch.spirv_hash,
                 dispatch.local_size,
                 dispatch.required_subgroup_size,
                 descriptor_spec,
@@ -10744,6 +14464,7 @@ fn execute_compute_dispatch(
         Err(error) => return ComputeDispatchOutcome::FailedBeforeSubmit(error),
     };
 
+    profile_compute_prep_stage(3, &mut prep_stage_started);
     let output_lengths: Vec<usize> = dispatch
         .outputs
         .iter()
@@ -10773,21 +14494,67 @@ fn execute_compute_dispatch(
         }
         for texel in &dispatch.texel_buffers {
             let resource = if texel.raw {
-                crate::compute::create_compute_buffer(
-                    &inner.device,
-                    &inner.mem_props,
-                    &texel.bytes,
-                    vk::BufferUsageFlags::STORAGE_BUFFER,
-                    false,
-                )?
+                if let Some(key) = texel.raw_storage_key {
+                    if usize::try_from(key.size).ok() != Some(texel.byte_len) {
+                        return Err(format!(
+                            "compute raw storage request/key size mismatch: request={:#x} key={:#x}",
+                            texel.byte_len, key.size
+                        ));
+                    }
+                    if let Some(resource) = acquire_compute_raw_storage(inner, key, &texel.bytes)? {
+                        resource
+                    } else {
+                        if texel.bytes.len() != texel.byte_len {
+                            return Err(
+                                "compute raw storage cache miss has no guest seed".to_string()
+                            );
+                        }
+                        let RendererInner {
+                            device,
+                            mem_props,
+                            compute_backend,
+                            ..
+                        } = &mut *inner;
+                        PreparedComputeTexel::owned(
+                            compute_backend
+                                .as_mut()
+                                .unwrap()
+                                .acquire_raw_storage_buffer(device, mem_props, &texel.bytes)?,
+                            true,
+                        )
+                    }
+                } else {
+                    if texel.bytes.len() != texel.byte_len {
+                        return Err("transient compute raw storage has no guest seed".to_string());
+                    }
+                    let RendererInner {
+                        device,
+                        mem_props,
+                        compute_backend,
+                        ..
+                    } = &mut *inner;
+                    PreparedComputeTexel::owned(
+                        compute_backend
+                            .as_mut()
+                            .unwrap()
+                            .acquire_raw_storage_buffer(device, mem_props, &texel.bytes)?,
+                        true,
+                    )
+                }
             } else {
-                crate::compute::create_compute_texel_buffer(
-                    &inner.device,
-                    &inner.mem_props,
-                    &texel.bytes,
-                    vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
-                    texel.format.vk_format(),
-                )?
+                if texel.bytes.len() != texel.byte_len {
+                    return Err("compute storage texel buffer size mismatch".to_string());
+                }
+                PreparedComputeTexel::owned(
+                    crate::compute::create_compute_texel_buffer(
+                        &inner.device,
+                        &inner.mem_props,
+                        &texel.bytes,
+                        vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
+                        texel.format.vk_format(),
+                    )?,
+                    false,
+                )
             };
             resources.texels.push(resource);
         }
@@ -10803,49 +14570,67 @@ fn execute_compute_dispatch(
                 )?);
         }
         for plan in &sample_plans {
+            if let ComputeSamplePlan::CachedVolume { volume, .. } = plan {
+                let mut volume = volume.clone();
+                if let Some(existing) = resources.guest_sources.iter().find_map(|source| {
+                    let PreparedComputeGuestSource::CachedVolume(existing) = source else {
+                        return None;
+                    };
+                    (existing.cache_index == volume.cache_index).then_some(existing)
+                }) {
+                    if existing.signature != volume.signature {
+                        return Err(
+                            "one compute dispatch requested conflicting versions of the same cached volume"
+                                .to_string(),
+                        );
+                    }
+                    volume.needs_copy = false;
+                }
+                resources
+                    .guest_sources
+                    .push(PreparedComputeGuestSource::CachedVolume(volume));
+                continue;
+            }
             let ComputeSamplePlan::Guest {
                 width,
                 height,
                 depth,
                 is_3d,
+                is_cube,
                 format,
                 components,
                 mip_levels,
                 view_base_mip,
                 view_mip_levels,
-                upload_bytes,
-                upload_copies,
+                content,
                 ..
             } = plan
             else {
                 continue;
             };
-            let copies: Vec<_> = upload_copies
-                .iter()
-                .map(|copy| crate::compute::ComputeGuestImageCopy {
-                    buffer_offset: copy.buffer_offset,
-                    mip_level: copy.mip_level,
-                    width: copy.width,
-                    height: copy.height,
-                })
-                .collect();
+            let (key, retained_content, image) = acquire_compute_guest_image(
+                &inner.device,
+                &inner.mem_props,
+                &mut inner.compute_guest_image_pool,
+                *width,
+                *height,
+                *depth,
+                *is_3d,
+                *is_cube,
+                *format,
+                *components,
+                *mip_levels,
+                *view_base_mip,
+                *view_mip_levels,
+                content,
+            )?;
+            let index = resources.guest_images.len();
+            resources.guest_images.push(image);
+            resources.guest_image_keys.push(key);
+            resources.guest_image_contents.push(retained_content);
             resources
-                .guest_images
-                .push(crate::compute::create_compute_guest_image(
-                    &inner.device,
-                    &inner.mem_props,
-                    *width,
-                    *height,
-                    *depth,
-                    *is_3d,
-                    *format,
-                    *components,
-                    *mip_levels,
-                    *view_base_mip,
-                    *view_mip_levels,
-                    upload_bytes,
-                    &copies,
-                )?);
+                .guest_sources
+                .push(PreparedComputeGuestSource::Transient(index));
         }
         for plan in &image_plans {
             let ComputeImagePlan::Guest {
@@ -10858,39 +14643,35 @@ fn execute_compute_dispatch(
                 mip_levels,
                 view_base_mip,
                 view_mip_levels,
-                upload_bytes,
-                upload_copies,
+                content,
                 ..
             } = plan
             else {
                 continue;
             };
-            let copies: Vec<_> = upload_copies
-                .iter()
-                .map(|copy| crate::compute::ComputeGuestImageCopy {
-                    buffer_offset: copy.buffer_offset,
-                    mip_level: copy.mip_level,
-                    width: copy.width,
-                    height: copy.height,
-                })
-                .collect();
+            let (key, retained_content, image) = acquire_compute_guest_image(
+                &inner.device,
+                &inner.mem_props,
+                &mut inner.compute_guest_image_pool,
+                *width,
+                *height,
+                *depth,
+                *is_3d,
+                false,
+                *format,
+                *components,
+                *mip_levels,
+                *view_base_mip,
+                *view_mip_levels,
+                content,
+            )?;
+            let index = resources.guest_images.len();
+            resources.guest_images.push(image);
+            resources.guest_image_keys.push(key);
+            resources.guest_image_contents.push(retained_content);
             resources
-                .guest_images
-                .push(crate::compute::create_compute_guest_image(
-                    &inner.device,
-                    &inner.mem_props,
-                    *width,
-                    *height,
-                    *depth,
-                    *is_3d,
-                    *format,
-                    *components,
-                    *mip_levels,
-                    *view_base_mip,
-                    *view_mip_levels,
-                    upload_bytes,
-                    &copies,
-                )?);
+                .guest_sources
+                .push(PreparedComputeGuestSource::Transient(index));
         }
         for (output, output_len) in dispatch.outputs.iter().zip(&output_lengths) {
             let RendererInner {
@@ -10985,6 +14766,24 @@ fn execute_compute_dispatch(
         .into_iter()
         .map(|plan| match plan {
             ComputeSamplePlan::Live(sample) => sample,
+            ComputeSamplePlan::CachedVolume {
+                binding, sampler, ..
+            } => {
+                let source = &resources.guest_sources[next_guest];
+                next_guest += 1;
+                let PreparedComputeGuestSource::CachedVolume(volume) = source else {
+                    unreachable!("cached compute volume lost its prepared source")
+                };
+                PreparedComputeSample {
+                    binding,
+                    image: volume.image,
+                    view: volume.view,
+                    sampler,
+                    descriptor_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    old_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    aspects: vk::ImageAspectFlags::COLOR,
+                }
+            }
             ComputeSamplePlan::CrossAccess {
                 binding,
                 sampler,
@@ -11006,13 +14805,19 @@ fn execute_compute_dispatch(
             ComputeSamplePlan::Guest {
                 binding, sampler, ..
             } => {
-                let guest_index = next_guest;
+                let source = &resources.guest_sources[next_guest];
                 next_guest += 1;
-                let image = &resources.guest_images[guest_index].image;
+                let (image, view) = match source {
+                    PreparedComputeGuestSource::Transient(index) => {
+                        let image = &resources.guest_images[*index].image;
+                        (image.image, image.view)
+                    }
+                    PreparedComputeGuestSource::CachedVolume(volume) => (volume.image, volume.view),
+                };
                 PreparedComputeSample {
                     binding,
-                    image: image.image,
-                    view: image.view,
+                    image,
+                    view,
                     sampler,
                     descriptor_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     old_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -11042,13 +14847,19 @@ fn execute_compute_dispatch(
                 }
             }
             ComputeImagePlan::Guest { binding, .. } => {
-                let guest_index = next_guest;
+                let source = &resources.guest_sources[next_guest];
                 next_guest += 1;
-                let image = &resources.guest_images[guest_index].image;
+                let (image, view) = match source {
+                    PreparedComputeGuestSource::Transient(index) => {
+                        let image = &resources.guest_images[*index].image;
+                        (image.image, image.view)
+                    }
+                    PreparedComputeGuestSource::CachedVolume(volume) => (volume.image, volume.view),
+                };
                 PreparedComputeImage {
                     binding,
-                    image: image.image,
-                    view: image.view,
+                    image,
+                    view,
                     descriptor_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     old_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     aspects: vk::ImageAspectFlags::COLOR,
@@ -11091,7 +14902,7 @@ fn execute_compute_dispatch(
         .map(|(request, resource)| vk::DescriptorBufferInfo {
             buffer: resource.buffer,
             offset: 0,
-            range: request.bytes.len() as u64,
+            range: request.byte_len as u64,
         })
         .collect();
     let output_infos: Vec<_> = resources
@@ -11215,7 +15026,11 @@ fn execute_compute_dispatch(
     for (texel, resource) in dispatch.texel_buffers.iter().zip(&resources.texels) {
         buffer_barriers.push(vk::BufferMemoryBarrier {
             s_type: vk::StructureType::BUFFER_MEMORY_BARRIER,
-            src_access_mask: vk::AccessFlags::HOST_WRITE,
+            src_access_mask: if resource.resident_dirty_hit {
+                vk::AccessFlags::SHADER_WRITE
+            } else {
+                vk::AccessFlags::HOST_WRITE
+            },
             dst_access_mask: if texel.writable {
                 vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE
             } else {
@@ -11225,7 +15040,7 @@ fn execute_compute_dispatch(
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             buffer: resource.buffer,
             offset: 0,
-            size: texel.bytes.len() as u64,
+            size: texel.byte_len as u64,
             ..Default::default()
         });
     }
@@ -11291,6 +15106,7 @@ fn execute_compute_dispatch(
         });
     }
 
+    profile_compute_prep_stage(4, &mut prep_stage_started);
     let (cmd, fence) = if lazy {
         match acquire_compute_slot(inner) {
             Ok(slot) => slot,
@@ -11303,13 +15119,27 @@ fn execute_compute_dispatch(
     } else {
         (inner.utility_slot.cmd, inner.utility_slot.fence)
     };
+    let prep_elapsed =
+        dispatch_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+    let record_started = dispatch_started.map(|_| std::time::Instant::now());
     let command_result = (|| -> Result<(), String> {
         reset_command_buffer(&inner.device, cmd)?;
         begin_one_time(&inner.device, cmd)?;
-        if !resources.guest_images.is_empty() {
+        let has_cached_volume_copy = resources.guest_sources.iter().any(|source| {
+            matches!(
+                source,
+                PreparedComputeGuestSource::CachedVolume(volume) if volume.needs_copy
+            )
+        });
+        let has_guest_image_upload = resources
+            .guest_images
+            .iter()
+            .any(|guest| guest.needs_upload);
+        if has_guest_image_upload || has_cached_volume_copy {
             let guest_buffer_barriers: Vec<_> = resources
                 .guest_images
                 .iter()
+                .filter(|guest| guest.needs_upload)
                 .map(|guest| vk::BufferMemoryBarrier {
                     s_type: vk::StructureType::BUFFER_MEMORY_BARRIER,
                     src_access_mask: vk::AccessFlags::HOST_WRITE,
@@ -11322,14 +15152,19 @@ fn execute_compute_dispatch(
                     ..Default::default()
                 })
                 .collect();
-            let guest_upload_barriers: Vec<_> = resources
+            let mut guest_upload_barriers: Vec<_> = resources
                 .guest_images
                 .iter()
+                .filter(|guest| guest.needs_upload)
                 .map(|guest| vk::ImageMemoryBarrier {
                     s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-                    src_access_mask: vk::AccessFlags::empty(),
+                    src_access_mask: if guest.layout == vk::ImageLayout::UNDEFINED {
+                        vk::AccessFlags::empty()
+                    } else {
+                        vk::AccessFlags::SHADER_READ
+                    },
                     dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-                    old_layout: vk::ImageLayout::UNDEFINED,
+                    old_layout: guest.layout,
                     new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
@@ -11339,22 +15174,55 @@ fn execute_compute_dispatch(
                         base_mip_level: 0,
                         level_count: guest.mip_levels,
                         base_array_layer: 0,
-                        layer_count: 1,
+                        layer_count: vk::REMAINING_ARRAY_LAYERS,
                     },
                     ..Default::default()
                 })
                 .collect();
+            guest_upload_barriers.extend(resources.guest_sources.iter().filter_map(|source| {
+                let PreparedComputeGuestSource::CachedVolume(volume) = source else {
+                    return None;
+                };
+                volume.needs_copy.then_some(vk::ImageMemoryBarrier {
+                    s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+                    src_access_mask: if volume.old_layout == vk::ImageLayout::UNDEFINED {
+                        vk::AccessFlags::empty()
+                    } else {
+                        vk::AccessFlags::SHADER_READ
+                    },
+                    dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                    old_layout: volume.old_layout,
+                    new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    image: volume.image,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: volume.mip_levels,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    ..Default::default()
+                })
+            }));
             unsafe {
                 inner.device.cmd_pipeline_barrier(
                     cmd,
-                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::HOST
+                        | vk::PipelineStageFlags::TOP_OF_PIPE
+                        | vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
                     &[],
                     &guest_buffer_barriers,
                     &guest_upload_barriers,
                 );
-                for guest in &resources.guest_images {
+                for guest in resources
+                    .guest_images
+                    .iter()
+                    .filter(|guest| guest.needs_upload)
+                {
                     inner.device.cmd_copy_buffer_to_image(
                         cmd,
                         guest.upload.buffer,
@@ -11363,9 +15231,25 @@ fn execute_compute_dispatch(
                         &guest.copies,
                     );
                 }
-                let guest_sample_barriers: Vec<_> = resources
+                for source in &resources.guest_sources {
+                    let PreparedComputeGuestSource::CachedVolume(volume) = source else {
+                        continue;
+                    };
+                    if volume.needs_copy {
+                        copy_compute_volume_rt_slices(
+                            &inner.device,
+                            cmd,
+                            volume.image,
+                            volume.width,
+                            volume.height,
+                            &volume.slices,
+                        );
+                    }
+                }
+                let mut guest_sample_barriers: Vec<_> = resources
                     .guest_images
                     .iter()
+                    .filter(|guest| guest.needs_upload)
                     .map(|guest| vk::ImageMemoryBarrier {
                         s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
                         src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
@@ -11380,11 +15264,34 @@ fn execute_compute_dispatch(
                             base_mip_level: 0,
                             level_count: guest.mip_levels,
                             base_array_layer: 0,
-                            layer_count: 1,
+                            layer_count: vk::REMAINING_ARRAY_LAYERS,
                         },
                         ..Default::default()
                     })
                     .collect();
+                guest_sample_barriers.extend(resources.guest_sources.iter().filter_map(|source| {
+                    let PreparedComputeGuestSource::CachedVolume(volume) = source else {
+                        return None;
+                    };
+                    volume.needs_copy.then_some(vk::ImageMemoryBarrier {
+                        s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+                        src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                        dst_access_mask: vk::AccessFlags::SHADER_READ,
+                        old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                        image: volume.image,
+                        subresource_range: vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: volume.mip_levels,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        ..Default::default()
+                    })
+                }));
                 inner.device.cmd_pipeline_barrier(
                     cmd,
                     vk::PipelineStageFlags::TRANSFER,
@@ -11561,7 +15468,7 @@ fn execute_compute_dispatch(
                 dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 buffer: resource.buffer,
                 offset: 0,
-                size: texel.bytes.len() as u64,
+                size: texel.byte_len as u64,
                 ..Default::default()
             });
         }
@@ -11681,6 +15588,8 @@ fn execute_compute_dispatch(
         }
         end_one_time(&inner.device, cmd)
     })();
+    let record_elapsed =
+        record_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     if let Err(error) = command_result {
         let _ = reset_command_buffer(&inner.device, cmd);
         resources.destroy(&inner.device);
@@ -11691,12 +15600,15 @@ fn execute_compute_dispatch(
         return ComputeDispatchOutcome::FailedBeforeSubmit(error);
     }
 
+    let submit_started = dispatch_started.map(|_| std::time::Instant::now());
     let submit_result = if lazy {
         submit_with_fence_untracked(&inner.device, inner.queue, cmd, fence)
     } else {
         submit_with_fence(&inner.device, inner.queue, cmd, fence)
             .and_then(|_| wait_fence(&inner.device, fence))
     };
+    let submit_elapsed =
+        submit_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
     if let Err(error) = submit_result {
         match unsafe { inner.device.device_wait_idle() } {
             Ok(()) => {
@@ -11726,6 +15638,13 @@ fn execute_compute_dispatch(
         }
     }
 
+    for guest in &mut resources.guest_images {
+        guest.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        guest.needs_upload = false;
+    }
+    resources.commit_cached_volumes(&mut inner.compute_volume_cache);
+    resources.commit_resident_raw_storage(&dispatch, &mut inner.compute_raw_storage_cache);
+
     if lazy {
         let outputs = dispatch
             .outputs
@@ -11747,9 +15666,24 @@ fn execute_compute_dispatch(
             .filter(|(_, request)| request.writable)
             .map(|(resource_index, request)| PendingComputeTexel {
                 resource_index,
-                byte_len: request.bytes.len(),
+                byte_len: request.byte_len,
             })
             .collect();
+        let mut resident_raw_storage: Vec<_> = resources
+            .texels
+            .iter()
+            .filter_map(|texel| texel.resident_key)
+            .collect();
+        resident_raw_storage.sort_unstable_by_key(|key| {
+            (
+                key.mapping_epoch,
+                key.nvmap_id,
+                key.gpu_va,
+                key.cpu_addr,
+                key.size,
+            )
+        });
+        resident_raw_storage.dedup();
         let id = inner.next_pending_compute_id;
         inner.next_pending_compute_id += 1;
         inner.pending_computes.push(PendingCompute {
@@ -11762,8 +15696,17 @@ fn execute_compute_dispatch(
             resources: Some(resources),
             outputs,
             texels,
+            resident_raw_storage,
             result: None,
         });
+        if let Some(started) = dispatch_started {
+            profile_compute_dispatch_stages(
+                prep_elapsed,
+                record_elapsed,
+                submit_elapsed,
+                started.elapsed(),
+            );
+        }
         return ComputeDispatchOutcome::Submitted(id);
     }
 
@@ -11821,7 +15764,20 @@ fn execute_compute_dispatch(
         if !request.writable {
             continue;
         }
-        match resource.read(&inner.device, request.bytes.len()) {
+        let readback = if let Some(key) = resource.resident_key {
+            inner
+                .compute_raw_storage_cache
+                .get(&key)
+                .ok_or_else(|| "resident compute raw storage disappeared".to_string())
+                .and_then(|entry| entry.resource.read(&inner.device, request.byte_len))
+        } else {
+            resource
+                .owned
+                .as_ref()
+                .ok_or_else(|| "compute texel buffer has no backing resource".to_string())
+                .and_then(|resource| resource.read(&inner.device, request.byte_len))
+        };
+        match readback {
             Ok(bytes) => texel_readbacks.push(ComputeTexelReadback {
                 resource_index,
                 bytes,
@@ -11836,7 +15792,11 @@ fn execute_compute_dispatch(
         image_readbacks,
         texel_readbacks,
     };
+    let raw_storage = resources.take_pooled_raw_texels();
     let uniforms = std::mem::take(&mut resources.uniforms);
+    let guest_images = std::mem::take(&mut resources.guest_images);
+    let guest_image_keys = std::mem::take(&mut resources.guest_image_keys);
+    let guest_image_contents = std::mem::take(&mut resources.guest_image_contents);
     let outputs = std::mem::take(&mut resources.outputs);
     let readbacks = std::mem::take(&mut resources.readbacks);
     resources.destroy(&inner.device);
@@ -11844,12 +15804,20 @@ fn execute_compute_dispatch(
         let RendererInner {
             device,
             compute_backend,
+            compute_guest_image_pool,
             ..
         } = &mut *inner;
         compute_backend
             .as_mut()
             .unwrap()
-            .recycle_dispatch_resources(device, uniforms, outputs, readbacks);
+            .recycle_dispatch_resources(device, uniforms, raw_storage, outputs, readbacks);
+        recycle_compute_guest_images(
+            device,
+            compute_guest_image_pool,
+            guest_image_keys,
+            guest_image_contents,
+            guest_images,
+        );
     }
     ComputeDispatchOutcome::Executed(result)
 }
@@ -11917,26 +15885,40 @@ fn validate_compute_dispatch(
     {
         return Err("invalid or excessive compute uniform buffers".to_string());
     }
-    let texel_binding_count: usize = dispatch
-        .texel_buffers
-        .iter()
-        .map(|buffer| buffer.bindings.len())
-        .sum();
-    if texel_binding_count > backend.max_storage_texel_buffers as usize {
+    let (raw_storage_binding_count, storage_texel_binding_count) =
+        crate::compute::compute_buffer_binding_counts(&dispatch.texel_buffers);
+    if raw_storage_binding_count > backend.max_storage_buffers as usize {
+        return Err("too many compute raw storage-buffer bindings".to_string());
+    }
+    if storage_texel_binding_count > backend.max_storage_texel_buffers as usize {
         return Err("too many compute storage texel-buffer bindings".to_string());
     }
     for buffer in &dispatch.texel_buffers {
-        if buffer.bytes.is_empty() || buffer.bindings.is_empty() {
+        if buffer.byte_len == 0 || buffer.bindings.is_empty() {
             return Err("invalid compute storage buffer".to_string());
         }
         if buffer.raw {
-            if buffer.bytes.len() % 4 != 0 {
+            let resident = buffer.raw_storage_key.is_some_and(|key| {
+                key.size == buffer.byte_len as u64
+                    && inner
+                        .compute_raw_storage_cache
+                        .get(&key)
+                        .is_some_and(|entry| entry.ready && entry.valid)
+            });
+            if !compute_raw_storage_seed_is_valid(buffer.byte_len, buffer.bytes.len(), resident) {
+                return Err("compute raw storage buffer has no valid seed".to_string());
+            }
+            if buffer.byte_len % 4 != 0 {
                 return Err("raw compute storage buffer is not word-aligned".to_string());
+            }
+            if buffer.byte_len > backend.max_storage_buffer_range as usize {
+                return Err("raw compute storage buffer exceeds the device range limit".to_string());
             }
             continue;
         }
-        if buffer.bytes.len() % buffer.format.bytes_per_element() != 0
-            || buffer.bytes.len() / buffer.format.bytes_per_element()
+        if buffer.bytes.len() != buffer.byte_len
+            || buffer.byte_len % buffer.format.bytes_per_element() != 0
+            || buffer.byte_len / buffer.format.bytes_per_element()
                 > inner.max_texel_buffer_elements as usize
         {
             return Err("invalid typed compute storage texel buffer".to_string());
@@ -12009,7 +15991,10 @@ fn validate_compute_dispatch(
     }
     if (dispatch.outputs.is_empty() && !dispatch.texel_buffers.iter().any(|buffer| buffer.writable))
         || dispatch.outputs.len() > backend.max_storage_images as usize
-        || dispatch.outputs.len().saturating_add(texel_binding_count)
+        || dispatch
+            .outputs
+            .len()
+            .saturating_add(storage_texel_binding_count)
             > backend.max_storage_images as usize
     {
         return Err("invalid compute storage-image count".to_string());
@@ -12126,6 +16111,8 @@ fn compute_rt_alias_for_key(
             format,
             aspects: vk::ImageAspectFlags::COLOR,
             depth: false,
+            frozen: false,
+            fermi_exact_rt_snapshot_id: None,
         },
     );
     let depth = rt_cache
@@ -12142,6 +16129,8 @@ fn compute_rt_alias_for_key(
             format,
             aspects,
             depth: true,
+            frozen: false,
+            fermi_exact_rt_snapshot_id: None,
         });
     if tic_format_prefers_depth_alias(tic_format) {
         depth
@@ -13014,7 +17003,7 @@ fn flip_rows_v(bytes: &mut [u8], width: u32, height: u32) {
 }
 
 fn max_texture_descriptors() -> usize {
-    crate::descriptor::MAX_TEXTURE_DESCRIPTORS as usize
+    MAX_TEXTURE_DESCRIPTOR_COUNT
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -13137,9 +17126,10 @@ fn trace_vs_tex_bind_alias(
     );
 }
 
-fn trace_vs_tex_bind_dummy<F>(call: &crate::draw::Maxwell3dDrawCall, slot: usize, read_guest: &F)
+fn trace_vs_tex_bind_dummy<F, D>(call: &crate::draw::Maxwell3dDrawCall, slot: usize, read_guest: &F)
 where
-    F: Fn(u64, usize) -> Option<Vec<u8>>,
+    F: Fn(u64, usize) -> Option<D>,
+    D: AsRef<[u8]>,
 {
     let Some((vs_slot, tex_id)) = vs_tex_slot(call, slot) else {
         return;
@@ -13163,13 +17153,14 @@ where
     );
 }
 
-fn vs_tex_dummy_reason<F>(
+fn vs_tex_dummy_reason<F, D>(
     call: &crate::draw::Maxwell3dDrawCall,
     tex_id: u32,
     read_guest: &F,
 ) -> String
 where
-    F: Fn(u64, usize) -> Option<Vec<u8>>,
+    F: Fn(u64, usize) -> Option<D>,
+    D: AsRef<[u8]>,
 {
     if tex_id == u32::MAX {
         return "tex-id-invalid".to_string();
@@ -13188,12 +17179,13 @@ where
         return format!("tic-read-fail addr={:#x}", tic_addr);
     };
     let raw_hex = raw
+        .as_ref()
         .iter()
         .take(32)
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
         .join("");
-    match crate::texture::TicEntry::parse(&raw) {
+    match crate::texture::TicEntry::parse(raw.as_ref()) {
         Some(tic) => format!(
             "tic-parse-ok-unexpected addr={:#x} va={:#x} {}x{} fmt={:?} raw={}",
             tic_addr, tic.gpu_va, tic.width, tic.height, tic.format, raw_hex
@@ -13498,6 +17490,11 @@ fn tic_requires_dedicated_sampled_view(tic: &crate::texture::TicEntry) -> bool {
         || tic_is_cube_array(tic)
 }
 
+fn tic_can_use_2d_rt_alias_view(tic: &crate::texture::TicEntry) -> bool {
+    !tic_requires_dedicated_sampled_view(tic)
+        || (tic_is_arrayed(tic) && tic.depth <= 1 && tic.base_layer == 0)
+}
+
 fn tic_layer_count(tic: &crate::texture::TicEntry) -> u32 {
     if tic_is_arrayed(tic) {
         tic.depth.max(1)
@@ -13529,7 +17526,9 @@ fn tic_view_layer_count(tic: &crate::texture::TicEntry) -> u32 {
 }
 
 fn tic_layer_read_size(tic: &crate::texture::TicEntry, pitch_size: usize) -> usize {
-    if tic.is_block_linear {
+    if let Some(size) = tic.pitch_linear_layer_size() {
+        size
+    } else if tic.is_block_linear {
         tic.format
             .block_linear_size(tic.width, tic.height, tic.block_height_log2)
             .max(pitch_size)
@@ -13557,12 +17556,11 @@ fn linear_texture_layers(
     tic: &crate::texture::TicEntry,
     layer_count: u32,
     pitch_size: usize,
+    effective_block_linear: bool,
     force_pitch: bool,
 ) -> Vec<u8> {
     let layers = layer_count.max(1) as usize;
     let layer_linear_size = tic.format.linear_size(tic.width, tic.height);
-    let effective_block_linear =
-        tic.is_block_linear && !crate::pitch_oracle::is_pitch_dst(tic.gpu_va);
     if effective_block_linear && !force_pitch && tic_is_volume(tic) {
         let (storage_width, storage_height, bpp) = tic.format.storage_extent(tic.width, tic.height);
         let read_size = block_linear_volume_byte_size(tic, layers as u32).min(raw.len());
@@ -13618,6 +17616,9 @@ fn linear_texture_layers(
                 bpp,
                 block_height_log2,
             )
+        } else if tic.pitch_linear_layer_size().is_some() {
+            crate::texture::unpack_pitch_linear(layer_raw, tic, 1)
+                .unwrap_or_else(|| layer_raw.to_vec())
         } else if layer_raw.len() >= pitch_size {
             layer_raw[..pitch_size].to_vec()
         } else {
@@ -13638,7 +17639,14 @@ fn decode_texture_rgba8_layers(
     force_pitch: bool,
 ) -> Vec<u8> {
     let layers = layer_count.max(1) as usize;
-    let linear = linear_texture_layers(raw, tic, layer_count, pitch_size, force_pitch);
+    let linear = linear_texture_layers(
+        raw,
+        tic,
+        layer_count,
+        pitch_size,
+        effective_texture_block_linear(tic),
+        force_pitch,
+    );
     let mut out = Vec::new();
     let layer_rgba_size = tic.width as usize * tic.height as usize * 4;
     let layer_linear_size = tic.format.linear_size(tic.width, tic.height);
@@ -13649,8 +17657,13 @@ fn decode_texture_rgba8_layers(
             break;
         }
         let end = (start + layer_linear_size).min(linear.len());
-        let mut decoded =
-            crate::texture::decode_to_rgba8(&linear[start..end], tic.width, tic.height, tic.format);
+        let mut decoded = crate::texture::decode_to_rgba8_typed(
+            &linear[start..end],
+            tic.width,
+            tic.height,
+            tic.format,
+            tic.component_types[0],
+        );
         decoded.resize(layer_rgba_size, 0);
         out.extend(decoded);
     }
@@ -13666,9 +17679,31 @@ fn texture_upload_data(
     force_pitch: bool,
     format: vk::Format,
 ) -> Result<TextureUploadData, String> {
+    texture_upload_data_with_layout(
+        raw,
+        tic,
+        layer_count,
+        pitch_size,
+        effective_texture_block_linear(tic),
+        force_pitch,
+        format,
+    )
+}
+
+fn effective_texture_block_linear(tic: &crate::texture::TicEntry) -> bool {
+    tic.is_block_linear && !crate::pitch_oracle::is_pitch_dst(tic.gpu_va)
+}
+
+fn texture_upload_data_with_layout(
+    raw: &[u8],
+    tic: &crate::texture::TicEntry,
+    layer_count: u32,
+    pitch_size: usize,
+    effective_block_linear: bool,
+    force_pitch: bool,
+    format: vk::Format,
+) -> Result<TextureUploadData, String> {
     let layers = layer_count.max(1);
-    let effective_block_linear =
-        tic.is_block_linear && !crate::pitch_oracle::is_pitch_dst(tic.gpu_va);
     if !tic_is_volume(tic) && tic.mip_levels() > 1 && (!effective_block_linear || force_pitch) {
         return Err("multi-mip pitch-linear upload is not implemented".to_string());
     }
@@ -13713,6 +17748,7 @@ fn texture_upload_data(
                     level.width,
                     level.height,
                     1,
+                    tic.component_types[0],
                     format,
                 ));
             }
@@ -13726,8 +17762,23 @@ fn texture_upload_data(
         return Ok(TextureUploadData { bytes, copies });
     }
 
-    let linear = linear_texture_layers(raw, tic, layers, pitch_size, force_pitch);
-    let bytes = texture_level_upload(&linear, tic.format, tic.width, tic.height, layers, format);
+    let linear = linear_texture_layers(
+        raw,
+        tic,
+        layers,
+        pitch_size,
+        effective_block_linear,
+        force_pitch,
+    );
+    let bytes = texture_level_upload(
+        &linear,
+        tic.format,
+        tic.width,
+        tic.height,
+        layers,
+        tic.component_types[0],
+        format,
+    );
     Ok(TextureUploadData::base(bytes, tic.width, tic.height))
 }
 
@@ -13737,6 +17788,7 @@ fn texture_level_upload(
     width: u32,
     height: u32,
     layers: u32,
+    component_type: crate::texture::ComponentType,
     format: vk::Format,
 ) -> Vec<u8> {
     let native_layout = matches!(
@@ -13794,7 +17846,16 @@ fn texture_level_upload(
             vk::Format::R32G32B32A32_SFLOAT
                 | vk::Format::R32G32B32A32_UINT
                 | vk::Format::R32G32B32A32_SINT
-        )
+        ) | (crate::texture::TicFormat::BC4, vk::Format::BC4_SNORM_BLOCK)
+            | (crate::texture::TicFormat::BC5, vk::Format::BC5_SNORM_BLOCK)
+            | (
+                crate::texture::TicFormat::BC6S,
+                vk::Format::BC6H_SFLOAT_BLOCK,
+            )
+            | (
+                crate::texture::TicFormat::BC6U,
+                vk::Format::BC6H_UFLOAT_BLOCK,
+            )
     );
     if native_layout
         || tic_format == crate::texture::TicFormat::R16G16B16A16
@@ -13823,8 +17884,13 @@ fn texture_level_upload(
                 out.resize(out.len().saturating_add(decoded_layer_size), 0);
                 continue;
             }
-            let mut decoded =
-                crate::texture::decode_to_rgba8(&linear[start..end], width, height, tic_format);
+            let mut decoded = crate::texture::decode_to_rgba8_typed(
+                &linear[start..end],
+                width,
+                height,
+                tic_format,
+                component_type,
+            );
             decoded.resize(decoded_layer_size, 0);
             out.extend(decoded);
         }
@@ -14082,6 +18148,19 @@ fn find_volume_rt_slices(
     Some(out)
 }
 
+fn volume_rt_slices_disjoint_from_attachments(
+    slices: &[VolumeRtSlice],
+    color_keys: &[RtKey],
+    depth_key: Option<RtKey>,
+) -> bool {
+    slices.iter().all(|slice| {
+        color_keys
+            .iter()
+            .chain(depth_key.iter())
+            .all(|attachment| attachment.nvmap_id != slice.key.nvmap_id)
+    })
+}
+
 fn volume_slice_offsets(
     tic: &crate::texture::TicEntry,
     pitch_size: usize,
@@ -14233,12 +18312,13 @@ fn graphics_draw_call_error(
     )
 }
 
-fn collect_tex_pendings<F>(
+fn collect_tex_pendings<F, D>(
     call: &crate::draw::Maxwell3dDrawCall,
     read_guest: &F,
 ) -> Result<Vec<Option<PendingTexture>>, String>
 where
-    F: Fn(u64, usize) -> Option<Vec<u8>>,
+    F: Fn(u64, usize) -> Option<D>,
+    D: AsRef<[u8]>,
 {
     call.fs_tex_ids
         .iter()
@@ -14252,10 +18332,10 @@ where
             let Some(tic_raw) = read_guest(tic_addr, 32) else {
                 return Ok(None);
             };
-            let Some(tic) = crate::texture::TicEntry::parse(&tic_raw) else {
+            let Some(tic) = crate::texture::TicEntry::parse(tic_raw.as_ref()) else {
                 return Ok(None);
             };
-            if tic.is_srgb && std::env::var_os("NEXIUM_TIC_SRGB_LOG").is_some() {
+            if tic.is_srgb && tic_srgb_log_enabled() {
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static N: AtomicU64 = AtomicU64::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
@@ -14337,6 +18417,7 @@ where
                 block_height_log2: tic.block_height_log2,
                 block_depth_log2: tic.block_depth_log2,
                 tile_width_spacing: tic.tile_width_spacing,
+                pitch_bytes: tic.pitch_bytes,
                 numeric_type: texture_numeric_cache_key(texture_numeric_type_for_slot(
                     &call.texture_numeric_manifest,
                     slot,
@@ -14356,12 +18437,13 @@ where
         .collect()
 }
 
-fn collect_tsc_entries<F>(
+fn collect_tsc_entries<F, D>(
     call: &crate::draw::Maxwell3dDrawCall,
     read_guest: &F,
 ) -> Vec<Option<crate::texture::TscEntry>>
 where
-    F: Fn(u64, usize) -> Option<Vec<u8>>,
+    F: Fn(u64, usize) -> Option<D>,
+    D: AsRef<[u8]>,
 {
     call.fs_sampler_ids
         .iter()
@@ -14371,7 +18453,7 @@ where
                 return None;
             }
             let tsc_addr = call.tsc_pool_gpu_va.wrapping_add((*tsc_id as u64) * 32);
-            read_guest(tsc_addr, 32).and_then(|r| crate::texture::TscEntry::parse(&r))
+            read_guest(tsc_addr, 32).and_then(|r| crate::texture::TscEntry::parse(r.as_ref()))
         })
         .collect()
 }
@@ -14413,8 +18495,35 @@ fn call_samples_rt(call: &crate::draw::Maxwell3dDrawCall, rt_key: RtKey) -> bool
             .any(|slot| *slot == Some(rt_key))
 }
 
+fn call_samples_only_frozen_rt_aliases(
+    call: &crate::draw::Maxwell3dDrawCall,
+    rt_key: RtKey,
+    aliases: &[Option<RtAlias>],
+) -> bool {
+    if call.sampled_rt_slots.is_empty() {
+        return false;
+    }
+    let mut sampled = false;
+    for (slot, key) in call.sampled_rt_slots.iter().enumerate() {
+        if *key != Some(rt_key) {
+            continue;
+        }
+        sampled = true;
+        if !aliases
+            .get(slot)
+            .copied()
+            .flatten()
+            .is_some_and(|alias| alias.frozen)
+        {
+            return false;
+        }
+    }
+    sampled
+}
+
 fn rt_alias_for_slot(
     rt_cache: &RtCache,
+    fermi_exact_rt_snapshot_leases: Option<&HashMap<u64, FermiExactRtSnapshotLease>>,
     call: &crate::draw::Maxwell3dDrawCall,
     slot: usize,
     rt_key: RtKey,
@@ -14422,22 +18531,54 @@ fn rt_alias_for_slot(
     tic: Option<&crate::texture::TicEntry>,
 ) -> Option<RtAlias> {
     let sk = sampled_rt_key_for_slot(call, slot)?;
+    if let (Some(leases), Some(id), Some(token), Some(tic)) = (
+        fermi_exact_rt_snapshot_leases,
+        call.sampled_rt_fermi_snapshot_slots
+            .get(slot)
+            .copied()
+            .flatten(),
+        call.sampled_rt_fermi_exact_slots
+            .get(slot)
+            .copied()
+            .flatten(),
+        tic.copied(),
+    ) {
+        if token.key == sk && fermi_exact_rt_snapshot_token_matches_tic(token, tic) {
+            if let Some(lease) = leases.get(&id) {
+                if lease.refs != 0 && lease.token == token {
+                    return Some(RtAlias {
+                        key: token.key,
+                        image: lease.image.image,
+                        view: lease.image.view,
+                        layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        format: lease.image.format,
+                        aspects: vk::ImageAspectFlags::COLOR,
+                        depth: false,
+                        frozen: true,
+                        fermi_exact_rt_snapshot_id: Some(id),
+                    });
+                }
+            }
+        }
+    }
     let direct_volume = sk.is_3d && tic.is_some_and(|tic| tic_is_volume(&tic));
-    if tic.is_some_and(tic_requires_dedicated_sampled_view) && !direct_volume {
+    if tic.is_some_and(|tic| !tic_can_use_2d_rt_alias_view(tic)) && !direct_volume {
         return None;
     }
     let mut used_copy_color = false;
     let found_color = (if direct_volume {
         rt_cache
             .color_exact_with_format(sk)
+            .filter(|(key, _, _, _, _, _)| !rt_cache.color_is_guest_stale(*key))
             .map(|(key, image, view, layout, format, _)| (key, image, view, layout, format))
     } else {
-        drawn_color_alias_for_key(rt_cache, sk).or_else(|| rt_cache.find_color_with_format(sk))
+        drawn_color_alias_for_key(rt_cache, sk)
+            .or_else(|| rt_cache.find_sampleable_color_with_format(sk))
     })
     .or_else(|| {
         let source = call.sampled_rt_copy_sources.get(slot).copied().flatten()?;
         let found = drawn_color_alias_for_key(rt_cache, source)
-            .or_else(|| rt_cache.find_color_with_format(source));
+            .or_else(|| rt_cache.find_sampleable_color_with_format(source));
         used_copy_color = found.is_some();
         found
     })
@@ -14468,8 +18609,10 @@ fn rt_alias_for_slot(
             format,
             aspects: vk::ImageAspectFlags::COLOR,
             depth: false,
+            frozen: false,
+            fermi_exact_rt_snapshot_id: None,
         });
-    let depth_source = rt_cache.find_depth(sk);
+    let depth_source = rt_cache.find_sampleable_depth(sk);
     let depth_alias = depth_source.and_then(|(key, image, view, layout, format, aspects)| {
         let active = call
             .depth_key
@@ -14485,6 +18628,8 @@ fn rt_alias_for_slot(
             format,
             aspects,
             depth: true,
+            frozen: false,
+            fermi_exact_rt_snapshot_id: None,
         })
     });
     let filtered = if tic.is_some_and(|tic| tic_format_prefers_depth_alias(tic.format)) {
@@ -14550,7 +18695,7 @@ fn drawn_color_alias_for_key(
     key: RtKey,
 ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
     if key.is_3d {
-        return rt_cache.find_color_with_format(key);
+        return rt_cache.find_sampleable_color_with_format(key);
     }
     let found = if key.gpu_va != 0 {
         rt_cache.find_drawn_color_at(key.width, key.height, key.gpu_va)
@@ -14559,7 +18704,7 @@ fn drawn_color_alias_for_key(
     } else {
         None
     }?;
-    rt_cache.find_color_with_format(found.0)
+    rt_cache.find_sampleable_color_with_format(found.0)
 }
 
 fn drawn_color_content_alias_for_key(
@@ -14567,7 +18712,7 @@ fn drawn_color_content_alias_for_key(
     key: RtKey,
 ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
     if key.is_3d {
-        return rt_cache.find_color_with_format(key);
+        return rt_cache.find_sampleable_color_with_format(key);
     }
     let found = if key.gpu_va != 0 {
         rt_cache.find_content_bearing_color_at(key.width, key.height, key.gpu_va)
@@ -14576,7 +18721,7 @@ fn drawn_color_content_alias_for_key(
     } else {
         None
     }?;
-    rt_cache.find_color_with_format(found.0)
+    rt_cache.find_sampleable_color_with_format(found.0)
 }
 
 fn snapshot_feedback_alias(
@@ -14653,25 +18798,42 @@ fn snapshot_feedback_alias(
     Ok((snap_image, snap_view, snap_format))
 }
 
-fn sampled_color_alias_needs_sync(rt_cache: &RtCache, key: RtKey) -> bool {
+fn sampled_color_needs_sync(rt_cache: &RtCache, key: RtKey) -> bool {
     if std::env::var_os("NEXIUM_NO_RT_ALIAS_SYNC").is_some() {
         return false;
     }
     color_alias_sync_pair(rt_cache, key).is_some()
+        || color_region_sync_pair(rt_cache, key).is_some()
 }
 
-fn sampled_color_region_needs_sync(rt_cache: &RtCache, key: RtKey) -> bool {
-    if std::env::var_os("NEXIUM_NO_RT_ALIAS_SYNC").is_some() {
-        return false;
-    }
-    color_region_sync_pair(rt_cache, key).is_some()
+fn color_sync_clean_across_group(
+    sampled: RtKey,
+    color_keys: &[RtKey],
+    color_formats: &[vk::Format],
+) -> bool {
+    color_keys.iter().enumerate().all(|(index, attachment)| {
+        *attachment == sampled
+            || !rt_color_region_covers(
+                *attachment,
+                color_formats
+                    .get(index)
+                    .copied()
+                    .unwrap_or(vk::Format::R8G8B8A8_UNORM),
+                sampled.width,
+                sampled.height,
+                sampled.gpu_va,
+            )
+    })
 }
 
-fn sampled_color_needs_sync(rt_cache: &RtCache, key: RtKey) -> bool {
-    sampled_color_alias_needs_sync(rt_cache, key) || sampled_color_region_needs_sync(rt_cache, key)
+fn color_sync_supports_key(key: RtKey) -> bool {
+    !key.is_3d && key.depth == 1
 }
 
 fn color_alias_sync_pair(rt_cache: &RtCache, key: RtKey) -> Option<ColorAliasSync> {
+    if !color_sync_supports_key(key) {
+        return None;
+    }
     let (dst_key, dst_image, _, dst_layout, dst_format, dst_stamp) =
         rt_cache.color_exact_with_format(key)?;
     let allow_resize = std::env::var_os("NEXIUM_RT_ALIAS_SCALE_BLIT").is_some()
@@ -14720,16 +18882,14 @@ fn color_alias_sync_pair(rt_cache: &RtCache, key: RtKey) -> Option<ColorAliasSyn
 }
 
 fn color_region_sync_pair(rt_cache: &RtCache, key: RtKey) -> Option<ColorRegionSync> {
-    if std::env::var_os("NEXIUM_NO_RT_REGION_SYNC").is_some() {
+    if std::env::var_os("NEXIUM_NO_RT_REGION_SYNC").is_some() || !color_sync_supports_key(key) {
         return None;
     }
     let allow_offset = std::env::var_os("NEXIUM_RT_REGION_OFFSET_SYNC").is_some();
     let region = if key.gpu_va != 0 {
         rt_cache
-            .find_drawn_color_region_at(key.width, key.height, key.gpu_va)
-            .filter(|region| {
-                region.key != key && (allow_offset || (region.src_x == 0 && region.src_y == 0))
-            })
+            .find_drawn_color_region_at_excluding(key.width, key.height, key.gpu_va, key)
+            .filter(|region| allow_offset || (region.src_x == 0 && region.src_y == 0))
     } else {
         None
     }?;
@@ -15136,6 +19296,51 @@ fn sampled_active_depth_key(
         .then_some(key)
 }
 
+fn direct_sampled_depth_read_only_alias(
+    rt_cache: &RtCache,
+    call: &crate::draw::Maxwell3dDrawCall,
+    sk: RtKey,
+    tic: crate::texture::TicEntry,
+    depth_needs_clear: bool,
+    batch_depth_key: Option<RtKey>,
+    batch_depth_image: Option<vk::Image>,
+) -> Option<RtAlias> {
+    if std::env::var_os("NEXIUM_NO_DEPTH_SELF_SAMPLE").is_some()
+        || depth_needs_clear
+        || call_writes_depth_stencil(call)
+        || tic.format != crate::texture::TicFormat::Z32
+        || !tic_can_use_2d_rt_alias_view(&tic)
+        || !call.depth_aspects.contains(vk::ImageAspectFlags::DEPTH)
+        || call.depth_aspects.contains(vk::ImageAspectFlags::STENCIL)
+    {
+        return None;
+    }
+    let src_key = sampled_active_depth_key(rt_cache, call, sk)?;
+    let (_, image, view, layout, format, aspects) = rt_cache.find_depth(src_key)?;
+    if !batch_depth_key.is_some_and(|key| key == src_key || same_physical_backing(key, src_key))
+        || batch_depth_image != Some(image)
+        || src_key.depth != 1
+        || src_key.is_3d
+        || layout == vk::ImageLayout::UNDEFINED
+        || format != vk::Format::D32_SFLOAT
+        || !aspects.contains(vk::ImageAspectFlags::DEPTH)
+        || aspects.contains(vk::ImageAspectFlags::STENCIL)
+    {
+        return None;
+    }
+    Some(RtAlias {
+        key: src_key,
+        image,
+        view,
+        layout: vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        format,
+        aspects,
+        depth: true,
+        frozen: false,
+        fermi_exact_rt_snapshot_id: None,
+    })
+}
+
 fn depth_self_shadow_key(key: RtKey) -> RtKey {
     RtKey {
         nvmap_id: key.nvmap_id ^ 0x4000_0000,
@@ -15206,6 +19411,8 @@ fn sync_sampled_depth_self(
             format: src_format,
             aspects: src_aspects,
             depth: true,
+            frozen: false,
+            fermi_exact_rt_snapshot_id: None,
         }));
     }
     transition_image_aspect(
@@ -15292,6 +19499,8 @@ fn sync_sampled_depth_self(
         format: src_format,
         aspects: src_aspects,
         depth: true,
+        frozen: false,
+        fermi_exact_rt_snapshot_id: None,
     }))
 }
 
@@ -15469,6 +19678,8 @@ fn sync_sampled_depth_as_color(
         format: vk::Format::R8G8B8A8_UNORM,
         aspects: vk::ImageAspectFlags::COLOR,
         depth: false,
+        frozen: false,
+        fermi_exact_rt_snapshot_id: None,
     }))
 }
 
@@ -15573,9 +19784,28 @@ fn prepare_vertex_bindings<F>(
 where
     F: Fn(u64, usize) -> Option<Vec<u8>>,
 {
+    prepare_vertex_bindings_shared(call, &|gpu_va, len| {
+        read_guest(gpu_va, len).map(SharedGuestSnapshot::from_vec)
+    })
+}
+
+fn prepare_vertex_bindings_shared<F>(
+    call: &crate::draw::Maxwell3dDrawCall,
+    read_guest: &F,
+) -> Result<(Vec<PreparedVertexBinding>, u32), String>
+where
+    F: Fn(u64, usize) -> Option<SharedGuestSnapshot>,
+{
     let mut out = Vec::new();
     let mut draw_vertex_count = call.vertex_count;
     for binding in &call.vertex_bindings {
+        if call
+            .resident_vertex
+            .iter()
+            .any(|range| range.binding == binding.binding)
+        {
+            continue;
+        }
         let Some((base, bytes)) = crate::draw::vertex_binding_read_range(call, binding) else {
             continue;
         };
@@ -15595,7 +19825,10 @@ where
             )
         })?;
         if call.quad_expand && !data.is_empty() {
-            data = crate::draw::expand_quad_vertices(&data, stride as usize);
+            data = SharedGuestSnapshot::from_vec(crate::draw::expand_quad_vertices(
+                &data,
+                stride as usize,
+            ));
             if out.is_empty() {
                 draw_vertex_count = (data.len() / stride as usize) as u32;
             }
@@ -15629,8 +19862,9 @@ fn mirror_20xx_sprite_batch(
     if stride == 0 || offset + std::mem::size_of::<f32>() > stride {
         return;
     }
+    let data = binding.data.make_mut();
     let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
-    for vertex in binding.data.chunks_exact(stride) {
+    for vertex in data.chunks_exact(stride) {
         let y = f32::from_le_bytes(vertex[offset..offset + 4].try_into().unwrap());
         min_y = min_y.min(y);
         max_y = max_y.max(y);
@@ -15639,7 +19873,7 @@ fn mirror_20xx_sprite_batch(
         return;
     }
     let pivot = min_y + max_y;
-    for vertex in binding.data.chunks_exact_mut(stride) {
+    for vertex in data.chunks_exact_mut(stride) {
         let y = f32::from_le_bytes(vertex[offset..offset + 4].try_into().unwrap());
         vertex[offset..offset + 4].copy_from_slice(&(pivot - y).to_le_bytes());
     }
@@ -15647,12 +19881,14 @@ fn mirror_20xx_sprite_batch(
 
 fn upload_vertex_bindings(
     device: &ash::Device,
-    frame_slots: &mut [FrameSlot; 2],
+    frame_slots: &mut [FrameSlot],
     other_idx: usize,
     pool: vk::DescriptorPool,
     ubo_ring: &mut UboRing,
     vertex_bindings: &[PreparedVertexBinding],
     allow_wrap: bool,
+    fermi_exact_rt_snapshot_leases: &mut HashMap<u64, FermiExactRtSnapshotLease>,
+    fermi_exact_rt_snapshot_ids: &mut HashMap<crate::draw::FermiExactRtToken, u64>,
 ) -> Result<Vec<(u32, vk::Buffer, u64)>, String> {
     let mut out = Vec::with_capacity(vertex_bindings.len());
     for binding in vertex_bindings {
@@ -15668,7 +19904,15 @@ fn upload_vertex_bindings(
                     binding.binding
                 ));
             }
-            ring_wrap_other(device, frame_slots, other_idx, pool, ubo_ring)?;
+            ring_wrap_other(
+                device,
+                frame_slots,
+                other_idx,
+                pool,
+                ubo_ring,
+                fermi_exact_rt_snapshot_leases,
+                fermi_exact_rt_snapshot_ids,
+            )?;
         }
         let (buf, off, ptr) =
             ring_alloc(ubo_ring, size, align).map_err(|e| format!("ring_alloc(vertex): {}", e))?;
@@ -15697,14 +19941,18 @@ fn destroy_descriptor_pools(device: &ash::Device, pools: &mut Vec<vk::Descriptor
 
 fn ring_wrap_other(
     device: &ash::Device,
-    frame_slots: &mut [FrameSlot; 2],
+    frame_slots: &mut [FrameSlot],
     other_idx: usize,
     pool: vk::DescriptorPool,
     ubo_ring: &mut UboRing,
+    fermi_exact_rt_snapshot_leases: &mut HashMap<u64, FermiExactRtSnapshotLease>,
+    fermi_exact_rt_snapshot_ids: &mut HashMap<crate::draw::FermiExactRtToken, u64>,
 ) -> Result<(), String> {
     let other = &mut frame_slots[other_idx];
     if other.in_flight {
-        wait_fence(device, other.fence)?;
+        if !frame_slot_submission_complete(device, other.submit_generation) {
+            wait_fence(device, other.fence)?;
+        }
         if !other.retired_dsets.is_empty() {
             unsafe {
                 let _ = device.free_descriptor_sets(pool, &other.retired_dsets);
@@ -15712,12 +19960,19 @@ fn ring_wrap_other(
             other.retired_dsets.clear();
         }
         destroy_descriptor_pools(device, &mut other.retired_dset_pools);
+        release_fermi_exact_rt_snapshot_lease_refs(
+            device,
+            fermi_exact_rt_snapshot_leases,
+            fermi_exact_rt_snapshot_ids,
+            &mut other.fermi_exact_rt_snapshot_leases,
+        );
         for (b, m) in other.retired_buffers.drain(..) {
             unsafe {
                 device.destroy_buffer(b, None);
                 device.free_memory(m, None);
             }
         }
+        recycle_slot_upload_buffers(device, other);
         for view in other.retired_views.drain(..) {
             unsafe {
                 device.destroy_image_view(view, None);
@@ -15733,6 +19988,7 @@ fn ring_wrap_other(
         for buffer in other.retired_texel_buffers.drain(..) {
             destroy_texel_buffer(device, buffer.resource);
         }
+        destroy_retired_rt_images(device, &mut other.retired_rt_images);
         for t in other.retired_rt_reinterprets.drain(..) {
             unsafe {
                 device.destroy_image_view(t.view, None);
@@ -15742,6 +19998,7 @@ fn ring_wrap_other(
         }
         reset_command_buffer(device, other.cmd)?;
         other.in_flight = false;
+        other.submit_generation = 0;
     }
     ubo_ring.head = 0;
     ubo_ring.slot_head[other_idx] = 0;
@@ -15922,7 +20179,7 @@ fn ensure_dummy_texel_buffer(
     Ok(dummy[index].as_ref().unwrap().view)
 }
 
-fn texel_buffer_view_for_tic<F>(
+fn texel_buffer_view_for_tic<F, D>(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     max_texel_buffer_elements: u32,
@@ -15935,7 +20192,8 @@ fn texel_buffer_view_for_tic<F>(
     read_guest: &F,
 ) -> Result<Option<vk::BufferView>, String>
 where
-    F: Fn(u64, usize) -> Option<Vec<u8>>,
+    F: Fn(u64, usize) -> Option<D>,
+    D: AsRef<[u8]>,
 {
     let Some((format, element_size)) = texel_buffer_format(tic, numeric_type) else {
         return Err(format!(
@@ -15991,14 +20249,14 @@ where
 
     let bytes = read_guest(tic.gpu_va, read_size)
         .ok_or_else(|| format!("guest read failed for {} bytes", read_size))?;
-    if bytes.len() != read_size {
+    if bytes.as_ref().len() != read_size {
         return Err(format!(
             "guest read returned {} bytes, expected {}",
-            bytes.len(),
+            bytes.as_ref().len(),
             read_size
         ));
     }
-    let hash = hash_sampled(&bytes);
+    let hash = hash_sampled(bytes.as_ref());
     if !force_refresh && cache.get(&key).is_some_and(|cached| cached.hash == hash) {
         let cached = cache.get_mut(&key).unwrap();
         cached.gen = generation;
@@ -16006,7 +20264,7 @@ where
         return Ok(Some(cached.resource.view));
     }
 
-    let resource = create_texel_buffer(device, mem_props, &bytes, format)?;
+    let resource = create_texel_buffer(device, mem_props, bytes.as_ref(), format)?;
     let view = resource.view;
     let cached = CachedTexelBuffer {
         resource,
@@ -16083,7 +20341,200 @@ fn create_host_buffer(
             device.unmap_memory(memory);
         }
     }
-    Ok(HostBuffer { buffer, memory })
+    Ok(HostBuffer {
+        buffer,
+        memory,
+        size,
+    })
+}
+
+fn create_persistent_upload_buffer_sized(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    requested_size: u64,
+    usage: vk::BufferUsageFlags,
+) -> Result<PersistentUploadBuffer, String> {
+    let size = requested_size.max(16);
+    let info = vk::BufferCreateInfo {
+        s_type: vk::StructureType::BUFFER_CREATE_INFO,
+        size,
+        usage,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        queue_family_index_count: 0,
+        p_queue_family_indices: std::ptr::null(),
+        p_next: std::ptr::null(),
+        flags: Default::default(),
+        _marker: std::marker::PhantomData,
+    };
+    let buffer = unsafe {
+        device
+            .create_buffer(&info, None)
+            .map_err(|e| format!("create_buffer(persistent upload): {:?}", e))?
+    };
+    let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let mt = find_memory_type(
+        mem_props,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )
+    .ok_or_else(|| "no HOST_VISIBLE memory type for persistent upload".to_string())?;
+    let alloc = vk::MemoryAllocateInfo {
+        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+        allocation_size: req.size,
+        memory_type_index: mt,
+        p_next: std::ptr::null(),
+        _marker: std::marker::PhantomData,
+    };
+    let memory = unsafe {
+        device
+            .allocate_memory(&alloc, None)
+            .map_err(|e| format!("allocate_memory(persistent upload): {:?}", e))?
+    };
+    unsafe {
+        device
+            .bind_buffer_memory(buffer, memory, 0)
+            .map_err(|e| format!("bind_buffer_memory(persistent upload): {:?}", e))?;
+        let mapped = device
+            .map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
+            .map_err(|e| format!("map_memory(persistent upload): {:?}", e))?
+            as *mut u8;
+        Ok(PersistentUploadBuffer {
+            buffer,
+            memory,
+            size,
+            mapped,
+        })
+    }
+}
+
+fn create_persistent_upload_buffer(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    data: &[u8],
+    usage: vk::BufferUsageFlags,
+) -> Result<PersistentUploadBuffer, String> {
+    let buffer =
+        create_persistent_upload_buffer_sized(device, mem_props, data.len() as u64, usage)?;
+    if !data.is_empty() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.mapped, data.len());
+        }
+    }
+    Ok(buffer)
+}
+
+fn create_persistent_upload_buffer_reusable(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    data: &[u8],
+    usage: vk::BufferUsageFlags,
+    pool: &mut Vec<PersistentUploadBuffer>,
+) -> Result<PersistentUploadBuffer, String> {
+    let required = data.len().max(16) as u64;
+    if let Some((index, _)) = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, buffer)| buffer.size >= required)
+        .min_by_key(|(_, buffer)| buffer.size)
+    {
+        let buffer = pool.swap_remove(index);
+        if !data.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.mapped, data.len());
+            }
+        }
+        return Ok(buffer);
+    }
+    create_persistent_upload_buffer(device, mem_props, data, usage)
+}
+
+fn allocate_texture_upload(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    data: &[u8],
+    slot: Option<&mut FrameSlot>,
+) -> Result<TextureUploadLease, String> {
+    let required = data.len().max(16) as u64;
+    if let Some(slot) = slot {
+        if texture_upload_arena_enabled() {
+            if slot.texture_upload_arena.is_none() && !slot.texture_upload_arena_unavailable {
+                match create_persistent_upload_buffer_sized(
+                    device,
+                    mem_props,
+                    TEXTURE_UPLOAD_ARENA_BYTES,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                ) {
+                    Ok(buffer) => {
+                        log::info!(
+                            "created {} MiB texture upload arena for graphics frame slot",
+                            TEXTURE_UPLOAD_ARENA_BYTES / (1024 * 1024)
+                        );
+                        slot.texture_upload_arena = Some(TextureUploadArena { buffer, head: 0 });
+                    }
+                    Err(error) => {
+                        slot.texture_upload_arena_unavailable = true;
+                        log::warn!(
+                            "texture upload arena unavailable (using dedicated staging buffers): {}",
+                            error
+                        );
+                    }
+                }
+            }
+            if let Some(arena) = slot.texture_upload_arena.as_mut() {
+                let remainder = arena.head % TEXTURE_UPLOAD_ARENA_ALIGNMENT;
+                let padding = if remainder == 0 {
+                    0
+                } else {
+                    TEXTURE_UPLOAD_ARENA_ALIGNMENT - remainder
+                };
+                let base_offset = arena.head.checked_add(padding);
+                let end = base_offset.and_then(|offset| offset.checked_add(required));
+                if let Some((base_offset, end)) = base_offset.zip(end) {
+                    if end <= arena.buffer.size {
+                        if !data.is_empty() {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    data.as_ptr(),
+                                    arena.buffer.mapped.add(base_offset as usize),
+                                    data.len(),
+                                );
+                            }
+                        }
+                        arena.head = end;
+                        return Ok(TextureUploadLease {
+                            buffer: arena.buffer.buffer,
+                            base_offset,
+                            dedicated: None,
+                        });
+                    }
+                }
+            }
+        }
+        let dedicated = create_persistent_upload_buffer_reusable(
+            device,
+            mem_props,
+            data,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            &mut slot.free_upload_buffers,
+        )?;
+        return Ok(TextureUploadLease {
+            buffer: dedicated.buffer,
+            base_offset: 0,
+            dedicated: Some(dedicated),
+        });
+    }
+
+    let dedicated = create_persistent_upload_buffer(
+        device,
+        mem_props,
+        data,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+    )?;
+    Ok(TextureUploadLease {
+        buffer: dedicated.buffer,
+        base_offset: 0,
+        dedicated: Some(dedicated),
+    })
 }
 
 fn create_aurora_resident_ssbo_cache(
@@ -16190,6 +20641,7 @@ fn create_ubo_ring(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     size: u64,
+    frame_slot_count: usize,
 ) -> Result<UboRing, String> {
     let info = vk::BufferCreateInfo {
         s_type: vk::StructureType::BUFFER_CREATE_INFO,
@@ -16245,7 +20697,7 @@ fn create_ubo_ring(
         mapped,
         size,
         head: 0,
-        slot_head: [0, 0],
+        slot_head: vec![0; frame_slot_count],
     })
 }
 
@@ -16540,15 +20992,15 @@ fn upload_texture_oneshot(
         format,
         hash,
         gen,
+        None,
     )?;
     end_one_time(device, cmd)?;
     submit_and_wait(device, queue, cmd)?;
     unsafe {
         device.free_command_buffers(cmd_pool, &[cmd]);
-        if let Some((sbuf, smem)) = stage {
-            device.destroy_buffer(sbuf, None);
-            device.free_memory(smem, None);
-        }
+    }
+    if let Some(stage) = stage {
+        destroy_persistent_upload_buffer(device, stage);
     }
     Ok(tex)
 }
@@ -16721,9 +21173,9 @@ fn texture_view_layer_range(
         }
         return Ok((0, 1));
     }
-    if layers != 1 || view_layers != 1 {
+    if view_layers != 1 {
         return Err(format!(
-            "2D texture requires one storage/view layer, got {}/{}",
+            "2D texture requires one view layer, got storage={} view={}",
             layers, view_layers
         ));
     }
@@ -16753,7 +21205,8 @@ fn create_texture_image(
     format: vk::Format,
     hash: u64,
     gen: u64,
-) -> Result<(CachedTexture, Option<(vk::Buffer, vk::DeviceMemory)>), String> {
+    upload_slot: Option<&mut FrameSlot>,
+) -> Result<(CachedTexture, Option<PersistentUploadBuffer>), String> {
     if (cube || cube_array) && width != height {
         return Err(format!(
             "cube texture must be square, got {}x{}",
@@ -16846,11 +21299,11 @@ fn create_texture_image(
     }
 
     let stage = if volume_slices.is_none() {
-        Some(create_host_buffer(
+        Some(allocate_texture_upload(
             device,
             mem_props,
             rgba8,
-            vk::BufferUsageFlags::TRANSFER_SRC,
+            upload_slot,
         )?)
     } else {
         None
@@ -16963,24 +21416,30 @@ fn create_texture_image(
     } else if let Some(stage) = stage.as_ref() {
         let copies: Vec<vk::BufferImageCopy> = mip_copies
             .iter()
-            .map(|copy| vk::BufferImageCopy {
-                buffer_offset: copy.buffer_offset,
-                buffer_row_length: 0,
-                buffer_image_height: 0,
-                image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: copy.mip_level,
-                    base_array_layer: 0,
-                    layer_count: if volume { 1 } else { layers },
-                },
-                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                image_extent: vk::Extent3D {
-                    width: copy.width,
-                    height: copy.height,
-                    depth: if volume { layers } else { 1 },
-                },
+            .map(|copy| {
+                let buffer_offset = copy
+                    .buffer_offset
+                    .checked_add(stage.base_offset)
+                    .ok_or_else(|| "texture upload arena offset overflow".to_string())?;
+                Ok(vk::BufferImageCopy {
+                    buffer_offset,
+                    buffer_row_length: 0,
+                    buffer_image_height: 0,
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: copy.mip_level,
+                        base_array_layer: 0,
+                        layer_count: if volume { 1 } else { layers },
+                    },
+                    image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                    image_extent: vk::Extent3D {
+                        width: copy.width,
+                        height: copy.height,
+                        depth: if volume { layers } else { 1 },
+                    },
+                })
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
         if copies.is_empty() {
             return Err("texture upload has no mip copy regions".to_string());
         }
@@ -17044,12 +21503,105 @@ fn create_texture_image(
             image,
             view,
             memory,
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             hash,
             gen,
             verified: std::time::Instant::now(),
         },
-        stage.map(|stage| (stage.buffer, stage.memory)),
+        stage.and_then(|stage| stage.dedicated),
     ))
+}
+
+fn update_texture_image(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    layers: u32,
+    volume: bool,
+    mip_levels: u32,
+    rgba8: &[u8],
+    mip_copies: &[TextureMipCopy],
+    upload_slot: &mut FrameSlot,
+) -> Result<Option<PersistentUploadBuffer>, String> {
+    if mip_copies.is_empty() {
+        return Err("texture update has no mip copy regions".to_string());
+    }
+    let stage = allocate_texture_upload(device, mem_props, rgba8, Some(upload_slot))?;
+    let layer_count = if volume { 1 } else { layers.max(1) };
+    transition_image_range(
+        device,
+        cmd,
+        image,
+        old_layout,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageAspectFlags::COLOR,
+        0,
+        mip_levels.max(1),
+        0,
+        layer_count,
+    );
+    let copies: Vec<vk::BufferImageCopy> = mip_copies
+        .iter()
+        .map(|copy| {
+            let buffer_offset = copy
+                .buffer_offset
+                .checked_add(stage.base_offset)
+                .ok_or_else(|| "texture upload arena offset overflow".to_string())?;
+            Ok(vk::BufferImageCopy {
+                buffer_offset,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: copy.mip_level,
+                    base_array_layer: 0,
+                    layer_count,
+                },
+                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                image_extent: vk::Extent3D {
+                    width: copy.width,
+                    height: copy.height,
+                    depth: if volume { layers.max(1) } else { 1 },
+                },
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    unsafe {
+        device.cmd_copy_buffer_to_image(
+            cmd,
+            stage.buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &copies,
+        );
+    }
+    transition_image_range(
+        device,
+        cmd,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::ImageAspectFlags::COLOR,
+        0,
+        mip_levels.max(1),
+        0,
+        layer_count,
+    );
+    Ok(stage.dedicated)
+}
+
+fn texture_update_in_place_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_TEXTURE_UPDATE_IN_PLACE")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON")
+        )
+    })
 }
 
 fn texture_image_format(
@@ -17233,6 +21785,64 @@ fn texture_image_format_for_tic(
             .all(|component| *component == crate::texture::ComponentType::Float)
     {
         return Ok(vk::Format::R16_SFLOAT);
+    }
+    if matches!(tic.format, TicFormat::BC6S | TicFormat::BC6U) {
+        if tic.is_srgb {
+            return Err(format!("{:?} sRGB view is not representable", tic.format));
+        }
+        if numeric_type != nexium_spirv::TextureNumericType::Float
+            || !tic
+                .component_types
+                .iter()
+                .all(|component| *component == ComponentType::Float)
+        {
+            return Err(format!(
+                "image format {:?}/{:?} cannot back {:?} shader sampling",
+                tic.format, tic.component_types, numeric_type
+            ));
+        }
+        return Ok(if tic.format == TicFormat::BC6S {
+            vk::Format::BC6H_SFLOAT_BLOCK
+        } else {
+            vk::Format::BC6H_UFLOAT_BLOCK
+        });
+    }
+    if matches!(tic.format, TicFormat::BC4 | TicFormat::BC5) {
+        let represented_components = if tic.format == TicFormat::BC4 { 1 } else { 2 };
+        let signed_components = tic.component_types[..represented_components]
+            .iter()
+            .filter(|component| {
+                matches!(
+                    component,
+                    ComponentType::Snorm | ComponentType::SnormForceFp16
+                )
+            })
+            .count();
+        if signed_components != 0 {
+            if signed_components != represented_components {
+                return Err(format!(
+                    "mixed signed compressed image component types are not representable: {:?}",
+                    tic.component_types
+                ));
+            }
+            if tic.is_srgb {
+                return Err(format!(
+                    "{:?} SNORM sRGB view is not representable",
+                    tic.format
+                ));
+            }
+            if numeric_type != nexium_spirv::TextureNumericType::Float {
+                return Err(format!(
+                    "image format {:?}/{:?} cannot back {:?} shader sampling",
+                    tic.format, component_type, numeric_type
+                ));
+            }
+            return Ok(if tic.format == TicFormat::BC4 {
+                vk::Format::BC4_SNORM_BLOCK
+            } else {
+                vk::Format::BC5_SNORM_BLOCK
+            });
+        }
     }
     if tic.format != crate::texture::TicFormat::R16G16B16A16 {
         return Ok(texture_image_format(
@@ -17521,7 +22131,8 @@ fn rt_alias_reinterpret_supported(
     alias: RtAlias,
     view_format: vk::Format,
 ) -> bool {
-    !alias.depth
+    !alias.frozen
+        && !alias.depth
         && alias.key.gpu_va != 0
         && alias.key.gpu_va == tic.gpu_va
         && texture_key.gpu_va == tic.gpu_va
@@ -17952,6 +22563,7 @@ fn record_rt_alias_reinterpret(
 fn rt_alias_sample_view(
     device: &ash::Device,
     rt_cache: &mut RtCache,
+    mut fermi_exact_rt_snapshot_leases: Option<&mut HashMap<u64, FermiExactRtSnapshotLease>>,
     slot: &mut FrameSlot,
     alias: RtAlias,
     tic: Option<crate::texture::TicEntry>,
@@ -17998,6 +22610,35 @@ fn rt_alias_sample_view(
     } else {
         vk::ImageViewType::TYPE_2D
     };
+    if let Some(id) = alias.fermi_exact_rt_snapshot_id {
+        let Some(lease) = fermi_exact_rt_snapshot_leases
+            .as_deref_mut()
+            .and_then(|leases| leases.get_mut(&id))
+        else {
+            return None;
+        };
+        return RtCache::get_or_create_detached_sample_view(
+            device,
+            &mut lease.image,
+            sample_format,
+            aspect,
+            view_type,
+            components,
+        )
+        .map(Some)
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "rt frozen alias sample view failed key={} fmt={:?}->{:?} aspect={:?} swz={:?}: {}",
+                alias.key.label(),
+                alias.format,
+                view_format,
+                aspect,
+                swizzle,
+                error
+            );
+            None
+        });
+    }
     match rt_cache.get_or_create_sample_view(
         device,
         alias.key,
@@ -18558,8 +23199,16 @@ fn tex_sample_spans(len: usize) -> Vec<(usize, usize)> {
 }
 
 fn fnv_bytes(mut h: u64, bytes: &[u8]) -> u64 {
-    for &b in bytes {
-        h ^= b as u64;
+    let mut words = bytes.chunks_exact(8);
+    for word in &mut words {
+        h ^= u64::from_le_bytes(word.try_into().expect("eight-byte hash word"));
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let remainder = words.remainder();
+    if !remainder.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..remainder.len()].copy_from_slice(remainder);
+        h ^= u64::from_le_bytes(tail) ^ ((remainder.len() as u64) << 56);
         h = h.wrapping_mul(0x100000001b3);
     }
     h
@@ -18575,19 +23224,20 @@ fn hash_sampled(bytes: &[u8]) -> u64 {
     h
 }
 
-fn hash_sampled_guest<F>(read_guest: &F, gpu_va: u64, len: usize) -> Option<u64>
+fn hash_sampled_guest<F, D>(read_guest: &F, gpu_va: u64, len: usize) -> Option<u64>
 where
-    F: Fn(u64, usize) -> Option<Vec<u8>>,
+    F: Fn(u64, usize) -> Option<D>,
+    D: AsRef<[u8]>,
 {
     let mut h: u64 = 0xcbf29ce484222325;
     h ^= len as u64;
     h = h.wrapping_mul(0x100000001b3);
     for (off, chunk_len) in tex_sample_spans(len) {
         let chunk = read_guest(gpu_va + off as u64, chunk_len)?;
-        if chunk.len() != chunk_len {
+        if chunk.as_ref().len() != chunk_len {
             return None;
         }
-        h = fnv_bytes(h, &chunk);
+        h = fnv_bytes(h, chunk.as_ref());
     }
     Some(h)
 }
@@ -18642,15 +23292,20 @@ fn acquire_clear_slot<'a>(
     device: &ash::Device,
     clear_slots: &'a mut [ClearSlot],
     clear_slot_index: &mut usize,
-) -> Result<&'a mut ClearSlot, String> {
+) -> Result<(&'a mut ClearSlot, std::time::Duration, bool), String> {
     let idx = *clear_slot_index;
     *clear_slot_index = (idx + 1) % clear_slots.len();
     let slot = &mut clear_slots[idx];
+    let mut wait = std::time::Duration::ZERO;
+    let mut waited = false;
     if slot.in_flight {
+        let started = std::time::Instant::now();
         wait_fence(device, slot.fence)?;
+        wait = started.elapsed();
+        waited = true;
         slot.in_flight = false;
     }
-    Ok(slot)
+    Ok((slot, wait, waited))
 }
 
 fn acquire_rt_copy_slot<'a>(
@@ -18679,10 +23334,23 @@ fn drain_rt_copies_before_color_recreate(
     if !rt_cache.color_requires_recreate(key, format) {
         return Ok(());
     }
+    let previous = rt_cache
+        .color_exact_with_format(key)
+        .map(|(_, _, _, _, previous, _)| previous);
+    let started = std::time::Instant::now();
     unsafe {
         device
             .queue_wait_idle(queue)
             .map_err(|e| format!("queue_wait_idle(color image recreate): {:?}", e))?;
+    }
+    if pprof_enabled() {
+        log::warn!(
+            "[rprof-recreate] key={} previous={:?} next={:?} wait_ms={:.3}",
+            key.label(),
+            previous,
+            format,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
     }
     note_queue_drained();
     for slot in slots {
@@ -18807,11 +23475,40 @@ fn end_one_time(device: &ash::Device, cmd: vk::CommandBuffer) -> Result<(), Stri
     }
 }
 
-fn submit_and_wait(
+fn queue_submit_tracked(
     device: &ash::Device,
     queue: vk::Queue,
     cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    tracked: bool,
 ) -> Result<(), String> {
+    use ash::vk::Handle;
+    let _seq = SUBMIT_SEQ_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let raw = SUBMIT_TIMELINE.load(std::sync::atomic::Ordering::Acquire);
+    let signalling = tracked && raw != 0;
+    let sig_sem = if signalling {
+        vk::Semaphore::from_raw(raw)
+    } else {
+        vk::Semaphore::null()
+    };
+    let sig_value: u64 = if signalling {
+        SUBMIT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+    } else {
+        if tracked {
+            note_queue_submission();
+        }
+        0
+    };
+    let tl = vk::TimelineSemaphoreSubmitInfo {
+        s_type: vk::StructureType::TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        wait_semaphore_value_count: 0,
+        p_wait_semaphore_values: std::ptr::null(),
+        signal_semaphore_value_count: 1,
+        p_signal_semaphore_values: &sig_value,
+        ..Default::default()
+    };
     let submit = vk::SubmitInfo {
         s_type: vk::StructureType::SUBMIT_INFO,
         command_buffer_count: 1,
@@ -18819,16 +23516,46 @@ fn submit_and_wait(
         wait_semaphore_count: 0,
         p_wait_semaphores: std::ptr::null(),
         p_wait_dst_stage_mask: std::ptr::null(),
-        signal_semaphore_count: 0,
-        p_signal_semaphores: std::ptr::null(),
-        p_next: std::ptr::null(),
+        signal_semaphore_count: if signalling { 1 } else { 0 },
+        p_signal_semaphores: if signalling {
+            &sig_sem
+        } else {
+            std::ptr::null()
+        },
+        p_next: if signalling {
+            &tl as *const _ as *const std::ffi::c_void
+        } else {
+            std::ptr::null()
+        },
         _marker: std::marker::PhantomData,
     };
+    let result = unsafe { device.queue_submit(queue, &[submit], fence) };
+    if let Err(error) = result {
+        if signalling {
+            let current =
+                unsafe { device.get_semaphore_counter_value(sig_sem) }.unwrap_or(u64::MAX);
+            if current < sig_value {
+                let info = vk::SemaphoreSignalInfo {
+                    s_type: vk::StructureType::SEMAPHORE_SIGNAL_INFO,
+                    semaphore: sig_sem,
+                    value: sig_value,
+                    ..Default::default()
+                };
+                let _ = unsafe { device.signal_semaphore(&info) };
+            }
+        }
+        return Err(format!("queue_submit(fence): {:?}", error));
+    }
+    Ok(())
+}
+
+fn submit_and_wait(
+    device: &ash::Device,
+    queue: vk::Queue,
+    cmd: vk::CommandBuffer,
+) -> Result<(), String> {
+    queue_submit_tracked(device, queue, cmd, vk::Fence::null(), true)?;
     unsafe {
-        device
-            .queue_submit(queue, &[submit], vk::Fence::null())
-            .map_err(|e| format!("queue_submit: {:?}", e))?;
-        note_queue_submission();
         device
             .queue_wait_idle(queue)
             .map_err(|e| format!("queue_wait_idle: {:?}", e))?;
@@ -18843,9 +23570,12 @@ fn submit_with_fence(
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
 ) -> Result<(), String> {
-    submit_with_fence_untracked(device, queue, cmd, fence)?;
-    note_queue_submission();
-    Ok(())
+    unsafe {
+        device
+            .reset_fences(&[fence])
+            .map_err(|e| format!("reset_fences(submit): {:?}", e))?;
+    }
+    queue_submit_tracked(device, queue, cmd, fence, true)
 }
 
 fn submit_with_fence_untracked(
@@ -18854,27 +23584,12 @@ fn submit_with_fence_untracked(
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
 ) -> Result<(), String> {
-    let submit = vk::SubmitInfo {
-        s_type: vk::StructureType::SUBMIT_INFO,
-        command_buffer_count: 1,
-        p_command_buffers: &cmd,
-        wait_semaphore_count: 0,
-        p_wait_semaphores: std::ptr::null(),
-        p_wait_dst_stage_mask: std::ptr::null(),
-        signal_semaphore_count: 0,
-        p_signal_semaphores: std::ptr::null(),
-        p_next: std::ptr::null(),
-        _marker: std::marker::PhantomData,
-    };
     unsafe {
         device
             .reset_fences(&[fence])
             .map_err(|e| format!("reset_fences(submit): {:?}", e))?;
-        device
-            .queue_submit(queue, &[submit], fence)
-            .map_err(|e| format!("queue_submit(fence): {:?}", e))?;
     }
-    Ok(())
+    queue_submit_tracked(device, queue, cmd, fence, false)
 }
 
 fn wait_fence(device: &ash::Device, fence: vk::Fence) -> Result<(), String> {
@@ -18935,6 +23650,28 @@ fn empty_graphics_cbuf_data() -> Vec<u8> {
             .copy_from_slice(&nexium_spirv::GFX_CBUF_ZERO_WORD.to_le_bytes());
     }
     data
+}
+
+fn graphics_cbuf_data_len(data: Option<&crate::draw::GraphicsCbufPayload>) -> usize {
+    data.map_or(nexium_spirv::GFX_CBUF_MIN_SIZE as usize, |data| {
+        data.packed_len()
+    })
+}
+
+fn write_graphics_cbuf_data(
+    data: Option<&crate::draw::GraphicsCbufPayload>,
+    dst: &mut [u8],
+) -> bool {
+    if let Some(data) = data {
+        data.write_packed_to(dst)
+    } else {
+        let empty = empty_graphics_cbuf_data();
+        if dst.len() != empty.len() {
+            return false;
+        }
+        dst.copy_from_slice(&empty);
+        true
+    }
 }
 
 fn reset_command_buffer(device: &ash::Device, cmd: vk::CommandBuffer) -> Result<(), String> {
@@ -19065,6 +23802,26 @@ fn barrier_color_attachment_after_pass(
             &[],
             &[],
             &[barrier],
+        );
+    }
+}
+
+fn barrier_wait_for_idle(device: &ash::Device, cmd: vk::CommandBuffer) {
+    let barrier = vk::MemoryBarrier {
+        s_type: vk::StructureType::MEMORY_BARRIER,
+        src_access_mask: vk::AccessFlags::MEMORY_WRITE,
+        dst_access_mask: vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+        ..Default::default()
+    };
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[barrier],
+            &[],
+            &[],
         );
     }
 }
@@ -19203,6 +23960,12 @@ fn transition_image_range(
             vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
             vk::AccessFlags::SHADER_READ,
         ),
+        (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::AccessFlags::SHADER_READ,
+            vk::AccessFlags::TRANSFER_WRITE,
+        ),
         (
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -19211,6 +23974,33 @@ fn transition_image_range(
             vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
             vk::AccessFlags::SHADER_READ,
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        ),
+        (
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        ) => (
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::FRAGMENT_SHADER
+                | vk::PipelineStageFlags::VERTEX_SHADER,
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::SHADER_READ,
+        ),
+        (
+            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        ) => (
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::FRAGMENT_SHADER
+                | vk::PipelineStageFlags::VERTEX_SHADER,
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::SHADER_READ,
             vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
                 | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
         ),
@@ -19377,7 +24167,7 @@ fn create_staging_owned(
     Ok(StagingBuffer {
         buffer,
         memory,
-        size: req.size,
+        size,
     })
 }
 
@@ -19443,7 +24233,25 @@ fn create_transfer_buffer_owned(
 impl Drop for RendererInner {
     fn drop(&mut self) {
         let device_idle = unsafe { self.device.device_wait_idle().is_ok() };
+        let fermi_exact_rt_snapshot_leases =
+            std::mem::take(&mut self.fermi_exact_rt_snapshot_leases);
+        self.fermi_exact_rt_snapshot_ids.clear();
+        if device_idle {
+            for (_, lease) in fermi_exact_rt_snapshot_leases {
+                RtCache::destroy_detached_image(&self.device, lease.image);
+            }
+        } else {
+            std::mem::forget(fermi_exact_rt_snapshot_leases);
+        }
+        if self.submit_timeline != vk::Semaphore::null() {
+            SUBMIT_TIMELINE.store(0, std::sync::atomic::Ordering::Release);
+            unsafe { self.device.destroy_semaphore(self.submit_timeline, None) };
+            self.submit_timeline = vk::Semaphore::null();
+        }
         if let Some(cache) = self.aurora_resident_ssbos.take() {
+            cache.destroy(&self.device);
+        }
+        if let Some(cache) = self.resident_vb.take() {
             cache.destroy(&self.device);
         }
         for pending in std::mem::take(&mut self.pending_computes) {
@@ -19455,6 +24263,30 @@ impl Drop for RendererInner {
                 self.device
                     .free_command_buffers(self.cmd_pool, &[pending.cmd]);
             }
+        }
+        let cached_compute_raw_storage = std::mem::take(&mut self.compute_raw_storage_cache);
+        if device_idle {
+            for (_, entry) in cached_compute_raw_storage {
+                entry.resource.destroy(&self.device);
+            }
+        } else {
+            std::mem::forget(cached_compute_raw_storage);
+        }
+        let cached_compute_guest_images = std::mem::take(&mut self.compute_guest_image_pool);
+        if device_idle {
+            for entry in cached_compute_guest_images {
+                entry.resource.destroy(&self.device);
+            }
+        } else {
+            std::mem::forget(cached_compute_guest_images);
+        }
+        let cached_compute_volumes = std::mem::take(&mut self.compute_volume_cache);
+        if device_idle {
+            for volume in cached_compute_volumes {
+                volume.resource.destroy(&self.device);
+            }
+        } else {
+            std::mem::forget(cached_compute_volumes);
         }
         for (cmd, fence) in std::mem::take(&mut self.compute_slot_pool) {
             unsafe {
@@ -19474,6 +24306,7 @@ impl Drop for RendererInner {
                 destroy_texel_buffer(&self.device, dummy);
             }
         }
+        self.tex_cache_vas.clear();
         for (_, t) in self.tex_cache.drain() {
             unsafe {
                 self.device.destroy_image_view(t.view, None);
@@ -19537,6 +24370,16 @@ impl Drop for RendererInner {
             for buffer in slot.retired_texel_buffers.drain(..) {
                 destroy_texel_buffer(&self.device, buffer.resource);
             }
+            for buffer in slot.upload_buffers.drain(..) {
+                destroy_persistent_upload_buffer(&self.device, buffer);
+            }
+            for buffer in slot.free_upload_buffers.drain(..) {
+                destroy_persistent_upload_buffer(&self.device, buffer);
+            }
+            if let Some(arena) = slot.texture_upload_arena.take() {
+                destroy_persistent_upload_buffer(&self.device, arena.buffer);
+            }
+            destroy_retired_rt_images(&self.device, &mut slot.retired_rt_images);
             for t in slot.retired_rt_reinterprets.drain(..) {
                 unsafe {
                     self.device.destroy_image_view(t.view, None);
@@ -19559,6 +24402,16 @@ impl Drop for RendererInner {
         for buffer in self.utility_slot.retired_texel_buffers.drain(..) {
             destroy_texel_buffer(&self.device, buffer.resource);
         }
+        for buffer in self.utility_slot.upload_buffers.drain(..) {
+            destroy_persistent_upload_buffer(&self.device, buffer);
+        }
+        for buffer in self.utility_slot.free_upload_buffers.drain(..) {
+            destroy_persistent_upload_buffer(&self.device, buffer);
+        }
+        if let Some(arena) = self.utility_slot.texture_upload_arena.take() {
+            destroy_persistent_upload_buffer(&self.device, arena.buffer);
+        }
+        destroy_retired_rt_images(&self.device, &mut self.utility_slot.retired_rt_images);
         for t in self.utility_slot.retired_rt_reinterprets.drain(..) {
             unsafe {
                 self.device.destroy_image_view(t.view, None);
@@ -19649,29 +24502,127 @@ unsafe impl Sync for Renderer {}
 #[cfg(test)]
 mod tests {
     use super::{
-        align_up, build_shared_ssbo_plan, choose_aurora_resident_slot,
-        compute_cross_access_view_components, compute_guest_sampler_format_features,
-        compute_sampled_image_alias_extent_matches, compute_texel_buffer_format_features,
+        align_up, build_grouped_shared_ssbo_plans, build_shared_ssbo_plan,
+        choose_aurora_resident_slot, color_sync_clean_across_group, color_sync_supports_key,
+        complete_compute_volume_rt_slices, compute_cross_access_view_components,
+        compute_guest_content_can_retain, compute_guest_content_matches,
+        compute_guest_image_pool_can_admit, compute_guest_image_pool_key,
+        compute_guest_sampler_format_features, compute_guest_source_matches,
+        compute_guest_upload_is_current, compute_guest_upload_spec,
+        compute_raw_storage_cache_can_admit, compute_raw_storage_keys_conflict,
+        compute_raw_storage_seed_is_valid, compute_sampled_image_alias_extent_matches,
+        compute_texel_buffer_format_features, compute_volume_cache_can_admit,
+        compute_volume_cache_identity, compute_volume_cache_needs_copy,
         depth_stencil_component_mapping, depth_stencil_sample_aspect,
         descriptor_slot_uses_arrayed_2d, dummy_image_format_and_aspect, exact_rt_copy_format_bpp,
-        format_graphics_texture_bind_trace, g24r8_scalar_upload, graphics_cbuf_allocation_size,
-        parse_bind_trace_filter, readback_byte_len, readback_fence_is_ready,
-        readback_layout_after_submit, readback_stage_needs_growth, readback_to_rgba8,
-        readback_wait_disposition, resolved_rt_copy_key, ring_request_upper_bound,
-        route_texture_key_to_shader_image_kind, sampled_rt_key_from_lists, shared_aurora_ssbo_key,
-        take_latest_completed_readback, texel_buffer_format, texture_image_format_for_tic,
+        fnv_chunked, format_graphics_texture_bind_trace, g24r8_scalar_upload,
+        graphics_cbuf_allocation_size, graphics_texture_descriptor_binding_mask,
+        parse_bind_trace_filter, preflight_draw_group_attachment_uses, readback_byte_len,
+        readback_fence_is_ready, readback_layout_after_submit, readback_stage_needs_growth,
+        readback_to_rgba8, readback_wait_disposition, resolved_rt_copy_key,
+        ring_request_upper_bound, route_texture_key_to_shader_image_kind,
+        sampled_rt_key_from_lists, shared_aurora_ssbo_key, take_latest_completed_readback,
+        take_latest_completed_readback_for_key, texel_buffer_format, texture_image_format_for_tic,
         texture_key_has_special_view, texture_level_upload, texture_numeric_cache_key,
         texture_numeric_type_matches_format, texture_requires_integer_sampler, texture_upload_data,
-        texture_view_layer_range, texture_view_swizzle, tic_format_prefers_depth_alias,
-        tic_is_cube, tic_layer_count, tic_read_size, tic_requires_dedicated_sampled_view,
-        tic_view_base_layer, tic_view_layer_count, typed_sampled_image_infos,
-        typed_texel_buffer_views, vk_integer_border_color, AuroraResidentSlot,
-        AuroraResidentSlotChoice, DummyImageKind, ExactReadbackStamp, GraphicsTextureBindOutcome,
+        texture_upload_data_with_layout, texture_view_layer_range, texture_view_swizzle,
+        tic_can_use_2d_rt_alias_view, tic_format_prefers_depth_alias, tic_is_cube, tic_layer_count,
+        tic_read_size, tic_requires_dedicated_sampled_view, tic_view_base_layer,
+        tic_view_layer_count, typed_sampled_image_infos, typed_texel_buffer_views,
+        vk_integer_border_color, volume_rt_slices_disjoint_from_attachments, AuroraResidentSlot,
+        AuroraResidentSlotChoice, ComputeGuestImageContent, DescriptorSetBatchCache,
+        DrawGroupAttachmentUse, DummyImageKind, ExactReadbackStamp, GraphicsTextureBindOutcome,
         GraphicsTextureBindTraceRecord, GraphicsTextureTraceResource, PendingReadback,
-        ReadbackWaitDisposition, RtAlias, RtKey, TexCacheKey,
+        ReadbackWaitDisposition, RtAlias, RtKey, SharedGuestSnapshot, TexCacheKey, TextureMipCopy,
+        VolumeRtSlice, COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES, COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES,
+        COMPUTE_GUEST_IMAGE_POOL_MAX_ITEMS, COMPUTE_RAW_STORAGE_CACHE_MAX_BYTES,
+        COMPUTE_RAW_STORAGE_CACHE_MAX_ITEMS, COMPUTE_VOLUME_CACHE_MAX_BYTES,
+        COMPUTE_VOLUME_CACHE_MAX_ITEMS, GRAPHICS_TEXTURE_DESCRIPTOR_BINDING_COUNT,
     };
     use ash::vk;
+    use ash::vk::Handle;
     use std::collections::{HashMap, VecDeque};
+
+    #[test]
+    fn shared_guest_snapshot_bounds_without_copy_and_cows_for_mutation() {
+        let source = std::sync::Arc::new(vec![1, 2, 3, 4, 5, 6]);
+        let source_ptr = source.as_ptr();
+        let mut snapshot = SharedGuestSnapshot::new(source.clone(), 4).unwrap();
+        let original = snapshot.clone();
+
+        assert_eq!(snapshot.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(snapshot.as_ptr(), source_ptr);
+        snapshot.make_mut()[0] = 9;
+        assert_eq!(snapshot.as_slice(), &[9, 2, 3, 4]);
+        assert_eq!(original.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(source.as_slice(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn descriptor_set_batch_cache_returns_each_set_once() {
+        let mut cache = DescriptorSetBatchCache::default();
+        cache.refill(vec![
+            vk::DescriptorSet::from_raw(1),
+            vk::DescriptorSet::from_raw(2),
+            vk::DescriptorSet::from_raw(3),
+        ]);
+
+        assert_eq!(cache.take().unwrap().as_raw(), 3);
+        assert_eq!(cache.take().unwrap().as_raw(), 2);
+        assert_eq!(cache.take().unwrap().as_raw(), 1);
+        assert!(cache.take().is_none());
+    }
+
+    #[test]
+    fn graphics_texture_descriptor_binding_mask_selects_used_families() {
+        use crate::texture_manifest::{GraphicsTextureImageKind, TextureNumericBinding};
+        use nexium_spirv::TextureNumericType::{Float, Sint, Uint};
+
+        let only_2d = [
+            TextureNumericBinding::new(1, 0, Float).with_image_kind(GraphicsTextureImageKind::D2),
+            TextureNumericBinding::new(2, 1, Float)
+                .with_image_kind(GraphicsTextureImageKind::D2Array),
+        ];
+        let mut expected_2d = [false; GRAPHICS_TEXTURE_DESCRIPTOR_BINDING_COUNT];
+        expected_2d[0] = true;
+        assert_eq!(
+            graphics_texture_descriptor_binding_mask(&only_2d),
+            expected_2d
+        );
+
+        let manifest = [
+            TextureNumericBinding::new(1, 0, Float).with_image_kind(GraphicsTextureImageKind::D2),
+            TextureNumericBinding::new(2, 1, Float)
+                .with_image_kind(GraphicsTextureImageKind::D2Array),
+            TextureNumericBinding::new(3, 2, Float).with_image_kind(GraphicsTextureImageKind::D3),
+            TextureNumericBinding::new(4, 3, Float).with_image_kind(GraphicsTextureImageKind::Cube),
+            TextureNumericBinding::new(5, 4, Float)
+                .with_image_kind(GraphicsTextureImageKind::CubeArray),
+            TextureNumericBinding::new(6, 5, Float)
+                .with_image_kind(GraphicsTextureImageKind::Buffer),
+            TextureNumericBinding::new(7, 6, Uint).with_image_kind(GraphicsTextureImageKind::D2),
+            TextureNumericBinding::new(8, 7, Uint).with_image_kind(GraphicsTextureImageKind::D3),
+            TextureNumericBinding::new(9, 8, Uint).with_image_kind(GraphicsTextureImageKind::Cube),
+            TextureNumericBinding::new(10, 9, Uint)
+                .with_image_kind(GraphicsTextureImageKind::CubeArray),
+            TextureNumericBinding::new(11, 10, Uint)
+                .with_image_kind(GraphicsTextureImageKind::Buffer),
+            TextureNumericBinding::new(12, 11, Sint).with_image_kind(GraphicsTextureImageKind::D2),
+            TextureNumericBinding::new(13, 12, Sint).with_image_kind(GraphicsTextureImageKind::D3),
+            TextureNumericBinding::new(14, 13, Sint)
+                .with_image_kind(GraphicsTextureImageKind::Cube),
+            TextureNumericBinding::new(15, 14, Sint)
+                .with_image_kind(GraphicsTextureImageKind::CubeArray),
+            TextureNumericBinding::new(16, 15, Sint)
+                .with_image_kind(GraphicsTextureImageKind::Buffer),
+        ];
+        assert!(graphics_texture_descriptor_binding_mask(&manifest)
+            .iter()
+            .all(|selected| *selected));
+        assert!(graphics_texture_descriptor_binding_mask(&[])
+            .iter()
+            .all(|selected| *selected));
+    }
 
     #[test]
     fn synchronous_readback_stage_is_grow_only() {
@@ -19679,6 +24630,346 @@ mod tests {
         assert!(readback_stage_needs_growth(Some(32), 64));
         assert!(!readback_stage_needs_growth(Some(64), 64));
         assert!(!readback_stage_needs_growth(Some(128), 64));
+    }
+
+    #[test]
+    fn grouped_draw_preflight_rejects_color_format_recreation() {
+        let key = RtKey::new(1, 16, 16, 0x1000);
+        let groups = [
+            DrawGroupAttachmentUse {
+                colors: vec![(key, vk::Format::R8G8B8A8_UNORM)],
+                ..Default::default()
+            },
+            DrawGroupAttachmentUse {
+                colors: vec![(key, vk::Format::R16G16B16A16_SFLOAT)],
+                ..Default::default()
+            },
+        ];
+
+        assert!(preflight_draw_group_attachment_uses(&groups).is_err());
+    }
+
+    #[test]
+    fn grouped_draw_preflight_accepts_compatible_color_views() {
+        let key = RtKey::with_cpu(1, 1600, 900, 0x525c_7000, 0x1000);
+        let groups = [
+            DrawGroupAttachmentUse {
+                colors: vec![(key, vk::Format::R32_SFLOAT)],
+                ..Default::default()
+            },
+            DrawGroupAttachmentUse {
+                colors: vec![(key, vk::Format::B10G11R11_UFLOAT_PACK32)],
+                ..Default::default()
+            },
+        ];
+
+        assert!(preflight_draw_group_attachment_uses(&groups).is_ok());
+    }
+
+    #[test]
+    fn grouped_draw_preflight_rejects_depth_recreation() {
+        let first_key = RtKey::with_cpu(2, 16, 16, 0x2000, 0x9000);
+        let aliased_key = RtKey::with_cpu(2, 16, 16, 0x3000, 0x9000);
+        let groups = [
+            DrawGroupAttachmentUse {
+                depths: vec![(
+                    first_key,
+                    vk::Format::D32_SFLOAT,
+                    vk::ImageAspectFlags::DEPTH,
+                )],
+                ..Default::default()
+            },
+            DrawGroupAttachmentUse {
+                depths: vec![(
+                    aliased_key,
+                    vk::Format::D24_UNORM_S8_UINT,
+                    vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+                )],
+                ..Default::default()
+            },
+        ];
+
+        assert!(preflight_draw_group_attachment_uses(&groups).is_err());
+    }
+
+    #[test]
+    fn grouped_draw_preflight_allows_ordered_exact_2d_color_transition() {
+        let key = RtKey::new(3, 16, 16, 0x3000);
+        let groups = [
+            DrawGroupAttachmentUse {
+                sampled: vec![key],
+                ..Default::default()
+            },
+            DrawGroupAttachmentUse {
+                colors: vec![(key, vk::Format::R8G8B8A8_UNORM)],
+                ..Default::default()
+            },
+        ];
+
+        assert!(preflight_draw_group_attachment_uses(&groups).is_ok());
+    }
+
+    #[test]
+    fn grouped_draw_preflight_rejects_nonexact_or_noncolor_sample_transitions() {
+        let key = RtKey::with_cpu(3, 16, 16, 0x3000, 0x5000);
+        let physical_alias = RtKey::with_cpu(3, 16, 16, 0x4000, 0x5000);
+        let volume = key.with_volume_depth(2);
+
+        let physical_groups = [
+            DrawGroupAttachmentUse {
+                sampled: vec![key],
+                ..Default::default()
+            },
+            DrawGroupAttachmentUse {
+                colors: vec![(physical_alias, vk::Format::R8G8B8A8_UNORM)],
+                ..Default::default()
+            },
+        ];
+        assert!(preflight_draw_group_attachment_uses(&physical_groups).is_err());
+
+        let depth_groups = [
+            DrawGroupAttachmentUse {
+                sampled: vec![key],
+                ..Default::default()
+            },
+            DrawGroupAttachmentUse {
+                depths: vec![(key, vk::Format::D32_SFLOAT, vk::ImageAspectFlags::DEPTH)],
+                ..Default::default()
+            },
+        ];
+        assert!(preflight_draw_group_attachment_uses(&depth_groups).is_err());
+
+        let volume_groups = [
+            DrawGroupAttachmentUse {
+                sampled: vec![volume],
+                ..Default::default()
+            },
+            DrawGroupAttachmentUse {
+                colors: vec![(volume, vk::Format::R8G8B8A8_UNORM)],
+                ..Default::default()
+            },
+        ];
+        assert!(preflight_draw_group_attachment_uses(&volume_groups).is_err());
+    }
+
+    #[test]
+    fn compute_raw_storage_cache_reuses_only_exact_non_aliasing_ranges() {
+        let exact = crate::compute::ComputeRawStorageKey {
+            mapping_epoch: 7,
+            nvmap_id: 3,
+            gpu_va: 0x1000,
+            cpu_addr: 0x8000,
+            size: 0x100,
+        };
+        assert!(!compute_raw_storage_keys_conflict(exact, exact));
+        assert!(compute_raw_storage_keys_conflict(
+            exact,
+            crate::compute::ComputeRawStorageKey {
+                gpu_va: 0x1080,
+                cpu_addr: 0xa000,
+                ..exact
+            }
+        ));
+        assert!(compute_raw_storage_keys_conflict(
+            exact,
+            crate::compute::ComputeRawStorageKey {
+                mapping_epoch: 8,
+                gpu_va: 0x3000,
+                cpu_addr: 0x8080,
+                ..exact
+            }
+        ));
+        assert!(!compute_raw_storage_keys_conflict(
+            exact,
+            crate::compute::ComputeRawStorageKey {
+                gpu_va: 0x3000,
+                cpu_addr: 0xa000,
+                ..exact
+            }
+        ));
+    }
+
+    #[test]
+    fn compute_raw_storage_cache_admission_is_bounded() {
+        assert!(compute_raw_storage_cache_can_admit(0, 0, 0x100));
+        assert!(!compute_raw_storage_cache_can_admit(0, 0, 0));
+        assert!(!compute_raw_storage_cache_can_admit(
+            COMPUTE_RAW_STORAGE_CACHE_MAX_ITEMS,
+            0,
+            0x100,
+        ));
+        assert!(!compute_raw_storage_cache_can_admit(
+            0,
+            COMPUTE_RAW_STORAGE_CACHE_MAX_BYTES,
+            1,
+        ));
+    }
+
+    #[test]
+    fn compute_guest_image_pool_identity_and_admission_are_exact_and_bounded() {
+        let components = vk::ComponentMapping {
+            r: vk::ComponentSwizzle::R,
+            g: vk::ComponentSwizzle::G,
+            b: vk::ComponentSwizzle::B,
+            a: vk::ComponentSwizzle::A,
+        };
+        let copies = [TextureMipCopy {
+            buffer_offset: 0,
+            mip_level: 0,
+            width: 32,
+            height: 32,
+        }];
+        let key = compute_guest_image_pool_key(
+            32,
+            32,
+            32,
+            true,
+            false,
+            vk::Format::R8G8B8A8_UNORM,
+            components,
+            1,
+            0,
+            1,
+            32 * 32 * 32 * 4,
+            &copies,
+        );
+        let mut changed_copies = copies;
+        changed_copies[0].buffer_offset = 16;
+        assert_ne!(
+            key,
+            compute_guest_image_pool_key(
+                32,
+                32,
+                32,
+                true,
+                false,
+                vk::Format::R8G8B8A8_UNORM,
+                components,
+                1,
+                0,
+                1,
+                32 * 32 * 32 * 4,
+                &changed_copies,
+            )
+        );
+        assert!(compute_guest_image_pool_can_admit(0, 0, 4096));
+        assert!(!compute_guest_image_pool_can_admit(0, 0, 0));
+        assert!(!compute_guest_image_pool_can_admit(
+            COMPUTE_GUEST_IMAGE_POOL_MAX_ITEMS,
+            0,
+            4096,
+        ));
+        assert!(!compute_guest_image_pool_can_admit(
+            0,
+            0,
+            COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES + 1,
+        ));
+        let mut raw_tic = [0; 32];
+        raw_tic[0..4].copy_from_slice(&0x1cu32.to_le_bytes());
+        raw_tic[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let match_tic = crate::texture::TicEntry::parse(&raw_tic).unwrap();
+        let match_spec =
+            compute_guest_upload_spec(match_tic, 1, 256, false, vk::Format::R8G8B8A8_UNORM);
+        let match_content = ComputeGuestImageContent {
+            spec: match_spec.clone(),
+            source_hash: fnv_chunked(&[1, 2, 3]),
+            source: std::sync::Arc::from([1, 2, 3]),
+            upload: std::sync::Arc::from([1, 2, 3]),
+            copies: std::sync::Arc::from(Vec::<TextureMipCopy>::new()),
+        };
+        let other_content = ComputeGuestImageContent {
+            spec: match_spec.clone(),
+            source_hash: fnv_chunked(&[1, 2, 4]),
+            source: std::sync::Arc::from([1, 2, 4]),
+            upload: std::sync::Arc::from([1, 2, 4]),
+            copies: std::sync::Arc::from(Vec::<TextureMipCopy>::new()),
+        };
+        assert!(compute_guest_content_matches(
+            Some(&match_content),
+            &match_content
+        ));
+        assert!(!compute_guest_content_matches(
+            Some(&other_content),
+            &match_content
+        ));
+        assert!(!compute_guest_content_matches(None, &match_content));
+        assert!(compute_guest_upload_is_current(
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            false,
+            Some(&match_content),
+            &match_content,
+        ));
+        assert!(!compute_guest_upload_is_current(
+            vk::ImageLayout::UNDEFINED,
+            false,
+            Some(&match_content),
+            &match_content,
+        ));
+        assert!(!compute_guest_upload_is_current(
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            true,
+            Some(&match_content),
+            &match_content,
+        ));
+        assert!(compute_guest_content_can_retain(0, 4096));
+        assert!(!compute_guest_content_can_retain(0, 0));
+        assert!(!compute_guest_content_can_retain(
+            COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES,
+            1,
+        ));
+    }
+
+    #[test]
+    fn compute_guest_source_reuse_requires_exact_source_and_upload_spec() {
+        let mut raw_tic = [0; 32];
+        raw_tic[0..4].copy_from_slice(&0x1cu32.to_le_bytes());
+        raw_tic[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let tic = crate::texture::TicEntry::parse(&raw_tic).unwrap();
+        let spec = compute_guest_upload_spec(tic, 1, 256, false, vk::Format::R8G8B8A8_UNORM);
+        let content = ComputeGuestImageContent {
+            spec: spec.clone(),
+            source_hash: fnv_chunked(&[1, 2, 3, 4]),
+            source: std::sync::Arc::from([1, 2, 3, 4]),
+            upload: std::sync::Arc::from([5, 6, 7, 8]),
+            copies: std::sync::Arc::from(Vec::<TextureMipCopy>::new()),
+        };
+
+        assert!(compute_guest_source_matches(
+            &content,
+            &spec,
+            fnv_chunked(&[1, 2, 3, 4]),
+            4
+        ));
+        assert!(!compute_guest_source_matches(
+            &content,
+            &spec,
+            fnv_chunked(&[1, 2, 3, 5]),
+            4
+        ));
+        assert!(!compute_guest_source_matches(
+            &content,
+            &compute_guest_upload_spec(tic, 2, 256, false, vk::Format::R8G8B8A8_UNORM),
+            fnv_chunked(&[1, 2, 3, 4]),
+            4,
+        ));
+
+        let mut changed_tic = tic;
+        changed_tic.width = changed_tic.width.saturating_add(1);
+        assert!(!compute_guest_source_matches(
+            &content,
+            &compute_guest_upload_spec(changed_tic, 1, 256, false, vk::Format::R8G8B8A8_UNORM,),
+            fnv_chunked(&[1, 2, 3, 4]),
+            4,
+        ));
+    }
+
+    #[test]
+    fn compute_raw_storage_seed_can_be_omitted_only_for_a_resident_exact_buffer() {
+        assert!(compute_raw_storage_seed_is_valid(0x100, 0x100, false));
+        assert!(compute_raw_storage_seed_is_valid(0x100, 0, true));
+        assert!(!compute_raw_storage_seed_is_valid(0x100, 0, false));
+        assert!(!compute_raw_storage_seed_is_valid(0x100, 0x80, true));
+        assert!(!compute_raw_storage_seed_is_valid(0, 0, true));
     }
 
     #[test]
@@ -19793,6 +25084,45 @@ mod tests {
     }
 
     #[test]
+    fn pinned_readback_reaper_never_consumes_another_target() {
+        fn pending(slot: usize, sequence: u64) -> PendingReadback {
+            PendingReadback {
+                sequence,
+                slot,
+                width: 1,
+                height: 1,
+                format: vk::Format::R8G8B8A8_UNORM,
+                flip_y: None,
+            }
+        }
+
+        let mut current = VecDeque::from([pending(0, 1), pending(1, 3), pending(2, 4)]);
+        let other = VecDeque::from([pending(3, 9)]);
+        let ready = [true, true, false, true];
+
+        let (latest, superseded_slots) =
+            take_latest_completed_readback_for_key(&mut current, |slot| ready[slot]);
+
+        let latest = latest.unwrap();
+        assert_eq!((latest.slot, latest.sequence), (1, 3));
+        assert_eq!(superseded_slots, vec![0]);
+        assert_eq!(
+            current
+                .iter()
+                .map(|readback| readback.slot)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(
+            other
+                .iter()
+                .map(|readback| readback.slot)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[test]
     fn exact_rt_copy_rejects_depth_and_requires_matching_color_bpp() {
         assert_eq!(exact_rt_copy_format_bpp(vk::Format::R8_UNORM), Some(1));
         assert_eq!(
@@ -19829,6 +25159,14 @@ mod tests {
         assert_eq!(key.gpu_va, 0x1234_5000);
         assert_eq!((key.width, key.height, key.depth), (640, 480, 1));
         assert!(!key.is_3d);
+    }
+
+    #[test]
+    fn color_sync_rejects_partial_volume_copies() {
+        assert!(color_sync_supports_key(RtKey::new(587, 16, 8, 0x5a1021400)));
+        assert!(!color_sync_supports_key(
+            RtKey::new(587, 8, 8, 0x5a1021400).with_volume_depth(8)
+        ));
     }
 
     fn sparse_aurora_snapshot(
@@ -19990,6 +25328,32 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(
             &plan.groups[1].patches[0].source,
             &changed
+        ));
+    }
+
+    #[test]
+    fn grouped_shared_ssbo_plans_keep_temporal_snapshots_isolated() {
+        const SIZE: usize = 3 * 1024 * 1024;
+        let first = std::sync::Arc::new(vec![0x5a; SIZE]);
+        let second = std::sync::Arc::new(vec![0xa5; SIZE]);
+        let groups = [
+            vec![vec![full_aurora_snapshot(2, 0x1000, first.clone())]],
+            vec![vec![full_aurora_snapshot(2, 0x1000, second.clone())]],
+        ];
+        let plans = build_grouped_shared_ssbo_plans(
+            groups.iter().map(|draws| draws.iter().map(Vec::as_slice)),
+        );
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].groups.len(), 1);
+        assert_eq!(plans[1].groups.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(
+            &plans[0].groups[0].patches[0].source,
+            &first
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &plans[1].groups[0].patches[0].source,
+            &second
         ));
     }
 
@@ -20212,6 +25576,7 @@ mod tests {
             block_height_log2: 4,
             block_depth_log2: 0,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: true,
             texture_type: 1,
             depth: 1,
@@ -20230,6 +25595,8 @@ mod tests {
             format: vk::Format::R16G16B16A16_SFLOAT,
             aspects: vk::ImageAspectFlags::COLOR,
             depth: false,
+            frozen: false,
+            fermi_exact_rt_snapshot_id: None,
         };
 
         assert!(compute_sampled_image_alias_extent_matches(
@@ -20243,6 +25610,186 @@ mod tests {
             tic,
             false,
             1
+        ));
+    }
+
+    #[test]
+    fn volume_slice_cache_requires_disjoint_attachment_allocations() {
+        let slice = VolumeRtSlice {
+            layer: 0,
+            key: RtKey::new(7, 32, 32, 0x5000),
+            image: vk::Image::null(),
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            format: vk::Format::R8_UNORM,
+            stamp: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+
+        assert!(volume_rt_slices_disjoint_from_attachments(
+            &[slice],
+            &[RtKey::new(8, 1600, 900, 0x8000)],
+            None,
+        ));
+        assert!(!volume_rt_slices_disjoint_from_attachments(
+            &[slice],
+            &[RtKey::new(7, 1600, 900, 0x9000)],
+            None,
+        ));
+        assert!(!volume_rt_slices_disjoint_from_attachments(
+            &[slice],
+            &[],
+            Some(RtKey::new(7, 1600, 900, 0xa000)),
+        ));
+    }
+
+    #[test]
+    fn group_sync_clean_cache_rejects_covering_attachments() {
+        let exact = RtKey::new(7, 32, 32, 0x5000);
+        assert!(color_sync_clean_across_group(
+            exact,
+            &[exact],
+            &[vk::Format::R8_UNORM],
+        ));
+        assert!(color_sync_clean_across_group(
+            exact,
+            &[RtKey::new(8, 64, 32, 0x9000)],
+            &[vk::Format::R8_UNORM],
+        ));
+        assert!(!color_sync_clean_across_group(
+            exact,
+            &[RtKey::new(8, 64, 32, 0x5000)],
+            &[vk::Format::R8_UNORM],
+        ));
+        assert!(!color_sync_clean_across_group(
+            RtKey::new(7, 32, 32, 0x5020),
+            &[RtKey::new(8, 64, 32, 0x5000)],
+            &[vk::Format::R8_UNORM],
+        ));
+    }
+
+    #[test]
+    fn compute_volume_rt_slices_require_a_complete_exact_source() {
+        let format = vk::Format::B10G11R11_UFLOAT_PACK32;
+        let slice = |layer, layout, slice_format| VolumeRtSlice {
+            layer,
+            key: RtKey::new(219, 16, 8, 0x56bc_6140_0 + u64::from(layer) * 0x200),
+            image: vk::Image::null(),
+            layout,
+            format: slice_format,
+            stamp: u64::from(layer) + 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        let complete = (0..8)
+            .map(|layer| slice(layer, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, format))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            complete_compute_volume_rt_slices(Some(complete.clone()), 8, format)
+                .map(|slices| slices.len()),
+            Some(8)
+        );
+        assert!(
+            complete_compute_volume_rt_slices(Some(complete[..7].to_vec()), 8, format).is_none()
+        );
+
+        let mut wrong_layer = complete.clone();
+        wrong_layer[7].layer = 6;
+        assert!(complete_compute_volume_rt_slices(Some(wrong_layer), 8, format).is_none());
+
+        let mut wrong_format = complete.clone();
+        wrong_format[3].format = vk::Format::R8G8B8A8_UNORM;
+        assert!(complete_compute_volume_rt_slices(Some(wrong_format), 8, format).is_none());
+
+        let mut undefined = complete;
+        undefined[2].layout = vk::ImageLayout::UNDEFINED;
+        assert!(complete_compute_volume_rt_slices(Some(undefined), 8, format).is_none());
+
+        let mut unstamped = (0..8)
+            .map(|layer| slice(layer, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, format))
+            .collect::<Vec<_>>();
+        unstamped[4].stamp = 0;
+        assert!(complete_compute_volume_rt_slices(Some(unstamped), 8, format).is_none());
+    }
+
+    #[test]
+    fn compute_volume_cache_freshness_tracks_content_not_layout() {
+        let format = vk::Format::B10G11R11_UFLOAT_PACK32;
+        let components = vk::ComponentMapping {
+            r: vk::ComponentSwizzle::R,
+            g: vk::ComponentSwizzle::G,
+            b: vk::ComponentSwizzle::B,
+            a: vk::ComponentSwizzle::A,
+        };
+        let slices = (0..8)
+            .map(|layer| VolumeRtSlice {
+                layer,
+                key: RtKey::new(219, 16, 8, 0x56bc_6140_0 + u64::from(layer) * 0x200),
+                image: vk::Image::from_raw(u64::from(layer) + 1),
+                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                format,
+                stamp: u64::from(layer) + 100,
+                src_x: 0,
+                src_y: 0,
+            })
+            .collect::<Vec<_>>();
+        let identify = |slices: &[VolumeRtSlice]| {
+            compute_volume_cache_identity(32, 32, 32, format, components, 1, 0, 1, slices)
+        };
+        let (key, signature) = identify(&slices);
+        assert!(!compute_volume_cache_needs_copy(
+            Some(&signature),
+            &signature
+        ));
+        assert!(compute_volume_cache_needs_copy(None, &signature));
+
+        let mut changed_stamp = slices.clone();
+        changed_stamp[3].stamp += 1;
+        let (stamp_key, stamp_signature) = identify(&changed_stamp);
+        assert_eq!(stamp_key, key);
+        assert!(compute_volume_cache_needs_copy(
+            Some(&signature),
+            &stamp_signature
+        ));
+
+        let mut changed_layout = slices.clone();
+        changed_layout[5].layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let (layout_key, layout_signature) = identify(&changed_layout);
+        assert_eq!(layout_key, key);
+        assert!(!compute_volume_cache_needs_copy(
+            Some(&signature),
+            &layout_signature
+        ));
+
+        let mut changed_format = slices.clone();
+        changed_format[2].format = vk::Format::R8G8B8A8_UNORM;
+        let (format_key, _) = identify(&changed_format);
+        assert_ne!(format_key, key);
+
+        let mut changed_identity = slices;
+        changed_identity[7].image = vk::Image::from_raw(0xfeed);
+        let (identity_key, _) = identify(&changed_identity);
+        assert_ne!(identity_key, key);
+    }
+
+    #[test]
+    fn compute_volume_cache_admission_is_bounded_by_items_and_bytes() {
+        assert!(compute_volume_cache_can_admit(0, 0, 4096));
+        assert!(!compute_volume_cache_can_admit(
+            COMPUTE_VOLUME_CACHE_MAX_ITEMS,
+            0,
+            4096
+        ));
+        assert!(!compute_volume_cache_can_admit(
+            0,
+            COMPUTE_VOLUME_CACHE_MAX_BYTES,
+            1
+        ));
+        assert!(!compute_volume_cache_can_admit(
+            0,
+            0,
+            COMPUTE_VOLUME_CACHE_MAX_BYTES + 1
         ));
     }
 
@@ -20267,6 +25814,7 @@ mod tests {
             block_height_log2: 1,
             block_depth_log2: 1,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: true,
             texture_type: 2,
             depth: 16,
@@ -20411,6 +25959,7 @@ mod tests {
             block_height_log2: 0,
             block_depth_log2: 0,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: false,
             texture_type: 6,
             depth: 1,
@@ -20514,6 +26063,7 @@ mod tests {
             block_height_log2: 0,
             block_depth_log2: 0,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: false,
             texture_type: 6,
             depth: 1,
@@ -20654,6 +26204,7 @@ mod tests {
             block_height_log2: 0,
             block_depth_log2: 0,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: false,
             texture_type: 1,
             depth: 1,
@@ -20736,6 +26287,7 @@ mod tests {
             block_height_log2: 0,
             block_depth_log2: 0,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: false,
             texture_type: 3,
             depth: 1,
@@ -20779,6 +26331,7 @@ mod tests {
             block_height_log2: tic.block_height_log2,
             block_depth_log2: tic.block_depth_log2,
             tile_width_spacing: tic.tile_width_spacing,
+            pitch_bytes: tic.pitch_bytes,
             numeric_type: 0,
         };
         let cube = TexCacheKey {
@@ -20805,6 +26358,19 @@ mod tests {
         );
         assert_eq!(nexium_spirv::GFX_BINDING_FLOAT_CUBE_ARRAY, 13);
 
+        let d2 = route_texture_key_to_shader_image_kind(
+            cube,
+            &tic,
+            crate::texture_manifest::GraphicsTextureImageKind::D2,
+        )
+        .unwrap();
+        assert!(!d2.arrayed && !d2.cube && !d2.cube_array && !d2.volume);
+        assert_eq!((d2.layers, d2.view_layers), (6, 1));
+        assert_eq!(
+            texture_view_layer_range(6, 0, 1, false, false, false, false).unwrap(),
+            (0, 1)
+        );
+
         let float_components = TexCacheKey {
             component_types: [ComponentType::Float; 4],
             ..plain
@@ -20814,9 +26380,13 @@ mod tests {
             block_height_log2: 4,
             ..plain
         };
+        let different_pitch = TexCacheKey {
+            pitch_bytes: 256,
+            ..plain
+        };
         assert_eq!(
-            HashSet::from([plain, float_components, different_tiling]).len(),
-            3
+            HashSet::from([plain, float_components, different_tiling, different_pitch]).len(),
+            4
         );
 
         let arrayed = TexCacheKey {
@@ -20827,6 +26397,80 @@ mod tests {
         let mut array_tic = tic;
         array_tic.texture_type = 5;
         assert!(tic_requires_dedicated_sampled_view(&array_tic));
+    }
+
+    #[test]
+    fn single_layer_array_tic_can_use_2d_rt_alias_view() {
+        use crate::texture::{ComponentType, SwizzleSource, TicEntry, TicFormat};
+
+        let mut tic = TicEntry {
+            format: TicFormat::B10G11R11,
+            component_types: [ComponentType::Float; 4],
+            swizzle: [
+                SwizzleSource::R,
+                SwizzleSource::G,
+                SwizzleSource::B,
+                SwizzleSource::One,
+            ],
+            gpu_va: 0x524c20000,
+            width: 1600,
+            height: 900,
+            block_width_log2: 0,
+            block_height_log2: 4,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            pitch_bytes: 0,
+            is_block_linear: true,
+            texture_type: 5,
+            depth: 1,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            max_mip_level: 0,
+            res_min_mip_level: 0,
+            res_max_mip_level: 0,
+        };
+
+        assert!(tic_can_use_2d_rt_alias_view(&tic));
+        tic.depth = 2;
+        assert!(!tic_can_use_2d_rt_alias_view(&tic));
+        tic.depth = 1;
+        tic.base_layer = 1;
+        assert!(!tic_can_use_2d_rt_alias_view(&tic));
+    }
+
+    #[test]
+    fn pitch_linear_upload_removes_row_padding() {
+        use crate::texture::{ComponentType, SwizzleSource, TicEntry, TicFormat};
+
+        let tic = TicEntry {
+            format: TicFormat::R8,
+            component_types: [ComponentType::Unorm; 4],
+            swizzle: [SwizzleSource::R; 4],
+            gpu_va: 0x2000,
+            width: 3,
+            height: 2,
+            block_width_log2: 0,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            pitch_bytes: 32,
+            is_block_linear: false,
+            texture_type: 1,
+            depth: 1,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            max_mip_level: 0,
+            res_min_mip_level: 0,
+            res_max_mip_level: 0,
+        };
+        let mut guest = vec![0xcc; tic.pitch_linear_layer_size().unwrap()];
+        guest[0..3].copy_from_slice(&[1, 2, 3]);
+        guest[32..35].copy_from_slice(&[4, 5, 6]);
+        let upload = texture_upload_data(&guest, &tic, 1, 6, false, vk::Format::R8_UNORM)
+            .expect("pitch-linear upload");
+        assert_eq!(upload.bytes, [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -20852,6 +26496,7 @@ mod tests {
             block_height_log2: 2,
             block_depth_log2: 0,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: true,
             texture_type: 8,
             depth: 35,
@@ -20889,15 +26534,18 @@ mod tests {
             }
         }
 
-        let upload = texture_upload_data(
+        crate::pitch_oracle::record_pitch_dst(tic.gpu_va, 0x10_0000);
+        let upload = texture_upload_data_with_layout(
             &guest,
             &tic,
             layers,
             layout.layer_stride,
+            true,
             false,
             vk::Format::R8_UNORM,
-        )
-        .unwrap();
+        );
+        crate::pitch_oracle::clear_pitch_range(tic.gpu_va, 0x10_0000);
+        let upload = upload.unwrap();
         assert_eq!(upload.copies.len(), 8);
 
         let mut expected_offset = 0usize;
@@ -20931,6 +26579,7 @@ mod tests {
             texture_view_layer_range(12, 0, 12, false, false, true, false).unwrap(),
             (0, 12)
         );
+        assert!(texture_view_layer_range(6, 0, 2, false, false, false, false).is_err());
     }
 
     #[test]
@@ -20971,6 +26620,7 @@ mod tests {
             block_height_log2: 0,
             block_depth_log2: 0,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: true,
             texture_type: 1,
             depth: 1,
@@ -21001,7 +26651,15 @@ mod tests {
         );
         let half = [0x00, 0x3c, 0x00, 0x38];
         assert_eq!(
-            texture_level_upload(&half, TicFormat::R16, 2, 1, 1, vk::Format::R16_SFLOAT),
+            texture_level_upload(
+                &half,
+                TicFormat::R16,
+                2,
+                1,
+                1,
+                ComponentType::Float,
+                vk::Format::R16_SFLOAT,
+            ),
             half
         );
 
@@ -21018,6 +26676,7 @@ mod tests {
                 1,
                 1,
                 1,
+                ComponentType::Float,
                 vk::Format::B10G11R11_UFLOAT_PACK32,
             ),
             packed
@@ -21031,7 +26690,15 @@ mod tests {
             vk::Format::R8_SRGB
         );
         assert_eq!(
-            texture_level_upload(&[0x80], TicFormat::R8, 1, 1, 1, vk::Format::R8_SRGB),
+            texture_level_upload(
+                &[0x80],
+                TicFormat::R8,
+                1,
+                1,
+                1,
+                ComponentType::Unorm,
+                vk::Format::R8_SRGB,
+            ),
             [0x80]
         );
         tic.format = TicFormat::R8G8;
@@ -21040,6 +26707,72 @@ mod tests {
             vk::Format::R8G8_SRGB
         );
         tic.format = TicFormat::R16;
+        assert!(texture_image_format_for_tic(&tic, TextureNumericType::Float).is_err());
+
+        tic.format = TicFormat::BC5;
+        tic.component_types = [ComponentType::Snorm; 4];
+        tic.is_srgb = false;
+        assert_eq!(
+            texture_image_format_for_tic(&tic, TextureNumericType::Float).unwrap(),
+            vk::Format::BC5_SNORM_BLOCK
+        );
+        assert!(texture_image_format_for_tic(&tic, TextureNumericType::Uint).is_err());
+        let block = [0xc0, 0x40, 0, 0, 0, 0, 0, 0, 0x20, 0xe0, 0, 0, 0, 0, 0, 0];
+        let uploaded = texture_level_upload(
+            &block,
+            TicFormat::BC5,
+            4,
+            4,
+            1,
+            ComponentType::Snorm,
+            vk::Format::BC5_SNORM_BLOCK,
+        );
+        assert_eq!(uploaded, block);
+
+        tic.format = TicFormat::BC6U;
+        tic.component_types = [ComponentType::Float; 4];
+        assert_eq!(
+            texture_image_format_for_tic(&tic, TextureNumericType::Float).unwrap(),
+            vk::Format::BC6H_UFLOAT_BLOCK
+        );
+        assert_eq!(
+            texture_level_upload(
+                &block,
+                TicFormat::BC6U,
+                4,
+                4,
+                1,
+                ComponentType::Float,
+                vk::Format::BC6H_UFLOAT_BLOCK,
+            ),
+            block
+        );
+        assert!(texture_image_format_for_tic(&tic, TextureNumericType::Uint).is_err());
+
+        tic.format = TicFormat::BC4;
+        tic.component_types = [ComponentType::Snorm; 4];
+        assert_eq!(
+            texture_image_format_for_tic(&tic, TextureNumericType::Float).unwrap(),
+            vk::Format::BC4_SNORM_BLOCK
+        );
+        assert_eq!(
+            texture_level_upload(
+                &block[..8],
+                TicFormat::BC4,
+                4,
+                4,
+                1,
+                ComponentType::Snorm,
+                vk::Format::BC4_SNORM_BLOCK,
+            ),
+            block[..8]
+        );
+
+        tic.format = TicFormat::BC5;
+        tic.component_types[1] = ComponentType::Unorm;
+        assert!(texture_image_format_for_tic(&tic, TextureNumericType::Float).is_err());
+        tic.component_types = [ComponentType::Snorm; 4];
+        tic.is_srgb = true;
         assert!(texture_image_format_for_tic(&tic, TextureNumericType::Float).is_err());
     }
 

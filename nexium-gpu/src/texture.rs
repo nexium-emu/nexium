@@ -25,6 +25,8 @@ pub enum TicFormat {
     BC3,
     BC4,
     BC5,
+    BC6S,
+    BC6U,
     BC7,
     Astc(u8, u8),
     Unknown(u32),
@@ -106,6 +108,8 @@ impl TicFormat {
             0x26 => TicFormat::BC3,
             0x27 => TicFormat::BC4,
             0x28 => TicFormat::BC5,
+            0x10 => TicFormat::BC6S,
+            0x11 => TicFormat::BC6U,
             0x17 => TicFormat::BC7,
             0x29 => TicFormat::Z24S8,
             0x2A => TicFormat::X8Z24,
@@ -149,7 +153,12 @@ impl TicFormat {
             TicFormat::R16G16 => 4,
             TicFormat::R8 => 1,
             TicFormat::BC1 | TicFormat::BC4 => 8,
-            TicFormat::BC2 | TicFormat::BC3 | TicFormat::BC5 | TicFormat::BC7 => 16,
+            TicFormat::BC2
+            | TicFormat::BC3
+            | TicFormat::BC5
+            | TicFormat::BC6S
+            | TicFormat::BC6U
+            | TicFormat::BC7 => 16,
             TicFormat::Astc(_, _) => 16,
             TicFormat::Unknown(_) => 4,
         }
@@ -171,6 +180,8 @@ impl TicFormat {
             | TicFormat::BC3
             | TicFormat::BC4
             | TicFormat::BC5
+            | TicFormat::BC6S
+            | TicFormat::BC6U
             | TicFormat::BC7 => (4, 4),
             TicFormat::Astc(bw, bh) => (*bw as u32, *bh as u32),
             _ => (1, 1),
@@ -188,7 +199,7 @@ impl TicFormat {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TicEntry {
     pub format: TicFormat,
     pub component_types: [ComponentType; 4],
@@ -200,6 +211,7 @@ pub struct TicEntry {
     pub block_height_log2: u32,
     pub block_depth_log2: u32,
     pub tile_width_spacing: u32,
+    pub pitch_bytes: u32,
     pub is_block_linear: bool,
     pub texture_type: u32,
     pub depth: u32,
@@ -243,6 +255,11 @@ impl TicEntry {
         let header_version = (w2 >> 21) & 0x7;
         let is_buffer_header = header_version == 0;
         let is_block_linear = matches!(header_version, 3 | 4);
+        let pitch_bytes = if matches!(header_version, 1 | 2) {
+            (w3 & 0xFFFF) << 5
+        } else {
+            0
+        };
 
         let block_width_log2 = if is_block_linear { w3 & 0x7 } else { 0 };
         let block_height_log2 = if is_block_linear { (w3 >> 3) & 0x7 } else { 0 };
@@ -289,6 +306,7 @@ impl TicEntry {
             block_height_log2,
             block_depth_log2,
             tile_width_spacing,
+            pitch_bytes,
             is_block_linear,
             texture_type,
             depth,
@@ -323,6 +341,25 @@ impl TicEntry {
             .min(self.max_mip_level)
             .saturating_sub(base)
             .saturating_add(1)
+    }
+
+    pub fn pitch_linear_layer_size(&self) -> Option<usize> {
+        if self.pitch_bytes == 0 {
+            return None;
+        }
+        let (storage_width, storage_height, bpp) =
+            self.format.storage_extent(self.width, self.height);
+        let row_size = (storage_width as usize).checked_mul(bpp)?;
+        let pitch = self.pitch_bytes as usize;
+        if pitch < row_size {
+            return None;
+        }
+        pitch.checked_mul(storage_height as usize)
+    }
+
+    pub fn pitch_linear_size(&self, layers: u32) -> Option<usize> {
+        self.pitch_linear_layer_size()?
+            .checked_mul(layers.max(1) as usize)
     }
 }
 
@@ -472,7 +509,35 @@ pub fn block_linear_mip_layout(tic: &TicEntry) -> Option<BlockLinearMipLayout> {
 }
 
 pub fn texture_guest_size_bytes(tic: &TicEntry, layers: u32) -> Option<usize> {
-    block_linear_mip_layout(tic).map(|layout| layout.guest_size_bytes(layers.max(1)))
+    tic.pitch_linear_size(layers).or_else(|| {
+        block_linear_mip_layout(tic).map(|layout| layout.guest_size_bytes(layers.max(1)))
+    })
+}
+
+pub fn unpack_pitch_linear(raw: &[u8], tic: &TicEntry, layers: u32) -> Option<Vec<u8>> {
+    let layer_guest_size = tic.pitch_linear_layer_size()?;
+    let (storage_width, storage_height, bpp) = tic.format.storage_extent(tic.width, tic.height);
+    let row_size = (storage_width as usize).checked_mul(bpp)?;
+    let layer_linear_size = row_size.checked_mul(storage_height as usize)?;
+    let layer_count = layers.max(1) as usize;
+    let guest_size = layer_guest_size.checked_mul(layer_count)?;
+    let linear_size = layer_linear_size.checked_mul(layer_count)?;
+    if raw.len() < guest_size {
+        return None;
+    }
+    let mut linear = vec![0; linear_size];
+    let pitch = tic.pitch_bytes as usize;
+    for layer in 0..layer_count {
+        let guest_layer = layer.checked_mul(layer_guest_size)?;
+        let linear_layer = layer.checked_mul(layer_linear_size)?;
+        for row in 0..storage_height as usize {
+            let guest_start = guest_layer.checked_add(row.checked_mul(pitch)?)?;
+            let linear_start = linear_layer.checked_add(row.checked_mul(row_size)?)?;
+            linear[linear_start..linear_start + row_size]
+                .copy_from_slice(&raw[guest_start..guest_start + row_size]);
+        }
+    }
+    Some(linear)
 }
 
 fn adjusted_mip_block_log2(size: u32, mut block_log2: u32, gob_extent: u32) -> u32 {
@@ -1274,6 +1339,117 @@ fn decode_bc5(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
     unpack_bcn_u32(&buf, out);
 }
 
+fn decode_bc6(src: &[u8], width: u32, height: u32, signed: bool, out: &mut [u8]) {
+    let (w, h) = (width as usize, height as usize);
+    let mut buf = vec![0u32; w * h];
+    let result = if signed {
+        texture2ddecoder::decode_bc6_signed(src, w, h, &mut buf)
+    } else {
+        texture2ddecoder::decode_bc6_unsigned(src, w, h, &mut buf)
+    };
+    if result.is_err() {
+        fill_magenta(out);
+        return;
+    }
+    unpack_bcn_u32(&buf, out);
+}
+
+fn bc_snorm_palette(block: &[u8]) -> ([u8; 8], u64) {
+    let raw_e0 = block[0] as i8;
+    let raw_e1 = block[1] as i8;
+    let e0 = (raw_e0 as i16).max(-127);
+    let e1 = (raw_e1 as i16).max(-127);
+    let mut values = [0i16; 8];
+    values[0] = e0;
+    values[1] = e1;
+    if raw_e0 > raw_e1 {
+        values[2] = (6 * e0 + e1) / 7;
+        values[3] = (5 * e0 + 2 * e1) / 7;
+        values[4] = (4 * e0 + 3 * e1) / 7;
+        values[5] = (3 * e0 + 4 * e1) / 7;
+        values[6] = (2 * e0 + 5 * e1) / 7;
+        values[7] = (e0 + 6 * e1) / 7;
+    } else {
+        values[2] = (4 * e0 + e1) / 5;
+        values[3] = (3 * e0 + 2 * e1) / 5;
+        values[4] = (2 * e0 + 3 * e1) / 5;
+        values[5] = (e0 + 4 * e1) / 5;
+        values[6] = -127;
+        values[7] = 127;
+    }
+    let mut palette = [0u8; 8];
+    for (dst, value) in palette.iter_mut().zip(values) {
+        *dst = value as i8 as u8;
+    }
+    let mut indices = 0u64;
+    for (i, byte) in block[2..8].iter().enumerate() {
+        indices |= (*byte as u64) << (i * 8);
+    }
+    (palette, indices)
+}
+
+fn decode_bc4_snorm(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let width = width as usize;
+    let height = height as usize;
+    let blocks_w = (width + 3) / 4;
+    let blocks_h = (height + 3) / 4;
+    for by in 0..blocks_h {
+        for bx in 0..blocks_w {
+            let off = (by * blocks_w + bx) * 8;
+            if off + 8 > src.len() {
+                continue;
+            }
+            let (palette, indices) = bc_snorm_palette(&src[off..off + 8]);
+            for py in 0..4 {
+                for px in 0..4 {
+                    let pos = py * 4 + px;
+                    let index = ((indices >> (pos * 3)) & 7) as usize;
+                    put_rgba(
+                        out,
+                        width,
+                        height,
+                        bx * 4 + px,
+                        by * 4 + py,
+                        [palette[index], 0, 0, 127],
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn decode_bc5_snorm(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let width = width as usize;
+    let height = height as usize;
+    let blocks_w = (width + 3) / 4;
+    let blocks_h = (height + 3) / 4;
+    for by in 0..blocks_h {
+        for bx in 0..blocks_w {
+            let off = (by * blocks_w + bx) * 16;
+            if off + 16 > src.len() {
+                continue;
+            }
+            let (red, red_indices) = bc_snorm_palette(&src[off..off + 8]);
+            let (green, green_indices) = bc_snorm_palette(&src[off + 8..off + 16]);
+            for py in 0..4 {
+                for px in 0..4 {
+                    let pos = py * 4 + px;
+                    let red_index = ((red_indices >> (pos * 3)) & 7) as usize;
+                    let green_index = ((green_indices >> (pos * 3)) & 7) as usize;
+                    put_rgba(
+                        out,
+                        width,
+                        height,
+                        bx * 4 + px,
+                        by * 4 + py,
+                        [red[red_index], green[green_index], 0, 127],
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn decode_bc7(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
     let (w, h) = (width as usize, height as usize);
     let mut buf = vec![0u32; w * h];
@@ -1284,7 +1460,13 @@ fn decode_bc7(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
     unpack_bcn_u32(&buf, out);
 }
 
-pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -> Vec<u8> {
+pub fn decode_to_rgba8_typed(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    format: TicFormat,
+    component_type: ComponentType,
+) -> Vec<u8> {
     let pixels = (width as usize) * (height as usize);
     let mut out = vec![0u8; pixels * 4];
 
@@ -1507,8 +1689,26 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
         TicFormat::BC1 => decode_bc1(src, width, height, &mut out),
         TicFormat::BC2 => decode_bc2(src, width, height, &mut out),
         TicFormat::BC3 => decode_bc3(src, width, height, &mut out),
+        TicFormat::BC4
+            if matches!(
+                component_type,
+                ComponentType::Snorm | ComponentType::SnormForceFp16
+            ) =>
+        {
+            decode_bc4_snorm(src, width, height, &mut out)
+        }
         TicFormat::BC4 => decode_bc4(src, width, height, &mut out),
+        TicFormat::BC5
+            if matches!(
+                component_type,
+                ComponentType::Snorm | ComponentType::SnormForceFp16
+            ) =>
+        {
+            decode_bc5_snorm(src, width, height, &mut out)
+        }
         TicFormat::BC5 => decode_bc5(src, width, height, &mut out),
+        TicFormat::BC6S => decode_bc6(src, width, height, true, &mut out),
+        TicFormat::BC6U => decode_bc6(src, width, height, false, &mut out),
         TicFormat::BC7 => decode_bc7(src, width, height, &mut out),
         TicFormat::Astc(bw, bh) => {
             decode_astc(src, width, height, bw as usize, bh as usize, &mut out)
@@ -1554,13 +1754,17 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
     out
 }
 
+pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -> Vec<u8> {
+    decode_to_rgba8_typed(src, width, height, format, ComponentType::Unorm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        block_linear_byte_size_3d, block_linear_mip_layout, decode_to_rgba8,
+        block_linear_byte_size_3d, block_linear_mip_layout, decode_to_rgba8, decode_to_rgba8_typed,
         swizzle_block_linear_3d, swizzle_block_linear_strided, texture_guest_size_bytes,
-        unswizzle_block_linear_3d, unswizzle_block_linear_strided, ComponentType, SwizzleSource,
-        TicEntry, TicFormat,
+        unpack_pitch_linear, unswizzle_block_linear_3d, unswizzle_block_linear_strided,
+        ComponentType, SwizzleSource, TicEntry, TicFormat,
     };
 
     #[test]
@@ -1596,6 +1800,27 @@ mod tests {
     }
 
     #[test]
+    fn decodes_bc5_snorm_as_signed_channels() {
+        let block = [0xc0, 0x40, 0, 0, 0, 0, 0, 0, 0x20, 0xe0, 0, 0, 0, 0, 0, 0];
+        let signed = decode_to_rgba8_typed(&block, 4, 4, TicFormat::BC5, ComponentType::Snorm);
+        assert!(signed
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0xc0, 0x20, 0, 0x7f]));
+
+        let unsigned = decode_to_rgba8(&block, 4, 4, TicFormat::BC5);
+        assert!(unsigned
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0xc0, 0x20, 0, 0xff]));
+    }
+
+    #[test]
+    fn bc_snorm_selects_mode_before_clamping_endpoints() {
+        let block = [0x81, 0x80, 0x1f, 0, 0, 0, 0, 0];
+        let signed = decode_to_rgba8_typed(&block, 4, 4, TicFormat::BC4, ComponentType::Snorm);
+        assert_eq!(&signed[..8], &[0x81, 0, 0, 0x7f, 0x81, 0, 0, 0x7f]);
+    }
+
+    #[test]
     fn parses_maxwell_g8r8_and_maps_video_luma_formats() {
         let mut raw = [0u8; 32];
         raw[0..4].copy_from_slice(&0x18u32.to_le_bytes());
@@ -1605,6 +1830,53 @@ mod tests {
         assert_eq!(tic.format.src_bpp(), 2);
         assert_eq!(TicFormat::from_raw(0x1c), TicFormat::R8);
         assert_eq!(TicFormat::from_raw(0x1d), TicFormat::R8);
+    }
+
+    #[test]
+    fn parses_pitch_linear_row_stride_and_guest_size() {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&0x1cu32.to_le_bytes());
+        raw[4..8].copy_from_slice(&1u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&(1u32 << 21).to_le_bytes());
+        raw[12..16].copy_from_slice(&(512u32 >> 5).to_le_bytes());
+        raw[16..20].copy_from_slice(&(479u32 | (1 << 23)).to_le_bytes());
+        raw[20..24].copy_from_slice(&271u32.to_le_bytes());
+        let tic = TicEntry::parse(&raw).unwrap();
+        assert!(!tic.is_block_linear);
+        assert_eq!(tic.pitch_bytes, 512);
+        assert_eq!(tic.pitch_linear_layer_size(), Some(512 * 272));
+        assert_eq!(texture_guest_size_bytes(&tic, 1), Some(512 * 272));
+    }
+
+    #[test]
+    fn pitch_linear_rows_unpack_without_padding() {
+        let tic = TicEntry {
+            format: TicFormat::R8,
+            component_types: [ComponentType::Unorm; 4],
+            swizzle: [SwizzleSource::R; 4],
+            gpu_va: 1,
+            width: 3,
+            height: 2,
+            block_width_log2: 0,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            pitch_bytes: 32,
+            is_block_linear: false,
+            texture_type: 1,
+            depth: 1,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            max_mip_level: 0,
+            res_min_mip_level: 0,
+            res_max_mip_level: 0,
+        };
+        let mut guest = vec![0xcc; 64];
+        guest[0..3].copy_from_slice(&[1, 2, 3]);
+        guest[32..35].copy_from_slice(&[4, 5, 6]);
+        let linear = unpack_pitch_linear(&guest, &tic, 1).unwrap();
+        assert_eq!(linear, [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -1622,6 +1894,15 @@ mod tests {
         assert_eq!(tic.mip_levels(), 8);
         assert_eq!(tic.view_base_mip(), 2);
         assert_eq!(tic.view_mip_levels(), 5);
+    }
+
+    #[test]
+    fn recognizes_bc6h_formats_and_block_sizes() {
+        assert_eq!(TicFormat::from_raw(0x10), TicFormat::BC6S);
+        assert_eq!(TicFormat::from_raw(0x11), TicFormat::BC6U);
+        assert_eq!(TicFormat::BC6U.src_bpp(), 16);
+        assert_eq!(TicFormat::BC6U.block_extent(), (4, 4));
+        assert_eq!(TicFormat::BC6U.linear_size(4096, 2048), 8 * 1024 * 1024);
     }
 
     #[test]
@@ -1688,6 +1969,7 @@ mod tests {
             block_height_log2: 4,
             block_depth_log2: 0,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: true,
             texture_type: 3,
             depth: 1,
@@ -1725,6 +2007,7 @@ mod tests {
             block_height_log2: 0,
             block_depth_log2: 0,
             tile_width_spacing: 4,
+            pitch_bytes: 0,
             is_block_linear: true,
             texture_type: 1,
             depth: 1,
@@ -1771,6 +2054,7 @@ mod tests {
             block_height_log2: 4,
             block_depth_log2: 0,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: true,
             texture_type: 1,
             depth: 1,
