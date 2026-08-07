@@ -480,7 +480,7 @@ struct ComputeProgram {
     pipeline: vk::Pipeline,
 }
 
-const COMPUTE_UNIFORM_POOL_MAX_ITEMS: usize = 16;
+const COMPUTE_UNIFORM_POOL_MAX_ITEMS: usize = 32;
 const COMPUTE_UNIFORM_POOL_MAX_BYTES: u64 = 1024 * 1024;
 const COMPUTE_RAW_STORAGE_POOL_MAX_ITEMS: usize = 512;
 const COMPUTE_RAW_STORAGE_POOL_MAX_BYTES: u64 = 128 * 1024 * 1024;
@@ -605,7 +605,7 @@ impl ComputeResourcePool {
         if !compute_pool_profile_enabled() || (dispatches > 8 && dispatches % 128 != 0) {
             return;
         }
-        log::info!(
+        log::warn!(
             "[compute-pool] dispatches={} uniform_hit_miss={}/{} raw_storage_hit_miss={}/{} \
              output_hit_miss={}/{} readback_hit_miss={}/{} retained_items={}/{}/{}/{} \
              retained_bytes={}/{}/{}/{}",
@@ -982,7 +982,7 @@ impl ComputeBackend {
         mem_props: &vk::PhysicalDeviceMemoryProperties,
         data: &[u8],
     ) -> Result<ComputeBufferResource, String> {
-        let key = data.len().max(16) as u64;
+        let key = (data.len().max(16) as u64).next_power_of_two().max(256);
         if let Some(resource) = self.resource_pool.uniforms.take(&key) {
             self.resource_pool.stats.uniform_hits =
                 self.resource_pool.stats.uniform_hits.saturating_add(1);
@@ -997,7 +997,7 @@ impl ComputeBackend {
         create_compute_buffer_allocation(
             device,
             mem_props,
-            data.len().max(16) as u64,
+            key,
             Some(data),
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             None,
