@@ -8915,9 +8915,11 @@ fn execute_one_inner(
         mappings,
         mem_read,
     );
-    let cbuf_data = Some(packed_cbuf);
+    let cbuf_data = packed_cbuf;
     let (call_cbuf_addr, call_cbuf_size) = if let Some(data) = &cbuf_data {
         (0, data.packed_len() as u32)
+    } else if let Some(resident) = &resident_cbuf {
+        (0, resident.packed_size as u32)
     } else {
         (fallback_cbuf_addr, _fallback_cbuf_size)
     };
@@ -14720,6 +14722,7 @@ fn pack_cbuf_data(
         mem_read,
     )
     .0
+    .expect("test cbuf pack always produces a payload")
 }
 
 fn resident_cbuf_prep_enabled() -> bool {
@@ -14743,7 +14746,7 @@ fn pack_cbuf_data_with_requirements(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> (
-    GraphicsCbufPayload,
+    Option<GraphicsCbufPayload>,
     Option<nexium_gpu::draw::ResidentCbufDraw>,
 ) {
     let used = vs_mask | fs_mask;
@@ -14809,17 +14812,79 @@ fn pack_cbuf_data_with_requirements(
     if let Some((cached_key, payload)) = snapshot_cache.last_packed_cbuf.as_ref() {
         if *cached_key == pack_key {
             super::pusher::kickprof::count(super::pusher::kickprof::CBUF_PACK_MEMO, 1);
-            return (payload.clone(), None);
+            return (Some(payload.clone()), None);
         }
+    }
+    let (required_read_lens, unknown_read_lens) = requirements;
+    if resident_cbuf_prep_enabled() && !recheck {
+        let kp_res = super::pusher::kickprof::start();
+        let mut resident_slots = Vec::new();
+        let mut packed_size = nexium_spirv::GFX_CBUF_MIN_SIZE as usize;
+        let mut resident_ok = true;
+        for logical_slot in 0..PACKED_CBUF_SLOTS {
+            if (used & (1u64 << logical_slot)) == 0 {
+                continue;
+            }
+            let stage = if logical_slot < FRAGMENT_CBUF_BASE {
+                vs_cbuf_group
+            } else {
+                fs_cbuf_group
+            };
+            let (addr, size) = cbuf_binds[stage][logical_slot % GRAPHICS_CBUF_SLOTS];
+            if addr == 0 || size == 0 {
+                continue;
+            }
+            let bound_len = (size as usize).min(nexium_spirv::GFX_CBUF_MAX_SIZE as usize);
+            let len = if unknown_read_lens[logical_slot] {
+                bound_len
+            } else {
+                required_read_lens[logical_slot].min(bound_len)
+            };
+            let word_count = len.div_ceil(4);
+            if word_count == 0 {
+                continue;
+            }
+            match snapshot_cache.mirror_resident_range(
+                mappings,
+                logical_slot as u32,
+                0,
+                addr,
+                len,
+                mem_read,
+            ) {
+                Some(range) => {
+                    packed_size = (packed_size + 15) & !15;
+                    packed_size = packed_size.saturating_add(word_count * 4);
+                    resident_slots.push(nexium_gpu::draw::ResidentCbufSlot {
+                        logical_slot: logical_slot as u32,
+                        word_count: word_count as u32,
+                        range,
+                    });
+                }
+                None => {
+                    resident_ok = false;
+                    break;
+                }
+            }
+        }
+        if resident_ok && !resident_slots.is_empty() {
+            super::pusher::kickprof::count(super::pusher::kickprof::RESIDENT_CBUF_DRAW, 1);
+            super::pusher::kickprof::add(super::pusher::kickprof::CBUF_SLOTS, kp_res);
+            return (
+                None,
+                Some(nexium_gpu::draw::ResidentCbufDraw {
+                    slots: resident_slots,
+                    packed_size,
+                }),
+            );
+        }
+        super::pusher::kickprof::add(super::pusher::kickprof::CBUF_SLOTS, kp_res);
     }
     let mut guest_addrs = [0u64; PACKED_CBUF_SLOTS];
     let mut bound_sizes = [0u32; PACKED_CBUF_SLOTS];
     let mut read_lens = [0usize; PACKED_CBUF_SLOTS];
     let mut slot_data: [Option<InputSnapshot>; PACKED_CBUF_SLOTS] = std::array::from_fn(|_| None);
-    let (required_read_lens, unknown_read_lens) = requirements;
     let mut cacheable = !recheck;
-    let mut resident_ok = resident_cbuf_prep_enabled();
-    let mut resident_slots = Vec::new();
     let kp_slots = super::pusher::kickprof::start();
     for logical_slot in 0..PACKED_CBUF_SLOTS {
         if (used & (1u64 << logical_slot)) == 0 {
@@ -14850,27 +14915,9 @@ fn pack_cbuf_data_with_requirements(
         }
 
         if let Some(data) = snapshot_cache.mirror_resolve_cbuf(mappings, addr, len, mem_read) {
-            if resident_ok {
-                match snapshot_cache.mirror_resident_range(
-                    mappings,
-                    logical_slot as u32,
-                    0,
-                    addr,
-                    len,
-                    mem_read,
-                ) {
-                    Some(range) => resident_slots.push(nexium_gpu::draw::ResidentCbufSlot {
-                        logical_slot: logical_slot as u32,
-                        word_count: word_count as u32,
-                        range,
-                    }),
-                    None => resident_ok = false,
-                }
-            }
             slot_data[logical_slot] = Some(data);
             continue;
         }
-        resident_ok = false;
         let map_generation = mappings.generation();
         let data = snapshot_cache
             .cbuf_slot_cached(logical_slot, addr, size, len, map_generation)
@@ -14930,14 +14977,7 @@ fn pack_cbuf_data_with_requirements(
             payload.clone(),
         ));
         super::pusher::kickprof::add(super::pusher::kickprof::CBUF_PACK, kp_pack);
-        let resident = (resident_ok && !resident_slots.is_empty()).then(|| {
-            super::pusher::kickprof::count(super::pusher::kickprof::RESIDENT_CBUF_DRAW, 1);
-            nexium_gpu::draw::ResidentCbufDraw {
-                slots: resident_slots,
-                packed_size,
-            }
-        });
-        return (payload, resident);
+        return (Some(payload), None);
     }
 
     let mut out = vec![0u8; nexium_spirv::GFX_CBUF_MIN_SIZE as usize];
@@ -14992,7 +15032,7 @@ fn pack_cbuf_data_with_requirements(
     }
     let payload = GraphicsCbufPayload::owned(Arc::new(out));
     super::pusher::kickprof::add(super::pusher::kickprof::CBUF_PACK, kp_pack);
-    (payload, None)
+    (Some(payload), None)
 }
 
 fn read_stage_cbuf_u32(

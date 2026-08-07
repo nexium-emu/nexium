@@ -651,6 +651,26 @@ fn create_resident_vb_cache(
     })
 }
 
+fn assemble_resident_cbuf_payload(draw: &crate::draw::ResidentCbufDraw) -> Option<Vec<u8>> {
+    let mut out = vec![0u8; nexium_spirv::GFX_CBUF_MIN_SIZE as usize];
+    for slot_index in 0..nexium_spirv::GFX_CBUF_SLOTS as usize {
+        let dir = slot_index * 8;
+        out[dir..dir + 4].copy_from_slice(&nexium_spirv::GFX_CBUF_ZERO_WORD.to_le_bytes());
+    }
+    for slot in &draw.slots {
+        let mut bytes = slot.range.assemble()?;
+        let aligned = (out.len() + 15) & !15;
+        out.resize(aligned, 0);
+        let base_word = (out.len() / 4) as u32;
+        bytes.resize(slot.word_count as usize * 4, 0);
+        out.extend_from_slice(&bytes);
+        let dir = slot.logical_slot as usize * 8;
+        out[dir..dir + 4].copy_from_slice(&base_word.to_le_bytes());
+        out[dir + 4..dir + 8].copy_from_slice(&slot.word_count.to_le_bytes());
+    }
+    Some(out)
+}
+
 fn assemble_resident_binding(
     range: &crate::draw::ResidentVertexRange,
 ) -> Option<PreparedVertexBinding> {
@@ -847,7 +867,11 @@ pub fn graphics_draw_ring_bytes_upper_bound(call: &crate::draw::Maxwell3dDrawCal
             4,
         ));
     }
-    let cbuf_len = graphics_cbuf_data_len(call.cbuf_data.as_ref()) as u64;
+    let cbuf_len = (graphics_cbuf_data_len(call.cbuf_data.as_ref()) as u64).max(
+        call.resident_cbuf
+            .as_ref()
+            .map_or(0, |draw| draw.packed_size as u64),
+    );
     bytes = bytes.saturating_add(ring_request_upper_bound(
         cbuf_len,
         MAX_STORAGE_BUFFER_OFFSET_ALIGNMENT,
@@ -6577,7 +6601,16 @@ impl Renderer {
         let (vertex_bindings, draw_vertex_count) = prepare_vertex_bindings(call, &read_guest)?;
 
         let cbuf_data = call.cbuf_data.as_ref();
-        let cbuf_len = graphics_cbuf_data_len(cbuf_data);
+        let assembled_cbuf = if cbuf_data.is_none() {
+            call.resident_cbuf
+                .as_ref()
+                .and_then(assemble_resident_cbuf_payload)
+        } else {
+            None
+        };
+        let cbuf_len = assembled_cbuf
+            .as_ref()
+            .map_or_else(|| graphics_cbuf_data_len(cbuf_data), |bytes| bytes.len());
 
         let (index_data, index_count, index_type) = match (&call.index_data, call.index_count) {
             (Some(d), Some(c)) if c > 0 && !d.is_empty() => (d.as_slice(), c, call.index_type),
@@ -7484,7 +7517,9 @@ impl Renderer {
             ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
                 .map_err(|e| format!("ring_alloc(graphics-cbuf): {}", e))?;
         let cbuf_dst = unsafe { std::slice::from_raw_parts_mut(ubo_ptr, cbuf_len) };
-        if !write_graphics_cbuf_data(cbuf_data, cbuf_dst) {
+        if let Some(bytes) = &assembled_cbuf {
+            cbuf_dst.copy_from_slice(bytes);
+        } else if !write_graphics_cbuf_data(cbuf_data, cbuf_dst) {
             return Err("invalid graphics cbuf snapshot".to_string());
         }
 
@@ -10160,8 +10195,18 @@ impl Renderer {
                 {
                     (buffer, offset, range)
                 } else {
+                    let assembled = if prep.cbuf_data.is_none() {
+                        call.resident_cbuf
+                            .as_ref()
+                            .and_then(assemble_resident_cbuf_payload)
+                    } else {
+                        None
+                    };
+                    let cbuf_len = assembled
+                        .as_ref()
+                        .map_or(prep.cbuf_len, |bytes| bytes.len());
                     let (_cbuf_range, cbuf_size_aligned) = graphics_cbuf_allocation_size(
-                        prep.cbuf_len,
+                        cbuf_len,
                         cbuf_alignment,
                         *max_storage_buffer_range,
                     )?;
@@ -10173,12 +10218,13 @@ impl Renderer {
                     let (ubo_buffer, ubo_offset, ubo_ptr) =
                         ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
                             .map_err(|e| format!("ring_alloc(graphics-cbuf): {}", e))?;
-                    let cbuf_dst =
-                        unsafe { std::slice::from_raw_parts_mut(ubo_ptr, prep.cbuf_len) };
-                    if !write_graphics_cbuf_data(prep.cbuf_data, cbuf_dst) {
+                    let cbuf_dst = unsafe { std::slice::from_raw_parts_mut(ubo_ptr, cbuf_len) };
+                    if let Some(bytes) = &assembled {
+                        cbuf_dst.copy_from_slice(bytes);
+                    } else if !write_graphics_cbuf_data(prep.cbuf_data, cbuf_dst) {
                         return Err("invalid batched graphics cbuf snapshot".to_string());
                     }
-                    (ubo_buffer, ubo_offset, prep.cbuf_len as u64)
+                    (ubo_buffer, ubo_offset, cbuf_len as u64)
                 };
 
                 if bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
