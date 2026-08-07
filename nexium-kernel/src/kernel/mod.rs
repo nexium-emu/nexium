@@ -18,6 +18,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 pub(crate) const MUTEX_HAS_LISTENERS: u32 = 0x4000_0000;
+const TLS_USER_DISABLE_COUNT_OFFSET: u64 = 0x100;
+const TLS_USER_INTERRUPT_FLAG_OFFSET: u64 = 0x102;
 
 pub struct Kernel {
     pub address_space: Arc<AddressSpace>,
@@ -91,6 +93,9 @@ pub struct Kernel {
 
     pub nro_mmap: Option<Arc<memmap2::Mmap>>,
     pub nro_romfs_range: Option<std::ops::Range<usize>>,
+    pub application_romfs: Option<nexium_loader::LazyRomfs>,
+    pub system_romfs_mmap: Option<Arc<memmap2::Mmap>>,
+    pub system_romfs_ranges: HashMap<u64, std::ops::Range<usize>>,
 
     pub homebrew_dir: Option<std::path::PathBuf>,
     pub dir_cursor: HashMap<u32, usize>,
@@ -126,6 +131,38 @@ pub struct Kernel {
     pub hwopus_decoders: HashMap<(u32, u32), crate::services::hwopus::DecoderState>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AudioAdpcmContext {
+    pub header: u8,
+    pub yn0: i16,
+    pub yn1: i16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AudioAdpcmStreamKey {
+    pub wb_index: u16,
+    pub buffer_address: u64,
+    pub buffer_size: u64,
+    pub start_offset: i32,
+    pub end_offset: i32,
+    pub context_address: u64,
+    pub coefficient_address: u64,
+    pub sample_rate: u32,
+    pub looping: bool,
+    pub initial_header: u16,
+    pub initial_yn0: i16,
+    pub initial_yn1: i16,
+    pub coefficients: [i16; 16],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AudioAdpcmDecodeState {
+    pub valid: bool,
+    pub key: AudioAdpcmStreamKey,
+    pub next_sample: u64,
+    pub context: AudioAdpcmContext,
+}
+
 #[derive(Clone, Debug)]
 pub struct AudioRendererState {
     pub sample_rate: u32,
@@ -144,6 +181,7 @@ pub struct AudioRendererState {
     pub voice_wb_progress_frames: Vec<u64>,
     pub voice_frac_q15: Vec<i32>,
     pub voice_hist: Vec<[f32; 6]>,
+    pub voice_adpcm_states: Vec<AudioAdpcmDecodeState>,
 }
 
 impl Kernel {
@@ -165,13 +203,26 @@ impl Kernel {
         let main_stack_top = stack_base + stack_size - 0x20;
         let threads =
             threads::Threads::new(main_thread_handle, tls_base, main_stack_top, tls_pool_base);
+        let mut nvdrv = Nvdrv::new();
+        let gpu_address_space = Arc::clone(&address_space);
+        nvdrv.set_guest_memory_writer(move |addr, bytes| {
+            gpu_address_space.write(addr, bytes).is_ok()
+        });
+        let gpu_read_space = Arc::clone(&address_space);
+        let gpu_write_space = Arc::clone(&address_space);
+        let gpu_copy_space = Arc::clone(&address_space);
+        nvdrv.set_gpu_async_memory(
+            Arc::new(move |addr, buf| gpu_read_space.read(addr, buf).is_ok()),
+            Arc::new(move |addr, buf| gpu_write_space.write(addr, buf).is_ok()),
+            Arc::new(move |src, dst, len| gpu_copy_space.copy(src, dst, len).is_ok()),
+        );
 
         Self {
             address_space,
             handles,
             threads,
             services: Services::new(),
-            nvdrv: Nvdrv::new(),
+            nvdrv,
             hid: Arc::new(Mutex::new(hid::HidShared::new())),
             hid_mapped_host_ptr: None,
             sessions: HashMap::new(),
@@ -232,6 +283,9 @@ impl Kernel {
             bcat_progress_event: None,
             nro_mmap: None,
             nro_romfs_range: None,
+            application_romfs: None,
+            system_romfs_mmap: None,
+            system_romfs_ranges: HashMap::new(),
             homebrew_dir: None,
             dir_cursor: HashMap::new(),
             open_files: HashMap::new(),
@@ -678,6 +732,12 @@ impl Kernel {
         }
     }
 
+    pub fn system_romfs(&self, title_id: u64) -> Option<&[u8]> {
+        let mmap = self.system_romfs_mmap.as_ref()?;
+        let range = self.system_romfs_ranges.get(&title_id)?;
+        mmap.get(range.clone())
+    }
+
     pub fn drain_gpu_fence_events(&mut self) {
         if self.gpu_fence_events.is_empty() {
             return;
@@ -838,6 +898,98 @@ impl Kernel {
         }
     }
 
+    fn current_thread_tls_va(&self) -> Option<u64> {
+        let handle = self.threads.current_handle()?;
+        self.threads
+            .threads
+            .get(&handle)
+            .map(|thread| thread.tls_va)
+    }
+
+    fn current_user_disable_count(&self) -> Option<u16> {
+        let tls_va = self.current_thread_tls_va()?;
+        let mut bytes = [0u8; 2];
+        if let Err(error) = self
+            .address_space
+            .read(tls_va + TLS_USER_DISABLE_COUNT_OFFSET, &mut bytes)
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "failed to read user preemption-disable count at {:#x}: {:?}; allowing host preemption",
+                    tls_va + TLS_USER_DISABLE_COUNT_OFFSET,
+                    error
+                );
+            }
+            return None;
+        }
+        Some(u16::from_le_bytes(bytes))
+    }
+
+    fn write_user_interrupt_flag(&self, tls_va: u64, value: u16) -> bool {
+        if let Err(error) = self.address_space.write(
+            tls_va + TLS_USER_INTERRUPT_FLAG_OFFSET,
+            &value.to_le_bytes(),
+        ) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "failed to write user preemption interrupt flag at {:#x}: {:?}",
+                    tls_va + TLS_USER_INTERRUPT_FLAG_OFFSET,
+                    error
+                );
+            }
+            return false;
+        }
+        true
+    }
+
+    fn defer_user_preemption_if_disabled(&mut self) -> bool {
+        if self.threads.current_user_preemption_pending() {
+            return true;
+        }
+        if self.current_user_disable_count().unwrap_or(0) == 0 {
+            return false;
+        }
+        if !self.threads.mark_current_user_preemption_pending() {
+            return false;
+        }
+        let flag_written = self
+            .current_thread_tls_va()
+            .is_some_and(|tls_va| self.write_user_interrupt_flag(tls_va, 1));
+        if !flag_written {
+            self.threads.take_current_user_preemption_pending();
+        }
+        true
+    }
+
+    pub fn try_yield_current_ready(&mut self, cpu: &Cpu) -> bool {
+        let core = cpu_local::current_core() as i32;
+        if !self.threads.has_ready_for_core(core) || self.defer_user_preemption_if_disabled() {
+            return false;
+        }
+        self.threads
+            .yield_with_state(cpu, threads::ThreadState::Ready)
+            .is_some()
+    }
+
+    pub(crate) fn synchronize_user_preemption_state(&mut self) {
+        let tls_va = self.current_thread_tls_va();
+        let was_pending = self.threads.take_current_user_preemption_pending();
+        if let Some(tls_va) = tls_va {
+            self.write_user_interrupt_flag(tls_va, 0);
+        }
+        if was_pending
+            && self
+                .threads
+                .has_ready_for_core(cpu_local::current_core() as i32)
+        {
+            self.yield_after_svc = true;
+        }
+    }
+
     pub fn init_cpu(&self, backend: nexium_cpu::CpuBackendKind) -> Result<Cpu, String> {
         let mut cpu = Cpu::new(backend)?;
         for region in self.address_space.host_regions() {
@@ -969,51 +1121,93 @@ impl Kernel {
         let mut off = 0u32;
         let mut loaded = 0usize;
 
+        let mut load_bfttf = |font_type: usize, raw: &[u8], source: &str| {
+            if offsets[font_type].1 != 0 {
+                return;
+            }
+            if raw.len() < 8 {
+                log::warn!("pl:u font too small: {}", source);
+                return;
+            }
+            let decoded_len = raw.len() - 8;
+            let end = off as usize + decoded_len;
+            if end > SHMEM_SIZE {
+                log::warn!("pl:u font shmem overflow at type {}", font_type);
+                return;
+            }
+            for (j, &byte) in raw[8..].iter().enumerate() {
+                buf[off as usize + j] = byte ^ BFTTF_KEY[j & 3];
+            }
+            offsets[font_type] = (off, decoded_len as u32);
+            off = (off + decoded_len as u32 + 3) & !3;
+            loaded += 1;
+            log::info!(
+                "pl:u loaded font type {} from {} ({} bytes decoded)",
+                font_type,
+                source,
+                decoded_len
+            );
+        };
+
         if let Some(dir) = fonts_dir {
             for (i, name) in BFTTF_NAMES.iter().enumerate() {
                 let path = dir.join(name);
                 let raw = match std::fs::read(&path) {
                     Ok(r) => r,
                     Err(_) => {
-                        log::warn!("pl:u font not found: {}", path.display());
+                        log::debug!("pl:u external font not found: {}", path.display());
                         continue;
                     }
                 };
-                if raw.len() < 8 {
-                    log::warn!("pl:u font too small: {}", path.display());
-                    continue;
-                }
-                let decoded_len = raw.len() - 8;
-                let end = off as usize + decoded_len;
-                if end > SHMEM_SIZE {
-                    log::warn!("pl:u font shmem overflow at type {}", i);
-                    break;
-                }
-                for (j, &b) in raw[8..].iter().enumerate() {
-                    buf[off as usize + j] = b ^ BFTTF_KEY[j & 3];
-                }
-                offsets[i] = (off, decoded_len as u32);
-                off = (off + decoded_len as u32 + 3) & !3;
-                loaded += 1;
-                log::info!(
-                    "pl:u loaded font type {}: {} ({} bytes decoded)",
-                    i,
-                    name,
-                    decoded_len
-                );
+                load_bfttf(i, &raw, &path.display().to_string());
             }
         }
 
-        if loaded == 0 {
+        for title_id in 0x0100_0000_0000_0810..=0x0100_0000_0000_0814 {
+            let Some(romfs) = self.system_romfs(title_id) else {
+                continue;
+            };
+            let Some(header) = nexium_loader::romfs::romfs_header(romfs) else {
+                log::warn!("pl:u bundled font archive {:#018x} has no RomFS", title_id);
+                continue;
+            };
+            for (name, start, size) in nexium_loader::romfs::romfs_dir_files(romfs, header, 0) {
+                let Some(font_type) = BFTTF_NAMES
+                    .iter()
+                    .position(|expected| expected.eq_ignore_ascii_case(&name))
+                else {
+                    continue;
+                };
+                let Some(raw) = romfs.get(start..start.saturating_add(size)) else {
+                    log::warn!(
+                        "pl:u bundled font {} has invalid range {:#x}+{:#x}",
+                        name,
+                        start,
+                        size
+                    );
+                    continue;
+                };
+                load_bfttf(
+                    font_type,
+                    raw,
+                    &format!("bundled {:#018x}/{}", title_id, name),
+                );
+            }
+        }
+        drop(load_bfttf);
+
+        if loaded < BFTTF_NAMES.len() {
             log::warn!("pl:u no system fonts found in {{config}}/NeXium/system/fonts/ — using built-in fallback (NotoMono)");
             const FALLBACK: &[u8] = include_bytes!("../data/fallback_font.ttf");
-            let mut off = 0u32;
             for i in 0..6usize {
+                if offsets[i].1 != 0 {
+                    continue;
+                }
                 let end = off as usize + FALLBACK.len();
                 if end <= SHMEM_SIZE {
                     buf[off as usize..end].copy_from_slice(FALLBACK);
                     offsets[i] = (off, FALLBACK.len() as u32);
-                    off += FALLBACK.len() as u32;
+                    off = (off + FALLBACK.len() as u32 + 3) & !3;
                 }
             }
         }
@@ -1045,6 +1239,7 @@ impl Kernel {
     }
 
     pub fn dispatch_svc(&mut self, imm: u16) -> u32 {
+        self.defer_user_preemption_if_disabled();
         svc::dispatch(self, imm)
     }
 }
@@ -1055,6 +1250,117 @@ impl Drop for Kernel {
             let state = crate::hid_state::get_hid_state();
             state.lock().unbind_mapped_host(ptr);
         }
+    }
+}
+
+#[cfg(test)]
+mod user_preemption_tests {
+    use super::*;
+
+    const TEST_TLS: u64 = 0x10_0000;
+
+    fn test_kernel(map_tls: bool) -> Kernel {
+        let address_space = Arc::new(AddressSpace::new());
+        if map_tls {
+            address_space
+                .map(TEST_TLS, 0x1000, nexium_memory::Perm::RW, "test_tls")
+                .unwrap();
+        }
+        Kernel::new(
+            address_space,
+            0x80_0000,
+            0x1000,
+            0x90_0000,
+            0x1000,
+            0xa0_0000,
+            0x1000,
+            TEST_TLS,
+            TEST_TLS + 0x1000,
+        )
+    }
+
+    fn add_ready_core_zero_thread(kernel: &mut Kernel) {
+        const READY_HANDLE: u32 = 0xfeed;
+        kernel.threads.add_thread(
+            READY_HANDLE,
+            threads::ThreadCtx::zero(),
+            TEST_TLS + 0x1000,
+            0,
+            0,
+        );
+        kernel.threads.threads.get_mut(&READY_HANDLE).unwrap().core = 0;
+        kernel
+            .threads
+            .transition_state(READY_HANDLE, threads::ThreadState::Ready);
+    }
+
+    fn read_tls_u16(kernel: &Kernel, offset: u64) -> u16 {
+        let mut bytes = [0u8; 2];
+        kernel
+            .address_space
+            .read(TEST_TLS + offset, &mut bytes)
+            .unwrap();
+        u16::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn disabled_boundary_marks_pending_and_sets_interrupt_flag() {
+        let mut kernel = test_kernel(true);
+        add_ready_core_zero_thread(&mut kernel);
+        kernel
+            .address_space
+            .write(
+                TEST_TLS + TLS_USER_DISABLE_COUNT_OFFSET,
+                &1u16.to_le_bytes(),
+            )
+            .unwrap();
+        let current = kernel.threads.current_handle();
+        let ready = kernel.threads.ready.clone();
+
+        assert!(kernel.defer_user_preemption_if_disabled());
+        assert!(kernel.threads.current_user_preemption_pending());
+        assert_eq!(read_tls_u16(&kernel, TLS_USER_INTERRUPT_FLAG_OFFSET), 1);
+        assert_eq!(kernel.threads.current_handle(), current);
+        assert_eq!(kernel.threads.ready, ready);
+    }
+
+    #[test]
+    fn pending_survives_zero_count_until_svc36_clears_and_reschedules() {
+        let mut kernel = test_kernel(true);
+        add_ready_core_zero_thread(&mut kernel);
+        kernel
+            .address_space
+            .write(
+                TEST_TLS + TLS_USER_DISABLE_COUNT_OFFSET,
+                &1u16.to_le_bytes(),
+            )
+            .unwrap();
+        assert!(kernel.defer_user_preemption_if_disabled());
+
+        kernel
+            .address_space
+            .write(
+                TEST_TLS + TLS_USER_DISABLE_COUNT_OFFSET,
+                &0u16.to_le_bytes(),
+            )
+            .unwrap();
+        assert!(kernel.defer_user_preemption_if_disabled());
+        assert_eq!(kernel.dispatch_svc(0x36), nexium_common::result::SUCCESS);
+
+        assert!(!kernel.threads.current_user_preemption_pending());
+        assert_eq!(read_tls_u16(&kernel, TLS_USER_INTERRUPT_FLAG_OFFSET), 0);
+        assert!(kernel.yield_after_svc);
+    }
+
+    #[test]
+    fn zero_count_and_unmapped_tls_fail_open() {
+        let mut mapped = test_kernel(true);
+        assert!(!mapped.defer_user_preemption_if_disabled());
+        assert!(!mapped.threads.current_user_preemption_pending());
+
+        let mut unmapped = test_kernel(false);
+        assert!(!unmapped.defer_user_preemption_if_disabled());
+        assert!(!unmapped.threads.current_user_preemption_pending());
     }
 }
 

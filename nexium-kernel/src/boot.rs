@@ -385,6 +385,17 @@ impl BootContext {
         };
         kernel.nro_mmap = romfs_mmap;
         kernel.nro_romfs_range = romfs_range;
+        kernel.application_romfs = app.romfs.clone();
+        kernel.system_romfs_mmap = if app.system_romfs.is_empty() {
+            None
+        } else {
+            Some(app.mmap.clone())
+        };
+        kernel.system_romfs_ranges = app
+            .system_romfs
+            .iter()
+            .map(|(&title_id, romfs)| (title_id, romfs.range.clone()))
+            .collect();
         kernel.aslr_base = aslr_base;
         kernel.aslr_size = aslr_size;
         kernel.alias_base = alias_base;

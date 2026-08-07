@@ -68,6 +68,7 @@ pub struct Thread {
     pub priority: i32,
     pub core: i32,
     pub wait_cancelled: bool,
+    user_preemption_pending: bool,
 }
 
 pub struct Threads {
@@ -101,6 +102,7 @@ impl Threads {
                 priority: 0x2C,
                 core: 0,
                 wait_cancelled: false,
+                user_preemption_pending: false,
             },
         );
         Self {
@@ -156,6 +158,7 @@ impl Threads {
                 priority: 0x2C,
                 core: -2,
                 wait_cancelled: false,
+                user_preemption_pending: false,
             },
         );
     }
@@ -164,11 +167,42 @@ impl Threads {
         self.current[current_core()]
     }
 
+    pub fn current_user_preemption_pending(&self) -> bool {
+        self.current_handle()
+            .and_then(|handle| self.threads.get(&handle))
+            .is_some_and(|thread| thread.user_preemption_pending)
+    }
+
+    pub fn mark_current_user_preemption_pending(&mut self) -> bool {
+        let Some(handle) = self.current_handle() else {
+            return false;
+        };
+        let Some(thread) = self.threads.get_mut(&handle) else {
+            return false;
+        };
+        let was_pending = thread.user_preemption_pending;
+        thread.user_preemption_pending = true;
+        !was_pending
+    }
+
+    pub fn take_current_user_preemption_pending(&mut self) -> bool {
+        let Some(handle) = self.current_handle() else {
+            return false;
+        };
+        self.threads
+            .get_mut(&handle)
+            .is_some_and(|thread| std::mem::take(&mut thread.user_preemption_pending))
+    }
+
     pub fn transition_state(&mut self, handle: u32, new_state: ThreadState) {
         self.ready.retain(|&h| h != handle);
         let became_ready = matches!(new_state, ThreadState::Ready);
+        let exited = matches!(new_state, ThreadState::Exited);
         if let Some(t) = self.threads.get_mut(&handle) {
             t.state = new_state;
+            if exited {
+                t.user_preemption_pending = false;
+            }
         }
         if became_ready && !self.ready.contains(&handle) {
             self.ready.push_back(handle);
@@ -524,8 +558,12 @@ impl Threads {
         let h = self.current[current_core()]?;
         self.save_current_ctx(cpu);
         let became_ready = matches!(new_state, ThreadState::Ready);
+        let exited = matches!(new_state, ThreadState::Exited);
         if let Some(t) = self.threads.get_mut(&h) {
             t.state = new_state;
+            if exited {
+                t.user_preemption_pending = false;
+            }
         }
         if became_ready && !self.ready.contains(&h) {
             self.ready.push_back(h);
@@ -605,6 +643,19 @@ mod tests {
         threads.add_thread(handle, ThreadCtx::zero(), 0, 0, 0);
         threads.threads.get_mut(&handle).unwrap().priority = priority;
         threads.transition_state(handle, ThreadState::Ready);
+    }
+
+    #[test]
+    fn user_preemption_pending_is_current_thread_state() {
+        let mut threads = Threads::new(0x100, 0x10_0000, 0, 0);
+
+        assert!(!threads.current_user_preemption_pending());
+        assert!(threads.mark_current_user_preemption_pending());
+        assert!(threads.current_user_preemption_pending());
+        assert!(!threads.mark_current_user_preemption_pending());
+        assert!(threads.take_current_user_preemption_pending());
+        assert!(!threads.take_current_user_preemption_pending());
+        assert!(!threads.current_user_preemption_pending());
     }
 
     #[test]

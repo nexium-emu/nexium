@@ -634,7 +634,7 @@ fn account_service(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
         1 => ok(vec![1u8]),
         2 | 3 => ok_empty(),
         4 => ok(ACCOUNT_UID.to_vec()),
-        100 | 102 | 103 | 110 | 140 | 141 => ok_empty(),
+        100 | 102 | 103 | 110 | 140 | 141 | 160 => ok_empty(),
         150 => ok(vec![0u8]),
         _ => {
             log::warn!("acc.cmd_{} → returning empty SUCCESS (likely wrong)", cmd);

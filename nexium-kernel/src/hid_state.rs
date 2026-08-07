@@ -509,4 +509,55 @@ mod tests {
         assert_eq!(hid.mapped_host_ptr, 0);
         assert!(hid.shmem_va.is_none());
     }
+
+    #[test]
+    fn supported_style_selection_republishes_a_compatible_docked_npad() {
+        set_docked(true);
+        set_player1_joy_dual(false);
+
+        let state = get_hid_state();
+        let mut mapped = Box::new([0u8; HID_SHMEM_SIZE]);
+        let mapped_ptr = mapped.as_mut_ptr() as usize;
+        {
+            let mut hid = state.lock();
+            let input = hid.input;
+            hid.tick(input);
+            unsafe {
+                hid.bind_mapped_host(mapped_ptr as *mut u8);
+            }
+        }
+
+        let style_offset = NPAD_OFFSET + NPAD_ENTRY_PLAYER1 * NPAD_ENTRY_SIZE;
+        let read_style = |buf: &[u8]| {
+            u32::from_le_bytes(buf[style_offset..style_offset + 4].try_into().unwrap())
+        };
+        let initial_style = read_style(&mapped[..]);
+
+        let initial_selection = apply_controller_applet_style(0x1f);
+        let broad_style = read_style(&mapped[..]);
+
+        let joy_dual_selection = apply_controller_applet_style(STYLE_HANDHELD | STYLE_JOY_DUAL);
+        let joy_dual_style = read_style(&mapped[..]);
+        let remains_docked = is_docked();
+
+        let unbound = {
+            let mut hid = state.lock();
+            hid.unbind_mapped_host(mapped_ptr)
+        };
+        set_docked(true);
+        set_player1_joy_dual(false);
+        {
+            let mut hid = state.lock();
+            let input = hid.input;
+            hid.tick(input);
+        }
+
+        assert_eq!(initial_selection, 0);
+        assert_eq!(initial_style, STYLE_FULLKEY);
+        assert_eq!(broad_style, STYLE_FULLKEY);
+        assert_eq!(joy_dual_selection, 0);
+        assert_eq!(joy_dual_style, STYLE_JOY_DUAL);
+        assert!(remains_docked);
+        assert!(unbound);
+    }
 }

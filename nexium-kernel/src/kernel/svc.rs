@@ -2,7 +2,9 @@ use super::{Kernel, MUTEX_HAS_LISTENERS};
 use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
 use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
-use crate::kernel::AudioRendererState;
+use crate::kernel::{
+    AudioAdpcmContext, AudioAdpcmDecodeState, AudioAdpcmStreamKey, AudioRendererState,
+};
 use nexium_common::result::{
     KERNEL_CANCELLED, KERNEL_INVALID_ADDRESS, KERNEL_INVALID_HANDLE, KERNEL_NOT_IMPLEMENTED,
     KERNEL_TIMEOUT, SUCCESS,
@@ -25,6 +27,71 @@ fn diagnostics_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_DIAG").is_some())
+}
+
+fn async_present_pipeline_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_ASYNC_PRESENT_PIPELINE")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+#[derive(Clone, Copy)]
+enum OrderedPresentProfileOutcome {
+    IdentityRejected,
+    TargetRejected,
+    Enqueued,
+    Coalesced,
+    Unavailable,
+}
+
+fn note_ordered_present_profile(outcome: OrderedPresentProfileOutcome) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static IDENTITY_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TARGET_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static ENQUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static COALESCED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static UNAVAILABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !*ENABLED.get_or_init(|| std::env::var_os("NEXIUM_ASYNC_GPU_PROFILE").is_some()) {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    match outcome {
+        OrderedPresentProfileOutcome::IdentityRejected => {
+            IDENTITY_REJECTED.fetch_add(1, Ordering::Relaxed);
+        }
+        OrderedPresentProfileOutcome::TargetRejected => {
+            TARGET_REJECTED.fetch_add(1, Ordering::Relaxed);
+        }
+        OrderedPresentProfileOutcome::Enqueued => {
+            ENQUEUED.fetch_add(1, Ordering::Relaxed);
+        }
+        OrderedPresentProfileOutcome::Coalesced => {
+            COALESCED.fetch_add(1, Ordering::Relaxed);
+        }
+        OrderedPresentProfileOutcome::Unavailable => {
+            UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if calls % 60 == 0 {
+        log::warn!(
+            "[async-present-prof] calls={} identity_rejected={} target_rejected={} enqueued={} coalesced={} unavailable={}",
+            calls,
+            IDENTITY_REJECTED.load(Ordering::Relaxed),
+            TARGET_REJECTED.load(Ordering::Relaxed),
+            ENQUEUED.load(Ordering::Relaxed),
+            COALESCED.load(Ordering::Relaxed),
+            UNAVAILABLE.load(Ordering::Relaxed),
+        );
+    }
 }
 
 fn pcm_bytes_per_sample(sample_format: u8) -> Option<usize> {
@@ -123,6 +190,154 @@ fn advance_audio_wave_buffers(
     (progress, completed, progress != 0)
 }
 
+fn audio_source_advance(mut fraction_q15: i32, step_q15: i32, frames: usize) -> (usize, i32) {
+    let mut source_frames = 0usize;
+    for _ in 0..frames {
+        let next = fraction_q15 + step_q15;
+        source_frames += (next >> 15) as usize;
+        fraction_q15 = next & 0x7fff;
+    }
+    (source_frames, fraction_q15)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GcAdpcmDecodeResult {
+    decoded_samples: usize,
+    bytes_read: usize,
+    checkpoint: Option<AudioAdpcmContext>,
+}
+
+fn gc_adpcm_byte_range(
+    start_sample: usize,
+    sample_count: usize,
+    buffer_size: usize,
+) -> Option<(usize, usize)> {
+    if sample_count == 0 {
+        return Some((0, 0));
+    }
+    let start_frame = start_sample / 14;
+    let start_in_frame = start_sample % 14;
+    let start_byte = start_frame
+        .checked_mul(8)?
+        .checked_add(if start_in_frame == 0 {
+            0
+        } else {
+            1 + start_in_frame / 2
+        })?;
+    let last_sample = start_sample.checked_add(sample_count)?.checked_sub(1)?;
+    let end_byte = (last_sample / 14)
+        .checked_mul(8)?
+        .checked_add(2 + (last_sample % 14) / 2)?;
+    if start_byte >= buffer_size {
+        return Some((buffer_size, 0));
+    }
+    Some((start_byte, end_byte.min(buffer_size) - start_byte))
+}
+
+fn can_stream_gc_adpcm(
+    state: AudioAdpcmDecodeState,
+    key: AudioAdpcmStreamKey,
+    requested_sample: usize,
+    is_new: bool,
+) -> bool {
+    !is_new && state.valid && state.key == key && state.next_sample == requested_sample as u64
+}
+
+fn decode_gc_adpcm_range(
+    data: &[u8],
+    coeffs: &[i16; 16],
+    initial_context: AudioAdpcmContext,
+    start_sample: usize,
+    sample_count: usize,
+    output_skip: usize,
+    output: &mut [i16],
+    checkpoint_after: usize,
+) -> GcAdpcmDecodeResult {
+    output.fill(0);
+    let mut context = initial_context;
+    let mut sample_in_frame = start_sample % 14;
+    let mut read_index = 0usize;
+    let mut bytes_read = 0usize;
+    let mut decoded_samples = 0usize;
+    let mut checkpoint = (checkpoint_after == 0).then_some(context);
+    let (mut c0, mut c1) = if sample_in_frame == 0 {
+        (0i64, 0i64)
+    } else {
+        let coefficient_index = ((context.header >> 4) & 0xF) as usize;
+        let Some(coefficients) = coeffs.get(coefficient_index * 2..coefficient_index * 2 + 2)
+        else {
+            return GcAdpcmDecodeResult {
+                decoded_samples: 0,
+                bytes_read: 0,
+                checkpoint: None,
+            };
+        };
+        (coefficients[0] as i64, coefficients[1] as i64)
+    };
+
+    while decoded_samples < sample_count {
+        if sample_in_frame == 0 {
+            let Some(&header) = data.get(read_index) else {
+                break;
+            };
+            context.header = header;
+            bytes_read = bytes_read.max(read_index + 1);
+            read_index += 1;
+            let coefficient_index = ((header >> 4) & 0xF) as usize;
+            let Some(coefficients) = coeffs.get(coefficient_index * 2..coefficient_index * 2 + 2)
+            else {
+                break;
+            };
+            c0 = coefficients[0] as i64;
+            c1 = coefficients[1] as i64;
+        }
+
+        let Some(&byte) = data.get(read_index) else {
+            break;
+        };
+        bytes_read = bytes_read.max(read_index + 1);
+        let nibble = if sample_in_frame & 1 == 0 {
+            byte >> 4
+        } else {
+            read_index += 1;
+            byte & 0xF
+        };
+        let code = if nibble >= 8 {
+            nibble as i64 - 16
+        } else {
+            nibble as i64
+        };
+        let scale = (context.header & 0xF) as u32;
+        let xn = code * (1i64 << scale);
+        let prediction = c0 * context.yn0 as i64 + c1 * context.yn1 as i64;
+        let sample = (((xn << 11) + 0x400 + prediction) >> 11).clamp(-0x8000, 0x7FFF);
+        context.yn1 = context.yn0;
+        context.yn0 = sample as i16;
+
+        if decoded_samples >= output_skip {
+            let output_index = decoded_samples - output_skip;
+            if let Some(slot) = output.get_mut(output_index) {
+                *slot = sample as i16;
+            }
+        }
+
+        decoded_samples += 1;
+        sample_in_frame += 1;
+        if sample_in_frame == 14 {
+            sample_in_frame = 0;
+        }
+        if decoded_samples == checkpoint_after {
+            checkpoint = Some(context);
+        }
+    }
+
+    GcAdpcmDecodeResult {
+        decoded_samples,
+        bytes_read,
+        checkpoint,
+    }
+}
+
 fn audio_renderer_output_slots(
     cmd_id: u32,
     recv_buffers: &[ipc::IpcBuffer],
@@ -156,9 +371,48 @@ fn audio_renderer_output_slots(
 #[cfg(test)]
 mod audio_pcm_tests {
     use super::{
-        advance_audio_wave_buffers, audio_renderer_output_slots, decode_pcm_stereo,
-        AudioWaveBufferSpan, AUDIO_PCM_FLOAT, AUDIO_PCM_INT16,
+        advance_audio_wave_buffers, audio_renderer_output_slots, can_stream_gc_adpcm,
+        decode_gc_adpcm_range, decode_pcm_stereo, gc_adpcm_byte_range, AudioAdpcmContext,
+        AudioAdpcmDecodeState, AudioAdpcmStreamKey, AudioWaveBufferSpan, AUDIO_PCM_FLOAT,
+        AUDIO_PCM_INT16,
     };
+
+    fn adpcm_fixture(frame_count: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(frame_count * 8);
+        for frame in 0..frame_count {
+            data.push((((frame % 4) as u8) << 4) | ((frame % 3) as u8));
+            for byte in 0..7 {
+                let high = ((frame * 3 + byte + 1) & 0xF) as u8;
+                let low = ((frame * 5 + byte * 2 + 9) & 0xF) as u8;
+                data.push((high << 4) | low);
+            }
+        }
+        data
+    }
+
+    fn adpcm_coefficients() -> [i16; 16] {
+        [
+            0x0400, 0, 0x0600, -0x0200, 0x0800, -0x0400, 0x0a00, -0x0600, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]
+    }
+
+    fn adpcm_stream_key() -> AudioAdpcmStreamKey {
+        AudioAdpcmStreamKey {
+            wb_index: 2,
+            buffer_address: 0x1200_0000,
+            buffer_size: 0x4000,
+            start_offset: 5,
+            end_offset: 40_000,
+            context_address: 0x1300_0000,
+            coefficient_address: 0x1400_0000,
+            sample_rate: 48_000,
+            looping: true,
+            initial_header: 0x21,
+            initial_yn0: 123,
+            initial_yn1: -45,
+            coefficients: adpcm_coefficients(),
+        }
+    }
 
     #[test]
     fn decodes_interleaved_float_stereo() {
@@ -247,6 +501,194 @@ mod audio_pcm_tests {
         ];
 
         assert_eq!(advance_audio_wave_buffers(90, 250, &buffers), (0, 1, false));
+    }
+
+    #[test]
+    fn adpcm_chunked_decode_matches_one_shot_across_frame_boundaries() {
+        let data = adpcm_fixture(6);
+        let coefficients = adpcm_coefficients();
+        let initial = AudioAdpcmContext {
+            header: 0,
+            yn0: 321,
+            yn1: -123,
+        };
+        let mut expected = vec![0i16; 84];
+        let expected_result =
+            decode_gc_adpcm_range(&data, &coefficients, initial, 0, 84, 0, &mut expected, 84);
+        assert_eq!(expected_result.decoded_samples, 84);
+
+        let mut actual = Vec::with_capacity(84);
+        let mut context = initial;
+        let mut position = 0usize;
+        for count in [1usize, 12, 2, 13, 14, 7, 35] {
+            let (byte_offset, byte_count) =
+                gc_adpcm_byte_range(position, count, data.len()).unwrap();
+            let mut chunk = vec![0i16; count];
+            let result = decode_gc_adpcm_range(
+                &data[byte_offset..byte_offset + byte_count],
+                &coefficients,
+                context,
+                position,
+                count,
+                0,
+                &mut chunk,
+                count,
+            );
+            assert_eq!(result.decoded_samples, count);
+            context = result.checkpoint.unwrap();
+            actual.extend_from_slice(&chunk);
+            position += count;
+        }
+
+        assert_eq!(actual, expected);
+        assert_eq!(context, expected_result.checkpoint.unwrap());
+    }
+
+    #[test]
+    fn adpcm_streaming_windows_match_prefix_redecode_with_lookahead() {
+        let data = adpcm_fixture(32);
+        let coefficients = adpcm_coefficients();
+        let initial = AudioAdpcmContext {
+            header: 0,
+            yn0: 777,
+            yn1: -333,
+        };
+        let mut context = initial;
+        let mut base = 5usize;
+        let window = 23usize;
+        let advance = 17usize;
+
+        for update in 0..8 {
+            let mut expected = vec![0i16; window];
+            decode_gc_adpcm_range(
+                &data,
+                &coefficients,
+                initial,
+                0,
+                base + window,
+                base,
+                &mut expected,
+                base + advance,
+            );
+
+            let decode_start = if update == 0 { 0 } else { base };
+            let decode_count = if update == 0 { base + window } else { window };
+            let output_skip = if update == 0 { base } else { 0 };
+            let checkpoint_after = if update == 0 { base + advance } else { advance };
+            let decode_context = if update == 0 { initial } else { context };
+            let (byte_offset, byte_count) =
+                gc_adpcm_byte_range(decode_start, decode_count, data.len()).unwrap();
+            let mut actual = vec![0i16; window];
+            let result = decode_gc_adpcm_range(
+                &data[byte_offset..byte_offset + byte_count],
+                &coefficients,
+                decode_context,
+                decode_start,
+                decode_count,
+                output_skip,
+                &mut actual,
+                checkpoint_after,
+            );
+
+            assert_eq!(actual, expected);
+            context = result.checkpoint.unwrap();
+            base += advance;
+        }
+    }
+
+    #[test]
+    fn adpcm_stream_state_rejects_rewind_reset_and_parameter_changes() {
+        let key = adpcm_stream_key();
+        let state = AudioAdpcmDecodeState {
+            valid: true,
+            key,
+            next_sample: 512,
+            context: AudioAdpcmContext {
+                header: 0x21,
+                yn0: 10,
+                yn1: -20,
+            },
+        };
+
+        assert!(can_stream_gc_adpcm(state, key, 512, false));
+        assert!(!can_stream_gc_adpcm(state, key, 0, false));
+        assert!(!can_stream_gc_adpcm(state, key, 512, true));
+
+        let mut changed = key;
+        changed.buffer_address += 0x1000;
+        assert!(!can_stream_gc_adpcm(state, changed, 512, false));
+        changed = key;
+        changed.initial_yn0 += 1;
+        assert!(!can_stream_gc_adpcm(state, changed, 512, false));
+        changed = key;
+        changed.coefficients[3] += 1;
+        assert!(!can_stream_gc_adpcm(state, changed, 512, false));
+        changed = key;
+        changed.looping = false;
+        assert!(!can_stream_gc_adpcm(state, changed, 512, false));
+    }
+
+    #[test]
+    fn adpcm_streaming_work_is_bounded_by_window_size() {
+        let count = 243usize;
+        let near = 13usize;
+        let far = near + 14 * 100_000;
+        let far_buffer_size = (far / 14 + 64) * 8;
+        let (_, near_bytes) = gc_adpcm_byte_range(near, count, far_buffer_size).unwrap();
+        let (_, far_bytes) = gc_adpcm_byte_range(far, count, far_buffer_size).unwrap();
+        assert_eq!(far_bytes, near_bytes);
+        assert!(far_bytes <= 152);
+
+        let data = vec![0u8; far_bytes];
+        let mut output = vec![0i16; count];
+        let result = decode_gc_adpcm_range(
+            &data,
+            &[0; 16],
+            AudioAdpcmContext::default(),
+            far,
+            count,
+            0,
+            &mut output,
+            count,
+        );
+        assert_eq!(result.decoded_samples, count);
+        assert!(result.bytes_read <= 152);
+    }
+
+    #[test]
+    fn adpcm_invalid_predictors_fail_without_a_checkpoint() {
+        let mut output = [1i16; 2];
+        let frame_result = decode_gc_adpcm_range(
+            &[0x80, 0, 0],
+            &[0; 16],
+            AudioAdpcmContext::default(),
+            0,
+            2,
+            0,
+            &mut output,
+            1,
+        );
+        assert_eq!(frame_result.decoded_samples, 0);
+        assert_eq!(frame_result.checkpoint, None);
+        assert_eq!(output, [0, 0]);
+
+        let mid_frame_result = decode_gc_adpcm_range(
+            &[0],
+            &[0; 16],
+            AudioAdpcmContext {
+                header: 0x80,
+                yn0: 1,
+                yn1: -1,
+            },
+            1,
+            1,
+            0,
+            &mut output[..1],
+            1,
+        );
+        assert_eq!(mid_frame_result.decoded_samples, 0);
+        assert_eq!(mid_frame_result.checkpoint, None);
+        assert_eq!(output[0], 0);
     }
 }
 
@@ -2743,9 +3185,17 @@ fn dispatch_service_v2(
             ctx.buf[title_id_off + 6],
             ctx.buf[title_id_off + 7],
         ]);
-        if title_id == 0x0100_0000_0000_0823 {
-            return return_subsession(kernel, ctx, session_handle, "IFsStorageNgWord2");
+        let available = kernel.system_romfs(title_id).is_some()
+            || matches!(title_id, 0x0100_0000_0000_0802 | 0x0100_0000_0000_0823);
+        if available {
+            let service = format!("IFsStorageSystemData:{title_id:016x}");
+            return return_subsession(kernel, ctx, session_handle, &service);
         }
+        log::warn!(
+            "fsp-srv.OpenDataStorageByDataId: system archive {:#018x} unavailable",
+            title_id
+        );
+        return build_ipc_response(ctx, 0x202, &[], &[]);
     }
 
     if let Some(response) = dispatch_aoc_bcat(kernel, port_name, ctx, cmd_id) {
@@ -2793,6 +3243,70 @@ fn dispatch_service_v2(
             10601 | 10610 | 10700 => return build_ipc_response(ctx, 0, &[], &[]),
             other => {
                 log::debug!("IFriendService.cmd_{} stubbed empty success", other);
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+        }
+    }
+
+    if port_name == "IDatabaseService" {
+        match cmd_id {
+            0 => return build_ipc_response(ctx, 0, &[0], &[]),
+            1 => return build_ipc_response(ctx, 0, &[0], &[]),
+            2 => {
+                let source = ipc_input_u32(ctx, 0).unwrap_or(0);
+                let count = if source & 2 != 0 { 6u32 } else { 0 };
+                return build_ipc_response(ctx, 0, &count.to_le_bytes(), &[]);
+            }
+            3 | 4 => {
+                let source = ipc_input_u32(ctx, 0).unwrap_or(0);
+                let requested = if source & 2 != 0 { 6usize } else { 0 };
+                let stride = if cmd_id == 3 { 0x5c } else { 0x58 };
+                let buffer = ctx
+                    .recv_buffers
+                    .iter()
+                    .chain(ctx.recv_statics.iter())
+                    .find(|buffer| buffer.addr != 0);
+                let capacity = buffer.map_or(0, |buffer| buffer.size as usize / stride);
+                let count = requested.min(capacity);
+                if let Some(buffer) = buffer.filter(|_| count != 0) {
+                    let mut elements = vec![0u8; count * stride];
+                    for index in 0..count as u32 {
+                        let offset = index as usize * stride;
+                        let info = kernel.services.mii.build_default(index);
+                        elements[offset..offset + 0x58].copy_from_slice(&info);
+                        if cmd_id == 3 {
+                            elements[offset + 0x58..offset + 0x5c]
+                                .copy_from_slice(&1u32.to_le_bytes());
+                        }
+                    }
+                    if let Err(error) = kernel.address_space.write_checked(buffer.addr, &elements) {
+                        log::error!("mii.Get: failed to write output elements: {}", error);
+                        return build_ipc_response(ctx, 0x47e, &(count as u32).to_le_bytes(), &[]);
+                    }
+                }
+                let result = if count < requested { 0x47e } else { 0 };
+                return build_ipc_response(ctx, result, &(count as u32).to_le_bytes(), &[]);
+            }
+            6 => {
+                let gender = ipc_input_u32(ctx, 4).unwrap_or(2);
+                let info = kernel.services.mii.build_random(gender);
+                return build_ipc_response(ctx, 0, &info, &[]);
+            }
+            7 => {
+                let index = ipc_input_u32(ctx, 0).unwrap_or(0);
+                if index >= 6 {
+                    return build_ipc_response(ctx, 0x27e, &[], &[]);
+                }
+                let info = kernel.services.mii.build_default(index);
+                return build_ipc_response(ctx, 0, &info, &[]);
+            }
+            22 => {
+                let version = ipc_input_u32(ctx, 0).unwrap_or(0);
+                kernel.services.mii.set_interface_version(version);
+                return build_ipc_response(ctx, 0, &[], &[]);
+            }
+            other => {
+                log::warn!("IDatabaseService.cmd_{} stubbed empty success", other);
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
         }
@@ -3584,9 +4098,18 @@ fn dispatch_service_v2(
         }
     }
 
-    if matches!(port_name, "IFsStorage" | "IFsStorageNgWord2") {
-        let storage = if port_name == "IFsStorageNgWord2" {
-            ng_word2_romfs()
+    let system_data_title_id = port_name
+        .strip_prefix("IFsStorageSystemData:")
+        .and_then(|value| u64::from_str_radix(value, 16).ok());
+    if port_name == "IFsStorage" || system_data_title_id.is_some() {
+        let storage = if let Some(title_id) = system_data_title_id {
+            kernel
+                .system_romfs(title_id)
+                .unwrap_or_else(|| match title_id {
+                    0x0100_0000_0000_0802 => mii_model_romfs(),
+                    0x0100_0000_0000_0823 => ng_word2_romfs(),
+                    _ => &[],
+                })
         } else {
             kernel.nro_romfs()
         };
@@ -3615,24 +4138,52 @@ fn dispatch_service_v2(
                     .or_else(|| ctx.recv_statics.iter().find(|b| b.size > 0 && b.addr != 0))
                     .copied();
                 if let Some(buf) = target {
-                    let start = (offset.max(0) as usize).min(storage.len());
+                    let virtual_len = if system_data_title_id.is_none() {
+                        kernel
+                            .application_romfs
+                            .as_ref()
+                            .map(|r| r.len() as usize)
+                            .unwrap_or(storage.len())
+                    } else {
+                        storage.len()
+                    };
+                    let start = (offset.max(0) as usize).min(virtual_len);
                     let want = (read_size as usize).min(buf.size as usize);
-                    let end = start.saturating_add(want).min(storage.len());
-                    let slice = &storage[start..end];
-                    if let Err(err) = kernel.address_space.write(buf.addr, slice) {
+                    let end = start.saturating_add(want).min(virtual_len);
+                    let owned;
+                    let slice = if let Some(romfs) = kernel
+                        .application_romfs
+                        .as_ref()
+                        .filter(|_| system_data_title_id.is_none())
+                    {
+                        match romfs.read(start as u64, end - start) {
+                            Ok(bytes) => {
+                                owned = bytes;
+                                &owned[..]
+                            }
+                            Err(err) => {
+                                log::error!("IFsStorage.Read compressed storage failed: {}", err);
+                                return build_ipc_response(ctx, 0xD401, &[], &[]);
+                            }
+                        }
+                    } else {
+                        &storage[start..end]
+                    };
+                    if let Err(err) = kernel.address_space.write_checked(buf.addr, slice) {
                         log::error!(
                             "IFsStorage.Read: guest write addr={:#x} len={:#x} failed: {}",
                             buf.addr,
                             slice.len(),
                             err
                         );
+                        return build_ipc_response(ctx, 0xD401, &[], &[]);
                     }
                     log::debug!(
                         "IFsStorage.Read off={:#x} size={:#x} bytes={} total={}",
                         offset,
                         read_size,
                         slice.len(),
-                        storage.len()
+                        virtual_len
                     );
                     let path = if fs_trace_enabled() {
                         romfs_path_for_data_offset(storage, start)
@@ -3662,7 +4213,15 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
             4 => {
-                let size = storage.len() as i64;
+                let size = if system_data_title_id.is_none() {
+                    kernel
+                        .application_romfs
+                        .as_ref()
+                        .map(|r| r.len() as i64)
+                        .unwrap_or(storage.len() as i64)
+                } else {
+                    storage.len() as i64
+                };
                 log::debug!("IFsStorage.GetSize → {}", size);
                 return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
             }
@@ -3724,6 +4283,7 @@ fn dispatch_service_v2(
             voice_wb_progress_frames: Vec::new(),
             voice_frac_q15: Vec::new(),
             voice_hist: Vec::new(),
+            voice_adpcm_states: Vec::new(),
         };
 
         let is_domain = kernel
@@ -3839,6 +4399,7 @@ fn dispatch_service_v2(
                 voice_wb_progress_frames: Vec::new(),
                 voice_frac_q15: Vec::new(),
                 voice_hist: Vec::new(),
+                voice_adpcm_states: Vec::new(),
             });
         match cmd_id {
             0 => {
@@ -3966,6 +4527,8 @@ fn dispatch_service_v2(
                     st.voice_wb_progress_frames.resize(voice_count_seen, 0);
                     st.voice_frac_q15.resize(voice_count_seen, 0);
                     st.voice_hist.resize(voice_count_seen, [0.0f32; 6]);
+                    st.voice_adpcm_states
+                        .resize(voice_count_seen, AudioAdpcmDecodeState::default());
                 }
 
                 const TARGET_FRAMES: usize = 240;
@@ -3986,63 +4549,70 @@ fn dispatch_service_v2(
                 let mut big_out: Vec<f32> =
                     Vec::with_capacity(TARGET_FRAMES * 2 * blocks_to_produce);
 
+                if blocks_to_produce == 0 {
+                    if let Some(ib) = in_buf {
+                        let voices_off: u64 =
+                            0x40 + in_behavior_sz + in_mempools_sz + in_channels_sz;
+                        let voice_info_stride: u64 = 0x170;
+                        for vid in 0..voice_count_seen {
+                            let vinfo_off = voices_off + (vid as u64) * voice_info_stride;
+                            if vinfo_off + 0x42 > ib.size as u64 {
+                                st.voice_adpcm_states[vid..].fill(AudioAdpcmDecodeState::default());
+                                break;
+                            }
+                            let mut metadata = [0u8; 0x42];
+                            if kernel
+                                .address_space
+                                .read(ib.addr.wrapping_add(vinfo_off), &mut metadata)
+                                .is_err()
+                            {
+                                st.voice_adpcm_states[vid] = AudioAdpcmDecodeState::default();
+                                continue;
+                            }
+                            let is_new = metadata[0x008] != 0;
+                            let is_in_use = metadata[0x009] != 0;
+                            let play_state = metadata[0x00A];
+                            let sample_format = metadata[0x00B];
+                            let sample_rate = u32::from_le_bytes([
+                                metadata[0x00C],
+                                metadata[0x00D],
+                                metadata[0x00E],
+                                metadata[0x00F],
+                            ]);
+                            let channel_count = u32::from_le_bytes([
+                                metadata[0x018],
+                                metadata[0x019],
+                                metadata[0x01A],
+                                metadata[0x01B],
+                            ]);
+                            let wb_count = u32::from_le_bytes([
+                                metadata[0x03C],
+                                metadata[0x03D],
+                                metadata[0x03E],
+                                metadata[0x03F],
+                            ]);
+                            let wb_index =
+                                u16::from_le_bytes([metadata[0x040], metadata[0x041]]) as usize;
+                            if is_new
+                                || !is_in_use
+                                || play_state != 0
+                                || sample_format != AUDIO_PCM_ADPCM
+                                || !(channel_count == 1 || channel_count == 2)
+                                || sample_rate == 0
+                                || wb_count == 0
+                                || wb_index >= 4
+                            {
+                                st.voice_adpcm_states[vid] = AudioAdpcmDecodeState::default();
+                            }
+                        }
+                    }
+                }
+
                 for _block in 0..blocks_to_produce {
                     let mut out_stereo = vec![0.0f32; TARGET_FRAMES * 2];
                     let mut block_consumed_wb = false;
                     let mut voice_snapshot =
                         vec![AudioVoiceMixSnapshot::default(); voice_count_seen];
-
-                    fn decode_gc_adpcm(
-                        data: &[u8],
-                        coeffs: &[i16; 16],
-                        yn0_seed: i16,
-                        yn1_seed: i16,
-                        count: usize,
-                    ) -> Vec<i16> {
-                        let mut out: Vec<i16> = Vec::with_capacity(count);
-                        let mut yn0 = yn0_seed as i64;
-                        let mut yn1 = yn1_seed as i64;
-                        let mut pos = 0usize;
-                        while out.len() < count {
-                            if pos >= data.len() {
-                                break;
-                            }
-                            let header = data[pos];
-                            pos += 1;
-                            let ci = ((header >> 4) & 0xF) as usize;
-                            let scale = (header & 0xF) as u32;
-                            let c0 = coeffs[ci * 2] as i64;
-                            let c1 = coeffs[ci * 2 + 1] as i64;
-                            for _ in 0..7 {
-                                if out.len() >= count || pos >= data.len() {
-                                    break;
-                                }
-                                let byte = data[pos];
-                                pos += 1;
-                                for nib in [(byte >> 4) & 0xF, byte & 0xF] {
-                                    if out.len() >= count {
-                                        break;
-                                    }
-                                    let code = if nib >= 8 {
-                                        nib as i64 - 16
-                                    } else {
-                                        nib as i64
-                                    };
-                                    let xn = code * (1i64 << scale);
-                                    let pred = c0 * yn0 + c1 * yn1;
-                                    let s =
-                                        (((xn << 11) + 0x400 + pred) >> 11).clamp(-0x8000, 0x7FFF);
-                                    yn1 = yn0;
-                                    yn0 = s;
-                                    out.push(s as i16);
-                                }
-                            }
-                        }
-                        while out.len() < count {
-                            out.push(0);
-                        }
-                        out
-                    }
 
                     'mix: {
                         let Some(ib) = in_buf else {
@@ -4081,6 +4651,18 @@ fn dispatch_service_v2(
                             let wb_index = u16::from_le_bytes([v[0x040], v[0x041]]) as usize;
                             voice_snapshot[vid].wb_index = wb_index as u16;
                             voice_snapshot[vid].is_new = is_new;
+
+                            if is_new
+                                || !is_in_use
+                                || play_state != 0
+                                || sample_format != AUDIO_PCM_ADPCM
+                                || !(channel_count == 1 || channel_count == 2)
+                                || sample_rate == 0
+                                || wb_count == 0
+                                || wb_index >= 4
+                            {
+                                st.voice_adpcm_states[vid] = AudioAdpcmDecodeState::default();
+                            }
 
                             if audio_debug_enabled() && is_in_use {
                                 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4207,10 +4789,16 @@ fn dispatch_service_v2(
                                     as usize)
                                     .min(wb_total_frames.saturating_sub(1));
                             let in_frames = in_frames_needed;
+                            let initial_frac_q15 = st.voice_frac_q15.get(vid).copied().unwrap_or(0);
+                            let step: i32 = ((sample_rate as f32 / TARGET_SR) * 32768.0) as i32;
+                            let (checkpoint_source_frames, _) =
+                                audio_source_advance(initial_frac_q15, step, TARGET_FRAMES);
                             let mut pcm_l = vec![0.0f32; in_frames];
                             let mut pcm_r = vec![0.0f32; in_frames];
 
                             if sample_format == AUDIO_PCM_ADPCM {
+                                let previous_state = st.voice_adpcm_states[vid];
+                                st.voice_adpcm_states[vid] = AudioAdpcmDecodeState::default();
                                 let coeff_addr = u64::from_le_bytes([
                                     v[0x048], v[0x049], v[0x04A], v[0x04B], v[0x04C], v[0x04D],
                                     v[0x04E], v[0x04F],
@@ -4235,39 +4823,105 @@ fn dispatch_service_v2(
                                         coeff_bytes[i * 2 + 1],
                                     ]);
                                 }
+                                let mut initial_header = 0u16;
                                 let (mut yn0_seed, mut yn1_seed) = (0i16, 0i16);
                                 if ctx_addr != 0 {
                                     let mut ctx = [0u8; 6];
                                     if kernel.address_space.read(ctx_addr, &mut ctx).is_ok() {
+                                        initial_header = u16::from_le_bytes([ctx[0], ctx[1]]);
                                         yn0_seed = i16::from_le_bytes([ctx[2], ctx[3]]);
                                         yn1_seed = i16::from_le_bytes([ctx[4], ctx[5]]);
                                     }
                                 }
-                                let decode_through = start_offset as usize + cursor + in_frames;
-                                let frames_needed = (decode_through + 13) / 14;
-                                let bytes_needed = (frames_needed * 8).min(buffer_size as usize);
-                                if buffer_address == 0 || bytes_needed < 8 {
+                                if buffer_address == 0 || buffer_size < 8 {
                                     continue;
                                 }
-                                let mut adpcm = vec![0u8; bytes_needed];
-                                if kernel
-                                    .address_space
-                                    .read(buffer_address, &mut adpcm)
-                                    .is_err()
+
+                                let base = start_offset as usize + cursor;
+                                let stream_key = AudioAdpcmStreamKey {
+                                    wb_index: wb_index as u16,
+                                    buffer_address,
+                                    buffer_size,
+                                    start_offset,
+                                    end_offset,
+                                    context_address: ctx_addr,
+                                    coefficient_address: coeff_addr,
+                                    sample_rate,
+                                    looping: wb[0x18] != 0,
+                                    initial_header,
+                                    initial_yn0: yn0_seed,
+                                    initial_yn1: yn1_seed,
+                                    coefficients: coeffs,
+                                };
+                                let streaming =
+                                    can_stream_gc_adpcm(previous_state, stream_key, base, is_new);
+                                let (decode_start, decode_count, output_skip, decode_context) =
+                                    if streaming {
+                                        (base, in_frames, 0, previous_state.context)
+                                    } else {
+                                        (
+                                            0,
+                                            base.saturating_add(in_frames),
+                                            base,
+                                            AudioAdpcmContext {
+                                                header: initial_header as u8,
+                                                yn0: yn0_seed,
+                                                yn1: yn1_seed,
+                                            },
+                                        )
+                                    };
+                                let checkpoint_after = if streaming {
+                                    checkpoint_source_frames
+                                } else {
+                                    base.saturating_add(checkpoint_source_frames)
+                                };
+                                let buffer_size_usize =
+                                    usize::try_from(buffer_size).unwrap_or(usize::MAX);
+                                let Some((byte_offset, byte_count)) = gc_adpcm_byte_range(
+                                    decode_start,
+                                    decode_count,
+                                    buffer_size_usize,
+                                ) else {
+                                    continue;
+                                };
+                                let mut adpcm = vec![0u8; byte_count];
+                                let Some(read_address) =
+                                    buffer_address.checked_add(byte_offset as u64)
+                                else {
+                                    continue;
+                                };
+                                if byte_count != 0
+                                    && kernel.address_space.read(read_address, &mut adpcm).is_err()
                                 {
                                     continue;
                                 }
-                                let decoded = decode_gc_adpcm(
+                                let mut decoded = vec![0i16; in_frames];
+                                let decode_result = decode_gc_adpcm_range(
                                     &adpcm,
                                     &coeffs,
-                                    yn0_seed,
-                                    yn1_seed,
-                                    decode_through,
+                                    decode_context,
+                                    decode_start,
+                                    decode_count,
+                                    output_skip,
+                                    &mut decoded,
+                                    checkpoint_after,
                                 );
-                                let base = start_offset as usize + cursor;
+                                debug_assert!(decode_result.bytes_read <= adpcm.len());
+                                st.voice_adpcm_states[vid] = if let Some(context) =
+                                    decode_result.checkpoint
+                                {
+                                    AudioAdpcmDecodeState {
+                                        valid: true,
+                                        key: stream_key,
+                                        next_sample: base.saturating_add(checkpoint_source_frames)
+                                            as u64,
+                                        context,
+                                    }
+                                } else {
+                                    AudioAdpcmDecodeState::default()
+                                };
                                 for f in 0..in_frames {
-                                    let s = decoded.get(base + f).copied().unwrap_or(0);
-                                    pcm_l[f] = (s as f32) / 32768.0;
+                                    pcm_l[f] = (decoded[f] as f32) / 32768.0;
                                     pcm_r[f] = pcm_l[f];
                                 }
                                 {
@@ -4277,15 +4931,16 @@ fn dispatch_service_v2(
                                     if DUMPED.fetch_or(bit, O::Relaxed) & bit == 0 {
                                         let nz = decoded.iter().filter(|s| **s != 0).count();
                                         log::trace!(
-                                            "voice[{}] ADPCM: decoded={} nonzero={} coeff_addr={:#x} ctx_addr={:#x} start_off={} in_frames={} sr={}",
+                                            "voice[{}] ADPCM: decoded={} nonzero={} coeff_addr={:#x} ctx_addr={:#x} start_off={} in_frames={} sr={} streaming={}",
                                             vid,
-                                            decoded.len(),
+                                            decode_result.decoded_samples,
                                             nz,
                                             coeff_addr,
                                             ctx_addr,
                                             start_offset,
                                             in_frames,
-                                            sample_rate
+                                            sample_rate,
+                                            streaming
                                         );
                                     }
                                 }
@@ -4413,9 +5068,7 @@ fn dispatch_service_v2(
                             }
 
                             let phist = st.voice_hist.get(vid).copied().unwrap_or([0.0f32; 6]);
-                            let mut frac_q15: i32 =
-                                st.voice_frac_q15.get(vid).copied().unwrap_or(0);
-                            let step: i32 = ((sample_rate as f32 / TARGET_SR) * 32768.0) as i32;
+                            let mut frac_q15 = initial_frac_q15;
                             let master = voice_drop_param.clamp(0.0, 4.0);
                             let gain = volume * master * 0.5;
                             let smp_l = |i: isize| -> f32 {
@@ -4446,6 +5099,7 @@ fn dispatch_service_v2(
                                 read_idx += (no >> 15) as usize;
                                 frac_q15 = no & 0x7fff;
                             }
+                            debug_assert_eq!(read_idx, checkpoint_source_frames);
                             let consumed =
                                 read_idx.min(in_frames).saturating_sub(1).min(in_frames - 1);
                             let mut nh = [0.0f32; 6];
@@ -5125,6 +5779,14 @@ fn dispatch_service_v2(
         return build_ipc_response_copy(ctx, 0, &[], &[h]);
     }
 
+    if matches!(port_name, "time:u" | "time:s" | "time:a" | "time:r") && cmd_id == 200 {
+        return build_ipc_response(ctx, 0, &[0], &[]);
+    }
+
+    if port_name == "prepo:u" && cmd_id == 10104 {
+        return build_ipc_response(ctx, 0, &[], &[]);
+    }
+
     if port_name == "hwopus" && matches!(cmd_id, 1 | 3 | 5 | 7 | 8 | 9) {
         let in_off = ctx.cmif_in_data_off;
         let channels = if ctx.cmif_in_data_len as usize >= 8 {
@@ -5268,6 +5930,12 @@ fn dispatch_service_v2(
         .services
         .dispatch_service(port_name, cmd_id, &mut svc_ctx);
     build_ipc_response(ctx, result, &out_data, &[])
+}
+
+fn ipc_input_u32(ctx: &ipc::IpcCtx, relative_offset: usize) -> Option<u32> {
+    let start = ctx.cmif_in_data_off.checked_add(relative_offset)?;
+    let bytes = ctx.buf.get(start..start.checked_add(4)?)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 const IGBP_REQUEST_BUFFER: u32 = 1;
@@ -5587,6 +6255,186 @@ fn igbp_handle_transact(
             }
 
             if let Some(gb) = gb_opt {
+                if async_present_pipeline_enabled()
+                    && std::env::var_os("NEXIUM_PRESENT_CPU_ONLY").is_none()
+                {
+                    let ordered_present_identity = (|| {
+                        let linear_size = (gb.stride as usize)
+                            .checked_mul(gb.height as usize)?
+                            .checked_mul(4)?;
+                        let tiled_size =
+                            compute_tiled_size(gb.stride, gb.height, gb.block_height_log2);
+                        let nvmap = kernel.nvdrv.nvmap_handles.get(&gb.nvmap_id)?;
+                        let surface_size = if nvmap.size as usize >= tiled_size
+                            && gb.kind == 254
+                            && gb.block_height_log2 != 0
+                        {
+                            tiled_size as u64
+                        } else {
+                            linear_size as u64
+                        };
+                        let buffer_offset = gb.buffer_offset as u64;
+                        if nvmap.address == 0
+                            || buffer_offset.checked_add(surface_size)? > nvmap.size as u64
+                        {
+                            return None;
+                        }
+                        let present_cpu_addr = nvmap.address.checked_add(buffer_offset)?;
+                        let mut present_gpu_vas = {
+                            let mappings = kernel.nvdrv.gpu.mappings.read();
+                            mappings
+                                .gpu_regions_for_cpu_range(present_cpu_addr, 4)
+                                .into_iter()
+                                .map(|(gpu_va, _)| gpu_va)
+                                .filter(|&gpu_va| {
+                                    mappings.nvmap_id_for(gpu_va) == Some(gb.nvmap_id)
+                                        && mappings.cpu_address_for(gpu_va)
+                                            == Some(present_cpu_addr)
+                                        && mappings
+                                            .cpu_range_for(gpu_va)
+                                            .is_some_and(|(_, available)| available >= surface_size)
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        present_gpu_vas.sort_unstable();
+                        present_gpu_vas.dedup();
+                        Some((present_cpu_addr, present_gpu_vas))
+                    })();
+                    let renderer_for_ordered_present = ordered_present_identity.as_ref().and_then(
+                        |(present_cpu_addr, direct_gpu_vas)| {
+                            let renderer = kernel.nvdrv.renderer().cloned()?;
+                            let mut ready_direct_vas = direct_gpu_vas
+                                .iter()
+                                .copied()
+                                .filter(|&gpu_va| {
+                                    renderer.present_rt_ready_at_va(
+                                        gb.nvmap_id,
+                                        gb.width,
+                                        gb.height,
+                                        gpu_va,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            ready_direct_vas.sort_unstable();
+                            ready_direct_vas.dedup();
+                            let present_gpu_va = if ready_direct_vas.len() == 1 {
+                                Some(ready_direct_vas[0])
+                            } else if std::env::var("NEXIUM_PRESENT_OFFSET_ALIAS")
+                                .map(|value| value != "0")
+                                .unwrap_or(true)
+                                && present_buffers_share_nvmap(binder_id, gb.nvmap_id)
+                            {
+                                let source_vas =
+                                    renderer.present_alias_vas(gb.nvmap_id, gb.width, gb.height);
+                                let wanted = source_vas
+                                    .first()
+                                    .copied()?
+                                    .checked_add(gb.buffer_offset as u64)?;
+                                (wanted != 0
+                                    && source_vas.contains(&wanted)
+                                    && renderer.present_rt_ready_at_va(
+                                        gb.nvmap_id,
+                                        gb.width,
+                                        gb.height,
+                                        wanted,
+                                    ))
+                                .then_some(wanted)
+                            } else {
+                                None
+                            };
+                            present_gpu_va.map(|gpu_va| (renderer, *present_cpu_addr, gpu_va))
+                        },
+                    );
+                    if let Some((renderer, present_cpu_addr, present_gpu_va)) =
+                        renderer_for_ordered_present
+                    {
+                        let queue_crop: Option<(u32, u32, u32, u32)> = {
+                            let cw = crop_r.saturating_sub(crop_l).max(0) as u32;
+                            let ch = crop_b.saturating_sub(crop_t).max(0) as u32;
+                            if crop_l >= 0
+                                && crop_t >= 0
+                                && cw > 0
+                                && ch > 0
+                                && crop_r as u32 <= gb.width
+                                && crop_b as u32 <= gb.height
+                                && (cw < gb.width || ch < gb.height)
+                            {
+                                Some((crop_l as u32, crop_t as u32, cw, ch))
+                            } else {
+                                None
+                            }
+                        };
+                        let frame_queue = kernel.nvdrv.frame_queue.clone();
+                        let stats = kernel.nvdrv.stats.clone();
+                        let (present_nvmap_id, present_width, present_height) =
+                            (gb.nvmap_id, gb.width, gb.height);
+                        let queued = kernel.nvdrv.try_queue_ordered_present(move || {
+                            submit_ordered_gpu_present(
+                                move |read_rect| {
+                                    renderer.readback_target_pipelined_pinned_at_va(
+                                        present_nvmap_id,
+                                        present_width,
+                                        present_height,
+                                        present_gpu_va,
+                                        present_cpu_addr,
+                                        read_rect,
+                                    )
+                                },
+                                frame_queue,
+                                stats,
+                                present_width,
+                                present_height,
+                                transform,
+                                queue_crop,
+                            );
+                        });
+                        match queued {
+                            nexium_nvdrv::AsyncPresentSubmit::Enqueued => {
+                                note_ordered_present_profile(
+                                    OrderedPresentProfileOutcome::Enqueued,
+                                );
+                                kernel
+                                    .nvdrv
+                                    .queue_buffer_active
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                let (qw, qh) = kernel
+                                    .nvdrv
+                                    .with_bufferqueue(binder_id, |bq| (bq.width, bq.height));
+                                let mut p = ParcelBuilder::new();
+                                p.write_bq_buffer_output(qw, qh);
+                                p.write_u32(0);
+                                return p.finish();
+                            }
+                            nexium_nvdrv::AsyncPresentSubmit::Coalesced => {
+                                note_ordered_present_profile(
+                                    OrderedPresentProfileOutcome::Coalesced,
+                                );
+                                kernel
+                                    .nvdrv
+                                    .queue_buffer_active
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                let (qw, qh) = kernel
+                                    .nvdrv
+                                    .with_bufferqueue(binder_id, |bq| (bq.width, bq.height));
+                                let mut p = ParcelBuilder::new();
+                                p.write_bq_buffer_output(qw, qh);
+                                p.write_u32(0);
+                                return p.finish();
+                            }
+                            nexium_nvdrv::AsyncPresentSubmit::Unavailable => {
+                                note_ordered_present_profile(
+                                    OrderedPresentProfileOutcome::Unavailable,
+                                );
+                            }
+                        }
+                    } else if ordered_present_identity.is_some() {
+                        note_ordered_present_profile(OrderedPresentProfileOutcome::TargetRejected);
+                    } else {
+                        note_ordered_present_profile(
+                            OrderedPresentProfileOutcome::IdentityRejected,
+                        );
+                    }
+                }
                 let bpp: usize = 4;
                 let linear_size = (gb.stride as usize) * (gb.height as usize) * bpp;
                 let tiled_size = compute_tiled_size(gb.stride, gb.height, gb.block_height_log2);
@@ -5637,6 +6485,7 @@ fn igbp_handle_transact(
                         None
                     }
                 };
+                kernel.nvdrv.wait_gpu_idle();
                 let renderer_for_present = kernel.nvdrv.renderer().cloned();
                 if let (Some(probe), Some(renderer)) = (
                     std::env::var("NEXIUM_PRESENT_PROBE_NVMAP")
@@ -5750,7 +6599,7 @@ fn igbp_handle_transact(
                     .map(|v| v != "0")
                     .unwrap_or(true);
                 let mut mapped_present_vas = if present_cpu_addr != 0 {
-                    let mappings = kernel.nvdrv.gpu.mappings.lock();
+                    let mappings = kernel.nvdrv.gpu.mappings.read();
                     mappings
                         .gpu_regions_for_cpu_range(present_cpu_addr, 4)
                         .into_iter()
@@ -5767,7 +6616,7 @@ fn igbp_handle_transact(
                     Vec::new()
                 };
                 let resolve_aliases = if present_is_tiled {
-                    let mappings = kernel.nvdrv.gpu.mappings.lock();
+                    let mappings = kernel.nvdrv.gpu.mappings.read();
                     mapped_present_vas
                         .iter()
                         .filter_map(|va| va.checked_add(tiled_size as u64))
@@ -6011,7 +6860,11 @@ fn igbp_handle_transact(
                                 } else {
                                     maybe_crop_present_subwindow(bytes, read_w, read_h)
                                 };
+                                if flip_y.unwrap_or_else(|| should_flip_vulkan_present(w, h)) {
+                                    flip_present_v(&mut b, w, h);
+                                }
                                 apply_present_transform(&mut b, w, h, transform);
+                                make_present_opaque(&mut b);
                                 (w, h, b)
                             };
                             let (present_w, present_h, bytes) = match queue_crop {
@@ -6782,6 +7635,73 @@ fn make_present_opaque(pixels: &mut [u8]) {
 fn legacy_present_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("NEXIUM_LEGACY_PRESENT").is_some())
+}
+
+fn submit_ordered_gpu_present<F>(
+    readback_fn: F,
+    frame_queue: std::sync::Arc<parking_lot::Mutex<Vec<nexium_nvdrv::QueuedFrame>>>,
+    stats: std::sync::Arc<nexium_nvdrv::PipelineStats>,
+    width: u32,
+    height: u32,
+    transform: u32,
+    queue_crop: Option<(u32, u32, u32, u32)>,
+) where
+    F: FnOnce(Option<[u32; 4]>) -> Option<(u32, u32, Vec<u8>, Option<bool>)>,
+{
+    let crop = cached_present_crop(width, height);
+    let read_rect = crop.map(|(x0, y0, w, h)| {
+        if should_flip_vulkan_present(width, height) {
+            [x0, height.saturating_sub(y0).saturating_sub(h), w, h]
+        } else {
+            [x0, y0, w, h]
+        }
+    });
+    let readback = readback_fn(read_rect);
+    let Some((read_w, read_h, bytes, flip_y)) = readback else {
+        return;
+    };
+    let (present_w, present_h, bytes) = if legacy_present_enabled() {
+        let (w, h, mut b) = prepare_vulkan_present_frame(bytes, read_w, read_h, transform, flip_y);
+        make_present_opaque(&mut b);
+        (w, h, b)
+    } else {
+        let (w, h, mut b) = if read_rect.map_or(false, |r| r[2] == read_w && r[3] == read_h) {
+            (read_w, read_h, bytes)
+        } else {
+            maybe_crop_present_subwindow(bytes, read_w, read_h)
+        };
+        if flip_y.unwrap_or_else(|| should_flip_vulkan_present(w, h)) {
+            flip_present_v(&mut b, w, h);
+        }
+        apply_present_transform(&mut b, w, h, transform);
+        make_present_opaque(&mut b);
+        (w, h, b)
+    };
+    let (present_w, present_h, bytes) = match queue_crop {
+        Some((cx, cy, cw, ch))
+            if cx + cw <= present_w
+                && cy + ch <= present_h
+                && (cw < present_w || ch < present_h) =>
+        {
+            let cropped = crop_and_upscale(&bytes, present_w, cx, cy, cw, ch, cw, ch);
+            (cw, ch, cropped)
+        }
+        _ => (present_w, present_h, bytes),
+    };
+    dump_present_frame(&bytes, present_w, present_h);
+    if std::env::var_os("NEXIUM_FRAME_PRESENT_CACHE").is_some() {
+        nexium_common::frame_present::set_last_presented(present_w, present_h, bytes.clone());
+    }
+    let mut queue = frame_queue.lock();
+    queue.clear();
+    queue.push(nexium_nvdrv::QueuedFrame {
+        width: present_w,
+        height: present_h,
+        pixels: bytes,
+    });
+    stats
+        .frames_submitted
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn outside_crop_has_visible(
@@ -7911,6 +8831,7 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("friend:u" | "friend:a" | "friend:s" | "friend:v" | "friend:m", 0) => {
             Some("IFriendService")
         }
+        ("mii:u" | "mii:e", 0) => Some("IDatabaseService"),
         ("nfp:user", 0) => Some("INfpUser"),
         ("bcat:u" | "bcat:a" | "bcat:m" | "bcat:s", 0) => Some("IBcatService"),
         ("bcat:u" | "bcat:a" | "bcat:m" | "bcat:s", 1 | 2) => Some("IDeliveryCacheStorageService"),
@@ -7922,7 +8843,6 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("aoc:u", 100 | 101) => Some("IPurchaseEventManager"),
         ("fsp-srv", 18) => Some("IFileSystem"),
         ("fsp-srv", 200) => Some("IFsStorage"),
-        ("fsp-srv", 202) => Some("IFsStorage"),
         ("vi:m" | "vi:s" | "vi:u", 0) => Some("IApplicationDisplayService"),
         ("vi:m" | "vi:s" | "vi:u", 1) => Some("IApplicationDisplayService"),
         ("vi:m" | "vi:s" | "vi:u", 2) => Some("IApplicationDisplayService"),
@@ -8649,7 +9569,7 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         17 => 0,
         18 => 0,
         19 => 0,
-        20 => 0,
+        20 => kernel.tls_base + 0x200,
         21 => kernel.total_memory,
         22 => (kernel.code_size + kernel.stack_size + kernel.heap_committed + 0x100_0000)
             .min(kernel.total_memory),
@@ -8934,11 +9854,15 @@ fn svc_create_thread(kernel: &mut Kernel) -> u32 {
     kernel.threads.add_thread(handle, ctx, tls_va, sp, arg);
     if let Some(t) = kernel.threads.threads.get_mut(&handle) {
         t.priority = priority;
-        let active_cores = std::env::var("NEXIUM_CPU_CORES")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(crate::kernel::threads::NUM_CORES as i32)
-            .clamp(1, crate::kernel::threads::NUM_CORES as i32);
+        let active_cores = if std::env::var("NEXIUM_SINGLECORE").is_ok() {
+            1
+        } else {
+            std::env::var("NEXIUM_CPU_CORES")
+                .ok()
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(crate::kernel::threads::NUM_CORES as i32)
+                .clamp(1, crate::kernel::threads::NUM_CORES as i32)
+        };
         if (0..active_cores).contains(&core) {
             t.core = core;
         }
@@ -9218,7 +10142,8 @@ fn svc_get_thread_context3(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
-fn svc_synchronize_preemption_state(_kernel: &mut Kernel) -> u32 {
+fn svc_synchronize_preemption_state(kernel: &mut Kernel) -> u32 {
+    kernel.synchronize_user_preemption_state();
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
@@ -9622,6 +10547,31 @@ fn ng_word2_romfs() -> &'static [u8] {
     ROMFS.get_or_init(build_ng_word2_romfs).as_slice()
 }
 
+fn mii_model_romfs() -> &'static [u8] {
+    use std::sync::OnceLock;
+
+    static ROMFS: OnceLock<Vec<u8>> = OnceLock::new();
+    ROMFS.get_or_init(build_mii_model_romfs).as_slice()
+}
+
+fn build_mii_model_romfs() -> Vec<u8> {
+    const NFTR_HEADER: &[u8] = b"NFTR\x01\0\0\0\0\0\0\0\0\0\0\0";
+    const NFSR_HEADER: &[u8] = b"NFSR\x01\0\0\0\0\0\0\0\0\0\0\0";
+
+    let files = [
+        ("NXTextureLowLinear.dat", NFTR_HEADER),
+        ("NXTextureLowSRGB.dat", NFTR_HEADER),
+        ("NXTextureMidLinear.dat", NFTR_HEADER),
+        ("NXTextureMidSRGB.dat", NFTR_HEADER),
+        ("ShapeHigh.dat", NFSR_HEADER),
+        ("ShapeMid.dat", NFSR_HEADER),
+    ]
+    .into_iter()
+    .map(|(name, data)| (name.to_string(), data.to_vec()))
+    .collect();
+    build_flat_romfs(files)
+}
+
 fn build_ng_word2_romfs() -> Vec<u8> {
     const AC_NX_DATA: &[u8] = &[
         0x1f, 0x8b, 0x08, 0x08, 0xd5, 0x2c, 0x09, 0x5c, 0x04, 0x00, 0x61, 0x63, 0x72, 0x61, 0x77,
@@ -9641,12 +10591,16 @@ fn build_ng_word2_romfs() -> Vec<u8> {
         ("ac_common_not_b_nx".to_string(), AC_NX_DATA.to_vec()),
         ("version.dat".to_string(), vec![0, 0, 0, 0x1a]),
     ]);
+    build_flat_romfs(files)
+}
+
+fn build_flat_romfs(mut files: Vec<(String, Vec<u8>)>) -> Vec<u8> {
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let align4 = |value: usize| (value + 3) & !3;
     let align16 = |value: usize| (value + 15) & !15;
     let dir_hash_count = 3usize;
-    let file_hash_count = 53usize;
+    let file_hash_count = romfs_hash_table_entry_count(files.len());
     let dir_hash_size = dir_hash_count * 4;
     let file_hash_size = file_hash_count * 4;
     let dir_table_size = 0x18usize;
@@ -9684,7 +10638,7 @@ fn build_ng_word2_romfs() -> Vec<u8> {
 
     let mut dir_hash = vec![u32::MAX; dir_hash_count];
     let mut file_hash = vec![u32::MAX; file_hash_count];
-    let root_hash = ng_word2_hash(0, &[]);
+    let root_hash = romfs_path_hash(0, &[]);
     dir_hash[(root_hash as usize) % dir_hash_count] = 0;
     for (index, word) in dir_hash.iter().enumerate() {
         let offset = dir_hash_ofs + index * 4;
@@ -9695,7 +10649,7 @@ fn build_ng_word2_romfs() -> Vec<u8> {
     romfs[dir_table_ofs + 4..dir_table_ofs + 8].copy_from_slice(&u32::MAX.to_le_bytes());
     romfs[dir_table_ofs + 8..dir_table_ofs + 12].copy_from_slice(&u32::MAX.to_le_bytes());
     romfs[dir_table_ofs + 12..dir_table_ofs + 16].copy_from_slice(&0u32.to_le_bytes());
-    romfs[dir_table_ofs + 16..dir_table_ofs + 20].copy_from_slice(&root_hash.to_le_bytes());
+    romfs[dir_table_ofs + 16..dir_table_ofs + 20].copy_from_slice(&u32::MAX.to_le_bytes());
     romfs[dir_table_ofs + 20..dir_table_ofs + 24].copy_from_slice(&0u32.to_le_bytes());
 
     let mut entry_offset = 0usize;
@@ -9706,7 +10660,7 @@ fn build_ng_word2_romfs() -> Vec<u8> {
         } else {
             u32::MAX
         };
-        let hash = ng_word2_hash(0, name.as_bytes());
+        let hash = romfs_path_hash(0, name.as_bytes());
         let bucket = (hash as usize) % file_hash_count;
         let table_entry = file_hash[bucket];
         file_hash[bucket] = entry_offset as u32;
@@ -9730,12 +10684,30 @@ fn build_ng_word2_romfs() -> Vec<u8> {
     romfs
 }
 
-fn ng_word2_hash(parent: u32, name: &[u8]) -> u32 {
+fn romfs_path_hash(parent: u32, name: &[u8]) -> u32 {
     let mut hash = parent ^ 123_456_789;
     for byte in name {
         hash = hash.rotate_right(5) ^ u32::from(*byte);
     }
     hash
+}
+
+fn romfs_hash_table_entry_count(entry_count: usize) -> usize {
+    if entry_count < 3 {
+        return 3;
+    }
+    if entry_count < 19 {
+        return entry_count | 1;
+    }
+
+    let mut count = entry_count;
+    while [2, 3, 5, 7, 11, 13, 17]
+        .into_iter()
+        .any(|divisor| count % divisor == 0)
+    {
+        count += 1;
+    }
+    count
 }
 
 #[derive(Clone, Copy)]
@@ -9898,6 +10870,40 @@ fn romfs_entry_type(romfs: &[u8], path: &str) -> Option<u32> {
     match romfs_find_entry(romfs, path)? {
         RomfsEntry::Dir => Some(0),
         RomfsEntry::File { .. } => Some(1),
+    }
+}
+
+#[cfg(test)]
+mod synthetic_system_archive_tests {
+    use super::{build_mii_model_romfs, build_ng_word2_romfs, romfs_open_file};
+
+    fn file<'a>(romfs: &'a [u8], path: &str) -> &'a [u8] {
+        let (offset, size) = romfs_open_file(romfs, path).expect("synthetic archive file");
+        &romfs[offset..offset + size]
+    }
+
+    #[test]
+    fn mii_model_archive_has_expected_header_only_resources() {
+        let romfs = build_mii_model_romfs();
+        for name in [
+            "NXTextureLowLinear.dat",
+            "NXTextureLowSRGB.dat",
+            "NXTextureMidLinear.dat",
+            "NXTextureMidSRGB.dat",
+        ] {
+            assert_eq!(file(&romfs, name), b"NFTR\x01\0\0\0\0\0\0\0\0\0\0\0");
+        }
+        for name in ["ShapeHigh.dat", "ShapeMid.dat"] {
+            assert_eq!(file(&romfs, name), b"NFSR\x01\0\0\0\0\0\0\0\0\0\0\0");
+        }
+        assert!(romfs_open_file(&romfs, "missing.dat").is_none());
+    }
+
+    #[test]
+    fn shared_flat_romfs_builder_preserves_ng_word2_files() {
+        let romfs = build_ng_word2_romfs();
+        assert_eq!(file(&romfs, "version.dat"), [0, 0, 0, 0x1a]);
+        assert_eq!(&file(&romfs, "ac_0_b1_nx")[..4], [0x1f, 0x8b, 0x08, 0x08]);
     }
 }
 

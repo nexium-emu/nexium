@@ -304,6 +304,7 @@ pub fn set_supported_npad_style_set(
     _aruid: u64,
 ) {
     kernel.services.hid.npad_style_set = style_set;
+    crate::hid_state::apply_controller_applet_style(style_set);
     let events: Vec<u32> = kernel.services.hid.style_change_events.clone();
     for h in events {
         kernel.event_signals.insert(h, true);
