@@ -405,6 +405,18 @@ fn resident_vb_bytes() -> u64 {
     })
 }
 
+fn resident_cbuf_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_RESIDENT_CBUF").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
+const RESIDENT_DIR_RING_BYTES: u64 = 4 * 1024 * 1024;
+
 struct ResidentVbSlab {
     offset: u64,
     serials: Vec<u64>,
@@ -421,6 +433,7 @@ struct ResidentVbCache {
     free: HashMap<u32, Vec<u64>>,
     slabs: HashMap<(u64, u32), ResidentVbSlab>,
     clock: u64,
+    dir_heads: [u64; 4],
 }
 
 unsafe impl Send for ResidentVbCache {}
@@ -431,6 +444,61 @@ impl ResidentVbCache {
         for slab in self.slabs.values_mut() {
             slab.in_flight_mask &= clear;
         }
+        if let Some(head) = self.dir_heads.get_mut(frame_slot) {
+            *head = 0;
+        }
+    }
+
+    fn dir_slot_region(&self, frame_slot: usize) -> (u64, u64) {
+        let slots = self.dir_heads.len() as u64;
+        let per_slot = RESIDENT_DIR_RING_BYTES / slots;
+        (frame_slot as u64 * per_slot, per_slot)
+    }
+
+    fn alloc_dir_block(&mut self, frame_slot: usize, bytes: u64) -> Option<u64> {
+        let (base, per_slot) = self.dir_slot_region(frame_slot);
+        let head = self.dir_heads.get_mut(frame_slot)?;
+        let aligned = (*head + 255) & !255;
+        if aligned + bytes > per_slot {
+            return None;
+        }
+        *head = aligned + bytes;
+        Some(base + aligned)
+    }
+
+    fn resolve_cbuf_dir(
+        &mut self,
+        draw: &crate::draw::ResidentCbufDraw,
+        frame_slot: usize,
+        used: &mut Vec<(u64, u32)>,
+    ) -> Option<(vk::Buffer, u64, u64)> {
+        let dir_bytes = (nexium_spirv::GFX_CBUF_MIN_SIZE as u64).max(304);
+        let mut resolved = Vec::with_capacity(draw.slots.len());
+        for slot in &draw.slots {
+            if slot.range.cpu_va % 4 != 0 {
+                return None;
+            }
+            let (_, offset) = self.resolve(&slot.range, used)?;
+            resolved.push((slot.logical_slot, offset, slot.word_count));
+        }
+        let dir_offset = self.alloc_dir_block(frame_slot, dir_bytes)?;
+        let dir_word_base = dir_offset / 4;
+        unsafe {
+            let dir = self.mapped.add(dir_offset as usize).cast::<u32>();
+            for slot_index in 0..nexium_spirv::GFX_CBUF_SLOTS as usize {
+                *dir.add(slot_index * 2) = nexium_spirv::GFX_CBUF_ZERO_WORD;
+                *dir.add(slot_index * 2 + 1) = 0;
+            }
+            let zero_word = nexium_spirv::GFX_CBUF_DIRECTORY_WORDS as usize;
+            *dir.add(zero_word) = 0;
+            for &(logical_slot, data_offset, word_count) in &resolved {
+                let rel_word = (data_offset / 4).checked_sub(dir_word_base)?;
+                let rel_word = u32::try_from(rel_word).ok()?;
+                *dir.add(logical_slot as usize * 2) = rel_word;
+                *dir.add(logical_slot as usize * 2 + 1) = word_count;
+            }
+        }
+        Some((self.buffer, dir_offset, self.size - dir_offset))
     }
 
     fn mark_submitted(&mut self, frame_slot: usize, used: &[(u64, u32)]) {
@@ -566,17 +634,20 @@ fn create_resident_vb_cache(
         device,
         mem_props,
         size,
-        vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
+        vk::BufferUsageFlags::VERTEX_BUFFER
+            | vk::BufferUsageFlags::INDEX_BUFFER
+            | vk::BufferUsageFlags::STORAGE_BUFFER,
     )?;
     Ok(ResidentVbCache {
         buffer: buffer.buffer,
         memory: buffer.memory,
         mapped: buffer.mapped,
         size,
-        head: 0,
+        head: RESIDENT_DIR_RING_BYTES,
         free: HashMap::new(),
         slabs: HashMap::new(),
         clock: 0,
+        dir_heads: [0; 4],
     })
 }
 
@@ -10079,23 +10150,36 @@ impl Renderer {
                     None
                 };
 
-                let (_cbuf_range, cbuf_size_aligned) = graphics_cbuf_allocation_size(
-                    prep.cbuf_len,
-                    cbuf_alignment,
-                    *max_storage_buffer_range,
-                )?;
-                if !ring_allocation_fits(ubo_ring, cbuf_size_aligned, cbuf_alignment) {
-                    return Err(format!(
+                let resident_cbuf_bind = call.resident_cbuf.as_ref().and_then(|draw| {
+                    resident_vb
+                        .as_mut()?
+                        .resolve_cbuf_dir(draw, cur_idx, &mut resident_vb_used)
+                });
+                let (ubo_buffer, ubo_offset, ubo_range) = if let Some((buffer, offset, range)) =
+                    resident_cbuf_bind
+                {
+                    (buffer, offset, range)
+                } else {
+                    let (_cbuf_range, cbuf_size_aligned) = graphics_cbuf_allocation_size(
+                        prep.cbuf_len,
+                        cbuf_alignment,
+                        *max_storage_buffer_range,
+                    )?;
+                    if !ring_allocation_fits(ubo_ring, cbuf_size_aligned, cbuf_alignment) {
+                        return Err(format!(
                     "batched graphics ring preflight underestimated graphics cbuf upload ({cbuf_size_aligned:#x} bytes, alignment {cbuf_alignment})"
                 ));
-                }
-                let (ubo_buffer, ubo_offset, ubo_ptr) =
-                    ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
-                        .map_err(|e| format!("ring_alloc(graphics-cbuf): {}", e))?;
-                let cbuf_dst = unsafe { std::slice::from_raw_parts_mut(ubo_ptr, prep.cbuf_len) };
-                if !write_graphics_cbuf_data(prep.cbuf_data, cbuf_dst) {
-                    return Err("invalid batched graphics cbuf snapshot".to_string());
-                }
+                    }
+                    let (ubo_buffer, ubo_offset, ubo_ptr) =
+                        ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
+                            .map_err(|e| format!("ring_alloc(graphics-cbuf): {}", e))?;
+                    let cbuf_dst =
+                        unsafe { std::slice::from_raw_parts_mut(ubo_ptr, prep.cbuf_len) };
+                    if !write_graphics_cbuf_data(prep.cbuf_data, cbuf_dst) {
+                        return Err("invalid batched graphics cbuf snapshot".to_string());
+                    }
+                    (ubo_buffer, ubo_offset, prep.cbuf_len as u64)
+                };
 
                 if bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
                     for binding in &call.texture_numeric_manifest {
@@ -10141,7 +10225,7 @@ impl Renderer {
                 let ubo_info = vk::DescriptorBufferInfo {
                     buffer: ubo_buffer,
                     offset: ubo_offset,
-                    range: prep.cbuf_len as u64,
+                    range: ubo_range,
                 };
                 let image_infos = typed_sampled_image_infos(
                     &bound_tex_views,

@@ -451,6 +451,19 @@ impl ResidentVertexRange {
 }
 
 #[derive(Clone, Debug)]
+pub struct ResidentCbufSlot {
+    pub logical_slot: u32,
+    pub word_count: u32,
+    pub range: ResidentVertexRange,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ResidentCbufDraw {
+    pub slots: Vec<ResidentCbufSlot>,
+    pub packed_size: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct Maxwell3dDrawCall {
     pub vs_spirv: std::sync::Arc<Vec<u32>>,
     pub fs_spirv: std::sync::Arc<Vec<u32>>,
@@ -470,6 +483,7 @@ pub struct Maxwell3dDrawCall {
     pub cbuf_addr: u64,
     pub cbuf_size: u32,
     pub cbuf_data: Option<GraphicsCbufPayload>,
+    pub resident_cbuf: Option<ResidentCbufDraw>,
     pub vertex_addr: u64,
     pub vertex_bindings: Vec<VertexBufferBinding>,
     pub resident_vertex: Vec<ResidentVertexRange>,

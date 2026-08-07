@@ -191,7 +191,8 @@ pub(crate) mod kickprof {
     pub const MIRROR_STRADDLE: usize = 124;
     pub const MIRROR_EVICT: usize = 125;
     pub const MIRROR_PATCH: usize = 126;
-    pub const COUNT: usize = 127;
+    pub const RESIDENT_CBUF_DRAW: usize = 127;
+    pub const COUNT: usize = 128;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -321,6 +322,7 @@ pub(crate) mod kickprof {
         "mirstraddle",
         "mirevict",
         "mirpatch",
+        "rescbuf",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
