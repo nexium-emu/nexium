@@ -267,6 +267,74 @@ fn track_storage_base(
     track_dfs(start, defs, buffers, true, 0).or_else(|| track_dfs(start, defs, buffers, false, 0))
 }
 
+fn writes_predicate(op: &Op, predicate: u8) -> bool {
+    match op {
+        Op::FSetPred {
+            dest_p, dest_np, ..
+        }
+        | Op::ISetPred {
+            dest_p, dest_np, ..
+        }
+        | Op::HSetPred {
+            dest_p, dest_np, ..
+        }
+        | Op::PSetPred {
+            dest_p, dest_np, ..
+        }
+        | Op::CSetPred {
+            dest_p, dest_np, ..
+        } => *dest_p == predicate || *dest_np == predicate,
+        Op::Shfl { pred_dest, .. } | Op::SubgroupVote { pred_dest, .. } => *pred_dest == predicate,
+        _ => false,
+    }
+}
+
+fn track_storage_access(
+    start: Value,
+    consumer_pred: Option<Predicate>,
+    block_index: usize,
+    instruction_index: usize,
+    defs: &HashMap<u32, Op>,
+    def_locations: &HashMap<u32, (usize, usize)>,
+    blocks: &[BasicBlock],
+    buffers: &[StorageBufferAddr],
+) -> Option<(TrackedStorageAddr, Value)> {
+    if let Some(tracked) = track_storage_base(start, defs, buffers) {
+        return Some((tracked, start));
+    }
+
+    let consumer_pred = consumer_pred?;
+    let Value::Inst(address_id) = start else {
+        return None;
+    };
+    let &(definition_block, definition_index) = def_locations.get(&address_id.0)?;
+    if definition_block != block_index || definition_index >= instruction_index {
+        return None;
+    }
+    let Op::SelectPred {
+        pred,
+        if_true,
+        if_false,
+    } = defs.get(&address_id.0)?
+    else {
+        return None;
+    };
+    if pred.idx != consumer_pred.idx
+        || blocks[block_index].program.instructions[definition_index + 1..instruction_index]
+            .iter()
+            .any(|instruction| writes_predicate(&instruction.op, pred.idx))
+    {
+        return None;
+    }
+    let active_address = if pred.negate == consumer_pred.negate {
+        *if_true
+    } else {
+        *if_false
+    };
+    let tracked = track_storage_base(active_address, defs, buffers)?;
+    Some((tracked, active_address))
+}
+
 fn track_dfs(
     v: Value,
     defs: &HashMap<u32, Op>,
@@ -325,6 +393,38 @@ fn track_dfs(
             })
         }
         Op::Mov(source) => track_dfs(*source, defs, buffers, biased, depth + 1),
+        Op::Phi { sources } => {
+            let mut tracked = None;
+            for (_, source) in sources {
+                if *source == v {
+                    continue;
+                }
+                if let Some(t) = track_dfs(*source, defs, buffers, biased, depth + 1) {
+                    tracked = Some(t);
+                    break;
+                }
+            }
+            let mut tracked: TrackedStorageAddr = tracked?;
+            tracked.relative_offset = None;
+            Some(tracked)
+        }
+        Op::SelectPred {
+            if_true, if_false, ..
+        } => {
+            let if_true = track_dfs(*if_true, defs, buffers, biased, depth + 1);
+            let if_false = track_dfs(*if_false, defs, buffers, biased, depth + 1);
+            match (if_true, if_false) {
+                (Some(mut left), Some(right))
+                    if same_storage_origin(left.descriptor, right.descriptor) =>
+                {
+                    if left.relative_offset != right.relative_offset {
+                        left.relative_offset = None;
+                    }
+                    Some(left)
+                }
+                _ => None,
+            }
+        }
         Op::IAdd { a, b, neg_a, neg_b } => {
             if !*neg_a {
                 if let Some(mut tracked) = track_dfs(*a, defs, buffers, biased, depth + 1) {
@@ -435,10 +535,12 @@ fn intern_storage_buffer(
 
 pub fn collect_storage_buffers(cfg: &mut Cfg) -> Vec<StorageBufferAddr> {
     let mut defs: HashMap<u32, Op> = HashMap::new();
-    for b in &cfg.blocks {
-        for inst in &b.program.instructions {
+    let mut def_locations: HashMap<u32, (usize, usize)> = HashMap::new();
+    for (block_index, block) in cfg.blocks.iter().enumerate() {
+        for (instruction_index, inst) in block.program.instructions.iter().enumerate() {
             if let Some(r) = inst.result {
                 defs.insert(r.0, inst.op.clone());
+                def_locations.insert(r.0, (block_index, instruction_index));
             }
         }
     }
@@ -449,18 +551,42 @@ pub fn collect_storage_buffers(cfg: &mut Cfg) -> Vec<StorageBufferAddr> {
         for (bi, block) in cfg.blocks.iter().enumerate() {
             for (ii, inst) in block.program.instructions.iter().enumerate() {
                 let global = match inst.op {
-                    Op::LoadGlobal { addr_lo, offset } => Some((addr_lo, offset, None)),
+                    Op::LoadGlobal { addr_lo, offset } => {
+                        Some((addr_lo, offset, None, inst.pred, None))
+                    }
                     Op::StoreGlobal {
                         addr_lo,
                         offset,
                         value,
-                    } => Some((addr_lo, offset, Some(value))),
+                    } => Some((addr_lo, offset, Some(value), inst.pred, None)),
+                    Op::GlobalAtomic {
+                        addr_lo,
+                        offset,
+                        value,
+                        op,
+                        is_signed,
+                    } => Some((
+                        addr_lo,
+                        offset,
+                        Some(value),
+                        inst.pred,
+                        Some((op, is_signed)),
+                    )),
                     _ => None,
                 };
-                let Some((addr_lo, offset, value)) = global else {
+                let Some((addr_lo, offset, value, predicate, atomic)) = global else {
                     continue;
                 };
-                let Some(mut tracked) = track_storage_base(addr_lo, &defs, &buffers) else {
+                let Some((mut tracked, access_addr_lo)) = track_storage_access(
+                    addr_lo,
+                    predicate,
+                    bi,
+                    ii,
+                    &defs,
+                    &def_locations,
+                    &cfg.blocks,
+                    &buffers,
+                ) else {
                     continue;
                 };
 
@@ -471,10 +597,23 @@ pub fn collect_storage_buffers(cfg: &mut Cfg) -> Vec<StorageBufferAddr> {
                 tracked.descriptor.required_size = required_size.unwrap_or(0);
                 let buffer_index = intern_storage_buffer(&mut buffers, tracked.descriptor);
                 let descriptor = buffers[buffer_index as usize];
-                let op = if let Some(value) = value {
+                let op = if let (Some(value), Some((atomic_op, is_signed))) = (value, atomic) {
+                    Op::StorageAtomic {
+                        buffer_index,
+                        addr_lo: access_addr_lo,
+                        base_addr_lo: tracked.base_addr_lo,
+                        imm: offset,
+                        value,
+                        op: atomic_op,
+                        is_signed,
+                        cbuf_binding: descriptor.cbuf_binding,
+                        cbuf_offset: descriptor.cbuf_offset,
+                        align: descriptor.align,
+                    }
+                } else if let Some(value) = value {
                     Op::StoreStorage {
                         buffer_index,
-                        addr_lo,
+                        addr_lo: access_addr_lo,
                         base_addr_lo: tracked.base_addr_lo,
                         imm: offset,
                         value,
@@ -485,7 +624,7 @@ pub fn collect_storage_buffers(cfg: &mut Cfg) -> Vec<StorageBufferAddr> {
                 } else {
                     Op::LoadStorage {
                         buffer_index,
-                        addr_lo,
+                        addr_lo: access_addr_lo,
                         base_addr_lo: tracked.base_addr_lo,
                         imm: offset,
                         cbuf_binding: descriptor.cbuf_binding,
@@ -504,6 +643,37 @@ pub fn collect_storage_buffers(cfg: &mut Cfg) -> Vec<StorageBufferAddr> {
             cfg.blocks[bi].program.instructions[ii].op = op.clone();
             if let Some(result) = result {
                 defs.insert(result.0, op);
+            }
+        }
+    }
+    if std::env::var_os("NEXIUM_TRACK_GLOBAL_DBG").is_some() {
+        for block in cfg.blocks.iter() {
+            for inst in block.program.instructions.iter() {
+                let addr = match inst.op {
+                    Op::LoadGlobal { addr_lo, .. }
+                    | Op::StoreGlobal { addr_lo, .. }
+                    | Op::GlobalAtomic { addr_lo, .. } => addr_lo,
+                    _ => continue,
+                };
+                let mut chain = String::new();
+                let mut v = addr;
+                for _ in 0..8 {
+                    let Value::Inst(id) = v else {
+                        chain.push_str(&format!(" <- {v:?}"));
+                        break;
+                    };
+                    let Some(op) = defs.get(&id.0) else {
+                        chain.push_str(" <- <no def>");
+                        break;
+                    };
+                    chain.push_str(&format!(" <- {op:?}"));
+                    v = match op {
+                        Op::Mov(source) => *source,
+                        Op::IAdd { a, .. } | Op::IScAdd { a, .. } => *a,
+                        _ => break,
+                    };
+                }
+                log::warn!("[track-global-miss] {:?} addr chain:{}", inst.op, chain);
             }
         }
     }
@@ -1867,6 +2037,375 @@ mod tests {
         program.emit(
             Op::LoadGlobal {
                 addr_lo: Value::Inst(dynamic_addr),
+                offset: 0,
+            },
+            Some(12),
+        );
+        let mut cfg = cfg_with_program(program);
+
+        let buffers = collect_storage_buffers(&mut cfg);
+
+        assert_eq!(buffers.len(), 1);
+        assert!(matches!(
+            cfg.blocks[0].program.instructions[4].op,
+            Op::LoadGlobal { .. }
+        ));
+    }
+
+    #[test]
+    fn storage_buffer_collection_rejects_conditional_unknown_pointer() {
+        let mut program = Program::new();
+        let pointer = program.emit(
+            Op::LoadCbuf {
+                binding: 0,
+                byte_offset: 0x2d0,
+            },
+            Some(4),
+        );
+        let selected = program.emit(
+            Op::SelectPred {
+                pred: Predicate {
+                    idx: 2,
+                    negate: false,
+                },
+                if_true: Value::Inst(pointer),
+                if_false: Value::GprIn(4),
+            },
+            Some(4),
+        );
+        for offset in [0x60, 0x64, 0x68, 0x6c] {
+            program.emit(
+                Op::LoadGlobal {
+                    addr_lo: Value::Inst(selected),
+                    offset,
+                },
+                Some(4),
+            );
+        }
+        let mut cfg = cfg_with_program(program);
+
+        let buffers = collect_storage_buffers(&mut cfg);
+
+        assert!(buffers.is_empty());
+        for instruction in &cfg.blocks[0].program.instructions[2..] {
+            assert!(matches!(instruction.op, Op::LoadGlobal { .. }));
+        }
+    }
+
+    #[test]
+    fn storage_buffer_collection_accepts_matching_predicated_pointer() {
+        let mut program = Program::new();
+        let predicate = Predicate {
+            idx: 2,
+            negate: false,
+        };
+        let pointer = program.emit(
+            Op::LoadCbuf {
+                binding: 0,
+                byte_offset: 0x2d0,
+            },
+            Some(4),
+        );
+        let selected = program.emit(
+            Op::SelectPred {
+                pred: predicate,
+                if_true: Value::Inst(pointer),
+                if_false: Value::GprIn(4),
+            },
+            Some(4),
+        );
+        for offset in [0x60, 0x64, 0x68, 0x6c] {
+            program.emit_pred(
+                Op::LoadGlobal {
+                    addr_lo: Value::Inst(selected),
+                    offset,
+                },
+                Some(4),
+                Some(predicate),
+            );
+        }
+        let mut cfg = cfg_with_program(program);
+
+        let buffers = collect_storage_buffers(&mut cfg);
+
+        assert_eq!(
+            buffers,
+            vec![StorageBufferAddr {
+                cbuf_binding: 0,
+                cbuf_offset: 0x2d0,
+                align: 16,
+                indirect: None,
+                required_size: 0x70,
+            }]
+        );
+        for instruction in &cfg.blocks[0].program.instructions[2..] {
+            assert_eq!(instruction.pred, Some(predicate));
+            assert!(matches!(
+                instruction.op,
+                Op::LoadStorage {
+                    addr_lo: Value::Inst(id),
+                    base_addr_lo: Value::Inst(base),
+                    ..
+                } if id == pointer && base == pointer
+            ));
+        }
+    }
+
+    #[test]
+    fn storage_buffer_collection_accepts_complementary_predicated_pointer() {
+        let mut program = Program::new();
+        let selector = Predicate {
+            idx: 2,
+            negate: false,
+        };
+        let consumer = Predicate {
+            idx: 2,
+            negate: true,
+        };
+        let pointer = program.emit(
+            Op::LoadCbuf {
+                binding: 0,
+                byte_offset: 0x2d0,
+            },
+            Some(4),
+        );
+        let selected = program.emit(
+            Op::SelectPred {
+                pred: selector,
+                if_true: Value::GprIn(4),
+                if_false: Value::Inst(pointer),
+            },
+            Some(4),
+        );
+        program.emit_pred(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(selected),
+                offset: 0x60,
+            },
+            Some(4),
+            Some(consumer),
+        );
+        let mut cfg = cfg_with_program(program);
+
+        let buffers = collect_storage_buffers(&mut cfg);
+
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].cbuf_offset, 0x2d0);
+        assert_eq!(buffers[0].required_size, 0x64);
+        assert!(matches!(
+            cfg.blocks[0].program.instructions[2].op,
+            Op::LoadStorage {
+                addr_lo: Value::Inst(id),
+                ..
+            } if id == pointer
+        ));
+    }
+
+    #[test]
+    fn storage_buffer_collection_rejects_redefined_pointer_predicate() {
+        let mut program = Program::new();
+        let predicate = Predicate {
+            idx: 2,
+            negate: false,
+        };
+        let pointer = program.emit(
+            Op::LoadCbuf {
+                binding: 0,
+                byte_offset: 0x2d0,
+            },
+            Some(4),
+        );
+        let selected = program.emit(
+            Op::SelectPred {
+                pred: predicate,
+                if_true: Value::Inst(pointer),
+                if_false: Value::GprIn(4),
+            },
+            Some(4),
+        );
+        program.emit(
+            Op::Shfl {
+                value: Value::Zero,
+                index: Value::Zero,
+                mask: Value::Zero,
+                mode: 0,
+                pred_dest: 2,
+            },
+            None,
+        );
+        program.emit_pred(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(selected),
+                offset: 0x60,
+            },
+            Some(4),
+            Some(predicate),
+        );
+        let mut cfg = cfg_with_program(program);
+
+        let buffers = collect_storage_buffers(&mut cfg);
+
+        assert!(buffers.is_empty());
+        assert!(matches!(
+            cfg.blocks[0].program.instructions[3].op,
+            Op::LoadGlobal { .. }
+        ));
+    }
+
+    #[test]
+    fn storage_buffer_collection_resolves_predicated_conditional_store() {
+        let mut program = Program::new();
+        let predicate = Predicate {
+            idx: 2,
+            negate: false,
+        };
+        let pointer = program.emit(
+            Op::LoadCbuf {
+                binding: 0,
+                byte_offset: 0x2d0,
+            },
+            Some(4),
+        );
+        let selected = program.emit(
+            Op::SelectPred {
+                pred: predicate,
+                if_true: Value::Inst(pointer),
+                if_false: Value::GprIn(4),
+            },
+            Some(4),
+        );
+        program.emit_void_pred(
+            Op::StoreGlobal {
+                addr_lo: Value::Inst(selected),
+                offset: 0x60,
+                value: Value::ImmU32(7),
+            },
+            Some(predicate),
+        );
+        let mut cfg = cfg_with_program(program);
+
+        let buffers = collect_storage_buffers(&mut cfg);
+
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].cbuf_binding, 0);
+        assert_eq!(buffers[0].cbuf_offset, 0x2d0);
+        assert!(matches!(
+            cfg.blocks[0].program.instructions[2].op,
+            Op::StoreStorage { .. }
+        ));
+
+        let mismatched = Predicate {
+            idx: 3,
+            negate: false,
+        };
+        let mut program = Program::new();
+        let pointer = program.emit(
+            Op::LoadCbuf {
+                binding: 0,
+                byte_offset: 0x2d0,
+            },
+            Some(4),
+        );
+        let selected = program.emit(
+            Op::SelectPred {
+                pred: predicate,
+                if_true: Value::Inst(pointer),
+                if_false: Value::GprIn(4),
+            },
+            Some(4),
+        );
+        program.emit_void_pred(
+            Op::StoreGlobal {
+                addr_lo: Value::Inst(selected),
+                offset: 0x60,
+                value: Value::ImmU32(7),
+            },
+            Some(mismatched),
+        );
+        let mut cfg = cfg_with_program(program);
+
+        let buffers = collect_storage_buffers(&mut cfg);
+
+        assert!(buffers.is_empty());
+        assert!(matches!(
+            cfg.blocks[0].program.instructions[2].op,
+            Op::StoreGlobal { .. }
+        ));
+    }
+
+    #[test]
+    fn odyssey_predicated_vector_global_load_rewrites_to_storage() {
+        let mut bytes = vec![0u8; 0x20];
+        write_word(&mut bytes, 0x08, 0x4c98_0780_0b42_0004);
+        write_word(&mut bytes, 0x10, 0xeed6_a000_0602_0404);
+        write_word(&mut bytes, 0x18, enc_exit());
+        let mut cfg = build_compute_cfg(&bytes);
+        let predicate = Predicate {
+            idx: 2,
+            negate: false,
+        };
+        let globals_before = cfg
+            .blocks
+            .iter()
+            .flat_map(|block| &block.program.instructions)
+            .filter(|instruction| matches!(instruction.op, Op::LoadGlobal { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(globals_before.len(), 4);
+        assert!(globals_before
+            .iter()
+            .all(|instruction| instruction.pred == Some(predicate)));
+
+        let buffers = collect_storage_buffers(&mut cfg);
+
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].cbuf_binding, 0);
+        assert_eq!(buffers[0].cbuf_offset, 0x2d0);
+        assert_eq!(buffers[0].required_size, 0x70);
+        assert!(cfg
+            .blocks
+            .iter()
+            .flat_map(|block| &block.program.instructions)
+            .all(|instruction| !matches!(instruction.op, Op::LoadGlobal { .. })));
+    }
+
+    #[test]
+    fn storage_buffer_collection_keeps_conditional_indirect_span_unresolved() {
+        let mut program = Program::new();
+        let root = program.emit(
+            Op::LoadCbuf {
+                binding: 0,
+                byte_offset: 0x128,
+            },
+            Some(8),
+        );
+        let child_pointer = program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(root),
+                offset: 0,
+            },
+            Some(8),
+        );
+        program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(root),
+                offset: 4,
+            },
+            Some(9),
+        );
+        let selected = program.emit(
+            Op::SelectPred {
+                pred: Predicate {
+                    idx: 0,
+                    negate: false,
+                },
+                if_true: Value::Inst(child_pointer),
+                if_false: Value::GprIn(8),
+            },
+            Some(8),
+        );
+        program.emit(
+            Op::LoadGlobal {
+                addr_lo: Value::Inst(selected),
                 offset: 0,
             },
             Some(12),

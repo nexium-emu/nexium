@@ -373,7 +373,7 @@ fn decode_texture_sample_form(raw: u64, bindless: bool) -> Option<TextureSampleF
     if lc
         || ndv
         || sparse_pred != PT
-        || !matches!(tex_type, 0 | 2 | 4 | 6 | 7)
+        || !matches!(tex_type, 0 | 2 | 3 | 4 | 6 | 7)
         || (aoffi && matches!(tex_type, 4 | 6 | 7))
         || mask == 0
     {
@@ -615,7 +615,11 @@ impl Translator {
             7 => self.read_reg(coord.wrapping_add(2)),
             _ => self.read_reg(coord.wrapping_add(1)),
         };
-        let array = (form.tex_type == 7).then(|| self.read_reg(coord));
+        let array = match form.tex_type {
+            3 => Some(self.read_reg(coord.wrapping_add(2))),
+            7 => Some(self.read_reg(coord)),
+            _ => None,
+        };
         let volume = (form.tex_type == 4).then(|| self.read_reg(coord.wrapping_add(2)));
         let cube = match form.tex_type {
             6 => Some(self.read_reg(coord.wrapping_add(2))),
@@ -2891,11 +2895,120 @@ impl Translator {
                 let rb = reg_b(raw);
                 let enc = (raw >> 53) & 0xF;
                 let is_texs = matches!(decoded.opcode, Opcode::TEXS);
-                let array_2d = is_texs && matches!(enc, 7 | 8);
+                let compute_sample = if is_texs && self.stage == ShaderStage::Compute {
+                    let sample = match enc {
+                        0 => (
+                            ImageDimension::D1,
+                            self.read_reg(ra),
+                            None,
+                            None,
+                            false,
+                            Some(Value::Zero),
+                        ),
+                        1 => (
+                            ImageDimension::D2,
+                            self.read_reg(ra),
+                            Some(self.read_reg(rb)),
+                            None,
+                            true,
+                            None,
+                        ),
+                        2 => (
+                            ImageDimension::D2,
+                            self.read_reg(ra),
+                            Some(self.read_reg(rb)),
+                            None,
+                            false,
+                            Some(Value::Zero),
+                        ),
+                        3 => (
+                            ImageDimension::D2,
+                            self.read_reg(ra),
+                            Some(self.read_reg(ra.wrapping_add(1))),
+                            None,
+                            false,
+                            Some(self.read_reg(rb)),
+                        ),
+                        10 => (
+                            ImageDimension::D3,
+                            self.read_reg(ra),
+                            Some(self.read_reg(ra.wrapping_add(1))),
+                            Some(self.read_reg(rb)),
+                            true,
+                            None,
+                        ),
+                        11 => (
+                            ImageDimension::D3,
+                            self.read_reg(ra),
+                            Some(self.read_reg(ra.wrapping_add(1))),
+                            Some(self.read_reg(rb)),
+                            false,
+                            Some(Value::Zero),
+                        ),
+                        12 => (
+                            ImageDimension::Cube,
+                            self.read_reg(ra),
+                            Some(self.read_reg(ra.wrapping_add(1))),
+                            Some(self.read_reg(rb)),
+                            true,
+                            None,
+                        ),
+                        13 => (
+                            ImageDimension::Cube,
+                            self.read_reg(ra),
+                            Some(self.read_reg(ra.wrapping_add(1))),
+                            Some(self.read_reg(rb)),
+                            false,
+                            Some(self.read_reg(rb.wrapping_add(1))),
+                        ),
+                        _ => {
+                            self.program.emit_void(Op::Unimplemented {
+                                opcode: decoded.opcode,
+                                raw,
+                            });
+                            self.unimplemented_count += 1;
+                            return false;
+                        }
+                    };
+                    Some(sample)
+                } else {
+                    None
+                };
+                let compute_fetch = if !is_texs && self.stage == ShaderStage::Compute {
+                    let fetch = match enc {
+                        0 => (ImageDimension::D1, self.read_reg(ra), None, None),
+                        2 => (
+                            ImageDimension::D2,
+                            self.read_reg(ra),
+                            Some(self.read_reg(rb)),
+                            None,
+                        ),
+                        7 => (
+                            ImageDimension::D3,
+                            self.read_reg(ra),
+                            Some(self.read_reg(ra.wrapping_add(1))),
+                            Some(self.read_reg(rb)),
+                        ),
+                        _ => {
+                            self.program.emit_void(Op::Unimplemented {
+                                opcode: decoded.opcode,
+                                raw,
+                            });
+                            self.unimplemented_count += 1;
+                            return false;
+                        }
+                    };
+                    Some(fetch)
+                } else {
+                    None
+                };
+                let array_2d = is_texs && matches!(enc, 7 | 8 | 9);
                 let tex_3d = is_texs && matches!(enc, 10 | 11);
+                let tex_cube = is_texs && matches!(enc, 12 | 13);
+                let paired_uv = is_texs && matches!(enc, 3 | 4 | 5 | 6);
                 let (u, v) = if array_2d {
                     (self.read_reg(ra.wrapping_add(1)), self.read_reg(rb))
-                } else if tex_3d {
+                } else if tex_3d || tex_cube || paired_uv {
                     (self.read_reg(ra), self.read_reg(ra.wrapping_add(1)))
                 } else {
                     (self.read_reg(ra), self.read_reg(rb))
@@ -2910,9 +3023,76 @@ impl Translator {
                 } else {
                     None
                 };
+                let cube = if tex_cube {
+                    Some(self.read_reg(rb))
+                } else {
+                    None
+                };
                 let tex_id = texs_tex_id(raw);
                 let swizzle = ((raw >> 50) & 0x7) as usize;
-                let implicit_lod = is_texs && matches!(enc, 1 | 7 | 10);
+                let implicit_lod = is_texs && matches!(enc, 1 | 4 | 7 | 10 | 12);
+                let explicit_lod = if is_texs {
+                    match enc {
+                        3 | 5 => Some(self.read_reg(rb)),
+                        13 => Some(self.read_reg(rb.wrapping_add(1))),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let dref = if is_texs {
+                    match enc {
+                        4 | 6 => Some(self.read_reg(rb)),
+                        5 | 9 => Some(self.read_reg(rb.wrapping_add(1))),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let handle = TextureHandleOrigin::Bound {
+                    cbuf_word_offset: tex_id,
+                };
+                let compact_texture_op = |component| {
+                    if let Some((dimension, u, v, w, implicit_lod, explicit_lod)) = compute_sample {
+                        Op::SampleTexHandle {
+                            handle,
+                            dimension,
+                            u,
+                            v,
+                            w,
+                            implicit_lod,
+                            lod_bias: None,
+                            explicit_lod,
+                            texel_offset: None,
+                            dref: None,
+                            component,
+                        }
+                    } else if let Some((dimension, x, y, z)) = compute_fetch {
+                        Op::TexelFetchHandle {
+                            handle,
+                            dimension,
+                            x,
+                            y,
+                            z,
+                            component,
+                        }
+                    } else {
+                        Op::SampleTex {
+                            tex_id,
+                            u,
+                            v,
+                            array,
+                            volume,
+                            cube,
+                            implicit_lod,
+                            lod_bias: None,
+                            explicit_lod,
+                            texel_offset: None,
+                            dref,
+                            component,
+                        }
+                    }
+                };
 
                 const RG_LUT: [u8; 8] = [1, 2, 4, 8, 1 | 2, 1 | 8, 2 | 8, 4 | 8];
                 const RGBA_LUT: [u8; 5] =
@@ -2932,23 +3112,7 @@ impl Translator {
                         if (mask >> component) & 1 == 0 {
                             continue;
                         }
-                        let id = self.program.emit(
-                            Op::SampleTex {
-                                tex_id,
-                                u,
-                                v,
-                                array,
-                                volume,
-                                cube: None,
-                                implicit_lod,
-                                lod_bias: None,
-                                explicit_lod: None,
-                                texel_offset: None,
-                                dref: None,
-                                component,
-                            },
-                            None,
-                        );
+                        let id = self.program.emit(compact_texture_op(component), None);
                         sampled.push(Value::Inst(id));
                     }
                     for (i, pair) in sampled.chunks(2).enumerate() {
@@ -2969,24 +3133,7 @@ impl Translator {
                             2 => dest_b,
                             _ => dest_b.wrapping_add(1),
                         };
-                        self.write_reg(
-                            dst_reg,
-                            Op::SampleTex {
-                                tex_id,
-                                u,
-                                v,
-                                array,
-                                volume,
-                                cube: None,
-                                implicit_lod,
-                                lod_bias: None,
-                                explicit_lod: None,
-                                texel_offset: None,
-                                dref: None,
-                                component,
-                            },
-                            pred,
-                        );
+                        self.write_reg(dst_reg, compact_texture_op(component), pred);
                         store_index += 1;
                     }
                 }
@@ -3206,12 +3353,13 @@ impl Translator {
                 let addr_lo = self.read_reg(addr_reg);
                 for w in 0..count {
                     let off = offset.wrapping_add((w * 4) as i32);
-                    let id = self.program.emit(
+                    let id = self.program.emit_pred(
                         Op::LoadGlobal {
                             addr_lo,
                             offset: off,
                         },
                         None,
+                        pred,
                     );
                     let dst = if dest == RZ {
                         RZ
@@ -3262,6 +3410,57 @@ impl Translator {
                         pred,
                     );
                 }
+            }
+
+            Opcode::RED => {
+                let operand = reg_dest(raw);
+                let addr_reg = reg_a(raw);
+                let size = ((raw >> 20) & 7) as u8;
+                let atomic_op = ((raw >> 23) & 7) as u8;
+                if size > 1 || (self.stage != ShaderStage::Compute && new_fs_ops_disabled()) {
+                    log::warn!(
+                        "RED non-32-bit size not yet lifted raw={:#018x} size={}",
+                        raw,
+                        size,
+                    );
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::RED,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                let is_signed = size == 1;
+                let op = match atomic_op {
+                    0 => ImageAtomicOp::Add,
+                    1 => ImageAtomicOp::Min,
+                    2 => ImageAtomicOp::Max,
+                    3 => ImageAtomicOp::Increment,
+                    4 => ImageAtomicOp::Decrement,
+                    5 => ImageAtomicOp::And,
+                    6 => ImageAtomicOp::Or,
+                    _ => ImageAtomicOp::Xor,
+                };
+                if is_signed && matches!(op, ImageAtomicOp::Increment | ImageAtomicOp::Decrement) {
+                    return true;
+                }
+                let offset = if addr_reg == RZ {
+                    ((raw >> 28) & 0xf_ffff) as i32
+                } else {
+                    (((((raw >> 28) & 0xf_ffff) as i64) << 44) >> 44) as i32
+                };
+                let addr_lo = self.read_reg(addr_reg);
+                let value = self.read_reg(operand);
+                self.program.emit_void_pred(
+                    Op::GlobalAtomic {
+                        addr_lo,
+                        offset,
+                        value,
+                        op,
+                        is_signed,
+                    },
+                    pred,
+                );
             }
 
             Opcode::LDL => {
@@ -3618,7 +3817,7 @@ impl Translator {
                 let (y, z) = match dimension {
                     ImageDimension::D1 | ImageDimension::Buffer => (None, None),
                     ImageDimension::D2 => (Some(self.read_reg(coord.wrapping_add(1))), None),
-                    ImageDimension::D3 => (
+                    ImageDimension::D3 | ImageDimension::Cube => (
                         Some(self.read_reg(coord.wrapping_add(1))),
                         Some(self.read_reg(coord.wrapping_add(2))),
                     ),
@@ -3951,9 +4150,11 @@ impl Translator {
             }
 
             Opcode::FLO_reg => {
-                let unsupported_modifiers = ((raw >> 40) & 0x3) != 0
-                    || ((raw >> 47) & 0x1) != 0
-                    || ((raw >> 48) & 0x1) != 0;
+                let tilde = ((raw >> 40) & 0x1) != 0;
+                let shift = ((raw >> 41) & 0x1) != 0;
+                let unsupported_modifiers = ((raw >> 47) & 0x1) != 0
+                    || ((raw >> 48) & 0x1) != 0
+                    || ((tilde || shift) && new_fs_ops_disabled());
                 if unsupported_modifiers {
                     self.program.emit_void(Op::Unimplemented {
                         opcode: Opcode::FLO_reg,
@@ -3962,8 +4163,101 @@ impl Translator {
                     self.unimplemented_count += 1;
                     return false;
                 }
-                let source = self.read_reg(reg_b(raw));
-                self.write_reg(reg_dest(raw), Op::FindUMsb { value: source }, pred);
+                let mut source = self.read_reg(reg_b(raw));
+                if tilde {
+                    source = self.emit_value(Op::ILop {
+                        a: Value::Zero,
+                        b: source,
+                        op: LogicOp::PassB,
+                        not_a: false,
+                        not_b: true,
+                    });
+                }
+                if shift {
+                    let msb = self.emit_value(Op::FindUMsb { value: source });
+                    let found_mask = self.emit_value(Op::ISet {
+                        cmp: ICmp::Ne,
+                        signed: false,
+                        a: msb,
+                        b: Value::ImmU32(0xFFFF_FFFF),
+                        bool_float: false,
+                    });
+                    let xor_mask = self.emit_value(Op::ILop {
+                        a: found_mask,
+                        b: Value::ImmU32(31),
+                        op: LogicOp::And,
+                        not_a: false,
+                        not_b: false,
+                    });
+                    self.write_reg(
+                        reg_dest(raw),
+                        Op::ILop {
+                            a: msb,
+                            b: xor_mask,
+                            op: LogicOp::Xor,
+                            not_a: false,
+                            not_b: false,
+                        },
+                        pred,
+                    );
+                } else {
+                    self.write_reg(reg_dest(raw), Op::FindUMsb { value: source }, pred);
+                }
+            }
+
+            Opcode::LEA_hi_reg => {
+                let neg = ((raw >> 37) & 1) != 0;
+                let x = ((raw >> 38) & 1) != 0;
+                let cc = ((raw >> 47) & 1) != 0;
+                let src_pred = ((raw >> 48) & 0x7) as u8;
+                if neg || x || cc || src_pred != PT || new_fs_ops_disabled() {
+                    log::debug!("LEA_hi_reg unsupported form raw={:#018x}", raw);
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::LEA_hi_reg,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                let scale = ((raw >> 28) & 0x1F) as u32;
+                let rc = ((raw >> 39) & 0xFF) as u8;
+                let base = self.read_reg(reg_b(raw));
+                let shifted = if scale == 0 {
+                    self.read_reg(rc)
+                } else {
+                    let lo = self.read_reg(reg_a(raw));
+                    let lo_part = self.emit_value(Op::IShr {
+                        a: lo,
+                        b: Value::ImmU32(32 - scale),
+                        signed: false,
+                    });
+                    if rc == RZ {
+                        lo_part
+                    } else {
+                        let hi = self.read_reg(rc);
+                        let hi_part = self.emit_value(Op::IShl {
+                            a: hi,
+                            b: Value::ImmU32(scale),
+                        });
+                        self.emit_value(Op::ILop {
+                            a: lo_part,
+                            b: hi_part,
+                            op: LogicOp::Or,
+                            not_a: false,
+                            not_b: false,
+                        })
+                    }
+                };
+                self.write_reg(
+                    reg_dest(raw),
+                    Op::IAdd {
+                        a: base,
+                        b: shifted,
+                        neg_a: false,
+                        neg_b: false,
+                    },
+                    pred,
+                );
             }
 
             Opcode::POPC_reg => {
@@ -4210,10 +4504,11 @@ impl Translator {
 
             Opcode::VOTE => {
                 let vote_mode = ((raw >> 48) & 0x3) as u8;
-                let mode = match (self.stage, vote_mode) {
-                    (ShaderStage::Compute, 0) => VoteMode::All,
-                    (ShaderStage::Compute, 1) => VoteMode::Any,
-                    (ShaderStage::Compute, 2) => VoteMode::Equal,
+                let vote_gated = self.stage != ShaderStage::Compute && new_fs_ops_disabled();
+                let mode = match (vote_mode, vote_gated) {
+                    (0, false) => VoteMode::All,
+                    (1, false) => VoteMode::Any,
+                    (2, false) => VoteMode::Equal,
                     _ => {
                         log::debug!(
                             "unsupported {:?} mode={} stage={:?} raw={:#018x}",
@@ -4268,6 +4563,11 @@ impl Translator {
         }
         true
     }
+}
+
+fn new_fs_ops_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("NEXIUM_DISABLE_NEW_FS_OPS").is_some())
 }
 
 impl Default for Translator {
@@ -5189,7 +5489,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_vote_modes_vtg_and_non_compute_vote_fail_closed() {
+    fn unsupported_vote_modes_vtg_fail_closed_and_graphics_vote_lowers() {
         let unsupported_mode = 0x50db_e380_0007_0001;
         assert_eq!(decode_one(unsupported_mode).unwrap().opcode, Opcode::VOTE);
         let mut compute = Translator::new_compute();
@@ -5213,8 +5513,18 @@ mod tests {
         assert_eq!(unsupported_vtg.unimplemented_count, 1);
 
         let mut graphics = Translator::new();
-        assert!(!graphics.translate(0x50d8_e380_0007_0001));
-        assert_eq!(graphics.unimplemented_count, 1);
+        assert!(graphics.translate(0x50d8_e380_0007_0001));
+        assert_eq!(graphics.unimplemented_count, 0);
+        assert!(matches!(
+            graphics.program.instructions.last(),
+            Some(Inst {
+                op: Op::SubgroupVote {
+                    mode: VoteMode::All,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -5229,6 +5539,261 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn compute_texs_2d_uses_bound_handle_and_metadata() {
+        let raw = 0xD822_00A0_5087_0500;
+        let mut t = Translator::new_compute();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(t.program.instructions.iter().all(|inst| matches!(
+            inst.op,
+            Op::SampleTexHandle {
+                handle: TextureHandleOrigin::Bound { cbuf_word_offset },
+                dimension: ImageDimension::D2,
+                u: Value::GprIn(u),
+                v: Some(Value::GprIn(v)),
+                w: None,
+                implicit_lod: true,
+                explicit_lod: None,
+                ..
+            } if cbuf_word_offset == texs_tex_id(raw) && u == reg_a(raw) && v == reg_b(raw)
+        )));
+    }
+
+    #[test]
+    fn compute_texs_2d_lod_level_uses_separate_v_and_lod() {
+        let raw = 0xD800_0000_0000_0000
+            | (3 << 53)
+            | (0x24 << 36)
+            | (u64::from(RZ) << 28)
+            | (6 << 20)
+            | (u64::from(PT) << 16)
+            | (4 << 8)
+            | 8;
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TEXS)
+        );
+        let mut t = Translator::new_compute();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::SampleTexHandle {
+                handle: TextureHandleOrigin::Bound {
+                    cbuf_word_offset: 0x24
+                },
+                dimension: ImageDimension::D2,
+                u: Value::GprIn(4),
+                v: Some(Value::GprIn(5)),
+                w: None,
+                implicit_lod: false,
+                explicit_lod: Some(Value::GprIn(6)),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn compute_tlds_lod_zero_uses_texel_fetch_handle() {
+        let raw = 0xDA00_0000_0000_0000
+            | (2 << 53)
+            | (0x24 << 36)
+            | (u64::from(RZ) << 28)
+            | (6 << 20)
+            | (u64::from(PT) << 16)
+            | (4 << 8)
+            | 8;
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TLDS)
+        );
+        let mut t = Translator::new_compute();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::TexelFetchHandle {
+                handle: TextureHandleOrigin::Bound {
+                    cbuf_word_offset: 0x24
+                },
+                dimension: ImageDimension::D2,
+                x: Value::GprIn(4),
+                y: Some(Value::GprIn(6)),
+                z: None,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn texs_cube_encoding_uses_xyz_and_implicit_lod() {
+        let raw = 0xD800_0000_0000_0000
+            | (12 << 53)
+            | (0x24 << 36)
+            | (u64::from(RZ) << 28)
+            | (6 << 20)
+            | (u64::from(PT) << 16)
+            | (4 << 8)
+            | 8;
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TEXS)
+        );
+        let mut t = Translator::new();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::SampleTex {
+                tex_id: 0x24,
+                u: Value::GprIn(4),
+                v: Value::GprIn(5),
+                array: None,
+                volume: None,
+                cube: Some(Value::GprIn(6)),
+                implicit_lod: true,
+                explicit_lod: None,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn texs_cube_ll_encoding_uses_register_after_z() {
+        let raw = 0xD800_0000_0000_0000
+            | (13 << 53)
+            | (0x24 << 36)
+            | (u64::from(RZ) << 28)
+            | (6 << 20)
+            | (u64::from(PT) << 16)
+            | (4 << 8)
+            | 8;
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TEXS)
+        );
+        let mut t = Translator::new();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::SampleTex {
+                tex_id: 0x24,
+                u: Value::GprIn(4),
+                v: Value::GprIn(5),
+                array: None,
+                volume: None,
+                cube: Some(Value::GprIn(6)),
+                implicit_lod: false,
+                explicit_lod: Some(Value::GprIn(7)),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn graphics_texs_encodings_match_hardware_operand_table() {
+        struct Expect {
+            enc: u64,
+            u: Value,
+            v: Value,
+            array: Option<Value>,
+            implicit_lod: bool,
+            explicit_lod: Option<Value>,
+            dref: Option<Value>,
+        }
+        let cases = [
+            Expect {
+                enc: 3,
+                u: Value::GprIn(4),
+                v: Value::GprIn(5),
+                array: None,
+                implicit_lod: false,
+                explicit_lod: Some(Value::GprIn(6)),
+                dref: None,
+            },
+            Expect {
+                enc: 4,
+                u: Value::GprIn(4),
+                v: Value::GprIn(5),
+                array: None,
+                implicit_lod: true,
+                explicit_lod: None,
+                dref: Some(Value::GprIn(6)),
+            },
+            Expect {
+                enc: 5,
+                u: Value::GprIn(4),
+                v: Value::GprIn(5),
+                array: None,
+                implicit_lod: false,
+                explicit_lod: Some(Value::GprIn(6)),
+                dref: Some(Value::GprIn(7)),
+            },
+            Expect {
+                enc: 6,
+                u: Value::GprIn(4),
+                v: Value::GprIn(5),
+                array: None,
+                implicit_lod: false,
+                explicit_lod: None,
+                dref: Some(Value::GprIn(6)),
+            },
+            Expect {
+                enc: 9,
+                u: Value::GprIn(5),
+                v: Value::GprIn(6),
+                array: Some(Value::GprIn(4)),
+                implicit_lod: false,
+                explicit_lod: None,
+                dref: Some(Value::GprIn(7)),
+            },
+        ];
+        for case in cases {
+            let raw = 0xD800_0000_0000_0000
+                | (case.enc << 53)
+                | (0x24 << 36)
+                | (u64::from(RZ) << 28)
+                | (6 << 20)
+                | (u64::from(PT) << 16)
+                | (4 << 8)
+                | 8;
+            assert_eq!(
+                decode_one(raw).map(|decoded| decoded.opcode),
+                Some(Opcode::TEXS)
+            );
+            let mut t = Translator::new();
+            assert!(t.translate(raw), "enc {}", case.enc);
+            assert_eq!(t.unimplemented_count, 0, "enc {}", case.enc);
+            assert!(
+                t.program.instructions.iter().any(|inst| matches!(
+                    inst.op,
+                    Op::SampleTex {
+                        tex_id: 0x24,
+                        u,
+                        v,
+                        array,
+                        volume: None,
+                        cube: None,
+                        implicit_lod,
+                        explicit_lod,
+                        dref,
+                        ..
+                    } if u == case.u
+                        && v == case.v
+                        && array == case.array
+                        && implicit_lod == case.implicit_lod
+                        && explicit_lod == case.explicit_lod
+                        && dref == case.dref
+                )),
+                "enc {} lowered as {:?}",
+                case.enc,
+                t.program.instructions
+            );
+        }
     }
 
     #[test]
@@ -6357,7 +6922,7 @@ mod tests {
     #[test]
     fn flo_reg_unsupported_modifiers_fail_closed() {
         let base = 0x5c30_0000_0017_0003u64;
-        for bit in [40, 41, 47, 48] {
+        for bit in [47, 48] {
             let raw = base | (1u64 << bit);
             assert_eq!(
                 decode_one(raw).map(|decoded| decoded.opcode),
@@ -6374,6 +6939,107 @@ mod tests {
                 }) if *failed == raw
             ));
         }
+    }
+
+    #[test]
+    fn flo_reg_tilde_and_shift_forms_lower() {
+        let tilde = 0x5c30_0000_0017_0003u64 | (1u64 << 40);
+        let mut t = Translator::new_compute();
+        assert!(t.translate(tilde));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(matches!(
+            t.program.instructions[0].op,
+            Op::ILop {
+                op: LogicOp::PassB,
+                not_b: true,
+                ..
+            }
+        ));
+        assert!(matches!(t.program.instructions[1].op, Op::FindUMsb { .. }));
+
+        let shift = 0x5c30_0000_0017_0003u64 | (1u64 << 41);
+        let mut t = Translator::new_compute();
+        assert!(t.translate(shift));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(matches!(t.program.instructions[0].op, Op::FindUMsb { .. }));
+        assert!(matches!(
+            t.program.instructions[1].op,
+            Op::ISet {
+                cmp: ICmp::Ne,
+                b: Value::ImmU32(0xFFFF_FFFF),
+                ..
+            }
+        ));
+        assert!(matches!(
+            t.program.instructions.last().unwrap().op,
+            Op::ILop {
+                op: LogicOp::Xor,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lea_hi_reg_scaled_pair_add_lowers() {
+        let raw = 0x5bdf_7f81_f037_0404u64;
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::LEA_hi_reg)
+        );
+        let mut t = Translator::new_compute();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(matches!(
+            t.program.instructions[0].op,
+            Op::IShr {
+                a: Value::GprIn(4),
+                b: Value::ImmU32(1),
+                signed: false,
+            }
+        ));
+        assert!(matches!(
+            t.program.instructions.last().unwrap().op,
+            Op::IAdd {
+                a: Value::GprIn(3),
+                neg_a: false,
+                neg_b: false,
+                ..
+            }
+        ));
+        assert_eq!(t.program.instructions.last().unwrap().dest_reg, Some(4));
+    }
+
+    #[test]
+    fn red_global_atomic_lowers_and_rejects_wide_sizes() {
+        for (raw, op, is_signed, offset) in [
+            (0xebf9_0000_0098_0002u64, ImageAtomicOp::Min, true, 0i32),
+            (0xebf9_0000_4118_0002u64, ImageAtomicOp::Max, true, 4),
+            (0xebf9_0000_0307_0002u64, ImageAtomicOp::Or, false, 0),
+        ] {
+            assert_eq!(
+                decode_one(raw).map(|decoded| decoded.opcode),
+                Some(Opcode::RED),
+                "raw={raw:#018x}"
+            );
+            let mut t = Translator::new_compute();
+            assert!(t.translate(raw), "raw={raw:#018x}");
+            assert_eq!(t.unimplemented_count, 0, "raw={raw:#018x}");
+            assert!(matches!(
+                t.program.instructions.last().unwrap().op,
+                Op::GlobalAtomic {
+                    addr_lo: Value::GprIn(0),
+                    value: Value::GprIn(2),
+                    offset: actual_offset,
+                    op: actual_op,
+                    is_signed: actual_signed,
+                } if actual_op == op && actual_signed == is_signed && actual_offset == offset
+            ));
+        }
+
+        let wide = 0xebf9_0000_0098_0002u64 | (2u64 << 20);
+        let mut t = Translator::new_compute();
+        assert!(!t.translate(wide));
+        assert_eq!(t.unimplemented_count, 1);
     }
 
     #[test]
@@ -6525,6 +7191,41 @@ mod tests {
             Op::SampleTex {
                 implicit_lod: false,
                 explicit_lod: Some(Value::GprIn(6)),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn direct_tex_2d_array_shadow_uses_xy_layer_and_dref() {
+        let raw = 0xc03e_00c0_b077_0406u64;
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TEX)
+        );
+
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert_eq!(t.program.instructions.len(), 1);
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst,
+            Inst {
+                op: Op::SampleTex {
+                    tex_id: 12,
+                    u: Value::GprIn(4),
+                    v: Value::GprIn(5),
+                    array: Some(Value::GprIn(6)),
+                    volume: None,
+                    cube: None,
+                    implicit_lod: true,
+                    lod_bias: None,
+                    explicit_lod: None,
+                    texel_offset: None,
+                    dref: Some(Value::GprIn(7)),
+                    component: 0,
+                },
+                dest_reg: Some(6),
                 ..
             }
         )));
@@ -6750,6 +7451,26 @@ mod tests {
     }
 
     #[test]
+    fn tex_b_handle_from_high_cbuf_bank_is_tagged() {
+        let raw = 0xdeba_0003_e037_0404;
+        let t = translate_tld(raw, 17, 0x1a0);
+        let texture_ids = t
+            .program
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::SampleTex { tex_id, .. } => Some(tex_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!texture_ids.is_empty());
+        assert!(texture_ids.iter().all(|texture_id| {
+            crate::decode_bindless_texture_id(*texture_id) == Some((17, 0x68, None))
+        }));
+    }
+
+    #[test]
     fn pps_tex_b_aoffi_extracts_signed_xy_after_bindless_handle() {
         for (raw, offset_mov, expected_x) in [
             (0xdeba_0033_a1e7_180c, 0x0100_0000_0017_f01f, 1),
@@ -6820,7 +7541,7 @@ mod tests {
             direct & !(0x7 << 51),
             direct & !(0xF << 31),
         ];
-        for tex_type in [1u64, 3, 5] {
+        for tex_type in [1u64, 5] {
             unsupported_bindless.push((bindless & !(0x7 << 28)) | (tex_type << 28));
             unsupported_direct.push((direct & !(0x7 << 28)) | (tex_type << 28));
         }

@@ -250,7 +250,7 @@ pub enum ComputeEmitError {
 pub enum SpirvEmitError {
     #[error("SPIR-V backend does not support indexed cbuf address mode {0:?}")]
     UnsupportedCbufAddressMode(CbufAddressMode),
-    #[error("graphics shader references cbuf bank {0}, outside Maxwell's 16 stage-local banks")]
+    #[error("graphics shader references cbuf bank {0}, outside Maxwell's 18 stage-local banks")]
     InvalidGraphicsCbufBinding(u8),
     #[error("graphics shader pair exceeds the 32-location varying interface")]
     TooManyGraphicsVaryings,
@@ -441,7 +441,9 @@ fn validate_spirv_ir(cfg: &Cfg, stage: Stage) -> Result<(), SpirvEmitError> {
                 | IrOp::StoreStorage { cbuf_binding, .. } => Some(*cbuf_binding),
                 _ => None,
             };
-            if let Some(binding) = binding.filter(|binding| *binding >= 16) {
+            if let Some(binding) =
+                binding.filter(|binding| u32::from(*binding) >= GFX_CBUF_STAGE_SLOTS)
+            {
                 return Err(SpirvEmitError::InvalidGraphicsCbufBinding(binding));
             }
         }
@@ -535,16 +537,16 @@ pub fn link_graphics_varyings(
 }
 
 const UBO_VEC4S: u32 = 4096;
-const CBUF_LOGICAL_SLOTS: u32 = 32;
-const CBUF_SLOT_VEC4S: u32 = UBO_VEC4S / CBUF_LOGICAL_SLOTS;
+const COMPUTE_CBUF_SLOT_VEC4S: u32 = UBO_VEC4S / 32;
 
-pub const GFX_CBUF_SLOTS: u32 = CBUF_LOGICAL_SLOTS;
+pub const GFX_CBUF_STAGE_SLOTS: u32 = 18;
+pub const GFX_CBUF_SLOTS: u32 = GFX_CBUF_STAGE_SLOTS * 2;
 pub const GFX_CBUF_DIRECTORY_WORDS: u32 = GFX_CBUF_SLOTS * 2;
 pub const GFX_CBUF_ZERO_WORD: u32 = GFX_CBUF_DIRECTORY_WORDS;
-pub const GFX_CBUF_PAYLOAD_WORD: u32 = 68;
+pub const GFX_CBUF_PAYLOAD_WORD: u32 = (GFX_CBUF_ZERO_WORD + 4) & !3;
 pub const GFX_CBUF_MAX_SIZE: u32 = 64 * 1024;
 pub const GFX_CBUF_MIN_SIZE: u32 = GFX_CBUF_PAYLOAD_WORD * 4;
-pub const COMPUTE_CBUF_SLOT_STRIDE: u32 = CBUF_SLOT_VEC4S * 16;
+pub const COMPUTE_CBUF_SLOT_STRIDE: u32 = COMPUTE_CBUF_SLOT_VEC4S * 16;
 pub const COMPUTE_CBUF_SIZE: u32 = UBO_VEC4S * 16;
 pub const COMPUTE_CBUF_SLOTS: usize = 8;
 pub const COMPUTE_CBUF_MAX_SIZE: u32 = UBO_VEC4S * 16;
@@ -617,6 +619,7 @@ pub const fn graphics_image_binding(
 }
 const SSBO_BINDING_BASE: u32 = GFX_BINDING_SSBO_BASE;
 pub const MAX_SSBO: u32 = 8;
+pub const MAX_COMPUTE_STORAGE_BUFFERS: u32 = 16;
 pub const COMPUTE_STORAGE_BUFFER_BINDING_BASE: u32 = 0x2000;
 const SHADER_LOOP_SAFETY_LIMIT: u32 = 0x2000;
 pub const MAX_COMPUTE_SHARED_MEMORY_SIZE: u32 = 64 * 1024;
@@ -726,7 +729,7 @@ pub struct Emitter {
     loop_carried: HashMap<BlockId, Vec<(ValueId, Word, Word, Option<u8>)>>,
     loop_safety_vars: HashMap<BlockId, Word>,
     current_block: Option<BlockId>,
-    cbuf_bindings_used: u32,
+    cbuf_bindings_used: u64,
     texs_ids_used: std::collections::BTreeSet<u32>,
     texture_slots: HashMap<u32, u32>,
     texture_numeric_manifest: Vec<GraphicsTextureResource>,
@@ -1093,7 +1096,14 @@ impl Emitter {
             pred_regs: [None; 7],
             pred_value_to_word: HashMap::new(),
             block_pred_exits: HashMap::new(),
-            ssbo_vars: vec![None; MAX_SSBO as usize],
+            ssbo_vars: vec![
+                None;
+                (if stage == Stage::Compute {
+                    MAX_COMPUTE_STORAGE_BUFFERS
+                } else {
+                    MAX_SSBO
+                }) as usize
+            ],
             ptr_storage_u32: None,
             return_block: None,
             sample_debug_slot: std::env::var("NEXIUM_FS_SAMPLE_SLOT")
@@ -1160,7 +1170,12 @@ impl Emitter {
             )
         };
         self.ptr_storage_u32 = Some(scalar_ptr);
-        let n = count.min(MAX_SSBO);
+        let max = if self.stage == Stage::Compute {
+            MAX_COMPUTE_STORAGE_BUFFERS
+        } else {
+            MAX_SSBO
+        };
+        let n = count.min(max);
         for i in 0..n {
             let var = self.b.variable(ptr_struct, None, storage_class, None);
             self.b
@@ -1714,20 +1729,6 @@ impl Emitter {
     }
 
     fn store_fragment_output_vec(&mut self, location: u32, value: Word) {
-        let value = {
-            use std::sync::OnceLock;
-            static SOLID: OnceLock<bool> = OnceLock::new();
-            let on = *SOLID.get_or_init(|| std::env::var_os("NEXIUM_FS_SOLID").is_some());
-            if on {
-                let one = self.const_f32(1.0f32.to_bits());
-                let zero = self.const_f32(0.0f32.to_bits());
-                self.b
-                    .composite_construct(self.vec4_t, None, [one, zero, one, one])
-                    .unwrap()
-            } else {
-                value
-            }
-        };
         let numeric_type = self.fragment_output_numeric_type(location);
         if self.fragment_output_map == 0 {
             let fc = self.frag_color_var_at(location);
@@ -2526,6 +2527,7 @@ impl Emitter {
                 ImageDimension::Buffer => rspirv::spirv::Dim::DimBuffer,
                 ImageDimension::D2 => rspirv::spirv::Dim::Dim2D,
                 ImageDimension::D3 => rspirv::spirv::Dim::Dim3D,
+                ImageDimension::Cube => rspirv::spirv::Dim::DimCube,
             };
             match resource.kind {
                 ComputeResourceKind::UniformTexelBuffer => {
@@ -2689,7 +2691,7 @@ impl Emitter {
                     .composite_construct(self.ivec2_t, None, [x, y])
                     .unwrap()
             }
-            ImageDimension::D3 => {
+            ImageDimension::D3 | ImageDimension::Cube => {
                 let y_value = self.lower_value(y.expect("3D image operation requires Y"));
                 let y = self.as_i32(y_value);
                 let z_value = self.lower_value(z.expect("3D image operation requires Z"));
@@ -2767,7 +2769,7 @@ impl Emitter {
                     .composite_construct(self.vec2_t, None, [u, v])
                     .unwrap()
             }
-            ImageDimension::D3 => {
+            ImageDimension::D3 | ImageDimension::Cube => {
                 let v = self.lower_value(v.expect("3D filtered sample requires V"));
                 let w = self.lower_value(w.expect("3D filtered sample requires W"));
                 self.b
@@ -2802,7 +2804,7 @@ impl Emitter {
                     let y = constant(self, y);
                     self.b.constant_composite(self.ivec2_t, [x, y])
                 }
-                ImageDimension::D3 | ImageDimension::Buffer => {
+                ImageDimension::D3 | ImageDimension::Cube | ImageDimension::Buffer => {
                     unreachable!("validated compute sample offset dimension")
                 }
             }
@@ -2859,7 +2861,7 @@ impl Emitter {
         } else {
             let component_count = match resource.resource.dimension {
                 ImageDimension::D1 | ImageDimension::Buffer => 1,
-                ImageDimension::D2 => 2,
+                ImageDimension::D2 | ImageDimension::Cube => 2,
                 ImageDimension::D3 => 3,
             };
             if component as u32 >= component_count {
@@ -2867,7 +2869,7 @@ impl Emitter {
             } else {
                 let result_t = match resource.resource.dimension {
                     ImageDimension::D1 | ImageDimension::Buffer => self.u32_t,
-                    ImageDimension::D2 => self.uvec2_t,
+                    ImageDimension::D2 | ImageDimension::Cube => self.uvec2_t,
                     ImageDimension::D3 => self.uvec3_t,
                 };
                 let dimensions = if resource.resource.dimension == ImageDimension::Buffer {
@@ -4287,10 +4289,10 @@ impl Emitter {
             } => {
                 let logical_binding = match self.stage {
                     Stage::Vertex => u32::from(*binding),
-                    Stage::Fragment => 16 + u32::from(*binding),
+                    Stage::Fragment => GFX_CBUF_STAGE_SLOTS + u32::from(*binding),
                     Stage::Compute => u32::from(*binding),
                 };
-                self.cbuf_bindings_used |= 1u32 << logical_binding;
+                self.cbuf_bindings_used |= 1u64 << logical_binding;
                 if self.stage == Stage::Compute {
                     let ubo_var = self.compute_cbuf_var(*binding);
                     let vec4_index = byte_offset / 16;
@@ -4327,10 +4329,10 @@ impl Emitter {
                 );
                 let logical_binding = match self.stage {
                     Stage::Vertex => u32::from(*binding),
-                    Stage::Fragment => 16 + u32::from(*binding),
+                    Stage::Fragment => GFX_CBUF_STAGE_SLOTS + u32::from(*binding),
                     Stage::Compute => u32::from(*binding),
                 };
-                self.cbuf_bindings_used |= 1u32 << logical_binding;
+                self.cbuf_bindings_used |= 1u64 << logical_binding;
                 let idx_f32 = self.lower_value(index);
                 let u32_t = self.u32_t;
                 let idx_u32 = self.b.bitcast(u32_t, None, idx_f32).unwrap();
@@ -4365,6 +4367,7 @@ impl Emitter {
             }
             IrOp::LoadGlobal { .. } => Some(self.f32_zero),
             IrOp::StoreGlobal { .. } => None,
+            IrOp::GlobalAtomic { .. } => None,
             IrOp::LoadLocal { addr } => {
                 let (pointer, in_bounds) = self.local_word_pointer(addr);
                 let loaded = self.b.load(self.u32_t, None, pointer, None, []).unwrap();
@@ -4434,34 +4437,72 @@ impl Emitter {
                         let u32_t = self.u32_t;
                         let addr_f = self.lower_value(addr_lo);
                         let addr_u = self.b.bitcast(u32_t, None, addr_f).unwrap();
-                        let eff = if *imm != 0 {
-                            let immc = self.const_u32(*imm as u32);
-                            self.b.i_add(u32_t, None, addr_u, immc).unwrap()
-                        } else {
-                            addr_u
-                        };
                         let logical_binding = match self.stage {
                             Stage::Vertex => u32::from(*cbuf_binding),
-                            Stage::Fragment => 16 + u32::from(*cbuf_binding),
+                            Stage::Fragment => GFX_CBUF_STAGE_SLOTS + u32::from(*cbuf_binding),
                             Stage::Compute => (*cbuf_binding as u32) & 0xF,
                         };
-                        self.cbuf_bindings_used |= 1u32 << logical_binding;
+                        self.cbuf_bindings_used |= 1u64 << logical_binding;
                         let base_f = self.lower_value(base_addr_lo);
                         let base_u = self.b.bitcast(u32_t, None, base_f).unwrap();
                         let mask = self.const_u32(!(align.saturating_sub(1)));
                         let base_a = self.b.bitwise_and(u32_t, None, base_u, mask).unwrap();
-                        let offset = self.b.i_sub(u32_t, None, eff, base_a).unwrap();
-                        let two = self.const_u32(2);
-                        let word = self
-                            .b
-                            .shift_right_logical(u32_t, None, offset, two)
-                            .unwrap();
-                        let zero2 = self.const_u32(0);
-                        let dac = self
-                            .b
-                            .access_chain(ptr_u, None, ssbo, [zero2, word])
-                            .unwrap();
-                        let val = self.b.load(u32_t, None, dac, None, []).unwrap();
+                        let emit_load = |emitter: &mut Self| {
+                            let eff = if *imm != 0 {
+                                let immc = emitter.const_u32(*imm as u32);
+                                emitter.b.i_add(u32_t, None, addr_u, immc).unwrap()
+                            } else {
+                                addr_u
+                            };
+                            let offset = emitter.b.i_sub(u32_t, None, eff, base_a).unwrap();
+                            let two = emitter.const_u32(2);
+                            let word = emitter
+                                .b
+                                .shift_right_logical(u32_t, None, offset, two)
+                                .unwrap();
+                            let zero = emitter.const_u32(0);
+                            let pointer = emitter
+                                .b
+                                .access_chain(ptr_u, None, ssbo, [zero, word])
+                                .unwrap();
+                            emitter.b.load(u32_t, None, pointer, None, []).unwrap()
+                        };
+                        let val = if let Some(predicate) = inst.pred {
+                            let guard = self.resolve_pred(predicate.idx, predicate.negate);
+                            let current_block = self
+                                .current_block
+                                .expect("storage load must be emitted inside a CFG block");
+                            let header_block = self
+                                .block_end_labels
+                                .get(&current_block)
+                                .copied()
+                                .unwrap_or(self.block_labels[&current_block]);
+                            let load_block = self.b.id();
+                            let merge_block = self.b.id();
+                            let false_value = self.const_u32(0);
+                            self.b
+                                .selection_merge(merge_block, rspirv::spirv::SelectionControl::NONE)
+                                .unwrap();
+                            self.b
+                                .branch_conditional(guard, load_block, merge_block, [])
+                                .unwrap();
+                            self.b.begin_block(Some(load_block)).unwrap();
+                            let loaded = emit_load(self);
+                            self.b.branch(merge_block).unwrap();
+                            self.b.begin_block(Some(merge_block)).unwrap();
+                            let result = self
+                                .b
+                                .phi(
+                                    u32_t,
+                                    None,
+                                    [(loaded, load_block), (false_value, header_block)],
+                                )
+                                .unwrap();
+                            self.block_end_labels.insert(current_block, merge_block);
+                            result
+                        } else {
+                            emit_load(self)
+                        };
                         Some(self.b.bitcast(self.f32_t, None, val).unwrap())
                     }
                     _ => Some(self.f32_zero),
@@ -4494,10 +4535,10 @@ impl Emitter {
                     };
                     let logical_binding = match self.stage {
                         Stage::Vertex => u32::from(*cbuf_binding),
-                        Stage::Fragment => 16 + u32::from(*cbuf_binding),
+                        Stage::Fragment => GFX_CBUF_STAGE_SLOTS + u32::from(*cbuf_binding),
                         Stage::Compute => (*cbuf_binding as u32) & 0xf,
                     };
-                    self.cbuf_bindings_used |= 1u32 << logical_binding;
+                    self.cbuf_bindings_used |= 1u64 << logical_binding;
                     let base_f = self.lower_value(base_addr_lo);
                     let base_u = self.b.bitcast(u32_t, None, base_f).unwrap();
                     let mask = self.const_u32(!(align.saturating_sub(1)));
@@ -4523,6 +4564,105 @@ impl Emitter {
                         value_u
                     };
                     self.b.store(pointer, stored, None, []).unwrap();
+                }
+                None
+            }
+            IrOp::StorageAtomic {
+                buffer_index,
+                addr_lo,
+                base_addr_lo,
+                imm,
+                value,
+                op,
+                is_signed,
+                cbuf_binding,
+                align,
+                ..
+            } => {
+                let ssbo = self
+                    .ssbo_vars
+                    .get(*buffer_index as usize)
+                    .copied()
+                    .flatten();
+                if let (Some(ssbo), Some(ptr_u)) = (ssbo, self.ptr_storage_u32) {
+                    let u32_t = self.u32_t;
+                    let addr_f = self.lower_value(addr_lo);
+                    let addr_u = self.b.bitcast(u32_t, None, addr_f).unwrap();
+                    let eff = if *imm != 0 {
+                        let immc = self.const_u32(*imm as u32);
+                        self.b.i_add(u32_t, None, addr_u, immc).unwrap()
+                    } else {
+                        addr_u
+                    };
+                    let logical_binding = match self.stage {
+                        Stage::Vertex => u32::from(*cbuf_binding),
+                        Stage::Fragment => GFX_CBUF_STAGE_SLOTS + u32::from(*cbuf_binding),
+                        Stage::Compute => (*cbuf_binding as u32) & 0xf,
+                    };
+                    self.cbuf_bindings_used |= 1u64 << logical_binding;
+                    let base_f = self.lower_value(base_addr_lo);
+                    let base_u = self.b.bitcast(u32_t, None, base_f).unwrap();
+                    let mask = self.const_u32(!(align.saturating_sub(1)));
+                    let base = self.b.bitwise_and(u32_t, None, base_u, mask).unwrap();
+                    let byte_offset = self.b.i_sub(u32_t, None, eff, base).unwrap();
+                    let two = self.const_u32(2);
+                    let word = self
+                        .b
+                        .shift_right_logical(u32_t, None, byte_offset, two)
+                        .unwrap();
+                    let zero = self.const_u32(0);
+                    let pointer = self
+                        .b
+                        .access_chain(ptr_u, None, ssbo, [zero, word])
+                        .unwrap();
+                    let value_f = self.lower_value(value);
+                    let value_u = self.b.bitcast(u32_t, None, value_f).unwrap();
+                    let scope = self.const_u32(Scope::Device as u32);
+                    let semantics = self.const_u32(MemorySemantics::NONE.bits());
+                    let data_type = if *is_signed {
+                        ImageAtomicType::S32
+                    } else {
+                        ImageAtomicType::U32
+                    };
+                    let current_block = self
+                        .current_block
+                        .expect("storage atomic must be emitted inside a CFG block");
+                    let entry = self
+                        .block_end_labels
+                        .get(&current_block)
+                        .copied()
+                        .unwrap_or(self.block_labels[&current_block]);
+                    if let Some(predicate) = inst.pred {
+                        let guard = self.resolve_pred(predicate.idx, predicate.negate);
+                        let atomic_block = self.b.id();
+                        let merge_block = self.b.id();
+                        self.b
+                            .selection_merge(merge_block, rspirv::spirv::SelectionControl::NONE)
+                            .unwrap();
+                        self.b
+                            .branch_conditional(guard, atomic_block, merge_block, [])
+                            .unwrap();
+                        self.b.begin_block(Some(atomic_block)).unwrap();
+                        let _ = self.emit_compute_image_atomic(
+                            *op,
+                            data_type,
+                            pointer,
+                            scope,
+                            semantics,
+                            value_u,
+                            atomic_block,
+                        );
+                        self.b.branch(merge_block).unwrap();
+                        self.b.begin_block(Some(merge_block)).unwrap();
+                        self.block_end_labels.insert(current_block, merge_block);
+                    } else {
+                        let (_, end) = self.emit_compute_image_atomic(
+                            *op, data_type, pointer, scope, semantics, value_u, entry,
+                        );
+                        if end != entry {
+                            self.block_end_labels.insert(current_block, end);
+                        }
+                    }
                 }
                 None
             }
@@ -7626,7 +7766,7 @@ impl Emitter {
         }
     }
 
-    fn set_image_type_depth(&mut self, image_type: Word) {
+    fn set_image_type_depth(&mut self, image_type: Word, depth: u32) {
         let instruction = self
             .b
             .module_mut()
@@ -7637,7 +7777,7 @@ impl Emitter {
                     && instruction.result_id == Some(image_type)
             })
             .expect("image type must exist");
-        instruction.operands[2] = Operand::LiteralBit32(1);
+        instruction.operands[2] = Operand::LiteralBit32(depth);
     }
 
     fn configure_depth_image_types(&mut self, cfg: &Cfg) {
@@ -7703,18 +7843,14 @@ impl Emitter {
             }
         }
 
-        for (usage, image_type, label) in [
+        for (usage, image_type, _label) in [
             (image_2d, self.image_t, "2D"),
             (image_2d_arrayed, self.image_arrayed_t, "2D array"),
             (image_cube, self.image_cube_t, "cube"),
             (image_cube_arrayed, self.image_cube_arrayed_t, "cube array"),
         ] {
             if usage[1] {
-                assert!(
-                    !usage[0],
-                    "mixed color and depth-compare {label} sampling needs separate descriptor arrays"
-                );
-                self.set_image_type_depth(image_type);
+                self.set_image_type_depth(image_type, if usage[0] { 2 } else { 1 });
             }
         }
     }
@@ -8001,7 +8137,7 @@ impl Emitter {
         self,
         cfg: &Cfg,
         required_output_locations: &[u32],
-    ) -> (Vec<u32>, u32) {
+    ) -> (Vec<u32>, u64) {
         let (words, mask, _ids, _) = self.finish_inner(cfg, required_output_locations);
         (words, mask)
     }
@@ -8010,7 +8146,7 @@ impl Emitter {
         self,
         cfg: &Cfg,
         required_output_locations: &[u32],
-    ) -> (Vec<u32>, u32, Vec<u32>) {
+    ) -> (Vec<u32>, u64, Vec<u32>) {
         let (words, mask, tex_ids, _) = self.finish_inner(cfg, required_output_locations);
         (words, mask, tex_ids)
     }
@@ -8019,7 +8155,7 @@ impl Emitter {
         self,
         cfg: &Cfg,
         required_output_locations: &[u32],
-    ) -> (Vec<u32>, u32, Vec<u32>, bool) {
+    ) -> (Vec<u32>, u64, Vec<u32>, bool) {
         self.finish_inner(cfg, required_output_locations)
     }
 
@@ -8035,7 +8171,7 @@ impl Emitter {
         mut self,
         cfg: &Cfg,
         required_output_locations: &[u32],
-    ) -> (Vec<u32>, u32, Vec<u32>, bool) {
+    ) -> (Vec<u32>, u64, Vec<u32>, bool) {
         validate_spirv_ir(cfg, self.stage)
             .unwrap_or_else(|error| panic!("nexium-spirv: refusing unsupported IR: {error}"));
         self.ir_constant_facts = nexium_shader::IrConstantFacts::analyze(cfg);
@@ -9226,14 +9362,18 @@ fn validate_compute_coordinates(
     y: Option<&IrValue>,
     z: Option<&IrValue>,
 ) -> Result<(), ComputeEmitError> {
-    if matches!(dimension, ImageDimension::D2 | ImageDimension::D3) && y.is_none() {
+    if matches!(
+        dimension,
+        ImageDimension::D2 | ImageDimension::D3 | ImageDimension::Cube
+    ) && y.is_none()
+    {
         return Err(ComputeEmitError::MissingCoordinate {
             handle,
             dimension,
             coordinate: "Y",
         });
     }
-    if dimension == ImageDimension::D3 && z.is_none() {
+    if matches!(dimension, ImageDimension::D3 | ImageDimension::Cube) && z.is_none() {
         return Err(ComputeEmitError::MissingCoordinate {
             handle,
             dimension,
@@ -9345,9 +9485,9 @@ fn validate_compute_options(
         cbuf_required_sizes[slot] = cbuf_required_sizes[slot].max(required);
     }
 
-    if options.num_storage_buffers > MAX_SSBO {
+    if options.num_storage_buffers > MAX_COMPUTE_STORAGE_BUFFERS {
         return Err(ComputeEmitError::UnsupportedOperation(format!(
-            "compute uses {} raw storage buffers, maximum is {MAX_SSBO}",
+            "compute uses {} raw storage buffers, maximum is {MAX_COMPUTE_STORAGE_BUFFERS}",
             options.num_storage_buffers
         )));
     }
@@ -9672,6 +9812,7 @@ fn validate_compute_options(
                 | IrOp::TexelFetch { .. }
                 | IrOp::LoadGlobal { .. }
                 | IrOp::StoreGlobal { .. }
+                | IrOp::GlobalAtomic { .. }
                 | IrOp::LoadAttr { .. }
                 | IrOp::StoreAttr { .. }
                 | IrOp::InterpAttr { .. }
@@ -9683,6 +9824,7 @@ fn validate_compute_options(
                             IrOp::TexelFetch { .. } => "legacy TexelFetch",
                             IrOp::LoadGlobal { .. } => "LoadGlobal",
                             IrOp::StoreGlobal { .. } => "StoreGlobal",
+                            IrOp::GlobalAtomic { .. } => "GlobalAtomic",
                             IrOp::LoadAttr { .. } => "LoadAttr",
                             IrOp::StoreAttr { .. } => "StoreAttr",
                             IrOp::InterpAttr { .. } => "InterpAttr",
@@ -9712,6 +9854,11 @@ pub fn emit_compute(
         COMPUTE_STORAGE_BUFFER_BINDING_BASE,
     );
     let (words, spirv_cbuf_bindings, _, _) = emitter.finish_inner(cfg, &[]);
+    let spirv_cbuf_bindings = u32::try_from(spirv_cbuf_bindings).map_err(|_| {
+        ComputeEmitError::UnsupportedOperation(
+            "compute cbuf binding mask exceeds its u32 ABI".to_owned(),
+        )
+    })?;
 
     let mut descriptors = Vec::with_capacity(
         options.resources.len()
@@ -9778,7 +9925,7 @@ pub fn emit_compute(
     })
 }
 
-pub fn emit_vertex_with_bindings(cfg: &Cfg, required_outputs: &[u32]) -> (Vec<u32>, u32) {
+pub fn emit_vertex_with_bindings(cfg: &Cfg, required_outputs: &[u32]) -> (Vec<u32>, u64) {
     Emitter::new(Stage::Vertex).finish_with_required_outputs_and_bindings(cfg, required_outputs)
 }
 
@@ -9848,25 +9995,25 @@ pub fn emit_vertex_with_bindings_opts(
     cfg: &Cfg,
     required_outputs: &[u32],
     opts: VertexOptions,
-) -> (Vec<u32>, u32, u32) {
+) -> (Vec<u32>, u64, u32) {
     let vec4s = cbuf_vec4s(cfg, if opts.inject_ubo_matrix { 4 } else { 1 }).max(UBO_VEC4S);
     let (words, mask) = Emitter::new_with_vertex_opts_sized(Stage::Vertex, opts, vec4s)
         .finish_with_required_outputs_and_bindings(cfg, required_outputs);
     (words, mask, vec4s * 16)
 }
 
-pub fn emit_fragment_with_bindings(cfg: &Cfg) -> (Vec<u32>, u32) {
+pub fn emit_fragment_with_bindings(cfg: &Cfg) -> (Vec<u32>, u64) {
     Emitter::new(Stage::Fragment).finish_with_required_outputs_and_bindings(cfg, &[])
 }
 
-pub fn emit_fragment_full(cfg: &Cfg) -> (Vec<u32>, u32, Vec<u32>, u32) {
+pub fn emit_fragment_full(cfg: &Cfg) -> (Vec<u32>, u64, Vec<u32>, u32) {
     emit_fragment_full_with_input_map(cfg, [0; 32])
 }
 
 pub fn emit_fragment_full_with_input_map(
     cfg: &Cfg,
     ps_input_map: [u8; 32],
-) -> (Vec<u32>, u32, Vec<u32>, u32) {
+) -> (Vec<u32>, u64, Vec<u32>, u32) {
     let (words, mask, tex_ids, cbuf_size, _) =
         emit_fragment_full_with_input_map_meta(cfg, ps_input_map);
     (words, mask, tex_ids, cbuf_size)
@@ -9875,7 +10022,7 @@ pub fn emit_fragment_full_with_input_map(
 pub fn emit_fragment_full_with_input_map_meta(
     cfg: &Cfg,
     ps_input_map: [u8; 32],
-) -> (Vec<u32>, u32, Vec<u32>, u32, bool) {
+) -> (Vec<u32>, u64, Vec<u32>, u32, bool) {
     emit_fragment_full_with_input_map_meta_outputs(cfg, ps_input_map, 1, 0)
 }
 
@@ -9884,7 +10031,7 @@ pub fn emit_fragment_full_with_input_map_meta_outputs(
     ps_input_map: [u8; 32],
     color_outputs: u32,
     output_map: u32,
-) -> (Vec<u32>, u32, Vec<u32>, u32, bool) {
+) -> (Vec<u32>, u64, Vec<u32>, u32, bool) {
     emit_fragment_full_with_input_map_meta_outputs_debug(
         cfg,
         ps_input_map,
@@ -9900,7 +10047,7 @@ pub fn emit_fragment_full_with_input_map_meta_outputs_debug(
     color_outputs: u32,
     output_map: u32,
     debug_active: bool,
-) -> (Vec<u32>, u32, Vec<u32>, u32, bool) {
+) -> (Vec<u32>, u64, Vec<u32>, u32, bool) {
     emit_fragment_full_with_alpha_test(
         cfg,
         ps_input_map,
@@ -9921,7 +10068,7 @@ pub fn emit_fragment_full_with_alpha_test(
     debug_active: bool,
     alpha_test_func: u32,
     alpha_test_ref: u32,
-) -> (Vec<u32>, u32, Vec<u32>, u32, bool) {
+) -> (Vec<u32>, u64, Vec<u32>, u32, bool) {
     emit_fragment_full_with_options(
         cfg,
         ps_input_map,
@@ -9944,7 +10091,7 @@ pub fn emit_fragment_full_with_options(
     alpha_test_func: u32,
     alpha_test_ref: u32,
     options: FragmentOptions,
-) -> (Vec<u32>, u32, Vec<u32>, u32, bool) {
+) -> (Vec<u32>, u64, Vec<u32>, u32, bool) {
     let vec4s = cbuf_vec4s(cfg, 1).max(UBO_VEC4S);
     let mut emitter = Emitter::new_sized(Stage::Fragment, vec4s);
     emitter.varying_map = options.varying_map;
@@ -10460,6 +10607,159 @@ mod tests {
             descriptor.binding == COMPUTE_STORAGE_BUFFER_BINDING_BASE
                 && descriptor.kind == ComputeDescriptorKind::StorageBuffer
         }));
+    }
+
+    #[test]
+    fn compute_predicated_raw_storage_load_uses_valid_vulkan_ssbo() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit_pred(
+            IrOp::LoadStorage {
+                buffer_index: 0,
+                addr_lo: IrValue::ImmU32(0xffff_f000),
+                base_addr_lo: IrValue::ImmU32(0x1000),
+                imm: 0x60,
+                cbuf_binding: 1,
+                cbuf_offset: 0,
+                align: 16,
+            },
+            Some(4),
+            Some(nexium_shader::Predicate {
+                idx: 2,
+                negate: false,
+            }),
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let mut options = ComputeOptions::default();
+        options.local_size = [32, 1, 1];
+        options.cbuf_sizes[1] = 16;
+        options.num_storage_buffers = 1;
+
+        let module = emit_compute(&cfg, &options).expect("predicated raw storage load");
+
+        validates_with_spirv_val_if_available(&module.words);
+        let parsed = rspirv::dr::load_words(&module.words).expect("valid SPIR-V");
+        let function = &parsed.functions[0];
+        let (header, load_block, merge_label) = function
+            .blocks
+            .iter()
+            .find_map(|header| {
+                let merge_label = header.instructions.iter().find_map(|instruction| {
+                    match (instruction.class.opcode, instruction.operands.first()) {
+                        (rspirv::spirv::Op::SelectionMerge, Some(Operand::IdRef(label))) => {
+                            Some(*label)
+                        }
+                        _ => None,
+                    }
+                })?;
+                let branch = header.instructions.last()?;
+                if branch.class.opcode != rspirv::spirv::Op::BranchConditional {
+                    return None;
+                }
+                let Operand::IdRef(true_label) = branch.operands[1] else {
+                    return None;
+                };
+                let Operand::IdRef(false_label) = branch.operands[2] else {
+                    return None;
+                };
+                if false_label != merge_label {
+                    return None;
+                }
+                let load_block = function.blocks.iter().find(|block| {
+                    block.label.as_ref().and_then(|label| label.result_id) == Some(true_label)
+                        && block.instructions.iter().any(|instruction| {
+                            instruction.class.opcode == rspirv::spirv::Op::AccessChain
+                        })
+                        && block
+                            .instructions
+                            .iter()
+                            .any(|instruction| instruction.class.opcode == rspirv::spirv::Op::Load)
+                })?;
+                Some((header, load_block, merge_label))
+            })
+            .expect("guarded storage load selection");
+        assert!(!header.instructions.iter().any(|instruction| matches!(
+            instruction.class.opcode,
+            rspirv::spirv::Op::AccessChain | rspirv::spirv::Op::Load
+        )));
+        assert!(load_block
+            .instructions
+            .iter()
+            .any(|instruction| { instruction.class.opcode == rspirv::spirv::Op::AccessChain }));
+        assert!(load_block
+            .instructions
+            .iter()
+            .any(|instruction| instruction.class.opcode == rspirv::spirv::Op::Load));
+        let merge_block = function
+            .blocks
+            .iter()
+            .find(|block| {
+                block.label.as_ref().and_then(|label| label.result_id) == Some(merge_label)
+            })
+            .expect("storage load merge block");
+        assert!(merge_block
+            .instructions
+            .iter()
+            .any(|instruction| instruction.class.opcode == rspirv::spirv::Op::Phi));
+        assert!(module.descriptors.iter().any(|descriptor| {
+            descriptor.binding == COMPUTE_STORAGE_BUFFER_BINDING_BASE
+                && descriptor.kind == ComputeDescriptorKind::StorageBuffer
+        }));
+    }
+
+    #[test]
+    fn compute_supports_maxwell_storage_buffer_limit() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit_void(IrOp::StoreStorage {
+            buffer_index: 10,
+            addr_lo: IrValue::ImmU32(0x1000),
+            base_addr_lo: IrValue::ImmU32(0x1000),
+            imm: 0,
+            value: IrValue::ImmU32(0x1234_5678),
+            cbuf_binding: 1,
+            cbuf_offset: 0,
+            align: 8,
+        });
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let mut options = ComputeOptions::default();
+        options.cbuf_sizes[1] = 16;
+        options.num_storage_buffers = 11;
+
+        let module = emit_compute(&cfg, &options).expect("eleven raw storage buffers");
+        validates_with_spirv_val_if_available(&module.words);
+        let storage_bindings = module
+            .descriptors
+            .iter()
+            .filter(|descriptor| descriptor.kind == ComputeDescriptorKind::StorageBuffer)
+            .map(|descriptor| descriptor.binding)
+            .collect::<Vec<_>>();
+        assert_eq!(storage_bindings.len(), 11);
+        assert_eq!(
+            storage_bindings.last(),
+            Some(&(COMPUTE_STORAGE_BUFFER_BINDING_BASE + 10))
+        );
+
+        options.num_storage_buffers = MAX_COMPUTE_STORAGE_BUFFERS;
+        let module = emit_compute(&cfg, &options).expect("maximum raw storage buffers");
+        assert_eq!(
+            module
+                .descriptors
+                .iter()
+                .filter(|descriptor| descriptor.kind == ComputeDescriptorKind::StorageBuffer)
+                .count(),
+            MAX_COMPUTE_STORAGE_BUFFERS as usize
+        );
+
+        options.num_storage_buffers = MAX_COMPUTE_STORAGE_BUFFERS + 1;
+        let error = emit_compute(&cfg, &options).expect_err("seventeen buffers must fail");
+        assert!(error.to_string().contains("maximum is 16"), "{error}");
     }
 
     #[test]
@@ -13320,6 +13620,83 @@ mod tests {
     }
 
     #[test]
+    fn mixed_color_and_depth_compare_2d_share_one_descriptor_array() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(
+            IrOp::SampleTex {
+                tex_id: 0,
+                u: IrValue::ImmF32(0.0),
+                v: IrValue::ImmF32(0.0),
+                array: None,
+                volume: None,
+                cube: None,
+                dref: None,
+                implicit_lod: true,
+                lod_bias: None,
+                explicit_lod: None,
+                texel_offset: None,
+                component: 0,
+            },
+            Some(0),
+        );
+        program.emit(
+            IrOp::SampleTex {
+                tex_id: 1,
+                u: IrValue::ImmF32(0.0),
+                v: IrValue::ImmF32(0.0),
+                array: None,
+                volume: None,
+                cube: None,
+                dref: Some(IrValue::ImmF32(0.5)),
+                implicit_lod: true,
+                lod_bias: None,
+                explicit_lod: None,
+                texel_offset: None,
+                component: 0,
+            },
+            Some(1),
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let (words, _, _, _, _) = emit_fragment_full_with_options(
+            &cfg,
+            [0; 32],
+            1,
+            0,
+            false,
+            0,
+            0,
+            FragmentOptions {
+                texture_numeric_manifest: vec![
+                    GraphicsTextureResource::new(0, 0, TextureNumericType::Float),
+                    GraphicsTextureResource::new(1, 1, TextureNumericType::Float),
+                ],
+                ..FragmentOptions::default()
+            },
+        );
+        assert!(validate_structured_cfg(&words).is_ok());
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let image = image_type_for_binding(&module, GFX_BINDING_FLOAT_2D);
+        assert_eq!(image.operands[2], Operand::LiteralBit32(2));
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        assert!(instructions
+            .iter()
+            .any(|inst| inst.class.opcode == rspirv::spirv::Op::ImageSampleImplicitLod));
+        assert!(instructions
+            .iter()
+            .any(|inst| inst.class.opcode == rspirv::spirv::Op::ImageSampleDrefImplicitLod));
+    }
+
+    #[test]
     fn mixed_sample_and_buffer_tld_keep_independent_numeric_types() {
         let mut program = nexium_shader::IrProgram::new();
         program.emit(
@@ -13953,7 +14330,7 @@ mod tests {
         let Some(Operand::IdRef(lod_id)) = samples[0].operands.get(3) else {
             panic!("explicit LOD operand must be an id");
         };
-        assert_graphics_cbuf_sample_operand(&module, *lod_id, 16, 0x40);
+        assert_graphics_cbuf_sample_operand(&module, *lod_id, GFX_CBUF_STAGE_SLOTS, 0x40);
     }
 
     #[test]
@@ -13992,7 +14369,7 @@ mod tests {
         let Some(Operand::IdRef(bias_id)) = samples[0].operands.get(3) else {
             panic!("LOD bias operand must be an id");
         };
-        assert_graphics_cbuf_sample_operand(&module, *bias_id, 16, 0x40);
+        assert_graphics_cbuf_sample_operand(&module, *bias_id, GFX_CBUF_STAGE_SLOTS, 0x40);
     }
 
     #[test]
@@ -16400,7 +16777,7 @@ mod tests {
             "the bounds-selected index must feed a later OpAccessChain"
         );
 
-        for literal in [44, 45, GFX_CBUF_ZERO_WORD, 0x2aa0, 0xffff_fffc] {
+        for literal in [48, 49, GFX_CBUF_ZERO_WORD, 0x2aa0, 0xffff_fffc] {
             assert!(
                 module.types_global_values.iter().any(|instruction| {
                     instruction.class.opcode == rspirv::spirv::Op::Constant
@@ -16467,11 +16844,47 @@ mod tests {
     }
 
     #[test]
-    fn graphics_cbuf_bank_sixteen_fails_closed() {
+    fn graphics_cbuf_banks_sixteen_and_seventeen_use_extended_directory() {
+        assert_eq!(GFX_CBUF_DIRECTORY_WORDS, 72);
+        assert_eq!(GFX_CBUF_ZERO_WORD, 72);
+        assert_eq!(GFX_CBUF_PAYLOAD_WORD, 76);
+        assert_eq!(GFX_CBUF_MIN_SIZE, 304);
+        assert_eq!(GFX_CBUF_PAYLOAD_WORD % 4, 0);
+
+        for binding in [16, 17] {
+            let mut program = nexium_shader::IrProgram::new();
+            program.emit(
+                IrOp::LoadCbuf {
+                    binding,
+                    byte_offset: 0,
+                },
+                Some(0),
+            );
+            let cfg = Cfg {
+                blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+                unimplemented: 0,
+                bindless_or_partners: Default::default(),
+            };
+
+            let (vertex_words, vertex_mask) = emit_vertex_with_bindings(&cfg, &[]);
+            validates_with_spirv_val_if_available(&vertex_words);
+            assert_eq!(vertex_mask, 1u64 << binding);
+
+            let (fragment_words, fragment_mask) = emit_fragment_with_bindings(&cfg);
+            validates_with_spirv_val_if_available(&fragment_words);
+            assert_eq!(
+                fragment_mask,
+                1u64 << (GFX_CBUF_STAGE_SLOTS + u32::from(binding))
+            );
+        }
+    }
+
+    #[test]
+    fn graphics_cbuf_bank_eighteen_fails_closed() {
         let mut program = nexium_shader::IrProgram::new();
         program.emit(
             IrOp::LoadCbuf {
-                binding: 16,
+                binding: 18,
                 byte_offset: 0,
             },
             Some(0),
@@ -16483,11 +16896,11 @@ mod tests {
         };
         assert_eq!(
             try_emit_vertex(&cfg),
-            Err(SpirvEmitError::InvalidGraphicsCbufBinding(16))
+            Err(SpirvEmitError::InvalidGraphicsCbufBinding(18))
         );
         assert_eq!(
             try_emit_fragment(&cfg),
-            Err(SpirvEmitError::InvalidGraphicsCbufBinding(16))
+            Err(SpirvEmitError::InvalidGraphicsCbufBinding(18))
         );
     }
 

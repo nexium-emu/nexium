@@ -121,6 +121,7 @@ pub enum ImageDimension {
     Buffer,
     D2,
     D3,
+    Cube,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -168,6 +169,7 @@ impl fmt::Display for ImageDimension {
             Self::Buffer => "buffer",
             Self::D2 => "2d",
             Self::D3 => "3d",
+            Self::Cube => "cube",
         })
     }
 }
@@ -424,6 +426,27 @@ pub enum Op {
         addr_lo: Value,
         offset: i32,
         value: Value,
+    },
+
+    GlobalAtomic {
+        addr_lo: Value,
+        offset: i32,
+        value: Value,
+        op: ImageAtomicOp,
+        is_signed: bool,
+    },
+
+    StorageAtomic {
+        buffer_index: u32,
+        addr_lo: Value,
+        base_addr_lo: Value,
+        imm: i32,
+        value: Value,
+        op: ImageAtomicOp,
+        is_signed: bool,
+        cbuf_binding: u8,
+        cbuf_offset: u32,
+        align: u32,
     },
 
     LoadLocal {
@@ -1031,6 +1054,30 @@ impl Inst {
                 offset,
                 value,
             } => write!(f, "StGbl [{addr_lo}+{offset:#x}], {value}"),
+            Op::GlobalAtomic {
+                addr_lo,
+                offset,
+                value,
+                op,
+                is_signed,
+            } => write!(
+                f,
+                "GblAtomic.{op:?}{} [{addr_lo}+{offset:#x}], {value}",
+                if *is_signed { ".s32" } else { ".u32" }
+            ),
+            Op::StorageAtomic {
+                buffer_index,
+                addr_lo,
+                imm,
+                value,
+                op,
+                is_signed,
+                ..
+            } => write!(
+                f,
+                "StorageAtomic.{op:?}{} ssbo{buffer_index}[{addr_lo}+{imm:#x}], {value}",
+                if *is_signed { ".s32" } else { ".u32" }
+            ),
             Op::LoadLocal { addr } => write!(f, "LdLcl [{addr}]"),
             Op::StoreLocal { addr, value } => write!(f, "StLcl [{addr}], {value}"),
             Op::LoadShared { addr } => write!(f, "LdShared [{addr}]"),

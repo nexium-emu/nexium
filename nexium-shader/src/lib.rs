@@ -31,10 +31,10 @@ pub use walk::{
 };
 
 const BINDLESS_TEXTURE_ID_TAG: u32 = 1 << 31;
-const BINDLESS_TEXTURE_BINDING_SHIFT: u32 = 27;
-const BINDLESS_TEXTURE_PRIMARY_SHIFT: u32 = 14;
+const BINDLESS_TEXTURE_BINDING_SHIFT: u32 = 26;
+const BINDLESS_TEXTURE_PRIMARY_SHIFT: u32 = 13;
+const BINDLESS_TEXTURE_BINDING_MASK: u32 = (1 << 5) - 1;
 const BINDLESS_TEXTURE_WORD_MASK: u32 = (1 << 13) - 1;
-const BINDLESS_TEXTURE_SECONDARY_MASK: u32 = (1 << BINDLESS_TEXTURE_PRIMARY_SHIFT) - 1;
 
 pub fn bindless_texture_id(cbuf_binding: u8, cbuf_word_offset: u32) -> u32 {
     bindless_texture_id_pair(cbuf_binding, cbuf_word_offset, None)
@@ -45,7 +45,7 @@ pub fn bindless_texture_id_pair(
     cbuf_word_offset: u32,
     cbuf_secondary_word_offset: Option<u32>,
 ) -> u32 {
-    assert!(cbuf_binding < 16);
+    assert!(u32::from(cbuf_binding) <= BINDLESS_TEXTURE_BINDING_MASK);
     let (primary, secondary) = match cbuf_secondary_word_offset {
         Some(secondary) if secondary < cbuf_word_offset => (secondary, Some(cbuf_word_offset)),
         Some(secondary) if secondary == cbuf_word_offset => (cbuf_word_offset, None),
@@ -53,7 +53,7 @@ pub fn bindless_texture_id_pair(
     };
     assert!(primary <= BINDLESS_TEXTURE_WORD_MASK);
     assert!(secondary.is_none_or(|word_offset| word_offset <= BINDLESS_TEXTURE_WORD_MASK));
-    let secondary = secondary.map_or(0, |word_offset| word_offset + 1);
+    let secondary = secondary.unwrap_or(primary);
     BINDLESS_TEXTURE_ID_TAG
         | (u32::from(cbuf_binding) << BINDLESS_TEXTURE_BINDING_SHIFT)
         | (primary << BINDLESS_TEXTURE_PRIMARY_SHIFT)
@@ -64,14 +64,15 @@ pub fn decode_bindless_texture_id(texture_id: u32) -> Option<(u8, u32, Option<u3
     if texture_id & BINDLESS_TEXTURE_ID_TAG == 0 {
         return None;
     }
-    let secondary = texture_id & BINDLESS_TEXTURE_SECONDARY_MASK;
-    if secondary > BINDLESS_TEXTURE_WORD_MASK + 1 {
+    let primary = (texture_id >> BINDLESS_TEXTURE_PRIMARY_SHIFT) & BINDLESS_TEXTURE_WORD_MASK;
+    let secondary = texture_id & BINDLESS_TEXTURE_WORD_MASK;
+    if secondary < primary {
         return None;
     }
     Some((
-        ((texture_id >> BINDLESS_TEXTURE_BINDING_SHIFT) & 0xF) as u8,
-        (texture_id >> BINDLESS_TEXTURE_PRIMARY_SHIFT) & BINDLESS_TEXTURE_WORD_MASK,
-        (secondary != 0).then(|| secondary - 1),
+        ((texture_id >> BINDLESS_TEXTURE_BINDING_SHIFT) & BINDLESS_TEXTURE_BINDING_MASK) as u8,
+        primary,
+        (secondary != primary).then_some(secondary),
     ))
 }
 
@@ -248,6 +249,43 @@ mod tests {
             unimplemented: 0,
             bindless_or_partners: Default::default(),
         }
+    }
+
+    #[test]
+    fn bindless_texture_ids_round_trip_five_bit_cbuf_banks() {
+        for binding in [0, 15, 16, 17, 31] {
+            for word_offset in [0, 1, 0x1ffe, 0x1fff] {
+                let texture_id = bindless_texture_id(binding, word_offset);
+                assert_eq!(
+                    decode_bindless_texture_id(texture_id),
+                    Some((binding, word_offset, None))
+                );
+            }
+
+            for (first, second) in [(0, 1), (0, 0x1fff), (0x1ffe, 0x1fff)] {
+                let texture_id = bindless_texture_id_pair(binding, second, Some(first));
+                assert_eq!(
+                    decode_bindless_texture_id(texture_id),
+                    Some((binding, first, Some(second)))
+                );
+                assert_eq!(
+                    texture_id,
+                    bindless_texture_id_pair(binding, first, Some(second))
+                );
+            }
+        }
+
+        assert_ne!(bindless_texture_id(0, 0), bindless_texture_id(16, 0));
+        assert_ne!(bindless_texture_id(1, 0), bindless_texture_id(17, 0));
+    }
+
+    #[test]
+    fn malformed_bindless_texture_id_fails_closed() {
+        let texture_id = BINDLESS_TEXTURE_ID_TAG
+            | (17 << BINDLESS_TEXTURE_BINDING_SHIFT)
+            | (5 << BINDLESS_TEXTURE_PRIMARY_SHIFT)
+            | 4;
+        assert_eq!(decode_bindless_texture_id(texture_id), None);
     }
 
     #[test]
