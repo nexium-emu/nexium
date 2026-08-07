@@ -83,6 +83,31 @@ fn sample_stats(buf: &[u8]) -> (usize, u64) {
     (nonzero, sum)
 }
 
+fn invalidate_block_linear_aliases(
+    mappings: &GpuMappings,
+    dst_gpu: u64,
+    dst_cpu: u64,
+    written_span: usize,
+) {
+    if written_span == 0 {
+        return;
+    }
+    let written_span = written_span as u64;
+    let mut aliases = mappings.gpu_regions_for_cpu_range(dst_cpu, written_span);
+    if !aliases
+        .iter()
+        .any(|(alias, available)| *alias == dst_gpu && *available >= written_span)
+    {
+        aliases.push((dst_gpu, written_span));
+    }
+    aliases.sort_unstable();
+    aliases.dedup();
+    for (alias, available) in aliases {
+        nexium_gpu::pitch_oracle::clear_pitch_range(alias, available);
+        nexium_gpu::tex_invalidate::bump_region(alias, available);
+    }
+}
+
 pub const MAXWELL_DMA_CLASS: u32 = 0xB0B5;
 
 const M_OFFSET_IN_UPPER: u32 = 0x100;
@@ -109,6 +134,10 @@ const M_SET_SRC_HEIGHT: u32 = 0x1CC;
 const M_SET_SRC_DEPTH: u32 = 0x1CD;
 const M_SET_SRC_LAYER: u32 = 0x1CE;
 const M_SET_SRC_ORIGIN: u32 = 0x1CF;
+
+pub(crate) fn method_requires_hard_boundary(method: u32) -> bool {
+    method == M_LAUNCH_DMA
+}
 
 const LAUNCH_SRC_LAYOUT_BIT: u32 = 7;
 const LAUNCH_DST_LAYOUT_BIT: u32 = 8;
@@ -219,6 +248,7 @@ pub struct MaxwellDma {
     pub draw_texture_blits: u64,
 
     clamp_log_count: u64,
+    guest_write_range: Option<(u64, u64)>,
 }
 
 impl MaxwellDma {
@@ -285,6 +315,10 @@ impl MaxwellDma {
             (self.src_addr(), src_stride.saturating_mul(lines)),
             (dst_addr, dst_stride.saturating_mul(lines)),
         ]
+    }
+
+    pub fn take_guest_write_range(&mut self) -> Option<(u64, u64)> {
+        self.guest_write_range.take()
     }
 
     fn rt_copy_record(&self, gpu_va: u64) -> Option<RtCopyRecord> {
@@ -926,6 +960,7 @@ impl MaxwellDma {
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
         mem_copy: &dyn Fn(u64, u64, usize) -> bool,
     ) {
+        self.guest_write_range = None;
         let src_layout = (flags >> LAUNCH_SRC_LAYOUT_BIT) & 1;
         let dst_layout = (flags >> LAUNCH_DST_LAYOUT_BIT) & 1;
         let multi_line = (flags >> LAUNCH_MULTI_LINE_BIT) & 1 != 0;
@@ -1202,7 +1237,7 @@ impl MaxwellDma {
 
         match (src_layout, dst_layout) {
             (LAYOUT_PITCH, LAYOUT_BLOCK_LINEAR) => {
-                self.blit_pitch_to_block(
+                let written_span = self.blit_pitch_to_block(
                     src_cpu,
                     src_limit,
                     dst_cpu,
@@ -1221,22 +1256,11 @@ impl MaxwellDma {
                     mem_read,
                     mem_write,
                 );
-                let dst_w = if self.dst_width != 0 {
-                    (self.dst_width as usize) * dst_bytes_per_element.max(1)
-                } else {
-                    line_length_dst
-                };
-                let dst_h = if self.dst_height != 0 {
-                    self.dst_height as usize
-                } else {
-                    line_count
-                };
-                let bh = ((self.dst_block_size >> 4) & 0xF) as u32;
-                nexium_gpu::tex_invalidate::bump_region(
-                    dst_gpu,
-                    tiled_size_bytes(dst_w, dst_h, bh) as u64,
-                );
-                copied_size = tiled_size_bytes(dst_w, dst_h, bh) as u64;
+                if written_span != 0 {
+                    invalidate_block_linear_aliases(mappings, dst_gpu, dst_cpu, written_span);
+                    self.guest_write_range = Some((dst_cpu, written_span as u64));
+                    copied_size = written_span as u64;
+                }
             }
             (LAYOUT_BLOCK_LINEAR, LAYOUT_PITCH) => {
                 let dst_pitch = (self.pitch_out as usize).max(line_length_src);
@@ -1643,7 +1667,7 @@ impl MaxwellDma {
         bytes_per_element: usize,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
-    ) {
+    ) -> usize {
         self.last_tiled_dst_cpu = dst_cpu;
 
         let block_height_log2 = ((self.dst_block_size >> 4) & 0xF) as u32;
@@ -1665,10 +1689,10 @@ impl MaxwellDma {
             .and_then(|last_row| last_row.checked_mul(src_pitch))
             .and_then(|last_row_off| last_row_off.checked_add(line_length_src))
         else {
-            return;
+            return 0;
         };
         if source_extent > src_limit {
-            return;
+            return 0;
         }
 
         let mut linear_src = vec![0u8; source_extent];
@@ -1676,7 +1700,7 @@ impl MaxwellDma {
             let src_off = src_cpu + (y * src_pitch) as u64;
             let row_off = y * src_pitch;
             if !mem_read(src_off, &mut linear_src[row_off..row_off + line_length_src]) {
-                return;
+                return 0;
             }
         }
         let post_remap = if remap_enable {
@@ -1742,11 +1766,13 @@ impl MaxwellDma {
                 mappings.describe_around(dst_gpu),
             );
         }
-        mem_write(dst_cpu, &tiled[..n]);
-        nexium_gpu::pitch_oracle::clear_pitch_range(dst_gpu, n as u64);
+        if !mem_write(dst_cpu, &tiled[..n]) {
+            return 0;
+        }
         self.last_tiled_dst_bh_log2 = block_height_log2;
         self.last_tiled_dst_stride = dst_width_bytes as u32;
         self.last_tiled_dst_height = dst_height as u32;
+        n
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2208,12 +2234,13 @@ fn unswizzle_block_linear_bytes(
 mod tests {
     use super::{
         active_gob_copy_plan, active_gob_copy_ranges_valid, copy_active_gobs,
-        exact_rt_copy_subresource_supported, in_gob_offset, swizzle_block_linear,
-        swizzle_block_linear_into, tiled_size_bytes, unswizzle_block_linear_bytes, LinearRtSource,
-        MaxwellDma, PendingRtSource, RtKey, RtSourceProvenance, GOB_H, GOB_SIZE, GOB_W,
-        LAUNCH_DST_LAYOUT_BIT, LAUNCH_MULTI_LINE_BIT, LAUNCH_REMAP_ENABLE_BIT,
-        LAUNCH_SRC_LAYOUT_BIT, M_LAUNCH_DMA, M_LINE_COUNT, M_LINE_LENGTH_IN, M_OFFSET_IN_LOWER,
-        M_OFFSET_IN_UPPER, M_OFFSET_OUT_LOWER, M_OFFSET_OUT_UPPER, M_PITCH_IN, M_PITCH_OUT,
+        exact_rt_copy_subresource_supported, in_gob_offset, method_requires_hard_boundary,
+        swizzle_block_linear, swizzle_block_linear_into, tiled_size_bytes,
+        unswizzle_block_linear_bytes, LinearRtSource, MaxwellDma, PendingRtSource, RtKey,
+        RtSourceProvenance, GOB_H, GOB_SIZE, GOB_W, LAUNCH_DST_LAYOUT_BIT, LAUNCH_MULTI_LINE_BIT,
+        LAUNCH_REMAP_ENABLE_BIT, LAUNCH_SRC_LAYOUT_BIT, M_LAUNCH_DMA, M_LINE_COUNT,
+        M_LINE_LENGTH_IN, M_OFFSET_IN_LOWER, M_OFFSET_IN_UPPER, M_OFFSET_OUT_LOWER,
+        M_OFFSET_OUT_UPPER, M_PITCH_IN, M_PITCH_OUT,
     };
     use crate::gpu::GpuMappings;
     use std::cell::{Cell, RefCell};
@@ -2222,6 +2249,14 @@ mod tests {
     const DST_GPU: u64 = 0x3000;
     const SRC_CPU: u64 = 0x1_0000;
     const DST_CPU: u64 = 0x1_1000;
+
+    #[test]
+    fn only_dma_launch_requires_hard_boundary() {
+        assert!(method_requires_hard_boundary(M_LAUNCH_DMA));
+        assert!(!method_requires_hard_boundary(M_OFFSET_IN_UPPER));
+        assert!(!method_requires_hard_boundary(M_LINE_LENGTH_IN));
+        assert!(!method_requires_hard_boundary(M_LAUNCH_DMA + 1));
+    }
 
     #[test]
     fn exact_rt_copy_accepts_only_single_layer_2d_subresources() {
@@ -2919,6 +2954,7 @@ mod tests {
         dma.launch_dma(flags, &mappings, &mem_read, &mem_write, &mem_copy);
         assert_eq!(dma.rt_copy_source(SECOND_GPU), Some((source, 42)));
         assert_eq!((reads.get(), writes.get(), copies.get()), (0, 0, 0));
+        assert_eq!(dma.take_guest_write_range(), None);
 
         let chained = dma.pending_copy_source(SECOND_GPU).unwrap();
         assert!(chained.virtual_block);
@@ -2928,6 +2964,7 @@ mod tests {
         dma.launch_dma(flags, &mappings, &mem_read, &mem_write, &mem_copy);
         assert_eq!(dma.rt_copy_source(THIRD_GPU), Some((source, 42)));
         assert_eq!((reads.get(), writes.get(), copies.get()), (0, 0, 0));
+        assert_eq!(dma.take_guest_write_range(), None);
     }
 
     #[test]
@@ -3040,6 +3077,159 @@ mod tests {
         assert_eq!(reads.get(), 2);
         assert_eq!(writes.get(), 1);
         assert_eq!(copies.get(), 0);
+    }
+
+    #[test]
+    fn pitch_to_block_invalidates_all_written_cpu_aliases() {
+        const SOURCE_GPU: u64 = 0xe1_0000;
+        const DEST_GPU: u64 = 0xe3_0000;
+        const ALIAS_GPU: u64 = 0xe5_0000;
+        const SOURCE_CPU: u64 = 0x81_0000;
+        const DEST_CPU: u64 = 0x83_0000;
+        const WIDTH: usize = 64;
+        const HEIGHT: usize = 8;
+        const WRITTEN_SPAN: usize = 0x180;
+
+        let mut mappings = GpuMappings::new();
+        mappings.add(SOURCE_GPU, 0x1000, SOURCE_CPU, 71);
+        mappings.add(DEST_GPU, WRITTEN_SPAN as u64, DEST_CPU, 72);
+        mappings.add(ALIAS_GPU, 0x1000, DEST_CPU, 73);
+
+        let source = (0..WIDTH * HEIGHT)
+            .map(|index| index.wrapping_mul(29).wrapping_add(7) as u8)
+            .collect::<Vec<_>>();
+        let destination = RefCell::new(vec![0u8; 0x1000]);
+        let writes = Cell::new(0usize);
+        let mem_read = |address: u64, output: &mut [u8]| {
+            if let Some(offset) = address.checked_sub(SOURCE_CPU) {
+                let offset = offset as usize;
+                if let Some(input) = source.get(offset..offset.saturating_add(output.len())) {
+                    output.copy_from_slice(input);
+                    return true;
+                }
+            }
+            if let Some(offset) = address.checked_sub(DEST_CPU) {
+                let offset = offset as usize;
+                if let Some(input) = destination
+                    .borrow()
+                    .get(offset..offset.saturating_add(output.len()))
+                {
+                    output.copy_from_slice(input);
+                    return true;
+                }
+            }
+            false
+        };
+        let mem_write = |address: u64, input: &[u8]| {
+            writes.set(writes.get() + 1);
+            assert_eq!(address, DEST_CPU);
+            assert_eq!(input.len(), WRITTEN_SPAN);
+            destination.borrow_mut()[..input.len()].copy_from_slice(input);
+            true
+        };
+
+        let mut dma = MaxwellDma::new();
+        dma.offset_in_lower = SOURCE_GPU as u32;
+        dma.offset_out_lower = DEST_GPU as u32;
+        dma.pitch_in = WIDTH as u32;
+        dma.line_length_in = WIDTH as u32;
+        dma.line_count = HEIGHT as u32;
+        dma.dst_width = WIDTH as u32;
+        dma.dst_height = HEIGHT as u32;
+
+        nexium_gpu::pitch_oracle::record_pitch_dst(DEST_GPU, 0x1000);
+        nexium_gpu::pitch_oracle::record_pitch_dst(ALIAS_GPU, 0x1000);
+        let exact_generation =
+            nexium_gpu::tex_invalidate::region_gen_range(DEST_GPU, WRITTEN_SPAN as u64);
+        let alias_generation =
+            nexium_gpu::tex_invalidate::region_gen_range(ALIAS_GPU, WRITTEN_SPAN as u64);
+
+        dma.launch_dma(
+            (1 << LAUNCH_SRC_LAYOUT_BIT) | (1 << LAUNCH_MULTI_LINE_BIT),
+            &mappings,
+            &mem_read,
+            &mem_write,
+            &|_, _, _| false,
+        );
+
+        assert_eq!(writes.get(), 1);
+        assert_eq!(
+            dma.take_guest_write_range(),
+            Some((DEST_CPU, WRITTEN_SPAN as u64))
+        );
+        assert_ne!(
+            nexium_gpu::tex_invalidate::region_gen_range(DEST_GPU, WRITTEN_SPAN as u64),
+            exact_generation
+        );
+        assert_ne!(
+            nexium_gpu::tex_invalidate::region_gen_range(ALIAS_GPU, WRITTEN_SPAN as u64),
+            alias_generation
+        );
+        assert!(!nexium_gpu::pitch_oracle::is_pitch_dst(DEST_GPU));
+        assert!(!nexium_gpu::pitch_oracle::is_pitch_dst(ALIAS_GPU));
+        assert!(nexium_gpu::pitch_oracle::is_pitch_dst(
+            DEST_GPU + WRITTEN_SPAN as u64
+        ));
+        assert!(nexium_gpu::pitch_oracle::is_pitch_dst(
+            ALIAS_GPU + WRITTEN_SPAN as u64
+        ));
+    }
+
+    #[test]
+    fn failed_pitch_to_block_write_preserves_alias_metadata() {
+        const SOURCE_GPU: u64 = 0xf1_0000;
+        const DEST_GPU: u64 = 0xf3_0000;
+        const ALIAS_GPU: u64 = 0xf5_0000;
+        const SOURCE_CPU: u64 = 0x91_0000;
+        const DEST_CPU: u64 = 0x93_0000;
+        const WIDTH: usize = 64;
+        const HEIGHT: usize = 8;
+
+        let mut mappings = GpuMappings::new();
+        mappings.add(SOURCE_GPU, 0x1000, SOURCE_CPU, 81);
+        mappings.add(DEST_GPU, 0x1000, DEST_CPU, 82);
+        mappings.add(ALIAS_GPU, 0x1000, DEST_CPU, 83);
+
+        let mut dma = MaxwellDma::new();
+        dma.offset_in_lower = SOURCE_GPU as u32;
+        dma.offset_out_lower = DEST_GPU as u32;
+        dma.pitch_in = WIDTH as u32;
+        dma.line_length_in = WIDTH as u32;
+        dma.line_count = HEIGHT as u32;
+        dma.dst_width = WIDTH as u32;
+        dma.dst_height = HEIGHT as u32;
+
+        nexium_gpu::pitch_oracle::record_pitch_dst(DEST_GPU, 0x1000);
+        nexium_gpu::pitch_oracle::record_pitch_dst(ALIAS_GPU, 0x1000);
+        let exact_generation = nexium_gpu::tex_invalidate::region_gen_range(DEST_GPU, 0x1000);
+        let alias_generation = nexium_gpu::tex_invalidate::region_gen_range(ALIAS_GPU, 0x1000);
+
+        dma.launch_dma(
+            (1 << LAUNCH_SRC_LAYOUT_BIT) | (1 << LAUNCH_MULTI_LINE_BIT),
+            &mappings,
+            &|_, output| {
+                output.fill(0x5a);
+                true
+            },
+            &|address, input| {
+                assert_eq!(address, DEST_CPU);
+                assert_eq!(input.len(), WIDTH * HEIGHT);
+                false
+            },
+            &|_, _, _| false,
+        );
+
+        assert_eq!(dma.take_guest_write_range(), None);
+        assert_eq!(
+            nexium_gpu::tex_invalidate::region_gen_range(DEST_GPU, 0x1000),
+            exact_generation
+        );
+        assert_eq!(
+            nexium_gpu::tex_invalidate::region_gen_range(ALIAS_GPU, 0x1000),
+            alias_generation
+        );
+        assert!(nexium_gpu::pitch_oracle::is_pitch_dst(DEST_GPU));
+        assert!(nexium_gpu::pitch_oracle::is_pitch_dst(ALIAS_GPU));
     }
 
     fn assert_active_gob_copy_matches_reference(

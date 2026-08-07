@@ -56,6 +56,18 @@ impl KeplerCompute {
         }
     }
 
+    pub(crate) fn method_requires_hard_boundary(&self, method: u32, is_last_call: bool) -> bool {
+        Self::method_is_launch(method) || self.method_writes_guest_memory(method, is_last_call)
+    }
+
+    pub(crate) fn method_is_launch(method: u32) -> bool {
+        method == M_LAUNCH
+    }
+
+    pub(crate) fn method_writes_guest_memory(&self, method: u32, is_last_call: bool) -> bool {
+        method == M_LOAD_INLINE_DATA && is_last_call && self.upload.copy_size > 0
+    }
+
     pub fn dispatch_method(
         &mut self,
         method: u32,
@@ -65,23 +77,30 @@ impl KeplerCompute {
         mappings: &GpuMappings,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
-    ) {
+        content_key: &dyn Fn(u64, usize) -> Option<u64>,
+    ) -> super::KeplerMemoryWriteOutcome {
         let index = method as usize;
         if index >= self.regs.len() {
             log::trace!("KeplerCompute: invalid method {:#x} arg={:#x}", method, arg);
-            return;
+            return super::KeplerMemoryWriteOutcome::NoWrite;
         }
 
         self.regs[index] = arg;
 
         match method {
-            M_EXEC_UPLOAD => self.upload.exec(arg, &self.regs),
+            M_EXEC_UPLOAD => {
+                self.upload.exec(arg, &self.regs);
+                super::KeplerMemoryWriteOutcome::NoWrite
+            }
             M_LOAD_INLINE_DATA => {
                 self.upload
                     .data(arg, is_last_call, mappings, mem_read, mem_write, &self.regs)
             }
-            M_LAUNCH => self.launch(renderer, mappings, mem_read, mem_write),
-            _ => {}
+            M_LAUNCH => {
+                self.launch(renderer, mappings, mem_read, mem_write, content_key);
+                super::KeplerMemoryWriteOutcome::NoWrite
+            }
+            _ => super::KeplerMemoryWriteOutcome::NoWrite,
         }
     }
 
@@ -91,11 +110,27 @@ impl KeplerCompute {
         mappings: &GpuMappings,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        content_key: &dyn Fn(u64, usize) -> Option<u64>,
     ) {
         let kp = crate::gpu::pusher::kickprof::start();
         let launch_gpu = (self.reg(M_LAUNCH_DESC_LOC) as u64) << 8;
         let launch_cpu = mappings.cpu_address_for(launch_gpu).unwrap_or(launch_gpu);
         let mut bytes = [0u8; LAUNCH_WORDS * 4];
+
+        if let (Some(renderer), Some((cpu_addr, available))) =
+            (renderer, mappings.cpu_range_for(launch_gpu))
+        {
+            if super::maxwell_compute::has_pending_writebacks()
+                && available >= bytes.len() as u64
+                && super::maxwell_compute::pending_writeback_overlaps(
+                    launch_gpu,
+                    cpu_addr,
+                    bytes.len(),
+                )
+            {
+                super::maxwell_compute::resolve_pending_writebacks(renderer, mappings, mem_write);
+            }
+        }
 
         if mem_read(launch_cpu, &mut bytes) {
             for i in 0..LAUNCH_WORDS {
@@ -138,10 +173,11 @@ impl KeplerCompute {
                 &self.launch_description,
                 code_base,
                 texture,
-                renderer.map(|renderer| renderer.as_ref()),
+                renderer,
                 mappings,
                 mem_read,
                 mem_write,
+                content_key,
             ) {
                 super::maxwell_compute::MaxwellComputeOutcome::Executed => {
                     backend = "vulkan-recompiler";
@@ -430,7 +466,7 @@ impl ComputeUpload {
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
         regs: &[u32],
-    ) {
+    ) -> super::KeplerMemoryWriteOutcome {
         let bytes = data.to_le_bytes();
         let off = self.write_offset;
         let mut n = 0;
@@ -440,9 +476,11 @@ impl ComputeUpload {
         }
         self.write_offset += n;
         if is_last_call && self.copy_size > 0 {
-            self.flush(mappings, mem_read, mem_write, regs);
+            let outcome = self.flush(mappings, mem_read, mem_write, regs);
             self.copy_size = 0;
+            return outcome;
         }
+        super::KeplerMemoryWriteOutcome::NoWrite
     }
 
     fn flush(
@@ -451,7 +489,7 @@ impl ComputeUpload {
         _mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
         regs: &[u32],
-    ) {
+    ) -> super::KeplerMemoryWriteOutcome {
         let kp = crate::gpu::pusher::kickprof::start();
         let dst_gpu =
             ((reg(regs, M_OFFSET_OUT_UPPER) as u64) << 32) | reg(regs, M_OFFSET_OUT_LOWER) as u64;
@@ -459,7 +497,7 @@ impl ComputeUpload {
         let line_count = reg(regs, M_LINE_COUNT).max(1) as usize;
         if dst_gpu == 0 || line_length == 0 {
             crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KCU_FLUSH, kp);
-            return;
+            return super::KeplerMemoryWriteOutcome::NoWrite;
         }
 
         if self.is_linear {
@@ -475,7 +513,8 @@ impl ComputeUpload {
                     mem_write(line_cpu, &self.inline_buf[src_off..src_end]);
                 }
             }
-            nexium_gpu::tex_invalidate::bump_region(dst_gpu, pitch * line_count as u64);
+            let span_bytes = pitch.saturating_mul(line_count as u64);
+            nexium_gpu::tex_invalidate::bump_region(dst_gpu, span_bytes);
             trace_upload(
                 dst_gpu,
                 line_length,
@@ -485,7 +524,7 @@ impl ComputeUpload {
                 self.inline_buf.len(),
             );
             crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KCU_FLUSH, kp);
-            return;
+            return super::KeplerMemoryWriteOutcome::Exact(vec![(dst_gpu, span_bytes as usize)]);
         }
 
         let Some((dst_cpu, dst_limit)) = mappings.cpu_range_for(dst_gpu) else {
@@ -494,7 +533,7 @@ impl ComputeUpload {
                 dst_gpu
             );
             crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KCU_FLUSH, kp);
-            return;
+            return super::KeplerMemoryWriteOutcome::Unknown;
         };
 
         let block_height_log2 = ((reg(regs, M_DST_BLOCK_SIZE) >> 4) & 0xF) as u32;
@@ -520,10 +559,15 @@ impl ComputeUpload {
             reg(regs, M_DST_ORIGIN_SAMPLES_Y) as usize,
         );
         let n = tiled.len().min(dst_limit as usize);
-        mem_write(dst_cpu, &tiled[..n]);
+        let written = mem_write(dst_cpu, &tiled[..n]);
         nexium_gpu::tex_invalidate::bump_region(dst_gpu, n as u64);
         trace_upload(dst_gpu, line_length, line_count, dst_width_bytes, false, n);
         crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KCU_FLUSH, kp);
+        if written {
+            super::KeplerMemoryWriteOutcome::Exact(vec![(dst_gpu, n)])
+        } else {
+            super::KeplerMemoryWriteOutcome::Unknown
+        }
     }
 }
 
@@ -595,7 +639,68 @@ fn trace_upload(
 
 #[cfg(test)]
 mod tests {
-    use super::{launch_invocations, parse_u64, LAUNCH_WORDS};
+    use super::super::super::GpuMappings;
+    use super::super::KeplerMemoryWriteOutcome;
+    use super::{
+        launch_invocations, parse_u64, KeplerCompute, LAUNCH_WORDS, M_EXEC_UPLOAD, M_LAUNCH,
+        M_LAUNCH_DESC_LOC, M_LINE_COUNT, M_LINE_LENGTH_IN, M_LOAD_INLINE_DATA, M_OFFSET_OUT_LOWER,
+        M_PITCH_OUT,
+    };
+
+    #[test]
+    fn terminal_inline_upload_reports_exact_written_span() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x4000, 0x1000, 0x1000, 1);
+        let mut compute = KeplerCompute::new();
+        let read = |_: u64, _: &mut [u8]| true;
+        let write = |_: u64, _: &[u8]| true;
+        let dispatch = |compute: &mut KeplerCompute, method: u32, arg: u32, is_last: bool| {
+            compute.dispatch_method(
+                method,
+                arg,
+                is_last,
+                None,
+                &mappings,
+                &read,
+                &write,
+                &|_, _| None,
+            )
+        };
+
+        dispatch(&mut compute, M_LINE_LENGTH_IN, 8, false);
+        dispatch(&mut compute, M_LINE_COUNT, 1, false);
+        dispatch(&mut compute, M_OFFSET_OUT_LOWER, 0x4000, false);
+        dispatch(&mut compute, M_PITCH_OUT, 8, false);
+        dispatch(&mut compute, M_EXEC_UPLOAD, 1, false);
+        assert_eq!(
+            dispatch(&mut compute, M_LOAD_INLINE_DATA, 0x1122_3344, false),
+            KeplerMemoryWriteOutcome::NoWrite
+        );
+        assert_eq!(
+            dispatch(&mut compute, M_LOAD_INLINE_DATA, 0x5566_7788, true),
+            KeplerMemoryWriteOutcome::Exact(vec![(0x4000, 8)])
+        );
+    }
+
+    #[test]
+    fn launch_and_terminal_inline_data_require_hard_boundary() {
+        let mut compute = KeplerCompute::new();
+        assert!(KeplerCompute::method_is_launch(M_LAUNCH));
+        assert!(!KeplerCompute::method_is_launch(M_LAUNCH_DESC_LOC));
+        assert!(!KeplerCompute::method_is_launch(M_LOAD_INLINE_DATA));
+        assert!(compute.method_requires_hard_boundary(M_LAUNCH, false));
+        assert!(!compute.method_writes_guest_memory(M_LAUNCH, false));
+        assert!(!compute.method_requires_hard_boundary(M_LAUNCH_DESC_LOC, true));
+        assert!(!compute.method_requires_hard_boundary(M_EXEC_UPLOAD, true));
+        assert!(!compute.method_requires_hard_boundary(M_LOAD_INLINE_DATA, true));
+        assert!(!compute.method_writes_guest_memory(M_LOAD_INLINE_DATA, true));
+
+        compute.upload.copy_size = 4;
+        assert!(!compute.method_requires_hard_boundary(M_LOAD_INLINE_DATA, false));
+        assert!(compute.method_requires_hard_boundary(M_LOAD_INLINE_DATA, true));
+        assert!(compute.method_writes_guest_memory(M_LOAD_INLINE_DATA, true));
+        assert!(!compute.method_writes_guest_memory(M_LAUNCH, true));
+    }
 
     #[test]
     fn invocation_count_multiplies_grid_and_block_dimensions() {

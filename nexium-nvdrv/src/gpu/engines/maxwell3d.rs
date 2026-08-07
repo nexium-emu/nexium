@@ -1,11 +1,20 @@
-use super::super::GpuMappings;
-use super::kepler_memory::KeplerMemory;
+#[cfg(test)]
+use super::kepler_memory::{KeplerMemory, KeplerMemoryWriteOutcome};
 
 pub const MAXWELL3D_CLASS: u32 = 0xB197;
+pub const GRAPHICS_CBUF_SLOTS: usize = nexium_spirv::GFX_CBUF_STAGE_SLOTS as usize;
+pub type GraphicsCbufBinds = [[(u64, u32); GRAPHICS_CBUF_SLOTS]; 5];
+
+#[derive(Clone, Copy)]
+pub struct GsDebugRegs {
+    pub post_vtg_masks: [u32; 8],
+    pub stage3_cbuf_binds: [(u64, u32); GRAPHICS_CBUF_SLOTS],
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SemaphoreWriteOrdering {
     RendererOrdered,
+    PayloadFence,
     SyntheticCounter,
 }
 
@@ -19,7 +28,14 @@ pub struct PendingSemaphoreWrite {
 
 impl PendingSemaphoreWrite {
     pub fn requires_renderer_completion(self) -> bool {
-        self.ordering == SemaphoreWriteOrdering::RendererOrdered
+        matches!(
+            self.ordering,
+            SemaphoreWriteOrdering::RendererOrdered | SemaphoreWriteOrdering::PayloadFence
+        )
+    }
+
+    pub fn can_complete_asynchronously(self) -> bool {
+        self.ordering == SemaphoreWriteOrdering::PayloadFence && !self.long
     }
 }
 
@@ -377,6 +393,8 @@ pub struct Maxwell3DRegisters {
     pub pending_semaphore_writes: Vec<PendingSemaphoreWrite>,
     pub pending_semaphore_acquires: Vec<(u64, u32, u32)>,
     pub pending_barrier_flushes: u32,
+    pub pending_fragment_barriers: u32,
+    pub pending_tiled_cache_barriers: u32,
     pub pending_texture_cache_invalidates: u32,
     pub sync_info: u32,
     pub clear_report_value: u32,
@@ -390,7 +408,7 @@ pub struct Maxwell3DRegisters {
     pub last_constbuf_addr: u64,
     pub last_constbuf_size: u32,
 
-    pub cbuf_binds: [[(u64, u32); 16]; 5],
+    pub cbuf_binds: GraphicsCbufBinds,
     pub tex_cb_index: u32,
     pub sampler_binding: u32,
     pub bindless_texture_const_buffer_slot: u32,
@@ -497,6 +515,8 @@ impl Default for Maxwell3DRegisters {
             pending_semaphore_writes: Vec::new(),
             pending_semaphore_acquires: Vec::new(),
             pending_barrier_flushes: 0,
+            pending_fragment_barriers: 0,
+            pending_tiled_cache_barriers: 0,
             pending_texture_cache_invalidates: 0,
             sync_info: 0,
             clear_report_value: 0,
@@ -507,7 +527,7 @@ impl Default for Maxwell3DRegisters {
             render_enable_override: 0,
             last_constbuf_addr: 0,
             last_constbuf_size: 0,
-            cbuf_binds: [[(0, 0); 16]; 5],
+            cbuf_binds: [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5],
             tex_cb_index: 0,
             sampler_binding: 0,
             bindless_texture_const_buffer_slot: 0,
@@ -581,7 +601,7 @@ pub struct DrawCall {
 
     pub shader_programs: [ShaderProgram; 6],
     pub program_region_gpu_va: u64,
-    pub cbuf_binds: [[(u64, u32); 16]; 5],
+    pub cbuf_binds: GraphicsCbufBinds,
     pub sampler_binding: u32,
     pub bindless_texture_const_buffer_slot: u32,
     pub tex_cb_index: u32,
@@ -643,6 +663,7 @@ pub struct DrawTextureCall {
 pub struct Maxwell3D {
     pub regs: Maxwell3DRegisters,
     pub reg_file: Vec<u32>,
+    reg_file_written: Vec<u8>,
     pub shadow_ram_control: u32,
     pub shadow_regs: Vec<u32>,
     pub macro_engine: super::MacroEngine,
@@ -651,7 +672,6 @@ pub struct Maxwell3D {
 
     pub pending_draws: Vec<DrawCall>,
 
-    inline_upload: KeplerMemory,
     pending_inline_upload_methods: Vec<(u32, u32)>,
     inline_indices: Vec<u32>,
     inline_u8_setup: Option<(usize, usize)>,
@@ -687,6 +707,11 @@ fn mme_trace() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_MME_TRACE").is_some())
 }
 
+fn viewport_enable_debug() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("NEXIUM_VPEN_DBG").is_some())
+}
+
 fn cbuf_bind_trace() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("NEXIUM_CBUF_BIND_TRACE").is_some())
@@ -708,11 +733,28 @@ fn synthetic_counter_value() -> u32 {
     C.fetch_add(0x1000, Ordering::Relaxed)
 }
 
+fn is_short_payload_fence(query: u32) -> bool {
+    let operation = query & 0x3;
+    let reduction_enabled = (query >> 3) & 1;
+    let sub_report = (query >> 5) & 0x7;
+    let dword_number = (query >> 21) & 1;
+    let report = (query >> 23) & 0x1f;
+    let short_query = (query >> 28) & 1;
+    operation == 0
+        && reduction_enabled == 0
+        && sub_report == 0
+        && dword_number == 0
+        && report == 0
+        && short_query == 1
+}
+
 fn report_semaphore_write_ordering(
-    operation: u32,
+    query: u32,
     raw_counter_reports: bool,
 ) -> Option<SemaphoreWriteOrdering> {
+    let operation = query & 0x3;
     match operation {
+        0 if is_short_payload_fence(query) => Some(SemaphoreWriteOrdering::PayloadFence),
         0 => Some(SemaphoreWriteOrdering::RendererOrdered),
         2 if !raw_counter_reports => Some(SemaphoreWriteOrdering::SyntheticCounter),
         2 => Some(SemaphoreWriteOrdering::RendererOrdered),
@@ -746,6 +788,7 @@ impl Maxwell3D {
         Self {
             regs: Maxwell3DRegisters::default(),
             reg_file: vec![0u32; 0xE00],
+            reg_file_written: vec![0; 0xE00],
             shadow_ram_control: 0,
             shadow_regs: vec![0u32; 0xE00],
             macro_engine: super::MacroEngine::new(),
@@ -754,7 +797,6 @@ impl Maxwell3D {
                 .map(|v| v != "0")
                 .unwrap_or(false),
             pending_draws: Vec::new(),
-            inline_upload: KeplerMemory::new(),
             pending_inline_upload_methods: Vec::new(),
             inline_indices: Vec::new(),
             inline_u8_setup: None,
@@ -782,6 +824,24 @@ impl Maxwell3D {
         *self.method_freq.entry(method).or_insert(0) += 1;
     }
 
+    pub(crate) fn is_pusher_passive_method(method: u32) -> bool {
+        (0x40..super::MACRO_REGISTERS_START).contains(&method)
+            && !matches!(method, 0x45..=0x49)
+            && Self::repeat_is_idempotent(method)
+    }
+
+    pub(crate) fn has_pending_pusher_work(&self) -> bool {
+        !self.pending_draws.is_empty()
+            || !self.pending_inline_upload_methods.is_empty()
+            || !self.regs.pending_constbuf_writes.is_empty()
+            || !self.regs.pending_semaphore_acquires.is_empty()
+            || !self.regs.pending_semaphore_writes.is_empty()
+            || self.regs.pending_barrier_flushes != 0
+            || self.regs.pending_fragment_barriers != 0
+            || self.regs.pending_tiled_cache_barriers != 0
+            || self.regs.pending_texture_cache_invalidates != 0
+    }
+
     pub fn take_top_methods(&mut self, n: usize) -> Vec<(u32, u64)> {
         if !self.method_profile_enabled {
             return Vec::new();
@@ -798,16 +858,23 @@ impl Maxwell3D {
             .any(|&(method, _)| method == 0x6C)
     }
 
-    pub(crate) fn process_inline_uploads(
-        &mut self,
-        mappings: &GpuMappings,
-        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
-        mem_write: &dyn Fn(u64, &[u8]) -> bool,
-    ) {
-        let methods = std::mem::take(&mut self.pending_inline_upload_methods);
-        for (method, arg) in methods {
-            self.inline_upload
-                .dispatch_method(method, arg, mappings, mem_read, mem_write);
+    pub(crate) fn has_pending_inline_uploads(&self) -> bool {
+        !self.pending_inline_upload_methods.is_empty()
+    }
+
+    pub(crate) fn take_pending_inline_uploads(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.pending_inline_upload_methods)
+    }
+
+    pub(crate) fn gs_debug_regs(&self) -> GsDebugRegs {
+        GsDebugRegs {
+            post_vtg_masks: std::array::from_fn(|index| {
+                self.reg_file
+                    .get(0x490 + index)
+                    .copied()
+                    .unwrap_or_default()
+            }),
+            stage3_cbuf_binds: self.regs.cbuf_binds[3],
         }
     }
 
@@ -922,10 +989,29 @@ impl Maxwell3D {
             }
         };
 
-        if !matches!(
-            method,
-            0x35D | 0x35E | 0x4C0 | 0x4C1 | 0x57A | 0x57B | 0x57C | 0x585 | 0x586 | 0x5F7 | 0x5F8
-        ) {
+        let m = method as usize;
+        let register_changed =
+            m >= self.reg_file.len() || self.reg_file_written[m] == 0 || self.reg_file[m] != arg;
+        if (register_changed
+            || (0x60..=0x6D).contains(&method)
+            || (0x8E4..=0x8F3).contains(&method))
+            && !matches!(
+                method,
+                0x35D
+                    | 0x35E
+                    | 0x4C0
+                    | 0x4C1
+                    | 0x47D
+                    | 0x57A
+                    | 0x57B
+                    | 0x57C
+                    | 0x585
+                    | 0x586
+                    | 0x5F7
+                    | 0x5F8
+                    | 0xB2
+            )
+        {
             self.draw_state_dirty_since_last_draw = true;
         }
 
@@ -964,6 +1050,11 @@ impl Maxwell3D {
 
         if (method as usize) < self.reg_file.len() {
             self.reg_file[method as usize] = arg;
+            self.reg_file_written[method as usize] = 1;
+        }
+
+        if !register_changed && Self::repeat_is_idempotent(method) {
+            return;
         }
 
         if (0x60..=0x6D).contains(&method) {
@@ -1017,16 +1108,27 @@ impl Maxwell3D {
         }
 
         match method {
-            0x44 | 0x378 | 0x3df | 0x47d => {
+            0x44 => {
                 self.regs.pending_barrier_flushes =
                     self.regs.pending_barrier_flushes.saturating_add(1);
                 trace_sync_method(method, arg, self.regs.pending_barrier_flushes);
             }
-            0xb2 => {
-                self.regs.sync_info = arg;
+            0x378 => {
                 self.regs.pending_barrier_flushes =
                     self.regs.pending_barrier_flushes.saturating_add(1);
+                self.regs.pending_fragment_barriers =
+                    self.regs.pending_fragment_barriers.saturating_add(1);
                 trace_sync_method(method, arg, self.regs.pending_barrier_flushes);
+            }
+            0x3df => {
+                self.regs.pending_barrier_flushes =
+                    self.regs.pending_barrier_flushes.saturating_add(1);
+                self.regs.pending_tiled_cache_barriers =
+                    self.regs.pending_tiled_cache_barriers.saturating_add(1);
+                trace_sync_method(method, arg, self.regs.pending_barrier_flushes);
+            }
+            0xb2 => {
+                self.regs.sync_info = arg;
             }
             0x3dd => {
                 self.regs.pending_barrier_flushes =
@@ -1077,8 +1179,7 @@ impl Maxwell3D {
                         );
                     }
                 }
-                if let Some(ordering) =
-                    report_semaphore_write_ordering(operation, raw_counter_reports())
+                if let Some(ordering) = report_semaphore_write_ordering(arg, raw_counter_reports())
                 {
                     let long = ((arg >> 28) & 1) == 0;
                     let value = if ordering == SemaphoreWriteOrdering::SyntheticCounter {
@@ -1288,7 +1389,7 @@ impl Maxwell3D {
             0x569 => self.regs.stencil_back.compare_op = arg,
             0x64B => {
                 self.regs.viewport_transform_en = arg & 1 != 0;
-                if std::env::var_os("NEXIUM_VPEN_DBG").is_some() {
+                if viewport_enable_debug() {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static N: AtomicU64 = AtomicU64::new(0);
                     let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1553,7 +1654,7 @@ impl Maxwell3D {
                         );
                     }
                 }
-                if stage < 5 && slot < 16 {
+                if stage < 5 && slot < GRAPHICS_CBUF_SLOTS {
                     self.regs.cbuf_binds[stage][slot] =
                         if valid { (cb_addr, cb_size) } else { (0, 0) };
                 }
@@ -1743,6 +1844,42 @@ impl Maxwell3D {
                 log::trace!("maxwell3d: write method {:#x} = {:#x}", method, arg);
             }
         }
+    }
+
+    fn repeat_is_idempotent(method: u32) -> bool {
+        !matches!(
+            method,
+            0x44 | 0x378
+                | 0x3DD
+                | 0x3DF
+                | 0x35D
+                | 0x35E
+                | 0x42B
+                | 0x47D
+                | 0x485
+                | 0x486
+                | 0x4C0
+                | 0x4C1
+                | 0x57A
+                | 0x57B
+                | 0x57C
+                | 0x585
+                | 0x586
+                | 0x5F7
+                | 0x5F8
+                | 0x674
+                | 0x6C3
+                | 0x8C4
+                | 0x8E2
+                | 0x8E3
+                | 0x904
+                | 0x90C
+                | 0x914
+                | 0x91C
+                | 0x924
+                | 0xB2
+        ) && !(0x60..=0x6D).contains(&method)
+            && !(0x8E4..=0x8F3).contains(&method)
     }
 
     fn push_draw(
@@ -2108,6 +2245,7 @@ impl Default for Maxwell3D {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::GpuMappings;
 
     #[test]
     fn synthetic_counter_report_does_not_require_renderer_completion() {
@@ -2135,6 +2273,148 @@ mod tests {
     }
 
     #[test]
+    fn inline_upload_drain_reports_each_terminal_write_in_order() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x4000, 0x100, 0x1000, 1);
+        let mut engine = Maxwell3D::new();
+        engine.pending_inline_upload_methods = vec![
+            (0x60, 4),
+            (0x61, 1),
+            (0x63, 0x4000),
+            (0x6c, 1),
+            (0x6d, 0x1122_3344),
+            (0x60, 4),
+            (0x61, 1),
+            (0x63, 0x4010),
+            (0x6c, 1),
+            (0x6d, 0x5566_7788),
+        ];
+        let read = |_: u64, _: &mut [u8]| true;
+        let write = |_: u64, _: &[u8]| true;
+        let mut outcomes = Vec::new();
+
+        let methods = engine.take_pending_inline_uploads();
+        assert!(engine.take_pending_inline_uploads().is_empty());
+        let mut upload = KeplerMemory::new();
+        for (method, arg) in methods {
+            let outcome = upload.dispatch_method(method, arg, &mappings, &read, &write);
+            if !matches!(outcome, KeplerMemoryWriteOutcome::NoWrite) {
+                outcomes.push(outcome);
+            }
+        }
+
+        assert_eq!(
+            outcomes,
+            vec![
+                KeplerMemoryWriteOutcome::Exact(vec![(0x4000, 4)]),
+                KeplerMemoryWriteOutcome::Exact(vec![(0x4010, 4)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_plain_short_payload_release_uses_async_fence_path() {
+        const SMO_PAYLOAD_FENCE: u32 = 0x1000_f010;
+        assert!(is_short_payload_fence(SMO_PAYLOAD_FENCE));
+        assert_eq!(
+            report_semaphore_write_ordering(SMO_PAYLOAD_FENCE, false),
+            Some(SemaphoreWriteOrdering::PayloadFence)
+        );
+        assert!(!is_short_payload_fence(SMO_PAYLOAD_FENCE & !(1 << 28)));
+        assert!(!is_short_payload_fence(SMO_PAYLOAD_FENCE | 2));
+        assert!(!is_short_payload_fence(SMO_PAYLOAD_FENCE | (1 << 23)));
+        assert!(!is_short_payload_fence(SMO_PAYLOAD_FENCE | (1 << 3)));
+        assert!(!is_short_payload_fence(SMO_PAYLOAD_FENCE | (1 << 5)));
+        assert!(!is_short_payload_fence(SMO_PAYLOAD_FENCE | (1 << 21)));
+    }
+
+    #[test]
+    fn pusher_passive_method_filter_excludes_all_work_emitting_methods() {
+        for method in [0x200, 0x280, 0x458, 0x700, 0x800, 0x8e0, 0x8e1] {
+            assert!(Maxwell3D::is_pusher_passive_method(method), "{method:#x}");
+        }
+
+        for method in [
+            0x3f,
+            0x44,
+            0x45,
+            0x46,
+            0x47,
+            0x48,
+            0x49,
+            0x35d,
+            0x35e,
+            0x378,
+            0x3dd,
+            0x3df,
+            0x42b,
+            0x47d,
+            0x485,
+            0x486,
+            0x4c0,
+            0x4c1,
+            0x57a,
+            0x57b,
+            0x57c,
+            0x585,
+            0x586,
+            0x5f7,
+            0x5f8,
+            0x674,
+            0x6c3,
+            0x8c4,
+            0x8e2,
+            0x8e3,
+            0x904,
+            0x90c,
+            0x914,
+            0x91c,
+            0x924,
+            0xb2,
+            crate::gpu::engines::MACRO_REGISTERS_START,
+        ] {
+            assert!(!Maxwell3D::is_pusher_passive_method(method), "{method:#x}");
+        }
+        for method in 0x60..=0x6d {
+            assert!(!Maxwell3D::is_pusher_passive_method(method), "{method:#x}");
+        }
+        for method in 0x8e4..=0x8f3 {
+            assert!(!Maxwell3D::is_pusher_passive_method(method), "{method:#x}");
+        }
+    }
+
+    #[test]
+    fn force_heavy_method_sync_is_state_only() {
+        let mut engine = Maxwell3D::new();
+        engine.draw_state_dirty_since_last_draw = false;
+        engine.dispatch_method(0x47d, 1, true);
+        assert_eq!(engine.regs.pending_barrier_flushes, 0);
+        assert_eq!(engine.reg_file[0x47d], 1);
+        assert!(!engine.draw_state_dirty_since_last_draw);
+
+        engine.dispatch_method(0xb2, 0x110001, true);
+        assert_eq!(engine.regs.sync_info, 0x110001);
+        assert_eq!(engine.regs.pending_barrier_flushes, 0);
+        assert!(!engine.draw_state_dirty_since_last_draw);
+
+        engine.dispatch_method(0x378, 1, true);
+        assert_eq!(engine.regs.pending_barrier_flushes, 1);
+        assert_eq!(engine.regs.pending_fragment_barriers, 1);
+        assert_eq!(engine.regs.pending_tiled_cache_barriers, 0);
+        assert_eq!(engine.regs.pending_texture_cache_invalidates, 0);
+
+        engine.dispatch_method(0x3df, 1, true);
+        assert_eq!(engine.regs.pending_barrier_flushes, 2);
+        assert_eq!(engine.regs.pending_fragment_barriers, 1);
+        assert_eq!(engine.regs.pending_tiled_cache_barriers, 1);
+
+        engine.dispatch_method(0x3dd, 1, true);
+        assert_eq!(engine.regs.pending_barrier_flushes, 3);
+        assert_eq!(engine.regs.pending_texture_cache_invalidates, 1);
+        assert!(engine.draw_state_dirty_since_last_draw);
+    }
+
+    #[test]
     fn face_state_methods_decode_in_order() {
         let mut engine = Maxwell3D::new();
         engine.dispatch_method(0x646, 1, true);
@@ -2156,7 +2436,7 @@ mod tests {
     #[test]
     fn constant_buffer_disable_clears_stale_binding() {
         let mut engine = Maxwell3D::new();
-        let slot = 3usize;
+        let slot = 17usize;
 
         engine.dispatch_method(0x8e0, 0x630, true);
         engine.dispatch_method(0x8e1, 0x12, true);
@@ -2469,5 +2749,46 @@ mod tests {
         assert_eq!(engine.pending_draws[0].depth_mode, 0);
         assert_eq!(engine.pending_draws[1].instance_count, 1);
         assert_eq!(engine.pending_draws[1].depth_mode, 1);
+    }
+
+    #[test]
+    fn legacy_continuation_survives_redundant_state_write() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x35f, 1, true);
+        engine.dispatch_method(0x586, 5, true);
+        engine.dispatch_method(0x35d, 4, true);
+        engine.dispatch_method(0x35e, 6, true);
+        engine.dispatch_method(0x585, 0, true);
+
+        engine.dispatch_method(0x35f, 1, true);
+        engine.dispatch_method(0x586, 5 | (1 << 26), true);
+        engine.dispatch_method(0x35d, 4, true);
+        engine.dispatch_method(0x35e, 6, true);
+        engine.dispatch_method(0x585, 0, true);
+
+        assert_eq!(engine.pending_draws.len(), 1);
+        assert_eq!(engine.pending_draws[0].instance_count, 2);
+        assert_eq!(engine.pending_draws[0].depth_mode, 1);
+    }
+
+    #[test]
+    fn first_zero_register_write_after_draw_is_a_state_change() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x586, 5, true);
+        engine.dispatch_method(0x35d, 4, true);
+        engine.dispatch_method(0x35e, 6, true);
+        engine.dispatch_method(0x585, 0, true);
+
+        engine.dispatch_method(0x4c3, 0, true);
+        engine.dispatch_method(0x586, 5 | (1 << 26), true);
+        engine.dispatch_method(0x35d, 4, true);
+        engine.dispatch_method(0x35e, 6, true);
+        engine.dispatch_method(0x585, 0, true);
+
+        assert_eq!(engine.pending_draws.len(), 2);
+        assert_eq!(engine.pending_draws[0].depth_func, 0x207);
+        assert_eq!(engine.pending_draws[1].depth_func, 0);
     }
 }

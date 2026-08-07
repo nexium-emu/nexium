@@ -8,7 +8,7 @@ pub mod maxwell_dma;
 pub mod sw_renderer;
 pub use fermi_2d::{Fermi2D, FERMI_2D_CLASS};
 pub use kepler_compute::{KeplerCompute, KEPLER_COMPUTE_CLASS};
-pub use kepler_memory::{KeplerMemory, KEPLER_MEMORY_CLASS};
+pub use kepler_memory::{KeplerMemory, KeplerMemoryWriteOutcome, KEPLER_MEMORY_CLASS};
 pub use macro_engine::{MacroEngine, MACRO_REGISTERS_START};
 pub use maxwell3d::{DrawCall, Maxwell3D, Maxwell3DRegisters, RenderTarget};
 pub use maxwell_dma::{MaxwellDma, MAXWELL_DMA_CLASS};
