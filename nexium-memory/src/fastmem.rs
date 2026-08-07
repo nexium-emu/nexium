@@ -62,7 +62,7 @@ mod sys {
         unsafe { VirtualProtect(ptr, len, p, &mut old) != 0 }
     }
 
-    pub fn take_write_watch(ptr: *mut u8, len: usize, addresses: &mut [usize]) -> Option<bool> {
+    pub fn take_write_watch(ptr: *mut u8, len: usize, addresses: &mut [usize]) -> Option<usize> {
         let mut count = addresses.len();
         let mut granularity = 0u32;
         let result = unsafe {
@@ -75,7 +75,7 @@ mod sys {
                 &mut granularity,
             )
         };
-        (result == 0).then_some(count != 0)
+        (result == 0).then_some(count)
     }
 }
 
@@ -135,6 +135,15 @@ mod sys {
 static ARENA: OnceLock<AtomicPtr<u8>> = OnceLock::new();
 static ARENA_WRITE_WATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static COMMITTED_RANGES: OnceLock<Mutex<Vec<CommittedRange>>> = OnceLock::new();
+static COMMIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn commit_generation() -> u64 {
+    COMMIT_GENERATION.load(Ordering::Relaxed)
+}
+
+pub fn write_watch_available() -> bool {
+    ARENA_WRITE_WATCH.load(Ordering::Acquire)
+}
 
 #[derive(Clone, Copy, Debug)]
 struct CommittedRange {
@@ -201,7 +210,11 @@ pub fn commit(va: u64, len: usize) -> Option<*mut u8> {
         );
         return None;
     }
+    let fresh = !is_committed(&ranges, va, end);
     update_commit_refs(&mut ranges, va, end, true);
+    if fresh {
+        COMMIT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
     Some(ptr)
 }
 
@@ -222,6 +235,9 @@ pub fn decommit(ptr: *mut u8, len: usize) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let released = update_commit_refs(&mut ranges, lo, hi, false);
+    if !released.is_empty() {
+        COMMIT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
     for (released_lo, released_hi) in released {
         let released_ptr = unsafe { base.add(released_lo as usize) };
         sys::decommit(released_ptr, (released_hi - released_lo) as usize);
@@ -286,8 +302,71 @@ pub fn take_write_watch(va: u64, len: usize) -> WriteWatchResult {
             addresses.resize(page_count, 0);
             let ptr = unsafe { base.add(lo as usize) };
             match sys::take_write_watch(ptr, query_len, &mut addresses) {
-                Some(false) => WriteWatchResult::Clean,
-                Some(true) => WriteWatchResult::Dirty,
+                Some(0) => WriteWatchResult::Clean,
+                Some(_) => WriteWatchResult::Dirty,
+                None => WriteWatchResult::Unavailable,
+            }
+        });
+        drop(ranges);
+        result
+    }
+}
+
+pub fn take_write_watch_spans(
+    va: u64,
+    len: usize,
+    spans: &mut Vec<(u64, usize)>,
+) -> WriteWatchResult {
+    #[cfg(not(windows))]
+    {
+        let _ = (va, len, spans);
+        return WriteWatchResult::Unavailable;
+    }
+
+    #[cfg(windows)]
+    {
+        if !ARENA_WRITE_WATCH.load(Ordering::Acquire) {
+            return WriteWatchResult::Unavailable;
+        }
+        let Some((lo, query_len)) = write_watch_query_range(va, len) else {
+            return WriteWatchResult::Unavailable;
+        };
+        let hi = lo + query_len as u64;
+        let base = arena();
+        if base.is_null() {
+            return WriteWatchResult::Unavailable;
+        }
+        let ranges = committed_ranges()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !is_committed(&ranges, lo, hi) {
+            return WriteWatchResult::Unavailable;
+        }
+        let page_count = query_len >> 12;
+        thread_local! {
+            static SPAN_ADDRESSES: std::cell::RefCell<Vec<usize>> = const {
+                std::cell::RefCell::new(Vec::new())
+            };
+        }
+        let result = SPAN_ADDRESSES.with(|addresses| {
+            let mut addresses = addresses.borrow_mut();
+            addresses.resize(page_count, 0);
+            let ptr = unsafe { base.add(lo as usize) };
+            match sys::take_write_watch(ptr, query_len, &mut addresses) {
+                Some(0) => WriteWatchResult::Clean,
+                Some(count) => {
+                    let base_addr = base as usize as u64;
+                    for &addr in addresses[..count.min(page_count)].iter() {
+                        let page_va = (addr as u64).saturating_sub(base_addr) & !0xfffu64;
+                        match spans.last_mut() {
+                            Some((last_va, last_len)) if *last_va + *last_len as u64 == page_va => {
+                                *last_len += 4096;
+                            }
+                            _ => spans.push((page_va, 4096)),
+                        }
+                    }
+                    WriteWatchResult::Dirty
+                }
                 None => WriteWatchResult::Unavailable,
             }
         });
