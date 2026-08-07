@@ -515,13 +515,14 @@ impl EmulationHandle {
                     .cpu
                     .take()
                     .expect("BootContext CPU not initialized");
-                let rustarmic_strict_memory =
-                    matches!(cpu_backend, nexium_core::cpu::CpuBackendKind::Rustarmic);
-                cpu.set_continue_on_null(!rustarmic_strict_memory);
+                let strict_null_memory =
+                    matches!(cpu_backend, nexium_core::cpu::CpuBackendKind::Rustarmic)
+                        || std::env::var_os("NEXIUM_STRICT_NULL").is_some();
+                cpu.set_continue_on_null(!strict_null_memory);
                 log::info!(
                     "cpu memory null policy: {}",
-                    if rustarmic_strict_memory {
-                        "strict fault (rustarmic)"
+                    if strict_null_memory {
+                        "strict fault"
                     } else {
                         "legacy continue (dynarmic)"
                     }
@@ -560,10 +561,11 @@ impl EmulationHandle {
                                         return;
                                     }
                                 };
-                                cpu_aux.set_continue_on_null(!matches!(
+                                let strict_null_memory = matches!(
                                     backend_aux,
                                     nexium_core::cpu::CpuBackendKind::Rustarmic
-                                ));
+                                ) || std::env::var_os("NEXIUM_STRICT_NULL").is_some();
+                                cpu_aux.set_continue_on_null(!strict_null_memory);
                                 let _g_aux = nexium_kernel::kernel::cpu_local::set_current_cpu(
                                     &mut cpu_aux,
                                     core_id,
@@ -632,22 +634,26 @@ impl EmulationHandle {
                                                 cpu_mut().unwrap().set_register(0, result as u64);
                                             }
                                             let pace_until = k.present_pace_until.take();
-                                            let should_yield =
-                                                k.yield_after_svc || pace_until.is_some();
+                                            let ready_yield = k.yield_after_svc;
                                             k.yield_after_svc = false;
-                                            if should_yield {
-                                                let state = match pace_until {
-                                                    Some(wake_at)
-                                                        if wake_at > std::time::Instant::now() =>
-                                                    {
+                                            match pace_until {
+                                                Some(wake_at)
+                                                    if wake_at > std::time::Instant::now() =>
+                                                {
+                                                    k.threads.yield_with_state(
+                                                        cpu_ref().unwrap(),
                                                         nexium_core::kernel::threads::ThreadState::Sleeping {
                                                             wake_at,
-                                                        }
-                                                    }
-                                                    _ => nexium_core::kernel::threads::ThreadState::Ready,
-                                                };
-                                                k.threads
-                                                    .yield_with_state(cpu_ref().unwrap(), state);
+                                                        },
+                                                    );
+                                                }
+                                                Some(_) => {
+                                                    k.try_yield_current_ready(cpu_ref().unwrap());
+                                                }
+                                                None if ready_yield => {
+                                                    k.try_yield_current_ready(cpu_ref().unwrap());
+                                                }
+                                                _ => {}
                                             }
                                         }
                                         drop(k);
@@ -658,10 +664,7 @@ impl EmulationHandle {
                                             slice_iters = 0;
                                             let mut k = kernel_aux.lock();
                                             if k.threads.has_ready_for_core(core_id as i32) {
-                                                k.threads.yield_with_state(
-                                                    cpu_ref().unwrap(),
-                                                    nexium_core::kernel::threads::ThreadState::Ready,
-                                                );
+                                                k.try_yield_current_ready(cpu_ref().unwrap());
                                             }
                                         }
                                     }
@@ -1218,7 +1221,7 @@ impl EmulationHandle {
                                         }
                                     }
                                 }
-                                let gpu_cpu = guard.nvdrv.gpu.mappings.lock().cpu_address_for(x19);
+                                let gpu_cpu = guard.nvdrv.gpu.mappings.read().cpu_address_for(x19);
                                 if let Some(gpu_cpu) = gpu_cpu {
                                     let mut backing = [0u8; 96];
                                     let base = gpu_cpu.saturating_sub(0x20);
@@ -1284,14 +1287,12 @@ impl EmulationHandle {
                             let n_threads = guard.threads.threads.len();
                             if n_ready > 0 {
                                 let from = guard.threads.current_handle();
-                                guard.threads.yield_with_state(
-                                    cpu,
-                                    nexium_core::kernel::threads::ThreadState::Ready,
-                                );
-                                no_svc_in_spin = 0;
-                                preempt_count += 1;
-                                if runtime_diagnostics && preempt_count % 512 == 1 {
-                                    log::info!("[preempt] #{} slice-expired pc={:#x}, yielded handle={:?}, ready_q={} total={}", preempt_count, pc_after, from, n_ready, n_threads);
+                                if guard.try_yield_current_ready(cpu) {
+                                    no_svc_in_spin = 0;
+                                    preempt_count += 1;
+                                    if runtime_diagnostics && preempt_count % 512 == 1 {
+                                        log::info!("[preempt] #{} slice-expired pc={:#x}, yielded handle={:?}, ready_q={} total={}", preempt_count, pc_after, from, n_ready, n_threads);
+                                    }
                                 }
                             } else if runtime_diagnostics {
                                 stuck_log_counter += 1;
@@ -1460,9 +1461,42 @@ impl EmulationHandle {
                                     f.addr, f.size, f.is_write, f.value, f.pc
                                 );
                                 }
-                                let mut stk = [0u8; 64];
+                                let mut stk = [0u8; 96];
                                 if guard.address_space.read(sp, &mut stk).is_ok() {
-                                    log::error!("  stack@SP[0..64] = {:02x?}", &stk[..]);
+                                    log::error!("  stack@SP[0..96] = {:02x?}", &stk[..]);
+                                }
+                                if std::env::var_os("NEXIUM_FAULT_CONTEXT").is_some() {
+                                    for reg in 19..=28u32 {
+                                        let addr = cpu.get_register(reg);
+                                        let mut head = [0u8; 32];
+                                        if addr >= 0x1_0000
+                                            && guard.address_space.read(addr, &mut head).is_ok()
+                                        {
+                                            log::error!(
+                                                "  mem@X{}({:#x})[0..32] = {:02x?}",
+                                                reg,
+                                                addr,
+                                                &head[..]
+                                            );
+                                            let pointee = u64::from_le_bytes(
+                                                head[..8].try_into().expect("eight-byte prefix"),
+                                            );
+                                            let mut nested = [0u8; 64];
+                                            if pointee >= 0x1_0000
+                                                && guard
+                                                    .address_space
+                                                    .read(pointee, &mut nested)
+                                                    .is_ok()
+                                            {
+                                                log::error!(
+                                                    "  mem@*X{}({:#x})[0..64] = {:02x?}",
+                                                    reg,
+                                                    pointee,
+                                                    &nested[..]
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                                 let mut prev = [0u8; 16];
                                 if pc >= 16 && guard.address_space.read(pc - 16, &mut prev).is_ok()
@@ -1520,18 +1554,19 @@ impl EmulationHandle {
                                 let from = guard.threads.current_handle();
                                 let ready_len = guard.threads.ready.len();
                                 guard.yield_after_svc = false;
-                                if let Some(cpu) = cpu_ref() {
-                                    let state = match pace_present {
-                                        Some(wake_at) if wake_at > std::time::Instant::now() => {
+                                let did_yield = cpu_ref().is_some_and(|cpu| match pace_present {
+                                    Some(wake_at) if wake_at > std::time::Instant::now() => guard
+                                        .threads
+                                        .yield_with_state(
+                                            cpu,
                                             nexium_core::kernel::threads::ThreadState::Sleeping {
                                                 wake_at,
-                                            }
-                                        }
-                                        _ => nexium_core::kernel::threads::ThreadState::Ready,
-                                    };
-                                    guard.threads.yield_with_state(cpu, state);
-                                }
-                                if reason != "present-pace" {
+                                            },
+                                        )
+                                        .is_some(),
+                                    _ => guard.try_yield_current_ready(cpu),
+                                });
+                                if did_yield && reason != "present-pace" {
                                     log::trace!(
                                         "[yield] reason={} from={:?} ready_before={}",
                                         reason,

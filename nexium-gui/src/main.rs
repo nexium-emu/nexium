@@ -110,7 +110,7 @@ fn main() -> Result<(), eframe::Error> {
             .with_icon(icon)
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([640.0, 480.0]),
-        renderer: eframe::Renderer::Glow,
+        renderer: eframe::Renderer::Wgpu,
         vsync: settings.vsync,
         ..Default::default()
     };

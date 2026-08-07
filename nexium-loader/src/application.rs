@@ -1,10 +1,11 @@
 use memmap2::Mmap;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 use crate::cnmt::{Cnmt, ContentType};
 use crate::container::{Nsp, PartitionFs, Xci};
-use crate::nca::{Nca, NcaContentType, NcaFsType};
+use crate::nca::{Nca, NcaContentType, NcaFsSection, NcaFsType};
 use crate::npdm::Npdm;
 use crate::nso::Nso;
 
@@ -57,14 +58,33 @@ pub fn detect(path: &str, mmap: &Mmap) -> ContainerKind {
     }
 }
 
+#[derive(Clone)]
 pub struct LazyRomfs {
     pub mmap: Arc<Mmap>,
     pub range: Range<usize>,
+    compressed: Option<CompressedRomfs>,
+}
+
+#[derive(Clone, Debug)]
+struct CompressedRomfs {
+    entries: Vec<CompressionEntry>,
+    virtual_size: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompressionEntry {
+    virtual_offset: u64,
+    physical_offset: u64,
+    compression_type: u8,
+    physical_size: u32,
 }
 
 impl LazyRomfs {
     pub fn len(&self) -> u64 {
-        (self.range.end - self.range.start) as u64
+        self.compressed
+            .as_ref()
+            .map(|storage| storage.virtual_size)
+            .unwrap_or((self.range.end - self.range.start) as u64)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -72,7 +92,179 @@ impl LazyRomfs {
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        &self.mmap[self.range.clone()]
+        if self.compressed.is_some() {
+            &[]
+        } else {
+            &self.mmap[self.range.clone()]
+        }
+    }
+
+    pub fn is_compressed(&self) -> bool {
+        self.compressed.is_some()
+    }
+
+    pub fn read(&self, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+        let available = self.len().saturating_sub(offset).min(size as u64) as usize;
+        if available == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(storage) = &self.compressed else {
+            let start = self.range.start + offset as usize;
+            return Ok(self.mmap[start..start + available].to_vec());
+        };
+
+        let mut output = vec![0; available];
+        let mut done = 0usize;
+        while done < available {
+            let position = offset + done as u64;
+            let index = storage
+                .entries
+                .partition_point(|entry| entry.virtual_offset <= position)
+                .checked_sub(1)
+                .ok_or_else(|| format!("compressed RomFS has no entry for {position:#x}"))?;
+            let entry = storage.entries[index];
+            let entry_end = storage
+                .entries
+                .get(index + 1)
+                .map(|next| next.virtual_offset)
+                .unwrap_or(storage.virtual_size);
+            if entry_end <= position {
+                return Err(format!("invalid compressed RomFS extent at {position:#x}"));
+            }
+            let within = (position - entry.virtual_offset) as usize;
+            let take = available
+                .saturating_sub(done)
+                .min((entry_end - position) as usize);
+            match entry.compression_type {
+                0 => {
+                    let physical = self.range.start
+                        + usize::try_from(entry.physical_offset)
+                            .map_err(|_| "physical offset overflow")?
+                        + within;
+                    let end = physical.checked_add(take).ok_or("physical read overflow")?;
+                    if end > self.range.end {
+                        return Err(format!(
+                            "compressed RomFS raw read {physical:#x}..{end:#x} out of range"
+                        ));
+                    }
+                    output[done..done + take].copy_from_slice(&self.mmap[physical..end]);
+                }
+                1 => {}
+                3 => {
+                    let physical = self.range.start
+                        + usize::try_from(entry.physical_offset)
+                            .map_err(|_| "physical offset overflow")?;
+                    let physical_end = physical
+                        .checked_add(entry.physical_size as usize)
+                        .ok_or("compressed read overflow")?;
+                    if physical_end > self.range.end {
+                        return Err(format!("compressed RomFS LZ4 read {physical:#x}..{physical_end:#x} out of range"));
+                    }
+                    let virtual_size = usize::try_from(entry_end - entry.virtual_offset)
+                        .map_err(|_| "virtual extent too large")?;
+                    let block = lz4_flex::block::decompress(
+                        &self.mmap[physical..physical_end],
+                        virtual_size,
+                    )
+                    .map_err(|err| {
+                        format!("compressed RomFS LZ4 decode at {position:#x}: {err}")
+                    })?;
+                    output[done..done + take].copy_from_slice(&block[within..within + take]);
+                }
+                kind => return Err(format!("unsupported RomFS compression type {kind}")),
+            }
+            done += take;
+        }
+        Ok(output)
+    }
+
+    fn from_section(mmap: Arc<Mmap>, section: &NcaFsSection) -> Result<Self, String> {
+        let compressed = section
+            .compression
+            .as_ref()
+            .map(|info| CompressedRomfs::parse(&mmap, &section.fs_data_range, info))
+            .transpose()?;
+        Ok(Self {
+            mmap,
+            range: section.fs_data_range.clone(),
+            compressed,
+        })
+    }
+}
+
+impl CompressedRomfs {
+    fn parse(
+        mmap: &Mmap,
+        data: &Range<usize>,
+        info: &crate::nca::NcaCompressionInfo,
+    ) -> Result<Self, String> {
+        const NODE_SIZE: usize = 0x4000;
+        const ENTRY_SIZE: usize = 0x18;
+        let per_node = (NODE_SIZE - 0x10) / ENTRY_SIZE;
+        let entry_sets = (info.entry_count as usize + per_node - 1) / per_node;
+        let offsets_per_node = (NODE_SIZE - 0x10) / 8;
+        let l2_nodes = if entry_sets <= offsets_per_node {
+            0
+        } else {
+            let initial = (entry_sets + offsets_per_node - 1) / offsets_per_node;
+            (entry_sets - (offsets_per_node - (initial - 1)) + offsets_per_node - 1)
+                / offsets_per_node
+        };
+        let node_size = (1 + l2_nodes) * NODE_SIZE;
+        let table = data
+            .start
+            .checked_add(info.bucket_offset as usize)
+            .ok_or("compression table overflow")?;
+        let table_end = table
+            .checked_add(info.bucket_size as usize)
+            .ok_or("compression table overflow")?;
+        if table_end > data.end || table + node_size + entry_sets * NODE_SIZE > table_end {
+            return Err(format!(
+                "compression table {table:#x}..{table_end:#x} is truncated"
+            ));
+        }
+        let virtual_size = u64::from_le_bytes(mmap[table + 8..table + 16].try_into().unwrap());
+        let entry_base = table + node_size;
+        let mut entries = Vec::with_capacity(info.entry_count as usize);
+        for set in 0..entry_sets {
+            let set_base = entry_base + set * NODE_SIZE;
+            let index = i32::from_le_bytes(mmap[set_base..set_base + 4].try_into().unwrap());
+            let count = i32::from_le_bytes(mmap[set_base + 4..set_base + 8].try_into().unwrap());
+            if index != set as i32 || count <= 0 || count as usize > per_node {
+                return Err(format!(
+                    "invalid compression entry set {set}: index={index} count={count}"
+                ));
+            }
+            for i in 0..count as usize {
+                let at = set_base + 0x10 + i * ENTRY_SIZE;
+                entries.push(CompressionEntry {
+                    virtual_offset: u64::from_le_bytes(mmap[at..at + 8].try_into().unwrap()),
+                    physical_offset: u64::from_le_bytes(mmap[at + 8..at + 16].try_into().unwrap()),
+                    compression_type: mmap[at + 16],
+                    physical_size: u32::from_le_bytes(mmap[at + 20..at + 24].try_into().unwrap()),
+                });
+            }
+        }
+        entries.truncate(info.entry_count as usize);
+        if entries.is_empty()
+            || entries[0].virtual_offset != 0
+            || virtual_size == 0
+            || entries
+                .windows(2)
+                .any(|pair| pair[0].virtual_offset >= pair[1].virtual_offset)
+        {
+            return Err("invalid compressed RomFS entry ordering".to_string());
+        }
+        log::info!(
+            "compressed RomFS: {} extents, virtual_size={:#x}, physical_size={:#x}",
+            entries.len(),
+            virtual_size,
+            data.end - data.start
+        );
+        Ok(Self {
+            entries,
+            virtual_size,
+        })
     }
 }
 
@@ -88,6 +280,7 @@ pub struct Application {
     pub total_code_size: u64,
     pub npdm: Npdm,
     pub romfs: Option<LazyRomfs>,
+    pub system_romfs: HashMap<u64, LazyRomfs>,
     pub title_id: u64,
 }
 
@@ -106,11 +299,21 @@ impl Application {
         match detect(path, &mmap) {
             ContainerKind::Dxci => {
                 let xci = Xci::parse(mmap.clone())?;
-                Self::from_partition(mmap, xci.ncas())
+                let mut system_romfs = Self::collect_system_romfs(&mmap, xci.ncas());
+                if let Some(update) = xci.update_ncas() {
+                    system_romfs.extend(Self::collect_system_romfs(&mmap, update));
+                }
+                log::info!("indexed {} bundled system archive(s)", system_romfs.len());
+                let mut application = Self::from_partition(mmap, xci.ncas())?;
+                application.system_romfs = system_romfs;
+                Ok(application)
             }
             ContainerKind::Dnsp => {
                 let nsp = Nsp::parse(mmap.clone())?;
-                Self::from_partition(mmap, nsp.ncas())
+                let system_romfs = Self::collect_system_romfs(&mmap, nsp.ncas());
+                let mut application = Self::from_partition(mmap, nsp.ncas())?;
+                application.system_romfs = system_romfs;
+                Ok(application)
             }
             ContainerKind::Nca => {
                 let nca = Nca::parse(mmap.clone(), 0)?;
@@ -139,6 +342,64 @@ impl Application {
 
         let program = Self::resolve_program(mmap.clone(), ncas, &parsed)?;
         Self::from_program_nca(mmap, &program)
+    }
+
+    fn collect_system_romfs(mmap: &Arc<Mmap>, ncas: &PartitionFs) -> HashMap<u64, LazyRomfs> {
+        let mut archives = HashMap::new();
+        for entry in ncas.entries() {
+            if !entry.name.to_ascii_lowercase().ends_with(".nca") {
+                continue;
+            }
+            let Ok(range) = ncas.entry_range(entry) else {
+                continue;
+            };
+            let Ok(nca) = Nca::parse(mmap.clone(), range.start) else {
+                continue;
+            };
+            if !matches!(
+                nca.content_type,
+                NcaContentType::Data | NcaContentType::PublicData
+            ) {
+                continue;
+            }
+            let Some(section) = nca.section(NcaFsType::RomFs) else {
+                continue;
+            };
+            if section.fs_data_range.start < range.start
+                || section.fs_data_range.end > range.end
+                || section.fs_data_range.start > section.fs_data_range.end
+            {
+                log::warn!(
+                    "skipping system archive {:#018x} from {}: RomFS range {:#x}..{:#x} lies outside NCA {:#x}..{:#x}",
+                    nca.program_id,
+                    entry.name,
+                    section.fs_data_range.start,
+                    section.fs_data_range.end,
+                    range.start,
+                    range.end
+                );
+                continue;
+            }
+            let candidate = LazyRomfs {
+                mmap: mmap.clone(),
+                range: section.fs_data_range.clone(),
+                compressed: None,
+            };
+            let should_replace = archives
+                .get(&nca.program_id)
+                .map(|current: &LazyRomfs| candidate.len() > current.len())
+                .unwrap_or(true);
+            if should_replace {
+                log::debug!(
+                    "system archive {:#018x} from {} romfs={} bytes",
+                    nca.program_id,
+                    entry.name,
+                    candidate.len()
+                );
+                archives.insert(nca.program_id, candidate);
+            }
+        }
+        archives
     }
 
     fn resolve_program(
@@ -181,6 +442,7 @@ impl Application {
     }
 
     fn from_program_nca(mmap: Arc<Mmap>, program: &Nca) -> Result<Self, String> {
+        log::info!("selected program NCA base={:#x}", program.nca_base);
         let exefs_section = program
             .section(NcaFsType::PartitionFs)
             .ok_or("program NCA has no exefs (PartitionFs) section")?;
@@ -240,10 +502,10 @@ impl Application {
         }
         let total_code_size = load_offset;
 
-        let romfs = program.section(NcaFsType::RomFs).map(|s| LazyRomfs {
-            mmap: mmap.clone(),
-            range: s.fs_data_range.clone(),
-        });
+        let romfs = program
+            .section(NcaFsType::RomFs)
+            .map(|section| LazyRomfs::from_section(mmap.clone(), section))
+            .transpose()?;
         if let Some(r) = &romfs {
             log::info!(
                 "romfs image {:#x}..{:#x} ({} bytes)",
@@ -273,6 +535,7 @@ impl Application {
             total_code_size,
             npdm,
             romfs,
+            system_romfs: HashMap::new(),
             title_id,
         })
     }

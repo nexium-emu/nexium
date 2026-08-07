@@ -51,6 +51,14 @@ pub struct NcaFsSection {
     pub encryption_type: u8,
     pub section_range: Range<usize>,
     pub fs_data_range: Range<usize>,
+    pub compression: Option<NcaCompressionInfo>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NcaCompressionInfo {
+    pub bucket_offset: u64,
+    pub bucket_size: u64,
+    pub entry_count: u32,
 }
 
 pub struct Nca {
@@ -133,6 +141,60 @@ impl Nca {
             };
             let hash_type = u8at(fs_header, 0x03)?;
             let encryption_type = u8at(fs_header, 0x04)?;
+            let indirect_offset = crate::bin_read::i64at(fs_header, 0x100)?;
+            let indirect_size = crate::bin_read::i64at(fs_header, 0x108)?;
+            let aes_ctr_ex_offset = crate::bin_read::i64at(fs_header, 0x120)?;
+            let aes_ctr_ex_size = crate::bin_read::i64at(fs_header, 0x128)?;
+            if indirect_size != 0 || aes_ctr_ex_size != 0 {
+                log::info!(
+                    "NCA section {} patch indirect={:#x}+{:#x} aes_ctr_ex={:#x}+{:#x}",
+                    i,
+                    indirect_offset,
+                    indirect_size,
+                    aes_ctr_ex_offset,
+                    aes_ctr_ex_size,
+                );
+            }
+            let sparse_bucket_offset = crate::bin_read::i64at(fs_header, 0x148)?;
+            let sparse_bucket_size = crate::bin_read::i64at(fs_header, 0x150)?;
+            let sparse_physical_offset = crate::bin_read::i64at(fs_header, 0x168)?;
+            let sparse_generation = u16::from_le_bytes([fs_header[0x170], fs_header[0x171]]);
+            if sparse_generation != 0 {
+                log::info!(
+                    "NCA section {} sparse generation={} bucket={:#x}+{:#x} physical_offset={:#x}",
+                    i,
+                    sparse_generation,
+                    sparse_bucket_offset,
+                    sparse_bucket_size,
+                    sparse_physical_offset,
+                );
+            }
+            let compression_bucket_offset = crate::bin_read::i64at(fs_header, 0x178)?;
+            let compression_bucket_size = crate::bin_read::i64at(fs_header, 0x180)?;
+            let compression_entry_count = crate::bin_read::u32at(fs_header, 0x190)?;
+            if compression_bucket_size != 0 {
+                log::info!(
+                    "NCA section {} compression bucket={:#x}+{:#x}",
+                    i,
+                    compression_bucket_offset,
+                    compression_bucket_size,
+                );
+            }
+            let compression = if compression_bucket_size > 0 {
+                if compression_bucket_offset < 0 || compression_entry_count == 0 {
+                    return Err(format!(
+                        "invalid NCA compression table offset={} size={} entries={}",
+                        compression_bucket_offset, compression_bucket_size, compression_entry_count
+                    ));
+                }
+                Some(NcaCompressionInfo {
+                    bucket_offset: compression_bucket_offset as u64,
+                    bucket_size: compression_bucket_size as u64,
+                    entry_count: compression_entry_count,
+                })
+            } else {
+                None
+            };
             if encryption_type != 0 && encryption_type != 1 {
                 log::warn!(
                     "NCA section {} encryption_type={} (expected None on a decrypted NCA)",
@@ -163,6 +225,7 @@ impl Nca {
                 encryption_type,
                 section_range: section_start as usize..section_end as usize,
                 fs_data_range: fs_data_start as usize..fs_data_end as usize,
+                compression,
             });
         }
 

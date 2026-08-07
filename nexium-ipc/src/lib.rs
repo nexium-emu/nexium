@@ -571,7 +571,7 @@ fn parse_abc_descriptor(buf: &[u8], off: usize) -> IpcBuffer {
     let addr_low = u32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
     let packed = u32::from_le_bytes([buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]]);
     let mode = packed & 0x3;
-    let addr_high = (packed >> 2) & 0x003F_FFFF;
+    let addr_high = (packed >> 2) & 0x7;
     let size_high = (packed >> 24) & 0xF;
     let addr_mid = (packed >> 28) & 0xF;
     let addr = (addr_low as u64) | ((addr_mid as u64) << 32) | ((addr_high as u64) << 36);
@@ -595,5 +595,24 @@ impl IpcCtx {
             response[16..].copy_from_slice(out_data);
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_abc_descriptor;
+
+    #[test]
+    fn abc_descriptor_ignores_reserved_address_bits() {
+        let mut raw = [0u8; 12];
+        raw[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&0x89ab_cdefu32.to_le_bytes());
+        let packed = 1u32 | (5 << 2) | (0x7ffff << 5) | (0xa << 24) | (0xb << 28);
+        raw[8..12].copy_from_slice(&packed.to_le_bytes());
+
+        let descriptor = parse_abc_descriptor(&raw, 0);
+        assert_eq!(descriptor.mode, 1);
+        assert_eq!(descriptor.addr, 0x5b_89ab_cdef);
+        assert_eq!(descriptor.size, 0xa_1234_5678);
     }
 }
