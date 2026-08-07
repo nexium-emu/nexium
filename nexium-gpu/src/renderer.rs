@@ -4270,6 +4270,186 @@ impl Renderer {
         self.resolve_rt_copy_exact_to_key(src_key, expected_src_stamp, expected_bpp, dst_key)
     }
 
+    pub fn plan_rt_copy_exact_guest(
+        &self,
+        src_key: RtKey,
+        expected_src_stamp: u64,
+        expected_bpp: usize,
+        dst_nvmap_id: u32,
+        dst_va: u64,
+    ) -> Result<Option<(RtKey, u64)>, String> {
+        if dst_nvmap_id == RESOLVED_RT_COPY_NVMAP_ID {
+            return Ok(None);
+        }
+        let dst_key = RtKey::new(dst_nvmap_id, src_key.width, src_key.height, dst_va);
+        if src_key.width == 0
+            || src_key.height == 0
+            || src_key.depth != 1
+            || src_key.is_3d
+            || dst_key.width != src_key.width
+            || dst_key.height != src_key.height
+            || dst_key.depth != 1
+            || dst_key.is_3d
+            || src_key == dst_key
+        {
+            return Ok(None);
+        }
+        let mut inner = self.inner.lock();
+        settle_all_pending_computes(&mut inner);
+        let RendererInner {
+            device,
+            queue,
+            rt_cache,
+            rt_copy_slots,
+            ..
+        } = &mut *inner;
+        let Some((_, src_image, _src_view, _src_layout, src_format, src_stamp)) =
+            rt_cache.color_exact_with_format(src_key)
+        else {
+            return Ok(None);
+        };
+        if src_stamp == 0 || src_stamp != expected_src_stamp {
+            return Ok(None);
+        }
+        if exact_rt_copy_format_bpp(src_format) != Some(expected_bpp) {
+            return Ok(None);
+        }
+        drain_rt_copies_before_color_recreate(
+            device,
+            *queue,
+            rt_cache,
+            rt_copy_slots,
+            dst_key,
+            src_format,
+        )?;
+        let dst_image = rt_cache
+            .get_or_create_with_format(dst_key, device, src_format)?
+            .image;
+        if src_image == dst_image {
+            return Ok(None);
+        }
+        rt_cache.set_color_layout(src_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        rt_cache.set_color_layout(dst_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        if let Some(flip_y) = rt_cache.present_flip_y(src_key) {
+            rt_cache.record_present_flip(dst_key, flip_y);
+        }
+        let dst_stamp = if is_synthetic_copy_key(dst_key) {
+            rt_cache.mark_synced_sample(dst_key)
+        } else {
+            rt_cache.mark_drawn(dst_key)
+        };
+        Ok(Some((dst_key, dst_stamp)))
+    }
+
+    pub fn execute_rt_copy_exact(&self, src_key: RtKey, dst_key: RtKey) -> Result<bool, String> {
+        let mut inner = self.inner.lock();
+        let RendererInner {
+            device,
+            queue,
+            rt_cache,
+            rt_copy_slots,
+            rt_copy_slot_index,
+            ..
+        } = &mut *inner;
+        let Some((_, src_image, _src_view, src_layout, _src_format, _)) =
+            rt_cache.color_exact_with_format(src_key)
+        else {
+            return Ok(false);
+        };
+        let Some((_, dst_image, _dst_view, dst_layout, _dst_format, _)) =
+            rt_cache.color_exact_with_format(dst_key)
+        else {
+            return Ok(false);
+        };
+        if src_image == dst_image {
+            return Ok(false);
+        }
+        let copy_slot = acquire_rt_copy_slot(device, rt_copy_slots, rt_copy_slot_index)?;
+        reset_command_buffer(device, copy_slot.cmd)?;
+        let cmd = copy_slot.cmd;
+        let begin = vk::CommandBufferBeginInfo {
+            s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+            flags: vk::CommandBufferUsageFlags::empty(),
+            p_inheritance_info: std::ptr::null(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        };
+        unsafe {
+            device
+                .begin_command_buffer(cmd, &begin)
+                .map_err(|e| format!("begin_command_buffer(async exact rt copy): {:?}", e))?;
+        }
+        transition_image(
+            device,
+            cmd,
+            src_image,
+            src_layout,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        transition_image(
+            device,
+            cmd,
+            dst_image,
+            dst_layout,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        let copy = vk::ImageCopy {
+            src_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            src_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            dst_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            dst_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            extent: vk::Extent3D {
+                width: src_key.width,
+                height: src_key.height,
+                depth: 1,
+            },
+        };
+        unsafe {
+            device.cmd_copy_image(
+                cmd,
+                src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+        }
+        transition_image(
+            device,
+            cmd,
+            src_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        transition_image(
+            device,
+            cmd,
+            dst_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        unsafe {
+            device
+                .end_command_buffer(cmd)
+                .map_err(|e| format!("end_command_buffer(async exact rt copy): {:?}", e))?;
+        }
+        submit_with_fence(device, *queue, cmd, copy_slot.fence)?;
+        copy_slot.in_flight = true;
+        rt_cache.set_color_layout(src_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        rt_cache.set_color_layout(dst_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        Ok(true)
+    }
+
     fn resolve_rt_copy_exact_to_key(
         &self,
         src_key: RtKey,

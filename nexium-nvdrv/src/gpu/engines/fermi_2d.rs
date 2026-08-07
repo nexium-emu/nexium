@@ -290,7 +290,7 @@ impl Fermi2D {
         method: u32,
         arg: u32,
         mappings: &GpuMappings,
-        renderer: Option<&nexium_gpu::renderer::Renderer>,
+        renderer: Option<&std::sync::Arc<nexium_gpu::renderer::Renderer>>,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
@@ -409,7 +409,8 @@ impl Fermi2D {
         }
     }
 
-    fn try_exact_rt_identity_copy(
+    #[allow(clippy::too_many_arguments)]
+    fn exact_copy_candidate(
         &self,
         renderer: Option<&nexium_gpu::renderer::Renderer>,
         mappings: &GpuMappings,
@@ -427,10 +428,8 @@ impl Fermi2D {
         dv_dy: i64,
         src_bpp: usize,
         dst_bpp: usize,
-    ) -> Option<(RtKey, u64)> {
-        let Some(renderer) = renderer else {
-            return None;
-        };
+    ) -> Option<(RtKey, u64, u32)> {
+        let renderer = renderer?;
         if !exact_rt_identity_copy_compatible(
             &self.src,
             &self.dst,
@@ -458,15 +457,9 @@ impl Fermi2D {
         {
             return None;
         }
-        let Some(src_nvmap) = mappings.nvmap_id_for(src_va) else {
-            return None;
-        };
-        let Some(dst_nvmap) = mappings.nvmap_id_for(dst_va) else {
-            return None;
-        };
-        let Some((source, source_stamp)) = renderer.render_target_at_va(src_nvmap, src_va) else {
-            return None;
-        };
+        let src_nvmap = mappings.nvmap_id_for(src_va)?;
+        let dst_nvmap = mappings.nvmap_id_for(dst_va)?;
+        let (source, source_stamp) = renderer.render_target_at_va(src_nvmap, src_va)?;
         if source.nvmap_id != src_nvmap
             || source.gpu_va != src_va
             || source.width != self.src.width
@@ -479,6 +472,34 @@ impl Fermi2D {
         {
             return None;
         }
+        Some((source, source_stamp, dst_nvmap))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_exact_rt_identity_copy(
+        &self,
+        renderer: Option<&nexium_gpu::renderer::Renderer>,
+        mappings: &GpuMappings,
+        src_va: u64,
+        dst_va: u64,
+        src_limit: u64,
+        dst_limit: u64,
+        width: usize,
+        height: usize,
+        dst_x_step: i64,
+        dst_y_step: i64,
+        src_x0: i64,
+        src_y0: i64,
+        du_dx: i64,
+        dv_dy: i64,
+        src_bpp: usize,
+        dst_bpp: usize,
+    ) -> Option<(RtKey, u64)> {
+        let (source, source_stamp, dst_nvmap) = self.exact_copy_candidate(
+            renderer, mappings, src_va, dst_va, src_limit, dst_limit, width, height, dst_x_step,
+            dst_y_step, src_x0, src_y0, du_dx, dv_dy, src_bpp, dst_bpp,
+        )?;
+        let renderer = renderer?;
         match renderer.resolve_rt_copy_exact_guest(source, source_stamp, src_bpp, dst_nvmap, dst_va)
         {
             Ok(provenance) => provenance,
@@ -492,6 +513,75 @@ impl Fermi2D {
                 None
             }
         }
+    }
+
+    fn blit_geometry(&self) -> Option<(usize, usize, i64, i64, i64, i64, i64, i64, usize, usize)> {
+        if !matches!(self.operation & 0x7, 0 | 3 | 5) {
+            return None;
+        }
+        let src_format = self.src.format_info()?;
+        let dst_format = self.dst.format_info()?;
+        let width = self.dst_width_blit.unsigned_abs() as usize;
+        let height = self.dst_height_blit.unsigned_abs() as usize;
+        if width == 0 || height == 0 || self.dst.width == 0 || self.dst.height == 0 {
+            return None;
+        }
+        let dst_x_step = if self.dst_width_blit < 0 { -1i64 } else { 1 };
+        let dst_y_step = if self.dst_height_blit < 0 { -1i64 } else { 1 };
+        let src_x0 = fixed_32_32(self.src_x0_low, self.src_x0_high);
+        let src_y0 = fixed_32_32(self.src_y0_low, self.src_y0_high);
+        let du_dx = fixed_or_one(self.du_dx_low, self.du_dx_high);
+        let dv_dy = fixed_or_one(self.dv_dy_low, self.dv_dy_high);
+        Some((
+            width,
+            height,
+            dst_x_step,
+            dst_y_step,
+            src_x0,
+            src_y0,
+            du_dx,
+            dv_dy,
+            src_format.bytes_per_pixel(),
+            dst_format.bytes_per_pixel(),
+        ))
+    }
+
+    pub(crate) fn blit_exact_async_candidate(
+        &self,
+        renderer: Option<&nexium_gpu::renderer::Renderer>,
+        mappings: &GpuMappings,
+    ) -> bool {
+        if !async_blit_enabled() {
+            return false;
+        }
+        let src_va = self.src.gpu_va();
+        let dst_va = self.dst.gpu_va();
+        let Some((_, src_limit)) = mappings.cpu_range_for(src_va) else {
+            return false;
+        };
+        let Some((_, dst_limit)) = mappings.cpu_range_for(dst_va) else {
+            return false;
+        };
+        let Some((
+            width,
+            height,
+            dst_x_step,
+            dst_y_step,
+            src_x0,
+            src_y0,
+            du_dx,
+            dv_dy,
+            src_bpp,
+            dst_bpp,
+        )) = self.blit_geometry()
+        else {
+            return false;
+        };
+        self.exact_copy_candidate(
+            renderer, mappings, src_va, dst_va, src_limit, dst_limit, width, height, dst_x_step,
+            dst_y_step, src_x0, src_y0, du_dx, dv_dy, src_bpp, dst_bpp,
+        )
+        .is_some()
     }
 
     fn stage_blit_rt_source(
@@ -581,10 +671,11 @@ impl Fermi2D {
         &mut self,
         _src_y0_high: u32,
         mappings: &GpuMappings,
-        renderer: Option<&nexium_gpu::renderer::Renderer>,
+        renderer_arc: Option<&std::sync::Arc<nexium_gpu::renderer::Renderer>>,
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) {
+        let renderer = renderer_arc.map(|arc| arc.as_ref());
         self.guest_write_range = None;
         self.logical_guest_write_span = None;
         let src_va = self.src.gpu_va();
@@ -638,6 +729,68 @@ impl Fermi2D {
         let dv_dy = fixed_or_one(self.dv_dy_low, self.dv_dy_high);
         let src_bpp = src_format.bytes_per_pixel();
         let dst_bpp = dst_format.bytes_per_pixel();
+        if async_blit_enabled() {
+            if let Some((source, source_stamp, dst_nvmap)) = self.exact_copy_candidate(
+                renderer, mappings, src_va, dst_va, src_limit, dst_limit, width, height,
+                dst_x_step, dst_y_step, src_x0, src_y0, du_dx, dv_dy, src_bpp, dst_bpp,
+            ) {
+                if let (Some(arc), Some(rt)) =
+                    (renderer_arc, crate::render_thread::maybe_render_thread())
+                {
+                    match arc.plan_rt_copy_exact_guest(
+                        source,
+                        source_stamp,
+                        src_bpp,
+                        dst_nvmap,
+                        dst_va,
+                    ) {
+                        Ok(Some((destination, stamp))) => {
+                            let job_renderer = std::sync::Arc::clone(arc);
+                            rt.submit_named(
+                                "fermi-exact-copy",
+                                Box::new(move || {
+                                    if let Err(error) =
+                                        job_renderer.execute_rt_copy_exact(source, destination)
+                                    {
+                                        log::warn!(
+                                            "Fermi2D: async exact RT copy failed: {}",
+                                            error
+                                        );
+                                    }
+                                }),
+                            );
+                            self.blit_count = self.blit_count.wrapping_add(1);
+                            let destination_size = self.dst.storage_size();
+                            self.record_logical_guest_write(dst_va, destination_size);
+                            nexium_gpu::tex_invalidate::bump_region(
+                                dst_va,
+                                destination_size as u64,
+                            );
+                            if exact_rt_copy_provenance_enabled() {
+                                self.record_exact_rt_copy(
+                                    destination,
+                                    stamp,
+                                    dst_va,
+                                    destination_size as u64,
+                                    dst_bpp,
+                                    self.dst.block_size,
+                                );
+                            }
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            log::warn!(
+                                "Fermi2D: async exact RT copy plan {:#x}->{:#x} failed: {}",
+                                src_va,
+                                dst_va,
+                                error
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if let Some((destination, stamp)) = self.try_exact_rt_identity_copy(
             renderer, mappings, src_va, dst_va, src_limit, dst_limit, width, height, dst_x_step,
             dst_y_step, src_x0, src_y0, du_dx, dv_dy, src_bpp, dst_bpp,
@@ -971,6 +1124,16 @@ fn copy_even_rgba(dst: &mut [u8], dst_offset: usize, src: &[u8], a: usize, b: us
     dst[8..12].copy_from_slice(&b[0..4]);
     dst[12..16].copy_from_slice(&b[8..12]);
     true
+}
+
+pub(crate) fn async_blit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_FERMI_ASYNC_BLIT").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
 }
 
 fn fixed_32_32(low: u32, high: u32) -> i64 {

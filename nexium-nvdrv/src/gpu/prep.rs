@@ -731,8 +731,11 @@ impl PrepState {
                         self.record_flush_reason(kickprof::FLUSH_HARD_FERMI);
                         self.flush_vk(mappings, mem_read, mem_write);
                         self.ssbo_snapshot_cache.clear_ssbo_snapshots();
-                        let needs_drain = !fermi_lazy_drain_enabled()
-                            || fermi_2d.blit_touches_live_rt(self.renderer.as_deref());
+                        let async_candidate =
+                            fermi_2d.blit_exact_async_candidate(self.renderer.as_deref(), mappings);
+                        let needs_drain = !async_candidate
+                            && (!fermi_lazy_drain_enabled()
+                                || fermi_2d.blit_touches_live_rt(self.renderer.as_deref()));
                         if needs_drain {
                             let kp_drain = kickprof::start();
                             let drained = super::vk_dispatch::sync_render_thread();
@@ -752,7 +755,7 @@ impl PrepState {
                         method,
                         arg,
                         mappings,
-                        r.as_deref(),
+                        r.as_ref(),
                         mem_read,
                         mem_write,
                     );
