@@ -1,31 +1,58 @@
 use ash::vk;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use super::engines::maxwell3d::{DrawCall, RenderTarget, VertexBuffer, WindowOrigin};
-use super::engines::Maxwell3D;
+use super::engines::maxwell3d::{
+    DrawCall, GraphicsCbufBinds, GsDebugRegs, RenderTarget, VertexBuffer, WindowOrigin,
+    GRAPHICS_CBUF_SLOTS,
+};
 use super::formats::map_surface_format;
 use super::GpuMappings;
 
 use nexium_gpu::bundle_cache::{CbufIndexOrigin, CbufRead};
 use nexium_gpu::draw::{
-    BlendAttachmentState, BlendState, DepthState, DrawState, Maxwell3dDrawCall,
+    BlendAttachmentState, BlendState, DepthState, DrawState, FermiExactRtToken,
+    GraphicsCbufPayload, GraphicsCbufSlotSnapshot, Maxwell3dDrawCall,
     StencilFaceState as GpuStencilFaceState, StencilState, StorageBufferSnapshot, VertexAttr,
     VertexBinding, VertexBufferBinding, VertexLayout,
 };
 use nexium_gpu::rt_cache::RtKey;
 use nexium_gpu::texture_manifest::{
     normalize_texture_numeric_manifest, texture_numeric_manifest_fingerprint,
-    GraphicsTextureImageKind, TextureNumericBinding,
+    texture_numeric_type_for_slot, GraphicsTextureImageKind, TextureNumericBinding,
 };
 
 const SPH_SIZE: usize = 0x50;
 const MAX_SASS_BYTES: usize = 64 * 1024;
 const PACKED_CBUF_SLOTS: usize = nexium_spirv::GFX_CBUF_SLOTS as usize;
+const FRAGMENT_CBUF_BASE: usize = GRAPHICS_CBUF_SLOTS;
 const MAX_ACCUMULATED_DRAWS: usize = 2048;
+const INPUT_SNAPSHOT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const INPUT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 65536;
+const INPUT_CBUF_COVER_PAGE_SIZE: u64 = 4096;
+const INPUT_CBUF_COVER_MAX_PAGES: u64 = 64;
+const INPUT_CBUF_COVER_CANDIDATES_PER_PAGE: usize = 8;
+const INPUT_INVALIDATION_PAGE_SHIFT: u32 = 12;
+const INPUT_INVALIDATION_MAX_QUERY_PAGES: u64 = 4096;
+const INPUT_INVALIDATION_MAX_CANDIDATES: usize = 1024;
+const RECENT_CBUF_REQUEST_CAPACITY: usize = 64;
+const PREPARED_INDEX_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const PREPARED_INDEX_CACHE_MAX_ENTRIES: usize = 4096;
+const TEXTURE_SNAPSHOT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const TEXTURE_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4096;
+const PREPARED_TIC_PLAN_CAPACITY: usize = 512;
+type GraphicsStageCbufBinds = [(u64, u32); GRAPHICS_CBUF_SLOTS];
+type DrawSnapshot = HashMap<u64, Arc<Vec<u8>>>;
+type PackedCbufReadRequirements = ([usize; PACKED_CBUF_SLOTS], [bool; PACKED_CBUF_SLOTS]);
 
 fn nvprof_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("NEXIUM_NVDRV_PROFILE").is_ok())
+}
+
+fn input_cache_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_INPUT_CACHE_PROFILE").is_some())
 }
 
 macro_rules! cached_env_present {
@@ -41,13 +68,33 @@ macro_rules! cached_env_present {
 cached_env_present!(small_rt_gate_trace_enabled, "NEXIUM_SMALL_RT_GATE_TRACE");
 cached_env_present!(water_forensics_enabled, "NEXIUM_WATER_FORENSICS");
 cached_env_present!(shader_map_debug_enabled, "NEXIUM_SHADER_MAP_DBG");
+
+fn fermi_rt_snapshot_lease_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_FERMI_RT_SNAPSHOT_LEASE")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
 cached_env_present!(probe_shade_enabled, "NEXIUM_PROBE_SHADE");
+cached_env_present!(tic_pool_scan_enabled, "NEXIUM_TIC_POOL_SCAN");
 cached_env_present!(texture_debug_enabled, "NEXIUM_TEXDBG");
 cached_env_present!(vs_cbuf_debug_enabled, "NEXIUM_VS_CBUF");
 cached_env_present!(ssbo_debug_enabled, "NEXIUM_SSBO_DBG");
 cached_env_present!(cull_forced_off, "NEXIUM_NO_CULL");
 cached_env_present!(dusk_quad_debug_enabled, "NEXIUM_DUSK_QUAD_DBG");
 cached_env_present!(font_ssbo_debug_enabled, "NEXIUM_FONT_SSBO_DBG");
+cached_env_present!(texture_type_debug_enabled, "NEXIUM_TEXTYPE_DBG");
+cached_env_present!(present_keys_enabled, "NEXIUM_PRESENT_KEYS");
+cached_env_present!(video_dma_trace_enabled, "NEXIUM_VIDEO_DMA_TRACE");
+cached_env_present!(
+    tic_video_backing_trace_enabled,
+    "NEXIUM_TIC_VIDEO_BACKING_TRACE"
+);
 
 #[inline]
 fn depth_clip_control_enabled() -> bool {
@@ -240,7 +287,7 @@ fn collect_graphics_cbuf_reads(
     fs_cfg: &nexium_shader::Cfg,
 ) -> Vec<CbufRead> {
     let mut reads = collect_cbuf_reads(vs_cfg, 0);
-    reads.extend(collect_cbuf_reads(fs_cfg, 16));
+    reads.extend(collect_cbuf_reads(fs_cfg, FRAGMENT_CBUF_BASE as u32));
     reads.sort_unstable();
     reads.dedup();
     reads
@@ -300,7 +347,7 @@ fn ssbo_snapshot_window(
 fn aurora_ssbo_read_window(
     desc: nexium_shader::StorageBufferAddr,
     descriptor_size: u32,
-    cbuf_data: &[u8],
+    cbuf_data: &GraphicsCbufPayload,
     cbuf_reads: &[CbufRead],
     first_vertex: u32,
     vertex_count: u32,
@@ -314,7 +361,7 @@ fn aurora_ssbo_read_window(
     let align_down = |value: usize| value & !(align - 1);
     match (desc.cbuf_offset, descriptor_size) {
         (0x00, AURORA_VERTEX_BUFFER_SIZE) => {
-            let start = packed_cbuf_word(cbuf_data, 1, 0)? as usize;
+            let start = cbuf_data.word(1, 0)? as usize;
             if start >= size {
                 return None;
             }
@@ -332,7 +379,7 @@ fn aurora_ssbo_read_window(
                 .filter_map(|read| {
                     let offset = read.effective_byte_offset()?;
                     (read.logical_slot == 1 && (0x20..0x50).contains(&offset))
-                        .then(|| packed_cbuf_word(cbuf_data, 1, offset as usize))
+                        .then(|| cbuf_data.word(1, offset as usize))
                         .flatten()
                 })
                 .map(|value| value as usize)
@@ -426,6 +473,15 @@ fn storage_pointer_source_mask(descriptors: &[nexium_shader::StorageBufferAddr])
     sources
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub(crate) struct CbufPackKey {
+    used: u64,
+    requirements: usize,
+    groups: (usize, usize),
+    binds: [(u64, u32); nexium_spirv::GFX_CBUF_SLOTS as usize],
+    epoch: u64,
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct SsboSnapshotCacheKey {
     pub(crate) storage_binding: u32,
@@ -440,14 +496,309 @@ pub(crate) struct SsboSnapshotCacheKey {
     pub(crate) read_len: usize,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct InputRangeKey {
+    gpu_addr: u64,
+    len: usize,
+    mapping_epoch: u64,
+    cpu_addr: u64,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct InputSourceKey {
+    gpu_addr: u64,
+    mapping_epoch: u64,
+    cpu_addr: u64,
+}
+
+struct InputRangeEntry {
+    data: Arc<Vec<u8>>,
+    watch_range: HostWatchRange,
+    serial: u64,
+}
+
+#[derive(Clone, Copy)]
+struct InputInvalidationSpan {
+    gpu_addr: Option<u64>,
+    cpu_addr: Option<u64>,
+    len: usize,
+    cpu_watch: bool,
+}
+
+#[derive(Clone)]
+struct CbufSlotState {
+    gpu_addr: u64,
+    bound_size: u32,
+    len: usize,
+    map_generation: u64,
+    cpu_addr: u64,
+    snapshot: InputSnapshot,
+}
+
+const CBUF_SLOT_STATE_VARIANTS: usize = 4;
+
+#[derive(Clone)]
+struct InputSnapshot {
+    data: Arc<Vec<u8>>,
+    source_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct InputSnapshotIdentity {
+    range: InputRangeKey,
+    serial: u64,
+    data_ptr: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RecentCbufRequest {
+    gpu_addr: u64,
+    len: usize,
+    mapping_epoch: u64,
+    identity: InputSnapshotIdentity,
+    source_offset: usize,
+}
+
+type RecentCbufRequestKey = (u64, usize, u64);
+
+impl RecentCbufRequest {
+    fn key(self) -> RecentCbufRequestKey {
+        (self.gpu_addr, self.len, self.mapping_epoch)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct PreparedIndexCacheKey {
+    input: InputSnapshotIdentity,
+    index_format: u32,
+    guest_topology: u32,
+    topology: i32,
+    restart_enabled: bool,
+    restart_index: u32,
+}
+
+struct PreparedIndexCacheEntry {
+    prepared: PreparedIndexData,
+    _source: Arc<Vec<u8>>,
+    bytes: usize,
+    serial: u64,
+}
+
 pub(crate) struct SsboSnapshotCache {
+    mirror: MirrorPageCache,
+    cbuf_slot_states: [Vec<CbufSlotState>; PACKED_CBUF_SLOTS],
+    input_mutation_epoch: u64,
+    last_packed_cbuf: Option<(CbufPackKey, nexium_gpu::draw::GraphicsCbufPayload)>,
     entries: std::collections::HashMap<SsboSnapshotCacheKey, Arc<Vec<u8>>>,
     full_watch_ranges: std::collections::HashMap<SsboSnapshotCacheKey, HostWatchRange>,
+    input_entries: HashMap<InputRangeKey, InputRangeEntry>,
+    input_sources: HashMap<InputSourceKey, InputRangeKey>,
+    input_cbuf_covering: HashMap<(u64, u64), Vec<InputRangeKey>>,
+    input_gpu_pages: HashMap<u64, Vec<InputRangeKey>>,
+    input_cpu_pages: HashMap<u64, Vec<InputRangeKey>>,
+    input_invalidation_candidates: Vec<InputRangeKey>,
+    input_invalidation_seen: HashSet<InputRangeKey>,
+    input_order: VecDeque<(InputRangeKey, u64)>,
+    input_bytes: usize,
+    input_next_serial: u64,
+    last_input: Option<InputSnapshotIdentity>,
+    recent_cbuf_requests: [Option<RecentCbufRequest>; RECENT_CBUF_REQUEST_CAPACITY],
+    recent_cbuf_request_index: HashMap<RecentCbufRequestKey, usize>,
+    recent_cbuf_cursor: usize,
+    deferred_gpu_writes: Vec<(u64, usize)>,
+    deferred_patched_writes: Vec<(u64, u64, usize)>,
+    input_max_bytes: usize,
+    input_max_entries: usize,
+    prepared_index_entries: HashMap<PreparedIndexCacheKey, PreparedIndexCacheEntry>,
+    prepared_index_order: VecDeque<(PreparedIndexCacheKey, u64)>,
+    prepared_index_bytes: usize,
+    prepared_index_next_serial: u64,
+    prepared_index_max_bytes: usize,
+    prepared_index_max_entries: usize,
+    input_profile: bool,
     watch_query_ranges: Vec<HostWatchRange>,
+    input_gpu_bounds: (u64, u64),
+    input_cpu_bounds: (u64, u64),
+    ssbo_gpu_bounds: (u64, u64),
+    ssbo_cpu_bounds: (u64, u64),
     hits: usize,
     misses: usize,
     bytes_read: usize,
+    input_hits: usize,
+    input_misses: usize,
+    input_bytes_read: usize,
+    prepared_index_hits: usize,
+    prepared_index_misses: usize,
+}
+
+impl Default for SsboSnapshotCache {
+    fn default() -> Self {
+        Self::with_input_capacity(
+            INPUT_SNAPSHOT_CACHE_MAX_BYTES,
+            INPUT_SNAPSHOT_CACHE_MAX_ENTRIES,
+        )
+    }
+}
+
+const MIRROR_CHUNK_SHIFT: u32 = 16;
+const MIRROR_CHUNK_SIZE: usize = 1 << MIRROR_CHUNK_SHIFT;
+const MIRROR_PAGE_SHIFT: u32 = 12;
+const MIRROR_PAGES_PER_CHUNK: usize = MIRROR_CHUNK_SIZE >> MIRROR_PAGE_SHIFT;
+
+pub(crate) fn input_mirror_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_INPUT_MIRROR").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        ) && nexium_memory::fastmem::base().is_some()
+            && nexium_memory::fastmem::write_watch_available()
+    })
+}
+
+pub(crate) fn cbuf_writethrough_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_CBUF_WRITETHROUGH").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
+fn mirror_max_bytes() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("NEXIUM_MIRROR_MAX_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(256)
+            .saturating_mul(1024 * 1024)
+    })
+}
+
+pub(crate) fn resident_vb_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_RESIDENT_VB").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
+struct MirrorChunk {
+    data: Arc<Vec<u8>>,
+    dirty: u16,
+    serial: u64,
+    swept_gen: u64,
+    touch_epoch: u64,
+}
+
+struct MirrorPageCache {
+    chunks: HashMap<u64, MirrorChunk>,
+    kick_epoch: u64,
+    sweep_gen: u64,
+    commit_gen_seen: u64,
+    bytes: usize,
+    max_bytes: usize,
+    span_scratch: Vec<(u64, usize)>,
+}
+
+impl MirrorPageCache {
+    fn new() -> Self {
+        Self {
+            chunks: HashMap::new(),
+            kick_epoch: 0,
+            sweep_gen: 1,
+            commit_gen_seen: nexium_memory::fastmem::commit_generation(),
+            bytes: 0,
+            max_bytes: mirror_max_bytes(),
+            span_scratch: Vec::new(),
+        }
+    }
+
+    fn page_mask(offset: usize, len: usize) -> u16 {
+        debug_assert!(len != 0 && offset + len <= MIRROR_CHUNK_SIZE);
+        let first = offset >> MIRROR_PAGE_SHIFT;
+        let last = (offset + len - 1) >> MIRROR_PAGE_SHIFT;
+        let count = last - first + 1;
+        if count >= MIRROR_PAGES_PER_CHUNK {
+            u16::MAX
+        } else {
+            (((1u32 << count) - 1) as u16) << first
+        }
+    }
+
+    fn mark_chunk_dirty(chunk: &mut MirrorChunk, chunk_base: u64, cpu_addr: u64, len: usize) {
+        let end = cpu_addr.saturating_add(len as u64);
+        let lo = cpu_addr.max(chunk_base);
+        let hi = end.min(chunk_base + MIRROR_CHUNK_SIZE as u64);
+        if hi > lo {
+            chunk.dirty |= Self::page_mask((lo - chunk_base) as usize, (hi - lo) as usize);
+        }
+    }
+
+    fn mark_dirty(&mut self, cpu_addr: u64, len: usize) {
+        if self.chunks.is_empty() || len == 0 {
+            return;
+        }
+        let first = cpu_addr >> MIRROR_CHUNK_SHIFT;
+        let last = cpu_addr.saturating_add(len as u64 - 1) >> MIRROR_CHUNK_SHIFT;
+        let span_chunks = last.saturating_sub(first).saturating_add(1);
+        if span_chunks as usize > self.chunks.len() {
+            for (&key, chunk) in self.chunks.iter_mut() {
+                Self::mark_chunk_dirty(chunk, key << MIRROR_CHUNK_SHIFT, cpu_addr, len);
+            }
+        } else {
+            for key in first..=last {
+                if let Some(chunk) = self.chunks.get_mut(&key) {
+                    Self::mark_chunk_dirty(chunk, key << MIRROR_CHUNK_SHIFT, cpu_addr, len);
+                }
+            }
+        }
+    }
+
+    fn remove_chunk(&mut self, key: u64) {
+        if self.chunks.remove(&key).is_some() {
+            self.bytes = self.bytes.saturating_sub(MIRROR_CHUNK_SIZE);
+        }
+    }
+
+    fn clear_all(&mut self) {
+        self.chunks.clear();
+        self.bytes = 0;
+    }
+
+    fn begin_kick(&mut self) {
+        self.kick_epoch = self.kick_epoch.wrapping_add(1);
+        self.sweep_gen = self.sweep_gen.wrapping_add(1);
+        let commit_gen = nexium_memory::fastmem::commit_generation();
+        if commit_gen != self.commit_gen_seen {
+            self.commit_gen_seen = commit_gen;
+            self.clear_all();
+            return;
+        }
+        if self.bytes > self.max_bytes {
+            let mut order: Vec<(u64, u64)> = self
+                .chunks
+                .iter()
+                .map(|(&key, chunk)| (chunk.touch_epoch, key))
+                .collect();
+            order.sort_unstable();
+            for (_, key) in order {
+                if self.bytes <= self.max_bytes {
+                    break;
+                }
+                self.remove_chunk(key);
+                super::pusher::kickprof::count(super::pusher::kickprof::MIRROR_EVICT, 1);
+            }
+        }
+    }
+
+    fn bump_sweep(&mut self) {
+        self.sweep_gen = self.sweep_gen.wrapping_add(1);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -496,7 +847,118 @@ fn is_exact_full_aurora_ssbo_snapshot(key: &SsboSnapshotCacheKey) -> bool {
         && key.read_len == key.logical_size
 }
 
+fn input_invalidation_pages(addr: u64, len: usize) -> Option<(u64, u64)> {
+    let len = u64::try_from(len).ok()?;
+    if len == 0 {
+        return None;
+    }
+    let last_addr = addr.saturating_add(len.saturating_sub(1));
+    Some((
+        addr >> INPUT_INVALIDATION_PAGE_SHIFT,
+        last_addr >> INPUT_INVALIDATION_PAGE_SHIFT,
+    ))
+}
+
+fn input_entry_overlaps_span(
+    key: InputRangeKey,
+    entry: &InputRangeEntry,
+    span: InputInvalidationSpan,
+) -> bool {
+    span.gpu_addr
+        .is_some_and(|addr| byte_ranges_overlap(key.gpu_addr, key.len, addr, span.len))
+        || span.cpu_addr.is_some_and(|addr| {
+            let (entry_addr, entry_len) = if span.cpu_watch {
+                (entry.watch_range.cpu_addr, entry.watch_range.len)
+            } else {
+                (key.cpu_addr, key.len)
+            };
+            byte_ranges_overlap(entry_addr, entry_len, addr, span.len)
+        })
+}
+
+fn collect_input_page_candidates(
+    index: &HashMap<u64, Vec<InputRangeKey>>,
+    addr: u64,
+    len: usize,
+    queried_pages: &mut u64,
+    query_page_limit: u64,
+    candidates: &mut Vec<InputRangeKey>,
+    seen: &mut HashSet<InputRangeKey>,
+) -> bool {
+    let Some((first_page, last_page)) = input_invalidation_pages(addr, len) else {
+        return true;
+    };
+    let page_count = last_page.saturating_sub(first_page).saturating_add(1);
+    *queried_pages = queried_pages.saturating_add(page_count);
+    if *queried_pages > query_page_limit {
+        return false;
+    }
+    for page in first_page..=last_page {
+        let Some(keys) = index.get(&page) else {
+            continue;
+        };
+        for &key in keys {
+            if seen.insert(key) {
+                if candidates.len() >= INPUT_INVALIDATION_MAX_CANDIDATES {
+                    return false;
+                }
+                candidates.push(key);
+            }
+        }
+    }
+    true
+}
+
 impl SsboSnapshotCache {
+    fn with_input_capacity(input_max_bytes: usize, input_max_entries: usize) -> Self {
+        Self {
+            mirror: MirrorPageCache::new(),
+            cbuf_slot_states: std::array::from_fn(|_| Vec::new()),
+            input_mutation_epoch: 0,
+            last_packed_cbuf: None,
+            entries: HashMap::new(),
+            full_watch_ranges: HashMap::new(),
+            input_entries: HashMap::new(),
+            input_sources: HashMap::new(),
+            input_cbuf_covering: HashMap::new(),
+            input_gpu_pages: HashMap::new(),
+            input_cpu_pages: HashMap::new(),
+            input_invalidation_candidates: Vec::new(),
+            input_invalidation_seen: HashSet::new(),
+            input_order: VecDeque::new(),
+            input_bytes: 0,
+            input_next_serial: 0,
+            last_input: None,
+            recent_cbuf_requests: [None; RECENT_CBUF_REQUEST_CAPACITY],
+            recent_cbuf_request_index: HashMap::new(),
+            recent_cbuf_cursor: 0,
+            deferred_gpu_writes: Vec::new(),
+            deferred_patched_writes: Vec::new(),
+            input_max_bytes,
+            input_max_entries,
+            prepared_index_entries: HashMap::new(),
+            prepared_index_order: VecDeque::new(),
+            prepared_index_bytes: 0,
+            prepared_index_next_serial: 0,
+            prepared_index_max_bytes: PREPARED_INDEX_CACHE_MAX_BYTES,
+            prepared_index_max_entries: PREPARED_INDEX_CACHE_MAX_ENTRIES,
+            input_profile: input_cache_profile_enabled(),
+            watch_query_ranges: Vec::new(),
+            input_gpu_bounds: (u64::MAX, 0),
+            input_cpu_bounds: (u64::MAX, 0),
+            ssbo_gpu_bounds: (u64::MAX, 0),
+            ssbo_cpu_bounds: (u64::MAX, 0),
+            hits: 0,
+            misses: 0,
+            bytes_read: 0,
+            input_hits: 0,
+            input_misses: 0,
+            input_bytes_read: 0,
+            prepared_index_hits: 0,
+            prepared_index_misses: 0,
+        }
+    }
+
     pub(crate) fn read_or_insert(
         &mut self,
         key: SsboSnapshotCacheKey,
@@ -543,6 +1005,7 @@ impl SsboSnapshotCache {
             if let Some(range) = full_watch_range {
                 match nexium_memory::fastmem::take_write_watch(range.cpu_addr, range.len) {
                     nexium_memory::fastmem::WriteWatchResult::Clean => {
+                        self.expand_ssbo_bounds(&key, cpu_addr);
                         self.entries.insert(key, data.clone());
                         self.full_watch_ranges.insert(key, range);
                         return Some(data);
@@ -559,10 +1022,17 @@ impl SsboSnapshotCache {
                     }
                 }
             }
+            self.expand_ssbo_bounds(&key, cpu_addr);
             self.entries.insert(key, data.clone());
             return Some(data);
         }
         unreachable!("consistent SSBO read loop always returns")
+    }
+
+    fn expand_ssbo_bounds(&mut self, key: &SsboSnapshotCacheKey, cpu_addr: u64) {
+        let entry_gpu = key.guest_addr.saturating_add(key.data_offset as u64);
+        expand_bounds(&mut self.ssbo_gpu_bounds, entry_gpu, key.read_len);
+        expand_bounds(&mut self.ssbo_cpu_bounds, cpu_addr, key.read_len);
     }
 
     fn read_snapshot(
@@ -588,7 +1058,943 @@ impl SsboSnapshotCache {
         self.read_snapshot(cpu_addr, len, mem_read)
     }
 
-    pub(crate) fn refresh_guest_writes(&mut self) {
+    fn read_input_bytes(
+        cpu_addr: u64,
+        len: usize,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        data: &mut [u8],
+    ) -> bool {
+        let in_fastmem = nexium_memory::fastmem::base().is_some_and(|base| {
+            let base = base as u64;
+            let ptr = cpu_addr;
+            ptr >= base
+                && ptr.saturating_sub(base) <= nexium_memory::fastmem::ARENA_SIZE
+                && len as u64
+                    <= nexium_memory::fastmem::ARENA_SIZE.saturating_sub(ptr.saturating_sub(base))
+        });
+        if in_fastmem && nexium_memory::fastmem::write_watch_query_range(cpu_addr, len).is_some() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(cpu_addr as *const u8, data.as_mut_ptr(), len);
+            }
+            true
+        } else {
+            mem_read(cpu_addr, data)
+        }
+    }
+
+    fn read_input_snapshot(
+        cpu_addr: u64,
+        len: usize,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<Vec<u8>> {
+        let kp_alloc = super::pusher::kickprof::start();
+        let mut data = Vec::<std::mem::MaybeUninit<u8>>::with_capacity(len);
+        unsafe {
+            data.set_len(len);
+        }
+        let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), len) };
+        super::pusher::kickprof::add_sized(super::pusher::kickprof::CBUF_ALLOC, kp_alloc, len);
+        let kp_copy = super::pusher::kickprof::start();
+        if !Self::read_input_bytes(cpu_addr, len, mem_read, bytes) {
+            super::pusher::kickprof::add_sized(super::pusher::kickprof::CBUF_COPY, kp_copy, len);
+            return None;
+        }
+        super::pusher::kickprof::add_sized(super::pusher::kickprof::CBUF_COPY, kp_copy, len);
+        let ptr = data.as_mut_ptr().cast::<u8>();
+        let len = data.len();
+        let cap = data.capacity();
+        std::mem::forget(data);
+        Some(unsafe { Vec::from_raw_parts(ptr, len, cap) })
+    }
+
+    fn read_input_or_insert(
+        &mut self,
+        mappings: &GpuMappings,
+        gpu_addr: u64,
+        len: usize,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<Arc<Vec<u8>>> {
+        let mapping_epoch = mappings.mapping_epoch_for(gpu_addr)?;
+        if let Some(data) = self.last_input_for_range(gpu_addr, len, false, mapping_epoch) {
+            if self.input_profile {
+                self.input_hits = self.input_hits.saturating_add(1);
+            }
+            super::pusher::kickprof::count(super::pusher::kickprof::CBUF_HIT_LAST, 1);
+            return Some(data);
+        }
+        let (cpu_addr, available) = mappings.cpu_range_for(gpu_addr)?;
+        if available < len as u64 {
+            return None;
+        }
+        let key = InputRangeKey {
+            gpu_addr,
+            len,
+            mapping_epoch,
+            cpu_addr,
+        };
+        self.last_input = None;
+        let watch_range = HostWatchRange::write_watch(cpu_addr, len)?;
+        if let Some(entry) = self.input_entries.get(&key) {
+            let identity = InputSnapshotIdentity {
+                range: key,
+                serial: entry.serial,
+                data_ptr: Arc::as_ptr(&entry.data) as usize,
+            };
+            let data = entry.data.clone();
+            if self.input_profile {
+                self.input_hits = self.input_hits.saturating_add(1);
+            }
+            super::pusher::kickprof::count(super::pusher::kickprof::CBUF_HIT_ENTRY, 1);
+            self.last_input = Some(identity);
+            return Some(data);
+        }
+        if self.input_profile {
+            self.input_misses = self.input_misses.saturating_add(1);
+        }
+        super::pusher::kickprof::count(super::pusher::kickprof::CBUF_MISS, 1);
+        let kp_miss = super::pusher::kickprof::start();
+
+        let kp_ww = super::pusher::kickprof::start();
+        let pre_watch =
+            nexium_memory::fastmem::take_write_watch(watch_range.cpu_addr, watch_range.len);
+        super::pusher::kickprof::add(super::pusher::kickprof::CBUF_WW, kp_ww);
+        match pre_watch {
+            nexium_memory::fastmem::WriteWatchResult::Clean => {}
+            nexium_memory::fastmem::WriteWatchResult::Dirty => {
+                super::pusher::kickprof::count(super::pusher::kickprof::CBUF_MISS_DIRTY, 1);
+                let kp_inval = super::pusher::kickprof::start();
+                self.invalidate_cpu_write(watch_range);
+                super::pusher::kickprof::add(super::pusher::kickprof::CBUF_INVAL, kp_inval);
+            }
+            nexium_memory::fastmem::WriteWatchResult::Unavailable => return None,
+        }
+
+        const MAX_CONSISTENT_READ_ATTEMPTS: usize = 3;
+        for attempt in 0..MAX_CONSISTENT_READ_ATTEMPTS {
+            let Some(data) = Self::read_input_snapshot(cpu_addr, len, mem_read) else {
+                return None;
+            };
+            if self.input_profile {
+                self.input_bytes_read = self.input_bytes_read.saturating_add(data.len());
+            }
+            let data = Arc::new(data);
+            let kp_ww = super::pusher::kickprof::start();
+            let post_watch =
+                nexium_memory::fastmem::take_write_watch(watch_range.cpu_addr, watch_range.len);
+            super::pusher::kickprof::add(super::pusher::kickprof::CBUF_WW, kp_ww);
+            match post_watch {
+                nexium_memory::fastmem::WriteWatchResult::Clean => {
+                    self.insert_input_entry(key, watch_range, data.clone());
+                    self.last_input =
+                        self.input_entries
+                            .get(&key)
+                            .map(|entry| InputSnapshotIdentity {
+                                range: key,
+                                serial: entry.serial,
+                                data_ptr: Arc::as_ptr(&entry.data) as usize,
+                            });
+                    super::pusher::kickprof::add_sized(
+                        super::pusher::kickprof::CBUF_MISS_READ,
+                        kp_miss,
+                        len,
+                    );
+                    return Some(data);
+                }
+                nexium_memory::fastmem::WriteWatchResult::Dirty => {
+                    let kp_inval = super::pusher::kickprof::start();
+                    self.invalidate_cpu_write(watch_range);
+                    super::pusher::kickprof::add(super::pusher::kickprof::CBUF_INVAL, kp_inval);
+                    if attempt + 1 == MAX_CONSISTENT_READ_ATTEMPTS {
+                        super::pusher::kickprof::add_sized(
+                            super::pusher::kickprof::CBUF_MISS_READ,
+                            kp_miss,
+                            len,
+                        );
+                        return Some(data);
+                    }
+                }
+                nexium_memory::fastmem::WriteWatchResult::Unavailable => {
+                    super::pusher::kickprof::add_sized(
+                        super::pusher::kickprof::CBUF_MISS_READ,
+                        kp_miss,
+                        len,
+                    );
+                    return Some(data);
+                }
+            }
+        }
+        unreachable!("consistent input read loop always returns")
+    }
+
+    fn read_cbuf_input_or_insert(
+        &mut self,
+        mappings: &GpuMappings,
+        gpu_addr: u64,
+        len: usize,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<InputSnapshot> {
+        let mapping_epoch = mappings.mapping_epoch_for(gpu_addr)?;
+        if let Some(data) = self.last_input_for_range(gpu_addr, len, true, mapping_epoch) {
+            if self.input_profile {
+                self.input_hits = self.input_hits.saturating_add(1);
+            }
+            super::pusher::kickprof::count(super::pusher::kickprof::CBUF_HIT_LAST, 1);
+            return Some(InputSnapshot {
+                data,
+                source_offset: 0,
+            });
+        }
+        if let Some((snapshot, identity)) = self.recent_cbuf_snapshot(gpu_addr, len, mapping_epoch)
+        {
+            if self.input_profile {
+                self.input_hits = self.input_hits.saturating_add(1);
+            }
+            let phase = if identity.range.gpu_addr == gpu_addr
+                && identity.range.len == len
+                && snapshot.source_offset == 0
+            {
+                super::pusher::kickprof::CBUF_HIT_ENTRY
+            } else {
+                super::pusher::kickprof::CBUF_HIT_COVER
+            };
+            super::pusher::kickprof::count(phase, 1);
+            super::pusher::kickprof::count(super::pusher::kickprof::CBUF_HIT_RECENT, 1);
+            return Some(snapshot);
+        }
+        let (cpu_addr, available) = mappings.cpu_range_for(gpu_addr)?;
+        if available < len as u64 {
+            return None;
+        }
+        let source = InputSourceKey {
+            gpu_addr,
+            mapping_epoch,
+            cpu_addr,
+        };
+        let key = InputRangeKey {
+            gpu_addr,
+            len,
+            mapping_epoch: source.mapping_epoch,
+            cpu_addr,
+        };
+        if let Some(entry) = self.input_entries.get(&key) {
+            let identity = InputSnapshotIdentity {
+                range: key,
+                serial: entry.serial,
+                data_ptr: Arc::as_ptr(&entry.data) as usize,
+            };
+            let data = entry.data.clone();
+            if self.input_profile {
+                self.input_hits = self.input_hits.saturating_add(1);
+            }
+            super::pusher::kickprof::count(super::pusher::kickprof::CBUF_HIT_ENTRY, 1);
+            self.last_input = Some(identity);
+            self.index_cbuf_covering_range(key);
+            self.remember_recent_cbuf_request(gpu_addr, len, mapping_epoch, identity, 0);
+            return Some(InputSnapshot {
+                data,
+                source_offset: 0,
+            });
+        }
+        if self.input_sources.get(&source).is_none() {
+            super::pusher::kickprof::count(super::pusher::kickprof::CBUF_MISS_COLD, 1);
+        }
+        if let Some(covering_key) = self.input_sources.get(&source).copied() {
+            if covering_key.len < len {
+                super::pusher::kickprof::count(super::pusher::kickprof::CBUF_MISS_GROW, 1);
+            }
+            if covering_key.len >= len {
+                if let Some(entry) = self.input_entries.get(&covering_key) {
+                    let identity = InputSnapshotIdentity {
+                        range: covering_key,
+                        serial: entry.serial,
+                        data_ptr: Arc::as_ptr(&entry.data) as usize,
+                    };
+                    let data = entry.data.clone();
+                    if self.input_profile {
+                        self.input_hits = self.input_hits.saturating_add(1);
+                    }
+                    super::pusher::kickprof::count(super::pusher::kickprof::CBUF_HIT_COVER, 1);
+                    self.last_input = Some(identity);
+                    self.index_cbuf_covering_range(covering_key);
+                    self.remember_recent_cbuf_request(gpu_addr, len, mapping_epoch, identity, 0);
+                    return Some(InputSnapshot {
+                        data,
+                        source_offset: 0,
+                    });
+                }
+            }
+        }
+        if let Some((snapshot, identity)) = self.cbuf_covering_snapshot(key) {
+            if self.input_profile {
+                self.input_hits = self.input_hits.saturating_add(1);
+            }
+            super::pusher::kickprof::count(super::pusher::kickprof::CBUF_HIT_COVER, 1);
+            self.last_input = Some(identity);
+            self.remember_recent_cbuf_request(
+                gpu_addr,
+                len,
+                mapping_epoch,
+                identity,
+                snapshot.source_offset,
+            );
+            return Some(snapshot);
+        }
+        let request_end = gpu_addr.checked_add(len as u64)?;
+        let page_start = gpu_addr & !(INPUT_CBUF_COVER_PAGE_SIZE - 1);
+        let page_end = request_end.checked_add(INPUT_CBUF_COVER_PAGE_SIZE - 1)?
+            & !(INPUT_CBUF_COVER_PAGE_SIZE - 1);
+        let page_len = usize::try_from(page_end.checked_sub(page_start)?).ok()?;
+        if page_len != 0
+            && page_len <= (INPUT_CBUF_COVER_PAGE_SIZE * INPUT_CBUF_COVER_MAX_PAGES) as usize
+        {
+            if let (Some(page_epoch), Some((page_cpu, page_available))) = (
+                mappings.mapping_epoch_for(page_start),
+                mappings.cpu_range_for(page_start),
+            ) {
+                let source_offset = usize::try_from(gpu_addr - page_start).ok()?;
+                if page_epoch == mapping_epoch
+                    && page_available >= page_len as u64
+                    && page_cpu.checked_add(source_offset as u64) == Some(cpu_addr)
+                {
+                    if let Some(data) =
+                        self.read_input_or_insert(mappings, page_start, page_len, mem_read)
+                    {
+                        let identity = self.last_input_identity_for(&data);
+                        let page_key = InputRangeKey {
+                            gpu_addr: page_start,
+                            len: page_len,
+                            mapping_epoch: page_epoch,
+                            cpu_addr: page_cpu,
+                        };
+                        self.index_cbuf_covering_range(page_key);
+                        if let Some(identity) = identity {
+                            self.remember_recent_cbuf_request(
+                                gpu_addr,
+                                len,
+                                mapping_epoch,
+                                identity,
+                                source_offset,
+                            );
+                        }
+                        return Some(InputSnapshot {
+                            data,
+                            source_offset,
+                        });
+                    }
+                }
+            }
+        }
+        let data = self.read_input_or_insert(mappings, gpu_addr, len, mem_read)?;
+        let identity = self.last_input_identity_for(&data);
+        self.index_cbuf_covering_range(key);
+        if let Some(identity) = identity {
+            self.remember_recent_cbuf_request(gpu_addr, len, mapping_epoch, identity, 0);
+        }
+        Some(InputSnapshot {
+            data,
+            source_offset: 0,
+        })
+    }
+
+    fn cbuf_covering_pages(key: InputRangeKey) -> Option<(u64, u64)> {
+        let end = key.gpu_addr.checked_add(key.len as u64)?.checked_sub(1)?;
+        let first = key.gpu_addr / INPUT_CBUF_COVER_PAGE_SIZE;
+        let last = end / INPUT_CBUF_COVER_PAGE_SIZE;
+        (last.saturating_sub(first) < INPUT_CBUF_COVER_MAX_PAGES).then_some((first, last))
+    }
+
+    fn recent_cbuf_snapshot(
+        &mut self,
+        gpu_addr: u64,
+        len: usize,
+        mapping_epoch: u64,
+    ) -> Option<(InputSnapshot, InputSnapshotIdentity)> {
+        let request_key = (gpu_addr, len, mapping_epoch);
+        let index = *self.recent_cbuf_request_index.get(&request_key)?;
+        let recent = self.recent_cbuf_requests.get(index).copied().flatten();
+        let Some(recent) = recent.filter(|recent| recent.key() == request_key) else {
+            self.recent_cbuf_request_index.remove(&request_key);
+            return None;
+        };
+        let range = recent.identity.range;
+        let source_offset = u64::try_from(recent.source_offset).ok()?;
+        if range.mapping_epoch != mapping_epoch
+            || range.gpu_addr.checked_add(source_offset) != Some(gpu_addr)
+        {
+            self.recent_cbuf_requests[index] = None;
+            self.recent_cbuf_request_index.remove(&request_key);
+            return None;
+        }
+        let source_end = recent.source_offset.checked_add(len)?;
+        let valid = self.input_entries.get(&range).is_some_and(|entry| {
+            entry.serial == recent.identity.serial
+                && Arc::as_ptr(&entry.data) as usize == recent.identity.data_ptr
+                && source_end <= range.len
+                && source_end <= entry.data.len()
+        });
+        if !valid {
+            self.recent_cbuf_requests[index] = None;
+            self.recent_cbuf_request_index.remove(&request_key);
+            return None;
+        }
+        let entry = self.input_entries.get(&range).unwrap();
+        let data = entry.data.clone();
+        self.last_input = Some(recent.identity);
+        Some((
+            InputSnapshot {
+                data,
+                source_offset: recent.source_offset,
+            },
+            recent.identity,
+        ))
+    }
+
+    fn remember_recent_cbuf_request(
+        &mut self,
+        gpu_addr: u64,
+        len: usize,
+        mapping_epoch: u64,
+        identity: InputSnapshotIdentity,
+        source_offset: usize,
+    ) {
+        if len == 0 || identity.range.mapping_epoch != mapping_epoch {
+            return;
+        }
+        let Ok(source_offset_u64) = u64::try_from(source_offset) else {
+            return;
+        };
+        if identity.range.gpu_addr.checked_add(source_offset_u64) != Some(gpu_addr) {
+            return;
+        }
+        let Some(source_end) = source_offset.checked_add(len) else {
+            return;
+        };
+        let Some(entry) = self.input_entries.get(&identity.range) else {
+            return;
+        };
+        if entry.serial != identity.serial
+            || Arc::as_ptr(&entry.data) as usize != identity.data_ptr
+            || source_end > identity.range.len
+            || source_end > entry.data.len()
+        {
+            return;
+        }
+        let recent = RecentCbufRequest {
+            gpu_addr,
+            len,
+            mapping_epoch,
+            identity,
+            source_offset,
+        };
+        let request_key = recent.key();
+        if let Some(index) = self.recent_cbuf_request_index.get(&request_key).copied() {
+            if self
+                .recent_cbuf_requests
+                .get(index)
+                .is_some_and(|slot| slot.is_some_and(|existing| existing.key() == request_key))
+            {
+                self.recent_cbuf_requests[index] = Some(recent);
+                return;
+            }
+            self.recent_cbuf_request_index.remove(&request_key);
+        }
+        let index = self.recent_cbuf_cursor;
+        if let Some(previous) = self.recent_cbuf_requests[index].replace(recent) {
+            self.recent_cbuf_request_index.remove(&previous.key());
+        }
+        self.recent_cbuf_request_index.insert(request_key, index);
+        self.recent_cbuf_cursor = (self.recent_cbuf_cursor + 1) % RECENT_CBUF_REQUEST_CAPACITY;
+    }
+
+    fn cbuf_covering_snapshot(
+        &self,
+        key: InputRangeKey,
+    ) -> Option<(InputSnapshot, InputSnapshotIdentity)> {
+        let (page, _) = Self::cbuf_covering_pages(key)?;
+        let candidates = self.input_cbuf_covering.get(&(key.mapping_epoch, page))?;
+        for candidate in candidates.iter().rev() {
+            let Some(entry) = self.input_entries.get(candidate) else {
+                continue;
+            };
+            let Some(offset) = key.gpu_addr.checked_sub(candidate.gpu_addr) else {
+                continue;
+            };
+            let Ok(source_offset) = usize::try_from(offset) else {
+                continue;
+            };
+            if candidate.cpu_addr.checked_add(offset) != Some(key.cpu_addr)
+                || source_offset.saturating_add(key.len) > entry.data.len()
+            {
+                continue;
+            }
+            let identity = InputSnapshotIdentity {
+                range: *candidate,
+                serial: entry.serial,
+                data_ptr: Arc::as_ptr(&entry.data) as usize,
+            };
+            return Some((
+                InputSnapshot {
+                    data: entry.data.clone(),
+                    source_offset,
+                },
+                identity,
+            ));
+        }
+        None
+    }
+
+    fn index_cbuf_covering_range(&mut self, key: InputRangeKey) {
+        if !self.input_entries.contains_key(&key) {
+            return;
+        }
+        let Some((first_page, last_page)) = Self::cbuf_covering_pages(key) else {
+            return;
+        };
+        for page in first_page..=last_page {
+            let candidates = self
+                .input_cbuf_covering
+                .entry((key.mapping_epoch, page))
+                .or_default();
+            if candidates.contains(&key) {
+                continue;
+            }
+            candidates.push(key);
+            if candidates.len() > INPUT_CBUF_COVER_CANDIDATES_PER_PAGE {
+                candidates.remove(0);
+            }
+        }
+    }
+
+    fn remove_cbuf_covering_range(&mut self, key: InputRangeKey) {
+        let Some((first_page, last_page)) = Self::cbuf_covering_pages(key) else {
+            return;
+        };
+        for page in first_page..=last_page {
+            let page_key = (key.mapping_epoch, page);
+            let remove_page =
+                self.input_cbuf_covering
+                    .get_mut(&page_key)
+                    .is_some_and(|candidates| {
+                        candidates.retain(|candidate| *candidate != key);
+                        candidates.is_empty()
+                    });
+            if remove_page {
+                self.input_cbuf_covering.remove(&page_key);
+            }
+        }
+    }
+
+    fn index_input_page_range(
+        index: &mut HashMap<u64, Vec<InputRangeKey>>,
+        addr: u64,
+        len: usize,
+        key: InputRangeKey,
+    ) {
+        let Some((first_page, last_page)) = input_invalidation_pages(addr, len) else {
+            return;
+        };
+        for page in first_page..=last_page {
+            index.entry(page).or_default().push(key);
+        }
+    }
+
+    fn remove_input_page_range(
+        index: &mut HashMap<u64, Vec<InputRangeKey>>,
+        addr: u64,
+        len: usize,
+        key: InputRangeKey,
+    ) {
+        let Some((first_page, last_page)) = input_invalidation_pages(addr, len) else {
+            return;
+        };
+        for page in first_page..=last_page {
+            let remove_page = index.get_mut(&page).is_some_and(|keys| {
+                keys.retain(|candidate| *candidate != key);
+                keys.is_empty()
+            });
+            if remove_page {
+                index.remove(&page);
+            }
+        }
+    }
+
+    fn index_input_entry(&mut self, key: InputRangeKey, watch_range: HostWatchRange) {
+        Self::index_input_page_range(&mut self.input_gpu_pages, key.gpu_addr, key.len, key);
+        Self::index_input_page_range(
+            &mut self.input_cpu_pages,
+            watch_range.cpu_addr,
+            watch_range.len,
+            key,
+        );
+    }
+
+    fn remove_input_entry(&mut self, key: InputRangeKey) -> Option<InputRangeEntry> {
+        self.input_mutation_epoch = self.input_mutation_epoch.wrapping_add(1);
+        let entry = self.input_entries.remove(&key)?;
+        self.input_bytes = self.input_bytes.saturating_sub(entry.data.len());
+        Self::remove_input_page_range(&mut self.input_gpu_pages, key.gpu_addr, key.len, key);
+        Self::remove_input_page_range(
+            &mut self.input_cpu_pages,
+            entry.watch_range.cpu_addr,
+            entry.watch_range.len,
+            key,
+        );
+        self.remove_cbuf_covering_range(key);
+        let source = InputSourceKey {
+            gpu_addr: key.gpu_addr,
+            mapping_epoch: key.mapping_epoch,
+            cpu_addr: key.cpu_addr,
+        };
+        if self.input_sources.get(&source) == Some(&key) {
+            self.input_sources.remove(&source);
+        }
+        if self
+            .last_input
+            .is_some_and(|identity| identity.range == key)
+        {
+            self.last_input = None;
+        }
+        for recent in &mut self.recent_cbuf_requests {
+            if recent.is_some_and(|request| request.identity.range == key) {
+                let request = recent.take().unwrap();
+                self.recent_cbuf_request_index.remove(&request.key());
+            }
+        }
+        Some(entry)
+    }
+
+    fn collect_input_invalidation_candidates(&mut self, spans: &[InputInvalidationSpan]) -> bool {
+        self.input_invalidation_candidates.clear();
+        self.input_invalidation_seen.clear();
+        let mut queried_pages = 0u64;
+        let query_page_limit = INPUT_INVALIDATION_MAX_QUERY_PAGES
+            .min(u64::try_from(self.input_entries.len()).unwrap_or(u64::MAX));
+        for span in spans {
+            let gpu_complete = span.gpu_addr.is_none_or(|addr| {
+                collect_input_page_candidates(
+                    &self.input_gpu_pages,
+                    addr,
+                    span.len,
+                    &mut queried_pages,
+                    query_page_limit,
+                    &mut self.input_invalidation_candidates,
+                    &mut self.input_invalidation_seen,
+                )
+            });
+            if !gpu_complete {
+                self.input_invalidation_candidates.clear();
+                self.input_invalidation_seen.clear();
+                return false;
+            }
+            let cpu_complete = span.cpu_addr.is_none_or(|addr| {
+                collect_input_page_candidates(
+                    &self.input_cpu_pages,
+                    addr,
+                    span.len,
+                    &mut queried_pages,
+                    query_page_limit,
+                    &mut self.input_invalidation_candidates,
+                    &mut self.input_invalidation_seen,
+                )
+            });
+            if !cpu_complete {
+                self.input_invalidation_candidates.clear();
+                self.input_invalidation_seen.clear();
+                return false;
+            }
+        }
+        true
+    }
+
+    fn cbuf_slot_cached(
+        &mut self,
+        logical_slot: usize,
+        gpu_addr: u64,
+        bound_size: u32,
+        len: usize,
+        map_generation: u64,
+    ) -> Option<InputSnapshot> {
+        let states = self.cbuf_slot_states.get_mut(logical_slot)?;
+        let index = states.iter().position(|state| {
+            state.gpu_addr == gpu_addr
+                && state.bound_size == bound_size
+                && state.len == len
+                && state.map_generation == map_generation
+        })?;
+        if index != 0 {
+            states.swap(0, index);
+        }
+        super::pusher::kickprof::count(super::pusher::kickprof::CBUF_SLOT_STATE_HIT, 1);
+        Some(states[0].snapshot.clone())
+    }
+
+    fn store_cbuf_slot(
+        &mut self,
+        logical_slot: usize,
+        gpu_addr: u64,
+        bound_size: u32,
+        len: usize,
+        map_generation: u64,
+        cpu_addr: u64,
+        snapshot: InputSnapshot,
+    ) {
+        let Some(states) = self.cbuf_slot_states.get_mut(logical_slot) else {
+            return;
+        };
+        states.retain(|state| {
+            state.gpu_addr != gpu_addr || state.bound_size != bound_size || state.len != len
+        });
+        if states.len() >= CBUF_SLOT_STATE_VARIANTS {
+            states.pop();
+        }
+        states.insert(
+            0,
+            CbufSlotState {
+                gpu_addr,
+                bound_size,
+                len,
+                map_generation,
+                cpu_addr,
+                snapshot,
+            },
+        );
+    }
+
+    fn invalidate_cbuf_slot_states(&mut self, spans: &[InputInvalidationSpan]) {
+        for states in self.cbuf_slot_states.iter_mut() {
+            if states.is_empty() {
+                continue;
+            }
+            states.retain(|state| {
+                !spans.iter().any(|span| {
+                    let len = state.len as u64;
+                    if let Some(gpu) = span.gpu_addr {
+                        if gpu < state.gpu_addr.saturating_add(len)
+                            && state.gpu_addr < gpu.saturating_add(span.len as u64)
+                        {
+                            return true;
+                        }
+                    }
+                    if let Some(cpu) = span.cpu_addr {
+                        if state.cpu_addr != 0
+                            && cpu < state.cpu_addr.saturating_add(len)
+                            && state.cpu_addr < cpu.saturating_add(span.len as u64)
+                        {
+                            return true;
+                        }
+                    }
+                    false
+                })
+            });
+        }
+    }
+
+    fn invalidate_input_spans(&mut self, spans: &[InputInvalidationSpan]) {
+        self.input_mutation_epoch = self.input_mutation_epoch.wrapping_add(1);
+        self.invalidate_cbuf_slot_states(spans);
+        if spans.is_empty() || self.input_entries.is_empty() {
+            return;
+        }
+        if !self.collect_input_invalidation_candidates(spans) {
+            self.retain_input_entries(|key, entry| {
+                !spans
+                    .iter()
+                    .copied()
+                    .any(|span| input_entry_overlaps_span(*key, entry, span))
+            });
+            return;
+        }
+        let mut candidates = std::mem::take(&mut self.input_invalidation_candidates);
+        for key in candidates.iter().copied() {
+            let remove = self.input_entries.get(&key).is_some_and(|entry| {
+                spans
+                    .iter()
+                    .copied()
+                    .any(|span| input_entry_overlaps_span(key, entry, span))
+            });
+            if remove {
+                self.remove_input_entry(key);
+            }
+        }
+        candidates.clear();
+        self.input_invalidation_candidates = candidates;
+        self.input_invalidation_seen.clear();
+    }
+
+    fn last_input_for_range(
+        &self,
+        gpu_addr: u64,
+        len: usize,
+        allow_covering: bool,
+        mapping_epoch: u64,
+    ) -> Option<Arc<Vec<u8>>> {
+        let identity = self.last_input?;
+        let range = identity.range;
+        if range.mapping_epoch != mapping_epoch
+            || range.gpu_addr != gpu_addr
+            || (if allow_covering {
+                range.len < len
+            } else {
+                range.len != len
+            })
+        {
+            return None;
+        }
+        let entry = self.input_entries.get(&range)?;
+        (entry.serial == identity.serial && Arc::as_ptr(&entry.data) as usize == identity.data_ptr)
+            .then(|| entry.data.clone())
+    }
+
+    fn insert_input_entry(
+        &mut self,
+        key: InputRangeKey,
+        watch_range: HostWatchRange,
+        data: Arc<Vec<u8>>,
+    ) {
+        self.input_mutation_epoch = self.input_mutation_epoch.wrapping_add(1);
+        if data.len() > self.input_max_bytes || self.input_max_entries == 0 {
+            return;
+        }
+        if self.input_entries.contains_key(&key) {
+            self.remove_input_entry(key);
+        }
+        let serial = self.input_next_serial;
+        self.input_next_serial = self.input_next_serial.wrapping_add(1);
+        let data_len = data.len();
+        self.input_bytes = self.input_bytes.saturating_add(data_len);
+        expand_bounds(&mut self.input_gpu_bounds, key.gpu_addr, key.len);
+        expand_bounds(
+            &mut self.input_cpu_bounds,
+            watch_range.cpu_addr,
+            watch_range.len,
+        );
+        self.input_entries.insert(
+            key,
+            InputRangeEntry {
+                data,
+                watch_range,
+                serial,
+            },
+        );
+        self.index_input_entry(key, watch_range);
+        self.input_order.push_back((key, serial));
+        let source = InputSourceKey {
+            gpu_addr: key.gpu_addr,
+            mapping_epoch: key.mapping_epoch,
+            cpu_addr: key.cpu_addr,
+        };
+        if self
+            .input_sources
+            .get(&source)
+            .and_then(|old_key| self.input_entries.get(old_key))
+            .map_or(true, |old| old.data.len() < data_len)
+        {
+            self.input_sources.insert(source, key);
+        }
+        let max_order = self.input_max_entries.saturating_mul(2).max(1);
+        while self.input_bytes > self.input_max_bytes
+            || self.input_entries.len() > self.input_max_entries
+            || self.input_order.len() > max_order
+        {
+            let Some((old_key, old_serial)) = self.input_order.pop_front() else {
+                break;
+            };
+            if self
+                .input_entries
+                .get(&old_key)
+                .is_some_and(|entry| entry.serial == old_serial)
+            {
+                self.remove_input_entry(old_key);
+            }
+        }
+    }
+
+    fn last_input_identity_for(&self, data: &Arc<Vec<u8>>) -> Option<InputSnapshotIdentity> {
+        let identity = self.last_input?;
+        let entry = self.input_entries.get(&identity.range)?;
+        (entry.serial == identity.serial && Arc::ptr_eq(&entry.data, data)).then_some(identity)
+    }
+
+    fn prepared_index(&mut self, key: &PreparedIndexCacheKey) -> Option<PreparedIndexData> {
+        let prepared = self
+            .prepared_index_entries
+            .get(key)
+            .map(|entry| entry.prepared.clone());
+        if self.input_profile {
+            if prepared.is_some() {
+                self.prepared_index_hits = self.prepared_index_hits.saturating_add(1);
+            } else {
+                self.prepared_index_misses = self.prepared_index_misses.saturating_add(1);
+            }
+        }
+        prepared
+    }
+
+    fn insert_prepared_index(
+        &mut self,
+        key: PreparedIndexCacheKey,
+        source: Arc<Vec<u8>>,
+        prepared: PreparedIndexData,
+    ) {
+        let bytes = prepared.data.len().saturating_add(
+            (!Arc::ptr_eq(&source, &prepared.data))
+                .then_some(source.len())
+                .unwrap_or(0),
+        );
+        if bytes > self.prepared_index_max_bytes || self.prepared_index_max_entries == 0 {
+            return;
+        }
+        if let Some(old) = self.prepared_index_entries.remove(&key) {
+            self.prepared_index_bytes = self.prepared_index_bytes.saturating_sub(old.bytes);
+        }
+        let serial = self.prepared_index_next_serial;
+        self.prepared_index_next_serial = self.prepared_index_next_serial.wrapping_add(1);
+        self.prepared_index_bytes = self.prepared_index_bytes.saturating_add(bytes);
+        self.prepared_index_entries.insert(
+            key,
+            PreparedIndexCacheEntry {
+                prepared,
+                _source: source,
+                bytes,
+                serial,
+            },
+        );
+        self.prepared_index_order.push_back((key, serial));
+        let max_order = self.prepared_index_max_entries.saturating_mul(2).max(1);
+        while self.prepared_index_bytes > self.prepared_index_max_bytes
+            || self.prepared_index_entries.len() > self.prepared_index_max_entries
+            || self.prepared_index_order.len() > max_order
+        {
+            let Some((old_key, old_serial)) = self.prepared_index_order.pop_front() else {
+                break;
+            };
+            if self
+                .prepared_index_entries
+                .get(&old_key)
+                .is_some_and(|entry| entry.serial == old_serial)
+            {
+                if let Some(old) = self.prepared_index_entries.remove(&old_key) {
+                    self.prepared_index_bytes = self.prepared_index_bytes.saturating_sub(old.bytes);
+                }
+            }
+        }
+    }
+
+    fn retain_input_entries(
+        &mut self,
+        mut keep: impl FnMut(&InputRangeKey, &InputRangeEntry) -> bool,
+    ) {
+        let removed_keys: Vec<InputRangeKey> = self
+            .input_entries
+            .iter()
+            .filter_map(|(key, entry)| (!keep(key, entry)).then_some(*key))
+            .collect();
+        for key in removed_keys {
+            self.remove_input_entry(key);
+        }
+    }
+
+    pub(crate) fn refresh_ssbo_guest_writes(&mut self) {
         self.entries.retain(|key, _| {
             !is_exact_full_aurora_ssbo_snapshot(key) || self.full_watch_ranges.contains_key(key)
         });
@@ -596,23 +2002,500 @@ impl SsboSnapshotCache {
         ranges.clear();
         ranges.extend(self.full_watch_ranges.values().copied());
         coalesce_host_watch_ranges(&mut ranges);
+        let mut dirty_spans: Vec<(u64, usize)> = Vec::new();
         for range in ranges.iter().copied() {
-            match nexium_memory::fastmem::take_write_watch(range.cpu_addr, range.len) {
-                nexium_memory::fastmem::WriteWatchResult::Clean => {}
-                nexium_memory::fastmem::WriteWatchResult::Dirty
-                | nexium_memory::fastmem::WriteWatchResult::Unavailable => {
-                    self.invalidate_cpu_write(range);
+            match nexium_memory::fastmem::take_write_watch_spans(
+                range.cpu_addr,
+                range.len,
+                &mut dirty_spans,
+            ) {
+                nexium_memory::fastmem::WriteWatchResult::Clean
+                | nexium_memory::fastmem::WriteWatchResult::Dirty => {}
+                nexium_memory::fastmem::WriteWatchResult::Unavailable => {
+                    dirty_spans.push((range.cpu_addr, range.len));
                 }
             }
+        }
+        if !dirty_spans.is_empty() {
+            self.invalidate_cpu_spans(&dirty_spans);
         }
         ranges.clear();
         self.watch_query_ranges = ranges;
     }
 
+    pub(crate) fn refresh_input_guest_writes(&mut self) {
+        let kp = super::pusher::kickprof::start();
+        let before = self.input_entries.len();
+        let mut ranges = std::mem::take(&mut self.watch_query_ranges);
+        ranges.clear();
+        ranges.extend(self.input_entries.values().map(|entry| entry.watch_range));
+        coalesce_host_watch_ranges(&mut ranges);
+        let mut dirty_spans: Vec<(u64, usize)> = Vec::new();
+        for range in ranges.iter().copied() {
+            match nexium_memory::fastmem::take_write_watch_spans(
+                range.cpu_addr,
+                range.len,
+                &mut dirty_spans,
+            ) {
+                nexium_memory::fastmem::WriteWatchResult::Clean
+                | nexium_memory::fastmem::WriteWatchResult::Dirty => {}
+                nexium_memory::fastmem::WriteWatchResult::Unavailable => {
+                    dirty_spans.push((range.cpu_addr, range.len));
+                }
+            }
+        }
+        if !dirty_spans.is_empty() {
+            self.invalidate_cpu_spans(&dirty_spans);
+        }
+        ranges.clear();
+        self.watch_query_ranges = ranges;
+        super::pusher::kickprof::add(super::pusher::kickprof::KICK_INVAL, kp);
+        super::pusher::kickprof::count(
+            super::pusher::kickprof::KICK_INVAL_N,
+            before.saturating_sub(self.input_entries.len()) as u64,
+        );
+    }
+
+    fn mirror_resolve_cbuf(
+        &mut self,
+        mappings: &GpuMappings,
+        gpu_addr: u64,
+        len: usize,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<InputSnapshot> {
+        if !input_mirror_enabled() || len == 0 || len > MIRROR_CHUNK_SIZE {
+            return None;
+        }
+        let (cpu_addr, available) = mappings.cpu_range_for(gpu_addr)?;
+        if available < len as u64 {
+            return None;
+        }
+        self.mirror_resolve(cpu_addr, len, mem_read)
+    }
+
+    fn mirror_prepare_chunk(
+        &mut self,
+        key: u64,
+        req_mask: u16,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        forward_spans: &mut Vec<(u64, usize)>,
+    ) -> bool {
+        let chunk_base = key << MIRROR_CHUNK_SHIFT;
+        if !self.mirror.chunks.contains_key(&key) {
+            self.mirror.chunks.insert(
+                key,
+                MirrorChunk {
+                    data: Arc::new(vec![0u8; MIRROR_CHUNK_SIZE]),
+                    dirty: u16::MAX,
+                    serial: 1,
+                    swept_gen: self.mirror.sweep_gen,
+                    touch_epoch: self.mirror.kick_epoch,
+                },
+            );
+            self.mirror.bytes += MIRROR_CHUNK_SIZE;
+        }
+        let sweep_gen = self.mirror.sweep_gen;
+        let kick_epoch = self.mirror.kick_epoch;
+        let ready = 'prepare: {
+            let chunk = self.mirror.chunks.get_mut(&key).unwrap();
+            if chunk.swept_gen != sweep_gen {
+                let pre_spans = forward_spans.len();
+                match nexium_memory::fastmem::take_write_watch_spans(
+                    chunk_base,
+                    MIRROR_CHUNK_SIZE,
+                    forward_spans,
+                ) {
+                    nexium_memory::fastmem::WriteWatchResult::Clean
+                    | nexium_memory::fastmem::WriteWatchResult::Dirty => {
+                        for &(span_addr, span_len) in forward_spans[pre_spans..].iter() {
+                            MirrorPageCache::mark_chunk_dirty(
+                                chunk, chunk_base, span_addr, span_len,
+                            );
+                        }
+                    }
+                    nexium_memory::fastmem::WriteWatchResult::Unavailable => {
+                        break 'prepare false;
+                    }
+                }
+                chunk.swept_gen = sweep_gen;
+            }
+            const MAX_CONSISTENT_READ_ATTEMPTS: usize = 3;
+            let mut attempt = 0;
+            loop {
+                let need = chunk.dirty & req_mask;
+                if need == 0 {
+                    break;
+                }
+                chunk.serial = chunk.serial.wrapping_add(1);
+                let kp_sync = super::pusher::kickprof::start();
+                let data = Arc::make_mut(&mut chunk.data);
+                let mut synced_bytes = 0usize;
+                let mut page = 0usize;
+                let mut read_failed = false;
+                while page < MIRROR_PAGES_PER_CHUNK {
+                    if need & (1 << page) == 0 {
+                        page += 1;
+                        continue;
+                    }
+                    let run_start = page;
+                    while page < MIRROR_PAGES_PER_CHUNK && need & (1 << page) != 0 {
+                        page += 1;
+                    }
+                    let run_off = run_start << MIRROR_PAGE_SHIFT;
+                    let run_len = (page - run_start) << MIRROR_PAGE_SHIFT;
+                    if !mem_read(
+                        chunk_base + run_off as u64,
+                        &mut data[run_off..run_off + run_len],
+                    ) {
+                        read_failed = true;
+                        break;
+                    }
+                    synced_bytes += run_len;
+                }
+                super::pusher::kickprof::add_sized(
+                    super::pusher::kickprof::MIRROR_SYNC,
+                    kp_sync,
+                    synced_bytes,
+                );
+                if read_failed {
+                    break 'prepare false;
+                }
+                let first_page = need.trailing_zeros() as usize;
+                let last_page = 15 - need.leading_zeros() as usize;
+                let recheck_base = chunk_base + ((first_page << MIRROR_PAGE_SHIFT) as u64);
+                let recheck_len = (last_page - first_page + 1) << MIRROR_PAGE_SHIFT;
+                let pre_spans = forward_spans.len();
+                match nexium_memory::fastmem::take_write_watch_spans(
+                    recheck_base,
+                    recheck_len,
+                    forward_spans,
+                ) {
+                    nexium_memory::fastmem::WriteWatchResult::Clean => {
+                        chunk.dirty &= !need;
+                        break;
+                    }
+                    nexium_memory::fastmem::WriteWatchResult::Dirty => {
+                        chunk.dirty &= !need;
+                        for &(span_addr, span_len) in forward_spans[pre_spans..].iter() {
+                            MirrorPageCache::mark_chunk_dirty(
+                                chunk, chunk_base, span_addr, span_len,
+                            );
+                        }
+                        attempt += 1;
+                        if attempt >= MAX_CONSISTENT_READ_ATTEMPTS {
+                            break;
+                        }
+                    }
+                    nexium_memory::fastmem::WriteWatchResult::Unavailable => {
+                        break 'prepare false;
+                    }
+                }
+            }
+            chunk.touch_epoch = kick_epoch;
+            true
+        };
+        if !ready {
+            self.mirror.remove_chunk(key);
+        }
+        ready
+    }
+
+    fn mirror_resolve(
+        &mut self,
+        cpu_addr: u64,
+        len: usize,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<InputSnapshot> {
+        let key = cpu_addr >> MIRROR_CHUNK_SHIFT;
+        let offset = (cpu_addr & (MIRROR_CHUNK_SIZE as u64 - 1)) as usize;
+        if offset + len > MIRROR_CHUNK_SIZE {
+            super::pusher::kickprof::count(super::pusher::kickprof::MIRROR_STRADDLE, 1);
+            return None;
+        }
+        let mut forward_spans = std::mem::take(&mut self.mirror.span_scratch);
+        forward_spans.clear();
+        let req_mask = MirrorPageCache::page_mask(offset, len);
+        let snapshot = if self.mirror_prepare_chunk(key, req_mask, mem_read, &mut forward_spans) {
+            let chunk = self.mirror.chunks.get(&key).unwrap();
+            super::pusher::kickprof::count(super::pusher::kickprof::MIRROR_HIT, 1);
+            Some(InputSnapshot {
+                data: chunk.data.clone(),
+                source_offset: offset,
+            })
+        } else {
+            None
+        };
+        if !forward_spans.is_empty() {
+            self.invalidate_cpu_spans_inner(&forward_spans);
+            forward_spans.clear();
+        }
+        self.mirror.span_scratch = forward_spans;
+        snapshot
+    }
+
+    pub(crate) fn mirror_resident_range(
+        &mut self,
+        mappings: &GpuMappings,
+        binding: u32,
+        stride: u64,
+        gpu_addr: u64,
+        len: usize,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<nexium_gpu::draw::ResidentVertexRange> {
+        const MAX_RESIDENT_CHUNKS: u64 = 512;
+        if len == 0 || nexium_memory::fastmem::base().is_none() {
+            return None;
+        }
+        let (cpu_addr, available) = mappings.cpu_range_for(gpu_addr)?;
+        if available < len as u64 {
+            return None;
+        }
+        let first_key = cpu_addr >> MIRROR_CHUNK_SHIFT;
+        let last_key = cpu_addr.saturating_add(len as u64 - 1) >> MIRROR_CHUNK_SHIFT;
+        if last_key - first_key + 1 > MAX_RESIDENT_CHUNKS {
+            return None;
+        }
+        let mut forward_spans = std::mem::take(&mut self.mirror.span_scratch);
+        forward_spans.clear();
+        let mut chunks = Vec::with_capacity((last_key - first_key + 1) as usize);
+        let mut ok = true;
+        for key in first_key..=last_key {
+            let chunk_base = key << MIRROR_CHUNK_SHIFT;
+            let range_end = cpu_addr + len as u64;
+            let lo = cpu_addr.max(chunk_base);
+            let hi = range_end.min(chunk_base + MIRROR_CHUNK_SIZE as u64);
+            let req_mask =
+                MirrorPageCache::page_mask((lo - chunk_base) as usize, (hi - lo) as usize);
+            if !self.mirror_prepare_chunk(key, req_mask, mem_read, &mut forward_spans) {
+                ok = false;
+                break;
+            }
+            let chunk = self.mirror.chunks.get(&key).unwrap();
+            chunks.push(nexium_gpu::draw::ResidentVertexChunk {
+                chunk_key: key,
+                serial: chunk.serial,
+                data: chunk.data.clone(),
+            });
+        }
+        if !forward_spans.is_empty() {
+            self.invalidate_cpu_spans_inner(&forward_spans);
+            forward_spans.clear();
+        }
+        self.mirror.span_scratch = forward_spans;
+        ok.then(|| nexium_gpu::draw::ResidentVertexRange {
+            binding,
+            stride,
+            cpu_va: cpu_addr,
+            len,
+            chunks,
+        })
+    }
+
+    pub(crate) fn mirror_mark_cpu(&mut self, cpu_addr: u64, len: usize) {
+        self.mirror.mark_dirty(cpu_addr, len);
+    }
+
+    pub(crate) fn mirror_content_key(
+        &mut self,
+        mappings: &GpuMappings,
+        gpu_addr: u64,
+        len: usize,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<u64> {
+        const MAX_KEY_CHUNKS: u64 = 512;
+        if len == 0 || nexium_memory::fastmem::base().is_none() {
+            return None;
+        }
+        let (cpu_addr, available) = mappings.cpu_range_for(gpu_addr)?;
+        if available < len as u64 {
+            return None;
+        }
+        let first_key = cpu_addr >> MIRROR_CHUNK_SHIFT;
+        let last_key = cpu_addr.saturating_add(len as u64 - 1) >> MIRROR_CHUNK_SHIFT;
+        if last_key - first_key + 1 > MAX_KEY_CHUNKS {
+            return None;
+        }
+        let mut forward_spans = std::mem::take(&mut self.mirror.span_scratch);
+        forward_spans.clear();
+        let mut fold: u64 = 0xcbf29ce484222325 ^ len as u64;
+        let mut ok = true;
+        for key in first_key..=last_key {
+            let chunk_base = key << MIRROR_CHUNK_SHIFT;
+            let range_end = cpu_addr + len as u64;
+            let lo = cpu_addr.max(chunk_base);
+            let hi = range_end.min(chunk_base + MIRROR_CHUNK_SIZE as u64);
+            let req_mask =
+                MirrorPageCache::page_mask((lo - chunk_base) as usize, (hi - lo) as usize);
+            if !self.mirror_prepare_chunk(key, req_mask, mem_read, &mut forward_spans) {
+                ok = false;
+                break;
+            }
+            let chunk = self.mirror.chunks.get(&key).unwrap();
+            fold ^= key;
+            fold = fold.wrapping_mul(0x100000001b3);
+            fold ^= chunk.serial;
+            fold = fold.wrapping_mul(0x100000001b3);
+        }
+        if !forward_spans.is_empty() {
+            self.invalidate_cpu_spans_inner(&forward_spans);
+            forward_spans.clear();
+        }
+        self.mirror.span_scratch = forward_spans;
+        ok.then_some(fold ^ cpu_addr)
+    }
+
+    pub(crate) fn mirror_write_through(&mut self, cpu_addr: u64, bytes: &[u8]) -> bool {
+        if !cbuf_writethrough_enabled() || !input_mirror_enabled() {
+            return false;
+        }
+        self.mirror_write_through_unchecked(cpu_addr, bytes)
+    }
+
+    fn mirror_write_through_unchecked(&mut self, cpu_addr: u64, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        let key = cpu_addr >> MIRROR_CHUNK_SHIFT;
+        let offset = (cpu_addr & (MIRROR_CHUNK_SIZE as u64 - 1)) as usize;
+        if offset + bytes.len() > MIRROR_CHUNK_SIZE {
+            return false;
+        }
+        let sweep_gen = self.mirror.sweep_gen;
+        let Some(chunk) = self.mirror.chunks.get_mut(&key) else {
+            return false;
+        };
+        if chunk.swept_gen != sweep_gen {
+            return false;
+        }
+        let data = Arc::make_mut(&mut chunk.data);
+        data[offset..offset + bytes.len()].copy_from_slice(bytes);
+        chunk.serial = chunk.serial.wrapping_add(1);
+        super::pusher::kickprof::count(super::pusher::kickprof::MIRROR_PATCH, 1);
+        true
+    }
+
+    pub(crate) fn defer_patched_gpu_writes(&mut self, writes: &[(u64, u64, usize)]) {
+        self.deferred_patched_writes.extend_from_slice(writes);
+    }
+
+    pub(crate) fn mirror_begin_kick(&mut self) {
+        self.mirror.begin_kick();
+    }
+
+    pub(crate) fn mirror_bump_sweep(&mut self) {
+        self.mirror.bump_sweep();
+    }
+
+    fn invalidate_cpu_spans(&mut self, spans: &[(u64, usize)]) {
+        for &(addr, len) in spans {
+            self.mirror.mark_dirty(addr, len);
+        }
+        self.invalidate_cpu_spans_inner(spans);
+    }
+
+    fn invalidate_cpu_spans_inner(&mut self, spans: &[(u64, usize)]) {
+        let watched = &self.full_watch_ranges;
+        self.entries.retain(|key, _| {
+            !watched.get(key).is_some_and(|entry| {
+                spans
+                    .iter()
+                    .any(|&(addr, len)| byte_ranges_overlap(entry.cpu_addr, entry.len, addr, len))
+            })
+        });
+        self.full_watch_ranges
+            .retain(|key, _| self.entries.contains_key(key));
+        let input_spans: Vec<InputInvalidationSpan> = spans
+            .iter()
+            .copied()
+            .map(|(addr, len)| InputInvalidationSpan {
+                gpu_addr: None,
+                cpu_addr: Some(addr),
+                len,
+                cpu_watch: true,
+            })
+            .collect();
+        self.invalidate_input_spans(&input_spans);
+    }
+
+    pub(crate) fn defer_gpu_writes(&mut self, writes: &[(u64, usize)]) {
+        self.deferred_gpu_writes.extend_from_slice(writes);
+    }
+
+    pub(crate) fn refresh_deferred_writes(&mut self, mappings: &GpuMappings) {
+        if !self.deferred_gpu_writes.is_empty() {
+            let writes = std::mem::take(&mut self.deferred_gpu_writes);
+            self.invalidate_gpu_writes(mappings, &writes);
+        }
+        if !self.deferred_patched_writes.is_empty() {
+            let writes = std::mem::take(&mut self.deferred_patched_writes);
+            let kp = super::pusher::kickprof::start();
+            if !self.entries.is_empty() {
+                self.entries.retain(|key, _| {
+                    let entry_gpu = key.guest_addr.saturating_add(key.data_offset as u64);
+                    !writes.iter().any(|&(gpu_addr, _, len)| {
+                        byte_ranges_overlap(entry_gpu, key.read_len, gpu_addr, len)
+                    })
+                });
+                self.full_watch_ranges
+                    .retain(|key, _| self.entries.contains_key(key));
+            }
+            let spans: Vec<InputInvalidationSpan> = writes
+                .iter()
+                .map(|&(gpu_addr, cpu_addr, len)| InputInvalidationSpan {
+                    gpu_addr: Some(gpu_addr),
+                    cpu_addr: Some(cpu_addr),
+                    len,
+                    cpu_watch: false,
+                })
+                .collect();
+            self.invalidate_input_spans(&spans);
+            super::pusher::kickprof::add(super::pusher::kickprof::GPU_INVAL, kp);
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
+        self.mirror.clear_all();
+        self.input_mutation_epoch = self.input_mutation_epoch.wrapping_add(1);
+        for states in self.cbuf_slot_states.iter_mut() {
+            states.clear();
+        }
+        super::pusher::kickprof::count_sized(
+            super::pusher::kickprof::KM_CACHE_CLEAR,
+            1,
+            self.input_entries.len(),
+        );
+        self.clear_ssbo_snapshots();
+        let input_keys: Vec<InputRangeKey> = self.input_entries.keys().copied().collect();
+        for key in input_keys {
+            self.remove_input_entry(key);
+        }
+        self.input_sources.clear();
+        self.input_cbuf_covering.clear();
+        self.input_gpu_pages.clear();
+        self.input_cpu_pages.clear();
+        self.input_invalidation_candidates.clear();
+        self.input_invalidation_seen.clear();
+        self.input_order.clear();
+        self.input_bytes = 0;
+        self.input_gpu_bounds = (u64::MAX, 0);
+        self.input_cpu_bounds = (u64::MAX, 0);
+        self.last_input = None;
+        self.recent_cbuf_requests.fill(None);
+        self.recent_cbuf_request_index.clear();
+        self.recent_cbuf_cursor = 0;
+        self.deferred_gpu_writes.clear();
+        self.deferred_patched_writes.clear();
+        self.prepared_index_entries.clear();
+        self.prepared_index_order.clear();
+        self.prepared_index_bytes = 0;
+    }
+
+    pub(crate) fn clear_ssbo_snapshots(&mut self) {
         self.entries.clear();
         self.full_watch_ranges.clear();
         self.watch_query_ranges.clear();
+        self.ssbo_gpu_bounds = (u64::MAX, 0);
+        self.ssbo_cpu_bounds = (u64::MAX, 0);
     }
 
     pub(crate) fn retain_watchable_full_aurora_snapshots(&mut self) {
@@ -624,6 +2507,7 @@ impl SsboSnapshotCache {
     }
 
     fn invalidate_cpu_write(&mut self, write: HostWatchRange) {
+        self.mirror.mark_dirty(write.cpu_addr, write.len);
         let watched = &self.full_watch_ranges;
         self.entries.retain(|key, _| {
             !watched.get(key).is_some_and(|entry| {
@@ -632,6 +2516,12 @@ impl SsboSnapshotCache {
         });
         self.full_watch_ranges
             .retain(|key, _| self.entries.contains_key(key));
+        self.invalidate_input_spans(&[InputInvalidationSpan {
+            gpu_addr: None,
+            cpu_addr: Some(write.cpu_addr),
+            len: write.len,
+            cpu_watch: true,
+        }]);
     }
 
     pub(crate) fn invalidate_gpu_write(
@@ -640,46 +2530,164 @@ impl SsboSnapshotCache {
         gpu_addr: u64,
         len: usize,
     ) {
-        if len == 0 || self.entries.is_empty() {
+        self.invalidate_gpu_writes(mappings, &[(gpu_addr, len)]);
+    }
+
+    pub(crate) fn invalidate_gpu_writes(
+        &mut self,
+        mappings: &GpuMappings,
+        writes: &[(u64, usize)],
+    ) {
+        if !self.mirror.chunks.is_empty() {
+            for &(gpu_addr, len) in writes {
+                if len == 0 {
+                    continue;
+                }
+                let cpu = mappings.cpu_address_for(gpu_addr).or_else(|| {
+                    mappings
+                        .cpu_address_for_any32(gpu_addr)
+                        .map(|(_, cpu, _)| cpu)
+                });
+                if let Some(cpu) = cpu {
+                    self.mirror.mark_dirty(cpu, len);
+                }
+            }
+        }
+        if writes.is_empty() || (self.entries.is_empty() && self.input_entries.is_empty()) {
+            return;
+        }
+        let kp = super::pusher::kickprof::start();
+        let before = self.input_entries.len();
+        let result = self.invalidate_gpu_writes_inner(mappings, writes);
+        super::pusher::kickprof::add(super::pusher::kickprof::GPU_INVAL, kp);
+        super::pusher::kickprof::count(
+            super::pusher::kickprof::GPU_INVAL_N,
+            before.saturating_sub(self.input_entries.len()) as u64,
+        );
+        result
+    }
+
+    fn invalidate_gpu_writes_inner(&mut self, mappings: &GpuMappings, writes: &[(u64, usize)]) {
+        let writes: Vec<(u64, usize, Option<u64>)> = writes
+            .iter()
+            .copied()
+            .filter(|(_, len)| *len != 0)
+            .map(|(gpu_addr, len)| {
+                let cpu = mappings.cpu_address_for(gpu_addr).or_else(|| {
+                    mappings
+                        .cpu_address_for_any32(gpu_addr)
+                        .map(|(_, cpu, _)| cpu)
+                });
+                (gpu_addr, len, cpu)
+            })
+            .collect();
+        if writes.is_empty() {
+            return;
+        }
+        let ssbo_possible = !self.entries.is_empty()
+            && writes.iter().any(|&(gpu_addr, len, write_cpu)| {
+                span_hits_bounds(self.ssbo_gpu_bounds, gpu_addr, len)
+                    || write_cpu.is_some_and(|cpu| span_hits_bounds(self.ssbo_cpu_bounds, cpu, len))
+            });
+        let input_possible = !self.input_entries.is_empty()
+            && writes.iter().any(|&(gpu_addr, len, write_cpu)| {
+                span_hits_bounds(self.input_gpu_bounds, gpu_addr, len)
+                    || write_cpu
+                        .is_some_and(|cpu| span_hits_bounds(self.input_cpu_bounds, cpu, len))
+            });
+        if ssbo_possible {
+            self.entries.retain(|key, _| {
+                let entry_gpu = key.guest_addr.saturating_add(key.data_offset as u64);
+                let entry_cpu = mappings.cpu_address_for(entry_gpu).or_else(|| {
+                    mappings
+                        .cpu_address_for_any32(entry_gpu)
+                        .map(|(_, cpu, _)| cpu)
+                });
+                !writes.iter().any(|&(gpu_addr, len, write_cpu)| {
+                    byte_ranges_overlap(entry_gpu, key.read_len, gpu_addr, len)
+                        || entry_cpu.is_some_and(|entry_cpu| {
+                            write_cpu.is_some_and(|write_cpu| {
+                                byte_ranges_overlap(entry_cpu, key.read_len, write_cpu, len)
+                            })
+                        })
+                })
+            });
+            self.full_watch_ranges
+                .retain(|key, _| self.entries.contains_key(key));
+        }
+        if input_possible {
+            let input_spans: Vec<InputInvalidationSpan> = writes
+                .iter()
+                .map(|&(gpu_addr, len, cpu_addr)| InputInvalidationSpan {
+                    gpu_addr: Some(gpu_addr),
+                    cpu_addr,
+                    len,
+                    cpu_watch: false,
+                })
+                .collect();
+            self.invalidate_input_spans(&input_spans);
+        }
+    }
+
+    fn invalidate_guest_write_chunks(
+        &mut self,
+        mappings: &GpuMappings,
+        chunks: &[GuestWriteChunk],
+    ) {
+        for chunk in chunks {
+            self.mirror.mark_dirty(chunk.cpu_addr, chunk.len);
+        }
+        if chunks.is_empty() || (self.entries.is_empty() && self.input_entries.is_empty()) {
             return;
         }
 
-        let write_cpu = mappings.cpu_address_for(gpu_addr).or_else(|| {
-            mappings
-                .cpu_address_for_any32(gpu_addr)
-                .map(|(_, cpu, _)| cpu)
-        });
         self.entries.retain(|key, _| {
             let entry_gpu = key.guest_addr.saturating_add(key.data_offset as u64);
-            let direct_overlap = byte_ranges_overlap(entry_gpu, key.read_len, gpu_addr, len);
-            let alias_overlap = write_cpu.is_some_and(|write_cpu| {
+            let entry_cpu = mappings.cpu_address_for(entry_gpu).or_else(|| {
                 mappings
-                    .cpu_address_for(entry_gpu)
-                    .or_else(|| {
-                        mappings
-                            .cpu_address_for_any32(entry_gpu)
-                            .map(|(_, cpu, _)| cpu)
-                    })
-                    .is_some_and(|entry_cpu| {
-                        byte_ranges_overlap(entry_cpu, key.read_len, write_cpu, len)
-                    })
+                    .cpu_address_for_any32(entry_gpu)
+                    .map(|(_, cpu, _)| cpu)
             });
-            !direct_overlap && !alias_overlap
+            !chunks.iter().any(|chunk| {
+                byte_ranges_overlap(entry_gpu, key.read_len, chunk.gpu_va, chunk.len)
+                    || entry_cpu.is_some_and(|entry_cpu| {
+                        byte_ranges_overlap(entry_cpu, key.read_len, chunk.cpu_addr, chunk.len)
+                    })
+            })
         });
         self.full_watch_ranges
             .retain(|key, _| self.entries.contains_key(key));
+        let input_spans: Vec<InputInvalidationSpan> = chunks
+            .iter()
+            .map(|chunk| InputInvalidationSpan {
+                gpu_addr: Some(chunk.gpu_va),
+                cpu_addr: Some(chunk.cpu_addr),
+                len: chunk.len,
+                cpu_watch: false,
+            })
+            .collect();
+        self.invalidate_input_spans(&input_spans);
     }
 
     pub(crate) fn reset_epoch(&mut self) {
-        self.clear();
+        self.clear_ssbo_snapshots();
         self.hits = 0;
         self.misses = 0;
         self.bytes_read = 0;
+        self.input_hits = 0;
+        self.input_misses = 0;
+        self.input_bytes_read = 0;
+        self.prepared_index_hits = 0;
+        self.prepared_index_misses = 0;
+        self.last_input = None;
+        self.deferred_gpu_writes.clear();
     }
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+            && self.input_entries.is_empty()
+            && self.prepared_index_entries.is_empty()
     }
 
     pub(crate) fn profile_epoch(&self) {
@@ -691,6 +2699,20 @@ impl SsboSnapshotCache {
                 self.bytes_read,
             );
         }
+        if self.input_profile && (self.input_hits != 0 || self.input_misses != 0) {
+            log::warn!(
+                "[input-cache-profile] hits={} misses={} bytes_read={} entries={} bytes={} index_hits={} index_misses={} index_entries={} index_bytes={}",
+                self.input_hits,
+                self.input_misses,
+                self.input_bytes_read,
+                self.input_entries.len(),
+                self.input_bytes,
+                self.prepared_index_hits,
+                self.prepared_index_misses,
+                self.prepared_index_entries.len(),
+                self.prepared_index_bytes,
+            );
+        }
     }
 }
 
@@ -699,6 +2721,18 @@ fn byte_ranges_overlap(a: u64, a_len: usize, b: u64, b_len: usize) -> bool {
         && b_len != 0
         && a < b.saturating_add(b_len as u64)
         && b < a.saturating_add(a_len as u64)
+}
+
+fn expand_bounds(bounds: &mut (u64, u64), addr: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    bounds.0 = bounds.0.min(addr);
+    bounds.1 = bounds.1.max(addr.saturating_add(len as u64));
+}
+
+fn span_hits_bounds(bounds: (u64, u64), addr: u64, len: usize) -> bool {
+    len != 0 && addr < bounds.1 && bounds.0 < addr.saturating_add(len as u64)
 }
 
 fn copy_mapped_cbuf_bytes(
@@ -731,10 +2765,10 @@ fn copy_mapped_cbuf_bytes(
         if readable_len == 0 {
             break;
         }
-        let mut readable = vec![0u8; readable_len];
-        if mem_read(cpu_addr, &mut readable) {
-            dst[cursor..cursor + readable_len].copy_from_slice(&readable);
+        if mem_read(cpu_addr, &mut dst[cursor..cursor + readable_len]) {
             copied_any = true;
+        } else {
+            dst[cursor..cursor + readable_len].fill(0);
         }
         cursor += readable_len;
     }
@@ -781,30 +2815,330 @@ fn tic_snapshot_layer_count(tic: &nexium_gpu::texture::TicEntry) -> u32 {
     }
 }
 
-fn finish_ssbo_flush_boundary(cache: &mut SsboSnapshotCache, guest_writeback: bool) {
-    if guest_writeback {
-        cache.clear();
-    } else {
-        cache.retain_watchable_full_aurora_snapshots();
+fn finish_ssbo_flush_boundary(cache: &mut SsboSnapshotCache) {
+    cache.retain_watchable_full_aurora_snapshots();
+}
+
+fn compute_graphics_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_COMPUTE_GRAPHICS_PROFILE").is_some())
+}
+
+fn overlap_bytes(a: u64, a_len: usize, b: u64, b_len: usize) -> usize {
+    if a_len == 0 || b_len == 0 {
+        return 0;
+    }
+    let start = a.max(b);
+    let end = a
+        .saturating_add(a_len as u64)
+        .min(b.saturating_add(b_len as u64));
+    end.saturating_sub(start) as usize
+}
+
+fn range_contains(outer: u64, outer_len: usize, inner: u64, inner_len: usize) -> bool {
+    inner_len != 0
+        && inner >= outer
+        && inner.saturating_add(inner_len as u64) <= outer.saturating_add(outer_len as u64)
+}
+
+#[derive(Clone, Copy)]
+struct ComputeGraphicsFirstMatch {
+    vs: u64,
+    ssbo_binding: u32,
+    read_gpu: u64,
+    read_cpu: u64,
+    read_len: usize,
+    dispatch_id: u64,
+    compute_binding: u32,
+    compute_gpu: u64,
+    compute_cpu: u64,
+    compute_len: usize,
+}
+
+pub(crate) struct ComputeGraphicsProbe {
+    raw_records: usize,
+    raw_dispatches: usize,
+    raw_spans: Vec<super::engines::maxwell_compute::PendingComputeWritebackSpan>,
+    raw_bytes: usize,
+    requests: usize,
+    clear_requests: usize,
+    draw_texture_requests: usize,
+    normal_requests: usize,
+    draws: usize,
+    ssbo_reads: usize,
+    unresolved: usize,
+    overlap_reads: usize,
+    overlap_pairs: usize,
+    overlap_bytes: usize,
+    bindable_reads: usize,
+    exact_reads: usize,
+    first: Option<ComputeGraphicsFirstMatch>,
+}
+
+impl ComputeGraphicsProbe {
+    pub(crate) fn new(
+        spans: &[super::engines::maxwell_compute::PendingComputeWritebackSpan],
+    ) -> Option<Self> {
+        if !compute_graphics_profile_enabled() {
+            return None;
+        }
+        let raw_records = spans.iter().filter(|span| span.raw).count();
+        let raw_dispatches = spans
+            .iter()
+            .filter(|span| span.raw)
+            .map(|span| span.dispatch_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let mut seen = std::collections::HashSet::new();
+        let mut raw_spans = spans
+            .iter()
+            .rev()
+            .filter(|span| span.raw)
+            .filter(|span| seen.insert((span.gpu_va, span.cpu_addr, span.len)))
+            .copied()
+            .collect::<Vec<_>>();
+        raw_spans.reverse();
+        if raw_spans.is_empty() {
+            return None;
+        }
+        let raw_bytes = raw_spans.iter().map(|span| span.len).sum();
+        Some(Self {
+            raw_records,
+            raw_dispatches,
+            raw_spans,
+            raw_bytes,
+            requests: 0,
+            clear_requests: 0,
+            draw_texture_requests: 0,
+            normal_requests: 0,
+            draws: 0,
+            ssbo_reads: 0,
+            unresolved: 0,
+            overlap_reads: 0,
+            overlap_pairs: 0,
+            overlap_bytes: 0,
+            bindable_reads: 0,
+            exact_reads: 0,
+            first: None,
+        })
+    }
+
+    fn record_request(&mut self, draw: &DrawCall) {
+        self.requests += 1;
+        if draw.is_clear {
+            self.clear_requests += 1;
+        } else if draw.draw_texture.is_some() {
+            self.draw_texture_requests += 1;
+        } else {
+            self.normal_requests += 1;
+        }
+    }
+
+    fn record_call(&mut self, call: &Maxwell3dDrawCall, mappings: &GpuMappings) {
+        self.draws += 1;
+        for snapshot in &call.ssbo_data {
+            if snapshot.guest_addr == 0 {
+                self.unresolved += 1;
+                continue;
+            }
+            let read_gpu = snapshot
+                .guest_addr
+                .saturating_add(snapshot.data_offset as u64);
+            let read_len = snapshot.data.len();
+            let read_cpu = mappings
+                .cpu_range_for(read_gpu)
+                .map(|(cpu, _)| cpu)
+                .or_else(|| {
+                    mappings
+                        .cpu_address_for_any32(read_gpu)
+                        .map(|(_, cpu, _)| cpu)
+                })
+                .unwrap_or(0);
+            self.ssbo_reads += 1;
+            let mut read_overlapped = false;
+            let mut read_bindable = false;
+            let mut read_exact = false;
+            for span in &self.raw_spans {
+                let gpu_overlap = overlap_bytes(read_gpu, read_len, span.gpu_va, span.len);
+                let cpu_overlap = overlap_bytes(read_cpu, read_len, span.cpu_addr, span.len);
+                let bytes = gpu_overlap.max(cpu_overlap);
+                if bytes == 0 {
+                    continue;
+                }
+                read_overlapped = true;
+                self.overlap_pairs += 1;
+                self.overlap_bytes += bytes;
+                let binding_cpu = mappings
+                    .cpu_range_for(snapshot.guest_addr)
+                    .map(|(cpu, _)| cpu)
+                    .or_else(|| {
+                        mappings
+                            .cpu_address_for_any32(snapshot.guest_addr)
+                            .map(|(_, cpu, _)| cpu)
+                    })
+                    .unwrap_or(0);
+                let bindable = range_contains(
+                    span.gpu_va,
+                    span.len,
+                    snapshot.guest_addr,
+                    snapshot.logical_size,
+                ) || range_contains(
+                    span.cpu_addr,
+                    span.len,
+                    binding_cpu,
+                    snapshot.logical_size,
+                );
+                let exact = (snapshot.guest_addr == span.gpu_va
+                    || (binding_cpu != 0 && binding_cpu == span.cpu_addr))
+                    && snapshot.logical_size == span.len;
+                read_bindable |= bindable;
+                read_exact |= exact;
+                if self.first.is_none() {
+                    self.first = Some(ComputeGraphicsFirstMatch {
+                        vs: call.vs_gpu_va,
+                        ssbo_binding: snapshot.binding,
+                        read_gpu,
+                        read_cpu,
+                        read_len,
+                        dispatch_id: span.dispatch_id,
+                        compute_binding: span.binding,
+                        compute_gpu: span.gpu_va,
+                        compute_cpu: span.cpu_addr,
+                        compute_len: span.len,
+                    });
+                }
+            }
+            self.overlap_reads += usize::from(read_overlapped);
+            self.bindable_reads += usize::from(read_bindable);
+            self.exact_reads += usize::from(read_exact);
+        }
+    }
+
+    pub(crate) fn finish(self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static EVENTS: AtomicU64 = AtomicU64::new(0);
+        static HIT_EVENTS: AtomicU64 = AtomicU64::new(0);
+        static RAW_RECORDS: AtomicU64 = AtomicU64::new(0);
+        static RAW_RANGES: AtomicU64 = AtomicU64::new(0);
+        static REQUESTS: AtomicU64 = AtomicU64::new(0);
+        static CLEAR_REQUESTS: AtomicU64 = AtomicU64::new(0);
+        static DRAW_TEXTURE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+        static NORMAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
+        static DRAWS: AtomicU64 = AtomicU64::new(0);
+        static SSBO_READS: AtomicU64 = AtomicU64::new(0);
+        static OVERLAP_READS: AtomicU64 = AtomicU64::new(0);
+        static BINDABLE_READS: AtomicU64 = AtomicU64::new(0);
+        static EXACT_READS: AtomicU64 = AtomicU64::new(0);
+        static UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+
+        let event = EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+        HIT_EVENTS.fetch_add(u64::from(self.overlap_reads != 0), Ordering::Relaxed);
+        RAW_RECORDS.fetch_add(self.raw_records as u64, Ordering::Relaxed);
+        RAW_RANGES.fetch_add(self.raw_spans.len() as u64, Ordering::Relaxed);
+        REQUESTS.fetch_add(self.requests as u64, Ordering::Relaxed);
+        CLEAR_REQUESTS.fetch_add(self.clear_requests as u64, Ordering::Relaxed);
+        DRAW_TEXTURE_REQUESTS.fetch_add(self.draw_texture_requests as u64, Ordering::Relaxed);
+        NORMAL_REQUESTS.fetch_add(self.normal_requests as u64, Ordering::Relaxed);
+        DRAWS.fetch_add(self.draws as u64, Ordering::Relaxed);
+        SSBO_READS.fetch_add(self.ssbo_reads as u64, Ordering::Relaxed);
+        OVERLAP_READS.fetch_add(self.overlap_reads as u64, Ordering::Relaxed);
+        BINDABLE_READS.fetch_add(self.bindable_reads as u64, Ordering::Relaxed);
+        EXACT_READS.fetch_add(self.exact_reads as u64, Ordering::Relaxed);
+        UNRESOLVED.fetch_add(self.unresolved as u64, Ordering::Relaxed);
+        if event > 8 && event % 32 != 0 {
+            return;
+        }
+        let first = self.first.map_or_else(
+            || "none".to_string(),
+            |first| {
+                format!(
+                    "vs={:#x}/ssbo={}/read={:#x}:{:#x}:{:#x}/compute={}:{}:{:#x}:{:#x}:{:#x}",
+                    first.vs,
+                    first.ssbo_binding,
+                    first.read_gpu,
+                    first.read_cpu,
+                    first.read_len,
+                    first.dispatch_id,
+                    first.compute_binding,
+                    first.compute_gpu,
+                    first.compute_cpu,
+                    first.compute_len,
+                )
+            },
+        );
+        log::warn!(
+            "[compute-graphics] event={} local=dispatches:{} records:{} ranges:{} bytes:{:#x} requests:{} clears:{} drawtex:{} normal:{} draws:{} ssbos:{} unresolved:{} overlaps:{} pairs:{} overlap_bytes:{:#x} bindable:{} exact:{} first={} total=events:{} hit_events:{} records:{} ranges:{} requests:{} clears:{} drawtex:{} normal:{} draws:{} ssbos:{} unresolved:{} overlaps:{} bindable:{} exact:{}",
+            event,
+            self.raw_dispatches,
+            self.raw_records,
+            self.raw_spans.len(),
+            self.raw_bytes,
+            self.requests,
+            self.clear_requests,
+            self.draw_texture_requests,
+            self.normal_requests,
+            self.draws,
+            self.ssbo_reads,
+            self.unresolved,
+            self.overlap_reads,
+            self.overlap_pairs,
+            self.overlap_bytes,
+            self.bindable_reads,
+            self.exact_reads,
+            first,
+            EVENTS.load(Ordering::Relaxed),
+            HIT_EVENTS.load(Ordering::Relaxed),
+            RAW_RECORDS.load(Ordering::Relaxed),
+            RAW_RANGES.load(Ordering::Relaxed),
+            REQUESTS.load(Ordering::Relaxed),
+            CLEAR_REQUESTS.load(Ordering::Relaxed),
+            DRAW_TEXTURE_REQUESTS.load(Ordering::Relaxed),
+            NORMAL_REQUESTS.load(Ordering::Relaxed),
+            DRAWS.load(Ordering::Relaxed),
+            SSBO_READS.load(Ordering::Relaxed),
+            UNRESOLVED.load(Ordering::Relaxed),
+            OVERLAP_READS.load(Ordering::Relaxed),
+            BINDABLE_READS.load(Ordering::Relaxed),
+            EXACT_READS.load(Ordering::Relaxed),
+        );
     }
 }
 
 pub(crate) fn enqueue_draws(
     draws: &[DrawCall],
     batch: &mut Vec<Maxwell3dDrawCall>,
+    packetizer: &mut PreparedDrawPacketizer,
     ssbo_snapshot_cache: &mut SsboSnapshotCache,
     mappings: &GpuMappings,
-    maxwell: &Maxwell3D,
+    gs_debug: Option<&GsDebugRegs>,
     renderer: &Arc<nexium_gpu::Renderer>,
     maxwell_dma: &mut super::engines::MaxwellDma,
+    fermi_2d: &super::engines::Fermi2D,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    mut compute_probe: Option<&mut ComputeGraphicsProbe>,
 ) {
+    ssbo_snapshot_cache.refresh_deferred_writes(mappings);
     for draw in draws {
+        if let Some(probe) = compute_probe.as_deref_mut() {
+            probe.record_request(draw);
+        }
         if !draw.is_clear {
             if render_enable_needs_ordered_read(draw) {
-                flush_accum(batch, renderer, mappings, mem_read, mem_write);
-                ssbo_snapshot_cache.clear();
+                record_enqueue_flush_reason(
+                    batch,
+                    super::pusher::kickprof::FLUSH_ENQUEUE_RENDER_ENABLE,
+                );
+                flush_accum(
+                    batch,
+                    renderer,
+                    mappings,
+                    mem_read,
+                    mem_write,
+                    ssbo_snapshot_cache,
+                    packetizer,
+                );
+                finish_ssbo_flush_boundary(ssbo_snapshot_cache);
             }
             if !render_enabled(draw, mappings, mem_read) {
                 bump_draw_drop(
@@ -818,8 +3152,17 @@ pub(crate) fn enqueue_draws(
             }
         }
         if draw.draw_texture.is_some() {
-            flush_accum(batch, renderer, mappings, mem_read, mem_write);
-            ssbo_snapshot_cache.clear();
+            record_enqueue_flush_reason(batch, super::pusher::kickprof::FLUSH_ENQUEUE_DRAW_TEXTURE);
+            flush_accum(
+                batch,
+                renderer,
+                mappings,
+                mem_read,
+                mem_write,
+                ssbo_snapshot_cache,
+                packetizer,
+            );
+            finish_ssbo_flush_boundary(ssbo_snapshot_cache);
             match prepare_draw_texture_job(draw, mappings, mem_read) {
                 Ok(job) => {
                     if let Some(rt_thread) = crate::render_thread::maybe_render_thread() {
@@ -851,13 +3194,23 @@ pub(crate) fn enqueue_draws(
             continue;
         }
         if draw.is_clear {
-            let guest_writeback = flush_accum(batch, renderer, mappings, mem_read, mem_write);
-            finish_ssbo_flush_boundary(ssbo_snapshot_cache, guest_writeback);
+            record_enqueue_flush_reason(batch, super::pusher::kickprof::FLUSH_ENQUEUE_CLEAR);
+            flush_accum(
+                batch,
+                renderer,
+                mappings,
+                mem_read,
+                mem_write,
+                ssbo_snapshot_cache,
+                packetizer,
+            );
+            finish_ssbo_flush_boundary(ssbo_snapshot_cache);
             if let Err(e) = execute_one(
                 draw,
                 mappings,
-                maxwell,
+                gs_debug,
                 maxwell_dma,
+                fermi_2d,
                 renderer,
                 ssbo_snapshot_cache,
                 mem_read,
@@ -868,38 +3221,73 @@ pub(crate) fn enqueue_draws(
             continue;
         }
         let flush_predicted_boundary = batch.last().is_some_and(|last| {
-            match draw_rt_binding_signature(draw, mappings, maxwell, mem_read) {
+            match draw_rt_binding_signature(draw, mappings, mem_read) {
                 Ok(signature) => !signature.matches_call(last),
                 Err(_) => false,
             }
         });
+        let predicted_boundary_usage = flush_predicted_boundary
+            .then(|| {
+                super::pusher::kickprof::enabled().then(|| {
+                    (
+                        RtBatchUsage::from_calls(batch),
+                        has_pending_small_rt_writebacks(),
+                    )
+                })
+            })
+            .flatten();
         if flush_predicted_boundary {
-            let guest_writeback = flush_accum(batch, renderer, mappings, mem_read, mem_write);
-            finish_ssbo_flush_boundary(ssbo_snapshot_cache, guest_writeback);
+            record_enqueue_flush_reason(batch, super::pusher::kickprof::FLUSH_ENQUEUE_RT_SIGNATURE);
+            flush_accum_soft(
+                batch,
+                renderer,
+                mappings,
+                mem_read,
+                mem_write,
+                ssbo_snapshot_cache,
+                packetizer,
+            );
+            finish_ssbo_flush_boundary(ssbo_snapshot_cache);
         }
         match execute_one(
             draw,
             mappings,
-            maxwell,
+            gs_debug,
             maxwell_dma,
+            fermi_2d,
             renderer,
             ssbo_snapshot_cache,
             mem_read,
         ) {
             Ok(None) => {}
             Ok(Some(mut call)) => {
+                if let Some((prior_usage, small_rt_pending)) = predicted_boundary_usage.as_ref() {
+                    record_rt_signature_boundary_profile(prior_usage, &call, *small_rt_pending);
+                }
                 let flush_prior = batch
                     .last()
                     .is_some_and(|last| !same_rt_bindings(last, &call));
                 if flush_prior {
-                    let guest_writeback =
-                        flush_accum(batch, renderer, mappings, mem_read, mem_write);
-                    finish_ssbo_flush_boundary(ssbo_snapshot_cache, guest_writeback);
+                    record_enqueue_flush_reason(
+                        batch,
+                        super::pusher::kickprof::FLUSH_ENQUEUE_RT_REBUILD,
+                    );
+                    flush_accum_soft(
+                        batch,
+                        renderer,
+                        mappings,
+                        mem_read,
+                        mem_write,
+                        ssbo_snapshot_cache,
+                        packetizer,
+                    );
+                    finish_ssbo_flush_boundary(ssbo_snapshot_cache);
                     call = match execute_one(
                         draw,
                         mappings,
-                        maxwell,
+                        gs_debug,
                         maxwell_dma,
+                        fermi_2d,
                         renderer,
                         ssbo_snapshot_cache,
                         mem_read,
@@ -907,6 +3295,19 @@ pub(crate) fn enqueue_draws(
                         Ok(Some(rebuilt)) => rebuilt,
                         Ok(None) => continue,
                         Err(e) => {
+                            record_enqueue_flush_reason(
+                                batch,
+                                super::pusher::kickprof::FLUSH_ENQUEUE_PREP_FAIL,
+                            );
+                            flush_accum(
+                                batch,
+                                renderer,
+                                mappings,
+                                mem_read,
+                                mem_write,
+                                ssbo_snapshot_cache,
+                                packetizer,
+                            );
                             log::debug!("vk_dispatch: boundary rebuild failed: {}", e);
                             bump_draw_drop(2, &e);
                             ssbo_snapshot_cache.clear();
@@ -922,15 +3323,41 @@ pub(crate) fn enqueue_draws(
                     };
                 }
                 register_small_rt_after_prior_work(call.rt_key, call.small_rt_tile_mode, || {});
+                if let Some(probe) = compute_probe.as_deref_mut() {
+                    probe.record_call(&call, mappings);
+                }
                 batch.push(call);
                 if batch.len() >= MAX_ACCUMULATED_DRAWS {
-                    let guest_writeback =
-                        flush_accum(batch, renderer, mappings, mem_read, mem_write);
-                    finish_ssbo_flush_boundary(ssbo_snapshot_cache, guest_writeback);
+                    record_enqueue_flush_reason(
+                        batch,
+                        super::pusher::kickprof::FLUSH_ENQUEUE_CAPACITY,
+                    );
+                    flush_accum_soft(
+                        batch,
+                        renderer,
+                        mappings,
+                        mem_read,
+                        mem_write,
+                        ssbo_snapshot_cache,
+                        packetizer,
+                    );
+                    finish_ssbo_flush_boundary(ssbo_snapshot_cache);
                 }
             }
             Err(e) => {
-                flush_accum(batch, renderer, mappings, mem_read, mem_write);
+                record_enqueue_flush_reason(
+                    batch,
+                    super::pusher::kickprof::FLUSH_ENQUEUE_PREP_FAIL,
+                );
+                flush_accum(
+                    batch,
+                    renderer,
+                    mappings,
+                    mem_read,
+                    mem_write,
+                    ssbo_snapshot_cache,
+                    packetizer,
+                );
                 ssbo_snapshot_cache.clear();
                 log::debug!("vk_dispatch: sw fallback: {}", e);
                 bump_draw_drop(2, &e);
@@ -1058,9 +3485,17 @@ fn read_gpu_strict(
     gpu_va: u64,
     len: usize,
 ) -> Option<Vec<u8>> {
-    let mut data = vec![0u8; len];
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let mut data = Vec::<std::mem::MaybeUninit<u8>>::with_capacity(len);
+    unsafe {
+        data.set_len(len);
+    }
+    let capacity = data.capacity();
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u8>(), len) };
     let mut offset = 0usize;
-    while offset < data.len() {
+    while offset < bytes.len() {
         let Some(va) = gpu_va.checked_add(offset as u64) else {
             trace_gpu_read_failure(mappings, gpu_va, len, gpu_va, None, 0, "overflow");
             return None;
@@ -1071,7 +3506,7 @@ fn read_gpu_strict(
         };
         let take = usize::try_from(remaining)
             .unwrap_or(usize::MAX)
-            .min(data.len() - offset);
+            .min(bytes.len() - offset);
         if take == 0 {
             trace_gpu_read_failure(
                 mappings,
@@ -1084,13 +3519,15 @@ fn read_gpu_strict(
             );
             return None;
         }
-        if !mem_read(cpu, &mut data[offset..offset + take]) {
+        if !mem_read(cpu, &mut bytes[offset..offset + take]) {
             trace_gpu_read_failure(mappings, gpu_va, len, va, Some(cpu), remaining, "cpu-read");
             return None;
         }
         offset += take;
     }
-    Some(data)
+    let ptr = data.as_mut_ptr().cast::<u8>();
+    std::mem::forget(data);
+    Some(unsafe { Vec::from_raw_parts(ptr, len, capacity) })
 }
 
 fn trace_gpu_read_failure(
@@ -1132,14 +3569,68 @@ fn trace_gpu_read_failure(
     );
 }
 
-pub fn flush_accum(
+fn record_enqueue_flush_reason(batch: &[Maxwell3dDrawCall], phase: usize) {
+    if !batch.is_empty() {
+        super::pusher::kickprof::count(phase, 1);
+    }
+}
+
+pub(crate) fn flush_accum(
     batch: &mut Vec<Maxwell3dDrawCall>,
     renderer: &Arc<nexium_gpu::Renderer>,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    snapshot_cache: &mut SsboSnapshotCache,
+    packetizer: &mut PreparedDrawPacketizer,
+) -> bool {
+    flush_accum_with_boundary(
+        batch,
+        renderer,
+        mappings,
+        mem_read,
+        mem_write,
+        snapshot_cache,
+        packetizer,
+        true,
+    )
+}
+
+pub(crate) fn flush_accum_soft(
+    batch: &mut Vec<Maxwell3dDrawCall>,
+    renderer: &Arc<nexium_gpu::Renderer>,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    snapshot_cache: &mut SsboSnapshotCache,
+    packetizer: &mut PreparedDrawPacketizer,
+) -> bool {
+    flush_accum_with_boundary(
+        batch,
+        renderer,
+        mappings,
+        mem_read,
+        mem_write,
+        snapshot_cache,
+        packetizer,
+        false,
+    )
+}
+
+fn flush_accum_with_boundary(
+    batch: &mut Vec<Maxwell3dDrawCall>,
+    renderer: &Arc<nexium_gpu::Renderer>,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    mem_write: &dyn Fn(u64, &[u8]) -> bool,
+    snapshot_cache: &mut SsboSnapshotCache,
+    packetizer: &mut PreparedDrawPacketizer,
+    hard_after: bool,
 ) -> bool {
     if batch.is_empty() {
+        if hard_after {
+            packetizer.drain_hard();
+        }
         return false;
     }
     let kickoff_profile = super::pusher::kickprof::start();
@@ -1149,15 +3640,34 @@ pub fn flush_accum(
     let read_guest = |gpu_va: u64, len: usize| -> Option<Vec<u8>> {
         read_gpu_strict(mappings, mem_read, gpu_va, len)
     };
-    let guest_writeback =
-        writeback_cube_sample_dependencies(batch, renderer, mappings, mem_read, mem_write);
+    let kp_cube = super::pusher::kickprof::start();
+    let writeback =
+        writeback_cube_sample_dependencies(batch, renderer, mappings, mem_read, mem_write, || {
+            packetizer.drain_hard()
+        });
+    let guest_writeback = writeback.targets_written != 0;
+    super::pusher::kickprof::add(super::pusher::kickprof::VKF_CUBE, kp_cube);
+    let kp_inval = super::pusher::kickprof::start();
+    invalidate_snapshot_cache_guest_write_chunks(snapshot_cache, mappings, &writeback.written);
+    super::pusher::kickprof::add(super::pusher::kickprof::VKF_INVAL, kp_inval);
     let before = batch.len();
-    let flushed = flush_batch(batch, renderer, rt_thread, mappings, &read_guest);
+    let flushed = flush_batch(
+        batch,
+        renderer,
+        rt_thread,
+        mappings,
+        &read_guest,
+        mem_read,
+        snapshot_cache,
+        packetizer,
+        hard_after || guest_writeback,
+    );
     if profile {
         log::warn!(
-            "[nvprof] flush_accum before={} flushed={} total_ms={:.3}",
+            "[nvprof] flush_accum before={} flushed={} hard={} total_ms={:.3}",
             before,
             flushed,
+            hard_after || guest_writeback,
             elapsed_ms(t0)
         );
     }
@@ -1172,6 +3682,131 @@ fn same_rt_bindings(a: &Maxwell3dDrawCall, b: &Maxwell3dDrawCall) -> bool {
         && a.depth_key == b.depth_key
         && a.depth_format == b.depth_format
         && a.depth_aspects == b.depth_aspects
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RtSignatureBoundaryProfile {
+    KnownIndependent,
+    AttachmentAlias,
+    PriorSample,
+    NextSample,
+    SmallRt,
+}
+
+#[derive(Default)]
+struct RtBatchUsage {
+    attachments: Vec<RtKey>,
+    sampled: Vec<RtKey>,
+}
+
+impl RtBatchUsage {
+    fn from_calls(calls: &[Maxwell3dDrawCall]) -> Self {
+        let mut usage = Self::default();
+        for call in calls {
+            if call.color_rt_keys.is_empty() {
+                push_unique_rt_key(&mut usage.attachments, call.rt_key);
+            } else {
+                for key in &call.color_rt_keys {
+                    push_unique_rt_key(&mut usage.attachments, *key);
+                }
+            }
+            if let Some(key) = call.depth_key {
+                push_unique_rt_key(&mut usage.attachments, key);
+            }
+            for key in call.sampled_rt_slots.iter().flatten() {
+                push_unique_rt_key(&mut usage.sampled, *key);
+            }
+            for key in &call.sampled_rt_keys {
+                push_unique_rt_key(&mut usage.sampled, *key);
+            }
+            if let Some(key) = call.sampled_rt_key {
+                push_unique_rt_key(&mut usage.sampled, key);
+            }
+            for key in call.sampled_rt_copy_sources.iter().flatten() {
+                push_unique_rt_key(&mut usage.sampled, *key);
+            }
+        }
+        usage
+    }
+}
+
+fn push_unique_rt_key(keys: &mut Vec<RtKey>, key: RtKey) {
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+fn rt_keys_overlap(a: RtKey, b: RtKey) -> bool {
+    a == b || nexium_gpu::rt_cache::same_physical_backing(a, b)
+}
+
+fn can_coalesce_full_color_depth_clear(
+    color_key: RtKey,
+    want_color_clear: bool,
+    clear_scissor: Option<[i32; 4]>,
+    depth_key: Option<RtKey>,
+    depth_aspects: vk::ImageAspectFlags,
+    clear_aspects: vk::ImageAspectFlags,
+) -> bool {
+    let Some(depth_key) = depth_key else {
+        return false;
+    };
+    want_color_clear
+        && clear_scissor.is_none()
+        && color_key.render_layer_count() == 1
+        && !clear_aspects.is_empty()
+        && depth_aspects.contains(clear_aspects)
+        && depth_key.width == color_key.width
+        && depth_key.height == color_key.height
+        && depth_key.render_layer_count() == 1
+        && !rt_keys_overlap(color_key, depth_key)
+}
+
+fn rt_key_lists_overlap(a: &[RtKey], b: &[RtKey]) -> bool {
+    a.iter()
+        .any(|a_key| b.iter().any(|b_key| rt_keys_overlap(*a_key, *b_key)))
+}
+
+fn classify_rt_signature_boundary(
+    prior: &RtBatchUsage,
+    next: &RtBatchUsage,
+    small_rt_pending: bool,
+) -> RtSignatureBoundaryProfile {
+    if small_rt_pending {
+        return RtSignatureBoundaryProfile::SmallRt;
+    }
+    if rt_key_lists_overlap(&prior.attachments, &next.attachments) {
+        return RtSignatureBoundaryProfile::AttachmentAlias;
+    }
+    if rt_key_lists_overlap(&prior.sampled, &next.attachments) {
+        return RtSignatureBoundaryProfile::PriorSample;
+    }
+    if rt_key_lists_overlap(&next.sampled, &prior.attachments) {
+        return RtSignatureBoundaryProfile::NextSample;
+    }
+    RtSignatureBoundaryProfile::KnownIndependent
+}
+
+fn record_rt_signature_boundary_profile(
+    prior: &RtBatchUsage,
+    next: &Maxwell3dDrawCall,
+    small_rt_pending: bool,
+) {
+    let next_usage = RtBatchUsage::from_calls(std::slice::from_ref(next));
+    let phase = match classify_rt_signature_boundary(prior, &next_usage, small_rt_pending) {
+        RtSignatureBoundaryProfile::KnownIndependent => {
+            super::pusher::kickprof::RT_SIGNATURE_KNOWN_INDEPENDENT
+        }
+        RtSignatureBoundaryProfile::AttachmentAlias => {
+            super::pusher::kickprof::RT_SIGNATURE_ATTACHMENT_ALIAS
+        }
+        RtSignatureBoundaryProfile::PriorSample => {
+            super::pusher::kickprof::RT_SIGNATURE_PRIOR_SAMPLE
+        }
+        RtSignatureBoundaryProfile::NextSample => super::pusher::kickprof::RT_SIGNATURE_NEXT_SAMPLE,
+        RtSignatureBoundaryProfile::SmallRt => super::pusher::kickprof::RT_SIGNATURE_SMALL_RT,
+    };
+    super::pusher::kickprof::count(phase, 1);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1193,6 +3828,69 @@ impl RtBindingSignature {
             && self.depth_format == call.depth_format
             && self.depth_aspects == call.depth_aspects
     }
+}
+
+fn draw_rt_binding_signature(
+    draw: &DrawCall,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> Result<RtBindingSignature, String> {
+    let rt_slot = draw_color_rt_slot(draw);
+    let rt = &draw.rt[rt_slot];
+    if rt.width == 0 || rt.height == 0 {
+        return Err(format!("RT[{}] has zero extent", rt_slot));
+    }
+    let rt_gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
+    let nvmap_id = mappings
+        .nvmap_id_for(rt_gpu_va)
+        .ok_or_else(|| format!("RT gpu_va={:#x} not mapped", rt_gpu_va))?;
+    let (msx, msy) = msaa_samples(draw.multisample_mode);
+    let rt_key = RtKey::with_cpu(
+        nvmap_id,
+        (rt.width / msx).max(1),
+        (rt.height / msy).max(1),
+        rt_gpu_va,
+        mappings.cpu_address_for(rt_gpu_va).unwrap_or(0),
+    )
+    .with_volume_depth(render_target_volume_depth(rt));
+    let program_region = draw.program_region_gpu_va;
+    let fs_prog = &draw.shader_programs[5];
+    let fs_addr = program_region.wrapping_add(fs_prog.address_lo as u64);
+    let fs_output_map = fetch_sph(fs_addr, mappings, mem_read)
+        .map(ps_output_map)
+        .unwrap_or(0);
+    let rt_format = map_rt_format_for_key(rt.format, rt_key);
+    let color_rts = active_color_rts(draw, mappings, rt_key, rt_format, fs_output_map);
+    let color_rt_keys = color_rts.iter().map(|(_, key, _)| *key).collect();
+    let color_rt_formats = color_rts.iter().map(|(_, _, format)| *format).collect();
+
+    let water_probe = water_no_ztest() && draw.color_blend.blend_enable[0];
+    let (depth_test, _, stencil_test) = effective_depth_states(
+        depth_disabled() || water_probe,
+        draw.zeta_enable,
+        draw.depth_test_enable,
+        draw.depth_write_enable,
+        draw.stencil_enable,
+    );
+    let depth_key = if depth_test || stencil_test {
+        zeta_rt_key(draw, mappings, rt_key)
+    } else {
+        None
+    };
+    let (depth_format, depth_aspects) = if depth_key.is_some() {
+        map_zeta_format(draw.zeta.format)
+    } else {
+        (vk::Format::UNDEFINED, vk::ImageAspectFlags::empty())
+    };
+
+    Ok(RtBindingSignature {
+        rt_key,
+        color_rt_keys,
+        color_rt_formats,
+        depth_key,
+        depth_format,
+        depth_aspects,
+    })
 }
 
 fn uniform_rt_run_end(calls: &[Maxwell3dDrawCall], start: usize) -> usize {
@@ -1257,6 +3955,10 @@ fn flush_batch(
     rt_thread: Option<&crate::render_thread::RenderThread>,
     mappings: &GpuMappings,
     read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    snapshot_cache: &mut SsboSnapshotCache,
+    packetizer: &mut PreparedDrawPacketizer,
+    hard_after: bool,
 ) -> usize {
     if batch.is_empty() {
         return 0;
@@ -1275,7 +3977,9 @@ fn flush_batch(
     debug_assert_eq!(chunk_lengths.iter().sum::<usize>(), n);
 
     let owned_calls = std::mem::take(batch);
-    for chunk in move_into_chunks(owned_calls, &chunk_lengths) {
+    let chunks = move_into_chunks(owned_calls, &chunk_lengths);
+    let mut prepared_chunks = Vec::new();
+    for chunk in chunks {
         if chunk.is_empty() {
             continue;
         }
@@ -1292,12 +3996,33 @@ fn flush_batch(
             );
         }
         match rt_thread {
-            Some(rt) => submit_draw_batch_async(chunk, renderer, rt, mappings, read_guest),
+            Some(_) => {
+                let kp_prep = super::pusher::kickprof::start();
+                prepared_chunks.push(prepare_draw_batch_async(
+                    chunk,
+                    renderer,
+                    mappings,
+                    read_guest,
+                    mem_read,
+                    snapshot_cache,
+                    chunk_bytes,
+                    false,
+                ));
+                super::pusher::kickprof::add(super::pusher::kickprof::VKF_PREP, kp_prep);
+            }
             None => {
-                if let Err(e) = renderer.execute_draws(&chunk, read_guest) {
+                if let Err(e) =
+                    renderer.execute_draws(&chunk, |gpu_va, len| read_guest(gpu_va, len))
+                {
                     log::debug!("vk_dispatch: execute_draws failed: {}", e);
                 }
             }
+        }
+    }
+    if let Some(rt) = rt_thread {
+        packetizer.stage(rt, prepared_chunks);
+        if hard_after {
+            packetizer.drain_hard();
         }
     }
     n
@@ -1358,7 +4083,9 @@ fn prepare_draw_texture_job(
     let tic = nexium_gpu::texture::TicEntry::parse(&tic_raw)
         .ok_or_else(|| format!("TIC parse failed for texture {}", dt.texture_id))?;
     let pitch_size = tic.format.linear_size(tic.width, tic.height);
-    let read_size = if tic.is_block_linear {
+    let read_size = if let Some(size) = tic.pitch_linear_layer_size() {
+        size
+    } else if tic.is_block_linear {
         tic.format
             .block_linear_size(tic.width, tic.height, tic.block_height_log2)
             .max(pitch_size)
@@ -1381,6 +4108,8 @@ fn prepare_draw_texture_job(
             bpp,
             tic.block_height_log2,
         )
+    } else if tic.pitch_linear_layer_size().is_some() {
+        nexium_gpu::texture::unpack_pitch_linear(&raw, &tic, 1).unwrap_or(raw)
     } else {
         raw
     };
@@ -1533,9 +4262,206 @@ fn execute_draw_texture_job(
     renderer.upload_target_rgba(job.nvmap_id, job.width, job.height, job.gpu_va, &dst)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TextureSnapshotCacheKey {
+    mapping_epoch: u64,
+    gpu_va: u64,
+    len: usize,
+    cpu_va: u64,
+    nvmap_id: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedTicTexturePlan {
+    tic: nexium_gpu::texture::TicEntry,
+    read_size: usize,
+    cache_key: Option<TextureSnapshotCacheKey>,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedTicPlan {
+    raw: [u8; 32],
+    texture: Option<PreparedTicTexturePlan>,
+}
+
+fn tic_raw_descriptor(raw: &[u8]) -> Option<[u8; 32]> {
+    raw.get(..32)?.try_into().ok()
+}
+
+fn derive_prepared_tic_texture_plan(
+    raw: [u8; 32],
+    mappings: &GpuMappings,
+) -> Option<PreparedTicTexturePlan> {
+    let tic = nexium_gpu::texture::TicEntry::parse(&raw)?;
+    let pitch = tic.format.linear_size(tic.width, tic.height);
+    let layer_size = if tic.is_block_linear {
+        tic.format
+            .block_linear_size(tic.width, tic.height, tic.block_height_log2)
+            .max(pitch)
+    } else {
+        pitch
+    };
+    let layer_count = tic_snapshot_layer_count(&tic);
+    let read_size = nexium_gpu::texture::texture_guest_size_bytes(&tic, layer_count)
+        .unwrap_or_else(|| layer_size.saturating_mul(layer_count as usize));
+    let cache_key = mappings
+        .cpu_range_for(tic.gpu_va)
+        .filter(|(_, available)| *available >= read_size as u64)
+        .and_then(|(cpu_va, _)| {
+            mappings
+                .nvmap_id_for(tic.gpu_va)
+                .zip(mappings.mapping_epoch_for(tic.gpu_va))
+                .map(|(nvmap_id, mapping_epoch)| TextureSnapshotCacheKey {
+                    mapping_epoch,
+                    gpu_va: tic.gpu_va,
+                    len: read_size,
+                    cpu_va,
+                    nvmap_id,
+                })
+        });
+    Some(PreparedTicTexturePlan {
+        tic,
+        read_size,
+        cache_key,
+    })
+}
+
+fn memoized_prepared_tic_plan(
+    plans: &mut HashMap<u64, PreparedTicPlan>,
+    tic_addr: u64,
+    raw: [u8; 32],
+    derive: impl FnOnce([u8; 32]) -> Option<PreparedTicTexturePlan>,
+) -> PreparedTicPlan {
+    if let Some(plan) = plans.get(&tic_addr).filter(|plan| plan.raw == raw) {
+        return *plan;
+    }
+    let plan = PreparedTicPlan {
+        raw,
+        texture: derive(raw),
+    };
+    if plans.len() < PREPARED_TIC_PLAN_CAPACITY || plans.contains_key(&tic_addr) {
+        plans.insert(tic_addr, plan);
+    }
+    plan
+}
+
+struct TextureSnapshotCacheEntry {
+    generation: u64,
+    serial: u64,
+    data: Arc<Vec<u8>>,
+}
+
+enum TextureSnapshotCacheLookup {
+    Hit(Arc<Vec<u8>>),
+    Miss,
+    Stale,
+}
+
+struct TextureSnapshotCache {
+    owner: Weak<nexium_gpu::Renderer>,
+    entries: HashMap<TextureSnapshotCacheKey, TextureSnapshotCacheEntry>,
+    order: VecDeque<(TextureSnapshotCacheKey, u64)>,
+    bytes: usize,
+    next_serial: u64,
+    max_bytes: usize,
+    max_entries: usize,
+}
+
+impl TextureSnapshotCache {
+    fn new(max_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            owner: Weak::new(),
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            next_serial: 0,
+            max_bytes,
+            max_entries,
+        }
+    }
+
+    fn set_owner(&mut self, owner: &Arc<nexium_gpu::Renderer>) {
+        let owner = Arc::downgrade(owner);
+        if !Weak::ptr_eq(&self.owner, &owner) {
+            self.entries.clear();
+            self.order.clear();
+            self.bytes = 0;
+            self.owner = owner;
+        }
+    }
+
+    fn get(&mut self, key: TextureSnapshotCacheKey, generation: u64) -> TextureSnapshotCacheLookup {
+        match self.entries.get(&key) {
+            Some(entry) if entry.generation == generation => {
+                return TextureSnapshotCacheLookup::Hit(entry.data.clone());
+            }
+            Some(_) => {}
+            None => return TextureSnapshotCacheLookup::Miss,
+        }
+        if let Some(stale) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(stale.data.len());
+        }
+        TextureSnapshotCacheLookup::Stale
+    }
+
+    fn insert(&mut self, key: TextureSnapshotCacheKey, generation: u64, data: Arc<Vec<u8>>) {
+        if data.len() > self.max_bytes || self.max_entries == 0 {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.data.len());
+        }
+        let serial = self.next_serial;
+        self.next_serial = self.next_serial.wrapping_add(1);
+        self.bytes = self.bytes.saturating_add(data.len());
+        self.entries.insert(
+            key,
+            TextureSnapshotCacheEntry {
+                generation,
+                serial,
+                data,
+            },
+        );
+        self.order.push_back((key, serial));
+        let max_order = self.max_entries.saturating_mul(2).max(1);
+        while self.bytes > self.max_bytes
+            || self.entries.len() > self.max_entries
+            || self.order.len() > max_order
+        {
+            let Some((old_key, old_serial)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&old_key)
+                .is_some_and(|entry| entry.serial == old_serial)
+            {
+                if let Some(old) = self.entries.remove(&old_key) {
+                    self.bytes = self.bytes.saturating_sub(old.data.len());
+                    super::pusher::kickprof::count_sized(
+                        super::pusher::kickprof::PREP_TEX_CACHE_EVICT,
+                        1,
+                        old.data.len(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn texture_snapshot_cache() -> &'static Mutex<TextureSnapshotCache> {
+    static CACHE: OnceLock<Mutex<TextureSnapshotCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(TextureSnapshotCache::new(
+            TEXTURE_SNAPSHOT_CACHE_MAX_BYTES,
+            TEXTURE_SNAPSHOT_CACHE_MAX_ENTRIES,
+        ))
+    })
+}
+
 fn snapshot_read_once(
-    snapshot: &mut std::collections::HashMap<u64, Vec<u8>>,
-    read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
+    snapshot: &mut DrawSnapshot,
+    read_guest: &mut dyn FnMut(u64, usize) -> Option<Arc<Vec<u8>>>,
     gpu_va: u64,
     len: usize,
 ) -> usize {
@@ -1558,12 +4484,25 @@ fn snapshot_read_once(
     }
 }
 
+fn snapshot_tic_descriptor_once(
+    snapshot: &DrawSnapshot,
+    read_guest: &mut dyn FnMut(u64, usize) -> Option<Arc<Vec<u8>>>,
+    tic_addr: u64,
+) -> Option<(Arc<Vec<u8>>, bool)> {
+    if let Some(data) = snapshot.get(&tic_addr).filter(|data| data.len() >= 32) {
+        return Some((data.clone(), false));
+    }
+    read_guest(tic_addr, 32).map(|data| (data, true))
+}
+
 fn snapshot_texture_once(
-    snapshot: &mut std::collections::HashMap<u64, Vec<u8>>,
+    snapshot: &mut DrawSnapshot,
     generations: &mut std::collections::HashMap<(u64, usize), u64>,
     read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
     gpu_va: u64,
     len: usize,
+    cache_key: Option<TextureSnapshotCacheKey>,
+    cache_owner: Option<&Arc<nexium_gpu::Renderer>>,
 ) -> usize {
     if snapshot.get(&gpu_va).is_some_and(|data| data.len() >= len) {
         generations
@@ -1571,14 +4510,69 @@ fn snapshot_texture_once(
             .or_insert_with(|| nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64));
         return 0;
     }
+    let initial_generation = nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64);
+    if let (Some(cache_key), Some(cache_owner)) = (cache_key, cache_owner) {
+        let data = {
+            let mut cache = texture_snapshot_cache().lock().unwrap();
+            cache.set_owner(cache_owner);
+            cache.get(cache_key, initial_generation)
+        };
+        match data {
+            TextureSnapshotCacheLookup::Hit(data) => {
+                super::pusher::kickprof::count_sized(
+                    super::pusher::kickprof::PREP_TEX_CACHE_HIT,
+                    1,
+                    len,
+                );
+                let after = nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64);
+                if after == initial_generation {
+                    snapshot.insert(gpu_va, data);
+                    generations.insert((gpu_va, len), initial_generation);
+                    return 0;
+                }
+            }
+            TextureSnapshotCacheLookup::Miss => super::pusher::kickprof::count_sized(
+                super::pusher::kickprof::PREP_TEX_CACHE_MISS,
+                1,
+                len,
+            ),
+            TextureSnapshotCacheLookup::Stale => super::pusher::kickprof::count_sized(
+                super::pusher::kickprof::PREP_TEX_CACHE_STALE,
+                1,
+                len,
+            ),
+        }
+    }
     for attempt in 0..3 {
-        let before = nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64);
+        let before = if attempt == 0 {
+            initial_generation
+        } else {
+            nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64)
+        };
         let Some(data) = read_guest(gpu_va, len) else {
             return 0;
         };
         let after = nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64);
         if before == after || attempt == 2 {
             let n = data.len();
+            let mut data = Arc::new(data);
+            if before == after {
+                let publish_generation =
+                    nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64);
+                if publish_generation == before {
+                    if let (Some(cache_key), Some(cache_owner)) = (cache_key, cache_owner) {
+                        let mut cache = texture_snapshot_cache().lock().unwrap();
+                        cache.set_owner(cache_owner);
+                        if let TextureSnapshotCacheLookup::Hit(cached) =
+                            cache.get(cache_key, before)
+                        {
+                            data = cached;
+                        } else {
+                            cache.insert(cache_key, before, data.clone());
+                        }
+                    }
+                }
+            }
             snapshot.insert(gpu_va, data);
             generations.insert((gpu_va, len), before);
             return n;
@@ -1689,7 +4683,7 @@ fn trace_tic_cpu_targets(
     tex_id: u32,
     tic: &nexium_gpu::texture::TicEntry,
     read_size: usize,
-    snapshot: &std::collections::HashMap<u64, Vec<u8>>,
+    snapshot: &DrawSnapshot,
 ) {
     use std::sync::{
         atomic::{AtomicU64, Ordering},
@@ -1702,7 +4696,7 @@ fn trace_tic_cpu_targets(
     static COUNT: AtomicU64 = AtomicU64::new(0);
 
     let configured_targets = TARGETS.get_or_init(|| parse_env_u64_list("NEXIUM_TIC_CPU_TRACE"));
-    let video_targets = if std::env::var_os("NEXIUM_TIC_VIDEO_BACKING_TRACE").is_some() {
+    let video_targets = if tic_video_backing_trace_enabled() {
         video_tic_cpu_targets()
             .lock()
             .map(|targets| targets.clone())
@@ -1758,7 +4752,10 @@ fn trace_tic_cpu_targets(
     if sequence >= 128 {
         return;
     }
-    let data = snapshot.get(&tic.gpu_va).map(Vec::as_slice).unwrap_or(&[]);
+    let data = snapshot
+        .get(&tic.gpu_va)
+        .map(|data| data.as_slice())
+        .unwrap_or(&[]);
     let (sampled, nonzero, hash) = movie_draw_sample_stats(data);
     log::warn!(
         "[tic-cpu-target] #{} target={:#x} fs={:#x} vs={:#x} slot={} tic={} gpu={:#x} cpu={:#x} nvmap={} map={:#x}+{:#x} fmt={:?} {}x{}x{} type={} bl={} bytes={}/{} sample={} nz={} hash={:#x}",
@@ -1798,7 +4795,7 @@ fn trace_movie_bound_tic(
     tic_raw: &[u8],
     tic: Option<&nexium_gpu::texture::TicEntry>,
     read_size: Option<usize>,
-    snapshot: &std::collections::HashMap<u64, Vec<u8>>,
+    snapshot: &DrawSnapshot,
     snapshot_generations: &std::collections::HashMap<(u64, usize), u64>,
 ) {
     use std::sync::{
@@ -1863,7 +4860,10 @@ fn trace_movie_bound_tic(
         .join(",");
     let (data, requested_size, generation) = match (tic, read_size) {
         (Some(tic), Some(read_size)) => (
-            snapshot.get(&tic.gpu_va).map(Vec::as_slice).unwrap_or(&[]),
+            snapshot
+                .get(&tic.gpu_va)
+                .map(|data| data.as_slice())
+                .unwrap_or(&[]),
             read_size,
             snapshot_generations
                 .get(&(tic.gpu_va, read_size))
@@ -1927,28 +4927,419 @@ fn trace_movie_bound_tic(
     );
 }
 
-fn submit_draw_batch_async(
-    calls: Vec<Maxwell3dDrawCall>,
+#[derive(Clone, Default)]
+pub(crate) struct DrawBatchCompatibility {
+    attachments: Vec<(RtKey, vk::Format)>,
+    color_attachments: Vec<(RtKey, vk::Format)>,
+    depths: Vec<(RtKey, vk::Format, vk::ImageAspectFlags)>,
+    sampled: Vec<RtKey>,
+}
+
+fn compatibility_legacy_color_attachments() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_LEGACY_COLOR_ATTACH").is_some())
+}
+
+fn compatibility_call_writes_any_color(call: &Maxwell3dDrawCall) -> bool {
+    if compatibility_legacy_color_attachments() || call.clear {
+        return true;
+    }
+    let count = call.color_rt_keys.len().max(1).min(8);
+    (0..count).any(|index| {
+        call.blend
+            .attachments
+            .get(index)
+            .is_some_and(|attachment| !attachment.color_write_mask.is_empty())
+    })
+}
+
+fn is_ordered_exact_sampled_color_transition(sampled: RtKey, attachment: RtKey) -> bool {
+    sampled == attachment
+        && sampled.gpu_va != 0
+        && sampled.nvmap_id != u32::MAX
+        && !sampled.is_3d
+        && sampled.depth == 1
+}
+
+impl DrawBatchCompatibility {
+    fn for_calls(calls: &[Maxwell3dDrawCall]) -> Self {
+        let mut color_attachments = Vec::new();
+        let mut depths = Vec::new();
+        for call in calls {
+            if compatibility_call_writes_any_color(call) {
+                if call.color_rt_keys.is_empty() {
+                    let attachment = (call.rt_key, call.rt_format);
+                    if !color_attachments.contains(&attachment) {
+                        color_attachments.push(attachment);
+                    }
+                } else {
+                    for (index, key) in call.color_rt_keys.iter().copied().enumerate() {
+                        let attachment = (
+                            key,
+                            call.color_rt_formats
+                                .get(index)
+                                .copied()
+                                .unwrap_or(call.rt_format),
+                        );
+                        if !color_attachments.contains(&attachment) {
+                            color_attachments.push(attachment);
+                        }
+                    }
+                }
+            }
+            if let Some(depth_key) = call.depth_key {
+                let depth = (depth_key, call.depth_format, call.depth_aspects);
+                if !depths.contains(&depth) {
+                    depths.push(depth);
+                }
+            }
+        }
+        let mut attachments = color_attachments.clone();
+        for &(key, format, _) in &depths {
+            let attachment = (key, format);
+            if !attachments.contains(&attachment) {
+                attachments.push(attachment);
+            }
+        }
+        let mut sampled = Vec::new();
+        for key in calls
+            .iter()
+            .flat_map(|call| call.sampled_rt_slots.iter().flatten().copied())
+        {
+            if !sampled.contains(&key) {
+                sampled.push(key);
+            }
+        }
+        Self {
+            attachments,
+            color_attachments,
+            depths,
+            sampled,
+        }
+    }
+
+    pub(crate) fn compatible_with_later(&self, later: &Self) -> bool {
+        if self
+            .attachments
+            .iter()
+            .any(|(earlier_key, earlier_format)| {
+                later.attachments.iter().any(|(later_key, later_format)| {
+                    earlier_key == later_key
+                        && !nexium_gpu::rt_cache::rt_formats_compatible(
+                            *earlier_format,
+                            *later_format,
+                        )
+                })
+            })
+        {
+            return false;
+        }
+        if self
+            .depths
+            .iter()
+            .any(|(earlier_key, earlier_format, earlier_aspects)| {
+                later
+                    .depths
+                    .iter()
+                    .any(|(later_key, later_format, later_aspects)| {
+                        nexium_gpu::rt_cache::same_physical_backing(*earlier_key, *later_key)
+                            && (earlier_format != later_format || earlier_aspects != later_aspects)
+                    })
+            })
+        {
+            return false;
+        }
+        if self.sampled.iter().any(|sampled_key| {
+            later.depths.iter().any(|(attachment_key, _, _)| {
+                sampled_key == attachment_key
+                    || nexium_gpu::rt_cache::same_physical_backing(*sampled_key, *attachment_key)
+            })
+        }) {
+            return false;
+        }
+        !self.sampled.iter().any(|sampled_key| {
+            later.color_attachments.iter().any(|(attachment_key, _)| {
+                (sampled_key == attachment_key
+                    || nexium_gpu::rt_cache::same_physical_backing(*sampled_key, *attachment_key))
+                    && !is_ordered_exact_sampled_color_transition(*sampled_key, *attachment_key)
+            })
+        })
+    }
+
+    pub(crate) fn extend(&mut self, later: &Self) {
+        for attachment in &later.attachments {
+            if !self.attachments.contains(attachment) {
+                self.attachments.push(*attachment);
+            }
+        }
+        for attachment in &later.color_attachments {
+            if !self.color_attachments.contains(attachment) {
+                self.color_attachments.push(*attachment);
+            }
+        }
+        for depth in &later.depths {
+            if !self.depths.contains(depth) {
+                self.depths.push(*depth);
+            }
+        }
+        for sampled in &later.sampled {
+            if !self.sampled.contains(sampled) {
+                self.sampled.push(*sampled);
+            }
+        }
+    }
+}
+
+pub(crate) struct PreparedDrawBatch {
+    renderer: Arc<nexium_gpu::Renderer>,
+    pub(crate) calls: Vec<Maxwell3dDrawCall>,
+    compatibility: DrawBatchCompatibility,
+    snapshot: DrawSnapshot,
+    snapshot_generations: HashMap<(u64, usize), u64>,
+    tic_summ: Vec<String>,
+    diag: bool,
+    ring_upper_bytes: u64,
+    hard_after: Arc<std::sync::atomic::AtomicBool>,
+    fermi_exact_snapshot_leases: Vec<u64>,
+    fermi_exact_snapshot_leases_transferred: bool,
+}
+
+impl PreparedDrawBatch {
+    pub(crate) fn same_renderer(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.renderer, &other.renderer)
+    }
+
+    pub(crate) fn ring_upper_bytes(&self) -> u64 {
+        self.ring_upper_bytes
+    }
+
+    pub(crate) fn compatibility(&self) -> &DrawBatchCompatibility {
+        &self.compatibility
+    }
+
+    pub(crate) fn hard_after(&self) -> bool {
+        self.hard_after.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn hard_after_handle(&self) -> std::sync::Weak<std::sync::atomic::AtomicBool> {
+        Arc::downgrade(&self.hard_after)
+    }
+
+    pub(crate) fn seal_hard_after(&self) {
+        self.hard_after
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn fermi_exact_snapshot_leases(&self) -> &[u64] {
+        &self.fermi_exact_snapshot_leases
+    }
+
+    pub(crate) fn mark_fermi_exact_snapshot_leases_transferred(&mut self) {
+        self.fermi_exact_snapshot_leases_transferred = true;
+    }
+}
+
+const PREPARED_DRAW_PACKET_MAX_BATCHES: usize = 64;
+
+struct PreparedDrawPacketQueue<T> {
+    batches: Vec<T>,
+    ring_upper_bytes: u64,
+}
+
+impl<T> Default for PreparedDrawPacketQueue<T> {
+    fn default() -> Self {
+        Self {
+            batches: Vec::new(),
+            ring_upper_bytes: 0,
+        }
+    }
+}
+
+impl<T> PreparedDrawPacketQueue<T> {
+    fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    fn stage(&mut self, batch: T, batch_ring_upper_bytes: u64) -> Option<Vec<T>> {
+        let exceeds_ring = self
+            .ring_upper_bytes
+            .checked_add(batch_ring_upper_bytes)
+            .is_none_or(|total| total > nexium_gpu::renderer::GRAPHICS_RING_SAFE_BATCH_BYTES);
+        let flush_before = !self.batches.is_empty()
+            && (self.batches.len() >= PREPARED_DRAW_PACKET_MAX_BATCHES || exceeds_ring);
+        let ready = flush_before.then(|| self.take());
+        self.ring_upper_bytes = self.ring_upper_bytes.saturating_add(batch_ring_upper_bytes);
+        self.batches.push(batch);
+        if self.batches.len() >= PREPARED_DRAW_PACKET_MAX_BATCHES {
+            return Some(self.take());
+        }
+        ready
+    }
+
+    fn take(&mut self) -> Vec<T> {
+        self.ring_upper_bytes = 0;
+        std::mem::take(&mut self.batches)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PreparedDrawPacketizer {
+    pending: PreparedDrawPacketQueue<PreparedDrawBatch>,
+}
+
+impl PreparedDrawPacketizer {
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub(crate) fn stage(
+        &mut self,
+        render_thread: &crate::render_thread::RenderThread,
+        batches: Vec<PreparedDrawBatch>,
+    ) {
+        for batch in batches {
+            let ring_upper_bytes = batch.ring_upper_bytes();
+            if let Some(ready) = self.pending.stage(batch, ring_upper_bytes) {
+                Self::submit(render_thread, ready);
+            }
+        }
+    }
+
+    pub(crate) fn drain_hard(&mut self) -> bool {
+        let batches = self.pending.take();
+        let Some(render_thread) = crate::render_thread::maybe_render_thread() else {
+            if !batches.is_empty() {
+                log::warn!(
+                    "dropped {} prepared draw batches without a render thread",
+                    batches.len()
+                );
+                return false;
+            }
+            return true;
+        };
+        if batches.is_empty() {
+            render_thread.seal_draw_tail();
+            return true;
+        }
+        batches.last().unwrap().seal_hard_after();
+        Self::submit(render_thread, batches)
+    }
+
+    pub(crate) fn drain_soft(&mut self) -> bool {
+        let batches = self.pending.take();
+        if batches.is_empty() {
+            return true;
+        }
+        let Some(render_thread) = crate::render_thread::maybe_render_thread() else {
+            log::warn!(
+                "dropped {} prepared draw batches without a render thread",
+                batches.len()
+            );
+            return false;
+        };
+        Self::submit(render_thread, batches)
+    }
+
+    fn submit(
+        render_thread: &crate::render_thread::RenderThread,
+        batches: Vec<PreparedDrawBatch>,
+    ) -> bool {
+        let call_count = batches
+            .iter()
+            .map(|prepared| prepared.calls.len())
+            .sum::<usize>();
+        let batch_count = batches.len();
+        let kp_submit = super::pusher::kickprof::start();
+        let submitted = render_thread.flush_draw_chunk_timeout_named(
+            "draw-packet",
+            batches,
+            std::time::Duration::from_secs(3),
+        );
+        super::pusher::kickprof::add(super::pusher::kickprof::VKF_SUBMIT, kp_submit);
+        if !submitted {
+            log::warn!(
+                "[render-saturated] dropped draw packet (batches={} calls={}) after 3s; render thread blocked",
+                batch_count,
+                call_count
+            );
+        }
+        submitted
+    }
+}
+
+impl Drop for PreparedDrawBatch {
+    fn drop(&mut self) {
+        if !self.fermi_exact_snapshot_leases_transferred
+            && !self.fermi_exact_snapshot_leases.is_empty()
+        {
+            self.renderer
+                .release_fermi_exact_rt_snapshot_leases(&self.fermi_exact_snapshot_leases);
+        }
+    }
+}
+
+fn prepare_draw_batch_async(
+    mut calls: Vec<Maxwell3dDrawCall>,
     renderer: &Arc<nexium_gpu::Renderer>,
-    rt: &crate::render_thread::RenderThread,
     mappings: &GpuMappings,
     read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
-) {
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    snapshot_cache: &mut SsboSnapshotCache,
+    ring_upper_bytes: u64,
+    hard_after: bool,
+) -> PreparedDrawBatch {
     let profile = nvprof_enabled();
     let t_snapshot = std::time::Instant::now();
-    let mut snapshot: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+    let mut snapshot = DrawSnapshot::new();
     let mut snapshot_generations: std::collections::HashMap<(u64, usize), u64> =
         std::collections::HashMap::new();
     let mut snapshot_reads = 0usize;
     let mut snapshot_bytes = 0usize;
     let mut tic_summ: Vec<String> = Vec::new();
+    let mut prepared_tic_plans = HashMap::new();
+    let mut fermi_exact_snapshot_lease_by_token = HashMap::new();
+    let mut fermi_exact_snapshot_leases = Vec::new();
     let movie_draw_trace = movie_draw_trace_config();
     let recent_present_keys = if movie_draw_trace.all_bound {
         nexium_gpu::renderer::movie_trace_present_keys()
     } else {
         Vec::new()
     };
-    for call in &calls {
+    if resident_vb_enabled() {
+        for call in &mut calls {
+            if call.quad_expand || call.sprite_batch_mirror {
+                continue;
+            }
+            let mut resident_ranges = Vec::new();
+            for binding in &call.vertex_bindings {
+                let Some((addr, vbytes)) =
+                    nexium_gpu::draw::vertex_binding_read_range(call, binding)
+                else {
+                    continue;
+                };
+                if let Some(range) = snapshot_cache.mirror_resident_range(
+                    mappings,
+                    binding.binding,
+                    binding.stride as u64,
+                    addr,
+                    vbytes,
+                    mem_read,
+                ) {
+                    resident_ranges.push(range);
+                }
+            }
+            call.resident_vertex = resident_ranges;
+        }
+    }
+    let mut read_input_guest = |gpu_va: u64, len: usize| {
+        let kp = super::pusher::kickprof::start();
+        let result = snapshot_cache
+            .read_input_or_insert(mappings, gpu_va, len, mem_read)
+            .or_else(|| read_guest(gpu_va, len).map(Arc::new));
+        super::pusher::kickprof::add(super::pusher::kickprof::PREP_READ, kp);
+        result
+    };
+    for call in &mut calls {
         let movie_present_key = recent_present_keys.iter().copied().find(|present_key| {
             call.rt_key == *present_key
                 || call
@@ -1957,23 +5348,25 @@ fn submit_draw_batch_async(
                     .any(|color_key| color_key == present_key)
         });
         for binding in &call.vertex_bindings {
+            if call
+                .resident_vertex
+                .iter()
+                .any(|range| range.binding == binding.binding)
+            {
+                continue;
+            }
             let Some((addr, vbytes)) = nexium_gpu::draw::vertex_binding_read_range(call, binding)
             else {
                 continue;
             };
-            let n = snapshot_read_once(&mut snapshot, read_guest, addr, vbytes);
+            let n = snapshot_read_once(&mut snapshot, &mut read_input_guest, addr, vbytes);
             snapshot_reads += usize::from(n != 0);
             snapshot_bytes += n;
-        }
-        if call.cbuf_size > 0 && call.cbuf_addr != 0 {
-            let n = snapshot_read_once(
-                &mut snapshot,
-                read_guest,
-                call.cbuf_addr,
-                call.cbuf_size as usize,
+            super::pusher::kickprof::count_sized(
+                super::pusher::kickprof::PREP_VERTEX,
+                u64::from(n != 0),
+                n,
             );
-            snapshot_reads += usize::from(n != 0);
-            snapshot_bytes += n;
         }
         if !call.fs_tex_ids.is_empty() && call.tic_pool_gpu_va != 0 {
             for (slot, &tex_id) in call.fs_tex_ids.iter().enumerate() {
@@ -1981,11 +5374,30 @@ fn submit_draw_batch_async(
                     continue;
                 }
                 let tic_addr = call.tic_pool_gpu_va.wrapping_add((tex_id as u64) * 32);
-                if let Some(tic_raw) = read_guest(tic_addr, 32) {
-                    snapshot_reads += 1;
-                    snapshot_bytes += tic_raw.len();
-                    if let Some(tic) = nexium_gpu::texture::TicEntry::parse(&tic_raw) {
-                        if std::env::var_os("NEXIUM_TEXTYPE_DBG").is_some() {
+                if let Some((tic_raw, tic_read)) =
+                    snapshot_tic_descriptor_once(&snapshot, &mut read_input_guest, tic_addr)
+                {
+                    if tic_read {
+                        snapshot_reads += 1;
+                        snapshot_bytes += tic_raw.len();
+                        super::pusher::kickprof::count_sized(
+                            super::pusher::kickprof::PREP_TIC,
+                            1,
+                            tic_raw.len(),
+                        );
+                    }
+                    let prepared_tic = tic_raw_descriptor(&tic_raw).map(|raw| {
+                        memoized_prepared_tic_plan(&mut prepared_tic_plans, tic_addr, raw, |raw| {
+                            derive_prepared_tic_texture_plan(raw, mappings)
+                        })
+                    });
+                    if let Some(PreparedTicTexturePlan {
+                        tic,
+                        read_size,
+                        cache_key,
+                    }) = prepared_tic.and_then(|plan| plan.texture)
+                    {
+                        if texture_type_debug_enabled() {
                             use std::sync::{Mutex, OnceLock};
                             static SEEN: OnceLock<Mutex<std::collections::HashSet<u32>>> =
                                 OnceLock::new();
@@ -2008,7 +5420,7 @@ fn submit_draw_batch_async(
                                 }
                             }
                         }
-                        if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+                        if present_keys_enabled() {
                             tic_summ.push(format!(
                                 "tic{}={:?} {}x{}x{} base={} type={} norm={} bl={} bh={} va={:#x}",
                                 tex_id,
@@ -2024,27 +5436,147 @@ fn submit_draw_batch_async(
                                 tic.gpu_va
                             ));
                         }
-                        let pitch = tic.format.linear_size(tic.width, tic.height);
-                        let layer_size = if tic.is_block_linear {
-                            tic.format
-                                .block_linear_size(tic.width, tic.height, tic.block_height_log2)
-                                .max(pitch)
+                        let fermi_exact_snapshot_lease = if fermi_rt_snapshot_lease_enabled() {
+                            call.sampled_rt_fermi_exact_slots
+                                .get(slot)
+                                .copied()
+                                .flatten()
+                                .and_then(|token| {
+                                    if let Some(&lease_id) =
+                                        fermi_exact_snapshot_lease_by_token.get(&token)
+                                    {
+                                        return Some(lease_id);
+                                    }
+                                    let numeric_type = texture_numeric_type_for_slot(
+                                        &call.texture_numeric_manifest,
+                                        slot,
+                                    );
+                                    match renderer.reserve_fermi_exact_rt_snapshot(
+                                        token,
+                                        tic,
+                                        numeric_type,
+                                    ) {
+                                        Ok(Some(lease_id)) => {
+                                            fermi_exact_snapshot_lease_by_token
+                                                .insert(token, lease_id);
+                                            if fermi_exact_snapshot_leases.contains(&lease_id) {
+                                                renderer.release_fermi_exact_rt_snapshot_leases(&[
+                                                    lease_id,
+                                                ]);
+                                            } else {
+                                                fermi_exact_snapshot_leases.push(lease_id);
+                                            }
+                                            Some(lease_id)
+                                        }
+                                        Ok(None) => None,
+                                        Err(error) => {
+                                            log::debug!(
+                                            "Fermi exact RT snapshot lease failed for {:#x}: {}",
+                                            tic.gpu_va,
+                                            error
+                                        );
+                                            None
+                                        }
+                                    }
+                                })
                         } else {
-                            pitch
+                            None
                         };
-                        let layer_count = tic_snapshot_layer_count(&tic);
-                        let read_size =
-                            nexium_gpu::texture::texture_guest_size_bytes(&tic, layer_count)
-                                .unwrap_or_else(|| layer_size.saturating_mul(layer_count as usize));
-                        let n = snapshot_texture_once(
-                            &mut snapshot,
-                            &mut snapshot_generations,
-                            read_guest,
-                            tic.gpu_va,
-                            read_size,
-                        );
+                        if let Some(lease_id) = fermi_exact_snapshot_lease {
+                            if let Some(snapshot_slot) =
+                                call.sampled_rt_fermi_snapshot_slots.get_mut(slot)
+                            {
+                                *snapshot_slot = Some(lease_id);
+                                super::pusher::kickprof::count_sized(
+                                    super::pusher::kickprof::PREP_TEX_FERMI_SNAPSHOT_LEASE,
+                                    1,
+                                    read_size,
+                                );
+                            }
+                        }
+                        let n = if fermi_exact_snapshot_lease.is_some()
+                            && call
+                                .sampled_rt_fermi_snapshot_slots
+                                .get(slot)
+                                .copied()
+                                .flatten()
+                                == fermi_exact_snapshot_lease
+                        {
+                            0
+                        } else {
+                            snapshot_texture_once(
+                                &mut snapshot,
+                                &mut snapshot_generations,
+                                read_guest,
+                                tic.gpu_va,
+                                read_size,
+                                cache_key,
+                                Some(renderer),
+                            )
+                        };
                         snapshot_reads += usize::from(n != 0);
                         snapshot_bytes += n;
+                        super::pusher::kickprof::count_sized(
+                            super::pusher::kickprof::PREP_TEXTURE,
+                            u64::from(n != 0),
+                            n,
+                        );
+                        if n != 0 {
+                            if let Some(token) = call
+                                .sampled_rt_fermi_exact_slots
+                                .get(slot)
+                                .copied()
+                                .flatten()
+                            {
+                                if tic.is_block_linear
+                                    && matches!(tic.texture_type, 1 | 5)
+                                    && tic.depth == 1
+                                    && tic.base_layer == 0
+                                    && tic.max_mip_level == 0
+                                    && tic.res_min_mip_level == 0
+                                    && tic.res_max_mip_level == 0
+                                    && token.guest_va == tic.gpu_va
+                                    && token.bytes_per_pixel == tic.format.src_bpp()
+                                    && token.fermi_block_size & !0xFF == 0
+                                    && token.fermi_block_size & 0xF == tic.block_width_log2
+                                    && (token.fermi_block_size >> 4) & 0xF == tic.block_height_log2
+                                    && token.block_width_log2 == tic.block_width_log2
+                                    && token.block_height_log2 == tic.block_height_log2
+                                    && token.block_depth_log2 == 0
+                                    && token.tile_width_spacing == 0
+                                    && token.block_depth_log2 == tic.block_depth_log2
+                                    && token.tile_width_spacing == tic.tile_width_spacing
+                                    && renderer.render_target_stamp(token.key) == Some(token.stamp)
+                                    && nexium_gpu::tex_invalidate::region_gen_range(
+                                        token.guest_va,
+                                        token.guest_size,
+                                    ) == token.guest_generation
+                                {
+                                    super::pusher::kickprof::count_sized(
+                                        super::pusher::kickprof::PREP_TEX_FERMI_RAW_SNAPSHOT,
+                                        1,
+                                        n,
+                                    );
+                                }
+                            }
+                            let is_rt_candidate =
+                                call.sampled_rt_slots.get(slot).copied().flatten().is_some();
+                            if is_rt_candidate {
+                                if let Some(snapshot_slot) =
+                                    call.sampled_rt_snapshot_slots.get_mut(slot)
+                                {
+                                    *snapshot_slot = true;
+                                }
+                            }
+                            let phase = if is_rt_candidate {
+                                super::pusher::kickprof::PREP_TEX_RT_CANDIDATE
+                            } else if matches!(tic.texture_type, 3 | 8) {
+                                super::pusher::kickprof::PREP_TEX_CUBE
+                            } else {
+                                super::pusher::kickprof::PREP_TEX_OTHER
+                            };
+                            super::pusher::kickprof::count_sized(phase, 1, n);
+                        }
                         trace_tic_cpu_targets(
                             mappings, call, slot, tex_id, &tic, read_size, &snapshot,
                         );
@@ -2062,7 +5594,7 @@ fn submit_draw_batch_async(
                             && matches!(tic.texture_type, 1 | 7)
                             && tic.width >= 256
                             && tic.height >= 128;
-                        let video_tic_trace = std::env::var_os("NEXIUM_VIDEO_DMA_TRACE").is_some();
+                        let video_tic_trace = video_dma_trace_enabled();
                         if movie_texture
                             && (video_tic_trace
                                 || movie_draw_trace.enabled
@@ -2091,8 +5623,10 @@ fn submit_draw_batch_async(
                                 if let Some(sequence) = sequence
                                     .filter(|sequence| *sequence < 512 || opening_movie_size)
                                 {
-                                    let data =
-                                        snapshot.get(&tic.gpu_va).map(Vec::as_slice).unwrap_or(&[]);
+                                    let data = snapshot
+                                        .get(&tic.gpu_va)
+                                        .map(|data| data.as_slice())
+                                        .unwrap_or(&[]);
                                     let sample = &data[..data.len().min(4096)];
                                     let nonzero = sample.iter().filter(|&&byte| byte != 0).count();
                                     let checksum = sample.iter().fold(0u64, |sum, &byte| {
@@ -2152,8 +5686,10 @@ fn submit_draw_batch_async(
                                 if let Some(trace_sequence) = trace_sequence
                                     .filter(|sequence| *sequence < movie_draw_trace.limit)
                                 {
-                                    let data =
-                                        snapshot.get(&tic.gpu_va).map(Vec::as_slice).unwrap_or(&[]);
+                                    let data = snapshot
+                                        .get(&tic.gpu_va)
+                                        .map(|data| data.as_slice())
+                                        .unwrap_or(&[]);
                                     let (sampled, nonzero, hash) = movie_draw_sample_stats(data);
                                     let generation = snapshot_generations
                                         .get(&(tic.gpu_va, read_size))
@@ -2253,7 +5789,9 @@ fn submit_draw_batch_async(
                             &snapshot_generations,
                         );
                     }
-                    snapshot.insert(tic_addr, tic_raw);
+                    if tic_read {
+                        snapshot.insert(tic_addr, tic_raw);
+                    }
                 }
             }
         }
@@ -2263,80 +5801,21 @@ fn submit_draw_batch_async(
                     continue;
                 }
                 let tsc_addr = call.tsc_pool_gpu_va.wrapping_add((tsc_id as u64) * 32);
-                let n = snapshot_read_once(&mut snapshot, read_guest, tsc_addr, 32);
+                let n = snapshot_read_once(&mut snapshot, &mut read_input_guest, tsc_addr, 32);
                 snapshot_reads += usize::from(n != 0);
                 snapshot_bytes += n;
+                super::pusher::kickprof::count_sized(
+                    super::pusher::kickprof::PREP_TSC,
+                    u64::from(n != 0),
+                    n,
+                );
             }
         }
     }
     let snapshot_ms = if profile { elapsed_ms(t_snapshot) } else { 0.0 };
     let snapshot_entries = snapshot.len();
     let n_calls = calls.len();
-    let r = renderer.clone();
-    let diag = std::env::var_os("NEXIUM_PRESENT_KEYS").is_some();
-    let job = Box::new(move || {
-        {
-            let mut ring = submit_ring().lock().unwrap();
-            let mut fss: Vec<String> = calls
-                .iter()
-                .map(|c| format!("{:#x}", c.fs_gpu_va))
-                .collect();
-            fss.dedup();
-            ring.push_back(format!(
-                "vs={:#x} fs=[{}] calls={} rt={}",
-                calls[0].vs_gpu_va,
-                fss.join(","),
-                calls.len(),
-                calls[0].rt_key.label()
-            ));
-            while ring.len() > 24 {
-                ring.pop_front();
-            }
-        }
-        let res = r.execute_draws_with_texture_generations(
-            &calls,
-            move |addr: u64, len: usize| {
-                snapshot
-                    .get(&addr)
-                    .filter(|b| b.len() >= len)
-                    .map(|b| b[..len].to_vec())
-            },
-            move |addr: u64, len: usize| {
-                snapshot_generations
-                    .get(&(addr, len))
-                    .copied()
-                    .unwrap_or_else(|| {
-                        nexium_gpu::tex_invalidate::region_gen_range(addr, len as u64)
-                    })
-            },
-        );
-        if let Err(e) = res {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static CT: AtomicU64 = AtomicU64::new(0);
-            let n = CT.fetch_add(1, Ordering::Relaxed);
-            if n < 6 {
-                let c = &calls[0];
-                log::warn!(
-                    "[draw-fail #{}] err={} n_calls={} rt={}:{}x{} vtx={} idx={:?} tex_ids={:?} tsc_ids={:?} cbuf_sz={} tics=[{}]",
-                    n, e, calls.len(), c.rt_key.nvmap_id, c.rt_key.width, c.rt_key.height,
-                    c.vertex_count, c.index_count, c.fs_tex_ids, c.fs_sampler_ids, c.cbuf_size,
-                    if diag { tic_summ.join(" | ") } else { String::new() }
-                );
-                if n == 0 {
-                    let ring = submit_ring().lock().unwrap();
-                    for (i, entry) in ring.iter().enumerate() {
-                        log::warn!("[draw-fail-ring] {}: {}", i, entry);
-                    }
-                }
-            }
-        }
-    }) as crate::render_thread::RenderJob;
-    if !rt.submit_timeout_named("draw-batch", job, std::time::Duration::from_secs(3)) {
-        log::warn!(
-            "[render-saturated] dropped draw batch (calls={}) after 3s; render thread blocked",
-            n_calls
-        );
-    }
+    let diag = present_keys_enabled();
     if profile {
         log::warn!(
             "[nvprof] draw_batch calls={} snapshot_entries={} reads={} bytes={} snapshot_ms={:.3}",
@@ -2347,14 +5826,139 @@ fn submit_draw_batch_async(
             snapshot_ms
         );
     }
+    let compatibility = DrawBatchCompatibility::for_calls(&calls);
+    PreparedDrawBatch {
+        renderer: renderer.clone(),
+        calls,
+        compatibility,
+        snapshot,
+        snapshot_generations,
+        tic_summ,
+        diag,
+        ring_upper_bytes,
+        hard_after: Arc::new(std::sync::atomic::AtomicBool::new(hard_after)),
+        fermi_exact_snapshot_leases,
+        fermi_exact_snapshot_leases_transferred: false,
+    }
+}
+
+pub(crate) fn execute_prepared_draw_batches(mut jobs: Vec<PreparedDrawBatch>) {
+    let Some(first) = jobs.first() else {
+        return;
+    };
+    debug_assert!(jobs.iter().all(|job| first.same_renderer(job)));
+    if submit_trace_enabled() {
+        for job in &jobs {
+            let Some(call) = job.calls.first() else {
+                continue;
+            };
+            let mut ring = submit_ring().lock().unwrap();
+            let mut fss: Vec<String> = job
+                .calls
+                .iter()
+                .map(|call| format!("{:#x}", call.fs_gpu_va))
+                .collect();
+            fss.dedup();
+            ring.push_back(format!(
+                "vs={:#x} fs=[{}] calls={} rt={}",
+                call.vs_gpu_va,
+                fss.join(","),
+                job.calls.len(),
+                call.rt_key.label()
+            ));
+            while ring.len() > 24 {
+                ring.pop_front();
+            }
+        }
+    }
+    let renderer = first.renderer.clone();
+    let call_groups = jobs
+        .iter()
+        .map(|job| job.calls.as_slice())
+        .collect::<Vec<_>>();
+    let fermi_exact_snapshot_leases = jobs
+        .iter()
+        .flat_map(|job| job.fermi_exact_snapshot_leases().iter().copied())
+        .collect::<Vec<_>>();
+    let result = renderer
+        .execute_draw_groups_with_texture_generations_and_fermi_exact_rt_snapshot_leases(
+            &call_groups,
+            |group_index: usize, addr: u64, len: usize| {
+                jobs.get(group_index)
+                    .and_then(|job| job.snapshot.get(&addr))
+                    .filter(|bytes| bytes.len() >= len)
+                    .and_then(|bytes| {
+                        nexium_gpu::renderer::SharedGuestSnapshot::new(bytes.clone(), len)
+                    })
+            },
+            |group_index: usize, addr: u64, len: usize| {
+                jobs.get(group_index)
+                    .and_then(|job| job.snapshot_generations.get(&(addr, len)))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        nexium_gpu::tex_invalidate::region_gen_range(addr, len as u64)
+                    })
+            },
+            &fermi_exact_snapshot_leases,
+        );
+    if result.as_ref().is_ok_and(|submitted| *submitted) {
+        for job in &mut jobs {
+            job.mark_fermi_exact_snapshot_leases_transferred();
+        }
+    }
+    if let Err(error) = result {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CT: AtomicU64 = AtomicU64::new(0);
+        for job in &jobs {
+            let n = CT.fetch_add(1, Ordering::Relaxed);
+            if n >= 6 {
+                break;
+            }
+            let Some(call) = job.calls.first() else {
+                continue;
+            };
+            log::warn!(
+                "[draw-fail #{}] err={} groups={} n_calls={} rt={}:{}x{} vtx={} idx={:?} tex_ids={:?} tsc_ids={:?} cbuf_sz={} tics=[{}]",
+                n,
+                error,
+                jobs.len(),
+                job.calls.len(),
+                call.rt_key.nvmap_id,
+                call.rt_key.width,
+                call.rt_key.height,
+                call.vertex_count,
+                call.index_count,
+                call.fs_tex_ids,
+                call.fs_sampler_ids,
+                call.cbuf_size,
+                if job.diag {
+                    job.tic_summ.join(" | ")
+                } else {
+                    String::new()
+                }
+            );
+            if n == 0 {
+                let ring = submit_ring().lock().unwrap();
+                for (index, entry) in ring.iter().enumerate() {
+                    log::warn!("[draw-fail-ring] {}: {}", index, entry);
+                }
+            }
+        }
+    }
+}
+
+fn submit_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_SUBMIT_TRACE").is_some())
 }
 
 struct ShaderBundle {
     vs_spirv: std::sync::Arc<Vec<u32>>,
-    vs_cbuf_mask: u32,
+    vs_input_locations: Vec<u32>,
+    vs_cbuf_mask: u64,
     vs_hash: u64,
     fs_spirv: std::sync::Arc<Vec<u32>>,
-    fs_cbuf_mask: u32,
+    fs_cbuf_mask: u64,
     fs_hash: u64,
     fs_tex_ids: Vec<u32>,
     texture_numeric_manifest: Vec<TextureNumericBinding>,
@@ -2367,6 +5971,7 @@ struct ShaderBundle {
     depth_compare_cube_mask: u32,
     depth_compare_cube_array_mask: u32,
     graphics_cbuf_reads: Vec<CbufRead>,
+    graphics_cbuf_requirements: PackedCbufReadRequirements,
     cbuf_used: u32,
     ssbo_descs: Vec<nexium_shader::StorageBufferAddr>,
 }
@@ -2469,6 +6074,9 @@ struct FragmentTextureNumericMetadata {
 struct GraphicsTextureLayout {
     fs_ids: Vec<u32>,
     fs_tic_ids: Vec<Option<u32>>,
+    resolved_tic_ids: Vec<u32>,
+    resolved_sampler_ids: Vec<u32>,
+    resolved_tics: Vec<Option<ResolvedTicDescriptor>>,
     vs_tex_base: u32,
     vs_tex_count: u32,
     manifest: Vec<TextureNumericBinding>,
@@ -2479,6 +6087,14 @@ struct GraphicsTextureLayout {
     depth_compare_2d_mask: u32,
     depth_compare_cube_mask: u32,
     depth_compare_cube_array_mask: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedTicDescriptor {
+    id: u32,
+    address: u64,
+    raw: [u8; 32],
+    entry: nexium_gpu::texture::TicEntry,
 }
 
 impl GraphicsTextureLayout {
@@ -2608,7 +6224,7 @@ fn collect_indirect_tables(cfg: &nexium_shader::Cfg) -> Vec<IndirectTableKey> {
 fn indirect_table_fingerprint(
     vs_tables: &[IndirectTableKey],
     fs_tables: &[IndirectTableKey],
-    cbuf_binds: &[[(u64, u32); 16]; 5],
+    cbuf_binds: &GraphicsCbufBinds,
     vs_cbuf_group: usize,
     fs_cbuf_group: usize,
     mappings: &GpuMappings,
@@ -2814,6 +6430,10 @@ fn small_rt_registry() -> &'static std::sync::Mutex<std::collections::HashMap<Rt
     R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+pub(crate) fn has_pending_small_rt_writebacks() -> bool {
+    !small_rt_registry().lock().unwrap().is_empty()
+}
+
 fn register_small_rt_after_prior_work(
     key: RtKey,
     tile_mode: Option<u32>,
@@ -2843,6 +6463,12 @@ struct GuestWriteChunk {
 #[derive(Debug, Default)]
 struct GuestWriteResult {
     complete: bool,
+    written: Vec<GuestWriteChunk>,
+}
+
+#[derive(Debug, Default)]
+struct SmallRtWritebackResult {
+    targets_written: usize,
     written: Vec<GuestWriteChunk>,
 }
 
@@ -2997,6 +6623,14 @@ fn invalidate_guest_write_chunks(
     }
 }
 
+fn invalidate_snapshot_cache_guest_write_chunks(
+    snapshot_cache: &mut SsboSnapshotCache,
+    mappings: &GpuMappings,
+    chunks: &[GuestWriteChunk],
+) {
+    snapshot_cache.invalidate_guest_write_chunks(mappings, chunks);
+}
+
 fn collect_cube_sample_ranges(
     batch: &[Maxwell3dDrawCall],
     mappings: &GpuMappings,
@@ -3004,6 +6638,7 @@ fn collect_cube_sample_ranges(
 ) -> CubeSampleDependencies {
     let mut ranges = Vec::new();
     let mut texture_bases = Vec::new();
+    let mut seen_tic_addresses = std::collections::HashSet::new();
     for call in batch {
         if call.tic_pool_gpu_va == 0 {
             continue;
@@ -3015,12 +6650,16 @@ fn collect_cube_sample_ranges(
             let tic_addr = call
                 .tic_pool_gpu_va
                 .wrapping_add(u64::from(tex_id).saturating_mul(32));
+            if seen_tic_addresses.contains(&tic_addr) {
+                continue;
+            }
             let Some(raw) = read_gpu_strict(mappings, mem_read, tic_addr, 32) else {
                 continue;
             };
             let Some(tic) = nexium_gpu::texture::TicEntry::parse(&raw) else {
                 continue;
             };
+            seen_tic_addresses.insert(tic_addr);
             if !matches!(tic.texture_type, 3 | 8) {
                 continue;
             }
@@ -3073,6 +6712,35 @@ fn restore_small_rt_entries(entries: Vec<(RtKey, u32)>) {
     }
 }
 
+type RawTargetReadback = Option<(u32, u32, usize, Vec<u8>)>;
+
+fn readback_targets_on_render_thread(
+    renderer: &Arc<nexium_gpu::Renderer>,
+    keys: &[RtKey],
+    wait_timeout: std::time::Duration,
+    label: &'static str,
+) -> Option<Vec<RawTargetReadback>> {
+    if let Some(rt) = crate::render_thread::maybe_render_thread() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = renderer.clone();
+        let queued_keys = keys.to_vec();
+        let submitted = rt.submit_timeout_named(
+            label,
+            Box::new(move || {
+                let readbacks = r.readback_targets_raw_keys(&queued_keys);
+                let _ = tx.send(readbacks);
+            }),
+            wait_timeout,
+        );
+        if !submitted {
+            return None;
+        }
+        rx.recv_timeout(wait_timeout).ok()
+    } else {
+        Some(renderer.readback_targets_raw_keys(keys))
+    }
+}
+
 fn writeback_small_rt_entries(
     renderer: &Arc<nexium_gpu::Renderer>,
     mappings: &GpuMappings,
@@ -3080,29 +6748,21 @@ fn writeback_small_rt_entries(
     pending: Vec<(RtKey, u32)>,
     wait_timeout: std::time::Duration,
     marker_label: &'static str,
-) -> usize {
+) -> SmallRtWritebackResult {
     if pending.is_empty() {
-        return 0;
+        return SmallRtWritebackResult::default();
     }
-    if let Some(rt) = crate::render_thread::maybe_render_thread() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        if !rt.submit_timeout_named(
-            marker_label,
-            Box::new(move || {
-                let _ = tx.send(());
-            }),
-            wait_timeout,
-        ) || rx.recv_timeout(wait_timeout).is_err()
-        {
-            restore_small_rt_entries(pending);
-            return 0;
-        }
-    }
-
-    let mut written = 0usize;
+    let mut result = SmallRtWritebackResult::default();
     let mut unresolved = Vec::new();
-    for (key, tile_mode) in pending {
-        let Some((kw, kh, bpp, mut raw)) = renderer.readback_target_raw_key(key) else {
+    let keys = pending.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    let Some(readbacks) =
+        readback_targets_on_render_thread(renderer, &keys, wait_timeout, marker_label)
+    else {
+        restore_small_rt_entries(pending);
+        return SmallRtWritebackResult::default();
+    };
+    for ((key, tile_mode), readback) in pending.into_iter().zip(readbacks) {
+        let Some((kw, kh, bpp, mut raw)) = readback else {
             unresolved.push((key, tile_mode));
             continue;
         };
@@ -3139,7 +6799,8 @@ fn writeback_small_rt_entries(
         let write = write_guest_strict(mappings, mem_write, key.gpu_va, &guest_bytes);
         invalidate_guest_write_chunks(renderer, mappings, &write.written);
         if !write.written.is_empty() {
-            written += 1;
+            result.targets_written += 1;
+            result.written.extend(write.written.iter().copied());
         }
         if !write.complete {
             unresolved.push((key, tile_mode));
@@ -3154,7 +6815,7 @@ fn writeback_small_rt_entries(
         );
     }
     restore_small_rt_entries(unresolved);
-    written
+    result
 }
 
 fn writeback_cube_sample_dependencies(
@@ -3163,10 +6824,10 @@ fn writeback_cube_sample_dependencies(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
-) -> bool {
-    let dependencies = collect_cube_sample_ranges(batch, mappings, mem_read);
-    if dependencies.ranges.is_empty() {
-        return false;
+    before_readback: impl FnOnce() -> bool,
+) -> SmallRtWritebackResult {
+    if small_rt_registry().lock().unwrap().is_empty() {
+        return SmallRtWritebackResult::default();
     }
     let current_targets = batch
         .iter()
@@ -3176,6 +6837,18 @@ fn writeback_cube_sample_dependencies(
                 .chain(call.depth_key)
         })
         .collect::<std::collections::HashSet<_>>();
+    let has_external_target = small_rt_registry()
+        .lock()
+        .unwrap()
+        .keys()
+        .any(|key| !current_targets.contains(key));
+    if !has_external_target {
+        return SmallRtWritebackResult::default();
+    }
+    let dependencies = collect_cube_sample_ranges(batch, mappings, mem_read);
+    if dependencies.ranges.is_empty() {
+        return SmallRtWritebackResult::default();
+    }
     let pending = {
         let mut registry = small_rt_registry().lock().unwrap();
         let mut selected = Vec::new();
@@ -3190,17 +6863,79 @@ fn writeback_cube_sample_dependencies(
         selected
     };
     if pending.is_empty() {
-        return false;
+        return SmallRtWritebackResult::default();
+    }
+    if !before_readback() {
+        restore_small_rt_entries(pending);
+        return SmallRtWritebackResult::default();
     }
     let pending_count = pending.len();
-    let written = writeback_small_rt_entries(
-        renderer,
-        mappings,
-        mem_write,
-        pending,
-        std::time::Duration::from_secs(5),
-        "cube-rt-dependency",
-    );
+    let keys = pending.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    let wait_timeout = std::time::Duration::from_secs(5);
+    let Some(readbacks) =
+        readback_targets_on_render_thread(renderer, &keys, wait_timeout, "cube-rt-dependency")
+    else {
+        restore_small_rt_entries(pending);
+        return SmallRtWritebackResult::default();
+    };
+    let mut result = SmallRtWritebackResult::default();
+    let mut unresolved = Vec::new();
+    for ((key, tile_mode), readback) in pending.into_iter().zip(readbacks) {
+        let Some((kw, kh, bpp, mut raw)) = readback else {
+            unresolved.push((key, tile_mode));
+            continue;
+        };
+        let width_bytes = kw as usize * bpp;
+        if kh >= 2 && raw.len() >= width_bytes * kh as usize {
+            let height = kh as usize;
+            for y in 0..height / 2 {
+                let (top, bottom) = raw.split_at_mut((height - 1 - y) * width_bytes);
+                top[y * width_bytes..(y + 1) * width_bytes]
+                    .swap_with_slice(&mut bottom[..width_bytes]);
+            }
+        }
+        let guest_bytes = if (tile_mode >> 12) & 1 == 1 {
+            raw
+        } else {
+            let block_height_log2 = (tile_mode >> 4) & 0x7;
+            super::engines::maxwell_dma::swizzle_block_linear(
+                &raw,
+                width_bytes,
+                kh as usize,
+                width_bytes,
+                width_bytes,
+                kh as usize,
+                block_height_log2,
+                0,
+                0,
+            )
+        };
+        let bytes_to_write = guest_bytes.len();
+        if bytes_to_write == 0 {
+            unresolved.push((key, tile_mode));
+            continue;
+        }
+        let write = write_guest_strict(mappings, mem_write, key.gpu_va, &guest_bytes);
+        invalidate_guest_write_chunks(renderer, mappings, &write.written);
+        if !write.written.is_empty() {
+            result.targets_written += 1;
+            result.written.extend(write.written.iter().copied());
+        }
+        if !write.complete {
+            unresolved.push((key, tile_mode));
+            continue;
+        }
+        log::debug!(
+            "[rt-writeback] {} bpp={} tile={:#x} bytes={:#x}",
+            key.label(),
+            bpp,
+            tile_mode,
+            bytes_to_write,
+        );
+    }
+    restore_small_rt_entries(unresolved);
+    let writeback = result;
+    let written = writeback.targets_written;
     if written != 0 {
         for base in &dependencies.texture_bases {
             renderer.invalidate_texture_address(*base);
@@ -3221,7 +6956,7 @@ fn writeback_cube_sample_dependencies(
             written,
         );
     }
-    written != 0
+    writeback
 }
 
 fn submit_ring() -> &'static std::sync::Mutex<std::collections::VecDeque<String>> {
@@ -3344,19 +7079,20 @@ pub fn guest_probe(mappings: &GpuMappings, mem_read: &dyn Fn(u64, &mut [u8]) -> 
     }
 }
 
-pub fn writeback_small_rts(
+pub(crate) fn writeback_small_rts(
     renderer: &Arc<nexium_gpu::Renderer>,
     mappings: &GpuMappings,
     mem_write: &dyn Fn(u64, &[u8]) -> bool,
-) {
+    snapshot_cache: &mut SsboSnapshotCache,
+) -> bool {
     let pending: Vec<(RtKey, u32)> = {
         let mut reg = small_rt_registry().lock().unwrap();
         if reg.is_empty() {
-            return;
+            return false;
         }
         reg.drain().collect()
     };
-    let _ = writeback_small_rt_entries(
+    let writeback = writeback_small_rt_entries(
         renderer,
         mappings,
         mem_write,
@@ -3364,34 +7100,28 @@ pub fn writeback_small_rts(
         std::time::Duration::from_millis(250),
         "small-rt-writeback",
     );
+    invalidate_snapshot_cache_guest_write_chunks(snapshot_cache, mappings, &writeback.written);
+    writeback.targets_written != 0
 }
 
 pub fn sync_render_thread() -> bool {
     let Some(rt) = crate::render_thread::maybe_render_thread() else {
         return true;
     };
-    if !rt.has_pending_jobs() {
-        return true;
+    if rt.finish(std::time::Duration::from_secs(5)) {
+        true
+    } else {
+        log::warn!("render scheduler finish timed out");
+        false
     }
-    let (tx, rx) = std::sync::mpsc::channel();
-    if !rt.try_submit(Box::new(move || {
-        let _ = tx.send(());
-    })) {
-        log::warn!("compute image sync marker could not be queued");
-        return false;
-    }
-    if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
-        log::warn!("compute image sync marker timed out");
-        return false;
-    }
-    true
 }
 
 fn execute_one(
     draw: &DrawCall,
     mappings: &GpuMappings,
-    maxwell: &Maxwell3D,
+    gs_debug: Option<&GsDebugRegs>,
     maxwell_dma: &super::engines::MaxwellDma,
+    fermi_2d: &super::engines::Fermi2D,
     renderer: &Arc<nexium_gpu::Renderer>,
     ssbo_snapshot_cache: &mut SsboSnapshotCache,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
@@ -3400,8 +7130,9 @@ fn execute_one(
     let result = execute_one_inner(
         draw,
         mappings,
-        maxwell,
+        gs_debug,
         maxwell_dma,
+        fermi_2d,
         renderer,
         ssbo_snapshot_cache,
         mem_read,
@@ -3413,12 +7144,15 @@ fn execute_one(
 fn execute_one_inner(
     draw: &DrawCall,
     mappings: &GpuMappings,
-    maxwell: &Maxwell3D,
+    gs_debug: Option<&GsDebugRegs>,
     maxwell_dma: &super::engines::MaxwellDma,
+    fermi_2d: &super::engines::Fermi2D,
     renderer: &Arc<nexium_gpu::Renderer>,
     ssbo_snapshot_cache: &mut SsboSnapshotCache,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Result<Option<Maxwell3dDrawCall>, String> {
+    let mut enq_phase_started = super::pusher::kickprof::start();
+    let fermi_provenance_profile = enq_phase_started.is_some() || fermi_rt_snapshot_lease_enabled();
     let rt_slot = if draw.is_clear {
         ((draw.clear_mask >> 6) & 0xF).min(7) as usize
     } else {
@@ -3500,6 +7234,22 @@ fn execute_one_inner(
         let do_depth = want_depth_clear && !no_depth && zeta_key.is_some();
         let do_stencil = want_stencil_clear && !no_depth && zeta_key.is_some();
         let depth_clear_key = zeta_key;
+        let (depth_format, depth_aspects) = map_zeta_format(draw.zeta.format);
+        let mut clear_aspects = vk::ImageAspectFlags::empty();
+        if do_depth {
+            clear_aspects |= vk::ImageAspectFlags::DEPTH;
+        }
+        if do_stencil {
+            clear_aspects |= vk::ImageAspectFlags::STENCIL;
+        }
+        let combined_clear = can_coalesce_full_color_depth_clear(
+            rt_key,
+            want_color_clear,
+            clear_scissor,
+            depth_clear_key,
+            depth_aspects,
+            clear_aspects,
+        );
         trace_clear(
             draw,
             op_seq,
@@ -3513,21 +7263,36 @@ fn execute_one_inner(
             do_stencil,
         );
         if let Some(rt_thread) = crate::render_thread::maybe_render_thread() {
-            let r = renderer.clone();
             let cdepth = draw.clear_depth;
             let cstencil = draw.clear_stencil;
             let (w, h) = (rt_key.width, rt_key.height);
-            let (depth_format, depth_aspects) = map_zeta_format(draw.zeta.format);
-            let mut clear_aspects = vk::ImageAspectFlags::empty();
-            if do_depth {
-                clear_aspects |= vk::ImageAspectFlags::DEPTH;
-            }
-            if do_stencil {
-                clear_aspects |= vk::ImageAspectFlags::STENCIL;
-            }
+            let r = renderer.clone();
             rt_thread.submit_named(
                 "clear",
                 Box::new(move || {
+                    if combined_clear {
+                        if let Some(depth_clear_key) = depth_clear_key {
+                            match r.clear_target_and_depth_stencil_with_format(
+                                rt_key,
+                                color,
+                                rt_format,
+                                depth_clear_key,
+                                depth_format,
+                                depth_aspects,
+                                clear_aspects,
+                                cdepth,
+                                cstencil,
+                            ) {
+                                Ok(()) => return,
+                                Err(error) => {
+                                    log::warn!(
+                                        "[clear] combined clear failed; falling back to separate clears: {}",
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if want_color_clear {
                         if let Some(rect) = clear_scissor {
                             let _ = r.clear_target_rect_with_format(
@@ -3554,39 +7319,12 @@ fn execute_one_inner(
                 }),
             );
         } else {
-            if want_color_clear {
-                if let Some(rect) = clear_scissor {
-                    renderer.clear_target_rect_with_format(
-                        nvmap_id,
-                        rt_key.width,
-                        rt_key.height,
-                        rt_gpu_va,
-                        color,
-                        rect,
-                        rt_format,
-                    )?;
-                } else {
-                    renderer.clear_target_with_format(
-                        nvmap_id,
-                        rt_key.width,
-                        rt_key.height,
-                        rt_gpu_va,
+            let combined_cleared = if combined_clear {
+                if let Some(depth_clear_key) = depth_clear_key {
+                    renderer.clear_target_and_depth_stencil_with_format(
+                        rt_key,
                         color,
                         rt_format,
-                    )?;
-                }
-            }
-            if let Some(depth_clear_key) = depth_clear_key {
-                let (depth_format, depth_aspects) = map_zeta_format(draw.zeta.format);
-                let mut clear_aspects = vk::ImageAspectFlags::empty();
-                if do_depth {
-                    clear_aspects |= vk::ImageAspectFlags::DEPTH;
-                }
-                if do_stencil {
-                    clear_aspects |= vk::ImageAspectFlags::STENCIL;
-                }
-                if !clear_aspects.is_empty() {
-                    renderer.clear_depth_stencil(
                         depth_clear_key,
                         depth_format,
                         depth_aspects,
@@ -3594,6 +7332,47 @@ fn execute_one_inner(
                         draw.clear_depth,
                         draw.clear_stencil,
                     )?;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !combined_cleared {
+                if want_color_clear {
+                    if let Some(rect) = clear_scissor {
+                        renderer.clear_target_rect_with_format(
+                            nvmap_id,
+                            rt_key.width,
+                            rt_key.height,
+                            rt_gpu_va,
+                            color,
+                            rect,
+                            rt_format,
+                        )?;
+                    } else {
+                        renderer.clear_target_with_format(
+                            nvmap_id,
+                            rt_key.width,
+                            rt_key.height,
+                            rt_gpu_va,
+                            color,
+                            rt_format,
+                        )?;
+                    }
+                }
+                if let Some(depth_clear_key) = depth_clear_key {
+                    if !clear_aspects.is_empty() {
+                        renderer.clear_depth_stencil(
+                            depth_clear_key,
+                            depth_format,
+                            depth_aspects,
+                            clear_aspects,
+                            draw.clear_depth,
+                            draw.clear_stencil,
+                        )?;
+                    }
                 }
             }
         }
@@ -3696,7 +7475,7 @@ fn execute_one_inner(
             program_region,
             gs_prog,
             draw,
-            maxwell,
+            gs_debug,
             mappings,
             mem_read,
         );
@@ -4216,8 +7995,10 @@ fn execute_one_inner(
             'translate: {
                 if let Some(rec) = l2_store.get(content_key) {
                     bundle_l2_stat(true);
+                    let vs_input_locations = nexium_spirv::scan_input_locations(&rec.vs_spirv);
                     let b = std::sync::Arc::new(ShaderBundle {
                         vs_spirv: std::sync::Arc::new(rec.vs_spirv.clone()),
+                        vs_input_locations,
                         vs_cbuf_mask: rec.vs_cbuf_mask,
                         vs_hash: rec.vs_hash,
                         fs_spirv: std::sync::Arc::new(rec.fs_spirv.clone()),
@@ -4234,6 +8015,9 @@ fn execute_one_inner(
                         depth_compare_cube_mask: rec.depth_compare_cube_mask,
                         depth_compare_cube_array_mask: rec.depth_compare_cube_array_mask,
                         graphics_cbuf_reads: rec.graphics_cbuf_reads.clone(),
+                        graphics_cbuf_requirements: packed_cbuf_read_requirements(
+                            &rec.graphics_cbuf_reads,
+                        ),
                         cbuf_used: rec.cbuf_used,
                         ssbo_descs: rec
                             .ssbo_descs
@@ -4283,6 +8067,8 @@ fn execute_one_inner(
                     Vec::new()
                 };
                 let graphics_cbuf_reads = collect_graphics_cbuf_reads(&vs_cfg, &fs_cfg);
+                let graphics_cbuf_requirements =
+                    packed_cbuf_read_requirements(&graphics_cbuf_reads);
                 let varying_map = match nexium_spirv::link_graphics_varyings(&vs_cfg, &fs_cfg) {
                     Ok(map) => map,
                     Err(error) => {
@@ -4464,8 +8250,10 @@ fn execute_one_inner(
                         fnv(&fs_spirv)
                     );
                 }
+                let vs_input_locations = nexium_spirv::scan_input_locations(&vs_spirv);
                 let b = std::sync::Arc::new(ShaderBundle {
                     vs_spirv: std::sync::Arc::new(vs_spirv),
+                    vs_input_locations,
                     vs_cbuf_mask,
                     vs_hash,
                     fs_spirv: std::sync::Arc::new(fs_spirv),
@@ -4483,6 +8271,7 @@ fn execute_one_inner(
                     depth_compare_cube_array_mask: active_texture_layout
                         .depth_compare_cube_array_mask,
                     graphics_cbuf_reads,
+                    graphics_cbuf_requirements,
                     cbuf_used: vs_cbuf_used.max(fs_cbuf_used),
                     ssbo_descs,
                 });
@@ -4595,12 +8384,17 @@ fn execute_one_inner(
             }
         }
     };
+    super::pusher::kickprof::add(super::pusher::kickprof::ENQ_PRE, enq_phase_started);
+    enq_phase_started = super::pusher::kickprof::start();
+    let mut enq_tex_sub = super::pusher::kickprof::start();
     let vs_spirv = bundle.vs_spirv.clone();
-    let fs_spirv = if fs_solid_probe_matches(fs_addr) {
+    let solid_fs_probe = fs_solid_probe_matches(fs_addr);
+    let fs_spirv = if solid_fs_probe {
         std::sync::Arc::new(solid_red_fs_spirv())
     } else {
         bundle.fs_spirv.clone()
     };
+    let fs_hash = effective_fragment_pipeline_hash(bundle.fs_hash, &fs_spirv, solid_fs_probe);
     let vs_cbuf_mask = bundle.vs_cbuf_mask;
     let fs_cbuf_mask = bundle.fs_cbuf_mask;
     let mut fs_tex_ids = bundle.fs_tex_ids.clone();
@@ -4633,8 +8427,9 @@ fn execute_one_inner(
     let texture_numeric_manifest = bundle.texture_numeric_manifest.clone();
     let texel_buffer_mask = active_texture_layout.texel_buffer_mask();
 
-    let vs_input_locations = nexium_spirv::scan_input_locations(&vs_spirv);
-    let layout = build_vertex_layout(draw, &vs_input_locations)?;
+    super::pusher::kickprof::add(super::pusher::kickprof::ENQ_TEX_A, enq_tex_sub);
+    enq_tex_sub = super::pusher::kickprof::start();
+    let layout = build_vertex_layout(draw, &bundle.vs_input_locations)?;
     let mut topology = map_topology(draw.topology)
         .ok_or_else(|| format!("unsupported topology {}", draw.topology))?;
 
@@ -4721,10 +8516,33 @@ fn execute_one_inner(
     );
 
     let shader_fs_tex_ids = fs_tex_ids.clone();
-    let mut fs_tex_remap: Vec<String> = Vec::with_capacity(fs_tex_ids.len());
-    let mut fs_sampler_ids: Vec<u32> = vec![0u32; fs_tex_ids.len()];
     let split_vs_stage = split_vs_texture_stage_enabled();
-    if !fs_tex_ids.is_empty() {
+    let fs_remap_trace_active = fs_remap_trace(fs_addr, bundle.fs_hash);
+    let collect_texture_remap = texture_bind_log_enabled()
+        || fs_remap_trace_active
+        || (vs_tex_count != 0 && vs_tex_bind_fs_trace(fs_addr))
+        || menu_draw_dbg_targets().is_some();
+    super::pusher::kickprof::add(super::pusher::kickprof::ENQ_TEX_B, enq_tex_sub);
+    enq_tex_sub = super::pusher::kickprof::start();
+    let use_resolved_texture_ids = draw.tic_pool_gpu_va != 0
+        && split_vs_stage
+        && active_texture_layout.resolved_tic_ids.len() == fs_tex_ids.len()
+        && active_texture_layout.resolved_sampler_ids.len() == fs_tex_ids.len();
+    let mut fs_sampler_ids = vec![0u32; fs_tex_ids.len()];
+    if use_resolved_texture_ids {
+        fs_tex_ids.clone_from(&active_texture_layout.resolved_tic_ids);
+        fs_sampler_ids.clone_from(&active_texture_layout.resolved_sampler_ids);
+    }
+    let mut fs_tex_remap = if collect_texture_remap {
+        Vec::with_capacity(fs_tex_ids.len())
+    } else {
+        Vec::new()
+    };
+    if (!use_resolved_texture_ids || collect_texture_remap) && !fs_tex_ids.is_empty() {
+        if use_resolved_texture_ids {
+            fs_tex_ids.clone_from(&shader_fs_tex_ids);
+            fs_sampler_ids.fill(0);
+        }
         let fs_end = if split_vs_stage && vs_tex_count != 0 {
             (vs_tex_base as usize).min(fs_tex_ids.len())
         } else {
@@ -4739,6 +8557,7 @@ fn execute_one_inner(
                 &mut fs_tex_ids[..fs_end],
                 &mut fs_sampler_ids[..fs_end],
                 0,
+                collect_texture_remap,
                 &mut fs_tex_remap,
                 draw.tic_pool_gpu_va,
                 draw.tic_pool_limit,
@@ -4762,6 +8581,7 @@ fn execute_one_inner(
                     &mut fs_tex_ids[vs_start..vs_end],
                     &mut fs_sampler_ids[vs_start..vs_end],
                     vs_start,
+                    collect_texture_remap,
                     &mut fs_tex_remap,
                     draw.tic_pool_gpu_va,
                     draw.tic_pool_limit,
@@ -4789,7 +8609,7 @@ fn execute_one_inner(
         draw.tic_pool_gpu_va,
         draw.tic_pool_limit,
     );
-    if fs_remap_trace(fs_addr, bundle.fs_hash)
+    if fs_remap_trace_active
         && (!fs_tex_remap.is_empty() || !bundle.texture_numeric_manifest.is_empty())
     {
         let numeric_bindings = bundle
@@ -4837,9 +8657,18 @@ fn execute_one_inner(
         mem_read,
     );
 
+    super::pusher::kickprof::add(super::pusher::kickprof::ENQ_TEX_C, enq_tex_sub);
+    enq_tex_sub = super::pusher::kickprof::start();
+    let tic_pool_cpu_range = (draw.tic_pool_gpu_va != 0)
+        .then(|| mappings.cpu_range_for(draw.tic_pool_gpu_va))
+        .flatten();
     let mut sampled_rt_keys: Vec<RtKey> = Vec::new();
     let mut sampled_rt_slots: Vec<Option<RtKey>> = vec![None; fs_tex_ids.len()];
     let mut sampled_rt_copy_sources: Vec<Option<RtKey>> = vec![None; fs_tex_ids.len()];
+    let mut sampled_rt_fermi_exact_slots: Vec<Option<FermiExactRtToken>> =
+        vec![None; fs_tex_ids.len()];
+    let reuse_resolved_tics =
+        use_resolved_texture_ids && !collect_texture_remap && !texture_debug_enabled();
     if texture_debug_enabled() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static D: AtomicU64 = AtomicU64::new(0);
@@ -4859,15 +8688,29 @@ fn execute_one_inner(
             if *tex_id == u32::MAX || *tex_id > draw.tic_pool_limit {
                 continue;
             }
-            let tic_addr = draw.tic_pool_gpu_va.wrapping_add((*tex_id as u64) * 32);
-            let Some(cpu) = mappings.cpu_address_for(tic_addr) else {
-                continue;
+            let tic_addr = draw
+                .tic_pool_gpu_va
+                .wrapping_add((*tex_id as u64).saturating_mul(32));
+            let tic_offset = (*tex_id as u64).saturating_mul(32);
+            let pool_cpu = tic_pool_cpu_range.and_then(|(cpu, available)| {
+                (available >= tic_offset.saturating_add(32)).then(|| cpu + tic_offset)
+            });
+            let tic_raw = match pool_cpu {
+                Some(cpu) => {
+                    let mut raw = [0u8; 32];
+                    mem_read(cpu, &mut raw).then_some(raw)
+                }
+                None => read_tic_raw(tic_addr, mappings, mem_read),
             };
-            let mut tic_raw = [0u8; 32];
-            if !mem_read(cpu, &mut tic_raw) {
-                continue;
-            }
-            let Some(tic) = nexium_gpu::texture::TicEntry::parse(&tic_raw) else {
+            let cached_tic = reuse_resolved_tics
+                .then(|| {
+                    active_texture_layout
+                        .resolved_tics
+                        .get(slot)
+                        .and_then(Option::as_ref)
+                })
+                .flatten();
+            let Some(tic) = tic_raw.and_then(|raw| tic_entry_for_alias(cached_tic, raw)) else {
                 continue;
             };
             if tic.width >= 512 && tic.height >= 256 && texture_debug_enabled() {
@@ -4893,29 +8736,40 @@ fn execute_one_inner(
                     );
                 }
             }
-            if !tic_can_alias_render_target_view(&tic) {
-                continue;
-            }
-            let Some(nv) = mappings.nvmap_id_for(tic.gpu_va) else {
+            let alias_key = if tic_can_alias_render_target_view(&tic) {
+                mappings.nvmap_id_for(tic.gpu_va).map(|nv| {
+                    RtKey::with_cpu(
+                        nv,
+                        tic.width,
+                        tic.height,
+                        tic.gpu_va,
+                        mappings.cpu_address_for(tic.gpu_va).unwrap_or(0),
+                    )
+                    .with_volume_depth(if tic.texture_type == 2 {
+                        tic.depth.max(1)
+                    } else {
+                        1
+                    })
+                })
+            } else {
+                None
+            };
+            let Some(key) = alias_key else {
                 continue;
             };
-            let key = RtKey::with_cpu(
-                nv,
-                tic.width,
-                tic.height,
-                tic.gpu_va,
-                mappings.cpu_address_for(tic.gpu_va).unwrap_or(0),
-            )
-            .with_volume_depth(if tic.texture_type == 2 {
-                tic.depth.max(1)
-            } else {
-                1
-            });
             sampled_rt_slots[slot] = Some(key);
-            if let Some((source, stamp)) = maxwell_dma.rt_copy_source(tic.gpu_va) {
-                if renderer.render_target_stamp(source) == Some(stamp) {
-                    sampled_rt_copy_sources[slot] = Some(source);
-                }
+            if fermi_provenance_profile {
+                record_fermi_provenance(
+                    &tic,
+                    key,
+                    slot,
+                    fermi_2d,
+                    maxwell_dma,
+                    renderer,
+                    mappings,
+                    &mut sampled_rt_fermi_exact_slots,
+                    &mut sampled_rt_copy_sources,
+                );
             }
             if !sampled_rt_keys.contains(&key) {
                 sampled_rt_keys.push(key);
@@ -4923,6 +8777,9 @@ fn execute_one_inner(
         }
     }
     let sampled_rt_key = sampled_rt_keys.first().copied();
+    super::pusher::kickprof::add(super::pusher::kickprof::ENQ_TEX_D, enq_tex_sub);
+    super::pusher::kickprof::add(super::pusher::kickprof::ENQ_TEX, enq_phase_started);
+    enq_phase_started = super::pusher::kickprof::start();
 
     let vertex_bindings = vertex_buffer_bindings(&draw.vertex_buffers, &layout);
     let vertex_addr = vertex_bindings.first().map(|b| b.addr).unwrap_or(0);
@@ -5036,29 +8893,35 @@ fn execute_one_inner(
         }
     }
 
-    let (fallback_cbuf_addr, fallback_cbuf_size) = {
+    let (fallback_cbuf_addr, fallback_cbuf_size) = if vs_cbuf_debug_enabled() {
         let (a, s) = resolve_vs_cbuf(cbuf_binds, vs_cbuf_group);
-        if a != 0 && vs_cbuf_debug_enabled() {
+        if a != 0 {
             (a, s)
         } else {
             (cbuf_addr, cbuf_size)
         }
+    } else {
+        (cbuf_addr, cbuf_size)
     };
     let _fallback_cbuf_size = fallback_cbuf_size.min(bundle.cbuf_used);
-    let cbuf_data = Some(pack_cbuf_data(
+    let cbuf_data = Some(pack_cbuf_data_with_requirements(
         cbuf_binds,
         vs_cbuf_mask,
         fs_cbuf_mask,
         vs_cbuf_group,
         fs_cbuf_group,
+        &bundle.graphics_cbuf_requirements,
+        ssbo_snapshot_cache,
         mappings,
         mem_read,
     ));
     let (call_cbuf_addr, call_cbuf_size) = if let Some(data) = &cbuf_data {
-        (0, data.len() as u32)
+        (0, data.packed_len() as u32)
     } else {
         (fallback_cbuf_addr, _fallback_cbuf_size)
     };
+    super::pusher::kickprof::add(super::pusher::kickprof::ENQ_CBUF, enq_phase_started);
+    enq_phase_started = super::pusher::kickprof::start();
 
     if water_forensics_enabled() {
         use std::collections::HashSet;
@@ -5157,10 +9020,15 @@ fn execute_one_inner(
             let start = draw
                 .index_gpu_va
                 .wrapping_add((draw.index_first as u64) * isz as u64);
-            let raw = read_gpu_strict(mappings, mem_read, start, icount * isz);
+            let raw = ssbo_snapshot_cache
+                .read_input_or_insert(mappings, start, icount * isz, mem_read)
+                .or_else(|| read_gpu_strict(mappings, mem_read, start, icount * isz).map(Arc::new));
             match raw {
                 Some(bytes) => {
-                    let prepared = prepare_index_data(
+                    let input = ssbo_snapshot_cache.last_input_identity_for(&bytes);
+                    let prepared = prepare_index_data_cached(
+                        ssbo_snapshot_cache,
+                        input,
                         bytes,
                         draw.index_format,
                         draw.topology,
@@ -5186,6 +9054,8 @@ fn execute_one_inner(
             (None, None, vk::IndexType::UINT16, draw.vertex_count)
         };
     let is_indexed = out_index_count.is_some();
+    super::pusher::kickprof::add(super::pusher::kickprof::ENQ_INDEX, enq_phase_started);
+    enq_phase_started = super::pusher::kickprof::start();
 
     let attachments: [BlendAttachmentState; 8] = std::array::from_fn(|rt| {
         let (
@@ -5276,7 +9146,7 @@ fn execute_one_inner(
         &blend_state,
         vs_cbuf_mask,
         fs_cbuf_mask,
-        cbuf_data.as_deref(),
+        cbuf_data.as_ref(),
         cbuf_binds,
     );
 
@@ -5316,7 +9186,7 @@ fn execute_one_inner(
         vs_cbuf_mask,
         fs_cbuf_mask,
         cbuf_binds,
-        cbuf_data.as_deref(),
+        cbuf_data.as_ref(),
         &bundle.graphics_cbuf_reads,
     );
     trace_cbuf_watch(
@@ -5328,11 +9198,13 @@ fn execute_one_inner(
         vs_cbuf_mask,
         fs_cbuf_mask,
         cbuf_binds,
-        cbuf_data.as_deref(),
+        cbuf_data.as_ref(),
         &fs_tex_ids,
         &sampled_rt_slots,
         &bundle.graphics_cbuf_reads,
     );
+    super::pusher::kickprof::add(super::pusher::kickprof::ENQ_STATE, enq_phase_started);
+    enq_phase_started = super::pusher::kickprof::start();
 
     let ssbo_dbg = ssbo_debug_enabled();
     if ssbo_dbg && !bundle.ssbo_descs.is_empty() {
@@ -5378,7 +9250,8 @@ fn execute_one_inner(
         let mut guest_addr = 0u64;
         let mut logical_size = 16usize;
         let mut data_offset = 0usize;
-        let (cb_va, _cb_sz) = cbuf_binds[vs_cbuf_group][(d.cbuf_binding as usize).min(15)];
+        let (cb_va, _cb_sz) =
+            cbuf_binds[vs_cbuf_group][(d.cbuf_binding as usize).min(GRAPHICS_CBUF_SLOTS - 1)];
         let mut dbg_base: u64 = 0;
         let mut dbg_slack: usize = 0;
         let mut dbg_size: u32 = 0;
@@ -5429,7 +9302,7 @@ fn execute_one_inner(
                 0x40000usize.max(required_logical_size)
             };
             let window = if d.is_direct() {
-                cbuf_data.as_deref().and_then(|data| {
+                cbuf_data.as_ref().and_then(|data| {
                     aurora_ssbo_read_window(
                         *d,
                         size,
@@ -5512,13 +9385,15 @@ fn execute_one_inner(
         });
         ssbo_meta.push((dbg_base, dbg_slack, dbg_readok));
     }
+    super::pusher::kickprof::add(super::pusher::kickprof::ENQ_SSBO, enq_phase_started);
+    enq_phase_started = super::pusher::kickprof::start();
     trace_dusk_quad_inputs(
         vs_addr,
         eff_vertex_count,
         out_index_count.unwrap_or(0),
         out_index_type,
-        out_index_data.as_deref(),
-        cbuf_data.as_deref(),
+        out_index_data.as_ref().map(|data| data.as_slice()),
+        cbuf_data.as_ref(),
         &ssbo_data,
         &ssbo_meta,
     );
@@ -5527,7 +9402,7 @@ fn execute_one_inner(
         fs_addr,
         &ssbo_data,
         &ssbo_meta,
-        cbuf_data.as_deref(),
+        cbuf_data.as_ref(),
         &fs_tex_ids,
         draw.tic_pool_gpu_va,
         draw.tic_pool_limit,
@@ -5536,7 +9411,7 @@ fn execute_one_inner(
         eff_vertex_count,
         out_index_count.unwrap_or(0),
         out_index_type,
-        out_index_data.as_deref(),
+        out_index_data.as_ref().map(|data| data.as_slice()),
     );
 
     let (depth_format, depth_aspects) = if depth_key.is_some() {
@@ -5553,13 +9428,15 @@ fn execute_one_inner(
     let (front_face, present_flip_y) =
         maxwell_draw_orientation(draw.window_origin, draw.front_face);
 
+    let sampled_rt_fermi_snapshot_slots = vec![None; fs_tex_ids.len()];
+    let sampled_rt_snapshot_slots = vec![false; fs_tex_ids.len()];
     let call = Maxwell3dDrawCall {
         vs_spirv,
         fs_spirv,
         vs_gpu_va: vs_addr,
         fs_gpu_va: fs_addr,
         vs_hash: bundle.vs_hash,
-        fs_hash: bundle.fs_hash,
+        fs_hash,
         vs_cbuf_mask,
         fs_cbuf_mask,
         fs_tex_ids,
@@ -5576,6 +9453,7 @@ fn execute_one_inner(
         cbuf_data,
         vertex_addr,
         vertex_bindings,
+        resident_vertex: Vec::new(),
         vertex_count: eff_vertex_count,
         first_vertex: draw.first_vertex,
         instance_count: draw.instance_count.max(1),
@@ -5627,6 +9505,11 @@ fn execute_one_inner(
         sampled_rt_keys,
         sampled_rt_slots,
         sampled_rt_copy_sources,
+        sampled_rt_fermi_exact_slots,
+        sampled_rt_fermi_snapshot_slots,
+        sampled_rt_snapshot_slots,
+        fragment_barrier_after: false,
+        texture_cache_invalidate_after: false,
         clear: false,
         clear_color: [0.0, 0.0, 0.0, 1.0],
         tic_pool_gpu_va: draw.tic_pool_gpu_va,
@@ -5649,6 +9532,7 @@ fn execute_one_inner(
         present_flip_y,
     };
 
+    super::pusher::kickprof::add(super::pusher::kickprof::ENQ_FINAL, enq_phase_started);
     Ok(Some(call))
 }
 
@@ -5658,7 +9542,7 @@ fn trace_dusk_quad_inputs(
     index_count: u32,
     index_type: vk::IndexType,
     index_data: Option<&[u8]>,
-    cbuf_data: Option<&[u8]>,
+    cbuf_data: Option<&GraphicsCbufPayload>,
     ssbo_data: &[StorageBufferSnapshot],
     ssbo_meta: &[(u64, usize, bool)],
 ) {
@@ -5673,7 +9557,8 @@ fn trace_dusk_quad_inputs(
     }
 
     let Some(cbuf) = cbuf_data else { return };
-    let word = |off: usize| packed_cbuf_word(cbuf, 1, off).unwrap_or(u32::MAX);
+    let cbuf = cbuf.materialize();
+    let word = |off: usize| packed_cbuf_word(&cbuf, 1, off).unwrap_or(u32::MAX);
     let vtx_start = word(0) as usize;
     let cbuf_words = (0..0x80usize)
         .step_by(4)
@@ -5848,70 +9733,6 @@ fn active_color_rts(
     keys
 }
 
-fn draw_rt_binding_signature(
-    draw: &DrawCall,
-    mappings: &GpuMappings,
-    _maxwell: &Maxwell3D,
-    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
-) -> Result<RtBindingSignature, String> {
-    let rt_slot = draw_color_rt_slot(draw);
-    let rt = &draw.rt[rt_slot];
-    if rt.width == 0 || rt.height == 0 {
-        return Err(format!("RT[{}] has zero extent", rt_slot));
-    }
-    let rt_gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
-    let nvmap_id = mappings
-        .nvmap_id_for(rt_gpu_va)
-        .ok_or_else(|| format!("RT gpu_va={:#x} not mapped", rt_gpu_va))?;
-    let (msx, msy) = msaa_samples(draw.multisample_mode);
-    let rt_key = RtKey::with_cpu(
-        nvmap_id,
-        (rt.width / msx).max(1),
-        (rt.height / msy).max(1),
-        rt_gpu_va,
-        mappings.cpu_address_for(rt_gpu_va).unwrap_or(0),
-    )
-    .with_volume_depth(render_target_volume_depth(rt));
-    let program_region = draw.program_region_gpu_va;
-    let fs_prog = &draw.shader_programs[5];
-    let fs_addr = program_region.wrapping_add(fs_prog.address_lo as u64);
-    let fs_output_map = fetch_sph(fs_addr, mappings, mem_read)
-        .map(ps_output_map)
-        .unwrap_or(0);
-    let rt_format = map_rt_format_for_key(rt.format, rt_key);
-    let color_rts = active_color_rts(draw, mappings, rt_key, rt_format, fs_output_map);
-    let color_rt_keys = color_rts.iter().map(|(_, key, _)| *key).collect();
-    let color_rt_formats = color_rts.iter().map(|(_, _, format)| *format).collect();
-
-    let water_probe = water_no_ztest() && draw.color_blend.blend_enable[0];
-    let (depth_test, _, stencil_test) = effective_depth_states(
-        depth_disabled() || water_probe,
-        draw.zeta_enable,
-        draw.depth_test_enable,
-        draw.depth_write_enable,
-        draw.stencil_enable,
-    );
-    let depth_key = if depth_test || stencil_test {
-        zeta_rt_key(draw, mappings, rt_key)
-    } else {
-        None
-    };
-    let (depth_format, depth_aspects) = if depth_key.is_some() {
-        map_zeta_format(draw.zeta.format)
-    } else {
-        (vk::Format::UNDEFINED, vk::ImageAspectFlags::empty())
-    };
-
-    Ok(RtBindingSignature {
-        rt_key,
-        color_rt_keys,
-        color_rt_formats,
-        depth_key,
-        depth_format,
-        depth_aspects,
-    })
-}
-
 fn fragment_output_numeric_masks(color_rts: &[(usize, RtKey, vk::Format)]) -> (u32, u32) {
     let mut uint_mask = 0u32;
     let mut sint_mask = 0u32;
@@ -6011,7 +9832,7 @@ fn trace_font_ssbo(
     fs_addr: u64,
     ssbo_data: &[StorageBufferSnapshot],
     ssbo_meta: &[(u64, usize, bool)],
-    cbuf_data: Option<&[u8]>,
+    cbuf_data: Option<&GraphicsCbufPayload>,
     fs_tex_ids: &[u32],
     tic_pool_gpu_va: u64,
     tic_pool_limit: u32,
@@ -6039,7 +9860,8 @@ fn trace_font_ssbo(
     if seq >= limit {
         return;
     }
-    let c3 = font_cbuf_summary(cbuf_data);
+    let packed_cbuf = cbuf_data.map(GraphicsCbufPayload::materialize);
+    let c3 = font_cbuf_summary(packed_cbuf.as_deref());
     let indices = font_indices(vertex_count, index_count, index_type, index_data);
     for (idx, snapshot) in ssbo_data.iter().enumerate() {
         let bytes = &snapshot.data;
@@ -6285,7 +10107,9 @@ fn font_tic_layer_count(tic: &nexium_gpu::texture::TicEntry) -> u32 {
 }
 
 fn font_tic_layer_read_size(tic: &nexium_gpu::texture::TicEntry, pitch_size: usize) -> usize {
-    if tic.is_block_linear {
+    if let Some(size) = tic.pitch_linear_layer_size() {
+        size
+    } else if tic.is_block_linear {
         tic.format
             .block_linear_size(tic.width, tic.height, tic.block_height_log2)
             .max(pitch_size)
@@ -6323,6 +10147,9 @@ fn font_decode_texture_layers(
                 bpp,
                 tic.block_height_log2,
             )
+        } else if tic.pitch_linear_layer_size().is_some() {
+            nexium_gpu::texture::unpack_pitch_linear(layer_raw, tic, 1)
+                .unwrap_or_else(|| layer_raw.to_vec())
         } else if layer_raw.len() >= pitch_size {
             layer_raw[..pitch_size].to_vec()
         } else {
@@ -6560,10 +10387,10 @@ fn trace_menu_draw(
     depth_test: bool,
     depth_write: bool,
     blend: &BlendState,
-    vs_cbuf_mask: u32,
-    fs_cbuf_mask: u32,
-    cbuf_data: Option<&[u8]>,
-    cbuf_binds: &[[(u64, u32); 16]; 5],
+    vs_cbuf_mask: u64,
+    fs_cbuf_mask: u64,
+    cbuf_data: Option<&GraphicsCbufPayload>,
+    cbuf_binds: &GraphicsCbufBinds,
 ) {
     let Some(targets) = menu_draw_dbg_targets() else {
         return;
@@ -6721,10 +10548,14 @@ fn trace_menu_draw(
     }
 }
 
-fn menu_cbuf_sample(cbuf_data: Option<&[u8]>, cbuf_binds: &[[(u64, u32); 16]; 5]) -> String {
+fn menu_cbuf_sample(
+    cbuf_data: Option<&GraphicsCbufPayload>,
+    cbuf_binds: &GraphicsCbufBinds,
+) -> String {
     let Some(data) = cbuf_data else {
         return "none".to_string();
     };
+    let data = data.materialize();
     let offsets = [
         0x0u32, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 0x38,
         0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0x58, 0x5c, 0x60, 0x64, 0x68, 0x6c, 0x70, 0x74,
@@ -6737,7 +10568,7 @@ fn menu_cbuf_sample(cbuf_data: Option<&[u8]>, cbuf_binds: &[[(u64, u32); 16]; 5]
     let (addr, size) = cbuf_bind_for_slot(cbuf_binds, logical_slot as u32);
     let mut vals = Vec::new();
     for off in offsets {
-        let Some(raw) = packed_cbuf_word(data, logical_slot, off as usize) else {
+        let Some(raw) = packed_cbuf_word(&data, logical_slot, off as usize) else {
             vals.push(format!("{:#x}=out", off));
             continue;
         };
@@ -7208,7 +11039,7 @@ fn dump_geometry_shader_once(
     program_region: u64,
     program: &super::engines::maxwell3d::ShaderProgram,
     draw: &DrawCall,
-    maxwell: &Maxwell3D,
+    gs_debug: Option<&GsDebugRegs>,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) {
@@ -7236,7 +11067,7 @@ fn dump_geometry_shader_once(
         program_region,
         program,
         draw,
-        maxwell,
+        gs_debug,
         &sph,
         &sass,
     ));
@@ -7255,7 +11086,7 @@ fn format_geometry_shader_metadata(
     program_region: u64,
     program: &super::engines::maxwell3d::ShaderProgram,
     draw: &DrawCall,
-    maxwell: &Maxwell3D,
+    gs_debug: Option<&GsDebugRegs>,
     sph: &[u8; SPH_SIZE],
     sass: &[u8],
 ) -> String {
@@ -7273,16 +11104,12 @@ fn format_geometry_shader_metadata(
     let common4 = word(16);
     let rt_slot = draw_color_rt_slot(draw);
     let rt = &draw.rt[rt_slot];
-    let post_vtg_masks = (0..8)
-        .map(|index| {
-            maxwell
-                .reg_file
-                .get(0x490 + index)
-                .copied()
-                .unwrap_or_default()
-        })
-        .collect::<Vec<_>>();
-    let cbufs = maxwell.regs.cbuf_binds[3]
+    let post_vtg_masks = gs_debug
+        .map(|regs| regs.post_vtg_masks.to_vec())
+        .unwrap_or_else(|| vec![0; 8]);
+    let cbufs = gs_debug
+        .map(|regs| regs.stage3_cbuf_binds)
+        .unwrap_or_default()
         .iter()
         .enumerate()
         .filter(|(_, (gpu_va, size))| *gpu_va != 0 && *size != 0)
@@ -7482,9 +11309,9 @@ fn trace_water_forensics(
     color_rt_keys: &[RtKey],
     vs_addr: u64,
     fs_addr: u64,
-    vs_cbuf_mask: u32,
-    fs_cbuf_mask: u32,
-    cbuf_binds: &[[(u64, u32); 16]; 5],
+    vs_cbuf_mask: u64,
+    fs_cbuf_mask: u64,
+    cbuf_binds: &GraphicsCbufBinds,
     blend: (bool, u32, u32),
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
@@ -7592,8 +11419,8 @@ fn trace_water_forensics(
         );
     }
     let mut parts: Vec<String> = Vec::new();
-    let mask = (vs_cbuf_mask | fs_cbuf_mask) as u64;
-    for logical in 0..32u32 {
+    let mask = vs_cbuf_mask | fs_cbuf_mask;
+    for logical in 0..PACKED_CBUF_SLOTS as u32 {
         if mask & (1u64 << logical) == 0 {
             continue;
         }
@@ -7718,9 +11545,9 @@ fn trace_grade_discover(
     fs_addr: u64,
     fs_output_map: u32,
     fs_input_map: &[u8; 32],
-    vs_cbuf_mask: u32,
-    fs_cbuf_mask: u32,
-    cbuf_binds: &[[(u64, u32); 16]; 5],
+    vs_cbuf_mask: u64,
+    fs_cbuf_mask: u64,
+    cbuf_binds: &GraphicsCbufBinds,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     fs_tex_ids: &[u32],
@@ -7743,7 +11570,8 @@ fn trace_grade_discover(
     }
     let slot19_offset = 0x120usize;
     let slot19_len = 0x60usize;
-    let (slot19_addr, slot19_size) = cbuf_bind_for_slot(cbuf_binds, 19);
+    let grade_slot = FRAGMENT_CBUF_BASE + 3;
+    let (slot19_addr, slot19_size) = cbuf_bind_for_slot(cbuf_binds, grade_slot as u32);
     let slot19_bytes = if slot19_addr != 0 && slot19_size as usize > slot19_offset {
         let len = slot19_len.min(slot19_size as usize - slot19_offset);
         mappings
@@ -7825,7 +11653,7 @@ fn trace_grade_discover(
     let reads = graphics_cbuf_reads
         .iter()
         .filter_map(|read| {
-            (read.logical_slot == 19).then(|| {
+            (read.logical_slot as usize == grade_slot).then(|| {
                 let origin = cbuf_read_origin_label(*read);
                 match read.effective_byte_offset() {
                     Some(effective) => format!(
@@ -7841,7 +11669,7 @@ fn trace_grade_discover(
         })
         .collect::<Vec<_>>()
         .join(",");
-    let fs_binds = (16..32u32)
+    let fs_binds = (FRAGMENT_CBUF_BASE as u32..PACKED_CBUF_SLOTS as u32)
         .filter_map(|slot| {
             let (addr, size) = cbuf_bind_for_slot(cbuf_binds, slot);
             (addr != 0 && size != 0).then(|| format!("{}={:#x}/{}", slot, addr, size))
@@ -7865,7 +11693,7 @@ fn trace_grade_discover(
         imap,
         vs_cbuf_mask,
         fs_cbuf_mask,
-        ((vs_cbuf_mask | fs_cbuf_mask) & (1u32 << 19)) != 0,
+        ((vs_cbuf_mask | fs_cbuf_mask) & (1u64 << grade_slot)) != 0,
         slot19_addr,
         slot19_size,
         slot19,
@@ -7904,10 +11732,10 @@ fn trace_draw(
     fs_output_map: u32,
     color_masks: &[u32; 8],
     color_mask_common: bool,
-    vs_cbuf_mask: u32,
-    fs_cbuf_mask: u32,
-    cbuf_binds: &[[(u64, u32); 16]; 5],
-    cbuf_data: Option<&[u8]>,
+    vs_cbuf_mask: u64,
+    fs_cbuf_mask: u64,
+    cbuf_binds: &GraphicsCbufBinds,
+    cbuf_data: Option<&GraphicsCbufPayload>,
     graphics_cbuf_reads: &[CbufRead],
 ) {
     let op_seq = next_gpu_op_seq();
@@ -8006,15 +11834,17 @@ fn trace_draw(
         signed_viewport_nvmap(nvmap_id),
     );
     let clip = draw.surface_clip.effective(rt.width, rt.height);
+    let packed_cbuf = cbuf_data.map(GraphicsCbufPayload::materialize);
+    let packed_cbuf = packed_cbuf.as_deref();
     let cbuf_full = std::env::var_os("NEXIUM_DRAW_TRACE_CBUF_FULL").is_some();
     let cbuf =
         if cbuf_full || matches!(draw.fs_shader_gpu_va, 0x20330 | 0x40430) || fs_tex_ids.is_empty()
         {
             if cbuf_full {
-                cbuf_sample(cbuf_data, vs_cbuf_mask | fs_cbuf_mask, &[], cbuf_binds)
+                cbuf_sample(packed_cbuf, vs_cbuf_mask | fs_cbuf_mask, &[], cbuf_binds)
             } else {
                 cbuf_sample(
-                    cbuf_data,
+                    packed_cbuf,
                     vs_cbuf_mask | fs_cbuf_mask,
                     graphics_cbuf_reads,
                     cbuf_binds,
@@ -8297,7 +12127,7 @@ fn cbuf_read_origin_label(read: CbufRead) -> String {
     }
 }
 
-fn format_cbuf_read(data: &[u8], read: CbufRead, cbuf_binds: &[[(u64, u32); 16]; 5]) -> String {
+fn format_cbuf_read(data: &[u8], read: CbufRead, cbuf_binds: &GraphicsCbufBinds) -> String {
     let logical_slot = u32::from(read.logical_slot);
     let (base, size) = cbuf_bind_for_slot(cbuf_binds, logical_slot);
     let origin = cbuf_read_origin_label(read);
@@ -8330,9 +12160,9 @@ fn format_cbuf_read(data: &[u8], read: CbufRead, cbuf_binds: &[[(u64, u32); 16];
 
 fn cbuf_sample(
     cbuf_data: Option<&[u8]>,
-    used_mask: u32,
+    used_mask: u64,
     cbuf_reads: &[CbufRead],
-    cbuf_binds: &[[(u64, u32); 16]; 5],
+    cbuf_binds: &GraphicsCbufBinds,
 ) -> String {
     let Some(data) = cbuf_data else {
         return "cbuf_sample=none".to_string();
@@ -8365,7 +12195,7 @@ fn cbuf_sample(
     }
     let mut slots = Vec::new();
     for logical_slot in 0..PACKED_CBUF_SLOTS {
-        if (used_mask & (1u32 << logical_slot)) == 0 {
+        if (used_mask & (1u64 << logical_slot)) == 0 {
             continue;
         }
         let Some(slot_data) = packed_cbuf_slot(data, logical_slot) else {
@@ -8434,7 +12264,7 @@ fn cbuf_watch_regions() -> Option<&'static [CbufWatchRegion]> {
                 || spec.eq_ignore_ascii_case("grade")
             {
                 return Some(vec![CbufWatchRegion {
-                    slot: 19,
+                    slot: FRAGMENT_CBUF_BASE + 3,
                     offset: 0x120,
                     len: 0x60,
                 }]);
@@ -8469,10 +12299,10 @@ fn trace_cbuf_watch(
     rt_key: RtKey,
     vs_addr: u64,
     fs_addr: u64,
-    vs_cbuf_mask: u32,
-    fs_cbuf_mask: u32,
-    cbuf_binds: &[[(u64, u32); 16]; 5],
-    cbuf_data: Option<&[u8]>,
+    vs_cbuf_mask: u64,
+    fs_cbuf_mask: u64,
+    cbuf_binds: &GraphicsCbufBinds,
+    cbuf_data: Option<&GraphicsCbufPayload>,
     fs_tex_ids: &[u32],
     sampled_rt_slots: &[Option<RtKey>],
     graphics_cbuf_reads: &[CbufRead],
@@ -8483,6 +12313,7 @@ fn trace_cbuf_watch(
     let Some(data) = cbuf_data else {
         return;
     };
+    let data = data.materialize();
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
@@ -8501,11 +12332,11 @@ fn trace_cbuf_watch(
     let include_inactive = std::env::var_os("NEXIUM_CBUF_WATCH_INACTIVE").is_some();
     let used_mask = vs_cbuf_mask | fs_cbuf_mask;
     for region in regions {
-        let active = (used_mask & (1u32 << region.slot)) != 0;
+        let active = (used_mask & (1u64 << region.slot)) != 0;
         if !active && !include_inactive {
             continue;
         }
-        let Some(slot_data) = packed_cbuf_slot(data, region.slot) else {
+        let Some(slot_data) = packed_cbuf_slot(&data, region.slot) else {
             continue;
         };
         let (addr, size) = cbuf_bind_for_slot(cbuf_binds, region.slot as u32);
@@ -8630,9 +12461,13 @@ fn cbuf_watch_hex_preview(bytes: &[u8]) -> String {
         .join("")
 }
 
-fn cbuf_bind_for_slot(cbuf_binds: &[[(u64, u32); 16]; 5], logical_slot: u32) -> (u64, u32) {
-    let stage = if logical_slot < 16 { 0 } else { 4 };
-    let binding = (logical_slot & 15) as usize;
+fn cbuf_bind_for_slot(cbuf_binds: &GraphicsCbufBinds, logical_slot: u32) -> (u64, u32) {
+    let stage = if logical_slot < FRAGMENT_CBUF_BASE as u32 {
+        0
+    } else {
+        4
+    };
+    let binding = logical_slot as usize % GRAPHICS_CBUF_SLOTS;
     cbuf_binds[stage][binding]
 }
 
@@ -8852,23 +12687,91 @@ fn append_walked_texture_ids(
     (metadata.descriptor_ids.len() - before, bindless)
 }
 
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn record_fermi_provenance(
+    tic: &nexium_gpu::texture::TicEntry,
+    key: RtKey,
+    slot: usize,
+    fermi_2d: &super::engines::Fermi2D,
+    maxwell_dma: &super::engines::MaxwellDma,
+    renderer: &Arc<nexium_gpu::Renderer>,
+    mappings: &GpuMappings,
+    fermi_exact_slots: &mut [Option<FermiExactRtToken>],
+    copy_sources: &mut [Option<RtKey>],
+) {
+    let _ = mappings;
+    if let Some(provenance) = fermi_2d.exact_rt_copy_for_tic(tic, key.nvmap_id) {
+        if renderer.render_target_stamp(provenance.destination) == Some(provenance.stamp) {
+            if let Some(entry) = fermi_exact_slots.get_mut(slot) {
+                *entry = Some(FermiExactRtToken {
+                    key: provenance.destination,
+                    stamp: provenance.stamp,
+                    guest_va: provenance.destination_va,
+                    guest_size: provenance.destination_size,
+                    guest_generation: provenance.destination_generation,
+                    bytes_per_pixel: provenance.bytes_per_pixel,
+                    fermi_block_size: provenance.block_size,
+                    block_width_log2: tic.block_width_log2,
+                    block_height_log2: tic.block_height_log2,
+                    block_depth_log2: tic.block_depth_log2,
+                    tile_width_spacing: tic.tile_width_spacing,
+                });
+            }
+            super::pusher::kickprof::count_sized(
+                super::pusher::kickprof::PREP_TEX_FERMI_EXACT_CANDIDATE,
+                1,
+                provenance.destination_size.min(usize::MAX as u64) as usize,
+            );
+        }
+    }
+    if let Some((source, stamp)) = maxwell_dma.rt_copy_source(tic.gpu_va) {
+        if renderer.render_target_stamp(source) == Some(stamp) {
+            if let Some(entry) = copy_sources.get_mut(slot) {
+                *entry = Some(source);
+            }
+        }
+    }
+}
+
+fn tic_entry_for_alias(
+    cached: Option<&ResolvedTicDescriptor>,
+    raw: [u8; 32],
+) -> Option<nexium_gpu::texture::TicEntry> {
+    match cached.filter(|cached| cached.raw == raw) {
+        Some(cached) => Some(cached.entry),
+        None => nexium_gpu::texture::TicEntry::parse(&raw),
+    }
+}
+
+fn read_tic_raw(
+    tic_addr: u64,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> Option<[u8; 32]> {
+    let cpu = mappings.cpu_address_for(tic_addr)?;
+    let mut raw = [0u8; 32];
+    mem_read(cpu, &mut raw).then_some(raw)
+}
+
 fn resolved_tic(
     tic_id: u32,
     tic_pool_gpu_va: u64,
     tic_pool_limit: u32,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
-) -> Option<(nexium_gpu::texture::TicEntry, u64)> {
+) -> Option<ResolvedTicDescriptor> {
     if tic_pool_gpu_va == 0 || tic_id == u32::MAX || tic_id > tic_pool_limit {
         return None;
     }
     let tic_addr = tic_pool_gpu_va.wrapping_add((tic_id as u64).saturating_mul(32));
-    let cpu = mappings.cpu_address_for(tic_addr)?;
-    let mut raw = [0u8; 32];
-    if !mem_read(cpu, &mut raw) {
-        return None;
-    }
-    Some((nexium_gpu::texture::TicEntry::parse(&raw)?, tic_addr))
+    let raw = read_tic_raw(tic_addr, mappings, mem_read)?;
+    Some(ResolvedTicDescriptor {
+        id: tic_id,
+        address: tic_addr,
+        raw,
+        entry: nexium_gpu::texture::TicEntry::parse(&raw)?,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -8886,7 +12789,7 @@ fn stage_texture_numeric_bindings(
     stage_name: &'static str,
     metadata: &FragmentTextureNumericMetadata,
     descriptor_slot_base: u32,
-    cbuf_binds: &[(u64, u32); 16],
+    cbuf_binds: &GraphicsStageCbufBinds,
     bindless_slot: u32,
     tex_cb_slot: u32,
     tic_pool_gpu_va: u64,
@@ -8899,6 +12802,9 @@ fn stage_texture_numeric_bindings(
         Vec<TextureNumericBinding>,
         u32,
         Vec<ResolvedTextureNumericUse>,
+        Vec<u32>,
+        Vec<u32>,
+        Vec<Option<ResolvedTicDescriptor>>,
     ),
     String,
 > {
@@ -8924,6 +12830,7 @@ fn stage_texture_numeric_bindings(
             &mut tic_ids,
             &mut sampler_ids,
             descriptor_slot_base as usize,
+            false,
             &mut remap_log,
             tic_pool_gpu_va,
             tic_pool_limit,
@@ -8936,6 +12843,7 @@ fn stage_texture_numeric_bindings(
 
     let mut bindings = Vec::with_capacity(shader_ids.len());
     let mut uses = Vec::with_capacity(shader_ids.len());
+    let mut resolved_tics = Vec::with_capacity(shader_ids.len());
     let mut mask = 0u32;
     for (local_slot, (&shader_id, &tic_id)) in shader_ids.iter().zip(&tic_ids).enumerate() {
         let descriptor_slot = descriptor_slot_base + local_slot as u32;
@@ -8951,16 +12859,16 @@ fn stage_texture_numeric_bindings(
             .and_then(|components| {
                 resolved
                     .as_ref()
-                    .map(|(tic, _)| tic_numeric_type(tic, components))
+                    .map(|tic| tic_numeric_type(&tic.entry, components))
             })
             .unwrap_or(nexium_spirv::TextureNumericType::Float);
         let buffer_backed = referenced_components.is_some()
             && metadata.buffer_candidates.binary_search(&shader_id).is_ok()
-            && resolved.as_ref().is_some_and(|(tic, _)| {
-                tic.is_buffer() && supported_texel_buffer(tic, numeric_type)
+            && resolved.as_ref().is_some_and(|tic| {
+                tic.entry.is_buffer() && supported_texel_buffer(&tic.entry, numeric_type)
             });
         if sampled && numeric_type != nexium_spirv::TextureNumericType::Float {
-            let tic = resolved.as_ref().map(|(tic, _)| tic);
+            let tic = resolved.as_ref().map(|tic| &tic.entry);
             return Err(format!(
                 "{stage_name} texture numeric conflict: shader_id={shader_id:#x} slot={descriptor_slot} tic_id={tic_id:#x} is used by Sample/Gather (Float) and TexelFetch ({numeric_type:?}); tic_format={:?} component_types={:?}",
                 tic.map(|tic| tic.format),
@@ -8997,15 +12905,16 @@ fn stage_texture_numeric_bindings(
             numeric_type,
             image_kind,
         });
+        resolved_tics.push(resolved);
     }
-    Ok((bindings, mask, uses))
+    Ok((bindings, mask, uses, tic_ids, sampler_ids, resolved_tics))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn graphics_texture_layout_from_metadata(
     fs_metadata: &FragmentTextureNumericMetadata,
     vs_metadata: &FragmentTextureNumericMetadata,
-    cbuf_binds: &[[(u64, u32); 16]; 5],
+    cbuf_binds: &GraphicsCbufBinds,
     vs_cbuf_group: usize,
     fs_cbuf_group: usize,
     bindless_slot: u32,
@@ -9027,7 +12936,14 @@ fn graphics_texture_layout_from_metadata(
         ));
     }
 
-    let (mut bindings, fs_texel_buffer_mask, fs_uses) = stage_texture_numeric_bindings(
+    let (
+        mut bindings,
+        fs_texel_buffer_mask,
+        fs_uses,
+        mut resolved_tic_ids,
+        mut resolved_sampler_ids,
+        mut resolved_tics,
+    ) = stage_texture_numeric_bindings(
         "fs",
         fs_metadata,
         0,
@@ -9041,7 +12957,14 @@ fn graphics_texture_layout_from_metadata(
         mem_read,
     )?;
     let fs_tic_ids = fs_uses.iter().map(|usage| usage.tic_id).collect();
-    let (vs_bindings, vs_texel_buffer_mask, vs_uses) = stage_texture_numeric_bindings(
+    let (
+        vs_bindings,
+        vs_texel_buffer_mask,
+        vs_uses,
+        vs_resolved_tic_ids,
+        vs_resolved_sampler_ids,
+        vs_resolved_tics,
+    ) = stage_texture_numeric_bindings(
         "vs",
         vs_metadata,
         vs_tex_base,
@@ -9055,6 +12978,9 @@ fn graphics_texture_layout_from_metadata(
         mem_read,
     )?;
     bindings.extend(vs_bindings);
+    resolved_tic_ids.extend(vs_resolved_tic_ids);
+    resolved_sampler_ids.extend(vs_resolved_sampler_ids);
+    resolved_tics.extend(vs_resolved_tics);
     let mut uses = fs_uses;
     uses.extend(vs_uses);
 
@@ -9117,6 +13043,9 @@ fn graphics_texture_layout_from_metadata(
     Ok(GraphicsTextureLayout {
         fs_ids,
         fs_tic_ids,
+        resolved_tic_ids,
+        resolved_sampler_ids,
+        resolved_tics,
         vs_tex_base,
         vs_tex_count,
         manifest,
@@ -9220,14 +13149,21 @@ fn consistent_tic_numeric_type(
     resolved_type.unwrap_or(nexium_spirv::TextureNumericType::Float)
 }
 
+fn texture_bind_log_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_TEX_BIND_LOG").is_some())
+}
+
 fn remap_texture_ids_for_stage(
     stage_name: &str,
-    cbuf_binds: &[(u64, u32); 16],
+    cbuf_binds: &GraphicsStageCbufBinds,
     bindless_slot: u32,
     tex_cb_slot: u32,
     tex_ids: &mut [u32],
     sampler_ids: &mut [u32],
     slot_offset: usize,
+    collect_remap: bool,
     tex_remap: &mut Vec<String>,
     tic_pool_gpu_va: u64,
     tic_pool_limit: u32,
@@ -9236,7 +13172,8 @@ fn remap_texture_ids_for_stage(
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     or_partners: &std::collections::HashMap<u32, u32>,
 ) {
-    let designated = (tex_cb_slot as usize).min(15);
+    let bind_log = texture_bind_log_enabled();
+    let designated = (tex_cb_slot as usize).min(GRAPHICS_CBUF_SLOTS - 1);
     let trusted = tex_cb_slot != 0 && cbuf_binds[designated].0 != 0 && cbuf_binds[designated].1 > 0;
     let tex_cb_index = if trusted {
         designated
@@ -9254,7 +13191,7 @@ fn remap_texture_ids_for_stage(
             mem_read,
         )
     };
-    let (tcb_addr, tcb_size) = cbuf_binds[tex_cb_index.min(15)];
+    let (tcb_addr, tcb_size) = cbuf_binds[tex_cb_index.min(GRAPHICS_CBUF_SLOTS - 1)];
     'texture_slot: for (local_i, unit_slot) in tex_ids.iter_mut().enumerate() {
         let i = slot_offset + local_i;
         let shader_id = *unit_slot;
@@ -9262,23 +13199,37 @@ fn remap_texture_ids_for_stage(
         let (entry_cb_index, shader_word_offset, secondary_word_offset, entry_trusted) =
             texture_cbuf_origin(shader_id, tex_cb_index, trusted);
         let (entry_tcb_addr, entry_tcb_size) = if exact_origin.is_some() {
-            cbuf_binds[entry_cb_index.min(15)]
+            cbuf_binds[entry_cb_index.min(GRAPHICS_CBUF_SLOTS - 1)]
         } else {
             (tcb_addr, tcb_size)
         };
         let off = (shader_word_offset as u64).saturating_mul(4);
         let secondary_off = secondary_word_offset.map(|word| (word as u64).saturating_mul(4));
-        let offsets = secondary_off.map_or_else(
-            || format!("{off:#x}"),
-            |secondary| format!("{off:#x}|{secondary:#x}"),
-        );
-        let mut remap = format!(
-            "s{}:{} stage={} cb{} base={:#x}/{} off={}",
-            i, shader_id, stage_name, entry_cb_index, entry_tcb_addr, entry_tcb_size, offsets
-        );
+        let offsets = (collect_remap || bind_log).then(|| {
+            secondary_off.map_or_else(
+                || format!("{off:#x}"),
+                |secondary| format!("{off:#x}|{secondary:#x}"),
+            )
+        });
+        let mut remap = collect_remap.then(|| {
+            format!(
+                "s{}:{} stage={} cb{} base={:#x}/{} off={}",
+                i,
+                shader_id,
+                stage_name,
+                entry_cb_index,
+                entry_tcb_addr,
+                entry_tcb_size,
+                offsets.as_deref().unwrap_or_default()
+            )
+        });
         if entry_tcb_addr == 0 {
-            remap.push_str(" no-tcb");
-            tex_remap.push(remap);
+            if let Some(remap) = remap.as_mut() {
+                remap.push_str(" no-tcb");
+            }
+            if let Some(remap) = remap {
+                tex_remap.push(remap);
+            }
             continue;
         }
         let mut handle = 0u32;
@@ -9288,19 +13239,31 @@ fn remap_texture_ids_for_stage(
         {
             let word_off = (word_offset as u64).saturating_mul(4);
             if word_off + 4 > entry_tcb_size as u64 {
-                remap.push_str(" out-of-range");
-                tex_remap.push(remap);
+                if let Some(remap) = remap.as_mut() {
+                    remap.push_str(" out-of-range");
+                }
+                if let Some(remap) = remap {
+                    tex_remap.push(remap);
+                }
                 continue 'texture_slot;
             }
             let Some(cpu) = mappings.cpu_address_for(entry_tcb_addr.wrapping_add(word_off)) else {
-                remap.push_str(" unmapped");
-                tex_remap.push(remap);
+                if let Some(remap) = remap.as_mut() {
+                    remap.push_str(" unmapped");
+                }
+                if let Some(remap) = remap {
+                    tex_remap.push(remap);
+                }
                 continue 'texture_slot;
             };
             let mut bytes = [0u8; 4];
             if !mem_read(cpu, &mut bytes) {
-                remap.push_str(" read-fail");
-                tex_remap.push(remap);
+                if let Some(remap) = remap.as_mut() {
+                    remap.push_str(" read-fail");
+                }
+                if let Some(remap) = remap {
+                    tex_remap.push(remap);
+                }
                 continue 'texture_slot;
             }
             handle |= u32::from_le_bytes(bytes);
@@ -9311,14 +13274,17 @@ fn remap_texture_ids_for_stage(
                     Some((binding, word_offset, None)) => (binding as usize, word_offset),
                     _ => (entry_cb_index, partner_word),
                 };
-            let (partner_tcb_addr, partner_tcb_size) = cbuf_binds[partner_cb_index.min(15)];
+            let (partner_tcb_addr, partner_tcb_size) =
+                cbuf_binds[partner_cb_index.min(GRAPHICS_CBUF_SLOTS - 1)];
             let poff = (partner_word_offset as u64).saturating_mul(4);
             if poff + 4 <= partner_tcb_size as u64 {
                 if let Some(pcpu) = mappings.cpu_address_for(partner_tcb_addr.wrapping_add(poff)) {
                     let mut pbytes = [0u8; 4];
                     if mem_read(pcpu, &mut pbytes) {
                         handle |= u32::from_le_bytes(pbytes);
-                        remap.push_str(&format!(" partner=cb{}:{:#x}", partner_cb_index, poff));
+                        if let Some(remap) = remap.as_mut() {
+                            remap.push_str(&format!(" partner=cb{}:{:#x}", partner_cb_index, poff));
+                        }
                     }
                 }
             }
@@ -9339,12 +13305,12 @@ fn remap_texture_ids_for_stage(
                 )
         };
         if accept {
-            if std::env::var_os("NEXIUM_TEX_BIND_LOG").is_some() {
+            if bind_log {
                 log::warn!(
                     "tex_handle: stage={} cb{} off={} handle={:#x} -> TIC {} TSC {}",
                     stage_name,
                     entry_cb_index,
-                    offsets,
+                    offsets.as_deref().unwrap_or_default(),
                     handle,
                     tic,
                     tsc
@@ -9352,14 +13318,20 @@ fn remap_texture_ids_for_stage(
             }
             *unit_slot = tic;
             sampler_ids[local_i] = tsc;
-            remap.push_str(&format!(" handle={:#x}->tic{} tsc{}", handle, tic, tsc));
+            if let Some(remap) = remap.as_mut() {
+                remap.push_str(&format!(" handle={:#x}->tic{} tsc{}", handle, tic, tsc));
+            }
         } else {
-            remap.push_str(&format!(
-                " handle={:#x} invalid tic{} tsc{}",
-                handle, tic, tsc
-            ));
+            if let Some(remap) = remap.as_mut() {
+                remap.push_str(&format!(
+                    " handle={:#x} invalid tic{} tsc{}",
+                    handle, tic, tsc
+                ));
+            }
         }
-        tex_remap.push(remap);
+        if let Some(remap) = remap {
+            tex_remap.push(remap);
+        }
     }
 }
 
@@ -9442,10 +13414,7 @@ fn trace_matching_tic_pool_entries(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) {
-    if std::env::var_os("NEXIUM_TIC_POOL_SCAN").is_none()
-        || !fs_remap_trace(fs_addr, fs_hash)
-        || tic_pool_gpu_va == 0
-    {
+    if !tic_pool_scan_enabled() || !fs_remap_trace(fs_addr, fs_hash) || tic_pool_gpu_va == 0 {
         return;
     }
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -9560,7 +13529,7 @@ fn tex_cb_sticky_enabled() -> bool {
 }
 
 fn choose_texture_cb_index(
-    cbuf_binds: &[(u64, u32); 16],
+    cbuf_binds: &GraphicsStageCbufBinds,
     bindless_slot: u32,
     tex_cb_slot: u32,
     shader_ids: &[u32],
@@ -9571,8 +13540,8 @@ fn choose_texture_cb_index(
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> usize {
-    let primary = (bindless_slot as usize).min(15);
-    let fallback = (tex_cb_slot as usize).min(15);
+    let primary = (bindless_slot as usize).min(GRAPHICS_CBUF_SLOTS - 1);
+    let fallback = (tex_cb_slot as usize).min(GRAPHICS_CBUF_SLOTS - 1);
     let mut best = primary;
     let mut best_score = texture_cb_score(
         cbuf_binds,
@@ -9607,7 +13576,7 @@ fn choose_texture_cb_index(
         use std::sync::atomic::Ordering;
         let sticky = tex_cb_sticky(stage_is_fs);
         let prev = sticky.load(Ordering::Relaxed);
-        if prev < 16 && prev != best {
+        if prev < GRAPHICS_CBUF_SLOTS && prev != best {
             let prev_score = texture_cb_score(
                 cbuf_binds,
                 prev,
@@ -9631,7 +13600,7 @@ fn choose_texture_cb_index(
 }
 
 fn texture_cb_score(
-    cbuf_binds: &[(u64, u32); 16],
+    cbuf_binds: &GraphicsStageCbufBinds,
     slot: usize,
     shader_ids: &[u32],
     tic_pool_gpu_va: u64,
@@ -9669,13 +13638,13 @@ fn texture_cb_score(
 }
 
 fn read_texture_handle(
-    cbuf_binds: &[(u64, u32); 16],
+    cbuf_binds: &GraphicsStageCbufBinds,
     slot: usize,
     shader_id: u32,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Option<u32> {
-    let (addr, size) = cbuf_binds[slot.min(15)];
+    let (addr, size) = cbuf_binds[slot.min(GRAPHICS_CBUF_SLOTS - 1)];
     let off = (shader_id as u64).saturating_mul(4);
     if addr == 0 || off + 4 > size as u64 {
         return None;
@@ -10060,6 +14029,14 @@ fn fs_solid_probe_matches(fs_addr: u64) -> bool {
     *enabled && (*all || list.contains(&fs_addr))
 }
 
+fn effective_fragment_pipeline_hash(bundle_hash: u64, spirv: &[u32], overridden: bool) -> u64 {
+    if overridden {
+        nexium_gpu::renderer::hash_spirv(spirv)
+    } else {
+        bundle_hash
+    }
+}
+
 fn solid_red_fs_spirv() -> Vec<u32> {
     vec![
         0x0723_0203,
@@ -10116,8 +14093,8 @@ fn solid_red_fs_spirv() -> Vec<u32> {
         (7 << 16) | 44,
         4,
         9,
-        8,
         7,
+        8,
         8,
         7,
         (5 << 16) | 54,
@@ -10367,9 +14344,9 @@ fn map_topology(t: u32) -> Option<vk::PrimitiveTopology> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PreparedIndexData {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     count: u32,
     index_type: vk::IndexType,
     topology: vk::PrimitiveTopology,
@@ -10378,14 +14355,100 @@ struct PreparedIndexData {
     max_index: Option<u32>,
 }
 
+fn prepare_index_data_cached(
+    snapshot_cache: &mut SsboSnapshotCache,
+    input: Option<InputSnapshotIdentity>,
+    raw: Arc<Vec<u8>>,
+    index_format: u32,
+    guest_topology: u32,
+    topology: vk::PrimitiveTopology,
+    restart_enabled: bool,
+    restart_index: u32,
+) -> PreparedIndexData {
+    let key = input.map(|input| PreparedIndexCacheKey {
+        input,
+        index_format,
+        guest_topology,
+        topology: topology.as_raw(),
+        restart_enabled,
+        restart_index,
+    });
+    if let Some(key) = key {
+        if let Some(prepared) = snapshot_cache.prepared_index(&key) {
+            return prepared;
+        }
+    }
+    let prepared = prepare_index_data_shared(
+        Arc::clone(&raw),
+        index_format,
+        guest_topology,
+        topology,
+        restart_enabled,
+        restart_index,
+    );
+    if let Some(key) = key {
+        snapshot_cache.insert_prepared_index(key, raw, prepared.clone());
+    }
+    prepared
+}
+
 fn prepare_index_data(
     raw: Vec<u8>,
+    index_format: u32,
+    guest_topology: u32,
+    topology: vk::PrimitiveTopology,
+    restart_enabled: bool,
+    restart_index: u32,
+) -> PreparedIndexData {
+    prepare_index_data_shared(
+        Arc::new(raw),
+        index_format,
+        guest_topology,
+        topology,
+        restart_enabled,
+        restart_index,
+    )
+}
+
+fn prepare_index_data_shared(
+    raw: Arc<Vec<u8>>,
     index_format: u32,
     guest_topology: u32,
     mut topology: vk::PrimitiveTopology,
     restart_enabled: bool,
     restart_index: u32,
 ) -> PreparedIndexData {
+    if !restart_enabled && guest_topology != 7 && matches!(index_format, 1 | 2) {
+        let (count, index_type, max_index) = if index_format == 2 {
+            let mut max_index = None;
+            let mut count = 0usize;
+            for value in raw.chunks_exact(4) {
+                let value = u32::from_le_bytes(value.try_into().unwrap());
+                max_index = Some(max_index.map_or(value, |current: u32| current.max(value)));
+                count += 1;
+            }
+            (count, vk::IndexType::UINT32, max_index)
+        } else {
+            let mut max_index = None;
+            let mut count = 0usize;
+            for value in raw.chunks_exact(2) {
+                let value = u16::from_le_bytes(value.try_into().unwrap()) as u32;
+                max_index = Some(max_index.map_or(value, |current: u32| current.max(value)));
+                count += 1;
+            }
+            (count, vk::IndexType::UINT16, max_index)
+        };
+        return PreparedIndexData {
+            data: raw,
+            count: count.min(u32::MAX as usize) as u32,
+            index_type,
+            topology,
+            primitive_restart_enabled: false,
+            primitive_restart_index: 0,
+            max_index,
+        };
+    }
+
     let mut values = match index_format {
         0 => raw.iter().map(|&value| value as u32).collect::<Vec<_>>(),
         2 => raw
@@ -10474,7 +14537,7 @@ fn prepare_index_data(
         .filter(|&value| !host_restart_enabled || value != host_restart_index)
         .max();
     let data = if data_changed {
-        encode_index_values(&values, index_type)
+        Arc::new(encode_index_values(&values, index_type))
     } else {
         raw
     };
@@ -10582,22 +14645,92 @@ fn expand_quad_indices(indices: &[u32]) -> Vec<u32> {
     out
 }
 
+#[cfg(test)]
+fn packed_cbuf_read_len(logical_slot: usize, bound_len: usize, reads: &[CbufRead]) -> usize {
+    let mut found = false;
+    let mut required = 0usize;
+    for read in reads
+        .iter()
+        .copied()
+        .filter(|read| read.logical_slot as usize == logical_slot)
+    {
+        found = true;
+        let Some(offset) = read.effective_byte_offset() else {
+            return bound_len;
+        };
+        required = required.max((offset as usize).saturating_add(4));
+    }
+    if found {
+        required.min(bound_len)
+    } else {
+        bound_len
+    }
+}
+
+fn packed_cbuf_read_requirements(
+    reads: &[CbufRead],
+) -> ([usize; PACKED_CBUF_SLOTS], [bool; PACKED_CBUF_SLOTS]) {
+    let mut required = [0usize; PACKED_CBUF_SLOTS];
+    let mut unknown = [false; PACKED_CBUF_SLOTS];
+    let mut found = [false; PACKED_CBUF_SLOTS];
+    for read in reads.iter().copied() {
+        let slot = read.logical_slot as usize;
+        if slot >= PACKED_CBUF_SLOTS {
+            continue;
+        }
+        found[slot] = true;
+        if let Some(offset) = read.effective_byte_offset() {
+            required[slot] = required[slot].max((offset as usize).saturating_add(4));
+        } else {
+            unknown[slot] = true;
+        }
+    }
+    for slot in 0..PACKED_CBUF_SLOTS {
+        if !found[slot] {
+            unknown[slot] = true;
+        }
+    }
+    (required, unknown)
+}
+
+#[cfg(test)]
 fn pack_cbuf_data(
-    cbuf_binds: &[[(u64, u32); 16]; 5],
-    vs_mask: u32,
-    fs_mask: u32,
+    cbuf_binds: &GraphicsCbufBinds,
+    vs_mask: u64,
+    fs_mask: u64,
     vs_cbuf_group: usize,
     fs_cbuf_group: usize,
+    reads: &[CbufRead],
+    snapshot_cache: &mut SsboSnapshotCache,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
-) -> Vec<u8> {
+) -> GraphicsCbufPayload {
+    let requirements = packed_cbuf_read_requirements(reads);
+    pack_cbuf_data_with_requirements(
+        cbuf_binds,
+        vs_mask,
+        fs_mask,
+        vs_cbuf_group,
+        fs_cbuf_group,
+        &requirements,
+        snapshot_cache,
+        mappings,
+        mem_read,
+    )
+}
+
+fn pack_cbuf_data_with_requirements(
+    cbuf_binds: &GraphicsCbufBinds,
+    vs_mask: u64,
+    fs_mask: u64,
+    vs_cbuf_group: usize,
+    fs_cbuf_group: usize,
+    requirements: &PackedCbufReadRequirements,
+    snapshot_cache: &mut SsboSnapshotCache,
+    mappings: &GpuMappings,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> GraphicsCbufPayload {
     let used = vs_mask | fs_mask;
-    let mut out = vec![0u8; nexium_spirv::GFX_CBUF_MIN_SIZE as usize];
-    for logical_slot in 0..PACKED_CBUF_SLOTS {
-        let directory = logical_slot * 8;
-        out[directory..directory + 4]
-            .copy_from_slice(&nexium_spirv::GFX_CBUF_ZERO_WORD.to_le_bytes());
-    }
     static CBUF_STASH: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, [u8; 64])>>> =
         std::sync::OnceLock::new();
     let recheck = {
@@ -10635,21 +14768,151 @@ fn pack_cbuf_data(
         }
         guard.clear();
     }
+
+    let pack_key = {
+        let mut binds = [(0u64, 0u32); PACKED_CBUF_SLOTS];
+        for logical_slot in 0..PACKED_CBUF_SLOTS {
+            if (used & (1u64 << logical_slot)) == 0 {
+                continue;
+            }
+            let stage = if logical_slot < FRAGMENT_CBUF_BASE {
+                vs_cbuf_group
+            } else {
+                fs_cbuf_group
+            };
+            binds[logical_slot] = cbuf_binds[stage][logical_slot % GRAPHICS_CBUF_SLOTS];
+        }
+        CbufPackKey {
+            used,
+            requirements: requirements as *const PackedCbufReadRequirements as usize,
+            groups: (vs_cbuf_group, fs_cbuf_group),
+            binds,
+            epoch: snapshot_cache.input_mutation_epoch,
+        }
+    };
+    if let Some((cached_key, payload)) = snapshot_cache.last_packed_cbuf.as_ref() {
+        if *cached_key == pack_key {
+            super::pusher::kickprof::count(super::pusher::kickprof::CBUF_PACK_MEMO, 1);
+            return payload.clone();
+        }
+    }
+    let mut guest_addrs = [0u64; PACKED_CBUF_SLOTS];
+    let mut bound_sizes = [0u32; PACKED_CBUF_SLOTS];
+    let mut read_lens = [0usize; PACKED_CBUF_SLOTS];
+    let mut slot_data: [Option<InputSnapshot>; PACKED_CBUF_SLOTS] = std::array::from_fn(|_| None);
+    let (required_read_lens, unknown_read_lens) = requirements;
+    let mut cacheable = !recheck;
+    let kp_slots = super::pusher::kickprof::start();
     for logical_slot in 0..PACKED_CBUF_SLOTS {
-        if (used & (1u32 << logical_slot)) == 0 {
+        if (used & (1u64 << logical_slot)) == 0 {
             continue;
         }
-        let stage = if logical_slot < 16 {
+        let stage = if logical_slot < FRAGMENT_CBUF_BASE {
             vs_cbuf_group
         } else {
             fs_cbuf_group
         };
-        let binding = logical_slot & 15;
+        let binding = logical_slot % GRAPHICS_CBUF_SLOTS;
         let (addr, size) = cbuf_binds[stage][binding];
+        guest_addrs[logical_slot] = addr;
+        bound_sizes[logical_slot] = size;
         if addr == 0 || size == 0 {
             continue;
         }
-        let len = (size as usize).min(nexium_spirv::GFX_CBUF_MAX_SIZE as usize);
+        let bound_len = (size as usize).min(nexium_spirv::GFX_CBUF_MAX_SIZE as usize);
+        let len = if unknown_read_lens[logical_slot] {
+            bound_len
+        } else {
+            required_read_lens[logical_slot].min(bound_len)
+        };
+        read_lens[logical_slot] = len;
+        let word_count = len.div_ceil(4);
+        if word_count == 0 {
+            continue;
+        }
+
+        if let Some(data) = snapshot_cache.mirror_resolve_cbuf(mappings, addr, len, mem_read) {
+            slot_data[logical_slot] = Some(data);
+            continue;
+        }
+        let map_generation = mappings.generation();
+        let data = snapshot_cache
+            .cbuf_slot_cached(logical_slot, addr, size, len, map_generation)
+            .or_else(|| {
+                let data = snapshot_cache.read_cbuf_input_or_insert(mappings, addr, len, mem_read);
+                if let Some(data) = &data {
+                    let cpu_addr = mappings.cpu_address_for(addr).unwrap_or(0);
+                    snapshot_cache.store_cbuf_slot(
+                        logical_slot,
+                        addr,
+                        size,
+                        len,
+                        map_generation,
+                        cpu_addr,
+                        data.clone(),
+                    );
+                }
+                data
+            });
+        if let Some(data) = data {
+            slot_data[logical_slot] = Some(data);
+        } else {
+            cacheable = false;
+        }
+    }
+    super::pusher::kickprof::add(super::pusher::kickprof::CBUF_SLOTS, kp_slots);
+    let kp_pack = super::pusher::kickprof::start();
+
+    if cacheable {
+        let mut packed_size = nexium_spirv::GFX_CBUF_MIN_SIZE as usize;
+        let mut slots = Vec::new();
+        for logical_slot in 0..PACKED_CBUF_SLOTS {
+            let Some(data) = slot_data[logical_slot].as_ref() else {
+                continue;
+            };
+            let read_len = read_lens[logical_slot];
+            let word_count = read_len.div_ceil(4);
+            packed_size = (packed_size + 15) & !15;
+            let slot = GraphicsCbufSlotSnapshot::new_with_offset(
+                logical_slot,
+                read_len,
+                packed_size,
+                data.source_offset,
+                data.data.clone(),
+            )
+            .expect("validated graphics cbuf slot snapshot");
+            packed_size = packed_size.saturating_add(word_count * 4);
+            slots.push(slot);
+        }
+        let payload = GraphicsCbufPayload::from_slots(packed_size, slots)
+            .expect("validated graphics cbuf slot layout");
+        snapshot_cache.last_packed_cbuf = Some((
+            CbufPackKey {
+                epoch: snapshot_cache.input_mutation_epoch,
+                ..pack_key
+            },
+            payload.clone(),
+        ));
+        super::pusher::kickprof::add(super::pusher::kickprof::CBUF_PACK, kp_pack);
+        return payload;
+    }
+
+    let mut out = vec![0u8; nexium_spirv::GFX_CBUF_MIN_SIZE as usize];
+    for logical_slot in 0..PACKED_CBUF_SLOTS {
+        let directory = logical_slot * 8;
+        out[directory..directory + 4]
+            .copy_from_slice(&nexium_spirv::GFX_CBUF_ZERO_WORD.to_le_bytes());
+    }
+    for logical_slot in 0..PACKED_CBUF_SLOTS {
+        if (used & (1u64 << logical_slot)) == 0 {
+            continue;
+        }
+        let guest_addr = guest_addrs[logical_slot];
+        let bound_size = bound_sizes[logical_slot];
+        if guest_addr == 0 || bound_size == 0 {
+            continue;
+        }
+        let len = read_lens[logical_slot];
         let word_count = len.div_ceil(4);
         if word_count == 0 {
             continue;
@@ -10664,9 +14927,15 @@ fn pack_cbuf_data(
         out[directory..directory + 4].copy_from_slice(&(base_word as u32).to_le_bytes());
         out[directory + 4..directory + 8].copy_from_slice(&(word_count as u32).to_le_bytes());
 
-        let readable = copy_mapped_cbuf_bytes(mappings, addr, &mut out[off..off + len], mem_read);
-        if let Some(cpu) = mappings.cpu_address_for(addr) {
-            if readable && recheck && logical_slot == 3 && size == 2560 {
+        let readable = if let Some(snapshot) = &slot_data[logical_slot] {
+            let source_end = snapshot.source_offset + len;
+            out[off..off + len].copy_from_slice(&snapshot.data[snapshot.source_offset..source_end]);
+            true
+        } else {
+            copy_mapped_cbuf_bytes(mappings, guest_addr, &mut out[off..off + len], mem_read)
+        };
+        if let Some(cpu) = mappings.cpu_address_for(guest_addr) {
+            if readable && recheck && logical_slot == 3 && bound_size == 2560 {
                 let mut first = [0u8; 64];
                 let take = len.min(64);
                 first[..take].copy_from_slice(&out[off..off + take]);
@@ -10678,14 +14947,16 @@ fn pack_cbuf_data(
             }
         }
     }
-    out
+    let payload = GraphicsCbufPayload::owned(Arc::new(out));
+    super::pusher::kickprof::add(super::pusher::kickprof::CBUF_PACK, kp_pack);
+    payload
 }
 
 fn read_stage_cbuf_u32(
     stage: usize,
     binding: u8,
     offset: u32,
-    cbuf_binds: &[[(u64, u32); 16]; 5],
+    cbuf_binds: &GraphicsCbufBinds,
     mappings: &GpuMappings,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Option<u32> {
@@ -10742,7 +15013,7 @@ fn read_stage_cbuf_u32(
     Some(value)
 }
 
-fn resolve_cbuf(draw: &DrawCall, cbuf_binds: &[[(u64, u32); 16]; 5]) -> (u64, u32) {
+fn resolve_cbuf(draw: &DrawCall, cbuf_binds: &GraphicsCbufBinds) -> (u64, u32) {
     if draw.last_constbuf_addr != 0 && draw.last_constbuf_size > 0 {
         return (draw.last_constbuf_addr, draw.last_constbuf_size);
     }
@@ -10756,7 +15027,7 @@ fn resolve_cbuf(draw: &DrawCall, cbuf_binds: &[[(u64, u32); 16]; 5]) -> (u64, u3
     (0, 0)
 }
 
-fn resolve_vs_cbuf(cbuf_binds: &[[(u64, u32); 16]; 5], vs_cbuf_group: usize) -> (u64, u32) {
+fn resolve_vs_cbuf(cbuf_binds: &GraphicsCbufBinds, vs_cbuf_group: usize) -> (u64, u32) {
     for &(addr, size) in cbuf_binds[vs_cbuf_group].iter().rev() {
         if addr != 0 && size > 0 {
             return (addr, size);
@@ -10798,29 +15069,415 @@ fn vertex_buffer_bindings(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
     use ash::vk;
+    use nexium_gpu::rt_cache::RtKey;
 
     use super::{
-        aliased_guest_ranges, build_vertex_layout, cfg_uses_texture_descriptors,
-        coalesce_host_watch_ranges, collect_cbuf_reads, collect_graphics_cbuf_reads,
-        consistent_tic_numeric_type, effective_depth_states, finish_ssbo_flush_boundary,
+        aliased_guest_ranges, build_vertex_layout, byte_ranges_overlap,
+        can_coalesce_full_color_depth_clear, cfg_uses_texture_descriptors,
+        classify_rt_signature_boundary, coalesce_host_watch_ranges, collect_cbuf_reads,
+        collect_graphics_cbuf_reads, consistent_tic_numeric_type, derive_prepared_tic_texture_plan,
+        effective_depth_states, effective_fragment_pipeline_hash, finish_ssbo_flush_boundary,
         font_tic_layer_count, format_cbuf_read, fragment_output_numeric_masks,
         fragment_texture_numeric_metadata, graphics_ring_chunk_ranges_for_costs,
         graphics_texture_layout_from_metadata, guest_write_alias_ranges, has_unimplemented_brx,
-        map_stencil_op, map_zeta_format, maxwell_draw_orientation, move_into_chunks,
-        normalize_guest_ranges, pack_cbuf_data, packed_cbuf_slot, packed_cbuf_word,
-        plan_guest_write_chunks, prepare_index_data, read_gpu_strict,
-        register_small_rt_after_prior_work, resolve_storage_buffer_descriptor, shader_numeric_key,
-        shader_resource_fingerprint, small_rt_registry, small_rt_starts_in_ranges,
-        snapshot_texture_once, spirv_texture_manifest_for_stage, split_texture_handle,
+        input_invalidation_pages, invalidate_snapshot_cache_guest_write_chunks, map_stencil_op,
+        map_zeta_format, maxwell_draw_orientation, memoized_prepared_tic_plan, move_into_chunks,
+        normalize_guest_ranges, overlap_bytes, pack_cbuf_data, packed_cbuf_read_len,
+        packed_cbuf_slot, packed_cbuf_word, plan_guest_write_chunks, prepare_index_data,
+        prepare_index_data_cached, prepare_index_data_shared, range_contains, read_gpu_strict,
+        register_small_rt_after_prior_work, resolve_storage_buffer_descriptor, resolved_tic,
+        shader_numeric_key, shader_resource_fingerprint, small_rt_registry,
+        small_rt_starts_in_ranges, snapshot_texture_once, snapshot_tic_descriptor_once,
+        solid_red_fs_spirv, spirv_texture_manifest_for_stage, split_texture_handle,
         ssbo_snapshot_window, storage_pointer_source_mask, supported_texel_buffer,
         texel_buffer_numeric_type, texture_cbuf_origin, texture_view_metadata_fingerprint,
         tic_can_alias_render_target, tic_can_alias_render_target_view, tic_numeric_type,
-        tic_snapshot_layer_count, vertex_buffer_bindings, write_guest_strict, y_direction_key,
-        FragmentTextureNumericMetadata, GuestRange, GuestWriteChunk, HostWatchRange,
-        SsboSnapshotCache, SsboSnapshotCacheKey, AURORA_STORAGE_BUFFER_SIZE,
-        AURORA_VERTEX_BUFFER_SIZE, MAX_ACCUMULATED_DRAWS,
+        tic_raw_descriptor, tic_snapshot_layer_count, vertex_buffer_bindings, write_guest_strict,
+        y_direction_key, DrawBatchCompatibility, FragmentTextureNumericMetadata, GuestRange,
+        GuestWriteChunk, HostWatchRange, InputInvalidationSpan, InputRangeKey,
+        InputSnapshotIdentity, InputSourceKey, PreparedDrawPacketQueue, PreparedTicPlan,
+        RtBatchUsage, RtSignatureBoundaryProfile, SsboSnapshotCache, SsboSnapshotCacheKey,
+        TextureSnapshotCache, TextureSnapshotCacheKey, TextureSnapshotCacheLookup,
+        AURORA_STORAGE_BUFFER_SIZE, AURORA_VERTEX_BUFFER_SIZE, FRAGMENT_CBUF_BASE,
+        GRAPHICS_CBUF_SLOTS, INPUT_INVALIDATION_MAX_CANDIDATES, INPUT_INVALIDATION_MAX_QUERY_PAGES,
+        INPUT_INVALIDATION_PAGE_SHIFT, MAX_ACCUMULATED_DRAWS, PREPARED_DRAW_PACKET_MAX_BATCHES,
+        PREPARED_TIC_PLAN_CAPACITY, RECENT_CBUF_REQUEST_CAPACITY,
     };
+
+    #[cfg(windows)]
+    mod mirror {
+        use super::super::{SsboSnapshotCache, MIRROR_CHUNK_SIZE};
+
+        fn arena_read() -> impl Fn(u64, &mut [u8]) -> bool {
+            let base = nexium_memory::fastmem::base().unwrap() as u64;
+            move |addr: u64, buf: &mut [u8]| {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (base + addr) as *const u8,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    );
+                }
+                true
+            }
+        }
+
+        fn write_guest(addr: u64, bytes: &[u8]) {
+            let base = nexium_memory::fastmem::base().unwrap() as u64;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    (base + addr) as *mut u8,
+                    bytes.len(),
+                );
+            }
+        }
+
+        fn watch_ready(va: u64, len: usize) -> bool {
+            nexium_memory::fastmem::commit(va, len).is_some()
+                && nexium_memory::fastmem::write_watch_available()
+        }
+
+        #[test]
+        fn mirror_resolve_syncs_serves_and_rediscovers_writes() {
+            let va = 0x7400_0000u64;
+            if !watch_ready(va, 2 * MIRROR_CHUNK_SIZE) {
+                return;
+            }
+            let mem_read = arena_read();
+            let mut cache = SsboSnapshotCache::default();
+            write_guest(va + 0x100, &[7u8; 64]);
+            let snap = cache.mirror_resolve(va + 0x100, 64, &mem_read).unwrap();
+            assert_eq!(snap.source_offset, 0x100);
+            assert_eq!(&snap.data[0x100..0x140], &[7u8; 64]);
+            let held = snap.data.clone();
+            write_guest(va + 0x100, &[9u8; 64]);
+            cache.mirror_bump_sweep();
+            let snap2 = cache.mirror_resolve(va + 0x100, 64, &mem_read).unwrap();
+            assert_eq!(&snap2.data[0x100..0x140], &[9u8; 64]);
+            assert_eq!(&held[0x100..0x140], &[7u8; 64]);
+        }
+
+        #[test]
+        fn mirror_resolve_rejects_chunk_straddle() {
+            let va = 0x7480_0000u64;
+            if !watch_ready(va, 2 * MIRROR_CHUNK_SIZE) {
+                return;
+            }
+            let mem_read = arena_read();
+            let mut cache = SsboSnapshotCache::default();
+            assert!(cache
+                .mirror_resolve(va + MIRROR_CHUNK_SIZE as u64 - 8, 64, &mem_read)
+                .is_none());
+        }
+
+        #[test]
+        fn mirror_mark_dirty_forces_resync() {
+            let va = 0x7500_0000u64;
+            if !watch_ready(va, MIRROR_CHUNK_SIZE) {
+                return;
+            }
+            let mem_read = arena_read();
+            let mut cache = SsboSnapshotCache::default();
+            write_guest(va, &[1u8; 32]);
+            let _ = cache.mirror_resolve(va, 32, &mem_read).unwrap();
+            write_guest(va, &[2u8; 32]);
+            cache.mirror_mark_cpu(va, 32);
+            let snap = cache.mirror_resolve(va, 32, &mem_read).unwrap();
+            assert_eq!(&snap.data[..32], &[2u8; 32]);
+        }
+
+        #[test]
+        fn mirror_write_through_serves_patch_and_keeps_shared_arc_stable() {
+            let va = 0x7680_0000u64;
+            if !watch_ready(va, MIRROR_CHUNK_SIZE) {
+                return;
+            }
+            let mem_read = arena_read();
+            let mut cache = SsboSnapshotCache::default();
+            write_guest(va, &[3u8; 64]);
+            let snap = cache.mirror_resolve(va, 64, &mem_read).unwrap();
+            let held = snap.data.clone();
+            write_guest(va, &[4u8; 64]);
+            assert!(cache.mirror_write_through_unchecked(va, &[4u8; 64]));
+            let snap2 = cache.mirror_resolve(va, 64, &mem_read).unwrap();
+            assert_eq!(&snap2.data[..64], &[4u8; 64]);
+            assert_eq!(&held[..64], &[3u8; 64]);
+        }
+
+        #[test]
+        fn mirror_write_through_rejects_unswept_or_missing_chunk() {
+            let va = 0x7700_0000u64;
+            if !watch_ready(va, MIRROR_CHUNK_SIZE) {
+                return;
+            }
+            let mem_read = arena_read();
+            let mut cache = SsboSnapshotCache::default();
+            assert!(!cache.mirror_write_through_unchecked(va, &[1u8; 16]));
+            let _ = cache.mirror_resolve(va, 16, &mem_read).unwrap();
+            cache.mirror_bump_sweep();
+            assert!(!cache.mirror_write_through_unchecked(va, &[1u8; 16]));
+        }
+
+        #[test]
+        fn mirror_resident_range_serials_track_writes_and_assemble_matches_guest() {
+            let va = 0x7780_0000u64;
+            let len = 2 * MIRROR_CHUNK_SIZE + 0x400;
+            if !watch_ready(va, 3 * MIRROR_CHUNK_SIZE) {
+                return;
+            }
+            let mem_read = arena_read();
+            let mut cache = SsboSnapshotCache::default();
+            let mut mappings = crate::gpu::GpuMappings::new();
+            let gpu_va = 0x9_0000_0000u64;
+            mappings.add(gpu_va, 3 * MIRROR_CHUNK_SIZE as u64, va, 7);
+            write_guest(va + 0x40, &[5u8; 16]);
+            write_guest(va + MIRROR_CHUNK_SIZE as u64 + 0x40, &[6u8; 16]);
+            let range = cache
+                .mirror_resident_range(&mappings, 0, 16, gpu_va, len, &mem_read)
+                .unwrap();
+            assert_eq!(range.chunks.len(), 3);
+            assert_eq!(range.cpu_va, va);
+            let assembled = range.assemble().unwrap();
+            assert_eq!(&assembled[0x40..0x50], &[5u8; 16]);
+            assert_eq!(
+                &assembled[MIRROR_CHUNK_SIZE + 0x40..MIRROR_CHUNK_SIZE + 0x50],
+                &[6u8; 16]
+            );
+            let serial0 = range.chunks[0].serial;
+            let serial1 = range.chunks[1].serial;
+            write_guest(va + 0x40, &[8u8; 16]);
+            cache.mirror_bump_sweep();
+            let range2 = cache
+                .mirror_resident_range(&mappings, 0, 16, gpu_va, len, &mem_read)
+                .unwrap();
+            assert_ne!(range2.chunks[0].serial, serial0);
+            assert_eq!(range2.chunks[1].serial, serial1);
+            assert_eq!(&range2.assemble().unwrap()[0x40..0x50], &[8u8; 16]);
+        }
+
+        #[test]
+        fn mirror_commit_generation_clears_chunks() {
+            let va = 0x7580_0000u64;
+            if !watch_ready(va, MIRROR_CHUNK_SIZE) {
+                return;
+            }
+            let mem_read = arena_read();
+            let mut cache = SsboSnapshotCache::default();
+            let _ = cache.mirror_resolve(va, 32, &mem_read).unwrap();
+            assert!(!cache.mirror.chunks.is_empty());
+            if nexium_memory::fastmem::commit(0x7600_0000, 0x1000).is_none() {
+                return;
+            }
+            cache.mirror_begin_kick();
+            assert!(cache.mirror.chunks.is_empty());
+        }
+    }
+
+    #[test]
+    fn compute_graphics_range_matching_rejects_adjacent_ranges() {
+        assert_eq!(overlap_bytes(0x1000, 0x40, 0x1020, 0x40), 0x20);
+        assert_eq!(overlap_bytes(0x1000, 0x40, 0x1040, 0x40), 0);
+        assert_eq!(overlap_bytes(0x1040, 0x40, 0x1000, 0x40), 0);
+        assert!(range_contains(0x1000, 0x80, 0x1020, 0x40));
+        assert!(!range_contains(0x1000, 0x40, 0x1020, 0x40));
+    }
+
+    #[test]
+    fn gathered_draw_compatibility_allows_only_ordered_exact_color_reuse() {
+        let color = RtKey::with_cpu(3, 1600, 900, 0x5000_0000, 0x1000_0000);
+        let other = RtKey::with_cpu(4, 1600, 900, 0x6000_0000, 0x2000_0000);
+        let physical_alias = RtKey::with_cpu(4, 1600, 900, 0x6100_0000, 0x2000_0000);
+        let volume = other.with_volume_depth(2);
+        let first = DrawBatchCompatibility {
+            attachments: vec![(color, vk::Format::R8G8B8A8_UNORM)],
+            color_attachments: vec![(color, vk::Format::R8G8B8A8_UNORM)],
+            depths: Vec::new(),
+            sampled: vec![other],
+        };
+        let exact_later = DrawBatchCompatibility {
+            attachments: vec![(other, vk::Format::R8G8B8A8_UNORM)],
+            color_attachments: vec![(other, vk::Format::R8G8B8A8_UNORM)],
+            depths: Vec::new(),
+            sampled: Vec::new(),
+        };
+        let incompatible_format = DrawBatchCompatibility {
+            attachments: vec![(color, vk::Format::R16G16B16A16_SFLOAT)],
+            color_attachments: vec![(color, vk::Format::R16G16B16A16_SFLOAT)],
+            depths: Vec::new(),
+            sampled: Vec::new(),
+        };
+        let alias_later = DrawBatchCompatibility {
+            attachments: vec![(physical_alias, vk::Format::R8G8B8A8_UNORM)],
+            color_attachments: vec![(physical_alias, vk::Format::R8G8B8A8_UNORM)],
+            depths: Vec::new(),
+            sampled: Vec::new(),
+        };
+        let depth_later = DrawBatchCompatibility {
+            attachments: vec![(other, vk::Format::D32_SFLOAT)],
+            color_attachments: Vec::new(),
+            depths: vec![(other, vk::Format::D32_SFLOAT, vk::ImageAspectFlags::DEPTH)],
+            sampled: Vec::new(),
+        };
+        let volume_first = DrawBatchCompatibility {
+            attachments: vec![(color, vk::Format::R8G8B8A8_UNORM)],
+            color_attachments: vec![(color, vk::Format::R8G8B8A8_UNORM)],
+            depths: Vec::new(),
+            sampled: vec![volume],
+        };
+        let volume_later = DrawBatchCompatibility {
+            attachments: vec![(volume, vk::Format::R8G8B8A8_UNORM)],
+            color_attachments: vec![(volume, vk::Format::R8G8B8A8_UNORM)],
+            depths: Vec::new(),
+            sampled: Vec::new(),
+        };
+
+        assert!(first.compatible_with_later(&exact_later));
+        assert!(!first.compatible_with_later(&incompatible_format));
+        assert!(!first.compatible_with_later(&alias_later));
+        assert!(!first.compatible_with_later(&depth_later));
+        assert!(!volume_first.compatible_with_later(&volume_later));
+        let mut gathered = DrawBatchCompatibility {
+            attachments: vec![(color, vk::Format::R8G8B8A8_UNORM)],
+            color_attachments: vec![(color, vk::Format::R8G8B8A8_UNORM)],
+            depths: Vec::new(),
+            sampled: Vec::new(),
+        };
+        assert!(gathered.compatible_with_later(&exact_later));
+        gathered.extend(&first);
+        assert!(gathered.compatible_with_later(&exact_later));
+        assert!(!gathered.compatible_with_later(&alias_later));
+    }
+
+    #[test]
+    fn gathered_draw_compatibility_rejects_depth_reinterpretation() {
+        let depth = RtKey::new(7, 1600, 900, 0x7000_0000);
+        let earlier = DrawBatchCompatibility {
+            attachments: vec![(depth, vk::Format::D32_SFLOAT)],
+            color_attachments: Vec::new(),
+            depths: vec![(depth, vk::Format::D32_SFLOAT, vk::ImageAspectFlags::DEPTH)],
+            sampled: Vec::new(),
+        };
+        let later = DrawBatchCompatibility {
+            attachments: vec![(depth, vk::Format::D24_UNORM_S8_UINT)],
+            color_attachments: Vec::new(),
+            depths: vec![(
+                depth,
+                vk::Format::D24_UNORM_S8_UINT,
+                vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+            )],
+            sampled: Vec::new(),
+        };
+
+        assert!(!earlier.compatible_with_later(&later));
+    }
+
+    #[test]
+    fn full_color_depth_clear_coalescing_requires_matching_disjoint_2d_targets() {
+        let color = RtKey::with_cpu(7, 1600, 900, 0x5000_0000, 0x1000_0000);
+        let depth = RtKey::with_cpu(7, 1600, 900, 0x6000_0000, 0x2000_0000);
+        let aspects = vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL;
+
+        assert!(can_coalesce_full_color_depth_clear(
+            color,
+            true,
+            None,
+            Some(depth),
+            aspects,
+            vk::ImageAspectFlags::DEPTH,
+        ));
+        assert!(!can_coalesce_full_color_depth_clear(
+            color,
+            true,
+            Some([0, 0, 1, 1]),
+            Some(depth),
+            aspects,
+            aspects,
+        ));
+        assert!(!can_coalesce_full_color_depth_clear(
+            color,
+            true,
+            None,
+            Some(RtKey::with_cpu(7, 1600, 900, 0x7000_0000, 0x1000_0000)),
+            aspects,
+            aspects,
+        ));
+        assert!(!can_coalesce_full_color_depth_clear(
+            color,
+            true,
+            None,
+            Some(RtKey::with_cpu(7, 1280, 900, 0x6000_0000, 0x2000_0000)),
+            aspects,
+            aspects,
+        ));
+        assert!(!can_coalesce_full_color_depth_clear(
+            color.with_volume_depth(2),
+            true,
+            None,
+            Some(depth),
+            aspects,
+            aspects,
+        ));
+        assert!(!can_coalesce_full_color_depth_clear(
+            color,
+            true,
+            None,
+            Some(depth),
+            vk::ImageAspectFlags::DEPTH,
+            vk::ImageAspectFlags::STENCIL,
+        ));
+    }
+
+    #[test]
+    fn rt_signature_boundary_profile_requires_disjoint_accesses() {
+        let color = RtKey::with_cpu(7, 1600, 900, 0x1000, 0x5000);
+        let other = RtKey::with_cpu(8, 1600, 900, 0x2000, 0x6000);
+        let prior = RtBatchUsage {
+            attachments: vec![color],
+            sampled: vec![other],
+        };
+        let independent = RtBatchUsage {
+            attachments: vec![RtKey::with_cpu(9, 1280, 720, 0x3000, 0x7000)],
+            sampled: Vec::new(),
+        };
+        let attachment_alias = RtBatchUsage {
+            attachments: vec![color],
+            sampled: Vec::new(),
+        };
+        let prior_sample = RtBatchUsage {
+            attachments: vec![other],
+            sampled: Vec::new(),
+        };
+        let next_sample = RtBatchUsage {
+            attachments: vec![RtKey::with_cpu(10, 800, 600, 0x4000, 0x8000)],
+            sampled: vec![color],
+        };
+
+        assert_eq!(
+            classify_rt_signature_boundary(&prior, &independent, false),
+            RtSignatureBoundaryProfile::KnownIndependent
+        );
+        assert_eq!(
+            classify_rt_signature_boundary(&prior, &attachment_alias, false),
+            RtSignatureBoundaryProfile::AttachmentAlias
+        );
+        assert_eq!(
+            classify_rt_signature_boundary(&prior, &prior_sample, false),
+            RtSignatureBoundaryProfile::PriorSample
+        );
+        assert_eq!(
+            classify_rt_signature_boundary(&prior, &next_sample, false),
+            RtSignatureBoundaryProfile::NextSample
+        );
+        assert_eq!(
+            classify_rt_signature_boundary(&prior, &independent, true),
+            RtSignatureBoundaryProfile::SmallRt
+        );
+    }
 
     fn test_ssbo_cache_key(data_offset: usize, read_len: usize) -> SsboSnapshotCacheKey {
         SsboSnapshotCacheKey {
@@ -10869,6 +15526,140 @@ mod tests {
             .collect()
     }
 
+    fn test_input_identity(cache: &SsboSnapshotCache, key: InputRangeKey) -> InputSnapshotIdentity {
+        let entry = cache.input_entries.get(&key).unwrap();
+        InputSnapshotIdentity {
+            range: key,
+            serial: entry.serial,
+            data_ptr: Arc::as_ptr(&entry.data) as usize,
+        }
+    }
+
+    fn insert_test_input(
+        cache: &mut SsboSnapshotCache,
+        key: InputRangeKey,
+        watch_range: HostWatchRange,
+    ) {
+        cache.insert_input_entry(
+            key,
+            watch_range,
+            Arc::new(vec![key.mapping_epoch as u8; key.len]),
+        );
+    }
+
+    fn assert_input_index_coherent(cache: &SsboSnapshotCache) {
+        assert_eq!(
+            cache.input_bytes,
+            cache
+                .input_entries
+                .values()
+                .map(|entry| entry.data.len())
+                .sum::<usize>()
+        );
+        for (&key, entry) in &cache.input_entries {
+            let (first_gpu, last_gpu) = input_invalidation_pages(key.gpu_addr, key.len).unwrap();
+            for page in first_gpu..=last_gpu {
+                assert_eq!(
+                    cache.input_gpu_pages.get(&page).map_or(0, |keys| keys
+                        .iter()
+                        .filter(|candidate| **candidate == key)
+                        .count()),
+                    1
+                );
+            }
+            let (first_cpu, last_cpu) =
+                input_invalidation_pages(entry.watch_range.cpu_addr, entry.watch_range.len)
+                    .unwrap();
+            for page in first_cpu..=last_cpu {
+                assert_eq!(
+                    cache.input_cpu_pages.get(&page).map_or(0, |keys| keys
+                        .iter()
+                        .filter(|candidate| **candidate == key)
+                        .count()),
+                    1
+                );
+            }
+        }
+        for (&page, keys) in &cache.input_gpu_pages {
+            for key in keys {
+                let entry = cache.input_entries.get(key).unwrap();
+                let (first, last) = input_invalidation_pages(key.gpu_addr, key.len).unwrap();
+                assert!((first..=last).contains(&page));
+                assert_eq!(entry.data.len(), key.len);
+            }
+        }
+        for (&page, keys) in &cache.input_cpu_pages {
+            for key in keys {
+                let entry = cache.input_entries.get(key).unwrap();
+                let (first, last) =
+                    input_invalidation_pages(entry.watch_range.cpu_addr, entry.watch_range.len)
+                        .unwrap();
+                assert!((first..=last).contains(&page));
+            }
+        }
+        assert!(cache
+            .input_sources
+            .values()
+            .all(|key| cache.input_entries.contains_key(key)));
+        assert!(cache
+            .input_cbuf_covering
+            .values()
+            .flatten()
+            .all(|key| cache.input_entries.contains_key(key)));
+        assert!(cache
+            .last_input
+            .is_none_or(|identity| cache.input_entries.contains_key(&identity.range)));
+        assert!(cache
+            .recent_cbuf_requests
+            .iter()
+            .flatten()
+            .all(|request| cache.input_entries.contains_key(&request.identity.range)));
+    }
+
+    fn full_scan_input_invalidations(
+        cache: &SsboSnapshotCache,
+        spans: &[InputInvalidationSpan],
+    ) -> HashSet<InputRangeKey> {
+        cache
+            .input_entries
+            .iter()
+            .filter_map(|(&key, entry)| {
+                spans
+                    .iter()
+                    .any(|span| {
+                        span.gpu_addr.is_some_and(|addr| {
+                            byte_ranges_overlap(key.gpu_addr, key.len, addr, span.len)
+                        }) || span.cpu_addr.is_some_and(|addr| {
+                            let (entry_addr, entry_len) = if span.cpu_watch {
+                                (entry.watch_range.cpu_addr, entry.watch_range.len)
+                            } else {
+                                (key.cpu_addr, key.len)
+                            };
+                            byte_ranges_overlap(entry_addr, entry_len, addr, span.len)
+                        })
+                    })
+                    .then_some(key)
+            })
+            .collect()
+    }
+
+    fn assert_input_invalidation_matches_full_scan(
+        cache: &mut SsboSnapshotCache,
+        spans: &[InputInvalidationSpan],
+    ) {
+        let before: HashSet<InputRangeKey> = cache.input_entries.keys().copied().collect();
+        let expected = full_scan_input_invalidations(cache, spans);
+        cache.invalidate_input_spans(spans);
+        let actual: HashSet<InputRangeKey> = before
+            .into_iter()
+            .filter(|key| !cache.input_entries.contains_key(key))
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(cache.input_invalidation_candidates.is_empty());
+        assert!(cache.input_invalidation_seen.is_empty());
+        assert_input_index_coherent(cache);
+    }
+
     fn decode_u32_indices(data: &[u8]) -> Vec<u32> {
         data.chunks_exact(4)
             .map(|value| u32::from_le_bytes(value.try_into().unwrap()))
@@ -10877,11 +15668,9 @@ mod tests {
 
     #[test]
     fn fixed_u16_restart_uses_native_triangle_strip_restart() {
-        let raw = u16_index_bytes(&[0, 1, 2, u16::MAX, 3, 4, 5]);
-        let expected = raw.clone();
-        let original_allocation = raw.as_ptr();
-        let prepared = prepare_index_data(
-            raw,
+        let raw = Arc::new(u16_index_bytes(&[0, 1, 2, u16::MAX, 3, 4, 5]));
+        let prepared = prepare_index_data_shared(
+            Arc::clone(&raw),
             1,
             5,
             vk::PrimitiveTopology::TRIANGLE_STRIP,
@@ -10889,13 +15678,62 @@ mod tests {
             u16::MAX as u32,
         );
 
-        assert_eq!(prepared.data, expected);
-        assert_eq!(prepared.data.as_ptr(), original_allocation);
+        assert!(Arc::ptr_eq(&prepared.data, &raw));
         assert_eq!(prepared.index_type, vk::IndexType::UINT16);
         assert_eq!(prepared.topology, vk::PrimitiveTopology::TRIANGLE_STRIP);
         assert!(prepared.primitive_restart_enabled);
         assert_eq!(prepared.primitive_restart_index, u16::MAX as u32);
         assert_eq!(prepared.max_index, Some(5));
+    }
+
+    #[test]
+    fn prepared_index_cache_reuses_transformed_payload() {
+        let raw = Arc::new(vec![0, 1, 2]);
+        let input = InputSnapshotIdentity {
+            range: InputRangeKey {
+                gpu_addr: 0x4000,
+                len: raw.len(),
+                mapping_epoch: 7,
+                cpu_addr: 0x8000,
+            },
+            serial: 11,
+            data_ptr: Arc::as_ptr(&raw) as usize,
+        };
+        let mut cache = SsboSnapshotCache::default();
+        let first = prepare_index_data_cached(
+            &mut cache,
+            Some(input),
+            Arc::clone(&raw),
+            0,
+            4,
+            vk::PrimitiveTopology::TRIANGLE_LIST,
+            false,
+            0,
+        );
+        let second = prepare_index_data_cached(
+            &mut cache,
+            Some(input),
+            Arc::clone(&raw),
+            0,
+            4,
+            vk::PrimitiveTopology::TRIANGLE_LIST,
+            false,
+            0,
+        );
+        let changed = prepare_index_data_cached(
+            &mut cache,
+            Some(input),
+            raw,
+            0,
+            5,
+            vk::PrimitiveTopology::TRIANGLE_STRIP,
+            true,
+            1,
+        );
+
+        assert!(Arc::ptr_eq(&first.data, &second.data));
+        assert!(!Arc::ptr_eq(&first.data, &changed.data));
+        assert_eq!(cache.prepared_index_entries.len(), 2);
     }
 
     #[test]
@@ -10910,7 +15748,10 @@ mod tests {
         );
 
         assert_eq!(prepared.index_type, vk::IndexType::UINT16);
-        assert_eq!(prepared.data, u16_index_bytes(&[0, u16::MAX, 0xff]));
+        assert_eq!(
+            prepared.data.as_slice(),
+            u16_index_bytes(&[0, u16::MAX, 0xff]).as_slice()
+        );
         assert!(prepared.primitive_restart_enabled);
         assert_eq!(prepared.primitive_restart_index, u16::MAX as u32);
         assert_eq!(prepared.max_index, Some(0xff));
@@ -10962,7 +15803,10 @@ mod tests {
 
         assert_eq!(prepared.topology, vk::PrimitiveTopology::TRIANGLE_LIST);
         assert!(!prepared.primitive_restart_enabled);
-        assert_eq!(prepared.data, u16_index_bytes(&[0, 1, 2, 3, 4, 5]));
+        assert_eq!(
+            prepared.data.as_slice(),
+            u16_index_bytes(&[0, 1, 2, 3, 4, 5]).as_slice()
+        );
         assert_eq!(prepared.max_index, Some(5));
     }
 
@@ -10978,7 +15822,7 @@ mod tests {
             u16::MAX as u32,
         );
 
-        assert_eq!(prepared.data, raw);
+        assert_eq!(prepared.data.as_slice(), raw.as_slice());
         assert!(!prepared.primitive_restart_enabled);
         assert_eq!(prepared.max_index, Some(u16::MAX as u32));
     }
@@ -11013,6 +15857,815 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn input_snapshot_capacity_evicts_oldest_entries() {
+        let key = |index: u64, len: usize| InputRangeKey {
+            gpu_addr: 0x1000 + index * 0x100,
+            len,
+            mapping_epoch: index + 1,
+            cpu_addr: 0x8000 + index * 0x100,
+        };
+        let range = |index: u64, len: usize| HostWatchRange {
+            cpu_addr: 0x8000 + index * 0x100,
+            len,
+        };
+        let source = |index: u64| InputSourceKey {
+            gpu_addr: 0x1000 + index * 0x100,
+            mapping_epoch: index + 1,
+            cpu_addr: 0x8000 + index * 0x100,
+        };
+        let mut cache = SsboSnapshotCache::with_input_capacity(8, 2);
+
+        for index in 0..3 {
+            cache.insert_input_entry(
+                key(index, 4),
+                range(index, 4),
+                std::sync::Arc::new(vec![index as u8; 4]),
+            );
+        }
+        cache.insert_input_entry(key(3, 9), range(3, 9), std::sync::Arc::new(vec![3; 9]));
+
+        assert_eq!(cache.input_entries.len(), 2);
+        assert_eq!(cache.input_bytes, 8);
+        assert!(!cache.input_entries.contains_key(&key(0, 4)));
+        assert!(cache.input_entries.contains_key(&key(1, 4)));
+        assert!(cache.input_entries.contains_key(&key(2, 4)));
+        assert!(!cache.input_entries.contains_key(&key(3, 9)));
+        assert!(!cache.input_sources.contains_key(&source(0)));
+        assert_eq!(cache.input_sources.get(&source(1)), Some(&key(1, 4)));
+        assert_eq!(cache.input_sources.get(&source(2)), Some(&key(2, 4)));
+        assert!(!cache.input_sources.contains_key(&source(3)));
+        assert_input_index_coherent(&cache);
+    }
+
+    #[test]
+    fn input_invalidation_index_matches_direct_alias_disjoint_and_remapped_ranges() {
+        let direct = InputRangeKey {
+            gpu_addr: 0x1100,
+            len: 0x80,
+            mapping_epoch: 1,
+            cpu_addr: 0x8100,
+        };
+        let alias = InputRangeKey {
+            gpu_addr: 0x5100,
+            len: 0x80,
+            mapping_epoch: 2,
+            cpu_addr: 0x8100,
+        };
+        let remapped = InputRangeKey {
+            gpu_addr: 0x1100,
+            len: 0x80,
+            mapping_epoch: 3,
+            cpu_addr: 0xa100,
+        };
+        let disjoint = InputRangeKey {
+            gpu_addr: 0x9100,
+            len: 0x80,
+            mapping_epoch: 4,
+            cpu_addr: 0xc100,
+        };
+        let mut cache = SsboSnapshotCache::default();
+        for key in [direct, alias, remapped, disjoint] {
+            insert_test_input(
+                &mut cache,
+                key,
+                HostWatchRange {
+                    cpu_addr: key.cpu_addr & !0xfff,
+                    len: 0x1000,
+                },
+            );
+        }
+        let spans = [InputInvalidationSpan {
+            gpu_addr: Some(0x1120),
+            cpu_addr: Some(0x8120),
+            len: 4,
+            cpu_watch: false,
+        }];
+
+        assert!(cache.collect_input_invalidation_candidates(&spans));
+        assert_eq!(
+            cache
+                .input_invalidation_candidates
+                .iter()
+                .filter(|candidate| **candidate == direct)
+                .count(),
+            1
+        );
+        cache.input_invalidation_candidates.clear();
+        cache.input_invalidation_seen.clear();
+        assert_input_invalidation_matches_full_scan(&mut cache, &spans);
+        assert!(!cache.input_entries.contains_key(&direct));
+        assert!(!cache.input_entries.contains_key(&alias));
+        assert!(!cache.input_entries.contains_key(&remapped));
+        assert!(cache.input_entries.contains_key(&disjoint));
+    }
+
+    #[test]
+    fn input_invalidation_index_preserves_half_open_cross_page_and_overflow_semantics() {
+        let adjacent = InputRangeKey {
+            gpu_addr: 0x1000,
+            len: 0x1000,
+            mapping_epoch: 1,
+            cpu_addr: 0x8000,
+        };
+        let cross_page = InputRangeKey {
+            gpu_addr: 0x1ff8,
+            len: 16,
+            mapping_epoch: 2,
+            cpu_addr: 0x9ff8,
+        };
+        let overflow = InputRangeKey {
+            gpu_addr: u64::MAX - 7,
+            len: 16,
+            mapping_epoch: 3,
+            cpu_addr: u64::MAX - 0x1007,
+        };
+        let mut cache = SsboSnapshotCache::default();
+        for key in [adjacent, cross_page, overflow] {
+            insert_test_input(
+                &mut cache,
+                key,
+                HostWatchRange {
+                    cpu_addr: key.cpu_addr,
+                    len: key.len,
+                },
+            );
+        }
+        let spans = [
+            InputInvalidationSpan {
+                gpu_addr: Some(0x2000),
+                cpu_addr: None,
+                len: 1,
+                cpu_watch: false,
+            },
+            InputInvalidationSpan {
+                gpu_addr: Some(u64::MAX - 4),
+                cpu_addr: None,
+                len: 8,
+                cpu_watch: false,
+            },
+        ];
+
+        assert_input_invalidation_matches_full_scan(&mut cache, &spans);
+        assert!(cache.input_entries.contains_key(&adjacent));
+        assert!(!cache.input_entries.contains_key(&cross_page));
+        assert!(!cache.input_entries.contains_key(&overflow));
+    }
+
+    #[test]
+    fn input_invalidation_index_finds_dirty_watch_span_outside_exact_range() {
+        let watched = InputRangeKey {
+            gpu_addr: 0x4100,
+            len: 4,
+            mapping_epoch: 1,
+            cpu_addr: 0x8100,
+        };
+        let disjoint = InputRangeKey {
+            gpu_addr: 0x5100,
+            len: 4,
+            mapping_epoch: 2,
+            cpu_addr: 0x9100,
+        };
+        let mut cache = SsboSnapshotCache::default();
+        insert_test_input(
+            &mut cache,
+            watched,
+            HostWatchRange {
+                cpu_addr: 0x8000,
+                len: 0x1000,
+            },
+        );
+        insert_test_input(
+            &mut cache,
+            disjoint,
+            HostWatchRange {
+                cpu_addr: 0x9000,
+                len: 0x1000,
+            },
+        );
+        let spans = [InputInvalidationSpan {
+            gpu_addr: None,
+            cpu_addr: Some(0x8f00),
+            len: 4,
+            cpu_watch: true,
+        }];
+
+        assert_input_invalidation_matches_full_scan(&mut cache, &spans);
+        assert!(!cache.input_entries.contains_key(&watched));
+        assert!(cache.input_entries.contains_key(&disjoint));
+    }
+
+    #[test]
+    fn input_invalidation_index_uses_dynamic_and_hard_page_fallbacks() {
+        let key = |index: u64| InputRangeKey {
+            gpu_addr: 0x1000 + index * 0x1000,
+            len: 4,
+            mapping_epoch: index + 1,
+            cpu_addr: 0x8000 + index * 0x1000,
+        };
+        let mut cache = SsboSnapshotCache::default();
+        for index in 0..4 {
+            let key = key(index);
+            insert_test_input(
+                &mut cache,
+                key,
+                HostWatchRange {
+                    cpu_addr: key.cpu_addr,
+                    len: key.len,
+                },
+            );
+        }
+        let dynamic = [InputInvalidationSpan {
+            gpu_addr: Some(0x1000),
+            cpu_addr: None,
+            len: 5 << INPUT_INVALIDATION_PAGE_SHIFT,
+            cpu_watch: false,
+        }];
+        assert!(!cache.collect_input_invalidation_candidates(&dynamic));
+        assert_input_invalidation_matches_full_scan(&mut cache, &dynamic);
+
+        let mut hard_cache = SsboSnapshotCache::default();
+        for index in 0..=INPUT_INVALIDATION_MAX_QUERY_PAGES {
+            let key = InputRangeKey {
+                gpu_addr: index << INPUT_INVALIDATION_PAGE_SHIFT,
+                len: 1,
+                mapping_epoch: index + 1,
+                cpu_addr: 0x1_0000_0000 + (index << INPUT_INVALIDATION_PAGE_SHIFT),
+            };
+            insert_test_input(
+                &mut hard_cache,
+                key,
+                HostWatchRange {
+                    cpu_addr: key.cpu_addr,
+                    len: key.len,
+                },
+            );
+        }
+        let hard = [InputInvalidationSpan {
+            gpu_addr: Some(0),
+            cpu_addr: None,
+            len: usize::try_from(
+                (INPUT_INVALIDATION_MAX_QUERY_PAGES + 1) << INPUT_INVALIDATION_PAGE_SHIFT,
+            )
+            .unwrap(),
+            cpu_watch: false,
+        }];
+        assert!(!hard_cache.collect_input_invalidation_candidates(&hard));
+        assert_input_invalidation_matches_full_scan(&mut hard_cache, &hard);
+    }
+
+    #[test]
+    fn input_invalidation_index_uses_candidate_saturation_fallback() {
+        let mut cache = SsboSnapshotCache::default();
+        for index in 0..=INPUT_INVALIDATION_MAX_CANDIDATES {
+            let key = InputRangeKey {
+                gpu_addr: 0x6000,
+                len: 1,
+                mapping_epoch: index as u64 + 1,
+                cpu_addr: 0xa000,
+            };
+            insert_test_input(
+                &mut cache,
+                key,
+                HostWatchRange {
+                    cpu_addr: 0xa000,
+                    len: 1,
+                },
+            );
+        }
+        let spans = [InputInvalidationSpan {
+            gpu_addr: Some(0x6000),
+            cpu_addr: None,
+            len: 1,
+            cpu_watch: false,
+        }];
+
+        assert!(!cache.collect_input_invalidation_candidates(&spans));
+        assert_input_invalidation_matches_full_scan(&mut cache, &spans);
+        assert!(cache.input_entries.is_empty());
+    }
+
+    #[test]
+    fn input_invalidation_index_stays_coherent_across_entry_lifecycle() {
+        let key = |index: u64| InputRangeKey {
+            gpu_addr: 0x20_000 + index * 0x1000,
+            len: 4,
+            mapping_epoch: index + 1,
+            cpu_addr: 0x80_000 + index * 0x1000,
+        };
+        let mut cache = SsboSnapshotCache::with_input_capacity(8, 2);
+        let first = key(0);
+        insert_test_input(
+            &mut cache,
+            first,
+            HostWatchRange {
+                cpu_addr: first.cpu_addr,
+                len: first.len,
+            },
+        );
+        cache.index_cbuf_covering_range(first);
+        let old_identity = test_input_identity(&cache, first);
+        cache.last_input = Some(old_identity);
+        cache.remember_recent_cbuf_request(
+            first.gpu_addr,
+            first.len,
+            first.mapping_epoch,
+            old_identity,
+            0,
+        );
+        cache.insert_input_entry(
+            first,
+            HostWatchRange {
+                cpu_addr: first.cpu_addr,
+                len: first.len,
+            },
+            Arc::new(vec![9; first.len]),
+        );
+        assert_eq!(cache.last_input, None);
+        assert!(cache.recent_cbuf_requests.iter().all(Option::is_none));
+        assert_input_index_coherent(&cache);
+
+        for index in 1..=2 {
+            let next = key(index);
+            insert_test_input(
+                &mut cache,
+                next,
+                HostWatchRange {
+                    cpu_addr: next.cpu_addr,
+                    len: next.len,
+                },
+            );
+        }
+        assert!(!cache.input_entries.contains_key(&first));
+        assert_input_index_coherent(&cache);
+
+        let retained = key(2);
+        cache.retain_input_entries(|key, _| *key == retained);
+        assert_eq!(cache.input_entries.len(), 1);
+        assert_input_index_coherent(&cache);
+
+        cache.reset_epoch();
+        cache.clear_ssbo_snapshots();
+        assert!(cache.input_entries.contains_key(&retained));
+        assert_input_index_coherent(&cache);
+
+        cache.clear();
+        assert!(cache.input_entries.is_empty());
+        assert!(cache.input_gpu_pages.is_empty());
+        assert!(cache.input_cpu_pages.is_empty());
+        assert!(cache.input_sources.is_empty());
+        assert!(cache.input_cbuf_covering.is_empty());
+        assert_input_index_coherent(&cache);
+    }
+
+    #[test]
+    fn recent_cbuf_request_memo_hits_live_identity() {
+        let key = InputRangeKey {
+            gpu_addr: 0x4100,
+            len: 32,
+            mapping_epoch: 7,
+            cpu_addr: 0x8100,
+        };
+        let data = Arc::new((0..32u8).collect::<Vec<_>>());
+        let mut cache = SsboSnapshotCache::default();
+        cache.insert_input_entry(
+            key,
+            HostWatchRange {
+                cpu_addr: key.cpu_addr,
+                len: key.len,
+            },
+            data.clone(),
+        );
+        let identity = test_input_identity(&cache, key);
+        cache.remember_recent_cbuf_request(key.gpu_addr, key.len, key.mapping_epoch, identity, 0);
+
+        let (snapshot, cached_identity) = cache
+            .recent_cbuf_snapshot(key.gpu_addr, key.len, key.mapping_epoch)
+            .unwrap();
+
+        assert_eq!(cached_identity, identity);
+        assert_eq!(snapshot.source_offset, 0);
+        assert!(Arc::ptr_eq(&snapshot.data, &data));
+        assert_eq!(cache.last_input, Some(identity));
+    }
+
+    #[test]
+    fn recent_cbuf_request_index_tracks_ring_replacement_and_invalidation() {
+        let mut cache = SsboSnapshotCache::default();
+        let mut keys = Vec::new();
+        for index in 0..=RECENT_CBUF_REQUEST_CAPACITY {
+            let key = InputRangeKey {
+                gpu_addr: 0x10_000 + (index as u64) * 0x100,
+                len: 16,
+                mapping_epoch: index as u64 + 1,
+                cpu_addr: 0x20_000 + (index as u64) * 0x100,
+            };
+            cache.insert_input_entry(
+                key,
+                HostWatchRange {
+                    cpu_addr: key.cpu_addr,
+                    len: key.len,
+                },
+                Arc::new(vec![index as u8; key.len]),
+            );
+            cache.remember_recent_cbuf_request(
+                key.gpu_addr,
+                key.len,
+                key.mapping_epoch,
+                test_input_identity(&cache, key),
+                0,
+            );
+            keys.push(key);
+        }
+
+        let first = keys[0];
+        assert!(!cache.recent_cbuf_request_index.contains_key(&(
+            first.gpu_addr,
+            first.len,
+            first.mapping_epoch
+        )));
+        for key in keys.iter().skip(1) {
+            assert!(cache
+                .recent_cbuf_snapshot(key.gpu_addr, key.len, key.mapping_epoch)
+                .is_some());
+        }
+
+        let removed = keys[1];
+        cache.remove_input_entry(removed);
+        assert!(!cache.recent_cbuf_request_index.contains_key(&(
+            removed.gpu_addr,
+            removed.len,
+            removed.mapping_epoch,
+        )));
+    }
+
+    #[test]
+    fn recent_cbuf_request_memo_rejects_replacement_and_invalidation() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x5000, 0x1000, 0x9000, 1);
+        let key = InputRangeKey {
+            gpu_addr: 0x5100,
+            len: 32,
+            mapping_epoch: mappings.mapping_epoch_for(0x5100).unwrap(),
+            cpu_addr: 0x9100,
+        };
+        let mut cache = SsboSnapshotCache::default();
+        let old_data = Arc::new(vec![1; key.len]);
+        cache.insert_input_entry(
+            key,
+            HostWatchRange {
+                cpu_addr: key.cpu_addr,
+                len: key.len,
+            },
+            old_data.clone(),
+        );
+        let old_identity = test_input_identity(&cache, key);
+        cache.remember_recent_cbuf_request(
+            key.gpu_addr,
+            key.len,
+            key.mapping_epoch,
+            old_identity,
+            0,
+        );
+        let replacement = Arc::new(vec![2; key.len]);
+        cache.insert_input_entry(
+            key,
+            HostWatchRange {
+                cpu_addr: key.cpu_addr,
+                len: key.len,
+            },
+            replacement.clone(),
+        );
+        assert!(cache
+            .recent_cbuf_snapshot(key.gpu_addr, key.len, key.mapping_epoch)
+            .is_none());
+        assert_eq!(old_data.as_slice(), &[1; 32]);
+
+        let replacement_identity = test_input_identity(&cache, key);
+        cache.remember_recent_cbuf_request(
+            key.gpu_addr,
+            key.len,
+            key.mapping_epoch,
+            replacement_identity,
+            0,
+        );
+        let (snapshot, _) = cache
+            .recent_cbuf_snapshot(key.gpu_addr, key.len, key.mapping_epoch)
+            .unwrap();
+        assert!(Arc::ptr_eq(&snapshot.data, &replacement));
+
+        cache.invalidate_gpu_write(&mappings, key.gpu_addr, 4);
+        assert!(cache
+            .recent_cbuf_snapshot(key.gpu_addr, key.len, key.mapping_epoch)
+            .is_none());
+    }
+
+    #[test]
+    fn recent_cbuf_request_memo_rejects_remapped_epoch() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x6000, 0x1000, 0xa000, 1);
+        let original_epoch = mappings.mapping_epoch_for(0x6080).unwrap();
+        let key = InputRangeKey {
+            gpu_addr: 0x6080,
+            len: 16,
+            mapping_epoch: original_epoch,
+            cpu_addr: 0xa080,
+        };
+        let mut cache = SsboSnapshotCache::default();
+        cache.insert_input_entry(
+            key,
+            HostWatchRange {
+                cpu_addr: key.cpu_addr,
+                len: key.len,
+            },
+            Arc::new(vec![3; key.len]),
+        );
+        let identity = test_input_identity(&cache, key);
+        cache.remember_recent_cbuf_request(key.gpu_addr, key.len, original_epoch, identity, 0);
+
+        mappings.add(0x6000, 0x1000, 0xb000, 2);
+        let remapped_epoch = mappings.mapping_epoch_for(key.gpu_addr).unwrap();
+
+        assert_ne!(remapped_epoch, original_epoch);
+        assert!(cache
+            .recent_cbuf_snapshot(key.gpu_addr, key.len, remapped_epoch)
+            .is_none());
+    }
+
+    #[test]
+    fn recent_cbuf_request_memo_preserves_contained_source_offset() {
+        const GPU_VA: u64 = 0x5100_0000;
+        const CPU_VA: u64 = 0x9100_0000;
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, 0x1000, CPU_VA, 1);
+        let container = InputRangeKey {
+            gpu_addr: GPU_VA,
+            len: 0x100,
+            mapping_epoch: mappings.mapping_epoch_for(GPU_VA).unwrap(),
+            cpu_addr: CPU_VA,
+        };
+        let data = Arc::new((0..=255u8).collect::<Vec<_>>());
+        let mut cache = SsboSnapshotCache::default();
+        cache.insert_input_entry(
+            container,
+            HostWatchRange {
+                cpu_addr: CPU_VA,
+                len: container.len,
+            },
+            data.clone(),
+        );
+        cache.index_cbuf_covering_range(container);
+        let read = |_: u64, _: &mut [u8]| false;
+
+        let first = cache
+            .read_cbuf_input_or_insert(&mappings, GPU_VA + 0x20, 4, &read)
+            .unwrap();
+        cache.input_cbuf_covering.clear();
+        cache.input_sources.clear();
+        cache.last_input = None;
+        let memoized = cache
+            .read_cbuf_input_or_insert(&mappings, GPU_VA + 0x20, 4, &read)
+            .unwrap();
+
+        assert_eq!(first.source_offset, 0x20);
+        assert_eq!(memoized.source_offset, 0x20);
+        assert_eq!(&memoized.data[0x20..0x24], &[0x20, 0x21, 0x22, 0x23]);
+        assert!(Arc::ptr_eq(&memoized.data, &data));
+    }
+
+    #[test]
+    fn recent_cbuf_request_memo_evicts_at_fixed_capacity() {
+        let key = InputRangeKey {
+            gpu_addr: 0x7000,
+            len: (RECENT_CBUF_REQUEST_CAPACITY + 1) * 4,
+            mapping_epoch: 11,
+            cpu_addr: 0xc000,
+        };
+        let mut cache = SsboSnapshotCache::default();
+        cache.insert_input_entry(
+            key,
+            HostWatchRange {
+                cpu_addr: key.cpu_addr,
+                len: key.len,
+            },
+            Arc::new(vec![4; key.len]),
+        );
+        let identity = test_input_identity(&cache, key);
+        for index in 0..=RECENT_CBUF_REQUEST_CAPACITY {
+            let source_offset = index * 4;
+            cache.remember_recent_cbuf_request(
+                key.gpu_addr + source_offset as u64,
+                4,
+                key.mapping_epoch,
+                identity,
+                source_offset,
+            );
+        }
+
+        assert_eq!(
+            cache
+                .recent_cbuf_requests
+                .iter()
+                .filter(|request| request.is_some())
+                .count(),
+            RECENT_CBUF_REQUEST_CAPACITY
+        );
+        assert!(cache
+            .recent_cbuf_snapshot(key.gpu_addr, 4, key.mapping_epoch)
+            .is_none());
+        assert!(cache
+            .recent_cbuf_snapshot(key.gpu_addr + 4, 4, key.mapping_epoch)
+            .is_some());
+        assert!(cache
+            .recent_cbuf_snapshot(
+                key.gpu_addr + (RECENT_CBUF_REQUEST_CAPACITY * 4) as u64,
+                4,
+                key.mapping_epoch,
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn cbuf_snapshot_reuses_containing_range_with_source_offset() {
+        use nexium_gpu::bundle_cache::{CbufIndexOrigin, CbufRead};
+
+        const GPU_VA: u64 = 0x5100_0000;
+        const CPU_VA: u64 = 0x9100_0000;
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, 0x1000, CPU_VA, 1);
+        let container = InputRangeKey {
+            gpu_addr: GPU_VA,
+            len: 0x80,
+            mapping_epoch: mappings.mapping_epoch_for(GPU_VA).unwrap(),
+            cpu_addr: CPU_VA,
+        };
+        let mut cache = SsboSnapshotCache::default();
+        cache.insert_input_entry(
+            container,
+            HostWatchRange {
+                cpu_addr: CPU_VA,
+                len: 0x80,
+            },
+            Arc::new((0..0x80u8).collect()),
+        );
+        cache.index_cbuf_covering_range(container);
+
+        let mut binds = [[(0u64, 0u32); GRAPHICS_CBUF_SLOTS]; 5];
+        binds[0][0] = (GPU_VA + 0x20, 4);
+        let reads = [CbufRead {
+            logical_slot: 0,
+            byte_offset: 0,
+            index_origin: CbufIndexOrigin::Static,
+        }];
+        let read = |_: u64, _: &mut [u8]| false;
+        let payload = pack_cbuf_data(&binds, 1, 0, 0, 4, &reads, &mut cache, &mappings, &read);
+        let packed = payload.materialize();
+
+        assert_eq!(packed_cbuf_word(&packed, 0, 0), Some(0x2322_2120));
+    }
+
+    #[test]
+    fn input_snapshot_invalidation_tracks_direct_alias_and_disjoint_gpu_writes() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x1000, 0x1000, 0x8000, 1);
+        mappings.add(0x5000, 0x1000, 0x8000, 2);
+        let key = InputRangeKey {
+            gpu_addr: 0x1200,
+            len: 0x100,
+            mapping_epoch: mappings.mapping_epoch_for(0x1200).unwrap(),
+            cpu_addr: 0x8200,
+        };
+        let mut cache = SsboSnapshotCache::default();
+        let insert = |cache: &mut SsboSnapshotCache| {
+            cache.insert_input_entry(
+                key,
+                HostWatchRange {
+                    cpu_addr: 0x8200,
+                    len: 0x100,
+                },
+                std::sync::Arc::new(vec![0x5a; 0x100]),
+            );
+        };
+
+        insert(&mut cache);
+        cache.invalidate_gpu_write(&mappings, 0x5100, 4);
+        assert!(cache.input_entries.contains_key(&key));
+
+        cache.invalidate_gpu_write(&mappings, 0x5240, 4);
+        assert!(!cache.input_entries.contains_key(&key));
+
+        insert(&mut cache);
+        cache.invalidate_gpu_write(&mappings, 0x1280, 4);
+        assert!(!cache.input_entries.contains_key(&key));
+    }
+
+    #[test]
+    fn small_rt_writeback_ranges_only_invalidate_overlapping_snapshots() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x1000, 0x1000, 0x8000, 1);
+        mappings.add(0x5000, 0x1000, 0x8000, 2);
+        mappings.add(0x7abc_0000, 0x1000, 0x8000, 3);
+        let overlapping_input = InputRangeKey {
+            gpu_addr: 0x1200,
+            len: 0x100,
+            mapping_epoch: mappings.mapping_epoch_for(0x1200).unwrap(),
+            cpu_addr: 0x8200,
+        };
+        let disjoint_input = InputRangeKey {
+            gpu_addr: 0x1400,
+            len: 0x100,
+            mapping_epoch: mappings.mapping_epoch_for(0x1400).unwrap(),
+            cpu_addr: 0x8400,
+        };
+        let overlapping_source = InputSourceKey {
+            gpu_addr: overlapping_input.gpu_addr,
+            mapping_epoch: overlapping_input.mapping_epoch,
+            cpu_addr: overlapping_input.cpu_addr,
+        };
+        let disjoint_source = InputSourceKey {
+            gpu_addr: disjoint_input.gpu_addr,
+            mapping_epoch: disjoint_input.mapping_epoch,
+            cpu_addr: disjoint_input.cpu_addr,
+        };
+        let overlapping_ssbo = test_ssbo_cache_key(0x200, 0x100);
+        let mut disjoint_ssbo = test_ssbo_cache_key(0x400, 0x100);
+        disjoint_ssbo.storage_binding = 2;
+        let mut cache = SsboSnapshotCache::default();
+        cache.insert_input_entry(
+            overlapping_input,
+            HostWatchRange {
+                cpu_addr: 0x8200,
+                len: 0x100,
+            },
+            std::sync::Arc::new(vec![1; 0x100]),
+        );
+        cache.insert_input_entry(
+            disjoint_input,
+            HostWatchRange {
+                cpu_addr: 0x8400,
+                len: 0x100,
+            },
+            std::sync::Arc::new(vec![2; 0x100]),
+        );
+        cache
+            .entries
+            .insert(overlapping_ssbo, std::sync::Arc::new(vec![3; 0x100]));
+        cache
+            .entries
+            .insert(disjoint_ssbo, std::sync::Arc::new(vec![4; 0x100]));
+
+        invalidate_snapshot_cache_guest_write_chunks(
+            &mut cache,
+            &mappings,
+            &[GuestWriteChunk {
+                gpu_va: 0x5240,
+                cpu_addr: 0x8240,
+                data_offset: 0,
+                len: 4,
+            }],
+        );
+
+        assert!(!cache.input_entries.contains_key(&overlapping_input));
+        assert!(cache.input_entries.contains_key(&disjoint_input));
+        assert!(!cache.input_sources.contains_key(&overlapping_source));
+        assert_eq!(
+            cache.input_sources.get(&disjoint_source),
+            Some(&disjoint_input)
+        );
+        assert!(!cache.entries.contains_key(&overlapping_ssbo));
+        assert!(cache.entries.contains_key(&disjoint_ssbo));
+        assert_input_index_coherent(&cache);
+    }
+
+    #[test]
+    fn input_snapshots_survive_render_and_epoch_boundaries_until_full_clear() {
+        let key = InputRangeKey {
+            gpu_addr: 0x1000,
+            len: 4,
+            mapping_epoch: 1,
+            cpu_addr: 0x8000,
+        };
+        let mut cache = SsboSnapshotCache::default();
+        cache.insert_input_entry(
+            key,
+            HostWatchRange {
+                cpu_addr: 0x8000,
+                len: 4,
+            },
+            std::sync::Arc::new(vec![1, 2, 3, 4]),
+        );
+
+        cache.reset_epoch();
+        finish_ssbo_flush_boundary(&mut cache);
+        cache.clear_ssbo_snapshots();
+        assert!(cache.input_entries.contains_key(&key));
+        assert_input_index_coherent(&cache);
+
+        cache.clear();
+        assert!(!cache.input_entries.contains_key(&key));
+        assert_input_index_coherent(&cache);
     }
 
     #[test]
@@ -11073,7 +16726,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_boundary_retains_only_watched_aurora_without_guest_writeback() {
+    fn flush_boundary_retains_only_watched_aurora() {
         let full = test_full_aurora_ssbo_cache_key(0x00, AURORA_VERTEX_BUFFER_SIZE);
         let mut partial = full;
         partial.read_len -= 16;
@@ -11091,14 +16744,14 @@ mod tests {
             },
         );
 
-        finish_ssbo_flush_boundary(&mut cache, false);
+        finish_ssbo_flush_boundary(&mut cache);
         assert!(cache
             .entries
             .get(&full)
             .is_some_and(|data| std::sync::Arc::ptr_eq(data, &full_data)));
         assert!(!cache.entries.contains_key(&partial));
 
-        finish_ssbo_flush_boundary(&mut cache, true);
+        cache.clear();
         assert!(cache.is_empty());
     }
 
@@ -11186,6 +16839,248 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn packed_cbuf_reuses_exact_watched_input_range() {
+        const GPU_VA: u64 = 0x4100_0000;
+        const CPU_VA: u64 = 0xeb_0000_0000;
+        const ARENA_LEN: usize = 0x1000;
+        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).expect("fastmem test arena");
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, ARENA_LEN);
+            std::ptr::copy_nonoverlapping([1u8, 2, 3, 4, 5, 6, 7, 8].as_ptr(), ptr, 8);
+        }
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
+        let reads = std::cell::Cell::new(0usize);
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            reads.set(reads.get() + 1);
+            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
+            true
+        };
+        let mut binds = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
+        binds[0][0] = (GPU_VA, 8);
+        let mut cache = SsboSnapshotCache::default();
+
+        let first = pack_cbuf_data(&binds, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
+        let second = pack_cbuf_data(&binds, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
+
+        let first_source = first.slots().unwrap()[0].data();
+        let second_source = second.slots().unwrap()[0].data();
+        assert!(std::sync::Arc::ptr_eq(first_source, second_source));
+        let first_packed = first.materialize();
+        let second_packed = second.materialize();
+        assert_eq!(
+            packed_cbuf_slot(&first_packed, 0),
+            Some(&[1, 2, 3, 4, 5, 6, 7, 8][..])
+        );
+        assert_eq!(first_packed, second_packed);
+        assert_eq!(reads.get(), 1);
+        assert_eq!(cache.input_entries.len(), 1);
+        cache.clear();
+        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_cbuf_reuses_a_larger_watched_input_range_for_a_shorter_slot() {
+        const GPU_VA: u64 = 0x4180_0000;
+        const CPU_VA: u64 = 0xeb_2000_0000;
+        const ARENA_LEN: usize = 0x1000;
+        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).expect("fastmem test arena");
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, ARENA_LEN);
+            std::ptr::copy_nonoverlapping(
+                [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].as_ptr(),
+                ptr,
+                16,
+            );
+        }
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
+        let reads = std::cell::Cell::new(0usize);
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            reads.set(reads.get() + 1);
+            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
+            true
+        };
+        let mut long_binds = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
+        long_binds[0][0] = (GPU_VA, 16);
+        let mut short_binds = long_binds;
+        short_binds[0][0].1 = 8;
+        let mut cache = SsboSnapshotCache::default();
+
+        let first = pack_cbuf_data(&long_binds, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
+        let second = pack_cbuf_data(&short_binds, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
+
+        let first_source = first.slots().unwrap()[0].data();
+        let second_source = second.slots().unwrap()[0].data();
+        assert!(std::sync::Arc::ptr_eq(first_source, second_source));
+        let second_packed = second.materialize();
+        assert_eq!(
+            packed_cbuf_slot(&second_packed, 0),
+            Some(&[1, 2, 3, 4, 5, 6, 7, 8][..])
+        );
+        assert_eq!(reads.get(), 1);
+        cache.clear();
+        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_cbuf_rebuilds_after_watched_input_write() {
+        const GPU_VA: u64 = 0x4150_0000;
+        const CPU_VA: u64 = 0xeb_1000_0000;
+        const ARENA_LEN: usize = 0x1000;
+        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).expect("fastmem test arena");
+        unsafe { std::ptr::write_bytes(ptr, 0x13, ARENA_LEN) };
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
+            true
+        };
+        let mut binds = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
+        binds[0][0] = (GPU_VA, 8);
+        let mut cache = SsboSnapshotCache::default();
+
+        let first = pack_cbuf_data(&binds, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
+        unsafe { ptr.add(3).write_volatile(0x7c) };
+        cache.refresh_input_guest_writes();
+        let second = pack_cbuf_data(&binds, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
+
+        let first_source = first.slots().unwrap()[0].data();
+        let second_source = second.slots().unwrap()[0].data();
+        assert!(!std::sync::Arc::ptr_eq(first_source, second_source));
+        let first_packed = first.materialize();
+        let second_packed = second.materialize();
+        assert_eq!(packed_cbuf_slot(&first_packed, 0).unwrap()[3], 0x13);
+        assert_eq!(packed_cbuf_slot(&second_packed, 0).unwrap()[3], 0x7c);
+        cache.clear();
+        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn input_only_write_waits_for_epoch_refresh() {
+        const GPU_VA: u64 = 0x4200_0000;
+        const CPU_VA: u64 = 0xec_0000_0000;
+        const ARENA_LEN: usize = 0x1000;
+        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).expect("fastmem test arena");
+        unsafe { std::ptr::write_bytes(ptr, 0x11, ARENA_LEN) };
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
+            true
+        };
+        let mut cache = SsboSnapshotCache::default();
+
+        let first = cache
+            .read_input_or_insert(&mappings, GPU_VA + 0x100, 16, &read)
+            .unwrap();
+        unsafe { ptr.add(0x108).write_volatile(0x7c) };
+        cache.refresh_ssbo_guest_writes();
+        assert_eq!(cache.input_entries.len(), 1);
+
+        cache.refresh_input_guest_writes();
+        assert!(cache.input_entries.is_empty());
+        let refreshed = cache
+            .read_input_or_insert(&mappings, GPU_VA + 0x100, 16, &read)
+            .unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first, &refreshed));
+        assert_eq!(refreshed[8], 0x7c);
+        cache.clear();
+        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ssbo_refresh_consumes_shared_page_write_and_evicts_input() {
+        const GPU_VA: u64 = 0x4300_0000;
+        const CPU_VA: u64 = 0xed_0000_0000;
+        const ARENA_LEN: usize = 0x1000;
+        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).expect("fastmem test arena");
+        unsafe { std::ptr::write_bytes(ptr, 0x21, ARENA_LEN) };
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
+            true
+        };
+        let mut cache = SsboSnapshotCache::default();
+        cache
+            .read_input_or_insert(&mappings, GPU_VA + 0x100, 16, &read)
+            .unwrap();
+        let ssbo_key = test_full_aurora_ssbo_cache_key(0, AURORA_VERTEX_BUFFER_SIZE);
+        cache
+            .entries
+            .insert(ssbo_key, std::sync::Arc::new(Vec::new()));
+        cache.full_watch_ranges.insert(
+            ssbo_key,
+            HostWatchRange::write_watch(CPU_VA + 0x200, 16).unwrap(),
+        );
+
+        unsafe { ptr.add(0x108).write_volatile(0x8d) };
+        cache.refresh_ssbo_guest_writes();
+
+        assert!(!cache.entries.contains_key(&ssbo_key));
+        assert!(cache.input_entries.is_empty());
+        cache.clear();
+        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn input_snapshot_key_rejects_remapped_backing() {
+        const GPU_VA: u64 = 0x4400_0000;
+        const CPU_A: u64 = 0xee_0000_0000;
+        const CPU_B: u64 = 0xef_0000_0000;
+        const ARENA_LEN: usize = 0x1000;
+        let ptr_a = nexium_memory::fastmem::commit(CPU_A, ARENA_LEN).expect("first fastmem arena");
+        let ptr_b = nexium_memory::fastmem::commit(CPU_B, ARENA_LEN).expect("second fastmem arena");
+        unsafe {
+            std::ptr::write_bytes(ptr_a, 0x31, ARENA_LEN);
+            std::ptr::write_bytes(ptr_b, 0x72, ARENA_LEN);
+        }
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_A, 1);
+        let reads = std::cell::Cell::new(0usize);
+        let read = |cpu_addr: u64, dst: &mut [u8]| {
+            reads.set(reads.get() + 1);
+            let (ptr, base) = if cpu_addr >= CPU_B {
+                (ptr_b, CPU_B)
+            } else {
+                (ptr_a, CPU_A)
+            };
+            let offset = usize::try_from(cpu_addr - base).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
+            true
+        };
+        let mut cache = SsboSnapshotCache::default();
+
+        let first = cache
+            .read_input_or_insert(&mappings, GPU_VA + 0x80, 16, &read)
+            .unwrap();
+        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_B, 2);
+        let remapped = cache
+            .read_input_or_insert(&mappings, GPU_VA + 0x80, 16, &read)
+            .unwrap();
+
+        assert_eq!(first.as_slice(), &[0x31; 16]);
+        assert_eq!(remapped.as_slice(), &[0x72; 16]);
+        assert!(!std::sync::Arc::ptr_eq(&first, &remapped));
+        assert_eq!(reads.get(), 2);
+        cache.clear();
+        nexium_memory::fastmem::decommit(ptr_a, ARENA_LEN);
+        nexium_memory::fastmem::decommit(ptr_b, ARENA_LEN);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn tracked_full_arena_refreshes_after_direct_cpu_write() {
         const CPU_VA: u64 = 0xe8_0000_0000;
         let key = test_full_aurora_ssbo_cache_key(0, AURORA_VERTEX_BUFFER_SIZE);
@@ -11200,10 +17095,10 @@ mod tests {
         let mut cache = SsboSnapshotCache::default();
 
         let first = cache.read_or_insert(key, CPU_VA, &read).unwrap();
-        cache.refresh_guest_writes();
+        cache.refresh_ssbo_guest_writes();
         assert!(cache.entries.contains_key(&key));
         unsafe { ptr.add(0x1234).write_volatile(0x7c) };
-        cache.refresh_guest_writes();
+        cache.refresh_ssbo_guest_writes();
         assert!(!cache.entries.contains_key(&key));
 
         let refreshed = cache.read_or_insert(key, CPU_VA, &read).unwrap();
@@ -11244,7 +17139,7 @@ mod tests {
         assert!(cache.entries.contains_key(&second_key));
 
         unsafe { ptr.add((SECOND_ADDR - BASE) as usize).write_volatile(0x7d) };
-        cache.refresh_guest_writes();
+        cache.refresh_ssbo_guest_writes();
         assert!(!cache.entries.contains_key(&first_key));
         assert!(!cache.entries.contains_key(&second_key));
         nexium_memory::fastmem::decommit(ptr, TOTAL_LEN);
@@ -11353,6 +17248,42 @@ mod tests {
             maxwell_draw_orientation(WindowOrigin { raw: 0 }, 0x0900),
             (0x0900, false)
         );
+    }
+
+    #[test]
+    fn solid_fragment_probe_uses_replacement_pipeline_hash() {
+        let bundle_hash = 0x057b_adbf_e517_43b7;
+        let spirv = solid_red_fs_spirv();
+        let replacement_hash = nexium_gpu::renderer::hash_spirv(&spirv);
+
+        assert_ne!(bundle_hash, replacement_hash);
+        assert_eq!(
+            effective_fragment_pipeline_hash(bundle_hash, &spirv, false),
+            bundle_hash
+        );
+        assert_eq!(
+            effective_fragment_pipeline_hash(bundle_hash, &spirv, true),
+            replacement_hash
+        );
+    }
+
+    #[test]
+    fn solid_fragment_probe_outputs_red() {
+        let spirv = solid_red_fs_spirv();
+        let mut offset = 5;
+        let mut composite = None;
+        while offset < spirv.len() {
+            let word_count = (spirv[offset] >> 16) as usize;
+            let opcode = spirv[offset] & 0xffff;
+            assert!(word_count > 0);
+            if opcode == 44 {
+                composite = Some(&spirv[offset + 1..offset + word_count]);
+                break;
+            }
+            offset += word_count;
+        }
+
+        assert_eq!(composite, Some(&[4, 9, 7, 8, 8, 7][..]));
     }
 
     #[test]
@@ -11551,6 +17482,26 @@ mod tests {
     }
 
     #[test]
+    fn prepared_draw_packet_queue_keeps_fifo_order_with_ring_and_count_limits() {
+        let safe = nexium_gpu::renderer::GRAPHICS_RING_SAFE_BATCH_BYTES;
+        let mut ring_queue = PreparedDrawPacketQueue::default();
+        assert!(ring_queue.stage(0u32, safe / 2).is_none());
+        assert!(ring_queue.stage(1u32, safe / 2).is_none());
+        assert_eq!(ring_queue.stage(2u32, 1), Some(vec![0, 1]));
+        assert_eq!(ring_queue.take(), vec![2]);
+
+        let mut count_queue = PreparedDrawPacketQueue::default();
+        for item in 0..PREPARED_DRAW_PACKET_MAX_BATCHES - 1 {
+            assert!(count_queue.stage(item, 0).is_none());
+        }
+        assert_eq!(
+            count_queue.stage(PREPARED_DRAW_PACKET_MAX_BATCHES - 1, 0),
+            Some((0..PREPARED_DRAW_PACKET_MAX_BATCHES).collect())
+        );
+        assert!(count_queue.is_empty());
+    }
+
+    #[test]
     fn cbuf_read_metadata_retains_static_indexed_and_more_than_thirty_two_entries() {
         let mut program = nexium_shader::IrProgram::new();
         for offset in (0..40u32).map(|word| word * 4) {
@@ -11586,13 +17537,13 @@ mod tests {
             bindless_or_partners: Default::default(),
         };
 
-        let reads = collect_cbuf_reads(&cfg, 16);
+        let reads = collect_cbuf_reads(&cfg, FRAGMENT_CBUF_BASE as u32);
         assert_eq!(reads.len(), 41);
         assert!(reads.iter().any(|read| {
-            read.logical_slot == 22 && read.byte_offset == 0 && !read.is_indexed()
+            read.logical_slot == 24 && read.byte_offset == 0 && !read.is_indexed()
         }));
         assert!(reads.iter().any(|read| {
-            read.logical_slot == 22
+            read.logical_slot == 24
                 && read.byte_offset == 0x2aa0
                 && read.index_origin == nexium_gpu::bundle_cache::CbufIndexOrigin::Gpr(37)
         }));
@@ -11682,12 +17633,12 @@ mod tests {
                     index_origin: nexium_gpu::bundle_cache::CbufIndexOrigin::Constant(0xffff_fff0,),
                 },
                 nexium_gpu::bundle_cache::CbufRead {
-                    logical_slot: 22,
+                    logical_slot: 24,
                     byte_offset: 0x1550,
                     index_origin: nexium_gpu::bundle_cache::CbufIndexOrigin::Static,
                 },
                 nexium_gpu::bundle_cache::CbufRead {
-                    logical_slot: 23,
+                    logical_slot: 25,
                     byte_offset: 0x2aa0,
                     index_origin: nexium_gpu::bundle_cache::CbufIndexOrigin::Instruction(73),
                 },
@@ -11703,26 +17654,26 @@ mod tests {
 
         let payload_word = nexium_spirv::GFX_CBUF_PAYLOAD_WORD as usize;
         let mut packed = vec![0u8; (payload_word + 2) * 4];
-        let directory = 22usize * 8;
+        let directory = 24usize * 8;
         packed[directory..directory + 4].copy_from_slice(&(payload_word as u32).to_le_bytes());
         packed[directory + 4..directory + 8].copy_from_slice(&2u32.to_le_bytes());
         packed[payload_word * 4..payload_word * 4 + 4]
             .copy_from_slice(&0x3f80_0000u32.to_le_bytes());
         packed[payload_word * 4 + 4..payload_word * 4 + 8]
             .copy_from_slice(&0x4000_0000u32.to_le_bytes());
-        let mut binds = [[(0u64, 0u32); 16]; 5];
+        let mut binds = [[(0u64, 0u32); GRAPHICS_CBUF_SLOTS]; 5];
         binds[4][6] = (0x1234_0000, 8);
 
         let known = format_cbuf_read(
             &packed,
             CbufRead {
-                logical_slot: 22,
+                logical_slot: 24,
                 byte_offset: 0x10,
                 index_origin: CbufIndexOrigin::Constant(0xffff_fff3),
             },
             &binds,
         );
-        assert!(known.contains("slot=22 base=0x12340000 size=8"), "{known}");
+        assert!(known.contains("slot=24 base=0x12340000 size=8"), "{known}");
         assert!(known.contains("effective=0x00000003"), "{known}");
         assert!(known.contains("word=0x00000000"), "{known}");
         assert!(known.contains("in_range=true"), "{known}");
@@ -11731,7 +17682,7 @@ mod tests {
         let dynamic = format_cbuf_read(
             &packed,
             CbufRead {
-                logical_slot: 22,
+                logical_slot: 24,
                 byte_offset: 0,
                 index_origin: CbufIndexOrigin::Gpr(37),
             },
@@ -11745,7 +17696,7 @@ mod tests {
         let out = format_cbuf_read(
             &packed,
             CbufRead {
-                logical_slot: 22,
+                logical_slot: 24,
                 byte_offset: 8,
                 index_origin: CbufIndexOrigin::Static,
             },
@@ -11791,14 +17742,26 @@ mod tests {
             copy(0x10_0000, &vs, dst) || copy(0x20_0000, &fs, dst)
         };
 
-        let mut binds = [[(0u64, 0u32); 16]; 5];
+        let mut binds = [[(0u64, 0u32); GRAPHICS_CBUF_SLOTS]; 5];
         binds[0][6] = (0x1000, 0x1_0000);
         binds[4][6] = (0x20_000, 0x1_0000);
         binds[0][7] = (0x40_000, 0x24);
-        let packed = pack_cbuf_data(&binds, (1 << 6) | (1 << 7), 1 << 22, 0, 4, &mappings, &read);
+        let mut snapshot_cache = SsboSnapshotCache::default();
+        let packed = pack_cbuf_data(
+            &binds,
+            (1 << 6) | (1 << 7),
+            1 << 24,
+            0,
+            4,
+            &[],
+            &mut snapshot_cache,
+            &mappings,
+            &read,
+        );
+        let packed = packed.materialize();
 
         assert_eq!(packed_cbuf_slot(&packed, 6).unwrap().len(), 0x1_0000);
-        assert_eq!(packed_cbuf_slot(&packed, 22).unwrap().len(), 0x1_0000);
+        assert_eq!(packed_cbuf_slot(&packed, 24).unwrap().len(), 0x1_0000);
         assert_eq!(packed_cbuf_word(&packed, 6, 0x2a0), Some(0x1111_02a0));
         for (offset, value) in [
             (0x2a0usize, 0x2222_02a0u32),
@@ -11807,16 +17770,44 @@ mod tests {
             (0x2aa0, 0x2222_2aa0),
             (0x4000, 0x2222_4000),
         ] {
-            assert_eq!(packed_cbuf_word(&packed, 22, offset), Some(value));
+            assert_eq!(packed_cbuf_word(&packed, 24, offset), Some(value));
         }
         assert_eq!(packed_cbuf_slot(&packed, 7).unwrap(), &[0u8; 0x24]);
         assert!(packed_cbuf_slot(&packed, 12).unwrap().is_empty());
         let absent_base = u32::from_le_bytes(packed[12 * 8..12 * 8 + 4].try_into().unwrap());
         assert_eq!(absent_base, nexium_spirv::GFX_CBUF_ZERO_WORD);
-        for slot in [6usize, 7, 22] {
+        for slot in [6usize, 7, 24] {
             let base = u32::from_le_bytes(packed[slot * 8..slot * 8 + 4].try_into().unwrap());
             assert_eq!(base % 4, 0, "slot {slot} payload must be 16-byte aligned");
         }
+    }
+
+    #[test]
+    fn graphics_cbuf_read_window_trims_static_reads_and_preserves_dynamic_or_unknown_slots() {
+        use nexium_gpu::bundle_cache::{CbufIndexOrigin, CbufRead};
+
+        let reads = [
+            CbufRead {
+                logical_slot: 6,
+                byte_offset: 0x20,
+                index_origin: CbufIndexOrigin::Static,
+            },
+            CbufRead {
+                logical_slot: 6,
+                byte_offset: 0x40,
+                index_origin: CbufIndexOrigin::Constant(0x10),
+            },
+            CbufRead {
+                logical_slot: 7,
+                byte_offset: 0,
+                index_origin: CbufIndexOrigin::Gpr(3),
+            },
+        ];
+
+        assert_eq!(packed_cbuf_read_len(6, 0x1000, &reads), 0x54);
+        assert_eq!(packed_cbuf_read_len(7, 0x1000, &reads), 0x1000);
+        assert_eq!(packed_cbuf_read_len(8, 0x1000, &reads), 0x1000);
+        assert_eq!(packed_cbuf_read_len(6, 0x30, &reads), 0x30);
     }
 
     #[test]
@@ -11835,14 +17826,59 @@ mod tests {
             true
         };
 
-        let mut binds = [[(0u64, 0u32); 16]; 5];
+        let mut binds = [[(0u64, 0u32); GRAPHICS_CBUF_SLOTS]; 5];
         binds[0][8] = (0x5000, 0x24);
-        let packed = pack_cbuf_data(&binds, 1 << 8, 0, 0, 4, &mappings, &read);
+        let mut snapshot_cache = SsboSnapshotCache::default();
+        let packed = pack_cbuf_data(
+            &binds,
+            1 << 8,
+            0,
+            0,
+            4,
+            &[],
+            &mut snapshot_cache,
+            &mappings,
+            &read,
+        );
+        let packed = packed.materialize();
         let slot = packed_cbuf_slot(&packed, 8).expect("packed VS cbuf 8");
 
         assert_eq!(slot.len(), 0x24);
         assert_eq!(&slot[..0x10], source.as_slice());
         assert_eq!(&slot[0x10..], &[0u8; 0x14]);
+    }
+
+    #[test]
+    fn fragmented_cbuf_range_uses_uncached_scattered_fallback() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x5000, 4, 0x10_0000, 1);
+        mappings.add(0x5004, 4, 0x20_0000, 2);
+        let reads = std::cell::Cell::new(0usize);
+        let read = |cpu: u64, dst: &mut [u8]| {
+            reads.set(reads.get() + 1);
+            match (cpu, dst.len()) {
+                (0x10_0000, 4) => dst.copy_from_slice(&[1, 2, 3, 4]),
+                (0x20_0000, 4) => dst.copy_from_slice(&[5, 6, 7, 8]),
+                _ => return false,
+            }
+            true
+        };
+        let mut binds = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
+        binds[0][0] = (0x5000, 8);
+        let mut cache = SsboSnapshotCache::default();
+
+        let first = pack_cbuf_data(&binds, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
+        let second = pack_cbuf_data(&binds, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
+        let first = first.materialize();
+        let second = second.materialize();
+
+        assert_eq!(
+            packed_cbuf_slot(&first, 0),
+            Some(&[1, 2, 3, 4, 5, 6, 7, 8][..])
+        );
+        assert_eq!(first, second);
+        assert_eq!(reads.get(), 4);
+        assert!(cache.input_entries.is_empty());
     }
 
     #[test]
@@ -11861,11 +17897,23 @@ mod tests {
             }
             _ => false,
         };
-        let mut binds = [[(0u64, 0u32); 16]; 5];
+        let mut binds = [[(0u64, 0u32); GRAPHICS_CBUF_SLOTS]; 5];
         binds[0][0] = (0x1000, 4);
         binds[1][0] = (0x2000, 4);
 
-        let packed = pack_cbuf_data(&binds, 1, 0, 1, 4, &mappings, &read);
+        let mut snapshot_cache = SsboSnapshotCache::default();
+        let packed = pack_cbuf_data(
+            &binds,
+            1,
+            0,
+            1,
+            4,
+            &[],
+            &mut snapshot_cache,
+            &mappings,
+            &read,
+        );
+        let packed = packed.materialize();
 
         assert_eq!(packed_cbuf_word(&packed, 0, 0), Some(0x2222_2222));
     }
@@ -12016,7 +18064,7 @@ mod tests {
     #[test]
     fn texture_snapshot_does_not_shrink_existing_vertex_range() {
         let mut snapshot = std::collections::HashMap::new();
-        snapshot.insert(0x4000, vec![0x5a; 0x100]);
+        snapshot.insert(0x4000, std::sync::Arc::new(vec![0x5a; 0x100]));
         let mut generations = std::collections::HashMap::new();
         let reads = std::cell::Cell::new(0usize);
         let read = |_: u64, len: usize| {
@@ -12025,12 +18073,226 @@ mod tests {
         };
 
         assert_eq!(
-            snapshot_texture_once(&mut snapshot, &mut generations, &read, 0x4000, 0x10),
+            snapshot_texture_once(
+                &mut snapshot,
+                &mut generations,
+                &read,
+                0x4000,
+                0x10,
+                None,
+                None,
+            ),
             0
         );
         assert_eq!(reads.get(), 0);
-        assert_eq!(snapshot[&0x4000], vec![0x5a; 0x100]);
+        assert_eq!(snapshot[&0x4000].as_slice(), &[0x5a; 0x100]);
         assert!(generations.contains_key(&(0x4000, 0x10)));
+    }
+
+    fn prepared_tic_plan_raw(gpu_va: u64) -> [u8; 32] {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&0x6014_9212u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&(gpu_va as u32).to_le_bytes());
+        raw[8..12].copy_from_slice(&(((gpu_va >> 32) as u32 & 0xffff) | (1 << 21)).to_le_bytes());
+        raw[12..16].copy_from_slice(&1u32.to_le_bytes());
+        raw[16..20].copy_from_slice(&(1u32 << 23).to_le_bytes());
+        raw[20..24].copy_from_slice(&(1u32 << 31).to_le_bytes());
+        raw
+    }
+
+    #[test]
+    fn tic_derived_plan_exact_raw_hits_without_derivation() {
+        let mappings = crate::gpu::GpuMappings::new();
+        let raw = prepared_tic_plan_raw(0x4000);
+        let mut plans = std::collections::HashMap::new();
+
+        let first = memoized_prepared_tic_plan(&mut plans, 0x1000, raw, |raw| {
+            derive_prepared_tic_texture_plan(raw, &mappings)
+        });
+        let second = memoized_prepared_tic_plan(&mut plans, 0x1000, raw, |_| {
+            panic!("exact TIC plan hit re-derived")
+        });
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(first.raw, second.raw);
+        assert_eq!(
+            first.texture.map(|texture| texture.tic.gpu_va),
+            Some(0x4000)
+        );
+        assert_eq!(
+            second.texture.map(|texture| texture.tic.gpu_va),
+            Some(0x4000)
+        );
+    }
+
+    #[test]
+    fn tic_derived_plan_replaces_changed_raw_at_same_address() {
+        let mappings = crate::gpu::GpuMappings::new();
+        let first_raw = prepared_tic_plan_raw(0x4000);
+        let second_raw = prepared_tic_plan_raw(0x8000);
+        let mut plans = std::collections::HashMap::new();
+
+        memoized_prepared_tic_plan(&mut plans, 0x1000, first_raw, |raw| {
+            derive_prepared_tic_texture_plan(raw, &mappings)
+        });
+        let replaced = memoized_prepared_tic_plan(&mut plans, 0x1000, second_raw, |raw| {
+            derive_prepared_tic_texture_plan(raw, &mappings)
+        });
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[&0x1000].raw, second_raw);
+        assert_eq!(
+            replaced.texture.map(|texture| texture.tic.gpu_va),
+            Some(0x8000)
+        );
+    }
+
+    #[test]
+    fn tic_derived_plan_replaces_invalid_and_valid_transitions() {
+        let mappings = crate::gpu::GpuMappings::new();
+        let invalid_raw = [0u8; 32];
+        let valid_raw = prepared_tic_plan_raw(0x4000);
+        let mut plans = std::collections::HashMap::new();
+
+        let invalid = memoized_prepared_tic_plan(&mut plans, 0x1000, invalid_raw, |raw| {
+            derive_prepared_tic_texture_plan(raw, &mappings)
+        });
+        assert!(invalid.texture.is_none());
+        let valid = memoized_prepared_tic_plan(&mut plans, 0x1000, valid_raw, |raw| {
+            derive_prepared_tic_texture_plan(raw, &mappings)
+        });
+        assert!(valid.texture.is_some());
+        let invalid_again = memoized_prepared_tic_plan(&mut plans, 0x1000, invalid_raw, |raw| {
+            derive_prepared_tic_texture_plan(raw, &mappings)
+        });
+
+        assert!(invalid_again.texture.is_none());
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[&0x1000].raw, invalid_raw);
+    }
+
+    #[test]
+    fn tic_derived_plan_capacity_does_not_admit_new_addresses() {
+        let mut plans: std::collections::HashMap<u64, PreparedTicPlan> =
+            std::collections::HashMap::new();
+        for tic_addr in 0..PREPARED_TIC_PLAN_CAPACITY as u64 {
+            let raw = [tic_addr as u8; 32];
+            memoized_prepared_tic_plan(&mut plans, tic_addr, raw, |_| None);
+        }
+        let derivations = std::cell::Cell::new(0usize);
+        let overflow_addr = PREPARED_TIC_PLAN_CAPACITY as u64;
+        let overflow_raw = [0xa5; 32];
+        for _ in 0..2 {
+            memoized_prepared_tic_plan(&mut plans, overflow_addr, overflow_raw, |_| {
+                derivations.set(derivations.get() + 1);
+                None
+            });
+        }
+
+        assert_eq!(plans.len(), PREPARED_TIC_PLAN_CAPACITY);
+        assert!(!plans.contains_key(&overflow_addr));
+        assert_eq!(derivations.get(), 2);
+        memoized_prepared_tic_plan(&mut plans, 0, [0; 32], |_| {
+            panic!("retained TIC plan re-derived at capacity")
+        });
+    }
+
+    #[test]
+    fn tic_derived_plan_short_raw_bypasses_memo() {
+        let mut plans = std::collections::HashMap::new();
+        let derivations = std::cell::Cell::new(0usize);
+        let prepared = tic_raw_descriptor(&[0x5a; 31]).map(|raw| {
+            memoized_prepared_tic_plan(&mut plans, 0x1000, raw, |_| {
+                derivations.set(derivations.get() + 1);
+                None
+            })
+        });
+        let mut oversized = [0xa5; 40];
+        oversized[31] = 0x5a;
+
+        assert!(prepared.is_none());
+        assert!(plans.is_empty());
+        assert_eq!(derivations.get(), 0);
+        assert_eq!(
+            tic_raw_descriptor(&oversized),
+            Some(oversized[..32].try_into().unwrap())
+        );
+    }
+
+    #[test]
+    fn tic_descriptor_snapshot_reuses_complete_arc() {
+        let mut snapshot = std::collections::HashMap::new();
+        let reads = std::cell::Cell::new(0usize);
+        let mut read = |_: u64, len: usize| {
+            reads.set(reads.get() + 1);
+            Some(std::sync::Arc::new(vec![0x5a; len]))
+        };
+
+        let (first, first_read) =
+            snapshot_tic_descriptor_once(&snapshot, &mut read, 0x4000).expect("first descriptor");
+        assert!(first_read);
+        snapshot.insert(0x4000, first.clone());
+
+        let (second, second_read) =
+            snapshot_tic_descriptor_once(&snapshot, &mut read, 0x4000).expect("cached descriptor");
+        assert!(!second_read);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn texture_snapshot_cache_reuses_generation_and_separates_backings() {
+        let key = TextureSnapshotCacheKey {
+            mapping_epoch: 1,
+            gpu_va: 0x4000,
+            len: 4,
+            cpu_va: 0x8000,
+            nvmap_id: 2,
+        };
+        let remapped = TextureSnapshotCacheKey {
+            cpu_va: 0x9000,
+            ..key
+        };
+        let data = std::sync::Arc::new(vec![1, 2, 3, 4]);
+        let mut cache = TextureSnapshotCache::new(16, 4);
+
+        cache.insert(key, 7, data.clone());
+        let TextureSnapshotCacheLookup::Hit(hit) = cache.get(key, 7) else {
+            panic!("matching generation");
+        };
+        assert!(std::sync::Arc::ptr_eq(&hit, &data));
+        assert!(matches!(
+            cache.get(remapped, 7),
+            TextureSnapshotCacheLookup::Miss
+        ));
+        assert!(matches!(
+            cache.get(key, 8),
+            TextureSnapshotCacheLookup::Stale
+        ));
+    }
+
+    #[test]
+    fn texture_snapshot_cache_evicts_to_byte_budget() {
+        let key = |gpu_va| TextureSnapshotCacheKey {
+            mapping_epoch: 1,
+            gpu_va,
+            len: 4,
+            cpu_va: gpu_va + 0x1000,
+            nvmap_id: 2,
+        };
+        let mut cache = TextureSnapshotCache::new(6, 4);
+
+        cache.insert(key(0x4000), 1, std::sync::Arc::new(vec![1; 4]));
+        cache.insert(key(0x5000), 1, std::sync::Arc::new(vec![2; 4]));
+        assert!(matches!(
+            cache.get(key(0x4000), 1),
+            TextureSnapshotCacheLookup::Miss
+        ));
+        assert!(matches!(
+            cache.get(key(0x5000), 1),
+            TextureSnapshotCacheLookup::Hit(_)
+        ));
+        assert!(cache.bytes <= 6);
     }
 
     #[test]
@@ -12088,10 +18350,10 @@ mod tests {
 
     #[test]
     fn tagged_texel_fetch_id_uses_exact_cbuf_origin() {
-        let tagged = nexium_shader::bindless_texture_id(2, 0x68);
+        let tagged = nexium_shader::bindless_texture_id(17, 0x68);
         assert_eq!(
             texture_cbuf_origin(tagged, 15, false),
-            (2, 0x68, None, true)
+            (17, 0x68, None, true)
         );
         assert_eq!(
             texture_cbuf_origin(0x68, 15, false),
@@ -12099,7 +18361,7 @@ mod tests {
         );
         assert_ne!(
             tagged,
-            nexium_shader::bindless_texture_id(3, 0x68),
+            nexium_shader::bindless_texture_id(1, 0x68),
             "equal word offsets in different cbuf bindings need distinct descriptor slots"
         );
     }
@@ -12385,7 +18647,7 @@ mod tests {
 
     #[test]
     fn pps_captured_vertex_zero_y_ssa_marks_slot1_and_slot10_as_buffer_candidates() {
-        for (primary, expected_shader_id) in [(0x5a, 0x9016_815b), (0x5e, 0x9017_815b)] {
+        for (primary, expected_shader_id) in [(0x5a, 0x880b_415a), (0x5e, 0x880b_c15a)] {
             let mut program = nexium_shader::IrProgram::new();
             let zero_y = program.emit(
                 nexium_shader::IrOp::Mov(nexium_shader::IrValue::Zero),
@@ -12499,7 +18761,7 @@ mod tests {
         let layout = graphics_texture_layout_from_metadata(
             &fs_metadata,
             &vs_metadata,
-            &[[(0, 0); 16]; 5],
+            &[[(0, 0); GRAPHICS_CBUF_SLOTS]; 5],
             0,
             4,
             0,
@@ -12549,6 +18811,7 @@ mod tests {
             block_height_log2: 0,
             block_depth_log2: 0,
             tile_width_spacing: 0,
+            pitch_bytes: 0,
             is_block_linear: false,
             texture_type: 1,
             depth: 1,
@@ -12658,7 +18921,7 @@ mod tests {
             ..Default::default()
         };
         let vs_metadata = FragmentTextureNumericMetadata::default();
-        let cbuf_binds = [[(0, 0); 16]; 5];
+        let cbuf_binds = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
         let mut mappings = crate::gpu::GpuMappings::new();
         mappings.add(0x1000, 64, 0x2000, 1);
         let read = |cpu: u64, out: &mut [u8]| {
@@ -12742,7 +19005,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut cbuf_binds = [[(0, 0); 16]; 5];
+        let mut cbuf_binds = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
         cbuf_binds[4][2] = (0x3000, 0x1000);
         let mut mappings = crate::gpu::GpuMappings::new();
         mappings.add(0x1000, 32, 0x2000, 1);
@@ -12811,7 +19074,7 @@ mod tests {
         let error = graphics_texture_layout_from_metadata(
             &fs_metadata,
             &FragmentTextureNumericMetadata::default(),
-            &[[(0, 0); 16]; 5],
+            &[[(0, 0); GRAPHICS_CBUF_SLOTS]; 5],
             0,
             4,
             0,
@@ -12847,7 +19110,7 @@ mod tests {
         let layout = graphics_texture_layout_from_metadata(
             &fs_metadata,
             &vs_metadata,
-            &[[(0, 0); 16]; 5],
+            &[[(0, 0); GRAPHICS_CBUF_SLOTS]; 5],
             0,
             4,
             0,
@@ -12860,6 +19123,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(layout.fs_ids, vec![5, 9, 2]);
+        assert_eq!(layout.resolved_tic_ids, vec![5, 9, 2]);
+        assert_eq!(layout.resolved_sampler_ids, vec![0, 0, 0]);
         assert_eq!(layout.vs_tex_base, 2);
         assert_eq!(layout.vs_tex_count, 1);
         assert_eq!(
@@ -12874,6 +19139,157 @@ mod tests {
             texture_numeric_type_for_slot(&layout.manifest, 2),
             TextureNumericType::Float
         );
+    }
+
+    #[test]
+    fn graphics_texture_layout_carries_resolved_tic_and_sampler_ids() {
+        let r16_uint = [
+            0x12, 0x92, 0x14, 0x60, 0x00, 0x00, 0x6d, 0x05, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x7f, 0xbb, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let shader_id = nexium_shader::bindless_texture_id(2, 4);
+        let fs_metadata = FragmentTextureNumericMetadata {
+            texture_ids: vec![shader_id],
+            descriptor_ids: vec![shader_id],
+            sampled_ids: vec![shader_id],
+            ..Default::default()
+        };
+        let mut cbuf_binds = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
+        cbuf_binds[4][2] = (0x3000, 0x100);
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x1000, 64, 0x2000, 1);
+        mappings.add(0x3000, 0x100, 0x4000, 2);
+        let handle = (3u32 << 20) | 1;
+        let read = |cpu: u64, out: &mut [u8]| {
+            if cpu == 0x4010 && out.len() == 4 {
+                out.copy_from_slice(&handle.to_le_bytes());
+                return true;
+            }
+            if cpu == 0x2020 && out.len() == r16_uint.len() {
+                out.copy_from_slice(&r16_uint);
+                return true;
+            }
+            false
+        };
+        let layout = graphics_texture_layout_from_metadata(
+            &fs_metadata,
+            &FragmentTextureNumericMetadata::default(),
+            &cbuf_binds,
+            0,
+            4,
+            0,
+            2,
+            0x1000,
+            1,
+            false,
+            &mappings,
+            &read,
+        )
+        .unwrap();
+
+        assert_eq!(layout.resolved_tic_ids, vec![1]);
+        assert_eq!(layout.resolved_sampler_ids, vec![3]);
+    }
+
+    #[test]
+    fn graphics_texture_layout_keeps_resolved_tics_aligned_fs_then_vs() {
+        const TIC_POOL: u64 = 0x7100_0000;
+        const TIC_CPU: u64 = 0x7200_0000;
+        let fs_raw = prepared_tic_plan_raw(0x8100_0000);
+        let vs_raw = prepared_tic_plan_raw(0x8200_0000);
+        let fs_metadata = FragmentTextureNumericMetadata {
+            texture_ids: vec![1],
+            descriptor_ids: vec![1],
+            sampled_ids: vec![1],
+            ..Default::default()
+        };
+        let vs_metadata = FragmentTextureNumericMetadata {
+            texture_ids: vec![2],
+            descriptor_ids: vec![2],
+            sampled_ids: vec![2],
+            ..Default::default()
+        };
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(TIC_POOL, 0x100, TIC_CPU, 1);
+        let read = |cpu: u64, out: &mut [u8]| match cpu {
+            address if address == TIC_CPU + 32 && out.len() == fs_raw.len() => {
+                out.copy_from_slice(&fs_raw);
+                true
+            }
+            address if address == TIC_CPU + 64 && out.len() == vs_raw.len() => {
+                out.copy_from_slice(&vs_raw);
+                true
+            }
+            _ => false,
+        };
+
+        let layout = graphics_texture_layout_from_metadata(
+            &fs_metadata,
+            &vs_metadata,
+            &[[(0, 0); GRAPHICS_CBUF_SLOTS]; 5],
+            0,
+            4,
+            0,
+            0,
+            TIC_POOL,
+            2,
+            false,
+            &mappings,
+            &read,
+        )
+        .unwrap();
+
+        assert_eq!(layout.resolved_tic_ids, vec![1, 2]);
+        assert_eq!(layout.resolved_tics.len(), 2);
+        assert_eq!(layout.vs_tex_base, 1);
+        let fs_tic = layout.resolved_tics[0].expect("FS TIC should be staged");
+        let vs_tic = layout.resolved_tics[1].expect("VS TIC should be staged");
+        assert_eq!(
+            (fs_tic.id, fs_tic.address, fs_tic.raw),
+            (1, TIC_POOL + 32, fs_raw)
+        );
+        assert_eq!(
+            (vs_tic.id, vs_tic.address, vs_tic.raw),
+            (2, TIC_POOL + 64, vs_raw)
+        );
+        assert_eq!(fs_tic.entry.gpu_va, 0x8100_0000);
+        assert_eq!(vs_tic.entry.gpu_va, 0x8200_0000);
+    }
+
+    #[test]
+    fn resolved_tic_alias_reuse_ignores_generation_only_changes() {
+        const TIC_POOL: u64 = 0x7300_0000;
+        const TIC_CPU: u64 = 0x7400_0000;
+        let current_raw = std::cell::Cell::new(prepared_tic_plan_raw(0x8300_0000));
+        let reads = std::cell::Cell::new(0usize);
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(TIC_POOL, 0x100, TIC_CPU, 1);
+        let read = |cpu: u64, out: &mut [u8]| {
+            assert_eq!(cpu, TIC_CPU + 32);
+            assert_eq!(out.len(), 32);
+            reads.set(reads.get() + 1);
+            out.copy_from_slice(&current_raw.get());
+            true
+        };
+
+        let cached = resolved_tic(1, TIC_POOL, 1, &mappings, &read).unwrap();
+        assert_eq!(cached.entry.gpu_va, 0x8300_0000);
+
+        let raw = super::read_tic_raw(TIC_POOL + 32, &mappings, &read).unwrap();
+        let unchanged = super::tic_entry_for_alias(Some(&cached), raw).unwrap();
+        assert_eq!(unchanged.gpu_va, 0x8300_0000);
+
+        nexium_gpu::tex_invalidate::bump_region(TIC_POOL + 32, 32);
+        let raw = super::read_tic_raw(TIC_POOL + 32, &mappings, &read).unwrap();
+        let generation_only = super::tic_entry_for_alias(Some(&cached), raw).unwrap();
+        assert_eq!(generation_only.gpu_va, 0x8300_0000);
+
+        current_raw.set(prepared_tic_plan_raw(0x8400_0000));
+        let raw = super::read_tic_raw(TIC_POOL + 32, &mappings, &read).unwrap();
+        let raw_changed = super::tic_entry_for_alias(Some(&cached), raw).unwrap();
+        assert_eq!(raw_changed.gpu_va, 0x8400_0000);
+        assert_eq!(reads.get(), 4);
     }
 
     #[test]

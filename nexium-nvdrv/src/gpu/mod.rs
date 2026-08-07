@@ -1,6 +1,8 @@
+pub(crate) mod completion;
 pub mod engines;
 pub mod flat_allocator;
 mod formats;
+pub(crate) mod prep;
 pub mod pusher;
 pub mod vk_dispatch;
 
@@ -9,10 +11,17 @@ pub use engines::{
 };
 pub use pusher::{CommandListHeader, Pusher};
 
-use parking_lot::Mutex;
-use std::cell::Cell;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+pub type GuestMemoryWriter = Arc<dyn Fn(u64, &[u8]) -> bool + Send + Sync + 'static>;
+
+#[derive(Clone)]
+pub(crate) struct GuestMemoryAccess {
+    mappings: Arc<RwLock<GpuMappings>>,
+    writer: Arc<Mutex<Option<GuestMemoryWriter>>>,
+}
 
 fn nvprof_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -28,9 +37,10 @@ pub struct GpuMapping {
     pub size: u64,
     pub cpu_addr: u64,
     pub nvmap_id: u32,
+    epoch: u64,
 }
 
-const MAPPING_LOOKUP_CACHE_SIZE: usize = 8;
+const MAPPING_LOOKUP_CACHE_SIZE: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MappingLookupCacheEntry {
@@ -39,27 +49,46 @@ struct MappingLookupCacheEntry {
     mapping_index: usize,
 }
 
+struct ThreadMappingLookupCache {
+    instance_id: u64,
+    generation: u64,
+    entries: [Option<MappingLookupCacheEntry>; MAPPING_LOOKUP_CACHE_SIZE],
+    cursor: usize,
+}
+
+impl ThreadMappingLookupCache {
+    const fn empty() -> Self {
+        Self {
+            instance_id: 0,
+            generation: 0,
+            entries: [None; MAPPING_LOOKUP_CACHE_SIZE],
+            cursor: 0,
+        }
+    }
+}
+
+thread_local! {
+    static MAPPING_LOOKUP_CACHE: std::cell::RefCell<ThreadMappingLookupCache> =
+        const { std::cell::RefCell::new(ThreadMappingLookupCache::empty()) };
+}
+
 pub struct GpuMappings {
     mappings: Vec<GpuMapping>,
-    lookup_cache: [Cell<Option<MappingLookupCacheEntry>>; MAPPING_LOOKUP_CACHE_SIZE],
-    lookup_cache_cursor: Cell<usize>,
+    instance_id: u64,
+    next_mapping_epoch: u64,
+    generation: u64,
 }
 
 impl GpuMappings {
     pub fn new() -> Self {
+        static NEXT_INSTANCE_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
         Self {
             mappings: Vec::new(),
-            lookup_cache: std::array::from_fn(|_| Cell::new(None)),
-            lookup_cache_cursor: Cell::new(0),
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            next_mapping_epoch: 1,
+            generation: 1,
         }
-    }
-
-    #[inline]
-    fn clear_lookup_cache(&self) {
-        for entry in &self.lookup_cache {
-            entry.set(None);
-        }
-        self.lookup_cache_cursor.set(0);
     }
 
     #[inline]
@@ -67,23 +96,7 @@ impl GpuMappings {
         gpu_va >= mapping.gpu_va && gpu_va < mapping.gpu_va.saturating_add(mapping.size)
     }
 
-    #[inline]
-    fn mapping_index_for(&self, gpu_va: u64) -> Option<usize> {
-        for cached in &self.lookup_cache {
-            let Some(cached) = cached.get() else {
-                continue;
-            };
-            if gpu_va >= cached.gpu_lo && gpu_va < cached.gpu_hi {
-                debug_assert!(
-                    self.mappings
-                        .get(cached.mapping_index)
-                        .is_some_and(|mapping| Self::contains(mapping, gpu_va)),
-                    "stale GMMU lookup cache entry"
-                );
-                return Some(cached.mapping_index);
-            }
-        }
-
+    fn mapping_lookup_slow(&self, gpu_va: u64) -> Option<MappingLookupCacheEntry> {
         let mapping_index = self
             .mappings
             .iter()
@@ -108,15 +121,45 @@ impl GpuMappings {
         }
 
         debug_assert!(gpu_va >= gpu_lo && gpu_va < gpu_hi);
-        let slot = self.lookup_cache_cursor.get() % MAPPING_LOOKUP_CACHE_SIZE;
-        self.lookup_cache[slot].set(Some(MappingLookupCacheEntry {
+        Some(MappingLookupCacheEntry {
             gpu_lo,
             gpu_hi,
             mapping_index,
-        }));
-        self.lookup_cache_cursor
-            .set((slot + 1) % MAPPING_LOOKUP_CACHE_SIZE);
-        Some(mapping_index)
+        })
+    }
+
+    #[inline]
+    fn mapping_lookup_for(&self, gpu_va: u64) -> Option<MappingLookupCacheEntry> {
+        MAPPING_LOOKUP_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.instance_id != self.instance_id || cache.generation != self.generation {
+                cache.instance_id = self.instance_id;
+                cache.generation = self.generation;
+                cache.entries = [None; MAPPING_LOOKUP_CACHE_SIZE];
+                cache.cursor = 0;
+            }
+            for cached in cache.entries.iter().flatten() {
+                if gpu_va >= cached.gpu_lo && gpu_va < cached.gpu_hi {
+                    debug_assert!(
+                        self.mappings
+                            .get(cached.mapping_index)
+                            .is_some_and(|mapping| Self::contains(mapping, gpu_va)),
+                        "stale GMMU lookup cache entry"
+                    );
+                    return Some(*cached);
+                }
+            }
+            let cached = self.mapping_lookup_slow(gpu_va)?;
+            let slot = cache.cursor % MAPPING_LOOKUP_CACHE_SIZE;
+            cache.entries[slot] = Some(cached);
+            cache.cursor = (slot + 1) % MAPPING_LOOKUP_CACHE_SIZE;
+            Some(cached)
+        })
+    }
+
+    #[inline]
+    fn mapping_index_for(&self, gpu_va: u64) -> Option<usize> {
+        Some(self.mapping_lookup_for(gpu_va)?.mapping_index)
     }
 
     pub fn add(&mut self, gpu_va: u64, size: u64, cpu_addr: u64, nvmap_id: u32) {
@@ -127,13 +170,16 @@ impl GpuMappings {
             cpu_addr,
             nvmap_id
         );
+        let epoch = self.next_mapping_epoch;
+        self.next_mapping_epoch = self.next_mapping_epoch.wrapping_add(1).max(1);
+        self.generation = self.generation.wrapping_add(1).max(1);
         self.mappings.push(GpuMapping {
             gpu_va,
             size,
             cpu_addr,
             nvmap_id,
+            epoch,
         });
-        self.clear_lookup_cache();
     }
 
     pub fn cpu_address_for_any32(&self, gpu_va: u64) -> Option<(u64, u64, u64)> {
@@ -190,7 +236,7 @@ impl GpuMappings {
     pub fn remove(&mut self, gpu_va: u64) -> Option<u64> {
         if let Some(pos) = self.mappings.iter().rposition(|m| m.gpu_va == gpu_va) {
             let size = self.mappings.remove(pos).size;
-            self.clear_lookup_cache();
+            self.generation = self.generation.wrapping_add(1).max(1);
             Some(size)
         } else {
             None
@@ -211,18 +257,10 @@ impl GpuMappings {
 
     #[inline]
     pub fn cpu_range_for(&self, gpu_va: u64) -> Option<(u64, u64)> {
-        let mapping_index = self.mapping_index_for(gpu_va)?;
-        let mapping = &self.mappings[mapping_index];
+        let cached = self.mapping_lookup_for(gpu_va)?;
+        let mapping = &self.mappings[cached.mapping_index];
         let offset = gpu_va - mapping.gpu_va;
-        let mapping_end = mapping.gpu_va.saturating_add(mapping.size);
-        let contiguous_end = self.mappings[mapping_index + 1..]
-            .iter()
-            .filter_map(|newer| {
-                (newer.gpu_va > gpu_va && newer.gpu_va < mapping_end).then_some(newer.gpu_va)
-            })
-            .min()
-            .unwrap_or(mapping_end);
-        Some((mapping.cpu_addr + offset, contiguous_end - gpu_va))
+        Some((mapping.cpu_addr + offset, cached.gpu_hi - gpu_va))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &GpuMapping> {
@@ -290,6 +328,16 @@ impl GpuMappings {
     pub fn nvmap_id_for(&self, gpu_va: u64) -> Option<u32> {
         Some(self.mappings[self.mapping_index_for(gpu_va)?].nvmap_id)
     }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[inline]
+    pub fn mapping_epoch_for(&self, gpu_va: u64) -> Option<u64> {
+        Some(self.mappings[self.mapping_index_for(gpu_va)?].epoch)
+    }
 }
 
 impl Default for GpuMappings {
@@ -298,8 +346,41 @@ impl Default for GpuMappings {
     }
 }
 
+impl GuestMemoryAccess {
+    fn new(mappings: Arc<RwLock<GpuMappings>>) -> Self {
+        Self {
+            mappings,
+            writer: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn set_writer(&self, writer: Option<GuestMemoryWriter>) {
+        *self.writer.lock() = writer;
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.writer.lock().is_some()
+    }
+
+    pub(crate) fn write_gpu(&self, gpu_va: u64, bytes: &[u8]) -> Option<(u64, bool)> {
+        let mappings = self.mappings.read();
+        self.write_gpu_with_mappings(&mappings, gpu_va, bytes)
+    }
+
+    pub(crate) fn write_gpu_with_mappings(
+        &self,
+        mappings: &GpuMappings,
+        gpu_va: u64,
+        bytes: &[u8],
+    ) -> Option<(u64, bool)> {
+        let cpu_addr = mappings.cpu_address_for(gpu_va)?;
+        let writer = self.writer.lock().clone()?;
+        Some((cpu_addr, writer(cpu_addr, bytes)))
+    }
+}
+
 pub struct GpuContext {
-    pub mappings: Arc<Mutex<GpuMappings>>,
+    pub mappings: Arc<RwLock<GpuMappings>>,
     pub maxwell3d: Arc<Mutex<Maxwell3D>>,
     pub maxwell_dma: Arc<Mutex<MaxwellDma>>,
     pub fermi_2d: Arc<Mutex<Fermi2D>>,
@@ -310,6 +391,29 @@ pub struct GpuContext {
     pub big_alloc: Arc<Mutex<flat_allocator::FlatAllocator>>,
     pub channels: Arc<Mutex<HashMap<u32, ChannelState>>>,
     pub stats: Arc<super::PipelineStats>,
+    guest_memory: GuestMemoryAccess,
+    decoder_stub_engines: Mutex<StubEngines>,
+}
+
+struct StubEngines {
+    maxwell_dma: MaxwellDma,
+    fermi_2d: Fermi2D,
+    kepler_compute: KeplerCompute,
+    kepler_memory: KeplerMemory,
+}
+
+pub(crate) fn gpu_pipeline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = matches!(
+            std::env::var("NEXIUM_GPU_PIPELINE").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        );
+        if on {
+            log::info!("nexium-nvdrv: GPU decode|prep pipeline ENABLED");
+        }
+        on
+    })
 }
 
 const BIG_VA_BASE: u64 = 0x4_0000_0000;
@@ -329,14 +433,18 @@ impl GpuContext {
     }
 
     pub fn with_stats(stats: Arc<super::PipelineStats>) -> Self {
+        let mappings = Arc::new(RwLock::new(GpuMappings::new()));
+        let guest_memory = GuestMemoryAccess::new(Arc::clone(&mappings));
+        let mut pusher = Pusher::new();
+        pusher.set_guest_memory_access(Some(guest_memory.clone()));
         Self {
-            mappings: Arc::new(Mutex::new(GpuMappings::new())),
+            mappings,
             maxwell3d: Arc::new(Mutex::new(Maxwell3D::new())),
             maxwell_dma: Arc::new(Mutex::new(MaxwellDma::new())),
             fermi_2d: Arc::new(Mutex::new(Fermi2D::new())),
             kepler_compute: Arc::new(Mutex::new(KeplerCompute::new())),
             kepler_memory: Arc::new(Mutex::new(KeplerMemory::new())),
-            pusher: Arc::new(Mutex::new(Pusher::new())),
+            pusher: Arc::new(Mutex::new(pusher)),
             small_alloc: Arc::new(Mutex::new(flat_allocator::FlatAllocator::new(
                 0x0400_0000,
                 BIG_VA_BASE,
@@ -347,7 +455,68 @@ impl GpuContext {
             ))),
             channels: Arc::new(Mutex::new(HashMap::new())),
             stats,
+            guest_memory,
+            decoder_stub_engines: Mutex::new(StubEngines {
+                maxwell_dma: MaxwellDma::new(),
+                fermi_2d: Fermi2D::new(),
+                kepler_compute: KeplerCompute::new(),
+                kepler_memory: KeplerMemory::new(),
+            }),
         }
+    }
+
+    pub(crate) fn install_prep_thread(&self, resources: prep::PrepThreadResources) {
+        let mut pusher = self.pusher.lock();
+        let previous = std::mem::replace(
+            &mut pusher.prep,
+            prep::PrepLane::Inline(prep::PrepState::new()),
+        );
+        let prep::PrepLane::Inline(state) = previous else {
+            pusher.prep = previous;
+            return;
+        };
+        let handle = prep::spawn_prep_thread(state, resources);
+        pusher.prep = prep::PrepLane::Threaded(handle);
+    }
+
+    pub(crate) fn prep_present(
+        &self,
+        job: crate::render_thread::RenderJob,
+        flush_small_rts: bool,
+    ) -> bool {
+        let mut pusher = self.pusher.lock();
+        match &mut pusher.prep {
+            prep::PrepLane::Threaded(handle) => {
+                handle.send(prep::PrepEvent::Present {
+                    job,
+                    flush_small_rts,
+                });
+                true
+            }
+            prep::PrepLane::Inline(_) => false,
+        }
+    }
+
+    pub(crate) fn prep_drain_barrier(
+        &self,
+        done: crossbeam::channel::Sender<()>,
+        flush_small_rts: bool,
+    ) -> bool {
+        let mut pusher = self.pusher.lock();
+        match &mut pusher.prep {
+            prep::PrepLane::Threaded(handle) => {
+                handle.send(prep::PrepEvent::DrainBarrier {
+                    done,
+                    flush_small_rts,
+                });
+                true
+            }
+            prep::PrepLane::Inline(_) => false,
+        }
+    }
+
+    pub fn set_guest_memory_writer(&self, writer: GuestMemoryWriter) {
+        self.guest_memory.set_writer(Some(writer));
     }
 
     pub fn alloc_gpu_va(&self, size: u64) -> u64 {
@@ -397,32 +566,152 @@ impl GpuContext {
         mem_read: impl Fn(u64, &mut [u8]) -> bool,
         mem_write: impl Fn(u64, &[u8]) -> bool,
         mem_copy: impl Fn(u64, u64, usize) -> bool,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
     ) -> (u32, u32) {
-        let kp_total = pusher::kickprof::start();
-        let kp_locks = pusher::kickprof::start();
-        let mut pusher = self.pusher.lock();
-        let mut maxwell = self.maxwell3d.lock();
-        let mut maxwell_dma = self.maxwell_dma.lock();
-        let mut fermi_2d = self.fermi_2d.lock();
-        let mut kepler_compute = self.kepler_compute.lock();
-        let mut kepler_memory = self.kepler_memory.lock();
-        let mappings = self.mappings.lock();
-        pusher::kickprof::add(pusher::kickprof::LOCKS, kp_locks);
-
-        pusher.process_gpfifo(
+        self.submit_gpfifo_with_boundary(
             address,
             num_entries,
-            &mappings,
-            &mut *maxwell,
-            &mut *maxwell_dma,
-            &mut *fermi_2d,
-            &mut *kepler_compute,
-            &mut *kepler_memory,
-            &*self.stats,
-            &mem_read,
-            &mem_write,
-            &mem_copy,
-        );
+            mem_read,
+            mem_write,
+            mem_copy,
+            true,
+            true,
+            on_complete,
+        )
+    }
+
+    pub fn submit_gpfifo_soft(
+        &self,
+        address: u64,
+        num_entries: u32,
+        mem_read: impl Fn(u64, &mut [u8]) -> bool,
+        mem_write: impl Fn(u64, &[u8]) -> bool,
+        mem_copy: impl Fn(u64, u64, usize) -> bool,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
+    ) -> (u32, u32) {
+        self.submit_gpfifo_with_boundary(
+            address,
+            num_entries,
+            mem_read,
+            mem_write,
+            mem_copy,
+            false,
+            true,
+            on_complete,
+        )
+    }
+
+    pub fn submit_gpfifo_soft_deferred(
+        &self,
+        address: u64,
+        num_entries: u32,
+        mem_read: impl Fn(u64, &mut [u8]) -> bool,
+        mem_write: impl Fn(u64, &[u8]) -> bool,
+        mem_copy: impl Fn(u64, u64, usize) -> bool,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
+    ) -> (u32, u32) {
+        self.submit_gpfifo_with_boundary(
+            address,
+            num_entries,
+            mem_read,
+            mem_write,
+            mem_copy,
+            false,
+            false,
+            on_complete,
+        )
+    }
+
+    fn submit_gpfifo_with_boundary(
+        &self,
+        address: u64,
+        num_entries: u32,
+        mem_read: impl Fn(u64, &mut [u8]) -> bool,
+        mem_write: impl Fn(u64, &[u8]) -> bool,
+        mem_copy: impl Fn(u64, u64, usize) -> bool,
+        hard_after: bool,
+        writeback_small_rts: bool,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
+    ) -> (u32, u32) {
+        let kp_total = pusher::kickprof::kick_start();
+        let kp_locks = pusher::kickprof::start();
+        let mut pusher = self.pusher.lock();
+        let threaded = pusher.prep.is_threaded();
+        let mut maxwell = self.maxwell3d.lock();
+        let mut stub = threaded.then(|| self.decoder_stub_engines.lock());
+        let mut dma_guard = (!threaded).then(|| self.maxwell_dma.lock());
+        let mut fermi_guard = (!threaded).then(|| self.fermi_2d.lock());
+        let mut kc_guard = (!threaded).then(|| self.kepler_compute.lock());
+        let mut km_guard = (!threaded).then(|| self.kepler_memory.lock());
+        let (maxwell_dma, fermi_2d, kepler_compute, kepler_memory) = match stub.as_mut() {
+            Some(stub) => {
+                let stub = &mut **stub;
+                (
+                    &mut stub.maxwell_dma,
+                    &mut stub.fermi_2d,
+                    &mut stub.kepler_compute,
+                    &mut stub.kepler_memory,
+                )
+            }
+            None => (
+                &mut **dma_guard.as_mut().unwrap(),
+                &mut **fermi_guard.as_mut().unwrap(),
+                &mut **kc_guard.as_mut().unwrap(),
+                &mut **km_guard.as_mut().unwrap(),
+            ),
+        };
+        let mappings = self.mappings.read();
+        pusher::kickprof::add(pusher::kickprof::LOCKS, kp_locks);
+
+        if hard_after {
+            pusher.process_gpfifo(
+                address,
+                num_entries,
+                &mappings,
+                &mut *maxwell,
+                maxwell_dma,
+                fermi_2d,
+                kepler_compute,
+                kepler_memory,
+                &*self.stats,
+                &mem_read,
+                &mem_write,
+                &mem_copy,
+                on_complete,
+            );
+        } else if writeback_small_rts {
+            pusher.process_gpfifo_soft(
+                address,
+                num_entries,
+                &mappings,
+                &mut *maxwell,
+                maxwell_dma,
+                fermi_2d,
+                kepler_compute,
+                kepler_memory,
+                &*self.stats,
+                &mem_read,
+                &mem_write,
+                &mem_copy,
+                on_complete,
+            );
+        } else {
+            pusher.process_gpfifo_soft_deferred(
+                address,
+                num_entries,
+                &mappings,
+                &mut *maxwell,
+                maxwell_dma,
+                fermi_2d,
+                kepler_compute,
+                kepler_memory,
+                &*self.stats,
+                &mem_read,
+                &mem_write,
+                &mem_copy,
+                on_complete,
+            );
+        }
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         pusher::kickprof::kick_done(kp_total);
 
@@ -437,22 +726,101 @@ impl GpuContext {
         mem_read: impl Fn(u64, &mut [u8]) -> bool,
         mem_write: impl Fn(u64, &[u8]) -> bool,
         mem_copy: impl Fn(u64, u64, usize) -> bool,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
+    ) -> (u32, u32) {
+        self.process_inline_gpfifo_with_options(
+            entries,
+            mem_read,
+            mem_write,
+            mem_copy,
+            true,
+            true,
+            on_complete,
+        )
+    }
+
+    pub fn process_inline_gpfifo_soft(
+        &self,
+        entries: &[CommandListHeader],
+        mem_read: impl Fn(u64, &mut [u8]) -> bool,
+        mem_write: impl Fn(u64, &[u8]) -> bool,
+        mem_copy: impl Fn(u64, u64, usize) -> bool,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
+    ) -> (u32, u32) {
+        self.process_inline_gpfifo_with_options(
+            entries,
+            mem_read,
+            mem_write,
+            mem_copy,
+            false,
+            true,
+            on_complete,
+        )
+    }
+
+    pub fn process_inline_gpfifo_soft_deferred(
+        &self,
+        entries: &[CommandListHeader],
+        mem_read: impl Fn(u64, &mut [u8]) -> bool,
+        mem_write: impl Fn(u64, &[u8]) -> bool,
+        mem_copy: impl Fn(u64, u64, usize) -> bool,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
+    ) -> (u32, u32) {
+        self.process_inline_gpfifo_with_options(
+            entries,
+            mem_read,
+            mem_write,
+            mem_copy,
+            false,
+            false,
+            on_complete,
+        )
+    }
+
+    fn process_inline_gpfifo_with_options(
+        &self,
+        entries: &[CommandListHeader],
+        mem_read: impl Fn(u64, &mut [u8]) -> bool,
+        mem_write: impl Fn(u64, &[u8]) -> bool,
+        mem_copy: impl Fn(u64, u64, usize) -> bool,
+        hard_after: bool,
+        writeback_small_rts: bool,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
     ) -> (u32, u32) {
         let profile = nvprof_enabled();
-        let kp_total = pusher::kickprof::start();
+        let kp_total = pusher::kickprof::kick_start();
         let kp_locks = pusher::kickprof::start();
         let t0 = std::time::Instant::now();
         let mut pusher = self.pusher.lock();
+        let threaded = pusher.prep.is_threaded();
         let mut maxwell = self.maxwell3d.lock();
-        let mut maxwell_dma = self.maxwell_dma.lock();
-        let mut fermi_2d = self.fermi_2d.lock();
-        let mut kepler_compute = self.kepler_compute.lock();
-        let mut kepler_memory = self.kepler_memory.lock();
-        let mappings = self.mappings.lock();
+        let mut stub = threaded.then(|| self.decoder_stub_engines.lock());
+        let mut dma_guard = (!threaded).then(|| self.maxwell_dma.lock());
+        let mut fermi_guard = (!threaded).then(|| self.fermi_2d.lock());
+        let mut kc_guard = (!threaded).then(|| self.kepler_compute.lock());
+        let mut km_guard = (!threaded).then(|| self.kepler_memory.lock());
+        let (maxwell_dma, fermi_2d, kepler_compute, kepler_memory) = match stub.as_mut() {
+            Some(stub) => {
+                let stub = &mut **stub;
+                (
+                    &mut stub.maxwell_dma,
+                    &mut stub.fermi_2d,
+                    &mut stub.kepler_compute,
+                    &mut stub.kepler_memory,
+                )
+            }
+            None => (
+                &mut **dma_guard.as_mut().unwrap(),
+                &mut **fermi_guard.as_mut().unwrap(),
+                &mut **kc_guard.as_mut().unwrap(),
+                &mut **km_guard.as_mut().unwrap(),
+            ),
+        };
+        let mappings = self.mappings.read();
         pusher::kickprof::add(pusher::kickprof::LOCKS, kp_locks);
         let locks_ms = if profile { elapsed_ms(t0) } else { 0.0 };
 
-        pusher.begin_ssbo_snapshot_epoch();
+        pusher.prep_kick_begin();
 
         let t_entries = std::time::Instant::now();
         let addrs: Vec<u64> = entries.iter().map(|e| e.address()).collect();
@@ -466,10 +834,10 @@ impl GpuContext {
                 entry,
                 &mappings,
                 &mut *maxwell,
-                &mut *maxwell_dma,
-                &mut *fermi_2d,
-                &mut *kepler_compute,
-                &mut *kepler_memory,
+                maxwell_dma,
+                fermi_2d,
+                kepler_compute,
+                kepler_memory,
                 &*self.stats,
                 &mem_read,
                 &mem_write,
@@ -479,15 +847,15 @@ impl GpuContext {
         pusher.entry_word_limit = 0;
         let entries_ms = if profile { elapsed_ms(t_entries) } else { 0.0 };
         let t_flush = std::time::Instant::now();
-        pusher.resolve_pending_compute(&mappings, &mem_write);
-        pusher.flush_vk(&mappings, &mem_read, &mem_write);
-        if let Some(r) = pusher.renderer.clone() {
-            let kp_wb = pusher::kickprof::start();
-            vk_dispatch::writeback_small_rts(&r, &mappings, &mem_write);
-            pusher::kickprof::add(pusher::kickprof::SMALLRT, kp_wb);
-        }
+        pusher.prep_kick_end(
+            hard_after,
+            writeback_small_rts,
+            on_complete,
+            &mappings,
+            &mem_read,
+            &mem_write,
+        );
         vk_dispatch::guest_probe(&mappings, &mem_read);
-        pusher.end_ssbo_snapshot_epoch();
         let flush_ms = if profile { elapsed_ms(t_flush) } else { 0.0 };
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         pusher::kickprof::kick_done(kp_total);
@@ -504,11 +872,37 @@ impl GpuContext {
         (0, pusher.syncpt_value)
     }
 
+    pub fn flush_small_rt_writebacks(&self, mem_write: impl Fn(u64, &[u8]) -> bool) -> bool {
+        let mut pusher = self.pusher.lock();
+        let mappings = self.mappings.read();
+        let Some(state) = pusher.prep.inline_state() else {
+            return false;
+        };
+        let Some(renderer) = state.renderer.clone() else {
+            return false;
+        };
+        state.writeback_small_rts(&renderer, &mappings, &mem_write)
+    }
+
+    pub(crate) fn flush_prepared_draw_packets(&self) -> bool {
+        match self.pusher.lock().prep.inline_state() {
+            Some(state) => state.flush_prepared_draw_packets(),
+            None => false,
+        }
+    }
+
+    pub(crate) fn has_prepared_draw_packets(&self) -> bool {
+        match self.pusher.lock().prep.inline_state() {
+            Some(state) => state.has_prepared_draw_packets(),
+            None => false,
+        }
+    }
+
     pub fn read_rt(
         &self,
         mem_read: impl Fn(u64, &mut [u8]) -> bool,
     ) -> Option<(u32, u32, Vec<u8>)> {
-        let mappings = self.mappings.lock();
+        let mappings = self.mappings.read();
         let maxwell = self.maxwell3d.lock();
         let rt = &maxwell.regs.rt[0];
         if rt.width == 0 || rt.height == 0 {
@@ -534,7 +928,67 @@ impl Default for GpuContext {
 
 #[cfg(test)]
 mod tests {
-    use super::GpuMappings;
+    use super::{GpuContext, GpuMappings, GuestMemoryAccess};
+    use parking_lot::RwLock;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    #[test]
+    fn guest_memory_access_resolves_latest_mapping_when_written() {
+        let mappings = Arc::new(RwLock::new(GpuMappings::new()));
+        mappings.write().add(0x1000, 0x1000, 0x1_0000, 1);
+        let access = GuestMemoryAccess::new(Arc::clone(&mappings));
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let writer_observed = Arc::clone(&observed);
+        access.set_writer(Some(Arc::new(move |cpu_addr, bytes| {
+            writer_observed
+                .lock()
+                .unwrap()
+                .push((cpu_addr, bytes.to_vec()));
+            true
+        })));
+
+        assert_eq!(mappings.write().remove(0x1000), Some(0x1000));
+        mappings.write().add(0x1000, 0x1000, 0x2_0000, 2);
+
+        assert_eq!(
+            access.write_gpu(0x1080, &[1, 2, 3, 4]),
+            Some((0x2_0080, true))
+        );
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![(0x2_0080, vec![1, 2, 3, 4])]
+        );
+    }
+
+    #[test]
+    fn guest_memory_access_keeps_mapping_locked_through_write() {
+        let mappings = Arc::new(RwLock::new(GpuMappings::new()));
+        mappings.write().add(0x1000, 0x1000, 0x1_0000, 1);
+        let access = GuestMemoryAccess::new(Arc::clone(&mappings));
+        let writer_mappings = Arc::clone(&mappings);
+        access.set_writer(Some(Arc::new(move |_, _| {
+            assert!(writer_mappings.try_write().is_none());
+            true
+        })));
+
+        assert_eq!(access.write_gpu(0x1000, &[7]), Some((0x1_0000, true)));
+    }
+
+    #[test]
+    fn present_and_queue_barrier_use_the_hard_prepared_packet_drain() {
+        let gpu = GpuContext::new();
+
+        assert!(gpu.flush_prepared_draw_packets());
+        assert!(gpu.flush_prepared_draw_packets());
+
+        assert_eq!(
+            gpu.pusher
+                .lock()
+                .inline_prep()
+                .prepared_packet_drain_counts(),
+            (2, 0)
+        );
+    }
 
     #[test]
     fn cpu_range_aliases_include_partial_overlaps() {
@@ -557,10 +1011,13 @@ mod tests {
         mappings.add(0x1800, 0x200, 0x3_0000, 3);
 
         assert_eq!(mappings.cpu_address_for(0x1200), Some(0x1_0200));
-        let cursor_after_miss = mappings.lookup_cache_cursor.get();
+        let cursor_after_miss = super::MAPPING_LOOKUP_CACHE.with(|cache| cache.borrow().cursor);
 
         assert_eq!(mappings.nvmap_id_for(0x1300), Some(1));
-        assert_eq!(mappings.lookup_cache_cursor.get(), cursor_after_miss);
+        assert_eq!(
+            super::MAPPING_LOOKUP_CACHE.with(|cache| cache.borrow().cursor),
+            cursor_after_miss
+        );
 
         assert_eq!(mappings.cpu_address_for(0x1500), Some(0x2_0100));
         assert_eq!(mappings.nvmap_id_for(0x1900), Some(3));
@@ -578,23 +1035,15 @@ mod tests {
         mappings.add(0x1000, 0x1000, 0x1_0000, 1);
 
         assert_eq!(mappings.cpu_address_for(0x1500), Some(0x1_0500));
-        assert!(mappings
-            .lookup_cache
-            .iter()
-            .any(|entry| entry.get().is_some()));
+        let generation_before = mappings.generation;
 
         mappings.add(0x1400, 0x200, 0x2_0000, 2);
-        assert!(mappings
-            .lookup_cache
-            .iter()
-            .all(|entry| entry.get().is_none()));
+        assert_ne!(mappings.generation, generation_before);
         assert_eq!(mappings.cpu_address_for(0x1500), Some(0x2_0100));
 
+        let generation_before = mappings.generation;
         assert_eq!(mappings.remove(0x1400), Some(0x200));
-        assert!(mappings
-            .lookup_cache
-            .iter()
-            .all(|entry| entry.get().is_none()));
+        assert_ne!(mappings.generation, generation_before);
         assert_eq!(mappings.cpu_address_for(0x1500), Some(0x1_0500));
         assert_eq!(mappings.nvmap_id_for(0x1500), Some(1));
     }

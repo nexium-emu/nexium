@@ -1,12 +1,397 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::{Arc, OnceLock};
+use crossbeam::channel::{
+    bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError,
+};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
+
+use crate::gpu::vk_dispatch::PreparedDrawBatch;
 
 pub type RenderJob = Box<dyn FnOnce() + Send + 'static>;
 
+enum RenderWork {
+    Job(&'static str, RenderJob),
+    Draw(PreparedDrawBatch),
+    DrawGroup(Vec<PreparedDrawBatch>),
+}
+
 pub struct RenderThread {
-    tx: SyncSender<RenderJob>,
+    tx: Sender<RenderWork>,
     pending: Arc<AtomicUsize>,
+    draw_tail: Mutex<Option<Weak<AtomicBool>>>,
+}
+
+const MAX_DRAW_GROUPS_PER_SUBMISSION: usize = 256;
+const DRAW_GATHER_GRACE: Duration = Duration::from_micros(200);
+
+fn draw_gather_grace() -> Duration {
+    static GRACE: OnceLock<Duration> = OnceLock::new();
+    *GRACE.get_or_init(|| {
+        let micros = std::env::var("NEXIUM_RENDER_GATHER_GRACE_US")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&value| (50..=2_000).contains(&value))
+            .unwrap_or(DRAW_GATHER_GRACE.as_micros() as u64);
+        Duration::from_micros(micros)
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawGatherEndReason {
+    Hard,
+    Job,
+    Compatibility,
+    Renderer,
+    Count,
+    Ring,
+    Deadline,
+    Disconnected,
+}
+
+impl DrawGatherEndReason {
+    const COUNT: usize = 8;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+static DRAW_GATHER_END_COUNTS: [AtomicUsize; DrawGatherEndReason::COUNT] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+
+fn draw_group_fit_end_reason(
+    group_count: usize,
+    ring_bytes: u64,
+    same_renderer: bool,
+    next_ring_bytes: u64,
+) -> Option<DrawGatherEndReason> {
+    if !same_renderer {
+        return Some(DrawGatherEndReason::Renderer);
+    }
+    if group_count >= MAX_DRAW_GROUPS_PER_SUBMISSION {
+        return Some(DrawGatherEndReason::Count);
+    }
+    if !ring_bytes
+        .checked_add(next_ring_bytes)
+        .is_some_and(|sum| sum <= nexium_gpu::renderer::GRAPHICS_RING_SAFE_BATCH_BYTES)
+    {
+        return Some(DrawGatherEndReason::Ring);
+    }
+    None
+}
+
+#[cfg(test)]
+fn draw_group_fits(
+    group_count: usize,
+    ring_bytes: u64,
+    same_renderer: bool,
+    next_ring_bytes: u64,
+) -> bool {
+    draw_group_fit_end_reason(group_count, ring_bytes, same_renderer, next_ring_bytes).is_none()
+}
+
+fn sealed_candidate_end_reason(is_job: bool) -> DrawGatherEndReason {
+    if is_job {
+        DrawGatherEndReason::Job
+    } else {
+        DrawGatherEndReason::Hard
+    }
+}
+
+fn rejected_draw_end_reason(fit_end_reason: Option<DrawGatherEndReason>) -> DrawGatherEndReason {
+    fit_end_reason.unwrap_or(DrawGatherEndReason::Compatibility)
+}
+
+fn recv_group_candidate<T>(
+    rx: &Receiver<T>,
+    gather_deadline: Instant,
+    hard_after: impl Fn() -> bool,
+) -> Result<T, DrawGatherEndReason> {
+    if hard_after() {
+        return Err(DrawGatherEndReason::Hard);
+    }
+    match rx.try_recv() {
+        Ok(received) => Ok(received),
+        Err(TryRecvError::Disconnected) => Err(DrawGatherEndReason::Disconnected),
+        Err(TryRecvError::Empty) => {
+            if hard_after() {
+                return Err(DrawGatherEndReason::Hard);
+            }
+            let remaining = gather_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(DrawGatherEndReason::Deadline);
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(received) => Ok(received),
+                Err(RecvTimeoutError::Timeout) => Err(DrawGatherEndReason::Deadline),
+                Err(RecvTimeoutError::Disconnected) => Err(DrawGatherEndReason::Disconnected),
+            }
+        }
+    }
+}
+
+fn recv_draw_candidate(
+    rx: &Receiver<RenderWork>,
+    queued_draws: &mut VecDeque<PreparedDrawBatch>,
+    gather_deadline: Instant,
+    hard_after: impl Fn() -> bool,
+) -> Result<RenderWork, DrawGatherEndReason> {
+    if hard_after() {
+        return Err(DrawGatherEndReason::Hard);
+    }
+    if let Some(draw) = queued_draws.pop_front() {
+        return Ok(RenderWork::Draw(draw));
+    }
+    recv_group_candidate(rx, gather_deadline, hard_after)
+}
+
+fn seal_draw_tail_locked(draw_tail: &mut Option<Weak<AtomicBool>>) {
+    if let Some(flag) = draw_tail.take().and_then(|flag| flag.upgrade()) {
+        flag.store(true, Ordering::Release);
+    }
+}
+
+fn retain_received_if_unsealed<T>(received: T, hard_after: impl FnOnce() -> bool) -> Result<T, T> {
+    if hard_after() {
+        Err(received)
+    } else {
+        Ok(received)
+    }
+}
+
+fn execute_job(label: &'static str, job: RenderJob, worker_pending: &AtomicUsize) {
+    let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
+    let started = profile.then(std::time::Instant::now);
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+        log::error!("[render-job] job panicked; worker continuing");
+    }
+    if let Some(started) = started {
+        if label == "clear" {
+            static CLEAR_JOBS: AtomicUsize = AtomicUsize::new(0);
+            let n = CLEAR_JOBS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 128 == 0 {
+                log::warn!("[render-clear] jobs={}", n);
+            }
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(10) {
+            log::warn!(
+                "[render-job] worker={} label={} elapsed_ms={:.3}",
+                std::thread::current().name().unwrap_or("nexium-render"),
+                label,
+                elapsed.as_secs_f64() * 1000.0,
+            );
+        }
+    }
+    worker_pending.fetch_sub(1, Ordering::Release);
+}
+
+fn execute_draw_groups(draws: Vec<PreparedDrawBatch>, worker_pending: &AtomicUsize) {
+    let group_count = draws.len();
+    let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
+    let started = profile.then(std::time::Instant::now);
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::gpu::vk_dispatch::execute_prepared_draw_batches(draws)
+    }))
+    .is_err()
+    {
+        log::error!("[render-job] grouped draw batch panicked; worker continuing");
+    }
+    if let Some(started) = started {
+        let elapsed = started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(10) {
+            log::warn!(
+                "[render-job] worker={} elapsed_ms={:.3} draw_groups={}",
+                std::thread::current().name().unwrap_or("nexium-render"),
+                elapsed.as_secs_f64() * 1000.0,
+                group_count,
+            );
+        }
+    }
+    worker_pending.fetch_sub(group_count, Ordering::Release);
+}
+
+fn profile_draw_gather(group_count: usize, hard_after: bool, end_reason: DrawGatherEndReason) {
+    if std::env::var_os("NEXIUM_RENDER_PROFILE").is_none() {
+        return;
+    }
+    static SUBMISSIONS: AtomicUsize = AtomicUsize::new(0);
+    static GROUPS: AtomicUsize = AtomicUsize::new(0);
+    static HARD: AtomicUsize = AtomicUsize::new(0);
+    static SINGLES: AtomicUsize = AtomicUsize::new(0);
+    GROUPS.fetch_add(group_count, Ordering::Relaxed);
+    HARD.fetch_add(usize::from(hard_after), Ordering::Relaxed);
+    SINGLES.fetch_add(usize::from(group_count == 1), Ordering::Relaxed);
+    DRAW_GATHER_END_COUNTS[end_reason.index()].fetch_add(1, Ordering::Relaxed);
+    let submissions = SUBMISSIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if submissions % 64 == 0 {
+        let groups = GROUPS.swap(0, Ordering::Relaxed);
+        let hard = HARD.swap(0, Ordering::Relaxed);
+        let singles = SINGLES.swap(0, Ordering::Relaxed);
+        log::warn!(
+            "[render-gather-window] submissions=64 groups={} avg_groups={:.2} hard={} singles={}",
+            groups,
+            groups as f64 / 64.0,
+            hard,
+            singles,
+        );
+        let hard_end =
+            DRAW_GATHER_END_COUNTS[DrawGatherEndReason::Hard.index()].swap(0, Ordering::Relaxed);
+        let job_end =
+            DRAW_GATHER_END_COUNTS[DrawGatherEndReason::Job.index()].swap(0, Ordering::Relaxed);
+        let compatibility_end = DRAW_GATHER_END_COUNTS[DrawGatherEndReason::Compatibility.index()]
+            .swap(0, Ordering::Relaxed);
+        let renderer_end = DRAW_GATHER_END_COUNTS[DrawGatherEndReason::Renderer.index()]
+            .swap(0, Ordering::Relaxed);
+        let count_end =
+            DRAW_GATHER_END_COUNTS[DrawGatherEndReason::Count.index()].swap(0, Ordering::Relaxed);
+        let ring_end =
+            DRAW_GATHER_END_COUNTS[DrawGatherEndReason::Ring.index()].swap(0, Ordering::Relaxed);
+        let deadline_end = DRAW_GATHER_END_COUNTS[DrawGatherEndReason::Deadline.index()]
+            .swap(0, Ordering::Relaxed);
+        let disconnected_end = DRAW_GATHER_END_COUNTS[DrawGatherEndReason::Disconnected.index()]
+            .swap(0, Ordering::Relaxed);
+        log::warn!(
+            "[render-gather-reasons] submissions=64 hard={} job={} compat={} renderer={} count={} ring={} deadline={} disconnected={}",
+            hard_end,
+            job_end,
+            compatibility_end,
+            renderer_end,
+            count_end,
+            ring_end,
+            deadline_end,
+            disconnected_end,
+        );
+    }
+}
+
+fn render_worker(rx: Receiver<RenderWork>, worker_pending: Arc<AtomicUsize>) {
+    let mut lookahead = None;
+    let mut queued_draws = VecDeque::new();
+    loop {
+        let work = match lookahead.take() {
+            Some(work) => work,
+            None => {
+                if let Some(draw) = queued_draws.pop_front() {
+                    RenderWork::Draw(draw)
+                } else {
+                    match rx.recv() {
+                        Ok(work) => work,
+                        Err(_) => break,
+                    }
+                }
+            }
+        };
+        match work {
+            RenderWork::Job(label, job) => execute_job(label, job, &worker_pending),
+            RenderWork::DrawGroup(group) => {
+                queued_draws.extend(group);
+            }
+            RenderWork::Draw(first) => {
+                let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
+                let gather_started = profile.then(Instant::now);
+                let mut compatibility_elapsed = Duration::ZERO;
+                let mut compatibility_checks = 0usize;
+                let mut compatibility_rejects = 0usize;
+                let mut ring_bytes = first.ring_upper_bytes();
+                let mut compatibility = first.compatibility().clone();
+                let mut draws = vec![first];
+                let gather_deadline = Instant::now() + draw_gather_grace();
+                let end_reason = loop {
+                    if draws.last().is_some_and(PreparedDrawBatch::hard_after) {
+                        break DrawGatherEndReason::Hard;
+                    }
+                    let next =
+                        match recv_draw_candidate(&rx, &mut queued_draws, gather_deadline, || {
+                            draws.last().is_some_and(PreparedDrawBatch::hard_after)
+                        }) {
+                            Ok(next) => next,
+                            Err(reason) => break reason,
+                        };
+                    let next = match retain_received_if_unsealed(next, || {
+                        draws.last().is_some_and(PreparedDrawBatch::hard_after)
+                    }) {
+                        Ok(next) => next,
+                        Err(next) => {
+                            let reason =
+                                sealed_candidate_end_reason(matches!(&next, RenderWork::Job(_, _)));
+                            lookahead = Some(next);
+                            break reason;
+                        }
+                    };
+                    match next {
+                        RenderWork::Draw(next_draw) => {
+                            let fit_end_reason = draw_group_fit_end_reason(
+                                draws.len(),
+                                ring_bytes,
+                                draws[0].same_renderer(&next_draw),
+                                next_draw.ring_upper_bytes(),
+                            );
+                            let fits = fit_end_reason.is_none();
+                            let compatible = if fits {
+                                let started = profile.then(Instant::now);
+                                compatibility_checks += 1;
+                                let compatible =
+                                    compatibility.compatible_with_later(next_draw.compatibility());
+                                compatibility_rejects += usize::from(!compatible);
+                                if let Some(started) = started {
+                                    compatibility_elapsed += started.elapsed();
+                                }
+                                compatible
+                            } else {
+                                false
+                            };
+                            if !compatible {
+                                lookahead = Some(RenderWork::Draw(next_draw));
+                                break rejected_draw_end_reason(fit_end_reason);
+                            }
+                            ring_bytes = ring_bytes.saturating_add(next_draw.ring_upper_bytes());
+                            compatibility.extend(next_draw.compatibility());
+                            draws.push(next_draw);
+                        }
+                        RenderWork::DrawGroup(group) => {
+                            queued_draws.extend(group);
+                            continue;
+                        }
+                        next => {
+                            lookahead = Some(next);
+                            break DrawGatherEndReason::Job;
+                        }
+                    }
+                };
+                if let Some(gather_started) = gather_started {
+                    let gather_elapsed = gather_started.elapsed();
+                    if draws.len() == MAX_DRAW_GROUPS_PER_SUBMISSION
+                        || compatibility_elapsed >= Duration::from_millis(1)
+                    {
+                        log::warn!(
+                            "[render-gather] groups={} gather_ms={:.3} compat_ms={:.3} checks={} rejects={}",
+                            draws.len(),
+                            gather_elapsed.as_secs_f64() * 1000.0,
+                            compatibility_elapsed.as_secs_f64() * 1000.0,
+                            compatibility_checks,
+                            compatibility_rejects,
+                        );
+                    }
+                }
+                profile_draw_gather(
+                    draws.len(),
+                    draws.last().is_some_and(PreparedDrawBatch::hard_after),
+                    end_reason,
+                );
+                execute_draw_groups(draws, &worker_pending);
+            }
+        }
+    }
 }
 
 impl RenderThread {
@@ -16,31 +401,18 @@ impl RenderThread {
 
     fn new_named(name: &str) -> Self {
         let queue_depth = render_queue_depth();
-        let (tx, rx) = sync_channel::<RenderJob>(queue_depth);
+        let (tx, rx) = bounded::<RenderWork>(queue_depth);
         let pending = Arc::new(AtomicUsize::new(0));
         let worker_pending = pending.clone();
         std::thread::Builder::new()
             .name(name.to_string())
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
-                    let started = profile.then(std::time::Instant::now);
-                    job();
-                    if let Some(started) = started {
-                        let elapsed = started.elapsed();
-                        if elapsed >= std::time::Duration::from_millis(10) {
-                            log::warn!(
-                                "[render-job] worker={} elapsed_ms={:.3}",
-                                std::thread::current().name().unwrap_or("nexium-render"),
-                                elapsed.as_secs_f64() * 1000.0,
-                            );
-                        }
-                    }
-                    worker_pending.fetch_sub(1, Ordering::Release);
-                }
-            })
+            .spawn(move || render_worker(rx, worker_pending))
             .expect("spawn render worker thread");
-        RenderThread { tx, pending }
+        RenderThread {
+            tx,
+            pending,
+            draw_tail: Mutex::new(None),
+        }
     }
 
     pub fn submit(&self, job: RenderJob) {
@@ -50,10 +422,13 @@ impl RenderThread {
     pub fn submit_named(&self, label: &'static str, job: RenderJob) {
         let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
         let started = profile.then(std::time::Instant::now);
+        let mut draw_tail = self.draw_tail.lock().unwrap();
+        seal_draw_tail_locked(&mut draw_tail);
         self.pending.fetch_add(1, Ordering::AcqRel);
-        if self.tx.send(job).is_err() {
+        if self.tx.send(RenderWork::Job(label, job)).is_err() {
             self.pending.fetch_sub(1, Ordering::Release);
         }
+        drop(draw_tail);
         if let Some(started) = started {
             let elapsed = started.elapsed();
             if elapsed >= std::time::Duration::from_millis(1) {
@@ -67,18 +442,16 @@ impl RenderThread {
     }
 
     pub fn try_submit(&self, job: RenderJob) -> bool {
+        let mut draw_tail = self.draw_tail.lock().unwrap();
+        seal_draw_tail_locked(&mut draw_tail);
         self.pending.fetch_add(1, Ordering::AcqRel);
-        match self.tx.try_send(job) {
+        match self.tx.try_send(RenderWork::Job("unnamed", job)) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.pending.fetch_sub(1, Ordering::Release);
                 false
             }
         }
-    }
-
-    pub(crate) fn has_pending_jobs(&self) -> bool {
-        self.pending.load(Ordering::Acquire) != 0
     }
 
     pub fn submit_timeout(&self, job: RenderJob, timeout: std::time::Duration) -> bool {
@@ -93,24 +466,14 @@ impl RenderThread {
     ) -> bool {
         let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
         let started = profile.then(std::time::Instant::now);
-        let deadline = std::time::Instant::now() + timeout;
-        let mut job = job;
-        let submitted = loop {
-            self.pending.fetch_add(1, Ordering::AcqRel);
-            match self.tx.try_send(job) {
-                Ok(()) => break true,
-                Err(TrySendError::Full(j)) => {
-                    self.pending.fetch_sub(1, Ordering::Release);
-                    if std::time::Instant::now() >= deadline {
-                        break false;
-                    }
-                    job = j;
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    self.pending.fetch_sub(1, Ordering::Release);
-                    break false;
-                }
+        let mut draw_tail = self.draw_tail.lock().unwrap();
+        seal_draw_tail_locked(&mut draw_tail);
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        let submitted = match self.tx.send_timeout(RenderWork::Job(label, job), timeout) {
+            Ok(()) => true,
+            Err(SendTimeoutError::Timeout(_)) | Err(SendTimeoutError::Disconnected(_)) => {
+                self.pending.fetch_sub(1, Ordering::Release);
+                false
             }
         };
         if let Some(started) = started {
@@ -125,6 +488,91 @@ impl RenderThread {
         }
         submitted
     }
+
+    pub(crate) fn submit_draw_group_timeout_named(
+        &self,
+        label: &'static str,
+        draws: Vec<PreparedDrawBatch>,
+        timeout: std::time::Duration,
+    ) -> bool {
+        if draws.is_empty() {
+            return true;
+        }
+        let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
+        let started = profile.then(std::time::Instant::now);
+        let hard_after = draws.last().is_some_and(PreparedDrawBatch::hard_after);
+        let hard_after_handle = draws
+            .last()
+            .and_then(|draw| (!hard_after).then(|| draw.hard_after_handle()));
+        let draw_count = draws.len();
+        let mut draw_tail = self.draw_tail.lock().unwrap();
+        self.pending.fetch_add(draw_count, Ordering::AcqRel);
+        let submitted = match self.tx.send_timeout(RenderWork::DrawGroup(draws), timeout) {
+            Ok(()) => {
+                if hard_after {
+                    *draw_tail = None;
+                } else {
+                    *draw_tail = hard_after_handle;
+                }
+                true
+            }
+            Err(SendTimeoutError::Timeout(_) | SendTimeoutError::Disconnected(_)) => {
+                self.pending.fetch_sub(draw_count, Ordering::Release);
+                if hard_after {
+                    seal_draw_tail_locked(&mut draw_tail);
+                }
+                false
+            }
+        };
+        drop(draw_tail);
+        if let Some(started) = started {
+            let elapsed = started.elapsed();
+            if elapsed >= std::time::Duration::from_millis(1) {
+                log::warn!(
+                    "[render-submit] label={} chunks={} blocked_ms={:.3}",
+                    label,
+                    draw_count,
+                    elapsed.as_secs_f64() * 1000.0,
+                );
+            }
+        }
+        submitted
+    }
+
+    pub(crate) fn flush_draw_chunk_timeout_named(
+        &self,
+        label: &'static str,
+        draws: Vec<PreparedDrawBatch>,
+        timeout: std::time::Duration,
+    ) -> bool {
+        self.submit_draw_group_timeout_named(label, draws, timeout)
+    }
+
+    pub(crate) fn finish(&self, timeout: std::time::Duration) -> bool {
+        if self.is_idle() {
+            return true;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        if !self.submit_timeout_named(
+            "scheduler-finish",
+            Box::new(move || {
+                let _ = tx.send(());
+            }),
+            timeout,
+        ) {
+            return false;
+        }
+        rx.recv_timeout(timeout).is_ok()
+    }
+
+    pub(crate) fn seal_draw_tail(&self) {
+        let mut draw_tail = self.draw_tail.lock().unwrap();
+        seal_draw_tail_locked(&mut draw_tail);
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+    }
 }
 
 fn render_queue_depth() -> usize {
@@ -132,7 +580,7 @@ fn render_queue_depth() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|depth| *depth > 0)
-        .unwrap_or(32)
+        .unwrap_or(256)
 }
 
 fn async_render_enabled() -> bool {
@@ -173,22 +621,44 @@ pub fn present_thread() -> &'static RenderThread {
 
 fn dedicated_present_thread() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("NEXIUM_DEDICATED_PRESENT_THREAD").is_some())
+    *V.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_DEDICATED_PRESENT_THREAD")
+                .ok()
+                .as_deref(),
+            Some("0")
+                | Some("false")
+                | Some("FALSE")
+                | Some("off")
+                | Some("OFF")
+                | Some("no")
+                | Some("NO")
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RenderThread;
+    use super::{
+        draw_group_fit_end_reason, draw_group_fits, recv_group_candidate, rejected_draw_end_reason,
+        retain_received_if_unsealed, seal_draw_tail_locked, sealed_candidate_end_reason,
+        DrawGatherEndReason, RenderThread, DRAW_GATHER_GRACE, MAX_DRAW_GROUPS_PER_SUBMISSION,
+    };
+    use crossbeam::channel::bounded;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn wait_until_idle(worker: &RenderThread) {
         let deadline = Instant::now() + Duration::from_secs(2);
-        while worker.has_pending_jobs() && Instant::now() < deadline {
+        while worker.pending.load(std::sync::atomic::Ordering::Acquire) != 0
+            && Instant::now() < deadline
+        {
             std::thread::yield_now();
         }
         assert!(
-            !worker.has_pending_jobs(),
+            worker.pending.load(std::sync::atomic::Ordering::Acquire) == 0,
             "render worker did not become idle"
         );
     }
@@ -196,7 +666,8 @@ mod tests {
     #[test]
     fn pending_jobs_tracks_queued_in_flight_and_idle_transitions() {
         let worker = RenderThread::new_named("nexium-render-pending-test");
-        assert!(!worker.has_pending_jobs());
+        assert!(worker.is_idle());
+        assert_eq!(worker.pending.load(std::sync::atomic::Ordering::Acquire), 0);
 
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -205,12 +676,138 @@ mod tests {
             release_rx.recv().unwrap();
         })));
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(worker.has_pending_jobs());
+        assert!(!worker.is_idle());
+        assert_ne!(worker.pending.load(std::sync::atomic::Ordering::Acquire), 0);
 
         assert!(worker.try_submit(Box::new(|| {})));
         assert_eq!(worker.pending.load(std::sync::atomic::Ordering::Acquire), 2);
 
         release_tx.send(()).unwrap();
         wait_until_idle(&worker);
+        assert!(worker.is_idle());
+    }
+
+    #[test]
+    fn draw_group_limits_require_renderer_identity_count_and_ring_budget() {
+        let safe = nexium_gpu::renderer::GRAPHICS_RING_SAFE_BATCH_BYTES;
+        assert!(draw_group_fits(1, safe - 1, true, 1));
+        assert!(!draw_group_fits(1, safe, true, 1));
+        assert!(!draw_group_fits(1, 0, false, 1));
+        assert!(!draw_group_fits(MAX_DRAW_GROUPS_PER_SUBMISSION, 0, true, 0));
+        assert!(!draw_group_fits(1, u64::MAX, true, 1));
+    }
+
+    #[test]
+    fn draw_group_fit_reason_distinguishes_each_limit() {
+        let safe = nexium_gpu::renderer::GRAPHICS_RING_SAFE_BATCH_BYTES;
+        assert_eq!(
+            draw_group_fit_end_reason(1, 0, false, 0),
+            Some(DrawGatherEndReason::Renderer)
+        );
+        assert_eq!(
+            draw_group_fit_end_reason(MAX_DRAW_GROUPS_PER_SUBMISSION, 0, true, 0),
+            Some(DrawGatherEndReason::Count)
+        );
+        assert_eq!(
+            draw_group_fit_end_reason(1, safe, true, 1),
+            Some(DrawGatherEndReason::Ring)
+        );
+        assert_eq!(
+            draw_group_fit_end_reason(1, u64::MAX, true, 1),
+            Some(DrawGatherEndReason::Ring)
+        );
+        assert_eq!(draw_group_fit_end_reason(1, safe - 1, true, 1), None);
+    }
+
+    #[test]
+    fn candidate_reason_distinguishes_sealing_job_and_compatibility() {
+        assert_eq!(sealed_candidate_end_reason(true), DrawGatherEndReason::Job);
+        assert_eq!(
+            sealed_candidate_end_reason(false),
+            DrawGatherEndReason::Hard
+        );
+        assert_eq!(
+            rejected_draw_end_reason(None),
+            DrawGatherEndReason::Compatibility
+        );
+        assert_eq!(
+            rejected_draw_end_reason(Some(DrawGatherEndReason::Ring)),
+            DrawGatherEndReason::Ring
+        );
+    }
+
+    #[test]
+    fn soft_draw_gather_accepts_work_arriving_before_deadline() {
+        let (tx, rx) = bounded(1);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            tx.send(7u32).unwrap();
+        });
+        let received =
+            recv_group_candidate(&rx, Instant::now() + Duration::from_millis(100), || false);
+        assert_eq!(received, Ok(7));
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn hard_draw_tail_skips_gather_without_consuming_work() {
+        let (tx, rx) = bounded(1);
+        tx.send(7u32).unwrap();
+        assert_eq!(
+            recv_group_candidate(&rx, Instant::now() + Duration::from_secs(1), || true),
+            Err(DrawGatherEndReason::Hard)
+        );
+        assert_eq!(rx.try_recv(), Ok(7));
+        assert!(DRAW_GATHER_GRACE >= Duration::from_micros(100));
+        assert!(DRAW_GATHER_GRACE <= Duration::from_micros(250));
+    }
+
+    #[test]
+    fn soft_draw_gather_preserves_disconnected_state() {
+        let (tx, rx) = bounded::<u32>(1);
+        drop(tx);
+        assert_eq!(
+            recv_group_candidate(&rx, Instant::now() + Duration::from_secs(1), || false),
+            Err(DrawGatherEndReason::Disconnected)
+        );
+    }
+
+    #[test]
+    fn soft_draw_gather_reports_expired_deadline_without_resampling_hard_state() {
+        let (_tx, rx) = bounded::<u32>(1);
+        let checks = AtomicUsize::new(0);
+        let result = recv_group_candidate(&rx, Instant::now(), || {
+            checks.fetch_add(1, Ordering::AcqRel) >= 2
+        });
+        assert_eq!(result, Err(DrawGatherEndReason::Deadline));
+        assert_eq!(checks.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn sealing_a_soft_tail_marks_it_hard_and_clears_tracking() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut tail = Some(Arc::downgrade(&flag));
+        seal_draw_tail_locked(&mut tail);
+        assert!(flag.load(Ordering::Acquire));
+        assert!(tail.is_none());
+    }
+
+    #[test]
+    fn sealing_between_initial_check_and_receive_recheck_rejects_next() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let worker_flag = flag.clone();
+        let (initial_tx, initial_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert!(!worker_flag.load(Ordering::Acquire));
+            initial_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            retain_received_if_unsealed(7u32, || worker_flag.load(Ordering::Acquire))
+        });
+        initial_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut tail = Some(Arc::downgrade(&flag));
+        seal_draw_tail_locked(&mut tail);
+        resume_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), Err(7));
     }
 }
