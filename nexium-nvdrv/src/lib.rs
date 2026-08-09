@@ -691,6 +691,9 @@ impl AsyncGpuQueue {
         std::thread::Builder::new()
             .name("nexium-gpu-submit".to_string())
             .spawn(move || {
+                nexium_common::thread_cpu_set::apply_current_thread_cpu_set(
+                    nexium_common::thread_cpu_set::ThreadCpuSetTarget::GpuSubmit,
+                );
                 #[cfg(windows)]
                 unsafe {
                     #[link(name = "kernel32")]
