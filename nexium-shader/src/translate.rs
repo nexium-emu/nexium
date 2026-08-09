@@ -4205,6 +4205,45 @@ impl Translator {
                 }
             }
 
+            opcode @ (Opcode::LEA_lo_reg | Opcode::LEA_lo_cbuf | Opcode::LEA_lo_imm) => {
+                let scale = ((raw >> 39) & 0x1F) as u8;
+                let neg = ((raw >> 45) & 1) != 0;
+                let x = ((raw >> 46) & 1) != 0;
+                let cc = ((raw >> 47) & 1) != 0;
+                let src_pred = ((raw >> 48) & 0x7) as u8;
+                if x || cc || src_pred != PT || new_fs_ops_disabled() {
+                    log::debug!(
+                        "LEA_lo unsupported form opcode={:?} raw={:#018x} x={} cc={} src_pred={}",
+                        opcode,
+                        raw,
+                        x,
+                        cc,
+                        src_pred,
+                    );
+                    self.program.emit_void(Op::Unimplemented { opcode, raw });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                let base = match opcode {
+                    Opcode::LEA_lo_reg => self.read_reg(reg_b(raw)),
+                    Opcode::LEA_lo_cbuf => Value::Inst(self.load_cbuf(raw)),
+                    Opcode::LEA_lo_imm => Value::ImmU32(imm20(raw) as u32),
+                    _ => unreachable!(),
+                };
+                let offset = self.read_reg(reg_a(raw));
+                self.write_reg(
+                    reg_dest(raw),
+                    Op::IScAdd {
+                        a: offset,
+                        b: base,
+                        shift: scale,
+                        neg_a: neg,
+                        neg_b: false,
+                    },
+                    pred,
+                );
+            }
+
             Opcode::LEA_hi_reg => {
                 let neg = ((raw >> 37) & 1) != 0;
                 let x = ((raw >> 38) & 1) != 0;
@@ -7007,6 +7046,155 @@ mod tests {
             }
         ));
         assert_eq!(t.program.instructions.last().unwrap().dest_reg, Some(4));
+    }
+
+    #[test]
+    fn lea_lo_imm_cappy_tower_capture_lowers() {
+        let raw = 0x36d7_0200_00f7_1112u64;
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::LEA_lo_imm)
+        );
+
+        let mut t = Translator::new_compute();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert_eq!(t.program.instructions.len(), 1);
+        assert!(matches!(
+            t.program.instructions[0].op,
+            Op::IScAdd {
+                a: Value::GprIn(17),
+                b: Value::ImmU32(15),
+                shift: 4,
+                neg_a: false,
+                neg_b: false,
+            }
+        ));
+        assert_eq!(t.program.instructions[0].dest_reg, Some(18));
+    }
+
+    #[test]
+    fn lea_lo_reg_and_cbuf_base_forms_lower() {
+        let reg_raw = (0x5bd7u64 << 48)
+            | (4u64 << 39)
+            | (3u64 << 20)
+            | (u64::from(PT) << 16)
+            | (17u64 << 8)
+            | 18;
+        assert_eq!(
+            decode_one(reg_raw).map(|decoded| decoded.opcode),
+            Some(Opcode::LEA_lo_reg)
+        );
+        let mut reg_t = Translator::new_compute();
+        assert!(reg_t.translate(reg_raw));
+        assert_eq!(reg_t.unimplemented_count, 0);
+        assert!(matches!(
+            reg_t.program.instructions[0].op,
+            Op::IScAdd {
+                a: Value::GprIn(17),
+                b: Value::GprIn(3),
+                shift: 4,
+                neg_a: false,
+                neg_b: false,
+            }
+        ));
+
+        let cbuf_raw = (0x4bd7u64 << 48)
+            | (2u64 << 39)
+            | (3u64 << 34)
+            | (5u64 << 20)
+            | (u64::from(PT) << 16)
+            | (17u64 << 8)
+            | 18;
+        assert_eq!(
+            decode_one(cbuf_raw).map(|decoded| decoded.opcode),
+            Some(Opcode::LEA_lo_cbuf)
+        );
+        let mut cbuf_t = Translator::new_compute();
+        assert!(cbuf_t.translate(cbuf_raw));
+        assert_eq!(cbuf_t.unimplemented_count, 0);
+        assert!(matches!(
+            cbuf_t.program.instructions[0].op,
+            Op::LoadCbuf {
+                binding: 3,
+                byte_offset: 20,
+            }
+        ));
+        assert!(matches!(
+            cbuf_t.program.instructions[1].op,
+            Op::IScAdd {
+                a: Value::GprIn(17),
+                b: Value::Inst(_),
+                shift: 2,
+                neg_a: false,
+                neg_b: false,
+            }
+        ));
+        assert_eq!(cbuf_t.program.instructions[1].dest_reg, Some(18));
+    }
+
+    #[test]
+    fn lea_lo_imm_supports_negation_and_outer_predication() {
+        const CAPTURE: u64 = 0x36d7_0200_00f7_1112;
+        let raw = (CAPTURE & !(0x7u64 << 16)) | (2u64 << 16) | (1u64 << 19) | (1u64 << 45);
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::LEA_lo_imm)
+        );
+
+        let mut t = Translator::new_compute();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert_eq!(t.program.instructions.len(), 2);
+        assert!(matches!(
+            t.program.instructions[0].op,
+            Op::IScAdd {
+                a: Value::GprIn(17),
+                b: Value::ImmU32(15),
+                shift: 4,
+                neg_a: true,
+                neg_b: false,
+            }
+        ));
+        assert!(matches!(
+            t.program.instructions[1].op,
+            Op::SelectPred {
+                pred: Predicate {
+                    idx: 2,
+                    negate: true,
+                },
+                if_true: Value::Inst(_),
+                if_false: Value::GprIn(18),
+            }
+        ));
+        assert_eq!(t.program.instructions[1].dest_reg, Some(18));
+    }
+
+    #[test]
+    fn lea_lo_imm_rejects_x_cc_and_auxiliary_predicate_forms() {
+        const CAPTURE: u64 = 0x36d7_0200_00f7_1112;
+        for raw in [
+            CAPTURE | (1u64 << 46),
+            CAPTURE | (1u64 << 47),
+            (CAPTURE & !(0x7u64 << 48)) | (1u64 << 48),
+        ] {
+            assert_eq!(
+                decode_one(raw).map(|decoded| decoded.opcode),
+                Some(Opcode::LEA_lo_imm),
+                "raw={raw:#018x}"
+            );
+
+            let mut t = Translator::new_compute();
+            assert!(!t.translate(raw), "raw={raw:#018x}");
+            assert_eq!(t.unimplemented_count, 1, "raw={raw:#018x}");
+            assert!(matches!(
+                t.program.instructions.last().unwrap().op,
+                Op::Unimplemented {
+                    opcode: Opcode::LEA_lo_imm,
+                    raw: actual,
+                } if actual == raw
+            ));
+        }
     }
 
     #[test]
