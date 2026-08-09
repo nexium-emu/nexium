@@ -8454,9 +8454,34 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 && ioctl_cmd == 0x001e
             {
                 if let Some(event_id) = ctrl_event_id_in {
+                    if crate::kernel::Kernel::fence_profile_enabled() {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static TRACKED: AtomicU64 = AtomicU64::new(0);
+                        static UNTRACKED: AtomicU64 = AtomicU64::new(0);
+                        let tracked = kernel.gpu_event_tokens.contains_key(&(fd, event_id & 0xFF))
+                            && kernel.nvdrv.ctrl_event_wait(fd, event_id).is_some();
+                        let total = if tracked {
+                            TRACKED.fetch_add(1, Ordering::Relaxed)
+                                + 1
+                                + UNTRACKED.load(Ordering::Relaxed)
+                        } else {
+                            UNTRACKED.fetch_add(1, Ordering::Relaxed)
+                                + 1
+                                + TRACKED.load(Ordering::Relaxed)
+                        };
+                        if total % 256 == 0 {
+                            log::warn!(
+                                "[fence-arm] tracked={} untracked={}",
+                                TRACKED.load(Ordering::Relaxed),
+                                UNTRACKED.load(Ordering::Relaxed)
+                            );
+                        }
+                    }
                     if let (Some(&handle), Some(wait)) = (
-                        kernel.gpu_event_tokens.get(&event_id),
-                        kernel.nvdrv.ctrl_event_wait(event_id),
+                        crate::kernel::Kernel::fence_signal_fix_enabled()
+                            .then(|| kernel.gpu_event_tokens.get(&(fd, event_id & 0xFF)))
+                            .flatten(),
+                        kernel.nvdrv.ctrl_event_wait(fd, event_id),
                     ) {
                         if kernel
                             .nvdrv
@@ -8468,6 +8493,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                             kernel
                                 .gpu_fence_events
                                 .insert(handle, (wait.syncpt_id, wait.threshold));
+                            kernel.record_fence_armed(handle);
                         }
                     }
                 }
@@ -8486,6 +8512,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                     .collect();
                 for fh in fence_handles {
                     kernel.gpu_fence_events.remove(&fh);
+                    kernel.record_fence_signal(fh);
                     kernel.event_signals.insert(fh, true);
                     kernel.threads.signal_handle(fh);
                     log::debug!(
@@ -8552,8 +8579,10 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 );
             }
             if is_nvhost_ctrl_fd {
-                kernel.gpu_event_tokens.insert(event_id, h);
-                let wait = kernel.nvdrv.ctrl_event_wait(event_id);
+                if crate::kernel::Kernel::fence_signal_fix_enabled() {
+                    kernel.gpu_event_tokens.insert((fd, event_id & 0xFF), h);
+                }
+                let wait = kernel.nvdrv.ctrl_event_wait(fd, event_id);
                 let signaled = wait
                     .map(|wait| {
                         kernel
@@ -8566,6 +8595,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                     kernel
                         .gpu_fence_events
                         .insert(h, (wait.syncpt_id, wait.threshold));
+                    kernel.record_fence_armed(h);
                 }
                 log::debug!(
                     "nvdrv:QueryEvent fd={} event_id={:#x} (nvhost-ctrl) → fence event handle={:#x} signaled={}",

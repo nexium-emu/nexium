@@ -71,7 +71,8 @@ pub struct Kernel {
     pub vsync_handles: HashSet<u32>,
     pub nvdrv_sync_events: HashSet<u32>,
     pub gpu_fence_events: HashMap<u32, (u32, u32)>,
-    pub gpu_event_tokens: HashMap<u32, u32>,
+    pub gpu_fence_armed: HashMap<u32, std::time::Instant>,
+    pub gpu_event_tokens: HashMap<(u32, u32), u32>,
     pub last_vsync: std::time::Instant,
     pub last_hid_tick: std::time::Instant,
     pub last_generic_svc_imm: u16,
@@ -265,6 +266,7 @@ impl Kernel {
             vsync_handles: HashSet::new(),
             nvdrv_sync_events: HashSet::new(),
             gpu_fence_events: HashMap::new(),
+            gpu_fence_armed: HashMap::new(),
             gpu_event_tokens: HashMap::new(),
             last_vsync: std::time::Instant::now(),
             last_hid_tick: std::time::Instant::now(),
@@ -751,6 +753,7 @@ impl Kernel {
             .collect();
         for handle in reached {
             let pending = self.gpu_fence_events.remove(&handle);
+            self.record_fence_signal(handle);
             self.event_signals.insert(handle, true);
             self.threads.signal_handle(handle);
             if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
@@ -763,6 +766,57 @@ impl Kernel {
                     );
                 }
             }
+        }
+    }
+
+    pub fn fence_profile_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_FENCE_PROFILE").is_some())
+    }
+
+    pub fn fence_signal_fix_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("NEXIUM_FENCE_SIGNAL_FIX").map_or(true, |value| value != "0")
+        })
+    }
+
+    pub fn record_fence_armed(&mut self, handle: u32) {
+        if Self::fence_profile_enabled() {
+            self.gpu_fence_armed
+                .insert(handle, std::time::Instant::now());
+        }
+    }
+
+    pub fn record_fence_signal(&mut self, handle: u32) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        if Self::fence_profile_enabled() {
+            static SIGNALS: AtomicU64 = AtomicU64::new(0);
+            let signals = SIGNALS.fetch_add(1, Ordering::Relaxed) + 1;
+            if signals % 64 == 0 {
+                log::warn!("[fence-signal] total={}", signals);
+            }
+        }
+        let Some(armed) = self.gpu_fence_armed.remove(&handle) else {
+            return;
+        };
+        static NS: AtomicU64 = AtomicU64::new(0);
+        static MAX_NS: AtomicU64 = AtomicU64::new(0);
+        static N: AtomicU64 = AtomicU64::new(0);
+        let ns = armed.elapsed().as_nanos() as u64;
+        NS.fetch_add(ns, Ordering::Relaxed);
+        MAX_NS.fetch_max(ns, Ordering::Relaxed);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 256 == 0 {
+            let total = NS.swap(0, Ordering::Relaxed);
+            let max = MAX_NS.swap(0, Ordering::Relaxed);
+            log::warn!(
+                "[fence-prof] signals={} window_avg_ms={:.2} window_max_ms={:.2} pending={}",
+                n,
+                total as f64 / 256.0 / 1_000_000.0,
+                max as f64 / 1_000_000.0,
+                self.gpu_fence_events.len()
+            );
         }
     }
 

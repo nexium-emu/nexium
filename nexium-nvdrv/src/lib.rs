@@ -969,7 +969,7 @@ pub struct Nvdrv {
     pub next_syncpoint_id: u32,
     pub retired_syncpts: HashMap<u32, (u32, u32)>,
     pub next_ctrl_event_slot: u32,
-    pub ctrl_event_waits: HashMap<u32, CtrlEventWait>,
+    pub ctrl_event_waits: HashMap<(u32, u32), CtrlEventWait>,
     pub gpu: Arc<GpuContext>,
     pub last_swap_return: Arc<Mutex<Option<std::time::Instant>>>,
     pub queue_buffer_active: Arc<std::sync::atomic::AtomicBool>,
@@ -1289,8 +1289,33 @@ impl Nvdrv {
         syncpoint_reached(self.syncpoint_value(id), threshold)
     }
 
-    pub fn ctrl_event_wait(&self, event_id: u32) -> Option<CtrlEventWait> {
-        self.ctrl_event_waits.get(&event_id).copied()
+    pub fn ctrl_event_wait(&self, fd: u32, event_id: u32) -> Option<CtrlEventWait> {
+        self.ctrl_event_waits.get(&(fd, event_id & 0xFF)).copied()
+    }
+
+    fn fence_wait_stat(deferred: bool) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("NEXIUM_FENCE_PROFILE").is_some()) {
+            return;
+        }
+        static INSTANT: AtomicU64 = AtomicU64::new(0);
+        static DEFERRED: AtomicU64 = AtomicU64::new(0);
+        static TOTAL: AtomicU64 = AtomicU64::new(0);
+        if deferred {
+            DEFERRED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            INSTANT.fetch_add(1, Ordering::Relaxed);
+        }
+        let total = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if total % 512 == 0 {
+            log::warn!(
+                "[fence-wait] total={} instant={} deferred={}",
+                total,
+                INSTANT.load(Ordering::Relaxed),
+                DEFERRED.load(Ordering::Relaxed)
+            );
+        }
     }
 
     pub fn device_for_fd(&self, fd: u32) -> Option<NvDevice> {
@@ -3547,6 +3572,7 @@ impl Nvdrv {
                         req.in_data[2],
                         req.in_data[3],
                     ]);
+                    self.ctrl_event_waits.remove(&(req.fd, event_id & 0xFF));
                     log::debug!("nvhost-ctrl:EventSignal event_id={}", event_id);
                 }
             }
@@ -3574,6 +3600,7 @@ impl Nvdrv {
                         );
                     }
                     if syncpoint_reached(current_val, threshold) {
+                        Self::fence_wait_stat(false);
                         out[12..16].copy_from_slice(&current_val.to_le_bytes());
                         log::debug!(
                             "nvhost-ctrl:EventWait syncpt={} threshold={:#x} current={} → Success (already reached)",
@@ -3582,11 +3609,12 @@ impl Nvdrv {
                             current_val
                         );
                     } else {
+                        Self::fence_wait_stat(true);
                         let slot = self.next_ctrl_event_slot & 63;
                         self.next_ctrl_event_slot = self.next_ctrl_event_slot.wrapping_add(1);
                         let event_val: u32 = slot | ((syncpt_id & 0xFFF) << 16) | (1 << 28);
                         self.ctrl_event_waits.insert(
-                            event_val,
+                            (req.fd, slot),
                             CtrlEventWait {
                                 syncpt_id,
                                 threshold,
@@ -3639,6 +3667,7 @@ impl Nvdrv {
                         );
                     }
                     if syncpoint_reached(current_val, threshold) {
+                        Self::fence_wait_stat(false);
                         if out.len() >= 16 {
                             out[12..16].copy_from_slice(&current_val.to_le_bytes());
                         }
@@ -3650,11 +3679,12 @@ impl Nvdrv {
                             event_id
                         );
                     } else {
+                        Self::fence_wait_stat(true);
                         if out.len() >= 16 {
                             out[12..16].copy_from_slice(&event_id.to_le_bytes());
                         }
                         self.ctrl_event_waits.insert(
-                            event_id,
+                            (req.fd, event_id & 0xFF),
                             CtrlEventWait {
                                 syncpt_id,
                                 threshold,
@@ -3694,7 +3724,8 @@ impl Nvdrv {
                         req.in_data[3],
                     ]);
                     let slot = event_id & 0xFF;
-                    self.ctrl_event_waits.retain(|id, _| (*id & 0xFF) != slot);
+                    self.ctrl_event_waits
+                        .retain(|(fd, id), _| *fd != req.fd || *id != slot);
                     log::debug!("nvhost-ctrl:EventUnregister event_id={}", event_id);
                 }
             }
