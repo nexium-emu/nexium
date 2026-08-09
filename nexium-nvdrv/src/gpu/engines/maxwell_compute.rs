@@ -27,6 +27,19 @@ use crate::gpu::{vk_dispatch, GpuMappings};
 const MAX_CODE_BYTES: usize = 0x1_0000;
 const MAX_RESOURCE_BYTES: usize = 512 * 1024 * 1024;
 
+static FRONTEND_CACHE_PROFILE_LOOKUPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FRONTEND_CACHE_PROFILE_DIRECT_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FRONTEND_CACHE_PROFILE_INDIRECT_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FRONTEND_CACHE_PROFILE_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FRONTEND_CACHE_PROFILE_CFG_BUILDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FRONTEND_CACHE_PROFILE_INDIRECT_VARIANT_INSERTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug)]
 pub(super) enum MaxwellComputeOutcome {
     Executed,
@@ -126,7 +139,7 @@ struct PreparedTexelWrite {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct FrontendCacheKey {
     code_sha256: [u8; 32],
-    indirect_cbuf_hash: u64,
+    indirect_cbuf_hash: Option<u64>,
 }
 
 struct FrontendPlan {
@@ -134,6 +147,95 @@ struct FrontendPlan {
     needs: Vec<ResourceNeed>,
     storage_buffers: Vec<nexium_shader::StorageBufferAddr>,
     writable_storage_buffers: Vec<bool>,
+}
+
+#[derive(Default)]
+struct FrontendPlanCache {
+    plans: HashMap<FrontendCacheKey, Arc<FrontendPlan>>,
+    indirect_codes: HashSet<[u8; 32]>,
+    #[cfg(test)]
+    build_attempts: usize,
+}
+
+impl FrontendPlanCache {
+    fn lookup(
+        &self,
+        code_sha256: [u8; 32],
+        cbufs: &[Option<Vec<u8>>; nexium_spirv::COMPUTE_CBUF_SLOTS],
+        indirect_hits_enabled: bool,
+    ) -> (Option<(FrontendCacheKey, Arc<FrontendPlan>)>, Option<u64>) {
+        let key = if self.indirect_codes.contains(&code_sha256) {
+            if !indirect_hits_enabled {
+                return (None, None);
+            }
+            let indirect_hash = indirect_cbuf_hash(cbufs);
+            let key = frontend_cache_key(code_sha256, Some(indirect_hash));
+            return (
+                self.plans.get(&key).map(|plan| (key, Arc::clone(plan))),
+                Some(indirect_hash),
+            );
+        } else {
+            frontend_cache_key(code_sha256, None)
+        };
+        (
+            self.plans.get(&key).map(|plan| (key, Arc::clone(plan))),
+            None,
+        )
+    }
+
+    fn insert(
+        &mut self,
+        code_sha256: [u8; 32],
+        cbufs: &[Option<Vec<u8>>; nexium_spirv::COMPUTE_CBUF_SLOTS],
+        uses_indirect: bool,
+        probed_indirect_hash: Option<u64>,
+        plan: Arc<FrontendPlan>,
+    ) -> (FrontendCacheKey, Arc<FrontendPlan>) {
+        let cbuf_dependent = uses_indirect || self.indirect_codes.contains(&code_sha256);
+        if uses_indirect {
+            self.indirect_codes.insert(code_sha256);
+            self.plans.remove(&frontend_cache_key(code_sha256, None));
+        }
+        let key = if cbuf_dependent {
+            frontend_cache_key(
+                code_sha256,
+                Some(probed_indirect_hash.unwrap_or_else(|| indirect_cbuf_hash(cbufs))),
+            )
+        } else {
+            frontend_cache_key(code_sha256, None)
+        };
+        if let Some(existing) = self.plans.get(&key) {
+            return (key, Arc::clone(existing));
+        }
+        if self.plans.len() >= MAX_TRANSLATION_CACHE_ENTRIES {
+            if let Some(oldest) = self.plans.keys().next().cloned() {
+                let evicted_code = oldest.code_sha256;
+                self.plans.remove(&oldest);
+                if !self
+                    .plans
+                    .keys()
+                    .any(|candidate| candidate.code_sha256 == evicted_code)
+                {
+                    self.indirect_codes.remove(&evicted_code);
+                }
+            }
+        }
+        if cbuf_dependent {
+            self.indirect_codes.insert(code_sha256);
+        }
+        let plan = Arc::clone(self.plans.entry(key.clone()).or_insert(plan));
+        if cbuf_dependent {
+            profile_frontend_cache_indirect_variant_insert();
+        }
+        (key, plan)
+    }
+
+    fn record_build_attempt(&mut self) {
+        #[cfg(test)]
+        {
+            self.build_attempts += 1;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1476,10 +1578,13 @@ fn prepare_and_execute(
         image_aliases,
     };
 
-    if std::env::var_os("NEXIUM_COMPUTE_RESOURCE_TRACE").is_some_and(|value| {
-        let value = value.to_string_lossy();
-        let value = value.trim();
-        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+    static RESOURCE_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *RESOURCE_TRACE.get_or_init(|| {
+        std::env::var_os("NEXIUM_COMPUTE_RESOURCE_TRACE").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
     }) {
         let sampled_rt_summary = dispatch
             .sampled_rts
@@ -1597,7 +1702,10 @@ fn prepare_and_execute(
             written.map_err(ExecuteError::Submitted)
         }
         ComputeDispatchOutcome::Submitted(id) => {
-            if std::env::var_os("NEXIUM_COMPUTE_SUBMIT_TRACE").is_some() {
+            static SUBMIT_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *SUBMIT_TRACE
+                .get_or_init(|| std::env::var_os("NEXIUM_COMPUTE_SUBMIT_TRACE").is_some())
+            {
                 log::warn!("[compute-submit] id={} program={:#x}", id, qmd[0x08]);
             }
             pending_writebacks()
@@ -1682,11 +1790,99 @@ fn qmd_cbuf_range(qmd: &[u32; 0x40], slot: u8) -> Option<(u64, usize)> {
     Some((gpu_va, size))
 }
 
-fn frontend_cache_key(code_sha256: [u8; 32], indirect_cbuf_hash: u64) -> FrontendCacheKey {
+fn frontend_cache_key(code_sha256: [u8; 32], indirect_cbuf_hash: Option<u64>) -> FrontendCacheKey {
     FrontendCacheKey {
         code_sha256,
         indirect_cbuf_hash,
     }
+}
+
+fn indirect_cbuf_hash(cbufs: &[Option<Vec<u8>>; nexium_spirv::COMPUTE_CBUF_SLOTS]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cbufs.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn indirect_frontend_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("NEXIUM_COMPUTE_INDIRECT_FRONTEND_CACHE")
+                .ok()
+                .as_deref(),
+            Some("0")
+                | Some("false")
+                | Some("FALSE")
+                | Some("off")
+                | Some("OFF")
+                | Some("no")
+                | Some("NO")
+        )
+    })
+}
+
+fn indirect_frontend_cache_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_COMPUTE_INDIRECT_FRONTEND_CACHE_PROFILE")
+                .ok()
+                .as_deref(),
+            Some("1")
+                | Some("true")
+                | Some("TRUE")
+                | Some("on")
+                | Some("ON")
+                | Some("yes")
+                | Some("YES")
+        )
+    })
+}
+
+fn profile_frontend_cache_lookup(indirect_hit: Option<bool>) {
+    if !indirect_frontend_cache_profile_enabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+
+    match indirect_hit {
+        Some(true) => {
+            FRONTEND_CACHE_PROFILE_INDIRECT_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(false) => {
+            FRONTEND_CACHE_PROFILE_DIRECT_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        None => {
+            FRONTEND_CACHE_PROFILE_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let lookups = FRONTEND_CACHE_PROFILE_LOOKUPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if lookups % 1024 == 0 {
+        log::warn!(
+            "[compute-frontend-cache] lookups={} direct_hits={} indirect_hits={} misses={} cfg_builds={} indirect_variant_inserts={}",
+            lookups,
+            FRONTEND_CACHE_PROFILE_DIRECT_HITS.load(Ordering::Relaxed),
+            FRONTEND_CACHE_PROFILE_INDIRECT_HITS.load(Ordering::Relaxed),
+            FRONTEND_CACHE_PROFILE_MISSES.load(Ordering::Relaxed),
+            FRONTEND_CACHE_PROFILE_CFG_BUILDS.load(Ordering::Relaxed),
+            FRONTEND_CACHE_PROFILE_INDIRECT_VARIANT_INSERTS.load(Ordering::Relaxed),
+        );
+    }
+}
+
+fn profile_frontend_cache_cfg_build() {
+    if !indirect_frontend_cache_profile_enabled() {
+        return;
+    }
+    FRONTEND_CACHE_PROFILE_CFG_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn profile_frontend_cache_indirect_variant_insert() {
+    if !indirect_frontend_cache_profile_enabled() {
+        return;
+    }
+    FRONTEND_CACHE_PROFILE_INDIRECT_VARIANT_INSERTS
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn memoized_code_sha256(code_gpu: u64, code: &[u8]) -> [u8; 32] {
@@ -1715,17 +1911,36 @@ fn cached_frontend_plan(
     code: &[u8],
     cbufs: &[Option<Vec<u8>>; 8],
 ) -> Result<(FrontendCacheKey, Arc<FrontendPlan>), String> {
-    static CACHE: OnceLock<Mutex<HashMap<FrontendCacheKey, Arc<FrontendPlan>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let base_key = frontend_cache_key(code_sha256, 0);
-    if let Some(plan) = cache
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(&base_key)
-    {
-        return Ok((base_key, Arc::clone(plan)));
-    }
+    static CACHE: OnceLock<Mutex<FrontendPlanCache>> = OnceLock::new();
+    cached_frontend_plan_with_cache(
+        CACHE.get_or_init(|| Mutex::new(FrontendPlanCache::default())),
+        code_sha256,
+        code,
+        cbufs,
+        indirect_frontend_cache_enabled(),
+    )
+}
 
+fn cached_frontend_plan_with_cache(
+    cache: &Mutex<FrontendPlanCache>,
+    code_sha256: [u8; 32],
+    code: &[u8],
+    cbufs: &[Option<Vec<u8>>; nexium_spirv::COMPUTE_CBUF_SLOTS],
+    indirect_hits_enabled: bool,
+) -> Result<(FrontendCacheKey, Arc<FrontendPlan>), String> {
+    let probed_indirect_hash = {
+        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        let (hit, probed_indirect_hash) = cache.lookup(code_sha256, cbufs, indirect_hits_enabled);
+        if let Some(hit) = hit {
+            profile_frontend_cache_lookup(Some(hit.0.indirect_cbuf_hash.is_some()));
+            return Ok(hit);
+        }
+        profile_frontend_cache_lookup(None);
+        cache.record_build_attempt();
+        probed_indirect_hash
+    };
+
+    profile_frontend_cache_cfg_build();
     let mut cfg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         nexium_shader::build_compute_cfg_with_cbuf(code, |binding, byte_offset| {
             cbufs
@@ -1782,13 +1997,6 @@ fn cached_frontend_plan(
         .blocks
         .iter()
         .any(|block| matches!(block.branch, nexium_shader::BranchKind::Indirect { .. }));
-    let key = if uses_indirect {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        cbufs.hash(&mut hasher);
-        frontend_cache_key(code_sha256, hasher.finish())
-    } else {
-        base_key
-    };
     let plan = Arc::new(FrontendPlan {
         cfg,
         needs,
@@ -1796,16 +2004,13 @@ fn cached_frontend_plan(
         writable_storage_buffers,
     });
     let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(existing) = cache.get(&key) {
-        return Ok((key, Arc::clone(existing)));
-    }
-    if cache.len() >= MAX_TRANSLATION_CACHE_ENTRIES {
-        if let Some(oldest) = cache.keys().next().cloned() {
-            cache.remove(&oldest);
-        }
-    }
-    let plan = Arc::clone(cache.entry(key.clone()).or_insert(plan));
-    Ok((key, plan))
+    Ok(cache.insert(
+        code_sha256,
+        cbufs,
+        uses_indirect,
+        probed_indirect_hash,
+        plan,
+    ))
 }
 
 struct CachedComputeModule {
@@ -3351,6 +3556,106 @@ fn cbuf_u32(cbuf: &[u8], byte_offset: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_shader_word(bytes: &mut [u8], offset: usize, word: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
+    }
+
+    fn direct_compute_program() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x20];
+        write_shader_word(&mut bytes, 0x08, 0xE300_0000_0007_000F);
+        bytes
+    }
+
+    fn indirect_compute_program() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x60];
+        let imnmx = 0x3820_0380_0007_0000u64 | (1u64 << 20);
+        let shl = 0x3848_0000_0007_0000u64 | (2u64 << 20);
+        let ldc = 0xEF94_0010_0007_0000u64;
+        let branch_offset = ((-0x30i32 as u32) & 0x00FF_FFFF) as u64;
+        let brx = 0xE250_0000_0007_000Fu64 | (branch_offset << 20);
+        write_shader_word(&mut bytes, 0x08, imnmx);
+        write_shader_word(&mut bytes, 0x10, shl);
+        write_shader_word(&mut bytes, 0x18, ldc);
+        write_shader_word(&mut bytes, 0x28, brx);
+        write_shader_word(&mut bytes, 0x30, 0xE300_0000_0007_000F);
+        write_shader_word(&mut bytes, 0x38, 0xE300_0000_0007_000F);
+        bytes
+    }
+
+    fn empty_compute_cbufs() -> [Option<Vec<u8>>; nexium_spirv::COMPUTE_CBUF_SLOTS] {
+        std::array::from_fn(|_| None)
+    }
+
+    fn indirect_compute_cbufs(first: u32, second: u32) -> [Option<Vec<u8>>; 8] {
+        let mut cbufs = empty_compute_cbufs();
+        let mut table = vec![0u8; 8];
+        table[0..4].copy_from_slice(&first.to_le_bytes());
+        table[4..8].copy_from_slice(&second.to_le_bytes());
+        cbufs[1] = Some(table);
+        cbufs
+    }
+
+    #[test]
+    fn direct_frontend_plan_cache_ignores_unrelated_cbuf_variants() {
+        let cache = Mutex::new(FrontendPlanCache::default());
+        let code = direct_compute_program();
+        let code_sha256: [u8; 32] = Sha256::digest(&code).into();
+        let first_cbufs = empty_compute_cbufs();
+        let (first_key, first) =
+            cached_frontend_plan_with_cache(&cache, code_sha256, &code, &first_cbufs, true)
+                .expect("direct frontend plan");
+        assert_eq!(first_key.indirect_cbuf_hash, None);
+        assert_eq!(cache.lock().unwrap().build_attempts, 1);
+
+        let mut changed_cbufs = empty_compute_cbufs();
+        changed_cbufs[0] = Some(vec![1, 2, 3, 4]);
+        let (changed_key, changed) =
+            cached_frontend_plan_with_cache(&cache, code_sha256, &code, &changed_cbufs, true)
+                .expect("cached direct frontend plan");
+        assert_eq!(changed_key, first_key);
+        assert!(Arc::ptr_eq(&first, &changed));
+        assert_eq!(cache.lock().unwrap().build_attempts, 1);
+    }
+
+    #[test]
+    fn indirect_frontend_plan_cache_hits_each_exact_cbuf_variant() {
+        let cache = Mutex::new(FrontendPlanCache::default());
+        let code = indirect_compute_program();
+        let code_sha256: [u8; 32] = Sha256::digest(&code).into();
+        let first_cbufs = indirect_compute_cbufs(0x30, 0x38);
+        let (first_key, first) =
+            cached_frontend_plan_with_cache(&cache, code_sha256, &code, &first_cbufs, true)
+                .expect("first indirect frontend plan");
+        assert!(first_key.indirect_cbuf_hash.is_some());
+        assert_eq!(cache.lock().unwrap().build_attempts, 1);
+
+        let (_, first_again) =
+            cached_frontend_plan_with_cache(&cache, code_sha256, &code, &first_cbufs, true)
+                .expect("cached first indirect frontend plan");
+        assert!(Arc::ptr_eq(&first, &first_again));
+        assert_eq!(cache.lock().unwrap().build_attempts, 1);
+
+        let second_cbufs = indirect_compute_cbufs(0x38, 0x30);
+        let (second_key, second) =
+            cached_frontend_plan_with_cache(&cache, code_sha256, &code, &second_cbufs, true)
+                .expect("second indirect frontend plan");
+        assert_ne!(second_key, first_key);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.lock().unwrap().build_attempts, 2);
+
+        let (_, first_after_switch) =
+            cached_frontend_plan_with_cache(&cache, code_sha256, &code, &first_cbufs, true)
+                .expect("reused first indirect frontend plan");
+        assert!(Arc::ptr_eq(&first, &first_after_switch));
+        assert_eq!(cache.lock().unwrap().build_attempts, 2);
+
+        let (_, disabled_hit) =
+            cached_frontend_plan_with_cache(&cache, code_sha256, &code, &first_cbufs, false)
+                .expect("legacy indirect frontend rebuild");
+        assert!(Arc::ptr_eq(&first, &disabled_hit));
+        assert_eq!(cache.lock().unwrap().build_attempts, 3);
+    }
 
     fn reported_span(gpu_va: u64) -> PendingComputeWritebackSpan {
         PendingComputeWritebackSpan {

@@ -3,7 +3,7 @@ use crossbeam::channel::{
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::gpu::vk_dispatch::PreparedDrawBatch;
@@ -20,10 +20,175 @@ pub struct RenderThread {
     tx: Sender<RenderWork>,
     pending: Arc<AtomicUsize>,
     draw_tail: Mutex<Option<Weak<AtomicBool>>>,
+    draw_work_budget: Arc<DrawWorkBudget>,
 }
 
 const MAX_DRAW_GROUPS_PER_SUBMISSION: usize = 256;
 const DRAW_GATHER_GRACE: Duration = Duration::from_micros(200);
+const DEFAULT_PENDING_DRAW_GROUP_BUDGET: usize = 0;
+const DRAW_BACKPRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+struct DrawWorkBudgetState {
+    outstanding: usize,
+    closed: bool,
+}
+
+struct DrawWorkBudget {
+    limit: usize,
+    state: Mutex<DrawWorkBudgetState>,
+    available: Condvar,
+}
+
+impl DrawWorkBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            state: Mutex::new(DrawWorkBudgetState::default()),
+            available: Condvar::new(),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.limit != 0
+    }
+
+    fn fits(&self, outstanding: usize, incoming: usize) -> bool {
+        if incoming > self.limit {
+            return outstanding == 0;
+        }
+        outstanding
+            .checked_add(incoming)
+            .is_some_and(|total| total <= self.limit)
+    }
+
+    fn reserve(&self, incoming: usize, label: &'static str, timeout: Duration) -> bool {
+        if !self.enabled() || incoming == 0 {
+            return true;
+        }
+        let started = Instant::now();
+        let deadline = started.checked_add(timeout).unwrap_or(started);
+        let mut next_report = started + DRAW_BACKPRESSURE_LOG_INTERVAL;
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if state.closed {
+                return false;
+            }
+            if self.fits(state.outstanding, incoming) {
+                state.outstanding = state.outstanding.saturating_add(incoming);
+                return true;
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                log::warn!(
+                    "[render-backpressure] phase=budget-timeout label={} chunks={} outstanding={} budget={} waited_ms={:.3}",
+                    label,
+                    incoming,
+                    state.outstanding,
+                    self.limit,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+                return false;
+            }
+            let wait_until = std::cmp::min(next_report, deadline);
+            let wait = wait_until.saturating_duration_since(now);
+            let (next_state, wait_result) = self
+                .available
+                .wait_timeout(state, wait)
+                .unwrap_or_else(|error| error.into_inner());
+            state = next_state;
+            if wait_result.timed_out() {
+                if Instant::now() >= deadline {
+                    log::warn!(
+                        "[render-backpressure] phase=budget-timeout label={} chunks={} outstanding={} budget={} waited_ms={:.3}",
+                        label,
+                        incoming,
+                        state.outstanding,
+                        self.limit,
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    );
+                    return false;
+                }
+                log::warn!(
+                    "[render-backpressure] phase=budget label={} chunks={} outstanding={} budget={} waited_ms={:.3}",
+                    label,
+                    incoming,
+                    state.outstanding,
+                    self.limit,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+                next_report = Instant::now() + DRAW_BACKPRESSURE_LOG_INTERVAL;
+            }
+        }
+    }
+
+    fn release(&self, completed: usize) {
+        if !self.enabled() || completed == 0 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        match state.outstanding.checked_sub(completed) {
+            Some(remaining) => state.outstanding = remaining,
+            None => {
+                log::error!(
+                    "[render-backpressure] release underflow completed={} outstanding={} budget={}",
+                    completed,
+                    state.outstanding,
+                    self.limit,
+                );
+                state.outstanding = 0;
+            }
+        }
+        drop(state);
+        self.available.notify_all();
+    }
+
+    fn close(&self) {
+        if !self.enabled() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        drop(state);
+        self.available.notify_all();
+    }
+
+    #[cfg(test)]
+    fn outstanding(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .outstanding
+    }
+}
+
+struct DrawWorkCompletion<'a> {
+    pending: &'a AtomicUsize,
+    budget: &'a DrawWorkBudget,
+    units: usize,
+}
+
+impl Drop for DrawWorkCompletion<'_> {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.units, Ordering::Release);
+        self.budget.release(self.units);
+    }
+}
+
+struct DrawWorkerBudgetGuard(Arc<DrawWorkBudget>);
+
+impl Drop for DrawWorkerBudgetGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+#[inline]
+fn render_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_RENDER_PROFILE").is_some())
+}
 
 fn draw_gather_grace() -> Duration {
     static GRACE: OnceLock<Duration> = OnceLock::new();
@@ -169,7 +334,7 @@ fn retain_received_if_unsealed<T>(received: T, hard_after: impl FnOnce() -> bool
 }
 
 fn execute_job(label: &'static str, job: RenderJob, worker_pending: &AtomicUsize) {
-    let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
+    let profile = render_profile_enabled();
     let started = profile.then(std::time::Instant::now);
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
         log::error!("[render-job] job panicked; worker continuing");
@@ -195,9 +360,19 @@ fn execute_job(label: &'static str, job: RenderJob, worker_pending: &AtomicUsize
     worker_pending.fetch_sub(1, Ordering::Release);
 }
 
-fn execute_draw_groups(draws: Vec<PreparedDrawBatch>, worker_pending: &AtomicUsize) {
+fn execute_draw_groups(
+    draws: Vec<PreparedDrawBatch>,
+    worker_pending: &AtomicUsize,
+    draw_work_budget: &DrawWorkBudget,
+) {
     let group_count = draws.len();
-    let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
+    let budget_enabled = draw_work_budget.enabled();
+    let _completion = budget_enabled.then(|| DrawWorkCompletion {
+        pending: worker_pending,
+        budget: draw_work_budget,
+        units: group_count,
+    });
+    let profile = render_profile_enabled();
     let started = profile.then(std::time::Instant::now);
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::gpu::vk_dispatch::execute_prepared_draw_batches(draws)
@@ -217,11 +392,13 @@ fn execute_draw_groups(draws: Vec<PreparedDrawBatch>, worker_pending: &AtomicUsi
             );
         }
     }
-    worker_pending.fetch_sub(group_count, Ordering::Release);
+    if !budget_enabled {
+        worker_pending.fetch_sub(group_count, Ordering::Release);
+    }
 }
 
 fn profile_draw_gather(group_count: usize, hard_after: bool, end_reason: DrawGatherEndReason) {
-    if std::env::var_os("NEXIUM_RENDER_PROFILE").is_none() {
+    if !render_profile_enabled() {
         return;
     }
     static SUBMISSIONS: AtomicUsize = AtomicUsize::new(0);
@@ -274,7 +451,12 @@ fn profile_draw_gather(group_count: usize, hard_after: bool, end_reason: DrawGat
     }
 }
 
-fn render_worker(rx: Receiver<RenderWork>, worker_pending: Arc<AtomicUsize>) {
+fn render_worker(
+    rx: Receiver<RenderWork>,
+    worker_pending: Arc<AtomicUsize>,
+    draw_work_budget: Arc<DrawWorkBudget>,
+) {
+    let _budget_guard = DrawWorkerBudgetGuard(Arc::clone(&draw_work_budget));
     let mut lookahead = None;
     let mut queued_draws = VecDeque::new();
     loop {
@@ -297,7 +479,7 @@ fn render_worker(rx: Receiver<RenderWork>, worker_pending: Arc<AtomicUsize>) {
                 queued_draws.extend(group);
             }
             RenderWork::Draw(first) => {
-                let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
+                let profile = render_profile_enabled();
                 let gather_started = profile.then(Instant::now);
                 let mut compatibility_elapsed = Duration::ZERO;
                 let mut compatibility_checks = 0usize;
@@ -388,7 +570,7 @@ fn render_worker(rx: Receiver<RenderWork>, worker_pending: Arc<AtomicUsize>) {
                     draws.last().is_some_and(PreparedDrawBatch::hard_after),
                     end_reason,
                 );
-                execute_draw_groups(draws, &worker_pending);
+                execute_draw_groups(draws, &worker_pending, &draw_work_budget);
             }
         }
     }
@@ -404,14 +586,17 @@ impl RenderThread {
         let (tx, rx) = bounded::<RenderWork>(queue_depth);
         let pending = Arc::new(AtomicUsize::new(0));
         let worker_pending = pending.clone();
+        let draw_work_budget = Arc::new(DrawWorkBudget::new(render_pending_group_budget()));
+        let worker_draw_work_budget = Arc::clone(&draw_work_budget);
         std::thread::Builder::new()
             .name(name.to_string())
-            .spawn(move || render_worker(rx, worker_pending))
+            .spawn(move || render_worker(rx, worker_pending, worker_draw_work_budget))
             .expect("spawn render worker thread");
         RenderThread {
             tx,
             pending,
             draw_tail: Mutex::new(None),
+            draw_work_budget,
         }
     }
 
@@ -420,7 +605,7 @@ impl RenderThread {
     }
 
     pub fn submit_named(&self, label: &'static str, job: RenderJob) {
-        let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
+        let profile = render_profile_enabled();
         let started = profile.then(std::time::Instant::now);
         let mut draw_tail = self.draw_tail.lock().unwrap();
         seal_draw_tail_locked(&mut draw_tail);
@@ -464,7 +649,7 @@ impl RenderThread {
         job: RenderJob,
         timeout: std::time::Duration,
     ) -> bool {
-        let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
+        let profile = render_profile_enabled();
         let started = profile.then(std::time::Instant::now);
         let mut draw_tail = self.draw_tail.lock().unwrap();
         seal_draw_tail_locked(&mut draw_tail);
@@ -498,7 +683,7 @@ impl RenderThread {
         if draws.is_empty() {
             return true;
         }
-        let profile = std::env::var_os("NEXIUM_RENDER_PROFILE").is_some();
+        let profile = render_profile_enabled();
         let started = profile.then(std::time::Instant::now);
         let hard_after = draws.last().is_some_and(PreparedDrawBatch::hard_after);
         let hard_after_handle = draws
@@ -507,21 +692,56 @@ impl RenderThread {
         let draw_count = draws.len();
         let mut draw_tail = self.draw_tail.lock().unwrap();
         self.pending.fetch_add(draw_count, Ordering::AcqRel);
-        let submitted = match self.tx.send_timeout(RenderWork::DrawGroup(draws), timeout) {
-            Ok(()) => {
-                if hard_after {
-                    *draw_tail = None;
-                } else {
-                    *draw_tail = hard_after_handle;
-                }
-                true
-            }
-            Err(SendTimeoutError::Timeout(_) | SendTimeoutError::Disconnected(_)) => {
+        let submitted = if self.draw_work_budget.enabled() {
+            let budget_started = Instant::now();
+            if !self.draw_work_budget.reserve(draw_count, label, timeout) {
                 self.pending.fetch_sub(draw_count, Ordering::Release);
                 if hard_after {
                     seal_draw_tail_locked(&mut draw_tail);
                 }
                 false
+            } else {
+                let remaining = timeout.saturating_sub(budget_started.elapsed());
+                let sent = match self
+                    .tx
+                    .send_timeout(RenderWork::DrawGroup(draws), remaining)
+                {
+                    Ok(()) => true,
+                    Err(SendTimeoutError::Timeout(_) | SendTimeoutError::Disconnected(_)) => false,
+                };
+                if sent {
+                    if hard_after {
+                        *draw_tail = None;
+                    } else {
+                        *draw_tail = hard_after_handle;
+                    }
+                    true
+                } else {
+                    self.draw_work_budget.release(draw_count);
+                    self.pending.fetch_sub(draw_count, Ordering::Release);
+                    if hard_after {
+                        seal_draw_tail_locked(&mut draw_tail);
+                    }
+                    false
+                }
+            }
+        } else {
+            match self.tx.send_timeout(RenderWork::DrawGroup(draws), timeout) {
+                Ok(()) => {
+                    if hard_after {
+                        *draw_tail = None;
+                    } else {
+                        *draw_tail = hard_after_handle;
+                    }
+                    true
+                }
+                Err(SendTimeoutError::Timeout(_) | SendTimeoutError::Disconnected(_)) => {
+                    self.pending.fetch_sub(draw_count, Ordering::Release);
+                    if hard_after {
+                        seal_draw_tail_locked(&mut draw_tail);
+                    }
+                    false
+                }
             }
         };
         drop(draw_tail);
@@ -583,6 +803,20 @@ fn render_queue_depth() -> usize {
         .unwrap_or(256)
 }
 
+fn pending_group_budget_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PENDING_DRAW_GROUP_BUDGET)
+}
+
+fn render_pending_group_budget() -> usize {
+    pending_group_budget_from_value(
+        std::env::var("NEXIUM_RENDER_PENDING_GROUP_BUDGET")
+            .ok()
+            .as_deref(),
+    )
+}
+
 fn async_render_enabled() -> bool {
     match std::env::var("NEXIUM_ASYNC_RENDER").ok().as_deref() {
         Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF") | Some("no")
@@ -640,9 +874,11 @@ fn dedicated_present_thread() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        draw_group_fit_end_reason, draw_group_fits, recv_group_candidate, rejected_draw_end_reason,
-        retain_received_if_unsealed, seal_draw_tail_locked, sealed_candidate_end_reason,
-        DrawGatherEndReason, RenderThread, DRAW_GATHER_GRACE, MAX_DRAW_GROUPS_PER_SUBMISSION,
+        draw_group_fit_end_reason, draw_group_fits, pending_group_budget_from_value,
+        recv_group_candidate, rejected_draw_end_reason, retain_received_if_unsealed,
+        seal_draw_tail_locked, sealed_candidate_end_reason, DrawGatherEndReason, DrawWorkBudget,
+        DrawWorkCompletion, RenderThread, DEFAULT_PENDING_DRAW_GROUP_BUDGET, DRAW_GATHER_GRACE,
+        MAX_DRAW_GROUPS_PER_SUBMISSION,
     };
     use crossbeam::channel::bounded;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -661,6 +897,120 @@ mod tests {
             worker.pending.load(std::sync::atomic::Ordering::Acquire) == 0,
             "render worker did not become idle"
         );
+    }
+
+    #[test]
+    fn pending_group_budget_defaults_to_exact_legacy_mode_and_accepts_opt_in_limit() {
+        assert_eq!(
+            pending_group_budget_from_value(None),
+            DEFAULT_PENDING_DRAW_GROUP_BUDGET
+        );
+        assert_eq!(pending_group_budget_from_value(Some("128")), 128);
+        assert_eq!(pending_group_budget_from_value(Some("0")), 0);
+        assert_eq!(
+            pending_group_budget_from_value(Some("invalid")),
+            DEFAULT_PENDING_DRAW_GROUP_BUDGET
+        );
+
+        let legacy = DrawWorkBudget::new(0);
+        assert!(!legacy.enabled());
+        assert!(legacy.reserve(usize::MAX, "legacy-test", Duration::from_secs(1)));
+        legacy.release(usize::MAX);
+        assert_eq!(legacy.outstanding(), 0);
+    }
+
+    #[test]
+    fn pending_group_budget_blocks_until_completed_work_releases_capacity() {
+        let budget = Arc::new(DrawWorkBudget::new(128));
+        assert!(budget.reserve(64, "first", Duration::from_secs(1)));
+        assert!(budget.reserve(64, "second", Duration::from_secs(1)));
+        assert_eq!(budget.outstanding(), 128);
+
+        let waiter_budget = Arc::clone(&budget);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            let reserved = waiter_budget.reserve(1, "waiter", Duration::from_secs(1));
+            if reserved {
+                waiter_budget.release(1);
+            }
+            done_tx.send(reserved).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+
+        budget.release(64);
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)), Ok(true));
+        waiter.join().unwrap();
+        assert_eq!(budget.outstanding(), 64);
+        budget.release(64);
+        assert_eq!(budget.outstanding(), 0);
+    }
+
+    #[test]
+    fn pending_group_budget_respects_reservation_timeout() {
+        let budget = DrawWorkBudget::new(64);
+        assert!(budget.reserve(64, "full", Duration::from_secs(1)));
+
+        let started = Instant::now();
+        assert!(!budget.reserve(1, "timeout", Duration::from_millis(20)));
+        assert!(started.elapsed() >= Duration::from_millis(15));
+        assert_eq!(budget.outstanding(), 64);
+
+        budget.release(64);
+        assert_eq!(budget.outstanding(), 0);
+    }
+
+    #[test]
+    fn pending_group_budget_admits_oversized_packet_only_when_empty() {
+        let budget = DrawWorkBudget::new(64);
+        assert!(budget.fits(0, 96));
+        assert!(!budget.fits(1, 96));
+        assert!(!budget.fits(usize::MAX, 1));
+        assert!(budget.reserve(96, "oversized", Duration::from_secs(1)));
+        assert_eq!(budget.outstanding(), 96);
+        budget.release(96);
+        assert_eq!(budget.outstanding(), 0);
+    }
+
+    #[test]
+    fn closing_pending_group_budget_unblocks_waiter_without_reserving() {
+        let budget = Arc::new(DrawWorkBudget::new(64));
+        assert!(budget.reserve(64, "full", Duration::from_secs(1)));
+        let waiter_budget = Arc::clone(&budget);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            done_tx
+                .send(waiter_budget.reserve(1, "closed-waiter", Duration::from_secs(1)))
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        budget.close();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)), Ok(false));
+        waiter.join().unwrap();
+        budget.release(64);
+        assert_eq!(budget.outstanding(), 0);
+    }
+
+    #[test]
+    fn draw_work_completion_releases_pending_and_budget_during_unwind() {
+        let budget = DrawWorkBudget::new(128);
+        assert!(budget.reserve(7, "panic", Duration::from_secs(1)));
+        let pending = AtomicUsize::new(7);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _completion = DrawWorkCompletion {
+                pending: &pending,
+                budget: &budget,
+                units: 7,
+            };
+            panic!("test unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(budget.outstanding(), 0);
     }
 
     #[test]

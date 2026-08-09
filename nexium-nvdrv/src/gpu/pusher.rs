@@ -192,7 +192,25 @@ pub(crate) mod kickprof {
     pub const MIRROR_EVICT: usize = 125;
     pub const MIRROR_PATCH: usize = 126;
     pub const RESIDENT_CBUF_DRAW: usize = 127;
-    pub const COUNT: usize = 128;
+    pub const TMPL_PROBE: usize = 128;
+    pub const TMPL_L0: usize = 129;
+    pub const TMPL_LRU: usize = 130;
+    pub const TMPL_OBS_BUNDLE: usize = 131;
+    pub const TMPL_OBS_LAYOUT: usize = 132;
+    pub const TMPL_OBS_TEX: usize = 133;
+    pub const TMPL_MISS: usize = 134;
+    pub const ENQPRE_RT: usize = 135;
+    pub const ENQPRE_SPH: usize = 136;
+    pub const ENQPRE_IND: usize = 137;
+    pub const ENQPRE_TEXLAY: usize = 138;
+    pub const ENQPRE_BUNDLE: usize = 139;
+    pub const PRES_WB: usize = 140;
+    pub const PRES_SUBMIT: usize = 141;
+    pub const PRES_WB_FLUSH: usize = 142;
+    pub const PRES_WB_READ: usize = 143;
+    pub const PRES_WB_POST: usize = 144;
+    pub const PREP_TEX_FAN: usize = 145;
+    pub const COUNT: usize = 146;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -323,6 +341,24 @@ pub(crate) mod kickprof {
         "mirevict",
         "mirpatch",
         "rescbuf",
+        "tmplprobe",
+        "tmpll0",
+        "tmpllru",
+        "tmplobsbund",
+        "tmplobslay",
+        "tmplobstex",
+        "tmplmiss",
+        "enqprert",
+        "enqpresph",
+        "enqpreind",
+        "enqpretexlay",
+        "enqprebundle",
+        "preswb",
+        "pressubmit",
+        "preswbflush",
+        "preswbread",
+        "preswbpost",
+        "preptexfan",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
@@ -540,6 +576,31 @@ pub(crate) fn gpu_profile_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_NVDRV_PROFILE").is_some())
 }
 
+fn semacq_ack_stat(elapsed: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("NEXIUM_PREP_PROFILE").is_some()) {
+        return;
+    }
+    static NS: AtomicU64 = AtomicU64::new(0);
+    static MAX_NS: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let ns = elapsed.as_nanos() as u64;
+    NS.fetch_add(ns, Ordering::Relaxed);
+    MAX_NS.fetch_max(ns, Ordering::Relaxed);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 512 == 0 {
+        let total = NS.swap(0, Ordering::Relaxed);
+        let max = MAX_NS.swap(0, Ordering::Relaxed);
+        log::warn!(
+            "[semacq-ack] waits={} window_avg_ms={:.2} window_max_ms={:.2}",
+            n,
+            total as f64 / 512.0 / 1_000_000.0,
+            max as f64 / 1_000_000.0
+        );
+    }
+}
+
 pub(crate) fn semrel_legacy() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -707,7 +768,7 @@ impl Pusher {
     ) -> bool {
         match &mut self.prep {
             super::prep::PrepLane::Inline(state) => state.run_event(
-                event, engines, mappings, stats, mem_read, mem_write, mem_copy,
+                event, None, engines, mappings, stats, mem_read, mem_write, mem_copy,
             ),
             super::prep::PrepLane::Threaded(handle) => {
                 handle.send(event);
@@ -1606,7 +1667,9 @@ impl Pusher {
                                     payload,
                                     ack: ack_tx,
                                 });
+                                let started = std::time::Instant::now();
                                 let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(4));
+                                semacq_ack_stat(started.elapsed());
                             }
                             continue;
                         }
@@ -1664,6 +1727,11 @@ impl Pusher {
             if !maxwell.pending_draws.is_empty() {
                 let gs_debug = gs_dump_enabled().then(|| maxwell.gs_debug_regs());
                 let draws = std::mem::take(&mut maxwell.pending_draws);
+                if let super::prep::PrepLane::Threaded(handle) = &self.prep {
+                    if let Some(recycled) = handle.try_take_recycled_draw_vec() {
+                        maxwell.pending_draws = recycled;
+                    }
+                }
                 if kickprof::enabled() {
                     kickprof::count(
                         kickprof::HOST_DRAWS,

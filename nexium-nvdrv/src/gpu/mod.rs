@@ -362,6 +362,14 @@ impl GuestMemoryAccess {
         self.writer.lock().is_some()
     }
 
+    pub(crate) fn writer(&self) -> Option<GuestMemoryWriter> {
+        self.writer.lock().clone()
+    }
+
+    pub(crate) fn read_mappings(&self) -> impl std::ops::Deref<Target = GpuMappings> + '_ {
+        self.mappings.read()
+    }
+
     pub(crate) fn write_gpu(&self, gpu_va: u64, bytes: &[u8]) -> Option<(u64, bool)> {
         let mappings = self.mappings.read();
         self.write_gpu_with_mappings(&mappings, gpu_va, bytes)

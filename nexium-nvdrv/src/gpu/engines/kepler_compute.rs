@@ -68,6 +68,37 @@ impl KeplerCompute {
         method == M_LOAD_INLINE_DATA && is_last_call && self.upload.copy_size > 0
     }
 
+    pub(crate) fn is_nonterminal_inline_data(method: u32, is_last_call: bool) -> bool {
+        method == M_LOAD_INLINE_DATA && !is_last_call
+    }
+
+    pub(crate) fn dispatch_inline_data_bulk<I>(&mut self, data: I)
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        if let Some(final_data) = self.upload.data_fast_bulk(data) {
+            self.regs[M_LOAD_INLINE_DATA as usize] = final_data;
+        }
+    }
+
+    pub fn dispatch_method_fast(&mut self, method: u32, arg: u32, is_last_call: bool) -> bool {
+        if self.method_requires_hard_boundary(method, is_last_call) {
+            return false;
+        }
+        let index = method as usize;
+        if index >= self.regs.len() {
+            log::trace!("KeplerCompute: invalid method {:#x} arg={:#x}", method, arg);
+            return true;
+        }
+        self.regs[index] = arg;
+        match method {
+            M_EXEC_UPLOAD => self.upload.exec(arg, &self.regs),
+            M_LOAD_INLINE_DATA => self.upload.data_fast(arg),
+            _ => {}
+        }
+        true
+    }
+
     pub fn dispatch_method(
         &mut self,
         method: u32,
@@ -161,9 +192,7 @@ impl KeplerCompute {
             tsc_limit: self.reg(M_TSC_LIMIT),
             tex_cb_index: self.reg(M_TEX_CB_INDEX),
         };
-        let profile_started = std::env::var_os("NEXIUM_NVDRV_PROFILE")
-            .is_some()
-            .then(std::time::Instant::now);
+        let profile_started = super::super::nvprof_enabled().then(std::time::Instant::now);
         let mut backend = "unsupported";
         let mut handled = false;
         let mut executed = false;
@@ -458,6 +487,43 @@ impl ComputeUpload {
         self.is_linear = (flags & 1) != 0;
     }
 
+    fn data_fast(&mut self, data: u32) {
+        let bytes = data.to_le_bytes();
+        let off = self.write_offset;
+        let mut n = 0;
+        if off < self.inline_buf.len() {
+            n = (self.inline_buf.len() - off).min(4);
+            self.inline_buf[off..off + n].copy_from_slice(&bytes[..n]);
+        }
+        self.write_offset += n;
+    }
+
+    fn data_fast_bulk<I>(&mut self, data: I) -> Option<u32>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let mut data = data.into_iter();
+        let mut final_data = None;
+        let mut off = self.write_offset;
+
+        while off < self.inline_buf.len() {
+            let Some(word) = data.next() else {
+                break;
+            };
+            final_data = Some(word);
+            let bytes = word.to_le_bytes();
+            let n = (self.inline_buf.len() - off).min(4);
+            self.inline_buf[off..off + n].copy_from_slice(&bytes[..n]);
+            off += n;
+        }
+
+        for word in data {
+            final_data = Some(word);
+        }
+        self.write_offset = off;
+        final_data
+    }
+
     fn data(
         &mut self,
         data: u32,
@@ -467,14 +533,7 @@ impl ComputeUpload {
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
         regs: &[u32],
     ) -> super::KeplerMemoryWriteOutcome {
-        let bytes = data.to_le_bytes();
-        let off = self.write_offset;
-        let mut n = 0;
-        if off < self.inline_buf.len() {
-            n = (self.inline_buf.len() - off).min(4);
-            self.inline_buf[off..off + n].copy_from_slice(&bytes[..n]);
-        }
-        self.write_offset += n;
+        self.data_fast(data);
         if is_last_call && self.copy_size > 0 {
             let outcome = self.flush(mappings, mem_read, mem_write, regs);
             self.copy_size = 0;
@@ -623,7 +682,8 @@ fn trace_upload(
     linear: bool,
     bytes: usize,
 ) {
-    if std::env::var_os("NEXIUM_COMPUTE_UPLOAD_TRACE").is_none() {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("NEXIUM_COMPUTE_UPLOAD_TRACE").is_some()) {
         return;
     }
     log::warn!(
@@ -646,6 +706,63 @@ mod tests {
         M_LAUNCH_DESC_LOC, M_LINE_COUNT, M_LINE_LENGTH_IN, M_LOAD_INLINE_DATA, M_OFFSET_OUT_LOWER,
         M_PITCH_OUT,
     };
+
+    fn compute_with_upload_capacity(copy_size: usize) -> KeplerCompute {
+        let mut compute = KeplerCompute::new();
+        compute.regs[M_LINE_LENGTH_IN as usize] = copy_size as u32;
+        compute.regs[M_LINE_COUNT as usize] = 1;
+        assert!(compute.dispatch_method_fast(M_EXEC_UPLOAD, 1, false));
+        compute
+    }
+
+    fn assert_bulk_matches_scalar(copy_size: usize, words: &[u32]) -> KeplerCompute {
+        let mut scalar = compute_with_upload_capacity(copy_size);
+        for &word in words {
+            assert!(scalar.dispatch_method_fast(M_LOAD_INLINE_DATA, word, false));
+        }
+
+        let mut bulk = compute_with_upload_capacity(copy_size);
+        bulk.dispatch_inline_data_bulk(words.iter().copied());
+
+        assert_eq!(bulk.upload.inline_buf, scalar.upload.inline_buf);
+        assert_eq!(bulk.upload.write_offset, scalar.upload.write_offset);
+        assert_eq!(bulk.upload.copy_size, scalar.upload.copy_size);
+        assert_eq!(
+            bulk.regs[M_LOAD_INLINE_DATA as usize],
+            scalar.regs[M_LOAD_INLINE_DATA as usize]
+        );
+        bulk
+    }
+
+    #[test]
+    fn bulk_inline_data_matches_single_and_large_scalar_runs() {
+        let single = assert_bulk_matches_scalar(4, &[0x1122_3344]);
+        assert_eq!(single.upload.inline_buf, [0x44, 0x33, 0x22, 0x11]);
+
+        let words: Vec<u32> = (0..1024).map(|word| word ^ 0xA5A5_5A5A).collect();
+        let large = assert_bulk_matches_scalar(words.len() * 4, &words);
+        assert_eq!(large.upload.write_offset, words.len() * 4);
+        assert_eq!(
+            large.regs[M_LOAD_INLINE_DATA as usize],
+            *words.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn bulk_inline_data_matches_partial_last_scalar_word() {
+        let bulk = assert_bulk_matches_scalar(6, &[0x1122_3344, 0x5566_7788]);
+        assert_eq!(bulk.upload.inline_buf, [0x44, 0x33, 0x22, 0x11, 0x88, 0x77]);
+        assert_eq!(bulk.upload.write_offset, 6);
+    }
+
+    #[test]
+    fn bulk_inline_data_matches_overflow_and_keeps_final_register() {
+        let words = [0x1122_3344, 0x5566_7788, 0x99AA_BBCC];
+        let bulk = assert_bulk_matches_scalar(5, &words);
+        assert_eq!(bulk.upload.inline_buf, [0x44, 0x33, 0x22, 0x11, 0x88]);
+        assert_eq!(bulk.upload.write_offset, 5);
+        assert_eq!(bulk.regs[M_LOAD_INLINE_DATA as usize], 0x99AA_BBCC);
+    }
 
     #[test]
     fn terminal_inline_upload_reports_exact_written_span() {

@@ -1374,6 +1374,28 @@ impl RtCache {
         format: vk::Format,
         aspects: vk::ImageAspectFlags,
     ) -> Result<(&mut GpuImage, bool), String> {
+        self.get_or_create_depth_impl(key, device, format, aspects, None)
+    }
+
+    pub fn get_or_create_depth_retiring(
+        &mut self,
+        key: RtKey,
+        device: &ash::Device,
+        format: vk::Format,
+        aspects: vk::ImageAspectFlags,
+        retired: &mut Vec<GpuImage>,
+    ) -> Result<(&mut GpuImage, bool), String> {
+        self.get_or_create_depth_impl(key, device, format, aspects, Some(retired))
+    }
+
+    fn get_or_create_depth_impl(
+        &mut self,
+        key: RtKey,
+        device: &ash::Device,
+        format: vk::Format,
+        aspects: vk::ImageAspectFlags,
+        mut retired: Option<&mut Vec<GpuImage>>,
+    ) -> Result<(&mut GpuImage, bool), String> {
         if aspects.is_empty() {
             return Err("depth image requires at least one aspect".to_string());
         }
@@ -1386,10 +1408,9 @@ impl RtCache {
                 .find(|existing| same_physical_backing(*existing, key))
                 .unwrap_or(key)
         };
-        let recreate = self
-            .depth_cache
-            .get(&cache_key)
-            .is_some_and(|image| image.format != format || image.aspects != aspects);
+        let recreate = self.depth_cache.get(&cache_key).is_some_and(|image| {
+            depth_image_requires_recreate(image.format, image.aspects, format, aspects)
+        });
         if recreate {
             self.forget_depth_tracking(cache_key);
             if let Some(image) = self.depth_cache.remove(&cache_key) {
@@ -1398,7 +1419,11 @@ impl RtCache {
                     &mut self.depth_guest_range_index,
                     cache_key,
                 );
-                destroy_gpu_image(device, image);
+                if let Some(retired) = retired.as_mut() {
+                    retired.push(image);
+                } else {
+                    destroy_gpu_image(device, image);
+                }
             }
         }
         let created = !self.depth_cache.contains_key(&cache_key);
@@ -2125,6 +2150,15 @@ impl RtCache {
         self.depth_generations.clear();
         self.depth_shadow_generations.clear();
     }
+}
+
+fn depth_image_requires_recreate(
+    existing_format: vk::Format,
+    existing_aspects: vk::ImageAspectFlags,
+    requested_format: vk::Format,
+    requested_aspects: vk::ImageAspectFlags,
+) -> bool {
+    existing_format != requested_format || existing_aspects != requested_aspects
 }
 
 fn get_or_create_sample_view(
@@ -3109,6 +3143,30 @@ mod tests {
         assert!(!same_d24_depth_allocation_covering(
             allocation,
             RtKey::new(57, 1068, 599, 0x524370000),
+        ));
+    }
+
+    #[test]
+    fn depth_recreation_requires_matching_format_and_aspects() {
+        let depth = vk::ImageAspectFlags::DEPTH;
+        let depth_stencil = depth | vk::ImageAspectFlags::STENCIL;
+        assert!(!super::depth_image_requires_recreate(
+            vk::Format::D32_SFLOAT,
+            depth,
+            vk::Format::D32_SFLOAT,
+            depth,
+        ));
+        assert!(super::depth_image_requires_recreate(
+            vk::Format::D32_SFLOAT,
+            depth,
+            vk::Format::D24_UNORM_S8_UINT,
+            depth,
+        ));
+        assert!(super::depth_image_requires_recreate(
+            vk::Format::D24_UNORM_S8_UINT,
+            depth,
+            vk::Format::D24_UNORM_S8_UINT,
+            depth_stencil,
         ));
     }
 

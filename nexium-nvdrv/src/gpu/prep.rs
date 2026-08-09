@@ -75,6 +75,90 @@ pub(crate) enum PrepEvent {
     SetGuestMemory(Option<super::GuestMemoryAccess>),
 }
 
+fn engb_prof_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_PREP_PROFILE").is_some())
+}
+
+fn bulk_compute_upload_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_BULK_COMPUTE_UPLOAD").ok().as_deref(),
+            Some("1")
+                | Some("true")
+                | Some("TRUE")
+                | Some("on")
+                | Some("ON")
+                | Some("yes")
+                | Some("YES")
+        )
+    })
+}
+
+fn nonterminal_inline_data_run_end(methods: &[(u32, u32, bool)], start: usize) -> usize {
+    let mut end = start;
+    while let Some(&(method, _, is_last)) = methods.get(end) {
+        if !KeplerCompute::is_nonterminal_inline_data(method, is_last) {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
+fn engb_prof_record(class: u32, methods: usize, elapsed: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static METHODS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static BATCHES: AtomicU64 = AtomicU64::new(0);
+    let slot = match class {
+        super::engines::MAXWELL_DMA_CLASS => 0,
+        super::engines::FERMI_2D_CLASS => 1,
+        super::engines::KEPLER_MEMORY_CLASS => 2,
+        super::engines::KEPLER_COMPUTE_CLASS => 3,
+        _ => 4,
+    };
+    NS[slot].fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    METHODS[slot].fetch_add(methods as u64, Ordering::Relaxed);
+    let batches = BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    if batches % 8192 == 0 {
+        let mut parts = Vec::with_capacity(5);
+        for (slot, name) in ["dma", "fermi", "kmem", "kcomp", "other"]
+            .iter()
+            .enumerate()
+        {
+            let ms = NS[slot].swap(0, Ordering::Relaxed) as f64 / 1_000_000.0;
+            let methods = METHODS[slot].swap(0, Ordering::Relaxed);
+            parts.push(format!("{}={:.1}ms/n{}", name, ms, methods));
+        }
+        log::warn!("[engb-prof] window {}", parts.join(" "));
+    }
+}
+
+fn draw_prof_start() -> Option<std::time::Instant> {
+    engb_prof_enabled().then(std::time::Instant::now)
+}
+
+fn draw_prof_record(flushes: u64, draws: u64, started: Option<std::time::Instant>) {
+    let Some(started) = started else { return };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NS: AtomicU64 = AtomicU64::new(0);
+    static FLUSHES: AtomicU64 = AtomicU64::new(0);
+    static DRAWS: AtomicU64 = AtomicU64::new(0);
+    NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    DRAWS.fetch_add(draws, Ordering::Relaxed);
+    let flushes_total = FLUSHES.fetch_add(flushes, Ordering::Relaxed) + flushes;
+    if flushes_total % 4096 < flushes {
+        log::warn!(
+            "[draw-prof] window flush_ms={:.1} flushes={} draws={}",
+            NS.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
+            flushes_total,
+            DRAWS.swap(0, Ordering::Relaxed)
+        );
+    }
+}
+
 pub(crate) struct PrepEngines<'a> {
     pub(crate) maxwell_dma: &'a mut MaxwellDma,
     pub(crate) fermi_2d: &'a mut Fermi2D,
@@ -85,6 +169,8 @@ pub(crate) struct PrepEngines<'a> {
 pub(crate) struct PrepState {
     pub(crate) renderer: Option<Arc<nexium_gpu::Renderer>>,
     pub(crate) guest_memory: Option<super::GuestMemoryAccess>,
+    pending_small_rt_wb:
+        Option<std::sync::mpsc::Receiver<Vec<super::vk_dispatch::GuestWriteChunk>>>,
     pub(crate) vk_batch: Vec<nexium_gpu::draw::Maxwell3dDrawCall>,
     pub(crate) prepared_draw_packets: PreparedDrawPacketizer,
     pub(crate) ssbo_snapshot_cache: SsboSnapshotCache,
@@ -100,6 +186,7 @@ impl PrepState {
     pub(crate) fn run_event(
         &mut self,
         event: PrepEvent,
+        draw_vec_recycle_tx: Option<&crossbeam::channel::Sender<Vec<DrawCall>>>,
         engines: &mut PrepEngines,
         mappings: &GpuMappings,
         stats: &PipelineStats,
@@ -134,6 +221,7 @@ impl PrepState {
                 writeback_small_rts,
                 on_complete,
             } => {
+                self.join_small_rt_writeback(mappings);
                 let kp_tail = kickprof::start();
                 self.resolve_pending_compute(mappings, mem_write);
                 kickprof::add(kickprof::RESOLVE_TAIL, kp_tail);
@@ -159,26 +247,53 @@ impl PrepState {
                 job,
                 flush_small_rts,
             } => {
+                let kp_wb = super::pusher::kickprof::start();
                 if flush_small_rts
                     && self.renderer.is_some()
                     && super::vk_dispatch::has_pending_small_rt_writebacks()
                 {
                     let renderer = self.renderer.clone().unwrap();
-                    let _ = self.writeback_small_rts(&renderer, mappings, mem_write);
+                    let async_memory = super::vk_dispatch::async_small_rt_writeback_enabled()
+                        .then(|| self.guest_memory.clone())
+                        .flatten()
+                        .filter(super::GuestMemoryAccess::is_available);
+                    if let Some(memory) = async_memory {
+                        self.join_small_rt_writeback(mappings);
+                        let kp_flush = super::pusher::kickprof::start();
+                        let flushed = self.flush_prepared_draw_packets();
+                        super::pusher::kickprof::add(
+                            super::pusher::kickprof::PRES_WB_FLUSH,
+                            kp_flush,
+                        );
+                        if flushed {
+                            self.pending_small_rt_wb =
+                                super::vk_dispatch::spawn_small_rt_writeback_async(
+                                    &renderer, memory,
+                                );
+                        } else {
+                            log::warn!("[rt-writeback] skipped after prepared draw drain failure");
+                        }
+                    } else {
+                        let _ = self.writeback_small_rts(&renderer, mappings, mem_write);
+                    }
                 } else {
                     self.flush_prepared_draw_packets();
                 }
+                super::pusher::kickprof::add(super::pusher::kickprof::PRES_WB, kp_wb);
+                let kp_submit = super::pusher::kickprof::start();
                 if let Some(rt) = crate::render_thread::maybe_render_thread() {
                     rt.submit_named("async-present-readback", job);
                 } else {
                     job();
                 }
+                super::pusher::kickprof::add(super::pusher::kickprof::PRES_SUBMIT, kp_submit);
                 true
             }
             PrepEvent::DrainBarrier {
                 done,
                 flush_small_rts,
             } => {
+                self.join_small_rt_writeback(mappings);
                 if flush_small_rts
                     && self.renderer.is_some()
                     && super::vk_dispatch::has_pending_small_rt_writebacks()
@@ -605,14 +720,50 @@ impl PrepState {
                 if let Some(probe) = compute_probe {
                     probe.finish();
                 }
+                recycle_processed_draw_vec(draw_vec_recycle_tx, draws);
                 true
             }
             PrepEvent::EngineMethods { class, methods } => {
-                for (method, arg, is_last) in methods {
-                    let _ = self.run_engine_method(
-                        class, method, arg, is_last, engines, mappings, stats, mem_read, mem_write,
-                        mem_copy,
-                    );
+                let started = engb_prof_enabled().then(std::time::Instant::now);
+                let count = methods.len();
+                if class == super::engines::KEPLER_COMPUTE_CLASS {
+                    let bulk_upload = bulk_compute_upload_enabled();
+                    let mut cursor = 0;
+                    while cursor < methods.len() {
+                        if bulk_upload {
+                            let end = nonterminal_inline_data_run_end(&methods, cursor);
+                            if end != cursor {
+                                engines.kepler_compute.dispatch_inline_data_bulk(
+                                    methods[cursor..end].iter().map(|&(_, arg, _)| arg),
+                                );
+                                cursor = end;
+                                continue;
+                            }
+                        }
+
+                        let (method, arg, is_last) = methods[cursor];
+                        if !engines
+                            .kepler_compute
+                            .dispatch_method_fast(method, arg, is_last)
+                        {
+                            let _ = self.run_engine_method(
+                                class, method, arg, is_last, engines, mappings, stats, mem_read,
+                                mem_write, mem_copy,
+                            );
+                        }
+                        cursor += 1;
+                    }
+                    self.invalidate_resolved_compute_writebacks(mappings);
+                } else {
+                    for (method, arg, is_last) in methods {
+                        let _ = self.run_engine_method(
+                            class, method, arg, is_last, engines, mappings, stats, mem_read,
+                            mem_write, mem_copy,
+                        );
+                    }
+                }
+                if let Some(started) = started {
+                    engb_prof_record(class, count, started.elapsed());
                 }
                 true
             }
@@ -872,13 +1023,34 @@ impl PrepState {
         super::pusher::kickprof::add(super::pusher::kickprof::EPOCH_END, kp);
     }
 
+    fn join_small_rt_writeback(&mut self, mappings: &GpuMappings) {
+        let Some(rx) = self.pending_small_rt_wb.take() else {
+            return;
+        };
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(chunks) => {
+                if !chunks.is_empty() {
+                    super::vk_dispatch::apply_small_rt_writeback_chunks(
+                        &mut self.ssbo_snapshot_cache,
+                        mappings,
+                        &chunks,
+                    );
+                }
+            }
+            Err(_) => log::warn!("[rt-writeback] async join timed out"),
+        }
+    }
+
     pub(crate) fn writeback_small_rts(
         &mut self,
         renderer: &Arc<nexium_gpu::Renderer>,
         mappings: &GpuMappings,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) -> bool {
-        if !self.flush_prepared_draw_packets() {
+        let kp_flush = super::pusher::kickprof::start();
+        let flushed = self.flush_prepared_draw_packets();
+        super::pusher::kickprof::add(super::pusher::kickprof::PRES_WB_FLUSH, kp_flush);
+        if !flushed {
             log::warn!("[rt-writeback] skipped after prepared draw drain failure");
             return false;
         }
@@ -996,6 +1168,8 @@ impl PrepState {
             }
             return;
         }
+        let dp = draw_prof_start();
+        let batch_len = self.vk_batch.len();
         let kp = super::pusher::kickprof::start();
         if let Some(r) = self.renderer.clone() {
             if hard_after {
@@ -1026,6 +1200,7 @@ impl PrepState {
             self.vk_batch.clear();
         }
         super::pusher::kickprof::add(super::pusher::kickprof::FLUSHP, kp);
+        draw_prof_record(1, batch_len as u64, dp);
     }
 
     pub(crate) fn resolve_pending_compute(
@@ -1236,6 +1411,7 @@ impl PrepState {
         Self {
             renderer: None,
             guest_memory: None,
+            pending_small_rt_wb: None,
             vk_batch: Vec::new(),
             prepared_draw_packets: PreparedDrawPacketizer::default(),
             ssbo_snapshot_cache: SsboSnapshotCache::default(),
@@ -1310,11 +1486,143 @@ pub(crate) enum PrepEngineAccess<'a, 'b> {
 
 pub(crate) struct PrepThreadHandle {
     tx: crossbeam::channel::Sender<PrepEvent>,
+    draw_vec_recycle_rx: Option<crossbeam::channel::Receiver<Vec<DrawCall>>>,
     inflight_kicks: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
 }
 
 const PREP_EVENT_QUEUE_CAPACITY: usize = 4096;
-const PREP_KICKS_IN_FLIGHT: usize = 2;
+const DRAW_VEC_RECYCLE_QUEUE_CAPACITY: usize = 256;
+
+static DRAW_VEC_RECYCLE_HITS: AtomicU64 = AtomicU64::new(0);
+static DRAW_VEC_RECYCLE_MISSES: AtomicU64 = AtomicU64::new(0);
+static DRAW_VEC_RECYCLE_RETURNS: AtomicU64 = AtomicU64::new(0);
+static DRAW_VEC_RECYCLE_DROPS: AtomicU64 = AtomicU64::new(0);
+static DRAW_VEC_RECYCLE_CAPACITY_SUM: AtomicU64 = AtomicU64::new(0);
+static DRAW_VEC_RECYCLE_CAPACITY_MAX: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Default)]
+struct DrawVecRecycleStats {
+    hits: u64,
+    misses: u64,
+    returns: u64,
+    drops: u64,
+    capacity_sum: u64,
+    capacity_max: u64,
+}
+
+impl DrawVecRecycleStats {
+    fn snapshot() -> Self {
+        Self {
+            hits: DRAW_VEC_RECYCLE_HITS.load(Ordering::Relaxed),
+            misses: DRAW_VEC_RECYCLE_MISSES.load(Ordering::Relaxed),
+            returns: DRAW_VEC_RECYCLE_RETURNS.load(Ordering::Relaxed),
+            drops: DRAW_VEC_RECYCLE_DROPS.load(Ordering::Relaxed),
+            capacity_sum: DRAW_VEC_RECYCLE_CAPACITY_SUM.load(Ordering::Relaxed),
+            capacity_max: DRAW_VEC_RECYCLE_CAPACITY_MAX.load(Ordering::Relaxed),
+        }
+    }
+
+    fn since(self, previous: Self) -> Self {
+        Self {
+            hits: self.hits.saturating_sub(previous.hits),
+            misses: self.misses.saturating_sub(previous.misses),
+            returns: self.returns.saturating_sub(previous.returns),
+            drops: self.drops.saturating_sub(previous.drops),
+            capacity_sum: self.capacity_sum.saturating_sub(previous.capacity_sum),
+            capacity_max: self.capacity_max,
+        }
+    }
+
+    fn average_returned_capacity(self) -> f64 {
+        if self.returns == 0 {
+            0.0
+        } else {
+            self.capacity_sum as f64 / self.returns as f64
+        }
+    }
+}
+
+fn record_draw_vec_recycle_result(hit: bool) {
+    if !engb_prof_enabled() {
+        return;
+    }
+    if hit {
+        DRAW_VEC_RECYCLE_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        DRAW_VEC_RECYCLE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn record_draw_vec_recycle_return(returned: bool, capacity: usize) {
+    if !engb_prof_enabled() {
+        return;
+    }
+    if returned {
+        DRAW_VEC_RECYCLE_RETURNS.fetch_add(1, Ordering::Relaxed);
+        DRAW_VEC_RECYCLE_CAPACITY_SUM.fetch_add(capacity as u64, Ordering::Relaxed);
+        DRAW_VEC_RECYCLE_CAPACITY_MAX.fetch_max(capacity as u64, Ordering::Relaxed);
+    } else {
+        DRAW_VEC_RECYCLE_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn draw_vec_recycling_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_RECYCLE_DRAW_VECS").ok().as_deref(),
+            Some("1")
+                | Some("true")
+                | Some("TRUE")
+                | Some("on")
+                | Some("ON")
+                | Some("yes")
+                | Some("YES")
+        )
+    })
+}
+
+fn recycle_processed_draw_vec(
+    tx: Option<&crossbeam::channel::Sender<Vec<DrawCall>>>,
+    mut draws: Vec<DrawCall>,
+) -> bool {
+    let Some(tx) = tx else {
+        record_draw_vec_recycle_return(false, draws.capacity());
+        return false;
+    };
+    draws.clear();
+    let capacity = draws.capacity();
+    let returned = tx.try_send(draws).is_ok();
+    record_draw_vec_recycle_return(returned, capacity);
+    returned
+}
+
+fn try_receive_recycled_draw_vec(
+    rx: Option<&crossbeam::channel::Receiver<Vec<DrawCall>>>,
+) -> Option<Vec<DrawCall>> {
+    let Some(rx) = rx else {
+        record_draw_vec_recycle_result(false);
+        return None;
+    };
+    let Ok(mut draws) = rx.try_recv() else {
+        record_draw_vec_recycle_result(false);
+        return None;
+    };
+    draws.clear();
+    record_draw_vec_recycle_result(true);
+    Some(draws)
+}
+
+fn prep_kicks_in_flight() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_PREP_KICKS_IN_FLIGHT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|limit| (1..=4).contains(limit))
+            .unwrap_or(2)
+    })
+}
 
 impl PrepThreadHandle {
     pub(crate) fn send(&self, event: PrepEvent) {
@@ -1323,10 +1631,14 @@ impl PrepThreadHandle {
         }
     }
 
+    pub(crate) fn try_take_recycled_draw_vec(&self) -> Option<Vec<DrawCall>> {
+        try_receive_recycled_draw_vec(self.draw_vec_recycle_rx.as_ref())
+    }
+
     pub(crate) fn begin_kick(&self) {
         let (lock, condvar) = &*self.inflight_kicks;
         let mut inflight = lock.lock().unwrap_or_else(|error| error.into_inner());
-        while *inflight >= PREP_KICKS_IN_FLIGHT {
+        while *inflight >= prep_kicks_in_flight() {
             inflight = condvar
                 .wait(inflight)
                 .unwrap_or_else(|error| error.into_inner());
@@ -1359,6 +1671,13 @@ pub(crate) fn spawn_prep_thread(
     resources: PrepThreadResources,
 ) -> PrepThreadHandle {
     let (tx, rx) = crossbeam::channel::bounded::<PrepEvent>(PREP_EVENT_QUEUE_CAPACITY);
+    let (draw_vec_recycle_tx, draw_vec_recycle_rx) = if draw_vec_recycling_enabled() {
+        let (tx, rx) =
+            crossbeam::channel::bounded::<Vec<DrawCall>>(DRAW_VEC_RECYCLE_QUEUE_CAPACITY);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let inflight_kicks = Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
     let worker_inflight = Arc::clone(&inflight_kicks);
     std::thread::Builder::new()
@@ -1376,6 +1695,7 @@ pub(crate) fn spawn_prep_thread(
                 }
                 let _ = SetThreadPriority(GetCurrentThread(), 2);
             }
+            super::vk_dispatch::set_prep_sync_guest_read(resources.mem_read.clone());
             let mem_read = move |addr: u64, buf: &mut [u8]| (resources.mem_read)(addr, buf);
             let mem_write = move |addr: u64, buf: &[u8]| (resources.mem_write)(addr, buf);
             let mem_copy =
@@ -1384,6 +1704,7 @@ pub(crate) fn spawn_prep_thread(
             let mut prof_events = 0u64;
             let mut prof_kicks = 0u64;
             let mut prof_class_ns = [0u64; 16];
+            let mut prof_recycle_last = DrawVecRecycleStats::snapshot();
             fn event_class_index(event: &PrepEvent) -> usize {
                 match event {
                     PrepEvent::EngineMethod { .. } => 0,
@@ -1447,6 +1768,7 @@ pub(crate) fn spawn_prep_thread(
                         };
                         state.run_event(
                             event,
+                            draw_vec_recycle_tx.as_ref(),
                             &mut engines,
                             &mappings,
                             &resources.stats,
@@ -1489,12 +1811,27 @@ pub(crate) fn spawn_prep_thread(
                                 ));
                             }
                         }
+                        let recycle_total = DrawVecRecycleStats::snapshot();
+                        let recycle_window = recycle_total.since(prof_recycle_last);
                         log::warn!(
-                            "[prep-prof] kicks=64 busy_ms_per_kick={:.2} events_per_kick={:.1} |{}",
+                            "[prep-prof] kicks=64 busy_ms_per_kick={:.2} events_per_kick={:.1} |{} | draw_vec_recycle window=h{}/m{}/r{}/d{} cap_avg={:.1} total=h{}/m{}/r{}/d{} cap_avg={:.1} cap_max={} queue_cap={}",
                             prof_busy_ns as f64 / prof_kicks as f64 / 1_000_000.0,
                             prof_events as f64 / prof_kicks as f64,
                             classes,
+                            recycle_window.hits,
+                            recycle_window.misses,
+                            recycle_window.returns,
+                            recycle_window.drops,
+                            recycle_window.average_returned_capacity(),
+                            recycle_total.hits,
+                            recycle_total.misses,
+                            recycle_total.returns,
+                            recycle_total.drops,
+                            recycle_total.average_returned_capacity(),
+                            recycle_total.capacity_max,
+                            DRAW_VEC_RECYCLE_QUEUE_CAPACITY,
                         );
+                        prof_recycle_last = recycle_total;
                         prof_busy_ns = 0;
                         prof_events = 0;
                         prof_kicks = 0;
@@ -1504,5 +1841,76 @@ pub(crate) fn spawn_prep_thread(
             }
         })
         .expect("spawn GPU prep thread");
-    PrepThreadHandle { tx, inflight_kicks }
+    PrepThreadHandle {
+        tx,
+        draw_vec_recycle_rx,
+        inflight_kicks,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        nonterminal_inline_data_run_end, recycle_processed_draw_vec, try_receive_recycled_draw_vec,
+    };
+    use crate::gpu::engines::maxwell3d::DrawCall;
+
+    #[test]
+    fn bulk_compute_upload_scanner_stops_before_terminal_word() {
+        let methods = [
+            (0x6C, 0, false),
+            (0x6D, 1, false),
+            (0x6D, 2, false),
+            (0x6D, 3, true),
+            (0x6D, 4, false),
+            (0xAF, 5, false),
+        ];
+
+        assert_eq!(nonterminal_inline_data_run_end(&methods, 0), 0);
+        assert_eq!(nonterminal_inline_data_run_end(&methods, 1), 3);
+        assert_eq!(nonterminal_inline_data_run_end(&methods, 3), 3);
+        assert_eq!(nonterminal_inline_data_run_end(&methods, 4), 5);
+        assert_eq!(
+            nonterminal_inline_data_run_end(&methods, methods.len()),
+            methods.len()
+        );
+    }
+
+    #[test]
+    fn draw_vec_recycle_roundtrips_outer_capacity_and_returns_empty() {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        let mut draws = Vec::with_capacity(19);
+        let mut draw = DrawCall::default();
+        draw.inline_indices = vec![1, 2, 3, 4];
+        draws.push(draw);
+        let capacity = draws.capacity();
+
+        assert!(recycle_processed_draw_vec(Some(&tx), draws));
+        let recycled = try_receive_recycled_draw_vec(Some(&rx)).unwrap();
+
+        assert!(recycled.is_empty());
+        assert_eq!(recycled.capacity(), capacity);
+    }
+
+    #[test]
+    fn draw_vec_recycle_unavailable_and_full_paths_never_wait() {
+        assert!(!recycle_processed_draw_vec(None, vec![DrawCall::default()]));
+        assert!(try_receive_recycled_draw_vec(None).is_none());
+
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        let queued = Vec::<DrawCall>::with_capacity(7);
+        tx.try_send(queued).unwrap();
+        assert!(!recycle_processed_draw_vec(
+            Some(&tx),
+            vec![DrawCall::default()]
+        ));
+        assert_eq!(rx.try_recv().unwrap().capacity(), 7);
+
+        let (disconnected_tx, disconnected_rx) = crossbeam::channel::bounded(1);
+        drop(disconnected_rx);
+        assert!(!recycle_processed_draw_vec(
+            Some(&disconnected_tx),
+            vec![DrawCall::default()]
+        ));
+    }
 }

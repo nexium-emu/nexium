@@ -48,8 +48,13 @@ pub(crate) fn known_driver_hostile_pipeline(vs_hash: u64, fs_hash: u64) -> bool 
     KNOWN_DRIVER_HOSTILE_PIPELINES.contains(&(vs_hash, fs_hash))
 }
 
-fn cache_save_due(dirty: bool, specs_dirty: bool, idle: std::time::Duration) -> bool {
-    (dirty || specs_dirty) && idle >= CACHE_SAVE_IDLE_INTERVAL
+fn cache_save_due(
+    dirty: bool,
+    specs_dirty: bool,
+    idle: std::time::Duration,
+    builds_in_flight: bool,
+) -> bool {
+    !builds_in_flight && (dirty || specs_dirty) && idle >= CACHE_SAVE_IDLE_INTERVAL
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -779,15 +784,27 @@ impl PipelineCache {
                                 Err(_) => break,
                             }
                         };
-                        let pipe =
-                            match build_graphics_pipeline(&dev, wcache, wlayout, &wlock, &req) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    log::warn!("async pipeline build failed: {}", e);
-                                    vk::Pipeline::null()
-                                }
-                            };
-                        if tx.send((req.key, pipe)).is_err() {
+                        let key = req.key;
+                        let pipe = match std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| {
+                                build_graphics_pipeline(&dev, wcache, wlayout, &wlock, &req)
+                            }),
+                        ) {
+                            Ok(Ok(p)) => p,
+                            Ok(Err(e)) => {
+                                log::warn!("async pipeline build failed: {}", e);
+                                vk::Pipeline::null()
+                            }
+                            Err(_) => {
+                                log::warn!(
+                                    "async pipeline worker panicked for vs_hash={:016x} fs_hash={:016x}",
+                                    key.vs_hash,
+                                    key.fs_hash
+                                );
+                                vk::Pipeline::null()
+                            }
+                        };
+                        if tx.send((key, pipe)).is_err() {
                             break;
                         }
                     })
@@ -830,20 +847,22 @@ impl PipelineCache {
         }
     }
 
-    pub fn queue_build(&mut self, req: PipelineBuildRequest) {
-        if self.pipelines.contains_key(&req.key) {
-            return;
+    pub fn queue_build(&mut self, req: PipelineBuildRequest) -> bool {
+        if self.pipelines.contains_key(&req.key) || self.failed.contains(&req.key) {
+            return false;
         }
         if let Some(w) = self.worker.as_mut() {
             if w.in_flight.contains_key(&req.key) {
-                return;
+                return false;
             }
             let key = req.key;
             if w.req_tx.send(req).is_ok() {
                 w.in_flight.insert(key, 0);
                 nexium_common::shader_progress::begin();
+                return true;
             }
         }
+        false
     }
 
     pub fn prewarm_specs(&self) -> Vec<PipelineSpec> {
@@ -867,30 +886,105 @@ impl PipelineCache {
         self.specs_dirty = false;
     }
 
+    fn integrate_completed(&mut self, device: &ash::Device, key: PipelineKey, pipe: vk::Pipeline) {
+        let was_in_flight = self
+            .worker
+            .as_mut()
+            .is_some_and(|w| w.in_flight.remove(&key).is_some());
+        if was_in_flight {
+            nexium_common::shader_progress::end();
+        }
+        if pipe == vk::Pipeline::null() {
+            self.failed.insert(key);
+            return;
+        }
+        if self.pipelines.contains_key(&key) {
+            unsafe {
+                device.destroy_pipeline(pipe, None);
+            }
+        } else {
+            self.pipelines.insert(key, pipe);
+            self.failed.remove(&key);
+            self.dirty = true;
+            self.last_change = std::time::Instant::now();
+        }
+    }
+
     pub fn drain_completed(&mut self, device: &ash::Device) {
         let mut done: Vec<(PipelineKey, vk::Pipeline)> = Vec::new();
-        if let Some(w) = self.worker.as_mut() {
+        if let Some(w) = self.worker.as_ref() {
             while let Ok(r) = w.res_rx.try_recv() {
-                w.in_flight.remove(&r.0);
-                nexium_common::shader_progress::end();
                 done.push(r);
             }
         }
         for (key, pipe) in done {
-            if pipe == vk::Pipeline::null() {
-                self.failed.insert(key);
-                continue;
-            }
-            if self.pipelines.contains_key(&key) {
-                unsafe {
-                    device.destroy_pipeline(pipe, None);
-                }
-            } else {
-                self.pipelines.insert(key, pipe);
-                self.dirty = true;
-                self.last_change = std::time::Instant::now();
-            }
+            self.integrate_completed(device, key, pipe);
         }
+    }
+
+    pub fn has_in_flight(&self, key: &PipelineKey) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(|w| w.in_flight.contains_key(key))
+    }
+
+    pub fn wait_for_in_flight(
+        &mut self,
+        device: &ash::Device,
+        target: &PipelineKey,
+    ) -> Option<vk::Pipeline> {
+        if !self.has_in_flight(target) {
+            return None;
+        }
+
+        let started = std::time::Instant::now();
+        let mut drained = 0usize;
+        let mut outcome = "worker-disconnected";
+        let pipeline = loop {
+            let result = match self.worker.as_ref() {
+                Some(w) => w.res_rx.recv(),
+                None => break None,
+            };
+            let (key, pipe) = match result {
+                Ok(result) => result,
+                Err(_) => {
+                    let abandoned = self
+                        .worker
+                        .as_mut()
+                        .map(|w| w.in_flight.drain().map(|(key, _)| key).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    for key in abandoned {
+                        nexium_common::shader_progress::end();
+                        self.failed.insert(key);
+                    }
+                    break None;
+                }
+            };
+            drained += 1;
+            self.integrate_completed(device, key, pipe);
+            if key == *target {
+                let ready = self.get(target);
+                outcome = if ready.is_some() {
+                    "ready"
+                } else {
+                    "worker-failed"
+                };
+                break ready;
+            }
+        };
+
+        let elapsed = started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(10) {
+            log::warn!(
+                "[pipeline-sync-wait] vs_hash={:016x} fs_hash={:016x} wait_ms={:.3} drained={} outcome={}",
+                target.vs_hash,
+                target.fs_hash,
+                elapsed.as_secs_f64() * 1000.0,
+                drained,
+                outcome
+            );
+        }
+        pipeline
     }
 
     pub fn try_async_skip(&mut self, req: PipelineBuildRequest) -> Option<PipelineBuildRequest> {
@@ -915,7 +1009,16 @@ impl PipelineCache {
     }
 
     pub fn maybe_save(&mut self, device: &ash::Device) {
-        if cache_save_due(self.dirty, self.specs_dirty, self.last_change.elapsed()) {
+        let builds_in_flight = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.in_flight.is_empty());
+        if cache_save_due(
+            self.dirty,
+            self.specs_dirty,
+            self.last_change.elapsed(),
+            builds_in_flight,
+        ) {
             self.save(device);
             self.save_specs();
             self.dirty = false;
@@ -959,6 +1062,7 @@ impl PipelineCache {
 
     pub fn insert(&mut self, key: PipelineKey, pipeline: vk::Pipeline) {
         self.pipelines.insert(key, pipeline);
+        self.failed.remove(&key);
         self.dirty = true;
         self.last_change = std::time::Instant::now();
     }
@@ -1039,10 +1143,17 @@ mod tests {
         assert!(!cache_save_due(
             true,
             false,
-            CACHE_SAVE_IDLE_INTERVAL - std::time::Duration::from_nanos(1)
+            CACHE_SAVE_IDLE_INTERVAL - std::time::Duration::from_nanos(1),
+            false,
         ));
-        assert!(cache_save_due(true, false, CACHE_SAVE_IDLE_INTERVAL));
-        assert!(cache_save_due(false, true, CACHE_SAVE_IDLE_INTERVAL));
-        assert!(!cache_save_due(false, false, CACHE_SAVE_IDLE_INTERVAL));
+        assert!(cache_save_due(true, false, CACHE_SAVE_IDLE_INTERVAL, false));
+        assert!(cache_save_due(false, true, CACHE_SAVE_IDLE_INTERVAL, false));
+        assert!(!cache_save_due(
+            false,
+            false,
+            CACHE_SAVE_IDLE_INTERVAL,
+            false
+        ));
+        assert!(!cache_save_due(true, true, CACHE_SAVE_IDLE_INTERVAL, true));
     }
 }

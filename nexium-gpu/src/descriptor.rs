@@ -41,6 +41,7 @@ pub const TEXEL_BUFFER_BINDINGS: [u32; 3] = [
 
 pub struct DescriptorSetLayout {
     pub layout: vk::DescriptorSetLayout,
+    pub texture_arrays_partially_bound: bool,
 }
 
 pub struct DescriptorPool {
@@ -108,6 +109,30 @@ fn graphics_layout_bindings() -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
     bindings
 }
 
+fn graphics_layout_binding_flags(
+    bindings: &[vk::DescriptorSetLayoutBinding<'_>],
+    texture_arrays_partially_bound: bool,
+) -> Vec<vk::DescriptorBindingFlags> {
+    bindings
+        .iter()
+        .map(|binding| {
+            if texture_arrays_partially_bound
+                && binding.descriptor_count == MAX_TEXTURE_DESCRIPTORS
+                && matches!(
+                    binding.descriptor_type,
+                    vk::DescriptorType::SAMPLED_IMAGE
+                        | vk::DescriptorType::SAMPLER
+                        | vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                )
+            {
+                vk::DescriptorBindingFlags::PARTIALLY_BOUND
+            } else {
+                vk::DescriptorBindingFlags::empty()
+            }
+        })
+        .collect()
+}
+
 fn graphics_pool_sizes(max_sets: u32) -> [vk::DescriptorPoolSize; 4] {
     [
         vk::DescriptorPoolSize {
@@ -165,14 +190,27 @@ fn graphics_write_specs() -> Vec<(u32, vk::DescriptorType, u32)> {
 }
 
 impl DescriptorSetLayout {
-    pub fn new(device: &ash::Device) -> Result<Self, String> {
+    pub fn new(device: &ash::Device, texture_arrays_partially_bound: bool) -> Result<Self, String> {
         let bindings = graphics_layout_bindings();
+        let binding_flags =
+            graphics_layout_binding_flags(&bindings, texture_arrays_partially_bound);
+        let binding_flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo {
+            s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+            p_next: std::ptr::null(),
+            binding_count: binding_flags.len() as u32,
+            p_binding_flags: binding_flags.as_ptr(),
+            _marker: std::marker::PhantomData,
+        };
 
         let layout_info = vk::DescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             binding_count: bindings.len() as u32,
             p_bindings: bindings.as_ptr(),
-            p_next: std::ptr::null(),
+            p_next: if texture_arrays_partially_bound {
+                &binding_flags_info as *const _ as *const std::ffi::c_void
+            } else {
+                std::ptr::null()
+            },
             flags: Default::default(),
             _marker: std::marker::PhantomData,
         };
@@ -183,7 +221,10 @@ impl DescriptorSetLayout {
                 .map_err(|_| "Failed to create descriptor set layout".to_string())?
         };
 
-        Ok(Self { layout })
+        Ok(Self {
+            layout,
+            texture_arrays_partially_bound,
+        })
     }
 }
 
@@ -315,5 +356,33 @@ mod tests {
             assert_eq!(layout.descriptor_type, write.1);
             assert_eq!(layout.descriptor_count, write.2);
         }
+
+        let binding_flags = graphics_layout_binding_flags(&layout, true);
+        assert_eq!(binding_flags.len(), layout.len());
+        assert_eq!(
+            binding_flags
+                .iter()
+                .filter(|flags| flags.contains(vk::DescriptorBindingFlags::PARTIALLY_BOUND))
+                .count(),
+            16
+        );
+        for (binding, flags) in layout.iter().zip(binding_flags) {
+            let texture_array = binding.descriptor_count == MAX_TEXTURE_DESCRIPTORS
+                && matches!(
+                    binding.descriptor_type,
+                    vk::DescriptorType::SAMPLED_IMAGE
+                        | vk::DescriptorType::SAMPLER
+                        | vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                );
+            assert_eq!(
+                flags.contains(vk::DescriptorBindingFlags::PARTIALLY_BOUND),
+                texture_array,
+                "unexpected descriptor binding flags for binding {}",
+                binding.binding
+            );
+        }
+        assert!(graphics_layout_binding_flags(&layout, false)
+            .iter()
+            .all(|flags| flags.is_empty()));
     }
 }

@@ -54,6 +54,16 @@ fn exact_rt_copy_provenance_enabled() -> bool {
     })
 }
 
+fn rt_resolve_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("NEXIUM_NO_RT_RESOLVE").is_some())
+}
+
+fn jumbo_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_JUMBO_DBG").is_some())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExactRtCopyProvenance {
     pub destination: RtKey,
@@ -343,7 +353,7 @@ impl Fermi2D {
         let Some(renderer) = renderer else {
             return false;
         };
-        if std::env::var_os("NEXIUM_NO_RT_RESOLVE").is_some() {
+        if rt_resolve_disabled() {
             return false;
         }
         let Some(src_nv) = mappings.nvmap_id_for(src_va) else {
@@ -635,7 +645,7 @@ impl Fermi2D {
         );
         let n = tiled.len().min(limit as usize);
         mem_write(src_cpu, &tiled[..n]);
-        if std::env::var_os("NEXIUM_JUMBO_DBG").is_some() {
+        if jumbo_debug_enabled() {
             let nz = tiled[..n].iter().filter(|b| **b != 0).count();
             log::warn!(
                 "[f2d-stage] src={:#x} dst={:#x} nvmap={} {}x{} bpp={} nz={}/{}",

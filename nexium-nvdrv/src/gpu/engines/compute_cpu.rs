@@ -7,6 +7,21 @@ const MAX_LANE_STEPS: u32 = 200_000;
 const GPU_PAGE_SIZE: u64 = 0x1_0000;
 const GPU_PAGE_MASK: u64 = !(GPU_PAGE_SIZE - 1);
 
+fn compute_cpu_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_COMPUTE_CPU_TRACE").is_some())
+}
+
+fn compute_cpu_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("NEXIUM_NO_COMPUTE_CPU").is_some())
+}
+
+fn tic_video_backing_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_TIC_VIDEO_BACKING_TRACE").is_some())
+}
+
 fn is_pps_b6300_buffer_sust(raw: u64) -> bool {
     matches!(
         raw,
@@ -285,8 +300,7 @@ pub fn try_execute(
         write_page_cache: HashMap::new(),
         invalidated_pages: HashSet::new(),
         tex_trace: compute_tex_trace_enabled(qmd[0x08]),
-        pps_5d_trace: (qmd[0x08] == 0x5dbe00
-            && std::env::var_os("NEXIUM_COMPUTE_CPU_TRACE").is_some())
+        pps_5d_trace: (qmd[0x08] == 0x5dbe00 && compute_cpu_trace_enabled())
         .then(Pps5dTrace::default),
         tex_logs: 0,
         sust_logs: 0,
@@ -329,7 +343,7 @@ pub fn try_execute(
     exec.log_pps_5d_trace(qmd[0x08], code_gpu, invocations);
 
     if let Some((pc, raw, opcode)) = exec.unsupported {
-        if launch_count < 8 || std::env::var_os("NEXIUM_COMPUTE_CPU_TRACE").is_some() {
+        if launch_count < 8 || compute_cpu_trace_enabled() {
             log::warn!(
                 "KeplerCompute::cpu unsupported program={:#x} code={:#x} pc={:#x} raw={:#018x} opcode={:?}",
                 qmd[0x08],
@@ -343,7 +357,7 @@ pub fn try_execute(
     }
 
     if exec.writes != 0 {
-        if launch_count < 8 || std::env::var_os("NEXIUM_COMPUTE_CPU_TRACE").is_some() {
+        if launch_count < 8 || compute_cpu_trace_enabled() {
             log::warn!(
                 "KeplerCompute::cpu executed program={:#x} invocations={} writes={} dirty_pages={} sust_tics={} write_pages={}",
                 code_gpu,
@@ -361,7 +375,7 @@ pub fn try_execute(
 }
 
 pub(super) fn is_candidate(qmd: &[u32; 0x40]) -> bool {
-    if std::env::var_os("NEXIUM_NO_COMPUTE_CPU").is_some() {
+    if compute_cpu_disabled() {
         return false;
     }
     let grid_x = qmd[0x0c] & 0x7fff_ffff;
@@ -380,31 +394,42 @@ pub(super) fn is_candidate(qmd: &[u32; 0x40]) -> bool {
 }
 
 fn compute_cpu_invocation_limit(program: u32) -> u64 {
-    if let Ok(allow) = std::env::var("NEXIUM_COMPUTE_CPU_ALLOW") {
+    static ALLOWED: std::sync::OnceLock<HashSet<u32>> = std::sync::OnceLock::new();
+    let allowed = ALLOWED.get_or_init(|| {
+        let Ok(allow) = std::env::var("NEXIUM_COMPUTE_CPU_ALLOW") else {
+            return HashSet::new();
+        };
         let list = if let Some(path) = allow.strip_prefix('@') {
             std::fs::read_to_string(path).unwrap_or_default()
         } else {
             allow
         };
-        let allowed = list.split([',', '\n', '\r']).filter_map(|part| {
-            let part = part.trim().trim_start_matches("0x");
-            u32::from_str_radix(part, 16).ok()
-        });
-        for entry in allowed {
-            if entry == program {
-                return compute_cpu_invocation_limit_for(program, None);
-            }
-        }
+        list.split([',', '\n', '\r'])
+            .filter_map(|part| {
+                let part = part.trim().trim_start_matches("0x");
+                u32::from_str_radix(part, 16).ok()
+            })
+            .collect()
+    });
+    if allowed.contains(&program) {
+        return compute_cpu_invocation_limit_for(program, None);
     }
-    let configured = std::env::var("NEXIUM_COMPUTE_CPU_LIMIT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|limit| *limit != 0);
+    static CONFIGURED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let configured = *CONFIGURED.get_or_init(|| {
+        std::env::var("NEXIUM_COMPUTE_CPU_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|limit| *limit != 0)
+    });
     configured.unwrap_or(4_096)
 }
 
 fn compute_tex_trace_enabled(program: u32) -> bool {
-    let Ok(configured) = std::env::var("NEXIUM_COMPUTE_TEX_TRACE") else {
+    static CONFIGURED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(configured) = CONFIGURED
+        .get_or_init(|| std::env::var("NEXIUM_COMPUTE_TEX_TRACE").ok())
+        .as_deref()
+    else {
         return false;
     };
     let configured = configured.trim();
@@ -1196,7 +1221,7 @@ impl ComputeExec<'_> {
                 I2I_imm => set_reg(&mut regs, reg_dest(raw), imm20(raw) as u32),
                 LDS => {
                     if !shared_load(&mut regs, raw, shared) {
-                        if std::env::var_os("NEXIUM_COMPUTE_CPU_TRACE").is_some() {
+                        if compute_cpu_trace_enabled() {
                             log::warn!(
                                 "KeplerCompute::shared-load-fault pc={:#x} group={:?} local={:?} base=R{}:{:#x} imm={:#x} addr={:#x} width={:?} shared={:#x} preds={:?}",
                                 pc,
@@ -2502,7 +2527,7 @@ impl ComputeExec<'_> {
             return None;
         }
         let tic = nexium_gpu::texture::TicEntry::parse(&tic_raw)?;
-        if std::env::var_os("NEXIUM_TIC_VIDEO_BACKING_TRACE").is_some() {
+        if tic_video_backing_trace_enabled() {
             let read_size = nexium_gpu::texture::texture_guest_size_bytes(&tic, 1)
                 .unwrap_or_else(|| tic.format.linear_size(tic.width, tic.height));
             if let Some((target, cpu_va, nvmap_id)) =

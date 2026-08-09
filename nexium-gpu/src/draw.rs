@@ -408,6 +408,7 @@ pub const RESIDENT_CHUNK_SIZE: usize = 1 << RESIDENT_CHUNK_SHIFT;
 #[derive(Clone, Debug)]
 pub struct ResidentVertexChunk {
     pub chunk_key: u64,
+    pub generation: u64,
     pub serial: u64,
     pub data: std::sync::Arc<Vec<u8>>,
 }
@@ -454,11 +455,15 @@ impl ResidentVertexRange {
 pub struct ResidentCbufSlot {
     pub logical_slot: u32,
     pub word_count: u32,
-    pub range: ResidentVertexRange,
+    pub chunk_index: u16,
+    pub byte_offset: u32,
+    pub byte_len: u32,
+    pub packed_offset: u32,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ResidentCbufDraw {
+    pub chunks: Vec<ResidentVertexChunk>,
     pub slots: Vec<ResidentCbufSlot>,
     pub packed_size: usize,
 }
