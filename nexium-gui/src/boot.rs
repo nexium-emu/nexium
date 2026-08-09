@@ -30,6 +30,16 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn cpu_slice_cycles() -> u64 {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("NEXIUM_CPU_SLICE")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_000_000)
+    })
+}
+
 fn sync_host_region_changes(
     cpu: &mut nexium_core::cpu::Cpu,
     address_space: &nexium_memory::AddressSpace,
@@ -476,6 +486,9 @@ impl EmulationHandle {
         let stats_clone = Arc::clone(&stats);
 
         let thread_handle = thread::spawn(move || {
+            nexium_common::thread_cpu_set::apply_current_thread_cpu_set(
+                nexium_common::thread_cpu_set::ThreadCpuSetTarget::GuestCore0,
+            );
             let _alive_guard = AliveGuard;
             let initial_loader_path = nro_path.clone();
             let initial_loader_filename = Path::new(&initial_loader_path)
@@ -1078,10 +1091,7 @@ impl EmulationHandle {
 
                     if let Some(cpu) = cpu_mut() {
                         let pc_before = cpu.get_pc();
-                        let cpu_slice: u64 = std::env::var("NEXIUM_CPU_SLICE")
-                            .ok()
-                            .and_then(|v| v.parse::<u64>().ok())
-                            .unwrap_or(1_000_000);
+                        let cpu_slice = cpu_slice_cycles();
                         drop(guard);
                         let gen = boot_ctx.address_space.generation();
                         if gen != last_map_gen0 {

@@ -21,6 +21,8 @@ pub struct DynarmicCpu {
     null_skip_count: Rc<Cell<u32>>,
     watch_applied: Rc<Cell<Option<(u64, u64)>>>,
     watch_protected: Rc<Cell<bool>>,
+    cache_profile_enabled: bool,
+    cache_profile_last: std::time::Instant,
 }
 
 unsafe impl Send for DynarmicCpu {}
@@ -48,6 +50,37 @@ impl DynarmicCpu {
                 }
                 (None, _) => dynarmic_sys::Dynarmic::new(),
             };
+        log::info!(
+            "dynarmic: guarded RSB/FastDispatch {} (DYNARMIC_FAST_PATHS=1 enables)",
+            if dynarmic_sys::guarded_fast_paths_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        log::info!(
+            "dynarmic: code-page fetch cache {} (DYNARMIC_CODE_PAGE_CACHE=0 disables)",
+            if dynarmic_sys::code_page_cache_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        log::info!(
+            "dynarmic: fastmem page-table mode {} (NEXIUM_DYNARMIC_SHARED_PAGE_TABLE=1 enables experimental sharing)",
+            if dynarmic_sys::shared_fastmem_page_table_enabled() {
+                "process-shared"
+            } else {
+                "private per JIT"
+            }
+        );
+        if dynarmic_sys::unsafe_fastmem_enabled() {
+            log::warn!(
+                "dynarmic: UNSAFE 64-bit fastmem addressing enabled; invalid guest addresses may escape the reserved arena"
+            );
+        } else {
+            log::info!("dynarmic: bounded fastmem address width enabled (safe default)");
+        }
 
         let last_event = Rc::new(Cell::new(None::<CpuEvent>));
         let last_fault: Rc<RefCell<Option<FaultSnapshot>>> = Rc::new(RefCell::new(None));
@@ -190,6 +223,8 @@ impl DynarmicCpu {
             null_skip_count,
             watch_applied,
             watch_protected,
+            cache_profile_enabled: dynarmic_cache_profile_enabled(),
+            cache_profile_last: std::time::Instant::now(),
         })
     }
 
@@ -253,6 +288,7 @@ impl DynarmicCpu {
             .mem_map_ptr(va, len as usize, perm_to_dyn(perm), ptr.cast())
             .map_err(|e| format!("map_host failed: {:?}", e));
         if result.is_ok() {
+            self.emu.emu.invalidate_cache_range(va, len);
             if let Some((lo, hi)) = nexium_memory::fastmem::watch_range() {
                 if va < hi && va.saturating_add(len) > lo {
                     self.watch_protected.set(false);
@@ -264,10 +300,15 @@ impl DynarmicCpu {
     }
 
     pub unsafe fn unmap_host(&mut self, va: u64, len: u64) -> Result<(), String> {
-        self.emu
+        let result = self
+            .emu
             .emu
             .mem_unmap(va, len as usize)
-            .map_err(|e| format!("unmap_host failed: {:?}", e))
+            .map_err(|e| format!("unmap_host failed: {:?}", e));
+        if result.is_ok() {
+            self.emu.emu.invalidate_cache_range(va, len);
+        }
+        result
     }
 
     pub fn write_bytes(&self, va: u64, bytes: &[u8]) -> Result<(), String> {
@@ -393,6 +434,7 @@ impl DynarmicCpu {
         } else {
             self.emu.emu.emu_start_bounded(pc, until, _max_insn)
         };
+        self.maybe_profile_cache();
         if let Some((target, label)) = pc_until {
             let after = self.get_pc();
             if after == target && pc != target {
@@ -459,6 +501,17 @@ impl DynarmicCpu {
         }
     }
 
+    pub fn run_with_count(&mut self, max_insn: u64) -> (CpuEvent, u64) {
+        let event = self.run(max_insn);
+        let retired = if max_insn == 0 || !dynarmic_exact_retired_enabled() {
+            max_insn
+        } else {
+            let remaining = self.emu.emu.emu_ticks_remaining().min(max_insn);
+            max_insn.saturating_sub(remaining)
+        };
+        (event, retired)
+    }
+
     pub fn step(&mut self) -> CpuEvent {
         self.run(1)
     }
@@ -467,7 +520,30 @@ impl DynarmicCpu {
         self.last_event.set(Some(CpuEvent::Svc(imm)));
     }
 
-    pub fn invalidate_range(&mut self, _va: u64, _len: u64) {}
+    pub fn invalidate_range(&mut self, va: u64, len: u64) {
+        self.emu.emu.invalidate_cache_range(va, len);
+    }
+
+    fn maybe_profile_cache(&mut self) {
+        if !self.cache_profile_enabled {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        if !cache_profile_due(self.cache_profile_last, now) {
+            return;
+        }
+        self.cache_profile_last = now;
+
+        let thread = std::thread::current();
+        log::warn!(
+            "[dynarmic-cache] thread={} used_bytes={} capacity_bytes={} evacuations={}",
+            thread.name().unwrap_or("<unnamed>"),
+            self.emu.emu.get_cache_size(),
+            self.emu.emu.get_cache_capacity(),
+            self.emu.emu.get_cache_evacuation_count()
+        );
+    }
 
     fn apply_watch_range(&self) {
         let page_protect = env_flag("NEXIUM_WATCH_PAGE_PROTECT");
@@ -663,6 +739,20 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn dynarmic_exact_retired_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("NEXIUM_DYNARMIC_EXACT_RETIRED"))
+}
+
+fn dynarmic_cache_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("NEXIUM_DYNARMIC_CACHE_PROFILE"))
+}
+
+fn cache_profile_due(last: std::time::Instant, now: std::time::Instant) -> bool {
+    now.duration_since(last) >= std::time::Duration::from_secs(1)
+}
+
 fn watch_write_limit() -> u64 {
     std::env::var("NEXIUM_WATCH_WRITE_LIMIT")
         .ok()
@@ -806,4 +896,18 @@ fn watch_value_ne(size: usize, value: u64, filter: u64) -> bool {
         return (value & 0xffff_ffff) != f || ((value >> 32) & 0xffff_ffff) != f;
     }
     (value & mask) != (filter & mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_profile_due;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn cache_profile_rate_limit_is_one_second() {
+        let last = Instant::now();
+        assert!(!cache_profile_due(last, last));
+        assert!(!cache_profile_due(last, last + Duration::from_millis(999)));
+        assert!(cache_profile_due(last, last + Duration::from_secs(1)));
+    }
 }

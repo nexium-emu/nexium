@@ -313,11 +313,8 @@ impl Cpu {
         match self {
             #[cfg(feature = "backend-dynarmic")]
             Cpu::Dynarmic(cpu) => {
-                let event = cpu.run(cycle_count);
-                CpuRunResult {
-                    event,
-                    retired: cycle_count,
-                }
+                let (event, retired) = cpu.run_with_count(cycle_count);
+                CpuRunResult { event, retired }
             }
             #[cfg(feature = "backend-rustarmic")]
             Cpu::Rustarmic(cpu) => {

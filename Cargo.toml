@@ -63,7 +63,7 @@ memmap2 = "0.9"
 
 sdl2 = "0.37"
 
-dynarmic-sys-mythrax = "0.2.12"
+dynarmic-sys-mythrax = { path = "../dynarmic-sys" }
 
 [profile.dev]
 opt-level = 1
