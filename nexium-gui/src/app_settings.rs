@@ -349,6 +349,9 @@ fn default_audio_volume() -> f32 {
 fn default_multicore() -> bool {
     true
 }
+fn default_docked() -> bool {
+    true
+}
 
 fn default_menu_music_track() -> u8 {
     255
@@ -391,6 +394,8 @@ pub struct AppSettings {
     pub audio_volume: f32,
     #[serde(default = "default_multicore")]
     pub multicore: bool,
+    #[serde(default = "default_docked")]
+    pub docked: bool,
     #[serde(default)]
     pub async_shaders: bool,
     #[serde(default)]
@@ -546,6 +551,7 @@ impl Default for AppSettings {
             audio_output_device: None,
             audio_volume: default_audio_volume(),
             multicore: default_multicore(),
+            docked: default_docked(),
             async_shaders: false,
             library_folders: Vec::new(),
             view_mode: ViewMode::Carousel,

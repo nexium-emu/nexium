@@ -217,6 +217,9 @@ impl Kernel {
             Arc::new(move |src, dst, len| gpu_copy_space.copy(src, dst, len).is_ok()),
         );
 
+        let docked = crate::hid_state::is_docked();
+        let _ = crate::hid_state::take_console_mode_dirty();
+
         Self {
             address_space,
             handles,
@@ -270,8 +273,8 @@ impl Kernel {
             generic_svc_streak: 0,
             next_generic_svc_streak_log: 64,
             applet_focus_state: 1,
-            applet_operation_mode: if crate::hid_state::is_docked() { 1 } else { 0 },
-            applet_performance_mode: if crate::hid_state::is_docked() { 1 } else { 0 },
+            applet_operation_mode: if docked { 1 } else { 0 },
+            applet_performance_mode: if docked { 1 } else { 0 },
             display_resolution_change_event: None,
             library_applet_launchable_event: None,
             accumulated_suspended_tick_event: None,
@@ -614,21 +617,16 @@ impl Kernel {
     }
 
     pub fn signal_vsync(&mut self) {
-        if std::env::var_os("NEXIUM_NO_BOOT_MODE_KICK").is_none() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static VN: AtomicU64 = AtomicU64::new(0);
-            let n = VN.fetch_add(1, Ordering::Relaxed);
-            if matches!(n, 180 | 420 | 720 | 1020 | 1380) {
-                crate::services::am::queue_message(self, 30);
-                crate::services::am::queue_message(self, 31);
-            }
-        }
         if crate::hid_state::take_console_mode_dirty() {
             let docked = crate::hid_state::is_docked();
             self.applet_operation_mode = if docked { 1 } else { 0 };
             self.applet_performance_mode = if docked { 1 } else { 0 };
             crate::services::am::queue_message(self, 30);
             crate::services::am::queue_message(self, 31);
+            if let Some(handle) = self.display_resolution_change_event {
+                self.event_signals.insert(handle, true);
+                self.threads.signal_handle(handle);
+            }
             log::info!(
                 "console mode -> {}",
                 if docked { "Docked" } else { "Handheld" }

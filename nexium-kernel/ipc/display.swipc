@@ -67,7 +67,7 @@ service ISystemDisplayService as system_display_service {
     [3001] ListDisplayRgbRanges() -> u64;
     # NOTE: cmd 3002 ListDisplayContentTypes writes content_types into out_buffer; buffer ignored.
     [3002] ListDisplayContentTypes() -> u64;
-    [3200] GetDisplayMode();
+    [3200] GetDisplayMode(u64 display_id) -> (u32, u32, u32, u32);
     [3201] SetDisplayMode();
     [3202] GetDisplayUnderscan() -> u64;
     [3203] SetDisplayUnderscan();

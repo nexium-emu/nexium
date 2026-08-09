@@ -6139,6 +6139,16 @@ fn igbp_handle_transact(
                 h,
                 off
             );
+            if crate::services::am::mode_trace_enabled() {
+                log::warn!(
+                    "[mode-trace] SetPreallocatedBuffer binder={} slot={} {}x{} docked={}",
+                    binder_id,
+                    slot,
+                    w,
+                    h,
+                    crate::hid_state::is_docked()
+                );
+            }
             let mut p = ParcelBuilder::new();
             p.write_u32(0);
             p.finish()
@@ -6235,6 +6245,25 @@ fn igbp_handle_transact(
                 (r, slot_count, has_buf)
             });
             let (gb_opt, slot_count, has_buf) = gb_opt;
+            if crate::services::am::mode_trace_enabled() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static QUEUE_TRACES: AtomicU64 = AtomicU64::new(0);
+                if QUEUE_TRACES.fetch_add(1, Ordering::Relaxed) < 8 {
+                    log::warn!(
+                        "[mode-trace] QueueBuffer slot={} crop=({},{},{},{}) scaling={} buffer={}",
+                        slot,
+                        crop_l,
+                        crop_t,
+                        crop_r,
+                        crop_b,
+                        scaling,
+                        gb_opt
+                            .as_ref()
+                            .map(|gb| format!("{}x{}", gb.width, gb.height))
+                            .unwrap_or_else(|| "none".to_string())
+                    );
+                }
+            }
             log::trace!(
                 "IGBP::QueueBuffer binder={} slot={} swap_interval={} transform={:#x} slot_count={} has_buf={} gb_some={}",
                 binder_id,

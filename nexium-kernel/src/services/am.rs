@@ -15,6 +15,19 @@ pub mod msg {
 
 pub const FOCUS_STATE_IN_FOCUS: u8 = 1;
 
+pub(crate) fn mode_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_MODE_TRACE").is_some())
+}
+
+pub(crate) fn default_display_resolution() -> (u32, u32) {
+    if crate::hid_state::is_docked() {
+        (1920, 1080)
+    } else {
+        (1280, 720)
+    }
+}
+
 pub const APPLET_MESSAGE_AVAILABLE_RC: u32 = 0;
 pub const APPLET_NO_MESSAGES_RC: u32 = 0x680;
 
@@ -199,8 +212,6 @@ fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, V
             kernel.applet_message_event = slot;
             if first {
                 queue_message(kernel, msg::FOCUS_STATE_CHANGED);
-                queue_message(kernel, msg::OPERATION_MODE_CHANGED);
-                queue_message(kernel, msg::PERFORMANCE_MODE_CHANGED);
             }
             log::debug!(
                 "ICommonStateGetter.GetEventHandle → {:#x} (initial focus msg queued={})",
@@ -230,10 +241,16 @@ fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, V
         3 | 4 => ok_empty(),
         5 => {
             let mode: u8 = if crate::hid_state::is_docked() { 1 } else { 0 };
+            if mode_trace_enabled() {
+                log::warn!("[mode-trace] GetOperationMode -> {mode}");
+            }
             ok(mode.to_le_bytes().to_vec())
         }
         6 => {
             let mode: u32 = if crate::hid_state::is_docked() { 1 } else { 0 };
+            if mode_trace_enabled() {
+                log::warn!("[mode-trace] GetPerformanceMode -> {mode}");
+            }
             ok(mode.to_le_bytes().to_vec())
         }
         7 => ok(0u8.to_le_bytes().to_vec()),
@@ -251,9 +268,13 @@ fn common_state_getter(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, V
         51 | 52 | 53 | 54 => ok_empty(),
         55 => ok(0u8.to_le_bytes().to_vec()),
         60 => {
+            let (width, height) = default_display_resolution();
+            if mode_trace_enabled() {
+                log::warn!("[mode-trace] GetDefaultDisplayResolution -> {width}x{height}");
+            }
             let mut buf = [0u8; 8];
-            buf[0..4].copy_from_slice(&1280u32.to_le_bytes());
-            buf[4..8].copy_from_slice(&720u32.to_le_bytes());
+            buf[0..4].copy_from_slice(&width.to_le_bytes());
+            buf[4..8].copy_from_slice(&height.to_le_bytes());
             ok(buf.to_vec())
         }
         61 => {
@@ -686,6 +707,9 @@ fn apm_manager(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
         1 => {
             let mode: i32 = if crate::hid_state::is_docked() { 1 } else { 0 };
+            if mode_trace_enabled() {
+                log::warn!("[mode-trace] IApmManager.GetPerformanceMode -> {mode}");
+            }
             ok(mode.to_le_bytes().to_vec())
         }
         6 => ok(vec![0u8]),

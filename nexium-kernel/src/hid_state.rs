@@ -426,26 +426,21 @@ pub fn take_console_mode_dirty() -> bool {
 }
 
 pub fn apply_controller_applet_style(style_set: u32) -> u32 {
-    let selected_id;
-    if style_set & STYLE_FULLKEY != 0 {
-        set_docked(true);
-        set_player1_joy_dual(false);
-        selected_id = 0;
+    let docked = is_docked();
+    let (selected_id, joy_dual) = if !docked && style_set & STYLE_HANDHELD != 0 {
+        (0x20, false)
+    } else if docked && style_set & STYLE_FULLKEY != 0 {
+        (0, false)
     } else if style_set & STYLE_JOY_DUAL != 0 {
-        set_player1_joy_dual(true);
-        selected_id = 0;
+        (0, true)
+    } else if style_set & (STYLE_FULLKEY | STYLE_JOY_LEFT | STYLE_JOY_RIGHT) != 0 {
+        (0, false)
     } else if style_set & STYLE_HANDHELD != 0 {
-        set_docked(false);
-        selected_id = 0x20;
-    } else if style_set & (STYLE_JOY_LEFT | STYLE_JOY_RIGHT) != 0 {
-        set_docked(true);
-        set_player1_joy_dual(false);
-        selected_id = 0;
+        (0x20, false)
     } else {
-        set_docked(true);
-        set_player1_joy_dual(false);
-        selected_id = 0;
-    }
+        (0, false)
+    };
+    set_player1_joy_dual(joy_dual);
     let state = get_hid_state();
     let mut hid = state.lock();
     let cur = hid.input;
@@ -454,9 +449,6 @@ pub fn apply_controller_applet_style(style_set: u32) -> u32 {
 }
 
 pub fn set_player1_joy_dual(value: bool) {
-    if value {
-        set_docked(true);
-    }
     PLAYER1_JOY_DUAL.store(value, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -511,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_style_selection_republishes_a_compatible_docked_npad() {
+    fn supported_style_selection_republishes_a_compatible_npad_without_changing_console_mode() {
         set_docked(true);
         set_player1_joy_dual(false);
 
@@ -527,18 +519,36 @@ mod tests {
             }
         }
 
-        let style_offset = NPAD_OFFSET + NPAD_ENTRY_PLAYER1 * NPAD_ENTRY_SIZE;
-        let read_style = |buf: &[u8]| {
-            u32::from_le_bytes(buf[style_offset..style_offset + 4].try_into().unwrap())
+        let player_style_offset = NPAD_OFFSET + NPAD_ENTRY_PLAYER1 * NPAD_ENTRY_SIZE;
+        let handheld_style_offset = NPAD_OFFSET + NPAD_ENTRY_HANDHELD * NPAD_ENTRY_SIZE;
+        let read_player_style = |buf: &[u8]| {
+            u32::from_le_bytes(
+                buf[player_style_offset..player_style_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            )
         };
-        let initial_style = read_style(&mapped[..]);
+        let read_handheld_style = |buf: &[u8]| {
+            u32::from_le_bytes(
+                buf[handheld_style_offset..handheld_style_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        let initial_style = read_player_style(&mapped[..]);
 
         let initial_selection = apply_controller_applet_style(0x1f);
-        let broad_style = read_style(&mapped[..]);
+        let docked_style = read_player_style(&mapped[..]);
+        let remains_docked = is_docked();
+
+        set_docked(false);
+        let handheld_selection = apply_controller_applet_style(0x1f);
+        let handheld_style = read_handheld_style(&mapped[..]);
+        let remains_handheld = !is_docked();
 
         let joy_dual_selection = apply_controller_applet_style(STYLE_HANDHELD | STYLE_JOY_DUAL);
-        let joy_dual_style = read_style(&mapped[..]);
-        let remains_docked = is_docked();
+        let joy_dual_style = read_handheld_style(&mapped[..]);
+        let joy_dual_remains_handheld = !is_docked();
 
         let unbound = {
             let mut hid = state.lock();
@@ -554,10 +564,14 @@ mod tests {
 
         assert_eq!(initial_selection, 0);
         assert_eq!(initial_style, STYLE_FULLKEY);
-        assert_eq!(broad_style, STYLE_FULLKEY);
-        assert_eq!(joy_dual_selection, 0);
-        assert_eq!(joy_dual_style, STYLE_JOY_DUAL);
+        assert_eq!(docked_style, STYLE_FULLKEY);
         assert!(remains_docked);
+        assert_eq!(handheld_selection, 0x20);
+        assert_eq!(handheld_style, STYLE_HANDHELD);
+        assert!(remains_handheld);
+        assert_eq!(joy_dual_selection, 0x20);
+        assert_eq!(joy_dual_style, STYLE_HANDHELD);
+        assert!(joy_dual_remains_handheld);
         assert!(unbound);
     }
 }

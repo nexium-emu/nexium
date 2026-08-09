@@ -115,7 +115,7 @@ pub fn get_default_display_resolution(
     _ctx: &mut IpcCtx,
     _session: u32,
 ) -> (u32, u32) {
-    (1280, 720)
+    crate::services::am::default_display_resolution()
 }
 
 pub fn get_default_display_resolution_change_event(
@@ -123,8 +123,12 @@ pub fn get_default_display_resolution_change_event(
     _ctx: &mut IpcCtx,
     _session: u32,
 ) -> u32 {
+    if let Some(handle) = kernel.display_resolution_change_event {
+        return handle;
+    }
     let h = kernel.handles.create_handle(HandleType::Event);
     kernel.event_signals.insert(h, false);
+    kernel.display_resolution_change_event = Some(h);
     h
 }
 pub fn get_hdcp_authentication_state(

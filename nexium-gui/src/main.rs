@@ -65,14 +65,12 @@ fn main() -> Result<(), eframe::Error> {
 
     log::info!("=== NeXium - Nintendo Switch Emulator ===");
 
-    if let Ok(v) = std::env::var("NEXIUM_DOCKED") {
-        let docked = v != "0";
-        nexium_core::hid_state::set_docked(docked);
-        log::info!(
-            "console mode initialized from NEXIUM_DOCKED={}",
-            if docked { "1" } else { "0" }
-        );
-    }
+    let docked = std::env::var("NEXIUM_DOCKED").map_or(settings.docked, |value| value != "0");
+    nexium_core::hid_state::set_docked(docked);
+    log::info!(
+        "console mode initialized as {}",
+        if docked { "Docked" } else { "Handheld" }
+    );
 
     #[cfg(windows)]
     fault_logger::install();

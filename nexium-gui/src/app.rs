@@ -7946,7 +7946,10 @@ impl eframe::App for HorizonApp {
                                 )
                                 .clicked()
                             {
-                                nexium_core::hid_state::set_docked(!docked);
+                                let docked = !docked;
+                                nexium_core::hid_state::set_docked(docked);
+                                self.app_settings.docked = docked;
+                                let _ = self.app_settings.save();
                             }
                             ui.add_space(6.0);
                             ui.label(egui::RichText::new("·").color(MUTED).size(12.0));

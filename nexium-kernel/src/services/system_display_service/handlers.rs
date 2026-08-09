@@ -31,7 +31,23 @@ pub fn list_display_rgb_ranges(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> u64
 pub fn list_display_content_types(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> u64 {
     0
 }
-pub fn get_display_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
+pub fn get_display_mode(
+    _k: &mut Kernel,
+    _c: &mut IpcCtx,
+    _s: u32,
+    display_id: u64,
+) -> (u32, u32, u32, u32) {
+    let (width, height) = crate::services::am::default_display_resolution();
+    if crate::services::am::mode_trace_enabled() {
+        log::warn!(
+            "[mode-trace] ISystemDisplayService.GetDisplayMode id={} -> {}x{}@60",
+            display_id,
+            width,
+            height
+        );
+    }
+    (width, height, 60.0f32.to_bits(), 0)
+}
 pub fn set_display_mode(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) {}
 pub fn get_display_underscan(_k: &mut Kernel, _c: &mut IpcCtx, _s: u32) -> u64 {
     0
