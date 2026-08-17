@@ -99,6 +99,7 @@ pub struct TextureNumericBinding {
     pub descriptor_slot: u32,
     pub numeric_type: GraphicsTextureNumericType,
     pub image_kind: GraphicsTextureImageKind,
+    pub normalized_coords: bool,
 }
 
 impl TextureNumericBinding {
@@ -117,11 +118,17 @@ impl TextureNumericBinding {
             descriptor_slot,
             numeric_type,
             image_kind: GraphicsTextureImageKind::D2,
+            normalized_coords: true,
         }
     }
 
     pub const fn with_image_kind(mut self, image_kind: GraphicsTextureImageKind) -> Self {
         self.image_kind = image_kind;
+        self
+    }
+
+    pub const fn with_normalized_coords(mut self, normalized_coords: bool) -> Self {
+        self.normalized_coords = normalized_coords;
         self
     }
 
@@ -164,6 +171,15 @@ pub enum TextureNumericManifestError {
         first: GraphicsTextureImageKind,
         second: GraphicsTextureImageKind,
     },
+    #[error(
+        "shader texture ID {shader_id:#x} at descriptor slot {slot} requires both normalized_coords={first} and normalized_coords={second}"
+    )]
+    CoordinateModeConflict {
+        shader_id: u32,
+        slot: u32,
+        first: bool,
+        second: bool,
+    },
 }
 
 pub fn normalize_texture_numeric_manifest(
@@ -175,6 +191,7 @@ pub fn normalize_texture_numeric_manifest(
             binding.shader_id,
             binding.numeric_type,
             binding.image_kind,
+            binding.normalized_coords,
         )
     });
 
@@ -208,6 +225,14 @@ pub fn normalize_texture_numeric_manifest(
                         slot: binding.descriptor_slot,
                         first: previous.image_kind,
                         second: binding.image_kind,
+                    });
+                }
+                if previous.normalized_coords != binding.normalized_coords {
+                    return Err(TextureNumericManifestError::CoordinateModeConflict {
+                        shader_id: binding.shader_id,
+                        slot: binding.descriptor_slot,
+                        first: previous.normalized_coords,
+                        second: binding.normalized_coords,
                     });
                 }
                 continue;
@@ -254,6 +279,7 @@ pub fn texture_numeric_manifest_fingerprint(manifest: &[TextureNumericBinding]) 
         eat(&binding.descriptor_slot.to_le_bytes());
         eat(&[binding.numeric_type as u8]);
         eat(&[binding.image_kind as u8]);
+        eat(&[u8::from(binding.normalized_coords)]);
     }
     hash
 }
@@ -313,6 +339,16 @@ mod tests {
             Err(TextureNumericManifestError::ImageKindConflict { slot: 7, .. })
         ));
 
+        let coordinate_mode_conflict = normalize_texture_numeric_manifest(vec![
+            TextureNumericBinding::new(1, 7, TextureNumericType::Float),
+            TextureNumericBinding::new(1, 7, TextureNumericType::Float)
+                .with_normalized_coords(false),
+        ]);
+        assert!(matches!(
+            coordinate_mode_conflict,
+            Err(TextureNumericManifestError::CoordinateModeConflict { slot: 7, .. })
+        ));
+
         assert!(matches!(
             normalize_texture_numeric_manifest(vec![TextureNumericBinding::new(
                 1,
@@ -356,6 +392,14 @@ mod tests {
         )
         .with_image_kind(GraphicsTextureImageKind::CubeArray)])
         .unwrap();
+        let changed_coordinate_mode =
+            normalize_texture_numeric_manifest(vec![TextureNumericBinding::new(
+                0x44,
+                2,
+                TextureNumericType::Float,
+            )
+            .with_normalized_coords(false)])
+            .unwrap();
 
         let fingerprint = texture_numeric_manifest_fingerprint(&base);
         assert_ne!(
@@ -373,6 +417,10 @@ mod tests {
         assert_ne!(
             fingerprint,
             texture_numeric_manifest_fingerprint(&changed_kind)
+        );
+        assert_ne!(
+            fingerprint,
+            texture_numeric_manifest_fingerprint(&changed_coordinate_mode)
         );
     }
 }

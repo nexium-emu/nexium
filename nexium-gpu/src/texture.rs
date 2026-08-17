@@ -9,6 +9,10 @@ pub enum TicFormat {
     R5G6B5,
     A1R5G5B5,
     A4R4G4B4,
+    A5B5G5R1,
+    A1B5G5R5,
+    B5G6R5,
+    A4B4G4R4,
     R8,
     R8G8,
     R16,
@@ -28,6 +32,9 @@ pub enum TicFormat {
     BC6S,
     BC6U,
     BC7,
+    Etc2Rgb,
+    Etc2RgbA1,
+    Etc2Rgba,
     Astc(u8, u8),
     Unknown(u32),
 }
@@ -90,15 +97,18 @@ impl TicFormat {
             0x01 => TicFormat::R32G32B32A32,
             0x04 => TicFormat::R32G32,
             0x03 => TicFormat::R16G16B16A16,
+            0x06 => TicFormat::Etc2Rgb,
             0x08 => TicFormat::A8B8G8R8,
             0x09 => TicFormat::A2B10G10R10,
-            0x0A => TicFormat::A1R5G5B5,
-            0x0B => TicFormat::A4R4G4B4,
+            0x0A => TicFormat::Etc2RgbA1,
+            0x0B => TicFormat::Etc2Rgba,
             0x0C => TicFormat::R16G16,
             0x0F => TicFormat::R32,
             0x0E => TicFormat::G24R8,
-            0x15 => TicFormat::R5G6B5,
-            0x12 => TicFormat::R16,
+            0x13 => TicFormat::A5B5G5R1,
+            0x14 => TicFormat::A1B5G5R5,
+            0x15 => TicFormat::B5G6R5,
+            0x12 => TicFormat::A4B4G4R4,
             0x1B => TicFormat::R16,
             0x18 => TicFormat::R8G8,
             0x1C | 0x1D => TicFormat::R8,
@@ -115,7 +125,7 @@ impl TicFormat {
             0x2A => TicFormat::X8Z24,
             0x2B => TicFormat::S8Z24,
             0x2F => TicFormat::Z32,
-            0x2D => TicFormat::R8G8B8A8,
+            0x2D => TicFormat::Unknown(0x2D),
             0x40 => TicFormat::Astc(4, 4),
             0x50 => TicFormat::Astc(5, 4),
             0x41 => TicFormat::Astc(5, 5),
@@ -148,17 +158,24 @@ impl TicFormat {
             | TicFormat::X8Z24
             | TicFormat::S8Z24
             | TicFormat::B10G11R11 => 4,
-            TicFormat::R5G6B5 | TicFormat::A1R5G5B5 | TicFormat::A4R4G4B4 => 2,
+            TicFormat::R5G6B5
+            | TicFormat::A1R5G5B5
+            | TicFormat::A4R4G4B4
+            | TicFormat::A5B5G5R1
+            | TicFormat::A1B5G5R5
+            | TicFormat::B5G6R5
+            | TicFormat::A4B4G4R4 => 2,
             TicFormat::R16 | TicFormat::R8G8 => 2,
             TicFormat::R16G16 => 4,
             TicFormat::R8 => 1,
-            TicFormat::BC1 | TicFormat::BC4 => 8,
+            TicFormat::BC1 | TicFormat::BC4 | TicFormat::Etc2Rgb | TicFormat::Etc2RgbA1 => 8,
             TicFormat::BC2
             | TicFormat::BC3
             | TicFormat::BC5
             | TicFormat::BC6S
             | TicFormat::BC6U
-            | TicFormat::BC7 => 16,
+            | TicFormat::BC7
+            | TicFormat::Etc2Rgba => 16,
             TicFormat::Astc(_, _) => 16,
             TicFormat::Unknown(_) => 4,
         }
@@ -182,7 +199,10 @@ impl TicFormat {
             | TicFormat::BC5
             | TicFormat::BC6S
             | TicFormat::BC6U
-            | TicFormat::BC7 => (4, 4),
+            | TicFormat::BC7
+            | TicFormat::Etc2Rgb
+            | TicFormat::Etc2RgbA1
+            | TicFormat::Etc2Rgba => (4, 4),
             TicFormat::Astc(bw, bh) => (*bw as u32, *bh as u32),
             _ => (1, 1),
         }
@@ -275,7 +295,11 @@ impl TicEntry {
         let layer_base_3_7 = (w2 >> 16) & 0x1F;
         let layer_base_8_10 = (w2 >> 29) & 0x7;
         let base_layer = layer_base_0_2 | (layer_base_3_7 << 3) | (layer_base_8_10 << 8);
-        let texture_type = (w4 >> 23) & 0xF;
+        let texture_type = if is_buffer_header {
+            6
+        } else {
+            (w4 >> 23) & 0xF
+        };
         let is_srgb = (w4 >> 22) & 1 != 0;
         let w5 = u32::from_le_bytes([raw[20], raw[21], raw[22], raw[23]]);
         let height = (w5 & 0xFFFF) + 1;
@@ -360,6 +384,25 @@ impl TicEntry {
     pub fn pitch_linear_size(&self, layers: u32) -> Option<usize> {
         self.pitch_linear_layer_size()?
             .checked_mul(layers.max(1) as usize)
+    }
+
+    pub fn layer_stride_bytes(&self) -> Option<usize> {
+        if self.is_buffer() || self.texture_type == 2 {
+            return None;
+        }
+        self.pitch_linear_layer_size()
+            .or_else(|| block_linear_mip_layout(self).map(|layout| layout.layer_stride))
+            .or_else(|| Some(self.format.linear_size(self.width, self.height)))
+    }
+
+    pub fn backing_gpu_va(&self) -> Option<u64> {
+        if self.is_buffer() || self.texture_type == 2 || self.base_layer == 0 {
+            return Some(self.gpu_va);
+        }
+        let layer_offset = self
+            .layer_stride_bytes()?
+            .checked_mul(self.base_layer as usize)?;
+        self.gpu_va.checked_sub(layer_offset as u64)
     }
 }
 
@@ -1460,6 +1503,21 @@ fn decode_bc7(src: &[u8], width: u32, height: u32, out: &mut [u8]) {
     unpack_bcn_u32(&buf, out);
 }
 
+fn decode_etc2(src: &[u8], width: u32, height: u32, alpha_bits: u8, out: &mut [u8]) {
+    let (w, h) = (width as usize, height as usize);
+    let mut buf = vec![0u32; w * h];
+    let result = match alpha_bits {
+        0 => texture2ddecoder::decode_etc2_rgb(src, w, h, &mut buf),
+        1 => texture2ddecoder::decode_etc2_rgba1(src, w, h, &mut buf),
+        _ => texture2ddecoder::decode_etc2_rgba8(src, w, h, &mut buf),
+    };
+    if result.is_err() {
+        fill_magenta(out);
+        return;
+    }
+    unpack_bcn_u32(&buf, out);
+}
+
 pub fn decode_to_rgba8_typed(
     src: &[u8],
     width: u32,
@@ -1535,6 +1593,57 @@ pub fn decode_to_rgba8_typed(
                 let r = ((v >> 8) & 0xF) as u8;
                 let g = ((v >> 4) & 0xF) as u8;
                 let b = (v & 0xF) as u8;
+                out[i * 4] = (r << 4) | r;
+                out[i * 4 + 1] = (g << 4) | g;
+                out[i * 4 + 2] = (b << 4) | b;
+                out[i * 4 + 3] = (a << 4) | a;
+            }
+        }
+        TicFormat::A5B5G5R1 => {
+            for i in 0..pixels.min(src.len() / 2) {
+                let v = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
+                let r = if v & 1 == 1 { 0xFF } else { 0 };
+                let g = ((v >> 1) & 0x1F) as u8;
+                let b = ((v >> 6) & 0x1F) as u8;
+                let a = ((v >> 11) & 0x1F) as u8;
+                out[i * 4] = r;
+                out[i * 4 + 1] = (g << 3) | (g >> 2);
+                out[i * 4 + 2] = (b << 3) | (b >> 2);
+                out[i * 4 + 3] = (a << 3) | (a >> 2);
+            }
+        }
+        TicFormat::A1B5G5R5 => {
+            for i in 0..pixels.min(src.len() / 2) {
+                let v = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
+                let r = (v & 0x1F) as u8;
+                let g = ((v >> 5) & 0x1F) as u8;
+                let b = ((v >> 10) & 0x1F) as u8;
+                let a = if (v >> 15) & 1 == 1 { 0xFF } else { 0 };
+                out[i * 4] = (r << 3) | (r >> 2);
+                out[i * 4 + 1] = (g << 3) | (g >> 2);
+                out[i * 4 + 2] = (b << 3) | (b >> 2);
+                out[i * 4 + 3] = a;
+            }
+        }
+        TicFormat::B5G6R5 => {
+            for i in 0..pixels.min(src.len() / 2) {
+                let v = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
+                let r = (v & 0x1F) as u8;
+                let g = ((v >> 5) & 0x3F) as u8;
+                let b = ((v >> 11) & 0x1F) as u8;
+                out[i * 4] = (r << 3) | (r >> 2);
+                out[i * 4 + 1] = (g << 2) | (g >> 4);
+                out[i * 4 + 2] = (b << 3) | (b >> 2);
+                out[i * 4 + 3] = 0xFF;
+            }
+        }
+        TicFormat::A4B4G4R4 => {
+            for i in 0..pixels.min(src.len() / 2) {
+                let v = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
+                let r = (v & 0xF) as u8;
+                let g = ((v >> 4) & 0xF) as u8;
+                let b = ((v >> 8) & 0xF) as u8;
+                let a = ((v >> 12) & 0xF) as u8;
                 out[i * 4] = (r << 4) | r;
                 out[i * 4 + 1] = (g << 4) | g;
                 out[i * 4 + 2] = (b << 4) | b;
@@ -1710,6 +1819,9 @@ pub fn decode_to_rgba8_typed(
         TicFormat::BC6S => decode_bc6(src, width, height, true, &mut out),
         TicFormat::BC6U => decode_bc6(src, width, height, false, &mut out),
         TicFormat::BC7 => decode_bc7(src, width, height, &mut out),
+        TicFormat::Etc2Rgb => decode_etc2(src, width, height, 0, &mut out),
+        TicFormat::Etc2RgbA1 => decode_etc2(src, width, height, 1, &mut out),
+        TicFormat::Etc2Rgba => decode_etc2(src, width, height, 8, &mut out),
         TicFormat::Astc(bw, bh) => {
             decode_astc(src, width, height, bw as usize, bh as usize, &mut out)
         }
@@ -1885,6 +1997,7 @@ mod tests {
         let w0: u32 = 0x03 | (7 << 7) | (7 << 10) | (7 << 13) | (7 << 16);
         raw[0..4].copy_from_slice(&w0.to_le_bytes());
         raw[4..8].copy_from_slice(&1u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&(3u32 << 21).to_le_bytes());
         raw[12..16].copy_from_slice(&(7u32 << 28).to_le_bytes());
         raw[28..32].copy_from_slice(&(2u32 | (6 << 4)).to_le_bytes());
         let tic = TicEntry::parse(&raw).unwrap();
@@ -1906,7 +2019,44 @@ mod tests {
     }
 
     #[test]
+    fn maxwell_compressed_and_packed_ids_preserve_channel_order() {
+        assert_eq!(TicFormat::from_raw(0x06), TicFormat::Etc2Rgb);
+        assert_eq!(TicFormat::from_raw(0x0a), TicFormat::Etc2RgbA1);
+        assert_eq!(TicFormat::from_raw(0x0b), TicFormat::Etc2Rgba);
+        assert_eq!(TicFormat::Etc2Rgb.storage_extent(7, 5), (2, 2, 8));
+        assert_eq!(TicFormat::Etc2RgbA1.storage_extent(7, 5), (2, 2, 8));
+        assert_eq!(TicFormat::Etc2Rgba.storage_extent(7, 5), (2, 2, 16));
+        assert_eq!(TicFormat::from_raw(0x12), TicFormat::A4B4G4R4);
+        assert_eq!(
+            decode_to_rgba8(&0x4321u16.to_le_bytes(), 1, 1, TicFormat::A4B4G4R4),
+            [0x11, 0x22, 0x33, 0x44]
+        );
+        assert_eq!(TicFormat::from_raw(0x13), TicFormat::A5B5G5R1);
+        assert_eq!(
+            decode_to_rgba8(&0xf801u16.to_le_bytes(), 1, 1, TicFormat::A5B5G5R1),
+            [0xff, 0, 0, 0xff]
+        );
+        assert_eq!(TicFormat::from_raw(0x14), TicFormat::A1B5G5R5);
+        assert_eq!(
+            decode_to_rgba8(&0xfc00u16.to_le_bytes(), 1, 1, TicFormat::A1B5G5R5),
+            [0, 0, 0xff, 0xff]
+        );
+        assert_eq!(TicFormat::from_raw(0x15), TicFormat::B5G6R5);
+        assert_eq!(
+            decode_to_rgba8(&0x001fu16.to_le_bytes(), 1, 1, TicFormat::B5G6R5),
+            [0xff, 0, 0, 0xff]
+        );
+        assert_eq!(TicFormat::from_raw(0x2d), TicFormat::Unknown(0x2d));
+    }
+
+    #[test]
     fn parses_one_d_buffer_width_from_both_descriptor_words() {
+        let mut header_only = [0u8; 32];
+        header_only[0..4].copy_from_slice(&0x1du32.to_le_bytes());
+        header_only[4..8].copy_from_slice(&1u32.to_le_bytes());
+        header_only[16..20].copy_from_slice(&(1u32 << 23).to_le_bytes());
+        assert!(TicEntry::parse(&header_only).unwrap().is_buffer());
+
         let slot8 = [
             0x1b, 0x92, 0x14, 0x60, 0x00, 0x00, 0x77, 0x03, 0x04, 0x00, 0x00, 0x00, 0x0b, 0x00,
             0x00, 0x00, 0xff, 0xb7, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1992,6 +2142,42 @@ mod tests {
         assert_eq!(layout.layer_size, 0x2b000);
         assert_eq!(layout.layer_stride, 0x2c000);
         assert_eq!(texture_guest_size_bytes(&tic, 6), Some(0x108000));
+        assert_eq!(tic.layer_stride_bytes(), Some(0x2c000));
+
+        let layer_view = TicEntry {
+            gpu_va: tic.gpu_va + 4 * 0x2c000,
+            base_layer: 4,
+            ..tic
+        };
+        assert_eq!(layer_view.backing_gpu_va(), Some(tic.gpu_va));
+    }
+
+    #[test]
+    fn pitch_linear_base_layer_uses_guest_row_stride() {
+        let tic = TicEntry {
+            format: TicFormat::R8,
+            component_types: [ComponentType::Unorm; 4],
+            swizzle: [SwizzleSource::R; 4],
+            gpu_va: 0x20_6000,
+            width: 3,
+            height: 2,
+            block_width_log2: 0,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            pitch_bytes: 0x1000,
+            is_block_linear: false,
+            texture_type: 5,
+            depth: 2,
+            base_layer: 3,
+            normalized_coords: true,
+            is_srgb: false,
+            max_mip_level: 0,
+            res_min_mip_level: 0,
+            res_max_mip_level: 0,
+        };
+        assert_eq!(tic.layer_stride_bytes(), Some(0x2000));
+        assert_eq!(tic.backing_gpu_va(), Some(0x20_0000));
     }
 
     #[test]
