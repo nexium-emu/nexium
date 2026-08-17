@@ -18,18 +18,19 @@ use super::operand::{
     fsetp_cmp, fsetp_dest_np, fsetp_dest_p, fsetp_neg_a, fsetp_neg_b, fsetp_src_pred,
     fsetp_src_pred_inv, half_bop, half_compare, half_dest_np, half_dest_p, half_h_and, half_merge,
     half_precision, half_src_pred, half_src_pred_inv, half_swizzle_a, half_swizzle_b,
-    half_swizzle_c, i2f_abs, i2f_int_format, i2f_neg, i2f_selector, i2f_signed, iadd3_half_a,
-    iadd3_half_b, iadd3_half_c, iadd3_neg_a, iadd3_neg_b, iadd3_neg_c, iadd3_shift, iadd_neg_a,
-    iadd_neg_b, imm20, imm32, ipa_interpolation_mode, ipa_saturate, iscadd_shift, iset_bf,
-    iset_cmp, iset_signed, isetp_bop, isetp_cmp, isetp_dest_np, isetp_dest_p, isetp_signed,
-    isetp_src_pred, isetp_src_pred_inv, ldc_mode, ldc_ref, ldc_size, ldc_src_reg, ldg_addr_reg,
-    ldg_offset, ldg_size, ldls_word_count, lop32i_not_a, lop32i_not_b, lop32i_op, lop_not_a,
-    lop_not_b, lop_op, mufu_func_bits, pset_bool_float, psetp_bop_1, psetp_bop_2, psetp_dest_np,
-    psetp_dest_p, psetp_neg_pred_a, psetp_neg_pred_b, psetp_neg_pred_c, psetp_pred_a, psetp_pred_b,
-    psetp_pred_c, reg_a, reg_b, reg_c, reg_dest, sel_neg_pred, sel_pred, shr_signed, texs_tex_id,
-    xmad_cr_mrg, xmad_cr_psl, xmad_half_a, xmad_imm_src_b, xmad_rc_half_b, xmad_rc_select,
-    xmad_reg_half_b, xmad_reg_mrg, xmad_reg_psl, xmad_reg_select, xmad_signed_a, xmad_signed_b,
-    LdcMode, RZ,
+    half_swizzle_c, i2f_abs, i2f_int_format, i2f_neg, i2f_selector, i2f_signed, i2i_abs, i2i_cc,
+    i2i_dst_format, i2i_dst_signed, i2i_neg, i2i_sat, i2i_selector, i2i_src_format, i2i_src_signed,
+    iadd32i_neg_a, iadd32i_po, iadd3_half_a, iadd3_half_b, iadd3_half_c, iadd3_neg_a, iadd3_neg_b,
+    iadd3_neg_c, iadd3_shift, iadd_neg_a, iadd_neg_b, imm20, imm32, ipa_interpolation_mode,
+    ipa_saturate, iscadd_shift, iset_bf, iset_cmp, iset_signed, isetp_bop, isetp_cmp,
+    isetp_dest_np, isetp_dest_p, isetp_signed, isetp_src_pred, isetp_src_pred_inv, ldc_mode,
+    ldc_ref, ldc_size, ldc_src_reg, ldg_addr_reg, ldg_offset, ldg_size, ldls_word_count,
+    lop32i_not_a, lop32i_not_b, lop32i_op, lop_not_a, lop_not_b, lop_op, mufu_func_bits,
+    pset_bool_float, psetp_bop_1, psetp_bop_2, psetp_dest_np, psetp_dest_p, psetp_neg_pred_a,
+    psetp_neg_pred_b, psetp_neg_pred_c, psetp_pred_a, psetp_pred_b, psetp_pred_c, reg_a, reg_b,
+    reg_c, reg_dest, sel_neg_pred, sel_pred, shr_signed, texs_tex_id, xmad_cr_mrg, xmad_cr_psl,
+    xmad_half_a, xmad_imm_src_b, xmad_rc_half_b, xmad_rc_select, xmad_reg_half_b, xmad_reg_mrg,
+    xmad_reg_psl, xmad_reg_select, xmad_signed_a, xmad_signed_b, LdcMode, RZ,
 };
 
 const PT: u8 = 7;
@@ -427,6 +428,7 @@ pub struct Translator {
     stage: ShaderStage,
 
     pred_state: HashMap<u8, ValueId>,
+    cc_source: Option<Value>,
     pending_bindless_origin_checks: Vec<PendingBindlessOriginCheck>,
     pub finished: bool,
     pub unimplemented_count: u32,
@@ -470,6 +472,7 @@ impl Translator {
             fine_derivative_shuffles: HashMap::new(),
             stage,
             pred_state: initial_pred,
+            cc_source: None,
             pending_bindless_origin_checks: Vec::new(),
             finished: false,
             unimplemented_count: 0,
@@ -482,6 +485,146 @@ impl Translator {
             return Value::Zero;
         }
         self.reg_state.get(&r).copied().unwrap_or(Value::GprIn(r))
+    }
+
+    fn invalidates_cc_source(opcode: Opcode, raw: u64) -> bool {
+        let regular_cc = ((raw >> 47) & 1) != 0
+            && matches!(
+                opcode,
+                Opcode::BFE_reg
+                    | Opcode::BFE_cbuf
+                    | Opcode::BFE_imm
+                    | Opcode::BFI_reg
+                    | Opcode::BFI_rc
+                    | Opcode::BFI_cr
+                    | Opcode::BFI_imm
+                    | Opcode::CSET
+                    | Opcode::DADD_reg
+                    | Opcode::DADD_cbuf
+                    | Opcode::DADD_imm
+                    | Opcode::DFMA_reg
+                    | Opcode::DFMA_rc
+                    | Opcode::DFMA_cr
+                    | Opcode::DFMA_imm
+                    | Opcode::DMNMX_reg
+                    | Opcode::DMNMX_cbuf
+                    | Opcode::DMNMX_imm
+                    | Opcode::DMUL_reg
+                    | Opcode::DMUL_cbuf
+                    | Opcode::DMUL_imm
+                    | Opcode::DSET_reg
+                    | Opcode::DSET_cbuf
+                    | Opcode::DSET_imm
+                    | Opcode::F2F_reg
+                    | Opcode::F2F_cbuf
+                    | Opcode::F2F_imm
+                    | Opcode::F2I_reg
+                    | Opcode::F2I_cbuf
+                    | Opcode::F2I_imm
+                    | Opcode::FADD_reg
+                    | Opcode::FADD_cbuf
+                    | Opcode::FADD_imm
+                    | Opcode::FFMA_reg
+                    | Opcode::FFMA_rc
+                    | Opcode::FFMA_cr
+                    | Opcode::FFMA_imm
+                    | Opcode::FLO_reg
+                    | Opcode::FLO_cbuf
+                    | Opcode::FLO_imm
+                    | Opcode::FMNMX_reg
+                    | Opcode::FMNMX_cbuf
+                    | Opcode::FMNMX_imm
+                    | Opcode::FMUL_reg
+                    | Opcode::FMUL_cbuf
+                    | Opcode::FMUL_imm
+                    | Opcode::FSET_reg
+                    | Opcode::FSET_cbuf
+                    | Opcode::FSET_imm
+                    | Opcode::FSWZADD
+                    | Opcode::I2F_reg
+                    | Opcode::I2F_cbuf
+                    | Opcode::I2F_imm
+                    | Opcode::IADD_reg
+                    | Opcode::IADD_cbuf
+                    | Opcode::IADD_imm
+                    | Opcode::IADD3_reg
+                    | Opcode::IADD3_cbuf
+                    | Opcode::IADD3_imm
+                    | Opcode::IMNMX_reg
+                    | Opcode::IMNMX_cbuf
+                    | Opcode::IMNMX_imm
+                    | Opcode::ISCADD_reg
+                    | Opcode::ISCADD_cbuf
+                    | Opcode::ISCADD_imm
+                    | Opcode::ISET_reg
+                    | Opcode::ISET_cbuf
+                    | Opcode::ISET_imm
+                    | Opcode::LEA_hi_reg
+                    | Opcode::LEA_hi_cbuf
+                    | Opcode::LEA_lo_reg
+                    | Opcode::LEA_lo_cbuf
+                    | Opcode::LEA_lo_imm
+                    | Opcode::LOP_reg
+                    | Opcode::LOP_cbuf
+                    | Opcode::LOP_imm
+                    | Opcode::LOP3_reg
+                    | Opcode::LOP3_cbuf
+                    | Opcode::LOP3_imm
+                    | Opcode::PSET
+                    | Opcode::SHF_l_reg
+                    | Opcode::SHF_l_imm
+                    | Opcode::SHF_r_reg
+                    | Opcode::SHF_r_imm
+                    | Opcode::SHL_reg
+                    | Opcode::SHL_cbuf
+                    | Opcode::SHL_imm
+                    | Opcode::SHR_reg
+                    | Opcode::SHR_cbuf
+                    | Opcode::SHR_imm
+                    | Opcode::VMAD
+                    | Opcode::VMNMX
+                    | Opcode::XMAD_reg
+                    | Opcode::XMAD_rc
+                    | Opcode::XMAD_cr
+                    | Opcode::XMAD_imm
+            );
+        let immediate_cc = ((raw >> 52) & 1) != 0
+            && matches!(
+                opcode,
+                Opcode::FADD32I
+                    | Opcode::FFMA32I
+                    | Opcode::FMUL32I
+                    | Opcode::IADD32I
+                    | Opcode::ISCADD32I
+                    | Opcode::LOP32I
+            );
+        let r2p_cc = ((raw >> 40) & 1) != 0
+            && matches!(opcode, Opcode::R2P_reg | Opcode::R2P_cbuf | Opcode::R2P_imm);
+        let control_ambiguity = matches!(
+            opcode,
+            Opcode::BAR
+                | Opcode::BRA
+                | Opcode::BRK
+                | Opcode::BRX
+                | Opcode::CAL
+                | Opcode::CONT
+                | Opcode::EXIT
+                | Opcode::JCAL
+                | Opcode::JMP
+                | Opcode::JMX
+                | Opcode::KIL
+                | Opcode::LONGJMP
+                | Opcode::PBK
+                | Opcode::PCNT
+                | Opcode::PEXIT
+                | Opcode::PLONGJMP
+                | Opcode::PRET
+                | Opcode::RET
+                | Opcode::RTT
+                | Opcode::SSY
+                | Opcode::SYNC
+        );
+        regular_cc || immediate_cc || r2p_cc || control_ambiguity
     }
 
     fn trace_cbuf_handle_origin(
@@ -609,15 +752,15 @@ impl Translator {
         pred: Option<Predicate>,
     ) -> Option<Vec<(usize, Value)>> {
         let coord = reg_a(raw);
-        let u = self.read_reg(coord.wrapping_add(u8::from(form.tex_type == 7)));
+        let arrayed = matches!(form.tex_type, 3 | 7);
+        let u = self.read_reg(coord.wrapping_add(u8::from(arrayed)));
         let v = match form.tex_type {
             0 => Value::Zero,
-            7 => self.read_reg(coord.wrapping_add(2)),
+            3 | 7 => self.read_reg(coord.wrapping_add(2)),
             _ => self.read_reg(coord.wrapping_add(1)),
         };
         let array = match form.tex_type {
-            3 => Some(self.read_reg(coord.wrapping_add(2))),
-            7 => Some(self.read_reg(coord)),
+            3 | 7 => Some(self.read_reg(coord)),
             _ => None,
         };
         let volume = (form.tex_type == 4).then(|| self.read_reg(coord.wrapping_add(2)));
@@ -657,6 +800,7 @@ impl Translator {
             None
         };
         let dref = form.dref_reg.map(|reg| self.read_reg(reg));
+        let sample_site = self.program.next_value_id();
         let mut dst = reg_dest(raw);
         let mut samples = Vec::new();
         for component in 0..4u8 {
@@ -665,8 +809,14 @@ impl Translator {
             }
             let old_value = self.read_reg(dst);
             let instruction_index = self.program.instructions.len();
+            if dref.is_some() && component == 3 {
+                self.write_reg(dst, Op::Mov(Value::ImmF32(1.0)), pred);
+                dst = dst.wrapping_add(1);
+                continue;
+            }
             let op = if let Some((handle, dimension)) = compute_handle {
                 Op::SampleTexHandle {
+                    sample_site: Some(sample_site),
                     handle,
                     dimension,
                     u,
@@ -683,6 +833,7 @@ impl Translator {
                 }
             } else {
                 Op::SampleTex {
+                    sample_site: Some(sample_site),
                     tex_id,
                     u,
                     v,
@@ -1026,6 +1177,32 @@ impl Translator {
         );
     }
 
+    fn emit_iadd32i(&mut self, raw: u64, pred: Option<Predicate>) {
+        let dest = reg_dest(raw);
+        let a = self.read_reg(reg_a(raw));
+        let add = Op::IAdd {
+            a,
+            b: Value::ImmU32(imm32(raw)),
+            neg_a: iadd32i_neg_a(raw),
+            neg_b: false,
+        };
+        if iadd32i_po(raw) {
+            let sum = self.emit_value(add);
+            self.write_reg(
+                dest,
+                Op::IAdd {
+                    a: sum,
+                    b: Value::ImmU32(1),
+                    neg_a: false,
+                    neg_b: false,
+                },
+                pred,
+            );
+        } else {
+            self.write_reg(dest, add, pred);
+        }
+    }
+
     fn emit_imad(&mut self, raw: u64, b: Value, c: Value, pred: Option<Predicate>) {
         let dest = reg_dest(raw);
         let a = self.read_reg(reg_a(raw));
@@ -1152,24 +1329,39 @@ impl Translator {
         }
     }
 
-    fn emit_csetp(&mut self, raw: u64, pred: Option<Predicate>) {
+    fn emit_csetp(&mut self, raw: u64, pred: Option<Predicate>) -> bool {
         let dest_p = psetp_dest_p(raw);
         let dest_np = psetp_dest_np(raw);
-        let op = Op::CSetPred {
+        if pred.is_some()
+            || csetp_flow_test(raw) != 13
+            || csetp_bop_pred(raw) != PT
+            || csetp_neg_bop_pred(raw)
+            || BoolOp::from_bits(csetp_bop(raw)) != BoolOp::And
+        {
+            return false;
+        }
+        let Some(cc_source) = self.cc_source else {
+            return false;
+        };
+        let op = Op::ISetPred {
+            cmp: ICmp::Ne,
+            signed: false,
+            bop: BoolOp::And,
+            src_a: cc_source,
+            src_b: Value::Zero,
+            src_pred: PT,
+            src_pred_inv: false,
             dest_p,
             dest_np,
-            flow_test: csetp_flow_test(raw),
-            bop_pred: csetp_bop_pred(raw),
-            neg_bop_pred: csetp_neg_bop_pred(raw),
-            bop: BoolOp::from_bits(csetp_bop(raw)),
         };
-        let id = self.program.emit_pred(op, None, pred);
+        let id = self.program.emit_pred(op, None, None);
         if dest_p != PT {
             self.pred_state.insert(dest_p, id);
         }
         if dest_np != PT {
             self.pred_state.insert(dest_np, id);
         }
+        true
     }
 
     fn emit_pset(&mut self, raw: u64, pred: Option<Predicate>) {
@@ -1771,7 +1963,27 @@ impl Translator {
         }
     }
 
-    fn emit_f2i(&mut self, raw: u64, src: Value, pred: Option<Predicate>) {
+    fn emit_f2i(&mut self, raw: u64, mut src: Value, pred: Option<Predicate>) {
+        let captured_u16 = ((raw >> 8) & 3) == 1
+            && ((raw >> 10) & 3) == 2
+            && !f2i_signed(raw)
+            && f2i_rounding(raw) == 0
+            && ((raw >> 41) & 1) == 0
+            && ((raw >> 45) & 1) == 0
+            && ((raw >> 47) & 1) == 0
+            && ((raw >> 49) & 1) == 0;
+        if captured_u16 {
+            src = self.emit_value(Op::FMax {
+                a: src,
+                b: Value::ImmF32(0.0),
+                mods: FMods::default(),
+            });
+            src = self.emit_value(Op::FMin {
+                a: src,
+                b: Value::ImmF32(65535.0),
+                mods: FMods::default(),
+            });
+        }
         let dest = reg_dest(raw);
         self.write_reg(
             dest,
@@ -1782,6 +1994,54 @@ impl Translator {
             },
             pred,
         );
+    }
+
+    fn emit_i2i(&mut self, raw: u64, src: Value, pred: Option<Predicate>) -> bool {
+        const WORD: u8 = 2;
+
+        let writes_cc = i2i_cc(raw);
+        if writes_cc {
+            self.cc_source = None;
+        }
+        let src_signed = i2i_src_signed(raw);
+        let dst_signed = i2i_dst_signed(raw);
+        let abs = i2i_abs(raw);
+        let neg = i2i_neg(raw);
+        if i2i_src_format(raw) != WORD
+            || i2i_dst_format(raw) != WORD
+            || i2i_selector(raw) != 0
+            || src_signed != dst_signed
+            || i2i_sat(raw)
+            || ((abs || neg) && !src_signed)
+        {
+            return false;
+        }
+        let mut value = src;
+        if abs {
+            let sign = self.emit_value(Op::IShr {
+                a: value.clone(),
+                b: Value::ImmU32(31),
+                signed: true,
+            });
+            let flipped = self.emit_value(Op::ILop {
+                a: value,
+                b: sign.clone(),
+                op: LogicOp::Xor,
+                not_a: false,
+                not_b: false,
+            });
+            value = self.emit_iadd_value(flipped, sign, false, true);
+        }
+        if neg {
+            value = self.emit_ineg_value(value);
+        }
+
+        if writes_cc && pred.is_none() && !abs && !neg {
+            self.cc_source = Some(value);
+        }
+
+        self.write_reg(reg_dest(raw), Op::Mov(value), pred);
+        true
     }
 
     fn emit_iset(&mut self, raw: u64, b: Value, pred: Option<Predicate>) {
@@ -1813,6 +2073,7 @@ impl Translator {
             return true;
         }
         let Some(decoded) = decode_one(raw) else {
+            self.cc_source = None;
             log::debug!(
                 "SASS decode failure raw={:#018x} top16={:#x} top13={:#x}",
                 raw,
@@ -1827,6 +2088,9 @@ impl Translator {
             return false;
         };
         let pred = decoded_pred(raw);
+        if Self::invalidates_cc_source(decoded.opcode, raw) {
+            self.cc_source = None;
+        }
         match decoded.opcode {
             Opcode::NOP => {}
 
@@ -2862,29 +3126,82 @@ impl Translator {
                 let gather_component = ((raw >> 52) & 0x3) as u8;
                 let aoffi = ((raw >> 51) & 0x1) != 0;
                 let dc = ((raw >> 50) & 0x1) != 0;
-                let (u, v) = if aoffi || dc {
-                    (self.read_reg(ra), self.read_reg(ra.wrapping_add(1)))
-                } else {
-                    (self.read_reg(ra), self.read_reg(rb))
-                };
-                for lane in 0..4u8 {
-                    let dst_reg = match lane {
-                        0 => dest_a,
-                        1 => dest_a.wrapping_add(1),
-                        2 => dest_b,
-                        _ => dest_b.wrapping_add(1),
-                    };
+                let fp16 = ((raw >> 55) & 0x1) != 0;
+                if aoffi
+                    || dc
+                    || (!fp16
+                        && [dest_a, dest_b]
+                            .into_iter()
+                            .any(|dest| dest != RZ && dest & 1 != 0))
+                {
+                    log::debug!(
+                        "TLD4S unsupported form raw={:#018x} aoffi={} dc={} fp16={} dest_a={} dest_b={}",
+                        raw,
+                        aoffi,
+                        dc,
+                        fp16,
+                        dest_a,
+                        dest_b,
+                    );
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::TLD4S,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+
+                let u = self.read_reg(ra);
+                let v = self.read_reg(rb);
+                if fp16 {
+                    let gathered: [Value; 4] = std::array::from_fn(|lane| {
+                        Value::Inst(self.program.emit(
+                            Op::GatherTex {
+                                tex_id,
+                                u,
+                                v,
+                                gather_component,
+                                lane: lane as u8,
+                            },
+                            None,
+                        ))
+                    });
                     self.write_reg(
-                        dst_reg,
-                        Op::GatherTex {
-                            tex_id,
-                            u,
-                            v,
-                            gather_component,
-                            lane,
+                        dest_a,
+                        Op::PackHalf2 {
+                            lo: gathered[0],
+                            hi: gathered[1],
                         },
                         pred,
                     );
+                    self.write_reg(
+                        dest_b,
+                        Op::PackHalf2 {
+                            lo: gathered[2],
+                            hi: gathered[3],
+                        },
+                        pred,
+                    );
+                } else {
+                    for lane in 0..4u8 {
+                        let pair_dest = if lane < 2 { dest_a } else { dest_b };
+                        let dst_reg = if pair_dest == RZ {
+                            RZ
+                        } else {
+                            pair_dest + (lane & 1)
+                        };
+                        self.write_reg(
+                            dst_reg,
+                            Op::GatherTex {
+                                tex_id,
+                                u,
+                                v,
+                                gather_component,
+                                lane,
+                            },
+                            pred,
+                        );
+                    }
                 }
             }
 
@@ -3052,9 +3369,15 @@ impl Translator {
                 let handle = TextureHandleOrigin::Bound {
                     cbuf_word_offset: tex_id,
                 };
+                let sample_site = self.program.next_value_id();
                 let compact_texture_op = |component| {
-                    if let Some((dimension, u, v, w, implicit_lod, explicit_lod)) = compute_sample {
+                    if dref.is_some() && component == 3 {
+                        Op::Mov(Value::ImmF32(1.0))
+                    } else if let Some((dimension, u, v, w, implicit_lod, explicit_lod)) =
+                        compute_sample
+                    {
                         Op::SampleTexHandle {
+                            sample_site: Some(sample_site),
                             handle,
                             dimension,
                             u,
@@ -3078,6 +3401,7 @@ impl Translator {
                         }
                     } else {
                         Op::SampleTex {
+                            sample_site: Some(sample_site),
                             tex_id,
                             u,
                             v,
@@ -3140,23 +3464,103 @@ impl Translator {
             }
 
             Opcode::TMML | Opcode::TMML_b => {
-                let mask = ((raw >> 31) & 0xF) as u8;
+                let bindless = decoded.opcode == Opcode::TMML_b;
+                let tex_type = ((raw >> 28) & 0x7) as u8;
+                let mask = ((raw >> 31) & 0xf) as u8;
+                if self.stage != ShaderStage::Fragment
+                    || !matches!(tex_type, 2 | 3)
+                    || mask & 0b1100 != 0
+                {
+                    log::debug!(
+                        "TMML unsupported form opcode={:?} raw={:#018x} stage={:?} type={} mask={:#x}",
+                        decoded.opcode,
+                        raw,
+                        self.stage,
+                        tex_type,
+                        mask,
+                    );
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: decoded.opcode,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+
+                let handle = if bindless {
+                    let meta_reg = ((raw >> 20) & 0xff) as u8;
+                    let handle_value = self.read_reg(meta_reg);
+                    let Some((origin, false)) =
+                        self.trace_cbuf_handle_origin(&handle_value, pred, defs)
+                    else {
+                        log::debug!(
+                            "TMML_b handle is not an exact static cbuf origin raw={:#018x}",
+                            raw,
+                        );
+                        self.program.emit_void(Op::Unimplemented {
+                            opcode: Opcode::TMML_b,
+                            raw,
+                        });
+                        self.unimplemented_count += 1;
+                        return false;
+                    };
+                    if origin.cross_binding_partner_id().is_some() {
+                        log::debug!(
+                            "TMML_b cross-buffer handle is unsupported raw={:#018x}",
+                            raw,
+                        );
+                        self.program.emit_void(Op::Unimplemented {
+                            opcode: Opcode::TMML_b,
+                            raw,
+                        });
+                        self.unimplemented_count += 1;
+                        return false;
+                    }
+                    origin.as_texture_handle()
+                } else {
+                    TextureHandleOrigin::Bound {
+                        cbuf_word_offset: ((raw >> 36) & 0x1fff) as u32,
+                    }
+                };
+                let arrayed = tex_type == 3;
+                let coord_reg = reg_a(raw).wrapping_add(u8::from(arrayed));
+                let u = self.read_reg(coord_reg);
+                let v = self.read_reg(coord_reg.wrapping_add(1));
                 let mut dst = reg_dest(raw);
-                for component in 0..4u8 {
-                    if (mask >> component) & 1 == 0 {
+                for component in 0..2u8 {
+                    if mask >> component & 1 == 0 {
                         continue;
                     }
-                    self.write_reg(dst, Op::Mov(Value::Zero), pred);
+                    let queried = self.emit_value(Op::TextureQueryLod {
+                        handle,
+                        u,
+                        v,
+                        arrayed,
+                        component,
+                    });
+                    let integer = self.emit_value(Op::F2I {
+                        src: queried,
+                        signed: false,
+                        round: 3,
+                    });
+                    self.write_reg(
+                        dst,
+                        Op::IShl {
+                            a: integer,
+                            b: Value::ImmU32(8),
+                        },
+                        pred,
+                    );
                     dst = dst.wrapping_add(1);
                 }
             }
 
-            Opcode::TXQ | Opcode::TXQ_b if self.stage == ShaderStage::Compute => {
+            Opcode::TXQ | Opcode::TXQ_b => {
                 let mask = ((raw >> 31) & 0xF) as u8;
                 let mode = ((raw >> 22) & 0x7) as u8;
                 if mode != 1 || mask == 0 {
                     log::debug!(
-                        "TXQ unsupported compute form raw={:#018x} mode={} mask={:#x}",
+                        "TXQ unsupported form raw={:#018x} mode={} mask={:#x}",
                         raw,
                         mode,
                         mask,
@@ -3184,6 +3588,15 @@ impl Translator {
                         self.unimplemented_count += 1;
                         return false;
                     };
+                    if origin.cross_binding_partner_id().is_some() {
+                        log::debug!("TXQ_b cross-buffer handle is unsupported raw={:#018x}", raw);
+                        self.program.emit_void(Op::Unimplemented {
+                            opcode: Opcode::TXQ_b,
+                            raw,
+                        });
+                        self.unimplemented_count += 1;
+                        return false;
+                    }
                     origin.as_texture_handle()
                 } else {
                     TextureHandleOrigin::Bound {
@@ -3209,14 +3622,96 @@ impl Translator {
                 }
             }
 
-            Opcode::TXQ | Opcode::TXQ_b | Opcode::TLD4 | Opcode::TLD4_b => {
+            Opcode::TLD4 | Opcode::TLD4_b => {
+                let bindless = decoded.opcode == Opcode::TLD4_b;
                 let mask = ((raw >> 31) & 0xF) as u8;
+                let tex_type = ((raw >> 28) & 0x7) as u8;
+                let dc = ((raw >> 50) & 0x1) != 0;
+                let sparse_pred = ((raw >> 51) & 0x7) as u8;
+                let (offset_type, gather_component) = if bindless {
+                    (((raw >> 36) & 0x3) as u8, ((raw >> 38) & 0x3) as u8)
+                } else {
+                    (((raw >> 54) & 0x3) as u8, ((raw >> 56) & 0x3) as u8)
+                };
+                if self.stage == ShaderStage::Compute
+                    || mask == 0
+                    || tex_type != 2
+                    || dc
+                    || sparse_pred != PT
+                    || offset_type != 0
+                {
+                    log::debug!(
+                        "TLD4 unsupported form raw={:#018x} bindless={} stage={:?} type={} mask={:#x} dc={} sparse_pred={} offset={}",
+                        raw,
+                        bindless,
+                        self.stage,
+                        tex_type,
+                        mask,
+                        dc,
+                        sparse_pred,
+                        offset_type,
+                    );
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: decoded.opcode,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+
+                let tex_id = if bindless {
+                    let handle = self.read_reg(reg_b(raw));
+                    let Some((origin, deferred)) =
+                        self.trace_cbuf_handle_origin(&handle, pred, defs)
+                    else {
+                        log::debug!("TLD4_b handle not traceable to LDC raw={:#018x}", raw);
+                        self.program.emit_void(Op::Unimplemented {
+                            opcode: Opcode::TLD4_b,
+                            raw,
+                        });
+                        self.unimplemented_count += 1;
+                        return false;
+                    };
+                    if deferred {
+                        log::debug!(
+                            "TLD4_b deferred handle origin is unsupported raw={:#018x}",
+                            raw,
+                        );
+                        self.program.emit_void(Op::Unimplemented {
+                            opcode: Opcode::TLD4_b,
+                            raw,
+                        });
+                        self.unimplemented_count += 1;
+                        return false;
+                    }
+                    if let Some(partner) = origin.cross_binding_partner_id() {
+                        self.bindless_or_partners
+                            .insert(origin.texture_id(), partner);
+                    }
+                    origin.texture_id()
+                } else {
+                    texs_tex_id(raw)
+                };
+
+                let coord = reg_a(raw);
+                let u = self.read_reg(coord);
+                let v = self.read_reg(coord.wrapping_add(1));
                 let mut dst = reg_dest(raw);
-                for component in 0..4u8 {
-                    if (mask >> component) & 1 == 0 {
+                for lane in 0..4u8 {
+                    if (mask >> lane) & 1 == 0 {
                         continue;
                     }
-                    self.write_reg(dst, Op::Mov(Value::Zero), pred);
+                    self.write_reg(
+                        dst,
+                        Op::GatherTex {
+                            tex_id,
+                            u,
+                            v,
+                            gather_component,
+                            lane,
+                        },
+                        pred,
+                    );
                     dst = dst.wrapping_add(1);
                 }
             }
@@ -3225,7 +3720,13 @@ impl Translator {
                 let dest = reg_dest(raw);
                 let src = self.read_reg(reg_a(raw));
                 let func = MufuFunc::from_bits(mufu_func_bits(raw));
-                self.write_reg(dest, Op::MultiFunc { src, func }, pred);
+                let mods = FMods {
+                    abs_a: ((raw >> 46) & 1) != 0,
+                    neg_a: ((raw >> 48) & 1) != 0,
+                    sat: ((raw >> 50) & 1) != 0,
+                    ..FMods::default()
+                };
+                self.write_reg(dest, Op::MultiFunc { src, func, mods }, pred);
             }
 
             Opcode::EXIT => {
@@ -3886,7 +4387,14 @@ impl Translator {
                 self.emit_psetp(raw, pred);
             }
             Opcode::CSETP => {
-                self.emit_csetp(raw, pred);
+                if !self.emit_csetp(raw, pred) {
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::CSETP,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
             }
             Opcode::PSET => {
                 self.emit_pset(raw, pred);
@@ -3938,7 +4446,25 @@ impl Translator {
                 self.emit_iadd(raw, Value::ImmU32(imm20(raw) as u32), pred);
             }
             Opcode::IADD32I => {
-                self.emit_iadd(raw, Value::ImmU32(imm32(raw)), pred);
+                let cc = ((raw >> 52) & 1) != 0;
+                let x = ((raw >> 53) & 1) != 0;
+                let sat = ((raw >> 54) & 1) != 0;
+                if cc || x || sat {
+                    log::debug!(
+                        "IADD32I unsupported flags raw={:#018x} cc={} x={} sat={}",
+                        raw,
+                        cc,
+                        x,
+                        sat,
+                    );
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::IADD32I,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+                self.emit_iadd32i(raw, pred);
             }
 
             Opcode::IMUL_imm => {
@@ -4411,18 +4937,36 @@ impl Translator {
             }
 
             Opcode::I2I_reg => {
-                let dest = reg_dest(raw);
                 let src = self.read_reg(reg_b(raw));
-                self.write_reg(dest, Op::Mov(src), pred);
+                if !self.emit_i2i(raw, src, pred) {
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: decoded.opcode,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
             }
             Opcode::I2I_cbuf => {
-                let dest = reg_dest(raw);
                 let id = self.load_cbuf(raw);
-                self.write_reg(dest, Op::Mov(Value::Inst(id)), pred);
+                if !self.emit_i2i(raw, Value::Inst(id), pred) {
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: decoded.opcode,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
             }
             Opcode::I2I_imm => {
-                let dest = reg_dest(raw);
-                self.write_reg(dest, Op::Mov(Value::ImmU32(imm20(raw) as u32)), pred);
+                if !self.emit_i2i(raw, Value::ImmU32(imm20(raw) as u32), pred) {
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: decoded.opcode,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
             }
 
             Opcode::ISET_reg => {
@@ -4669,6 +5213,86 @@ mod tests {
             | (u64::from(PT) << 16)
             | (u64::from(src) << 8)
             | u64::from(dest)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tld4_raw(
+        bindless: bool,
+        dest: u8,
+        coord: u8,
+        meta_or_tex_id: u32,
+        tex_type: u8,
+        mask: u8,
+        gather_component: u8,
+        offset_type: u8,
+        dc: bool,
+        sparse_pred: u8,
+    ) -> u64 {
+        let common = (u64::from(dc) << 50)
+            | (u64::from(sparse_pred & 0x7) << 51)
+            | (u64::from(mask & 0xf) << 31)
+            | (u64::from(tex_type & 0x7) << 28)
+            | (u64::from(PT) << 16)
+            | (u64::from(coord) << 8)
+            | u64::from(dest);
+        if bindless {
+            (0b1101_1110_11u64 << 54)
+                | (u64::from(gather_component & 0x3) << 38)
+                | (u64::from(offset_type & 0x3) << 36)
+                | (u64::from(meta_or_tex_id & 0xff) << 20)
+                | common
+        } else {
+            (0b1100_10u64 << 58)
+                | (u64::from(gather_component & 0x3) << 56)
+                | (u64::from(offset_type & 0x3) << 54)
+                | (u64::from(meta_or_tex_id & 0x1fff) << 36)
+                | common
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tld4s_raw(
+        dest_a: u8,
+        dest_b: u8,
+        coord_a: u8,
+        coord_b: u8,
+        tex_id: u32,
+        gather_component: u8,
+        fp16: bool,
+        aoffi: bool,
+        dc: bool,
+    ) -> u64 {
+        (0xdfu64 << 56)
+            | (u64::from(fp16) << 55)
+            | (u64::from(gather_component & 0x3) << 52)
+            | (u64::from(aoffi) << 51)
+            | (u64::from(dc) << 50)
+            | (u64::from(tex_id & 0x1fff) << 36)
+            | (u64::from(dest_b) << 28)
+            | (u64::from(coord_b) << 20)
+            | (u64::from(PT) << 16)
+            | (u64::from(coord_a) << 8)
+            | u64::from(dest_a)
+    }
+
+    fn tmml_raw(
+        bindless: bool,
+        dest: u8,
+        coord: u8,
+        meta_or_tex_id: u32,
+        tex_type: u8,
+        mask: u8,
+    ) -> u64 {
+        let common = (u64::from(mask & 0xf) << 31)
+            | (u64::from(tex_type & 0x7) << 28)
+            | (u64::from(PT) << 16)
+            | (u64::from(coord) << 8)
+            | u64::from(dest);
+        if bindless {
+            (0b1101_1111_0110_0u64 << 51) | (u64::from(meta_or_tex_id & 0xff) << 20) | common
+        } else {
+            (0b1101_1111_0101_1u64 << 51) | (u64::from(meta_or_tex_id & 0x1fff) << 36) | common
+        }
     }
 
     fn translate_tld(raw: u64, binding: u8, byte_offset: u32) -> Translator {
@@ -4952,9 +5576,33 @@ mod tests {
         match &t.program.instructions[0].op {
             Op::MultiFunc {
                 func: MufuFunc::Rcp,
+                mods,
                 ..
-            } => {}
+            } => assert_eq!(*mods, FMods::default()),
             other => panic!("expected MultiFunc Rcp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mufu_carries_abs_neg_and_sat_modifiers_into_ir() {
+        let raw = 0x5084_0000_0027_230bu64 | (1u64 << 46) | (1u64 << 48);
+        let mut t = Translator::new();
+        assert!(t.translate(raw));
+        match &t.program.instructions[0].op {
+            Op::MultiFunc {
+                src: Value::GprIn(35),
+                func: MufuFunc::Ex2,
+                mods,
+            } => assert_eq!(
+                *mods,
+                FMods {
+                    abs_a: true,
+                    neg_a: true,
+                    sat: true,
+                    ..FMods::default()
+                }
+            ),
+            other => panic!("expected modified MultiFunc Ex2, got {other:?}"),
         }
     }
 
@@ -5578,6 +6226,115 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn captured_texs_sparse_and_rgba_lanes_share_one_unique_sample_site() {
+        let title_sparse = 0xd836_022f_f087_0908u64;
+        let mut sparse = Translator::new_fragment();
+        assert!(sparse.translate(title_sparse));
+        let sparse_lanes = sparse
+            .program
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::SampleTex {
+                    sample_site: Some(site),
+                    component,
+                    ..
+                } => Some((site, component, inst.dest_reg)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sparse_lanes, vec![(0, 0, Some(8)), (0, 3, Some(9))]);
+
+        let material_rgba = 0xd9b2_01a0_8087_0a0au64;
+        let mut rgba = Translator::new_fragment();
+        assert!(rgba.translate(material_rgba));
+        let rgba_lanes = rgba
+            .program
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::SampleTex {
+                    sample_site: Some(site),
+                    component,
+                    ..
+                } => Some((site, component, inst.dest_reg)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rgba_lanes,
+            vec![
+                (0, 0, Some(10)),
+                (0, 1, Some(11)),
+                (0, 2, Some(8)),
+                (0, 3, Some(9)),
+            ]
+        );
+    }
+
+    #[test]
+    fn texture_sample_sites_are_unique_within_a_merged_cfg_block() {
+        let first = 0xd822_00a0_5087_0500u64;
+        let second = (first & !0xff) | 8;
+        let exit = 0xe300_0000_0007_000fu64;
+        let nop = 0x50b0_0000_0007_0f00u64;
+        let bundle = |sample| {
+            [0, sample, exit, nop]
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        let merged = crate::merge_dual_vertex_sass(&bundle(first), &bundle(second))
+            .expect("dual-vertex SASS merge");
+        let cfg = crate::build_cfg(&merged);
+        assert_eq!(cfg.blocks.len(), 1);
+        let sites = cfg.blocks[0]
+            .program
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::SampleTex {
+                    sample_site: Some(site),
+                    ..
+                } => Some(site),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sites.len(), 6);
+        assert!(sites[..3].iter().all(|site| *site == sites[0]));
+        assert!(sites[3..].iter().all(|site| *site == sites[3]));
+        assert_ne!(sites[0], sites[3]);
+    }
+
+    #[test]
+    fn depth_compare_alpha_is_one_instead_of_repeating_comparison() {
+        let raw = (0xc03e_00c0_b077_0406u64 & !(0xf << 31)) | (0b1001 << 31);
+        let mut translator = Translator::new_fragment();
+        assert!(translator.translate(raw));
+        let results = translator
+            .program
+            .instructions
+            .iter()
+            .map(|inst| (&inst.op, inst.dest_reg))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            results.as_slice(),
+            [
+                (
+                    Op::SampleTex {
+                        sample_site: Some(_),
+                        dref: Some(Value::GprIn(7)),
+                        component: 0,
+                        ..
+                    },
+                    Some(6)
+                ),
+                (Op::Mov(Value::ImmF32(alpha)), Some(7)),
+            ] if *alpha == 1.0
+        ));
     }
 
     #[test]
@@ -6454,6 +7211,7 @@ mod tests {
                 instruction,
                 Inst {
                     op: Op::SampleTexHandle {
+                        sample_site: Some(_),
                         handle: TextureHandleOrigin::Bindless {
                             cbuf_binding: 2,
                             cbuf_word_offset: 0x5e,
@@ -6500,6 +7258,415 @@ mod tests {
                     lod: Value::GprIn(8),
                     component: actual,
                 } if actual == component as u8
+            ));
+        }
+    }
+
+    #[test]
+    fn fragment_tmml_2d_queries_rg_and_converts_to_maxwell_fixed_point() {
+        let raw = tmml_raw(false, 8, 4, 0x24, 2, 0b11);
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TMML)
+        );
+        let mut translator = Translator::new_fragment();
+        assert!(translator.translate(raw));
+        assert_eq!(translator.unimplemented_count, 0);
+
+        let queries = translator
+            .program
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::TextureQueryLod { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(queries.len(), 2);
+        for (component, query) in queries.into_iter().enumerate() {
+            assert_eq!(query.dest_reg, None);
+            assert!(matches!(
+                query.op,
+                Op::TextureQueryLod {
+                    handle: TextureHandleOrigin::Bound {
+                        cbuf_word_offset: 0x24,
+                    },
+                    u: Value::GprIn(4),
+                    v: Value::GprIn(5),
+                    arrayed: false,
+                    component: actual,
+                } if actual == component as u8
+            ));
+            let query_id = query.result.expect("query result");
+            let conversion = translator
+                .program
+                .instructions
+                .iter()
+                .find(|inst| {
+                    matches!(
+                        inst.op,
+                        Op::F2I {
+                            src: Value::Inst(source),
+                            signed: false,
+                            round: 3,
+                        } if source == query_id
+                    )
+                })
+                .expect("TMML float-to-unsigned conversion");
+            let conversion_id = conversion.result.expect("conversion result");
+            assert!(translator.program.instructions.iter().any(|inst| {
+                inst.dest_reg == Some(8 + component as u8)
+                    && matches!(
+                        inst.op,
+                        Op::IShl {
+                            a: Value::Inst(source),
+                            b: Value::ImmU32(8),
+                        } if source == conversion_id
+                    )
+            }));
+        }
+    }
+
+    #[test]
+    fn fragment_tmml_bindless_2d_array_uses_static_handle_and_drops_layer_coordinate() {
+        let raw = tmml_raw(true, 20, 4, 12, 3, 0b10);
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TMML_b)
+        );
+        let mut translator = Translator::new_fragment();
+        assert!(translator.translate(static_ldc(12, 2, 0x1a0)));
+        assert!(translator.translate(raw));
+        assert_eq!(translator.unimplemented_count, 0);
+        assert!(translator.program.instructions.iter().any(|inst| {
+            matches!(
+                inst.op,
+                Op::TextureQueryLod {
+                    handle: TextureHandleOrigin::Bindless {
+                        cbuf_binding: 2,
+                        cbuf_word_offset: 0x68,
+                        cbuf_secondary_word_offset: None,
+                    },
+                    u: Value::GprIn(5),
+                    v: Value::GprIn(6),
+                    arrayed: true,
+                    component: 1,
+                }
+            )
+        }));
+        assert!(translator
+            .program
+            .instructions
+            .iter()
+            .any(|inst| { inst.dest_reg == Some(20) && matches!(inst.op, Op::IShl { .. }) }));
+    }
+
+    #[test]
+    fn tmml_unsupported_stage_type_lanes_and_handles_fail_closed() {
+        let direct_2d = tmml_raw(false, 8, 4, 0x24, 2, 0b11);
+        let cases = [
+            tmml_raw(false, 8, 4, 0x24, 6, 0b11),
+            tmml_raw(false, 8, 4, 0x24, 2, 0b100),
+        ];
+        for raw in cases {
+            let mut translator = Translator::new_fragment();
+            assert!(!translator.translate(raw), "raw={raw:#018x}");
+            assert_eq!(translator.unimplemented_count, 1, "raw={raw:#018x}");
+            assert!(matches!(
+                translator.program.instructions.last(),
+                Some(Inst {
+                    op: Op::Unimplemented { raw: failed, .. },
+                    ..
+                }) if *failed == raw
+            ));
+        }
+
+        let mut vertex = Translator::new();
+        assert!(!vertex.translate(direct_2d));
+        assert_eq!(vertex.unimplemented_count, 1);
+
+        let dynamic = tmml_raw(true, 8, 4, 12, 2, 0b11);
+        let mut bindless = Translator::new_fragment();
+        assert!(!bindless.translate(dynamic));
+        assert_eq!(bindless.unimplemented_count, 1);
+
+        let mov = 0x4c98_0788_06c7_0004u64;
+        let or = 0x4c47_0208_1627_0404u64;
+        let other_binding = (or & !(0x1f << 34)) | (3 << 34);
+        let cross_cbuf = tmml_raw(true, 8, 4, 4, 2, 0b11);
+        let mut cross = Translator::new_fragment();
+        assert!(cross.translate(mov));
+        assert!(cross.translate(other_binding));
+        assert!(!cross.translate(cross_cbuf));
+        assert_eq!(cross.unimplemented_count, 1);
+    }
+
+    #[test]
+    fn graphics_txq_dimension_preserves_bound_and_bindless_handles() {
+        let direct_raw = (0b1101_1111_0100_1u64 << 51)
+            | (1u64 << 22)
+            | (0xdu64 << 31)
+            | (0x48u64 << 36)
+            | (u64::from(PT) << 16)
+            | (8u64 << 8)
+            | 4;
+        assert_eq!(
+            decode_one(direct_raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TXQ)
+        );
+        let mut direct = Translator::new_fragment();
+        assert!(direct.translate(direct_raw));
+        assert_eq!(direct.unimplemented_count, 0);
+        let direct_queries = direct
+            .program
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::TextureQueryDimension { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(direct_queries.len(), 3);
+        for ((dest, component), query) in [(4, 0), (5, 2), (6, 3)].into_iter().zip(direct_queries) {
+            assert_eq!(query.dest_reg, Some(dest));
+            assert!(matches!(
+                query.op,
+                Op::TextureQueryDimension {
+                    handle: TextureHandleOrigin::Bound {
+                        cbuf_word_offset: 0x48,
+                    },
+                    lod: Value::GprIn(8),
+                    component: actual,
+                } if actual == component
+            ));
+        }
+
+        let bindless_raw = (0b1101_1111_0101_0u64 << 51)
+            | (1u64 << 22)
+            | (0xbu64 << 31)
+            | (u64::from(PT) << 16)
+            | (12u64 << 8)
+            | 20;
+        assert_eq!(
+            decode_one(bindless_raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TXQ_b)
+        );
+        let mut bindless = Translator::new_fragment();
+        assert!(bindless.translate(static_ldc(12, 2, 0x1a0)));
+        assert!(bindless.translate(bindless_raw));
+        assert_eq!(bindless.unimplemented_count, 0);
+        let bindless_queries = bindless
+            .program
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::TextureQueryDimension { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(bindless_queries.len(), 3);
+        for ((dest, component), query) in [(20, 0), (21, 1), (22, 3)]
+            .into_iter()
+            .zip(bindless_queries)
+        {
+            assert_eq!(query.dest_reg, Some(dest));
+            assert!(matches!(
+                query.op,
+                Op::TextureQueryDimension {
+                    handle: TextureHandleOrigin::Bindless {
+                        cbuf_binding: 2,
+                        cbuf_word_offset: 0x68,
+                        cbuf_secondary_word_offset: None,
+                    },
+                    lod: Value::GprIn(13),
+                    component: actual,
+                } if actual == component
+            ));
+        }
+    }
+
+    #[test]
+    fn graphics_tld4_2d_gather_preserves_mask_component_and_bound_handle() {
+        let raw = tld4_raw(false, 8, 4, 0x24, 2, 0b1011, 2, 0, false, PT);
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TLD4)
+        );
+
+        let mut translator = Translator::new_fragment();
+        assert!(translator.translate(raw));
+        assert_eq!(translator.unimplemented_count, 0);
+        let gathers = translator
+            .program
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::GatherTex { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(gathers.len(), 3);
+        for ((expected_dest, expected_lane), gather) in
+            [(8, 0), (9, 1), (10, 3)].into_iter().zip(gathers)
+        {
+            assert_eq!(gather.dest_reg, Some(expected_dest));
+            assert!(matches!(
+                gather.op,
+                Op::GatherTex {
+                    tex_id: 0x24,
+                    u: Value::GprIn(4),
+                    v: Value::GprIn(5),
+                    gather_component: 2,
+                    lane,
+                } if lane == expected_lane
+            ));
+        }
+    }
+
+    #[test]
+    fn graphics_tld4_bindless_gather_uses_exact_static_cbuf_origin() {
+        let raw = tld4_raw(true, 8, 4, 12, 2, 0xf, 3, 0, false, PT);
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TLD4_b)
+        );
+
+        let mut translator = Translator::new_fragment();
+        assert!(translator.translate(static_ldc(12, 2, 0x1a0)));
+        assert!(translator.translate(raw));
+        assert_eq!(translator.unimplemented_count, 0);
+        let expected_tex_id = bindless_texture_id_pair(2, 0x1a0 / 4, None);
+        let gathers = translator
+            .program
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::GatherTex { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(gathers.len(), 4);
+        for (lane, gather) in gathers.into_iter().enumerate() {
+            assert_eq!(gather.dest_reg, Some(8 + lane as u8));
+            assert!(matches!(
+                gather.op,
+                Op::GatherTex {
+                    tex_id,
+                    u: Value::GprIn(4),
+                    v: Value::GprIn(5),
+                    gather_component: 3,
+                    lane: actual_lane,
+                } if tex_id == expected_tex_id && actual_lane == lane as u8
+            ));
+        }
+    }
+
+    #[test]
+    fn tld4_unsupported_forms_fail_closed_without_zero_results() {
+        let direct_base = tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, false, PT);
+        let unsupported = [
+            tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 1, false, PT),
+            tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, true, PT),
+            tld4_raw(false, 8, 4, 0x24, 3, 0xf, 0, 0, false, PT),
+            tld4_raw(false, 8, 4, 0x24, 2, 0xf, 0, 0, false, 6),
+            tld4_raw(false, 8, 4, 0x24, 2, 0, 0, 0, false, PT),
+        ];
+        for raw in unsupported {
+            let opcode = decode_one(raw).expect("TLD4 must decode").opcode;
+            let mut translator = Translator::new_fragment();
+            assert!(!translator.translate(raw), "raw={raw:#018x}");
+            assert_eq!(translator.unimplemented_count, 1, "raw={raw:#018x}");
+            assert!(matches!(
+                translator.program.instructions.last(),
+                Some(Inst {
+                    op: Op::Unimplemented {
+                        opcode: failed_opcode,
+                        raw: failed_raw,
+                    },
+                    ..
+                }) if *failed_opcode == opcode && *failed_raw == raw
+            ));
+            assert!(!translator.program.instructions.iter().any(|inst| {
+                matches!(inst.op, Op::Mov(Value::Zero)) && inst.dest_reg.is_some()
+            }));
+        }
+
+        let mut compute = Translator::new_compute();
+        assert!(!compute.translate(direct_base));
+        assert_eq!(compute.unimplemented_count, 1);
+
+        let dynamic_bindless = tld4_raw(true, 8, 4, 12, 2, 0xf, 0, 0, false, PT);
+        let mut bindless = Translator::new_fragment();
+        assert!(!bindless.translate(dynamic_bindless));
+        assert_eq!(bindless.unimplemented_count, 1);
+    }
+
+    #[test]
+    fn tld4s_preserves_f32_destinations_and_packs_fp16_results() {
+        let f32_raw = tld4s_raw(8, 12, 4, 6, 0x24, 1, false, false, false);
+        assert_eq!(
+            decode_one(f32_raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TLD4S)
+        );
+        let mut f32_translator = Translator::new_fragment();
+        assert!(f32_translator.translate(f32_raw));
+        let f32_gathers = f32_translator
+            .program
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::GatherTex { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(f32_gathers.len(), 4);
+        for ((expected_dest, expected_lane), gather) in [(8, 0), (9, 1), (12, 2), (13, 3)]
+            .into_iter()
+            .zip(f32_gathers)
+        {
+            assert_eq!(gather.dest_reg, Some(expected_dest));
+            assert!(matches!(
+                gather.op,
+                Op::GatherTex {
+                    tex_id: 0x24,
+                    u: Value::GprIn(4),
+                    v: Value::GprIn(6),
+                    gather_component: 1,
+                    lane,
+                } if lane == expected_lane
+            ));
+        }
+
+        let fp16_raw = tld4s_raw(8, 12, 4, 6, 0x24, 1, true, false, false);
+        assert_eq!(
+            decode_one(fp16_raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TLD4S)
+        );
+        let mut fp16_translator = Translator::new_fragment();
+        assert!(fp16_translator.translate(fp16_raw));
+        assert_eq!(
+            fp16_translator
+                .program
+                .instructions
+                .iter()
+                .filter(|inst| matches!(inst.op, Op::GatherTex { .. }))
+                .count(),
+            4
+        );
+        let packs = fp16_translator
+            .program
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst.op, Op::PackHalf2 { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(packs.len(), 2);
+        assert_eq!(packs[0].dest_reg, Some(8));
+        assert_eq!(packs[1].dest_reg, Some(12));
+        assert_eq!(fp16_translator.unimplemented_count, 0);
+    }
+
+    #[test]
+    fn tld4s_offset_depth_and_unaligned_f32_forms_fail_closed() {
+        let cases = [
+            tld4s_raw(8, 12, 4, 6, 0x24, 1, false, true, false),
+            tld4s_raw(8, 12, 4, 6, 0x24, 1, false, false, true),
+            tld4s_raw(9, 12, 4, 6, 0x24, 1, false, false, false),
+        ];
+        for raw in cases {
+            let mut translator = Translator::new_fragment();
+            assert!(!translator.translate(raw), "raw={raw:#018x}");
+            assert_eq!(translator.unimplemented_count, 1, "raw={raw:#018x}");
+            assert!(matches!(
+                translator.program.instructions.last(),
+                Some(Inst {
+                    op: Op::Unimplemented {
+                        opcode: Opcode::TLD4S,
+                        raw: failed_raw,
+                    },
+                    ..
+                }) if *failed_raw == raw
             ));
         }
     }
@@ -7385,7 +8552,38 @@ mod tests {
     }
 
     #[test]
-    fn direct_tex_2d_array_shadow_uses_xy_layer_and_dref() {
+    fn direct_tex_2d_array_color_consumes_layer_before_xy() {
+        let raw = direct_tex(0, 3, 1);
+        assert_eq!(
+            decode_one(raw).map(|decoded| decoded.opcode),
+            Some(Opcode::TEX)
+        );
+
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(raw));
+        assert_eq!(t.unimplemented_count, 0);
+        assert!(t.program.instructions.iter().any(|inst| matches!(
+            inst.op,
+            Op::SampleTex {
+                sample_site: Some(_),
+                tex_id: 0x24,
+                u: Value::GprIn(5),
+                v: Value::GprIn(6),
+                array: Some(Value::GprIn(4)),
+                volume: None,
+                cube: None,
+                implicit_lod: true,
+                lod_bias: None,
+                explicit_lod: None,
+                texel_offset: None,
+                dref: None,
+                component: 0,
+            }
+        )));
+    }
+
+    #[test]
+    fn direct_tex_2d_array_shadow_consumes_layer_before_xy_and_dref() {
         let raw = 0xc03e_00c0_b077_0406u64;
         assert_eq!(
             decode_one(raw).map(|decoded| decoded.opcode),
@@ -7400,10 +8598,11 @@ mod tests {
             inst,
             Inst {
                 op: Op::SampleTex {
+                    sample_site: Some(_),
                     tex_id: 12,
-                    u: Value::GprIn(4),
-                    v: Value::GprIn(5),
-                    array: Some(Value::GprIn(6)),
+                    u: Value::GprIn(5),
+                    v: Value::GprIn(6),
+                    array: Some(Value::GprIn(4)),
                     volume: None,
                     cube: None,
                     implicit_lod: true,
@@ -7619,6 +8818,7 @@ mod tests {
             inst,
             Inst {
                 op: Op::SampleTex {
+                    sample_site: Some(_),
                     tex_id,
                     u: Value::GprIn(8),
                     v: Value::GprIn(9),
@@ -8168,6 +9368,343 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn captured_smo_iadd32i_minus_one_uses_immediate_bits_only_as_data() {
+        const CAPTURED: u64 = 0x1c0f_ffff_fff7_2222;
+
+        let mut t = Translator::new();
+        assert!(t.translate(CAPTURED));
+        assert!(matches!(
+            t.program.instructions.last(),
+            Some(Inst {
+                op: Op::IAdd {
+                    a: Value::GprIn(0x22),
+                    b: Value::ImmU32(u32::MAX),
+                    neg_a: false,
+                    neg_b: false,
+                },
+                dest_reg: Some(0x22),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn iadd32i_po_adds_one_without_treating_po_as_negate_a() {
+        const CAPTURED: u64 = 0x1c0f_ffff_fff7_2222;
+        let po = (CAPTURED & !(3u64 << 55)) | (3u64 << 55);
+
+        let mut t = Translator::new();
+        assert!(t.translate(po));
+        let first = &t.program.instructions[t.program.instructions.len() - 2];
+        let first_result = first.result.expect("IADD32I base sum");
+        assert!(matches!(
+            first.op,
+            Op::IAdd {
+                a: Value::GprIn(0x22),
+                b: Value::ImmU32(u32::MAX),
+                neg_a: false,
+                neg_b: false,
+            }
+        ));
+        assert!(matches!(
+            t.program.instructions.last(),
+            Some(Inst {
+                op: Op::IAdd {
+                    a: Value::Inst(id),
+                    b: Value::ImmU32(1),
+                    neg_a: false,
+                    neg_b: false,
+                },
+                dest_reg: Some(0x22),
+                ..
+            }) if *id == first_result
+        ));
+    }
+
+    #[test]
+    fn iadd32i_x_sat_and_cc_fail_closed() {
+        const CAPTURED: u64 = 0x1c0f_ffff_fff7_2222;
+        for flag in [52, 53, 54] {
+            let mut t = Translator::new();
+            let raw = CAPTURED | (1u64 << flag);
+            assert!(!t.translate(raw));
+            assert_eq!(t.unimplemented_count, 1);
+            assert!(matches!(
+                t.program.instructions.last().map(|inst| &inst.op),
+                Some(Op::Unimplemented {
+                    opcode: Opcode::IADD32I,
+                    raw: actual,
+                }) if *actual == raw
+            ));
+        }
+    }
+
+    #[test]
+    fn captured_smo_i2i_s32_abs_is_not_lowered_as_a_move() {
+        const CAPTURED: u64 = 0x5ce2_0000_0057_3a04;
+
+        let mut t = Translator::new();
+        assert!(t.translate(CAPTURED));
+        assert_eq!(t.program.instructions.len(), 4);
+
+        let sign = t.program.instructions[0].result.expect("I2I sign mask");
+        assert!(matches!(
+            t.program.instructions[0].op,
+            Op::IShr {
+                a: Value::GprIn(5),
+                b: Value::ImmU32(31),
+                signed: true,
+            }
+        ));
+        let flipped = t.program.instructions[1]
+            .result
+            .expect("I2I sign-flipped value");
+        assert!(matches!(
+            t.program.instructions[1].op,
+            Op::ILop {
+                a: Value::GprIn(5),
+                b: Value::Inst(id),
+                op: LogicOp::Xor,
+                not_a: false,
+                not_b: false,
+            } if id == sign
+        ));
+        let absolute = t.program.instructions[2]
+            .result
+            .expect("I2I absolute value");
+        assert!(matches!(
+            t.program.instructions[2].op,
+            Op::IAdd {
+                a: Value::Inst(lhs),
+                b: Value::Inst(rhs),
+                neg_a: false,
+                neg_b: true,
+            } if lhs == flipped && rhs == sign
+        ));
+        assert!(matches!(
+            t.program.instructions[3],
+            Inst {
+                op: Op::Mov(Value::Inst(id)),
+                dest_reg: Some(4),
+                ..
+            } if id == absolute
+        ));
+    }
+
+    #[test]
+    fn captured_smo_i2i_applies_neg_after_abs() {
+        const CAPTURED: u64 = 0x5ce2_2000_0097_3a09;
+
+        let mut t = Translator::new();
+        assert!(t.translate(CAPTURED));
+        assert_eq!(t.program.instructions.len(), 5);
+        let absolute = t.program.instructions[2]
+            .result
+            .expect("I2I absolute value");
+        let negated = t.program.instructions[3]
+            .result
+            .expect("I2I negated absolute value");
+        assert!(matches!(
+            t.program.instructions[3].op,
+            Op::IAdd {
+                a: Value::Zero,
+                b: Value::Inst(id),
+                neg_a: false,
+                neg_b: true,
+            } if id == absolute
+        ));
+        assert!(matches!(
+            t.program.instructions[4],
+            Inst {
+                op: Op::Mov(Value::Inst(id)),
+                dest_reg: Some(9),
+                ..
+            } if id == negated
+        ));
+    }
+
+    #[test]
+    fn i2i_unproven_formats_selector_sat_and_unsigned_modifiers_fail_closed() {
+        const CAPTURED: u64 = 0x5ce2_0000_0057_3a04;
+        for raw in [
+            CAPTURED | (1u64 << 41),
+            (CAPTURED & !(3u64 << 10)) | (1u64 << 10),
+            CAPTURED & !(3u64 << 8),
+            CAPTURED | (1u64 << 50),
+            CAPTURED & !((1u64 << 12) | (1u64 << 13)),
+        ] {
+            let mut t = Translator::new();
+            assert!(!t.translate(raw), "raw={raw:#018x}");
+            assert_eq!(t.unimplemented_count, 1, "raw={raw:#018x}");
+            assert!(matches!(
+                t.program.instructions.last().map(|inst| &inst.op),
+                Some(Op::Unimplemented {
+                    opcode: Opcode::I2I_reg,
+                    raw: actual,
+                }) if *actual == raw
+            ));
+        }
+    }
+
+    #[test]
+    fn captured_smo_i2i_cc_identity_keeps_translating() {
+        const CAPTURED: u64 = 0x5ce0_8000_0017_0aff;
+
+        let mut t = Translator::new();
+        assert!(t.translate(CAPTURED));
+        assert_eq!(t.unimplemented_count, 0);
+        assert_eq!(t.cc_source, Some(Value::GprIn(1)));
+        assert!(matches!(
+            t.program.instructions.last(),
+            Some(Inst {
+                op: Op::Mov(Value::GprIn(1)),
+                dest_reg: Some(RZ),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn captured_smo_fs_and_vs_i2i_cc_feed_csetp_neu() {
+        const CSETP_NEU_P0: u64 = 0x50a0_0380_0007_0d07;
+        for (i2i, source) in [(0x5ce0_8000_0017_0aff, 1), (0x5ce0_8000_0127_3aff, 0x12)] {
+            let mut t = Translator::new();
+            assert!(t.translate(i2i), "I2I raw={i2i:#018x}");
+            assert!(t.translate(CSETP_NEU_P0));
+            assert_eq!(t.unimplemented_count, 0);
+            assert!(matches!(
+                t.program.instructions.last(),
+                Some(Inst {
+                    op: Op::ISetPred {
+                        cmp: ICmp::Ne,
+                        signed: false,
+                        bop: BoolOp::And,
+                        src_a: Value::GprIn(actual),
+                        src_b: Value::Zero,
+                        src_pred: PT,
+                        src_pred_inv: false,
+                        dest_p: 0,
+                        dest_np: PT,
+                    },
+                    pred: None,
+                    ..
+                }) if *actual == source
+            ));
+        }
+    }
+
+    #[test]
+    fn i2i_cc_source_is_invalidated_by_later_cc_writer() {
+        const I2I_CC: u64 = 0x5ce0_8000_0017_0aff;
+        const IADD_CC: u64 = 0x5c10_8000_0037_0404;
+        const CSETP_NEU_P0: u64 = 0x50a0_0380_0007_0d07;
+
+        assert!(matches!(
+            decode_one(IADD_CC).map(|decoded| decoded.opcode),
+            Some(Opcode::IADD_reg)
+        ));
+        let mut t = Translator::new();
+        assert!(t.translate(I2I_CC));
+        assert_eq!(t.cc_source, Some(Value::GprIn(1)));
+        assert!(t.translate(IADD_CC));
+        assert_eq!(t.cc_source, None);
+        assert!(!t.translate(CSETP_NEU_P0));
+        assert_eq!(t.unimplemented_count, 1);
+        assert!(matches!(
+            t.program.instructions.last().map(|inst| &inst.op),
+            Some(Op::Unimplemented {
+                opcode: Opcode::CSETP,
+                raw: CSETP_NEU_P0,
+            })
+        ));
+    }
+
+    #[test]
+    fn i2i_cc_source_is_invalidated_by_r2p_cc() {
+        const I2I_CC: u64 = 0x5ce0_8000_0017_0aff;
+        const R2P_CC: u64 = 0x38f0_0100_0607_1400;
+        const CSETP_NEU_P0: u64 = 0x50a0_0380_0007_0d07;
+
+        assert!(matches!(
+            decode_one(R2P_CC).map(|decoded| decoded.opcode),
+            Some(Opcode::R2P_imm)
+        ));
+        let mut t = Translator::new();
+        assert!(t.translate(I2I_CC));
+        assert_eq!(t.cc_source, Some(Value::GprIn(1)));
+        assert!(!t.translate(R2P_CC));
+        assert_eq!(t.cc_source, None);
+        assert!(!t.translate(CSETP_NEU_P0));
+        assert_eq!(t.unimplemented_count, 2);
+        assert!(matches!(
+            t.program.instructions.last().map(|inst| &inst.op),
+            Some(Op::Unimplemented {
+                opcode: Opcode::CSETP,
+                raw: CSETP_NEU_P0,
+            })
+        ));
+    }
+
+    #[test]
+    fn captured_smo_f2i_u16_clamps_before_conversion() {
+        const CAPTURED: u64 = 0x5cb0_1000_0047_0904;
+
+        let mut t = Translator::new_fragment();
+        assert!(t.translate(CAPTURED));
+        assert_eq!(t.program.instructions.len(), 3);
+        let lower = t.program.instructions[0]
+            .result
+            .expect("F2I U16 lower clamp");
+        assert!(matches!(
+            t.program.instructions[0].op,
+            Op::FMax {
+                a: Value::GprIn(4),
+                b: Value::ImmF32(0.0),
+                mods: FMods {
+                    neg_a: false,
+                    abs_a: false,
+                    neg_b: false,
+                    abs_b: false,
+                    neg_c: false,
+                    sat: false,
+                    scale: 0,
+                },
+            }
+        ));
+        let upper = t.program.instructions[1]
+            .result
+            .expect("F2I U16 upper clamp");
+        assert!(matches!(
+            t.program.instructions[1].op,
+            Op::FMin {
+                a: Value::Inst(id),
+                b: Value::ImmF32(65535.0),
+                mods: FMods {
+                    neg_a: false,
+                    abs_a: false,
+                    neg_b: false,
+                    abs_b: false,
+                    neg_c: false,
+                    sat: false,
+                    scale: 0,
+                },
+            } if id == lower
+        ));
+        assert!(matches!(
+            t.program.instructions[2],
+            Inst {
+                op: Op::F2I {
+                    src: Value::Inst(id),
+                    signed: false,
+                    round: 0,
+                },
+                dest_reg: Some(4),
+                ..
+            } if id == upper
+        ));
     }
 
     #[test]

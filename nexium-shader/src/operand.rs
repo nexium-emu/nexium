@@ -723,6 +723,50 @@ pub fn iadd_neg_b(insn: u64) -> bool {
     bits(insn, 48, 48) != 0
 }
 #[inline]
+pub fn iadd32i_neg_a(insn: u64) -> bool {
+    !iadd32i_po(insn) && bits(insn, 56, 56) != 0
+}
+#[inline]
+pub fn iadd32i_po(insn: u64) -> bool {
+    bits(insn, 55, 56) == 3
+}
+#[inline]
+pub fn i2i_dst_format(insn: u64) -> u8 {
+    bits(insn, 8, 9) as u8
+}
+#[inline]
+pub fn i2i_src_format(insn: u64) -> u8 {
+    bits(insn, 10, 11) as u8
+}
+#[inline]
+pub fn i2i_dst_signed(insn: u64) -> bool {
+    bits(insn, 12, 12) != 0
+}
+#[inline]
+pub fn i2i_src_signed(insn: u64) -> bool {
+    bits(insn, 13, 13) != 0
+}
+#[inline]
+pub fn i2i_selector(insn: u64) -> u8 {
+    bits(insn, 41, 43) as u8
+}
+#[inline]
+pub fn i2i_neg(insn: u64) -> bool {
+    bits(insn, 45, 45) != 0
+}
+#[inline]
+pub fn i2i_cc(insn: u64) -> bool {
+    bits(insn, 47, 47) != 0
+}
+#[inline]
+pub fn i2i_abs(insn: u64) -> bool {
+    bits(insn, 49, 49) != 0
+}
+#[inline]
+pub fn i2i_sat(insn: u64) -> bool {
+    bits(insn, 50, 50) != 0
+}
+#[inline]
 pub fn lop_op(insn: u64) -> u64 {
     bits(insn, 41, 42)
 }

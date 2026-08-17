@@ -403,6 +403,7 @@ pub enum Op {
     MultiFunc {
         src: Value,
         func: MufuFunc,
+        mods: FMods,
     },
 
     LoadCbuf {
@@ -517,6 +518,7 @@ pub enum Op {
     },
 
     SampleTex {
+        sample_site: Option<u32>,
         tex_id: u32,
         u: Value,
         v: Value,
@@ -532,6 +534,7 @@ pub enum Op {
     },
 
     SampleTexHandle {
+        sample_site: Option<u32>,
         handle: TextureHandleOrigin,
         dimension: ImageDimension,
         u: Value,
@@ -567,6 +570,14 @@ pub enum Op {
     TextureQueryDimension {
         handle: TextureHandleOrigin,
         lod: Value,
+        component: u8,
+    },
+
+    TextureQueryLod {
+        handle: TextureHandleOrigin,
+        u: Value,
+        v: Value,
+        arrayed: bool,
         component: u8,
     },
 
@@ -1023,7 +1034,14 @@ impl Inst {
                 neg_pred,
                 ..
             } => write!(f, "FMnMx {a}, {b}, P{pred}, neg={neg_pred}"),
-            Op::MultiFunc { src, func } => write!(f, "MFn.{} {src}", func.name()),
+            Op::MultiFunc { src, func, mods } => write!(
+                f,
+                "MFn.{}{}{}{} {src}",
+                func.name(),
+                if mods.abs_a { ".abs" } else { "" },
+                if mods.neg_a { ".neg" } else { "" },
+                if mods.sat { ".sat" } else { "" },
+            ),
             Op::LoadCbuf {
                 binding,
                 byte_offset,
@@ -1128,6 +1146,7 @@ impl Inst {
                 )
             }
             Op::SampleTex {
+                sample_site,
                 tex_id,
                 u,
                 v,
@@ -1158,6 +1177,9 @@ impl Inst {
                     .map(|(x, y)| format!(".offset({x}, {y})"))
                     .unwrap_or_default();
                 write!(f, "TexSamp")?;
+                if let Some(site) = sample_site {
+                    write!(f, "#{site}")?;
+                }
                 if *implicit_lod {
                     write!(f, ".implicit")?;
                     if let Some(bias) = lod_bias {
@@ -1181,6 +1203,7 @@ impl Inst {
                 )
             }
             Op::SampleTexHandle {
+                sample_site,
                 handle,
                 dimension,
                 u,
@@ -1200,6 +1223,9 @@ impl Inst {
                     (None, Some(w)) => format!("({u}, ?, {w})"),
                 };
                 write!(f, "TexSampHandle")?;
+                if let Some(site) = sample_site {
+                    write!(f, "#{site}")?;
+                }
                 if *implicit_lod {
                     write!(f, ".implicit")?;
                     if let Some(bias) = lod_bias {
@@ -1286,6 +1312,17 @@ impl Inst {
                 lod,
                 component,
             } => write!(f, "TexQueryDim {handle}, lod={lod}[{component}]"),
+            Op::TextureQueryLod {
+                handle,
+                u,
+                v,
+                arrayed,
+                component,
+            } => write!(
+                f,
+                "TexQueryLod {handle}, ({u}, {v}){}[{component}]",
+                if *arrayed { "2d[]" } else { "2d" }
+            ),
             Op::LocalInvocationId { component } => {
                 write!(f, "LocalInvocationId[{component}]")
             }

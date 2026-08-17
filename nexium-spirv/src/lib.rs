@@ -38,6 +38,105 @@ pub enum Stage {
     Compute,
 }
 
+const GRAPHICS_SPIRV_ENV_OPTIONS: &[&str] = &[
+    "NEXIUM_DISABLE_NEW_FS_OPS",
+    "NEXIUM_SPIRV_FTZ",
+    "NEXIUM_TEX_2X",
+    "NEXIUM_TEX_LAYER_OVERRIDE",
+    "NEXIUM_TEX_UV_OVERRIDE",
+    "NEXIUM_NO_KIL",
+    "NEXIUM_FORCE_GATE",
+    "NEXIUM_NO_KIL_TEX_ID",
+    "NEXIUM_NO_STRUCT_EXIT",
+    "NEXIUM_VS_Z_REMAP",
+    "NEXIUM_FS_COLOR_ATTR",
+];
+
+const FRAGMENT_DEBUG_SPIRV_ENV_OPTIONS: &[&str] = &[
+    "NEXIUM_FS_SAMPLE_SLOT",
+    "NEXIUM_FS_SAMPLE_COMPONENT",
+    "NEXIUM_FS_TEXCOORD_SLOT",
+    "NEXIUM_FS_FORCE_SAMPLE_LOD",
+    "NEXIUM_FS_DEBUG_OUTPUT_LOC",
+    "NEXIUM_TEX_V_FLIP_SLOTS",
+    "NEXIUM_FS_FORCE_OUTPUT_LOC",
+    "NEXIUM_FS_FORCE_OUTPUT_VALUE",
+    "NEXIUM_FS_IR_VALUES",
+    "NEXIUM_FS_IR_OCT_NORMAL",
+    "NEXIUM_FS_COLOR_LOC",
+    "NEXIUM_FS_COLOR_SCALE",
+    "NEXIUM_FS_COLOR_ALPHA_ONE",
+    "NEXIUM_FRAG_2X",
+];
+
+fn parse_fragment_ir_oct_normal(value: &str) -> Option<[ValueId; 3]> {
+    let mut parts = value.split(',').map(str::trim);
+    let mut parse = || {
+        parts
+            .next()?
+            .trim_start_matches(['v', 'V'])
+            .parse::<u32>()
+            .ok()
+            .map(ValueId)
+    };
+    let ids = [parse()?, parse()?, parse()?];
+    parts.next().is_none().then_some(ids)
+}
+
+fn graphics_spirv_environment_fingerprint_with(
+    fragment_debug_active: bool,
+    mut value: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> u128 {
+    fn fold(hash: &mut u64, bytes: &[u8], prime: u64) {
+        for &byte in bytes {
+            *hash ^= u64::from(byte);
+            *hash = hash.wrapping_mul(prime);
+        }
+    }
+
+    fn fold_field(lo: &mut u64, hi: &mut u64, name: &str, value: &std::ffi::OsStr) {
+        let name_len = (name.len() as u64).to_le_bytes();
+        let value = value.as_encoded_bytes();
+        let value_len = (value.len() as u64).to_le_bytes();
+        fold(lo, &name_len, 0x0000_0100_0000_01b3);
+        fold(lo, name.as_bytes(), 0x0000_0100_0000_01b3);
+        fold(lo, &value_len, 0x0000_0100_0000_01b3);
+        fold(lo, value, 0x0000_0100_0000_01b3);
+        fold(hi, &name_len, 0x9e37_79b1_85eb_ca87);
+        fold(hi, name.as_bytes(), 0x9e37_79b1_85eb_ca87);
+        fold(hi, &value_len, 0x9e37_79b1_85eb_ca87);
+        fold(hi, value, 0x9e37_79b1_85eb_ca87);
+    }
+
+    let mut lo = 0xcbf2_9ce4_8422_2325;
+    let mut hi = 0x6a09_e667_f3bc_c909;
+    let mut any = false;
+    let names = GRAPHICS_SPIRV_ENV_OPTIONS.iter().copied().chain(
+        fragment_debug_active
+            .then_some(FRAGMENT_DEBUG_SPIRV_ENV_OPTIONS)
+            .into_iter()
+            .flatten()
+            .copied(),
+    );
+    for name in names {
+        if let Some(value) = value(name) {
+            any = true;
+            fold_field(&mut lo, &mut hi, name, &value);
+        }
+    }
+    if !any {
+        return 0;
+    }
+    let fingerprint = (u128::from(hi) << 64) | u128::from(lo);
+    fingerprint.max(1)
+}
+
+pub fn graphics_spirv_environment_fingerprint(fragment_debug_active: bool) -> u128 {
+    graphics_spirv_environment_fingerprint_with(fragment_debug_active, |name| {
+        std::env::var_os(name)
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TextureNumericType {
     #[default]
@@ -273,6 +372,7 @@ pub struct GraphicsTextureResource {
     pub descriptor_slot: u32,
     pub numeric_type: TextureNumericType,
     pub image_kind: GraphicsImageKind,
+    pub normalized_coords: bool,
 }
 
 impl GraphicsTextureResource {
@@ -286,11 +386,17 @@ impl GraphicsTextureResource {
             descriptor_slot,
             numeric_type,
             image_kind: GraphicsImageKind::D2,
+            normalized_coords: true,
         }
     }
 
     pub const fn with_image_kind(mut self, image_kind: GraphicsImageKind) -> Self {
         self.image_kind = image_kind;
+        self
+    }
+
+    pub const fn with_normalized_coords(mut self, normalized_coords: bool) -> Self {
+        self.normalized_coords = normalized_coords;
         self
     }
 }
@@ -324,6 +430,15 @@ pub enum GraphicsTextureManifestError {
         slot: u32,
         first: GraphicsImageKind,
         second: GraphicsImageKind,
+    },
+    #[error(
+        "shader texture ID {shader_id:#x} at descriptor slot {slot} requires conflicting normalized-coordinate modes {first} and {second}"
+    )]
+    NormalizedCoordsConflict {
+        shader_id: u32,
+        slot: u32,
+        first: bool,
+        second: bool,
     },
     #[error(
         "graphics texture descriptor slot {slot} should contain shader texture ID {expected_shader_id:#x}, but the manifest contains {actual_shader_id:#x}"
@@ -365,6 +480,7 @@ pub fn normalize_graphics_texture_manifest(
             resource.shader_id,
             resource.numeric_type,
             resource.image_kind,
+            resource.normalized_coords,
         )
     });
 
@@ -400,6 +516,14 @@ pub fn normalize_graphics_texture_manifest(
                         second: resource.image_kind,
                     });
                 }
+                if previous.normalized_coords != resource.normalized_coords {
+                    return Err(GraphicsTextureManifestError::NormalizedCoordsConflict {
+                        shader_id: resource.shader_id,
+                        slot: resource.descriptor_slot,
+                        first: previous.normalized_coords,
+                        second: resource.normalized_coords,
+                    });
+                }
                 continue;
             }
         }
@@ -418,6 +542,21 @@ fn record_graphics_texture_image_kind(
             previous, image_kind,
             "graphics shader texture {shader_id:#x} is used with incompatible {previous:?} and {image_kind:?} image families"
         );
+    }
+}
+
+fn graphics_texture_id(handle: TextureHandleOrigin) -> u32 {
+    match handle {
+        TextureHandleOrigin::Bound { cbuf_word_offset } => cbuf_word_offset,
+        TextureHandleOrigin::Bindless {
+            cbuf_binding,
+            cbuf_word_offset,
+            cbuf_secondary_word_offset,
+        } => nexium_shader::bindless_texture_id_pair(
+            cbuf_binding,
+            cbuf_word_offset,
+            cbuf_secondary_word_offset,
+        ),
     }
 }
 
@@ -628,6 +767,7 @@ pub const MAX_COMPUTE_LOCAL_MEMORY_SIZE: u32 = 512 * 1024;
 pub struct Emitter {
     b: rspirv::dr::Builder,
     stage: Stage,
+    force_fp32_ftz: bool,
     f32_t: Word,
     vec2_t: Word,
     vec3_t: Word,
@@ -699,6 +839,7 @@ pub struct Emitter {
     fswzadd_lut_b: Option<Word>,
     layer_var: Option<Word>,
     frag_coord_var: Option<Word>,
+    front_facing_var: Option<Word>,
     frag_color_vars: HashMap<u32, Word>,
     vertex_index_var: Option<Word>,
     instance_index_var: Option<Word>,
@@ -732,6 +873,7 @@ pub struct Emitter {
     cbuf_bindings_used: u64,
     texs_ids_used: std::collections::BTreeSet<u32>,
     texture_slots: HashMap<u32, u32>,
+    graphics_texture_kinds: HashMap<u32, GraphicsImageKind>,
     texture_numeric_manifest: Vec<GraphicsTextureResource>,
     typed_image_decls: HashMap<(TextureNumericType, GraphicsImageKind), GraphicsImageDecl>,
     vertex_opts: VertexOptions,
@@ -751,6 +893,9 @@ pub struct Emitter {
     sample_debug_component: Option<u32>,
     sample_debug_value: Option<Word>,
     texcoord_debug_slot: Option<u32>,
+    force_sample_lod: Option<f32>,
+    fragment_debug_output_location: Option<u32>,
+    fragment_ir_oct_normal: Option<[ValueId; 3]>,
     tex_v_flip_slots: Vec<u32>,
     fragment_debug_active: bool,
     sampler_arrayed: bool,
@@ -767,6 +912,7 @@ pub struct Emitter {
     compute_options: Option<ComputeOptions>,
     compute_resource_vars: Vec<ComputeResourceVar>,
     ir_constant_facts: nexium_shader::IrConstantFacts,
+    texture_sample_sites: HashMap<u32, CachedTextureSample>,
 }
 
 #[derive(Clone, Copy)]
@@ -792,6 +938,19 @@ struct GraphicsImageDecl {
     image_t: Word,
     ptr_image: Word,
     var: Word,
+}
+
+#[derive(Clone, Copy)]
+enum CachedTextureSample {
+    Graphics {
+        value: Word,
+        depth_compare: bool,
+    },
+    Compute {
+        value: Word,
+        scalar_type: Word,
+        numeric_type: TextureNumericType,
+    },
 }
 
 #[derive(Clone)]
@@ -980,6 +1139,7 @@ impl Emitter {
         Self {
             b,
             stage,
+            force_fp32_ftz: std::env::var("NEXIUM_SPIRV_FTZ").ok().as_deref() == Some("1"),
             f32_t,
             vec2_t,
             vec3_t,
@@ -1051,6 +1211,7 @@ impl Emitter {
             fswzadd_lut_b: None,
             layer_var: None,
             frag_coord_var: None,
+            front_facing_var: None,
             frag_color_vars: HashMap::new(),
             vertex_index_var: None,
             instance_index_var: None,
@@ -1084,6 +1245,7 @@ impl Emitter {
             cbuf_bindings_used: 0,
             texs_ids_used: std::collections::BTreeSet::new(),
             texture_slots: HashMap::new(),
+            graphics_texture_kinds: HashMap::new(),
             texture_numeric_manifest: Vec::new(),
             typed_image_decls: HashMap::new(),
             vertex_opts: VertexOptions::default(),
@@ -1117,6 +1279,17 @@ impl Emitter {
             texcoord_debug_slot: std::env::var("NEXIUM_FS_TEXCOORD_SLOT")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok()),
+            force_sample_lod: std::env::var("NEXIUM_FS_FORCE_SAMPLE_LOD")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| v.is_finite()),
+            fragment_debug_output_location: std::env::var("NEXIUM_FS_DEBUG_OUTPUT_LOC")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok()),
+            fragment_ir_oct_normal: std::env::var("NEXIUM_FS_IR_OCT_NORMAL")
+                .ok()
+                .as_deref()
+                .and_then(parse_fragment_ir_oct_normal),
             tex_v_flip_slots: std::env::var("NEXIUM_TEX_V_FLIP_SLOTS")
                 .ok()
                 .map(|v| {
@@ -1140,6 +1313,7 @@ impl Emitter {
             compute_options: (stage == Stage::Compute).then(ComputeOptions::default),
             compute_resource_vars: Vec::new(),
             ir_constant_facts: nexium_shader::IrConstantFacts::default(),
+            texture_sample_sites: HashMap::new(),
         }
     }
 
@@ -1622,6 +1796,38 @@ impl Emitter {
         v
     }
 
+    fn front_facing_var_id(&mut self) -> Word {
+        assert_eq!(
+            self.stage,
+            Stage::Fragment,
+            "FrontFacing is only available to fragment shaders"
+        );
+        if let Some(v) = self.front_facing_var {
+            return v;
+        }
+        let ptr_input_bool = self.b.type_pointer(None, StorageClass::Input, self.bool_t);
+        let v = self
+            .b
+            .variable(ptr_input_bool, None, StorageClass::Input, None);
+        self.b.decorate(
+            v,
+            Decoration::BuiltIn,
+            [Operand::BuiltIn(BuiltIn::FrontFacing)],
+        );
+        self.interface.push(v);
+        self.front_facing_var = Some(v);
+        v
+    }
+
+    fn load_front_facing_bits(&mut self) -> Word {
+        let var = self.front_facing_var_id();
+        let front_facing = self.b.load(self.bool_t, None, var, None, []).unwrap();
+        let front_mask = self.const_f32(u32::MAX);
+        self.b
+            .select(self.f32_t, None, front_facing, front_mask, self.f32_zero)
+            .unwrap()
+    }
+
     fn frag_color_var_at(&mut self, location: u32) -> Word {
         if let Some(&v) = self.frag_color_vars.get(&location) {
             return v;
@@ -1848,6 +2054,21 @@ impl Emitter {
         }
     }
 
+    fn replace_fragment_debug_output(&self, outputs: &mut [(u32, Word)], value: Word) {
+        if !self.fragment_debug_active {
+            return;
+        }
+        let selected = match self.fragment_debug_output_location {
+            Some(location) => outputs
+                .iter_mut()
+                .find(|(out_location, _)| *out_location == location),
+            None => outputs.first_mut(),
+        };
+        if let Some((_, output)) = selected {
+            *output = value;
+        }
+    }
+
     fn fragment_ir_debug_value(&mut self) -> Option<Word> {
         if !self.fragment_debug_active {
             return None;
@@ -1881,6 +2102,98 @@ impl Emitter {
         Some(
             self.b
                 .composite_construct(self.vec4_t, None, components)
+                .unwrap(),
+        )
+    }
+
+    fn fragment_ir_oct_normal_debug_value(&mut self) -> Option<Word> {
+        if !self.fragment_debug_active {
+            return None;
+        }
+        let [x_id, y_id, z_id] = self.fragment_ir_oct_normal?;
+        let x = self.value_to_word.get(&x_id).copied()?;
+        let y = self.value_to_word.get(&y_id).copied()?;
+        let z = self.value_to_word.get(&z_id).copied()?;
+
+        let abs = |emitter: &mut Self, value| {
+            emitter
+                .b
+                .ext_inst(
+                    emitter.f32_t,
+                    None,
+                    emitter.glsl,
+                    4,
+                    [Operand::IdRef(value)],
+                )
+                .unwrap()
+        };
+        let abs_x = abs(self, x);
+        let abs_y = abs(self, y);
+        let abs_z = abs(self, z);
+        let abs_xy = self.b.f_add(self.f32_t, None, abs_x, abs_y).unwrap();
+        let l1 = self.b.f_add(self.f32_t, None, abs_xy, abs_z).unwrap();
+        let inv_l1 = self.b.f_div(self.f32_t, None, self.f32_one, l1).unwrap();
+        let projected_x = self.b.f_mul(self.f32_t, None, x, inv_l1).unwrap();
+        let projected_y = self.b.f_mul(self.f32_t, None, y, inv_l1).unwrap();
+        let abs_projected_x = abs(self, projected_x);
+        let abs_projected_y = abs(self, projected_y);
+        let fold_x_magnitude = self
+            .b
+            .f_sub(self.f32_t, None, self.f32_one, abs_projected_y)
+            .unwrap();
+        let fold_y_magnitude = self
+            .b
+            .f_sub(self.f32_t, None, self.f32_one, abs_projected_x)
+            .unwrap();
+        let negative_one = self.const_f32((-1.0f32).to_bits());
+        let x_negative = self
+            .b
+            .f_ord_less_than(self.bool_t, None, projected_x, self.f32_zero)
+            .unwrap();
+        let y_negative = self
+            .b
+            .f_ord_less_than(self.bool_t, None, projected_y, self.f32_zero)
+            .unwrap();
+        let sign_x = self
+            .b
+            .select(self.f32_t, None, x_negative, negative_one, self.f32_one)
+            .unwrap();
+        let sign_y = self
+            .b
+            .select(self.f32_t, None, y_negative, negative_one, self.f32_one)
+            .unwrap();
+        let folded_x = self
+            .b
+            .f_mul(self.f32_t, None, fold_x_magnitude, sign_x)
+            .unwrap();
+        let folded_y = self
+            .b
+            .f_mul(self.f32_t, None, fold_y_magnitude, sign_y)
+            .unwrap();
+        let z_negative = self
+            .b
+            .f_ord_less_than(self.bool_t, None, z, self.f32_zero)
+            .unwrap();
+        let oct_x = self
+            .b
+            .select(self.f32_t, None, z_negative, folded_x, projected_x)
+            .unwrap();
+        let oct_y = self
+            .b
+            .select(self.f32_t, None, z_negative, folded_y, projected_y)
+            .unwrap();
+        let half = self.const_f32(0.5f32.to_bits());
+        let encoded_x = self.b.f_mul(self.f32_t, None, oct_x, half).unwrap();
+        let encoded_x = self.b.f_add(self.f32_t, None, encoded_x, half).unwrap();
+        let encoded_y = self.b.f_mul(self.f32_t, None, oct_y, half).unwrap();
+        let encoded_y = self.b.f_add(self.f32_t, None, encoded_y, half).unwrap();
+        Some(
+            self.b
+                .composite_construct(
+                    self.vec4_t,
+                    None,
+                    [encoded_x, encoded_y, self.f32_zero, self.f32_one],
+                )
                 .unwrap(),
         )
     }
@@ -2398,6 +2711,32 @@ impl Emitter {
             .unwrap_or(TextureNumericType::Float)
     }
 
+    fn texture_uses_normalized_coords(&self, tex_id: u32) -> bool {
+        if self.texture_numeric_manifest.is_empty() {
+            return true;
+        }
+        let slot = self.texture_slot(tex_id);
+        self.texture_numeric_manifest
+            .binary_search_by_key(&slot, |resource| resource.descriptor_slot)
+            .ok()
+            .map(|index| self.texture_numeric_manifest[index].normalized_coords)
+            .unwrap_or(true)
+    }
+
+    fn manifested_texture_for_shader_id(&self, shader_id: u32) -> Option<GraphicsTextureResource> {
+        let mut matches = self
+            .texture_numeric_manifest
+            .iter()
+            .copied()
+            .filter(|resource| resource.shader_id == shader_id);
+        let resource = matches.next()?;
+        assert!(
+            matches.next().is_none(),
+            "nexium-spirv: graphics texture manifest assigns shader texture ID {shader_id:#x} to multiple descriptor slots"
+        );
+        Some(resource)
+    }
+
     fn validate_graphics_texture_manifest(
         &self,
         texture_kinds: &std::collections::BTreeMap<u32, GraphicsImageKind>,
@@ -2753,8 +3092,7 @@ impl Emitter {
         implicit_lod: bool,
         explicit_lod: Option<&IrValue>,
         texel_offset: Option<&(IrValue, IrValue)>,
-        component: u8,
-    ) -> Word {
+    ) -> CachedTextureSample {
         use rspirv::spirv::ImageOperands;
 
         let resource = self.compute_filtered_resource(handle);
@@ -2832,15 +3170,10 @@ impl Emitter {
                 )
                 .unwrap()
         };
-        let component = self
-            .b
-            .composite_extract(resource.scalar_t, None, sampled, [component.min(3) as u32])
-            .unwrap();
-        match resource.resource.numeric_type {
-            TextureNumericType::Float => component,
-            TextureNumericType::Uint | TextureNumericType::Sint => {
-                self.b.bitcast(self.f32_t, None, component).unwrap()
-            }
+        CachedTextureSample::Compute {
+            value: sampled,
+            scalar_type: resource.scalar_t,
+            numeric_type: resource.resource.numeric_type,
         }
     }
 
@@ -2891,6 +3224,137 @@ impl Emitter {
             }
         };
         self.store_bits(result)
+    }
+
+    fn lower_graphics_texture_query(
+        &mut self,
+        handle: TextureHandleOrigin,
+        lod: &IrValue,
+        component: u8,
+    ) -> Word {
+        let tex_id = graphics_texture_id(handle);
+        let kind = *self.graphics_texture_kinds.get(&tex_id).unwrap_or_else(|| {
+            panic!(
+                "nexium-spirv: graphics TXQ texture {tex_id:#x} was not assigned an image kind during resource preallocation"
+            )
+        });
+        let numeric_type = self.texture_numeric_type_at(tex_id);
+        let (decl, image_pointer) = self.typed_image_at(tex_id, numeric_type, kind);
+        let image = self
+            .b
+            .load(decl.image_t, None, image_pointer, None, [])
+            .unwrap();
+        let result = if component == 3 {
+            if kind == GraphicsImageKind::Buffer {
+                self.const_u32(0)
+            } else {
+                self.b.image_query_levels(self.u32_t, None, image).unwrap()
+            }
+        } else {
+            let component_count = match kind {
+                GraphicsImageKind::D2 | GraphicsImageKind::Cube => 2,
+                GraphicsImageKind::D2Array
+                | GraphicsImageKind::D3
+                | GraphicsImageKind::CubeArray => 3,
+                GraphicsImageKind::Buffer => 1,
+            };
+            if component as u32 >= component_count {
+                self.const_u32(0)
+            } else {
+                let result_t = match component_count {
+                    1 => self.u32_t,
+                    2 => self.uvec2_t,
+                    3 => self.uvec3_t,
+                    _ => unreachable!(),
+                };
+                let dimensions = if kind == GraphicsImageKind::Buffer {
+                    self.b.image_query_size(result_t, None, image).unwrap()
+                } else {
+                    let lod_value = self.lower_value(lod);
+                    let lod = self.as_i32(lod_value);
+                    self.b
+                        .image_query_size_lod(result_t, None, image, lod)
+                        .unwrap()
+                };
+                if component_count == 1 {
+                    dimensions
+                } else {
+                    self.b
+                        .composite_extract(self.u32_t, None, dimensions, [component as u32])
+                        .unwrap()
+                }
+            }
+        };
+        self.store_bits(result)
+    }
+
+    fn lower_graphics_texture_lod_query(
+        &mut self,
+        handle: TextureHandleOrigin,
+        u: &IrValue,
+        v: &IrValue,
+        arrayed: bool,
+        component: u8,
+    ) -> Word {
+        assert_eq!(
+            self.stage,
+            Stage::Fragment,
+            "OpImageQueryLod is only valid in fragment shaders"
+        );
+        assert!(component < 2, "TMML only exposes the R/G LOD results");
+        let tex_id = graphics_texture_id(handle);
+        let expected_kind = if arrayed {
+            GraphicsImageKind::D2Array
+        } else {
+            GraphicsImageKind::D2
+        };
+        let kind = *self.graphics_texture_kinds.get(&tex_id).unwrap_or_else(|| {
+            panic!(
+                "nexium-spirv: graphics TMML texture {tex_id:#x} was not assigned an image kind during resource preallocation"
+            )
+        });
+        assert_eq!(
+            kind, expected_kind,
+            "nexium-spirv: graphics TMML texture {tex_id:#x} uses {kind:?}, but the instruction requires {expected_kind:?}"
+        );
+
+        let numeric_type = self.texture_numeric_type_at(tex_id);
+        let (decl, image_pointer) = self.typed_image_at(tex_id, numeric_type, kind);
+        let image = self
+            .b
+            .load(decl.image_t, None, image_pointer, None, [])
+            .unwrap();
+        let sampler_array = self.ensure_sampler_only();
+        let slot = self.const_u32(self.texture_slot(tex_id));
+        let sampler_pointer = self
+            .b
+            .access_chain(self.ptr_sampler, None, sampler_array, [slot])
+            .unwrap();
+        let sampler = self
+            .b
+            .load(self.sampler_t, None, sampler_pointer, None, [])
+            .unwrap();
+        let sampled_image_t = self.b.type_sampled_image(decl.image_t);
+        let sampled_image = self
+            .b
+            .sampled_image(sampled_image_t, None, image, sampler)
+            .unwrap();
+        let mut u = self.lower_value(u);
+        let mut v = self.lower_value(v);
+        if !self.texture_uses_normalized_coords(tex_id) {
+            (u, v) = self.normalize_filtered_2d_coords(image, arrayed, u, v);
+        }
+        let coords = self
+            .b
+            .composite_construct(self.vec2_t, None, [u, v])
+            .unwrap();
+        let lods = self
+            .b
+            .image_query_lod(self.vec2_t, None, sampled_image, coords)
+            .unwrap();
+        self.b
+            .composite_extract(self.f32_t, None, lods, [u32::from(component)])
+            .unwrap()
     }
 
     fn shared_word_index(&mut self, addr: &IrValue) -> Word {
@@ -3884,6 +4348,34 @@ impl Emitter {
         self.apply_neg_abs(value, neg, abs)
     }
 
+    fn normalize_filtered_2d_coords(
+        &mut self,
+        image: Word,
+        arrayed: bool,
+        u: Word,
+        v: Word,
+    ) -> (Word, Word) {
+        let dimensions_type = if arrayed { self.uvec3_t } else { self.uvec2_t };
+        let dimensions = self
+            .b
+            .image_query_size_lod(dimensions_type, None, image, self.i32_zero)
+            .unwrap();
+        let width = self
+            .b
+            .composite_extract(self.u32_t, None, dimensions, [0])
+            .unwrap();
+        let height = self
+            .b
+            .composite_extract(self.u32_t, None, dimensions, [1])
+            .unwrap();
+        let width = self.b.convert_u_to_f(self.f32_t, None, width).unwrap();
+        let height = self.b.convert_u_to_f(self.f32_t, None, height).unwrap();
+        (
+            self.b.f_div(self.f32_t, None, u, width).unwrap(),
+            self.b.f_div(self.f32_t, None, v, height).unwrap(),
+        )
+    }
+
     fn sample_image(
         &mut self,
         sampled_image: Word,
@@ -3894,6 +4386,35 @@ impl Emitter {
         texel_offset: Option<Word>,
     ) -> Word {
         use rspirv::spirv::ImageOperands;
+
+        if implicit_lod && matches!(self.stage, Stage::Fragment) && self.fragment_debug_active {
+            if let Some(forced_lod) = self.force_sample_lod {
+                let lod = self.const_f32(forced_lod.to_bits());
+                return if let Some(offset) = texel_offset {
+                    self.b
+                        .image_sample_explicit_lod(
+                            self.vec4_t,
+                            None,
+                            sampled_image,
+                            coords,
+                            ImageOperands::LOD | ImageOperands::CONST_OFFSET,
+                            [Operand::IdRef(lod), Operand::IdRef(offset)],
+                        )
+                        .unwrap()
+                } else {
+                    self.b
+                        .image_sample_explicit_lod(
+                            self.vec4_t,
+                            None,
+                            sampled_image,
+                            coords,
+                            ImageOperands::LOD,
+                            [Operand::IdRef(lod)],
+                        )
+                        .unwrap()
+                };
+            }
+        }
 
         if implicit_lod && matches!(self.stage, Stage::Fragment) {
             return match (lod_bias, texel_offset) {
@@ -3961,6 +4482,68 @@ impl Emitter {
                 )
                 .unwrap()
         }
+    }
+
+    fn extract_texture_sample_lane(&mut self, sample: CachedTextureSample, component: u8) -> Word {
+        match sample {
+            CachedTextureSample::Graphics {
+                value,
+                depth_compare,
+            } => {
+                if depth_compare {
+                    if component < 3 {
+                        value
+                    } else {
+                        self.f32_one
+                    }
+                } else {
+                    self.b
+                        .composite_extract(self.f32_t, None, value, [component.min(3) as u32])
+                        .unwrap_or(self.f32_zero)
+                }
+            }
+            CachedTextureSample::Compute {
+                value,
+                scalar_type,
+                numeric_type,
+            } => {
+                let component = self
+                    .b
+                    .composite_extract(scalar_type, None, value, [component.min(3) as u32])
+                    .unwrap();
+                match numeric_type {
+                    TextureNumericType::Float => component,
+                    TextureNumericType::Uint | TextureNumericType::Sint => {
+                        self.b.bitcast(self.f32_t, None, component).unwrap()
+                    }
+                }
+            }
+        }
+    }
+
+    fn cached_texture_sample_lane(
+        &mut self,
+        sample_site: Option<u32>,
+        component: u8,
+    ) -> Option<Word> {
+        let sample = *self.texture_sample_sites.get(&sample_site?)?;
+        Some(self.extract_texture_sample_lane(sample, component))
+    }
+
+    fn record_texture_sample_lane(
+        &mut self,
+        sample_site: Option<u32>,
+        sample: CachedTextureSample,
+        component: u8,
+    ) -> Word {
+        if let Some(sample_site) = sample_site {
+            let previous = self.texture_sample_sites.insert(sample_site, sample);
+            debug_assert!(
+                previous.is_none(),
+                "texture sample site emitted more than once"
+            );
+        }
+        self.extract_texture_sample_lane(sample, component)
     }
 
     fn lower_op(&mut self, inst: &IrInst) {
@@ -4262,13 +4845,14 @@ impl Emitter {
                 let f = self.lower_value(if_false);
                 Some(self.b.select(self.f32_t, None, cond, t, f).unwrap())
             }
-            IrOp::MultiFunc { src, func } => {
+            IrOp::MultiFunc { src, func, mods } => {
                 let s = self.lower_value(src);
+                let s = self.apply_neg_abs(s, mods.neg_a, mods.abs_a);
                 let glsl = self.glsl;
                 let f32_t = self.f32_t;
                 let f32_one = self.f32_one;
                 let one_arg = [Operand::IdRef(s)];
-                Some(match func {
+                let value = match func {
                     MufuFunc::Sin => self.b.ext_inst(f32_t, None, glsl, 13, one_arg).unwrap(),
                     MufuFunc::Cos => self.b.ext_inst(f32_t, None, glsl, 14, one_arg).unwrap(),
                     MufuFunc::Ex2 => self.b.ext_inst(f32_t, None, glsl, 29, one_arg).unwrap(),
@@ -4281,7 +4865,8 @@ impl Emitter {
                         self.b.f_div(f32_t, None, f32_one, s).unwrap()
                     }
                     MufuFunc::Unknown(_) => self.b.undef(f32_t, None),
-                })
+                };
+                Some(self.apply_sat(value, mods.sat))
             }
             IrOp::LoadCbuf {
                 binding,
@@ -4667,7 +5252,9 @@ impl Emitter {
                 None
             }
             IrOp::LoadAttr { slot } => {
-                if let Some(val) = self.load_system_attr_bits(*slot) {
+                if self.stage == Stage::Fragment && *slot == 0x3fc {
+                    Some(self.load_front_facing_bits())
+                } else if let Some(val) = self.load_system_attr_bits(*slot) {
                     Some(val)
                 } else {
                     let component = (slot & 0xC) >> 2;
@@ -4684,7 +5271,9 @@ impl Emitter {
             } => {
                 let component = (slot & 0xC) >> 2;
                 let aligned_slot = slot & !0xF;
-                let mut val = if aligned_slot == 0x70 {
+                let mut val = if self.stage == Stage::Fragment && *slot == 0x3fc {
+                    self.load_front_facing_bits()
+                } else if aligned_slot == 0x70 {
                     let fc = self.frag_coord_var();
                     let idx = self.const_u32(component);
                     let ac = self
@@ -4830,6 +5419,7 @@ impl Emitter {
                 Some(self.lower_compute_texel_fetch(*handle, x, y.as_ref(), z.as_ref(), *component))
             }
             IrOp::SampleTexHandle {
+                sample_site,
                 handle,
                 dimension,
                 u,
@@ -4840,22 +5430,39 @@ impl Emitter {
                 texel_offset,
                 component,
                 ..
-            } => Some(self.lower_compute_texture_sample(
-                *handle,
-                *dimension,
-                u,
-                v.as_ref(),
-                w.as_ref(),
-                *implicit_lod,
-                explicit_lod.as_ref(),
-                texel_offset.as_ref(),
-                *component,
-            )),
+            } => Some(
+                if let Some(component) = self.cached_texture_sample_lane(*sample_site, *component) {
+                    component
+                } else {
+                    let sample = self.lower_compute_texture_sample(
+                        *handle,
+                        *dimension,
+                        u,
+                        v.as_ref(),
+                        w.as_ref(),
+                        *implicit_lod,
+                        explicit_lod.as_ref(),
+                        texel_offset.as_ref(),
+                    );
+                    self.record_texture_sample_lane(*sample_site, sample, *component)
+                },
+            ),
             IrOp::TextureQueryDimension {
                 handle,
                 lod,
                 component,
-            } => Some(self.lower_compute_texture_query(*handle, lod, *component)),
+            } => Some(if self.stage == Stage::Compute {
+                self.lower_compute_texture_query(*handle, lod, *component)
+            } else {
+                self.lower_graphics_texture_query(*handle, lod, *component)
+            }),
+            IrOp::TextureQueryLod {
+                handle,
+                u,
+                v,
+                arrayed,
+                component,
+            } => Some(self.lower_graphics_texture_lod_query(*handle, u, v, *arrayed, *component)),
             IrOp::LocalInvocationId { component } => {
                 Some(self.compute_builtin_component(true, *component))
             }
@@ -4899,6 +5506,7 @@ impl Emitter {
                 ..
             } => Some(self.lower_compute_image_atomic(inst, *handle, x, value, *op, *data_type)),
             IrOp::SampleTex {
+                sample_site,
                 tex_id,
                 u,
                 v,
@@ -4913,6 +5521,23 @@ impl Emitter {
                 component,
             } => 'sample_tex: {
                 self.texs_ids_used.insert(*tex_id);
+                let depth_compare = dref.is_some();
+                if let Some(mut sampled_component) =
+                    self.cached_texture_sample_lane(*sample_site, *component)
+                {
+                    if cube.is_none()
+                        && volume.is_none()
+                        && !depth_compare
+                        && std::env::var("NEXIUM_TEX_2X").is_ok()
+                    {
+                        let two = self.const_f32(2.0f32.to_bits());
+                        sampled_component = self
+                            .b
+                            .f_mul(self.f32_t, None, sampled_component, two)
+                            .unwrap();
+                    }
+                    break 'sample_tex Some(sampled_component);
+                }
                 let lod_bias = lod_bias.as_ref().map(|bias| self.lower_value(bias));
                 let explicit_lod = explicit_lod.as_ref().map(|lod| self.lower_value(lod));
                 let dref = dref.as_ref().map(|reference| self.lower_value(reference));
@@ -5051,13 +5676,14 @@ impl Emitter {
                         };
                         self.sample_debug_value = Some(debug_value);
                     }
-                    let c = if dref.is_some() {
-                        sampled
-                    } else {
-                        self.b
-                            .composite_extract(self.f32_t, None, sampled, [*component as u32])
-                            .unwrap_or(self.f32_zero)
-                    };
+                    let c = self.record_texture_sample_lane(
+                        *sample_site,
+                        CachedTextureSample::Graphics {
+                            value: sampled,
+                            depth_compare,
+                        },
+                        *component,
+                    );
                     break 'sample_tex Some(c);
                 }
                 if let Some(w) = volume {
@@ -5146,13 +5772,14 @@ impl Emitter {
                         };
                         self.sample_debug_value = Some(debug_value);
                     }
-                    let c = if dref.is_some() {
-                        sampled
-                    } else {
-                        self.b
-                            .composite_extract(self.f32_t, None, sampled, [*component as u32])
-                            .unwrap_or(self.f32_zero)
-                    };
+                    let c = self.record_texture_sample_lane(
+                        *sample_site,
+                        CachedTextureSample::Graphics {
+                            value: sampled,
+                            depth_compare,
+                        },
+                        *component,
+                    );
                     break 'sample_tex Some(c);
                 }
                 let tex_slot = self
@@ -5167,11 +5794,27 @@ impl Emitter {
                     let v = parts.next()?.trim().parse::<f32>().ok()?;
                     Some((u, v))
                 });
-                let (uv0, mut uv1) = if let Some((u, v)) = uv_override {
+                let (mut uv0, mut uv1) = if let Some((u, v)) = uv_override {
                     (self.const_f32(u.to_bits()), self.const_f32(v.to_bits()))
                 } else {
                     (self.lower_value(u), self.lower_value(v))
                 };
+                let (img_var, samp_var) = self.sampler_at(*tex_id);
+                let image_t = if self.sampler_arrayed {
+                    self.image_arrayed_t
+                } else {
+                    self.image_t
+                };
+                let sampled_image_t = if self.sampler_arrayed {
+                    self.sampled_image_arrayed_t
+                } else {
+                    self.sampled_image_t
+                };
+                let img = self.b.load(image_t, None, img_var, None, []).unwrap();
+                if !self.texture_uses_normalized_coords(*tex_id) {
+                    (uv0, uv1) =
+                        self.normalize_filtered_2d_coords(img, self.sampler_arrayed, uv0, uv1);
+                }
                 if matches!(self.stage, Stage::Fragment)
                     && self.tex_v_flip_slots.contains(&tex_slot)
                 {
@@ -5218,18 +5861,6 @@ impl Emitter {
                             .unwrap(),
                     );
                 }
-                let (img_var, samp_var) = self.sampler_at(*tex_id);
-                let image_t = if self.sampler_arrayed {
-                    self.image_arrayed_t
-                } else {
-                    self.image_t
-                };
-                let sampled_image_t = if self.sampler_arrayed {
-                    self.sampled_image_arrayed_t
-                } else {
-                    self.sampled_image_t
-                };
-                let img = self.b.load(image_t, None, img_var, None, []).unwrap();
                 let samp = self
                     .b
                     .load(self.sampler_t, None, samp_var, None, [])
@@ -5283,14 +5914,15 @@ impl Emitter {
                     };
                     self.sample_debug_value = Some(debug_value);
                 }
-                let c = if dref.is_some() {
-                    sampled
-                } else {
-                    self.b
-                        .composite_extract(self.f32_t, None, sampled, [*component as u32])
-                        .unwrap_or(self.f32_zero)
-                };
-                if std::env::var("NEXIUM_TEX_2X").is_ok() {
+                let c = self.record_texture_sample_lane(
+                    *sample_site,
+                    CachedTextureSample::Graphics {
+                        value: sampled,
+                        depth_compare,
+                    },
+                    *component,
+                );
+                if !depth_compare && std::env::var("NEXIUM_TEX_2X").is_ok() {
                     let two = self.const_f32(2.0f32.to_bits());
                     Some(self.b.f_mul(self.f32_t, None, c, two).unwrap())
                 } else {
@@ -5311,8 +5943,24 @@ impl Emitter {
                     .copied()
                     .unwrap_or(0)
                     .min(MAX_TEXTURE_DESCRIPTORS - 1);
-                let uv0 = self.lower_value(u);
+                let mut uv0 = self.lower_value(u);
                 let mut uv1 = self.lower_value(v);
+                let (img_var, samp_var) = self.sampler_at(*tex_id);
+                let image_t = if self.sampler_arrayed {
+                    self.image_arrayed_t
+                } else {
+                    self.image_t
+                };
+                let sampled_image_t = if self.sampler_arrayed {
+                    self.sampled_image_arrayed_t
+                } else {
+                    self.sampled_image_t
+                };
+                let img = self.b.load(image_t, None, img_var, None, []).unwrap();
+                if !self.texture_uses_normalized_coords(*tex_id) {
+                    (uv0, uv1) =
+                        self.normalize_filtered_2d_coords(img, self.sampler_arrayed, uv0, uv1);
+                }
                 if matches!(self.stage, Stage::Fragment)
                     && self.tex_v_flip_slots.contains(&tex_slot)
                 {
@@ -5341,18 +5989,6 @@ impl Emitter {
                             .unwrap(),
                     );
                 }
-                let (img_var, samp_var) = self.sampler_at(*tex_id);
-                let image_t = if self.sampler_arrayed {
-                    self.image_arrayed_t
-                } else {
-                    self.image_t
-                };
-                let sampled_image_t = if self.sampler_arrayed {
-                    self.sampled_image_arrayed_t
-                } else {
-                    self.sampled_image_t
-                };
-                let img = self.b.load(image_t, None, img_var, None, []).unwrap();
                 let samp = self
                     .b
                     .load(self.sampler_t, None, samp_var, None, [])
@@ -7245,6 +7881,7 @@ impl Emitter {
                 continue;
             }
             self.current_block = Some(block.id);
+            self.texture_sample_sites.clear();
             self.restore_pred_regs(cfg, &predecessors, block);
             self.lower_pred_phis(block);
             self.lower_phis(block);
@@ -7483,12 +8120,11 @@ impl Emitter {
                                 self.read_attr_component(color, 2),
                                 self.read_attr_component(color, 3),
                             ];
-                            if let Some((_, out)) = outputs.get_mut(0) {
-                                *out = self
-                                    .b
-                                    .composite_construct(self.vec4_t, None, forced)
-                                    .unwrap();
-                            }
+                            let value = self
+                                .b
+                                .composite_construct(self.vec4_t, None, forced)
+                                .unwrap();
+                            self.replace_fragment_debug_output(&mut outputs, value);
                         }
                         if let (true, Ok(scale)) = (
                             self.fragment_debug_active,
@@ -7524,14 +8160,13 @@ impl Emitter {
                             }
                         }
                         if let Some(sample) = self.sample_debug_value {
-                            if let Some((_, out)) = outputs.get_mut(0) {
-                                *out = sample;
-                            }
+                            self.replace_fragment_debug_output(&mut outputs, sample);
                         }
                         if let Some(value) = self.fragment_ir_debug_value() {
-                            if let Some((_, out)) = outputs.get_mut(0) {
-                                *out = value;
-                            }
+                            self.replace_fragment_debug_output(&mut outputs, value);
+                        }
+                        if let Some(value) = self.fragment_ir_oct_normal_debug_value() {
+                            self.replace_fragment_debug_output(&mut outputs, value);
                         }
                         self.apply_fragment_output_debug_overrides(&mut outputs);
                         self.emit_alpha_test(&outputs);
@@ -7892,6 +8527,7 @@ impl Emitter {
         let mut texture_kinds = std::collections::BTreeMap::new();
         let mut filtered_tex_ids = std::collections::BTreeSet::new();
         let mut texel_fetches = Vec::new();
+        let mut texture_query_ids = std::collections::BTreeSet::new();
         for block in &cfg.blocks {
             for inst in &block.program.instructions {
                 match &inst.op {
@@ -7925,10 +8561,42 @@ impl Emitter {
                     IrOp::WorkgroupId { .. } => {
                         self.workgroup_id_var();
                     }
-                    IrOp::TextureQueryDimension { .. } => {
+                    IrOp::TextureQueryDimension { handle, .. } => {
                         self.b.capability(Capability::ImageQuery);
+                        if self.stage != Stage::Compute {
+                            let tex_id = graphics_texture_id(*handle);
+                            needs_image = true;
+                            tex_ids.insert(tex_id);
+                            texture_query_ids.insert(tex_id);
+                        }
+                    }
+                    IrOp::TextureQueryLod {
+                        handle, arrayed, ..
+                    } => {
+                        assert_eq!(
+                            self.stage,
+                            Stage::Fragment,
+                            "OpImageQueryLod is only valid in fragment shaders"
+                        );
+                        self.b.capability(Capability::ImageQuery);
+                        let tex_id = graphics_texture_id(*handle);
+                        let kind = if *arrayed {
+                            GraphicsImageKind::D2Array
+                        } else {
+                            GraphicsImageKind::D2
+                        };
+                        needs_image = true;
+                        needs_sampler = true;
+                        needs_arrayed_sampler |= *arrayed;
+                        tex_ids.insert(tex_id);
+                        texture_query_ids.insert(tex_id);
+                        record_graphics_texture_image_kind(&mut texture_kinds, tex_id, kind);
                     }
                     IrOp::LoadAttr { slot } => {
+                        if self.stage == Stage::Fragment && *slot == 0x3fc {
+                            self.front_facing_var_id();
+                            continue;
+                        }
                         if self.system_attr_var_id(*slot).is_some() {
                             continue;
                         }
@@ -7936,6 +8604,10 @@ impl Emitter {
                         self.input_var(aligned);
                     }
                     IrOp::InterpAttr { slot, .. } => {
+                        if self.stage == Stage::Fragment && *slot == 0x3fc {
+                            self.front_facing_var_id();
+                            continue;
+                        }
                         let aligned = slot & !0xF;
                         if aligned == 0x70 {
                             if matches!(self.stage, Stage::Fragment) {
@@ -8065,6 +8737,14 @@ impl Emitter {
                     TextureNumericType::Float,
                     "graphics texture {tex_id:#x} at descriptor slot {slot} is used by Sample/Gather but was assigned the incompatible {numeric_type:?} descriptor family"
                 );
+                if !self.texture_uses_normalized_coords(tex_id) {
+                    let kind = texture_kinds[&tex_id];
+                    assert!(
+                        matches!(kind, GraphicsImageKind::D2 | GraphicsImageKind::D2Array),
+                        "graphics texture {tex_id:#x} at descriptor slot {slot} uses unnormalized coordinates with unsupported {kind:?} image kind"
+                    );
+                    self.b.capability(Capability::ImageQuery);
+                }
             }
             for (tex_id, buffer_candidate, is_3d) in texel_fetches {
                 let kind = if buffer_candidate && self.texel_buffer_slot_enabled(tex_id) {
@@ -8076,6 +8756,20 @@ impl Emitter {
                 } else {
                     GraphicsImageKind::D2
                 };
+                record_graphics_texture_image_kind(&mut texture_kinds, tex_id, kind);
+                let numeric_type = self.texture_numeric_type_at(tex_id);
+                self.ensure_typed_image_array(numeric_type, kind);
+            }
+            for tex_id in texture_query_ids {
+                let kind = texture_kinds.get(&tex_id).copied().unwrap_or_else(|| {
+                    self.manifested_texture_for_shader_id(tex_id)
+                        .map(|resource| resource.image_kind)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "nexium-spirv: graphics TXQ texture {tex_id:#x} has no image-kind source; provide it in the graphics texture manifest or use the texture in a dimensioned shader operation"
+                            )
+                        })
+                });
                 record_graphics_texture_image_kind(&mut texture_kinds, tex_id, kind);
                 let numeric_type = self.texture_numeric_type_at(tex_id);
                 self.ensure_typed_image_array(numeric_type, kind);
@@ -8093,6 +8787,10 @@ impl Emitter {
                 self.ensure_image_cube_arrayed_array();
             }
         }
+        self.graphics_texture_kinds = texture_kinds
+            .iter()
+            .map(|(&tex_id, &kind)| (tex_id, kind))
+            .collect();
         self.validate_graphics_texture_manifest(&texture_kinds)
             .unwrap_or_else(|error| {
                 panic!("nexium-spirv: graphics texture manifest does not match shader resources: {error}")
@@ -8403,12 +9101,11 @@ impl Emitter {
                             self.read_attr_component(color, 2),
                             self.read_attr_component(color, 3),
                         ];
-                        if let Some((_, out)) = outputs.get_mut(0) {
-                            *out = self
-                                .b
-                                .composite_construct(self.vec4_t, None, forced)
-                                .unwrap();
-                        }
+                        let value = self
+                            .b
+                            .composite_construct(self.vec4_t, None, forced)
+                            .unwrap();
+                        self.replace_fragment_debug_output(&mut outputs, value);
                     }
                     if let (true, Ok(scale)) = (
                         self.fragment_debug_active,
@@ -8440,14 +9137,13 @@ impl Emitter {
                         }
                     }
                     if let Some(sample) = self.sample_debug_value {
-                        if let Some((_, out)) = outputs.get_mut(0) {
-                            *out = sample;
-                        }
+                        self.replace_fragment_debug_output(&mut outputs, sample);
                     }
                     if let Some(value) = self.fragment_ir_debug_value() {
-                        if let Some((_, out)) = outputs.get_mut(0) {
-                            *out = value;
-                        }
+                        self.replace_fragment_debug_output(&mut outputs, value);
+                    }
+                    if let Some(value) = self.fragment_ir_oct_normal_debug_value() {
+                        self.replace_fragment_debug_output(&mut outputs, value);
                     }
                     if self.fragment_debug_active && std::env::var("NEXIUM_FRAG_2X").is_ok() {
                         let two = self.const_f32(2.0f32.to_bits());
@@ -8479,11 +9175,22 @@ impl Emitter {
         };
         self.b
             .entry_point(exec_model, main_id, "main", self.interface.clone());
+        if self.force_fp32_ftz {
+            self.b.extension("SPV_KHR_float_controls");
+            self.b.capability(Capability::DenormFlushToZero);
+            self.b.execution_mode(
+                main_id,
+                rspirv::spirv::ExecutionMode::DenormFlushToZero,
+                [32],
+            );
+        }
         if self.stage == Stage::Fragment {
             self.b
                 .execution_mode(main_id, rspirv::spirv::ExecutionMode::OriginUpperLeft, []);
         } else if self.stage == Stage::Compute {
-            self.b.extension("SPV_KHR_float_controls");
+            if !self.force_fp32_ftz {
+                self.b.extension("SPV_KHR_float_controls");
+            }
             self.b.capability(Capability::SignedZeroInfNanPreserve);
             self.b.execution_mode(
                 main_id,
@@ -10103,6 +10810,8 @@ pub fn emit_fragment_full_with_options(
     if !debug_active {
         emitter.sample_debug_slot = None;
         emitter.texcoord_debug_slot = None;
+        emitter.force_sample_lod = None;
+        emitter.fragment_ir_oct_normal = None;
         emitter.tex_v_flip_slots.clear();
     }
     emitter.ps_input_map = ps_input_map;
@@ -10171,6 +10880,117 @@ pub fn scan_input_locations(words: &[u32]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn environment_fingerprint(fragment_debug_active: bool, values: &[(&str, &str)]) -> u128 {
+        graphics_spirv_environment_fingerprint_with(fragment_debug_active, |name| {
+            values
+                .iter()
+                .find_map(|(key, value)| (*key == name).then(|| (*value).into()))
+        })
+    }
+
+    #[test]
+    fn graphics_spirv_environment_fingerprint_is_zero_without_overrides() {
+        assert_eq!(environment_fingerprint(false, &[]), 0);
+        assert_eq!(environment_fingerprint(true, &[]), 0);
+    }
+
+    #[test]
+    fn fragment_debug_variants_have_distinct_cache_fingerprints() {
+        let force_zero = environment_fingerprint(
+            true,
+            &[
+                ("NEXIUM_FS_FORCE_OUTPUT_LOC", "0"),
+                ("NEXIUM_FS_FORCE_OUTPUT_VALUE", "0"),
+            ],
+        );
+        let force_one = environment_fingerprint(
+            true,
+            &[
+                ("NEXIUM_FS_FORCE_OUTPUT_LOC", "0"),
+                ("NEXIUM_FS_FORCE_OUTPUT_VALUE", "1"),
+            ],
+        );
+        let sample = environment_fingerprint(true, &[("NEXIUM_FS_SAMPLE_SLOT", "1")]);
+        let texcoord = environment_fingerprint(true, &[("NEXIUM_FS_TEXCOORD_SLOT", "1")]);
+        let forced_lod = environment_fingerprint(true, &[("NEXIUM_FS_FORCE_SAMPLE_LOD", "6")]);
+        let ir_values = environment_fingerprint(true, &[("NEXIUM_FS_IR_VALUES", "v5,v6")]);
+        let oct_normal = environment_fingerprint(true, &[("NEXIUM_FS_IR_OCT_NORMAL", "v5,v6,v7")]);
+
+        let variants = [
+            force_zero, force_one, sample, texcoord, forced_lod, ir_values, oct_normal,
+        ]
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        assert_eq!(variants.len(), 7);
+        assert!(!variants.contains(&0));
+    }
+
+    #[test]
+    fn fragment_ir_oct_normal_parser_requires_exactly_three_ids() {
+        assert_eq!(
+            parse_fragment_ir_oct_normal("v128, V124,140"),
+            Some([ValueId(128), ValueId(124), ValueId(140)])
+        );
+        assert_eq!(parse_fragment_ir_oct_normal("1,2"), None);
+        assert_eq!(parse_fragment_ir_oct_normal("1,2,3,4"), None);
+        assert_eq!(parse_fragment_ir_oct_normal("1,nope,3"), None);
+    }
+
+    #[test]
+    fn fragment_debug_output_location_is_cache_keyed_and_selects_guest_mrt() {
+        let mrt0 = environment_fingerprint(true, &[("NEXIUM_FS_DEBUG_OUTPUT_LOC", "0")]);
+        let mrt1 = environment_fingerprint(true, &[("NEXIUM_FS_DEBUG_OUTPUT_LOC", "1")]);
+        assert_ne!(mrt0, mrt1);
+        assert_ne!(mrt0, 0);
+
+        let mut emitter = Emitter::new(Stage::Fragment);
+        emitter.fragment_debug_output_location = Some(1);
+        let mut outputs = [(0, 10), (1, 20), (3, 30)];
+        emitter.replace_fragment_debug_output(&mut outputs, 99);
+        assert_eq!(outputs, [(0, 10), (1, 99), (3, 30)]);
+
+        emitter.fragment_debug_output_location = Some(2);
+        emitter.replace_fragment_debug_output(&mut outputs, 77);
+        assert_eq!(outputs, [(0, 10), (1, 99), (3, 30)]);
+
+        emitter.fragment_debug_output_location = None;
+        emitter.replace_fragment_debug_output(&mut outputs, 55);
+        assert_eq!(outputs, [(0, 55), (1, 99), (3, 30)]);
+    }
+
+    #[test]
+    fn inactive_fragment_debug_options_do_not_change_production_cache_key() {
+        assert_eq!(
+            environment_fingerprint(false, &[("NEXIUM_FS_SAMPLE_SLOT", "1")]),
+            0
+        );
+        assert_ne!(
+            environment_fingerprint(false, &[("NEXIUM_SPIRV_FTZ", "1")]),
+            0,
+            "non-targeted graphics overrides still alter emitted SPIR-V"
+        );
+    }
+
+    #[test]
+    fn every_declared_spirv_environment_option_contributes_to_its_cache_key() {
+        let global = GRAPHICS_SPIRV_ENV_OPTIONS
+            .iter()
+            .map(|name| environment_fingerprint(false, &[(*name, "set")]))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(global.len(), GRAPHICS_SPIRV_ENV_OPTIONS.len());
+        assert!(!global.contains(&0));
+
+        let debug = FRAGMENT_DEBUG_SPIRV_ENV_OPTIONS
+            .iter()
+            .map(|name| environment_fingerprint(true, &[(*name, "set")]))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(debug.len(), FRAGMENT_DEBUG_SPIRV_ENV_OPTIONS.len());
+        assert!(!debug.contains(&0));
+        for name in FRAGMENT_DEBUG_SPIRV_ENV_OPTIONS {
+            assert_eq!(environment_fingerprint(false, &[(*name, "set")]), 0);
+        }
+    }
 
     fn enc_fmul_reg(rd: u8, ra: u8, rb: u8) -> u64 {
         0x5C68_1000_0000_0000u64
@@ -12938,6 +13758,39 @@ mod tests {
     }
 
     #[test]
+    fn fragment_modified_mufu_emits_abs_neg_exp2_and_saturate() {
+        let mufu = 0x5084_0000_0027_230bu64 | (1u64 << 46) | (1u64 << 48);
+        let bytes = build_test_program(&[mufu, enc_exit()]);
+        let cfg = nexium_shader::build_fragment_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+
+        let words = emit_fragment(&cfg);
+        validates_with_naga(&words);
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+
+        for operation in [4, 29, 43] {
+            assert!(
+                instructions.iter().any(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::ExtInst
+                        && instruction.operands.get(1)
+                            == Some(&Operand::LiteralExtInstInteger(operation))
+                }),
+                "missing GLSL.std.450 operation {operation}"
+            );
+        }
+        assert!(instructions
+            .iter()
+            .any(|instruction| instruction.class.opcode == rspirv::spirv::Op::FMul));
+    }
+
+    #[test]
     fn fragment_y_direction_uses_pipeline_orientation_sign() {
         let bytes = build_test_program(&[0xf0c8_0000_0127_0003, enc_exit()]);
         let cfg = nexium_shader::build_cfg(&bytes);
@@ -13624,6 +14477,7 @@ mod tests {
         let mut program = nexium_shader::IrProgram::new();
         program.emit(
             IrOp::SampleTex {
+                sample_site: None,
                 tex_id: 0,
                 u: IrValue::ImmF32(0.0),
                 v: IrValue::ImmF32(0.0),
@@ -13641,6 +14495,7 @@ mod tests {
         );
         program.emit(
             IrOp::SampleTex {
+                sample_site: None,
                 tex_id: 1,
                 u: IrValue::ImmF32(0.0),
                 v: IrValue::ImmF32(0.0),
@@ -13713,6 +14568,7 @@ mod tests {
         );
         program.emit(
             IrOp::SampleTex {
+                sample_site: None,
                 tex_id: 0,
                 u: IrValue::ImmF32(0.0),
                 v: IrValue::ImmF32(0.0),
@@ -13847,6 +14703,7 @@ mod tests {
         let mut program = nexium_shader::IrProgram::new();
         program.emit(
             IrOp::SampleTex {
+                sample_site: None,
                 tex_id: 0x44,
                 u: IrValue::ImmF32(0.0),
                 v: IrValue::ImmF32(0.0),
@@ -14083,6 +14940,7 @@ mod tests {
     fn graphics_texture_manifest_normalization_is_deterministic() {
         let first = GraphicsTextureResource::new(0x10, 1, TextureNumericType::Float);
         let second = GraphicsTextureResource::new(0x44, 7, TextureNumericType::Uint);
+        assert!(first.normalized_coords);
         let forward = normalize_graphics_texture_manifest(vec![first, second, second]).unwrap();
         let reverse = normalize_graphics_texture_manifest(vec![second, first, second]).unwrap();
         assert_eq!(forward, vec![first, second]);
@@ -14096,6 +14954,13 @@ mod tests {
             normalize_graphics_texture_manifest(vec![cube, cube_array]),
             Err(GraphicsTextureManifestError::ImageKindConflict { slot: 4, .. })
         ));
+
+        let rectangle = first.with_normalized_coords(false);
+        assert!(!rectangle.normalized_coords);
+        assert!(matches!(
+            normalize_graphics_texture_manifest(vec![first, rectangle]),
+            Err(GraphicsTextureManifestError::NormalizedCoordsConflict { slot: 1, .. })
+        ));
     }
 
     #[test]
@@ -14103,6 +14968,7 @@ mod tests {
         let mut program = nexium_shader::IrProgram::new();
         program.emit(
             IrOp::SampleTex {
+                sample_site: None,
                 tex_id: 0x44,
                 u: IrValue::ImmF32(0.0),
                 v: IrValue::ImmF32(0.0),
@@ -14157,10 +15023,652 @@ mod tests {
     }
 
     #[test]
+    fn unnormalized_filtered_sample_and_gather_query_size_and_divide_xy_only_when_marked() {
+        for gather in [false, true] {
+            for normalized_coords in [true, false] {
+                let mut program = nexium_shader::IrProgram::new();
+                if gather {
+                    program.emit(
+                        IrOp::GatherTex {
+                            tex_id: 0x44,
+                            u: IrValue::ImmF32(32.0),
+                            v: IrValue::ImmF32(16.0),
+                            gather_component: 1,
+                            lane: 2,
+                        },
+                        Some(0),
+                    );
+                } else {
+                    program.emit(
+                        IrOp::SampleTex {
+                            sample_site: None,
+                            tex_id: 0x44,
+                            u: IrValue::ImmF32(32.0),
+                            v: IrValue::ImmF32(16.0),
+                            array: None,
+                            volume: None,
+                            cube: None,
+                            dref: None,
+                            implicit_lod: true,
+                            lod_bias: None,
+                            explicit_lod: None,
+                            texel_offset: None,
+                            component: 0,
+                        },
+                        Some(0),
+                    );
+                }
+                let cfg = Cfg {
+                    blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+                    unimplemented: 0,
+                    bindless_or_partners: Default::default(),
+                };
+                let (words, _, _, _, _) = emit_fragment_full_with_options(
+                    &cfg,
+                    [0; 32],
+                    1,
+                    0,
+                    false,
+                    0,
+                    0,
+                    FragmentOptions {
+                        texture_numeric_manifest: vec![GraphicsTextureResource::new(
+                            0x44,
+                            0,
+                            TextureNumericType::Float,
+                        )
+                        .with_normalized_coords(normalized_coords)],
+                        ..FragmentOptions::default()
+                    },
+                );
+                validates_with_spirv_val_if_available(&words);
+                let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+                let instructions = module
+                    .functions
+                    .iter()
+                    .flat_map(|function| &function.blocks)
+                    .flat_map(|block| &block.instructions)
+                    .collect::<Vec<_>>();
+                let expected_queries = usize::from(!normalized_coords);
+                let expected_divides = 2 * expected_queries;
+                assert_eq!(
+                    instructions
+                        .iter()
+                        .filter(|instruction| {
+                            instruction.class.opcode == rspirv::spirv::Op::ImageQuerySizeLod
+                        })
+                        .count(),
+                    expected_queries,
+                    "gather={gather} normalized={normalized_coords}",
+                );
+                assert_eq!(
+                    instructions
+                        .iter()
+                        .filter(|instruction| {
+                            instruction.class.opcode == rspirv::spirv::Op::FDiv
+                        })
+                        .count(),
+                    expected_divides,
+                    "gather={gather} normalized={normalized_coords}",
+                );
+                assert_eq!(
+                    module.capabilities.iter().any(|instruction| {
+                        instruction.operands == [Operand::Capability(Capability::ImageQuery)]
+                    }),
+                    !normalized_coords,
+                    "gather={gather} normalized={normalized_coords}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unnormalized_array_sample_divides_xy_but_preserves_layer_coordinate() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(
+            IrOp::SampleTex {
+                sample_site: None,
+                tex_id: 0x44,
+                u: IrValue::ImmF32(32.0),
+                v: IrValue::ImmF32(16.0),
+                array: Some(IrValue::ImmU32(7)),
+                volume: None,
+                cube: None,
+                dref: None,
+                implicit_lod: true,
+                lod_bias: None,
+                explicit_lod: None,
+                texel_offset: None,
+                component: 0,
+            },
+            Some(0),
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let (words, _, _, _, _) = emit_fragment_full_with_options(
+            &cfg,
+            [0; 32],
+            1,
+            0,
+            false,
+            0,
+            0,
+            FragmentOptions {
+                texture_numeric_manifest: vec![GraphicsTextureResource::new(
+                    0x44,
+                    0,
+                    TextureNumericType::Float,
+                )
+                .with_image_kind(GraphicsImageKind::D2Array)
+                .with_normalized_coords(false)],
+                ..FragmentOptions::default()
+            },
+        );
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        let divided = instructions
+            .iter()
+            .filter_map(|instruction| {
+                (instruction.class.opcode == rspirv::spirv::Op::FDiv)
+                    .then_some(instruction.result_id?)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(divided.len(), 2);
+        let sample = instructions
+            .iter()
+            .find(|instruction| {
+                matches!(
+                    instruction.class.opcode,
+                    rspirv::spirv::Op::ImageSampleImplicitLod
+                        | rspirv::spirv::Op::ImageSampleExplicitLod
+                )
+            })
+            .expect("array sample");
+        let Operand::IdRef(coords_id) = sample.operands[1] else {
+            panic!("sample coordinates must be an ID");
+        };
+        let coords = instructions
+            .iter()
+            .find(|instruction| {
+                instruction.result_id == Some(coords_id)
+                    && instruction.class.opcode == rspirv::spirv::Op::CompositeConstruct
+            })
+            .expect("array coordinate constructor");
+        assert_eq!(coords.operands.len(), 3);
+        assert!(matches!(coords.operands[0], Operand::IdRef(id) if divided.contains(&id)));
+        assert!(matches!(coords.operands[1], Operand::IdRef(id) if divided.contains(&id)));
+        assert!(matches!(coords.operands[2], Operand::IdRef(id) if !divided.contains(&id)));
+    }
+
+    #[test]
+    fn unnormalized_manifest_does_not_modify_texel_fetch_coordinates() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(
+            IrOp::TexelFetch {
+                cbuf_binding: 2,
+                cbuf_word_offset: 0x68,
+                cbuf_secondary_word_offset: None,
+                x: IrValue::ImmU32(32),
+                y: Some(IrValue::ImmU32(16)),
+                z: None,
+                component: 0,
+            },
+            Some(0),
+        );
+        let tex_id = nexium_shader::bindless_texture_id(2, 0x68);
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let (words, _, _, _, _) = emit_fragment_full_with_options(
+            &cfg,
+            [0; 32],
+            1,
+            0,
+            false,
+            0,
+            0,
+            FragmentOptions {
+                texture_numeric_manifest: vec![GraphicsTextureResource::new(
+                    tex_id,
+                    0,
+                    TextureNumericType::Float,
+                )
+                .with_normalized_coords(false)],
+                ..FragmentOptions::default()
+            },
+        );
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        assert!(instructions
+            .iter()
+            .any(|instruction| instruction.class.opcode == rspirv::spirv::Op::ImageFetch));
+        assert!(!instructions.iter().any(|instruction| matches!(
+            instruction.class.opcode,
+            rspirv::spirv::Op::ImageQuerySizeLod | rspirv::spirv::Op::FDiv
+        )));
+    }
+
+    #[test]
+    fn graphics_tmml_emits_fragment_query_lod_for_2d_and_2d_array() {
+        for arrayed in [false, true] {
+            for normalized_coords in [true, false] {
+                let handle = TextureHandleOrigin::Bound {
+                    cbuf_word_offset: 0x44,
+                };
+                let mut program = nexium_shader::IrProgram::new();
+                program.emit(
+                    IrOp::TextureQueryLod {
+                        handle,
+                        u: IrValue::ImmF32(0.25),
+                        v: IrValue::ImmF32(0.75),
+                        arrayed,
+                        component: 1,
+                    },
+                    Some(0),
+                );
+                let cfg = Cfg {
+                    blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+                    unimplemented: 0,
+                    bindless_or_partners: Default::default(),
+                };
+                let kind = if arrayed {
+                    GraphicsImageKind::D2Array
+                } else {
+                    GraphicsImageKind::D2
+                };
+                let (words, _, tex_ids, _, _) = emit_fragment_full_with_options(
+                    &cfg,
+                    [0; 32],
+                    1,
+                    0,
+                    false,
+                    0,
+                    0,
+                    FragmentOptions {
+                        texture_numeric_manifest: vec![GraphicsTextureResource::new(
+                            0x44,
+                            0,
+                            TextureNumericType::Float,
+                        )
+                        .with_image_kind(kind)
+                        .with_normalized_coords(normalized_coords)],
+                        ..FragmentOptions::default()
+                    },
+                );
+                assert_eq!(tex_ids, vec![0x44]);
+                validates_with_spirv_val_if_available(&words);
+
+                let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+                assert!(module.capabilities.iter().any(|instruction| {
+                    instruction.operands == [Operand::Capability(Capability::ImageQuery)]
+                }));
+                let instructions = module
+                    .functions
+                    .iter()
+                    .flat_map(|function| &function.blocks)
+                    .flat_map(|block| &block.instructions)
+                    .collect::<Vec<_>>();
+                let query = instructions
+                    .iter()
+                    .find(|instruction| {
+                        instruction.class.opcode == rspirv::spirv::Op::ImageQueryLod
+                    })
+                    .expect("OpImageQueryLod");
+                assert_eq!(
+                    instructions
+                        .iter()
+                        .filter(|instruction| {
+                            instruction.class.opcode == rspirv::spirv::Op::ImageQueryLod
+                        })
+                        .count(),
+                    1
+                );
+                let Operand::IdRef(sampled_image_id) = query.operands[0] else {
+                    panic!("query sampled image must be an ID");
+                };
+                let sampled_image = instructions
+                    .iter()
+                    .find(|instruction| {
+                        instruction.result_id == Some(sampled_image_id)
+                            && instruction.class.opcode == rspirv::spirv::Op::SampledImage
+                    })
+                    .expect("OpSampledImage");
+                let sampled_image_t = sampled_image.result_type.expect("sampled image type");
+                let sampled_image_type = module
+                    .types_global_values
+                    .iter()
+                    .find(|instruction| {
+                        instruction.result_id == Some(sampled_image_t)
+                            && instruction.class.opcode == rspirv::spirv::Op::TypeSampledImage
+                    })
+                    .expect("OpTypeSampledImage");
+                let Operand::IdRef(image_t) = sampled_image_type.operands[0] else {
+                    panic!("sampled image type must reference an image type");
+                };
+                let image_type = module
+                    .types_global_values
+                    .iter()
+                    .find(|instruction| {
+                        instruction.result_id == Some(image_t)
+                            && instruction.class.opcode == rspirv::spirv::Op::TypeImage
+                    })
+                    .expect("OpTypeImage");
+                assert_eq!(
+                    image_type.operands[1],
+                    Operand::Dim(rspirv::spirv::Dim::Dim2D)
+                );
+                assert_eq!(
+                    image_type.operands[3],
+                    Operand::LiteralBit32(u32::from(arrayed))
+                );
+
+                let Operand::IdRef(coords_id) = query.operands[1] else {
+                    panic!("query coordinates must be an ID");
+                };
+                let coords = instructions
+                    .iter()
+                    .find(|instruction| {
+                        instruction.result_id == Some(coords_id)
+                            && instruction.class.opcode == rspirv::spirv::Op::CompositeConstruct
+                    })
+                    .expect("vec2 query coordinates");
+                assert_eq!(
+                    coords.operands.len(),
+                    2,
+                    "array layer must not be included in OpImageQueryLod coordinates"
+                );
+                assert_eq!(
+                    instructions
+                        .iter()
+                        .filter(|instruction| {
+                            instruction.class.opcode == rspirv::spirv::Op::ImageQuerySizeLod
+                        })
+                        .count(),
+                    usize::from(!normalized_coords)
+                );
+                assert_eq!(
+                    instructions
+                        .iter()
+                        .filter(|instruction| instruction.class.opcode == rspirv::spirv::Op::FDiv)
+                        .count(),
+                    2 * usize::from(!normalized_coords)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn translated_tmml_emits_query_convert_and_shift_sequence() {
+        let tmml = (0b1101_1111_0101_1u64 << 51)
+            | (0x44u64 << 36)
+            | (0b11u64 << 31)
+            | (2u64 << 28)
+            | (7u64 << 16)
+            | (4u64 << 8)
+            | 8;
+        let bytes = build_test_program(&[tmml, enc_exit()]);
+        let cfg = nexium_shader::build_fragment_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+        let words = emit_fragment(&cfg);
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        for (opcode, expected) in [
+            (rspirv::spirv::Op::ImageQueryLod, 2),
+            (rspirv::spirv::Op::ConvertFToU, 2),
+            (rspirv::spirv::Op::ShiftLeftLogical, 2),
+        ] {
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|instruction| instruction.class.opcode == opcode)
+                    .count(),
+                expected,
+                "unexpected {opcode:?} count"
+            );
+        }
+    }
+
+    #[test]
+    fn graphics_tmml_backend_rejects_non_fragment_execution_models() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(
+            IrOp::TextureQueryLod {
+                handle: TextureHandleOrigin::Bound {
+                    cbuf_word_offset: 0x44,
+                },
+                u: IrValue::ImmF32(0.25),
+                v: IrValue::ImmF32(0.75),
+                arrayed: false,
+                component: 0,
+            },
+            Some(0),
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Emitter::new(Stage::Vertex).finish_full(&cfg, &[])
+        }))
+        .expect_err("OpImageQueryLod must remain fragment-only");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains("OpImageQueryLod is only valid in fragment shaders"),
+            "unexpected panic: {message}"
+        );
+    }
+
+    #[test]
+    fn graphics_txq_uses_manifest_image_kind_for_size_and_mip_queries() {
+        let handle = TextureHandleOrigin::Bound {
+            cbuf_word_offset: 0x44,
+        };
+        let mut program = nexium_shader::IrProgram::new();
+        for component in 0..4u8 {
+            program.emit(
+                IrOp::TextureQueryDimension {
+                    handle,
+                    lod: IrValue::ImmU32(2),
+                    component,
+                },
+                Some(component),
+            );
+        }
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let (words, _, tex_ids, _, _) = emit_fragment_full_with_options(
+            &cfg,
+            [0; 32],
+            1,
+            0,
+            false,
+            0,
+            0,
+            FragmentOptions {
+                texture_numeric_manifest: vec![GraphicsTextureResource::new(
+                    0x44,
+                    0,
+                    TextureNumericType::Float,
+                )
+                .with_image_kind(GraphicsImageKind::D3)],
+                ..FragmentOptions::default()
+            },
+        );
+        assert_eq!(tex_ids, vec![0x44]);
+        validates_with_spirv_val_if_available(&words);
+
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        assert!(module.capabilities.iter().any(
+            |instruction| instruction.operands == [Operand::Capability(Capability::ImageQuery)]
+        ));
+        assert!(module.types_global_values.iter().any(|instruction| {
+            instruction.class.opcode == rspirv::spirv::Op::TypeImage
+                && instruction.operands.get(1) == Some(&Operand::Dim(rspirv::spirv::Dim::Dim3D))
+        }));
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::ImageQuerySizeLod
+                })
+                .count(),
+            3
+        );
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::ImageQueryLevels
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn graphics_bindless_buffer_txq_uses_size_without_lod_or_mip_query() {
+        let handle = TextureHandleOrigin::Bindless {
+            cbuf_binding: 2,
+            cbuf_word_offset: 0x68,
+            cbuf_secondary_word_offset: None,
+        };
+        let tex_id = nexium_shader::bindless_texture_id(2, 0x68);
+        let mut program = nexium_shader::IrProgram::new();
+        for component in [0u8, 3] {
+            program.emit(
+                IrOp::TextureQueryDimension {
+                    handle,
+                    lod: IrValue::ImmU32(7),
+                    component,
+                },
+                Some(component),
+            );
+        }
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let (words, _, tex_ids, _, _) = emit_fragment_full_with_options(
+            &cfg,
+            [0; 32],
+            1,
+            0,
+            false,
+            0,
+            0,
+            FragmentOptions {
+                texture_numeric_manifest: vec![GraphicsTextureResource::new(
+                    tex_id,
+                    0,
+                    TextureNumericType::Uint,
+                )
+                .with_image_kind(GraphicsImageKind::Buffer)],
+                ..FragmentOptions::default()
+            },
+        );
+        assert_eq!(tex_ids, vec![tex_id]);
+        validates_with_spirv_val_if_available(&words);
+
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        assert!(module.capabilities.iter().any(|instruction| {
+            instruction.operands == [Operand::Capability(Capability::SampledBuffer)]
+        }));
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::ImageQuerySize
+                })
+                .count(),
+            1
+        );
+        assert!(!instructions.iter().any(|instruction| matches!(
+            instruction.class.opcode,
+            rspirv::spirv::Op::ImageQuerySizeLod | rspirv::spirv::Op::ImageQueryLevels
+        )));
+    }
+
+    #[test]
+    fn graphics_query_only_texture_without_image_kind_manifest_fails_closed() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(
+            IrOp::TextureQueryDimension {
+                handle: TextureHandleOrigin::Bound {
+                    cbuf_word_offset: 0x44,
+                },
+                lod: IrValue::Zero,
+                component: 0,
+            },
+            Some(0),
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| emit_fragment(&cfg)))
+            .expect_err("query-only graphics texture without a dimension source must fail closed");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains("graphics TXQ texture 0x44 has no image-kind source"),
+            "unexpected panic: {message}"
+        );
+    }
+
+    #[test]
     fn vertex_texture_manifest_includes_descriptor_slot_base() {
         let mut program = nexium_shader::IrProgram::new();
         program.emit(
             IrOp::SampleTex {
+                sample_site: None,
                 tex_id: 0x22,
                 u: IrValue::ImmF32(0.0),
                 v: IrValue::ImmF32(0.0),
@@ -14275,13 +15783,36 @@ mod tests {
         let words = emit_fragment(&cfg);
         validates_with_naga(&words);
         let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
-        assert!(module.functions.iter().any(|function| {
-            function.blocks.iter().any(|block| {
-                block.instructions.iter().any(|instruction| {
-                    instruction.class.opcode == rspirv::spirv::Op::ImageSampleImplicitLod
-                })
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        let samples = instructions
+            .iter()
+            .copied()
+            .filter(|instruction| {
+                instruction.class.opcode == rspirv::spirv::Op::ImageSampleImplicitLod
             })
-        }));
+            .collect::<Vec<_>>();
+        assert_eq!(
+            samples.len(),
+            1,
+            "one Maxwell TEXS must issue one vector sample"
+        );
+        let sample_id = samples[0].result_id.expect("sample result");
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::CompositeExtract
+                        && instruction.operands.first() == Some(&Operand::IdRef(sample_id))
+                })
+                .count(),
+            3,
+            "the captured RGB mask must extract three lanes from one sample"
+        );
         assert!(!module.functions.iter().any(|function| {
             function.blocks.iter().any(|block| {
                 block.instructions.iter().any(|instruction| {
@@ -14289,6 +15820,158 @@ mod tests {
                 })
             })
         }));
+    }
+
+    #[test]
+    fn fragment_debug_forced_lod_replaces_implicit_sample_only_when_active() {
+        let bytes = build_test_program(&[0xD822_00A0_5087_0500u64, enc_exit()]);
+        let cfg = nexium_shader::build_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+
+        for (debug_active, expected_explicit) in [(true, true), (false, false)] {
+            let mut emitter = Emitter::new(Stage::Fragment);
+            emitter.fragment_debug_active = debug_active;
+            emitter.force_sample_lod = Some(6.0);
+            let words = emitter.finish(&cfg);
+            validates_with_naga(&words);
+            let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+            let (mut implicit, mut explicit) = (0, 0);
+            for instruction in module
+                .functions
+                .iter()
+                .flat_map(|function| &function.blocks)
+                .flat_map(|block| &block.instructions)
+            {
+                match instruction.class.opcode {
+                    rspirv::spirv::Op::ImageSampleImplicitLod => implicit += 1,
+                    rspirv::spirv::Op::ImageSampleExplicitLod => explicit += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(explicit, usize::from(expected_explicit));
+            assert_eq!(implicit, usize::from(!expected_explicit));
+        }
+    }
+
+    #[test]
+    fn fragment_ir_oct_normal_probe_reencodes_three_values_branchlessly() {
+        let mut program = nexium_shader::IrProgram::new();
+        let x = program.emit(IrOp::Mov(IrValue::ImmF32(0.25)), Some(0));
+        let y = program.emit(IrOp::Mov(IrValue::ImmF32(-0.5)), Some(1));
+        let z = program.emit(IrOp::Mov(IrValue::ImmF32(0.75)), Some(2));
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+        let mut emitter = Emitter::new(Stage::Fragment);
+        emitter.fragment_ir_oct_normal = Some([x, y, z]);
+        let words = emitter.finish(&cfg);
+        validates_with_naga(&words);
+        validates_with_spirv_val_if_available(&words);
+
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| instruction.class.opcode == rspirv::spirv::Op::FDiv)
+                .count(),
+            1
+        );
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| instruction.class.opcode == rspirv::spirv::Op::Select)
+                .count(),
+            4,
+            "two sign selects plus the z-hemisphere fold for each output"
+        );
+    }
+
+    #[test]
+    fn captured_smo_cube_texs_rgba_emits_one_sample_and_four_extracts() {
+        let bytes = build_test_program(&[0xd9b2_01a0_8087_0a0au64, enc_exit()]);
+        let cfg = nexium_shader::build_fragment_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+        let words = emit_fragment(&cfg);
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        let samples = instructions
+            .iter()
+            .copied()
+            .filter(|instruction| {
+                instruction.class.opcode == rspirv::spirv::Op::ImageSampleExplicitLod
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(samples.len(), 1);
+        let sample_id = samples[0].result_id.expect("sample result");
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::CompositeExtract
+                        && instruction.operands.first() == Some(&Operand::IdRef(sample_id))
+                })
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn captured_smo_direct_tex_rgb_emits_one_sample_and_three_extracts() {
+        let bytes = build_test_program(&[
+            0x0100_0000_0117_f00au64,
+            0xc078_0083_a0a7_0800u64,
+            enc_exit(),
+        ]);
+        let cfg = nexium_shader::build_fragment_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+        let words = emit_fragment(&cfg);
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        let samples = instructions
+            .iter()
+            .copied()
+            .filter(|instruction| {
+                instruction.class.opcode == rspirv::spirv::Op::ImageSampleImplicitLod
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(
+            samples[0].operands.get(2),
+            Some(&Operand::ImageOperands(
+                rspirv::spirv::ImageOperands::CONST_OFFSET
+            ))
+        );
+        let sample_id = samples[0].result_id.expect("sample result");
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::CompositeExtract
+                        && instruction.operands.first() == Some(&Operand::IdRef(sample_id))
+                })
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -14548,7 +16231,7 @@ mod tests {
             .copied()
             .filter(|inst| inst.class.opcode == rspirv::spirv::Op::ImageSampleExplicitLod)
             .collect::<Vec<_>>();
-        assert_eq!(samples.len(), 3);
+        assert_eq!(samples.len(), 1);
         let expected =
             rspirv::spirv::ImageOperands::LOD | rspirv::spirv::ImageOperands::CONST_OFFSET;
         assert!(samples
@@ -14570,6 +16253,129 @@ mod tests {
         let words = emit_vertex(&cfg);
         let locs = scan_input_locations(&words);
         assert_eq!(locs, vec![0]);
+    }
+
+    #[test]
+    fn fragment_front_facing_interp_uses_builtin_all_ones_mask() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(
+            IrOp::InterpAttr {
+                slot: 0x3fc,
+                perspective: IrValue::Zero,
+                mode: 0,
+                sat: false,
+            },
+            Some(0),
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+
+        let words = emit_fragment(&cfg);
+        validates_with_naga(&words);
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let front_facing_var = module
+            .annotations
+            .iter()
+            .find_map(|instruction| match instruction.operands.as_slice() {
+                [
+                    Operand::IdRef(var),
+                    Operand::Decoration(Decoration::BuiltIn),
+                    Operand::BuiltIn(BuiltIn::FrontFacing),
+                ] => Some(*var),
+                _ => None,
+            })
+            .expect("FrontFacing built-in input");
+        assert!(module.entry_points.iter().any(|entry_point| {
+            entry_point
+                .operands
+                .contains(&Operand::IdRef(front_facing_var))
+        }));
+        assert!(!module.annotations.iter().any(|instruction| {
+            matches!(
+                instruction.operands.as_slice(),
+                [
+                    Operand::IdRef(var),
+                    Operand::Decoration(Decoration::Location),
+                    ..
+                ] if *var == front_facing_var
+            )
+        }));
+
+        let input = module
+            .types_global_values
+            .iter()
+            .find(|instruction| instruction.result_id == Some(front_facing_var))
+            .expect("FrontFacing input variable");
+        assert_eq!(input.class.opcode, rspirv::spirv::Op::Variable);
+        assert_eq!(
+            input.operands.first(),
+            Some(&Operand::StorageClass(StorageClass::Input))
+        );
+        let pointer_type = input.result_type.expect("FrontFacing pointer type");
+        let pointer = module
+            .types_global_values
+            .iter()
+            .find(|instruction| instruction.result_id == Some(pointer_type))
+            .expect("FrontFacing pointer declaration");
+        let bool_type = match pointer.operands.as_slice() {
+            [Operand::StorageClass(StorageClass::Input), Operand::IdRef(bool_type)] => *bool_type,
+            operands => panic!("unexpected FrontFacing pointer declaration: {operands:?}"),
+        };
+        assert!(module.types_global_values.iter().any(|instruction| {
+            instruction.result_id == Some(bool_type)
+                && instruction.class.opcode == rspirv::spirv::Op::TypeBool
+        }));
+
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        let load = instructions
+            .iter()
+            .copied()
+            .find(|instruction| {
+                instruction.class.opcode == rspirv::spirv::Op::Load
+                    && instruction.result_type == Some(bool_type)
+                    && instruction.operands.first() == Some(&Operand::IdRef(front_facing_var))
+            })
+            .expect("load FrontFacing bool");
+        let condition = load.result_id.expect("FrontFacing load result");
+        let select = instructions
+            .iter()
+            .copied()
+            .find(|instruction| {
+                instruction.class.opcode == rspirv::spirv::Op::Select
+                    && instruction.operands.first() == Some(&Operand::IdRef(condition))
+            })
+            .expect("select Maxwell FrontFacing mask");
+        let (front_mask, back_mask) = match select.operands.as_slice() {
+            [Operand::IdRef(_), Operand::IdRef(front_mask), Operand::IdRef(back_mask)] => {
+                (*front_mask, *back_mask)
+            }
+            operands => panic!("unexpected FrontFacing select operands: {operands:?}"),
+        };
+        let constant_bits = |id| {
+            module
+                .types_global_values
+                .iter()
+                .find_map(|instruction| {
+                    (instruction.result_id == Some(id)
+                        && instruction.class.opcode == rspirv::spirv::Op::Constant)
+                        .then(|| match instruction.operands.as_slice() {
+                            [Operand::LiteralBit32(bits)] => *bits,
+                            operands => panic!("unexpected scalar constant: {operands:?}"),
+                        })
+                })
+                .expect("FrontFacing mask constant")
+        };
+        assert_eq!(constant_bits(front_mask), u32::MAX);
+        assert_eq!(constant_bits(back_mask), 0);
     }
 
     #[test]
@@ -15135,6 +16941,7 @@ mod tests {
         let mut program = nexium_shader::IrProgram::new();
         program.emit(
             IrOp::SampleTexHandle {
+                sample_site: None,
                 handle,
                 dimension: ImageDimension::D2,
                 u: IrValue::ImmF32(0.25),
@@ -15206,6 +17013,138 @@ mod tests {
                 && instruction.class.opcode == rspirv::spirv::Op::Constant
                 && instruction.operands.last() == Some(&Operand::LiteralBit32(0))
         }));
+    }
+
+    #[test]
+    fn grouped_compute_samples_preserve_float_uint_and_sint_lanes() {
+        let handle = TextureHandleOrigin::Bound {
+            cbuf_word_offset: 0x20,
+        };
+        for numeric_type in [
+            TextureNumericType::Float,
+            TextureNumericType::Uint,
+            TextureNumericType::Sint,
+        ] {
+            let mut program = nexium_shader::IrProgram::new();
+            for (dest, component) in [(0, 0), (1, 2)] {
+                program.emit(
+                    IrOp::SampleTexHandle {
+                        sample_site: Some(7),
+                        handle,
+                        dimension: ImageDimension::D2,
+                        u: IrValue::ImmF32(0.25),
+                        v: Some(IrValue::ImmF32(0.75)),
+                        w: None,
+                        implicit_lod: false,
+                        lod_bias: None,
+                        explicit_lod: Some(IrValue::ImmF32(1.0)),
+                        texel_offset: None,
+                        dref: None,
+                        component,
+                    },
+                    Some(dest),
+                );
+            }
+            let cfg = Cfg {
+                blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+                unimplemented: 0,
+                bindless_or_partners: Default::default(),
+            };
+            let options = ComputeOptions {
+                resources: vec![ComputeImageResource {
+                    handle,
+                    binding: 1,
+                    kind: ComputeResourceKind::CombinedSampledImage,
+                    dimension: ImageDimension::D2,
+                    numeric_type,
+                    texel_format: None,
+                }],
+                ..ComputeOptions::default()
+            };
+            let emitted = emit_compute(&cfg, &options).expect("grouped compute sample");
+            validates_with_spirv_val_if_available(&emitted.words);
+            let module = rspirv::dr::load_words(&emitted.words).expect("valid SPIR-V");
+            let instructions = module
+                .functions
+                .iter()
+                .flat_map(|function| &function.blocks)
+                .flat_map(|block| &block.instructions)
+                .collect::<Vec<_>>();
+            let samples = instructions
+                .iter()
+                .copied()
+                .filter(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::ImageSampleExplicitLod
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(samples.len(), 1, "numeric type {numeric_type:?}");
+            let sample_id = samples[0].result_id.expect("sample result");
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|instruction| {
+                        instruction.class.opcode == rspirv::spirv::Op::CompositeExtract
+                            && instruction.operands.first() == Some(&Operand::IdRef(sample_id))
+                    })
+                    .count(),
+                2,
+                "numeric type {numeric_type:?}"
+            );
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|instruction| {
+                        instruction.class.opcode == rspirv::spirv::Op::Bitcast
+                    })
+                    .count(),
+                usize::from(numeric_type != TextureNumericType::Float) * 2,
+                "numeric type {numeric_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fragment_fp32_denorm_flush_control_is_opt_in() {
+        let cfg = Cfg {
+            blocks: vec![empty_cfg_block(0, BranchKind::Exit)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+
+        for (enabled, expected) in [(false, false), (true, true)] {
+            let mut emitter = Emitter::new(Stage::Fragment);
+            emitter.force_fp32_ftz = enabled;
+            let words = emitter.finish(&cfg);
+            validates_with_spirv_val_if_available(&words);
+
+            let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+            assert_eq!(
+                module.extensions.iter().any(|extension| {
+                    extension.operands
+                        == [Operand::LiteralString("SPV_KHR_float_controls".to_string())]
+                }),
+                expected
+            );
+            assert_eq!(
+                module.capabilities.iter().any(|capability| {
+                    capability.operands == [Operand::Capability(Capability::DenormFlushToZero)]
+                }),
+                expected
+            );
+            assert_eq!(
+                module.execution_modes.iter().any(|mode| {
+                    matches!(
+                        mode.operands.as_slice(),
+                        [
+                            Operand::IdRef(_),
+                            Operand::ExecutionMode(rspirv::spirv::ExecutionMode::DenormFlushToZero),
+                            Operand::LiteralBit32(32)
+                        ]
+                    )
+                }),
+                expected
+            );
+        }
     }
 
     #[test]

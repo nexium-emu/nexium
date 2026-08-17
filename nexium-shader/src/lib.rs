@@ -195,6 +195,7 @@ pub fn texture_ids(cfg: &Cfg) -> Vec<u32> {
                 IrOp::SampleTexHandle { handle, .. }
                 | IrOp::TexelFetchHandle { handle, .. }
                 | IrOp::TextureQueryDimension { handle, .. }
+                | IrOp::TextureQueryLod { handle, .. }
                 | IrOp::ImageWrite { handle, .. }
                 | IrOp::ImageAtomic { handle, .. } => match handle {
                     TextureHandleOrigin::Bound { cbuf_word_offset } => {
