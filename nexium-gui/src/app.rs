@@ -161,6 +161,8 @@ pub struct HorizonApp {
     egui_ctx: egui::Context,
     wgpu_state: Option<eframe::egui_wgpu::RenderState>,
     game_texture_native: Option<NativeGameTexture>,
+    last_game_rect: Option<egui::Rect>,
+    mouse_wheel_accum: egui::Vec2,
     frame_backlog: std::collections::VecDeque<crate::boot::Frame>,
     show_settings: bool,
     settings_tab: SettingsTab,
@@ -418,6 +420,8 @@ impl HorizonApp {
             egui_ctx: cc.egui_ctx.clone(),
             wgpu_state: cc.wgpu_render_state.clone(),
             game_texture_native: None,
+            last_game_rect: None,
+            mouse_wheel_accum: egui::Vec2::ZERO,
             frame_backlog: std::collections::VecDeque::new(),
             show_settings: false,
             settings_tab: SettingsTab::General,
@@ -7756,6 +7760,78 @@ impl eframe::App for HorizonApp {
                 stick_r_x: sticks[2],
                 stick_r_y: sticks[3],
             });
+
+            let wants_keyboard = ctx.wants_keyboard_input();
+            let wants_pointer = ctx.wants_pointer_input();
+            let mut keys = [0u8; 32];
+            let mut modifiers = 0u32;
+            if self.app_settings.emulate_keyboard && !wants_keyboard {
+                ctx.input(|i| {
+                    for key in i.keys_down.iter() {
+                        if let Some(index) = hid_keyboard_usage(*key) {
+                            keys[(index / 8) as usize] |= 1 << (index % 8);
+                        }
+                    }
+                    if i.modifiers.ctrl {
+                        modifiers |= nexium_core::hid_state::KEYBOARD_MOD_CONTROL;
+                    }
+                    if i.modifiers.shift {
+                        modifiers |= nexium_core::hid_state::KEYBOARD_MOD_SHIFT;
+                    }
+                    if i.modifiers.alt {
+                        modifiers |= nexium_core::hid_state::KEYBOARD_MOD_LEFT_ALT;
+                    }
+                });
+            }
+            let mut mouse = nexium_core::hid_state::MouseInput::default();
+            if self.app_settings.emulate_mouse {
+                let previous = hid.mouse;
+                mouse = nexium_core::hid_state::MouseInput {
+                    connected: true,
+                    buttons: 0,
+                    ..previous
+                };
+                let game_rect = self.last_game_rect;
+                let wheel_accum = &mut self.mouse_wheel_accum;
+                ctx.input(|i| {
+                    *wheel_accum += i.raw_scroll_delta;
+                    mouse.wheel_x = wheel_accum.x as i32;
+                    mouse.wheel_y = wheel_accum.y as i32;
+                    if let (Some(pos), Some(rect)) = (i.pointer.latest_pos(), game_rect) {
+                        if rect.width() > 0.0 && rect.height() > 0.0 {
+                            let nx = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                            let ny = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+                            mouse.x = ((nx * 1280.0) as i32).min(1279);
+                            mouse.y = ((ny * 720.0) as i32).min(719);
+                        }
+                    }
+                    if !wants_pointer {
+                        if i.pointer.primary_down() {
+                            mouse.buttons |= nexium_core::hid_state::MOUSE_BUTTON_LEFT;
+                        }
+                        if i.pointer.secondary_down() {
+                            mouse.buttons |= nexium_core::hid_state::MOUSE_BUTTON_RIGHT;
+                        }
+                        if i.pointer.middle_down() {
+                            mouse.buttons |= nexium_core::hid_state::MOUSE_BUTTON_MIDDLE;
+                        }
+                        if i.pointer.button_down(egui::PointerButton::Extra1) {
+                            mouse.buttons |= nexium_core::hid_state::MOUSE_BUTTON_BACK;
+                        }
+                        if i.pointer.button_down(egui::PointerButton::Extra2) {
+                            mouse.buttons |= nexium_core::hid_state::MOUSE_BUTTON_FORWARD;
+                        }
+                    }
+                });
+            }
+            hid.update_devices(
+                mouse,
+                nexium_core::hid_state::KeyboardInput {
+                    modifiers,
+                    keys,
+                    connected: self.app_settings.emulate_keyboard,
+                },
+            );
         }
 
         self.poll_frames(ctx);
@@ -8517,7 +8593,9 @@ impl eframe::App for HorizonApp {
                     }
                 } else if running {
                     if let Some((tid, tsz)) = self.game_display() {
-                        let draw_size = self.game_draw_rect(ui.max_rect(), tsz).size();
+                        let draw_rect = self.game_draw_rect(ui.max_rect(), tsz);
+                        self.last_game_rect = Some(draw_rect);
+                        let draw_size = draw_rect.size();
                         ui.centered_and_justified(|ui| {
                             ui.image((tid, draw_size));
                         });
@@ -9623,6 +9701,26 @@ fn emulation_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_nee
         *save_needed = true;
     }
     resp.on_hover_text("Keep this on — disables only for debugging");
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new("Emulated devices")
+            .size(12.0)
+            .color(MUTED),
+    );
+    let resp = ui.checkbox(&mut cfg.emulate_mouse, "Mouse (direct mouse input)");
+    if resp.changed() {
+        *save_needed = true;
+    }
+    resp.on_hover_text(
+        "Report the host mouse to the game as a USB mouse; the cursor maps onto the game viewport",
+    );
+    let resp = ui.checkbox(&mut cfg.emulate_keyboard, "Keyboard");
+    if resp.changed() {
+        *save_needed = true;
+    }
+    resp.on_hover_text(
+        "Report host keys to the game as a USB keyboard alongside the keyboard-to-controller bindings",
+    );
 }
 
 fn logging_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_needed: &mut bool) {
@@ -9656,6 +9754,87 @@ fn logging_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_neede
             .size(10.5)
             .color(MUTED),
     );
+}
+
+fn hid_keyboard_usage(key: egui::Key) -> Option<u8> {
+    use egui::Key;
+    Some(match key {
+        Key::A => 4,
+        Key::B => 5,
+        Key::C => 6,
+        Key::D => 7,
+        Key::E => 8,
+        Key::F => 9,
+        Key::G => 10,
+        Key::H => 11,
+        Key::I => 12,
+        Key::J => 13,
+        Key::K => 14,
+        Key::L => 15,
+        Key::M => 16,
+        Key::N => 17,
+        Key::O => 18,
+        Key::P => 19,
+        Key::Q => 20,
+        Key::R => 21,
+        Key::S => 22,
+        Key::T => 23,
+        Key::U => 24,
+        Key::V => 25,
+        Key::W => 26,
+        Key::X => 27,
+        Key::Y => 28,
+        Key::Z => 29,
+        Key::Num1 => 30,
+        Key::Num2 => 31,
+        Key::Num3 => 32,
+        Key::Num4 => 33,
+        Key::Num5 => 34,
+        Key::Num6 => 35,
+        Key::Num7 => 36,
+        Key::Num8 => 37,
+        Key::Num9 => 38,
+        Key::Num0 => 39,
+        Key::Enter => 40,
+        Key::Escape => 41,
+        Key::Backspace => 42,
+        Key::Tab => 43,
+        Key::Space => 44,
+        Key::Minus => 45,
+        Key::Equals => 46,
+        Key::OpenBracket => 47,
+        Key::CloseBracket => 48,
+        Key::Backslash => 49,
+        Key::Semicolon => 51,
+        Key::Quote => 52,
+        Key::Backtick => 53,
+        Key::Comma => 54,
+        Key::Period => 55,
+        Key::Slash => 56,
+        Key::F1 => 58,
+        Key::F2 => 59,
+        Key::F3 => 60,
+        Key::F4 => 61,
+        Key::F5 => 62,
+        Key::F6 => 63,
+        Key::F7 => 64,
+        Key::F8 => 65,
+        Key::F9 => 66,
+        Key::F10 => 67,
+        Key::F11 => 68,
+        Key::F12 => 69,
+        Key::Insert => 73,
+        Key::Home => 74,
+        Key::PageUp => 75,
+        Key::Delete => 76,
+        Key::End => 77,
+        Key::PageDown => 78,
+        Key::ArrowRight => 79,
+        Key::ArrowLeft => 80,
+        Key::ArrowDown => 81,
+        Key::ArrowUp => 82,
+        _ => return None,
+    })
 }
 
 fn wait_tree_color(class: nexium_kernel::kernel::ThreadWaitClass) -> Color32 {

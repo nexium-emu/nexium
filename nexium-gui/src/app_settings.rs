@@ -531,8 +531,16 @@ pub struct AppSettings {
     pub left_deadzone: f32,
     #[serde(default = "default_right_deadzone")]
     pub right_deadzone: f32,
+    #[serde(default = "default_emulated_device")]
+    pub emulate_mouse: bool,
+    #[serde(default = "default_emulated_device")]
+    pub emulate_keyboard: bool,
     #[serde(default)]
     pub performance_debug: PerformanceDebugSettings,
+}
+
+fn default_emulated_device() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -668,6 +676,8 @@ impl Default for AppSettings {
             dockbar_theme: DockbarTheme::default(),
             left_deadzone: default_left_deadzone(),
             right_deadzone: default_right_deadzone(),
+            emulate_mouse: default_emulated_device(),
+            emulate_keyboard: default_emulated_device(),
             performance_debug: PerformanceDebugSettings::default(),
         }
     }
