@@ -823,6 +823,12 @@ impl EmulationHandle {
                 let max_cycles = u64::MAX;
                 let mut cycle_count = 0u64;
                 let mut svc_count = 0u32;
+                let forced_snapshot_period = std::env::var("NEXIUM_THREAD_SNAPSHOT_PERIOD")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|&seconds| seconds > 0)
+                    .map(std::time::Duration::from_secs);
+                let mut last_forced_snapshot = std::time::Instant::now();
                 let mut stuck_log_counter: u64 = 0;
                 let mut pc_check_count = 0u32;
                 let mut stuck_pc: Option<u64> = None;
@@ -1015,6 +1021,12 @@ impl EmulationHandle {
                                     .map(|(m, n)| format!("{:#x}={}", m, n))
                                     .collect();
                                 log::info!("[mw3d-methods] {}", pretty.join(" "));
+                            }
+                            if let Some(period) = forced_snapshot_period {
+                                if last_forced_snapshot.elapsed() >= period {
+                                    guard.log_thread_snapshot("periodic");
+                                    last_forced_snapshot = std::time::Instant::now();
+                                }
                             }
                             if gpu_progress {
                                 last_render_progress = std::time::Instant::now();
