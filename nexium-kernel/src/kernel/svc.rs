@@ -6555,10 +6555,10 @@ fn igbp_handle_transact(
                         let tiled_size =
                             compute_tiled_size(gb.stride, gb.height, gb.block_height_log2);
                         let nvmap = kernel.nvdrv.nvmap_handles.get(&gb.nvmap_id)?;
-                        let surface_size = if nvmap.size as usize >= tiled_size
+                        let tiled_present = nvmap.size as usize >= tiled_size
                             && gb.kind == 254
-                            && gb.block_height_log2 != 0
-                        {
+                            && gb.block_height_log2 != 0;
+                        let surface_size = if tiled_present {
                             tiled_size as u64
                         } else {
                             linear_size as u64
@@ -6591,14 +6591,26 @@ fn igbp_handle_transact(
                         if present_gpu_vas.is_empty() {
                             return None;
                         }
-                        Some((present_cpu_addr, present_gpu_vas))
+                        Some((
+                            present_cpu_addr,
+                            present_gpu_vas,
+                            surface_size,
+                            tiled_present,
+                        ))
                     })();
                     let renderer_for_ordered_present = ordered_present_identity
                         .as_ref()
                         .and_then(|_| kernel.nvdrv.renderer().cloned());
                     let ordered_identity_valid = ordered_present_identity.is_some();
-                    if let (Some(renderer), Some((present_cpu_addr, direct_gpu_vas))) =
-                        (renderer_for_ordered_present, ordered_present_identity)
+                    if let (
+                        Some(renderer),
+                        Some((
+                            present_cpu_addr,
+                            direct_gpu_vas,
+                            present_surface_size,
+                            present_tiled,
+                        )),
+                    ) = (renderer_for_ordered_present, ordered_present_identity)
                     {
                         let queue_crop: Option<(u32, u32, u32, u32)> = {
                             let cw = crop_r.saturating_sub(crop_l).max(0) as u32;
@@ -6640,6 +6652,8 @@ fn igbp_handle_transact(
                         }
                         let maxwell_dma_for_ordered =
                             std::sync::Arc::clone(&kernel.nvdrv.gpu.maxwell_dma);
+                        let address_space_for_ordered = kernel.address_space.clone();
+                        let (present_stride, present_bh_log2) = (gb.stride, gb.block_height_log2);
                         let queued = kernel.nvdrv.try_queue_ordered_present(move || {
                             let _slot_guard = AcquiredBufferSlotGuard::new(
                                 present_bufferqueues,
@@ -6680,12 +6694,55 @@ fn igbp_handle_transact(
                                 &direct_gpu_vas,
                             );
                             if exact_present_source.is_none() && direct_present.is_none() {
-                                log::warn!(
-                                    "ordered present has no exact target binder={} slot={} nvmap={} searched_vas={}",
-                                    binder_id,
-                                    slot,
-                                    present_nvmap_id,
-                                    direct_gpu_vas.len()
+                                use std::sync::atomic::{AtomicU64, Ordering};
+                                static GUEST_PRESENTS: AtomicU64 = AtomicU64::new(0);
+                                let sequence = GUEST_PRESENTS.fetch_add(1, Ordering::Relaxed);
+                                if sequence < 3 || sequence % 600 == 0 {
+                                    log::info!(
+                                        "ordered present falling back to guest bytes #{} binder={} slot={} nvmap={} tiled={} searched_vas={}",
+                                        sequence,
+                                        binder_id,
+                                        slot,
+                                        present_nvmap_id,
+                                        present_tiled,
+                                        direct_gpu_vas.len()
+                                    );
+                                }
+                                submit_ordered_gpu_present(
+                                    move |_read_rect| {
+                                        let mut raw =
+                                            vec![0u8; usize::try_from(present_surface_size).ok()?];
+                                        address_space_for_ordered
+                                            .read(present_cpu_addr, &mut raw)
+                                            .ok()?;
+                                        let linear = (present_stride as usize)
+                                            .checked_mul(present_height as usize)?
+                                            .checked_mul(4)?;
+                                        let mut pixels = if present_tiled {
+                                            unswizzle_block_linear(
+                                                &raw,
+                                                present_stride,
+                                                present_height,
+                                                4,
+                                                present_bh_log2,
+                                            )
+                                        } else {
+                                            raw
+                                        };
+                                        if pixels.len() < linear {
+                                            pixels.resize(linear, 0);
+                                        }
+                                        for px in pixels.chunks_exact_mut(4) {
+                                            px[3] = 0xFF;
+                                        }
+                                        Some((present_stride, present_height, pixels, Some(false)))
+                                    },
+                                    frame_queue,
+                                    stats,
+                                    present_width,
+                                    present_height,
+                                    transform,
+                                    queue_crop,
                                 );
                                 return;
                             }
