@@ -5,6 +5,23 @@ use std::time::Instant;
 
 pub const NUM_CORES: usize = 4;
 
+pub const IDEAL_CORE_DONT_CARE: i32 = -1;
+pub const IDEAL_CORE_USE_PROCESS_VALUE: i32 = -2;
+pub const IDEAL_CORE_NO_UPDATE: i32 = -3;
+
+pub fn resolve_create_thread_core(requested: i32, process_ideal_core: i32) -> Result<i32, u32> {
+    let ideal = if requested == IDEAL_CORE_USE_PROCESS_VALUE {
+        process_ideal_core
+    } else {
+        requested
+    };
+    if (0..NUM_CORES as i32).contains(&ideal) {
+        Ok(ideal)
+    } else {
+        Err(nexium_common::result::KERNEL_INVALID_CORE_ID)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ThreadCtx {
     pub x: [u64; 31],
@@ -67,6 +84,8 @@ pub struct Thread {
     pub entry_arg: u64,
     pub priority: i32,
     pub core: i32,
+    pub ideal_core: i32,
+    pub affinity_mask: u64,
     pub wait_cancelled: bool,
     user_preemption_pending: bool,
 }
@@ -101,6 +120,8 @@ impl Threads {
                 entry_arg: 0,
                 priority: 0x2C,
                 core: 0,
+                ideal_core: 0,
+                affinity_mask: 1,
                 wait_cancelled: false,
                 user_preemption_pending: false,
             },
@@ -157,6 +178,8 @@ impl Threads {
                 entry_arg,
                 priority: 0x2C,
                 core: -2,
+                ideal_core: IDEAL_CORE_USE_PROCESS_VALUE,
+                affinity_mask: 0,
                 wait_cancelled: false,
                 user_preemption_pending: false,
             },
@@ -196,13 +219,14 @@ impl Threads {
 
     pub fn transition_state(&mut self, handle: u32, new_state: ThreadState) {
         self.ready.retain(|&h| h != handle);
+        let Some(t) = self.threads.get_mut(&handle) else {
+            return;
+        };
         let became_ready = matches!(new_state, ThreadState::Ready);
         let exited = matches!(new_state, ThreadState::Exited);
-        if let Some(t) = self.threads.get_mut(&handle) {
-            t.state = new_state;
-            if exited {
-                t.user_preemption_pending = false;
-            }
+        t.state = new_state;
+        if exited {
+            t.user_preemption_pending = false;
         }
         if became_ready && !self.ready.contains(&handle) {
             self.ready.push_back(handle);
@@ -523,13 +547,82 @@ impl Threads {
         }
     }
 
+    pub fn thread_core_mask(&self, handle: u32) -> Option<(i32, u64)> {
+        self.threads
+            .get(&handle)
+            .map(|t| (t.ideal_core, t.affinity_mask))
+    }
+
+    pub fn set_thread_core_mask(
+        &mut self,
+        handle: u32,
+        core_id: i32,
+        affinity_mask: u64,
+        process_ideal_core: i32,
+        active_cores: i32,
+    ) -> Result<(), u32> {
+        use nexium_common::result::{
+            KERNEL_INVALID_COMBINATION, KERNEL_INVALID_CORE_ID, KERNEL_INVALID_HANDLE,
+        };
+        let virtual_core_mask: u64 = (1u64 << NUM_CORES) - 1;
+        let (ideal_update, affinity_mask) = if core_id == IDEAL_CORE_USE_PROCESS_VALUE {
+            (process_ideal_core, 1u64 << process_ideal_core)
+        } else {
+            if affinity_mask & !virtual_core_mask != 0 {
+                return Err(KERNEL_INVALID_CORE_ID);
+            }
+            if affinity_mask == 0 {
+                return Err(KERNEL_INVALID_COMBINATION);
+            }
+            if (0..NUM_CORES as i32).contains(&core_id) {
+                if affinity_mask & (1u64 << core_id) == 0 {
+                    return Err(KERNEL_INVALID_COMBINATION);
+                }
+            } else if core_id != IDEAL_CORE_DONT_CARE && core_id != IDEAL_CORE_NO_UPDATE {
+                return Err(KERNEL_INVALID_CORE_ID);
+            }
+            (core_id, affinity_mask)
+        };
+        let thread = self.threads.get_mut(&handle).ok_or(KERNEL_INVALID_HANDLE)?;
+        if ideal_update == IDEAL_CORE_NO_UPDATE {
+            if thread.ideal_core >= 0 && affinity_mask & (1u64 << thread.ideal_core) == 0 {
+                return Err(KERNEL_INVALID_COMBINATION);
+            }
+        } else {
+            thread.ideal_core = ideal_update;
+        }
+        thread.affinity_mask = affinity_mask;
+        if matches!(thread.state, ThreadState::Created) {
+            let preferred = if thread.ideal_core >= 0 {
+                thread.ideal_core
+            } else {
+                affinity_mask.trailing_zeros() as i32
+            };
+            thread.core = preferred.min(active_cores.max(1) - 1);
+        } else if thread.core >= 0 && affinity_mask & (1u64 << thread.core) == 0 {
+            log::debug!(
+                "SetThreadCoreMask handle={:#x}: started thread stays on sticky core {} outside new guest mask {:#x}",
+                handle,
+                thread.core,
+                affinity_mask
+            );
+        }
+        Ok(())
+    }
+
     pub fn pick_next(&mut self) -> Option<u32> {
         let core = current_core() as i32;
-        let pos = self.ready.iter().position(|h| {
-            self.threads
-                .get(h)
-                .map_or(false, |t| t.core == core || t.core < 0)
-        })?;
+        let pos = self
+            .ready
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| {
+                self.threads
+                    .get(h)
+                    .map_or(false, |t| t.core == core || t.core < 0)
+            })
+            .min_by_key(|(idx, h)| (self.effective_priority(**h), *idx))
+            .map(|(idx, _)| idx)?;
         let handle = self.ready.remove(pos)?;
         if let Some(t) = self.threads.get_mut(&handle) {
             if t.core < 0 {
@@ -637,12 +730,166 @@ impl Default for Threads {
 
 #[cfg(test)]
 mod tests {
-    use super::{ThreadCtx, ThreadState, Threads};
+    use super::{
+        resolve_create_thread_core, ThreadCtx, ThreadState, Threads, IDEAL_CORE_DONT_CARE,
+        IDEAL_CORE_NO_UPDATE, IDEAL_CORE_USE_PROCESS_VALUE,
+    };
+    use nexium_common::result::{
+        KERNEL_INVALID_COMBINATION, KERNEL_INVALID_CORE_ID, KERNEL_INVALID_HANDLE,
+    };
 
     fn add_ready_thread(threads: &mut Threads, handle: u32, priority: i32) {
         threads.add_thread(handle, ThreadCtx::zero(), 0, 0, 0);
         threads.threads.get_mut(&handle).unwrap().priority = priority;
         threads.transition_state(handle, ThreadState::Ready);
+    }
+
+    fn add_created_thread(threads: &mut Threads, handle: u32) {
+        threads.add_thread(handle, ThreadCtx::zero(), 0, 0, 0);
+    }
+
+    fn core_state(threads: &Threads, handle: u32) -> (i32, u64, i32) {
+        let t = threads.threads.get(&handle).unwrap();
+        (t.ideal_core, t.affinity_mask, t.core)
+    }
+
+    #[test]
+    fn create_thread_core_resolution() {
+        assert_eq!(resolve_create_thread_core(2, 0), Ok(2));
+        assert_eq!(
+            resolve_create_thread_core(IDEAL_CORE_USE_PROCESS_VALUE, 1),
+            Ok(1)
+        );
+        assert_eq!(
+            resolve_create_thread_core(IDEAL_CORE_DONT_CARE, 0),
+            Err(KERNEL_INVALID_CORE_ID)
+        );
+        assert_eq!(
+            resolve_create_thread_core(IDEAL_CORE_NO_UPDATE, 0),
+            Err(KERNEL_INVALID_CORE_ID)
+        );
+        assert_eq!(
+            resolve_create_thread_core(4, 0),
+            Err(KERNEL_INVALID_CORE_ID)
+        );
+    }
+
+    #[test]
+    fn set_core_mask_validates_inputs() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_created_thread(&mut threads, 0x200);
+        assert_eq!(
+            threads.set_thread_core_mask(0x999, 0, 1, 0, 4),
+            Err(KERNEL_INVALID_HANDLE)
+        );
+        assert_eq!(
+            threads.set_thread_core_mask(0x999, 0, 0, 0, 4),
+            Err(KERNEL_INVALID_COMBINATION)
+        );
+        assert_eq!(
+            threads.set_thread_core_mask(0x999, 0, 0x10, 0, 4),
+            Err(KERNEL_INVALID_CORE_ID)
+        );
+        assert_eq!(
+            threads.set_thread_core_mask(0x200, 0, 0x11, 0, 4),
+            Err(KERNEL_INVALID_CORE_ID)
+        );
+        assert_eq!(
+            threads.set_thread_core_mask(0x200, 0, 0, 0, 4),
+            Err(KERNEL_INVALID_COMBINATION)
+        );
+        assert_eq!(
+            threads.set_thread_core_mask(0x200, 2, 0b0011, 0, 4),
+            Err(KERNEL_INVALID_COMBINATION)
+        );
+        assert_eq!(
+            threads.set_thread_core_mask(0x200, 4, 0b0011, 0, 4),
+            Err(KERNEL_INVALID_CORE_ID)
+        );
+        assert_eq!(
+            threads.set_thread_core_mask(0x200, -4, 0b0011, 0, 4),
+            Err(KERNEL_INVALID_CORE_ID)
+        );
+        assert_eq!(
+            core_state(&threads, 0x200),
+            (IDEAL_CORE_USE_PROCESS_VALUE, 0, -2)
+        );
+    }
+
+    #[test]
+    fn set_core_mask_applies_before_start_and_sticks_after() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_created_thread(&mut threads, 0x200);
+        assert_eq!(threads.set_thread_core_mask(0x200, 2, 0b0100, 0, 4), Ok(()));
+        assert_eq!(core_state(&threads, 0x200), (2, 0b0100, 2));
+
+        threads.transition_state(0x200, ThreadState::Ready);
+        assert_eq!(threads.set_thread_core_mask(0x200, 1, 0b0010, 0, 4), Ok(()));
+        assert_eq!(core_state(&threads, 0x200), (1, 0b0010, 2));
+    }
+
+    #[test]
+    fn set_core_mask_resolves_special_ideals() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_created_thread(&mut threads, 0x200);
+
+        assert_eq!(
+            threads.set_thread_core_mask(0x200, IDEAL_CORE_USE_PROCESS_VALUE, 0xdead, 1, 4),
+            Ok(())
+        );
+        assert_eq!(core_state(&threads, 0x200), (1, 0b0010, 1));
+
+        assert_eq!(
+            threads.set_thread_core_mask(0x200, IDEAL_CORE_DONT_CARE, 0b1100, 0, 4),
+            Ok(())
+        );
+        assert_eq!(
+            core_state(&threads, 0x200),
+            (IDEAL_CORE_DONT_CARE, 0b1100, 2)
+        );
+
+        assert_eq!(
+            threads.set_thread_core_mask(0x200, IDEAL_CORE_NO_UPDATE, 0b1000, 0, 4),
+            Ok(())
+        );
+        assert_eq!(
+            core_state(&threads, 0x200),
+            (IDEAL_CORE_DONT_CARE, 0b1000, 3)
+        );
+    }
+
+    #[test]
+    fn mask_only_update_must_contain_the_preserved_ideal() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_created_thread(&mut threads, 0x200);
+        assert_eq!(threads.set_thread_core_mask(0x200, 0, 0b0001, 0, 4), Ok(()));
+
+        assert_eq!(
+            threads.set_thread_core_mask(0x200, IDEAL_CORE_NO_UPDATE, 0b1000, 0, 4),
+            Err(KERNEL_INVALID_COMBINATION)
+        );
+        assert_eq!(core_state(&threads, 0x200), (0, 0b0001, 0));
+
+        assert_eq!(
+            threads.set_thread_core_mask(0x200, IDEAL_CORE_NO_UPDATE, 0b0011, 0, 4),
+            Ok(())
+        );
+        assert_eq!(core_state(&threads, 0x200), (0, 0b0011, 0));
+    }
+
+    #[test]
+    fn set_core_mask_clamps_execution_core_to_active_cores() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_created_thread(&mut threads, 0x200);
+        assert_eq!(threads.set_thread_core_mask(0x200, 3, 0b1000, 0, 2), Ok(()));
+        assert_eq!(core_state(&threads, 0x200), (3, 0b1000, 1));
+    }
+
+    #[test]
+    fn get_core_mask_returns_stored_guest_state() {
+        let threads = Threads::new(0x100, 0, 0, 0);
+        assert_eq!(threads.thread_core_mask(0x100), Some((0, 1)));
+        assert_eq!(threads.thread_core_mask(0xdead), None);
     }
 
     #[test]
@@ -659,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_is_deterministic_fifo_with_core_affinity() {
+    fn scheduler_picks_priority_then_fifo_with_core_affinity() {
         let mut threads = Threads::new(0x100, 0, 0, 0);
         add_ready_thread(&mut threads, 0x200, 0);
         threads.threads.get_mut(&0x200).unwrap().core = 1;
@@ -673,15 +920,42 @@ mod tests {
         }
         add_ready_thread(&mut threads, 0x300, 1);
 
+        assert_eq!(threads.pick_next(), Some(0x300));
         for &handle in &fifo_handles {
             assert_eq!(threads.pick_next(), Some(handle));
             assert_eq!(threads.threads.get(&handle).unwrap().core, 0);
         }
-        assert_eq!(threads.pick_next(), Some(0x300));
         assert_eq!(
             threads.ready.iter().copied().collect::<Vec<_>>(),
             vec![0x200]
         );
+    }
+
+    #[test]
+    fn pick_next_uses_inherited_priority() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_ready_thread(&mut threads, 0x200, 0x30);
+        add_ready_thread(&mut threads, 0x201, 0x20);
+        threads.add_thread(0x300, ThreadCtx::zero(), 0, 0, 0);
+        threads.threads.get_mut(&0x300).unwrap().priority = 0x10;
+        threads.transition_state(
+            0x300,
+            ThreadState::WaitingMutex {
+                mutex_addr: 0x1000,
+                owner_handle: 0x200,
+                tag: 0x300,
+            },
+        );
+
+        assert_eq!(threads.pick_next(), Some(0x200));
+        assert_eq!(threads.pick_next(), Some(0x201));
+    }
+
+    #[test]
+    fn transition_state_ignores_unknown_handles() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        threads.transition_state(0xdead, ThreadState::Ready);
+        assert!(threads.ready.is_empty());
     }
 
     #[test]

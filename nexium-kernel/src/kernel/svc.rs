@@ -6,8 +6,9 @@ use crate::kernel::{
     AudioAdpcmContext, AudioAdpcmDecodeState, AudioAdpcmStreamKey, AudioRendererState,
 };
 use nexium_common::result::{
-    KERNEL_CANCELLED, KERNEL_INVALID_ADDRESS, KERNEL_INVALID_HANDLE, KERNEL_NOT_IMPLEMENTED,
-    KERNEL_TIMEOUT, SUCCESS,
+    KERNEL_CANCELLED, KERNEL_INVALID_ADDRESS, KERNEL_INVALID_ENUM_VALUE, KERNEL_INVALID_HANDLE,
+    KERNEL_INVALID_PRIORITY, KERNEL_INVALID_THREAD_STATE, KERNEL_NOT_IMPLEMENTED, KERNEL_TIMEOUT,
+    SUCCESS,
 };
 use nexium_ipc as ipc;
 
@@ -40,6 +41,146 @@ fn async_present_pipeline_enabled() -> bool {
             Some("0") | Some("false") | Some("off") | Some("no")
         )
     })
+}
+
+struct AcquiredBufferSlotGuard {
+    queues: std::sync::Arc<
+        parking_lot::Mutex<std::collections::HashMap<u32, nexium_nvdrv::BufferQueue>>,
+    >,
+    binder_id: u32,
+    slot: u32,
+}
+
+impl AcquiredBufferSlotGuard {
+    fn new(
+        queues: std::sync::Arc<
+            parking_lot::Mutex<std::collections::HashMap<u32, nexium_nvdrv::BufferQueue>>,
+        >,
+        binder_id: u32,
+        slot: u32,
+    ) -> Self {
+        Self {
+            queues,
+            binder_id,
+            slot,
+        }
+    }
+}
+
+impl Drop for AcquiredBufferSlotGuard {
+    fn drop(&mut self) {
+        let mut queues = self.queues.lock();
+        let Some(queue) = queues.get_mut(&self.binder_id) else {
+            return;
+        };
+        if !queue.release(self.slot) {
+            log::warn!(
+                "IGBP failed to release acquired slot binder={} slot={}",
+                self.binder_id,
+                self.slot
+            );
+        }
+    }
+}
+
+fn release_rejected_present_slot_after_fences(
+    queues: &std::sync::Arc<
+        parking_lot::Mutex<std::collections::HashMap<u32, nexium_nvdrv::BufferQueue>>,
+    >,
+    binder_id: u32,
+    slot: u32,
+    fences: &[(u32, u32)],
+    timeout: std::time::Duration,
+    mut fence_reached: impl FnMut(u32, u32) -> bool,
+) -> bool {
+    let started = std::time::Instant::now();
+    for &(syncpt_id, threshold) in fences {
+        while !fence_reached(syncpt_id, threshold) {
+            if started.elapsed() >= timeout {
+                log::error!(
+                    "IGBP rejected present fence timeout binder={} slot={} syncpt={} threshold={}; retaining Acquired slot",
+                    binder_id,
+                    slot,
+                    syncpt_id,
+                    threshold
+                );
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
+
+    let mut queues = queues.lock();
+    let Some(queue) = queues.get_mut(&binder_id) else {
+        log::warn!(
+            "IGBP rejected present lost BufferQueue binder={} slot={}; slot not released",
+            binder_id,
+            slot
+        );
+        return false;
+    };
+    if !queue.release(slot) {
+        log::warn!(
+            "IGBP rejected present failed to release acquired slot binder={} slot={}",
+            binder_id,
+            slot
+        );
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod bufferqueue_present_tests {
+    use super::release_rejected_present_slot_after_fences;
+    use nexium_nvdrv::bufferqueue::SlotState;
+    use nexium_nvdrv::{BufferQueue, GraphicBuffer};
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn acquired_slot() -> Arc<Mutex<HashMap<u32, BufferQueue>>> {
+        let mut queue = BufferQueue::new(7);
+        queue.set_preallocated(0, GraphicBuffer::default());
+        assert_eq!(queue.try_dequeue(), Some(0));
+        assert!(queue.queue_and_acquire(0));
+        Arc::new(Mutex::new(HashMap::from([(7, queue)])))
+    }
+
+    #[test]
+    fn rejected_present_releases_only_after_elided_fence_retires() {
+        let queues = acquired_slot();
+        assert!(release_rejected_present_slot_after_fences(
+            &queues,
+            7,
+            0,
+            &[(3, 9)],
+            Duration::ZERO,
+            |syncpt_id, threshold| syncpt_id == 3 && threshold == 9,
+        ));
+        let mut queues = queues.lock();
+        let queue = queues.get_mut(&7).unwrap();
+        assert_eq!(queue.slot_state(0), Some(SlotState::Free));
+        assert_eq!(queue.try_dequeue(), Some(0));
+    }
+
+    #[test]
+    fn rejected_present_timeout_retains_acquired_slot() {
+        let queues = acquired_slot();
+        assert!(!release_rejected_present_slot_after_fences(
+            &queues,
+            7,
+            0,
+            &[(3, 9)],
+            Duration::ZERO,
+            |_, _| false,
+        ));
+        let mut queues = queues.lock();
+        let queue = queues.get_mut(&7).unwrap();
+        assert_eq!(queue.slot_state(0), Some(SlotState::Acquired));
+        assert_eq!(queue.try_dequeue(), None);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1081,7 +1222,7 @@ fn svc_map_memory(kernel: &mut Kernel) -> u32 {
                 };
                 match plumb {
                     Ok(_) => log::debug!(
-                        "svcMapMemory dst={:#x} src={:#x} size={:#x} → mapped + copied + plumbed to dynarmic",
+                        "svcMapMemory dst={:#x} src={:#x} size={:#x} â†’ mapped + copied + plumbed to dynarmic",
                         dst,
                         src,
                         size
@@ -1102,7 +1243,7 @@ fn svc_map_memory(kernel: &mut Kernel) -> u32 {
         }
     } else if let Err(e) = map_rc {
         log::debug!(
-            "svcMapMemory dst={:#x} src={:#x} size={:#x} → already mapped ({:?}), refreshed contents only",
+            "svcMapMemory dst={:#x} src={:#x} size={:#x} â†’ already mapped ({:?}), refreshed contents only",
             dst,
             src,
             size,
@@ -1367,7 +1508,7 @@ fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
             hid.bind_mapped_host(region.host_ptr);
         }
         log::debug!(
-            "  → recognized as HID shared memory, publishing synchronized guest VA {:#x}",
+            "  â†’ recognized as HID shared memory, publishing synchronized guest VA {:#x}",
             addr
         );
         if let Some(cpu) = cpu_mut() {
@@ -1380,7 +1521,7 @@ fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
         }
     } else if kernel.time_shmem_handle == Some(handle) {
         log::debug!(
-            "  → recognized as time shared memory, mapping {} bytes at {:#x}",
+            "  â†’ recognized as time shared memory, mapping {} bytes at {:#x}",
             size,
             addr
         );
@@ -1410,14 +1551,14 @@ fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
                     {
                         log::warn!("failed to map time shmem in CPU: {}", e);
                     } else {
-                        log::debug!("  → registered time shmem at {:#x} with CPU", region.base);
+                        log::debug!("  â†’ registered time shmem at {:#x} with CPU", region.base);
                     }
                 }
             }
         }
     } else if kernel.font_shmem_handle == Some(handle) {
         log::debug!(
-            "  → recognized as font shared memory, mapping {} bytes of font data at {:#x}",
+            "  â†’ recognized as font shared memory, mapping {} bytes of font data at {:#x}",
             size,
             addr
         );
@@ -1447,7 +1588,7 @@ fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
                     {
                         log::warn!("failed to map font shmem in CPU: {}", e);
                     } else {
-                        log::debug!("  → registered font shmem at {:#x} with CPU", region.base);
+                        log::debug!("  â†’ registered font shmem at {:#x} with CPU", region.base);
                     }
                 }
             }
@@ -1468,7 +1609,10 @@ fn svc_map_shared_memory(kernel: &mut Kernel) -> u32 {
                         {
                             log::warn!("failed to map shared mem in CPU: {}", e);
                         } else {
-                            log::debug!("  → registered shared mem at {:#x} with CPU", region.base);
+                            log::debug!(
+                                "  â†’ registered shared mem at {:#x} with CPU",
+                                region.base
+                            );
                         }
                     }
                 }
@@ -1529,7 +1673,7 @@ fn completed_thread_wait_index(kernel: &Kernel, handles: &[u32]) -> Option<usize
         ) {
             return false;
         }
-        if kernel.exited_thread_handles.contains(h) {
+        if kernel.exited_thread_handles.contains_key(h) {
             return true;
         }
         kernel
@@ -1642,6 +1786,8 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         }
     }
 
+    kernel.refresh_bufferqueue_events();
+
     for h in &handles {
         crate::kernel::profile::record_wait_handle(*h);
     }
@@ -1654,34 +1800,26 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         return SUCCESS;
     }
 
-    let mut vsync_idx: Option<usize> = None;
-    for (i, h) in handles.iter().enumerate() {
-        if kernel.vsync_handles.contains(h) {
-            vsync_idx = Some(i);
-            break;
+    if let Some(i) = ready_event_wait_index(
+        &handles,
+        kernel.applet_message_event,
+        !kernel.applet_messages.is_empty(),
+        &kernel.event_signals,
+    ) {
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(0, SUCCESS as u64);
+            cpu.set_register(1, i as u64);
         }
+        return SUCCESS;
     }
 
     if timeout_ns == 0 {
         log::trace!(
-            "svcWaitSync(timeout=0) handles={:?} applet_msg_event={:?} applet_msgs_pending={} vsync_idx={:?}",
+            "svcWaitSync(timeout=0) handles={:?} applet_msg_event={:?} applet_msgs_pending={}",
             handles,
             kernel.applet_message_event,
-            kernel.applet_messages.len(),
-            vsync_idx
+            kernel.applet_messages.len()
         );
-        if let Some(i) = ready_event_wait_index(
-            &handles,
-            kernel.applet_message_event,
-            !kernel.applet_messages.is_empty(),
-            &kernel.event_signals,
-        ) {
-            if let Some(cpu) = cpu_mut() {
-                cpu.set_register(0, SUCCESS as u64);
-                cpu.set_register(1, i as u64);
-            }
-            return SUCCESS;
-        }
 
         {
             let state = crate::hid_state::get_hid_state();
@@ -1717,62 +1855,6 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         return TIMEOUT_ERROR;
     }
 
-    if let Some(i) = vsync_idx {
-        const VSYNC_PERIOD: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
-        let now = std::time::Instant::now();
-        let elapsed = now.saturating_duration_since(kernel.last_vsync);
-        let remaining = if elapsed >= VSYNC_PERIOD {
-            std::time::Duration::ZERO
-        } else {
-            VSYNC_PERIOD - elapsed
-        };
-        let allowed = if timeout_ns == u64::MAX || timeout_ns == 0 {
-            remaining
-        } else {
-            std::time::Duration::from_nanos(timeout_ns).min(remaining)
-        };
-        kernel.last_vsync = std::time::Instant::now() + allowed;
-        {
-            let state = crate::hid_state::get_hid_state();
-            let mut hid = state.lock();
-            if hid.shmem_va.is_some() {
-                let cur = hid.input.clone();
-                hid.tick(cur);
-            }
-        }
-        crate::services::audio_out::handlers::drain_audio_spill(kernel);
-        let now_audio = std::time::Instant::now();
-        signal_due_audio_sessions(kernel, now_audio);
-        if let Some(cpu) = cpu_mut() {
-            cpu.set_register(0, SUCCESS as u64);
-            cpu.set_register(1, i as u64);
-        }
-        if allowed > std::time::Duration::ZERO {
-            if let Some(cpu) = cpu_ref() {
-                let wake_at = std::time::Instant::now() + allowed;
-                kernel.threads.yield_with_state(
-                    cpu,
-                    crate::kernel::threads::ThreadState::Sleeping { wake_at },
-                );
-                kernel.yield_after_svc = true;
-            }
-        }
-        return SUCCESS;
-    }
-
-    if let Some(i) = ready_event_wait_index(
-        &handles,
-        kernel.applet_message_event,
-        !kernel.applet_messages.is_empty(),
-        &kernel.event_signals,
-    ) {
-        if let Some(cpu) = cpu_mut() {
-            cpu.set_register(0, SUCCESS as u64);
-            cpu.set_register(1, i as u64);
-        }
-        return SUCCESS;
-    }
-
     if let Some(handle) = kernel.threads.current_handle() {
         if kernel.threads.take_wait_cancelled(handle) {
             if let Some(cpu) = cpu_mut() {
@@ -1797,10 +1879,7 @@ fn svc_wait_synchronization(kernel: &mut Kernel) -> u32 {
         let wake_at = if timeout_ns == u64::MAX {
             None
         } else {
-            const VSYNC_PERIOD_NS: u64 = 16_666_667;
-            let cap = std::time::Duration::from_nanos(VSYNC_PERIOD_NS);
-            let wait = std::time::Duration::from_nanos(timeout_ns).min(cap);
-            Some(std::time::Instant::now() + wait)
+            Some(std::time::Instant::now() + std::time::Duration::from_nanos(timeout_ns))
         };
         kernel.threads.yield_with_state(
             cpu,
@@ -2473,7 +2552,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             Some(name) => name,
             None => {
                 log::warn!(
-                    "domain object_id={} not found on session={:#x} (port={}) → InvalidObject 0xCE01",
+                    "domain object_id={} not found on session={:#x} (port={}) â†’ InvalidObject 0xCE01",
                     d.object_id,
                     session_handle,
                     port_name
@@ -2655,7 +2734,7 @@ fn handle_control_request(
         }
         3 => {
             log::debug!(
-                "Control: QueryPointerBufferSize → 0x500 service={}",
+                "Control: QueryPointerBufferSize â†’ 0x500 service={}",
                 port_name
             );
             build_ipc_response(&mut ctx, 0, &0x500u16.to_le_bytes(), &[])
@@ -3152,7 +3231,7 @@ fn dispatch_service_v2(
 
     if let Some(sub_service) = crate::services::am::proxy_subsession(port_name, cmd_id) {
         log::debug!(
-            "{} cmd={} → returning {} sub-session",
+            "{} cmd={} â†’ returning {} sub-session",
             port_name,
             cmd_id,
             sub_service
@@ -3220,7 +3299,7 @@ fn dispatch_service_v2(
         crate::services::am::dispatch_command(kernel, port_name, cmd_id)
     {
         log::trace!(
-            "am.{}.cmd_{} rc={:#x} → {} bytes, {} handle(s) [copy]",
+            "am.{}.cmd_{} rc={:#x} â†’ {} bytes, {} handle(s) [copy]",
             port_name,
             cmd_id,
             rc,
@@ -3318,7 +3397,7 @@ fn dispatch_service_v2(
             2 => return build_ipc_response(ctx, 0, &0u32.to_le_bytes(), &[]),
             17 | 18 | 23 => {
                 let h = kernel.handles.create_handle(HandleType::Event);
-                log::debug!("nfp IUser.cmd_{} → event {:#x}", cmd_id, h);
+                log::debug!("nfp IUser.cmd_{} â†’ event {:#x}", cmd_id, h);
                 return build_ipc_response_copy(ctx, 0, &[], &[h]);
             }
             19 => return build_ipc_response(ctx, 0, &1u32.to_le_bytes(), &[]),
@@ -3344,7 +3423,7 @@ fn dispatch_service_v2(
                 let host = fs_host_path(kernel, session_handle, fs_obj_id, &path_str);
                 let Some(host) = host else {
                     log::warn!(
-                        "IFileSystem.CreateFile path={:?} → 0x202 PathNotFound",
+                        "IFileSystem.CreateFile path={:?} â†’ 0x202 PathNotFound",
                         path_str
                     );
                     return build_ipc_response(ctx, 0x202, &[], &[]);
@@ -3358,7 +3437,7 @@ fn dispatch_service_v2(
                     .open(&host)
                 {
                     Ok(_) => {
-                        log::debug!("IFileSystem.CreateFile path={:?} → SUCCESS", path_str);
+                        log::debug!("IFileSystem.CreateFile path={:?} â†’ SUCCESS", path_str);
                         return build_ipc_response(ctx, 0, &[], &[]);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -3408,7 +3487,6 @@ fn dispatch_service_v2(
                 }
             }
             5 | 6 => {
-                // RenameFile / RenameDirectory: source = path_str, dest = 2nd buffer.
                 let all: Vec<_> = ctx
                     .send_statics
                     .iter()
@@ -3435,7 +3513,7 @@ fn dispatch_service_v2(
                         match std::fs::rename(&o, &n) {
                             Ok(()) => {
                                 log::debug!(
-                                    "IFileSystem.Rename{} {:?} -> {:?} → SUCCESS",
+                                    "IFileSystem.Rename{} {:?} -> {:?} â†’ SUCCESS",
                                     if cmd_id == 5 { "File" } else { "Directory" },
                                     path_str,
                                     new_path
@@ -3444,7 +3522,7 @@ fn dispatch_service_v2(
                             }
                             Err(e) => {
                                 log::warn!(
-                                    "IFileSystem.Rename {:?} -> {:?} → err {}",
+                                    "IFileSystem.Rename {:?} -> {:?} â†’ err {}",
                                     path_str,
                                     new_path,
                                     e
@@ -3478,7 +3556,7 @@ fn dispatch_service_v2(
                                 } else {
                                     fs_trace_path("GetEntryType", &path_str, "not_found");
                                     log::debug!(
-                                        "IFileSystem.GetEntryType path={:?} → 0x202 NotFound",
+                                        "IFileSystem.GetEntryType path={:?} â†’ 0x202 NotFound",
                                         path_str
                                     );
                                     return build_ipc_response(ctx, 0x202, &[], &[]);
@@ -3490,7 +3568,7 @@ fn dispatch_service_v2(
                     } else {
                         fs_trace_path("GetEntryType", &path_str, "not_found");
                         log::debug!(
-                            "IFileSystem.GetEntryType path={:?} → 0x202 NotFound",
+                            "IFileSystem.GetEntryType path={:?} â†’ 0x202 NotFound",
                             path_str
                         );
                         return build_ipc_response(ctx, 0x202, &[], &[]);
@@ -3498,7 +3576,7 @@ fn dispatch_service_v2(
                 };
                 fs_trace_path("GetEntryType", &path_str, &format!("type={}", entry_type));
                 log::debug!(
-                    "IFileSystem.GetEntryType path={:?} → {}",
+                    "IFileSystem.GetEntryType path={:?} â†’ {}",
                     path_str,
                     entry_type
                 );
@@ -3532,7 +3610,7 @@ fn dispatch_service_v2(
                     let mmap_len = m.len();
                     kernel.open_files.insert((session_handle, new_obj_id), m);
                     log::debug!(
-                        "IFileSystem.OpenFile path={:?} → IFile (NRO mmap {} bytes)",
+                        "IFileSystem.OpenFile path={:?} â†’ IFile (NRO mmap {} bytes)",
                         path_str,
                         mmap_len
                     );
@@ -3549,7 +3627,7 @@ fn dispatch_service_v2(
                                 &format!("host {}", host.display()),
                             );
                             log::debug!(
-                                "IFileSystem.OpenFile path={:?} → IFile (host {})",
+                                "IFileSystem.OpenFile path={:?} â†’ IFile (host {})",
                                 path_str,
                                 host.display()
                             );
@@ -3566,14 +3644,14 @@ fn dispatch_service_v2(
                                 &format!("romfs off={:#x} size={}", rf.0, rf.1),
                             );
                             log::debug!(
-                                "IFileSystem.OpenFile path={:?} → IFile (romfs off={:#x} size={})",
+                                "IFileSystem.OpenFile path={:?} â†’ IFile (romfs off={:#x} size={})",
                                 path_str,
                                 rf.0,
                                 rf.1
                             );
                         } else {
                             log::debug!(
-                                "IFileSystem.OpenFile path={:?} → 0x202 NotFound (host miss)",
+                                "IFileSystem.OpenFile path={:?} â†’ 0x202 NotFound (host miss)",
                                 path_str
                             );
                             fs_trace_path("OpenFile", &path_str, "not_found_host_miss");
@@ -3592,14 +3670,17 @@ fn dispatch_service_v2(
                             &format!("romfs off={:#x} size={}", rf.0, rf.1),
                         );
                         log::debug!(
-                            "IFileSystem.OpenFile path={:?} → IFile (romfs off={:#x} size={})",
+                            "IFileSystem.OpenFile path={:?} â†’ IFile (romfs off={:#x} size={})",
                             path_str,
                             rf.0,
                             rf.1
                         );
                     } else {
                         fs_trace_path("OpenFile", &path_str, "not_found");
-                        log::debug!("IFileSystem.OpenFile path={:?} → 0x202 NotFound", path_str);
+                        log::debug!(
+                            "IFileSystem.OpenFile path={:?} â†’ 0x202 NotFound",
+                            path_str
+                        );
                         return build_ipc_response(ctx, 0x202, &[], &[]);
                     }
                 }
@@ -3677,7 +3758,7 @@ fn dispatch_service_v2(
                     }
                 }
                 log::debug!(
-                    "IFileSystem.OpenDirectory path={:?} filter={:#x} → {} entries",
+                    "IFileSystem.OpenDirectory path={:?} filter={:#x} â†’ {} entries",
                     path_str,
                     filter,
                     entries.len()
@@ -3697,18 +3778,18 @@ fn dispatch_service_v2(
             11 | 12 => {
                 let huge: u64 = 64u64 * 1024 * 1024 * 1024;
                 log::debug!(
-                    "IFileSystem.Get{}SpaceSize → {}",
+                    "IFileSystem.Get{}SpaceSize â†’ {}",
                     if cmd_id == 11 { "Free" } else { "Total" },
                     huge
                 );
                 return build_ipc_response(ctx, 0, &huge.to_le_bytes(), &[]);
             }
             14 => {
-                log::debug!("IFileSystem.GetFileTimeStampRaw → zeros");
+                log::debug!("IFileSystem.GetFileTimeStampRaw â†’ zeros");
                 return build_ipc_response(ctx, 0, &[0u8; 0x20], &[]);
             }
             _ => {
-                log::warn!("IFileSystem.cmd_{} UNHANDLED → empty SUCCESS", cmd_id);
+                log::warn!("IFileSystem.cmd_{} UNHANDLED â†’ empty SUCCESS", cmd_id);
             }
         }
     }
@@ -3795,7 +3876,7 @@ fn dispatch_service_v2(
                             bytes_read = slice.len() as u64;
                         }
                         log::debug!(
-                            "IFile.Read (host {}) off={:#x} size={:#x} → {} bytes",
+                            "IFile.Read (host {}) off={:#x} size={:#x} â†’ {} bytes",
                             host.display(),
                             offset,
                             read_size,
@@ -3819,7 +3900,7 @@ fn dispatch_service_v2(
                         }
                         bytes_read = slice.len() as u64;
                         log::debug!(
-                            "IFile.Read (romfs off={:#x}) read_off={:#x} size={:#x} → {} bytes",
+                            "IFile.Read (romfs off={:#x}) read_off={:#x} size={:#x} â†’ {} bytes",
                             base,
                             offset,
                             read_size,
@@ -3852,7 +3933,7 @@ fn dispatch_service_v2(
                         }
                         bytes_read = slice.len() as u64;
                         log::debug!(
-                            "IFile.Read (sess={:#x} obj={}) off={:#x} size={:#x} → {} bytes",
+                            "IFile.Read (sess={:#x} obj={}) off={:#x} size={:#x} â†’ {} bytes",
                             session_handle,
                             obj_id,
                             offset,
@@ -3921,7 +4002,7 @@ fn dispatch_service_v2(
                                     }
                                     kernel.host_file_cache.remove(&host);
                                     log::debug!(
-                                        "IFile.Write (host {}) off={:#x} size={} → SUCCESS",
+                                        "IFile.Write (host {}) off={:#x} size={} â†’ SUCCESS",
                                         host.display(),
                                         offset,
                                         n
@@ -3933,7 +4014,7 @@ fn dispatch_service_v2(
                     }
                     return build_ipc_response(ctx, 0x2EE602, &[], &[]);
                 }
-                log::debug!("IFile.Write (read-only mmap) → SUCCESS discarded");
+                log::debug!("IFile.Write (read-only mmap) â†’ SUCCESS discarded");
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
             2 => return build_ipc_response(ctx, 0, &[], &[]),
@@ -3990,7 +4071,7 @@ fn dispatch_service_v2(
                     }
                 };
                 log::debug!(
-                    "IFile.GetSize (sess={:#x} obj={}) → {}",
+                    "IFile.GetSize (sess={:#x} obj={}) â†’ {}",
                     session_handle,
                     obj_id,
                     size
@@ -3998,7 +4079,7 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
             }
             _ => {
-                log::warn!("IFile.cmd_{} UNHANDLED → empty SUCCESS", cmd_id);
+                log::warn!("IFile.cmd_{} UNHANDLED â†’ empty SUCCESS", cmd_id);
             }
         }
     }
@@ -4048,7 +4129,7 @@ fn dispatch_service_v2(
                         let _ = kernel.address_space.write(buf.addr, &payload);
                     }
                     log::debug!(
-                        "IDirectory.Read (host) → {} of {} entries",
+                        "IDirectory.Read (host) â†’ {} of {} entries",
                         to_emit,
                         entries.len()
                     );
@@ -4073,7 +4154,7 @@ fn dispatch_service_v2(
                 }
                 kernel.dir_cursor.insert(session_handle, cursor + to_emit);
                 log::debug!(
-                    "IDirectory.Read (homebrew_dir fallback) cursor={} → {} of {}",
+                    "IDirectory.Read (homebrew_dir fallback) cursor={} â†’ {} of {}",
                     cursor,
                     to_emit,
                     entries.len()
@@ -4089,11 +4170,11 @@ fn dispatch_service_v2(
                 } else {
                     enumerate_homebrew_nros(&kernel.homebrew_dir).len() as i64
                 };
-                log::debug!("IDirectory.GetEntryCount → {}", count);
+                log::debug!("IDirectory.GetEntryCount â†’ {}", count);
                 return build_ipc_response(ctx, 0, &count.to_le_bytes(), &[]);
             }
             _ => {
-                log::warn!("IDirectory.cmd_{} UNHANDLED → empty SUCCESS", cmd_id);
+                log::warn!("IDirectory.cmd_{} UNHANDLED â†’ empty SUCCESS", cmd_id);
             }
         }
     }
@@ -4222,7 +4303,7 @@ fn dispatch_service_v2(
                 } else {
                     storage.len() as i64
                 };
-                log::debug!("IFsStorage.GetSize → {}", size);
+                log::debug!("IFsStorage.GetSize â†’ {}", size);
                 return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
             }
             _ => {}
@@ -4292,7 +4373,7 @@ fn dispatch_service_v2(
             .map(|s| s.is_domain)
             .unwrap_or(false);
         log::debug!(
-            "audren:u OpenAudioRenderer sr={} samples={} voices={} sinks={} effects={} rev={:#x} → IAudioRenderer (domain={})",
+            "audren:u OpenAudioRenderer sr={} samples={} voices={} sinks={} effects={} rev={:#x} â†’ IAudioRenderer (domain={})",
             sample_rate,
             sample_count,
             voice_count,
@@ -4363,7 +4444,7 @@ fn dispatch_service_v2(
             .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
             .unwrap_or_else(|| computed.clamp(0x20_0000, 0x80_0000));
         log::debug!(
-            "audren GetWorkBufferSize voices={} effects={} mixes={} → {:#x} (computed {:#x})",
+            "audren GetWorkBufferSize voices={} effects={} mixes={} â†’ {:#x} (computed {:#x})",
             voices,
             effects,
             mixes,
@@ -5397,7 +5478,7 @@ fn dispatch_service_v2(
                         static FIRST_NONZERO: AtomicBool = AtomicBool::new(false);
                         if !FIRST_PUSH.swap(true, O::Relaxed) {
                             log::info!(
-                                "audio: first push to sink — pushed {} frames of {} mix_peak={:.4} (frame {})",
+                                "audio: first push to sink â€” pushed {} frames of {} mix_peak={:.4} (frame {})",
                                 pushed,
                                 TARGET_FRAMES,
                                 mix_peak,
@@ -5406,7 +5487,7 @@ fn dispatch_service_v2(
                         }
                         if mix_peak > 0.001 && !FIRST_NONZERO.swap(true, O::Relaxed) {
                             log::info!(
-                                "audio: FIRST NON-ZERO MIX — peak={:.4} pushed={}/{} (frame {})",
+                                "audio: FIRST NON-ZERO MIX â€” peak={:.4} pushed={}/{} (frame {})",
                                 mix_peak,
                                 pushed,
                                 TARGET_FRAMES,
@@ -5446,7 +5527,7 @@ fn dispatch_service_v2(
                     kernel.event_signals.insert(h, false);
                     kernel.audio_renderer_events.insert(key, h);
                     log::debug!(
-                        "IAudioRenderer.QuerySystemEvent → new event handle={:#x}",
+                        "IAudioRenderer.QuerySystemEvent â†’ new event handle={:#x}",
                         h
                     );
                     h
@@ -5486,7 +5567,7 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
             }
             other => {
-                log::warn!("IAudioRenderer.cmd_{} UNHANDLED → empty SUCCESS", other);
+                log::warn!("IAudioRenderer.cmd_{} UNHANDLED â†’ empty SUCCESS", other);
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
         }
@@ -5551,7 +5632,7 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &ch.to_le_bytes(), &[]);
             }
             other => {
-                log::debug!("IAudioDevice.cmd_{} → empty SUCCESS", other);
+                log::debug!("IAudioDevice.cmd_{} â†’ empty SUCCESS", other);
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
         }
@@ -5574,7 +5655,7 @@ fn dispatch_service_v2(
         }
         let count: u32 = 1;
         log::debug!(
-            "audout:u ListAudioOuts cmd_{} → count=1 (DeviceOut)",
+            "audout:u ListAudioOuts cmd_{} â†’ count=1 (DeviceOut)",
             cmd_id
         );
         return build_ipc_response(ctx, 0, &count.to_le_bytes(), &[]);
@@ -5632,7 +5713,7 @@ fn dispatch_service_v2(
             .map(|s| s.is_domain)
             .unwrap_or(false);
         log::debug!(
-            "audout:u OpenAudioOut sample_rate={} channels={} → IAudioOut (domain={})",
+            "audout:u OpenAudioOut sample_rate={} channels={} â†’ IAudioOut (domain={})",
             effective_rate,
             effective_channels,
             is_domain
@@ -5725,7 +5806,7 @@ fn dispatch_service_v2(
                 return build_ipc_response(ctx, 0, &v.to_le_bytes(), &[]);
             }
             other => {
-                log::debug!("IAudioOut.cmd_{} → empty SUCCESS", other);
+                log::debug!("IAudioOut.cmd_{} â†’ empty SUCCESS", other);
                 return build_ipc_response(ctx, 0, &[], &[]);
             }
         }
@@ -5734,7 +5815,7 @@ fn dispatch_service_v2(
     if port_name == "set" || port_name == "set:sys" {
         if let Some(outcome) = cmif_dispatch_set(kernel, ctx) {
             log::debug!(
-                "set.cmd_{} → {} bytes (rc={:#x}) via #[service]",
+                "set.cmd_{} â†’ {} bytes (rc={:#x}) via #[service]",
                 cmd_id,
                 outcome.inline_out.len(),
                 outcome.result
@@ -5751,7 +5832,7 @@ fn dispatch_service_v2(
 
     if port_name == "fsp-srv" && cmd_id == 203 {
         log::debug!(
-            "fsp-srv.OpenPatchDataStorageByCurrentProcess → ResultTargetNotFound (no patch)"
+            "fsp-srv.OpenPatchDataStorageByCurrentProcess â†’ ResultTargetNotFound (no patch)"
         );
         return build_ipc_response(ctx, 0x7D402, &[], &[]);
     }
@@ -5763,7 +5844,7 @@ fn dispatch_service_v2(
 
     if let Some((data, handle_opt)) = applet_command_response(kernel, port_name, cmd_id) {
         log::debug!(
-            "{}.cmd_{} → returning data ({} bytes, handle={:?})",
+            "{}.cmd_{} â†’ returning data ({} bytes, handle={:?})",
             port_name,
             cmd_id,
             data.len(),
@@ -5775,7 +5856,7 @@ fn dispatch_service_v2(
 
     if matches!(port_name, "time:u" | "time:s" | "time:a" | "time:r") && cmd_id == 20 {
         let h = kernel.ensure_time_shmem_handle();
-        log::debug!("time:u GetSharedMemoryNativeHandle → handle={:#x}", h);
+        log::debug!("time:u GetSharedMemoryNativeHandle â†’ handle={:#x}", h);
         return build_ipc_response_copy(ctx, 0, &[], &[h]);
     }
 
@@ -5801,7 +5882,7 @@ fn dispatch_service_v2(
         };
         let size = crate::services::hwopus::HwOpusService::work_buffer_size(channels);
         log::debug!(
-            "hwopus GetWorkBufferSize channels={} → {:#x}",
+            "hwopus GetWorkBufferSize channels={} â†’ {:#x}",
             channels,
             size
         );
@@ -5827,7 +5908,7 @@ fn dispatch_service_v2(
             .hwopus
             .open(session_handle, sample_rate, channels);
         log::debug!(
-            "hwopus OpenHardwareOpusDecoder rate={} ch={} → IHardwareOpusDecoder",
+            "hwopus OpenHardwareOpusDecoder rate={} ch={} â†’ IHardwareOpusDecoder",
             sample_rate,
             channels
         );
@@ -5898,7 +5979,7 @@ fn dispatch_service_v2(
     if port_name == "IAppletResource" && cmd_id == 0 {
         let h = kernel.handles.create_handle(HandleType::SharedMemory);
         log::debug!(
-            "IAppletResource.GetSharedMemoryHandle → hid_shmem_handle={:#x}",
+            "IAppletResource.GetSharedMemoryHandle â†’ hid_shmem_handle={:#x}",
             h
         );
         return build_ipc_response_copy(ctx, 0, &[], &[h]);
@@ -6090,7 +6171,7 @@ fn igbp_handle_transact(
             let has = reader.read_i32().unwrap_or(0);
             if has == 0 {
                 log::warn!(
-                    "IGBP::SetPreallocatedBuffer slot={} has=0 — no buffer",
+                    "IGBP::SetPreallocatedBuffer slot={} has=0 â€” no buffer",
                     slot
                 );
                 return ParcelBuilder::new().finish();
@@ -6110,7 +6191,7 @@ fn igbp_handle_transact(
                     if let Some(id) = pick {
                         g.nvmap_id = id;
                         log::debug!(
-                            "SetPreallocatedBuffer fixup: nvmap_id=0 → {} (off={:#x} tiled_size={:#x} needed={:#x})",
+                            "SetPreallocatedBuffer fixup: nvmap_id=0 â†’ {} (off={:#x} tiled_size={:#x} needed={:#x})",
                             id,
                             g.buffer_offset,
                             tiled_size,
@@ -6180,28 +6261,54 @@ fn igbp_handle_transact(
                 .stats
                 .dequeue_buffer_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let _async_ = reader.read_i32();
+            let async_dequeue = reader.read_i32().unwrap_or(0) != 0;
             let _w = reader.read_u32();
             let _h = reader.read_u32();
             let _fmt = reader.read_i32();
             let _usage = reader.read_u32();
-            let (slot, free, deq, queued) = kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
-                let s = bq.dequeue();
-                (s, bq.free.len(), bq.dequeued.len(), bq.queued.len())
-            });
+            let started = std::time::Instant::now();
+            let (slot, free, deq, queued) = loop {
+                let state = kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
+                    (
+                        bq.try_dequeue(),
+                        bq.free.len(),
+                        bq.dequeued.len(),
+                        bq.queued.len(),
+                    )
+                });
+                if let (Some(slot), free, deq, queued) = state {
+                    break (Some(slot), free, deq, queued);
+                }
+                if async_dequeue {
+                    let (_, free, deq, queued) = state;
+                    break (None, free, deq, queued);
+                }
+                if started.elapsed() >= std::time::Duration::from_secs(3) {
+                    let (_, free, deq, queued) = state;
+                    log::error!(
+                        "IGBP::DequeueBuffer timed out waiting for a released slot binder={} (free={} deq={} queued={})",
+                        binder_id,
+                        free,
+                        deq,
+                        queued
+                    );
+                    break (None, free, deq, queued);
+                }
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            };
             log::trace!(
-                "IGBP::DequeueBuffer binder={} → slot={} (free={} deq={} queued={})",
+                "IGBP::DequeueBuffer binder={} â†’ slot={} (free={} deq={} queued={})",
                 binder_id,
-                slot,
+                slot.unwrap_or(u32::MAX),
                 free,
                 deq,
                 queued
             );
             let mut p = ParcelBuilder::new();
-            p.write_u32(slot);
+            p.write_u32(slot.unwrap_or(u32::MAX));
             p.write_u32(1);
             p.write_flattened_zero_fence();
-            p.write_u32(0);
+            p.write_u32(if slot.is_some() { 0 } else { (-11i32) as u32 });
             p.finish()
         }
         IGBP_QUEUE_BUFFER => {
@@ -6211,10 +6318,10 @@ fn igbp_handle_transact(
                 .queue_buffer_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let slot = reader.read_i32().unwrap_or(0).max(0) as u32;
-            let _has = reader.read_u32();
+            let flattened_size = reader.read_u32().unwrap_or(0);
+            let flattened_size_hi = reader.read_u32().unwrap_or(0);
             let _timestamp = reader.read_u64();
             let _is_auto = reader.read_i32();
-            let _data_space = reader.read_i32();
             let crop_l = reader.read_i32().unwrap_or(0);
             let crop_t = reader.read_i32().unwrap_or(0);
             let crop_r = reader.read_i32().unwrap_or(0);
@@ -6231,20 +6338,145 @@ fn igbp_handle_transact(
             let transform = reader.read_i32().unwrap_or(0) as u32;
             let _sticky = reader.read_u32();
             let _async = reader.read_i32();
-            let swap_interval = reader.read_i32().unwrap_or(1).max(1);
+            let swap_interval = reader.read_i32().unwrap_or(1);
+            let fence_count_raw = reader.read_i32().unwrap_or(-1);
+            let fence_count = fence_count_raw.clamp(0, 4) as u32;
+            let mut acquire_fences = Vec::with_capacity(fence_count as usize);
+            for index in 0..4 {
+                let syncpt_id = reader.read_u32().unwrap_or(u32::MAX);
+                let threshold = reader.read_u32().unwrap_or(0);
+                if index < fence_count && syncpt_id != u32::MAX {
+                    acquire_fences.push((syncpt_id, threshold));
+                }
+            }
+            if flattened_size != 0x54
+                || flattened_size_hi != 0
+                || !(0..=4).contains(&fence_count_raw)
+            {
+                log::warn!(
+                    "IGBP::QueueBuffer malformed input binder={} slot={} size={:#x}:{:08x} fence_count={}",
+                    binder_id,
+                    slot,
+                    flattened_size_hi,
+                    flattened_size,
+                    fence_count_raw,
+                );
+                let (qw, qh) = kernel
+                    .nvdrv
+                    .with_bufferqueue(binder_id, |bq| (bq.width, bq.height));
+                let mut p = ParcelBuilder::new();
+                p.write_bq_buffer_output(qw, qh);
+                p.write_u32((-22i32) as u32);
+                return p.finish();
+            }
+            if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() && !acquire_fences.is_empty() {
+                log::info!(
+                    "IGBP::QueueBuffer acquire fences binder={} slot={} fences={:?}",
+                    binder_id,
+                    slot,
+                    acquire_fences
+                );
+            }
 
+            let mut strict_acquire_fences = Vec::new();
+            let mut elided_ordered_fences = Vec::new();
+            for &(syncpt_id, threshold) in &acquire_fences {
+                match kernel
+                    .nvdrv
+                    .queue_buffer_fence_disposition(syncpt_id, threshold)
+                {
+                    nexium_nvdrv::FenceWaitDisposition::Reached => {}
+                    nexium_nvdrv::FenceWaitDisposition::OrderedPredecessor => {
+                        elided_ordered_fences.push((syncpt_id, threshold));
+                        if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+                            log::trace!(
+                                "IGBP::QueueBuffer elided ordered acquire fence binder={} slot={} syncpt={} threshold={}",
+                                binder_id,
+                                slot,
+                                syncpt_id,
+                                threshold
+                            );
+                        }
+                    }
+                    nexium_nvdrv::FenceWaitDisposition::Strict => {
+                        strict_acquire_fences.push((syncpt_id, threshold));
+                    }
+                }
+            }
+            let mut acquire_fences_ready = true;
+            for &(syncpt_id, threshold) in &strict_acquire_fences {
+                let wait_started = std::time::Instant::now();
+                while !kernel.nvdrv.is_syncpoint_reached(syncpt_id, threshold) {
+                    if wait_started.elapsed() >= std::time::Duration::from_secs(3) {
+                        acquire_fences_ready = false;
+                        log::error!(
+                            "IGBP::QueueBuffer acquire fence timeout binder={} slot={} syncpt={} threshold={}",
+                            binder_id,
+                            slot,
+                            syncpt_id,
+                            threshold
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            }
+            if !acquire_fences_ready {
+                let (qw, qh) = kernel
+                    .nvdrv
+                    .with_bufferqueue(binder_id, |bq| (bq.width, bq.height));
+                let mut p = ParcelBuilder::new();
+                p.write_bq_buffer_output(qw, qh);
+                p.write_u32((-110i32) as u32);
+                return p.finish();
+            }
+
+            let prev_interval = kernel
+                .bufferqueue_swap_intervals
+                .insert(binder_id, swap_interval);
+            if prev_interval != Some(swap_interval) {
+                log::info!(
+                    "IGBP::QueueBuffer binder={} swap_interval={} (was {:?})",
+                    binder_id,
+                    swap_interval,
+                    prev_interval
+                );
+            }
             let gb_opt = kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
-                bq.queue(slot);
-                let r = bq.request_buffer(slot).cloned();
+                let slot_acquired = bq.queue_and_acquire(slot);
+                if let Some(entry) = bq.slots.get_mut(slot as usize) {
+                    entry.last_swap_interval = swap_interval.max(0) as u32;
+                }
+                let pace_until = slot_acquired
+                    .then(|| bq.schedule_swap(std::time::Instant::now(), swap_interval))
+                    .flatten();
+                let r = slot_acquired
+                    .then(|| bq.request_buffer(slot).cloned())
+                    .flatten();
                 let slot_count = bq.slots.len();
                 let has_buf = bq
                     .slots
                     .get(slot as usize)
                     .and_then(|s| s.buffer.as_ref())
                     .is_some();
-                (r, slot_count, has_buf)
+                (r, slot_count, has_buf, slot_acquired, pace_until)
             });
-            let (gb_opt, slot_count, has_buf) = gb_opt;
+            let (gb_opt, slot_count, has_buf, slot_acquired, pace_until) = gb_opt;
+            if !slot_acquired {
+                log::warn!(
+                    "IGBP::QueueBuffer rejected invalid slot transition binder={} slot={}",
+                    binder_id,
+                    slot
+                );
+                let (qw, qh) = kernel
+                    .nvdrv
+                    .with_bufferqueue(binder_id, |bq| (bq.width, bq.height));
+                let mut p = ParcelBuilder::new();
+                p.write_bq_buffer_output(qw, qh);
+                p.write_u32((-22i32) as u32);
+                return p.finish();
+            }
+            kernel.present_pace_until = pace_until;
             if crate::services::am::mode_trace_enabled() {
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static QUEUE_TRACES: AtomicU64 = AtomicU64::new(0);
@@ -6327,55 +6559,17 @@ fn igbp_handle_transact(
                         };
                         present_gpu_vas.sort_unstable();
                         present_gpu_vas.dedup();
+                        if present_gpu_vas.is_empty() {
+                            return None;
+                        }
                         Some((present_cpu_addr, present_gpu_vas))
                     })();
-                    let renderer_for_ordered_present = ordered_present_identity.as_ref().and_then(
-                        |(present_cpu_addr, direct_gpu_vas)| {
-                            let renderer = kernel.nvdrv.renderer().cloned()?;
-                            let mut ready_direct_vas = direct_gpu_vas
-                                .iter()
-                                .copied()
-                                .filter(|&gpu_va| {
-                                    renderer.present_rt_ready_at_va(
-                                        gb.nvmap_id,
-                                        gb.width,
-                                        gb.height,
-                                        gpu_va,
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                            ready_direct_vas.sort_unstable();
-                            ready_direct_vas.dedup();
-                            let present_gpu_va = if ready_direct_vas.len() == 1 {
-                                Some(ready_direct_vas[0])
-                            } else if std::env::var("NEXIUM_PRESENT_OFFSET_ALIAS")
-                                .map(|value| value != "0")
-                                .unwrap_or(true)
-                                && present_buffers_share_nvmap(binder_id, gb.nvmap_id)
-                            {
-                                let source_vas =
-                                    renderer.present_alias_vas(gb.nvmap_id, gb.width, gb.height);
-                                let wanted = source_vas
-                                    .first()
-                                    .copied()?
-                                    .checked_add(gb.buffer_offset as u64)?;
-                                (wanted != 0
-                                    && source_vas.contains(&wanted)
-                                    && renderer.present_rt_ready_at_va(
-                                        gb.nvmap_id,
-                                        gb.width,
-                                        gb.height,
-                                        wanted,
-                                    ))
-                                .then_some(wanted)
-                            } else {
-                                None
-                            };
-                            present_gpu_va.map(|gpu_va| (renderer, *present_cpu_addr, gpu_va))
-                        },
-                    );
-                    if let Some((renderer, present_cpu_addr, present_gpu_va)) =
-                        renderer_for_ordered_present
+                    let renderer_for_ordered_present = ordered_present_identity
+                        .as_ref()
+                        .and_then(|_| kernel.nvdrv.renderer().cloned());
+                    let ordered_identity_valid = ordered_present_identity.is_some();
+                    if let (Some(renderer), Some((present_cpu_addr, direct_gpu_vas))) =
+                        (renderer_for_ordered_present, ordered_present_identity)
                     {
                         let queue_crop: Option<(u32, u32, u32, u32)> = {
                             let cw = crop_r.saturating_sub(crop_l).max(0) as u32;
@@ -6394,10 +6588,50 @@ fn igbp_handle_transact(
                             }
                         };
                         let frame_queue = kernel.nvdrv.frame_queue.clone();
+                        let bufferqueues = kernel.nvdrv.bufferqueues.clone();
+                        let present_bufferqueues = std::sync::Arc::clone(&bufferqueues);
                         let stats = kernel.nvdrv.stats.clone();
                         let (present_nvmap_id, present_width, present_height) =
                             (gb.nvmap_id, gb.width, gb.height);
                         let queued = kernel.nvdrv.try_queue_ordered_present(move || {
+                            let _slot_guard = AcquiredBufferSlotGuard::new(
+                                present_bufferqueues,
+                                binder_id,
+                                slot,
+                            );
+                            let Some((present_key, present_stamp)) = renderer
+                                .newest_exact_present_target_at_vas(
+                                    present_nvmap_id,
+                                    present_width,
+                                    present_height,
+                                    &direct_gpu_vas,
+                                )
+                            else {
+                                log::warn!(
+                                    "ordered present has no exact target binder={} slot={} nvmap={}",
+                                    binder_id,
+                                    slot,
+                                    present_nvmap_id
+                                );
+                                return;
+                            };
+                            let present_gpu_va = present_key.gpu_va;
+                            if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
+                                use std::sync::atomic::{AtomicU64, Ordering};
+                                static ORDERED_KEYS: AtomicU64 = AtomicU64::new(0);
+                                let sequence = ORDERED_KEYS.fetch_add(1, Ordering::Relaxed);
+                                if sequence < 3 || sequence % 20 == 0 {
+                                    log::info!(
+                                        "[ordered-present-key #{}] slot={} nvmap={} cpu={:#x} gpu_va={:#x} stamp={}",
+                                        sequence,
+                                        slot,
+                                        present_nvmap_id,
+                                        present_cpu_addr,
+                                        present_gpu_va,
+                                        present_stamp
+                                    );
+                                }
+                            }
                             submit_ordered_gpu_present(
                                 move |read_rect| {
                                     renderer.readback_target_pipelined_pinned_at_va(
@@ -6438,6 +6672,16 @@ fn igbp_handle_transact(
                                 note_ordered_present_profile(
                                     OrderedPresentProfileOutcome::Coalesced,
                                 );
+                                let _ = release_rejected_present_slot_after_fences(
+                                    &bufferqueues,
+                                    binder_id,
+                                    slot,
+                                    &elided_ordered_fences,
+                                    std::time::Duration::from_secs(3),
+                                    |syncpt_id, threshold| {
+                                        kernel.nvdrv.is_syncpoint_reached(syncpt_id, threshold)
+                                    },
+                                );
                                 kernel
                                     .nvdrv
                                     .queue_buffer_active
@@ -6454,14 +6698,35 @@ fn igbp_handle_transact(
                                 note_ordered_present_profile(
                                     OrderedPresentProfileOutcome::Unavailable,
                                 );
+                                let _ = release_rejected_present_slot_after_fences(
+                                    &bufferqueues,
+                                    binder_id,
+                                    slot,
+                                    &elided_ordered_fences,
+                                    std::time::Duration::from_secs(3),
+                                    |syncpt_id, threshold| {
+                                        kernel.nvdrv.is_syncpoint_reached(syncpt_id, threshold)
+                                    },
+                                );
+                                kernel
+                                    .nvdrv
+                                    .queue_buffer_active
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                let (qw, qh) = kernel
+                                    .nvdrv
+                                    .with_bufferqueue(binder_id, |bq| (bq.width, bq.height));
+                                let mut p = ParcelBuilder::new();
+                                p.write_bq_buffer_output(qw, qh);
+                                p.write_u32(0);
+                                return p.finish();
                             }
                         }
-                    } else if ordered_present_identity.is_some() {
-                        note_ordered_present_profile(OrderedPresentProfileOutcome::TargetRejected);
-                    } else {
+                    } else if !ordered_identity_valid {
                         note_ordered_present_profile(
                             OrderedPresentProfileOutcome::IdentityRejected,
                         );
+                    } else {
+                        note_ordered_present_profile(OrderedPresentProfileOutcome::TargetRejected);
                     }
                 }
                 let bpp: usize = 4;
@@ -6611,11 +6876,7 @@ fn igbp_handle_transact(
                     || gpu_stats.maxwell3d_clears != 0
                     || gpu_stats.fermi_2d_blits != 0
                     || gpu_stats.maxwell_dma_blits != 0;
-                let mut has_gpu_present_target = renderer_for_present
-                    .as_ref()
-                    .and_then(|r| r.rt_key_for_nvmap(gb.nvmap_id, gb.width, gb.height))
-                    .is_some()
-                    && has_gpu_activity;
+                let has_gpu_present_target = renderer_for_present.is_some() && has_gpu_activity;
                 let cpu_present_only = std::env::var_os("NEXIUM_PRESENT_CPU_ONLY").is_some();
                 let present_cpu_addr = resolved.map(|(addr, _)| addr).unwrap_or(0);
                 let present_is_tiled = resolved.map(|(_, is_tiled)| is_tiled).unwrap_or(false);
@@ -6624,9 +6885,6 @@ fn igbp_handle_transact(
                 } else {
                     linear_size
                 } as u64;
-                let offset_alias_enabled = std::env::var("NEXIUM_PRESENT_OFFSET_ALIAS")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
                 let mut mapped_present_vas = if present_cpu_addr != 0 {
                     let mappings = kernel.nvdrv.gpu.mappings.read();
                     mappings
@@ -6681,7 +6939,6 @@ fn igbp_handle_transact(
                 mapped_present_vas.extend(resolve_aliases);
                 mapped_present_vas.sort_unstable();
                 mapped_present_vas.dedup();
-                let mapped_present_va = mapped_present_vas.first().copied().unwrap_or(0);
                 let present_source_vas = renderer_for_present
                     .as_ref()
                     .map(|renderer| renderer.present_alias_vas(gb.nvmap_id, gb.width, gb.height))
@@ -6700,102 +6957,17 @@ fn igbp_handle_transact(
                             &present_source_vas,
                         );
                 }
-                let exact_present_candidates = {
-                    let maxwell_dma = kernel.nvdrv.gpu.maxwell_dma.lock();
-                    mapped_present_vas
-                        .iter()
-                        .filter_map(|&present_va| {
-                            maxwell_dma
-                                .exact_present_source_token(present_va, gb.width, gb.height)
-                                .map(|token| (present_va, token))
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let exact_present_source = renderer_for_present.as_ref().and_then(|renderer| {
-                    exact_present_candidates
-                        .into_iter()
-                        .filter(|(_, token)| {
-                            renderer
-                                .render_target_stamp(token.source)
-                                .is_some_and(|current| {
-                                    if token.source_may_advance {
-                                        current >= token.source_stamp
-                                    } else {
-                                        current == token.source_stamp
-                                    }
-                                })
-                        })
-                        .max_by_key(|(_, token)| token.source_stamp)
-                });
-                if exact_present_source.is_some() && has_gpu_activity {
-                    has_gpu_present_target = true;
-                }
-                let mut present_alias_va: u64 = 0;
-                let mut present_alias_mode = "stamp";
-                if offset_alias_enabled {
-                    if let Some(r) = renderer_for_present.as_ref() {
-                        if mapped_present_va != 0
-                            && r.present_rt_ready_at_va(
-                                gb.nvmap_id,
-                                gb.width,
-                                gb.height,
-                                mapped_present_va,
-                            )
-                        {
-                            present_alias_va = mapped_present_va;
-                            present_alias_mode = "mapping";
-                        } else {
-                            let vas: &[u64] = if present_buffers_share_nvmap(binder_id, gb.nvmap_id)
-                            {
-                                &present_source_vas
-                            } else {
-                                &[]
-                            };
-                            let wanted = vas
-                                .first()
-                                .copied()
-                                .map(|base| base.wrapping_add(gb.buffer_offset))
-                                .unwrap_or(0);
-                            if wanted != 0 && vas.contains(&wanted) {
-                                present_alias_va = wanted;
-                                present_alias_mode = "offset";
-                            } else if mapped_present_va != 0 {
-                                present_alias_mode = "fallback-no-rt-at-va";
-                            } else {
-                                present_alias_mode = "fallback-unmapped";
-                            }
-                        }
-                    }
-                }
-                let generic_present_gpu_va = present_alias_va;
-                if let Some((present_va, _)) = exact_present_source {
-                    present_alias_va = present_va;
-                    present_alias_mode = "exact-dma";
-                }
                 if let Some(r_async) =
                     renderer_for_present.filter(|_| has_gpu_present_target && !cpu_present_only)
                 {
                     let rt_worker = nexium_nvdrv::render_thread::present_thread();
                     let fq = kernel.nvdrv.frame_queue.clone();
+                    let bufferqueues = kernel.nvdrv.bufferqueues.clone();
                     let qba = kernel.nvdrv.queue_buffer_active.clone();
                     let stats = kernel.nvdrv.stats.clone();
                     let (pw, ph, pnv) = (gb.width, gb.height, gb.nvmap_id);
-                    let present_gpu_va = present_alias_va;
-                    {
-                        let verbose = std::env::var_os("NEXIUM_PRESENT_KEYS").is_some();
-                        if diagnostics_enabled() || verbose {
-                            use std::sync::atomic::{AtomicU64, Ordering as O2};
-                            static QP: AtomicU64 = AtomicU64::new(0);
-                            let n = QP.fetch_add(1, O2::Relaxed);
-                            if n < 3 || n % 300 == 0 || (verbose && n % 20 == 0) {
-                                log::info!(
-                                    "[queue-present #{}] slot={} nvmap={} buf_off={:#x} present_cpu_addr={:#x} present_gpu_va={:#x} alias_mode={}",
-                                    n, slot, gb.nvmap_id, gb.buffer_offset, present_cpu_addr,
-                                    present_gpu_va, present_alias_mode
-                                );
-                            }
-                        }
-                    }
+                    let maxwell_dma_for_present =
+                        std::sync::Arc::clone(&kernel.nvdrv.gpu.maxwell_dma);
                     qba.store(true, std::sync::atomic::Ordering::Relaxed);
                     let present_profile = std::env::var_os("NEXIUM_NVDRV_PROFILE").is_some();
                     use std::sync::atomic::{AtomicU64, Ordering};
@@ -6827,7 +6999,9 @@ fn igbp_handle_transact(
                             None
                         }
                     };
+                    let slot_guard = AcquiredBufferSlotGuard::new(bufferqueues, binder_id, slot);
                     let submitted = rt_worker.try_submit(Box::new(move || {
+                        let _slot_guard = slot_guard;
                         let t0 = std::time::Instant::now();
                         let crop = cached_present_crop(pw, ph);
                         let read_rect = crop.map(|(x0, y0, w, h)| {
@@ -6837,19 +7011,68 @@ fn igbp_handle_transact(
                                 [x0, y0, w, h]
                             }
                         });
-                        let exact_present_source = exact_present_source
-                            .filter(|(_, token)| token.destination_is_current())
-                            .filter(|(_, token)| {
-                                r_async
-                                    .render_target_stamp(token.source)
-                                    .is_some_and(|current| {
-                                        if token.source_may_advance {
-                                            current >= token.source_stamp
-                                        } else {
-                                            current == token.source_stamp
-                                        }
+                        let exact_present_source = {
+                            let maxwell_dma = maxwell_dma_for_present.lock();
+                            mapped_present_vas
+                                .iter()
+                                .filter_map(|&present_va| {
+                                    maxwell_dma
+                                        .exact_present_source_token(present_va, pw, ph)
+                                        .map(|token| (present_va, token))
+                                })
+                                .filter(|(_, token)| token.destination_is_current())
+                                .filter(|(_, token)| {
+                                    r_async.render_target_stamp(token.source).is_some_and(
+                                        |current| {
+                                            if token.source_may_advance {
+                                                current >= token.source_stamp
+                                            } else {
+                                                current == token.source_stamp
+                                            }
+                                        },
+                                    )
+                                })
+                                .max_by_key(|(_, token)| token.source_stamp)
+                        };
+                        let direct_present = r_async.newest_exact_present_target_at_vas(
+                            pnv,
+                            pw,
+                            ph,
+                            &mapped_present_vas,
+                        );
+                        if diagnostics_enabled()
+                            || std::env::var_os("NEXIUM_PRESENT_KEYS").is_some()
+                        {
+                            use std::sync::atomic::{AtomicU64, Ordering as O2};
+                            static QP: AtomicU64 = AtomicU64::new(0);
+                            let n = QP.fetch_add(1, O2::Relaxed);
+                            if n < 3
+                                || n % 300 == 0
+                                || (std::env::var_os("NEXIUM_PRESENT_KEYS").is_some()
+                                    && n % 20 == 0)
+                            {
+                                let (present_gpu_va, alias_mode, stamp) = exact_present_source
+                                    .as_ref()
+                                    .map(|(va, token)| (*va, "exact-dma", token.source_stamp))
+                                    .or_else(|| {
+                                        direct_present
+                                            .as_ref()
+                                            .map(|(key, stamp)| (key.gpu_va, "newest-exact", *stamp))
                                     })
-                            });
+                                    .unwrap_or((0, "none", 0));
+                                log::info!(
+                                    "[queue-present #{}] slot={} nvmap={} buf_off={:#x} present_cpu_addr={:#x} present_gpu_va={:#x} alias_mode={} stamp={}",
+                                    n,
+                                    slot,
+                                    pnv,
+                                    gb.buffer_offset,
+                                    present_cpu_addr,
+                                    present_gpu_va,
+                                    alias_mode,
+                                    stamp
+                                );
+                            }
+                        }
                         let readback = if let Some((_, token)) = exact_present_source {
                             if token.source_may_advance {
                                 r_async.readback_live_provenance_pipelined(
@@ -6864,15 +7087,17 @@ fn igbp_handle_transact(
                                     read_rect,
                                 )
                             }
-                        } else {
-                            r_async.readback_target_pipelined(
+                        } else if let Some((present_key, _)) = direct_present {
+                            r_async.readback_target_pipelined_pinned_at_va(
                                 pnv,
                                 pw,
                                 ph,
-                                generic_present_gpu_va,
+                                present_key.gpu_va,
                                 present_cpu_addr,
                                 read_rect,
                             )
+                        } else {
+                            None
                         };
                         if let Some((read_w, read_h, bytes, flip_y)) = readback {
                             let (present_w, present_h, bytes) = if legacy_present_enabled() {
@@ -7007,7 +7232,7 @@ fn igbp_handle_transact(
                                     && tiled_raw.iter().any(|&b| b != 0)
                                 {
                                     log::debug!(
-                                        "QueueBuffer tiled-rt-redirect: slot={} slot_tiled={:#x} → rt_cpu={:#x} (gralloc_bh={} dma_bh={} dma_stride={} dma_h={})",
+                                        "QueueBuffer tiled-rt-redirect: slot={} slot_tiled={:#x} â†’ rt_cpu={:#x} (gralloc_bh={} dma_bh={} dma_stride={} dma_h={})",
                                         slot,
                                         addr,
                                         tiled_rt_cpu,
@@ -7085,7 +7310,7 @@ fn igbp_handle_transact(
                                 let (present_w, present_h, mut bytes) =
                                     maybe_crop_present_subwindow(bytes, gb.width, gb.height);
                                 log::debug!(
-                                    "QueueBuffer vk_readback: gb={}x{} stride={} readback_bytes={} → present {}x{} (cropped={})",
+                                    "QueueBuffer vk_readback: gb={}x{} stride={} readback_bytes={} â†’ present {}x{} (cropped={})",
                                     gb.width,
                                     gb.height,
                                     gb.stride,
@@ -7159,7 +7384,7 @@ fn igbp_handle_transact(
                                             &pixels, gb.width, x0, y0, w, h, gb.width, gb.height,
                                         );
                                         log::debug!(
-                                            "QueueBuffer legacy_gfx sub-window: src=({},{}) {}x{} → upscale to {}x{}",
+                                            "QueueBuffer legacy_gfx sub-window: src=({},{}) {}x{} â†’ upscale to {}x{}",
                                             x0,
                                             y0,
                                             w,
@@ -7202,7 +7427,7 @@ fn igbp_handle_transact(
                                         r.readback_target(gb.nvmap_id, gb.width, gb.height)
                                     {
                                         log::debug!(
-                                            "QueueBuffer legacy_gfx Vulkan clear-only fallback: {}x{} color=[{:.2},{:.2},{:.2},{:.2}] clears={} → {} bytes",
+                                            "QueueBuffer legacy_gfx Vulkan clear-only fallback: {}x{} color=[{:.2},{:.2},{:.2},{:.2}] clears={} â†’ {} bytes",
                                             gb.width,
                                             gb.height,
                                             color[0],
@@ -7265,7 +7490,7 @@ fn igbp_handle_transact(
                                         .join(format!("compose-{}.bmp", seq));
                                     let _ = save_rgba_bmp(&path, frame_w, frame_h, &frame_pixels);
                                     log::warn!(
-                                        "FRAME DUMP seq={} rgb_nz={} → {}",
+                                        "FRAME DUMP seq={} rgb_nz={} â†’ {}",
                                         seq,
                                         rgb_nz,
                                         path.display()
@@ -7298,7 +7523,7 @@ fn igbp_handle_transact(
                                 && crop_b as u32 <= frame_h;
                             if valid && (cw < frame_w || ch < frame_h) {
                                 log::debug!(
-                                    "QueueBuffer honoring crop rect ({},{},{},{}) → present {}x{} (was {}x{})",
+                                    "QueueBuffer honoring crop rect ({},{},{},{}) â†’ present {}x{} (was {}x{})",
                                     crop_l, crop_t, crop_r, crop_b, cw, ch, frame_w, frame_h
                                 );
                                 let cropped = crop_and_upscale(
@@ -7330,15 +7555,26 @@ fn igbp_handle_transact(
                             read_size
                         );
                     }
+                    kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
+                        let _ = bq.release(slot);
+                    });
                 } else {
                     log::warn!(
                         "QueueBuffer: no nvmap candidate for size {} (slot {})",
                         linear_size,
                         slot
                     );
+                    kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
+                        let _ = bq.release(slot);
+                    });
                 }
             } else {
                 log::warn!("QueueBuffer: slot {} has no GraphicBuffer", slot);
+                if slot_acquired {
+                    kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
+                        let _ = bq.release(slot);
+                    });
+                }
             }
 
             let _ = swap_interval;
@@ -7353,6 +7589,54 @@ fn igbp_handle_transact(
         }
         IGBP_CANCEL_BUFFER => {
             let slot = reader.read_i32().unwrap_or(0).max(0) as u32;
+            let flattened_size = reader.read_u64().unwrap_or(0);
+            let fence_count_raw = reader.read_i32().unwrap_or(-1);
+            let fence_count = fence_count_raw.clamp(0, 4) as u32;
+            let mut cancel_fences = Vec::with_capacity(fence_count as usize);
+            for index in 0..4 {
+                let syncpt_id = reader.read_u32().unwrap_or(u32::MAX);
+                let threshold = reader.read_u32().unwrap_or(0);
+                if index < fence_count && syncpt_id != u32::MAX {
+                    cancel_fences.push((syncpt_id, threshold));
+                }
+            }
+            if (flattened_size != 0 && flattened_size != 0x24)
+                || !(0..=4).contains(&fence_count_raw)
+            {
+                log::warn!(
+                    "IGBP::CancelBuffer malformed fence binder={} slot={} size={:#x} count={}",
+                    binder_id,
+                    slot,
+                    flattened_size,
+                    fence_count_raw
+                );
+                let mut p = ParcelBuilder::new();
+                p.write_u32((-22i32) as u32);
+                return p.finish();
+            }
+            let mut cancel_fences_ready = true;
+            for (syncpt_id, threshold) in cancel_fences {
+                let started = std::time::Instant::now();
+                while !kernel.nvdrv.is_syncpoint_reached(syncpt_id, threshold) {
+                    if started.elapsed() >= std::time::Duration::from_secs(3) {
+                        cancel_fences_ready = false;
+                        log::error!(
+                            "IGBP::CancelBuffer fence timeout binder={} slot={} syncpt={} threshold={}",
+                            binder_id,
+                            slot,
+                            syncpt_id,
+                            threshold
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            }
+            if !cancel_fences_ready {
+                let mut p = ParcelBuilder::new();
+                p.write_u32((-110i32) as u32);
+                return p.finish();
+            }
             kernel
                 .nvdrv
                 .with_bufferqueue(binder_id, |bq| bq.cancel(slot));
@@ -7372,7 +7656,7 @@ fn igbp_handle_transact(
                 3 => 2,
                 _ => 0,
             };
-            log::debug!("IGBP::Query what={} → {}", what, value);
+            log::debug!("IGBP::Query what={} â†’ {}", what, value);
             let mut p = ParcelBuilder::new();
             p.write_u32(value as u32);
             p.write_u32(0);
@@ -8264,6 +8548,66 @@ fn parse_flattened_graphic_buffer(
     })
 }
 
+fn deferred_ctrl_wait_event_id(
+    ioctl_cmd: u16,
+    ioctl_result: u32,
+    input_event_id: Option<u32>,
+    output: &[u8],
+) -> Option<u32> {
+    if ioctl_result != 5 {
+        return None;
+    }
+
+    match ioctl_cmd {
+        0x001d => output
+            .get(12..16)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())),
+        0x001e => input_event_id,
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod ctrl_wait_event_tests {
+    use super::deferred_ctrl_wait_event_id;
+
+    #[test]
+    fn allocation_wait_uses_returned_event_id() {
+        let event_id = 0x102a_0017u32;
+        let mut output = [0u8; 16];
+        output[12..16].copy_from_slice(&event_id.to_le_bytes());
+
+        assert_eq!(
+            deferred_ctrl_wait_event_id(0x001d, 5, Some(0xdead_beef), &output),
+            Some(event_id)
+        );
+    }
+
+    #[test]
+    fn async_wait_uses_input_event_id() {
+        assert_eq!(
+            deferred_ctrl_wait_event_id(0x001e, 5, Some(23), &[]),
+            Some(23)
+        );
+    }
+
+    #[test]
+    fn successful_or_malformed_wait_does_not_arm_an_event() {
+        assert_eq!(
+            deferred_ctrl_wait_event_id(0x001d, 0, Some(7), &[0u8; 16]),
+            None
+        );
+        assert_eq!(
+            deferred_ctrl_wait_event_id(0x001d, 5, Some(7), &[0u8; 15]),
+            None
+        );
+        assert_eq!(
+            deferred_ctrl_wait_event_id(0x001e, 5, None, &[0u8; 16]),
+            None
+        );
+    }
+}
+
 fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name: &str) -> Vec<u8> {
     let cmd_id = ctx.cmif_in.cmd_id;
     log::trace!("nvdrv:{}.cmd_{}", port_name, cmd_id);
@@ -8321,6 +8665,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             } else {
                 0
             };
+            let ioctl_cmd = (ioctl_id & 0xFFFF) as u16;
 
             let in_srcs: Vec<_> = ctx
                 .send_buffers
@@ -8373,7 +8718,6 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                         .collect::<Vec<_>>()
                 );
             }
-            let ioctl_cmd = (ioctl_id & 0xFFFF) as u16;
             if ioctl_cmd == 0x4808 || ioctl_cmd == 0x481b {
                 log::trace!(
                     "nvdrv:SubmitGPFIFO ioctl cmd_id={} fd={} ioctl={:#x} in={} inline={} recv={:?}",
@@ -8388,6 +8732,9 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
 
             let ctrl_event_id_in = in_data
                 .get(12..16)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+            let ctrl_cancel_id_in = in_data
+                .get(0..4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
             let req = nexium_nvdrv::IoctlRequest {
                 fd,
@@ -8450,10 +8797,13 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                 }
             }
 
-            if kernel.nvdrv.device_for_fd(fd) == Some(nexium_nvdrv::NvDevice::NvhostCtrl)
-                && ioctl_cmd == 0x001e
-            {
-                if let Some(event_id) = ctrl_event_id_in {
+            if kernel.nvdrv.device_for_fd(fd) == Some(nexium_nvdrv::NvDevice::NvhostCtrl) {
+                if let Some(event_id) = deferred_ctrl_wait_event_id(
+                    ioctl_cmd,
+                    outcome.result,
+                    ctrl_event_id_in,
+                    &outcome.data,
+                ) {
                     if crate::kernel::Kernel::fence_profile_enabled() {
                         use std::sync::atomic::{AtomicU64, Ordering};
                         static TRACKED: AtomicU64 = AtomicU64::new(0);
@@ -8490,11 +8840,23 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                             kernel.event_signals.insert(handle, true);
                             kernel.threads.signal_handle(handle);
                         } else {
+                            kernel.event_signals.insert(handle, false);
                             kernel
                                 .gpu_fence_events
                                 .insert(handle, (wait.syncpt_id, wait.threshold));
                             kernel.record_fence_armed(handle);
                         }
+                    }
+                }
+            }
+
+            if kernel.nvdrv.device_for_fd(fd) == Some(nexium_nvdrv::NvDevice::NvhostCtrl)
+                && ioctl_cmd == 0x001c
+            {
+                if let Some(event_id) = ctrl_cancel_id_in {
+                    if let Some(&handle) = kernel.gpu_event_tokens.get(&(fd, event_id & 0xFF)) {
+                        kernel.gpu_fence_events.remove(&handle);
+                        kernel.event_signals.insert(handle, false);
                     }
                 }
             }
@@ -8516,7 +8878,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                     kernel.event_signals.insert(fh, true);
                     kernel.threads.signal_handle(fh);
                     log::debug!(
-                        "nvdrv:SubmitGPFIFO → signaling gpu_fence_event handle={:#x}",
+                        "nvdrv:SubmitGPFIFO â†’ signaling gpu_fence_event handle={:#x}",
                         fh
                     );
                 }
@@ -8598,7 +8960,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                     kernel.record_fence_armed(h);
                 }
                 log::debug!(
-                    "nvdrv:QueryEvent fd={} event_id={:#x} (nvhost-ctrl) → fence event handle={:#x} signaled={}",
+                    "nvdrv:QueryEvent fd={} event_id={:#x} (nvhost-ctrl) â†’ fence event handle={:#x} signaled={}",
                     fd,
                     event_id,
                     h,
@@ -8607,7 +8969,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
             } else {
                 kernel.event_signals.insert(h, false);
                 log::debug!(
-                    "nvdrv:QueryEvent fd={} event_id={:#x} → event handle={:#x} (unsignaled)",
+                    "nvdrv:QueryEvent fd={} event_id={:#x} â†’ event handle={:#x} (unsignaled)",
                     fd,
                     event_id,
                     h
@@ -8712,13 +9074,13 @@ pub(crate) fn return_subsession(
         .unwrap_or(false);
     if is_domain {
         let object_id = alloc_domain_object(kernel, session_handle, sub_service);
-        log::debug!("→ {} sub-object id={}", sub_service, object_id);
+        log::debug!("â†’ {} sub-object id={}", sub_service, object_id);
         build_ipc_response_full(ctx, 0, &[], &[], &[], &[object_id])
     } else {
         let h = kernel.handles.create_handle(HandleType::Session);
         let session = Session::new(h, sub_service.to_string());
         kernel.sessions.insert(h, session);
-        log::debug!("→ {} sub-session handle={:#x}", sub_service, h);
+        log::debug!("â†’ {} sub-session handle={:#x}", sub_service, h);
         build_ipc_response(ctx, 0, &[], &[h])
     }
 }
@@ -9203,6 +9565,7 @@ fn svc_clear_event(kernel: &mut Kernel) -> u32 {
         0
     };
     kernel.event_signals.insert(handle, false);
+    kernel.refresh_bufferqueue_event(handle);
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, SUCCESS as u64);
     }
@@ -9220,6 +9583,9 @@ fn svc_reset_signal(kernel: &mut Kernel) -> u32 {
         Some(entry) if entry.handle_type == HandleType::Event
     );
     let result = reset_event_signal(&mut kernel.event_signals, is_event, handle);
+    if result == SUCCESS {
+        kernel.refresh_bufferqueue_event(handle);
+    }
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, result as u64);
     }
@@ -9238,14 +9604,26 @@ fn svc_wait_for_address(kernel: &mut Kernel) -> u32 {
         return 1;
     };
 
-    let mut buf = [0u8; 4];
-    let read_ok = kernel.address_space.read(addr, &mut buf).is_ok();
-    let current = u32::from_le_bytes(buf);
-
-    let should_wait = match arb_type {
-        0 | 1 => current < value,
-        2 => current == value,
-        _ => false,
+    let (read_ok, current, should_wait) = loop {
+        let Ok(current) = kernel.address_space.atomic_load_u32(addr) else {
+            break (false, 0, false);
+        };
+        let should_wait = match arb_type {
+            0 | 1 => (current as i32) < (value as i32),
+            2 => current == value,
+            _ => false,
+        };
+        if arb_type == 1 && should_wait {
+            match kernel
+                .address_space
+                .atomic_cas_u32(addr, current, current.wrapping_sub(1))
+            {
+                Ok(true) => break (true, current, true),
+                Ok(false) => continue,
+                Err(_) => break (false, current, false),
+            }
+        }
+        break (true, current, should_wait);
     };
     let trace_arbiter = std::env::var_os("NEXIUM_ARBITER_TRACE").is_some();
     if trace_arbiter {
@@ -9267,12 +9645,6 @@ fn svc_wait_for_address(kernel: &mut Kernel) -> u32 {
             cpu.set_register(0, KERNEL_INVALID_STATE as u64);
         }
         return KERNEL_INVALID_STATE;
-    }
-
-    if arb_type == 1 {
-        let _ = kernel
-            .address_space
-            .write(addr, &current.wrapping_sub(1).to_le_bytes());
     }
 
     const KERNEL_TIMEOUT: u32 = 1 | (117 << 9);
@@ -9348,23 +9720,20 @@ fn svc_signal_to_address(kernel: &mut Kernel) -> u32 {
     match signal_type {
         0 => {}
         1 => {
-            if current != value {
+            let ok = matches!(
+                kernel
+                    .address_space
+                    .atomic_cas_u32(addr, value, value.wrapping_add(1)),
+                Ok(true)
+            );
+            if !ok {
                 if let Some(cpu) = cpu_mut() {
                     cpu.set_register(0, KERNEL_INVALID_STATE as u64);
                 }
                 return KERNEL_INVALID_STATE;
             }
-            let _ = kernel
-                .address_space
-                .write(addr, &current.wrapping_add(1).to_le_bytes());
         }
         2 => {
-            if current != value {
-                if let Some(cpu) = cpu_mut() {
-                    cpu.set_register(0, KERNEL_INVALID_STATE as u64);
-                }
-                return KERNEL_INVALID_STATE;
-            }
             let waiters = kernel
                 .threads
                 .threads
@@ -9386,7 +9755,16 @@ fn svc_signal_to_address(kernel: &mut Kernel) -> u32 {
             } else {
                 value
             };
-            let _ = kernel.address_space.write(addr, &new_value.to_le_bytes());
+            let ok = matches!(
+                kernel.address_space.atomic_cas_u32(addr, value, new_value),
+                Ok(true)
+            );
+            if !ok {
+                if let Some(cpu) = cpu_mut() {
+                    cpu.set_register(0, KERNEL_INVALID_STATE as u64);
+                }
+                return KERNEL_INVALID_STATE;
+            }
         }
         _ => {}
     }
@@ -9575,7 +9953,7 @@ fn svc_connect_to_named_port(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_get_info(kernel: &mut Kernel) -> u32 {
-    let (info_type, _handle, _sub) = if let Some(cpu) = cpu_ref() {
+    let (info_type, handle, sub) = if let Some(cpu) = cpu_ref() {
         (
             cpu.get_register(1) as u32,
             cpu.get_register(2),
@@ -9586,7 +9964,23 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
     };
 
     let val: u64 = match info_type {
-        0 => 0xF,
+        0 => {
+            if sub != 0 {
+                if let Some(cpu) = cpu_mut() {
+                    cpu.set_register(1, 0);
+                    cpu.set_register(0, KERNEL_INVALID_ENUM_VALUE as u64);
+                }
+                return KERNEL_INVALID_ENUM_VALUE;
+            }
+            if handle as u32 != 0xFFFF8001 && handle as u32 != kernel.process_handle {
+                if let Some(cpu) = cpu_mut() {
+                    cpu.set_register(1, 0);
+                    cpu.set_register(0, KERNEL_INVALID_HANDLE as u64);
+                }
+                return KERNEL_INVALID_HANDLE;
+            }
+            0xF
+        }
         1 => 0x0001_0000_0000,
         2 => kernel.alias_base,
         3 => kernel.alias_size,
@@ -9647,7 +10041,7 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         41 => 0,
         _ => {
             log::warn!(
-                "svcGetInfo: unsupported type {} — returning InvalidEnumValue (0xF001)",
+                "svcGetInfo: unsupported type {} â€” returning InvalidEnumValue (0xF001)",
                 info_type
             );
             if let Some(cpu) = cpu_mut() {
@@ -9758,7 +10152,7 @@ fn svc_map_physical_memory(kernel: &mut Kernel) -> u32 {
     }
 
     log::trace!(
-        "svcMapPhysicalMemory addr={:#x} size={:#x} → {} new region(s)",
+        "svcMapPhysicalMemory addr={:#x} size={:#x} â†’ {} new region(s)",
         addr,
         size,
         gaps.len()
@@ -9840,7 +10234,7 @@ fn svc_create_transfer_memory(kernel: &mut Kernel) -> u32 {
     };
     let handle = kernel.handles.create_handle(HandleType::TransferMemory);
     log::debug!(
-        "svcCreateTransferMemory addr={:#x} size={:#x} perm={:#x} → handle={:#x}",
+        "svcCreateTransferMemory addr={:#x} size={:#x} perm={:#x} â†’ handle={:#x}",
         addr,
         size,
         perm,
@@ -9875,6 +10269,9 @@ fn svc_close_handle(kernel: &mut Kernel) -> u32 {
         crate::services::audio_out::handlers::close_audio_out_session(kernel, handle);
         kernel.sessions.remove(&handle);
     }
+    if kernel.bufferqueue_events.remove(&handle).is_some() {
+        kernel.event_signals.remove(&handle);
+    }
     if let Some(closed) = kernel.handles.close_handle(handle) {
         if closed.handle_type == HandleType::Thread {
             kernel.exited_thread_handles.remove(&handle);
@@ -9884,6 +10281,29 @@ fn svc_close_handle(kernel: &mut Kernel) -> u32 {
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
+}
+
+fn active_core_count() -> i32 {
+    if std::env::var("NEXIUM_SINGLECORE").is_ok() {
+        1
+    } else {
+        std::env::var("NEXIUM_CPU_CORES")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(crate::kernel::threads::NUM_CORES as i32)
+            .clamp(1, crate::kernel::threads::NUM_CORES as i32)
+    }
+}
+
+fn resolve_thread_pseudo_handle(kernel: &Kernel, handle: u32) -> u32 {
+    if handle == 0xFFFF8000 {
+        kernel
+            .threads
+            .current_handle()
+            .unwrap_or(kernel.main_thread_handle)
+    } else {
+        handle
+    }
 }
 
 fn svc_create_thread(kernel: &mut Kernel) -> u32 {
@@ -9899,6 +10319,36 @@ fn svc_create_thread(kernel: &mut Kernel) -> u32 {
         return 1;
     };
 
+    let ideal_core =
+        match crate::kernel::threads::resolve_create_thread_core(core, kernel.process_ideal_core) {
+            Ok(resolved) => resolved,
+            Err(code) => {
+                log::warn!(
+                    "svcCreateThread entry={:#x} rejected invalid core {}",
+                    entry,
+                    core
+                );
+                if let Some(cpu) = cpu_mut() {
+                    cpu.set_register(1, 0);
+                    cpu.set_register(0, code as u64);
+                }
+                return code;
+            }
+        };
+
+    if !(0..=63).contains(&priority) {
+        log::warn!(
+            "svcCreateThread entry={:#x} rejected invalid priority {}",
+            entry,
+            priority
+        );
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(1, 0);
+            cpu.set_register(0, KERNEL_INVALID_PRIORITY as u64);
+        }
+        return KERNEL_INVALID_PRIORITY;
+    }
+
     let handle = kernel
         .handles
         .create_handle(crate::kernel::handles::HandleType::Thread);
@@ -9913,27 +10363,19 @@ fn svc_create_thread(kernel: &mut Kernel) -> u32 {
     kernel.threads.add_thread(handle, ctx, tls_va, sp, arg);
     if let Some(t) = kernel.threads.threads.get_mut(&handle) {
         t.priority = priority;
-        let active_cores = if std::env::var("NEXIUM_SINGLECORE").is_ok() {
-            1
-        } else {
-            std::env::var("NEXIUM_CPU_CORES")
-                .ok()
-                .and_then(|v| v.parse::<i32>().ok())
-                .unwrap_or(crate::kernel::threads::NUM_CORES as i32)
-                .clamp(1, crate::kernel::threads::NUM_CORES as i32)
-        };
-        if (0..active_cores).contains(&core) {
-            t.core = core;
-        }
+        t.ideal_core = ideal_core;
+        t.affinity_mask = 1u64 << ideal_core;
+        t.core = ideal_core.min(active_core_count() - 1);
     }
 
     log::debug!(
-        "svcCreateThread entry={:#x} arg={:#x} sp={:#x} prio={} core={} -> handle={:#x} tls={:#x}",
+        "svcCreateThread entry={:#x} arg={:#x} sp={:#x} prio={} core={} ideal={} -> handle={:#x} tls={:#x}",
         entry,
         arg,
         sp,
         priority,
         core,
+        ideal_core,
         handle,
         tls_va
     );
@@ -9951,21 +10393,43 @@ fn svc_start_thread(kernel: &mut Kernel) -> u32 {
     } else {
         return 1;
     };
-    log::debug!("svcStartThread handle={:#x}", handle);
-    kernel
-        .threads
-        .transition_state(handle, crate::kernel::threads::ThreadState::Ready);
+    let code = match kernel.threads.threads.get(&handle).map(|t| &t.state) {
+        Some(crate::kernel::threads::ThreadState::Created) => {
+            kernel
+                .threads
+                .transition_state(handle, crate::kernel::threads::ThreadState::Ready);
+            SUCCESS
+        }
+        Some(_) => KERNEL_INVALID_THREAD_STATE,
+        None if kernel.exited_thread_handles.contains_key(&handle) => KERNEL_INVALID_THREAD_STATE,
+        None => KERNEL_INVALID_HANDLE,
+    };
+    log::debug!("svcStartThread handle={:#x} -> {:#x}", handle, code);
     if let Some(cpu) = cpu_mut() {
-        cpu.set_register(0, SUCCESS as u64);
+        cpu.set_register(0, code as u64);
     }
-    SUCCESS
+    code
 }
 
 fn svc_exit_thread(kernel: &mut Kernel) -> u32 {
     let current = kernel.threads.current_handle();
     log::debug!("svcExitThread current={:?}", current);
     if let Some(handle) = current {
-        kernel.exited_thread_handles.insert(handle);
+        let state = kernel
+            .threads
+            .threads
+            .get(&handle)
+            .map(|t| crate::kernel::ExitedThreadState {
+                ideal_core: t.ideal_core,
+                affinity_mask: t.affinity_mask,
+                priority: t.priority,
+            })
+            .unwrap_or(crate::kernel::ExitedThreadState {
+                ideal_core: kernel.process_ideal_core,
+                affinity_mask: 1u64 << kernel.process_ideal_core,
+                priority: 0x2C,
+            });
+        kernel.exited_thread_handles.insert(handle, state);
         kernel.threads.signal_handle(handle);
     }
     if let Some(cpu) = cpu_ref() {
@@ -10018,12 +10482,22 @@ fn svc_get_thread_priority(kernel: &mut Kernel) -> u32 {
     } else {
         return 1;
     };
-    let prio = kernel
-        .threads
-        .threads
-        .get(&handle)
-        .map(|t| t.priority)
-        .unwrap_or(0x2C);
+    let target = resolve_thread_pseudo_handle(kernel, handle);
+    let prio = if kernel.threads.threads.contains_key(&target) {
+        Some(kernel.threads.effective_priority(target))
+    } else {
+        kernel
+            .exited_thread_handles
+            .get(&target)
+            .map(|t| t.priority)
+    };
+    let Some(prio) = prio else {
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(1, 0);
+            cpu.set_register(0, KERNEL_INVALID_HANDLE as u64);
+        }
+        return KERNEL_INVALID_HANDLE;
+    };
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(1, prio as u64);
         cpu.set_register(0, SUCCESS as u64);
@@ -10037,35 +10511,98 @@ fn svc_set_thread_priority(kernel: &mut Kernel) -> u32 {
     } else {
         return 1;
     };
-    if let Some(t) = kernel.threads.threads.get_mut(&handle) {
-        t.priority = priority;
-    }
+    let code = if !(0..=63).contains(&priority) {
+        KERNEL_INVALID_PRIORITY
+    } else {
+        let target = resolve_thread_pseudo_handle(kernel, handle);
+        if let Some(t) = kernel.threads.threads.get_mut(&target) {
+            t.priority = priority;
+            SUCCESS
+        } else if kernel.exited_thread_handles.contains_key(&target) {
+            SUCCESS
+        } else {
+            KERNEL_INVALID_HANDLE
+        }
+    };
     if let Some(cpu) = cpu_mut() {
-        cpu.set_register(0, SUCCESS as u64);
+        cpu.set_register(0, code as u64);
     }
-    SUCCESS
+    code
 }
 
 fn svc_get_thread_core_mask(kernel: &mut Kernel) -> u32 {
-    let handle = cpu_ref().map(|cpu| cpu.get_register(0) as u32);
-    let core = handle
-        .and_then(|h| kernel.threads.threads.get(&h))
-        .map(|t| t.core)
-        .filter(|core| (0..crate::kernel::threads::NUM_CORES as i32).contains(core))
-        .unwrap_or(0) as u64;
+    let handle = if let Some(cpu) = cpu_ref() {
+        cpu.get_register(2) as u32
+    } else {
+        return 1;
+    };
+    let target = resolve_thread_pseudo_handle(kernel, handle);
+    let Some((ideal_core, affinity_mask)) = kernel.threads.thread_core_mask(target).or_else(|| {
+        kernel
+            .exited_thread_handles
+            .get(&target)
+            .map(|t| (t.ideal_core, t.affinity_mask))
+    }) else {
+        if let Some(cpu) = cpu_mut() {
+            cpu.set_register(1, 0);
+            cpu.set_register(2, 0);
+            cpu.set_register(0, KERNEL_INVALID_HANDLE as u64);
+        }
+        return KERNEL_INVALID_HANDLE;
+    };
     if let Some(cpu) = cpu_mut() {
-        cpu.set_register(1, core);
-        cpu.set_register(2, 0xF);
+        cpu.set_register(1, ideal_core as u32 as u64);
+        cpu.set_register(2, affinity_mask);
         cpu.set_register(0, SUCCESS as u64);
     }
     SUCCESS
 }
 
-fn svc_set_thread_core_mask(_kernel: &mut Kernel) -> u32 {
-    if let Some(cpu) = cpu_mut() {
-        cpu.set_register(0, SUCCESS as u64);
+fn svc_set_thread_core_mask(kernel: &mut Kernel) -> u32 {
+    let (handle, core_id, affinity_mask) = if let Some(cpu) = cpu_ref() {
+        (
+            cpu.get_register(0) as u32,
+            cpu.get_register(1) as u32 as i32,
+            cpu.get_register(2),
+        )
+    } else {
+        return 1;
+    };
+    let target = resolve_thread_pseudo_handle(kernel, handle);
+    let mut result = kernel.threads.set_thread_core_mask(
+        target,
+        core_id,
+        affinity_mask,
+        kernel.process_ideal_core,
+        active_core_count(),
+    );
+    if result == Err(KERNEL_INVALID_HANDLE) {
+        if let Some(t) = kernel.exited_thread_handles.get(&target) {
+            result = if core_id == crate::kernel::threads::IDEAL_CORE_NO_UPDATE
+                && t.ideal_core >= 0
+                && affinity_mask & (1u64 << t.ideal_core) == 0
+            {
+                Err(nexium_common::result::KERNEL_INVALID_COMBINATION)
+            } else {
+                Ok(())
+            };
+        }
     }
-    SUCCESS
+    log::info!(
+        "svcSetThreadCoreMask handle={:#x} core={} mask={:#x} -> {:?}",
+        handle,
+        core_id,
+        affinity_mask,
+        result
+    );
+    let code = match result {
+        Ok(()) => SUCCESS,
+        Err(code) => code,
+    };
+    if let Some(cpu) = cpu_mut() {
+        cpu.set_register(0, code as u64);
+    }
+    code
 }
 
 fn svc_get_current_processor_number(_kernel: &mut Kernel) -> u32 {
@@ -10240,7 +10777,7 @@ fn svc_reply_and_receive_light(kernel: &mut Kernel) -> u32 {
 }
 
 fn svc_reply_and_receive(_kernel: &mut Kernel) -> u32 {
-    log::debug!("svcReplyAndReceive (stub → TIMEOUT)");
+    log::debug!("svcReplyAndReceive (stub â†’ TIMEOUT)");
     const KERNEL_TIMEOUT: u32 = 1 | (117 << 9);
     if let Some(cpu) = cpu_mut() {
         cpu.set_register(0, KERNEL_TIMEOUT as u64);
@@ -10432,21 +10969,6 @@ fn fs_sd_root(kernel: &mut Kernel) -> Option<std::path::PathBuf> {
         kernel.sd_root = Some(root);
     }
     kernel.sd_root.clone()
-}
-
-fn present_buffers_share_nvmap(binder_id: u32, nvmap_id: u32) -> bool {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashMap<u32, (u32, bool)>>> = OnceLock::new();
-    let mut map = SEEN
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
-    let entry = map.entry(binder_id).or_insert((nvmap_id, true));
-    if entry.0 != nvmap_id {
-        entry.1 = false;
-    }
-    entry.1
 }
 
 fn fs_save_data_root(kernel: &Kernel, ctx: &ipc::IpcCtx) -> Option<std::path::PathBuf> {

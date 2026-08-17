@@ -148,6 +148,9 @@ pub fn dump_heartbeat_with_kernel(kernel: &crate::kernel::Kernel) {
         if kernel.vsync_handles.contains(h) {
             tags.push("vsync");
         }
+        if kernel.bufferqueue_events.contains_key(h) {
+            tags.push("bufferqueue");
+        }
         if Some(*h) == kernel.applet_message_event {
             tags.push("applet_msg");
         }

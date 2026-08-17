@@ -198,5 +198,5 @@ service IManagerDisplayService as manager_display_service {
 
 service IHOSBinderDriver as binder_driver {
     [1] AdjustRefcount();
-    [2] GetNativeHandle() -> out_handle;
+    [2] GetNativeHandle(i32 binder_id, u32 type_id) -> out_handle;
 }

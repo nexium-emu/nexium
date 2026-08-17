@@ -413,6 +413,18 @@ impl BootContext {
                 "disabled"
             }
         );
+        kernel.process_ideal_core = (app.npdm.main_thread_core as i32)
+            .clamp(0, crate::kernel::threads::NUM_CORES as i32 - 1);
+        if let Some(main) = kernel.threads.threads.get_mut(&kernel.main_thread_handle) {
+            main.ideal_core = kernel.process_ideal_core;
+            main.affinity_mask = 1u64 << kernel.process_ideal_core;
+            main.priority = app.npdm.main_thread_priority as i32;
+        }
+        log::info!(
+            "npdm main_thread_core={} main_thread_priority={} (process ideal core)",
+            kernel.process_ideal_core,
+            app.npdm.main_thread_priority
+        );
 
         nexium_common::paths::init();
 

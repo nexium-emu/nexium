@@ -31,7 +31,7 @@ pub struct Kernel {
     hid_mapped_host_ptr: Option<usize>,
     pub sessions: HashMap<u32, session::Session>,
     pub event_signals: HashMap<u32, bool>,
-    pub exited_thread_handles: HashSet<u32>,
+    pub exited_thread_handles: HashMap<u32, ExitedThreadState>,
     pub pending_condvar_signals: HashMap<u64, u32>,
     pub audio_render_condvar: Option<u64>,
     pub tls_buffer: [u8; 0x100],
@@ -65,15 +65,18 @@ pub struct Kernel {
 
     pub process_handle: u32,
     pub main_thread_handle: u32,
+    pub process_ideal_core: i32,
 
     pub applet_messages: VecDeque<u32>,
     pub applet_message_event: Option<u32>,
     pub vsync_handles: HashSet<u32>,
+    pub bufferqueue_swap_intervals: HashMap<u32, i32>,
+    pub bufferqueue_events: HashMap<u32, u32>,
+    bufferqueue_event_generation: u64,
     pub nvdrv_sync_events: HashSet<u32>,
     pub gpu_fence_events: HashMap<u32, (u32, u32)>,
     pub gpu_fence_armed: HashMap<u32, std::time::Instant>,
     pub gpu_event_tokens: HashMap<(u32, u32), u32>,
-    pub last_vsync: std::time::Instant,
     pub last_hid_tick: std::time::Instant,
     pub last_generic_svc_imm: u16,
     pub last_generic_svc_lr: u64,
@@ -130,6 +133,13 @@ pub struct Kernel {
     pub audio_renderer_last_tick: std::time::Instant,
     pub audio_renderer_last_consumed: u64,
     pub hwopus_decoders: HashMap<(u32, u32), crate::services::hwopus::DecoderState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ExitedThreadState {
+    pub ideal_core: i32,
+    pub affinity_mask: u64,
+    pub priority: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -231,7 +241,7 @@ impl Kernel {
             hid_mapped_host_ptr: None,
             sessions: HashMap::new(),
             event_signals: HashMap::new(),
-            exited_thread_handles: HashSet::new(),
+            exited_thread_handles: HashMap::new(),
             pending_condvar_signals: HashMap::new(),
             audio_render_condvar: None,
             tls_buffer: [0u8; 0x100],
@@ -261,14 +271,17 @@ impl Kernel {
             vsync_poll_count: 0,
             process_handle,
             main_thread_handle,
+            process_ideal_core: 0,
             applet_messages: VecDeque::new(),
             applet_message_event: None,
             vsync_handles: HashSet::new(),
+            bufferqueue_swap_intervals: HashMap::new(),
+            bufferqueue_events: HashMap::new(),
+            bufferqueue_event_generation: 0,
             nvdrv_sync_events: HashSet::new(),
             gpu_fence_events: HashMap::new(),
             gpu_fence_armed: HashMap::new(),
             gpu_event_tokens: HashMap::new(),
-            last_vsync: std::time::Instant::now(),
             last_hid_tick: std::time::Instant::now(),
             last_generic_svc_imm: 0xFFFF,
             last_generic_svc_lr: 0,
@@ -453,6 +466,9 @@ impl Kernel {
         }
         if self.vsync_handles.contains(&handle) {
             tags.push("vsync");
+        }
+        if self.bufferqueue_events.contains_key(&handle) {
+            tags.push("bufferqueue");
         }
         if self.nvdrv_sync_events.contains(&handle) {
             tags.push("nvdrv_sync");
@@ -645,6 +661,50 @@ impl Kernel {
         }
     }
 
+    fn set_bufferqueue_event_level(&mut self, handle: u32, signaled: bool) {
+        let was_signaled = self.event_signals.insert(handle, signaled).unwrap_or(false);
+        if signaled && !was_signaled {
+            self.threads.signal_handle(handle);
+        }
+    }
+
+    pub fn register_bufferqueue_event(&mut self, handle: u32, binder_id: u32) {
+        self.bufferqueue_events.insert(handle, binder_id);
+        self.event_signals.insert(handle, false);
+        self.refresh_bufferqueue_event(handle);
+    }
+
+    pub fn refresh_bufferqueue_event(&mut self, handle: u32) {
+        let Some(&binder_id) = self.bufferqueue_events.get(&handle) else {
+            return;
+        };
+        let signaled = self
+            .nvdrv
+            .with_bufferqueue(binder_id, |queue| queue.has_free_slot());
+        self.set_bufferqueue_event_level(handle, signaled);
+    }
+
+    pub fn refresh_bufferqueue_events(&mut self) {
+        let generation = self.nvdrv.bufferqueue_state_generation();
+        if generation == self.bufferqueue_event_generation {
+            return;
+        }
+
+        let events: Vec<(u32, u32)> = self
+            .bufferqueue_events
+            .iter()
+            .map(|(&handle, &binder_id)| (handle, binder_id))
+            .collect();
+        for (handle, binder_id) in events {
+            let signaled = self
+                .nvdrv
+                .with_bufferqueue(binder_id, |queue| queue.has_free_slot());
+            self.set_bufferqueue_event_level(handle, signaled);
+        }
+
+        self.bufferqueue_event_generation = generation;
+    }
+
     pub fn tick_audio_renderers(&mut self) {
         const FRAMES_PER_AUDIO_FRAME: u64 = 240;
         const MAX_BACKLOG_BLOCKS: u64 = 400;
@@ -821,6 +881,7 @@ impl Kernel {
     }
 
     pub fn wake_due_sleepers(&mut self, now: std::time::Instant) {
+        self.refresh_bufferqueue_events();
         self.drain_gpu_fence_events();
         let timed_out: Vec<(u32, u64, u64, bool)> = self
             .threads
@@ -881,9 +942,6 @@ impl Kernel {
                         tag: h,
                     },
                 );
-            }
-            if !self.threads.has_condvar_waiters(condvar_addr) {
-                let _ = self.address_space.write(condvar_addr, &0u32.to_le_bytes());
             }
         }
 
@@ -1312,10 +1370,14 @@ mod user_preemption_tests {
     const TEST_TLS: u64 = 0x10_0000;
 
     fn test_kernel(map_tls: bool) -> Kernel {
+        test_kernel_at(map_tls, TEST_TLS)
+    }
+
+    fn test_kernel_at(map_tls: bool, tls_base: u64) -> Kernel {
         let address_space = Arc::new(AddressSpace::new());
         if map_tls {
             address_space
-                .map(TEST_TLS, 0x1000, nexium_memory::Perm::RW, "test_tls")
+                .map(tls_base, 0x1000, nexium_memory::Perm::RW, "test_tls")
                 .unwrap();
         }
         Kernel::new(
@@ -1326,20 +1388,17 @@ mod user_preemption_tests {
             0x1000,
             0xa0_0000,
             0x1000,
-            TEST_TLS,
-            TEST_TLS + 0x1000,
+            tls_base,
+            tls_base + 0x1000,
         )
     }
 
     fn add_ready_core_zero_thread(kernel: &mut Kernel) {
         const READY_HANDLE: u32 = 0xfeed;
-        kernel.threads.add_thread(
-            READY_HANDLE,
-            threads::ThreadCtx::zero(),
-            TEST_TLS + 0x1000,
-            0,
-            0,
-        );
+        let ready_tls = kernel.tls_base + 0x1000;
+        kernel
+            .threads
+            .add_thread(READY_HANDLE, threads::ThreadCtx::zero(), ready_tls, 0, 0);
         kernel.threads.threads.get_mut(&READY_HANDLE).unwrap().core = 0;
         kernel
             .threads
@@ -1350,7 +1409,7 @@ mod user_preemption_tests {
         let mut bytes = [0u8; 2];
         kernel
             .address_space
-            .read(TEST_TLS + offset, &mut bytes)
+            .read(kernel.tls_base + offset, &mut bytes)
             .unwrap();
         u16::from_le_bytes(bytes)
     }
@@ -1362,7 +1421,7 @@ mod user_preemption_tests {
         kernel
             .address_space
             .write(
-                TEST_TLS + TLS_USER_DISABLE_COUNT_OFFSET,
+                kernel.tls_base + TLS_USER_DISABLE_COUNT_OFFSET,
                 &1u16.to_le_bytes(),
             )
             .unwrap();
@@ -1378,12 +1437,12 @@ mod user_preemption_tests {
 
     #[test]
     fn pending_survives_zero_count_until_svc36_clears_and_reschedules() {
-        let mut kernel = test_kernel(true);
+        let mut kernel = test_kernel_at(true, TEST_TLS + 0x2_0000);
         add_ready_core_zero_thread(&mut kernel);
         kernel
             .address_space
             .write(
-                TEST_TLS + TLS_USER_DISABLE_COUNT_OFFSET,
+                kernel.tls_base + TLS_USER_DISABLE_COUNT_OFFSET,
                 &1u16.to_le_bytes(),
             )
             .unwrap();
@@ -1392,7 +1451,7 @@ mod user_preemption_tests {
         kernel
             .address_space
             .write(
-                TEST_TLS + TLS_USER_DISABLE_COUNT_OFFSET,
+                kernel.tls_base + TLS_USER_DISABLE_COUNT_OFFSET,
                 &0u16.to_le_bytes(),
             )
             .unwrap();
@@ -1406,13 +1465,40 @@ mod user_preemption_tests {
 
     #[test]
     fn zero_count_and_unmapped_tls_fail_open() {
-        let mut mapped = test_kernel(true);
+        let mut mapped = test_kernel_at(true, TEST_TLS + 0x4_0000);
         assert!(!mapped.defer_user_preemption_if_disabled());
         assert!(!mapped.threads.current_user_preemption_pending());
 
         let mut unmapped = test_kernel(false);
         assert!(!unmapped.defer_user_preemption_if_disabled());
         assert!(!unmapped.threads.current_user_preemption_pending());
+    }
+
+    #[test]
+    fn bufferqueue_event_level_tracks_producer_availability() {
+        let mut kernel = test_kernel(false);
+        let handle = kernel.handles.create_handle(handles::HandleType::Event);
+        kernel.register_bufferqueue_event(handle, 7);
+        assert_eq!(kernel.event_signals.get(&handle), Some(&false));
+
+        kernel.nvdrv.with_bufferqueue(7, |queue| {
+            queue.set_preallocated(0, nexium_nvdrv::GraphicBuffer::default());
+        });
+        kernel.refresh_bufferqueue_events();
+        assert_eq!(kernel.event_signals.get(&handle), Some(&true));
+
+        assert_eq!(
+            kernel
+                .nvdrv
+                .with_bufferqueue(7, |queue| queue.try_dequeue()),
+            Some(0)
+        );
+        kernel.refresh_bufferqueue_events();
+        assert_eq!(kernel.event_signals.get(&handle), Some(&false));
+
+        assert!(kernel.nvdrv.with_bufferqueue(7, |queue| queue.cancel(0)));
+        kernel.refresh_bufferqueue_events();
+        assert_eq!(kernel.event_signals.get(&handle), Some(&true));
     }
 }
 
