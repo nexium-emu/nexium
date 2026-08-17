@@ -1139,10 +1139,16 @@ fn copy_even_rgba(dst: &mut [u8], dst_offset: usize, src: &[u8], a: usize, b: us
 pub(crate) fn async_blit_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
+        let requested = matches!(
             std::env::var("NEXIUM_FERMI_ASYNC_BLIT").ok().as_deref(),
             Some("1") | Some("true") | Some("on") | Some("yes")
-        )
+        );
+        if requested {
+            log::warn!(
+                "NEXIUM_FERMI_ASYNC_BLIT is quarantined: its planned image layouts are not Vulkan-safe"
+            );
+        }
+        false
     })
 }
 

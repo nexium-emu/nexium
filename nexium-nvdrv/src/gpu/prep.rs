@@ -96,6 +96,24 @@ fn bulk_compute_upload_enabled() -> bool {
     })
 }
 
+fn texture_cache_invalidate_clear_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        texture_cache_invalidate_clear_value_enabled(
+            std::env::var_os("NEXIUM_TIC_INVALIDATE_CLEAR").as_deref(),
+        )
+    })
+}
+
+fn texture_cache_invalidate_clear_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| {
+        !matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        )
+    })
+}
+
 fn nonterminal_inline_data_run_end(methods: &[(u32, u32, bool)], start: usize) -> usize {
     let mut end = start;
     while let Some(&(method, _, is_last)) = methods.get(end) {
@@ -183,6 +201,21 @@ pub(crate) struct PrepState {
 }
 
 impl PrepState {
+    pub(crate) fn schedule_kick_completion(&self, on_complete: Option<Box<dyn FnOnce() + Send>>) {
+        let Some(on_complete) = on_complete else {
+            return;
+        };
+        let Some(renderer) = self.renderer.clone() else {
+            on_complete();
+            return;
+        };
+        if !super::completion::submit_renderer_completion(renderer, on_complete) {
+            log::error!(
+                "[gpu-sync] failed to enqueue GPFIFO completion behind the renderer timeline"
+            );
+        }
+    }
+
     pub(crate) fn run_event(
         &mut self,
         event: PrepEvent,
@@ -238,9 +271,7 @@ impl PrepState {
                     }
                 }
                 self.end_ssbo_snapshot_epoch();
-                if let Some(on_complete) = on_complete {
-                    on_complete();
-                }
+                self.schedule_kick_completion(on_complete);
                 true
             }
             PrepEvent::Present {
@@ -440,11 +471,7 @@ impl PrepState {
                     self.flush_vk_soft(mappings, mem_read, mem_write);
                     let kp = kickprof::start();
                     if texture_invalidates != 0 {
-                        static CLEAR_ON_TIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        let clear_on_tic = *CLEAR_ON_TIC.get_or_init(|| {
-                            std::env::var_os("NEXIUM_TIC_INVALIDATE_CLEAR").is_some()
-                        });
-                        if clear_on_tic {
+                        if texture_cache_invalidate_clear_enabled() {
                             if let Some(r) = self.renderer.clone() {
                                 if let Some(rt) = crate::render_thread::maybe_render_thread() {
                                     self.flush_prepared_draw_packets();
@@ -579,14 +606,16 @@ impl PrepState {
                             } else {
                                 mem_write(cpu, &write.payload.to_le_bytes())
                             };
-                            log::trace!(
-                            "pusher: fence release gpu_va={:#x} cpu={:#x} payload={:#x} long={} write_ok={}",
-                            write.gpu_va,
-                            cpu,
-                            write.payload,
-                            write.long,
-                            ok
-                        );
+                            if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                                log::info!(
+                                    "[syncpt] fence release gpu_va={:#x} cpu={:#x} payload={:#x} long={} write_ok={}",
+                                    write.gpu_va,
+                                    cpu,
+                                    write.payload,
+                                    write.long,
+                                    ok
+                                );
+                            }
                             stats.fence_releases.fetch_add(1, AtomicOrdering::Relaxed);
                         } else {
                             log::warn!(
@@ -1003,6 +1032,21 @@ impl PrepState {
     }
 
     pub fn set_renderer(&mut self, r: Option<Arc<nexium_gpu::Renderer>>) {
+        let renderer_changed = match (&self.renderer, &r) {
+            (Some(current), Some(next)) => !Arc::ptr_eq(current, next),
+            (None, None) => false,
+            _ => true,
+        };
+        if renderer_changed {
+            self.pending_small_rt_wb = None;
+            let cleared = super::vk_dispatch::clear_pending_small_rt_writebacks();
+            if cleared != 0 {
+                log::debug!(
+                    "[rt-writeback] discarded {} stale target(s) after renderer change",
+                    cleared
+                );
+            }
+        }
         self.renderer = r;
     }
 
@@ -1047,6 +1091,9 @@ impl PrepState {
         mappings: &GpuMappings,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
     ) -> bool {
+        if !super::vk_dispatch::has_pending_small_rt_writebacks() {
+            return false;
+        }
         let kp_flush = super::pusher::kickprof::start();
         let flushed = self.flush_prepared_draw_packets();
         super::pusher::kickprof::add(super::pusher::kickprof::PRES_WB_FLUSH, kp_flush);
@@ -1259,14 +1306,11 @@ impl PrepState {
         let target = renderer.submitted_generation();
         let mut completed = renderer.wait_submit_generation(target, Duration::from_secs(3));
         if !completed {
-            completed = renderer.wait_idle_checked();
-            if !completed {
-                log::error!(
-                    "[gpu-sync] {} timeline and device-idle waits failed target={}",
-                    reason,
-                    target
-                );
-            }
+            log::error!(
+                "[gpu-sync] {} timeline wait failed target={}; device-idle fallback suppressed",
+                reason,
+                target
+            );
         }
         if completed && semrel_verify() {
             completed = renderer.wait_idle_checked();
@@ -1431,7 +1475,7 @@ fn fermi_lazy_drain_enabled() -> bool {
         matches!(
             std::env::var("NEXIUM_FERMI_LAZY_DRAIN").ok().as_deref(),
             Some("1") | Some("true") | Some("on") | Some("yes")
-        )
+        ) && super::experimental_gpu_scheduling_enabled()
     })
 }
 
@@ -1626,9 +1670,13 @@ fn prep_kicks_in_flight() -> usize {
 
 impl PrepThreadHandle {
     pub(crate) fn send(&self, event: PrepEvent) {
-        if self.tx.send(event).is_err() {
+        if self.send_recover(event).is_err() {
             log::error!("[gpu-prep] event dropped after prep thread exit");
         }
+    }
+
+    pub(crate) fn send_recover(&self, event: PrepEvent) -> Result<(), PrepEvent> {
+        self.tx.send(event).map_err(|error| error.0)
     }
 
     pub(crate) fn try_take_recycled_draw_vec(&self) -> Option<Vec<DrawCall>> {
@@ -1651,6 +1699,10 @@ impl PrepThreadHandle {
         let mut inflight = lock.lock().unwrap_or_else(|error| error.into_inner());
         *inflight = inflight.saturating_sub(1);
         condvar.notify_all();
+    }
+
+    pub(crate) fn cancel_kick(&self) {
+        Self::finish_kick(&self.inflight_kicks);
     }
 }
 
@@ -1782,9 +1834,7 @@ pub(crate) fn spawn_prep_thread(
                         state.vk_batch.clear();
                         state.ssbo_snapshot_cache.clear();
                     }
-                    if let Some(on_complete) = deferred_completion {
-                        on_complete();
-                    }
+                    state.schedule_kick_completion(deferred_completion);
                     if is_kick_end {
                         PrepThreadHandle::finish_kick(&worker_inflight);
                         prof_kicks += 1;
@@ -1851,7 +1901,8 @@ pub(crate) fn spawn_prep_thread(
 #[cfg(test)]
 mod tests {
     use super::{
-        nonterminal_inline_data_run_end, recycle_processed_draw_vec, try_receive_recycled_draw_vec,
+        nonterminal_inline_data_run_end, recycle_processed_draw_vec,
+        texture_cache_invalidate_clear_value_enabled, try_receive_recycled_draw_vec,
     };
     use crate::gpu::engines::maxwell3d::DrawCall;
 
@@ -1874,6 +1925,23 @@ mod tests {
             nonterminal_inline_data_run_end(&methods, methods.len()),
             methods.len()
         );
+    }
+
+    #[test]
+    fn texture_invalidates_do_not_destroy_persistent_images_by_default() {
+        use std::ffi::OsStr;
+
+        assert!(!texture_cache_invalidate_clear_value_enabled(None));
+        for disabled in ["", "0", "false", "OFF", " no "] {
+            assert!(!texture_cache_invalidate_clear_value_enabled(Some(
+                OsStr::new(disabled)
+            )));
+        }
+        for enabled in ["1", "true", "on", "yes"] {
+            assert!(texture_cache_invalidate_clear_value_enabled(Some(
+                OsStr::new(enabled)
+            )));
+        }
     }
 
     #[test]

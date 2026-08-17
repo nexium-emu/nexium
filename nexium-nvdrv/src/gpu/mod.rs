@@ -410,15 +410,60 @@ struct StubEngines {
     kepler_memory: KeplerMemory,
 }
 
+pub(crate) fn experimental_gpu_scheduling_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("NEXIUM_EXPERIMENTAL_GPU_SCHEDULING")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
+fn eager_small_rt_writeback_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+pub(crate) fn eager_small_rt_writeback_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = eager_small_rt_writeback_value_enabled(
+            std::env::var_os("NEXIUM_EAGER_SMALL_RT_WRITEBACK").as_deref(),
+        );
+        if enabled {
+            log::warn!(
+                "nexium-nvdrv: eager small render-target guest writeback enabled; GPU submissions will serialize"
+            );
+        } else {
+            log::info!(
+                "nexium-nvdrv: small render-target guest writeback is dependency-driven"
+            );
+        }
+        enabled
+    })
+}
+
 pub(crate) fn gpu_pipeline_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let on = matches!(
+        let requested = matches!(
             std::env::var("NEXIUM_GPU_PIPELINE").ok().as_deref(),
             Some("1") | Some("true") | Some("on") | Some("yes")
         );
+        let on = requested && experimental_gpu_scheduling_enabled();
         if on {
             log::info!("nexium-nvdrv: GPU decode|prep pipeline ENABLED");
+        } else if requested {
+            log::warn!(
+                "nexium-nvdrv: GPU decode|prep pipeline quarantined; developer opt-in requires NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1"
+            );
         }
         on
     })
@@ -491,17 +536,20 @@ impl GpuContext {
         &self,
         job: crate::render_thread::RenderJob,
         flush_small_rts: bool,
-    ) -> bool {
+    ) -> Result<(), crate::render_thread::RenderJob> {
         let mut pusher = self.pusher.lock();
         match &mut pusher.prep {
             prep::PrepLane::Threaded(handle) => {
-                handle.send(prep::PrepEvent::Present {
+                match handle.send_recover(prep::PrepEvent::Present {
                     job,
                     flush_small_rts,
-                });
-                true
+                }) {
+                    Ok(()) => Ok(()),
+                    Err(prep::PrepEvent::Present { job, .. }) => Err(job),
+                    Err(_) => unreachable!("prep present returned a different event"),
+                }
             }
-            prep::PrepLane::Inline(_) => false,
+            prep::PrepLane::Inline(_) => Err(job),
         }
     }
 
@@ -583,7 +631,7 @@ impl GpuContext {
             mem_write,
             mem_copy,
             true,
-            true,
+            eager_small_rt_writeback_enabled(),
             on_complete,
         )
     }
@@ -685,6 +733,7 @@ impl GpuContext {
                 &mem_read,
                 &mem_write,
                 &mem_copy,
+                writeback_small_rts,
                 on_complete,
             );
         } else if writeback_small_rts {
@@ -742,7 +791,7 @@ impl GpuContext {
             mem_write,
             mem_copy,
             true,
-            true,
+            eager_small_rt_writeback_enabled(),
             on_complete,
         )
     }
@@ -831,13 +880,78 @@ impl GpuContext {
         pusher.prep_kick_begin();
 
         let t_entries = std::time::Instant::now();
-        let addrs: Vec<u64> = entries.iter().map(|e| e.address()).collect();
-        for (i, entry) in entries.iter().enumerate() {
-            pusher.entry_word_limit = if entry.entry_count() > 4096 {
-                crate::gpu::pusher::nearest_forward_gap(&addrs, i)
-            } else {
-                0
-            };
+        let entries = pusher::repair_endform_entries(entries);
+        let entries = entries.as_slice();
+        let _addrs: Vec<u64> = entries.iter().map(|e| e.address()).collect();
+        if pusher::direct_forensics() && entries.iter().any(|e| e.entry_count() > 4096) {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                let raw: Vec<String> = entries
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "{:08x}:{:08x}(va={:#x},n={})",
+                            e.address_lo,
+                            e.address_hi_and_count,
+                            e.address(),
+                            e.entry_count()
+                        )
+                    })
+                    .collect();
+                log::warn!(
+                    "[el-dump] inline num_entries={} {}",
+                    entries.len(),
+                    raw.join(" ")
+                );
+                for entry in entries.iter().filter(|e| e.entry_count() > 4096).take(2) {
+                    let base = entry.address() & !0xF_FFFF;
+                    let cf = entry.entry_count() as u64;
+                    for (tag, probe) in [
+                        ("recs", base + cf.saturating_sub(0x30)),
+                        ("segva", entry.address().saturating_sub(0x20)),
+                    ] {
+                        let mut buf = vec![0u8; 0x120];
+                        pusher::read_gpu_scattered(&mappings, probe, &mut buf, &mem_read);
+                        let words: Vec<String> = buf
+                            .chunks_exact(4)
+                            .map(|c| {
+                                format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            })
+                            .collect();
+                        log::warn!(
+                            "[ctrl-dump] {} entry_va={:#x} cf={:#x} probe={:#x} map={:?} {}",
+                            tag,
+                            entry.address(),
+                            cf,
+                            probe,
+                            mappings
+                                .mapping_at(probe)
+                                .map(|(g, s, c)| { format!("gpu={:#x}+{:#x} cpu={:#x}", g, s, c) }),
+                            words.join(" ")
+                        );
+                    }
+                    let base = entry.address() & !0xF_FFFF;
+                    let mut cursor = base;
+                    let mut spans: Vec<String> = Vec::new();
+                    while cursor < base + 0x10_0000 && spans.len() < 16 {
+                        match mappings.mapping_at(cursor) {
+                            Some((g, s, c)) => {
+                                spans.push(format!("gpu={:#x}+{:#x} cpu={:#x}", g, s, c));
+                                cursor = g + s;
+                            }
+                            None => {
+                                spans.push(format!("HOLE@{:#x}", cursor));
+                                cursor += 0x1000;
+                            }
+                        }
+                    }
+                    log::warn!("[ctrl-dump] arena {:#x} spans: {}", base, spans.join(" | "));
+                }
+            }
+        }
+        for entry in entries.iter() {
+            pusher.entry_word_limit = 0;
             pusher.process_entry(
                 entry,
                 &mappings,
@@ -936,9 +1050,28 @@ impl Default for GpuContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuContext, GpuMappings, GuestMemoryAccess};
+    use super::{
+        eager_small_rt_writeback_value_enabled, GpuContext, GpuMappings, GuestMemoryAccess,
+    };
     use parking_lot::RwLock;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    #[test]
+    fn eager_small_rt_writeback_is_an_explicit_compatibility_opt_in() {
+        use std::ffi::OsStr;
+
+        assert!(!eager_small_rt_writeback_value_enabled(None));
+        for disabled in ["", "0", "false", "OFF", " no ", "unexpected"] {
+            assert!(!eager_small_rt_writeback_value_enabled(Some(OsStr::new(
+                disabled
+            ))));
+        }
+        for enabled in ["1", "true", "TRUE", "on", " yes "] {
+            assert!(eager_small_rt_writeback_value_enabled(Some(OsStr::new(
+                enabled
+            ))));
+        }
+    }
 
     #[test]
     fn guest_memory_access_resolves_latest_mapping_when_written() {

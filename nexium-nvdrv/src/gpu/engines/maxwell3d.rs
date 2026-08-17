@@ -303,6 +303,8 @@ pub struct Maxwell3DRegisters {
     pub draw_vertex_count: u32,
     pub draw_first_vertex: u32,
     pub draw_topology: u32,
+    pub primitive_topology_control: u32,
+    pub topology_override: u32,
     pub vertex_array_instance_count: u32,
     pub global_base_vertex_index: u32,
     pub global_base_instance_index: u32,
@@ -430,6 +432,8 @@ impl Default for Maxwell3DRegisters {
             draw_vertex_count: 0,
             draw_first_vertex: 0,
             draw_topology: 0,
+            primitive_topology_control: 0,
+            topology_override: 0,
             vertex_array_instance_count: 0,
             global_base_vertex_index: 0,
             global_base_instance_index: 0,
@@ -536,6 +540,53 @@ impl Default for Maxwell3DRegisters {
 }
 
 impl Maxwell3DRegisters {
+    fn reset_register_image(&self) -> Vec<u32> {
+        let mut image = vec![0u32; MAXWELL3D_REGISTER_COUNT];
+
+        image[0x286] = self.viewport.swizzle;
+        image[0x3D6] = self.stencil_back.write_mask;
+        image[0x3D7] = self.stencil_back.compare_mask;
+        image[0x487] = self.rt_control;
+        image[0x4C3] = self.depth_func;
+        image[0x4C5] = self.alpha_test_func;
+        image[0x4D0] = self.blend_eq_rgb;
+        image[0x4D1] = self.blend_src_rgb;
+        image[0x4D2] = self.blend_dst_rgb;
+        image[0x4D3] = self.blend_eq_alpha;
+        image[0x4D4] = self.blend_src_alpha;
+        image[0x4D6] = self.blend_dst_alpha;
+        image[0x4E1] = self.stencil_front.fail_op;
+        image[0x4E2] = self.stencil_front.depth_fail_op;
+        image[0x4E3] = self.stencil_front.depth_pass_op;
+        image[0x4E4] = self.stencil_front.compare_op;
+        image[0x4E6] = self.stencil_front.compare_mask;
+        image[0x4E7] = self.stencil_front.write_mask;
+        image[0x556] = self.render_enable_mode;
+        image[0x565] = u32::from(self.stencil_two_side_enable);
+        image[0x566] = self.stencil_back.fail_op;
+        image[0x567] = self.stencil_back.depth_fail_op;
+        image[0x568] = self.stencil_back.depth_pass_op;
+        image[0x569] = self.stencil_back.compare_op;
+        image[0x647] = self.front_face;
+        image[0x648] = self.cull_face;
+        image[0x64B] = u32::from(self.viewport_transform_en);
+
+        for (rt, &mask) in self.color_masks.iter().enumerate() {
+            image[0x680 + rt] = mask;
+        }
+        for rt in 0..8 {
+            let base = 0x780 + rt * 8;
+            image[base + 1] = self.blend_pt_eq_rgb[rt];
+            image[base + 2] = self.blend_pt_src_rgb[rt];
+            image[base + 3] = self.blend_pt_dst_rgb[rt];
+            image[base + 4] = self.blend_pt_eq_alpha[rt];
+            image[base + 5] = self.blend_pt_src_alpha[rt];
+            image[base + 6] = self.blend_pt_dst_alpha[rt];
+        }
+
+        image
+    }
+
     fn color_blend_state(&self) -> ColorBlendState {
         ColorBlendState {
             blend_enable: self.blend_enable,
@@ -696,6 +747,7 @@ const REG_LOAD_MME_INSTRUCTION_PTR: u32 = 0x45;
 const REG_LOAD_MME_INSTRUCTION: u32 = 0x46;
 const REG_LOAD_MME_START_ADDRESS_PTR: u32 = 0x47;
 const REG_LOAD_MME_START_ADDRESS: u32 = 0x48;
+const MAXWELL3D_REGISTER_COUNT: usize = 0xE00;
 
 fn mme_forensics() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -785,12 +837,15 @@ fn trace_sync_method(method: u32, arg: u32, pending: u32) {
 
 impl Maxwell3D {
     pub fn new() -> Self {
+        let regs = Maxwell3DRegisters::default();
+        let reg_file = regs.reset_register_image();
+        let shadow_regs = reg_file.clone();
         Self {
-            regs: Maxwell3DRegisters::default(),
-            reg_file: vec![0u32; 0xE00],
-            reg_file_written: vec![0; 0xE00],
+            regs,
+            reg_file,
+            reg_file_written: vec![0; MAXWELL3D_REGISTER_COUNT],
             shadow_ram_control: 0,
-            shadow_regs: vec![0u32; 0xE00],
+            shadow_regs,
             macro_engine: super::MacroEngine::new(),
             method_freq: std::collections::HashMap::new(),
             method_profile_enabled: std::env::var("NEXIUM_GPU_METHOD_PROFILE")
@@ -879,11 +934,6 @@ impl Maxwell3D {
     }
 
     pub fn dispatch_method(&mut self, method: u32, arg: u32, is_last: bool) {
-        if matches!(method, 0x1234 | 0x2608) {
-            self.write_register(method, arg);
-            return;
-        }
-
         if method >= super::MACRO_REGISTERS_START {
             if mme_trace() && self.macro_invocations < 1024 {
                 log::info!(
@@ -967,7 +1017,9 @@ impl Maxwell3D {
     pub fn write_register(&mut self, method: u32, arg: u32) {
         let incoming_arg = arg;
         let arg = if method == 0x49 {
-            self.shadow_ram_control = arg;
+            self.shadow_ram_control = arg & 0x3;
+            arg
+        } else if method < 0x80 {
             arg
         } else {
             let m = method as usize;
@@ -1011,6 +1063,7 @@ impl Maxwell3D {
                     | 0x5F8
                     | 0xB2
             )
+            && !(0x5F9..=0x5FE).contains(&method)
         {
             self.draw_state_dirty_since_last_draw = true;
         }
@@ -1232,6 +1285,8 @@ impl Maxwell3D {
             0x555 => self.regs.render_enable_addr_lo = arg,
             0x556 => self.regs.render_enable_mode = arg,
             0x651 => self.regs.render_enable_override = arg,
+            0x652 => self.regs.primitive_topology_control = arg,
+            0x65C => self.regs.topology_override = arg,
             0x420 => self.regs.draw_texture_dst_x = arg,
             0x421 => self.regs.draw_texture_dst_y = arg,
             0x422 => self.regs.draw_texture_dst_width = arg,
@@ -1569,6 +1624,27 @@ impl Maxwell3D {
                     }
                 }
             }
+            0x5F9..=0x5FE => {
+                let first_index = arg & 0xFFFF;
+                let index_count = (arg >> 16) & 0xFFF;
+                let topology = (arg >> 28) & 0xF;
+                let instance_id = u32::from(method >= 0x5FC);
+                let saved_index_first = self.regs.index_first;
+                self.regs.index_first = first_index;
+                self.regs.draw_count += 1;
+                self.push_draw(
+                    topology,
+                    self.regs.global_base_vertex_index,
+                    0,
+                    true,
+                    index_count,
+                    1,
+                    self.regs.global_base_instance_index,
+                    Some(instance_id),
+                    Vec::new(),
+                );
+                self.regs.index_first = saved_index_first;
+            }
 
             0x557 => {
                 log::trace!("maxwell3d: SetTexSamplerPool[hi] = {:#x}", arg);
@@ -1659,9 +1735,12 @@ impl Maxwell3D {
                         if valid { (cb_addr, cb_size) } else { (0, 0) };
                 }
             }
-            0x982 => self.regs.tex_cb_index = arg & 0x1F,
-            0x1234 => self.regs.sampler_binding = arg,
-            0x2608 => self.regs.bindless_texture_const_buffer_slot = arg & 0x1F,
+            0x48D => self.regs.sampler_binding = arg,
+            0x982 => {
+                let slot = arg & 0x1F;
+                self.regs.tex_cb_index = slot;
+                self.regs.bindless_texture_const_buffer_slot = slot;
+            }
             0x4BB => self.regs.alpha_test_enabled = (arg & 1) != 0,
             0x4C4 => self.regs.alpha_test_ref = arg,
             0x4C5 => self.regs.alpha_test_func = arg,
@@ -1880,6 +1959,24 @@ impl Maxwell3D {
                 | 0xB2
         ) && !(0x60..=0x6D).contains(&method)
             && !(0x8E4..=0x8F3).contains(&method)
+            && !(0x5F9..=0x5FE).contains(&method)
+    }
+
+    fn effective_topology(&self, draw_topology: u32) -> u32 {
+        if self.regs.primitive_topology_control != 1 {
+            return draw_topology;
+        }
+        match self.regs.topology_override {
+            0 => draw_topology,
+            1 | 0x1001 => 0,
+            2 | 0x1002 | 0x100F | 0x1018 | 0x101B => 1,
+            3 | 0x1010 | 0x1011 => 3,
+            4 | 0x1003 | 0x1012 | 0x101A => 4,
+            5 | 0x1013 | 0x1014 => 5,
+            0x1015 | 0x1016 | 0x1017 => 6,
+            topology @ (0xA..=0xE) => topology,
+            _ => draw_topology,
+        }
     }
 
     fn push_draw(
@@ -1894,6 +1991,7 @@ impl Maxwell3D {
         legacy_instance_id: Option<u32>,
         inline_indices: Vec<u32>,
     ) {
+        let topology = self.effective_topology(topology);
         let instance_count = self
             .macro_draw_instance_count
             .take()
@@ -2378,6 +2476,9 @@ mod tests {
         for method in 0x60..=0x6d {
             assert!(!Maxwell3D::is_pusher_passive_method(method), "{method:#x}");
         }
+        for method in 0x5f9..=0x5fe {
+            assert!(!Maxwell3D::is_pusher_passive_method(method), "{method:#x}");
+        }
         for method in 0x8e4..=0x8f3 {
             assert!(!Maxwell3D::is_pusher_passive_method(method), "{method:#x}");
         }
@@ -2434,6 +2535,111 @@ mod tests {
     }
 
     #[test]
+    fn shadow_ram_starts_from_the_encoded_live_reset_state() {
+        let engine = Maxwell3D::new();
+
+        assert_eq!(engine.shadow_regs, engine.reg_file);
+        assert_eq!(engine.reg_file[0x286], engine.regs.viewport.swizzle);
+        assert_eq!(engine.reg_file[0x4c3], engine.regs.depth_func);
+        assert_eq!(engine.reg_file[0x4d0], engine.regs.blend_eq_rgb);
+        assert_eq!(
+            engine.reg_file[0x4e6],
+            engine.regs.stencil_front.compare_mask
+        );
+        assert_eq!(engine.reg_file[0x64b], 1);
+        for rt in 0..8 {
+            assert_eq!(engine.reg_file[0x680 + rt], engine.regs.color_masks[rt]);
+            assert_eq!(
+                engine.reg_file[0x780 + rt * 8 + 1],
+                engine.regs.blend_pt_eq_rgb[rt]
+            );
+            assert_eq!(
+                engine.reg_file[0x780 + rt * 8 + 6],
+                engine.regs.blend_pt_dst_alpha[rt]
+            );
+        }
+    }
+
+    #[test]
+    fn replay_before_track_preserves_viewport_and_fixed_function_defaults() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x49, 3, true);
+        for method in [0x286, 0x4c3, 0x4d0, 0x4e6, 0x64b, 0x680, 0x781] {
+            engine.dispatch_method(method, 0, true);
+        }
+
+        assert_eq!(engine.regs.viewport.swizzle, 0x6420);
+        assert_eq!(engine.reg_file[0x286], 0x6420);
+        assert_eq!(engine.regs.depth_func, 0x207);
+        assert_eq!(engine.regs.blend_eq_rgb, 0x8006);
+        assert_eq!(engine.regs.stencil_front.compare_mask, u32::MAX);
+        assert!(engine.regs.viewport_transform_en);
+        assert_eq!(engine.regs.color_masks[0], 0x1111);
+        assert_eq!(engine.regs.blend_pt_eq_rgb[0], 0x8006);
+    }
+
+    #[test]
+    fn low_upload_methods_bypass_shadow_tracking_and_replay() {
+        let mut engine = Maxwell3D::new();
+        engine.shadow_regs[0x60] = 0xdead_0060;
+        engine.shadow_regs[0x6d] = 0xdead_006d;
+
+        engine.dispatch_method(0x60, 0x1111_0060, true);
+        engine.dispatch_method(0x6d, 0x1111_006d, true);
+        assert_eq!(engine.shadow_regs[0x60], 0xdead_0060);
+        assert_eq!(engine.shadow_regs[0x6d], 0xdead_006d);
+        assert_eq!(
+            engine.take_pending_inline_uploads(),
+            vec![(0x60, 0x1111_0060), (0x6d, 0x1111_006d)]
+        );
+
+        engine.dispatch_method(0x49, 3, true);
+        engine.dispatch_method(0x60, 0x2222_0060, true);
+        engine.dispatch_method(0x6d, 0x2222_006d, true);
+        assert_eq!(engine.reg_file[0x60], 0x2222_0060);
+        assert_eq!(engine.reg_file[0x6d], 0x2222_006d);
+        assert_eq!(
+            engine.take_pending_inline_uploads(),
+            vec![(0x60, 0x2222_0060), (0x6d, 0x2222_006d)]
+        );
+    }
+
+    #[test]
+    fn high_methods_replay_with_masked_shadow_control() {
+        let mut engine = Maxwell3D::new();
+        engine.dispatch_method(0x4c3, 0x203, true);
+
+        let raw_control = 0xffff_fff3;
+        engine.dispatch_method(0x49, raw_control, true);
+        assert_eq!(engine.shadow_ram_control, 3);
+        assert_eq!(engine.reg_file[0x49], raw_control);
+
+        engine.dispatch_method(0x4c3, 0x207, true);
+        assert_eq!(engine.reg_file[0x4c3], 0x203);
+        assert_eq!(engine.regs.depth_func, 0x203);
+    }
+
+    #[test]
+    fn track_updates_live_and_shadow_register_images() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x286, 0x6430, true);
+        engine.dispatch_method(0x4d0, 0x800a, true);
+        engine.dispatch_method(0x680, 0x1011, true);
+
+        for method in [0x286, 0x4d0, 0x680] {
+            assert_eq!(
+                engine.shadow_regs[method as usize],
+                engine.reg_file[method as usize]
+            );
+        }
+        assert_eq!(engine.regs.viewport.swizzle, 0x6430);
+        assert_eq!(engine.regs.blend_eq_rgb, 0x800a);
+        assert_eq!(engine.regs.color_masks[0], 0x1011);
+    }
+
+    #[test]
     fn constant_buffer_disable_clears_stale_binding() {
         let mut engine = Maxwell3D::new();
         let slot = 17usize;
@@ -2469,8 +2675,7 @@ mod tests {
         engine.dispatch_method(0x8e1, 0, true);
         engine.dispatch_method(0x8e2, 0x1000, true);
         engine.dispatch_method(0x904, 1, true);
-        engine.dispatch_method(0x1234, 1, true);
-        engine.dispatch_method(0x2608, 7, true);
+        engine.dispatch_method(0x48d, 1, true);
         engine.dispatch_method(0x982, 3, true);
         engine.dispatch_method(0x8e3, 0, true);
         engine.dispatch_method(0x8e4, 0x1111_1111, true);
@@ -2481,8 +2686,7 @@ mod tests {
         engine.dispatch_method(0x8e0, 0x200, true);
         engine.dispatch_method(0x8e2, 0x2000, true);
         engine.dispatch_method(0x904, 1, true);
-        engine.dispatch_method(0x1234, 0, true);
-        engine.dispatch_method(0x2608, 8, true);
+        engine.dispatch_method(0x48d, 0, true);
         engine.dispatch_method(0x982, 4, true);
         engine.dispatch_method(0x8e3, 0, true);
         engine.dispatch_method(0x8e4, 0x2222_2222, true);
@@ -2493,7 +2697,7 @@ mod tests {
         assert_eq!(first.program_region_gpu_va, 0x1_0000_8000);
         assert_eq!(first.cbuf_binds[0][0], (0x1000, 0x100));
         assert_eq!(first.sampler_binding, 1);
-        assert_eq!(first.bindless_texture_const_buffer_slot, 7);
+        assert_eq!(first.bindless_texture_const_buffer_slot, 3);
         assert_eq!(first.tex_cb_index, 3);
         assert_eq!(first.constbuf_write_count, 1);
 
@@ -2502,7 +2706,7 @@ mod tests {
         assert_eq!(second.program_region_gpu_va, 0x1_0000_9000);
         assert_eq!(second.cbuf_binds[0][0], (0x2000, 0x200));
         assert_eq!(second.sampler_binding, 0);
-        assert_eq!(second.bindless_texture_const_buffer_slot, 8);
+        assert_eq!(second.bindless_texture_const_buffer_slot, 4);
         assert_eq!(second.tex_cb_index, 4);
         assert_eq!(second.constbuf_write_count, 2);
     }
@@ -2560,6 +2764,79 @@ mod tests {
         engine.dispatch_method(0x35f, 1, true);
         assert_eq!(engine.regs.draw_first_vertex, 17);
         assert_eq!(engine.regs.depth_mode, 1);
+    }
+
+    #[test]
+    fn topology_override_methods_match_maxwell_encodings() {
+        let mut engine = Maxwell3D::new();
+
+        engine.dispatch_method(0x65c, 4, true);
+        assert_eq!(engine.effective_topology(5), 5);
+
+        engine.dispatch_method(0x652, 1, true);
+        for (override_raw, expected) in [
+            (0, 5),
+            (1, 0),
+            (2, 1),
+            (3, 3),
+            (4, 4),
+            (5, 5),
+            (0xa, 0xa),
+            (0xe, 0xe),
+            (0x1001, 0),
+            (0x1002, 1),
+            (0x1003, 4),
+            (0x1010, 3),
+            (0x1015, 6),
+            (0x1017, 6),
+            (0x1018, 1),
+            (0x101a, 4),
+            (0x101b, 1),
+        ] {
+            engine.dispatch_method(0x65c, override_raw, true);
+            assert_eq!(engine.effective_topology(5), expected, "{override_raw:#x}");
+        }
+    }
+
+    #[test]
+    fn topology_override_is_snapshotted_by_all_draw_entry_paths() {
+        let configure_override = |engine: &mut Maxwell3D| {
+            engine.dispatch_method(0x652, 1, true);
+            engine.dispatch_method(0x65c, 4, true);
+        };
+
+        let mut ordinary = Maxwell3D::new();
+        configure_override(&mut ordinary);
+        ordinary.dispatch_method(0x35e, 3, true);
+        assert_eq!(ordinary.pending_draws[0].topology, 4);
+
+        let mut legacy = Maxwell3D::new();
+        configure_override(&mut legacy);
+        legacy.dispatch_method(0x586, 5, true);
+        legacy.dispatch_method(0x35d, 2, true);
+        legacy.dispatch_method(0x35e, 3, true);
+        legacy.dispatch_method(0x585, 0, true);
+        assert_eq!(legacy.pending_draws[0].topology, 4);
+
+        let mut packed_vertex = Maxwell3D::new();
+        configure_override(&mut packed_vertex);
+        packed_vertex.dispatch_method(0x485, (5 << 28) | (3 << 16) | 2, true);
+        assert_eq!(packed_vertex.pending_draws[0].topology, 4);
+
+        let mut packed_index = Maxwell3D::new();
+        configure_override(&mut packed_index);
+        packed_index.dispatch_method(0x5f3, 0x1234_0000, true);
+        packed_index.dispatch_method(0x5f9, (5 << 28) | (3 << 16) | 2, true);
+        assert_eq!(packed_index.pending_draws[0].topology, 4);
+
+        let mut inline_index = Maxwell3D::new();
+        configure_override(&mut inline_index);
+        inline_index.dispatch_method(0x586, 5, true);
+        inline_index.dispatch_method(0x57a, 0, true);
+        inline_index.dispatch_method(0x57a, 1, true);
+        inline_index.dispatch_method(0x57a, 2, true);
+        inline_index.dispatch_method(0x585, 0, true);
+        assert_eq!(inline_index.pending_draws[0].topology, 4);
     }
 
     #[test]
@@ -2727,6 +3004,59 @@ mod tests {
         assert_eq!(draw.index_gpu_va, 0x1234_0000);
         assert_eq!(draw.index_format, 2);
         assert_eq!(draw.instance_count, 2);
+    }
+
+    #[test]
+    fn packed_indexed_draw_methods_decode_current_index_state() {
+        for method in 0x5f9..=0x5fe {
+            let mut engine = Maxwell3D::new();
+            engine.dispatch_method(0x5f2, 0x4, true);
+            engine.dispatch_method(0x5f3, 0x1234_0000, true);
+            engine.dispatch_method(0x5f6, 2, true);
+            engine.dispatch_method(0x5f7, 9, true);
+            engine.dispatch_method(0x50d, 0xffff_fff9, true);
+            engine.dispatch_method(0x50e, 11, true);
+
+            engine.dispatch_method(method, (5 << 28) | (0x345 << 16) | 0x4567, true);
+
+            assert_eq!(engine.pending_draws.len(), 1, "method {method:#x}");
+            let draw = &engine.pending_draws[0];
+            assert!(draw.indexed, "method {method:#x}");
+            assert_eq!(draw.topology, 5, "method {method:#x}");
+            assert_eq!(draw.index_first, 0x4567, "method {method:#x}");
+            assert_eq!(draw.index_count, 0x345, "method {method:#x}");
+            assert_eq!(draw.index_gpu_va, 0x4_1234_0000, "method {method:#x}");
+            assert_eq!(draw.index_format, 2, "method {method:#x}");
+            assert_eq!(draw.first_vertex, 0xffff_fff9, "method {method:#x}");
+            assert_eq!(draw.first_instance, 11, "method {method:#x}");
+            assert_eq!(draw.instance_count, 1, "method {method:#x}");
+            assert_eq!(engine.regs.index_first, 9, "method {method:#x}");
+        }
+    }
+
+    #[test]
+    fn packed_indexed_subsequent_methods_accumulate_instances() {
+        let mut engine = Maxwell3D::new();
+        engine.dispatch_method(0x5f3, 0x1234_0000, true);
+        engine.dispatch_method(0x5f6, 2, true);
+        engine.dispatch_method(0x50d, 7, true);
+        engine.dispatch_method(0x50e, 3, true);
+        let argument = (4 << 28) | (12 << 16) | 5;
+
+        engine.dispatch_method(0x5fa, argument, true);
+        engine.dispatch_method(0x5fd, argument, true);
+        engine.dispatch_method(0x5fd, argument, true);
+
+        assert_eq!(engine.pending_draws.len(), 1);
+        let draw = &engine.pending_draws[0];
+        assert!(draw.indexed);
+        assert_eq!(draw.topology, 4);
+        assert_eq!(draw.index_first, 5);
+        assert_eq!(draw.index_count, 12);
+        assert_eq!(draw.index_format, 2);
+        assert_eq!(draw.first_vertex, 7);
+        assert_eq!(draw.first_instance, 3);
+        assert_eq!(draw.instance_count, 3);
     }
 
     #[test]

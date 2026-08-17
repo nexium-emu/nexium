@@ -371,7 +371,8 @@ pub(crate) mod kickprof {
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
-            let on = std::env::var_os("NEXIUM_KICKOFF_PROFILE").is_some();
+            let on = std::env::var_os("NEXIUM_KICKOFF_PROFILE").is_some()
+                || std::env::var_os("NEXIUM_KICK_STAGE_PROFILE").is_some();
             if on {
                 log::warn!("[kickprof] armed");
             }
@@ -622,13 +623,17 @@ pub(crate) fn write_payload_fences(
 ) {
     for &(gpu_va, payload) in writes {
         match write_gpu(gpu_va, &payload.to_le_bytes()) {
-            Some((cpu, ok)) => log::trace!(
-                "pusher: async fence release gpu_va={:#x} cpu={:#x} payload={:#x} write_ok={}",
-                gpu_va,
-                cpu,
-                payload,
-                ok
-            ),
+            Some((cpu, ok)) => {
+                if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                    log::info!(
+                        "[syncpt] async fence release gpu_va={:#x} cpu={:#x} payload={:#x} write_ok={}",
+                        gpu_va,
+                        cpu,
+                        payload,
+                        ok
+                    );
+                }
+            }
             None => log::warn!(
                 "pusher: async fence release gpu_va={:#x} not mapped; payload={:#x} dropped",
                 gpu_va,
@@ -783,7 +788,13 @@ impl Pusher {
             super::prep::PrepLane::Inline(state) => state.begin_ssbo_snapshot_epoch(),
             super::prep::PrepLane::Threaded(handle) => {
                 handle.begin_kick();
-                handle.send(super::prep::PrepEvent::KickBegin);
+                if handle
+                    .send_recover(super::prep::PrepEvent::KickBegin)
+                    .is_err()
+                {
+                    handle.cancel_kick();
+                    log::error!("[gpu-prep] kick-begin dropped after prep thread exit");
+                }
             }
         }
     }
@@ -849,16 +860,24 @@ impl Pusher {
                     }
                 }
                 state.end_ssbo_snapshot_epoch();
-                if let Some(on_complete) = on_complete {
-                    on_complete();
-                }
+                state.schedule_kick_completion(on_complete);
             }
             super::prep::PrepLane::Threaded(handle) => {
-                handle.send(super::prep::PrepEvent::KickEnd {
+                match handle.send_recover(super::prep::PrepEvent::KickEnd {
                     hard_after,
                     writeback_small_rts,
                     on_complete,
-                })
+                }) {
+                    Ok(()) => {}
+                    Err(super::prep::PrepEvent::KickEnd { on_complete, .. }) => {
+                        handle.cancel_kick();
+                        log::error!("[gpu-prep] kick-end dropped after prep thread exit");
+                        if let Some(on_complete) = on_complete {
+                            on_complete();
+                        }
+                    }
+                    Err(_) => unreachable!("prep kick-end returned a different event"),
+                }
             }
         }
     }
@@ -877,6 +896,7 @@ impl Pusher {
         mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
         mem_copy: &dyn Fn(u64, u64, usize) -> bool,
+        writeback_small_rts: bool,
         on_complete: Option<Box<dyn FnOnce() + Send>>,
     ) {
         self.process_gpfifo_with_boundary(
@@ -893,7 +913,7 @@ impl Pusher {
             mem_write,
             mem_copy,
             true,
-            true,
+            writeback_small_rts,
             on_complete,
         );
     }
@@ -1047,8 +1067,34 @@ impl Pusher {
                 }
             })
             .collect();
+        let decoded = repair_endform_entries(&decoded);
         let addrs: Vec<u64> = decoded.iter().map(|e| e.address()).collect();
         kickprof::add(kickprof::ELIST, kp_elist);
+
+        if direct_forensics() && decoded.iter().any(|e| e.entry_count() > 4096) {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                let raw: Vec<String> = decoded
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "{:08x}:{:08x}(va={:#x},n={})",
+                            e.address_lo,
+                            e.address_hi_and_count,
+                            e.address(),
+                            e.entry_count()
+                        )
+                    })
+                    .collect();
+                log::warn!(
+                    "[el-dump] list_va={:#x} num_entries={} {}",
+                    address,
+                    num_entries,
+                    raw.join(" ")
+                );
+            }
+        }
 
         for i in 0..num_entries as usize {
             let entry = decoded[i];
@@ -1202,6 +1248,13 @@ impl Pusher {
 
         self.active_entry_gpu_va = address;
         self.active_entry_cpu_va = cpu_addr;
+        let entry_state_in = (
+            self.state.method,
+            self.state.subchannel,
+            self.state.method_count,
+            self.state.non_incrementing,
+            self.state.increment_once,
+        );
         self.process_commands(
             &words,
             mappings,
@@ -1228,6 +1281,18 @@ impl Pusher {
                     self.state.non_incrementing,
                     self.state.subchannel
                 );
+                if let Some(n) = std::env::var("NEXIUM_PB_DUMP_WORDS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    log::warn!(
+                        "[pb-leak-words] entry_gpu={:#x} entry_state_in={:?} words[0..{}]={:08x?}",
+                        address,
+                        entry_state_in,
+                        n.min(words.len()),
+                        &words[..n.min(words.len())]
+                    );
+                }
             }
         }
         self.active_entry_gpu_va = 0;
@@ -2027,7 +2092,7 @@ fn puller_method_requires_hard_boundary(method: u32) -> bool {
     )
 }
 
-fn direct_forensics() -> bool {
+pub(crate) fn direct_forensics() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("NEXIUM_MME_FORENSICS").is_some())
@@ -2051,7 +2116,110 @@ pub(crate) fn nearest_forward_gap(addrs: &[u64], i: usize) -> u32 {
     }
 }
 
-fn read_gpu_scattered(
+fn dedup_walker_blocks(entries: &[CommandListHeader]) -> Vec<CommandListHeader> {
+    if !entries.iter().any(|e| e.entry_count() > 4096) {
+        return entries.to_vec();
+    }
+    let mut out: Vec<CommandListHeader> = Vec::with_capacity(entries.len());
+    let mut i = 0usize;
+    while i < entries.len() {
+        let mut dropped = false;
+        let remaining = entries.len() - i;
+        let max_block = (out.len()).min(remaining);
+        for block in (1..=max_block).rev() {
+            let prior = &out[out.len() - block..];
+            let cand = &entries[i..i + block];
+            let equal = prior.iter().zip(cand.iter()).all(|(a, b)| {
+                a.address_lo == b.address_lo && a.address_hi_and_count == b.address_hi_and_count
+            });
+            let has_giant = cand.iter().any(|e| e.entry_count() > 4096);
+            if equal && has_giant {
+                if direct_forensics() {
+                    log::warn!(
+                        "[pb-dedup] dropped repeated block len={} at index {} first_va={:#x}",
+                        block,
+                        i,
+                        cand[0].address()
+                    );
+                }
+                i += block;
+                dropped = true;
+                break;
+            }
+        }
+        if !dropped {
+            out.push(entries[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn endform_fix_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("NEXIUM_ENDFORM_FIX")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+pub(crate) fn repair_endform_entries(entries: &[CommandListHeader]) -> Vec<CommandListHeader> {
+    if !endform_fix_enabled() {
+        return entries.to_vec();
+    }
+    let entries = &dedup_walker_blocks(entries)[..];
+    let addrs: Vec<u64> = entries.iter().map(|e| e.address()).collect();
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let count = e.entry_count();
+            if count <= 4096 {
+                return *e;
+            }
+            let va = e.address();
+            let va_lo = (va & 0x1F_FFFF) as u32;
+            let diff = count.wrapping_sub(va_lo) & 0x1F_FFFF;
+            let chained = addrs
+                .iter()
+                .enumerate()
+                .any(|(j, &a)| j != i && a == va + count as u64 * 4);
+            let (words, family) = if chained {
+                (None, "chained")
+            } else if diff != 0 && diff % 4 == 0 && diff / 4 <= 4096 {
+                (Some(diff / 4), "endform")
+            } else if diff <= 0x10_0000 {
+                (None, "cursor")
+            } else {
+                (None, "torn")
+            };
+            if direct_forensics() {
+                log::warn!(
+                    "[pb-endform] va={:#x} raw_count={} repaired_words={:?} family={}",
+                    va,
+                    count,
+                    words,
+                    family
+                );
+            }
+            let Some(words) = words else {
+                return *e;
+            };
+            CommandListHeader {
+                address_lo: e.address_lo,
+                address_hi_and_count: (e.address_hi_and_count & !(0x1F_FFFF << 10)) | (words << 10),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn read_gpu_scattered(
     mappings: &GpuMappings,
     gpu_va: u64,
     out: &mut [u8],
@@ -2135,8 +2303,13 @@ fn dump_direct_ctx(
     if N.fetch_add(1, Ordering::Relaxed) >= 64 {
         return;
     }
-    let lo = i.saturating_sub(3);
-    let hi = (i + 6).min(commands.len());
+    let full = std::env::var("NEXIUM_PB_DUMP_WORDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let (lo, hi) = match full {
+        Some(n) => (0, n.min(commands.len())),
+        None => (i.saturating_sub(3), (i + 6).min(commands.len())),
+    };
     log::warn!(
         "[pb-garbage] entry_gpu={:#x} cpu={:#x} word={} class={:#x} method={:#x} arg={:#010x} mcount={} noninc={} words[{}..{}]={:08x?}",
         entry_gpu_va,
