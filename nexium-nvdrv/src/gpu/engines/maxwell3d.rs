@@ -693,6 +693,7 @@ pub struct DrawCall {
     pub clear_depth: f32,
     pub clear_stencil: u32,
     pub clear_mask: u32,
+    pub state_clean_from_previous: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1312,6 +1313,7 @@ impl Maxwell3D {
                     self.regs.scissor
                 );
                 self.pending_draws.push(DrawCall {
+                    state_clean_from_previous: false,
                     topology: 0,
                     first_vertex: 0,
                     vertex_count: 0,
@@ -2001,9 +2003,10 @@ impl Maxwell3D {
             ((self.regs.index_buffer_hi as u64) << 32) | self.regs.index_buffer_lo as u64;
 
         let is_first_or_subsequent = matches!(legacy_instance_id, Some(0 | 1));
+        let state_clean_from_previous = !self.draw_state_dirty_since_last_draw;
         let can_coalesce = legacy_instance_id == Some(1)
             && self.last_draw_allows_continuation
-            && !self.draw_state_dirty_since_last_draw;
+            && state_clean_from_previous;
         self.last_draw_allows_continuation = is_first_or_subsequent;
         self.draw_state_dirty_since_last_draw = false;
 
@@ -2057,6 +2060,7 @@ impl Maxwell3D {
             index_format: self.regs.index_format,
             index_first: self.regs.index_first,
             inline_indices,
+            state_clean_from_previous,
             primitive_restart_enabled: self.regs.primitive_restart_enabled,
             primitive_restart_index: self.regs.primitive_restart_index,
             point_size,
@@ -2202,6 +2206,7 @@ impl Maxwell3D {
             );
         }
         self.pending_draws.push(DrawCall {
+            state_clean_from_previous: false,
             topology: 0,
             first_vertex: 0,
             vertex_count: 0,

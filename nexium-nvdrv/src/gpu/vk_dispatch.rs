@@ -3516,6 +3516,7 @@ pub(crate) fn enqueue_draws(
     mut compute_probe: Option<&mut ComputeGraphicsProbe>,
 ) {
     ssbo_snapshot_cache.refresh_deferred_writes(mappings);
+    let mut rt_signature_memo: Option<(RtBindingSignature, u64)> = None;
     for draw in draws {
         if let Some(probe) = compute_probe.as_deref_mut() {
             probe.record_request(draw);
@@ -3638,12 +3639,23 @@ pub(crate) fn enqueue_draws(
             }
             continue;
         }
-        let flush_predicted_boundary = batch.last().is_some_and(|last| {
-            match draw_rt_binding_signature(draw, mappings, mem_read) {
-                Ok(signature) => !signature.matches_call(last),
-                Err(_) => false,
+        let flush_predicted_boundary = if let Some(last) = batch.last() {
+            let generation = mappings.generation();
+            let reuse = draw.state_clean_from_previous
+                && rt_signature_memo
+                    .as_ref()
+                    .is_some_and(|(_, cached)| *cached == generation);
+            if !reuse {
+                rt_signature_memo = draw_rt_binding_signature(draw, mappings, mem_read)
+                    .ok()
+                    .map(|signature| (signature, generation));
             }
-        });
+            rt_signature_memo
+                .as_ref()
+                .is_some_and(|(signature, _)| !signature.matches_call(last))
+        } else {
+            false
+        };
         let predicted_boundary_usage = flush_predicted_boundary
             .then(|| {
                 super::pusher::kickprof::enabled().then(|| {
