@@ -1,9 +1,47 @@
 use crate::kernel::cpu_local::current_core;
 use nexium_cpu::Cpu;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub const NUM_CORES: usize = 4;
+
+pub struct CoreWakers {
+    condvars: [parking_lot::Condvar; NUM_CORES],
+}
+
+impl CoreWakers {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            condvars: std::array::from_fn(|_| parking_lot::Condvar::new()),
+        })
+    }
+
+    pub fn notify_core(&self, core: i32) {
+        if (0..NUM_CORES as i32).contains(&core) {
+            self.condvars[core as usize].notify_one();
+        } else {
+            self.notify_all_cores();
+        }
+    }
+
+    pub fn notify_all_cores(&self) {
+        for condvar in &self.condvars {
+            condvar.notify_one();
+        }
+    }
+
+    pub fn park_core<T>(
+        &self,
+        guard: &mut parking_lot::MutexGuard<'_, T>,
+        core: usize,
+        timeout: std::time::Duration,
+    ) {
+        if core < NUM_CORES {
+            self.condvars[core].wait_for(guard, timeout);
+        }
+    }
+}
 
 pub const IDEAL_CORE_DONT_CARE: i32 = -1;
 pub const IDEAL_CORE_USE_PROCESS_VALUE: i32 = -2;
@@ -98,6 +136,7 @@ pub struct Threads {
     pub next_tls_va: u64,
     pub tls_stride: u64,
     pub last_switch: Instant,
+    pub wakers: Arc<CoreWakers>,
 }
 
 impl Threads {
@@ -138,6 +177,7 @@ impl Threads {
             next_tls_va: tls_pool_base,
             tls_stride: 0x1000,
             last_switch: Instant::now(),
+            wakers: CoreWakers::new(),
         }
     }
 
@@ -224,12 +264,14 @@ impl Threads {
         };
         let became_ready = matches!(new_state, ThreadState::Ready);
         let exited = matches!(new_state, ThreadState::Exited);
+        let core = t.core;
         t.state = new_state;
         if exited {
             t.user_preemption_pending = false;
         }
         if became_ready && !self.ready.contains(&handle) {
             self.ready.push_back(handle);
+            self.wakers.notify_core(core);
         }
     }
 

@@ -2053,6 +2053,25 @@ fn release_mutex_word(kernel: &mut Kernel, mutex_addr: u64, caller: u32) -> (u32
     }
 }
 
+pub(crate) fn nudge_preempt_for_wake(kernel: &mut Kernel, woken: u32) {
+    if woken == 0 {
+        return;
+    }
+    let core = crate::kernel::cpu_local::current_core();
+    let Some(current) = kernel.threads.current[core] else {
+        return;
+    };
+    let Some(t) = kernel.threads.threads.get(&woken) else {
+        return;
+    };
+    if t.core >= 0 && t.core != core as i32 {
+        return;
+    }
+    if kernel.threads.effective_priority(woken) < kernel.threads.effective_priority(current) {
+        kernel.yield_after_svc = true;
+    }
+}
+
 fn svc_arbitrate_unlock(kernel: &mut Kernel) -> u32 {
     let mutex_addr = if let Some(cpu) = cpu_ref() {
         cpu.get_register(0)
@@ -2061,6 +2080,7 @@ fn svc_arbitrate_unlock(kernel: &mut Kernel) -> u32 {
     };
     let owner_handle = kernel.threads.current_handle().unwrap_or(0);
     let (prev_word, new_word, handed) = release_mutex_word(kernel, mutex_addr, owner_handle);
+    nudge_preempt_for_wake(kernel, handed);
     log::debug!(
         "svcArbitrateUnlock mutex={:#x} self={:#x} word {:#x}->{:#x} handed={:#x}",
         mutex_addr,
@@ -2237,6 +2257,7 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
                     Err(_) => break 'outer,
                 }
                 kernel.threads.wake_condvar_to_ready(handle);
+                nudge_preempt_for_wake(kernel, handle);
                 log::debug!(
                     "cond_signal handoff: cond={:#x} handle={:#x} mutex={:#x} word {:#x}->{:#x}",
                     condvar_addr,
@@ -6418,7 +6439,7 @@ fn igbp_handle_transact(
                         );
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_micros(100));
+                    nexium_common::host_wake::micro_pause();
                 }
             }
             if !acquire_fences_ready {
@@ -9770,11 +9791,14 @@ fn svc_signal_to_address(kernel: &mut Kernel) -> u32 {
     }
 
     if count <= 0 {
-        kernel.threads.wake_all_on_arbiter(addr);
+        if kernel.threads.wake_all_on_arbiter(addr) > 0 {
+            kernel.yield_after_svc = true;
+        }
     } else {
         for _ in 0..count {
-            if kernel.threads.wake_one_on_arbiter(addr).is_none() {
-                break;
+            match kernel.threads.wake_one_on_arbiter(addr) {
+                Some(woken) => nudge_preempt_for_wake(kernel, woken),
+                None => break,
             }
         }
     }

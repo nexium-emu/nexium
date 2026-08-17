@@ -1623,6 +1623,72 @@ mod user_preemption_tests {
     }
 
     #[test]
+    fn ready_transition_wakes_parked_core() {
+        let kernel = Arc::new(Mutex::new(test_kernel(false)));
+        const HANDLE: u32 = 0xb100;
+        let wakers = {
+            let mut k = kernel.lock();
+            k.threads
+                .add_thread(HANDLE, threads::ThreadCtx::zero(), 0, 0, 0);
+            k.threads.threads.get_mut(&HANDLE).unwrap().core = 1;
+            k.threads.wakers.clone()
+        };
+        let parker = {
+            let kernel = Arc::clone(&kernel);
+            let wakers = wakers.clone();
+            std::thread::spawn(move || {
+                let mut guard = kernel.lock();
+                let start = std::time::Instant::now();
+                while !guard.threads.ready.contains(&HANDLE) {
+                    wakers.park_core(&mut guard, 1, std::time::Duration::from_secs(4));
+                    if start.elapsed() > std::time::Duration::from_secs(12) {
+                        break;
+                    }
+                }
+                start.elapsed()
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        kernel
+            .lock()
+            .threads
+            .transition_state(HANDLE, threads::ThreadState::Ready);
+        let elapsed = parker.join().unwrap();
+        assert!(elapsed < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn wake_nudge_yields_only_for_better_priority_same_core() {
+        let mut kernel = test_kernel(false);
+        const WOKEN: u32 = 0xb200;
+        kernel
+            .threads
+            .add_thread(WOKEN, threads::ThreadCtx::zero(), 0, 0, 0);
+        {
+            let t = kernel.threads.threads.get_mut(&WOKEN).unwrap();
+            t.core = 0;
+            t.priority = 5;
+        }
+        kernel.yield_after_svc = false;
+        svc::nudge_preempt_for_wake(&mut kernel, WOKEN);
+        assert!(kernel.yield_after_svc);
+
+        kernel.yield_after_svc = false;
+        kernel.threads.threads.get_mut(&WOKEN).unwrap().priority = 60;
+        svc::nudge_preempt_for_wake(&mut kernel, WOKEN);
+        assert!(!kernel.yield_after_svc);
+
+        kernel.yield_after_svc = false;
+        {
+            let t = kernel.threads.threads.get_mut(&WOKEN).unwrap();
+            t.priority = 5;
+            t.core = 2;
+        }
+        svc::nudge_preempt_for_wake(&mut kernel, WOKEN);
+        assert!(!kernel.yield_after_svc);
+    }
+
+    #[test]
     fn thread_wait_tree_reports_states_and_waiters() {
         let mut kernel = test_kernel(false);
         const OWNER: u32 = 0xa100;
