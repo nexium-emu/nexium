@@ -3250,6 +3250,14 @@ fn dispatch_service_v2(
         }
     }
 
+    if port_name == "IApplicationFunctions" && cmd_id == 1 {
+        let kind = ipc_input_u32(ctx, 0).unwrap_or(2);
+        if kind == 1 {
+            log::debug!("am: PopLaunchParameter(UserChannel) -> no data");
+            return build_ipc_response(ctx, 0x480, &[], &[]);
+        }
+    }
+
     if let Some(sub_service) = crate::services::am::proxy_subsession(port_name, cmd_id) {
         log::debug!(
             "{} cmd={} â†’ returning {} sub-session",
@@ -6614,55 +6622,120 @@ fn igbp_handle_transact(
                         let stats = kernel.nvdrv.stats.clone();
                         let (present_nvmap_id, present_width, present_height) =
                             (gb.nvmap_id, gb.width, gb.height);
+                        let present_source_vas =
+                            renderer.present_alias_vas(gb.nvmap_id, gb.width, gb.height);
+                        if !present_source_vas.is_empty() {
+                            kernel
+                                .nvdrv
+                                .gpu
+                                .maxwell_dma
+                                .lock()
+                                .register_present_surface(
+                                    gb.nvmap_id,
+                                    &direct_gpu_vas,
+                                    gb.width,
+                                    gb.height,
+                                    &present_source_vas,
+                                );
+                        }
+                        let maxwell_dma_for_ordered =
+                            std::sync::Arc::clone(&kernel.nvdrv.gpu.maxwell_dma);
                         let queued = kernel.nvdrv.try_queue_ordered_present(move || {
                             let _slot_guard = AcquiredBufferSlotGuard::new(
                                 present_bufferqueues,
                                 binder_id,
                                 slot,
                             );
-                            let Some((present_key, present_stamp)) = renderer
-                                .newest_exact_present_target_at_vas(
-                                    present_nvmap_id,
-                                    present_width,
-                                    present_height,
-                                    &direct_gpu_vas,
-                                )
-                            else {
+                            let exact_present_source = {
+                                let maxwell_dma = maxwell_dma_for_ordered.lock();
+                                direct_gpu_vas
+                                    .iter()
+                                    .filter_map(|&present_va| {
+                                        maxwell_dma
+                                            .exact_present_source_token(
+                                                present_va,
+                                                present_width,
+                                                present_height,
+                                            )
+                                            .map(|token| (present_va, token))
+                                    })
+                                    .filter(|(_, token)| token.destination_is_current())
+                                    .filter(|(_, token)| {
+                                        renderer.render_target_stamp(token.source).is_some_and(
+                                            |current| {
+                                                if token.source_may_advance {
+                                                    current >= token.source_stamp
+                                                } else {
+                                                    current == token.source_stamp
+                                                }
+                                            },
+                                        )
+                                    })
+                                    .max_by_key(|(_, token)| token.source_stamp)
+                            };
+                            let direct_present = renderer.newest_exact_present_target_at_vas(
+                                present_nvmap_id,
+                                present_width,
+                                present_height,
+                                &direct_gpu_vas,
+                            );
+                            if exact_present_source.is_none() && direct_present.is_none() {
                                 log::warn!(
-                                    "ordered present has no exact target binder={} slot={} nvmap={}",
+                                    "ordered present has no exact target binder={} slot={} nvmap={} searched_vas={}",
                                     binder_id,
                                     slot,
-                                    present_nvmap_id
+                                    present_nvmap_id,
+                                    direct_gpu_vas.len()
                                 );
                                 return;
-                            };
-                            let present_gpu_va = present_key.gpu_va;
+                            }
                             if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
                                 use std::sync::atomic::{AtomicU64, Ordering};
                                 static ORDERED_KEYS: AtomicU64 = AtomicU64::new(0);
                                 let sequence = ORDERED_KEYS.fetch_add(1, Ordering::Relaxed);
                                 if sequence < 3 || sequence % 20 == 0 {
                                     log::info!(
-                                        "[ordered-present-key #{}] slot={} nvmap={} cpu={:#x} gpu_va={:#x} stamp={}",
+                                        "[ordered-present-key #{}] slot={} nvmap={} cpu={:#x} mode={}",
                                         sequence,
                                         slot,
                                         present_nvmap_id,
                                         present_cpu_addr,
-                                        present_gpu_va,
-                                        present_stamp
+                                        if exact_present_source.is_some() {
+                                            "exact-dma"
+                                        } else {
+                                            "newest-exact"
+                                        }
                                     );
                                 }
                             }
                             submit_ordered_gpu_present(
                                 move |read_rect| {
-                                    renderer.readback_target_pipelined_pinned_at_va(
-                                        present_nvmap_id,
-                                        present_width,
-                                        present_height,
-                                        present_gpu_va,
-                                        present_cpu_addr,
-                                        read_rect,
-                                    )
+                                    if let Some((_, token)) = exact_present_source {
+                                        if token.source_may_advance {
+                                            renderer.readback_live_provenance_pipelined(
+                                                token.source,
+                                                token.source_stamp,
+                                                read_rect,
+                                            )
+                                        } else {
+                                            renderer.readback_exact_provenance_pipelined(
+                                                token.source,
+                                                token.source_stamp,
+                                                read_rect,
+                                            )
+                                        }
+                                    } else if let Some((present_key, _)) = direct_present {
+                                        renderer.readback_target_pipelined_pinned_at_va(
+                                            present_nvmap_id,
+                                            present_width,
+                                            present_height,
+                                            present_key.gpu_va,
+                                            present_cpu_addr,
+                                            read_rect,
+                                        )
+                                    } else {
+                                        None
+                                    }
                                 },
                                 frame_queue,
                                 stats,

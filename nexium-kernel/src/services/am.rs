@@ -482,7 +482,7 @@ fn application_functions(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>,
         27 => ok(vec![0u8; 16]),
         28 => ok(vec![0u8; 16]),
         30 | 31 | 32 | 33 => ok_empty(),
-        40 => ok(0u8.to_le_bytes().to_vec()),
+        40 => ok(1u8.to_le_bytes().to_vec()),
         50 => ok(vec![0u8; 16]),
         60 => ok_empty(),
         65 => ok(0u8.to_le_bytes().to_vec()),
@@ -492,25 +492,27 @@ fn application_functions(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>,
         111 => ok(0u64.to_le_bytes().to_vec()),
         120 => ok(vec![0u8; 16]),
         121 => ok(0i32.to_le_bytes().to_vec()),
-        123 => {
+        123 => ok((-1i32).to_le_bytes().to_vec()),
+        124 => ok_empty(),
+        130 => {
             let mut slot = kernel.gpu_error_detected_event;
             let h = alloc_event(kernel, &mut slot, "GpuErrorDetectedSystemEvent");
             kernel.gpu_error_detected_event = slot;
             ok_with_handle(Vec::new(), h)
         }
-        124 => {
+        140 => {
             let mut slot = kernel.friend_invitation_event;
             let h = alloc_event(kernel, &mut slot, "FriendInvitationStorageChannelEvent");
             kernel.friend_invitation_event = slot;
             ok_with_handle(Vec::new(), h)
         }
-        130 => {
+        150 => {
             let mut slot = kernel.notification_event;
             let h = alloc_event(kernel, &mut slot, "NotificationStorageChannelEvent");
             kernel.notification_event = slot;
             ok_with_handle(Vec::new(), h)
         }
-        131 | 140 | 141 | 150 | 160 | 170 | 1000 | 1001 => ok_empty(),
+        131 | 141 | 160 | 170 | 1000 | 1001 => ok_empty(),
         _ => {
             log::warn!(
                 "IApplicationFunctions.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",
