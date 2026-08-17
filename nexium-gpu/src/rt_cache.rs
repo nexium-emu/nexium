@@ -906,6 +906,60 @@ impl RtCache {
             .copied()
     }
 
+    pub fn newest_exact_present_key_at_vas(
+        &self,
+        nvmap_id: u32,
+        width: u32,
+        height: u32,
+        gpu_vas: &[u64],
+    ) -> Option<(RtKey, u64)> {
+        if nvmap_id == 0 || nvmap_id == u32::MAX || width == 0 || height == 0 || gpu_vas.is_empty()
+        {
+            return None;
+        }
+
+        let mut best = None;
+        for &gpu_va in gpu_vas {
+            if gpu_va == 0 {
+                continue;
+            }
+            let Some(candidates) = self.color_gpu_base_index.get(&gpu_va) else {
+                continue;
+            };
+            for key in candidates {
+                if is_synthetic_copy_key(*key)
+                    || key.nvmap_id != nvmap_id
+                    || key.width != width
+                    || key.height != height
+                    || key.depth != 1
+                    || key.is_3d
+                    || key.gpu_va != gpu_va
+                    || self.present_excluded.contains(key)
+                {
+                    continue;
+                }
+                let Some(image) = self.cache.get(key) else {
+                    continue;
+                };
+                if image.layout == vk::ImageLayout::UNDEFINED {
+                    continue;
+                }
+                let Some(stamp) = self
+                    .drawn_stamp
+                    .get(key)
+                    .copied()
+                    .filter(|stamp| *stamp != 0)
+                else {
+                    continue;
+                };
+                if best.is_none_or(|(_, best_stamp)| stamp > best_stamp) {
+                    best = Some((*key, stamp));
+                }
+            }
+        }
+        best
+    }
+
     pub fn present_alias_vas(&self, want: RtKey) -> Vec<u64> {
         let mut vas: Vec<u64> = self
             .present_candidates(want)
@@ -1530,8 +1584,25 @@ impl RtCache {
         vk::Format,
         vk::ImageAspectFlags,
     )> {
-        self.find_depth(want)
-            .filter(|(key, _, _, _, _, _)| !self.depth_is_guest_stale(*key))
+        let (key, img) = if let Some(img) = self.depth_cache.get(&want) {
+            (want, img)
+        } else {
+            self.depth_cache
+                .iter()
+                .find(|(key, _)| same_physical_backing(**key, want))
+                .map(|(key, img)| (*key, img))?
+        };
+        if self.depth_is_guest_stale(key) {
+            return None;
+        }
+        Some((
+            key,
+            img.image,
+            img.view,
+            img.layout,
+            img.format,
+            img.aspects,
+        ))
     }
 
     pub fn find_d24_depth_covering(
@@ -1685,8 +1756,22 @@ impl RtCache {
         &self,
         want: RtKey,
     ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
-        self.find_color_with_format(want)
-            .filter(|(key, _, _, _, _)| !self.color_is_guest_stale(*key))
+        let (key, img) = if let Some(img) = self.cache.get(&want) {
+            (want, img)
+        } else if is_synthetic_copy_key(want) {
+            return None;
+        } else {
+            self.cache
+                .iter()
+                .find(|(key, _)| {
+                    !is_synthetic_copy_key(**key) && same_physical_backing(**key, want)
+                })
+                .map(|(key, img)| (*key, img))?
+        };
+        if self.color_is_guest_stale(key) {
+            return None;
+        }
+        Some((key, img.image, img.view, img.layout, img.format))
     }
 
     pub fn find_drawn_color_at(
@@ -2619,6 +2704,81 @@ mod tests {
     }
 
     #[test]
+    fn newest_exact_present_key_uses_freshest_supplied_va_only() {
+        const OLD_VA: u64 = 0x5400_7000_0;
+        const NEW_VA: u64 = 0x5408_e000_0;
+        const OTHER_VA: u64 = 0x5324_7000_0;
+        let old = RtKey::new(7, 1280, 720, OLD_VA);
+        let new = RtKey::new(7, 1280, 720, NEW_VA);
+        let not_supplied = RtKey::new(7, 1280, 720, OTHER_VA);
+        let wrong_nvmap = RtKey::new(8, 1280, 720, NEW_VA);
+        let wrong_extent = RtKey::new(7, 640, 360, NEW_VA);
+        let mut cache = RtCache::new();
+        for key in [old, new, not_supplied, wrong_nvmap, wrong_extent] {
+            cache.insert_color_image(
+                key,
+                test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+            );
+            cache.mark_drawn(key);
+        }
+        let old_stamp = cache.mark_drawn(old);
+
+        assert_eq!(
+            cache.newest_exact_present_key_at_vas(7, 1280, 720, &[0, NEW_VA, OLD_VA]),
+            Some((old, old_stamp))
+        );
+        assert_eq!(
+            cache.newest_exact_present_key_at_vas(7, 1280, 720, &[OTHER_VA]),
+            Some((not_supplied, 3))
+        );
+        assert_eq!(
+            cache.newest_exact_present_key_at_vas(7, 1280, 720, &[0xdead_beef]),
+            None
+        );
+
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn newest_exact_present_key_rejects_excluded_undefined_and_invalid_requests() {
+        const VA_A: u64 = 0x5400_7000_0;
+        const VA_B: u64 = 0x5408_e000_0;
+        let excluded = RtKey::new(7, 1280, 720, VA_A);
+        let undefined = RtKey::new(7, 1280, 720, VA_B);
+        let mut cache = RtCache::new();
+        for key in [excluded, undefined] {
+            cache.insert_color_image(
+                key,
+                test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+            );
+            cache.mark_drawn(key);
+        }
+        cache.mark_synced_sample(excluded);
+        cache.get_existing(undefined).unwrap().layout = vk::ImageLayout::UNDEFINED;
+
+        assert_eq!(
+            cache.newest_exact_present_key_at_vas(7, 1280, 720, &[VA_A, VA_B]),
+            None
+        );
+        assert_eq!(
+            cache.newest_exact_present_key_at_vas(0, 1280, 720, &[VA_A]),
+            None
+        );
+        assert_eq!(
+            cache.newest_exact_present_key_at_vas(u32::MAX, 1280, 720, &[VA_A]),
+            None
+        );
+        assert_eq!(
+            cache.newest_exact_present_key_at_vas(7, 0, 720, &[VA_A]),
+            None
+        );
+
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
     fn region_lookup_can_exclude_stale_exact_destination() {
         const VA: u64 = 0x5a0e_a1000;
         let exact = RtKey::new(584, 2, 1, VA);
@@ -3059,6 +3219,74 @@ mod tests {
         cache.forget_depth_tracking(source);
         assert_eq!(cache.depth_generation(source), None);
         assert!(!cache.depth_shadow_is_current(source, shadow));
+    }
+
+    #[test]
+    fn sampleable_color_lookup_rejects_fuzzy_extent_aliases() {
+        const VA: u64 = 0x5340_0000;
+        const CPU: u64 = 0x8340_0000;
+        let stored = RtKey::with_cpu(91, 128, 128, VA, CPU);
+        let mismatched_extent = RtKey::with_cpu(91, 96, 96, VA, CPU);
+        let same_backing = RtKey::with_cpu(91, 128, 128, VA + 0x10_000, CPU);
+        let mut cache = RtCache::new();
+        cache.insert_color_image(
+            stored,
+            test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+        );
+
+        assert_eq!(
+            cache
+                .find_color_with_format(mismatched_extent)
+                .map(|result| result.0),
+            Some(stored)
+        );
+        assert!(cache
+            .find_sampleable_color_with_format(mismatched_extent)
+            .is_none());
+        assert_eq!(
+            cache
+                .find_sampleable_color_with_format(stored)
+                .map(|result| result.0),
+            Some(stored)
+        );
+        assert_eq!(
+            cache
+                .find_sampleable_color_with_format(same_backing)
+                .map(|result| result.0),
+            Some(stored)
+        );
+
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn sampleable_depth_lookup_rejects_fuzzy_extent_aliases() {
+        const VA: u64 = 0x5350_0000;
+        const CPU: u64 = 0x8350_0000;
+        let stored = RtKey::with_cpu(92, 128, 128, VA, CPU);
+        let fuzzy_request = RtKey::request(92, 96, 96);
+        let same_backing = RtKey::with_cpu(92, 128, 128, VA + 0x10_000, CPU);
+        let mut cache = RtCache::new();
+        cache.depth_cache.insert(stored, test_depth_image());
+
+        assert_eq!(
+            cache.find_depth(fuzzy_request).map(|result| result.0),
+            Some(stored)
+        );
+        assert!(cache.find_sampleable_depth(fuzzy_request).is_none());
+        assert_eq!(
+            cache.find_sampleable_depth(stored).map(|result| result.0),
+            Some(stored)
+        );
+        assert_eq!(
+            cache
+                .find_sampleable_depth(same_backing)
+                .map(|result| result.0),
+            Some(stored)
+        );
+
+        cache.depth_cache.clear();
     }
 
     #[test]
