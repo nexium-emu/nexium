@@ -1022,12 +1022,6 @@ impl EmulationHandle {
                                     .collect();
                                 log::info!("[mw3d-methods] {}", pretty.join(" "));
                             }
-                            if let Some(period) = forced_snapshot_period {
-                                if last_forced_snapshot.elapsed() >= period {
-                                    guard.log_thread_snapshot("periodic");
-                                    last_forced_snapshot = std::time::Instant::now();
-                                }
-                            }
                             if gpu_progress {
                                 last_render_progress = std::time::Instant::now();
                                 seen_render_progress = true;
@@ -1097,6 +1091,12 @@ impl EmulationHandle {
                         }
                     }
 
+                    if let Some(period) = forced_snapshot_period {
+                        if last_forced_snapshot.elapsed() >= period {
+                            guard.log_thread_snapshot("periodic");
+                            last_forced_snapshot = std::time::Instant::now();
+                        }
+                    }
                     if guard.ensure_thread_loaded().is_none() {
                         guard.tick_audio_renderers();
                         guard.threads.wake_due_sleepers(std::time::Instant::now());
