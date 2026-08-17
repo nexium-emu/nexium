@@ -7914,6 +7914,10 @@ impl eframe::App for HorizonApp {
                                 self.debugger.toggle_disasm();
                                 ui.close_menu();
                             }
+                            if ui.button("Wait Tree").clicked() {
+                                self.debugger.toggle_wait_tree();
+                                ui.close_menu();
+                            }
                             if ui.button("Logs").clicked() {
                                 self.debugger.toggle_logs();
                                 ui.close_menu();
@@ -9654,6 +9658,18 @@ fn logging_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_neede
     );
 }
 
+fn wait_tree_color(class: nexium_kernel::kernel::ThreadWaitClass) -> Color32 {
+    use nexium_kernel::kernel::ThreadWaitClass as C;
+    match class {
+        C::Running => GREEN,
+        C::Ready => Color32::from_rgb(0x2f, 0x9e, 0x4f),
+        C::Sleeping => AMBER,
+        C::Waiting => Color32::from_rgb(0xe5, 0x53, 0x53),
+        C::Created => Color32::from_rgb(0x46, 0xc8, 0xd8),
+        C::Exited => MUTED,
+    }
+}
+
 fn debug_windows(
     ctx: &egui::Context,
     dbg: &mut DebuggerState,
@@ -9875,6 +9891,115 @@ fn debug_windows(
                                         );
                                     });
                                     off += 4;
+                                }
+                            });
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new("No emulation running")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                }
+            });
+    }
+
+    if dbg.show_wait_tree {
+        egui::Window::new("Wait Tree")
+            .open(&mut dbg.show_wait_tree)
+            .default_size([580.0, 440.0])
+            .show(ctx, |ui| {
+                if let Some(snap) = snapshot {
+                    if snap.threads.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No thread data yet")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                    } else {
+                        use nexium_kernel::kernel::ThreadWaitClass;
+                        let count = |class: ThreadWaitClass| {
+                            snap.threads
+                                .iter()
+                                .filter(|t| t.state_class == class)
+                                .count()
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} threads — {} running, {} ready, {} waiting, {} sleeping",
+                                snap.threads.len(),
+                                count(ThreadWaitClass::Running),
+                                count(ThreadWaitClass::Ready),
+                                count(ThreadWaitClass::Waiting),
+                                count(ThreadWaitClass::Sleeping),
+                            ))
+                            .size(11.0)
+                            .color(MUTED),
+                        );
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false; 2])
+                            .show(ui, |ui| {
+                                for t in &snap.threads {
+                                    let color = wait_tree_color(t.state_class);
+                                    let header = format!(
+                                        "{:#06x} tid={:<3} core={} prio={:<2} {}",
+                                        t.handle, t.tid, t.core, t.effective_priority, t.status
+                                    );
+                                    egui::CollapsingHeader::new(
+                                        egui::RichText::new(header)
+                                            .size(12.0)
+                                            .monospace()
+                                            .color(color),
+                                    )
+                                    .show(ui, |ui| {
+                                        let row = |ui: &mut egui::Ui, text: String| {
+                                            ui.label(
+                                                egui::RichText::new(text)
+                                                    .size(11.5)
+                                                    .monospace()
+                                                    .color(TEXT),
+                                            );
+                                        };
+                                        if !t.detail.is_empty() {
+                                            row(ui, t.detail.clone());
+                                        }
+                                        row(
+                                            ui,
+                                            format!(
+                                                "processor = core {} (ideal {}, affinity {:#x})",
+                                                t.core, t.ideal_core, t.affinity_mask
+                                            ),
+                                        );
+                                        row(
+                                            ui,
+                                            format!(
+                                                "priority = {} (current) / {} (base)",
+                                                t.effective_priority, t.priority
+                                            ),
+                                        );
+                                        row(ui, format!("PC = {:#x} LR = {:#x}", t.pc, t.lr));
+                                        if t.waiters.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new("waited by no thread")
+                                                    .size(11.5)
+                                                    .monospace()
+                                                    .color(MUTED),
+                                            );
+                                        } else {
+                                            row(
+                                                ui,
+                                                format!(
+                                                    "waited by: {}",
+                                                    t.waiters
+                                                        .iter()
+                                                        .map(|h| format!("{:#x}", h))
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                ),
+                                            );
+                                        }
+                                    });
                                 }
                             });
                     }

@@ -142,6 +142,33 @@ pub struct ExitedThreadState {
     pub priority: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadWaitClass {
+    Running,
+    Ready,
+    Created,
+    Sleeping,
+    Waiting,
+    Exited,
+}
+
+#[derive(Clone, Debug)]
+pub struct ThreadWaitEntry {
+    pub handle: u32,
+    pub tid: u64,
+    pub state_class: ThreadWaitClass,
+    pub status: String,
+    pub detail: String,
+    pub core: i32,
+    pub ideal_core: i32,
+    pub affinity_mask: u64,
+    pub priority: i32,
+    pub effective_priority: i32,
+    pub pc: u64,
+    pub lr: u64,
+    pub waiters: Vec<u32>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AudioAdpcmContext {
     pub header: u8,
@@ -497,6 +524,127 @@ impl Kernel {
         } else {
             format!("{:#x}:{}:{}", handle, ty, tags.join("|"))
         }
+    }
+
+    pub fn thread_wait_tree(&self) -> Vec<ThreadWaitEntry> {
+        let mut handles: Vec<u32> = self.threads.threads.keys().copied().collect();
+        handles.sort_unstable();
+        let mut entries = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let Some(t) = self.threads.threads.get(&handle) else {
+                continue;
+            };
+            let (state_class, status, detail) = match &t.state {
+                threads::ThreadState::Created => {
+                    (ThreadWaitClass::Created, "initialized", String::new())
+                }
+                threads::ThreadState::Ready => (ThreadWaitClass::Ready, "ready", String::new()),
+                threads::ThreadState::Running => {
+                    (ThreadWaitClass::Running, "running", String::new())
+                }
+                threads::ThreadState::Sleeping { wake_at } => (
+                    ThreadWaitClass::Sleeping,
+                    "sleeping",
+                    Self::debug_wait_deadline(Some(*wake_at)),
+                ),
+                threads::ThreadState::WaitingHandle { handles, wake_at } => {
+                    let waited = handles
+                        .iter()
+                        .map(|h| self.debug_handle_tags(*h))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (
+                        ThreadWaitClass::Waiting,
+                        "waiting for objects",
+                        format!("[{}] {}", waited, Self::debug_wait_deadline(*wake_at)),
+                    )
+                }
+                threads::ThreadState::WaitingMutex {
+                    mutex_addr,
+                    owner_handle,
+                    tag,
+                } => (
+                    ThreadWaitClass::Waiting,
+                    "waiting for mutex",
+                    format!(
+                        "addr={:#x} owner={:#x} tag={:#x} word={:#x}",
+                        mutex_addr,
+                        owner_handle,
+                        tag,
+                        self.debug_read_u32(*mutex_addr).unwrap_or(0)
+                    ),
+                ),
+                threads::ThreadState::WaitingCondvar {
+                    mutex_addr,
+                    condvar_addr,
+                    wake_at,
+                    ..
+                } => (
+                    ThreadWaitClass::Waiting,
+                    "waiting for condition variable",
+                    format!(
+                        "cond={:#x} mutex={:#x} pending={} {}",
+                        condvar_addr,
+                        mutex_addr,
+                        self.pending_condvar_signals
+                            .get(condvar_addr)
+                            .copied()
+                            .unwrap_or(0),
+                        Self::debug_wait_deadline(*wake_at)
+                    ),
+                ),
+                threads::ThreadState::WaitingArbiter {
+                    addr,
+                    value,
+                    wake_at,
+                } => (
+                    ThreadWaitClass::Waiting,
+                    "waiting for address arbiter",
+                    format!(
+                        "addr={:#x} expected={:#x} word={:#x} {}",
+                        addr,
+                        value,
+                        self.debug_read_u32(*addr).unwrap_or(0),
+                        Self::debug_wait_deadline(*wake_at)
+                    ),
+                ),
+                threads::ThreadState::Exited => {
+                    (ThreadWaitClass::Exited, "terminated", String::new())
+                }
+            };
+            let mut waiters: Vec<u32> = self
+                .threads
+                .threads
+                .iter()
+                .filter(|(_, other)| match &other.state {
+                    threads::ThreadState::WaitingMutex { owner_handle, .. } => {
+                        *owner_handle == handle
+                    }
+                    threads::ThreadState::WaitingHandle { handles, .. } => {
+                        handles.contains(&handle)
+                    }
+                    _ => false,
+                })
+                .map(|(h, _)| *h)
+                .collect();
+            waiters.sort_unstable();
+            entries.push(ThreadWaitEntry {
+                handle,
+                tid: t.tid,
+                state_class,
+                status: status.to_string(),
+                detail,
+                core: t.core,
+                ideal_core: t.ideal_core,
+                affinity_mask: t.affinity_mask,
+                priority: t.priority,
+                effective_priority: self.threads.effective_priority(handle),
+                pc: t.ctx.pc,
+                lr: t.ctx.x[30],
+                waiters,
+            });
+        }
+        entries
     }
 
     pub fn log_thread_snapshot(&self, label: &str) {
@@ -1472,6 +1620,41 @@ mod user_preemption_tests {
         let mut unmapped = test_kernel(false);
         assert!(!unmapped.defer_user_preemption_if_disabled());
         assert!(!unmapped.threads.current_user_preemption_pending());
+    }
+
+    #[test]
+    fn thread_wait_tree_reports_states_and_waiters() {
+        let mut kernel = test_kernel(false);
+        const OWNER: u32 = 0xa100;
+        const BLOCKED: u32 = 0xa200;
+        kernel
+            .threads
+            .add_thread(OWNER, threads::ThreadCtx::zero(), 0, 0, 0);
+        kernel
+            .threads
+            .transition_state(OWNER, threads::ThreadState::Ready);
+        kernel
+            .threads
+            .add_thread(BLOCKED, threads::ThreadCtx::zero(), 0, 0, 0);
+        kernel.threads.transition_state(
+            BLOCKED,
+            threads::ThreadState::WaitingMutex {
+                mutex_addr: 0x1000,
+                owner_handle: OWNER,
+                tag: OWNER,
+            },
+        );
+
+        let tree = kernel.thread_wait_tree();
+        let owner = tree.iter().find(|e| e.handle == OWNER).unwrap();
+        let blocked = tree.iter().find(|e| e.handle == BLOCKED).unwrap();
+
+        assert_eq!(owner.state_class, ThreadWaitClass::Ready);
+        assert_eq!(owner.waiters, vec![BLOCKED]);
+        assert_eq!(blocked.state_class, ThreadWaitClass::Waiting);
+        assert_eq!(blocked.status, "waiting for mutex");
+        assert!(blocked.detail.contains("owner=0xa100"));
+        assert!(blocked.waiters.is_empty());
     }
 
     #[test]

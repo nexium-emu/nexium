@@ -442,6 +442,7 @@ pub struct CpuSnapshot {
     pub mem_address: u64,
     pub mem_data: Vec<u8>,
     pub mem_request_address: u64,
+    pub threads: Vec<nexium_kernel::kernel::ThreadWaitEntry>,
 }
 
 #[derive(Clone, Default)]
@@ -1371,6 +1372,7 @@ impl EmulationHandle {
                             if guard.address_space.read(snap.pc, &mut instr_buf).is_ok() {
                                 snap.instruction_bytes = instr_buf;
                             }
+                            snap.threads = guard.thread_wait_tree();
                             let mem_req = *mem_request_clone.lock();
                             if mem_req != 0 {
                                 snap.mem_request_address = mem_req;

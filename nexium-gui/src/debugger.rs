@@ -40,6 +40,7 @@ pub struct DebuggerState {
     pub show_disasm: bool,
     pub show_logs: bool,
     pub show_performance: bool,
+    pub show_wait_tree: bool,
     pub log_history: Arc<Mutex<LogHistory>>,
 }
 
@@ -54,6 +55,7 @@ impl DebuggerState {
             show_disasm: false,
             show_logs: false,
             show_performance: false,
+            show_wait_tree: false,
             log_history: Arc::new(Mutex::new(LogHistory::new(1000))),
         }
     }
@@ -80,6 +82,10 @@ impl DebuggerState {
 
     pub fn toggle_performance(&mut self) {
         self.show_performance = !self.show_performance;
+    }
+
+    pub fn toggle_wait_tree(&mut self) {
+        self.show_wait_tree = !self.show_wait_tree;
     }
 }
 
