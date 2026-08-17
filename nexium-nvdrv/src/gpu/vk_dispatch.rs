@@ -544,6 +544,7 @@ struct CbufPackMemoSlot {
 }
 
 struct CbufPackMemoEntry {
+    fingerprint: u64,
     key: CbufPackKey,
     slots: Vec<CbufPackMemoSlot>,
     payload: nexium_gpu::draw::GraphicsCbufPayload,
@@ -2097,13 +2098,14 @@ impl SsboSnapshotCache {
 
     fn packed_cbuf_memo_lookup(
         &mut self,
+        fingerprint: u64,
         key: &CbufPackKey,
         map_generation: u64,
     ) -> Option<nexium_gpu::draw::GraphicsCbufPayload> {
         let index = self
             .packed_cbuf_memo
             .iter()
-            .position(|entry| entry.key == *key)?;
+            .position(|entry| entry.fingerprint == fingerprint && entry.key == *key)?;
         let valid = self.packed_cbuf_memo[index].slots.iter().all(|slot| {
             self.cbuf_slot_states
                 .get(slot.logical_slot)
@@ -2128,6 +2130,7 @@ impl SsboSnapshotCache {
 
     fn packed_cbuf_memo_store(
         &mut self,
+        fingerprint: u64,
         key: CbufPackKey,
         slots: Vec<CbufPackMemoSlot>,
         payload: nexium_gpu::draw::GraphicsCbufPayload,
@@ -2135,7 +2138,7 @@ impl SsboSnapshotCache {
         if let Some(index) = self
             .packed_cbuf_memo
             .iter()
-            .position(|entry| entry.key == key)
+            .position(|entry| entry.fingerprint == fingerprint && entry.key == key)
         {
             self.packed_cbuf_memo.remove(index);
         } else if self.packed_cbuf_memo.len() >= PACKED_CBUF_MEMO_CAPACITY {
@@ -2144,6 +2147,7 @@ impl SsboSnapshotCache {
         self.packed_cbuf_memo.insert(
             0,
             CbufPackMemoEntry {
+                fingerprint,
                 key,
                 slots,
                 payload,
@@ -16476,9 +16480,13 @@ fn pack_cbuf_data_with_requirements(
         }
         super::pusher::kickprof::add(super::pusher::kickprof::CBUF_SLOTS, kp_res);
     }
-    let pack_key = {
+    let (pack_key, pack_fingerprint) = {
         let mut binds = [(0u64, 0u32); PACKED_CBUF_SLOTS];
         let mut key_read_lens = [0u32; PACKED_CBUF_SLOTS];
+        let mut fold = TemplateFold::new();
+        fold.u64(used);
+        fold.u64(vs_cbuf_group as u64);
+        fold.u64(fs_cbuf_group as u64);
         let mut remaining = used;
         while remaining != 0 {
             let logical_slot = remaining.trailing_zeros() as usize;
@@ -16503,15 +16511,22 @@ fn pack_cbuf_data_with_requirements(
                 required_read_lens[logical_slot].min(bound_len)
             };
             key_read_lens[logical_slot] = len as u32;
+            fold.u64(addr);
+            fold.u32(size);
+            fold.u32(len as u32);
         }
-        CbufPackKey {
-            used,
-            groups: (vs_cbuf_group, fs_cbuf_group),
-            binds,
-            read_lens: key_read_lens,
-        }
+        (
+            CbufPackKey {
+                used,
+                groups: (vs_cbuf_group, fs_cbuf_group),
+                binds,
+                read_lens: key_read_lens,
+            },
+            fold.0,
+        )
     };
-    if let Some(payload) = snapshot_cache.packed_cbuf_memo_lookup(&pack_key, mappings.generation())
+    if let Some(payload) =
+        snapshot_cache.packed_cbuf_memo_lookup(pack_fingerprint, &pack_key, mappings.generation())
     {
         super::pusher::kickprof::count(super::pusher::kickprof::CBUF_PACK_MEMO, 1);
         return (Some(payload), None);
@@ -16617,7 +16632,12 @@ fn pack_cbuf_data_with_requirements(
         let payload = GraphicsCbufPayload::from_slots(packed_size, slots)
             .expect("validated graphics cbuf slot layout");
         if memoizable {
-            snapshot_cache.packed_cbuf_memo_store(pack_key, memo_slots, payload.clone());
+            snapshot_cache.packed_cbuf_memo_store(
+                pack_fingerprint,
+                pack_key,
+                memo_slots,
+                payload.clone(),
+            );
         }
         super::pusher::kickprof::add(super::pusher::kickprof::CBUF_PACK, kp_pack);
         return (Some(payload), None);
