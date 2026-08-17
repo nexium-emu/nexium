@@ -529,28 +529,11 @@ fn storage_pointer_source_mask(descriptors: &[nexium_shader::StorageBufferAddr])
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub(crate) struct CbufPackKey {
     used: u64,
+    requirements: usize,
     groups: (usize, usize),
     binds: [(u64, u32); nexium_spirv::GFX_CBUF_SLOTS as usize],
-    read_lens: [u32; nexium_spirv::GFX_CBUF_SLOTS as usize],
+    epoch: u64,
 }
-
-struct CbufPackMemoSlot {
-    logical_slot: usize,
-    gpu_addr: u64,
-    bound_size: u32,
-    len: usize,
-    source_offset: usize,
-    data: Arc<Vec<u8>>,
-}
-
-struct CbufPackMemoEntry {
-    fingerprint: u64,
-    key: CbufPackKey,
-    slots: Vec<CbufPackMemoSlot>,
-    payload: nexium_gpu::draw::GraphicsCbufPayload,
-}
-
-const PACKED_CBUF_MEMO_CAPACITY: usize = 16;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct SsboSnapshotCacheKey {
@@ -848,7 +831,8 @@ struct PreparedIndexCacheEntry {
 pub(crate) struct SsboSnapshotCache {
     mirror: MirrorPageCache,
     cbuf_slot_states: [Vec<CbufSlotState>; PACKED_CBUF_SLOTS],
-    packed_cbuf_memo: Vec<CbufPackMemoEntry>,
+    input_mutation_epoch: u64,
+    last_packed_cbuf: Option<(CbufPackKey, nexium_gpu::draw::GraphicsCbufPayload)>,
     entries: std::collections::HashMap<SsboSnapshotCacheKey, Arc<Vec<u8>>>,
     full_watch_ranges: std::collections::HashMap<SsboSnapshotCacheKey, HostWatchRange>,
     input_entries: HashMap<InputRangeKey, InputRangeEntry>,
@@ -1181,7 +1165,8 @@ impl SsboSnapshotCache {
         Self {
             mirror: MirrorPageCache::new(),
             cbuf_slot_states: std::array::from_fn(|_| Vec::new()),
-            packed_cbuf_memo: Vec::new(),
+            input_mutation_epoch: 0,
+            last_packed_cbuf: None,
             entries: HashMap::new(),
             full_watch_ranges: HashMap::new(),
             input_entries: HashMap::new(),
@@ -1937,6 +1922,7 @@ impl SsboSnapshotCache {
     }
 
     fn remove_input_entry(&mut self, key: InputRangeKey) -> Option<InputRangeEntry> {
+        self.input_mutation_epoch = self.input_mutation_epoch.wrapping_add(1);
         let entry = self.input_entries.remove(&key)?;
         self.input_bytes = self.input_bytes.saturating_sub(entry.data.len());
         Self::remove_input_page_range(&mut self.input_gpu_pages, key.gpu_addr, key.len, key);
@@ -2096,66 +2082,8 @@ impl SsboSnapshotCache {
         }
     }
 
-    fn packed_cbuf_memo_lookup(
-        &mut self,
-        fingerprint: u64,
-        key: &CbufPackKey,
-        map_generation: u64,
-    ) -> Option<nexium_gpu::draw::GraphicsCbufPayload> {
-        let index = self
-            .packed_cbuf_memo
-            .iter()
-            .position(|entry| entry.fingerprint == fingerprint && entry.key == *key)?;
-        let valid = self.packed_cbuf_memo[index].slots.iter().all(|slot| {
-            self.cbuf_slot_states
-                .get(slot.logical_slot)
-                .is_some_and(|states| {
-                    states.iter().any(|state| {
-                        state.gpu_addr == slot.gpu_addr
-                            && state.bound_size == slot.bound_size
-                            && state.len == slot.len
-                            && state.map_generation == map_generation
-                            && state.snapshot.source_offset == slot.source_offset
-                            && Arc::ptr_eq(&state.snapshot.data, &slot.data)
-                    })
-                })
-        });
-        if !valid {
-            self.packed_cbuf_memo.remove(index);
-            return None;
-        }
-        self.packed_cbuf_memo[..=index].rotate_right(1);
-        Some(self.packed_cbuf_memo[0].payload.clone())
-    }
-
-    fn packed_cbuf_memo_store(
-        &mut self,
-        fingerprint: u64,
-        key: CbufPackKey,
-        slots: Vec<CbufPackMemoSlot>,
-        payload: nexium_gpu::draw::GraphicsCbufPayload,
-    ) {
-        if let Some(index) = self
-            .packed_cbuf_memo
-            .iter()
-            .position(|entry| entry.fingerprint == fingerprint && entry.key == key)
-        {
-            self.packed_cbuf_memo.remove(index);
-        } else if self.packed_cbuf_memo.len() >= PACKED_CBUF_MEMO_CAPACITY {
-            self.packed_cbuf_memo.pop();
-        }
-        self.packed_cbuf_memo.insert(
-            0,
-            CbufPackMemoEntry {
-                fingerprint,
-                key,
-                slots,
-                payload,
-            },
-        );
-    }
-
     fn invalidate_input_spans(&mut self, spans: &[InputInvalidationSpan]) {
+        self.input_mutation_epoch = self.input_mutation_epoch.wrapping_add(1);
         self.invalidate_cbuf_slot_states(spans);
         if spans.is_empty() || self.input_entries.is_empty() {
             return;
@@ -2216,6 +2144,7 @@ impl SsboSnapshotCache {
         watch_range: HostWatchRange,
         data: Arc<Vec<u8>>,
     ) {
+        self.input_mutation_epoch = self.input_mutation_epoch.wrapping_add(1);
         if data.len() > self.input_max_bytes || self.input_max_entries == 0 {
             return;
         }
@@ -2917,7 +2846,7 @@ impl SsboSnapshotCache {
 
     pub(crate) fn clear(&mut self) {
         self.mirror.clear_all();
-        self.packed_cbuf_memo.clear();
+        self.input_mutation_epoch = self.input_mutation_epoch.wrapping_add(1);
         for states in self.cbuf_slot_states.iter_mut() {
             states.clear();
         }
@@ -16480,13 +16409,8 @@ fn pack_cbuf_data_with_requirements(
         }
         super::pusher::kickprof::add(super::pusher::kickprof::CBUF_SLOTS, kp_res);
     }
-    let (pack_key, pack_fingerprint) = {
+    let pack_key = {
         let mut binds = [(0u64, 0u32); PACKED_CBUF_SLOTS];
-        let mut key_read_lens = [0u32; PACKED_CBUF_SLOTS];
-        let mut fold = TemplateFold::new();
-        fold.u64(used);
-        fold.u64(vs_cbuf_group as u64);
-        fold.u64(fs_cbuf_group as u64);
         let mut remaining = used;
         while remaining != 0 {
             let logical_slot = remaining.trailing_zeros() as usize;
@@ -16499,45 +16423,27 @@ fn pack_cbuf_data_with_requirements(
             } else {
                 fs_cbuf_group
             };
-            let (addr, size) = cbuf_binds[stage][logical_slot % GRAPHICS_CBUF_SLOTS];
-            binds[logical_slot] = (addr, size);
-            if addr == 0 || size == 0 {
-                continue;
-            }
-            let bound_len = (size as usize).min(nexium_spirv::GFX_CBUF_MAX_SIZE as usize);
-            let len = if unknown_read_lens[logical_slot] {
-                bound_len
-            } else {
-                required_read_lens[logical_slot].min(bound_len)
-            };
-            key_read_lens[logical_slot] = len as u32;
-            fold.u64(addr);
-            fold.u32(size);
-            fold.u32(len as u32);
+            binds[logical_slot] = cbuf_binds[stage][logical_slot % GRAPHICS_CBUF_SLOTS];
         }
-        (
-            CbufPackKey {
-                used,
-                groups: (vs_cbuf_group, fs_cbuf_group),
-                binds,
-                read_lens: key_read_lens,
-            },
-            fold.0,
-        )
+        CbufPackKey {
+            used,
+            requirements: requirements as *const PackedCbufReadRequirements as usize,
+            groups: (vs_cbuf_group, fs_cbuf_group),
+            binds,
+            epoch: snapshot_cache.input_mutation_epoch,
+        }
     };
-    if let Some(payload) =
-        snapshot_cache.packed_cbuf_memo_lookup(pack_fingerprint, &pack_key, mappings.generation())
-    {
-        super::pusher::kickprof::count(super::pusher::kickprof::CBUF_PACK_MEMO, 1);
-        return (Some(payload), None);
+    if let Some((cached_key, payload)) = snapshot_cache.last_packed_cbuf.as_ref() {
+        if *cached_key == pack_key {
+            super::pusher::kickprof::count(super::pusher::kickprof::CBUF_PACK_MEMO, 1);
+            return (Some(payload.clone()), None);
+        }
     }
     let mut guest_addrs = [0u64; PACKED_CBUF_SLOTS];
     let mut bound_sizes = [0u32; PACKED_CBUF_SLOTS];
     let mut read_lens = [0usize; PACKED_CBUF_SLOTS];
     let mut slot_data: [Option<InputSnapshot>; PACKED_CBUF_SLOTS] = std::array::from_fn(|_| None);
     let mut cacheable = !recheck;
-    let mut memoizable = true;
-    let mut memo_slots: Vec<CbufPackMemoSlot> = Vec::new();
     let kp_slots = super::pusher::kickprof::start();
     for logical_slot in 0..PACKED_CBUF_SLOTS {
         if (used & (1u64 << logical_slot)) == 0 {
@@ -16568,7 +16474,6 @@ fn pack_cbuf_data_with_requirements(
         }
 
         if let Some(data) = snapshot_cache.mirror_resolve_cbuf(mappings, addr, len, mem_read) {
-            memoizable = false;
             slot_data[logical_slot] = Some(data);
             continue;
         }
@@ -16592,14 +16497,6 @@ fn pack_cbuf_data_with_requirements(
                 data
             });
         if let Some(data) = data {
-            memo_slots.push(CbufPackMemoSlot {
-                logical_slot,
-                gpu_addr: addr,
-                bound_size: size,
-                len,
-                source_offset: data.source_offset,
-                data: data.data.clone(),
-            });
             slot_data[logical_slot] = Some(data);
         } else {
             cacheable = false;
@@ -16631,14 +16528,13 @@ fn pack_cbuf_data_with_requirements(
         }
         let payload = GraphicsCbufPayload::from_slots(packed_size, slots)
             .expect("validated graphics cbuf slot layout");
-        if memoizable {
-            snapshot_cache.packed_cbuf_memo_store(
-                pack_fingerprint,
-                pack_key,
-                memo_slots,
-                payload.clone(),
-            );
-        }
+        snapshot_cache.last_packed_cbuf = Some((
+            CbufPackKey {
+                epoch: snapshot_cache.input_mutation_epoch,
+                ..pack_key
+            },
+            payload.clone(),
+        ));
         super::pusher::kickprof::add(super::pusher::kickprof::CBUF_PACK, kp_pack);
         return (Some(payload), None);
     }
@@ -19349,136 +19245,6 @@ mod tests {
         let second_packed = second.materialize();
         assert_eq!(packed_cbuf_slot(&first_packed, 0).unwrap()[3], 0x13);
         assert_eq!(packed_cbuf_slot(&second_packed, 0).unwrap()[3], 0x7c);
-        cache.clear();
-        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn packed_cbuf_memo_serves_alternating_bind_sets() {
-        const GPU_VA: u64 = 0x41c0_0000;
-        const CPU_VA: u64 = 0xeb_3000_0000;
-        const ARENA_LEN: usize = 0x1000;
-        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).expect("fastmem test arena");
-        unsafe {
-            for offset in 0..ARENA_LEN {
-                ptr.add(offset).write(offset as u8);
-            }
-        }
-        let mut mappings = crate::gpu::GpuMappings::new();
-        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
-        let reads = std::cell::Cell::new(0usize);
-        let read = |cpu_addr: u64, dst: &mut [u8]| {
-            reads.set(reads.get() + 1);
-            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
-            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
-            true
-        };
-        let mut binds_a = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
-        binds_a[0][0] = (GPU_VA, 8);
-        let mut binds_b = binds_a;
-        binds_b[0][0] = (GPU_VA + 0x80, 8);
-        let mut cache = SsboSnapshotCache::default();
-
-        let first_a = pack_cbuf_data(&binds_a, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
-        let first_b = pack_cbuf_data(&binds_b, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
-        let warm_reads = reads.get();
-        let second_a = pack_cbuf_data(&binds_a, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
-        let second_b = pack_cbuf_data(&binds_b, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
-
-        assert_eq!(cache.packed_cbuf_memo.len(), 2);
-        assert_eq!(reads.get(), warm_reads);
-        assert!(std::sync::Arc::ptr_eq(
-            first_a.slots().unwrap()[0].data(),
-            second_a.slots().unwrap()[0].data()
-        ));
-        assert!(std::sync::Arc::ptr_eq(
-            first_b.slots().unwrap()[0].data(),
-            second_b.slots().unwrap()[0].data()
-        ));
-        assert_eq!(first_a.materialize(), second_a.materialize());
-        assert_eq!(first_b.materialize(), second_b.materialize());
-        assert_eq!(
-            packed_cbuf_slot(&second_b.materialize(), 0),
-            Some(&[0x80u8, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87][..])
-        );
-        cache.clear();
-        assert!(cache.packed_cbuf_memo.is_empty());
-        nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn packed_cbuf_memo_distinguishes_read_requirements() {
-        use nexium_gpu::bundle_cache::{CbufIndexOrigin, CbufRead};
-
-        const GPU_VA: u64 = 0x41d0_0000;
-        const CPU_VA: u64 = 0xeb_4000_0000;
-        const ARENA_LEN: usize = 0x1000;
-        let ptr = nexium_memory::fastmem::commit(CPU_VA, ARENA_LEN).expect("fastmem test arena");
-        unsafe {
-            for offset in 0..ARENA_LEN {
-                ptr.add(offset).write(offset as u8);
-            }
-        }
-        let mut mappings = crate::gpu::GpuMappings::new();
-        mappings.add(GPU_VA, ARENA_LEN as u64, CPU_VA, 1);
-        let reads = std::cell::Cell::new(0usize);
-        let read = |cpu_addr: u64, dst: &mut [u8]| {
-            reads.set(reads.get() + 1);
-            let offset = usize::try_from(cpu_addr - CPU_VA).unwrap();
-            unsafe { std::ptr::copy_nonoverlapping(ptr.add(offset), dst.as_mut_ptr(), dst.len()) };
-            true
-        };
-        let mut binds = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
-        binds[0][0] = (GPU_VA, 0x100);
-        let trim_reads = [CbufRead {
-            logical_slot: 0,
-            byte_offset: 0x10,
-            index_origin: CbufIndexOrigin::Static,
-        }];
-        let mut cache = SsboSnapshotCache::default();
-
-        let trimmed = pack_cbuf_data(
-            &binds,
-            1,
-            0,
-            0,
-            4,
-            &trim_reads,
-            &mut cache,
-            &mappings,
-            &read,
-        );
-        let full = pack_cbuf_data(&binds, 1, 0, 0, 4, &[], &mut cache, &mappings, &read);
-        let warm_reads = reads.get();
-        let trimmed_again = pack_cbuf_data(
-            &binds,
-            1,
-            0,
-            0,
-            4,
-            &trim_reads,
-            &mut cache,
-            &mappings,
-            &read,
-        );
-
-        assert_eq!(cache.packed_cbuf_memo.len(), 2);
-        assert_eq!(reads.get(), warm_reads);
-        assert_eq!(
-            packed_cbuf_slot(&trimmed.materialize(), 0).unwrap().len(),
-            0x14
-        );
-        assert_eq!(
-            packed_cbuf_slot(&full.materialize(), 0).unwrap().len(),
-            0x100
-        );
-        assert_eq!(trimmed.materialize(), trimmed_again.materialize());
-        assert!(std::sync::Arc::ptr_eq(
-            trimmed.slots().unwrap()[0].data(),
-            trimmed_again.slots().unwrap()[0].data()
-        ));
         cache.clear();
         nexium_memory::fastmem::decommit(ptr, ARENA_LEN);
     }
