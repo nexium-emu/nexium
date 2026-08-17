@@ -59,7 +59,18 @@ fn main() -> Result<(), eframe::Error> {
         panic!("Logger initialization failed");
     });
 
-    if let Err(e) = logger.init(settings.log_level.to_filter()) {
+    let log_filter = std::env::var("NEXIUM_LOG_LEVEL")
+        .ok()
+        .and_then(|value| match value.to_ascii_lowercase().as_str() {
+            "error" => Some(log::LevelFilter::Error),
+            "warn" => Some(log::LevelFilter::Warn),
+            "info" => Some(log::LevelFilter::Info),
+            "debug" => Some(log::LevelFilter::Debug),
+            "trace" => Some(log::LevelFilter::Trace),
+            _ => None,
+        })
+        .unwrap_or_else(|| settings.log_level.to_filter());
+    if let Err(e) = logger.init(log_filter) {
         eprintln!("Failed to set logger: {}", e);
     }
 
