@@ -137,6 +137,59 @@ static ARENA_WRITE_WATCH: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 static COMMITTED_RANGES: OnceLock<Mutex<Vec<CommittedRange>>> = OnceLock::new();
 static COMMIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+const OBSERVED_WRITE_PAGE_SHIFT: u64 = 16;
+const OBSERVED_WRITE_PAGE_MASK: u64 = !((1u64 << OBSERVED_WRITE_PAGE_SHIFT) - 1);
+static OBSERVED_WRITE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OBSERVED_WRITE_GENERATIONS: OnceLock<Mutex<std::collections::HashMap<u64, u64>>> =
+    OnceLock::new();
+
+fn observed_write_generations() -> &'static Mutex<std::collections::HashMap<u64, u64>> {
+    OBSERVED_WRITE_GENERATIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(windows)]
+fn record_observed_write_pages(base: *mut u8, addresses: &[usize]) {
+    if addresses.is_empty() {
+        return;
+    }
+    let serial = OBSERVED_WRITE_SERIAL
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    let base_addr = base as usize as u64;
+    let mut generations = observed_write_generations()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for &address in addresses {
+        let guest_va = (address as u64).saturating_sub(base_addr);
+        let generation = generations
+            .entry(guest_va & OBSERVED_WRITE_PAGE_MASK)
+            .or_insert(0);
+        *generation = (*generation).max(serial);
+    }
+}
+
+pub fn observed_write_generation_range(va: u64, len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let start = va & OBSERVED_WRITE_PAGE_MASK;
+    let Some(end_unaligned) = va.checked_add(len as u64) else {
+        return u64::MAX;
+    };
+    let end = end_unaligned.saturating_add((1u64 << OBSERVED_WRITE_PAGE_SHIFT) - 1)
+        & OBSERVED_WRITE_PAGE_MASK;
+    let generations = observed_write_generations()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut generation = 0;
+    let mut page = start;
+    while page < end {
+        generation = generation.max(generations.get(&page).copied().unwrap_or(0));
+        page = page.saturating_add(1u64 << OBSERVED_WRITE_PAGE_SHIFT);
+    }
+    generation
+}
+
 pub fn commit_generation() -> u64 {
     COMMIT_GENERATION.load(Ordering::Relaxed)
 }
@@ -303,7 +356,10 @@ pub fn take_write_watch(va: u64, len: usize) -> WriteWatchResult {
             let ptr = unsafe { base.add(lo as usize) };
             match sys::take_write_watch(ptr, query_len, &mut addresses) {
                 Some(0) => WriteWatchResult::Clean,
-                Some(_) => WriteWatchResult::Dirty,
+                Some(count) => {
+                    record_observed_write_pages(base, &addresses[..count.min(page_count)]);
+                    WriteWatchResult::Dirty
+                }
                 None => WriteWatchResult::Unavailable,
             }
         });
@@ -356,7 +412,9 @@ pub fn take_write_watch_spans(
                 Some(0) => WriteWatchResult::Clean,
                 Some(count) => {
                     let base_addr = base as usize as u64;
-                    for &addr in addresses[..count.min(page_count)].iter() {
+                    let dirty_addresses = &addresses[..count.min(page_count)];
+                    record_observed_write_pages(base, dirty_addresses);
+                    for &addr in dirty_addresses.iter() {
                         let page_va = (addr as u64).saturating_sub(base_addr) & !0xfffu64;
                         match spans.last_mut() {
                             Some((last_va, last_len)) if *last_va + *last_len as u64 == page_va => {
@@ -596,9 +654,13 @@ mod tests {
         let ptr = commit(VA, LEN).expect("write-watched fastmem allocation");
 
         let _ = take_write_watch(VA, LEN);
+        let generation_before = observed_write_generation_range(VA, LEN);
         unsafe { ptr.add(0x123).write_volatile(0x5a) };
         assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Dirty);
+        let generation_after = observed_write_generation_range(VA, LEN);
+        assert!(generation_after > generation_before);
         assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Clean);
+        assert_eq!(observed_write_generation_range(VA, LEN), generation_after);
 
         decommit(ptr, LEN);
         assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Unavailable);
