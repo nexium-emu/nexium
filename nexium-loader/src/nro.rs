@@ -272,6 +272,7 @@ impl Nro {
 pub struct NroMetadata {
     pub title: String,
     pub author: String,
+    pub version: String,
     pub icon_jpeg: Option<Vec<u8>>,
 }
 
@@ -312,7 +313,7 @@ pub fn read_nro_metadata(path: &std::path::Path) -> Option<NroMetadata> {
         .flatten()
         .map(|b| b.to_vec());
 
-    let (title, author) = mmap
+    let (title, author, version) = mmap
         .get(asset_start + nacp_off..asset_start + nacp_off + nacp_size)
         .filter(|n| n.len() >= 0x300)
         .map(parse_nacp)
@@ -321,11 +322,13 @@ pub fn read_nro_metadata(path: &std::path::Path) -> Option<NroMetadata> {
     Some(NroMetadata {
         title,
         author,
+        version,
         icon_jpeg,
     })
 }
 
-pub(crate) fn parse_nacp(nacp: &[u8]) -> (String, String) {
+pub(crate) fn parse_nacp(nacp: &[u8]) -> (String, String, String) {
+    let version = nacp.get(0x3060..0x3070).map(read_cstr).unwrap_or_default();
     for i in 0..16 {
         let base = i * 0x300;
         if base + 0x300 > nacp.len() {
@@ -333,10 +336,10 @@ pub(crate) fn parse_nacp(nacp: &[u8]) -> (String, String) {
         }
         let name = read_cstr(&nacp[base..base + 0x200]);
         if !name.is_empty() {
-            return (name, read_cstr(&nacp[base + 0x200..base + 0x300]));
+            return (name, read_cstr(&nacp[base + 0x200..base + 0x300]), version);
         }
     }
-    (String::new(), String::new())
+    (String::new(), String::new(), version)
 }
 
 pub(crate) fn read_cstr(b: &[u8]) -> String {

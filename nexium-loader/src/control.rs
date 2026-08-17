@@ -28,7 +28,7 @@ pub fn read_container_metadata(path: &std::path::Path) -> Option<NroMetadata> {
     let section = control.section(NcaFsType::RomFs)?;
     let romfs = mmap.get(section.fs_data_range.clone())?;
 
-    let (title, author) = romfs_file(romfs, "/control.nacp")
+    let (title, author, version) = romfs_file(romfs, "/control.nacp")
         .filter(|n| n.len() >= 0x300)
         .map(parse_nacp)
         .unwrap_or_default();
@@ -40,6 +40,7 @@ pub fn read_container_metadata(path: &std::path::Path) -> Option<NroMetadata> {
     Some(NroMetadata {
         title,
         author,
+        version,
         icon_jpeg,
     })
 }
