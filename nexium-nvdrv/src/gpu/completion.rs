@@ -45,12 +45,11 @@ pub(crate) fn async_semaphore_completion_enabled() -> bool {
     })
 }
 
-fn run_completion_after_waits(
-    wait_timeline: impl FnOnce() -> bool,
-    wait_idle: impl FnOnce() -> bool,
+fn run_completion_after_wait(
+    wait_for_predecessor: impl FnOnce() -> bool,
     completion: impl FnOnce(),
 ) -> bool {
-    if !wait_timeline() && !wait_idle() {
+    if !wait_for_predecessor() {
         return false;
     }
     completion();
@@ -64,15 +63,29 @@ pub(crate) fn submit_renderer_completion(
     let marker = move || {
         let target = renderer.submitted_generation();
         let completion_job = Box::new(move || {
-            if !run_completion_after_waits(
-                || renderer.wait_submit_generation(target, Duration::from_secs(3)),
-                || renderer.wait_idle_checked(),
+            let timeline_available = renderer.timeline_sync_available();
+            let waited = run_completion_after_wait(
+                || {
+                    if timeline_available {
+                        renderer.wait_submit_generation(target, Duration::from_secs(3))
+                    } else {
+                        renderer.wait_idle_checked()
+                    }
+                },
                 completion,
-            ) {
-                log::error!(
-                    "[gpu-completion] timeline and device-idle waits failed target={}; completion dropped",
-                    target
-                );
+            );
+            if !waited {
+                if timeline_available {
+                    log::error!(
+                        "[gpu-completion] timeline wait failed target={}; completion dropped and device-idle fallback suppressed",
+                        target
+                    );
+                } else {
+                    log::error!(
+                        "[gpu-completion] legacy device-idle wait failed target={}; completion dropped",
+                        target
+                    );
+                }
             }
         }) as CompletionJob;
         if let Err(completion_job) = completion_queue().submit(completion_job) {
@@ -81,11 +94,8 @@ pub(crate) fn submit_renderer_completion(
     };
 
     if let Some(render_thread) = crate::render_thread::maybe_render_thread() {
-        render_thread.submit_timeout_named(
-            "semaphore-completion-marker",
-            Box::new(marker),
-            Duration::from_secs(3),
-        )
+        render_thread.submit_named("semaphore-completion-marker", Box::new(marker));
+        true
     } else {
         marker();
         true
@@ -94,7 +104,7 @@ pub(crate) fn submit_renderer_completion(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_completion_after_waits, CompletionQueue};
+    use super::{run_completion_after_wait, CompletionQueue};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
@@ -132,10 +142,9 @@ mod tests {
     }
 
     #[test]
-    fn failed_timeline_and_idle_waits_drop_completion() {
+    fn failed_predecessor_wait_drops_completion() {
         let calls = AtomicUsize::new(0);
-        assert!(!run_completion_after_waits(
-            || false,
+        assert!(!run_completion_after_wait(
             || false,
             || {
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -145,38 +154,14 @@ mod tests {
     }
 
     #[test]
-    fn checked_idle_fallback_allows_completion() {
-        let idle_calls = AtomicUsize::new(0);
+    fn successful_predecessor_wait_runs_completion_once() {
         let completion_calls = AtomicUsize::new(0);
-        assert!(run_completion_after_waits(
-            || false,
-            || {
-                idle_calls.fetch_add(1, Ordering::Relaxed);
-                true
-            },
-            || {
-                completion_calls.fetch_add(1, Ordering::Relaxed);
-            },
-        ));
-        assert_eq!(idle_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(completion_calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn successful_timeline_wait_skips_idle_fallback() {
-        let idle_calls = AtomicUsize::new(0);
-        let completion_calls = AtomicUsize::new(0);
-        assert!(run_completion_after_waits(
+        assert!(run_completion_after_wait(
             || true,
             || {
-                idle_calls.fetch_add(1, Ordering::Relaxed);
-                false
-            },
-            || {
                 completion_calls.fetch_add(1, Ordering::Relaxed);
             },
         ));
-        assert_eq!(idle_calls.load(Ordering::Relaxed), 0);
         assert_eq!(completion_calls.load(Ordering::Relaxed), 1);
     }
 }

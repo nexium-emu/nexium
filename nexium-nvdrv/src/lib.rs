@@ -7,6 +7,27 @@ fn syncpoint_reached(current: u32, threshold: u32) -> bool {
     current.wrapping_sub(threshold) < 0x8000_0000
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FenceWaitDisposition {
+    Reached,
+    OrderedPredecessor,
+    Strict,
+}
+
+fn classify_submit_fence_wait(
+    current: u32,
+    ordered_reserved_max: Option<u32>,
+    threshold: u32,
+) -> FenceWaitDisposition {
+    if syncpoint_reached(current, threshold) {
+        FenceWaitDisposition::Reached
+    } else if ordered_reserved_max.is_some_and(|reserved| syncpoint_reached(reserved, threshold)) {
+        FenceWaitDisposition::OrderedPredecessor
+    } else {
+        FenceWaitDisposition::Strict
+    }
+}
+
 fn gpfifo_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -64,10 +85,18 @@ fn trace_gpfifo_submit(
     }
     static TRACES: AtomicU64 = AtomicU64::new(0);
     static WARNINGS: AtomicU64 = AtomicU64::new(0);
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let trace_limit = *LIMIT.get_or_init(|| {
+        std::env::var("NEXIUM_GPFIFO_TRACE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 1)
+            .unwrap_or(256)
+    });
     let (counter, limit) = if warning {
         (&WARNINGS, 64)
     } else {
-        (&TRACES, 256)
+        (&TRACES, trace_limit)
     };
     let sequence = counter.fetch_add(1, Ordering::Relaxed);
     if sequence >= limit {
@@ -535,6 +564,20 @@ impl Drop for AsyncPresentPendingGuard {
     }
 }
 
+fn guarded_present_job<F>(
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    present: F,
+) -> crate::render_thread::RenderJob
+where
+    F: FnOnce() + Send + 'static,
+{
+    let pending_guard = AsyncPresentPendingGuard { pending };
+    Box::new(move || {
+        let _pending_guard = pending_guard;
+        present();
+    })
+}
+
 fn async_present_inflight_limit() -> usize {
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -714,12 +757,12 @@ impl AsyncGpuQueue {
                         })
                     };
                 while let Ok(submission) = rx.recv() {
-                    let completion = match submission {
+                    match submission {
                         AsyncGpuSubmission::Inline {
                             entries,
                             completion,
                         } => {
-                            let on_complete = pipeline.then(|| make_on_complete(completion));
+                            let on_complete = Some(make_on_complete(completion));
                             if defer_small_rts {
                                 worker_gpu.process_inline_gpfifo_soft_deferred(
                                     &entries,
@@ -737,17 +780,13 @@ impl AsyncGpuQueue {
                                     on_complete,
                                 );
                             }
-                            if pipeline {
-                                continue;
-                            }
-                            completion
                         }
                         AsyncGpuSubmission::Gpfifo {
                             address,
                             num_entries,
                             completion,
                         } => {
-                            let on_complete = pipeline.then(|| make_on_complete(completion));
+                            let on_complete = Some(make_on_complete(completion));
                             if defer_small_rts {
                                 worker_gpu.submit_gpfifo_soft_deferred(
                                     address,
@@ -767,10 +806,6 @@ impl AsyncGpuQueue {
                                     on_complete,
                                 );
                             }
-                            if pipeline {
-                                continue;
-                            }
-                            completion
                         }
                         AsyncGpuSubmission::Present(job) => {
                             let pending_guard = AsyncGpuPendingGuard {
@@ -780,14 +815,19 @@ impl AsyncGpuQueue {
                                 let _pending_guard = pending_guard;
                                 job();
                             });
-                            if pipeline {
-                                if !worker_gpu.prep_present(job, defer_small_rts) {
-                                    log::error!(
-                                        "[gpu-prep] present dropped: prep lane not threaded"
-                                    );
+                            let job = if pipeline {
+                                match worker_gpu.prep_present(job, defer_small_rts) {
+                                    Ok(()) => continue,
+                                    Err(job) => {
+                                        log::error!(
+                                            "[gpu-prep] prep lane unavailable; preserving present on render FIFO"
+                                        );
+                                        job
+                                    }
                                 }
-                                continue;
-                            }
+                            } else {
+                                job
+                            };
                             let _ = worker_gpu.flush_prepared_draw_packets();
                             if defer_small_rts {
                                 let _ = worker_gpu
@@ -799,25 +839,22 @@ impl AsyncGpuQueue {
                             } else {
                                 job();
                             }
-                            continue;
                         }
                         AsyncGpuSubmission::Barrier(done) => {
                             if pipeline
                                 && worker_gpu.prep_drain_barrier(done.clone(), defer_small_rts)
                             {
-                                continue;
+                            } else {
+                                let _ = worker_gpu.flush_prepared_draw_packets();
+                                if defer_small_rts {
+                                    let _ = worker_gpu.flush_small_rt_writebacks(|addr, buf| {
+                                        mem_write(addr, buf)
+                                    });
+                                }
+                                let _ = done.send(());
                             }
-                            let _ = worker_gpu.flush_prepared_draw_packets();
-                            if defer_small_rts {
-                                let _ = worker_gpu
-                                    .flush_small_rt_writebacks(|addr, buf| mem_write(addr, buf));
-                            }
-                            let _ = done.send(());
-                            continue;
                         }
-                    };
-                    completed.lock().push(completion);
-                    pending_worker.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    }
                 }
             })
             .expect("spawn GPU submit thread");
@@ -855,18 +892,6 @@ impl AsyncGpuQueue {
         } else {
             self.pending.fetch_sub(1, Ordering::Relaxed);
             false
-        }
-    }
-
-    fn try_present(&self, job: crate::render_thread::RenderJob) -> bool {
-        self.pending.fetch_add(1, Ordering::Relaxed);
-        match self.tx.try_send(AsyncGpuSubmission::Present(job)) {
-            Ok(()) => true,
-            Err(crossbeam::channel::TrySendError::Full(_))
-            | Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
-                self.pending.fetch_sub(1, Ordering::Relaxed);
-                false
-            }
         }
     }
 
@@ -964,10 +989,12 @@ pub struct Nvdrv {
     pub nvmap_handles: HashMap<u32, NvmapHandle>,
     pub next_nvmap_id: u32,
     pub bufferqueues: Arc<Mutex<HashMap<u32, BufferQueue>>>,
+    pub bufferqueue_state_generation: Arc<AtomicU64>,
     pub frame_queue: Arc<Mutex<Vec<QueuedFrame>>>,
     pub next_event_id: u32,
     pub next_syncpoint_id: u32,
-    pub retired_syncpts: HashMap<u32, (u32, u32)>,
+    pub retired_syncpts: Arc<Mutex<HashMap<u32, (u32, u32)>>>,
+    ordered_submit_max: HashMap<u32, u32>,
     pub next_ctrl_event_slot: u32,
     pub ctrl_event_waits: HashMap<(u32, u32), CtrlEventWait>,
     pub gpu: Arc<GpuContext>,
@@ -987,16 +1014,19 @@ pub struct Nvdrv {
 impl Nvdrv {
     pub fn new() -> Self {
         let stats = Arc::new(PipelineStats::default());
+        let bufferqueue_state_generation = Arc::new(AtomicU64::new(0));
         Self {
             files: HashMap::new(),
             next_fd: 1,
             nvmap_handles: HashMap::new(),
             next_nvmap_id: 1,
             bufferqueues: Arc::new(Mutex::new(HashMap::new())),
+            bufferqueue_state_generation,
             frame_queue: Arc::new(Mutex::new(Vec::new())),
             next_event_id: 1,
             next_syncpoint_id: 1,
-            retired_syncpts: HashMap::new(),
+            retired_syncpts: Arc::new(Mutex::new(HashMap::new())),
+            ordered_submit_max: HashMap::new(),
             next_ctrl_event_slot: 0,
             ctrl_event_waits: HashMap::new(),
             gpu: Arc::new(GpuContext::with_stats(stats.clone())),
@@ -1051,10 +1081,17 @@ impl Nvdrv {
         mem_write: AsyncMemoryWrite,
         mem_copy: AsyncMemoryCopy,
     ) {
-        if !matches!(
+        let requested = matches!(
             std::env::var("NEXIUM_ASYNC_GPU").ok().as_deref(),
             Some("1") | Some("true") | Some("on") | Some("yes")
-        ) {
+        );
+        if !requested {
+            return;
+        }
+        if !gpu::experimental_gpu_scheduling_enabled() {
+            log::warn!(
+                "nexium-nvdrv: asynchronous GPU submission quarantined; developer opt-in requires NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1"
+            );
             return;
         }
         if self.gpu_async.is_none() {
@@ -1069,24 +1106,45 @@ impl Nvdrv {
     }
 
     pub fn wait_gpu_idle(&self) {
+        let mut queue_profile = None;
         if let Some(queue) = &self.gpu_async {
             let queue_started = std::time::Instant::now();
             let drain = queue.drain();
             let queue_ns = queue_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            let render_ns = if drain.completed {
-                let render_started = std::time::Instant::now();
-                let _ = gpu::vk_dispatch::sync_render_thread();
-                render_started.elapsed().as_nanos().min(u64::MAX as u128) as u64
-            } else {
-                0
-            };
-            queue.profile_idle_wait(
+            queue_profile = Some((
+                queue,
                 queue_ns,
-                render_ns,
+                drain.completed,
                 drain.barrier_send_ns,
                 drain.barrier_wait_ns,
-            );
+            ));
             self.poll_gpu_completions();
+        }
+        let render_started = std::time::Instant::now();
+        let _ = gpu::vk_dispatch::sync_render_thread();
+        let render_ns = render_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        if let Some((queue, ..)) = queue_profile {
+            let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while queue.pending.load(Ordering::Acquire) != 0
+                && std::time::Instant::now() < completion_deadline
+            {
+                self.poll_gpu_completions();
+                std::thread::yield_now();
+            }
+            if queue.pending.load(Ordering::Acquire) != 0 {
+                log::error!("[gpu-sync] timed out draining renderer-backed GPU completions");
+            }
+            self.poll_gpu_completions();
+        }
+        if let Some((queue, queue_ns, queue_completed, barrier_send_ns, barrier_wait_ns)) =
+            queue_profile
+        {
+            queue.profile_idle_wait(
+                queue_ns,
+                queue_completed.then_some(render_ns).unwrap_or(0),
+                barrier_send_ns,
+                barrier_wait_ns,
+            );
         }
     }
 
@@ -1094,9 +1152,6 @@ impl Nvdrv {
     where
         F: FnOnce() + Send + 'static,
     {
-        let Some(queue) = &self.gpu_async else {
-            return AsyncPresentSubmit::Unavailable;
-        };
         let limit = async_present_inflight_limit();
         if self
             .async_present_pending
@@ -1107,15 +1162,22 @@ impl Nvdrv {
         {
             return AsyncPresentSubmit::Coalesced;
         }
-        let pending = Arc::clone(&self.async_present_pending);
-        let present = Box::new(move || {
-            let _pending_guard = AsyncPresentPendingGuard { pending };
+        let present = guarded_present_job(Arc::clone(&self.async_present_pending), present);
+        let queued = if let Some(queue) = &self.gpu_async {
+            queue.submit(AsyncGpuSubmission::Present(present))
+        } else if let Some(render_thread) = crate::render_thread::maybe_render_thread() {
+            render_thread.submit_timeout_named(
+                "ordered-present-readback",
+                present,
+                std::time::Duration::from_secs(3),
+            )
+        } else {
             present();
-        });
-        if queue.try_present(present) {
+            true
+        };
+        if queued {
             AsyncPresentSubmit::Enqueued
         } else {
-            self.async_present_pending.fetch_sub(1, Ordering::Release);
             AsyncPresentSubmit::Unavailable
         }
     }
@@ -1128,12 +1190,29 @@ impl Nvdrv {
         if completions.is_empty() {
             return;
         }
-        let mut channels = self.gpu.channels.lock();
-        for completion in completions.drain(..) {
-            if let Some(channel) = channels.get_mut(&completion.fd) {
-                if channel.syncpt_id == completion.syncpt_id {
-                    channel.syncpt_min = completion.threshold;
+        let mut orphaned: Vec<(u32, u32)> = Vec::new();
+        {
+            let mut channels = self.gpu.channels.lock();
+            for completion in completions.drain(..) {
+                if let Some(channel) = channels.get_mut(&completion.fd) {
+                    if channel.syncpt_id == completion.syncpt_id {
+                        if !syncpoint_reached(channel.syncpt_min, completion.threshold) {
+                            channel.syncpt_min = completion.threshold;
+                        }
+                    }
+                } else {
+                    orphaned.push((completion.syncpt_id, completion.threshold));
                 }
+            }
+        }
+        if !orphaned.is_empty() {
+            let mut retired = self.retired_syncpts.lock();
+            for (id, threshold) in orphaned {
+                let entry = retired.entry(id).or_insert((0, threshold));
+                if !syncpoint_reached(entry.0, threshold) {
+                    entry.0 = threshold;
+                }
+                entry.1 = entry.1.max(threshold);
             }
         }
     }
@@ -1185,6 +1264,7 @@ impl Nvdrv {
         if let Some(channel) = self.gpu.channels.lock().remove(&fd) {
             if channel.syncpt_id != 0 {
                 self.retired_syncpts
+                    .lock()
                     .insert(channel.syncpt_id, (channel.syncpt_min, channel.syncpt_max));
             }
         }
@@ -1210,7 +1290,10 @@ impl Nvdrv {
             increment = increment.wrapping_add(increment_value);
         }
         channel.syncpt_max = channel.syncpt_max.wrapping_add(increment);
-        (syncpt_id, channel.syncpt_max)
+        let threshold = channel.syncpt_max;
+        drop(channels);
+        self.ordered_submit_max.insert(syncpt_id, threshold);
+        (syncpt_id, threshold)
     }
 
     fn syncpoint_value(&self, id: u32) -> u32 {
@@ -1221,7 +1304,7 @@ impl Nvdrv {
             .values()
             .find(|channel| channel.syncpt_id == id)
             .map(|channel| channel.syncpt_min)
-            .or_else(|| self.retired_syncpts.get(&id).map(|(min, _)| *min))
+            .or_else(|| self.retired_syncpts.lock().get(&id).map(|(min, _)| *min))
             .unwrap_or(0)
     }
 
@@ -1233,7 +1316,7 @@ impl Nvdrv {
             .values()
             .find(|channel| channel.syncpt_id == id)
             .map(|channel| channel.syncpt_max)
-            .or_else(|| self.retired_syncpts.get(&id).map(|(_, max)| *max))
+            .or_else(|| self.retired_syncpts.lock().get(&id).map(|(_, max)| *max))
             .unwrap_or(0)
     }
 
@@ -1244,7 +1327,8 @@ impl Nvdrv {
             .find(|channel| channel.syncpt_id == id)
         else {
             drop(channels);
-            let e = self.retired_syncpts.entry(id).or_insert((0, 0));
+            let mut retired = self.retired_syncpts.lock();
+            let e = retired.entry(id).or_insert((0, 0));
             e.1 = e.1.wrapping_add(amount);
             e.0 = e.1;
             return e.0;
@@ -1261,7 +1345,8 @@ impl Nvdrv {
             .find(|channel| channel.syncpt_id == id)
         else {
             drop(channels);
-            let entry = self.retired_syncpts.entry(id).or_insert((0, 0));
+            let mut retired = self.retired_syncpts.lock();
+            let entry = retired.entry(id).or_insert((0, 0));
             entry.1 = entry.1.wrapping_add(amount);
             return entry.1;
         };
@@ -1276,7 +1361,8 @@ impl Nvdrv {
             .find(|channel| channel.syncpt_id == id)
         else {
             drop(channels);
-            let entry = self.retired_syncpts.entry(id).or_insert((0, threshold));
+            let mut retired = self.retired_syncpts.lock();
+            let entry = retired.entry(id).or_insert((0, threshold));
             entry.0 = threshold;
             entry.1 = entry.1.max(threshold);
             return;
@@ -1284,9 +1370,112 @@ impl Nvdrv {
         channel.syncpt_min = threshold;
     }
 
+    fn channel_submit_completion(
+        &self,
+        fd: u32,
+        syncpt_id: u32,
+        threshold: u32,
+    ) -> Box<dyn FnOnce() + Send> {
+        let gpu = Arc::clone(&self.gpu);
+        let retired_syncpts = Arc::clone(&self.retired_syncpts);
+        Box::new(move || {
+            let mut channels = gpu.channels.lock();
+            if let Some(channel) = channels
+                .get_mut(&fd)
+                .filter(|channel| channel.syncpt_id == syncpt_id)
+            {
+                if !syncpoint_reached(channel.syncpt_min, threshold) {
+                    channel.syncpt_min = threshold;
+                }
+                return;
+            }
+            if let Some(channel) = channels.get(&fd) {
+                log::warn!(
+                    "[gpu-sync] ignored mismatched channel completion fd={} expected_syncpt={} got_syncpt={}",
+                    fd,
+                    channel.syncpt_id,
+                    syncpt_id
+                );
+            }
+            drop(channels);
+            let mut retired = retired_syncpts.lock();
+            let entry = retired.entry(syncpt_id).or_insert((0, threshold));
+            if !syncpoint_reached(entry.0, threshold) {
+                entry.0 = threshold;
+            }
+            entry.1 = entry.1.max(threshold);
+        })
+    }
+
+    fn wait_for_strict_submit_fence(
+        &self,
+        syncpt_id: u32,
+        threshold: u32,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            if syncpoint_reached(self.syncpoint_value(syncpt_id), threshold) {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                log::error!(
+                    "[gpu-sync] strict submit fence timed out syncpt={} threshold={}; dependent GPFIFO rejected",
+                    syncpt_id,
+                    threshold
+                );
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
+
     pub fn is_syncpoint_reached(&self, id: u32, threshold: u32) -> bool {
         self.poll_gpu_completions();
         syncpoint_reached(self.syncpoint_value(id), threshold)
+    }
+
+    pub fn queue_buffer_fence_disposition(&self, id: u32, threshold: u32) -> FenceWaitDisposition {
+        let disposition = classify_submit_fence_wait(
+            self.syncpoint_value(id),
+            self.ordered_submit_max.get(&id).copied(),
+            threshold,
+        );
+        Self::queue_buffer_fence_stat(disposition);
+        disposition
+    }
+
+    fn queue_buffer_fence_stat(disposition: FenceWaitDisposition) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("NEXIUM_FENCE_PROFILE").is_some()) {
+            return;
+        }
+        static REACHED: AtomicU64 = AtomicU64::new(0);
+        static ORDERED: AtomicU64 = AtomicU64::new(0);
+        static STRICT: AtomicU64 = AtomicU64::new(0);
+        static TOTAL: AtomicU64 = AtomicU64::new(0);
+        match disposition {
+            FenceWaitDisposition::Reached => {
+                REACHED.fetch_add(1, Ordering::Relaxed);
+            }
+            FenceWaitDisposition::OrderedPredecessor => {
+                ORDERED.fetch_add(1, Ordering::Relaxed);
+            }
+            FenceWaitDisposition::Strict => {
+                STRICT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let total = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if total % 256 == 0 {
+            log::warn!(
+                "[queue-fence] total={} reached={} ordered={} strict={}",
+                total,
+                REACHED.load(Ordering::Relaxed),
+                ORDERED.load(Ordering::Relaxed),
+                STRICT.load(Ordering::Relaxed),
+            );
+        }
     }
 
     pub fn ctrl_event_wait(&self, fd: u32, event_id: u32) -> Option<CtrlEventWait> {
@@ -3117,9 +3306,26 @@ impl Nvdrv {
                 if submit_flags & 1 != 0 {
                     let current = trace_fence_current
                         .unwrap_or_else(|| self.syncpoint_value(submit_fence_id));
-                    if !syncpoint_reached(current, submit_fence_value) {
-                        trace_submit(true, "reject-error5-unsignalled-wait");
-                        return IoctlOutcome::error(5);
+                    match classify_submit_fence_wait(
+                        current,
+                        self.ordered_submit_max.get(&submit_fence_id).copied(),
+                        submit_fence_value,
+                    ) {
+                        FenceWaitDisposition::Reached => {}
+                        FenceWaitDisposition::OrderedPredecessor => {
+                            trace_submit(false, "ordered-reserved-fence-wait-elided");
+                        }
+                        FenceWaitDisposition::Strict => {
+                            trace_submit(false, "strict-external-fence-wait");
+                            if !self.wait_for_strict_submit_fence(
+                                submit_fence_id,
+                                submit_fence_value,
+                                std::time::Duration::from_secs(3),
+                            ) {
+                                trace_submit(true, "reject-error5-fence-wait-timeout");
+                                return IoctlOutcome::error(5);
+                            }
+                        }
                     }
                 }
                 let _ = self.renderer();
@@ -3191,10 +3397,18 @@ impl Nvdrv {
                             })
                         });
                         if !queued {
+                            let on_complete = Some(self.channel_submit_completion(
+                                req.fd,
+                                syncpt_id,
+                                syncpt_value,
+                            ));
                             let _ = self.gpu.process_inline_gpfifo(
-                                &entries, mem_read, mem_write, mem_copy, None,
+                                &entries,
+                                mem_read,
+                                mem_write,
+                                mem_copy,
+                                on_complete,
                             );
-                            self.complete_syncpoint_to(syncpt_id, syncpt_value);
                         }
                         log::trace!(
                             "nvhost-gpu:SubmitGPFIFO (inline) entries={} draws={}",
@@ -3206,8 +3420,18 @@ impl Nvdrv {
                             out[16..20].copy_from_slice(&syncpt_id.to_le_bytes());
                             out[20..24].copy_from_slice(&syncpt_value.to_le_bytes());
                         }
-                    } else if cmd == 0x4808 && req.in_data.len() >= 24 + (num_entries as usize) * 8
-                    {
+                    } else if cmd == 0x4808 && req.in_data.len() > 24 {
+                        let available = ((req.in_data.len() - 24) / 8).min(num_entries as usize);
+                        if available < num_entries as usize {
+                            log::warn!(
+                                "nvhost-gpu:SubmitGpfifo rejected truncated payload: num_entries={} available={} in_size={}",
+                                num_entries,
+                                available,
+                                req.in_data.len()
+                            );
+                            trace_submit(true, "reject-error10-truncated-embedded");
+                            return IoctlOutcome::error(0xA);
+                        }
                         trace_submit(false, "embedded-4808");
                         let entries: Vec<gpu::CommandListHeader> = (0..num_entries as usize)
                             .map(|i| {
@@ -3235,6 +3459,20 @@ impl Nvdrv {
                             req.in_data.get(24..).unwrap_or(&[]),
                             req.in_data.len(),
                         );
+                        if crate::gpu::pusher::direct_forensics()
+                            && entries.iter().any(|e| e.entry_count() > 4096)
+                        {
+                            use std::sync::atomic::{AtomicU32, Ordering as AO};
+                            static N: AtomicU32 = AtomicU32::new(0);
+                            if N.fetch_add(1, AO::Relaxed) < 4 {
+                                log::warn!(
+                                    "[el-raw] in_size={} num_entries={} in_data={:02x?}",
+                                    req.in_data.len(),
+                                    num_entries,
+                                    &req.in_data[..req.in_data.len().min(192)]
+                                );
+                            }
+                        }
                         self.stats.gpfifo_submits.fetch_add(1, Ordering::Relaxed);
                         self.stats
                             .gpfifo_entries
@@ -3252,10 +3490,18 @@ impl Nvdrv {
                             })
                         });
                         if !queued {
+                            let on_complete = Some(self.channel_submit_completion(
+                                req.fd,
+                                syncpt_id,
+                                syncpt_value,
+                            ));
                             let _ = self.gpu.process_inline_gpfifo(
-                                &entries, mem_read, mem_write, mem_copy, None,
+                                &entries,
+                                mem_read,
+                                mem_write,
+                                mem_copy,
+                                on_complete,
                             );
-                            self.complete_syncpoint_to(syncpt_id, syncpt_value);
                         }
                         if log::log_enabled!(log::Level::Trace) {
                             let (dc, cc) = {
@@ -3294,15 +3540,19 @@ impl Nvdrv {
                             })
                         });
                         if !queued {
+                            let on_complete = Some(self.channel_submit_completion(
+                                req.fd,
+                                syncpt_id,
+                                syncpt_value,
+                            ));
                             let _ = self.gpu.submit_gpfifo(
                                 address,
                                 num_entries,
                                 mem_read,
                                 mem_write,
                                 mem_copy,
-                                None,
+                                on_complete,
                             );
-                            self.complete_syncpoint_to(syncpt_id, syncpt_value);
                         }
                         log::trace!(
                             "nvhost-gpu:SubmitGPFIFO (kickoff) addr={:#x} entries={} draws={}",
@@ -3430,7 +3680,7 @@ impl Nvdrv {
                     let (syncpt_id, syncpt_value) = self.ensure_channel_syncpoint(req.fd);
                     out[12..16].copy_from_slice(&syncpt_id.to_le_bytes());
                     out[16..20].copy_from_slice(&syncpt_value.to_le_bytes());
-                    log::debug!(
+                    log::info!(
                         "nvhost-gpu:AllocGpfifoEx2 num_entries={} flags={:#x} → fence_id={}",
                         num_entries,
                         flags,
@@ -3668,6 +3918,7 @@ impl Nvdrv {
                     }
                     if syncpoint_reached(current_val, threshold) {
                         Self::fence_wait_stat(false);
+                        self.ctrl_event_waits.remove(&(req.fd, event_id & 0xFF));
                         if out.len() >= 16 {
                             out[12..16].copy_from_slice(&current_val.to_le_bytes());
                         }
@@ -3755,10 +4006,15 @@ impl Nvdrv {
 
     pub fn with_bufferqueue<R>(&self, binder_id: u32, f: impl FnOnce(&mut BufferQueue) -> R) -> R {
         let mut bqs = self.bufferqueues.lock();
+        let generation = Arc::clone(&self.bufferqueue_state_generation);
         let bq = bqs
             .entry(binder_id)
-            .or_insert_with(|| BufferQueue::new(binder_id));
+            .or_insert_with(|| BufferQueue::with_generation(binder_id, generation));
         f(bq)
+    }
+
+    pub fn bufferqueue_state_generation(&self) -> u64 {
+        self.bufferqueue_state_generation.load(Ordering::Acquire)
     }
 
     pub fn drain_frames(&self) -> Vec<QueuedFrame> {
@@ -3927,6 +4183,85 @@ impl Default for Nvdrv {
 mod tests {
     use super::*;
 
+    #[test]
+    fn submit_fence_wait_only_elides_an_ordered_reserved_predecessor() {
+        assert_eq!(
+            classify_submit_fence_wait(7, Some(9), 7),
+            FenceWaitDisposition::Reached
+        );
+        assert_eq!(
+            classify_submit_fence_wait(7, Some(9), 9),
+            FenceWaitDisposition::OrderedPredecessor
+        );
+        assert_eq!(
+            classify_submit_fence_wait(7, Some(8), 9),
+            FenceWaitDisposition::Strict
+        );
+        assert_eq!(
+            classify_submit_fence_wait(7, None, 9),
+            FenceWaitDisposition::Strict
+        );
+
+        assert_eq!(
+            classify_submit_fence_wait(u32::MAX - 1, Some(1), 1),
+            FenceWaitDisposition::OrderedPredecessor
+        );
+    }
+
+    #[test]
+    fn only_gpfifo_reservations_are_recorded_as_ordered() {
+        let mut nvdrv = Nvdrv::new();
+        let gpu_fd = nvdrv.open("/dev/nvhost-gpu").unwrap();
+        let (gpu_syncpt, threshold) = nvdrv.reserve_channel_submit(gpu_fd, 1 << 1, 0);
+        assert_eq!(threshold, 2);
+        assert_eq!(nvdrv.ordered_submit_max.get(&gpu_syncpt), Some(&threshold));
+        assert_eq!(
+            nvdrv.queue_buffer_fence_disposition(gpu_syncpt, threshold),
+            FenceWaitDisposition::OrderedPredecessor
+        );
+
+        let video_fd = nvdrv.open("/dev/nvhost-nvdec").unwrap();
+        let video_syncpt = nvdrv.ensure_channel_syncpoint(video_fd).0;
+        let video_threshold = nvdrv.reserve_syncpoint_max(video_syncpt, 1);
+        assert_eq!(video_threshold, 1);
+        assert!(!nvdrv.ordered_submit_max.contains_key(&video_syncpt));
+        assert_eq!(
+            nvdrv.queue_buffer_fence_disposition(video_syncpt, video_threshold),
+            FenceWaitDisposition::Strict
+        );
+
+        nvdrv
+            .gpu
+            .channels
+            .lock()
+            .get_mut(&gpu_fd)
+            .unwrap()
+            .syncpt_min = threshold;
+        assert_eq!(
+            nvdrv.queue_buffer_fence_disposition(gpu_syncpt, threshold),
+            FenceWaitDisposition::Reached
+        );
+    }
+
+    #[test]
+    fn strict_submit_fence_timeout_rejects_without_vulkan_work() {
+        let nvdrv = Nvdrv::new();
+        assert!(!nvdrv.wait_for_strict_submit_fence(0xfeed, 1, std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn ordered_present_guard_releases_inflight_once_on_run_or_rejection() {
+        let rejected_pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let rejected = guarded_present_job(Arc::clone(&rejected_pending), || {});
+        drop(rejected);
+        assert_eq!(rejected_pending.load(Ordering::Acquire), 0);
+
+        let executed_pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let executed = guarded_present_job(Arc::clone(&executed_pending), || {});
+        executed();
+        assert_eq!(executed_pending.load(Ordering::Acquire), 0);
+    }
+
     fn request(fd: u32, ioctl_id: u32, in_data: Vec<u8>, out_size: usize) -> IoctlRequest {
         IoctlRequest {
             fd,
@@ -4037,6 +4372,22 @@ mod tests {
                 .result,
             0xB
         );
+    }
+
+    #[test]
+    fn gpu_submit_rejects_truncated_embedded_gpfifo_entries() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-gpu").unwrap();
+        let mut input = vec![0u8; 24 + 8];
+        write_u32(&mut input, 8, 2);
+        write_u32(&mut input, 24, 0x1000);
+        write_u32(&mut input, 28, 1 << 10);
+
+        let submitted = nvdrv.dispatch_ioctl(request(fd, 0xc020_4808, input, 24));
+
+        assert_eq!(submitted.result, 0xA);
+        assert_eq!(nvdrv.stats.gpfifo_submits.load(Ordering::Relaxed), 0);
+        assert_eq!(nvdrv.stats.gpfifo_entries.load(Ordering::Relaxed), 0);
     }
 
     #[test]

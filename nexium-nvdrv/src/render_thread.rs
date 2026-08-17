@@ -3,7 +3,7 @@ use crossbeam::channel::{
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use crate::gpu::vk_dispatch::PreparedDrawBatch;
@@ -23,51 +23,113 @@ pub struct RenderThread {
     draw_work_budget: Arc<DrawWorkBudget>,
 }
 
-const MAX_DRAW_GROUPS_PER_SUBMISSION: usize = 256;
+const DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION: usize = 16;
+const MAX_DRAW_GROUPS_PER_SUBMISSION_ENV: &str = "NEXIUM_RENDER_MAX_GROUPS_PER_SUBMISSION";
 const DRAW_GATHER_GRACE: Duration = Duration::from_micros(200);
-const DEFAULT_PENDING_DRAW_GROUP_BUDGET: usize = 0;
+const DEFAULT_PENDING_DRAW_GROUP_BUDGET: usize = 256;
+const DEFAULT_PENDING_DRAW_SNAPSHOT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const DRAW_BACKPRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(3);
+const DRAW_QUEUE_TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DrawWorkCost {
+    groups: usize,
+    snapshot_bytes: usize,
+}
+
+impl DrawWorkCost {
+    fn for_draws(draws: &[PreparedDrawBatch]) -> Self {
+        Self {
+            groups: draws.len(),
+            snapshot_bytes: draws.iter().fold(0usize, |total, draw| {
+                total.saturating_add(draw.snapshot_retained_bytes_upper_bound())
+            }),
+        }
+    }
+
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            groups: self.groups.saturating_add(other.groups),
+            snapshot_bytes: self.snapshot_bytes.saturating_add(other.snapshot_bytes),
+        }
+    }
+}
+
 struct DrawWorkBudgetState {
-    outstanding: usize,
+    outstanding: DrawWorkCost,
+    peak: DrawWorkCost,
     closed: bool,
+    next_telemetry: Instant,
 }
 
 struct DrawWorkBudget {
-    limit: usize,
+    group_limit: usize,
+    snapshot_byte_limit: usize,
     state: Mutex<DrawWorkBudgetState>,
     available: Condvar,
 }
 
 impl DrawWorkBudget {
-    fn new(limit: usize) -> Self {
+    fn new(group_limit: usize, snapshot_byte_limit: usize) -> Self {
         Self {
-            limit,
-            state: Mutex::new(DrawWorkBudgetState::default()),
+            group_limit,
+            snapshot_byte_limit,
+            state: Mutex::new(DrawWorkBudgetState {
+                outstanding: DrawWorkCost::default(),
+                peak: DrawWorkCost::default(),
+                closed: false,
+                next_telemetry: Instant::now() + DRAW_QUEUE_TELEMETRY_INTERVAL,
+            }),
             available: Condvar::new(),
         }
     }
 
     fn enabled(&self) -> bool {
-        self.limit != 0
+        self.group_limit != 0 || self.snapshot_byte_limit != 0
     }
 
-    fn fits(&self, outstanding: usize, incoming: usize) -> bool {
-        if incoming > self.limit {
+    fn dimension_fits(outstanding: usize, incoming: usize, limit: usize) -> bool {
+        if limit == 0 {
+            return true;
+        }
+        if incoming > limit {
             return outstanding == 0;
         }
         outstanding
             .checked_add(incoming)
-            .is_some_and(|total| total <= self.limit)
+            .is_some_and(|total| total <= limit)
     }
 
-    fn reserve(&self, incoming: usize, label: &'static str, timeout: Duration) -> bool {
-        if !self.enabled() || incoming == 0 {
+    fn fits(&self, outstanding: DrawWorkCost, incoming: DrawWorkCost) -> bool {
+        Self::dimension_fits(outstanding.groups, incoming.groups, self.group_limit)
+            && Self::dimension_fits(
+                outstanding.snapshot_bytes,
+                incoming.snapshot_bytes,
+                self.snapshot_byte_limit,
+            )
+    }
+
+    #[cfg(test)]
+    fn reserve(&self, incoming: DrawWorkCost, label: &'static str, timeout: Duration) -> bool {
+        let started = Instant::now();
+        let deadline = Some(started.checked_add(timeout).unwrap_or(started));
+        self.reserve_until(incoming, label, started, deadline)
+    }
+
+    fn reserve_blocking(&self, incoming: DrawWorkCost, label: &'static str) -> bool {
+        self.reserve_until(incoming, label, Instant::now(), None)
+    }
+
+    fn reserve_until(
+        &self,
+        incoming: DrawWorkCost,
+        label: &'static str,
+        started: Instant,
+        deadline: Option<Instant>,
+    ) -> bool {
+        if !self.enabled() || incoming.groups == 0 {
             return true;
         }
-        let started = Instant::now();
-        let deadline = started.checked_add(timeout).unwrap_or(started);
         let mut next_report = started + DRAW_BACKPRESSURE_LOG_INTERVAL;
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         loop {
@@ -76,22 +138,43 @@ impl DrawWorkBudget {
             }
             if self.fits(state.outstanding, incoming) {
                 state.outstanding = state.outstanding.saturating_add(incoming);
+                state.peak.groups = state.peak.groups.max(state.outstanding.groups);
+                state.peak.snapshot_bytes = state
+                    .peak
+                    .snapshot_bytes
+                    .max(state.outstanding.snapshot_bytes);
+                let now = Instant::now();
+                if now >= state.next_telemetry {
+                    log::info!(
+                        "[render-queue] outstanding_groups={} group_budget={} outstanding_snapshot_mib={:.1} snapshot_budget_mib={:.1} peak_groups={} peak_snapshot_mib={:.1}",
+                        state.outstanding.groups,
+                        self.group_limit,
+                        state.outstanding.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                        self.snapshot_byte_limit as f64 / (1024.0 * 1024.0),
+                        state.peak.groups,
+                        state.peak.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                    );
+                    state.next_telemetry = now + DRAW_QUEUE_TELEMETRY_INTERVAL;
+                }
                 return true;
             }
 
             let now = Instant::now();
-            if now >= deadline {
+            if deadline.is_some_and(|deadline| now >= deadline) {
                 log::warn!(
-                    "[render-backpressure] phase=budget-timeout label={} chunks={} outstanding={} budget={} waited_ms={:.3}",
+                    "[render-backpressure] phase=budget-timeout label={} incoming_groups={} incoming_snapshot_mib={:.1} outstanding_groups={} group_budget={} outstanding_snapshot_mib={:.1} snapshot_budget_mib={:.1} waited_ms={:.3}",
                     label,
-                    incoming,
-                    state.outstanding,
-                    self.limit,
+                    incoming.groups,
+                    incoming.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                    state.outstanding.groups,
+                    self.group_limit,
+                    state.outstanding.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                    self.snapshot_byte_limit as f64 / (1024.0 * 1024.0),
                     started.elapsed().as_secs_f64() * 1000.0,
                 );
                 return false;
             }
-            let wait_until = std::cmp::min(next_report, deadline);
+            let wait_until = deadline.map_or(next_report, |deadline| deadline.min(next_report));
             let wait = wait_until.saturating_duration_since(now);
             let (next_state, wait_result) = self
                 .available
@@ -99,47 +182,74 @@ impl DrawWorkBudget {
                 .unwrap_or_else(|error| error.into_inner());
             state = next_state;
             if wait_result.timed_out() {
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                if deadline.is_some_and(|deadline| now >= deadline) {
                     log::warn!(
-                        "[render-backpressure] phase=budget-timeout label={} chunks={} outstanding={} budget={} waited_ms={:.3}",
+                        "[render-backpressure] phase=budget-timeout label={} incoming_groups={} incoming_snapshot_mib={:.1} outstanding_groups={} group_budget={} outstanding_snapshot_mib={:.1} snapshot_budget_mib={:.1} waited_ms={:.3}",
                         label,
-                        incoming,
-                        state.outstanding,
-                        self.limit,
+                        incoming.groups,
+                        incoming.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                        state.outstanding.groups,
+                        self.group_limit,
+                        state.outstanding.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                        self.snapshot_byte_limit as f64 / (1024.0 * 1024.0),
                         started.elapsed().as_secs_f64() * 1000.0,
                     );
                     return false;
                 }
                 log::warn!(
-                    "[render-backpressure] phase=budget label={} chunks={} outstanding={} budget={} waited_ms={:.3}",
+                    "[render-backpressure] phase=budget label={} incoming_groups={} incoming_snapshot_mib={:.1} outstanding_groups={} group_budget={} outstanding_snapshot_mib={:.1} snapshot_budget_mib={:.1} waited_ms={:.3}",
                     label,
-                    incoming,
-                    state.outstanding,
-                    self.limit,
+                    incoming.groups,
+                    incoming.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                    state.outstanding.groups,
+                    self.group_limit,
+                    state.outstanding.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                    self.snapshot_byte_limit as f64 / (1024.0 * 1024.0),
                     started.elapsed().as_secs_f64() * 1000.0,
                 );
-                next_report = Instant::now() + DRAW_BACKPRESSURE_LOG_INTERVAL;
+                next_report = now + DRAW_BACKPRESSURE_LOG_INTERVAL;
             }
         }
     }
 
-    fn release(&self, completed: usize) {
-        if !self.enabled() || completed == 0 {
+    fn release(&self, completed: DrawWorkCost) {
+        if !self.enabled() || completed.groups == 0 {
             return;
         }
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        match state.outstanding.checked_sub(completed) {
-            Some(remaining) => state.outstanding = remaining,
-            None => {
-                log::error!(
-                    "[render-backpressure] release underflow completed={} outstanding={} budget={}",
-                    completed,
-                    state.outstanding,
-                    self.limit,
-                );
-                state.outstanding = 0;
-            }
-        }
+        let Some(groups) = state.outstanding.groups.checked_sub(completed.groups) else {
+            log::error!(
+                "[render-backpressure] release group underflow completed={} outstanding={} budget={}",
+                completed.groups,
+                state.outstanding.groups,
+                self.group_limit,
+            );
+            state.outstanding = DrawWorkCost::default();
+            drop(state);
+            self.available.notify_all();
+            return;
+        };
+        let Some(snapshot_bytes) = state
+            .outstanding
+            .snapshot_bytes
+            .checked_sub(completed.snapshot_bytes)
+        else {
+            log::error!(
+                "[render-backpressure] release snapshot underflow completed={} outstanding={} budget={}",
+                completed.snapshot_bytes,
+                state.outstanding.snapshot_bytes,
+                self.snapshot_byte_limit,
+            );
+            state.outstanding = DrawWorkCost::default();
+            drop(state);
+            self.available.notify_all();
+            return;
+        };
+        state.outstanding = DrawWorkCost {
+            groups,
+            snapshot_bytes,
+        };
         drop(state);
         self.available.notify_all();
     }
@@ -155,7 +265,7 @@ impl DrawWorkBudget {
     }
 
     #[cfg(test)]
-    fn outstanding(&self) -> usize {
+    fn outstanding(&self) -> DrawWorkCost {
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -166,13 +276,13 @@ impl DrawWorkBudget {
 struct DrawWorkCompletion<'a> {
     pending: &'a AtomicUsize,
     budget: &'a DrawWorkBudget,
-    units: usize,
+    cost: DrawWorkCost,
 }
 
 impl Drop for DrawWorkCompletion<'_> {
     fn drop(&mut self) {
-        self.pending.fetch_sub(self.units, Ordering::Release);
-        self.budget.release(self.units);
+        self.pending.fetch_sub(self.cost.groups, Ordering::Release);
+        self.budget.release(self.cost);
     }
 }
 
@@ -234,6 +344,7 @@ static DRAW_GATHER_END_COUNTS: [AtomicUsize; DrawGatherEndReason::COUNT] = [
 ];
 
 fn draw_group_fit_end_reason(
+    max_group_count: usize,
     group_count: usize,
     ring_bytes: u64,
     same_renderer: bool,
@@ -242,7 +353,7 @@ fn draw_group_fit_end_reason(
     if !same_renderer {
         return Some(DrawGatherEndReason::Renderer);
     }
-    if group_count >= MAX_DRAW_GROUPS_PER_SUBMISSION {
+    if group_count >= max_group_count {
         return Some(DrawGatherEndReason::Count);
     }
     if !ring_bytes
@@ -256,12 +367,20 @@ fn draw_group_fit_end_reason(
 
 #[cfg(test)]
 fn draw_group_fits(
+    max_group_count: usize,
     group_count: usize,
     ring_bytes: u64,
     same_renderer: bool,
     next_ring_bytes: u64,
 ) -> bool {
-    draw_group_fit_end_reason(group_count, ring_bytes, same_renderer, next_ring_bytes).is_none()
+    draw_group_fit_end_reason(
+        max_group_count,
+        group_count,
+        ring_bytes,
+        same_renderer,
+        next_ring_bytes,
+    )
+    .is_none()
 }
 
 fn sealed_candidate_end_reason(is_job: bool) -> DrawGatherEndReason {
@@ -308,20 +427,60 @@ fn recv_draw_candidate(
     rx: &Receiver<RenderWork>,
     queued_draws: &mut VecDeque<PreparedDrawBatch>,
     gather_deadline: Instant,
+    group_count: usize,
+    max_group_count: usize,
     hard_after: impl Fn() -> bool,
 ) -> Result<RenderWork, DrawGatherEndReason> {
     if hard_after() {
         return Err(DrawGatherEndReason::Hard);
     }
-    if let Some(draw) = queued_draws.pop_front() {
-        return Ok(RenderWork::Draw(draw));
+    match pop_front_below_group_limit(queued_draws, group_count, max_group_count) {
+        Ok(Some(draw)) => return Ok(RenderWork::Draw(draw)),
+        Ok(None) => {}
+        Err(reason) => return Err(reason),
     }
     recv_group_candidate(rx, gather_deadline, hard_after)
+}
+
+fn enqueue_draw_group_fifo<T>(queued: &mut VecDeque<T>, group: Vec<T>) {
+    queued.extend(group);
+}
+
+fn pop_front_below_group_limit<T>(
+    queued: &mut VecDeque<T>,
+    group_count: usize,
+    max_group_count: usize,
+) -> Result<Option<T>, DrawGatherEndReason> {
+    if group_count >= max_group_count {
+        Err(DrawGatherEndReason::Count)
+    } else {
+        Ok(queued.pop_front())
+    }
 }
 
 fn seal_draw_tail_locked(draw_tail: &mut Option<Weak<AtomicBool>>) {
     if let Some(flag) = draw_tail.take().and_then(|flag| flag.upgrade()) {
         flag.store(true, Ordering::Release);
+    }
+}
+
+fn lock_until_timeout<'a, T>(
+    mutex: &'a Mutex<T>,
+    started: Instant,
+    timeout: Duration,
+) -> Option<MutexGuard<'a, T>> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(error)) => return Some(error.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return None;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
     }
 }
 
@@ -365,13 +524,13 @@ fn execute_draw_groups(
     worker_pending: &AtomicUsize,
     draw_work_budget: &DrawWorkBudget,
 ) {
-    let group_count = draws.len();
-    let budget_enabled = draw_work_budget.enabled();
-    let _completion = budget_enabled.then(|| DrawWorkCompletion {
+    let cost = DrawWorkCost::for_draws(&draws);
+    let group_count = cost.groups;
+    let _completion = DrawWorkCompletion {
         pending: worker_pending,
         budget: draw_work_budget,
-        units: group_count,
-    });
+        cost,
+    };
     let profile = render_profile_enabled();
     let started = profile.then(std::time::Instant::now);
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -391,9 +550,6 @@ fn execute_draw_groups(
                 group_count,
             );
         }
-    }
-    if !budget_enabled {
-        worker_pending.fetch_sub(group_count, Ordering::Release);
     }
 }
 
@@ -457,6 +613,7 @@ fn render_worker(
     draw_work_budget: Arc<DrawWorkBudget>,
 ) {
     let _budget_guard = DrawWorkerBudgetGuard(Arc::clone(&draw_work_budget));
+    let max_groups_per_submission = render_max_groups_per_submission();
     let mut lookahead = None;
     let mut queued_draws = VecDeque::new();
     loop {
@@ -476,7 +633,7 @@ fn render_worker(
         match work {
             RenderWork::Job(label, job) => execute_job(label, job, &worker_pending),
             RenderWork::DrawGroup(group) => {
-                queued_draws.extend(group);
+                enqueue_draw_group_fifo(&mut queued_draws, group);
             }
             RenderWork::Draw(first) => {
                 let profile = render_profile_enabled();
@@ -492,13 +649,17 @@ fn render_worker(
                     if draws.last().is_some_and(PreparedDrawBatch::hard_after) {
                         break DrawGatherEndReason::Hard;
                     }
-                    let next =
-                        match recv_draw_candidate(&rx, &mut queued_draws, gather_deadline, || {
-                            draws.last().is_some_and(PreparedDrawBatch::hard_after)
-                        }) {
-                            Ok(next) => next,
-                            Err(reason) => break reason,
-                        };
+                    let next = match recv_draw_candidate(
+                        &rx,
+                        &mut queued_draws,
+                        gather_deadline,
+                        draws.len(),
+                        max_groups_per_submission,
+                        || draws.last().is_some_and(PreparedDrawBatch::hard_after),
+                    ) {
+                        Ok(next) => next,
+                        Err(reason) => break reason,
+                    };
                     let next = match retain_received_if_unsealed(next, || {
                         draws.last().is_some_and(PreparedDrawBatch::hard_after)
                     }) {
@@ -513,6 +674,7 @@ fn render_worker(
                     match next {
                         RenderWork::Draw(next_draw) => {
                             let fit_end_reason = draw_group_fit_end_reason(
+                                max_groups_per_submission,
                                 draws.len(),
                                 ring_bytes,
                                 draws[0].same_renderer(&next_draw),
@@ -541,7 +703,7 @@ fn render_worker(
                             draws.push(next_draw);
                         }
                         RenderWork::DrawGroup(group) => {
-                            queued_draws.extend(group);
+                            enqueue_draw_group_fifo(&mut queued_draws, group);
                             continue;
                         }
                         next => {
@@ -552,7 +714,7 @@ fn render_worker(
                 };
                 if let Some(gather_started) = gather_started {
                     let gather_elapsed = gather_started.elapsed();
-                    if draws.len() == MAX_DRAW_GROUPS_PER_SUBMISSION
+                    if draws.len() == max_groups_per_submission
                         || compatibility_elapsed >= Duration::from_millis(1)
                     {
                         log::warn!(
@@ -586,7 +748,20 @@ impl RenderThread {
         let (tx, rx) = bounded::<RenderWork>(queue_depth);
         let pending = Arc::new(AtomicUsize::new(0));
         let worker_pending = pending.clone();
-        let draw_work_budget = Arc::new(DrawWorkBudget::new(render_pending_group_budget()));
+        let pending_group_budget = render_pending_group_budget();
+        let pending_snapshot_budget = render_pending_snapshot_budget_bytes();
+        log::info!(
+            "[render-queue] worker={} message_depth={} submission_group_limit={} group_budget={} snapshot_budget_mib={:.1}",
+            name,
+            queue_depth,
+            render_max_groups_per_submission(),
+            pending_group_budget,
+            pending_snapshot_budget as f64 / (1024.0 * 1024.0),
+        );
+        let draw_work_budget = Arc::new(DrawWorkBudget::new(
+            pending_group_budget,
+            pending_snapshot_budget,
+        ));
         let worker_draw_work_budget = Arc::clone(&draw_work_budget);
         std::thread::Builder::new()
             .name(name.to_string())
@@ -650,18 +825,28 @@ impl RenderThread {
         timeout: std::time::Duration,
     ) -> bool {
         let profile = render_profile_enabled();
-        let started = profile.then(std::time::Instant::now);
-        let mut draw_tail = self.draw_tail.lock().unwrap();
+        let started = Instant::now();
+        let Some(mut draw_tail) = lock_until_timeout(&self.draw_tail, started, timeout) else {
+            if profile && started.elapsed() >= Duration::from_millis(1) {
+                log::warn!(
+                    "[render-submit] label={} blocked_ms={:.3}",
+                    label,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            return false;
+        };
         seal_draw_tail_locked(&mut draw_tail);
         self.pending.fetch_add(1, Ordering::AcqRel);
-        let submitted = match self.tx.send_timeout(RenderWork::Job(label, job), timeout) {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let submitted = match self.tx.send_timeout(RenderWork::Job(label, job), remaining) {
             Ok(()) => true,
             Err(SendTimeoutError::Timeout(_)) | Err(SendTimeoutError::Disconnected(_)) => {
                 self.pending.fetch_sub(1, Ordering::Release);
                 false
             }
         };
-        if let Some(started) = started {
+        if profile {
             let elapsed = started.elapsed();
             if elapsed >= std::time::Duration::from_millis(1) {
                 log::warn!(
@@ -674,11 +859,10 @@ impl RenderThread {
         submitted
     }
 
-    pub(crate) fn submit_draw_group_timeout_named(
+    pub(crate) fn submit_draw_group_named(
         &self,
         label: &'static str,
         draws: Vec<PreparedDrawBatch>,
-        timeout: std::time::Duration,
     ) -> bool {
         if draws.is_empty() {
             return true;
@@ -689,59 +873,33 @@ impl RenderThread {
         let hard_after_handle = draws
             .last()
             .and_then(|draw| (!hard_after).then(|| draw.hard_after_handle()));
-        let draw_count = draws.len();
+        let cost = DrawWorkCost::for_draws(&draws);
         let mut draw_tail = self.draw_tail.lock().unwrap();
-        self.pending.fetch_add(draw_count, Ordering::AcqRel);
-        let submitted = if self.draw_work_budget.enabled() {
-            let budget_started = Instant::now();
-            if !self.draw_work_budget.reserve(draw_count, label, timeout) {
-                self.pending.fetch_sub(draw_count, Ordering::Release);
+        self.pending.fetch_add(cost.groups, Ordering::AcqRel);
+        let reserved = self.draw_work_budget.reserve_blocking(cost, label);
+        let submitted = if !reserved {
+            self.pending.fetch_sub(cost.groups, Ordering::Release);
+            if hard_after {
+                seal_draw_tail_locked(&mut draw_tail);
+            }
+            false
+        } else {
+            let work = RenderWork::DrawGroup(draws);
+            let sent = self.tx.send(work).is_ok();
+            if sent {
+                if hard_after {
+                    *draw_tail = None;
+                } else {
+                    *draw_tail = hard_after_handle;
+                }
+                true
+            } else {
+                self.draw_work_budget.release(cost);
+                self.pending.fetch_sub(cost.groups, Ordering::Release);
                 if hard_after {
                     seal_draw_tail_locked(&mut draw_tail);
                 }
                 false
-            } else {
-                let remaining = timeout.saturating_sub(budget_started.elapsed());
-                let sent = match self
-                    .tx
-                    .send_timeout(RenderWork::DrawGroup(draws), remaining)
-                {
-                    Ok(()) => true,
-                    Err(SendTimeoutError::Timeout(_) | SendTimeoutError::Disconnected(_)) => false,
-                };
-                if sent {
-                    if hard_after {
-                        *draw_tail = None;
-                    } else {
-                        *draw_tail = hard_after_handle;
-                    }
-                    true
-                } else {
-                    self.draw_work_budget.release(draw_count);
-                    self.pending.fetch_sub(draw_count, Ordering::Release);
-                    if hard_after {
-                        seal_draw_tail_locked(&mut draw_tail);
-                    }
-                    false
-                }
-            }
-        } else {
-            match self.tx.send_timeout(RenderWork::DrawGroup(draws), timeout) {
-                Ok(()) => {
-                    if hard_after {
-                        *draw_tail = None;
-                    } else {
-                        *draw_tail = hard_after_handle;
-                    }
-                    true
-                }
-                Err(SendTimeoutError::Timeout(_) | SendTimeoutError::Disconnected(_)) => {
-                    self.pending.fetch_sub(draw_count, Ordering::Release);
-                    if hard_after {
-                        seal_draw_tail_locked(&mut draw_tail);
-                    }
-                    false
-                }
             }
         };
         drop(draw_tail);
@@ -749,9 +907,10 @@ impl RenderThread {
             let elapsed = started.elapsed();
             if elapsed >= std::time::Duration::from_millis(1) {
                 log::warn!(
-                    "[render-submit] label={} chunks={} blocked_ms={:.3}",
+                    "[render-submit] label={} groups={} snapshot_mib={:.1} blocked_ms={:.3}",
                     label,
-                    draw_count,
+                    cost.groups,
+                    cost.snapshot_bytes as f64 / (1024.0 * 1024.0),
                     elapsed.as_secs_f64() * 1000.0,
                 );
             }
@@ -759,30 +918,32 @@ impl RenderThread {
         submitted
     }
 
-    pub(crate) fn flush_draw_chunk_timeout_named(
+    pub(crate) fn flush_draw_chunk_named(
         &self,
         label: &'static str,
         draws: Vec<PreparedDrawBatch>,
-        timeout: std::time::Duration,
     ) -> bool {
-        self.submit_draw_group_timeout_named(label, draws, timeout)
+        self.submit_draw_group_named(label, draws)
     }
 
     pub(crate) fn finish(&self, timeout: std::time::Duration) -> bool {
+        let started = Instant::now();
         if self.is_idle() {
             return true;
         }
         let (tx, rx) = std::sync::mpsc::channel();
+        let remaining = timeout.saturating_sub(started.elapsed());
         if !self.submit_timeout_named(
             "scheduler-finish",
             Box::new(move || {
                 let _ = tx.send(());
             }),
-            timeout,
+            remaining,
         ) {
             return false;
         }
-        rx.recv_timeout(timeout).is_ok()
+        rx.recv_timeout(timeout.saturating_sub(started.elapsed()))
+            .is_ok()
     }
 
     pub(crate) fn seal_draw_tail(&self) {
@@ -803,15 +964,48 @@ fn render_queue_depth() -> usize {
         .unwrap_or(256)
 }
 
+fn max_groups_per_submission_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|groups| groups.max(1))
+        .unwrap_or(DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION)
+}
+
+fn render_max_groups_per_submission() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        max_groups_per_submission_from_value(
+            std::env::var(MAX_DRAW_GROUPS_PER_SUBMISSION_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
 fn pending_group_budget_from_value(value: Option<&str>) -> usize {
     value
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_PENDING_DRAW_GROUP_BUDGET)
 }
 
+fn pending_snapshot_budget_bytes_from_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|mib| mib.checked_mul(1024 * 1024))
+        .unwrap_or(DEFAULT_PENDING_DRAW_SNAPSHOT_BUDGET_BYTES)
+}
+
 fn render_pending_group_budget() -> usize {
     pending_group_budget_from_value(
         std::env::var("NEXIUM_RENDER_PENDING_GROUP_BUDGET")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn render_pending_snapshot_budget_bytes() -> usize {
+    pending_snapshot_budget_bytes_from_value(
+        std::env::var("NEXIUM_RENDER_PENDING_SNAPSHOT_MIB")
             .ok()
             .as_deref(),
     )
@@ -842,10 +1036,6 @@ pub fn maybe_render_thread() -> Option<&'static RenderThread> {
 }
 
 pub fn present_thread() -> &'static RenderThread {
-    if dedicated_present_thread() {
-        static PT: OnceLock<RenderThread> = OnceLock::new();
-        return PT.get_or_init(|| RenderThread::new_named("nexium-present"));
-    }
     if let Some(rt) = maybe_render_thread() {
         return rt;
     }
@@ -853,38 +1043,32 @@ pub fn present_thread() -> &'static RenderThread {
     PT.get_or_init(|| RenderThread::new_named("nexium-present"))
 }
 
-fn dedicated_present_thread() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        !matches!(
-            std::env::var("NEXIUM_DEDICATED_PRESENT_THREAD")
-                .ok()
-                .as_deref(),
-            Some("0")
-                | Some("false")
-                | Some("FALSE")
-                | Some("off")
-                | Some("OFF")
-                | Some("no")
-                | Some("NO")
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        draw_group_fit_end_reason, draw_group_fits, pending_group_budget_from_value,
+        draw_group_fit_end_reason, draw_group_fits, enqueue_draw_group_fifo,
+        max_groups_per_submission_from_value, pending_group_budget_from_value,
+        pending_snapshot_budget_bytes_from_value, pop_front_below_group_limit,
         recv_group_candidate, rejected_draw_end_reason, retain_received_if_unsealed,
         seal_draw_tail_locked, sealed_candidate_end_reason, DrawGatherEndReason, DrawWorkBudget,
-        DrawWorkCompletion, RenderThread, DEFAULT_PENDING_DRAW_GROUP_BUDGET, DRAW_GATHER_GRACE,
-        MAX_DRAW_GROUPS_PER_SUBMISSION,
+        DrawWorkCompletion, DrawWorkCost, RenderThread, RenderWork,
+        DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION, DEFAULT_PENDING_DRAW_GROUP_BUDGET,
+        DEFAULT_PENDING_DRAW_SNAPSHOT_BUDGET_BYTES, DRAW_GATHER_GRACE,
+        MAX_DRAW_GROUPS_PER_SUBMISSION_ENV,
     };
     use crossbeam::channel::bounded;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    fn cost(groups: usize, snapshot_bytes: usize) -> DrawWorkCost {
+        DrawWorkCost {
+            groups,
+            snapshot_bytes,
+        }
+    }
 
     fn wait_until_idle(worker: &RenderThread) {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -900,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_group_budget_defaults_to_exact_legacy_mode_and_accepts_opt_in_limit() {
+    fn pending_draw_budgets_are_finite_by_default_and_accept_explicit_overrides() {
         assert_eq!(
             pending_group_budget_from_value(None),
             DEFAULT_PENDING_DRAW_GROUP_BUDGET
@@ -911,106 +1095,186 @@ mod tests {
             pending_group_budget_from_value(Some("invalid")),
             DEFAULT_PENDING_DRAW_GROUP_BUDGET
         );
+        assert_eq!(
+            pending_snapshot_budget_bytes_from_value(None),
+            DEFAULT_PENDING_DRAW_SNAPSHOT_BUDGET_BYTES
+        );
+        assert_eq!(
+            pending_snapshot_budget_bytes_from_value(Some("64")),
+            64 * 1024 * 1024
+        );
+        assert_eq!(pending_snapshot_budget_bytes_from_value(Some("0")), 0);
+        assert_eq!(
+            pending_snapshot_budget_bytes_from_value(Some("invalid")),
+            DEFAULT_PENDING_DRAW_SNAPSHOT_BUDGET_BYTES
+        );
 
-        let legacy = DrawWorkBudget::new(0);
-        assert!(!legacy.enabled());
-        assert!(legacy.reserve(usize::MAX, "legacy-test", Duration::from_secs(1)));
-        legacy.release(usize::MAX);
-        assert_eq!(legacy.outstanding(), 0);
+        let unlimited = DrawWorkBudget::new(0, 0);
+        assert!(!unlimited.enabled());
+        assert!(unlimited.reserve(
+            cost(usize::MAX, usize::MAX),
+            "unlimited-test",
+            Duration::from_secs(1)
+        ));
+        unlimited.release(cost(usize::MAX, usize::MAX));
+        assert_eq!(unlimited.outstanding(), DrawWorkCost::default());
     }
 
     #[test]
-    fn pending_group_budget_blocks_until_completed_work_releases_capacity() {
-        let budget = Arc::new(DrawWorkBudget::new(128));
-        assert!(budget.reserve(64, "first", Duration::from_secs(1)));
-        assert!(budget.reserve(64, "second", Duration::from_secs(1)));
-        assert_eq!(budget.outstanding(), 128);
+    fn renderer_submission_group_limit_defaults_to_sixteen_and_parses_env_values() {
+        assert_eq!(
+            MAX_DRAW_GROUPS_PER_SUBMISSION_ENV,
+            "NEXIUM_RENDER_MAX_GROUPS_PER_SUBMISSION"
+        );
+        assert_eq!(
+            max_groups_per_submission_from_value(None),
+            DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION
+        );
+        assert_eq!(max_groups_per_submission_from_value(Some("1")), 1);
+        assert_eq!(max_groups_per_submission_from_value(Some(" 32 ")), 32);
+        assert_eq!(max_groups_per_submission_from_value(Some("0")), 1);
+        assert_eq!(
+            max_groups_per_submission_from_value(Some("invalid")),
+            DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION
+        );
+        assert_eq!(
+            max_groups_per_submission_from_value(Some("")),
+            DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION
+        );
+    }
+
+    #[test]
+    fn oversized_draw_group_splits_fifo_and_releases_accounting_per_chunk() {
+        const LIMIT: usize = 3;
+        let mut queued = VecDeque::new();
+        enqueue_draw_group_fifo(&mut queued, (0usize..8).collect());
+
+        let budget = DrawWorkBudget::new(16, 1024);
+        let total = cost(8, 80);
+        assert!(budget.reserve(total, "split", Duration::from_secs(1)));
+        let pending = AtomicUsize::new(total.groups);
+        let mut chunks = Vec::new();
+
+        while !queued.is_empty() {
+            let mut chunk = Vec::new();
+            loop {
+                match pop_front_below_group_limit(&mut queued, chunk.len(), LIMIT) {
+                    Ok(Some(draw)) => chunk.push(draw),
+                    Ok(None) | Err(DrawGatherEndReason::Count) => break,
+                    Err(reason) => panic!("unexpected split reason: {reason:?}"),
+                }
+            }
+            assert!(!chunk.is_empty());
+            let chunk_cost = cost(chunk.len(), chunk.len() * 10);
+            {
+                let _completion = DrawWorkCompletion {
+                    pending: &pending,
+                    budget: &budget,
+                    cost: chunk_cost,
+                };
+            }
+            chunks.push(chunk);
+        }
+
+        assert_eq!(chunks, vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7]]);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(budget.outstanding(), DrawWorkCost::default());
+    }
+
+    #[test]
+    fn pending_draw_budget_blocks_until_completed_work_releases_capacity() {
+        let budget = Arc::new(DrawWorkBudget::new(128, 1024));
+        assert!(budget.reserve(cost(64, 512), "first", Duration::from_secs(1)));
+        assert!(budget.reserve(cost(64, 512), "second", Duration::from_secs(1)));
+        assert_eq!(budget.outstanding(), cost(128, 1024));
 
         let waiter_budget = Arc::clone(&budget);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let waiter = std::thread::spawn(move || {
             entered_tx.send(()).unwrap();
-            let reserved = waiter_budget.reserve(1, "waiter", Duration::from_secs(1));
+            let reserved = waiter_budget.reserve_blocking(cost(1, 1), "blocking-no-drop-waiter");
             if reserved {
-                waiter_budget.release(1);
+                waiter_budget.release(cost(1, 1));
             }
             done_tx.send(reserved).unwrap();
         });
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
 
-        budget.release(64);
+        budget.release(cost(64, 512));
         assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)), Ok(true));
         waiter.join().unwrap();
-        assert_eq!(budget.outstanding(), 64);
-        budget.release(64);
-        assert_eq!(budget.outstanding(), 0);
+        assert_eq!(budget.outstanding(), cost(64, 512));
+        budget.release(cost(64, 512));
+        assert_eq!(budget.outstanding(), DrawWorkCost::default());
     }
 
     #[test]
-    fn pending_group_budget_respects_reservation_timeout() {
-        let budget = DrawWorkBudget::new(64);
-        assert!(budget.reserve(64, "full", Duration::from_secs(1)));
+    fn pending_draw_budget_respects_reservation_timeout() {
+        let budget = DrawWorkBudget::new(64, 64);
+        assert!(budget.reserve(cost(64, 64), "full", Duration::from_secs(1)));
 
         let started = Instant::now();
-        assert!(!budget.reserve(1, "timeout", Duration::from_millis(20)));
+        assert!(!budget.reserve(cost(1, 1), "timeout", Duration::from_millis(20)));
         assert!(started.elapsed() >= Duration::from_millis(15));
-        assert_eq!(budget.outstanding(), 64);
+        assert_eq!(budget.outstanding(), cost(64, 64));
 
-        budget.release(64);
-        assert_eq!(budget.outstanding(), 0);
+        budget.release(cost(64, 64));
+        assert_eq!(budget.outstanding(), DrawWorkCost::default());
     }
 
     #[test]
-    fn pending_group_budget_admits_oversized_packet_only_when_empty() {
-        let budget = DrawWorkBudget::new(64);
-        assert!(budget.fits(0, 96));
-        assert!(!budget.fits(1, 96));
-        assert!(!budget.fits(usize::MAX, 1));
-        assert!(budget.reserve(96, "oversized", Duration::from_secs(1)));
-        assert_eq!(budget.outstanding(), 96);
-        budget.release(96);
-        assert_eq!(budget.outstanding(), 0);
+    fn pending_draw_budget_admits_oversized_packet_only_when_empty() {
+        let budget = DrawWorkBudget::new(64, 64);
+        assert!(budget.fits(DrawWorkCost::default(), cost(96, 96)));
+        assert!(!budget.fits(cost(1, 0), cost(96, 96)));
+        assert!(!budget.fits(cost(0, 1), cost(96, 96)));
+        assert!(!budget.fits(cost(usize::MAX, 0), cost(1, 0)));
+        assert!(budget.reserve(cost(96, 96), "oversized", Duration::from_secs(1)));
+        assert_eq!(budget.outstanding(), cost(96, 96));
+        budget.release(cost(96, 96));
+        assert_eq!(budget.outstanding(), DrawWorkCost::default());
     }
 
     #[test]
-    fn closing_pending_group_budget_unblocks_waiter_without_reserving() {
-        let budget = Arc::new(DrawWorkBudget::new(64));
-        assert!(budget.reserve(64, "full", Duration::from_secs(1)));
+    fn closing_pending_draw_budget_unblocks_blocking_waiter_without_reserving() {
+        let budget = Arc::new(DrawWorkBudget::new(64, 64));
+        assert!(budget.reserve(cost(64, 64), "full", Duration::from_secs(1)));
         let waiter_budget = Arc::clone(&budget);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let waiter = std::thread::spawn(move || {
             entered_tx.send(()).unwrap();
             done_tx
-                .send(waiter_budget.reserve(1, "closed-waiter", Duration::from_secs(1)))
+                .send(waiter_budget.reserve_blocking(cost(1, 1), "closed-waiter"))
                 .unwrap();
         });
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         budget.close();
         assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)), Ok(false));
         waiter.join().unwrap();
-        budget.release(64);
-        assert_eq!(budget.outstanding(), 0);
+        budget.release(cost(64, 64));
+        assert_eq!(budget.outstanding(), DrawWorkCost::default());
     }
 
     #[test]
     fn draw_work_completion_releases_pending_and_budget_during_unwind() {
-        let budget = DrawWorkBudget::new(128);
-        assert!(budget.reserve(7, "panic", Duration::from_secs(1)));
+        let budget = DrawWorkBudget::new(128, 4096);
+        let work = cost(7, 2048);
+        assert!(budget.reserve(work, "panic", Duration::from_secs(1)));
         let pending = AtomicUsize::new(7);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _completion = DrawWorkCompletion {
                 pending: &pending,
                 budget: &budget,
-                units: 7,
+                cost: work,
             };
             panic!("test unwind");
         }));
         assert!(result.is_err());
         assert_eq!(pending.load(Ordering::Acquire), 0);
-        assert_eq!(budget.outstanding(), 0);
+        assert_eq!(budget.outstanding(), DrawWorkCost::default());
     }
 
     #[test]
@@ -1038,35 +1302,116 @@ mod tests {
     }
 
     #[test]
+    fn timed_job_submission_bounds_draw_tail_lock_wait() {
+        let (tx, _rx) = bounded(1);
+        let worker = Arc::new(RenderThread {
+            tx,
+            pending: Arc::new(AtomicUsize::new(0)),
+            draw_tail: Mutex::new(None),
+            draw_work_budget: Arc::new(DrawWorkBudget::new(0, 0)),
+        });
+        let held_tail = worker.draw_tail.lock().unwrap();
+        let submitted_worker = Arc::clone(&worker);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let timeout = Duration::from_millis(30);
+        let submitter = std::thread::spawn(move || {
+            let started = Instant::now();
+            started_tx.send(()).unwrap();
+            let submitted = submitted_worker.submit_timeout_named(
+                "held-draw-tail-test",
+                Box::new(|| {}),
+                timeout,
+            );
+            done_tx.send((submitted, started.elapsed())).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (submitted, elapsed) = done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("timed submission blocked indefinitely on draw_tail");
+        assert!(!submitted);
+        assert!(elapsed >= Duration::from_millis(20));
+        assert!(elapsed < Duration::from_millis(200));
+        assert_eq!(worker.pending.load(Ordering::Acquire), 0);
+
+        drop(held_tail);
+        submitter.join().unwrap();
+    }
+
+    #[test]
+    fn timed_job_send_uses_budget_remaining_after_draw_tail_wait() {
+        let (tx, _rx) = bounded(1);
+        tx.send(RenderWork::Job("occupied", Box::new(|| {})))
+            .unwrap();
+        let worker = Arc::new(RenderThread {
+            tx,
+            pending: Arc::new(AtomicUsize::new(1)),
+            draw_tail: Mutex::new(None),
+            draw_work_budget: Arc::new(DrawWorkBudget::new(0, 0)),
+        });
+        let held_tail = worker.draw_tail.lock().unwrap();
+        let submitted_worker = Arc::clone(&worker);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let timeout = Duration::from_millis(400);
+        let submitter = std::thread::spawn(move || {
+            let started = Instant::now();
+            started_tx.send(()).unwrap();
+            let submitted = submitted_worker.submit_timeout_named(
+                "remaining-send-budget-test",
+                Box::new(|| {}),
+                timeout,
+            );
+            done_tx.send((submitted, started.elapsed())).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held_tail);
+        let (submitted, elapsed) = done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!submitted);
+        assert!(elapsed >= Duration::from_millis(350));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "send_timeout restarted the full timeout after lock acquisition: {elapsed:?}"
+        );
+        assert_eq!(worker.pending.load(Ordering::Acquire), 1);
+        submitter.join().unwrap();
+    }
+
+    #[test]
     fn draw_group_limits_require_renderer_identity_count_and_ring_budget() {
         let safe = nexium_gpu::renderer::GRAPHICS_RING_SAFE_BATCH_BYTES;
-        assert!(draw_group_fits(1, safe - 1, true, 1));
-        assert!(!draw_group_fits(1, safe, true, 1));
-        assert!(!draw_group_fits(1, 0, false, 1));
-        assert!(!draw_group_fits(MAX_DRAW_GROUPS_PER_SUBMISSION, 0, true, 0));
-        assert!(!draw_group_fits(1, u64::MAX, true, 1));
+        let limit = DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION;
+        assert!(draw_group_fits(limit, 1, safe - 1, true, 1));
+        assert!(!draw_group_fits(limit, 1, safe, true, 1));
+        assert!(!draw_group_fits(limit, 1, 0, false, 1));
+        assert!(!draw_group_fits(limit, limit, 0, true, 0));
+        assert!(!draw_group_fits(limit, 1, u64::MAX, true, 1));
     }
 
     #[test]
     fn draw_group_fit_reason_distinguishes_each_limit() {
         let safe = nexium_gpu::renderer::GRAPHICS_RING_SAFE_BATCH_BYTES;
+        let limit = DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION;
         assert_eq!(
-            draw_group_fit_end_reason(1, 0, false, 0),
+            draw_group_fit_end_reason(limit, 1, 0, false, 0),
             Some(DrawGatherEndReason::Renderer)
         );
         assert_eq!(
-            draw_group_fit_end_reason(MAX_DRAW_GROUPS_PER_SUBMISSION, 0, true, 0),
+            draw_group_fit_end_reason(limit, limit, 0, true, 0),
             Some(DrawGatherEndReason::Count)
         );
         assert_eq!(
-            draw_group_fit_end_reason(1, safe, true, 1),
+            draw_group_fit_end_reason(limit, 1, safe, true, 1),
             Some(DrawGatherEndReason::Ring)
         );
         assert_eq!(
-            draw_group_fit_end_reason(1, u64::MAX, true, 1),
+            draw_group_fit_end_reason(limit, 1, u64::MAX, true, 1),
             Some(DrawGatherEndReason::Ring)
         );
-        assert_eq!(draw_group_fit_end_reason(1, safe - 1, true, 1), None);
+        assert_eq!(draw_group_fit_end_reason(limit, 1, safe - 1, true, 1), None);
     }
 
     #[test]
