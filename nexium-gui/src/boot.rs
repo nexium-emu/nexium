@@ -40,6 +40,11 @@ fn cpu_slice_cycles() -> u64 {
     })
 }
 
+fn core_park_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| std::env::var("NEXIUM_CORE_PARK").ok().as_deref() != Some("0"))
+}
+
 fn sync_host_region_changes(
     cpu: &mut nexium_core::cpu::Cpu,
     address_space: &nexium_memory::AddressSpace,
@@ -609,10 +614,24 @@ impl EmulationHandle {
                                     let has = {
                                         let mut k = kernel_aux.lock();
                                         k.threads.wake_due_sleepers(std::time::Instant::now());
-                                        k.ensure_thread_loaded().is_some()
+                                        let mut loaded = k.ensure_thread_loaded().is_some();
+                                        if !loaded && core_park_enabled() {
+                                            let wakers = k.threads.wakers.clone();
+                                            wakers.park_core(
+                                                &mut k,
+                                                core_id,
+                                                std::time::Duration::from_millis(2),
+                                            );
+                                            loaded = k.ensure_thread_loaded().is_some();
+                                        }
+                                        loaded
                                     };
                                     if !has {
-                                        std::thread::sleep(std::time::Duration::from_micros(200));
+                                        if !core_park_enabled() {
+                                            std::thread::sleep(std::time::Duration::from_micros(
+                                                200,
+                                            ));
+                                        }
                                         continue;
                                     }
                                     let gen = addr_aux.generation();
@@ -752,6 +771,12 @@ impl EmulationHandle {
                 }
                 let _wd_guard = WatchdogGuard(Arc::clone(&watchdog_stop));
 
+                {
+                    let wakers = boot_ctx.kernel.lock().threads.wakers.clone();
+                    nexium_common::host_wake::install(std::sync::Arc::new(move || {
+                        wakers.notify_all_cores();
+                    }));
+                }
                 let vsync_stop = Arc::new(AtomicBool::new(false));
                 let vsync_handle = {
                     let kernel_v = Arc::clone(&boot_ctx.kernel);
@@ -769,9 +794,7 @@ impl EmulationHandle {
                                     if rem > std::time::Duration::from_millis(2) {
                                         thread::sleep(rem - std::time::Duration::from_millis(1));
                                     } else {
-                                        while std::time::Instant::now() < next {
-                                            std::hint::spin_loop();
-                                        }
+                                        nexium_common::host_wake::wait_until(next);
                                     }
                                     continue;
                                 }
@@ -1069,25 +1092,51 @@ impl EmulationHandle {
                             continue;
                         }
                         let wake_opt = guard.threads.earliest_wake();
-                        drop(guard);
-                        match wake_opt {
-                            Some(wake) => {
-                                let now = std::time::Instant::now();
-                                if wake > now {
-                                    let remaining = wake - now;
-                                    if remaining > std::time::Duration::from_micros(1500) {
-                                        let coarse = (remaining
-                                            - std::time::Duration::from_millis(1))
+                        if core_park_enabled() {
+                            let now = std::time::Instant::now();
+                            let near = wake_opt.filter(|wake| {
+                                wake.saturating_duration_since(now)
+                                    <= std::time::Duration::from_micros(1500)
+                            });
+                            match near {
+                                Some(wake) => {
+                                    drop(guard);
+                                    nexium_common::host_wake::wait_until(wake);
+                                }
+                                None => {
+                                    let timeout = wake_opt
+                                        .map(|wake| {
+                                            wake.saturating_duration_since(now)
+                                                .saturating_sub(std::time::Duration::from_millis(1))
+                                        })
+                                        .unwrap_or(std::time::Duration::from_millis(2))
                                         .min(std::time::Duration::from_millis(2));
-                                        std::thread::sleep(coarse);
-                                    } else {
-                                        while std::time::Instant::now() < wake {
-                                            std::hint::spin_loop();
+                                    let wakers = guard.threads.wakers.clone();
+                                    wakers.park_core(&mut guard, 0, timeout);
+                                    drop(guard);
+                                }
+                            }
+                        } else {
+                            drop(guard);
+                            match wake_opt {
+                                Some(wake) => {
+                                    let now = std::time::Instant::now();
+                                    if wake > now {
+                                        let remaining = wake - now;
+                                        if remaining > std::time::Duration::from_micros(1500) {
+                                            let coarse = (remaining
+                                                - std::time::Duration::from_millis(1))
+                                            .min(std::time::Duration::from_millis(2));
+                                            std::thread::sleep(coarse);
+                                        } else {
+                                            while std::time::Instant::now() < wake {
+                                                std::hint::spin_loop();
+                                            }
                                         }
                                     }
                                 }
+                                None => std::thread::sleep(std::time::Duration::from_millis(2)),
                             }
-                            None => std::thread::sleep(std::time::Duration::from_millis(2)),
                         }
                         continue;
                     }

@@ -1783,7 +1783,7 @@ impl Pusher {
                                 }
                                 break;
                             }
-                            std::thread::sleep(std::time::Duration::from_micros(100));
+                            nexium_common::host_wake::micro_pause();
                         }
                     }
                 }

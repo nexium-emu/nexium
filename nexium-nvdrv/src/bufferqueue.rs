@@ -231,6 +231,7 @@ impl BufferQueue {
 
     fn notify_availability_changed(&self) {
         self.availability_generation.fetch_add(1, Ordering::Release);
+        nexium_common::host_wake::signal();
     }
 
     fn set_state(&mut self, slot: u32, state: SlotState) {

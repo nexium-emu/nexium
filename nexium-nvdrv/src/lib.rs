@@ -1387,6 +1387,8 @@ impl Nvdrv {
                 if !syncpoint_reached(channel.syncpt_min, threshold) {
                     channel.syncpt_min = threshold;
                 }
+                drop(channels);
+                nexium_common::host_wake::signal();
                 return;
             }
             if let Some(channel) = channels.get(&fd) {
@@ -1404,6 +1406,8 @@ impl Nvdrv {
                 entry.0 = threshold;
             }
             entry.1 = entry.1.max(threshold);
+            drop(retired);
+            nexium_common::host_wake::signal();
         })
     }
 
@@ -1426,7 +1430,7 @@ impl Nvdrv {
                 );
                 return false;
             }
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            nexium_common::host_wake::micro_pause();
         }
     }
 
