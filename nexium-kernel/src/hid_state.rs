@@ -92,10 +92,57 @@ pub struct ControllerInput {
     pub stick_r_y: i32,
 }
 
+pub const MOUSE_BUTTON_LEFT: u32 = 1 << 0;
+pub const MOUSE_BUTTON_RIGHT: u32 = 1 << 1;
+pub const MOUSE_BUTTON_MIDDLE: u32 = 1 << 2;
+pub const MOUSE_BUTTON_FORWARD: u32 = 1 << 3;
+pub const MOUSE_BUTTON_BACK: u32 = 1 << 4;
+
+const MOUSE_ATTR_IS_CONNECTED: u32 = 1 << 1;
+const KEYBOARD_ATTR_IS_CONNECTED: u32 = 1 << 0;
+
+pub const KEYBOARD_MOD_CONTROL: u32 = 1 << 0;
+pub const KEYBOARD_MOD_SHIFT: u32 = 1 << 1;
+pub const KEYBOARD_MOD_LEFT_ALT: u32 = 1 << 2;
+pub const KEYBOARD_MOD_RIGHT_ALT: u32 = 1 << 3;
+
+const MOUSE_ELEM_SIZE: usize = 0x30;
+const KEYBOARD_ELEM_SIZE: usize = 0x38;
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub struct MouseInput {
+    pub x: i32,
+    pub y: i32,
+    pub wheel_x: i32,
+    pub wheel_y: i32,
+    pub buttons: u32,
+    pub connected: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardInput {
+    pub modifiers: u32,
+    pub keys: [u8; 32],
+    pub connected: bool,
+}
+
+impl Default for KeyboardInput {
+    fn default() -> Self {
+        Self {
+            modifiers: 0,
+            keys: [0; 32],
+            connected: false,
+        }
+    }
+}
+
 pub struct HidState {
     buf: Box<[u8; HID_SHMEM_SIZE]>,
     mapped_host_ptr: usize,
     pub input: ControllerInput,
+    pub mouse: MouseInput,
+    pub keyboard: KeyboardInput,
+    last_written_mouse: MouseInput,
     pub sampling_number: u64,
     pub shmem_va: Option<u64>,
     last_tick: Option<std::time::Instant>,
@@ -107,6 +154,9 @@ impl HidState {
             buf: Box::new([0u8; HID_SHMEM_SIZE]),
             mapped_host_ptr: 0,
             input: ControllerInput::default(),
+            mouse: MouseInput::default(),
+            keyboard: KeyboardInput::default(),
+            last_written_mouse: MouseInput::default(),
             sampling_number: 0,
             shmem_va: None,
             last_tick: None,
@@ -114,6 +164,19 @@ impl HidState {
         s.init_metadata();
         s.tick(ControllerInput::default());
         s
+    }
+
+    pub fn update_devices(&mut self, mouse: MouseInput, keyboard: KeyboardInput) {
+        let force = mouse.buttons != self.mouse.buttons
+            || mouse.connected != self.mouse.connected
+            || keyboard != self.keyboard;
+        self.mouse = mouse;
+        self.keyboard = keyboard;
+        if force {
+            self.last_tick = Some(std::time::Instant::now());
+            let input = self.input;
+            self.tick(input);
+        }
     }
 
     pub fn maybe_tick(&mut self, input: ControllerInput) {
@@ -220,6 +283,13 @@ impl HidState {
             );
         }
 
+        let mouse = self.mouse;
+        let previous_mouse = self.last_written_mouse;
+        Self::write_mouse_lifo(&mut self.buf[..], &mouse, &previous_mouse, sampling);
+        self.last_written_mouse = mouse;
+        let keyboard = self.keyboard;
+        Self::write_keyboard_lifo(&mut self.buf[..], &keyboard, sampling);
+
         if self.mapped_host_ptr != 0 {
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -229,6 +299,67 @@ impl HidState {
                 );
             }
         }
+    }
+
+    fn write_device_lifo_header(buf: &mut [u8], lifo: usize, sampling: u64) -> usize {
+        let tail = (sampling % LIFO_STORAGE_COUNT as u64) as usize;
+        let count = sampling.min(LIFO_STORAGE_COUNT as u64 - 1);
+        write_u64(buf, lifo + 0x00, sampling);
+        write_u64(buf, lifo + 0x08, LIFO_STORAGE_COUNT as u64);
+        write_u64(buf, lifo + 0x10, tail as u64);
+        write_u64(buf, lifo + 0x18, count);
+        tail
+    }
+
+    fn write_mouse_lifo(buf: &mut [u8], mouse: &MouseInput, previous: &MouseInput, sampling: u64) {
+        let tail = Self::write_device_lifo_header(buf, MOUSE_OFFSET, sampling);
+        let storage = MOUSE_OFFSET + LIFO_HEADER_SIZE + tail * MOUSE_ELEM_SIZE;
+        write_u64(buf, storage, sampling);
+        let state = storage + 8;
+        write_u64(buf, state + 0x00, sampling);
+        write_i32(buf, state + 0x08, mouse.x);
+        write_i32(buf, state + 0x0C, mouse.y);
+        write_i32(buf, state + 0x10, mouse.x.wrapping_sub(previous.x));
+        write_i32(buf, state + 0x14, mouse.y.wrapping_sub(previous.y));
+        write_i32(
+            buf,
+            state + 0x18,
+            mouse.wheel_y.wrapping_sub(previous.wheel_y),
+        );
+        write_i32(
+            buf,
+            state + 0x1C,
+            mouse.wheel_x.wrapping_sub(previous.wheel_x),
+        );
+        write_u32(buf, state + 0x20, mouse.buttons);
+        write_u32(
+            buf,
+            state + 0x24,
+            if mouse.connected {
+                MOUSE_ATTR_IS_CONNECTED
+            } else {
+                0
+            },
+        );
+    }
+
+    fn write_keyboard_lifo(buf: &mut [u8], keyboard: &KeyboardInput, sampling: u64) {
+        let tail = Self::write_device_lifo_header(buf, KEYBOARD_OFFSET, sampling);
+        let storage = KEYBOARD_OFFSET + LIFO_HEADER_SIZE + tail * KEYBOARD_ELEM_SIZE;
+        write_u64(buf, storage, sampling);
+        let state = storage + 8;
+        write_u64(buf, state + 0x00, sampling);
+        write_u32(buf, state + 0x08, keyboard.modifiers);
+        write_u32(
+            buf,
+            state + 0x0C,
+            if keyboard.connected {
+                KEYBOARD_ATTR_IS_CONNECTED
+            } else {
+                0
+            },
+        );
+        buf[state + 0x10..state + 0x30].copy_from_slice(&keyboard.keys);
     }
 
     fn init_metadata(&mut self) {
@@ -482,6 +613,69 @@ mod tests {
                 1234
             );
         }
+    }
+
+    #[test]
+    fn mouse_lifo_publishes_position_deltas_and_connection() {
+        let mut hid = HidState::new();
+        hid.mouse = MouseInput {
+            x: 100,
+            y: 200,
+            wheel_x: 0,
+            wheel_y: 0,
+            buttons: MOUSE_BUTTON_LEFT,
+            connected: true,
+        };
+        hid.tick(ControllerInput::default());
+        hid.mouse = MouseInput {
+            x: 140,
+            y: 190,
+            wheel_x: 0,
+            wheel_y: 240,
+            buttons: 0,
+            connected: true,
+        };
+        hid.tick(ControllerInput::default());
+
+        let tail = read_u64(&hid.buf[..], MOUSE_OFFSET + 0x10) as usize;
+        assert_eq!(tail, (hid.sampling_number % 17) as usize);
+        let state = MOUSE_OFFSET + LIFO_HEADER_SIZE + tail * MOUSE_ELEM_SIZE + 8;
+        assert_eq!(read_u64(&hid.buf[..], state), hid.sampling_number);
+        let read_i32 = |off: usize| {
+            i32::from_le_bytes(hid.buf[state + off..state + off + 4].try_into().unwrap())
+        };
+        assert_eq!(read_i32(0x08), 140);
+        assert_eq!(read_i32(0x0C), 190);
+        assert_eq!(read_i32(0x10), 40);
+        assert_eq!(read_i32(0x14), -10);
+        assert_eq!(read_i32(0x18), 240);
+        assert_eq!(read_i32(0x1C), 0);
+        assert_eq!(read_i32(0x20), 0);
+        assert_eq!(read_i32(0x24) as u32, 1 << 1);
+    }
+
+    #[test]
+    fn keyboard_lifo_publishes_key_bitmap_and_modifiers() {
+        let mut hid = HidState::new();
+        let mut keys = [0u8; 32];
+        keys[0] = 1 << 4;
+        hid.keyboard = KeyboardInput {
+            modifiers: KEYBOARD_MOD_SHIFT,
+            keys,
+            connected: true,
+        };
+        hid.tick(ControllerInput::default());
+
+        let tail = read_u64(&hid.buf[..], KEYBOARD_OFFSET + 0x10) as usize;
+        let state = KEYBOARD_OFFSET + LIFO_HEADER_SIZE + tail * KEYBOARD_ELEM_SIZE + 8;
+        assert_eq!(read_u64(&hid.buf[..], state), hid.sampling_number);
+        let read_u32_at = |off: usize| {
+            u32::from_le_bytes(hid.buf[state + off..state + off + 4].try_into().unwrap())
+        };
+        assert_eq!(read_u32_at(0x08), KEYBOARD_MOD_SHIFT);
+        assert_eq!(read_u32_at(0x0C), 1);
+        assert_eq!(hid.buf[state + 0x10], 1 << 4);
+        assert_eq!(&hid.buf[state + 0x11..state + 0x30], &[0u8; 31][..]);
     }
 
     #[test]
