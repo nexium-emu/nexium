@@ -535,6 +535,8 @@ pub struct AppSettings {
     pub emulate_mouse: bool,
     #[serde(default = "default_emulated_device")]
     pub emulate_keyboard: bool,
+    #[serde(default = "default_emulated_device")]
+    pub emulate_touch: bool,
     #[serde(default)]
     pub performance_debug: PerformanceDebugSettings,
 }
@@ -678,6 +680,7 @@ impl Default for AppSettings {
             right_deadzone: default_right_deadzone(),
             emulate_mouse: default_emulated_device(),
             emulate_keyboard: default_emulated_device(),
+            emulate_touch: default_emulated_device(),
             performance_debug: PerformanceDebugSettings::default(),
         }
     }

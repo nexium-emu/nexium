@@ -7784,10 +7784,12 @@ impl eframe::App for HorizonApp {
                 });
             }
             let mut mouse = nexium_core::hid_state::MouseInput::default();
-            if self.app_settings.emulate_mouse {
+            let mut touch = hid.touch;
+            touch.pressed = false;
+            if self.app_settings.emulate_mouse || self.app_settings.emulate_touch {
                 let previous = hid.mouse;
                 mouse = nexium_core::hid_state::MouseInput {
-                    connected: true,
+                    connected: self.app_settings.emulate_mouse,
                     buttons: 0,
                     ..previous
                 };
@@ -7823,6 +7825,18 @@ impl eframe::App for HorizonApp {
                         }
                     }
                 });
+                if self.app_settings.emulate_touch {
+                    touch = nexium_core::hid_state::TouchInput {
+                        x: mouse.x.max(0) as u32,
+                        y: mouse.y.max(0) as u32,
+                        pressed: !wants_pointer
+                            && ctx.input(|i| i.pointer.primary_down())
+                            && self.last_game_rect.is_some(),
+                    };
+                }
+                if !self.app_settings.emulate_mouse {
+                    mouse = nexium_core::hid_state::MouseInput::default();
+                }
             }
             hid.update_devices(
                 mouse,
@@ -7831,6 +7845,7 @@ impl eframe::App for HorizonApp {
                     keys,
                     connected: self.app_settings.emulate_keyboard,
                 },
+                touch,
             );
         }
 
@@ -9720,6 +9735,13 @@ fn emulation_settings_content(ui: &mut egui::Ui, cfg: &mut AppSettings, save_nee
     }
     resp.on_hover_text(
         "Report host keys to the game as a USB keyboard alongside the keyboard-to-controller bindings",
+    );
+    let resp = ui.checkbox(&mut cfg.emulate_touch, "Touchscreen (tap with mouse)");
+    if resp.changed() {
+        *save_needed = true;
+    }
+    resp.on_hover_text(
+        "Left-clicking the game viewport sends a touchscreen tap at the cursor position — most point-and-click games use this, not the USB mouse",
     );
 }
 

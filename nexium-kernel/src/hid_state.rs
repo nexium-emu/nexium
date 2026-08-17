@@ -108,6 +108,10 @@ pub const KEYBOARD_MOD_RIGHT_ALT: u32 = 1 << 3;
 
 const MOUSE_ELEM_SIZE: usize = 0x30;
 const KEYBOARD_ELEM_SIZE: usize = 0x38;
+const TOUCH_ELEM_SIZE: usize = 0x298;
+
+const TOUCH_ATTR_START: u32 = 1 << 0;
+const TOUCH_ATTR_END: u32 = 1 << 1;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub struct MouseInput {
@@ -117,6 +121,13 @@ pub struct MouseInput {
     pub wheel_y: i32,
     pub buttons: u32,
     pub connected: bool,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub struct TouchInput {
+    pub x: u32,
+    pub y: u32,
+    pub pressed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -142,7 +153,9 @@ pub struct HidState {
     pub input: ControllerInput,
     pub mouse: MouseInput,
     pub keyboard: KeyboardInput,
+    pub touch: TouchInput,
     last_written_mouse: MouseInput,
+    last_written_touch: TouchInput,
     pub sampling_number: u64,
     pub shmem_va: Option<u64>,
     last_tick: Option<std::time::Instant>,
@@ -156,7 +169,9 @@ impl HidState {
             input: ControllerInput::default(),
             mouse: MouseInput::default(),
             keyboard: KeyboardInput::default(),
+            touch: TouchInput::default(),
             last_written_mouse: MouseInput::default(),
+            last_written_touch: TouchInput::default(),
             sampling_number: 0,
             shmem_va: None,
             last_tick: None,
@@ -166,12 +181,19 @@ impl HidState {
         s
     }
 
-    pub fn update_devices(&mut self, mouse: MouseInput, keyboard: KeyboardInput) {
+    pub fn update_devices(
+        &mut self,
+        mouse: MouseInput,
+        keyboard: KeyboardInput,
+        touch: TouchInput,
+    ) {
         let force = mouse.buttons != self.mouse.buttons
             || mouse.connected != self.mouse.connected
-            || keyboard != self.keyboard;
+            || keyboard != self.keyboard
+            || touch.pressed != self.touch.pressed;
         self.mouse = mouse;
         self.keyboard = keyboard;
+        self.touch = touch;
         if force {
             self.last_tick = Some(std::time::Instant::now());
             let input = self.input;
@@ -289,6 +311,10 @@ impl HidState {
         self.last_written_mouse = mouse;
         let keyboard = self.keyboard;
         Self::write_keyboard_lifo(&mut self.buf[..], &keyboard, sampling);
+        let touch = self.touch;
+        let previous_touch = self.last_written_touch;
+        Self::write_touch_lifo(&mut self.buf[..], &touch, &previous_touch, sampling);
+        self.last_written_touch = touch;
 
         if self.mapped_host_ptr != 0 {
             unsafe {
@@ -341,6 +367,44 @@ impl HidState {
                 0
             },
         );
+    }
+
+    fn write_touch_lifo(buf: &mut [u8], touch: &TouchInput, previous: &TouchInput, sampling: u64) {
+        let tail = Self::write_device_lifo_header(buf, TOUCH_OFFSET, sampling);
+        let storage = TOUCH_OFFSET + LIFO_HEADER_SIZE + tail * TOUCH_ELEM_SIZE;
+        write_u64(buf, storage, sampling);
+        let state = storage + 8;
+        write_u64(buf, state + 0x00, sampling);
+        let ending = !touch.pressed && previous.pressed;
+        let entry_count = if touch.pressed || ending { 1 } else { 0 };
+        write_i32(buf, state + 0x08, entry_count);
+        write_u32(buf, state + 0x0C, 0);
+        let finger = state + 0x10;
+        if entry_count == 0 {
+            buf[finger..finger + 0x28].fill(0);
+            return;
+        }
+        let attribute = if ending {
+            TOUCH_ATTR_END
+        } else if !previous.pressed {
+            TOUCH_ATTR_START
+        } else {
+            0
+        };
+        let (x, y) = if ending {
+            (previous.x, previous.y)
+        } else {
+            (touch.x, touch.y)
+        };
+        write_u64(buf, finger + 0x00, sampling);
+        write_u32(buf, finger + 0x08, attribute);
+        write_u32(buf, finger + 0x0C, 0);
+        write_u32(buf, finger + 0x10, x.min(1279));
+        write_u32(buf, finger + 0x14, y.min(719));
+        write_u32(buf, finger + 0x18, 15);
+        write_u32(buf, finger + 0x1C, 15);
+        write_u32(buf, finger + 0x20, 0);
+        write_u32(buf, finger + 0x24, 0);
     }
 
     fn write_keyboard_lifo(buf: &mut [u8], keyboard: &KeyboardInput, sampling: u64) {
@@ -676,6 +740,46 @@ mod tests {
         assert_eq!(read_u32_at(0x0C), 1);
         assert_eq!(hid.buf[state + 0x10], 1 << 4);
         assert_eq!(&hid.buf[state + 0x11..state + 0x30], &[0u8; 31][..]);
+    }
+
+    #[test]
+    fn touch_lifo_tracks_press_hold_release_lifecycle() {
+        let mut hid = HidState::new();
+        let touch_state = |hid: &HidState| {
+            let tail = read_u64(&hid.buf[..], TOUCH_OFFSET + 0x10) as usize;
+            TOUCH_OFFSET + LIFO_HEADER_SIZE + tail * TOUCH_ELEM_SIZE + 8
+        };
+        let read_u32_at = |hid: &HidState, off: usize| {
+            let state = touch_state(hid);
+            u32::from_le_bytes(hid.buf[state + off..state + off + 4].try_into().unwrap())
+        };
+
+        hid.touch = TouchInput {
+            x: 640,
+            y: 360,
+            pressed: true,
+        };
+        hid.tick(ControllerInput::default());
+        assert_eq!(read_u32_at(&hid, 0x08), 1);
+        assert_eq!(read_u32_at(&hid, 0x18), TOUCH_ATTR_START);
+        assert_eq!(read_u32_at(&hid, 0x20), 640);
+        assert_eq!(read_u32_at(&hid, 0x24), 360);
+
+        hid.touch.x = 700;
+        hid.tick(ControllerInput::default());
+        assert_eq!(read_u32_at(&hid, 0x08), 1);
+        assert_eq!(read_u32_at(&hid, 0x18), 0);
+        assert_eq!(read_u32_at(&hid, 0x20), 700);
+
+        hid.touch.pressed = false;
+        hid.tick(ControllerInput::default());
+        assert_eq!(read_u32_at(&hid, 0x08), 1);
+        assert_eq!(read_u32_at(&hid, 0x18), TOUCH_ATTR_END);
+        assert_eq!(read_u32_at(&hid, 0x20), 700);
+
+        hid.tick(ControllerInput::default());
+        assert_eq!(read_u32_at(&hid, 0x08), 0);
+        assert_eq!(read_u32_at(&hid, 0x18), 0);
     }
 
     #[test]
