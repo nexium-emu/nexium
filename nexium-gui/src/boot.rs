@@ -254,7 +254,7 @@ impl PcTrace {
             let hit = r.hits;
             r.hits = r.hits.saturating_add(1);
             log::warn!(
-                "[pc-trace] core={} hit={} label={} pc={:#x} off={:#x} lr={:#x} sp={:#x} handle={:?} event={:?} cycles={} svcs={} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x19={:#x} x20={:#x} x21={:#x} x22={:#x} x29={:#x}",
+                "[pc-trace] core={} hit={} label={} pc={:#x} off={:#x} lr={:#x} sp={:#x} handle={:?} event={:?} cycles={} svcs={} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x19={:#x} x20={:#x} x21={:#x} x22={:#x} x25={:#x} x26={:#x} x27={:#x} x28={:#x} x29={:#x}",
                 core,
                 hit,
                 r.label,
@@ -274,6 +274,10 @@ impl PcTrace {
                 cpu.get_register(20),
                 cpu.get_register(21),
                 cpu.get_register(22),
+                cpu.get_register(25),
+                cpu.get_register(26),
+                cpu.get_register(27),
+                cpu.get_register(28),
                 cpu.get_register(29)
             );
         }

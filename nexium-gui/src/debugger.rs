@@ -39,6 +39,7 @@ pub struct DebuggerState {
     pub show_registers: bool,
     pub show_disasm: bool,
     pub show_logs: bool,
+    pub show_performance: bool,
     pub log_history: Arc<Mutex<LogHistory>>,
 }
 
@@ -52,6 +53,7 @@ impl DebuggerState {
             show_registers: false,
             show_disasm: false,
             show_logs: false,
+            show_performance: false,
             log_history: Arc::new(Mutex::new(LogHistory::new(1000))),
         }
     }
@@ -74,6 +76,10 @@ impl DebuggerState {
 
     pub fn toggle_logs(&mut self) {
         self.show_logs = !self.show_logs;
+    }
+
+    pub fn toggle_performance(&mut self) {
+        self.show_performance = !self.show_performance;
     }
 }
 

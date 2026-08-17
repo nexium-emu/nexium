@@ -158,6 +158,7 @@ pub struct HorizonApp {
     nro_path: String,
     emulation_handle: Option<EmulationHandle>,
     game_texture: Option<egui::TextureHandle>,
+    egui_ctx: egui::Context,
     wgpu_state: Option<eframe::egui_wgpu::RenderState>,
     game_texture_native: Option<NativeGameTexture>,
     frame_backlog: std::collections::VecDeque<crate::boot::Frame>,
@@ -400,6 +401,7 @@ impl HorizonApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         log_buffer: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+        app_settings: AppSettings,
         nro_arg: Option<String>,
     ) -> Self {
         Self::apply_theme(&cc.egui_ctx);
@@ -413,6 +415,7 @@ impl HorizonApp {
             nro_path: nro_path.clone(),
             emulation_handle: None,
             game_texture: None,
+            egui_ctx: cc.egui_ctx.clone(),
             wgpu_state: cc.wgpu_render_state.clone(),
             game_texture_native: None,
             frame_backlog: std::collections::VecDeque::new(),
@@ -451,7 +454,7 @@ impl HorizonApp {
             prefs_rebind_cool: false,
             prefs_enter_held: false,
             input_device: InputDevice::Keyboard,
-            app_settings: AppSettings::load(),
+            app_settings,
             last_buttons_logged: 0,
             last_sticks_logged: [0; 4],
             audio_device_cache: None,
@@ -533,7 +536,7 @@ impl HorizonApp {
         app.library
             .rescan(&cc.egui_ctx, &app.app_settings.library_folders);
         if !nro_path.is_empty() {
-            let backend = app.app_settings.cpu_backend.to_cpu_kind();
+            let backend = app.app_settings.effective_cpu_backend().to_cpu_kind();
             if let Ok(handle) = EmulationHandle::new(&nro_path, backend, Some(cc.egui_ctx.clone()))
             {
                 app.emulation_handle = Some(handle);
@@ -543,6 +546,9 @@ impl HorizonApp {
                     game_index,
                     start_time: 0.0,
                 };
+                cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                    app.game_window_title(&launched),
+                ));
                 app.playing_path = Some(launched);
                 log::info!("Auto-loaded NRO: {} (CPU: {})", nro_path, backend.label());
             } else {
@@ -1087,6 +1093,7 @@ impl HorizonApp {
         let Some(t) = self.game_texture_native.as_ref() else {
             return;
         };
+        let _ = rs.device.poll(eframe::wgpu::Maintain::Poll);
         rs.queue.write_texture(
             eframe::wgpu::ImageCopyTexture {
                 texture: &t.texture,
@@ -6121,11 +6128,45 @@ impl HorizonApp {
         }
     }
 
+    fn game_window_title(&self, path: &std::path::Path) -> String {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let meta = if ext == "nro" {
+            nexium_loader::read_nro_metadata(path)
+        } else {
+            nexium_loader::read_container_metadata(path)
+        };
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        let (game, version) = match meta {
+            Some(m) => {
+                let name = if m.title.is_empty() { stem } else { m.title };
+                (name, m.version)
+            }
+            None => (stem, String::new()),
+        };
+        let mut title = format!("NeXium {} | {}", env!("CARGO_PKG_VERSION"), game);
+        if !version.is_empty() {
+            title.push_str(&format!(" {}", version));
+        }
+        if let Some(rs) = self.wgpu_state.as_ref() {
+            let info = rs.adapter.get_info();
+            title.push_str(&format!(" | {:?} | {}", info.backend, info.name));
+        }
+        title
+    }
+
     fn boot_nro(&mut self, ctx: &egui::Context) {
         if self.nro_path.is_empty() {
             return;
         }
-        let backend = self.app_settings.cpu_backend.to_cpu_kind();
+        let backend = self.app_settings.effective_cpu_backend().to_cpu_kind();
         log::info!("Boot: NRO={} CPU={}", self.nro_path, backend.label());
         if let Some(mut old) = self.emulation_handle.take() {
             old.stop();
@@ -6148,6 +6189,7 @@ impl HorizonApp {
                     self.carousel.selected = n + crate::carousel::CS_FRONT;
                     self.carousel.scroll_offset = (n + crate::carousel::CS_FRONT) as f32;
                 }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.game_window_title(&path)));
                 self.playing_path = Some(path);
             }
             Err(e) => log::error!("Boot: {}", e),
@@ -6155,6 +6197,8 @@ impl HorizonApp {
     }
 
     fn stop_emulation(&mut self) {
+        self.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::Title("NeXium".to_string()));
         self.play_times.save_if_dirty();
         self.carousel.boot_stage = crate::carousel::BootStage::None;
         let was_paused = self
@@ -7874,6 +7918,10 @@ impl eframe::App for HorizonApp {
                                 self.debugger.toggle_logs();
                                 ui.close_menu();
                             }
+                            if ui.button("Performance Tuning...").clicked() {
+                                self.debugger.toggle_performance();
+                                ui.close_menu();
+                            }
                             ui.separator();
                             let mut dumps_on = nexium_common::dumps::enabled();
                             if ui.checkbox(&mut dumps_on, "Frame dumps (.bmp)").changed() {
@@ -8790,6 +8838,7 @@ impl eframe::App for HorizonApp {
             snapshot.as_ref(),
             mem_req.as_deref(),
             &self.log_buffer,
+            &mut self.app_settings,
         );
 
         if running {
@@ -9611,6 +9660,7 @@ fn debug_windows(
     snapshot: Option<&crate::boot::CpuSnapshot>,
     mem_request: Option<&dyn Fn(u64)>,
     log_buffer: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    app_settings: &mut AppSettings,
 ) {
     if dbg.show_memory {
         egui::Window::new("Memory")
@@ -9838,6 +9888,7 @@ fn debug_windows(
             });
     }
 
+    let mut open_performance_from_logs = false;
     if dbg.show_logs {
         egui::Window::new("Logs")
             .open(&mut dbg.show_logs)
@@ -9848,6 +9899,9 @@ fn debug_windows(
                         if let Ok(mut buf) = log_buffer.lock() {
                             buf.clear();
                         }
+                    }
+                    if pill_button(ui, "Performance Tuning", false).clicked() {
+                        open_performance_from_logs = true;
                     }
                 });
                 ui.add_space(4.0);
@@ -9868,6 +9922,269 @@ fn debug_windows(
                     });
             });
     }
+
+    if open_performance_from_logs {
+        dbg.show_performance = true;
+    }
+
+    if dbg.show_performance {
+        let mut changed = false;
+        egui::Window::new("Performance Tuning")
+            .open(&mut dbg.show_performance)
+            .default_size([620.0, 620.0])
+            .min_size([480.0, 420.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("Advanced performance controls")
+                        .size(14.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.add_space(3.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Changes apply after restarting NeXium. Values supplied by your launcher take precedence.",
+                    )
+                    .size(11.0)
+                    .color(AMBER),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Unchecked options use automatic defaults. Hover any option for behavior, dependencies, and compatibility notes.",
+                    )
+                    .size(10.5)
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if pill_button(ui, "Enable safe preset", true).clicked() {
+                        app_settings.performance_debug.enable_safe_preset();
+                        changed = true;
+                    }
+                    if pill_button(ui, "Reset overrides", false).clicked() {
+                        app_settings.performance_debug.clear();
+                        changed = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} of 14 enabled",
+                            app_settings
+                                .performance_debug
+                                .enabled_overrides()
+                                .len()
+                        ))
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        performance_debug_section(ui, "CPU recompiler");
+                        changed |= performance_debug_toggle(
+                            ui,
+                            &mut app_settings.performance_debug.cpu_backend_dynarmic,
+                            "Dynarmic CPU Recompiler",
+                            "Uses NeXium's high-performance ARM64 dynamic recompiler.",
+                            "Forces the Dynarmic backend even when another backend is selected in the normal CPU settings. Dynarmic is already the default.",
+                            "NEXIUM_CPU_BACKEND=dynarmic",
+                        );
+                        changed |= performance_debug_toggle(
+                            ui,
+                            &mut app_settings.performance_debug.cpu_cores_4,
+                            "Four-Core CPU Emulation",
+                            "Runs the full four-core guest CPU configuration.",
+                            "Overrides the guest CPU core count to four. This is already the normal default and may still be superseded by single-core compatibility mode.",
+                            "NEXIUM_CPU_CORES=4",
+                        );
+                        changed |= performance_debug_toggle(
+                            ui,
+                            &mut app_settings
+                                .performance_debug
+                                .dynarmic_code_page_cache,
+                            "Dynarmic Instruction Page Cache",
+                            "Caches guest code-page lookups inside Dynarmic.",
+                            "Reduces repeated page-table lookups while translating and executing guest code. This cache is already enabled by default.",
+                            "DYNARMIC_CODE_PAGE_CACHE=1",
+                        );
+                        changed |= performance_debug_toggle(
+                            ui,
+                            &mut app_settings.performance_debug.dynarmic_jit_size_64,
+                            "64 MiB Dynarmic JIT Cache",
+                            "Uses a 64 MiB generated-code cache for each guest core.",
+                            "Pins Dynarmic's per-core JIT cache to the stable 64 MiB baseline. Larger caches can increase memory use and have caused long transition stalls.",
+                            "DYNARMIC_JIT_SIZE=64",
+                        );
+
+                        performance_debug_section(ui, "GPU scheduling");
+                        ui.label(
+                            egui::RichText::new(
+                                "Temporarily quarantined: the parallel submission path can stall guest fences and trigger a host GPU reset.",
+                            )
+                            .size(10.5)
+                            .color(DANGER_HV),
+                        );
+                        ui.add_enabled_ui(false, |ui| {
+                            changed |= performance_debug_toggle(
+                                ui,
+                                &mut app_settings.performance_debug.async_gpu,
+                                "Asynchronous GPU Submission",
+                                "Moves guest GPU submissions to a dedicated worker.",
+                                "Developer-only while host completion and device-loss recovery are being hardened.",
+                                "NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1\nNEXIUM_ASYNC_GPU=1",
+                            );
+                            changed |= performance_debug_toggle(
+                                ui,
+                                &mut app_settings
+                                    .performance_debug
+                                    .async_gpu_defer_smallrt,
+                                "Deferred Small Render-Target Writeback",
+                                "Batches small render-target readbacks until synchronization is required.",
+                                "Developer-only. Requires the quarantined asynchronous GPU path.",
+                                "NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1\nNEXIUM_ASYNC_GPU=1\nNEXIUM_ASYNC_GPU_DEFER_SMALLRT=1",
+                            );
+                            changed |= performance_debug_toggle(
+                                ui,
+                                &mut app_settings.performance_debug.gpu_pipeline,
+                                "Parallel GPU Command Preparation",
+                                "Separates command decoding and preparation from submission.",
+                                "Developer-only while host completion and device-loss recovery are being hardened.",
+                                "NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1\nNEXIUM_ASYNC_GPU=1\nNEXIUM_GPU_PIPELINE=1",
+                            );
+                            changed |= performance_debug_toggle(
+                                ui,
+                                &mut app_settings.performance_debug.fermi_lazy_drain,
+                                "Reduced 2D Copy Synchronization",
+                                "Avoids redundant render-thread drains for safe 2D copies.",
+                                "Developer-only. Requires the quarantined parallel GPU path.",
+                                "NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1\nNEXIUM_FERMI_LAZY_DRAIN=1",
+                            );
+                            changed |= performance_debug_toggle(
+                                ui,
+                                &mut app_settings.performance_debug.fermi_async_blit,
+                                "Asynchronous 2D Render-Target Copies",
+                                "Offloads compatible 2D copies to the render thread.",
+                                "Hard-disabled because its deferred layout publication is not Vulkan-safe. The synchronous exact-copy path remains active.",
+                                "Hard-disabled in this build",
+                            );
+                            changed |= performance_debug_toggle(
+                                ui,
+                                &mut app_settings.performance_debug.async_smallrt_wb,
+                                "Asynchronous Small-Target Writeback",
+                                "Completes deferred small-target readbacks on the render thread.",
+                                "Developer-only while Vulkan resource lifetime validation is incomplete.",
+                                "NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1\nNEXIUM_ASYNC_GPU=1\nNEXIUM_GPU_PIPELINE=1\nNEXIUM_ASYNC_SMALLRT_WB=1",
+                            );
+                        });
+
+                        performance_debug_section(ui, "GPU data caching");
+                        changed |= performance_debug_toggle(
+                            ui,
+                            &mut app_settings.performance_debug.input_mirror,
+                            "GPU Input Mirroring",
+                            "Reuses unchanged GPU input data tracked through fast memory.",
+                            "Caches guest GPU inputs through fastmem write-watch tracking. It remains inactive when the required fast-memory support is unavailable.",
+                            "NEXIUM_INPUT_MIRROR=1",
+                        );
+                        ui.add_enabled_ui(false, |ui| {
+                            changed |= performance_debug_toggle(
+                                ui,
+                                &mut app_settings.performance_debug.cbuf_writethrough,
+                                "Constant-Buffer Write-Through",
+                                "Updates mirrored constants in place instead of invalidating them.",
+                                "Developer-only. Requires the quarantined parallel GPU path.",
+                                "NEXIUM_EXPERIMENTAL_GPU_SCHEDULING=1\nNEXIUM_INPUT_MIRROR=1\nNEXIUM_CBUF_WRITETHROUGH=1",
+                            );
+                        });
+                        changed |= performance_debug_toggle(
+                            ui,
+                            &mut app_settings.performance_debug.resident_vb,
+                            "Resident Vertex Buffer Cache",
+                            "Keeps frequently reused vertex data resident on the GPU.",
+                            "Maintains a resident Vulkan buffer cache for mirrored vertex chunks to reduce repeated uploads. Falls back safely when mirroring is unavailable.",
+                            "NEXIUM_RESIDENT_VB=1",
+                        );
+                        changed |= performance_debug_toggle(
+                            ui,
+                            &mut app_settings.performance_debug.resident_cbuf,
+                            "Resident Constant Buffer Cache",
+                            "Reuses stable constant-buffer snapshots across draws.",
+                            "Retains mirrored constant-buffer data and binds resident storage when possible. Direct resident binding works best with the Resident Vertex Buffer Cache.",
+                            "NEXIUM_RESIDENT_CBUF=1",
+                        );
+                    });
+            });
+        if changed {
+            if let Err(error) = app_settings.save() {
+                log::warn!("failed to save performance debug settings: {error}");
+            }
+        }
+    }
+}
+
+fn performance_debug_section(ui: &mut egui::Ui, label: &str) {
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new(label).size(13.0).strong().color(TEXT));
+    ui.add_space(3.0);
+}
+
+fn performance_debug_toggle(
+    ui: &mut egui::Ui,
+    enabled: &mut bool,
+    title: &str,
+    summary: &str,
+    details: &str,
+    technical_override: &str,
+) -> bool {
+    let checkbox = ui.checkbox(enabled, egui::RichText::new(title).size(12.0).color(TEXT));
+    let changed = checkbox.changed();
+    let summary_response = ui
+        .indent(title, |ui| {
+            ui.label(egui::RichText::new(summary).size(10.5).color(MUTED))
+        })
+        .inner;
+    checkbox
+        .on_hover_cursor(egui::CursorIcon::Help)
+        .on_hover_ui(|ui| performance_debug_tooltip(ui, title, details, technical_override));
+    summary_response
+        .on_hover_cursor(egui::CursorIcon::Help)
+        .on_hover_ui(|ui| performance_debug_tooltip(ui, title, details, technical_override));
+    ui.add_space(4.0);
+    changed
+}
+
+fn performance_debug_tooltip(
+    ui: &mut egui::Ui,
+    title: &str,
+    details: &str,
+    technical_override: &str,
+) {
+    ui.set_max_width(380.0);
+    ui.label(egui::RichText::new(title).size(12.0).strong().color(TEXT));
+    ui.add_space(3.0);
+    ui.label(egui::RichText::new(details).size(11.0).color(TEXT));
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("Requires a full application restart")
+            .size(10.5)
+            .color(AMBER),
+    );
+    ui.add_space(3.0);
+    ui.label(
+        egui::RichText::new("Technical control")
+            .size(9.5)
+            .color(MUTED),
+    );
+    ui.label(
+        egui::RichText::new(technical_override)
+            .size(10.0)
+            .monospace()
+            .color(MUTED),
+    );
 }
 
 fn disasm_arm64(instr: u32) -> String {

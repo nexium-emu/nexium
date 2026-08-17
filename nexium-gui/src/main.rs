@@ -28,7 +28,7 @@ use nexium_common::FileLogger;
 fn main() -> Result<(), eframe::Error> {
     std::env::set_var("DISABLE_MANGOHUD", "1");
 
-    if std::env::var_os("NEXIUM_DIAG").is_some() {
+    if std::env::var("NEXIUM_DIAG").is_ok_and(|v| v != "lite") {
         let defaults: [(&str, &str); 14] = [
             ("NEXIUM_RT_STATS", "1"),
             ("NEXIUM_RT_STATS_PERIOD", "120"),
@@ -121,6 +121,7 @@ fn main() -> Result<(), eframe::Error> {
             Ok(Box::new(HorizonApp::new(
                 cc,
                 log_buf_for_app.clone(),
+                settings.clone(),
                 nro_arg.clone(),
             )))
         }),

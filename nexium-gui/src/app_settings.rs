@@ -369,6 +369,99 @@ fn default_right_deadzone() -> f32 {
     0.12
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PerformanceDebugSettings {
+    pub cpu_backend_dynarmic: bool,
+    pub cpu_cores_4: bool,
+    pub dynarmic_code_page_cache: bool,
+    pub dynarmic_jit_size_64: bool,
+    pub async_gpu: bool,
+    pub async_gpu_defer_smallrt: bool,
+    pub gpu_pipeline: bool,
+    pub fermi_lazy_drain: bool,
+    pub input_mirror: bool,
+    pub cbuf_writethrough: bool,
+    pub resident_vb: bool,
+    pub fermi_async_blit: bool,
+    pub resident_cbuf: bool,
+    pub async_smallrt_wb: bool,
+}
+
+impl PerformanceDebugSettings {
+    fn entries(&self) -> [(bool, &'static str, &'static str); 14] {
+        [
+            (self.cpu_backend_dynarmic, "NEXIUM_CPU_BACKEND", "dynarmic"),
+            (self.cpu_cores_4, "NEXIUM_CPU_CORES", "4"),
+            (
+                self.dynarmic_code_page_cache,
+                "DYNARMIC_CODE_PAGE_CACHE",
+                "1",
+            ),
+            (self.dynarmic_jit_size_64, "DYNARMIC_JIT_SIZE", "64"),
+            (self.async_gpu, "NEXIUM_ASYNC_GPU", "1"),
+            (
+                self.async_gpu_defer_smallrt,
+                "NEXIUM_ASYNC_GPU_DEFER_SMALLRT",
+                "1",
+            ),
+            (self.gpu_pipeline, "NEXIUM_GPU_PIPELINE", "1"),
+            (self.fermi_lazy_drain, "NEXIUM_FERMI_LAZY_DRAIN", "1"),
+            (self.input_mirror, "NEXIUM_INPUT_MIRROR", "1"),
+            (self.cbuf_writethrough, "NEXIUM_CBUF_WRITETHROUGH", "1"),
+            (self.resident_vb, "NEXIUM_RESIDENT_VB", "1"),
+            (self.fermi_async_blit, "NEXIUM_FERMI_ASYNC_BLIT", "1"),
+            (self.resident_cbuf, "NEXIUM_RESIDENT_CBUF", "1"),
+            (self.async_smallrt_wb, "NEXIUM_ASYNC_SMALLRT_WB", "1"),
+        ]
+    }
+
+    pub fn enabled_overrides(&self) -> Vec<(&'static str, &'static str)> {
+        self.entries()
+            .into_iter()
+            .filter_map(|(enabled, name, value)| enabled.then_some((name, value)))
+            .collect()
+    }
+
+    pub fn apply_to_process(&self) {
+        for (name, value) in self.enabled_overrides() {
+            if std::env::var_os(name).is_none() {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+
+    pub fn enable_safe_preset(&mut self) {
+        self.clear();
+        self.cpu_backend_dynarmic = true;
+        self.cpu_cores_4 = true;
+        self.dynarmic_code_page_cache = true;
+        self.dynarmic_jit_size_64 = true;
+    }
+
+    pub fn sanitize_unsafe_gpu_overrides(&mut self) -> bool {
+        let unsafe_requested = self.async_gpu
+            || self.async_gpu_defer_smallrt
+            || self.gpu_pipeline
+            || self.fermi_lazy_drain
+            || self.cbuf_writethrough
+            || self.fermi_async_blit
+            || self.async_smallrt_wb;
+        self.async_gpu = false;
+        self.async_gpu_defer_smallrt = false;
+        self.gpu_pipeline = false;
+        self.fermi_lazy_drain = false;
+        self.cbuf_writethrough = false;
+        self.fermi_async_blit = false;
+        self.async_smallrt_wb = false;
+        unsafe_requested
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppSettings {
     pub log_level: LogLevel,
@@ -438,6 +531,8 @@ pub struct AppSettings {
     pub left_deadzone: f32,
     #[serde(default = "default_right_deadzone")]
     pub right_deadzone: f32,
+    #[serde(default)]
+    pub performance_debug: PerformanceDebugSettings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -573,6 +668,7 @@ impl Default for AppSettings {
             dockbar_theme: DockbarTheme::default(),
             left_deadzone: default_left_deadzone(),
             right_deadzone: default_right_deadzone(),
+            performance_debug: PerformanceDebugSettings::default(),
         }
     }
 }
@@ -596,16 +692,24 @@ impl AppSettings {
         } else {
             Self::default()
         };
+        if cfg.performance_debug.sanitize_unsafe_gpu_overrides() {
+            let _ = cfg.save();
+        }
+        cfg.performance_debug.apply_to_process();
+        cfg
+    }
+
+    pub fn effective_cpu_backend(&self) -> CpuBackend {
         if let Ok(backend) = std::env::var("NEXIUM_CPU_BACKEND") {
             if backend.eq_ignore_ascii_case("rustarmic") || backend.eq_ignore_ascii_case("rust") {
-                cfg.cpu_backend = CpuBackend::Rustarmic;
+                return CpuBackend::Rustarmic;
             } else if backend.eq_ignore_ascii_case("dynarmic")
                 || backend.eq_ignore_ascii_case("dyn")
             {
-                cfg.cpu_backend = CpuBackend::Dynarmic;
+                return CpuBackend::Dynarmic;
             }
         }
-        cfg
+        self.cpu_backend
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -621,5 +725,80 @@ impl AppSettings {
         let s = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(&path, s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAFE_PRESET_OVERRIDES: [(&str, &str); 4] = [
+        ("NEXIUM_CPU_BACKEND", "dynarmic"),
+        ("NEXIUM_CPU_CORES", "4"),
+        ("DYNARMIC_CODE_PAGE_CACHE", "1"),
+        ("DYNARMIC_JIT_SIZE", "64"),
+    ];
+
+    #[test]
+    fn performance_debug_defaults_to_no_overrides() {
+        assert!(PerformanceDebugSettings::default()
+            .enabled_overrides()
+            .is_empty());
+    }
+
+    #[test]
+    fn performance_safe_preset_has_exact_environment() {
+        let mut settings = PerformanceDebugSettings::default();
+        settings.enable_safe_preset();
+        assert_eq!(settings.enabled_overrides(), SAFE_PRESET_OVERRIDES);
+    }
+
+    #[test]
+    fn unsafe_gpu_overrides_are_sanitized_without_disabling_safe_caches() {
+        let mut settings = PerformanceDebugSettings {
+            async_gpu: true,
+            async_gpu_defer_smallrt: true,
+            gpu_pipeline: true,
+            fermi_lazy_drain: true,
+            cbuf_writethrough: true,
+            fermi_async_blit: true,
+            async_smallrt_wb: true,
+            input_mirror: true,
+            resident_vb: true,
+            resident_cbuf: true,
+            ..PerformanceDebugSettings::default()
+        };
+        assert!(settings.sanitize_unsafe_gpu_overrides());
+        assert!(!settings.async_gpu);
+        assert!(!settings.async_gpu_defer_smallrt);
+        assert!(!settings.gpu_pipeline);
+        assert!(!settings.fermi_lazy_drain);
+        assert!(!settings.cbuf_writethrough);
+        assert!(!settings.fermi_async_blit);
+        assert!(!settings.async_smallrt_wb);
+        assert!(settings.input_mirror);
+        assert!(settings.resident_vb);
+        assert!(settings.resident_cbuf);
+        assert!(!settings.sanitize_unsafe_gpu_overrides());
+    }
+
+    #[test]
+    fn legacy_settings_json_defaults_performance_debug() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("performance_debug");
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            settings.performance_debug,
+            PerformanceDebugSettings::default()
+        );
+    }
+
+    #[test]
+    fn partial_performance_debug_json_uses_field_defaults() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value["performance_debug"] = serde_json::json!({ "async_gpu": true });
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(settings.performance_debug.async_gpu);
+        assert_eq!(settings.performance_debug.enabled_overrides().len(), 1);
     }
 }
