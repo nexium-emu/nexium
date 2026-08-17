@@ -1183,6 +1183,19 @@ impl Nvdrv {
     }
 
     fn poll_gpu_completions(&self) {
+        let pending_engine_incrs =
+            std::mem::take(&mut *crate::gpu::PENDING_ENGINE_SYNCPT_INCRS.lock());
+        if !pending_engine_incrs.is_empty() {
+            let mut channels = self.gpu.channels.lock();
+            for id in pending_engine_incrs {
+                if let Some(channel) = channels.values_mut().find(|c| c.syncpt_id == id) {
+                    channel.syncpt_min = channel.syncpt_min.wrapping_add(1);
+                    if syncpoint_reached(channel.syncpt_max, channel.syncpt_min) {
+                        channel.syncpt_max = channel.syncpt_min;
+                    }
+                }
+            }
+        }
         let Some(queue) = &self.gpu_async else {
             return;
         };

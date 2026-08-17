@@ -1183,6 +1183,7 @@ impl Maxwell3D {
             }
             0xb2 => {
                 self.regs.sync_info = arg;
+                crate::gpu::record_engine_syncpt_increment(arg & 0xFFF);
             }
             0x3dd => {
                 self.regs.pending_barrier_flushes =

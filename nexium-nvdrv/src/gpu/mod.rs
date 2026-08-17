@@ -387,6 +387,14 @@ impl GuestMemoryAccess {
     }
 }
 
+pub(crate) static PENDING_ENGINE_SYNCPT_INCRS: parking_lot::Mutex<Vec<u32>> =
+    parking_lot::Mutex::new(Vec::new());
+
+pub(crate) fn record_engine_syncpt_increment(id: u32) {
+    PENDING_ENGINE_SYNCPT_INCRS.lock().push(id);
+    nexium_common::host_wake::signal();
+}
+
 pub struct GpuContext {
     pub mappings: Arc<RwLock<GpuMappings>>,
     pub maxwell3d: Arc<Mutex<Maxwell3D>>,
