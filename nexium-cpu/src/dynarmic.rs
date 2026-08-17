@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use crate::{CpuEvent, FaultSnapshot, HaltHandle};
 
+const DYNARMIC_FAST_PATHS_ENV: &str = "DYNARMIC_FAST_PATHS";
+
 pub(crate) struct SharedDynarmic {
     pub(crate) emu: dynarmic_sys::Dynarmic<'static, ()>,
 }
@@ -30,6 +32,7 @@ unsafe impl Sync for DynarmicCpu {}
 
 impl DynarmicCpu {
     pub fn new() -> Result<Self, String> {
+        configure_dynarmic_fast_paths();
         let force_no_fastmem = env_flag("NEXIUM_DYNARMIC_NO_FASTMEM")
             || ((std::env::var("NEXIUM_WATCH_WRITE_CPU").is_ok()
                 || std::env::var("NEXIUM_WATCH_WRITE_GPU").is_ok())
@@ -51,7 +54,7 @@ impl DynarmicCpu {
                 (None, _) => dynarmic_sys::Dynarmic::new(),
             };
         log::info!(
-            "dynarmic: guarded RSB/FastDispatch {} (DYNARMIC_FAST_PATHS=1 enables)",
+            "dynarmic: RSB/FastDispatch {} (default; DYNARMIC_FAST_PATHS=0 disables)",
             if dynarmic_sys::guarded_fast_paths_enabled() {
                 "enabled"
             } else {
@@ -739,6 +742,20 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn configure_dynarmic_fast_paths() {
+    static CONFIGURED: std::sync::Once = std::sync::Once::new();
+    CONFIGURED.call_once(|| {
+        let configured = std::env::var_os(DYNARMIC_FAST_PATHS_ENV);
+        if let Some(value) = dynarmic_fast_paths_default(configured.as_deref()) {
+            std::env::set_var(DYNARMIC_FAST_PATHS_ENV, value);
+        }
+    });
+}
+
+fn dynarmic_fast_paths_default(value: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    value.is_none().then_some("1")
+}
+
 fn dynarmic_exact_retired_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("NEXIUM_DYNARMIC_EXACT_RETIRED"))
@@ -900,8 +917,16 @@ fn watch_value_ne(size: usize, value: u64, filter: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::cache_profile_due;
+    use super::{cache_profile_due, dynarmic_fast_paths_default};
+    use std::ffi::OsStr;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn dynarmic_fast_paths_default_on_preserves_explicit_rollback() {
+        assert_eq!(dynarmic_fast_paths_default(None), Some("1"));
+        assert_eq!(dynarmic_fast_paths_default(Some(OsStr::new("0"))), None);
+        assert_eq!(dynarmic_fast_paths_default(Some(OsStr::new("1"))), None);
+    }
 
     #[test]
     fn cache_profile_rate_limit_is_one_second() {
