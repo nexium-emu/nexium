@@ -769,12 +769,31 @@ impl GpuContext {
                 on_complete,
             );
         }
+        let embedded_incrs = std::mem::take(&mut pusher.pending_syncpt_incrs);
+        self.apply_embedded_syncpt_incrs(embedded_incrs);
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         pusher::kickprof::kick_done(kp_total);
 
         let syncpt_id = 0u32;
         let syncpt_value = pusher.syncpt_value;
         (syncpt_id, syncpt_value)
+    }
+
+    fn apply_embedded_syncpt_incrs(&self, incrs: Vec<(u32, u32)>) {
+        if incrs.is_empty() {
+            return;
+        }
+        let mut channels = self.channels.lock();
+        for (id, count) in incrs {
+            if let Some(channel) = channels.values_mut().find(|c| c.syncpt_id == id) {
+                channel.syncpt_min = channel.syncpt_min.wrapping_add(count);
+                if crate::syncpoint_reached(channel.syncpt_max, channel.syncpt_min) {
+                    channel.syncpt_max = channel.syncpt_min;
+                }
+            }
+        }
+        drop(channels);
+        nexium_common::host_wake::signal();
     }
 
     pub fn process_inline_gpfifo(
@@ -979,6 +998,8 @@ impl GpuContext {
         );
         vk_dispatch::guest_probe(&mappings, &mem_read);
         let flush_ms = if profile { elapsed_ms(t_flush) } else { 0.0 };
+        let embedded_incrs = std::mem::take(&mut pusher.pending_syncpt_incrs);
+        self.apply_embedded_syncpt_incrs(embedded_incrs);
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         pusher::kickprof::kick_done(kp_total);
         if profile {

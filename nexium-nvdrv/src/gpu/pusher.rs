@@ -685,6 +685,7 @@ struct PullerState {
 
 pub struct Pusher {
     pub syncpt_value: u32,
+    pub(crate) pending_syncpt_incrs: Vec<(u32, u32)>,
     bound_classes: [u32; 8],
     state: DmaState,
     puller: PullerState,
@@ -702,6 +703,7 @@ impl Pusher {
     pub fn new() -> Self {
         Self {
             syncpt_value: 0,
+            pending_syncpt_incrs: Vec::new(),
             bound_classes: [
                 0xB197,
                 KEPLER_COMPUTE_CLASS,
@@ -2069,10 +2071,23 @@ impl Pusher {
             METHOD_SEMAPHORE_ACQUIRE => {}
             METHOD_SYNCPOINT_PAYLOAD => self.puller.syncpoint_payload = arg,
             METHOD_SYNCPOINT_OPERATION => {
-                let op = arg & 0xFF;
+                let op = arg & 0xF;
                 if op == 1 {
+                    let index = (arg >> 8) & 0xFF;
                     self.syncpt_value = self.syncpt_value.wrapping_add(1);
-                    log::trace!("puller: SyncpointIncrement → {}", self.syncpt_value);
+                    match self
+                        .pending_syncpt_incrs
+                        .iter_mut()
+                        .find(|(id, _)| *id == index)
+                    {
+                        Some((_, count)) => *count = count.wrapping_add(1),
+                        None => self.pending_syncpt_incrs.push((index, 1)),
+                    }
+                    log::debug!(
+                        "puller: SyncpointIncrement id={} → {}",
+                        index,
+                        self.syncpt_value
+                    );
                 }
             }
             _ => {

@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-fn syncpoint_reached(current: u32, threshold: u32) -> bool {
+pub(crate) fn syncpoint_reached(current: u32, threshold: u32) -> bool {
     current.wrapping_sub(threshold) < 0x8000_0000
 }
 
