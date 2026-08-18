@@ -2496,6 +2496,9 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
                     session_handle,
                 );
             }
+            if port_name == "IAudioRenderer" {
+                kernel.close_audio_renderer_session(session_handle);
+            }
             kernel.sessions.remove(&session_handle);
             if let Some(cpu) = cpu_mut() {
                 cpu.set_register(0, SUCCESS as u64);
@@ -2549,6 +2552,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
             let group = domain_group(kernel, session_handle);
             let domain_handles = close_domain_object(kernel, session_handle, d.object_id);
             kernel.hwopus_decoders.remove(&(group, d.object_id));
+            kernel.close_audio_renderer_object(group, d.object_id);
             for handle in domain_handles {
                 kernel.open_files.remove(&(handle, d.object_id));
                 kernel.file_system_roots.remove(&(handle, d.object_id));
@@ -2558,6 +2562,7 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
                 kernel.open_file_handles.remove(&(handle, d.object_id));
                 kernel.open_dir_lists.remove(&(handle, d.object_id));
                 kernel.hwopus_decoders.remove(&(handle, d.object_id));
+                kernel.close_audio_renderer_object(handle, d.object_id);
             }
             log::debug!(
                 "domain Close-object session={:#x} object_id={}",
@@ -10507,6 +10512,7 @@ fn svc_create_thread(kernel: &mut Kernel) -> u32 {
         .handles
         .create_handle(crate::kernel::handles::HandleType::Thread);
     let tls_va = kernel.threads.alloc_tls();
+    let _ = kernel.address_space.write(tls_va, &[0u8; 0x1000]);
 
     let mut ctx = crate::kernel::threads::ThreadCtx::zero();
     ctx.x[0] = arg;

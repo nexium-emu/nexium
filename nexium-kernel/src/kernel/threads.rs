@@ -135,6 +135,8 @@ pub struct Threads {
     pub next_tid: u64,
     pub next_tls_va: u64,
     pub tls_stride: u64,
+    pub tls_pool_base: u64,
+    pub free_tls: Vec<u64>,
     pub last_switch: Instant,
     pub wakers: Arc<CoreWakers>,
 }
@@ -176,6 +178,8 @@ impl Threads {
             next_tid: 2,
             next_tls_va: tls_pool_base,
             tls_stride: 0x1000,
+            tls_pool_base,
+            free_tls: Vec::new(),
             last_switch: Instant::now(),
             wakers: CoreWakers::new(),
         }
@@ -186,6 +190,9 @@ impl Threads {
     }
 
     pub fn alloc_tls(&mut self) -> u64 {
+        if let Some(va) = self.free_tls.pop() {
+            return va;
+        }
         let va = self.next_tls_va;
         self.next_tls_va = self.next_tls_va.wrapping_add(self.tls_stride);
         va
@@ -744,8 +751,18 @@ impl Threads {
     }
 
     pub fn drop_exited(&mut self) {
-        self.threads
-            .retain(|_, t| !matches!(t.state, ThreadState::Exited));
+        let pool_base = self.tls_pool_base;
+        let free_tls = &mut self.free_tls;
+        self.threads.retain(|_, t| {
+            if matches!(t.state, ThreadState::Exited) {
+                if pool_base != 0 && t.tls_va >= pool_base {
+                    free_tls.push(t.tls_va);
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 
     pub fn ensure_thread_loaded(&mut self, cpu: &mut Cpu) -> Option<u32> {

@@ -853,6 +853,29 @@ impl Kernel {
         self.bufferqueue_event_generation = generation;
     }
 
+    pub fn close_audio_renderer_object(&mut self, session: u32, object_id: u32) {
+        self.audio_renderers.remove(&(session, object_id));
+        if let Some(ev) = self.audio_renderer_events.remove(&(session, object_id)) {
+            self.event_signals.remove(&ev);
+        }
+    }
+
+    pub fn close_audio_renderer_session(&mut self, session: u32) {
+        self.audio_renderers.retain(|&(s, _), _| s != session);
+        let mut removed: Vec<u32> = Vec::new();
+        self.audio_renderer_events.retain(|&(s, _), ev| {
+            if s == session {
+                removed.push(*ev);
+                false
+            } else {
+                true
+            }
+        });
+        for ev in removed {
+            self.event_signals.remove(&ev);
+        }
+    }
+
     pub fn tick_audio_renderers(&mut self) {
         const FRAMES_PER_AUDIO_FRAME: u64 = 240;
         const MAX_BACKLOG_BLOCKS: u64 = 400;
