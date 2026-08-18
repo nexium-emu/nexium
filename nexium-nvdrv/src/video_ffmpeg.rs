@@ -2,6 +2,21 @@ use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FfmpegCodec {
+    H264,
+    Vp9,
+}
+
+impl FfmpegCodec {
+    fn input_format(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Vp9 => "ivf",
+        }
+    }
+}
+
 pub fn enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -25,6 +40,14 @@ pub fn resolve_binary() -> Option<std::path::PathBuf> {
     } else {
         "ffmpeg"
     };
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(dir) = current_exe.parent() {
+            let candidate = dir.join(exe);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
     for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
         let candidate = dir.join(exe);
         if candidate.is_file() {
@@ -40,11 +63,14 @@ pub struct FfmpegDecoder {
     frames: mpsc::Receiver<Vec<u8>>,
     width: u32,
     height: u32,
+    codec: FfmpegCodec,
     primed: bool,
+    ivf_header_sent: bool,
+    ivf_pts: u64,
 }
 
 impl FfmpegDecoder {
-    pub fn new(width: u32, height: u32) -> Result<Self, String> {
+    pub fn new(width: u32, height: u32, codec: FfmpegCodec) -> Result<Self, String> {
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             return Err(format!("unsupported dimensions {}x{}", width, height));
         }
@@ -58,12 +84,12 @@ impl FfmpegDecoder {
                 "32",
                 "-analyzeduration",
                 "0",
-                "-fflags",
-                "nobuffer",
                 "-flags",
                 "low_delay",
+                "-threads",
+                "1",
                 "-f",
-                "h264",
+                codec.input_format(),
                 "-i",
                 "pipe:0",
                 "-f",
@@ -106,7 +132,10 @@ impl FfmpegDecoder {
             frames: rx,
             width,
             height,
+            codec,
             primed: false,
+            ivf_header_sent: false,
+            ivf_pts: 0,
         })
     }
 
@@ -118,12 +147,42 @@ impl FfmpegDecoder {
         self.height
     }
 
-    pub fn decode(&mut self, packet: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    pub fn codec(&self) -> FfmpegCodec {
+        self.codec
+    }
+
+    pub fn decode(&mut self, packet: &[u8], expect_frame: bool) -> Result<Option<Vec<u8>>, String> {
         let stdin = self.stdin.as_mut().ok_or("ffmpeg stdin closed")?;
+        if self.codec == FfmpegCodec::Vp9 {
+            if !self.ivf_header_sent {
+                let header =
+                    crate::video_vp9::ivf_file_header(self.width as u16, self.height as u16);
+                stdin
+                    .write_all(&header)
+                    .map_err(|error| format!("ffmpeg write ivf header: {}", error))?;
+                self.ivf_header_sent = true;
+            }
+            let frame_header =
+                crate::video_vp9::ivf_frame_header(packet.len() as u32, self.ivf_pts);
+            self.ivf_pts += 1;
+            stdin
+                .write_all(&frame_header)
+                .map_err(|error| format!("ffmpeg write ivf frame header: {}", error))?;
+        }
         stdin
             .write_all(packet)
             .and_then(|_| stdin.flush())
             .map_err(|error| format!("ffmpeg write: {}", error))?;
+        if !expect_frame {
+            return match self.frames.try_recv() {
+                Ok(frame) => {
+                    self.primed = true;
+                    Ok(Some(frame))
+                }
+                Err(mpsc::TryRecvError::Empty) => Ok(None),
+                Err(mpsc::TryRecvError::Disconnected) => Err("ffmpeg exited".into()),
+            };
+        }
         let wait = if self.primed { 700 } else { 250 };
         match self
             .frames

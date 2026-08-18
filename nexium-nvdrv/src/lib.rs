@@ -293,6 +293,7 @@ pub mod video_decode;
 pub mod video_ffmpeg;
 pub mod video_host1x;
 pub mod video_surface;
+pub mod video_vp9;
 pub use bufferqueue::{BufferQueue, GraphicBuffer, QueuedFrame};
 pub use gpu::GpuContext;
 
@@ -302,6 +303,8 @@ struct VideoChannelRuntime {
     ffmpeg: Option<video_ffmpeg::FfmpegDecoder>,
     ffmpeg_failed: bool,
     composer: video_decode::H264AnnexBComposer,
+    vp9_composer: video_vp9::Vp9FrameComposer,
+    vp9_unavailable_logged: bool,
 }
 
 impl VideoChannelRuntime {
@@ -317,6 +320,8 @@ impl VideoChannelRuntime {
             ffmpeg: None,
             ffmpeg_failed: false,
             composer: video_decode::H264AnnexBComposer::new(),
+            vp9_composer: video_vp9::Vp9FrameComposer::new(),
+            vp9_unavailable_logged: false,
         }
     }
 }
@@ -1743,13 +1748,16 @@ impl Nvdrv {
         const SURFACE_LUMA_BASE_METHOD: usize = 0x10c;
         const MAX_BITSTREAM_SIZE: usize = 32 * 1024 * 1024;
 
-        if registers[CODEC_METHOD] != 3 {
-            log::warn!(
-                "[video-decode] fd={} unsupported NVDEC codec {}",
-                fd,
-                registers[CODEC_METHOD]
-            );
-            return;
+        match registers[CODEC_METHOD] {
+            3 => {}
+            9 => {
+                self.process_nvdec_vp9_execute(fd, registers, runtime, mem_read);
+                return;
+            }
+            other => {
+                log::warn!("[video-decode] fd={} unsupported NVDEC codec {}", fd, other);
+                return;
+            }
         }
 
         let context_iova = u64::from(registers[PICTURE_INFO_METHOD]) << 8;
@@ -1814,6 +1822,13 @@ impl Nvdrv {
             }
         };
 
+        if runtime
+            .ffmpeg
+            .as_ref()
+            .is_some_and(|decoder| decoder.codec() != video_ffmpeg::FfmpegCodec::H264)
+        {
+            runtime.ffmpeg = None;
+        }
         let mut ffmpeg_frame: Option<video_decode::OwnedI420Frame> = None;
         if video_ffmpeg::enabled() && !runtime.ffmpeg_failed {
             if runtime.ffmpeg.is_none() {
@@ -1821,7 +1836,11 @@ impl Nvdrv {
                     .frame_width()
                     .and_then(|width| context.frame_height().map(|height| (width, height)));
                 match dims {
-                    Ok((width, height)) => match video_ffmpeg::FfmpegDecoder::new(width, height) {
+                    Ok((width, height)) => match video_ffmpeg::FfmpegDecoder::new(
+                        width,
+                        height,
+                        video_ffmpeg::FfmpegCodec::H264,
+                    ) {
                         Ok(decoder) => {
                             log::info!(
                                 "[video-decode] fd={} ffmpeg software decoder {}x{}",
@@ -1851,7 +1870,7 @@ impl Nvdrv {
                 }
             }
             if let Some(decoder) = runtime.ffmpeg.as_mut() {
-                match decoder.decode(&packet) {
+                match decoder.decode(&packet, true) {
                     Ok(Some(raw)) => {
                         match video_ffmpeg::i420_frame(decoder.width(), decoder.height(), &raw) {
                             Ok(frame) => ffmpeg_frame = Some(frame),
@@ -1960,6 +1979,216 @@ impl Nvdrv {
                 luma_iova,
                 picture_index,
                 context.parameter_set.frame_number
+            );
+        }
+    }
+
+    fn process_nvdec_vp9_execute(
+        &mut self,
+        fd: u32,
+        registers: &[u32; video_host1x::ENGINE_REGISTER_COUNT],
+        runtime: &mut VideoChannelRuntime,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+    ) {
+        const PICTURE_INFO_METHOD: usize = 0x101;
+        const BITSTREAM_METHOD: usize = 0x102;
+        const SURFACE_LUMA_BASE_METHOD: usize = 0x10c;
+        const VP9_PROB_TAB_METHOD: usize = 0x170;
+        const MAX_BITSTREAM_SIZE: usize = 32 * 1024 * 1024;
+
+        if !video_ffmpeg::enabled() {
+            if !runtime.vp9_unavailable_logged {
+                runtime.vp9_unavailable_logged = true;
+                log::warn!(
+                    "[video-decode] fd={} VP9 stream requires ffmpeg; place ffmpeg.exe next to the emulator, on PATH, or set NEXIUM_FFMPEG",
+                    fd
+                );
+            }
+            return;
+        }
+
+        let picture_iova = u64::from(registers[PICTURE_INFO_METHOD]) << 8;
+        let prob_iova = u64::from(registers[VP9_PROB_TAB_METHOD]) << 8;
+        let bitstream_iova = u64::from(registers[BITSTREAM_METHOD]) << 8;
+        let Some(picture_cpu) = self.video_cpu_address(picture_iova) else {
+            log::warn!(
+                "[video-decode] fd={} unmapped vp9 picture info iova={:#x}",
+                fd,
+                picture_iova
+            );
+            return;
+        };
+        let Some(prob_cpu) = self.video_cpu_address(prob_iova) else {
+            log::warn!(
+                "[video-decode] fd={} unmapped vp9 prob tab iova={:#x}",
+                fd,
+                prob_iova
+            );
+            return;
+        };
+        let Some(bitstream_cpu) = self.video_cpu_address(bitstream_iova) else {
+            log::warn!(
+                "[video-decode] fd={} unmapped vp9 bitstream iova={:#x}",
+                fd,
+                bitstream_iova
+            );
+            return;
+        };
+
+        let mut picture_bytes = vec![0u8; video_vp9::VP9_PICTURE_INFO_SIZE];
+        if !mem_read(picture_cpu, &mut picture_bytes) {
+            log::warn!(
+                "[video-decode] fd={} failed vp9 picture info read cpu={:#x}",
+                fd,
+                picture_cpu
+            );
+            return;
+        }
+        let mut info = match video_vp9::parse_picture_info(&picture_bytes) {
+            Ok(info) => info,
+            Err(error) => {
+                log::warn!(
+                    "[video-decode] fd={} invalid vp9 picture info: {}",
+                    fd,
+                    error
+                );
+                return;
+            }
+        };
+        let mut prob_bytes = vec![0u8; video_vp9::VP9_ENTROPY_PROBS_SIZE];
+        if !mem_read(prob_cpu, &mut prob_bytes) {
+            log::warn!(
+                "[video-decode] fd={} failed vp9 prob tab read cpu={:#x}",
+                fd,
+                prob_cpu
+            );
+            return;
+        }
+        let (entropy, seg_probs) = match video_vp9::parse_entropy_probs(&prob_bytes) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                log::warn!("[video-decode] fd={} invalid vp9 prob tab: {}", fd, error);
+                return;
+            }
+        };
+        info.entropy = entropy;
+        for index in 0..4 {
+            info.frame_offsets[index] = u64::from(registers[SURFACE_LUMA_BASE_METHOD + index]) << 8;
+        }
+
+        let bitstream_len = info.bitstream_size as usize;
+        if bitstream_len == 0 || bitstream_len > MAX_BITSTREAM_SIZE {
+            log::warn!(
+                "[video-decode] fd={} invalid vp9 bitstream size {}",
+                fd,
+                bitstream_len
+            );
+            return;
+        }
+        let mut bitstream = vec![0u8; bitstream_len];
+        if !mem_read(bitstream_cpu, &mut bitstream) {
+            log::warn!(
+                "[video-decode] fd={} failed vp9 bitstream read cpu={:#x} bytes={}",
+                fd,
+                bitstream_cpu,
+                bitstream_len
+            );
+            return;
+        }
+
+        let width = info.frame_width as u32;
+        let height = info.frame_height as u32;
+        if info.y_dc_delta_q != 0 || info.uv_dc_delta_q != 0 || info.uv_ac_delta_q != 0 {
+            static DELTA_Q_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !DELTA_Q_WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "[video-decode] fd={} vp9 stream uses nonzero delta_q ({},{},{}); composed header encoding for this case is unverified",
+                    fd,
+                    info.y_dc_delta_q,
+                    info.uv_dc_delta_q,
+                    info.uv_ac_delta_q
+                );
+            }
+        }
+        let (packet, show_frame) = runtime.vp9_composer.compose(info, bitstream, &seg_probs);
+
+        if runtime.ffmpeg.as_ref().is_some_and(|decoder| {
+            decoder.codec() != video_ffmpeg::FfmpegCodec::Vp9
+                || decoder.width() != width
+                || decoder.height() != height
+        }) {
+            runtime.ffmpeg = None;
+        }
+        if runtime.ffmpeg.is_none() {
+            match video_ffmpeg::FfmpegDecoder::new(width, height, video_ffmpeg::FfmpegCodec::Vp9) {
+                Ok(decoder) => {
+                    log::info!(
+                        "[video-decode] fd={} ffmpeg vp9 software decoder {}x{}",
+                        fd,
+                        width,
+                        height
+                    );
+                    runtime.ffmpeg = Some(decoder);
+                }
+                Err(error) => {
+                    log::warn!("[video-decode] fd={} vp9 ffmpeg init failed: {}", fd, error);
+                    return;
+                }
+            }
+        }
+        let decoder = runtime.ffmpeg.as_mut().unwrap();
+        let raw = match decoder.decode(&packet, show_frame) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                log::debug!(
+                    "[video-decode] fd={} vp9 ffmpeg needs more data (show={})",
+                    fd,
+                    show_frame
+                );
+                return;
+            }
+            Err(error) => {
+                log::warn!(
+                    "[video-decode] fd={} vp9 ffmpeg decode failed: {}",
+                    fd,
+                    error
+                );
+                runtime.ffmpeg = None;
+                return;
+            }
+        };
+        let frame = match video_ffmpeg::i420_frame(width, height, &raw) {
+            Ok(frame) => frame,
+            Err(error) => {
+                log::warn!("[video-decode] fd={} vp9 frame invalid: {}", fd, error);
+                runtime.ffmpeg = None;
+                return;
+            }
+        };
+
+        let luma_iova = u64::from(registers[SURFACE_LUMA_BASE_METHOD + 3]) << 8;
+        self.video_frames.insert(luma_iova, frame);
+        self.video_frame_order.retain(|key| *key != luma_iova);
+        self.video_frame_order.push_back(luma_iova);
+        while self.video_frame_order.len() > 32 {
+            if let Some(old_key) = self.video_frame_order.pop_front() {
+                self.video_frames.remove(&old_key);
+            }
+        }
+
+        static DECODED_VP9_FRAMES: AtomicU64 = AtomicU64::new(0);
+        let frame_index = DECODED_VP9_FRAMES.fetch_add(1, Ordering::Relaxed);
+        if frame_index < 32 || frame_index % 300 == 0 {
+            log::info!(
+                "[video-decode] vp9 frame={} fd={} {}x{} bytes={} luma_iova={:#x} show={}",
+                frame_index,
+                fd,
+                width,
+                height,
+                packet.len(),
+                luma_iova,
+                show_frame
             );
         }
     }
