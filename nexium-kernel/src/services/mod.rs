@@ -15,6 +15,8 @@ pub mod binder_driver;
 pub mod bsd;
 pub mod btm;
 pub mod caps;
+pub mod clkrst_manager;
+pub mod clkrst_session;
 pub mod common_state_getter;
 pub mod cradle_firmware_updater;
 pub mod debug_functions;

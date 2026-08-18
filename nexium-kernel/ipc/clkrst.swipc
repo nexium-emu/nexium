@@ -1,0 +1,14 @@
+# Clock/reset services — clkrst manager + per-module sessions.
+# Source: libnx clkrst.c (OpenSession cmd 0 → session; IClkrstSession cmds
+# 7 SetClockRate / 8 GetClockRate / 10 GetPossibleClockRates).
+# NOTE: cmd 10 writes rates into out_buffer; buffer ignored, count 0.
+
+service clkrst as clkrst_manager {
+    [0] OpenSession() -> session<IClkrstSession>;
+}
+
+service IClkrstSession as clkrst_session {
+    [7] SetClockRate();
+    [8] GetClockRate() -> u32;
+    [10] GetPossibleClockRates() -> (u32, u32);
+}
