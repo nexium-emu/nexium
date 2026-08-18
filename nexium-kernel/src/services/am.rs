@@ -424,7 +424,7 @@ fn swkbd_read_initial_text(kernel: &mut Kernel) -> String {
     let Some((offset, units)) = crate::swkbd_state::config_initial_span() else {
         return String::new();
     };
-    let units = units.min(249) as usize;
+    let units = units.min(4096) as usize;
     let byte_len = units * 2;
     if (offset as u64).saturating_add(byte_len as u64) > workbuf_size {
         log::warn!(
@@ -463,9 +463,9 @@ fn library_applet_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8
     match cmd {
         0 => {
             let h = kernel.handles.create_handle(HandleType::Event);
-            if swkbd_pending() {
+            if swkbd_pending() && !crate::swkbd_state::is_completed() {
                 kernel.event_signals.insert(h, false);
-                kernel.swkbd_state_changed_event = Some(h);
+                kernel.swkbd_state_changed_events.push(h);
                 log::debug!("swkbd: state-changed event {:#x} (deferred completion)", h);
             } else {
                 kernel.event_signals.insert(h, true);
@@ -483,6 +483,15 @@ fn library_applet_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8
             if swkbd_pending() {
                 let initial = swkbd_read_initial_text(kernel);
                 crate::swkbd_state::start(initial);
+            }
+            ok_empty()
+        }
+        20 | 25 => {
+            if swkbd_pending() && !crate::swkbd_state::is_completed() {
+                crate::swkbd_state::complete(false, "");
+                crate::swkbd_state::request_gui_cancel();
+                kernel.signal_swkbd_state_changed();
+                log::info!("swkbd: canceled by guest (accessor cmd {})", cmd);
             }
             ok_empty()
         }
@@ -515,9 +524,7 @@ fn library_applet_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8
             );
             ok_empty()
         }
-        20 | 25 | 26 | 50 | 51 | 60 | 90 | 91 | 100 | 102 | 103 | 110 | 120 | 150 | 160 => {
-            ok_empty()
-        }
+        26 | 50 | 51 | 60 | 90 | 91 | 100 | 102 | 103 | 110 | 120 | 150 | 160 => ok_empty(),
         _ => {
             log::warn!(
                 "ILibraryAppletAccessor.cmd_{} UNHANDLED → returning empty SUCCESS (likely wrong)",

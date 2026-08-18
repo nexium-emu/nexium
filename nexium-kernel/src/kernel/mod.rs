@@ -94,7 +94,7 @@ pub struct Kernel {
     pub acquired_sleep_lock_event: Option<u32>,
     pub aoc_change_event: Option<u32>,
     pub bcat_progress_event: Option<u32>,
-    pub swkbd_state_changed_event: Option<u32>,
+    pub swkbd_state_changed_events: Vec<u32>,
     pub swkbd_interactive_event: Option<u32>,
     pub swkbd_workbuf: Option<(u64, u64)>,
     pub transfer_memories: HashMap<u32, (u64, u64)>,
@@ -330,7 +330,7 @@ impl Kernel {
             acquired_sleep_lock_event: None,
             aoc_change_event: None,
             bcat_progress_event: None,
-            swkbd_state_changed_event: None,
+            swkbd_state_changed_events: Vec::new(),
             swkbd_interactive_event: None,
             swkbd_workbuf: None,
             transfer_memories: HashMap::new(),
@@ -792,12 +792,8 @@ impl Kernel {
 
     pub fn signal_vsync(&mut self) {
         if let Some(resp) = crate::swkbd_state::take_response() {
-            let out = crate::swkbd_state::build_out_data(resp.accepted, &resp.text);
-            crate::swkbd_state::set_completed(out);
-            if let Some(handle) = self.swkbd_state_changed_event.take() {
-                self.event_signals.insert(handle, true);
-                self.threads.signal_handle(handle);
-            }
+            crate::swkbd_state::complete(resp.accepted, &resp.text);
+            self.signal_swkbd_state_changed();
             log::info!(
                 "swkbd: completed gen={} accepted={} chars={}",
                 resp.generation,
@@ -828,6 +824,14 @@ impl Kernel {
                 .stats
                 .vsync_signals
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn signal_swkbd_state_changed(&mut self) {
+        let handles = std::mem::take(&mut self.swkbd_state_changed_events);
+        for handle in handles {
+            self.event_signals.insert(handle, true);
+            self.threads.signal_handle(handle);
         }
     }
 

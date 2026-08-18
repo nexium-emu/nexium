@@ -46,6 +46,7 @@ pub struct VirtualKeyboard {
     max: usize,
     orig: String,
     title: String,
+    pub mask: bool,
     prev_a: bool,
     prev_b: bool,
     prev_x: bool,
@@ -77,6 +78,7 @@ impl VirtualKeyboard {
             max: 64,
             orig: String::new(),
             title: String::new(),
+            mask: false,
             prev_a: false,
             prev_b: false,
             prev_x: false,
@@ -105,6 +107,14 @@ impl VirtualKeyboard {
         self.col = 0;
         self.nav_dir = 0;
         self.title.clear();
+        self.mask = false;
+        self.prev_a = true;
+        self.prev_b = true;
+        self.prev_x = true;
+        self.prev_y = true;
+        self.prev_l = true;
+        self.prev_r = true;
+        self.prev_start = true;
     }
 
     pub fn show_titled(&mut self, current: &str, max: usize, title: &str) {
@@ -485,13 +495,17 @@ impl VirtualKeyboard {
         p.rect_filled(preview, Rounding::same(9.0), key_bg);
         p.rect_stroke(preview, Rounding::same(9.0), Stroke::new(1.5_f32, accent));
         let pv_font = FontId::proportional(20.0);
-        let shown = if buf.is_empty() { "" } else { buf };
-        let pre: String = buf.chars().take(self.caret).collect();
+        let display: String = if self.mask {
+            buf.chars().map(|_| '\u{2022}').collect()
+        } else {
+            buf.to_string()
+        };
+        let pre: String = display.chars().take(self.caret).collect();
         let pre_w = ui.fonts(|f| f.layout_no_wrap(pre, pv_font.clone(), text).size().x);
         p.text(
             egui::pos2(preview.min.x + 14.0, preview.center().y),
             egui::Align2::LEFT_CENTER,
-            shown,
+            display,
             pv_font.clone(),
             text,
         );

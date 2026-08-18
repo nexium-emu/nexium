@@ -3326,6 +3326,7 @@ fn dispatch_service_v2(
             if applet_id == crate::services::am::APPLET_ID_SWKBD {
                 let generation = crate::swkbd_state::begin_applet();
                 kernel.swkbd_workbuf = None;
+                kernel.swkbd_state_changed_events.clear();
                 log::info!("swkbd: applet created (gen={})", generation);
             }
         }
@@ -10511,6 +10512,9 @@ fn svc_close_handle(kernel: &mut Kernel) -> u32 {
     if let Some(closed) = kernel.handles.close_handle(handle) {
         if closed.handle_type == HandleType::Thread {
             kernel.exited_thread_handles.remove(&handle);
+        }
+        if closed.handle_type == HandleType::TransferMemory {
+            kernel.transfer_memories.remove(&handle);
         }
     }
     if let Some(cpu) = cpu_mut() {

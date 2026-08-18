@@ -188,6 +188,9 @@ pub struct HorizonApp {
     swkbd_text: String,
     swkbd_gen: u64,
     swkbd_max: usize,
+    swkbd_min: usize,
+    swkbd_title: String,
+    swkbd_password: bool,
     updater: crate::updater::Updater,
     update_restart_shown: bool,
     input: Option<InputBackend>,
@@ -451,6 +454,9 @@ impl HorizonApp {
             swkbd_text: String::new(),
             swkbd_gen: 0,
             swkbd_max: 500,
+            swkbd_min: 0,
+            swkbd_title: String::new(),
+            swkbd_password: false,
             updater: crate::updater::Updater::new(),
             update_restart_shown: false,
             input,
@@ -1141,6 +1147,7 @@ impl HorizonApp {
             || self.shop.open
             || self.carousel_settings_open
             || self.game_info_path.is_some()
+            || self.vkeyboard.open
     }
 
     fn update_icon_picker(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -3138,6 +3145,15 @@ impl HorizonApp {
     }
 
     fn poll_swkbd_request(&mut self) {
+        if nexium_core::swkbd_state::take_gui_cancel() {
+            if self.vk_target == VkTarget::Swkbd {
+                self.vkeyboard.open = false;
+            }
+            return;
+        }
+        if self.vkeyboard.active() && self.vk_target != VkTarget::Swkbd {
+            return;
+        }
         let Some(req) = nexium_core::swkbd_state::take_request() else {
             return;
         };
@@ -3148,16 +3164,20 @@ impl HorizonApp {
         } else {
             req.max_len as usize
         };
-        let title = if !req.header_text.is_empty() {
+        self.swkbd_min = req.min_len as usize;
+        self.swkbd_title = if !req.header_text.is_empty() {
             req.header_text.clone()
         } else if !req.sub_text.is_empty() {
             req.sub_text.clone()
         } else {
             req.guide_text.clone()
         };
+        self.swkbd_password = req.password;
         self.vk_target = VkTarget::Swkbd;
-        self.vkeyboard
-            .show_titled(&self.swkbd_text, self.swkbd_max, &title);
+        let text = self.swkbd_text.clone();
+        let title = self.swkbd_title.clone();
+        self.vkeyboard.show_titled(&text, self.swkbd_max, &title);
+        self.vkeyboard.mask = self.swkbd_password;
     }
 
     fn drive_vkeyboard(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -3222,13 +3242,20 @@ impl HorizonApp {
                 );
                 match r {
                     crate::vkeyboard::VkResult::Accept => {
-                        nexium_core::swkbd_state::post_response(
-                            nexium_core::swkbd_state::SwkbdResponse {
-                                generation: self.swkbd_gen,
-                                accepted: true,
-                                text: self.swkbd_text.clone(),
-                            },
-                        );
+                        if self.swkbd_text.chars().count() < self.swkbd_min {
+                            let text = self.swkbd_text.clone();
+                            let title = self.swkbd_title.clone();
+                            self.vkeyboard.show_titled(&text, self.swkbd_max, &title);
+                            self.vkeyboard.mask = self.swkbd_password;
+                        } else {
+                            nexium_core::swkbd_state::post_response(
+                                nexium_core::swkbd_state::SwkbdResponse {
+                                    generation: self.swkbd_gen,
+                                    accepted: true,
+                                    text: self.swkbd_text.clone(),
+                                },
+                            );
+                        }
                     }
                     crate::vkeyboard::VkResult::Cancel => {
                         nexium_core::swkbd_state::post_response(
@@ -7866,7 +7893,7 @@ impl eframe::App for HorizonApp {
             let mut mouse = nexium_core::hid_state::MouseInput::default();
             let mut touch = hid.touch;
             touch.pressed = false;
-            if self.app_settings.emulate_mouse || self.app_settings.emulate_touch {
+            if (self.app_settings.emulate_mouse || self.app_settings.emulate_touch) && !swkbd_open {
                 let previous = hid.mouse;
                 mouse = nexium_core::hid_state::MouseInput {
                     connected: self.app_settings.emulate_mouse,

@@ -17,6 +17,7 @@ pub struct SwkbdConfig {
     pub max_len: u32,
     pub min_len: u32,
     pub password: bool,
+    pub use_utf8: bool,
     pub initial_string_offset: u32,
     pub initial_string_units: u32,
     pub text_check: bool,
@@ -51,6 +52,7 @@ struct SwkbdShared {
     response: Option<SwkbdResponse>,
     out_data: Vec<u8>,
     completed: bool,
+    gui_cancel: bool,
 }
 
 static SWKBD: Lazy<Mutex<SwkbdShared>> = Lazy::new(|| Mutex::new(SwkbdShared::default()));
@@ -64,6 +66,7 @@ pub fn begin_applet() -> u64 {
     s.response = None;
     s.out_data.clear();
     s.completed = false;
+    s.gui_cancel = false;
     s.generation
 }
 
@@ -97,6 +100,9 @@ fn u32_at(buf: &[u8], offset: usize) -> u32 {
 
 pub fn capture_storage_write(bytes: &[u8]) {
     let mut s = SWKBD.lock();
+    if s.completed {
+        return;
+    }
     if bytes.len() == LIBAPPLET_ARGS_SIZE {
         s.la_version = u32_at(bytes, 8);
         log::debug!(
@@ -115,18 +121,20 @@ pub fn capture_storage_write(bytes: &[u8]) {
             max_len: u32_at(bytes, 0x3AC),
             min_len: u32_at(bytes, 0x3B0),
             password: u32_at(bytes, 0x3B4) != 0,
+            use_utf8: bytes.len() > 0x3BD && bytes[0x3BD] != 0,
             initial_string_offset: u32_at(bytes, 0x3C0),
             initial_string_units: u32_at(bytes, 0x3C4),
             text_check: bytes.len() > 0x3D0 && bytes[0x3D0] != 0,
         };
         log::info!(
-            "swkbd: captured config size={:#x} mode={} header='{}' max={} min={} password={} initial=+{:#x}x{} text_check={}",
+            "swkbd: captured config size={:#x} mode={} header='{}' max={} min={} password={} utf8={} initial=+{:#x}x{} text_check={}",
             bytes.len(),
             cfg.keyboard_mode,
             cfg.header_text,
             cfg.max_len,
             cfg.min_len,
             cfg.password,
+            cfg.use_utf8,
             cfg.initial_string_offset,
             cfg.initial_string_units,
             cfg.text_check
@@ -152,6 +160,9 @@ pub fn config_initial_span() -> Option<(u32, u32)> {
 pub fn start(initial_text: String) -> u64 {
     let mut s = SWKBD.lock();
     let cfg = s.config.clone().unwrap_or_default();
+    if cfg.text_check {
+        log::warn!("swkbd: text-check requested; interactive validation unsupported, result returned directly");
+    }
     let max_len = if cfg.max_len == 0 {
         DEFAULT_MAX_LEN
     } else {
@@ -206,19 +217,57 @@ pub fn take_response() -> Option<SwkbdResponse> {
     Some(resp)
 }
 
-pub fn build_out_data(accepted: bool, text: &str) -> Vec<u8> {
+pub fn build_out_data(accepted: bool, text: &str, use_utf8: bool) -> Vec<u8> {
     let mut out = vec![0u8; OUT_DATA_BYTES];
     let close_result: u32 = if accepted { 0 } else { 1 };
     out[0..4].copy_from_slice(&close_result.to_le_bytes());
     let mut at = 4;
-    for unit in text.encode_utf16() {
-        if at + 2 > 4 + OUT_STRING_BYTES - 2 {
-            break;
+    if use_utf8 {
+        for ch in text.chars() {
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf).as_bytes();
+            if at + encoded.len() > 4 + OUT_STRING_BYTES - 1 {
+                break;
+            }
+            out[at..at + encoded.len()].copy_from_slice(encoded);
+            at += encoded.len();
         }
-        out[at..at + 2].copy_from_slice(&unit.to_le_bytes());
-        at += 2;
+    } else {
+        for ch in text.chars() {
+            let mut units = [0u16; 2];
+            let encoded = ch.encode_utf16(&mut units);
+            if at + encoded.len() * 2 > 4 + OUT_STRING_BYTES - 2 {
+                break;
+            }
+            for unit in encoded.iter() {
+                out[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+                at += 2;
+            }
+        }
     }
     out
+}
+
+pub fn complete(accepted: bool, text: &str) {
+    let mut s = SWKBD.lock();
+    let use_utf8 = s.config.as_ref().map(|c| c.use_utf8).unwrap_or(false);
+    s.out_data = build_out_data(accepted, text, use_utf8);
+    s.completed = true;
+    s.request = None;
+    s.response = None;
+}
+
+pub fn request_gui_cancel() {
+    let mut s = SWKBD.lock();
+    s.request = None;
+    s.gui_cancel = true;
+}
+
+pub fn take_gui_cancel() -> bool {
+    let mut s = SWKBD.lock();
+    let v = s.gui_cancel;
+    s.gui_cancel = false;
+    v
 }
 
 pub fn set_completed(out_data: Vec<u8>) {
@@ -285,14 +334,22 @@ mod tests {
 
     #[test]
     fn out_data_layout_matches_libnx_expectation() {
-        let ok = build_out_data(true, "ab");
+        let ok = build_out_data(true, "ab", false);
         assert_eq!(ok.len(), OUT_DATA_BYTES);
         assert_eq!(&ok[0..4], &0u32.to_le_bytes());
         assert_eq!(u16::from_le_bytes([ok[4], ok[5]]), 'a' as u16);
         assert_eq!(u16::from_le_bytes([ok[6], ok[7]]), 'b' as u16);
         assert_eq!(u16::from_le_bytes([ok[8], ok[9]]), 0);
-        let cancel = build_out_data(false, "");
+        let cancel = build_out_data(false, "", false);
         assert_eq!(&cancel[0..4], &1u32.to_le_bytes());
+    }
+
+    #[test]
+    fn out_data_utf8_mode_encodes_utf8() {
+        let ok = build_out_data(true, "aé", true);
+        assert_eq!(&ok[0..4], &0u32.to_le_bytes());
+        assert_eq!(&ok[4..7], "aé".as_bytes());
+        assert_eq!(ok[7], 0);
     }
 
     #[test]
@@ -318,11 +375,20 @@ mod tests {
     #[test]
     fn long_text_truncates_inside_string_buffer() {
         let text: String = std::iter::repeat('x').take(3000).collect();
-        let out = build_out_data(true, &text);
+        let out = build_out_data(true, &text, false);
         assert_eq!(out.len(), OUT_DATA_BYTES);
         assert_eq!(
             u16::from_le_bytes([out[OUT_DATA_BYTES - 2], out[OUT_DATA_BYTES - 1]]),
             0
         );
+    }
+
+    #[test]
+    fn truncation_never_splits_surrogate_pairs() {
+        let mut text: String = std::iter::repeat('x').take(1000).collect();
+        text.push('\u{1F600}');
+        let out = build_out_data(true, &text, false);
+        let last = u16::from_le_bytes([out[OUT_DATA_BYTES - 4], out[OUT_DATA_BYTES - 3]]);
+        assert!(!(0xD800..0xDC00).contains(&last));
     }
 }
