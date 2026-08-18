@@ -2132,6 +2132,59 @@ fn condvar_trace_enabled(condvar_addr: u64) -> bool {
     COUNT.fetch_add(1, Ordering::Relaxed) < limit
 }
 
+fn condwait_backtrace_range() -> Option<(u64, u64)> {
+    use std::sync::OnceLock;
+    static RANGE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let value = std::env::var("NEXIUM_CONDWAIT_BACKTRACE").ok()?;
+        let mut parts = value
+            .split(',')
+            .filter_map(|part| u64::from_str_radix(part.trim().trim_start_matches("0x"), 16).ok());
+        let min = parts.next().unwrap_or(500_000_000);
+        let max = parts.next().unwrap_or(1_500_000_000);
+        Some((min, max))
+    })
+}
+
+fn log_condwait_backtrace(kernel: &Kernel, self_handle: u32, condvar_addr: u64) {
+    let Some(cpu) = cpu_ref() else {
+        return;
+    };
+    let mut frames = Vec::with_capacity(10);
+    frames.push(cpu.get_register(30));
+    let mut fp = cpu.get_register(29);
+    for _ in 0..8 {
+        if fp == 0 || fp & 0x7 != 0 {
+            break;
+        }
+        let Some(next_fp) = kernel.debug_read_u64(fp) else {
+            break;
+        };
+        let Some(lr) = kernel.debug_read_u64(fp + 8) else {
+            break;
+        };
+        if lr == 0 {
+            break;
+        }
+        frames.push(lr);
+        if next_fp <= fp {
+            break;
+        }
+        fp = next_fp;
+    }
+    let chain = frames
+        .iter()
+        .map(|frame| format!("{frame:#x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    log::warn!(
+        "[condwait-backtrace] self={:#x} cond={:#x} frames=[{}]",
+        self_handle,
+        condvar_addr,
+        chain
+    );
+}
+
 fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
     let (mutex_addr, condvar_addr, self_handle, timeout_ns) = if let Some(cpu) = cpu_ref() {
         (
@@ -2143,6 +2196,20 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
     } else {
         return 1;
     };
+    if let Some((min, max)) = condwait_backtrace_range() {
+        if timeout_ns >= min && timeout_ns <= max {
+            log_condwait_backtrace(kernel, self_handle, condvar_addr);
+        } else if timeout_ns == u64::MAX {
+            use std::collections::HashSet;
+            use std::sync::Mutex as StdMutex;
+            use std::sync::OnceLock;
+            static SEEN: OnceLock<StdMutex<HashSet<(u32, u64)>>> = OnceLock::new();
+            let seen = SEEN.get_or_init(|| StdMutex::new(HashSet::new()));
+            if seen.lock().unwrap().insert((self_handle, condvar_addr)) {
+                log_condwait_backtrace(kernel, self_handle, condvar_addr);
+            }
+        }
+    }
     let lr = cpu_ref().map(|c| c.get_register(30)).unwrap_or(0);
     log::trace!(
         "svcWaitProcessWideKeyAtomic mutex={:#x} condvar={:#x} self_handle={:#x} timeout_ns={} lr={:#x}",
