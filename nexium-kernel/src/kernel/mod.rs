@@ -875,6 +875,21 @@ impl Kernel {
         let event_already_pending = to_signal
             .iter()
             .any(|ev| self.event_signals.get(ev).copied().unwrap_or(false));
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CALLS: AtomicU64 = AtomicU64::new(0);
+            let calls = CALLS.fetch_add(1, Ordering::Relaxed);
+            if calls % 2048 == 0 {
+                log::debug!(
+                    "[audren-tick] calls={} renderers={} to_signal={} pending={} sink={}",
+                    calls,
+                    self.audio_renderers.len(),
+                    to_signal.len(),
+                    event_already_pending,
+                    crate::audio_sink::host_audio_sink().is_some()
+                );
+            }
+        }
 
         let blocks = if let Some(sink) = crate::audio_sink::host_audio_sink() {
             let mut n = sink.drain_pending_events();
