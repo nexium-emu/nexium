@@ -45,6 +45,7 @@ pub struct VirtualKeyboard {
     caret: usize,
     max: usize,
     orig: String,
+    title: String,
     prev_a: bool,
     prev_b: bool,
     prev_x: bool,
@@ -75,6 +76,7 @@ impl VirtualKeyboard {
             caret: 0,
             max: 64,
             orig: String::new(),
+            title: String::new(),
             prev_a: false,
             prev_b: false,
             prev_x: false,
@@ -102,6 +104,12 @@ impl VirtualKeyboard {
         self.row = 1;
         self.col = 0;
         self.nav_dir = 0;
+        self.title.clear();
+    }
+
+    pub fn show_titled(&mut self, current: &str, max: usize, title: &str) {
+        self.show(current, max);
+        self.title = title.to_string();
     }
 
     fn rows(&self) -> [&'static str; 4] {
@@ -461,6 +469,15 @@ impl VirtualKeyboard {
         );
 
         let pad = 24.0;
+        if !self.title.is_empty() {
+            p.text(
+                egui::pos2(panel.min.x + pad + 2.0, panel.min.y + 8.0),
+                egui::Align2::LEFT_CENTER,
+                &self.title,
+                FontId::proportional(13.0),
+                muted,
+            );
+        }
         let preview = egui::Rect::from_min_max(
             egui::pos2(panel.min.x + pad, panel.min.y + 16.0),
             egui::pos2(panel.max.x - pad, panel.min.y + 58.0),

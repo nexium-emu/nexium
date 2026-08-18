@@ -413,14 +413,93 @@ fn library_applet_creator(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     ok_empty()
 }
 
+fn swkbd_pending() -> bool {
+    pending_applet_id() == APPLET_ID_SWKBD
+}
+
+fn swkbd_read_initial_text(kernel: &mut Kernel) -> String {
+    let Some((workbuf_addr, workbuf_size)) = kernel.swkbd_workbuf else {
+        return String::new();
+    };
+    let Some((offset, units)) = crate::swkbd_state::config_initial_span() else {
+        return String::new();
+    };
+    let units = units.min(249) as usize;
+    let byte_len = units * 2;
+    if (offset as u64).saturating_add(byte_len as u64) > workbuf_size {
+        log::warn!(
+            "swkbd: initial string span +{:#x}x{} exceeds workbuf size {:#x}",
+            offset,
+            units,
+            workbuf_size
+        );
+        return String::new();
+    }
+    let mut bytes = vec![0u8; byte_len];
+    if kernel
+        .address_space
+        .read(workbuf_addr + offset as u64, &mut bytes)
+        .is_err()
+    {
+        log::warn!(
+            "swkbd: failed to read initial string at {:#x}+{:#x}",
+            workbuf_addr,
+            offset
+        );
+        return String::new();
+    }
+    let mut u16s = Vec::with_capacity(units);
+    for pair in bytes.chunks_exact(2) {
+        let u = u16::from_le_bytes([pair[0], pair[1]]);
+        if u == 0 {
+            break;
+        }
+        u16s.push(u);
+    }
+    String::from_utf16_lossy(&u16s)
+}
+
 fn library_applet_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
         0 => {
             let h = kernel.handles.create_handle(HandleType::Event);
-            kernel.event_signals.insert(h, true);
+            if swkbd_pending() {
+                kernel.event_signals.insert(h, false);
+                kernel.swkbd_state_changed_event = Some(h);
+                log::debug!("swkbd: state-changed event {:#x} (deferred completion)", h);
+            } else {
+                kernel.event_signals.insert(h, true);
+            }
             ok_with_handle(Vec::new(), h)
         }
-        1 => ok(vec![1u8]),
+        1 => {
+            if swkbd_pending() {
+                ok(vec![u8::from(crate::swkbd_state::is_completed())])
+            } else {
+                ok(vec![1u8])
+            }
+        }
+        10 => {
+            if swkbd_pending() {
+                let initial = swkbd_read_initial_text(kernel);
+                crate::swkbd_state::start(initial);
+            }
+            ok_empty()
+        }
+        106 => {
+            if swkbd_pending() {
+                let h = kernel.handles.create_handle(HandleType::Event);
+                kernel.event_signals.insert(h, false);
+                kernel.swkbd_interactive_event = Some(h);
+                log::debug!("swkbd: interactive-out event {:#x} (never signaled)", h);
+                ok_with_handle(Vec::new(), h)
+            } else {
+                log::warn!(
+                    "ILibraryAppletAccessor.cmd_106 UNHANDLED → returning empty SUCCESS (likely wrong)"
+                );
+                ok_empty()
+            }
+        }
         30 => {
             kernel.applet_focus_state = FOCUS_STATE_IN_FOCUS;
             let exit_on_result = std::env::var_os("NEXIUM_APPLET_EXIT_ON_RESULT").is_some();
@@ -436,7 +515,7 @@ fn library_applet_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8
             );
             ok_empty()
         }
-        10 | 20 | 25 | 26 | 50 | 51 | 60 | 90 | 91 | 100 | 102 | 103 | 110 | 120 | 150 | 160 => {
+        20 | 25 | 26 | 50 | 51 | 60 | 90 | 91 | 100 | 102 | 103 | 110 | 120 | 150 | 160 => {
             ok_empty()
         }
         _ => {
@@ -599,6 +678,7 @@ static PENDING_APPLET_ID: AtomicU32 = AtomicU32::new(0);
 static CONTROLLER_SELECTED_ID: AtomicU32 = AtomicU32::new(0);
 
 pub const APPLET_ID_CONTROLLER: u32 = 0x0c;
+pub const APPLET_ID_SWKBD: u32 = 0x11;
 
 pub fn set_pending_applet_id(id: u32) {
     PENDING_APPLET_ID.store(id, Ordering::Relaxed);
@@ -613,14 +693,16 @@ pub fn set_controller_selected_id(id: u32) {
 }
 
 pub fn applet_out_data() -> Vec<u8> {
-    if PENDING_APPLET_ID.load(Ordering::Relaxed) == APPLET_ID_CONTROLLER {
-        let mut v = vec![0u8; 0xc];
-        v[0] = 1;
-        let sel = CONTROLLER_SELECTED_ID.load(Ordering::Relaxed);
-        v[4..8].copy_from_slice(&sel.to_le_bytes());
-        v
-    } else {
-        Vec::new()
+    match PENDING_APPLET_ID.load(Ordering::Relaxed) {
+        APPLET_ID_CONTROLLER => {
+            let mut v = vec![0u8; 0xc];
+            v[0] = 1;
+            let sel = CONTROLLER_SELECTED_ID.load(Ordering::Relaxed);
+            v[4..8].copy_from_slice(&sel.to_le_bytes());
+            v
+        }
+        APPLET_ID_SWKBD => crate::swkbd_state::out_data(),
+        _ => Vec::new(),
     }
 }
 

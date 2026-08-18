@@ -15,3 +15,4 @@ pub use nexium_kernel::hid_state;
 pub use nexium_kernel::kernel;
 pub use nexium_kernel::sdl_emu;
 pub use nexium_kernel::services;
+pub use nexium_kernel::swkbd_state;

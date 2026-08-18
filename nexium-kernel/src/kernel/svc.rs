@@ -3200,7 +3200,77 @@ fn dispatch_service_v2(
         }
     }
 
+    if port_name == "IStorageAccessor"
+        && cmd_id == 10
+        && crate::services::am::pending_applet_id() == crate::services::am::APPLET_ID_SWKBD
+    {
+        let sb = ctx
+            .send_buffers
+            .iter()
+            .chain(ctx.send_statics.iter())
+            .find(|b| b.size > 0 && b.addr != 0)
+            .copied();
+        if let Some(b) = sb {
+            let size = (b.size as usize).min(0x2000);
+            let mut bytes = vec![0u8; size];
+            if kernel.address_space.read(b.addr, &mut bytes).is_ok() {
+                crate::swkbd_state::capture_storage_write(&bytes);
+            }
+        }
+    }
+
+    if port_name == "ILibraryAppletCreator"
+        && cmd_id == 11
+        && crate::services::am::pending_applet_id() == crate::services::am::APPLET_ID_SWKBD
+    {
+        let tmem_handle = ctx
+            .copy_handles
+            .first()
+            .or_else(|| ctx.move_handles.first())
+            .copied();
+        if let Some(h) = tmem_handle {
+            if let Some(&(addr, size)) = kernel.transfer_memories.get(&h) {
+                kernel.swkbd_workbuf = Some((addr, size));
+                log::debug!(
+                    "swkbd: workbuf tmem handle={:#x} addr={:#x} size={:#x}",
+                    h,
+                    addr,
+                    size
+                );
+            } else {
+                log::warn!(
+                    "swkbd: CreateTransferMemoryStorage with unknown tmem handle {:#x}",
+                    h
+                );
+            }
+        }
+    }
+
     if let Some(buffer_data) = applet_buffer_response(port_name, cmd_id) {
+        let read_offset = if port_name == "IStorageAccessorOut" && cmd_id == 11 {
+            let off = ctx.cmif_in_data_off;
+            if ctx.cmif_in_data_len >= 8 && off + 8 <= ctx.buf.len() {
+                u64::from_le_bytes([
+                    ctx.buf[off],
+                    ctx.buf[off + 1],
+                    ctx.buf[off + 2],
+                    ctx.buf[off + 3],
+                    ctx.buf[off + 4],
+                    ctx.buf[off + 5],
+                    ctx.buf[off + 6],
+                    ctx.buf[off + 7],
+                ]) as usize
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let buffer_data: &[u8] = if read_offset > 0 {
+            buffer_data.get(read_offset..).unwrap_or(&[])
+        } else {
+            &buffer_data[..]
+        };
         let target_buf = ctx
             .recv_buffers
             .iter()
@@ -3213,10 +3283,11 @@ fn dispatch_service_v2(
                 .address_space
                 .write(buf.addr, &buffer_data[..write_len]);
             log::debug!(
-                "  wrote {} bytes to recv buf at {:#x} (avail {})",
+                "  wrote {} bytes to recv buf at {:#x} (avail {}, offset {})",
                 write_len,
                 buf.addr,
-                buf.size
+                buf.size,
+                read_offset
             );
         } else {
             log::debug!(
@@ -3252,6 +3323,11 @@ fn dispatch_service_v2(
                 applet_mode
             );
             crate::services::am::set_pending_applet_id(applet_id);
+            if applet_id == crate::services::am::APPLET_ID_SWKBD {
+                let generation = crate::swkbd_state::begin_applet();
+                kernel.swkbd_workbuf = None;
+                log::info!("swkbd: applet created (gen={})", generation);
+            }
         }
     }
 
@@ -10392,6 +10468,7 @@ fn svc_create_transfer_memory(kernel: &mut Kernel) -> u32 {
         return 1;
     };
     let handle = kernel.handles.create_handle(HandleType::TransferMemory);
+    kernel.transfer_memories.insert(handle, (addr, size));
     log::debug!(
         "svcCreateTransferMemory addr={:#x} size={:#x} perm={:#x} â†’ handle={:#x}",
         addr,

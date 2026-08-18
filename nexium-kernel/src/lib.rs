@@ -7,5 +7,6 @@ pub mod hid_state;
 pub mod kernel;
 pub mod sdl_emu;
 pub mod services;
+pub mod swkbd_state;
 
 pub use kernel::Kernel;

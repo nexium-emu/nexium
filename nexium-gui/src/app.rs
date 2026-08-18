@@ -185,6 +185,9 @@ pub struct HorizonApp {
     prefs_key_anchor: usize,
     vkeyboard: crate::vkeyboard::VirtualKeyboard,
     vk_target: VkTarget,
+    swkbd_text: String,
+    swkbd_gen: u64,
+    swkbd_max: usize,
     updater: crate::updater::Updater,
     update_restart_shown: bool,
     input: Option<InputBackend>,
@@ -397,6 +400,7 @@ pub enum VkTarget {
     None,
     ApiKey,
     ListName,
+    Swkbd,
 }
 
 impl HorizonApp {
@@ -444,6 +448,9 @@ impl HorizonApp {
             prefs_key_anchor: 0,
             vkeyboard: crate::vkeyboard::VirtualKeyboard::new(),
             vk_target: VkTarget::None,
+            swkbd_text: String::new(),
+            swkbd_gen: 0,
+            swkbd_max: 500,
             updater: crate::updater::Updater::new(),
             update_restart_shown: false,
             input,
@@ -3118,24 +3125,60 @@ impl HorizonApp {
         let cur = match target {
             VkTarget::ApiKey => self.app_settings.steamgriddb_key.clone(),
             VkTarget::ListName => self.cs_new_name.clone(),
+            VkTarget::Swkbd => self.swkbd_text.clone(),
             VkTarget::None => return,
         };
         let max = match target {
             VkTarget::ApiKey => 80,
+            VkTarget::Swkbd => self.swkbd_max,
             _ => 28,
         };
         self.vk_target = target;
         self.vkeyboard.show(&cur, max);
     }
 
+    fn poll_swkbd_request(&mut self) {
+        let Some(req) = nexium_core::swkbd_state::take_request() else {
+            return;
+        };
+        self.swkbd_gen = req.generation;
+        self.swkbd_text = req.initial_text.clone();
+        self.swkbd_max = if req.max_len == 0 {
+            500
+        } else {
+            req.max_len as usize
+        };
+        let title = if !req.header_text.is_empty() {
+            req.header_text.clone()
+        } else if !req.sub_text.is_empty() {
+            req.sub_text.clone()
+        } else {
+            req.guide_text.clone()
+        };
+        self.vk_target = VkTarget::Swkbd;
+        self.vkeyboard
+            .show_titled(&self.swkbd_text, self.swkbd_max, &title);
+    }
+
     fn drive_vkeyboard(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        self.poll_swkbd_request();
         if self.vkeyboard.open {
             let stale = match self.vk_target {
                 VkTarget::ApiKey => !self.show_settings,
                 VkTarget::ListName => !self.cs_creating,
+                VkTarget::Swkbd => self.emulation_handle.is_none(),
                 VkTarget::None => true,
             };
             if stale {
+                if self.vk_target == VkTarget::Swkbd {
+                    nexium_core::swkbd_state::post_response(
+                        nexium_core::swkbd_state::SwkbdResponse {
+                            generation: self.swkbd_gen,
+                            accepted: false,
+                            text: String::new(),
+                        },
+                    );
+                }
                 self.vkeyboard.open = false;
             }
         }
@@ -3168,6 +3211,38 @@ impl HorizonApp {
                 accent,
                 light,
             ),
+            VkTarget::Swkbd => {
+                let r = self.vkeyboard.update(
+                    ctx,
+                    ui,
+                    &mut self.swkbd_text,
+                    &self.last_input,
+                    accent,
+                    light,
+                );
+                match r {
+                    crate::vkeyboard::VkResult::Accept => {
+                        nexium_core::swkbd_state::post_response(
+                            nexium_core::swkbd_state::SwkbdResponse {
+                                generation: self.swkbd_gen,
+                                accepted: true,
+                                text: self.swkbd_text.clone(),
+                            },
+                        );
+                    }
+                    crate::vkeyboard::VkResult::Cancel => {
+                        nexium_core::swkbd_state::post_response(
+                            nexium_core::swkbd_state::SwkbdResponse {
+                                generation: self.swkbd_gen,
+                                accepted: false,
+                                text: String::new(),
+                            },
+                        );
+                    }
+                    crate::vkeyboard::VkResult::None => {}
+                }
+                r
+            }
             VkTarget::None => {
                 let mut discard = String::new();
                 self.vkeyboard
@@ -7732,12 +7807,17 @@ impl eframe::App for HorizonApp {
             } else {
                 (0u64, [0i32; 4])
             };
-            let buttons = kb_buttons | gp_buttons;
+            let swkbd_open = self.vk_target == VkTarget::Swkbd && self.vkeyboard.active();
+            let mut buttons = kb_buttons | gp_buttons;
             let mut sticks = kb_sticks;
             for i in 0..4 {
                 if gp_sticks[i].abs() > sticks[i].abs() {
                     sticks[i] = gp_sticks[i];
                 }
+            }
+            if swkbd_open {
+                buttons = 0;
+                sticks = [0i32; 4];
             }
             if diagnostics_enabled()
                 && (buttons != self.last_buttons_logged || sticks != self.last_sticks_logged)
@@ -7765,7 +7845,7 @@ impl eframe::App for HorizonApp {
             let wants_pointer = ctx.wants_pointer_input();
             let mut keys = [0u8; 32];
             let mut modifiers = 0u32;
-            if self.app_settings.emulate_keyboard && !wants_keyboard {
+            if self.app_settings.emulate_keyboard && !wants_keyboard && !swkbd_open {
                 ctx.input(|i| {
                     for key in i.keys_down.iter() {
                         if let Some(index) = hid_keyboard_usage(*key) {

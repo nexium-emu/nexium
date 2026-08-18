@@ -94,6 +94,10 @@ pub struct Kernel {
     pub acquired_sleep_lock_event: Option<u32>,
     pub aoc_change_event: Option<u32>,
     pub bcat_progress_event: Option<u32>,
+    pub swkbd_state_changed_event: Option<u32>,
+    pub swkbd_interactive_event: Option<u32>,
+    pub swkbd_workbuf: Option<(u64, u64)>,
+    pub transfer_memories: HashMap<u32, (u64, u64)>,
 
     pub nro_mmap: Option<Arc<memmap2::Mmap>>,
     pub nro_romfs_range: Option<std::ops::Range<usize>>,
@@ -326,6 +330,10 @@ impl Kernel {
             acquired_sleep_lock_event: None,
             aoc_change_event: None,
             bcat_progress_event: None,
+            swkbd_state_changed_event: None,
+            swkbd_interactive_event: None,
+            swkbd_workbuf: None,
+            transfer_memories: HashMap::new(),
             nro_mmap: None,
             nro_romfs_range: None,
             application_romfs: None,
@@ -783,6 +791,20 @@ impl Kernel {
     }
 
     pub fn signal_vsync(&mut self) {
+        if let Some(resp) = crate::swkbd_state::take_response() {
+            let out = crate::swkbd_state::build_out_data(resp.accepted, &resp.text);
+            crate::swkbd_state::set_completed(out);
+            if let Some(handle) = self.swkbd_state_changed_event.take() {
+                self.event_signals.insert(handle, true);
+                self.threads.signal_handle(handle);
+            }
+            log::info!(
+                "swkbd: completed gen={} accepted={} chars={}",
+                resp.generation,
+                resp.accepted,
+                resp.text.chars().count()
+            );
+        }
         if crate::hid_state::take_console_mode_dirty() {
             let docked = crate::hid_state::is_docked();
             self.applet_operation_mode = if docked { 1 } else { 0 };
