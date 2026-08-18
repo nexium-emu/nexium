@@ -1153,6 +1153,7 @@ impl EmulationHandle {
                         continue;
                     }
 
+                    guard.tick_audio_renderers();
                     guard.threads.wake_due_sleepers(std::time::Instant::now());
 
                     if let Some(cpu) = cpu_mut() {
