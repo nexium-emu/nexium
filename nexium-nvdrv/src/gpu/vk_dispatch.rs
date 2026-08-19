@@ -14535,7 +14535,6 @@ struct ResolvedTextureNumericUse {
     descriptor_slot: u32,
     tic_id: Option<u32>,
     numeric_type: nexium_spirv::TextureNumericType,
-    image_kind: GraphicsTextureImageKind,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14663,7 +14662,6 @@ fn stage_texture_numeric_bindings(
             tic_id: (tic_pool_gpu_va != 0 && tic_id != u32::MAX && tic_id <= tic_pool_limit)
                 .then_some(tic_id),
             numeric_type,
-            image_kind,
         });
         resolved_tics.push(resolved);
     }
@@ -14758,19 +14756,6 @@ fn graphics_texture_layout_from_metadata(
                     usage.shader_id,
                     usage.descriptor_slot,
                     usage.numeric_type,
-                ));
-            }
-            if previous.image_kind != usage.image_kind {
-                return Err(format!(
-                    "graphics texture image-kind conflict: TIC {tic_id:#x} is used by {} shader_id={:#x} slot={} as {:?} and {} shader_id={:#x} slot={} as {:?}",
-                    previous.stage_name,
-                    previous.shader_id,
-                    previous.descriptor_slot,
-                    previous.image_kind,
-                    usage.stage_name,
-                    usage.shader_id,
-                    usage.descriptor_slot,
-                    usage.image_kind,
                 ));
             }
         }
@@ -21889,6 +21874,64 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("Sample/Gather (Float) and TexelFetch (Uint)"));
         assert!(error.contains("shader_id=0x0 slot=0 tic_id=0x0"));
+    }
+
+    #[test]
+    fn graphics_texture_manifest_allows_distinct_views_of_same_resource() {
+        use nexium_gpu::texture_manifest::{texture_image_kind_for_slot, GraphicsTextureImageKind};
+
+        let raw = prepared_tic_plan_raw_with_view(0x8100_0000, 3, 0);
+        let fs_metadata = FragmentTextureNumericMetadata {
+            texture_ids: vec![0x16, 0x20],
+            descriptor_ids: vec![0x16, 0x20],
+            sampled_ids: vec![0x16, 0x20],
+            image_kinds: vec![
+                (0x16, GraphicsTextureImageKind::D2),
+                (0x20, GraphicsTextureImageKind::Cube),
+            ],
+            ..Default::default()
+        };
+        let mut cbuf_binds = [[(0, 0); GRAPHICS_CBUF_SLOTS]; 5];
+        cbuf_binds[4][0] = (0x3000, 0x100);
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x1000, 32, 0x2000, 1);
+        mappings.add(0x3000, 0x100, 0x4000, 2);
+        let read = |cpu: u64, out: &mut [u8]| {
+            if cpu == 0x2000 && out.len() == raw.len() {
+                out.copy_from_slice(&raw);
+                return true;
+            }
+            if matches!(cpu, 0x4058 | 0x4080) && out.len() == 4 {
+                out.copy_from_slice(&0u32.to_le_bytes());
+                return true;
+            }
+            false
+        };
+
+        let layout = graphics_texture_layout_from_metadata(
+            &fs_metadata,
+            &FragmentTextureNumericMetadata::default(),
+            &cbuf_binds,
+            0,
+            4,
+            0,
+            0x1000,
+            0,
+            false,
+            &mappings,
+            &read,
+        )
+        .unwrap();
+
+        assert_eq!(layout.resolved_tic_ids, vec![0, 0]);
+        assert_eq!(
+            texture_image_kind_for_slot(&layout.manifest, 0),
+            GraphicsTextureImageKind::D2
+        );
+        assert_eq!(
+            texture_image_kind_for_slot(&layout.manifest, 1),
+            GraphicsTextureImageKind::Cube
+        );
     }
 
     #[test]
