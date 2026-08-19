@@ -34,7 +34,7 @@ jobs:
             experimental: true
     steps:
       - name: Checkout NeXium
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Fetch rustarmic (CPU JIT dependency)
         shell: bash
