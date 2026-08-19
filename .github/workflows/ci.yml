@@ -125,7 +125,7 @@ jobs:
           mkdir -p dist/NeXium
           cp target/release/nexium dist/NeXium/
           cp LICENSE README.md dist/NeXium/
-          cp -a target/ffmpeg-dist/. dist/NeXium/
+          cp -a "${RUNNER_TEMP}/nexium-ffmpeg-dist/." dist/NeXium/
           test -x dist/NeXium/ffmpeg
           test -f dist/NeXium/THIRD_PARTY_NOTICES.txt
           test -f dist/NeXium/licenses/FFmpeg/LICENSE.md
@@ -144,7 +144,8 @@ jobs:
           New-Item -ItemType Directory -Force dist/NeXium | Out-Null
           Copy-Item target/release/nexium.exe dist/NeXium/
           Copy-Item LICENSE, README.md dist/NeXium/
-          Copy-Item target/ffmpeg-dist/* dist/NeXium/ -Recurse
+          $ffmpegDist = Join-Path $env:RUNNER_TEMP 'nexium-ffmpeg-dist'
+          Copy-Item (Join-Path $ffmpegDist '*') dist/NeXium/ -Recurse
           $required = @(
             'dist/NeXium/ffmpeg.exe',
             'dist/NeXium/THIRD_PARTY_NOTICES.txt',

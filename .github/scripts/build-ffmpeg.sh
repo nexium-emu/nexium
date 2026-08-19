@@ -8,22 +8,27 @@ source_url="https://ffmpeg.org/releases/ffmpeg-${ffmpeg_version}.tar.xz"
 signature_url="${source_url}.asc"
 signing_key_url="https://ffmpeg.org/ffmpeg-devel.asc"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-work_root="${FFMPEG_WORK_ROOT:-${repo_root}/target/ffmpeg-build}"
-dist_root="${FFMPEG_DIST_ROOT:-${repo_root}/target/ffmpeg-dist}"
+runner_temp=""
+if [[ -n "${RUNNER_TEMP:-}" ]]; then
+    runner_temp="${RUNNER_TEMP}"
+    if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
+        runner_temp="$(cygpath -u "${runner_temp}")"
+    fi
+    work_root="${runner_temp}/nexium-ffmpeg-build"
+    dist_root="${runner_temp}/nexium-ffmpeg-dist"
+else
+    work_root="${repo_root}/target/ffmpeg-build"
+    dist_root="${repo_root}/target/ffmpeg-dist"
+fi
 source_dir="${work_root}/ffmpeg-${ffmpeg_version}"
 archive="${work_root}/ffmpeg-${ffmpeg_version}.tar.xz"
 signature="${archive}.asc"
 signing_key="${work_root}/ffmpeg-devel.asc"
 keyring="${work_root}/gnupg"
 
-case "${work_root}" in
-    "${repo_root}"/target/*) ;;
-    *) echo "FFmpeg work directory must be inside target" >&2; exit 1 ;;
-esac
-case "${dist_root}" in
-    "${repo_root}"/target/*) ;;
-    *) echo "FFmpeg output directory must be inside target" >&2; exit 1 ;;
-esac
+if [[ -n "${runner_temp}" ]]; then
+    rm -rf "${repo_root}/target/ffmpeg-build" "${repo_root}/target/ffmpeg-dist"
+fi
 
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then
