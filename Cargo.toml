@@ -54,7 +54,7 @@ log = "0.4"
 env_logger = "0.11"
 
 rspirv = "0.12"
-naga = { version = "0.14", features = ["spv-in"] }
+naga = { version = "0.20", features = ["spv-in"] }
 ringbuf = "0.4"
 directories = "5"
 chrono = "0.4"
