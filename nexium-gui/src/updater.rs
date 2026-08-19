@@ -1,6 +1,20 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+#[cfg(any(target_os = "linux", test))]
+const UPDATE_PAYLOAD_FILES: [(&str, bool); 10] = [
+    ("ffmpeg", true),
+    ("THIRD_PARTY_NOTICES.txt", false),
+    ("licenses/FFmpeg/LICENSE.md", false),
+    ("licenses/FFmpeg/COPYING.LGPLv2.1", false),
+    ("licenses/FFmpeg/BUILD.txt", false),
+    ("licenses/FFmpeg/ffmpeg-9.0.1.tar.xz", false),
+    ("licenses/FFmpeg/ffmpeg-9.0.1.tar.xz.asc", false),
+    ("licenses/FFmpeg/ffmpeg-devel.asc", false),
+    ("licenses/FFmpeg/CHANGES.diff", false),
+    ("nexium", true),
+];
+
 #[derive(Clone)]
 pub struct Release {
     pub tag: String,
@@ -111,7 +125,7 @@ impl Updater {
         std::thread::spawn(move || {
             let next = match fetch_latest() {
                 Ok(rel) => {
-                    if is_current(&rel.commit) {
+                    if is_current(&rel.commit) && current_update_payload_complete() {
                         Status::UpToDate
                     } else {
                         Status::Available(rel)
@@ -177,30 +191,11 @@ impl Updater {
         if !ok {
             return Err("failed to extract archive".into());
         }
-        let newbin = find_binary(&tmp, "nexium").ok_or("new binary not found in archive")?;
-
-        let parent = exe.parent().ok_or("no parent directory")?;
-        let backups = parent.join("backups");
-        std::fs::create_dir_all(&backups).map_err(|e| e.to_string())?;
-        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let base = exe.file_name().and_then(|n| n.to_str()).unwrap_or("nexium");
-        let backup_dest = backups.join(format!("{}-{}", base, stamp));
-
-        std::fs::rename(&exe, &backup_dest)
-            .map_err(|e| format!("could not move current binary aside: {}", e))?;
-        prune_backups(&backups, 20);
-
-        if let Err(e) = std::fs::copy(&newbin, &exe) {
-            let _ = std::fs::rename(&backup_dest, &exe);
-            return Err(format!("could not write new binary: {}", e));
-        }
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
-        }
+        let parent = exe.parent().ok_or("no parent directory")?.to_path_buf();
+        install_update_payload(&tmp, &exe)?;
 
         std::process::Command::new(&exe)
-            .current_dir(std::env::current_dir().unwrap_or_else(|_| parent.to_path_buf()))
+            .current_dir(std::env::current_dir().unwrap_or(parent))
             .spawn()
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -326,15 +321,20 @@ fn extract_commit(s: &str) -> Option<String> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn find_binary(dir: &std::path::Path, name: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut dirs = Vec::new();
     for e in entries.flatten() {
         let path = e.path();
-        if path.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_dir() {
             dirs.push(path);
-        } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+        } else if metadata.file_type().is_file()
+            && path.file_name().and_then(|n| n.to_str()) == Some(name)
+        {
             return Some(path);
         }
     }
@@ -346,43 +346,616 @@ fn find_binary(dir: &std::path::Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-#[cfg(target_os = "linux")]
-fn backup_current(exe: &std::path::Path) -> Result<(), String> {
-    let parent = exe.parent().ok_or("no parent dir")?;
-    let backups = parent.join("backups");
-    std::fs::create_dir_all(&backups).map_err(|e| e.to_string())?;
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let base = exe.file_name().and_then(|n| n.to_str()).unwrap_or("nexium");
-    let dest = backups.join(format!("{}-{}", base, stamp));
-    std::fs::copy(exe, &dest).map_err(|e| e.to_string())?;
-    prune_backups(&backups, 20);
-    Ok(())
+#[cfg(any(target_os = "linux", test))]
+fn validate_payload_file(
+    package_root: &std::path::Path,
+    relative: &str,
+) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    let relative_path = std::path::Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!("invalid update payload path {}", relative));
+    }
+
+    let mut current = package_root.to_path_buf();
+    if let Some(parent) = relative_path.parent() {
+        for component in parent.components() {
+            let Component::Normal(segment) = component else {
+                return Err(format!("invalid update payload path {}", relative));
+            };
+            current.push(segment);
+            let metadata = std::fs::symlink_metadata(&current)
+                .map_err(|e| format!("missing update payload {}: {}", relative, e))?;
+            if !metadata.file_type().is_dir() {
+                return Err(format!("invalid update payload directory {}", relative));
+            }
+        }
+    }
+
+    let path = package_root.join(relative_path);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|e| format!("missing update payload {}: {}", relative, e))?;
+    let may_be_empty = relative == "licenses/FFmpeg/CHANGES.diff";
+    if !metadata.file_type().is_file() || (!may_be_empty && metadata.len() == 0) {
+        return Err(format!("invalid update payload file {}", relative));
+    }
+    Ok(path)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resolve_update_payload(extracted_root: &std::path::Path) -> Result<PathBuf, String> {
+    let new_binary =
+        find_binary(extracted_root, "nexium").ok_or("new binary not found in archive")?;
+    let package_root = new_binary
+        .parent()
+        .ok_or("update payload has no package directory")?;
+    for (relative, _) in UPDATE_PAYLOAD_FILES {
+        validate_payload_file(package_root, relative)?;
+    }
+    Ok(package_root.to_path_buf())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn installed_update_payload_complete(executable: &std::path::Path) -> bool {
+    let Some(package_root) = executable.parent() else {
+        return false;
+    };
+    for (relative, executable_file) in UPDATE_PAYLOAD_FILES {
+        let path = if relative == "nexium" {
+            executable.to_path_buf()
+        } else {
+            let Ok(path) = validate_payload_file(package_root, relative) else {
+                return false;
+            };
+            path
+        };
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        if !metadata.file_type().is_file()
+            || (metadata.len() == 0 && relative != "licenses/FFmpeg/CHANGES.diff")
+        {
+            return false;
+        }
+        if executable_file {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 #[cfg(target_os = "linux")]
+fn current_update_payload_complete() -> bool {
+    std::env::current_exe().is_ok_and(|executable| installed_update_payload_complete(&executable))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn update_destination(
+    executable: &std::path::Path,
+    install_root: &std::path::Path,
+    relative: &str,
+) -> PathBuf {
+    if relative == "nexium" {
+        executable.to_path_buf()
+    } else {
+        install_root.join(relative)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn ensure_destination_parent(install_root: &std::path::Path, relative: &str) -> Result<(), String> {
+    use std::path::Component;
+
+    let mut current = install_root.to_path_buf();
+    let Some(parent) = std::path::Path::new(relative).parent() else {
+        return Ok(());
+    };
+    for component in parent.components() {
+        let Component::Normal(segment) = component else {
+            return Err(format!("invalid update destination {}", relative));
+        };
+        current.push(segment);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "update destination is not a directory: {}",
+                    current.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|e| {
+                    format!(
+                        "could not create update directory {}: {}",
+                        current.display(),
+                        e
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect update directory {}: {}",
+                    current.display(),
+                    error
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::rename(source, destination)
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::remove_file(destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        std::fs::rename(source, destination)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn rollback_update(installed: &[PathBuf], backed_up: &[(PathBuf, PathBuf)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for destination in installed.iter().rev() {
+        if let Some((_, backup)) = backed_up
+            .iter()
+            .find(|(backed_up_destination, _)| backed_up_destination == destination)
+        {
+            if let Err(error) = replace_file(backup, destination) {
+                errors.push(format!(
+                    "could not restore {}: {}",
+                    destination.display(),
+                    error
+                ));
+            }
+        } else {
+            match std::fs::remove_file(destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => errors.push(format!(
+                    "could not remove {}: {}",
+                    destination.display(),
+                    error
+                )),
+            }
+        }
+    }
+    errors
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn failed_update(
+    error: String,
+    stage_root: &std::path::Path,
+    backup_root: &std::path::Path,
+    installed: &[PathBuf],
+    backed_up: &[(PathBuf, PathBuf)],
+) -> String {
+    let rollback_errors = rollback_update(installed, backed_up);
+    let _ = std::fs::remove_dir_all(stage_root);
+    if rollback_errors.is_empty() {
+        let _ = std::fs::remove_dir_all(backup_root);
+        error
+    } else {
+        format!("{}; rollback failed: {}", error, rollback_errors.join("; "))
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn install_update_payload(
+    extracted_root: &std::path::Path,
+    executable: &std::path::Path,
+) -> Result<(), String> {
+    let package_root = resolve_update_payload(extracted_root)?;
+    let install_root = executable.parent().ok_or("no parent directory")?;
+    for (relative, _) in UPDATE_PAYLOAD_FILES {
+        ensure_destination_parent(install_root, relative)?;
+        let destination = update_destination(executable, install_root, relative);
+        match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(format!(
+                    "update destination is not a regular file: {}",
+                    destination.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if relative == "nexium" {
+                    return Err("current executable is missing".into());
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect update destination {}: {}",
+                    destination.display(),
+                    error
+                ));
+            }
+        }
+    }
+
+    let backups_root = install_root.join("backups");
+    match std::fs::symlink_metadata(&backups_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err("backup path is not a directory".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&backups_root)
+                .map_err(|e| format!("could not create backup directory: {}", e))?;
+        }
+        Err(error) => return Err(format!("could not inspect backup directory: {}", error)),
+    }
+
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let unique = format!("{}-{}-{}", stamp, std::process::id(), nonce);
+    let stage_root = install_root.join(format!(".nexium-update-stage-{}", unique));
+    let backup_root = backups_root.join(format!("update-{}", unique));
+    std::fs::create_dir(&stage_root)
+        .map_err(|e| format!("could not create update staging directory: {}", e))?;
+
+    for (relative, executable_file) in UPDATE_PAYLOAD_FILES {
+        let source = package_root.join(relative);
+        let staged = stage_root.join(relative);
+        if let Some(parent) = staged.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                let _ = std::fs::remove_dir_all(&stage_root);
+                return Err(format!("could not stage {}: {}", relative, error));
+            }
+        }
+        if let Err(error) = std::fs::copy(&source, &staged) {
+            let _ = std::fs::remove_dir_all(&stage_root);
+            return Err(format!("could not stage {}: {}", relative, error));
+        }
+        if executable_file {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                if let Err(error) =
+                    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+                {
+                    let _ = std::fs::remove_dir_all(&stage_root);
+                    return Err(format!(
+                        "could not set permissions on {}: {}",
+                        relative, error
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Err(error) = std::fs::create_dir(&backup_root) {
+        let _ = std::fs::remove_dir_all(&stage_root);
+        return Err(format!("could not create update backup: {}", error));
+    }
+
+    let mut backed_up = Vec::new();
+    for (relative, _) in UPDATE_PAYLOAD_FILES {
+        let destination = update_destination(executable, install_root, relative);
+        match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                let backup = backup_root.join(relative);
+                if let Some(parent) = backup.parent() {
+                    if let Err(error) = std::fs::create_dir_all(parent) {
+                        let message =
+                            format!("could not prepare backup for {}: {}", relative, error);
+                        let _ = std::fs::remove_dir_all(&stage_root);
+                        let _ = std::fs::remove_dir_all(&backup_root);
+                        return Err(message);
+                    }
+                }
+                if let Err(error) = std::fs::copy(&destination, &backup) {
+                    let message = format!("could not back up {}: {}", relative, error);
+                    let _ = std::fs::remove_dir_all(&stage_root);
+                    let _ = std::fs::remove_dir_all(&backup_root);
+                    return Err(message);
+                }
+                backed_up.push((destination, backup));
+            }
+            Ok(_) => {
+                let message = format!("{} is no longer a regular file", relative);
+                let _ = std::fs::remove_dir_all(&stage_root);
+                let _ = std::fs::remove_dir_all(&backup_root);
+                return Err(message);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let message = format!("could not inspect {} for backup: {}", relative, error);
+                let _ = std::fs::remove_dir_all(&stage_root);
+                let _ = std::fs::remove_dir_all(&backup_root);
+                return Err(message);
+            }
+        }
+    }
+
+    let mut installed = Vec::new();
+    for (relative, _) in UPDATE_PAYLOAD_FILES {
+        let staged = stage_root.join(relative);
+        let destination = update_destination(executable, install_root, relative);
+        if let Err(error) = replace_file(&staged, &destination) {
+            let message = format!("could not install {}: {}", relative, error);
+            return Err(failed_update(
+                message,
+                &stage_root,
+                &backup_root,
+                &installed,
+                &backed_up,
+            ));
+        }
+        installed.push(destination);
+    }
+
+    let _ = std::fs::remove_dir_all(&stage_root);
+    prune_backups(&backups_root, 20);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn prune_backups(dir: &std::path::Path, keep: usize) {
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            if p.is_file() {
-                let t = e
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                Some((t, p))
-            } else {
-                None
+            let name = e.file_name();
+            let name = name.to_str()?;
+            let metadata = std::fs::symlink_metadata(&p).ok()?;
+            let is_dir = metadata.file_type().is_dir();
+            if !is_dir || !name.starts_with("update-") {
+                return None;
             }
+            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+            Some((modified, p))
         })
         .collect();
-    if files.len() <= keep {
+    if entries.len() <= keep {
         return;
     }
-    files.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, p) in files.into_iter().skip(keep) {
-        let _ = std::fs::remove_file(p);
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in entries.into_iter().skip(keep) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(name: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "nexium-updater-{}-{}-{}",
+                name,
+                std::process::id(),
+                nonce
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_payload(extracted_root: &std::path::Path) -> PathBuf {
+        let package_root = extracted_root.join("NeXium");
+        for (relative, executable_file) in UPDATE_PAYLOAD_FILES {
+            let path = package_root.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let contents = if relative == "licenses/FFmpeg/CHANGES.diff" {
+                String::new()
+            } else {
+                format!("new:{}", relative)
+            };
+            std::fs::write(&path, contents).unwrap();
+            if executable_file {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+            }
+        }
+        package_root
+    }
+
+    #[test]
+    fn complete_update_payload_is_resolved() {
+        let tree = TempTree::new("complete");
+        let package_root = write_payload(&tree.0);
+        assert_eq!(resolve_update_payload(&tree.0).unwrap(), package_root);
+    }
+
+    #[test]
+    fn missing_update_payload_file_is_rejected() {
+        let tree = TempTree::new("missing");
+        let package_root = write_payload(&tree.0);
+        std::fs::remove_file(package_root.join("ffmpeg")).unwrap();
+        let error = resolve_update_payload(&tree.0).unwrap_err();
+        assert!(error.contains("ffmpeg"));
+    }
+
+    #[test]
+    fn empty_required_payload_file_is_rejected() {
+        let tree = TempTree::new("empty");
+        let package_root = write_payload(&tree.0);
+        std::fs::write(package_root.join("licenses/FFmpeg/BUILD.txt"), []).unwrap();
+        let error = resolve_update_payload(&tree.0).unwrap_err();
+        assert!(error.contains("BUILD.txt"));
+    }
+
+    #[test]
+    fn installed_payload_requires_every_sidecar() {
+        let tree = TempTree::new("installed-complete");
+        let package_root = write_payload(&tree.0);
+        let executable = package_root.join("nexium");
+        assert!(installed_update_payload_complete(&executable));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let ffmpeg = package_root.join("ffmpeg");
+            std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!installed_update_payload_complete(&executable));
+            std::fs::set_permissions(ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(installed_update_payload_complete(&executable));
+        }
+
+        std::fs::remove_file(package_root.join("licenses/FFmpeg/ffmpeg-devel.asc")).unwrap();
+        assert!(!installed_update_payload_complete(&executable));
+    }
+
+    #[test]
+    fn update_payload_replaces_all_files() {
+        let tree = TempTree::new("install");
+        let extracted_root = tree.0.join("archive");
+        write_payload(&extracted_root);
+        let install_root = tree.0.join("installed");
+        std::fs::create_dir(&install_root).unwrap();
+        let executable = install_root.join("nexium");
+        std::fs::write(&executable, "old:nexium").unwrap();
+        std::fs::write(install_root.join("ffmpeg"), "old:ffmpeg").unwrap();
+
+        install_update_payload(&extracted_root, &executable).unwrap();
+
+        for (relative, executable_file) in UPDATE_PAYLOAD_FILES {
+            let destination = update_destination(&executable, &install_root, relative);
+            let expected = if relative == "licenses/FFmpeg/CHANGES.diff" {
+                String::new()
+            } else {
+                format!("new:{}", relative)
+            };
+            assert_eq!(std::fs::read_to_string(&destination).unwrap(), expected);
+            if executable_file {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    let mode = std::fs::metadata(destination).unwrap().permissions().mode();
+                    assert_eq!(mode & 0o111, 0o111);
+                }
+            }
+        }
+
+        let backup = std::fs::read_dir(install_root.join("backups"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.is_dir())
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(backup.join("nexium")).unwrap(),
+            "old:nexium"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup.join("ffmpeg")).unwrap(),
+            "old:ffmpeg"
+        );
+    }
+
+    #[test]
+    fn incomplete_payload_does_not_mutate_install() {
+        let tree = TempTree::new("incomplete-install");
+        let extracted_root = tree.0.join("archive");
+        let package_root = write_payload(&extracted_root);
+        std::fs::remove_file(package_root.join("licenses/FFmpeg/BUILD.txt")).unwrap();
+        let install_root = tree.0.join("installed");
+        std::fs::create_dir(&install_root).unwrap();
+        let executable = install_root.join("nexium");
+        std::fs::write(&executable, "old:nexium").unwrap();
+
+        assert!(install_update_payload(&extracted_root, &executable).is_err());
+        assert_eq!(std::fs::read_to_string(&executable).unwrap(), "old:nexium");
+        assert!(!install_root.join("backups").exists());
+    }
+
+    #[test]
+    fn rollback_restores_backups_and_removes_new_files() {
+        let tree = TempTree::new("rollback");
+        let install_root = tree.0.join("installed");
+        let backup_root = tree.0.join("backup");
+        std::fs::create_dir(&install_root).unwrap();
+        std::fs::create_dir(&backup_root).unwrap();
+        let executable = install_root.join("nexium");
+        let ffmpeg = install_root.join("ffmpeg");
+        let executable_backup = backup_root.join("nexium");
+        std::fs::write(&executable, "new:nexium").unwrap();
+        std::fs::write(&ffmpeg, "new:ffmpeg").unwrap();
+        std::fs::write(&executable_backup, "old:nexium").unwrap();
+
+        let errors = rollback_update(
+            &[executable.clone(), ffmpeg.clone()],
+            &[(executable.clone(), executable_backup)],
+        );
+
+        assert!(errors.is_empty());
+        assert_eq!(std::fs::read_to_string(&executable).unwrap(), "old:nexium");
+        assert!(!ffmpeg.exists());
+    }
+
+    #[test]
+    fn backup_pruning_ignores_unowned_entries() {
+        let tree = TempTree::new("prune");
+        let backups = tree.0.join("backups");
+        std::fs::create_dir(&backups).unwrap();
+        for index in 0..4 {
+            std::fs::create_dir(backups.join(format!("update-{}", index))).unwrap();
+        }
+        std::fs::write(backups.join("nexium-legacy"), "backup").unwrap();
+        std::fs::create_dir(backups.join("personal-backup")).unwrap();
+        std::fs::write(backups.join("notes.txt"), "keep").unwrap();
+
+        prune_backups(&backups, 2);
+
+        let updater_owned = std::fs::read_dir(&backups)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("update-")
+            })
+            .count();
+        assert_eq!(updater_owned, 2);
+        assert!(backups.join("nexium-legacy").is_file());
+        assert!(backups.join("personal-backup").is_dir());
+        assert!(backups.join("notes.txt").is_file());
     }
 }
