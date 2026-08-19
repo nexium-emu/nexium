@@ -42,7 +42,7 @@ rfd = "0.17"
 arboard = "3"
 
 cpal = "0.18"
-getrandom = "0.3"
+getrandom = "0.4"
 symphonia = { version = "0.6", default-features = false, features = ["mp3"] }
 ringbuf = { workspace = true }
 nexium-kernel = { workspace = true, default-features = false }
