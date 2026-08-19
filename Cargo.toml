@@ -37,7 +37,7 @@ nexium-core = { path = "nexium-core", default-features = false }
 nexium-gpu = { path = "nexium-gpu" }
 
 bytemuck = { version = "1", features = ["derive"] }
-zerocopy = { version = "0.7", features = ["derive"] }
+zerocopy = { version = "0.8", features = ["derive"] }
 modular-bitfield = "0.13"
 bitflags = "2"
 num_enum = "0.7"
