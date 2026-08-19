@@ -533,6 +533,12 @@ pub enum Op {
         component: u8,
     },
 
+    TextureGradients {
+        sample_site: u32,
+        dpdx: (Value, Value),
+        dpdy: (Value, Value),
+    },
+
     SampleTexHandle {
         sample_site: Option<u32>,
         handle: TextureHandleOrigin,
@@ -1202,6 +1208,15 @@ impl Inst {
                         .unwrap_or("?")
                 )
             }
+            Op::TextureGradients {
+                sample_site,
+                dpdx,
+                dpdy,
+            } => write!(
+                f,
+                "TexGrad#{sample_site} dpdx=({}, {}), dpdy=({}, {})",
+                dpdx.0, dpdx.1, dpdy.0, dpdy.1
+            ),
             Op::SampleTexHandle {
                 sample_site,
                 handle,

@@ -913,6 +913,7 @@ pub struct Emitter {
     compute_resource_vars: Vec<ComputeResourceVar>,
     ir_constant_facts: nexium_shader::IrConstantFacts,
     texture_sample_sites: HashMap<u32, CachedTextureSample>,
+    texture_gradients: HashMap<u32, (Word, Word)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1314,6 +1315,7 @@ impl Emitter {
             compute_resource_vars: Vec::new(),
             ir_constant_facts: nexium_shader::IrConstantFacts::default(),
             texture_sample_sites: HashMap::new(),
+            texture_gradients: HashMap::new(),
         }
     }
 
@@ -4384,8 +4386,39 @@ impl Emitter {
         lod_bias: Option<Word>,
         explicit_lod: Option<Word>,
         texel_offset: Option<Word>,
+        gradients: Option<(Word, Word)>,
     ) -> Word {
         use rspirv::spirv::ImageOperands;
+
+        if let Some((dpdx, dpdy)) = gradients {
+            return if let Some(offset) = texel_offset {
+                self.b
+                    .image_sample_explicit_lod(
+                        self.vec4_t,
+                        None,
+                        sampled_image,
+                        coords,
+                        ImageOperands::GRAD | ImageOperands::CONST_OFFSET,
+                        [
+                            Operand::IdRef(dpdx),
+                            Operand::IdRef(dpdy),
+                            Operand::IdRef(offset),
+                        ],
+                    )
+                    .unwrap()
+            } else {
+                self.b
+                    .image_sample_explicit_lod(
+                        self.vec4_t,
+                        None,
+                        sampled_image,
+                        coords,
+                        ImageOperands::GRAD,
+                        [Operand::IdRef(dpdx), Operand::IdRef(dpdy)],
+                    )
+                    .unwrap()
+            };
+        }
 
         if implicit_lod && matches!(self.stage, Stage::Fragment) && self.fragment_debug_active {
             if let Some(forced_lod) = self.force_sample_lod {
@@ -5505,6 +5538,30 @@ impl Emitter {
                 data_type,
                 ..
             } => Some(self.lower_compute_image_atomic(inst, *handle, x, value, *op, *data_type)),
+            IrOp::TextureGradients {
+                sample_site,
+                dpdx,
+                dpdy,
+            } => {
+                let dpdx_u = self.lower_value(&dpdx.0);
+                let dpdx_v = self.lower_value(&dpdx.1);
+                let dpdx = self
+                    .b
+                    .composite_construct(self.vec2_t, None, [dpdx_u, dpdx_v])
+                    .unwrap();
+                let dpdy_u = self.lower_value(&dpdy.0);
+                let dpdy_v = self.lower_value(&dpdy.1);
+                let dpdy = self
+                    .b
+                    .composite_construct(self.vec2_t, None, [dpdy_u, dpdy_v])
+                    .unwrap();
+                let previous = self.texture_gradients.insert(*sample_site, (dpdx, dpdy));
+                debug_assert!(
+                    previous.is_none(),
+                    "texture gradients emitted more than once"
+                );
+                None
+            }
             IrOp::SampleTex {
                 sample_site,
                 tex_id,
@@ -5541,6 +5598,10 @@ impl Emitter {
                 let lod_bias = lod_bias.as_ref().map(|bias| self.lower_value(bias));
                 let explicit_lod = explicit_lod.as_ref().map(|lod| self.lower_value(lod));
                 let dref = dref.as_ref().map(|reference| self.lower_value(reference));
+                let gradients = sample_site
+                    .as_ref()
+                    .and_then(|site| self.texture_gradients.get(site))
+                    .copied();
                 let texel_offset = texel_offset.as_ref().map(|(x, y)| {
                     let immediate_bits = |value: &IrValue| match value {
                         IrValue::Zero => Some(0),
@@ -5649,6 +5710,7 @@ impl Emitter {
                             lod_bias,
                             explicit_lod,
                             texel_offset,
+                            gradients,
                         )
                     };
                     if matches!(self.stage, Stage::Fragment)
@@ -5745,6 +5807,7 @@ impl Emitter {
                             lod_bias,
                             explicit_lod,
                             texel_offset,
+                            gradients,
                         )
                     };
                     if matches!(self.stage, Stage::Fragment)
@@ -5887,6 +5950,7 @@ impl Emitter {
                         lod_bias,
                         explicit_lod,
                         texel_offset,
+                        gradients,
                     )
                 };
                 if matches!(self.stage, Stage::Fragment)
@@ -7882,6 +7946,7 @@ impl Emitter {
             }
             self.current_block = Some(block.id);
             self.texture_sample_sites.clear();
+            self.texture_gradients.clear();
             self.restore_pred_regs(cfg, &predecessors, block);
             self.lower_pred_phis(block);
             self.lower_phis(block);
@@ -15819,6 +15884,63 @@ mod tests {
                     instruction.class.opcode == rspirv::spirv::Op::ImageSampleExplicitLod
                 })
             })
+        }));
+    }
+
+    #[test]
+    fn captured_direct_2d_txd_emits_grad_operands_once() {
+        let bytes = build_test_program(&[0xde38_0081_a047_0e0cu64, enc_exit()]);
+        let cfg = nexium_shader::build_fragment_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+        assert_eq!(nexium_shader::texture_ids(&cfg), vec![8]);
+        let words = emit_fragment(&cfg);
+        assert!(validate_structured_cfg(&words).is_ok());
+        validates_with_naga(&words);
+        validates_with_spirv_val_if_available(&words);
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        let samples = instructions
+            .iter()
+            .copied()
+            .filter(|instruction| {
+                instruction.class.opcode == rspirv::spirv::Op::ImageSampleExplicitLod
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(
+            samples[0].operands.get(2),
+            Some(&Operand::ImageOperands(rspirv::spirv::ImageOperands::GRAD))
+        );
+        let [Some(Operand::IdRef(dpdx)), Some(Operand::IdRef(dpdy))] =
+            [samples[0].operands.get(3), samples[0].operands.get(4)]
+        else {
+            panic!("gradient operands must be ids");
+        };
+        for gradient in [dpdx, dpdy] {
+            assert!(instructions.iter().any(|instruction| {
+                instruction.result_id == Some(*gradient)
+                    && instruction.class.opcode == rspirv::spirv::Op::CompositeConstruct
+                    && instruction.operands.len() == 2
+            }));
+        }
+        let sample_id = samples[0].result_id.expect("sample result");
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::CompositeExtract
+                        && instruction.operands.first() == Some(&Operand::IdRef(sample_id))
+                })
+                .count(),
+            2
+        );
+        assert!(!instructions.iter().any(|instruction| {
+            instruction.class.opcode == rspirv::spirv::Op::ImageSampleImplicitLod
         }));
     }
 

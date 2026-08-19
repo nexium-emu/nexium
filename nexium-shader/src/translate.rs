@@ -2968,6 +2968,85 @@ impl Translator {
                 }
             }
 
+            Opcode::TXD => {
+                let aoffi = ((raw >> 35) & 1) != 0;
+                let lc = ((raw >> 50) & 1) != 0;
+                let sparse_pred = ((raw >> 51) & 0x7) as u8;
+                let tex_type = ((raw >> 28) & 0x7) as u8;
+                let mask = ((raw >> 31) & 0xf) as u8;
+                if self.stage != ShaderStage::Fragment
+                    || aoffi
+                    || lc
+                    || sparse_pred != PT
+                    || tex_type != 2
+                    || mask == 0
+                {
+                    log::debug!(
+                        "TXD unsupported form raw={:#018x} stage={:?} type={} mask={:#x} aoffi={} lc={} sparse_pred={}",
+                        raw,
+                        self.stage,
+                        tex_type,
+                        mask,
+                        aoffi,
+                        lc,
+                        sparse_pred,
+                    );
+                    self.program.emit_void(Op::Unimplemented {
+                        opcode: Opcode::TXD,
+                        raw,
+                    });
+                    self.unimplemented_count += 1;
+                    return false;
+                }
+
+                let coord = reg_a(raw);
+                let derivative = reg_b(raw);
+                let u = self.read_reg(coord);
+                let v = self.read_reg(coord.wrapping_add(1));
+                let dpdx = (
+                    self.read_reg(derivative),
+                    self.read_reg(derivative.wrapping_add(2)),
+                );
+                let dpdy = (
+                    self.read_reg(derivative.wrapping_add(1)),
+                    self.read_reg(derivative.wrapping_add(3)),
+                );
+                let sample_site = self.program.next_value_id();
+                self.program.emit_void(Op::TextureGradients {
+                    sample_site,
+                    dpdx,
+                    dpdy,
+                });
+
+                let tex_id = texs_tex_id(raw);
+                let mut dst = reg_dest(raw);
+                for component in 0..4u8 {
+                    if (mask >> component) & 1 == 0 {
+                        continue;
+                    }
+                    self.write_reg(
+                        dst,
+                        Op::SampleTex {
+                            sample_site: Some(sample_site),
+                            tex_id,
+                            u,
+                            v,
+                            array: None,
+                            volume: None,
+                            cube: None,
+                            implicit_lod: false,
+                            lod_bias: None,
+                            explicit_lod: None,
+                            texel_offset: None,
+                            dref: None,
+                            component,
+                        },
+                        pred,
+                    );
+                    dst = dst.wrapping_add(1);
+                }
+            }
+
             Opcode::TLD | Opcode::TLD_b => {
                 let bindless = decoded.opcode == Opcode::TLD_b;
                 let lod = ((raw >> 55) & 1) != 0;
@@ -6226,6 +6305,116 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn captured_direct_2d_txd_preserves_interleaved_gradients() {
+        let raw = 0xde38_0081_a047_0e0cu64;
+        assert_eq!(decode_one(raw).unwrap().opcode, Opcode::TXD);
+        let mut translator = Translator::new_fragment();
+        assert!(translator.translate(raw));
+        assert_eq!(translator.unimplemented_count, 0);
+        assert!(matches!(
+            translator.program.instructions.as_slice(),
+            [
+                Inst {
+                    op: Op::TextureGradients {
+                        sample_site: 0,
+                        dpdx: (Value::GprIn(4), Value::GprIn(6)),
+                        dpdy: (Value::GprIn(5), Value::GprIn(7)),
+                    },
+                    result: None,
+                    dest_reg: None,
+                    pred: None,
+                },
+                Inst {
+                    op: Op::SampleTex {
+                        sample_site: Some(0),
+                        tex_id: 8,
+                        u: Value::GprIn(14),
+                        v: Value::GprIn(15),
+                        array: None,
+                        volume: None,
+                        cube: None,
+                        implicit_lod: false,
+                        lod_bias: None,
+                        explicit_lod: None,
+                        texel_offset: None,
+                        dref: None,
+                        component: 0,
+                    },
+                    dest_reg: Some(12),
+                    ..
+                },
+                Inst {
+                    op: Op::SampleTex {
+                        sample_site: Some(0),
+                        tex_id: 8,
+                        component: 1,
+                        ..
+                    },
+                    dest_reg: Some(13),
+                    ..
+                },
+            ]
+        ));
+    }
+
+    #[test]
+    fn all_captured_direct_2d_txd_instructions_translate() {
+        for raw in [
+            0xde38_0081_a047_0e0c,
+            0xde38_0081_a047_0a08,
+            0xde38_0081_a040_0e08,
+            0xde38_0081_a041_0a00,
+            0xde38_0081_a041_0e08,
+            0xde38_0081_a040_0a00,
+            0xde38_0081_a041_0e00,
+            0xde38_0081_a040_0a08,
+        ] {
+            assert_eq!(decode_one(raw).unwrap().opcode, Opcode::TXD);
+            let mut translator = Translator::new_fragment();
+            assert!(translator.translate(raw), "raw={raw:#018x}");
+            assert_eq!(translator.unimplemented_count, 0, "raw={raw:#018x}");
+        }
+    }
+
+    #[test]
+    fn unhandled_txd_modes_fail_closed() {
+        let captured = 0xde38_0081_a047_0e0cu64;
+        let unsupported = [
+            captured | (1u64 << 35),
+            captured | (1u64 << 50),
+            captured & !(7u64 << 51),
+            (captured & !(7u64 << 28)) | (3u64 << 28),
+            captured & !(0xfu64 << 31),
+        ];
+        for raw in unsupported {
+            assert_eq!(decode_one(raw).unwrap().opcode, Opcode::TXD);
+            let mut translator = Translator::new_fragment();
+            assert!(!translator.translate(raw), "raw={raw:#018x}");
+            assert_eq!(translator.unimplemented_count, 1, "raw={raw:#018x}");
+            assert!(matches!(
+                translator.program.instructions.last(),
+                Some(Inst {
+                    op: Op::Unimplemented {
+                        opcode: Opcode::TXD,
+                        raw: rejected,
+                    },
+                    ..
+                }) if *rejected == raw
+            ));
+        }
+
+        let mut compute = Translator::new_compute();
+        assert!(!compute.translate(captured));
+        assert_eq!(compute.unimplemented_count, 1);
+
+        let bindless = captured | (1u64 << 54);
+        assert_eq!(decode_one(bindless).unwrap().opcode, Opcode::TXD_b);
+        let mut translator = Translator::new_fragment();
+        assert!(!translator.translate(bindless));
+        assert_eq!(translator.unimplemented_count, 1);
     }
 
     #[test]

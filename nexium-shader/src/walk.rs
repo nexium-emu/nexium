@@ -72,12 +72,12 @@ pub fn extract_fs_tex_ids(code: &[u8], bindless_slot: u8) -> Vec<FsTexId> {
                 push(FsTexId::ImmediateTic(idx), &mut out);
             }
 
-            Opcode::TEX | Opcode::TLD | Opcode::TLD4 | Opcode::TXQ => {
+            Opcode::TEX | Opcode::TLD | Opcode::TLD4 | Opcode::TXQ | Opcode::TXD => {
                 let idx = texs_tex_id(raw);
                 push(FsTexId::ImmediateTic(idx), &mut out);
             }
 
-            Opcode::TEX_b | Opcode::TLD_b | Opcode::TLD4_b | Opcode::TXQ_b => {}
+            Opcode::TEX_b | Opcode::TLD_b | Opcode::TLD4_b | Opcode::TXQ_b | Opcode::TXD_b => {}
 
             Opcode::LDC => {
                 let r = ldc_ref(raw);
@@ -133,6 +133,16 @@ mod tests {
         let segmented = make_ldc(0x14, 15) | (2 << 44);
         let code = make_group(segmented, 0, 0);
         assert!(extract_fs_tex_ids(&code, 15).is_empty());
+    }
+
+    #[test]
+    fn direct_txd_contributes_its_immediate_texture_id() {
+        let direct = 0xde38_0081_a047_0e0cu64;
+        let code = make_group(direct, direct | (1u64 << 54), 0);
+        assert_eq!(
+            extract_fs_tex_ids(&code, 15),
+            vec![FsTexId::ImmediateTic(8)]
+        );
     }
 
     #[test]
