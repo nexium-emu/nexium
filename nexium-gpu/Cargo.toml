@@ -12,7 +12,7 @@ nexium-spirv.workspace = true
 ash = "0.38"
 parking_lot = "0.12"
 log = "0.4"
-thiserror = "1"
+thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 texture2ddecoder = "0.1"
