@@ -35,7 +35,7 @@ chrono.workspace = true
 # runs on wgpu (see NativeOptions.renderer) so the NVIDIA OpenGL ICD
 # (nvoglv64.dll) is never loaded — it was crashing alongside the guest's Vulkan
 # renderer. glow stays compiled as a fallback selectable via the renderer field.
-eframe = { version = "0.29", features = ["wgpu"] }
+eframe = { version = "0.36", features = ["wgpu"] }
 egui = "0.29"
 winit = "0.30"
 rfd = "0.15"
