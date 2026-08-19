@@ -25,6 +25,8 @@ Discord: https://discord.gg/qx97vK5tq7
 
 NeXium ships no Nintendo code, firmware, or keys, and it never will. Bring your own dumps from hardware you own. It's for homebrew and for software you're allowed to run.
 
+Official release archives bundle the FFmpeg command-line program under the GNU LGPL v2.1 or later. FFmpeg remains separately licensed from NeXium. Its exact unmodified source, upstream signature, license, and build configuration are included under `licenses/FFmpeg` in each archive. See `THIRD_PARTY_NOTICES.txt` for details.
+
 ## Status
 
 Work in progress and rough. Homebrew is the main focus right now; commercial titles are hit and miss. Expect crashes.
@@ -52,6 +54,8 @@ cargo run --release -p nexium-gui --no-default-features --features backend-rusta
 ```
 
 Drop the `--no-default-features --features backend-rustarmic` flags to build both CPU backends (that also compiles the C++ Dynarmic JIT). Run with no path to open the UI.
+
+Video playback in source builds uses `ffmpeg` from beside the NeXium executable or from `PATH`. Set `NEXIUM_FFMPEG` to select another executable, or `NEXIUM_VIDEO_FFMPEG=0` to disable it. Official release archives already include the required minimal FFmpeg build.
 
 ## Layout
 

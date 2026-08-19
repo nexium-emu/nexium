@@ -10,6 +10,9 @@ env:
   CARGO_TERM_COLOR: always
   RUSTARMIC_URL: https://github.com/nexium-emu/rustarmic.git
   RUSTARMIC_REF: main
+  FFMPEG_VERSION: 9.0.1
+  FFMPEG_SOURCE_SHA256: cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635
+  FFMPEG_SIGNING_FINGERPRINT: FCF986EA15E6E293A5644F10B4322F04D67658D8
 
 jobs:
   build:
@@ -56,7 +59,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config \
+            build-essential cmake gnupg nasm ninja-build pkg-config xz-utils \
             libgtk-3-dev libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libibus-1.0-dev \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev \
             libxss-dev libxtst-dev libxinerama-dev libxkbcommon-dev \
@@ -67,7 +70,7 @@ jobs:
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
         run: |
-          brew install cmake ninja
+          brew install cmake gnupg nasm ninja
           RT="$(find "$(dirname "$(xcrun --find clang)")/../lib/clang" -name libclang_rt.osx.a 2>/dev/null | head -1)"
           if [ -n "$RT" ]; then
             echo "Linking clang_rt from: $RT"
@@ -89,6 +92,31 @@ jobs:
           BOOST_ROOT: ${{ steps.boost.outputs.BOOST_ROOT }}
         run: cargo build --release -p nexium-gui --bin nexium ${{ matrix.cargo_flags }}
 
+      - name: Configure MSVC for FFmpeg
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install FFmpeg build tools (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          path-type: inherit
+          update: true
+          install: diffutils gnupg make nasm perl
+
+      - name: Build bundled FFmpeg (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash .github/scripts/build-ffmpeg.sh
+
+      - name: Build bundled FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: bash .github/scripts/build-ffmpeg.sh
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -96,6 +124,16 @@ jobs:
           mkdir -p dist/NeXium
           cp target/release/nexium dist/NeXium/
           cp LICENSE README.md dist/NeXium/
+          cp -a target/ffmpeg-dist/. dist/NeXium/
+          test -x dist/NeXium/ffmpeg
+          test -f dist/NeXium/THIRD_PARTY_NOTICES.txt
+          test -f dist/NeXium/licenses/FFmpeg/LICENSE.md
+          test -f dist/NeXium/licenses/FFmpeg/COPYING.LGPLv2.1
+          test -f dist/NeXium/licenses/FFmpeg/BUILD.txt
+          test -f dist/NeXium/licenses/FFmpeg/ffmpeg-${FFMPEG_VERSION}.tar.xz
+          test -f dist/NeXium/licenses/FFmpeg/ffmpeg-${FFMPEG_VERSION}.tar.xz.asc
+          test -f dist/NeXium/licenses/FFmpeg/ffmpeg-devel.asc
+          test -f dist/NeXium/licenses/FFmpeg/CHANGES.diff
           tar -C dist -czf "dist/nexium-${{ matrix.asset }}.tar.gz" NeXium
 
       - name: Package (Windows)
@@ -105,6 +143,23 @@ jobs:
           New-Item -ItemType Directory -Force dist/NeXium | Out-Null
           Copy-Item target/release/nexium.exe dist/NeXium/
           Copy-Item LICENSE, README.md dist/NeXium/
+          Copy-Item target/ffmpeg-dist/* dist/NeXium/ -Recurse
+          $required = @(
+            'dist/NeXium/ffmpeg.exe',
+            'dist/NeXium/THIRD_PARTY_NOTICES.txt',
+            "dist/NeXium/licenses/FFmpeg/ffmpeg-$env:FFMPEG_VERSION.tar.xz",
+            "dist/NeXium/licenses/FFmpeg/ffmpeg-$env:FFMPEG_VERSION.tar.xz.asc",
+            'dist/NeXium/licenses/FFmpeg/ffmpeg-devel.asc',
+            'dist/NeXium/licenses/FFmpeg/LICENSE.md',
+            'dist/NeXium/licenses/FFmpeg/COPYING.LGPLv2.1',
+            'dist/NeXium/licenses/FFmpeg/BUILD.txt',
+            'dist/NeXium/licenses/FFmpeg/CHANGES.diff'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Missing packaged FFmpeg file: $path"
+            }
+          }
           Compress-Archive -Path dist/NeXium/* -DestinationPath "dist/nexium-${{ matrix.asset }}.zip"
 
       - name: Upload artifact
@@ -153,6 +208,8 @@ jobs:
             - macOS (Apple Silicon): `nexium-macos-arm64.tar.gz`
 
             > Pre-release / experimental. NeXium is an x86_64-host emulator; the macOS build is the rustarmic backend compiled for Apple Silicon and is provided as a build artifact only (it will not run on Apple Silicon).
+
+            NeXium archives bundle the FFmpeg command-line program under the GNU LGPL v2.1 or later. The corresponding unmodified source, license, signature, and build configuration are included in each archive under `licenses/FFmpeg`.
           files: artifacts/**/*
 
       - name: Notify Discord (#early-access)

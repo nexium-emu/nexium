@@ -1,0 +1,23 @@
+Third-Party Notices
+===================
+
+FFmpeg
+------
+
+Official NeXium distributions include the FFmpeg command-line program,
+version 9.0.1. FFmpeg is copyright the FFmpeg developers and is licensed
+under the GNU Lesser General Public License version 2.1 or later.
+
+FFmpeg is a separately licensed program. The NeXium MIT license does not
+replace or alter FFmpeg's license terms.
+
+NeXium builds FFmpeg from the unmodified official source without GPL or
+nonfree components and without external codec libraries. The corresponding
+source archive, upstream signature, complete license text, empty changes file,
+release signing key, and exact build configuration are included under
+licenses/FFmpeg in every
+distribution that contains FFmpeg.
+
+Project: https://ffmpeg.org/
+Source: https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz
+Build recipe: https://github.com/nexium-emu/nexium/blob/main/.github/scripts/build-ffmpeg.sh
