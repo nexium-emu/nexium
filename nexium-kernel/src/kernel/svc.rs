@@ -992,6 +992,290 @@ pub fn dispatch(kernel: &mut Kernel, imm: u16) -> u32 {
     __svc_res
 }
 
+const GUEST_PROBE_SVC_INSN: u32 = 0xD400_0FE1;
+const METROID_DREAD_TITLE_ID: u64 = 0x0100_9380_1237_C000;
+const DREAD_RESOURCE_ALLOC_RETURN_PC: u64 = 0x081B_688C;
+const DREAD_RESOURCE_ALLOC_RETURN_SIGNATURE: [u8; 16] = [
+    0xF6, 0x03, 0x00, 0xAA, 0x80, 0x2E, 0x40, 0xF9, 0x96, 0x42, 0x00, 0xF9, 0x08, 0x00, 0x40, 0xF9,
+];
+const DREAD_COMPAT_ALLOCATION_BASE: u64 = 0x70_0000_0000;
+const DREAD_COMPAT_ALLOCATION_LIMIT: u64 = DREAD_COMPAT_ALLOCATION_BASE + 512 * 1024 * 1024;
+const MAX_DREAD_COMPAT_ALLOCATION: u64 = 64 * 1024 * 1024;
+const COMPAT_PAGE_SIZE: u64 = 0x1000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompatibilityGuestProbePatch {
+    pc: u64,
+    signature: &'static [u8],
+    name: &'static str,
+}
+
+fn compatibility_guest_probe_patch(title_id: u64) -> Option<CompatibilityGuestProbePatch> {
+    (title_id == METROID_DREAD_TITLE_ID).then_some(CompatibilityGuestProbePatch {
+        pc: DREAD_RESOURCE_ALLOC_RETURN_PC,
+        signature: &DREAD_RESOURCE_ALLOC_RETURN_SIGNATURE,
+        name: "Metroid Dread 1.0.0 resource allocation fallback",
+    })
+}
+
+pub(crate) fn install_compatibility_guest_probes(
+    address_space: &nexium_memory::AddressSpace,
+    title_id: u64,
+) -> bool {
+    let Some(patch) = compatibility_guest_probe_patch(title_id) else {
+        return false;
+    };
+    let mut actual = vec![0u8; patch.signature.len()];
+    if let Err(error) = address_space.read(patch.pc, &mut actual) {
+        log::warn!(
+            "[compat] skipped {}: could not read pc={:#x}: {error:?}",
+            patch.name,
+            patch.pc
+        );
+        return false;
+    }
+    if actual != patch.signature {
+        log::warn!(
+            "[compat] skipped {}: signature mismatch at pc={:#x}",
+            patch.name,
+            patch.pc
+        );
+        return false;
+    }
+    match address_space.write(patch.pc, &GUEST_PROBE_SVC_INSN.to_le_bytes()) {
+        Ok(()) => {
+            log::info!("[compat] enabled {}", patch.name);
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "[compat] skipped {}: could not patch pc={:#x}: {error:?}",
+                patch.name,
+                patch.pc
+            );
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedGuestProbeAction {
+    kind: &'static str,
+    arg: u64,
+    log_hits: bool,
+}
+
+fn resolve_guest_probe_action(
+    title_id: u64,
+    compatibility_enabled: bool,
+    pc: u64,
+) -> Option<ResolvedGuestProbeAction> {
+    if compatibility_enabled
+        && title_id == METROID_DREAD_TITLE_ID
+        && pc == DREAD_RESOURCE_ALLOC_RETURN_PC
+    {
+        return Some(ResolvedGuestProbeAction {
+            kind: "dread_allocret",
+            arg: DREAD_COMPAT_ALLOCATION_BASE,
+            log_hits: false,
+        });
+    }
+    if let Some((kind, arg)) = guest_probe_actions().get(&pc) {
+        return Some(ResolvedGuestProbeAction {
+            kind: kind.as_str(),
+            arg: *arg,
+            log_hits: true,
+        });
+    }
+    None
+}
+
+fn resolve_guest_probe_at(
+    title_id: u64,
+    compatibility_enabled: bool,
+    pc_now: u64,
+) -> Option<(u64, ResolvedGuestProbeAction)> {
+    let previous = pc_now.wrapping_sub(4);
+    if let Some(action) = resolve_guest_probe_action(title_id, compatibility_enabled, previous) {
+        Some((previous, action))
+    } else {
+        resolve_guest_probe_action(title_id, compatibility_enabled, pc_now)
+            .map(|action| (pc_now, action))
+    }
+}
+
+fn plan_dread_compat_allocation(
+    address_space: &nexium_memory::AddressSpace,
+    cursor: u64,
+    requested: u64,
+) -> Option<(u64, u64, u64)> {
+    if requested == 0 || requested > MAX_DREAD_COMPAT_ALLOCATION {
+        return None;
+    }
+    let map_len = requested.checked_add(COMPAT_PAGE_SIZE - 1)? & !(COMPAT_PAGE_SIZE - 1);
+    let current = if cursor == 0 {
+        DREAD_COMPAT_ALLOCATION_BASE
+    } else {
+        cursor.max(DREAD_COMPAT_ALLOCATION_BASE)
+    };
+    let search_start = current.checked_add(COMPAT_PAGE_SIZE - 1)? & !(COMPAT_PAGE_SIZE - 1);
+    let search_len = DREAD_COMPAT_ALLOCATION_LIMIT.checked_sub(search_start)?;
+    if search_len == 0 {
+        return None;
+    }
+    address_space
+        .unmapped_gaps(search_start, search_len)
+        .ok()?
+        .into_iter()
+        .find_map(|(gap_start, gap_end)| {
+            let allocation = gap_start.checked_add(COMPAT_PAGE_SIZE - 1)? & !(COMPAT_PAGE_SIZE - 1);
+            let end = allocation.checked_add(map_len)?;
+            (end <= gap_end && end <= DREAD_COMPAT_ALLOCATION_LIMIT)
+                .then_some((allocation, map_len, end))
+        })
+}
+
+#[cfg(test)]
+mod metroid_dread_compatibility_tests {
+    use super::{
+        compatibility_guest_probe_patch, install_compatibility_guest_probes,
+        plan_dread_compat_allocation, resolve_guest_probe_at, COMPAT_PAGE_SIZE,
+        DREAD_COMPAT_ALLOCATION_BASE, DREAD_COMPAT_ALLOCATION_LIMIT,
+        DREAD_RESOURCE_ALLOC_RETURN_PC, DREAD_RESOURCE_ALLOC_RETURN_SIGNATURE,
+        GUEST_PROBE_SVC_INSN, MAX_DREAD_COMPAT_ALLOCATION, METROID_DREAD_TITLE_ID,
+    };
+    use nexium_memory::{AddressSpace, Perm};
+
+    fn mapped_signature() -> AddressSpace {
+        let address_space = AddressSpace::new();
+        let page = DREAD_RESOURCE_ALLOC_RETURN_PC & !(COMPAT_PAGE_SIZE - 1);
+        address_space
+            .map(page, COMPAT_PAGE_SIZE, Perm::RX, "dread_compat_test")
+            .unwrap();
+        address_space
+            .write(
+                DREAD_RESOURCE_ALLOC_RETURN_PC,
+                &DREAD_RESOURCE_ALLOC_RETURN_SIGNATURE,
+            )
+            .unwrap();
+        address_space
+    }
+
+    #[test]
+    fn patch_is_exact_title_and_signature_gated() {
+        assert!(compatibility_guest_probe_patch(METROID_DREAD_TITLE_ID).is_some());
+        assert!(compatibility_guest_probe_patch(METROID_DREAD_TITLE_ID + 1).is_none());
+
+        let address_space = mapped_signature();
+        assert!(!install_compatibility_guest_probes(
+            &address_space,
+            METROID_DREAD_TITLE_ID + 1
+        ));
+        let mut actual = [0u8; 16];
+        address_space
+            .read(DREAD_RESOURCE_ALLOC_RETURN_PC, &mut actual)
+            .unwrap();
+        assert_eq!(actual, DREAD_RESOURCE_ALLOC_RETURN_SIGNATURE);
+
+        address_space
+            .write(DREAD_RESOURCE_ALLOC_RETURN_PC + 4, &[0xFF])
+            .unwrap();
+        assert!(!install_compatibility_guest_probes(
+            &address_space,
+            METROID_DREAD_TITLE_ID
+        ));
+        address_space
+            .read(DREAD_RESOURCE_ALLOC_RETURN_PC, &mut actual)
+            .unwrap();
+        assert_eq!(&actual[..4], &DREAD_RESOURCE_ALLOC_RETURN_SIGNATURE[..4]);
+
+        address_space
+            .write(
+                DREAD_RESOURCE_ALLOC_RETURN_PC,
+                &DREAD_RESOURCE_ALLOC_RETURN_SIGNATURE,
+            )
+            .unwrap();
+        assert!(install_compatibility_guest_probes(
+            &address_space,
+            METROID_DREAD_TITLE_ID
+        ));
+        address_space
+            .read(DREAD_RESOURCE_ALLOC_RETURN_PC, &mut actual)
+            .unwrap();
+        assert_eq!(&actual[..4], &GUEST_PROBE_SVC_INSN.to_le_bytes());
+        assert_eq!(&actual[4..], &DREAD_RESOURCE_ALLOC_RETURN_SIGNATURE[4..]);
+    }
+
+    #[test]
+    fn fallback_reservations_are_aligned_bounded_and_skip_collisions() {
+        assert!(DREAD_COMPAT_ALLOCATION_LIMIT <= (1u64 << 39));
+        let address_space = AddressSpace::new();
+        assert_eq!(
+            plan_dread_compat_allocation(&address_space, 0, 0x4002CD),
+            Some((
+                DREAD_COMPAT_ALLOCATION_BASE,
+                0x401000,
+                DREAD_COMPAT_ALLOCATION_BASE + 0x401000
+            ))
+        );
+        address_space
+            .map(
+                DREAD_COMPAT_ALLOCATION_BASE,
+                0x2000,
+                Perm::RW,
+                "occupied_compat_test",
+            )
+            .unwrap();
+        assert_eq!(
+            plan_dread_compat_allocation(&address_space, 0, 1),
+            Some((
+                DREAD_COMPAT_ALLOCATION_BASE + 0x2000,
+                0x1000,
+                DREAD_COMPAT_ALLOCATION_BASE + 0x3000
+            ))
+        );
+
+        assert_eq!(plan_dread_compat_allocation(&address_space, 0, 0), None);
+        assert!(plan_dread_compat_allocation(
+            &address_space,
+            DREAD_COMPAT_ALLOCATION_BASE + 0x2000,
+            MAX_DREAD_COMPAT_ALLOCATION,
+        )
+        .is_some());
+        assert_eq!(
+            plan_dread_compat_allocation(&address_space, 0, MAX_DREAD_COMPAT_ALLOCATION + 1,),
+            None
+        );
+        assert_eq!(
+            plan_dread_compat_allocation(
+                &address_space,
+                DREAD_COMPAT_ALLOCATION_LIMIT - COMPAT_PAGE_SIZE,
+                COMPAT_PAGE_SIZE * 2,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn built_in_probe_resolves_both_backend_pc_forms_only_when_enabled() {
+        assert!(resolve_guest_probe_at(
+            METROID_DREAD_TITLE_ID,
+            false,
+            DREAD_RESOURCE_ALLOC_RETURN_PC + 4,
+        )
+        .is_none());
+        for pc in [
+            DREAD_RESOURCE_ALLOC_RETURN_PC,
+            DREAD_RESOURCE_ALLOC_RETURN_PC + 4,
+        ] {
+            let (probe_pc, action) =
+                resolve_guest_probe_at(METROID_DREAD_TITLE_ID, true, pc).unwrap();
+            assert_eq!(probe_pc, DREAD_RESOURCE_ALLOC_RETURN_PC);
+            assert_eq!(action.kind, "dread_allocret");
+        }
+    }
+}
+
 pub fn guest_probe_actions() -> &'static std::collections::HashMap<u64, (String, u64)> {
     use std::sync::OnceLock;
     static MAP: OnceLock<std::collections::HashMap<u64, (String, u64)>> = OnceLock::new();
@@ -1019,35 +1303,41 @@ fn svc_guest_probe(kernel: &mut Kernel) -> u32 {
         return 0;
     };
     let pc_now = cpu.get_pc();
-    let probe_pc = if guest_probe_actions().contains_key(&pc_now.wrapping_sub(4)) {
-        pc_now.wrapping_sub(4)
-    } else {
-        pc_now
-    };
-    let Some((kind, arg)) = guest_probe_actions().get(&probe_pc) else {
+    let Some((probe_pc, action)) = resolve_guest_probe_at(
+        kernel.title_id,
+        kernel.compatibility_guest_probe_enabled,
+        pc_now,
+    ) else {
         log::warn!("[guest-probe] svc 0x7f at pc={:#x} with no action", pc_now);
         return 0;
     };
+    if pc_now == probe_pc {
+        cpu.set_pc(probe_pc.wrapping_add(4));
+    }
+    let kind = action.kind;
+    let arg = action.arg;
     let lr = cpu.get_register(30);
     let sp = cpu.get_sp();
     let x0 = cpu.get_register(0);
     let x1 = cpu.get_register(1);
     let x2 = cpu.get_register(2);
     let x3 = cpu.get_register(3);
-    log::warn!(
-        "[guest-probe] hit pc={:#x} kind={} arg={:#x} lr={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} sp={:#x} thread={:?}",
-        probe_pc,
-        kind,
-        arg,
-        lr,
-        x0,
-        x1,
-        x2,
-        x3,
-        sp,
-        kernel.threads.current_handle()
-    );
-    if std::env::var_os("NEXIUM_GUEST_PROBE_DUMP").is_some() {
+    if action.log_hits {
+        log::warn!(
+            "[guest-probe] hit pc={:#x} kind={} arg={:#x} lr={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} sp={:#x} thread={:?}",
+            probe_pc,
+            kind,
+            arg,
+            lr,
+            x0,
+            x1,
+            x2,
+            x3,
+            sp,
+            kernel.threads.current_handle()
+        );
+    }
+    if action.log_hits && std::env::var_os("NEXIUM_GUEST_PROBE_DUMP").is_some() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static DUMPS: AtomicU64 = AtomicU64::new(0);
         let sequence = DUMPS.fetch_add(1, Ordering::Relaxed);
@@ -1066,17 +1356,101 @@ fn svc_guest_probe(kernel: &mut Kernel) -> u32 {
             }
         }
     }
-    match kind.as_str() {
+    match kind {
         "subsp" => {
-            cpu.set_sp(sp.wrapping_sub(*arg));
+            cpu.set_sp(sp.wrapping_sub(arg));
         }
         "stpfp" => {
-            let nsp = sp.wrapping_sub(*arg);
+            let nsp = sp.wrapping_sub(arg);
             let mut buf = [0u8; 16];
             buf[..8].copy_from_slice(&cpu.get_register(29).to_le_bytes());
             buf[8..].copy_from_slice(&lr.to_le_bytes());
             let _ = kernel.address_space.write(nsp, &buf);
             cpu.set_sp(nsp);
+        }
+        "dread_allocret" => {
+            if x0 != 0 {
+                cpu.set_register(22, x0);
+                return 0;
+            }
+
+            let owner = cpu.get_register(20);
+            let mut size_bytes = [0u8; 8];
+            let Some(size_address) = owner.checked_add(136).filter(|_| owner != 0) else {
+                log::warn!(
+                    "[compat] Metroid Dread allocation fallback rejected owner={:#x}",
+                    owner
+                );
+                cpu.set_register(22, 0);
+                return 0;
+            };
+            if kernel
+                .address_space
+                .read(size_address, &mut size_bytes)
+                .is_err()
+            {
+                log::warn!(
+                    "[compat] Metroid Dread allocation fallback could not read size from owner={:#x}",
+                    owner
+                );
+                cpu.set_register(22, 0);
+                return 0;
+            }
+            let requested = u64::from_le_bytes(size_bytes);
+            let Some((allocation, map_len, next)) = plan_dread_compat_allocation(
+                &kernel.address_space,
+                kernel.compatibility_allocation_next,
+                requested,
+            ) else {
+                log::warn!(
+                    "[compat] Metroid Dread allocation fallback rejected owner={:#x} requested={:#x}",
+                    owner,
+                    requested
+                );
+                cpu.set_register(22, 0);
+                return 0;
+            };
+
+            if let Err(error) = kernel.address_space.map(
+                allocation,
+                map_len,
+                nexium_memory::Perm::RW,
+                "metroid_dread_resource_fallback",
+            ) {
+                log::warn!(
+                    "[compat] Metroid Dread allocation mapping failed at {:#x}: {error:?}",
+                    allocation
+                );
+                cpu.set_register(22, 0);
+                return 0;
+            }
+            let Some(region) = kernel.address_space.host_region_at(allocation) else {
+                log::warn!("[compat] Metroid Dread allocation could not lease mapped region");
+                cpu.set_register(22, 0);
+                return 0;
+            };
+            if let Err(error) = unsafe {
+                cpu.map_host(
+                    region.base,
+                    region.size,
+                    region.perm,
+                    region.host_ptr as *mut u8,
+                )
+            } {
+                log::warn!("[compat] Metroid Dread allocation CPU mapping failed: {error}");
+                cpu.set_register(22, 0);
+                return 0;
+            }
+
+            kernel.compatibility_allocation_next = next;
+            log::warn!(
+                "[compat] Metroid Dread resource pool exhausted; supplied requested={:#x} at {:#x} (mapped={:#x})",
+                requested,
+                allocation,
+                map_len
+            );
+            cpu.set_register(0, allocation);
+            cpu.set_register(22, allocation);
         }
         other => {
             log::warn!("[guest-probe] unknown action kind {}", other);

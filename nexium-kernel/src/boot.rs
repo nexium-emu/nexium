@@ -326,6 +326,9 @@ impl BootContext {
             );
         }
 
+        let compatibility_guest_probe_enabled =
+            crate::kernel::svc::install_compatibility_guest_probes(&address_space, app.title_id);
+
         for (&pc, (kind, arg)) in crate::kernel::svc::guest_probe_actions() {
             let insn: u32 = 0xD400_0FE1;
             match address_space.write(pc, &insn.to_le_bytes()) {
@@ -378,6 +381,7 @@ impl BootContext {
             tls_base,
             tls_pool_base,
         );
+        kernel.compatibility_guest_probe_enabled = compatibility_guest_probe_enabled;
 
         let (romfs_mmap, romfs_range) = match &app.romfs {
             Some(r) => (Some(r.mmap.clone()), Some(r.range.clone())),

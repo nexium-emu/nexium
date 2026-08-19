@@ -120,6 +120,8 @@ pub struct Kernel {
     pub yield_after_svc: bool,
     pub preempt_after_svc: bool,
     pub present_pace_until: Option<std::time::Instant>,
+    pub(crate) compatibility_guest_probe_enabled: bool,
+    pub(crate) compatibility_allocation_next: u64,
 
     pub font_shmem: Option<Vec<u8>>,
     pub font_shmem_handle: Option<u32>,
@@ -354,6 +356,8 @@ impl Kernel {
             yield_after_svc: false,
             preempt_after_svc: false,
             present_pace_until: None,
+            compatibility_guest_probe_enabled: false,
+            compatibility_allocation_next: 0,
             font_shmem: None,
             font_shmem_handle: None,
             font_offsets: [(0, 0); 6],
