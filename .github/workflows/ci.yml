@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
   RUSTARMIC_URL: https://github.com/nexium-emu/rustarmic.git
   RUSTARMIC_REF: main
   FFMPEG_VERSION: 9.0.1
@@ -168,6 +169,7 @@ jobs:
           name: nexium-${{ matrix.asset }}
           path: dist/nexium-${{ matrix.asset }}.*
           if-no-files-found: error
+          retention-days: 1
 
   release:
     name: Pre-release
