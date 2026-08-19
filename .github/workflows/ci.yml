@@ -194,7 +194,7 @@ jobs:
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Publish pre-release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           repository: nexium-emu/nexium-nightly
           token: ${{ secrets.RELEASE_TOKEN }}
