@@ -33,7 +33,7 @@ log.workspace = true
 thiserror.workspace = true
 once_cell.workspace = true
 memmap2.workspace = true
-getrandom = "0.3"
+getrandom = "0.4"
 opusic-sys = "=0.7.5"
 
 sdl2.workspace = true
