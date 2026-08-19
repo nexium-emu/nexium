@@ -487,6 +487,7 @@ pub struct NvFile {
 
 pub struct NvmapHandle {
     pub id: u32,
+    pub user_refcount: u32,
     pub size: u32,
     pub address: u64,
     pub kind: u32,
@@ -2781,6 +2782,7 @@ impl Nvdrv {
                     id,
                     NvmapHandle {
                         id,
+                        user_refcount: 1,
                         size,
                         address: 0,
                         kind: 0,
@@ -2810,6 +2812,9 @@ impl Nvdrv {
                         req.in_data[2],
                         req.in_data[3],
                     ]);
+                    if let Some(handle) = self.nvmap_handles.get_mut(&id) {
+                        handle.user_refcount = handle.user_refcount.saturating_add(1);
+                    }
                     out[4..8].copy_from_slice(&id.to_le_bytes());
                     log::debug!("nvmap:FromId id={} → handle={}", id, id);
                 }
@@ -2859,12 +2864,29 @@ impl Nvdrv {
                         req.in_data[2],
                         req.in_data[3],
                     ]);
-                    let size = self.nvmap_handles.get(&handle).map(|h| h.size).unwrap_or(0);
-                    self.nvmap_handles.remove(&handle);
-                    out[8..16].copy_from_slice(&0u64.to_le_bytes());
+                    let final_reference = self
+                        .nvmap_handles
+                        .get(&handle)
+                        .is_some_and(|entry| entry.user_refcount <= 1);
+                    let (address, size, flags) = if final_reference {
+                        let removed = self.nvmap_handles.remove(&handle).unwrap();
+                        (removed.address, removed.size, 0u32)
+                    } else if let Some(entry) = self.nvmap_handles.get_mut(&handle) {
+                        entry.user_refcount -= 1;
+                        (0, entry.size, 1u32)
+                    } else {
+                        (0, 0, 0u32)
+                    };
+                    out[8..16].copy_from_slice(&address.to_le_bytes());
                     out[16..20].copy_from_slice(&size.to_le_bytes());
-                    out[20..24].copy_from_slice(&0u32.to_le_bytes());
-                    log::debug!("nvmap:Free handle={} size={}", handle, size);
+                    out[20..24].copy_from_slice(&flags.to_le_bytes());
+                    log::debug!(
+                        "nvmap:Free handle={} address={:#x} size={} flags={}",
+                        handle,
+                        address,
+                        size,
+                        flags
+                    );
                 }
             }
             0x0109 => {
@@ -4521,6 +4543,7 @@ mod tests {
     fn test_nvmap_handle(id: u32, size: u32, address: u64) -> NvmapHandle {
         NvmapHandle {
             id,
+            user_refcount: 1,
             size,
             address,
             kind: 0,
@@ -4528,6 +4551,77 @@ mod tests {
             channel_map_address: 0,
             channel_pin_count: 0,
         }
+    }
+
+    #[test]
+    fn nvmap_free_returns_backing_address_and_size() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvmap").unwrap();
+        let handle = 7;
+        let address = 0x10_44b6_6000;
+        let size = 0x15e000;
+        nvdrv
+            .nvmap_handles
+            .insert(handle, test_nvmap_handle(handle, size, address));
+        let mut input = vec![0u8; 24];
+        input[..4].copy_from_slice(&handle.to_le_bytes());
+
+        let freed = nvdrv.dispatch_ioctl(request(fd, 0xc018_0105, input, 24));
+
+        assert_eq!(freed.result, 0);
+        assert_eq!(
+            u64::from_le_bytes(freed.data[8..16].try_into().unwrap()),
+            address
+        );
+        assert_eq!(read_u32(&freed.data, 16), Some(size));
+        assert_eq!(read_u32(&freed.data, 20), Some(0));
+        assert!(!nvdrv.nvmap_handles.contains_key(&handle));
+    }
+
+    #[test]
+    fn nvmap_free_accepts_null_handle() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvmap").unwrap();
+        let freed = nvdrv.dispatch_ioctl(request(fd, 0xc018_0105, vec![0u8; 24], 24));
+
+        assert_eq!(freed.result, 0);
+        assert_eq!(freed.data, vec![0u8; 24]);
+    }
+
+    #[test]
+    fn nvmap_free_retains_from_id_reference_until_final_free() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvmap").unwrap();
+        let handle = 9;
+        let address = 0x10_6000_0000;
+        let size = 0x4000;
+        nvdrv
+            .nvmap_handles
+            .insert(handle, test_nvmap_handle(handle, size, address));
+        let mut from_id = vec![0u8; 8];
+        from_id[..4].copy_from_slice(&handle.to_le_bytes());
+        let duplicated = nvdrv.dispatch_ioctl(request(fd, 0xc008_0103, from_id, 8));
+        assert_eq!(read_u32(&duplicated.data, 4), Some(handle));
+
+        let mut input = vec![0u8; 24];
+        input[..4].copy_from_slice(&handle.to_le_bytes());
+        let retained = nvdrv.dispatch_ioctl(request(fd, 0xc018_0105, input.clone(), 24));
+        assert_eq!(
+            u64::from_le_bytes(retained.data[8..16].try_into().unwrap()),
+            0
+        );
+        assert_eq!(read_u32(&retained.data, 16), Some(size));
+        assert_eq!(read_u32(&retained.data, 20), Some(1));
+        assert_eq!(nvdrv.nvmap_handles[&handle].user_refcount, 1);
+
+        let freed = nvdrv.dispatch_ioctl(request(fd, 0xc018_0105, input, 24));
+        assert_eq!(
+            u64::from_le_bytes(freed.data[8..16].try_into().unwrap()),
+            address
+        );
+        assert_eq!(read_u32(&freed.data, 16), Some(size));
+        assert_eq!(read_u32(&freed.data, 20), Some(0));
+        assert!(!nvdrv.nvmap_handles.contains_key(&handle));
     }
 
     #[test]
