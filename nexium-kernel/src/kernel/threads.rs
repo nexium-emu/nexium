@@ -6,6 +6,8 @@ use std::time::Instant;
 
 pub const NUM_CORES: usize = 4;
 
+pub const HOS_PREEMPTION_PRIORITIES: [i32; NUM_CORES] = [59, 59, 59, 63];
+
 pub struct CoreWakers {
     condvars: [parking_lot::Condvar; NUM_CORES],
 }
@@ -138,6 +140,7 @@ pub struct Threads {
     pub tls_pool_base: u64,
     pub free_tls: Vec<u64>,
     pub last_switch: Instant,
+    per_core_last_switch: [Instant; NUM_CORES],
     pub wakers: Arc<CoreWakers>,
 }
 
@@ -167,6 +170,7 @@ impl Threads {
                 user_preemption_pending: false,
             },
         );
+        let now = Instant::now();
         Self {
             threads,
             current: {
@@ -180,13 +184,34 @@ impl Threads {
             tls_stride: 0x1000,
             tls_pool_base,
             free_tls: Vec::new(),
-            last_switch: Instant::now(),
+            last_switch: now,
+            per_core_last_switch: [now; NUM_CORES],
             wakers: CoreWakers::new(),
         }
     }
 
     pub fn timeslice_expired(&self, threshold: std::time::Duration) -> bool {
         !self.ready.is_empty() && self.last_switch.elapsed() >= threshold
+    }
+
+    pub fn hos_timeslice_expired(&self, threshold: std::time::Duration) -> bool {
+        self.hos_timeslice_expired_on_core(current_core(), threshold)
+    }
+
+    fn hos_timeslice_expired_on_core(&self, core: usize, threshold: std::time::Duration) -> bool {
+        let Some(Some(handle)) = self.current.get(core) else {
+            return false;
+        };
+        self.effective_priority(*handle) == HOS_PREEMPTION_PRIORITIES[core]
+            && self.has_ready_for_core(core as i32)
+            && self.per_core_last_switch[core].elapsed() >= threshold
+    }
+
+    fn record_switch(&mut self) {
+        let now = Instant::now();
+        let core = current_core();
+        self.last_switch = now;
+        self.per_core_last_switch[core] = now;
     }
 
     pub fn alloc_tls(&mut self) -> u64 {
@@ -689,6 +714,30 @@ impl Threads {
         })
     }
 
+    pub fn has_higher_priority_ready_for_core(&self, core: usize) -> bool {
+        let Some(current) = self.current.get(core).copied().flatten() else {
+            return false;
+        };
+        let current_priority = self.effective_priority(current);
+        self.ready.iter().any(|handle| {
+            self.threads.get(handle).is_some_and(|thread| {
+                (thread.core == core as i32 || thread.core < 0)
+                    && self.effective_priority(*handle) < current_priority
+            })
+        })
+    }
+
+    fn enqueue_ready(&mut self, handle: u32, front: bool) {
+        if self.ready.contains(&handle) {
+            return;
+        }
+        if front {
+            self.ready.push_front(handle);
+        } else {
+            self.ready.push_back(handle);
+        }
+    }
+
     pub fn yield_current(&mut self, cpu: &Cpu) {
         if self.current[current_core()].is_some() {
             self.save_current_ctx(cpu);
@@ -697,6 +746,23 @@ impl Threads {
     }
 
     pub fn yield_with_state(&mut self, cpu: &Cpu, new_state: ThreadState) -> Option<u32> {
+        self.yield_with_state_at_back(cpu, new_state)
+    }
+
+    pub fn preempt_current(&mut self, cpu: &Cpu) -> Option<u32> {
+        self.yield_with_state_position(cpu, ThreadState::Ready, true)
+    }
+
+    fn yield_with_state_at_back(&mut self, cpu: &Cpu, new_state: ThreadState) -> Option<u32> {
+        self.yield_with_state_position(cpu, new_state, false)
+    }
+
+    fn yield_with_state_position(
+        &mut self,
+        cpu: &Cpu,
+        new_state: ThreadState,
+        ready_front: bool,
+    ) -> Option<u32> {
         let h = self.current[current_core()]?;
         self.save_current_ctx(cpu);
         let became_ready = matches!(new_state, ThreadState::Ready);
@@ -707,11 +773,11 @@ impl Threads {
                 t.user_preemption_pending = false;
             }
         }
-        if became_ready && !self.ready.contains(&h) {
-            self.ready.push_back(h);
+        if became_ready {
+            self.enqueue_ready(h, ready_front);
         }
         self.current[current_core()] = None;
-        self.last_switch = Instant::now();
+        self.record_switch();
         Some(h)
     }
 
@@ -728,7 +794,7 @@ impl Threads {
             );
         }
         self.current[current_core()] = Some(handle);
-        self.last_switch = Instant::now();
+        self.record_switch();
     }
 
     pub fn earliest_wake(&self) -> Option<Instant> {
@@ -796,6 +862,7 @@ mod tests {
     use nexium_common::result::{
         KERNEL_INVALID_COMBINATION, KERNEL_INVALID_CORE_ID, KERNEL_INVALID_HANDLE,
     };
+    use std::time::{Duration, Instant};
 
     fn add_ready_thread(threads: &mut Threads, handle: u32, priority: i32) {
         threads.add_thread(handle, ThreadCtx::zero(), 0, 0, 0);
@@ -962,6 +1029,111 @@ mod tests {
         assert!(threads.take_current_user_preemption_pending());
         assert!(!threads.take_current_user_preemption_pending());
         assert!(!threads.current_user_preemption_pending());
+    }
+
+    #[test]
+    fn hos_timeslice_only_rotates_the_designated_priority_for_each_core() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_ready_thread(&mut threads, 0x200, 59);
+        threads.threads.get_mut(&0x200).unwrap().core = 0;
+        threads.per_core_last_switch[0] = Instant::now() - Duration::from_millis(20);
+
+        threads.threads.get_mut(&0x100).unwrap().priority = 44;
+        assert!(!threads.hos_timeslice_expired_on_core(0, Duration::from_millis(10)));
+
+        threads.threads.get_mut(&0x100).unwrap().priority = 63;
+        assert!(!threads.hos_timeslice_expired_on_core(0, Duration::from_millis(10)));
+
+        threads.threads.get_mut(&0x100).unwrap().priority = 59;
+        assert!(threads.hos_timeslice_expired_on_core(0, Duration::from_millis(10)));
+
+        threads.current[0] = None;
+        threads.current[3] = Some(0x100);
+        let current = threads.threads.get_mut(&0x100).unwrap();
+        current.core = 3;
+        current.priority = 59;
+        threads.threads.get_mut(&0x200).unwrap().core = 3;
+        threads.per_core_last_switch[3] = Instant::now() - Duration::from_millis(20);
+        assert!(!threads.hos_timeslice_expired_on_core(3, Duration::from_millis(10)));
+
+        threads.threads.get_mut(&0x100).unwrap().priority = 63;
+        assert!(threads.hos_timeslice_expired_on_core(3, Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn hos_timeslice_uses_a_per_core_clock_and_requires_ready_work() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        threads.threads.get_mut(&0x100).unwrap().priority = 59;
+        add_ready_thread(&mut threads, 0x200, 59);
+        threads.threads.get_mut(&0x200).unwrap().core = 0;
+
+        threads.per_core_last_switch[0] = Instant::now();
+        threads.per_core_last_switch[1] = Instant::now() - Duration::from_millis(20);
+        assert!(!threads.hos_timeslice_expired_on_core(0, Duration::from_millis(10)));
+
+        threads.per_core_last_switch[0] = Instant::now() - Duration::from_millis(20);
+        assert!(threads.hos_timeslice_expired_on_core(0, Duration::from_millis(10)));
+
+        threads.ready.clear();
+        assert!(!threads.hos_timeslice_expired_on_core(0, Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn higher_priority_ready_check_is_strict_and_core_local() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_ready_thread(&mut threads, 0x200, 44);
+        add_ready_thread(&mut threads, 0x201, 60);
+        assert!(!threads.has_higher_priority_ready_for_core(0));
+
+        add_ready_thread(&mut threads, 0x202, 30);
+        threads.threads.get_mut(&0x202).unwrap().core = 1;
+        assert!(!threads.has_higher_priority_ready_for_core(0));
+
+        threads.threads.get_mut(&0x202).unwrap().core = 0;
+        assert!(threads.has_higher_priority_ready_for_core(0));
+    }
+
+    #[test]
+    fn involuntary_preemption_compares_inherited_priority() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_ready_thread(&mut threads, 0x200, 30);
+        threads.add_thread(0x300, ThreadCtx::zero(), 0, 0, 0);
+        threads.threads.get_mut(&0x300).unwrap().priority = 20;
+        threads.transition_state(
+            0x300,
+            ThreadState::WaitingMutex {
+                mutex_addr: 0x1000,
+                owner_handle: 0x100,
+                tag: 0x300,
+            },
+        );
+        assert_eq!(threads.effective_priority(0x100), 20);
+        assert!(!threads.has_higher_priority_ready_for_core(0));
+
+        add_ready_thread(&mut threads, 0x201, 10);
+        assert!(threads.has_higher_priority_ready_for_core(0));
+    }
+
+    #[test]
+    fn involuntary_preemption_keeps_current_ahead_of_equal_priority_peers() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_ready_thread(&mut threads, 0x200, 44);
+        add_ready_thread(&mut threads, 0x300, 30);
+        threads.enqueue_ready(0x100, true);
+
+        assert_eq!(threads.pick_next(), Some(0x300));
+        assert_eq!(threads.pick_next(), Some(0x100));
+        assert_eq!(threads.pick_next(), Some(0x200));
+    }
+
+    #[test]
+    fn voluntary_yield_moves_current_behind_equal_priority_peers() {
+        let mut threads = Threads::new(0x100, 0, 0, 0);
+        add_ready_thread(&mut threads, 0x200, 44);
+        threads.enqueue_ready(0x100, false);
+
+        assert_eq!(threads.pick_next(), Some(0x200));
+        assert_eq!(threads.pick_next(), Some(0x100));
     }
 
     #[test]

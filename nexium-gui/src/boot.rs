@@ -45,6 +45,16 @@ fn core_park_enabled() -> bool {
     *VALUE.get_or_init(|| std::env::var("NEXIUM_CORE_PARK").ok().as_deref() != Some("0"))
 }
 
+fn hos_timeslice_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| std::env::var("NEXIUM_HOS_TIMESLICE").ok().as_deref() == Some("1"))
+}
+
+fn hos_preemption_order_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| std::env::var("NEXIUM_HOS_PREEMPT_ORDER").ok().as_deref() == Some("1"))
+}
+
 fn sync_host_region_changes(
     cpu: &mut nexium_core::cpu::Cpu,
     address_space: &nexium_memory::AddressSpace,
@@ -566,6 +576,16 @@ impl EmulationHandle {
                         .unwrap_or(nexium_core::kernel::threads::NUM_CORES)
                         .clamp(1, nexium_core::kernel::threads::NUM_CORES)
                 };
+                let hos_timeslice = hos_timeslice_enabled();
+                let hos_preemption_order = hos_preemption_order_enabled();
+                if hos_timeslice {
+                    log::info!(
+                        "scheduler: HOS timeslice experiment enabled (priorities [59,59,59,63], 10ms, per-core clocks)"
+                    );
+                }
+                if hos_preemption_order {
+                    log::info!("scheduler: HOS involuntary-preemption ordering experiment enabled");
+                }
                 if active_cores > 1 {
                     for core_id in 1..active_cores {
                         let kernel_aux = Arc::clone(&boot_ctx.kernel);
@@ -672,7 +692,9 @@ impl EmulationHandle {
                                             }
                                             let pace_until = k.present_pace_until.take();
                                             let ready_yield = k.yield_after_svc;
+                                            let preempt_yield = k.preempt_after_svc;
                                             k.yield_after_svc = false;
+                                            k.preempt_after_svc = false;
                                             match pace_until {
                                                 Some(wake_at)
                                                     if wake_at > std::time::Instant::now() =>
@@ -685,17 +707,40 @@ impl EmulationHandle {
                                                     );
                                                 }
                                                 Some(_) => {
-                                                    k.try_yield_current_ready(cpu_ref().unwrap());
+                                                    if hos_preemption_order && preempt_yield {
+                                                        k.try_preempt_current_ready(
+                                                            cpu_ref().unwrap(),
+                                                        );
+                                                    } else {
+                                                        k.try_yield_current_ready(
+                                                            cpu_ref().unwrap(),
+                                                        );
+                                                    }
                                                 }
                                                 None if ready_yield => {
-                                                    k.try_yield_current_ready(cpu_ref().unwrap());
+                                                    if hos_preemption_order && preempt_yield {
+                                                        k.try_preempt_current_ready(
+                                                            cpu_ref().unwrap(),
+                                                        );
+                                                    } else {
+                                                        k.try_yield_current_ready(
+                                                            cpu_ref().unwrap(),
+                                                        );
+                                                    }
                                                 }
                                                 _ => {}
                                             }
                                         }
                                         drop(k);
                                     }
-                                    if spin_yield_n != 0 {
+                                    if hos_timeslice {
+                                        let mut k = kernel_aux.lock();
+                                        if k.threads.hos_timeslice_expired(
+                                            std::time::Duration::from_millis(10),
+                                        ) {
+                                            k.try_yield_current_ready(cpu_ref().unwrap());
+                                        }
+                                    } else if spin_yield_n != 0 {
                                         slice_iters = slice_iters.saturating_add(1);
                                         if slice_iters >= spin_yield_n {
                                             slice_iters = 0;
@@ -1352,7 +1397,14 @@ impl EmulationHandle {
                         if no_svc_progress {
                             no_svc_in_spin = no_svc_in_spin.saturating_add(1);
                         }
-                        if no_svc_progress && no_svc_in_spin >= SPIN_PREEMPT_THRESHOLD {
+                        let legacy_spin_timeslice =
+                            no_svc_progress && no_svc_in_spin >= SPIN_PREEMPT_THRESHOLD;
+                        let hos_spin_timeslice = no_svc_progress
+                            && hos_timeslice
+                            && guard
+                                .threads
+                                .hos_timeslice_expired(std::time::Duration::from_millis(10));
+                        if legacy_spin_timeslice {
                             let hid = nexium_core::hid_state::get_hid_state();
                             let mut h = hid.lock();
                             if h.shmem_va.is_some() {
@@ -1360,6 +1412,16 @@ impl EmulationHandle {
                                 h.tick(cur);
                             }
                             drop(h);
+                            if hos_timeslice {
+                                no_svc_in_spin = 0;
+                            }
+                        }
+                        let spin_timeslice = if hos_timeslice {
+                            hos_spin_timeslice
+                        } else {
+                            legacy_spin_timeslice
+                        };
+                        if spin_timeslice {
                             let n_ready = guard.threads.ready.len();
                             let n_threads = guard.threads.threads.len();
                             if n_ready > 0 {
@@ -1616,14 +1678,22 @@ impl EmulationHandle {
                                 }
                             }
                             let pace_present = guard.present_pace_until.take();
-                            let timeslice = guard
-                                .threads
-                                .timeslice_expired(std::time::Duration::from_millis(4));
+                            let timeslice = if hos_timeslice {
+                                guard
+                                    .threads
+                                    .hos_timeslice_expired(std::time::Duration::from_millis(10))
+                            } else {
+                                guard
+                                    .threads
+                                    .timeslice_expired(std::time::Duration::from_millis(4))
+                            };
                             let should_yield =
                                 guard.yield_after_svc || timeslice || pace_present.is_some();
                             if should_yield {
                                 let reason = if pace_present.is_some() {
                                     "present-pace"
+                                } else if guard.preempt_after_svc && hos_preemption_order {
+                                    "preempt"
                                 } else if guard.yield_after_svc {
                                     "flag"
                                 } else {
@@ -1631,7 +1701,9 @@ impl EmulationHandle {
                                 };
                                 let from = guard.threads.current_handle();
                                 let ready_len = guard.threads.ready.len();
+                                let preempt_yield = guard.preempt_after_svc;
                                 guard.yield_after_svc = false;
+                                guard.preempt_after_svc = false;
                                 let did_yield = cpu_ref().is_some_and(|cpu| match pace_present {
                                     Some(wake_at) if wake_at > std::time::Instant::now() => guard
                                         .threads
@@ -1642,6 +1714,9 @@ impl EmulationHandle {
                                             },
                                         )
                                         .is_some(),
+                                    _ if hos_preemption_order && preempt_yield => {
+                                        guard.try_preempt_current_ready(cpu)
+                                    }
                                     _ => guard.try_yield_current_ready(cpu),
                                 });
                                 if did_yield && reason != "present-pace" {

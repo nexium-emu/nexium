@@ -2069,6 +2069,7 @@ pub(crate) fn nudge_preempt_for_wake(kernel: &mut Kernel, woken: u32) {
     }
     if kernel.threads.effective_priority(woken) < kernel.threads.effective_priority(current) {
         kernel.yield_after_svc = true;
+        kernel.preempt_after_svc = true;
     }
 }
 

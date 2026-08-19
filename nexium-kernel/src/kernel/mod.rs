@@ -118,6 +118,7 @@ pub struct Kernel {
     pub open_dir_lists: HashMap<(u32, u32), (Vec<(String, bool, u64)>, usize)>,
 
     pub yield_after_svc: bool,
+    pub preempt_after_svc: bool,
     pub present_pace_until: Option<std::time::Instant>,
 
     pub font_shmem: Option<Vec<u8>>,
@@ -351,6 +352,7 @@ impl Kernel {
             host_file_cache: HashMap::new(),
             open_dir_lists: HashMap::new(),
             yield_after_svc: false,
+            preempt_after_svc: false,
             present_pace_until: None,
             font_shmem: None,
             font_shmem_handle: None,
@@ -1297,6 +1299,16 @@ impl Kernel {
             .is_some()
     }
 
+    pub fn try_preempt_current_ready(&mut self, cpu: &Cpu) -> bool {
+        let core = cpu_local::current_core();
+        if !self.threads.has_higher_priority_ready_for_core(core)
+            || self.defer_user_preemption_if_disabled()
+        {
+            return false;
+        }
+        self.threads.preempt_current(cpu).is_some()
+    }
+
     pub(crate) fn synchronize_user_preemption_state(&mut self) {
         let tls_va = self.current_thread_tls_va();
         let was_pending = self.threads.take_current_user_preemption_pending();
@@ -1734,15 +1746,20 @@ mod user_preemption_tests {
             t.priority = 5;
         }
         kernel.yield_after_svc = false;
+        kernel.preempt_after_svc = false;
         svc::nudge_preempt_for_wake(&mut kernel, WOKEN);
         assert!(kernel.yield_after_svc);
+        assert!(kernel.preempt_after_svc);
 
         kernel.yield_after_svc = false;
+        kernel.preempt_after_svc = false;
         kernel.threads.threads.get_mut(&WOKEN).unwrap().priority = 60;
         svc::nudge_preempt_for_wake(&mut kernel, WOKEN);
         assert!(!kernel.yield_after_svc);
+        assert!(!kernel.preempt_after_svc);
 
         kernel.yield_after_svc = false;
+        kernel.preempt_after_svc = false;
         {
             let t = kernel.threads.threads.get_mut(&WOKEN).unwrap();
             t.priority = 5;
@@ -1750,6 +1767,7 @@ mod user_preemption_tests {
         }
         svc::nudge_preempt_for_wake(&mut kernel, WOKEN);
         assert!(!kernel.yield_after_svc);
+        assert!(!kernel.preempt_after_svc);
     }
 
     #[test]
