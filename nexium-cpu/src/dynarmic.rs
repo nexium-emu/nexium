@@ -160,14 +160,15 @@ impl DynarmicCpu {
                             log::warn!("[watch-write] cap reached, disarming");
                         }
                         nexium_memory::fastmem::watch_disarm();
-                        unsafe {
-                            let base = nexium_memory::fastmem::base().unwrap();
-                            let bytes = value.to_le_bytes();
-                            std::ptr::copy_nonoverlapping(
-                                bytes.as_ptr(),
-                                base.add(addr as usize),
-                                (size as usize).min(8),
-                            );
+                        if let Some(base) = nexium_memory::fastmem::base() {
+                            unsafe {
+                                let bytes = value.to_le_bytes();
+                                std::ptr::copy_nonoverlapping(
+                                    bytes.as_ptr(),
+                                    base.add(addr as usize),
+                                    (size as usize).min(8),
+                                );
+                            }
                         }
                         return true;
                     }
