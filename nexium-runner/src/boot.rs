@@ -1535,6 +1535,90 @@ impl EmulationHandle {
                                         "STUCK: CPU looping at PC {:#x} for 10M+ cycles, no SVCs",
                                         pc_before
                                     );
+                                    let mut word = [0u8; 4];
+                                    let _ = guard.address_space.read(pc_before, &mut word);
+                                    let regs: Vec<String> = (0..31)
+                                        .map(|i| format!("x{}={:#x}", i, cpu.get_register(i)))
+                                        .collect();
+                                    log::error!(
+                                        "[stuck-dump] insn={:#010x} sp={:#x} {}",
+                                        u32::from_le_bytes(word),
+                                        cpu.get_register(31),
+                                        regs.join(" ")
+                                    );
+                                    let read_u64 = |addr: u64| -> Option<u64> {
+                                        let mut buf = [0u8; 8];
+                                        guard.address_space.read(addr, &mut buf).ok()?;
+                                        Some(u64::from_le_bytes(buf))
+                                    };
+                                    let mut frames = vec![cpu.get_register(30)];
+                                    let mut fp = cpu.get_register(29);
+                                    for _ in 0..16 {
+                                        if fp == 0 || fp & 0x7 != 0 {
+                                            break;
+                                        }
+                                        let Some(next_fp) = read_u64(fp) else {
+                                            break;
+                                        };
+                                        let Some(lr) = read_u64(fp + 8) else {
+                                            break;
+                                        };
+                                        if lr == 0 {
+                                            break;
+                                        }
+                                        frames.push(lr);
+                                        if next_fp <= fp {
+                                            break;
+                                        }
+                                        fp = next_fp;
+                                    }
+                                    log::error!(
+                                        "[stuck-dump] frames=[{}]",
+                                        frames
+                                            .iter()
+                                            .map(|f| format!("{f:#x}"))
+                                            .collect::<Vec<_>>()
+                                            .join(" ")
+                                    );
+                                    let read_str = |addr: u64| -> Option<String> {
+                                        if addr < 0x10000 {
+                                            return None;
+                                        }
+                                        let mut buf = [0u8; 160];
+                                        guard.address_space.read(addr, &mut buf).ok()?;
+                                        let end =
+                                            buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                                        if end < 4 {
+                                            return None;
+                                        }
+                                        let s = &buf[..end];
+                                        if s.iter().all(|&b| (0x20..0x7f).contains(&b) || b == b'\n')
+                                        {
+                                            Some(String::from_utf8_lossy(s).into_owned())
+                                        } else {
+                                            None
+                                        }
+                                    };
+                                    for i in 0..31 {
+                                        if let Some(s) = read_str(cpu.get_register(i)) {
+                                            log::error!("[stuck-dump] x{} -> {:?}", i, s);
+                                        }
+                                    }
+                                    let sp = cpu.get_register(31);
+                                    for slot in 0..64u64 {
+                                        let addr = sp + slot * 8;
+                                        let Some(value) = read_u64(addr) else {
+                                            continue;
+                                        };
+                                        if let Some(s) = read_str(value) {
+                                            log::error!(
+                                                "[stuck-dump] sp+{:#x} ({:#x}) -> {:?}",
+                                                slot * 8,
+                                                value,
+                                                s
+                                            );
+                                        }
+                                    }
                                 }
                             } else {
                                 stuck_pc = Some(pc_before);
