@@ -10695,7 +10695,7 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         12 => kernel.aslr_base,
         13 => kernel.aslr_size,
         14 => kernel.stack_base,
-        15 => 0x4_000_000,
+        15 => 0x8000_0000,
         16 => kernel.system_resource_size,
         17 => 0,
         18 => 0,
