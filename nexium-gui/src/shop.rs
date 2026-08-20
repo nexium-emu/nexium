@@ -325,16 +325,16 @@ impl ShopState {
             }
         }
 
-        let screen = ctx.screen_rect();
+        let screen = ctx.viewport_rect();
         let mut paint = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
             egui::Id::new("shop"),
         ));
         paint.set_opacity(ease);
-        paint.rect_filled(screen, egui::Rounding::ZERO, pal.bg);
+        paint.rect_filled(screen, egui::CornerRadius::ZERO, pal.bg);
 
         let bar = egui::Rect::from_min_size(screen.min, egui::Vec2::new(screen.width(), 52.0));
-        paint.rect_filled(bar, egui::Rounding::ZERO, BLUE);
+        paint.rect_filled(bar, egui::CornerRadius::ZERO, BLUE);
         paint.text(
             egui::pos2(bar.min.x + 24.0, bar.center().y),
             egui::Align2::LEFT_CENTER,
@@ -423,12 +423,12 @@ impl ShopState {
         let field_hot = self.editing || self.search_nav || self.search_kb.open;
         paint.rect_filled(
             field,
-            egui::Rounding::same(8.0),
+            egui::CornerRadius::same(8),
             Color32::from_black_alpha(60),
         );
         paint.rect_stroke(
             field,
-            egui::Rounding::same(8.0),
+            egui::CornerRadius::same(8),
             egui::Stroke::new(
                 if field_hot { 2.0_f32 } else { 1.0_f32 },
                 if field_hot {
@@ -437,6 +437,7 @@ impl ShopState {
                     Color32::from_white_alpha(120)
                 },
             ),
+            egui::StrokeKind::Outside,
         );
         let disp = if self.search.is_empty() {
             "Search…".to_string()
@@ -553,7 +554,7 @@ impl ShopState {
             let a = ((1.0 - self.view_fade) * 255.0) as u8;
             paint.rect_filled(
                 content,
-                egui::Rounding::ZERO,
+                egui::CornerRadius::ZERO,
                 Color32::from_rgba_unmultiplied(pal.bg.r(), pal.bg.g(), pal.bg.b(), a),
             );
         }
@@ -601,7 +602,7 @@ impl ShopState {
     ) {
         let band_bg = tint_toward(pal.bg, pal.panel2, 0.5);
         let clip = paint.with_clip_rect(clip_rect);
-        clip.rect_filled(clip_rect, egui::Rounding::ZERO, band_bg);
+        clip.rect_filled(clip_rect, egui::CornerRadius::ZERO, band_bg);
         let t = ui.input(|i| i.time) as f32;
         let ph = band.height() - 34.0;
         let pw = ph * 1.72;
@@ -625,10 +626,10 @@ impl ShopState {
             let tile = egui::Rect::from_min_size(egui::pos2(x, y), egui::Vec2::new(pw, ph));
             clip.rect_filled(
                 tile.translate(egui::Vec2::new(0.0, 3.0)),
-                egui::Rounding::same(9.0),
+                egui::CornerRadius::same(9),
                 Color32::from_black_alpha(55),
             );
-            clip.rect_filled(tile, egui::Rounding::same(9.0), pal.panel);
+            clip.rect_filled(tile, egui::CornerRadius::same(9), pal.panel);
             if let Some(Some(tex)) = self.icons.get(idx) {
                 crate::carousel::draw_rounded_image(&clip, tex.id(), tile, 9.0, Color32::WHITE);
             } else {
@@ -685,7 +686,7 @@ impl ShopState {
         };
         let tag = TAGLINES[idx];
         let fid = egui::FontId::proportional(19.0);
-        let tw = ui.fonts(|f| {
+        let tw = ui.fonts_mut(|f| {
             f.layout_no_wrap(tag.to_string(), fid.clone(), pal.text)
                 .size()
                 .x
@@ -693,13 +694,14 @@ impl ShopState {
         let pill = egui::Rect::from_center_size(band.center(), egui::Vec2::new(tw + 56.0, 44.0));
         clip.rect_filled(
             pill,
-            egui::Rounding::same(22.0),
+            egui::CornerRadius::same(22),
             Color32::from_rgba_unmultiplied(band_bg.r(), band_bg.g(), band_bg.b(), 236),
         );
         clip.rect_stroke(
             pill,
-            egui::Rounding::same(22.0),
+            egui::CornerRadius::same(22),
             egui::Stroke::new(1.0_f32, pal.border),
+            egui::StrokeKind::Outside,
         );
         clip.text(
             band.center(),
@@ -870,7 +872,7 @@ impl ShopState {
             let pulse = 0.7 + 0.3 * (now_t * 3.0).sin();
             clip.rect_filled(
                 sr.expand(6.0),
-                egui::Rounding::same(15.0),
+                egui::CornerRadius::same(15),
                 Color32::from_rgba_unmultiplied(
                     accent.r(),
                     accent.g(),
@@ -880,8 +882,9 @@ impl ShopState {
             );
             clip.rect_stroke(
                 sr.expand(4.0),
-                egui::Rounding::same(13.0),
+                egui::CornerRadius::same(13),
                 egui::Stroke::new(2.5_f32, accent),
+                egui::StrokeKind::Outside,
             );
         }
         let mut open_detail = None;
@@ -900,10 +903,10 @@ impl ShopState {
             let sel = vi == self.selected;
             clip.rect_filled(
                 tile.translate(egui::Vec2::new(0.0, 4.0)).expand(1.0),
-                egui::Rounding::same(11.0),
+                egui::CornerRadius::same(11),
                 Color32::from_black_alpha(70),
             );
-            clip.rect_filled(tile, egui::Rounding::same(10.0), pal.panel);
+            clip.rect_filled(tile, egui::CornerRadius::same(10), pal.panel);
             if let Some(Some(tex)) = self.icons.get(ai) {
                 crate::carousel::draw_rounded_image(&clip, tex.id(), tile, 10.0, Color32::WHITE);
             } else {
@@ -982,7 +985,7 @@ impl ShopState {
             let hot = self.sb_drag || ptr_pos.map_or(false, |p| hit.contains(p));
             paint.rect_filled(
                 track,
-                egui::Rounding::same(3.5),
+                egui::CornerRadius::same(4),
                 tint_toward(pal.bg, pal.panel2, 0.6),
             );
             let thumb_y = track.min.y + range * (self.scroll / max_scroll);
@@ -992,7 +995,7 @@ impl ShopState {
             );
             paint.rect_filled(
                 thumb,
-                egui::Rounding::same(3.5),
+                egui::CornerRadius::same(4),
                 if hot {
                     pal.muted
                 } else {
@@ -1016,7 +1019,7 @@ impl ShopState {
 
         let link = "Browse at hb-app.store";
         let fid = egui::FontId::proportional(13.0);
-        let lw = ui.fonts(|f| {
+        let lw = ui.fonts_mut(|f| {
             f.layout_no_wrap(link.to_string(), fid.clone(), accent)
                 .size()
                 .x
@@ -1077,14 +1080,14 @@ impl ShopState {
         );
         paint.rect_filled(
             icon_r.expand(2.0).translate(egui::Vec2::new(0.0, 5.0)),
-            egui::Rounding::same(22.0),
+            egui::CornerRadius::same(22),
             Color32::from_black_alpha(70),
         );
-        paint.rect_filled(icon_r.expand(2.0), egui::Rounding::same(22.0), pal.panel2);
+        paint.rect_filled(icon_r.expand(2.0), egui::CornerRadius::same(22), pal.panel2);
         if let Some(Some(tex)) = self.icons.get(ai) {
             crate::carousel::draw_rounded_image(paint, tex.id(), icon_r, 20.0, Color32::WHITE);
         } else {
-            paint.rect_filled(icon_r, egui::Rounding::same(20.0), pal.panel);
+            paint.rect_filled(icon_r, egui::CornerRadius::same(20), pal.panel);
         }
         let tx = icon_r.max.x + 30.0;
         paint.text(
@@ -1115,7 +1118,7 @@ impl ShopState {
         );
         let link = "View on hb-app.store";
         let lfid = egui::FontId::proportional(14.0);
-        let lw = ui.fonts(|f| {
+        let lw = ui.fonts_mut(|f| {
             f.layout_no_wrap(link.to_string(), lfid.clone(), self.accent)
                 .size()
                 .x
@@ -1159,8 +1162,8 @@ impl ShopState {
             egui::pos2(content.min.x + pad, icon_r.max.y + 26.0),
             egui::pos2(col_split - 20.0, content.max.y - 60.0),
         );
-        paint.rect_filled(desc_rect, egui::Rounding::same(12.0), pal.panel);
-        let galley = ui.fonts(|f| {
+        paint.rect_filled(desc_rect, egui::CornerRadius::same(12), pal.panel);
+        let galley = ui.fonts_mut(|f| {
             f.layout(
                 desc,
                 egui::FontId::proportional(15.0),
@@ -1197,14 +1200,14 @@ impl ShopState {
                 egui::pos2(desc_rect.max.x - 6.0, desc_rect.min.y + 6.0),
                 egui::Vec2::new(4.0, desc_rect.height() - 12.0),
             );
-            paint.rect_filled(track, egui::Rounding::same(2.0), pal.panel2);
+            paint.rect_filled(track, egui::CornerRadius::same(2), pal.panel2);
             let frac = self.desc_scroll / max_ds;
             let th = (track.height() * (desc_rect.height() / (text_h + 24.0)))
                 .clamp(20.0, track.height());
             let ty = track.min.y + (track.height() - th) * frac;
             paint.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(track.min.x, ty), egui::Vec2::new(4.0, th)),
-                egui::Rounding::same(2.0),
+                egui::CornerRadius::same(2),
                 pal.muted,
             );
         }
@@ -1232,7 +1235,7 @@ impl ShopState {
                 let e = (4 - k) as f32 * 3.0;
                 paint.rect_stroke(
                     btn.expand(e),
-                    egui::Rounding::same(12.0 + e),
+                    egui::CornerRadius::from(12.0 + e),
                     egui::Stroke::new(
                         2.0_f32,
                         Color32::from_rgba_unmultiplied(
@@ -1242,11 +1245,12 @@ impl ShopState {
                             (40.0 * pulse) as u8,
                         ),
                     ),
+                    egui::StrokeKind::Outside,
                 );
             }
             paint.rect_stroke(
                 btn.expand(3.0),
-                egui::Rounding::same(15.0),
+                egui::CornerRadius::same(15),
                 egui::Stroke::new(
                     2.5_f32,
                     Color32::from_rgba_unmultiplied(
@@ -1256,6 +1260,7 @@ impl ShopState {
                         (200.0 * pulse) as u8,
                     ),
                 ),
+                egui::StrokeKind::Outside,
             );
         }
         let btn_col = if installing {
@@ -1269,7 +1274,7 @@ impl ShopState {
         } else {
             BLUE
         };
-        paint.rect_filled(btn, egui::Rounding::same(12.0), btn_col);
+        paint.rect_filled(btn, egui::CornerRadius::same(12), btn_col);
         let label = if done && ok {
             "Installed".to_string()
         } else if installing {
@@ -1279,7 +1284,7 @@ impl ShopState {
         } else {
             "Install".to_string()
         };
-        let tw = ui.fonts(|f| {
+        let tw = ui.fonts_mut(|f| {
             f.layout_no_wrap(
                 label.clone(),
                 egui::FontId::proportional(20.0),
@@ -1316,12 +1321,12 @@ impl ShopState {
                 egui::pos2(btn.min.x, btn.max.y + 10.0),
                 egui::Vec2::new(btn.width(), 7.0),
             );
-            paint.rect_filled(barr, egui::Rounding::same(3.5), pal.panel2);
+            paint.rect_filled(barr, egui::CornerRadius::same(4), pal.panel2);
             let mut fill = barr;
             fill.set_width(barr.width() * progress);
             paint.rect_filled(
                 fill,
-                egui::Rounding::same(3.5),
+                egui::CornerRadius::same(4),
                 Color32::from_rgb(0x35, 0xD0, 0x6A),
             );
         }
@@ -1333,11 +1338,12 @@ impl ShopState {
             egui::pos2(btn.min.x, btn.max.y + 40.0),
             egui::pos2(content.max.x - 40.0, content.max.y - 60.0),
         );
-        paint.rect_filled(info, egui::Rounding::same(12.0), pal.panel);
+        paint.rect_filled(info, egui::CornerRadius::same(12), pal.panel);
         paint.rect_stroke(
             info,
-            egui::Rounding::same(12.0),
+            egui::CornerRadius::same(12),
             egui::Stroke::new(1.0_f32, pal.border),
+            egui::StrokeKind::Outside,
         );
         let rows = [
             ("Developer", app.author.clone()),
@@ -1410,11 +1416,11 @@ impl ShopState {
         pal: Pal,
         pop: f32,
     ) {
-        dp.rect_filled(rect, egui::Rounding::same(10.0), pal.btn_fill);
+        dp.rect_filled(rect, egui::CornerRadius::same(10), pal.btn_fill);
         if selected {
             dp.rect_filled(
                 rect,
-                egui::Rounding::same(10.0),
+                egui::CornerRadius::same(10),
                 Color32::from_rgba_unmultiplied(
                     self.accent.r(),
                     self.accent.g(),
@@ -1424,14 +1430,16 @@ impl ShopState {
             );
             dp.rect_stroke(
                 rect,
-                egui::Rounding::same(10.0),
+                egui::CornerRadius::same(10),
                 egui::Stroke::new(2.6_f32, self.accent),
+                egui::StrokeKind::Outside,
             );
         } else {
             dp.rect_stroke(
                 rect,
-                egui::Rounding::same(10.0),
+                egui::CornerRadius::same(10),
                 egui::Stroke::new(1.2_f32, pal.border),
+                egui::StrokeKind::Outside,
             );
         }
         let col = if selected {
@@ -1487,7 +1495,7 @@ impl ShopState {
             egui::Id::new("shop_dialog"),
         ));
         dp.set_opacity(shop_ease * de);
-        dp.rect_filled(screen, egui::Rounding::ZERO, Color32::from_black_alpha(195));
+        dp.rect_filled(screen, egui::CornerRadius::ZERO, Color32::from_black_alpha(195));
         let handle = interactive && !self.dialog_closing;
 
         match kind {
@@ -1500,14 +1508,15 @@ impl ShopState {
                 let dlg = egui::Rect::from_center_size(screen.center(), egui::Vec2::new(w, h));
                 dp.rect_filled(
                     dlg.translate(egui::Vec2::new(0.0, 10.0)),
-                    egui::Rounding::same(18.0),
+                    egui::CornerRadius::same(18),
                     Color32::from_black_alpha(90),
                 );
-                dp.rect_filled(dlg, egui::Rounding::same(18.0), pal.panel);
+                dp.rect_filled(dlg, egui::CornerRadius::same(18), pal.panel);
                 dp.rect_stroke(
                     dlg,
-                    egui::Rounding::same(18.0),
+                    egui::CornerRadius::same(18),
                     egui::Stroke::new(1.5_f32, pal.border),
+                    egui::StrokeKind::Outside,
                 );
                 dp.text(
                     egui::pos2(dlg.center().x, dlg.min.y + 40.0 * pop),
@@ -1579,14 +1588,15 @@ impl ShopState {
                 let dlg = egui::Rect::from_center_size(screen.center(), egui::Vec2::new(w, h));
                 dp.rect_filled(
                     dlg.translate(egui::Vec2::new(0.0, 10.0)),
-                    egui::Rounding::same(18.0),
+                    egui::CornerRadius::same(18),
                     Color32::from_black_alpha(90),
                 );
-                dp.rect_filled(dlg, egui::Rounding::same(18.0), pal.panel);
+                dp.rect_filled(dlg, egui::CornerRadius::same(18), pal.panel);
                 dp.rect_stroke(
                     dlg,
-                    egui::Rounding::same(18.0),
+                    egui::CornerRadius::same(18),
                     egui::Stroke::new(1.5_f32, pal.border),
+                    egui::StrokeKind::Outside,
                 );
                 dp.text(
                     egui::pos2(dlg.center().x, dlg.min.y + 40.0 * pop),
@@ -1642,7 +1652,7 @@ fn hint_bar(paint: &egui::Painter, content: egui::Rect, pal: Pal, text: &str) {
     );
     vfade(paint, shadow, Color32::from_black_alpha(70), false);
     let fill = tint_toward(pal.bg, pal.panel2, 0.7);
-    paint.rect_filled(bar, egui::Rounding::ZERO, fill);
+    paint.rect_filled(bar, egui::CornerRadius::ZERO, fill);
     paint.line_segment(
         [bar.min, egui::pos2(bar.max.x, bar.min.y)],
         egui::Stroke::new(1.0_f32, pal.border),

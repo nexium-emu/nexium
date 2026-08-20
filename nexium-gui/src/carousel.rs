@@ -1,6 +1,6 @@
 use crate::library::Library;
 use eframe::egui;
-use eframe::egui::{Color32, FontId, Rounding, Sense, Stroke, Vec2};
+use eframe::egui::{Color32, FontId, CornerRadius, Sense, Stroke, Vec2};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BootStage {
@@ -631,7 +631,7 @@ pub fn draw_backdrop(
             let a = (opacity * 255.0) as u8;
             painter.rect_filled(
                 rect,
-                Rounding::ZERO,
+                CornerRadius::ZERO,
                 Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a),
             );
         }
@@ -673,7 +673,7 @@ fn draw_space_backdrop(
 
     painter.rect_filled(
         rect,
-        Rounding::ZERO,
+        CornerRadius::ZERO,
         Color32::from_rgba_unmultiplied(4, 5, 9, a(255.0)),
     );
     let neb = sh(color, -0.1);
@@ -1652,7 +1652,7 @@ fn draw_cherry_blossom_backdrop(
         );
         painter.rect_filled(
             seg,
-            Rounding::same(2.0),
+            CornerRadius::same(2),
             rgba(mix(water_hi, Color32::from_rgb(0xFF, 0xF6, 0xFA), 0.72), al),
         );
     }
@@ -2037,7 +2037,7 @@ fn draw_gradient_backdrop(
     let base_alpha = (opacity * 255.0) as u8;
     painter.rect_filled(
         rect,
-        Rounding::ZERO,
+        CornerRadius::ZERO,
         Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), base_alpha),
     );
 
@@ -2095,7 +2095,7 @@ pub fn draw_wave_background(
     let bg_alpha = (opacity * 255.0) as u8;
     painter.rect_filled(
         rect,
-        Rounding::ZERO,
+        CornerRadius::ZERO,
         Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), bg_alpha),
     );
 
@@ -2563,11 +2563,12 @@ pub fn carousel_view(
                 sb_alpha,
             )
         };
-        painter.rect_filled(search_rect, Rounding::same(18.0 * s * scale_factor), sb_bg);
+        painter.rect_filled(search_rect, CornerRadius::from(18.0 * s * scale_factor), sb_bg);
         painter.rect_stroke(
             search_rect,
-            Rounding::same(18.0 * s * scale_factor),
+            CornerRadius::from(18.0 * s * scale_factor),
             Stroke::new(1.5 * scale_factor, sb_border),
+            egui::StrokeKind::Outside,
         );
 
         let icon_pos = scale_pos(search_rect.min + Vec2::new(16.0 * s, search_rect.height() * 0.5));
@@ -2788,7 +2789,7 @@ pub fn carousel_view(
 
         painter.rect_filled(
             draw_rect.translate(Vec2::new(0.0, 6.0)),
-            Rounding::same(14.0 * scale_factor),
+            CornerRadius::from(14.0 * scale_factor),
             Color32::from_rgba_premultiplied(0, 0, 0, (120.0 * alpha_f) as u8),
         );
 
@@ -2873,11 +2874,11 @@ pub fn carousel_view(
             resp.context_menu(|ui| {
                 if !is_playing_card && ui.button("Launch").clicked() {
                     want_launch = Some(path_string.clone());
-                    ui.close_menu();
+                    ui.close();
                 }
                 if is_playing_card && ui.button("⏹  Close Game").clicked() {
                     want_close = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 let label = if favd {
                     "★  Unfavorite Game"
@@ -2886,15 +2887,15 @@ pub fn carousel_view(
                 };
                 if ui.button(label).clicked() {
                     want_fav = Some(path_string.clone());
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("🖼  Download Icon…").clicked() {
                     want_download = Some(path_string.clone());
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("View Game Information").clicked() {
                     want_info = Some(path_string.clone());
-                    ui.close_menu();
+                    ui.close();
                 }
             });
         }
@@ -2905,7 +2906,7 @@ pub fn carousel_view(
             let bg = Color32::from_rgb(0xC0, 0x39, 0x3B);
             painter.rect_filled(
                 draw_rect,
-                Rounding::same(14.0 * scale_factor),
+                CornerRadius::from(14.0 * scale_factor),
                 Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8),
             );
             let top = egui::Rect::from_min_max(
@@ -2914,11 +2915,11 @@ pub fn carousel_view(
             );
             painter.rect_filled(
                 top,
-                Rounding {
-                    nw: 14.0 * scale_factor,
-                    ne: 14.0 * scale_factor,
-                    sw: 0.0,
-                    se: 0.0,
+                CornerRadius {
+                    nw: (14.0 * scale_factor).round() as u8,
+                    ne: (14.0 * scale_factor).round() as u8,
+                    sw: 0,
+                    se: 0,
                 },
                 Color32::from_white_alpha((alpha_f * 22.0) as u8),
             );
@@ -2939,7 +2940,7 @@ pub fn carousel_view(
             let bg = Color32::from_rgb(0x53, 0x5E, 0xC8);
             painter.rect_filled(
                 draw_rect,
-                Rounding::same(14.0 * scale_factor),
+                CornerRadius::from(14.0 * scale_factor),
                 Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), a8),
             );
             let top = egui::Rect::from_min_max(
@@ -2948,11 +2949,11 @@ pub fn carousel_view(
             );
             painter.rect_filled(
                 top,
-                Rounding {
-                    nw: 14.0 * scale_factor,
-                    ne: 14.0 * scale_factor,
-                    sw: 0.0,
-                    se: 0.0,
+                CornerRadius {
+                    nw: (14.0 * scale_factor).round() as u8,
+                    ne: (14.0 * scale_factor).round() as u8,
+                    sw: 0,
+                    se: 0,
                 },
                 Color32::from_white_alpha((alpha_f * 22.0) as u8),
             );
@@ -2993,13 +2994,13 @@ pub fn carousel_view(
             );
             painter.rect_filled(
                 draw_rect,
-                Rounding::same(14.0 * scale_factor),
+                CornerRadius::from(14.0 * scale_factor),
                 Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a8),
             );
             let acc = state.ambient_color;
             painter.rect_filled(
                 draw_rect.shrink(3.0 * scale_factor),
-                Rounding::same(12.0 * scale_factor),
+                CornerRadius::from(12.0 * scale_factor),
                 Color32::from_rgba_unmultiplied(acc.r(), acc.g(), acc.b(), (alpha_f * 235.0) as u8),
             );
             let list = &lists[li];
@@ -3020,17 +3021,18 @@ pub fn carousel_view(
             if !is_hero {
                 painter.rect_stroke(
                     draw_rect,
-                    Rounding::same(14.0 * scale_factor),
+                    CornerRadius::from(14.0 * scale_factor),
                     Stroke::new(
                         1.5 * scale_factor,
                         Color32::from_rgba_unmultiplied(0x50, 0x50, 0x60, (alpha_f * 170.0) as u8),
                     ),
+                    egui::StrokeKind::Outside,
                 );
             }
         } else if is_add_dir {
             painter.rect_filled(
                 draw_rect,
-                Rounding::same(14.0 * scale_factor),
+                CornerRadius::from(14.0 * scale_factor),
                 Color32::from_rgba_unmultiplied(
                     col_surface.r(),
                     col_surface.g(),
@@ -3040,7 +3042,7 @@ pub fn carousel_view(
             );
             painter.rect_stroke(
                 draw_rect,
-                Rounding::same(14.0 * scale_factor),
+                CornerRadius::from(14.0 * scale_factor),
                 Stroke::new(
                     1.0 * scale_factor,
                     Color32::from_rgba_unmultiplied(
@@ -3050,6 +3052,7 @@ pub fn carousel_view(
                         (alpha_f * 255.0) as u8,
                     ),
                 ),
+                egui::StrokeKind::Outside,
             );
 
             let center = draw_rect.center() - Vec2::new(0.0, 20.0 * scale_factor);
@@ -3097,7 +3100,7 @@ pub fn carousel_view(
             );
             painter.rect_filled(
                 draw_rect,
-                Rounding::same(14.0 * scale_factor),
+                CornerRadius::from(14.0 * scale_factor),
                 Color32::from_rgba_unmultiplied(
                     card_fill.r(),
                     card_fill.g(),
@@ -3215,19 +3218,21 @@ pub fn carousel_view(
             if !is_hero {
                 painter.rect_stroke(
                     draw_rect,
-                    Rounding::same(14.0 * scale_factor),
+                    CornerRadius::from(14.0 * scale_factor),
                     Stroke::new(
                         1.5 * scale_factor,
                         Color32::from_rgba_unmultiplied(0x50, 0x50, 0x60, (alpha_f * 170.0) as u8),
                     ),
+                    egui::StrokeKind::Outside,
                 );
                 painter.rect_stroke(
                     draw_rect.expand(1.0 * scale_factor),
-                    Rounding::same(15.0 * scale_factor),
+                    CornerRadius::from(15.0 * scale_factor),
                     Stroke::new(
                         1.0 * scale_factor,
                         Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, (alpha_f * 120.0) as u8),
                     ),
+                    egui::StrokeKind::Outside,
                 );
             }
 
@@ -3247,7 +3252,7 @@ pub fn carousel_view(
                 let pill_font = FontId::proportional((draw_rect.width() * 0.072).clamp(10.0, 20.0));
                 let fh = pill_font.size;
                 let label = "Playing";
-                let text_w = ui.fonts(|f| {
+                let text_w = ui.fonts_mut(|f| {
                     f.layout_no_wrap(label.to_string(), pill_font.clone(), Color32::WHITE)
                         .size()
                         .x
@@ -3270,21 +3275,22 @@ pub fn carousel_view(
                 let a = |x: f32| (x * alpha_f * playing_alpha).clamp(0.0, 255.0) as u8;
                 painter.rect_filled(
                     pill_rect.expand(2.5),
-                    Rounding::same(pill_h * 0.5 + 2.5),
+                    CornerRadius::from(pill_h * 0.5 + 2.5),
                     Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(70.0 * pulse)),
                 );
                 painter.rect_filled(
                     pill_rect,
-                    Rounding::same(pill_h * 0.5),
+                    CornerRadius::from(pill_h * 0.5),
                     Color32::from_rgba_unmultiplied(0x0C, 0x14, 0x0E, a(215.0)),
                 );
                 painter.rect_stroke(
                     pill_rect,
-                    Rounding::same(pill_h * 0.5),
+                    CornerRadius::from(pill_h * 0.5),
                     Stroke::new(
                         1.4_f32,
                         Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a(235.0)),
                     ),
+                    egui::StrokeKind::Outside,
                 );
                 let dot_c = egui::pos2(pill_rect.min.x + pad_x + dot_r, pill_rect.center().y);
                 painter.circle_filled(
@@ -3427,7 +3433,7 @@ pub fn carousel_view(
             let overlay_alpha = (p * p * 255.0) as u8;
             painter.rect_filled(
                 bg_rect,
-                Rounding::ZERO,
+                CornerRadius::ZERO,
                 Color32::from_rgba_unmultiplied(0, 0, 0, overlay_alpha),
             );
         }
@@ -3565,7 +3571,7 @@ pub fn carousel_view(
                 }
                 painter.rect_filled(
                     dock_bg.expand(e).translate(Vec2::new(0.0, e * 0.9)),
-                    Rounding::same(round + e),
+                    CornerRadius::from(round + e),
                     Color32::from_black_alpha(a),
                 );
             }
@@ -3577,7 +3583,7 @@ pub fn carousel_view(
         };
         painter.rect_filled(
             dock_bg,
-            Rounding::same(round),
+            CornerRadius::from(round),
             Color32::from_rgba_premultiplied(col_bar.r(), col_bar.g(), col_bar.b(), bar_alpha),
         );
         if !dockbar_simple {
@@ -3656,7 +3662,7 @@ pub fn carousel_view(
         }
         painter.rect_stroke(
             dock_bg,
-            Rounding::same(round),
+            CornerRadius::from(round),
             Stroke::new(
                 1.1 * scale_factor,
                 Color32::from_rgba_unmultiplied(
@@ -3666,6 +3672,7 @@ pub fn carousel_view(
                     (ui_opacity * 255.0) as u8,
                 ),
             ),
+            egui::StrokeKind::Outside,
         );
 
         let scaled_dock_sx = scaled_dock_center.x - scaled_dock_total * 0.5;
@@ -3888,7 +3895,7 @@ pub fn carousel_view(
                 );
                 painter.rect_filled(
                     body_rect,
-                    Rounding::same(4.0 * scale_factor),
+                    CornerRadius::from(4.0 * scale_factor),
                     final_icon_color,
                 );
             } else if *label == "Quit" {
@@ -3916,7 +3923,7 @@ pub fn carousel_view(
                     center + Vec2::new(-u, -u * 0.55),
                     center + Vec2::new(u, u * 1.25),
                 );
-                painter.rect_filled(body, Rounding::same(2.5 * scale_factor), final_icon_color);
+                painter.rect_filled(body, CornerRadius::from(2.5 * scale_factor), final_icon_color);
                 let handle_c = egui::pos2(center.x, body.min.y);
                 let arc: Vec<egui::Pos2> = (0..=12)
                     .map(|i| {
@@ -3994,7 +4001,7 @@ pub fn carousel_view(
         let accent = state.ambient_color;
         painter.rect_filled(
             bg_rect,
-            Rounding::ZERO,
+            CornerRadius::ZERO,
             Color32::from_black_alpha((e * 90.0) as u8),
         );
 
@@ -4008,7 +4015,7 @@ pub fn carousel_view(
             egui::Rect::from_min_max(sc(egui::pos2(ax, ay)), sc(egui::pos2(ax + pw, ay + ph)));
         painter.rect_filled(
             panel.translate(Vec2::new(0.0, 8.0 * scale_factor)),
-            Rounding::same(16.0 * scale_factor),
+            CornerRadius::from(16.0 * scale_factor),
             Color32::from_black_alpha((e * 120.0) as u8),
         );
         let pfill = tl(
@@ -4017,12 +4024,12 @@ pub fn carousel_view(
         );
         painter.rect_filled(
             panel,
-            Rounding::same(16.0 * scale_factor),
+            CornerRadius::from(16.0 * scale_factor),
             Color32::from_rgba_unmultiplied(pfill.r(), pfill.g(), pfill.b(), (e * 255.0) as u8),
         );
         painter.rect_stroke(
             panel,
-            Rounding::same(16.0 * scale_factor),
+            CornerRadius::from(16.0 * scale_factor),
             Stroke::new(
                 1.2 * scale_factor,
                 Color32::from_rgba_unmultiplied(
@@ -4032,6 +4039,7 @@ pub fn carousel_view(
                     (e * 255.0) as u8,
                 ),
             ),
+            egui::StrokeKind::Outside,
         );
 
         let labels = [
@@ -4052,7 +4060,7 @@ pub fn carousel_view(
             if i == state.game_menu_sel {
                 painter.rect_filled(
                     row,
-                    Rounding::same(10.0 * scale_factor),
+                    CornerRadius::from(10.0 * scale_factor),
                     Color32::from_rgba_unmultiplied(
                         accent.r(),
                         accent.g(),
@@ -4062,7 +4070,7 @@ pub fn carousel_view(
                 );
                 painter.rect_stroke(
                     row,
-                    Rounding::same(10.0 * scale_factor),
+                    CornerRadius::from(10.0 * scale_factor),
                     Stroke::new(
                         1.4 * scale_factor,
                         Color32::from_rgba_unmultiplied(
@@ -4072,6 +4080,7 @@ pub fn carousel_view(
                             (e * 220.0) as u8,
                         ),
                     ),
+                    egui::StrokeKind::Outside,
                 );
             }
             let tc = if i == 0 && favd {
@@ -4140,12 +4149,12 @@ pub fn carousel_view(
 
         painter.rect_filled(
             panel,
-            Rounding::same(20.0 * scale_factor),
+            CornerRadius::from(20.0 * scale_factor),
             Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), a(240.0)),
         );
         painter.rect_stroke(
             panel,
-            Rounding::same(20.0 * scale_factor),
+            CornerRadius::from(20.0 * scale_factor),
             Stroke::new(
                 1.0_f32,
                 Color32::from_rgba_unmultiplied(
@@ -4155,6 +4164,7 @@ pub fn carousel_view(
                     a(255.0),
                 ),
             ),
+            egui::StrokeKind::Outside,
         );
 
         shadowed_text(
@@ -4186,7 +4196,7 @@ pub fn carousel_view(
                 }
             }
             let is_sel = state.palette_selected == i;
-            let rounding = Rounding::same(10.0 * scale_factor);
+            let rounding = CornerRadius::from(10.0 * scale_factor);
             if is_sel {
                 if *th == crate::app_settings::CarouselTheme::Rgb {
                     draw_rainbow_rounded_rect(
@@ -4246,7 +4256,7 @@ pub fn carousel_view(
                     a(160.0),
                 )
             };
-            painter.rect_stroke(r, rounding, Stroke::new(1.3_f32, sw_stroke));
+            painter.rect_stroke(r, rounding, Stroke::new(1.3_f32, sw_stroke), egui::StrokeKind::Outside);
         }
 
         let cur = themes
@@ -4504,7 +4514,7 @@ pub fn carousel_view(
             true,
         );
 
-        let clock_w = ui.fonts(|f| {
+        let clock_w = ui.fonts_mut(|f| {
             f.layout_no_wrap(clock.clone(), clock_font.clone(), cc)
                 .size()
                 .x
@@ -4513,7 +4523,7 @@ pub fn carousel_view(
             clock_right - clock_w - 14.0 * top_s,
             bg_rect.min.y + 34.0 * top_s,
         );
-        let date_w = ui.fonts(|f| {
+        let date_w = ui.fonts_mut(|f| {
             f.layout_no_wrap(date.clone(), date_font.clone(), cc)
                 .size()
                 .x
@@ -4556,17 +4566,17 @@ pub fn carousel_view(
             let spill = egui::Rect::from_min_max(sp(pill.min), sp(pill.max));
             painter.rect_filled(
                 spill.translate(Vec2::new(0.0, 2.0 * scale_factor)),
-                Rounding::same(9.0 * scale_factor),
+                CornerRadius::from(9.0 * scale_factor),
                 Color32::from_black_alpha((top_alpha as f32 * 0.28) as u8),
             );
             painter.rect_filled(
                 spill,
-                Rounding::same(9.0 * scale_factor),
+                CornerRadius::from(9.0 * scale_factor),
                 Color32::from_rgba_unmultiplied(col_bar.r(), col_bar.g(), col_bar.b(), top_alpha),
             );
             painter.rect_stroke(
                 spill,
-                Rounding::same(9.0 * scale_factor),
+                CornerRadius::from(9.0 * scale_factor),
                 Stroke::new(
                     1.4 * scale_factor,
                     Color32::from_rgba_unmultiplied(
@@ -4576,6 +4586,7 @@ pub fn carousel_view(
                         (top_alpha as f32 * 0.7) as u8,
                     ),
                 ),
+                egui::StrokeKind::Outside,
             );
             let pulse = 0.5 + 0.5 * (t * 2.2).sin();
             let dc = sp(egui::pos2(pill.min.x + 16.0 * top_s, cy));
@@ -4653,7 +4664,7 @@ pub fn carousel_view(
                         sx(0.0, py),
                         Vec2::new(u * 1.05 * scale_factor, u * 0.74 * scale_factor),
                     );
-                    painter.rect_filled(body, Rounding::same(1.6 * scale_factor), cc);
+                    painter.rect_filled(body, CornerRadius::from(1.6 * scale_factor), cc);
                     for k in -1..=1 {
                         let px = k as f32 * 0.3;
                         painter.line_segment(
@@ -4685,7 +4696,7 @@ pub fn carousel_view(
             if last_input.wired {
                 let z = 6.0 * s;
                 let bodyr = egui::Rect::from_center_size(bc, Vec2::new(z * 0.95, z * 0.85));
-                painter.rect_filled(bodyr, Rounding::same(1.5 * scale_factor), col);
+                painter.rect_filled(bodyr, CornerRadius::from(1.5 * scale_factor), col);
                 let prong = Stroke::new(1.6 * scale_factor, col);
                 painter.line_segment(
                     [
@@ -4731,8 +4742,9 @@ pub fn carousel_view(
             );
             painter.rect_stroke(
                 gbody,
-                Rounding::same(gh * 0.48),
+                CornerRadius::from(gh * 0.48),
                 Stroke::new(1.6 * scale_factor, col),
+                egui::StrokeKind::Outside,
             );
             let lc = egui::pos2(gbody.min.x + gw * 0.27, gbody.center().y);
             let arm = 2.3 * s;
@@ -4758,15 +4770,16 @@ pub fn carousel_view(
             );
             painter.rect_stroke(
                 bbody,
-                Rounding::same(2.5 * scale_factor),
+                CornerRadius::from(2.5 * scale_factor),
                 Stroke::new(1.6 * scale_factor, col),
+                egui::StrokeKind::Outside,
             );
             painter.rect_filled(
                 egui::Rect::from_min_max(
                     egui::pos2(x + bw, y - bh * 0.22),
                     egui::pos2(x + bw + nub, y + bh * 0.22),
                 ),
-                Rounding::same(1.0 * scale_factor),
+                CornerRadius::from(1.0 * scale_factor),
                 col,
             );
             let fc = if last_input.charging {
@@ -4783,7 +4796,7 @@ pub fn carousel_view(
             f.set_width(inner.width() * frac);
             painter.rect_filled(
                 f,
-                Rounding::same(1.5 * scale_factor),
+                CornerRadius::from(1.5 * scale_factor),
                 Color32::from_rgba_unmultiplied(fc.r(), fc.g(), fc.b(), top_alpha),
             );
             if last_input.charging {

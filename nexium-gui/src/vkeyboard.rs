@@ -1,6 +1,6 @@
 use crate::controller_config::SwitchButton;
 use crate::input::InputSnapshot;
-use egui::{Color32, FontId, Rounding, Stroke, Vec2};
+use egui::{Color32, FontId, CornerRadius, Stroke, Vec2};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Layer {
@@ -250,9 +250,9 @@ impl VirtualKeyboard {
         let mut result = VkResult::None;
 
         if self.open {
-            let full = ctx.screen_rect();
+            let full = ctx.viewport_rect();
             let blocker = egui::LayerId::new(egui::Order::Debug, egui::Id::new("vkb_blocker"));
-            ui.with_layer_id(blocker, |ui| {
+            ui.scope_builder(egui::UiBuilder::new().layer_id(blocker), |ui| {
                 ui.allocate_rect(full, egui::Sense::click_and_drag());
             });
             let events = ctx.input(|i| i.events.clone());
@@ -412,7 +412,7 @@ impl VirtualKeyboard {
         accent: Color32,
         light: bool,
     ) {
-        let full = ctx.screen_rect();
+        let full = ctx.viewport_rect();
         let mut p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Debug,
             egui::Id::new("vkeyboard"),
@@ -454,28 +454,29 @@ impl VirtualKeyboard {
 
         p.rect_filled(
             egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, panel.min.y)),
-            Rounding::ZERO,
+            CornerRadius::ZERO,
             Color32::from_rgba_unmultiplied(0, 0, 0, (ease * 90.0) as u8),
         );
         p.rect_filled(
             panel,
-            Rounding {
-                nw: 18.0,
-                ne: 18.0,
-                sw: 0.0,
-                se: 0.0,
+            CornerRadius {
+                nw: 18,
+                ne: 18,
+                sw: 0,
+                se: 0,
             },
             bg,
         );
         p.rect_stroke(
             panel,
-            Rounding {
-                nw: 18.0,
-                ne: 18.0,
-                sw: 0.0,
-                se: 0.0,
+            CornerRadius {
+                nw: 18,
+                ne: 18,
+                sw: 0,
+                se: 0,
             },
             Stroke::new(1.5_f32, key_border),
+            egui::StrokeKind::Outside,
         );
 
         let pad = 24.0;
@@ -492,8 +493,8 @@ impl VirtualKeyboard {
             egui::pos2(panel.min.x + pad, panel.min.y + 16.0),
             egui::pos2(panel.max.x - pad, panel.min.y + 58.0),
         );
-        p.rect_filled(preview, Rounding::same(9.0), key_bg);
-        p.rect_stroke(preview, Rounding::same(9.0), Stroke::new(1.5_f32, accent));
+        p.rect_filled(preview, CornerRadius::same(9), key_bg);
+        p.rect_stroke(preview, CornerRadius::same(9), Stroke::new(1.5_f32, accent), egui::StrokeKind::Outside);
         let pv_font = FontId::proportional(20.0);
         let display: String = if self.mask {
             buf.chars().map(|_| '\u{2022}').collect()
@@ -501,7 +502,7 @@ impl VirtualKeyboard {
             buf.to_string()
         };
         let pre: String = display.chars().take(self.caret).collect();
-        let pre_w = ui.fonts(|f| f.layout_no_wrap(pre, pv_font.clone(), text).size().x);
+        let pre_w = ui.fonts_mut(|f| f.layout_no_wrap(pre, pv_font.clone(), text).size().x);
         p.text(
             egui::pos2(preview.min.x + 14.0, preview.center().y),
             egui::Align2::LEFT_CENTER,
@@ -516,7 +517,7 @@ impl VirtualKeyboard {
                     egui::pos2(cx, preview.center().y - 11.0),
                     egui::pos2(cx + 2.0, preview.center().y + 11.0),
                 ),
-                Rounding::ZERO,
+                CornerRadius::ZERO,
                 accent,
             );
         }
@@ -538,11 +539,11 @@ impl VirtualKeyboard {
                 let y = grid_top + row as f32 * (cell_h + gap);
                 let r = egui::Rect::from_min_size(egui::pos2(x, y), Vec2::new(cell_w, cell_h));
                 let selected = self.open && self.row == row && self.col == col;
-                p.rect_filled(r, Rounding::same(7.0), key_bg);
+                p.rect_filled(r, CornerRadius::same(7), key_bg);
                 if selected {
-                    p.rect_stroke(r, Rounding::same(7.0), Stroke::new(2.6_f32, accent));
+                    p.rect_stroke(r, CornerRadius::same(7), Stroke::new(2.6_f32, accent), egui::StrokeKind::Outside);
                 } else {
-                    p.rect_stroke(r, Rounding::same(7.0), Stroke::new(1.0_f32, key_border));
+                    p.rect_stroke(r, CornerRadius::same(7), Stroke::new(1.0_f32, key_border), egui::StrokeKind::Outside);
                 }
                 p.text(
                     r.center(),
@@ -579,11 +580,11 @@ impl VirtualKeyboard {
             let selected = self.open && self.row == 4 && self.col == i;
             let is_ok = i == 4;
             let fill = if is_ok { accent } else { key_bg };
-            p.rect_filled(r, Rounding::same(7.0), fill);
+            p.rect_filled(r, CornerRadius::same(7), fill);
             if selected {
-                p.rect_stroke(r, Rounding::same(7.0), Stroke::new(2.6_f32, accent));
+                p.rect_stroke(r, CornerRadius::same(7), Stroke::new(2.6_f32, accent), egui::StrokeKind::Outside);
             } else {
-                p.rect_stroke(r, Rounding::same(7.0), Stroke::new(1.0_f32, key_border));
+                p.rect_stroke(r, CornerRadius::same(7), Stroke::new(1.0_f32, key_border), egui::StrokeKind::Outside);
             }
             let lc = if is_ok { Color32::WHITE } else { text };
             p.text(

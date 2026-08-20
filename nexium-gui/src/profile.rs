@@ -2,7 +2,7 @@ use crate::input::InputSnapshot;
 use crate::library::Library;
 use crate::playtime::{format_playtime, PlayTimes};
 use eframe::egui;
-use eframe::egui::{Color32, FontId, Rounding, Sense, Stroke, Vec2};
+use eframe::egui::{Color32, FontId, CornerRadius, Sense, Stroke, Vec2};
 
 #[derive(Clone, Copy)]
 struct Pal {
@@ -294,7 +294,7 @@ pub fn profile_view(
             (55.0 * (state.theme_t * 2.0 - 1.0)) as u8,
         )
     };
-    backdrop_painter.rect_filled(full, Rounding::ZERO, scrim);
+    backdrop_painter.rect_filled(full, CornerRadius::ZERO, scrim);
 
     let mut painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
@@ -558,16 +558,16 @@ pub fn profile_view(
         }
         let selected = state.tab == *tab;
         let ring = if sidebar_focused { accent } else { pal.border };
-        let rounding = Rounding::same(12.0 * s * scale_factor);
+        let rounding = CornerRadius::from(12.0 * s * scale_factor);
         if selected {
             painter.rect_filled(r, rounding, pal.sel);
-            painter.rect_stroke(r, rounding, Stroke::new(1.8 * scale_factor, ring));
+            painter.rect_stroke(r, rounding, Stroke::new(1.8 * scale_factor, ring), egui::StrokeKind::Outside);
 
             let bar_rect = scale_rect(egui::Rect::from_min_size(
                 base_rect.min + Vec2::new(6.0 * s, 12.0 * s),
                 Vec2::new(4.0 * s, base_rect.height() - 24.0 * s),
             ));
-            painter.rect_filled(bar_rect, Rounding::same(2.0 * s * scale_factor), ring);
+            painter.rect_filled(bar_rect, CornerRadius::from(2.0 * s * scale_factor), ring);
         } else if resp.hovered() {
             painter.rect_filled(r, rounding, pal.hover);
         }
@@ -773,7 +773,7 @@ fn system_page(
             Vec2::new(content.width(), row_h),
         );
         let r = scale_rect(row);
-        let rounding = Rounding::same(12.0 * s * scale_factor);
+        let rounding = CornerRadius::from(12.0 * s * scale_factor);
         let is_update = idx == 3;
         let actionable = is_update && update_clickable;
         painter.rect_filled(r, rounding, pal.panel);
@@ -794,6 +794,7 @@ fn system_page(
                 } * scale_factor,
                 stroke_col,
             ),
+            egui::StrokeKind::Outside,
         );
         let label_y = if actionable {
             row.center().y - 10.0 * s
@@ -920,10 +921,10 @@ fn settings_page(
             }
         }
 
-        let rounding = Rounding::same(12.0 * s * scale_factor);
+        let rounding = CornerRadius::from(12.0 * s * scale_factor);
         painter.rect_filled(r, rounding, pal.panel);
         let ring = if focused { accent } else { pal.border };
-        painter.rect_stroke(r, rounding, Stroke::new(1.8 * scale_factor, ring));
+        painter.rect_stroke(r, rounding, Stroke::new(1.8 * scale_factor, ring), egui::StrokeKind::Outside);
 
         painter.text(
             scale_pos(egui::pos2(row.min.x + 24.0 * s, row.center().y - 9.0 * s)),
@@ -1160,7 +1161,7 @@ fn profile_page(
     );
     let scaled_btn_rect = scale_rect(btn_rect);
     let btn_resp = ui.allocate_rect(scaled_btn_rect, Sense::click());
-    let rounding = Rounding::same(9.0 * s * scale_factor);
+    let rounding = CornerRadius::from(9.0 * s * scale_factor);
     let fill_a = if btn_resp.hovered() { 150 } else { 115 };
     let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), fill_a);
     let border = if btn_resp.hovered() {
@@ -1173,6 +1174,7 @@ fn profile_page(
         scaled_btn_rect,
         rounding,
         Stroke::new(2.0 * scale_factor, border),
+        egui::StrokeKind::Outside,
     );
     let text_pos = scaled_btn_rect.center();
     let font_id = FontId::proportional(15.5 * s * scale_factor);
@@ -1243,12 +1245,12 @@ fn profile_page(
 
     painter.rect_filled(
         scaled_field_rect,
-        Rounding::same(9.0 * s * scale_factor),
+        CornerRadius::from(9.0 * s * scale_factor),
         pal.input_bg,
     );
     painter.rect_stroke(
         scaled_field_rect,
-        Rounding::same(9.0 * s * scale_factor),
+        CornerRadius::from(9.0 * s * scale_factor),
         Stroke::new(
             1.8 * scale_factor,
             if state.name_editing {
@@ -1257,6 +1259,7 @@ fn profile_page(
                 pal.border
             },
         ),
+        egui::StrokeKind::Outside,
     );
 
     let font = FontId::proportional(22.0 * s * scale_factor);
@@ -1415,7 +1418,7 @@ fn recently_played_page(
     if state.focus_content {
         state.list_scroll += (target - state.list_scroll) * 0.35;
     }
-    let wheel = ui.input(|i| i.raw_scroll_delta.y);
+    let wheel = ui.input(|i| crate::app::raw_wheel_delta(i).y);
     if wheel != 0.0 {
         state.list_scroll = (state.list_scroll - wheel).clamp(0.0, max_scroll);
     }
@@ -1448,12 +1451,12 @@ fn recently_played_page(
 
         painter.rect_filled(
             scaled_rect,
-            Rounding::same(9.0 * s * scale_factor),
+            CornerRadius::from(9.0 * s * scale_factor),
             if is_sel { pal.sel } else { pal.panel },
         );
         painter.rect_stroke(
             scaled_rect,
-            Rounding::same(9.0 * s * scale_factor),
+            CornerRadius::from(9.0 * s * scale_factor),
             Stroke::new(
                 if is_sel {
                     2.0 * scale_factor
@@ -1462,6 +1465,7 @@ fn recently_played_page(
                 },
                 if is_sel { accent } else { pal.border },
             ),
+            egui::StrokeKind::Outside,
         );
 
         let pad = 7.0 * s;
@@ -1482,7 +1486,7 @@ fn recently_played_page(
         } else {
             painter.rect_filled(
                 scaled_icon,
-                Rounding::same(7.0 * s * scale_factor),
+                CornerRadius::from(7.0 * s * scale_factor),
                 Color32::from_rgb(0x22, 0x22, 0x2C),
             );
         }
@@ -1531,9 +1535,9 @@ fn recently_played_page(
 
         painter.rect_filled(
             track_rect,
-            Rounding::same(2.0 * s * scale_factor),
+            CornerRadius::from(2.0 * s * scale_factor),
             Color32::from_rgb(0x20, 0x20, 0x2A),
         );
-        painter.rect_filled(bar_rect, Rounding::same(2.0 * s * scale_factor), accent);
+        painter.rect_filled(bar_rect, CornerRadius::from(2.0 * s * scale_factor), accent);
     }
 }

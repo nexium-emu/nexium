@@ -61,7 +61,7 @@ impl Splash {
 
         if elapsed < DURATION {
             let painter = ctx.layer_painter(egui::LayerId::background());
-            let rect = ctx.screen_rect();
+            let rect = ctx.viewport_rect();
             painter.rect_filled(rect, 0.0, Color32::BLACK);
             paint_scene(&painter, rect, elapsed, 1.0);
             ctx.request_repaint();
@@ -74,7 +74,7 @@ impl Splash {
                 egui::Order::Foreground,
                 egui::Id::new("splash_fade"),
             ));
-            let rect = ctx.screen_rect();
+            let rect = ctx.viewport_rect();
             painter.rect_filled(
                 rect,
                 0.0,
