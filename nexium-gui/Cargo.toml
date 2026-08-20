@@ -28,6 +28,7 @@ nexium-core = { workspace = true, default-features = false }
 nexium-cpu = { workspace = true, default-features = false }
 nexium-gpu.workspace = true
 nexium-loader.workspace = true
+nexium-runner = { path = "../nexium-runner", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 chrono.workspace = true
 
@@ -60,6 +61,6 @@ sdl3 = { version = "0.18.4", default-features = false, features = ["build-from-s
 
 [features]
 default = ["backend-dynarmic", "backend-rustarmic"]
-backend-dynarmic = ["nexium-core/backend-dynarmic", "nexium-cpu/backend-dynarmic"]
-backend-rustarmic = ["nexium-core/backend-rustarmic", "nexium-cpu/backend-rustarmic"]
+backend-dynarmic = ["nexium-core/backend-dynarmic", "nexium-cpu/backend-dynarmic", "nexium-runner/backend-dynarmic"]
+backend-rustarmic = ["nexium-core/backend-rustarmic", "nexium-cpu/backend-rustarmic", "nexium-runner/backend-rustarmic"]
 

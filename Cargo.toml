@@ -15,6 +15,7 @@ members = [
     "nexium-core",
     "nexium-gpu",
     "nexium-gui",
+    "nexium-runner",
 ]
 
 [workspace.package]

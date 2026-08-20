@@ -1,0 +1,23 @@
+[package]
+name = "nexium-runner"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nexium-common.workspace = true
+nexium-memory.workspace = true
+nexium-core = { workspace = true, default-features = false }
+nexium-cpu = { workspace = true, default-features = false }
+nexium-kernel = { workspace = true, default-features = false }
+
+parking_lot = "0.12"
+log = "0.4"
+cpal = "0.18"
+ringbuf = { workspace = true }
+
+[features]
+default = ["backend-dynarmic", "backend-rustarmic"]
+backend-dynarmic = ["nexium-core/backend-dynarmic", "nexium-cpu/backend-dynarmic", "nexium-kernel/backend-dynarmic"]
+backend-rustarmic = ["nexium-core/backend-rustarmic", "nexium-cpu/backend-rustarmic", "nexium-kernel/backend-rustarmic"]
