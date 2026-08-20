@@ -1824,7 +1824,8 @@ impl Emitter {
     fn load_front_facing_bits(&mut self) -> Word {
         let var = self.front_facing_var_id();
         let front_facing = self.b.load(self.bool_t, None, var, None, []).unwrap();
-        let front_mask = self.const_f32(u32::MAX);
+        let front_mask_bits = self.const_u32(u32::MAX);
+        let front_mask = self.b.bitcast(self.f32_t, None, front_mask_bits).unwrap();
         self.b
             .select(self.f32_t, None, front_facing, front_mask, self.f32_zero)
             .unwrap()
@@ -16496,8 +16497,22 @@ mod tests {
                 })
                 .expect("FrontFacing mask constant")
         };
-        assert_eq!(constant_bits(front_mask), u32::MAX);
-        assert_eq!(constant_bits(back_mask), 0);
+        let resolve_bitcast = |id| {
+            instructions
+                .iter()
+                .copied()
+                .find_map(|instruction| {
+                    (instruction.result_id == Some(id)
+                        && instruction.class.opcode == rspirv::spirv::Op::Bitcast)
+                        .then(|| match instruction.operands.as_slice() {
+                            [Operand::IdRef(source)] => *source,
+                            operands => panic!("unexpected bitcast operands: {operands:?}"),
+                        })
+                })
+                .unwrap_or(id)
+        };
+        assert_eq!(constant_bits(resolve_bitcast(front_mask)), u32::MAX);
+        assert_eq!(constant_bits(resolve_bitcast(back_mask)), 0);
     }
 
     #[test]
