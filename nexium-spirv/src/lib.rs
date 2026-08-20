@@ -14,8 +14,8 @@ use nexium_shader::{
 use rspirv::binary::Assemble;
 use rspirv::dr::Operand;
 use rspirv::spirv::{
-    AddressingModel, BuiltIn, Capability, Decoration, ExecutionModel, FunctionControl, GLOp,
-    ImageFormat, MemoryModel, MemorySemantics, Scope, StorageClass, Word,
+    AddressingModel, BuiltIn, Capability, Decoration, ExecutionModel, FunctionControl,
+    GlslStd450Op, ImageFormat, MemoryModel, MemorySemantics, Scope, StorageClass, Word,
 };
 
 fn lop3_anf_coefficients(lut: u8) -> u8 {
@@ -975,7 +975,7 @@ impl Emitter {
         let glsl = b.ext_inst_import("GLSL.std.450");
         b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
 
-        let f32_t = b.type_float(32);
+        let f32_t = b.type_float(32, None);
         let vec2_t = b.type_vector(f32_t, 2);
         let vec3_t = b.type_vector(f32_t, 3);
         let vec4_t = b.type_vector(f32_t, 4);
@@ -3466,7 +3466,7 @@ impl Emitter {
         self.b.begin_block(Some(atomic_block)).unwrap();
         let pointer = self.shared_word_pointer_from_index(word_index);
         let scope = self.const_u32(Scope::Workgroup as u32);
-        let semantics = self.const_u32(MemorySemantics::NONE.bits());
+        let semantics = self.const_u32(MemorySemantics::RELAXED.bits());
         let (atomic, atomic_end) = self.emit_compute_image_atomic(
             op,
             ImageAtomicType::U32,
@@ -3763,7 +3763,7 @@ impl Emitter {
         let value_word = self.lower_value(value);
         let value = self.as_u32(value_word);
         let scope = self.const_u32(Scope::Device as u32);
-        let semantics = self.const_u32(MemorySemantics::NONE.bits());
+        let semantics = self.const_u32(MemorySemantics::RELAXED.bits());
 
         let result = if let Some(predicate) = inst.pred {
             let guard = self.resolve_pred(predicate.idx, predicate.negate);
@@ -5236,7 +5236,7 @@ impl Emitter {
                     let value_f = self.lower_value(value);
                     let value_u = self.b.bitcast(u32_t, None, value_f).unwrap();
                     let scope = self.const_u32(Scope::Device as u32);
-                    let semantics = self.const_u32(MemorySemantics::NONE.bits());
+                    let semantics = self.const_u32(MemorySemantics::RELAXED.bits());
                     let data_type = if *is_signed {
                         ImageAtomicType::S32
                     } else {
@@ -6542,7 +6542,7 @@ impl Emitter {
                         self.u32_t,
                         None,
                         self.glsl,
-                        GLOp::FindUMsb as u32,
+                        GlslStd450Op::FindUMsb as u32,
                         [Operand::IdRef(value)],
                     )
                     .unwrap();
@@ -11795,7 +11795,7 @@ mod tests {
             .find(|instruction| {
                 instruction.class.opcode == rspirv::spirv::Op::ExtInst
                     && instruction.operands.get(1)
-                        == Some(&Operand::LiteralExtInstInteger(GLOp::Fma as u32))
+                        == Some(&Operand::LiteralExtInstInteger(GlslStd450Op::Fma as u32))
             })
             .expect("vertex FMA");
         for operand_index in [3, 4] {
@@ -16929,7 +16929,7 @@ mod tests {
         assert!(instructions.iter().any(|instruction| {
             instruction.class.opcode == rspirv::spirv::Op::ExtInst
                 && instruction.operands.get(1)
-                    == Some(&Operand::LiteralExtInstInteger(GLOp::FindUMsb as u32))
+                    == Some(&Operand::LiteralExtInstInteger(GlslStd450Op::FindUMsb as u32))
         }));
         for opcode in [
             rspirv::spirv::Op::BitCount,
@@ -17700,7 +17700,7 @@ mod tests {
                 panic!("unexpected {opcode:?} operands: {:?}", atomic.operands);
             };
             assert_eq!(constants[scope], Scope::Device as u32);
-            assert_eq!(constants[semantics], MemorySemantics::NONE.bits());
+            assert_eq!(constants[semantics], MemorySemantics::RELAXED.bits());
         }
         assert_eq!(
             instructions
@@ -18375,7 +18375,7 @@ mod tests {
             panic!("unexpected AtomicOr operands: {:?}", atomic.operands);
         };
         assert_eq!(constants[scope], Scope::Workgroup as u32);
-        assert_eq!(constants[semantics], MemorySemantics::NONE.bits());
+        assert_eq!(constants[semantics], MemorySemantics::RELAXED.bits());
 
         let instructions = blocks
             .iter()

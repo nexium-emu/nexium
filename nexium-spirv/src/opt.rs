@@ -36,6 +36,35 @@ fn remap_operand(operand: &mut Operand, remap: &HashMap<Word, Word>) {
     }
 }
 
+fn is_type(opcode: Op) -> bool {
+    matches!(
+        opcode,
+        Op::TypeVoid
+            | Op::TypeBool
+            | Op::TypeInt
+            | Op::TypeFloat
+            | Op::TypeVector
+            | Op::TypeMatrix
+            | Op::TypeImage
+            | Op::TypeSampler
+            | Op::TypeSampledImage
+            | Op::TypeArray
+            | Op::TypeRuntimeArray
+            | Op::TypeStruct
+            | Op::TypeOpaque
+            | Op::TypePointer
+            | Op::TypeFunction
+            | Op::TypeEvent
+            | Op::TypeDeviceEvent
+            | Op::TypeReserveId
+            | Op::TypeQueue
+            | Op::TypePipe
+            | Op::TypeAccelerationStructureKHR
+            | Op::TypeRayQueryKHR
+            | Op::TypeForwardPointer
+    )
+}
+
 fn is_deduplicable_constant(opcode: Op) -> bool {
     matches!(
         opcode,
@@ -92,7 +121,7 @@ pub fn dedup_constants(words: Vec<u32>) -> Vec<u32> {
             continue;
         }
         let opcode = inst.class.opcode;
-        let deduplicable = rspirv::grammar::reflect::is_type(opcode)
+        let deduplicable = is_type(opcode)
             || is_deduplicable_constant(opcode)
                 && !(has_continued_constants && opcode == Op::ConstantComposite);
         if !deduplicable {
