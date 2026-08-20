@@ -45,7 +45,7 @@ num_enum = "0.7"
 byteorder = "1"
 
 aes = "0.9"
-lz4_flex = { version = "0.14", default-features = false }
+lz4_flex = { version = "0.14", default-features = false, features = ["alloc"] }
 
 parking_lot = "0.12"
 crossbeam = "0.8"
