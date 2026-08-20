@@ -3,13 +3,13 @@ use std::hash::{BuildHasher, Hasher};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 const SR: f32 = 48_000.0;
 
@@ -90,32 +90,38 @@ fn decode_mp3_stereo(bytes: &'static [u8]) -> Option<MusicTrack> {
     let source = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
     let mut hint = Hint::new();
     hint.with_extension("mp3");
-    let format_options = FormatOptions {
-        enable_gapless: true,
-        ..FormatOptions::default()
-    };
-    let probed = symphonia::default::get_probe()
-        .format(&hint, source, &format_options, &MetadataOptions::default())
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            source,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
         .ok()?;
-    let mut format = probed.format;
-    let track = format.default_track()?;
+    let track = format.default_track(TrackType::Audio)?;
     let track_id = track.id;
-    let sample_rate = track.codec_params.sample_rate.unwrap_or(SR as u32) as f64;
+    let codec_params = match track.codec_params.as_ref()? {
+        CodecParameters::Audio(params) => params,
+        _ => return None,
+    };
+    let sample_rate = codec_params.sample_rate.unwrap_or(SR as u32) as f64;
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make_audio_decoder(codec_params, &AudioDecoderOptions::default().gapless(true))
         .ok()?;
     let mut samples = Vec::new();
+    let mut interleaved = Vec::new();
 
     loop {
         let packet = match format.next_packet() {
-            Ok(packet) => packet,
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
             Err(SymphoniaError::IoError(_)) => break,
             Err(err) => {
                 log::warn!("Failed to read UI music packet: {err}");
                 break;
             }
         };
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
         let decoded = match decoder.decode(&packet) {
@@ -127,14 +133,12 @@ fn decode_mp3_stereo(bytes: &'static [u8]) -> Option<MusicTrack> {
                 return None;
             }
         };
-        let spec = *decoded.spec();
-        let channels = spec.channels.count();
+        let channels = decoded.spec().channels().count();
         if channels == 0 {
             continue;
         }
-        let mut interleaved = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-        interleaved.copy_interleaved_ref(decoded);
-        for frame in interleaved.samples().chunks(channels) {
+        decoded.copy_to_vec_interleaved(&mut interleaved);
+        for frame in interleaved.chunks(channels) {
             let left = frame[0];
             let right = frame.get(1).copied().unwrap_or(left);
             samples.push([left, right]);
@@ -382,21 +386,22 @@ fn build() -> Option<Engine> {
     let host = cpal::default_host();
     let device = host.default_output_device()?;
     let device_name = device
-        .name()
+        .description()
+        .map(|desc| desc.name().to_string())
         .unwrap_or_else(|_| "default output".to_string());
 
     let cfg = device
         .supported_output_configs()
         .ok()?
         .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
-        .max_by_key(|c| c.max_sample_rate().0)
+        .max_by_key(|c| c.max_sample_rate())
         .map(|c| c.with_max_sample_rate())
         .or_else(|| device.default_output_config().ok())?;
     if cfg.sample_format() != cpal::SampleFormat::F32 {
         return None;
     }
     let channels = cfg.channels() as usize;
-    let dev_sr = cfg.sample_rate().0 as f32;
+    let dev_sr = cfg.sample_rate() as f32;
     let sfx_ratio = SR / dev_sr;
     let gain_step = 1.0 / (0.45 * dev_sr);
     let mode_step = 1.0 / (0.45 * dev_sr);
@@ -413,7 +418,7 @@ fn build() -> Option<Engine> {
     let err_cb = |e| log::warn!("ui_audio stream error: {}", e);
     let stream = device
         .build_output_stream(
-            &cfg.config(),
+            cfg.config(),
             move |out: &mut [f32], _| {
                 let frames = out.len() / channels.max(1);
                 let target = f32::from_bits(MUSIC_TARGET.load(Ordering::Relaxed));
