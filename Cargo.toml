@@ -64,6 +64,9 @@ memmap2 = "0.9"
 
 dynarmic-sys-mythrax = "0.3.0"
 
+[patch.crates-io]
+dynarmic-sys-mythrax = { path = "../dynarmic-sys" }
+
 [profile.dev]
 opt-level = 1
 
