@@ -36,7 +36,6 @@ memmap2.workspace = true
 getrandom = "0.4"
 opusic-sys = "=0.7.5"
 
-sdl2.workspace = true
 directories.workspace = true
 
 [features]
