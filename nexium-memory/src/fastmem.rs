@@ -91,6 +91,14 @@ mod sys {
     }
 
     pub fn reserve(size: usize) -> (*mut u8, bool) {
+        let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if host_page != 4096 {
+            log::warn!(
+                "fastmem: host page size {} != 4096; arena disabled (commit granularity mismatch)",
+                host_page
+            );
+            return (std::ptr::null_mut(), false);
+        }
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
