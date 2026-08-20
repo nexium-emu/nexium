@@ -39,7 +39,7 @@ pub struct PipelineKey {
     pub color_write_mask: u32,
 }
 
-const SPEC_VERSION: u32 = 40;
+const SPEC_VERSION: u32 = 41;
 const CACHE_SAVE_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const KNOWN_DRIVER_HOSTILE_PIPELINES: &[(u64, u64)] =
     &[(0x59b9_0e74_4b2a_7537, 0xe505_d075_601e_e633)];
@@ -716,7 +716,7 @@ impl PipelineCache {
                     }
                 }
             })
-            .and_then(|bytes| match bincode::deserialize::<SpecFile>(&bytes) {
+            .and_then(|bytes| match postcard::from_bytes::<SpecFile>(&bytes) {
                 Ok(f) if f.version == SPEC_VERSION => Some(f),
                 Ok(f) => {
                     log::warn!(
@@ -877,7 +877,7 @@ impl PipelineCache {
             version: SPEC_VERSION,
             specs: self.specs.values().cloned().collect(),
         };
-        if let Ok(bytes) = bincode::serialize(&file) {
+        if let Ok(bytes) = postcard::to_allocvec(&file) {
             self.specs_saved_count = self.specs.len();
             if let Some(tx) = &self.specs_tx {
                 let _ = tx.send(bytes);

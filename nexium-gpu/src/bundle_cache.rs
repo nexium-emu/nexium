@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const BUNDLE_MAGIC: [u8; 8] = *b"NXBUNDL1";
-const BUNDLE_VERSION: u32 = 50;
+const BUNDLE_VERSION: u32 = 51;
 const SPIRV_MAGIC: u32 = 0x0723_0203;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -149,7 +149,7 @@ fn load_file(path: &PathBuf) -> Option<BundleFile> {
             return None;
         }
     };
-    match bincode::deserialize::<BundleFile>(&bytes) {
+    match postcard::from_bytes::<BundleFile>(&bytes) {
         Ok(f) if f.magic == BUNDLE_MAGIC && f.version == BUNDLE_VERSION => {
             if f.build_id != build_id() {
                 log::info!("bundle cache from a different build, ignoring");
@@ -204,7 +204,7 @@ fn spawn_writer(
                         }
                     };
                     let mut writer = std::io::BufWriter::new(output);
-                    if let Err(error) = bincode::serialize_into(&mut writer, &file) {
+                    if let Err(error) = postcard::to_io(&file, &mut writer) {
                         log::warn!("bundle cache serialize failed: {:?}", error);
                         drop(writer);
                         let _ = std::fs::remove_file(&tmp);
@@ -476,8 +476,8 @@ mod tests {
         };
 
         assert_eq!(
-            bincode::serialize(&borrowed).unwrap(),
-            bincode::serialize(&owned).unwrap()
+            postcard::to_allocvec(&borrowed).unwrap(),
+            postcard::to_allocvec(&owned).unwrap()
         );
     }
 
@@ -500,7 +500,7 @@ mod tests {
             failed: Vec::new(),
         };
 
-        std::fs::write(&path, bincode::serialize(&file).unwrap()).unwrap();
+        std::fs::write(&path, postcard::to_allocvec(&file).unwrap()).unwrap();
         let loaded = load_file(&path);
         std::fs::remove_file(&path).unwrap();
 
@@ -517,9 +517,9 @@ mod tests {
             ),
         );
 
-        let bytes = bincode::serialize(&record).expect("serialize BundleRecord");
+        let bytes = postcard::to_allocvec(&record).expect("serialize BundleRecord");
         let decoded =
-            bincode::deserialize::<BundleRecord>(&bytes).expect("deserialize BundleRecord");
+            postcard::from_bytes::<BundleRecord>(&bytes).expect("deserialize BundleRecord");
 
         assert!(record_valid(&decoded));
         assert_eq!(decoded.graphics_cbuf_reads, record.graphics_cbuf_reads);
