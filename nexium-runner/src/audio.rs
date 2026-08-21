@@ -37,6 +37,11 @@ impl PrebufState {
 
     fn callback_ratio(&mut self, frames_written: usize, nominal_ratio: f32) -> f32 {
         let nominal = nominal_ratio.clamp(0.05, 4.0);
+        if (nominal - 1.0).abs() < 1e-6 {
+            self.last_callback = Some(std::time::Instant::now());
+            self.ratio = 1.0;
+            return 1.0;
+        }
         let now = std::time::Instant::now();
         let measured = self
             .last_callback
@@ -321,6 +326,23 @@ impl HostPcmSink for HostAudioSink {
     }
 }
 
+#[cfg(target_os = "android")]
+const DESIRED_BUFFER_FRAMES: Option<u32> = Some(1024);
+#[cfg(not(target_os = "android"))]
+const DESIRED_BUFFER_FRAMES: Option<u32> = None;
+
+fn apply_buffer_size(config: &mut StreamConfig, supported: Option<&cpal::SupportedBufferSize>) {
+    let Some(want) = DESIRED_BUFFER_FRAMES else {
+        return;
+    };
+    let frames = match supported {
+        Some(cpal::SupportedBufferSize::Range { min, max }) => want.clamp(*min, *max),
+        _ => want,
+    };
+    config.buffer_size = cpal::BufferSize::Fixed(frames);
+    log::info!("audio: requesting fixed buffer of {} frames", frames);
+}
+
 fn pick_config(device: &cpal::Device) -> Result<(StreamConfig, SampleFormat), String> {
     let supported: Vec<_> = device
         .supported_output_configs()
@@ -335,13 +357,19 @@ fn pick_config(device: &cpal::Device) -> Result<(StreamConfig, SampleFormat), St
                 && r.min_sample_rate() <= want_sr
                 && r.max_sample_rate() >= want_sr
         }) {
-            return Ok((range.with_sample_rate(want_sr).config(), fmt));
+            let mut config = range.with_sample_rate(want_sr).config();
+            apply_buffer_size(&mut config, Some(range.buffer_size()));
+            return Ok((config, fmt));
         }
     }
     let def = device
         .default_output_config()
         .map_err(|e| format!("default_output_config: {}", e))?;
-    Ok((def.config(), def.sample_format()))
+    let format = def.sample_format();
+    let buffer = def.buffer_size().clone();
+    let mut config = def.config();
+    apply_buffer_size(&mut config, Some(&buffer));
+    Ok((config, format))
 }
 
 pub fn init_host_audio(preferred_device: Option<&str>, initial_volume: f32) {
