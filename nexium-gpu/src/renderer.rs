@@ -3983,6 +3983,26 @@ impl Renderer {
             props.limits.min_storage_buffer_offset_alignment.max(1);
         let max_storage_buffer_range = u64::from(props.limits.max_storage_buffer_range);
         let max_texel_buffer_elements = props.limits.max_texel_buffer_elements;
+        let can_pin_guest_warp = subgroup_size_control_supported
+            && subgroup_size_properties
+                .required_subgroup_size_stages
+                .contains(vk::ShaderStageFlags::COMPUTE)
+            && subgroup_size_properties.min_subgroup_size <= 32
+            && subgroup_size_properties.max_subgroup_size >= 32;
+        let host_warp = if subgroup_size_control_supported {
+            subgroup_size_properties.max_subgroup_size
+        } else {
+            subgroup_properties.subgroup_size
+        };
+        let can_emulate_guest_warp = host_warp >= 32 && host_warp % 32 == 0;
+        let big_warp = !can_pin_guest_warp && can_emulate_guest_warp;
+        nexium_common::gpu_caps::set_big_warp(big_warp);
+        if big_warp {
+            log::info!(
+                "compute: emulating 32-wide guest warps on a {}-wide host subgroup",
+                host_warp
+            );
+        }
         let compute_feature_reason = if !queue_supports_compute {
             Some("selected graphics queue has no compute capability".to_string())
         } else if !storage_image_write_without_format_supported {
@@ -3993,14 +4013,15 @@ impl Renderer {
             Some("shaderSignedZeroInfNanPreserveFloat32 is unavailable".to_string())
         } else if !uniform_buffer_standard_layout_supported {
             Some("uniformBufferStandardLayout is unavailable".to_string())
-        } else if !subgroup_size_control_supported
-            || !subgroup_size_properties
-                .required_subgroup_size_stages
-                .contains(vk::ShaderStageFlags::COMPUTE)
-            || subgroup_size_properties.min_subgroup_size > 32
-            || subgroup_size_properties.max_subgroup_size < 32
-        {
-            Some("required compute subgroup size 32 is unavailable".to_string())
+        } else if !can_pin_guest_warp && !can_emulate_guest_warp {
+            Some(format!(
+                "no usable compute subgroup width (size_control={}, stages={:?}, min={}, max={}, device_subgroup={})",
+                subgroup_size_control_supported,
+                subgroup_size_properties.required_subgroup_size_stages,
+                subgroup_size_properties.min_subgroup_size,
+                subgroup_size_properties.max_subgroup_size,
+                subgroup_properties.subgroup_size,
+            ))
         } else if !subgroup_properties
             .supported_stages
             .contains(vk::ShaderStageFlags::COMPUTE)

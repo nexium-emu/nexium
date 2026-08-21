@@ -370,6 +370,7 @@ struct ModuleCacheKey {
     cbuf_sizes: [u32; nexium_spirv::COMPUTE_CBUF_SLOTS],
     resources: Vec<ComputeImageResource>,
     num_storage_buffers: u32,
+    big_warp: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -952,6 +953,7 @@ fn prepare_and_execute(
         cbuf_sizes,
         num_storage_buffers: frontend.storage_buffers.len() as u32,
         resources: resolved.iter().map(|resource| resource.metadata).collect(),
+        big_warp: nexium_common::gpu_caps::big_warp(),
     };
     let module_key = ModuleCacheKey {
         frontend: frontend_key,
@@ -964,6 +966,7 @@ fn prepare_and_execute(
         cbuf_sizes,
         resources: options.resources.clone(),
         num_storage_buffers: options.num_storage_buffers,
+        big_warp: options.big_warp,
     };
     let module = cached_compute_module(module_key, &frontend.cfg, &options)?;
     if module.texture_bound_cbuf != texture_bound_cbuf {
@@ -1567,7 +1570,11 @@ fn prepare_and_execute(
         group_count,
         local_size,
         shared_memory_size: qmd[0x11] & 0x3ffff,
-        required_subgroup_size: Some(32),
+        required_subgroup_size: if nexium_common::gpu_caps::big_warp() {
+            None
+        } else {
+            Some(32)
+        },
         requires_workgroup_explicit_layout: false,
         uniform_buffers,
         texel_buffers,

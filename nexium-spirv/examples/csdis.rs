@@ -15,6 +15,7 @@ fn main() {
         cbuf_sizes: [65536; COMPUTE_CBUF_SLOTS],
         num_storage_buffers: buffers.len() as u32,
         resources: Vec::new(),
+        big_warp: false,
     };
     let module = emit_compute(&cfg, &options).expect("emit compute");
     let mut loader = rspirv::dr::Loader::new();

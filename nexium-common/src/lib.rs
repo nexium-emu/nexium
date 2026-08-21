@@ -4,6 +4,7 @@ pub mod dumps;
 pub mod error;
 pub mod file_logger;
 pub mod frame_present;
+pub mod gpu_caps;
 pub mod host_wake;
 pub mod log_init;
 pub mod log_sink;

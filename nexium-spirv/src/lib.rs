@@ -228,6 +228,7 @@ pub struct ComputeOptions {
     pub cbuf_sizes: [u32; COMPUTE_CBUF_SLOTS],
     pub num_storage_buffers: u32,
     pub resources: Vec<ComputeImageResource>,
+    pub big_warp: bool,
 }
 
 impl Default for ComputeOptions {
@@ -242,6 +243,7 @@ impl Default for ComputeOptions {
             cbuf_sizes: [COMPUTE_CBUF_MAX_SIZE; COMPUTE_CBUF_SLOTS],
             num_storage_buffers: 0,
             resources: Vec::new(),
+            big_warp: false,
         }
     }
 }
@@ -1610,9 +1612,68 @@ impl Emitter {
         v
     }
 
-    fn subgroup_lane_id(&mut self) -> Word {
+    fn big_warp(&self) -> bool {
+        self.compute_options
+            .as_ref()
+            .map(|options| options.big_warp)
+            .unwrap_or(false)
+    }
+
+    fn subgroup_host_lane_id(&mut self) -> Word {
         let v = self.subgroup_id_var();
         self.b.load(self.u32_t, None, v, None, []).unwrap()
+    }
+
+    fn subgroup_lane_id(&mut self) -> Word {
+        let raw = self.subgroup_host_lane_id();
+        if !self.big_warp() {
+            return raw;
+        }
+        let mask = self.const_u32(31);
+        self.b.bitwise_and(self.u32_t, None, raw, mask).unwrap()
+    }
+
+    fn warp_partition_index(&mut self) -> Word {
+        let raw = self.subgroup_host_lane_id();
+        let five = self.const_u32(5);
+        self.b
+            .shift_right_logical(self.u32_t, None, raw, five)
+            .unwrap()
+    }
+
+    fn warp_partition_base(&mut self) -> Word {
+        let index = self.warp_partition_index();
+        let five = self.const_u32(5);
+        self.b
+            .shift_left_logical(self.u32_t, None, index, five)
+            .unwrap()
+    }
+
+    fn warp_extract(&mut self, ballot: Word) -> Word {
+        if !self.big_warp() {
+            return self
+                .b
+                .composite_extract(self.u32_t, None, ballot, [0])
+                .unwrap();
+        }
+        let index = self.warp_partition_index();
+        let mut acc = self
+            .b
+            .composite_extract(self.u32_t, None, ballot, [3])
+            .unwrap();
+        for component in (0..3u32).rev() {
+            let value = self
+                .b
+                .composite_extract(self.u32_t, None, ballot, [component])
+                .unwrap();
+            let key = self.const_u32(component);
+            let is_match = self.b.i_equal(self.bool_t, None, index, key).unwrap();
+            acc = self
+                .b
+                .select(self.u32_t, None, is_match, value, acc)
+                .unwrap();
+        }
+        acc
     }
 
     fn subgroup_mask(&mut self, kind: SubgroupMask) -> Word {
@@ -6692,6 +6753,12 @@ impl Emitter {
                 let maskv = self.lower_value(mask);
                 let mask_u = self.as_u32(maskv);
                 let (src_tid, in_range) = self.shfl_target(*mode, idx, mask_u);
+                let src_tid = if self.big_warp() {
+                    let base = self.warp_partition_base();
+                    self.b.i_add(self.u32_t, None, base, src_tid).unwrap()
+                } else {
+                    src_tid
+                };
                 let scope = self.const_u32(3);
                 let shuffled = self
                     .b
@@ -6741,11 +6808,47 @@ impl Emitter {
                     .b
                     .group_non_uniform_ballot(self.uvec4_t, None, scope, ballot_predicate)
                     .unwrap();
-                let ballot_x = self
-                    .b
-                    .composite_extract(self.u32_t, None, ballot, [0])
-                    .unwrap();
-                let scalar = match mode {
+                let ballot_x = self.warp_extract(ballot);
+                let scalar = if self.big_warp() {
+                    let participant_predicate = guard.unwrap_or(self.bool_true);
+                    let participants = self
+                        .b
+                        .group_non_uniform_ballot(
+                            self.uvec4_t,
+                            None,
+                            scope,
+                            participant_predicate,
+                        )
+                        .unwrap();
+                    let active = self.warp_extract(participants);
+                    let zero = self.const_u32(0);
+                    match mode {
+                        VoteMode::All => {
+                            let masked = self
+                                .b
+                                .bitwise_and(self.u32_t, None, ballot_x, active)
+                                .unwrap();
+                            self.b.i_equal(self.bool_t, None, masked, active).unwrap()
+                        }
+                        VoteMode::Any => {
+                            let masked = self
+                                .b
+                                .bitwise_and(self.u32_t, None, ballot_x, active)
+                                .unwrap();
+                            self.b.i_not_equal(self.bool_t, None, masked, zero).unwrap()
+                        }
+                        VoteMode::Equal => {
+                            let diff = self
+                                .b
+                                .bitwise_xor(self.u32_t, None, ballot_x, active)
+                                .unwrap();
+                            let none = self.b.i_equal(self.bool_t, None, diff, zero).unwrap();
+                            let all = self.b.i_equal(self.bool_t, None, diff, active).unwrap();
+                            self.b.logical_or(self.bool_t, None, none, all).unwrap()
+                        }
+                    }
+                } else {
+                    match mode {
                     VoteMode::All => self
                         .b
                         .group_non_uniform_all(self.bool_t, None, scope, vote_predicate)
@@ -6778,6 +6881,7 @@ impl Emitter {
                         self.b
                             .logical_or(self.bool_t, None, all_false, all_true)
                             .unwrap()
+                    }
                     }
                 };
                 let result = match guard {
@@ -16835,6 +16939,7 @@ mod tests {
             texture_bound_cbuf: 2,
             cbuf_sizes: [COMPUTE_CBUF_MAX_SIZE; COMPUTE_CBUF_SLOTS],
             num_storage_buffers: 0,
+            big_warp: false,
             resources: vec![
                 ComputeImageResource {
                     handle: TextureHandleOrigin::Bindless {
@@ -16962,6 +17067,93 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn compute_subgroup_big_warp_emulates_guest_warp_width() {
+        let mut program = nexium_shader::IrProgram::new();
+        program.emit(IrOp::SubgroupLaneId, Some(0));
+        program.emit(
+            IrOp::SubgroupMask {
+                kind: SubgroupMask::Lt,
+            },
+            Some(1),
+        );
+        program.emit_pred(
+            IrOp::SubgroupVote {
+                source_pred: nexium_shader::Predicate {
+                    idx: 0,
+                    negate: false,
+                },
+                mode: VoteMode::All,
+                pred_dest: 0,
+                old: IrValue::Zero,
+            },
+            Some(2),
+            None,
+        );
+        program.emit_pred(
+            IrOp::SubgroupVote {
+                source_pred: nexium_shader::Predicate {
+                    idx: 0,
+                    negate: false,
+                },
+                mode: VoteMode::Any,
+                pred_dest: 0,
+                old: IrValue::Zero,
+            },
+            Some(3),
+            None,
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+
+        let emitted = emit_compute(
+            &cfg,
+            &ComputeOptions {
+                local_size: [32, 1, 1],
+                big_warp: true,
+                ..ComputeOptions::default()
+            },
+        )
+        .expect("big warp compute module");
+        validates_with_spirv_val_if_available(&emitted.words);
+        let module = rspirv::dr::load_words(&emitted.words).expect("valid SPIR-V");
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+
+        for opcode in [
+            rspirv::spirv::Op::GroupNonUniformAll,
+            rspirv::spirv::Op::GroupNonUniformAny,
+            rspirv::spirv::Op::VectorExtractDynamic,
+        ] {
+            assert!(
+                !instructions
+                    .iter()
+                    .any(|instruction| instruction.class.opcode == opcode),
+                "{opcode:?} must not survive big-warp lowering"
+            );
+        }
+        for opcode in [
+            rspirv::spirv::Op::GroupNonUniformBallot,
+            rspirv::spirv::Op::BitwiseAnd,
+            rspirv::spirv::Op::Select,
+            rspirv::spirv::Op::ShiftRightLogical,
+        ] {
+            assert!(
+                instructions
+                    .iter()
+                    .any(|instruction| instruction.class.opcode == opcode),
+                "missing {opcode:?}"
+            );
+        }
+    }
+
     fn compute_subgroup_ir_emits_lane_masks_ballot_all_any_and_equal() {
         let mut program = nexium_shader::IrProgram::new();
         program.emit(IrOp::SubgroupLaneId, Some(0));
@@ -18106,6 +18298,7 @@ mod tests {
             texture_bound_cbuf: 2,
             cbuf_sizes: [COMPUTE_CBUF_MAX_SIZE; COMPUTE_CBUF_SLOTS],
             num_storage_buffers: 0,
+            big_warp: false,
             resources: vec![
                 ComputeImageResource {
                     handle: TextureHandleOrigin::Bindless {
