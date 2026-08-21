@@ -172,9 +172,139 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+
+  android:
+    name: NeXium APK (arm64-v8a)
+    runs-on: ubuntu-latest
+    env:
+      BUILD_TOOLS_VERSION: "35.0.0"
+      MIN_SDK: "26"
+      TARGET_SDK: "34"
+    steps:
+      - name: Checkout NeXium
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-arm64
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config libboost-dev
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: >-
+            platforms;android-${{ env.TARGET_SDK }}
+            build-tools;${{ env.BUILD_TOOLS_VERSION }}
+
+      - name: Export Android environment
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          test -d "$NDK" || { echo "::error::no Android NDK on the runner"; exit 1; }
+          echo "using NDK: $NDK"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "BOOST_ROOT=/usr/include" >> "$GITHUB_ENV"
+          echo "BUILD_TOOLS=$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_JAR=$ANDROID_SDK_ROOT/platforms/android-$TARGET_SDK/android.jar" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build native library
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384"
+        run: cargo ndk -t arm64-v8a --platform "$MIN_SDK" build --release -p nexium-android
+
+      - name: Stage native libraries
+        run: |
+          set -euo pipefail
+          STAGE=target/android-apk
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/lib/arm64-v8a"
+          cp target/aarch64-linux-android/release/libnexium_android.so "$STAGE/lib/arm64-v8a/"
+          cp "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
+             "$STAGE/lib/arm64-v8a/"
+
+      - name: Verify no unresolved Dynarmic symbols
+        run: |
+          set -euo pipefail
+          READELF="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          SO=target/android-apk/lib/arm64-v8a/libnexium_android.so
+          UND=$("$READELF" --dyn-syms "$SO" | awk '$7=="UND" {print $8}' | grep -c "Dynarmic" || true)
+          echo "unresolved Dynarmic symbols: $UND"
+          if [ "$UND" -ne 0 ]; then
+            echo "::error::libnexium_android.so has unresolved Dynarmic symbols; it would fail dlopen on device"
+            "$READELF" --dyn-syms "$SO" | awk '$7=="UND" {print $8}' | grep "Dynarmic" || true
+            exit 1
+          fi
+
+      - name: Verify 16 KB page alignment
+        run: |
+          set -euo pipefail
+          READELF="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          SO=target/android-apk/lib/arm64-v8a/libnexium_android.so
+          BAD=$("$READELF" -l "$SO" | awk '$1=="LOAD" {print $NF}' | grep -cv "0x4000" || true)
+          if [ "$BAD" -ne 0 ]; then
+            echo "::error::LOAD segments are not 16 KB aligned; the app will not load on 16 KB-page devices"
+            "$READELF" -l "$SO" | grep LOAD
+            exit 1
+          fi
+
+      - name: Package APK
+        run: |
+          set -euo pipefail
+          STAGE=target/android-apk
+          "$BUILD_TOOLS/aapt2" link -o "$STAGE/base.apk" \
+            --manifest android/AndroidManifest.xml \
+            -I "$ANDROID_JAR" \
+            --min-sdk-version "$MIN_SDK" \
+            --target-sdk-version "$TARGET_SDK"
+          (cd "$STAGE" && jar --update --file base.apk \
+            lib/arm64-v8a/libnexium_android.so lib/arm64-v8a/libc++_shared.so)
+          "$BUILD_TOOLS/zipalign" -f -p 4 "$STAGE/base.apk" "$STAGE/aligned.apk"
+
+      - name: Sign APK
+        run: |
+          set -euo pipefail
+          KEYSTORE="$HOME/.android/debug.keystore"
+          mkdir -p "$HOME/.android" dist
+          if [ ! -f "$KEYSTORE" ]; then
+            keytool -genkeypair -keystore "$KEYSTORE" -storepass android -keypass android \
+              -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" \
+              -keyalg RSA -keysize 2048 -validity 10000
+          fi
+          "$BUILD_TOOLS/apksigner" sign --ks "$KEYSTORE" \
+            --ks-pass pass:android --key-pass pass:android \
+            --out dist/nexium-android-arm64.apk target/android-apk/aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --print-certs dist/nexium-android-arm64.apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nexium-android-arm64
+          path: dist/nexium-android-arm64.apk
+          if-no-files-found: error
+          retention-days: 1
+
   release:
     name: Pre-release
-    needs: build
+    needs: [build, android]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -209,6 +339,7 @@ jobs:
             - Windows (x86_64): `nexium-windows-x86_64.zip`
             - Linux (x86_64): `nexium-linux-x86_64.tar.gz`
             - macOS (Apple Silicon): `nexium-macos-arm64.tar.gz`
+            - Android (arm64-v8a): `nexium-android-arm64.apk`
 
             > Pre-release / experimental. NeXium is an x86_64-host emulator; the macOS build is the rustarmic backend compiled for Apple Silicon and is provided as a build artifact only (it will not run on Apple Silicon).
 
@@ -225,7 +356,7 @@ jobs:
             embeds: [ {
               title: ("NeXium nightly " + $ver),
               url: $url,
-              description: "A new early-access build is up. Windows and Linux (x86_64) downloads are on the release page.\n\nExperimental — expect bugs.",
+              description: "A new early-access build is up. Windows and Linux (x86_64) downloads plus an Android arm64 APK are on the release page.\n\nExperimental — expect bugs.",
               color: 5814783
             } ]
           }')"
