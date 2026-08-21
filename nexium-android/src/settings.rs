@@ -27,6 +27,8 @@ pub struct Settings {
     pub async_shaders: bool,
     #[serde(default = "default_true")]
     pub async_render: bool,
+    #[serde(default = "default_true")]
+    pub fastmem: bool,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -42,6 +44,7 @@ impl Default for Settings {
             show_hud: true,
             async_shaders: true,
             async_render: true,
+            fastmem: true,
             path: PathBuf::new(),
         }
     }
@@ -106,6 +109,13 @@ impl Settings {
             std::env::remove_var("NEXIUM_SINGLECORE");
         } else {
             std::env::set_var("NEXIUM_SINGLECORE", "1");
+        }
+        if self.fastmem {
+            std::env::remove_var("NEXIUM_DYNARMIC_NO_FASTMEM");
+            std::env::remove_var("NEXIUM_NO_FASTMEM_ARENA");
+        } else {
+            std::env::set_var("NEXIUM_DYNARMIC_NO_FASTMEM", "1");
+            std::env::set_var("NEXIUM_NO_FASTMEM_ARENA", "1");
         }
         nexium_core::hid_state::set_docked(self.docked);
         nexium_runner::audio::set_master_volume(self.audio_volume);

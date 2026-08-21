@@ -209,7 +209,7 @@ enum Screen {
     },
 }
 
-const SETTINGS_ROWS: usize = 8;
+const SETTINGS_ROWS: usize = 9;
 
 fn browse_dir(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -543,6 +543,12 @@ impl App {
                         self.ui_dirty = true;
                     }
                     7 => {
+                        self.settings.fastmem = !self.settings.fastmem;
+                        self.settings.apply_runtime();
+                        self.settings.save();
+                        self.ui_dirty = true;
+                    }
+                    8 => {
                         self.settings.docked = !self.settings.docked;
                         nexium_core::hid_state::set_docked(self.settings.docked);
                         self.settings.save();
@@ -941,6 +947,15 @@ impl App {
                 "Multicore CPU".to_string(),
                 if self.settings.multicore { "On (restart game)" } else { "Off (restart game)" }
                     .to_string(),
+            ),
+            (
+                "Fastmem (experimental)".to_string(),
+                if self.settings.fastmem {
+                    "On (restart game)"
+                } else {
+                    "Off (restart game)"
+                }
+                .to_string(),
             ),
             (
                 "Console mode".to_string(),
