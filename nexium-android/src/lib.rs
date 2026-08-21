@@ -2,6 +2,8 @@
 
 mod library;
 mod overlay;
+mod platform;
+mod settings;
 mod ui;
 
 use android_activity::input::{
@@ -9,6 +11,7 @@ use android_activity::input::{
 };
 use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
 use library::{GameEntry, LibraryScan, ICON_SIZE};
+use settings::Settings as AppConfig;
 use nexium_core::hid_state::{
     ControllerInput, KeyboardInput, MouseInput, TouchInput,
 };
@@ -195,9 +198,34 @@ enum Screen {
     Error {
         message: String,
     },
+    Settings {
+        selected: usize,
+    },
+    Browser {
+        dir: PathBuf,
+        entries: Vec<PathBuf>,
+        selected: usize,
+        scroll: f32,
+    },
+}
+
+const SETTINGS_ROWS: usize = 8;
+
+fn browse_dir(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
 }
 
 struct App {
+    app: AndroidApp,
     screen: Screen,
     emulation: Option<EmulationHandle>,
     last_frame: Option<Frame>,
@@ -208,9 +236,16 @@ struct App {
     logo: Option<(usize, usize, Vec<u8>)>,
     logo_cache: Vec<(usize, Vec<u8>)>,
     roms_dir: PathBuf,
+    settings: settings::Settings,
+    access_granted: bool,
     window_ready: bool,
     ui_dirty: bool,
     last_stick_nav: f32,
+    frames_since_report: u32,
+    last_fps_report: Instant,
+    compose_nanos: u64,
+    hud_fps: f32,
+    hud_compose_ms: f32,
 }
 
 fn decode_logo() -> Option<(usize, usize, Vec<u8>)> {
@@ -357,9 +392,20 @@ impl App {
         Some(outcome)
     }
 
+    fn gear_center(&self, win_w: usize, win_h: usize) -> (f32, f32, f32) {
+        let h = win_h as f32;
+        let header_h = (h * 0.14).max(64.0);
+        let r = header_h * 0.26;
+        (win_w as f32 - r - h * 0.03, header_h * 0.5, r)
+    }
+
+    fn scan_roots(&self) -> Vec<PathBuf> {
+        self.settings.scan_roots(&self.roms_dir)
+    }
+
     fn to_library(&mut self) {
         self.screen = Screen::Library {
-            scan: LibraryScan::start(self.roms_dir.clone()),
+            scan: LibraryScan::start(self.scan_roots()),
             selected: 0,
             scroll: 0.0,
             drag: None,
@@ -367,7 +413,53 @@ impl App {
         self.ui_dirty = true;
     }
 
+    fn open_settings(&mut self) {
+        self.access_granted = platform::has_all_files_access();
+        self.screen = Screen::Settings { selected: 0 };
+        self.ui_dirty = true;
+    }
+
+    fn open_browser(&mut self) {
+        let start = PathBuf::from("/storage/emulated/0");
+        let entries = browse_dir(&start);
+        self.screen = Screen::Browser {
+            dir: start,
+            entries,
+            selected: 0,
+            scroll: 0.0,
+        };
+        self.ui_dirty = true;
+    }
+
+    fn browse_to(&mut self, target: PathBuf) {
+        let entries = browse_dir(&target);
+        self.screen = Screen::Browser {
+            dir: target,
+            entries,
+            selected: 0,
+            scroll: 0.0,
+        };
+        self.ui_dirty = true;
+    }
+
     fn nav_move(&mut self, delta: i8) {
+        if let Screen::Settings { selected } = &mut self.screen {
+            let cur = *selected as i64 + delta as i64;
+            *selected = cur.rem_euclid(SETTINGS_ROWS as i64) as usize;
+            self.ui_dirty = true;
+            return;
+        }
+        if let Screen::Browser {
+            entries, selected, ..
+        } = &mut self.screen
+        {
+            if !entries.is_empty() {
+                let cur = *selected as i64 + delta as i64;
+                *selected = cur.rem_euclid(entries.len() as i64) as usize;
+                self.ui_dirty = true;
+            }
+            return;
+        }
         if let Screen::Library {
             scan, selected, ..
         } = &mut self.screen
@@ -412,7 +504,89 @@ impl App {
                 }
             }
             Screen::Error { .. } => self.to_library(),
+            Screen::Settings { selected } => {
+                let row = *selected;
+                match row {
+                    0 => {
+                        if !self.access_granted {
+                            platform::request_all_files_access(&self.app);
+                        }
+                    }
+                    1 => self.open_browser(),
+                    2 => {
+                        self.settings.touch_overlay = !self.settings.touch_overlay;
+                        self.overlay.enabled = self.settings.touch_overlay;
+                        self.settings.save();
+                        self.ui_dirty = true;
+                    }
+                    3 => {
+                        self.settings.show_hud = !self.settings.show_hud;
+                        self.settings.save();
+                        self.ui_dirty = true;
+                    }
+                    4 => {
+                        self.settings.async_shaders = !self.settings.async_shaders;
+                        self.settings.apply_runtime();
+                        self.settings.save();
+                        self.ui_dirty = true;
+                    }
+                    5 => {
+                        self.settings.async_render = !self.settings.async_render;
+                        self.settings.apply_runtime();
+                        self.settings.save();
+                        self.ui_dirty = true;
+                    }
+                    6 => {
+                        self.settings.multicore = !self.settings.multicore;
+                        self.settings.apply_runtime();
+                        self.settings.save();
+                        self.ui_dirty = true;
+                    }
+                    7 => {
+                        self.settings.docked = !self.settings.docked;
+                        nexium_core::hid_state::set_docked(self.settings.docked);
+                        self.settings.save();
+                        self.ui_dirty = true;
+                    }
+                    _ => {
+                        let next = self.settings.audio_volume + 0.25;
+                        self.settings.audio_volume = if next > 1.001 { 0.0 } else { next };
+                        nexium_runner::audio::set_master_volume(self.settings.audio_volume);
+                        self.settings.save();
+                        self.ui_dirty = true;
+                    }
+                }
+            }
+            Screen::Browser {
+                entries, selected, ..
+            } => {
+                if let Some(target) = entries.get(*selected).cloned() {
+                    self.browse_to(target);
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn use_current_folder(&mut self) {
+        if let Screen::Browser { dir, .. } = &self.screen {
+            let folder = dir.clone();
+            if self.settings.add_folder(folder) {
+                log::info!("added rom folder");
+            }
+            self.to_library();
+        }
+    }
+
+    fn browser_up(&mut self) {
+        if let Screen::Browser { dir, .. } = &self.screen {
+            match dir.parent() {
+                Some(parent) if parent.as_os_str().len() >= "/storage".len() => {
+                    let parent = parent.to_path_buf();
+                    self.browse_to(parent);
+                }
+                _ => self.open_settings(),
+            }
         }
     }
 
@@ -445,13 +619,19 @@ impl App {
     fn back_is_consumed(&self) -> bool {
         matches!(
             self.screen,
-            Screen::Playing { .. } | Screen::Error { .. } | Screen::Booting { .. }
+            Screen::Playing { .. }
+                | Screen::Error { .. }
+                | Screen::Booting { .. }
+                | Screen::Settings { .. }
+                | Screen::Browser { .. }
         )
     }
 
     fn on_back(&mut self) {
         match &self.screen {
             Screen::Booting { .. } => self.exit_to_library(),
+            Screen::Settings { .. } => self.to_library(),
+            Screen::Browser { .. } => self.browser_up(),
             Screen::Playing { menu: None } => self.open_menu(),
             Screen::Playing { menu: Some(_) } => self.close_menu(),
             Screen::Error { .. } => self.nav_accept(),
@@ -594,7 +774,11 @@ impl App {
             let hint2 = h * 0.028;
             let path = self.roms_dir.display().to_string();
             let mut y = h * 0.36 + px * 2.0;
-            let intro = "Copy games (.dnsp / .dxci / .nro) to:";
+            let intro = if self.access_granted {
+                "Press Y for Settings to add a ROM folder, or copy games to:"
+            } else {
+                "Press Y for Settings to grant file access, or copy games to:"
+            };
             let tw = self.text.measure(intro, hint2, false);
             self.text
                 .draw(&mut self.canvas, (w - tw) * 0.5, y, hint2, TEXT_DIM, intro);
@@ -642,14 +826,27 @@ impl App {
         };
         let count_px = header_h * 0.24;
         let count_w = self.text.measure(&count_text, count_px, false);
+        let (gx, gy, gr) = self.gear_center(win_w, win_h);
         self.text.draw(
             &mut self.canvas,
-            w - count_w - h * 0.03,
+            gx - gr - count_w - h * 0.02,
             header_h * 0.5 - count_px * 0.62,
             count_px,
             TEXT_DIM,
             &count_text,
         );
+        self.canvas.fill_circle(gx, gy, gr, PANEL_HI);
+        self.canvas.stroke_circle(gx, gy, gr, 2.0, ACCENT);
+        let bar_w = gr * 0.92;
+        for i in 0..3 {
+            self.canvas.fill_rect(
+                (gx - bar_w * 0.5) as i32,
+                (gy - gr * 0.34 + i as f32 * gr * 0.34) as i32,
+                bar_w as i32,
+                (gr * 0.13).max(2.0) as i32,
+                ACCENT,
+            );
+        }
 
         if scan_done && game_count > 0 {
             self.canvas.fill_rect(
@@ -659,7 +856,7 @@ impl App {
                 hint_h as i32 + 1,
                 PANEL,
             );
-            let hint = "tap or press A to play";
+            let hint = "tap or press A to play    -    Y for settings";
             let tw = self.text.measure(hint, hint_px, false);
             self.text.draw(
                 &mut self.canvas,
@@ -707,6 +904,248 @@ impl App {
             self.canvas.blit_rgba(x, y, target, target, &pixels);
             self.logo_cache[idx].1 = pixels;
         }
+    }
+
+    fn settings_rows(&self) -> Vec<(String, String)> {
+        vec![
+            (
+                "File access".to_string(),
+                if self.access_granted {
+                    "Granted".to_string()
+                } else {
+                    "Tap to grant".to_string()
+                },
+            ),
+            (
+                "ROM folders".to_string(),
+                format!("{} added  -  tap to add", self.settings.rom_folders.len()),
+            ),
+            (
+                "Touch controls".to_string(),
+                if self.settings.touch_overlay { "On" } else { "Off" }.to_string(),
+            ),
+            (
+                "Performance overlay".to_string(),
+                if self.settings.show_hud { "On" } else { "Off" }.to_string(),
+            ),
+            (
+                "Async shader compile".to_string(),
+                if self.settings.async_shaders { "On" } else { "Off" }.to_string(),
+            ),
+            (
+                "Async render thread".to_string(),
+                if self.settings.async_render { "On (restart game)" } else { "Off (restart game)" }
+                    .to_string(),
+            ),
+            (
+                "Multicore CPU".to_string(),
+                if self.settings.multicore { "On (restart game)" } else { "Off (restart game)" }
+                    .to_string(),
+            ),
+            (
+                "Console mode".to_string(),
+                if self.settings.docked { "Docked" } else { "Handheld" }.to_string(),
+            ),
+            (
+                "Audio volume".to_string(),
+                format!("{:.0}%", self.settings.audio_volume * 100.0),
+            ),
+        ]
+    }
+
+    fn render_settings(&mut self, app: &AndroidApp) {
+        let (win_w, win_h) = self.window_size(app);
+        self.canvas.resize(win_w, win_h);
+        self.canvas.clear(BG);
+        let w = win_w as f32;
+        let h = win_h as f32;
+        let header_h = (h * 0.14).max(64.0);
+        self.canvas
+            .fill_rect(0, 0, win_w as i32, header_h as i32, PANEL);
+        let title_px = header_h * 0.36;
+        self.text.draw(
+            &mut self.canvas,
+            h * 0.03,
+            header_h * 0.5 - title_px * 0.62,
+            title_px,
+            TEXT,
+            "Settings",
+        );
+        let hint = "B or Back to return";
+        let hint_px = header_h * 0.2;
+        let tw = self.text.measure(hint, hint_px, false);
+        self.text.draw(
+            &mut self.canvas,
+            w - tw - h * 0.03,
+            header_h * 0.5 - hint_px * 0.62,
+            hint_px,
+            TEXT_DIM,
+            hint,
+        );
+
+        let selected = match &self.screen {
+            Screen::Settings { selected } => *selected,
+            _ => 0,
+        };
+        let rows = self.settings_rows();
+        let row_h = h * 0.094;
+        let mut y = header_h + h * 0.03;
+        for (i, (label, value)) in rows.iter().enumerate() {
+            if i == selected {
+                self.canvas.fill_rounded(
+                    (h * 0.02) as i32,
+                    y as i32,
+                    win_w as i32 - (h * 0.04) as i32,
+                    (row_h * 0.86) as i32,
+                    (h * 0.012) as i32,
+                    PANEL_HI,
+                );
+                self.canvas.fill_rect(
+                    (h * 0.02) as i32,
+                    y as i32 + (row_h * 0.16) as i32,
+                    (h * 0.006).max(3.0) as i32,
+                    (row_h * 0.54) as i32,
+                    ACCENT,
+                );
+            }
+            let label_px = row_h * 0.30;
+            self.text.draw(
+                &mut self.canvas,
+                h * 0.05,
+                y + row_h * 0.26,
+                label_px,
+                TEXT,
+                label,
+            );
+            let value_px = row_h * 0.26;
+            let vw = self.text.measure(value, value_px, false);
+            let value_color = if i == 0 && !self.access_granted {
+                DANGER
+            } else {
+                ACCENT
+            };
+            self.text.draw(
+                &mut self.canvas,
+                w - vw - h * 0.05,
+                y + row_h * 0.30,
+                value_px,
+                value_color,
+                value,
+            );
+            y += row_h;
+        }
+
+        let folders: Vec<String> = self
+            .settings
+            .rom_folders
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        if !folders.is_empty() {
+            let fpx = h * 0.024;
+            self.text.draw(
+                &mut self.canvas,
+                h * 0.05,
+                y + h * 0.01,
+                fpx,
+                TEXT_DIM,
+                "Folders (press X on the row above to clear):",
+            );
+            y += fpx * 2.0;
+            for folder in folders.iter().take(4) {
+                self.text
+                    .draw_mono(&mut self.canvas, h * 0.05, y, fpx, TEXT_DIM, folder);
+                y += fpx * 1.6;
+            }
+        }
+        present(app, self.canvas.w, self.canvas.h, &self.canvas.pixels);
+    }
+
+    fn render_browser(&mut self, app: &AndroidApp) {
+        let (win_w, win_h) = self.window_size(app);
+        self.canvas.resize(win_w, win_h);
+        self.canvas.clear(BG);
+        let w = win_w as f32;
+        let h = win_h as f32;
+        let header_h = (h * 0.14).max(64.0);
+        let row_h = h * 0.105;
+        let list_top = header_h + h * 0.02;
+        let footer_h = h * 0.10;
+
+        let (dir, entries, selected, scroll) = match &self.screen {
+            Screen::Browser {
+                dir,
+                entries,
+                selected,
+                scroll,
+            } => (dir.clone(), entries.clone(), *selected, *scroll),
+            _ => return,
+        };
+
+        for (i, entry) in entries.iter().enumerate() {
+            let y = list_top + i as f32 * row_h - scroll;
+            if y + row_h < list_top || y > h - footer_h {
+                continue;
+            }
+            if i == selected {
+                self.canvas.fill_rounded(
+                    (h * 0.02) as i32,
+                    y as i32,
+                    win_w as i32 - (h * 0.04) as i32,
+                    (row_h * 0.88) as i32,
+                    (h * 0.010) as i32,
+                    PANEL_HI,
+                );
+            }
+            let name = entry
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let px = row_h * 0.34;
+            self.text.draw(
+                &mut self.canvas,
+                h * 0.06,
+                y + row_h * 0.24,
+                px,
+                TEXT,
+                &name,
+            );
+        }
+
+        self.canvas
+            .fill_rect(0, 0, win_w as i32, header_h as i32, PANEL);
+        let title_px = header_h * 0.28;
+        self.text.draw(
+            &mut self.canvas,
+            h * 0.03,
+            header_h * 0.28 - title_px * 0.62,
+            title_px,
+            TEXT,
+            "Choose ROM folder",
+        );
+        let path_px = header_h * 0.20;
+        self.text.draw_mono(
+            &mut self.canvas,
+            h * 0.03,
+            header_h * 0.66 - path_px * 0.62,
+            path_px,
+            ACCENT,
+            &dir.display().to_string(),
+        );
+
+        self.canvas
+            .fill_rect(0, (h - footer_h) as i32, win_w as i32, footer_h as i32 + 1, PANEL);
+        let fpx = footer_h * 0.28;
+        self.text.draw(
+            &mut self.canvas,
+            h * 0.03,
+            h - footer_h * 0.62,
+            fpx,
+            TEXT_DIM,
+            "A open   Y use this folder   B up",
+        );
+        present(app, self.canvas.w, self.canvas.h, &self.canvas.pixels);
     }
 
     fn render_center_screen(&mut self, app: &AndroidApp, lines: &[(String, [u8; 4], f32)]) {
@@ -777,11 +1216,65 @@ impl App {
             .set_frame_rect(ox as f32, oy as f32, fw as f32, fh as f32);
         if menu.is_none() {
             self.overlay.render(&mut self.canvas, &mut self.text);
+            if self.settings.show_hud {
+                self.render_hud(ox as f32, oy as f32, fh as f32);
+            }
         } else {
             self.canvas.dim(140);
             self.render_menu(menu.unwrap_or(0), cw as f32, ch as f32);
         }
         present(app, self.canvas.w, self.canvas.h, &self.canvas.pixels);
+    }
+
+    fn render_hud(&mut self, ox: f32, oy: f32, fh: f32) {
+        let px = (fh * 0.028).max(11.0);
+        let pad = px * 0.5;
+        let lines = [
+            format!("{:.1} fps", self.hud_fps),
+            format!("compose {:.1} ms", self.hud_compose_ms),
+            format!(
+                "shaders {}{}",
+                nexium_common::async_compile::shaders_built(),
+                if self.settings.async_shaders {
+                    " async"
+                } else {
+                    " sync"
+                }
+            ),
+        ];
+        let width = lines
+            .iter()
+            .map(|l| self.text.measure(l, px, true))
+            .fold(0.0f32, f32::max);
+        let box_w = width + pad * 2.0;
+        let box_h = px * 1.45 * lines.len() as f32 + pad;
+        let x0 = ox + pad;
+        let y0 = oy + pad;
+        self.canvas.fill_rounded(
+            x0 as i32,
+            y0 as i32,
+            box_w as i32,
+            box_h as i32,
+            (px * 0.3) as i32,
+            [0x0E, 0x10, 0x18, 0xB4],
+        );
+        let mut y = y0 + pad * 0.6;
+        for (i, line) in lines.iter().enumerate() {
+            let color = if i == 0 {
+                if self.hud_fps >= 55.0 {
+                    ACCENT
+                } else if self.hud_fps >= 28.0 {
+                    [0xE5, 0xC0, 0x7B, 0xFF]
+                } else {
+                    DANGER
+                }
+            } else {
+                TEXT_DIM
+            };
+            self.text
+                .draw_mono(&mut self.canvas, x0 + pad, y, px, color, line);
+            y += px * 1.45;
+        }
     }
 
     fn render_menu(&mut self, selected: usize, w: f32, h: f32) {
@@ -912,6 +1405,13 @@ fn android_main(android_app: AndroidApp) {
     let data_root = init_environment(&android_app);
     log::info!("data root: {}", data_root.display());
 
+    android_app.set_window_flags(
+        android_activity::WindowManagerFlags::FULLSCREEN
+            | android_activity::WindowManagerFlags::KEEP_SCREEN_ON,
+        android_activity::WindowManagerFlags::empty(),
+    );
+    platform::hide_system_bars(&android_app);
+
     nexium_core::hid_state::set_docked(false);
     nexium_runner::audio::init_host_audio(None, 1.0);
 
@@ -920,9 +1420,16 @@ fn android_main(android_app: AndroidApp) {
         return;
     };
     let roms_dir = find_roms_dir(&android_app);
+    let config_dir = data_root.join("config");
+    let loaded_settings = AppConfig::load(&config_dir);
+    let access_granted = platform::has_all_files_access();
+    log::info!("all-files access: {}", access_granted);
+    loaded_settings.apply_runtime();
+    let initial_roots = loaded_settings.scan_roots(&roms_dir);
     let mut state = App {
+        app: android_app.clone(),
         screen: Screen::Library {
-            scan: LibraryScan::start(roms_dir.clone()),
+            scan: LibraryScan::start(initial_roots),
             selected: 0,
             scroll: 0.0,
             drag: None,
@@ -936,10 +1443,18 @@ fn android_main(android_app: AndroidApp) {
         logo: decode_logo(),
         logo_cache: Vec::new(),
         roms_dir,
+        settings: loaded_settings,
+        access_granted,
         window_ready: false,
         ui_dirty: true,
         last_stick_nav: 0.0,
+        frames_since_report: 0,
+        last_fps_report: Instant::now(),
+        compose_nanos: 0,
+        hud_fps: 0.0,
+        hud_compose_ms: 0.0,
     };
+    state.overlay.enabled = state.settings.touch_overlay;
     let mut running = true;
     let mut last_ui_draw = Instant::now() - Duration::from_secs(1);
 
@@ -955,6 +1470,7 @@ fn android_main(android_app: AndroidApp) {
         android_app.poll_events(Some(poll_timeout), |event| match event {
             PollEvent::Main(main_event) => match main_event {
                 MainEvent::InitWindow { .. } => {
+                    platform::hide_system_bars(&android_app);
                     state.window_ready = true;
                     state.ui_dirty = true;
                     log::info!("window ready");
@@ -964,6 +1480,12 @@ fn android_main(android_app: AndroidApp) {
                     log::info!("window lost");
                 }
                 MainEvent::GainedFocus => {
+                    platform::hide_system_bars(&android_app);
+                    let granted = platform::has_all_files_access();
+                    if granted != state.access_granted {
+                        state.access_granted = granted;
+                        state.ui_dirty = true;
+                    }
                     if matches!(
                         state.screen,
                         Screen::Playing { menu: None } | Screen::Booting { .. }
@@ -1031,14 +1553,17 @@ fn android_main(android_app: AndroidApp) {
                                         state.nav_accept()
                                     }
                                 }
-                                BTN_B => {
-                                    if matches!(
-                                        state.screen,
-                                        Screen::Playing { menu: Some(_) }
-                                    ) {
-                                        state.close_menu()
-                                    }
-                                }
+                                BTN_B => match state.screen {
+                                    Screen::Playing { menu: Some(_) } => state.close_menu(),
+                                    Screen::Settings { .. } => state.to_library(),
+                                    Screen::Browser { .. } => state.browser_up(),
+                                    _ => {}
+                                },
+                                BTN_Y => match state.screen {
+                                    Screen::Library { .. } => state.open_settings(),
+                                    Screen::Browser { .. } => state.use_current_folder(),
+                                    _ => {}
+                                },
                                 _ => {}
                             }
                         }
@@ -1161,11 +1686,64 @@ fn android_main(android_app: AndroidApp) {
                                             OverlayEvent::MenuTap => {}
                                             OverlayEvent::None => {}
                                         }
-                                    } else if let Screen::Library {
-                                        drag, ..
-                                    } = &mut state.screen
+                                    } else if matches!(state.screen, Screen::Library { .. })
                                     {
-                                        *drag = Some((p.pointer_id(), y, 0.0));
+                                        let (gx, gy, gr) =
+                                            state.gear_center(win_w, win_h);
+                                        let hit = ((x - gx).powi(2) + (y - gy).powi(2))
+                                            .sqrt()
+                                            < gr * 1.5;
+                                        if hit {
+                                            state.open_settings();
+                                        } else if let Screen::Library { drag, .. } =
+                                            &mut state.screen
+                                        {
+                                            *drag = Some((p.pointer_id(), y, 0.0));
+                                        }
+                                    } else if matches!(state.screen, Screen::Settings { .. })
+                                    {
+                                        let header_h = (h * 0.14).max(64.0);
+                                        let row_h = h * 0.094;
+                                        let rel = y - (header_h + h * 0.03);
+                                        if rel >= 0.0 {
+                                            let idx = (rel / row_h) as usize;
+                                            if idx < SETTINGS_ROWS {
+                                                if let Screen::Settings { selected } =
+                                                    &mut state.screen
+                                                {
+                                                    *selected = idx;
+                                                }
+                                                state.nav_accept();
+                                            }
+                                        }
+                                    } else if matches!(state.screen, Screen::Browser { .. })
+                                    {
+                                        let header_h = (h * 0.14).max(64.0);
+                                        let row_h = h * 0.105;
+                                        let footer_h = h * 0.10;
+                                        if y > h - footer_h {
+                                            state.use_current_folder();
+                                        } else {
+                                            let rel = y - (header_h + h * 0.02);
+                                            if rel >= 0.0 {
+                                                let idx = (rel / row_h) as usize;
+                                                let len = match &state.screen {
+                                                    Screen::Browser { entries, .. } => {
+                                                        entries.len()
+                                                    }
+                                                    _ => 0,
+                                                };
+                                                if idx < len {
+                                                    if let Screen::Browser {
+                                                        selected, ..
+                                                    } = &mut state.screen
+                                                    {
+                                                        *selected = idx;
+                                                    }
+                                                    state.nav_accept();
+                                                }
+                                            }
+                                        }
                                     } else if matches!(state.screen, Screen::Error { .. })
                                     {
                                         state.nav_accept();
@@ -1324,8 +1902,11 @@ fn android_main(android_app: AndroidApp) {
                 }
                 if let Some(frame) = newest {
                     state.last_frame = Some(frame);
+                    state.frames_since_report += 1;
                     if !menu_open && state.window_ready {
+                        let t0 = Instant::now();
                         state.render_playing(&android_app);
+                        state.compose_nanos += t0.elapsed().as_nanos() as u64;
                     }
                 } else if let Some(outcome) = state.take_emulation_end() {
                     match outcome {
@@ -1347,7 +1928,35 @@ fn android_main(android_app: AndroidApp) {
                     state.to_library();
                 }
             }
-            Screen::Error { .. } => {}
+            Screen::Error { .. } | Screen::Settings { .. } | Screen::Browser { .. } => {}
+        }
+
+        if matches!(state.screen, Screen::Playing { .. }) {
+            let elapsed = state.last_fps_report.elapsed();
+            if elapsed >= Duration::from_secs(3) {
+                let fps = state.frames_since_report as f32 / elapsed.as_secs_f32();
+                let compose_ms = if state.frames_since_report > 0 {
+                    state.compose_nanos as f32
+                        / state.frames_since_report as f32
+                        / 1.0e6
+                } else {
+                    0.0
+                };
+                state.hud_fps = fps;
+                state.hud_compose_ms = compose_ms;
+                log::info!(
+                    "[perf] {:.1} fps, compose {:.2} ms/frame ({} frames)",
+                    fps,
+                    compose_ms,
+                    state.frames_since_report
+                );
+                state.frames_since_report = 0;
+                state.compose_nanos = 0;
+                state.last_fps_report = Instant::now();
+            }
+        } else {
+            state.frames_since_report = 0;
+            state.last_fps_report = Instant::now();
         }
 
         let animating = matches!(
@@ -1380,6 +1989,8 @@ fn android_main(android_app: AndroidApp) {
                             vec![("Shutting down...".to_string(), TEXT_DIM, 0.04f32)];
                         state.render_center_screen(&android_app, &lines);
                     }
+                    Screen::Settings { .. } => state.render_settings(&android_app),
+                    Screen::Browser { .. } => state.render_browser(&android_app),
                     Screen::Error { message } => {
                         let lines = vec![
                             ("Could not start game".to_string(), DANGER, 0.045f32),

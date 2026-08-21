@@ -17,21 +17,39 @@ pub struct LibraryScan {
     pub games: Vec<GameEntry>,
 }
 
-fn rom_paths(roms_dir: &Path) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(roms_dir)
-        .map(|it| {
-            it.filter_map(|entry| entry.ok())
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    matches!(
-                        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()),
-                        Some(ref ext) if ["nro", "dnsp", "dxci", "dnca"].contains(&ext.as_str())
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+pub fn is_rom(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()),
+        Some(ref ext) if ["nro", "dnsp", "dxci", "dnca", "nsp", "xci"].contains(&ext.as_str())
+    )
+}
+
+fn collect_roms(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if depth > 0 {
+                collect_roms(&path, depth - 1, out);
+            }
+        } else if is_rom(&path) {
+            out.push(path);
+        }
+    }
+}
+
+fn rom_paths(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        collect_roms(root, 2, &mut paths);
+    }
     paths.sort();
+    paths.dedup();
     paths
 }
 
@@ -88,12 +106,12 @@ fn read_entry(path: PathBuf) -> GameEntry {
 }
 
 impl LibraryScan {
-    pub fn start(roms_dir: PathBuf) -> Self {
+    pub fn start(roots: Vec<PathBuf>) -> Self {
         let (tx, rx) = channel();
         let _ = std::thread::Builder::new()
             .name("nexium-libscan".into())
             .spawn(move || {
-                let games = rom_paths(&roms_dir).into_iter().map(read_entry).collect();
+                let games = rom_paths(&roots).into_iter().map(read_entry).collect();
                 let _ = tx.send(games);
             });
         Self {

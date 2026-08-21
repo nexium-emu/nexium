@@ -588,6 +588,7 @@ pub fn build_graphics_pipeline(
                 .create_graphics_pipelines(vk_cache, &[pipeline_info], None)
                 .map_err(|(_, e)| format!("create_graphics_pipelines: {:?}", e))?
         };
+        nexium_common::async_compile::note_shader_built();
         if pipeline_debug {
             log::warn!(
                 "[pipeline-build] end vs_hash={:016x} fs_hash={:016x}",
