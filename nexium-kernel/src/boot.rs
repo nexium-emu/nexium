@@ -50,12 +50,12 @@ impl BootContext {
         log::info!("Creating address space");
         let address_space = Arc::new(AddressSpace::new());
 
-        let code_base: u64 = 0x80_0000_0000;
-        let heap_base: u64 = 0x90_0000_0000;
-        let stack_base: u64 = 0xA0_0000_0000;
-        let env_base: u64 = 0xB0_0000_0000;
-        let tls_base: u64 = 0xB0_0000_1000;
-        let exit_stub_va: u64 = 0xB0_0000_2000;
+        let code_base: u64 = 0x1_0000_0000;
+        let heap_base: u64 = 0x4_0000_0000;
+        let stack_base: u64 = 0x8_0000_0000;
+        let env_base: u64 = 0x10_0000_0000;
+        let tls_base: u64 = 0x10_0000_1000;
+        let exit_stub_va: u64 = 0x10_0000_2000;
 
         log::info!("Mapping memory regions");
 
@@ -250,21 +250,42 @@ impl BootContext {
         };
         let space: u64 = 1u64 << bits;
 
-        let code_base: u64 = 0x800_0000;
-        let heap_base: u64 = space / 8;
-        let alias_base: u64 = space / 2;
-        let stack_base: u64 = space * 3 / 4;
-        let env_base: u64 = stack_base + 0x4000_0000;
-        let tls_base: u64 = env_base + 0x1000;
-        let exit_stub_va: u64 = env_base + 0x2000;
-        let aslr_base: u64 = code_base;
-        let aslr_size: u64 = space - code_base;
+        let arena_limit: u64 = nexium_memory::fastmem::arena_size();
+        let window: u64 = space.min(arena_limit);
         let alias_size: u64 = if bits == 39 {
             0x10_0000_0000
         } else {
             0x1_8000_0000
         };
         let heap_size: u64 = 0xCC00_0000;
+        let stack_region_size: u64 = 0x8000_0000;
+        let code_base: u64 = 0x800_0000;
+        let code_span: u64 = 0x1_0000_0000;
+        let mut alias_size = alias_size;
+        let mut cursor = code_base + code_span;
+        let tail = heap_size + stack_region_size + 0x4000_0000;
+        if cursor + alias_size + tail > window {
+            let room = window.saturating_sub(cursor + tail);
+            let shrunk = room.min(alias_size).max(0x8000_0000);
+            log::warn!(
+                "alias region {:#x} does not fit the {:#x} window; using {:#x}",
+                alias_size,
+                window,
+                shrunk
+            );
+            alias_size = shrunk;
+        }
+        let alias_base: u64 = cursor;
+        cursor += alias_size;
+        let heap_base: u64 = cursor;
+        cursor += heap_size;
+        let stack_base: u64 = cursor;
+        cursor += stack_region_size;
+        let env_base: u64 = cursor;
+        let tls_base: u64 = env_base + 0x1000;
+        let exit_stub_va: u64 = env_base + 0x2000;
+        let aslr_base: u64 = code_base;
+        let aslr_size: u64 = window - code_base;
 
         const PAGE_SIZE: u64 = 0x1000;
         let code_size = app.total_code_size.max(PAGE_SIZE);

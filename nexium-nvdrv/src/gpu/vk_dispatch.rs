@@ -1360,10 +1360,10 @@ impl SsboSnapshotCache {
         let in_fastmem = nexium_memory::fastmem::base().is_some_and(|base| {
             let base = base as u64;
             let ptr = cpu_addr;
+            let arena = nexium_memory::fastmem::arena_size();
             ptr >= base
-                && ptr.saturating_sub(base) <= nexium_memory::fastmem::ARENA_SIZE
-                && len as u64
-                    <= nexium_memory::fastmem::ARENA_SIZE.saturating_sub(ptr.saturating_sub(base))
+                && ptr.saturating_sub(base) <= arena
+                && len as u64 <= arena.saturating_sub(ptr.saturating_sub(base))
         });
         if in_fastmem && nexium_memory::fastmem::write_watch_query_range(cpu_addr, len).is_some() {
             unsafe {

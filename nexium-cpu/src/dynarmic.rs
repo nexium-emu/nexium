@@ -42,7 +42,10 @@ impl DynarmicCpu {
             match (nexium_memory::fastmem::base(), force_no_fastmem) {
                 (Some(base), false) => {
                     log::info!("dynarmic: fastmem enabled, arena base={:p}", base);
-                    dynarmic_sys::Dynarmic::new_fastmem(base.cast())
+                    dynarmic_sys::Dynarmic::new_fastmem_bits(
+                        base.cast(),
+                        nexium_memory::fastmem::arena_bits(),
+                    )
                 }
                 (Some(base), true) => {
                     log::info!(

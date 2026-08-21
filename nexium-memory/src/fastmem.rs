@@ -1,8 +1,24 @@
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-pub const ARENA_BITS: u32 = 40;
-pub const ARENA_SIZE: u64 = 1u64 << ARENA_BITS;
+pub const ARENA_MAX_BITS: u32 = 40;
+pub const ARENA_MIN_BITS: u32 = 36;
+
+static ARENA_BITS_ACHIEVED: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+pub fn arena_bits() -> u32 {
+    let bits = ARENA_BITS_ACHIEVED.load(Ordering::Acquire);
+    if bits != 0 {
+        return bits;
+    }
+    arena();
+    ARENA_BITS_ACHIEVED.load(Ordering::Acquire).max(ARENA_MIN_BITS)
+}
+
+pub fn arena_size() -> u64 {
+    1u64 << arena_bits()
+}
 
 #[cfg(windows)]
 mod sys {
@@ -216,22 +232,48 @@ struct CommittedRange {
 fn arena() -> *mut u8 {
     ARENA
         .get_or_init(|| {
-            let (base, write_watch) = sys::reserve(ARENA_SIZE as usize);
+            let mut chosen = std::ptr::null_mut();
+            let mut chosen_bits = 0u32;
+            let mut write_watch = false;
+            let disabled = std::env::var("NEXIUM_NO_FASTMEM_ARENA")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false);
+            let mut bits = if disabled { 0 } else { ARENA_MAX_BITS };
+            if disabled {
+                log::info!("fastmem: arena disabled by NEXIUM_NO_FASTMEM_ARENA");
+            }
+            while bits >= ARENA_MIN_BITS {
+                let (base, ww) = sys::reserve(1usize << bits);
+                if !base.is_null() {
+                    chosen = base;
+                    chosen_bits = bits;
+                    write_watch = ww;
+                    break;
+                }
+                log::info!(
+                    "fastmem: {}GB arena unavailable; trying {}GB",
+                    1u64 << (bits - 30),
+                    1u64 << (bits - 31)
+                );
+                bits -= 1;
+            }
             ARENA_WRITE_WATCH.store(write_watch, Ordering::Release);
-            if base.is_null() {
+            ARENA_BITS_ACHIEVED.store(chosen_bits, Ordering::Release);
+            if chosen.is_null() {
                 log::warn!(
-                    "fastmem: failed to reserve {}GB arena; falling back to heap regions",
-                    ARENA_SIZE >> 30
+                    "fastmem: could not reserve an arena down to {}GB; falling back to heap regions",
+                    1u64 << (ARENA_MIN_BITS - 30)
                 );
             } else {
                 log::info!(
-                    "fastmem: reserved {}GB arena at {:p} (write-watch={})",
-                    ARENA_SIZE >> 30,
-                    base,
+                    "fastmem: reserved {}GB arena at {:p} (bits={}, write-watch={})",
+                    1u64 << (chosen_bits - 30),
+                    chosen,
+                    chosen_bits,
                     write_watch,
                 );
             }
-            AtomicPtr::new(base)
+            AtomicPtr::new(chosen)
         })
         .load(Ordering::Relaxed)
 }
@@ -251,7 +293,7 @@ pub fn commit(va: u64, len: usize) -> Option<*mut u8> {
         return None;
     }
     let end = va.checked_add(len as u64)?;
-    if end > ARENA_SIZE {
+    if end > arena_size() {
         log::warn!(
             "fastmem: region va={:#x} len={:#x} outside arena; using heap",
             va,
@@ -289,7 +331,7 @@ pub fn decommit(ptr: *mut u8, len: usize) {
     let Some(hi) = lo.checked_add(len as u64) else {
         return;
     };
-    if hi > ARENA_SIZE || hi <= lo {
+    if hi > arena_size() || hi <= lo {
         return;
     }
     let mut ranges = committed_ranges()
@@ -320,7 +362,7 @@ pub fn write_watch_query_range(va: u64, len: usize) -> Option<(u64, usize)> {
     let lo = va & !PAGE_MASK;
     let end = va.checked_add(len as u64)?;
     let hi = end.checked_add(PAGE_MASK)? & !PAGE_MASK;
-    if hi <= lo || hi > ARENA_SIZE {
+    if hi <= lo || hi > arena_size() {
         return None;
     }
     Some((lo, usize::try_from(hi - lo).ok()?))
@@ -554,7 +596,7 @@ pub fn watch_arm(va: u64, len: u64) -> bool {
     }
     let lo = va & !0xFFF;
     let hi = (va + len + 0xFFF) & !0xFFF;
-    if hi > ARENA_SIZE {
+    if hi > arena_size() {
         return false;
     }
     let ptr = unsafe { base.add(lo as usize) };
@@ -571,7 +613,7 @@ pub fn watch_arm(va: u64, len: u64) -> bool {
 pub fn watch_mark(va: u64, len: u64) -> bool {
     let lo = va & !0xFFF;
     let hi = (va + len + 0xFFF) & !0xFFF;
-    if hi <= lo || hi > ARENA_SIZE {
+    if hi <= lo || hi > arena_size() {
         return false;
     }
     WATCH_LO.store(lo, Ordering::SeqCst);

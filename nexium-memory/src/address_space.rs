@@ -78,7 +78,7 @@ impl Region {
     fn reserved(base: u64, len: usize, perm: Perm, name: String) -> Self {
         if base
             .checked_add(len as u64)
-            .is_some_and(|end| end <= crate::fastmem::ARENA_SIZE)
+            .is_some_and(|end| end <= crate::fastmem::arena_size())
         {
             if let Some(arena) = crate::fastmem::base() {
                 let buf = unsafe { NonNull::new_unchecked(arena.add(base as usize)) };
