@@ -134,7 +134,7 @@ jobs:
           "$BUILD_TOOLS/apksigner" verify --print-certs android/NeXium-debug.apk
 
       - name: Upload APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: NeXium-debug-apk
           path: android/NeXium-debug.apk
