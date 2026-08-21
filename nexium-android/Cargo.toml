@@ -1,0 +1,26 @@
+[package]
+name = "nexium-android"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "nexium_android"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+nexium-common.workspace = true
+nexium-core = { workspace = true, default-features = false, features = ["backend-dynarmic"] }
+nexium-cpu = { workspace = true, default-features = false, features = ["backend-dynarmic"] }
+nexium-kernel = { workspace = true, default-features = false, features = ["backend-dynarmic"] }
+nexium-loader.workspace = true
+nexium-runner = { path = "../nexium-runner", default-features = false, features = ["backend-dynarmic"] }
+
+log = "0.4"
+android_logger = "0.15"
+android-activity = { version = "0.6", features = ["native-activity"] }
+ndk = "0.9"
+ab_glyph = "0.2"
+epaint_default_fonts = "0.36"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
