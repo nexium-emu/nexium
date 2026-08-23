@@ -11,6 +11,8 @@ use std::thread;
 
 pub static EMU_ALIVE: AtomicBool = AtomicBool::new(false);
 
+const METROID_DREAD_TITLE_ID: u64 = 0x0100_9380_1237_C000;
+
 pub fn emu_alive() -> bool {
     EMU_ALIVE.load(Ordering::Acquire)
 }
@@ -45,9 +47,38 @@ fn core_park_enabled() -> bool {
     *VALUE.get_or_init(|| std::env::var("NEXIUM_CORE_PARK").ok().as_deref() != Some("0"))
 }
 
-fn hos_timeslice_enabled() -> bool {
-    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *VALUE.get_or_init(|| std::env::var("NEXIUM_HOS_TIMESLICE").ok().as_deref() == Some("1"))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HosTimesliceMode {
+    Disabled,
+    EnvironmentOverride,
+    MetroidDreadCompatibility,
+}
+
+impl HosTimesliceMode {
+    fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+fn hos_timeslice_environment_override(value: Option<&str>) -> Option<bool> {
+    value.map(|value| value == "1")
+}
+
+fn hos_timeslice_mode_for(title_id: u64, environment_override: Option<bool>) -> HosTimesliceMode {
+    match environment_override {
+        Some(true) => HosTimesliceMode::EnvironmentOverride,
+        Some(false) => HosTimesliceMode::Disabled,
+        None if title_id == METROID_DREAD_TITLE_ID => HosTimesliceMode::MetroidDreadCompatibility,
+        None => HosTimesliceMode::Disabled,
+    }
+}
+
+fn hos_timeslice_mode(title_id: u64) -> HosTimesliceMode {
+    static ENVIRONMENT_OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let environment_override = *ENVIRONMENT_OVERRIDE.get_or_init(|| {
+        hos_timeslice_environment_override(std::env::var("NEXIUM_HOS_TIMESLICE").ok().as_deref())
+    });
+    hos_timeslice_mode_for(title_id, environment_override)
 }
 
 fn hos_preemption_order_enabled() -> bool {
@@ -468,6 +499,99 @@ pub struct EmuStats {
 
 pub type RepaintHook = Arc<dyn Fn() + Send + Sync>;
 
+fn try_deliver_pending_frame(
+    frame_tx: &mpsc::SyncSender<Frame>,
+    pending_frame: &mut Option<Frame>,
+    repaint: Option<&RepaintHook>,
+) -> bool {
+    let Some(frame) = pending_frame.take() else {
+        return true;
+    };
+    match frame_tx.try_send(frame) {
+        Ok(()) => {
+            if let Some(hook) = repaint {
+                hook();
+            }
+            true
+        }
+        Err(mpsc::TrySendError::Full(frame)) => {
+            *pending_frame = Some(frame);
+            true
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => false,
+    }
+}
+
+struct FrameDeliveryGuard {
+    stop: Arc<AtomicBool>,
+    frame_queue: nexium_nvdrv::FrameQueue,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl FrameDeliveryGuard {
+    fn start(
+        frame_queue: nexium_nvdrv::FrameQueue,
+        stats: Arc<nexium_nvdrv::PipelineStats>,
+        frame_tx: mpsc::SyncSender<Frame>,
+        repaint: Option<RepaintHook>,
+        emulation_stop: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_queue = Arc::clone(&frame_queue);
+        let handle = thread::Builder::new()
+            .name("nexium-frame-delivery".into())
+            .spawn(move || {
+                let mut pending_frame = None;
+                loop {
+                    if worker_stop.load(Ordering::Acquire)
+                        || emulation_stop.load(Ordering::Acquire)
+                    {
+                        break;
+                    }
+                    if pending_frame.is_none() {
+                        let Some(frame) = worker_queue.wait_pop_front_due(|| {
+                            worker_stop.load(Ordering::Acquire)
+                                || emulation_stop.load(Ordering::Acquire)
+                        }) else {
+                            break;
+                        };
+                        stats.frames_drained.fetch_add(1, Ordering::Relaxed);
+                        pending_frame = Some(Frame {
+                            width: frame.width,
+                            height: frame.height,
+                            pixels: frame.pixels,
+                        });
+                    }
+                    if !try_deliver_pending_frame(&frame_tx, &mut pending_frame, repaint.as_ref())
+                    {
+                        break;
+                    }
+                    if pending_frame.is_some() {
+                        thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                worker_queue.close();
+            })
+            .map_err(|error| format!("spawn frame delivery worker: {error}"))?;
+        Ok(Self {
+            stop,
+            frame_queue,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for FrameDeliveryGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.frame_queue.close();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 pub struct EmulationHandle {
     pub stop_flag: Arc<AtomicBool>,
     pub pause_flag: Arc<AtomicBool>,
@@ -545,6 +669,21 @@ impl EmulationHandle {
                 config.argv_override = chained_argv.take();
                 config.cpu_backend = cpu_backend;
                 let mut boot_ctx = BootContext::new(config)?;
+                let (frame_queue, frame_stats) = {
+                    let kernel = boot_ctx.kernel.lock();
+                    (
+                        Arc::clone(&kernel.nvdrv.frame_queue),
+                        Arc::clone(&kernel.nvdrv.stats),
+                    )
+                };
+                let _frame_delivery_guard = FrameDeliveryGuard::start(
+                    frame_queue,
+                    frame_stats,
+                    frame_tx.clone(),
+                    repaint.clone(),
+                    Arc::clone(&stop_flag_clone),
+                )?;
+                let title_id = boot_ctx.kernel.lock().title_id;
 
                 let mut cpu = boot_ctx
                     .cpu
@@ -578,12 +717,21 @@ impl EmulationHandle {
                         .unwrap_or(nexium_core::kernel::threads::NUM_CORES)
                         .clamp(1, nexium_core::kernel::threads::NUM_CORES)
                 };
-                let hos_timeslice = hos_timeslice_enabled();
+                let hos_timeslice_mode = hos_timeslice_mode(title_id);
+                let hos_timeslice = hos_timeslice_mode.enabled();
                 let hos_preemption_order = hos_preemption_order_enabled();
-                if hos_timeslice {
-                    log::info!(
-                        "scheduler: HOS timeslice experiment enabled (priorities [59,59,59,63], 10ms, per-core clocks)"
-                    );
+                match hos_timeslice_mode {
+                    HosTimesliceMode::EnvironmentOverride => {
+                        log::info!(
+                            "scheduler: HOS timeslice enabled by NEXIUM_HOS_TIMESLICE=1 (priorities [59,59,59,63], 10ms, per-core clocks)"
+                        );
+                    }
+                    HosTimesliceMode::MetroidDreadCompatibility => {
+                        log::info!(
+                            "scheduler: HOS timeslice enabled by Metroid Dread compatibility default (priorities [59,59,59,63], 10ms, per-core clocks)"
+                        );
+                    }
+                    HosTimesliceMode::Disabled => {}
                 }
                 if hos_preemption_order {
                     log::info!("scheduler: HOS involuntary-preemption ordering experiment enabled");
@@ -1825,21 +1973,6 @@ impl EmulationHandle {
                             }
                         }
 
-                        if let Some(f) = guard.nvdrv.drain_latest_frame() {
-                            if frame_tx
-                                .try_send(Frame {
-                                    width: f.width,
-                                    height: f.height,
-                                    pixels: f.pixels,
-                                })
-                                .is_ok()
-                            {
-                                if let Some(hook) = &repaint {
-                                    hook();
-                                }
-                            }
-                        }
-
                         guard.tick_audio_renderers();
 
                         if svc_count % 256 == 0 {
@@ -1950,5 +2083,164 @@ impl EmulationHandle {
 impl Drop for EmulationHandle {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_frame_channel_keeps_the_pending_frame_for_retry() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Frame {
+            width: 1,
+            height: 1,
+            pixels: vec![1, 0, 0, 255],
+        })
+        .unwrap();
+        let mut pending = Some(Frame {
+            width: 1,
+            height: 1,
+            pixels: vec![2, 0, 0, 255],
+        });
+
+        let repaint_count = Arc::new(AtomicU64::new(0));
+        let repaint_counter = Arc::clone(&repaint_count);
+        let repaint: RepaintHook = Arc::new(move || {
+            repaint_counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        try_deliver_pending_frame(&tx, &mut pending, Some(&repaint));
+        assert_eq!(pending.as_ref().unwrap().pixels[0], 2);
+        assert_eq!(repaint_count.load(Ordering::Relaxed), 0);
+
+        assert_eq!(rx.recv().unwrap().pixels[0], 1);
+        try_deliver_pending_frame(&tx, &mut pending, Some(&repaint));
+        assert!(pending.is_none());
+        assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.recv().unwrap().pixels[0], 2);
+    }
+
+    #[test]
+    fn frame_delivery_worker_keeps_fifo_order_across_a_full_gui_channel() {
+        let queue = Arc::new(nexium_nvdrv::FrameQueueState::new());
+        let stats = Arc::new(nexium_nvdrv::PipelineStats::default());
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Frame {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0, 255],
+        })
+        .unwrap();
+        let worker = FrameDeliveryGuard::start(
+            Arc::clone(&queue),
+            Arc::clone(&stats),
+            tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        for value in [1u8, 2] {
+            nexium_nvdrv::enqueue_bounded_frame(
+                &queue,
+                &stats,
+                nexium_nvdrv::QueuedFrame {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![value, 0, 0, 255],
+                    present_at: None,
+                },
+            );
+        }
+
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .pixels[0],
+            0
+        );
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .pixels[0],
+            1
+        );
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .pixels[0],
+            2
+        );
+        assert_eq!(stats.snapshot().frames_drained, 2);
+        worker.stop.store(true, Ordering::Release);
+        drop(worker);
+    }
+
+    #[test]
+    fn frame_delivery_worker_honors_the_queuebuffer_deadline() {
+        let queue = Arc::new(nexium_nvdrv::FrameQueueState::new());
+        let stats = Arc::new(nexium_nvdrv::PipelineStats::default());
+        let (tx, rx) = mpsc::sync_channel(1);
+        let worker = FrameDeliveryGuard::start(
+            Arc::clone(&queue),
+            Arc::clone(&stats),
+            tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        nexium_nvdrv::enqueue_bounded_frame(
+            &queue,
+            &stats,
+            nexium_nvdrv::QueuedFrame {
+                width: 1,
+                height: 1,
+                pixels: vec![9, 0, 0, 255],
+                present_at: Some(deadline),
+            },
+        );
+
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err());
+        let delivered = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert!(std::time::Instant::now() >= deadline);
+        assert_eq!(delivered.pixels[0], 9);
+        worker.stop.store(true, Ordering::Release);
+        drop(worker);
+    }
+
+    #[test]
+    fn hos_timeslice_defaults_to_metroid_dread_only() {
+        assert_eq!(
+            hos_timeslice_mode_for(METROID_DREAD_TITLE_ID, None),
+            HosTimesliceMode::MetroidDreadCompatibility
+        );
+        assert_eq!(
+            hos_timeslice_mode_for(0x0100_0000_0000_1000, None),
+            HosTimesliceMode::Disabled
+        );
+    }
+
+    #[test]
+    fn hos_timeslice_environment_override_wins() {
+        assert_eq!(hos_timeslice_environment_override(Some("1")), Some(true));
+        assert_eq!(hos_timeslice_environment_override(Some("0")), Some(false));
+        assert_eq!(
+            hos_timeslice_environment_override(Some("other")),
+            Some(false)
+        );
+
+        assert_eq!(
+            hos_timeslice_mode_for(0x0100_0000_0000_1000, Some(true)),
+            HosTimesliceMode::EnvironmentOverride
+        );
+        assert_eq!(
+            hos_timeslice_mode_for(METROID_DREAD_TITLE_ID, Some(false)),
+            HosTimesliceMode::Disabled
+        );
     }
 }

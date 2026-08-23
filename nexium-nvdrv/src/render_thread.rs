@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::gpu::vk_dispatch::PreparedDrawBatch;
 
 pub type RenderJob = Box<dyn FnOnce() + Send + 'static>;
+pub(crate) type PresentSubmitter = Box<dyn FnOnce(&'static str, RenderJob) + Send + 'static>;
 
 enum RenderWork {
     Job(&'static str, RenderJob),
@@ -21,6 +22,120 @@ pub struct RenderThread {
     pending: Arc<AtomicUsize>,
     draw_tail: Mutex<Option<Weak<AtomicBool>>>,
     draw_work_budget: Arc<DrawWorkBudget>,
+}
+
+enum PresentWork {
+    Direct {
+        label: &'static str,
+        job: RenderJob,
+    },
+    Ordered {
+        label: &'static str,
+        pending: Arc<AtomicUsize>,
+        limit: usize,
+        job: RenderJob,
+        submit: PresentSubmitter,
+    },
+    Shutdown,
+}
+
+pub struct PresentThread {
+    tx: Sender<PresentWork>,
+    stop: Arc<AtomicBool>,
+    handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl PresentThread {
+    fn new_named(name: &str) -> Self {
+        let (tx, rx) = crossbeam::channel::unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_name = name.to_owned();
+        let handle = std::thread::Builder::new()
+            .name(worker_name)
+            .spawn(move || present_worker(rx, worker_stop))
+            .expect("spawn present dispatch thread");
+        Self {
+            tx,
+            stop,
+            handle: Mutex::new(Some(handle)),
+        }
+    }
+
+    pub fn submit_named(&self, label: &'static str, job: RenderJob) -> bool {
+        self.tx.send(PresentWork::Direct { label, job }).is_ok()
+    }
+
+    pub(crate) fn submit_ordered_named(
+        &self,
+        pending: Arc<AtomicUsize>,
+        limit: usize,
+        label: &'static str,
+        job: RenderJob,
+        submit: PresentSubmitter,
+    ) -> bool {
+        self.tx
+            .send(PresentWork::Ordered {
+                label,
+                pending,
+                limit,
+                job,
+                submit,
+            })
+            .is_ok()
+    }
+}
+
+impl Drop for PresentThread {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.tx.send(PresentWork::Shutdown);
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn submit_present_to_renderer(label: &'static str, job: RenderJob) {
+    if let Some(render_thread) = maybe_render_thread() {
+        render_thread.submit_named(label, job);
+    } else {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+            log::error!("[present-job] job panicked; dispatcher continuing");
+        }
+    }
+}
+
+fn present_worker(rx: Receiver<PresentWork>, stop: Arc<AtomicBool>) {
+    while let Ok(work) = rx.recv() {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match work {
+            PresentWork::Direct { label, job } => submit_present_to_renderer(label, job),
+            PresentWork::Ordered {
+                label,
+                pending,
+                limit,
+                job,
+                submit,
+            } => {
+                if !crate::reserve_ordered_present_slot_until(&pending, limit, || {
+                    stop.load(Ordering::Acquire)
+                }) {
+                    break;
+                }
+                let job = crate::guarded_present_job(pending, job);
+                submit(label, job);
+            }
+            PresentWork::Shutdown => break,
+        }
+    }
 }
 
 const DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION: usize = 16;
@@ -1035,12 +1150,9 @@ pub fn maybe_render_thread() -> Option<&'static RenderThread> {
     .as_ref()
 }
 
-pub fn present_thread() -> &'static RenderThread {
-    if let Some(rt) = maybe_render_thread() {
-        return rt;
-    }
-    static PT: OnceLock<RenderThread> = OnceLock::new();
-    PT.get_or_init(|| RenderThread::new_named("nexium-present"))
+pub fn present_thread() -> &'static PresentThread {
+    static PT: OnceLock<PresentThread> = OnceLock::new();
+    PT.get_or_init(|| PresentThread::new_named("nexium-present-dispatch"))
 }
 
 #[cfg(test)]
@@ -1051,7 +1163,7 @@ mod tests {
         pending_snapshot_budget_bytes_from_value, pop_front_below_group_limit,
         recv_group_candidate, rejected_draw_end_reason, retain_received_if_unsealed,
         seal_draw_tail_locked, sealed_candidate_end_reason, DrawGatherEndReason, DrawWorkBudget,
-        DrawWorkCompletion, DrawWorkCost, RenderThread, RenderWork,
+        DrawWorkCompletion, DrawWorkCost, PresentThread, RenderThread, RenderWork,
         DEFAULT_MAX_DRAW_GROUPS_PER_SUBMISSION, DEFAULT_PENDING_DRAW_GROUP_BUDGET,
         DEFAULT_PENDING_DRAW_SNAPSHOT_BUDGET_BYTES, DRAW_GATHER_GRACE,
         MAX_DRAW_GROUPS_PER_SUBMISSION_ENV,
@@ -1081,6 +1193,30 @@ mod tests {
             worker.pending.load(std::sync::atomic::Ordering::Acquire) == 0,
             "render worker did not become idle"
         );
+    }
+
+    #[test]
+    fn ordered_present_enqueue_returns_without_waiting_for_an_inflight_slot() {
+        let dispatcher = PresentThread::new_named("nexium-present-nonblocking-test");
+        let pending = Arc::new(AtomicUsize::new(1));
+        let (ran_tx, ran_rx) = mpsc::channel();
+
+        let started = Instant::now();
+        assert!(dispatcher.submit_ordered_named(
+            Arc::clone(&pending),
+            1,
+            "ordered-present-nonblocking-test",
+            Box::new(move || ran_tx.send(()).unwrap()),
+            Box::new(|_label, job| job()),
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "guest-side QueueBuffer submission waited for an in-flight present slot"
+        );
+        assert!(ran_rx.recv_timeout(Duration::from_millis(20)).is_err());
+
+        pending.fetch_sub(1, Ordering::Release);
+        ran_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]

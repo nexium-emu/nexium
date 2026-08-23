@@ -149,6 +149,70 @@ fn gui_rate_stats(kind: usize) {
     }
 }
 
+fn request_idle_repaint(ctx: &egui::Context, idle_for: std::time::Duration) {
+    let predicted_dt = ctx.input(|input| {
+        std::time::Duration::try_from_secs_f32(input.predicted_dt).unwrap_or_default()
+    });
+    ctx.request_repaint_after(idle_for.saturating_add(predicted_dt));
+}
+
+fn take_next_game_frame(
+    frame_rx: &std::sync::mpsc::Receiver<crate::boot::Frame>,
+) -> Option<crate::boot::Frame> {
+    loop {
+        match frame_rx.try_recv() {
+            Ok(frame) if frame.width > 0 && frame.height > 0 && !frame.pixels.is_empty() => {
+                return Some(frame);
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty)
+            | Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod frame_receive_tests {
+    use super::take_next_game_frame;
+    use crate::boot::Frame;
+
+    fn frame(marker: u8) -> Frame {
+        Frame {
+            width: 1,
+            height: 1,
+            pixels: vec![marker, 0, 0, 0],
+        }
+    }
+
+    #[test]
+    fn receives_one_fifo_frame_per_paint() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(3);
+        tx.send(frame(1)).unwrap();
+        tx.send(frame(2)).unwrap();
+        tx.send(frame(3)).unwrap();
+
+        assert_eq!(take_next_game_frame(&rx).unwrap().pixels[0], 1);
+        assert_eq!(take_next_game_frame(&rx).unwrap().pixels[0], 2);
+        assert_eq!(take_next_game_frame(&rx).unwrap().pixels[0], 3);
+        assert!(take_next_game_frame(&rx).is_none());
+    }
+
+    #[test]
+    fn skips_only_malformed_frames_before_the_next_valid_frame() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        tx.send(Frame {
+            width: 0,
+            height: 1,
+            pixels: vec![0; 4],
+        })
+        .unwrap();
+        tx.send(frame(7)).unwrap();
+
+        assert_eq!(take_next_game_frame(&rx).unwrap().pixels[0], 7);
+        assert!(take_next_game_frame(&rx).is_none());
+    }
+}
+
 fn diagnostics_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_DIAG").is_some())
@@ -163,7 +227,6 @@ pub struct HorizonApp {
     game_texture_native: Option<NativeGameTexture>,
     last_game_rect: Option<egui::Rect>,
     mouse_wheel_accum: egui::Vec2,
-    frame_backlog: std::collections::VecDeque<crate::boot::Frame>,
     show_settings: bool,
     settings_tab: SettingsTab,
     prefs_anim: f32,
@@ -429,7 +492,6 @@ impl HorizonApp {
             game_texture_native: None,
             last_game_rect: None,
             mouse_wheel_accum: egui::Vec2::ZERO,
-            frame_backlog: std::collections::VecDeque::new(),
             show_settings: false,
             settings_tab: SettingsTab::General,
             prefs_anim: 0.0,
@@ -1024,17 +1086,7 @@ impl HorizonApp {
             crate::app_settings::FilterMode::Linear => egui::TextureOptions::LINEAR,
             crate::app_settings::FilterMode::Nearest => egui::TextureOptions::NEAREST,
         };
-        while let Ok(frame) = handle.frame_rx.try_recv() {
-            if frame.width == 0 || frame.height == 0 || frame.pixels.is_empty() {
-                continue;
-            }
-            self.frame_backlog.push_back(frame);
-        }
-        while self.frame_backlog.len() > 3 {
-            self.frame_backlog.pop_front();
-            gui_rate_stats(2);
-        }
-        if let Some(frame) = self.frame_backlog.pop_front() {
+        if let Some(frame) = take_next_game_frame(&handle.frame_rx) {
             gui_rate_stats(1);
             self.performance.record_frame();
             self.last_frame_res = (frame.width, frame.height);
@@ -6320,7 +6372,6 @@ impl HorizonApp {
                 self.emulation_handle = Some(h);
                 self.game_texture = None;
                 self.free_native_texture();
-                self.frame_backlog.clear();
                 self.pause_anim = None;
                 self.pill_fade = None;
                 let path = std::path::PathBuf::from(&self.nro_path);
@@ -6348,7 +6399,6 @@ impl HorizonApp {
         let carousel = self.app_settings.view_mode == crate::app_settings::ViewMode::Carousel;
         if let Some(mut h) = self.emulation_handle.take() {
             h.stop();
-            self.frame_backlog.clear();
             self.pause_anim = None;
             self.resume_anim = None;
             let has_frame = self.game_texture.is_some() || self.game_texture_native.is_some();
@@ -7667,7 +7717,7 @@ impl eframe::App for HorizonApp {
                 self.app_settings.right_deadzone,
             );
             if self.last_input.connected {
-                ctx.request_repaint_after(std::time::Duration::from_millis(8));
+                request_idle_repaint(ctx, std::time::Duration::from_millis(8));
             }
             if let Some(btn) = self.rebinding_pad {
                 if self.rebinding_pad_wait_release {
@@ -8548,7 +8598,7 @@ impl eframe::App for HorizonApp {
                             crate::carousel::shadowed_text(&painter, egui::pos2(center.x, text_y + 74.0), egui::Align2::CENTER_CENTER, "[Home / `] Cancel", FontId::proportional(13.0), Color32::from_rgba_unmultiplied(0xC0, 0xC0, 0xCC, await_alpha), false);
                         }
 
-                        ctx.request_repaint();
+                        request_idle_repaint(ctx, std::time::Duration::from_millis(16));
                     } else {
                         let panel = ui.max_rect();
                         let scale_f = if let Some(start) = self.pause_anim.or(self.stop_anim) {
@@ -9110,11 +9160,7 @@ impl eframe::App for HorizonApp {
             &mut self.app_settings,
         );
 
-        if running {
-            ctx.request_repaint();
-        } else {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-        }
+        request_idle_repaint(ctx, std::time::Duration::from_millis(16));
     }
 }
 

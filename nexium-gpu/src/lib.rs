@@ -15,4 +15,7 @@ pub mod tex_invalidate;
 pub mod texture;
 pub mod texture_manifest;
 
-pub use renderer::Renderer;
+pub use renderer::{
+    PipelinedPresentCompletion, PipelinedPresentFrame, PipelinedPresentReadback,
+    PipelinedPresentSubmission, Renderer,
+};

@@ -1215,6 +1215,8 @@ struct RendererInner {
     max_storage_buffer_range: u64,
     max_texel_buffer_elements: u32,
     pending_readbacks: HashMap<RtKey, VecDeque<PendingReadback>>,
+    pending_readback_order: HashMap<u32, VecDeque<PendingReadbackRef>>,
+    completed_readback_backlogs: HashMap<u32, VecDeque<PipelinedPresentRawCompletion>>,
     next_readback_sequence: u64,
     readback_slots: Vec<ReadbackSlot>,
     sync_readback_slot: SyncReadbackSlot,
@@ -2228,6 +2230,15 @@ fn fnv_chunked(bytes: &[u8]) -> u64 {
     h.wrapping_mul(0x100000001b3)
 }
 
+fn memoized_texture_snapshot_hash(
+    hashes: &mut HashMap<(u64, usize), u64>,
+    range: (u64, usize),
+    snapshot: &[u8],
+) -> u64 {
+    debug_assert_eq!(range.1, snapshot.len());
+    *hashes.entry(range).or_insert_with(|| fnv_chunked(snapshot))
+}
+
 fn trusted_texture_snapshot_matches(
     cached_identity: Option<u64>,
     snapshot: Option<&SharedGuestSnapshot>,
@@ -2820,13 +2831,110 @@ struct RtCopySlot {
     in_flight: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct PipelinedPresentFrame {
+    pub present_id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    pub flip_y: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub enum PipelinedPresentCompletion {
+    Ready(PipelinedPresentFrame),
+    Dropped { present_id: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PipelinedPresentSubmission {
+    Submitted,
+    SourceUnavailable,
+    Backpressured,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub struct PipelinedPresentReadback {
+    pub completion: Option<PipelinedPresentCompletion>,
+    pub submission: PipelinedPresentSubmission,
+}
+
 struct PendingReadback {
+    stream: u32,
+    present_id: u64,
     sequence: u64,
     slot: usize,
     width: u32,
     height: u32,
     format: vk::Format,
     flip_y: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingReadbackRef {
+    key: RtKey,
+    sequence: u64,
+}
+
+struct PipelinedPresentRawFrame {
+    present_id: u64,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    format: vk::Format,
+    flip_y: Option<bool>,
+}
+
+enum PipelinedPresentRawCompletion {
+    Ready(PipelinedPresentRawFrame),
+    Dropped { present_id: u64 },
+}
+
+struct PipelinedPresentRawReadback {
+    completion: Option<PipelinedPresentRawCompletion>,
+    submission: PipelinedPresentSubmission,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadbackBacklogDisposition {
+    Queue,
+    ReturnCallerDirectly,
+    Hold,
+}
+
+fn readback_backlog_disposition(
+    stream: u32,
+    caller_stream: u32,
+    caller_may_receive_direct: bool,
+    caller_backlog_is_empty: bool,
+    queued_count: usize,
+    queued_capacity: usize,
+) -> ReadbackBacklogDisposition {
+    if queued_count < queued_capacity {
+        ReadbackBacklogDisposition::Queue
+    } else if stream == caller_stream && caller_may_receive_direct && caller_backlog_is_empty {
+        ReadbackBacklogDisposition::ReturnCallerDirectly
+    } else {
+        ReadbackBacklogDisposition::Hold
+    }
+}
+
+fn completed_readback_backlog_len(
+    backlogs: &HashMap<u32, VecDeque<PipelinedPresentRawCompletion>>,
+) -> usize {
+    backlogs.values().map(VecDeque::len).sum()
+}
+
+fn take_backlogged_readback_completion(
+    backlogs: &mut HashMap<u32, VecDeque<PipelinedPresentRawCompletion>>,
+    stream: u32,
+) -> Option<PipelinedPresentRawCompletion> {
+    let completion = backlogs.get_mut(&stream).and_then(VecDeque::pop_front);
+    if backlogs.get(&stream).is_some_and(VecDeque::is_empty) {
+        backlogs.remove(&stream);
+    }
+    completion
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2844,61 +2952,70 @@ impl ExactReadbackStamp {
     }
 }
 
-fn take_latest_completed_readback(
+fn take_stream_head_completed_readback(
     pending_readbacks: &mut HashMap<RtKey, VecDeque<PendingReadback>>,
+    pending_readback_order: &mut HashMap<u32, VecDeque<PendingReadbackRef>>,
+    stream: u32,
     mut is_ready: impl FnMut(usize) -> bool,
-) -> (Option<PendingReadback>, Vec<usize>) {
-    let mut latest = None;
-    let mut superseded_slots = Vec::new();
-    pending_readbacks.retain(|_, pending| {
-        let mut keep = VecDeque::with_capacity(pending.len());
-        while let Some(readback) = pending.pop_front() {
-            if !is_ready(readback.slot) {
-                keep.push_back(readback);
-                continue;
-            }
-            if latest
-                .as_ref()
-                .is_none_or(|current: &PendingReadback| readback.sequence > current.sequence)
-            {
-                if let Some(superseded) = latest.replace(readback) {
-                    superseded_slots.push(superseded.slot);
-                }
-            } else {
-                superseded_slots.push(readback.slot);
-            }
-        }
-        *pending = keep;
-        !pending.is_empty()
-    });
-    (latest, superseded_slots)
-}
+) -> Option<PendingReadback> {
+    loop {
+        let head = pending_readback_order
+            .get(&stream)
+            .and_then(|order| order.front())
+            .copied()?;
 
-fn take_latest_completed_readback_for_key(
-    pending: &mut VecDeque<PendingReadback>,
-    mut is_ready: impl FnMut(usize) -> bool,
-) -> (Option<PendingReadback>, Vec<usize>) {
-    let mut latest = None;
-    let mut keep = VecDeque::with_capacity(pending.len());
-    let mut superseded_slots = Vec::new();
-    while let Some(readback) = pending.pop_front() {
-        if !is_ready(readback.slot) {
-            keep.push_back(readback);
-            continue;
-        }
-        if latest
-            .as_ref()
-            .is_none_or(|current: &PendingReadback| readback.sequence > current.sequence)
-        {
-            if let Some(superseded) = latest.replace(readback) {
-                superseded_slots.push(superseded.slot);
+        let mut completed = None;
+        let mut key_is_empty = false;
+        if let Some(pending_for_key) = pending_readbacks.get_mut(&head.key) {
+            if let Some(index) = pending_for_key.iter().position(|readback| {
+                readback.sequence == head.sequence && readback.stream == stream
+            }) {
+                let slot = pending_for_key[index].slot;
+                if !is_ready(slot) {
+                    return None;
+                }
+                completed = pending_for_key.remove(index);
+                key_is_empty = pending_for_key.is_empty();
             }
-        } else {
-            superseded_slots.push(readback.slot);
         }
+
+        if let Some(completed) = completed {
+            if key_is_empty {
+                pending_readbacks.remove(&head.key);
+            }
+            let order_is_empty = {
+                let order = pending_readback_order
+                    .get_mut(&stream)
+                    .expect("stream order disappeared while consuming its head");
+                let removed = order.pop_front();
+                debug_assert_eq!(removed, Some(head));
+                order.is_empty()
+            };
+            if order_is_empty {
+                pending_readback_order.remove(&stream);
+            }
+            debug_assert_eq!(completed.stream, stream);
+            return Some(completed);
+        }
+
+        let order_is_empty = {
+            let order = pending_readback_order
+                .get_mut(&stream)
+                .expect("stream order disappeared while removing a stale head");
+            let removed = order.pop_front();
+            debug_assert_eq!(removed, Some(head));
+            order.is_empty()
+        };
+        if order_is_empty {
+            pending_readback_order.remove(&stream);
+        }
+        log::warn!(
+            "discarded stale pipelined readback reference: stream={} sequence={} key={}",
+            stream,
+            head.sequence,
+            head.key.label()
+        );
     }
-    *pending = keep;
-    (latest, superseded_slots)
 }
 
 fn readback_fence_is_ready(status: Result<bool, vk::Result>) -> bool {
@@ -2918,9 +3035,13 @@ fn materialize_completed_readback(
     device: &ash::Device,
     readback_slots: &mut [ReadbackSlot],
     completed: Option<PendingReadback>,
-) -> Option<(u32, u32, Vec<u8>, vk::Format, Option<bool>)> {
+) -> Option<PipelinedPresentRawCompletion> {
     let completed = completed?;
-    let slot = readback_slots.get_mut(completed.slot)?;
+    let Some(slot) = readback_slots.get_mut(completed.slot) else {
+        return Some(PipelinedPresentRawCompletion::Dropped {
+            present_id: completed.present_id,
+        });
+    };
     let raw = (|| {
         let total = readback_byte_len(completed.width, completed.height, completed.format)?;
         let stage = slot.stage.as_ref()?;
@@ -2938,14 +3059,121 @@ fn materialize_completed_readback(
         Some(raw)
     })();
     slot.in_flight = false;
-    let raw = raw?;
-    Some((
-        completed.width,
-        completed.height,
-        raw,
-        completed.format,
-        completed.flip_y,
-    ))
+    Some(match raw {
+        Some(pixels) => PipelinedPresentRawCompletion::Ready(PipelinedPresentRawFrame {
+            present_id: completed.present_id,
+            width: completed.width,
+            height: completed.height,
+            pixels,
+            format: completed.format,
+            flip_y: completed.flip_y,
+        }),
+        None => PipelinedPresentRawCompletion::Dropped {
+            present_id: completed.present_id,
+        },
+    })
+}
+
+fn drain_ready_readback_heads(
+    device: &ash::Device,
+    readback_slots: &mut [ReadbackSlot],
+    pending_readbacks: &mut HashMap<RtKey, VecDeque<PendingReadback>>,
+    pending_readback_order: &mut HashMap<u32, VecDeque<PendingReadbackRef>>,
+    completed_readback_backlogs: &mut HashMap<u32, VecDeque<PipelinedPresentRawCompletion>>,
+    caller_stream: u32,
+    caller_may_receive_direct: bool,
+) -> Option<PipelinedPresentRawCompletion> {
+    let queued_capacity = readback_slots.len();
+    let mut queued_count = completed_readback_backlog_len(completed_readback_backlogs);
+    let mut caller_direct = None;
+    let mut streams: Vec<u32> = pending_readback_order.keys().copied().collect();
+    streams.sort_unstable();
+
+    loop {
+        let mut progressed = false;
+        for &stream in &streams {
+            let caller_backlog_is_empty = completed_readback_backlogs
+                .get(&caller_stream)
+                .is_none_or(VecDeque::is_empty);
+            let disposition = readback_backlog_disposition(
+                stream,
+                caller_stream,
+                caller_may_receive_direct && caller_direct.is_none(),
+                caller_backlog_is_empty,
+                queued_count,
+                queued_capacity,
+            );
+            if disposition == ReadbackBacklogDisposition::Hold {
+                continue;
+            }
+
+            let completed = take_stream_head_completed_readback(
+                pending_readbacks,
+                pending_readback_order,
+                stream,
+                |slot_idx| {
+                    readback_slots.get(slot_idx).is_some_and(|slot| {
+                        readback_fence_is_ready(unsafe { device.get_fence_status(slot.fence) })
+                    })
+                },
+            );
+            let Some(completion) =
+                materialize_completed_readback(device, readback_slots, completed)
+            else {
+                continue;
+            };
+
+            match disposition {
+                ReadbackBacklogDisposition::Queue => {
+                    completed_readback_backlogs
+                        .entry(stream)
+                        .or_default()
+                        .push_back(completion);
+                    queued_count += 1;
+                    progressed = true;
+                }
+                ReadbackBacklogDisposition::ReturnCallerDirectly => {
+                    caller_direct = Some(completion);
+                    progressed = true;
+                    break;
+                }
+                ReadbackBacklogDisposition::Hold => unreachable!("held readback was consumed"),
+            }
+        }
+
+        if caller_direct.is_some() || queued_count >= queued_capacity || !progressed {
+            break;
+        }
+    }
+
+    caller_direct
+}
+
+fn take_pipelined_readback_completion(
+    device: &ash::Device,
+    readback_slots: &mut [ReadbackSlot],
+    pending_readbacks: &mut HashMap<RtKey, VecDeque<PendingReadback>>,
+    pending_readback_order: &mut HashMap<u32, VecDeque<PendingReadbackRef>>,
+    completed_readback_backlogs: &mut HashMap<u32, VecDeque<PipelinedPresentRawCompletion>>,
+    caller_stream: u32,
+) -> Option<PipelinedPresentRawCompletion> {
+    let mut completion =
+        take_backlogged_readback_completion(completed_readback_backlogs, caller_stream);
+    let caller_direct = drain_ready_readback_heads(
+        device,
+        readback_slots,
+        pending_readbacks,
+        pending_readback_order,
+        completed_readback_backlogs,
+        caller_stream,
+        completion.is_none(),
+    );
+    if completion.is_none() {
+        completion =
+            take_backlogged_readback_completion(completed_readback_backlogs, caller_stream)
+                .or(caller_direct);
+    }
+    completion
 }
 
 struct ReadbackSlot {
@@ -4346,6 +4574,8 @@ impl Renderer {
                 max_storage_buffer_range,
                 max_texel_buffer_elements,
                 pending_readbacks: HashMap::new(),
+                pending_readback_order: HashMap::new(),
+                completed_readback_backlogs: HashMap::new(),
                 next_readback_sequence: 1,
                 readback_slots,
                 sync_readback_slot,
@@ -5850,6 +6080,7 @@ impl Renderer {
             rt_cache,
             mem_props,
             pending_readbacks,
+            pending_readback_order,
             readback_slots,
             quarantined_readbacks,
             ..
@@ -5880,6 +6111,18 @@ impl Renderer {
                 pending_readbacks.insert(pending_key, keep);
             }
         }
+        pending_readback_order.retain(|_, order| {
+            order.retain(|reference| {
+                pending_readbacks
+                    .get(&reference.key)
+                    .is_some_and(|pending| {
+                        pending
+                            .iter()
+                            .any(|readback| readback.sequence == reference.sequence)
+                    })
+            });
+            !order.is_empty()
+        });
 
         let total = (width as u64) * 4 * (height as u64);
         let stage = create_staging_owned(device, mem_props, total).ok()?;
@@ -6414,45 +6657,60 @@ impl Renderer {
 
     pub fn readback_target_pipelined(
         &self,
+        binder_id: u32,
+        present_id: u64,
         nvmap_id: u32,
         width: u32,
         height: u32,
         gpu_va: u64,
         cpu_addr: u64,
         copy_rect: Option<[u32; 4]>,
-    ) -> Option<(u32, u32, Vec<u8>, Option<bool>)> {
+    ) -> PipelinedPresentReadback {
         self.readback_target_pipelined_selected(
-            nvmap_id, width, height, gpu_va, cpu_addr, copy_rect, None, false,
+            binder_id, present_id, nvmap_id, width, height, gpu_va, cpu_addr, copy_rect, None,
+            false,
         )
     }
 
     pub fn readback_target_pipelined_pinned_at_va(
         &self,
+        binder_id: u32,
+        present_id: u64,
         nvmap_id: u32,
         width: u32,
         height: u32,
         gpu_va: u64,
         cpu_addr: u64,
         copy_rect: Option<[u32; 4]>,
-    ) -> Option<(u32, u32, Vec<u8>, Option<bool>)> {
+    ) -> PipelinedPresentReadback {
         if gpu_va == 0 {
-            return None;
+            return PipelinedPresentReadback {
+                completion: None,
+                submission: PipelinedPresentSubmission::SourceUnavailable,
+            };
         }
         self.readback_target_pipelined_selected(
-            nvmap_id, width, height, gpu_va, cpu_addr, copy_rect, None, true,
+            binder_id, present_id, nvmap_id, width, height, gpu_va, cpu_addr, copy_rect, None, true,
         )
     }
 
     pub fn readback_exact_provenance_pipelined(
         &self,
+        binder_id: u32,
+        present_id: u64,
         key: RtKey,
         expected_stamp: u64,
         copy_rect: Option<[u32; 4]>,
-    ) -> Option<(u32, u32, Vec<u8>, Option<bool>)> {
+    ) -> PipelinedPresentReadback {
         if key.width == 0 || key.height == 0 || key.depth != 1 || key.is_3d || expected_stamp == 0 {
-            return None;
+            return PipelinedPresentReadback {
+                completion: None,
+                submission: PipelinedPresentSubmission::SourceUnavailable,
+            };
         }
         self.readback_target_pipelined_selected(
+            binder_id,
+            present_id,
             key.nvmap_id,
             key.width,
             key.height,
@@ -6466,14 +6724,21 @@ impl Renderer {
 
     pub fn readback_live_provenance_pipelined(
         &self,
+        binder_id: u32,
+        present_id: u64,
         key: RtKey,
         minimum_stamp: u64,
         copy_rect: Option<[u32; 4]>,
-    ) -> Option<(u32, u32, Vec<u8>, Option<bool>)> {
+    ) -> PipelinedPresentReadback {
         if key.width == 0 || key.height == 0 || key.depth != 1 || key.is_3d || minimum_stamp == 0 {
-            return None;
+            return PipelinedPresentReadback {
+                completion: None,
+                submission: PipelinedPresentSubmission::SourceUnavailable,
+            };
         }
         self.readback_target_pipelined_selected(
+            binder_id,
+            present_id,
             key.nvmap_id,
             key.width,
             key.height,
@@ -6487,6 +6752,8 @@ impl Renderer {
 
     fn readback_target_pipelined_selected(
         &self,
+        binder_id: u32,
+        present_id: u64,
         nvmap_id: u32,
         width: u32,
         height: u32,
@@ -6495,9 +6762,11 @@ impl Renderer {
         copy_rect: Option<[u32; 4]>,
         exact_copy: Option<(RtKey, ExactReadbackStamp)>,
         pinned_only: bool,
-    ) -> Option<(u32, u32, Vec<u8>, Option<bool>)> {
+    ) -> PipelinedPresentReadback {
         let pp_t0 = std::time::Instant::now();
         let raw_result = self.readback_target_pipelined_raw(
+            binder_id,
+            present_id,
             nvmap_id,
             width,
             height,
@@ -6508,20 +6777,47 @@ impl Renderer {
             pinned_only,
         );
         let pp_raw = pp_t0.elapsed();
-        let (w, h, raw, format, flip_y) = raw_result?;
-        let pp_t1 = std::time::Instant::now();
-        let out = if legacy_present_enabled() {
-            readback_to_rgba8(&raw, format, w, h)
-        } else {
-            let vflip = flip_y.unwrap_or(!(w == 1600 && h == 900));
-            readout_present_rgba8(raw, format, w, h, vflip)
+        let completion = match raw_result.completion {
+            Some(PipelinedPresentRawCompletion::Ready(frame)) => {
+                let pp_t1 = std::time::Instant::now();
+                let out = if legacy_present_enabled() {
+                    readback_to_rgba8(&frame.pixels, frame.format, frame.width, frame.height)
+                } else {
+                    let vflip = frame
+                        .flip_y
+                        .unwrap_or(!(frame.width == 1600 && frame.height == 900));
+                    readout_present_rgba8(
+                        frame.pixels,
+                        frame.format,
+                        frame.width,
+                        frame.height,
+                        vflip,
+                    )
+                };
+                pprof_record(frame.width, frame.height, pp_raw, pp_t1.elapsed());
+                Some(PipelinedPresentCompletion::Ready(PipelinedPresentFrame {
+                    present_id: frame.present_id,
+                    width: frame.width,
+                    height: frame.height,
+                    pixels: out,
+                    flip_y: frame.flip_y,
+                }))
+            }
+            Some(PipelinedPresentRawCompletion::Dropped { present_id }) => {
+                Some(PipelinedPresentCompletion::Dropped { present_id })
+            }
+            None => None,
         };
-        pprof_record(w, h, pp_raw, pp_t1.elapsed());
-        Some((w, h, out, flip_y))
+        PipelinedPresentReadback {
+            completion,
+            submission: raw_result.submission,
+        }
     }
 
     fn readback_target_pipelined_raw(
         &self,
+        binder_id: u32,
+        present_id: u64,
         nvmap_id: u32,
         width: u32,
         height: u32,
@@ -6530,7 +6826,7 @@ impl Renderer {
         copy_rect: Option<[u32; 4]>,
         exact_copy: Option<(RtKey, ExactReadbackStamp)>,
         pinned_only: bool,
-    ) -> Option<(u32, u32, Vec<u8>, vk::Format, Option<bool>)> {
+    ) -> PipelinedPresentRawReadback {
         let pr_t0 = std::time::Instant::now();
         let mut inner = self.inner.lock();
         pprof_raw_lock(pr_t0.elapsed());
@@ -6541,6 +6837,8 @@ impl Renderer {
             rt_cache,
             mem_props,
             pending_readbacks,
+            pending_readback_order,
+            completed_readback_backlogs,
             next_readback_sequence,
             readback_slots,
             ..
@@ -6580,22 +6878,48 @@ impl Renderer {
         };
         let Some((key, pinned)) = selected else {
             if pinned_only {
-                return None;
+                let _ = drain_ready_readback_heads(
+                    device,
+                    readback_slots,
+                    pending_readbacks,
+                    pending_readback_order,
+                    completed_readback_backlogs,
+                    binder_id,
+                    false,
+                );
+                return PipelinedPresentRawReadback {
+                    completion: None,
+                    submission: PipelinedPresentSubmission::SourceUnavailable,
+                };
             }
-            let (latest, superseded_slots) =
-                take_latest_completed_readback(pending_readbacks, |slot_idx| {
-                    readback_slots.get(slot_idx).is_some_and(|slot| {
-                        readback_fence_is_ready(unsafe { device.get_fence_status(slot.fence) })
-                    })
-                });
-            for slot_idx in superseded_slots {
-                if let Some(slot) = readback_slots.get_mut(slot_idx) {
-                    slot.in_flight = false;
-                }
-            }
-            return materialize_completed_readback(device, readback_slots, latest);
+            let completion = take_pipelined_readback_completion(
+                device,
+                readback_slots,
+                pending_readbacks,
+                pending_readback_order,
+                completed_readback_backlogs,
+                binder_id,
+            );
+            return PipelinedPresentRawReadback {
+                completion,
+                submission: PipelinedPresentSubmission::SourceUnavailable,
+            };
         };
-        let readback_format = rt_cache.get_existing(key)?.format;
+        let Some(readback_format) = rt_cache.get_existing(key).map(|image| image.format) else {
+            let _ = drain_ready_readback_heads(
+                device,
+                readback_slots,
+                pending_readbacks,
+                pending_readback_order,
+                completed_readback_backlogs,
+                binder_id,
+                false,
+            );
+            return PipelinedPresentRawReadback {
+                completion: None,
+                submission: PipelinedPresentSubmission::SourceUnavailable,
+            };
+        };
         let resolved_flip_y = rt_cache.present_flip_y(key);
         trace_present_key(rt_cache, requested_key, key, pinned);
         if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
@@ -6622,31 +6946,14 @@ impl Renderer {
         );
         rt_cache.reset_frame_draws();
 
-        let (latest_ready, superseded_slots, mut keep_pending) = if pinned_only {
-            let mut pending = pending_readbacks.remove(&key).unwrap_or_default();
-            let (latest_ready, superseded_slots) =
-                take_latest_completed_readback_for_key(&mut pending, |slot_idx| {
-                    readback_slots.get(slot_idx).is_some_and(|slot| {
-                        readback_fence_is_ready(unsafe { device.get_fence_status(slot.fence) })
-                    })
-                });
-            (latest_ready, superseded_slots, pending)
-        } else {
-            let (latest_ready, superseded_slots) =
-                take_latest_completed_readback(pending_readbacks, |slot_idx| {
-                    readback_slots.get(slot_idx).is_some_and(|slot| {
-                        readback_fence_is_ready(unsafe { device.get_fence_status(slot.fence) })
-                    })
-                });
-            let pending = pending_readbacks.remove(&key).unwrap_or_default();
-            (latest_ready, superseded_slots, pending)
-        };
-        for slot_idx in superseded_slots {
-            if let Some(slot) = readback_slots.get_mut(slot_idx) {
-                slot.in_flight = false;
-            }
-        }
-        let ready_frame = materialize_completed_readback(device, readback_slots, latest_ready);
+        let completion = take_pipelined_readback_completion(
+            device,
+            readback_slots,
+            pending_readbacks,
+            pending_readback_order,
+            completed_readback_backlogs,
+            binder_id,
+        );
         let Some(slot_idx) = readback_slots.iter().position(|slot| !slot.in_flight) else {
             if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() {
                 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6669,8 +6976,10 @@ impl Renderer {
                     );
                 }
             }
-            pending_readbacks.insert(key, keep_pending);
-            return ready_frame;
+            return PipelinedPresentRawReadback {
+                completion,
+                submission: PipelinedPresentSubmission::Backpressured,
+            };
         };
 
         let copy_rect = if key.width != width || key.height != height {
@@ -6684,10 +6993,10 @@ impl Renderer {
         let copy_w = copy_w.min(key.width.saturating_sub(copy_x));
         let copy_h = copy_h.min(key.height.saturating_sub(copy_y));
         let Some(total) = readback_byte_len(copy_w, copy_h, readback_format) else {
-            if !keep_pending.is_empty() {
-                pending_readbacks.insert(key, keep_pending);
-            }
-            return ready_frame;
+            return PipelinedPresentRawReadback {
+                completion,
+                submission: PipelinedPresentSubmission::Failed,
+            };
         };
         let total = total as u64;
         {
@@ -6709,36 +7018,36 @@ impl Renderer {
                         slot.stage = Some(stage);
                     }
                     Err(_) => {
-                        if !keep_pending.is_empty() {
-                            pending_readbacks.insert(key, keep_pending);
-                        }
-                        return ready_frame;
+                        return PipelinedPresentRawReadback {
+                            completion,
+                            submission: PipelinedPresentSubmission::Failed,
+                        };
                     }
                 }
             }
         }
         let slot = &mut readback_slots[slot_idx];
         if reset_command_buffer(device, slot.cmd).is_err() {
-            if !keep_pending.is_empty() {
-                pending_readbacks.insert(key, keep_pending);
-            }
-            return ready_frame;
+            return PipelinedPresentRawReadback {
+                completion,
+                submission: PipelinedPresentSubmission::Failed,
+            };
         }
         if begin_one_time(device, slot.cmd).is_err() {
-            if !keep_pending.is_empty() {
-                pending_readbacks.insert(key, keep_pending);
-            }
-            return ready_frame;
+            return PipelinedPresentRawReadback {
+                completion,
+                submission: PipelinedPresentSubmission::Failed,
+            };
         }
         let cmd = slot.cmd;
         let fence = slot.fence;
         let stage_buffer = match slot.stage.as_ref() {
             Some(stage) => stage.buffer,
             None => {
-                if !keep_pending.is_empty() {
-                    pending_readbacks.insert(key, keep_pending);
-                }
-                return ready_frame;
+                return PipelinedPresentRawReadback {
+                    completion,
+                    submission: PipelinedPresentSubmission::Failed,
+                };
             }
         };
         let img = match rt_cache.get_existing(key) {
@@ -6747,10 +7056,10 @@ impl Renderer {
                 unsafe {
                     let _ = device.end_command_buffer(cmd);
                 }
-                if !keep_pending.is_empty() {
-                    pending_readbacks.insert(key, keep_pending);
-                }
-                return ready_frame;
+                return PipelinedPresentRawReadback {
+                    completion,
+                    submission: PipelinedPresentSubmission::Failed,
+                };
             }
         };
         transition_image(
@@ -6812,25 +7121,36 @@ impl Renderer {
                     );
                 }
             }
-            if !keep_pending.is_empty() {
-                pending_readbacks.insert(key, keep_pending);
-            }
-            return ready_frame;
+            return PipelinedPresentRawReadback {
+                completion,
+                submission: PipelinedPresentSubmission::Failed,
+            };
         }
         img.layout = readback_layout_after_submit(previous_layout, true);
         readback_slots[slot_idx].in_flight = true;
         let sequence = *next_readback_sequence;
         *next_readback_sequence = sequence.wrapping_add(1).max(1);
-        keep_pending.push_back(PendingReadback {
-            sequence,
-            slot: slot_idx,
-            width: copy_w,
-            height: copy_h,
-            format: readback_format,
-            flip_y: resolved_flip_y,
-        });
-        pending_readbacks.insert(key, keep_pending);
-        ready_frame
+        pending_readbacks
+            .entry(key)
+            .or_default()
+            .push_back(PendingReadback {
+                stream: binder_id,
+                present_id,
+                sequence,
+                slot: slot_idx,
+                width: copy_w,
+                height: copy_h,
+                format: readback_format,
+                flip_y: resolved_flip_y,
+            });
+        pending_readback_order
+            .entry(binder_id)
+            .or_default()
+            .push_back(PendingReadbackRef { key, sequence });
+        PipelinedPresentRawReadback {
+            completion,
+            submission: PipelinedPresentSubmission::Submitted,
+        }
     }
 
     pub fn compile_pipeline(
@@ -7452,7 +7772,7 @@ impl Renderer {
             let direct_volume_rt = pending.map_or(false, |(key, _, _, _)| key.volume)
                 && sampled_rt_key_for_slot(call, slot).is_some_and(|key| key.is_3d);
             let pending_special = pending
-                .map_or(false, |(key, _, _, _)| texture_key_has_special_view(key))
+                .map_or(false, |(key, tic, _, _)| texture_key_blocks_2d_rt_alias(key, &tic))
                 && !direct_volume_rt;
             if !pending_special {
                 if let Some(alias) = rt_aliases.get(slot).copied().flatten().filter(|alias| {
@@ -9490,6 +9810,7 @@ impl Renderer {
             let mut post_submit_texture_probe: [Option<PostSubmitTextureProbe>; 2] = [None, None];
             let mut tex_raw_cache: HashMap<(u64, usize), Option<SharedGuestSnapshot>> =
                 HashMap::new();
+            let mut tex_raw_hash_cache: HashMap<(u64, usize), u64> = HashMap::new();
             let mut volume_slice_cache: HashMap<
                 (TexCacheKey, usize, Option<RtKey>),
                 Vec<VolumeRtSlice>,
@@ -9852,7 +10173,9 @@ impl Renderer {
                     let direct_volume_rt = pending.map_or(false, |(key, _, _, _)| key.volume)
                         && sampled_rt_key_for_slot(call, slot).is_some_and(|key| key.is_3d);
                     let pending_special = pending
-                        .map_or(false, |(key, _, _, _)| texture_key_has_special_view(key))
+                        .map_or(false, |(key, tic, _, _)| {
+                            texture_key_blocks_2d_rt_alias(key, &tic)
+                        })
                         && !direct_volume_rt;
                     let frozen_rt_alias = rt_aliases
                         .get(slot)
@@ -10405,7 +10728,15 @@ impl Renderer {
                             raw_snapshot,
                             raw_snapshot.map(SharedGuestSnapshot::as_slice),
                             (!trusted_match)
-                                .then(|| raw_snapshot.map(|raw| fnv_chunked(raw.as_slice())))
+                                .then(|| {
+                                    raw_snapshot.map(|raw| {
+                                        memoized_texture_snapshot_hash(
+                                            &mut tex_raw_hash_cache,
+                                            (key.gpu_va, read_size),
+                                            raw.as_slice(),
+                                        )
+                                    })
+                                })
                                 .flatten(),
                         )
                     };
@@ -11817,6 +12148,7 @@ impl Renderer {
                         hot_generic_texture_bindings.fill(None);
                         clear_group_texture_bindings_after_invalidate(&mut group_texture_bindings);
                         tex_raw_cache.clear();
+                        tex_raw_hash_cache.clear();
                         if texture_cache_invalidate_clear_enabled() {
                             frame_slots[cur_idx]
                                 .retired_textures
@@ -19366,6 +19698,16 @@ fn tic_can_use_2d_rt_alias_view(tic: &crate::texture::TicEntry) -> bool {
     !tic_requires_dedicated_sampled_view(tic) || (tic_is_arrayed(tic) && tic.depth <= 1)
 }
 
+fn texture_key_blocks_2d_rt_alias(
+    key: TexCacheKey,
+    tic: &crate::texture::TicEntry,
+) -> bool {
+    key.volume
+        || key.cube
+        || key.cube_array
+        || (key.arrayed && !tic_can_use_2d_rt_alias_view(tic))
+}
+
 fn tic_layer_count(tic: &crate::texture::TicEntry) -> u32 {
     if tic_is_arrayed(tic) {
         tic.depth.max(1)
@@ -26444,6 +26786,8 @@ impl Drop for RendererInner {
             }
         }
         self.pending_readbacks.clear();
+        self.pending_readback_order.clear();
+        self.completed_readback_backlogs.clear();
         for slot in self.readback_slots.drain(..) {
             let safe = device_idle
                 || !slot.in_flight
@@ -26513,10 +26857,11 @@ mod tests {
         align_up, build_grouped_shared_ssbo_plans, build_shared_ssbo_plan,
         choose_aurora_resident_slot, clear_group_texture_bindings_after_invalidate,
         color_sync_clean_across_group, color_sync_supports_key, complete_compute_volume_rt_slices,
-        compute_cross_access_view_components, compute_guest_content_can_retain,
-        compute_guest_content_matches, compute_guest_image_pool_can_admit,
-        compute_guest_image_pool_key, compute_guest_sampler_format_features,
-        compute_guest_source_matches, compute_guest_upload_is_current, compute_guest_upload_spec,
+        completed_readback_backlog_len, compute_cross_access_view_components,
+        compute_guest_content_can_retain, compute_guest_content_matches,
+        compute_guest_image_pool_can_admit, compute_guest_image_pool_key,
+        compute_guest_sampler_format_features, compute_guest_source_matches,
+        compute_guest_upload_is_current, compute_guest_upload_spec,
         compute_raw_storage_cache_can_admit, compute_raw_storage_keys_conflict,
         compute_raw_storage_seed_is_valid, compute_sampled_image_alias_extent_matches,
         compute_texel_buffer_format_features, compute_volume_cache_can_admit,
@@ -26530,30 +26875,32 @@ mod tests {
         group_texture_binding_lookup, group_texture_binding_memo_eligible,
         group_texture_memo_enabled_for_contract, inline_graphics_clear_rect,
         inline_graphics_color_clear_region, memoized_group_tic, memoized_group_tsc,
-        parse_bind_trace_filter, pipeline_prewarm_value_enabled,
-        preflight_draw_group_attachment_uses, readback_byte_len, readback_fence_is_ready,
-        readback_layout_after_submit, readback_stage_needs_growth, readback_to_rgba8,
-        readback_wait_disposition, resident_cbuf_draw_is_valid, resolved_rt_copy_key,
-        ring_request_upper_bound, route_texture_key_to_shader_image_kind,
+        memoized_texture_snapshot_hash, parse_bind_trace_filter, pipeline_prewarm_value_enabled,
+        preflight_draw_group_attachment_uses, readback_backlog_disposition, readback_byte_len,
+        readback_fence_is_ready, readback_layout_after_submit, readback_stage_needs_growth,
+        readback_to_rgba8, readback_wait_disposition, resident_cbuf_draw_is_valid,
+        resolved_rt_copy_key, ring_request_upper_bound, route_texture_key_to_shader_image_kind,
         rt_alias_sample_view_type, sampled_rt_key_from_lists, sampled_texture_needs_upload,
         segment_group_texture_prep_memo, shared_aurora_ssbo_key, sparse_texture_manifest_eligible,
-        take_latest_completed_readback, take_latest_completed_readback_for_key,
+        take_backlogged_readback_completion, take_stream_head_completed_readback,
         tex_gen_gating_value_enabled, texel_buffer_format,
         texture_cache_invalidate_clear_value_enabled, texture_image_format_for_tic,
-        texture_key_has_special_view, texture_level_upload, texture_numeric_cache_key,
-        texture_numeric_type_matches_format, texture_requires_integer_sampler, texture_upload_data,
-        texture_upload_data_with_layout, texture_view_layer_range, texture_view_swizzle,
-        tic_can_use_2d_rt_alias_view, tic_format_prefers_depth_alias, tic_is_cube, tic_layer_count,
-        tic_read_size, tic_requires_dedicated_sampled_view, tic_storage_layer_count,
-        tic_view_base_layer, tic_view_layer_count, trusted_texture_snapshot_matches,
-        typed_sampled_image_infos, typed_texel_buffer_views, vk_integer_border_color,
+        texture_key_blocks_2d_rt_alias, texture_key_has_special_view, texture_level_upload,
+        texture_numeric_cache_key, texture_numeric_type_matches_format,
+        texture_requires_integer_sampler, texture_upload_data, texture_upload_data_with_layout,
+        texture_view_layer_range, texture_view_swizzle, tic_can_use_2d_rt_alias_view,
+        tic_format_prefers_depth_alias, tic_is_cube, tic_layer_count, tic_read_size,
+        tic_requires_dedicated_sampled_view, tic_storage_layer_count, tic_view_base_layer,
+        tic_view_layer_count, trusted_texture_snapshot_matches, typed_sampled_image_infos,
+        typed_texel_buffer_views, vk_integer_border_color,
         volume_rt_slices_disjoint_from_attachments, write_resident_cbuf_payload,
         AuroraResidentSlot, AuroraResidentSlotChoice, ComputeGuestImageContent,
         DescriptorSetBatchCache, DrawGroupAttachmentUse, DummyImageKind, ExactReadbackStamp,
         GraphicsClearOp, GraphicsColorClear, GraphicsDepthStencilClear, GraphicsTextureBindOutcome,
         GraphicsTextureBindTraceRecord, GraphicsTextureTraceResource, GroupTexturePrepMemo,
         GroupTextureReadContract, GroupTextureRouteKey, HotGenericTextureBinding,
-        InlineGraphicsColorClearRegion, PendingReadback, ReadbackWaitDisposition,
+        InlineGraphicsColorClearRegion, PendingReadback, PendingReadbackRef,
+        PipelinedPresentRawCompletion, ReadbackBacklogDisposition, ReadbackWaitDisposition,
         RecordTextureMemoProfile, RecordedGraphicsState, RecordedGraphicsStateDecision, RtAlias,
         RtKey, SharedGuestSnapshot, TexCacheKey, TextureMipCopy, VolumeRtSlice,
         COMPUTE_GUEST_IMAGE_CONTENT_MAX_BYTES, COMPUTE_GUEST_IMAGE_POOL_MAX_BYTES,
@@ -26588,6 +26935,40 @@ mod tests {
         for enabled in ["1", "true", "on", "yes"] {
             assert!(tex_gen_gating_value_enabled(Some(OsStr::new(enabled))));
         }
+    }
+
+    #[test]
+    fn texture_snapshot_hash_memo_reuses_exact_ranges_and_restarts_after_clear() {
+        let first = [1, 2, 3, 4];
+        let changed = [9, 2, 3, 4];
+        let longer = [1, 2, 3, 4, 5];
+        let first_hash = fnv_chunked(&first);
+        let changed_hash = fnv_chunked(&changed);
+        let mut hashes = HashMap::new();
+
+        assert_eq!(
+            memoized_texture_snapshot_hash(&mut hashes, (0x4000, first.len()), &first),
+            first_hash
+        );
+        assert_eq!(
+            memoized_texture_snapshot_hash(&mut hashes, (0x4000, changed.len()), &changed),
+            first_hash
+        );
+        assert_eq!(
+            memoized_texture_snapshot_hash(&mut hashes, (0x5000, changed.len()), &changed),
+            changed_hash
+        );
+        assert_eq!(
+            memoized_texture_snapshot_hash(&mut hashes, (0x4000, longer.len()), &longer),
+            fnv_chunked(&longer)
+        );
+        assert_eq!(hashes.len(), 3);
+
+        hashes.clear();
+        assert_eq!(
+            memoized_texture_snapshot_hash(&mut hashes, (0x4000, changed.len()), &changed),
+            changed_hash
+        );
     }
 
     #[test]
@@ -27781,9 +28162,11 @@ mod tests {
     }
 
     #[test]
-    fn completed_readback_reaper_returns_global_latest_across_rotating_keys() {
-        fn pending(slot: usize, sequence: u64) -> PendingReadback {
+    fn stream_readback_fifo_blocks_a_later_ready_target() {
+        fn pending(stream: u32, present_id: u64, slot: usize, sequence: u64) -> PendingReadback {
             PendingReadback {
+                stream,
+                present_id,
                 sequence,
                 slot,
                 width: 1,
@@ -27793,35 +28176,61 @@ mod tests {
             }
         }
 
-        let current_key = RtKey::new(1, 1, 1, 0x1000);
-        let mixed_other_key = RtKey::new(2, 1, 1, 0x2000);
-        let completed_other_key = RtKey::new(3, 1, 1, 0x3000);
+        let stream = 17;
+        let first_key = RtKey::new(1, 1, 1, 0x1000);
+        let second_key = RtKey::new(2, 1, 1, 0x2000);
         let mut pending_readbacks = HashMap::from([
-            (current_key, VecDeque::from([pending(0, 1)])),
-            (
-                mixed_other_key,
-                VecDeque::from([pending(1, 2), pending(2, 3)]),
-            ),
-            (completed_other_key, VecDeque::from([pending(3, 0)])),
+            (first_key, VecDeque::from([pending(stream, 100, 0, 1)])),
+            (second_key, VecDeque::from([pending(stream, 101, 1, 2)])),
         ]);
-        let ready = [true, true, false, true];
+        let mut pending_readback_order = HashMap::from([(
+            stream,
+            VecDeque::from([
+                PendingReadbackRef {
+                    key: first_key,
+                    sequence: 1,
+                },
+                PendingReadbackRef {
+                    key: second_key,
+                    sequence: 2,
+                },
+            ]),
+        )]);
+        let mut ready = [false, true];
 
-        let (latest, mut superseded_slots) =
-            take_latest_completed_readback(&mut pending_readbacks, |slot| ready[slot]);
-        superseded_slots.sort_unstable();
+        assert!(take_stream_head_completed_readback(
+            &mut pending_readbacks,
+            &mut pending_readback_order,
+            stream,
+            |slot| ready[slot],
+        )
+        .is_none());
+        assert_eq!(pending_readback_order[&stream].len(), 2);
+        assert!(pending_readbacks.contains_key(&first_key));
+        assert!(pending_readbacks.contains_key(&second_key));
 
-        let latest = latest.unwrap();
-        assert_eq!((latest.slot, latest.sequence), (1, 2));
-        assert_eq!(superseded_slots, vec![0, 3]);
-        assert!(!pending_readbacks.contains_key(&current_key));
+        ready[0] = true;
+        let first = take_stream_head_completed_readback(
+            &mut pending_readbacks,
+            &mut pending_readback_order,
+            stream,
+            |slot| ready[slot],
+        )
+        .unwrap();
+        assert_eq!((first.present_id, first.sequence, first.slot), (100, 1, 0));
+        let second = take_stream_head_completed_readback(
+            &mut pending_readbacks,
+            &mut pending_readback_order,
+            stream,
+            |slot| ready[slot],
+        )
+        .unwrap();
         assert_eq!(
-            pending_readbacks[&mixed_other_key]
-                .iter()
-                .map(|readback| readback.slot)
-                .collect::<Vec<_>>(),
-            vec![2]
+            (second.present_id, second.sequence, second.slot),
+            (101, 2, 1)
         );
-        assert!(!pending_readbacks.contains_key(&completed_other_key));
+        assert!(pending_readbacks.is_empty());
+        assert!(pending_readback_order.is_empty());
 
         assert!(ExactReadbackStamp::Equal(7).accepts(7));
         assert!(!ExactReadbackStamp::Equal(7).accepts(8));
@@ -27830,9 +28239,11 @@ mod tests {
     }
 
     #[test]
-    fn pinned_readback_reaper_never_consumes_another_target() {
-        fn pending(slot: usize, sequence: u64) -> PendingReadback {
+    fn stream_readback_fifo_does_not_consume_another_binder() {
+        fn pending(stream: u32, present_id: u64, slot: usize, sequence: u64) -> PendingReadback {
             PendingReadback {
+                stream,
+                present_id,
                 sequence,
                 slot,
                 width: 1,
@@ -27842,29 +28253,109 @@ mod tests {
             }
         }
 
-        let mut current = VecDeque::from([pending(0, 1), pending(1, 3), pending(2, 4)]);
-        let other = VecDeque::from([pending(3, 9)]);
-        let ready = [true, true, false, true];
+        let first_stream = 17;
+        let second_stream = 23;
+        let shared_key = RtKey::new(1, 1, 1, 0x1000);
+        let mut pending_readbacks = HashMap::from([(
+            shared_key,
+            VecDeque::from([
+                pending(first_stream, 100, 0, 1),
+                pending(second_stream, 200, 1, 2),
+            ]),
+        )]);
+        let mut pending_readback_order = HashMap::from([
+            (
+                first_stream,
+                VecDeque::from([PendingReadbackRef {
+                    key: shared_key,
+                    sequence: 1,
+                }]),
+            ),
+            (
+                second_stream,
+                VecDeque::from([PendingReadbackRef {
+                    key: shared_key,
+                    sequence: 2,
+                }]),
+            ),
+        ]);
+        let ready = [false, true];
 
-        let (latest, superseded_slots) =
-            take_latest_completed_readback_for_key(&mut current, |slot| ready[slot]);
-
-        let latest = latest.unwrap();
-        assert_eq!((latest.slot, latest.sequence), (1, 3));
-        assert_eq!(superseded_slots, vec![0]);
+        assert!(take_stream_head_completed_readback(
+            &mut pending_readbacks,
+            &mut pending_readback_order,
+            first_stream,
+            |slot| ready[slot],
+        )
+        .is_none());
+        let second = take_stream_head_completed_readback(
+            &mut pending_readbacks,
+            &mut pending_readback_order,
+            second_stream,
+            |slot| ready[slot],
+        )
+        .unwrap();
         assert_eq!(
-            current
-                .iter()
-                .map(|readback| readback.slot)
-                .collect::<Vec<_>>(),
-            vec![2]
+            (second.stream, second.present_id, second.sequence),
+            (23, 200, 2)
+        );
+        assert!(pending_readback_order.contains_key(&first_stream));
+        assert!(!pending_readback_order.contains_key(&second_stream));
+        assert_eq!(pending_readbacks[&shared_key].len(), 1);
+    }
+
+    #[test]
+    fn readback_cpu_backlogs_are_fifo_and_stream_local() {
+        let first_stream = 17;
+        let second_stream = 23;
+        let mut backlogs = HashMap::from([
+            (
+                first_stream,
+                VecDeque::from([
+                    PipelinedPresentRawCompletion::Dropped { present_id: 100 },
+                    PipelinedPresentRawCompletion::Dropped { present_id: 101 },
+                ]),
+            ),
+            (
+                second_stream,
+                VecDeque::from([PipelinedPresentRawCompletion::Dropped { present_id: 200 }]),
+            ),
+        ]);
+
+        assert_eq!(completed_readback_backlog_len(&backlogs), 3);
+        assert!(matches!(
+            take_backlogged_readback_completion(&mut backlogs, first_stream),
+            Some(PipelinedPresentRawCompletion::Dropped { present_id: 100 })
+        ));
+        assert!(matches!(
+            take_backlogged_readback_completion(&mut backlogs, second_stream),
+            Some(PipelinedPresentRawCompletion::Dropped { present_id: 200 })
+        ));
+        assert!(matches!(
+            take_backlogged_readback_completion(&mut backlogs, first_stream),
+            Some(PipelinedPresentRawCompletion::Dropped { present_id: 101 })
+        ));
+        assert!(backlogs.is_empty());
+    }
+
+    #[test]
+    fn readback_cpu_backlog_cap_allows_only_the_callers_transient_escape() {
+        let caller_stream = 17;
+        assert_eq!(
+            readback_backlog_disposition(caller_stream, caller_stream, true, true, 3, 4),
+            ReadbackBacklogDisposition::Queue
         );
         assert_eq!(
-            other
-                .iter()
-                .map(|readback| readback.slot)
-                .collect::<Vec<_>>(),
-            vec![3]
+            readback_backlog_disposition(caller_stream, caller_stream, true, true, 4, 4),
+            ReadbackBacklogDisposition::ReturnCallerDirectly
+        );
+        assert_eq!(
+            readback_backlog_disposition(23, caller_stream, true, true, 4, 4),
+            ReadbackBacklogDisposition::Hold
+        );
+        assert_eq!(
+            readback_backlog_disposition(caller_stream, caller_stream, true, false, 4, 4),
+            ReadbackBacklogDisposition::Hold
         );
     }
 
@@ -29142,9 +29633,16 @@ mod tests {
             ..plain
         };
         assert!(texture_key_has_special_view(arrayed));
+        let mut two_d_tic = tic;
+        two_d_tic.texture_type = 1;
+        assert!(!texture_key_blocks_2d_rt_alias(arrayed, &two_d_tic));
+        assert!(texture_key_blocks_2d_rt_alias(cube, &two_d_tic));
         let mut array_tic = tic;
         array_tic.texture_type = 5;
         assert!(tic_requires_dedicated_sampled_view(&array_tic));
+        assert!(!texture_key_blocks_2d_rt_alias(arrayed, &array_tic));
+        array_tic.depth = 2;
+        assert!(texture_key_blocks_2d_rt_alias(arrayed, &array_tic));
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub struct QueuedFrame {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    pub present_at: Option<std::time::Instant>,
 }
 
 pub struct BufferQueue {

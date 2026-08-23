@@ -25,6 +25,25 @@ use app::HorizonApp;
 use app_settings::AppSettings;
 use nexium_common::FileLogger;
 
+fn host_vsync_enabled(preference: bool, environment_override: Option<&str>) -> bool {
+    match environment_override {
+        Some("1" | "true" | "on" | "yes") => true,
+        Some("0" | "false" | "off" | "no") => false,
+        _ => preference,
+    }
+}
+
+fn host_surface_config(vsync: bool) -> eframe::SurfaceConfig {
+    eframe::SurfaceConfig {
+        present_mode: if vsync {
+            eframe::wgpu::PresentMode::Fifo
+        } else {
+            eframe::wgpu::PresentMode::AutoNoVsync
+        },
+        desired_maximum_frame_latency: Some(2),
+    }
+}
+
 fn main() -> Result<(), eframe::Error> {
     std::env::set_var("DISABLE_MANGOHUD", "1");
 
@@ -112,6 +131,18 @@ fn main() -> Result<(), eframe::Error> {
     )
     .expect("logo PNG decode");
 
+    let host_vsync = host_vsync_enabled(
+        settings.vsync,
+        std::env::var("NEXIUM_HOST_VSYNC").ok().as_deref(),
+    );
+    let surface_config = host_surface_config(host_vsync);
+    log::info!(
+        "host surface: vsync={} present_mode={:?} max_frame_latency={:?}",
+        host_vsync,
+        surface_config.present_mode,
+        surface_config.desired_maximum_frame_latency,
+    );
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NeXium")
@@ -120,6 +151,8 @@ fn main() -> Result<(), eframe::Error> {
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([640.0, 480.0]),
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::WgpuConfiguration::default()
+            .with_surface_config(surface_config),
         ..Default::default()
     };
 
@@ -136,6 +169,34 @@ fn main() -> Result<(), eframe::Error> {
             )))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{host_surface_config, host_vsync_enabled};
+
+    #[test]
+    fn host_vsync_override_only_accepts_known_values() {
+        assert!(host_vsync_enabled(false, Some("1")));
+        assert!(!host_vsync_enabled(true, Some("off")));
+        assert!(host_vsync_enabled(true, Some("unexpected")));
+    }
+
+    #[test]
+    fn host_surface_config_matches_vsync_preference() {
+        assert_eq!(
+            host_surface_config(true).present_mode,
+            eframe::wgpu::PresentMode::Fifo
+        );
+        assert_eq!(
+            host_surface_config(false).present_mode,
+            eframe::wgpu::PresentMode::AutoNoVsync
+        );
+        assert_eq!(
+            host_surface_config(true).desired_maximum_frame_latency,
+            Some(2)
+        );
+    }
 }
 
 #[cfg(windows)]
