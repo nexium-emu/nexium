@@ -21,6 +21,30 @@ pub(crate) const MUTEX_HAS_LISTENERS: u32 = 0x4000_0000;
 const TLS_USER_DISABLE_COUNT_OFFSET: u64 = 0x100;
 const TLS_USER_INTERRUPT_FLAG_OFFSET: u64 = 0x102;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PresentMetadata {
+    pub read_rect: Option<[u32; 4]>,
+    pub transform: u32,
+    pub queue_crop: Option<(u32, u32, u32, u32)>,
+    pub present_at: Option<std::time::Instant>,
+}
+
+pub(crate) type PresentMetadataQueue = Arc<Mutex<HashMap<u64, PresentMetadata>>>;
+
+pub(crate) type PresentDeliveryLanes = Arc<Mutex<HashMap<u32, Arc<Mutex<()>>>>>;
+
+pub(crate) fn present_delivery_lane(
+    lanes: &PresentDeliveryLanes,
+    binder_id: u32,
+) -> Arc<Mutex<()>> {
+    let mut lanes = lanes.lock();
+    Arc::clone(
+        lanes
+            .entry(binder_id)
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
 pub struct Kernel {
     pub address_space: Arc<AddressSpace>,
     pub handles: handles::HandleTable,
@@ -120,6 +144,9 @@ pub struct Kernel {
     pub yield_after_svc: bool,
     pub preempt_after_svc: bool,
     pub present_pace_until: Option<std::time::Instant>,
+    pub(crate) next_present_id: u64,
+    pub(crate) present_metadata: PresentMetadataQueue,
+    pub(crate) present_delivery_lanes: PresentDeliveryLanes,
     pub(crate) compatibility_guest_probe_enabled: bool,
     pub(crate) compatibility_allocation_next: u64,
 
@@ -225,11 +252,18 @@ pub struct AudioRendererState {
     pub voice_last_wb_index: Vec<u16>,
     pub voice_wb_progress_frames: Vec<u64>,
     pub voice_frac_q15: Vec<i32>,
+    pub voice_prev_gain: Vec<f32>,
     pub voice_hist: Vec<[f32; 6]>,
     pub voice_adpcm_states: Vec<AudioAdpcmDecodeState>,
 }
 
 impl Kernel {
+    pub(crate) fn allocate_present_id(&mut self) -> u64 {
+        let id = self.next_present_id;
+        self.next_present_id = self.next_present_id.wrapping_add(1).max(1);
+        id
+    }
+
     pub fn new(
         address_space: Arc<AddressSpace>,
         code_base: u64,
@@ -356,6 +390,9 @@ impl Kernel {
             yield_after_svc: false,
             preempt_after_svc: false,
             present_pace_until: None,
+            next_present_id: 1,
+            present_metadata: Arc::new(Mutex::new(HashMap::new())),
+            present_delivery_lanes: Arc::new(Mutex::new(HashMap::new())),
             compatibility_guest_probe_enabled: false,
             compatibility_allocation_next: 0,
             font_shmem: None,
@@ -911,7 +948,7 @@ impl Kernel {
     pub fn tick_audio_renderers(&mut self) {
         const FRAMES_PER_AUDIO_FRAME: u64 = 240;
         const MAX_BACKLOG_BLOCKS: u64 = 400;
-        const TARGET_QUEUE_BLOCKS: u64 = 16;
+        const TARGET_QUEUE_BLOCKS: u64 = 24;
 
         let now = std::time::Instant::now();
         if now.saturating_duration_since(self.audio_out_last_tick)
@@ -930,6 +967,34 @@ impl Kernel {
         let event_already_pending = to_signal
             .iter()
             .any(|ev| self.event_signals.get(ev).copied().unwrap_or(false));
+        if let Some(sink) = crate::audio_sink::host_audio_sink() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::sync::{Mutex, OnceLock};
+            static UNDERRUN_ACCUM: AtomicU64 = AtomicU64::new(0);
+            static DROP_ACCUM: AtomicU64 = AtomicU64::new(0);
+            static LAST_REPORT: OnceLock<Mutex<std::time::Instant>> = OnceLock::new();
+
+            UNDERRUN_ACCUM.fetch_add(sink.drain_underrun_frames(), Ordering::Relaxed);
+            DROP_ACCUM.fetch_add(sink.drain_dropped_frames(), Ordering::Relaxed);
+            if !to_signal.is_empty() {
+                let last = LAST_REPORT.get_or_init(|| Mutex::new(std::time::Instant::now()));
+                let mut last = last.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if last.elapsed() >= std::time::Duration::from_secs(1) {
+                    let underruns = UNDERRUN_ACCUM.swap(0, Ordering::Relaxed);
+                    let dropped = DROP_ACCUM.swap(0, Ordering::Relaxed);
+                    if underruns != 0 || dropped != 0 {
+                        log::warn!(
+                            "audio host ring loss: underrun_frames={} dropped_frames={} queued_frames={} target_frames={}",
+                            underruns,
+                            dropped,
+                            sink.queued_frames(),
+                            TARGET_QUEUE_BLOCKS * FRAMES_PER_AUDIO_FRAME,
+                        );
+                    }
+                    *last = std::time::Instant::now();
+                }
+            }
+        }
         {
             use std::sync::atomic::{AtomicU64, Ordering};
             static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1640,6 +1705,39 @@ mod user_preemption_tests {
             .read(kernel.tls_base + offset, &mut bytes)
             .unwrap();
         u16::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn present_delivery_lanes_are_per_binder_and_exclusive() {
+        let lanes: PresentDeliveryLanes = Arc::new(Mutex::new(HashMap::new()));
+        let first = present_delivery_lane(&lanes, 17);
+        let same_binder = present_delivery_lane(&lanes, 17);
+        let other_binder = present_delivery_lane(&lanes, 23);
+
+        assert!(Arc::ptr_eq(&first, &same_binder));
+        assert!(!Arc::ptr_eq(&first, &other_binder));
+        assert!(other_binder.try_lock().is_some());
+
+        let first_guard = first.lock();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _same_binder_guard = same_binder.lock();
+            acquired_tx.send(()).unwrap();
+        });
+        attempted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(acquired_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err());
+
+        drop(first_guard);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        waiter.join().unwrap();
     }
 
     #[test]

@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const RENDER_SR: u32 = 48_000;
-const RB_CAP_SAMPLES: usize = 48_000;
-const PREBUF_TARGET_SAMPLES: usize = 2_400;
+const RB_CAP_SAMPLES: usize = 96_000;
+const PREBUF_TARGET_SAMPLES: usize = 5_760;
 
 struct PrebufState {
     priming: bool,
@@ -18,11 +18,10 @@ struct PrebufState {
     prev_l: f32,
     prev_r: f32,
     pos: f32,
-    ratio: f32,
-    last_callback: Option<std::time::Instant>,
+    saw_emulated_audio: bool,
 }
 impl PrebufState {
-    fn new(nominal_ratio: f32) -> Self {
+    fn new(_nominal_ratio: f32) -> Self {
         Self {
             priming: true,
             cur_l: 0.0,
@@ -30,33 +29,12 @@ impl PrebufState {
             prev_l: 0.0,
             prev_r: 0.0,
             pos: 1.0,
-            ratio: nominal_ratio.clamp(0.05, 4.0),
-            last_callback: None,
+            saw_emulated_audio: false,
         }
     }
 
-    fn callback_ratio(&mut self, frames_written: usize, nominal_ratio: f32) -> f32 {
-        let nominal = nominal_ratio.clamp(0.05, 4.0);
-        if (nominal - 1.0).abs() < 1e-6 {
-            self.last_callback = Some(std::time::Instant::now());
-            self.ratio = 1.0;
-            return 1.0;
-        }
-        let now = std::time::Instant::now();
-        let measured = self
-            .last_callback
-            .replace(now)
-            .and_then(|prev| {
-                let elapsed = now.saturating_duration_since(prev).as_secs_f32();
-                if elapsed > 0.001 && frames_written > 0 {
-                    Some((elapsed * RENDER_SR as f32 / frames_written as f32).clamp(0.05, 4.0))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(nominal);
-        self.ratio = self.ratio * 0.75 + measured * 0.25;
-        self.ratio
+    fn callback_ratio(&self, _frames_written: usize, nominal_ratio: f32) -> f32 {
+        nominal_ratio.clamp(0.05, 4.0)
     }
 }
 
@@ -246,6 +224,8 @@ pub struct HostAudioSink {
     consumed: Arc<AtomicU64>,
     volume: Arc<AtomicU32>,
     audio_out: Arc<Mutex<AudioOutMixer>>,
+    underrun_frames: Arc<AtomicU64>,
+    dropped_frames: AtomicU64,
 }
 
 impl HostPcmSink for HostAudioSink {
@@ -254,7 +234,12 @@ impl HostPcmSink for HostAudioSink {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let pushed = prod.push_slice(samples);
+        let requested = samples.len() & !1;
+        let pushed = prod.push_slice(&samples[..requested]);
+        if pushed < requested {
+            self.dropped_frames
+                .fetch_add(((requested - pushed) / 2) as u64, Ordering::Relaxed);
+        }
         pushed / 2
     }
 
@@ -323,6 +308,14 @@ impl HostPcmSink for HostAudioSink {
 
     fn repost_pending_events(&self, n: u64) {
         repost_pending_events(n);
+    }
+
+    fn drain_underrun_frames(&self) -> u64 {
+        self.underrun_frames.swap(0, Ordering::Relaxed)
+    }
+
+    fn drain_dropped_frames(&self) -> u64 {
+        self.dropped_frames.swap(0, Ordering::Relaxed)
     }
 }
 
@@ -407,6 +400,8 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
     let volume = Arc::new(AtomicU32::new(initial_volume.clamp(0.0, 2.0).to_bits()));
     let volume_cb = volume.clone();
     let audio_out = Arc::new(Mutex::new(AudioOutMixer::default()));
+    let underrun_frames = Arc::new(AtomicU64::new(0));
+    let underrun_cb = underrun_frames.clone();
 
     let resample_ratio = RENDER_SR as f32 / device_sr as f32;
     let _need_resample = (RENDER_SR != device_sr) || (device_ch != 2);
@@ -431,6 +426,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
                         &consumed_cb,
                         &vol,
                         &audio_out_cb,
+                        &underrun_cb,
                         &mut prebuf,
                     );
                 },
@@ -442,6 +438,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
             let consumed_cb = consumed_cb.clone();
             let vol = volume_cb.clone();
             let audio_out_cb = audio_out.clone();
+            let underrun_cb = underrun_cb.clone();
             let mut prebuf = PrebufState::new(resample_ratio);
             device.build_output_stream(
                 config.clone(),
@@ -454,6 +451,7 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
                         &consumed_cb,
                         &vol,
                         &audio_out_cb,
+                        &underrun_cb,
                         &mut prebuf,
                     );
                 },
@@ -515,6 +513,8 @@ fn init_host_audio_on_thread(preferred_device: Option<&str>, initial_volume: f32
         consumed,
         volume,
         audio_out,
+        underrun_frames,
+        dropped_frames: AtomicU64::new(0),
     });
     let _ = SINK_HANDLE.set(sink.clone());
     let sink_dyn: Arc<dyn HostPcmSink> = sink;
@@ -535,6 +535,7 @@ fn drain_stereo_to(
     consumed: &AtomicU64,
     volume: &AtomicU32,
     audio_out: &Mutex<AudioOutMixer>,
+    underrun_frames: &AtomicU64,
     prebuf: &mut PrebufState,
 ) {
     let vol = f32::from_bits(volume.load(Ordering::Relaxed));
@@ -553,7 +554,12 @@ fn drain_stereo_to(
             while prebuf.pos >= 1.0 {
                 prebuf.prev_l = prebuf.cur_l;
                 prebuf.prev_r = prebuf.cur_r;
-                (prebuf.cur_l, prebuf.cur_r) = pop_mixed_stereo_frame(consumer, &mut audio_out);
+                (prebuf.cur_l, prebuf.cur_r) = pop_mixed_stereo_frame(
+                    consumer,
+                    &mut audio_out,
+                    underrun_frames,
+                    &mut prebuf.saw_emulated_audio,
+                );
                 prebuf.pos -= 1.0;
             }
         }
@@ -594,6 +600,7 @@ fn drain_stereo_to_i16(
     consumed: &AtomicU64,
     volume: &AtomicU32,
     audio_out: &Mutex<AudioOutMixer>,
+    underrun_frames: &AtomicU64,
     prebuf: &mut PrebufState,
 ) {
     let vol = f32::from_bits(volume.load(Ordering::Relaxed));
@@ -612,7 +619,12 @@ fn drain_stereo_to_i16(
             while prebuf.pos >= 1.0 {
                 prebuf.prev_l = prebuf.cur_l;
                 prebuf.prev_r = prebuf.cur_r;
-                (prebuf.cur_l, prebuf.cur_r) = pop_mixed_stereo_frame(consumer, &mut audio_out);
+                (prebuf.cur_l, prebuf.cur_r) = pop_mixed_stereo_frame(
+                    consumer,
+                    &mut audio_out,
+                    underrun_frames,
+                    &mut prebuf.saw_emulated_audio,
+                );
                 prebuf.pos -= 1.0;
             }
         }
@@ -649,13 +661,19 @@ fn drain_stereo_to_i16(
 fn pop_mixed_stereo_frame(
     consumer: &mut <HeapRb<f32> as Split>::Cons,
     audio_out: &mut AudioOutMixer,
+    underrun_frames: &AtomicU64,
+    saw_emulated_audio: &mut bool,
 ) -> (f32, f32) {
     let (mut left, mut right) = if consumer.occupied_len() >= 2 {
+        *saw_emulated_audio = true;
         (
             consumer.try_pop().unwrap_or(0.0),
             consumer.try_pop().unwrap_or(0.0),
         )
     } else {
+        if *saw_emulated_audio {
+            underrun_frames.fetch_add(1, Ordering::Relaxed);
+        }
         (0.0, 0.0)
     };
     let (audio_out_left, audio_out_right) = audio_out.mix_next_frame();
@@ -685,7 +703,10 @@ fn post_audio_events(new_consumed: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_stereo_output, AudioOutMixer};
+    use super::{clamp_stereo_output, pop_mixed_stereo_frame, AudioOutMixer, PrebufState};
+    use ringbuf::traits::{Producer, Split};
+    use ringbuf::HeapRb;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn audio_out_streams_mix_samplewise_with_independent_clocks() {
@@ -735,5 +756,56 @@ mod tests {
     fn mixed_f32_output_saturates_after_summing() {
         assert_eq!(clamp_stereo_output(1.75, -2.0), (1.0, -1.0));
         assert_eq!(clamp_stereo_output(0.25, -0.5), (0.25, -0.5));
+    }
+
+    #[test]
+    fn emulated_ring_underrun_counts_only_after_pcm_started() {
+        let ring = HeapRb::<f32>::new(8);
+        let (mut producer, mut consumer) = ring.split();
+        let mut mixer = AudioOutMixer::default();
+        let underruns = AtomicU64::new(0);
+        let mut saw_emulated_audio = false;
+
+        assert_eq!(
+            pop_mixed_stereo_frame(
+                &mut consumer,
+                &mut mixer,
+                &underruns,
+                &mut saw_emulated_audio,
+            ),
+            (0.0, 0.0)
+        );
+        assert_eq!(underruns.load(Ordering::Relaxed), 0);
+
+        assert_eq!(producer.push_slice(&[0.25, -0.5]), 2);
+        assert_eq!(
+            pop_mixed_stereo_frame(
+                &mut consumer,
+                &mut mixer,
+                &underruns,
+                &mut saw_emulated_audio,
+            ),
+            (0.25, -0.5)
+        );
+        assert!(saw_emulated_audio);
+
+        assert_eq!(
+            pop_mixed_stereo_frame(
+                &mut consumer,
+                &mut mixer,
+                &underruns,
+                &mut saw_emulated_audio,
+            ),
+            (0.0, 0.0)
+        );
+        assert_eq!(underruns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn resample_ratio_is_locked_to_the_stream_rates() {
+        let prebuf = PrebufState::new(0.5);
+        assert_eq!(prebuf.callback_ratio(240, 0.5), 0.5);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(prebuf.callback_ratio(240, 0.5), 0.5);
     }
 }

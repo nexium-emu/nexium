@@ -3,7 +3,8 @@ use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
 use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
 use crate::kernel::{
-    AudioAdpcmContext, AudioAdpcmDecodeState, AudioAdpcmStreamKey, AudioRendererState,
+    present_delivery_lane, AudioAdpcmContext, AudioAdpcmDecodeState, AudioAdpcmStreamKey,
+    AudioRendererState, PresentDeliveryLanes, PresentMetadata, PresentMetadataQueue,
 };
 use nexium_common::result::{
     KERNEL_CANCELLED, KERNEL_INVALID_ADDRESS, KERNEL_INVALID_ENUM_VALUE, KERNEL_INVALID_HANDLE,
@@ -41,6 +42,14 @@ fn async_present_pipeline_enabled() -> bool {
             Some("0") | Some("false") | Some("off") | Some("no")
         )
     })
+}
+
+fn try_select_ordered_present_source<R>(
+    maxwell_dma: &parking_lot::Mutex<nexium_nvdrv::gpu::engines::MaxwellDma>,
+    select: impl FnOnce(&nexium_nvdrv::gpu::engines::MaxwellDma) -> Option<R>,
+) -> Option<R> {
+    let maxwell_dma = maxwell_dma.try_lock()?;
+    select(&maxwell_dma)
 }
 
 struct AcquiredBufferSlotGuard {
@@ -132,9 +141,17 @@ fn release_rejected_present_slot_after_fences(
 
 #[cfg(test)]
 mod bufferqueue_present_tests {
-    use super::release_rejected_present_slot_after_fences;
+    use super::{
+        release_rejected_present_slot_after_fences, submit_ordered_gpu_present,
+        try_select_ordered_present_source, PresentDeliveryLanes, PresentMetadata,
+        PresentMetadataQueue,
+    };
     use nexium_nvdrv::bufferqueue::SlotState;
-    use nexium_nvdrv::{BufferQueue, GraphicBuffer};
+    use nexium_nvdrv::gpu::engines::MaxwellDma;
+    use nexium_nvdrv::{
+        BufferQueue, GraphicBuffer, Nvdrv, PipelinedPresentCompletion, PipelinedPresentFrame,
+        PipelinedPresentReadback, PipelinedPresentSubmission,
+    };
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -180,6 +197,75 @@ mod bufferqueue_present_tests {
         let queue = queues.get_mut(&7).unwrap();
         assert_eq!(queue.slot_state(0), Some(SlotState::Acquired));
         assert_eq!(queue.try_dequeue(), None);
+    }
+
+    #[test]
+    fn ordered_present_source_contention_returns_for_fallback() {
+        let maxwell_dma = Arc::new(Mutex::new(MaxwellDma::new()));
+        let held = maxwell_dma.lock();
+        let worker_dma = Arc::clone(&maxwell_dma);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let selected = try_select_ordered_present_source(&worker_dma, |_| Some("exact"));
+            tx.send(selected.or(Some("fallback"))).unwrap();
+        });
+
+        let selected = rx.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(selected.unwrap(), Some("fallback"));
+    }
+
+    #[test]
+    fn completed_readback_uses_its_original_swap_deadline() {
+        let nvdrv = Nvdrv::new();
+        let now = std::time::Instant::now();
+        let original_deadline = now + Duration::from_millis(33);
+        let metadata: PresentMetadataQueue = Arc::new(Mutex::new(HashMap::from([(
+            41,
+            PresentMetadata {
+                read_rect: None,
+                transform: 0,
+                queue_crop: None,
+                present_at: Some(original_deadline),
+            },
+        )])));
+        let lanes: PresentDeliveryLanes = Arc::new(Mutex::new(HashMap::new()));
+
+        let emitted = submit_ordered_gpu_present(
+            |_| PipelinedPresentReadback {
+                completion: Some(PipelinedPresentCompletion::Ready(PipelinedPresentFrame {
+                    present_id: 41,
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 255],
+                    flip_y: Some(false),
+                })),
+                submission: PipelinedPresentSubmission::SourceUnavailable,
+            },
+            Arc::clone(&metadata),
+            lanes,
+            7,
+            42,
+            Arc::clone(&nvdrv.frame_queue),
+            Arc::clone(&nvdrv.stats),
+            1,
+            1,
+            0,
+            None,
+            Some(now),
+        );
+
+        assert!(emitted);
+        assert!(nvdrv.drain_next_frame_due(now).is_none());
+        assert_eq!(
+            nvdrv
+                .drain_next_frame_due(original_deadline)
+                .unwrap()
+                .pixels,
+            vec![1, 2, 3, 255]
+        );
+        assert!(metadata.lock().is_empty());
     }
 }
 
@@ -305,6 +391,18 @@ struct AudioVoiceMixSnapshot {
     source_frames: u32,
     wb_count: u32,
     buffers: [AudioWaveBufferSpan; 4],
+}
+
+const AUDIO_RENDER_BLOCK_FRAMES: usize = 240;
+const AUDIO_RING_HIGH_WATER_FRAMES: usize = 5_760;
+const AUDIO_MAX_BLOCKS_PER_UPDATE: usize = 8;
+
+fn audio_blocks_to_produce(queued_frames: usize) -> usize {
+    if queued_frames >= AUDIO_RING_HIGH_WATER_FRAMES {
+        return 0;
+    }
+    ((AUDIO_RING_HIGH_WATER_FRAMES - queued_frames) / AUDIO_RENDER_BLOCK_FRAMES)
+        .clamp(1, AUDIO_MAX_BLOCKS_PER_UPDATE)
 }
 
 fn advance_audio_wave_buffers(
@@ -603,6 +701,47 @@ mod audio_pcm_tests {
         let slots = audio_renderer_output_slots(10, &[performance], &[output]);
         assert_eq!(slots.0.map(|buffer| buffer.addr), Some(output.addr));
         assert_eq!(slots.1.map(|buffer| buffer.addr), Some(performance.addr));
+    }
+
+    #[test]
+    fn a_full_ring_stops_producing_and_a_shallow_one_keeps_the_old_single_block() {
+        assert_eq!(
+            super::audio_blocks_to_produce(super::AUDIO_RING_HIGH_WATER_FRAMES),
+            0
+        );
+        assert_eq!(
+            super::audio_blocks_to_produce(super::AUDIO_RING_HIGH_WATER_FRAMES + 4_800),
+            0
+        );
+        assert_eq!(
+            super::audio_blocks_to_produce(super::AUDIO_RING_HIGH_WATER_FRAMES - 1),
+            1
+        );
+        assert_eq!(
+            super::audio_blocks_to_produce(
+                super::AUDIO_RING_HIGH_WATER_FRAMES - super::AUDIO_RENDER_BLOCK_FRAMES
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_drained_ring_refills_in_a_bounded_burst() {
+        assert_eq!(
+            super::audio_blocks_to_produce(0),
+            super::AUDIO_MAX_BLOCKS_PER_UPDATE
+        );
+        assert_eq!(super::audio_blocks_to_produce(4_800), 4);
+
+        let mut queued = 0usize;
+        let mut updates = 0u32;
+        while queued < super::AUDIO_RING_HIGH_WATER_FRAMES {
+            queued += super::audio_blocks_to_produce(queued) * super::AUDIO_RENDER_BLOCK_FRAMES;
+            updates += 1;
+            assert!(updates < 24);
+        }
+        assert_eq!(queued, super::AUDIO_RING_HIGH_WATER_FRAMES);
+        assert!(updates <= 6);
     }
 
     #[test]
@@ -4916,6 +5055,7 @@ fn dispatch_service_v2(
             voice_last_wb_index: Vec::new(),
             voice_wb_progress_frames: Vec::new(),
             voice_frac_q15: Vec::new(),
+            voice_prev_gain: Vec::new(),
             voice_hist: Vec::new(),
             voice_adpcm_states: Vec::new(),
         };
@@ -5032,6 +5172,7 @@ fn dispatch_service_v2(
                 voice_last_wb_index: Vec::new(),
                 voice_wb_progress_frames: Vec::new(),
                 voice_frac_q15: Vec::new(),
+                voice_prev_gain: Vec::new(),
                 voice_hist: Vec::new(),
                 voice_adpcm_states: Vec::new(),
             });
@@ -5160,25 +5301,20 @@ fn dispatch_service_v2(
                     st.voice_last_wb_index.resize(voice_count_seen, 0);
                     st.voice_wb_progress_frames.resize(voice_count_seen, 0);
                     st.voice_frac_q15.resize(voice_count_seen, 0);
+                    st.voice_prev_gain.resize(voice_count_seen, 0.0);
                     st.voice_hist.resize(voice_count_seen, [0.0f32; 6]);
                     st.voice_adpcm_states
                         .resize(voice_count_seen, AudioAdpcmDecodeState::default());
                 }
 
-                const TARGET_FRAMES: usize = 240;
+                const TARGET_FRAMES: usize = AUDIO_RENDER_BLOCK_FRAMES;
                 const TARGET_SR: f32 = 48_000.0;
-
-                const RING_HIGH_WATER_FRAMES: usize = 3_840;
 
                 let queued_now = crate::audio_sink::host_audio_sink()
                     .map(|s| s.queued_frames())
                     .unwrap_or(0);
 
-                let blocks_to_produce: usize = if queued_now >= RING_HIGH_WATER_FRAMES {
-                    0
-                } else {
-                    1
-                };
+                let blocks_to_produce: usize = audio_blocks_to_produce(queued_now);
                 let mut is_new_latched: Vec<bool> = vec![false; voice_count_seen];
                 let mut big_out: Vec<f32> =
                     Vec::with_capacity(TARGET_FRAMES * 2 * blocks_to_produce);
@@ -5356,6 +5492,12 @@ fn dispatch_service_v2(
                                 }
                             }
 
+                            if is_new {
+                                if let Some(g) = st.voice_prev_gain.get_mut(vid) {
+                                    *g = 0.0;
+                                }
+                            }
+
                             if !is_in_use
                                 || play_state != 0
                                 || (sample_format != AUDIO_PCM_INT16
@@ -5366,6 +5508,9 @@ fn dispatch_service_v2(
                                 || wb_count == 0
                                 || wb_index >= 4
                             {
+                                if let Some(g) = st.voice_prev_gain.get_mut(vid) {
+                                    *g = 0.0;
+                                }
                                 continue;
                             }
 
@@ -5719,6 +5864,9 @@ fn dispatch_service_v2(
                                     pcm_r[(i as usize).min(in_frames - 1)]
                                 }
                             };
+                            let prev_gain = st.voice_prev_gain.get(vid).copied().unwrap_or(0.0);
+                            let gain_ramp = (gain - prev_gain) / TARGET_FRAMES as f32;
+                            let mut ramped_gain = prev_gain;
                             let mut read_idx: usize = 0;
                             for i in 0..TARGET_FRAMES {
                                 let bi = read_idx as isize;
@@ -5727,11 +5875,15 @@ fn dispatch_service_v2(
                                 let right = smp_r(bi);
                                 let ol = left + (smp_l(bi + 1) - left) * fraction;
                                 let orr = right + (smp_r(bi + 1) - right) * fraction;
-                                out_stereo[i * 2] += ol * gain;
-                                out_stereo[i * 2 + 1] += orr * gain;
+                                out_stereo[i * 2] += ol * ramped_gain;
+                                out_stereo[i * 2 + 1] += orr * ramped_gain;
+                                ramped_gain += gain_ramp;
                                 let no = frac_q15 + step;
                                 read_idx += (no >> 15) as usize;
                                 frac_q15 = no & 0x7fff;
+                            }
+                            if let Some(g) = st.voice_prev_gain.get_mut(vid) {
+                                *g = gain;
                             }
                             debug_assert_eq!(read_idx, checkpoint_source_frames);
                             let consumed =
@@ -7029,7 +7181,6 @@ fn igbp_handle_transact(
                 p.write_u32((-22i32) as u32);
                 return p.finish();
             }
-            kernel.present_pace_until = pace_until;
             if crate::services::am::mode_trace_enabled() {
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static QUEUE_TRACES: AtomicU64 = AtomicU64::new(0);
@@ -7178,39 +7329,45 @@ fn igbp_handle_transact(
                             std::sync::Arc::clone(&kernel.nvdrv.gpu.maxwell_dma);
                         let address_space_for_ordered = kernel.address_space.clone();
                         let (present_stride, present_bh_log2) = (gb.stride, gb.block_height_log2);
+                        let present_id = kernel.allocate_present_id();
+                        let present_metadata = std::sync::Arc::clone(&kernel.present_metadata);
+                        let present_delivery_lanes =
+                            std::sync::Arc::clone(&kernel.present_delivery_lanes);
                         let queued = kernel.nvdrv.try_queue_ordered_present(move || {
                             let _slot_guard = AcquiredBufferSlotGuard::new(
                                 present_bufferqueues,
                                 binder_id,
                                 slot,
                             );
-                            let exact_present_source = {
-                                let maxwell_dma = maxwell_dma_for_ordered.lock();
-                                direct_gpu_vas
-                                    .iter()
-                                    .filter_map(|&present_va| {
-                                        maxwell_dma
-                                            .exact_present_source_token(
-                                                present_va,
-                                                present_width,
-                                                present_height,
+                            let exact_present_source = try_select_ordered_present_source(
+                                &maxwell_dma_for_ordered,
+                                |maxwell_dma| {
+                                    direct_gpu_vas
+                                        .iter()
+                                        .filter_map(|&present_va| {
+                                            maxwell_dma
+                                                .exact_present_source_token(
+                                                    present_va,
+                                                    present_width,
+                                                    present_height,
+                                                )
+                                                .map(|token| (present_va, token))
+                                        })
+                                        .filter(|(_, token)| token.destination_is_current())
+                                        .filter(|(_, token)| {
+                                            renderer.render_target_stamp(token.source).is_some_and(
+                                                |current| {
+                                                    if token.source_may_advance {
+                                                        current >= token.source_stamp
+                                                    } else {
+                                                        current == token.source_stamp
+                                                    }
+                                                },
                                             )
-                                            .map(|token| (present_va, token))
-                                    })
-                                    .filter(|(_, token)| token.destination_is_current())
-                                    .filter(|(_, token)| {
-                                        renderer.render_target_stamp(token.source).is_some_and(
-                                            |current| {
-                                                if token.source_may_advance {
-                                                    current >= token.source_stamp
-                                                } else {
-                                                    current == token.source_stamp
-                                                }
-                                            },
-                                        )
-                                    })
-                                    .max_by_key(|(_, token)| token.source_stamp)
-                            };
+                                        })
+                                        .max_by_key(|(_, token)| token.source_stamp)
+                                },
+                            );
                             let direct_present = renderer.newest_exact_present_target_at_vas(
                                 present_nvmap_id,
                                 present_width,
@@ -7232,7 +7389,7 @@ fn igbp_handle_transact(
                                         direct_gpu_vas.len()
                                     );
                                 }
-                                submit_ordered_gpu_present(
+                                submit_ordered_cpu_present(
                                     move |_read_rect| {
                                         let mut raw =
                                             vec![0u8; usize::try_from(present_surface_size).ok()?];
@@ -7267,6 +7424,7 @@ fn igbp_handle_transact(
                                     present_height,
                                     transform,
                                     queue_crop,
+                                    pace_until,
                                 );
                                 return;
                             }
@@ -7294,12 +7452,16 @@ fn igbp_handle_transact(
                                     if let Some((_, token)) = exact_present_source {
                                         if token.source_may_advance {
                                             renderer.readback_live_provenance_pipelined(
+                                                binder_id,
+                                                present_id,
                                                 token.source,
                                                 token.source_stamp,
                                                 read_rect,
                                             )
                                         } else {
                                             renderer.readback_exact_provenance_pipelined(
+                                                binder_id,
+                                                present_id,
                                                 token.source,
                                                 token.source_stamp,
                                                 read_rect,
@@ -7307,6 +7469,8 @@ fn igbp_handle_transact(
                                         }
                                     } else if let Some((present_key, _)) = direct_present {
                                         renderer.readback_target_pipelined_pinned_at_va(
+                                            binder_id,
+                                            present_id,
                                             present_nvmap_id,
                                             present_width,
                                             present_height,
@@ -7315,15 +7479,20 @@ fn igbp_handle_transact(
                                             read_rect,
                                         )
                                     } else {
-                                        None
+                                        unreachable!("ordered GPU present entered without a source")
                                     }
                                 },
+                                present_metadata,
+                                present_delivery_lanes,
+                                binder_id,
+                                present_id,
                                 frame_queue,
                                 stats,
                                 present_width,
                                 present_height,
                                 transform,
                                 queue_crop,
+                                pace_until,
                             );
                         });
                         match queued {
@@ -7675,40 +7844,38 @@ fn igbp_handle_transact(
                         }
                     };
                     let slot_guard = AcquiredBufferSlotGuard::new(bufferqueues, binder_id, slot);
-                    let submitted = rt_worker.try_submit(Box::new(move || {
+                    let present_id = kernel.allocate_present_id();
+                    let present_metadata = std::sync::Arc::clone(&kernel.present_metadata);
+                    let present_delivery_lanes =
+                        std::sync::Arc::clone(&kernel.present_delivery_lanes);
+                    rt_worker.submit_named("fallback-present-readback", Box::new(move || {
                         let _slot_guard = slot_guard;
                         let t0 = std::time::Instant::now();
-                        let crop = cached_present_crop(pw, ph);
-                        let read_rect = crop.map(|(x0, y0, w, h)| {
-                            if should_flip_vulkan_present(pw, ph) {
-                                [x0, ph.saturating_sub(y0).saturating_sub(h), w, h]
-                            } else {
-                                [x0, y0, w, h]
-                            }
-                        });
-                        let exact_present_source = {
-                            let maxwell_dma = maxwell_dma_for_present.lock();
-                            mapped_present_vas
-                                .iter()
-                                .filter_map(|&present_va| {
-                                    maxwell_dma
-                                        .exact_present_source_token(present_va, pw, ph)
-                                        .map(|token| (present_va, token))
-                                })
-                                .filter(|(_, token)| token.destination_is_current())
-                                .filter(|(_, token)| {
-                                    r_async.render_target_stamp(token.source).is_some_and(
-                                        |current| {
-                                            if token.source_may_advance {
-                                                current >= token.source_stamp
-                                            } else {
-                                                current == token.source_stamp
-                                            }
-                                        },
-                                    )
-                                })
-                                .max_by_key(|(_, token)| token.source_stamp)
-                        };
+                        let exact_present_source = try_select_ordered_present_source(
+                            &maxwell_dma_for_present,
+                            |maxwell_dma| {
+                                mapped_present_vas
+                                    .iter()
+                                    .filter_map(|&present_va| {
+                                        maxwell_dma
+                                            .exact_present_source_token(present_va, pw, ph)
+                                            .map(|token| (present_va, token))
+                                    })
+                                    .filter(|(_, token)| token.destination_is_current())
+                                    .filter(|(_, token)| {
+                                        r_async.render_target_stamp(token.source).is_some_and(
+                                            |current| {
+                                                if token.source_may_advance {
+                                                    current >= token.source_stamp
+                                                } else {
+                                                    current == token.source_stamp
+                                                }
+                                            },
+                                        )
+                                    })
+                                    .max_by_key(|(_, token)| token.source_stamp)
+                            },
+                        );
                         let direct_present = r_async.newest_exact_present_target_at_vas(
                             pnv,
                             pw,
@@ -7748,90 +7915,62 @@ fn igbp_handle_transact(
                                 );
                             }
                         }
-                        let readback = if let Some((_, token)) = exact_present_source {
-                            if token.source_may_advance {
-                                r_async.readback_live_provenance_pipelined(
-                                    token.source,
-                                    token.source_stamp,
-                                    read_rect,
-                                )
-                            } else {
-                                r_async.readback_exact_provenance_pipelined(
-                                    token.source,
-                                    token.source_stamp,
-                                    read_rect,
-                                )
-                            }
-                        } else if let Some((present_key, _)) = direct_present {
-                            r_async.readback_target_pipelined_pinned_at_va(
-                                pnv,
-                                pw,
-                                ph,
-                                present_key.gpu_va,
-                                present_cpu_addr,
-                                read_rect,
-                            )
-                        } else {
-                            None
-                        };
-                        if let Some((read_w, read_h, bytes, flip_y)) = readback {
-                            let (present_w, present_h, bytes) = if legacy_present_enabled() {
-                                let (w, h, mut b) = prepare_vulkan_present_frame(
-                                    bytes, read_w, read_h, transform, flip_y,
-                                );
-                                make_present_opaque(&mut b);
-                                (w, h, b)
-                            } else {
-                                let (w, h, mut b) = if read_rect
-                                    .map_or(false, |r| r[2] == read_w && r[3] == read_h)
-                                {
-                                    (read_w, read_h, bytes)
+                        let emitted = submit_ordered_gpu_present(
+                            move |read_rect| {
+                                if let Some((_, token)) = exact_present_source {
+                                    if token.source_may_advance {
+                                        r_async.readback_live_provenance_pipelined(
+                                            binder_id,
+                                            present_id,
+                                            token.source,
+                                            token.source_stamp,
+                                            read_rect,
+                                        )
+                                    } else {
+                                        r_async.readback_exact_provenance_pipelined(
+                                            binder_id,
+                                            present_id,
+                                            token.source,
+                                            token.source_stamp,
+                                            read_rect,
+                                        )
+                                    }
+                                } else if let Some((present_key, _)) = direct_present {
+                                    r_async.readback_target_pipelined_pinned_at_va(
+                                        binder_id,
+                                        present_id,
+                                        pnv,
+                                        pw,
+                                        ph,
+                                        present_key.gpu_va,
+                                        present_cpu_addr,
+                                        read_rect,
+                                    )
                                 } else {
-                                    maybe_crop_present_subwindow(bytes, read_w, read_h)
-                                };
-                                if flip_y.unwrap_or_else(|| should_flip_vulkan_present(w, h)) {
-                                    flip_present_v(&mut b, w, h);
+                                    nexium_nvdrv::PipelinedPresentReadback {
+                                        completion: None,
+                                        submission: nexium_nvdrv::PipelinedPresentSubmission::SourceUnavailable,
+                                    }
                                 }
-                                apply_present_transform(&mut b, w, h, transform);
-                                make_present_opaque(&mut b);
-                                (w, h, b)
-                            };
-                            let (present_w, present_h, bytes) = match queue_crop {
-                                Some((cx, cy, cw, ch))
-                                    if cx + cw <= present_w
-                                        && cy + ch <= present_h
-                                        && (cw < present_w || ch < present_h) =>
-                                {
-                                    let cropped = crop_and_upscale(
-                                        &bytes, present_w, cx, cy, cw, ch, cw, ch,
-                                    );
-                                    (cw, ch, cropped)
-                                }
-                                _ => (present_w, present_h, bytes),
-                            };
-                            dump_present_frame(&bytes, present_w, present_h);
-                            if std::env::var_os("NEXIUM_FRAME_PRESENT_CACHE").is_some() {
-                                nexium_common::frame_present::set_last_presented(
-                                    present_w,
-                                    present_h,
-                                    bytes.clone(),
-                                );
-                            }
-                            let mut frame_queue = fq.lock();
-                            frame_queue.clear();
-                            frame_queue.push(nexium_nvdrv::QueuedFrame {
-                                width: present_w,
-                                height: present_h,
-                                pixels: bytes,
-                            });
-                            stats
-                                .frames_submitted
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if present_profile {
+                            },
+                            present_metadata,
+                            present_delivery_lanes,
+                            binder_id,
+                            present_id,
+                            fq,
+                            stats,
+                            pw,
+                            ph,
+                            transform,
+                            queue_crop,
+                            pace_until,
+                        );
+                        if present_profile {
+                            if emitted {
                                 PRESENT_READY.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                PRESENT_EMPTY.fetch_add(1, Ordering::Relaxed);
                             }
-                        } else if present_profile {
-                            PRESENT_EMPTY.fetch_add(1, Ordering::Relaxed);
                         }
                         if present_profile {
                             let elapsed = t0.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -7849,6 +7988,7 @@ fn igbp_handle_transact(
                             }
                         }
                     }));
+                    let submitted = true;
                     if present_profile {
                         if submitted {
                             PRESENT_ENQUEUED.fetch_add(1, Ordering::Relaxed);
@@ -8217,11 +8357,14 @@ fn igbp_handle_transact(
                             }
                         };
                         dump_present_frame(&frame_pixels, frame_w, frame_h);
-                        kernel.nvdrv.submit_frame(nexium_nvdrv::QueuedFrame {
-                            width: frame_w,
-                            height: frame_h,
-                            pixels: frame_pixels,
-                        });
+                        let _ = kernel
+                            .nvdrv
+                            .submit_frame_nonblocking(nexium_nvdrv::QueuedFrame {
+                                width: frame_w,
+                                height: frame_h,
+                                pixels: frame_pixels,
+                                present_at: pace_until,
+                            });
                     } else {
                         log::warn!(
                             "QueueBuffer: failed to read slot {} addr={:#x} read_size={:#x}",
@@ -8289,28 +8432,13 @@ fn igbp_handle_transact(
                 p.write_u32((-22i32) as u32);
                 return p.finish();
             }
-            let mut cancel_fences_ready = true;
-            for (syncpt_id, threshold) in cancel_fences {
-                let started = std::time::Instant::now();
-                while !kernel.nvdrv.is_syncpoint_reached(syncpt_id, threshold) {
-                    if started.elapsed() >= std::time::Duration::from_secs(3) {
-                        cancel_fences_ready = false;
-                        log::error!(
-                            "IGBP::CancelBuffer fence timeout binder={} slot={} syncpt={} threshold={}",
-                            binder_id,
-                            slot,
-                            syncpt_id,
-                            threshold
-                        );
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_micros(100));
-                }
-            }
-            if !cancel_fences_ready {
-                let mut p = ParcelBuilder::new();
-                p.write_u32((-110i32) as u32);
-                return p.finish();
+            if std::env::var_os("NEXIUM_PRESENT_KEYS").is_some() && !cancel_fences.is_empty() {
+                log::info!(
+                    "IGBP::CancelBuffer binder={} slot={} fences={:?}",
+                    binder_id,
+                    slot,
+                    cancel_fences
+                );
             }
             kernel
                 .nvdrv
@@ -8625,35 +8753,35 @@ fn legacy_present_enabled() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_LEGACY_PRESENT").is_some())
 }
 
-fn submit_ordered_gpu_present<F>(
-    readback_fn: F,
-    frame_queue: std::sync::Arc<parking_lot::Mutex<Vec<nexium_nvdrv::QueuedFrame>>>,
-    stats: std::sync::Arc<nexium_nvdrv::PipelineStats>,
-    width: u32,
-    height: u32,
-    transform: u32,
-    queue_crop: Option<(u32, u32, u32, u32)>,
-) where
-    F: FnOnce(Option<[u32; 4]>) -> Option<(u32, u32, Vec<u8>, Option<bool>)>,
-{
-    let crop = cached_present_crop(width, height);
-    let read_rect = crop.map(|(x0, y0, w, h)| {
+fn present_read_rect(width: u32, height: u32) -> Option<[u32; 4]> {
+    cached_present_crop(width, height).map(|(x0, y0, w, h)| {
         if should_flip_vulkan_present(width, height) {
             [x0, height.saturating_sub(y0).saturating_sub(h), w, h]
         } else {
             [x0, y0, w, h]
         }
-    });
-    let readback = readback_fn(read_rect);
-    let Some((read_w, read_h, bytes, flip_y)) = readback else {
-        return;
-    };
+    })
+}
+
+fn submit_present_frame(
+    read_w: u32,
+    read_h: u32,
+    bytes: Vec<u8>,
+    flip_y: Option<bool>,
+    metadata: PresentMetadata,
+    frame_queue: &nexium_nvdrv::FrameQueue,
+    stats: &std::sync::Arc<nexium_nvdrv::PipelineStats>,
+) {
     let (present_w, present_h, bytes) = if legacy_present_enabled() {
-        let (w, h, mut b) = prepare_vulkan_present_frame(bytes, read_w, read_h, transform, flip_y);
+        let (w, h, mut b) =
+            prepare_vulkan_present_frame(bytes, read_w, read_h, metadata.transform, flip_y);
         make_present_opaque(&mut b);
         (w, h, b)
     } else {
-        let (w, h, mut b) = if read_rect.map_or(false, |r| r[2] == read_w && r[3] == read_h) {
+        let (w, h, mut b) = if metadata
+            .read_rect
+            .map_or(false, |r| r[2] == read_w && r[3] == read_h)
+        {
             (read_w, read_h, bytes)
         } else {
             maybe_crop_present_subwindow(bytes, read_w, read_h)
@@ -8661,11 +8789,11 @@ fn submit_ordered_gpu_present<F>(
         if flip_y.unwrap_or_else(|| should_flip_vulkan_present(w, h)) {
             flip_present_v(&mut b, w, h);
         }
-        apply_present_transform(&mut b, w, h, transform);
+        apply_present_transform(&mut b, w, h, metadata.transform);
         make_present_opaque(&mut b);
         (w, h, b)
     };
-    let (present_w, present_h, bytes) = match queue_crop {
+    let (present_w, present_h, bytes) = match metadata.queue_crop {
         Some((cx, cy, cw, ch))
             if cx + cw <= present_w
                 && cy + ch <= present_h
@@ -8680,16 +8808,135 @@ fn submit_ordered_gpu_present<F>(
     if std::env::var_os("NEXIUM_FRAME_PRESENT_CACHE").is_some() {
         nexium_common::frame_present::set_last_presented(present_w, present_h, bytes.clone());
     }
-    let mut queue = frame_queue.lock();
-    queue.clear();
-    queue.push(nexium_nvdrv::QueuedFrame {
-        width: present_w,
-        height: present_h,
-        pixels: bytes,
-    });
-    stats
-        .frames_submitted
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    nexium_nvdrv::enqueue_bounded_frame(
+        frame_queue,
+        stats,
+        nexium_nvdrv::QueuedFrame {
+            width: present_w,
+            height: present_h,
+            pixels: bytes,
+            present_at: metadata.present_at,
+        },
+    );
+}
+
+fn submit_ordered_cpu_present<F>(
+    readback_fn: F,
+    frame_queue: nexium_nvdrv::FrameQueue,
+    stats: std::sync::Arc<nexium_nvdrv::PipelineStats>,
+    width: u32,
+    height: u32,
+    transform: u32,
+    queue_crop: Option<(u32, u32, u32, u32)>,
+    present_at: Option<std::time::Instant>,
+) where
+    F: FnOnce(Option<[u32; 4]>) -> Option<(u32, u32, Vec<u8>, Option<bool>)>,
+{
+    let metadata = PresentMetadata {
+        read_rect: present_read_rect(width, height),
+        transform,
+        queue_crop,
+        present_at,
+    };
+    let readback = readback_fn(metadata.read_rect);
+    let Some((read_w, read_h, bytes, flip_y)) = readback else {
+        return;
+    };
+    submit_present_frame(
+        read_w,
+        read_h,
+        bytes,
+        flip_y,
+        metadata,
+        &frame_queue,
+        &stats,
+    );
+}
+
+fn submit_ordered_gpu_present<F>(
+    mut readback_fn: F,
+    present_metadata: PresentMetadataQueue,
+    present_delivery_lanes: PresentDeliveryLanes,
+    binder_id: u32,
+    present_id: u64,
+    frame_queue: nexium_nvdrv::FrameQueue,
+    stats: std::sync::Arc<nexium_nvdrv::PipelineStats>,
+    width: u32,
+    height: u32,
+    transform: u32,
+    queue_crop: Option<(u32, u32, u32, u32)>,
+    present_at: Option<std::time::Instant>,
+) -> bool
+where
+    F: FnMut(Option<[u32; 4]>) -> nexium_nvdrv::PipelinedPresentReadback,
+{
+    const BACKPRESSURE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
+    let delivery_lane = present_delivery_lane(&present_delivery_lanes, binder_id);
+    let _delivery_guard = delivery_lane.lock();
+    let metadata = PresentMetadata {
+        read_rect: present_read_rect(width, height),
+        transform,
+        queue_crop,
+        present_at,
+    };
+    present_metadata.lock().insert(present_id, metadata);
+    let retry_started = std::time::Instant::now();
+    let mut next_backpressure_report = std::time::Duration::from_millis(100);
+    let mut emitted = false;
+    loop {
+        let readback = readback_fn(metadata.read_rect);
+        if let Some(completion) = readback.completion {
+            match completion {
+                nexium_nvdrv::PipelinedPresentCompletion::Ready(frame) => {
+                    if let Some(metadata) = present_metadata.lock().remove(&frame.present_id) {
+                        submit_present_frame(
+                            frame.width,
+                            frame.height,
+                            frame.pixels,
+                            frame.flip_y,
+                            metadata,
+                            &frame_queue,
+                            &stats,
+                        );
+                        emitted = true;
+                    } else {
+                        log::warn!(
+                            "ordered GPU present lost metadata binder={} present_id={}",
+                            binder_id,
+                            frame.present_id
+                        );
+                    }
+                }
+                nexium_nvdrv::PipelinedPresentCompletion::Dropped { present_id } => {
+                    present_metadata.lock().remove(&present_id);
+                }
+            }
+        }
+
+        match readback.submission {
+            nexium_nvdrv::PipelinedPresentSubmission::Submitted => return emitted,
+            nexium_nvdrv::PipelinedPresentSubmission::Backpressured => {
+                let waited = retry_started.elapsed();
+                if waited >= next_backpressure_report {
+                    log::warn!(
+                        "ordered GPU present backpressured binder={} present_id={} waited_ms={:.1}",
+                        binder_id,
+                        present_id,
+                        waited.as_secs_f64() * 1000.0,
+                    );
+                    next_backpressure_report = next_backpressure_report
+                        .saturating_add(std::time::Duration::from_millis(100));
+                }
+                std::thread::sleep(BACKPRESSURE_RETRY_DELAY);
+            }
+            nexium_nvdrv::PipelinedPresentSubmission::SourceUnavailable
+            | nexium_nvdrv::PipelinedPresentSubmission::Failed => {
+                present_metadata.lock().remove(&present_id);
+                return emitted;
+            }
+        }
+    }
 }
 
 fn outside_crop_has_visible(

@@ -43,6 +43,14 @@ pub trait HostPcmSink: Send + Sync {
     fn vacant_frames(&self) -> usize {
         0
     }
+
+    fn drain_underrun_frames(&self) -> u64 {
+        0
+    }
+
+    fn drain_dropped_frames(&self) -> u64 {
+        0
+    }
 }
 
 static HOST_AUDIO_SINK: OnceCell<Arc<dyn HostPcmSink>> = OnceCell::new();
