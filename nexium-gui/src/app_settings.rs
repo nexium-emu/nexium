@@ -688,7 +688,7 @@ impl Default for AppSettings {
 
 impl AppSettings {
     pub fn config_path() -> Option<PathBuf> {
-        directories::BaseDirs::new().map(|d| d.config_dir().join("NeXium").join("app.json"))
+        Some(nexium_common::paths::root().join("app.json"))
     }
 
     pub fn load() -> Self {

@@ -14,11 +14,7 @@ pub struct FileLogger {
 
 impl FileLogger {
     pub fn new(capacity: usize) -> Result<(Self, Arc<Mutex<VecDeque<String>>>), String> {
-        let log_dir = directories::BaseDirs::new()
-            .ok_or_else(|| "Failed to get base directories".to_string())?
-            .config_dir()
-            .join("NeXium")
-            .join("logs");
+        let log_dir = crate::paths::root().join("logs");
 
         fs::create_dir_all(&log_dir)
             .map_err(|e| format!("Failed to create log directory: {}", e))?;

@@ -9,7 +9,7 @@ pub struct PlayTimes {
 
 impl PlayTimes {
     fn config_path() -> Option<PathBuf> {
-        directories::BaseDirs::new().map(|d| d.config_dir().join("NeXium").join("playtimes.json"))
+        Some(nexium_common::paths::root().join("playtimes.json"))
     }
 
     pub fn load() -> Self {

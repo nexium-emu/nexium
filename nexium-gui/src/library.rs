@@ -295,10 +295,7 @@ fn read_entry(path: &Path) -> Option<GameEntry> {
 
 pub fn custom_icon_path(game_path: &Path) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
-    let base = directories::BaseDirs::new()?
-        .config_dir()
-        .join("NeXium")
-        .join("icons");
+    let base = nexium_common::paths::root().join("icons");
     let mut h = std::collections::hash_map::DefaultHasher::new();
     game_path.hash(&mut h);
     Some(base.join(format!("{:016x}.png", h.finish())))

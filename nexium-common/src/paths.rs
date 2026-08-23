@@ -1,6 +1,16 @@
 use std::path::{Path, PathBuf};
 
+const DATA_ROOT_OVERRIDE_ENV: &str = "NEXIUM_DATA_ROOT";
+
+fn data_root_override(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let value = value?;
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
 fn data_root() -> PathBuf {
+    if let Some(path) = data_root_override(std::env::var_os(DATA_ROOT_OVERRIDE_ENV)) {
+        return path;
+    }
     if let Some(dirs) = directories::BaseDirs::new() {
         return dirs.config_dir().join("NeXium");
     }
@@ -65,4 +75,19 @@ pub fn sdmc_app_dir(app: &str) -> PathBuf {
 
 pub fn guest_app_dir(app: &str) -> String {
     format!("sdmc:/switch/{}", app)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonempty_data_root_override_is_used_verbatim() {
+        let path = PathBuf::from("C:/isolated/nexium");
+        assert_eq!(
+            data_root_override(Some(path.clone().into_os_string())),
+            Some(path)
+        );
+        assert_eq!(data_root_override(Some("".into())), None);
+    }
 }
