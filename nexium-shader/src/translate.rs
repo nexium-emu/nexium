@@ -5164,6 +5164,8 @@ impl Translator {
                 }
             }
 
+            Opcode::VOTE_vtg if self.stage != ShaderStage::Compute => {}
+
             Opcode::VOTE => {
                 let vote_mode = ((raw >> 48) & 0x3) as u8;
                 let vote_gated = self.stage != ShaderStage::Compute && new_fs_ops_disabled();
@@ -6255,7 +6257,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_vote_modes_vtg_fail_closed_and_graphics_vote_lowers() {
+    fn unsupported_vote_mode_fails_closed() {
         let unsupported_mode = 0x50db_e380_0007_0001;
         assert_eq!(decode_one(unsupported_mode).unwrap().opcode, Opcode::VOTE);
         let mut compute = Translator::new_compute();
@@ -6271,13 +6273,40 @@ mod tests {
                 ..
             }) if *raw == unsupported_mode
         ));
+    }
 
-        let vtg = 0x50e0_e380_0007_0001;
-        assert_eq!(decode_one(vtg).unwrap().opcode, Opcode::VOTE_vtg);
-        let mut unsupported_vtg = Translator::new_compute();
-        assert!(!unsupported_vtg.translate(vtg));
-        assert_eq!(unsupported_vtg.unimplemented_count, 1);
+    #[test]
+    fn dredge_vote_vtg_is_a_graphics_noop_but_compute_fails_closed() {
+        let dredge_vtg = 0x50e2_4321_1117_0000;
+        assert_eq!(decode_one(dredge_vtg).unwrap().opcode, Opcode::VOTE_vtg);
 
+        for mut graphics in [Translator::new(), Translator::new_fragment()] {
+            let registers_before = graphics.reg_state.clone();
+            let predicates_before = graphics.pred_state.clone();
+            assert!(graphics.translate(dredge_vtg));
+            assert_eq!(graphics.unimplemented_count, 0);
+            assert!(graphics.program.instructions.is_empty());
+            assert_eq!(graphics.reg_state, registers_before);
+            assert_eq!(graphics.pred_state, predicates_before);
+        }
+
+        let mut compute = Translator::new_compute();
+        assert!(!compute.translate(dredge_vtg));
+        assert_eq!(compute.unimplemented_count, 1);
+        assert!(matches!(
+            compute.program.instructions.last(),
+            Some(Inst {
+                op: Op::Unimplemented {
+                    opcode: Opcode::VOTE_vtg,
+                    raw
+                },
+                ..
+            }) if *raw == dredge_vtg
+        ));
+    }
+
+    #[test]
+    fn graphics_vote_lowers() {
         let mut graphics = Translator::new();
         assert!(graphics.translate(0x50d8_e380_0007_0001));
         assert_eq!(graphics.unimplemented_count, 0);
