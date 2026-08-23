@@ -254,6 +254,7 @@ pub struct AudioRendererState {
     pub voice_wb_progress_frames: Vec<u64>,
     pub voice_frac_q15: Vec<i32>,
     pub voice_prev_gain: Vec<f32>,
+    pub voice_biquad_state: Vec<[[[f32; 2]; 2]; 2]>,
     pub voice_hist: Vec<[f32; 6]>,
     pub voice_adpcm_states: Vec<AudioAdpcmDecodeState>,
 }

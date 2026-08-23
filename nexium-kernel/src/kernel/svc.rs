@@ -396,6 +396,42 @@ impl Default for AudioWaveBufferSpan {
 }
 
 const AUDIO_WAVE_BUFFER_LOOP_INFINITE: i32 = -1;
+const AUDIO_BIQUAD_COEFFICIENT_SCALE: f32 = 1.0 / 16384.0;
+const AUDIO_BIQUADS_PER_VOICE: usize = 2;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct AudioBiquadCoefficients {
+    enabled: bool,
+    a0: f32,
+    a1: f32,
+    a2: f32,
+    b1: f32,
+    b2: f32,
+}
+
+fn parse_audio_biquad(bytes: &[u8]) -> AudioBiquadCoefficients {
+    if bytes.len() < 0x0C {
+        return AudioBiquadCoefficients::default();
+    }
+    let coefficient = |off: usize| {
+        i16::from_le_bytes([bytes[off], bytes[off + 1]]) as f32 * AUDIO_BIQUAD_COEFFICIENT_SCALE
+    };
+    AudioBiquadCoefficients {
+        enabled: bytes[0x00] != 0,
+        a0: coefficient(0x02),
+        a1: coefficient(0x04),
+        a2: coefficient(0x06),
+        b1: coefficient(0x08),
+        b2: coefficient(0x0A),
+    }
+}
+
+fn apply_audio_biquad(coefficients: &AudioBiquadCoefficients, state: &mut [f32; 2], input: f32) -> f32 {
+    let output = input * coefficients.a0 + state[0];
+    state[0] = input * coefficients.a1 + output * coefficients.b1 + state[1];
+    state[1] = input * coefficients.a2 + output * coefficients.b2;
+    output
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct AudioVoiceMixSnapshot {
@@ -766,6 +802,72 @@ mod audio_pcm_tests {
         }
         assert_eq!(queued, super::AUDIO_RING_HIGH_WATER_FRAMES);
         assert!(updates <= 6);
+    }
+
+    fn biquad_bytes(enabled: bool, numerator: [i16; 3], denominator: [i16; 2]) -> [u8; 0x0C] {
+        let mut bytes = [0u8; 0x0C];
+        bytes[0x00] = enabled as u8;
+        bytes[0x02..0x04].copy_from_slice(&numerator[0].to_le_bytes());
+        bytes[0x04..0x06].copy_from_slice(&numerator[1].to_le_bytes());
+        bytes[0x06..0x08].copy_from_slice(&numerator[2].to_le_bytes());
+        bytes[0x08..0x0A].copy_from_slice(&denominator[0].to_le_bytes());
+        bytes[0x0A..0x0C].copy_from_slice(&denominator[1].to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn biquad_parameters_decode_as_q14_fixed_point() {
+        let parsed = super::parse_audio_biquad(&biquad_bytes(
+            true,
+            [16384, -8192, 4096],
+            [8192, -16384],
+        ));
+        assert!(parsed.enabled);
+        assert_eq!(parsed.a0, 1.0);
+        assert_eq!(parsed.a1, -0.5);
+        assert_eq!(parsed.a2, 0.25);
+        assert_eq!(parsed.b1, 0.5);
+        assert_eq!(parsed.b2, -1.0);
+
+        let disabled = super::parse_audio_biquad(&biquad_bytes(false, [16384, 0, 0], [0, 0]));
+        assert!(!disabled.enabled);
+        assert_eq!(
+            super::parse_audio_biquad(&[0u8; 4]),
+            super::AudioBiquadCoefficients::default()
+        );
+    }
+
+    #[test]
+    fn a_unity_biquad_passes_the_signal_through_untouched() {
+        let unity = super::parse_audio_biquad(&biquad_bytes(true, [16384, 0, 0], [0, 0]));
+        let mut state = [0.0f32; 2];
+        for input in [0.0f32, 0.5, -0.25, 1.0, -1.0] {
+            assert_eq!(super::apply_audio_biquad(&unity, &mut state, input), input);
+        }
+        assert_eq!(state, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn biquad_recurrence_matches_the_reference_transposed_form() {
+        let filter = super::parse_audio_biquad(&biquad_bytes(
+            true,
+            [8192, 4096, 2048],
+            [4096, -2048],
+        ));
+        let (a0, a1, a2, b1, b2) = (0.5f32, 0.25, 0.125, 0.25, -0.125);
+        let mut state = [0.0f32; 2];
+        let mut expected = [0.0f32; 2];
+        for input in [1.0f32, 0.5, -0.75, 0.0, 0.25] {
+            let want = input * a0 + expected[0];
+            let next0 = input * a1 + want * b1 + expected[1];
+            let next1 = input * a2 + want * b2;
+            expected = [next0, next1];
+
+            let got = super::apply_audio_biquad(&filter, &mut state, input);
+            assert!((got - want).abs() < 1e-6, "got {} want {}", got, want);
+            assert!((state[0] - expected[0]).abs() < 1e-6);
+            assert!((state[1] - expected[1]).abs() < 1e-6);
+        }
     }
 
     #[test]
@@ -5132,6 +5234,7 @@ fn dispatch_service_v2(
             voice_wb_progress_frames: Vec::new(),
             voice_frac_q15: Vec::new(),
             voice_prev_gain: Vec::new(),
+            voice_biquad_state: Vec::new(),
             voice_hist: Vec::new(),
             voice_adpcm_states: Vec::new(),
         };
@@ -5251,6 +5354,7 @@ fn dispatch_service_v2(
                 voice_wb_progress_frames: Vec::new(),
                 voice_frac_q15: Vec::new(),
                 voice_prev_gain: Vec::new(),
+                voice_biquad_state: Vec::new(),
                 voice_hist: Vec::new(),
                 voice_adpcm_states: Vec::new(),
             });
@@ -5398,6 +5502,8 @@ fn dispatch_service_v2(
                     st.voice_wb_progress_frames.resize(voice_count_seen, 0);
                     st.voice_frac_q15.resize(voice_count_seen, 0);
                     st.voice_prev_gain.resize(voice_count_seen, 0.0);
+                    st.voice_biquad_state
+                        .resize(voice_count_seen, [[[0.0f32; 2]; 2]; 2]);
                     st.voice_hist.resize(voice_count_seen, [0.0f32; 6]);
                     st.voice_adpcm_states
                         .resize(voice_count_seen, AudioAdpcmDecodeState::default());
@@ -5592,6 +5698,9 @@ fn dispatch_service_v2(
                                 if let Some(g) = st.voice_prev_gain.get_mut(vid) {
                                     *g = 0.0;
                                 }
+                                if let Some(s) = st.voice_biquad_state.get_mut(vid) {
+                                    *s = [[[0.0f32; 2]; 2]; 2];
+                                }
                             }
 
                             if !is_in_use
@@ -5606,6 +5715,9 @@ fn dispatch_service_v2(
                             {
                                 if let Some(g) = st.voice_prev_gain.get_mut(vid) {
                                     *g = 0.0;
+                                }
+                                if let Some(s) = st.voice_biquad_state.get_mut(vid) {
+                                    *s = [[[0.0f32; 2]; 2]; 2];
                                 }
                                 continue;
                             }
@@ -5965,6 +6077,16 @@ fn dispatch_service_v2(
                                     pcm_r[(i as usize).min(in_frames - 1)]
                                 }
                             };
+                            let biquads = [
+                                parse_audio_biquad(&v[0x024..0x030]),
+                                parse_audio_biquad(&v[0x030..0x03C]),
+                            ];
+                            let any_biquad = biquads.iter().any(|filter| filter.enabled);
+                            let mut biquad_state = st
+                                .voice_biquad_state
+                                .get(vid)
+                                .copied()
+                                .unwrap_or([[[0.0f32; 2]; 2]; 2]);
                             let prev_gain = st.voice_prev_gain.get(vid).copied().unwrap_or(0.0);
                             let gain_ramp = (gain - prev_gain) / TARGET_FRAMES as f32;
                             let mut ramped_gain = prev_gain;
@@ -5974,8 +6096,25 @@ fn dispatch_service_v2(
                                 let fraction = frac_q15 as f32 * (1.0 / 32768.0);
                                 let left = smp_l(bi);
                                 let right = smp_r(bi);
-                                let ol = left + (smp_l(bi + 1) - left) * fraction;
-                                let orr = right + (smp_r(bi + 1) - right) * fraction;
+                                let mut ol = left + (smp_l(bi + 1) - left) * fraction;
+                                let mut orr = right + (smp_r(bi + 1) - right) * fraction;
+                                if any_biquad {
+                                    for (filter_index, filter) in biquads.iter().enumerate() {
+                                        if !filter.enabled {
+                                            continue;
+                                        }
+                                        ol = apply_audio_biquad(
+                                            filter,
+                                            &mut biquad_state[filter_index][0],
+                                            ol,
+                                        );
+                                        orr = apply_audio_biquad(
+                                            filter,
+                                            &mut biquad_state[filter_index][1],
+                                            orr,
+                                        );
+                                    }
+                                }
                                 out_stereo[i * 2] += ol * ramped_gain;
                                 out_stereo[i * 2 + 1] += orr * ramped_gain;
                                 ramped_gain += gain_ramp;
@@ -5985,6 +6124,9 @@ fn dispatch_service_v2(
                             }
                             if let Some(g) = st.voice_prev_gain.get_mut(vid) {
                                 *g = gain;
+                            }
+                            if let Some(s) = st.voice_biquad_state.get_mut(vid) {
+                                *s = biquad_state;
                             }
                             debug_assert_eq!(read_idx, checkpoint_source_frames);
                             let consumed =
