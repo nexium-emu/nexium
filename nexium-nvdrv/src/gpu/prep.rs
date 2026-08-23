@@ -1038,6 +1038,7 @@ impl PrepState {
             _ => true,
         };
         if renderer_changed {
+            self.ssbo_snapshot_cache.clear_prepared_texture_snapshots();
             self.pending_small_rt_wb = None;
             let cleared = super::vk_dispatch::clear_pending_small_rt_writebacks();
             if cleared != 0 {
@@ -1064,6 +1065,7 @@ impl PrepState {
         let kp = super::pusher::kickprof::start();
         self.ssbo_snapshot_cache.profile_epoch();
         self.ssbo_snapshot_cache.clear_ssbo_snapshots();
+        self.ssbo_snapshot_cache.clear_prepared_texture_snapshots();
         super::pusher::kickprof::add(super::pusher::kickprof::EPOCH_END, kp);
     }
 

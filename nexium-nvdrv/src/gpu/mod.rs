@@ -383,7 +383,11 @@ impl GuestMemoryAccess {
     ) -> Option<(u64, bool)> {
         let cpu_addr = mappings.cpu_address_for(gpu_va)?;
         let writer = self.writer.lock().clone()?;
-        Some((cpu_addr, writer(cpu_addr, bytes)))
+        let written = writer(cpu_addr, bytes);
+        if written && !bytes.is_empty() {
+            nexium_gpu::tex_invalidate::bump_region(gpu_va, bytes.len() as u64);
+        }
+        Some((cpu_addr, written))
     }
 }
 
@@ -391,6 +395,9 @@ pub(crate) static PENDING_ENGINE_SYNCPT_INCRS: parking_lot::Mutex<Vec<u32>> =
     parking_lot::Mutex::new(Vec::new());
 
 pub(crate) fn record_engine_syncpt_increment(id: u32) {
+    if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+        log::info!("[syncpt] engine incr id={}", id);
+    }
     PENDING_ENGINE_SYNCPT_INCRS.lock().push(id);
     nexium_common::host_wake::signal();
 }
@@ -787,7 +794,7 @@ impl GpuContext {
         (syncpt_id, syncpt_value)
     }
 
-    fn apply_embedded_syncpt_incrs(&self, incrs: Vec<(u32, u32)>) {
+    pub(crate) fn apply_embedded_syncpt_incrs(&self, incrs: Vec<(u32, u32)>) {
         if incrs.is_empty() {
             return;
         }
@@ -795,7 +802,7 @@ impl GpuContext {
         for (id, count) in incrs {
             if let Some(channel) = channels.values_mut().find(|c| c.syncpt_id == id) {
                 channel.syncpt_min = channel.syncpt_min.wrapping_add(count);
-                if crate::syncpoint_reached(channel.syncpt_max, channel.syncpt_min) {
+                if !crate::syncpoint_reached(channel.syncpt_max, channel.syncpt_min) {
                     channel.syncpt_max = channel.syncpt_min;
                 }
             }
@@ -907,9 +914,8 @@ impl GpuContext {
         pusher.prep_kick_begin();
 
         let t_entries = std::time::Instant::now();
-        let entries = pusher::repair_endform_entries(entries);
+        let entries = pusher::repair_endform_entries(entries, &mappings);
         let entries = entries.as_slice();
-        let _addrs: Vec<u64> = entries.iter().map(|e| e.address()).collect();
         if pusher::direct_forensics() && entries.iter().any(|e| e.entry_count() > 4096) {
             use std::sync::atomic::{AtomicU32, Ordering};
             static N: AtomicU32 = AtomicU32::new(0);
@@ -977,8 +983,28 @@ impl GpuContext {
                 }
             }
         }
-        for entry in entries.iter() {
-            pusher.entry_word_limit = 0;
+        let trace_entries = std::env::var_os("NEXIUM_ENTRY_TRACE").is_some();
+        for entry in entries {
+            if trace_entries {
+                let va = entry.address();
+                let count = entry.entry_count();
+                let mut head = [0u8; 16];
+                pusher::read_gpu_scattered(&mappings, va, &mut head, &mem_read);
+                let words: Vec<String> = head
+                    .chunks_exact(4)
+                    .map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                    .collect();
+                log::info!(
+                    "[entry] va={:#x} count={} cpu={:?} head=[{}] methods_before={}",
+                    va,
+                    count,
+                    mappings.cpu_address_for(va),
+                    words.join(","),
+                    self.stats
+                        .methods_dispatched
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
             pusher.process_entry(
                 entry,
                 &mappings,
@@ -993,7 +1019,6 @@ impl GpuContext {
                 &mem_copy,
             );
         }
-        pusher.entry_word_limit = 0;
         let entries_ms = if profile { elapsed_ms(t_entries) } else { 0.0 };
         let t_flush = std::time::Instant::now();
         pusher.prep_kick_end(

@@ -548,8 +548,8 @@ enum Mode {
 impl Mode {
     fn from_bits(v: u32) -> Option<Mode> {
         Some(match v {
-            0 | 1 => Mode::Increasing,
-            2 | 3 => Mode::NonIncreasing,
+            1 => Mode::Increasing,
+            3 => Mode::NonIncreasing,
             4 => Mode::Inline,
             5 => Mode::IncreaseOnce,
             _ => return None,
@@ -694,7 +694,6 @@ pub struct Pusher {
     active_entry_cpu_va: u64,
     active_word_index: usize,
     active_header: u32,
-    pub entry_word_limit: u32,
     pub(crate) prep: super::prep::PrepLane,
     engine_event_batch: Option<(u32, Vec<(u32, u32, bool)>)>,
 }
@@ -721,7 +720,6 @@ impl Pusher {
             active_entry_cpu_va: 0,
             active_word_index: 0,
             active_header: 0,
-            entry_word_limit: 0,
             prep: super::prep::PrepLane::Inline(super::prep::PrepState::new()),
             engine_event_batch: None,
         }
@@ -1069,8 +1067,7 @@ impl Pusher {
                 }
             })
             .collect();
-        let decoded = repair_endform_entries(&decoded);
-        let addrs: Vec<u64> = decoded.iter().map(|e| e.address()).collect();
+        let decoded = repair_endform_entries(&decoded, mappings);
         kickprof::add(kickprof::ELIST, kp_elist);
 
         if direct_forensics() && decoded.iter().any(|e| e.entry_count() > 4096) {
@@ -1098,15 +1095,9 @@ impl Pusher {
             }
         }
 
-        for i in 0..num_entries as usize {
-            let entry = decoded[i];
-            self.entry_word_limit = if entry.entry_count() > 4096 {
-                nearest_forward_gap(&addrs, i)
-            } else {
-                0
-            };
+        for entry in &decoded {
             self.process_entry(
-                &entry,
+                entry,
                 mappings,
                 maxwell,
                 maxwell_dma,
@@ -1119,7 +1110,6 @@ impl Pusher {
                 mem_copy,
             );
         }
-        self.entry_word_limit = 0;
         self.prep_kick_end(
             hard_after,
             writeback_small_rts,
@@ -1146,30 +1136,10 @@ impl Pusher {
     ) {
         self.prep_entry_begin();
         let address = entry.address();
-        let mut word_count = entry.entry_count();
+        let word_count = entry.entry_count();
         let profile = gpu_profile_enabled();
         let started = profile.then(std::time::Instant::now);
         let methods_before = profile.then(|| stats.methods_dispatched.load(Ordering::Relaxed));
-
-        if self.entry_word_limit != 0 && word_count > self.entry_word_limit {
-            if direct_forensics() {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static N: AtomicU32 = AtomicU32::new(0);
-                if N.fetch_add(1, Ordering::Relaxed) < 48 {
-                    log::warn!(
-                        "[pb-clamp] gpu_va={:#x} declared={} clamped_to={} (next entry overlaps)",
-                        address,
-                        word_count,
-                        self.entry_word_limit
-                    );
-                }
-            }
-            self.state.method_count = self
-                .state
-                .method_count
-                .saturating_sub(word_count - self.entry_word_limit);
-            word_count = self.entry_word_limit;
-        }
 
         if gpfifo_trace_enabled() && self.entries_logged < 16 {
             log::info!(
@@ -1257,6 +1227,16 @@ impl Pusher {
             self.state.non_incrementing,
             self.state.increment_once,
         );
+        let frame_trace = std::env::var_os("NEXIUM_PB_FRAME_TRACE").is_some();
+        if frame_trace {
+            log::warn!(
+                "[pb-frame-in] gpu_va={:#x} words={} state_in={:?} w={:08x?}",
+                address,
+                word_count,
+                entry_state_in,
+                &words[..words.len().min(64)]
+            );
+        }
         self.process_commands(
             &words,
             mappings,
@@ -1270,6 +1250,42 @@ impl Pusher {
             mem_write,
             mem_copy,
         );
+        if frame_trace {
+            log::warn!(
+                "[pb-frame-out] gpu_va={:#x} state_out=({:#x},{},{},{},{})",
+                address,
+                self.state.method,
+                self.state.subchannel,
+                self.state.method_count,
+                self.state.non_incrementing,
+                self.state.increment_once
+            );
+            let mut again = vec![0u8; bytes_needed];
+            read_gpu_scattered(mappings, address, &mut again, mem_read);
+            let reread: Vec<u32> = (0..word_count as usize)
+                .map(|i| {
+                    let off = i * 4;
+                    u32::from_le_bytes([again[off], again[off + 1], again[off + 2], again[off + 3]])
+                })
+                .map(|w| if w == POISON_SENTINEL { 0 } else { w })
+                .collect();
+            if reread != words {
+                let diffs: Vec<String> = words
+                    .iter()
+                    .zip(reread.iter())
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(i, (a, b))| format!("{}:{:08x}->{:08x}", i, a, b))
+                    .collect();
+                log::error!(
+                    "[pb-torn] gpu_va={:#x} words={} changed={} {}",
+                    address,
+                    word_count,
+                    diffs.len(),
+                    diffs.join(" ")
+                );
+            }
+        }
         if direct_forensics() && self.state.method_count > 0 {
             use std::sync::atomic::{AtomicU32, Ordering};
             static N: AtomicU32 = AtomicU32::new(0);
@@ -1283,6 +1299,7 @@ impl Pusher {
                     self.state.non_incrementing,
                     self.state.subchannel
                 );
+                log::warn!("[pb-leak-maps] {}", mappings.describe_around(address));
                 if let Some(n) = std::env::var("NEXIUM_PB_DUMP_WORDS")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
@@ -1301,7 +1318,6 @@ impl Pusher {
         self.active_entry_cpu_va = 0;
         self.active_word_index = 0;
         self.active_header = 0;
-        self.entry_word_limit = 0;
         if let (Some(started), Some(methods_before)) = (started, methods_before) {
             let elapsed = started.elapsed();
             if elapsed >= Duration::from_millis(5) {
@@ -2113,61 +2129,77 @@ pub(crate) fn direct_forensics() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_MME_FORENSICS").is_some())
 }
 
-pub(crate) fn nearest_forward_gap(addrs: &[u64], i: usize) -> u32 {
-    let cur = addrs[i];
-    let mut best: Option<u64> = None;
-    for (j, &a) in addrs.iter().enumerate() {
-        if j == i || a <= cur {
-            continue;
-        }
-        let d = a - cur;
-        if best.map_or(true, |b| d < b) {
-            best = Some(d);
-        }
-    }
-    match best {
-        Some(d) if d <= 0x100000 * 4 => (d / 4) as u32,
-        _ => 0,
+const GPFIFO_LENGTH_MASK: u32 = 0x1F_FFFF;
+const RECOVERED_RANGE_WORD_LIMIT: u32 = 4096;
+
+fn with_entry_range(entry: CommandListHeader, start: u64, words: u32) -> CommandListHeader {
+    debug_assert!(words <= GPFIFO_LENGTH_MASK);
+    CommandListHeader {
+        address_lo: (start as u32 & !3) | (entry.address_lo & 3),
+        address_hi_and_count: (entry.address_hi_and_count & 0x8000_0300)
+            | ((start >> 32) as u32 & 0xFF)
+            | (words << 10),
     }
 }
 
-fn dedup_walker_blocks(entries: &[CommandListHeader]) -> Vec<CommandListHeader> {
-    if !entries.iter().any(|e| e.entry_count() > 4096) {
-        return entries.to_vec();
+fn recover_gpu_end_range(
+    entries: &[CommandListHeader],
+    index: usize,
+    mappings: &GpuMappings,
+) -> Option<(u64, u32)> {
+    let entry = entries[index];
+    if !entry.no_prefetch() || !entry.not_main() {
+        return None;
     }
-    let mut out: Vec<CommandListHeader> = Vec::with_capacity(entries.len());
-    let mut i = 0usize;
-    while i < entries.len() {
-        let mut dropped = false;
-        let remaining = entries.len() - i;
-        let max_block = (out.len()).min(remaining);
-        for block in (1..=max_block).rev() {
-            let prior = &out[out.len() - block..];
-            let cand = &entries[i..i + block];
-            let equal = prior.iter().zip(cand.iter()).all(|(a, b)| {
-                a.address_lo == b.address_lo && a.address_hi_and_count == b.address_hi_and_count
-            });
-            let has_giant = cand.iter().any(|e| e.entry_count() > 4096);
-            if equal && has_giant {
-                if direct_forensics() {
-                    log::warn!(
-                        "[pb-dedup] dropped repeated block len={} at index {} first_va={:#x}",
-                        block,
-                        i,
-                        cand[0].address()
-                    );
-                }
-                i += block;
-                dropped = true;
-                break;
+    let start = entry.address();
+    let encoded_end = entry.entry_count();
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(other_index, other)| {
+            if other_index == index
+                || (other.address() & GPFIFO_LENGTH_MASK as u64) as u32 != encoded_end
+            {
+                return None;
             }
-        }
-        if !dropped {
-            out.push(entries[i]);
-            i += 1;
-        }
+            let bytes = other.address().checked_sub(start)?;
+            if bytes == 0 || bytes & 3 != 0 {
+                return None;
+            }
+            let start_cpu = mappings.cpu_address_for(start)?;
+            let end_cpu = mappings.cpu_address_for(other.address())?;
+            if start_cpu.checked_add(bytes) != Some(end_cpu) {
+                return None;
+            }
+            let words = u32::try_from(bytes / 4).ok()?;
+            (words <= RECOVERED_RANGE_WORD_LIMIT).then_some((start, words))
+        })
+        .min_by_key(|(_, words)| *words)
+}
+
+fn recover_cpu_start_range(entry: CommandListHeader, mappings: &GpuMappings) -> Option<(u64, u32)> {
+    if entry.no_prefetch() || !entry.not_main() {
+        return None;
     }
-    out
+    let end = entry.address();
+    let end_cpu = mappings.cpu_address_for(end)?;
+    let encoded_start = entry.entry_count();
+    let bytes = ((end_cpu & GPFIFO_LENGTH_MASK as u64) as u32).checked_sub(encoded_start)?;
+    if bytes == 0 || bytes & 3 != 0 {
+        return None;
+    }
+    let words = bytes / 4;
+    if words > RECOVERED_RANGE_WORD_LIMIT {
+        return None;
+    }
+    let start = end.checked_sub(bytes as u64)?;
+    let start_cpu = mappings.cpu_address_for(start)?;
+    if start_cpu.checked_add(bytes as u64) != Some(end_cpu)
+        || (start_cpu & GPFIFO_LENGTH_MASK as u64) as u32 != encoded_start
+    {
+        return None;
+    }
+    Some((start, words))
 }
 
 fn endform_fix_enabled() -> bool {
@@ -2175,61 +2207,51 @@ fn endform_fix_enabled() -> bool {
     *ON.get_or_init(|| {
         std::env::var("NEXIUM_ENDFORM_FIX")
             .map(|v| {
-                matches!(
+                !matches!(
                     v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "on" | "yes"
+                    "0" | "false" | "off" | "no"
                 )
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
-pub(crate) fn repair_endform_entries(entries: &[CommandListHeader]) -> Vec<CommandListHeader> {
+pub(crate) fn repair_endform_entries(
+    entries: &[CommandListHeader],
+    mappings: &GpuMappings,
+) -> Vec<CommandListHeader> {
     if !endform_fix_enabled() {
         return entries.to_vec();
     }
-    let entries = &dedup_walker_blocks(entries)[..];
-    let addrs: Vec<u64> = entries.iter().map(|e| e.address()).collect();
     entries
         .iter()
         .enumerate()
         .map(|(i, e)| {
             let count = e.entry_count();
-            if count <= 4096 {
+            if count <= RECOVERED_RANGE_WORD_LIMIT {
                 return *e;
             }
-            let va = e.address();
-            let va_lo = (va & 0x1F_FFFF) as u32;
-            let diff = count.wrapping_sub(va_lo) & 0x1F_FFFF;
-            let chained = addrs
-                .iter()
-                .enumerate()
-                .any(|(j, &a)| j != i && a == va + count as u64 * 4);
-            let (words, family) = if chained {
-                (None, "chained")
-            } else if diff != 0 && diff % 4 == 0 && diff / 4 <= 4096 {
-                (Some(diff / 4), "endform")
-            } else if diff <= 0x10_0000 {
-                (None, "cursor")
-            } else {
-                (None, "torn")
-            };
+            let recovered = recover_gpu_end_range(entries, i, mappings)
+                .map(|range| (range, "gpu-start/end"))
+                .or_else(|| {
+                    recover_cpu_start_range(*e, mappings).map(|range| (range, "cpu-start/gpu-end"))
+                });
             if direct_forensics() {
+                let normalized = recovered.map(|((start, words), _)| (start, words));
                 log::warn!(
-                    "[pb-endform] va={:#x} raw_count={} repaired_words={:?} family={}",
-                    va,
+                    "[pb-range] raw_va={:#x} raw_count={} normalized={:?} family={}",
+                    e.address(),
                     count,
-                    words,
-                    family
+                    normalized,
+                    recovered
+                        .map(|(_, family)| family)
+                        .unwrap_or("unrecognized")
                 );
             }
-            let Some(words) = words else {
+            let Some(((start, words), _)) = recovered else {
                 return *e;
             };
-            CommandListHeader {
-                address_lo: e.address_lo,
-                address_hi_and_count: (e.address_hi_and_count & !(0x1F_FFFF << 10)) | (words << 10),
-            }
+            with_entry_range(*e, start, words)
         })
         .collect()
 }
@@ -2434,16 +2456,94 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    fn gpfifo_entry(address: u64, count: u32, no_prefetch: bool) -> CommandListHeader {
+        CommandListHeader {
+            address_lo: address as u32,
+            address_hi_and_count: ((address >> 32) as u32 & 0xFF)
+                | 0x200
+                | (count << 10)
+                | if no_prefetch { 0x8000_0000 } else { 0 },
+        }
+    }
+
     #[test]
-    fn legacy_pushbuffer_modes_decode_to_current_semantics() {
-        assert_eq!(Mode::from_bits(0), Some(Mode::Increasing));
+    fn only_dispatchable_pushbuffer_modes_decode_to_headers() {
+        assert_eq!(Mode::from_bits(0), None);
         assert_eq!(Mode::from_bits(1), Some(Mode::Increasing));
-        assert_eq!(Mode::from_bits(2), Some(Mode::NonIncreasing));
+        assert_eq!(Mode::from_bits(2), None);
         assert_eq!(Mode::from_bits(3), Some(Mode::NonIncreasing));
         assert_eq!(Mode::from_bits(4), Some(Mode::Inline));
         assert_eq!(Mode::from_bits(5), Some(Mode::IncreaseOnce));
         assert_eq!(Mode::from_bits(6), None);
         assert_eq!(Mode::from_bits(7), None);
+    }
+
+    #[test]
+    fn repairs_gpu_start_end_intermediate_range_only_at_a_submitted_boundary() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5_64a5_0000, 0x180_0000, 0x3_1c25_d000, 27);
+        let range = gpfifo_entry(0x5_64a5_0560, 0x50_5ec, true);
+        let end = gpfifo_entry(0x5_64a5_05ec, 29, false);
+
+        let repaired = repair_endform_entries(&[range, end], &mappings);
+
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[0].address(), 0x5_64a5_0560);
+        assert_eq!(repaired[0].entry_count(), 35);
+        assert_eq!(repaired[1].address(), end.address());
+        assert_eq!(repaired[1].entry_count(), end.entry_count());
+    }
+
+    #[test]
+    fn repairs_cpu_start_gpu_end_intermediate_range_through_the_mapping() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5_64a5_0000, 0x180_0000, 0x3_1c25_d000, 27);
+        let long_range = gpfifo_entry(0x5_64a5_05ec, 0x5_d578, false);
+        let short_range = gpfifo_entry(0x5_64a5_055c, 0x5_d548, false);
+
+        let repaired = repair_endform_entries(&[long_range, short_range], &mappings);
+
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[0].address(), 0x5_64a5_0578);
+        assert_eq!(repaired[0].entry_count(), 29);
+        assert_eq!(repaired[1].address(), 0x5_64a5_0548);
+        assert_eq!(repaired[1].entry_count(), 5);
+    }
+
+    #[test]
+    fn range_repair_preserves_repeated_entries_and_unmatched_large_counts() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5_64a5_0000, 0x180_0000, 0x3_1c25_d000, 27);
+        let range = gpfifo_entry(0x5_64a5_0560, 0x50_5ec, true);
+        let end = gpfifo_entry(0x5_64a5_05ec, 29, false);
+        let unmatched = gpfifo_entry(0x5_64a5_1000, 0x1100, true);
+
+        let repaired = repair_endform_entries(&[range, end, range, end, unmatched], &mappings);
+
+        assert_eq!(repaired.len(), 5);
+        assert_eq!(repaired[0].address_lo, repaired[2].address_lo);
+        assert_eq!(
+            repaired[0].address_hi_and_count,
+            repaired[2].address_hi_and_count
+        );
+        assert_eq!(repaired[4].address(), unmatched.address());
+        assert_eq!(repaired[4].entry_count(), 0x1100);
+    }
+
+    #[test]
+    fn range_repair_rejects_unmapped_or_geometrically_invalid_records() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5_64a5_0000, 0x180_0000, 0x3_1c25_d000, 27);
+        let reverse_underflow = gpfifo_entry(0x5_64a5_03f8, 0x5_e128, false);
+        let mut main_level = gpfifo_entry(0x5_64a5_05ec, 0x5_d578, false);
+        main_level.address_hi_and_count &= !0x200;
+
+        let repaired = repair_endform_entries(&[reverse_underflow, main_level], &mappings);
+
+        assert_eq!(repaired[0].address(), reverse_underflow.address());
+        assert_eq!(repaired[0].entry_count(), reverse_underflow.entry_count());
+        assert_eq!(repaired[1].address(), main_level.address());
+        assert_eq!(repaired[1].entry_count(), main_level.entry_count());
     }
 
     #[test]
@@ -2587,7 +2687,7 @@ mod tests {
             committed.lock().unwrap().push((cpu, data.to_vec()));
             true
         };
-        let header = (2u32 << 29) | (4 << 16) | 0x8E4;
+        let header = (3u32 << 29) | (4 << 16) | 0x8E4;
 
         pusher.process_commands(
             &[header, 0x1122_3344, 0x5566_7788, 0x99AA_BBCC, 0xDDEE_FF00],
@@ -2637,7 +2737,7 @@ mod tests {
             committed.lock().unwrap().push((cpu, data.to_vec()));
             true
         };
-        let header = (2u32 << 29) | (4 << 16) | 0x8E4;
+        let header = (3u32 << 29) | (4 << 16) | 0x8E4;
 
         pusher.process_commands(
             &[header, 0x1122_3344, 0x5566_7788],

@@ -2,6 +2,8 @@ use ash::vk;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+const MAX_RT_DIMENSION: u32 = 32768;
+
 use super::engines::maxwell3d::{
     DrawCall, GraphicsCbufBinds, GsDebugRegs, RenderTarget, VertexBuffer, WindowOrigin,
     GRAPHICS_CBUF_SLOTS,
@@ -859,6 +861,7 @@ pub(crate) struct SsboSnapshotCache {
     prepared_index_next_serial: u64,
     prepared_index_max_bytes: usize,
     prepared_index_max_entries: usize,
+    prepared_texture_snapshots: PreparedTextureSnapshotMemo,
     input_profile: bool,
     watch_query_ranges: Vec<HostWatchRange>,
     input_gpu_bounds: (u64, u64),
@@ -1193,6 +1196,7 @@ impl SsboSnapshotCache {
             prepared_index_next_serial: 0,
             prepared_index_max_bytes: PREPARED_INDEX_CACHE_MAX_BYTES,
             prepared_index_max_entries: PREPARED_INDEX_CACHE_MAX_ENTRIES,
+            prepared_texture_snapshots: PreparedTextureSnapshotMemo::new(),
             input_profile: input_cache_profile_enabled(),
             watch_query_ranges: Vec::new(),
             input_gpu_bounds: (u64::MAX, 0),
@@ -2766,6 +2770,12 @@ impl SsboSnapshotCache {
     }
 
     pub(crate) fn defer_patched_gpu_writes(&mut self, writes: &[(u64, u64, usize)]) {
+        self.prepared_texture_snapshots.retain(|key, _| {
+            !writes.iter().any(|&(gpu_addr, cpu_addr, len)| {
+                byte_ranges_overlap(key.gpu_va, key.len, gpu_addr, len)
+                    || byte_ranges_overlap(key.cpu_va, key.len, cpu_addr, len)
+            })
+        });
         self.deferred_patched_writes.extend_from_slice(writes);
     }
 
@@ -2784,7 +2794,23 @@ impl SsboSnapshotCache {
         self.invalidate_cpu_spans_inner(spans);
     }
 
+    fn invalidate_prepared_texture_spans(
+        &mut self,
+        gpu_spans: &[(u64, usize)],
+        cpu_spans: &[(u64, usize)],
+    ) {
+        self.prepared_texture_snapshots.retain(|key, _| {
+            !gpu_spans
+                .iter()
+                .any(|&(addr, len)| byte_ranges_overlap(key.gpu_va, key.len, addr, len))
+                && !cpu_spans
+                    .iter()
+                    .any(|&(addr, len)| byte_ranges_overlap(key.cpu_va, key.len, addr, len))
+        });
+    }
+
     fn invalidate_cpu_spans_inner(&mut self, spans: &[(u64, usize)]) {
+        self.invalidate_prepared_texture_spans(&[], spans);
         let watched = &self.full_watch_ranges;
         self.entries.retain(|key, _| {
             !watched.get(key).is_some_and(|entry| {
@@ -2809,6 +2835,7 @@ impl SsboSnapshotCache {
     }
 
     pub(crate) fn defer_gpu_writes(&mut self, writes: &[(u64, usize)]) {
+        self.invalidate_prepared_texture_spans(writes, &[]);
         self.deferred_gpu_writes.extend_from_slice(writes);
     }
 
@@ -2879,6 +2906,7 @@ impl SsboSnapshotCache {
         self.prepared_index_entries.clear();
         self.prepared_index_order.clear();
         self.prepared_index_bytes = 0;
+        self.prepared_texture_snapshots.clear();
     }
 
     pub(crate) fn clear_ssbo_snapshots(&mut self) {
@@ -2887,6 +2915,10 @@ impl SsboSnapshotCache {
         self.watch_query_ranges.clear();
         self.ssbo_gpu_bounds = (u64::MAX, 0);
         self.ssbo_cpu_bounds = (u64::MAX, 0);
+    }
+
+    pub(crate) fn clear_prepared_texture_snapshots(&mut self) {
+        self.prepared_texture_snapshots.clear();
     }
 
     pub(crate) fn retain_watchable_full_aurora_snapshots(&mut self) {
@@ -2899,6 +2931,7 @@ impl SsboSnapshotCache {
 
     fn invalidate_cpu_write(&mut self, write: HostWatchRange) {
         self.mirror.mark_dirty(write.cpu_addr, write.len);
+        self.invalidate_prepared_texture_spans(&[], &[(write.cpu_addr, write.len)]);
         let watched = &self.full_watch_ranges;
         self.entries.retain(|key, _| {
             !watched.get(key).is_some_and(|entry| {
@@ -2944,6 +2977,20 @@ impl SsboSnapshotCache {
                 }
             }
         }
+        let mapped_cpu_writes = writes
+            .iter()
+            .filter_map(|&(gpu_addr, len)| {
+                mappings
+                    .cpu_address_for(gpu_addr)
+                    .or_else(|| {
+                        mappings
+                            .cpu_address_for_any32(gpu_addr)
+                            .map(|(_, cpu, _)| cpu)
+                    })
+                    .map(|cpu_addr| (cpu_addr, len))
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_prepared_texture_spans(writes, &mapped_cpu_writes);
         if writes.is_empty() || (self.entries.is_empty() && self.input_entries.is_empty()) {
             return;
         }
@@ -3028,6 +3075,12 @@ impl SsboSnapshotCache {
         for chunk in chunks {
             self.mirror.mark_dirty(chunk.cpu_addr, chunk.len);
         }
+        self.prepared_texture_snapshots.retain(|key, _| {
+            !chunks.iter().any(|chunk| {
+                byte_ranges_overlap(key.gpu_va, key.len, chunk.gpu_va, chunk.len)
+                    || byte_ranges_overlap(key.cpu_va, key.len, chunk.cpu_addr, chunk.len)
+            })
+        });
         if chunks.is_empty() || (self.entries.is_empty() && self.input_entries.is_empty()) {
             return;
         }
@@ -3062,6 +3115,7 @@ impl SsboSnapshotCache {
 
     pub(crate) fn reset_epoch(&mut self) {
         self.clear_ssbo_snapshots();
+        self.prepared_texture_snapshots.clear();
         self.hits = 0;
         self.misses = 0;
         self.bytes_read = 0;
@@ -3828,6 +3882,21 @@ fn clear_surface_has_any_aspect(mask: u32) -> bool {
     (mask & 0x3) != 0 || clear_surface_wants_color(mask)
 }
 
+fn effective_depth_stencil_clear_aspects(
+    clear_depth: bool,
+    clear_stencil: bool,
+    image_aspects: vk::ImageAspectFlags,
+) -> vk::ImageAspectFlags {
+    let mut requested = vk::ImageAspectFlags::empty();
+    if clear_depth {
+        requested |= vk::ImageAspectFlags::DEPTH;
+    }
+    if clear_stencil {
+        requested |= vk::ImageAspectFlags::STENCIL;
+    }
+    requested & image_aspects
+}
+
 fn prepare_graphics_clear_op(
     draw: &DrawCall,
     mappings: &GpuMappings,
@@ -3840,6 +3909,12 @@ fn prepare_graphics_clear_op(
     let rt = &draw.rt[rt_slot];
     if rt.width == 0 || rt.height == 0 {
         return Err(format!("RT[{}] has zero extent", rt_slot));
+    }
+    if rt.width > MAX_RT_DIMENSION || rt.height > MAX_RT_DIMENSION {
+        return Err(format!(
+            "RT[{}] has implausible extent {}x{}",
+            rt_slot, rt.width, rt.height
+        ));
     }
     let rt_gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
     let nvmap_id = mappings
@@ -3880,13 +3955,7 @@ fn prepare_graphics_clear_op(
     let do_depth = want_depth_clear && !no_depth && depth_key.is_some();
     let do_stencil = want_stencil_clear && !no_depth && depth_key.is_some();
     let (depth_format, depth_aspects) = map_zeta_format(draw.zeta.format);
-    let mut clear_aspects = vk::ImageAspectFlags::empty();
-    if do_depth {
-        clear_aspects |= vk::ImageAspectFlags::DEPTH;
-    }
-    if do_stencil {
-        clear_aspects |= vk::ImageAspectFlags::STENCIL;
-    }
+    let clear_aspects = effective_depth_stencil_clear_aspects(do_depth, do_stencil, depth_aspects);
     let depth_stencil = depth_key.filter(|_| !clear_aspects.is_empty()).map(|key| {
         nexium_gpu::renderer::GraphicsDepthStencilClear {
             key,
@@ -4387,6 +4456,12 @@ fn draw_rt_binding_signature(
     if rt.width == 0 || rt.height == 0 {
         return Err(format!("RT[{}] has zero extent", rt_slot));
     }
+    if rt.width > MAX_RT_DIMENSION || rt.height > MAX_RT_DIMENSION {
+        return Err(format!(
+            "RT[{}] has implausible extent {}x{}",
+            rt_slot, rt.width, rt.height
+        ));
+    }
     let rt_gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
     let nvmap_id = mappings
         .nvmap_id_for(rt_gpu_va)
@@ -4526,6 +4601,8 @@ fn flush_batch(
     let owned_calls = std::mem::take(batch);
     let chunks = move_into_chunks(owned_calls, &chunk_lengths);
     let mut prepared_chunks = Vec::new();
+    let mut prepared_texture_snapshots =
+        std::mem::take(&mut snapshot_cache.prepared_texture_snapshots);
     for chunk in chunks {
         if chunk.is_empty() {
             continue;
@@ -4552,6 +4629,7 @@ fn flush_batch(
                     read_guest,
                     mem_read,
                     snapshot_cache,
+                    &mut prepared_texture_snapshots,
                     chunk_bytes,
                     false,
                 ));
@@ -4572,6 +4650,7 @@ fn flush_batch(
             packetizer.drain_hard();
         }
     }
+    snapshot_cache.prepared_texture_snapshots = prepared_texture_snapshots;
     n
 }
 
@@ -4612,6 +4691,12 @@ fn prepare_draw_texture_job(
     let rt = &draw.rt[rt_slot];
     if rt.width == 0 || rt.height == 0 {
         return Err(format!("RT[{}] has zero extent", rt_slot));
+    }
+    if rt.width > MAX_RT_DIMENSION || rt.height > MAX_RT_DIMENSION {
+        return Err(format!(
+            "RT[{}] has implausible extent {}x{}",
+            rt_slot, rt.width, rt.height
+        ));
     }
     let rt_gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
     let nvmap_id = mappings
@@ -4816,6 +4901,70 @@ struct TextureSnapshotCacheKey {
     len: usize,
     cpu_va: u64,
     nvmap_id: u32,
+}
+
+#[derive(Clone)]
+struct ValidatedTextureSnapshot {
+    data: Arc<Vec<u8>>,
+    gpu_generation: u64,
+    commit_generation: u64,
+    trusted_identity: u64,
+}
+
+type PreparedTextureSnapshotMemo = HashMap<TextureSnapshotCacheKey, ValidatedTextureSnapshot>;
+
+fn memoized_validated_texture_snapshot(
+    memo: &mut PreparedTextureSnapshotMemo,
+    cache_key: Option<TextureSnapshotCacheKey>,
+    fetch: impl FnOnce() -> Option<(Arc<Vec<u8>>, u64, u64, usize, Option<u64>)>,
+) -> Option<(Arc<Vec<u8>>, u64, u64, usize, Option<u64>)> {
+    let current_generations = cache_key.map(|key| {
+        (
+            nexium_gpu::tex_invalidate::region_gen_range(key.gpu_va, key.len as u64),
+            nexium_memory::fastmem::commit_generation(),
+        )
+    });
+    memoized_validated_texture_snapshot_at_generations(memo, cache_key, current_generations, fetch)
+}
+
+fn memoized_validated_texture_snapshot_at_generations(
+    memo: &mut PreparedTextureSnapshotMemo,
+    cache_key: Option<TextureSnapshotCacheKey>,
+    current_generations: Option<(u64, u64)>,
+    fetch: impl FnOnce() -> Option<(Arc<Vec<u8>>, u64, u64, usize, Option<u64>)>,
+) -> Option<(Arc<Vec<u8>>, u64, u64, usize, Option<u64>)> {
+    if let (Some(cache_key), Some((gpu_generation, commit_generation))) =
+        (cache_key, current_generations)
+    {
+        if let Some(cached) = memo.get(&cache_key) {
+            if cached.gpu_generation == gpu_generation
+                && cached.commit_generation == commit_generation
+            {
+                return Some((
+                    cached.data.clone(),
+                    cached.gpu_generation,
+                    cached.commit_generation,
+                    0,
+                    Some(cached.trusted_identity),
+                ));
+            }
+            memo.remove(&cache_key);
+        }
+    }
+
+    let fetched = fetch()?;
+    if let (Some(cache_key), Some(trusted_identity)) = (cache_key, fetched.4) {
+        memo.insert(
+            cache_key,
+            ValidatedTextureSnapshot {
+                data: fetched.0.clone(),
+                gpu_generation: fetched.1,
+                commit_generation: fetched.2,
+                trusted_identity,
+            },
+        );
+    }
+    Some(fetched)
 }
 
 #[derive(Clone, Copy)]
@@ -5637,7 +5786,7 @@ fn fetch_texture_snapshot(
     len: usize,
     cache_key: Option<TextureSnapshotCacheKey>,
     cache_owner: Option<&Arc<nexium_gpu::Renderer>>,
-) -> Option<(Arc<Vec<u8>>, u64, usize, Option<u64>)> {
+) -> Option<(Arc<Vec<u8>>, u64, u64, usize, Option<u64>)> {
     let initial_gpu_generation = nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64);
     let initial_commit_generation = nexium_memory::fastmem::commit_generation();
     let initial_host_generation = cache_key.and_then(take_texture_host_generation);
@@ -5668,7 +5817,13 @@ fn fetch_texture_snapshot(
                             1,
                             len,
                         );
-                        return Some((data, initial_gpu_generation, 0, Some(trusted_identity)));
+                        return Some((
+                            data,
+                            initial_gpu_generation,
+                            initial_commit_generation,
+                            0,
+                            Some(trusted_identity),
+                        ));
                     }
                     let mut cache = texture_snapshot_cache().lock().unwrap();
                     cache.set_owner(cache_owner);
@@ -5736,7 +5891,13 @@ fn fetch_texture_snapshot(
                     after_commit_generation,
                 ) {
                     data = cached;
-                    return Some((data, after_gpu_generation, 0, Some(trusted_identity)));
+                    return Some((
+                        data,
+                        after_gpu_generation,
+                        after_commit_generation,
+                        0,
+                        Some(trusted_identity),
+                    ));
                 } else {
                     let trusted_identity = next_texture_snapshot_identity();
                     cache.insert(
@@ -5747,13 +5908,25 @@ fn fetch_texture_snapshot(
                         trusted_identity,
                         data.clone(),
                     );
-                    return Some((data, after_gpu_generation, n, Some(trusted_identity)));
+                    return Some((
+                        data,
+                        after_gpu_generation,
+                        after_commit_generation,
+                        n,
+                        Some(trusted_identity),
+                    ));
                 }
             }
-            return Some((data, after_gpu_generation, n, None));
+            return Some((data, after_gpu_generation, after_commit_generation, n, None));
         }
         if attempt == 2 {
-            return Some((Arc::new(data), after_gpu_generation, len, None));
+            return Some((
+                Arc::new(data),
+                after_gpu_generation,
+                after_commit_generation,
+                len,
+                None,
+            ));
         }
         if let (Some(cache_key), Some(cache_owner)) = (cache_key, cache_owner) {
             if before_gpu_generation != after_gpu_generation
@@ -5773,6 +5946,7 @@ fn snapshot_texture_once(
     snapshot: &mut DrawSnapshot,
     generations: &mut std::collections::HashMap<(u64, usize), u64>,
     trusted_identities: &mut std::collections::HashMap<u64, TrustedTextureSnapshotIdentity>,
+    prepared_snapshots: &mut PreparedTextureSnapshotMemo,
     read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
     gpu_va: u64,
     len: usize,
@@ -5785,8 +5959,10 @@ fn snapshot_texture_once(
             .or_insert_with(|| nexium_gpu::tex_invalidate::region_gen_range(gpu_va, len as u64));
         return 0;
     }
-    match fetch_texture_snapshot(read_guest, gpu_va, len, cache_key, cache_owner) {
-        Some((data, generation, n, trusted_identity)) => {
+    match memoized_validated_texture_snapshot(prepared_snapshots, cache_key, || {
+        fetch_texture_snapshot(read_guest, gpu_va, len, cache_key, cache_owner)
+    }) {
+        Some((data, generation, _commit_generation, n, trusted_identity)) => {
             let trusted_data = Arc::downgrade(&data);
             snapshot.insert(gpu_va, data);
             generations.insert((gpu_va, len), generation);
@@ -6594,6 +6770,7 @@ fn prepare_draw_batch_async(
     read_guest: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
     snapshot_cache: &mut SsboSnapshotCache,
+    prepared_texture_snapshots: &mut PreparedTextureSnapshotMemo,
     ring_upper_bytes: u64,
     hard_after: bool,
 ) -> PreparedDrawBatch {
@@ -6819,6 +6996,7 @@ fn prepare_draw_batch_async(
                                 &mut snapshot,
                                 &mut snapshot_generations,
                                 &mut trusted_texture_snapshot_identities,
+                                prepared_texture_snapshots,
                                 read_guest,
                                 backing_gpu_va,
                                 read_size,
@@ -8801,6 +8979,12 @@ fn execute_one_inner(
     if rt.width == 0 || rt.height == 0 {
         return Err(format!("RT[{}] has zero extent", rt_slot));
     }
+    if rt.width > MAX_RT_DIMENSION || rt.height > MAX_RT_DIMENSION {
+        return Err(format!(
+            "RT[{}] has implausible extent {}x{}",
+            rt_slot, rt.width, rt.height
+        ));
+    }
     let rt_gpu_va = ((rt.address_hi as u64) << 32) | rt.address_lo as u64;
     let nvmap_id = mappings
         .nvmap_id_for(rt_gpu_va)
@@ -8874,13 +9058,8 @@ fn execute_one_inner(
         let do_stencil = want_stencil_clear && !no_depth && zeta_key.is_some();
         let depth_clear_key = zeta_key;
         let (depth_format, depth_aspects) = map_zeta_format(draw.zeta.format);
-        let mut clear_aspects = vk::ImageAspectFlags::empty();
-        if do_depth {
-            clear_aspects |= vk::ImageAspectFlags::DEPTH;
-        }
-        if do_stencil {
-            clear_aspects |= vk::ImageAspectFlags::STENCIL;
-        }
+        let clear_aspects =
+            effective_depth_stencil_clear_aspects(do_depth, do_stencil, depth_aspects);
         let combined_clear = can_coalesce_full_color_depth_clear(
             rt_key,
             want_color_clear,
@@ -16716,7 +16895,8 @@ mod tests {
         graphics_texture_layout_from_metadata, guest_write_alias_ranges,
         inferred_texture_image_kind, inline_graphics_clears_value_enabled,
         input_invalidation_pages, invalidate_snapshot_cache_guest_write_chunks, map_stencil_op,
-        map_zeta_format, maxwell_draw_orientation, memoized_prepared_tic_plan, move_into_chunks,
+        map_zeta_format, maxwell_draw_orientation, memoized_prepared_tic_plan,
+        memoized_validated_texture_snapshot_at_generations, move_into_chunks,
         normalize_guest_ranges, overlap_bytes, pack_cbuf_data, packed_cbuf_read_len,
         packed_cbuf_slot, packed_cbuf_word, plan_guest_write_chunks, prepare_index_data,
         prepare_index_data_cached, prepare_index_data_shared, range_contains, read_gpu_strict,
@@ -16796,6 +16976,28 @@ mod tests {
         for aspect in 0..6 {
             assert!(super::clear_surface_has_any_aspect(1 << aspect));
         }
+    }
+
+    #[test]
+    fn depth_stencil_clear_uses_only_aspects_present_in_the_attachment() {
+        use ash::vk;
+
+        assert_eq!(
+            super::effective_depth_stencil_clear_aspects(true, true, vk::ImageAspectFlags::DEPTH,),
+            vk::ImageAspectFlags::DEPTH
+        );
+        assert_eq!(
+            super::effective_depth_stencil_clear_aspects(
+                true,
+                true,
+                vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+            ),
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        );
+        assert_eq!(
+            super::effective_depth_stencil_clear_aspects(false, true, vk::ImageAspectFlags::DEPTH,),
+            vk::ImageAspectFlags::empty()
+        );
     }
 
     #[test]
@@ -20400,6 +20602,7 @@ mod tests {
         snapshot.insert(0x4000, std::sync::Arc::new(vec![0x5a; 0x100]));
         let mut generations = std::collections::HashMap::new();
         let mut trusted_identities = std::collections::HashMap::new();
+        let mut prepared_snapshots = std::collections::HashMap::new();
         let reads = std::cell::Cell::new(0usize);
         let read = |_: u64, len: usize| {
             reads.set(reads.get() + 1);
@@ -20411,6 +20614,7 @@ mod tests {
                 &mut snapshot,
                 &mut generations,
                 &mut trusted_identities,
+                &mut prepared_snapshots,
                 &read,
                 0x4000,
                 0x10,
@@ -20485,10 +20689,12 @@ mod tests {
         let mut snapshot = std::collections::HashMap::new();
         let mut generations = std::collections::HashMap::new();
         let mut trusted_identities = std::collections::HashMap::new();
+        let mut prepared_snapshots = std::collections::HashMap::new();
         let copied = snapshot_texture_once(
             &mut snapshot,
             &mut generations,
             &mut trusted_identities,
+            &mut prepared_snapshots,
             &read,
             plan.backing_gpu_va,
             plan.read_size,
@@ -20651,6 +20857,182 @@ mod tests {
         assert!(!second_read);
         assert!(std::sync::Arc::ptr_eq(&first, &second));
         assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn dredge_title_flushes_reuse_one_trusted_texture_validation_per_kick() {
+        const DREDGE_TITLE_FLUSHES_PER_KICK: usize = 19;
+        let key = TextureSnapshotCacheKey {
+            mapping_epoch: 3,
+            gpu_va: 0x4000,
+            len: 0x26_0000,
+            cpu_va: 0x10_4000,
+            nvmap_id: 7,
+        };
+        let data = std::sync::Arc::new(vec![0x5a; 16]);
+        let validations = std::cell::Cell::new(0usize);
+        let mut memo = std::collections::HashMap::new();
+
+        let first = memoized_validated_texture_snapshot_at_generations(
+            &mut memo,
+            Some(key),
+            Some((11, 17)),
+            || {
+                validations.set(validations.get() + 1);
+                Some((data.clone(), 11, 17, key.len, Some(13)))
+            },
+        )
+        .expect("first validated snapshot");
+        assert_eq!(
+            (first.1, first.2, first.3, first.4),
+            (11, 17, key.len, Some(13))
+        );
+        for _ in 1..DREDGE_TITLE_FLUSHES_PER_KICK {
+            let reused = memoized_validated_texture_snapshot_at_generations(
+                &mut memo,
+                Some(key),
+                Some((11, 17)),
+                || panic!("exact intra-kick hit revalidated"),
+            )
+            .expect("reused validated snapshot");
+            assert!(std::sync::Arc::ptr_eq(&first.0, &reused.0));
+            assert_eq!(
+                (reused.1, reused.2, reused.3, reused.4),
+                (11, 17, 0, Some(13))
+            );
+        }
+        assert_eq!(validations.get(), 1);
+
+        let gpu_changed = memoized_validated_texture_snapshot_at_generations(
+            &mut memo,
+            Some(key),
+            Some((12, 17)),
+            || {
+                validations.set(validations.get() + 1);
+                Some((data.clone(), 12, 17, key.len, Some(14)))
+            },
+        )
+        .expect("GPU write revalidated");
+        assert_eq!(
+            (gpu_changed.1, gpu_changed.2, gpu_changed.4),
+            (12, 17, Some(14))
+        );
+
+        let commit_changed = memoized_validated_texture_snapshot_at_generations(
+            &mut memo,
+            Some(key),
+            Some((12, 18)),
+            || {
+                validations.set(validations.get() + 1);
+                Some((data.clone(), 12, 18, key.len, Some(15)))
+            },
+        )
+        .expect("mapping commit revalidated");
+        assert_eq!(
+            (commit_changed.1, commit_changed.2, commit_changed.4),
+            (12, 18, Some(15))
+        );
+
+        let changed_key = TextureSnapshotCacheKey {
+            mapping_epoch: 4,
+            ..key
+        };
+        memoized_validated_texture_snapshot_at_generations(
+            &mut memo,
+            Some(changed_key),
+            Some((17, 23)),
+            || {
+                validations.set(validations.get() + 1);
+                Some((data.clone(), 17, 23, changed_key.len, Some(19)))
+            },
+        )
+        .expect("changed mapping revalidated");
+
+        let untrusted_key = TextureSnapshotCacheKey {
+            gpu_va: 0x8000,
+            cpu_va: 0x10_8000,
+            ..key
+        };
+        for _ in 0..2 {
+            memoized_validated_texture_snapshot_at_generations(
+                &mut memo,
+                Some(untrusted_key),
+                Some((23, 29)),
+                || {
+                    validations.set(validations.get() + 1);
+                    Some((data.clone(), 23, 29, untrusted_key.len, None))
+                },
+            )
+            .expect("untrusted snapshot remains usable");
+        }
+
+        let mut next_kick = std::collections::HashMap::new();
+        memoized_validated_texture_snapshot_at_generations(
+            &mut next_kick,
+            Some(key),
+            Some((29, 31)),
+            || {
+                validations.set(validations.get() + 1);
+                Some((data.clone(), 29, 31, key.len, Some(31)))
+            },
+        )
+        .expect("next kickoff revalidates");
+        assert_eq!(validations.get(), 7);
+    }
+
+    #[test]
+    fn kick_texture_memo_invalidates_unversioned_gpu_and_cpu_alias_writes() {
+        let mut mappings = crate::gpu::GpuMappings::new();
+        mappings.add(0x7abc_0000, 0x1000, 0x9000_0000, 1);
+        mappings.add(0x5000_0000, 0x1000, 0x9000_0000, 1);
+        let direct = TextureSnapshotCacheKey {
+            mapping_epoch: mappings.mapping_epoch_for(0x7abc_0200).unwrap(),
+            gpu_va: 0x7abc_0200,
+            len: 0x100,
+            cpu_va: 0x9000_0200,
+            nvmap_id: 1,
+        };
+        let disjoint = TextureSnapshotCacheKey {
+            gpu_va: 0x7abc_0600,
+            cpu_va: 0x9000_0600,
+            ..direct
+        };
+        let data = Arc::new(vec![0x5a; 16]);
+        let mut cache = SsboSnapshotCache::default();
+        fn seed(
+            cache: &mut SsboSnapshotCache,
+            key: TextureSnapshotCacheKey,
+            data: &Arc<Vec<u8>>,
+            identity: u64,
+        ) {
+            memoized_validated_texture_snapshot_at_generations(
+                &mut cache.prepared_texture_snapshots,
+                Some(key),
+                Some((11, 13)),
+                || Some((data.clone(), 11, 13, key.len, Some(identity))),
+            )
+            .unwrap();
+        }
+
+        seed(&mut cache, direct, &data, 17);
+        seed(&mut cache, disjoint, &data, 19);
+        cache.invalidate_gpu_write(&mappings, 0x5000_0240, 4);
+        assert!(!cache.prepared_texture_snapshots.contains_key(&direct));
+        assert!(cache.prepared_texture_snapshots.contains_key(&disjoint));
+
+        seed(&mut cache, direct, &data, 23);
+        cache.defer_gpu_writes(&[(direct.gpu_va + 0x40, 4)]);
+        assert!(!cache.prepared_texture_snapshots.contains_key(&direct));
+        assert!(cache.prepared_texture_snapshots.contains_key(&disjoint));
+
+        seed(&mut cache, direct, &data, 29);
+        cache.defer_patched_gpu_writes(&[(0x1234, direct.cpu_va + 0x80, 4)]);
+        assert!(!cache.prepared_texture_snapshots.contains_key(&direct));
+        assert!(cache.prepared_texture_snapshots.contains_key(&disjoint));
+
+        seed(&mut cache, direct, &data, 31);
+        cache.reset_epoch();
+        assert!(cache.prepared_texture_snapshots.is_empty());
     }
 
     #[test]

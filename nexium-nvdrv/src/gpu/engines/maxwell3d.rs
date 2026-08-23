@@ -1224,7 +1224,10 @@ impl Maxwell3D {
                 } else {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static N: AtomicU32 = AtomicU32::new(0);
-                    if operation != 0 || N.fetch_add(1, Ordering::Relaxed) < 12 {
+                    if operation != 0
+                        || N.fetch_add(1, Ordering::Relaxed) < 12
+                        || std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some()
+                    {
                         log::info!(
                             "maxwell3d: REPORT_SEMAPHORE arg={:#x} op={} gpu_va={:#x} payload={:#x}",
                             arg,
@@ -2315,10 +2318,27 @@ impl Maxwell3D {
     }
 
     pub fn render_target(&self, idx: usize) -> Option<&RenderTarget> {
-        self.regs
-            .rt
-            .get(idx)
-            .filter(|rt| rt.width > 0 && rt.height > 0)
+        const MAX_RT_DIMENSION: u32 = 32768;
+        let rt = self.regs.rt.get(idx)?;
+        if rt.width == 0 || rt.height == 0 {
+            return None;
+        }
+        if rt.width > MAX_RT_DIMENSION || rt.height > MAX_RT_DIMENSION {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n % 4096 == 0 {
+                log::warn!(
+                    "maxwell3d: rejecting render target {} with implausible size {}x{} (n={})",
+                    idx,
+                    rt.width,
+                    rt.height,
+                    n + 1
+                );
+            }
+            return None;
+        }
+        Some(rt)
     }
 
     pub fn primary_rt_gpu_va(&self) -> Option<u64> {
