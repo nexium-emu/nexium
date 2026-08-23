@@ -2,6 +2,7 @@ use super::{Kernel, MUTEX_HAS_LISTENERS};
 use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
 use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
+use crate::services::audio_renderer::behavior as audren_behavior;
 use crate::kernel::{
     present_delivery_lane, AudioAdpcmContext, AudioAdpcmDecodeState, AudioAdpcmStreamKey,
     AudioRendererState, PresentDeliveryLanes, PresentMetadata, PresentMetadataQueue,
@@ -5038,6 +5039,17 @@ fn dispatch_service_v2(
         let sink_count = read_u32(0x14);
         let effect_count = read_u32(0x18);
         let revision = read_u32(0x30);
+        let revision_num = if audren_behavior::check_valid_revision(revision) {
+            audren_behavior::get_revision_num(revision)
+        } else {
+            log::warn!(
+                "audren:u OpenAudioRenderer unsupported revision {:#x} (decodes to {}); clamping to REV{}",
+                revision,
+                audren_behavior::get_revision_num(revision),
+                audren_behavior::CURRENT_REVISION
+            );
+            audren_behavior::CURRENT_REVISION
+        };
 
         let state = AudioRendererState {
             sample_rate,
@@ -5047,6 +5059,7 @@ fn dispatch_service_v2(
             sink_count,
             effect_count,
             revision,
+            revision_num,
             state: 1,
             rendering_time_limit: 100,
             voice_drop_param: 1.0,
@@ -5066,13 +5079,14 @@ fn dispatch_service_v2(
             .map(|s| s.is_domain)
             .unwrap_or(false);
         log::debug!(
-            "audren:u OpenAudioRenderer sr={} samples={} voices={} sinks={} effects={} rev={:#x} â†’ IAudioRenderer (domain={})",
+            "audren:u OpenAudioRenderer sr={} samples={} voices={} sinks={} effects={} rev={:#x} REV{} â†’ IAudioRenderer (domain={})",
             sample_rate,
             sample_count,
             voice_count,
             sink_count,
             effect_count,
             revision,
+            revision_num,
             is_domain
         );
 
@@ -5163,7 +5177,8 @@ fn dispatch_service_v2(
                 voice_count: 0,
                 sink_count: 0,
                 effect_count: 0,
-                revision: 0,
+                revision: audren_behavior::encode_revision(audren_behavior::CURRENT_REVISION),
+                revision_num: audren_behavior::CURRENT_REVISION,
                 state: 1,
                 rendering_time_limit: 100,
                 voice_drop_param: 1.0,
@@ -5204,6 +5219,7 @@ fn dispatch_service_v2(
                 let (out_buf, perf_buf) =
                     audio_renderer_output_slots(cmd_id, &ctx.recv_buffers, &ctx.recv_statics);
                 let revision = st.revision;
+                let revision_num = st.revision_num;
                 let voice_drop_param = st.voice_drop_param;
                 let frame = kernel.audio_renderer_frame_counter;
 
@@ -5212,8 +5228,10 @@ fn dispatch_service_v2(
                 let mut in_voices_sz: u64 = 0;
                 let mut in_channels_sz: u64 = 0;
                 let mut in_effects_sz: u64 = 0;
+                let mut in_mixes_sz: u64 = 0;
                 let mut in_sinks_sz: u64 = 0;
                 let mut in_perf_sz: u64 = 0;
+                let mut in_behavior_param: Option<audren_behavior::InParameter> = None;
                 let mut mempool_in_states: Vec<u32> = Vec::new();
                 if let Some(ib) = in_buf {
                     let mut hdr = [0u8; 0x40];
@@ -5229,8 +5247,19 @@ fn dispatch_service_v2(
                         in_voices_sz = rd(0x0C);
                         in_channels_sz = rd(0x10);
                         in_effects_sz = rd(0x14);
+                        in_mixes_sz = rd(0x18);
                         in_sinks_sz = rd(0x1C);
                         in_perf_sz = rd(0x20);
+                    }
+                    if in_behavior_sz as usize >= audren_behavior::IN_PARAMETER_SIZE {
+                        let mut block = [0u8; audren_behavior::IN_PARAMETER_SIZE];
+                        if kernel
+                            .address_space
+                            .read(ib.addr.wrapping_add(0x40), &mut block)
+                            .is_ok()
+                        {
+                            in_behavior_param = audren_behavior::InParameter::parse(&block);
+                        }
                     }
                     if in_mempools_sz > 0 {
                         let mempool_count = (in_mempools_sz / 0x20) as usize;
@@ -6048,11 +6077,15 @@ fn dispatch_service_v2(
                 }
 
                 if let Some(ob) = out_buf {
-                    let rev_num = if revision >= 0x100 {
-                        revision.wrapping_sub(0x3056_4552) >> 24
-                    } else {
-                        revision
-                    };
+                    let mut behavior =
+                        audren_behavior::BehaviorInfo::from_user_revision(revision_num);
+                    behavior.clear_error();
+                    if let Some(param) = in_behavior_param {
+                        if audren_behavior::check_valid_revision(param.revision) {
+                            behavior.set_user_lib_revision(param.revision);
+                        }
+                        behavior.update_flags(param.flags);
+                    }
                     let mempool_out_count = mempool_count;
                     let voice_out_count = voice_count_seen;
                     let effect_out_count = effect_count_seen;
@@ -6060,12 +6093,20 @@ fn dispatch_service_v2(
 
                     let mempools_sz: u32 = (mempool_out_count as u32) * 0x10;
                     let voices_sz: u32 = (voice_out_count as u32) * 0x10;
-                    let effect_status_size: u32 = if rev_num >= 9 { 0x90 } else { 0x10 };
+                    let effect_status_size: u32 = if behavior.is_effect_info_version2_supported() {
+                        0x90
+                    } else {
+                        0x10
+                    };
                     let effects_sz: u32 = (effect_out_count as u32) * effect_status_size;
                     let sinks_sz: u32 = (sink_out_count as u32) * 0x20;
                     let perf_sz: u32 = if in_perf_sz == 0 { 0 } else { 0x10 };
-                    let behaviour_sz: u32 = 0xB0;
-                    let render_info_sz: u32 = if rev_num >= 5 { 0x10 } else { 0 };
+                    let behaviour_sz: u32 = audren_behavior::OUT_STATUS_SIZE as u32;
+                    let render_info_sz: u32 = if behavior.is_elapsed_frame_count_supported() {
+                        0x10
+                    } else {
+                        0
+                    };
 
                     let mempools_off = 0x40usize;
                     let voices_off = mempools_off + mempools_sz as usize;
@@ -6080,7 +6121,9 @@ fn dispatch_service_v2(
                     out[0x04..0x08].copy_from_slice(&behaviour_sz.to_le_bytes());
                     out[0x08..0x0C].copy_from_slice(&mempools_sz.to_le_bytes());
                     out[0x0C..0x10].copy_from_slice(&voices_sz.to_le_bytes());
+                    out[0x10..0x14].copy_from_slice(&(in_channels_sz as u32).to_le_bytes());
                     out[0x14..0x18].copy_from_slice(&effects_sz.to_le_bytes());
+                    out[0x18..0x1C].copy_from_slice(&(in_mixes_sz as u32).to_le_bytes());
                     out[0x1C..0x20].copy_from_slice(&sinks_sz.to_le_bytes());
                     out[0x20..0x24].copy_from_slice(&perf_sz.to_le_bytes());
                     out[0x28..0x2C].copy_from_slice(&render_info_sz.to_le_bytes());
@@ -6107,6 +6150,9 @@ fn dispatch_service_v2(
                         let off = effects_off + i * effect_status_size as usize;
                         out[off] = state;
                     }
+                    behavior
+                        .out_status()
+                        .write_to(&mut out[behaviour_off..behaviour_off + behaviour_sz as usize]);
                     if render_info_sz != 0 {
                         out[render_info_off..render_info_off + 8]
                             .copy_from_slice(&frame.to_le_bytes());

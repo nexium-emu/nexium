@@ -244,6 +244,7 @@ pub struct AudioRendererState {
     pub sink_count: u32,
     pub effect_count: u32,
     pub revision: u32,
+    pub revision_num: u32,
     pub state: u32,
     pub rendering_time_limit: u32,
     pub voice_drop_param: f32,

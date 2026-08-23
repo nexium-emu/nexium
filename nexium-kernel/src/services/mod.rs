@@ -10,6 +10,7 @@ pub mod application_functions;
 pub mod audio;
 pub mod audio_controller;
 pub mod audio_out;
+pub mod audio_renderer;
 pub mod base;
 pub mod binder_driver;
 pub mod bsd;
