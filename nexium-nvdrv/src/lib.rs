@@ -1,10 +1,14 @@
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub(crate) fn syncpoint_reached(current: u32, threshold: u32) -> bool {
     current.wrapping_sub(threshold) < 0x8000_0000
+}
+
+pub(crate) fn syncpoint_expired(min: u32, max: u32, threshold: u32) -> bool {
+    max.wrapping_sub(threshold) >= min.wrapping_sub(threshold)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,20 +294,129 @@ pub mod bufferqueue;
 pub mod gpu;
 pub mod render_thread;
 pub mod video_decode;
+pub mod video_decode_thread;
 pub mod video_ffmpeg;
 pub mod video_host1x;
 pub mod video_surface;
 pub mod video_vp9;
 pub use bufferqueue::{BufferQueue, GraphicBuffer, QueuedFrame};
 pub use gpu::GpuContext;
+pub use nexium_gpu::{
+    PipelinedPresentCompletion, PipelinedPresentFrame, PipelinedPresentReadback,
+    PipelinedPresentSubmission,
+};
+
+pub const FRAME_QUEUE_CAPACITY: usize = 4;
+
+pub struct FrameQueueState {
+    frames: Mutex<VecDeque<QueuedFrame>>,
+    frame_available: Condvar,
+    space_available: Condvar,
+    closed: AtomicBool,
+}
+
+impl FrameQueueState {
+    pub fn new() -> Self {
+        Self {
+            frames: Mutex::new(VecDeque::new()),
+            frame_available: Condvar::new(),
+            space_available: Condvar::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn enqueue(&self, frame: QueuedFrame) -> bool {
+        let mut frames = self.frames.lock();
+        while frames.len() >= FRAME_QUEUE_CAPACITY {
+            if self.closed.load(Ordering::Acquire) {
+                return false;
+            }
+            self.space_available.wait(&mut frames);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        frames.push_back(frame);
+        drop(frames);
+        self.frame_available.notify_one();
+        true
+    }
+
+    fn pop_front_due(&self, now: std::time::Instant) -> Option<QueuedFrame> {
+        let mut frames = self.frames.lock();
+        let is_due = frames
+            .front()
+            .and_then(|frame| frame.present_at)
+            .is_none_or(|deadline| deadline <= now);
+        let frame = is_due.then(|| frames.pop_front()).flatten();
+        drop(frames);
+        if frame.is_some() {
+            self.space_available.notify_one();
+        }
+        frame
+    }
+
+    pub fn wait_pop_front_due(&self, stopping: impl Fn() -> bool) -> Option<QueuedFrame> {
+        const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+        let mut frames = self.frames.lock();
+        loop {
+            if stopping() || self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            let Some(front) = frames.front() else {
+                self.frame_available.wait_for(&mut frames, STOP_POLL);
+                continue;
+            };
+            let now = std::time::Instant::now();
+            if let Some(deadline) = front.present_at.filter(|deadline| *deadline > now) {
+                self.frame_available
+                    .wait_for(&mut frames, (deadline - now).min(STOP_POLL));
+                continue;
+            }
+            let frame = frames.pop_front();
+            drop(frames);
+            self.space_available.notify_one();
+            return frame;
+        }
+    }
+
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.frame_available.notify_all();
+        self.space_available.notify_all();
+    }
+
+    fn drain(&self) -> Vec<QueuedFrame> {
+        let frames: Vec<_> = std::mem::take(&mut *self.frames.lock())
+            .into_iter()
+            .collect();
+        if !frames.is_empty() {
+            self.space_available.notify_all();
+        }
+        frames
+    }
+
+    fn len(&self) -> usize {
+        self.frames.lock().len()
+    }
+}
+
+pub type FrameQueue = Arc<FrameQueueState>;
+
+pub fn enqueue_bounded_frame(frame_queue: &FrameQueue, stats: &PipelineStats, frame: QueuedFrame) {
+    if frame_queue.enqueue(frame) {
+        stats.frames_submitted.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 struct VideoChannelRuntime {
     parser: video_host1x::VideoHost1xParser,
     decoder: Option<openh264::decoder::Decoder>,
-    ffmpeg: Option<video_ffmpeg::FfmpegDecoder>,
-    ffmpeg_failed: bool,
+    ffmpeg_config: Option<(video_ffmpeg::FfmpegCodec, u32, u32)>,
+    ffmpeg_failed: Arc<std::sync::atomic::AtomicBool>,
     composer: video_decode::H264AnnexBComposer,
     vp9_composer: video_vp9::Vp9FrameComposer,
+    vp9_packet_target: Option<u64>,
     vp9_unavailable_logged: bool,
 }
 
@@ -317,13 +430,20 @@ impl VideoChannelRuntime {
         Self {
             parser: video_host1x::VideoHost1xParser::new(initial_class),
             decoder: None,
-            ffmpeg: None,
-            ffmpeg_failed: false,
+            ffmpeg_config: None,
+            ffmpeg_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             composer: video_decode::H264AnnexBComposer::new(),
             vp9_composer: video_vp9::Vp9FrameComposer::new(),
+            vp9_packet_target: None,
             vp9_unavailable_logged: false,
         }
     }
+}
+
+fn next_vp9_packet_target(pending_target: &mut Option<u64>, current_target: u64) -> u64 {
+    pending_target
+        .replace(current_target)
+        .unwrap_or(current_target)
 }
 
 fn debug_giant_entries(
@@ -593,6 +713,44 @@ fn async_present_inflight_limit() -> usize {
             .filter(|count| (1..=3).contains(count))
             .unwrap_or(2)
     })
+}
+
+#[cfg(test)]
+fn reserve_ordered_present_slot(pending: &std::sync::atomic::AtomicUsize, limit: usize) {
+    let _ = reserve_ordered_present_slot_until(pending, limit, || false);
+}
+
+fn reserve_ordered_present_slot_until(
+    pending: &std::sync::atomic::AtomicUsize,
+    limit: usize,
+    stopping: impl Fn() -> bool,
+) -> bool {
+    let waited_from = std::time::Instant::now();
+    let mut next_report = std::time::Duration::from_millis(250);
+    loop {
+        if stopping() {
+            return false;
+        }
+        if pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
+                (inflight < limit).then_some(inflight + 1)
+            })
+            .is_ok()
+        {
+            return true;
+        }
+        let waited = waited_from.elapsed();
+        if waited >= next_report {
+            log::warn!(
+                "[ordered-present] FIFO backpressure pending={} limit={} waited_ms={:.1}",
+                pending.load(Ordering::Acquire),
+                limit,
+                waited.as_secs_f64() * 1000.0,
+            );
+            next_report = next_report.saturating_add(std::time::Duration::from_secs(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 struct AsyncGpuPendingGuard {
@@ -996,7 +1154,7 @@ pub struct Nvdrv {
     pub next_nvmap_id: u32,
     pub bufferqueues: Arc<Mutex<HashMap<u32, BufferQueue>>>,
     pub bufferqueue_state_generation: Arc<AtomicU64>,
-    pub frame_queue: Arc<Mutex<Vec<QueuedFrame>>>,
+    pub frame_queue: FrameQueue,
     pub next_event_id: u32,
     pub next_syncpoint_id: u32,
     pub retired_syncpts: Arc<Mutex<HashMap<u32, (u32, u32)>>>,
@@ -1009,11 +1167,10 @@ pub struct Nvdrv {
     pub stats: Arc<PipelineStats>,
     pub channel_client_data: u64,
     video_channels: HashMap<u32, VideoChannelRuntime>,
-    video_frames: HashMap<u64, video_decode::OwnedI420Frame>,
-    video_frame_order: VecDeque<u64>,
+    video_decoder: video_decode_thread::VideoDecoder,
     pub legacy_gfx: std::sync::atomic::AtomicBool,
     pub renderer: std::sync::OnceLock<Option<Arc<nexium_gpu::Renderer>>>,
-    gpu_async: Option<AsyncGpuQueue>,
+    gpu_async: Option<Arc<AsyncGpuQueue>>,
     async_present_pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -1028,7 +1185,7 @@ impl Nvdrv {
             next_nvmap_id: 1,
             bufferqueues: Arc::new(Mutex::new(HashMap::new())),
             bufferqueue_state_generation,
-            frame_queue: Arc::new(Mutex::new(Vec::new())),
+            frame_queue: Arc::new(FrameQueueState::new()),
             next_event_id: 1,
             next_syncpoint_id: 1,
             retired_syncpts: Arc::new(Mutex::new(HashMap::new())),
@@ -1041,8 +1198,7 @@ impl Nvdrv {
             stats,
             channel_client_data: 0,
             video_channels: HashMap::new(),
-            video_frames: HashMap::new(),
-            video_frame_order: VecDeque::new(),
+            video_decoder: video_decode_thread::VideoDecoder::new(),
             legacy_gfx: std::sync::atomic::AtomicBool::new(false),
             renderer: std::sync::OnceLock::new(),
             gpu_async: None,
@@ -1051,7 +1207,7 @@ impl Nvdrv {
     }
 
     pub fn frame_queue_depth(&self) -> usize {
-        self.frame_queue.lock().len()
+        self.frame_queue.len()
     }
 
     pub fn renderer(&self) -> Option<&Arc<nexium_gpu::Renderer>> {
@@ -1102,12 +1258,12 @@ impl Nvdrv {
         }
         if self.gpu_async.is_none() {
             log::info!("nexium-nvdrv: async GPU submit thread ENABLED");
-            self.gpu_async = Some(AsyncGpuQueue::new(
+            self.gpu_async = Some(Arc::new(AsyncGpuQueue::new(
                 Arc::clone(&self.gpu),
                 mem_read,
                 mem_write,
                 mem_copy,
-            ));
+            )));
         }
     }
 
@@ -1159,28 +1315,28 @@ impl Nvdrv {
         F: FnOnce() + Send + 'static,
     {
         let limit = async_present_inflight_limit();
-        if self
-            .async_present_pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
-                (inflight < limit).then_some(inflight + 1)
-            })
-            .is_err()
-        {
-            return AsyncPresentSubmit::Coalesced;
-        }
-        let present = guarded_present_job(Arc::clone(&self.async_present_pending), present);
-        let queued = if let Some(queue) = &self.gpu_async {
-            queue.submit(AsyncGpuSubmission::Present(present))
-        } else if let Some(render_thread) = crate::render_thread::maybe_render_thread() {
-            render_thread.submit_timeout_named(
-                "ordered-present-readback",
-                present,
-                std::time::Duration::from_secs(3),
-            )
-        } else {
-            present();
-            true
-        };
+        let submit: Box<dyn FnOnce(&'static str, crate::render_thread::RenderJob) + Send> =
+            if let Some(queue) = &self.gpu_async {
+                let queue = Arc::clone(queue);
+                Box::new(move |_label, job| {
+                    let _ = queue.submit(AsyncGpuSubmission::Present(job));
+                })
+            } else {
+                Box::new(move |label, job| {
+                    if let Some(render_thread) = crate::render_thread::maybe_render_thread() {
+                        render_thread.submit_named(label, job);
+                    } else if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                        log::error!("[ordered-present] job panicked; dispatcher continuing");
+                    }
+                })
+            };
+        let queued = crate::render_thread::present_thread().submit_ordered_named(
+            Arc::clone(&self.async_present_pending),
+            limit,
+            "ordered-present-readback",
+            Box::new(present),
+            submit,
+        );
         if queued {
             AsyncPresentSubmit::Enqueued
         } else {
@@ -1196,7 +1352,7 @@ impl Nvdrv {
             for id in pending_engine_incrs {
                 if let Some(channel) = channels.values_mut().find(|c| c.syncpt_id == id) {
                     channel.syncpt_min = channel.syncpt_min.wrapping_add(1);
-                    if syncpoint_reached(channel.syncpt_max, channel.syncpt_min) {
+                    if !syncpoint_reached(channel.syncpt_max, channel.syncpt_min) {
                         channel.syncpt_max = channel.syncpt_min;
                     }
                 }
@@ -1279,7 +1435,10 @@ impl Nvdrv {
 
     pub fn close(&mut self, fd: u32) {
         self.files.remove(&fd);
-        self.video_channels.remove(&fd);
+        if self.video_channels.remove(&fd).is_some() {
+            self.video_decoder
+                .submit(video_decode_thread::DecodeWork::Release { fd });
+        }
         if let Some(channel) = self.gpu.channels.lock().remove(&fd) {
             if channel.syncpt_id != 0 {
                 self.retired_syncpts
@@ -1310,8 +1469,21 @@ impl Nvdrv {
         }
         channel.syncpt_max = channel.syncpt_max.wrapping_add(increment);
         let threshold = channel.syncpt_max;
+        let min = channel.syncpt_min;
         drop(channels);
         self.ordered_submit_max.insert(syncpt_id, threshold);
+        if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+            log::info!(
+                "[syncpt] reserve fd={} flags={:#x} incr_value={} incr={} id={} min={} max={}",
+                fd,
+                flags,
+                increment_value,
+                increment,
+                syncpt_id,
+                min,
+                threshold
+            );
+        }
         (syncpt_id, threshold)
     }
 
@@ -1389,6 +1561,14 @@ impl Nvdrv {
         channel.syncpt_min = threshold;
     }
 
+    fn submit_emits_increments(flags: u32) -> bool {
+        static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *EAGER.get_or_init(|| std::env::var_os("NEXIUM_EAGER_SUBMIT_FENCE").is_some()) {
+            return true;
+        }
+        flags & (1 << 1) != 0
+    }
+
     fn channel_submit_completion(
         &self,
         fd: u32,
@@ -1455,15 +1635,44 @@ impl Nvdrv {
 
     pub fn is_syncpoint_reached(&self, id: u32, threshold: u32) -> bool {
         self.poll_gpu_completions();
-        syncpoint_reached(self.syncpoint_value(id), threshold)
+        let min = self.syncpoint_value(id);
+        if syncpoint_reached(min, threshold) {
+            return true;
+        }
+        let max = self.syncpoint_max(id);
+        if syncpoint_expired(min, max, threshold) {
+            static UNREACHABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = UNREACHABLE.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n % 4096 == 0 {
+                log::warn!(
+                    "[syncpt] threshold beyond reserved max treated as expired id={} threshold={} min={} max={} (n={})",
+                    id,
+                    threshold,
+                    min,
+                    max,
+                    n + 1
+                );
+            }
+            return true;
+        }
+        false
     }
 
     pub fn queue_buffer_fence_disposition(&self, id: u32, threshold: u32) -> FenceWaitDisposition {
-        let disposition = classify_submit_fence_wait(
-            self.syncpoint_value(id),
-            self.ordered_submit_max.get(&id).copied(),
-            threshold,
-        );
+        let current = self.syncpoint_value(id);
+        let ordered = self.ordered_submit_max.get(&id).copied();
+        let disposition = classify_submit_fence_wait(current, ordered, threshold);
+        if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+            log::info!(
+                "[syncpt] queue-fence id={} threshold={} current={} ordered_max={:?} max={} -> {:?}",
+                id,
+                threshold,
+                current,
+                ordered,
+                self.syncpoint_max(id),
+                disposition
+            );
+        }
         Self::queue_buffer_fence_stat(disposition);
         disposition
     }
@@ -1823,88 +2032,66 @@ impl Nvdrv {
             }
         };
 
-        if runtime
-            .ffmpeg
-            .as_ref()
-            .is_some_and(|decoder| decoder.codec() != video_ffmpeg::FfmpegCodec::H264)
+        let picture_index = context.parameter_set.current_picture_index as usize;
+        let Some(surface_register) = registers.get(SURFACE_LUMA_BASE_METHOD + picture_index) else {
+            log::warn!(
+                "[video-decode] fd={} invalid picture index {}",
+                fd,
+                picture_index
+            );
+            return;
+        };
+        let luma_iova = (u64::from(*surface_register) << 8)
+            .wrapping_add(u64::from(context.parameter_set.luma_frame_offset));
+
+        let ffmpeg_dims = if video_ffmpeg::enabled() && !runtime.ffmpeg_failed.load(Ordering::Relaxed)
         {
-            runtime.ffmpeg = None;
-        }
-        let mut ffmpeg_frame: Option<video_decode::OwnedI420Frame> = None;
-        if video_ffmpeg::enabled() && !runtime.ffmpeg_failed {
-            if runtime.ffmpeg.is_none() {
-                let dims = context
-                    .frame_width()
-                    .and_then(|width| context.frame_height().map(|height| (width, height)));
-                match dims {
-                    Ok((width, height)) => match video_ffmpeg::FfmpegDecoder::new(
+            match context
+                .frame_width()
+                .and_then(|width| context.frame_height().map(|height| (width, height)))
+            {
+                Ok(dims) => Some(dims),
+                Err(error) => {
+                    log::warn!(
+                        "[video-decode] fd={} ffmpeg dims unavailable ({}), using OpenH264",
+                        fd,
+                        error
+                    );
+                    runtime.ffmpeg_failed.store(true, Ordering::Relaxed);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some((width, height)) = ffmpeg_dims {
+            let config = (video_ffmpeg::FfmpegCodec::H264, width, height);
+            if runtime.ffmpeg_config != Some(config) {
+                runtime.ffmpeg_config = Some(config);
+                self.video_decoder
+                    .submit(video_decode_thread::DecodeWork::Configure {
+                        fd,
+                        codec: video_ffmpeg::FfmpegCodec::H264,
                         width,
                         height,
-                        video_ffmpeg::FfmpegCodec::H264,
-                    ) {
-                        Ok(decoder) => {
-                            log::info!(
-                                "[video-decode] fd={} ffmpeg software decoder {}x{}",
-                                fd,
-                                width,
-                                height
-                            );
-                            runtime.ffmpeg = Some(decoder);
-                        }
-                        Err(error) => {
-                            log::warn!(
-                                "[video-decode] fd={} ffmpeg init failed ({}), using OpenH264",
-                                fd,
-                                error
-                            );
-                            runtime.ffmpeg_failed = true;
-                        }
+                        failed: runtime.ffmpeg_failed.clone(),
+                    });
+            }
+            self.video_decoder
+                .submit(video_decode_thread::DecodeWork::Packet {
+                    fd,
+                    packet,
+                    target_luma_iova: luma_iova,
+                    detail: video_decode_thread::PacketDetail::H264 {
+                        picture_index: picture_index as u32,
+                        guest_frame: context.parameter_set.frame_number,
                     },
-                    Err(error) => {
-                        log::warn!(
-                            "[video-decode] fd={} ffmpeg dims unavailable ({}), using OpenH264",
-                            fd,
-                            error
-                        );
-                        runtime.ffmpeg_failed = true;
-                    }
-                }
-            }
-            if let Some(decoder) = runtime.ffmpeg.as_mut() {
-                match decoder.decode(&packet, true) {
-                    Ok(Some(raw)) => {
-                        match video_ffmpeg::i420_frame(decoder.width(), decoder.height(), &raw) {
-                            Ok(frame) => ffmpeg_frame = Some(frame),
-                            Err(error) => {
-                                log::warn!(
-                                    "[video-decode] fd={} ffmpeg frame invalid ({}), using OpenH264",
-                                    fd,
-                                    error
-                                );
-                                runtime.ffmpeg = None;
-                                runtime.ffmpeg_failed = true;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        log::debug!("[video-decode] fd={} ffmpeg needs more data", fd);
-                        return;
-                    }
-                    Err(error) => {
-                        log::warn!(
-                            "[video-decode] fd={} ffmpeg decode failed ({}), using OpenH264",
-                            fd,
-                            error
-                        );
-                        runtime.ffmpeg = None;
-                        runtime.ffmpeg_failed = true;
-                    }
-                }
-            }
+                });
+            return;
         }
-        let frame = if let Some(frame) = ffmpeg_frame {
-            frame
-        } else {
+
+        let frame = {
             if runtime.decoder.is_none() {
                 match openh264::decoder::Decoder::new(openh264::OpenH264API::from_source()) {
                     Ok(decoder) => runtime.decoder = Some(decoder),
@@ -1947,25 +2134,7 @@ impl Nvdrv {
         };
         let (width, height) = (frame.width(), frame.height());
 
-        let picture_index = context.parameter_set.current_picture_index as usize;
-        let Some(surface_register) = registers.get(SURFACE_LUMA_BASE_METHOD + picture_index) else {
-            log::warn!(
-                "[video-decode] fd={} invalid picture index {}",
-                fd,
-                picture_index
-            );
-            return;
-        };
-        let luma_iova = (u64::from(*surface_register) << 8)
-            .wrapping_add(u64::from(context.parameter_set.luma_frame_offset));
-        self.video_frames.insert(luma_iova, frame);
-        self.video_frame_order.retain(|key| *key != luma_iova);
-        self.video_frame_order.push_back(luma_iova);
-        while self.video_frame_order.len() > 32 {
-            if let Some(old_key) = self.video_frame_order.pop_front() {
-                self.video_frames.remove(&old_key);
-            }
-        }
+        video_decode_thread::lock_frame_cache(self.video_decoder.cache()).insert(luma_iova, frame);
 
         static DECODED_FRAMES: AtomicU64 = AtomicU64::new(0);
         let frame_index = DECODED_FRAMES.fetch_add(1, Ordering::Relaxed);
@@ -2112,86 +2281,37 @@ impl Nvdrv {
                 );
             }
         }
+        let config = (video_ffmpeg::FfmpegCodec::Vp9, width, height);
+        if runtime.ffmpeg_config != Some(config) {
+            runtime.ffmpeg_config = Some(config);
+            runtime.vp9_packet_target = None;
+            runtime.ffmpeg_failed
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.video_decoder
+                .submit(video_decode_thread::DecodeWork::Configure {
+                    fd,
+                    codec: video_ffmpeg::FfmpegCodec::Vp9,
+                    width,
+                    height,
+                    failed: runtime.ffmpeg_failed.clone(),
+                });
+        }
+        if runtime.ffmpeg_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+
+        let current_luma_iova = u64::from(registers[SURFACE_LUMA_BASE_METHOD + 3]) << 8;
+        let packet_luma_iova =
+            next_vp9_packet_target(&mut runtime.vp9_packet_target, current_luma_iova);
         let (packet, show_frame) = runtime.vp9_composer.compose(info, bitstream, &seg_probs);
 
-        if runtime.ffmpeg.as_ref().is_some_and(|decoder| {
-            decoder.codec() != video_ffmpeg::FfmpegCodec::Vp9
-                || decoder.width() != width
-                || decoder.height() != height
-        }) {
-            runtime.ffmpeg = None;
-        }
-        if runtime.ffmpeg.is_none() {
-            match video_ffmpeg::FfmpegDecoder::new(width, height, video_ffmpeg::FfmpegCodec::Vp9) {
-                Ok(decoder) => {
-                    log::info!(
-                        "[video-decode] fd={} ffmpeg vp9 software decoder {}x{}",
-                        fd,
-                        width,
-                        height
-                    );
-                    runtime.ffmpeg = Some(decoder);
-                }
-                Err(error) => {
-                    log::warn!("[video-decode] fd={} vp9 ffmpeg init failed: {}", fd, error);
-                    return;
-                }
-            }
-        }
-        let decoder = runtime.ffmpeg.as_mut().unwrap();
-        let raw = match decoder.decode(&packet, show_frame) {
-            Ok(Some(raw)) => raw,
-            Ok(None) => {
-                log::debug!(
-                    "[video-decode] fd={} vp9 ffmpeg needs more data (show={})",
-                    fd,
-                    show_frame
-                );
-                return;
-            }
-            Err(error) => {
-                log::warn!(
-                    "[video-decode] fd={} vp9 ffmpeg decode failed: {}",
-                    fd,
-                    error
-                );
-                runtime.ffmpeg = None;
-                return;
-            }
-        };
-        let frame = match video_ffmpeg::i420_frame(width, height, &raw) {
-            Ok(frame) => frame,
-            Err(error) => {
-                log::warn!("[video-decode] fd={} vp9 frame invalid: {}", fd, error);
-                runtime.ffmpeg = None;
-                return;
-            }
-        };
-
-        let luma_iova = u64::from(registers[SURFACE_LUMA_BASE_METHOD + 3]) << 8;
-        self.video_frames.insert(luma_iova, frame);
-        self.video_frame_order.retain(|key| *key != luma_iova);
-        self.video_frame_order.push_back(luma_iova);
-        while self.video_frame_order.len() > 32 {
-            if let Some(old_key) = self.video_frame_order.pop_front() {
-                self.video_frames.remove(&old_key);
-            }
-        }
-
-        static DECODED_VP9_FRAMES: AtomicU64 = AtomicU64::new(0);
-        let frame_index = DECODED_VP9_FRAMES.fetch_add(1, Ordering::Relaxed);
-        if frame_index < 32 || frame_index % 300 == 0 {
-            log::info!(
-                "[video-decode] vp9 frame={} fd={} {}x{} bytes={} luma_iova={:#x} show={}",
-                frame_index,
+        self.video_decoder
+            .submit(video_decode_thread::DecodeWork::Packet {
                 fd,
-                width,
-                height,
-                packet.len(),
-                luma_iova,
-                show_frame
-            );
-        }
+                packet,
+                target_luma_iova: packet_luma_iova,
+                detail: video_decode_thread::PacketDetail::Vp9 { show_frame },
+            });
     }
 
     fn process_vic_execute(
@@ -2275,30 +2395,23 @@ impl Nvdrv {
             }
         }
 
-        let (frame_key, exact_frame, frame) =
-            if let Some(frame) = self.video_frames.get(&input_luma_iova).cloned() {
-                (input_luma_iova, true, frame)
-            } else {
-                let fallback_key = self
-                    .video_frame_order
-                    .iter()
-                    .rev()
-                    .find(|key| self.video_frames.contains_key(key))
-                    .copied();
-                let Some(fallback_key) = fallback_key else {
-                    log::warn!(
-                        "[video-vic] fd={} no decoded frame for input luma={:#x}",
-                        fd,
-                        input_luma_iova
-                    );
-                    return;
-                };
-                (
-                    fallback_key,
-                    false,
-                    self.video_frames[&fallback_key].clone(),
-                )
-            };
+        let selected = {
+            let cache = video_decode_thread::lock_frame_cache(self.video_decoder.cache());
+            match cache.get_cloned(input_luma_iova) {
+                Some(frame) => Some((input_luma_iova, true, frame)),
+                None => cache
+                    .latest_cloned()
+                    .map(|(fallback_key, frame)| (fallback_key, false, frame)),
+            }
+        };
+        let Some((frame_key, exact_frame, frame)) = selected else {
+            log::warn!(
+                "[video-vic] fd={} no decoded frame for input luma={:#x}",
+                fd,
+                input_luma_iova
+            );
+            return;
+        };
 
         let strides = frame.strides();
         let surface_frame = video_surface::I420Frame {
@@ -2400,23 +2513,14 @@ impl Nvdrv {
             }
         }
 
-        if output_is_nv12 {
+        if output_is_nv12 || exact_frame {
+            let mut cache = video_decode_thread::lock_frame_cache(self.video_decoder.cache());
             if exact_frame {
-                self.video_frames.remove(&frame_key);
-                self.video_frame_order.retain(|key| *key != frame_key);
+                cache.remove(frame_key);
             }
-            self.video_frames.insert(output_luma_iova, frame);
-            self.video_frame_order
-                .retain(|key| *key != output_luma_iova);
-            self.video_frame_order.push_back(output_luma_iova);
-            while self.video_frame_order.len() > 32 {
-                if let Some(old_key) = self.video_frame_order.pop_front() {
-                    self.video_frames.remove(&old_key);
-                }
+            if output_is_nv12 {
+                cache.insert(output_luma_iova, frame);
             }
-        } else if exact_frame {
-            self.video_frames.remove(&frame_key);
-            self.video_frame_order.retain(|key| *key != frame_key);
         }
 
         let first_output = mapped_writes[0].0.address;
@@ -3665,11 +3769,10 @@ impl Nvdrv {
                             })
                         });
                         if !queued {
-                            let on_complete = Some(self.channel_submit_completion(
-                                req.fd,
-                                syncpt_id,
-                                syncpt_value,
-                            ));
+                            let on_complete =
+                                Self::submit_emits_increments(submit_flags).then(|| {
+                                    self.channel_submit_completion(req.fd, syncpt_id, syncpt_value)
+                                });
                             let _ = self.gpu.process_inline_gpfifo(
                                 &entries,
                                 mem_read,
@@ -3741,6 +3844,48 @@ impl Nvdrv {
                                 );
                             }
                         }
+                        if std::env::var_os("NEXIUM_ENTRY_MIRROR").is_some() && address != 0 {
+                            let mut mirror = vec![0u8; num_entries as usize * 8];
+                            let read_ok = mem_read(address, &mut mirror);
+                            let guest: Vec<gpu::CommandListHeader> = mirror
+                                .chunks_exact(8)
+                                .map(|c| gpu::CommandListHeader {
+                                    address_lo: u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                                    address_hi_and_count: u32::from_le_bytes([
+                                        c[4], c[5], c[6], c[7],
+                                    ]),
+                                })
+                                .collect();
+                            let mismatches: Vec<String> = entries
+                                .iter()
+                                .zip(guest.iter())
+                                .enumerate()
+                                .filter(|(_, (a, b))| {
+                                    a.address_lo != b.address_lo
+                                        || a.address_hi_and_count != b.address_hi_and_count
+                                })
+                                .map(|(i, (a, b))| {
+                                    format!(
+                                        "{}:ioctl({:#x},n={})!=guest({:#x},n={})",
+                                        i,
+                                        a.address(),
+                                        a.entry_count(),
+                                        b.address(),
+                                        b.entry_count()
+                                    )
+                                })
+                                .collect();
+                            if !mismatches.is_empty() || !read_ok {
+                                log::error!(
+                                    "[entry-mirror] params_addr={:#x} read_ok={} n={} mismatches={} {}",
+                                    address,
+                                    read_ok,
+                                    num_entries,
+                                    mismatches.len(),
+                                    mismatches.join(" ")
+                                );
+                            }
+                        }
                         self.stats.gpfifo_submits.fetch_add(1, Ordering::Relaxed);
                         self.stats
                             .gpfifo_entries
@@ -3758,11 +3903,10 @@ impl Nvdrv {
                             })
                         });
                         if !queued {
-                            let on_complete = Some(self.channel_submit_completion(
-                                req.fd,
-                                syncpt_id,
-                                syncpt_value,
-                            ));
+                            let on_complete =
+                                Self::submit_emits_increments(submit_flags).then(|| {
+                                    self.channel_submit_completion(req.fd, syncpt_id, syncpt_value)
+                                });
                             let _ = self.gpu.process_inline_gpfifo(
                                 &entries,
                                 mem_read,
@@ -3808,11 +3952,10 @@ impl Nvdrv {
                             })
                         });
                         if !queued {
-                            let on_complete = Some(self.channel_submit_completion(
-                                req.fd,
-                                syncpt_id,
-                                syncpt_value,
-                            ));
+                            let on_complete =
+                                Self::submit_emits_increments(submit_flags).then(|| {
+                                    self.channel_submit_completion(req.fd, syncpt_id, syncpt_value)
+                                });
                             let _ = self.gpu.submit_gpfifo(
                                 address,
                                 num_entries,
@@ -4286,31 +4429,40 @@ impl Nvdrv {
     }
 
     pub fn drain_frames(&self) -> Vec<QueuedFrame> {
-        let frames = std::mem::take(&mut *self.frame_queue.lock());
+        let frames = self.frame_queue.drain();
         self.stats
             .frames_drained
             .fetch_add(frames.len() as u64, Ordering::Relaxed);
         frames
     }
 
-    pub fn drain_latest_frame(&self) -> Option<QueuedFrame> {
-        let mut queue = self.frame_queue.lock();
-        let len = queue.len();
-        let latest = queue.pop();
-        queue.clear();
-        self.stats
-            .frames_drained
-            .fetch_add(len as u64, Ordering::Relaxed);
-        latest
+    pub fn drain_next_frame(&self) -> Option<QueuedFrame> {
+        self.drain_next_frame_due(std::time::Instant::now())
+    }
+
+    pub fn drain_next_frame_due(&self, now: std::time::Instant) -> Option<QueuedFrame> {
+        let frame = self.frame_queue.pop_front_due(now);
+        if frame.is_some() {
+            self.stats.frames_drained.fetch_add(1, Ordering::Relaxed);
+        }
+        frame
     }
 
     pub fn submit_frame(&self, frame: QueuedFrame) {
         self.queue_buffer_active
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let mut queue = self.frame_queue.lock();
-        queue.clear();
-        queue.push(frame);
-        self.stats.frames_submitted.fetch_add(1, Ordering::Relaxed);
+        enqueue_bounded_frame(&self.frame_queue, &self.stats, frame);
+    }
+
+    pub fn submit_frame_nonblocking(&self, frame: QueuedFrame) -> bool {
+        self.queue_buffer_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let frame_queue = Arc::clone(&self.frame_queue);
+        let stats = Arc::clone(&self.stats);
+        crate::render_thread::present_thread().submit_named(
+            "cpu-present-frame",
+            Box::new(move || enqueue_bounded_frame(&frame_queue, &stats, frame)),
+        )
     }
 
     pub fn capture_gpu_frame(
@@ -4334,6 +4486,7 @@ impl Nvdrv {
                 width: w,
                 height: h,
                 pixels,
+                present_at: None,
             })
         } else {
             None
@@ -4413,6 +4566,7 @@ impl Nvdrv {
             width: dst_w,
             height: dst_h,
             pixels: out,
+            present_at: None,
         })
     }
 
@@ -4450,6 +4604,228 @@ impl Default for Nvdrv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_frame(value: u8) -> QueuedFrame {
+        QueuedFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![value, 0, 0, 255],
+            present_at: None,
+        }
+    }
+
+    #[test]
+    fn frame_handoff_backpressures_and_preserves_every_frame_in_fifo_order() {
+        let queue = Arc::new(FrameQueueState::new());
+        let stats = Arc::new(PipelineStats::default());
+        for value in 0..FRAME_QUEUE_CAPACITY as u8 {
+            enqueue_bounded_frame(&queue, &stats, test_frame(value));
+        }
+
+        let worker_queue = Arc::clone(&queue);
+        let worker_stats = Arc::clone(&stats);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let producer = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            enqueue_bounded_frame(
+                &worker_queue,
+                &worker_stats,
+                test_frame(FRAME_QUEUE_CAPACITY as u8),
+            );
+            finished_tx.send(()).unwrap();
+        });
+
+        entered_rx.recv().unwrap();
+        assert!(finished_rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err());
+        assert_eq!(queue.len(), FRAME_QUEUE_CAPACITY);
+        assert_eq!(
+            queue
+                .pop_front_due(std::time::Instant::now())
+                .unwrap()
+                .pixels[0],
+            0
+        );
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        producer.join().unwrap();
+
+        let delivered: Vec<u8> = (0..FRAME_QUEUE_CAPACITY)
+            .map(|_| {
+                queue
+                    .pop_front_due(std::time::Instant::now())
+                    .unwrap()
+                    .pixels[0]
+            })
+            .collect();
+        assert_eq!(delivered, vec![1, 2, 3, 4]);
+        assert_eq!(
+            stats.snapshot().frames_submitted,
+            FRAME_QUEUE_CAPACITY as u64 + 1
+        );
+        assert!(queue.pop_front_due(std::time::Instant::now()).is_none());
+    }
+
+    #[test]
+    fn cpu_present_submit_returns_without_waiting_for_host_fifo_capacity() {
+        let nvdrv = Nvdrv::new();
+        for value in 0..FRAME_QUEUE_CAPACITY as u8 {
+            nvdrv.submit_frame(test_frame(value));
+        }
+
+        let started = std::time::Instant::now();
+        assert!(nvdrv.submit_frame_nonblocking(test_frame(FRAME_QUEUE_CAPACITY as u8)));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "CPU QueueBuffer fallback waited for a full host FIFO"
+        );
+
+        assert_eq!(
+            nvdrv
+                .drain_next_frame_due(std::time::Instant::now())
+                .unwrap()
+                .pixels[0],
+            0
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while nvdrv.frame_queue_depth() < FRAME_QUEUE_CAPACITY
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(nvdrv.frame_queue_depth(), FRAME_QUEUE_CAPACITY);
+
+        let delivered: Vec<u8> = (0..FRAME_QUEUE_CAPACITY)
+            .map(|_| {
+                nvdrv
+                    .drain_next_frame_due(std::time::Instant::now())
+                    .unwrap()
+                    .pixels[0]
+            })
+            .collect();
+        assert_eq!(delivered, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn queuebuffer_deadline_holds_the_fifo_head_without_leapfrogging() {
+        let nvdrv = Nvdrv::new();
+        let now = std::time::Instant::now();
+        let mut interval_two_frame = test_frame(1);
+        interval_two_frame.present_at = Some(now + std::time::Duration::from_millis(33));
+        nvdrv.submit_frame(interval_two_frame);
+        nvdrv.submit_frame(test_frame(2));
+
+        assert!(nvdrv.drain_next_frame_due(now).is_none());
+        assert_eq!(
+            nvdrv
+                .drain_next_frame_due(now + std::time::Duration::from_millis(33))
+                .unwrap()
+                .pixels[0],
+            1
+        );
+        assert_eq!(
+            nvdrv
+                .drain_next_frame_due(now + std::time::Duration::from_millis(33))
+                .unwrap()
+                .pixels[0],
+            2
+        );
+    }
+
+    #[test]
+    fn ordered_present_slot_waits_for_capacity_to_open() {
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let release_pending = Arc::clone(&pending);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            release_pending.fetch_sub(1, Ordering::Release);
+        });
+
+        reserve_ordered_present_slot(&pending, 1);
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn ordered_present_slot_waits_past_the_old_drop_timeout() {
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let release_pending = Arc::clone(&pending);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(275));
+            release_pending.fetch_sub(1, Ordering::Release);
+        });
+
+        let waited_from = std::time::Instant::now();
+        reserve_ordered_present_slot(&pending, 1);
+        assert!(waited_from.elapsed() >= std::time::Duration::from_millis(250));
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn vp9_output_targets_follow_the_composed_packet_not_the_current_submit() {
+        let mut pending_target = None;
+        assert_eq!(next_vp9_packet_target(&mut pending_target, 0x1000), 0x1000);
+        assert_eq!(next_vp9_packet_target(&mut pending_target, 0x2000), 0x1000);
+        assert_eq!(next_vp9_packet_target(&mut pending_target, 0x3000), 0x2000);
+
+        pending_target = None;
+        assert_eq!(next_vp9_packet_target(&mut pending_target, 0x4000), 0x4000);
+        assert_eq!(next_vp9_packet_target(&mut pending_target, 0x5000), 0x4000);
+    }
+
+    #[test]
+    fn a_reconfigured_vp9_channel_clears_its_pending_packet_target() {
+        let mut runtime = VideoChannelRuntime::new(NvDevice::NvhostNvdec);
+        assert_eq!(
+            next_vp9_packet_target(&mut runtime.vp9_packet_target, 0x1000),
+            0x1000
+        );
+        assert_eq!(runtime.vp9_packet_target, Some(0x1000));
+
+        let config = (video_ffmpeg::FfmpegCodec::Vp9, 1280, 720);
+        assert_ne!(runtime.ffmpeg_config, Some(config));
+        runtime.ffmpeg_config = Some(config);
+        runtime.vp9_packet_target = None;
+
+        assert_eq!(
+            next_vp9_packet_target(&mut runtime.vp9_packet_target, 0x9000),
+            0x9000
+        );
+    }
+
+    #[test]
+    fn syncpoint_expiry_follows_the_reserved_window() {
+        assert!(syncpoint_expired(8, 8, 8));
+        assert!(syncpoint_expired(9, 12, 8));
+        assert!(!syncpoint_expired(8, 12, 9));
+        assert!(syncpoint_expired(8, 8, 9));
+        assert!(syncpoint_expired(5, 8, 9));
+        assert!(!syncpoint_expired(u32::MAX - 1, 2, 1));
+        assert!(syncpoint_expired(u32::MAX - 1, 2, u32::MAX - 1));
+    }
+
+    #[test]
+    fn engine_increments_never_lower_the_reserved_max() {
+        let mut nvdrv = Nvdrv::new();
+        let gpu_fd = nvdrv.open("/dev/nvhost-gpu").unwrap();
+        let (syncpt, threshold) = nvdrv.reserve_channel_submit(gpu_fd, 1 << 1, 0);
+        assert_eq!(threshold, 2);
+        nvdrv.gpu.apply_embedded_syncpt_incrs(vec![(syncpt, 1)]);
+        assert!(syncpoint_reached(nvdrv.syncpoint_max(syncpt), threshold));
+        assert!(syncpoint_reached(
+            nvdrv.syncpoint_max(syncpt),
+            nvdrv.syncpoint_value(syncpt)
+        ));
+        nvdrv.gpu.apply_embedded_syncpt_incrs(vec![(syncpt, 8)]);
+        let min = nvdrv.syncpoint_value(syncpt);
+        assert!(syncpoint_reached(min, threshold));
+        assert!(syncpoint_reached(nvdrv.syncpoint_max(syncpt), min));
+    }
 
     #[test]
     fn submit_fence_wait_only_elides_an_ordered_reserved_predecessor() {

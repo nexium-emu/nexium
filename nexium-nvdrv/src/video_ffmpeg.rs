@@ -64,7 +64,6 @@ pub struct FfmpegDecoder {
     width: u32,
     height: u32,
     codec: FfmpegCodec,
-    primed: bool,
     ivf_header_sent: bool,
     ivf_pts: u64,
 }
@@ -133,7 +132,6 @@ impl FfmpegDecoder {
             width,
             height,
             codec,
-            primed: false,
             ivf_header_sent: false,
             ivf_pts: 0,
         })
@@ -151,7 +149,7 @@ impl FfmpegDecoder {
         self.codec
     }
 
-    pub fn decode(&mut self, packet: &[u8], expect_frame: bool) -> Result<Option<Vec<u8>>, String> {
+    pub fn submit(&mut self, packet: &[u8]) -> Result<(), String> {
         let stdin = self.stdin.as_mut().ok_or("ffmpeg stdin closed")?;
         if self.codec == FfmpegCodec::Vp9 {
             if !self.ivf_header_sent {
@@ -172,28 +170,14 @@ impl FfmpegDecoder {
         stdin
             .write_all(packet)
             .and_then(|_| stdin.flush())
-            .map_err(|error| format!("ffmpeg write: {}", error))?;
-        if !expect_frame {
-            return match self.frames.try_recv() {
-                Ok(frame) => {
-                    self.primed = true;
-                    Ok(Some(frame))
-                }
-                Err(mpsc::TryRecvError::Empty) => Ok(None),
-                Err(mpsc::TryRecvError::Disconnected) => Err("ffmpeg exited".into()),
-            };
-        }
-        let wait = if self.primed { 700 } else { 250 };
-        match self
-            .frames
-            .recv_timeout(std::time::Duration::from_millis(wait))
-        {
-            Ok(frame) => {
-                self.primed = true;
-                Ok(Some(frame))
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err("ffmpeg exited".into()),
+            .map_err(|error| format!("ffmpeg write: {}", error))
+    }
+
+    pub fn receive(&mut self) -> Result<Option<Vec<u8>>, String> {
+        match self.frames.try_recv() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err("ffmpeg exited".into()),
         }
     }
 }
