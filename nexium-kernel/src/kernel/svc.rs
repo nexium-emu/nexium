@@ -378,11 +378,24 @@ fn decode_pcm_stereo(
     frame_count
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AudioWaveBufferSpan {
     frames: u32,
     looping: bool,
+    loop_count: i32,
 }
+
+impl Default for AudioWaveBufferSpan {
+    fn default() -> Self {
+        Self {
+            frames: 0,
+            looping: false,
+            loop_count: AUDIO_WAVE_BUFFER_LOOP_INFINITE,
+        }
+    }
+}
+
+const AUDIO_WAVE_BUFFER_LOOP_INFINITE: i32 = -1;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct AudioVoiceMixSnapshot {
@@ -422,7 +435,17 @@ fn advance_audio_wave_buffers(
             return (progress, completed, false);
         }
         if buffer.looping {
-            return (progress % frames, completed, false);
+            if buffer.loop_count < 0 {
+                return (progress % frames, completed, false);
+            }
+            let plays = (buffer.loop_count as u64).saturating_add(1);
+            let total = frames.saturating_mul(plays);
+            if progress < total {
+                return (progress % frames, completed, false);
+            }
+            progress -= total;
+            completed += 1;
+            continue;
         }
         progress -= frames;
         completed += 1;
@@ -746,15 +769,53 @@ mod audio_pcm_tests {
     }
 
     #[test]
+    fn a_finite_loop_count_completes_the_buffer_but_infinite_never_does() {
+        let finite = [
+            AudioWaveBufferSpan {
+                frames: 100,
+                looping: true,
+                loop_count: 2,
+            },
+            AudioWaveBufferSpan {
+                frames: 50,
+                looping: false,
+                ..Default::default()
+            },
+            AudioWaveBufferSpan::default(),
+            AudioWaveBufferSpan::default(),
+        ];
+        assert_eq!(advance_audio_wave_buffers(0, 250, &finite), (50, 0, false));
+        assert_eq!(advance_audio_wave_buffers(0, 300, &finite), (0, 1, false));
+        assert_eq!(advance_audio_wave_buffers(0, 330, &finite), (30, 1, false));
+
+        let infinite = [
+            AudioWaveBufferSpan {
+                frames: 100,
+                looping: true,
+                loop_count: super::AUDIO_WAVE_BUFFER_LOOP_INFINITE,
+            },
+            AudioWaveBufferSpan::default(),
+            AudioWaveBufferSpan::default(),
+            AudioWaveBufferSpan::default(),
+        ];
+        assert_eq!(
+            advance_audio_wave_buffers(0, 100_000, &infinite),
+            (0, 0, false)
+        );
+    }
+
+    #[test]
     fn advances_across_unequal_wave_buffers() {
         let buffers = [
             AudioWaveBufferSpan {
                 frames: 100,
                 looping: false,
+                ..Default::default()
             },
             AudioWaveBufferSpan {
                 frames: 300,
                 looping: false,
+                ..Default::default()
             },
             AudioWaveBufferSpan::default(),
             AudioWaveBufferSpan::default(),
@@ -772,10 +833,12 @@ mod audio_pcm_tests {
             AudioWaveBufferSpan {
                 frames: 100,
                 looping: false,
+                ..Default::default()
             },
             AudioWaveBufferSpan {
                 frames: 80,
                 looping: true,
+                ..Default::default()
             },
             AudioWaveBufferSpan::default(),
             AudioWaveBufferSpan::default(),
@@ -5220,6 +5283,10 @@ fn dispatch_service_v2(
                     audio_renderer_output_slots(cmd_id, &ctx.recv_buffers, &ctx.recv_statics);
                 let revision = st.revision;
                 let revision_num = st.revision_num;
+                let wave_buffer_ver2 = audren_behavior::check_feature_supported(
+                    audren_behavior::SupportTags::WaveBufferVer2,
+                    revision_num,
+                );
                 let voice_drop_param = st.voice_drop_param;
                 let frame = kernel.audio_renderer_frame_counter;
 
@@ -5585,6 +5652,11 @@ fn dispatch_service_v2(
                                 }
                                 span.frames = (queued_end - queued_start) as u32;
                                 span.looping = queued[0x18] != 0;
+                                span.loop_count = if wave_buffer_ver2 {
+                                    i32::from_le_bytes(queued[0x1C..0x20].try_into().unwrap())
+                                } else {
+                                    AUDIO_WAVE_BUFFER_LOOP_INFINITE
+                                };
                             }
 
                             let ch = channel_count as usize;
