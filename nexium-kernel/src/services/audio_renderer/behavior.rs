@@ -509,7 +509,10 @@ mod tests {
         ));
         assert!(!check_feature_supported(SupportTags::Splitter, 99));
         assert!(!check_feature_supported(SupportTags::WaveBufferVer2, 99));
-        assert!(!check_feature_supported(SupportTags::VoiceInParameterV2, 99));
+        assert!(!check_feature_supported(
+            SupportTags::VoiceInParameterV2,
+            99
+        ));
     }
 
     #[test]
@@ -595,7 +598,9 @@ mod tests {
         assert_eq!(&block[0xA0..0xA4], &1u32.to_le_bytes());
         assert!(block[0xA4..0xB0].iter().all(|byte| *byte == 0));
 
-        assert!(!behavior.out_status().write_to(&mut [0u8; OUT_STATUS_SIZE - 1]));
+        assert!(!behavior
+            .out_status()
+            .write_to(&mut [0u8; OUT_STATUS_SIZE - 1]));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::controller_config::SwitchButton;
 use crate::input::InputSnapshot;
-use egui::{Color32, FontId, CornerRadius, Stroke, Vec2};
+use egui::{Color32, CornerRadius, FontId, Stroke, Vec2};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Layer {
@@ -494,7 +494,12 @@ impl VirtualKeyboard {
             egui::pos2(panel.max.x - pad, panel.min.y + 58.0),
         );
         p.rect_filled(preview, CornerRadius::same(9), key_bg);
-        p.rect_stroke(preview, CornerRadius::same(9), Stroke::new(1.5_f32, accent), egui::StrokeKind::Outside);
+        p.rect_stroke(
+            preview,
+            CornerRadius::same(9),
+            Stroke::new(1.5_f32, accent),
+            egui::StrokeKind::Outside,
+        );
         let pv_font = FontId::proportional(20.0);
         let display: String = if self.mask {
             buf.chars().map(|_| '\u{2022}').collect()
@@ -541,9 +546,19 @@ impl VirtualKeyboard {
                 let selected = self.open && self.row == row && self.col == col;
                 p.rect_filled(r, CornerRadius::same(7), key_bg);
                 if selected {
-                    p.rect_stroke(r, CornerRadius::same(7), Stroke::new(2.6_f32, accent), egui::StrokeKind::Outside);
+                    p.rect_stroke(
+                        r,
+                        CornerRadius::same(7),
+                        Stroke::new(2.6_f32, accent),
+                        egui::StrokeKind::Outside,
+                    );
                 } else {
-                    p.rect_stroke(r, CornerRadius::same(7), Stroke::new(1.0_f32, key_border), egui::StrokeKind::Outside);
+                    p.rect_stroke(
+                        r,
+                        CornerRadius::same(7),
+                        Stroke::new(1.0_f32, key_border),
+                        egui::StrokeKind::Outside,
+                    );
                 }
                 p.text(
                     r.center(),
@@ -582,9 +597,19 @@ impl VirtualKeyboard {
             let fill = if is_ok { accent } else { key_bg };
             p.rect_filled(r, CornerRadius::same(7), fill);
             if selected {
-                p.rect_stroke(r, CornerRadius::same(7), Stroke::new(2.6_f32, accent), egui::StrokeKind::Outside);
+                p.rect_stroke(
+                    r,
+                    CornerRadius::same(7),
+                    Stroke::new(2.6_f32, accent),
+                    egui::StrokeKind::Outside,
+                );
             } else {
-                p.rect_stroke(r, CornerRadius::same(7), Stroke::new(1.0_f32, key_border), egui::StrokeKind::Outside);
+                p.rect_stroke(
+                    r,
+                    CornerRadius::same(7),
+                    Stroke::new(1.0_f32, key_border),
+                    egui::StrokeKind::Outside,
+                );
             }
             let lc = if is_ok { Color32::WHITE } else { text };
             p.text(

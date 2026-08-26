@@ -114,9 +114,7 @@ pub fn request_all_files_access(app: &AndroidApp) -> bool {
     }
     with_env(|env| {
         let activity = unsafe { JObject::from_raw(env, activity_ptr as jni::sys::jobject) };
-        let action = env.new_string(
-            "android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION",
-        )?;
+        let action = env.new_string("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION")?;
         let package = env.new_string("package:dev.nexium.emu")?;
 
         let uri_class = env.find_class(jni_str!("android/net/Uri"))?;

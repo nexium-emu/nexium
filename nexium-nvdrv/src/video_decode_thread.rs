@@ -247,7 +247,15 @@ fn decode_into_cache(
             }
         };
         lock_frame_cache(cache).insert(luma_iova, frame);
-        log_decoded_frame(fd, width, height, packet.len(), target_luma_iova, luma_iova, detail);
+        log_decoded_frame(
+            fd,
+            width,
+            height,
+            packet.len(),
+            target_luma_iova,
+            luma_iova,
+            detail,
+        );
     }
 }
 

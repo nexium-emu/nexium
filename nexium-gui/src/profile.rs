@@ -2,7 +2,7 @@ use crate::input::InputSnapshot;
 use crate::library::Library;
 use crate::playtime::{format_playtime, PlayTimes};
 use eframe::egui;
-use eframe::egui::{Color32, FontId, CornerRadius, Sense, Stroke, Vec2};
+use eframe::egui::{Color32, CornerRadius, FontId, Sense, Stroke, Vec2};
 
 #[derive(Clone, Copy)]
 struct Pal {
@@ -561,7 +561,12 @@ pub fn profile_view(
         let rounding = CornerRadius::from(12.0 * s * scale_factor);
         if selected {
             painter.rect_filled(r, rounding, pal.sel);
-            painter.rect_stroke(r, rounding, Stroke::new(1.8 * scale_factor, ring), egui::StrokeKind::Outside);
+            painter.rect_stroke(
+                r,
+                rounding,
+                Stroke::new(1.8 * scale_factor, ring),
+                egui::StrokeKind::Outside,
+            );
 
             let bar_rect = scale_rect(egui::Rect::from_min_size(
                 base_rect.min + Vec2::new(6.0 * s, 12.0 * s),
@@ -924,7 +929,12 @@ fn settings_page(
         let rounding = CornerRadius::from(12.0 * s * scale_factor);
         painter.rect_filled(r, rounding, pal.panel);
         let ring = if focused { accent } else { pal.border };
-        painter.rect_stroke(r, rounding, Stroke::new(1.8 * scale_factor, ring), egui::StrokeKind::Outside);
+        painter.rect_stroke(
+            r,
+            rounding,
+            Stroke::new(1.8 * scale_factor, ring),
+            egui::StrokeKind::Outside,
+        );
 
         painter.text(
             scale_pos(egui::pos2(row.min.x + 24.0 * s, row.center().y - 9.0 * s)),

@@ -6,17 +6,13 @@ mod platform;
 mod settings;
 mod ui;
 
-use android_activity::input::{
-    Axis, InputEvent, KeyAction, Keycode, MotionAction, Source,
-};
+use android_activity::input::{Axis, InputEvent, KeyAction, Keycode, MotionAction, Source};
 use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
 use library::{GameEntry, LibraryScan, ICON_SIZE};
-use settings::Settings as AppConfig;
-use nexium_core::hid_state::{
-    ControllerInput, KeyboardInput, MouseInput, TouchInput,
-};
+use nexium_core::hid_state::{ControllerInput, KeyboardInput, MouseInput, TouchInput};
 use nexium_runner::boot::{EmulationHandle, Frame};
 use overlay::{OverlayEvent, TouchOverlay};
+use settings::Settings as AppConfig;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -335,9 +331,7 @@ impl App {
             }
             Err(error) => {
                 log::error!("emulation failed to start: {}", error);
-                self.screen = Screen::Error {
-                    message: error,
-                };
+                self.screen = Screen::Error { message: error };
             }
         }
         self.ui_dirty = true;
@@ -460,10 +454,7 @@ impl App {
             }
             return;
         }
-        if let Screen::Library {
-            scan, selected, ..
-        } = &mut self.screen
-        {
+        if let Screen::Library { scan, selected, .. } = &mut self.screen {
             if !scan.done || scan.games.is_empty() {
                 return;
             }
@@ -480,9 +471,7 @@ impl App {
 
     fn nav_accept(&mut self) {
         match &mut self.screen {
-            Screen::Library {
-                scan, selected, ..
-            } => {
+            Screen::Library { scan, selected, .. } => {
                 if scan.done {
                     if let Some(game) = scan.games.get(*selected) {
                         let path = game.path.clone();
@@ -887,8 +876,7 @@ impl App {
             let scaled = if *w == target && *h == target {
                 pixels.clone()
             } else {
-                let Some(img) =
-                    image::RgbaImage::from_raw(*w as u32, *h as u32, pixels.clone())
+                let Some(img) = image::RgbaImage::from_raw(*w as u32, *h as u32, pixels.clone())
                 else {
                     return;
                 };
@@ -928,7 +916,12 @@ impl App {
             ),
             (
                 "Touch controls".to_string(),
-                if self.settings.touch_overlay { "On" } else { "Off" }.to_string(),
+                if self.settings.touch_overlay {
+                    "On"
+                } else {
+                    "Off"
+                }
+                .to_string(),
             ),
             (
                 "Performance overlay".to_string(),
@@ -936,17 +929,30 @@ impl App {
             ),
             (
                 "Async shader compile".to_string(),
-                if self.settings.async_shaders { "On" } else { "Off" }.to_string(),
+                if self.settings.async_shaders {
+                    "On"
+                } else {
+                    "Off"
+                }
+                .to_string(),
             ),
             (
                 "Async render thread".to_string(),
-                if self.settings.async_render { "On (restart game)" } else { "Off (restart game)" }
-                    .to_string(),
+                if self.settings.async_render {
+                    "On (restart game)"
+                } else {
+                    "Off (restart game)"
+                }
+                .to_string(),
             ),
             (
                 "Multicore CPU".to_string(),
-                if self.settings.multicore { "On (restart game)" } else { "Off (restart game)" }
-                    .to_string(),
+                if self.settings.multicore {
+                    "On (restart game)"
+                } else {
+                    "Off (restart game)"
+                }
+                .to_string(),
             ),
             (
                 "Fastmem (experimental)".to_string(),
@@ -959,7 +965,12 @@ impl App {
             ),
             (
                 "Console mode".to_string(),
-                if self.settings.docked { "Docked" } else { "Handheld" }.to_string(),
+                if self.settings.docked {
+                    "Docked"
+                } else {
+                    "Handheld"
+                }
+                .to_string(),
             ),
             (
                 "Audio volume".to_string(),
@@ -1149,8 +1160,13 @@ impl App {
             &dir.display().to_string(),
         );
 
-        self.canvas
-            .fill_rect(0, (h - footer_h) as i32, win_w as i32, footer_h as i32 + 1, PANEL);
+        self.canvas.fill_rect(
+            0,
+            (h - footer_h) as i32,
+            win_w as i32,
+            footer_h as i32 + 1,
+            PANEL,
+        );
         let fpx = footer_h * 0.28;
         self.text.draw(
             &mut self.canvas,
@@ -1476,9 +1492,7 @@ fn android_main(android_app: AndroidApp) {
     while running {
         let poll_timeout = match &state.screen {
             Screen::Playing { menu: None } => Duration::from_millis(4),
-            Screen::Booting { .. } | Screen::Stopping { .. } => {
-                Duration::from_millis(16)
-            }
+            Screen::Booting { .. } | Screen::Stopping { .. } => Duration::from_millis(16),
             Screen::Library { scan, .. } if !scan.done => Duration::from_millis(16),
             _ => Duration::from_millis(100),
         };
@@ -1561,10 +1575,7 @@ fn android_main(android_app: AndroidApp) {
                                 BTN_DUP => state.nav_move(-1),
                                 BTN_DDOWN => state.nav_move(1),
                                 BTN_A => {
-                                    if !matches!(
-                                        state.screen,
-                                        Screen::Playing { menu: None }
-                                    ) {
+                                    if !matches!(state.screen, Screen::Playing { menu: None }) {
                                         state.nav_accept()
                                     }
                                 }
@@ -1652,17 +1663,14 @@ fn android_main(android_app: AndroidApp) {
                         let w = win_w as f32;
                         let h = win_h as f32;
                         let playing = matches!(state.screen, Screen::Playing { .. });
-                        let menu_open =
-                            matches!(state.screen, Screen::Playing { menu: Some(_) });
+                        let menu_open = matches!(state.screen, Screen::Playing { menu: Some(_) });
                         let compose = if playing {
                             state.compose_rect(&android_app)
                         } else {
                             None
                         };
                         let scale = compose
-                            .map(|(cw, ch, ..)| {
-                                (cw as f32 / w.max(1.0), ch as f32 / h.max(1.0))
-                            })
+                            .map(|(cw, ch, ..)| (cw as f32 / w.max(1.0), ch as f32 / h.max(1.0)))
                             .unwrap_or((1.0, 1.0));
                         match action {
                             MotionAction::Down | MotionAction::PointerDown => {
@@ -1677,15 +1685,10 @@ fn android_main(android_app: AndroidApp) {
                                         let (cw, ch) = compose
                                             .map(|(cw, ch, ..)| (cw as f32, ch as f32))
                                             .unwrap_or((w, h));
-                                        if let Some(idx) = state.menu_hit(
-                                            x * scale.0,
-                                            y * scale.1,
-                                            cw,
-                                            ch,
-                                        ) {
-                                            if let Screen::Playing { menu } =
-                                                &mut state.screen
-                                            {
+                                        if let Some(idx) =
+                                            state.menu_hit(x * scale.0, y * scale.1, cw, ch)
+                                        {
+                                            if let Screen::Playing { menu } = &mut state.screen {
                                                 *menu = Some(idx);
                                             }
                                             state.nav_accept();
@@ -1701,13 +1704,10 @@ fn android_main(android_app: AndroidApp) {
                                             OverlayEvent::MenuTap => {}
                                             OverlayEvent::None => {}
                                         }
-                                    } else if matches!(state.screen, Screen::Library { .. })
-                                    {
-                                        let (gx, gy, gr) =
-                                            state.gear_center(win_w, win_h);
-                                        let hit = ((x - gx).powi(2) + (y - gy).powi(2))
-                                            .sqrt()
-                                            < gr * 1.5;
+                                    } else if matches!(state.screen, Screen::Library { .. }) {
+                                        let (gx, gy, gr) = state.gear_center(win_w, win_h);
+                                        let hit =
+                                            ((x - gx).powi(2) + (y - gy).powi(2)).sqrt() < gr * 1.5;
                                         if hit {
                                             state.open_settings();
                                         } else if let Screen::Library { drag, .. } =
@@ -1715,8 +1715,7 @@ fn android_main(android_app: AndroidApp) {
                                         {
                                             *drag = Some((p.pointer_id(), y, 0.0));
                                         }
-                                    } else if matches!(state.screen, Screen::Settings { .. })
-                                    {
+                                    } else if matches!(state.screen, Screen::Settings { .. }) {
                                         let header_h = (h * 0.14).max(64.0);
                                         let row_h = h * 0.094;
                                         let rel = y - (header_h + h * 0.03);
@@ -1731,8 +1730,7 @@ fn android_main(android_app: AndroidApp) {
                                                 state.nav_accept();
                                             }
                                         }
-                                    } else if matches!(state.screen, Screen::Browser { .. })
-                                    {
+                                    } else if matches!(state.screen, Screen::Browser { .. }) {
                                         let header_h = (h * 0.14).max(64.0);
                                         let row_h = h * 0.105;
                                         let footer_h = h * 0.10;
@@ -1749,9 +1747,8 @@ fn android_main(android_app: AndroidApp) {
                                                     _ => 0,
                                                 };
                                                 if idx < len {
-                                                    if let Screen::Browser {
-                                                        selected, ..
-                                                    } = &mut state.screen
+                                                    if let Screen::Browser { selected, .. } =
+                                                        &mut state.screen
                                                     {
                                                         *selected = idx;
                                                     }
@@ -1759,8 +1756,7 @@ fn android_main(android_app: AndroidApp) {
                                                 }
                                             }
                                         }
-                                    } else if matches!(state.screen, Screen::Error { .. })
-                                    {
+                                    } else if matches!(state.screen, Screen::Error { .. }) {
                                         state.nav_accept();
                                     }
                                 }
@@ -1775,11 +1771,8 @@ fn android_main(android_app: AndroidApp) {
                                             x * scale.0,
                                             y * scale.1,
                                         );
-                                    } else if let Screen::Library {
-                                        drag,
-                                        scroll,
-                                        ..
-                                    } = &mut state.screen
+                                    } else if let Screen::Library { drag, scroll, .. } =
+                                        &mut state.screen
                                     {
                                         if let Some((id, last_y, total)) = drag {
                                             if *id == p.pointer_id() {
@@ -1794,9 +1787,7 @@ fn android_main(android_app: AndroidApp) {
                                 }
                                 input_dirty = true;
                             }
-                            MotionAction::Up
-                            | MotionAction::PointerUp
-                            | MotionAction::Cancel => {
+                            MotionAction::Up | MotionAction::PointerUp | MotionAction::Cancel => {
                                 let cancelled = matches!(action, MotionAction::Cancel);
                                 let idx = if matches!(action, MotionAction::PointerUp) {
                                     motion_event.pointer_index()
@@ -1808,12 +1799,9 @@ fn android_main(android_app: AndroidApp) {
                                     if playing && !menu_open {
                                         if cancelled {
                                             state.overlay.cancel_all();
-                                        } else if let OverlayEvent::MenuTap =
-                                            state.overlay.pointer_up(
-                                                p.pointer_id(),
-                                                x * scale.0,
-                                                y * scale.1,
-                                            )
+                                        } else if let OverlayEvent::MenuTap = state
+                                            .overlay
+                                            .pointer_up(p.pointer_id(), x * scale.0, y * scale.1)
                                         {
                                             state.open_menu();
                                         }
@@ -1828,26 +1816,20 @@ fn android_main(android_app: AndroidApp) {
                                         {
                                             if let Some((id, _, total)) = drag {
                                                 if *id == p.pointer_id() {
-                                                    let tap =
-                                                        !cancelled && *total < h * 0.01;
+                                                    let tap = !cancelled && *total < h * 0.01;
                                                     *drag = None;
                                                     if tap && scan.done {
-                                                        let header_h =
-                                                            (h * 0.14).max(64.0);
-                                                        let row_h = (ICON_SIZE as f32
-                                                            + h * 0.03)
+                                                        let header_h = (h * 0.14).max(64.0);
+                                                        let row_h = (ICON_SIZE as f32 + h * 0.03)
                                                             .max(h * 0.16);
-                                                        let list_top =
-                                                            header_h + h * 0.02;
+                                                        let list_top = header_h + h * 0.02;
                                                         let hint_h = h * 0.026 * 2.2;
-                                                        let rel =
-                                                            y - list_top + *scroll;
+                                                        let rel = y - list_top + *scroll;
                                                         if rel >= 0.0
                                                             && y >= list_top
                                                             && y <= h - hint_h
                                                         {
-                                                            let idx =
-                                                                (rel / row_h) as usize;
+                                                            let idx = (rel / row_h) as usize;
                                                             if idx < scan.games.len() {
                                                                 *selected = idx;
                                                                 launch = Some(idx);
@@ -1934,9 +1916,7 @@ fn android_main(android_app: AndroidApp) {
                 }
             }
             Screen::Stopping { done, since } => {
-                if done.load(Ordering::Acquire)
-                    || since.elapsed() >= Duration::from_secs(10)
-                {
+                if done.load(Ordering::Acquire) || since.elapsed() >= Duration::from_secs(10) {
                     if !done.load(Ordering::Acquire) {
                         log::warn!("stop timed out; returning to library");
                     }
@@ -1951,9 +1931,7 @@ fn android_main(android_app: AndroidApp) {
             if elapsed >= Duration::from_secs(3) {
                 let fps = state.frames_since_report as f32 / elapsed.as_secs_f32();
                 let compose_ms = if state.frames_since_report > 0 {
-                    state.compose_nanos as f32
-                        / state.frames_since_report as f32
-                        / 1.0e6
+                    state.compose_nanos as f32 / state.frames_since_report as f32 / 1.0e6
                 } else {
                     0.0
                 };
@@ -1980,14 +1958,13 @@ fn android_main(android_app: AndroidApp) {
         ) || matches!(&state.screen, Screen::Library { scan, .. } if !scan.done);
         let ui_due = last_ui_draw.elapsed() >= Duration::from_millis(16);
         let anim_due = last_ui_draw.elapsed() >= Duration::from_millis(100);
-        if state.window_ready
-            && ((state.ui_dirty && ui_due) || (animating && anim_due))
-        {
+        if state.window_ready && ((state.ui_dirty && ui_due) || (animating && anim_due)) {
             {
                 match &state.screen {
                     Screen::Library { .. } => state.render_library(&android_app),
                     Screen::Booting { title, started } => {
-                        let dots = ".".repeat(1 + (started.elapsed().as_millis() / 400 % 3) as usize);
+                        let dots =
+                            ".".repeat(1 + (started.elapsed().as_millis() / 400 % 3) as usize);
                         let lines = vec![
                             (format!("Booting {}{}", title, dots), TEXT, 0.045f32),
                             (
@@ -2000,8 +1977,7 @@ fn android_main(android_app: AndroidApp) {
                     }
                     Screen::Playing { .. } => state.render_playing(&android_app),
                     Screen::Stopping { .. } => {
-                        let lines =
-                            vec![("Shutting down...".to_string(), TEXT_DIM, 0.04f32)];
+                        let lines = vec![("Shutting down...".to_string(), TEXT_DIM, 0.04f32)];
                         state.render_center_screen(&android_app, &lines);
                     }
                     Screen::Settings { .. } => state.render_settings(&android_app),

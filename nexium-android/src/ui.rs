@@ -164,11 +164,19 @@ impl Canvas {
     }
 
     pub fn fill_triangle(&mut self, pts: [(f32, f32); 3], color: [u8; 4]) {
-        let min_x = pts.iter().fold(f32::MAX, |a, p| a.min(p.0)).floor().max(0.0) as usize;
+        let min_x = pts
+            .iter()
+            .fold(f32::MAX, |a, p| a.min(p.0))
+            .floor()
+            .max(0.0) as usize;
         let max_x = (pts.iter().fold(f32::MIN, |a, p| a.max(p.0)).ceil() + 1.0)
             .min(self.w as f32)
             .max(0.0) as usize;
-        let min_y = pts.iter().fold(f32::MAX, |a, p| a.min(p.1)).floor().max(0.0) as usize;
+        let min_y = pts
+            .iter()
+            .fold(f32::MAX, |a, p| a.min(p.1))
+            .floor()
+            .max(0.0) as usize;
         let max_y = (pts.iter().fold(f32::MIN, |a, p| a.max(p.1)).ceil() + 1.0)
             .min(self.h as f32)
             .max(0.0) as usize;
@@ -182,8 +190,8 @@ impl Canvas {
                 let w0 = edge(pts[0], pts[1], px, py);
                 let w1 = edge(pts[1], pts[2], px, py);
                 let w2 = edge(pts[2], pts[0], px, py);
-                let inside = (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0)
-                    || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+                let inside =
+                    (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
                 if inside {
                     self.blend_px(col, row, color, 255);
                 }
@@ -212,12 +220,7 @@ impl Canvas {
                 let a = src[s + 3];
                 if a == 0xFF {
                     let d = (dy as usize * self.w + dx) * 4;
-                    self.pixels[d..d + 4].copy_from_slice(&[
-                        src[s],
-                        src[s + 1],
-                        src[s + 2],
-                        0xFF,
-                    ]);
+                    self.pixels[d..d + 4].copy_from_slice(&[src[s], src[s + 1], src[s + 2], 0xFF]);
                 } else if a != 0 {
                     let color = [src[s], src[s + 1], src[s + 2], 0xFF];
                     self.blend_px(dx, dy as usize, color, a as u16);

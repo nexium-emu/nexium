@@ -1,6 +1,6 @@
 use crate::library::Library;
 use eframe::egui;
-use eframe::egui::{Color32, FontId, CornerRadius, Sense, Stroke, Vec2};
+use eframe::egui::{Color32, CornerRadius, FontId, Sense, Stroke, Vec2};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BootStage {
@@ -2563,7 +2563,11 @@ pub fn carousel_view(
                 sb_alpha,
             )
         };
-        painter.rect_filled(search_rect, CornerRadius::from(18.0 * s * scale_factor), sb_bg);
+        painter.rect_filled(
+            search_rect,
+            CornerRadius::from(18.0 * s * scale_factor),
+            sb_bg,
+        );
         painter.rect_stroke(
             search_rect,
             CornerRadius::from(18.0 * s * scale_factor),
@@ -3923,7 +3927,11 @@ pub fn carousel_view(
                     center + Vec2::new(-u, -u * 0.55),
                     center + Vec2::new(u, u * 1.25),
                 );
-                painter.rect_filled(body, CornerRadius::from(2.5 * scale_factor), final_icon_color);
+                painter.rect_filled(
+                    body,
+                    CornerRadius::from(2.5 * scale_factor),
+                    final_icon_color,
+                );
                 let handle_c = egui::pos2(center.x, body.min.y);
                 let arc: Vec<egui::Pos2> = (0..=12)
                     .map(|i| {
@@ -4256,7 +4264,12 @@ pub fn carousel_view(
                     a(160.0),
                 )
             };
-            painter.rect_stroke(r, rounding, Stroke::new(1.3_f32, sw_stroke), egui::StrokeKind::Outside);
+            painter.rect_stroke(
+                r,
+                rounding,
+                Stroke::new(1.3_f32, sw_stroke),
+                egui::StrokeKind::Outside,
+            );
         }
 
         let cur = themes

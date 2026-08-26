@@ -205,7 +205,10 @@ fn resolve_device(preferred: Option<&str>) -> Option<Device> {
         match host.output_devices() {
             Ok(it) => {
                 for d in it {
-                    if d.description().ok().map(|desc| desc.name().to_string()).as_deref()
+                    if d.description()
+                        .ok()
+                        .map(|desc| desc.name().to_string())
+                        .as_deref()
                         == Some(name)
                     {
                         return Some(d);

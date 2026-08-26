@@ -1495,7 +1495,11 @@ impl ShopState {
             egui::Id::new("shop_dialog"),
         ));
         dp.set_opacity(shop_ease * de);
-        dp.rect_filled(screen, egui::CornerRadius::ZERO, Color32::from_black_alpha(195));
+        dp.rect_filled(
+            screen,
+            egui::CornerRadius::ZERO,
+            Color32::from_black_alpha(195),
+        );
         let handle = interactive && !self.dialog_closing;
 
         match kind {
