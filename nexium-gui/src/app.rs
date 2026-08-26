@@ -1139,7 +1139,7 @@ impl HorizonApp {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: eframe::wgpu::TextureDimension::D2,
-                format: eframe::wgpu::TextureFormat::Rgba8UnormSrgb,
+                format: eframe::wgpu::TextureFormat::Rgba8Unorm,
                 usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING
                     | eframe::wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
