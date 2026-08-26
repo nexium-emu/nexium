@@ -2,11 +2,11 @@ use super::{Kernel, MUTEX_HAS_LISTENERS};
 use crate::kernel::cpu_local::{cpu_mut, cpu_ref};
 use crate::kernel::handles::HandleType;
 use crate::kernel::session::Session;
-use crate::services::audio_renderer::behavior as audren_behavior;
 use crate::kernel::{
     present_delivery_lane, AudioAdpcmContext, AudioAdpcmDecodeState, AudioAdpcmStreamKey,
     AudioRendererState, PresentDeliveryLanes, PresentMetadata, PresentMetadataQueue,
 };
+use crate::services::audio_renderer::behavior as audren_behavior;
 use nexium_common::result::{
     KERNEL_CANCELLED, KERNEL_INVALID_ADDRESS, KERNEL_INVALID_ENUM_VALUE, KERNEL_INVALID_HANDLE,
     KERNEL_INVALID_PRIORITY, KERNEL_INVALID_THREAD_STATE, KERNEL_NOT_IMPLEMENTED, KERNEL_TIMEOUT,
@@ -426,7 +426,11 @@ fn parse_audio_biquad(bytes: &[u8]) -> AudioBiquadCoefficients {
     }
 }
 
-fn apply_audio_biquad(coefficients: &AudioBiquadCoefficients, state: &mut [f32; 2], input: f32) -> f32 {
+fn apply_audio_biquad(
+    coefficients: &AudioBiquadCoefficients,
+    state: &mut [f32; 2],
+    input: f32,
+) -> f32 {
     let output = input * coefficients.a0 + state[0];
     state[0] = input * coefficients.a1 + output * coefficients.b1 + state[1];
     state[1] = input * coefficients.a2 + output * coefficients.b2;
@@ -817,11 +821,8 @@ mod audio_pcm_tests {
 
     #[test]
     fn biquad_parameters_decode_as_q14_fixed_point() {
-        let parsed = super::parse_audio_biquad(&biquad_bytes(
-            true,
-            [16384, -8192, 4096],
-            [8192, -16384],
-        ));
+        let parsed =
+            super::parse_audio_biquad(&biquad_bytes(true, [16384, -8192, 4096], [8192, -16384]));
         assert!(parsed.enabled);
         assert_eq!(parsed.a0, 1.0);
         assert_eq!(parsed.a1, -0.5);
@@ -849,11 +850,8 @@ mod audio_pcm_tests {
 
     #[test]
     fn biquad_recurrence_matches_the_reference_transposed_form() {
-        let filter = super::parse_audio_biquad(&biquad_bytes(
-            true,
-            [8192, 4096, 2048],
-            [4096, -2048],
-        ));
+        let filter =
+            super::parse_audio_biquad(&biquad_bytes(true, [8192, 4096, 2048], [4096, -2048]));
         let (a0, a1, a2, b1, b2) = (0.5f32, 0.25, 0.125, 0.25, -0.125);
         let mut state = [0.0f32; 2];
         let mut expected = [0.0f32; 2];
@@ -2967,6 +2965,36 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
     SUCCESS
 }
 
+pub fn condvar_signal_counts() -> &'static std::sync::Mutex<std::collections::HashMap<u64, u64>> {
+    static COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, u64>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn condvar_diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_STUCK_DIAG")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+    })
+}
+
+fn note_condvar_signal(condvar_addr: u64) {
+    if !condvar_diagnostics_enabled() {
+        return;
+    }
+    if let Ok(mut counts) = condvar_signal_counts().lock() {
+        let entry = counts.entry(condvar_addr).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+}
+
 fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
     let (condvar_addr, count) = if let Some(cpu) = cpu_ref() {
         (cpu.get_register(0), cpu.get_register(1) as i32)
@@ -2974,6 +3002,8 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
         return 1;
     };
 
+    let diagnostics = condvar_diagnostics_enabled();
+    let had_waiters = diagnostics && kernel.threads.has_condvar_waiters(condvar_addr);
     let max = if count <= 0 { i32::MAX } else { count };
     let mut woken = 0;
     'outer: for _ in 0..max {
@@ -2985,6 +3015,14 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
         loop {
             let cur_word = match kernel.address_space.atomic_load_u32(mutex_addr) {
                 Ok(w) => w,
+                Err(_) if diagnostics => {
+                    log::warn!(
+                        "[condvar-lost] mutex access failed cond={:#x} mutex={:#x}",
+                        condvar_addr,
+                        mutex_addr
+                    );
+                    break 'outer;
+                }
                 Err(_) => break 'outer,
             };
             let holder = cur_word & !MUTEX_HAS_LISTENERS;
@@ -3001,6 +3039,14 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
                 {
                     Ok(true) => {}
                     Ok(false) => continue,
+                    Err(_) if diagnostics => {
+                        log::warn!(
+                            "[condvar-lost] mutex access failed cond={:#x} mutex={:#x}",
+                            condvar_addr,
+                            mutex_addr
+                        );
+                        break 'outer;
+                    }
                     Err(_) => break 'outer,
                 }
                 kernel.threads.wake_condvar_to_ready(handle);
@@ -3022,6 +3068,14 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
                     {
                         Ok(true) => {}
                         Ok(false) => continue,
+                        Err(_) if diagnostics => {
+                            log::warn!(
+                                "[condvar-lost] mutex access failed cond={:#x} mutex={:#x}",
+                                condvar_addr,
+                                mutex_addr
+                            );
+                            break 'outer;
+                        }
                         Err(_) => break 'outer,
                     }
                 }
@@ -3060,6 +3114,15 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
             lr
         );
     }
+    if had_waiters && woken == 0 {
+        log::warn!(
+            "[condvar-lost] cond={:#x} count={} woken={} but waiters were present",
+            condvar_addr,
+            count,
+            woken
+        );
+    }
+    note_condvar_signal(condvar_addr);
     log::trace!(
         "svcSignalProcessWideKey cond={:#x} count={} woken={}",
         condvar_addr,

@@ -32,6 +32,40 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn stuck_diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_STUCK_DIAG")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+    })
+}
+
+fn stuck_backtrace_due() -> bool {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static LAST: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+    let cell = LAST.get_or_init(|| Mutex::new(None));
+    let mut guard = match cell.lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+    let now = std::time::Instant::now();
+    let due = match *guard {
+        Some(previous) => now.duration_since(previous) >= std::time::Duration::from_secs(2),
+        None => true,
+    };
+    if due {
+        *guard = Some(now);
+    }
+    due
+}
+
 fn cpu_slice_cycles() -> u64 {
     static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -544,8 +578,7 @@ impl FrameDeliveryGuard {
             .spawn(move || {
                 let mut pending_frame = None;
                 loop {
-                    if worker_stop.load(Ordering::Acquire)
-                        || emulation_stop.load(Ordering::Acquire)
+                    if worker_stop.load(Ordering::Acquire) || emulation_stop.load(Ordering::Acquire)
                     {
                         break;
                     }
@@ -563,8 +596,7 @@ impl FrameDeliveryGuard {
                             pixels: frame.pixels,
                         });
                     }
-                    if !try_deliver_pending_frame(&frame_tx, &mut pending_frame, repaint.as_ref())
-                    {
+                    if !try_deliver_pending_frame(&frame_tx, &mut pending_frame, repaint.as_ref()) {
                         break;
                     }
                     if pending_frame.is_some() {
@@ -1625,6 +1657,88 @@ impl EmulationHandle {
                                     "[stuck-cpu #{}] handle={:?} pc={:#x} lr={:#x} x0={:#x} x1={:#x} x8={:#x} x16={:#x} x19={:#x} x20={:#x} insn=[{:#010x} {:#010x} {:#010x} {:#010x}] threads={} states=[{}]",
                                     stuck_log_counter, cur, pc_after, lr, x0, x1, x8, x16, x19, x20, i0, i1, i2, i3, n_threads_total, states.join(",")
                                 );
+                                    if stuck_diagnostics_enabled() && stuck_backtrace_due() {
+                                        let read_u64_bt = |addr: u64| -> Option<u64> {
+                                            let mut buf = [0u8; 8];
+                                            guard.address_space.read(addr, &mut buf).ok()?;
+                                            Some(u64::from_le_bytes(buf))
+                                        };
+                                        let mut frames = vec![lr];
+                                        let mut fp = cpu.get_register(29);
+                                        for _ in 0..24 {
+                                            if fp == 0 || fp & 0x7 != 0 {
+                                                break;
+                                            }
+                                            let Some(next_fp) = read_u64_bt(fp) else {
+                                                break;
+                                            };
+                                            let Some(frame_lr) = read_u64_bt(fp + 8) else {
+                                                break;
+                                            };
+                                            if frame_lr == 0 {
+                                                break;
+                                            }
+                                            frames.push(frame_lr);
+                                            if next_fp <= fp {
+                                                break;
+                                            }
+                                            fp = next_fp;
+                                        }
+                                        let x21 = cpu.get_register(21);
+                                        let x22 = cpu.get_register(22);
+                                        let x26 = cpu.get_register(26);
+                                        let x27 = cpu.get_register(27);
+                                        let polled = {
+                                            let mut buf = [0u8; 4];
+                                            guard
+                                                .address_space
+                                                .read(x26, &mut buf)
+                                                .ok()
+                                                .map(|_| u32::from_le_bytes(buf))
+                                        };
+                                        log::warn!(
+                                            "[stuck-poll] addr={:#x} value={:?} threshold={:#x} ({}) deadline={:#x} obj={:#x}",
+                                            x26,
+                                            polled,
+                                            x27 as u32,
+                                            x27 as u32,
+                                            x22,
+                                            x21
+                                        );
+                                        if let Ok(counts) =
+                                            nexium_core::kernel::svc::condvar_signal_counts().lock()
+                                        {
+                                            let parked: Vec<String> = guard
+                                                .threads
+                                                .threads
+                                                .iter()
+                                                .filter_map(|(h, t)| match &t.state {
+                                                    nexium_core::kernel::threads::ThreadState::WaitingCondvar {
+                                                        condvar_addr,
+                                                        ..
+                                                    } => Some(format!(
+                                                        "{:#x}@{:#x}:sig={}",
+                                                        h,
+                                                        condvar_addr,
+                                                        counts.get(condvar_addr).copied().unwrap_or(0)
+                                                    )),
+                                                    _ => None,
+                                                })
+                                                .collect();
+                                            log::warn!("[stuck-condvars] {}", parked.join(" "));
+                                        }
+                                        log::warn!(
+                                            "[stuck-bt] handle={:?} pc={:#x} sp={:#x} frames=[{}]",
+                                            cur,
+                                            pc_after,
+                                            cpu.get_register(31),
+                                            frames
+                                                .iter()
+                                                .map(|f| format!("{f:#x}"))
+                                                .collect::<Vec<_>>()
+                                                .join(" ")
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1740,7 +1854,8 @@ impl EmulationHandle {
                                             return None;
                                         }
                                         let s = &buf[..end];
-                                        if s.iter().all(|&b| (0x20..0x7f).contains(&b) || b == b'\n')
+                                        if s.iter()
+                                            .all(|&b| (0x20..0x7f).contains(&b) || b == b'\n')
                                         {
                                             Some(String::from_utf8_lossy(s).into_owned())
                                         } else {
