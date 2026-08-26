@@ -9,7 +9,7 @@ use crate::debugger::DebuggerState;
 use crate::input::{InputBackend, InputSnapshot};
 use crate::performance::PerformanceMonitor;
 use eframe::egui;
-use eframe::egui::{Color32, FontId, CornerRadius, Sense, Stroke, Vec2};
+use eframe::egui::{Color32, CornerRadius, FontId, Sense, Stroke, Vec2};
 use std::sync::Arc;
 
 const BG: Color32 = Color32::from_rgb(0x0F, 0x0F, 0x11);
@@ -90,7 +90,12 @@ fn status_icon(ui: &mut egui::Ui, icon: StatusIcon, color: Color32) -> egui::Res
                 egui::pos2(r.left() + r.width() * 0.22, r.top()),
                 egui::pos2(r.right() - r.width() * 0.22, r.top() + r.height() * 0.58),
             );
-            p.rect_stroke(screen, 1.0, Stroke::new(1.2_f32, color), egui::StrokeKind::Outside);
+            p.rect_stroke(
+                screen,
+                1.0,
+                Stroke::new(1.2_f32, color),
+                egui::StrokeKind::Outside,
+            );
             let dock = egui::Rect::from_min_max(
                 egui::pos2(r.left(), r.top() + r.height() * 0.48),
                 r.right_bottom(),
@@ -114,7 +119,12 @@ fn status_icon(ui: &mut egui::Ui, icon: StatusIcon, color: Color32) -> egui::Res
                 2.0,
                 color,
             );
-            p.rect_stroke(body, 2.0, Stroke::new(1.1_f32, color), egui::StrokeKind::Outside);
+            p.rect_stroke(
+                body,
+                2.0,
+                Stroke::new(1.1_f32, color),
+                egui::StrokeKind::Outside,
+            );
         }
     }
     resp
@@ -1521,7 +1531,12 @@ impl HorizonApp {
             Color32::from_black_alpha(90),
         );
         paint.rect_filled(box_rect, CornerRadius::same(20), panel);
-        paint.rect_stroke(box_rect, CornerRadius::same(20), Stroke::new(1.5_f32, border), egui::StrokeKind::Outside);
+        paint.rect_stroke(
+            box_rect,
+            CornerRadius::same(20),
+            Stroke::new(1.5_f32, border),
+            egui::StrokeKind::Outside,
+        );
         paint.text(
             egui::pos2(box_rect.center().x, box_rect.min.y + 34.0),
             egui::Align2::CENTER_CENTER,
@@ -2000,7 +2015,12 @@ impl HorizonApp {
             let rounding = egui::CornerRadius::from(12.0 * s);
             if selected {
                 p.rect_filled(r, rounding, sel);
-                p.rect_stroke(r, rounding, egui::Stroke::new(1.8_f32, ring), egui::StrokeKind::Outside);
+                p.rect_stroke(
+                    r,
+                    rounding,
+                    egui::Stroke::new(1.8_f32, ring),
+                    egui::StrokeKind::Outside,
+                );
                 let bar = sr(egui::Rect::from_min_size(
                     base.min + egui::Vec2::new(6.0 * s, 12.0 * s),
                     egui::Vec2::new(4.0 * s, base.height() - 24.0 * s),
@@ -3655,7 +3675,12 @@ impl HorizonApp {
             let rounding = egui::CornerRadius::from(12.0 * s);
             if selected {
                 p.rect_filled(r, rounding, sel);
-                p.rect_stroke(r, rounding, egui::Stroke::new(1.8_f32, ring), egui::StrokeKind::Outside);
+                p.rect_stroke(
+                    r,
+                    rounding,
+                    egui::Stroke::new(1.8_f32, ring),
+                    egui::StrokeKind::Outside,
+                );
                 let bar = sr(egui::Rect::from_min_size(
                     base.min + egui::Vec2::new(6.0 * s, 12.0 * s),
                     egui::Vec2::new(4.0 * s, base.height() - 24.0 * s),
@@ -6180,7 +6205,12 @@ impl HorizonApp {
             Color32::from_black_alpha(90),
         );
         p.rect_filled(box_rect, CornerRadius::same(18), panel);
-        p.rect_stroke(box_rect, CornerRadius::same(18), Stroke::new(1.5_f32, border), egui::StrokeKind::Outside);
+        p.rect_stroke(
+            box_rect,
+            CornerRadius::same(18),
+            Stroke::new(1.5_f32, border),
+            egui::StrokeKind::Outside,
+        );
 
         if is_teardown {
             p.text(
@@ -6243,9 +6273,19 @@ impl HorizonApp {
                     rounding,
                     Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 42),
                 );
-                p.rect_stroke(rect, rounding, Stroke::new(2.6_f32, accent), egui::StrokeKind::Outside);
+                p.rect_stroke(
+                    rect,
+                    rounding,
+                    Stroke::new(2.6_f32, accent),
+                    egui::StrokeKind::Outside,
+                );
             } else {
-                p.rect_stroke(rect, rounding, Stroke::new(1.2_f32, border), egui::StrokeKind::Outside);
+                p.rect_stroke(
+                    rect,
+                    rounding,
+                    Stroke::new(1.2_f32, border),
+                    egui::StrokeKind::Outside,
+                );
             }
             let col = if sel {
                 let f = |x: u8| (x as f32 + (255.0 - x as f32) * 0.2) as u8;
@@ -7411,11 +7451,19 @@ fn game_tile(
                 egui::StrokeKind::Outside,
             );
         }
-        ui.painter()
-            .rect_stroke(rect, rounding, Stroke::new(1.4_f32, ACCENT_HV), egui::StrokeKind::Outside);
+        ui.painter().rect_stroke(
+            rect,
+            rounding,
+            Stroke::new(1.4_f32, ACCENT_HV),
+            egui::StrokeKind::Outside,
+        );
     } else {
-        ui.painter()
-            .rect_stroke(rect, rounding, Stroke::new(1.0_f32, BORDER), egui::StrokeKind::Outside);
+        ui.painter().rect_stroke(
+            rect,
+            rounding,
+            Stroke::new(1.0_f32, BORDER),
+            egui::StrokeKind::Outside,
+        );
     }
 
     let pad = 11.0;
@@ -7481,11 +7529,19 @@ fn add_folder_tile(ui: &mut egui::Ui) -> egui::Response {
     let rounding = CornerRadius::same(10);
     ui.painter().rect_filled(rect, rounding, bg);
     if hovered {
-        ui.painter()
-            .rect_stroke(rect, rounding, Stroke::new(1.4_f32, ACCENT_HV), egui::StrokeKind::Outside);
+        ui.painter().rect_stroke(
+            rect,
+            rounding,
+            Stroke::new(1.4_f32, ACCENT_HV),
+            egui::StrokeKind::Outside,
+        );
     } else {
-        ui.painter()
-            .rect_stroke(rect, rounding, Stroke::new(1.0_f32, BORDER), egui::StrokeKind::Outside);
+        ui.painter().rect_stroke(
+            rect,
+            rounding,
+            Stroke::new(1.0_f32, BORDER),
+            egui::StrokeKind::Outside,
+        );
     }
 
     let pad = 11.0;
@@ -7646,7 +7702,13 @@ fn pill_button(ui: &mut egui::Ui, label: &str, filled: bool) -> egui::Response {
         (c, TEXT, Stroke::new(1.0_f32, bc))
     };
 
-    ui.painter().rect(rect, CornerRadius::same(5), bg, stroke, egui::StrokeKind::Outside);
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(5),
+        bg,
+        stroke,
+        egui::StrokeKind::Outside,
+    );
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -9486,7 +9548,13 @@ fn draw_controller_diagram(ui: &mut egui::Ui, input: &InputSnapshot) {
     let c = rect.center();
     let map = |x: f32, y: f32| c + Vec2::new(x * s, (y + 6.0) * s);
 
-    painter.rect(rect, CornerRadius::same(10), BG, Stroke::NONE, egui::StrokeKind::Outside);
+    painter.rect(
+        rect,
+        CornerRadius::same(10),
+        BG,
+        Stroke::NONE,
+        egui::StrokeKind::Outside,
+    );
 
     let outline = Color32::from_rgb(0x4C, 0x4C, 0x58);
     let body_stroke = Stroke::new((2.0 * s).max(1.2), outline);
@@ -9527,7 +9595,13 @@ fn draw_controller_diagram(ui: &mut egui::Ui, input: &InputSnapshot) {
     let pad = |center: egui::Pos2, sz: Vec2, label: &str, on: bool| {
         let r = egui::Rect::from_center_size(center, sz);
         let fill = if on { ACCENT } else { BG_INPUT };
-        painter.rect(r, CornerRadius::same(3), fill, Stroke::new(1.0_f32, BORDER), egui::StrokeKind::Outside);
+        painter.rect(
+            r,
+            CornerRadius::same(3),
+            fill,
+            Stroke::new(1.0_f32, BORDER),
+            egui::StrokeKind::Outside,
+        );
         if !label.is_empty() {
             let tc = if on { Color32::WHITE } else { MUTED };
             painter.text(
