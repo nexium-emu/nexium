@@ -7961,6 +7961,19 @@ impl eframe::App for HorizonApp {
                 buttons = 0;
                 sticks = [0i32; 4];
             }
+            if !swkbd_open
+                && std::env::var_os("NEXIUM_TEST_AUTOPRESS_A").is_some()
+                && self
+                    .emulation_handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.is_running())
+            {
+                let elapsed = ctx.input(|input| input.time) - 30.0;
+                if elapsed >= 0.0 && elapsed % 8.0 < 0.25 {
+                    buttons |= SwitchButton::A.npad_bit();
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
             if diagnostics_enabled()
                 && (buttons != self.last_buttons_logged || sticks != self.last_sticks_logged)
             {
