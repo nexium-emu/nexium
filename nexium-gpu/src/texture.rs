@@ -220,6 +220,35 @@ impl TicFormat {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SampleGrid {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl SampleGrid {
+    pub const SINGLE: Self = Self {
+        width: 1,
+        height: 1,
+    };
+
+    pub fn count(self) -> u32 {
+        self.width.saturating_mul(self.height)
+    }
+}
+
+pub fn maxwell_sample_grid(msaa_mode: u32) -> Option<SampleGrid> {
+    let (width, height) = match msaa_mode {
+        0 => (1, 1),
+        1 | 5 => (2, 1),
+        2 | 8 | 9 => (2, 2),
+        3 | 4 | 10 | 11 => (4, 2),
+        6 => (4, 4),
+        _ => return None,
+    };
+    Some(SampleGrid { width, height })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TicEntry {
     pub format: TicFormat,
     pub component_types: [ComponentType; 4],
@@ -238,6 +267,8 @@ pub struct TicEntry {
     pub base_layer: u32,
     pub normalized_coords: bool,
     pub is_srgb: bool,
+    pub is_sparse: bool,
+    pub msaa_mode: u32,
     pub max_mip_level: u32,
     pub res_min_mip_level: u32,
     pub res_max_mip_level: u32,
@@ -304,11 +335,13 @@ impl TicEntry {
         let w5 = u32::from_le_bytes([raw[20], raw[21], raw[22], raw[23]]);
         let height = (w5 & 0xFFFF) + 1;
         let depth = ((w5 >> 16) & 0x3FFF) + 1;
+        let is_sparse = (w5 >> 30) & 1 != 0;
         let normalized_coords = (w5 >> 31) & 1 != 0;
         let w7 = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
         let max_mip_level = (w3 >> 28) & 0xF;
         let res_min_mip_level = w7 & 0xF;
         let res_max_mip_level = (w7 >> 4) & 0xF;
+        let msaa_mode = (w7 >> 8) & 0xF;
 
         if gpu_va == 0
             || width == 0
@@ -337,6 +370,8 @@ impl TicEntry {
             base_layer,
             normalized_coords,
             is_srgb,
+            is_sparse,
+            msaa_mode,
             max_mip_level,
             res_min_mip_level,
             res_max_mip_level,
@@ -367,12 +402,54 @@ impl TicEntry {
             .saturating_add(1)
     }
 
+    pub fn sample_grid(&self) -> Option<SampleGrid> {
+        if self.is_buffer() {
+            Some(SampleGrid::SINGLE)
+        } else {
+            maxwell_sample_grid(self.msaa_mode)
+        }
+    }
+
+    pub fn sample_count(&self) -> Option<u32> {
+        self.sample_grid().map(SampleGrid::count)
+    }
+
+    pub fn logical_mip_extent(&self, level: u32) -> (u32, u32) {
+        (
+            self.width.checked_shr(level).unwrap_or(0).max(1),
+            self.height.checked_shr(level).unwrap_or(0).max(1),
+        )
+    }
+
+    pub fn physical_mip_extent(&self, level: u32) -> Option<(u32, u32)> {
+        let (width, height) = self.logical_mip_extent(level);
+        let samples = self.sample_grid()?;
+        Some((
+            width.checked_mul(samples.width)?,
+            height.checked_mul(samples.height)?,
+        ))
+    }
+
+    pub fn physical_storage_extent(&self, level: u32) -> Option<(u32, u32, usize)> {
+        if self.is_sparse {
+            return None;
+        }
+        let (width, height) = self.physical_mip_extent(level)?;
+        Some(self.format.storage_extent(width, height))
+    }
+
+    pub fn physical_linear_size(&self, level: u32) -> Option<usize> {
+        let (storage_width, storage_height, bpp) = self.physical_storage_extent(level)?;
+        (storage_width as usize)
+            .checked_mul(storage_height as usize)?
+            .checked_mul(bpp)
+    }
+
     pub fn pitch_linear_layer_size(&self) -> Option<usize> {
         if self.pitch_bytes == 0 {
             return None;
         }
-        let (storage_width, storage_height, bpp) =
-            self.format.storage_extent(self.width, self.height);
+        let (storage_width, storage_height, bpp) = self.physical_storage_extent(0)?;
         let row_size = (storage_width as usize).checked_mul(bpp)?;
         let pitch = self.pitch_bytes as usize;
         if pitch < row_size {
@@ -392,7 +469,7 @@ impl TicEntry {
         }
         self.pitch_linear_layer_size()
             .or_else(|| block_linear_mip_layout(self).map(|layout| layout.layer_stride))
-            .or_else(|| Some(self.format.linear_size(self.width, self.height)))
+            .or_else(|| self.physical_linear_size(0))
     }
 
     pub fn backing_gpu_va(&self) -> Option<u64> {
@@ -438,7 +515,7 @@ impl BlockLinearMipLayout {
 }
 
 pub fn block_linear_mip_layout(tic: &TicEntry) -> Option<BlockLinearMipLayout> {
-    if !tic.is_block_linear || tic.texture_type == 2 {
+    if !tic.is_block_linear || tic.texture_type == 2 || tic.is_sparse {
         return None;
     }
 
@@ -452,9 +529,8 @@ pub fn block_linear_mip_layout(tic: &TicEntry) -> Option<BlockLinearMipLayout> {
     let mut levels = Vec::with_capacity(mip_levels as usize);
     let mut layer_size = 0usize;
     for level in 0..mip_levels {
-        let width = (tic.width >> level).max(1);
-        let height = (tic.height >> level).max(1);
-        let (storage_width, storage_height, _) = tic.format.storage_extent(width, height);
+        let (width, height) = tic.logical_mip_extent(level);
+        let (storage_width, storage_height, _) = tic.physical_storage_extent(level)?;
         let width_bytes = storage_width.saturating_mul(bpp as u32);
 
         let single_base_level = level == 0 && mip_levels == 1;
@@ -515,7 +591,7 @@ pub fn block_linear_mip_layout(tic: &TicEntry) -> Option<BlockLinearMipLayout> {
                     .saturating_add(block_depth_log2),
             )
             .unwrap_or(usize::MAX);
-        let linear_size = tic.format.linear_size(width, height);
+        let linear_size = tic.physical_linear_size(level)?;
         levels.push(BlockLinearMipLevel {
             level,
             width,
@@ -537,7 +613,8 @@ pub fn block_linear_mip_layout(tic: &TicEntry) -> Option<BlockLinearMipLayout> {
             .saturating_add(tic.block_depth_log2)
     } else {
         let (_, tile_height) = tic.format.block_extent();
-        let aligned_height = align_up_u32(tic.height, tile_height.max(1));
+        let (_, physical_height) = tic.physical_mip_extent(0)?;
+        let aligned_height = align_up_u32(physical_height, tile_height.max(1));
         let block_height_log2 = adjusted_mip_block_log2(aligned_height, tic.block_height_log2, 8);
         let block_depth_log2 = adjusted_mip_block_log2(1, tic.block_depth_log2, 1);
         9u32.saturating_add(block_height_log2)
@@ -559,7 +636,7 @@ pub fn texture_guest_size_bytes(tic: &TicEntry, layers: u32) -> Option<usize> {
 
 pub fn unpack_pitch_linear(raw: &[u8], tic: &TicEntry, layers: u32) -> Option<Vec<u8>> {
     let layer_guest_size = tic.pitch_linear_layer_size()?;
-    let (storage_width, storage_height, bpp) = tic.format.storage_extent(tic.width, tic.height);
+    let (storage_width, storage_height, bpp) = tic.physical_storage_extent(0)?;
     let row_size = (storage_width as usize).checked_mul(bpp)?;
     let layer_linear_size = row_size.checked_mul(storage_height as usize)?;
     let layer_count = layers.max(1) as usize;
@@ -824,7 +901,7 @@ pub fn unswizzle_block_linear_strided(
     let rows_per_block = block_height * GOB_H;
     let aligned_width = align_up_pow2_usize(width, stride_alignment_log2);
     let aligned_width_bytes = aligned_width.saturating_mul(bpp);
-    let gobs_per_row = (aligned_width_bytes + GOB_W - 1) / GOB_W;
+    let gobs_per_row = aligned_width_bytes.div_ceil(GOB_W);
     let block_row_stride_bytes = gobs_per_row * block_height * GOB_SIZE;
 
     for y in 0..height {
@@ -916,19 +993,46 @@ pub fn unswizzle_block_linear_3d(
     block_depth_log2: u32,
     tile_width_spacing: u32,
 ) -> Vec<u8> {
+    unswizzle_block_linear_3d_with_block_width(
+        src,
+        width_px,
+        height_px,
+        depth_px,
+        bpp,
+        0,
+        block_height_log2,
+        block_depth_log2,
+        tile_width_spacing,
+    )
+}
+
+pub fn unswizzle_block_linear_3d_with_block_width(
+    src: &[u8],
+    width_px: u32,
+    height_px: u32,
+    depth_px: u32,
+    bpp: usize,
+    block_width_log2: u32,
+    block_height_log2: u32,
+    block_depth_log2: u32,
+    tile_width_spacing: u32,
+) -> Vec<u8> {
     let width = width_px as usize;
     let height = height_px as usize;
     let depth = depth_px as usize;
     let dst_stride = width.saturating_mul(bpp);
     let mut dst = vec![0u8; dst_stride.saturating_mul(height).saturating_mul(depth)];
-    let gobs_in_x = block_linear_gobs_in_x(
-        width,
-        height,
-        depth,
-        bpp,
-        block_height_log2,
-        block_depth_log2,
-        tile_width_spacing,
+    let gobs_in_x = align_up_pow2_usize(
+        block_linear_gobs_in_x(
+            width,
+            height,
+            depth,
+            bpp,
+            block_height_log2,
+            block_depth_log2,
+            tile_width_spacing,
+        ),
+        block_width_log2,
     );
     let block_height = 1usize << block_height_log2 as usize;
     let block_depth = 1usize << block_depth_log2 as usize;
@@ -1039,6 +1143,113 @@ pub fn swizzle_block_linear_3d(
     dst
 }
 
+pub fn native_render_target_source_size(
+    width_px: u32,
+    height_px: u32,
+    depth_px: u32,
+    bpp: usize,
+    layout_signature: u64,
+) -> Option<usize> {
+    let width = usize::try_from(width_px).ok()?;
+    let height = usize::try_from(height_px).ok()?;
+    let depth = usize::try_from(depth_px).ok()?;
+    if width == 0 || height == 0 || depth == 0 || bpp == 0 {
+        return None;
+    }
+    let row_bytes = width.checked_mul(bpp)?;
+    let tight_size = row_bytes.checked_mul(height)?.checked_mul(depth)?;
+
+    match layout_signature & 0xff {
+        0 if layout_signature == 0 => Some(tight_size),
+        1 if layout_signature >> 40 == 0 => {
+            let block_width_log2 = ((layout_signature >> 8) & 0xff) as u32;
+            let block_height_log2 = ((layout_signature >> 16) & 0xff) as u32;
+            let block_depth_log2 = ((layout_signature >> 24) & 0xff) as u32;
+            let tile_width_spacing = ((layout_signature >> 32) & 0xff) as u32;
+            checked_block_linear_byte_size_3d_with_block_width(
+                width,
+                height,
+                depth,
+                bpp,
+                block_width_log2,
+                block_height_log2,
+                block_depth_log2,
+                tile_width_spacing,
+            )
+        }
+        2 if layout_signature >> 40 == 0 => {
+            let pitch = usize::try_from(layout_signature >> 8).ok()?;
+            (pitch >= row_bytes)
+                .then(|| pitch.checked_mul(height)?.checked_mul(depth))
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+pub fn unpack_native_render_target(
+    src: &[u8],
+    width_px: u32,
+    height_px: u32,
+    depth_px: u32,
+    bpp: usize,
+    layout_signature: u64,
+) -> Option<Vec<u8>> {
+    let guest_size =
+        native_render_target_source_size(width_px, height_px, depth_px, bpp, layout_signature)?;
+    if src.len() < guest_size {
+        return None;
+    }
+    let width = usize::try_from(width_px).ok()?;
+    let height = usize::try_from(height_px).ok()?;
+    let depth = usize::try_from(depth_px).ok()?;
+    let row_bytes = width.checked_mul(bpp)?;
+    let tight_size = row_bytes.checked_mul(height)?.checked_mul(depth)?;
+
+    match layout_signature & 0xff {
+        0 if layout_signature == 0 => Some(src[..tight_size].to_vec()),
+        1 if layout_signature >> 40 == 0 => {
+            let block_width_log2 = ((layout_signature >> 8) & 0xff) as u32;
+            let block_height_log2 = ((layout_signature >> 16) & 0xff) as u32;
+            let block_depth_log2 = ((layout_signature >> 24) & 0xff) as u32;
+            let tile_width_spacing = ((layout_signature >> 32) & 0xff) as u32;
+            let unit_bpp_log2 = row_bytes.trailing_zeros().min(4);
+            let unit_bpp = 1usize.checked_shl(unit_bpp_log2)?;
+            let unit_width = u32::try_from(row_bytes / unit_bpp).ok()?;
+            let linear = unswizzle_block_linear_3d_with_block_width(
+                &src[..guest_size],
+                unit_width,
+                height_px,
+                depth_px,
+                unit_bpp,
+                block_width_log2,
+                block_height_log2,
+                block_depth_log2,
+                tile_width_spacing,
+            );
+            (linear.len() == tight_size).then_some(linear)
+        }
+        2 if layout_signature >> 40 == 0 => {
+            let pitch = usize::try_from(layout_signature >> 8).ok()?;
+            if pitch < row_bytes {
+                return None;
+            }
+            let slice_size = pitch.checked_mul(height)?;
+            let mut linear = Vec::with_capacity(tight_size);
+            for z in 0..depth {
+                let slice_offset = z.checked_mul(slice_size)?;
+                for y in 0..height {
+                    let row_offset = slice_offset.checked_add(y.checked_mul(pitch)?)?;
+                    let row_end = row_offset.checked_add(row_bytes)?;
+                    linear.extend_from_slice(src.get(row_offset..row_end)?);
+                }
+            }
+            Some(linear)
+        }
+        _ => None,
+    }
+}
+
 pub fn block_linear_byte_size_3d(
     width_px: u32,
     height_px: u32,
@@ -1048,14 +1259,39 @@ pub fn block_linear_byte_size_3d(
     block_depth_log2: u32,
     tile_width_spacing: u32,
 ) -> usize {
-    let gobs_in_x = block_linear_gobs_in_x(
-        width_px as usize,
-        height_px as usize,
-        depth_px as usize,
+    block_linear_byte_size_3d_with_block_width(
+        width_px,
+        height_px,
+        depth_px,
         bpp,
+        0,
         block_height_log2,
         block_depth_log2,
         tile_width_spacing,
+    )
+}
+
+pub fn block_linear_byte_size_3d_with_block_width(
+    width_px: u32,
+    height_px: u32,
+    depth_px: u32,
+    bpp: usize,
+    block_width_log2: u32,
+    block_height_log2: u32,
+    block_depth_log2: u32,
+    tile_width_spacing: u32,
+) -> usize {
+    let gobs_in_x = align_up_pow2_usize(
+        block_linear_gobs_in_x(
+            width_px as usize,
+            height_px as usize,
+            depth_px as usize,
+            bpp,
+            block_height_log2,
+            block_depth_log2,
+            tile_width_spacing,
+        ),
+        block_width_log2,
     );
     let block_height = 1usize << block_height_log2 as usize;
     let block_depth = 1usize << block_depth_log2 as usize;
@@ -1085,6 +1321,44 @@ fn block_linear_gobs_in_x(
     } else {
         align_up_pow2_usize(raw_gobs, tile_width_spacing)
     }
+}
+
+fn checked_block_linear_byte_size_3d_with_block_width(
+    width: usize,
+    height: usize,
+    depth: usize,
+    bpp: usize,
+    block_width_log2: u32,
+    block_height_log2: u32,
+    block_depth_log2: u32,
+    tile_width_spacing: u32,
+) -> Option<usize> {
+    let width_bytes = width.checked_mul(bpp)?;
+    let raw_gobs = width_bytes.div_ceil(GOB_W);
+    let gob_width_bytes = GOB_W.checked_shl(tile_width_spacing)?;
+    let gob_height = GOB_H.checked_shl(block_height_log2)?;
+    let block_depth = 1usize.checked_shl(block_depth_log2)?;
+    let small = width_bytes <= gob_width_bytes || height <= gob_height || depth < block_depth;
+    let spaced_gobs = if small {
+        raw_gobs
+    } else {
+        checked_align_up_pow2_usize(raw_gobs, tile_width_spacing)?
+    };
+    let gobs_in_x = checked_align_up_pow2_usize(spaced_gobs, block_width_log2)?;
+    let block_height = 1usize.checked_shl(block_height_log2)?;
+    let rows_per_block = block_height.checked_mul(GOB_H)?;
+    let x_shift = 9u32
+        .checked_add(block_height_log2)?
+        .checked_add(block_depth_log2)?;
+    let block_size = gobs_in_x.checked_shl(x_shift)?;
+    let slice_size = height.div_ceil(rows_per_block).checked_mul(block_size)?;
+    depth.div_ceil(block_depth).checked_mul(slice_size)
+}
+
+fn checked_align_up_pow2_usize(value: usize, shift: u32) -> Option<usize> {
+    let alignment = 1usize.checked_shl(shift)?;
+    let mask = alignment.checked_sub(1)?;
+    Some(value.checked_add(mask)? & !mask)
 }
 
 fn align_up_pow2_usize(value: usize, shift: u32) -> usize {
@@ -1873,10 +2147,12 @@ pub fn decode_to_rgba8(src: &[u8], width: u32, height: u32, format: TicFormat) -
 #[cfg(test)]
 mod tests {
     use super::{
-        block_linear_byte_size_3d, block_linear_mip_layout, decode_to_rgba8, decode_to_rgba8_typed,
+        block_linear_byte_size_3d, block_linear_byte_size_3d_with_block_width,
+        block_linear_mip_layout, decode_to_rgba8, decode_to_rgba8_typed, maxwell_sample_grid,
         swizzle_block_linear_3d, swizzle_block_linear_strided, texture_guest_size_bytes,
-        unpack_pitch_linear, unswizzle_block_linear_3d, unswizzle_block_linear_strided,
-        ComponentType, SwizzleSource, TicEntry, TicFormat,
+        unpack_native_render_target, unpack_pitch_linear, unswizzle_block_linear_3d,
+        unswizzle_block_linear_3d_with_block_width, unswizzle_block_linear_strided, ComponentType,
+        SampleGrid, SwizzleSource, TicEntry, TicFormat,
     };
 
     #[test]
@@ -1961,6 +2237,125 @@ mod tests {
     }
 
     #[test]
+    fn maxwell_msaa_modes_decode_to_physical_sample_grids() {
+        let expected = [
+            (0, 1, 1),
+            (1, 2, 1),
+            (2, 2, 2),
+            (3, 4, 2),
+            (4, 4, 2),
+            (5, 2, 1),
+            (6, 4, 4),
+            (8, 2, 2),
+            (9, 2, 2),
+            (10, 4, 2),
+            (11, 4, 2),
+        ];
+        for (mode, width, height) in expected {
+            let grid = maxwell_sample_grid(mode).unwrap();
+            assert_eq!(grid, SampleGrid { width, height });
+            assert_eq!(grid.count(), width * height);
+        }
+        for reserved in [7, 12, 13, 14, 15, 16, u32::MAX] {
+            assert_eq!(maxwell_sample_grid(reserved), None);
+        }
+    }
+
+    #[test]
+    fn parses_msaa_and_sparse_tic_metadata() {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&0x1cu32.to_le_bytes());
+        raw[4..8].copy_from_slice(&1u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&(3u32 << 21).to_le_bytes());
+        raw[16..20].copy_from_slice(&(1u32 << 23).to_le_bytes());
+        raw[20..24].copy_from_slice(&(1u32 << 30).to_le_bytes());
+        raw[28..32].copy_from_slice(&(11u32 << 8).to_le_bytes());
+
+        let tic = TicEntry::parse(&raw).unwrap();
+        assert_eq!(tic.msaa_mode, 11);
+        assert_eq!(
+            tic.sample_grid(),
+            Some(SampleGrid {
+                width: 4,
+                height: 2
+            })
+        );
+        assert_eq!(tic.sample_count(), Some(8));
+        assert!(tic.is_sparse);
+        assert_eq!(tic.depth, 1);
+        assert!(!tic.normalized_coords);
+        assert_eq!((tic.res_min_mip_level, tic.res_max_mip_level), (0, 0));
+        assert_eq!(tic.physical_mip_extent(0), Some((4, 2)));
+        assert_eq!(tic.physical_storage_extent(0), None);
+        assert_eq!(tic.physical_linear_size(0), None);
+        assert_eq!(block_linear_mip_layout(&tic), None);
+        assert_eq!(texture_guest_size_bytes(&tic, 1), None);
+    }
+
+    #[test]
+    fn msaa_expands_physical_footprint_but_not_logical_extent() {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&0x1cu32.to_le_bytes());
+        raw[4..8].copy_from_slice(&1u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&(3u32 << 21).to_le_bytes());
+        raw[16..20].copy_from_slice(&(16u32 | (1 << 23)).to_le_bytes());
+        raw[20..24].copy_from_slice(&8u32.to_le_bytes());
+        raw[28..32].copy_from_slice(&(3u32 << 8).to_le_bytes());
+
+        let tic = TicEntry::parse(&raw).unwrap();
+        assert_eq!((tic.width, tic.height), (17, 9));
+        assert_eq!(tic.logical_mip_extent(0), (17, 9));
+        assert_eq!(tic.physical_mip_extent(0), Some((68, 18)));
+        assert_eq!(tic.physical_storage_extent(0), Some((68, 18, 1)));
+        assert_eq!(tic.physical_linear_size(0), Some(68 * 18));
+
+        let layout = block_linear_mip_layout(&tic).unwrap();
+        assert_eq!((layout.levels[0].width, layout.levels[0].height), (17, 9));
+        assert_eq!(
+            (
+                layout.levels[0].storage_width,
+                layout.levels[0].storage_height,
+            ),
+            (68, 18)
+        );
+        assert_eq!(layout.levels[0].linear_size, 68 * 18);
+        assert_eq!(layout.levels[0].guest_size, 6 * 512);
+        assert_eq!(texture_guest_size_bytes(&tic, 1), Some(6 * 512));
+    }
+
+    #[test]
+    fn msaa_expansion_precedes_compression_block_rounding() {
+        let tic = TicEntry {
+            format: TicFormat::BC1,
+            component_types: [ComponentType::Unorm; 4],
+            swizzle: [SwizzleSource::R; 4],
+            gpu_va: 1,
+            width: 7,
+            height: 5,
+            block_width_log2: 0,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            pitch_bytes: 0,
+            is_block_linear: true,
+            texture_type: 1,
+            depth: 1,
+            base_layer: 0,
+            normalized_coords: true,
+            is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 2,
+            max_mip_level: 0,
+            res_min_mip_level: 0,
+            res_max_mip_level: 0,
+        };
+        assert_eq!(tic.logical_mip_extent(0), (7, 5));
+        assert_eq!(tic.physical_mip_extent(0), Some((14, 10)));
+        assert_eq!(tic.physical_storage_extent(0), Some((4, 3, 8)));
+        assert_eq!(tic.physical_linear_size(0), Some(96));
+    }
+
+    #[test]
     fn pitch_linear_rows_unpack_without_padding() {
         let tic = TicEntry {
             format: TicFormat::R8,
@@ -1980,6 +2375,8 @@ mod tests {
             base_layer: 0,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 0,
             res_min_mip_level: 0,
             res_max_mip_level: 0,
@@ -2126,6 +2523,8 @@ mod tests {
             base_layer: 0,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 7,
             res_min_mip_level: 0,
             res_max_mip_level: 7,
@@ -2172,6 +2571,8 @@ mod tests {
             base_layer: 3,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 0,
             res_min_mip_level: 0,
             res_max_mip_level: 0,
@@ -2200,6 +2601,8 @@ mod tests {
             base_layer: 0,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 1,
             res_min_mip_level: 0,
             res_max_mip_level: 1,
@@ -2247,6 +2650,8 @@ mod tests {
             base_layer: 0,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 0,
             res_min_mip_level: 0,
             res_max_mip_level: 0,
@@ -2271,6 +2676,95 @@ mod tests {
         assert_eq!(
             unswizzle_block_linear_3d(&tiled, width, height, depth, bpp, 1, 1, 2),
             linear
+        );
+    }
+
+    #[test]
+    fn block_width_padding_expands_guest_footprint() {
+        let unpadded = block_linear_byte_size_3d_with_block_width(17, 8, 1, 4, 0, 0, 0, 0);
+        let padded = block_linear_byte_size_3d_with_block_width(17, 8, 1, 4, 2, 0, 0, 0);
+
+        assert_eq!(unpadded, 1024);
+        assert_eq!(padded, 2048);
+    }
+
+    #[test]
+    fn native_render_target_unpack_handles_tight_and_pitch_layouts() {
+        let tight: Vec<u8> = (0..24).collect();
+        assert_eq!(
+            unpack_native_render_target(&tight, 3, 2, 2, 2, 0),
+            Some(tight.clone())
+        );
+
+        let mut pitched = vec![0xcc; 32];
+        pitched[0..6].copy_from_slice(&tight[0..6]);
+        pitched[8..14].copy_from_slice(&tight[6..12]);
+        pitched[16..22].copy_from_slice(&tight[12..18]);
+        pitched[24..30].copy_from_slice(&tight[18..24]);
+        assert_eq!(
+            unpack_native_render_target(&pitched, 3, 2, 2, 2, 2 | (8 << 8)),
+            Some(tight)
+        );
+    }
+
+    #[test]
+    fn native_render_target_unpack_decodes_block_linear_3d_layout() {
+        let (width, height, depth, bpp) = (13, 11, 5, 4usize);
+        let linear: Vec<u8> = (0..width * height * depth * bpp as u32)
+            .map(|index| index.wrapping_mul(29).wrapping_add(7) as u8)
+            .collect();
+        let guest = swizzle_block_linear_3d(&linear, width, height, depth, bpp, 1, 1, 2);
+        let signature = 1 | (1 << 16) | (1 << 24) | (2 << 32);
+
+        assert_eq!(
+            unpack_native_render_target(&guest, width, height, depth, bpp, signature),
+            Some(linear)
+        );
+    }
+
+    #[test]
+    fn block_width_aware_unswizzle_uses_padded_block_rows() {
+        let (width, height, depth, bpp) = (17, 9, 1, 4usize);
+        let guest_size =
+            block_linear_byte_size_3d_with_block_width(width, height, depth, bpp, 2, 0, 0, 0);
+        let mut guest = vec![0u8; guest_size];
+        let marker = [0x12, 0x34, 0x56, 0x78];
+        guest[0..4].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        guest[0xa00..0xa04].copy_from_slice(&marker);
+
+        let linear = unswizzle_block_linear_3d_with_block_width(
+            &guest, width, height, depth, bpp, 2, 0, 0, 0,
+        );
+        assert_eq!(&linear[0..4], &[0xaa, 0xbb, 0xcc, 0xdd]);
+        assert_eq!(&linear[0x260..0x264], &marker);
+        assert_eq!(
+            unpack_native_render_target(&guest, width, height, depth, bpp, 1 | (2 << 8)),
+            Some(linear)
+        );
+    }
+
+    #[test]
+    fn native_render_target_unpack_rejects_invalid_or_truncated_layouts() {
+        assert_eq!(unpack_native_render_target(&[0; 7], 2, 1, 1, 4, 0), None);
+        assert_eq!(
+            unpack_native_render_target(&[0; 8], 2, 1, 1, 4, 2 | (4 << 8)),
+            None
+        );
+        assert_eq!(unpack_native_render_target(&[0; 8], 2, 1, 1, 4, 3), None);
+        assert_eq!(
+            unpack_native_render_target(&[0; 8], 2, 1, 1, 4, 1 | (1 << 40)),
+            None
+        );
+        assert_eq!(
+            unpack_native_render_target(&[], u32::MAX, u32::MAX, u32::MAX, usize::MAX, 0),
+            None
+        );
+
+        let required = block_linear_byte_size_3d_with_block_width(17, 9, 1, 4, 2, 0, 0, 0);
+        let truncated = vec![0u8; required - 1];
+        assert_eq!(
+            unpack_native_render_target(&truncated, 17, 9, 1, 4, 1 | (2 << 8)),
+            None
         );
     }
 

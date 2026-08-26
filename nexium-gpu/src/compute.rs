@@ -1979,6 +1979,8 @@ mod tests {
             base_layer: 0,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 0,
             res_min_mip_level: 0,
             res_max_mip_level: 0,
