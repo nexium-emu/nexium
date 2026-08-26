@@ -1303,6 +1303,7 @@ pub struct Nvdrv {
     video_decoder: video_decode_thread::VideoDecoder,
     pub legacy_gfx: std::sync::atomic::AtomicBool,
     pub renderer: std::sync::OnceLock<Option<Arc<nexium_gpu::Renderer>>>,
+    as_gpu_states: HashMap<u32, AsGpuState>,
     gpu_async: Option<Arc<AsyncGpuQueue>>,
     async_present_pending: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -1335,6 +1336,7 @@ impl Nvdrv {
             video_decoder: video_decode_thread::VideoDecoder::new(),
             legacy_gfx: std::sync::atomic::AtomicBool::new(false),
             renderer: std::sync::OnceLock::new(),
+            as_gpu_states: HashMap::new(),
             gpu_async: None,
             async_present_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -1362,6 +1364,134 @@ impl Nvdrv {
                 }
             });
         slot.as_ref()
+    }
+
+    fn invalidate_texture_mapping_update(&self, update: &gpu::GpuMappingUpdate) {
+        if update.changed_gpu_ranges.is_empty() && update.epoch_transitions.is_empty() {
+            return;
+        }
+        let Some(renderer) = self
+            .renderer
+            .get()
+            .and_then(|renderer| renderer.as_ref())
+            .cloned()
+        else {
+            return;
+        };
+        let changed_gpu_ranges = update.changed_gpu_ranges.clone();
+        let transitions = update
+            .epoch_transitions
+            .iter()
+            .map(
+                |transition| nexium_gpu::rt_cache::RtMappingEpochTransition {
+                    gpu_va: transition.gpu_va,
+                    size: transition.size,
+                    old_epoch: transition.old_epoch,
+                    new_epoch: transition.new_epoch,
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut texture_ranges = changed_gpu_ranges.clone();
+        texture_ranges.extend(
+            update
+                .epoch_transitions
+                .iter()
+                .map(|transition| (transition.gpu_va, transition.size)),
+        );
+        texture_ranges.sort_unstable();
+        let job = move || {
+            renderer.apply_render_target_mapping_update(&transitions, &changed_gpu_ranges);
+            for &(gpu_va, size) in &texture_ranges {
+                renderer.invalidate_texture_range(gpu_va, size);
+            }
+        };
+        if let Some(render_thread) = crate::render_thread::maybe_render_thread() {
+            render_thread.submit_named("gpu-map-invalidate", Box::new(job));
+        } else {
+            job();
+        }
+    }
+
+    fn as_gpu_allocation_containing(
+        &self,
+        fd: u32,
+        gpu_va: u64,
+        size: u64,
+    ) -> Option<AsGpuAllocation> {
+        let gpu_end = gpu_va.checked_add(size).filter(|_| size != 0)?;
+        let state = self.as_gpu_states.get(&fd)?;
+        let allocation = state
+            .allocations
+            .range(..=gpu_va)
+            .next_back()
+            .map(|(_, allocation)| *allocation)?;
+        let allocation_end = allocation.base.checked_add(allocation.size)?;
+        (gpu_va >= allocation.base && gpu_end <= allocation_end).then_some(allocation)
+    }
+
+    fn release_as_gpu_allocation(
+        &mut self,
+        fd: u32,
+        base: u64,
+        expected: Option<(u64, u32)>,
+    ) -> bool {
+        let Some(allocation) = self
+            .as_gpu_states
+            .get(&fd)
+            .and_then(|state| state.allocations.get(&base))
+            .copied()
+        else {
+            return false;
+        };
+        if expected.is_some_and(|(size, page_size)| {
+            size != allocation.size || page_size != allocation.page_size
+        }) {
+            return false;
+        }
+        let removed = if allocation.sparse {
+            let Ok(removed) = self
+                .gpu
+                .mappings
+                .write()
+                .remove_all_contained_with_metadata(fd, allocation.base, allocation.size)
+            else {
+                return false;
+            };
+            removed
+        } else {
+            self.gpu
+                .mappings
+                .write()
+                .remove_all_for_allocation_with_metadata(fd, allocation.base)
+        };
+        for (owned_gpu_va, owned_size) in removed.owned_va_ranges {
+            let freed = self.gpu.free_va(owned_gpu_va, owned_size);
+            debug_assert!(freed);
+        }
+        let freed = self.gpu.free_va(allocation.base, allocation.size);
+        debug_assert!(freed);
+        if let Some(state) = self.as_gpu_states.get_mut(&fd) {
+            state.allocations.remove(&base);
+        }
+        self.invalidate_texture_mapping_update(&removed.update);
+        true
+    }
+
+    fn release_as_gpu_fd_mappings(&mut self, fd: u32) -> bool {
+        let Ok(removed) = self
+            .gpu
+            .mappings
+            .write()
+            .remove_all_contained_with_metadata(fd, 0, u64::MAX)
+        else {
+            return false;
+        };
+        for (owned_gpu_va, owned_size) in removed.owned_va_ranges {
+            let freed = self.gpu.free_va(owned_gpu_va, owned_size);
+            debug_assert!(freed);
+        }
+        self.invalidate_texture_mapping_update(&removed.update);
+        true
     }
 
     pub fn set_guest_memory_writer<F>(&self, writer: F)
@@ -1612,6 +1742,9 @@ impl Nvdrv {
                 submit_timeout: 0,
             },
         );
+        if device == NvDevice::NvhostAsGpu {
+            self.as_gpu_states.insert(fd, AsGpuState::default());
+        }
         if matches!(device, NvDevice::NvhostNvdec | NvDevice::NvhostVic) {
             let (syncpt_id, _) = self.ensure_channel_syncpoint(fd);
             self.video_channels
@@ -1628,7 +1761,29 @@ impl Nvdrv {
     }
 
     pub fn close(&mut self, fd: u32) {
-        self.files.remove(&fd);
+        let device = self.files.remove(&fd).map(|file| file.device);
+        if device == Some(NvDevice::NvhostAsGpu) {
+            let allocation_bases = self
+                .as_gpu_states
+                .get(&fd)
+                .map(|state| state.allocations.keys().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let mut released = true;
+            for base in allocation_bases {
+                released &= self.release_as_gpu_allocation(fd, base, None);
+            }
+            if released {
+                released = self.release_as_gpu_fd_mappings(fd);
+            }
+            if released {
+                self.as_gpu_states.remove(&fd);
+            } else {
+                log::error!(
+                    "nvdrv:Close fd={} retained unreleased GPU VA allocations",
+                    fd
+                );
+            }
+        }
         if self.video_channels.remove(&fd).is_some() {
             self.video_decoder
                 .submit(video_decode_thread::DecodeWork::Release { fd });
@@ -2029,6 +2184,30 @@ impl Nvdrv {
         );
         trace_video_ioctl(device, &req, cmd);
 
+        if ioctl_profile_enabled() {
+            let started = std::time::Instant::now();
+            let outcome =
+                self.dispatch_ioctl_for_device(device, cmd, &req, mem_read, mem_write, mem_copy);
+            ioctl_profile_record(
+                device,
+                cmd,
+                outcome.result,
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            );
+            return outcome;
+        }
+        self.dispatch_ioctl_for_device(device, cmd, &req, mem_read, mem_write, mem_copy)
+    }
+
+    fn dispatch_ioctl_for_device(
+        &mut self,
+        device: NvDevice,
+        cmd: u16,
+        req: &IoctlRequest,
+        mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+        mem_write: &dyn Fn(u64, &[u8]) -> bool,
+        mem_copy: &dyn Fn(u64, u64, usize) -> bool,
+    ) -> IoctlOutcome {
         match device {
             NvDevice::Nvmap => self.nvmap_ioctl(cmd, &req),
             NvDevice::NvhostCtrlGpu => self.nvhost_ctrl_gpu_ioctl(cmd, &req),
@@ -2054,7 +2233,7 @@ impl Nvdrv {
         }
         let size = handle.size;
         let cpu_address = handle.address;
-        if size == 0 || cpu_address == 0 {
+        if size == 0 || cpu_address == 0 || cpu_address.checked_add(u64::from(size)).is_none() {
             return 0;
         }
 
@@ -2062,7 +2241,7 @@ impl Nvdrv {
         let map_address = self.gpu.alloc_gpu_va(allocation_size);
         let Ok(map_address_u32) = u32::try_from(map_address) else {
             if map_address != 0 {
-                self.gpu.free_va(map_address, allocation_size);
+                let _ = self.gpu.free_va(map_address, allocation_size);
             }
             return 0;
         };
@@ -2070,10 +2249,13 @@ impl Nvdrv {
             return 0;
         }
 
-        self.gpu
-            .mappings
-            .write()
-            .add(map_address, u64::from(size), cpu_address, handle_id);
+        self.gpu.mappings.write().add_with_va_ownership(
+            map_address,
+            u64::from(size),
+            cpu_address,
+            handle_id,
+            (map_address, allocation_size),
+        );
         handle.channel_map_address = map_address_u32;
         handle.channel_pin_count = 1;
         map_address_u32
@@ -2289,26 +2471,26 @@ impl Nvdrv {
         let luma_iova = (u64::from(*surface_register) << 8)
             .wrapping_add(u64::from(context.parameter_set.luma_frame_offset));
 
-        let ffmpeg_dims = if video_ffmpeg::enabled() && !runtime.ffmpeg_failed.load(Ordering::Relaxed)
-        {
-            match context
-                .frame_width()
-                .and_then(|width| context.frame_height().map(|height| (width, height)))
-            {
-                Ok(dims) => Some(dims),
-                Err(error) => {
-                    log::warn!(
-                        "[video-decode] fd={} ffmpeg dims unavailable ({}), using OpenH264",
-                        fd,
-                        error
-                    );
-                    runtime.ffmpeg_failed.store(true, Ordering::Relaxed);
-                    None
+        let ffmpeg_dims =
+            if video_ffmpeg::enabled() && !runtime.ffmpeg_failed.load(Ordering::Relaxed) {
+                match context
+                    .frame_width()
+                    .and_then(|width| context.frame_height().map(|height| (width, height)))
+                {
+                    Ok(dims) => Some(dims),
+                    Err(error) => {
+                        log::warn!(
+                            "[video-decode] fd={} ffmpeg dims unavailable ({}), using OpenH264",
+                            fd,
+                            error
+                        );
+                        runtime.ffmpeg_failed.store(true, Ordering::Relaxed);
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         if let Some((width, height)) = ffmpeg_dims {
             let config = (video_ffmpeg::FfmpegCodec::H264, width, height);
@@ -2530,7 +2712,8 @@ impl Nvdrv {
         if runtime.ffmpeg_config != Some(config) {
             runtime.ffmpeg_config = Some(config);
             runtime.vp9_packet_target = None;
-            runtime.ffmpeg_failed
+            runtime
+                .ffmpeg_failed
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             self.video_decoder
                 .submit(video_decode_thread::DecodeWork::Configure {
@@ -2541,7 +2724,10 @@ impl Nvdrv {
                     failed: runtime.ffmpeg_failed.clone(),
                 });
         }
-        if runtime.ffmpeg_failed.load(std::sync::atomic::Ordering::Relaxed) {
+        if runtime
+            .ffmpeg_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
 
@@ -2732,6 +2918,7 @@ impl Nvdrv {
             aliases.dedup();
             mapped_writes.push((write, cpu_address, aliases));
         }
+        let mut successful_write_count = 0;
         for (write, cpu_address, _) in &mapped_writes {
             gpu::vk_dispatch::register_video_tic_cpu_target(*cpu_address, write.bytes.len() as u64);
             if !mem_write(*cpu_address, &write.bytes) {
@@ -2742,20 +2929,42 @@ impl Nvdrv {
                     cpu_address,
                     write.bytes.len()
                 );
-                return;
+                break;
             }
+            successful_write_count += 1;
         }
-        for (_, _, aliases) in &mapped_writes {
+        let successful_writes = &mapped_writes[..successful_write_count];
+        for (_, _, aliases) in successful_writes {
             for &(alias, size) in aliases {
                 nexium_gpu::tex_invalidate::bump_region(alias, size);
             }
         }
         if let Some(renderer) = self.renderer.get().and_then(|renderer| renderer.as_ref()) {
-            for (_, _, aliases) in &mapped_writes {
+            for (_, _, aliases) in successful_writes {
                 for &(alias, _) in aliases {
                     renderer.invalidate_texture_address(alias);
                 }
             }
+            let invalidations = successful_writes
+                .iter()
+                .map(|(write, cpu_addr, aliases)| {
+                    (*cpu_addr, write.bytes.len() as u64, aliases.clone())
+                })
+                .collect::<Vec<_>>();
+            let renderer = Arc::clone(renderer);
+            let job = move || {
+                for (cpu_addr, size, aliases) in invalidations {
+                    renderer.invalidate_render_target_range(cpu_addr, size, &aliases);
+                }
+            };
+            if let Some(render_thread) = crate::render_thread::maybe_render_thread() {
+                render_thread.submit_named("vic-guest-write-invalidate", Box::new(job));
+            } else {
+                job();
+            }
+        }
+        if successful_write_count != mapped_writes.len() {
+            return;
         }
 
         if output_is_nv12 || exact_frame {
@@ -3456,7 +3665,7 @@ impl Nvdrv {
                 } else {
                     0
                 };
-                let total_size = (pages as u64) * (page_size as u64);
+                let total_size = u64::from(pages) * u64::from(page_size);
                 let offset_in: u64 = if req.in_data.len() >= 24 {
                     u64::from_le_bytes([
                         req.in_data[16],
@@ -3471,15 +3680,50 @@ impl Nvdrv {
                 } else {
                     0
                 };
-                let alloc = if (flags & 0x1) != 0 && offset_in != 0 {
-                    self.gpu.alloc_va_fixed(offset_in, total_size.max(0x1000));
+                if total_size == 0 {
+                    return IoctlOutcome::error(0xB);
+                }
+                let big_page_size = self.as_gpu_states.entry(req.fd).or_default().big_page_size;
+                if page_size != AS_GPU_SMALL_PAGE_SIZE && page_size != big_page_size {
+                    return IoctlOutcome::error(0xB);
+                }
+                let sparse = (flags & 0x2) != 0;
+                let big_pages = page_size == big_page_size;
+                if sparse && !big_pages {
+                    return IoctlOutcome::error(NVRESULT_NOT_IMPLEMENTED);
+                }
+                let alloc = if (flags & 0x1) != 0 {
+                    if offset_in == 0 || !self.gpu.alloc_va_fixed_exclusive(offset_in, total_size) {
+                        return IoctlOutcome::error(0xB);
+                    }
                     offset_in
                 } else {
-                    self.gpu.alloc_gpu_va_aligned(
-                        total_size.max(0x1000),
-                        (page_size as u64).max(0x1000),
-                    )
+                    self.gpu.alloc_va(total_size, big_pages)
                 };
+                if alloc == 0 {
+                    return IoctlOutcome::error(0xB);
+                }
+                let allocation = AsGpuAllocation {
+                    base: alloc,
+                    size: total_size,
+                    page_size,
+                    sparse,
+                    big_pages,
+                };
+                let state = self.as_gpu_states.get_mut(&req.fd).unwrap();
+                if state.allocations.insert(alloc, allocation).is_some() {
+                    let _ = self.gpu.free_va(alloc, total_size);
+                    return IoctlOutcome::error(0xB);
+                }
+                state.initialized = true;
+                if sparse {
+                    let mapping_update = self
+                        .gpu
+                        .mappings
+                        .write()
+                        .add_sparse_as_gpu_with_metadata(req.fd, alloc, total_size);
+                    self.invalidate_texture_mapping_update(&mapping_update);
+                }
                 if out.len() >= 24 {
                     out[0..4].copy_from_slice(&pages.to_le_bytes());
                     out[4..8].copy_from_slice(&page_size.to_le_bytes());
@@ -3508,9 +3752,21 @@ impl Nvdrv {
                         req.in_data[6],
                         req.in_data[7],
                     ]);
-                    let removed = self.gpu.mappings.write().remove(gpu_va);
-                    if let Some(size) = removed {
-                        self.gpu.free_va(gpu_va, size);
+                    let removed = self
+                        .gpu
+                        .mappings
+                        .write()
+                        .unmap_as_gpu_with_metadata(req.fd, gpu_va);
+                    if let Some(removed) = removed {
+                        if let Some((owned_gpu_va, owned_size)) = removed.owned_va_range {
+                            let _ = self.gpu.free_va(owned_gpu_va, owned_size);
+                        }
+                        let mapping_update = gpu::GpuMappingUpdate {
+                            change: gpu::GpuMappingChange::Replaced,
+                            changed_gpu_ranges: removed.changed_gpu_ranges,
+                            epoch_transitions: removed.epoch_transitions,
+                        };
+                        self.invalidate_texture_mapping_update(&mapping_update);
                     }
                     log::debug!("nvhost-as-gpu:UnmapBuffer gpu_va={:#x}", gpu_va);
                 }
@@ -3541,7 +3797,7 @@ impl Nvdrv {
                         req.in_data[14],
                         req.in_data[15],
                     ]);
-                    let buffer_offset = u64::from_le_bytes([
+                    let buffer_offset = i64::from_le_bytes([
                         req.in_data[16],
                         req.in_data[17],
                         req.in_data[18],
@@ -3573,13 +3829,14 @@ impl Nvdrv {
                     ]);
 
                     if (flags & 0x100) != 0 {
-                        let valid = self
+                        let source = self
                             .gpu
                             .mappings
                             .read()
-                            .mapping_starting_at(requested_offset)
-                            .is_some_and(|mapping| mapping.size >= mapping_size_in);
-                        if !valid {
+                            .remap_source_starting_at(req.fd, requested_offset);
+                        let Some((source_cpu, source_size, source_nvmap, source_record_id)) =
+                            source
+                        else {
                             log::warn!(
                                 "nvhost-as-gpu:MapBufferEx remap rejected base={:#x} buffer_offset={:#x} size={:#x}",
                                 requested_offset,
@@ -3587,79 +3844,111 @@ impl Nvdrv {
                                 mapping_size_in,
                             );
                             return IoctlOutcome::error(0xB);
+                        };
+                        if mapping_size_in == 0 || source_size < mapping_size_in {
+                            return IoctlOutcome::error(0xB);
                         }
+                        let Some(remap_va) = requested_offset.checked_add_signed(buffer_offset)
+                        else {
+                            return IoctlOutcome::error(0xB);
+                        };
+                        let Some(cpu_addr) = source_cpu.checked_add_signed(buffer_offset) else {
+                            return IoctlOutcome::error(0xB);
+                        };
+                        if remap_va.checked_add(mapping_size_in).is_none()
+                            || cpu_addr.checked_add(mapping_size_in).is_none()
+                        {
+                            return IoctlOutcome::error(0xB);
+                        }
+                        let mapping_update = self.gpu.mappings.write().add_owned(
+                            req.fd,
+                            remap_va,
+                            mapping_size_in,
+                            cpu_addr,
+                            source_nvmap,
+                            source_record_id,
+                        );
+                        self.invalidate_texture_mapping_update(&mapping_update);
+                        self.as_gpu_states.entry(req.fd).or_default().initialized = true;
                         if out.len() >= 40 {
                             out[32..40].copy_from_slice(&requested_offset.to_le_bytes());
                         }
                         log::debug!(
-                            "nvhost-as-gpu:MapBufferEx remap base={:#x} buffer_offset={:#x} size={:#x}",
+                            "nvhost-as-gpu:MapBufferEx remap base={:#x} buffer_offset={:#x} gpu_va={:#x} cpu={:#x} size={:#x}",
                             requested_offset,
                             buffer_offset,
+                            remap_va,
+                            cpu_addr,
                             mapping_size_in,
                         );
                         return IoctlOutcome::ok(out);
                     }
 
+                    let Some(handle) = self.nvmap_handles.get(&nvmap_id) else {
+                        return IoctlOutcome::error(0xB);
+                    };
+                    if handle.address == 0 {
+                        return IoctlOutcome::error(0xB);
+                    }
                     let mapping_size = if mapping_size_in == 0 {
-                        self.nvmap_handles
-                            .get(&nvmap_id)
-                            .map(|h| (h.size as u64).saturating_sub(buffer_offset))
-                            .unwrap_or(0x1000)
+                        u64::from(handle.size)
                     } else {
                         mapping_size_in
                     };
-                    let handle_cpu = self
-                        .nvmap_handles
-                        .get(&nvmap_id)
-                        .map(|h| h.address.wrapping_add(buffer_offset))
-                        .unwrap_or(0);
-                    let (gpu_va, cpu_addr, final_nvmap) = if (flags & 0x1) != 0
-                        && requested_offset != 0
+                    let Some(handle_cpu) = handle.address.checked_add_signed(buffer_offset) else {
+                        return IoctlOutcome::error(0xB);
+                    };
+                    if mapping_size == 0
+                        || handle_cpu.checked_add(mapping_size).is_none()
+                        || ((flags & 0x1) != 0
+                            && requested_offset != 0
+                            && requested_offset
+                                .checked_add(mapping_size.max(0x1000))
+                                .is_none())
                     {
-                        self.gpu
-                            .alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
-                        (requested_offset, handle_cpu, nvmap_id)
-                    } else if (flags & 0x100) != 0 && requested_offset != 0 {
-                        let remap_va = requested_offset.wrapping_add(buffer_offset);
-                        self.gpu.alloc_va_fixed(remap_va, mapping_size.max(0x1000));
-                        let handle_valid =
-                            nvmap_id != 0 && self.nvmap_handles.contains_key(&nvmap_id);
-                        let (cpu, nv) = if handle_valid {
-                            (handle_cpu, nvmap_id)
-                        } else {
-                            let m = self.gpu.mappings.read();
-                            match m.cpu_address_for(remap_va) {
-                                Some(cpu) => (cpu, m.nvmap_id_for(remap_va).unwrap_or(nvmap_id)),
-                                None => (handle_cpu, nvmap_id),
-                            }
-                        };
-                        log::debug!(
-                                "nvhost-as-gpu:MapBufferEx REMAP offset={:#x} buffer_offset={:#x} → gpu_va={:#x} cpu={:#x} nvmap={} handle_valid={}",
-                                requested_offset,
-                                buffer_offset,
-                                remap_va,
-                                cpu,
-                                nv,
-                                handle_valid
-                            );
-                        (remap_va, cpu, nv)
-                    } else if requested_offset != 0 {
-                        self.gpu
-                            .alloc_va_fixed(requested_offset, mapping_size.max(0x1000));
-                        (requested_offset, handle_cpu, nvmap_id)
+                        return IoctlOutcome::error(0xB);
+                    }
+                    let fixed = (flags & 0x1) != 0;
+                    let big_page_size = u64::from(
+                        self.as_gpu_states
+                            .get(&req.fd)
+                            .map(|state| state.big_page_size)
+                            .unwrap_or(AS_GPU_DEFAULT_BIG_PAGE_SIZE),
+                    );
+                    let handle_align = u64::from(handle.align);
+                    let mapping_page_size = if handle_align % big_page_size == 0 {
+                        big_page_size
+                    } else if handle_align % u64::from(AS_GPU_SMALL_PAGE_SIZE) == 0 {
+                        u64::from(AS_GPU_SMALL_PAGE_SIZE)
                     } else {
-                        let big = self
-                            .nvmap_handles
-                            .get(&nvmap_id)
-                            .map(|h| h.align >= 0x10000)
-                            .unwrap_or(false);
+                        return IoctlOutcome::error(0xB);
+                    };
+                    let Some(owned_size) = mapping_size
+                        .checked_add(mapping_page_size - 1)
+                        .map(|value| value & !(mapping_page_size - 1))
+                    else {
+                        return IoctlOutcome::error(0xB);
+                    };
+                    let (gpu_va, allocation_base) = if fixed {
+                        let Some(allocation) = self.as_gpu_allocation_containing(
+                            req.fd,
+                            requested_offset,
+                            mapping_size,
+                        ) else {
+                            return IoctlOutcome::error(0xB);
+                        };
+                        if requested_offset == 0 {
+                            return IoctlOutcome::error(0xB);
+                        }
+                        (requested_offset, Some(allocation.base))
+                    } else {
                         (
-                            self.gpu.alloc_va(mapping_size.max(0x1000), big),
-                            handle_cpu,
-                            nvmap_id,
+                            self.gpu
+                                .alloc_va_with_page_size(owned_size, mapping_page_size),
+                            None,
                         )
                     };
-                    let nvmap_id = final_nvmap;
+                    let cpu_addr = handle_cpu;
                     log::debug!(
                         "nvhost-as-gpu:MapBufferEx flags={:#x} nvmap_id={} req_off={:#x} cpu_addr={:#x} size={:#x} → gpu_va={:#x}",
                         flags,
@@ -3670,10 +3959,37 @@ impl Nvdrv {
                         gpu_va
                     );
 
-                    self.gpu
-                        .mappings
-                        .write()
-                        .add(gpu_va, mapping_size, cpu_addr, nvmap_id);
+                    if gpu_va == 0 || gpu_va.checked_add(mapping_size).is_none() {
+                        if !fixed && gpu_va != 0 {
+                            let _ = self.gpu.free_va(gpu_va, owned_size);
+                        }
+                        return IoctlOutcome::error(0xB);
+                    }
+                    let mapping_update = if fixed {
+                        self.gpu.mappings.write().add_as_gpu_mapping(
+                            req.fd,
+                            gpu_va,
+                            mapping_size,
+                            cpu_addr,
+                            nvmap_id,
+                            None,
+                            allocation_base,
+                            true,
+                        )
+                    } else {
+                        self.gpu.mappings.write().add_as_gpu_mapping(
+                            req.fd,
+                            gpu_va,
+                            mapping_size,
+                            cpu_addr,
+                            nvmap_id,
+                            Some((gpu_va, owned_size)),
+                            None,
+                            true,
+                        )
+                    };
+                    self.invalidate_texture_mapping_update(&mapping_update);
+                    self.as_gpu_states.entry(req.fd).or_default().initialized = true;
 
                     if out.len() >= 40 {
                         out[32..40].copy_from_slice(&gpu_va.to_le_bytes());
@@ -3685,7 +4001,11 @@ impl Nvdrv {
                 let small_page: u32 = 0x1000;
                 let small_pages: u64 = ((1u64 << 34) - small_offset) / small_page as u64;
                 let big_offset: u64 = 1u64 << 34;
-                let big_page: u32 = 0x10000;
+                let big_page = self
+                    .as_gpu_states
+                    .get(&req.fd)
+                    .map(|state| state.big_page_size)
+                    .unwrap_or(AS_GPU_DEFAULT_BIG_PAGE_SIZE);
                 let big_pages: u64 = ((1u64 << 37) - big_offset) / big_page as u64;
                 if out.len() < 64 {
                     out.resize(64, 0);
@@ -3703,77 +4023,72 @@ impl Nvdrv {
                 );
             }
             0x4109 => {
-                let big_page_size = if req.in_data.len() >= 12 {
-                    u32::from_le_bytes([
-                        req.in_data[8],
-                        req.in_data[9],
-                        req.in_data[10],
-                        req.in_data[11],
-                    ])
-                } else {
-                    0
-                };
-                let va_start = if req.in_data.len() >= 24 {
-                    u64::from_le_bytes([
-                        req.in_data[16],
-                        req.in_data[17],
-                        req.in_data[18],
-                        req.in_data[19],
-                        req.in_data[20],
-                        req.in_data[21],
-                        req.in_data[22],
-                        req.in_data[23],
-                    ])
-                } else {
-                    0
-                };
+                if req.in_data.len() < 40 {
+                    return IoctlOutcome::error(0xB);
+                }
+                let big_page_size = u32::from_le_bytes(req.in_data[8..12].try_into().unwrap());
+                let va_start = u64::from_le_bytes(req.in_data[16..24].try_into().unwrap());
+                let va_end = u64::from_le_bytes(req.in_data[24..32].try_into().unwrap());
+                let va_split = u64::from_le_bytes(req.in_data[32..40].try_into().unwrap());
+                let state = self.as_gpu_states.entry(req.fd).or_default();
+                if state.initialized {
+                    return IoctlOutcome::error(0x8);
+                }
+                if !state.allocations.is_empty()
+                    || va_start != 0
+                    || va_end != 0
+                    || va_split != 0
+                    || (big_page_size != 0
+                        && (!big_page_size.is_power_of_two() || (big_page_size & 0x30000) == 0))
+                {
+                    return IoctlOutcome::error(0xB);
+                }
+                if big_page_size != 0 {
+                    state.big_page_size = big_page_size;
+                }
+                state.initialized = true;
                 log::debug!(
-                    "nvhost-as-gpu:AllocAsEx big_page_size={:#x} va_start={:#x} in_len={}",
+                    "nvhost-as-gpu:AllocAsEx big_page_size={:#x} va_start={:#x} va_end={:#x} va_split={:#x} in_len={}",
                     big_page_size,
                     va_start,
+                    va_end,
+                    va_split,
                     req.in_data.len()
                 );
             }
             0x4103 => {
-                if req.in_data.len() >= 16 {
-                    let gpu_va = u64::from_le_bytes([
-                        req.in_data[0],
-                        req.in_data[1],
-                        req.in_data[2],
-                        req.in_data[3],
-                        req.in_data[4],
-                        req.in_data[5],
-                        req.in_data[6],
-                        req.in_data[7],
-                    ]);
-                    let pages = u32::from_le_bytes([
-                        req.in_data[8],
-                        req.in_data[9],
-                        req.in_data[10],
-                        req.in_data[11],
-                    ]);
-                    let page_size = u32::from_le_bytes([
-                        req.in_data[12],
-                        req.in_data[13],
-                        req.in_data[14],
-                        req.in_data[15],
-                    ]);
-                    let size = ((pages as u64) * (page_size as u64)).max(0x1000);
-                    self.gpu.free_va(gpu_va, size);
-                    log::debug!(
-                        "nvhost-as-gpu:FreeSpace gpu_va={:#x} size={:#x}",
-                        gpu_va,
-                        size
-                    );
+                if req.in_data.len() < 16 {
+                    return IoctlOutcome::error(0xB);
                 }
+                let gpu_va = u64::from_le_bytes(req.in_data[0..8].try_into().unwrap());
+                let pages = u32::from_le_bytes(req.in_data[8..12].try_into().unwrap());
+                let page_size = u32::from_le_bytes(req.in_data[12..16].try_into().unwrap());
+                let size = u64::from(pages) * u64::from(page_size);
+                if size == 0
+                    || !self.release_as_gpu_allocation(req.fd, gpu_va, Some((size, page_size)))
+                {
+                    return IoctlOutcome::error(0xB);
+                }
+                log::debug!(
+                    "nvhost-as-gpu:FreeSpace gpu_va={:#x} size={:#x}",
+                    gpu_va,
+                    size
+                );
             }
             0x4114 => {
+                if req.in_data.len() % 20 != 0 {
+                    return IoctlOutcome::error(0xB);
+                }
+                let big_page_size = u64::from(
+                    self.as_gpu_states
+                        .get(&req.fd)
+                        .map(|state| state.big_page_size)
+                        .unwrap_or(AS_GPU_DEFAULT_BIG_PAGE_SIZE),
+                );
                 let num_entries = req.in_data.len() / 20;
+                let mut actions = Vec::with_capacity(num_entries);
                 for i in 0..num_entries {
                     let off = i * 20;
-                    if req.in_data.len() < off + 20 {
-                        break;
-                    }
                     let _flags = u16::from_le_bytes([req.in_data[off], req.in_data[off + 1]]);
                     let _kind = u16::from_le_bytes([req.in_data[off + 2], req.in_data[off + 3]]);
                     let nvmap_handle = u32::from_le_bytes([
@@ -3800,15 +4115,51 @@ impl Nvdrv {
                         req.in_data[off + 18],
                         req.in_data[off + 19],
                     ]);
-                    let big_page_size: u64 = 0x10000;
-                    let gpu_va = (as_offset_big_pages as u64) * big_page_size;
-                    let size = (big_pages as u64) * big_page_size;
-                    let handle_off = (handle_offset_big_pages as u64) * big_page_size;
-                    let cpu_addr = self
-                        .nvmap_handles
-                        .get(&nvmap_handle)
-                        .map(|h| h.address.wrapping_add(handle_off))
-                        .unwrap_or(0);
+                    let Some(gpu_va) = u64::from(as_offset_big_pages).checked_mul(big_page_size)
+                    else {
+                        return IoctlOutcome::error(0xB);
+                    };
+                    let Some(size) = u64::from(big_pages).checked_mul(big_page_size) else {
+                        return IoctlOutcome::error(0xB);
+                    };
+                    let Some(handle_off) =
+                        u64::from(handle_offset_big_pages).checked_mul(big_page_size)
+                    else {
+                        return IoctlOutcome::error(0xB);
+                    };
+                    let Some(allocation) = self.as_gpu_allocation_containing(req.fd, gpu_va, size)
+                    else {
+                        return IoctlOutcome::error(0xB);
+                    };
+                    if size == 0
+                        || !allocation.sparse
+                        || !allocation.big_pages
+                        || u64::from(allocation.page_size) != big_page_size
+                    {
+                        return IoctlOutcome::error(0xB);
+                    }
+                    if nvmap_handle == 0 {
+                        actions.push((gpu_va, size, None));
+                        continue;
+                    }
+                    let Some(handle) = self.nvmap_handles.get(&nvmap_handle) else {
+                        return IoctlOutcome::error(0xB);
+                    };
+                    if handle.address == 0 {
+                        return IoctlOutcome::error(0xB);
+                    }
+                    if handle_off
+                        .checked_add(size)
+                        .is_none_or(|end| end > u64::from(handle.size))
+                    {
+                        return IoctlOutcome::error(0xB);
+                    }
+                    let Some(cpu_addr) = handle.address.checked_add(handle_off) else {
+                        return IoctlOutcome::error(0xB);
+                    };
+                    if cpu_addr.checked_add(size).is_none() {
+                        return IoctlOutcome::error(0xB);
+                    }
                     log::debug!(
                         "nvhost-as-gpu:Remap[{}/{}] nvmap_id={} cpu={:#x} → gpu_va={:#x} size={:#x}",
                         i,
@@ -3818,13 +4169,31 @@ impl Nvdrv {
                         gpu_va,
                         size
                     );
-                    if cpu_addr != 0 {
-                        self.gpu.alloc_va_fixed(gpu_va, size);
+                    actions.push((gpu_va, size, Some((cpu_addr, nvmap_handle))));
+                }
+                let mutated = !actions.is_empty();
+                for (gpu_va, size, mapped) in actions {
+                    let mapping_update = if let Some((cpu_addr, nvmap_handle)) = mapped {
+                        self.gpu.mappings.write().add_as_gpu_mapping(
+                            req.fd,
+                            gpu_va,
+                            size,
+                            cpu_addr,
+                            nvmap_handle,
+                            None,
+                            None,
+                            false,
+                        )
+                    } else {
                         self.gpu
                             .mappings
                             .write()
-                            .add(gpu_va, size, cpu_addr, nvmap_handle);
-                    }
+                            .add_sparse_as_gpu_with_metadata(req.fd, gpu_va, size)
+                    };
+                    self.invalidate_texture_mapping_update(&mapping_update);
+                }
+                if mutated {
+                    self.as_gpu_states.entry(req.fd).or_default().initialized = true;
                 }
             }
             0x4118 => {
@@ -5421,6 +5790,45 @@ mod tests {
         }
     }
 
+    fn alloc_as_gpu_space(
+        nvdrv: &mut Nvdrv,
+        fd: u32,
+        base: u64,
+        pages: u32,
+        page_size: u32,
+        flags: u32,
+    ) -> IoctlOutcome {
+        let mut input = vec![0u8; 24];
+        input[0..4].copy_from_slice(&pages.to_le_bytes());
+        input[4..8].copy_from_slice(&page_size.to_le_bytes());
+        input[8..12].copy_from_slice(&flags.to_le_bytes());
+        input[16..24].copy_from_slice(&base.to_le_bytes());
+        nvdrv.dispatch_ioctl(request(fd, 0xc018_4102, input, 24))
+    }
+
+    fn free_as_gpu_space(
+        nvdrv: &mut Nvdrv,
+        fd: u32,
+        base: u64,
+        pages: u32,
+        page_size: u32,
+    ) -> IoctlOutcome {
+        let mut input = vec![0u8; 16];
+        input[0..8].copy_from_slice(&base.to_le_bytes());
+        input[8..12].copy_from_slice(&pages.to_le_bytes());
+        input[12..16].copy_from_slice(&page_size.to_le_bytes());
+        nvdrv.dispatch_ioctl(request(fd, 0x4010_4103, input, 0))
+    }
+
+    fn as_gpu_remap_entry(base: u64, pages: u32, handle: u32, handle_pages: u32) -> Vec<u8> {
+        let mut input = vec![0u8; 20];
+        input[4..8].copy_from_slice(&handle.to_le_bytes());
+        input[8..12].copy_from_slice(&handle_pages.to_le_bytes());
+        input[12..16].copy_from_slice(&((base / 0x10000) as u32).to_le_bytes());
+        input[16..20].copy_from_slice(&pages.to_le_bytes());
+        input
+    }
+
     #[test]
     fn nvmap_free_returns_backing_address_and_size() {
         let mut nvdrv = Nvdrv::new();
@@ -5517,12 +5925,16 @@ mod tests {
     }
 
     #[test]
-    fn map_buffer_ex_remap_reuses_exact_base_without_new_mapping() {
+    fn map_buffer_ex_remap_updates_only_the_exact_offsetted_subrange() {
         let mut nvdrv = Nvdrv::new();
         let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
         let base = 0x5_04d3_0000u64;
         let cpu = 0x4a_0200_0000u64;
-        nvdrv.gpu.mappings.write().add(base, 0x400000, cpu, 77);
+        nvdrv
+            .gpu
+            .mappings
+            .write()
+            .add_as_gpu_mapping(fd, base, 0x400000, cpu, 77, None, None, true);
 
         let mut input = vec![0u8; 40];
         input[0..4].copy_from_slice(&0x100u32.to_le_bytes());
@@ -5530,6 +5942,11 @@ mod tests {
         input[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
         input[32..40].copy_from_slice(&base.to_le_bytes());
         let before = nvdrv.gpu.mappings.read().iter().count();
+        let generations = [
+            nexium_gpu::tex_invalidate::region_gen(base),
+            nexium_gpu::tex_invalidate::region_gen(base + 0x2f0000),
+            nexium_gpu::tex_invalidate::region_gen(base + 0x300000),
+        ];
 
         let first = nvdrv.dispatch_ioctl(request(fd, 0xc028_4106, input.clone(), 40));
         let second = nvdrv.dispatch_ioctl(request(fd, 0xc028_4106, input, 40));
@@ -5541,12 +5958,213 @@ mod tests {
             base
         );
         let mappings = nvdrv.gpu.mappings.read();
-        assert_eq!(mappings.iter().count(), before);
+        assert_eq!(mappings.iter().count(), before + 2);
         assert_eq!(
             mappings.cpu_address_for(base + 0x2f0000),
             Some(cpu + 0x2f0000)
         );
         assert!(mappings.iter().all(|mapping| mapping.nvmap_id != 0));
+        assert_eq!(nexium_gpu::tex_invalidate::region_gen(base), generations[0]);
+        assert_ne!(
+            nexium_gpu::tex_invalidate::region_gen(base + 0x2f0000),
+            generations[1]
+        );
+        assert_eq!(
+            nexium_gpu::tex_invalidate::region_gen(base + 0x300000),
+            generations[2]
+        );
+    }
+
+    #[test]
+    fn map_buffer_ex_remap_honors_signed_negative_offsets_and_survives_source_unmap() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let base = 0x7040_0000u64;
+        let target = base - 0x10000;
+        let source_cpu = 0x5040_0000u64;
+        let restored_cpu = 0x6040_0000u64;
+        nvdrv
+            .gpu
+            .mappings
+            .write()
+            .add(target, 0x10000, restored_cpu, 76);
+        nvdrv
+            .gpu
+            .mappings
+            .write()
+            .add_as_gpu_mapping(fd, base, 0x20000, source_cpu, 77, None, None, true);
+
+        let mut input = vec![0u8; 40];
+        input[0..4].copy_from_slice(&0x100u32.to_le_bytes());
+        input[16..24].copy_from_slice(&(-0x10000i64).to_le_bytes());
+        input[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        input[32..40].copy_from_slice(&base.to_le_bytes());
+
+        let remapped = nvdrv.dispatch_ioctl(request(fd, 0xc028_4106, input, 40));
+        assert_eq!(remapped.result, 0);
+        assert_eq!(
+            u64::from_le_bytes(remapped.data[32..40].try_into().unwrap()),
+            base
+        );
+        assert_eq!(
+            nvdrv.gpu.mappings.read().cpu_address_for(target + 0x800),
+            Some(source_cpu - 0x10000 + 0x800)
+        );
+
+        let unmapped =
+            nvdrv.dispatch_ioctl(request(fd, 0xc008_4105, base.to_le_bytes().to_vec(), 8));
+        assert_eq!(unmapped.result, 0);
+        let mappings = nvdrv.gpu.mappings.read();
+        assert_eq!(mappings.cpu_address_for(base), None);
+        assert_eq!(
+            mappings.cpu_address_for(target + 0x800),
+            Some(source_cpu - 0x10000 + 0x800)
+        );
+    }
+
+    #[test]
+    fn map_buffer_ex_normal_mapping_honors_signed_negative_buffer_offsets() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let handle = 78;
+        let base = 0x7140_0000u64;
+        let handle_cpu = 0x5141_0000u64;
+        nvdrv
+            .nvmap_handles
+            .insert(handle, test_nvmap_handle(handle, 0x10000, handle_cpu));
+        assert_eq!(
+            alloc_as_gpu_space(&mut nvdrv, fd, base, 1, 0x10000, 1).result,
+            0
+        );
+        let mut input = vec![0u8; 40];
+        input[0..4].copy_from_slice(&1u32.to_le_bytes());
+        input[8..12].copy_from_slice(&handle.to_le_bytes());
+        input[16..24].copy_from_slice(&(-0x10000i64).to_le_bytes());
+        input[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        input[32..40].copy_from_slice(&base.to_le_bytes());
+
+        let mapped = nvdrv.dispatch_ioctl(request(fd, 0xc028_4106, input, 40));
+
+        assert_eq!(mapped.result, 0);
+        assert_eq!(
+            nvdrv.gpu.mappings.read().cpu_address_for(base + 0x800),
+            Some(handle_cpu - 0x10000 + 0x800)
+        );
+    }
+
+    #[test]
+    fn repeated_fixed_map_unmaps_to_a_hole_without_extra_va_ownership() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let base = 0x0400_0000u64;
+        let target = base + 0x10000;
+        let handle = 79;
+        nvdrv
+            .nvmap_handles
+            .insert(handle, test_nvmap_handle(handle, 0x10000, 0x5240_0000));
+
+        let mut allocation = vec![0u8; 24];
+        allocation[0..4].copy_from_slice(&3u32.to_le_bytes());
+        allocation[4..8].copy_from_slice(&0x10000u32.to_le_bytes());
+        allocation[8..12].copy_from_slice(&1u32.to_le_bytes());
+        allocation[16..24].copy_from_slice(&base.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc018_4102, allocation, 24))
+                .result,
+            0
+        );
+
+        let mut map = vec![0u8; 40];
+        map[0..4].copy_from_slice(&1u32.to_le_bytes());
+        map[8..12].copy_from_slice(&handle.to_le_bytes());
+        map[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        map[32..40].copy_from_slice(&target.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4106, map.clone(), 40))
+                .result,
+            0
+        );
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4106, map, 40))
+                .result,
+            0
+        );
+        assert_eq!(nvdrv.gpu.mappings.read().iter().count(), 2);
+
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc008_4105, target.to_le_bytes().to_vec(), 8,))
+                .result,
+            0
+        );
+        assert_eq!(nvdrv.gpu.mappings.read().cpu_address_for(target), None);
+        let mut free = vec![0u8; 16];
+        free[0..8].copy_from_slice(&base.to_le_bytes());
+        free[8..12].copy_from_slice(&3u32.to_le_bytes());
+        free[12..16].copy_from_slice(&0x10000u32.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0x4010_4103, free, 0))
+                .result,
+            0
+        );
+        assert_eq!(nvdrv.gpu.alloc_va(0x30000, false), base);
+    }
+
+    #[test]
+    fn remap_holes_do_not_block_unmap_and_unmap_blocks_older_remap_sources() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let base = 0x7300_0000;
+        let handle = 80;
+        nvdrv
+            .nvmap_handles
+            .insert(handle, test_nvmap_handle(handle, 0x10000, 0x5300_0000));
+        assert_eq!(
+            alloc_as_gpu_space(&mut nvdrv, fd, base, 1, 0x10000, 3).result,
+            0
+        );
+        let mut map = vec![0u8; 40];
+        map[0..4].copy_from_slice(&1u32.to_le_bytes());
+        map[8..12].copy_from_slice(&handle.to_le_bytes());
+        map[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        map[32..40].copy_from_slice(&base.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4106, map, 40))
+                .result,
+            0
+        );
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(
+                    fd,
+                    0x4014_4114,
+                    as_gpu_remap_entry(base, 1, 0, 0),
+                    0,
+                ))
+                .result,
+            0
+        );
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc008_4105, base.to_le_bytes().to_vec(), 8,))
+                .result,
+            0
+        );
+        let mut remap = vec![0u8; 40];
+        remap[0..4].copy_from_slice(&0x100u32.to_le_bytes());
+        remap[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        remap[32..40].copy_from_slice(&base.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4106, remap, 40))
+                .result,
+            0xB
+        );
     }
 
     #[test]
@@ -5554,11 +6172,16 @@ mod tests {
         let mut nvdrv = Nvdrv::new();
         let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
         let base = 0x5_04d3_0000u64;
-        nvdrv
-            .gpu
-            .mappings
-            .write()
-            .add(base, 0x10000, 0x4a_0200_0000, 77);
+        nvdrv.gpu.mappings.write().add_as_gpu_mapping(
+            fd,
+            base,
+            0x10000,
+            0x4a_0200_0000,
+            77,
+            None,
+            None,
+            true,
+        );
 
         let remap = |offset: u64, size: u64| {
             let mut input = vec![0u8; 40];
@@ -5580,6 +6203,703 @@ mod tests {
                 .result,
             0xB
         );
+    }
+
+    #[test]
+    fn as_gpu_map_unmap_and_remap_bump_every_covered_texture_page() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let handle = 701;
+        let base = 0x6e40_0000u64;
+        let remap_base = 0x6e80_0000u64;
+        let size = 0x20000u64;
+        nvdrv
+            .nvmap_handles
+            .insert(handle, test_nvmap_handle(handle, size as u32, 0x4b00_0000));
+        assert_eq!(
+            alloc_as_gpu_space(&mut nvdrv, fd, base, 2, 0x10000, 1).result,
+            0
+        );
+        assert_eq!(
+            alloc_as_gpu_space(&mut nvdrv, fd, remap_base, 2, 0x10000, 3).result,
+            0
+        );
+
+        let generations_before = [
+            nexium_gpu::tex_invalidate::region_gen(base),
+            nexium_gpu::tex_invalidate::region_gen(base + 0x10000),
+            nexium_gpu::tex_invalidate::region_gen(base + size),
+        ];
+        let mut map = vec![0u8; 40];
+        map[0..4].copy_from_slice(&1u32.to_le_bytes());
+        map[8..12].copy_from_slice(&handle.to_le_bytes());
+        map[24..32].copy_from_slice(&size.to_le_bytes());
+        map[32..40].copy_from_slice(&base.to_le_bytes());
+
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4106, map, 40))
+                .result,
+            0
+        );
+        for (index, before) in generations_before[..2].iter().enumerate() {
+            assert_ne!(
+                nexium_gpu::tex_invalidate::region_gen(base + index as u64 * 0x10000),
+                *before
+            );
+        }
+        assert_eq!(
+            nexium_gpu::tex_invalidate::region_gen(base + size),
+            generations_before[2]
+        );
+
+        let generations_before_unmap = [
+            nexium_gpu::tex_invalidate::region_gen(base),
+            nexium_gpu::tex_invalidate::region_gen(base + 0x10000),
+            nexium_gpu::tex_invalidate::region_gen(base + size),
+        ];
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc008_4105, base.to_le_bytes().to_vec(), 8))
+                .result,
+            0
+        );
+        for (index, before) in generations_before_unmap[..2].iter().enumerate() {
+            assert_ne!(
+                nexium_gpu::tex_invalidate::region_gen(base + index as u64 * 0x10000),
+                *before
+            );
+        }
+        assert_eq!(
+            nexium_gpu::tex_invalidate::region_gen(base + size),
+            generations_before_unmap[2]
+        );
+
+        let remap_generations_before = [
+            nexium_gpu::tex_invalidate::region_gen(remap_base),
+            nexium_gpu::tex_invalidate::region_gen(remap_base + 0x10000),
+            nexium_gpu::tex_invalidate::region_gen(remap_base + size),
+        ];
+        let mut remap = vec![0u8; 20];
+        remap[4..8].copy_from_slice(&handle.to_le_bytes());
+        remap[12..16].copy_from_slice(&((remap_base / 0x10000) as u32).to_le_bytes());
+        remap[16..20].copy_from_slice(&2u32.to_le_bytes());
+
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0x4014_4114, remap, 0))
+                .result,
+            0
+        );
+        for (index, before) in remap_generations_before[..2].iter().enumerate() {
+            assert_ne!(
+                nexium_gpu::tex_invalidate::region_gen(remap_base + index as u64 * 0x10000),
+                *before
+            );
+        }
+        assert_eq!(
+            nexium_gpu::tex_invalidate::region_gen(remap_base + size),
+            remap_generations_before[2]
+        );
+    }
+
+    #[test]
+    fn sparse_remap_holes_shadow_aliases_and_preserve_parent_va_reservation() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let base = 0x0400_0000u64;
+        let target = base + 0x10000;
+        let parent_size = 0x30000u64;
+        let first_handle = 711;
+        let second_handle = 712;
+        let first_cpu = 0x4c00_0000u64;
+        let second_cpu = 0x4d00_0000u64;
+        nvdrv.nvmap_handles.insert(
+            first_handle,
+            test_nvmap_handle(first_handle, 0x10000, first_cpu),
+        );
+        nvdrv.nvmap_handles.insert(
+            second_handle,
+            test_nvmap_handle(second_handle, 0x10000, second_cpu),
+        );
+
+        let mut allocation = vec![0u8; 24];
+        allocation[0..4].copy_from_slice(&3u32.to_le_bytes());
+        allocation[4..8].copy_from_slice(&0x10000u32.to_le_bytes());
+        allocation[8..12].copy_from_slice(&3u32.to_le_bytes());
+        allocation[16..24].copy_from_slice(&base.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc018_4102, allocation, 24))
+                .result,
+            0
+        );
+
+        let remap = |handle: u32| {
+            let mut entry = vec![0u8; 20];
+            entry[4..8].copy_from_slice(&handle.to_le_bytes());
+            entry[12..16].copy_from_slice(&((target / 0x10000) as u32).to_le_bytes());
+            entry[16..20].copy_from_slice(&1u32.to_le_bytes());
+            entry
+        };
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0x4014_4114, remap(first_handle), 0))
+                .result,
+            0
+        );
+        assert_eq!(
+            nvdrv.gpu.mappings.read().cpu_address_for(target + 0x800),
+            Some(first_cpu + 0x800)
+        );
+        nexium_gpu::pitch_oracle::record_pitch_dst(target, 0x10000);
+        let generations = [
+            nexium_gpu::tex_invalidate::region_gen(target - 0x10000),
+            nexium_gpu::tex_invalidate::region_gen(target),
+            nexium_gpu::tex_invalidate::region_gen(target + 0x10000),
+        ];
+
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0x4014_4114, remap(0), 0))
+                .result,
+            0
+        );
+        {
+            let mappings = nvdrv.gpu.mappings.read();
+            assert_eq!(mappings.cpu_address_for(target + 0x800), None);
+            assert_eq!(mappings.cpu_address_for_any32(target + 0x800), None);
+            assert_eq!(mappings.nvmap_id_for(target + 0x800), None);
+            assert_eq!(mappings.mapping_epoch_for(target + 0x800), None);
+            assert!(mappings
+                .gpu_regions_for_cpu_range(first_cpu, 0x10000)
+                .is_empty());
+        }
+        assert!(!nexium_gpu::pitch_oracle::is_pitch_dst(target + 0x800));
+        assert_eq!(
+            nexium_gpu::tex_invalidate::region_gen(target - 0x10000),
+            generations[0]
+        );
+        assert_ne!(
+            nexium_gpu::tex_invalidate::region_gen(target),
+            generations[1]
+        );
+        assert_eq!(
+            nexium_gpu::tex_invalidate::region_gen(target + 0x10000),
+            generations[2]
+        );
+        assert_eq!(nvdrv.gpu.alloc_va(parent_size, false), base + parent_size);
+
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0x4014_4114, remap(second_handle), 0))
+                .result,
+            0
+        );
+        let mappings = nvdrv.gpu.mappings.read();
+        assert_eq!(
+            mappings.cpu_address_for(target + 0x800),
+            Some(second_cpu + 0x800)
+        );
+        assert_eq!(
+            mappings.gpu_regions_for_cpu_range(second_cpu, 0x10000),
+            vec![(target, 0x10000)]
+        );
+    }
+
+    #[test]
+    fn free_space_requires_the_same_fd_and_exact_allocation_tuple() {
+        let mut nvdrv = Nvdrv::new();
+        let first_fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let second_fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let base = 0x7400_0000;
+        assert_eq!(
+            alloc_as_gpu_space(&mut nvdrv, first_fd, base, 2, 0x10000, 1).result,
+            0
+        );
+
+        assert_eq!(
+            free_as_gpu_space(&mut nvdrv, second_fd, base, 2, 0x10000).result,
+            0xB
+        );
+        nvdrv.close(second_fd);
+        assert!(nvdrv.as_gpu_states[&first_fd]
+            .allocations
+            .contains_key(&base));
+        assert_eq!(
+            free_as_gpu_space(&mut nvdrv, first_fd, base, 1, 0x10000).result,
+            0xB
+        );
+        assert_eq!(
+            free_as_gpu_space(&mut nvdrv, first_fd, base, 32, 0x1000).result,
+            0xB
+        );
+        assert_eq!(
+            free_as_gpu_space(&mut nvdrv, first_fd, base, 2, 0x10000).result,
+            0
+        );
+        assert_eq!(
+            free_as_gpu_space(&mut nvdrv, first_fd, base, 2, 0x10000).result,
+            0xB
+        );
+    }
+
+    #[test]
+    fn as_gpu_fds_cannot_remap_or_unmap_each_others_roots() {
+        let mut nvdrv = Nvdrv::new();
+        let first_fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let second_fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let base = 0x7480_0000;
+        let handle = 720;
+        let cpu = 0x5480_0000;
+        nvdrv
+            .nvmap_handles
+            .insert(handle, test_nvmap_handle(handle, 0x10000, cpu));
+        assert_eq!(
+            alloc_as_gpu_space(&mut nvdrv, first_fd, base, 1, 0x10000, 1).result,
+            0
+        );
+        let mut map = vec![0u8; 40];
+        map[0..4].copy_from_slice(&1u32.to_le_bytes());
+        map[8..12].copy_from_slice(&handle.to_le_bytes());
+        map[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        map[32..40].copy_from_slice(&base.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(first_fd, 0xc028_4106, map, 40))
+                .result,
+            0
+        );
+
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(
+                    second_fd,
+                    0xc008_4105,
+                    base.to_le_bytes().to_vec(),
+                    8,
+                ))
+                .result,
+            0
+        );
+        assert_eq!(nvdrv.gpu.mappings.read().cpu_address_for(base), Some(cpu));
+        let mut remap = vec![0u8; 40];
+        remap[0..4].copy_from_slice(&0x100u32.to_le_bytes());
+        remap[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        remap[32..40].copy_from_slice(&base.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(second_fd, 0xc028_4106, remap, 40))
+                .result,
+            0xB
+        );
+        assert_eq!(nvdrv.gpu.mappings.read().cpu_address_for(base), Some(cpu));
+    }
+
+    #[test]
+    fn remap_entries_require_sparse_bounds_valid_handles_and_atomic_preflight() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let non_sparse = 0x7500_0000;
+        let sparse = 0x7510_0000;
+        let handle = 721;
+        let zero_handle = 722;
+        let cpu = 0x5510_0000;
+        nvdrv
+            .nvmap_handles
+            .insert(handle, test_nvmap_handle(handle, 0x10000, cpu));
+        nvdrv
+            .nvmap_handles
+            .insert(zero_handle, test_nvmap_handle(zero_handle, 0x10000, 0));
+        let mut zero_map = vec![0u8; 40];
+        zero_map[8..12].copy_from_slice(&zero_handle.to_le_bytes());
+        zero_map[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4106, zero_map, 40))
+                .result,
+            0xB
+        );
+        let missing = as_gpu_remap_entry(sparse, 1, handle, 0);
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0x4014_4114, missing, 0))
+                .result,
+            0xB
+        );
+        assert_eq!(
+            alloc_as_gpu_space(&mut nvdrv, fd, non_sparse, 1, 0x10000, 1).result,
+            0
+        );
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(
+                    fd,
+                    0x4014_4114,
+                    as_gpu_remap_entry(non_sparse, 1, handle, 0),
+                    0,
+                ))
+                .result,
+            0xB
+        );
+        assert_eq!(
+            alloc_as_gpu_space(&mut nvdrv, fd, sparse, 2, 0x10000, 3).result,
+            0
+        );
+        for invalid in [
+            as_gpu_remap_entry(sparse + 0x20000, 1, handle, 0),
+            as_gpu_remap_entry(sparse, 2, handle, 0),
+            as_gpu_remap_entry(sparse, 1, zero_handle, 0),
+            as_gpu_remap_entry(sparse, 0, handle, 0),
+        ] {
+            assert_eq!(
+                nvdrv
+                    .dispatch_ioctl(request(fd, 0x4014_4114, invalid, 0))
+                    .result,
+                0xB
+            );
+        }
+        let valid = as_gpu_remap_entry(sparse, 1, handle, 0);
+        let invalid = as_gpu_remap_entry(sparse + 0x10000, 1, handle, 1);
+        let mut batch = valid.clone();
+        batch.extend_from_slice(&invalid);
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0x4028_4114, batch, 0))
+                .result,
+            0xB
+        );
+        assert_eq!(nvdrv.gpu.mappings.read().cpu_address_for(sparse), None);
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0x4014_4114, valid, 0))
+                .result,
+            0
+        );
+        assert_eq!(nvdrv.gpu.mappings.read().cpu_address_for(sparse), Some(cpu));
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc008_4105, sparse.to_le_bytes().to_vec(), 8,))
+                .result,
+            0
+        );
+        assert_eq!(nvdrv.gpu.mappings.read().cpu_address_for(sparse), Some(cpu));
+    }
+
+    #[test]
+    fn free_space_clears_its_range_but_preserves_negative_remap_aliases() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let base = 0x7600_0000;
+        let source = base + 0x10000;
+        let alias = base - 0x10000;
+        let handle = 723;
+        let cpu = 0x5610_0000;
+        nvdrv
+            .nvmap_handles
+            .insert(handle, test_nvmap_handle(handle, 0x10000, cpu));
+        assert_eq!(
+            alloc_as_gpu_space(&mut nvdrv, fd, base, 3, 0x10000, 3).result,
+            0
+        );
+        let mut map = vec![0u8; 40];
+        map[0..4].copy_from_slice(&1u32.to_le_bytes());
+        map[8..12].copy_from_slice(&handle.to_le_bytes());
+        map[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        map[32..40].copy_from_slice(&source.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4106, map, 40))
+                .result,
+            0
+        );
+        let mut remap = vec![0u8; 40];
+        remap[0..4].copy_from_slice(&0x100u32.to_le_bytes());
+        remap[16..24].copy_from_slice(&(-0x20000i64).to_le_bytes());
+        remap[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        remap[32..40].copy_from_slice(&source.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4106, remap, 40))
+                .result,
+            0
+        );
+        assert_eq!(
+            nvdrv.gpu.mappings.read().cpu_address_for(alias),
+            Some(cpu - 0x20000)
+        );
+
+        assert_eq!(
+            free_as_gpu_space(&mut nvdrv, fd, base, 3, 0x10000).result,
+            0
+        );
+        assert_eq!(nvdrv.gpu.mappings.read().cpu_address_for(base), None);
+        assert_eq!(nvdrv.gpu.mappings.read().cpu_address_for(source), None);
+        assert_eq!(
+            nvdrv.gpu.mappings.read().cpu_address_for(alias),
+            Some(cpu - 0x20000)
+        );
+        assert!(nvdrv.gpu.alloc_va_fixed_exclusive(base, 0x30000));
+        assert!(nvdrv.gpu.free_va(base, 0x30000));
+    }
+
+    #[test]
+    fn non_sparse_free_space_preserves_a_preexisting_remap_alias() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let source = 0x7701_0000;
+        let target = source - 0x10000;
+        let cpu = 0x5711_0000;
+        nvdrv
+            .gpu
+            .mappings
+            .write()
+            .add_as_gpu_mapping(fd, source, 0x10000, cpu, 727, None, None, true);
+        let mut remap = vec![0u8; 40];
+        remap[0..4].copy_from_slice(&0x100u32.to_le_bytes());
+        remap[16..24].copy_from_slice(&(-0x10000i64).to_le_bytes());
+        remap[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        remap[32..40].copy_from_slice(&source.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4106, remap, 40))
+                .result,
+            0
+        );
+        assert_eq!(
+            nvdrv.gpu.mappings.read().cpu_address_for(target + 0x800),
+            Some(cpu - 0x10000 + 0x800)
+        );
+        assert_eq!(
+            alloc_as_gpu_space(&mut nvdrv, fd, target, 1, 0x10000, 1).result,
+            0
+        );
+
+        assert_eq!(
+            free_as_gpu_space(&mut nvdrv, fd, target, 1, 0x10000).result,
+            0
+        );
+        assert_eq!(
+            nvdrv.gpu.mappings.read().cpu_address_for(target + 0x800),
+            Some(cpu - 0x10000 + 0x800)
+        );
+        assert!(nvdrv.gpu.alloc_va_fixed_exclusive(target, 0x10000));
+        assert!(nvdrv.gpu.free_va(target, 0x10000));
+    }
+
+    #[test]
+    fn alloc_as_ex_rejects_custom_ranges_without_state_mutation() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        for (offset, value) in [(16, 0x0400_0000u64), (24, 1u64 << 37), (32, 1u64 << 34)] {
+            let mut input = vec![0u8; 40];
+            input[8..12].copy_from_slice(&0x20000u32.to_le_bytes());
+            input[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            assert_eq!(
+                nvdrv
+                    .dispatch_ioctl(request(fd, 0xc028_4109, input, 40))
+                    .result,
+                0xB
+            );
+            let state = &nvdrv.as_gpu_states[&fd];
+            assert!(!state.initialized);
+            assert_eq!(state.big_page_size, AS_GPU_DEFAULT_BIG_PAGE_SIZE);
+            assert!(state.allocations.is_empty());
+        }
+
+        let mut valid = vec![0u8; 40];
+        valid[8..12].copy_from_slice(&0x20000u32.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4109, valid, 40))
+                .result,
+            0
+        );
+        assert!(nvdrv.as_gpu_states[&fd].initialized);
+        assert_eq!(nvdrv.as_gpu_states[&fd].big_page_size, 0x20000);
+    }
+
+    #[test]
+    fn alloc_as_ex_rejects_reinitialization_with_only_dynamic_maps() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let mut alloc_as = vec![0u8; 40];
+        alloc_as[8..12].copy_from_slice(&0x20000u32.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4109, alloc_as.clone(), 40))
+                .result,
+            0
+        );
+        let handle = 730;
+        let mut nvmap = test_nvmap_handle(handle, 0x10000, 0x5c00_0000);
+        nvmap.align = 0x20000;
+        nvdrv.nvmap_handles.insert(handle, nvmap);
+        let mut map = vec![0u8; 40];
+        map[8..12].copy_from_slice(&handle.to_le_bytes());
+        map[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        let mapped = nvdrv.dispatch_ioctl(request(fd, 0xc028_4106, map, 40));
+        assert_eq!(mapped.result, 0);
+        let gpu_va = u64::from_le_bytes(mapped.data[32..40].try_into().unwrap());
+        assert!(nvdrv.as_gpu_states[&fd].allocations.is_empty());
+        let mapping_count = nvdrv.gpu.mappings.read().iter().count();
+
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4109, alloc_as, 40))
+                .result,
+            0x8
+        );
+        assert!(nvdrv.as_gpu_states[&fd].initialized);
+        assert_eq!(nvdrv.as_gpu_states[&fd].big_page_size, 0x20000);
+        assert!(nvdrv.as_gpu_states[&fd].allocations.is_empty());
+        assert_eq!(nvdrv.gpu.mappings.read().iter().count(), mapping_count);
+        assert_eq!(
+            nvdrv.gpu.mappings.read().cpu_address_for(gpu_va),
+            Some(0x5c00_0000)
+        );
+    }
+
+    #[test]
+    fn dynamic_map_implicitly_initializes_defaults_before_alloc_as_ex() {
+        let mut nvdrv = Nvdrv::new();
+        let fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let handle = 731;
+        let mut nvmap = test_nvmap_handle(handle, 0x10000, 0x5d00_0000);
+        nvmap.align = 0x10000;
+        nvdrv.nvmap_handles.insert(handle, nvmap);
+        let mut map = vec![0u8; 40];
+        map[8..12].copy_from_slice(&handle.to_le_bytes());
+        map[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+        let mapped = nvdrv.dispatch_ioctl(request(fd, 0xc028_4106, map, 40));
+        assert_eq!(mapped.result, 0);
+        let gpu_va = u64::from_le_bytes(mapped.data[32..40].try_into().unwrap());
+        assert!(nvdrv.as_gpu_states[&fd].initialized);
+        assert_eq!(
+            nvdrv.as_gpu_states[&fd].big_page_size,
+            AS_GPU_DEFAULT_BIG_PAGE_SIZE
+        );
+        let mapping_count = nvdrv.gpu.mappings.read().iter().count();
+        let mut alloc_as = vec![0u8; 40];
+        alloc_as[8..12].copy_from_slice(&0x20000u32.to_le_bytes());
+
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd, 0xc028_4109, alloc_as, 40))
+                .result,
+            0x8
+        );
+        assert!(nvdrv.as_gpu_states[&fd].initialized);
+        assert_eq!(
+            nvdrv.as_gpu_states[&fd].big_page_size,
+            AS_GPU_DEFAULT_BIG_PAGE_SIZE
+        );
+        assert!(nvdrv.as_gpu_states[&fd].allocations.is_empty());
+        assert_eq!(nvdrv.gpu.mappings.read().iter().count(), mapping_count);
+        assert_eq!(
+            nvdrv.gpu.mappings.read().cpu_address_for(gpu_va),
+            Some(0x5d00_0000)
+        );
+    }
+
+    #[test]
+    fn mixed_fd_big_page_sizes_align_shared_dynamic_va_allocations() {
+        let mut nvdrv = Nvdrv::new();
+        let fd_64k = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let fd_128k = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let mut alloc_as = vec![0u8; 40];
+        alloc_as[8..12].copy_from_slice(&0x20000u32.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(fd_128k, 0xc028_4109, alloc_as, 40))
+                .result,
+            0
+        );
+        let handle_64k = 728;
+        let handle_128k = 729;
+        let mut map_64k = test_nvmap_handle(handle_64k, 0x10000, 0x5a00_0000);
+        map_64k.align = 0x10000;
+        let mut map_128k = test_nvmap_handle(handle_128k, 0x10000, 0x5b00_0000);
+        map_128k.align = 0x20000;
+        nvdrv.nvmap_handles.insert(handle_64k, map_64k);
+        nvdrv.nvmap_handles.insert(handle_128k, map_128k);
+        let map = |handle: u32| {
+            let mut input = vec![0u8; 40];
+            input[8..12].copy_from_slice(&handle.to_le_bytes());
+            input[24..32].copy_from_slice(&0x10000u64.to_le_bytes());
+            input
+        };
+        let first = nvdrv.dispatch_ioctl(request(fd_64k, 0xc028_4106, map(handle_64k), 40));
+        let second = nvdrv.dispatch_ioctl(request(fd_128k, 0xc028_4106, map(handle_128k), 40));
+        assert_eq!((first.result, second.result), (0, 0));
+        let first_va = u64::from_le_bytes(first.data[32..40].try_into().unwrap());
+        let second_va = u64::from_le_bytes(second.data[32..40].try_into().unwrap());
+        assert_eq!(first_va & 0xffff, 0);
+        assert_eq!(second_va & 0x1ffff, 0);
+        assert_eq!(second_va, first_va + 0x20000);
+    }
+
+    #[test]
+    fn configured_big_pages_control_dynamic_mapping_alignment_and_close_cleanup() {
+        let mut nvdrv = Nvdrv::new();
+        let first_fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let second_fd = nvdrv.open("/dev/nvhost-as-gpu").unwrap();
+        let mut alloc_as = vec![0u8; 40];
+        alloc_as[8..12].copy_from_slice(&0x20000u32.to_le_bytes());
+        assert_eq!(
+            nvdrv
+                .dispatch_ioctl(request(first_fd, 0xc028_4109, alloc_as, 40))
+                .result,
+            0
+        );
+        let small_handle = 724;
+        let big_handle = 725;
+        let other_handle = 726;
+        let mut small = test_nvmap_handle(small_handle, 0x10000, 0x5700_0000);
+        small.align = 0x10000;
+        let mut big = test_nvmap_handle(big_handle, 0x28000, 0x5800_0000);
+        big.align = 0x20000;
+        let other = test_nvmap_handle(other_handle, 0x10000, 0x5900_0000);
+        nvdrv.nvmap_handles.insert(small_handle, small);
+        nvdrv.nvmap_handles.insert(big_handle, big);
+        nvdrv.nvmap_handles.insert(other_handle, other);
+        let map = |handle: u32, size: u64| {
+            let mut input = vec![0u8; 40];
+            input[8..12].copy_from_slice(&handle.to_le_bytes());
+            input[24..32].copy_from_slice(&size.to_le_bytes());
+            input
+        };
+        let small = nvdrv.dispatch_ioctl(request(
+            first_fd,
+            0xc028_4106,
+            map(small_handle, 0x10000),
+            40,
+        ));
+        let big =
+            nvdrv.dispatch_ioctl(request(first_fd, 0xc028_4106, map(big_handle, 0x28000), 40));
+        let other = nvdrv.dispatch_ioctl(request(
+            second_fd,
+            0xc028_4106,
+            map(other_handle, 0x10000),
+            40,
+        ));
+        assert_eq!((small.result, big.result, other.result), (0, 0, 0));
+        let small_va = u64::from_le_bytes(small.data[32..40].try_into().unwrap());
+        let big_va = u64::from_le_bytes(big.data[32..40].try_into().unwrap());
+        let other_va = u64::from_le_bytes(other.data[32..40].try_into().unwrap());
+        assert!(small_va < 0x4_0000_0000);
+        assert_eq!(big_va & 0x1ffff, 0);
+        assert!(big_va >= 0x4_0000_0000);
+
+        nvdrv.close(first_fd);
+        assert_eq!(nvdrv.gpu.mappings.read().cpu_address_for(small_va), None);
+        assert_eq!(nvdrv.gpu.mappings.read().cpu_address_for(big_va), None);
+        assert_eq!(
+            nvdrv.gpu.mappings.read().cpu_address_for(other_va),
+            Some(0x5900_0000)
+        );
+        assert!(nvdrv.gpu.alloc_va_fixed_exclusive(big_va, 0x40000));
+        assert!(nvdrv.gpu.free_va(big_va, 0x40000));
     }
 
     #[test]

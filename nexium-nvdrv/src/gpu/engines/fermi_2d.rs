@@ -141,6 +141,38 @@ impl Surface {
             self.pitch().saturating_mul(self.height as usize)
         }
     }
+
+    fn rt_key(&self, mappings: &GpuMappings) -> Option<RtKey> {
+        if self.depth > 1 || self._layer != 0 {
+            return None;
+        }
+        let gpu_va = self.gpu_va();
+        let nvmap_id = mappings.nvmap_id_for(gpu_va)?;
+        let mapping_epoch = mappings.mapping_epoch_for(gpu_va)?;
+        let (cpu_addr, available) = mappings.cpu_range_for(gpu_va)?;
+        let guest_size_bytes = u64::try_from(self.storage_size()).ok()?;
+        if guest_size_bytes == 0 || guest_size_bytes > available {
+            return None;
+        }
+        let key = RtKey::with_cpu(nvmap_id, self.width, self.height, gpu_va, cpu_addr)
+            .with_mapping_epoch(mapping_epoch)
+            .with_base_layer(self._layer)
+            .with_guest_size_bytes(guest_size_bytes);
+        match self.memory_layout {
+            MEMORY_LAYOUT_BLOCK_LINEAR if self.block_size & !0xff == 0 => {
+                Some(key.with_block_linear_layout(
+                    self.block_width_log2(),
+                    self.block_height_log2(),
+                    0,
+                    0,
+                ))
+            }
+            MEMORY_LAYOUT_PITCH => {
+                Some(key.with_pitch_linear_layout(u32::try_from(self.pitch()).ok()?))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -382,15 +414,15 @@ impl Fermi2D {
         let dy0 = self.dst_y0;
         let dx1 = self.dst_x0.saturating_add(width as i32);
         let dy1 = self.dst_y0.saturating_add(height as i32);
+        let Some(dst_key) = self.dst.rt_key(mappings) else {
+            return false;
+        };
         match renderer.resolve_rt_copy(
             src_nv,
             kw,
             kh,
             src_va,
-            dst_nv,
-            self.dst.width,
-            self.dst.height,
-            dst_va,
+            dst_key,
             [sx0, sy0, sx1, sy1],
             [dx0, dy0, dx1, dy1],
         ) {
@@ -425,7 +457,6 @@ impl Fermi2D {
         renderer: Option<&nexium_gpu::renderer::Renderer>,
         mappings: &GpuMappings,
         src_va: u64,
-        dst_va: u64,
         src_limit: u64,
         dst_limit: u64,
         width: usize,
@@ -438,7 +469,7 @@ impl Fermi2D {
         dv_dy: i64,
         src_bpp: usize,
         dst_bpp: usize,
-    ) -> Option<(RtKey, u64, u32)> {
+    ) -> Option<(RtKey, u64, RtKey)> {
         let renderer = renderer?;
         if !exact_rt_identity_copy_compatible(
             &self.src,
@@ -468,7 +499,7 @@ impl Fermi2D {
             return None;
         }
         let src_nvmap = mappings.nvmap_id_for(src_va)?;
-        let dst_nvmap = mappings.nvmap_id_for(dst_va)?;
+        let dst_key = self.dst.rt_key(mappings)?;
         let (source, source_stamp) = renderer.render_target_at_va(src_nvmap, src_va)?;
         if source.nvmap_id != src_nvmap
             || source.gpu_va != src_va
@@ -482,7 +513,7 @@ impl Fermi2D {
         {
             return None;
         }
-        Some((source, source_stamp, dst_nvmap))
+        Some((source, source_stamp, dst_key))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -505,13 +536,12 @@ impl Fermi2D {
         src_bpp: usize,
         dst_bpp: usize,
     ) -> Option<(RtKey, u64)> {
-        let (source, source_stamp, dst_nvmap) = self.exact_copy_candidate(
-            renderer, mappings, src_va, dst_va, src_limit, dst_limit, width, height, dst_x_step,
+        let (source, source_stamp, dst_key) = self.exact_copy_candidate(
+            renderer, mappings, src_va, src_limit, dst_limit, width, height, dst_x_step,
             dst_y_step, src_x0, src_y0, du_dx, dv_dy, src_bpp, dst_bpp,
         )?;
         let renderer = renderer?;
-        match renderer.resolve_rt_copy_exact_guest(source, source_stamp, src_bpp, dst_nvmap, dst_va)
-        {
+        match renderer.resolve_rt_copy_exact_guest(source, source_stamp, src_bpp, dst_key) {
             Ok(provenance) => provenance,
             Err(error) => {
                 log::warn!(
@@ -588,7 +618,7 @@ impl Fermi2D {
             return false;
         };
         self.exact_copy_candidate(
-            renderer, mappings, src_va, dst_va, src_limit, dst_limit, width, height, dst_x_step,
+            renderer, mappings, src_va, src_limit, dst_limit, width, height, dst_x_step,
             dst_y_step, src_x0, src_y0, du_dx, dv_dy, src_bpp, dst_bpp,
         )
         .is_some()
@@ -740,20 +770,14 @@ impl Fermi2D {
         let src_bpp = src_format.bytes_per_pixel();
         let dst_bpp = dst_format.bytes_per_pixel();
         if async_blit_enabled() {
-            if let Some((source, source_stamp, dst_nvmap)) = self.exact_copy_candidate(
-                renderer, mappings, src_va, dst_va, src_limit, dst_limit, width, height,
-                dst_x_step, dst_y_step, src_x0, src_y0, du_dx, dv_dy, src_bpp, dst_bpp,
+            if let Some((source, source_stamp, dst_key)) = self.exact_copy_candidate(
+                renderer, mappings, src_va, src_limit, dst_limit, width, height, dst_x_step,
+                dst_y_step, src_x0, src_y0, du_dx, dv_dy, src_bpp, dst_bpp,
             ) {
                 if let (Some(arc), Some(rt)) =
                     (renderer_arc, crate::render_thread::maybe_render_thread())
                 {
-                    match arc.plan_rt_copy_exact_guest(
-                        source,
-                        source_stamp,
-                        src_bpp,
-                        dst_nvmap,
-                        dst_va,
-                    ) {
+                    match arc.plan_rt_copy_exact_guest(source, source_stamp, src_bpp, dst_key) {
                         Ok(Some((destination, stamp))) => {
                             let job_renderer = std::sync::Arc::clone(arc);
                             rt.submit_named(
@@ -1423,9 +1447,7 @@ fn block_linear_y_offset(
     let gob_row = y_in_block / GOB_H;
     let y_in_gob = y_in_block % GOB_H;
     let block_size = block_width * block_height * GOB_SIZE;
-    block_y * blocks_per_row * block_size
-        + gob_row * block_width * GOB_SIZE
-        + in_gob_y_offset(y_in_gob)
+    block_y * blocks_per_row * block_size + gob_row * GOB_SIZE + in_gob_y_offset(y_in_gob)
 }
 
 fn block_linear_offset(
@@ -1453,7 +1475,7 @@ fn block_linear_offset(
     let block_row_stride = blocks_per_row * block_size;
     block_y * block_row_stride
         + block_x * block_size
-        + gob_row * block_width * GOB_SIZE
+        + gob_row * GOB_SIZE
         + gob_col * block_height * GOB_SIZE
         + in_gob
 }
@@ -1477,6 +1499,35 @@ mod tests {
         assert!(method_executes_blit(M_PIXELS_SRC_Y0_HIGH));
         assert!(!method_executes_blit(M_PIXELS_SRC_Y0_HIGH - 1));
         assert!(!method_executes_blit(0));
+    }
+
+    #[test]
+    fn surface_rt_key_matches_later_texture_alias_metadata() {
+        const GPU: u64 = 0x5940_8000_0;
+        const CPU: u64 = 0x1181_a000_00;
+        let mut mappings = GpuMappings::new();
+        mappings.add(GPU, 0x10_0000, CPU, 588);
+        let surface = Surface {
+            format: FMT_A8B8G8R8_UNORM,
+            memory_layout: MEMORY_LAYOUT_BLOCK_LINEAR,
+            block_size: 4 << 4,
+            width: 256,
+            height: 256,
+            offset_high: (GPU >> 32) as u32,
+            offset_low: GPU as u32,
+            ..Default::default()
+        };
+
+        let key = surface.rt_key(&mappings).unwrap();
+        let sampled = RtKey::with_cpu(588, 256, 256, GPU, CPU)
+            .with_mapping_epoch(mappings.mapping_epoch_for(GPU).unwrap())
+            .with_block_linear_layout(0, 4, 0, 0)
+            .with_guest_size_bytes(surface.storage_size() as u64);
+
+        assert!(key.same_alias_view_identity(sampled));
+        assert_eq!(key.layout_signature, 0x40001);
+        assert_eq!(key.guest_size_bytes, 0x40000);
+        assert!(!RtKey::new(588, 256, 256, GPU).same_alias_view_identity(sampled));
     }
 
     #[test]
@@ -1507,6 +1558,8 @@ mod tests {
             base_layer: 0,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 0,
             res_min_mip_level: 0,
             res_max_mip_level: 0,
@@ -1661,6 +1714,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn block_width_offsets_assign_each_gob_once() {
+        let width_bytes = 128;
+        assert_eq!(block_linear_offset(0, 0, width_bytes, 1, 1), 0);
+        assert_eq!(block_linear_offset(0, 8, width_bytes, 1, 1), 0x200);
+        assert_eq!(block_linear_offset(64, 0, width_bytes, 1, 1), 0x400);
+        assert_eq!(block_linear_offset(64, 8, width_bytes, 1, 1), 0x600);
     }
 
     #[test]

@@ -27,7 +27,7 @@ const LAYOUT_PITCH: u32 = 1;
 pub enum KeplerMemoryWriteOutcome {
     NoWrite,
     Exact(Vec<(u64, usize)>),
-    Unknown,
+    Unknown(Vec<(u64, usize)>),
 }
 
 #[derive(Default)]
@@ -232,7 +232,9 @@ impl KeplerMemory {
                 let mut writes = Vec::new();
                 let mut unknown = false;
                 if line_count == 1 || pitch_out == line_length {
-                    let n = (line_length * line_count).min(dst_limit);
+                    let n = (line_length * line_count)
+                        .min(dst_limit)
+                        .min(self.inline_buf.len());
                     let wrote = mem_write(dst_cpu, &self.inline_buf[..n]);
                     if n != 0 {
                         if wrote {
@@ -249,8 +251,16 @@ impl KeplerMemory {
                         if dst_row_off >= dst_limit {
                             break;
                         }
-                        let n = line_length.min(dst_limit - dst_row_off);
                         let src_off = y * line_length;
+                        if src_off >= self.inline_buf.len() {
+                            break;
+                        }
+                        let n = line_length
+                            .min(dst_limit - dst_row_off)
+                            .min(self.inline_buf.len() - src_off);
+                        if n == 0 {
+                            break;
+                        }
                         let dst_off = dst_cpu + dst_row_off as u64;
                         if mem_write(dst_off, &self.inline_buf[src_off..src_off + n]) {
                             writes.push((dst_gpu.saturating_add(dst_row_off as u64), n));
@@ -260,7 +270,7 @@ impl KeplerMemory {
                     }
                 }
                 if unknown {
-                    KeplerMemoryWriteOutcome::Unknown
+                    KeplerMemoryWriteOutcome::Unknown(writes)
                 } else if writes.is_empty() {
                     KeplerMemoryWriteOutcome::NoWrite
                 } else {
@@ -333,12 +343,12 @@ impl KeplerMemory {
                     if mem_write(dst_cpu, &tiled[..n]) {
                         KeplerMemoryWriteOutcome::NoWrite
                     } else {
-                        KeplerMemoryWriteOutcome::Unknown
+                        KeplerMemoryWriteOutcome::Unknown(Vec::new())
                     }
                 } else if mem_write(dst_cpu, &tiled[..n]) {
                     KeplerMemoryWriteOutcome::Exact(vec![(dst_gpu, n)])
                 } else {
-                    KeplerMemoryWriteOutcome::Unknown
+                    KeplerMemoryWriteOutcome::Unknown(Vec::new())
                 }
             }
             _ => unreachable!(),
@@ -516,8 +526,64 @@ mod tests {
         memory.dispatch_method(M_LOAD_INLINE_DATA, 0x5566_7788, &mappings, &read, &write);
         assert_eq!(
             memory.dispatch_method(M_LOAD_INLINE_DATA, 0x99aa_bbcc, &mappings, &read, &write),
-            KeplerMemoryWriteOutcome::Unknown
+            KeplerMemoryWriteOutcome::Unknown(vec![(0x4000, 4), (0x4010, 4)])
         );
         assert_eq!(write_calls.get(), 3);
+    }
+
+    #[test]
+    fn clamped_pitch_uploads_never_read_past_inline_buffer() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x4000, 0x300_0000, 0x1000, 1);
+        let read = |_: u64, _: &mut [u8]| true;
+
+        let contiguous_len = 0x900000usize;
+        let mut contiguous = KeplerMemory::new();
+        contiguous.line_length_in = contiguous_len as u32;
+        contiguous.line_count = 2;
+        contiguous.offset_out_lower = 0x4000;
+        contiguous.pitch_out = contiguous_len as u32;
+        contiguous.launch(LAYOUT_PITCH);
+        let contiguous_writes = RefCell::new(Vec::new());
+        let contiguous_write = |cpu: u64, bytes: &[u8]| {
+            contiguous_writes.borrow_mut().push((cpu, bytes.len()));
+            true
+        };
+        assert_eq!(
+            contiguous.flush(&mappings, &read, &contiguous_write),
+            KeplerMemoryWriteOutcome::Exact(vec![(0x4000, MAX_INLINE_BYTES)])
+        );
+        assert_eq!(
+            *contiguous_writes.borrow(),
+            vec![(0x1000, MAX_INLINE_BYTES)]
+        );
+
+        let row_len = MAX_INLINE_BYTES / 2 + 1;
+        let pitch = row_len + 0x10;
+        let mut strided = KeplerMemory::new();
+        strided.line_length_in = row_len as u32;
+        strided.line_count = 2;
+        strided.offset_out_lower = 0x4000;
+        strided.pitch_out = pitch as u32;
+        strided.launch(LAYOUT_PITCH);
+        let strided_writes = RefCell::new(Vec::new());
+        let strided_write = |cpu: u64, bytes: &[u8]| {
+            strided_writes.borrow_mut().push((cpu, bytes.len()));
+            true
+        };
+        assert_eq!(
+            strided.flush(&mappings, &read, &strided_write),
+            KeplerMemoryWriteOutcome::Exact(vec![
+                (0x4000, row_len),
+                (0x4000 + pitch as u64, MAX_INLINE_BYTES - row_len)
+            ])
+        );
+        assert_eq!(
+            *strided_writes.borrow(),
+            vec![
+                (0x1000, row_len),
+                (0x1000 + pitch as u64, MAX_INLINE_BYTES - row_len)
+            ]
+        );
     }
 }

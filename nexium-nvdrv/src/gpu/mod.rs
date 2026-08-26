@@ -32,12 +32,75 @@ fn elapsed_ms(start: std::time::Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+#[derive(Clone)]
 pub struct GpuMapping {
     pub gpu_va: u64,
     pub size: u64,
     pub cpu_addr: u64,
     pub nvmap_id: u32,
     epoch: u64,
+    record_id: u64,
+    sparse: bool,
+    owner_record_id: Option<u64>,
+    owned_va_range: Option<(u64, u64)>,
+    as_gpu_fd: Option<u32>,
+    as_gpu_allocation_base: Option<u64>,
+    as_gpu_root: bool,
+    as_gpu_unmap_barrier: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemovedGpuMapping {
+    pub gpu_va: u64,
+    pub size: u64,
+    pub cpu_addr: u64,
+    pub nvmap_id: u32,
+    pub epoch: u64,
+    pub owned_va_range: Option<(u64, u64)>,
+    pub changed_gpu_ranges: Vec<(u64, u64)>,
+    pub epoch_transitions: Vec<GpuMappingEpochTransition>,
+    pub unmapped_gpu_ranges: Vec<(u64, u64)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemovedGpuMappingSet {
+    pub update: GpuMappingUpdate,
+    pub owned_va_ranges: Vec<(u64, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuMappingChange {
+    Fresh,
+    Extended,
+    Idempotent,
+    Replaced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMappingEpochTransition {
+    pub gpu_va: u64,
+    pub size: u64,
+    pub old_epoch: u64,
+    pub new_epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuMappingUpdate {
+    pub change: GpuMappingChange,
+    pub changed_gpu_ranges: Vec<(u64, u64)>,
+    pub epoch_transitions: Vec<GpuMappingEpochTransition>,
+}
+
+impl GpuMappingChange {
+    pub fn invalidates_render_targets(self) -> bool {
+        self == Self::Replaced
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhysicalMappingIdentity {
+    Cpu { cpu_addr: u64, nvmap_id: u32 },
+    Sparse,
 }
 
 const MAPPING_LOOKUP_CACHE_SIZE: usize = 64;
@@ -76,6 +139,7 @@ pub struct GpuMappings {
     mappings: Vec<GpuMapping>,
     instance_id: u64,
     next_mapping_epoch: u64,
+    next_mapping_record_id: u64,
     generation: u64,
 }
 
@@ -87,6 +151,7 @@ impl GpuMappings {
             mappings: Vec::new(),
             instance_id: NEXT_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             next_mapping_epoch: 1,
+            next_mapping_record_id: 1,
             generation: 1,
         }
     }
@@ -162,16 +227,249 @@ impl GpuMappings {
         Some(self.mapping_lookup_for(gpu_va)?.mapping_index)
     }
 
-    pub fn add(&mut self, gpu_va: u64, size: u64, cpu_addr: u64, nvmap_id: u32) {
-        log::debug!(
-            "GpuMap: gpu_va={:#x} size={:#x} cpu_addr={:#x} nvmap_id={}",
+    fn effective_physical_identity(&self, gpu_va: u64) -> Option<(PhysicalMappingIdentity, u64)> {
+        let mapping = &self.mappings[self.mapping_index_for(gpu_va)?];
+        let physical = if mapping.sparse {
+            PhysicalMappingIdentity::Sparse
+        } else {
+            PhysicalMappingIdentity::Cpu {
+                cpu_addr: mapping
+                    .cpu_addr
+                    .checked_add(gpu_va.saturating_sub(mapping.gpu_va))?,
+                nvmap_id: mapping.nvmap_id,
+            }
+        };
+        Some((physical, mapping.epoch))
+    }
+
+    fn effective_range_snapshot(
+        &self,
+        gpu_va: u64,
+        size: u64,
+    ) -> Vec<(u64, u64, Option<(PhysicalMappingIdentity, u64)>)> {
+        let Some(gpu_end) = gpu_va.checked_add(size) else {
+            return Vec::new();
+        };
+        let mut boundaries = vec![gpu_va, gpu_end];
+        for mapping in &self.mappings {
+            let mapping_end = mapping.gpu_va.saturating_add(mapping.size);
+            let overlap_start = gpu_va.max(mapping.gpu_va);
+            let overlap_end = gpu_end.min(mapping_end);
+            if overlap_start < overlap_end {
+                boundaries.push(overlap_start);
+                boundaries.push(overlap_end);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries
+            .windows(2)
+            .filter_map(|window| {
+                (window[0] < window[1]).then(|| {
+                    (
+                        window[0],
+                        window[1],
+                        self.effective_physical_identity(window[0]),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn classify_sparse_add(&self, gpu_va: u64, size: u64) -> GpuMappingChange {
+        if size == 0 {
+            return GpuMappingChange::Fresh;
+        }
+        let Some(gpu_end) = gpu_va.checked_add(size) else {
+            return GpuMappingChange::Replaced;
+        };
+        let mut boundaries = vec![gpu_va, gpu_end];
+        for mapping in &self.mappings {
+            let mapping_end = mapping.gpu_va.saturating_add(mapping.size);
+            let overlap_start = gpu_va.max(mapping.gpu_va);
+            let overlap_end = gpu_end.min(mapping_end);
+            if overlap_start < overlap_end {
+                boundaries.push(overlap_start);
+                boundaries.push(overlap_end);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let mut has_gap = false;
+        let mut has_sparse = false;
+        for window in boundaries.windows(2) {
+            if window[0] >= window[1] {
+                continue;
+            }
+            match self.mapping_index_for(window[0]) {
+                Some(index) if self.mappings[index].sparse => has_sparse = true,
+                Some(_) => return GpuMappingChange::Replaced,
+                None => has_gap = true,
+            }
+        }
+        if has_sparse && !has_gap {
+            GpuMappingChange::Idempotent
+        } else {
+            GpuMappingChange::Fresh
+        }
+    }
+
+    fn push_coalesced_gpu_range(ranges: &mut Vec<(u64, u64)>, gpu_va: u64, size: u64) {
+        if size == 0 {
+            return;
+        }
+        if let Some((last_gpu_va, last_size)) = ranges.last_mut() {
+            if last_gpu_va.checked_add(*last_size) == Some(gpu_va) {
+                *last_size += size;
+                return;
+            }
+        }
+        ranges.push((gpu_va, size));
+    }
+
+    fn push_epoch_transition(
+        transitions: &mut Vec<GpuMappingEpochTransition>,
+        gpu_va: u64,
+        size: u64,
+        old_epoch: u64,
+        new_epoch: u64,
+    ) {
+        if size == 0 || old_epoch == new_epoch {
+            return;
+        }
+        if let Some(last) = transitions.last_mut() {
+            if last.gpu_va.checked_add(last.size) == Some(gpu_va)
+                && last.old_epoch == old_epoch
+                && last.new_epoch == new_epoch
+            {
+                last.size += size;
+                return;
+            }
+        }
+        transitions.push(GpuMappingEpochTransition {
             gpu_va,
             size,
-            cpu_addr,
-            nvmap_id
-        );
-        let epoch = self.next_mapping_epoch;
-        self.next_mapping_epoch = self.next_mapping_epoch.wrapping_add(1).max(1);
+            old_epoch,
+            new_epoch,
+        });
+    }
+
+    fn classify_add(
+        &self,
+        gpu_va: u64,
+        size: u64,
+        cpu_addr: u64,
+        nvmap_id: u32,
+    ) -> (GpuMappingChange, Option<u64>) {
+        if size == 0 {
+            return (GpuMappingChange::Fresh, None);
+        }
+        let Some(gpu_end) = gpu_va.checked_add(size) else {
+            return (GpuMappingChange::Replaced, None);
+        };
+        let mut boundaries = vec![gpu_va, gpu_end];
+        for mapping in &self.mappings {
+            let mapping_end = mapping.gpu_va.saturating_add(mapping.size);
+            let overlap_start = gpu_va.max(mapping.gpu_va);
+            let overlap_end = gpu_end.min(mapping_end);
+            if overlap_start < overlap_end {
+                boundaries.push(overlap_start);
+                boundaries.push(overlap_end);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let mut overlaps = false;
+        let mut has_gaps = false;
+        let mut overlap_epoch = None;
+        let mut multiple_overlap_epochs = false;
+        for window in boundaries.windows(2) {
+            let segment_start = window[0];
+            let segment_end = window[1];
+            if segment_start >= segment_end {
+                continue;
+            }
+            let requested_cpu = cpu_addr.checked_add(segment_start.saturating_sub(gpu_va));
+            let Some(mapping_index) = self.mapping_index_for(segment_start) else {
+                if requested_cpu.is_none() {
+                    return (GpuMappingChange::Replaced, None);
+                }
+                has_gaps = true;
+                continue;
+            };
+            overlaps = true;
+            let mapping = &self.mappings[mapping_index];
+            let existing_cpu = if mapping.sparse {
+                None
+            } else {
+                mapping
+                    .cpu_addr
+                    .checked_add(segment_start.saturating_sub(mapping.gpu_va))
+            };
+            if mapping.nvmap_id != nvmap_id
+                || existing_cpu.is_none()
+                || existing_cpu != requested_cpu
+            {
+                return (GpuMappingChange::Replaced, None);
+            }
+            match overlap_epoch {
+                Some(epoch) if epoch != mapping.epoch => multiple_overlap_epochs = true,
+                None => overlap_epoch = Some(mapping.epoch),
+                _ => {}
+            }
+        }
+        if !overlaps {
+            (GpuMappingChange::Fresh, None)
+        } else if multiple_overlap_epochs {
+            (GpuMappingChange::Replaced, None)
+        } else if !has_gaps {
+            (GpuMappingChange::Idempotent, overlap_epoch)
+        } else {
+            (GpuMappingChange::Extended, overlap_epoch)
+        }
+    }
+
+    fn insert_mapping(
+        &mut self,
+        gpu_va: u64,
+        size: u64,
+        cpu_addr: u64,
+        nvmap_id: u32,
+        sparse: bool,
+        owner_record_id: Option<u64>,
+        owned_va_range: Option<(u64, u64)>,
+        change: GpuMappingChange,
+        preserved_epoch: Option<u64>,
+        retain_idempotent: bool,
+        as_gpu_fd: Option<u32>,
+        as_gpu_allocation_base: Option<u64>,
+        as_gpu_root: bool,
+    ) -> GpuMappingUpdate {
+        let before = self.effective_range_snapshot(gpu_va, size);
+        nexium_gpu::tex_invalidate::bump_region(gpu_va, size);
+        if change == GpuMappingChange::Idempotent && !retain_idempotent {
+            return GpuMappingUpdate {
+                change,
+                changed_gpu_ranges: Vec::new(),
+                epoch_transitions: Vec::new(),
+            };
+        }
+        let epoch = if matches!(
+            change,
+            GpuMappingChange::Extended | GpuMappingChange::Idempotent
+        ) {
+            preserved_epoch.unwrap_or_else(|| {
+                let epoch = self.next_mapping_epoch;
+                self.next_mapping_epoch = self.next_mapping_epoch.wrapping_add(1).max(1);
+                epoch
+            })
+        } else {
+            let epoch = self.next_mapping_epoch;
+            self.next_mapping_epoch = self.next_mapping_epoch.wrapping_add(1).max(1);
+            epoch
+        };
+        let record_id = self.next_mapping_record_id;
+        self.next_mapping_record_id = self.next_mapping_record_id.wrapping_add(1).max(1);
         self.generation = self.generation.wrapping_add(1).max(1);
         self.mappings.push(GpuMapping {
             gpu_va,
@@ -179,28 +477,321 @@ impl GpuMappings {
             cpu_addr,
             nvmap_id,
             epoch,
+            record_id,
+            sparse,
+            owner_record_id,
+            owned_va_range,
+            as_gpu_fd,
+            as_gpu_allocation_base,
+            as_gpu_root,
+            as_gpu_unmap_barrier: false,
         });
+        let mut changed_gpu_ranges = Vec::new();
+        let mut epoch_transitions = Vec::new();
+        for (range_start, range_end, previous) in before {
+            let current = self.effective_physical_identity(range_start);
+            let range_size = range_end - range_start;
+            match (previous, current) {
+                (Some((old_physical, old_epoch)), Some((new_physical, new_epoch)))
+                    if old_physical == new_physical =>
+                {
+                    Self::push_epoch_transition(
+                        &mut epoch_transitions,
+                        range_start,
+                        range_size,
+                        old_epoch,
+                        new_epoch,
+                    );
+                }
+                (old, new) if old != new => {
+                    Self::push_coalesced_gpu_range(
+                        &mut changed_gpu_ranges,
+                        range_start,
+                        range_size,
+                    );
+                }
+                _ => {}
+            }
+        }
+        for &(range_gpu, range_size) in &changed_gpu_ranges {
+            nexium_gpu::pitch_oracle::clear_pitch_range(range_gpu, range_size);
+        }
+        GpuMappingUpdate {
+            change,
+            changed_gpu_ranges,
+            epoch_transitions,
+        }
+    }
+
+    pub fn add_with_metadata(
+        &mut self,
+        gpu_va: u64,
+        size: u64,
+        cpu_addr: u64,
+        nvmap_id: u32,
+    ) -> GpuMappingUpdate {
+        log::debug!(
+            "GpuMap: gpu_va={:#x} size={:#x} cpu_addr={:#x} nvmap_id={}",
+            gpu_va,
+            size,
+            cpu_addr,
+            nvmap_id
+        );
+        if size == 0 || gpu_va.checked_add(size).is_none() || cpu_addr.checked_add(size).is_none() {
+            return GpuMappingUpdate {
+                change: GpuMappingChange::Replaced,
+                changed_gpu_ranges: Vec::new(),
+                epoch_transitions: Vec::new(),
+            };
+        }
+        let (change, preserved_epoch) = self.classify_add(gpu_va, size, cpu_addr, nvmap_id);
+        self.insert_mapping(
+            gpu_va,
+            size,
+            cpu_addr,
+            nvmap_id,
+            false,
+            None,
+            None,
+            change,
+            preserved_epoch,
+            false,
+            None,
+            None,
+            false,
+        )
+    }
+
+    pub(crate) fn add_tracked_with_metadata(
+        &mut self,
+        gpu_va: u64,
+        size: u64,
+        cpu_addr: u64,
+        nvmap_id: u32,
+    ) -> GpuMappingUpdate {
+        if size == 0 || gpu_va.checked_add(size).is_none() || cpu_addr.checked_add(size).is_none() {
+            return GpuMappingUpdate {
+                change: GpuMappingChange::Replaced,
+                changed_gpu_ranges: Vec::new(),
+                epoch_transitions: Vec::new(),
+            };
+        }
+        let (change, preserved_epoch) = self.classify_add(gpu_va, size, cpu_addr, nvmap_id);
+        self.insert_mapping(
+            gpu_va,
+            size,
+            cpu_addr,
+            nvmap_id,
+            false,
+            None,
+            None,
+            change,
+            preserved_epoch,
+            true,
+            None,
+            None,
+            false,
+        )
+    }
+
+    pub(crate) fn add_as_gpu_mapping(
+        &mut self,
+        fd: u32,
+        gpu_va: u64,
+        size: u64,
+        cpu_addr: u64,
+        nvmap_id: u32,
+        owned_va_range: Option<(u64, u64)>,
+        allocation_base: Option<u64>,
+        root: bool,
+    ) -> GpuMappingUpdate {
+        if size == 0 || gpu_va.checked_add(size).is_none() || cpu_addr.checked_add(size).is_none() {
+            return GpuMappingUpdate {
+                change: GpuMappingChange::Replaced,
+                changed_gpu_ranges: Vec::new(),
+                epoch_transitions: Vec::new(),
+            };
+        }
+        let (change, preserved_epoch) = self.classify_add(gpu_va, size, cpu_addr, nvmap_id);
+        self.insert_mapping(
+            gpu_va,
+            size,
+            cpu_addr,
+            nvmap_id,
+            false,
+            None,
+            owned_va_range,
+            change,
+            preserved_epoch,
+            true,
+            Some(fd),
+            allocation_base,
+            root,
+        )
+    }
+
+    pub fn add(
+        &mut self,
+        gpu_va: u64,
+        size: u64,
+        cpu_addr: u64,
+        nvmap_id: u32,
+    ) -> GpuMappingChange {
+        self.add_with_metadata(gpu_va, size, cpu_addr, nvmap_id)
+            .change
+    }
+
+    pub(crate) fn add_with_va_ownership(
+        &mut self,
+        gpu_va: u64,
+        size: u64,
+        cpu_addr: u64,
+        nvmap_id: u32,
+        owned_va_range: (u64, u64),
+    ) -> GpuMappingUpdate {
+        if size == 0 || gpu_va.checked_add(size).is_none() || cpu_addr.checked_add(size).is_none() {
+            return GpuMappingUpdate {
+                change: GpuMappingChange::Replaced,
+                changed_gpu_ranges: Vec::new(),
+                epoch_transitions: Vec::new(),
+            };
+        }
+        let (change, preserved_epoch) = self.classify_add(gpu_va, size, cpu_addr, nvmap_id);
+        self.insert_mapping(
+            gpu_va,
+            size,
+            cpu_addr,
+            nvmap_id,
+            false,
+            None,
+            Some(owned_va_range),
+            change,
+            preserved_epoch,
+            true,
+            None,
+            None,
+            false,
+        )
+    }
+
+    pub(crate) fn add_owned(
+        &mut self,
+        fd: u32,
+        gpu_va: u64,
+        size: u64,
+        cpu_addr: u64,
+        nvmap_id: u32,
+        owner_record_id: u64,
+    ) -> GpuMappingUpdate {
+        if size == 0 || gpu_va.checked_add(size).is_none() || cpu_addr.checked_add(size).is_none() {
+            return GpuMappingUpdate {
+                change: GpuMappingChange::Replaced,
+                changed_gpu_ranges: Vec::new(),
+                epoch_transitions: Vec::new(),
+            };
+        }
+        let (change, preserved_epoch) = self.classify_add(gpu_va, size, cpu_addr, nvmap_id);
+        self.insert_mapping(
+            gpu_va,
+            size,
+            cpu_addr,
+            nvmap_id,
+            false,
+            Some(owner_record_id),
+            None,
+            change,
+            preserved_epoch,
+            true,
+            Some(fd),
+            None,
+            false,
+        )
+    }
+
+    pub(crate) fn add_sparse_with_metadata(&mut self, gpu_va: u64, size: u64) -> GpuMappingUpdate {
+        if size == 0 || gpu_va.checked_add(size).is_none() {
+            return GpuMappingUpdate {
+                change: GpuMappingChange::Replaced,
+                changed_gpu_ranges: Vec::new(),
+                epoch_transitions: Vec::new(),
+            };
+        }
+        let change = self.classify_sparse_add(gpu_va, size);
+        self.insert_mapping(
+            gpu_va, size, 0, 0, true, None, None, change, None, false, None, None, false,
+        )
+    }
+
+    pub(crate) fn add_sparse(&mut self, gpu_va: u64, size: u64) -> GpuMappingChange {
+        self.add_sparse_with_metadata(gpu_va, size).change
+    }
+
+    pub(crate) fn add_sparse_as_gpu_with_metadata(
+        &mut self,
+        fd: u32,
+        gpu_va: u64,
+        size: u64,
+    ) -> GpuMappingUpdate {
+        if size == 0 || gpu_va.checked_add(size).is_none() {
+            return GpuMappingUpdate {
+                change: GpuMappingChange::Replaced,
+                changed_gpu_ranges: Vec::new(),
+                epoch_transitions: Vec::new(),
+            };
+        }
+        let change = self.classify_sparse_add(gpu_va, size);
+        self.insert_mapping(
+            gpu_va,
+            size,
+            0,
+            0,
+            true,
+            None,
+            None,
+            change,
+            None,
+            true,
+            Some(fd),
+            None,
+            false,
+        )
     }
 
     pub fn cpu_address_for_any32(&self, gpu_va: u64) -> Option<(u64, u64, u64)> {
+        fn segment_for(mapping: &GpuMapping, address: u64) -> Option<(u64, u64)> {
+            const DOMAIN: u64 = 1u64 << 32;
+            let base = mapping.gpu_va & 0xFFFF_FFFF;
+            let covered = mapping.size.min(DOMAIN);
+            let first_len = covered.min(DOMAIN - base);
+            if address >= base && address - base < first_len {
+                return Some((address - base, base + first_len));
+            }
+            let wrapped_len = covered - first_len;
+            (address < wrapped_len).then_some((first_len + address, wrapped_len))
+        }
+
         let lo = gpu_va & 0xFFFF_FFFF;
-        let mut best: Option<&GpuMapping> = None;
-        for m in &self.mappings {
-            let mlo = m.gpu_va & 0xFFFF_FFFF;
-            if lo >= mlo && lo < mlo + m.size {
-                let better = match best {
-                    Some(b) => (m.gpu_va & 0xFFFF_FFFF) > (b.gpu_va & 0xFFFF_FFFF),
-                    None => true,
-                };
-                if better {
-                    best = Some(m);
-                }
+        let mapping_index = self
+            .mappings
+            .iter()
+            .rposition(|mapping| segment_for(mapping, lo).is_some())?;
+        let mapping = &self.mappings[mapping_index];
+        if mapping.sparse {
+            return None;
+        }
+        let (offset, segment_end) = segment_for(mapping, lo)?;
+        let mut remaining = segment_end - lo;
+        for newer in &self.mappings[mapping_index + 1..] {
+            let newer_lo = newer.gpu_va & 0xFFFF_FFFF;
+            if newer_lo > lo {
+                remaining = remaining.min(newer_lo - lo);
             }
         }
-        best.map(|m| {
-            let off = lo - (m.gpu_va & 0xFFFF_FFFF);
-            (m.gpu_va, m.cpu_addr + off, m.size - off)
-        })
+        Some((
+            mapping.gpu_va,
+            mapping.cpu_addr.checked_add(offset)?,
+            remaining,
+        ))
     }
 
     pub fn bracket(&self, gpu_va: u64) -> String {
@@ -233,34 +824,563 @@ impl GpuMappings {
         )
     }
 
-    pub fn remove(&mut self, gpu_va: u64) -> Option<u64> {
-        if let Some(pos) = self.mappings.iter().rposition(|m| m.gpu_va == gpu_va) {
-            let size = self.mappings.remove(pos).size;
-            self.generation = self.generation.wrapping_add(1).max(1);
-            Some(size)
-        } else {
-            None
+    pub fn remove_with_metadata(&mut self, gpu_va: u64) -> Option<RemovedGpuMapping> {
+        let pos = self.mappings.iter().rposition(|mapping| {
+            mapping.gpu_va == gpu_va && !mapping.sparse && mapping.owner_record_id.is_none()
+        })?;
+        let removed = self.mappings[pos].clone();
+        let removed_end = removed.gpu_va.saturating_add(removed.size);
+        let mut remove_mask = vec![false; self.mappings.len()];
+        let mut removed_ranges = Vec::new();
+        for (index, mapping) in self.mappings.iter().enumerate() {
+            if index == pos {
+                remove_mask[index] = true;
+                removed_ranges.push((mapping.gpu_va, mapping.gpu_va.saturating_add(mapping.size)));
+            }
         }
+        let mut boundaries = Vec::new();
+        for &(range_start, range_end) in &removed_ranges {
+            boundaries.push(range_start);
+            boundaries.push(range_end);
+            for mapping in &self.mappings {
+                let mapping_end = mapping.gpu_va.saturating_add(mapping.size);
+                let overlap_start = range_start.max(mapping.gpu_va);
+                let overlap_end = range_end.min(mapping_end);
+                if overlap_start < overlap_end {
+                    boundaries.push(overlap_start);
+                    boundaries.push(overlap_end);
+                }
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let before = boundaries
+            .windows(2)
+            .filter_map(|window| {
+                (window[0] < window[1]
+                    && removed_ranges
+                        .iter()
+                        .any(|&(start, end)| window[0] >= start && window[0] < end))
+                .then(|| {
+                    (
+                        window[0],
+                        window[1],
+                        self.effective_physical_identity(window[0]),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut index = 0;
+        self.mappings.retain(|_| {
+            let keep = !remove_mask[index];
+            index += 1;
+            keep
+        });
+        self.generation = self.generation.wrapping_add(1).max(1);
+        let mut changed_gpu_ranges = Vec::new();
+        let mut epoch_transitions = Vec::new();
+        let mut unmapped_gpu_ranges = Vec::new();
+        for (range_start, range_end, previous) in before {
+            let current = self.effective_physical_identity(range_start);
+            let range_size = range_end - range_start;
+            match (previous, current) {
+                (Some((old_physical, old_epoch)), Some((new_physical, new_epoch)))
+                    if old_physical == new_physical =>
+                {
+                    Self::push_epoch_transition(
+                        &mut epoch_transitions,
+                        range_start,
+                        range_size,
+                        old_epoch,
+                        new_epoch,
+                    );
+                }
+                (old, new) if old != new => {
+                    Self::push_coalesced_gpu_range(
+                        &mut changed_gpu_ranges,
+                        range_start,
+                        range_size,
+                    );
+                    if new.is_none() && range_start >= removed.gpu_va && range_end <= removed_end {
+                        Self::push_coalesced_gpu_range(
+                            &mut unmapped_gpu_ranges,
+                            range_start,
+                            range_size,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        for &(range_gpu, range_size) in &changed_gpu_ranges {
+            nexium_gpu::pitch_oracle::clear_pitch_range(range_gpu, range_size);
+            nexium_gpu::tex_invalidate::bump_region(range_gpu, range_size);
+        }
+        for transition in &epoch_transitions {
+            nexium_gpu::tex_invalidate::bump_region(transition.gpu_va, transition.size);
+        }
+        Some(RemovedGpuMapping {
+            gpu_va: removed.gpu_va,
+            size: removed.size,
+            cpu_addr: removed.cpu_addr,
+            nvmap_id: removed.nvmap_id,
+            epoch: removed.epoch,
+            owned_va_range: removed.owned_va_range,
+            changed_gpu_ranges,
+            epoch_transitions,
+            unmapped_gpu_ranges,
+        })
+    }
+
+    pub(crate) fn remove_all_contained_with_metadata(
+        &mut self,
+        fd: u32,
+        gpu_va: u64,
+        size: u64,
+    ) -> Result<RemovedGpuMappingSet, ()> {
+        let gpu_end = gpu_va.checked_add(size).filter(|_| size != 0).ok_or(())?;
+        let remove_mask = self
+            .mappings
+            .iter()
+            .map(|mapping| {
+                mapping.as_gpu_fd == Some(fd)
+                    && mapping
+                        .gpu_va
+                        .checked_add(mapping.size)
+                        .is_some_and(|end| mapping.gpu_va >= gpu_va && end <= gpu_end)
+            })
+            .collect::<Vec<_>>();
+        if self
+            .mappings
+            .iter()
+            .zip(&remove_mask)
+            .any(|(mapping, selected)| {
+                !selected
+                    && mapping.as_gpu_fd == Some(fd)
+                    && mapping.gpu_va < gpu_end
+                    && mapping.gpu_va.saturating_add(mapping.size) > gpu_va
+                    && mapping.owned_va_range.is_some()
+            })
+        {
+            return Err(());
+        }
+        let mut owned_va_ranges = self
+            .mappings
+            .iter()
+            .zip(&remove_mask)
+            .filter_map(|(mapping, selected)| selected.then_some(mapping.owned_va_range).flatten())
+            .collect::<Vec<_>>();
+        owned_va_ranges.sort_unstable();
+        owned_va_ranges.dedup();
+        let has_crossing = self
+            .mappings
+            .iter()
+            .zip(&remove_mask)
+            .any(|(mapping, selected)| {
+                !selected
+                    && mapping.as_gpu_fd == Some(fd)
+                    && mapping.gpu_va < gpu_end
+                    && mapping.gpu_va.saturating_add(mapping.size) > gpu_va
+            });
+        if !remove_mask.iter().any(|selected| *selected) && !has_crossing {
+            return Ok(RemovedGpuMappingSet {
+                update: GpuMappingUpdate {
+                    change: GpuMappingChange::Replaced,
+                    changed_gpu_ranges: Vec::new(),
+                    epoch_transitions: Vec::new(),
+                },
+                owned_va_ranges,
+            });
+        }
+        let mut boundaries = vec![gpu_va, gpu_end];
+        for mapping in &self.mappings {
+            let mapping_end = mapping.gpu_va.saturating_add(mapping.size);
+            let overlap_start = gpu_va.max(mapping.gpu_va);
+            let overlap_end = gpu_end.min(mapping_end);
+            if overlap_start < overlap_end {
+                boundaries.push(overlap_start);
+                boundaries.push(overlap_end);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let before = boundaries
+            .windows(2)
+            .filter_map(|window| {
+                (window[0] < window[1]).then(|| {
+                    (
+                        window[0],
+                        window[1],
+                        self.effective_physical_identity(window[0]),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mappings = std::mem::take(&mut self.mappings);
+        self.mappings = Vec::with_capacity(mappings.len() + 2);
+        for (index, mapping) in mappings.into_iter().enumerate() {
+            if remove_mask[index] {
+                continue;
+            }
+            let mapping_end = mapping.gpu_va.saturating_add(mapping.size);
+            if mapping.as_gpu_fd != Some(fd) || mapping.gpu_va >= gpu_end || mapping_end <= gpu_va {
+                self.mappings.push(mapping);
+                continue;
+            }
+            let left_size = gpu_va.saturating_sub(mapping.gpu_va);
+            let right_size = mapping_end.saturating_sub(gpu_end);
+            let right_cpu_offset = gpu_end.saturating_sub(mapping.gpu_va);
+            if left_size != 0 {
+                let mut left = mapping.clone();
+                left.size = left_size;
+                self.mappings.push(left);
+            }
+            if right_size != 0 {
+                let mut right = mapping;
+                right.gpu_va = gpu_end;
+                right.size = right_size;
+                if !right.sparse {
+                    right.cpu_addr = right
+                        .cpu_addr
+                        .checked_add(right_cpu_offset)
+                        .unwrap_or(right.cpu_addr);
+                }
+                if left_size != 0 {
+                    right.record_id = self.next_mapping_record_id;
+                    self.next_mapping_record_id =
+                        self.next_mapping_record_id.wrapping_add(1).max(1);
+                }
+                self.mappings.push(right);
+            }
+        }
+        self.generation = self.generation.wrapping_add(1).max(1);
+        let mut changed_gpu_ranges = Vec::new();
+        let mut epoch_transitions = Vec::new();
+        for (range_start, range_end, previous) in before {
+            let current = self.effective_physical_identity(range_start);
+            let range_size = range_end - range_start;
+            match (previous, current) {
+                (Some((old_physical, old_epoch)), Some((new_physical, new_epoch)))
+                    if old_physical == new_physical =>
+                {
+                    Self::push_epoch_transition(
+                        &mut epoch_transitions,
+                        range_start,
+                        range_size,
+                        old_epoch,
+                        new_epoch,
+                    );
+                }
+                (old, new) if old != new => {
+                    Self::push_coalesced_gpu_range(
+                        &mut changed_gpu_ranges,
+                        range_start,
+                        range_size,
+                    );
+                }
+                _ => {}
+            }
+        }
+        for &(range_gpu, range_size) in &changed_gpu_ranges {
+            nexium_gpu::pitch_oracle::clear_pitch_range(range_gpu, range_size);
+            nexium_gpu::tex_invalidate::bump_region(range_gpu, range_size);
+        }
+        for transition in &epoch_transitions {
+            nexium_gpu::tex_invalidate::bump_region(transition.gpu_va, transition.size);
+        }
+        Ok(RemovedGpuMappingSet {
+            update: GpuMappingUpdate {
+                change: GpuMappingChange::Replaced,
+                changed_gpu_ranges,
+                epoch_transitions,
+            },
+            owned_va_ranges,
+        })
+    }
+
+    pub(crate) fn remove_all_for_allocation_with_metadata(
+        &mut self,
+        fd: u32,
+        allocation_base: u64,
+    ) -> RemovedGpuMappingSet {
+        let remove_mask = self
+            .mappings
+            .iter()
+            .map(|mapping| {
+                mapping.as_gpu_fd == Some(fd)
+                    && mapping.as_gpu_allocation_base == Some(allocation_base)
+            })
+            .collect::<Vec<_>>();
+        let mut owned_va_ranges = self
+            .mappings
+            .iter()
+            .zip(&remove_mask)
+            .filter_map(|(mapping, selected)| selected.then_some(mapping.owned_va_range).flatten())
+            .collect::<Vec<_>>();
+        owned_va_ranges.sort_unstable();
+        owned_va_ranges.dedup();
+        let mut affected_ranges = self
+            .mappings
+            .iter()
+            .zip(&remove_mask)
+            .filter_map(|(mapping, selected)| {
+                selected.then(|| (mapping.gpu_va, mapping.gpu_va.saturating_add(mapping.size)))
+            })
+            .collect::<Vec<_>>();
+        affected_ranges.sort_unstable();
+        let mut merged_ranges: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in affected_ranges {
+            if let Some(last) = merged_ranges.last_mut() {
+                if start <= last.1 {
+                    last.1 = last.1.max(end);
+                    continue;
+                }
+            }
+            merged_ranges.push((start, end));
+        }
+        if merged_ranges.is_empty() {
+            return RemovedGpuMappingSet {
+                update: GpuMappingUpdate {
+                    change: GpuMappingChange::Replaced,
+                    changed_gpu_ranges: Vec::new(),
+                    epoch_transitions: Vec::new(),
+                },
+                owned_va_ranges,
+            };
+        }
+        let mut before = Vec::new();
+        for &(range_start, range_end) in &merged_ranges {
+            let mut boundaries = vec![range_start, range_end];
+            for mapping in &self.mappings {
+                let mapping_end = mapping.gpu_va.saturating_add(mapping.size);
+                let overlap_start = range_start.max(mapping.gpu_va);
+                let overlap_end = range_end.min(mapping_end);
+                if overlap_start < overlap_end {
+                    boundaries.push(overlap_start);
+                    boundaries.push(overlap_end);
+                }
+            }
+            boundaries.sort_unstable();
+            boundaries.dedup();
+            before.extend(boundaries.windows(2).filter_map(|window| {
+                (window[0] < window[1]).then(|| {
+                    (
+                        window[0],
+                        window[1],
+                        self.effective_physical_identity(window[0]),
+                    )
+                })
+            }));
+        }
+        let mut index = 0;
+        self.mappings.retain(|_| {
+            let keep = !remove_mask[index];
+            index += 1;
+            keep
+        });
+        for &(range_start, range_end) in &merged_ranges {
+            let epoch = self.next_mapping_epoch;
+            self.next_mapping_epoch = self.next_mapping_epoch.wrapping_add(1).max(1);
+            let record_id = self.next_mapping_record_id;
+            self.next_mapping_record_id = self.next_mapping_record_id.wrapping_add(1).max(1);
+            self.mappings.push(GpuMapping {
+                gpu_va: range_start,
+                size: range_end - range_start,
+                cpu_addr: 0,
+                nvmap_id: 0,
+                epoch,
+                record_id,
+                sparse: true,
+                owner_record_id: None,
+                owned_va_range: None,
+                as_gpu_fd: Some(fd),
+                as_gpu_allocation_base: None,
+                as_gpu_root: false,
+                as_gpu_unmap_barrier: true,
+            });
+        }
+        self.generation = self.generation.wrapping_add(1).max(1);
+        let mut changed_gpu_ranges = Vec::new();
+        let mut epoch_transitions = Vec::new();
+        for (range_start, range_end, previous) in before {
+            let current = self.effective_physical_identity(range_start);
+            let range_size = range_end - range_start;
+            match (previous, current) {
+                (Some((old_physical, old_epoch)), Some((new_physical, new_epoch)))
+                    if old_physical == new_physical =>
+                {
+                    Self::push_epoch_transition(
+                        &mut epoch_transitions,
+                        range_start,
+                        range_size,
+                        old_epoch,
+                        new_epoch,
+                    );
+                }
+                (old, new) if old != new => {
+                    Self::push_coalesced_gpu_range(
+                        &mut changed_gpu_ranges,
+                        range_start,
+                        range_size,
+                    );
+                }
+                _ => {}
+            }
+        }
+        for &(range_gpu, range_size) in &changed_gpu_ranges {
+            nexium_gpu::pitch_oracle::clear_pitch_range(range_gpu, range_size);
+            nexium_gpu::tex_invalidate::bump_region(range_gpu, range_size);
+        }
+        for transition in &epoch_transitions {
+            nexium_gpu::tex_invalidate::bump_region(transition.gpu_va, transition.size);
+        }
+        RemovedGpuMappingSet {
+            update: GpuMappingUpdate {
+                change: GpuMappingChange::Replaced,
+                changed_gpu_ranges,
+                epoch_transitions,
+            },
+            owned_va_ranges,
+        }
+    }
+
+    pub fn remove(&mut self, gpu_va: u64) -> Option<u64> {
+        self.remove_with_metadata(gpu_va)
+            .map(|removed| removed.size)
+    }
+
+    pub(crate) fn unmap_as_gpu_with_metadata(
+        &mut self,
+        fd: u32,
+        gpu_va: u64,
+    ) -> Option<RemovedGpuMapping> {
+        let barrier = self.mappings.iter().rposition(|mapping| {
+            mapping.as_gpu_fd == Some(fd)
+                && mapping.as_gpu_unmap_barrier
+                && Self::contains(mapping, gpu_va)
+        });
+        let pos = self
+            .mappings
+            .iter()
+            .enumerate()
+            .rposition(|(index, mapping)| {
+                barrier.is_none_or(|barrier| index > barrier)
+                    && mapping.gpu_va == gpu_va
+                    && !mapping.sparse
+                    && mapping.owner_record_id.is_none()
+                    && mapping.as_gpu_fd == Some(fd)
+                    && mapping.as_gpu_root
+            })?;
+        let removed = self.mappings[pos].clone();
+        let before = self.effective_range_snapshot(removed.gpu_va, removed.size);
+        self.mappings.remove(pos);
+        let epoch = self.next_mapping_epoch;
+        self.next_mapping_epoch = self.next_mapping_epoch.wrapping_add(1).max(1);
+        let record_id = self.next_mapping_record_id;
+        self.next_mapping_record_id = self.next_mapping_record_id.wrapping_add(1).max(1);
+        self.mappings.push(GpuMapping {
+            gpu_va: removed.gpu_va,
+            size: removed.size,
+            cpu_addr: 0,
+            nvmap_id: 0,
+            epoch,
+            record_id,
+            sparse: true,
+            owner_record_id: None,
+            owned_va_range: None,
+            as_gpu_fd: Some(fd),
+            as_gpu_allocation_base: removed.as_gpu_allocation_base,
+            as_gpu_root: false,
+            as_gpu_unmap_barrier: true,
+        });
+        self.generation = self.generation.wrapping_add(1).max(1);
+        let mut changed_gpu_ranges = Vec::new();
+        let mut epoch_transitions = Vec::new();
+        let mut unmapped_gpu_ranges = Vec::new();
+        for (range_start, range_end, previous) in before {
+            let current = self.effective_physical_identity(range_start);
+            let range_size = range_end - range_start;
+            match (previous, current) {
+                (Some((old_physical, old_epoch)), Some((new_physical, new_epoch)))
+                    if old_physical == new_physical =>
+                {
+                    Self::push_epoch_transition(
+                        &mut epoch_transitions,
+                        range_start,
+                        range_size,
+                        old_epoch,
+                        new_epoch,
+                    );
+                }
+                (old, new) if old != new => {
+                    Self::push_coalesced_gpu_range(
+                        &mut changed_gpu_ranges,
+                        range_start,
+                        range_size,
+                    );
+                    Self::push_coalesced_gpu_range(
+                        &mut unmapped_gpu_ranges,
+                        range_start,
+                        range_size,
+                    );
+                }
+                _ => {}
+            }
+        }
+        for &(range_gpu, range_size) in &changed_gpu_ranges {
+            nexium_gpu::pitch_oracle::clear_pitch_range(range_gpu, range_size);
+            nexium_gpu::tex_invalidate::bump_region(range_gpu, range_size);
+        }
+        for transition in &epoch_transitions {
+            nexium_gpu::tex_invalidate::bump_region(transition.gpu_va, transition.size);
+        }
+        Some(RemovedGpuMapping {
+            gpu_va: removed.gpu_va,
+            size: removed.size,
+            cpu_addr: removed.cpu_addr,
+            nvmap_id: removed.nvmap_id,
+            epoch: removed.epoch,
+            owned_va_range: removed.owned_va_range,
+            changed_gpu_ranges,
+            epoch_transitions,
+            unmapped_gpu_ranges,
+        })
     }
 
     #[inline]
     pub fn cpu_address_for(&self, gpu_va: u64) -> Option<u64> {
         let mapping = &self.mappings[self.mapping_index_for(gpu_va)?];
-        Some(mapping.cpu_addr + (gpu_va - mapping.gpu_va))
+        (!mapping.sparse)
+            .then(|| mapping.cpu_addr.checked_add(gpu_va - mapping.gpu_va))
+            .flatten()
     }
 
     #[inline]
     pub fn mapping_at(&self, gpu_va: u64) -> Option<(u64, u64, u64)> {
-        let mapping = &self.mappings[self.mapping_index_for(gpu_va)?];
-        Some((mapping.gpu_va, mapping.size, mapping.cpu_addr))
+        let cached = self.mapping_lookup_for(gpu_va)?;
+        let mapping = &self.mappings[cached.mapping_index];
+        if mapping.sparse {
+            return None;
+        }
+        let cpu_addr = mapping
+            .cpu_addr
+            .checked_add(cached.gpu_lo.saturating_sub(mapping.gpu_va))?;
+        Some((cached.gpu_lo, cached.gpu_hi - cached.gpu_lo, cpu_addr))
     }
 
     #[inline]
     pub fn cpu_range_for(&self, gpu_va: u64) -> Option<(u64, u64)> {
         let cached = self.mapping_lookup_for(gpu_va)?;
         let mapping = &self.mappings[cached.mapping_index];
+        if mapping.sparse {
+            return None;
+        }
         let offset = gpu_va - mapping.gpu_va;
-        Some((mapping.cpu_addr + offset, cached.gpu_hi - gpu_va))
+        Some((
+            mapping.cpu_addr.checked_add(offset)?,
+            cached.gpu_hi - gpu_va,
+        ))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &GpuMapping> {
@@ -274,29 +1394,99 @@ impl GpuMappings {
             .find(|mapping| mapping.gpu_va == gpu_va)
     }
 
+    pub(crate) fn remap_source_starting_at(
+        &self,
+        fd: u32,
+        gpu_va: u64,
+    ) -> Option<(u64, u64, u32, u64)> {
+        let barrier = self.mappings.iter().rposition(|mapping| {
+            mapping.as_gpu_fd == Some(fd)
+                && mapping.as_gpu_unmap_barrier
+                && Self::contains(mapping, gpu_va)
+        });
+        self.mappings
+            .iter()
+            .enumerate()
+            .rfind(|(index, mapping)| {
+                barrier.is_none_or(|barrier| *index > barrier)
+                    && mapping.gpu_va == gpu_va
+                    && !mapping.sparse
+                    && mapping.owner_record_id.is_none()
+                    && mapping.as_gpu_fd == Some(fd)
+                    && mapping.as_gpu_root
+            })
+            .map(|(_, mapping)| {
+                (
+                    mapping.cpu_addr,
+                    mapping.size,
+                    mapping.nvmap_id,
+                    mapping.record_id,
+                )
+            })
+    }
+
     pub fn gpu_regions_for_cpu_range(&self, cpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
         if size == 0 {
             return Vec::new();
         }
         let cpu_end = cpu_addr.saturating_add(size);
-        let mut regions = self
-            .mappings
-            .iter()
-            .filter_map(|mapping| {
-                let mapping_end = mapping.cpu_addr.saturating_add(mapping.size);
-                let overlap_start = cpu_addr.max(mapping.cpu_addr);
-                let overlap_end = cpu_end.min(mapping_end);
-                (overlap_start < overlap_end).then(|| {
-                    (
-                        mapping.gpu_va + (overlap_start - mapping.cpu_addr),
-                        overlap_end - overlap_start,
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut regions = Vec::new();
+        for (index, mapping) in self.mappings.iter().enumerate() {
+            if mapping.sparse {
+                continue;
+            }
+            let mapping_end = mapping.cpu_addr.saturating_add(mapping.size);
+            let overlap_start = cpu_addr.max(mapping.cpu_addr);
+            let overlap_end = cpu_end.min(mapping_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let Some(fragment_start) = mapping.gpu_va.checked_add(overlap_start - mapping.cpu_addr)
+            else {
+                continue;
+            };
+            let fragment_end = fragment_start.saturating_add(overlap_end - overlap_start);
+            let mut fragments = vec![(fragment_start, fragment_end)];
+            for newer in &self.mappings[index + 1..] {
+                let newer_start = newer.gpu_va;
+                let newer_end = newer.gpu_va.saturating_add(newer.size);
+                let mut surviving = Vec::with_capacity(fragments.len() + 1);
+                for (start, end) in fragments {
+                    if end <= newer_start || start >= newer_end {
+                        surviving.push((start, end));
+                        continue;
+                    }
+                    if start < newer_start {
+                        surviving.push((start, newer_start));
+                    }
+                    if end > newer_end {
+                        surviving.push((newer_end, end));
+                    }
+                }
+                fragments = surviving;
+                if fragments.is_empty() {
+                    break;
+                }
+            }
+            regions.extend(
+                fragments
+                    .into_iter()
+                    .filter_map(|(start, end)| (start < end).then_some((start, end - start))),
+            );
+        }
         regions.sort_unstable();
-        regions.dedup();
-        regions
+        let mut coalesced = Vec::<(u64, u64)>::with_capacity(regions.len());
+        for (start, size) in regions {
+            if let Some((previous_start, previous_size)) = coalesced.last_mut() {
+                let previous_end = previous_start.saturating_add(*previous_size);
+                if start <= previous_end {
+                    *previous_size = previous_end.max(start.saturating_add(size)) - *previous_start;
+                    continue;
+                }
+            }
+            coalesced.push((start, size));
+        }
+        coalesced
     }
 
     pub fn describe_around(&self, gpu_va: u64) -> String {
@@ -326,7 +1516,8 @@ impl GpuMappings {
 
     #[inline]
     pub fn nvmap_id_for(&self, gpu_va: u64) -> Option<u32> {
-        Some(self.mappings[self.mapping_index_for(gpu_va)?].nvmap_id)
+        let mapping = &self.mappings[self.mapping_index_for(gpu_va)?];
+        (!mapping.sparse).then_some(mapping.nvmap_id)
     }
 
     #[inline]
@@ -336,7 +1527,8 @@ impl GpuMappings {
 
     #[inline]
     pub fn mapping_epoch_for(&self, gpu_va: u64) -> Option<u64> {
-        Some(self.mappings[self.mapping_index_for(gpu_va)?].epoch)
+        let mapping = &self.mappings[self.mapping_index_for(gpu_va)?];
+        (!mapping.sparse).then_some(mapping.epoch)
     }
 }
 
@@ -688,39 +1880,86 @@ impl GpuContext {
     }
 
     pub fn alloc_gpu_va_aligned(&self, size: u64, align: u64) -> u64 {
-        self.alloc_va(size, align >= 0x10000)
+        self.alloc_va_with_page_size(size, align.max(0x1000))
     }
 
     pub fn alloc_va(&self, size: u64, big: bool) -> u64 {
-        let (alloc, page) = if big {
-            (&self.big_alloc, 0x10000u64)
-        } else {
-            (&self.small_alloc, 0x1000u64)
-        };
-        let padded = (size + (page - 1)) & !(page - 1);
-        alloc.lock().allocate(padded)
+        self.alloc_va_with_page_size(size, if big { 0x10000 } else { 0x1000 })
     }
 
-    pub fn alloc_va_fixed(&self, gpu_va: u64, size: u64) {
+    pub fn alloc_va_with_page_size(&self, size: u64, page: u64) -> u64 {
+        if page < 0x1000 || !page.is_power_of_two() {
+            return 0;
+        }
+        let alloc = if page > 0x1000 {
+            &self.big_alloc
+        } else {
+            &self.small_alloc
+        };
+        let Some(padded) = size.checked_add(page - 1).map(|value| value & !(page - 1)) else {
+            return 0;
+        };
+        alloc.lock().allocate_aligned(padded, page)
+    }
+
+    pub fn alloc_va_fixed(&self, gpu_va: u64, size: u64) -> bool {
+        if size == 0 {
+            return false;
+        }
         let (alloc, page) = if gpu_va >= BIG_VA_BASE {
             (&self.big_alloc, 0x10000u64)
         } else {
             (&self.small_alloc, 0x1000u64)
         };
         let base = gpu_va & !(page - 1);
-        let padded = ((gpu_va - base) + size + (page - 1)) & !(page - 1);
-        alloc.lock().allocate_fixed(base, padded);
+        let Some(padded) = (gpu_va - base)
+            .checked_add(size)
+            .and_then(|value| value.checked_add(page - 1))
+            .map(|value| value & !(page - 1))
+        else {
+            return false;
+        };
+        alloc.lock().allocate_fixed(base, padded)
     }
 
-    pub fn free_va(&self, gpu_va: u64, size: u64) {
+    pub fn alloc_va_fixed_exclusive(&self, gpu_va: u64, size: u64) -> bool {
+        if size == 0 {
+            return false;
+        }
         let (alloc, page) = if gpu_va >= BIG_VA_BASE {
             (&self.big_alloc, 0x10000u64)
         } else {
             (&self.small_alloc, 0x1000u64)
         };
         let base = gpu_va & !(page - 1);
-        let padded = ((gpu_va - base) + size + (page - 1)) & !(page - 1);
-        alloc.lock().free(base, padded);
+        let Some(padded) = (gpu_va - base)
+            .checked_add(size)
+            .and_then(|value| value.checked_add(page - 1))
+            .map(|value| value & !(page - 1))
+        else {
+            return false;
+        };
+        alloc.lock().allocate_fixed_exclusive(base, padded)
+    }
+
+    pub fn free_va(&self, gpu_va: u64, size: u64) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let (alloc, page) = if gpu_va >= BIG_VA_BASE {
+            (&self.big_alloc, 0x10000u64)
+        } else {
+            (&self.small_alloc, 0x1000u64)
+        };
+        let base = gpu_va & !(page - 1);
+        let Some(padded) = (gpu_va - base)
+            .checked_add(size)
+            .and_then(|value| value.checked_add(page - 1))
+            .map(|value| value & !(page - 1))
+        else {
+            return false;
+        };
+        alloc.lock().free(base, padded)
     }
 
     pub fn submit_gpfifo(
@@ -1216,7 +2455,8 @@ impl Default for GpuContext {
 #[cfg(test)]
 mod tests {
     use super::{
-        eager_small_rt_writeback_value_enabled, GpuContext, GpuMappings, GuestMemoryAccess,
+        eager_small_rt_writeback_value_enabled, GpuContext, GpuMappingChange, GpuMappings,
+        GuestMemoryAccess, PendingSyncpointEvent,
     };
     use parking_lot::RwLock;
     use std::sync::{Arc, Mutex as StdMutex};
@@ -1236,6 +2476,24 @@ mod tests {
                 enabled
             ))));
         }
+    }
+
+    #[test]
+    fn syncpoint_events_are_owned_by_the_gpu_context() {
+        let first = GpuContext::new();
+        let second = GpuContext::new();
+
+        first.record_embedded_syncpt_incrs(vec![(7, 2), (0, 1)]);
+
+        assert_eq!(
+            first.syncpoint_events().drain(..).collect::<Vec<_>>(),
+            vec![PendingSyncpointEvent::Increment {
+                syncpt_id: 7,
+                count: 2
+            }]
+        );
+        assert!(first.syncpoint_events().is_empty());
+        assert!(second.syncpoint_events().is_empty());
     }
 
     #[test]
@@ -1281,6 +2539,36 @@ mod tests {
     }
 
     #[test]
+    fn guest_memory_access_versions_only_successful_nonempty_writes() {
+        let mappings = Arc::new(RwLock::new(GpuMappings::new()));
+        mappings.write().add(0x1000, 0x1000, 0x1_0000, 1);
+        let access = GuestMemoryAccess::new(Arc::clone(&mappings));
+        access.set_writer(Some(Arc::new(|_, bytes| bytes.first() == Some(&1))));
+
+        let before_success = nexium_gpu::tex_invalidate::region_gen(0x1080);
+        assert_eq!(
+            access.write_gpu(0x1080, &[1, 2, 3, 4]),
+            Some((0x1_0080, true))
+        );
+        assert_ne!(
+            nexium_gpu::tex_invalidate::region_gen(0x1080),
+            before_success
+        );
+        let before_failed = nexium_gpu::tex_invalidate::region_gen(0x1090);
+        assert_eq!(
+            access.write_gpu(0x1090, &[0, 2, 3, 4]),
+            Some((0x1_0090, false))
+        );
+        assert_eq!(
+            nexium_gpu::tex_invalidate::region_gen(0x1090),
+            before_failed
+        );
+        let before_empty = nexium_gpu::tex_invalidate::region_gen(0x10a0);
+        assert_eq!(access.write_gpu(0x10a0, &[]), Some((0x1_00a0, false)));
+        assert_eq!(nexium_gpu::tex_invalidate::region_gen(0x10a0), before_empty);
+    }
+
+    #[test]
     fn present_and_queue_barrier_use_the_hard_prepared_packet_drain() {
         let gpu = GpuContext::new();
 
@@ -1310,6 +2598,39 @@ mod tests {
     }
 
     #[test]
+    fn cpu_range_aliases_exclude_shadowed_mapping_records() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x1000, 0xa000, 1);
+        mappings.add(0x3000, 0x1000, 0xa000, 2);
+        mappings.add(0x1000, 0x1000, 0xb000, 3);
+
+        assert_eq!(
+            mappings.gpu_regions_for_cpu_range(0xa100, 0x100),
+            vec![(0x3100, 0x100)]
+        );
+        assert_eq!(
+            mappings.gpu_regions_for_cpu_range(0xb100, 0x100),
+            vec![(0x1100, 0x100)]
+        );
+    }
+
+    #[test]
+    fn cpu_range_aliases_split_around_partial_newer_overlays() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x2000, 0xa000, 1);
+        mappings.add(0x1800, 0x800, 0xd000, 2);
+
+        assert_eq!(
+            mappings.gpu_regions_for_cpu_range(0xa000, 0x2000),
+            vec![(0x1000, 0x800), (0x2000, 0x1000)]
+        );
+        assert_eq!(
+            mappings.gpu_regions_for_cpu_range(0xd000, 0x800),
+            vec![(0x1800, 0x800)]
+        );
+    }
+
+    #[test]
     fn mapping_lookup_cache_respects_newest_overlapping_mapping() {
         let mut mappings = GpuMappings::new();
         mappings.add(0x1000, 0x2000, 0x1_0000, 1);
@@ -1327,12 +2648,512 @@ mod tests {
 
         assert_eq!(mappings.cpu_address_for(0x1500), Some(0x2_0100));
         assert_eq!(mappings.nvmap_id_for(0x1900), Some(3));
-        assert_eq!(mappings.mapping_at(0x1b00), Some((0x1400, 0x800, 0x2_0000)));
+        assert_eq!(mappings.mapping_at(0x1200), Some((0x1000, 0x400, 0x1_0000)));
+        assert_eq!(mappings.mapping_at(0x1b00), Some((0x1a00, 0x200, 0x2_0600)));
         assert_eq!(mappings.cpu_range_for(0x1200), Some((0x1_0200, 0x200)));
         assert_eq!(mappings.cpu_range_for(0x1500), Some((0x2_0100, 0x300)));
         assert_eq!(mappings.cpu_range_for(0x1900), Some((0x3_0100, 0x100)));
         assert_eq!(mappings.cpu_range_for(0x1b00), Some((0x2_0700, 0x100)));
         assert_eq!(mappings.cpu_range_for(0x1d00), Some((0x1_0d00, 0x1300)));
+    }
+
+    #[test]
+    fn mapping_add_classifies_fresh_idempotent_and_replaced_ranges() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x7f11_3000;
+        let cpu = 0x4e22_0000;
+
+        let fresh = mappings.add(base, 0x2000, cpu, 17);
+        assert_eq!(fresh, GpuMappingChange::Fresh);
+        assert!(!fresh.invalidates_render_targets());
+        let original_epoch = mappings.mapping_epoch_for(base + 0x800).unwrap();
+        let original_generation = mappings.generation();
+
+        let texture_generation = nexium_gpu::tex_invalidate::region_gen(base);
+        let idempotent = mappings.add(base, 0x2000, cpu, 17);
+        assert_eq!(idempotent, GpuMappingChange::Idempotent);
+        assert!(!idempotent.invalidates_render_targets());
+        assert_eq!(
+            mappings.mapping_epoch_for(base + 0x800),
+            Some(original_epoch)
+        );
+        assert_eq!(mappings.generation(), original_generation);
+        assert_ne!(
+            nexium_gpu::tex_invalidate::region_gen(base),
+            texture_generation
+        );
+
+        assert_eq!(
+            mappings.add(base + 0x400, 0x800, cpu + 0x400, 17),
+            GpuMappingChange::Idempotent
+        );
+        assert_eq!(
+            mappings.mapping_epoch_for(base + 0x800),
+            Some(original_epoch)
+        );
+        assert_eq!(mappings.iter().count(), 1);
+
+        let replaced_identity = mappings.add(base + 0x400, 0x200, cpu + 0x400, 18);
+        assert_eq!(replaced_identity, GpuMappingChange::Replaced);
+        assert!(replaced_identity.invalidates_render_targets());
+
+        let replaced = mappings.add(base, 0x2000, cpu + 0x8000, 18);
+        assert_eq!(replaced, GpuMappingChange::Replaced);
+        assert!(replaced.invalidates_render_targets());
+        assert_ne!(
+            mappings.mapping_epoch_for(base + 0x800),
+            Some(original_epoch)
+        );
+        assert_eq!(mappings.cpu_address_for(base + 0x800), Some(cpu + 0x8800));
+
+        let disjoint = mappings.add(base + 0x4000, 0x1000, cpu + 0x10_000, 19);
+        assert_eq!(disjoint, GpuMappingChange::Fresh);
+        assert!(!disjoint.invalidates_render_targets());
+    }
+
+    #[test]
+    fn mapping_add_classification_uses_the_newest_effective_overlay() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x7f22_0000;
+        let cpu = 0x4f33_0000;
+        assert_eq!(mappings.add(base, 0x2000, cpu, 21), GpuMappingChange::Fresh);
+        assert_eq!(
+            mappings.add(base + 0x800, 0x400, cpu + 0x8000, 22),
+            GpuMappingChange::Replaced
+        );
+
+        assert_eq!(
+            mappings.add(base, 0x2000, cpu, 21),
+            GpuMappingChange::Replaced
+        );
+        let epoch = mappings.mapping_epoch_for(base + 0x900).unwrap();
+        assert_eq!(
+            mappings.add(base, 0x2000, cpu, 21),
+            GpuMappingChange::Idempotent
+        );
+        assert_eq!(mappings.mapping_epoch_for(base + 0x900), Some(epoch));
+    }
+
+    #[test]
+    fn any32_lookup_uses_the_newest_effective_overlay() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1_0000_1000, 0x1000, 0xa000, 1);
+        mappings.add(0x2_0000_1000, 0x1000, 0xb000, 2);
+
+        assert_eq!(
+            mappings.cpu_address_for_any32(0x1800),
+            Some((0x2_0000_1000, 0xb800, 0x800))
+        );
+    }
+
+    #[test]
+    fn any32_lookup_clamps_remaining_length_at_newer_overlays() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1_0000_1000, 0x3000, 0xa000, 1);
+        mappings.add(0x2_0000_2000, 0x800, 0xd000, 2);
+
+        assert_eq!(
+            mappings.cpu_address_for_any32(0x1800),
+            Some((0x1_0000_1000, 0xa800, 0x800))
+        );
+        assert_eq!(
+            mappings.cpu_address_for_any32(0x2100),
+            Some((0x2_0000_2000, 0xd100, 0x700))
+        );
+
+        mappings.add_sparse(0x3_0000_3000, 0x400);
+        assert_eq!(
+            mappings.cpu_address_for_any32(0x2900),
+            Some((0x1_0000_1000, 0xb900, 0x700))
+        );
+        assert_eq!(mappings.cpu_address_for_any32(0x3100), None);
+    }
+
+    #[test]
+    fn sparse_overlays_shadow_cpu_lookups_and_reverse_aliases_until_refilled() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x6d20_0000;
+        let cpu = 0x4d20_0000;
+        mappings.add(base, 0x3000, cpu, 11);
+
+        assert_eq!(
+            mappings.add_sparse(base + 0x1000, 0x1000),
+            GpuMappingChange::Replaced
+        );
+        assert_eq!(mappings.cpu_address_for(base + 0x800), Some(cpu + 0x800));
+        assert_eq!(mappings.cpu_address_for(base + 0x1800), None);
+        assert_eq!(mappings.mapping_at(base + 0x1800), None);
+        assert_eq!(mappings.cpu_range_for(base + 0x1800), None);
+        assert_eq!(mappings.nvmap_id_for(base + 0x1800), None);
+        assert_eq!(mappings.mapping_epoch_for(base + 0x1800), None);
+        assert_eq!(
+            mappings.gpu_regions_for_cpu_range(cpu, 0x3000),
+            vec![(base, 0x1000), (base + 0x2000, 0x1000)]
+        );
+
+        assert_eq!(
+            mappings.add(base + 0x1000, 0x1000, 0x5d20_0000, 12),
+            GpuMappingChange::Replaced
+        );
+        assert_eq!(mappings.cpu_address_for(base + 0x1800), Some(0x5d20_0800));
+    }
+
+    #[test]
+    fn replacement_mapping_clears_stale_pitch_identity() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x6e71_0000;
+        mappings.add(base, 0x1000, 0x3e71_0000, 1);
+        nexium_gpu::pitch_oracle::record_pitch_dst(base, 0x1000);
+        assert!(nexium_gpu::pitch_oracle::is_pitch_dst(base + 0x800));
+
+        assert_eq!(
+            mappings.add(base, 0x1000, 0x4e71_0000, 2),
+            GpuMappingChange::Replaced
+        );
+        assert!(!nexium_gpu::pitch_oracle::is_pitch_dst(base + 0x800));
+    }
+
+    #[test]
+    fn mapping_add_extension_removes_as_one_overlay_and_preserves_overlap_epoch() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x7f44_0000;
+        let cpu = 0x4f55_0000;
+        assert_eq!(
+            mappings.add(base + 0x1000, 0x1000, cpu + 0x1000, 31),
+            GpuMappingChange::Fresh
+        );
+        let middle_epoch = mappings.mapping_epoch_for(base + 0x1800).unwrap();
+
+        let extended = mappings.add(base, 0x3000, cpu, 31);
+        assert_eq!(extended, GpuMappingChange::Extended);
+        assert!(!extended.invalidates_render_targets());
+        assert_eq!(mappings.mapping_epoch_for(base + 0x800), Some(middle_epoch));
+        assert_eq!(
+            mappings.mapping_epoch_for(base + 0x1800),
+            Some(middle_epoch)
+        );
+        assert_eq!(
+            mappings.mapping_epoch_for(base + 0x2800),
+            Some(middle_epoch)
+        );
+        assert_eq!(mappings.cpu_address_for(base + 0x800), Some(cpu + 0x800));
+        assert_eq!(mappings.cpu_address_for(base + 0x2800), Some(cpu + 0x2800));
+        assert_eq!(mappings.iter().count(), 2);
+
+        let generation = mappings.generation();
+        assert_eq!(
+            mappings.add(base, 0x3000, cpu, 31),
+            GpuMappingChange::Idempotent
+        );
+        assert_eq!(mappings.generation(), generation);
+        assert_eq!(
+            mappings.mapping_epoch_for(base + 0x1800),
+            Some(middle_epoch)
+        );
+        assert_eq!(
+            mappings.mapping_epoch_for(base + 0x2800),
+            Some(middle_epoch)
+        );
+
+        let removed = mappings.remove_with_metadata(base).unwrap();
+        assert_eq!((removed.gpu_va, removed.size), (base, 0x3000));
+        assert_eq!(removed.cpu_addr, cpu);
+        assert_eq!(removed.epoch, middle_epoch);
+        assert_eq!(
+            removed.changed_gpu_ranges,
+            vec![(base, 0x1000), (base + 0x2000, 0x1000)]
+        );
+        assert_eq!(
+            removed.unmapped_gpu_ranges,
+            vec![(base, 0x1000), (base + 0x2000, 0x1000)]
+        );
+        assert_eq!(mappings.cpu_address_for(base + 0x800), None);
+        assert_eq!(mappings.cpu_address_for(base + 0x1800), Some(cpu + 0x1800));
+        assert_eq!(
+            mappings.mapping_epoch_for(base + 0x1800),
+            Some(middle_epoch)
+        );
+        assert_eq!(mappings.cpu_address_for(base + 0x2800), None);
+        assert_eq!(mappings.iter().count(), 1);
+    }
+
+    #[test]
+    fn mapping_add_matching_multi_epoch_range_falls_back_to_replacement() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x7f66_0000;
+        let cpu = 0x4f77_0000;
+        assert_eq!(mappings.add(base, 0x1000, cpu, 37), GpuMappingChange::Fresh);
+        let first_epoch = mappings.mapping_epoch_for(base + 0x800).unwrap();
+        assert_eq!(
+            mappings.add(base + 0x1000, 0x1000, cpu + 0x1000, 37),
+            GpuMappingChange::Fresh
+        );
+        let second_epoch = mappings.mapping_epoch_for(base + 0x1800).unwrap();
+        assert_ne!(first_epoch, second_epoch);
+
+        let update = mappings.add_with_metadata(base, 0x3000, cpu, 37);
+        assert_eq!(update.change, GpuMappingChange::Replaced);
+        assert_eq!(update.changed_gpu_ranges, vec![(base + 0x2000, 0x1000)]);
+        let replacement_epoch = mappings.mapping_epoch_for(base + 0x800).unwrap();
+        assert_ne!(replacement_epoch, first_epoch);
+        assert_ne!(replacement_epoch, second_epoch);
+        assert_eq!(
+            mappings.mapping_epoch_for(base + 0x1800),
+            Some(replacement_epoch)
+        );
+        assert_eq!(
+            mappings.mapping_epoch_for(base + 0x2800),
+            Some(replacement_epoch)
+        );
+        assert_eq!(
+            update.epoch_transitions,
+            vec![
+                super::GpuMappingEpochTransition {
+                    gpu_va: base,
+                    size: 0x1000,
+                    old_epoch: first_epoch,
+                    new_epoch: replacement_epoch,
+                },
+                super::GpuMappingEpochTransition {
+                    gpu_va: base + 0x1000,
+                    size: 0x1000,
+                    old_epoch: second_epoch,
+                    new_epoch: replacement_epoch,
+                },
+            ]
+        );
+
+        let removed = mappings.remove_with_metadata(base).unwrap();
+        assert_eq!(removed.changed_gpu_ranges, vec![(base + 0x2000, 0x1000)]);
+        assert_eq!(
+            removed.epoch_transitions,
+            vec![
+                super::GpuMappingEpochTransition {
+                    gpu_va: base,
+                    size: 0x1000,
+                    old_epoch: replacement_epoch,
+                    new_epoch: first_epoch,
+                },
+                super::GpuMappingEpochTransition {
+                    gpu_va: base + 0x1000,
+                    size: 0x1000,
+                    old_epoch: replacement_epoch,
+                    new_epoch: second_epoch,
+                },
+            ]
+        );
+        assert_eq!(removed.unmapped_gpu_ranges, vec![(base + 0x2000, 0x1000)]);
+        assert_eq!(mappings.mapping_epoch_for(base + 0x800), Some(first_epoch));
+        assert_eq!(
+            mappings.mapping_epoch_for(base + 0x1800),
+            Some(second_epoch)
+        );
+        assert_eq!(mappings.cpu_address_for(base + 0x2800), None);
+    }
+
+    #[test]
+    fn matching_multi_epoch_range_reports_only_epoch_transitions() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x7f77_0000;
+        let cpu = 0x4f88_0000;
+        mappings.add(base, 0x1000, cpu, 38);
+        mappings.add(base + 0x1000, 0x1000, cpu + 0x1000, 38);
+        let epochs = [
+            mappings.mapping_epoch_for(base + 0x800).unwrap(),
+            mappings.mapping_epoch_for(base + 0x1800).unwrap(),
+        ];
+        let update = mappings.add_with_metadata(base, 0x2000, cpu, 38);
+        let new_epoch = mappings.mapping_epoch_for(base + 0x800).unwrap();
+
+        assert_eq!(update.change, GpuMappingChange::Replaced);
+        assert!(update.changed_gpu_ranges.is_empty());
+        assert_eq!(
+            update.epoch_transitions,
+            vec![
+                super::GpuMappingEpochTransition {
+                    gpu_va: base,
+                    size: 0x1000,
+                    old_epoch: epochs[0],
+                    new_epoch,
+                },
+                super::GpuMappingEpochTransition {
+                    gpu_va: base + 0x1000,
+                    size: 0x1000,
+                    old_epoch: epochs[1],
+                    new_epoch,
+                },
+            ]
+        );
+        assert_eq!(mappings.mapping_epoch_for(base + 0x1800), Some(new_epoch));
+    }
+
+    #[test]
+    fn mapping_add_range_overflow_fails_closed() {
+        let mut mappings = GpuMappings::new();
+        let change = mappings.add(u64::MAX - 0x100, 0x200, 0x1000, 41);
+        assert_eq!(change, GpuMappingChange::Replaced);
+        assert!(change.invalidates_render_targets());
+        assert_eq!(mappings.iter().count(), 0);
+        assert_eq!(
+            mappings.add(0x1000, 0, 0x2000, 42),
+            GpuMappingChange::Replaced
+        );
+        assert_eq!(mappings.iter().count(), 0);
+    }
+
+    #[test]
+    fn tracked_idempotent_subrange_retains_an_unmap_root() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x7f88_0000;
+        let cpu = 0x4f99_0000;
+        mappings.add_tracked_with_metadata(base, 0x3000, cpu, 51);
+        let epoch = mappings.mapping_epoch_for(base + 0x1800).unwrap();
+
+        let update = mappings.add_tracked_with_metadata(base + 0x1000, 0x1000, cpu + 0x1000, 51);
+
+        assert_eq!(update.change, GpuMappingChange::Idempotent);
+        assert!(update.changed_gpu_ranges.is_empty());
+        assert!(update.epoch_transitions.is_empty());
+        assert_eq!(mappings.iter().count(), 2);
+        let removed = mappings.remove_with_metadata(base + 0x1000).unwrap();
+        assert_eq!((removed.gpu_va, removed.size), (base + 0x1000, 0x1000));
+        assert!(removed.changed_gpu_ranges.is_empty());
+        assert!(removed.epoch_transitions.is_empty());
+        assert_eq!(mappings.mapping_epoch_for(base + 0x1800), Some(epoch));
+    }
+
+    #[test]
+    fn unmap_does_not_select_sparse_or_owned_alias_records() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x7fa0_0000;
+        let alias = base + 0x2000;
+        mappings.add_sparse_with_metadata(base, 0x1000);
+        assert!(mappings.remove_with_metadata(base).is_none());
+
+        mappings.add_tracked_with_metadata(base + 0x1000, 0x1000, 0x5fa0_0000, 52);
+        let owner = mappings
+            .mapping_starting_at(base + 0x1000)
+            .unwrap()
+            .record_id;
+        mappings.add_owned(1, alias, 0x1000, 0x5fa0_0000, 52, owner);
+        assert!(mappings.remove_with_metadata(alias).is_none());
+        assert_eq!(mappings.cpu_address_for(alias + 0x100), Some(0x5fa0_0100));
+    }
+
+    #[test]
+    fn sparse_remap_holes_do_not_supersede_roots_but_unmap_barriers_do() {
+        let mut mappings = GpuMappings::new();
+        let fd = 1;
+        let base = 0x7fa8_0000;
+        mappings.add_sparse_as_gpu_with_metadata(fd, base, 0x1000);
+        mappings.add_as_gpu_mapping(fd, base, 0x1000, 0x5fa8_0000, 58, None, None, true);
+        assert!(mappings.remap_source_starting_at(fd, base).is_some());
+
+        mappings.add_sparse_as_gpu_with_metadata(fd, base, 0x1000);
+        assert!(mappings.unmap_as_gpu_with_metadata(fd, base).is_some());
+        assert!(mappings.remap_source_starting_at(fd, base).is_none());
+        assert!(mappings.unmap_as_gpu_with_metadata(fd, base).is_none());
+        assert_eq!(mappings.cpu_address_for(base + 0x800), None);
+    }
+
+    #[test]
+    fn allocation_scoped_teardown_masks_members_and_preserves_other_aliases() {
+        let mut mappings = GpuMappings::new();
+        let fd = 1;
+        let allocation = 0x7fac_0000;
+        mappings.add_as_gpu_mapping(fd, allocation, 0x2000, 0x5fac_0000, 59, None, None, false);
+        mappings.add_as_gpu_mapping(
+            fd,
+            allocation + 0x1000,
+            0x1000,
+            0x6fac_1000,
+            60,
+            None,
+            Some(allocation),
+            true,
+        );
+
+        let removed = mappings.remove_all_for_allocation_with_metadata(fd, allocation);
+
+        assert_eq!(
+            removed.update.changed_gpu_ranges,
+            vec![(allocation + 0x1000, 0x1000)]
+        );
+        assert_eq!(
+            mappings.cpu_address_for(allocation + 0x800),
+            Some(0x5fac_0800)
+        );
+        assert_eq!(mappings.cpu_address_for(allocation + 0x1800), None);
+    }
+
+    #[test]
+    fn contained_mapping_teardown_compares_only_initial_and_final_state() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x7fb0_0000;
+        mappings.add_sparse_as_gpu_with_metadata(1, base, 0x3000);
+        mappings.add_as_gpu_mapping(1, base + 0x1000, 0x1000, 0x5fb0_0000, 53, None, None, false);
+        mappings.add_as_gpu_mapping(1, base + 0x1000, 0x1000, 0x6fb0_0000, 54, None, None, false);
+
+        let removed = mappings
+            .remove_all_contained_with_metadata(1, base, 0x3000)
+            .unwrap();
+
+        assert_eq!(removed.update.changed_gpu_ranges, vec![(base, 0x3000)]);
+        assert!(removed.update.epoch_transitions.is_empty());
+        assert!(removed.owned_va_ranges.is_empty());
+        assert_eq!(mappings.iter().count(), 0);
+    }
+
+    #[test]
+    fn contained_mapping_teardown_splits_crossing_aliases() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x7fc0_0000;
+        mappings.add_as_gpu_mapping(1, base - 0x1000, 0x3000, 0x5fc0_0000, 55, None, None, false);
+
+        let removed = mappings
+            .remove_all_contained_with_metadata(1, base, 0x1000)
+            .unwrap();
+
+        assert_eq!(removed.update.changed_gpu_ranges, vec![(base, 0x1000)]);
+        assert_eq!(mappings.cpu_address_for(base - 0x800), Some(0x5fc0_0800));
+        assert_eq!(mappings.cpu_address_for(base + 0x800), None);
+        assert_eq!(mappings.cpu_address_for(base + 0x1800), Some(0x5fc0_2800));
+        assert_eq!(mappings.iter().count(), 2);
+    }
+
+    #[test]
+    fn any32_lookup_splits_mappings_that_wrap_the_low_address_domain() {
+        let mut mappings = GpuMappings::new();
+        let base = 0xffff_f000;
+        let cpu = 0x6fd0_0000;
+        mappings.add(base, 0x3000, cpu, 56);
+
+        assert_eq!(
+            mappings.cpu_address_for_any32(0xffff_f800),
+            Some((base, cpu + 0x800, 0x800))
+        );
+        assert_eq!(
+            mappings.cpu_address_for_any32(0x800),
+            Some((base, cpu + 0x1800, 0x1800))
+        );
+
+        mappings.add(0x1000, 0x800, 0x7fd0_0000, 57);
+        assert_eq!(
+            mappings.cpu_address_for_any32(0x800),
+            Some((base, cpu + 0x1800, 0x800))
+        );
+    }
+
+    #[test]
+    fn fixed_va_reservations_reject_cross_domain_and_overflow_ranges() {
+        let gpu = GpuContext::new();
+
+        assert!(!gpu.alloc_va_fixed(0x0400_0800, 0));
+        assert!(!gpu.free_va(0x0400_0800, 0));
+        assert!(!gpu.alloc_va_fixed(super::BIG_VA_BASE - 0x1000, 0x2000));
+        assert!(!gpu.alloc_va_fixed(u64::MAX - 0x800, 0x1000));
+        assert!(!gpu.free_va(super::BIG_VA_BASE - 0x1000, 0x2000));
+        assert_eq!(gpu.alloc_va(0x1000, false), 0x0400_0000);
     }
 
     #[test]
@@ -1352,5 +3173,50 @@ mod tests {
         assert_ne!(mappings.generation, generation_before);
         assert_eq!(mappings.cpu_address_for(0x1500), Some(0x1_0500));
         assert_eq!(mappings.nvmap_id_for(0x1500), Some(1));
+    }
+
+    #[test]
+    fn mapping_mutations_bump_texture_generations_across_the_full_range() {
+        let mut mappings = GpuMappings::new();
+        let base = 0x6f21_8000;
+        let size = 0x20000;
+        let generations_before = [
+            nexium_gpu::tex_invalidate::region_gen(base),
+            nexium_gpu::tex_invalidate::region_gen(base + 0x10000),
+            nexium_gpu::tex_invalidate::region_gen(base + 0x20000),
+            nexium_gpu::tex_invalidate::region_gen(base + 0x30000),
+        ];
+
+        mappings.add(base, size, 0x4f00_0000, 7);
+
+        for (index, before) in generations_before[..3].iter().enumerate() {
+            assert_ne!(
+                nexium_gpu::tex_invalidate::region_gen(base + index as u64 * 0x10000),
+                *before
+            );
+        }
+        assert_eq!(
+            nexium_gpu::tex_invalidate::region_gen(base + 0x30000),
+            generations_before[3]
+        );
+
+        let generations_before_remove = [
+            nexium_gpu::tex_invalidate::region_gen(base),
+            nexium_gpu::tex_invalidate::region_gen(base + 0x10000),
+            nexium_gpu::tex_invalidate::region_gen(base + 0x20000),
+            nexium_gpu::tex_invalidate::region_gen(base + 0x30000),
+        ];
+        assert_eq!(mappings.remove(base), Some(size));
+
+        for (index, before) in generations_before_remove[..3].iter().enumerate() {
+            assert_ne!(
+                nexium_gpu::tex_invalidate::region_gen(base + index as u64 * 0x10000),
+                *before
+            );
+        }
+        assert_eq!(
+            nexium_gpu::tex_invalidate::region_gen(base + 0x30000),
+            generations_before_remove[3]
+        );
     }
 }

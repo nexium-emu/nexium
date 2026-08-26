@@ -1354,17 +1354,13 @@ fn prepare_and_execute(
                         descriptor.binding, view_tic.gpu_va
                     )
                 })?;
-                let mut key = RtKey::with_cpu(
-                    nvmap_id,
-                    view_tic.width,
-                    view_tic.height,
-                    view_tic.gpu_va,
-                    cpu_addr,
-                );
-                if resource.metadata.dimension == ImageDimension::D3 {
-                    key.depth = image_depth(&resource.tic);
-                    key.is_3d = true;
-                }
+                let key =
+                    texture_rt_key(mappings, nvmap_id, &view_tic, cpu_addr).ok_or_else(|| {
+                        format!(
+                            "filtered sampled image binding {} has unsupported layout identity",
+                            descriptor.binding
+                        )
+                    })?;
                 sampled_rts.push(ComputeSampledRt {
                     binding: descriptor.binding,
                     key,
@@ -1408,19 +1404,8 @@ fn prepare_and_execute(
                 let guest_bytes =
                     read_gpu_vec(mappings, mem_read, view_tic.gpu_va, size, "sampled image")?;
                 let key = mappings.nvmap_id_for(view_tic.gpu_va).and_then(|nvmap_id| {
-                    mapped_range(mappings, view_tic.gpu_va).map(|(cpu_addr, _)| {
-                        let mut key = RtKey::with_cpu(
-                            nvmap_id,
-                            view_tic.width,
-                            view_tic.height,
-                            view_tic.gpu_va,
-                            cpu_addr,
-                        );
-                        if resource.metadata.dimension == ImageDimension::D3 {
-                            key.depth = image_depth(&resource.tic);
-                            key.is_3d = true;
-                        }
-                        key
+                    mapped_range(mappings, view_tic.gpu_va).and_then(|(cpu_addr, _)| {
+                        texture_rt_key(mappings, nvmap_id, &view_tic, cpu_addr)
                     })
                 });
                 sampled_images.push(ComputeSampledImage {
@@ -1509,8 +1494,11 @@ fn prepare_and_execute(
                     if let Some(nvmap_id) = mappings.nvmap_id_for(gpu_va) {
                         let mut key_tic = resource.tic;
                         key_tic.gpu_va = gpu_va;
-                        let key = storage_rt_key(nvmap_id, &key_tic, cpu_addr);
-                        match renderer.readback_compute_storage_seed(key, format)? {
+                        let live_seed = storage_rt_key(mappings, nvmap_id, &key_tic, cpu_addr)
+                            .map(|key| renderer.readback_compute_storage_seed(key, format))
+                            .transpose()?
+                            .flatten();
+                        match live_seed {
                             Some(live_bytes) => live_bytes,
                             None => {
                                 let guest_bytes = read_gpu_vec(
@@ -2277,6 +2265,8 @@ fn null_tic(dimension: Option<ImageDimension>) -> TicEntry {
         base_layer: 0,
         normalized_coords: true,
         is_srgb: false,
+        is_sparse: false,
+        msaa_mode: 0,
         max_mip_level: 0,
         res_min_mip_level: 0,
         res_max_mip_level: 0,
@@ -2609,13 +2599,61 @@ fn storage_texel_format(
     })
 }
 
-fn storage_rt_key(nvmap_id: u32, tic: &TicEntry, cpu_addr: u64) -> RtKey {
-    let mut key = RtKey::with_cpu(nvmap_id, tic.width, tic.height, tic.gpu_va, cpu_addr);
-    if tic.texture_type == 2 {
-        key.depth = image_depth(tic);
-        key.is_3d = true;
+fn texture_rt_key(
+    mappings: &GpuMappings,
+    nvmap_id: u32,
+    tic: &TicEntry,
+    cpu_addr: u64,
+) -> Option<RtKey> {
+    let samples = tic.sample_grid()?;
+    let layers = if tic.texture_type == 2 {
+        image_depth(tic)
+    } else {
+        1
+    };
+    let mut key = RtKey::with_cpu(nvmap_id, tic.width, tic.height, tic.gpu_va, cpu_addr)
+        .with_mapping_epoch(mappings.mapping_epoch_for(tic.gpu_va)?)
+        .with_sample_grid(samples.width, samples.height)
+        .with_volume_depth(layers)
+        .with_guest_size_bytes(
+            texture_guest_size_bytes(tic, layers)
+                .and_then(|size| u64::try_from(size).ok())
+                .unwrap_or(0),
+        );
+    key = if tic.is_block_linear {
+        key.with_block_linear_layout(
+            tic.block_width_log2,
+            tic.block_height_log2,
+            tic.block_depth_log2,
+            tic.tile_width_spacing,
+        )
+    } else {
+        key.with_pitch_linear_layout(tic.pitch_bytes)
+    };
+    Some(key)
+}
+
+fn storage_rt_key(
+    mappings: &GpuMappings,
+    nvmap_id: u32,
+    tic: &TicEntry,
+    cpu_addr: u64,
+) -> Option<RtKey> {
+    if tic.is_sparse
+        || !tic.is_block_linear
+        || tic.pitch_bytes != 0
+        || tic.tile_width_spacing != 0
+        || tic.block_depth_log2 != 0
+        || tic.base_layer != 0
+        || tic.max_mip_level != 0
+        || tic.res_min_mip_level != 0
+        || tic.res_max_mip_level != 0
+        || tic.depth != 1
+        || !(matches!(tic.texture_type, 1 | 7) || (tic.texture_type == 0 && tic.height == 1))
+    {
+        return None;
     }
-    key
+    texture_rt_key(mappings, nvmap_id, tic, cpu_addr)
 }
 
 fn validate_storage_texel_buffer(tic: &TicEntry) -> Result<(), String> {
@@ -3354,11 +3392,11 @@ fn write_back_outputs(
     for write in prepared {
         if write.target.subresource.mip_level == 0 {
             if let Some(nvmap_id) = mappings.nvmap_id_for(write.target.gpu_va) {
-                renderer.invalidate_render_target_content(storage_rt_key(
-                    nvmap_id,
-                    &write.target.tic,
-                    write.target.cpu_addr,
-                ));
+                if let Some(key) =
+                    storage_rt_key(mappings, nvmap_id, &write.target.tic, write.target.cpu_addr)
+                {
+                    renderer.invalidate_render_target_content(key);
+                }
             }
         }
         invalidate_guest_write(
@@ -4275,6 +4313,8 @@ mod tests {
             base_layer: 0,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 3,
             res_min_mip_level: 0,
             res_max_mip_level: 3,
@@ -4326,6 +4366,8 @@ mod tests {
             base_layer: 1,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 6,
             res_min_mip_level: 0,
             res_max_mip_level: 6,
@@ -4457,6 +4499,8 @@ mod tests {
             base_layer: 0,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 0,
             res_min_mip_level: 0,
             res_max_mip_level: 0,
@@ -4495,6 +4539,8 @@ mod tests {
             base_layer: 0,
             normalized_coords: false,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 0,
             res_min_mip_level: 0,
             res_max_mip_level: 0,
@@ -4582,6 +4628,8 @@ mod tests {
             base_layer: 0,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 0,
             res_min_mip_level: 0,
             res_max_mip_level: 0,
@@ -4629,10 +4677,30 @@ mod tests {
             base_layer: 0,
             normalized_coords: true,
             is_srgb: false,
+            is_sparse: false,
+            msaa_mode: 0,
             max_mip_level: 0,
             res_min_mip_level: 0,
             res_max_mip_level: 0,
         }
+    }
+
+    #[test]
+    fn storage_rt_key_rejects_unsupported_3d_alias_footprint() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1234_0000, 0x20_000, 0x8000, 1);
+        let mut tic = pitch_r8_tic();
+        tic.is_block_linear = true;
+        tic.pitch_bytes = 0;
+        assert!(storage_rt_key(&mappings, 1, &tic, 0x8000).is_some());
+
+        tic.depth = 2;
+        assert!(storage_rt_key(&mappings, 1, &tic, 0x8000).is_none());
+        tic.depth = 1;
+
+        tic.texture_type = 2;
+        tic.depth = 4;
+        assert!(storage_rt_key(&mappings, 1, &tic, 0x8000).is_none());
     }
 
     #[test]

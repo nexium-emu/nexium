@@ -561,15 +561,62 @@ impl ComputeUpload {
 
         if self.is_linear {
             let pitch = reg(regs, M_PITCH_OUT).max(line_length as u32) as u64;
+            let mut writes = Vec::<(u64, usize)>::new();
+            let mut previous_cpu_end = None;
+            let mut unknown = false;
             for line in 0..line_count {
                 let src_off = line * line_length;
                 if src_off >= self.inline_buf.len() {
                     break;
                 }
                 let src_end = (src_off + line_length).min(self.inline_buf.len());
-                let line_gpu = dst_gpu + line as u64 * pitch;
-                if let Some(line_cpu) = mappings.cpu_address_for(line_gpu) {
-                    mem_write(line_cpu, &self.inline_buf[src_off..src_end]);
+                let Some(line_gpu) = (line as u64)
+                    .checked_mul(pitch)
+                    .and_then(|offset| dst_gpu.checked_add(offset))
+                else {
+                    unknown = true;
+                    break;
+                };
+                let len = src_end - src_off;
+                let mut line_offset = 0usize;
+                while line_offset < len {
+                    let Some(fragment_gpu) = (line_offset as u64).checked_add(line_gpu) else {
+                        unknown = true;
+                        break;
+                    };
+                    let Some((fragment_cpu, available)) = mappings.cpu_range_for(fragment_gpu)
+                    else {
+                        unknown = true;
+                        break;
+                    };
+                    let fragment_len = usize::try_from(available)
+                        .unwrap_or(usize::MAX)
+                        .min(len - line_offset);
+                    if fragment_len == 0 {
+                        unknown = true;
+                        break;
+                    }
+                    let fragment_end = line_offset + fragment_len;
+                    if mem_write(
+                        fragment_cpu,
+                        &self.inline_buf[src_off + line_offset..src_off + fragment_end],
+                    ) {
+                        let cpu_contiguous = previous_cpu_end == Some(fragment_cpu);
+                        let gpu_contiguous =
+                            writes.last().is_some_and(|&(previous_gpu, previous_len)| {
+                                previous_gpu.checked_add(previous_len as u64) == Some(fragment_gpu)
+                            });
+                        if cpu_contiguous && gpu_contiguous {
+                            writes.last_mut().unwrap().1 += fragment_len;
+                        } else {
+                            writes.push((fragment_gpu, fragment_len));
+                        }
+                        previous_cpu_end = fragment_cpu.checked_add(fragment_len as u64);
+                    } else {
+                        unknown = true;
+                        previous_cpu_end = None;
+                    }
+                    line_offset = fragment_end;
                 }
             }
             let span_bytes = pitch.saturating_mul(line_count as u64);
@@ -583,7 +630,13 @@ impl ComputeUpload {
                 self.inline_buf.len(),
             );
             crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KCU_FLUSH, kp);
-            return super::KeplerMemoryWriteOutcome::Exact(vec![(dst_gpu, span_bytes as usize)]);
+            return if unknown {
+                super::KeplerMemoryWriteOutcome::Unknown(writes)
+            } else if writes.is_empty() {
+                super::KeplerMemoryWriteOutcome::NoWrite
+            } else {
+                super::KeplerMemoryWriteOutcome::Exact(writes)
+            };
         }
 
         let Some((dst_cpu, dst_limit)) = mappings.cpu_range_for(dst_gpu) else {
@@ -592,7 +645,7 @@ impl ComputeUpload {
                 dst_gpu
             );
             crate::gpu::pusher::kickprof::add(crate::gpu::pusher::kickprof::KCU_FLUSH, kp);
-            return super::KeplerMemoryWriteOutcome::Unknown;
+            return super::KeplerMemoryWriteOutcome::Unknown(Vec::new());
         };
 
         let block_height_log2 = ((reg(regs, M_DST_BLOCK_SIZE) >> 4) & 0xF) as u32;
@@ -625,7 +678,7 @@ impl ComputeUpload {
         if written {
             super::KeplerMemoryWriteOutcome::Exact(vec![(dst_gpu, n)])
         } else {
-            super::KeplerMemoryWriteOutcome::Unknown
+            super::KeplerMemoryWriteOutcome::Unknown(Vec::new())
         }
     }
 }
@@ -796,6 +849,86 @@ mod tests {
         assert_eq!(
             dispatch(&mut compute, M_LOAD_INLINE_DATA, 0x5566_7788, true),
             KeplerMemoryWriteOutcome::Exact(vec![(0x4000, 8)])
+        );
+    }
+
+    #[test]
+    fn terminal_inline_upload_splits_discontiguous_cpu_mappings() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x4000, 4, 0x1000, 1);
+        mappings.add(0x4004, 4, 0x3000, 2);
+        let mut compute = KeplerCompute::new();
+        let writes = std::cell::RefCell::new(Vec::new());
+        let read = |_: u64, _: &mut [u8]| true;
+        let write = |cpu: u64, bytes: &[u8]| {
+            writes.borrow_mut().push((cpu, bytes.to_vec()));
+            true
+        };
+        let dispatch = |compute: &mut KeplerCompute, method: u32, arg: u32, is_last: bool| {
+            compute.dispatch_method(
+                method,
+                arg,
+                is_last,
+                None,
+                &mappings,
+                &read,
+                &write,
+                &|_, _| None,
+            )
+        };
+
+        dispatch(&mut compute, M_LINE_LENGTH_IN, 8, false);
+        dispatch(&mut compute, M_LINE_COUNT, 1, false);
+        dispatch(&mut compute, M_OFFSET_OUT_LOWER, 0x4000, false);
+        dispatch(&mut compute, M_PITCH_OUT, 8, false);
+        dispatch(&mut compute, M_EXEC_UPLOAD, 1, false);
+        assert_eq!(
+            dispatch(&mut compute, M_LOAD_INLINE_DATA, 0x1122_3344, false),
+            KeplerMemoryWriteOutcome::NoWrite
+        );
+        assert_eq!(
+            dispatch(&mut compute, M_LOAD_INLINE_DATA, 0x5566_7788, true),
+            KeplerMemoryWriteOutcome::Exact(vec![(0x4000, 4), (0x4004, 4)])
+        );
+        assert_eq!(
+            *writes.borrow(),
+            vec![
+                (0x1000, vec![0x44, 0x33, 0x22, 0x11]),
+                (0x3000, vec![0x88, 0x77, 0x66, 0x55])
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_inline_upload_preserves_successful_rows_on_partial_failure() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x4000, 0x1000, 0x1000, 1);
+        let mut compute = KeplerCompute::new();
+        let read = |_: u64, _: &mut [u8]| true;
+        let write = |cpu: u64, _: &[u8]| cpu != 0x1010;
+        let dispatch = |compute: &mut KeplerCompute, method: u32, arg: u32, is_last: bool| {
+            compute.dispatch_method(
+                method,
+                arg,
+                is_last,
+                None,
+                &mappings,
+                &read,
+                &write,
+                &|_, _| None,
+            )
+        };
+
+        dispatch(&mut compute, M_LINE_LENGTH_IN, 4, false);
+        dispatch(&mut compute, M_LINE_COUNT, 3, false);
+        dispatch(&mut compute, M_OFFSET_OUT_LOWER, 0x4000, false);
+        dispatch(&mut compute, M_PITCH_OUT, 0x10, false);
+        dispatch(&mut compute, M_EXEC_UPLOAD, 1, false);
+        dispatch(&mut compute, M_LOAD_INLINE_DATA, 0x1122_3344, false);
+        dispatch(&mut compute, M_LOAD_INLINE_DATA, 0x5566_7788, false);
+        assert_eq!(
+            dispatch(&mut compute, M_LOAD_INLINE_DATA, 0x99aa_bbcc, true),
+            KeplerMemoryWriteOutcome::Unknown(vec![(0x4000, 4), (0x4020, 4)])
         );
     }
 

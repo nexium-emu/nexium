@@ -47,14 +47,68 @@ fn compute_debug_enabled() -> bool {
 pub(crate) fn apply_kepler_memory_write(
     cache: &mut super::vk_dispatch::SsboSnapshotCache,
     mappings: &GpuMappings,
+    renderer: Option<&Arc<nexium_gpu::Renderer>>,
     outcome: KeplerMemoryWriteOutcome,
 ) {
+    invalidate_kepler_render_targets(renderer, mappings, &outcome);
     match outcome {
         KeplerMemoryWriteOutcome::NoWrite => {}
         KeplerMemoryWriteOutcome::Exact(spans) => {
             cache.invalidate_gpu_writes(mappings, &spans);
         }
-        KeplerMemoryWriteOutcome::Unknown => cache.clear(),
+        KeplerMemoryWriteOutcome::Unknown(_) => cache.clear(),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeplerRtInvalidation {
+    Exact(Vec<(u64, u64, u64)>),
+}
+
+fn kepler_rt_invalidation(
+    mappings: &GpuMappings,
+    outcome: &KeplerMemoryWriteOutcome,
+) -> Option<KeplerRtInvalidation> {
+    match outcome {
+        KeplerMemoryWriteOutcome::NoWrite => None,
+        KeplerMemoryWriteOutcome::Exact(spans) | KeplerMemoryWriteOutcome::Unknown(spans) => {
+            let mut exact = Vec::with_capacity(spans.len());
+            for &(gpu_va, size) in spans {
+                let Ok(size) = u64::try_from(size) else {
+                    return None;
+                };
+                if size == 0 {
+                    continue;
+                }
+                let cpu_addr = mappings.cpu_address_for(gpu_va).unwrap_or(0);
+                exact.push((cpu_addr, gpu_va, size));
+            }
+            (!exact.is_empty()).then_some(KeplerRtInvalidation::Exact(exact))
+        }
+    }
+}
+
+fn invalidate_kepler_render_targets(
+    renderer: Option<&Arc<nexium_gpu::Renderer>>,
+    mappings: &GpuMappings,
+    outcome: &KeplerMemoryWriteOutcome,
+) {
+    let Some(renderer) = renderer.cloned() else {
+        return;
+    };
+    let Some(invalidation) = kepler_rt_invalidation(mappings, outcome) else {
+        return;
+    };
+    let KeplerRtInvalidation::Exact(spans) = invalidation;
+    let job = move || {
+        for (cpu_addr, gpu_va, size) in spans {
+            renderer.invalidate_render_target_range(cpu_addr, size, &[(gpu_va, size)]);
+        }
+    };
+    if let Some(render_thread) = crate::render_thread::maybe_render_thread() {
+        render_thread.submit_named("kepler-guest-write-invalidate", Box::new(job));
+    } else {
+        job();
     }
 }
 
@@ -2464,6 +2518,74 @@ mod tests {
                 | (count << 10)
                 | if no_prefetch { 0x8000_0000 } else { 0 },
         }
+    }
+
+    #[test]
+    fn kepler_rt_invalidation_keeps_unmapped_spans_gpu_targeted() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x100, 0x8000, 1);
+        let outcome = KeplerMemoryWriteOutcome::Exact(vec![(0x1010, 0x10), (0x3000, 0x10)]);
+
+        assert_eq!(
+            kepler_rt_invalidation(&mappings, &outcome),
+            Some(KeplerRtInvalidation::Exact(vec![
+                (0x8010, 0x1010, 0x10),
+                (0, 0x3000, 0x10)
+            ]))
+        );
+    }
+
+    #[test]
+    fn kepler_rt_invalidation_uses_gpu_range_at_mapping_boundary() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x100, 0x8000, 1);
+        let outcome = KeplerMemoryWriteOutcome::Exact(vec![(0x10f0, 0x20)]);
+
+        assert_eq!(
+            kepler_rt_invalidation(&mappings, &outcome),
+            Some(KeplerRtInvalidation::Exact(vec![(0x80f0, 0x10f0, 0x20)]))
+        );
+    }
+
+    #[test]
+    fn kepler_rt_invalidation_ignores_empty_outcomes() {
+        let mappings = GpuMappings::new();
+
+        assert_eq!(
+            kepler_rt_invalidation(&mappings, &KeplerMemoryWriteOutcome::Unknown(Vec::new())),
+            None
+        );
+        assert_eq!(
+            kepler_rt_invalidation(&mappings, &KeplerMemoryWriteOutcome::Exact(Vec::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn kepler_rt_invalidation_preserves_known_spans_from_partial_writes() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x100, 0x8000, 1);
+        let outcome = KeplerMemoryWriteOutcome::Unknown(vec![(0x1010, 0x10), (0x3000, 0x10)]);
+
+        assert_eq!(
+            kepler_rt_invalidation(&mappings, &outcome),
+            Some(KeplerRtInvalidation::Exact(vec![
+                (0x8010, 0x1010, 0x10),
+                (0, 0x3000, 0x10)
+            ]))
+        );
+    }
+
+    #[test]
+    fn kepler_rt_invalidation_preserves_fully_resolved_spans() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x100, 0x8000, 1);
+        let outcome = KeplerMemoryWriteOutcome::Exact(vec![(0x1010, 0x20)]);
+
+        assert_eq!(
+            kepler_rt_invalidation(&mappings, &outcome),
+            Some(KeplerRtInvalidation::Exact(vec![(0x8010, 0x1010, 0x20)]))
+        );
     }
 
     #[test]
