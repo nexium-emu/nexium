@@ -1,5 +1,5 @@
 use parking_lot::{Condvar, Mutex};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -562,7 +562,7 @@ impl PipelineStats {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum NvDevice {
     Nvmap,
     NvhostCtrl,
@@ -629,13 +629,145 @@ pub struct IoctlOutcome {
     pub data: Vec<u8>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CtrlEventWait {
     pub syncpt_id: u32,
     pub threshold: u32,
 }
 
 pub const NVRESULT_NOT_IMPLEMENTED: u32 = 1;
+
+const AS_GPU_SMALL_PAGE_SIZE: u32 = 0x1000;
+const AS_GPU_DEFAULT_BIG_PAGE_SIZE: u32 = 0x10000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AsGpuAllocation {
+    base: u64,
+    size: u64,
+    page_size: u32,
+    sparse: bool,
+    big_pages: bool,
+}
+
+struct AsGpuState {
+    initialized: bool,
+    big_page_size: u32,
+    allocations: BTreeMap<u64, AsGpuAllocation>,
+}
+
+impl Default for AsGpuState {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            big_page_size: AS_GPU_DEFAULT_BIG_PAGE_SIZE,
+            allocations: BTreeMap::new(),
+        }
+    }
+}
+
+const CTRL_EVENT_WAIT_FAIL_LIMIT: u32 = 3;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CtrlEventWaitFailure {
+    failures: u32,
+    logged: bool,
+    drain_attempted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CtrlEventWaitFailureAction {
+    log: bool,
+    drain: bool,
+}
+
+fn ctrl_event_wait_failure_action(
+    state: &mut CtrlEventWaitFailure,
+    submitted: bool,
+    escape_enabled: bool,
+) -> CtrlEventWaitFailureAction {
+    state.failures = state.failures.saturating_add(1);
+    if state.failures <= CTRL_EVENT_WAIT_FAIL_LIMIT {
+        return CtrlEventWaitFailureAction::default();
+    }
+    let log = !state.logged;
+    state.logged = true;
+    let drain = submitted && escape_enabled && !state.drain_attempted;
+    if drain {
+        state.drain_attempted = true;
+    }
+    CtrlEventWaitFailureAction { log, drain }
+}
+
+fn syncpoint_escape_drain_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+fn syncpoint_escape_drain_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        syncpoint_escape_drain_value_enabled(std::env::var_os("NEXIUM_SYNCPT_ESCAPE").as_deref())
+    })
+}
+
+fn ioctl_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_IOCTL_PROFILE").is_some())
+}
+
+type IoctlProfileTable = HashMap<(NvDevice, u16), (u64, u64, HashMap<u32, u64>)>;
+
+fn ioctl_profile_state() -> &'static Mutex<(IoctlProfileTable, Option<std::time::Instant>)> {
+    static STATE: std::sync::OnceLock<Mutex<(IoctlProfileTable, Option<std::time::Instant>)>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(|| Mutex::new((HashMap::new(), None)))
+}
+
+fn ioctl_profile_record(device: NvDevice, cmd: u16, result: u32, elapsed_ns: u64) {
+    let now = std::time::Instant::now();
+    let mut guard = ioctl_profile_state().lock();
+    let (table, last_dump) = &mut *guard;
+    let entry = table
+        .entry((device, cmd))
+        .or_insert_with(|| (0, 0, HashMap::new()));
+    entry.0 = entry.0.saturating_add(1);
+    entry.1 = entry.1.saturating_add(elapsed_ns);
+    *entry.2.entry(result).or_insert(0) += 1;
+
+    let due = match last_dump {
+        Some(previous) => now.duration_since(*previous) >= std::time::Duration::from_secs(1),
+        None => true,
+    };
+    if !due {
+        return;
+    }
+    *last_dump = Some(now);
+    let mut rows: Vec<_> = table.drain().collect();
+    rows.sort_by_key(|(_, (count, _, _))| std::cmp::Reverse(*count));
+    log::warn!("[ioctl-profile] top nvdrv ioctls (last interval):");
+    for ((device, cmd), (count, ns, results)) in rows.into_iter().take(10) {
+        let mut codes: Vec<_> = results.into_iter().collect();
+        codes.sort_by_key(|(_, hits)| std::cmp::Reverse(*hits));
+        let codes: Vec<String> = codes
+            .into_iter()
+            .take(3)
+            .map(|(code, hits)| format!("r{}={}", code, hits))
+            .collect();
+        log::warn!(
+            "  {:?} cmd={:#06x} count={} total_ms={:.2} avg_us={:.2} [{}]",
+            device,
+            cmd,
+            count,
+            ns as f64 / 1.0e6,
+            ns as f64 / 1000.0 / count.max(1) as f64,
+            codes.join(" ")
+        );
+    }
+}
 
 pub type AsyncMemoryRead = Arc<dyn Fn(u64, &mut [u8]) -> bool + Send + Sync>;
 pub type AsyncMemoryWrite = Arc<dyn Fn(u64, &[u8]) -> bool + Send + Sync>;
@@ -672,7 +804,6 @@ pub enum AsyncPresentSubmit {
 struct AsyncGpuQueue {
     gpu: Arc<GpuContext>,
     tx: crossbeam::channel::Sender<AsyncGpuSubmission>,
-    completions: Arc<Mutex<Vec<AsyncGpuCompletion>>>,
     pending: Arc<std::sync::atomic::AtomicUsize>,
     capacity: usize,
     profile: Option<AsyncGpuQueueProfile>,
@@ -879,8 +1010,6 @@ impl AsyncGpuQueue {
             });
         }
         let (tx, rx) = crossbeam::channel::bounded(capacity);
-        let completions = Arc::new(Mutex::new(Vec::new()));
-        let completed = Arc::clone(&completions);
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pending_worker = Arc::clone(&pending);
         let worker_gpu = Arc::clone(&gpu);
@@ -913,10 +1042,14 @@ impl AsyncGpuQueue {
                 let pipeline = gpu::gpu_pipeline_enabled();
                 let make_on_complete =
                     |completion: AsyncGpuCompletion| -> Box<dyn FnOnce() + Send> {
-                        let completed = Arc::clone(&completed);
+                        let completion_gpu = Arc::clone(&worker_gpu);
                         let pending = Arc::clone(&pending_worker);
                         Box::new(move || {
-                            completed.lock().push(completion);
+                            completion_gpu.record_syncpoint_completion(
+                                completion.fd,
+                                completion.syncpt_id,
+                                completion.threshold,
+                            );
                             pending.fetch_sub(1, std::sync::atomic::Ordering::Release);
                         })
                     };
@@ -1025,7 +1158,6 @@ impl AsyncGpuQueue {
         Self {
             gpu,
             tx,
-            completions,
             pending,
             capacity,
             profile,
@@ -1161,6 +1293,7 @@ pub struct Nvdrv {
     ordered_submit_max: HashMap<u32, u32>,
     pub next_ctrl_event_slot: u32,
     pub ctrl_event_waits: HashMap<(u32, u32), CtrlEventWait>,
+    ctrl_event_wait_failures: Arc<Mutex<HashMap<(u32, u32), CtrlEventWaitFailure>>>,
     pub gpu: Arc<GpuContext>,
     pub last_swap_return: Arc<Mutex<Option<std::time::Instant>>>,
     pub queue_buffer_active: Arc<std::sync::atomic::AtomicBool>,
@@ -1192,6 +1325,7 @@ impl Nvdrv {
             ordered_submit_max: HashMap::new(),
             next_ctrl_event_slot: 0,
             ctrl_event_waits: HashMap::new(),
+            ctrl_event_wait_failures: Arc::new(Mutex::new(HashMap::new())),
             gpu: Arc::new(GpuContext::with_stats(stats.clone())),
             last_swap_return: Arc::new(Mutex::new(None)),
             queue_buffer_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1285,6 +1419,7 @@ impl Nvdrv {
         let render_started = std::time::Instant::now();
         let _ = gpu::vk_dispatch::sync_render_thread();
         let render_ns = render_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.poll_gpu_completions();
         if let Some((queue, ..)) = queue_profile {
             let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             while queue.pending.load(Ordering::Acquire) != 0
@@ -1345,51 +1480,110 @@ impl Nvdrv {
     }
 
     fn poll_gpu_completions(&self) {
-        let pending_engine_incrs =
-            std::mem::take(&mut *crate::gpu::PENDING_ENGINE_SYNCPT_INCRS.lock());
-        if !pending_engine_incrs.is_empty() {
-            let mut channels = self.gpu.channels.lock();
-            for id in pending_engine_incrs {
-                if let Some(channel) = channels.values_mut().find(|c| c.syncpt_id == id) {
-                    channel.syncpt_min = channel.syncpt_min.wrapping_add(1);
-                    if !syncpoint_reached(channel.syncpt_max, channel.syncpt_min) {
-                        channel.syncpt_max = channel.syncpt_min;
-                    }
-                }
-            }
-        }
-        let Some(queue) = &self.gpu_async else {
-            return;
-        };
-        let mut completions = queue.completions.lock();
-        if completions.is_empty() {
-            return;
-        }
-        let mut orphaned: Vec<(u32, u32)> = Vec::new();
         {
-            let mut channels = self.gpu.channels.lock();
-            for completion in completions.drain(..) {
-                if let Some(channel) = channels.get_mut(&completion.fd) {
-                    if channel.syncpt_id == completion.syncpt_id {
-                        if !syncpoint_reached(channel.syncpt_min, completion.threshold) {
-                            channel.syncpt_min = completion.threshold;
+            let mut events = self.gpu.syncpoint_events();
+            if !events.is_empty() {
+                let mut channels = self.gpu.channels.lock();
+                let mut retired = self.retired_syncpts.lock();
+                while let Some(event) = events.pop_front() {
+                    match event {
+                        gpu::PendingSyncpointEvent::Increment { syncpt_id, count } => {
+                            if let Some(channel) = channels
+                                .values_mut()
+                                .find(|channel| channel.syncpt_id == syncpt_id)
+                            {
+                                channel.syncpt_min = channel.syncpt_min.wrapping_add(count);
+                                if !syncpoint_reached(channel.syncpt_max, channel.syncpt_min) {
+                                    channel.syncpt_max = channel.syncpt_min;
+                                }
+                                continue;
+                            }
+                            let Some(entry) = retired.get_mut(&syncpt_id) else {
+                                log::warn!(
+                                    "[syncpt-orphan] rejected increment id={} count={} without retired state",
+                                    syncpt_id,
+                                    count
+                                );
+                                continue;
+                            };
+                            log::warn!(
+                                "[syncpt-orphan] applied increment id={} count={} to retired channel",
+                                syncpt_id,
+                                count
+                            );
+                            entry.0 = entry.0.wrapping_add(count);
+                            if !syncpoint_reached(entry.1, entry.0) {
+                                entry.1 = entry.0;
+                            }
+                        }
+                        gpu::PendingSyncpointEvent::Completion {
+                            fd,
+                            syncpt_id,
+                            threshold,
+                        } => {
+                            if syncpt_id == 0 {
+                                log::warn!(
+                                    "[gpu-sync] rejected completion fd={} for syncpt id=0 threshold={}",
+                                    fd,
+                                    threshold
+                                );
+                                continue;
+                            }
+                            if let Some(channel) = channels.get_mut(&fd) {
+                                if channel.syncpt_id != syncpt_id {
+                                    log::warn!(
+                                        "[gpu-sync] ignored mismatched channel completion fd={} expected_syncpt={} got_syncpt={}",
+                                        fd,
+                                        channel.syncpt_id,
+                                        syncpt_id
+                                    );
+                                    continue;
+                                }
+                                if !syncpoint_reached(channel.syncpt_min, threshold) {
+                                    channel.syncpt_min = threshold;
+                                }
+                                continue;
+                            }
+                            let Some(entry) = retired.get_mut(&syncpt_id) else {
+                                log::warn!(
+                                    "[gpu-sync] rejected completion fd={} syncpt={} threshold={} without retired state",
+                                    fd,
+                                    syncpt_id,
+                                    threshold
+                                );
+                                continue;
+                            };
+                            if !syncpoint_reached(entry.0, threshold) {
+                                entry.0 = threshold;
+                            }
+                            if !syncpoint_reached(entry.1, threshold) {
+                                entry.1 = threshold;
+                            }
                         }
                     }
-                } else {
-                    orphaned.push((completion.syncpt_id, completion.threshold));
                 }
             }
         }
-        if !orphaned.is_empty() {
-            let mut retired = self.retired_syncpts.lock();
-            for (id, threshold) in orphaned {
-                let entry = retired.entry(id).or_insert((0, threshold));
-                if !syncpoint_reached(entry.0, threshold) {
-                    entry.0 = threshold;
-                }
-                entry.1 = entry.1.max(threshold);
-            }
+
+        self.cleanup_reached_ctrl_event_wait_failures();
+    }
+
+    fn cleanup_reached_ctrl_event_wait_failures(&self) {
+        if self.ctrl_event_wait_failures.lock().is_empty() {
+            return;
         }
+        let channels = self.gpu.channels.lock();
+        let retired = self.retired_syncpts.lock();
+        self.ctrl_event_wait_failures
+            .lock()
+            .retain(|(id, threshold), _| {
+                let current = channels
+                    .values()
+                    .find(|channel| channel.syncpt_id == *id)
+                    .map(|channel| channel.syncpt_min)
+                    .or_else(|| retired.get(id).map(|(min, _)| *min));
+                !current.is_some_and(|current| syncpoint_reached(current, *threshold))
+            });
     }
 
     pub fn pace_swap(&self, swap_interval: i32) {
@@ -1439,14 +1633,47 @@ impl Nvdrv {
             self.video_decoder
                 .submit(video_decode_thread::DecodeWork::Release { fd });
         }
-        if let Some(channel) = self.gpu.channels.lock().remove(&fd) {
+        let removed_waits: Vec<_> = self
+            .ctrl_event_waits
+            .extract_if(|(wait_fd, _), _| *wait_fd == fd)
+            .map(|(_, wait)| wait)
+            .collect();
+        for wait in removed_waits {
+            self.clear_ctrl_event_wait_failure_if_unused(wait);
+        }
+
+        let mut channels = self.gpu.channels.lock();
+        if let Some(channel) = channels.remove(&fd) {
             if channel.syncpt_id != 0 {
                 self.retired_syncpts
                     .lock()
                     .insert(channel.syncpt_id, (channel.syncpt_min, channel.syncpt_max));
+                self.ctrl_event_wait_failures
+                    .lock()
+                    .retain(|(id, _), _| *id != channel.syncpt_id);
             }
         }
+        drop(channels);
         log::debug!("nvdrv:Close fd={}", fd);
+    }
+
+    fn clear_ctrl_event_wait_failure_if_unused(&self, wait: CtrlEventWait) {
+        if self
+            .ctrl_event_waits
+            .values()
+            .any(|candidate| *candidate == wait)
+        {
+            return;
+        }
+        self.ctrl_event_wait_failures
+            .lock()
+            .remove(&(wait.syncpt_id, wait.threshold));
+    }
+
+    fn remove_ctrl_event_wait_slot(&mut self, fd: u32, slot: u32) {
+        if let Some(wait) = self.ctrl_event_waits.remove(&(fd, slot & 0xFF)) {
+            self.clear_ctrl_event_wait_failure_if_unused(wait);
+        }
     }
 
     fn ensure_channel_syncpoint(&mut self, fd: u32) -> (u32, u32) {
@@ -1497,6 +1724,53 @@ impl Nvdrv {
             .map(|channel| channel.syncpt_min)
             .or_else(|| self.retired_syncpts.lock().get(&id).map(|(min, _)| *min))
             .unwrap_or(0)
+    }
+
+    fn ctrl_event_wait_escape(&mut self, syncpt_id: u32, threshold: u32) -> Option<u32> {
+        let key = (syncpt_id, threshold);
+        let min = self.syncpoint_value(syncpt_id);
+        if syncpoint_reached(min, threshold) {
+            self.ctrl_event_wait_failures.lock().remove(&key);
+            return Some(min);
+        }
+        let max = self.syncpoint_max(syncpt_id);
+        let submitted = syncpoint_reached(max, threshold);
+        let action = {
+            let mut failures = self.ctrl_event_wait_failures.lock();
+            ctrl_event_wait_failure_action(
+                failures.entry(key).or_default(),
+                submitted,
+                syncpoint_escape_drain_enabled(),
+            )
+        };
+        if action.log {
+            log::warn!(
+                "[syncpt-stall] id={} threshold={} min={} max={} missing_increments={} submitted={}",
+                syncpt_id,
+                threshold,
+                min,
+                max,
+                max.wrapping_sub(min),
+                submitted
+            );
+        }
+        if !action.drain {
+            return None;
+        }
+        self.wait_gpu_idle();
+        let settled = self.syncpoint_value(syncpt_id);
+        if syncpoint_reached(settled, threshold) {
+            self.ctrl_event_wait_failures.lock().remove(&key);
+            log::warn!(
+                "[syncpt-stall] id={} threshold={} released at {} after gpu drain",
+                syncpt_id,
+                threshold,
+                settled
+            );
+            Some(settled)
+        } else {
+            None
+        }
     }
 
     fn syncpoint_max(&self, id: u32) -> u32 {
@@ -1576,37 +1850,8 @@ impl Nvdrv {
         threshold: u32,
     ) -> Box<dyn FnOnce() + Send> {
         let gpu = Arc::clone(&self.gpu);
-        let retired_syncpts = Arc::clone(&self.retired_syncpts);
         Box::new(move || {
-            let mut channels = gpu.channels.lock();
-            if let Some(channel) = channels
-                .get_mut(&fd)
-                .filter(|channel| channel.syncpt_id == syncpt_id)
-            {
-                if !syncpoint_reached(channel.syncpt_min, threshold) {
-                    channel.syncpt_min = threshold;
-                }
-                drop(channels);
-                nexium_common::host_wake::signal();
-                return;
-            }
-            if let Some(channel) = channels.get(&fd) {
-                log::warn!(
-                    "[gpu-sync] ignored mismatched channel completion fd={} expected_syncpt={} got_syncpt={}",
-                    fd,
-                    channel.syncpt_id,
-                    syncpt_id
-                );
-            }
-            drop(channels);
-            let mut retired = retired_syncpts.lock();
-            let entry = retired.entry(syncpt_id).or_insert((0, threshold));
-            if !syncpoint_reached(entry.0, threshold) {
-                entry.0 = threshold;
-            }
-            entry.1 = entry.1.max(threshold);
-            drop(retired);
-            nexium_common::host_wake::signal();
+            gpu.record_syncpoint_completion(fd, syncpt_id, threshold);
         })
     }
 
@@ -4233,7 +4478,7 @@ impl Nvdrv {
                         req.in_data[2],
                         req.in_data[3],
                     ]);
-                    self.ctrl_event_waits.remove(&(req.fd, event_id & 0xFF));
+                    self.remove_ctrl_event_wait_slot(req.fd, event_id);
                     log::debug!("nvhost-ctrl:EventSignal event_id={}", event_id);
                 }
             }
@@ -4262,6 +4507,9 @@ impl Nvdrv {
                     }
                     if syncpoint_reached(current_val, threshold) {
                         Self::fence_wait_stat(false);
+                        self.ctrl_event_wait_failures
+                            .lock()
+                            .remove(&(syncpt_id, threshold));
                         out[12..16].copy_from_slice(&current_val.to_le_bytes());
                         log::debug!(
                             "nvhost-ctrl:EventWait syncpt={} threshold={:#x} current={} → Success (already reached)",
@@ -4269,18 +4517,25 @@ impl Nvdrv {
                             threshold,
                             current_val
                         );
+                    } else if let Some(settled) = self.ctrl_event_wait_escape(syncpt_id, threshold)
+                    {
+                        Self::fence_wait_stat(false);
+                        out[12..16].copy_from_slice(&settled.to_le_bytes());
                     } else {
                         Self::fence_wait_stat(true);
                         let slot = self.next_ctrl_event_slot & 63;
                         self.next_ctrl_event_slot = self.next_ctrl_event_slot.wrapping_add(1);
                         let event_val: u32 = slot | ((syncpt_id & 0xFFF) << 16) | (1 << 28);
-                        self.ctrl_event_waits.insert(
+                        let replaced = self.ctrl_event_waits.insert(
                             (req.fd, slot),
                             CtrlEventWait {
                                 syncpt_id,
                                 threshold,
                             },
                         );
+                        if let Some(replaced) = replaced {
+                            self.clear_ctrl_event_wait_failure_if_unused(replaced);
+                        }
                         out[12..16].copy_from_slice(&event_val.to_le_bytes());
                         log::debug!(
                             "nvhost-ctrl:EventWait syncpt={} threshold={:#x} current={} → Timeout (deferred, slot={}, event_val={:#x})",
@@ -4327,17 +4582,25 @@ impl Nvdrv {
                             current_val
                         );
                     }
-                    if syncpoint_reached(current_val, threshold) {
+                    let escaped = if syncpoint_reached(current_val, threshold) {
+                        Some(current_val)
+                    } else {
+                        self.ctrl_event_wait_escape(syncpt_id, threshold)
+                    };
+                    if let Some(settled) = escaped {
                         Self::fence_wait_stat(false);
-                        self.ctrl_event_waits.remove(&(req.fd, event_id & 0xFF));
+                        self.remove_ctrl_event_wait_slot(req.fd, event_id);
+                        self.ctrl_event_wait_failures
+                            .lock()
+                            .remove(&(syncpt_id, threshold));
                         if out.len() >= 16 {
-                            out[12..16].copy_from_slice(&current_val.to_le_bytes());
+                            out[12..16].copy_from_slice(&settled.to_le_bytes());
                         }
                         log::debug!(
                             "nvhost-ctrl:EventWaitAsync syncpt={} threshold={:#x} current={} event_id={} → Success",
                             syncpt_id,
                             threshold,
-                            current_val,
+                            settled,
                             event_id
                         );
                     } else {
@@ -4345,13 +4608,16 @@ impl Nvdrv {
                         if out.len() >= 16 {
                             out[12..16].copy_from_slice(&event_id.to_le_bytes());
                         }
-                        self.ctrl_event_waits.insert(
+                        let replaced = self.ctrl_event_waits.insert(
                             (req.fd, event_id & 0xFF),
                             CtrlEventWait {
                                 syncpt_id,
                                 threshold,
                             },
                         );
+                        if let Some(replaced) = replaced {
+                            self.clear_ctrl_event_wait_failure_if_unused(replaced);
+                        }
                         log::debug!(
                             "nvhost-ctrl:EventWaitAsync syncpt={} threshold={:#x} current={} event_id={} → Timeout",
                             syncpt_id,
@@ -4385,9 +4651,7 @@ impl Nvdrv {
                         req.in_data[2],
                         req.in_data[3],
                     ]);
-                    let slot = event_id & 0xFF;
-                    self.ctrl_event_waits
-                        .retain(|(fd, id), _| *fd != req.fd || *id != slot);
+                    self.remove_ctrl_event_wait_slot(req.fd, event_id);
                     log::debug!("nvhost-ctrl:EventUnregister event_id={}", event_id);
                 }
             }
@@ -4810,18 +5074,246 @@ mod tests {
     }
 
     #[test]
+    fn syncpoint_escape_requires_an_explicit_true_value() {
+        use std::ffi::OsStr;
+
+        assert!(!syncpoint_escape_drain_value_enabled(None));
+        for disabled in ["", "0", "false", "OFF", " no ", "unexpected"] {
+            assert!(!syncpoint_escape_drain_value_enabled(Some(OsStr::new(
+                disabled
+            ))));
+        }
+        for enabled in ["1", "true", "TRUE", "on", " yes "] {
+            assert!(syncpoint_escape_drain_value_enabled(Some(OsStr::new(
+                enabled
+            ))));
+        }
+    }
+
+    #[test]
+    fn wait_stall_observation_logs_once_and_drains_once_when_later_submitted() {
+        let mut state = CtrlEventWaitFailure::default();
+        for _ in 0..CTRL_EVENT_WAIT_FAIL_LIMIT {
+            assert_eq!(
+                ctrl_event_wait_failure_action(&mut state, false, true),
+                CtrlEventWaitFailureAction::default()
+            );
+        }
+        assert_eq!(
+            ctrl_event_wait_failure_action(&mut state, false, true),
+            CtrlEventWaitFailureAction {
+                log: true,
+                drain: false
+            }
+        );
+        assert_eq!(
+            ctrl_event_wait_failure_action(&mut state, true, false),
+            CtrlEventWaitFailureAction::default()
+        );
+        assert_eq!(
+            ctrl_event_wait_failure_action(&mut state, true, true),
+            CtrlEventWaitFailureAction {
+                log: false,
+                drain: true
+            }
+        );
+        assert_eq!(
+            ctrl_event_wait_failure_action(&mut state, true, true),
+            CtrlEventWaitFailureAction::default()
+        );
+    }
+
+    #[test]
+    fn orphan_increment_before_and_after_close_are_equivalent() {
+        fn configured_channel() -> (Nvdrv, u32, u32) {
+            let mut nvdrv = Nvdrv::new();
+            let fd = nvdrv.open("/dev/nvhost-gpu").unwrap();
+            let syncpt = nvdrv.ensure_channel_syncpoint(fd).0;
+            let mut channels = nvdrv.gpu.channels.lock();
+            let channel = channels.get_mut(&fd).unwrap();
+            channel.syncpt_min = 27_062;
+            channel.syncpt_max = 27_066;
+            drop(channels);
+            (nvdrv, fd, syncpt)
+        }
+
+        let (mut before, before_fd, before_id) = configured_channel();
+        before
+            .gpu
+            .record_embedded_syncpt_incrs(vec![(before_id, 4)]);
+        before.poll_gpu_completions();
+        before.close(before_fd);
+
+        let (mut after, after_fd, after_id) = configured_channel();
+        after.close(after_fd);
+        after.gpu.record_embedded_syncpt_incrs(vec![(after_id, 4)]);
+        after.poll_gpu_completions();
+
+        assert_eq!(
+            before.retired_syncpts.lock().get(&before_id),
+            Some(&(27_066, 27_066))
+        );
+        assert_eq!(
+            after.retired_syncpts.lock().get(&after_id),
+            Some(&(27_066, 27_066))
+        );
+    }
+
+    #[test]
+    fn orphan_increments_handle_partial_multi_id_wrap_and_reject_unknown_ids() {
+        let nvdrv = Nvdrv::new();
+        nvdrv.retired_syncpts.lock().extend([
+            (7, (100, 108)),
+            (8, (u32::MAX - 1, 2)),
+            (9, (u32::MAX - 1, 0)),
+        ]);
+        nvdrv
+            .gpu
+            .record_embedded_syncpt_incrs(vec![(7, 3), (8, 3), (9, 4), (0, 1), (99, 1)]);
+        nvdrv.poll_gpu_completions();
+
+        let retired = nvdrv.retired_syncpts.lock();
+        assert_eq!(retired.get(&7), Some(&(103, 108)));
+        assert_eq!(retired.get(&8), Some(&(1, 2)));
+        assert_eq!(retired.get(&9), Some(&(2, 2)));
+        assert!(!retired.contains_key(&0));
+        assert!(!retired.contains_key(&99));
+    }
+
+    #[test]
+    fn syncpoint_events_preserve_increment_then_floor_order() {
+        let nvdrv = Nvdrv::new();
+        nvdrv.retired_syncpts.lock().insert(7, (10, 14));
+        nvdrv.gpu.record_embedded_syncpt_incrs(vec![(7, 2)]);
+        nvdrv.gpu.record_syncpoint_completion(99, 7, 14);
+
+        nvdrv.poll_gpu_completions();
+
+        assert_eq!(nvdrv.retired_syncpts.lock().get(&7), Some(&(14, 14)));
+    }
+
+    #[test]
+    fn syncpoint_events_preserve_floor_then_increment_order() {
+        let nvdrv = Nvdrv::new();
+        nvdrv.retired_syncpts.lock().insert(7, (10, 16));
+        nvdrv.gpu.record_syncpoint_completion(99, 7, 14);
+        nvdrv.gpu.record_embedded_syncpt_incrs(vec![(7, 2)]);
+
+        nvdrv.poll_gpu_completions();
+
+        assert_eq!(nvdrv.retired_syncpts.lock().get(&7), Some(&(16, 16)));
+    }
+
+    #[test]
+    fn poll_between_gated_completion_and_increment_transfer_preserves_order() {
+        let nvdrv = Nvdrv::new();
+        nvdrv.retired_syncpts.lock().insert(7, (10, 12));
+        let completion_gpu = Arc::clone(&nvdrv.gpu);
+        let (completion, gate) = gpu::gate_syncpoint_completion(Some(Box::new(move || {
+            completion_gpu.record_syncpoint_completion(99, 7, 12);
+        })));
+        let completion = completion.unwrap();
+        let gate = gate.unwrap();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let fired = Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let worker_start = Arc::clone(&start);
+            let worker_fired = Arc::clone(&fired);
+            scope.spawn(move || {
+                worker_start.wait();
+                completion();
+                worker_fired.wait();
+            });
+            start.wait();
+            fired.wait();
+
+            nvdrv.poll_gpu_completions();
+            assert_eq!(nvdrv.retired_syncpts.lock().get(&7), Some(&(10, 12)));
+
+            nvdrv.gpu.record_embedded_syncpt_incrs(vec![(7, 2)]);
+            gate.release();
+        });
+
+        nvdrv.poll_gpu_completions();
+        assert_eq!(nvdrv.retired_syncpts.lock().get(&7), Some(&(12, 12)));
+    }
+
+    #[test]
+    fn orphan_increments_do_not_cross_nvdrv_instances() {
+        let first = Nvdrv::new();
+        let second = Nvdrv::new();
+        first.retired_syncpts.lock().insert(1, (20, 24));
+        second.retired_syncpts.lock().insert(1, (40, 44));
+
+        first.gpu.record_embedded_syncpt_incrs(vec![(1, 2)]);
+        first.poll_gpu_completions();
+        second.poll_gpu_completions();
+
+        assert_eq!(first.retired_syncpts.lock().get(&1), Some(&(22, 24)));
+        assert_eq!(second.retired_syncpts.lock().get(&1), Some(&(40, 44)));
+    }
+
+    #[test]
+    fn event_wait_failure_state_cleans_up_on_completion_cancel_unregister_and_close() {
+        let mut nvdrv = Nvdrv::new();
+        let ctrl_fd = nvdrv.open("/dev/nvhost-ctrl").unwrap();
+        let gpu_fd = nvdrv.open("/dev/nvhost-gpu").unwrap();
+        let syncpt = nvdrv.ensure_channel_syncpoint(gpu_fd).0;
+        let wait = CtrlEventWait {
+            syncpt_id: syncpt,
+            threshold: 4,
+        };
+
+        nvdrv
+            .ctrl_event_wait_failures
+            .lock()
+            .insert((syncpt, 4), CtrlEventWaitFailure::default());
+        nvdrv.gpu.record_syncpoint_completion(gpu_fd, syncpt, 4);
+        nvdrv.poll_gpu_completions();
+        assert!(nvdrv.ctrl_event_wait_failures.lock().is_empty());
+
+        let request = |fd: u32, event_id: u32, cmd: u16| IoctlRequest {
+            fd,
+            ioctl_id: cmd as u32,
+            in_data: event_id.to_le_bytes().to_vec(),
+            inline_in_data: Vec::new(),
+            out_size: 0,
+        };
+        for cmd in [0x001c, 0x0020] {
+            nvdrv.ctrl_event_waits.insert((ctrl_fd, 3), wait);
+            nvdrv
+                .ctrl_event_wait_failures
+                .lock()
+                .insert((syncpt, 4), CtrlEventWaitFailure::default());
+            let _ = nvdrv.nvhost_ctrl_ioctl(cmd, &request(ctrl_fd, 3u32, cmd));
+            assert!(nvdrv.ctrl_event_waits.is_empty());
+            assert!(nvdrv.ctrl_event_wait_failures.lock().is_empty());
+        }
+
+        nvdrv.ctrl_event_waits.insert((ctrl_fd, 5), wait);
+        nvdrv
+            .ctrl_event_wait_failures
+            .lock()
+            .insert((syncpt, 4), CtrlEventWaitFailure::default());
+        nvdrv.close(ctrl_fd);
+        assert!(nvdrv.ctrl_event_waits.is_empty());
+        assert!(nvdrv.ctrl_event_wait_failures.lock().is_empty());
+    }
+
+    #[test]
     fn engine_increments_never_lower_the_reserved_max() {
         let mut nvdrv = Nvdrv::new();
         let gpu_fd = nvdrv.open("/dev/nvhost-gpu").unwrap();
         let (syncpt, threshold) = nvdrv.reserve_channel_submit(gpu_fd, 1 << 1, 0);
         assert_eq!(threshold, 2);
-        nvdrv.gpu.apply_embedded_syncpt_incrs(vec![(syncpt, 1)]);
+        nvdrv.gpu.record_embedded_syncpt_incrs(vec![(syncpt, 1)]);
         assert!(syncpoint_reached(nvdrv.syncpoint_max(syncpt), threshold));
         assert!(syncpoint_reached(
             nvdrv.syncpoint_max(syncpt),
             nvdrv.syncpoint_value(syncpt)
         ));
-        nvdrv.gpu.apply_embedded_syncpt_incrs(vec![(syncpt, 8)]);
+        nvdrv.gpu.record_embedded_syncpt_incrs(vec![(syncpt, 8)]);
         let min = nvdrv.syncpoint_value(syncpt);
         assert!(syncpoint_reached(min, threshold));
         assert!(syncpoint_reached(nvdrv.syncpoint_max(syncpt), min));

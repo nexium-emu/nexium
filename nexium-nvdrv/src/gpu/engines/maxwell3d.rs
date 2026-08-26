@@ -732,6 +732,8 @@ pub struct Maxwell3D {
 
     pub pending_draws: Vec<DrawCall>,
 
+    pending_syncpt_incrs: Vec<u32>,
+
     pending_inline_upload_methods: Vec<(u32, u32)>,
     inline_indices: Vec<u32>,
     inline_u8_setup: Option<(usize, usize)>,
@@ -861,6 +863,7 @@ impl Maxwell3D {
                 .map(|v| v != "0")
                 .unwrap_or(false),
             pending_draws: Vec::new(),
+            pending_syncpt_incrs: Vec::new(),
             pending_inline_upload_methods: Vec::new(),
             inline_indices: Vec::new(),
             inline_u8_setup: None,
@@ -886,6 +889,10 @@ impl Maxwell3D {
             return;
         }
         *self.method_freq.entry(method).or_insert(0) += 1;
+    }
+
+    pub(crate) fn take_pending_syncpt_incrs(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pending_syncpt_incrs)
     }
 
     pub(crate) fn is_pusher_passive_method(method: u32) -> bool {
@@ -1191,7 +1198,11 @@ impl Maxwell3D {
             }
             0xb2 => {
                 self.regs.sync_info = arg;
-                crate::gpu::record_engine_syncpt_increment(arg & 0xFFF);
+                let id = arg & 0xFFF;
+                if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
+                    log::info!("[syncpt] engine incr id={}", id);
+                }
+                self.pending_syncpt_incrs.push(id);
             }
             0x3dd => {
                 self.regs.pending_barrier_flushes =
@@ -2550,6 +2561,20 @@ mod tests {
         assert_eq!(engine.regs.pending_barrier_flushes, 3);
         assert_eq!(engine.regs.pending_texture_cache_invalidates, 1);
         assert!(engine.draw_state_dirty_since_last_draw);
+    }
+
+    #[test]
+    fn syncpoint_method_increments_are_owned_by_the_engine_instance() {
+        let mut first = Maxwell3D::new();
+        let mut second = Maxwell3D::new();
+
+        first.dispatch_method(0xb2, 0x11_0007, true);
+        first.dispatch_method(0xb2, 0x22_0007, true);
+        second.dispatch_method(0xb2, 0x33_0009, true);
+
+        assert_eq!(first.take_pending_syncpt_incrs(), vec![7, 7]);
+        assert!(first.take_pending_syncpt_incrs().is_empty());
+        assert_eq!(second.take_pending_syncpt_incrs(), vec![9]);
     }
 
     #[test]

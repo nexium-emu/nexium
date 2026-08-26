@@ -12,7 +12,7 @@ pub use engines::{
 pub use pusher::{CommandListHeader, Pusher};
 
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 pub type GuestMemoryWriter = Arc<dyn Fn(u64, &[u8]) -> bool + Send + Sync + 'static>;
@@ -391,15 +391,89 @@ impl GuestMemoryAccess {
     }
 }
 
-pub(crate) static PENDING_ENGINE_SYNCPT_INCRS: parking_lot::Mutex<Vec<u32>> =
-    parking_lot::Mutex::new(Vec::new());
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingSyncpointEvent {
+    Increment {
+        syncpt_id: u32,
+        count: u32,
+    },
+    Completion {
+        fd: u32,
+        syncpt_id: u32,
+        threshold: u32,
+    },
+}
 
-pub(crate) fn record_engine_syncpt_increment(id: u32) {
-    if std::env::var_os("NEXIUM_SYNCPT_DEBUG").is_some() {
-        log::info!("[syncpt] engine incr id={}", id);
+struct GatedSyncpointCompletionState {
+    callback: Option<Box<dyn FnOnce() + Send>>,
+    fired: bool,
+    released: bool,
+}
+
+pub(crate) struct GatedSyncpointCompletion {
+    state: Mutex<GatedSyncpointCompletionState>,
+}
+
+impl GatedSyncpointCompletion {
+    fn fire(&self) {
+        let callback = {
+            let mut state = self.state.lock();
+            if state.released {
+                state.callback.take()
+            } else {
+                state.fired = true;
+                None
+            }
+        };
+        if let Some(callback) = callback {
+            callback();
+        }
     }
-    PENDING_ENGINE_SYNCPT_INCRS.lock().push(id);
-    nexium_common::host_wake::signal();
+
+    pub(crate) fn release(&self) {
+        let callback = {
+            let mut state = self.state.lock();
+            state.released = true;
+            if state.fired {
+                state.callback.take()
+            } else {
+                None
+            }
+        };
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+}
+
+pub(crate) fn gate_syncpoint_completion(
+    callback: Option<Box<dyn FnOnce() + Send>>,
+) -> (
+    Option<Box<dyn FnOnce() + Send>>,
+    Option<Arc<GatedSyncpointCompletion>>,
+) {
+    let Some(callback) = callback else {
+        return (None, None);
+    };
+    let gate = Arc::new(GatedSyncpointCompletion {
+        state: Mutex::new(GatedSyncpointCompletionState {
+            callback: Some(callback),
+            fired: false,
+            released: false,
+        }),
+    });
+    let fired_gate = Arc::clone(&gate);
+    let wrapped = Box::new(move || fired_gate.fire()) as Box<dyn FnOnce() + Send>;
+    (Some(wrapped), Some(gate))
+}
+
+fn merge_engine_syncpt_incrs(incrs: &mut Vec<(u32, u32)>, engine_incrs: Vec<u32>) {
+    for id in engine_incrs {
+        match incrs.iter_mut().find(|(pending_id, _)| *pending_id == id) {
+            Some((_, count)) => *count = count.wrapping_add(1),
+            None => incrs.push((id, 1)),
+        }
+    }
 }
 
 pub struct GpuContext {
@@ -414,6 +488,7 @@ pub struct GpuContext {
     pub big_alloc: Arc<Mutex<flat_allocator::FlatAllocator>>,
     pub channels: Arc<Mutex<HashMap<u32, ChannelState>>>,
     pub stats: Arc<super::PipelineStats>,
+    pending_syncpoint_events: Mutex<VecDeque<PendingSyncpointEvent>>,
     guest_memory: GuestMemoryAccess,
     decoder_stub_engines: Mutex<StubEngines>,
 }
@@ -523,6 +598,7 @@ impl GpuContext {
             ))),
             channels: Arc::new(Mutex::new(HashMap::new())),
             stats,
+            pending_syncpoint_events: Mutex::new(VecDeque::new()),
             guest_memory,
             decoder_stub_engines: Mutex::new(StubEngines {
                 maxwell_dma: MaxwellDma::new(),
@@ -531,6 +607,23 @@ impl GpuContext {
                 kepler_memory: KeplerMemory::new(),
             }),
         }
+    }
+
+    pub(crate) fn record_syncpoint_completion(&self, fd: u32, syncpt_id: u32, threshold: u32) {
+        self.pending_syncpoint_events
+            .lock()
+            .push_back(PendingSyncpointEvent::Completion {
+                fd,
+                syncpt_id,
+                threshold,
+            });
+        nexium_common::host_wake::signal();
+    }
+
+    pub(crate) fn syncpoint_events(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, VecDeque<PendingSyncpointEvent>> {
+        self.pending_syncpoint_events.lock()
     }
 
     pub(crate) fn install_prep_thread(&self, resources: prep::PrepThreadResources) {
@@ -707,6 +800,7 @@ impl GpuContext {
         let kp_total = pusher::kickprof::kick_start();
         let kp_locks = pusher::kickprof::start();
         let mut pusher = self.pusher.lock();
+        let (on_complete, completion_gate) = gate_syncpoint_completion(on_complete);
         let threaded = pusher.prep.is_threaded();
         let mut maxwell = self.maxwell3d.lock();
         let mut stub = threaded.then(|| self.decoder_stub_engines.lock());
@@ -784,8 +878,12 @@ impl GpuContext {
                 on_complete,
             );
         }
-        let embedded_incrs = std::mem::take(&mut pusher.pending_syncpt_incrs);
-        self.apply_embedded_syncpt_incrs(embedded_incrs);
+        let mut embedded_incrs = std::mem::take(&mut pusher.pending_syncpt_incrs);
+        merge_engine_syncpt_incrs(&mut embedded_incrs, maxwell.take_pending_syncpt_incrs());
+        self.record_embedded_syncpt_incrs(embedded_incrs);
+        if let Some(gate) = completion_gate {
+            gate.release();
+        }
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         pusher::kickprof::kick_done(kp_total);
 
@@ -794,21 +892,29 @@ impl GpuContext {
         (syncpt_id, syncpt_value)
     }
 
-    pub(crate) fn apply_embedded_syncpt_incrs(&self, incrs: Vec<(u32, u32)>) {
+    pub(crate) fn record_embedded_syncpt_incrs(&self, incrs: Vec<(u32, u32)>) {
         if incrs.is_empty() {
             return;
         }
-        let mut channels = self.channels.lock();
+        let mut events = self.pending_syncpoint_events.lock();
+        let mut recorded = false;
         for (id, count) in incrs {
-            if let Some(channel) = channels.values_mut().find(|c| c.syncpt_id == id) {
-                channel.syncpt_min = channel.syncpt_min.wrapping_add(count);
-                if !crate::syncpoint_reached(channel.syncpt_max, channel.syncpt_min) {
-                    channel.syncpt_max = channel.syncpt_min;
+            if id == 0 || count == 0 {
+                if id == 0 && count != 0 {
+                    log::warn!("[syncpt-orphan] rejected increment id=0 count={}", count);
                 }
+                continue;
             }
+            events.push_back(PendingSyncpointEvent::Increment {
+                syncpt_id: id,
+                count,
+            });
+            recorded = true;
         }
-        drop(channels);
-        nexium_common::host_wake::signal();
+        drop(events);
+        if recorded {
+            nexium_common::host_wake::signal();
+        }
     }
 
     pub fn process_inline_gpfifo(
@@ -883,6 +989,7 @@ impl GpuContext {
         let kp_locks = pusher::kickprof::start();
         let t0 = std::time::Instant::now();
         let mut pusher = self.pusher.lock();
+        let (on_complete, completion_gate) = gate_syncpoint_completion(on_complete);
         let threaded = pusher.prep.is_threaded();
         let mut maxwell = self.maxwell3d.lock();
         let mut stub = threaded.then(|| self.decoder_stub_engines.lock());
@@ -1031,8 +1138,12 @@ impl GpuContext {
         );
         vk_dispatch::guest_probe(&mappings, &mem_read);
         let flush_ms = if profile { elapsed_ms(t_flush) } else { 0.0 };
-        let embedded_incrs = std::mem::take(&mut pusher.pending_syncpt_incrs);
-        self.apply_embedded_syncpt_incrs(embedded_incrs);
+        let mut embedded_incrs = std::mem::take(&mut pusher.pending_syncpt_incrs);
+        merge_engine_syncpt_incrs(&mut embedded_incrs, maxwell.take_pending_syncpt_incrs());
+        self.record_embedded_syncpt_incrs(embedded_incrs);
+        if let Some(gate) = completion_gate {
+            gate.release();
+        }
         pusher.syncpt_value = pusher.syncpt_value.wrapping_add(2);
         pusher::kickprof::kick_done(kp_total);
         if profile {
