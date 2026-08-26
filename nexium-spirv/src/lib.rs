@@ -41,6 +41,7 @@ pub enum Stage {
 const GRAPHICS_SPIRV_ENV_OPTIONS: &[&str] = &[
     "NEXIUM_DISABLE_NEW_FS_OPS",
     "NEXIUM_SPIRV_FTZ",
+    "NEXIUM_SPIRV_SIGNED_ZERO_PRESERVE",
     "NEXIUM_TEX_2X",
     "NEXIUM_TEX_LAYER_OVERRIDE",
     "NEXIUM_TEX_UV_OVERRIDE",
@@ -56,6 +57,7 @@ const FRAGMENT_DEBUG_SPIRV_ENV_OPTIONS: &[&str] = &[
     "NEXIUM_FS_SAMPLE_SLOT",
     "NEXIUM_FS_SAMPLE_COMPONENT",
     "NEXIUM_FS_TEXCOORD_SLOT",
+    "NEXIUM_FS_QUERY_LOD_SLOT",
     "NEXIUM_FS_FORCE_SAMPLE_LOD",
     "NEXIUM_FS_DEBUG_OUTPUT_LOC",
     "NEXIUM_TEX_V_FLIP_SLOTS",
@@ -283,13 +285,17 @@ pub struct ComputeModule {
 pub enum ComputeEmitError {
     #[error("compute local size components must all be non-zero (got {0:?})")]
     InvalidLocalSize([u32; 3]),
-    #[error("compute shared-memory size {0:#x} exceeds the supported {MAX_COMPUTE_SHARED_MEMORY_SIZE:#x} bytes")]
+    #[error(
+        "compute shared-memory size {0:#x} exceeds the supported {MAX_COMPUTE_SHARED_MEMORY_SIZE:#x} bytes"
+    )]
     InvalidSharedMemorySize(u32),
     #[error("compute shared-memory IR requires a non-zero shared-memory allocation")]
     MissingSharedMemory,
     #[error("compute local-memory IR requires a non-zero QMD local-memory allocation")]
     MissingLocalMemory,
-    #[error("compute local-memory size {0:#x} exceeds the supported {MAX_COMPUTE_LOCAL_MEMORY_SIZE:#x} bytes per thread")]
+    #[error(
+        "compute local-memory size {0:#x} exceeds the supported {MAX_COMPUTE_LOCAL_MEMORY_SIZE:#x} bytes per thread"
+    )]
     InvalidLocalMemorySize(u32),
     #[error("compute QMD local-memory allocation overflows: low={low:#x}, high={high:#x}")]
     InvalidLocalMemoryAllocation { low: u32, high: u32 },
@@ -303,7 +309,9 @@ pub enum ComputeEmitError {
         end: u32,
         available: u32,
     },
-    #[error("compute indexed cbuf {binding} size {size:#x} exceeds the supported {COMPUTE_CBUF_MAX_SIZE:#x} bytes")]
+    #[error(
+        "compute indexed cbuf {binding} size {size:#x} exceeds the supported {COMPUTE_CBUF_MAX_SIZE:#x} bytes"
+    )]
     IndexedCbufTooLarge { binding: u8, size: u32 },
     #[error("compute IR references cbuf slot {0} outside the eight-entry QMD table")]
     InvalidCbufBinding(u8),
@@ -612,6 +620,83 @@ fn fixed_varying_index(slot: u32) -> Option<usize> {
     }
 }
 
+fn value_is_raw_fragment_position_w(
+    value: &IrValue,
+    definitions: &HashMap<ValueId, &IrInst>,
+    visiting: &mut std::collections::HashSet<ValueId>,
+) -> bool {
+    let IrValue::Inst(id) = value else {
+        return false;
+    };
+    if !visiting.insert(*id) {
+        return false;
+    }
+    let result = definitions.get(id).is_some_and(|instruction| {
+        instruction.pred.is_none()
+            && match &instruction.op {
+                IrOp::LoadAttr { slot } => *slot == 0x7c,
+                IrOp::InterpAttr {
+                    slot, mode, sat, ..
+                } => *slot == 0x7c && *mode == 0 && !*sat,
+                IrOp::Mov(source) => {
+                    value_is_raw_fragment_position_w(source, definitions, visiting)
+                }
+                _ => false,
+            }
+    });
+    visiting.remove(id);
+    result
+}
+
+fn value_is_fragment_position_w_reciprocal(
+    value: &IrValue,
+    definitions: &HashMap<ValueId, &IrInst>,
+    visiting: &mut std::collections::HashSet<ValueId>,
+) -> bool {
+    let IrValue::Inst(id) = value else {
+        return false;
+    };
+    if !visiting.insert(*id) {
+        return false;
+    }
+    let result = definitions.get(id).is_some_and(|instruction| {
+        instruction.pred.is_none()
+            && match &instruction.op {
+                IrOp::MultiFunc { src, func, mods }
+                    if *func == MufuFunc::Rcp && *mods == Default::default() =>
+                {
+                    value_is_raw_fragment_position_w(src, definitions, visiting)
+                }
+                IrOp::Mov(source) => {
+                    value_is_fragment_position_w_reciprocal(source, definitions, visiting)
+                }
+                _ => false,
+            }
+    });
+    visiting.remove(id);
+    result
+}
+
+fn fragment_position_w_reciprocals(cfg: &Cfg) -> std::collections::HashSet<ValueId> {
+    let definitions = cfg
+        .blocks
+        .iter()
+        .flat_map(|block| &block.program.instructions)
+        .filter_map(|instruction| instruction.result.map(|result| (result, instruction)))
+        .collect::<HashMap<_, _>>();
+    definitions
+        .keys()
+        .copied()
+        .filter(|id| {
+            value_is_fragment_position_w_reciprocal(
+                &IrValue::Inst(*id),
+                &definitions,
+                &mut std::collections::HashSet::new(),
+            )
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GraphicsVaryingMap {
     fixed: [Option<u8>; 14],
@@ -770,6 +855,7 @@ pub struct Emitter {
     b: rspirv::dr::Builder,
     stage: Stage,
     force_fp32_ftz: bool,
+    force_signed_zero_preserve: bool,
     f32_t: Word,
     vec2_t: Word,
     vec3_t: Word,
@@ -895,6 +981,7 @@ pub struct Emitter {
     sample_debug_component: Option<u32>,
     sample_debug_value: Option<Word>,
     texcoord_debug_slot: Option<u32>,
+    query_lod_debug_slot: Option<u32>,
     force_sample_lod: Option<f32>,
     fragment_debug_output_location: Option<u32>,
     fragment_ir_oct_normal: Option<[ValueId; 3]>,
@@ -914,6 +1001,7 @@ pub struct Emitter {
     compute_options: Option<ComputeOptions>,
     compute_resource_vars: Vec<ComputeResourceVar>,
     ir_constant_facts: nexium_shader::IrConstantFacts,
+    fragment_position_w_reciprocals: std::collections::HashSet<ValueId>,
     texture_sample_sites: HashMap<u32, CachedTextureSample>,
     texture_gradients: HashMap<u32, (Word, Word)>,
 }
@@ -1143,6 +1231,11 @@ impl Emitter {
             b,
             stage,
             force_fp32_ftz: std::env::var("NEXIUM_SPIRV_FTZ").ok().as_deref() == Some("1"),
+            force_signed_zero_preserve: stage != Stage::Compute
+                && std::env::var("NEXIUM_SPIRV_SIGNED_ZERO_PRESERVE")
+                    .ok()
+                    .as_deref()
+                    == Some("1"),
             f32_t,
             vec2_t,
             vec3_t,
@@ -1282,6 +1375,9 @@ impl Emitter {
             texcoord_debug_slot: std::env::var("NEXIUM_FS_TEXCOORD_SLOT")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok()),
+            query_lod_debug_slot: std::env::var("NEXIUM_FS_QUERY_LOD_SLOT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok()),
             force_sample_lod: std::env::var("NEXIUM_FS_FORCE_SAMPLE_LOD")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
@@ -1316,6 +1412,7 @@ impl Emitter {
             compute_options: (stage == Stage::Compute).then(ComputeOptions::default),
             compute_resource_vars: Vec::new(),
             ir_constant_facts: nexium_shader::IrConstantFacts::default(),
+            fragment_position_w_reciprocals: std::collections::HashSet::new(),
             texture_sample_sites: HashMap::new(),
             texture_gradients: HashMap::new(),
         }
@@ -4046,6 +4143,10 @@ impl Emitter {
             .unwrap()
     }
 
+    fn decorate_guest_fp_result(&mut self, value: Word) {
+        self.b.decorate(value, Decoration::NoContraction, []);
+    }
+
     fn resolve_pred(&mut self, idx: u8, negate: bool) -> Word {
         let raw = if idx == 7 {
             self.bool_true
@@ -4579,6 +4680,69 @@ impl Emitter {
         }
     }
 
+    fn capture_fragment_lod_debug(
+        &mut self,
+        tex_slot: u32,
+        image: Word,
+        sampled_image: Word,
+        coords: Word,
+        implicit_lod: bool,
+    ) {
+        if !implicit_lod
+            || !matches!(self.stage, Stage::Fragment)
+            || !self.fragment_debug_active
+            || self.query_lod_debug_slot != Some(tex_slot)
+            || self.sample_debug_value.is_some()
+        {
+            return;
+        }
+
+        let lods = self
+            .b
+            .image_query_lod(self.vec2_t, None, sampled_image, coords)
+            .unwrap();
+        let lod = self
+            .b
+            .composite_extract(self.f32_t, None, lods, [0])
+            .unwrap();
+        let levels = self.b.image_query_levels(self.u32_t, None, image).unwrap();
+        let one = self.const_u32(1);
+        let multiple_levels = self
+            .b
+            .u_greater_than(self.bool_t, None, levels, one)
+            .unwrap();
+        let last_level = self.b.i_sub(self.u32_t, None, levels, one).unwrap();
+        let scale = self
+            .b
+            .select(self.u32_t, None, multiple_levels, last_level, one)
+            .unwrap();
+        let scale = self.b.convert_u_to_f(self.f32_t, None, scale).unwrap();
+        let normalized = self.b.f_div(self.f32_t, None, lod, scale).unwrap();
+        let normalized = self
+            .b
+            .ext_inst(
+                self.f32_t,
+                None,
+                self.glsl,
+                GlslStd450Op::FClamp as u32,
+                [
+                    Operand::IdRef(normalized),
+                    Operand::IdRef(self.f32_zero),
+                    Operand::IdRef(self.f32_one),
+                ],
+            )
+            .unwrap();
+        self.sample_debug_value = Some(
+            self.b
+                .composite_construct(
+                    self.vec4_t,
+                    None,
+                    [normalized, normalized, normalized, self.f32_one],
+                )
+                .unwrap(),
+        );
+    }
+
     fn extract_texture_sample_lane(&mut self, sample: CachedTextureSample, component: u8) -> Word {
         match sample {
             CachedTextureSample::Graphics {
@@ -4664,6 +4828,7 @@ impl Emitter {
                     av = self.b.f_mul(self.f32_t, None, av, fc).unwrap();
                 }
                 let r = self.b.f_mul(self.f32_t, None, av, bv).unwrap();
+                self.decorate_guest_fp_result(r);
                 Some(self.apply_sat(r, mods.sat))
             }
             IrOp::FAdd { a, b, mods } => {
@@ -4672,6 +4837,7 @@ impl Emitter {
                 let av = self.apply_neg_abs(av, mods.neg_a, mods.abs_a);
                 let bv = self.apply_neg_abs(bv, mods.neg_b, mods.abs_b);
                 let r = self.b.f_add(self.f32_t, None, av, bv).unwrap();
+                self.decorate_guest_fp_result(r);
                 Some(self.apply_sat(r, mods.sat))
             }
             IrOp::FFma { a, b, c, mods } => {
@@ -4693,6 +4859,7 @@ impl Emitter {
                         [Operand::IdRef(av), Operand::IdRef(bv), Operand::IdRef(cv)],
                     )
                     .unwrap();
+                self.decorate_guest_fp_result(r);
                 Some(self.apply_sat(r, mods.sat))
             }
             IrOp::DpdxFine { src } => {
@@ -4728,6 +4895,8 @@ impl Emitter {
                 let b1 = self.lower_half_abs_neg(b1, *abs_b, *neg_b);
                 let lhs = self.b.f_add(self.f32_t, None, a0, b0).unwrap();
                 let rhs = self.b.f_add(self.f32_t, None, a1, b1).unwrap();
+                self.decorate_guest_fp_result(lhs);
+                self.decorate_guest_fp_result(rhs);
                 let [lhs, rhs] = if Self::half_pair_promotes(*swizzle_a, *swizzle_b, None) {
                     self.round_half_pair(lhs, rhs)
                 } else {
@@ -4761,6 +4930,8 @@ impl Emitter {
                 let b1 = self.lower_half_abs_neg(b1, *abs_b, *neg_b);
                 let mut lhs = self.b.f_mul(self.f32_t, None, a0, b0).unwrap();
                 let mut rhs = self.b.f_mul(self.f32_t, None, a1, b1).unwrap();
+                self.decorate_guest_fp_result(lhs);
+                self.decorate_guest_fp_result(rhs);
                 if matches!(precision, HalfPrecision::FMZ) && !*sat {
                     let z = self.f32_zero;
                     let az0 = self.b.f_ord_equal(self.bool_t, None, a0, z).unwrap();
@@ -4824,6 +4995,8 @@ impl Emitter {
                         [Operand::IdRef(a1), Operand::IdRef(b1), Operand::IdRef(c1)],
                     )
                     .unwrap();
+                self.decorate_guest_fp_result(lhs);
+                self.decorate_guest_fp_result(rhs);
                 if matches!(precision, HalfPrecision::FMZ) && !*sat {
                     let z = self.f32_zero;
                     let az0 = self.b.f_ord_equal(self.bool_t, None, a0, z).unwrap();
@@ -5366,6 +5539,15 @@ impl Emitter {
             } => {
                 let component = (slot & 0xC) >> 2;
                 let aligned_slot = slot & !0xF;
+                let fold_perspective_round_trip = matches!(self.stage, Stage::Fragment)
+                    && *mode == 1
+                    && generic_varying_location(aligned_slot).is_some_and(|location| {
+                        self.ps_input_component_mode(location, component) == 2
+                    })
+                    && matches!(
+                        perspective,
+                        IrValue::Inst(id) if self.fragment_position_w_reciprocals.contains(id)
+                    );
                 let mut val = if self.stage == Stage::Fragment && *slot == 0x3fc {
                     self.load_front_facing_bits()
                 } else if aligned_slot == 0x70 {
@@ -5380,7 +5562,9 @@ impl Emitter {
                     let av = self.input_var(aligned_slot);
                     let mut val = self.read_attr_component(av, component);
                     if let Some(loc) = generic_varying_location(aligned_slot) {
-                        if self.ps_input_component_mode(loc, component) == 2 {
+                        if self.ps_input_component_mode(loc, component) == 2
+                            && !fold_perspective_round_trip
+                        {
                             let fc = self.frag_coord_var();
                             let idx = self.const_u32(3);
                             let ac = self
@@ -5393,7 +5577,10 @@ impl Emitter {
                     }
                     val
                 };
-                if *mode == 1 && fixed_varying_index(aligned_slot).is_none() {
+                if *mode == 1
+                    && fixed_varying_index(aligned_slot).is_none()
+                    && !fold_perspective_round_trip
+                {
                     let p = self.lower_value(perspective);
                     val = self.b.f_mul(self.f32_t, None, val, p).unwrap();
                 }
@@ -5994,6 +6181,16 @@ impl Emitter {
                     .b
                     .sampled_image(sampled_image_t, None, img, samp)
                     .unwrap();
+                self.capture_fragment_lod_debug(
+                    tex_slot,
+                    img,
+                    sampled_img,
+                    coords,
+                    *implicit_lod
+                        && !self.sampler_arrayed
+                        && lod_bias.is_none()
+                        && gradients.is_none(),
+                );
                 let sampled = if let Some(dref) = dref {
                     self.sample_image_dref(
                         sampled_img,
@@ -6813,12 +7010,7 @@ impl Emitter {
                     let participant_predicate = guard.unwrap_or(self.bool_true);
                     let participants = self
                         .b
-                        .group_non_uniform_ballot(
-                            self.uvec4_t,
-                            None,
-                            scope,
-                            participant_predicate,
-                        )
+                        .group_non_uniform_ballot(self.uvec4_t, None, scope, participant_predicate)
                         .unwrap();
                     let active = self.warp_extract(participants);
                     let zero = self.const_u32(0);
@@ -6849,39 +7041,40 @@ impl Emitter {
                     }
                 } else {
                     match mode {
-                    VoteMode::All => self
-                        .b
-                        .group_non_uniform_all(self.bool_t, None, scope, vote_predicate)
-                        .unwrap(),
-                    VoteMode::Any => self
-                        .b
-                        .group_non_uniform_any(self.bool_t, None, scope, vote_predicate)
-                        .unwrap(),
-                    VoteMode::Equal => {
-                        let participant_predicate = guard.unwrap_or(self.bool_true);
-                        let participants = self
+                        VoteMode::All => self
                             .b
-                            .group_non_uniform_ballot(
-                                self.uvec4_t,
-                                None,
-                                scope,
-                                participant_predicate,
-                            )
-                            .unwrap();
-                        let participants_x = self
+                            .group_non_uniform_all(self.bool_t, None, scope, vote_predicate)
+                            .unwrap(),
+                        VoteMode::Any => self
                             .b
-                            .composite_extract(self.u32_t, None, participants, [0])
-                            .unwrap();
-                        let zero = self.const_u32(0);
-                        let all_false = self.b.i_equal(self.bool_t, None, ballot_x, zero).unwrap();
-                        let all_true = self
-                            .b
-                            .i_equal(self.bool_t, None, ballot_x, participants_x)
-                            .unwrap();
-                        self.b
-                            .logical_or(self.bool_t, None, all_false, all_true)
-                            .unwrap()
-                    }
+                            .group_non_uniform_any(self.bool_t, None, scope, vote_predicate)
+                            .unwrap(),
+                        VoteMode::Equal => {
+                            let participant_predicate = guard.unwrap_or(self.bool_true);
+                            let participants = self
+                                .b
+                                .group_non_uniform_ballot(
+                                    self.uvec4_t,
+                                    None,
+                                    scope,
+                                    participant_predicate,
+                                )
+                                .unwrap();
+                            let participants_x = self
+                                .b
+                                .composite_extract(self.u32_t, None, participants, [0])
+                                .unwrap();
+                            let zero = self.const_u32(0);
+                            let all_false =
+                                self.b.i_equal(self.bool_t, None, ballot_x, zero).unwrap();
+                            let all_true = self
+                                .b
+                                .i_equal(self.bool_t, None, ballot_x, participants_x)
+                                .unwrap();
+                            self.b
+                                .logical_or(self.bool_t, None, all_false, all_true)
+                                .unwrap()
+                        }
                     }
                 };
                 let result = match guard {
@@ -8898,6 +9091,28 @@ impl Emitter {
                 self.texture_slots
                     .insert(tex_id, slot as u32 + tex_slot_base);
             }
+            if self.fragment_debug_active
+                && !self.sampler_arrayed
+                && self.query_lod_debug_slot.is_some_and(|debug_slot| {
+                    cfg.blocks.iter().any(|block| {
+                        block.program.instructions.iter().any(|instruction| {
+                            matches!(
+                                &instruction.op,
+                                IrOp::SampleTex {
+                                    tex_id,
+                                    volume: None,
+                                    cube: None,
+                                    implicit_lod: true,
+                                    lod_bias: None,
+                                    ..
+                                } if self.texture_slot(*tex_id) == debug_slot
+                            )
+                        })
+                    })
+                })
+            {
+                self.b.capability(Capability::ImageQuery);
+            }
 
             for tex_id in filtered_tex_ids {
                 let slot = self.texture_slot(tex_id);
@@ -9043,6 +9258,9 @@ impl Emitter {
         validate_spirv_ir(cfg, self.stage)
             .unwrap_or_else(|error| panic!("nexium-spirv: refusing unsupported IR: {error}"));
         self.ir_constant_facts = nexium_shader::IrConstantFacts::analyze(cfg);
+        if matches!(self.stage, Stage::Fragment) {
+            self.fragment_position_w_reciprocals = fragment_position_w_reciprocals(cfg);
+        }
         self.configure_depth_image_types(cfg);
         self.preallocate_resources(cfg);
         let sampler_arrayed = self.sampler_arrayed;
@@ -9354,10 +9572,7 @@ impl Emitter {
                 [32],
             );
         }
-        if self.stage == Stage::Fragment {
-            self.b
-                .execution_mode(main_id, rspirv::spirv::ExecutionMode::OriginUpperLeft, []);
-        } else if self.stage == Stage::Compute {
+        if self.stage == Stage::Compute || self.force_signed_zero_preserve {
             if !self.force_fp32_ftz {
                 self.b.extension("SPV_KHR_float_controls");
             }
@@ -9367,6 +9582,11 @@ impl Emitter {
                 rspirv::spirv::ExecutionMode::SignedZeroInfNanPreserve,
                 [32],
             );
+        }
+        if self.stage == Stage::Fragment {
+            self.b
+                .execution_mode(main_id, rspirv::spirv::ExecutionMode::OriginUpperLeft, []);
+        } else if self.stage == Stage::Compute {
             let local_size = self
                 .compute_options
                 .as_ref()
@@ -10980,6 +11200,7 @@ pub fn emit_fragment_full_with_options(
     if !debug_active {
         emitter.sample_debug_slot = None;
         emitter.texcoord_debug_slot = None;
+        emitter.query_lod_debug_slot = None;
         emitter.force_sample_lod = None;
         emitter.fragment_ir_oct_normal = None;
         emitter.tex_v_flip_slots.clear();
@@ -11083,16 +11304,17 @@ mod tests {
         );
         let sample = environment_fingerprint(true, &[("NEXIUM_FS_SAMPLE_SLOT", "1")]);
         let texcoord = environment_fingerprint(true, &[("NEXIUM_FS_TEXCOORD_SLOT", "1")]);
+        let query_lod = environment_fingerprint(true, &[("NEXIUM_FS_QUERY_LOD_SLOT", "1")]);
         let forced_lod = environment_fingerprint(true, &[("NEXIUM_FS_FORCE_SAMPLE_LOD", "6")]);
         let ir_values = environment_fingerprint(true, &[("NEXIUM_FS_IR_VALUES", "v5,v6")]);
         let oct_normal = environment_fingerprint(true, &[("NEXIUM_FS_IR_OCT_NORMAL", "v5,v6,v7")]);
 
         let variants = [
-            force_zero, force_one, sample, texcoord, forced_lod, ir_values, oct_normal,
+            force_zero, force_one, sample, texcoord, query_lod, forced_lod, ir_values, oct_normal,
         ]
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
-        assert_eq!(variants.len(), 7);
+        assert_eq!(variants.len(), 8);
         assert!(!variants.contains(&0));
     }
 
@@ -12379,16 +12601,17 @@ mod tests {
         }));
 
         let builtin_var = |builtin| {
-            module.annotations.iter().find_map(|inst| {
-                match inst.operands.as_slice() {
+            module
+                .annotations
+                .iter()
+                .find_map(|inst| match inst.operands.as_slice() {
                     [
                         Operand::IdRef(var),
                         Operand::Decoration(Decoration::BuiltIn),
                         Operand::BuiltIn(found),
                     ] if *found == builtin => Some(*var),
                     _ => None,
-                }
-            })
+                })
         };
         let instance_var = builtin_var(BuiltIn::InstanceIndex).expect("InstanceIndex input");
         let base_var = builtin_var(BuiltIn::BaseInstance).expect("BaseInstance input");
@@ -14437,8 +14660,7 @@ mod tests {
                 module.types_global_values.iter().find_map(|inst| {
                     (inst.class.opcode == rspirv::spirv::Op::Variable
                         && inst.result_id == Some(target)
-                        && inst.operands.first()
-                            == Some(&Operand::StorageClass(storage_class)))
+                        && inst.operands.first() == Some(&Operand::StorageClass(storage_class)))
                     .then_some(inst.result_type?)
                 })
             })
@@ -15946,6 +16168,67 @@ mod tests {
     }
 
     #[test]
+    fn captured_smo_perspective_ipa_fold_preserves_implicit_sample_derivatives() {
+        let bytes = build_test_program(&[
+            0x5c98_0780_0ff7_000a,
+            0xe003_ff87_cff7_ff05,
+            0x5c98_0780_0ff7_000d,
+            0x5080_0000_0047_0505,
+            0xe043_ff88_0057_ff01,
+            0xe043_ff88_4057_ff02,
+            0xd832_0080_0027_0102,
+            enc_exit(),
+        ]);
+        let cfg = nexium_shader::build_fragment_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+
+        let mut ps_input_map = [0; 32];
+        ps_input_map[0] = 0x0a;
+        let words = emit_fragment_full_with_input_map(&cfg, ps_input_map).0;
+        validates_with_naga(&words);
+        validates_with_spirv_val_if_available(&words);
+
+        let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+        let instructions = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        let definitions = instructions
+            .iter()
+            .filter_map(|instruction| instruction.result_id.map(|id| (id, *instruction)))
+            .collect::<HashMap<_, _>>();
+        let sample = instructions
+            .iter()
+            .copied()
+            .find(|instruction| {
+                instruction.class.opcode == rspirv::spirv::Op::ImageSampleImplicitLod
+            })
+            .expect("target TEXS implicit sample");
+        let Operand::IdRef(coords_id) = sample.operands[1] else {
+            panic!("sample coordinates must be an id")
+        };
+        let coords = definitions.get(&coords_id).expect("coordinate definition");
+        assert_eq!(coords.class.opcode, rspirv::spirv::Op::CompositeConstruct);
+        assert_eq!(coords.operands.len(), 2);
+        for operand in &coords.operands {
+            let Operand::IdRef(component_id) = operand else {
+                panic!("coordinate component must be an id")
+            };
+            assert_eq!(
+                definitions
+                    .get(component_id)
+                    .expect("coordinate component definition")
+                    .class
+                    .opcode,
+                rspirv::spirv::Op::Load,
+                "the implicit sample must derive directly from the smooth varying"
+            );
+        }
+    }
+
+    #[test]
     fn fragment_texs_2d_emits_implicit_lod() {
         let bytes = build_test_program(&[0xD822_00A0_5087_0500u64, enc_exit()]);
         let cfg = nexium_shader::build_cfg(&bytes);
@@ -16077,6 +16360,85 @@ mod tests {
             }
             assert_eq!(explicit, usize::from(expected_explicit));
             assert_eq!(implicit, usize::from(!expected_explicit));
+        }
+    }
+
+    #[test]
+    fn fragment_debug_query_lod_uses_matching_implicit_sample_and_normalizes_by_mip_range() {
+        let bytes = build_test_program(&[0xD822_00A0_5087_0500u64, enc_exit()]);
+        let cfg = nexium_shader::build_cfg(&bytes);
+        assert_eq!(cfg.unimplemented, 0);
+
+        for (debug_active, slot, expected_queries) in
+            [(true, 0, 1usize), (true, 1, 0), (false, 0, 0)]
+        {
+            let mut emitter = Emitter::new(Stage::Fragment);
+            emitter.fragment_debug_active = debug_active;
+            emitter.query_lod_debug_slot = Some(slot);
+            let words = emitter.finish(&cfg);
+            if expected_queries == 0 {
+                validates_with_naga(&words);
+            }
+            validates_with_spirv_val_if_available(&words);
+            let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+            let instructions = module
+                .functions
+                .iter()
+                .flat_map(|function| &function.blocks)
+                .flat_map(|block| &block.instructions)
+                .collect::<Vec<_>>();
+            let queries = instructions
+                .iter()
+                .copied()
+                .filter(|instruction| instruction.class.opcode == rspirv::spirv::Op::ImageQueryLod)
+                .collect::<Vec<_>>();
+            assert_eq!(queries.len(), expected_queries);
+            assert_eq!(
+                module.capabilities.iter().any(|instruction| {
+                    instruction.operands == [Operand::Capability(Capability::ImageQuery)]
+                }),
+                expected_queries != 0
+            );
+            let sample = instructions
+                .iter()
+                .copied()
+                .find(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::ImageSampleImplicitLod
+                })
+                .expect("implicit sample remains intact");
+
+            if let Some(query) = queries.first() {
+                assert_eq!(&query.operands[..2], &sample.operands[..2]);
+                let Operand::IdRef(sampled_image_id) = sample.operands[0] else {
+                    panic!("sampled image must be an id")
+                };
+                let sampled_image = instructions
+                    .iter()
+                    .find(|instruction| {
+                        instruction.result_id == Some(sampled_image_id)
+                            && instruction.class.opcode == rspirv::spirv::Op::SampledImage
+                    })
+                    .expect("OpSampledImage");
+                let query_levels = instructions
+                    .iter()
+                    .find(|instruction| {
+                        instruction.class.opcode == rspirv::spirv::Op::ImageQueryLevels
+                    })
+                    .expect("OpImageQueryLevels");
+                assert_eq!(query_levels.operands[0], sampled_image.operands[0]);
+                assert!(instructions
+                    .iter()
+                    .any(|instruction| { instruction.class.opcode == rspirv::spirv::Op::FDiv }));
+                assert!(instructions.iter().any(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::ExtInst
+                        && instruction.operands.get(1)
+                            == Some(&Operand::LiteralExtInstInteger(GlslStd450Op::FClamp as u32))
+                }));
+            } else {
+                assert!(!instructions.iter().any(|instruction| {
+                    instruction.class.opcode == rspirv::spirv::Op::ImageQueryLevels
+                }));
+            }
         }
     }
 
@@ -17049,7 +17411,9 @@ mod tests {
         assert!(instructions.iter().any(|instruction| {
             instruction.class.opcode == rspirv::spirv::Op::ExtInst
                 && instruction.operands.get(1)
-                    == Some(&Operand::LiteralExtInstInteger(GlslStd450Op::FindUMsb as u32))
+                    == Some(&Operand::LiteralExtInstInteger(
+                        GlslStd450Op::FindUMsb as u32,
+                    ))
         }));
         for opcode in [
             rspirv::spirv::Op::BitCount,
@@ -17473,6 +17837,225 @@ mod tests {
                 }),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn graphics_signed_zero_preserve_control_is_opt_in() {
+        let cfg = Cfg {
+            blocks: vec![empty_cfg_block(0, BranchKind::Exit)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+
+        for stage in [Stage::Vertex, Stage::Fragment] {
+            for (enabled, expected) in [(false, false), (true, true)] {
+                let mut emitter = Emitter::new(stage);
+                emitter.force_fp32_ftz = false;
+                emitter.force_signed_zero_preserve = enabled;
+                let words = emitter.finish(&cfg);
+                validates_with_spirv_val_if_available(&words);
+
+                let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+                assert_eq!(
+                    module.extensions.iter().any(|extension| {
+                        extension.operands
+                            == [Operand::LiteralString("SPV_KHR_float_controls".to_string())]
+                    }),
+                    expected
+                );
+                assert_eq!(
+                    module.capabilities.iter().any(|capability| {
+                        capability.operands
+                            == [Operand::Capability(Capability::SignedZeroInfNanPreserve)]
+                    }),
+                    expected
+                );
+                assert_eq!(
+                    module.execution_modes.iter().any(|mode| {
+                        matches!(
+                            mode.operands.as_slice(),
+                            [
+                                Operand::IdRef(_),
+                                Operand::ExecutionMode(
+                                    rspirv::spirv::ExecutionMode::SignedZeroInfNanPreserve
+                                ),
+                                Operand::LiteralBit32(32)
+                            ]
+                        )
+                    }),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guest_fp_results_disallow_contraction_in_every_stage() {
+        let mut program = nexium_shader::IrProgram::new();
+        let mul = program.emit(
+            IrOp::FMul {
+                a: IrValue::ImmF32(2.0),
+                b: IrValue::ImmF32(3.0),
+                mods: nexium_shader::ir::FMods {
+                    neg_a: true,
+                    sat: true,
+                    scale: 1,
+                    ..Default::default()
+                },
+            },
+            None,
+        );
+        let add = program.emit(
+            IrOp::FAdd {
+                a: IrValue::Inst(mul),
+                b: IrValue::ImmF32(4.0),
+                mods: nexium_shader::ir::FMods {
+                    sat: true,
+                    ..Default::default()
+                },
+            },
+            None,
+        );
+        let _fma = program.emit(
+            IrOp::FFma {
+                a: IrValue::Inst(add),
+                b: IrValue::ImmF32(5.0),
+                c: IrValue::ImmF32(6.0),
+                mods: nexium_shader::ir::FMods {
+                    sat: true,
+                    ..Default::default()
+                },
+            },
+            None,
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+
+        for stage in [Stage::Vertex, Stage::Fragment, Stage::Compute] {
+            let emitter = Emitter::new(stage);
+            let words = emitter.finish(&cfg);
+            validates_with_spirv_val_if_available(&words);
+
+            let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+            let decorated = module
+                .annotations
+                .iter()
+                .filter_map(|annotation| match annotation.operands.as_slice() {
+                    [Operand::IdRef(id), Operand::Decoration(Decoration::NoContraction)] => {
+                        Some(*id)
+                    }
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(decorated.len(), 3);
+
+            let definitions = module
+                .functions
+                .iter()
+                .flat_map(|function| &function.blocks)
+                .flat_map(|block| &block.instructions)
+                .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
+                .collect::<std::collections::HashMap<_, _>>();
+            for id in &decorated {
+                let instruction = definitions.get(id).expect("decorated FP definition");
+                assert!(
+                    matches!(
+                        instruction.class.opcode,
+                        rspirv::spirv::Op::FMul | rspirv::spirv::Op::FAdd
+                    ) || (instruction.class.opcode == rspirv::spirv::Op::ExtInst
+                        && instruction.operands.get(1)
+                            == Some(&Operand::LiteralExtInstInteger(GlslStd450Op::Fma as u32)))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guest_half_pair_results_disallow_contraction() {
+        let mut program = nexium_shader::IrProgram::new();
+        let a = IrValue::ImmU32(0x4000_3c00);
+        let b = IrValue::ImmU32(0x4400_4200);
+        let c = IrValue::ImmU32(0x3800_3400);
+        let _add = program.emit(
+            IrOp::HAdd {
+                a,
+                b,
+                old: IrValue::Zero,
+                merge: HalfMerge::H1H0,
+                swizzle_a: HalfSwizzle::H1H0,
+                swizzle_b: HalfSwizzle::H1H0,
+                abs_a: false,
+                neg_a: false,
+                abs_b: false,
+                neg_b: false,
+                sat: false,
+                ftz: false,
+            },
+            None,
+        );
+        let _mul = program.emit(
+            IrOp::HMul {
+                a,
+                b,
+                old: IrValue::Zero,
+                merge: HalfMerge::H1H0,
+                swizzle_a: HalfSwizzle::H1H0,
+                swizzle_b: HalfSwizzle::H1H0,
+                abs_a: false,
+                neg_a: false,
+                abs_b: false,
+                neg_b: false,
+                sat: false,
+                precision: HalfPrecision::None,
+            },
+            None,
+        );
+        let _fma = program.emit(
+            IrOp::HFma {
+                a,
+                b,
+                c,
+                old: IrValue::Zero,
+                merge: HalfMerge::H1H0,
+                swizzle_a: HalfSwizzle::H1H0,
+                swizzle_b: HalfSwizzle::H1H0,
+                swizzle_c: HalfSwizzle::H1H0,
+                neg_b: false,
+                neg_c: false,
+                sat: false,
+                precision: HalfPrecision::None,
+            },
+            None,
+        );
+        let cfg = Cfg {
+            blocks: vec![cfg_block(0, BranchKind::Exit, program)],
+            unimplemented: 0,
+            bindless_or_partners: Default::default(),
+        };
+
+        for stage in [Stage::Vertex, Stage::Fragment, Stage::Compute] {
+            let emitter = Emitter::new(stage);
+            let words = emitter.finish(&cfg);
+            validates_with_spirv_val_if_available(&words);
+            let module = rspirv::dr::load_words(&words).expect("valid SPIR-V");
+            let decorated = module
+                .annotations
+                .iter()
+                .filter(|annotation| {
+                    matches!(
+                        annotation.operands.as_slice(),
+                        [
+                            Operand::IdRef(_),
+                            Operand::Decoration(Decoration::NoContraction)
+                        ]
+                    )
+                })
+                .count();
+            assert_eq!(decorated, 6);
         }
     }
 
