@@ -855,19 +855,18 @@ impl PrepState {
                         }
                         if let Some(r) = self.renderer.clone() {
                             let stage_started = kickprof::start();
-                            if super::vk_dispatch::input_mirror_enabled() {
-                                let recorded: std::cell::RefCell<Vec<(u64, usize)>> =
-                                    std::cell::RefCell::new(Vec::new());
-                                let recording_write = |addr: u64, bytes: &[u8]| {
+                            let recorded: std::cell::RefCell<Vec<(u64, usize)>> =
+                                std::cell::RefCell::new(Vec::new());
+                            let recording_write = |addr: u64, bytes: &[u8]| {
+                                let written = mem_write(addr, bytes);
+                                if written && !bytes.is_empty() {
                                     recorded.borrow_mut().push((addr, bytes.len()));
-                                    mem_write(addr, bytes)
-                                };
-                                maxwell_dma.stage_rt_source(arg, mappings, &r, &recording_write);
-                                for (addr, len) in recorded.into_inner() {
-                                    self.ssbo_snapshot_cache.mirror_mark_cpu(addr, len);
                                 }
-                            } else {
-                                maxwell_dma.stage_rt_source(arg, mappings, &r, mem_write);
+                                written
+                            };
+                            maxwell_dma.stage_rt_source(arg, mappings, &r, &recording_write);
+                            for (addr, len) in recorded.into_inner() {
+                                self.ssbo_snapshot_cache.mirror_mark_cpu(addr, len);
                             }
                             kickprof::add(kickprof::DMA_STAGE, stage_started);
                         }
@@ -983,6 +982,7 @@ impl PrepState {
                     super::pusher::apply_kepler_memory_write(
                         &mut self.ssbo_snapshot_cache,
                         mappings,
+                        self.renderer.as_ref(),
                         outcome,
                     );
                     kickprof::add(kickprof::KEPLER, kp);
@@ -1020,6 +1020,7 @@ impl PrepState {
                     super::pusher::apply_kepler_memory_write(
                         &mut self.ssbo_snapshot_cache,
                         mappings,
+                        self.renderer.as_ref(),
                         outcome,
                     );
                     self.invalidate_resolved_compute_writebacks(mappings);
@@ -1126,6 +1127,7 @@ impl PrepState {
                 super::pusher::apply_kepler_memory_write(
                     &mut self.ssbo_snapshot_cache,
                     mappings,
+                    self.renderer.as_ref(),
                     outcome,
                 );
             }
@@ -1134,6 +1136,7 @@ impl PrepState {
 
     pub(crate) fn begin_ssbo_snapshot_entry(&mut self) {
         let watch_started = super::pusher::kickprof::start();
+        self.ssbo_snapshot_cache.mirror_bump_sweep();
         self.ssbo_snapshot_cache.refresh_ssbo_guest_writes();
         super::pusher::kickprof::add(super::pusher::kickprof::ENQ_WATCH, watch_started);
         let retain_started = super::pusher::kickprof::start();
@@ -1904,7 +1907,7 @@ pub(crate) fn spawn_prep_thread(
 mod tests {
     use super::{
         nonterminal_inline_data_run_end, recycle_processed_draw_vec,
-        texture_cache_invalidate_clear_value_enabled, try_receive_recycled_draw_vec,
+        texture_cache_invalidate_clear_value_enabled, try_receive_recycled_draw_vec, PrepState,
     };
     use crate::gpu::engines::maxwell3d::DrawCall;
 
@@ -1944,6 +1947,16 @@ mod tests {
                 OsStr::new(enabled)
             )));
         }
+    }
+
+    #[test]
+    fn entry_boundary_advances_resident_mirror_sweep() {
+        let mut state = PrepState::new();
+        let before = state.ssbo_snapshot_cache.mirror_sweep_generation();
+
+        state.begin_ssbo_snapshot_entry();
+
+        assert_ne!(state.ssbo_snapshot_cache.mirror_sweep_generation(), before);
     }
 
     #[test]

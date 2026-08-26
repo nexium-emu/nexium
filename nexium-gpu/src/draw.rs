@@ -424,31 +424,79 @@ pub struct ResidentVertexRange {
 }
 
 impl ResidentVertexRange {
+    pub fn has_exact_coverage(&self) -> bool {
+        let Ok(range_len) = u64::try_from(self.len) else {
+            return false;
+        };
+        if range_len == 0 {
+            return false;
+        }
+        let Some(range_end) = self.cpu_va.checked_add(range_len) else {
+            return false;
+        };
+        let first_key = self.cpu_va >> RESIDENT_CHUNK_SHIFT;
+        let last_key = (range_end - 1) >> RESIDENT_CHUNK_SHIFT;
+        let Some(expected_count) = last_key
+            .checked_sub(first_key)
+            .and_then(|span| span.checked_add(1))
+            .and_then(|count| usize::try_from(count).ok())
+        else {
+            return false;
+        };
+        expected_count == self.chunks.len()
+            && self.chunks.iter().enumerate().all(|(index, chunk)| {
+                chunk.data.len() == RESIDENT_CHUNK_SIZE
+                    && u64::try_from(index)
+                        .ok()
+                        .and_then(|index| first_key.checked_add(index))
+                        == Some(chunk.chunk_key)
+            })
+    }
+
     pub fn assemble(&self) -> Option<Vec<u8>> {
-        let first_base = self.chunks.first()?.chunk_key << RESIDENT_CHUNK_SHIFT;
+        if !self.has_exact_coverage() {
+            return None;
+        }
+        let range_end = self.cpu_va.checked_add(u64::try_from(self.len).ok()?)?;
         let mut out = vec![0u8; self.len];
-        for (index, chunk) in self.chunks.iter().enumerate() {
-            if chunk.data.len() != RESIDENT_CHUNK_SIZE
-                || chunk.chunk_key != self.chunks[0].chunk_key + index as u64
-            {
-                return None;
-            }
+        let mut copied = 0usize;
+        for chunk in &self.chunks {
             let chunk_base = chunk.chunk_key << RESIDENT_CHUNK_SHIFT;
-            let range_end = self.cpu_va.checked_add(self.len as u64)?;
             let lo = self.cpu_va.max(chunk_base);
-            let hi = range_end.min(chunk_base + RESIDENT_CHUNK_SIZE as u64);
-            if hi <= lo {
-                return None;
-            }
+            let hi = range_end.min(chunk_base.saturating_add(RESIDENT_CHUNK_SIZE as u64));
             let src = (lo - chunk_base) as usize;
             let dst = (lo - self.cpu_va) as usize;
             let len = (hi - lo) as usize;
             out[dst..dst + len].copy_from_slice(&chunk.data[src..src + len]);
+            copied = copied.checked_add(len)?;
         }
-        if self.cpu_va < first_base {
-            return None;
+        (copied == self.len).then_some(out)
+    }
+
+    pub fn matches_bytes(&self, bytes: &[u8]) -> bool {
+        if bytes.len() != self.len || !self.has_exact_coverage() {
+            return false;
         }
-        Some(out)
+        let Some(range_end) = self.cpu_va.checked_add(self.len as u64) else {
+            return false;
+        };
+        let mut compared = 0usize;
+        for chunk in &self.chunks {
+            let chunk_base = chunk.chunk_key << RESIDENT_CHUNK_SHIFT;
+            let lo = self.cpu_va.max(chunk_base);
+            let hi = range_end.min(chunk_base.saturating_add(RESIDENT_CHUNK_SIZE as u64));
+            let src = (lo - chunk_base) as usize;
+            let dst = (lo - self.cpu_va) as usize;
+            let len = (hi - lo) as usize;
+            if chunk.data[src..src + len] != bytes[dst..dst + len] {
+                return false;
+            }
+            let Some(total) = compared.checked_add(len) else {
+                return false;
+            };
+            compared = total;
+        }
+        compared == self.len
     }
 }
 
@@ -467,6 +515,19 @@ pub struct ResidentCbufDraw {
     pub chunks: Vec<ResidentVertexChunk>,
     pub slots: Vec<ResidentCbufSlot>,
     pub packed_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfiguredColorRt {
+    pub raw_slot: u8,
+    pub key: RtKey,
+    pub format: vk::Format,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SmallColorRtWriteback {
+    pub key: RtKey,
+    pub tile_mode: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -501,11 +562,13 @@ pub struct Maxwell3dDrawCall {
     pub index_count: Option<u32>,
     pub index_type: vk::IndexType,
     pub index_data: Option<std::sync::Arc<Vec<u8>>>,
+    pub resident_index: Option<ResidentVertexRange>,
     pub primitive_restart_enabled: bool,
     pub primitive_restart_index: u32,
     pub quad_expand: bool,
     pub rt_key: RtKey,
-    pub small_rt_tile_mode: Option<u32>,
+    pub small_color_rt_writebacks: Vec<SmallColorRtWriteback>,
+    pub configured_color_rts: Vec<ConfiguredColorRt>,
     pub color_rt_keys: Vec<RtKey>,
     pub color_rt_formats: Vec<vk::Format>,
     pub rt_format: vk::Format,
@@ -689,8 +752,70 @@ mod tests {
 
     use super::{
         indexed_vertex_span, primitive_restart_fixed_index, primitive_restart_topology_supported,
-        GraphicsCbufPayload, GraphicsCbufSlotSnapshot, StorageBufferSnapshot,
+        GraphicsCbufPayload, GraphicsCbufSlotSnapshot, ResidentVertexChunk, ResidentVertexRange,
+        StorageBufferSnapshot, RESIDENT_CHUNK_SIZE,
     };
+
+    fn resident_chunk(chunk_key: u64, fill: u8) -> ResidentVertexChunk {
+        ResidentVertexChunk {
+            chunk_key,
+            generation: 1,
+            serial: 1,
+            data: std::sync::Arc::new(vec![fill; RESIDENT_CHUNK_SIZE]),
+        }
+    }
+
+    #[test]
+    fn resident_vertex_range_assembles_only_exact_full_coverage() {
+        let chunk = RESIDENT_CHUNK_SIZE as u64;
+        let range = ResidentVertexRange {
+            binding: 3,
+            stride: 4,
+            cpu_va: chunk - 2,
+            len: 4,
+            chunks: vec![resident_chunk(0, 0x11), resident_chunk(1, 0x22)],
+        };
+        assert!(range.has_exact_coverage());
+        assert_eq!(
+            range.assemble().as_deref(),
+            Some(&[0x11, 0x11, 0x22, 0x22][..])
+        );
+        assert!(range.matches_bytes(&[0x11, 0x11, 0x22, 0x22]));
+        assert!(!range.matches_bytes(&[0x11, 0x11, 0x22, 0x23]));
+        assert!(!range.matches_bytes(&[0x11, 0x11, 0x22]));
+
+        for invalid in [
+            ResidentVertexRange {
+                chunks: range.chunks[..1].to_vec(),
+                ..range.clone()
+            },
+            ResidentVertexRange {
+                chunks: vec![resident_chunk(0, 0x11), resident_chunk(2, 0x22)],
+                ..range.clone()
+            },
+            ResidentVertexRange {
+                chunks: vec![
+                    resident_chunk(0, 0x11),
+                    resident_chunk(1, 0x22),
+                    resident_chunk(2, 0x33),
+                ],
+                ..range.clone()
+            },
+            ResidentVertexRange {
+                len: 0,
+                ..range.clone()
+            },
+        ] {
+            assert!(!invalid.has_exact_coverage());
+            assert!(invalid.assemble().is_none());
+            assert!(!invalid.matches_bytes(&[0x11, 0x11, 0x22, 0x22]));
+        }
+
+        let mut short = range;
+        short.chunks[1].data = std::sync::Arc::new(vec![0; RESIDENT_CHUNK_SIZE - 1]);
+        assert!(!short.has_exact_coverage());
+        assert!(short.assemble().is_none());
+    }
 
     #[test]
     fn primitive_restart_helpers_match_core_vulkan_rules() {

@@ -4,8 +4,7 @@ use std::sync::{Mutex, OnceLock};
 pub const ARENA_MAX_BITS: u32 = 40;
 pub const ARENA_MIN_BITS: u32 = 36;
 
-static ARENA_BITS_ACHIEVED: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static ARENA_BITS_ACHIEVED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub fn arena_bits() -> u32 {
     let bits = ARENA_BITS_ACHIEVED.load(Ordering::Acquire);
@@ -13,7 +12,9 @@ pub fn arena_bits() -> u32 {
         return bits;
     }
     arena();
-    ARENA_BITS_ACHIEVED.load(Ordering::Acquire).max(ARENA_MIN_BITS)
+    ARENA_BITS_ACHIEVED
+        .load(Ordering::Acquire)
+        .max(ARENA_MIN_BITS)
 }
 
 pub fn arena_size() -> u64 {
@@ -176,13 +177,13 @@ fn record_observed_write_pages(base: *mut u8, addresses: &[usize]) {
     if addresses.is_empty() {
         return;
     }
-    let serial = OBSERVED_WRITE_SERIAL
-        .fetch_add(1, Ordering::Relaxed)
-        .wrapping_add(1);
     let base_addr = base as usize as u64;
     let mut generations = observed_write_generations()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let serial = OBSERVED_WRITE_SERIAL
+        .load(Ordering::Relaxed)
+        .wrapping_add(1);
     for &address in addresses {
         let guest_va = (address as u64).saturating_sub(base_addr);
         let generation = generations
@@ -190,28 +191,39 @@ fn record_observed_write_pages(base: *mut u8, addresses: &[usize]) {
             .or_insert(0);
         *generation = (*generation).max(serial);
     }
+    OBSERVED_WRITE_SERIAL.store(serial, Ordering::Release);
 }
 
-pub fn observed_write_generation_range(va: u64, len: usize) -> u64 {
-    if len == 0 {
-        return 0;
-    }
-    let start = va & OBSERVED_WRITE_PAGE_MASK;
-    let Some(end_unaligned) = va.checked_add(len as u64) else {
-        return u64::MAX;
-    };
-    let end = end_unaligned.saturating_add((1u64 << OBSERVED_WRITE_PAGE_SHIFT) - 1)
-        & OBSERVED_WRITE_PAGE_MASK;
+pub fn observed_write_serial() -> u64 {
+    OBSERVED_WRITE_SERIAL.load(Ordering::Acquire)
+}
+
+pub fn observed_write_snapshot_range(va: u64, len: usize) -> (u64, u64) {
     let generations = observed_write_generations()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut generation = 0;
-    let mut page = start;
-    while page < end {
-        generation = generation.max(generations.get(&page).copied().unwrap_or(0));
-        page = page.saturating_add(1u64 << OBSERVED_WRITE_PAGE_SHIFT);
-    }
-    generation
+    let serial = observed_write_serial();
+    let generation = if len == 0 {
+        0
+    } else if let Some(end_unaligned) = va.checked_add(len as u64) {
+        let start = va & OBSERVED_WRITE_PAGE_MASK;
+        let end = end_unaligned.saturating_add((1u64 << OBSERVED_WRITE_PAGE_SHIFT) - 1)
+            & OBSERVED_WRITE_PAGE_MASK;
+        let mut generation = 0;
+        let mut page = start;
+        while page < end {
+            generation = generation.max(generations.get(&page).copied().unwrap_or(0));
+            page = page.saturating_add(1u64 << OBSERVED_WRITE_PAGE_SHIFT);
+        }
+        generation
+    } else {
+        u64::MAX
+    };
+    (serial, generation)
+}
+
+pub fn observed_write_generation_range(va: u64, len: usize) -> u64 {
+    observed_write_snapshot_range(va, len).1
 }
 
 pub fn commit_generation() -> u64 {
@@ -704,10 +716,14 @@ mod tests {
         let ptr = commit(VA, LEN).expect("write-watched fastmem allocation");
 
         let _ = take_write_watch(VA, LEN);
-        let generation_before = observed_write_generation_range(VA, LEN);
+        let (serial_before, generation_before) = observed_write_snapshot_range(VA, LEN);
+        assert!(generation_before <= serial_before);
         unsafe { ptr.add(0x123).write_volatile(0x5a) };
         assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Dirty);
-        let generation_after = observed_write_generation_range(VA, LEN);
+        let published_serial = observed_write_serial();
+        let (serial_after, generation_after) = observed_write_snapshot_range(VA, LEN);
+        assert!(serial_after >= published_serial);
+        assert!(generation_after <= serial_after);
         assert!(generation_after > generation_before);
         assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Clean);
         assert_eq!(observed_write_generation_range(VA, LEN), generation_after);
