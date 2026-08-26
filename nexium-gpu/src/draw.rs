@@ -104,6 +104,7 @@ pub struct BlendState {
     pub alpha_op: vk::BlendOp,
     pub color_write_mask: vk::ColorComponentFlags,
     pub attachments: [BlendAttachmentState; 8],
+    pub constants: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug)]

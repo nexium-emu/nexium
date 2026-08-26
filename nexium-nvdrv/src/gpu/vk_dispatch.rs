@@ -10946,6 +10946,7 @@ fn execute_one_inner(
         alpha_op: compact_attachments[0].alpha_op,
         color_write_mask: compact_attachments[0].color_write_mask,
         attachments: compact_attachments,
+        constants: draw.color_blend.blend_constants,
     };
 
     trace_menu_draw(

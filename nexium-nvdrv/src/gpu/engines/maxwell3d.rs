@@ -246,6 +246,7 @@ pub struct ColorBlendState {
     pub blend_pt_dst_alpha: [u32; 8],
     pub color_mask_common: bool,
     pub color_masks: [u32; 8],
+    pub blend_constants: [f32; 4],
 }
 
 impl Default for ColorBlendState {
@@ -267,6 +268,7 @@ impl Default for ColorBlendState {
             blend_pt_dst_alpha: [0x4000; 8],
             color_mask_common: false,
             color_masks: [0x1111; 8],
+            blend_constants: [0.0; 4],
         }
     }
 }
@@ -359,6 +361,7 @@ pub struct Maxwell3DRegisters {
     pub blend_pt_dst_alpha: [u32; 8],
     pub color_mask_common: bool,
     pub color_masks: [u32; 8],
+    pub blend_constants: [f32; 4],
     pub draw_count: u64,
     pub clear_count: u64,
 
@@ -488,6 +491,7 @@ impl Default for Maxwell3DRegisters {
             blend_pt_dst_alpha: [0x4000; 8],
             color_mask_common: false,
             color_masks: [0x1111; 8],
+            blend_constants: [0.0; 4],
             draw_count: 0,
             clear_count: 0,
             tic_pool_va_lo: 0,
@@ -549,6 +553,9 @@ impl Maxwell3DRegisters {
         image[0x487] = self.rt_control;
         image[0x4C3] = self.depth_func;
         image[0x4C5] = self.alpha_test_func;
+        for (index, value) in self.blend_constants.iter().enumerate() {
+            image[0x4C7 + index] = value.to_bits();
+        }
         image[0x4D0] = self.blend_eq_rgb;
         image[0x4D1] = self.blend_src_rgb;
         image[0x4D2] = self.blend_dst_rgb;
@@ -605,6 +612,7 @@ impl Maxwell3DRegisters {
             blend_pt_dst_alpha: self.blend_pt_dst_alpha,
             color_mask_common: self.color_mask_common,
             color_masks: self.color_masks,
+            blend_constants: self.blend_constants,
         }
     }
 }
@@ -1807,6 +1815,9 @@ impl Maxwell3D {
                 }
                 self.regs.depth_func = arg;
             }
+            0x4C7..=0x4CA => {
+                self.regs.blend_constants[(method - 0x4C7) as usize] = f32::from_bits(arg);
+            }
             0x4D0 => self.regs.blend_eq_rgb = arg,
             0x4D1 => self.regs.blend_src_rgb = arg,
             0x4D2 => self.regs.blend_dst_rgb = arg,
@@ -2740,12 +2751,17 @@ mod tests {
     #[test]
     fn draws_snapshot_blend_and_color_mask_state() {
         let mut engine = Maxwell3D::new();
+        let first_constants = [0x3e80_0001, 0x3f00_0002, 0x3f40_0003, 0x3f80_0004];
+        let second_constants = [0x4000_0001, 0x4020_0002, 0x4040_0003, 0x4060_0004];
 
         engine.dispatch_method(0x4b9, 1, true);
         engine.dispatch_method(0x4d8, 1, true);
         engine.dispatch_method(0x782, 0x0302, true);
         engine.dispatch_method(0x783, 0x0303, true);
         engine.dispatch_method(0x680, 0x0111, true);
+        for (index, bits) in first_constants.into_iter().enumerate() {
+            engine.dispatch_method(0x4c7 + index as u32, bits, true);
+        }
         engine.dispatch_method(0x35e, 3, true);
 
         engine.dispatch_method(0x4b9, 0, true);
@@ -2753,6 +2769,9 @@ mod tests {
         engine.dispatch_method(0x4d1, 0x0304, true);
         engine.dispatch_method(0x4d2, 0x0305, true);
         engine.dispatch_method(0x680, 0x1110, true);
+        for (index, bits) in second_constants.into_iter().enumerate() {
+            engine.dispatch_method(0x4c7 + index as u32, bits, true);
+        }
         engine.dispatch_method(0x35e, 3, true);
 
         let first = engine.pending_draws[0].color_blend;
@@ -2761,6 +2780,7 @@ mod tests {
         assert_eq!(first.blend_pt_src_rgb[0], 0x0302);
         assert_eq!(first.blend_pt_dst_rgb[0], 0x0303);
         assert_eq!(first.color_masks[0], 0x0111);
+        assert_eq!(first.blend_constants.map(f32::to_bits), first_constants);
 
         let second = engine.pending_draws[1].color_blend;
         assert!(!second.blend_per_target_enabled);
@@ -2768,6 +2788,7 @@ mod tests {
         assert_eq!(second.blend_src_rgb, 0x0304);
         assert_eq!(second.blend_dst_rgb, 0x0305);
         assert_eq!(second.color_masks[0], 0x1110);
+        assert_eq!(second.blend_constants.map(f32::to_bits), second_constants);
     }
 
     #[test]

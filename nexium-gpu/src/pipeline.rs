@@ -202,6 +202,7 @@ pub fn spec_to_request(
             alpha_op: attachments[0].alpha_op,
             color_write_mask: attachments[0].color_write_mask,
             attachments,
+            constants: [0.0; 4],
         },
         depth: crate::draw::DepthState {
             test_enabled: spec.depth.0,
@@ -470,6 +471,7 @@ pub fn build_graphics_pipeline(
         vk::DynamicState::STENCIL_REFERENCE,
         vk::DynamicState::STENCIL_COMPARE_MASK,
         vk::DynamicState::STENCIL_WRITE_MASK,
+        vk::DynamicState::BLEND_CONSTANTS,
     ];
     let dyn_state = vk::PipelineDynamicStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_DYNAMIC_STATE_CREATE_INFO,

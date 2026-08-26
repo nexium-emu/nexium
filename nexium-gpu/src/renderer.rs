@@ -8848,6 +8848,7 @@ impl Renderer {
             device.cmd_set_scissor(cmd, 0, &[scissor]);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             set_dynamic_stencil_state(device, cmd, call.stencil);
+            device.cmd_set_blend_constants(cmd, &call.blend.constants);
             device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -12036,11 +12037,13 @@ impl Renderer {
                     let viewport_key = viewport_record_key(vp);
                     let scissor_key = scissor_record_key(scissor);
                     let stencil_key = stencil_record_key(call.stencil);
+                    let blend_constants_key = blend_constants_record_key(call.blend.constants);
                     let decision = recorded_graphics_state.update(
                         prep.pipeline,
                         viewport_key,
                         scissor_key,
                         stencil_key,
+                        blend_constants_key,
                     );
                     if record_stage_profile {
                         let stencil_commands = dynamic_stencil_command_count(call.stencil);
@@ -12069,6 +12072,9 @@ impl Renderer {
                     }
                     if !record_state_dedup || decision.set_stencil {
                         set_dynamic_stencil_state(device, cmd, call.stencil);
+                    }
+                    if !record_state_dedup || decision.set_blend_constants {
+                        device.cmd_set_blend_constants(cmd, &call.blend.constants);
                     }
                     device.cmd_bind_descriptor_sets(
                         cmd,
@@ -12368,6 +12374,7 @@ struct RecordStageProfileWindow {
 type ViewportRecordKey = [u32; 6];
 type ScissorRecordKey = [u32; 4];
 type StencilRecordKey = [u32; 6];
+type BlendConstantsRecordKey = [u32; 4];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RecordedGraphicsStateDecision {
@@ -12375,6 +12382,7 @@ struct RecordedGraphicsStateDecision {
     set_viewport: bool,
     set_scissor: bool,
     set_stencil: bool,
+    set_blend_constants: bool,
 }
 
 #[derive(Default)]
@@ -12383,6 +12391,7 @@ struct RecordedGraphicsState {
     viewport: Option<ViewportRecordKey>,
     scissor: Option<ScissorRecordKey>,
     stencil: Option<StencilRecordKey>,
+    blend_constants: Option<BlendConstantsRecordKey>,
 }
 
 impl RecordedGraphicsState {
@@ -12392,17 +12401,20 @@ impl RecordedGraphicsState {
         viewport: ViewportRecordKey,
         scissor: ScissorRecordKey,
         stencil: StencilRecordKey,
+        blend_constants: BlendConstantsRecordKey,
     ) -> RecordedGraphicsStateDecision {
         let decision = RecordedGraphicsStateDecision {
             bind_pipeline: self.pipeline != Some(pipeline),
             set_viewport: self.viewport != Some(viewport),
             set_scissor: self.scissor != Some(scissor),
             set_stencil: self.stencil != Some(stencil),
+            set_blend_constants: self.blend_constants != Some(blend_constants),
         };
         self.pipeline = Some(pipeline);
         self.viewport = Some(viewport);
         self.scissor = Some(scissor);
         self.stencil = Some(stencil);
+        self.blend_constants = Some(blend_constants);
         decision
     }
 }
@@ -12436,6 +12448,10 @@ fn stencil_record_key(state: crate::draw::StencilState) -> StencilRecordKey {
         state.front.write_mask,
         state.back.write_mask,
     ]
+}
+
+fn blend_constants_record_key(constants: [f32; 4]) -> BlendConstantsRecordKey {
+    constants.map(f32::to_bits)
 }
 
 fn dynamic_stencil_command_count(state: crate::draw::StencilState) -> u64 {
@@ -26854,7 +26870,8 @@ unsafe impl Sync for Renderer {}
 #[cfg(test)]
 mod tests {
     use super::{
-        align_up, build_grouped_shared_ssbo_plans, build_shared_ssbo_plan,
+        align_up, blend_constants_record_key, build_grouped_shared_ssbo_plans,
+        build_shared_ssbo_plan,
         choose_aurora_resident_slot, clear_group_texture_bindings_after_invalidate,
         color_sync_clean_across_group, color_sync_supports_key, complete_compute_volume_rt_slices,
         completed_readback_backlog_len, compute_cross_access_view_components,
@@ -27501,59 +27518,86 @@ mod tests {
         let scissor_b = [8, 9, 10, 12];
         let stencil_a = [13, 14, 15, 16, 17, 18];
         let stencil_b = [13, 14, 15, 16, 17, 19];
+        let blend_a = [20, 21, 22, 23];
+        let blend_b = [20, 21, 22, 24];
         let all = RecordedGraphicsStateDecision {
             bind_pipeline: true,
             set_viewport: true,
             set_scissor: true,
             set_stencil: true,
+            set_blend_constants: true,
         };
         let none = RecordedGraphicsStateDecision {
             bind_pipeline: false,
             set_viewport: false,
             set_scissor: false,
             set_stencil: false,
+            set_blend_constants: false,
         };
         let mut state = RecordedGraphicsState::default();
 
         assert_eq!(
-            state.update(pipeline_a, viewport_a, scissor_a, stencil_a),
+            state.update(pipeline_a, viewport_a, scissor_a, stencil_a, blend_a),
             all
         );
         assert_eq!(
-            state.update(pipeline_a, viewport_a, scissor_a, stencil_a),
+            state.update(pipeline_a, viewport_a, scissor_a, stencil_a, blend_a),
             none
         );
         assert_eq!(
-            state.update(pipeline_b, viewport_a, scissor_a, stencil_a),
+            state.update(pipeline_b, viewport_a, scissor_a, stencil_a, blend_a),
             RecordedGraphicsStateDecision {
                 bind_pipeline: true,
                 ..none
             }
         );
         assert_eq!(
-            state.update(pipeline_b, viewport_b, scissor_a, stencil_a),
+            state.update(pipeline_b, viewport_b, scissor_a, stencil_a, blend_a),
             RecordedGraphicsStateDecision {
                 set_viewport: true,
                 ..none
             }
         );
         assert_eq!(
-            state.update(pipeline_b, viewport_b, scissor_b, stencil_a),
+            state.update(pipeline_b, viewport_b, scissor_b, stencil_a, blend_a),
             RecordedGraphicsStateDecision {
                 set_scissor: true,
                 ..none
             }
         );
         assert_eq!(
-            state.update(pipeline_b, viewport_b, scissor_b, stencil_b),
+            state.update(pipeline_b, viewport_b, scissor_b, stencil_b, blend_a),
             RecordedGraphicsStateDecision {
                 set_stencil: true,
                 ..none
             }
         );
         assert_eq!(
-            RecordedGraphicsState::default().update(pipeline_b, viewport_b, scissor_b, stencil_b),
+            state.update(pipeline_b, viewport_b, scissor_b, stencil_b, blend_b),
+            RecordedGraphicsStateDecision {
+                set_blend_constants: true,
+                ..none
+            }
+        );
+        let mut reset_state = RecordedGraphicsState::default();
+        assert_eq!(
+            reset_state.update(pipeline_b, viewport_b, scissor_b, stencil_b, blend_b),
             all
+        );
+    }
+
+    #[test]
+    fn blend_constants_record_key_preserves_exact_float_bits() {
+        let constants = [
+            0.0,
+            -0.0,
+            f32::from_bits(0x7fc0_0001),
+            f32::from_bits(0x7fc0_0002),
+        ];
+
+        assert_eq!(
+            blend_constants_record_key(constants),
+            [0x0000_0000, 0x8000_0000, 0x7fc0_0001, 0x7fc0_0002]
         );
     }
 
