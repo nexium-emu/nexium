@@ -1033,6 +1033,74 @@ impl RenderThread {
         submitted
     }
 
+    pub(crate) fn submit_draw_group_then_job_named(
+        &self,
+        label: &'static str,
+        draws: Vec<PreparedDrawBatch>,
+        job_label: &'static str,
+        job: RenderJob,
+    ) -> bool {
+        let profile = render_profile_enabled();
+        let started = profile.then(std::time::Instant::now);
+        let hard_after = draws.last().is_some_and(PreparedDrawBatch::hard_after);
+        let hard_after_handle = draws
+            .last()
+            .and_then(|draw| (!hard_after).then(|| draw.hard_after_handle()));
+        let cost = DrawWorkCost::for_draws(&draws);
+        let mut draw_tail = self.draw_tail.lock().unwrap();
+        self.pending.fetch_add(1, Ordering::AcqRel);
+
+        if cost.groups != 0 {
+            self.pending.fetch_add(cost.groups, Ordering::AcqRel);
+            if !self.draw_work_budget.reserve_blocking(cost, label) {
+                self.pending.fetch_sub(cost.groups, Ordering::Release);
+                self.pending.fetch_sub(1, Ordering::Release);
+                if hard_after {
+                    seal_draw_tail_locked(&mut draw_tail);
+                }
+                return false;
+            }
+            if self.tx.send(RenderWork::DrawGroup(draws)).is_err() {
+                self.draw_work_budget.release(cost);
+                self.pending.fetch_sub(cost.groups, Ordering::Release);
+                self.pending.fetch_sub(1, Ordering::Release);
+                if hard_after {
+                    seal_draw_tail_locked(&mut draw_tail);
+                }
+                return false;
+            }
+            if hard_after {
+                *draw_tail = None;
+            } else {
+                *draw_tail = hard_after_handle;
+            }
+        }
+
+        seal_draw_tail_locked(&mut draw_tail);
+        let submitted = if self.tx.send(RenderWork::Job(job_label, job)).is_ok() {
+            true
+        } else {
+            self.pending.fetch_sub(1, Ordering::Release);
+            false
+        };
+        drop(draw_tail);
+
+        if let Some(started) = started {
+            let elapsed = started.elapsed();
+            if elapsed >= std::time::Duration::from_millis(1) {
+                log::warn!(
+                    "[render-submit] label={} job_label={} groups={} snapshot_mib={:.1} blocked_ms={:.3}",
+                    label,
+                    job_label,
+                    cost.groups,
+                    cost.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                    elapsed.as_secs_f64() * 1000.0,
+                );
+            }
+        }
+        submitted
+    }
+
     pub(crate) fn flush_draw_chunk_named(
         &self,
         label: &'static str,
@@ -1435,6 +1503,62 @@ mod tests {
         release_tx.send(()).unwrap();
         wait_until_idle(&worker);
         assert!(worker.is_idle());
+    }
+
+    #[test]
+    fn draw_group_then_job_with_empty_group_seals_tail_and_tracks_job() {
+        let (tx, rx) = bounded(1);
+        let tail = Arc::new(AtomicBool::new(false));
+        let worker = RenderThread {
+            tx,
+            pending: Arc::new(AtomicUsize::new(0)),
+            draw_tail: Mutex::new(Some(Arc::downgrade(&tail))),
+            draw_work_budget: Arc::new(DrawWorkBudget::new(0, 0)),
+        };
+        let (ran_tx, ran_rx) = mpsc::channel();
+
+        assert!(worker.submit_draw_group_then_job_named(
+            "empty-draw-group",
+            Vec::new(),
+            "paired-job",
+            Box::new(move || ran_tx.send(()).unwrap()),
+        ));
+        assert!(tail.load(Ordering::Acquire));
+        assert!(worker.draw_tail.lock().unwrap().is_none());
+        assert_eq!(worker.pending.load(Ordering::Acquire), 1);
+
+        match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            RenderWork::Job(label, job) => {
+                assert_eq!(label, "paired-job");
+                super::execute_job(label, job, worker.pending.as_ref());
+            }
+            _ => panic!("unexpected render work"),
+        }
+        ran_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(worker.is_idle());
+    }
+
+    #[test]
+    fn draw_group_then_job_failure_restores_job_pending_count() {
+        let (tx, rx) = bounded(1);
+        drop(rx);
+        let tail = Arc::new(AtomicBool::new(false));
+        let worker = RenderThread {
+            tx,
+            pending: Arc::new(AtomicUsize::new(0)),
+            draw_tail: Mutex::new(Some(Arc::downgrade(&tail))),
+            draw_work_budget: Arc::new(DrawWorkBudget::new(0, 0)),
+        };
+
+        assert!(!worker.submit_draw_group_then_job_named(
+            "empty-draw-group",
+            Vec::new(),
+            "disconnected-job",
+            Box::new(|| {}),
+        ));
+        assert!(tail.load(Ordering::Acquire));
+        assert!(worker.draw_tail.lock().unwrap().is_none());
+        assert_eq!(worker.pending.load(Ordering::Acquire), 0);
     }
 
     #[test]

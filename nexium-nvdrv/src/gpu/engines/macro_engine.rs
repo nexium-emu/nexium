@@ -1,8 +1,48 @@
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 const NUM_REGS: usize = 8;
 pub const MACRO_REGISTERS_START: u32 = 0xE00;
 const NUM_MACRO_POSITIONS: usize = 0x80;
+const LLE_WRITE_SCRATCH_LIMIT: usize = 32 * 1024;
+const LLE_PROFILE_SAMPLE_MASK: u64 = 63;
+const LLE_PROFILE_REPORT_MASK: u64 = 1_048_575;
+const LLE_PROFILE_HASH_LIMIT: usize = 128;
+
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| truthy(&value))
+}
+
+fn enabled_by_default(value: Option<&str>) -> bool {
+    value.is_none_or(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+fn mme_fast_lle_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        let value = std::env::var("NEXIUM_MME_FAST_LLE").ok();
+        enabled_by_default(value.as_deref())
+    })
+}
+
+fn mme_lle_profile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| env_truthy("NEXIUM_RENDER_PROFILE") || env_truthy("NEXIUM_MME_LLE_PROFILE"))
+}
 
 fn macro_hash(code: &[u32]) -> u64 {
     const M: u64 = 0xc6a4_a793_5bd1_e995;
@@ -358,6 +398,45 @@ impl Opcode {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DecodedOpcode {
+    operation: Operation,
+    result_operation: ResultOperation,
+    is_exit: bool,
+    dst: u32,
+    src_a: u32,
+    src_b: u32,
+    immediate: i32,
+    alu_op: AluOp,
+    bf_src_bit: u32,
+    bitfield_mask: u32,
+    bf_dst_bit: u32,
+    branch_zero: bool,
+    branch_annul: bool,
+    branch_target: i32,
+}
+
+impl From<Opcode> for DecodedOpcode {
+    fn from(op: Opcode) -> Self {
+        Self {
+            operation: op.operation(),
+            result_operation: op.result_operation(),
+            is_exit: op.is_exit(),
+            dst: op.dst(),
+            src_a: op.src_a(),
+            src_b: op.src_b(),
+            immediate: op.immediate(),
+            alu_op: op.alu_op(),
+            bf_src_bit: op.bf_src_bit(),
+            bitfield_mask: op.bitfield_mask(),
+            bf_dst_bit: op.bf_dst_bit(),
+            branch_zero: op.branch_zero(),
+            branch_annul: op.branch_annul(),
+            branch_target: op.branch_target(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct MacroOutput {
     pub writes: Vec<(u32, u32)>,
@@ -365,6 +444,83 @@ pub struct MacroOutput {
     pub hash: u64,
     pub entry: u32,
     pub hle: bool,
+    fast_lle: bool,
+}
+
+#[derive(Default)]
+struct LleHashProfile {
+    hash: u64,
+    calls: u64,
+    fast_calls: u64,
+    steps: u64,
+    writes: u64,
+    elapsed: Duration,
+}
+
+#[derive(Default)]
+struct LleProfile {
+    calls: u64,
+    fast_calls: u64,
+    steps: u64,
+    writes: u64,
+    sampled_calls: u64,
+    sampled_elapsed: Duration,
+    hashes: Vec<LleHashProfile>,
+}
+
+impl LleProfile {
+    fn sample_next(&self) -> bool {
+        self.calls & LLE_PROFILE_SAMPLE_MASK == 0
+    }
+
+    fn record(&mut self, hash: u64, fast: bool, steps: u32, writes: usize, elapsed: Duration) {
+        self.calls = self.calls.wrapping_add(1);
+        self.fast_calls += u64::from(fast);
+        self.steps = self.steps.wrapping_add(u64::from(steps));
+        self.writes = self.writes.wrapping_add(writes as u64);
+        if elapsed != Duration::ZERO {
+            self.sampled_calls = self.sampled_calls.wrapping_add(1);
+            self.sampled_elapsed += elapsed;
+            if let Some(profile) = self.hashes.iter_mut().find(|profile| profile.hash == hash) {
+                profile.calls = profile.calls.wrapping_add(1);
+                profile.fast_calls += u64::from(fast);
+                profile.steps = profile.steps.wrapping_add(u64::from(steps));
+                profile.writes = profile.writes.wrapping_add(writes as u64);
+                profile.elapsed += elapsed;
+            } else if self.hashes.len() < LLE_PROFILE_HASH_LIMIT {
+                self.hashes.push(LleHashProfile {
+                    hash,
+                    calls: 1,
+                    fast_calls: u64::from(fast),
+                    steps: u64::from(steps),
+                    writes: writes as u64,
+                    elapsed,
+                });
+            }
+        }
+        if self.calls & LLE_PROFILE_REPORT_MASK == 0 {
+            log::info!(
+                "[mme-lle] calls={} fast={} steps={} writes={} samples={} sample_ms={:.3}",
+                self.calls,
+                self.fast_calls,
+                self.steps,
+                self.writes,
+                self.sampled_calls,
+                self.sampled_elapsed.as_secs_f64() * 1000.0
+            );
+            for profile in &self.hashes {
+                log::info!(
+                    "[mme-lle] hash={:#018x} samples={} fast={} steps={} writes={} ns_call={:.0}",
+                    profile.hash,
+                    profile.calls,
+                    profile.fast_calls,
+                    profile.steps,
+                    profile.writes,
+                    profile.elapsed.as_nanos() as f64 / profile.calls.max(1) as f64
+                );
+            }
+        }
+    }
 }
 
 fn mme_forensics() -> bool {
@@ -424,27 +580,45 @@ pub struct MacroEngine {
     executing_macro: u32,
     pending_params: Vec<u32>,
     seen_hashes: HashSet<u64>,
+    fast_lle: bool,
+    upload_serials: HashMap<u32, u64>,
+    next_upload_serial: u64,
+    lle_write_scratch: Vec<(u32, u32)>,
+    lle_profile: Option<LleProfile>,
 }
 
 struct CompiledMacro {
     code: Vec<u32>,
     hash: u64,
     hle: Option<HleMacro>,
+    decoded: Option<Box<[DecodedOpcode]>>,
 }
 
 impl CompiledMacro {
-    fn new(code: Vec<u32>) -> Self {
+    fn new(code: Vec<u32>, fast_lle: bool) -> Self {
         let hash = macro_hash(&code);
+        let decoded = fast_lle.then(|| {
+            code.iter()
+                .copied()
+                .map(Opcode)
+                .map(DecodedOpcode::from)
+                .collect()
+        });
         Self {
             code,
             hash,
             hle: hle_macro_kind(hash),
+            decoded,
         }
     }
 }
 
 impl MacroEngine {
     pub fn new() -> Self {
+        Self::new_with_options(mme_fast_lle_enabled(), mme_lle_profile_enabled())
+    }
+
+    fn new_with_options(fast_lle: bool, profile_lle: bool) -> Self {
         Self {
             uploaded_code: HashMap::new(),
             compiled: HashMap::new(),
@@ -454,16 +628,30 @@ impl MacroEngine {
             executing_macro: 0,
             pending_params: Vec::new(),
             seen_hashes: HashSet::new(),
+            fast_lle,
+            upload_serials: HashMap::new(),
+            next_upload_serial: 0,
+            lle_write_scratch: Vec::new(),
+            lle_profile: profile_lle.then(LleProfile::default),
         }
     }
 
     pub fn set_instruction_ptr(&mut self, value: u32) {
         self.instruction_ptr = value;
         self.uploaded_code.remove(&value);
+        if self.fast_lle {
+            self.upload_serials.remove(&value);
+        }
         self.compiled.clear();
     }
 
     pub fn upload_instruction(&mut self, word: u32) {
+        if self.fast_lle {
+            self.compiled.clear();
+            self.next_upload_serial = self.next_upload_serial.wrapping_add(1).max(1);
+            self.upload_serials
+                .insert(self.instruction_ptr, self.next_upload_serial);
+        }
         self.uploaded_code
             .entry(self.instruction_ptr)
             .or_default()
@@ -478,7 +666,23 @@ impl MacroEngine {
         let slot = (self.start_address_ptr as usize) % NUM_MACRO_POSITIONS;
         self.macro_positions[slot] = offset;
         self.start_address_ptr = self.start_address_ptr.wrapping_add(1) & 0x7F;
-        self.compiled.remove(&offset);
+        if self.fast_lle {
+            self.compiled.clear();
+        } else {
+            self.compiled.remove(&offset);
+        }
+    }
+
+    pub fn recycle_output(&mut self, mut output: MacroOutput) {
+        if !output.fast_lle {
+            return;
+        }
+        output.writes.clear();
+        if output.writes.capacity() <= LLE_WRITE_SCRATCH_LIMIT
+            && output.writes.capacity() > self.lle_write_scratch.capacity()
+        {
+            self.lle_write_scratch = output.writes;
+        }
     }
 
     pub fn on_macro_method(
@@ -488,11 +692,22 @@ impl MacroEngine {
         is_last_call: bool,
         reg_reader: &dyn Fn(u32) -> u32,
     ) -> Option<MacroOutput> {
+        self.on_macro_methods(method, std::slice::from_ref(&arg), is_last_call, reg_reader)
+    }
+
+    pub fn on_macro_methods(
+        &mut self,
+        method: u32,
+        args: &[u32],
+        is_last_call: bool,
+        reg_reader: &dyn Fn(u32) -> u32,
+    ) -> Option<MacroOutput> {
+        debug_assert!(!args.is_empty());
         if self.executing_macro == 0 {
             self.executing_macro = method & !1;
             self.pending_params.clear();
         }
-        self.pending_params.push(arg);
+        self.pending_params.extend_from_slice(args);
         if !is_last_call {
             return None;
         }
@@ -534,23 +749,60 @@ impl MacroEngine {
                 logged_code
             );
         }
+        let sample_lle = hle.is_none()
+            && self
+                .lle_profile
+                .as_ref()
+                .is_some_and(LleProfile::sample_next);
+        let started = sample_lle.then(Instant::now);
+        let mut lle_stats = None;
         let mut out = if let Some(mut out) = hle {
             out.hle = true;
             out
-        } else {
-            let mut interp = Interpreter::new(&code, &params, reg_reader);
+        } else if self.fast_lle {
+            let decoded = compiled.decoded.as_deref().unwrap_or_default();
+            let scratch = std::mem::take(&mut self.lle_write_scratch);
+            let mut interp = FastInterpreter::new(decoded, params, reg_reader, scratch);
             interp.run();
+            if self.lle_profile.is_some() {
+                lle_stats = Some((true, 8192 - interp.steps_remaining, interp.writes.len()));
+            }
             MacroOutput {
                 writes: interp.writes,
                 draw_instance_count: None,
                 hash: 0,
                 entry: 0,
                 hle: false,
+                fast_lle: true,
+            }
+        } else {
+            let mut interp = Interpreter::new(&code, &params, reg_reader);
+            interp.run();
+            if self.lle_profile.is_some() {
+                lle_stats = Some((false, 8192 - interp.steps_remaining, interp.writes.len()));
+            }
+            MacroOutput {
+                writes: interp.writes,
+                draw_instance_count: None,
+                hash: 0,
+                entry: 0,
+                hle: false,
+                fast_lle: false,
             }
         };
         out.hash = hash;
         out.entry = entry as u32;
         forensic_report(&out, params);
+        if let (Some(profile), Some((fast, steps, writes))) = (self.lle_profile.as_mut(), lle_stats)
+        {
+            profile.record(
+                hash,
+                fast,
+                steps,
+                writes,
+                started.map_or(Duration::ZERO, |started| started.elapsed()),
+            );
+        }
         self.pending_params.clear();
         Some(out)
     }
@@ -559,8 +811,16 @@ impl MacroEngine {
         if self.compiled.contains_key(&offset) {
             return;
         }
+        if self.fast_lle {
+            let code = self.resolve_fast_code(offset);
+            if !code.is_empty() {
+                self.compiled.insert(offset, CompiledMacro::new(code, true));
+            }
+            return;
+        }
         if let Some(c) = self.uploaded_code.get(&offset) {
-            self.compiled.insert(offset, CompiledMacro::new(c.clone()));
+            self.compiled
+                .insert(offset, CompiledMacro::new(c.clone(), self.fast_lle));
             return;
         }
         let mut found: Option<Vec<u32>> = None;
@@ -573,8 +833,57 @@ impl MacroEngine {
         }
         let v = found.unwrap_or_default();
         if !v.is_empty() {
-            self.compiled.insert(offset, CompiledMacro::new(v));
+            self.compiled
+                .insert(offset, CompiledMacro::new(v, self.fast_lle));
         }
+    }
+
+    fn resolve_fast_code(&self, offset: u32) -> Vec<u32> {
+        let mut end = self
+            .uploaded_code
+            .iter()
+            .filter_map(|(&base, code)| {
+                let segment_end = base.saturating_add(code.len() as u32);
+                (base <= offset && offset < segment_end).then_some(segment_end)
+            })
+            .max()
+            .unwrap_or(offset);
+        if end == offset {
+            return Vec::new();
+        }
+        loop {
+            let expanded = self
+                .uploaded_code
+                .iter()
+                .filter_map(|(&base, code)| {
+                    let segment_end = base.saturating_add(code.len() as u32);
+                    (base < end && segment_end > offset).then_some(segment_end)
+                })
+                .max()
+                .unwrap_or(end);
+            if expanded <= end {
+                break;
+            }
+            end = expanded;
+        }
+        let mut code = Vec::with_capacity((end - offset) as usize);
+        for address in offset..end {
+            let selected = self
+                .uploaded_code
+                .iter()
+                .filter_map(|(&base, words)| {
+                    let index = address.checked_sub(base)? as usize;
+                    let word = words.get(index).copied()?;
+                    let serial = self.upload_serials.get(&base).copied().unwrap_or(0);
+                    Some((serial, base, word))
+                })
+                .max_by_key(|&(serial, base, _)| (serial, base));
+            let Some((_, _, word)) = selected else {
+                break;
+            };
+            code.push(word);
+        }
+        code
     }
 }
 
@@ -834,6 +1143,254 @@ impl<'a> Interpreter<'a> {
     }
 }
 
+struct FastInterpreter<'a> {
+    code: &'a [DecodedOpcode],
+    params: &'a [u32],
+    next_param: usize,
+    registers: [u32; NUM_REGS],
+    pc: usize,
+    delayed_pc: Option<usize>,
+    method_address: u32,
+    carry: bool,
+    writes: Vec<(u32, u32)>,
+    reg_reader: &'a dyn Fn(u32) -> u32,
+    steps_remaining: u32,
+}
+
+impl<'a> FastInterpreter<'a> {
+    fn new(
+        code: &'a [DecodedOpcode],
+        params: &'a [u32],
+        reg_reader: &'a dyn Fn(u32) -> u32,
+        writes: Vec<(u32, u32)>,
+    ) -> Self {
+        let mut registers = [0; NUM_REGS];
+        if let Some(&first) = params.first() {
+            registers[1] = first;
+        }
+        Self {
+            code,
+            params,
+            next_param: 1,
+            registers,
+            pc: 0,
+            delayed_pc: None,
+            method_address: 0,
+            carry: false,
+            writes,
+            reg_reader,
+            steps_remaining: 8192,
+        }
+    }
+
+    fn run(&mut self) {
+        let mut exited = false;
+        while self.steps_remaining > 0 {
+            self.steps_remaining -= 1;
+            if !self.step(false) {
+                exited = true;
+                break;
+            }
+        }
+        if !exited {
+            log::warn!(
+                "MME: macro hit step cap (produced {} writes) — discarding as runaway",
+                self.writes.len()
+            );
+            self.writes.clear();
+        }
+    }
+
+    fn read_reg(&self, id: u32) -> u32 {
+        if id == 0 {
+            0
+        } else {
+            self.registers[id as usize & 7]
+        }
+    }
+
+    fn write_reg(&mut self, id: u32, value: u32) {
+        if id != 0 {
+            self.registers[id as usize & 7] = value;
+        }
+    }
+
+    fn send(&mut self, value: u32) {
+        let address = self.method_address & 0xFFF;
+        let increment = (self.method_address >> 12) & 0x3F;
+        self.writes.push((address, value));
+        let next = address.wrapping_add(increment) & 0xFFF;
+        self.method_address = (self.method_address & !0xFFF) | next;
+    }
+
+    fn fetch_param(&mut self) -> u32 {
+        if self.next_param >= self.params.len() {
+            return 0;
+        }
+        let value = self.params[self.next_param];
+        self.next_param += 1;
+        value
+    }
+
+    fn read_method(&self, address: u32) -> u32 {
+        for &(method, value) in self.writes.iter().rev() {
+            if method == address {
+                return value;
+            }
+            if method == 0x8C4 && address == 0xD00 {
+                return 1;
+            }
+        }
+        (self.reg_reader)(address)
+    }
+
+    fn alu(&mut self, op: AluOp, a: u32, b: u32) -> u32 {
+        match op {
+            AluOp::Add => {
+                let result = u64::from(a) + u64::from(b);
+                self.carry = result > u64::from(u32::MAX);
+                result as u32
+            }
+            AluOp::AddWithCarry => {
+                let result = u64::from(a) + u64::from(b) + u64::from(self.carry);
+                self.carry = result > u64::from(u32::MAX);
+                result as u32
+            }
+            AluOp::Subtract => {
+                let result = u64::from(a).wrapping_sub(u64::from(b));
+                self.carry = result < 0x1_0000_0000;
+                result as u32
+            }
+            AluOp::SubtractWithBorrow => {
+                let result = u64::from(a)
+                    .wrapping_sub(u64::from(b))
+                    .wrapping_sub(u64::from(!self.carry));
+                self.carry = result < 0x1_0000_0000;
+                result as u32
+            }
+            AluOp::Xor => a ^ b,
+            AluOp::Or => a | b,
+            AluOp::And => a & b,
+            AluOp::AndNot => a & !b,
+            AluOp::Nand => !(a & b),
+            AluOp::Unknown => 0,
+        }
+    }
+
+    fn process_result(&mut self, op: ResultOperation, reg: u32, result: u32) {
+        match op {
+            ResultOperation::IgnoreAndFetch => {
+                let param = self.fetch_param();
+                self.write_reg(reg, param);
+            }
+            ResultOperation::Move => self.write_reg(reg, result),
+            ResultOperation::MoveAndSetMethod => {
+                self.write_reg(reg, result);
+                self.method_address = result;
+            }
+            ResultOperation::FetchAndSend => {
+                let param = self.fetch_param();
+                self.write_reg(reg, param);
+                self.send(result);
+            }
+            ResultOperation::MoveAndSend => {
+                self.write_reg(reg, result);
+                self.send(result);
+            }
+            ResultOperation::FetchAndSetMethod => {
+                let param = self.fetch_param();
+                self.write_reg(reg, param);
+                self.method_address = result;
+            }
+            ResultOperation::MoveAndSetMethodFetchAndSend => {
+                self.write_reg(reg, result);
+                self.method_address = result;
+                let param = self.fetch_param();
+                self.send(param);
+            }
+            ResultOperation::MoveAndSetMethodSend => {
+                self.write_reg(reg, result);
+                self.method_address = result;
+                self.send((result >> 12) & 0x3F);
+            }
+        }
+    }
+
+    fn step(&mut self, is_delay_slot: bool) -> bool {
+        if self.pc >= self.code.len() * 4 {
+            return false;
+        }
+        let base = self.pc;
+        let op = self.code[self.pc / 4];
+        self.pc += 4;
+        if let Some(delayed_pc) = self.delayed_pc.take() {
+            let _ = is_delay_slot;
+            self.pc = delayed_pc;
+        }
+        match op.operation {
+            Operation::Alu => {
+                let a = self.read_reg(op.src_a);
+                let b = self.read_reg(op.src_b);
+                let result = self.alu(op.alu_op, a, b);
+                self.process_result(op.result_operation, op.dst, result);
+            }
+            Operation::AddImmediate => {
+                let result = self.read_reg(op.src_a).wrapping_add(op.immediate as u32);
+                self.process_result(op.result_operation, op.dst, result);
+            }
+            Operation::ExtractInsert => {
+                let mut dst = self.read_reg(op.src_a);
+                let mut src = self.read_reg(op.src_b);
+                src = (src >> op.bf_src_bit) & op.bitfield_mask;
+                dst &= !(op.bitfield_mask << op.bf_dst_bit);
+                dst |= src << op.bf_dst_bit;
+                self.process_result(op.result_operation, op.dst, dst);
+            }
+            Operation::ExtractShiftLeftImmediate => {
+                let dst = self.read_reg(op.src_a);
+                let src = self.read_reg(op.src_b);
+                let result = ((src >> dst) & op.bitfield_mask) << op.bf_dst_bit;
+                self.process_result(op.result_operation, op.dst, result);
+            }
+            Operation::ExtractShiftLeftRegister => {
+                let dst = self.read_reg(op.src_a);
+                let src = self.read_reg(op.src_b);
+                let result = ((src >> op.bf_src_bit) & op.bitfield_mask) << dst;
+                self.process_result(op.result_operation, op.dst, result);
+            }
+            Operation::Read => {
+                let address = self.read_reg(op.src_a).wrapping_add(op.immediate as u32);
+                let value = self.read_method(address);
+                self.process_result(op.result_operation, op.dst, value);
+            }
+            Operation::Branch => {
+                let value = self.read_reg(op.src_a);
+                let taken = if op.branch_zero {
+                    value == 0
+                } else {
+                    value != 0
+                };
+                if taken {
+                    let target = (base as i64).wrapping_add(i64::from(op.branch_target));
+                    let target = if target < 0 { 0 } else { target as usize };
+                    if op.branch_annul {
+                        self.pc = target;
+                        return true;
+                    }
+                    self.delayed_pc = Some(target);
+                    return self.step(true);
+                }
+            }
+            Operation::Unused => {}
+        }
+        if op.is_exit && !is_delay_slot {
+            self.step(true);
+            return false;
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,6 +1589,45 @@ mod tests {
         output.expect("the final parameter must execute the macro")
     }
 
+    fn decoded(code: &[u32]) -> Vec<DecodedOpcode> {
+        code.iter()
+            .copied()
+            .map(Opcode)
+            .map(DecodedOpcode::from)
+            .collect()
+    }
+
+    fn assert_fast_matches_legacy(
+        code: &[u32],
+        params: &[u32],
+        reg_reader: &dyn Fn(u32) -> u32,
+    ) -> (Vec<(u32, u32)>, u32) {
+        let mut legacy = Interpreter::new(code, params, reg_reader);
+        legacy.run();
+        let decoded = decoded(code);
+        let mut fast = FastInterpreter::new(&decoded, params, reg_reader, Vec::new());
+        fast.run();
+        assert_eq!(fast.writes, legacy.writes);
+        assert_eq!(fast.steps_remaining, legacy.steps_remaining);
+        (fast.writes, fast.steps_remaining)
+    }
+
+    fn add_immediate(result: u32, dst: u32, src_a: u32, immediate: u32) -> u32 {
+        1 | (result << 4) | (dst << 8) | (src_a << 11) | (immediate << 14)
+    }
+
+    fn set_method(method: u32) -> u32 {
+        add_immediate(2, 1, 0, method)
+    }
+
+    fn send_immediate(value: u32) -> u32 {
+        add_immediate(4, 2, 0, value)
+    }
+
+    fn read_and_send(address: u32) -> u32 {
+        5 | (4 << 4) | (2 << 8) | (address << 14)
+    }
+
     #[test]
     fn compiled_macro_and_parameter_storage_are_reused() {
         let mut engine = MacroEngine::new();
@@ -1056,6 +1652,36 @@ mod tests {
     }
 
     #[test]
+    fn sliced_and_scalar_parameter_delivery_match() {
+        let code = [
+            0x0480_0221,
+            0x0000_0A30,
+            0x0000_1330,
+            0x0000_1BC0,
+            0x0000_0010,
+        ];
+        let mut scalar = MacroEngine::new();
+        let mut sliced = MacroEngine::new();
+        upload_entry_11(&mut scalar, &code);
+        upload_entry_11(&mut sliced, &code);
+
+        assert!(scalar.on_macro_method(0xE17, 0x11, false, &|_| 0).is_none());
+        assert!(scalar.on_macro_method(0xE17, 0x22, false, &|_| 0).is_none());
+        let scalar = scalar.on_macro_method(0xE17, 0x33, true, &|_| 0).unwrap();
+
+        assert!(sliced
+            .on_macro_methods(0xE17, &[0x11, 0x22], false, &|_| 0)
+            .is_none());
+        let sliced = sliced.on_macro_method(0xE17, 0x33, true, &|_| 0).unwrap();
+
+        assert_eq!(sliced.writes, scalar.writes);
+        assert_eq!(sliced.draw_instance_count, scalar.draw_instance_count);
+        assert_eq!(sliced.hash, scalar.hash);
+        assert_eq!(sliced.entry, scalar.entry);
+        assert_eq!(sliced.hle, scalar.hle);
+    }
+
+    #[test]
     fn replacing_uploaded_code_invalidates_compiled_metadata() {
         let mut engine = MacroEngine::new();
         let original = [0x0000_0090, 0x0000_0010];
@@ -1069,6 +1695,164 @@ mod tests {
         let replacement_hash = invoke_entry_11(&mut engine).hash;
         assert_eq!(replacement_hash, macro_hash(&replacement));
         assert_ne!(replacement_hash, original_hash);
+    }
+
+    #[test]
+    fn fast_lle_is_enabled_by_default_with_explicit_rollback_values() {
+        assert!(enabled_by_default(None));
+        for value in ["1", "true", "TRUE", " yes ", "On", "enabled"] {
+            assert!(enabled_by_default(Some(value)));
+        }
+        for value in ["", "0", "false", " no ", "off"] {
+            assert!(!enabled_by_default(Some(value)));
+        }
+    }
+
+    #[test]
+    fn decoded_plans_are_only_created_for_fast_lle() {
+        let code = [0x0000_0090, 0x0000_0010];
+        let mut legacy = MacroEngine::new_with_options(false, false);
+        upload_entry_11(&mut legacy, &code);
+        let legacy_output = invoke_entry_11(&mut legacy);
+        assert!(!legacy_output.fast_lle);
+        assert!(legacy.compiled.get(&0).unwrap().decoded.is_none());
+
+        let mut fast = MacroEngine::new_with_options(true, false);
+        upload_entry_11(&mut fast, &code);
+        let fast_output = invoke_entry_11(&mut fast);
+        assert!(fast_output.fast_lle);
+        assert_eq!(
+            fast.compiled
+                .get(&0)
+                .unwrap()
+                .decoded
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(fast_output.writes, legacy_output.writes);
+    }
+
+    #[test]
+    fn fast_lle_preserves_branch_delay_and_exit_slots() {
+        let non_annul = [
+            7 | (3 << 14),
+            send_immediate(0x11),
+            send_immediate(0x22),
+            0x0000_0090,
+            send_immediate(0x33),
+        ];
+        let (writes, _) = assert_fast_matches_legacy(&non_annul, &[], &|_| 0);
+        assert_eq!(writes, vec![(0, 0x11), (0, 0x33)]);
+
+        let annul = [
+            7 | (1 << 5) | (2 << 14),
+            send_immediate(0x44),
+            0x0000_0090,
+            send_immediate(0x55),
+        ];
+        let (writes, _) = assert_fast_matches_legacy(&annul, &[], &|_| 0);
+        assert_eq!(writes, vec![(0, 0x55)]);
+    }
+
+    #[test]
+    fn fast_lle_preserves_step_cap() {
+        let runaway = [7 | (1 << 5)];
+        let (writes, steps_remaining) = assert_fast_matches_legacy(&runaway, &[], &|_| 0);
+        assert!(writes.is_empty());
+        assert_eq!(steps_remaining, 0);
+    }
+
+    #[test]
+    fn fast_lle_latest_write_lookup_preserves_d00_special_order() {
+        let code = [
+            set_method(0xD00),
+            send_immediate(7),
+            set_method(0x8C4),
+            send_immediate(9),
+            set_method(0x700),
+            read_and_send(0xD00),
+            set_method(0xD00),
+            send_immediate(3),
+            set_method(0x701),
+            read_and_send(0xD00),
+            0x0000_0090,
+            0x0000_0010,
+        ];
+        let (writes, _) = assert_fast_matches_legacy(&code, &[], &|_| 0xDEAD_BEEF);
+        assert_eq!(
+            writes,
+            vec![(0xD00, 7), (0x8C4, 9), (0x700, 1), (0xD00, 3), (0x701, 3)]
+        );
+    }
+
+    #[test]
+    fn fast_lle_invalidates_plans_on_upload_bind_and_pointer_reset() {
+        let code = [0x0000_0090, 0x0000_0010];
+        let mut engine = MacroEngine::new_with_options(true, false);
+        upload_entry_11(&mut engine, &code);
+        let output = invoke_entry_11(&mut engine);
+        engine.recycle_output(output);
+        assert!(engine.compiled.contains_key(&0));
+
+        engine.upload_instruction(0x1234_5678);
+        assert!(engine.compiled.is_empty());
+        let output = invoke_entry_11(&mut engine);
+        engine.recycle_output(output);
+        assert!(engine.compiled.contains_key(&0));
+
+        engine.set_start_address_ptr(11);
+        engine.bind_macro_entry(0);
+        assert!(engine.compiled.is_empty());
+        let output = invoke_entry_11(&mut engine);
+        engine.recycle_output(output);
+        assert!(engine.compiled.contains_key(&0));
+
+        engine.set_instruction_ptr(0);
+        assert!(engine.compiled.is_empty());
+    }
+
+    #[test]
+    fn fast_lle_resolves_overlapping_uploads_by_latest_write() {
+        let mut engine = MacroEngine::new_with_options(true, false);
+        engine.set_instruction_ptr(0);
+        for word in [0xA0, 0xB0, 0xC0, 0xD0] {
+            engine.upload_instruction(word);
+        }
+        engine.set_instruction_ptr(2);
+        for word in [0xC1, 0xD1] {
+            engine.upload_instruction(word);
+        }
+
+        engine.resolve_code(1);
+        assert_eq!(engine.compiled.get(&1).unwrap().code, [0xB0, 0xC1, 0xD1]);
+        engine.resolve_code(3);
+        assert_eq!(engine.compiled.get(&3).unwrap().code, [0xD1]);
+    }
+
+    #[test]
+    fn fast_lle_write_scratch_is_reused_after_replay() {
+        let code = [
+            set_method(0x700),
+            send_immediate(0x1234),
+            0x0000_0090,
+            0x0000_0010,
+        ];
+        let mut engine = MacroEngine::new_with_options(true, false);
+        upload_entry_11(&mut engine, &code);
+
+        let first = invoke_entry_11(&mut engine);
+        let first_ptr = first.writes.as_ptr();
+        assert!(first.fast_lle);
+        assert_eq!(first.writes, vec![(0x700, 0x1234)]);
+        engine.recycle_output(first);
+        assert_eq!(engine.lle_write_scratch.as_ptr(), first_ptr);
+
+        let second = invoke_entry_11(&mut engine);
+        assert_eq!(second.writes.as_ptr(), first_ptr);
+        assert_eq!(second.writes, vec![(0x700, 0x1234)]);
+        engine.recycle_output(second);
     }
 
     fn assert_draw_instanced_with_vb_mask_hle_matches_interpreter(
@@ -1123,9 +1907,14 @@ mod tests {
 
             let mut interpreter = Interpreter::new(code, params, &reg_reader);
             interpreter.run();
+            let decoded = decoded(code);
+            let mut fast = FastInterpreter::new(&decoded, params, &reg_reader, Vec::new());
+            fast.run();
             let hle = hle_macro(kind, params, &reg_reader)
                 .expect("bounded randomized draws must use the HLE path");
 
+            assert_eq!(fast.writes, interpreter.writes);
+            assert_eq!(fast.steps_remaining, interpreter.steps_remaining);
             assert_eq!(
                 hle.writes, interpreter.writes,
                 "write mismatch for hash {hash:#018x}, case {case}, params={params:08x?}, mask={vertex_buffer_mask:#010x}, topology={draw_topology:#010x}"

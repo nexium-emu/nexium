@@ -75,6 +75,16 @@ pub struct ExactRtCopyProvenance {
     pub block_size: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExactIdentityBlitPreview {
+    pub(crate) source: RtKey,
+    pub(crate) destination: RtKey,
+    pub(crate) expected_bpp: usize,
+    pub(crate) destination_va: u64,
+    pub(crate) destination_size: u64,
+    pub(crate) block_size: u32,
+}
+
 #[derive(Default, Clone, Copy)]
 struct Surface {
     format: u32,
@@ -212,6 +222,137 @@ impl Fermi2D {
 impl Fermi2D {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn exact_identity_blit_metadata(&self, terminal_arg: u32) -> Option<(usize, u64)> {
+        if !matches!(self.operation & 0x7, 0 | 3 | 5) {
+            return None;
+        }
+        let src_format = self.src.format_info()?;
+        let dst_format = self.dst.format_info()?;
+        let width = self.dst_width_blit.unsigned_abs() as usize;
+        let height = self.dst_height_blit.unsigned_abs() as usize;
+        if width == 0 || height == 0 || self.dst.width == 0 || self.dst.height == 0 {
+            return None;
+        }
+        let dst_x_step = if self.dst_width_blit < 0 { -1i64 } else { 1 };
+        let dst_y_step = if self.dst_height_blit < 0 { -1i64 } else { 1 };
+        let src_x0 = fixed_32_32(self.src_x0_low, self.src_x0_high);
+        let src_y0 = fixed_32_32(self.src_y0_low, terminal_arg);
+        let du_dx = fixed_or_one(self.du_dx_low, self.du_dx_high);
+        let dv_dy = fixed_or_one(self.dv_dy_low, self.dv_dy_high);
+        let src_bpp = src_format.bytes_per_pixel();
+        let dst_bpp = dst_format.bytes_per_pixel();
+        if !exact_rt_identity_copy_compatible(
+            &self.src,
+            &self.dst,
+            self.dst_x0,
+            self.dst_y0,
+            width,
+            height,
+            dst_x_step,
+            dst_y_step,
+            src_x0,
+            src_y0,
+            du_dx,
+            dv_dy,
+            src_bpp,
+            dst_bpp,
+        ) {
+            return None;
+        }
+        let destination_size = u64::try_from(self.dst.storage_size()).ok()?;
+        (destination_size != 0).then_some((dst_bpp, destination_size))
+    }
+
+    pub(crate) fn preview_exact_identity_blit(
+        &self,
+        terminal_arg: u32,
+        mappings: &GpuMappings,
+    ) -> Option<ExactIdentityBlitPreview> {
+        let (expected_bpp, destination_size) = self.exact_identity_blit_metadata(terminal_arg)?;
+        let source = self.src.rt_key(mappings)?;
+        let destination = self.dst.rt_key(mappings)?;
+        if source.guest_size_bytes != destination_size
+            || destination.guest_size_bytes != destination_size
+            || source.gpu_va == destination.gpu_va
+        {
+            return None;
+        }
+        let source_end = source.cpu_addr.checked_add(source.guest_size_bytes)?;
+        let destination_end = destination.cpu_addr.checked_add(destination_size)?;
+        if source.cpu_addr < destination_end && destination.cpu_addr < source_end {
+            return None;
+        }
+        Some(ExactIdentityBlitPreview {
+            source,
+            destination,
+            expected_bpp,
+            destination_va: destination.gpu_va,
+            destination_size,
+            block_size: self.dst.block_size,
+        })
+    }
+
+    pub(crate) fn commit_ordered_exact_blit(
+        &mut self,
+        terminal_arg: u32,
+        preview: &ExactIdentityBlitPreview,
+    ) -> bool {
+        let Some((expected_bpp, destination_size)) =
+            self.exact_identity_blit_metadata(terminal_arg)
+        else {
+            return false;
+        };
+        let Some(source_end) = preview
+            .source
+            .cpu_addr
+            .checked_add(preview.source.guest_size_bytes)
+        else {
+            return false;
+        };
+        let Some(destination_end) = preview
+            .destination
+            .cpu_addr
+            .checked_add(preview.destination_size)
+        else {
+            return false;
+        };
+        if expected_bpp != preview.expected_bpp
+            || destination_size != preview.destination_size
+            || preview.source.guest_size_bytes != destination_size
+            || preview.destination.guest_size_bytes != destination_size
+            || preview.source.gpu_va != self.src.gpu_va()
+            || preview.destination.gpu_va != self.dst.gpu_va()
+            || preview.destination_va != self.dst.gpu_va()
+            || preview.source.width != self.src.width
+            || preview.source.height != self.src.height
+            || preview.destination.width != self.dst.width
+            || preview.destination.height != self.dst.height
+            || preview.source.depth != 1
+            || preview.destination.depth != 1
+            || preview.source.is_3d
+            || preview.destination.is_3d
+            || preview.source.base_layer != self.src._layer
+            || preview.destination.base_layer != self.dst._layer
+            || preview.source.layout_signature != preview.destination.layout_signature
+            || preview.block_size != self.dst.block_size
+            || preview.source.gpu_va == preview.destination.gpu_va
+            || (preview.source.cpu_addr < destination_end
+                && preview.destination.cpu_addr < source_end)
+        {
+            return false;
+        }
+        let Ok(destination_size) = usize::try_from(preview.destination_size) else {
+            return false;
+        };
+        self.src_y0_high = terminal_arg;
+        self.guest_write_range = None;
+        self.logical_guest_write_span = None;
+        self.blit_count = self.blit_count.wrapping_add(1);
+        self.record_logical_guest_write(preview.destination_va, destination_size);
+        nexium_gpu::tex_invalidate::bump_region(preview.destination_va, preview.destination_size);
+        true
     }
 
     pub fn take_guest_write_range(&mut self) -> Option<(u64, u64)> {
@@ -1528,6 +1669,129 @@ mod tests {
         assert_eq!(key.layout_signature, 0x40001);
         assert_eq!(key.guest_size_bytes, 0x40000);
         assert!(!RtKey::new(588, 256, 256, GPU).same_alias_view_identity(sampled));
+    }
+
+    fn exact_identity_fermi(src_gpu: u64, dst_gpu: u64) -> Fermi2D {
+        let surface = |gpu_va: u64| Surface {
+            format: FMT_A8B8G8R8_UNORM,
+            memory_layout: MEMORY_LAYOUT_BLOCK_LINEAR,
+            block_size: 2 << 4,
+            depth: 1,
+            width: 64,
+            height: 32,
+            offset_high: (gpu_va >> 32) as u32,
+            offset_low: gpu_va as u32,
+            ..Surface::default()
+        };
+        Fermi2D {
+            src: surface(src_gpu),
+            dst: surface(dst_gpu),
+            dst_width_blit: 64,
+            dst_height_blit: 32,
+            du_dx_high: 1,
+            dv_dy_high: 1,
+            src_x0_low: 1 << 31,
+            src_y0_low: 1 << 31,
+            src_y0_high: 7,
+            ..Fermi2D::default()
+        }
+    }
+
+    #[test]
+    fn exact_identity_preview_uses_terminal_arg_and_mapped_backing() {
+        const SRC_GPU: u64 = 0x7f20_1000_0000;
+        const DST_GPU: u64 = 0x7f20_2000_0000;
+        const SRC_CPU: u64 = 0x5f20_1000_0000;
+        const DST_CPU: u64 = 0x5f20_2000_0000;
+        let mut mappings = GpuMappings::new();
+        mappings.add(SRC_GPU, 0x10_000, SRC_CPU, 71);
+        mappings.add(DST_GPU, 0x10_000, DST_CPU, 72);
+        let fermi = exact_identity_fermi(SRC_GPU, DST_GPU);
+
+        assert!(fermi.preview_exact_identity_blit(1, &mappings).is_none());
+        let preview = fermi.preview_exact_identity_blit(0, &mappings).unwrap();
+
+        assert_eq!(fermi.src_y0_high, 7);
+        assert_eq!(preview.source.gpu_va, SRC_GPU);
+        assert_eq!(preview.destination.gpu_va, DST_GPU);
+        assert_eq!(preview.source.cpu_addr, SRC_CPU);
+        assert_eq!(preview.destination.cpu_addr, DST_CPU);
+        assert_eq!(preview.expected_bpp, 4);
+        assert_eq!(preview.destination_va, DST_GPU);
+        assert_eq!(preview.destination_size, 0x2000);
+        assert_eq!(preview.block_size, 2 << 4);
+    }
+
+    #[test]
+    fn exact_identity_preview_rejects_partial_or_overlapping_backing() {
+        const SRC_GPU: u64 = 0x7f21_1000_0000;
+        const DST_GPU: u64 = 0x7f21_2000_0000;
+        const CPU: u64 = 0x5f21_1000_0000;
+        let fermi = exact_identity_fermi(SRC_GPU, DST_GPU);
+        let mut partial = GpuMappings::new();
+        partial.add(SRC_GPU, 0x10_000, CPU, 73);
+        partial.add(DST_GPU, 0x1fff, CPU + 0x20_000, 74);
+        assert!(fermi.preview_exact_identity_blit(0, &partial).is_none());
+
+        let mut overlapping = GpuMappings::new();
+        overlapping.add(SRC_GPU, 0x10_000, CPU, 73);
+        overlapping.add(DST_GPU, 0x10_000, CPU + 0x1000, 74);
+        assert!(fermi.preview_exact_identity_blit(0, &overlapping).is_none());
+    }
+
+    #[test]
+    fn ordered_exact_blit_commit_updates_only_logical_outcome() {
+        const SRC_GPU: u64 = 0x7f22_1000_0000;
+        const DST_GPU: u64 = 0x7f22_2000_0000;
+        const SRC_CPU: u64 = 0x5f22_1000_0000;
+        const DST_CPU: u64 = 0x5f22_2000_0000;
+        let mut mappings = GpuMappings::new();
+        mappings.add(SRC_GPU, 0x10_000, SRC_CPU, 75);
+        mappings.add(DST_GPU, 0x10_000, DST_CPU, 76);
+        let mut fermi = exact_identity_fermi(SRC_GPU, DST_GPU);
+        let preview = fermi.preview_exact_identity_blit(0, &mappings).unwrap();
+        fermi.record_guest_write(0x1234, 8);
+        fermi.record_logical_guest_write(0x5678, 16);
+        let generation = nexium_gpu::tex_invalidate::region_gen_range(
+            preview.destination_va,
+            preview.destination_size,
+        );
+
+        assert!(fermi.commit_ordered_exact_blit(0, &preview));
+
+        assert_eq!(fermi.src_y0_high, 0);
+        assert_eq!(fermi.blit_count, 1);
+        assert_eq!(fermi.take_guest_write_range(), None);
+        assert_eq!(
+            fermi.take_logical_guest_write_span(),
+            Some((DST_GPU, 0x2000))
+        );
+        assert!(fermi.exact_rt_copies.is_empty());
+        assert_ne!(
+            nexium_gpu::tex_invalidate::region_gen_range(
+                preview.destination_va,
+                preview.destination_size,
+            ),
+            generation
+        );
+    }
+
+    #[test]
+    fn ordered_exact_blit_commit_rejects_changed_preview() {
+        const SRC_GPU: u64 = 0x7f23_1000_0000;
+        const DST_GPU: u64 = 0x7f23_2000_0000;
+        let mut mappings = GpuMappings::new();
+        mappings.add(SRC_GPU, 0x10_000, 0x5f23_1000_0000, 77);
+        mappings.add(DST_GPU, 0x10_000, 0x5f23_2000_0000, 78);
+        let mut fermi = exact_identity_fermi(SRC_GPU, DST_GPU);
+        let mut preview = fermi.preview_exact_identity_blit(0, &mappings).unwrap();
+        preview.destination_size -= 1;
+
+        assert!(!fermi.commit_ordered_exact_blit(0, &preview));
+        assert_eq!(fermi.src_y0_high, 7);
+        assert_eq!(fermi.blit_count, 0);
+        assert_eq!(fermi.take_guest_write_range(), None);
+        assert_eq!(fermi.take_logical_guest_write_span(), None);
     }
 
     #[test]

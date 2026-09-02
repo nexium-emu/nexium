@@ -5,6 +5,16 @@ pub const MAXWELL3D_CLASS: u32 = 0xB197;
 pub const GRAPHICS_CBUF_SLOTS: usize = nexium_spirv::GFX_CBUF_STAGE_SLOTS as usize;
 pub type GraphicsCbufBinds = [[(u64, u32); GRAPHICS_CBUF_SLOTS]; 5];
 
+fn replay_macro_writes(
+    output: super::macro_engine::MacroOutput,
+    mut writer: impl FnMut(u32, u32),
+) -> super::macro_engine::MacroOutput {
+    for &(method, argument) in &output.writes {
+        writer(method, argument);
+    }
+    output
+}
+
 #[derive(Clone, Copy)]
 pub struct GsDebugRegs {
     pub post_vtg_masks: [u32; 8],
@@ -617,6 +627,82 @@ impl Maxwell3DRegisters {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DrawStateDirty(u8);
+
+impl DrawStateDirty {
+    pub const NONE: Self = Self(0);
+    pub const RENDER_TARGETS: Self = Self(1 << 0);
+    pub const SHADERS: Self = Self(1 << 1);
+    pub const TEXTURES: Self = Self(1 << 2);
+    pub const VERTEX_INPUT: Self = Self(1 << 3);
+    pub const FIXED_FUNCTION: Self = Self(1 << 4);
+    pub const RESOURCE_BINDINGS: Self = Self(1 << 5);
+    pub const ALL: Self = Self((1 << 6) - 1);
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DrawStateIdentities {
+    pub render_targets: u64,
+    pub shaders: u64,
+    pub textures: u64,
+    pub vertex_input: u64,
+    pub fixed_function: u64,
+    pub resource_bindings: u64,
+}
+
+impl DrawStateIdentities {
+    const INITIAL: Self = Self {
+        render_targets: 1,
+        shaders: 1,
+        textures: 1,
+        vertex_input: 1,
+        fixed_function: 1,
+        resource_bindings: 1,
+    };
+
+    fn bump(&mut self, dirty: DrawStateDirty) {
+        fn next(value: u64) -> u64 {
+            value.wrapping_add(1).max(1)
+        }
+
+        if dirty.contains(DrawStateDirty::RENDER_TARGETS) {
+            self.render_targets = next(self.render_targets);
+        }
+        if dirty.contains(DrawStateDirty::SHADERS) {
+            self.shaders = next(self.shaders);
+        }
+        if dirty.contains(DrawStateDirty::TEXTURES) {
+            self.textures = next(self.textures);
+        }
+        if dirty.contains(DrawStateDirty::VERTEX_INPUT) {
+            self.vertex_input = next(self.vertex_input);
+        }
+        if dirty.contains(DrawStateDirty::FIXED_FUNCTION) {
+            self.fixed_function = next(self.fixed_function);
+        }
+        if dirty.contains(DrawStateDirty::RESOURCE_BINDINGS) {
+            self.resource_bindings = next(self.resource_bindings);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DrawCall {
     pub topology: u32,
@@ -702,6 +788,8 @@ pub struct DrawCall {
     pub clear_stencil: u32,
     pub clear_mask: u32,
     pub state_clean_from_previous: bool,
+    pub state_dirty_categories: DrawStateDirty,
+    pub state_identities: DrawStateIdentities,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -751,6 +839,8 @@ pub struct Maxwell3D {
     legacy_draw_vertex_pending: bool,
     legacy_draw_index_pending: bool,
     draw_state_dirty_since_last_draw: bool,
+    draw_state_dirty_categories: DrawStateDirty,
+    draw_state_identities: DrawStateIdentities,
     last_draw_allows_continuation: bool,
 }
 
@@ -759,6 +849,88 @@ const REG_LOAD_MME_INSTRUCTION: u32 = 0x46;
 const REG_LOAD_MME_START_ADDRESS_PTR: u32 = 0x47;
 const REG_LOAD_MME_START_ADDRESS: u32 = 0x48;
 const MAXWELL3D_REGISTER_COUNT: usize = 0xE00;
+
+const fn fill_draw_state_categories(
+    table: &mut [u8; MAXWELL3D_REGISTER_COUNT],
+    start: usize,
+    end: usize,
+    categories: DrawStateDirty,
+) {
+    let mut index = start;
+    while index <= end {
+        table[index] |= categories.bits();
+        index += 1;
+    }
+}
+
+const fn build_draw_state_category_table() -> [u8; MAXWELL3D_REGISTER_COUNT] {
+    let mut table = [0; MAXWELL3D_REGISTER_COUNT];
+    let rt_fixed = DrawStateDirty::RENDER_TARGETS.union(DrawStateDirty::FIXED_FUNCTION);
+    let texture_resource = DrawStateDirty::TEXTURES.union(DrawStateDirty::RESOURCE_BINDINGS);
+    let vertex_resource = DrawStateDirty::VERTEX_INPUT.union(DrawStateDirty::RESOURCE_BINDINGS);
+
+    fill_draw_state_categories(&mut table, 0x200, 0x27F, DrawStateDirty::RENDER_TARGETS);
+    table[0x487] |= DrawStateDirty::RENDER_TARGETS.bits();
+    fill_draw_state_categories(&mut table, 0x3F8, 0x3FE, rt_fixed);
+    table[0x48A] |= rt_fixed.bits();
+    table[0x48B] |= rt_fixed.bits();
+    table[0x54E] |= rt_fixed.bits();
+    table[0x574] |= rt_fixed.bits();
+
+    table[0x582] |= DrawStateDirty::SHADERS.bits();
+    table[0x583] |= DrawStateDirty::SHADERS.bits();
+    fill_draw_state_categories(&mut table, 0x800, 0x85F, DrawStateDirty::SHADERS);
+
+    fill_draw_state_categories(&mut table, 0x420, 0x42B, texture_resource);
+    table[0x48D] |= texture_resource.bits();
+    fill_draw_state_categories(&mut table, 0x557, 0x559, texture_resource);
+    fill_draw_state_categories(&mut table, 0x55D, 0x55F, texture_resource);
+    table[0x982] |= texture_resource.bits();
+
+    fill_draw_state_categories(&mut table, 0x458, 0x477, DrawStateDirty::VERTEX_INPUT);
+    fill_draw_state_categories(&mut table, 0x620, 0x63F, DrawStateDirty::VERTEX_INPUT);
+    fill_draw_state_categories(&mut table, 0x591, 0x592, vertex_resource);
+    fill_draw_state_categories(&mut table, 0x5F2, 0x5F6, vertex_resource);
+    fill_draw_state_categories(&mut table, 0x700, 0x77F, vertex_resource);
+    fill_draw_state_categories(&mut table, 0x7C0, 0x7FF, vertex_resource);
+
+    fill_draw_state_categories(&mut table, 0x280, 0x286, DrawStateDirty::FIXED_FUNCTION);
+    table[0x35F] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    fill_draw_state_categories(&mut table, 0x360, 0x364, DrawStateDirty::FIXED_FUNCTION);
+    table[0x368] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    table[0x372] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    fill_draw_state_categories(&mut table, 0x380, 0x382, DrawStateDirty::FIXED_FUNCTION);
+    fill_draw_state_categories(&mut table, 0x3D5, 0x3D7, DrawStateDirty::FIXED_FUNCTION);
+    table[0x3E4] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    table[0x43E] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    table[0x4B3] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    fill_draw_state_categories(&mut table, 0x4B9, 0x4BB, DrawStateDirty::FIXED_FUNCTION);
+    fill_draw_state_categories(&mut table, 0x4C3, 0x4C5, DrawStateDirty::FIXED_FUNCTION);
+    fill_draw_state_categories(&mut table, 0x4C7, 0x4CA, DrawStateDirty::FIXED_FUNCTION);
+    fill_draw_state_categories(&mut table, 0x4D0, 0x4D4, DrawStateDirty::FIXED_FUNCTION);
+    table[0x4D6] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    fill_draw_state_categories(&mut table, 0x4D8, 0x4DF, DrawStateDirty::FIXED_FUNCTION);
+    fill_draw_state_categories(&mut table, 0x4E0, 0x4E7, DrawStateDirty::FIXED_FUNCTION);
+    table[0x4EB] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    table[0x546] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    table[0x55B] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    fill_draw_state_categories(&mut table, 0x565, 0x569, DrawStateDirty::FIXED_FUNCTION);
+    table[0x56F] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    fill_draw_state_categories(&mut table, 0x646, 0x648, DrawStateDirty::FIXED_FUNCTION);
+    table[0x64B] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    table[0x64F] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    table[0x652] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    table[0x65C] |= DrawStateDirty::FIXED_FUNCTION.bits();
+    fill_draw_state_categories(&mut table, 0x680, 0x687, DrawStateDirty::FIXED_FUNCTION);
+    fill_draw_state_categories(&mut table, 0x780, 0x7BF, DrawStateDirty::FIXED_FUNCTION);
+
+    fill_draw_state_categories(&mut table, 0x554, 0x556, DrawStateDirty::RESOURCE_BINDINGS);
+    table[0x651] |= DrawStateDirty::RESOURCE_BINDINGS.bits();
+    fill_draw_state_categories(&mut table, 0x8E0, 0x8E3, DrawStateDirty::RESOURCE_BINDINGS);
+    table
+}
+
+const DRAW_STATE_CATEGORY_TABLE: [u8; MAXWELL3D_REGISTER_COUNT] = build_draw_state_category_table();
 
 fn mme_forensics() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -880,15 +1052,38 @@ impl Maxwell3D {
             legacy_draw_vertex_pending: false,
             legacy_draw_index_pending: false,
             draw_state_dirty_since_last_draw: true,
+            draw_state_dirty_categories: DrawStateDirty::ALL,
+            draw_state_identities: DrawStateIdentities::INITIAL,
             last_draw_allows_continuation: false,
         }
     }
 
+    fn draw_state_categories(method: u32) -> DrawStateDirty {
+        let index = method as usize;
+        if index < DRAW_STATE_CATEGORY_TABLE.len() {
+            DrawStateDirty(DRAW_STATE_CATEGORY_TABLE[index])
+        } else {
+            DrawStateDirty::NONE
+        }
+    }
+
+    fn mark_draw_state_categories(&mut self, dirty: DrawStateDirty) {
+        if dirty.is_empty() {
+            return;
+        }
+        self.draw_state_dirty_categories = self.draw_state_dirty_categories.union(dirty);
+        self.draw_state_identities.bump(dirty);
+    }
+
     pub fn record_method(&mut self, method: u32) {
+        self.record_methods(method, 1);
+    }
+
+    pub fn record_methods(&mut self, method: u32, count: u64) {
         if !self.method_profile_enabled {
             return;
         }
-        *self.method_freq.entry(method).or_insert(0) += 1;
+        *self.method_freq.entry(method).or_insert(0) += count;
     }
 
     pub(crate) fn take_pending_syncpt_incrs(&mut self) -> Vec<u32> {
@@ -951,43 +1146,7 @@ impl Maxwell3D {
 
     pub fn dispatch_method(&mut self, method: u32, arg: u32, is_last: bool) {
         if method >= super::MACRO_REGISTERS_START {
-            if mme_trace() && self.macro_invocations < 1024 {
-                log::info!(
-                    "maxwell3d: MME invoke method={:#x} arg={:#x} is_last={} (slot offset {:#x})",
-                    method,
-                    arg,
-                    is_last,
-                    method - super::MACRO_REGISTERS_START
-                );
-                self.macro_invocations += 1;
-            }
-            let reg_file_ptr = &self.reg_file as *const Vec<u32>;
-            let writes =
-                self.macro_engine
-                    .on_macro_method(method, arg, is_last, &|idx: u32| unsafe {
-                        let rf = &*reg_file_ptr;
-                        rf.get(idx as usize).copied().unwrap_or(0)
-                    });
-            if let Some(out) = writes {
-                if mme_trace() && self.macro_writes_logged < 512 {
-                    log::info!(
-                        "maxwell3d: MME produced {} writes inst={:?}: {:?}",
-                        out.writes.len(),
-                        out.draw_instance_count,
-                        out.writes.iter().take(8).copied().collect::<Vec<_>>()
-                    );
-                    self.macro_writes_logged += 1;
-                }
-                self.macro_draw_instance_count = out.draw_instance_count;
-                self.mme_active = true;
-                self.mme_hash = out.hash;
-                self.mme_entry = out.entry;
-                for (m, a) in out.writes {
-                    self.write_register(m, a);
-                }
-                self.mme_active = false;
-                self.macro_draw_instance_count = None;
-            }
+            self.dispatch_macro_methods(method, std::slice::from_ref(&arg), is_last);
             return;
         }
 
@@ -1030,7 +1189,142 @@ impl Maxwell3D {
         self.write_register(method, arg);
     }
 
+    pub fn dispatch_macro_methods(&mut self, method: u32, args: &[u32], is_last: bool) {
+        debug_assert!(method >= super::MACRO_REGISTERS_START);
+        debug_assert!(!args.is_empty());
+        if mme_trace() {
+            for (index, &arg) in args.iter().enumerate() {
+                if self.macro_invocations >= 1024 {
+                    break;
+                }
+                log::info!(
+                    "maxwell3d: MME invoke method={:#x} arg={:#x} is_last={} (slot offset {:#x})",
+                    method,
+                    arg,
+                    is_last && index + 1 == args.len(),
+                    method - super::MACRO_REGISTERS_START
+                );
+                self.macro_invocations += 1;
+            }
+        }
+        let reg_file_ptr = &self.reg_file as *const Vec<u32>;
+        let writes =
+            self.macro_engine
+                .on_macro_methods(method, args, is_last, &|idx: u32| unsafe {
+                    let rf = &*reg_file_ptr;
+                    rf.get(idx as usize).copied().unwrap_or(0)
+                });
+        if let Some(out) = writes {
+            if mme_trace() && self.macro_writes_logged < 512 {
+                log::info!(
+                    "maxwell3d: MME produced {} writes inst={:?}: {:?}",
+                    out.writes.len(),
+                    out.draw_instance_count,
+                    out.writes.iter().take(8).copied().collect::<Vec<_>>()
+                );
+                self.macro_writes_logged += 1;
+            }
+            self.macro_draw_instance_count = out.draw_instance_count;
+            self.mme_active = true;
+            self.mme_hash = out.hash;
+            self.mme_entry = out.entry;
+            let out = replay_macro_writes(out, |m, a| self.write_register(m, a));
+            self.mme_active = false;
+            self.macro_draw_instance_count = None;
+            self.macro_engine.recycle_output(out);
+        }
+    }
+
     pub fn write_register(&mut self, method: u32, arg: u32) {
+        let Some((arg, register_changed)) = self.prepare_register_write(method, arg) else {
+            return;
+        };
+
+        if !register_changed && Self::repeat_is_idempotent(method) {
+            return;
+        }
+
+        if (0x60..=0x6D).contains(&method) {
+            self.pending_inline_upload_methods.push((method, arg));
+        }
+
+        if mme_forensics() {
+            let hi_reg = method == 0x582
+                || method == 0x6c0
+                || method == 0x8e1
+                || method == 0x1c
+                || method == 0x554
+                || (method >= 0x200 && method < 0x280 && (method & 0xF) == 0);
+            let floaty = matches!(method, 0x582 | 0x583 | 0x6c0 | 0x6c1 | 0x6c2)
+                && matches!(arg >> 24, 0x3E..=0x48);
+            if (hi_reg && arg > 0xFF) || floaty {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 96 {
+                    log::warn!(
+                        "[reg-garbage] method={:#x} arg={:#010x} mme={} hash={:#018x} entry={}",
+                        method,
+                        arg,
+                        self.mme_active,
+                        self.mme_hash,
+                        self.mme_entry
+                    );
+                }
+            }
+        }
+
+        self.apply_register_value(method, arg);
+    }
+
+    pub(crate) fn write_passive_register_run(
+        &mut self,
+        method: u32,
+        args: &[u32],
+        non_incrementing: bool,
+    ) -> usize {
+        debug_assert!(!args.is_empty());
+        if non_incrementing {
+            let mut previous = None;
+            let mut collapsed = 0usize;
+            let can_collapse = !wf_state_log() && !mme_forensics();
+            for &arg in args {
+                if can_collapse
+                    && (method >= 0x80 && self.shadow_ram_control == 3 && previous.is_some()
+                        || previous.is_some_and(|previous| previous == arg))
+                {
+                    collapsed += 1;
+                    continue;
+                }
+                self.write_passive_register(method, arg);
+                previous = Some(arg);
+            }
+            self.record_methods(method, args.len() as u64);
+            collapsed
+        } else {
+            for (offset, &arg) in args.iter().enumerate() {
+                let method = method.wrapping_add(offset as u32);
+                self.write_passive_register(method, arg);
+            }
+            if self.method_profile_enabled {
+                for offset in 0..args.len() {
+                    let method = method.wrapping_add(offset as u32);
+                    *self.method_freq.entry(method).or_insert(0) += 1;
+                }
+            }
+            0
+        }
+    }
+
+    fn write_passive_register(&mut self, method: u32, arg: u32) {
+        let Some((arg, register_changed)) = self.prepare_register_write(method, arg) else {
+            return;
+        };
+        if register_changed {
+            self.apply_register_value(method, arg);
+        }
+    }
+
+    fn prepare_register_write(&mut self, method: u32, arg: u32) -> Option<(u32, bool)> {
         let incoming_arg = arg;
         let arg = if method == 0x49 {
             self.shadow_ram_control = arg & 0x3;
@@ -1058,6 +1352,7 @@ impl Maxwell3D {
         };
 
         let m = method as usize;
+        let state_value_changed = m >= self.reg_file.len() || self.reg_file[m] != arg;
         let register_changed =
             m >= self.reg_file.len() || self.reg_file_written[m] == 0 || self.reg_file[m] != arg;
         if (register_changed
@@ -1114,7 +1409,11 @@ impl Maxwell3D {
                     );
                 }
             }
-            return;
+            return None;
+        }
+
+        if state_value_changed {
+            self.mark_draw_state_categories(Self::draw_state_categories(method));
         }
 
         if (method as usize) < self.reg_file.len() {
@@ -1122,39 +1421,10 @@ impl Maxwell3D {
             self.reg_file_written[method as usize] = 1;
         }
 
-        if !register_changed && Self::repeat_is_idempotent(method) {
-            return;
-        }
+        Some((arg, register_changed))
+    }
 
-        if (0x60..=0x6D).contains(&method) {
-            self.pending_inline_upload_methods.push((method, arg));
-        }
-
-        if mme_forensics() {
-            let hi_reg = method == 0x582
-                || method == 0x6c0
-                || method == 0x8e1
-                || method == 0x1c
-                || method == 0x554
-                || (method >= 0x200 && method < 0x280 && (method & 0xF) == 0);
-            let floaty = matches!(method, 0x582 | 0x583 | 0x6c0 | 0x6c1 | 0x6c2)
-                && matches!(arg >> 24, 0x3E..=0x48);
-            if (hi_reg && arg > 0xFF) || floaty {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static N: AtomicU32 = AtomicU32::new(0);
-                if N.fetch_add(1, Ordering::Relaxed) < 96 {
-                    log::warn!(
-                        "[reg-garbage] method={:#x} arg={:#010x} mme={} hash={:#018x} entry={}",
-                        method,
-                        arg,
-                        self.mme_active,
-                        self.mme_hash,
-                        self.mme_entry
-                    );
-                }
-            }
-        }
-
+    fn apply_register_value(&mut self, method: u32, arg: u32) {
         if method >= 0x200 && method < 0x280 {
             let rt_index = ((method - 0x200) / 0x10) as usize;
             let field = (method - 0x200) % 0x10;
@@ -1211,6 +1481,7 @@ impl Maxwell3D {
                     .regs
                     .pending_texture_cache_invalidates
                     .saturating_add(1);
+                self.mark_draw_state_categories(DrawStateDirty::TEXTURES);
                 trace_sync_method(method, arg, self.regs.pending_barrier_flushes);
             }
             0x545 => self.regs.zpass_pixel_count_enable = (arg & 1) != 0,
@@ -1337,6 +1608,8 @@ impl Maxwell3D {
                 );
                 self.pending_draws.push(DrawCall {
                     state_clean_from_previous: false,
+                    state_dirty_categories: DrawStateDirty::ALL,
+                    state_identities: self.draw_state_identities,
                     topology: 0,
                     first_vertex: 0,
                     vertex_count: 0,
@@ -1722,6 +1995,9 @@ impl Maxwell3D {
                     self.regs.pending_constbuf_writes.push((target, arg));
                 }
                 self.regs.constbuf_load_offset = self.regs.constbuf_load_offset.wrapping_add(4);
+                self.mark_draw_state_categories(
+                    DrawStateDirty::TEXTURES.union(DrawStateDirty::RESOURCE_BINDINGS),
+                );
             }
 
             0x904 | 0x90C | 0x914 | 0x91C | 0x924 => {
@@ -1731,6 +2007,12 @@ impl Maxwell3D {
                 let cb_addr = ((self.regs.constbuf_selector_addr_hi as u64) << 32)
                     | self.regs.constbuf_selector_addr_lo as u64;
                 let cb_size = self.regs.constbuf_selector_size;
+                if crate::gpu::pusher::kickprof::census_enabled() {
+                    crate::gpu::pusher::kickprof::count(
+                        crate::gpu::pusher::kickprof::CENSUS_CBBIND,
+                        1,
+                    );
+                }
                 if cbuf_bind_trace() {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static N: AtomicU64 = AtomicU64::new(0);
@@ -1756,8 +2038,11 @@ impl Maxwell3D {
                     }
                 }
                 if stage < 5 && slot < GRAPHICS_CBUF_SLOTS {
-                    self.regs.cbuf_binds[stage][slot] =
-                        if valid { (cb_addr, cb_size) } else { (0, 0) };
+                    let binding = if valid { (cb_addr, cb_size) } else { (0, 0) };
+                    self.regs.cbuf_binds[stage][slot] = binding;
+                    self.mark_draw_state_categories(
+                        DrawStateDirty::TEXTURES.union(DrawStateDirty::RESOURCE_BINDINGS),
+                    );
                 }
             }
             0x48D => self.regs.sampler_binding = arg,
@@ -2030,11 +2315,14 @@ impl Maxwell3D {
 
         let is_first_or_subsequent = matches!(legacy_instance_id, Some(0 | 1));
         let state_clean_from_previous = !self.draw_state_dirty_since_last_draw;
+        let state_dirty_categories = self.draw_state_dirty_categories;
+        let state_identities = self.draw_state_identities;
         let can_coalesce = legacy_instance_id == Some(1)
             && self.last_draw_allows_continuation
             && state_clean_from_previous;
         self.last_draw_allows_continuation = is_first_or_subsequent;
         self.draw_state_dirty_since_last_draw = false;
+        self.draw_state_dirty_categories = DrawStateDirty::NONE;
 
         if can_coalesce {
             if let Some(previous) = self.pending_draws.last_mut() {
@@ -2087,6 +2375,8 @@ impl Maxwell3D {
             index_first: self.regs.index_first,
             inline_indices,
             state_clean_from_previous,
+            state_dirty_categories,
+            state_identities,
             primitive_restart_enabled: self.regs.primitive_restart_enabled,
             primitive_restart_index: self.regs.primitive_restart_index,
             point_size,
@@ -2233,6 +2523,8 @@ impl Maxwell3D {
         }
         self.pending_draws.push(DrawCall {
             state_clean_from_previous: false,
+            state_dirty_categories: DrawStateDirty::ALL,
+            state_identities: self.draw_state_identities,
             topology: 0,
             first_vertex: 0,
             vertex_count: 0,
@@ -2392,6 +2684,153 @@ impl Default for Maxwell3D {
 mod tests {
     use super::*;
     use crate::gpu::GpuMappings;
+
+    fn legacy_passive_run(
+        engine: &mut Maxwell3D,
+        method: u32,
+        args: &[u32],
+        non_incrementing: bool,
+    ) {
+        for (offset, &arg) in args.iter().enumerate() {
+            let method = if non_incrementing {
+                method
+            } else {
+                method.wrapping_add(offset as u32)
+            };
+            engine.write_register(method, arg);
+            engine.record_method(method);
+        }
+    }
+
+    fn assert_passive_engines_equal(legacy: &mut Maxwell3D, fast: &mut Maxwell3D) {
+        if let Some(index) = legacy
+            .reg_file
+            .iter()
+            .zip(&fast.reg_file)
+            .position(|(legacy, fast)| legacy != fast)
+        {
+            panic!(
+                "register {index:#x} differs: legacy={:#x} fast={:#x}",
+                legacy.reg_file[index], fast.reg_file[index]
+            );
+        }
+        assert_eq!(legacy.reg_file_written, fast.reg_file_written);
+        assert_eq!(legacy.shadow_ram_control, fast.shadow_ram_control);
+        assert_eq!(legacy.shadow_regs, fast.shadow_regs);
+        assert_eq!(
+            legacy.draw_state_dirty_since_last_draw,
+            fast.draw_state_dirty_since_last_draw
+        );
+        assert_eq!(
+            legacy.draw_state_dirty_categories,
+            fast.draw_state_dirty_categories
+        );
+        assert_eq!(legacy.draw_state_identities, fast.draw_state_identities);
+        assert_eq!(legacy.method_freq, fast.method_freq);
+        assert_eq!(
+            legacy.pending_inline_upload_methods,
+            fast.pending_inline_upload_methods
+        );
+        assert_eq!(legacy.pending_syncpt_incrs, fast.pending_syncpt_incrs);
+        assert_eq!(
+            legacy.regs.reset_register_image(),
+            fast.regs.reset_register_image()
+        );
+        legacy.push_draw(4, 3, 9, false, 0, 1, 0, None, Vec::new());
+        fast.push_draw(4, 3, 9, false, 0, 1, 0, None, Vec::new());
+        assert_eq!(
+            format!("{:?}", legacy.pending_draws.pop().unwrap()),
+            format!("{:?}", fast.pending_draws.pop().unwrap())
+        );
+    }
+
+    #[test]
+    fn passive_bulk_matches_deterministic_legacy_corpus() {
+        let passive: Vec<u32> = (0x40..crate::gpu::engines::MACRO_REGISTERS_START)
+            .filter(|&method| Maxwell3D::is_pusher_passive_method(method))
+            .collect();
+        let mut legacy = Maxwell3D::new();
+        let mut fast = Maxwell3D::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let next = |seed: &mut u64| {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed as u32
+        };
+
+        for round in 0..512 {
+            if round % 64 == 0 {
+                let mode = (round / 64) as u32 & 3;
+                legacy.write_register(0x49, mode);
+                fast.write_register(0x49, mode);
+            }
+            let method = passive[next(&mut seed) as usize % passive.len()];
+            let non_incrementing = next(&mut seed) & 1 != 0;
+            let max_len = if non_incrementing {
+                12
+            } else {
+                (1..12)
+                    .take_while(|offset| {
+                        Maxwell3D::is_pusher_passive_method(method.wrapping_add(*offset))
+                    })
+                    .count()
+                    .max(1)
+            };
+            let len = 1 + next(&mut seed) as usize % max_len;
+            let mut args = Vec::with_capacity(len);
+            for index in 0..len {
+                let value = if non_incrementing && index % 3 == 2 {
+                    args[index - 1]
+                } else {
+                    next(&mut seed)
+                };
+                args.push(value);
+            }
+            legacy_passive_run(&mut legacy, method, &args, non_incrementing);
+            fast.write_passive_register_run(method, &args, non_incrementing);
+        }
+
+        assert_passive_engines_equal(&mut legacy, &mut fast);
+    }
+
+    #[test]
+    fn passive_bulk_preserves_shadow_and_invalid_high_address_writes() {
+        let mut legacy = Maxwell3D::new();
+        let mut fast = Maxwell3D::new();
+        let values = [0x12, 0x12, 0x123, 0x34, 0x123, 0x56, 0x56];
+        legacy.write_register(0x49, 1);
+        fast.write_register(0x49, 1);
+        legacy_passive_run(&mut legacy, 0x582, &values, true);
+        let collapsed = fast.write_passive_register_run(0x582, &values, true);
+        assert_eq!(collapsed, 2);
+        assert_passive_engines_equal(&mut legacy, &mut fast);
+
+        let mut legacy = Maxwell3D::new();
+        let mut fast = Maxwell3D::new();
+        legacy.write_register(0x49, 1);
+        fast.write_register(0x49, 1);
+        legacy.write_register(0x582, 0x44);
+        fast.write_register(0x582, 0x44);
+        legacy.write_register(0x49, 3);
+        fast.write_register(0x49, 3);
+        legacy_passive_run(&mut legacy, 0x582, &values, true);
+        let collapsed = fast.write_passive_register_run(0x582, &values, true);
+        assert_eq!(collapsed, values.len() - 1);
+        assert_passive_engines_equal(&mut legacy, &mut fast);
+    }
+
+    #[test]
+    fn macro_writes_replay_in_order_before_output_return() {
+        let mut output = super::super::macro_engine::MacroOutput::default();
+        output.writes = vec![(3, 7), (3, 9), (4, 11)];
+        let mut replayed = Vec::new();
+        let output = replay_macro_writes(output, |method, argument| {
+            replayed.push((method, argument));
+        });
+        assert_eq!(replayed, [(3, 7), (3, 9), (4, 11)]);
+        assert_eq!(output.writes, replayed);
+    }
 
     #[test]
     fn synthetic_counter_report_does_not_require_renderer_completion() {
@@ -2561,6 +3000,116 @@ mod tests {
         assert_eq!(engine.regs.pending_barrier_flushes, 3);
         assert_eq!(engine.regs.pending_texture_cache_invalidates, 1);
         assert!(engine.draw_state_dirty_since_last_draw);
+    }
+
+    #[test]
+    fn unchanged_state_writes_do_not_advance_category_identities() {
+        let mut engine = Maxwell3D::new();
+        engine.draw_state_dirty_categories = DrawStateDirty::NONE;
+        let initial = engine.draw_state_identities;
+
+        engine.write_register(0x55D, 0);
+        assert_eq!(engine.draw_state_identities, initial);
+        assert_eq!(engine.draw_state_dirty_categories, DrawStateDirty::NONE);
+
+        engine.write_register(0x55D, 1);
+        let changed = engine.draw_state_identities;
+        assert_ne!(changed, initial);
+        engine.draw_state_dirty_categories = DrawStateDirty::NONE;
+
+        engine.write_register(0x55D, 1);
+        assert_eq!(engine.draw_state_identities, changed);
+        assert_eq!(engine.draw_state_dirty_categories, DrawStateDirty::NONE);
+    }
+
+    #[test]
+    fn repeated_effect_writes_advance_category_identities() {
+        let mut engine = Maxwell3D::new();
+        let texture_resource = DrawStateDirty::TEXTURES.union(DrawStateDirty::RESOURCE_BINDINGS);
+
+        engine.write_register(0x3DD, 1);
+        engine.draw_state_dirty_categories = DrawStateDirty::NONE;
+        let before_invalidate = engine.draw_state_identities;
+        let mut expected_invalidate = before_invalidate;
+        expected_invalidate.bump(DrawStateDirty::TEXTURES);
+        engine.write_register(0x3DD, 1);
+        assert_eq!(engine.draw_state_identities, expected_invalidate);
+        assert_eq!(engine.draw_state_dirty_categories, DrawStateDirty::TEXTURES);
+
+        engine.write_register(0x8E0, 0x100);
+        engine.write_register(0x8E1, 0);
+        engine.write_register(0x8E2, 0x1000);
+        engine.write_register(0x8E3, 0);
+        engine.write_register(0x8E4, 0xABCD_EF01);
+        engine.draw_state_dirty_categories = DrawStateDirty::NONE;
+        let before_cbuf_write = engine.draw_state_identities;
+        let mut expected_cbuf_write = before_cbuf_write;
+        expected_cbuf_write.bump(texture_resource);
+        engine.write_register(0x8E4, 0xABCD_EF01);
+        assert_eq!(engine.draw_state_identities, expected_cbuf_write);
+        assert_eq!(engine.draw_state_dirty_categories, texture_resource);
+
+        engine.write_register(0x904, 1);
+        engine.draw_state_dirty_categories = DrawStateDirty::NONE;
+        let before_bind = engine.draw_state_identities;
+        let mut expected_bind = before_bind;
+        expected_bind.bump(texture_resource);
+        engine.write_register(0x904, 1);
+        assert_eq!(engine.draw_state_identities, expected_bind);
+        assert_eq!(engine.draw_state_dirty_categories, texture_resource);
+    }
+
+    #[test]
+    fn state_writes_advance_only_their_categories() {
+        let mut engine = Maxwell3D::new();
+        let cases = [
+            (0x202, 64, DrawStateDirty::RENDER_TARGETS),
+            (0x801, 0x100, DrawStateDirty::SHADERS),
+            (0x3DD, 1, DrawStateDirty::TEXTURES),
+            (0x458, 0x1234, DrawStateDirty::VERTEX_INPUT),
+            (0x4B3, 1, DrawStateDirty::FIXED_FUNCTION),
+            (0x554, 1, DrawStateDirty::RESOURCE_BINDINGS),
+        ];
+
+        for (method, argument, category) in cases {
+            engine.draw_state_dirty_categories = DrawStateDirty::NONE;
+            let before = engine.draw_state_identities;
+            let mut expected = before;
+            expected.bump(category);
+
+            engine.write_register(method, argument);
+
+            assert_eq!(engine.draw_state_dirty_categories, category, "{method:#x}");
+            assert_eq!(engine.draw_state_identities, expected, "{method:#x}");
+        }
+    }
+
+    #[test]
+    fn draws_keep_the_category_identities_captured_at_submission() {
+        let mut engine = Maxwell3D::new();
+        engine.draw_state_dirty_categories = DrawStateDirty::NONE;
+        engine.write_register(0x801, 0x100);
+        let shader_identities = engine.draw_state_identities;
+        engine.write_register(0x35E, 3);
+
+        assert_eq!(engine.pending_draws.len(), 1);
+        assert_eq!(
+            engine.pending_draws[0].state_dirty_categories,
+            DrawStateDirty::SHADERS
+        );
+        assert_eq!(engine.pending_draws[0].state_identities, shader_identities);
+
+        engine.write_register(0x4B3, 1);
+        let fixed_identities = engine.draw_state_identities;
+        engine.write_register(0x35E, 4);
+
+        assert_eq!(engine.pending_draws.len(), 2);
+        assert_eq!(engine.pending_draws[0].state_identities, shader_identities);
+        assert_eq!(
+            engine.pending_draws[1].state_dirty_categories,
+            DrawStateDirty::FIXED_FUNCTION
+        );
+        assert_eq!(engine.pending_draws[1].state_identities, fixed_identities);
     }
 
     #[test]

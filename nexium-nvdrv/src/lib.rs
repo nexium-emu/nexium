@@ -637,6 +637,7 @@ pub struct CtrlEventWait {
 
 pub const NVRESULT_NOT_IMPLEMENTED: u32 = 1;
 
+const MAX_VSMS: usize = 128;
 const AS_GPU_SMALL_PAGE_SIZE: u32 = 0x1000;
 const AS_GPU_DEFAULT_BIG_PAGE_SIZE: u32 = 0x10000;
 
@@ -783,15 +784,36 @@ struct AsyncGpuCompletion {
 enum AsyncGpuSubmission {
     Inline {
         entries: Vec<gpu::CommandListHeader>,
-        completion: AsyncGpuCompletion,
+        completion: Option<AsyncGpuCompletion>,
     },
-    Gpfifo {
-        address: u64,
-        num_entries: u32,
-        completion: AsyncGpuCompletion,
+    Present {
+        job: crate::render_thread::RenderJob,
+        pending: Arc<std::sync::atomic::AtomicUsize>,
+        limit: usize,
     },
-    Present(crate::render_thread::RenderJob),
-    Barrier(crossbeam::channel::Sender<()>),
+    Barrier(crossbeam::channel::Sender<bool>),
+    Shutdown,
+}
+
+struct QueuedAsyncGpuSubmission {
+    submission: AsyncGpuSubmission,
+    pending: Option<AsyncGpuPendingGuard>,
+}
+
+impl QueuedAsyncGpuSubmission {
+    fn tracked(submission: AsyncGpuSubmission, pending: AsyncGpuPendingGuard) -> Self {
+        Self {
+            submission,
+            pending: Some(pending),
+        }
+    }
+
+    fn untracked(submission: AsyncGpuSubmission) -> Self {
+        Self {
+            submission,
+            pending: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -803,11 +825,14 @@ pub enum AsyncPresentSubmit {
 
 struct AsyncGpuQueue {
     gpu: Arc<GpuContext>,
-    tx: crossbeam::channel::Sender<AsyncGpuSubmission>,
+    tx: crossbeam::channel::Sender<QueuedAsyncGpuSubmission>,
     pending: Arc<std::sync::atomic::AtomicUsize>,
     capacity: usize,
     profile: Option<AsyncGpuQueueProfile>,
     defer_small_rts: bool,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 struct AsyncPresentPendingGuard {
@@ -886,10 +911,36 @@ fn reserve_ordered_present_slot_until(
 
 struct AsyncGpuPendingGuard {
     pending: Arc<std::sync::atomic::AtomicUsize>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+    completed: bool,
+}
+
+impl AsyncGpuPendingGuard {
+    fn reserve(
+        pending: Arc<std::sync::atomic::AtomicUsize>,
+        failed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (Self, usize) {
+        let inflight = pending.fetch_add(1, Ordering::Relaxed) + 1;
+        (
+            Self {
+                pending,
+                failed,
+                completed: false,
+            },
+            inflight,
+        )
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+    }
 }
 
 impl Drop for AsyncGpuPendingGuard {
     fn drop(&mut self) {
+        if !self.completed {
+            self.failed.store(true, Ordering::Release);
+        }
         self.pending
             .fetch_sub(1, std::sync::atomic::Ordering::Release);
     }
@@ -997,34 +1048,41 @@ impl AsyncGpuQueue {
     ) -> Self {
         let capacity = async_gpu_queue_depth();
         if gpu::gpu_pipeline_enabled() {
-            gpu.install_prep_thread(gpu::prep::PrepThreadResources {
-                maxwell_dma: Arc::clone(&gpu.maxwell_dma),
-                fermi_2d: Arc::clone(&gpu.fermi_2d),
-                kepler_compute: Arc::clone(&gpu.kepler_compute),
-                kepler_memory: Arc::clone(&gpu.kepler_memory),
-                mappings: Arc::clone(&gpu.mappings),
-                stats: Arc::clone(&gpu.stats),
-                mem_read: Arc::clone(&mem_read),
-                mem_write: Arc::clone(&mem_write),
-                mem_copy: Arc::clone(&mem_copy),
-            });
+            gpu.install_prep_thread(
+                gpu::prep::PrepThreadResources {
+                    maxwell_dma: Arc::clone(&gpu.maxwell_dma),
+                    fermi_2d: Arc::clone(&gpu.fermi_2d),
+                    kepler_compute: Arc::clone(&gpu.kepler_compute),
+                    kepler_memory: Arc::clone(&gpu.kepler_memory),
+                    mappings: Arc::clone(&gpu.mappings),
+                    stats: Arc::clone(&gpu.stats),
+                    mem_read: Arc::clone(&mem_read),
+                    mem_write: Arc::clone(&mem_write),
+                    mem_copy: Arc::clone(&mem_copy),
+                },
+                gpu::prep::PrepThreadBehavior::Pipeline,
+            );
         }
-        let (tx, rx) = crossbeam::channel::bounded(capacity);
+        let (tx, rx) = crossbeam::channel::bounded::<QueuedAsyncGpuSubmission>(capacity);
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pending_worker = Arc::clone(&pending);
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed_worker = Arc::clone(&failed);
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping_worker = Arc::clone(&stopping);
         let worker_gpu = Arc::clone(&gpu);
         let profile = async_gpu_queue_profile_enabled().then(AsyncGpuQueueProfile::new);
-        let defer_small_rts = matches!(
-            std::env::var("NEXIUM_ASYNC_GPU_DEFER_SMALLRT")
-                .ok()
-                .as_deref(),
-            Some("1") | Some("true") | Some("on") | Some("yes")
-        );
+        let defer_small_rts = !gpu::eager_small_rt_writeback_enabled()
+            || matches!(
+                std::env::var("NEXIUM_ASYNC_GPU_DEFER_SMALLRT")
+                    .ok()
+                    .as_deref(),
+                Some("1") | Some("true") | Some("on") | Some("yes")
+            );
         if defer_small_rts {
             log::info!("nexium-nvdrv: async GPU small-RT writeback deferred to queue barriers");
         }
         log::info!("nexium-nvdrv: async GPU queue depth={capacity}");
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("nexium-gpu-submit".to_string())
             .spawn(move || {
                 nexium_common::thread_cpu_set::apply_current_thread_cpu_set(
@@ -1041,25 +1099,44 @@ impl AsyncGpuQueue {
                 }
                 let pipeline = gpu::gpu_pipeline_enabled();
                 let make_on_complete =
-                    |completion: AsyncGpuCompletion| -> Box<dyn FnOnce() + Send> {
+                    |completion: Option<AsyncGpuCompletion>,
+                     pending_guard: AsyncGpuPendingGuard|
+                     -> Box<dyn FnOnce() + Send> {
                         let completion_gpu = Arc::clone(&worker_gpu);
-                        let pending = Arc::clone(&pending_worker);
                         Box::new(move || {
-                            completion_gpu.record_syncpoint_completion(
-                                completion.fd,
-                                completion.syncpt_id,
-                                completion.threshold,
-                            );
-                            pending.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                            if let Some(completion) = completion {
+                                completion_gpu.record_syncpoint_completion(
+                                    completion.fd,
+                                    completion.syncpt_id,
+                                    completion.threshold,
+                                );
+                            }
+                            pending_guard.complete();
                         })
                     };
-                while let Ok(submission) = rx.recv() {
-                    match submission {
-                        AsyncGpuSubmission::Inline {
-                            entries,
-                            completion,
-                        } => {
-                            let on_complete = Some(make_on_complete(completion));
+                while let Ok(queued) = rx.recv() {
+                    if matches!(&queued.submission, AsyncGpuSubmission::Shutdown) {
+                        break;
+                    }
+                    if failed_worker.load(Ordering::Acquire) {
+                        drop(queued);
+                        continue;
+                    }
+                    let QueuedAsyncGpuSubmission {
+                        submission,
+                        pending,
+                    } = queued;
+                    let processed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || match (submission, pending) {
+                        (
+                            AsyncGpuSubmission::Inline {
+                                entries,
+                                completion,
+                            },
+                            Some(pending_guard),
+                        ) => {
+                            let on_complete =
+                                Some(make_on_complete(completion, pending_guard));
                             if defer_small_rts {
                                 worker_gpu.process_inline_gpfifo_soft_deferred(
                                     &entries,
@@ -1078,83 +1155,117 @@ impl AsyncGpuQueue {
                                 );
                             }
                         }
-                        AsyncGpuSubmission::Gpfifo {
-                            address,
-                            num_entries,
-                            completion,
-                        } => {
-                            let on_complete = Some(make_on_complete(completion));
-                            if defer_small_rts {
-                                worker_gpu.submit_gpfifo_soft_deferred(
-                                    address,
-                                    num_entries,
-                                    |addr, buf| mem_read(addr, buf),
-                                    |addr, buf| mem_write(addr, buf),
-                                    |src, dst, len| mem_copy(src, dst, len),
-                                    on_complete,
-                                );
-                            } else {
-                                worker_gpu.submit_gpfifo_soft(
-                                    address,
-                                    num_entries,
-                                    |addr, buf| mem_read(addr, buf),
-                                    |addr, buf| mem_write(addr, buf),
-                                    |src, dst, len| mem_copy(src, dst, len),
-                                    on_complete,
-                                );
+                        (
+                            AsyncGpuSubmission::Present {
+                                job,
+                                pending,
+                                limit,
+                            },
+                            Some(pending_guard),
+                        ) => {
+                            let deadline = std::time::Instant::now()
+                                + std::time::Duration::from_secs(3);
+                            if !reserve_ordered_present_slot_until(&pending, limit, || {
+                                stopping_worker.load(Ordering::Acquire)
+                                    || std::time::Instant::now() >= deadline
+                            }) {
+                                log::error!("[ordered-present] inflight reservation timed out");
+                                failed_worker.store(true, Ordering::Release);
+                                return;
                             }
-                        }
-                        AsyncGpuSubmission::Present(job) => {
-                            let pending_guard = AsyncGpuPendingGuard {
-                                pending: Arc::clone(&pending_worker),
-                            };
+                            let job = guarded_present_job(pending, job);
                             let job: crate::render_thread::RenderJob = Box::new(move || {
-                                let _pending_guard = pending_guard;
                                 job();
+                                pending_guard.complete();
                             });
                             let job = if pipeline {
                                 match worker_gpu.prep_present(job, defer_small_rts) {
-                                    Ok(()) => continue,
+                                    Ok(()) => None,
                                     Err(job) => {
                                         log::error!(
                                             "[gpu-prep] prep lane unavailable; preserving present on render FIFO"
                                         );
-                                        job
+                                        Some(job)
                                     }
                                 }
                             } else {
-                                job
+                                Some(job)
                             };
-                            let _ = worker_gpu.flush_prepared_draw_packets();
-                            if defer_small_rts {
-                                let _ = worker_gpu
-                                    .flush_small_rt_writebacks(|addr, buf| mem_write(addr, buf));
-                            }
-                            if let Some(render_thread) = crate::render_thread::maybe_render_thread()
-                            {
-                                render_thread.submit_named("async-present-readback", job);
-                            } else {
-                                job();
-                            }
-                        }
-                        AsyncGpuSubmission::Barrier(done) => {
-                            if pipeline
-                                && worker_gpu.prep_drain_barrier(done.clone(), defer_small_rts)
-                            {
-                            } else {
-                                let _ = worker_gpu.flush_prepared_draw_packets();
-                                if defer_small_rts {
-                                    let _ = worker_gpu.flush_small_rt_writebacks(|addr, buf| {
-                                        mem_write(addr, buf)
-                                    });
+                            if let Some(job) = job {
+                                let mut completed = worker_gpu.flush_prepared_draw_packets();
+                                if completed
+                                    && defer_small_rts
+                                    && gpu::vk_dispatch::has_pending_small_rt_writebacks()
+                                {
+                                    completed = worker_gpu
+                                        .flush_small_rt_writebacks(|addr, buf| mem_write(addr, buf));
                                 }
-                                let _ = done.send(());
+                                if completed {
+                                    if let Some(render_thread) =
+                                        crate::render_thread::maybe_render_thread()
+                                    {
+                                        render_thread
+                                            .submit_named("async-present-readback", job);
+                                    } else {
+                                        job();
+                                    }
+                                } else {
+                                    log::error!(
+                                        "[ordered-present] flush failed before render submission"
+                                    );
+                                    failed_worker.store(true, Ordering::Release);
+                                }
                             }
                         }
+                        (AsyncGpuSubmission::Barrier(done), None) => {
+                            if pipeline {
+                                match worker_gpu.prep_drain_barrier(done, defer_small_rts) {
+                                    gpu::prep::PrepBarrierDispatch::Queued => {}
+                                    gpu::prep::PrepBarrierDispatch::Inline => {
+                                        log::error!(
+                                            "[gpu-prep] drain barrier reached an inline lane"
+                                        );
+                                        failed_worker.store(true, Ordering::Release);
+                                    }
+                                    gpu::prep::PrepBarrierDispatch::Disconnected => {
+                                        log::error!(
+                                            "[gpu-prep] drain barrier reached a disconnected lane"
+                                        );
+                                        failed_worker.store(true, Ordering::Release);
+                                    }
+                                }
+                            } else {
+                                let mut completed = worker_gpu.flush_prepared_draw_packets();
+                                if completed
+                                    && defer_small_rts
+                                    && gpu::vk_dispatch::has_pending_small_rt_writebacks()
+                                {
+                                    completed = worker_gpu
+                                        .flush_small_rt_writebacks(|addr, buf| mem_write(addr, buf));
+                                }
+                                let _ = done.send(completed);
+                            }
+                        }
+                        (AsyncGpuSubmission::Shutdown, None) => unreachable!(),
+                        (_, _) => {
+                            log::error!("[async-gpu] malformed pending ownership");
+                            failed_worker.store(true, Ordering::Release);
+                        }
+                    },
+                    ));
+                    if processed.is_err() {
+                        log::error!("[async-gpu] submission panicked; queue failed");
+                        failed_worker.store(true, Ordering::Release);
                     }
                 }
-            })
-            .expect("spawn GPU submit thread");
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                let _ = gpu.shutdown_prep_thread(defer_small_rts);
+                panic!("spawn GPU submit thread: {error}");
+            }
+        };
         Self {
             gpu,
             tx,
@@ -1162,23 +1273,31 @@ impl AsyncGpuQueue {
             capacity,
             profile,
             defer_small_rts,
+            failed,
+            stopping,
+            worker: Mutex::new(Some(worker)),
         }
     }
 
     fn submit(&self, submission: AsyncGpuSubmission) -> bool {
-        let inflight = self.pending.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.failed.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire) {
+            return false;
+        }
+        let (pending_guard, inflight) =
+            AsyncGpuPendingGuard::reserve(Arc::clone(&self.pending), Arc::clone(&self.failed));
+        let queued_submission = QueuedAsyncGpuSubmission::tracked(submission, pending_guard);
         let (queued, was_full, blocked_ns) = if self.profile.is_some() {
-            match self.tx.try_send(submission) {
+            match self.tx.try_send(queued_submission) {
                 Ok(()) => (true, false, 0),
-                Err(crossbeam::channel::TrySendError::Full(submission)) => {
+                Err(crossbeam::channel::TrySendError::Full(queued_submission)) => {
                     let started = std::time::Instant::now();
-                    let queued = self.tx.send(submission).is_ok();
+                    let queued = self.tx.send(queued_submission).is_ok();
                     (queued, true, started.elapsed().as_nanos() as u64)
                 }
                 Err(crossbeam::channel::TrySendError::Disconnected(_)) => (false, false, 0),
             }
         } else {
-            (self.tx.send(submission).is_ok(), false, 0)
+            (self.tx.send(queued_submission).is_ok(), false, 0)
         };
         if let Some(profile) = &self.profile {
             profile.submitted(was_full, blocked_ns, inflight, self.capacity);
@@ -1186,12 +1305,18 @@ impl AsyncGpuQueue {
         if queued {
             true
         } else {
-            self.pending.fetch_sub(1, Ordering::Relaxed);
             false
         }
     }
 
     fn drain(&self) -> AsyncGpuDrain {
+        if self.failed.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire) {
+            return AsyncGpuDrain {
+                completed: false,
+                barrier_send_ns: 0,
+                barrier_wait_ns: 0,
+            };
+        }
         let pending = self.pending.load(std::sync::atomic::Ordering::Acquire);
         if pending == 0
             && !gpu::gpu_pipeline_enabled()
@@ -1206,7 +1331,14 @@ impl AsyncGpuQueue {
         }
         let (done_tx, done_rx) = crossbeam::channel::bounded(1);
         let send_started = std::time::Instant::now();
-        if self.tx.send(AsyncGpuSubmission::Barrier(done_tx)).is_err() {
+        if self
+            .tx
+            .send_timeout(
+                QueuedAsyncGpuSubmission::untracked(AsyncGpuSubmission::Barrier(done_tx)),
+                std::time::Duration::from_secs(3),
+            )
+            .is_err()
+        {
             return AsyncGpuDrain {
                 completed: false,
                 barrier_send_ns: send_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
@@ -1215,8 +1347,21 @@ impl AsyncGpuQueue {
         }
         let barrier_send_ns = send_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let wait_started = std::time::Instant::now();
+        let completed = match done_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(true) => true,
+            Ok(false) => {
+                log::error!("[async-gpu] drain barrier reported failure");
+                self.failed.store(true, Ordering::Release);
+                false
+            }
+            Err(error) => {
+                log::error!("[async-gpu] drain barrier failed: {error}");
+                self.failed.store(true, Ordering::Release);
+                false
+            }
+        };
         AsyncGpuDrain {
-            completed: done_rx.recv().is_ok(),
+            completed,
             barrier_send_ns,
             barrier_wait_ns: wait_started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
         }
@@ -1235,6 +1380,44 @@ impl AsyncGpuQueue {
     }
 }
 
+impl Drop for AsyncGpuQueue {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        let (replacement_tx, replacement_rx) = crossbeam::channel::bounded(0);
+        drop(replacement_rx);
+        let tx = std::mem::replace(&mut self.tx, replacement_tx);
+        if tx
+            .send(QueuedAsyncGpuSubmission::untracked(
+                AsyncGpuSubmission::Shutdown,
+            ))
+            .is_err()
+        {
+            self.failed.store(true, Ordering::Release);
+        }
+        drop(tx);
+        if let Some(worker) = self.worker.lock().take() {
+            if worker.join().is_err() {
+                log::error!("[async-gpu] submit worker panicked during shutdown");
+                self.failed.store(true, Ordering::Release);
+            }
+        }
+        if !self.gpu.shutdown_prep_thread(self.defer_small_rts) {
+            self.failed.store(true, Ordering::Release);
+        }
+        if !gpu::vk_dispatch::sync_render_thread() {
+            log::error!("[async-gpu] render worker drain failed during shutdown");
+            self.failed.store(true, Ordering::Release);
+        }
+        if self.pending.load(Ordering::Acquire) != 0 {
+            log::error!(
+                "[async-gpu] pending work remained after shutdown: {}",
+                self.pending.load(Ordering::Acquire)
+            );
+            self.failed.store(true, Ordering::Release);
+        }
+    }
+}
+
 fn async_gpu_queue_depth() -> usize {
     std::env::var("NEXIUM_ASYNC_GPU_QUEUE_DEPTH")
         .ok()
@@ -1246,6 +1429,52 @@ fn async_gpu_queue_depth() -> usize {
 fn async_gpu_queue_profile_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("NEXIUM_ASYNC_GPU_PROFILE").is_some())
+}
+
+fn gpu_thread_flag_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuThreadModeRequest {
+    Inline,
+    SyncPrepThread,
+    AsyncGpu,
+    Conflict,
+}
+
+fn gpu_thread_mode_request(
+    sync_prep: Option<&str>,
+    async_gpu: Option<&str>,
+    gpu_pipeline: Option<&str>,
+) -> GpuThreadModeRequest {
+    let sync_prep = gpu_thread_flag_enabled(sync_prep);
+    let async_gpu = gpu_thread_flag_enabled(async_gpu);
+    let gpu_pipeline = gpu_thread_flag_enabled(gpu_pipeline);
+    if sync_prep && (async_gpu || gpu_pipeline) {
+        GpuThreadModeRequest::Conflict
+    } else if sync_prep {
+        GpuThreadModeRequest::SyncPrepThread
+    } else if async_gpu {
+        GpuThreadModeRequest::AsyncGpu
+    } else {
+        GpuThreadModeRequest::Inline
+    }
+}
+
+fn ioctl_requires_async_gpu_drain(device: NvDevice, cmd: u16) -> bool {
+    match device {
+        NvDevice::NvhostAsGpu => matches!(cmd, 0x4102 | 0x4103 | 0x4105 | 0x4106 | 0x4114),
+        NvDevice::NvhostNvdec => cmd == 0x0009,
+        NvDevice::NvhostVic => matches!(cmd, 0x0001 | 0x0009),
+        NvDevice::Nvmap => cmd == 0x0105,
+        _ => false,
+    }
 }
 
 fn log_unknown_ioctl(device: &str, cmd: u16) {
@@ -1305,6 +1534,7 @@ pub struct Nvdrv {
     pub renderer: std::sync::OnceLock<Option<Arc<nexium_gpu::Renderer>>>,
     as_gpu_states: HashMap<u32, AsGpuState>,
     gpu_async: Option<Arc<AsyncGpuQueue>>,
+    sync_prep_thread: bool,
     async_present_pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -1338,6 +1568,7 @@ impl Nvdrv {
             renderer: std::sync::OnceLock::new(),
             as_gpu_states: HashMap::new(),
             gpu_async: None,
+            sync_prep_thread: false,
             async_present_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -1507,11 +1738,57 @@ impl Nvdrv {
         mem_write: AsyncMemoryWrite,
         mem_copy: AsyncMemoryCopy,
     ) {
-        let requested = matches!(
-            std::env::var("NEXIUM_ASYNC_GPU").ok().as_deref(),
-            Some("1") | Some("true") | Some("on") | Some("yes")
-        );
-        if !requested {
+        let sync_prep = std::env::var("NEXIUM_SYNC_PREP_THREAD").ok();
+        let async_gpu = std::env::var("NEXIUM_ASYNC_GPU").ok();
+        let gpu_pipeline = std::env::var("NEXIUM_GPU_PIPELINE").ok();
+        match gpu_thread_mode_request(
+            sync_prep.as_deref(),
+            async_gpu.as_deref(),
+            gpu_pipeline.as_deref(),
+        ) {
+            GpuThreadModeRequest::Inline => return,
+            GpuThreadModeRequest::Conflict => {
+                log::error!(
+                    "nexium-nvdrv: NEXIUM_SYNC_PREP_THREAD is mutually exclusive with asynchronous GPU modes"
+                );
+                return;
+            }
+            GpuThreadModeRequest::SyncPrepThread => {
+                if self.gpu_async.is_some() {
+                    log::error!(
+                        "nexium-nvdrv: synchronous prep thread rejected while async GPU queue is active"
+                    );
+                    return;
+                }
+                if !self.sync_prep_thread {
+                    self.sync_prep_thread = self.gpu.install_prep_thread(
+                        gpu::prep::PrepThreadResources {
+                            maxwell_dma: Arc::clone(&self.gpu.maxwell_dma),
+                            fermi_2d: Arc::clone(&self.gpu.fermi_2d),
+                            kepler_compute: Arc::clone(&self.gpu.kepler_compute),
+                            kepler_memory: Arc::clone(&self.gpu.kepler_memory),
+                            mappings: Arc::clone(&self.gpu.mappings),
+                            stats: Arc::clone(&self.gpu.stats),
+                            mem_read,
+                            mem_write,
+                            mem_copy,
+                        },
+                        gpu::prep::PrepThreadBehavior::DrainEachKick,
+                    );
+                    if self.sync_prep_thread {
+                        log::info!("nexium-nvdrv: synchronous drained GPU prep thread ENABLED");
+                    } else {
+                        log::error!(
+                            "nexium-nvdrv: synchronous GPU prep thread installation failed"
+                        );
+                    }
+                }
+                return;
+            }
+            GpuThreadModeRequest::AsyncGpu => {}
+        }
+        if self.sync_prep_thread {
+            log::error!("nexium-nvdrv: async GPU queue rejected while sync prep thread is active");
             return;
         }
         if !gpu::experimental_gpu_scheduling_enabled() {
@@ -1531,11 +1808,30 @@ impl Nvdrv {
         }
     }
 
-    pub fn wait_gpu_idle(&self) {
+    fn finish_sync_prep_submit(&self, label: &str) -> bool {
+        if !self.sync_prep_thread {
+            return true;
+        }
+        if self.gpu.drain_prep_after_kick() {
+            true
+        } else {
+            log::error!("nvhost-gpu: {label} failed while draining GPU prep");
+            false
+        }
+    }
+
+    pub fn wait_gpu_idle_checked(&self) -> bool {
+        let prep_completed = if self.sync_prep_thread {
+            self.gpu.drain_prep_thread(false)
+        } else {
+            true
+        };
         let mut queue_profile = None;
+        let mut queue_completed = true;
         if let Some(queue) = &self.gpu_async {
             let queue_started = std::time::Instant::now();
             let drain = queue.drain();
+            queue_completed = drain.completed;
             let queue_ns = queue_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             queue_profile = Some((
                 queue,
@@ -1547,9 +1843,10 @@ impl Nvdrv {
             self.poll_gpu_completions();
         }
         let render_started = std::time::Instant::now();
-        let _ = gpu::vk_dispatch::sync_render_thread();
+        let render_completed = gpu::vk_dispatch::sync_render_thread();
         let render_ns = render_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         self.poll_gpu_completions();
+        let mut completions_completed = true;
         if let Some((queue, ..)) = queue_profile {
             let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             while queue.pending.load(Ordering::Acquire) != 0
@@ -1560,6 +1857,11 @@ impl Nvdrv {
             }
             if queue.pending.load(Ordering::Acquire) != 0 {
                 log::error!("[gpu-sync] timed out draining renderer-backed GPU completions");
+                completions_completed = false;
+            }
+            if queue.failed.load(Ordering::Acquire) {
+                log::error!("[gpu-sync] asynchronous GPU queue failed");
+                completions_completed = false;
             }
             self.poll_gpu_completions();
         }
@@ -1573,6 +1875,13 @@ impl Nvdrv {
                 barrier_wait_ns,
             );
         }
+        prep_completed && queue_completed && render_completed && completions_completed
+    }
+
+    pub fn wait_gpu_idle(&self) {
+        if !self.wait_gpu_idle_checked() {
+            log::error!("[gpu-sync] GPU idle wait failed");
+        }
     }
 
     pub fn try_queue_ordered_present<F>(&self, present: F) -> AsyncPresentSubmit
@@ -1580,21 +1889,25 @@ impl Nvdrv {
         F: FnOnce() + Send + 'static,
     {
         let limit = async_present_inflight_limit();
-        let submit: Box<dyn FnOnce(&'static str, crate::render_thread::RenderJob) + Send> =
-            if let Some(queue) = &self.gpu_async {
-                let queue = Arc::clone(queue);
-                Box::new(move |_label, job| {
-                    let _ = queue.submit(AsyncGpuSubmission::Present(job));
-                })
+        if let Some(queue) = &self.gpu_async {
+            return if queue.submit(AsyncGpuSubmission::Present {
+                job: Box::new(present),
+                pending: Arc::clone(&self.async_present_pending),
+                limit,
+            }) {
+                AsyncPresentSubmit::Enqueued
             } else {
-                Box::new(move |label, job| {
-                    if let Some(render_thread) = crate::render_thread::maybe_render_thread() {
-                        render_thread.submit_named(label, job);
-                    } else if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
-                        log::error!("[ordered-present] job panicked; dispatcher continuing");
-                    }
-                })
+                AsyncPresentSubmit::Unavailable
             };
+        }
+        let submit: Box<dyn FnOnce(&'static str, crate::render_thread::RenderJob) + Send> =
+            Box::new(move |label, job| {
+                if let Some(render_thread) = crate::render_thread::maybe_render_thread() {
+                    render_thread.submit_named(label, job);
+                } else if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                    log::error!("[ordered-present] job panicked; dispatcher continuing");
+                }
+            });
         let queued = crate::render_thread::present_thread().submit_ordered_named(
             Arc::clone(&self.async_present_pending),
             limit,
@@ -1761,6 +2074,13 @@ impl Nvdrv {
     }
 
     pub fn close(&mut self, fd: u32) {
+        if self.files.get(&fd).map(|file| file.device) == Some(NvDevice::NvhostAsGpu)
+            && self.gpu_async.is_some()
+            && !self.wait_gpu_idle_checked()
+        {
+            log::error!("nvdrv:Close fd={} rejected after GPU drain failure", fd);
+            return;
+        }
         let device = self.files.remove(&fd).map(|file| file.device);
         if device == Some(NvDevice::NvhostAsGpu) {
             let allocation_bases = self
@@ -1990,12 +2310,16 @@ impl Nvdrv {
         channel.syncpt_min = threshold;
     }
 
+    fn submit_emits_increments_value(flags: u32, eager: bool) -> bool {
+        eager || flags & (1 << 1) != 0
+    }
+
     fn submit_emits_increments(flags: u32) -> bool {
         static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *EAGER.get_or_init(|| std::env::var_os("NEXIUM_EAGER_SUBMIT_FENCE").is_some()) {
-            return true;
-        }
-        flags & (1 << 1) != 0
+        Self::submit_emits_increments_value(
+            flags,
+            *EAGER.get_or_init(|| std::env::var_os("NEXIUM_EAGER_SUBMIT_FENCE").is_some()),
+        )
     }
 
     fn channel_submit_completion(
@@ -2208,6 +2532,17 @@ impl Nvdrv {
         mem_write: &dyn Fn(u64, &[u8]) -> bool,
         mem_copy: &dyn Fn(u64, u64, usize) -> bool,
     ) -> IoctlOutcome {
+        if self.gpu_async.is_some()
+            && ioctl_requires_async_gpu_drain(device, cmd)
+            && !self.wait_gpu_idle_checked()
+        {
+            log::error!(
+                "nvdrv:Ioctl device={:?} cmd={:#06x} rejected after GPU drain failure",
+                device,
+                cmd
+            );
+            return IoctlOutcome::error(0xA);
+        }
         match device {
             NvDevice::Nvmap => self.nvmap_ioctl(cmd, &req),
             NvDevice::NvhostCtrlGpu => self.nvhost_ctrl_gpu_ioctl(cmd, &req),
@@ -3597,14 +3932,42 @@ impl Nvdrv {
                 }
                 log::debug!("nvhost-ctrl-gpu:GetTpcMasks → 3");
             }
+            0x4712 => {
+                if out.len() < 4 {
+                    out.resize(4, 0);
+                }
+                out[0..4].copy_from_slice(&2u32.to_le_bytes());
+                log::debug!("nvhost-ctrl-gpu:NumVsms → 2");
+            }
+            0x4713 => {
+                if out.len() < 8 + 2 * MAX_VSMS {
+                    out.resize(8 + 2 * MAX_VSMS, 0);
+                }
+                out[0] = 0;
+                out[1] = 0;
+                out[2] = 0;
+                out[3] = 1;
+                for index in 0..MAX_VSMS {
+                    out[8 + 2 * index] = 0;
+                    out[8 + 2 * index + 1] = index as u8;
+                }
+                log::debug!("nvhost-ctrl-gpu:VsmsMapping → sm0=(0,0) sm1=(0,1)");
+            }
             0x4714 => {
                 if out.len() >= 8 {
                     out[0..4].copy_from_slice(&0x07u32.to_le_bytes());
                     out[4..8].copy_from_slice(&0x01u32.to_le_bytes());
                 }
-                self.legacy_gfx.store(true, Ordering::Relaxed);
+                let legacy = !matches!(
+                    std::env::var("NEXIUM_LEGACY_GFX").ok().as_deref(),
+                    Some("0" | "off" | "false")
+                );
+                if legacy {
+                    self.legacy_gfx.store(true, Ordering::Relaxed);
+                }
                 log::debug!(
-                    "nvhost-ctrl-gpu:GetActiveSlotMask → slot=7 mask=1 (legacy_gfx detected)"
+                    "nvhost-ctrl-gpu:GetActiveSlotMask → slot=7 mask=1 (legacy_gfx={})",
+                    legacy
                 );
             }
             0x471c => {
@@ -4372,16 +4735,23 @@ impl Nvdrv {
                             .fetch_add(entries.len() as u64, Ordering::Relaxed);
                         let (syncpt_id, syncpt_value) =
                             self.reserve_channel_submit(req.fd, submit_flags, submit_fence_value);
+                        let async_enabled = self.gpu_async.is_some();
                         let queued = self.gpu_async.as_ref().is_some_and(|queue| {
                             queue.submit(AsyncGpuSubmission::Inline {
                                 entries: entries.clone(),
-                                completion: AsyncGpuCompletion {
-                                    fd: req.fd,
-                                    syncpt_id,
-                                    threshold: syncpt_value,
-                                },
+                                completion: Self::submit_emits_increments(submit_flags).then_some(
+                                    AsyncGpuCompletion {
+                                        fd: req.fd,
+                                        syncpt_id,
+                                        threshold: syncpt_value,
+                                    },
+                                ),
                             })
                         });
+                        if async_enabled && !queued {
+                            log::error!("nvhost-gpu: async inline submission failed");
+                            return IoctlOutcome::error(0xA);
+                        }
                         if !queued {
                             let on_complete =
                                 Self::submit_emits_increments(submit_flags).then(|| {
@@ -4394,6 +4764,9 @@ impl Nvdrv {
                                 mem_copy,
                                 on_complete,
                             );
+                            if !self.finish_sync_prep_submit("inline submission") {
+                                return IoctlOutcome::error(0xA);
+                            }
                         }
                         log::trace!(
                             "nvhost-gpu:SubmitGPFIFO (inline) entries={} draws={}",
@@ -4506,16 +4879,23 @@ impl Nvdrv {
                             .fetch_add(entries.len() as u64, Ordering::Relaxed);
                         let (syncpt_id, syncpt_value) =
                             self.reserve_channel_submit(req.fd, submit_flags, submit_fence_value);
+                        let async_enabled = self.gpu_async.is_some();
                         let queued = self.gpu_async.as_ref().is_some_and(|queue| {
                             queue.submit(AsyncGpuSubmission::Inline {
                                 entries: entries.clone(),
-                                completion: AsyncGpuCompletion {
-                                    fd: req.fd,
-                                    syncpt_id,
-                                    threshold: syncpt_value,
-                                },
+                                completion: Self::submit_emits_increments(submit_flags).then_some(
+                                    AsyncGpuCompletion {
+                                        fd: req.fd,
+                                        syncpt_id,
+                                        threshold: syncpt_value,
+                                    },
+                                ),
                             })
                         });
+                        if async_enabled && !queued {
+                            log::error!("nvhost-gpu: async embedded submission failed");
+                            return IoctlOutcome::error(0xA);
+                        }
                         if !queued {
                             let on_complete =
                                 Self::submit_emits_increments(submit_flags).then(|| {
@@ -4528,6 +4908,9 @@ impl Nvdrv {
                                 mem_copy,
                                 on_complete,
                             );
+                            if !self.finish_sync_prep_submit("embedded submission") {
+                                return IoctlOutcome::error(0xA);
+                            }
                         }
                         if log::log_enabled!(log::Level::Trace) {
                             let (dc, cc) = {
@@ -4554,30 +4937,55 @@ impl Nvdrv {
                             .fetch_add(num_entries as u64, Ordering::Relaxed);
                         let (syncpt_id, syncpt_value) =
                             self.reserve_channel_submit(req.fd, submit_flags, submit_fence_value);
-                        let queued = self.gpu_async.as_ref().is_some_and(|queue| {
-                            queue.submit(AsyncGpuSubmission::Gpfifo {
-                                address,
-                                num_entries,
-                                completion: AsyncGpuCompletion {
-                                    fd: req.fd,
-                                    syncpt_id,
-                                    threshold: syncpt_value,
-                                },
-                            })
+                        let async_entries = self.gpu_async.as_ref().and_then(|_| {
+                            self.gpu
+                                .snapshot_gpfifo_entries(address, num_entries, mem_read)
                         });
+                        let queued = self
+                            .gpu_async
+                            .as_ref()
+                            .zip(async_entries.as_ref())
+                            .is_some_and(|(queue, entries)| {
+                                queue.submit(AsyncGpuSubmission::Inline {
+                                    entries: entries.clone(),
+                                    completion: Self::submit_emits_increments(submit_flags)
+                                        .then_some(AsyncGpuCompletion {
+                                            fd: req.fd,
+                                            syncpt_id,
+                                            threshold: syncpt_value,
+                                        }),
+                                })
+                            });
+                        if async_entries.is_some() && !queued {
+                            log::error!("nvhost-gpu: async kickoff submission failed");
+                            return IoctlOutcome::error(0xA);
+                        }
                         if !queued {
                             let on_complete =
                                 Self::submit_emits_increments(submit_flags).then(|| {
                                     self.channel_submit_completion(req.fd, syncpt_id, syncpt_value)
                                 });
-                            let _ = self.gpu.submit_gpfifo(
-                                address,
-                                num_entries,
-                                mem_read,
-                                mem_write,
-                                mem_copy,
-                                on_complete,
-                            );
+                            if let Some(entries) = async_entries.as_ref() {
+                                let _ = self.gpu.process_inline_gpfifo(
+                                    entries,
+                                    mem_read,
+                                    mem_write,
+                                    mem_copy,
+                                    on_complete,
+                                );
+                            } else {
+                                let _ = self.gpu.submit_gpfifo(
+                                    address,
+                                    num_entries,
+                                    mem_read,
+                                    mem_write,
+                                    mem_copy,
+                                    on_complete,
+                                );
+                            }
+                            if !self.finish_sync_prep_submit("kickoff submission") {
+                                return IoctlOutcome::error(0xA);
+                            }
                         }
                         log::trace!(
                             "nvhost-gpu:SubmitGPFIFO (kickoff) addr={:#x} entries={} draws={}",
@@ -5228,6 +5636,17 @@ impl Nvdrv {
     }
 }
 
+impl Drop for Nvdrv {
+    fn drop(&mut self) {
+        if self.sync_prep_thread {
+            self.sync_prep_thread = false;
+            if !self.gpu.shutdown_prep_thread(false) {
+                log::error!("nexium-nvdrv: synchronous GPU prep thread shutdown failed");
+            }
+        }
+    }
+}
+
 impl Default for Nvdrv {
     fn default() -> Self {
         Self::new()
@@ -5238,6 +5657,30 @@ impl Default for Nvdrv {
 mod tests {
     use super::*;
 
+    fn install_test_sync_prep_thread(nvdrv: &mut Nvdrv) {
+        let read: AsyncMemoryRead = Arc::new(|_, bytes| {
+            bytes.fill(0);
+            true
+        });
+        let write: AsyncMemoryWrite = Arc::new(|_, _| true);
+        let copy: AsyncMemoryCopy = Arc::new(|_, _, _| true);
+        assert!(nvdrv.gpu.install_prep_thread(
+            gpu::prep::PrepThreadResources {
+                maxwell_dma: Arc::clone(&nvdrv.gpu.maxwell_dma),
+                fermi_2d: Arc::clone(&nvdrv.gpu.fermi_2d),
+                kepler_compute: Arc::clone(&nvdrv.gpu.kepler_compute),
+                kepler_memory: Arc::clone(&nvdrv.gpu.kepler_memory),
+                mappings: Arc::clone(&nvdrv.gpu.mappings),
+                stats: Arc::clone(&nvdrv.gpu.stats),
+                mem_read: read,
+                mem_write: write,
+                mem_copy: copy,
+            },
+            gpu::prep::PrepThreadBehavior::DrainEachKick,
+        ));
+        nvdrv.sync_prep_thread = true;
+    }
+
     fn test_frame(value: u8) -> QueuedFrame {
         QueuedFrame {
             width: 1,
@@ -5245,6 +5688,205 @@ mod tests {
             pixels: vec![value, 0, 0, 255],
             present_at: None,
         }
+    }
+
+    #[test]
+    fn sync_prep_mode_is_opt_in_and_mutually_exclusive() {
+        assert_eq!(
+            gpu_thread_mode_request(None, None, None),
+            GpuThreadModeRequest::Inline
+        );
+        assert_eq!(
+            gpu_thread_mode_request(Some("1"), None, None),
+            GpuThreadModeRequest::SyncPrepThread
+        );
+        assert_eq!(
+            gpu_thread_mode_request(None, Some("true"), Some("on")),
+            GpuThreadModeRequest::AsyncGpu
+        );
+        assert_eq!(
+            gpu_thread_mode_request(Some("yes"), Some("1"), None),
+            GpuThreadModeRequest::Conflict
+        );
+        assert_eq!(
+            gpu_thread_mode_request(Some("on"), None, Some("true")),
+            GpuThreadModeRequest::Conflict
+        );
+        for disabled in ["", "0", "false", "off", "no", "unexpected"] {
+            assert_eq!(
+                gpu_thread_mode_request(Some(disabled), None, None),
+                GpuThreadModeRequest::Inline
+            );
+        }
+    }
+
+    #[test]
+    fn sync_prep_idle_wait_drains_kick_without_async_queue() {
+        let mut nvdrv = Nvdrv::new();
+        install_test_sync_prep_thread(&mut nvdrv);
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_callback = Arc::clone(&completed);
+
+        nvdrv.gpu.process_inline_gpfifo(
+            &[],
+            |_, bytes| {
+                bytes.fill(0);
+                true
+            },
+            |_, _| true,
+            |_, _, _| true,
+            Some(Box::new(move || {
+                completed_callback.store(true, Ordering::Release)
+            })),
+        );
+
+        assert!(nvdrv.gpu_async.is_none());
+        assert!(nvdrv.wait_gpu_idle_checked());
+        assert!(completed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn sync_prep_drop_joins_and_restores_inline_lane() {
+        let mut nvdrv = Nvdrv::new();
+        let gpu = Arc::clone(&nvdrv.gpu);
+        install_test_sync_prep_thread(&mut nvdrv);
+
+        assert!(nvdrv.gpu_async.is_none());
+        assert!(gpu.pusher.lock().prep.is_threaded());
+        drop(nvdrv);
+        assert!(!gpu.pusher.lock().prep.is_threaded());
+    }
+
+    #[test]
+    fn sync_prep_submit_propagates_latched_worker_failure() {
+        let mut nvdrv = Nvdrv::new();
+        install_test_sync_prep_thread(&mut nvdrv);
+        {
+            let pusher = nvdrv.gpu.pusher.lock();
+            let gpu::prep::PrepLane::Threaded(handle) = &pusher.prep else {
+                panic!("missing prep thread")
+            };
+            handle.failure_latch().store(true, Ordering::Release);
+        }
+
+        assert!(!nvdrv.finish_sync_prep_submit("test submission"));
+        assert!(!nvdrv.gpu.shutdown_prep_thread(false));
+        nvdrv.sync_prep_thread = false;
+        assert!(!nvdrv.gpu.pusher.lock().prep.is_threaded());
+    }
+
+    #[test]
+    fn async_pending_guard_releases_when_completion_is_discarded() {
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (guard, inflight) =
+            AsyncGpuPendingGuard::reserve(Arc::clone(&pending), Arc::clone(&failed));
+
+        assert_eq!(inflight, 1);
+
+        drop(guard);
+
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert!(failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn async_pending_guard_records_success_without_faulting_queue() {
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (guard, inflight) =
+            AsyncGpuPendingGuard::reserve(Arc::clone(&pending), Arc::clone(&failed));
+
+        assert_eq!(inflight, 1);
+
+        guard.complete();
+
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert!(!failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn queued_pending_guard_releases_after_post_empty_channel_drop() {
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        assert!(rx.is_empty());
+        let (guard, _) = AsyncGpuPendingGuard::reserve(Arc::clone(&pending), Arc::clone(&failed));
+        let queued = QueuedAsyncGpuSubmission::tracked(
+            AsyncGpuSubmission::Inline {
+                entries: Vec::new(),
+                completion: None,
+            },
+            guard,
+        );
+
+        assert!(tx.send(queued).is_ok());
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        drop(rx);
+        drop(tx);
+
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert!(failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn async_gpu_queue_drains_and_joins_cleanly() {
+        let gpu = Arc::new(GpuContext::new());
+        let read: AsyncMemoryRead = Arc::new(|_, bytes| {
+            bytes.fill(0);
+            true
+        });
+        let write: AsyncMemoryWrite = Arc::new(|_, _| true);
+        let copy: AsyncMemoryCopy = Arc::new(|_, _, _| true);
+        let queue = AsyncGpuQueue::new(gpu, read, write, copy);
+
+        assert!(queue.submit(AsyncGpuSubmission::Inline {
+            entries: Vec::new(),
+            completion: None,
+        }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while queue.pending.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(queue.pending.load(Ordering::Acquire), 0);
+        assert!(!queue.failed.load(Ordering::Acquire));
+        assert!(queue.drain().completed);
+
+        let started = std::time::Instant::now();
+        drop(queue);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn async_completion_matches_submit_increment_semantics() {
+        assert!(!Nvdrv::submit_emits_increments_value(0, false));
+        assert!(!Nvdrv::submit_emits_increments_value(1 << 8, false));
+        assert!(Nvdrv::submit_emits_increments_value(1 << 1, false));
+        assert!(Nvdrv::submit_emits_increments_value(
+            (1 << 1) | (1 << 8),
+            false
+        ));
+        assert!(Nvdrv::submit_emits_increments_value(0, true));
+    }
+
+    #[test]
+    fn async_gpu_drain_classifier_covers_mapping_mutations() {
+        for cmd in [0x4102, 0x4103, 0x4105, 0x4106, 0x4114] {
+            assert!(ioctl_requires_async_gpu_drain(NvDevice::NvhostAsGpu, cmd));
+        }
+        assert!(ioctl_requires_async_gpu_drain(
+            NvDevice::NvhostNvdec,
+            0x0009
+        ));
+        assert!(ioctl_requires_async_gpu_drain(NvDevice::NvhostVic, 0x0001));
+        assert!(ioctl_requires_async_gpu_drain(NvDevice::NvhostVic, 0x0009));
+        assert!(ioctl_requires_async_gpu_drain(NvDevice::Nvmap, 0x0105));
+        assert!(!ioctl_requires_async_gpu_drain(NvDevice::NvhostGpu, 0x4808));
+        assert!(!ioctl_requires_async_gpu_drain(NvDevice::NvhostGpu, 0x481B));
+        assert!(!ioctl_requires_async_gpu_drain(
+            NvDevice::NvhostAsGpu,
+            0x4109
+        ));
     }
 
     #[test]

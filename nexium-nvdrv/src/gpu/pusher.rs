@@ -264,7 +264,38 @@ pub(crate) mod kickprof {
     pub const PRES_WB_READ: usize = 143;
     pub const PRES_WB_POST: usize = 144;
     pub const PREP_TEX_FAN: usize = 145;
-    pub const COUNT: usize = 146;
+    pub const VKF_CUBE_SCAN: usize = 146;
+    pub const VKF_CUBE_WB: usize = 147;
+    pub const M3D_PASSIVE_BULK: usize = 148;
+    pub const M3D_PASSIVE_BULK_RUN: usize = 149;
+    pub const M3D_PASSIVE_COLLAPSED: usize = 150;
+    pub const CENSUS_SPH_STABLE: usize = 151;
+    pub const CENSUS_SPH_PROBE: usize = 152;
+    pub const CENSUS_TEXLAY_STABLE: usize = 153;
+    pub const CENSUS_TEXLAY_PROBE: usize = 154;
+    pub const CENSUS_TEXLAY_UNCACHEABLE: usize = 155;
+    pub const CENSUS_PLAN_STABLE: usize = 156;
+    pub const CENSUS_PLAN_PROBE: usize = 157;
+    pub const CENSUS_CBBIND: usize = 158;
+    pub const CENSUS_FLUSH_CHUNKS: usize = 159;
+    pub const CENSUS_FLUSH_ONE_CHUNK: usize = 160;
+    pub const SPH_MEMO_HIT: usize = 161;
+    pub const SPH_MEMO_MISS: usize = 162;
+    pub const CENSUS_TEXLAY2_STABLE: usize = 163;
+    pub const CENSUS_TEXLAY2_PROBE: usize = 164;
+    pub const TEXLAY_MEMO_HIT: usize = 165;
+    pub const TEXLAY_MEMO_MISS: usize = 166;
+    pub const TEXLAY_MEMO_FALLBACK: usize = 167;
+    pub const TEXLAY_MEMO_UNCACHEABLE: usize = 168;
+    pub const CENSUS_PLAN_LAYOUT_STABLE: usize = 169;
+    pub const CENSUS_PLAN_LAYOUT_PROBE: usize = 170;
+    pub const CBUF_ARENA_MEMO_HIT: usize = 171;
+    pub const CBUF_ARENA_MEMO_MISS: usize = 172;
+    pub const CBUF_BARRIER_SYNCS: usize = 173;
+    pub const CBUF_BARRIER_CHUNKS: usize = 174;
+    pub const CBUF_WINDOW_HIT: usize = 175;
+    pub const CBUF_WINDOW_MISS: usize = 176;
+    pub const COUNT: usize = 177;
 
     const NAMES: [&str; COUNT] = [
         "locks",
@@ -413,6 +444,37 @@ pub(crate) mod kickprof {
         "preswbread",
         "preswbpost",
         "preptexfan",
+        "vkfcubescan",
+        "vkfcubewb",
+        "m3dpbulk",
+        "m3dpbulkrun",
+        "m3dpbulkcollapse",
+        "censsph",
+        "censsphn",
+        "censtexlay",
+        "censtexlayn",
+        "censtexlayunc",
+        "censplan",
+        "censplann",
+        "censcbbind",
+        "censflushchunks",
+        "censflushone",
+        "sphmemohit",
+        "sphmemomiss",
+        "censtexlay2",
+        "censtexlay2n",
+        "texlaymemohit",
+        "texlaymemomiss",
+        "texlaymemofb",
+        "texlaymemounc",
+        "censplanlayout",
+        "censplanlayoutn",
+        "cbarenamemohit",
+        "cbarenamemomiss",
+        "cbbarriersyncs",
+        "cbbarrierchunks",
+        "cbwindowhit",
+        "cbwindowmiss",
     ];
 
     static NS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
@@ -431,6 +493,21 @@ pub(crate) mod kickprof {
                 log::warn!("[kickprof] armed");
             }
             on
+        })
+    }
+
+    pub fn census_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("NEXIUM_MEMO_CENSUS")
+                .ok()
+                .is_some_and(|value| {
+                    let value = value.trim();
+                    value == "1"
+                        || value.eq_ignore_ascii_case("true")
+                        || value.eq_ignore_ascii_case("on")
+                        || value.eq_ignore_ascii_case("yes")
+                })
         })
     }
 
@@ -591,6 +668,16 @@ impl CommandListHeader {
     }
 }
 
+pub(crate) fn decode_command_list_headers(bytes: &[u8]) -> Vec<CommandListHeader> {
+    bytes
+        .chunks_exact(8)
+        .map(|chunk| CommandListHeader {
+            address_lo: u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            address_hi_and_count: u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
+        })
+        .collect()
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Mode {
     Increasing,
@@ -629,6 +716,23 @@ pub(crate) static GPU_SEM_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub(crate) fn gpu_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_NVDRV_PROFILE").is_some())
+}
+
+fn m3d_passive_bulk_value_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("on")
+            || value.eq_ignore_ascii_case("yes")
+    })
+}
+
+fn m3d_passive_bulk_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        m3d_passive_bulk_value_enabled(std::env::var("NEXIUM_M3D_PASSIVE_BULK").ok().as_deref())
+    })
 }
 
 fn semacq_ack_stat(elapsed: std::time::Duration) {
@@ -750,6 +854,12 @@ pub struct Pusher {
     active_header: u32,
     pub(crate) prep: super::prep::PrepLane,
     engine_event_batch: Option<(u32, Vec<(u32, u32, bool)>)>,
+    live_macro_scratch: Vec<u8>,
+    live_macro_values: Vec<u32>,
+    #[cfg(test)]
+    passive_bulk_override: Option<bool>,
+    #[cfg(test)]
+    passive_bulk_words: usize,
 }
 
 impl Pusher {
@@ -776,6 +886,12 @@ impl Pusher {
             active_header: 0,
             prep: super::prep::PrepLane::Inline(super::prep::PrepState::new()),
             engine_event_batch: None,
+            live_macro_scratch: Vec::new(),
+            live_macro_values: Vec::new(),
+            #[cfg(test)]
+            passive_bulk_override: None,
+            #[cfg(test)]
+            passive_bulk_words: 0,
         }
     }
 
@@ -905,7 +1021,7 @@ impl Pusher {
                     state.record_flush_reason(kickprof::FLUSH_HARD_TAIL);
                 }
                 state.flush_vk_with_boundary(mappings, mem_read, mem_write, hard_after);
-                state.finish_prepared_draw_packet_tail(hard_after, writeback_small_rts);
+                let submitted = state.finish_prepared_draw_packet_tail(hard_after);
                 if writeback_small_rts {
                     if let Some(r) = state.renderer.clone() {
                         let kp = kickprof::start();
@@ -914,7 +1030,9 @@ impl Pusher {
                     }
                 }
                 state.end_ssbo_snapshot_epoch();
-                state.schedule_kick_completion(on_complete);
+                if submitted {
+                    state.schedule_kick_completion(on_complete);
+                }
             }
             super::prep::PrepLane::Threaded(handle) => {
                 match handle.send_recover(super::prep::PrepEvent::KickEnd {
@@ -926,9 +1044,7 @@ impl Pusher {
                     Err(super::prep::PrepEvent::KickEnd { on_complete, .. }) => {
                         handle.cancel_kick();
                         log::error!("[gpu-prep] kick-end dropped after prep thread exit");
-                        if let Some(on_complete) = on_complete {
-                            on_complete();
-                        }
+                        drop(on_complete);
                     }
                     Err(_) => unreachable!("prep kick-end returned a different event"),
                 }
@@ -1102,25 +1218,7 @@ impl Pusher {
         let mut buf = vec![0u8; bytes_needed];
         read_gpu_scattered(mappings, address, &mut buf, mem_read);
 
-        let decoded: Vec<CommandListHeader> = (0..num_entries as usize)
-            .map(|i| {
-                let off = i * 8;
-                CommandListHeader {
-                    address_lo: u32::from_le_bytes([
-                        buf[off],
-                        buf[off + 1],
-                        buf[off + 2],
-                        buf[off + 3],
-                    ]),
-                    address_hi_and_count: u32::from_le_bytes([
-                        buf[off + 4],
-                        buf[off + 5],
-                        buf[off + 6],
-                        buf[off + 7],
-                    ]),
-                }
-            })
-            .collect();
+        let decoded = decode_command_list_headers(&buf);
         let decoded = repair_endform_entries(&decoded, mappings);
         kickprof::add(kickprof::ELIST, kp_elist);
 
@@ -1407,42 +1505,81 @@ impl Pusher {
         let mut i = 0;
         let mut methods_dispatched = 0u64;
         let constbuf_upload_watch_active = constbuf_upload_watch().is_some();
+        let gpu_profile_active = gpu_profile_enabled();
+        #[cfg(not(test))]
+        let passive_bulk_active = m3d_passive_bulk_enabled();
+        #[cfg(test)]
+        let passive_bulk_active = self
+            .passive_bulk_override
+            .unwrap_or_else(m3d_passive_bulk_enabled);
+        let live_macro_batch_active =
+            mme_batch_refresh_enabled() && !gpu_profile_active && !direct_forensics();
+        let live_macro_slice_active = live_macro_batch_active
+            && mme_slice_dispatch_enabled()
+            && !mme_param_trace()
+            && !mme_dispatch_trace();
+        let mut live_macro_scratch = std::mem::take(&mut self.live_macro_scratch);
+        let mut live_macro_values = std::mem::take(&mut self.live_macro_values);
+        let mut live_macro_start = 0usize;
+        let mut live_macro_end = 0usize;
+        let mut live_macro_valid = false;
         while i < commands.len() {
             let header = commands[i];
 
             if self.state.method_count > 0 {
                 self.active_word_index = i;
                 let cls = self.bound_classes[self.state.subchannel as usize & 7];
-                if cls == 0xB197
-                    && !gpu_profile_enabled()
+                let passive_run = (cls == 0xB197
+                    && (!gpu_profile_active || passive_bulk_active)
                     && !direct_forensics()
-                    && !self.state.increment_once
-                    && !maxwell.has_pending_pusher_work()
-                {
-                    let available = (commands.len() - i).min(self.state.method_count as usize);
-                    let method = self.state.method;
-                    let count = if self.state.non_incrementing {
-                        Maxwell3D::is_pusher_passive_method(method).then_some(available)
-                    } else {
-                        let count = (0..available)
-                            .take_while(|offset| {
-                                Maxwell3D::is_pusher_passive_method(
-                                    method.wrapping_add(*offset as u32),
-                                )
-                            })
-                            .count();
-                        (count != 0).then_some(count)
-                    };
-                    if let Some(count) = count {
+                    && !self.state.increment_once)
+                    .then(|| {
+                        let available = (commands.len() - i).min(self.state.method_count as usize);
+                        let method = self.state.method;
+                        let count =
+                            passive_maxwell_run_len(method, available, self.state.non_incrementing);
+                        (method, count)
+                    })
+                    .filter(|(_, count)| *count != 0);
+                let passive_drain_boundary =
+                    passive_run.is_some() && maxwell.has_pending_pusher_work();
+                if !passive_drain_boundary {
+                    if let Some((method, count)) = passive_run {
                         let kp_m3d = kickprof::start();
-                        for offset in 0..count {
-                            let method = if self.state.non_incrementing {
-                                method
+                        if passive_bulk_active {
+                            let kp_bulk = if gpu_profile_active {
+                                kickprof::start()
                             } else {
-                                method.wrapping_add(offset as u32)
+                                None
                             };
-                            maxwell.write_register(method, commands[i + offset]);
-                            maxwell.record_method(method);
+                            let collapsed = maxwell.write_passive_register_run(
+                                method,
+                                &commands[i..i + count],
+                                self.state.non_incrementing,
+                            );
+                            if gpu_profile_active {
+                                kickprof::add_counted(
+                                    kickprof::M3D_PASSIVE_BULK,
+                                    kp_bulk,
+                                    count as u64,
+                                );
+                                kickprof::count(kickprof::M3D_PASSIVE_BULK_RUN, 1);
+                                kickprof::count(kickprof::M3D_PASSIVE_COLLAPSED, collapsed as u64);
+                            }
+                            #[cfg(test)]
+                            {
+                                self.passive_bulk_words += count;
+                            }
+                        } else {
+                            for offset in 0..count {
+                                let method = if self.state.non_incrementing {
+                                    method
+                                } else {
+                                    method.wrapping_add(offset as u32)
+                                };
+                                maxwell.write_register(method, commands[i + offset]);
+                                maxwell.record_method(method);
+                            }
                         }
                         kickprof::add_counted(kickprof::M3D, kp_m3d, count as u64);
                         self.active_word_index = i + count - 1;
@@ -1453,6 +1590,72 @@ impl Pusher {
                         methods_dispatched += count as u64;
                         i += count;
                         continue;
+                    }
+                }
+                if live_macro_slice_active
+                    && cls == 0xB197
+                    && self.state.method >= MACRO_REGISTERS_START
+                    && self.state.non_incrementing
+                    && self.state.method_count > 1
+                    && !maxwell.has_pending_pusher_work()
+                {
+                    let available = (commands.len() - i).min(self.state.method_count as usize);
+                    if i >= live_macro_end {
+                        live_macro_start = i;
+                        live_macro_end = i + 1;
+                        live_macro_valid = false;
+                        if available > 1 {
+                            let arg_gpu_va = self
+                                .active_entry_gpu_va
+                                .checked_add((self.active_word_index as u64) * 4);
+                            let kp = kickprof::start();
+                            let (span, valid) = arg_gpu_va.map_or((1, false), |gpu_va| {
+                                read_live_words(
+                                    mappings,
+                                    gpu_va,
+                                    available,
+                                    &mut live_macro_scratch,
+                                    mem_read,
+                                )
+                            });
+                            live_macro_end = i + span;
+                            live_macro_valid = valid;
+                            kickprof::add_counted_sized(
+                                kickprof::MACRO,
+                                kp,
+                                if valid { span as u64 } else { 0 },
+                                if valid { span * 4 } else { 0 },
+                            );
+                        }
+                    }
+                    if live_macro_valid {
+                        let span = live_macro_end - i;
+                        let count = span.min(self.state.method_count.saturating_sub(1) as usize);
+                        if count != 0 {
+                            let byte_start = (i - live_macro_start) * 4;
+                            let byte_end = byte_start + count * 4;
+                            live_macro_values.clear();
+                            live_macro_values.extend(
+                                live_macro_scratch[byte_start..byte_end]
+                                    .chunks_exact(4)
+                                    .map(|bytes| {
+                                        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                                    }),
+                            );
+                            let kp_m3d = kickprof::start();
+                            maxwell.dispatch_macro_methods(
+                                self.state.method,
+                                live_macro_values.as_slice(),
+                                false,
+                            );
+                            kickprof::add_counted(kickprof::M3D, kp_m3d, count as u64);
+                            maxwell.record_methods(self.state.method, count as u64);
+                            self.active_word_index = i + count - 1;
+                            self.state.method_count -= count as u32;
+                            methods_dispatched += count as u64;
+                            i += count;
+                            continue;
+                        }
                     }
                 }
                 if suspicious_direct(cls, self.state.method, header) {
@@ -1468,15 +1671,60 @@ impl Pusher {
                         i,
                     );
                 }
-                let defer_constbuf_writeback = should_defer_constbuf_writeback(
-                    &self.state,
-                    i + 1 < commands.len(),
-                    constbuf_upload_watch_active,
-                );
+                let defer_constbuf_writeback = !passive_drain_boundary
+                    && should_defer_constbuf_writeback(
+                        &self.state,
+                        i + 1 < commands.len(),
+                        constbuf_upload_watch_active,
+                    );
+                let arg_gpu_va = self
+                    .active_entry_gpu_va
+                    .checked_add((self.active_word_index as u64) * 4);
+                let prefetched_macro_arg = if live_macro_batch_active
+                    && cls == 0xB197
+                    && self.state.method >= MACRO_REGISTERS_START
+                    && self.state.non_incrementing
+                {
+                    if i >= live_macro_end {
+                        let available = (commands.len() - i).min(self.state.method_count as usize);
+                        live_macro_start = i;
+                        live_macro_end = i + 1;
+                        live_macro_valid = false;
+                        if available > 1 {
+                            let kp = kickprof::start();
+                            let (span, valid) = arg_gpu_va.map_or((1, false), |gpu_va| {
+                                read_live_words(
+                                    mappings,
+                                    gpu_va,
+                                    available,
+                                    &mut live_macro_scratch,
+                                    mem_read,
+                                )
+                            });
+                            live_macro_end = i + span;
+                            live_macro_valid = valid;
+                            kickprof::add_counted_sized(
+                                kickprof::MACRO,
+                                kp,
+                                if live_macro_valid { span as u64 } else { 0 },
+                                if live_macro_valid { span * 4 } else { 0 },
+                            );
+                        }
+                    }
+                    if live_macro_valid {
+                        let offset = (i - live_macro_start) * 4;
+                        let bytes = &live_macro_scratch[offset..offset + 4];
+                        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 self.dispatch_method(
                     header,
-                    self.active_entry_gpu_va
-                        .checked_add((self.active_word_index as u64) * 4),
+                    arg_gpu_va,
+                    prefetched_macro_arg,
                     defer_constbuf_writeback,
                     mappings,
                     maxwell,
@@ -1563,6 +1811,7 @@ impl Pusher {
                     self.dispatch_method(
                         arg_count,
                         None,
+                        None,
                         false,
                         mappings,
                         maxwell,
@@ -1585,12 +1834,17 @@ impl Pusher {
                 .methods_dispatched
                 .fetch_add(methods_dispatched, Ordering::Relaxed);
         }
+        live_macro_scratch.clear();
+        self.live_macro_scratch = live_macro_scratch;
+        live_macro_values.clear();
+        self.live_macro_values = live_macro_values;
     }
 
     fn dispatch_method(
         &mut self,
         arg: u32,
         arg_gpu_va: Option<u64>,
+        prefetched_macro_arg: Option<u32>,
         defer_constbuf_writeback: bool,
         mappings: &GpuMappings,
         maxwell: &mut Maxwell3D,
@@ -1649,11 +1903,17 @@ impl Pusher {
 
         if bound_class == 0xB197 {
             let arg = if method >= MACRO_REGISTERS_START {
-                let kp = kickprof::start();
-                let live = arg_gpu_va.and_then(|gpu_va| {
-                    read_live_word(mappings, gpu_va, mem_read).map(|value| (gpu_va, value))
-                });
-                kickprof::add(kickprof::MACRO, kp);
+                let live = match (arg_gpu_va, prefetched_macro_arg) {
+                    (Some(gpu_va), Some(value)) => Some((gpu_va, value)),
+                    (arg_gpu_va, _) => {
+                        let kp = kickprof::start();
+                        let live = arg_gpu_va.and_then(|gpu_va| {
+                            read_live_word(mappings, gpu_va, mem_read).map(|value| (gpu_va, value))
+                        });
+                        kickprof::add(kickprof::MACRO, kp);
+                        live
+                    }
+                };
                 if let Some((gpu_va, value)) = live {
                     if value != arg && mme_param_trace() {
                         use std::sync::atomic::{AtomicU32, Ordering};
@@ -2183,6 +2443,17 @@ pub(crate) fn direct_forensics() -> bool {
     *V.get_or_init(|| std::env::var_os("NEXIUM_MME_FORENSICS").is_some())
 }
 
+fn passive_maxwell_run_len(method: u32, available: usize, non_incrementing: bool) -> usize {
+    if non_incrementing {
+        return usize::from(Maxwell3D::is_pusher_passive_method(method)) * available;
+    }
+    (0..available)
+        .take_while(|offset| {
+            Maxwell3D::is_pusher_passive_method(method.wrapping_add(*offset as u32))
+        })
+        .count()
+}
+
 const GPFIFO_LENGTH_MASK: u32 = 0x1F_FFFF;
 const RECOVERED_RANGE_WORD_LIMIT: u32 = 4096;
 
@@ -2341,7 +2612,10 @@ fn read_live_word(
     gpu_va: u64,
     mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
 ) -> Option<u32> {
-    let cpu_addr = mappings.cpu_address_for(gpu_va)?;
+    let (cpu_addr, available) = mappings.cpu_range_for(gpu_va)?;
+    if available < 4 {
+        return None;
+    }
     let mut bytes = [0u8; 4];
     if !mem_read(cpu_addr, &mut bytes) {
         return None;
@@ -2349,9 +2623,66 @@ fn read_live_word(
     Some(u32::from_le_bytes(bytes))
 }
 
+fn read_live_words(
+    mappings: &GpuMappings,
+    gpu_va: u64,
+    max_word_count: usize,
+    out: &mut Vec<u8>,
+    mem_read: &dyn Fn(u64, &mut [u8]) -> bool,
+) -> (usize, bool) {
+    let Some((cpu_addr, available)) = mappings.cpu_range_for(gpu_va) else {
+        return (1, false);
+    };
+    let mapped_words = usize::try_from(available / 4).unwrap_or(usize::MAX);
+    let word_count = max_word_count.min(mapped_words);
+    if word_count <= 1 {
+        return (1, false);
+    }
+    let Some(byte_len) = word_count.checked_mul(4) else {
+        return (1, false);
+    };
+    out.resize(byte_len, 0);
+    (word_count, mem_read(cpu_addr, out.as_mut_slice()))
+}
+
 fn mme_param_trace() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_MME_PARAM_TRACE").is_some())
+}
+
+fn mme_batch_refresh_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("NEXIUM_MME_BATCH_REFRESH")
+            .ok()
+            .is_some_and(|value| {
+                let value = value.trim();
+                value == "0"
+                    || value.eq_ignore_ascii_case("false")
+                    || value.eq_ignore_ascii_case("off")
+                    || value.eq_ignore_ascii_case("no")
+            })
+    })
+}
+
+fn mme_slice_dispatch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("NEXIUM_MME_SLICE_DISPATCH")
+            .ok()
+            .is_some_and(|value| {
+                let value = value.trim();
+                value == "0"
+                    || value.eq_ignore_ascii_case("false")
+                    || value.eq_ignore_ascii_case("off")
+                    || value.eq_ignore_ascii_case("no")
+            })
+    })
+}
+
+fn mme_dispatch_trace() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_MME_TRACE").is_some())
 }
 
 fn suspicious_direct(class: u32, method: u32, arg: u32) -> bool {
@@ -2518,6 +2849,69 @@ mod tests {
                 | (count << 10)
                 | if no_prefetch { 0x8000_0000 } else { 0 },
         }
+    }
+
+    fn install_three_param_echo(maxwell: &mut Maxwell3D) {
+        maxwell.dispatch_method(0x45, 0, true);
+        for word in [
+            0x0480_0221,
+            0x0000_0A30,
+            0x0000_1330,
+            0x0000_1BC0,
+            0x0000_0010,
+        ] {
+            maxwell.dispatch_method(0x46, word, true);
+        }
+        maxwell.dispatch_method(0x47, 0, true);
+        maxwell.dispatch_method(0x48, 0, true);
+    }
+
+    fn words_bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn passive_bulk_gate_requires_explicit_truthy_value() {
+        for value in ["1", "true", "TRUE", "on", "On", "yes", " YES "] {
+            assert!(m3d_passive_bulk_value_enabled(Some(value)));
+        }
+        for value in ["", "0", "false", "off", "no", "2", "enabled"] {
+            assert!(!m3d_passive_bulk_value_enabled(Some(value)));
+        }
+        assert!(!m3d_passive_bulk_value_enabled(None));
+    }
+
+    #[test]
+    fn passive_bulk_run_stops_before_side_effect_boundaries() {
+        assert_eq!(passive_maxwell_run_len(0x43, 8, false), 1);
+        assert_eq!(passive_maxwell_run_len(0x44, 8, false), 0);
+        assert_eq!(passive_maxwell_run_len(0x45, 8, false), 0);
+        assert_eq!(passive_maxwell_run_len(0x8e1, 8, false), 1);
+        assert_eq!(passive_maxwell_run_len(0x8e2, 8, false), 0);
+        assert_eq!(passive_maxwell_run_len(0x200, 12, true), 12);
+        assert_eq!(passive_maxwell_run_len(0x44, 12, true), 0);
+    }
+
+    #[test]
+    fn command_list_headers_are_decoded_into_owned_values() {
+        let first = gpfifo_entry(0x12_3456_7000, 37, false);
+        let second = gpfifo_entry(0x23_4567_8000, 91, true);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&first.address_lo.to_le_bytes());
+        bytes.extend_from_slice(&first.address_hi_and_count.to_le_bytes());
+        bytes.extend_from_slice(&second.address_lo.to_le_bytes());
+        bytes.extend_from_slice(&second.address_hi_and_count.to_le_bytes());
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        let decoded = decode_command_list_headers(&bytes);
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].address(), first.address());
+        assert_eq!(decoded[0].entry_count(), 37);
+        assert!(!decoded[0].no_prefetch());
+        assert_eq!(decoded[1].address(), second.address());
+        assert_eq!(decoded[1].entry_count(), 91);
+        assert!(decoded[1].no_prefetch());
     }
 
     #[test]
@@ -2945,6 +3339,7 @@ mod tests {
     #[test]
     fn passive_maxwell_run_drains_deferred_constbuf_writes_first() {
         let mut pusher = Pusher::new();
+        pusher.passive_bulk_override = Some(true);
         let mut mappings = GpuMappings::new();
         mappings.add(0x5000, 4, 0x9000, 1);
         let mut maxwell = Maxwell3D::new();
@@ -2960,7 +3355,7 @@ mod tests {
         let writes = Mutex::new(Vec::new());
 
         pusher.process_commands(
-            &[(1 << 29) | (1 << 16) | 0x200, 0x12],
+            &[(1 << 29) | (3 << 16) | 0x200, 0x12, 0x3456, 0x789a],
             &mappings,
             &mut maxwell,
             &mut maxwell_dma,
@@ -2982,6 +3377,127 @@ mod tests {
         );
         assert!(maxwell.regs.pending_constbuf_writes.is_empty());
         assert_eq!(maxwell.reg_file[0x200], 0x12);
+        assert_eq!(maxwell.reg_file[0x201], 0x3456);
+        assert_eq!(maxwell.reg_file[0x202], 0x789a);
+        assert_eq!(pusher.passive_bulk_words, 2);
+        assert_eq!(stats.methods_dispatched.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn passive_maxwell_run_drains_draw_upload_and_sync_work_first() {
+        let mut pusher = Pusher::new();
+        pusher.passive_bulk_override = Some(true);
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x6000, 4, 0xa000, 1);
+        mappings.add(0x7000, 4, 0xb000, 2);
+        let mut maxwell = Maxwell3D::new();
+        maxwell.dispatch_method(0x35e, 3, true);
+        maxwell.write_register(0x60, 4);
+        maxwell.regs.pending_semaphore_acquires.push((0x7000, 0, 0));
+        maxwell.regs.pending_semaphore_writes.push(
+            super::super::engines::maxwell3d::PendingSemaphoreWrite {
+                gpu_va: 0x6000,
+                payload: 0x5566_7788,
+                long: false,
+                ordering:
+                    super::super::engines::maxwell3d::SemaphoreWriteOrdering::SyntheticCounter,
+            },
+        );
+        maxwell.regs.pending_barrier_flushes = 2;
+        maxwell.regs.pending_fragment_barriers = 1;
+        maxwell.regs.pending_tiled_cache_barriers = 1;
+        maxwell.regs.pending_texture_cache_invalidates = 1;
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let writes = Mutex::new(Vec::new());
+
+        pusher.process_commands(
+            &[(1 << 29) | (3 << 16) | 0x200, 0x12, 0x3456, 0x789a],
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &|_, _| true,
+            &|cpu, bytes| {
+                writes.lock().unwrap().push((cpu, bytes.to_vec()));
+                true
+            },
+            &|_, _, _| false,
+        );
+
+        assert!(!maxwell.has_pending_pusher_work());
+        assert_eq!(maxwell.reg_file[0x200], 0x12);
+        assert_eq!(maxwell.reg_file[0x201], 0x3456);
+        assert_eq!(maxwell.reg_file[0x202], 0x789a);
+        assert_eq!(pusher.passive_bulk_words, 2);
+        assert_eq!(stats.methods_dispatched.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![(0xa000, vec![0x88, 0x77, 0x66, 0x55])]
+        );
+    }
+
+    #[test]
+    fn passive_maxwell_run_preserves_cross_subchannel_hard_boundary() {
+        let mut pusher = Pusher::new();
+        pusher.passive_bulk_override = Some(true);
+        pusher.puller.semaphore_addr_low = 0x6000;
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5000, 4, 0x9000, 1);
+        mappings.add(0x6000, 4, 0xa000, 2);
+        let mut maxwell = Maxwell3D::new();
+        maxwell
+            .regs
+            .pending_constbuf_writes
+            .push((0x5000, 0x1122_3344));
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let writes = Mutex::new(Vec::new());
+        let passive_header = (1 << 29) | (3 << 16) | 0x200;
+        let release_header = (1 << 29) | (1 << 16) | (7 << 13) | METHOD_SEMAPHORE_RELEASE;
+
+        pusher.process_commands(
+            &[
+                passive_header,
+                0x12,
+                0x3456,
+                0x789a,
+                release_header,
+                0x99aa_bbcc,
+            ],
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &|_, _| true,
+            &|cpu, bytes| {
+                writes.lock().unwrap().push((cpu, bytes.to_vec()));
+                true
+            },
+            &|_, _, _| false,
+        );
+
+        assert_eq!(pusher.passive_bulk_words, 2);
+        assert_eq!(stats.methods_dispatched.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                (0x9000, vec![0x44, 0x33, 0x22, 0x11]),
+                (0xa000, vec![0xcc, 0xbb, 0xaa, 0x99]),
+            ]
+        );
     }
 
     #[test]
@@ -3051,6 +3567,368 @@ mod tests {
         let mappings = GpuMappings::new();
         let read = |_: u64, _: &mut [u8]| false;
         assert_eq!(read_live_word(&mappings, 0x5020, &read), None);
+    }
+
+    #[test]
+    fn macro_argument_refresh_rejects_a_split_word_mapping() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5000, 2, 0x9000, 1);
+        mappings.add(0x5002, 2, 0xa000, 2);
+        let reads = std::cell::Cell::new(0);
+        let read = |_: u64, _: &mut [u8]| {
+            reads.set(reads.get() + 1);
+            true
+        };
+
+        assert_eq!(read_live_word(&mappings, 0x5000, &read), None);
+        assert_eq!(reads.get(), 0);
+    }
+
+    #[test]
+    fn contiguous_macro_batch_preserves_packet_semantics() {
+        for (mode, method, non_incrementing, increment_once) in [
+            (1u32, MACRO_REGISTERS_START + 3, false, false),
+            (3, MACRO_REGISTERS_START, true, false),
+            (5, MACRO_REGISTERS_START + 1, true, true),
+        ] {
+            let mut pusher = Pusher::new();
+            let mappings = GpuMappings::new();
+            let mut maxwell = Maxwell3D::new();
+            install_three_param_echo(&mut maxwell);
+            let mut maxwell_dma = MaxwellDma::new();
+            let mut fermi_2d = Fermi2D::new();
+            let mut kepler_compute = KeplerCompute::new();
+            let mut kepler_memory = KeplerMemory::new();
+            let stats = PipelineStats::default();
+            let header = (mode << 29) | (3 << 16) | MACRO_REGISTERS_START;
+
+            pusher.process_commands(
+                &[header, 0x11, 0x22, 0x33],
+                &mappings,
+                &mut maxwell,
+                &mut maxwell_dma,
+                &mut fermi_2d,
+                &mut kepler_compute,
+                &mut kepler_memory,
+                &stats,
+                &|_, _| panic!("unmapped macro payload was read"),
+                &|_, _| true,
+                &|_, _, _| false,
+            );
+
+            assert_eq!(&maxwell.reg_file[0x200..0x203], &[0x11, 0x22, 0x33]);
+            assert_eq!(pusher.state.method, method);
+            assert_eq!(pusher.state.method_count, 0);
+            assert_eq!(pusher.state.non_incrementing, non_incrementing);
+            assert_eq!(pusher.state.increment_once, increment_once);
+            assert_eq!(stats.methods_dispatched.load(Ordering::Relaxed), 3);
+        }
+    }
+
+    #[test]
+    fn contiguous_macro_batch_reads_live_payload_once() {
+        let mut pusher = Pusher::new();
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5000, 16, 0x9000, 1);
+        let mut maxwell = Maxwell3D::new();
+        install_three_param_echo(&mut maxwell);
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let header = (3u32 << 29) | (3 << 16) | MACRO_REGISTERS_START;
+        let backing = Mutex::new(words_bytes(&[header, 1, 2, 3]));
+        let live = words_bytes(&[0x11, 0x22, 0x33]);
+        let reads = Mutex::new(Vec::new());
+        let mem_read = |cpu_addr: u64, out: &mut [u8]| {
+            reads.lock().unwrap().push((cpu_addr, out.len()));
+            let mut backing = backing.lock().unwrap();
+            let offset = cpu_addr.saturating_sub(0x9000) as usize;
+            let Some(source) = backing.get(offset..offset + out.len()) else {
+                return false;
+            };
+            out.copy_from_slice(source);
+            if cpu_addr == 0x9000 && out.len() == 16 {
+                backing[4..16].copy_from_slice(&live);
+            }
+            true
+        };
+
+        pusher.process_entry(
+            &gpfifo_entry(0x5000, 4, false),
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &|_, _| true,
+            &|_, _, _| false,
+        );
+
+        assert_eq!(&maxwell.reg_file[0x200..0x203], &[0x11, 0x22, 0x33]);
+        assert_eq!(*reads.lock().unwrap(), vec![(0x9000, 16), (0x9004, 12)]);
+        assert!(pusher.live_macro_values.capacity() >= 2);
+        assert_eq!(stats.methods_dispatched.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn macro_batch_preserves_snapshot_for_split_and_failed_reads() {
+        let mut pusher = Pusher::new();
+        pusher.active_entry_gpu_va = 0x5000;
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5004, 2, 0x9000, 1);
+        mappings.add(0x5006, 2, 0xA000, 2);
+        mappings.add(0x5008, 4, 0xB000, 3);
+        mappings.add(0x500C, 4, 0xC000, 4);
+        let mut maxwell = Maxwell3D::new();
+        install_three_param_echo(&mut maxwell);
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let reads = Mutex::new(Vec::new());
+        let mem_read = |cpu_addr: u64, out: &mut [u8]| {
+            reads.lock().unwrap().push((cpu_addr, out.len()));
+            if cpu_addr == 0xB000 {
+                return false;
+            }
+            if cpu_addr == 0xC000 && out.len() == 4 {
+                out.copy_from_slice(&0x33u32.to_le_bytes());
+                return true;
+            }
+            false
+        };
+        let header = (3u32 << 29) | (3 << 16) | MACRO_REGISTERS_START;
+
+        pusher.process_commands(
+            &[header, 0x11, 0x22, 0x03],
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &|_, _| true,
+            &|_, _, _| false,
+        );
+
+        assert_eq!(&maxwell.reg_file[0x200..0x203], &[0x11, 0x22, 0x33]);
+        assert_eq!(*reads.lock().unwrap(), vec![(0xB000, 4), (0xC000, 4)]);
+    }
+
+    #[test]
+    fn macro_batch_bulk_failure_retries_each_live_word() {
+        let mut pusher = Pusher::new();
+        pusher.active_entry_gpu_va = 0x5000;
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5004, 12, 0x9000, 1);
+        let mut maxwell = Maxwell3D::new();
+        install_three_param_echo(&mut maxwell);
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let reads = Mutex::new(Vec::new());
+        let live = words_bytes(&[0x11, 0x22, 0x33]);
+        let mem_read = |cpu_addr: u64, out: &mut [u8]| {
+            reads.lock().unwrap().push((cpu_addr, out.len()));
+            if out.len() != 4 {
+                return false;
+            }
+            let offset = cpu_addr.saturating_sub(0x9000) as usize;
+            let Some(source) = live.get(offset..offset + 4) else {
+                return false;
+            };
+            out.copy_from_slice(source);
+            true
+        };
+        let header = (3u32 << 29) | (3 << 16) | MACRO_REGISTERS_START;
+
+        pusher.process_commands(
+            &[header, 1, 2, 3],
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &|_, _| true,
+            &|_, _, _| false,
+        );
+
+        assert_eq!(&maxwell.reg_file[0x200..0x203], &[0x11, 0x22, 0x33]);
+        assert_eq!(
+            *reads.lock().unwrap(),
+            vec![(0x9000, 12), (0x9000, 4), (0x9004, 4), (0x9008, 4)]
+        );
+    }
+
+    #[test]
+    fn increase_once_batches_only_non_incrementing_remainder() {
+        let mut pusher = Pusher::new();
+        pusher.active_entry_gpu_va = 0x5000;
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5004, 12, 0x9000, 1);
+        let mut maxwell = Maxwell3D::new();
+        install_three_param_echo(&mut maxwell);
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let live = words_bytes(&[0x11, 0x22, 0x33]);
+        let reads = Mutex::new(Vec::new());
+        let mem_read = |cpu_addr: u64, out: &mut [u8]| {
+            reads.lock().unwrap().push((cpu_addr, out.len()));
+            let offset = cpu_addr.saturating_sub(0x9000) as usize;
+            let Some(source) = live.get(offset..offset + out.len()) else {
+                return false;
+            };
+            out.copy_from_slice(source);
+            true
+        };
+        let header = (5u32 << 29) | (3 << 16) | MACRO_REGISTERS_START;
+
+        pusher.process_commands(
+            &[header, 1, 2, 3],
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &|_, _| true,
+            &|_, _, _| false,
+        );
+
+        assert_eq!(&maxwell.reg_file[0x200..0x203], &[0x11, 0x22, 0x33]);
+        assert_eq!(*reads.lock().unwrap(), vec![(0x9000, 4), (0x9004, 8)]);
+        assert_eq!(pusher.state.method, MACRO_REGISTERS_START + 1);
+        assert!(pusher.state.non_incrementing);
+        assert!(pusher.state.increment_once);
+    }
+
+    #[test]
+    fn inline_macro_argument_skips_live_refresh() {
+        let mut pusher = Pusher::new();
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5000, 4, 0x9000, 1);
+        let mut maxwell = Maxwell3D::new();
+        install_three_param_echo(&mut maxwell);
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let reads = std::cell::Cell::new(0usize);
+        let header = (4u32 << 29) | (0x1234 << 16) | MACRO_REGISTERS_START;
+
+        pusher.process_commands(
+            &[header],
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &|_, _| {
+                reads.set(reads.get() + 1);
+                true
+            },
+            &|_, _| true,
+            &|_, _, _| false,
+        );
+
+        assert_eq!(reads.get(), 0);
+        assert_eq!(pusher.state.method_count, 0);
+        assert_eq!(stats.methods_dispatched.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn macro_packet_continues_across_gpfifo_entries() {
+        let mut pusher = Pusher::new();
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x5000, 8, 0x9000, 1);
+        mappings.add(0x6000, 8, 0xA000, 2);
+        let mut maxwell = Maxwell3D::new();
+        install_three_param_echo(&mut maxwell);
+        let mut maxwell_dma = MaxwellDma::new();
+        let mut fermi_2d = Fermi2D::new();
+        let mut kepler_compute = KeplerCompute::new();
+        let mut kepler_memory = KeplerMemory::new();
+        let stats = PipelineStats::default();
+        let header = (3u32 << 29) | (3 << 16) | MACRO_REGISTERS_START;
+        let first_snapshot = words_bytes(&[header, 1]);
+        let second_snapshot = words_bytes(&[2, 3]);
+        let second_live = words_bytes(&[0x22, 0x33]);
+        let reads = Mutex::new(Vec::new());
+        let mem_read = |cpu_addr: u64, out: &mut [u8]| {
+            let call = {
+                let mut reads = reads.lock().unwrap();
+                let call = reads.len();
+                reads.push((cpu_addr, out.len()));
+                call
+            };
+            match (cpu_addr, out.len(), call) {
+                (0x9000, 8, 0) => out.copy_from_slice(&first_snapshot),
+                (0x9004, 4, 1) => out.copy_from_slice(&0x11u32.to_le_bytes()),
+                (0xA000, 8, 2) => out.copy_from_slice(&second_snapshot),
+                (0xA000, 8, 3) => out.copy_from_slice(&second_live),
+                _ => return false,
+            }
+            true
+        };
+
+        pusher.process_entry(
+            &gpfifo_entry(0x5000, 2, false),
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &|_, _| true,
+            &|_, _, _| false,
+        );
+        assert_eq!(pusher.state.method_count, 2);
+        assert_eq!(stats.methods_dispatched.load(Ordering::Relaxed), 1);
+
+        pusher.process_entry(
+            &gpfifo_entry(0x6000, 2, false),
+            &mappings,
+            &mut maxwell,
+            &mut maxwell_dma,
+            &mut fermi_2d,
+            &mut kepler_compute,
+            &mut kepler_memory,
+            &stats,
+            &mem_read,
+            &|_, _| true,
+            &|_, _, _| false,
+        );
+
+        assert_eq!(&maxwell.reg_file[0x200..0x203], &[0x11, 0x22, 0x33]);
+        assert_eq!(pusher.state.method_count, 0);
+        assert_eq!(stats.methods_dispatched.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            *reads.lock().unwrap(),
+            vec![(0x9000, 8), (0x9004, 4), (0xA000, 8), (0xA000, 8)]
+        );
     }
 
     #[test]

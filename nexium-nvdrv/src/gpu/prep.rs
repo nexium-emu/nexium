@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use super::engines::{KeplerMemory, KeplerMemoryWriteOutcome};
 use super::pusher::{
     contiguous_constbuf_write_run_end, gpu_profile_enabled, semrel_legacy, semrel_verify,
 };
-use super::vk_dispatch::{PreparedDrawPacketizer, SsboSnapshotCache};
+use super::vk_dispatch::{PendingDrawBatch, PreparedDrawPacketizer, SsboSnapshotCache};
 use super::GpuMappings;
 use crate::PipelineStats;
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -63,7 +63,7 @@ pub(crate) enum PrepEvent {
         flush_small_rts: bool,
     },
     DrainBarrier {
-        done: crossbeam::channel::Sender<()>,
+        done: crossbeam::channel::Sender<bool>,
         flush_small_rts: bool,
     },
     SemAcquire {
@@ -188,9 +188,10 @@ pub(crate) struct PrepState {
     pub(crate) renderer: Option<Arc<nexium_gpu::Renderer>>,
     pub(crate) guest_memory: Option<super::GuestMemoryAccess>,
     pending_small_rt_wb:
-        Option<std::sync::mpsc::Receiver<Vec<super::vk_dispatch::GuestWriteChunk>>>,
-    pub(crate) vk_batch: Vec<nexium_gpu::draw::Maxwell3dDrawCall>,
+        Option<std::sync::mpsc::Receiver<(bool, Vec<super::vk_dispatch::GuestWriteChunk>)>>,
+    pub(crate) vk_batch: PendingDrawBatch,
     pub(crate) prepared_draw_packets: PreparedDrawPacketizer,
+    vk_flush_completed: bool,
     pub(crate) ssbo_snapshot_cache: SsboSnapshotCache,
     pub(crate) inline_upload: KeplerMemory,
     pub(crate) constbuf_invalidation_scratch: Vec<(u64, usize)>,
@@ -254,7 +255,7 @@ impl PrepState {
                 writeback_small_rts,
                 on_complete,
             } => {
-                self.join_small_rt_writeback(mappings);
+                let joined = self.join_small_rt_writeback(mappings);
                 let kp_tail = kickprof::start();
                 self.resolve_pending_compute(mappings, mem_write);
                 kickprof::add(kickprof::RESOLVE_TAIL, kp_tail);
@@ -262,80 +263,114 @@ impl PrepState {
                     self.record_flush_reason(kickprof::FLUSH_HARD_TAIL);
                 }
                 self.flush_vk_with_boundary(mappings, mem_read, mem_write, hard_after);
-                self.finish_prepared_draw_packet_tail(hard_after, writeback_small_rts);
-                if writeback_small_rts {
+                let submitted = self.finish_prepared_draw_packet_tail(hard_after);
+                let writeback_completed = if !joined {
+                    false
+                } else if writeback_small_rts
+                    && super::vk_dispatch::has_pending_small_rt_writebacks()
+                {
                     if let Some(r) = self.renderer.clone() {
                         let kp = kickprof::start();
-                        self.writeback_small_rts(&r, mappings, mem_write);
+                        let completed = self.writeback_small_rts(&r, mappings, mem_write);
                         kickprof::add(kickprof::SMALLRT, kp);
+                        completed
+                    } else {
+                        false
                     }
-                }
+                } else {
+                    true
+                };
                 self.end_ssbo_snapshot_epoch();
-                self.schedule_kick_completion(on_complete);
-                true
+                let completed = joined && submitted && writeback_completed;
+                if completed {
+                    self.schedule_kick_completion(on_complete);
+                }
+                completed
             }
             PrepEvent::Present {
                 job,
                 flush_small_rts,
             } => {
                 let kp_wb = super::pusher::kickprof::start();
-                if flush_small_rts
-                    && self.renderer.is_some()
-                    && super::vk_dispatch::has_pending_small_rt_writebacks()
-                {
-                    let renderer = self.renderer.clone().unwrap();
-                    let async_memory = super::vk_dispatch::async_small_rt_writeback_enabled()
-                        .then(|| self.guest_memory.clone())
-                        .flatten()
-                        .filter(super::GuestMemoryAccess::is_available);
-                    if let Some(memory) = async_memory {
-                        self.join_small_rt_writeback(mappings);
-                        let kp_flush = super::pusher::kickprof::start();
-                        let flushed = self.flush_prepared_draw_packets();
-                        super::pusher::kickprof::add(
-                            super::pusher::kickprof::PRES_WB_FLUSH,
-                            kp_flush,
-                        );
-                        if flushed {
-                            self.pending_small_rt_wb =
+                let joined = self.join_small_rt_writeback(mappings);
+                let kp_flush = super::pusher::kickprof::start();
+                let flushed = self.flush_prepared_draw_packets();
+                super::pusher::kickprof::add(super::pusher::kickprof::PRES_WB_FLUSH, kp_flush);
+                let completed = if !joined || !flushed {
+                    false
+                } else if flush_small_rts && super::vk_dispatch::has_pending_small_rt_writebacks() {
+                    if let Some(renderer) = self.renderer.clone() {
+                        let async_memory = super::vk_dispatch::async_small_rt_writeback_enabled()
+                            .then(|| self.guest_memory.clone())
+                            .flatten()
+                            .filter(super::GuestMemoryAccess::is_available);
+                        if let Some(memory) = async_memory {
+                            if let Some(pending) =
                                 super::vk_dispatch::spawn_small_rt_writeback_async(
                                     &renderer, memory,
-                                );
+                                )
+                            {
+                                self.pending_small_rt_wb = Some(pending);
+                                true
+                            } else {
+                                super::vk_dispatch::writeback_small_rts(
+                                    &renderer,
+                                    mappings,
+                                    mem_write,
+                                    &mut self.ssbo_snapshot_cache,
+                                )
+                            }
                         } else {
-                            log::warn!("[rt-writeback] skipped after prepared draw drain failure");
+                            super::vk_dispatch::writeback_small_rts(
+                                &renderer,
+                                mappings,
+                                mem_write,
+                                &mut self.ssbo_snapshot_cache,
+                            )
                         }
                     } else {
-                        let _ = self.writeback_small_rts(&renderer, mappings, mem_write);
+                        false
                     }
                 } else {
-                    self.flush_prepared_draw_packets();
-                }
+                    true
+                };
                 super::pusher::kickprof::add(super::pusher::kickprof::PRES_WB, kp_wb);
-                let kp_submit = super::pusher::kickprof::start();
-                if let Some(rt) = crate::render_thread::maybe_render_thread() {
-                    rt.submit_named("async-present-readback", job);
-                } else {
-                    job();
+                if completed {
+                    let kp_submit = super::pusher::kickprof::start();
+                    if let Some(rt) = crate::render_thread::maybe_render_thread() {
+                        rt.submit_named("async-present-readback", job);
+                    } else {
+                        job();
+                    }
+                    super::pusher::kickprof::add(super::pusher::kickprof::PRES_SUBMIT, kp_submit);
                 }
-                super::pusher::kickprof::add(super::pusher::kickprof::PRES_SUBMIT, kp_submit);
-                true
+                completed
             }
             PrepEvent::DrainBarrier {
                 done,
                 flush_small_rts,
             } => {
-                self.join_small_rt_writeback(mappings);
-                if flush_small_rts
-                    && self.renderer.is_some()
-                    && super::vk_dispatch::has_pending_small_rt_writebacks()
-                {
-                    let renderer = self.renderer.clone().unwrap();
-                    let _ = self.writeback_small_rts(&renderer, mappings, mem_write);
+                let joined = self.join_small_rt_writeback(mappings);
+                let flushed = self.flush_prepared_draw_packets();
+                let writeback_completed = if !joined || !flushed {
+                    false
+                } else if flush_small_rts && super::vk_dispatch::has_pending_small_rt_writebacks() {
+                    if let Some(renderer) = self.renderer.clone() {
+                        super::vk_dispatch::writeback_small_rts(
+                            &renderer,
+                            mappings,
+                            mem_write,
+                            &mut self.ssbo_snapshot_cache,
+                        )
+                    } else {
+                        false
+                    }
                 } else {
-                    self.flush_prepared_draw_packets();
-                }
-                let _ = done.send(());
-                true
+                    true
+                };
+                let completed = joined && flushed && writeback_completed;
+                let _ = done.send(completed);
+                completed
             }
             PrepEvent::SemAcquire {
                 gpu_va,
@@ -372,6 +407,7 @@ impl PrepState {
                     );
                 }
                 self.ssbo_snapshot_cache.mirror_bump_sweep();
+                self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
                 let _ = ack.send(());
                 true
             }
@@ -395,6 +431,7 @@ impl PrepState {
                 long,
             } => {
                 self.resolve_pending_compute(mappings, mem_write);
+                self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
                 self.ssbo_snapshot_cache.invalidate_gpu_write(
                     mappings,
                     gpu_va,
@@ -474,11 +511,13 @@ impl PrepState {
                         if texture_cache_invalidate_clear_enabled() {
                             if let Some(r) = self.renderer.clone() {
                                 if let Some(rt) = crate::render_thread::maybe_render_thread() {
-                                    self.flush_prepared_draw_packets();
-                                    rt.submit_named(
+                                    let flushed = self.flush_prepared_draw_packets();
+                                    let submitted = rt.submit_timeout_named(
                                         "texture-cache-invalidate",
                                         Box::new(move || r.clear_texture_cache()),
+                                        std::time::Duration::from_secs(3),
                                     );
+                                    self.vk_flush_completed &= flushed && submitted;
                                 } else {
                                     r.clear_texture_cache();
                                 }
@@ -498,6 +537,7 @@ impl PrepState {
             }
             PrepEvent::SemRelease(writes) => {
                 self.resolve_pending_compute(mappings, mem_write);
+                self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
                 let can_complete_asynchronously =
                     super::completion::async_semaphore_completion_enabled()
                         && self
@@ -641,7 +681,7 @@ impl PrepState {
                 if let Some(r) = self.renderer.clone() {
                     if replay_constbuf_writes.is_empty() {
                         let kp = kickprof::start();
-                        super::vk_dispatch::enqueue_draws(
+                        let completed = super::vk_dispatch::enqueue_draws(
                             &draws,
                             &mut self.vk_batch,
                             &mut self.prepared_draw_packets,
@@ -655,6 +695,7 @@ impl PrepState {
                             mem_write,
                             compute_probe.as_mut(),
                         );
+                        self.vk_flush_completed &= completed;
                         kickprof::add(kickprof::ENQ, kp);
                     } else {
                         let mut draw_start = 0;
@@ -678,7 +719,7 @@ impl PrepState {
                             }
                             committed_constbuf_writes = end;
                             let kp = kickprof::start();
-                            super::vk_dispatch::enqueue_draws(
+                            let completed = super::vk_dispatch::enqueue_draws(
                                 &draws[draw_start..draw_end],
                                 &mut self.vk_batch,
                                 &mut self.prepared_draw_packets,
@@ -692,6 +733,7 @@ impl PrepState {
                                 mem_write,
                                 compute_probe.as_mut(),
                             );
+                            self.vk_flush_completed &= completed;
                             kickprof::add(kickprof::ENQ, kp);
                             draw_start = draw_end;
                         }
@@ -907,6 +949,91 @@ impl PrepState {
                 super::engines::FERMI_2D_CLASS => {
                     let fermi_2d = &mut *engines.fermi_2d;
                     if super::engines::fermi_2d::method_executes_blit(method) {
+                        if fermi_ordered_exact_enabled() {
+                            if let Some(preview) =
+                                fermi_2d.preview_exact_identity_blit(arg, mappings)
+                            {
+                                let copy_size = usize::try_from(preview.destination_size).ok();
+                                let compute_overlap = copy_size.is_none_or(|size| {
+                                    super::engines::maxwell_compute::has_pending_writebacks()
+                                        && (super::engines::maxwell_compute::pending_writeback_overlaps(
+                                            preview.source.gpu_va,
+                                            preview.source.cpu_addr,
+                                            size,
+                                        ) || super::engines::maxwell_compute::pending_writeback_overlaps(
+                                            preview.destination.gpu_va,
+                                            preview.destination.cpu_addr,
+                                            size,
+                                        ))
+                                });
+                                if !compute_overlap {
+                                    self.record_flush_reason(kickprof::FLUSH_HARD_FERMI);
+                                    self.flush_vk_soft(mappings, mem_read, mem_write);
+                                    self.ssbo_snapshot_cache.clear_ssbo_snapshots();
+                                    if let (Some(source), Some(renderer)) = (
+                                        self.prepared_draw_packets
+                                            .latest_pending_exact_color_source(
+                                                preview.source,
+                                                preview.expected_bpp,
+                                            ),
+                                        self.renderer.clone(),
+                                    ) {
+                                        let destination = preview.destination;
+                                        let expected_bpp = preview.expected_bpp;
+                                        let job_renderer = Arc::clone(&renderer);
+                                        let job = Box::new(move || {
+                                            match job_renderer.execute_ordered_rt_copy_exact(
+                                                source,
+                                                expected_bpp,
+                                                destination,
+                                            ) {
+                                                Ok(Some(_)) => {}
+                                                Ok(None) => log::warn!(
+                                                    "Fermi2D: ordered exact RT copy source vanished"
+                                                ),
+                                                Err(error) => log::warn!(
+                                                    "Fermi2D: ordered exact RT copy failed: {}",
+                                                    error
+                                                ),
+                                            }
+                                        });
+                                        if !self
+                                            .prepared_draw_packets
+                                            .drain_hard_then_job("fermi-ordered-exact-copy", job)
+                                        {
+                                            log::warn!(
+                                                "Fermi2D: ordered exact RT copy enqueue failed"
+                                            );
+                                            return false;
+                                        }
+                                        let kp = kickprof::start();
+                                        let pre = fermi_2d.blit_count;
+                                        if !fermi_2d.commit_ordered_exact_blit(arg, &preview) {
+                                            log::error!(
+                                                "Fermi2D: ordered exact RT copy commit rejected"
+                                            );
+                                            return false;
+                                        }
+                                        if let Some((gpu_addr, size)) =
+                                            fermi_2d.take_logical_guest_write_span()
+                                        {
+                                            self.ssbo_snapshot_cache
+                                                .invalidate_gpu_write(mappings, gpu_addr, size);
+                                        }
+                                        self.invalidate_resolved_compute_writebacks(mappings);
+                                        let n = fermi_2d.blit_count - pre;
+                                        if n > 0 {
+                                            stats
+                                                .fermi_2d_blits
+                                                .fetch_add(n, AtomicOrdering::Relaxed);
+                                        }
+                                        kickprof::add(kickprof::FERMI, kp);
+                                        kickprof::count(kickprof::FERMI_DRAIN_SKIPPED, 1);
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
                         self.record_flush_reason(kickprof::FLUSH_HARD_FERMI);
                         self.flush_vk(mappings, mem_read, mem_write);
                         self.ssbo_snapshot_cache.clear_ssbo_snapshots();
@@ -1058,6 +1185,7 @@ impl PrepState {
 
     pub(crate) fn begin_ssbo_snapshot_epoch(&mut self) {
         self.ssbo_snapshot_cache.mirror_begin_kick();
+        self.ssbo_snapshot_cache.mirror_cbuf_barrier_bump();
         self.ssbo_snapshot_cache.reset_epoch();
         self.ssbo_snapshot_cache.refresh_input_guest_writes();
     }
@@ -1070,12 +1198,12 @@ impl PrepState {
         super::pusher::kickprof::add(super::pusher::kickprof::EPOCH_END, kp);
     }
 
-    fn join_small_rt_writeback(&mut self, mappings: &GpuMappings) {
+    fn join_small_rt_writeback(&mut self, mappings: &GpuMappings) -> bool {
         let Some(rx) = self.pending_small_rt_wb.take() else {
-            return;
+            return true;
         };
         match rx.recv_timeout(std::time::Duration::from_millis(500)) {
-            Ok(chunks) => {
+            Ok((completed, chunks)) => {
                 if !chunks.is_empty() {
                     super::vk_dispatch::apply_small_rt_writeback_chunks(
                         &mut self.ssbo_snapshot_cache,
@@ -1083,8 +1211,17 @@ impl PrepState {
                         &chunks,
                     );
                 }
+                completed
             }
-            Err(_) => log::warn!("[rt-writeback] async join timed out"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                log::warn!("[rt-writeback] async join timed out");
+                self.pending_small_rt_wb = Some(rx);
+                false
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                log::warn!("[rt-writeback] async join disconnected");
+                false
+            }
         }
     }
 
@@ -1160,7 +1297,9 @@ impl PrepState {
         {
             self.prepared_packet_drain_counts.hard += 1;
         }
-        self.prepared_draw_packets.drain_hard()
+        let drained = self.prepared_draw_packets.drain_hard();
+        let submitted = self.prepared_draw_packets.take_submit_completed();
+        std::mem::replace(&mut self.vk_flush_completed, true) && drained && submitted
     }
 
     pub(crate) fn flush_prepared_draw_packets_soft(&mut self) -> bool {
@@ -1168,16 +1307,17 @@ impl PrepState {
         {
             self.prepared_packet_drain_counts.soft += 1;
         }
-        self.prepared_draw_packets.drain_soft()
+        let drained = self.prepared_draw_packets.drain_soft();
+        let submitted = self.prepared_draw_packets.take_submit_completed();
+        std::mem::replace(&mut self.vk_flush_completed, true) && drained && submitted
     }
 
-    pub(crate) fn finish_prepared_draw_packet_tail(
-        &mut self,
-        hard_after: bool,
-        writeback_small_rts: bool,
-    ) {
-        if !hard_after && !writeback_small_rts {
-            self.flush_prepared_draw_packets_soft();
+    pub(crate) fn finish_prepared_draw_packet_tail(&mut self, hard_after: bool) -> bool {
+        if hard_after {
+            let submitted = self.prepared_draw_packets.take_submit_completed();
+            std::mem::replace(&mut self.vk_flush_completed, true) && submitted
+        } else {
+            self.flush_prepared_draw_packets_soft()
         }
     }
 
@@ -1216,14 +1356,15 @@ impl PrepState {
     ) {
         if self.vk_batch.is_empty() {
             if hard_after {
-                self.flush_prepared_draw_packets();
+                let completed = self.prepared_draw_packets.drain_hard();
+                self.vk_flush_completed &= completed;
             }
             return;
         }
         let dp = draw_prof_start();
         let batch_len = self.vk_batch.len();
         let kp = super::pusher::kickprof::start();
-        if let Some(r) = self.renderer.clone() {
+        let completed = if let Some(r) = self.renderer.clone() {
             if hard_after {
                 super::vk_dispatch::flush_accum(
                     &mut self.vk_batch,
@@ -1233,7 +1374,7 @@ impl PrepState {
                     mem_write,
                     &mut self.ssbo_snapshot_cache,
                     &mut self.prepared_draw_packets,
-                );
+                )
             } else {
                 super::vk_dispatch::flush_accum_soft(
                     &mut self.vk_batch,
@@ -1243,14 +1384,16 @@ impl PrepState {
                     mem_write,
                     &mut self.ssbo_snapshot_cache,
                     &mut self.prepared_draw_packets,
-                );
+                )
             }
         } else {
             if hard_after {
-                self.flush_prepared_draw_packets();
+                let _ = self.prepared_draw_packets.drain_hard();
             }
             self.vk_batch.clear();
-        }
+            false
+        };
+        self.vk_flush_completed &= completed;
         super::pusher::kickprof::add(super::pusher::kickprof::FLUSHP, kp);
         draw_prof_record(1, batch_len as u64, dp);
     }
@@ -1461,8 +1604,9 @@ impl PrepState {
             renderer: None,
             guest_memory: None,
             pending_small_rt_wb: None,
-            vk_batch: Vec::new(),
+            vk_batch: PendingDrawBatch::default(),
             prepared_draw_packets: PreparedDrawPacketizer::default(),
+            vk_flush_completed: true,
             ssbo_snapshot_cache: SsboSnapshotCache::default(),
             inline_upload: KeplerMemory::new(),
             constbuf_invalidation_scratch: Vec::new(),
@@ -1482,6 +1626,25 @@ fn fermi_lazy_drain_enabled() -> bool {
             Some("1") | Some("true") | Some("on") | Some("yes")
         ) && super::experimental_gpu_scheduling_enabled()
     })
+}
+
+fn fermi_ordered_exact_value_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        let value = value.trim();
+        value == "0"
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("no")
+    })
+}
+
+fn fermi_ordered_exact_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        fermi_ordered_exact_value_enabled(
+            std::env::var("NEXIUM_FERMI_ORDERED_EXACT").ok().as_deref(),
+        )
+    }) && crate::render_thread::maybe_render_thread().is_some()
 }
 
 fn trace_constbuf_upload(trace: Option<(u64, u32)>, gpu_va: u64, cpu: u64, dword: u32) {
@@ -1515,6 +1678,24 @@ pub(crate) enum PrepLane {
     Threaded(PrepThreadHandle),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrepThreadBehavior {
+    Pipeline,
+    DrainEachKick,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrepBarrierDispatch {
+    Queued,
+    Inline,
+    Disconnected,
+}
+
+pub(crate) enum PrepThreadShutdown {
+    Joined { state: PrepState, drained: bool },
+    Panicked { drained: bool },
+}
+
 impl PrepLane {
     pub(crate) fn inline_state(&mut self) -> Option<&mut PrepState> {
         match self {
@@ -1535,8 +1716,36 @@ pub(crate) enum PrepEngineAccess<'a, 'b> {
 
 pub(crate) struct PrepThreadHandle {
     tx: crossbeam::channel::Sender<PrepEvent>,
+    worker: std::thread::JoinHandle<PrepState>,
     draw_vec_recycle_rx: Option<crossbeam::channel::Receiver<Vec<DrawCall>>>,
     inflight_kicks: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+    failed: Arc<AtomicBool>,
+    behavior: PrepThreadBehavior,
+}
+
+struct PrepWorkerExitGuard {
+    failed: Arc<AtomicBool>,
+    inflight_kicks: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+    clean: bool,
+}
+
+impl Drop for PrepWorkerExitGuard {
+    fn drop(&mut self) {
+        if self.clean {
+            return;
+        }
+        self.failed.store(true, Ordering::Release);
+        let (lock, condvar) = &*self.inflight_kicks;
+        let mut inflight = lock.lock().unwrap_or_else(|error| error.into_inner());
+        *inflight = 0;
+        condvar.notify_all();
+    }
+}
+
+fn record_prep_event_completion(failed: &AtomicBool, completed: bool) {
+    if !completed {
+        failed.store(true, Ordering::Release);
+    }
 }
 
 const PREP_EVENT_QUEUE_CAPACITY: usize = 4096;
@@ -1681,7 +1890,21 @@ impl PrepThreadHandle {
     }
 
     pub(crate) fn send_recover(&self, event: PrepEvent) -> Result<(), PrepEvent> {
-        self.tx.send(event).map_err(|error| error.0)
+        if self.failed.load(Ordering::Acquire) {
+            return Err(event);
+        }
+        self.tx.send(event).map_err(|error| {
+            self.failed.store(true, Ordering::Release);
+            error.0
+        })
+    }
+
+    pub(crate) fn behavior(&self) -> PrepThreadBehavior {
+        self.behavior
+    }
+
+    pub(crate) fn failure_latch(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.failed)
     }
 
     pub(crate) fn try_take_recycled_draw_vec(&self) -> Option<Vec<DrawCall>> {
@@ -1689,12 +1912,22 @@ impl PrepThreadHandle {
     }
 
     pub(crate) fn begin_kick(&self) {
+        if self.failed.load(Ordering::Acquire) {
+            return;
+        }
         let (lock, condvar) = &*self.inflight_kicks;
         let mut inflight = lock.lock().unwrap_or_else(|error| error.into_inner());
         while *inflight >= prep_kicks_in_flight() {
-            inflight = condvar
-                .wait(inflight)
+            if self.failed.load(Ordering::Acquire) {
+                return;
+            }
+            let (next, _) = condvar
+                .wait_timeout(inflight, Duration::from_millis(50))
                 .unwrap_or_else(|error| error.into_inner());
+            inflight = next;
+        }
+        if self.failed.load(Ordering::Acquire) {
+            return;
         }
         *inflight += 1;
     }
@@ -1708,6 +1941,30 @@ impl PrepThreadHandle {
 
     pub(crate) fn cancel_kick(&self) {
         Self::finish_kick(&self.inflight_kicks);
+    }
+
+    pub(crate) fn shutdown(self, flush_small_rts: bool) -> PrepThreadShutdown {
+        let Self {
+            tx,
+            worker,
+            draw_vec_recycle_rx: _,
+            inflight_kicks: _,
+            failed,
+            behavior: _,
+        } = self;
+        let (done_tx, done_rx) = crossbeam::channel::bounded(1);
+        let queued = tx
+            .send(PrepEvent::DrainBarrier {
+                done: done_tx,
+                flush_small_rts,
+            })
+            .is_ok();
+        let drained = queued && done_rx.recv().unwrap_or(false) && !failed.load(Ordering::Acquire);
+        drop(tx);
+        match worker.join() {
+            Ok(state) => PrepThreadShutdown::Joined { state, drained },
+            Err(_) => PrepThreadShutdown::Panicked { drained },
+        }
     }
 }
 
@@ -1726,6 +1983,7 @@ pub(crate) struct PrepThreadResources {
 pub(crate) fn spawn_prep_thread(
     mut state: PrepState,
     resources: PrepThreadResources,
+    behavior: PrepThreadBehavior,
 ) -> PrepThreadHandle {
     let (tx, rx) = crossbeam::channel::bounded::<PrepEvent>(PREP_EVENT_QUEUE_CAPACITY);
     let (draw_vec_recycle_tx, draw_vec_recycle_rx) = if draw_vec_recycling_enabled() {
@@ -1737,9 +1995,16 @@ pub(crate) fn spawn_prep_thread(
     };
     let inflight_kicks = Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
     let worker_inflight = Arc::clone(&inflight_kicks);
-    std::thread::Builder::new()
+    let failed = Arc::new(AtomicBool::new(false));
+    let worker_failed = Arc::clone(&failed);
+    let worker = std::thread::Builder::new()
         .name("nexium-gpu-prep".to_string())
         .spawn(move || {
+            let mut exit_guard = PrepWorkerExitGuard {
+                failed: Arc::clone(&worker_failed),
+                inflight_kicks: Arc::clone(&worker_inflight),
+                clean: false,
+            };
             nexium_common::thread_cpu_set::apply_current_thread_cpu_set(
                 nexium_common::thread_cpu_set::ThreadCpuSetTarget::GpuPrep,
             );
@@ -1798,6 +2063,19 @@ pub(crate) fn spawn_prep_thread(
                 let mut kepler_memory = resources.kepler_memory.lock();
                 let mappings = resources.mappings.read_recursive();
                 for event in burst {
+                    if worker_failed.load(Ordering::Acquire) {
+                        match event {
+                            PrepEvent::KickEnd { on_complete, .. } => {
+                                drop(on_complete);
+                                PrepThreadHandle::finish_kick(&worker_inflight);
+                            }
+                            PrepEvent::DrainBarrier { done, .. } => {
+                                let _ = done.send(false);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     let class_index = event_class_index(&event);
                     let class_started = burst_started.map(|_| std::time::Instant::now());
                     let (event, deferred_completion, is_kick_end) = match event {
@@ -1832,14 +2110,18 @@ pub(crate) fn spawn_prep_thread(
                             &mem_read,
                             &mem_write,
                             &mem_copy,
-                        );
+                        )
                     }));
                     if outcome.is_err() {
                         log::error!("[gpu-prep] event handler panicked; clearing prep caches");
                         state.vk_batch.clear();
                         state.ssbo_snapshot_cache.clear();
                     }
-                    state.schedule_kick_completion(deferred_completion);
+                    let completed = matches!(outcome, Ok(true));
+                    record_prep_event_completion(&worker_failed, completed);
+                    if completed {
+                        state.schedule_kick_completion(deferred_completion);
+                    }
                     if is_kick_end {
                         PrepThreadHandle::finish_kick(&worker_inflight);
                         prof_kicks += 1;
@@ -1894,22 +2176,53 @@ pub(crate) fn spawn_prep_thread(
                     }
                 }
             }
+
+            let (lock, condvar) = &*worker_inflight;
+            let mut inflight = lock.lock().unwrap_or_else(|error| error.into_inner());
+            *inflight = 0;
+            condvar.notify_all();
+            drop(inflight);
+            exit_guard.clean = true;
+            state
         })
         .expect("spawn GPU prep thread");
     PrepThreadHandle {
         tx,
+        worker,
         draw_vec_recycle_rx,
         inflight_kicks,
+        failed,
+        behavior,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        nonterminal_inline_data_run_end, recycle_processed_draw_vec,
-        texture_cache_invalidate_clear_value_enabled, try_receive_recycled_draw_vec, PrepState,
+        fermi_ordered_exact_value_enabled, nonterminal_inline_data_run_end,
+        record_prep_event_completion, recycle_processed_draw_vec,
+        texture_cache_invalidate_clear_value_enabled, try_receive_recycled_draw_vec, PrepEvent,
+        PrepState, PrepThreadBehavior, PrepThreadHandle, PrepThreadShutdown,
     };
     use crate::gpu::engines::maxwell3d::DrawCall;
+    use crate::gpu::GpuMappings;
+
+    fn test_prep_handle(
+        tx: crossbeam::channel::Sender<PrepEvent>,
+        worker: std::thread::JoinHandle<PrepState>,
+    ) -> PrepThreadHandle {
+        PrepThreadHandle {
+            tx,
+            worker,
+            draw_vec_recycle_rx: None,
+            inflight_kicks: std::sync::Arc::new((
+                std::sync::Mutex::new(0),
+                std::sync::Condvar::new(),
+            )),
+            failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            behavior: PrepThreadBehavior::Pipeline,
+        }
+    }
 
     #[test]
     fn bulk_compute_upload_scanner_stops_before_terminal_word() {
@@ -1946,6 +2259,17 @@ mod tests {
             assert!(texture_cache_invalidate_clear_value_enabled(Some(
                 OsStr::new(enabled)
             )));
+        }
+    }
+
+    #[test]
+    fn ordered_exact_fermi_copies_default_on_with_explicit_rollback() {
+        assert!(fermi_ordered_exact_value_enabled(None));
+        for enabled in ["", "1", "true", "ON", " yes "] {
+            assert!(fermi_ordered_exact_value_enabled(Some(enabled)));
+        }
+        for disabled in ["0", "false", "OFF", " no "] {
+            assert!(!fermi_ordered_exact_value_enabled(Some(disabled)));
         }
     }
 
@@ -1994,6 +2318,113 @@ mod tests {
         assert!(!recycle_processed_draw_vec(
             Some(&disconnected_tx),
             vec![DrawCall::default()]
+        ));
+    }
+
+    #[test]
+    fn hard_tail_propagates_buffered_flush_failure_once() {
+        let mut state = PrepState::new();
+        state.vk_flush_completed = false;
+
+        assert!(!state.finish_prepared_draw_packet_tail(true));
+        assert!(state.finish_prepared_draw_packet_tail(true));
+    }
+
+    #[test]
+    fn async_small_rt_join_propagates_worker_failure() {
+        let mut state = PrepState::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((false, Vec::new())).unwrap();
+        state.pending_small_rt_wb = Some(rx);
+
+        assert!(!state.join_small_rt_writeback(&GpuMappings::new()));
+    }
+
+    #[test]
+    fn prep_thread_shutdown_drains_and_joins() {
+        let (tx, rx) = crossbeam::channel::bounded(2);
+        let worker = std::thread::spawn(move || {
+            let state = PrepState::new();
+            while let Ok(event) = rx.recv() {
+                if let PrepEvent::DrainBarrier { done, .. } = event {
+                    let _ = done.send(true);
+                }
+            }
+            state
+        });
+        let handle = test_prep_handle(tx, worker);
+
+        assert!(matches!(
+            handle.shutdown(false),
+            PrepThreadShutdown::Joined { drained: true, .. }
+        ));
+    }
+
+    #[test]
+    fn prep_thread_shutdown_propagates_failed_barrier() {
+        let (tx, rx) = crossbeam::channel::bounded(2);
+        let worker = std::thread::spawn(move || {
+            let state = PrepState::new();
+            while let Ok(event) = rx.recv() {
+                if let PrepEvent::DrainBarrier { done, .. } = event {
+                    let _ = done.send(false);
+                }
+            }
+            state
+        });
+        let handle = test_prep_handle(tx, worker);
+
+        assert!(matches!(
+            handle.shutdown(false),
+            PrepThreadShutdown::Joined { drained: false, .. }
+        ));
+    }
+
+    #[test]
+    fn prep_thread_shutdown_reports_disconnected_barrier() {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        drop(rx);
+        let worker = std::thread::spawn(PrepState::new);
+        let handle = test_prep_handle(tx, worker);
+
+        assert!(matches!(
+            handle.shutdown(false),
+            PrepThreadShutdown::Joined { drained: false, .. }
+        ));
+    }
+
+    #[test]
+    fn prep_event_failure_latch_never_recovers() {
+        let failed = std::sync::atomic::AtomicBool::new(false);
+
+        record_prep_event_completion(&failed, false);
+        assert!(failed.load(std::sync::atomic::Ordering::Acquire));
+
+        record_prep_event_completion(&failed, true);
+        assert!(failed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_prep_thread_rejects_events_and_shutdown_success() {
+        let (tx, rx) = crossbeam::channel::bounded(2);
+        let worker = std::thread::spawn(move || {
+            let state = PrepState::new();
+            while let Ok(event) = rx.recv() {
+                if let PrepEvent::DrainBarrier { done, .. } = event {
+                    let _ = done.send(true);
+                }
+            }
+            state
+        });
+        let handle = test_prep_handle(tx, worker);
+        handle
+            .failure_latch()
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        assert!(handle.send_recover(PrepEvent::KickBegin).is_err());
+        assert!(matches!(
+            handle.shutdown(false),
+            PrepThreadShutdown::Joined { drained: false, .. }
         ));
     }
 }

@@ -1525,6 +1525,10 @@ impl GpuMappings {
         self.generation
     }
 
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     #[inline]
     pub fn mapping_epoch_for(&self, gpu_va: u64) -> Option<u64> {
         let mapping = &self.mappings[self.mapping_index_for(gpu_va)?];
@@ -1818,7 +1822,11 @@ impl GpuContext {
         self.pending_syncpoint_events.lock()
     }
 
-    pub(crate) fn install_prep_thread(&self, resources: prep::PrepThreadResources) {
+    pub(crate) fn install_prep_thread(
+        &self,
+        resources: prep::PrepThreadResources,
+        behavior: prep::PrepThreadBehavior,
+    ) -> bool {
         let mut pusher = self.pusher.lock();
         let previous = std::mem::replace(
             &mut pusher.prep,
@@ -1826,10 +1834,11 @@ impl GpuContext {
         );
         let prep::PrepLane::Inline(state) = previous else {
             pusher.prep = previous;
-            return;
+            return false;
         };
-        let handle = prep::spawn_prep_thread(state, resources);
+        let handle = prep::spawn_prep_thread(state, resources, behavior);
         pusher.prep = prep::PrepLane::Threaded(handle);
+        true
     }
 
     pub(crate) fn prep_present(
@@ -1855,19 +1864,98 @@ impl GpuContext {
 
     pub(crate) fn prep_drain_barrier(
         &self,
-        done: crossbeam::channel::Sender<()>,
+        done: crossbeam::channel::Sender<bool>,
         flush_small_rts: bool,
-    ) -> bool {
+    ) -> prep::PrepBarrierDispatch {
         let mut pusher = self.pusher.lock();
         match &mut pusher.prep {
             prep::PrepLane::Threaded(handle) => {
-                handle.send(prep::PrepEvent::DrainBarrier {
+                match handle.send_recover(prep::PrepEvent::DrainBarrier {
                     done,
                     flush_small_rts,
-                });
+                }) {
+                    Ok(()) => prep::PrepBarrierDispatch::Queued,
+                    Err(_) => prep::PrepBarrierDispatch::Disconnected,
+                }
+            }
+            prep::PrepLane::Inline(_) => prep::PrepBarrierDispatch::Inline,
+        }
+    }
+
+    fn drain_prep_thread_matching(
+        &self,
+        flush_small_rts: bool,
+        behavior: Option<prep::PrepThreadBehavior>,
+    ) -> bool {
+        let (done_tx, done_rx) = crossbeam::channel::bounded(1);
+        let failed = {
+            let mut pusher = self.pusher.lock();
+            let prep::PrepLane::Threaded(handle) = &mut pusher.prep else {
+                return true;
+            };
+            if behavior.is_some_and(|behavior| handle.behavior() != behavior) {
+                return true;
+            }
+            let failed = handle.failure_latch();
+            if handle
+                .send_recover(prep::PrepEvent::DrainBarrier {
+                    done: done_tx,
+                    flush_small_rts,
+                })
+                .is_err()
+            {
+                return false;
+            }
+            failed
+        };
+        let completed = match done_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(completed) => completed,
+            Err(error) => {
+                log::error!("[gpu-prep] drain barrier failed: {error}");
+                false
+            }
+        };
+        if !completed {
+            failed.store(true, std::sync::atomic::Ordering::Release);
+        }
+        completed
+    }
+
+    pub(crate) fn drain_prep_after_kick(&self) -> bool {
+        self.drain_prep_thread_matching(false, Some(prep::PrepThreadBehavior::DrainEachKick))
+    }
+
+    pub(crate) fn drain_prep_thread(&self, flush_small_rts: bool) -> bool {
+        self.drain_prep_thread_matching(flush_small_rts, None)
+    }
+
+    pub(crate) fn shutdown_prep_thread(&self, flush_small_rts: bool) -> bool {
+        let mut pusher = self.pusher.lock();
+        let previous = std::mem::replace(
+            &mut pusher.prep,
+            prep::PrepLane::Inline(prep::PrepState::new()),
+        );
+        match previous {
+            prep::PrepLane::Inline(state) => {
+                pusher.prep = prep::PrepLane::Inline(state);
                 true
             }
-            prep::PrepLane::Inline(_) => false,
+            prep::PrepLane::Threaded(handle) => match handle.shutdown(flush_small_rts) {
+                prep::PrepThreadShutdown::Joined { state, drained } => {
+                    pusher.prep = prep::PrepLane::Inline(state);
+                    if !drained {
+                        log::error!("[gpu-prep] shutdown barrier failed");
+                    }
+                    drained
+                }
+                prep::PrepThreadShutdown::Panicked { drained } => {
+                    log::error!(
+                        "[gpu-prep] worker panicked during shutdown drained={}",
+                        drained
+                    );
+                    false
+                }
+            },
         }
     }
 
@@ -1981,6 +2069,20 @@ impl GpuContext {
             eager_small_rt_writeback_enabled(),
             on_complete,
         )
+    }
+
+    pub fn snapshot_gpfifo_entries(
+        &self,
+        address: u64,
+        num_entries: u32,
+        mem_read: impl Fn(u64, &mut [u8]) -> bool,
+    ) -> Option<Vec<CommandListHeader>> {
+        let mappings = self.mappings.read();
+        mappings.cpu_address_for(address)?;
+        let bytes_needed = (num_entries as usize).checked_mul(8)?;
+        let mut bytes = vec![0u8; bytes_needed];
+        pusher::read_gpu_scattered(&mappings, address, &mut bytes, &mem_read);
+        Some(pusher::decode_command_list_headers(&bytes))
     }
 
     pub fn submit_gpfifo_soft(
@@ -2455,7 +2557,7 @@ impl Default for GpuContext {
 #[cfg(test)]
 mod tests {
     use super::{
-        eager_small_rt_writeback_value_enabled, GpuContext, GpuMappingChange, GpuMappings,
+        eager_small_rt_writeback_value_enabled, prep, GpuContext, GpuMappingChange, GpuMappings,
         GuestMemoryAccess, PendingSyncpointEvent,
     };
     use parking_lot::RwLock;
@@ -2582,6 +2684,95 @@ mod tests {
                 .prepared_packet_drain_counts(),
             (2, 0)
         );
+    }
+
+    #[test]
+    fn prep_thread_barrier_shutdown_restores_inline_lane() {
+        let gpu = GpuContext::new();
+        let read: crate::AsyncMemoryRead = Arc::new(|_, bytes| {
+            bytes.fill(0);
+            true
+        });
+        let write: crate::AsyncMemoryWrite = Arc::new(|_, _| true);
+        let copy: crate::AsyncMemoryCopy = Arc::new(|_, _, _| true);
+        assert!(gpu.install_prep_thread(
+            prep::PrepThreadResources {
+                maxwell_dma: Arc::clone(&gpu.maxwell_dma),
+                fermi_2d: Arc::clone(&gpu.fermi_2d),
+                kepler_compute: Arc::clone(&gpu.kepler_compute),
+                kepler_memory: Arc::clone(&gpu.kepler_memory),
+                mappings: Arc::clone(&gpu.mappings),
+                stats: Arc::clone(&gpu.stats),
+                mem_read: read,
+                mem_write: write,
+                mem_copy: copy,
+            },
+            prep::PrepThreadBehavior::Pipeline,
+        ));
+        assert!(gpu.pusher.lock().prep.is_threaded());
+        let (done_tx, done_rx) = crossbeam::channel::bounded(1);
+        assert_eq!(
+            gpu.prep_drain_barrier(done_tx, false),
+            prep::PrepBarrierDispatch::Queued
+        );
+        assert!(done_rx.recv().unwrap());
+
+        assert!(gpu.shutdown_prep_thread(false));
+        assert!(!gpu.pusher.lock().prep.is_threaded());
+        assert!(gpu.shutdown_prep_thread(false));
+    }
+
+    #[test]
+    fn drain_each_kick_waits_for_kick_completion() {
+        let gpu = GpuContext::new();
+        let read: crate::AsyncMemoryRead = Arc::new(|_, bytes| {
+            bytes.fill(0);
+            true
+        });
+        let write: crate::AsyncMemoryWrite = Arc::new(|_, _| true);
+        let copy: crate::AsyncMemoryCopy = Arc::new(|_, _, _| true);
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_callback = Arc::clone(&completed);
+        assert!(gpu.install_prep_thread(
+            prep::PrepThreadResources {
+                maxwell_dma: Arc::clone(&gpu.maxwell_dma),
+                fermi_2d: Arc::clone(&gpu.fermi_2d),
+                kepler_compute: Arc::clone(&gpu.kepler_compute),
+                kepler_memory: Arc::clone(&gpu.kepler_memory),
+                mappings: Arc::clone(&gpu.mappings),
+                stats: Arc::clone(&gpu.stats),
+                mem_read: Arc::clone(&read),
+                mem_write: Arc::clone(&write),
+                mem_copy: Arc::clone(&copy),
+            },
+            prep::PrepThreadBehavior::DrainEachKick,
+        ));
+
+        gpu.process_inline_gpfifo(
+            &[],
+            move |address, bytes| read(address, bytes),
+            move |address, bytes| write(address, bytes),
+            move |source, destination, size| copy(source, destination, size),
+            Some(Box::new(move || {
+                completed_callback.store(true, std::sync::atomic::Ordering::Release)
+            })),
+        );
+
+        assert!(gpu.drain_prep_after_kick());
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+        assert!(gpu.shutdown_prep_thread(false));
+    }
+
+    #[test]
+    fn inline_prep_barrier_is_explicit() {
+        let gpu = GpuContext::new();
+        let (done_tx, done_rx) = crossbeam::channel::bounded(1);
+
+        assert_eq!(
+            gpu.prep_drain_barrier(done_tx, false),
+            prep::PrepBarrierDispatch::Inline
+        );
+        assert!(done_rx.recv().is_err());
     }
 
     #[test]
