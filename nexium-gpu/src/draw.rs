@@ -510,11 +510,46 @@ pub struct ResidentCbufSlot {
     pub packed_offset: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ResidentCbufSource {
+    pub page_key: u64,
+    pub generation: u64,
+    pub serial: u64,
+    pub data: std::sync::Arc<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentCbufSegment {
+    pub source_index: u32,
+    pub byte_offset: u32,
+    pub byte_len: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentCbufArenaSlot {
+    pub logical_slot: u32,
+    pub word_count: u32,
+    pub segment_start: u32,
+    pub segment_count: u16,
+    pub byte_len: u32,
+    pub packed_offset: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ResidentCbufArena {
+    pub sources: Box<[ResidentCbufSource]>,
+    pub segments: Box<[ResidentCbufSegment]>,
+    pub slots: Box<[ResidentCbufArenaSlot]>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ResidentCbufDraw {
     pub chunks: Vec<ResidentVertexChunk>,
     pub slots: Vec<ResidentCbufSlot>,
     pub packed_size: usize,
+    pub arena: Option<std::sync::Arc<ResidentCbufArena>>,
+    pub arena_slot_start: u32,
+    pub arena_slot_count: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

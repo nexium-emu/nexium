@@ -1,8 +1,154 @@
 use ash::vk;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 const RT_COLOR_GPU_PAGE_SHIFT: u32 = 20;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RtAliasIndexedLookupTelemetry {
+    pub exact_hits: u64,
+    pub exact_misses: u64,
+    pub wildcard_fallbacks: u64,
+    pub cpu_candidates: u64,
+    pub shadow_mismatches: u64,
+}
+
+static RT_ALIAS_INDEXED_EXACT_HITS: AtomicU64 = AtomicU64::new(0);
+static RT_ALIAS_INDEXED_EXACT_MISSES: AtomicU64 = AtomicU64::new(0);
+static RT_ALIAS_INDEXED_WILDCARD_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static RT_ALIAS_INDEXED_CPU_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+static RT_ALIAS_INDEXED_SHADOW_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+type RtSampleableColorAlias = (RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format);
+type RtSampleableDepthAlias = (
+    RtKey,
+    vk::Image,
+    vk::ImageView,
+    vk::ImageLayout,
+    vk::Format,
+    vk::ImageAspectFlags,
+);
+
+fn rt_alias_indexed_lookup_value_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        let value = value.trim();
+        value == "0"
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("no")
+    })
+}
+
+fn rt_alias_indexed_lookup_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        rt_alias_indexed_lookup_value_enabled(
+            std::env::var("NEXIUM_RT_ALIAS_INDEXED_LOOKUP")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn rt_alias_indexed_lookup_shadow_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_RT_ALIAS_INDEXED_LOOKUP_SHADOW")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+fn rt_alias_indexed_lookup_telemetry_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        rt_alias_indexed_lookup_shadow_enabled()
+            || std::env::var("NEXIUM_RT_ALIAS_INDEXED_LOOKUP_PROFILE")
+                .ok()
+                .as_deref()
+                == Some("1")
+    })
+}
+
+#[inline]
+fn count_rt_alias_indexed(counter: &AtomicU64, value: u64) {
+    if value != 0 && rt_alias_indexed_lookup_telemetry_enabled() {
+        counter.fetch_add(value, Ordering::Relaxed);
+    }
+}
+
+fn rt_sampleable_color_alias_equal(
+    indexed: &Option<RtSampleableColorAlias>,
+    legacy: &Option<RtSampleableColorAlias>,
+) -> bool {
+    match (indexed, legacy) {
+        (Some(indexed), Some(legacy)) => {
+            indexed.0.same_live_identity(legacy.0)
+                && indexed.1 == legacy.1
+                && indexed.2 == legacy.2
+                && indexed.3 == legacy.3
+                && indexed.4 == legacy.4
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn rt_sampleable_depth_alias_equal(
+    indexed: &Option<RtSampleableDepthAlias>,
+    legacy: &Option<RtSampleableDepthAlias>,
+) -> bool {
+    match (indexed, legacy) {
+        (Some(indexed), Some(legacy)) => {
+            indexed.0.same_live_identity(legacy.0)
+                && indexed.1 == legacy.1
+                && indexed.2 == legacy.2
+                && indexed.3 == legacy.3
+                && indexed.4 == legacy.4
+                && indexed.5 == legacy.5
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+#[inline]
+fn rt_alias_shadow_color_result(
+    indexed: Option<RtSampleableColorAlias>,
+    legacy: Option<RtSampleableColorAlias>,
+) -> Option<RtSampleableColorAlias> {
+    if !rt_sampleable_color_alias_equal(&indexed, &legacy) {
+        count_rt_alias_indexed(&RT_ALIAS_INDEXED_SHADOW_MISMATCHES, 1);
+    }
+    legacy
+}
+
+#[inline]
+fn rt_alias_shadow_depth_result(
+    indexed: Option<RtSampleableDepthAlias>,
+    legacy: Option<RtSampleableDepthAlias>,
+) -> Option<RtSampleableDepthAlias> {
+    if !rt_sampleable_depth_alias_equal(&indexed, &legacy) {
+        count_rt_alias_indexed(&RT_ALIAS_INDEXED_SHADOW_MISMATCHES, 1);
+    }
+    legacy
+}
+
+pub fn take_rt_alias_indexed_lookup_telemetry() -> RtAliasIndexedLookupTelemetry {
+    if !rt_alias_indexed_lookup_telemetry_enabled() {
+        return RtAliasIndexedLookupTelemetry::default();
+    }
+    RtAliasIndexedLookupTelemetry {
+        exact_hits: RT_ALIAS_INDEXED_EXACT_HITS.swap(0, Ordering::Relaxed),
+        exact_misses: RT_ALIAS_INDEXED_EXACT_MISSES.swap(0, Ordering::Relaxed),
+        wildcard_fallbacks: RT_ALIAS_INDEXED_WILDCARD_FALLBACKS.swap(0, Ordering::Relaxed),
+        cpu_candidates: RT_ALIAS_INDEXED_CPU_CANDIDATES.swap(0, Ordering::Relaxed),
+        shadow_mismatches: RT_ALIAS_INDEXED_SHADOW_MISMATCHES.swap(0, Ordering::Relaxed),
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct RtKey {
@@ -2105,6 +2251,30 @@ impl RtCache {
         vk::Format,
         vk::ImageAspectFlags,
     )> {
+        if !rt_alias_indexed_lookup_enabled() {
+            return self.find_sampleable_depth_for_exact_alias_legacy(want);
+        }
+        let indexed = self.find_sampleable_depth_for_exact_alias_indexed(want);
+        if !rt_alias_indexed_lookup_shadow_enabled() {
+            return indexed;
+        }
+        rt_alias_shadow_depth_result(
+            indexed,
+            self.find_sampleable_depth_for_exact_alias_legacy(want),
+        )
+    }
+
+    fn find_sampleable_depth_for_exact_alias_legacy(
+        &self,
+        want: RtKey,
+    ) -> Option<(
+        RtKey,
+        vk::Image,
+        vk::ImageView,
+        vk::ImageLayout,
+        vk::Format,
+        vk::ImageAspectFlags,
+    )> {
         let (key, image) = self
             .depth_cache
             .iter()
@@ -2113,6 +2283,45 @@ impl RtCache {
         if self.depth_is_guest_stale(key) || image.layout == vk::ImageLayout::UNDEFINED {
             return None;
         }
+        Some((
+            key,
+            image.image,
+            image.view,
+            image.layout,
+            image.format,
+            image.aspects,
+        ))
+    }
+
+    fn find_sampleable_depth_for_exact_alias_indexed(
+        &self,
+        want: RtKey,
+    ) -> Option<(
+        RtKey,
+        vk::Image,
+        vk::ImageView,
+        vk::ImageLayout,
+        vk::Format,
+        vk::ImageAspectFlags,
+    )> {
+        if want.gpu_va == 0 {
+            count_rt_alias_indexed(&RT_ALIAS_INDEXED_WILDCARD_FALLBACKS, 1);
+            return self.find_sampleable_depth_for_exact_alias_legacy(want);
+        }
+        let Some((key, image)) = self
+            .depth_cache
+            .get_key_value(&want)
+            .filter(|(candidate, _)| exact_texture_alias_identity(**candidate, want))
+            .map(|(key, image)| (*key, image))
+        else {
+            count_rt_alias_indexed(&RT_ALIAS_INDEXED_EXACT_MISSES, 1);
+            return None;
+        };
+        if self.depth_is_guest_stale(key) || image.layout == vk::ImageLayout::UNDEFINED {
+            count_rt_alias_indexed(&RT_ALIAS_INDEXED_EXACT_MISSES, 1);
+            return None;
+        }
+        count_rt_alias_indexed(&RT_ALIAS_INDEXED_EXACT_HITS, 1);
         Some((
             key,
             image.image,
@@ -2309,6 +2518,23 @@ impl RtCache {
         &self,
         want: RtKey,
     ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
+        if !rt_alias_indexed_lookup_enabled() {
+            return self.find_sampleable_color_for_exact_alias_legacy(want);
+        }
+        let indexed = self.find_sampleable_color_for_exact_alias_indexed(want);
+        if !rt_alias_indexed_lookup_shadow_enabled() {
+            return indexed;
+        }
+        rt_alias_shadow_color_result(
+            indexed,
+            self.find_sampleable_color_for_exact_alias_legacy(want),
+        )
+    }
+
+    fn find_sampleable_color_for_exact_alias_legacy(
+        &self,
+        want: RtKey,
+    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
         let (key, image) = self
             .cache
             .iter()
@@ -2320,12 +2546,57 @@ impl RtCache {
         Some((key, image.image, image.view, image.layout, image.format))
     }
 
+    fn find_sampleable_color_for_exact_alias_indexed(
+        &self,
+        want: RtKey,
+    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
+        if want.gpu_va == 0 {
+            count_rt_alias_indexed(&RT_ALIAS_INDEXED_WILDCARD_FALLBACKS, 1);
+            return self.find_sampleable_color_for_exact_alias_legacy(want);
+        }
+        let Some((key, image)) = self
+            .cache
+            .get_key_value(&want)
+            .filter(|(candidate, _)| exact_texture_alias_identity(**candidate, want))
+            .map(|(key, image)| (*key, image))
+        else {
+            count_rt_alias_indexed(&RT_ALIAS_INDEXED_EXACT_MISSES, 1);
+            return None;
+        };
+        if self.color_is_guest_stale(key) || image.layout == vk::ImageLayout::UNDEFINED {
+            count_rt_alias_indexed(&RT_ALIAS_INDEXED_EXACT_MISSES, 1);
+            return None;
+        }
+        count_rt_alias_indexed(&RT_ALIAS_INDEXED_EXACT_HITS, 1);
+        Some((key, image.image, image.view, image.layout, image.format))
+    }
+
     pub fn find_sampleable_color_for_exact_or_physical_alias(
         &self,
         want: RtKey,
         view_format: vk::Format,
     ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
-        if let Some(exact) = self.find_sampleable_color_for_exact_alias(want) {
+        if !rt_alias_indexed_lookup_enabled() {
+            return self
+                .find_sampleable_color_for_exact_or_physical_alias_legacy(want, view_format);
+        }
+        let indexed =
+            self.find_sampleable_color_for_exact_or_physical_alias_indexed(want, view_format);
+        if !rt_alias_indexed_lookup_shadow_enabled() {
+            return indexed;
+        }
+        rt_alias_shadow_color_result(
+            indexed,
+            self.find_sampleable_color_for_exact_or_physical_alias_legacy(want, view_format),
+        )
+    }
+
+    fn find_sampleable_color_for_exact_or_physical_alias_legacy(
+        &self,
+        want: RtKey,
+        view_format: vk::Format,
+    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
+        if let Some(exact) = self.find_sampleable_color_for_exact_alias_legacy(want) {
             return Some(exact);
         }
         if is_synthetic_copy_key(want) {
@@ -2344,6 +2615,36 @@ impl RtCache {
             return None;
         }
         let key = *key;
+        Some((key, image.image, image.view, image.layout, image.format))
+    }
+
+    fn find_sampleable_color_for_exact_or_physical_alias_indexed(
+        &self,
+        want: RtKey,
+        view_format: vk::Format,
+    ) -> Option<(RtKey, vk::Image, vk::ImageView, vk::ImageLayout, vk::Format)> {
+        if let Some(exact) = self.find_sampleable_color_for_exact_alias_indexed(want) {
+            return Some(exact);
+        }
+        if is_synthetic_copy_key(want) || want.cpu_addr == 0 {
+            return None;
+        }
+        let candidates = self.color_cpu_base_index.get(&want.cpu_addr)?;
+        count_rt_alias_indexed(&RT_ALIAS_INDEXED_CPU_CANDIDATES, candidates.len() as u64);
+        let mut candidates = candidates.iter().filter_map(|candidate| {
+            let (key, image) = self.cache.get_key_value(candidate)?;
+            (!is_synthetic_copy_key(*key)
+                && same_physical_backing(*key, want)
+                && !alias_view_metadata_changed(*key, want)
+                && rt_formats_compatible(image.base_format, view_format)
+                && !self.color_is_guest_stale(*key)
+                && image.layout != vk::ImageLayout::UNDEFINED)
+                .then_some((*key, image))
+        });
+        let (key, image) = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
         Some((key, image.image, image.view, image.layout, image.format))
     }
 
@@ -3212,9 +3513,10 @@ impl Drop for RtCache {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_synthetic_copy_key, rt_formats_compatible, same_d24_depth_allocation_covering,
-        same_physical_backing, GpuImage, RtCache, RtColorRegion, RtKey, RtMappingEpochTransition,
-        RtSampleViewKey,
+        is_synthetic_copy_key, rt_alias_indexed_lookup_value_enabled, rt_formats_compatible,
+        rt_sampleable_color_alias_equal, rt_sampleable_depth_alias_equal,
+        same_d24_depth_allocation_covering, same_physical_backing, GpuImage, RtCache,
+        RtColorRegion, RtKey, RtMappingEpochTransition, RtSampleViewKey,
     };
     use ash::vk;
     use ash::vk::Handle;
@@ -3254,6 +3556,30 @@ mod tests {
             },
             layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         }
+    }
+
+    fn assert_indexed_color_exact_matches_legacy(cache: &RtCache, want: RtKey) {
+        let indexed = cache.find_sampleable_color_for_exact_alias_indexed(want);
+        let legacy = cache.find_sampleable_color_for_exact_alias_legacy(want);
+        assert!(rt_sampleable_color_alias_equal(&indexed, &legacy));
+    }
+
+    fn assert_indexed_depth_exact_matches_legacy(cache: &RtCache, want: RtKey) {
+        let indexed = cache.find_sampleable_depth_for_exact_alias_indexed(want);
+        let legacy = cache.find_sampleable_depth_for_exact_alias_legacy(want);
+        assert!(rt_sampleable_depth_alias_equal(&indexed, &legacy));
+    }
+
+    fn assert_indexed_color_physical_matches_legacy(
+        cache: &RtCache,
+        want: RtKey,
+        view_format: vk::Format,
+    ) {
+        let indexed =
+            cache.find_sampleable_color_for_exact_or_physical_alias_indexed(want, view_format);
+        let legacy =
+            cache.find_sampleable_color_for_exact_or_physical_alias_legacy(want, view_format);
+        assert!(rt_sampleable_color_alias_equal(&indexed, &legacy));
     }
 
     fn region_signature(
@@ -4743,6 +5069,101 @@ mod tests {
         cache.forget_depth_tracking(source);
         assert_eq!(cache.depth_generation(source), None);
         assert!(!cache.depth_shadow_is_current(source, shadow));
+    }
+
+    #[test]
+    fn indexed_exact_sampleable_alias_matches_legacy() {
+        const VA: u64 = 0x5330_0000;
+        const CPU: u64 = 0x8330_0000;
+        let stored = RtKey::with_cpu(90, 128, 128, VA, CPU)
+            .with_mapping_epoch(7)
+            .with_block_linear_layout(0, 4, 0, 0)
+            .with_guest_size_bytes(0x20_000);
+        let mut cache = RtCache::new();
+        cache.insert_color_image(
+            stored,
+            test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM),
+        );
+        cache.depth_cache.insert(stored, test_depth_image());
+
+        for want in [
+            stored,
+            RtKey::with_cpu(90, 128, 128, VA, CPU),
+            RtKey::request(90, 128, 128),
+            stored.with_mapping_epoch(8),
+            stored.with_block_linear_layout(0, 3, 0, 0),
+            stored.with_base_layer(2),
+            RtKey::with_cpu(90, 128, 128, VA, CPU + 0x10_000)
+                .with_mapping_epoch(7)
+                .with_block_linear_layout(0, 4, 0, 0),
+        ] {
+            assert_indexed_color_exact_matches_legacy(&cache, want);
+            assert_indexed_depth_exact_matches_legacy(&cache, want);
+        }
+
+        cache.guest_stale_color.insert(stored);
+        cache.guest_stale_depth.insert(stored);
+        assert_indexed_color_exact_matches_legacy(&cache, stored);
+        assert_indexed_depth_exact_matches_legacy(&cache, stored);
+        cache.guest_stale_color.remove(&stored);
+        cache.guest_stale_depth.remove(&stored);
+
+        cache.cache.get_mut(&stored).unwrap().layout = vk::ImageLayout::UNDEFINED;
+        cache.depth_cache.get_mut(&stored).unwrap().layout = vk::ImageLayout::UNDEFINED;
+        assert_indexed_color_exact_matches_legacy(&cache, stored);
+        assert_indexed_depth_exact_matches_legacy(&cache, stored);
+
+        cache.cache.clear();
+        cache.depth_cache.clear();
+        cache.clear_color_lookup_index();
+    }
+
+    #[test]
+    fn indexed_alias_lookup_defaults_on_and_requires_explicit_opt_out() {
+        for enabled in [None, Some(""), Some("1"), Some("true"), Some("garbage")] {
+            assert!(rt_alias_indexed_lookup_value_enabled(enabled));
+        }
+        for disabled in [Some("0"), Some("false"), Some("OFF"), Some(" no ")] {
+            assert!(!rt_alias_indexed_lookup_value_enabled(disabled));
+        }
+    }
+
+    #[test]
+    fn indexed_physical_sampleable_alias_matches_legacy() {
+        const CPU: u64 = 0x8338_0000;
+        let stored = RtKey::with_cpu(90, 128, 128, 0x5338_0000, CPU)
+            .with_mapping_epoch(9)
+            .with_block_linear_layout(0, 4, 0, 0);
+        let want = RtKey::with_cpu(90, 128, 128, 0x5339_0000, CPU)
+            .with_mapping_epoch(9)
+            .with_block_linear_layout(0, 4, 0, 0);
+        let ambiguous = RtKey::with_cpu(90, 128, 128, 0x533a_0000, CPU)
+            .with_mapping_epoch(9)
+            .with_block_linear_layout(0, 4, 0, 0);
+        let mut cache = RtCache::new();
+        cache.insert_color_image(
+            stored,
+            test_color_image(vk::Format::R16_SFLOAT, vk::Format::R16_SFLOAT),
+        );
+
+        assert_indexed_color_physical_matches_legacy(&cache, want, vk::Format::R16_SFLOAT);
+        assert_indexed_color_physical_matches_legacy(&cache, want, vk::Format::R32_SFLOAT);
+
+        cache.guest_stale_color.insert(stored);
+        assert_indexed_color_physical_matches_legacy(&cache, want, vk::Format::R16_SFLOAT);
+        cache.guest_stale_color.remove(&stored);
+        cache.cache.get_mut(&stored).unwrap().layout = vk::ImageLayout::UNDEFINED;
+        assert_indexed_color_physical_matches_legacy(&cache, want, vk::Format::R16_SFLOAT);
+        cache.cache.get_mut(&stored).unwrap().layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+
+        cache.insert_color_image(
+            ambiguous,
+            test_color_image(vk::Format::R16_SFLOAT, vk::Format::R16_SFLOAT),
+        );
+        assert_indexed_color_physical_matches_legacy(&cache, want, vk::Format::R16_SFLOAT);
+
+        cache.cache.clear();
+        cache.clear_color_lookup_index();
     }
 
     #[test]

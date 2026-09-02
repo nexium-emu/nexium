@@ -24,6 +24,30 @@ pub struct Renderer {
     inner: Mutex<RendererInner>,
     device: ash::Device,
     submit_timeline: vk::Semaphore,
+    submit_state: Arc<SubmitState>,
+}
+
+struct SubmitState {
+    generation: std::sync::atomic::AtomicU64,
+    last_idle_generation: std::sync::atomic::AtomicU64,
+    sequence: std::sync::Mutex<()>,
+}
+
+impl SubmitState {
+    fn new() -> Self {
+        Self {
+            generation: std::sync::atomic::AtomicU64::new(0),
+            last_idle_generation: std::sync::atomic::AtomicU64::new(u64::MAX),
+            sequence: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn note_queue_drained(&self) {
+        self.last_idle_generation.store(
+            self.generation.load(std::sync::atomic::Ordering::Acquire),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -83,12 +107,6 @@ impl GraphicsClearOp {
     }
 }
 
-static SUBMIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static LAST_IDLE_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(u64::MAX);
-static SUBMIT_TIMELINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static SUBMIT_SEQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RtAliasTelemetry {
     pub binds: u64,
@@ -127,17 +145,6 @@ pub fn take_rt_alias_telemetry() -> RtAliasTelemetry {
         binds_after_raw_snapshot: RT_ALIAS_TELEMETRY_BINDS_AFTER_RAW_SNAPSHOT
             .swap(0, std::sync::atomic::Ordering::Relaxed),
     }
-}
-
-fn note_queue_submission() {
-    SUBMIT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
-}
-
-fn note_queue_drained() {
-    LAST_IDLE_GENERATION.store(
-        SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire),
-        std::sync::atomic::Ordering::Release,
-    );
 }
 
 fn idle_skip_disabled() -> bool {
@@ -191,18 +198,20 @@ fn clear_slot_count() -> usize {
     })
 }
 
-fn frame_slot_submission_complete(device: &ash::Device, generation: u64) -> bool {
+fn frame_slot_submission_complete(
+    device: &ash::Device,
+    submit_timeline: vk::Semaphore,
+    generation: u64,
+) -> bool {
     if generation == 0 {
         return false;
     }
-    let raw = SUBMIT_TIMELINE.load(std::sync::atomic::Ordering::Acquire);
-    if raw == 0 {
+    if submit_timeline == vk::Semaphore::null() {
         return false;
     }
-    let semaphore = vk::Semaphore::from_raw(raw);
     unsafe {
         device
-            .get_semaphore_counter_value(semaphore)
+            .get_semaphore_counter_value(submit_timeline)
             .is_ok_and(|completed| completed >= generation)
     }
 }
@@ -480,7 +489,7 @@ fn env_switch_value_default_enabled(value: Option<&str>) -> bool {
 pub(crate) fn resident_vb_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        env_switch_value_enabled(std::env::var("NEXIUM_RESIDENT_VB").ok().as_deref())
+        env_switch_value_default_enabled(std::env::var("NEXIUM_RESIDENT_VB").ok().as_deref())
     })
 }
 
@@ -506,22 +515,6 @@ fn resident_vb_bytes() -> u64 {
     })
 }
 
-fn resident_cbuf_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        env_switch_value_default_enabled(std::env::var("NEXIUM_RESIDENT_CBUF").ok().as_deref())
-    })
-}
-
-fn resident_cbuf_direct_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        env_switch_value_enabled(std::env::var("NEXIUM_RESIDENT_CBUF_DIRECT").ok().as_deref())
-    })
-}
-
-const RESIDENT_DIR_RING_BYTES: u64 = 4 * 1024 * 1024;
-
 struct ResidentVbSlab {
     offset: u64,
     versions: Vec<(u64, u64)>,
@@ -537,10 +530,10 @@ struct ResidentSlabUse {
 }
 
 impl ResidentSlabUse {
-    fn new(key: (u64, u32), offset: u64) -> Self {
+    fn new(first_chunk_key: u64, chunk_count: u32, offset: u64) -> Self {
         Self {
-            first_chunk_key: key.0,
-            chunk_count: key.1,
+            first_chunk_key,
+            chunk_count,
             offset,
         }
     }
@@ -616,52 +609,8 @@ fn resident_chunk_version(chunk: &crate::draw::ResidentVertexChunk) -> (u64, u64
     (chunk.generation, chunk.serial)
 }
 
-const RESCBUF_DIRECT: u8 = 0;
-const RESCBUF_FAIL_OTHER: u8 = 1;
-const RESCBUF_FAIL_UNALIGNED: u8 = 2;
-const RESCBUF_FAIL_SHAPE: u8 = 3;
-const RESCBUF_FAIL_VERSION: u8 = 4;
-const RESCBUF_FAIL_SLAB: u8 = 5;
-const RESCBUF_FAIL_DIR: u8 = 6;
-const RESCBUF_FAIL_RANGE: u8 = 7;
-
-fn rescbuf_stat(kind: u8) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| {
-        env_switch_value_enabled(std::env::var("NEXIUM_RENDER_PROFILE").ok().as_deref())
-    }) {
-        return;
-    }
-    static COUNTS: [AtomicU64; 8] = [
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-    ];
-    static N: AtomicU64 = AtomicU64::new(0);
-    COUNTS[kind as usize].fetch_add(1, Ordering::Relaxed);
-    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-    if n % 65536 == 0 {
-        let c = |kind: u8| COUNTS[kind as usize].load(Ordering::Relaxed);
-        log::warn!(
-            "[rescbuf] total={} direct={} other={} unal={} shape={} version={} slab={} dir={} range={}",
-            n,
-            c(RESCBUF_DIRECT),
-            c(RESCBUF_FAIL_OTHER),
-            c(RESCBUF_FAIL_UNALIGNED),
-            c(RESCBUF_FAIL_SHAPE),
-            c(RESCBUF_FAIL_VERSION),
-            c(RESCBUF_FAIL_SLAB),
-            c(RESCBUF_FAIL_DIR),
-            c(RESCBUF_FAIL_RANGE)
-        );
-    }
-}
+const RESIDENT_FAIL_OTHER: u8 = 0;
+const RESIDENT_FAIL_SLAB: u8 = 1;
 
 const RESVB_HIT: u8 = 0;
 const RESVB_COLD: u8 = 1;
@@ -714,16 +663,6 @@ enum ResidentResolveKind {
     Rename,
 }
 
-fn resident_directory_config(cbuf_enabled: bool, frame_slot_count: usize) -> Option<(u64, usize)> {
-    if !(1..=u64::BITS as usize).contains(&frame_slot_count) {
-        return None;
-    }
-    if !cbuf_enabled {
-        return Some((0, 0));
-    }
-    Some((RESIDENT_DIR_RING_BYTES, frame_slot_count))
-}
-
 fn resident_range_slab_delta(
     cpu_va: u64,
     len: usize,
@@ -748,7 +687,6 @@ struct ResidentVbCache {
     free: ResidentFreeList,
     slabs: HashMap<(u64, u32), Vec<ResidentVbSlab>>,
     clock: u64,
-    dir_heads: Vec<u64>,
     last_fail: u8,
 }
 
@@ -764,119 +702,6 @@ impl ResidentVbCache {
                 slab.in_flight_mask &= !bit;
             }
         }
-        if let Some(head) = self.dir_heads.get_mut(frame_slot) {
-            *head = 0;
-        }
-    }
-
-    fn dir_slot_region(&self, frame_slot: usize) -> Option<(u64, u64)> {
-        let slots = u64::try_from(self.dir_heads.len()).ok()?;
-        if slots == 0 || frame_slot >= self.dir_heads.len() {
-            return None;
-        }
-        let per_slot = RESIDENT_DIR_RING_BYTES / slots;
-        Some((
-            u64::try_from(frame_slot).ok()?.checked_mul(per_slot)?,
-            per_slot,
-        ))
-    }
-
-    fn alloc_dir_block(&mut self, frame_slot: usize, bytes: u64) -> Option<u64> {
-        let (base, per_slot) = self.dir_slot_region(frame_slot)?;
-        let head = self.dir_heads.get_mut(frame_slot)?;
-        let aligned = head.checked_add(255)? & !255;
-        if aligned.checked_add(bytes)? > per_slot {
-            return None;
-        }
-        *head = aligned + bytes;
-        Some(base + aligned)
-    }
-
-    fn resolve_cbuf_dir(
-        &mut self,
-        draw: &crate::draw::ResidentCbufDraw,
-        frame_slot: usize,
-        max_range: u64,
-        used: &mut HashSet<ResidentSlabUse>,
-    ) -> Option<(vk::Buffer, u64, u64)> {
-        self.last_fail = RESCBUF_FAIL_OTHER;
-        let out = self.resolve_cbuf_dir_inner(draw, frame_slot, max_range, used);
-        rescbuf_stat(if out.is_some() {
-            RESCBUF_DIRECT
-        } else {
-            self.last_fail
-        });
-        out
-    }
-
-    fn resolve_cbuf_dir_inner(
-        &mut self,
-        draw: &crate::draw::ResidentCbufDraw,
-        frame_slot: usize,
-        max_range: u64,
-        used: &mut HashSet<ResidentSlabUse>,
-    ) -> Option<(vk::Buffer, u64, u64)> {
-        if !resident_cbuf_draw_is_valid(draw, draw.packed_size, true) {
-            self.last_fail = RESCBUF_FAIL_UNALIGNED;
-            return None;
-        }
-        const MAX_CBUF_SLOTS: usize = nexium_spirv::GFX_CBUF_SLOTS as usize;
-        if draw.chunks.len() > MAX_CBUF_SLOTS || draw.slots.len() > MAX_CBUF_SLOTS {
-            self.last_fail = RESCBUF_FAIL_SHAPE;
-            return None;
-        }
-        let dir_bytes = (nexium_spirv::GFX_CBUF_MIN_SIZE as u64).max(304);
-        let mut chunk_offsets = [0u64; MAX_CBUF_SLOTS];
-        for (index, chunk) in draw.chunks.iter().enumerate() {
-            let (_, offset) = self.resolve_chunk(chunk, used)?;
-            chunk_offsets[index] = offset;
-        }
-        let mut resolved = [(0u32, 0u64, 0u32); MAX_CBUF_SLOTS];
-        let mut resolved_count = 0usize;
-        let mut max_data_end = 0u64;
-        for slot in &draw.slots {
-            let data_offset = chunk_offsets
-                .get(usize::from(slot.chunk_index))?
-                .checked_add(u64::from(slot.byte_offset))?;
-            if data_offset % 4 != 0 {
-                self.last_fail = RESCBUF_FAIL_UNALIGNED;
-                return None;
-            }
-            let data_end = data_offset.checked_add(u64::from(slot.word_count).checked_mul(4)?)?;
-            max_data_end = max_data_end.max(data_end);
-            resolved[resolved_count] = (slot.logical_slot, data_offset, slot.word_count);
-            resolved_count += 1;
-        }
-        let dir_offset = match self.alloc_dir_block(frame_slot, dir_bytes) {
-            Some(offset) => offset,
-            None => {
-                self.last_fail = RESCBUF_FAIL_DIR;
-                return None;
-            }
-        };
-        let range_end = max_data_end.max(dir_offset.checked_add(dir_bytes)?);
-        let range = range_end.checked_sub(dir_offset)?;
-        if range > max_range || range > self.size.checked_sub(dir_offset)? {
-            self.last_fail = RESCBUF_FAIL_RANGE;
-            return None;
-        }
-        let dir_word_base = dir_offset / 4;
-        unsafe {
-            let dir = self.mapped.add(dir_offset as usize).cast::<u32>();
-            for slot_index in 0..nexium_spirv::GFX_CBUF_SLOTS as usize {
-                *dir.add(slot_index * 2) = nexium_spirv::GFX_CBUF_ZERO_WORD;
-                *dir.add(slot_index * 2 + 1) = 0;
-            }
-            let zero_word = nexium_spirv::GFX_CBUF_DIRECTORY_WORDS as usize;
-            *dir.add(zero_word) = 0;
-            for &(logical_slot, data_offset, word_count) in &resolved[..resolved_count] {
-                let rel_word = (data_offset / 4).checked_sub(dir_word_base)?;
-                let rel_word = u32::try_from(rel_word).ok()?;
-                *dir.add(logical_slot as usize * 2) = rel_word;
-                *dir.add(logical_slot as usize * 2 + 1) = word_count;
-            }
-        }
-        Some((self.buffer, dir_offset, range))
     }
 
     fn mark_submitted(&mut self, frame_slot: usize, used: &HashSet<ResidentSlabUse>) {
@@ -895,7 +720,7 @@ impl ResidentVbCache {
     }
 
     fn alloc(&mut self, chunk_count: u32, used: &HashSet<ResidentSlabUse>) -> Option<u64> {
-        let bytes = u64::from(chunk_count).checked_shl(crate::draw::RESIDENT_CHUNK_SHIFT)?;
+        let bytes = u64::from(chunk_count).checked_mul(crate::draw::RESIDENT_CHUNK_SIZE as u64)?;
         if let Some(offset) = self.free.take(bytes) {
             return Some(offset);
         }
@@ -908,7 +733,7 @@ impl ResidentVbCache {
             let mut victim = None;
             for (&key, versions) in &self.slabs {
                 for (index, slab) in versions.iter().enumerate() {
-                    let slab_use = ResidentSlabUse::new(key, slab.offset);
+                    let slab_use = ResidentSlabUse::new(key.0, key.1, slab.offset);
                     if slab.in_flight_mask != 0 || used.contains(&slab_use) {
                         continue;
                     }
@@ -926,7 +751,7 @@ impl ResidentVbCache {
                 self.slabs.remove(&victim_key);
             }
             let victim_bytes =
-                u64::from(victim_key.1).checked_shl(crate::draw::RESIDENT_CHUNK_SHIFT)?;
+                u64::from(victim_key.1).checked_mul(crate::draw::RESIDENT_CHUNK_SIZE as u64)?;
             if !self.free.insert(slab.offset, victim_bytes) {
                 return None;
             }
@@ -950,9 +775,9 @@ impl ResidentVbCache {
         let (buffer, offset, kind) = match resolved {
             Some(resolved) => resolved,
             None => {
-                if self.last_fail == RESCBUF_FAIL_SLAB {
+                if self.last_fail == RESIDENT_FAIL_SLAB {
                     resvb_stat(RESVB_CAPACITY, range.len);
-                } else if self.last_fail == RESCBUF_FAIL_VERSION {
+                } else {
                     resvb_stat(RESVB_VERSION, range.len);
                 }
                 return None;
@@ -973,26 +798,20 @@ impl ResidentVbCache {
         Some((buffer, bind_offset))
     }
 
-    fn resolve_chunk(
-        &mut self,
-        chunk: &crate::draw::ResidentVertexChunk,
-        used: &mut HashSet<ResidentSlabUse>,
-    ) -> Option<(vk::Buffer, u64)> {
-        self.resolve_chunks(std::slice::from_ref(chunk), used)
-            .map(|(buffer, offset, _)| (buffer, offset))
-    }
-
     fn resolve_chunks(
         &mut self,
         chunks: &[crate::draw::ResidentVertexChunk],
         used: &mut HashSet<ResidentSlabUse>,
     ) -> Option<(vk::Buffer, u64, ResidentResolveKind)> {
-        let chunk_size = crate::draw::RESIDENT_CHUNK_SIZE;
-        self.last_fail = RESCBUF_FAIL_SHAPE;
+        self.last_fail = RESIDENT_FAIL_OTHER;
         let count = u32::try_from(chunks.len()).ok()?;
         let first = chunks.first()?.chunk_key;
         if chunks.iter().enumerate().any(|(index, chunk)| {
-            chunk.chunk_key != first + index as u64 || chunk.data.len() != chunk_size
+            u64::try_from(index)
+                .ok()
+                .and_then(|index| first.checked_add(index))
+                != Some(chunk.chunk_key)
+                || chunk.data.len() != crate::draw::RESIDENT_CHUNK_SIZE
         }) {
             return None;
         }
@@ -1012,7 +831,7 @@ impl ResidentVbCache {
         if let Some(index) = exact_index {
             let slab = self.slabs.get_mut(&key)?.get_mut(index)?;
             slab.last_used = clock;
-            used.insert(ResidentSlabUse::new(key, slab.offset));
+            used.insert(ResidentSlabUse::new(key.0, key.1, slab.offset));
             return Some((self.buffer, slab.offset, ResidentResolveKind::Hit));
         }
         let reusable_index = self.slabs.get(&key).and_then(|versions| {
@@ -1021,7 +840,7 @@ impl ResidentVbCache {
                 .enumerate()
                 .filter(|(_, slab)| {
                     slab.in_flight_mask == 0
-                        && !used.contains(&ResidentSlabUse::new(key, slab.offset))
+                        && !used.contains(&ResidentSlabUse::new(key.0, key.1, slab.offset))
                 })
                 .min_by_key(|(_, slab)| slab.last_used)
                 .map(|(index, _)| index)
@@ -1036,41 +855,43 @@ impl ResidentVbCache {
                 let chunk_offset = slab.offset.checked_add(
                     u64::try_from(chunk_index)
                         .ok()?
-                        .checked_shl(crate::draw::RESIDENT_CHUNK_SHIFT)?,
+                        .checked_mul(crate::draw::RESIDENT_CHUNK_SIZE as u64)?,
                 )?;
-                if chunk_offset.checked_add(u64::try_from(chunk_size).ok()?)? > self.size {
+                if chunk_offset.checked_add(crate::draw::RESIDENT_CHUNK_SIZE as u64)? > self.size {
                     return None;
                 }
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         chunk.data.as_ptr(),
                         self.mapped.add(usize::try_from(chunk_offset).ok()?),
-                        chunk_size,
+                        crate::draw::RESIDENT_CHUNK_SIZE,
                     );
                 }
             }
             slab.versions = chunks.iter().map(resident_chunk_version).collect();
             slab.last_used = clock;
-            used.insert(ResidentSlabUse::new(key, slab.offset));
+            used.insert(ResidentSlabUse::new(key.0, key.1, slab.offset));
             return Some((self.buffer, slab.offset, ResidentResolveKind::Version));
         }
         let had_logical_slab = self.slabs.contains_key(&key);
         let offset = match self.alloc(count, used) {
             Some(offset) => offset,
             None => {
-                self.last_fail = RESCBUF_FAIL_SLAB;
+                self.last_fail = RESIDENT_FAIL_SLAB;
                 return None;
             }
         };
         let mut versions = Vec::with_capacity(chunks.len());
         for (index, chunk) in chunks.iter().enumerate() {
+            let chunk_offset = u64::try_from(index)
+                .ok()?
+                .checked_mul(crate::draw::RESIDENT_CHUNK_SIZE as u64)?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     chunk.data.as_ptr(),
-                    self.mapped.add(
-                        (offset + ((index as u64) << crate::draw::RESIDENT_CHUNK_SHIFT)) as usize,
-                    ),
-                    chunk_size,
+                    self.mapped
+                        .add(usize::try_from(offset.checked_add(chunk_offset)?).ok()?),
+                    crate::draw::RESIDENT_CHUNK_SIZE,
                 );
             }
             versions.push(resident_chunk_version(chunk));
@@ -1081,7 +902,7 @@ impl ResidentVbCache {
             in_flight_mask: 0,
             last_used: clock,
         });
-        used.insert(ResidentSlabUse::new(key, offset));
+        used.insert(ResidentSlabUse::new(key.0, key.1, offset));
         Some((
             self.buffer,
             offset,
@@ -1106,97 +927,199 @@ impl ResidentVbCache {
 fn create_resident_vb_cache(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
-    frame_slot_count: usize,
-    cbuf_enabled: bool,
 ) -> Result<ResidentVbCache, String> {
     let size = resident_vb_bytes();
-    let (data_start, dir_slot_count) = resident_directory_config(cbuf_enabled, frame_slot_count)
-        .ok_or_else(|| "resident cache requires between 1 and 64 frame slots".to_string())?;
-    if data_start >= size {
-        return Err(format!(
-            "resident cache size {size:#x} does not leave room after directory reservation {data_start:#x}"
-        ));
-    }
     let buffer = create_persistent_upload_buffer_sized(
         device,
         mem_props,
         size,
-        vk::BufferUsageFlags::VERTEX_BUFFER
-            | vk::BufferUsageFlags::INDEX_BUFFER
-            | vk::BufferUsageFlags::STORAGE_BUFFER,
+        vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
     )?;
     Ok(ResidentVbCache {
         buffer: buffer.buffer,
         memory: buffer.memory,
         mapped: buffer.mapped,
         size,
-        head: data_start,
+        head: 0,
         free: ResidentFreeList::default(),
         slabs: HashMap::new(),
         clock: 0,
-        dir_heads: vec![0; dir_slot_count],
-        last_fail: RESCBUF_FAIL_OTHER,
+        last_fail: RESIDENT_FAIL_OTHER,
     })
 }
 
-fn resident_cbuf_draw_is_valid(
-    draw: &crate::draw::ResidentCbufDraw,
-    dst_len: usize,
-    require_full_words: bool,
+fn resident_cbuf_draw_is_valid(draw: &crate::draw::ResidentCbufDraw, dst_len: usize) -> bool {
+    resident_cbuf_draw_layout_is_valid(draw, dst_len)
+}
+
+fn resident_cbuf_slot_layout_is_valid(
+    logical_slot: u32,
+    word_count: u32,
+    byte_len: u32,
+    packed_offset: u32,
+    packed_size: usize,
+    occupied: &mut [bool; nexium_spirv::GFX_CBUF_SLOTS as usize],
+    packed_ranges: &mut [(usize, usize); nexium_spirv::GFX_CBUF_SLOTS as usize],
+    packed_range_count: &mut usize,
 ) -> bool {
-    if draw.packed_size != dst_len
-        || draw.packed_size < nexium_spirv::GFX_CBUF_MIN_SIZE as usize
-        || draw
-            .chunks
+    let Ok(logical_slot) = usize::try_from(logical_slot) else {
+        return false;
+    };
+    let Ok(word_count) = usize::try_from(word_count) else {
+        return false;
+    };
+    let Ok(byte_len) = usize::try_from(byte_len) else {
+        return false;
+    };
+    let Ok(packed_offset) = usize::try_from(packed_offset) else {
+        return false;
+    };
+    let Some(word_bytes) = word_count.checked_mul(4) else {
+        return false;
+    };
+    let Some(packed_end) = packed_offset.checked_add(word_bytes) else {
+        return false;
+    };
+    if logical_slot >= occupied.len()
+        || occupied[logical_slot]
+        || word_count == 0
+        || byte_len == 0
+        || byte_len.div_ceil(4) != word_count
+        || packed_offset < nexium_spirv::GFX_CBUF_MIN_SIZE as usize
+        || packed_offset % 16 != 0
+        || packed_end > packed_size
+        || u32::try_from(packed_offset / 4).is_err()
+        || packed_ranges[..*packed_range_count]
             .iter()
-            .any(|chunk| chunk.data.len() != crate::draw::RESIDENT_CHUNK_SIZE)
+            .any(|&(start, end)| packed_offset < end && start < packed_end)
     {
         return false;
     }
+    occupied[logical_slot] = true;
+    packed_ranges[*packed_range_count] = (packed_offset, packed_end);
+    *packed_range_count += 1;
+    true
+}
+
+fn resident_cbuf_arena_slots<'a>(
+    draw: &crate::draw::ResidentCbufDraw,
+    arena: &'a crate::draw::ResidentCbufArena,
+) -> Option<&'a [crate::draw::ResidentCbufArenaSlot]> {
+    let start = usize::try_from(draw.arena_slot_start).ok()?;
+    let count = usize::from(draw.arena_slot_count);
+    let end = start.checked_add(count)?;
+    arena.slots.get(start..end)
+}
+
+fn resident_cbuf_draw_layout_is_valid(
+    draw: &crate::draw::ResidentCbufDraw,
+    dst_len: usize,
+) -> bool {
+    if draw.packed_size != dst_len || draw.packed_size < nexium_spirv::GFX_CBUF_MIN_SIZE as usize {
+        return false;
+    }
     let mut occupied = [false; nexium_spirv::GFX_CBUF_SLOTS as usize];
-    for slot in &draw.slots {
-        let Ok(logical_slot) = usize::try_from(slot.logical_slot) else {
+    let mut packed_ranges = [(0usize, 0usize); nexium_spirv::GFX_CBUF_SLOTS as usize];
+    let mut packed_range_count = 0usize;
+    let Some(arena) = draw.arena.as_deref() else {
+        if draw.arena_slot_start != 0 || draw.arena_slot_count != 0 {
+            return false;
+        }
+        for slot in &draw.slots {
+            let Some(chunk) = draw.chunks.get(usize::from(slot.chunk_index)) else {
+                return false;
+            };
+            let Ok(byte_offset) = usize::try_from(slot.byte_offset) else {
+                return false;
+            };
+            let Ok(byte_len) = usize::try_from(slot.byte_len) else {
+                return false;
+            };
+            let Some(source_end) = byte_offset.checked_add(byte_len) else {
+                return false;
+            };
+            if source_end > chunk.data.len()
+                || !resident_cbuf_slot_layout_is_valid(
+                    slot.logical_slot,
+                    slot.word_count,
+                    slot.byte_len,
+                    slot.packed_offset,
+                    draw.packed_size,
+                    &mut occupied,
+                    &mut packed_ranges,
+                    &mut packed_range_count,
+                )
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+    if !draw.chunks.is_empty() || !draw.slots.is_empty() || draw.arena_slot_count == 0 {
+        return false;
+    }
+    let Some(slots) = resident_cbuf_arena_slots(draw, arena) else {
+        return false;
+    };
+    for slot in slots {
+        let Ok(segment_start) = usize::try_from(slot.segment_start) else {
             return false;
         };
-        let Ok(word_count) = usize::try_from(slot.word_count) else {
+        let segment_count = usize::from(slot.segment_count);
+        let Some(segment_end) = segment_start.checked_add(segment_count) else {
             return false;
         };
-        let Some(chunk) = draw.chunks.get(usize::from(slot.chunk_index)) else {
+        let Some(segments) = arena.segments.get(segment_start..segment_end) else {
             return false;
         };
-        let byte_offset = slot.byte_offset as usize;
-        let byte_len = slot.byte_len as usize;
-        let packed_offset = slot.packed_offset as usize;
-        let Some(word_bytes) = word_count.checked_mul(4) else {
+        let mut total = 0usize;
+        if segments.is_empty() {
             return false;
-        };
-        let Some(source_end) = byte_offset.checked_add(byte_len) else {
-            return false;
-        };
-        let Some(packed_end) = packed_offset.checked_add(word_bytes) else {
-            return false;
-        };
-        if logical_slot >= occupied.len()
-            || occupied[logical_slot]
-            || word_count == 0
-            || byte_len == 0
-            || byte_len.div_ceil(4) != word_count
-            || (require_full_words && (byte_len != word_bytes || byte_offset % 4 != 0))
-            || source_end > chunk.data.len()
-            || packed_offset < nexium_spirv::GFX_CBUF_MIN_SIZE as usize
-            || packed_offset % 16 != 0
-            || packed_end > draw.packed_size
-            || u32::try_from(packed_offset / 4).is_err()
+        }
+        for segment in segments {
+            let Ok(source_index) = usize::try_from(segment.source_index) else {
+                return false;
+            };
+            let Some(source) = arena.sources.get(source_index) else {
+                return false;
+            };
+            let Ok(byte_offset) = usize::try_from(segment.byte_offset) else {
+                return false;
+            };
+            let Ok(byte_len) = usize::try_from(segment.byte_len) else {
+                return false;
+            };
+            let Some(source_end) = byte_offset.checked_add(byte_len) else {
+                return false;
+            };
+            let Some(next_total) = total.checked_add(byte_len) else {
+                return false;
+            };
+            if byte_len == 0 || source_end > source.data.len() {
+                return false;
+            }
+            total = next_total;
+        }
+        if total != slot.byte_len as usize
+            || !resident_cbuf_slot_layout_is_valid(
+                slot.logical_slot,
+                slot.word_count,
+                slot.byte_len,
+                slot.packed_offset,
+                draw.packed_size,
+                &mut occupied,
+                &mut packed_ranges,
+                &mut packed_range_count,
+            )
         {
             return false;
         }
-        occupied[logical_slot] = true;
     }
     true
 }
 
 fn write_resident_cbuf_payload(draw: &crate::draw::ResidentCbufDraw, dst: &mut [u8]) -> bool {
-    if !resident_cbuf_draw_is_valid(draw, dst.len(), false) {
+    if !resident_cbuf_draw_is_valid(draw, dst.len()) {
         return false;
     }
     dst.fill(0);
@@ -1205,17 +1128,39 @@ fn write_resident_cbuf_payload(draw: &crate::draw::ResidentCbufDraw, dst: &mut [
         dst[directory..directory + 4]
             .copy_from_slice(&nexium_spirv::GFX_CBUF_ZERO_WORD.to_le_bytes());
     }
-    for slot in &draw.slots {
-        let directory = slot.logical_slot as usize * 8;
-        let packed_offset = slot.packed_offset as usize;
-        let byte_offset = slot.byte_offset as usize;
-        let byte_len = slot.byte_len as usize;
-        let base_word = (packed_offset / 4) as u32;
-        dst[directory..directory + 4].copy_from_slice(&base_word.to_le_bytes());
-        dst[directory + 4..directory + 8].copy_from_slice(&slot.word_count.to_le_bytes());
-        let source = &draw.chunks[usize::from(slot.chunk_index)].data;
-        dst[packed_offset..packed_offset + byte_len]
-            .copy_from_slice(&source[byte_offset..byte_offset + byte_len]);
+    if let Some(arena) = draw.arena.as_deref() {
+        for slot in resident_cbuf_arena_slots(draw, arena).unwrap() {
+            let directory = slot.logical_slot as usize * 8;
+            let packed_offset = slot.packed_offset as usize;
+            let base_word = (packed_offset / 4) as u32;
+            dst[directory..directory + 4].copy_from_slice(&base_word.to_le_bytes());
+            dst[directory + 4..directory + 8].copy_from_slice(&slot.word_count.to_le_bytes());
+            let segment_start = slot.segment_start as usize;
+            let segment_end = segment_start + usize::from(slot.segment_count);
+            let mut output_offset = packed_offset;
+            for segment in &arena.segments[segment_start..segment_end] {
+                let source = &arena.sources[segment.source_index as usize].data;
+                let byte_offset = segment.byte_offset as usize;
+                let byte_len = segment.byte_len as usize;
+                let source_end = byte_offset + byte_len;
+                let output_end = output_offset + byte_len;
+                dst[output_offset..output_end].copy_from_slice(&source[byte_offset..source_end]);
+                output_offset = output_end;
+            }
+        }
+    } else {
+        for slot in &draw.slots {
+            let directory = slot.logical_slot as usize * 8;
+            let packed_offset = slot.packed_offset as usize;
+            let byte_offset = slot.byte_offset as usize;
+            let byte_len = slot.byte_len as usize;
+            let base_word = (packed_offset / 4) as u32;
+            dst[directory..directory + 4].copy_from_slice(&base_word.to_le_bytes());
+            dst[directory + 4..directory + 8].copy_from_slice(&slot.word_count.to_le_bytes());
+            let source = &draw.chunks[usize::from(slot.chunk_index)].data;
+            dst[packed_offset..packed_offset + byte_len]
+                .copy_from_slice(&source[byte_offset..byte_offset + byte_len]);
+        }
     }
     true
 }
@@ -1529,6 +1474,7 @@ struct RendererInner {
     sampler_filter_minmax_supported: bool,
     sampler_anisotropy_supported: bool,
     submit_timeline: vk::Semaphore,
+    submit_state: Arc<SubmitState>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1587,6 +1533,7 @@ fn group_texture_memo_enabled_for_contract(
 struct HotGenericTextureBinding {
     key: TexCacheKey,
     generation: u64,
+    trusted_source_identity: Option<u64>,
     image: vk::Image,
     view: vk::ImageView,
     layout: vk::ImageLayout,
@@ -2166,15 +2113,12 @@ fn hot_generic_texture_bindings_enabled() -> bool {
 fn group_texture_memo_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("NEXIUM_GROUP_TEXTURE_MEMO")
-            .ok()
-            .is_some_and(|value| {
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("on")
-                    || value.eq_ignore_ascii_case("yes")
-            })
+        group_texture_memo_value_enabled(std::env::var("NEXIUM_GROUP_TEXTURE_MEMO").ok().as_deref())
     })
+}
+
+fn group_texture_memo_value_enabled(value: Option<&str>) -> bool {
+    env_switch_value_default_enabled(value)
 }
 
 fn sparse_texture_manifest_eligible(manifest: &[TextureNumericBinding]) -> bool {
@@ -2273,11 +2217,10 @@ fn group_texture_binding_lookup(
     bindings: &HashMap<GroupTextureRouteKey, HotGenericTextureBinding>,
     route: GroupTextureRouteKey,
     exact_key: TexCacheKey,
-    generation: u64,
 ) -> Option<HotGenericTextureBinding> {
     bindings.get(&route).copied().filter(|binding| {
         binding.key == exact_key
-            && binding.generation == generation
+            && binding.trusted_source_identity.is_some()
             && binding.layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
     })
 }
@@ -2587,6 +2530,20 @@ fn trusted_texture_snapshot_matches(
         .is_some_and(|identity| Some(identity) == cached_identity)
 }
 
+fn resolve_texture_generation<F>(
+    generation: &mut Option<u64>,
+    query: &mut Option<F>,
+    required: bool,
+) -> Option<u64>
+where
+    F: FnOnce() -> u64,
+{
+    if generation.is_none() && required {
+        *generation = query.take().map(|query| query());
+    }
+    *generation
+}
+
 fn sampled_texture_needs_upload(
     force_refresh: bool,
     cached_generation_and_hash: Option<(u64, u64)>,
@@ -2822,14 +2779,16 @@ fn fermi_exact_rt_snapshot_requires_reinterpret(
 
 fn reap_fermi_exact_rt_snapshot_leases(
     device: &ash::Device,
+    submit_timeline: vk::Semaphore,
     leases: &mut HashMap<u64, FermiExactRtSnapshotLease>,
     ids: &mut HashMap<crate::draw::FermiExactRtToken, u64>,
 ) {
     let retired = leases
         .iter()
         .filter_map(|(id, lease)| {
-            (lease.refs == 0 && frame_slot_submission_complete(device, lease.ready_generation))
-                .then_some(*id)
+            (lease.refs == 0
+                && frame_slot_submission_complete(device, submit_timeline, lease.ready_generation))
+            .then_some(*id)
         })
         .collect::<Vec<_>>();
     for id in retired {
@@ -2842,6 +2801,7 @@ fn reap_fermi_exact_rt_snapshot_leases(
 
 fn release_fermi_exact_rt_snapshot_lease_refs(
     device: &ash::Device,
+    submit_timeline: vk::Semaphore,
     leases: &mut HashMap<u64, FermiExactRtSnapshotLease>,
     ids: &mut HashMap<crate::draw::FermiExactRtToken, u64>,
     refs: &mut Vec<u64>,
@@ -2851,7 +2811,7 @@ fn release_fermi_exact_rt_snapshot_lease_refs(
             lease.refs = lease.refs.saturating_sub(1);
         }
     }
-    reap_fermi_exact_rt_snapshot_leases(device, leases, ids);
+    reap_fermi_exact_rt_snapshot_leases(device, submit_timeline, leases, ids);
 }
 
 const FRAME_SLOT_UPLOAD_POOL_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -3822,10 +3782,14 @@ impl Renderer {
     }
 
     pub fn submitted_generation(&self) -> u64 {
-        let _sequence = SUBMIT_SEQ_LOCK
+        let _sequence = self
+            .submit_state
+            .sequence
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+        self.submit_state
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn completed_generation(&self) -> Option<u64> {
@@ -3879,12 +3843,12 @@ impl Renderer {
         let _ = self.wait_idle_checked();
     }
 
-    pub fn wait_idle_checked(&self) -> bool {
-        let generation = SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-        let inner = self.inner.lock();
+    fn wait_idle_locked(&self, inner: &RendererInner, generation: u64) -> bool {
         match unsafe { inner.device.device_wait_idle() } {
             Ok(()) => {
-                LAST_IDLE_GENERATION.store(generation, std::sync::atomic::Ordering::Release);
+                self.submit_state
+                    .last_idle_generation
+                    .store(generation, std::sync::atomic::Ordering::Release);
                 true
             }
             Err(error) => {
@@ -3894,25 +3858,65 @@ impl Renderer {
         }
     }
 
+    pub fn wait_idle_checked(&self) -> bool {
+        let inner = self.inner.lock();
+        let _sequence = self
+            .submit_state
+            .sequence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let generation = self
+            .submit_state
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        self.wait_idle_locked(&inner, generation)
+    }
+
     pub fn wait_idle_if_dirty(&self) -> bool {
+        let inner = self.inner.lock();
+        let _sequence = self
+            .submit_state
+            .sequence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let generation = self
+            .submit_state
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire);
         if !idle_skip_disabled()
-            && LAST_IDLE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
-                == SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .submit_state
+                .last_idle_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                == generation
         {
             return false;
         }
-        self.wait_idle();
+        let _ = self.wait_idle_locked(&inner, generation);
         true
     }
 
     pub fn wait_idle_if_dirty_checked(&self) -> bool {
+        let inner = self.inner.lock();
+        let _sequence = self
+            .submit_state
+            .sequence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let generation = self
+            .submit_state
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire);
         if !idle_skip_disabled()
-            && LAST_IDLE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
-                == SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .submit_state
+                .last_idle_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                == generation
         {
             return true;
         }
-        self.wait_idle_checked()
+        self.wait_idle_locked(&inner, generation)
     }
 
     pub fn clear_texture_cache(&self) {
@@ -4668,16 +4672,10 @@ impl Renderer {
         let submit_timeline = if timeline_semaphore_supported
             && std::env::var_os("NEXIUM_NO_SEMREL_TIMELINE").is_none()
         {
-            let initial_generation = {
-                let _sequence = SUBMIT_SEQ_LOCK
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire)
-            };
             let mut type_info = vk::SemaphoreTypeCreateInfo {
                 s_type: vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO,
                 semaphore_type: vk::SemaphoreType::TIMELINE,
-                initial_value: initial_generation,
+                initial_value: 0,
                 ..Default::default()
             };
             let info = vk::SemaphoreCreateInfo {
@@ -4698,13 +4696,7 @@ impl Renderer {
         } else {
             vk::Semaphore::null()
         };
-        {
-            use ash::vk::Handle;
-            SUBMIT_TIMELINE.store(
-                submit_timeline.as_raw(),
-                std::sync::atomic::Ordering::Release,
-            );
-        }
+        let submit_state = Arc::new(SubmitState::new());
         log::info!(
             "submit timeline semaphore {}",
             if submit_timeline == vk::Semaphore::null() {
@@ -4841,14 +4833,8 @@ impl Renderer {
             }
         };
         let resident_vb_on = resident_vb_enabled();
-        let resident_cbuf_direct_on = resident_cbuf_enabled() && resident_cbuf_direct_enabled();
-        let resident_vb = if resident_vb_on || resident_cbuf_direct_on {
-            match create_resident_vb_cache(
-                &device,
-                &mem_props,
-                frame_slot_count,
-                resident_cbuf_direct_on,
-            ) {
+        let resident_vb = if resident_vb_on {
+            match create_resident_vb_cache(&device, &mem_props) {
                 Ok(cache) => Some(cache),
                 Err(error) => {
                     log::warn!(
@@ -4932,9 +4918,11 @@ impl Renderer {
                 sampler_filter_minmax_supported,
                 sampler_anisotropy_supported,
                 submit_timeline,
+                submit_state: Arc::clone(&submit_state),
             }),
             device: device_handle,
             submit_timeline,
+            submit_state,
         });
         renderer.prewarm();
         Ok(renderer)
@@ -5077,6 +5065,8 @@ impl Renderer {
         let RendererInner {
             device,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             clear_slots,
             clear_slot_index,
@@ -5085,6 +5075,7 @@ impl Renderer {
         } = &mut *inner;
         let key = RtKey::new(nvmap_id, width, height, gpu_va);
         drain_rt_copies_before_color_recreate(
+            submit_state,
             device,
             *queue,
             rt_cache,
@@ -5163,7 +5154,14 @@ impl Renderer {
         }
         let clear_record = clear_record_started.elapsed();
         let clear_submit_started = std::time::Instant::now();
-        submit_with_fence(device, *queue, cmd, clear_slot.fence)?;
+        submit_with_fence(
+            submit_state,
+            *submit_timeline,
+            device,
+            *queue,
+            cmd,
+            clear_slot.fence,
+        )?;
         let clear_submit = clear_submit_started.elapsed();
         clear_slot.in_flight = true;
         rt_cache.mark_cleared(key, true);
@@ -5216,6 +5214,8 @@ impl Renderer {
         let RendererInner {
             device,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             clear_slots,
             clear_slot_index,
@@ -5224,6 +5224,7 @@ impl Renderer {
         } = &mut *inner;
         let color_requires_recreate = rt_cache.color_requires_recreate(color_key, color_format);
         drain_rt_copies_before_color_recreate(
+            submit_state,
             device,
             *queue,
             rt_cache,
@@ -5233,6 +5234,7 @@ impl Renderer {
         )?;
         if !color_requires_recreate {
             drain_rt_copies_before_depth_recreate(
+                submit_state,
                 device,
                 *queue,
                 rt_cache,
@@ -5341,7 +5343,14 @@ impl Renderer {
         }
         let clear_record = clear_record_started.elapsed();
         let clear_submit_started = std::time::Instant::now();
-        submit_with_fence(device, *queue, cmd, clear_slot.fence)?;
+        submit_with_fence(
+            submit_state,
+            *submit_timeline,
+            device,
+            *queue,
+            cmd,
+            clear_slot.fence,
+        )?;
         let clear_submit = clear_submit_started.elapsed();
         clear_slot.in_flight = true;
         rt_cache.set_color_layout(color_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
@@ -5408,6 +5417,8 @@ impl Renderer {
         let RendererInner {
             device,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             clear_slots,
             clear_slot_index,
@@ -5416,6 +5427,7 @@ impl Renderer {
         } = &mut *inner;
         let key = RtKey::new(nvmap_id, width, height, gpu_va);
         drain_rt_copies_before_color_recreate(
+            submit_state,
             device,
             *queue,
             rt_cache,
@@ -5514,7 +5526,14 @@ impl Renderer {
         }
         let clear_record = clear_record_started.elapsed();
         let clear_submit_started = std::time::Instant::now();
-        submit_with_fence(device, *queue, cmd, clear_slot.fence)?;
+        submit_with_fence(
+            submit_state,
+            *submit_timeline,
+            device,
+            *queue,
+            cmd,
+            clear_slot.fence,
+        )?;
         let clear_submit = clear_submit_started.elapsed();
         clear_slot.in_flight = true;
         rt_cache.mark_cleared(key, false);
@@ -5552,6 +5571,8 @@ impl Renderer {
         let RendererInner {
             device,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             utility_slot,
             rt_copy_slots,
@@ -5560,6 +5581,7 @@ impl Renderer {
         } = &mut *inner;
         let key = RtKey::new(nvmap_id, width, height, gpu_va);
         drain_rt_copies_before_color_recreate(
+            submit_state,
             device,
             *queue,
             rt_cache,
@@ -5637,8 +5659,15 @@ impl Renderer {
                 .end_command_buffer(cmd)
                 .map_err(|e| format!("end_command_buffer(upload target): {:?}", e))?;
         }
-        let result = submit_with_fence(device, *queue, cmd, utility_slot.fence)
-            .and_then(|_| wait_fence(device, utility_slot.fence));
+        let result = submit_with_fence(
+            submit_state,
+            *submit_timeline,
+            device,
+            *queue,
+            cmd,
+            utility_slot.fence,
+        )
+        .and_then(|_| wait_fence(device, utility_slot.fence));
         unsafe {
             device.destroy_buffer(stage.buffer, None);
             device.free_memory(stage.memory, None);
@@ -5673,6 +5702,23 @@ impl Renderer {
         self.resolve_rt_copy_exact_to_key(src_key, expected_src_stamp, expected_bpp, dst_key)
     }
 
+    pub fn execute_ordered_rt_copy_exact(
+        &self,
+        source_alias: RtKey,
+        expected_bpp: usize,
+        destination: RtKey,
+    ) -> Result<Option<(RtKey, u64)>, String> {
+        if destination.nvmap_id == RESOLVED_RT_COPY_NVMAP_ID {
+            return Ok(None);
+        }
+        self.resolve_rt_copy_to_key(
+            source_alias,
+            ExactRtCopySource::Latest,
+            expected_bpp,
+            destination,
+        )
+    }
+
     pub fn plan_rt_copy_exact_guest(
         &self,
         _src_key: RtKey,
@@ -5694,18 +5740,33 @@ impl Renderer {
         expected_bpp: usize,
         dst_key: RtKey,
     ) -> Result<Option<(RtKey, u64)>, String> {
-        if src_key.width == 0
-            || src_key.height == 0
-            || src_key.depth != 1
-            || src_key.is_3d
-            || dst_key.width != src_key.width
-            || dst_key.height != src_key.height
+        self.resolve_rt_copy_to_key(
+            src_key,
+            ExactRtCopySource::Exact(expected_src_stamp),
+            expected_bpp,
+            dst_key,
+        )
+    }
+
+    fn resolve_rt_copy_to_key(
+        &self,
+        source_alias: RtKey,
+        source_requirement: ExactRtCopySource,
+        expected_bpp: usize,
+        dst_key: RtKey,
+    ) -> Result<Option<(RtKey, u64)>, String> {
+        if source_alias.width == 0
+            || source_alias.height == 0
+            || source_alias.depth != 1
+            || source_alias.is_3d
+            || dst_key.width != source_alias.width
+            || dst_key.height != source_alias.height
             || dst_key.depth != 1
             || dst_key.is_3d
         {
             return Ok(None);
         }
-        if src_key == dst_key {
+        if source_alias == dst_key {
             return Ok(None);
         }
 
@@ -5714,23 +5775,47 @@ impl Renderer {
         let RendererInner {
             device,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             rt_copy_slots,
             rt_copy_slot_index,
             ..
         } = &mut *inner;
-        let Some((_, src_image, _src_view, src_layout, src_format, src_stamp)) =
-            rt_cache.color_exact_with_format(src_key)
-        else {
-            return Ok(None);
+        let source = match source_requirement {
+            ExactRtCopySource::Exact(expected_src_stamp) => {
+                let Some(source) = rt_cache.color_exact_with_format(source_alias) else {
+                    return Ok(None);
+                };
+                if source.5 == 0 || source.5 != expected_src_stamp {
+                    return Ok(None);
+                }
+                source
+            }
+            ExactRtCopySource::Latest => {
+                let Some(source_key) =
+                    rt_cache.find_color_key_at_va(source_alias.nvmap_id, source_alias.gpu_va)
+                else {
+                    return Ok(None);
+                };
+                let Some(source) = rt_cache.color_exact_with_format(source_key) else {
+                    return Ok(None);
+                };
+                if source.5 == 0 || !ordered_rt_copy_source_identity(source_alias, source.0) {
+                    return Ok(None);
+                }
+                source
+            }
         };
-        if src_stamp == 0 || src_stamp != expected_src_stamp {
+        let (src_key, src_image, _src_view, src_layout, src_format, _src_stamp) = source;
+        if src_key == dst_key {
             return Ok(None);
         }
         if exact_rt_copy_format_bpp(src_format) != Some(expected_bpp) {
             return Ok(None);
         }
         drain_rt_copies_before_color_recreate(
+            submit_state,
             device,
             *queue,
             rt_cache,
@@ -5825,7 +5910,14 @@ impl Renderer {
                 .end_command_buffer(cmd)
                 .map_err(|e| format!("end_command_buffer(exact rt copy): {:?}", e))?;
         }
-        submit_with_fence(device, *queue, cmd, copy_slot.fence)?;
+        submit_with_fence(
+            submit_state,
+            *submit_timeline,
+            device,
+            *queue,
+            cmd,
+            copy_slot.fence,
+        )?;
         copy_slot.in_flight = true;
         rt_cache.set_color_layout(src_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         rt_cache.set_color_layout(dst_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
@@ -5854,13 +5946,14 @@ impl Renderer {
         let RendererInner {
             device,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             rt_copy_slots,
             rt_copy_slot_index,
             fermi_exact_rt_snapshot_leases,
             fermi_exact_rt_snapshot_ids,
             next_fermi_exact_rt_snapshot_id,
-            submit_timeline,
             ..
         } = &mut *inner;
         if *submit_timeline == vk::Semaphore::null() {
@@ -5868,6 +5961,7 @@ impl Renderer {
         }
         reap_fermi_exact_rt_snapshot_leases(
             device,
+            *submit_timeline,
             fermi_exact_rt_snapshot_leases,
             fermi_exact_rt_snapshot_ids,
         );
@@ -6016,9 +6110,16 @@ impl Renderer {
                     .end_command_buffer(cmd)
                     .map_err(|error| format!("end_command_buffer(fermi snapshot): {error:?}"))?;
             }
-            submit_with_fence(device, *queue, cmd, copy_slot.fence)?;
+            let generation = submit_with_fence(
+                submit_state,
+                *submit_timeline,
+                device,
+                *queue,
+                cmd,
+                copy_slot.fence,
+            )?;
             copy_slot.in_flight = true;
-            Ok(SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire))
+            Ok(generation)
         })();
         let ready_generation = match copy_result {
             Ok(generation) => generation,
@@ -6052,6 +6153,7 @@ impl Renderer {
         let mut inner = self.inner.lock();
         let RendererInner {
             device,
+            submit_timeline,
             fermi_exact_rt_snapshot_leases,
             fermi_exact_rt_snapshot_ids,
             ..
@@ -6059,6 +6161,7 @@ impl Renderer {
         let mut released = ids.to_vec();
         release_fermi_exact_rt_snapshot_lease_refs(
             device,
+            *submit_timeline,
             fermi_exact_rt_snapshot_leases,
             fermi_exact_rt_snapshot_ids,
             &mut released,
@@ -6080,6 +6183,8 @@ impl Renderer {
         let RendererInner {
             device,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             utility_slot,
             rt_copy_slots,
@@ -6091,6 +6196,7 @@ impl Renderer {
             return Ok(false);
         };
         drain_rt_copies_before_color_recreate(
+            submit_state,
             device,
             *queue,
             rt_cache,
@@ -6221,8 +6327,15 @@ impl Renderer {
                 .end_command_buffer(cmd)
                 .map_err(|e| format!("end_command_buffer(rt resolve): {:?}", e))?;
         }
-        submit_with_fence(device, *queue, cmd, utility_slot.fence)
-            .and_then(|_| wait_fence(device, utility_slot.fence))?;
+        submit_with_fence(
+            submit_state,
+            *submit_timeline,
+            device,
+            *queue,
+            cmd,
+            utility_slot.fence,
+        )
+        .and_then(|_| wait_fence(device, utility_slot.fence))?;
         rt_cache.set_color_layout(src_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         rt_cache.set_color_layout(dst_key, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         rt_cache.mark_drawn(dst_key);
@@ -6269,6 +6382,8 @@ impl Renderer {
         let RendererInner {
             device,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             clear_slots,
             clear_slot_index,
@@ -6276,6 +6391,7 @@ impl Renderer {
             ..
         } = &mut *inner;
         drain_rt_copies_before_depth_recreate(
+            submit_state,
             device,
             *queue,
             rt_cache,
@@ -6336,7 +6452,14 @@ impl Renderer {
         }
         let clear_record = clear_record_started.elapsed();
         let clear_submit_started = std::time::Instant::now();
-        submit_with_fence(device, *queue, cmd, clear_slot.fence)?;
+        submit_with_fence(
+            submit_state,
+            *submit_timeline,
+            device,
+            *queue,
+            cmd,
+            clear_slot.fence,
+        )?;
         let clear_submit = clear_submit_started.elapsed();
         clear_slot.in_flight = true;
         rt_cache.mark_depth_written(key);
@@ -6434,6 +6557,8 @@ impl Renderer {
             device,
             cmd_pool,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             mem_props,
             pending_readbacks,
@@ -6566,7 +6691,8 @@ impl Renderer {
             );
         }
         if end_one_time(device, cmd).is_err()
-            || submit_with_fence(device, *queue, cmd, fence).is_err()
+            || submit_with_fence(submit_state, *submit_timeline, device, *queue, cmd, fence)
+                .is_err()
         {
             cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
             return None;
@@ -6665,6 +6791,8 @@ impl Renderer {
         let RendererInner {
             device,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             mem_props,
             sync_readback_slot,
@@ -6711,7 +6839,7 @@ impl Renderer {
             } {
                 Ok(()) => {
                     sync_readback_slot.in_flight = false;
-                    note_queue_drained();
+                    submit_state.note_queue_drained();
                 }
                 Err(error) => {
                     log::warn!(
@@ -6804,7 +6932,8 @@ impl Renderer {
             }
         }
         if end_one_time(device, cmd).is_err()
-            || submit_with_fence(device, *queue, cmd, fence).is_err()
+            || submit_with_fence(submit_state, *submit_timeline, device, *queue, cmd, fence)
+                .is_err()
         {
             return outputs;
         }
@@ -6827,7 +6956,7 @@ impl Renderer {
             }
         }
         sync_readback_slot.in_flight = false;
-        note_queue_drained();
+        submit_state.note_queue_drained();
         unsafe {
             let Ok(ptr) =
                 device.map_memory(stage_memory, 0, stage_size, vk::MemoryMapFlags::empty())
@@ -6861,6 +6990,8 @@ impl Renderer {
             device,
             cmd_pool,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             mem_props,
             quarantined_readbacks,
@@ -6978,7 +7109,8 @@ impl Renderer {
             );
         }
         if end_one_time(device, cmd).is_err()
-            || submit_with_fence(device, *queue, cmd, fence).is_err()
+            || submit_with_fence(submit_state, *submit_timeline, device, *queue, cmd, fence)
+                .is_err()
         {
             cleanup(device, *cmd_pool, Some(fence), Some(cmd), &stage);
             return None;
@@ -7191,6 +7323,8 @@ impl Renderer {
             device,
             cmd_pool,
             queue,
+            submit_state,
+            submit_timeline,
             rt_cache,
             mem_props,
             pending_readbacks,
@@ -7293,6 +7427,8 @@ impl Renderer {
             }
         }
         trace_rt_stats(
+            submit_state,
+            *submit_timeline,
             device,
             *cmd_pool,
             *queue,
@@ -7459,7 +7595,8 @@ impl Renderer {
         let previous_layout = img.layout;
         let end_res = end_one_time(device, cmd);
         let sub_res = if end_res.is_ok() {
-            submit_with_fence(device, *queue, cmd, fence)
+            submit_with_fence(submit_state, *submit_timeline, device, *queue, cmd, fence)
+                .map(|_| ())
         } else {
             Ok(())
         };
@@ -7621,6 +7758,12 @@ impl Renderer {
             ..
         } = &mut *inner;
 
+        if let Some(p) = pipeline_cache.get_current(&key) {
+            if pipeline_cache.has_any_in_flight() {
+                pipeline_cache.drain_completed(device);
+            }
+            return Ok(Some(p));
+        }
         pipeline_cache.drain_completed(device);
         if let Some(p) = pipeline_cache.get(&key) {
             return Ok(Some(p));
@@ -7899,6 +8042,8 @@ impl Renderer {
         let RendererInner {
             device,
             queue,
+            submit_state,
+            submit_timeline,
             mem_props,
             cmd_pool,
             rt_cache,
@@ -7938,7 +8083,8 @@ impl Renderer {
         {
             let slot = &mut frame_slots[cur_idx];
             if slot.in_flight {
-                if !frame_slot_submission_complete(device, slot.submit_generation) {
+                if !frame_slot_submission_complete(device, *submit_timeline, slot.submit_generation)
+                {
                     wait_fence(device, slot.fence)?;
                     *tele_ring_waits += 1;
                 }
@@ -7956,6 +8102,7 @@ impl Renderer {
                 );
                 release_fermi_exact_rt_snapshot_lease_refs(
                     device,
+                    *submit_timeline,
                     fermi_exact_rt_snapshot_leases,
                     fermi_exact_rt_snapshot_ids,
                     &mut slot.fermi_exact_rt_snapshot_leases,
@@ -8003,6 +8150,8 @@ impl Renderer {
         let graphics_dummies = ensure_graphics_dummy_views(
             dummy_images,
             dummy_texel_buffers,
+            submit_state,
+            *submit_timeline,
             device,
             *queue,
             *cmd_pool,
@@ -8218,6 +8367,8 @@ impl Renderer {
                                 None,
                             );
                             trace_vs_tex_bind_alias(
+                                submit_state,
+                                *submit_timeline,
                                 device,
                                 *cmd_pool,
                                 *queue,
@@ -8263,6 +8414,8 @@ impl Renderer {
                                 None,
                             );
                             trace_vs_tex_bind_alias(
+                                submit_state,
+                                *submit_timeline,
                                 device,
                                 *cmd_pool,
                                 *queue,
@@ -8300,7 +8453,15 @@ impl Renderer {
                 trace_vs_tex_bind_dummy(call, slot, &read_guest);
                 continue;
             };
-            let cur_gen = crate::tex_invalidate::region_gen_range(key.gpu_va, read_size as u64);
+            let generation_gating = tex_gen_gating_enabled();
+            let mut current_generation = None;
+            let mut generation_query =
+                Some(|| crate::tex_invalidate::region_gen_range(key.gpu_va, read_size as u64));
+            let gated_generation = resolve_texture_generation(
+                &mut current_generation,
+                &mut generation_query,
+                generation_gating,
+            );
             let numeric_type = texture_numeric_type_for_slot(&call.texture_numeric_manifest, slot);
             let numeric_family = texture_numeric_index(numeric_type);
             let mut binding_failure_reason = None;
@@ -8316,15 +8477,25 @@ impl Renderer {
             };
             if let Some(slices) = volume_slices.as_ref() {
                 trace_volume_rt_pixels(
-                    device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
+                    submit_state,
+                    *submit_timeline,
+                    device,
+                    *cmd_pool,
+                    *queue,
+                    rt_cache,
+                    mem_props,
+                    &tic,
+                    slices,
                 );
             }
             let force_refresh_early = force_refresh_texture(key.gpu_va);
-            let cache_fresh = tex_gen_gating_enabled()
+            let cache_fresh = generation_gating
                 && !force_refresh_early
                 && volume_slices.is_none()
                 && !identity_volume
-                && tex_cache.get(&key).map_or(false, |t| t.gen == cur_gen);
+                && tex_cache
+                    .get(&key)
+                    .is_some_and(|t| Some(t.gen) == gated_generation);
             let raw = if cache_fresh {
                 None
             } else {
@@ -8339,6 +8510,13 @@ impl Renderer {
                 let force_refresh = force_refresh_early;
                 let content_hash_authoritative =
                     raw_hash.is_some() && volume_slices.is_none() && !identity_volume;
+                let mut cur_gen = resolve_texture_generation(
+                    &mut current_generation,
+                    &mut generation_query,
+                    !content_hash_authoritative,
+                )
+                .or_else(|| tex_cache.get(&key).map(|texture| texture.gen))
+                .unwrap_or(0);
                 let need_upload = sampled_texture_needs_upload(
                     force_refresh,
                     tex_cache
@@ -8355,6 +8533,12 @@ impl Renderer {
                     }
                 }
                 if need_upload {
+                    cur_gen = resolve_texture_generation(
+                        &mut current_generation,
+                        &mut generation_query,
+                        true,
+                    )
+                    .unwrap_or(cur_gen);
                     let force_pitch = force_pitch_enabled();
                     let image_format = if identity_volume {
                         Ok(texture_image_format(
@@ -8445,6 +8629,8 @@ impl Renderer {
                         tic.is_block_linear, tic.block_height_log2, tic.block_depth_log2, read_size, texels.len(), image_format
                     );
                     match upload_texture_oneshot(
+                        submit_state,
+                        *submit_timeline,
                         device,
                         *queue,
                         *cmd_pool,
@@ -8628,6 +8814,7 @@ impl Renderer {
 
         let mut vertex_binds = upload_vertex_bindings(
             device,
+            *submit_timeline,
             frame_slots,
             other_idx,
             descriptor_pool.pool,
@@ -8647,6 +8834,7 @@ impl Renderer {
             if !fallback_bindings.is_empty() {
                 vertex_binds.extend(upload_vertex_bindings(
                     device,
+                    *submit_timeline,
                     frame_slots,
                     other_idx,
                     descriptor_pool.pool,
@@ -8664,6 +8852,7 @@ impl Renderer {
                 if !ring_allocation_fits(ubo_ring, 16, 16) {
                     ring_wrap_other(
                         device,
+                        *submit_timeline,
                         frame_slots,
                         other_idx,
                         descriptor_pool.pool,
@@ -8688,6 +8877,7 @@ impl Renderer {
             if !ring_allocation_fits(ubo_ring, isz, 4) {
                 ring_wrap_other(
                     device,
+                    *submit_timeline,
                     frame_slots,
                     other_idx,
                     descriptor_pool.pool,
@@ -8711,16 +8901,20 @@ impl Renderer {
         {
             let v_size = vertex_bindings_size(&vertex_bindings);
             debug_assert!(
-                v_size + cbuf_size_aligned <= ubo_ring.size,
-                "execute_draw: per-draw ring payload ({} vertex + {} ubo) exceeds ring capacity ({})",
-                v_size, cbuf_size_aligned, ubo_ring.size,
-            );
+                    v_size + cbuf_size_aligned <= ubo_ring.size,
+                    "execute_draw: per-draw ring payload ({} vertex + {} ubo) exceeds ring capacity ({})",
+                    v_size, cbuf_size_aligned, ubo_ring.size,
+                );
         }
         if ubo_ring.head + cbuf_size_aligned > ubo_ring.size {
             *tele_ring_wraps += 1;
             let other = &mut frame_slots[other_idx];
             if other.in_flight {
-                if !frame_slot_submission_complete(device, other.submit_generation) {
+                if !frame_slot_submission_complete(
+                    device,
+                    *submit_timeline,
+                    other.submit_generation,
+                ) {
                     wait_fence(device, other.fence)?;
                     *tele_ring_waits += 1;
                 }
@@ -8738,6 +8932,7 @@ impl Renderer {
                 );
                 release_fermi_exact_rt_snapshot_lease_refs(
                     device,
+                    *submit_timeline,
                     fermi_exact_rt_snapshot_leases,
                     fermi_exact_rt_snapshot_ids,
                     &mut other.fermi_exact_rt_snapshot_leases,
@@ -8766,6 +8961,11 @@ impl Renderer {
         } else if !write_graphics_cbuf_data(cbuf_data, cbuf_dst) {
             return Err("invalid graphics cbuf snapshot".to_string());
         }
+        let ubo_info = vk::DescriptorBufferInfo {
+            buffer: ubo_buffer,
+            offset: ubo_offset,
+            range: cbuf_len as u64,
+        };
 
         let set_layouts = [descriptor_layout.layout];
         let alloc_info = vk::DescriptorSetAllocateInfo {
@@ -8783,11 +8983,6 @@ impl Renderer {
         };
         let dset = dsets[0];
 
-        let ubo_info = vk::DescriptorBufferInfo {
-            buffer: ubo_buffer,
-            offset: ubo_offset,
-            range: cbuf_len as u64,
-        };
         let image_infos = typed_sampled_image_infos(
             &bound_tex_views,
             None,
@@ -8840,6 +9035,7 @@ impl Renderer {
             if !ring_allocation_fits(ubo_ring, sz_al, 16) {
                 ring_wrap_other(
                     device,
+                    *submit_timeline,
                     frame_slots,
                     other_idx,
                     descriptor_pool.pool,
@@ -8869,6 +9065,7 @@ impl Renderer {
             if !ring_allocation_fits(ubo_ring, 16, 16) {
                 ring_wrap_other(
                     device,
+                    *submit_timeline,
                     frame_slots,
                     other_idx,
                     descriptor_pool.pool,
@@ -8893,34 +9090,33 @@ impl Renderer {
                 }
             }
         }
-        let mut writes = vec![
-            vk::WriteDescriptorSet {
-                s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                dst_set: dset,
-                dst_binding: crate::descriptor::CBUF_BINDING,
-                dst_array_element: 0,
-                descriptor_count: 1,
-                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                p_buffer_info: &ubo_info,
-                p_image_info: std::ptr::null(),
-                p_texel_buffer_view: std::ptr::null(),
-                p_next: std::ptr::null(),
-                _marker: std::marker::PhantomData,
-            },
-            vk::WriteDescriptorSet {
-                s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                dst_set: dset,
-                dst_binding: crate::descriptor::SAMPLER_BINDING,
-                dst_array_element: 0,
-                descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
-                descriptor_type: vk::DescriptorType::SAMPLER,
-                p_image_info: sampler_infos.as_ptr(),
-                p_buffer_info: std::ptr::null(),
-                p_texel_buffer_view: std::ptr::null(),
-                p_next: std::ptr::null(),
-                _marker: std::marker::PhantomData,
-            },
-        ];
+        let mut writes = Vec::with_capacity(4 + ssbo_bindings.len());
+        writes.push(vk::WriteDescriptorSet {
+            s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+            dst_set: dset,
+            dst_binding: crate::descriptor::CBUF_BINDING,
+            dst_array_element: 0,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            p_buffer_info: &ubo_info,
+            p_image_info: std::ptr::null(),
+            p_texel_buffer_view: std::ptr::null(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        });
+        writes.push(vk::WriteDescriptorSet {
+            s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+            dst_set: dset,
+            dst_binding: crate::descriptor::SAMPLER_BINDING,
+            dst_array_element: 0,
+            descriptor_count: crate::descriptor::MAX_TEXTURE_DESCRIPTORS,
+            descriptor_type: vk::DescriptorType::SAMPLER,
+            p_image_info: sampler_infos.as_ptr(),
+            p_buffer_info: std::ptr::null(),
+            p_texel_buffer_view: std::ptr::null(),
+            p_next: std::ptr::null(),
+            _marker: std::marker::PhantomData,
+        });
         for (i, binding) in ssbo_bindings.iter().enumerate() {
             writes.push(vk::WriteDescriptorSet {
                 s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
@@ -9301,10 +9497,16 @@ impl Renderer {
         }
 
         let slot_fence = frame_slots[cur_idx].fence;
-        submit_with_fence(device, *queue, cmd, slot_fence)?;
+        let submit_generation = submit_with_fence(
+            submit_state,
+            *submit_timeline,
+            device,
+            *queue,
+            cmd,
+            slot_fence,
+        )?;
         frame_slots[cur_idx].in_flight = true;
-        frame_slots[cur_idx].submit_generation =
-            SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        frame_slots[cur_idx].submit_generation = submit_generation;
         frame_slots[cur_idx].retired_dsets.push(dset);
 
         for (key, _, _, _, _) in &color_bind {
@@ -9531,6 +9733,8 @@ impl Renderer {
             texture_read_contract,
             group_texture_memo_enabled(),
         );
+        let texture_generation_gating = tex_gen_gating_enabled();
+        let hot_generic_texture_binding_cache = hot_generic_texture_bindings_enabled();
         let mut rp_texture_memo = RecordTextureMemoProfile::default();
 
         struct Prep<'a> {
@@ -9802,6 +10006,8 @@ impl Renderer {
         let RendererInner {
             device,
             queue,
+            submit_state,
+            submit_timeline,
             mem_props,
             cmd_pool,
             rt_cache,
@@ -9842,7 +10048,8 @@ impl Renderer {
             let slot = &mut frame_slots[cur_idx];
             if slot.in_flight {
                 let wait_t0 = std::time::Instant::now();
-                if !frame_slot_submission_complete(device, slot.submit_generation) {
+                if !frame_slot_submission_complete(device, *submit_timeline, slot.submit_generation)
+                {
                     wait_fence(device, slot.fence)?;
                 }
                 rp_fence_wait = wait_t0.elapsed();
@@ -9860,6 +10067,7 @@ impl Renderer {
                 );
                 release_fermi_exact_rt_snapshot_lease_refs(
                     device,
+                    *submit_timeline,
                     fermi_exact_rt_snapshot_leases,
                     fermi_exact_rt_snapshot_ids,
                     &mut slot.fermi_exact_rt_snapshot_leases,
@@ -9964,6 +10172,7 @@ impl Renderer {
         if ubo_ring.head.saturating_add(batch_ring_upper) > ubo_ring.size {
             ring_wrap_other(
                 device,
+                *submit_timeline,
                 frame_slots,
                 other_idx,
                 descriptor_pool.pool,
@@ -10064,6 +10273,8 @@ impl Renderer {
         let graphics_dummies = ensure_graphics_dummy_views(
             dummy_images,
             dummy_texel_buffers,
+            submit_state,
+            *submit_timeline,
             device,
             *queue,
             *cmd_pool,
@@ -10855,6 +11066,8 @@ impl Renderer {
                                         None,
                                     );
                                     trace_vs_tex_bind_alias(
+                                        submit_state,
+                                        *submit_timeline,
                                         device,
                                         *cmd_pool,
                                         *queue,
@@ -10980,6 +11193,8 @@ impl Renderer {
                                             None,
                                         );
                                         trace_vs_tex_bind_alias(
+                                            submit_state,
+                                            *submit_timeline,
                                             device,
                                             *cmd_pool,
                                             *queue,
@@ -11068,15 +11283,23 @@ impl Renderer {
                     };
                     if let Some(slices) = volume_slices.as_ref() {
                         trace_volume_rt_pixels(
-                            device, *cmd_pool, *queue, rt_cache, mem_props, &tic, slices,
+                            submit_state,
+                            *submit_timeline,
+                            device,
+                            *cmd_pool,
+                            *queue,
+                            rt_cache,
+                            mem_props,
+                            &tic,
+                            slices,
                         );
                     }
                     let force_refresh_early = force_refresh_texture(key.gpu_va);
                     let group_route = group_texture_memo
                         .then(|| group_texture_route_key(call, slot))
                         .flatten();
+                    let generation_gating = texture_generation_gating;
                     let group_binding_eligible = group_route.is_some()
-                        && tex_gen_gating_enabled()
                         && group_texture_binding_memo_eligible(
                             key,
                             tic,
@@ -11084,18 +11307,12 @@ impl Renderer {
                             volume_slices.is_some(),
                             identity_volume,
                         );
-                    let cur_gen = texture_generation(key.gpu_va, read_size);
                     let group_binding = if group_binding_eligible {
                         if record_stage_profile {
                             rp_texture_memo.binding_lookups += 1;
                         }
                         let binding = group_route.and_then(|route| {
-                            group_texture_binding_lookup(
-                                &group_texture_bindings,
-                                route,
-                                key,
-                                cur_gen,
-                            )
+                            group_texture_binding_lookup(&group_texture_bindings, route, key)
                         });
                         if record_stage_profile && binding.is_some() {
                             rp_texture_memo.binding_hits += 1;
@@ -11104,8 +11321,16 @@ impl Renderer {
                     } else {
                         None
                     };
-                    let hot_binding_eligible = hot_generic_texture_bindings_enabled()
-                        && tex_gen_gating_enabled()
+                    let mut current_generation = None;
+                    let mut generation_query = Some(|| texture_generation(key.gpu_va, read_size));
+                    let gated_generation = resolve_texture_generation(
+                        &mut current_generation,
+                        &mut generation_query,
+                        generation_gating && group_binding.is_none(),
+                    );
+                    let hot_binding_eligible = hot_generic_texture_binding_cache
+                        && group_binding.is_none()
+                        && generation_gating
                         && !force_refresh_early
                         && volume_slices.is_none()
                         && !identity_volume
@@ -11114,14 +11339,19 @@ impl Renderer {
                     let slot_hot_binding = hot_binding_eligible
                         .then_some(hot_generic_texture_bindings[slot])
                         .flatten()
-                        .filter(|binding| binding.key == key && binding.generation == cur_gen);
+                        .filter(|binding| {
+                            binding.key == key && Some(binding.generation) == gated_generation
+                        });
                     let hot_binding = group_binding.or(slot_hot_binding);
-                    let cache_fresh = tex_gen_gating_enabled()
-                        && !force_refresh_early
+                    let cache_fresh = !force_refresh_early
                         && volume_slices.is_none()
                         && !identity_volume
-                        && (hot_binding.is_some()
-                            || tex_cache.get(&key).map_or(false, |t| t.gen == cur_gen));
+                        && (group_binding.is_some()
+                            || (generation_gating
+                                && (slot_hot_binding.is_some()
+                                    || tex_cache
+                                        .get(&key)
+                                        .is_some_and(|t| Some(t.gen) == gated_generation))));
                     let (raw_snapshot, raw, raw_hash): (
                         Option<&SharedGuestSnapshot>,
                         Option<&[u8]>,
@@ -11163,7 +11393,8 @@ impl Renderer {
                                 .flatten(),
                         )
                     };
-                    let trusted_snapshot_match = volume_slices.is_none()
+                    let trusted_snapshot_match = raw_snapshot.is_some()
+                        && volume_slices.is_none()
                         && !identity_volume
                         && trusted_texture_snapshot_matches(
                             tex_cache
@@ -11174,6 +11405,20 @@ impl Renderer {
                     let trusted_source_identity = raw_snapshot
                         .and_then(SharedGuestSnapshot::trusted_identity)
                         .filter(|_| volume_slices.is_none() && !identity_volume);
+                    let upload_decision_available =
+                        raw.is_some() || volume_slices.is_some() || identity_volume;
+                    let content_hash_authoritative =
+                        raw_hash.is_some() && volume_slices.is_none() && !identity_volume;
+                    let mut cur_gen = resolve_texture_generation(
+                        &mut current_generation,
+                        &mut generation_query,
+                        upload_decision_available
+                            && !content_hash_authoritative
+                            && !trusted_snapshot_match,
+                    )
+                    .or_else(|| hot_binding.map(|binding| binding.generation))
+                    .or_else(|| tex_cache.get(&key).map(|texture| texture.gen))
+                    .unwrap_or(0);
                     rp_tex_raw_slots += raw.is_some() as usize;
                     rp_tex_gen += profile_elapsed(rp_gen_t0);
                     let rp_upload_t0 = record_detail_profile.then(std::time::Instant::now);
@@ -11183,8 +11428,6 @@ impl Renderer {
                             tex_hash = volume_rt_slice_hash(tex_hash, slices);
                         }
                         let force_refresh = force_refresh_early;
-                        let content_hash_authoritative =
-                            raw_hash.is_some() && volume_slices.is_none() && !identity_volume;
                         let need_upload = sampled_texture_needs_upload(
                             force_refresh,
                             tex_cache
@@ -11206,6 +11449,12 @@ impl Renderer {
                             }
                         }
                         if need_upload {
+                            cur_gen = resolve_texture_generation(
+                                &mut current_generation,
+                                &mut generation_query,
+                                true,
+                            )
+                            .unwrap_or(cur_gen);
                             hot_generic_texture_bindings_evict_range(
                                 &mut hot_generic_texture_bindings,
                                 key.gpu_va,
@@ -11534,6 +11783,7 @@ impl Renderer {
                         tex_cache.get(&key).map(|texture| HotGenericTextureBinding {
                             key,
                             generation: texture.gen,
+                            trusted_source_identity: texture.trusted_source_identity,
                             image: texture.image,
                             view: texture.view,
                             layout: texture.layout,
@@ -11545,9 +11795,10 @@ impl Renderer {
                                 && binding.layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                         });
                     }
-                    if group_binding_eligible {
+                    if group_binding_eligible && group_binding.is_none() {
                         if let (Some(route), Some(binding)) = (group_route, cached_binding) {
                             if binding.generation == cur_gen
+                                && binding.trusted_source_identity.is_some()
                                 && binding.layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                             {
                                 group_texture_bindings.insert(route, binding);
@@ -11638,8 +11889,17 @@ impl Renderer {
                         if key.volume {
                             if let Some((image, _)) = cached_texture {
                                 verify_volume_image(
-                                    device, *cmd_pool, *queue, mem_props, image, key.width,
-                                    key.height, key.layers, tic.gpu_va,
+                                    submit_state,
+                                    *submit_timeline,
+                                    device,
+                                    *cmd_pool,
+                                    *queue,
+                                    mem_props,
+                                    image,
+                                    key.width,
+                                    key.height,
+                                    key.layers,
+                                    tic.gpu_va,
                                 );
                             }
                         }
@@ -11667,6 +11927,7 @@ impl Renderer {
                 let rp_vx0 = record_detail_profile.then(std::time::Instant::now);
                 let mut vertex_binds = upload_vertex_bindings(
                     device,
+                    *submit_timeline,
                     frame_slots,
                     other_idx,
                     descriptor_pool.pool,
@@ -11698,6 +11959,7 @@ impl Renderer {
                     if !fallback_bindings.is_empty() {
                         vertex_binds.extend(upload_vertex_bindings(
                             device,
+                            *submit_timeline,
                             frame_slots,
                             other_idx,
                             descriptor_pool.pool,
@@ -11780,54 +12042,37 @@ impl Renderer {
                     None
                 };
 
-                let resident_cbuf_bind =
-                    if prep.cbuf_data.is_none() && resident_cbuf_direct_enabled() {
-                        call.resident_cbuf.as_ref().and_then(|draw| {
-                            resident_vb.as_mut()?.resolve_cbuf_dir(
-                                draw,
-                                cur_idx,
-                                *max_storage_buffer_range,
-                                &mut resident_vb_used,
-                            )
-                        })
-                    } else {
-                        None
-                    };
-                let (ubo_buffer, ubo_offset, ubo_range) = if let Some((buffer, offset, range)) =
-                    resident_cbuf_bind
-                {
-                    (buffer, offset, range)
-                } else {
-                    let resident_cbuf = prep
-                        .cbuf_data
-                        .is_none()
-                        .then_some(call.resident_cbuf.as_ref())
-                        .flatten();
-                    let cbuf_len = resident_cbuf.map_or(prep.cbuf_len, |draw| draw.packed_size);
-                    let (_cbuf_range, cbuf_size_aligned) = graphics_cbuf_allocation_size(
-                        cbuf_len,
-                        cbuf_alignment,
-                        *max_storage_buffer_range,
-                    )?;
-                    if !ring_allocation_fits(ubo_ring, cbuf_size_aligned, cbuf_alignment) {
-                        return Err(format!(
-                    "batched graphics ring preflight underestimated graphics cbuf upload ({cbuf_size_aligned:#x} bytes, alignment {cbuf_alignment})"
-                ));
+                let resident_cbuf = prep
+                    .cbuf_data
+                    .is_none()
+                    .then_some(call.resident_cbuf.as_ref())
+                    .flatten();
+                let cbuf_len = resident_cbuf.map_or(prep.cbuf_len, |draw| draw.packed_size);
+                let (_cbuf_range, cbuf_size_aligned) = graphics_cbuf_allocation_size(
+                    cbuf_len,
+                    cbuf_alignment,
+                    *max_storage_buffer_range,
+                )?;
+                if !ring_allocation_fits(ubo_ring, cbuf_size_aligned, cbuf_alignment) {
+                    return Err(format!(
+                                "batched graphics ring preflight underestimated graphics cbuf upload ({cbuf_size_aligned:#x} bytes, alignment {cbuf_alignment})"
+                            ));
+                }
+                let (ubo_buffer, ubo_offset, ubo_ptr) =
+                    ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
+                        .map_err(|e| format!("ring_alloc(graphics-cbuf): {}", e))?;
+                let cbuf_dst = unsafe { std::slice::from_raw_parts_mut(ubo_ptr, cbuf_len) };
+                if let Some(draw) = resident_cbuf {
+                    if !write_resident_cbuf_payload(draw, cbuf_dst) {
+                        return Err("invalid batched resident graphics cbuf snapshot".to_string());
                     }
-                    let (ubo_buffer, ubo_offset, ubo_ptr) =
-                        ring_alloc(ubo_ring, cbuf_size_aligned, cbuf_alignment)
-                            .map_err(|e| format!("ring_alloc(graphics-cbuf): {}", e))?;
-                    let cbuf_dst = unsafe { std::slice::from_raw_parts_mut(ubo_ptr, cbuf_len) };
-                    if let Some(draw) = resident_cbuf {
-                        if !write_resident_cbuf_payload(draw, cbuf_dst) {
-                            return Err(
-                                "invalid batched resident graphics cbuf snapshot".to_string()
-                            );
-                        }
-                    } else if !write_graphics_cbuf_data(prep.cbuf_data, cbuf_dst) {
-                        return Err("invalid batched graphics cbuf snapshot".to_string());
-                    }
-                    (ubo_buffer, ubo_offset, cbuf_len as u64)
+                } else if !write_graphics_cbuf_data(prep.cbuf_data, cbuf_dst) {
+                    return Err("invalid batched graphics cbuf snapshot".to_string());
+                }
+                let ubo_info = vk::DescriptorBufferInfo {
+                    buffer: ubo_buffer,
+                    offset: ubo_offset,
+                    range: cbuf_len as u64,
                 };
 
                 if bind_trace_fs(call.fs_gpu_va, call.fs_hash) {
@@ -11875,11 +12120,6 @@ impl Renderer {
                 if let Some(start) = rp_ds_alloc_t0 {
                     rp_dset_stages.allocate += start.elapsed();
                 }
-                let ubo_info = vk::DescriptorBufferInfo {
-                    buffer: ubo_buffer,
-                    offset: ubo_offset,
-                    range: ubo_range,
-                };
                 let sparse_texture_descriptors = descriptor_layout.texture_arrays_partially_bound
                     && sparse_texture_descriptors_enabled()
                     && sparse_texture_manifest_eligible(&call.texture_numeric_manifest);
@@ -12745,14 +12985,20 @@ impl Renderer {
         );
         let rp_t4 = std::time::Instant::now();
         let slot_fence = frame_slots[cur_idx].fence;
-        submit_with_fence(device, *queue, cmd, slot_fence)?;
+        let submit_generation = submit_with_fence(
+            submit_state,
+            *submit_timeline,
+            device,
+            *queue,
+            cmd,
+            slot_fence,
+        )?;
         note_inline_clear_profile(
             inline_clear_count,
             inline_clear_group_count,
             inline_draw_group_count,
         );
-        frame_slots[cur_idx].submit_generation =
-            SUBMIT_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        frame_slots[cur_idx].submit_generation = submit_generation;
         frame_slots[cur_idx]
             .fermi_exact_rt_snapshot_leases
             .extend_from_slice(fermi_exact_rt_snapshot_lease_ids);
@@ -12765,6 +13011,8 @@ impl Renderer {
         let rp_submit = rp_t4.elapsed();
         for post_submit_texture_probe in post_submit_texture_probes {
             run_post_submit_texture_probe(
+                submit_state,
+                *submit_timeline,
                 device,
                 *cmd_pool,
                 *queue,
@@ -13509,6 +13757,8 @@ fn dump_rt_bmp(key: RtKey, rgba: &[u8]) {
 }
 
 fn trace_rt_stats(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
     queue: vk::Queue,
@@ -13546,7 +13796,16 @@ fn trace_rt_stats(
     }
     for key in rt_stats_keys(rt_cache, requested_key, resolved_key) {
         let stamp = stamps.get(&key).copied().unwrap_or(0);
-        match read_rt_image_stats(device, cmd_pool, queue, rt_cache, mem_props, key) {
+        match read_rt_image_stats(
+            submit_state,
+            submit_timeline,
+            device,
+            cmd_pool,
+            queue,
+            rt_cache,
+            mem_props,
+            key,
+        ) {
             Some(stats) => {
                 let pct = if stats.pixels == 0 {
                     0.0
@@ -13630,7 +13889,16 @@ fn trace_rt_stats(
                 continue;
             }
             match read_depth_image_stats(
-                device, cmd_pool, queue, mem_props, key, image, layout, aspects,
+                submit_state,
+                submit_timeline,
+                device,
+                cmd_pool,
+                queue,
+                mem_props,
+                key,
+                image,
+                layout,
+                aspects,
             ) {
                 Some((nonzero, min, max, total)) => {
                     log::warn!(
@@ -13658,6 +13926,8 @@ fn trace_rt_stats(
 }
 
 fn read_depth_image_stats(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
     queue: vk::Queue,
@@ -13753,7 +14023,9 @@ fn read_depth_image_stats(
         prev_layout,
         aspects,
     );
-    if end_one_time(device, cmd).is_err() || submit_with_fence(device, queue, cmd, fence).is_err() {
+    if end_one_time(device, cmd).is_err()
+        || submit_with_fence(submit_state, submit_timeline, device, queue, cmd, fence).is_err()
+    {
         cleanup(device, Some(fence), Some(cmd), &stage);
         return None;
     }
@@ -14595,6 +14867,8 @@ fn finish_color_pass(
 }
 
 fn trace_volume_rt_pixels(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
     queue: vk::Queue,
@@ -14620,7 +14894,16 @@ fn trace_volume_rt_pixels(
         .clamp(1, 64) as usize;
     for slice in slices.iter().take(max_layers) {
         let stamp = slice.stamp;
-        match read_rt_image_stats(device, cmd_pool, queue, rt_cache, mem_props, slice.key) {
+        match read_rt_image_stats(
+            submit_state,
+            submit_timeline,
+            device,
+            cmd_pool,
+            queue,
+            rt_cache,
+            mem_props,
+            slice.key,
+        ) {
             Some(stats) => {
                 let pct = if stats.pixels == 0 {
                     0.0
@@ -18316,10 +18599,25 @@ fn execute_compute_dispatch(
 
     let submit_started = dispatch_started.map(|_| std::time::Instant::now());
     let submit_result = if lazy {
-        submit_with_fence(&inner.device, inner.queue, cmd, fence)
+        submit_with_fence(
+            inner.submit_state.as_ref(),
+            inner.submit_timeline,
+            &inner.device,
+            inner.queue,
+            cmd,
+            fence,
+        )
+        .map(|_| ())
     } else {
-        submit_with_fence(&inner.device, inner.queue, cmd, fence)
-            .and_then(|_| wait_fence(&inner.device, fence))
+        submit_with_fence(
+            inner.submit_state.as_ref(),
+            inner.submit_timeline,
+            &inner.device,
+            inner.queue,
+            cmd,
+            fence,
+        )
+        .and_then(|_| wait_fence(&inner.device, fence))
     };
     let submit_elapsed =
         submit_started.map_or(std::time::Duration::ZERO, |started| started.elapsed());
@@ -18901,6 +19199,8 @@ fn wait_fence_no_reset(device: &ash::Device, fence: vk::Fence) -> Result<(), Str
 }
 
 fn run_post_submit_texture_probe(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
     queue: vk::Queue,
@@ -18928,6 +19228,8 @@ fn run_post_submit_texture_probe(
         }
         for mip_level in 0..probe.mip_levels {
             match read_image_mip_stats(
+                submit_state,
+                submit_timeline,
                 device,
                 cmd_pool,
                 queue,
@@ -18971,6 +19273,8 @@ fn run_post_submit_texture_probe(
     for (slot, probe) in probes.into_iter().enumerate() {
         let probe = probe.unwrap();
         match read_image_stats(
+            submit_state,
+            submit_timeline,
             device,
             cmd_pool,
             queue,
@@ -19036,6 +19340,8 @@ fn run_post_submit_texture_probe(
 }
 
 fn read_rt_image_stats(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
     queue: vk::Queue,
@@ -19048,11 +19354,22 @@ fn read_rt_image_stats(
         (existing.image, existing.layout, existing.format)
     };
     read_image_stats(
-        device, cmd_pool, queue, mem_props, key, image, layout, format,
+        submit_state,
+        submit_timeline,
+        device,
+        cmd_pool,
+        queue,
+        mem_props,
+        key,
+        image,
+        layout,
+        format,
     )
 }
 
 fn read_image_stats(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
     queue: vk::Queue,
@@ -19063,6 +19380,8 @@ fn read_image_stats(
     format: vk::Format,
 ) -> Option<RtImageStats> {
     read_image_mip_stats(
+        submit_state,
+        submit_timeline,
         device,
         cmd_pool,
         queue,
@@ -19076,6 +19395,8 @@ fn read_image_stats(
 }
 
 fn read_image_mip_stats(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
     queue: vk::Queue,
@@ -19186,7 +19507,9 @@ fn read_image_mip_stats(
             1,
         );
     }
-    if end_one_time(device, cmd).is_err() || submit_with_fence(device, queue, cmd, fence).is_err() {
+    if end_one_time(device, cmd).is_err()
+        || submit_with_fence(submit_state, submit_timeline, device, queue, cmd, fence).is_err()
+    {
         cleanup(device, cmd_pool, Some(fence), Some(cmd), &stage);
         return None;
     }
@@ -19297,11 +19620,31 @@ fn read_image_mip_stats(
 
 const RESOLVED_RT_COPY_NVMAP_ID: u32 = u32::MAX;
 
+#[derive(Clone, Copy)]
+enum ExactRtCopySource {
+    Exact(u64),
+    Latest,
+}
+
 fn resolved_rt_copy_key(width: u32, height: u32, dst_va: u64) -> RtKey {
     RtKey::new(RESOLVED_RT_COPY_NVMAP_ID, width, height, dst_va)
 }
 
-fn exact_rt_copy_format_bpp(format: vk::Format) -> Option<usize> {
+fn ordered_rt_copy_source_identity(source_alias: RtKey, actual: RtKey) -> bool {
+    source_alias.nvmap_id != 0
+        && source_alias.nvmap_id != RESOLVED_RT_COPY_NVMAP_ID
+        && source_alias.gpu_va != 0
+        && source_alias.width != 0
+        && source_alias.height != 0
+        && source_alias.depth == 1
+        && !source_alias.is_3d
+        && source_alias.mapping_epoch != 0
+        && actual.mapping_epoch == source_alias.mapping_epoch
+        && source_alias.same_live_identity(actual)
+        && same_physical_backing(source_alias, actual)
+}
+
+pub fn exact_rt_copy_format_bpp(format: vk::Format) -> Option<usize> {
     match format {
         vk::Format::R32G32B32A32_SFLOAT
         | vk::Format::R32G32B32A32_SINT
@@ -19901,6 +20244,8 @@ fn rt_stamp(rt_cache: &RtCache, key: RtKey) -> u64 {
 }
 
 fn trace_vs_tex_bind_alias(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
     queue: vk::Queue,
@@ -19935,7 +20280,18 @@ fn trace_vs_tex_bind_alias(
         bound
     );
     trace_vs_tex_bind_alias_stats(
-        device, cmd_pool, queue, rt_cache, mem_props, call, vs_slot, slot, tex_id, alias,
+        submit_state,
+        submit_timeline,
+        device,
+        cmd_pool,
+        queue,
+        rt_cache,
+        mem_props,
+        call,
+        vs_slot,
+        slot,
+        tex_id,
+        alias,
     );
 }
 
@@ -20042,6 +20398,8 @@ fn trace_vs_tex_bind_texture(
 }
 
 fn trace_vs_tex_bind_alias_stats(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
     queue: vk::Queue,
@@ -20070,7 +20428,16 @@ fn trace_vs_tex_bind_alias_stats(
         }
     }
     let stamp = rt_stamp(rt_cache, alias.key);
-    match read_rt_image_stats(device, cmd_pool, queue, rt_cache, mem_props, alias.key) {
+    match read_rt_image_stats(
+        submit_state,
+        submit_timeline,
+        device,
+        cmd_pool,
+        queue,
+        rt_cache,
+        mem_props,
+        alias.key,
+    ) {
         Some(stats) => {
             let avg_rgb = if stats.pixels == 0 {
                 0.0
@@ -20127,6 +20494,8 @@ fn trace_vs_tex_bind_alias_stats(
 }
 
 fn verify_volume_image(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     cmd_pool: vk::CommandPool,
     queue: vk::Queue,
@@ -20200,7 +20569,7 @@ fn verify_volume_image(
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         );
         end_one_time(device, cmd)?;
-        submit_and_wait(device, queue, cmd)?;
+        submit_and_wait(submit_state, submit_timeline, device, queue, cmd)?;
         let mut out = vec![0u8; size];
         unsafe {
             let ptr = device
@@ -23193,6 +23562,7 @@ fn mirror_20xx_sprite_batch(
 
 fn upload_vertex_bindings(
     device: &ash::Device,
+    submit_timeline: vk::Semaphore,
     frame_slots: &mut [FrameSlot],
     other_idx: usize,
     pool: vk::DescriptorPool,
@@ -23218,6 +23588,7 @@ fn upload_vertex_bindings(
             }
             ring_wrap_other(
                 device,
+                submit_timeline,
                 frame_slots,
                 other_idx,
                 pool,
@@ -23282,6 +23653,7 @@ fn recycle_descriptor_pools(
 
 fn ring_wrap_other(
     device: &ash::Device,
+    submit_timeline: vk::Semaphore,
     frame_slots: &mut [FrameSlot],
     other_idx: usize,
     pool: vk::DescriptorPool,
@@ -23291,7 +23663,7 @@ fn ring_wrap_other(
 ) -> Result<(), String> {
     let other = &mut frame_slots[other_idx];
     if other.in_flight {
-        if !frame_slot_submission_complete(device, other.submit_generation) {
+        if !frame_slot_submission_complete(device, submit_timeline, other.submit_generation) {
             wait_fence(device, other.fence)?;
         }
         if !other.retired_dsets.is_empty() {
@@ -23307,6 +23679,7 @@ fn ring_wrap_other(
         );
         release_fermi_exact_rt_snapshot_lease_refs(
             device,
+            submit_timeline,
             fermi_exact_rt_snapshot_leases,
             fermi_exact_rt_snapshot_ids,
             &mut other.fermi_exact_rt_snapshot_leases,
@@ -24278,6 +24651,8 @@ fn cached_sampler_for_tsc(
 }
 
 fn upload_texture_oneshot(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
@@ -24330,7 +24705,7 @@ fn upload_texture_oneshot(
         None,
     )?;
     end_one_time(device, cmd)?;
-    submit_and_wait(device, queue, cmd)?;
+    submit_and_wait(submit_state, submit_timeline, device, queue, cmd)?;
     unsafe {
         device.free_command_buffers(cmd_pool, &[cmd]);
     }
@@ -26140,6 +26515,8 @@ fn texture_view_swizzle(
 fn ensure_graphics_dummy_views(
     images: &mut HashMap<(u8, DummyImageKind), DummyImage>,
     texel_buffers: &mut [Option<TexelBufferResource>; 3],
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
@@ -26155,6 +26532,8 @@ fn ensure_graphics_dummy_views(
     for (family, numeric_type) in GRAPHICS_TEXTURE_NUMERIC_TYPES.into_iter().enumerate() {
         image_2d[family] = ensure_dummy_image(
             images,
+            submit_state,
+            submit_timeline,
             device,
             queue,
             cmd_pool,
@@ -26164,6 +26543,8 @@ fn ensure_graphics_dummy_views(
         )?;
         image_2d_array[family] = ensure_dummy_image(
             images,
+            submit_state,
+            submit_timeline,
             device,
             queue,
             cmd_pool,
@@ -26173,6 +26554,8 @@ fn ensure_graphics_dummy_views(
         )?;
         image_3d[family] = ensure_dummy_image(
             images,
+            submit_state,
+            submit_timeline,
             device,
             queue,
             cmd_pool,
@@ -26182,6 +26565,8 @@ fn ensure_graphics_dummy_views(
         )?;
         image_cube[family] = ensure_dummy_image(
             images,
+            submit_state,
+            submit_timeline,
             device,
             queue,
             cmd_pool,
@@ -26191,6 +26576,8 @@ fn ensure_graphics_dummy_views(
         )?;
         image_cube_array[family] = ensure_dummy_image(
             images,
+            submit_state,
+            submit_timeline,
             device,
             queue,
             cmd_pool,
@@ -26203,6 +26590,8 @@ fn ensure_graphics_dummy_views(
     }
     let depth_image_2d = ensure_dummy_image(
         images,
+        submit_state,
+        submit_timeline,
         device,
         queue,
         cmd_pool,
@@ -26212,6 +26601,8 @@ fn ensure_graphics_dummy_views(
     )?;
     let depth_image_2d_array = ensure_dummy_image(
         images,
+        submit_state,
+        submit_timeline,
         device,
         queue,
         cmd_pool,
@@ -26221,6 +26612,8 @@ fn ensure_graphics_dummy_views(
     )?;
     let depth_image_cube = ensure_dummy_image(
         images,
+        submit_state,
+        submit_timeline,
         device,
         queue,
         cmd_pool,
@@ -26230,6 +26623,8 @@ fn ensure_graphics_dummy_views(
     )?;
     let depth_image_cube_array = ensure_dummy_image(
         images,
+        submit_state,
+        submit_timeline,
         device,
         queue,
         cmd_pool,
@@ -26254,6 +26649,8 @@ fn ensure_graphics_dummy_views(
 
 fn ensure_dummy_image(
     images: &mut HashMap<(u8, DummyImageKind), DummyImage>,
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
@@ -26264,6 +26661,8 @@ fn ensure_dummy_image(
     let key = (texture_numeric_cache_key(numeric_type), kind);
     if let Entry::Vacant(entry) = images.entry(key) {
         entry.insert(create_dummy_image(
+            submit_state,
+            submit_timeline,
             device,
             queue,
             cmd_pool,
@@ -26301,6 +26700,8 @@ fn dummy_image_format_and_aspect(
 }
 
 fn create_dummy_image(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
@@ -26436,7 +26837,7 @@ fn create_dummy_image(
         aspect,
     );
     end_one_time(device, cmd)?;
-    submit_and_wait(device, queue, cmd)?;
+    submit_and_wait(submit_state, submit_timeline, device, queue, cmd)?;
     unsafe {
         device.free_command_buffers(cmd_pool, &[cmd]);
         device.destroy_buffer(stage.buffer, None);
@@ -26641,6 +27042,7 @@ fn acquire_rt_copy_slot<'a>(
 }
 
 fn drain_rt_copies_before_color_recreate(
+    submit_state: &SubmitState,
     device: &ash::Device,
     queue: vk::Queue,
     rt_cache: &RtCache,
@@ -26669,7 +27071,7 @@ fn drain_rt_copies_before_color_recreate(
             started.elapsed().as_secs_f64() * 1000.0,
         );
     }
-    note_queue_drained();
+    submit_state.note_queue_drained();
     for slot in slots {
         if slot.in_flight {
             slot.in_flight = false;
@@ -26679,6 +27081,7 @@ fn drain_rt_copies_before_color_recreate(
 }
 
 fn drain_rt_copies_before_depth_recreate(
+    submit_state: &SubmitState,
     device: &ash::Device,
     queue: vk::Queue,
     rt_cache: &RtCache,
@@ -26695,7 +27098,7 @@ fn drain_rt_copies_before_depth_recreate(
             .queue_wait_idle(queue)
             .map_err(|e| format!("queue_wait_idle(depth image recreate): {:?}", e))?;
     }
-    note_queue_drained();
+    submit_state.note_queue_drained();
     for slot in slots {
         if slot.in_flight {
             slot.in_flight = false;
@@ -26819,29 +27222,31 @@ fn end_one_time(device: &ash::Device, cmd: vk::CommandBuffer) -> Result<(), Stri
 }
 
 fn queue_submit_tracked(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     queue: vk::Queue,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     tracked: bool,
-) -> Result<(), String> {
-    use ash::vk::Handle;
-    let _seq = SUBMIT_SEQ_LOCK
+) -> Result<u64, String> {
+    let _seq = submit_state
+        .sequence
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let raw = SUBMIT_TIMELINE.load(std::sync::atomic::Ordering::Acquire);
-    let signalling = tracked && raw != 0;
+    let signalling = tracked && submit_timeline != vk::Semaphore::null();
     let sig_sem = if signalling {
-        vk::Semaphore::from_raw(raw)
+        submit_timeline
     } else {
         vk::Semaphore::null()
     };
-    let sig_value: u64 = if signalling {
-        SUBMIT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+    let sig_value = if tracked {
+        submit_state
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            .wrapping_add(1)
+            .max(1)
     } else {
-        if tracked {
-            note_queue_submission();
-        }
         0
     };
     let tl = vk::TimelineSemaphoreSubmitInfo {
@@ -26872,53 +27277,64 @@ fn queue_submit_tracked(
         },
         _marker: std::marker::PhantomData,
     };
-    let result = unsafe { device.queue_submit(queue, &[submit], fence) };
-    if let Err(error) = result {
-        if signalling {
-            let current =
-                unsafe { device.get_semaphore_counter_value(sig_sem) }.unwrap_or(u64::MAX);
-            if current < sig_value {
-                let info = vk::SemaphoreSignalInfo {
-                    s_type: vk::StructureType::SEMAPHORE_SIGNAL_INFO,
-                    semaphore: sig_sem,
-                    value: sig_value,
-                    ..Default::default()
-                };
-                let _ = unsafe { device.signal_semaphore(&info) };
-            }
-        }
+    if let Err(error) = unsafe { device.queue_submit(queue, &[submit], fence) } {
         return Err(format!("queue_submit(fence): {:?}", error));
     }
-    Ok(())
+    if tracked {
+        submit_state
+            .generation
+            .store(sig_value, std::sync::atomic::Ordering::Release);
+    }
+    Ok(sig_value)
 }
 
 fn submit_and_wait(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     queue: vk::Queue,
     cmd: vk::CommandBuffer,
 ) -> Result<(), String> {
-    queue_submit_tracked(device, queue, cmd, vk::Fence::null(), true)?;
+    queue_submit_tracked(
+        submit_state,
+        submit_timeline,
+        device,
+        queue,
+        cmd,
+        vk::Fence::null(),
+        true,
+    )?;
     unsafe {
         device
             .queue_wait_idle(queue)
             .map_err(|e| format!("queue_wait_idle: {:?}", e))?;
     }
-    note_queue_drained();
+    submit_state.note_queue_drained();
     Ok(())
 }
 
 fn submit_with_fence(
+    submit_state: &SubmitState,
+    submit_timeline: vk::Semaphore,
     device: &ash::Device,
     queue: vk::Queue,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     unsafe {
         device
             .reset_fences(&[fence])
             .map_err(|e| format!("reset_fences(submit): {:?}", e))?;
     }
-    queue_submit_tracked(device, queue, cmd, fence, true)
+    queue_submit_tracked(
+        submit_state,
+        submit_timeline,
+        device,
+        queue,
+        cmd,
+        fence,
+        true,
+    )
 }
 
 fn wait_fence(device: &ash::Device, fence: vk::Fence) -> Result<(), String> {
@@ -27573,7 +27989,6 @@ impl Drop for RendererInner {
             std::mem::forget(fermi_exact_rt_snapshot_leases);
         }
         if self.submit_timeline != vk::Semaphore::null() {
-            SUBMIT_TIMELINE.store(0, std::sync::atomic::Ordering::Release);
             unsafe { self.device.destroy_semaphore(self.submit_timeline, None) };
             self.submit_timeline = vk::Semaphore::null();
         }
@@ -27855,14 +28270,15 @@ mod tests {
         graphics_texture_descriptor_binding_mask, graphics_texture_descriptor_target,
         group_texture_binding_epoch_changed, group_texture_binding_evict_range,
         group_texture_binding_lookup, group_texture_binding_memo_eligible,
-        group_texture_memo_enabled_for_contract, hot_generic_texture_bindings_evict_range,
-        inline_graphics_clear_rect, inline_graphics_color_clear_region, memoized_group_tic,
-        memoized_group_tsc, memoized_texture_snapshot_hash, parse_bind_trace_filter,
+        group_texture_memo_enabled_for_contract, group_texture_memo_value_enabled,
+        hot_generic_texture_bindings_evict_range, inline_graphics_clear_rect,
+        inline_graphics_color_clear_region, memoized_group_tic, memoized_group_tsc,
+        memoized_texture_snapshot_hash, ordered_rt_copy_source_identity, parse_bind_trace_filter,
         pipeline_prewarm_value_enabled, preflight_draw_group_attachment_uses,
         readback_backlog_disposition, readback_byte_len, readback_fence_is_ready,
         readback_layout_after_submit, readback_stage_needs_growth, readback_to_rgba8,
-        readback_wait_disposition, resident_cbuf_draw_is_valid, resident_directory_config,
-        resident_range_slab_delta, resolved_rt_copy_key, ring_request_upper_bound,
+        readback_wait_disposition, resident_cbuf_draw_is_valid, resident_range_slab_delta,
+        resolve_texture_generation, resolved_rt_copy_key, ring_request_upper_bound,
         route_texture_key_to_shader_image_kind, rt_alias_sample_view_type, rt_alias_view_format,
         sampled_rt_key_from_lists, sampled_texture_needs_upload, segment_group_texture_prep_memo,
         shared_aurora_ssbo_key, sparse_texture_manifest_eligible,
@@ -27972,6 +28388,47 @@ mod tests {
         assert_eq!(mutated.trusted_identity(), None);
         assert!(!trusted_texture_snapshot_matches(Some(17), Some(&mutated)));
         assert_eq!(trusted.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn texture_generation_query_is_skipped_until_required() {
+        let calls = std::cell::Cell::new(0);
+        let mut generation = None;
+        let mut query = Some(|| {
+            calls.set(calls.get() + 1);
+            41
+        });
+
+        assert_eq!(
+            resolve_texture_generation(&mut generation, &mut query, false),
+            None
+        );
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            resolve_texture_generation(&mut generation, &mut query, true),
+            Some(41)
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn texture_generation_query_runs_at_most_once() {
+        let calls = std::cell::Cell::new(0);
+        let mut generation = None;
+        let mut query = Some(|| {
+            calls.set(calls.get() + 1);
+            73
+        });
+
+        assert_eq!(
+            resolve_texture_generation(&mut generation, &mut query, true),
+            Some(73)
+        );
+        assert_eq!(
+            resolve_texture_generation(&mut generation, &mut query, true),
+            Some(73)
+        );
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
@@ -28228,6 +28685,7 @@ mod tests {
         let binding = HotGenericTextureBinding {
             key,
             generation: 3,
+            trusted_source_identity: Some(13),
             image: vk::Image::from_raw(21),
             view: vk::ImageView::from_raw(22),
             layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -28301,6 +28759,17 @@ mod tests {
     }
 
     #[test]
+    fn immutable_group_texture_memo_defaults_on_with_rollback() {
+        assert!(group_texture_memo_value_enabled(None));
+        for value in ["1", "true", "on", "yes"] {
+            assert!(group_texture_memo_value_enabled(Some(value)));
+        }
+        for value in ["0", "false", "off", "no"] {
+            assert!(!group_texture_memo_value_enabled(Some(value)));
+        }
+    }
+
+    #[test]
     fn group_texture_binding_memo_requires_exact_safe_binding_and_evicts_uploads() {
         let route = GroupTextureRouteKey {
             tic_addr: 0x4000,
@@ -28312,30 +28781,31 @@ mod tests {
         let binding = HotGenericTextureBinding {
             key,
             generation: 7,
+            trusted_source_identity: Some(17),
             image: vk::Image::from_raw(11),
             view: vk::ImageView::from_raw(12),
             layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         };
         let mut bindings = HashMap::from([(route, binding)]);
         assert_eq!(
-            group_texture_binding_lookup(&bindings, route, key, 7).map(|hit| hit.view),
+            group_texture_binding_lookup(&bindings, route, key).map(|hit| hit.view),
             Some(binding.view)
         );
-        assert!(group_texture_binding_lookup(&bindings, route, key, 8).is_none());
-        assert!(group_texture_binding_lookup(
-            &bindings,
-            route,
-            TexCacheKey { width: 65, ..key },
-            7,
-        )
-        .is_none());
+        assert!(
+            group_texture_binding_lookup(&bindings, route, TexCacheKey { width: 65, ..key })
+                .is_none()
+        );
         bindings.get_mut(&route).unwrap().layout = vk::ImageLayout::GENERAL;
-        assert!(group_texture_binding_lookup(&bindings, route, key, 7).is_none());
+        assert!(group_texture_binding_lookup(&bindings, route, key).is_none());
         bindings.get_mut(&route).unwrap().layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         let other_route = GroupTextureRouteKey {
             tic_addr: 0x5000,
             ..route
         };
+        assert!(group_texture_binding_lookup(&bindings, other_route, key).is_none());
+        bindings.get_mut(&route).unwrap().trusted_source_identity = None;
+        assert!(group_texture_binding_lookup(&bindings, route, key).is_none());
+        bindings.get_mut(&route).unwrap().trusted_source_identity = Some(17);
         let other = HotGenericTextureBinding {
             key: group_memo_test_key(0x20000),
             ..binding
@@ -28368,7 +28838,72 @@ mod tests {
             key, tic, true, false, false
         ));
         assert!(!group_texture_binding_memo_eligible(
+            key, tic, false, true, false
+        ));
+        assert!(!group_texture_binding_memo_eligible(
+            key, tic, false, false, true
+        ));
+        assert!(!group_texture_binding_memo_eligible(
+            TexCacheKey {
+                volume: true,
+                ..key
+            },
+            tic,
+            false,
+            false,
+            false
+        ));
+        assert!(!group_texture_binding_memo_eligible(
+            TexCacheKey { cube: true, ..key },
+            tic,
+            false,
+            false,
+            false
+        ));
+        assert!(!group_texture_binding_memo_eligible(
+            TexCacheKey {
+                cube_array: true,
+                ..key
+            },
+            tic,
+            false,
+            false,
+            false
+        ));
+        assert!(!group_texture_binding_memo_eligible(
+            TexCacheKey {
+                base_layer: 1,
+                ..key
+            },
+            tic,
+            false,
+            false,
+            false
+        ));
+        assert!(!group_texture_binding_memo_eligible(
             TexCacheKey { base_mip: 1, ..key },
+            tic,
+            false,
+            false,
+            false
+        ));
+        assert!(!group_texture_binding_memo_eligible(
+            TexCacheKey {
+                layers: 2,
+                view_layers: 1,
+                ..key
+            },
+            tic,
+            false,
+            false,
+            false
+        ));
+        assert!(!group_texture_binding_memo_eligible(
+            TexCacheKey {
+                mip_levels: 2,
+                view_mips: 1,
+                ..key
+            },
             tic,
             false,
             false,
@@ -28411,6 +28946,44 @@ mod tests {
                 },
             ],
             packed_size: 324,
+            arena: None,
+            arena_slot_start: 0,
+            arena_slot_count: 0,
+        }
+    }
+
+    fn resident_cbuf_arena_test_draw() -> crate::draw::ResidentCbufDraw {
+        let arena = crate::draw::ResidentCbufArena {
+            sources: vec![crate::draw::ResidentCbufSource {
+                page_key: 7,
+                generation: 2,
+                serial: 3,
+                data: std::sync::Arc::new(vec![0, 1, 2, 3, 4, 5, 0]),
+            }]
+            .into_boxed_slice(),
+            segments: vec![crate::draw::ResidentCbufSegment {
+                source_index: 0,
+                byte_offset: 1,
+                byte_len: 5,
+            }]
+            .into_boxed_slice(),
+            slots: vec![crate::draw::ResidentCbufArenaSlot {
+                logical_slot: 0,
+                word_count: 2,
+                segment_start: 0,
+                segment_count: 1,
+                byte_len: 5,
+                packed_offset: 304,
+            }]
+            .into_boxed_slice(),
+        };
+        crate::draw::ResidentCbufDraw {
+            chunks: Vec::new(),
+            slots: Vec::new(),
+            packed_size: 312,
+            arena: Some(std::sync::Arc::new(arena)),
+            arena_slot_start: 0,
+            arena_slot_count: 1,
         }
     }
 
@@ -28448,22 +29021,6 @@ mod tests {
     }
 
     #[test]
-    fn resident_directory_is_reserved_only_for_actual_cbuf_frame_slots() {
-        assert_eq!(resident_directory_config(false, 2), Some((0, 0)));
-        assert_eq!(resident_directory_config(false, 0), None);
-        assert_eq!(resident_directory_config(false, 65), None);
-        assert_eq!(
-            resident_directory_config(true, 3),
-            Some((4 * 1024 * 1024, 3))
-        );
-        assert_eq!(
-            resident_directory_config(true, 64),
-            Some((4 * 1024 * 1024, 64))
-        );
-        assert_eq!(resident_directory_config(true, 0), None);
-    }
-
-    #[test]
     fn resident_slab_delta_rejects_ranges_outside_full_slab() {
         let chunk = crate::draw::RESIDENT_CHUNK_SIZE as u64;
         assert_eq!(resident_range_slab_delta(chunk + 7, 9, 1, 1), Some(7));
@@ -28496,8 +29053,7 @@ mod tests {
             free: super::ResidentFreeList::default(),
             slabs: HashMap::new(),
             clock: 0,
-            dir_heads: Vec::new(),
-            last_fail: super::RESCBUF_FAIL_OTHER,
+            last_fail: super::RESIDENT_FAIL_OTHER,
         }
     }
 
@@ -28549,7 +29105,7 @@ mod tests {
 
         used.clear();
         assert!(cache.resolve_chunks(&v4, &mut used).is_none());
-        assert_eq!(cache.last_fail, super::RESCBUF_FAIL_SLAB);
+        assert_eq!(cache.last_fail, super::RESIDENT_FAIL_SLAB);
         cache.complete_frame_slot(0);
         let (_, offset4, kind4) = cache.resolve_chunks(&v4, &mut used).unwrap();
         assert_eq!(kind4, super::ResidentResolveKind::Version);
@@ -28605,7 +29161,60 @@ mod tests {
         assert_eq!(&dst[304..309], &[1, 2, 3, 4, 5]);
         assert!(dst[309..320].iter().all(|byte| *byte == 0));
         assert_eq!(&dst[320..324], &[9, 8, 7, 6]);
-        assert!(!resident_cbuf_draw_is_valid(&draw, draw.packed_size, true));
+    }
+
+    #[test]
+    fn resident_cbuf_writer_accepts_4k_page_chunks() {
+        let mut draw = resident_cbuf_test_draw();
+        draw.chunks[0].data = std::sync::Arc::new(draw.chunks[0].data[..4096].to_vec());
+        let mut dst = vec![0; draw.packed_size];
+
+        assert!(resident_cbuf_draw_is_valid(&draw, draw.packed_size));
+        assert!(write_resident_cbuf_payload(&draw, &mut dst));
+        assert_eq!(&dst[304..309], &[1, 2, 3, 4, 5]);
+        assert_eq!(&dst[320..324], &[9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn resident_cbuf_writer_accepts_exact_cross_page_payload() {
+        let data = vec![11, 22, 33, 44, 55, 66, 77, 88];
+        let draw = crate::draw::ResidentCbufDraw {
+            chunks: vec![crate::draw::ResidentVertexChunk {
+                chunk_key: 19,
+                generation: 4,
+                serial: 9,
+                data: std::sync::Arc::new(data.clone()),
+            }],
+            slots: vec![crate::draw::ResidentCbufSlot {
+                logical_slot: 3,
+                word_count: 2,
+                chunk_index: 0,
+                byte_offset: 0,
+                byte_len: 8,
+                packed_offset: 304,
+            }],
+            packed_size: 312,
+            arena: None,
+            arena_slot_start: 0,
+            arena_slot_count: 0,
+        };
+        let mut dst = vec![0; draw.packed_size];
+
+        assert!(write_resident_cbuf_payload(&draw, &mut dst));
+        assert_eq!(&dst[304..312], data.as_slice());
+    }
+
+    #[test]
+    fn resident_cbuf_writer_rejects_variable_source_oob_before_mutation() {
+        let mut draw = resident_cbuf_test_draw();
+        draw.chunks[0].data = std::sync::Arc::new(vec![0; 4096]);
+        draw.slots[0].byte_offset = 4092;
+        draw.slots[0].byte_len = 8;
+        let mut dst = vec![0xa5; draw.packed_size];
+        let before = dst.clone();
+
+        assert!(!write_resident_cbuf_payload(&draw, &mut dst));
+        assert_eq!(dst, before);
     }
 
     #[test]
@@ -28636,7 +29245,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_cbuf_writer_accepts_unaligned_source_with_direct_bind_fallback() {
+    fn resident_cbuf_writer_accepts_unaligned_source() {
         let mut draw = resident_cbuf_test_draw();
         std::sync::Arc::make_mut(&mut draw.chunks[0].data)[3..8].copy_from_slice(&[6, 5, 4, 3, 2]);
         draw.slots[0].byte_offset = 3;
@@ -28644,7 +29253,126 @@ mod tests {
 
         assert!(write_resident_cbuf_payload(&draw, &mut dst));
         assert_eq!(&dst[304..309], &[6, 5, 4, 3, 2]);
-        assert!(!resident_cbuf_draw_is_valid(&draw, draw.packed_size, true));
+    }
+
+    #[test]
+    fn resident_cbuf_writer_accepts_one_page_arena() {
+        let draw = resident_cbuf_arena_test_draw();
+        let mut dst = vec![0xcc; draw.packed_size];
+
+        assert!(resident_cbuf_draw_is_valid(&draw, draw.packed_size));
+        assert!(write_resident_cbuf_payload(&draw, &mut dst));
+        assert_eq!(cbuf_directory_entry(&dst, 0), (76, 2));
+        assert_eq!(&dst[304..309], &[1, 2, 3, 4, 5]);
+        assert!(dst[309..312].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn resident_cbuf_writer_accepts_cross_page_arena() {
+        let arena = crate::draw::ResidentCbufArena {
+            sources: vec![
+                crate::draw::ResidentCbufSource {
+                    page_key: 19,
+                    generation: 4,
+                    serial: 9,
+                    data: std::sync::Arc::new(vec![0, 0, 1, 2, 3]),
+                },
+                crate::draw::ResidentCbufSource {
+                    page_key: 20,
+                    generation: 5,
+                    serial: 10,
+                    data: std::sync::Arc::new(vec![4, 5, 6, 7, 8, 0]),
+                },
+            ]
+            .into_boxed_slice(),
+            segments: vec![
+                crate::draw::ResidentCbufSegment {
+                    source_index: 0,
+                    byte_offset: 2,
+                    byte_len: 3,
+                },
+                crate::draw::ResidentCbufSegment {
+                    source_index: 1,
+                    byte_offset: 0,
+                    byte_len: 5,
+                },
+            ]
+            .into_boxed_slice(),
+            slots: vec![crate::draw::ResidentCbufArenaSlot {
+                logical_slot: 3,
+                word_count: 2,
+                segment_start: 0,
+                segment_count: 2,
+                byte_len: 8,
+                packed_offset: 304,
+            }]
+            .into_boxed_slice(),
+        };
+        let draw = crate::draw::ResidentCbufDraw {
+            chunks: Vec::new(),
+            slots: Vec::new(),
+            packed_size: 312,
+            arena: Some(std::sync::Arc::new(arena)),
+            arena_slot_start: 0,
+            arena_slot_count: 1,
+        };
+        let mut dst = vec![0; draw.packed_size];
+
+        assert!(write_resident_cbuf_payload(&draw, &mut dst));
+        assert_eq!(cbuf_directory_entry(&dst, 3), (76, 2));
+        assert_eq!(&dst[304..312], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn resident_cbuf_writer_rejects_malformed_arena_before_mutation() {
+        let draw = resident_cbuf_arena_test_draw();
+        let invalid = [
+            {
+                let mut invalid = draw.clone();
+                std::sync::Arc::make_mut(invalid.arena.as_mut().unwrap()).segments[0]
+                    .source_index = 1;
+                invalid
+            },
+            {
+                let mut invalid = draw.clone();
+                std::sync::Arc::make_mut(invalid.arena.as_mut().unwrap()).segments[0].byte_offset =
+                    7;
+                invalid
+            },
+            {
+                let mut invalid = draw.clone();
+                std::sync::Arc::make_mut(invalid.arena.as_mut().unwrap()).segments[0].byte_len = 4;
+                invalid
+            },
+            {
+                let mut invalid = draw.clone();
+                std::sync::Arc::make_mut(invalid.arena.as_mut().unwrap()).slots[0].segment_start =
+                    1;
+                invalid
+            },
+            {
+                let mut invalid = draw.clone();
+                invalid.chunks.push(crate::draw::ResidentVertexChunk {
+                    chunk_key: 7,
+                    generation: 2,
+                    serial: 3,
+                    data: std::sync::Arc::new(vec![0; 8]),
+                });
+                invalid
+            },
+            {
+                let mut invalid = draw.clone();
+                invalid.arena = None;
+                invalid
+            },
+        ];
+        for invalid in invalid {
+            let mut dst = vec![0xa5; invalid.packed_size];
+            let before = dst.clone();
+
+            assert!(!write_resident_cbuf_payload(&invalid, &mut dst));
+            assert_eq!(dst, before);
+        }
     }
 
     #[test]
@@ -29600,6 +30328,41 @@ mod tests {
             None
         );
         assert_eq!(exact_rt_copy_format_bpp(vk::Format::R8G8B8_UNORM), None);
+    }
+
+    #[test]
+    fn ordered_rt_copy_requires_live_physical_source_identity() {
+        let source_alias = RtKey::with_cpu(31, 1280, 720, 0x5000, 0x9000)
+            .with_mapping_epoch(7)
+            .with_guest_size_bytes(1280 * 720 * 4)
+            .with_pitch_linear_layout(1280 * 4);
+        assert!(ordered_rt_copy_source_identity(source_alias, source_alias));
+        assert!(!ordered_rt_copy_source_identity(
+            source_alias,
+            source_alias.with_mapping_epoch(8)
+        ));
+        assert!(!ordered_rt_copy_source_identity(
+            source_alias,
+            source_alias.with_guest_size_bytes(1280 * 720 * 8)
+        ));
+        assert!(!ordered_rt_copy_source_identity(
+            source_alias,
+            RtKey::with_cpu(31, 1280, 720, 0x5000, 0xa000)
+                .with_mapping_epoch(7)
+                .with_guest_size_bytes(1280 * 720 * 4)
+                .with_pitch_linear_layout(1280 * 4)
+        ));
+        assert!(!ordered_rt_copy_source_identity(
+            source_alias.with_mapping_epoch(0),
+            source_alias
+        ));
+        assert!(!ordered_rt_copy_source_identity(
+            source_alias,
+            RtKey {
+                width: 640,
+                ..source_alias
+            }
+        ));
     }
 
     #[test]

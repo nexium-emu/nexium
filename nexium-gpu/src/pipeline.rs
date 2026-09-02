@@ -14,7 +14,9 @@ fn cache_path(device_tag: &str) -> Option<PathBuf> {
     )
 }
 
-#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Default, Hash, Eq, PartialEq, Clone, Copy, Debug, serde::Serialize, serde::Deserialize,
+)]
 pub struct PipelineKey {
     pub vs_hash: u64,
     pub fs_hash: u64,
@@ -37,6 +39,27 @@ pub struct PipelineKey {
     pub depth_clamp_enabled: bool,
     pub poly_offset_packed: u64,
     pub color_write_mask: u32,
+}
+
+#[derive(Default)]
+struct CurrentPipeline {
+    entry: Option<(PipelineKey, vk::Pipeline)>,
+}
+
+impl CurrentPipeline {
+    fn get(&self, key: &PipelineKey) -> Option<vk::Pipeline> {
+        self.entry
+            .filter(|(current_key, _)| current_key == key)
+            .map(|(_, pipeline)| pipeline)
+    }
+
+    fn set(&mut self, key: PipelineKey, pipeline: vk::Pipeline) {
+        self.entry = Some((key, pipeline));
+    }
+
+    fn clear(&mut self) {
+        self.entry = None;
+    }
 }
 
 const SPEC_VERSION: u32 = 41;
@@ -612,6 +635,7 @@ struct CompileWorker {
 
 pub struct PipelineCache {
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
+    current_pipeline: CurrentPipeline,
     pub layout: vk::PipelineLayout,
     pub vk_cache: vk::PipelineCache,
     dirty: bool,
@@ -827,6 +851,7 @@ impl PipelineCache {
 
         Ok(Self {
             pipelines: HashMap::new(),
+            current_pipeline: CurrentPipeline::default(),
             layout,
             vk_cache,
             dirty: false,
@@ -929,6 +954,12 @@ impl PipelineCache {
         self.worker
             .as_ref()
             .is_some_and(|w| w.in_flight.contains_key(key))
+    }
+
+    pub fn has_any_in_flight(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(|w| !w.in_flight.is_empty())
     }
 
     pub fn wait_for_in_flight(
@@ -1059,18 +1090,29 @@ impl PipelineCache {
         build_graphics_pipeline(device, self.vk_cache, self.layout, &self.cache_lock, req)
     }
 
-    pub fn get(&self, key: &PipelineKey) -> Option<vk::Pipeline> {
-        self.pipelines.get(key).copied()
+    pub fn get(&mut self, key: &PipelineKey) -> Option<vk::Pipeline> {
+        if let Some(pipeline) = self.get_current(key) {
+            return Some(pipeline);
+        }
+        let pipeline = self.pipelines.get(key).copied()?;
+        self.current_pipeline.set(*key, pipeline);
+        Some(pipeline)
+    }
+
+    pub fn get_current(&self, key: &PipelineKey) -> Option<vk::Pipeline> {
+        self.current_pipeline.get(key)
     }
 
     pub fn insert(&mut self, key: PipelineKey, pipeline: vk::Pipeline) {
         self.pipelines.insert(key, pipeline);
+        self.current_pipeline.set(key, pipeline);
         self.failed.remove(&key);
         self.dirty = true;
         self.last_change = std::time::Instant::now();
     }
 
     pub fn clear(&mut self, device: &ash::Device) {
+        self.current_pipeline.clear();
         if let Some(w) = self.worker.take() {
             let CompileWorker {
                 req_tx,
@@ -1123,7 +1165,32 @@ impl Drop for PipelineCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_save_due, known_driver_hostile_pipeline, CACHE_SAVE_IDLE_INTERVAL};
+    use ash::vk;
+    use ash::vk::Handle;
+
+    use super::{
+        cache_save_due, known_driver_hostile_pipeline, CurrentPipeline, PipelineKey,
+        CACHE_SAVE_IDLE_INTERVAL,
+    };
+
+    #[test]
+    fn current_pipeline_requires_exact_key_and_resets() {
+        let key = PipelineKey::default();
+        let other_key = PipelineKey { fs_hash: 1, ..key };
+        let pipeline = vk::Pipeline::from_raw(7);
+        let other_pipeline = vk::Pipeline::from_raw(9);
+        let mut current = CurrentPipeline::default();
+
+        assert_eq!(current.get(&key), None);
+        current.set(key, pipeline);
+        assert_eq!(current.get(&key), Some(pipeline));
+        assert_eq!(current.get(&other_key), None);
+        current.set(other_key, other_pipeline);
+        assert_eq!(current.get(&key), None);
+        assert_eq!(current.get(&other_key), Some(other_pipeline));
+        current.clear();
+        assert_eq!(current.get(&other_key), None);
+    }
 
     #[test]
     fn driver_hostile_pipeline_guard_is_pair_specific() {
