@@ -10745,7 +10745,7 @@ fn debug_windows(
                             &mut app_settings.performance_debug.resident_cbuf,
                             "Resident Constant Buffer Cache",
                             "Reuses stable constant-buffer snapshots across draws.",
-                            "Retains mirrored constant-buffer data and binds resident storage when possible. Direct resident binding works best with the Resident Vertex Buffer Cache.",
+                            "Retains immutable mirrored constant-buffer page snapshots and reuses them across queued draws.",
                             "NEXIUM_RESIDENT_CBUF=1",
                         );
                     });
