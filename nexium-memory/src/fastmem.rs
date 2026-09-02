@@ -366,6 +366,25 @@ pub enum WriteWatchResult {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WriteWatchObservation {
+    pub result: WriteWatchResult,
+    pub serial_after: u64,
+    pub generation_before: u64,
+    pub generation_after: u64,
+}
+
+impl WriteWatchObservation {
+    fn unavailable() -> Self {
+        Self {
+            result: WriteWatchResult::Unavailable,
+            serial_after: observed_write_serial(),
+            generation_before: 0,
+            generation_after: 0,
+        }
+    }
+}
+
 pub fn write_watch_query_range(va: u64, len: usize) -> Option<(u64, usize)> {
     const PAGE_MASK: u64 = 0xfff;
     if len == 0 {
@@ -492,6 +511,78 @@ pub fn take_write_watch_spans(
         });
         drop(ranges);
         result
+    }
+}
+
+pub fn take_write_watch_spans_observed(
+    va: u64,
+    len: usize,
+    spans: &mut Vec<(u64, usize)>,
+) -> WriteWatchObservation {
+    #[cfg(not(windows))]
+    {
+        let _ = (va, len, spans);
+        return WriteWatchObservation::unavailable();
+    }
+
+    #[cfg(windows)]
+    {
+        if !ARENA_WRITE_WATCH.load(Ordering::Acquire) {
+            return WriteWatchObservation::unavailable();
+        }
+        let Some((lo, query_len)) = write_watch_query_range(va, len) else {
+            return WriteWatchObservation::unavailable();
+        };
+        let hi = lo + query_len as u64;
+        let base = arena();
+        if base.is_null() {
+            return WriteWatchObservation::unavailable();
+        }
+        let ranges = committed_ranges()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !is_committed(&ranges, lo, hi) {
+            return WriteWatchObservation::unavailable();
+        }
+        let (_, generation_before) = observed_write_snapshot_range(lo, query_len);
+        let page_count = query_len >> 12;
+        thread_local! {
+            static SPAN_ADDRESSES: std::cell::RefCell<Vec<usize>> = const {
+                std::cell::RefCell::new(Vec::new())
+            };
+        }
+        let result = SPAN_ADDRESSES.with(|addresses| {
+            let mut addresses = addresses.borrow_mut();
+            addresses.resize(page_count, 0);
+            let ptr = unsafe { base.add(lo as usize) };
+            match sys::take_write_watch(ptr, query_len, &mut addresses) {
+                Some(0) => WriteWatchResult::Clean,
+                Some(count) => {
+                    let base_addr = base as usize as u64;
+                    let dirty_addresses = &addresses[..count.min(page_count)];
+                    record_observed_write_pages(base, dirty_addresses);
+                    for &addr in dirty_addresses.iter() {
+                        let page_va = (addr as u64).saturating_sub(base_addr) & !0xfffu64;
+                        match spans.last_mut() {
+                            Some((last_va, last_len)) if *last_va + *last_len as u64 == page_va => {
+                                *last_len += 4096;
+                            }
+                            _ => spans.push((page_va, 4096)),
+                        }
+                    }
+                    WriteWatchResult::Dirty
+                }
+                None => WriteWatchResult::Unavailable,
+            }
+        });
+        let (serial_after, generation_after) = observed_write_snapshot_range(lo, query_len);
+        drop(ranges);
+        WriteWatchObservation {
+            result,
+            serial_after,
+            generation_before,
+            generation_after,
+        }
     }
 }
 
@@ -730,6 +821,28 @@ mod tests {
 
         decommit(ptr, LEN);
         assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Unavailable);
+    }
+
+    #[test]
+    fn observed_span_take_brackets_scoped_generation() {
+        const VA: u64 = 0xf2_0000_0000;
+        const LEN: usize = 0x1_0000;
+        let ptr = commit(VA, LEN).expect("write-watched fastmem allocation");
+        let _ = take_write_watch(VA, LEN);
+        unsafe { ptr.add(0x100).write_volatile(0x31) };
+        assert_eq!(take_write_watch(VA, LEN), WriteWatchResult::Dirty);
+        let consumed_generation = observed_write_generation_range(VA, LEN);
+        unsafe { ptr.add(0x2100).write_volatile(0x72) };
+        let mut spans = Vec::new();
+
+        let observation = take_write_watch_spans_observed(VA, LEN, &mut spans);
+
+        assert_eq!(observation.result, WriteWatchResult::Dirty);
+        assert_eq!(observation.generation_before, consumed_generation);
+        assert!(observation.generation_after > observation.generation_before);
+        assert!(observation.serial_after >= observation.generation_after);
+        assert_eq!(spans, vec![(VA + 0x2000, 0x1000)]);
+        decommit(ptr, LEN);
     }
 
     #[test]
