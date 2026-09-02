@@ -5227,6 +5227,10 @@ fn dispatch_service_v2(
                 log::debug!("IFsStorage.GetSize â†’ {}", size);
                 return build_ipc_response(ctx, 0, &size.to_le_bytes(), &[]);
             }
+            5 => {
+                log::debug!("IFsStorage.OperateRange â†’ zeroed QueryRangeInfo");
+                return build_ipc_response(ctx, 0, &[0u8; 16], &[]);
+            }
             _ => {}
         }
     }
@@ -10026,6 +10030,7 @@ fn dispatch_nvdrv_command(kernel: &mut Kernel, ctx: &mut ipc::IpcCtx, port_name:
                         let inline = match ioctl_cmd {
                             0x4705 if outcome.data.len() > 16 => &outcome.data[16..],
                             0x4706 if outcome.data.len() >= 20 => &outcome.data[16..20],
+                            0x4713 if outcome.data.len() > 8 => &outcome.data[8..],
                             _ => &[],
                         };
                         if !inline.is_empty() {
@@ -10509,6 +10514,7 @@ fn subsession_service(port_name: &str, cmd_id: u32) -> Option<&'static str> {
         ("aoc:u", 100 | 101) => Some("IPurchaseEventManager"),
         ("fsp-srv", 18) => Some("IFileSystem"),
         ("fsp-srv", 200) => Some("IFsStorage"),
+        ("fsp-srv", 1200) => Some("IMultiCommitManager"),
         ("vi:m" | "vi:s" | "vi:u", 0) => Some("IApplicationDisplayService"),
         ("vi:m" | "vi:s" | "vi:u", 1) => Some("IApplicationDisplayService"),
         ("vi:m" | "vi:s" | "vi:u", 2) => Some("IApplicationDisplayService"),
@@ -10538,6 +10544,7 @@ fn applet_command_response(
         ("IHOSBinderDriver", 0) | ("IHOSBinderDriver", 3) => Some((Vec::new(), None)),
 
         ("IFileSystem", _) => Some((Vec::new(), None)),
+        ("IMultiCommitManager", _) => Some((Vec::new(), None)),
         ("fsp-srv", _) => Some((Vec::new(), None)),
 
         ("psm", _) => Some((Vec::new(), None)),

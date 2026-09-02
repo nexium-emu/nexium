@@ -125,7 +125,7 @@ pub struct Kernel {
 
     pub nro_mmap: Option<Arc<memmap2::Mmap>>,
     pub nro_romfs_range: Option<std::ops::Range<usize>>,
-    pub application_romfs: Option<nexium_loader::LazyRomfs>,
+    pub application_romfs: Option<nexium_loader::AppRomfs>,
     pub system_romfs_mmap: Option<Arc<memmap2::Mmap>>,
     pub system_romfs_ranges: HashMap<u64, std::ops::Range<usize>>,
 

@@ -410,7 +410,47 @@ impl BootContext {
         };
         kernel.nro_mmap = romfs_mmap;
         kernel.nro_romfs_range = romfs_range;
-        kernel.application_romfs = app.romfs.clone();
+        kernel.application_romfs = {
+            let mut roots = Vec::new();
+            if let Ok(dir) = std::env::var("NEXIUM_MODS_DIR") {
+                if !dir.is_empty() {
+                    roots.push(std::path::PathBuf::from(dir));
+                }
+            }
+            roots.push(nexium_common::paths::root().join("mods"));
+            roots.push(nexium_common::paths::sdmc_dir().join("atmosphere"));
+            match nexium_loader::find_overlay_dir(&roots, app.title_id) {
+                Some(overlay) => {
+                    let started = std::time::Instant::now();
+                    match nexium_loader::LayeredRomfs::build(app.romfs.as_ref(), &overlay) {
+                        Ok(layered) => {
+                            log::info!(
+                                "layered romfs: {} ({} base files, {} overlay files, {} replaced, {} total, virtual size {:#x}, built in {:?})",
+                                overlay.display(),
+                                layered.base_file_count,
+                                layered.overlay_file_count,
+                                layered.replaced_file_count,
+                                layered.file_count(),
+                                layered.len(),
+                                started.elapsed()
+                            );
+                            Some(nexium_loader::AppRomfs::Layered(std::sync::Arc::new(
+                                layered,
+                            )))
+                        }
+                        Err(err) => {
+                            log::error!(
+                                "layered romfs build failed for {}: {} (using base romfs only)",
+                                overlay.display(),
+                                err
+                            );
+                            app.romfs.clone().map(nexium_loader::AppRomfs::Plain)
+                        }
+                    }
+                }
+                None => app.romfs.clone().map(nexium_loader::AppRomfs::Plain),
+            }
+        };
         kernel.system_romfs_mmap = if app.system_romfs.is_empty() {
             None
         } else {
