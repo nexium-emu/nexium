@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-opus = "0.3"
+opus = "0.4"
 nexium-common.workspace = true
 nexium-memory.workspace = true
 nexium-cpu = { workspace = true, default-features = false }
