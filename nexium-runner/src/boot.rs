@@ -1488,6 +1488,24 @@ impl EmulationHandle {
                                 log::error!("[null-pc] callstack(+base): {}", frames.join(" <- "));
                             }
                             {
+                                let mut candidates: Vec<String> = Vec::new();
+                                let mut slot = [0u8; 8];
+                                for i in 0..1024u64 {
+                                    let addr = sp.wrapping_add(i * 8);
+                                    if guard.address_space.read(addr, &mut slot).is_err() {
+                                        break;
+                                    }
+                                    let val = u64::from_le_bytes(slot);
+                                    if (0x8000000..0x1270_0000).contains(&val) && val & 3 == 0 {
+                                        candidates.push(format!("{:#x}@sp+{:#x}", val, i * 8));
+                                        if candidates.len() >= 32 {
+                                            break;
+                                        }
+                                    }
+                                }
+                                log::error!("[null-pc] stack code ptrs: {}", candidates.join(" "));
+                            }
+                            {
                                 let x19 = regs[19];
                                 let mut slot = [0u8; 8];
                                 let readable = x19 >= 0x1000
