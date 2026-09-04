@@ -19,7 +19,6 @@ jobs:
   build:
     name: NeXium (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -28,10 +27,6 @@ jobs:
             asset: linux-x86_64
           - os: windows-latest
             asset: windows-x86_64
-          - os: macos-latest
-            asset: macos-arm64
-            cargo_flags: "--no-default-features --features backend-rustarmic"
-            experimental: true
     steps:
       - name: Checkout NeXium
         uses: actions/checkout@v7
@@ -68,16 +63,6 @@ jobs:
             libdrm-dev libgbm-dev \
             libboost-dev
 
-      - name: Install macOS dependencies
-        if: runner.os == 'macOS'
-        run: |
-          brew install cmake gnupg nasm ninja
-          RT="$(find "$(dirname "$(xcrun --find clang)")/../lib/clang" -name libclang_rt.osx.a 2>/dev/null | head -1)"
-          if [ -n "$RT" ]; then
-            echo "Linking clang_rt from: $RT"
-            echo "RUSTFLAGS=-L native=$(dirname "$RT") -l static=clang_rt.osx" >> "$GITHUB_ENV"
-          fi
-
       - name: Install Boost (Windows, for Dynarmic)
         if: runner.os == 'Windows'
         id: boost
@@ -91,7 +76,7 @@ jobs:
         shell: bash
         env:
           BOOST_ROOT: ${{ steps.boost.outputs.BOOST_ROOT }}
-        run: cargo build --release -p nexium-gui --bin nexium ${{ matrix.cargo_flags }}
+        run: cargo build --release -p nexium-gui --bin nexium
 
       - name: Configure MSVC for FFmpeg
         if: runner.os == 'Windows'
@@ -183,6 +168,12 @@ jobs:
     steps:
       - name: Checkout NeXium
         uses: actions/checkout@v7
+
+      - name: Stub rustarmic (optional path dependency, not built for Android)
+        run: |
+          mkdir -p ../rustarmic/src
+          printf '[package]\nname = "rustarmic"\nversion = "0.1.0"\nedition = "2021"\n' > ../rustarmic/Cargo.toml
+          : > ../rustarmic/src/lib.rs
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -338,10 +329,9 @@ jobs:
             **Downloads**
             - Windows (x86_64): `nexium-windows-x86_64.zip`
             - Linux (x86_64): `nexium-linux-x86_64.tar.gz`
-            - macOS (Apple Silicon): `nexium-macos-arm64.tar.gz`
             - Android (arm64-v8a): `nexium-android-arm64.apk`
 
-            > Pre-release / experimental. NeXium is an x86_64-host emulator; the macOS build is the rustarmic backend compiled for Apple Silicon and is provided as a build artifact only (it will not run on Apple Silicon).
+            > Pre-release / experimental.
 
             NeXium archives bundle the FFmpeg command-line program under the GNU LGPL v2.1 or later. The corresponding unmodified source, license, signature, and build configuration are included in each archive under `licenses/FFmpeg`.
           files: artifacts/**/*
