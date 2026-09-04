@@ -210,7 +210,11 @@ jobs:
           echo "using NDK: $NDK"
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
-          echo "BOOST_ROOT=/usr/include" >> "$GITHUB_ENV"
+          BOOST_STAGE="$RUNNER_TEMP/boost-headers"
+          mkdir -p "$BOOST_STAGE"
+          ln -sfn /usr/include/boost "$BOOST_STAGE/boost"
+          test -f "$BOOST_STAGE/boost/icl/interval_map.hpp"
+          echo "BOOST_ROOT=$BOOST_STAGE" >> "$GITHUB_ENV"
           echo "BUILD_TOOLS=$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION" >> "$GITHUB_ENV"
           echo "ANDROID_JAR=$ANDROID_SDK_ROOT/platforms/android-$TARGET_SDK/android.jar" >> "$GITHUB_ENV"
 
