@@ -3466,6 +3466,9 @@ fn svc_send_sync_request(kernel: &mut Kernel) -> u32 {
         kernel.pending_frames = pending_frames;
         response
     };
+    if std::mem::take(&mut kernel.ipc_retry_pending) {
+        return SUCCESS;
+    }
 
     if ipc_diagnostics {
         use parking_lot::Mutex;
@@ -3862,6 +3865,44 @@ fn dump_throw_context(kernel: &Kernel) {
     log::warn!("[throw] ===== end context =====");
 }
 
+const SVC_SEND_SYNC_REQUEST_INSN: u32 = 0xD400_0421;
+const IPC_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+fn rewind_svc_for_retry(kernel: &mut Kernel) -> bool {
+    if kernel.threads.current_handle().is_none() {
+        return false;
+    }
+    let Some(cpu) = cpu_mut() else {
+        return false;
+    };
+    let pc = cpu.get_pc();
+    let read_insn = |addr: u64| -> Option<u32> {
+        let mut bytes = [0u8; 4];
+        kernel.address_space.read(addr, &mut bytes).ok()?;
+        Some(u32::from_le_bytes(bytes))
+    };
+    let target = if read_insn(pc.wrapping_sub(4)) == Some(SVC_SEND_SYNC_REQUEST_INSN) {
+        pc.wrapping_sub(4)
+    } else if read_insn(pc) == Some(SVC_SEND_SYNC_REQUEST_INSN) {
+        pc
+    } else {
+        log::warn!(
+            "ipc retry: no svcSendSyncRequest instruction around pc={:#x}, replying immediately",
+            pc
+        );
+        return false;
+    };
+    cpu.set_pc(target);
+    let wake_at = std::time::Instant::now() + IPC_RETRY_INTERVAL;
+    kernel
+        .threads
+        .yield_with_state(
+            cpu,
+            crate::kernel::threads::ThreadState::Sleeping { wake_at },
+        )
+        .is_some()
+}
+
 fn dispatch_service_v2(
     kernel: &mut Kernel,
     port_name: &str,
@@ -4208,12 +4249,16 @@ fn dispatch_service_v2(
 
     if matches!(port_name, "bsd:u" | "bsd:s") {
         let address_space = std::sync::Arc::clone(&kernel.address_space);
-        let (rc, data, wait) = kernel.services.bsd.dispatch_ipc(&address_space, ctx);
-        if wait {
-            kernel.present_pace_until =
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(1));
+        let thread = kernel.threads.current_handle().unwrap_or(0);
+        let reply = kernel
+            .services
+            .bsd
+            .dispatch_ipc(&address_space, ctx, thread);
+        if reply.retry && rewind_svc_for_retry(kernel) {
+            kernel.ipc_retry_pending = true;
+            return Vec::new();
         }
-        return build_ipc_response(ctx, rc, &data, &[]);
+        return build_ipc_response(ctx, reply.rc, &reply.data, &[]);
     }
 
     if let Some((rc, data, handles)) =

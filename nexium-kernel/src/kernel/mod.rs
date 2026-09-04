@@ -142,6 +142,7 @@ pub struct Kernel {
     pub open_dir_lists: HashMap<(u32, u32), (Vec<(String, bool, u64)>, usize)>,
 
     pub yield_after_svc: bool,
+    pub ipc_retry_pending: bool,
     pub preempt_after_svc: bool,
     pub present_pace_until: Option<std::time::Instant>,
     pub(crate) next_present_id: u64,
@@ -390,6 +391,7 @@ impl Kernel {
             host_file_cache: HashMap::new(),
             open_dir_lists: HashMap::new(),
             yield_after_svc: false,
+            ipc_retry_pending: false,
             preempt_after_svc: false,
             present_pace_until: None,
             next_present_id: 1,

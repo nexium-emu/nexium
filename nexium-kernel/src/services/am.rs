@@ -163,7 +163,6 @@ pub fn dispatch_command(
         "IGeneralService" => general_service(cmd_id),
         "IRequest" => nifm_request(kernel, cmd_id),
         "IScanRequest" => ok_empty(),
-        "bsd:u" | "bsd:s" => socket_client(cmd_id),
         "ssl" => ssl_service(cmd_id),
         "ISslContext" | "ISslContextForSystem" => ssl_context(cmd_id),
         "ISslConnection" => ssl_connection(cmd_id),
@@ -842,8 +841,27 @@ fn async_context(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32
     }
 }
 
-fn nifm_forced_online() -> bool {
-    std::env::var("NEXIUM_NIFM_ONLINE").ok().as_deref() == Some("1")
+fn nifm_online() -> bool {
+    std::env::var("NEXIUM_NIFM_ONLINE").ok().as_deref() != Some("0")
+}
+
+fn host_ip_address() -> [u8; 4] {
+    use std::sync::OnceLock;
+    static ADDRESS: OnceLock<[u8; 4]> = OnceLock::new();
+    *ADDRESS.get_or_init(|| {
+        std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|socket| {
+                socket.connect("8.8.8.8:53")?;
+                socket.local_addr()
+            })
+            .ok()
+            .and_then(|address| match address {
+                std::net::SocketAddr::V4(address) => Some(address.ip().octets()),
+                std::net::SocketAddr::V6(_) => None,
+            })
+            .filter(|octets| octets != &[0, 0, 0, 0])
+            .unwrap_or([192, 168, 0, 2])
+    })
 }
 
 const NIFM_REQUEST_NOT_SUBMITTED: u32 = 1;
@@ -860,17 +878,17 @@ fn general_service(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
             ok_empty()
         }
         12 => {
-            if nifm_forced_online() {
-                ok(vec![192u8, 168u8, 0u8, 2u8])
+            if nifm_online() {
+                ok(host_ip_address().to_vec())
             } else {
                 ok(vec![0u8; 4])
             }
         }
         15 => ok(vec![0u8; 0x16]),
         17 => ok(vec![1u8]),
-        20 | 21 => ok(vec![u8::from(nifm_forced_online())]),
+        20 | 21 => ok(vec![u8::from(nifm_online())]),
         18 => {
-            if nifm_forced_online() {
+            if nifm_online() {
                 ok(vec![1u8, 3u8, 4u8])
             } else {
                 ok(vec![0u8, 0u8, 0u8])
@@ -888,7 +906,7 @@ fn nifm_request(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>
             ok(state.to_le_bytes().to_vec())
         }
         1 => {
-            if nifm_forced_online() {
+            if nifm_online() {
                 if NIFM_REQUEST_STATE.load(Ordering::Relaxed) != NIFM_REQUEST_NOT_SUBMITTED {
                     NIFM_REQUEST_STATE.store(NIFM_REQUEST_ACCEPTED, Ordering::Relaxed);
                 }
@@ -911,7 +929,7 @@ fn nifm_request(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>
             ok_empty()
         }
         4 => {
-            let state = if nifm_forced_online() {
+            let state = if nifm_online() {
                 NIFM_REQUEST_ACCEPTED
             } else {
                 NIFM_REQUEST_NOT_SUBMITTED
@@ -921,20 +939,6 @@ fn nifm_request(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>
         }
         5 | 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 23 | 24 | 25 => ok_empty(),
         _ => ok_empty(),
-    }
-}
-
-fn socket_client(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
-    match cmd {
-        0 => ok(0u32.to_le_bytes().to_vec()),
-        1 => ok_empty(),
-        _ => {
-            log::debug!("bsd.cmd_{} stubbed as socket failure (-1, ENETDOWN)", cmd);
-            let mut out = Vec::with_capacity(8);
-            out.extend_from_slice(&(-1i32).to_le_bytes());
-            out.extend_from_slice(&100i32.to_le_bytes());
-            ok(out)
-        }
     }
 }
 
