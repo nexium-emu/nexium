@@ -72,12 +72,12 @@ jobs:
         run: |
           set -euo pipefail
           WINROOT="${BOOST_ROOT:-C:\boost}"
-          UNIXROOT="${WINROOT//\//}"
+          UNIXROOT="${WINROOT//\\//}"
           case "$UNIXROOT" in
             [A-Za-z]:/*) UNIXROOT="/$(printf '%s' "${UNIXROOT%%:*}" | tr 'A-Z' 'a-z')${UNIXROOT#*:}" ;;
           esac
           test -f "$UNIXROOT/boost/version.hpp" || { echo "::error::no Boost headers at $WINROOT (set BOOST_ROOT on the runner)"; exit 1; }
-          grep -m1 BOOST_LIB_VERSION "$UNIXROOT/boost/version.hpp" | sed 's/^/using /'
+          grep -m1 '#define BOOST_LIB_VERSION' "$UNIXROOT/boost/version.hpp" | sed 's/^/using /'
           echo "BOOST_ROOT=$WINROOT" >> "$GITHUB_ENV"
 
       - name: Build NeXium
