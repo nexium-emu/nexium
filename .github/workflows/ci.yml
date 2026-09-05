@@ -17,19 +17,28 @@ env:
 
 jobs:
   build:
-    name: NeXium (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: NeXium (${{ matrix.target }})
+    runs-on: [ self-hosted, "${{ matrix.runner }}" ]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - target: linux
+            runner: nexium-linux
             asset: linux-x86_64
-          - os: windows-latest
+          - target: windows
+            runner: nexium-win
             asset: windows-x86_64
     steps:
       - name: Checkout NeXium
         uses: actions/checkout@v7
+
+      - name: Drop devkitPro from PATH (self-hosted Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $clean = ($env:PATH -split ";" | Where-Object { $_ -and $_ -notmatch "devkitPro" }) -join ";"
+          "PATH=$clean" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Fetch rustarmic (CPU JIT dependency)
         shell: bash
@@ -37,6 +46,7 @@ jobs:
           RUSTARMIC_TOKEN: ${{ secrets.RUSTARMIC_TOKEN }}
         run: |
           export GIT_TERMINAL_PROMPT=0
+          rm -rf ../rustarmic
           if [ -n "$RUSTARMIC_TOKEN" ]; then
             git clone --depth 1 --branch "$RUSTARMIC_REF" \
               "https://x-access-token:${RUSTARMIC_TOKEN}@github.com/nexium-emu/rustarmic.git" ../rustarmic
@@ -160,7 +170,7 @@ jobs:
 
   android:
     name: NeXium APK (arm64-v8a)
-    runs-on: ubuntu-latest
+    runs-on: [ self-hosted, Linux, X64, nexium-linux ]
     env:
       BUILD_TOOLS_VERSION: "35.0.0"
       MIN_SDK: "26"
@@ -301,7 +311,7 @@ jobs:
     name: Pre-release
     needs: [build, android]
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [ self-hosted, Linux, X64, nexium-linux ]
     permissions:
       contents: write
     env:
