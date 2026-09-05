@@ -33,13 +33,6 @@ jobs:
       - name: Checkout NeXium
         uses: actions/checkout@v7
 
-      - name: Drop devkitPro from PATH (self-hosted Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $clean = ($env:PATH -split ";" | Where-Object { $_ -and $_ -notmatch "devkitPro" }) -join ";"
-          "PATH=$clean" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
       - name: Fetch rustarmic (CPU JIT dependency)
         shell: bash
         env:
