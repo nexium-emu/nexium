@@ -152,14 +152,29 @@ jobs:
           }
           Compress-Archive -Path dist/NeXium/* -DestinationPath "dist/nexium-${{ matrix.asset }}.zip"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: nexium-${{ matrix.asset }}
-          path: dist/nexium-${{ matrix.asset }}.*
-          if-no-files-found: error
-          retention-days: 1
+      - name: Resolve shared artifact drop
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ROOT=/c/nexium-ci-artifacts
+          else
+            ROOT=/mnt/c/nexium-ci-artifacts
+          fi
+          DROP="$ROOT/${{ github.run_id }}"
+          mkdir -p "$DROP"
+          echo "DROP=$DROP" >> "$GITHUB_ENV"
+          find "$ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null || true
 
+      - name: Hand off package to shared drop
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/nexium-${{ matrix.asset }}.*)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::no package produced"; exit 1; }
+          cp -f "${files[@]}" "$DROP/"
+          ls -l "$DROP"
 
   android:
     name: NeXium APK (arm64-v8a)
@@ -292,13 +307,27 @@ jobs:
             --out dist/nexium-android-arm64.apk target/android-apk/aligned.apk
           "$BUILD_TOOLS/apksigner" verify --print-certs dist/nexium-android-arm64.apk
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: nexium-android-arm64
-          path: dist/nexium-android-arm64.apk
-          if-no-files-found: error
-          retention-days: 1
+      - name: Resolve shared artifact drop
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ROOT=/c/nexium-ci-artifacts
+          else
+            ROOT=/mnt/c/nexium-ci-artifacts
+          fi
+          DROP="$ROOT/${{ github.run_id }}"
+          mkdir -p "$DROP"
+          echo "DROP=$DROP" >> "$GITHUB_ENV"
+          find "$ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null || true
+
+      - name: Hand off APK to shared drop
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/nexium-android-arm64.apk
+          cp -f dist/nexium-android-arm64.apk "$DROP/"
+          ls -l "$DROP"
 
   release:
     name: Pre-release
@@ -310,11 +339,18 @@ jobs:
     env:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-          merge-multiple: true
+      - name: Collect artifacts from shared drop
+        shell: bash
+        run: |
+          set -euo pipefail
+          DROP="/mnt/c/nexium-ci-artifacts/${{ github.run_id }}"
+          test -d "$DROP" || { echo "::error::no drop directory for this run"; exit 1; }
+          mkdir -p artifacts
+          cp -f "$DROP"/* artifacts/
+          for f in nexium-linux-x86_64.tar.gz nexium-windows-x86_64.zip nexium-android-arm64.apk; do
+            test -f "artifacts/$f" || { echo "::error::missing $f"; exit 1; }
+          done
+          ls -l artifacts
 
       - name: Release metadata
         id: meta
