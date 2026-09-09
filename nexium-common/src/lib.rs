@@ -2,6 +2,7 @@ pub mod async_compile;
 pub mod constants;
 pub mod dumps;
 pub mod error;
+pub mod fast_hash;
 pub mod file_logger;
 pub mod frame_present;
 pub mod gpu_caps;

@@ -172,6 +172,58 @@ fn observed_write_generations() -> &'static Mutex<std::collections::HashMap<u64,
     OBSERVED_WRITE_GENERATIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+const OBSERVED_WRITE_PAGE_4K_MASK: u64 = !0xfffu64;
+static OBSERVED_WRITE_PAGES: OnceLock<Mutex<nexium_common::fast_hash::FastMap<u64, u64>>> =
+    OnceLock::new();
+
+fn observed_write_pages() -> &'static Mutex<nexium_common::fast_hash::FastMap<u64, u64>> {
+    OBSERVED_WRITE_PAGES.get_or_init(|| Mutex::new(nexium_common::fast_hash::FastMap::default()))
+}
+
+pub fn observed_write_pages_changed_since(va: u64, len: usize, generation: u64) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let Some(end_unaligned) = va.checked_add(len as u64) else {
+        return usize::MAX;
+    };
+    let pages = observed_write_pages()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let start = va & OBSERVED_WRITE_PAGE_4K_MASK;
+    let end = end_unaligned.saturating_add(0xfff) & OBSERVED_WRITE_PAGE_4K_MASK;
+    let mut changed = 0usize;
+    let mut page = start;
+    while page < end {
+        if pages.get(&page).copied().unwrap_or(0) > generation {
+            changed += 1;
+        }
+        page = page.saturating_add(0x1000);
+    }
+    changed
+}
+
+pub fn observed_write_generation_pages(va: u64, len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let Some(end_unaligned) = va.checked_add(len as u64) else {
+        return u64::MAX;
+    };
+    let pages = observed_write_pages()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let start = va & OBSERVED_WRITE_PAGE_4K_MASK;
+    let end = end_unaligned.saturating_add(0xfff) & OBSERVED_WRITE_PAGE_4K_MASK;
+    let mut generation = 0;
+    let mut page = start;
+    while page < end {
+        generation = generation.max(pages.get(&page).copied().unwrap_or(0));
+        page = page.saturating_add(0x1000);
+    }
+    generation
+}
+
 #[cfg(windows)]
 fn record_observed_write_pages(base: *mut u8, addresses: &[usize]) {
     if addresses.is_empty() {
@@ -184,13 +236,21 @@ fn record_observed_write_pages(base: *mut u8, addresses: &[usize]) {
     let serial = OBSERVED_WRITE_SERIAL
         .load(Ordering::Relaxed)
         .wrapping_add(1);
+    let mut pages = observed_write_pages()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for &address in addresses {
         let guest_va = (address as u64).saturating_sub(base_addr);
         let generation = generations
             .entry(guest_va & OBSERVED_WRITE_PAGE_MASK)
             .or_insert(0);
         *generation = (*generation).max(serial);
+        let page_generation = pages
+            .entry(guest_va & OBSERVED_WRITE_PAGE_4K_MASK)
+            .or_insert(0);
+        *page_generation = (*page_generation).max(serial);
     }
+    drop(pages);
     OBSERVED_WRITE_SERIAL.store(serial, Ordering::Release);
 }
 

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+nexium-common.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 bitflags.workspace = true

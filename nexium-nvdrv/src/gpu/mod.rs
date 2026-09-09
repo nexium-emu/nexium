@@ -12,7 +12,7 @@ pub use engines::{
 pub use pusher::{CommandListHeader, Pusher};
 
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 pub type GuestMemoryWriter = Arc<dyn Fn(u64, &[u8]) -> bool + Send + Sync + 'static>;
@@ -104,8 +104,9 @@ enum PhysicalMappingIdentity {
 }
 
 const MAPPING_LOOKUP_CACHE_SIZE: usize = 64;
+const MAPPING_LOOKUP_CACHE_SHIFT: u32 = 16;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct MappingLookupCacheEntry {
     gpu_lo: u64,
     gpu_hi: u64,
@@ -116,7 +117,7 @@ struct ThreadMappingLookupCache {
     instance_id: u64,
     generation: u64,
     entries: [Option<MappingLookupCacheEntry>; MAPPING_LOOKUP_CACHE_SIZE],
-    cursor: usize,
+    misses: u64,
 }
 
 impl ThreadMappingLookupCache {
@@ -125,9 +126,189 @@ impl ThreadMappingLookupCache {
             instance_id: 0,
             generation: 0,
             entries: [None; MAPPING_LOOKUP_CACHE_SIZE],
-            cursor: 0,
+            misses: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EffectiveMappingSegment {
+    gpu_lo: u64,
+    gpu_hi: u64,
+    mapping_index: usize,
+}
+
+struct MappingSegmentIndex {
+    generation: u64,
+    by_gpu: Vec<EffectiveMappingSegment>,
+    by_cpu: Vec<(u64, u64, usize)>,
+    cpu_hi_prefix_max: Vec<u64>,
+}
+
+const MAPPING_INDEX_REBUILD_AFTER_STALE_LOOKUPS: u32 = 32;
+
+#[derive(Default)]
+struct MappingIndexState {
+    index: Option<Arc<MappingSegmentIndex>>,
+    stale_lookups: u32,
+}
+
+impl MappingSegmentIndex {
+    fn build(mappings: &[GpuMapping], generation: u64) -> Self {
+        let mut painted: BTreeMap<u64, EffectiveMappingSegment> = BTreeMap::new();
+        for (mapping_index, mapping) in mappings.iter().enumerate() {
+            let lo = mapping.gpu_va;
+            let hi = mapping.gpu_va.saturating_add(mapping.size);
+            let mut overlapped = Vec::new();
+            for (&key, segment) in painted.range(..hi).rev() {
+                if segment.gpu_hi <= lo {
+                    break;
+                }
+                overlapped.push(key);
+            }
+            if lo >= hi {
+                if let Some(key) = overlapped.first().copied() {
+                    let segment = painted.remove(&key).unwrap();
+                    if segment.gpu_lo < lo && segment.gpu_hi > lo {
+                        painted.insert(
+                            segment.gpu_lo,
+                            EffectiveMappingSegment {
+                                gpu_lo: segment.gpu_lo,
+                                gpu_hi: lo,
+                                mapping_index: segment.mapping_index,
+                            },
+                        );
+                        painted.insert(
+                            lo,
+                            EffectiveMappingSegment {
+                                gpu_lo: lo,
+                                gpu_hi: segment.gpu_hi,
+                                mapping_index: segment.mapping_index,
+                            },
+                        );
+                    } else {
+                        painted.insert(segment.gpu_lo, segment);
+                    }
+                }
+                continue;
+            }
+            for key in overlapped {
+                let segment = painted.remove(&key).unwrap();
+                if segment.gpu_lo < lo {
+                    painted.insert(
+                        segment.gpu_lo,
+                        EffectiveMappingSegment {
+                            gpu_lo: segment.gpu_lo,
+                            gpu_hi: lo,
+                            mapping_index: segment.mapping_index,
+                        },
+                    );
+                }
+                if segment.gpu_hi > hi {
+                    painted.insert(
+                        hi,
+                        EffectiveMappingSegment {
+                            gpu_lo: hi,
+                            gpu_hi: segment.gpu_hi,
+                            mapping_index: segment.mapping_index,
+                        },
+                    );
+                }
+            }
+            painted.insert(
+                lo,
+                EffectiveMappingSegment {
+                    gpu_lo: lo,
+                    gpu_hi: hi,
+                    mapping_index,
+                },
+            );
+        }
+        let by_gpu: Vec<EffectiveMappingSegment> = painted.into_values().collect();
+        let mut by_cpu: Vec<(u64, u64, usize)> = by_gpu
+            .iter()
+            .enumerate()
+            .filter_map(|(segment_index, segment)| {
+                let mapping = &mappings[segment.mapping_index];
+                if mapping.sparse {
+                    return None;
+                }
+                let cpu_lo = mapping
+                    .cpu_addr
+                    .checked_add(segment.gpu_lo - mapping.gpu_va)?;
+                let cpu_hi = cpu_lo.saturating_add(segment.gpu_hi - segment.gpu_lo);
+                Some((cpu_lo, cpu_hi, segment_index))
+            })
+            .collect();
+        by_cpu.sort_unstable();
+        let mut cpu_hi_prefix_max = Vec::with_capacity(by_cpu.len());
+        let mut running = 0u64;
+        for (_, cpu_hi, _) in &by_cpu {
+            running = running.max(*cpu_hi);
+            cpu_hi_prefix_max.push(running);
+        }
+        Self {
+            generation,
+            by_gpu,
+            by_cpu,
+            cpu_hi_prefix_max,
+        }
+    }
+
+    fn lookup(&self, gpu_va: u64) -> Option<MappingLookupCacheEntry> {
+        let index = self
+            .by_gpu
+            .partition_point(|segment| segment.gpu_lo <= gpu_va)
+            .checked_sub(1)?;
+        let segment = self.by_gpu[index];
+        (gpu_va < segment.gpu_hi).then_some(MappingLookupCacheEntry {
+            gpu_lo: segment.gpu_lo,
+            gpu_hi: segment.gpu_hi,
+            mapping_index: segment.mapping_index,
+        })
+    }
+
+    fn gpu_regions_for_cpu_range(&self, cpu_addr: u64, cpu_end: u64) -> Vec<(u64, u64)> {
+        let mut regions = Vec::new();
+        let mut index = self
+            .by_cpu
+            .partition_point(|(cpu_lo, _, _)| *cpu_lo < cpu_end);
+        while index > 0 {
+            index -= 1;
+            if self.cpu_hi_prefix_max[index] <= cpu_addr {
+                break;
+            }
+            let (cpu_lo, cpu_hi, segment_index) = self.by_cpu[index];
+            if cpu_hi <= cpu_addr {
+                continue;
+            }
+            let segment = self.by_gpu[segment_index];
+            let overlap_start = cpu_addr.max(cpu_lo);
+            let overlap_end = cpu_end.min(cpu_hi);
+            let start = segment.gpu_lo + (overlap_start - cpu_lo);
+            let end = start.saturating_add(overlap_end - overlap_start);
+            if start < end {
+                regions.push((start, end - start));
+            }
+        }
+        coalesce_gpu_regions(regions)
+    }
+}
+
+fn coalesce_gpu_regions(mut regions: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    regions.sort_unstable();
+    let mut coalesced = Vec::<(u64, u64)>::with_capacity(regions.len());
+    for (start, size) in regions {
+        if let Some((previous_start, previous_size)) = coalesced.last_mut() {
+            let previous_end = previous_start.saturating_add(*previous_size);
+            if start <= previous_end {
+                *previous_size = previous_end.max(start.saturating_add(size)) - *previous_start;
+                continue;
+            }
+        }
+        coalesced.push((start, size));
+    }
+    coalesced
 }
 
 thread_local! {
@@ -141,6 +322,7 @@ pub struct GpuMappings {
     next_mapping_epoch: u64,
     next_mapping_record_id: u64,
     generation: u64,
+    segment_index: Mutex<MappingIndexState>,
 }
 
 impl GpuMappings {
@@ -153,7 +335,25 @@ impl GpuMappings {
             next_mapping_epoch: 1,
             next_mapping_record_id: 1,
             generation: 1,
+            segment_index: Mutex::new(MappingIndexState::default()),
         }
+    }
+
+    fn segment_index(&self) -> Option<Arc<MappingSegmentIndex>> {
+        let mut state = self.segment_index.lock();
+        if let Some(index) = &state.index {
+            if index.generation == self.generation {
+                return Some(Arc::clone(index));
+            }
+            state.stale_lookups += 1;
+            if state.stale_lookups < MAPPING_INDEX_REBUILD_AFTER_STALE_LOOKUPS {
+                return None;
+            }
+        }
+        let index = Arc::new(MappingSegmentIndex::build(&self.mappings, self.generation));
+        state.index = Some(Arc::clone(&index));
+        state.stale_lookups = 0;
+        Some(index)
     }
 
     #[inline]
@@ -162,6 +362,13 @@ impl GpuMappings {
     }
 
     fn mapping_lookup_slow(&self, gpu_va: u64) -> Option<MappingLookupCacheEntry> {
+        match self.segment_index() {
+            Some(index) => index.lookup(gpu_va),
+            None => self.mapping_lookup_linear(gpu_va),
+        }
+    }
+
+    fn mapping_lookup_linear(&self, gpu_va: u64) -> Option<MappingLookupCacheEntry> {
         let mapping_index = self
             .mappings
             .iter()
@@ -201,9 +408,9 @@ impl GpuMappings {
                 cache.instance_id = self.instance_id;
                 cache.generation = self.generation;
                 cache.entries = [None; MAPPING_LOOKUP_CACHE_SIZE];
-                cache.cursor = 0;
             }
-            for cached in cache.entries.iter().flatten() {
+            let slot = (gpu_va >> MAPPING_LOOKUP_CACHE_SHIFT) as usize % MAPPING_LOOKUP_CACHE_SIZE;
+            if let Some(cached) = cache.entries[slot] {
                 if gpu_va >= cached.gpu_lo && gpu_va < cached.gpu_hi {
                     debug_assert!(
                         self.mappings
@@ -211,13 +418,12 @@ impl GpuMappings {
                             .is_some_and(|mapping| Self::contains(mapping, gpu_va)),
                         "stale GMMU lookup cache entry"
                     );
-                    return Some(*cached);
+                    return Some(cached);
                 }
             }
             let cached = self.mapping_lookup_slow(gpu_va)?;
-            let slot = cache.cursor % MAPPING_LOOKUP_CACHE_SIZE;
             cache.entries[slot] = Some(cached);
-            cache.cursor = (slot + 1) % MAPPING_LOOKUP_CACHE_SIZE;
+            cache.misses = cache.misses.wrapping_add(1);
             Some(cached)
         })
     }
@@ -1429,6 +1635,16 @@ impl GpuMappings {
         if size == 0 {
             return Vec::new();
         }
+        match self.segment_index() {
+            Some(index) => index.gpu_regions_for_cpu_range(cpu_addr, cpu_addr.saturating_add(size)),
+            None => self.gpu_regions_for_cpu_range_linear(cpu_addr, size),
+        }
+    }
+
+    fn gpu_regions_for_cpu_range_linear(&self, cpu_addr: u64, size: u64) -> Vec<(u64, u64)> {
+        if size == 0 {
+            return Vec::new();
+        }
         let cpu_end = cpu_addr.saturating_add(size);
         let mut regions = Vec::new();
         for (index, mapping) in self.mappings.iter().enumerate() {
@@ -1474,19 +1690,7 @@ impl GpuMappings {
                     .filter_map(|(start, end)| (start < end).then_some((start, end - start))),
             );
         }
-        regions.sort_unstable();
-        let mut coalesced = Vec::<(u64, u64)>::with_capacity(regions.len());
-        for (start, size) in regions {
-            if let Some((previous_start, previous_size)) = coalesced.last_mut() {
-                let previous_end = previous_start.saturating_add(*previous_size);
-                if start <= previous_end {
-                    *previous_size = previous_end.max(start.saturating_add(size)) - *previous_start;
-                    continue;
-                }
-            }
-            coalesced.push((start, size));
-        }
-        coalesced
+        coalesce_gpu_regions(regions)
     }
 
     pub fn describe_around(&self, gpu_va: u64) -> String {
@@ -2557,8 +2761,9 @@ impl Default for GpuContext {
 #[cfg(test)]
 mod tests {
     use super::{
-        eager_small_rt_writeback_value_enabled, prep, GpuContext, GpuMappingChange, GpuMappings,
-        GuestMemoryAccess, PendingSyncpointEvent,
+        eager_small_rt_writeback_value_enabled, prep, GpuContext, GpuMapping, GpuMappingChange,
+        GpuMappings, GuestMemoryAccess, PendingSyncpointEvent,
+        MAPPING_INDEX_REBUILD_AFTER_STALE_LOOKUPS,
     };
     use parking_lot::RwLock;
     use std::sync::{Arc, Mutex as StdMutex};
@@ -2776,6 +2981,95 @@ mod tests {
     }
 
     #[test]
+    fn mapping_segment_index_matches_linear_scans() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..48 {
+            let mut mappings = GpuMappings::new();
+            let count = 1 + (next() % 40) as usize;
+            for record in 0..count {
+                let gpu_va = (next() % 0x40) * 0x1000;
+                let size = match next() % 8 {
+                    0 => 0,
+                    _ => (1 + next() % 6) * 0x1000 + (next() % 3) * 0x200,
+                };
+                let cpu_addr = 0x10_0000 + (next() % 0x20) * 0x1000;
+                let sparse = round % 3 == 0 && next() % 5 == 0;
+                mappings.mappings.push(GpuMapping {
+                    gpu_va,
+                    size,
+                    cpu_addr,
+                    nvmap_id: record as u32 + 1,
+                    epoch: record as u64 + 1,
+                    record_id: record as u64 + 1,
+                    sparse,
+                    owner_record_id: None,
+                    owned_va_range: None,
+                    as_gpu_fd: None,
+                    as_gpu_allocation_base: None,
+                    as_gpu_root: false,
+                    as_gpu_unmap_barrier: false,
+                });
+                mappings.generation = mappings.generation.wrapping_add(1).max(1);
+            }
+            let index = mappings.segment_index().expect("index builds on first use");
+            for probe in 0..600u64 {
+                let gpu_va = probe * 0x100 + (next() % 0x100);
+                assert_eq!(
+                    index.lookup(gpu_va),
+                    mappings.mapping_lookup_linear(gpu_va),
+                    "round {round} gpu_va {gpu_va:#x}"
+                );
+            }
+            for _ in 0..200 {
+                let cpu_addr = 0x10_0000 + next() % 0x2_8000;
+                let size = next() % 0x9000;
+                assert_eq!(
+                    mappings.gpu_regions_for_cpu_range(cpu_addr, size),
+                    mappings.gpu_regions_for_cpu_range_linear(cpu_addr, size),
+                    "round {round} cpu {cpu_addr:#x}+{size:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mapping_segment_index_defers_rebuilds_while_mappings_churn() {
+        let mut mappings = GpuMappings::new();
+        mappings.add(0x1000, 0x1000, 0x1_0000, 1);
+        let mut deferred = 0usize;
+        let first = loop {
+            match mappings.segment_index() {
+                Some(index) if index.generation == mappings.generation => break index,
+                _ => deferred += 1,
+            }
+        };
+        assert!(deferred < MAPPING_INDEX_REBUILD_AFTER_STALE_LOOKUPS as usize);
+        assert_eq!(first.lookup(0x1010), mappings.mapping_lookup_linear(0x1010));
+        mappings.add(0x3000, 0x1000, 0x2_0000, 2);
+        let mut deferred = 0usize;
+        let rebuilt = loop {
+            match mappings.segment_index() {
+                Some(index) => break index,
+                None => deferred += 1,
+            }
+        };
+        assert!(deferred < MAPPING_INDEX_REBUILD_AFTER_STALE_LOOKUPS as usize);
+        assert_eq!(rebuilt.generation, mappings.generation);
+        assert_eq!(
+            rebuilt.lookup(0x3010),
+            mappings.mapping_lookup_linear(0x3010)
+        );
+        assert_eq!(mappings.cpu_address_for(0x3010), Some(0x2_0010));
+        assert_eq!(mappings.cpu_address_for(0x1010), Some(0x1_0010));
+    }
+
+    #[test]
     fn cpu_range_aliases_include_partial_overlaps() {
         let mut mappings = GpuMappings::new();
         mappings.add(0x1000, 0x1000, 0x1_0000, 7);
@@ -2829,12 +3123,12 @@ mod tests {
         mappings.add(0x1800, 0x200, 0x3_0000, 3);
 
         assert_eq!(mappings.cpu_address_for(0x1200), Some(0x1_0200));
-        let cursor_after_miss = super::MAPPING_LOOKUP_CACHE.with(|cache| cache.borrow().cursor);
+        let misses_after_miss = super::MAPPING_LOOKUP_CACHE.with(|cache| cache.borrow().misses);
 
         assert_eq!(mappings.nvmap_id_for(0x1300), Some(1));
         assert_eq!(
-            super::MAPPING_LOOKUP_CACHE.with(|cache| cache.borrow().cursor),
-            cursor_after_miss
+            super::MAPPING_LOOKUP_CACHE.with(|cache| cache.borrow().misses),
+            misses_after_miss
         );
 
         assert_eq!(mappings.cpu_address_for(0x1500), Some(0x2_0100));

@@ -218,6 +218,7 @@ struct VersionedHostRegionChange {
 }
 
 pub struct AddressSpace {
+    id: u64,
     regions: Mutex<Vec<Arc<Region>>>,
     host_changes: Mutex<Vec<VersionedHostRegionChange>>,
     generation: AtomicU64,
@@ -226,6 +227,7 @@ pub struct AddressSpace {
 impl AddressSpace {
     pub fn new() -> Self {
         Self {
+            id: ADDRESS_SPACE_IDS.fetch_add(1, Ordering::Relaxed),
             regions: Mutex::new(Vec::new()),
             host_changes: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
@@ -397,8 +399,52 @@ impl AddressSpace {
         Ok(())
     }
 
+    #[inline]
+    fn with_cached_region<R>(
+        &self,
+        generation: u64,
+        va: u64,
+        len: usize,
+        visit: impl FnOnce(&Region, usize) -> R,
+    ) -> Option<R> {
+        LAST_REGION.with(|slot| {
+            let slot = slot.borrow();
+            let cached = slot.as_ref()?;
+            if cached.space != self.id || cached.generation != generation {
+                return None;
+            }
+            let region = &cached.region;
+            let off = usize::try_from(va.checked_sub(region.base)?).ok()?;
+            if off.checked_add(len)? > region.committed_len() {
+                return None;
+            }
+            Some(visit(region, off))
+        })
+    }
+
+    fn remember_region(&self, generation: u64, region: &Arc<Region>) {
+        LAST_REGION.with(|slot| {
+            *slot.borrow_mut() = Some(CachedRegion {
+                space: self.id,
+                generation,
+                region: Arc::clone(region),
+            });
+        });
+    }
+
     pub fn read(&self, va: u64, buf: &mut [u8]) -> Result<()> {
-        let plan = self.plan_range(va, buf.len(), None)?;
+        let generation = self.generation();
+        let len = buf.len();
+        let hit = self.with_cached_region(generation, va, len, |region, off| unsafe {
+            std::ptr::copy_nonoverlapping(region.buf.as_ptr().add(off), buf.as_mut_ptr(), len);
+        });
+        if hit.is_some() {
+            return Ok(());
+        }
+        let plan = self.plan_range(va, len, None)?;
+        if let RangePlan::Single(region) = &plan {
+            self.remember_region(generation, region);
+        }
         plan.for_each_chunk(va, buf.len(), |region, region_off, buf_off, len| unsafe {
             std::ptr::copy_nonoverlapping(
                 region.buf.as_ptr().add(region_off),
@@ -410,7 +456,21 @@ impl AddressSpace {
     }
 
     pub fn write(&self, va: u64, buf: &[u8]) -> Result<()> {
-        let plan = self.plan_range(va, buf.len(), None)?;
+        let generation = self.generation();
+        let len = buf.len();
+        let hit = self.with_cached_region(generation, va, len, |region, off| {
+            trace_host_write(region, va, off, buf);
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), region.buf.as_ptr().add(off), len);
+            }
+        });
+        if hit.is_some() {
+            return Ok(());
+        }
+        let plan = self.plan_range(va, len, None)?;
+        if let RangePlan::Single(region) = &plan {
+            self.remember_region(generation, region);
+        }
         plan.for_each_chunk(va, buf.len(), |region, region_off, buf_off, len| {
             let chunk = &buf[buf_off..buf_off + len];
             trace_host_write(region, va + buf_off as u64, region_off, chunk);
@@ -688,6 +748,19 @@ impl AddressSpace {
 enum RangePlan {
     Single(Arc<Region>),
     Multiple(Vec<Arc<Region>>),
+}
+
+static ADDRESS_SPACE_IDS: AtomicU64 = AtomicU64::new(1);
+
+struct CachedRegion {
+    space: u64,
+    generation: u64,
+    region: Arc<Region>,
+}
+
+thread_local! {
+    static LAST_REGION: std::cell::RefCell<Option<CachedRegion>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl RangePlan {
@@ -1360,5 +1433,36 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn cached_region_reads_follow_the_space_and_new_mappings() {
+        const BASE: u64 = 1 << 41;
+        let a = fresh();
+        let b = fresh();
+        a.map(BASE, PAGE_SIZE, Perm::RW, "a").unwrap();
+        b.map(BASE, PAGE_SIZE, Perm::RW, "b").unwrap();
+        a.write(BASE + 8, &[0xaa]).unwrap();
+        b.write(BASE + 8, &[0xbb]).unwrap();
+        let mut byte = [0u8; 1];
+        a.read(BASE + 8, &mut byte).unwrap();
+        assert_eq!(byte, [0xaa]);
+        b.read(BASE + 8, &mut byte).unwrap();
+        assert_eq!(byte, [0xbb]);
+        a.read(BASE + 8, &mut byte).unwrap();
+        assert_eq!(byte, [0xaa]);
+
+        let mut span = [0u8; 8];
+        assert!(matches!(
+            a.read(BASE + PAGE_SIZE - 4, &mut span),
+            Err(AddressSpaceError::Unmapped { .. })
+        ));
+        a.map(BASE + PAGE_SIZE, PAGE_SIZE, Perm::RW, "a2").unwrap();
+        a.write(BASE + PAGE_SIZE - 4, &[1, 2, 3, 4, 5, 6, 7, 8])
+            .unwrap();
+        a.read(BASE + PAGE_SIZE - 4, &mut span).unwrap();
+        assert_eq!(span, [1, 2, 3, 4, 5, 6, 7, 8]);
+        a.read(BASE + PAGE_SIZE + 2, &mut byte).unwrap();
+        assert_eq!(byte, [7]);
     }
 }
