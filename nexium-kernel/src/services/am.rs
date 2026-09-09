@@ -482,6 +482,10 @@ fn library_applet_accessor(kernel: &mut Kernel, cmd: u32) -> Option<(u32, Vec<u8
             if swkbd_pending() {
                 let initial = swkbd_read_initial_text(kernel);
                 crate::swkbd_state::start(initial);
+            } else if pending_applet_id() == APPLET_ID_OFFLINE_WEB {
+                log::warn!(
+                    "offline HTML viewer unavailable; returning a WindowClosed result to the game"
+                );
             }
             ok_empty()
         }
@@ -685,6 +689,7 @@ static CONTROLLER_SELECTED_ID: AtomicU32 = AtomicU32::new(0);
 
 pub const APPLET_ID_CONTROLLER: u32 = 0x0c;
 pub const APPLET_ID_SWKBD: u32 = 0x11;
+pub const APPLET_ID_OFFLINE_WEB: u32 = 0x17;
 
 pub fn set_pending_applet_id(id: u32) {
     PENDING_APPLET_ID.store(id, Ordering::Relaxed);
@@ -708,6 +713,11 @@ pub fn applet_out_data() -> Vec<u8> {
             v
         }
         APPLET_ID_SWKBD => crate::swkbd_state::out_data(),
+        APPLET_ID_OFFLINE_WEB => {
+            let mut result = vec![0u8; 0x1010];
+            result[..4].copy_from_slice(&4u32.to_le_bytes());
+            result
+        }
         _ => Vec::new(),
     }
 }

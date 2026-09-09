@@ -11005,6 +11005,112 @@ fn applet_buffer_response(port_name: &str, cmd_id: u32) -> Option<Vec<u8>> {
     }
 }
 
+#[cfg(test)]
+mod offline_web_applet_tests {
+    use super::{dispatch_service_v2, Kernel};
+    use crate::services::am;
+    use nexium_ipc::{IpcBuffer, IpcCtx, CMIF_IN_MAGIC};
+    use nexium_memory::{AddressSpace, Perm};
+    use std::sync::Arc;
+
+    fn request(command: u32, offset: u64) -> IpcCtx {
+        let mut bytes = vec![0; 0x100];
+        bytes[..4].copy_from_slice(&4u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&CMIF_IN_MAGIC.to_le_bytes());
+        bytes[0x18..0x1c].copy_from_slice(&command.to_le_bytes());
+        bytes[0x20..0x28].copy_from_slice(&offset.to_le_bytes());
+        IpcCtx::parse(bytes, false).unwrap()
+    }
+
+    #[test]
+    fn offline_web_result_reports_size_and_reads_complete_exit_record() {
+        struct RestoreApplet(u32);
+        impl Drop for RestoreApplet {
+            fn drop(&mut self) {
+                am::set_pending_applet_id(self.0);
+            }
+        }
+        let _restore = RestoreApplet(am::pending_applet_id());
+        const BASE: u64 = 0x1000_0000_0000;
+        let memory = Arc::new(AddressSpace::new());
+        memory
+            .map(BASE, 0x20000, Perm::RW, "offline_web_test")
+            .unwrap();
+        let mut kernel = Kernel::new(
+            memory.clone(),
+            BASE,
+            0x1000,
+            BASE + 0x10000,
+            0x1000,
+            BASE + 0x18000,
+            0x1000,
+            BASE + 0x19000,
+            BASE + 0x1a000,
+        );
+        for _ in 0..3 {
+            am::set_pending_applet_id(0x17);
+            for command in [10, 30] {
+                let response = dispatch_service_v2(
+                    &mut kernel,
+                    "ILibraryAppletAccessor",
+                    &mut request(command, 0),
+                    0x80,
+                    &mut Vec::new(),
+                );
+                assert_eq!(&response[0x18..0x1c], &0u32.to_le_bytes());
+            }
+            let response = dispatch_service_v2(
+                &mut kernel,
+                "IStorageAccessorOut",
+                &mut request(0, 0),
+                0x80,
+                &mut Vec::new(),
+            );
+            assert_eq!(&response[0x20..0x28], &0x1010u64.to_le_bytes());
+            for static_buffer in [false, true] {
+                for (offset, size) in [(0u64, 0x1010u64), (8, 0x1000), (0x1008, 8)] {
+                    memory.write(BASE, &vec![0xa5; 0x1020]).unwrap();
+                    let mut ctx = request(11, offset);
+                    let target = IpcBuffer {
+                        addr: BASE + 8,
+                        size,
+                        mode: 0,
+                    };
+                    if static_buffer {
+                        ctx.recv_statics.push(target);
+                    } else {
+                        ctx.recv_buffers.push(target);
+                    }
+                    let response = dispatch_service_v2(
+                        &mut kernel,
+                        "IStorageAccessorOut",
+                        &mut ctx,
+                        0x80,
+                        &mut Vec::new(),
+                    );
+                    assert_eq!(&response[0x18..0x1c], &0u32.to_le_bytes());
+                    let mut actual = vec![0; size as usize + 16];
+                    memory.read(BASE, &mut actual).unwrap();
+                    assert_eq!(&actual[..8], &[0xa5; 8]);
+                    assert_eq!(&actual[size as usize + 8..], &[0xa5; 8]);
+                    let payload = &actual[8..size as usize + 8];
+                    if offset == 0 {
+                        assert_eq!(&payload[..4], &4u32.to_le_bytes());
+                        assert!(payload[4..].iter().all(|byte| *byte == 0));
+                    } else {
+                        assert!(payload.iter().all(|byte| *byte == 0));
+                    }
+                }
+            }
+            am::set_pending_applet_id(am::APPLET_ID_CONTROLLER);
+            assert_eq!(am::applet_out_data().len(), 0xc);
+            am::set_pending_applet_id(0);
+            assert!(am::applet_out_data().is_empty());
+        }
+    }
+}
+
 fn build_launch_parameter() -> Vec<u8> {
     let mut out = vec![0u8; 0x88];
     out[0..4].copy_from_slice(&0xC794_97CAu32.to_le_bytes());
