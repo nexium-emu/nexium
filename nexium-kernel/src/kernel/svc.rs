@@ -2627,7 +2627,7 @@ fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
     let lr = cpu_ref().map(|c| c.get_register(30)).unwrap_or(0);
 
     if cur_word != (owner_handle | MUTEX_HAS_LISTENERS) {
-        log::debug!(
+        log::trace!(
             "svcArbitrateLock mutex={:#x} owner={:#x} self={:#x} cur={:#x} holder={:#x} -> retry lr={:#x}",
             mutex_addr,
             owner_handle,
@@ -2673,7 +2673,7 @@ fn svc_arbitrate_lock(kernel: &mut Kernel) -> u32 {
         );
         kernel.yield_after_svc = true;
     }
-    log::debug!(
+    log::trace!(
         "svcArbitrateLock mutex={:#x} contended (owner={:#x} self={:#x}) -> parked",
         mutex_addr,
         owner_handle,
@@ -2759,7 +2759,7 @@ fn svc_arbitrate_unlock(kernel: &mut Kernel) -> u32 {
     let owner_handle = kernel.threads.current_handle().unwrap_or(0);
     let (prev_word, new_word, handed) = release_mutex_word(kernel, mutex_addr, owner_handle);
     nudge_preempt_for_wake(kernel, handed);
-    log::debug!(
+    log::trace!(
         "svcArbitrateUnlock mutex={:#x} self={:#x} word {:#x}->{:#x} handed={:#x}",
         mutex_addr,
         owner_handle,
@@ -2917,7 +2917,7 @@ fn svc_wait_process_wide_key_atomic(kernel: &mut Kernel) -> u32 {
             lr
         );
     }
-    log::debug!(
+    log::trace!(
         "cond_wait: self={:#x} mutex={:#x} cond={:#x} word {:#x}->{:#x} handed={:#x} timeout={}",
         self_handle,
         mutex_addr,
@@ -3051,7 +3051,7 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
                 }
                 kernel.threads.wake_condvar_to_ready(handle);
                 nudge_preempt_for_wake(kernel, handle);
-                log::debug!(
+                log::trace!(
                     "cond_signal handoff: cond={:#x} handle={:#x} mutex={:#x} word {:#x}->{:#x}",
                     condvar_addr,
                     handle,
@@ -3082,7 +3082,7 @@ fn svc_signal_process_wide_key(kernel: &mut Kernel) -> u32 {
                 kernel
                     .threads
                     .wake_condvar_into_mutex_waiter(handle, mutex_addr, holder, handle);
-                log::debug!(
+                log::trace!(
                     "cond_signal requeue: cond={:#x} handle={:#x} mutex={:#x} word {:#x}->{:#x} holder={:#x}",
                     condvar_addr,
                     handle,

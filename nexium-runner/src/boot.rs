@@ -265,6 +265,9 @@ struct PcTraceRange {
 struct PcTrace {
     ranges: Vec<PcTraceRange>,
     max_hits: u32,
+    next_hit_at: std::time::Instant,
+    interval: std::time::Duration,
+    read_register: Option<u32>,
 }
 
 impl PcTrace {
@@ -302,16 +305,42 @@ impl PcTrace {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(8);
+        let delay = std::time::Duration::from_secs(
+            std::env::var("NEXIUM_PC_TRACE_DELAY_SECONDS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0),
+        );
+        let interval = std::time::Duration::from_millis(
+            std::env::var("NEXIUM_PC_TRACE_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0),
+        );
+        let read_register = std::env::var("NEXIUM_PC_TRACE_READ_REG")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v < 31);
+        let now = std::time::Instant::now();
         for r in &ranges {
             log::warn!(
-                "[pc-trace] configured {} {:#x}-{:#x} max_hits={}",
+                "[pc-trace] configured {} {:#x}-{:#x} max_hits={} delay={:?} interval={:?} read_register={:?}",
                 r.label,
                 r.start,
                 r.end,
-                max_hits
+                max_hits,
+                delay,
+                interval,
+                read_register
             );
         }
-        Some(Self { ranges, max_hits })
+        Some(Self {
+            ranges,
+            max_hits,
+            next_hit_at: now.checked_add(delay).unwrap_or(now),
+            interval,
+            read_register,
+        })
     }
 
     fn check(
@@ -323,6 +352,10 @@ impl PcTrace {
         cycles: u64,
         svcs: u32,
     ) {
+        let now = std::time::Instant::now();
+        if now < self.next_hit_at {
+            return;
+        }
         let pc = cpu.get_pc();
         for r in &mut self.ranges {
             if pc < r.start || pc >= r.end {
@@ -333,6 +366,7 @@ impl PcTrace {
             }
             let hit = r.hits;
             r.hits = r.hits.saturating_add(1);
+            self.next_hit_at = now.checked_add(self.interval).unwrap_or(now);
             log::warn!(
                 "[pc-trace] core={} hit={} label={} pc={:#x} off={:#x} lr={:#x} sp={:#x} handle={:?} event={:?} cycles={} svcs={} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x19={:#x} x20={:#x} x21={:#x} x22={:#x} x25={:#x} x26={:#x} x27={:#x} x28={:#x} x29={:#x}",
                 core,
@@ -360,6 +394,24 @@ impl PcTrace {
                 cpu.get_register(28),
                 cpu.get_register(29)
             );
+            if let Some(register) = self.read_register {
+                let address = cpu.get_register(register);
+                let mut bytes = [0u8; 4];
+                let word = kernel
+                    .address_space
+                    .read(address, &mut bytes)
+                    .ok()
+                    .map(|()| u32::from_le_bytes(bytes));
+                log::warn!(
+                    "[pc-trace-memory] core={} hit={} label={} x{}={:#x} u32={:#x?}",
+                    core,
+                    hit,
+                    r.label,
+                    register,
+                    address,
+                    word
+                );
+            }
         }
     }
 }

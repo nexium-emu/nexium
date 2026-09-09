@@ -156,7 +156,7 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     let log_buf_for_app = log_buffer.clone();
-    eframe::run_native(
+    let result = eframe::run_native(
         "NeXium",
         options,
         Box::new(move |cc| {
@@ -167,7 +167,31 @@ fn main() -> Result<(), eframe::Error> {
                 nro_arg.clone(),
             )))
         }),
-    )
+    );
+    if let Err(e) = &result {
+        log::error!("eframe exited with error: {e}");
+    }
+    log::logger().flush();
+    #[cfg(windows)]
+    if std::env::var("NEXIUM_FAST_EXIT").map_or(true, |v| v != "0") {
+        fast_exit::terminate(u32::from(result.is_err()));
+    }
+    result
+}
+
+#[cfg(windows)]
+mod fast_exit {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn TerminateProcess(process: *mut std::ffi::c_void, exit_code: u32) -> i32;
+    }
+
+    pub fn terminate(code: u32) {
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), code);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +261,7 @@ mod fault_logger {
                 let in_arena = base != 0 && fault >= base && fault < base + ARENA_SIZE;
                 static N: AtomicU32 = AtomicU32::new(0);
                 if !in_arena && N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    let _ = nexium_common::FileLogger::flush_on_fault();
                     let kind = match access {
                         0 => "read",
                         1 => "write",
@@ -260,6 +285,8 @@ mod fault_logger {
                             let v = core::ptr::read_unaligned(gp.add(i));
                             let tag = if base != 0 && v >= base && v < base + ARENA_SIZE {
                                 format!(" (arena+{:#x})", v.wrapping_sub(base))
+                            } else if let Some((name, _, rva)) = module_of(v) {
+                                format!(" ({}+{:#x})", name, rva)
                             } else {
                                 String::new()
                             };
@@ -269,39 +296,39 @@ mod fault_logger {
                             core::ptr::read_unaligned((ctx as *const u8).add(0xf8) as *const u64);
                         eprintln!("[host-AV]   rip={:#018x}", rip);
                         let exe_base = GetModuleHandleW(core::ptr::null()) as u64;
-                        let mut hmod: *mut std::ffi::c_void = core::ptr::null_mut();
-                        let ok = GetModuleHandleExW(0x6, rip as *const u16, &mut hmod);
-                        let mod_base = hmod as u64;
-                        if ok != 0 && mod_base != 0 {
-                            let mut name = [0u16; 260];
-                            let n = GetModuleFileNameW(hmod, name.as_mut_ptr(), 260);
-                            let fname = String::from_utf16_lossy(&name[..n as usize]);
+                        if let Some((name, mod_base, rva)) = module_of(rip) {
                             eprintln!(
                                 "[host-AV]   rip module={} base={:#x} rva={:#x} in_exe={}",
-                                fname,
+                                name,
                                 mod_base,
-                                rip.wrapping_sub(mod_base),
+                                rva,
                                 mod_base == exe_base
                             );
                         }
                         let rsp =
                             core::ptr::read_unaligned((ctx as *const u8).add(0x98) as *const u64);
+                        let mut region: MemoryBasicInformation = core::mem::zeroed();
+                        let mut scan_end = rsp;
+                        if VirtualQuery(
+                            rsp as *const std::ffi::c_void,
+                            &mut region,
+                            core::mem::size_of::<MemoryBasicInformation>(),
+                        ) != 0
+                            && region.state == 0x1000
+                            && region.protect & 0x101 == 0
+                        {
+                            scan_end = (region.base_address as u64)
+                                .saturating_add(region.region_size as u64)
+                                .min(rsp.saturating_add(0x4000));
+                        }
+                        eprintln!("[host-AV]   stack scan {:#x}..{:#x}", rsp, scan_end);
                         let mut found = 0u32;
                         let mut off = 0u64;
-                        while off < 0x4000 && found < 24 {
+                        while rsp + off + 8 <= scan_end && found < 32 {
                             let v = core::ptr::read_unaligned((rsp + off) as *const u64);
-                            if v > 0x10000 {
-                                let mut hm: *mut std::ffi::c_void = core::ptr::null_mut();
-                                if GetModuleHandleExW(0x6, v as *const u16, &mut hm) != 0
-                                    && hm as u64 == exe_base
-                                {
-                                    eprintln!(
-                                        "[host-AV]   stack[{:#x}] nexium.exe+{:#x}",
-                                        off,
-                                        v.wrapping_sub(exe_base)
-                                    );
-                                    found += 1;
-                                }
+                            if let Some((name, _, rva)) = module_of(v) {
+                                eprintln!("[host-AV]   stack[{:#x}] {}+{:#x}", off, name, rva);
+                                found += 1;
                             }
                             off += 8;
                         }
@@ -310,6 +337,40 @@ mod fault_logger {
             }
         }
         EXCEPTION_CONTINUE_SEARCH
+    }
+
+    #[repr(C)]
+    struct MemoryBasicInformation {
+        base_address: *mut std::ffi::c_void,
+        allocation_base: *mut std::ffi::c_void,
+        allocation_protect: u32,
+        partition_id: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+    }
+
+    unsafe fn module_of(addr: u64) -> Option<(String, u64, u64)> {
+        if addr < 0x10000 {
+            return None;
+        }
+        let mut hmod: *mut std::ffi::c_void = core::ptr::null_mut();
+        if GetModuleHandleExW(0x6, addr as *const u16, &mut hmod) == 0 || hmod.is_null() {
+            return None;
+        }
+        let mut name = [0u16; 260];
+        let n = GetModuleFileNameW(hmod, name.as_mut_ptr(), 260) as usize;
+        let path = &name[..n.min(260)];
+        let start = path
+            .iter()
+            .rposition(|&c| c == u16::from(b'\\'))
+            .map_or(0, |p| p + 1);
+        Some((
+            String::from_utf16_lossy(&path[start..]),
+            hmod as u64,
+            addr.wrapping_sub(hmod as u64),
+        ))
     }
 
     #[link(name = "kernel32")]
@@ -325,6 +386,11 @@ mod fault_logger {
             module: *mut *mut std::ffi::c_void,
         ) -> i32;
         fn GetModuleFileNameW(module: *mut std::ffi::c_void, buf: *mut u16, size: u32) -> u32;
+        fn VirtualQuery(
+            address: *const std::ffi::c_void,
+            buffer: *mut MemoryBasicInformation,
+            length: usize,
+        ) -> usize;
     }
 
     pub fn install() {
