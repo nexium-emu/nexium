@@ -20,6 +20,11 @@ const AUDIO_PCM_INT16: u8 = 2;
 const AUDIO_PCM_FLOAT: u8 = 5;
 const AUDIO_PCM_ADPCM: u8 = 6;
 
+fn audio_effect_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEXIUM_AUDIO_EFFECT_TRACE").is_some())
+}
+
 fn audio_debug_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -451,6 +456,26 @@ const AUDIO_RENDER_BLOCK_FRAMES: usize = 240;
 const AUDIO_RING_HIGH_WATER_FRAMES: usize = 5_760;
 const AUDIO_MAX_BLOCKS_PER_UPDATE: usize = 8;
 
+fn initialize_audio_voice(st: &mut AudioRendererState, vid: usize, wb_index: u16) {
+    st.voice_played_samples[vid] = 0;
+    st.voice_wbufs_consumed[vid] = 0;
+    st.voice_last_wb_index[vid] = wb_index;
+    st.voice_wb_progress_frames[vid] = 0;
+    st.voice_frac_q15[vid] = 0;
+    st.voice_prev_gain[vid] = 0.0;
+    st.voice_biquad_state[vid] = [[[0.0; 2]; 2]; 2];
+    st.voice_hist[vid] = [0.0; 6];
+    st.voice_adpcm_states[vid] = AudioAdpcmDecodeState::default();
+}
+
+fn audio_source_step(sample_rate: u32, pitch: f32) -> Option<i32> {
+    let ratio = sample_rate as f32 / 48_000.0 * pitch;
+    if !ratio.is_finite() || ratio < 0.0 || ratio * AUDIO_RENDER_BLOCK_FRAMES as f32 > 16_124.0 {
+        return None;
+    }
+    Some((ratio * 32768.0) as i32)
+}
+
 fn audio_blocks_to_produce(queued_frames: usize) -> usize {
     if queued_frames >= AUDIO_RING_HIGH_WATER_FRAMES {
         return 0;
@@ -481,7 +506,7 @@ fn advance_audio_wave_buffers(
             let plays = (buffer.loop_count as u64).saturating_add(1);
             let total = frames.saturating_mul(plays);
             if progress < total {
-                return (progress % frames, completed, false);
+                return (progress, completed, false);
             }
             progress -= total;
             completed += 1;
@@ -508,6 +533,7 @@ struct GcAdpcmDecodeResult {
     decoded_samples: usize,
     bytes_read: usize,
     checkpoint: Option<AudioAdpcmContext>,
+    end_context: AudioAdpcmContext,
 }
 
 fn gc_adpcm_byte_range(
@@ -573,6 +599,7 @@ fn decode_gc_adpcm_range(
                 decoded_samples: 0,
                 bytes_read: 0,
                 checkpoint: None,
+                end_context: context,
             };
         };
         (coefficients[0] as i64, coefficients[1] as i64)
@@ -638,7 +665,174 @@ fn decode_gc_adpcm_range(
         decoded_samples,
         bytes_read,
         checkpoint,
+        end_context: context,
     }
+}
+
+fn decode_audio_adpcm_window(
+    voice: &[u8; 0x170],
+    spans: &[AudioWaveBufferSpan; 4],
+    mut progress: u64,
+    previous_state: AudioAdpcmDecodeState,
+    output: &mut [i16],
+    checkpoint_after: usize,
+    mut read: impl FnMut(u64, &mut [u8]) -> bool,
+) -> (usize, AudioAdpcmDecodeState) {
+    output.fill(0);
+    let mut checkpoint_state = AudioAdpcmDecodeState::default();
+    let coefficient_address = u64::from_le_bytes(voice[0x048..0x050].try_into().unwrap());
+    let mut coefficient_bytes = [0u8; 32];
+    if coefficient_address == 0 || !read(coefficient_address, &mut coefficient_bytes) {
+        return (0, checkpoint_state);
+    }
+    let mut coefficients = [0i16; 16];
+    for (coefficient, bytes) in coefficients
+        .iter_mut()
+        .zip(coefficient_bytes.chunks_exact(2))
+    {
+        *coefficient = i16::from_le_bytes(bytes.try_into().unwrap());
+    }
+    let first_slot = u16::from_le_bytes(voice[0x040..0x042].try_into().unwrap()) as usize;
+    let sample_rate = u32::from_le_bytes(voice[0x00C..0x010].try_into().unwrap());
+    let mut stream_state = previous_state;
+    let mut filled = 0usize;
+    let mut buffer_index = 0usize;
+    while filled < output.len() && buffer_index < spans.len() {
+        let span = spans[buffer_index];
+        if span.frames == 0 {
+            break;
+        }
+        let cursor = if span.looping {
+            progress % span.frames as u64
+        } else {
+            progress.min(span.frames as u64)
+        } as usize;
+        let count = (output.len() - filled).min(span.frames as usize - cursor);
+        if count == 0 {
+            break;
+        }
+        let slot = (first_slot + buffer_index) % 4;
+        let wave = &voice[0x060 + slot * 0x38..0x098 + slot * 0x38];
+        let buffer_address = u64::from_le_bytes(wave[0x00..0x08].try_into().unwrap());
+        let buffer_size = u64::from_le_bytes(wave[0x08..0x10].try_into().unwrap());
+        let start_offset = i32::from_le_bytes(wave[0x10..0x14].try_into().unwrap());
+        let end_offset = i32::from_le_bytes(wave[0x14..0x18].try_into().unwrap());
+        let context_address = u64::from_le_bytes(wave[0x20..0x28].try_into().unwrap());
+        if buffer_address == 0 || start_offset < 0 || end_offset <= start_offset {
+            break;
+        }
+        let mut context_bytes = [0u8; 6];
+        if context_address != 0 && !read(context_address, &mut context_bytes) {
+            break;
+        }
+        let key = AudioAdpcmStreamKey {
+            wb_index: slot as u16,
+            buffer_address,
+            buffer_size,
+            start_offset,
+            end_offset,
+            context_address,
+            coefficient_address,
+            sample_rate,
+            looping: span.looping,
+            initial_header: u16::from_le_bytes(context_bytes[0..2].try_into().unwrap()),
+            initial_yn0: i16::from_le_bytes(context_bytes[2..4].try_into().unwrap()),
+            initial_yn1: i16::from_le_bytes(context_bytes[4..6].try_into().unwrap()),
+            coefficients,
+        };
+        let base = start_offset as usize + cursor;
+        let streaming = can_stream_gc_adpcm(stream_state, key, base, false);
+        let mut context = AudioAdpcmContext {
+            header: key.initial_header as u8,
+            yn0: key.initial_yn0,
+            yn1: key.initial_yn1,
+        };
+        if streaming
+            || (context_address == 0
+                && cursor == 0
+                && stream_state.valid
+                && stream_state.next_sample == stream_state.key.end_offset as u64)
+        {
+            context = stream_state.context;
+        }
+        let decode_start = if streaming {
+            base
+        } else {
+            start_offset as usize
+        };
+        let output_skip = if streaming { 0 } else { cursor };
+        let decode_count = output_skip + count;
+        let Some((byte_offset, byte_count)) = gc_adpcm_byte_range(
+            decode_start,
+            decode_count,
+            usize::try_from(buffer_size).unwrap_or(usize::MAX),
+        ) else {
+            break;
+        };
+        let Some(read_address) = buffer_address.checked_add(byte_offset as u64) else {
+            break;
+        };
+        let mut encoded = vec![0u8; byte_count];
+        if byte_count != 0 && !read(read_address, &mut encoded) {
+            break;
+        }
+        let local_checkpoint = checkpoint_after
+            .checked_sub(filled)
+            .filter(|offset| *offset <= count);
+        let result = decode_gc_adpcm_range(
+            &encoded,
+            &coefficients,
+            context,
+            decode_start,
+            decode_count,
+            output_skip,
+            &mut output[filled..filled + count],
+            output_skip + local_checkpoint.unwrap_or(count),
+        );
+        let decoded = result
+            .decoded_samples
+            .saturating_sub(output_skip)
+            .min(count);
+        if let Some(offset) = local_checkpoint {
+            checkpoint_state =
+                result
+                    .checkpoint
+                    .map_or_else(AudioAdpcmDecodeState::default, |context| {
+                        AudioAdpcmDecodeState {
+                            valid: true,
+                            key,
+                            next_sample: (base + offset) as u64,
+                            context,
+                        }
+                    });
+        }
+        if decoded != 0 {
+            stream_state = AudioAdpcmDecodeState {
+                valid: true,
+                key,
+                next_sample: (base + decoded) as u64,
+                context: result.end_context,
+            };
+        }
+        filled += decoded;
+        if decoded != count {
+            break;
+        }
+        progress += decoded as u64;
+        if cursor + decoded == span.frames as usize {
+            let repeat = span.looping
+                && (span.loop_count < 0
+                    || progress < (span.frames as u64) * (span.loop_count as u64 + 1));
+            if !repeat {
+                buffer_index += 1;
+                progress = 0;
+            }
+        }
+    }
+    if filled < checkpoint_after {
+        checkpoint_state = stream_state;
+    }
+    (filled, checkpoint_state)
 }
 
 fn audio_renderer_output_slots(
@@ -715,6 +909,614 @@ mod audio_pcm_tests {
             initial_yn1: -45,
             coefficients: adpcm_coefficients(),
         }
+    }
+
+    fn renderer_request_fixture(pitch: f32) -> (super::Kernel, nexium_ipc::IpcCtx) {
+        use nexium_memory::{AddressSpace, Perm};
+        use std::sync::Arc;
+
+        const BASE: u64 = 0x1000_0000_0000;
+        let address_space = Arc::new(AddressSpace::new());
+        address_space
+            .map(BASE, 0x20000, Perm::RW, "audio_renderer_test")
+            .unwrap();
+        let mut input = vec![0u8; 0x40 + 0x170];
+        input[0x0C..0x10].copy_from_slice(&0x170u32.to_le_bytes());
+        let voice = &mut input[0x40..];
+        voice[0x008] = 1;
+        voice[0x009] = 1;
+        voice[0x00B] = AUDIO_PCM_INT16;
+        voice[0x00C..0x010].copy_from_slice(&48_000u32.to_le_bytes());
+        voice[0x018..0x01C].copy_from_slice(&1u32.to_le_bytes());
+        voice[0x01C..0x020].copy_from_slice(&pitch.to_le_bytes());
+        voice[0x020..0x024].copy_from_slice(&1.0f32.to_le_bytes());
+        voice[0x024..0x030].copy_from_slice(&biquad_bytes(true, [16384, 0, 0], [16383, 0]));
+        voice[0x03C..0x040].copy_from_slice(&1u32.to_le_bytes());
+        voice[0x060..0x068].copy_from_slice(&(BASE + 0x10000).to_le_bytes());
+        voice[0x068..0x070].copy_from_slice(&0x4000u64.to_le_bytes());
+        voice[0x074..0x078].copy_from_slice(&8192i32.to_le_bytes());
+        address_space.write(BASE, &input).unwrap();
+        let pcm: Vec<u8> = (0..8192i16).flat_map(i16::to_le_bytes).collect();
+        address_space.write(BASE + 0x10000, &pcm).unwrap();
+        let kernel = super::Kernel::new(
+            address_space,
+            BASE,
+            0x1000,
+            BASE + 0x10000,
+            0x1000,
+            BASE + 0x18000,
+            0x1000,
+            BASE + 0x19000,
+            BASE + 0x1A000,
+        );
+        let mut request = vec![0u8; 0x100];
+        request[0..4].copy_from_slice(&4u32.to_le_bytes());
+        request[4..8].copy_from_slice(&6u32.to_le_bytes());
+        request[0x10..0x14].copy_from_slice(&nexium_ipc::CMIF_IN_MAGIC.to_le_bytes());
+        request[0x18..0x1C].copy_from_slice(&4u32.to_le_bytes());
+        let mut ctx = nexium_ipc::IpcCtx::parse(request, false).unwrap();
+        ctx.send_buffers.push(nexium_ipc::IpcBuffer {
+            addr: BASE,
+            size: input.len() as u64,
+            mode: 0,
+        });
+        ctx.recv_buffers.push(nexium_ipc::IpcBuffer {
+            addr: BASE + 0x2000,
+            size: 0x1000,
+            mode: 0,
+        });
+        (kernel, ctx)
+    }
+
+    fn update_renderer(kernel: &mut super::Kernel, ctx: &mut nexium_ipc::IpcCtx) {
+        let response =
+            super::dispatch_service_v2(kernel, "IAudioRenderer", ctx, 0x80, &mut Vec::new());
+        assert!(response.windows(4).any(|word| word == b"SFCO"));
+    }
+
+    fn adpcm_renderer_request_fixture() -> (super::Kernel, nexium_ipc::IpcCtx, Vec<i16>, Vec<i16>) {
+        let (kernel, ctx) = renderer_request_fixture(1.0);
+        let base = ctx.send_buffers[0].addr;
+        let mut voice = [0u8; 0x170];
+        kernel.address_space.read(base + 0x40, &mut voice).unwrap();
+        voice[0x00B] = super::AUDIO_PCM_ADPCM;
+        voice[0x024] = 0;
+        voice[0x03C..0x040].copy_from_slice(&2u32.to_le_bytes());
+        voice[0x048..0x050].copy_from_slice(&(base + 0x6000).to_le_bytes());
+        let coefficients = adpcm_coefficients();
+        let coefficient_bytes: Vec<u8> = coefficients
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        kernel
+            .address_space
+            .write(base + 0x6000, &coefficient_bytes)
+            .unwrap();
+        let first_data = adpcm_fixture(22);
+        let mut second_data = adpcm_fixture(300);
+        for (index, byte) in second_data.iter_mut().enumerate() {
+            if index % 8 == 0 {
+                *byte = 0x23;
+            } else {
+                *byte ^= 0x55;
+            }
+        }
+        let contexts = [
+            AudioAdpcmContext {
+                header: 0x21,
+                yn0: 12345,
+                yn1: -567,
+            },
+            AudioAdpcmContext {
+                header: 0x30,
+                yn0: -3456,
+                yn1: 678,
+            },
+        ];
+        let mut expected = [vec![0i16; 253], vec![0i16; 4096]];
+        for (index, data) in [&first_data, &second_data].into_iter().enumerate() {
+            let buffer_address = base + 0x10000 + index as u64 * 0x2000;
+            let context_address = base + 0x6100 + index as u64 * 0x100;
+            let wave = &mut voice[0x060 + index * 0x38..0x098 + index * 0x38];
+            wave[0..8].copy_from_slice(&buffer_address.to_le_bytes());
+            wave[8..16].copy_from_slice(&(data.len() as u64).to_le_bytes());
+            wave[0x14..0x18].copy_from_slice(&(expected[index].len() as i32).to_le_bytes());
+            wave[0x20..0x28].copy_from_slice(&context_address.to_le_bytes());
+            let context = contexts[index];
+            let mut context_bytes = [0u8; 6];
+            context_bytes[0..2].copy_from_slice(&(context.header as u16).to_le_bytes());
+            context_bytes[2..4].copy_from_slice(&context.yn0.to_le_bytes());
+            context_bytes[4..6].copy_from_slice(&context.yn1.to_le_bytes());
+            kernel.address_space.write(buffer_address, data).unwrap();
+            kernel
+                .address_space
+                .write(context_address, &context_bytes)
+                .unwrap();
+            let count = expected[index].len();
+            let result = decode_gc_adpcm_range(
+                data,
+                &coefficients,
+                context,
+                0,
+                count,
+                0,
+                &mut expected[index],
+                count,
+            );
+            assert_eq!(result.decoded_samples, count);
+        }
+        kernel.address_space.write(base + 0x40, &voice).unwrap();
+        let [first, second] = expected;
+        (kernel, ctx, first, second)
+    }
+
+    #[test]
+    fn adpcm_queued_buffer_boundary_preserves_samples_context_and_consumption() {
+        let (mut kernel, mut ctx, first, second) = adpcm_renderer_request_fixture();
+        let mut voice = [0u8; 0x170];
+        kernel
+            .address_space
+            .read(ctx.send_buffers[0].addr + 0x40, &mut voice)
+            .unwrap();
+        let spans = [
+            AudioWaveBufferSpan {
+                frames: 253,
+                ..Default::default()
+            },
+            AudioWaveBufferSpan {
+                frames: 4096,
+                ..Default::default()
+            },
+            AudioWaveBufferSpan::default(),
+            AudioWaveBufferSpan::default(),
+        ];
+        let mut window = vec![0i16; 243];
+        let (filled, checkpoint) = super::decode_audio_adpcm_window(
+            &voice,
+            &spans,
+            240,
+            AudioAdpcmDecodeState::default(),
+            &mut window,
+            240,
+            |address, bytes| kernel.address_space.read(address, bytes).is_ok(),
+        );
+        let expected: Vec<i16> = first[240..].iter().chain(&second[..230]).copied().collect();
+        assert_eq!(filled, expected.len());
+        assert_eq!(window, expected);
+        assert!(checkpoint.valid);
+        assert_eq!(checkpoint.key.wb_index, 1);
+        assert_eq!(checkpoint.next_sample, 227);
+        assert_eq!(checkpoint.context.yn0, second[226]);
+        assert_eq!(checkpoint.context.yn1, second[225]);
+
+        update_renderer(&mut kernel, &mut ctx);
+        let state = &kernel.audio_renderers[&(0x80, 0)];
+        assert_eq!(state.voice_played_samples[0], 480);
+        assert_eq!(state.voice_wbufs_consumed[0], 1);
+        assert_eq!(state.voice_wb_progress_frames[0], 227);
+        assert_eq!(state.voice_hist[0][0], second[226] as f32 / 32768.0);
+        assert_eq!(state.voice_adpcm_states[0], checkpoint);
+        voice[0x008] = 0;
+        voice[0x040..0x042].copy_from_slice(&1u16.to_le_bytes());
+        voice[0x03C..0x040].copy_from_slice(&1u32.to_le_bytes());
+        kernel
+            .address_space
+            .write(ctx.send_buffers[0].addr + 0x40, &voice)
+            .unwrap();
+        update_renderer(&mut kernel, &mut ctx);
+        let state = &kernel.audio_renderers[&(0x80, 0)];
+        assert_eq!(state.voice_played_samples[0], 2400);
+        assert_eq!(state.voice_wb_progress_frames[0], 2147);
+        assert_eq!(state.voice_wbufs_consumed[0], 1);
+        assert_eq!(state.voice_hist[0][0], second[2146] as f32 / 32768.0);
+    }
+
+    #[test]
+    fn adpcm_loop_boundary_uses_each_buffers_context_without_consuming_lookahead() {
+        let (kernel, ctx, first, second) = adpcm_renderer_request_fixture();
+        let mut voice = [0u8; 0x170];
+        kernel
+            .address_space
+            .read(ctx.send_buffers[0].addr + 0x40, &mut voice)
+            .unwrap();
+        voice[0x078] = 1;
+        for loop_count in [1, -1] {
+            let spans = [
+                AudioWaveBufferSpan {
+                    frames: 253,
+                    looping: true,
+                    loop_count,
+                },
+                AudioWaveBufferSpan {
+                    frames: 4096,
+                    ..Default::default()
+                },
+                AudioWaveBufferSpan::default(),
+                AudioWaveBufferSpan::default(),
+            ];
+            let mut window = vec![0i16; 520];
+            let (filled, checkpoint) = super::decode_audio_adpcm_window(
+                &voice,
+                &spans,
+                0,
+                AudioAdpcmDecodeState::default(),
+                &mut window,
+                514,
+                |address, bytes| kernel.address_space.read(address, bytes).is_ok(),
+            );
+            let tail = if loop_count == 1 { &second } else { &first };
+            let expected: Vec<i16> = first
+                .iter()
+                .chain(&first)
+                .chain(&tail[..14])
+                .copied()
+                .collect();
+            assert_eq!(filled, 520);
+            assert_eq!(window, expected);
+            assert!(checkpoint.valid);
+            assert_eq!(checkpoint.key.wb_index, if loop_count == 1 { 1 } else { 0 });
+            assert_eq!(checkpoint.next_sample, 8);
+            assert_eq!(checkpoint.context.yn0, tail[7]);
+            assert_eq!(checkpoint.context.yn1, tail[6]);
+        }
+    }
+
+    #[test]
+    fn adpcm_next_buffer_without_context_continues_the_previous_predictor() {
+        let (kernel, ctx, first, _) = adpcm_renderer_request_fixture();
+        let mut voice = [0u8; 0x170];
+        kernel
+            .address_space
+            .read(ctx.send_buffers[0].addr + 0x40, &mut voice)
+            .unwrap();
+        voice[0x0B8..0x0C0].fill(0);
+        let spans = [
+            AudioWaveBufferSpan {
+                frames: 253,
+                ..Default::default()
+            },
+            AudioWaveBufferSpan {
+                frames: 4096,
+                ..Default::default()
+            },
+            AudioWaveBufferSpan::default(),
+            AudioWaveBufferSpan::default(),
+        ];
+        let second_address = u64::from_le_bytes(voice[0x098..0x0A0].try_into().unwrap());
+        let second_size = u64::from_le_bytes(voice[0x0A0..0x0A8].try_into().unwrap()) as usize;
+        let mut second_data = vec![0u8; second_size];
+        kernel
+            .address_space
+            .read(second_address, &mut second_data)
+            .unwrap();
+        let carried_context = AudioAdpcmContext {
+            header: adpcm_fixture(22)[252 / 14 * 8],
+            yn0: first[252],
+            yn1: first[251],
+        };
+        let mut second = vec![0i16; 230];
+        let reference = decode_gc_adpcm_range(
+            &second_data,
+            &adpcm_coefficients(),
+            carried_context,
+            0,
+            230,
+            0,
+            &mut second,
+            227,
+        );
+        let mut window = vec![0i16; 243];
+        let (filled, checkpoint) = super::decode_audio_adpcm_window(
+            &voice,
+            &spans,
+            240,
+            AudioAdpcmDecodeState::default(),
+            &mut window,
+            240,
+            |address, bytes| kernel.address_space.read(address, bytes).is_ok(),
+        );
+        let expected: Vec<i16> = first[240..].iter().chain(&second).copied().collect();
+        assert_eq!(filled, expected.len());
+        assert_eq!(window, expected);
+        assert_eq!(checkpoint.context, reference.checkpoint.unwrap());
+        assert_eq!(checkpoint.next_sample, 227);
+    }
+
+    #[test]
+    fn adpcm_nonzero_wave_starts_use_context_at_the_declared_offset() {
+        for supplied_next_context in [true, false] {
+            let (mut kernel, mut ctx, _, _) = adpcm_renderer_request_fixture();
+            let mut voice = [0u8; 0x170];
+            let voice_address = ctx.send_buffers[0].addr + 0x40;
+            kernel
+                .address_space
+                .read(voice_address, &mut voice)
+                .unwrap();
+            voice[0x070..0x074].copy_from_slice(&5i32.to_le_bytes());
+            voice[0x074..0x078].copy_from_slice(&258i32.to_le_bytes());
+            voice[0x0A8..0x0AC].copy_from_slice(&17i32.to_le_bytes());
+            voice[0x0AC..0x0B0].copy_from_slice(&4113i32.to_le_bytes());
+            if !supplied_next_context {
+                voice[0x0B8..0x0C0].fill(0);
+            }
+            kernel.address_space.write(voice_address, &voice).unwrap();
+            let decode_reference = |index: usize, start: usize, count: usize, seed| {
+                let wave = &voice[0x060 + index * 0x38..0x098 + index * 0x38];
+                let address = u64::from_le_bytes(wave[0..8].try_into().unwrap());
+                let size = u64::from_le_bytes(wave[8..16].try_into().unwrap()) as usize;
+                let (offset, bytes) = gc_adpcm_byte_range(start, count, size).unwrap();
+                let mut encoded = vec![0u8; bytes];
+                kernel
+                    .address_space
+                    .read(address + offset as u64, &mut encoded)
+                    .unwrap();
+                let mut decoded = vec![0i16; count];
+                let result = decode_gc_adpcm_range(
+                    &encoded,
+                    &adpcm_coefficients(),
+                    seed,
+                    start,
+                    count,
+                    0,
+                    &mut decoded,
+                    count,
+                );
+                assert_eq!(result.decoded_samples, count);
+                (decoded, result.end_context)
+            };
+            let first_seed = AudioAdpcmContext {
+                header: 0x21,
+                yn0: 12345,
+                yn1: -567,
+            };
+            let (first, first_end) = decode_reference(0, 5, 253, first_seed);
+            let next_seed = if supplied_next_context {
+                AudioAdpcmContext {
+                    header: 0x30,
+                    yn0: -3456,
+                    yn1: 678,
+                }
+            } else {
+                first_end
+            };
+            let (second, _) = decode_reference(1, 17, 4096, next_seed);
+            let spans = [
+                AudioWaveBufferSpan {
+                    frames: 253,
+                    ..Default::default()
+                },
+                AudioWaveBufferSpan {
+                    frames: 4096,
+                    ..Default::default()
+                },
+                AudioWaveBufferSpan::default(),
+                AudioWaveBufferSpan::default(),
+            ];
+            let mut window = vec![0i16; 243];
+            let (filled, checkpoint) = super::decode_audio_adpcm_window(
+                &voice,
+                &spans,
+                240,
+                AudioAdpcmDecodeState::default(),
+                &mut window,
+                240,
+                |address, bytes| kernel.address_space.read(address, bytes).is_ok(),
+            );
+            let expected: Vec<i16> = first[240..].iter().chain(&second[..230]).copied().collect();
+            assert_eq!(filled, expected.len());
+            assert_eq!(window, expected);
+            assert_eq!(checkpoint.next_sample, 17 + 227);
+            update_renderer(&mut kernel, &mut ctx);
+            let state = &kernel.audio_renderers[&(0x80, 0)];
+            assert_eq!(state.voice_played_samples[0], 480);
+            assert_eq!(state.voice_wbufs_consumed[0], 1);
+            assert_eq!(state.voice_wb_progress_frames[0], 227);
+            assert_eq!(state.voice_hist[0][0], second[226] as f32 / 32768.0);
+            assert_eq!(state.voice_adpcm_states[0], checkpoint);
+            voice[0x008] = 0;
+            voice[0x040..0x042].copy_from_slice(&1u16.to_le_bytes());
+            voice[0x03C..0x040].copy_from_slice(&1u32.to_le_bytes());
+            kernel.address_space.write(voice_address, &voice).unwrap();
+            update_renderer(&mut kernel, &mut ctx);
+            let state = &kernel.audio_renderers[&(0x80, 0)];
+            assert_eq!(state.voice_played_samples[0], 2400);
+            assert_eq!(state.voice_wb_progress_frames[0], 2147);
+            assert_eq!(state.voice_hist[0][0], second[2146] as f32 / 32768.0);
+        }
+    }
+
+    #[test]
+    fn pcm_short_tail_does_not_count_padding_or_skip_a_later_refill() {
+        for format in [AUDIO_PCM_INT16, AUDIO_PCM_FLOAT] {
+            let (mut kernel, mut ctx) = renderer_request_fixture(1.0);
+            let base = ctx.send_buffers[0].addr;
+            let mut voice = [0u8; 0x170];
+            kernel.address_space.read(base + 0x40, &mut voice).unwrap();
+            voice[0x00B] = format;
+            voice[0x024] = 0;
+            let encode = |count: usize, initial: i16| -> Vec<u8> {
+                if format == AUDIO_PCM_FLOAT {
+                    (0..count)
+                        .flat_map(|i| ((initial as f32 + i as f32) / 4096.0).to_le_bytes())
+                        .collect()
+                } else {
+                    (0..count)
+                        .flat_map(|i| (initial + i as i16).to_le_bytes())
+                        .collect()
+                }
+            };
+            for (index, samples) in [encode(253, 0), encode(257, 1000)].iter().enumerate() {
+                let wave = &mut voice[0x060 + index * 0x38..0x098 + index * 0x38];
+                let address = base + 0x10000 + index as u64 * 0x4000;
+                wave[0..8].copy_from_slice(&address.to_le_bytes());
+                wave[8..16].copy_from_slice(&(samples.len() as u64).to_le_bytes());
+                wave[0x14..0x18]
+                    .copy_from_slice(&(if index == 0 { 253i32 } else { 257 }).to_le_bytes());
+                kernel.address_space.write(address, samples).unwrap();
+            }
+            kernel.address_space.write(base + 0x40, &voice).unwrap();
+            update_renderer(&mut kernel, &mut ctx);
+            let state = &kernel.audio_renderers[&(0x80, 0)];
+            assert_eq!(state.voice_played_samples[0], 253);
+            assert_eq!(state.voice_wbufs_consumed[0], 1);
+            assert_eq!(state.voice_wb_progress_frames[0], 0);
+            voice[0x008] = 0;
+            voice[0x03C..0x040].fill(0);
+            kernel.address_space.write(base + 0x40, &voice).unwrap();
+            update_renderer(&mut kernel, &mut ctx);
+            assert_eq!(
+                kernel.audio_renderers[&(0x80, 0)].voice_played_samples[0],
+                253
+            );
+            voice[0x040..0x042].copy_from_slice(&1u16.to_le_bytes());
+            voice[0x03C..0x040].copy_from_slice(&1u32.to_le_bytes());
+            kernel.address_space.write(base + 0x40, &voice).unwrap();
+            update_renderer(&mut kernel, &mut ctx);
+            let state = &kernel.audio_renderers[&(0x80, 0)];
+            assert_eq!(state.voice_played_samples[0], 510);
+            assert_eq!(state.voice_wbufs_consumed[0], 2);
+            assert_eq!(state.voice_wb_progress_frames[0], 0);
+        }
+    }
+
+    #[test]
+    fn adpcm_short_tail_retains_predictor_for_refill_without_counting_silence() {
+        let (mut kernel, mut ctx, first, _) = adpcm_renderer_request_fixture();
+        let voice_address = ctx.send_buffers[0].addr + 0x40;
+        let mut voice = [0u8; 0x170];
+        kernel
+            .address_space
+            .read(voice_address, &mut voice)
+            .unwrap();
+        voice[0x03C..0x040].copy_from_slice(&1u32.to_le_bytes());
+        kernel.address_space.write(voice_address, &voice).unwrap();
+        update_renderer(&mut kernel, &mut ctx);
+        let state = &kernel.audio_renderers[&(0x80, 0)];
+        assert_eq!(state.voice_played_samples[0], 253);
+        assert_eq!(state.voice_wbufs_consumed[0], 1);
+        assert_eq!(state.voice_wb_progress_frames[0], 0);
+        let checkpoint = state.voice_adpcm_states[0];
+        assert!(checkpoint.valid);
+        assert_eq!(checkpoint.next_sample, 253);
+        let expected_context = AudioAdpcmContext {
+            header: adpcm_fixture(22)[252 / 14 * 8],
+            yn0: first[252],
+            yn1: first[251],
+        };
+        assert_eq!(checkpoint.context, expected_context);
+        voice[0x008] = 0;
+        voice[0x03C..0x040].fill(0);
+        kernel.address_space.write(voice_address, &voice).unwrap();
+        update_renderer(&mut kernel, &mut ctx);
+        assert_eq!(
+            kernel.audio_renderers[&(0x80, 0)].voice_adpcm_states[0],
+            checkpoint
+        );
+
+        let second_address = u64::from_le_bytes(voice[0x098..0x0A0].try_into().unwrap());
+        let second_size = u64::from_le_bytes(voice[0x0A0..0x0A8].try_into().unwrap()) as usize;
+        let mut encoded = vec![0u8; second_size];
+        kernel
+            .address_space
+            .read(second_address, &mut encoded)
+            .unwrap();
+        let mut expected = vec![0i16; 1920];
+        let reference = decode_gc_adpcm_range(
+            &encoded,
+            &adpcm_coefficients(),
+            expected_context,
+            0,
+            1920,
+            0,
+            &mut expected,
+            1920,
+        );
+        assert_eq!(reference.decoded_samples, 1920);
+        voice[0x040..0x042].copy_from_slice(&1u16.to_le_bytes());
+        voice[0x03C..0x040].copy_from_slice(&1u32.to_le_bytes());
+        voice[0x0B8..0x0C0].fill(0);
+        kernel.address_space.write(voice_address, &voice).unwrap();
+        update_renderer(&mut kernel, &mut ctx);
+        let state = &kernel.audio_renderers[&(0x80, 0)];
+        assert_eq!(state.voice_played_samples[0], 2173);
+        assert_eq!(state.voice_wbufs_consumed[0], 1);
+        assert_eq!(state.voice_wb_progress_frames[0], 1920);
+        assert_eq!(state.voice_hist[0][0], expected[1919] as f32 / 32768.0);
+        assert_eq!(
+            state.voice_adpcm_states[0].context,
+            reference.checkpoint.unwrap()
+        );
+    }
+
+    #[test]
+    fn new_voice_burst_preserves_all_decoded_samples_and_filter_history() {
+        let (mut kernel, mut ctx) = renderer_request_fixture(1.0);
+        update_renderer(&mut kernel, &mut ctx);
+        let state = &kernel.audio_renderers[&(0x80, 0)];
+        assert_eq!(state.voice_played_samples[0], 1920);
+        assert_eq!(state.voice_wb_progress_frames[0], 1920);
+        assert_eq!(state.voice_hist[0][0], 1919.0 / 32768.0);
+        let mut expected_filter = 0.0f32;
+        for sample in 0..1920 {
+            expected_filter = (sample as f32 / 32768.0 + expected_filter) * (16383.0 / 16384.0);
+        }
+        assert!((state.voice_biquad_state[0][0][0][0] - expected_filter).abs() < 0.0001);
+        let mut status = [0u8; 16];
+        kernel
+            .address_space
+            .read(ctx.recv_buffers[0].addr + 0x40, &mut status)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(status[..8].try_into().unwrap()), 1920);
+        kernel
+            .address_space
+            .write(ctx.send_buffers[0].addr + 0x48, &[0])
+            .unwrap();
+        update_renderer(&mut kernel, &mut ctx);
+        let state = &kernel.audio_renderers[&(0x80, 0)];
+        assert_eq!(state.voice_played_samples[0], 3840);
+        assert_eq!(state.voice_wb_progress_frames[0], 3840);
+        assert_eq!(state.voice_hist[0][0], 3839.0 / 32768.0);
+    }
+
+    #[test]
+    fn reused_voice_starts_from_its_own_origin_before_the_first_decode() {
+        let (mut kernel, mut ctx) = renderer_request_fixture(1.0);
+        update_renderer(&mut kernel, &mut ctx);
+        let state = kernel.audio_renderers.get_mut(&(0x80, 0)).unwrap();
+        state.voice_wb_progress_frames[0] = 7000;
+        state.voice_played_samples[0] = 12000;
+        state.voice_wbufs_consumed[0] = 9;
+        state.voice_frac_q15[0] = 16384;
+        state.voice_hist[0] = [0.9; 6];
+        state.voice_biquad_state[0] = [[[0.8; 2]; 2]; 2];
+        update_renderer(&mut kernel, &mut ctx);
+        let state = &kernel.audio_renderers[&(0x80, 0)];
+        assert_eq!(state.voice_played_samples[0], 1920);
+        assert_eq!(state.voice_wb_progress_frames[0], 1920);
+        assert_eq!(state.voice_wbufs_consumed[0], 0);
+        assert_eq!(state.voice_frac_q15[0], 0);
+        assert_eq!(state.voice_hist[0][0], 1919.0 / 32768.0);
+    }
+
+    #[test]
+    fn voice_pitch_changes_decoding_and_reported_source_progress_together() {
+        for (pitch, expected) in [(0.5, 960u64), (1.0, 1920), (2.0, 3840)] {
+            let (mut kernel, mut ctx) = renderer_request_fixture(pitch);
+            update_renderer(&mut kernel, &mut ctx);
+            let state = &kernel.audio_renderers[&(0x80, 0)];
+            assert_eq!(state.voice_played_samples[0], expected);
+            assert_eq!(state.voice_wb_progress_frames[0], expected);
+            assert_eq!(state.voice_hist[0][0], (expected - 1) as f32 / 32768.0);
+        }
+    }
+
+    #[test]
+    fn invalid_voice_pitch_does_not_advance_the_source() {
+        for pitch in [f32::NAN, f32::INFINITY, -1.0, 1000.0] {
+            assert_eq!(super::audio_source_step(48_000, pitch), None);
+        }
+        assert_eq!(super::audio_source_step(48_000, 0.0), Some(0));
+        assert_eq!(super::audio_source_step(24_000, 2.0), Some(32768));
     }
 
     #[test]
@@ -884,7 +1686,7 @@ mod audio_pcm_tests {
             AudioWaveBufferSpan::default(),
             AudioWaveBufferSpan::default(),
         ];
-        assert_eq!(advance_audio_wave_buffers(0, 250, &finite), (50, 0, false));
+        assert_eq!(advance_audio_wave_buffers(0, 250, &finite), (250, 0, false));
         assert_eq!(advance_audio_wave_buffers(0, 300, &finite), (0, 1, false));
         assert_eq!(advance_audio_wave_buffers(0, 330, &finite), (30, 1, false));
 
@@ -901,6 +1703,30 @@ mod audio_pcm_tests {
         assert_eq!(
             advance_audio_wave_buffers(0, 100_000, &infinite),
             (0, 0, false)
+        );
+    }
+
+    #[test]
+    fn finite_wave_buffer_loops_complete_across_repeated_render_updates() {
+        let buffers = [
+            AudioWaveBufferSpan {
+                frames: 960,
+                looping: true,
+                loop_count: 2,
+            },
+            AudioWaveBufferSpan::default(),
+            AudioWaveBufferSpan::default(),
+            AudioWaveBufferSpan::default(),
+        ];
+        let mut progress = 0;
+        for update in 1..12 {
+            let result = advance_audio_wave_buffers(progress, 240, &buffers);
+            assert_eq!(result, (update * 240, 0, false));
+            progress = result.0;
+        }
+        assert_eq!(
+            advance_audio_wave_buffers(progress, 240, &buffers),
+            (0, 1, false)
         );
     }
 
@@ -5340,6 +6166,7 @@ fn dispatch_service_v2(
             state: 1,
             rendering_time_limit: 100,
             voice_drop_param: 1.0,
+            effect_states: Vec::new(),
             voice_played_samples: Vec::new(),
             voice_wbufs_consumed: Vec::new(),
             voice_last_wb_index: Vec::new(),
@@ -5460,6 +6287,7 @@ fn dispatch_service_v2(
                 state: 1,
                 rendering_time_limit: 100,
                 voice_drop_param: 1.0,
+                effect_states: Vec::new(),
                 voice_played_samples: Vec::new(),
                 voice_wbufs_consumed: Vec::new(),
                 voice_last_wb_index: Vec::new(),
@@ -5583,6 +6411,8 @@ fn dispatch_service_v2(
                         );
                     }
                 }
+                st.effect_states
+                    .resize(effect_count_seen, Default::default());
                 let mut effect_out_states: Vec<u8> = vec![4; effect_count_seen];
                 if let Some(ib) = in_buf {
                     let effects_in_off =
@@ -5598,12 +6428,30 @@ fn dispatch_service_v2(
                             let ty = eb[0];
                             let is_new = eb[1] != 0;
                             let enabled = eb[2] != 0;
+                            let previous = st.effect_states[i];
                             effect_out_states[i] =
-                                if ty != 0 && (st.state == 0 || is_new || enabled) {
-                                    3
-                                } else {
-                                    4
-                                };
+                                st.effect_states[i].update(ty, is_new, enabled, st.state == 0);
+                            if previous != st.effect_states[i] && audio_effect_trace_enabled() {
+                                use std::sync::atomic::{AtomicU64, Ordering};
+                                static COUNT: AtomicU64 = AtomicU64::new(0);
+                                let count = COUNT.fetch_add(1, Ordering::Relaxed);
+                                if count < 128 || count % 256 == 0 {
+                                    log::info!(
+                                        "[audio-effect] #{} renderer={:?} frame={} slot={} type={} new={} enabled={} active={} status={} {:?} -> {:?}",
+                                        count,
+                                        key,
+                                        frame,
+                                        i,
+                                        ty,
+                                        is_new,
+                                        enabled,
+                                        st.state == 0,
+                                        effect_out_states[i],
+                                        previous,
+                                        st.effect_states[i],
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -5629,11 +6477,10 @@ fn dispatch_service_v2(
                     .unwrap_or(0);
 
                 let blocks_to_produce: usize = audio_blocks_to_produce(queued_now);
-                let mut is_new_latched: Vec<bool> = vec![false; voice_count_seen];
                 let mut big_out: Vec<f32> =
                     Vec::with_capacity(TARGET_FRAMES * 2 * blocks_to_produce);
 
-                if blocks_to_produce == 0 {
+                {
                     if let Some(ib) = in_buf {
                         let voices_off: u64 =
                             0x40 + in_behavior_sz + in_mempools_sz + in_channels_sz;
@@ -5669,21 +6516,17 @@ fn dispatch_service_v2(
                                 metadata[0x01A],
                                 metadata[0x01B],
                             ]);
-                            let wb_count = u32::from_le_bytes([
-                                metadata[0x03C],
-                                metadata[0x03D],
-                                metadata[0x03E],
-                                metadata[0x03F],
-                            ]);
                             let wb_index =
                                 u16::from_le_bytes([metadata[0x040], metadata[0x041]]) as usize;
+                            if is_new {
+                                initialize_audio_voice(st, vid, wb_index as u16);
+                            }
                             if is_new
                                 || !is_in_use
                                 || play_state != 0
                                 || sample_format != AUDIO_PCM_ADPCM
                                 || !(channel_count == 1 || channel_count == 2)
                                 || sample_rate == 0
-                                || wb_count == 0
                                 || wb_index >= 4
                             {
                                 st.voice_adpcm_states[vid] = AudioAdpcmDecodeState::default();
@@ -5736,13 +6579,11 @@ fn dispatch_service_v2(
                             voice_snapshot[vid].wb_index = wb_index as u16;
                             voice_snapshot[vid].is_new = is_new;
 
-                            if is_new
-                                || !is_in_use
+                            if !is_in_use
                                 || play_state != 0
                                 || sample_format != AUDIO_PCM_ADPCM
                                 || !(channel_count == 1 || channel_count == 2)
                                 || sample_rate == 0
-                                || wb_count == 0
                                 || wb_index >= 4
                             {
                                 st.voice_adpcm_states[vid] = AudioAdpcmDecodeState::default();
@@ -5806,15 +6647,6 @@ fn dispatch_service_v2(
                                 }
                             }
 
-                            if is_new {
-                                if let Some(g) = st.voice_prev_gain.get_mut(vid) {
-                                    *g = 0.0;
-                                }
-                                if let Some(s) = st.voice_biquad_state.get_mut(vid) {
-                                    *s = [[[0.0f32; 2]; 2]; 2];
-                                }
-                            }
-
                             if !is_in_use
                                 || play_state != 0
                                 || (sample_format != AUDIO_PCM_INT16
@@ -5839,10 +6671,6 @@ fn dispatch_service_v2(
                             let buffer_address = u64::from_le_bytes([
                                 wb[0x00], wb[0x01], wb[0x02], wb[0x03], wb[0x04], wb[0x05],
                                 wb[0x06], wb[0x07],
-                            ]);
-                            let buffer_size = u64::from_le_bytes([
-                                wb[0x08], wb[0x09], wb[0x0A], wb[0x0B], wb[0x0C], wb[0x0D],
-                                wb[0x0E], wb[0x0F],
                             ]);
                             let start_offset =
                                 i32::from_le_bytes([wb[0x10], wb[0x11], wb[0x12], wb[0x13]]);
@@ -5884,169 +6712,50 @@ fn dispatch_service_v2(
                             }
 
                             let ch = channel_count as usize;
-                            let ratio = sample_rate as f32 / TARGET_SR;
+                            let pitch = f32::from_le_bytes(v[0x01C..0x020].try_into().unwrap());
+                            let Some(step) = audio_source_step(sample_rate, pitch) else {
+                                continue;
+                            };
+                            let ratio = step as f32 / 32768.0;
                             let in_frames_needed =
                                 ((TARGET_FRAMES as f32) * ratio).ceil() as usize + 3;
                             let wb_total_frames = (end_offset - start_offset) as usize;
-                            let cursor =
-                                (st.voice_wb_progress_frames.get(vid).copied().unwrap_or(0)
-                                    as usize)
-                                    .min(wb_total_frames.saturating_sub(1));
+                            let progress =
+                                st.voice_wb_progress_frames.get(vid).copied().unwrap_or(0) as usize;
+                            let cursor = if wave_buffers[0].looping {
+                                progress % wb_total_frames
+                            } else {
+                                progress.min(wb_total_frames.saturating_sub(1))
+                            };
                             let in_frames = in_frames_needed;
                             let initial_frac_q15 = st.voice_frac_q15.get(vid).copied().unwrap_or(0);
-                            let step: i32 = ((sample_rate as f32 / TARGET_SR) * 32768.0) as i32;
                             let (checkpoint_source_frames, _) =
                                 audio_source_advance(initial_frac_q15, step, TARGET_FRAMES);
                             let mut pcm_l = vec![0.0f32; in_frames];
                             let mut pcm_r = vec![0.0f32; in_frames];
+                            let available_source_frames;
 
                             if sample_format == AUDIO_PCM_ADPCM {
-                                let previous_state = st.voice_adpcm_states[vid];
-                                st.voice_adpcm_states[vid] = AudioAdpcmDecodeState::default();
-                                let coeff_addr = u64::from_le_bytes([
-                                    v[0x048], v[0x049], v[0x04A], v[0x04B], v[0x04C], v[0x04D],
-                                    v[0x04E], v[0x04F],
-                                ]);
-                                let ctx_addr = u64::from_le_bytes([
-                                    wb[0x20], wb[0x21], wb[0x22], wb[0x23], wb[0x24], wb[0x25],
-                                    wb[0x26], wb[0x27],
-                                ]);
-                                let mut coeff_bytes = [0u8; 32];
-                                if coeff_addr == 0
-                                    || kernel
-                                        .address_space
-                                        .read(coeff_addr, &mut coeff_bytes)
-                                        .is_err()
-                                {
-                                    continue;
-                                }
-                                let mut coeffs = [0i16; 16];
-                                for i in 0..16 {
-                                    coeffs[i] = i16::from_le_bytes([
-                                        coeff_bytes[i * 2],
-                                        coeff_bytes[i * 2 + 1],
-                                    ]);
-                                }
-                                let mut initial_header = 0u16;
-                                let (mut yn0_seed, mut yn1_seed) = (0i16, 0i16);
-                                if ctx_addr != 0 {
-                                    let mut ctx = [0u8; 6];
-                                    if kernel.address_space.read(ctx_addr, &mut ctx).is_ok() {
-                                        initial_header = u16::from_le_bytes([ctx[0], ctx[1]]);
-                                        yn0_seed = i16::from_le_bytes([ctx[2], ctx[3]]);
-                                        yn1_seed = i16::from_le_bytes([ctx[4], ctx[5]]);
-                                    }
-                                }
-                                if buffer_address == 0 || buffer_size < 8 {
-                                    continue;
-                                }
-
-                                let base = start_offset as usize + cursor;
-                                let stream_key = AudioAdpcmStreamKey {
-                                    wb_index: wb_index as u16,
-                                    buffer_address,
-                                    buffer_size,
-                                    start_offset,
-                                    end_offset,
-                                    context_address: ctx_addr,
-                                    coefficient_address: coeff_addr,
-                                    sample_rate,
-                                    looping: wb[0x18] != 0,
-                                    initial_header,
-                                    initial_yn0: yn0_seed,
-                                    initial_yn1: yn1_seed,
-                                    coefficients: coeffs,
-                                };
-                                let streaming =
-                                    can_stream_gc_adpcm(previous_state, stream_key, base, is_new);
-                                let (decode_start, decode_count, output_skip, decode_context) =
-                                    if streaming {
-                                        (base, in_frames, 0, previous_state.context)
-                                    } else {
-                                        (
-                                            0,
-                                            base.saturating_add(in_frames),
-                                            base,
-                                            AudioAdpcmContext {
-                                                header: initial_header as u8,
-                                                yn0: yn0_seed,
-                                                yn1: yn1_seed,
-                                            },
-                                        )
-                                    };
-                                let checkpoint_after = if streaming {
-                                    checkpoint_source_frames
-                                } else {
-                                    base.saturating_add(checkpoint_source_frames)
-                                };
-                                let buffer_size_usize =
-                                    usize::try_from(buffer_size).unwrap_or(usize::MAX);
-                                let Some((byte_offset, byte_count)) = gc_adpcm_byte_range(
-                                    decode_start,
-                                    decode_count,
-                                    buffer_size_usize,
-                                ) else {
-                                    continue;
-                                };
-                                let mut adpcm = vec![0u8; byte_count];
-                                let Some(read_address) =
-                                    buffer_address.checked_add(byte_offset as u64)
-                                else {
-                                    continue;
-                                };
-                                if byte_count != 0
-                                    && kernel.address_space.read(read_address, &mut adpcm).is_err()
-                                {
-                                    continue;
-                                }
                                 let mut decoded = vec![0i16; in_frames];
-                                let decode_result = decode_gc_adpcm_range(
-                                    &adpcm,
-                                    &coeffs,
-                                    decode_context,
-                                    decode_start,
-                                    decode_count,
-                                    output_skip,
+                                let (decoded_samples, next_state) = decode_audio_adpcm_window(
+                                    &v,
+                                    &wave_buffers,
+                                    progress as u64,
+                                    st.voice_adpcm_states[vid],
                                     &mut decoded,
-                                    checkpoint_after,
+                                    checkpoint_source_frames,
+                                    |address, bytes| {
+                                        kernel.address_space.read(address, bytes).is_ok()
+                                    },
                                 );
-                                debug_assert!(decode_result.bytes_read <= adpcm.len());
-                                st.voice_adpcm_states[vid] = if let Some(context) =
-                                    decode_result.checkpoint
-                                {
-                                    AudioAdpcmDecodeState {
-                                        valid: true,
-                                        key: stream_key,
-                                        next_sample: base.saturating_add(checkpoint_source_frames)
-                                            as u64,
-                                        context,
-                                    }
-                                } else {
-                                    AudioAdpcmDecodeState::default()
-                                };
-                                for f in 0..in_frames {
-                                    pcm_l[f] = (decoded[f] as f32) / 32768.0;
-                                    pcm_r[f] = pcm_l[f];
+                                st.voice_adpcm_states[vid] = next_state;
+                                if decoded_samples == 0 {
+                                    continue;
                                 }
-                                {
-                                    use std::sync::atomic::{AtomicU64, Ordering as O};
-                                    static DUMPED: AtomicU64 = AtomicU64::new(0);
-                                    let bit = 1u64 << ((vid as u64) & 63);
-                                    if DUMPED.fetch_or(bit, O::Relaxed) & bit == 0 {
-                                        let nz = decoded.iter().filter(|s| **s != 0).count();
-                                        log::trace!(
-                                            "voice[{}] ADPCM: decoded={} nonzero={} coeff_addr={:#x} ctx_addr={:#x} start_off={} in_frames={} sr={} streaming={}",
-                                            vid,
-                                            decode_result.decoded_samples,
-                                            nz,
-                                            coeff_addr,
-                                            ctx_addr,
-                                            start_offset,
-                                            in_frames,
-                                            sample_rate,
-                                            streaming
-                                        );
-                                    }
+                                available_source_frames = decoded_samples;
+                                for f in 0..in_frames {
+                                    pcm_l[f] = decoded[f] as f32 / 32768.0;
+                                    pcm_r[f] = pcm_l[f];
                                 }
                             } else {
                                 let Some(bytes_per_sample) = pcm_bytes_per_sample(sample_format)
@@ -6169,6 +6878,7 @@ fn dispatch_service_v2(
                                 if got == 0 {
                                     continue;
                                 }
+                                available_source_frames = got;
                             }
 
                             let phist = st.voice_hist.get(vid).copied().unwrap_or([0.0f32; 6]);
@@ -6253,7 +6963,7 @@ fn dispatch_service_v2(
                                 *f = frac_q15;
                             }
 
-                            let src_frames_this_pass = read_idx as u32;
+                            let src_frames_this_pass = read_idx.min(available_source_frames) as u32;
                             voice_snapshot[vid].did_mix = true;
                             voice_snapshot[vid].source_frames = src_frames_this_pass;
                             voice_snapshot[vid].wb_count = wb_count;
@@ -6274,15 +6984,7 @@ fn dispatch_service_v2(
                             if snapshot.did_mix {
                                 any_mix = true;
                             }
-                            if snapshot.is_new && !is_new_latched[vid] {
-                                st.voice_played_samples[vid] = 0;
-                                st.voice_wbufs_consumed[vid] = 0;
-                                st.voice_last_wb_index[vid] = wb_now;
-                                is_new_latched[vid] = true;
-                                if let Some(p) = st.voice_wb_progress_frames.get_mut(vid) {
-                                    *p = 0;
-                                }
-                            } else if snapshot.did_mix && wb_total > 0 {
+                            if snapshot.did_mix && wb_total > 0 {
                                 st.voice_played_samples[vid] = st.voice_played_samples[vid]
                                     .wrapping_add(snapshot.source_frames as u64);
 

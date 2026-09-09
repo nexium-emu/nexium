@@ -249,6 +249,7 @@ pub struct AudioRendererState {
     pub state: u32,
     pub rendering_time_limit: u32,
     pub voice_drop_param: f32,
+    pub effect_states: Vec<crate::services::audio_renderer::effect::EffectState>,
     pub voice_played_samples: Vec<u64>,
     pub voice_wbufs_consumed: Vec<u32>,
     pub voice_last_wb_index: Vec<u16>,

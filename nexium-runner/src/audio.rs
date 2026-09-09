@@ -346,17 +346,24 @@ fn pick_config(device: &cpal::Device) -> Result<(StreamConfig, SampleFormat), St
         .collect();
 
     let want_sr = RENDER_SR;
-    for fmt in [SampleFormat::F32, SampleFormat::I16, SampleFormat::U16] {
-        if let Some(range) = supported.iter().find(|r| {
-            r.channels() == 2
-                && r.sample_format() == fmt
-                && r.min_sample_rate() <= want_sr
-                && r.max_sample_rate() >= want_sr
-        }) {
-            let mut config = range.with_sample_rate(want_sr).config();
-            apply_buffer_size(&mut config, Some(range.buffer_size()));
-            return Ok((config, fmt));
-        }
+    if let Some((range, format)) = supported
+        .iter()
+        .filter_map(|range| {
+            output_config_preference(
+                range.channels(),
+                range.sample_format(),
+                range.min_sample_rate(),
+                range.max_sample_rate(),
+                want_sr,
+            )
+            .map(|rank| (rank, range))
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, range)| (range, range.sample_format()))
+    {
+        let mut config = range.with_sample_rate(want_sr).config();
+        apply_buffer_size(&mut config, Some(range.buffer_size()));
+        return Ok((config, format));
     }
     let def = device
         .default_output_config()
@@ -366,6 +373,27 @@ fn pick_config(device: &cpal::Device) -> Result<(StreamConfig, SampleFormat), St
     let mut config = def.config();
     apply_buffer_size(&mut config, Some(&buffer));
     Ok((config, format))
+}
+
+fn output_config_preference(
+    channels: u16,
+    format: SampleFormat,
+    min_sample_rate: u32,
+    max_sample_rate: u32,
+    wanted_sample_rate: u32,
+) -> Option<(u8, u8, u16)> {
+    if channels == 0
+        || min_sample_rate > wanted_sample_rate
+        || max_sample_rate < wanted_sample_rate
+    {
+        return None;
+    }
+    let format_rank = match format {
+        SampleFormat::F32 => 0,
+        SampleFormat::I16 => 1,
+        _ => return None,
+    };
+    Some((u8::from(channels != 2), format_rank, channels.abs_diff(2)))
 }
 
 pub fn init_host_audio(preferred_device: Option<&str>, initial_volume: f32) {
@@ -706,7 +734,11 @@ fn post_audio_events(new_consumed: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_stereo_output, pop_mixed_stereo_frame, AudioOutMixer, PrebufState};
+    use super::{
+        clamp_stereo_output, output_config_preference, pop_mixed_stereo_frame, AudioOutMixer,
+        PrebufState,
+    };
+    use cpal::SampleFormat;
     use ringbuf::traits::{Producer, Split};
     use ringbuf::HeapRb;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -810,5 +842,21 @@ mod tests {
         assert_eq!(prebuf.callback_ratio(240, 0.5), 0.5);
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert_eq!(prebuf.callback_ratio(240, 0.5), 0.5);
+    }
+
+    #[test]
+    fn native_rate_multichannel_output_precedes_rate_fallback() {
+        let stereo_f32 = output_config_preference(2, SampleFormat::F32, 44_100, 48_000, 48_000);
+        let surround_f32 =
+            output_config_preference(8, SampleFormat::F32, 44_100, 96_000, 48_000);
+        let stereo_i16 = output_config_preference(2, SampleFormat::I16, 48_000, 48_000, 48_000);
+
+        assert!(stereo_f32 < surround_f32);
+        assert!(stereo_f32 < stereo_i16);
+        assert!(surround_f32.is_some());
+        assert_eq!(
+            output_config_preference(8, SampleFormat::F32, 96_000, 96_000, 48_000),
+            None
+        );
     }
 }
